@@ -17,7 +17,7 @@
 //! **Compaction runs quiesced.** It is called from the shard's maintenance
 //! slice, between statements, never concurrently with one. That is what lets it
 //! move a record and update the index without a lock, an epoch handshake or a
-//! read barrier, and it is the same reason [`Log`](crate::Log) is not `Send`.
+//! read barrier, and it is the same reason [`Log`] is not `Send`.
 
 use yo_common::{Code, Error, Result};
 use yo_format::PAGE_HEADER_LEN;
