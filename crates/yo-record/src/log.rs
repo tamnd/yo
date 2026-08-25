@@ -28,6 +28,15 @@
 //! four bytes zeroed. That is what makes `len == 0` mean end of log without
 //! anybody having to zero a 32 MiB page on reuse, which would cost about three
 //! milliseconds of pure memory bandwidth every time the log turns a page.
+//!
+//! The sentinel is only half of it. Writes go out a block at a time, so a flush
+//! part way through a page also sends the rest of the block, and that part of
+//! the buffer still holds the previous tenant of the ring slot. A store must
+//! never be given those bytes: a record's checksum covers its own bytes and says
+//! nothing about the address they belong at, so an old record landing at the
+//! same offset in a new page parses, and a reader walks into it. So the tail of
+//! the block past the sentinel is zeroed on the way out. Under a block per
+//! flush, against a page turn that would be eight thousand times that.
 
 use core::marker::PhantomData;
 use core::sync::atomic::{Ordering, fence};
@@ -693,6 +702,29 @@ impl<S: PageSink> Log<S> {
         let lo = (flushed / FLUSH_BLOCK) * FLUSH_BLOCK;
         let covers_upto = page_addr + u64::from(used);
 
+        // Writes are block sized, so the block holding the sentinel goes out
+        // with a tail of bytes past it that no append has filled in yet. Those
+        // bytes are whatever the previous tenant of this ring slot left behind,
+        // and handing them to the store is a real bug rather than untidiness.
+        //
+        // The store may not have written the block yet, and the same block goes
+        // out again on the next flush with more records in it. A device is free
+        // to take one sector from this write and the neighbouring sector from
+        // the next, and nothing has synced in between to forbid it. So a page
+        // can come back with a used mark from the later write and a sentinel
+        // sector from the earlier one, and if that sector carries a stale record
+        // it parses: a record's checksum covers its own bytes and says nothing
+        // about which address they belong at, so a record from an older page at
+        // the same offset is indistinguishable from the right one. Replay walks
+        // straight into it and hands back a record that was never written there.
+        //
+        // Zeroing the tail is enough on its own. It costs one memset of under a
+        // block per flush, and it means every byte the store is ever given is
+        // either a record of this page or a zero, so whichever sector wins the
+        // race the worst case is an early end of log, which is what a torn tail
+        // is supposed to look like.
+        self.pages[slot].buf[phys_end..hi].fill(0);
+
         // Data first, header second. Neither order is unsafe, because `used` is
         // a hint and the record walk is the authority on where the log ends, but
         // a header that promises records which did not land is the kind of thing
@@ -1335,6 +1367,106 @@ mod tests {
             let r = RecordRef::parse(&bytes[off..]).unwrap().unwrap();
             assert_eq!(r.value, &i.to_le_bytes());
         }
+    }
+
+    /// A store is never handed a byte that is not a record of the page it is
+    /// being told about, or a zero.
+    ///
+    /// Writes are block sized, so a flush in the middle of a page sends a tail
+    /// of bytes past the sentinel that no append has filled in. Those bytes used
+    /// to be whatever the previous tenant of the ring slot left behind, which
+    /// meant a real record of an older page sitting at the same offset. Two
+    /// flushes of the same block with no sync between them can be split by the
+    /// device sector by sector, so a page could come back with a used mark from
+    /// the second and a sentinel from the first, and the first had a parseable
+    /// stale record where the sentinel should be. Replay walked into it and
+    /// handed back a record that was never written at that address, which is the
+    /// one thing this format is not allowed to do.
+    ///
+    /// Found by `yo-crash` at seed 26281, 400 records into an 8192 byte page.
+    #[test]
+    fn a_flush_never_hands_the_store_the_previous_tenant_of_the_page() {
+        #[derive(Default)]
+        struct Watchful {
+            page_len: usize,
+            writes: usize,
+            checked_a_tail: bool,
+        }
+
+        impl PageSink for Watchful {
+            fn write(&mut self, w: PageWrite<'_>) -> Result<()> {
+                self.writes += 1;
+                let used = (w.covers_upto - w.page_addr) as usize;
+                let phys_end = (PAGE_HEADER_LEN + used + 4).min(self.page_len);
+                // The part of this write that lies past the sentinel.
+                if w.offset + w.bytes.len() > phys_end {
+                    let from = phys_end.saturating_sub(w.offset);
+                    let tail = &w.bytes[from..];
+                    if !tail.is_empty() {
+                        self.checked_a_tail = true;
+                    }
+                    let bad = tail.iter().position(|b| *b != 0);
+                    assert!(
+                        bad.is_none(),
+                        "write {} to page {} put {} bytes past the sentinel at {}, first \
+                         non zero at {}",
+                        self.writes,
+                        w.page_addr,
+                        tail.len(),
+                        phys_end,
+                        bad.unwrap()
+                    );
+                }
+                Ok(())
+            }
+
+            fn sync(&mut self) -> Result<()> {
+                Ok(())
+            }
+
+            fn durable_upto(&self) -> u64 {
+                0
+            }
+        }
+
+        let page_len = 8192;
+        let mut log = Log::new(
+            LogConfig {
+                shard: 1,
+                page_len,
+                // Three slots, so a page turn puts a live page back on top of
+                // one that still holds an older page's records.
+                resident_pages: 3,
+                mutable_fraction: 0.40,
+                durability: Durability::Group,
+            },
+            Watchful {
+                page_len,
+                ..Watchful::default()
+            },
+        )
+        .unwrap();
+
+        // Enough to turn the ring several times, with sizes that vary so the
+        // sentinel lands at a different place in the block each flush.
+        for i in 0..600u32 {
+            let value = vec![i as u8; 40 + (i as usize % 173)];
+            log.append(&RecordHeader::new(RecordKind::String), b"key", &value)
+                .unwrap();
+            // Flush part way through a page, repeatedly, which is what makes the
+            // same block go out more than once.
+            if i % 3 == 0 {
+                log.flush().unwrap();
+            }
+        }
+        log.commit_pending().unwrap();
+
+        let sink = log.into_sink();
+        assert!(sink.writes > 20, "only {} writes, too few", sink.writes);
+        assert!(
+            sink.checked_a_tail,
+            "no write ever had bytes past the sentinel, so this proved nothing"
+        );
     }
 
     #[test]
