@@ -153,3 +153,38 @@ jobs:
           ./target/release/yo-crash --trials 4000 --page-len 65536 --records 800 --seed 3000000
           ./target/release/yo-crash --trials 2000 --records 40 --seed 4000000
           ./target/release/yo-crash --trials 2000 --sync --seed 5000000
+
+  # The header and the model are generated, and a generated file that somebody
+  # edited by hand is a header that no longer matches the library. This job
+  # regenerates both and fails if the result differs from what is checked in.
+  generated:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2.9.2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - run: cargo xtask check
+
+  # The C header is the surface every binding sits on, so it gets compiled the
+  # way a caller would compile it: two compilers, every dialect they support,
+  # warnings as errors. Then the example is linked and run, because a header
+  # that compiles and a library that works are two different claims.
+  capi:
+    strategy:
+      fail-fast: false
+      matrix:
+        cc: [gcc, clang]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2.9.2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - run: examples/c/build.sh ${{ matrix.cc }}
+        env:
+          CXX: ${{ matrix.cc == 'gcc' && 'g++' || 'clang++' }}
