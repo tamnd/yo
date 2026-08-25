@@ -46,7 +46,42 @@ const ROUND: usize = 100_000;
 const STRIDE: usize = 7919;
 
 fn key(i: usize) -> Vec<u8> {
-    format!("key:{i:012}").into_bytes()
+    let mut buf = KeyBuf::new();
+    buf.set(i);
+    buf.as_bytes().to_vec()
+}
+
+/// A key on the stack, written digit by digit.
+///
+/// The obvious version of this is `format!("key:{i:012}")` and it was what this
+/// file did first, which turned out to measure the formatter and the allocator
+/// rather than the map. One `format!` plus one `Vec` is over a hundred
+/// nanoseconds, and the operation underneath it is supposed to cost forty. The
+/// hot loops fill one of these instead, so the only thing between the clock and
+/// the map is the twelve stores below.
+struct KeyBuf([u8; 16]);
+
+impl KeyBuf {
+    const fn new() -> Self {
+        Self(*b"key:000000000000")
+    }
+
+    /// Overwrite the twelve digits with `i`, least significant first.
+    #[inline]
+    fn set(&mut self, i: usize) {
+        let mut n = i;
+        let mut p = 15;
+        while p >= 4 {
+            self.0[p] = b'0' + (n % 10) as u8;
+            n /= 10;
+            p -= 1;
+        }
+    }
+
+    #[inline]
+    fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
 }
 
 fn thread_counts() -> Vec<usize> {
@@ -125,12 +160,14 @@ fn bench_owned(c: &mut Criterion) {
             b.iter_custom(|iters| {
                 fan_out(&rt, shards, iters as usize, |m, seed| {
                     let mut i = seed % KEYS;
+                    let mut k = KeyBuf::new();
                     for _ in 0..ROUND {
                         i += STRIDE;
                         if i >= KEYS {
                             i -= KEYS;
                         }
-                        black_box(m.get(black_box(&key(i))));
+                        k.set(i);
+                        black_box(m.get(black_box(k.as_bytes())));
                     }
                 })
             })
@@ -140,12 +177,14 @@ fn bench_owned(c: &mut Criterion) {
             b.iter_custom(|iters| {
                 fan_out(&rt, shards, iters as usize, |m, seed| {
                     let mut i = seed % KEYS;
+                    let mut k = KeyBuf::new();
                     for _ in 0..ROUND {
                         i += STRIDE;
                         if i >= KEYS {
                             i -= KEYS;
                         }
-                        black_box(m.set(black_box(&key(i)), VALUE));
+                        k.set(i);
+                        black_box(m.set(black_box(k.as_bytes()), VALUE));
                     }
                 })
             })
@@ -177,16 +216,22 @@ fn bench_routed(c: &mut Criterion) {
                             let start = Instant::now();
                             let mut i = t * STRIDE;
                             for _ in 0..iters {
-                                let batch: Vec<Vec<u8>> = (0..BATCH)
-                                    .map(|_| {
-                                        i = (i + STRIDE) % KEYS;
-                                        key(i)
-                                    })
-                                    .collect();
+                                // One flat array rather than a vector of
+                                // vectors. Sixty five allocations per batch
+                                // would cost more than the crossing this is
+                                // trying to measure.
+                                let mut batch = [0u8; 16 * BATCH];
+                                let mut k = KeyBuf::new();
+                                for slot in 0..BATCH {
+                                    i = (i + STRIDE) % KEYS;
+                                    k.set(i);
+                                    batch[slot * 16..slot * 16 + 16].copy_from_slice(k.as_bytes());
+                                }
                                 let shard = (t + i) % rt.shards();
                                 black_box(sub.call(shard, move |ctx| {
                                     let mut hits = 0u32;
-                                    for k in &batch {
+                                    for slot in 0..BATCH {
+                                        let k = &batch[slot * 16..slot * 16 + 16];
                                         hits += ctx.state.get(k).is_some() as u32;
                                     }
                                     hits
