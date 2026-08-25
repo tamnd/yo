@@ -1,0 +1,58 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/yo-alloc",
+    "crates/yo-arena",
+    "crates/yo-common",
+    "crates/yo-index",
+    "crates/yo-shard",
+]
+# The fuzz targets need nightly and a libfuzzer link, so they are their own
+# package rather than a member that would break `cargo build --workspace`.
+exclude = ["fuzz"]
+
+[workspace.package]
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.94"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/tamnd/yo"
+homepage = "https://yo.tamnd.dev"
+authors = ["tamnd <tamnd87@gmail.com>"]
+
+[workspace.dependencies]
+yo-alloc = { path = "crates/yo-alloc", version = "0.0.0" }
+yo-arena = { path = "crates/yo-arena", version = "0.0.0" }
+yo-common = { path = "crates/yo-common", version = "0.0.0" }
+yo-index = { path = "crates/yo-index", version = "0.0.0" }
+yo-shard = { path = "crates/yo-shard", version = "0.0.0" }
+
+criterion = "0.8"
+libc = "0.2"
+loom = "0.7"
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+# `--cfg loom` swaps the atomics for loom's so the model checker can run. It is
+# set by the CI job and by hand, never by a feature, because a feature would let
+# it end up in a release build.
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)'] }
+missing_docs = "warn"
+
+[workspace.lints.clippy]
+undocumented_unsafe_blocks = "deny"
+alloc_instead_of_core = "warn"
+
+# The gate numbers in bench/ are only meaningful against this profile. Anything
+# published from a different profile says so in the row.
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+
+[profile.bench]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+debug = true

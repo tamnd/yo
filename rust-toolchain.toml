@@ -1,0 +1,5 @@
+[toolchain]
+# Current stable, pinned in AUDIT-2026-08.md section 1. The MSRV job in CI
+# overrides this with 1.94 so both are tested on every pull request.
+channel = "1.98.0"
+components = ["rustfmt", "clippy"]
