@@ -265,7 +265,12 @@ mod tests {
         // A build that predates `detail` would declare a struct ending after
         // `url`. Nothing may be written past that.
         e.size = offset_of!(yo_error, detail) as u32;
-        e.detail = 0xdead_beef as *const c_char;
+        // A sentinel, never dereferenced, only compared. `without_provenance`
+        // rather than a plain `as` cast because a cast from an integer is an
+        // unsupported operation under `-Zmiri-strict-provenance` and this test
+        // is one of the ones Miri runs.
+        let sentinel = core::ptr::without_provenance::<c_char>(0xdead_beef);
+        e.detail = sentinel;
         // SAFETY: `e` is valid and its size says how much of it exists.
         unsafe {
             Report::new(Code::Corrupt, "checksum mismatch\0")
@@ -278,7 +283,7 @@ mod tests {
             "url is inside the declared size and should be written"
         );
         assert_eq!(
-            e.detail, 0xdead_beef as *const c_char,
+            e.detail, sentinel,
             "detail was written past the caller's struct"
         );
     }
