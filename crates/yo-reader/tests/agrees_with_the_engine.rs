@@ -267,6 +267,67 @@ fn a_torn_slot_does_not_stop_the_reader() {
     assert_eq!(n, 30, "the records are still all there");
 }
 
+/// Rewrites one region's header with a different `used`, leaving the payload
+/// alone. This is what a crash that loses the header write but keeps the record
+/// writes leaves behind, and there is no way to produce it through the engine's
+/// own API because the engine writes the two together.
+fn stale_used(path: &std::path::Path, offset: u64, used: u32) {
+    use std::io::{Read, Seek, SeekFrom, Write};
+    let mut f = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+        .unwrap();
+    let mut head = [0u8; 32];
+    f.seek(SeekFrom::Start(offset)).unwrap();
+    f.read_exact(&mut head).unwrap();
+    let mut h = yo_format::PageHeader::decode(&head).expect("the header we are about to spoil");
+    h.used = used;
+    h.dead_bytes = 0;
+    h.encode(&mut head);
+    f.seek(SeekFrom::Start(offset)).unwrap();
+    f.write_all(&head).unwrap();
+}
+
+#[test]
+fn a_stale_used_mark_does_not_hide_records() {
+    // Enough records to run past the first read, which is sized from `used` and
+    // rounded up to 64 KiB. At roughly fifty bytes each this is a few hundred
+    // KiB of payload, so the walk has to ask for more of the segment several
+    // times over rather than once.
+    let t = Tmp::new("stale-used");
+    let wrote = write_a_file(&t.0, 4000, 1);
+
+    let r = Reader::open(&t.0).expect("open");
+    let region = r.regions()[0].clone();
+    let real = region.header.used;
+    let all = r.records(&region).expect("walk").len();
+    assert_eq!(all, wrote.len(), "the file is intact to begin with");
+    assert!(
+        real > 64 * 1024,
+        "under one read block of payload, so this would pass without the walk ever asking for more of the segment: used {real}"
+    );
+    drop(r);
+
+    // Zero is the header a page starts life with, so a lost header write leaves
+    // exactly this. Half is a header from an earlier flush of the same page.
+    for used in [0, real / 2, real - 1] {
+        stale_used(&t.0, region.offset, used);
+        let r = Reader::open(&t.0).expect("open");
+        let got = r.records(&r.regions()[0]).expect("walk");
+        assert_eq!(
+            got.len(),
+            wrote.len(),
+            "used {used} of {real} hid {} records",
+            wrote.len() - got.len()
+        );
+        for (i, (rec, (key, value))) in got.iter().zip(&wrote).enumerate() {
+            assert_eq!(&rec.key, key, "key of record {i} at used {used}");
+            assert_eq!(&rec.value, value, "value of record {i} at used {used}");
+        }
+    }
+}
+
 #[test]
 fn a_flipped_bit_in_a_value_is_caught() {
     let t = Tmp::new("flip");
