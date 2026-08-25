@@ -606,6 +606,11 @@ mod tests {
     }
 
     #[test]
+    // Fifteen hundred trials of two hundred records each, which is minutes on a
+    // real machine and hours under Miri. There is no unsafe in this crate for
+    // Miri to check, so what it would be doing is interpreting a fuzzer, and the
+    // cheap trials below already prove the harness still runs under it.
+    #[cfg_attr(miri, ignore)]
     fn a_few_hundred_trials_pass() {
         // The real run is a hundred thousand and lives in the binary. This is
         // enough to fail the build if something obvious breaks.
@@ -621,6 +626,11 @@ mod tests {
     }
 
     #[test]
+    // Fifteen hundred trials of two hundred records each, which is minutes on a
+    // real machine and hours under Miri. There is no unsafe in this crate for
+    // Miri to check, so what it would be doing is interpreting a fuzzer, and the
+    // cheap trials below already prove the harness still runs under it.
+    #[cfg_attr(miri, ignore)]
     fn the_shape_that_caught_the_stale_page_tail() {
         // Small pages and enough records to turn the ring several times, which
         // is what it takes to get an old page's records sitting under a new
@@ -645,6 +655,11 @@ mod tests {
     }
 
     #[test]
+    // Fifteen hundred trials of two hundred records each, which is minutes on a
+    // real machine and hours under Miri. There is no unsafe in this crate for
+    // Miri to check, so what it would be doing is interpreting a fuzzer, and the
+    // cheap trials below already prove the harness still runs under it.
+    #[cfg_attr(miri, ignore)]
     fn the_trials_actually_reach_every_fault() {
         // A suite that passes because it never injected anything is the failure
         // mode worth guarding, so count what the seeds reached.
@@ -666,6 +681,11 @@ mod tests {
     }
 
     #[test]
+    // Fifteen hundred trials of two hundred records each, which is minutes on a
+    // real machine and hours under Miri. There is no unsafe in this crate for
+    // Miri to check, so what it would be doing is interpreting a fuzzer, and the
+    // cheap trials below already prove the harness still runs under it.
+    #[cfg_attr(miri, ignore)]
     fn the_trials_actually_lose_things() {
         // And a suite where every trial recovers everything is a suite whose
         // faults are landing somewhere harmless.
