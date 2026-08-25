@@ -8,6 +8,44 @@ While the major is 0, a minor release may break anything, including the on-disk 
 
 Nothing yet.
 
+## 0.2.0 — 2026-08-28
+
+**Milestone: M1, the record plane and the file.** M0 was a workspace and the pieces every milestone stands on. This is the first release that writes anything down. A `.yo` file, a hybrid log over it, replay, compaction, an independent reader that shares no code with the engine, a checker built on that reader, and a crash injection harness with an exact oracle.
+
+### Added
+
+- **`yo-format`.** The byte layouts and nothing that touches a file: superblock, checkpoint entry, page header, record framing, and the encode and decode for each. Both the engine and the independent reader are written against the same document rather than against each other, which is the only arrangement where a disagreement means something.
+- **`yo-record`.** The hybrid log. Mutable, read only and stable regions over a ring of resident pages, per shard epochs, group commit with four durability modes, replay, and F2 style lookup based compaction with dead byte accounting deciding when it runs. `Log<S>` is not `Send`, so installing a record is a store rather than a compare and swap.
+- **`yo-file`.** The `.yo` file. Two superblocks at 0 and 16384 with the root flip done as sync the data, write the slot that is not live, sync again. Log addresses count payload bytes rather than file bytes, so every page address is an exact multiple of the payload length and asking whether a segment is where it says it is is arithmetic rather than a guess.
+- **`yo-reader`.** A second reader that shares no code with the engine. It is not a test double. It is the only thing that can catch the format drifting away from what is written down, and it is what makes a yanked release still readable.
+- **`yo check`.** The tool you run when a database will not start. It separates a usage failure from a verdict, so a file that is not ours exits 2 and a file that is ours and damaged exits 1, and it never writes to the file it is checking.
+- **`yo-crash`.** Crash injection with an exact oracle: lose everything, lose a prefix, reorder, tear at sector granularity, scatter, and flip a bit, against an image that only holds what a sync covered. Every damaged image is read twice, by recovery and by the independent reader, and compared record by record and on where the walk stops. Seeded with splitmix64, so a failure is a seed somebody can type in.
+- **A `crash` CI job**, running a fifth of the gate across four shapes on fixed seeds. Fixed rather than drawn from the clock, because a job that picks its own seeds fails once a month on a seed nobody wrote down.
+
+### Fixed
+
+- **A `yo-format` test never finished under Miri.** Flipping every bit of a 16 KiB superblock slot and decoding after each one is sixteen thousand iterations, each copying and checksumming 16 KiB. Natively that is a few milliseconds. Interpreted it did not finish inside a CI job's six hour ceiling, and it took a nightly Miri run with it. Under Miri the walk is now a stride of 601 bytes plus nine offsets visited by hand, which is 37 seconds; every ordinary run still flips every byte.
+- **The log handed the store the previous tenant of a page, and it was a silent corruption.** Writes go out a block at a time, so a flush part way through a page sends the end of log sentinel and then the rest of the block behind it, and those trailing bytes were whatever the previous tenant of the ring slot left there. The same block goes out again on the next flush with more records in it and nothing syncs in between, so a device may take one sector from the first write and the neighbouring sector from the second. The page then comes back with a used mark from the later write and a sentinel sector from the earlier one, and the earlier one has a stale record where the sentinel should be. It parses, because a record's checksum covers its own bytes and says nothing about the address they belong at, and replay walked into it and handed back a record that was never written there. The tail of the block past the sentinel is now zeroed on the way out, which costs under a block per flush. Found by `yo-crash` at seed 26281, 400 records into an 8192 byte page, after a hundred thousand trials at the default shape had run clean.
+- **`Reader::records` capped its walk at the page header's `used` field.** A crash can take the header write and leave the record writes, and on that file the reader reported fewer records than the file holds while recovery found all of them. `used` now sizes the first read and nothing else, and the walk runs to the sentinel, which is what replay does.
+- **The commit benchmark was measuring a tmpfs** and was wrong by four orders of magnitude. It now takes its directory from `YO_BENCH_DIR` and prints the device's `fdatasync` floor next to the result, so the two can be read together. Any commit rate published before this should be discarded.
+
+### Format
+
+The `.yo` layout is defined by this release and is not frozen. `MAGIC` is `tamndyo fmt001`, superblocks are 16 KiB at 0 and 16384, the data area starts at 32768, and a region is 32 MiB. A minor release may still change any of it before `M6`.
+
+Not changed but worth writing down, because it is the shape of the bug above: a record cannot be tied to its address. Any future path that puts old bytes under a new address ends the same silent way. Mixing the address into the record checksum would close that off and it is a format change rather than a fix, so it is not in this release.
+
+### Performance
+
+Development measurements. Not one of the machines available meets the gate box definition in `bench/00` section 7, so nothing here is a gate number.
+
+- Durable commits, group mode, on gamingpc, an i9-13900K under WSL2, release profile with fat LTO and one codegen unit: the `commit_batch` curve crosses 200 thousand per second at a batch of roughly 1024, on a device whose `fdatasync` costs 2.3 milliseconds. Development measurement, and the batch size and the device floor are part of the number rather than footnotes to it.
+
+### Known gaps
+
+- **The two performance rows of the M1 gate are open**, and the reason is the box rather than the code: 200 thousand or more durable commits per second in group mode on NVMe with SQPoll, and a 10 GB file opening in under 100 ms. Neither gamingpc nor server1, server2 or server3 qualifies under `bench/00` section 7. No row from those machines is a gate row.
+- `yo-file` still bump allocates regions and never reuses a freed one.
+
 ## 0.1.1 — 2026-08-28
 
 A CI release. Nothing in the library changed, and a `0.1.0` file, API and ABI are all still exactly what they were. What changed is how long you wait to find out whether a change is good.
@@ -23,6 +61,8 @@ A CI release. Nothing in the library changed, and a `0.1.0` file, API and ABI ar
 ### Known gaps
 
 - Miri and the fuzzers no longer gate an ordinary pull request. A patch that introduces undefined behaviour can now land and be caught the following morning by the nightly rather than before the merge. That is the trade the three minute budget is bought with, and the `deep` label is the way to pay it back on a change that deserves it.
+
+## 0.1.0 — 2026-08-26
 
 **Milestone: M0, Skeleton.** The parts every later milestone stands on, built first and on their own so that a mistake in them is found now rather than underneath a hundred thousand lines. Nothing here is a database yet. It is a workspace, a hash, an allocator, a bucket, a shard runtime and the CI that keeps them honest.
 
