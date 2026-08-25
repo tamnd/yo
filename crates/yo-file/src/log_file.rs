@@ -257,6 +257,19 @@ impl PageSink for LogFile {
     }
 
     fn sync(&mut self) -> Result<()> {
+        // Nothing has reached the file since the last sync, so there is nothing
+        // for this one to make durable. Skipping it is not an optimisation for
+        // its own sake: group commit runs off a timer, most ticks find an idle
+        // shard, and a real sync costs milliseconds on the devices that matter.
+        // Paying that per idle tick would put a floor under the shard's latency
+        // that has nothing to do with the work it is doing.
+        //
+        // Safe because this file has one owner. `written_upto` moves only in
+        // `write`, which takes `&mut self`, so equality here means no byte was
+        // handed over that the last `sync_data` did not already cover.
+        if self.durable_upto == self.written_upto {
+            return Ok(());
+        }
         fio::sync_data(&self.file).map_err(|e| io_err("could not sync the log", &e))?;
         self.syncs += 1;
         // Exactly what was handed over before the sync, and nothing handed over
@@ -508,6 +521,35 @@ mod tests {
         assert_eq!(sink.durable_upto(), 100);
         assert_eq!(sink.syncs(), 1);
         assert_eq!(sink.writes(), 1);
+    }
+
+    #[test]
+    fn syncing_an_idle_log_does_not_touch_the_device() {
+        let t = Tmp::new("idlesync");
+        let mut db = Yo::create(&t.0, &CreateOptions::default()).unwrap();
+        let mut sink = db.log(0).unwrap();
+
+        // Nothing written yet, so there is nothing to make durable.
+        sink.sync().unwrap();
+        sink.sync().unwrap();
+        assert_eq!(sink.syncs(), 0, "an empty log has nothing to sync");
+
+        put_page(&mut sink, 0, 0x11);
+        sink.sync().unwrap();
+        assert_eq!(sink.syncs(), 1);
+
+        // The timer keeps firing on a shard that has gone quiet. Only the first
+        // of these had anything behind it.
+        for _ in 0..10 {
+            sink.sync().unwrap();
+        }
+        assert_eq!(sink.syncs(), 1, "an idle tick is free");
+        assert_eq!(sink.durable_upto(), sink.written_upto);
+
+        // Work again, and the next sync is real again.
+        put_page(&mut sink, LOG_PAGE_LEN, 0x22);
+        sink.sync().unwrap();
+        assert_eq!(sink.syncs(), 2);
     }
 
     #[test]

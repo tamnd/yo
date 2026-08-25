@@ -22,6 +22,14 @@
 //! `fdatasync`, which does not, unless the drive has no volatile cache or has
 //! been told to write through. The Linux number is therefore the optimistic one
 //! and the macOS number is the honest one, and they are not comparable.
+//!
+//! **Set `YO_BENCH_DIR`.** The default is [`std::env::temp_dir`], and on plenty
+//! of machines that is a tmpfs, where a sync returns without going anywhere. The
+//! first run of this benchmark measured a ramdisk and reported nine million
+//! durable commits a second against a two hundred thousand gate, which is the
+//! sort of number that should be an obvious lie and was not obvious at all. So
+//! the directory is printed on every run, next to the device it sits on, and
+//! anyone quoting a number from here is expected to quote those too.
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use std::hint::black_box;
@@ -29,6 +37,22 @@ use std::path::PathBuf;
 use yo_file::{CreateOptions, LogFile, Yo};
 use yo_format::{RecordHeader, RecordKind};
 use yo_record::{Durability, Log, LogConfig};
+
+/// Where the benchmark file goes, from `YO_BENCH_DIR` or the temporary
+/// directory, and loudly enough that nobody reads the result without it.
+fn bench_dir() -> PathBuf {
+    match std::env::var_os("YO_BENCH_DIR") {
+        Some(d) => PathBuf::from(d),
+        None => {
+            eprintln!(
+                "warning: YO_BENCH_DIR is not set, so this is measuring {}, \
+                 which may be a ramdisk. Do not quote these numbers.",
+                std::env::temp_dir().display()
+            );
+            std::env::temp_dir()
+        }
+    }
+}
 
 /// How many commits go between two syncs in `group` mode. The maintenance
 /// slice picks this by time rather than by count, but a count is what a
@@ -61,7 +85,8 @@ struct Fixture {
 
 impl Fixture {
     fn new(name: &str, durability: Durability) -> Fixture {
-        let mut path = std::env::temp_dir();
+        let mut path = bench_dir();
+        std::fs::create_dir_all(&path).expect("the benchmark directory");
         path.push(format!("yo-bench-commit-{name}-{}.yo", std::process::id()));
         let _ = std::fs::remove_file(&path);
 
@@ -90,6 +115,8 @@ fn commit(c: &mut Criterion) {
     let h = RecordHeader::new(RecordKind::String);
     let value = [b'v'; 64];
 
+    eprintln!("commit benchmark writing to {}", bench_dir().display());
+
     let mut g = c.benchmark_group("commit");
     g.throughput(Throughput::Elements(BATCH as u64));
     for durability in [Durability::None, Durability::Group, Durability::Sync] {
@@ -106,11 +133,16 @@ fn commit(c: &mut Criterion) {
                         let a = f.log.append(&h, keys.set(n), &value).expect("append").addr;
                         black_box(a);
                     }
-                    // What makes the batch durable. In `none` this is a write
-                    // with no sync behind it, and in `sync` the appends above
-                    // have each already paid, so the shape of the loop is the
-                    // same in all three and only the cost moves.
-                    f.log.commit_pending().expect("commit");
+                    // What ends the batch. `commit_pending` flushes and syncs
+                    // whatever the mode, so `none` gets the flush on its own or
+                    // it would be measuring a sync it never asked for, which is
+                    // how `none` and `group` came out identical the first time
+                    // this was run. In `sync` the appends above have each
+                    // already paid and this finds nothing left to do.
+                    match d {
+                        Durability::None => f.log.flush().expect("flush"),
+                        _ => f.log.commit_pending().expect("commit"),
+                    }
                 });
             },
         );
