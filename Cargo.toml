@@ -4,6 +4,7 @@ members = [
     "crates/yo-alloc",
     "crates/yo-arena",
     "crates/yo-common",
+    "crates/yo-file",
     "crates/yo-format",
     "crates/yo-index",
     "crates/yo-record",
@@ -28,6 +29,7 @@ authors = ["tamnd <tamnd87@gmail.com>"]
 yo-alloc = { path = "crates/yo-alloc", version = "0.1.1" }
 yo-arena = { path = "crates/yo-arena", version = "0.1.1" }
 yo-common = { path = "crates/yo-common", version = "0.1.1" }
+yo-file = { path = "crates/yo-file", version = "0.1.1" }
 yo-format = { path = "crates/yo-format", version = "0.1.1" }
 yo-index = { path = "crates/yo-index", version = "0.1.1" }
 yo-record = { path = "crates/yo-record", version = "0.1.1" }

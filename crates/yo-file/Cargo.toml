@@ -1,0 +1,34 @@
+[package]
+name = "yo-file"
+description = "The .yo file: segments, two superblocks, the root flip, and durability."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+yo-common = { workspace = true }
+yo-format = { workspace = true }
+yo-record = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }
+
+[dev-dependencies]
+criterion = { workspace = true }
+
+# Open time is about the shape of the file, and durable commit rate is about the
+# device. They are separate binaries because they answer separate questions and
+# because only one of them is worth running on a laptop.
+[[bench]]
+name = "open"
+harness = false
+
+[[bench]]
+name = "commit"
+harness = false
