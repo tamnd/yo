@@ -103,6 +103,35 @@ fn a_good_file_passes() {
 }
 
 #[test]
+fn a_lost_header_write_does_not_hide_records() {
+    // A crash can take the header write and leave the record writes, and this
+    // is the file somebody runs the checker on. Counting only as far as `used`
+    // would report fewer records than the engine's recovery is going to find,
+    // which is a worse answer than saying nothing.
+    let t = Tmp::new("staleused");
+    good_file(&t.0, 200, 1);
+
+    let off = yo_format::DATA_START;
+    let mut head = [0u8; PAGE_HEADER_LEN];
+    {
+        use std::io::Read;
+        let mut f = std::fs::File::open(&t.0).unwrap();
+        f.seek(SeekFrom::Start(off)).unwrap();
+        f.read_exact(&mut head).unwrap();
+    }
+    let mut h = PageHeader::decode(&head).expect("the header we are about to spoil");
+    // Zero is what a page starts life with, so a header write that never landed
+    // leaves exactly this behind.
+    h.used = 0;
+    h.dead_bytes = 0;
+    h.encode(&mut head);
+    poke(&t.0, off, &head);
+
+    let (code, out) = run(&t.0, &[]);
+    assert!(out.contains("200 records"), "code {code}: {out}");
+}
+
+#[test]
 fn quick_skips_the_records_and_says_so() {
     let t = Tmp::new("quick");
     good_file(&t.0, 50, 1);
