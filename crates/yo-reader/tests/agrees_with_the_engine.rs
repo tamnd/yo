@@ -370,6 +370,9 @@ fn a_flipped_bit_in_a_value_is_caught() {
 }
 
 #[test]
+// Miri cannot spawn a process, and the binary would not be interpreted by it
+// anyway.
+#[cfg_attr(miri, ignore)]
 fn the_dump_binary_prints_what_is_in_the_file() {
     // A library that works and a binary that does not is a thing nobody notices
     // until they reach for the binary, which by definition is a bad moment.
@@ -397,6 +400,9 @@ fn the_dump_binary_prints_what_is_in_the_file() {
 }
 
 #[test]
+// Miri cannot spawn a process, and the binary would not be interpreted by it
+// anyway.
+#[cfg_attr(miri, ignore)]
 fn the_dump_binary_says_no_to_a_file_that_is_not_ours() {
     let t = Tmp::new("notours");
     std::fs::write(&t.0, vec![0x41u8; 40000]).unwrap();

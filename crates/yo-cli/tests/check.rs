@@ -5,6 +5,11 @@
 //! two shards both think is theirs, where both of them have written perfectly
 //! valid records into it, is what a checker is for.
 
+// Every test here runs the binary, and Miri cannot spawn a process. It would
+// not be interpreting the tool anyway, only the harness that launches it, so
+// there is nothing to gain by making these work under it.
+#![cfg(not(miri))]
+
 use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
