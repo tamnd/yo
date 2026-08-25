@@ -12,7 +12,9 @@ members = [
 exclude = ["fuzz"]
 
 [workspace.package]
-version = "0.0.0"
+# One minor per milestone, patches in between, and nothing here promises
+# anything while the major is 0. See RELEASING.md.
+version = "0.1.0"
 edition = "2024"
 rust-version = "1.94"
 license = "MIT OR Apache-2.0"
@@ -21,11 +23,11 @@ homepage = "https://yo.tamnd.dev"
 authors = ["tamnd <tamnd87@gmail.com>"]
 
 [workspace.dependencies]
-yo-alloc = { path = "crates/yo-alloc", version = "0.0.0" }
-yo-arena = { path = "crates/yo-arena", version = "0.0.0" }
-yo-common = { path = "crates/yo-common", version = "0.0.0" }
-yo-index = { path = "crates/yo-index", version = "0.0.0" }
-yo-shard = { path = "crates/yo-shard", version = "0.0.0" }
+yo-alloc = { path = "crates/yo-alloc", version = "0.1.0" }
+yo-arena = { path = "crates/yo-arena", version = "0.1.0" }
+yo-common = { path = "crates/yo-common", version = "0.1.0" }
+yo-index = { path = "crates/yo-index", version = "0.1.0" }
+yo-shard = { path = "crates/yo-shard", version = "0.1.0" }
 
 criterion = "0.8"
 libc = "0.2"
