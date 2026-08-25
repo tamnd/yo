@@ -794,6 +794,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "yo-file"
+version = "0.1.0"
+dependencies = [
+ "criterion",
+ "libc",
+ "yo-common",
+ "yo-format",
+ "yo-record",
+]
+
+[[package]]
 name = "yo-format"
 version = "0.1.0"
 dependencies = [
