@@ -1,0 +1,12 @@
+[package]
+name = "yo-alloc"
+description = "A global allocator that aborts when a shard thread allocates off the marked setup path."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
