@@ -150,5 +150,44 @@ fn commit(c: &mut Criterion) {
     g.finish();
 }
 
-criterion_group!(benches, commit);
+/// Group commit against batch size, which is the shape the gate actually asks
+/// about.
+///
+/// The comparison above holds the batch at 64, and on a device where a sync
+/// costs two milliseconds that caps the whole thing at 32 thousand commits a
+/// second no matter how good the code is. That is not a fact about yo, it is 64
+/// divided by the sync cost, and a fixed batch turns the gate into a question
+/// about the drive alone.
+///
+/// The maintenance slice does not work that way. It batches by time, so on a
+/// slow device it naturally gathers more commits per sync, and on a fast one it
+/// syncs sooner. What this sweep gives is the curve: commits per second against
+/// how many of them share a sync. Read the batch size where the line crosses
+/// two hundred thousand, and compare it against how many commits a shard really
+/// has in flight in the window the slice waits.
+fn commit_batch(c: &mut Criterion) {
+    let h = RecordHeader::new(RecordKind::String);
+    let value = [b'v'; 64];
+
+    let mut g = c.benchmark_group("commit_batch");
+    for batch in [8usize, 64, 512, 4096] {
+        g.throughput(Throughput::Elements(batch as u64));
+        g.bench_with_input(BenchmarkId::from_parameter(batch), &batch, |b, &batch| {
+            let mut f = Fixture::new(&format!("batch{batch}"), Durability::Group);
+            let mut keys = KeyBuf::new();
+            let mut n = 0u64;
+            b.iter(|| {
+                for _ in 0..batch {
+                    n += 1;
+                    let a = f.log.append(&h, keys.set(n), &value).expect("append").addr;
+                    black_box(a);
+                }
+                f.log.commit_pending().expect("commit");
+            });
+        });
+    }
+    g.finish();
+}
+
+criterion_group!(benches, commit, commit_batch);
 criterion_main!(benches);

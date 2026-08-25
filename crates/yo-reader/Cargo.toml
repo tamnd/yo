@@ -1,0 +1,32 @@
+[package]
+name = "yo-reader"
+description = "An independent minimal reader for .yo files, written from the specification and sharing no code with the engine."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+# No dependencies, and that is the feature. This crate exists to disagree with
+# the engine, so anything it borrowed from the engine would be a place the two
+# cannot disagree. Not yo-common for the checksum, not yo-format for the layout,
+# not even a byte order helper.
+[dependencies]
+
+# The tests are the exception, on purpose. A reader that nobody has checked
+# against the writer is a second opinion from someone who has not seen the
+# patient, so the tests build files with the real engine and read them back with
+# this.
+[dev-dependencies]
+yo-common = { workspace = true }
+yo-file = { workspace = true }
+yo-format = { workspace = true }
+yo-record = { workspace = true }
+
+[[bin]]
+name = "yo-dump"
+path = "src/bin/yo-dump.rs"

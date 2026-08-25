@@ -822,6 +822,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "yo-reader"
+version = "0.1.0"
+dependencies = [
+ "yo-common",
+ "yo-file",
+ "yo-format",
+ "yo-record",
+]
+
+[[package]]
 name = "yo-record"
 version = "0.1.0"
 dependencies = [
