@@ -290,6 +290,10 @@ fn stale_used(path: &std::path::Path, offset: u64, used: u32) {
 }
 
 #[test]
+// Four thousand records written and then walked four times, which is a second
+// here and about seven minutes under Miri. Everything it touches is safe code,
+// so Miri would be interpreting a loop over a byte buffer for no return.
+#[cfg_attr(miri, ignore)]
 fn a_stale_used_mark_does_not_hide_records() {
     // Enough records to run past the first read, which is sized from `used` and
     // rounded up to 64 KiB. At roughly fifty bytes each this is a few hundred
