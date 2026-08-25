@@ -804,6 +804,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "yo-crash"
+version = "0.1.0"
+dependencies = [
+ "yo-common",
+ "yo-format",
+ "yo-reader",
+ "yo-record",
+]
+
+[[package]]
 name = "yo-file"
 version = "0.1.0"
 dependencies = [
