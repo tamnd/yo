@@ -8,7 +8,7 @@ While the major is 0, a minor release may break anything, including the on-disk 
 
 Nothing yet.
 
-## 0.1.0 — 2026-08-25
+## 0.1.0 — 2026-08-26
 
 **Milestone: M0, Skeleton.** The parts every later milestone stands on, built first and on their own so that a mistake in them is found now rather than underneath a hundred thousand lines. Nothing here is a database yet. It is a workspace, a hash, an allocator, a bucket, a shard runtime and the CI that keeps them honest.
 
@@ -38,6 +38,7 @@ Development measurements, all of them. Not one of the machines available meets t
 - Undefined behaviour in `Bucket::tag_word`, found by Miri, fixed by taking the pointer from the bucket rather than from the tag array.
 - Two build failures that were invisible on the arm dev machine and only showed up on x86: an `unused_unsafe` warning around the crc32 intrinsics, and the `chunks_exact` to `as_chunks` migration. Every commit is now built on x86 before it lands.
 - Windows CI was failing on line endings. Fixed with `.gitattributes` and a normalizer in the tooling rather than by turning the check off.
+- A `yo-shard` test counted jobs across four lanes through a fifth one and expected an exact total. Ordering is per lane and a shard polls its lanes in turn, so jobs sent on one lane can still be queued when a call on another lane comes back, and the count was short. It passed on a quiet machine for weeks and failed once on a loaded macOS runner. The test now waits on each lane it used. Nothing in the runtime changed: no job was ever lost, `send` spins until the lane takes it.
 
 ### Known gaps
 
