@@ -811,6 +811,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "yo-record"
+version = "0.1.0"
+dependencies = [
+ "criterion",
+ "yo-common",
+ "yo-format",
+]
+
+[[package]]
 name = "yo-shard"
 version = "0.1.1"
 dependencies = [

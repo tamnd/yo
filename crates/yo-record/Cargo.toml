@@ -1,0 +1,23 @@
+[package]
+name = "yo-record"
+description = "The hybrid log: append, regions, group commit, replay and compaction."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+yo-common = { workspace = true }
+yo-format = { workspace = true }
+
+[dev-dependencies]
+criterion = { workspace = true }
+
+[[bench]]
+name = "append"
+harness = false
