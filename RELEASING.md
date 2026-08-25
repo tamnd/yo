@@ -1,0 +1,39 @@
+# Releasing
+
+`yo` releases early and often, from `0.1.0`, well before anything here is worth depending on. The reason is not ceremony. A milestone that has not been tagged has no fixed meaning, so a benchmark number, a bug report or a spec amendment cannot be pinned to anything, and six months from now nobody will be able to tell which version of the format a file was written by. A tag is what makes all three possible.
+
+## What the numbers mean
+
+While the major is 0, the guarantees are these and only these.
+
+**Minor** goes up when a milestone lands. `M0` is `0.1.0`, and every engine or DX milestone that merges takes the next minor. A minor may break anything: the Rust API, the C ABI, the on-disk format, the command set. That is what a zero major is for, and pretending otherwise would be worse than saying it plainly.
+
+**Patch** goes up for anything that lands between milestones. Fixes, benchmark corrections, documentation, a dependency bump. A patch never changes the on-disk format and never removes a public item.
+
+**The on-disk format is not frozen until `M6`.** Until then a minor may change it, and when it does the release notes say so under its own heading with the migration, if there is one. From `M6` on, a file written by any later version is readable by every version at or above its `min_reader_version`, and that is checked in CI by the independent reader.
+
+`1.0.0` is `M9`. It means the format is frozen, the six language bindings are real, and the gate numbers in `bench/` are met on a qualified box rather than on whatever machine was free.
+
+## Cutting one
+
+1. The milestone PR is green on all of CI, including the slow jobs, and has been built and tested on x86 as well as arm. The arm dev machine cannot see the crc intrinsic paths or the target specific lints.
+2. Bump `workspace.package.version` in the root `Cargo.toml`, and the `version` on every path dependency in `[workspace.dependencies]` with it, then run `cargo update --workspace` so `Cargo.lock` agrees. The release workflow refuses a tag whose version does not match the manifest, so a half-done bump fails before anything is published rather than after.
+3. Add the release's section to `CHANGELOG.md`. Write it for somebody who was not in the room: what changed, why it changed, and what it costs them. Numbers get their machine and their profile next to them or they do not go in.
+4. Merge the PR.
+5. Tag the merge commit `vX.Y.Z` and push the tag. The `release` workflow takes it from there: it re-runs the gate jobs against the tag, then publishes the GitHub release with the changelog section as its body.
+
+A tag is never moved and never deleted. If a release is wrong, the fix is the next patch.
+
+## What a release note has to contain
+
+Every section carries whichever of these apply, in this order. Headings that have nothing under them are left out rather than filled with "none".
+
+- **Milestone.** Which one, and a sentence on what it was for.
+- **Added**, **Changed**, **Fixed.** Ordinary changes.
+- **Format.** Any change to the `.yo` layout, with the offset or field, and whether a file written by the previous version still opens.
+- **Performance.** Numbers, each with the machine, the profile, and whether it is a gate number or a development measurement. A development measurement says so in the same sentence as the number, not in a footnote.
+- **Known gaps.** What the milestone was gated on and did not reach, and what is deliberately unimplemented so far. This is the section that keeps the rest honest.
+
+## Style
+
+Prose is not hard wrapped. One line per paragraph and one line per bullet, however long it runs, in every markdown file, pull request body, issue body and commit message in this repository. A sentence broken across two lines makes a one word edit show up as a two line diff, and it makes a paragraph impossible to grep for.

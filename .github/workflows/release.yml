@@ -1,0 +1,96 @@
+name: release
+
+# A tag is the only trigger. Nothing here runs on a branch, because a release
+# that can be produced from an untagged tree is a release nobody can point at.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: The tag to build the release from
+        required: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  RUSTFLAGS: -D warnings
+
+permissions:
+  contents: write
+
+jobs:
+  # The tag, the version in Cargo.toml and the changelog have to agree before
+  # anything else runs. All three drift, and finding out after the release is
+  # published means the fix is another release.
+  check:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+      - id: v
+        run: |
+          tag="${{ inputs.tag || github.ref_name }}"
+          version="${tag#v}"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          manifest=$(grep -m1 '^version = ' Cargo.toml | cut -d'"' -f2)
+          if [ "$manifest" != "$version" ]; then
+            echo "tag $tag says $version, Cargo.toml says $manifest" >&2
+            exit 1
+          fi
+          if ! grep -q "^## $version " CHANGELOG.md; then
+            echo "CHANGELOG.md has no section for $version" >&2
+            exit 1
+          fi
+
+  # The same gates the branch runs, against the tag rather than against a
+  # branch tip that has since moved.
+  verify:
+    needs: check
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2.9.2
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets --all-features
+      - run: cargo test --workspace --locked
+      - run: cargo test --workspace --locked --release
+
+  publish:
+    needs: [check, verify]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+      # The release body is the changelog section, not a generated commit list.
+      # A commit list tells you what was typed; the changelog tells you what it
+      # costs you, which is the only thing worth reading.
+      - name: Cut the changelog section
+        run: |
+          awk -v v="${{ needs.check.outputs.version }}" '
+            $0 ~ "^## " v " " { on = 1; next }
+            on && /^## / { exit }
+            on { print }
+          ' CHANGELOG.md > release-notes.md
+          test -s release-notes.md
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${{ inputs.tag || github.ref_name }}" \
+            --title "v${{ needs.check.outputs.version }}" \
+            --notes-file release-notes.md \
+            --verify-tag
