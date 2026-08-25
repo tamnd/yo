@@ -138,12 +138,15 @@ unsafe fn crc32c_sse42(crc: u32, data: &[u8]) -> u32 {
         let v = u64::from_le_bytes([
             chunk[0], chunk[1], chunk[2], chunk[3], chunk[4], chunk[5], chunk[6], chunk[7],
         ]);
-        // SAFETY: sse4.2 is enabled for this function and checked by the caller.
-        c = unsafe { _mm_crc32_u64(c as u64, v) as u32 };
+        // No unsafe block. These intrinsics are safe to call from a function
+        // that carries the matching `#[target_feature]`, and wrapping them
+        // anyway is an unused_unsafe warning on x86, which CI treats as an
+        // error. The unsafety is at the call site in `crc32c`, where the
+        // runtime feature check lives.
+        c = _mm_crc32_u64(c as u64, v) as u32;
     }
     for &b in chunks.remainder() {
-        // SAFETY: same as above.
-        c = unsafe { _mm_crc32_u8(c, b) };
+        c = _mm_crc32_u8(c, b);
     }
     !c
 }
