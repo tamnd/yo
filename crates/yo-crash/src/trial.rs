@@ -621,6 +621,30 @@ mod tests {
     }
 
     #[test]
+    fn the_shape_that_caught_the_stale_page_tail() {
+        // Small pages and enough records to turn the ring several times, which
+        // is what it takes to get an old page's records sitting under a new
+        // page's flush block. Both of these failed before `yo-record` stopped
+        // sending the store the part of the block past the sentinel, and the
+        // default shape did not: a hundred thousand trials at 16 KiB pages went
+        // clean while this found it in the first thirty thousand.
+        let shape = Shape {
+            page_len: 8192,
+            records: 400,
+            ..Shape::default()
+        };
+        for seed in [26281u64, 31175] {
+            let out = run(seed, shape).unwrap();
+            assert!(
+                out.passed(),
+                "seed {seed}, fault {:?}: {:?}",
+                out.fault,
+                out.violations
+            );
+        }
+    }
+
+    #[test]
     fn the_trials_actually_reach_every_fault() {
         // A suite that passes because it never injected anything is the failure
         // mode worth guarding, so count what the seeds reached.
