@@ -774,11 +774,11 @@ dependencies = [
 
 [[package]]
 name = "yo-alloc"
-version = "0.0.0"
+version = "0.1.0"
 
 [[package]]
 name = "yo-arena"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "criterion",
  "libc",
@@ -788,14 +788,14 @@ dependencies = [
 
 [[package]]
 name = "yo-common"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "criterion",
 ]
 
 [[package]]
 name = "yo-index"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "criterion",
  "yo-alloc",
@@ -805,7 +805,7 @@ dependencies = [
 
 [[package]]
 name = "yo-shard"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "criterion",
  "libc",
