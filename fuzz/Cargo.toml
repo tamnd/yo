@@ -1,0 +1,55 @@
+[package]
+name = "yo-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+license = "MIT OR Apache-2.0"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+arbitrary = { version = "1", features = ["derive"] }
+yo-arena = { path = "../crates/yo-arena" }
+yo-common = { path = "../crates/yo-common" }
+yo-index = { path = "../crates/yo-index" }
+yo-shard = { path = "../crates/yo-shard" }
+
+[[bin]]
+name = "bucket"
+path = "fuzz_targets/bucket.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "arena"
+path = "fuzz_targets/arena.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "map"
+path = "fuzz_targets/map.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "lane"
+path = "fuzz_targets/lane.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "hash"
+path = "fuzz_targets/hash.rs"
+test = false
+doc = false
+bench = false
+
+[profile.release]
+debug = 1
