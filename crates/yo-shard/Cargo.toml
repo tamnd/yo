@@ -1,0 +1,28 @@
+[package]
+name = "yo-shard"
+description = "Shard per core runtime: single ownership, SPSC lanes, and per shard epochs."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+yo-alloc = { workspace = true }
+yo-common = { workspace = true }
+libc = { workspace = true }
+
+[dev-dependencies]
+criterion = { workspace = true }
+yo-index = { workspace = true }
+
+[lints]
+workspace = true
+
+[[bench]]
+name = "shard"
+harness = false
+
+[target.'cfg(loom)'.dev-dependencies]
+loom = { workspace = true }
