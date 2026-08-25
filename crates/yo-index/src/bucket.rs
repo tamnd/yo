@@ -68,11 +68,18 @@ impl Bucket {
     /// The seven tags and the flags byte, as one little endian word.
     #[inline(always)]
     fn tag_word(&self) -> u64 {
+        // The pointer has to come from the whole bucket rather than from
+        // `self.tags`. A pointer derived from a seven byte array carries
+        // provenance over seven bytes, and reading eight through it is
+        // undefined behaviour even though the eighth byte is the very next
+        // field of the same struct. Miri catches it under stacked borrows,
+        // nothing else does, and the two versions compile to the same load.
+        let base: *const u8 = core::ptr::from_ref(self).cast();
         // SAFETY: `Bucket` is `repr(C)` with `tags` at offset 0 followed by
-        // `flags`, so the first eight bytes are initialised and readable. An
-        // unaligned read is used because the compiler is free to pick either
-        // and this makes the intent explicit.
-        unsafe { self.tags.as_ptr().cast::<u64>().read_unaligned().to_le() }
+        // `flags`, so the first eight bytes are inside the bucket and are
+        // initialised. An unaligned read is used because the compiler is free
+        // to pick either and this makes the intent explicit.
+        unsafe { base.cast::<u64>().read_unaligned().to_le() }
     }
 
     /// A bitmask over the seven slots whose tag equals `tag`.
