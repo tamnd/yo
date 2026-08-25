@@ -72,7 +72,7 @@ fn generate() {
             fs::create_dir_all(dir).expect("could not make the output directory");
         }
         let same = fs::read_to_string(&dest)
-            .map(|old| old == text)
+            .map(|old| lf(&old) == text)
             .unwrap_or(false);
         fs::write(&dest, text)
             .unwrap_or_else(|e| panic!("could not write {}: {e}", dest.display()));
@@ -90,7 +90,7 @@ fn check() {
     for a in ARTIFACTS {
         let dest = root.join(a.path);
         let want = (a.render)();
-        match fs::read_to_string(&dest) {
+        match fs::read_to_string(&dest).map(|s| lf(&s)) {
             Ok(got) if got == want => println!("ok       {}", a.path),
             Ok(got) => {
                 println!("STALE    {}", a.path);
@@ -109,6 +109,17 @@ fn check() {
         eprintln!("Run `cargo xtask generate` and commit the result.");
         process::exit(1);
     }
+}
+
+/// Line endings, normalised to what the generator emits.
+///
+/// .gitattributes asks for an LF checkout everywhere, so on a correctly
+/// configured clone this changes nothing. It exists because a Windows clone
+/// with core.autocrlf set the other way turns every line into CRLF, and then
+/// this check fails on a difference that is not in the model and that the
+/// person reading the failure cannot see.
+fn lf(s: &str) -> String {
+    s.replace("\r\n", "\n")
 }
 
 /// Prints the first line that differs, because a whole diff of a generated file
@@ -154,6 +165,7 @@ mod tests {
         for a in ARTIFACTS {
             let dest = root.join(a.path);
             let got = fs::read_to_string(&dest)
+                .map(|s| lf(&s))
                 .unwrap_or_else(|_| panic!("{} is missing, run `cargo xtask generate`", a.path));
             assert_eq!(
                 got,

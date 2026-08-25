@@ -1,0 +1,18 @@
+# Line endings are LF in the repository and LF in the working tree, on every
+# platform. Two reasons, and the second one is the one that bites.
+#
+# api.model.json and include/yo.h are generated and then compared byte for byte
+# against the model by `cargo xtask check`. A Windows checkout that rewrites
+# every line ending fails that comparison for a reason that has nothing to do
+# with the model, and the failure message is unreadable because the difference
+# is invisible.
+#
+# The other reason is that a C header shipped to callers should be the same
+# file everywhere. A binding generator that hashes it should get one hash.
+* text=auto eol=lf
+
+# Things that are not text and must never be touched.
+*.png binary
+*.jpg binary
+*.ico binary
+*.yo binary
