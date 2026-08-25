@@ -642,6 +642,18 @@ mod tests {
                             *ctx.state += 1;
                         });
                     }
+                    // Sending only puts the job on a lane. Ordering is per lane
+                    // and a shard polls its lanes in turn, so a job this worker
+                    // sent can still be sitting there after the send returns,
+                    // and a count read through anybody else's lane would be
+                    // short. A call on this worker's own lane comes back only
+                    // once everything it put on that lane has run, so doing one
+                    // per shard before letting go is what makes the total below
+                    // an exact number rather than a race the test happens to
+                    // win on a quiet machine.
+                    for s in 0..4 {
+                        sub.call(s, |_| ());
+                    }
                     rt.release(sub);
                 })
             })

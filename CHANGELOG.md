@@ -6,7 +6,9 @@ While the major is 0, a minor release may break anything, including the on-disk 
 
 ## Unreleased
 
-Nothing yet.
+### Fixed
+
+- A `yo-shard` test counted jobs across four lanes through a fifth one and expected an exact total. Ordering is per lane and a shard polls its lanes in turn, so jobs sent on one lane can still be queued when a call on another lane comes back, and the count was short. It passed on a quiet machine for weeks and failed once on a loaded macOS runner. The test now waits on each lane it used. Nothing in the runtime changed: no job was ever lost, `send` spins until the lane takes it.
 
 ## 0.1.0 — 2026-08-25
 
