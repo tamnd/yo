@@ -36,6 +36,13 @@ pub const LOG_PAGE_LEN: u64 = 32 * 1024 * 1024;
 /// The header at the front of every log segment.
 pub const PAGE_HEADER_LEN: usize = 32;
 
+/// How many bytes of a segment hold records.
+///
+/// Log addresses are counted in payload bytes, not in file bytes, so a page
+/// address is always a multiple of this. That is the fact a checker leans on
+/// hardest: it turns "is this segment where it says it is" into arithmetic.
+pub const PAYLOAD_LEN: u64 = LOG_PAGE_LEN - PAGE_HEADER_LEN as u64;
+
 /// `YOLG`.
 pub const PAGE_MAGIC: u32 = 0x594f_4c47;
 
