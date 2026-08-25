@@ -1,0 +1,150 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  RUSTFLAGS: -D warnings
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # Formatting and lints first, so a run that is going to fail on style fails in
+  # under a minute instead of after the test matrix.
+  style:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2.9.2
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets --all-features
+
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2.9.2
+      - run: cargo test --workspace --locked
+      - run: cargo test --workspace --locked --release
+
+  # The floor stays green too. Held about six months behind stable, and the
+  # number lives in AUDIT-2026-08.md section 1 so there is one place to bump it.
+  msrv:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: dtolnay/rust-toolchain@1.94.0
+      - uses: Swatinem/rust-cache@v2.9.2
+      # rust-toolchain.toml pins the working toolchain, and it has to be out of
+      # the way for this job to test what it says it tests.
+      - run: rm rust-toolchain.toml
+      - run: cargo test --workspace --locked
+
+  # Every unsafe block in the workspace, interpreted. Miri is slow, so the
+  # arena's segment tests run at a reduced size through an environment variable
+  # rather than being skipped.
+  miri:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: miri
+      - uses: Swatinem/rust-cache@v2.9.2
+      - run: rm rust-toolchain.toml
+      - name: strict provenance and stacked borrows
+        run: cargo miri test --workspace --locked
+        env:
+          MIRIFLAGS: -Zmiri-strict-provenance -Zmiri-disable-isolation
+      # Tree borrows is stricter about aliasing than stacked borrows and catches
+      # a different class of mistake, so both are worth running.
+      - name: tree borrows
+        run: cargo miri test --workspace --locked
+        env:
+          MIRIFLAGS: -Zmiri-tree-borrows -Zmiri-disable-isolation
+
+  # The SPSC lane is the only lock free thing in the tree. Loom enumerates the
+  # interleavings a weak memory model allows rather than hoping the test machine
+  # produces the interesting one.
+  loom:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2.9.2
+      - run: cargo test -p yo-shard --release --locked --lib spsc::loom
+        env:
+          RUSTFLAGS: --cfg loom
+          LOOM_MAX_PREEMPTIONS: "3"
+
+  # Fuzz targets are built on every pull request and run briefly, so a target
+  # that stops compiling is caught the same day rather than the next time
+  # somebody remembers to run the fuzzer.
+  fuzz:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2.9.2
+      - run: rm rust-toolchain.toml
+      - run: cargo install cargo-fuzz --locked
+      - run: cargo fuzz build
+      - name: sixty seconds per target
+        run: |
+          for t in $(cargo fuzz list); do
+            cargo fuzz run "$t" -- -max_total_time=60 -rss_limit_mb=4096
+          done
+      - uses: actions/upload-artifact@v7.0.1
+        if: failure()
+        with:
+          name: fuzz-artifacts
+          path: fuzz/artifacts
+
+  # Documentation is part of the interface. A broken intra doc link is a broken
+  # link in the published API reference, so it fails the build.
+  docs:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2.9.2
+      - run: rm rust-toolchain.toml
+      - run: cargo doc --workspace --no-deps --all-features
+        env:
+          RUSTDOCFLAGS: -D warnings --cfg docsrs
+
+  # The benchmarks have to keep compiling and keep running. This does not
+  # measure anything, it runs one iteration of each so that a benchmark which
+  # panics or no longer builds is caught here rather than on the bench box.
+  bench-smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2.9.2
+      - run: cargo bench --workspace --locked -- --test
+
+  # Somebody with nothing but rustup should be able to clone and build. No
+  # cache, no toolchain file, no repository specific setup.
+  from-source:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo build --workspace --release --locked
+      - run: cargo test --workspace --release --locked --no-fail-fast
