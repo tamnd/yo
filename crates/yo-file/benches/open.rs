@@ -20,12 +20,20 @@ use yo_file::io as fio;
 use yo_file::{CreateOptions, REGION_LEN, Yo, region_offset};
 use yo_format::{PAGE_HEADER_LEN, PageHeader};
 
+/// Where the fixtures go, from `YO_BENCH_DIR` or the temporary directory. Open
+/// time is mostly the syscalls rather than the device, but a ramdisk still
+/// flatters it, so the knob is the same one the commit benchmark uses.
+fn bench_dir() -> PathBuf {
+    std::env::var_os("YO_BENCH_DIR").map_or_else(std::env::temp_dir, PathBuf::from)
+}
+
 /// A file with `regions` written regions, and its own path.
 struct Fixture(PathBuf);
 
 impl Fixture {
     fn new(name: &str, regions: u64, shards: u32) -> Fixture {
-        let mut p = std::env::temp_dir();
+        let mut p = bench_dir();
+        std::fs::create_dir_all(&p).expect("the benchmark directory");
         p.push(format!("yo-bench-open-{name}-{}.yo", std::process::id()));
         let _ = std::fs::remove_file(&p);
 
