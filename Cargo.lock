@@ -787,6 +787,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "yo-cli"
+version = "0.1.0"
+dependencies = [
+ "yo-file",
+ "yo-format",
+ "yo-reader",
+ "yo-record",
+]
+
+[[package]]
 name = "yo-common"
 version = "0.1.1"
 dependencies = [
