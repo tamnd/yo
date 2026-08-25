@@ -238,10 +238,20 @@ impl Reader {
     /// Every record in one region, in the order they were appended.
     ///
     /// Stops at the first zero length field, which is the end of what was
-    /// written, and stops at `used` whichever comes first. A record that will
-    /// not parse ends the walk with an error carrying the byte offset it was
-    /// at, because everything after a record of unknown length is unreachable:
-    /// the only way to find the next record is to trust this one's length.
+    /// written. A record that will not parse ends the walk with an error
+    /// carrying the byte offset it was at, because everything after a record of
+    /// unknown length is unreachable: the only way to find the next record is to
+    /// trust this one's length.
+    ///
+    /// The header's `used` field sizes the first read and nothing else. It is
+    /// not the limit of the walk, because it is written by the same flush as the
+    /// records and a crash can take one and leave the other. A file whose header
+    /// write was lost still has the records, and stopping at a stale `used`
+    /// would report fewer records than recovery is going to find, which is the
+    /// worst possible answer from a tool somebody is running because the
+    /// database will not start. The sentinel is the authority, which is also
+    /// what the engine's replay does, and the two agreeing is the entire point
+    /// of this crate existing.
     ///
     /// # Errors
     ///
@@ -256,26 +266,48 @@ impl Reader {
             .at(region.offset));
         }
         let used = region.header.used as usize;
-        if used == 0 {
-            return Ok(Vec::new());
-        }
+        let segment = LOG_PAGE_LEN as usize;
+
         // The sentinel that ends the walk lives just past the last record, so
-        // read four bytes more than `used` claims, and never more than the
-        // segment holds.
-        let want = (PAGE_HEADER_LEN + used + 4)
+        // ask for four bytes more than `used` claims. An undamaged file is the
+        // common case and this is the whole read.
+        let mut want = (PAGE_HEADER_LEN + used + 4)
             .next_multiple_of(READ_BLOCK)
-            .min(LOG_PAGE_LEN as usize);
+            .min(segment);
         let mut buf = vec![0u8; want];
         let got = rio::read_at(&self.file, region.offset, &mut buf)
             .map_err(|e| Error::from(e).at(region.offset))?;
         buf.truncate(got);
 
-        let end = (PAGE_HEADER_LEN + used).min(buf.len());
         let mut out = Vec::new();
         let mut at = PAGE_HEADER_LEN;
-        while at < end {
+        // A record needs its length field to be worth looking at, and a segment
+        // that ends without a sentinel ends here anyway.
+        while at + 4 <= segment {
+            // The read was sized from `used`, so the walk can arrive at a record
+            // that is only part way into the buffer. That is a short read, not a
+            // short record: ask for another block and look at the same offset
+            // again. Once the buffer holds everything the file has to give,
+            // `read_more` says so and the walk stops or the parse errors, which
+            // is the right answer at that point.
+            if at + 4 > buf.len() {
+                if self.read_more(region.offset, &mut buf, &mut want)? {
+                    continue;
+                }
+                break;
+            }
+            let len = u32::from_le_bytes([buf[at], buf[at + 1], buf[at + 2], buf[at + 3]]) as usize;
+            if len == 0 {
+                break;
+            }
+            if at + len > buf.len()
+                && buf.len() < segment
+                && self.read_more(region.offset, &mut buf, &mut want)?
+            {
+                continue;
+            }
             let here = region.offset + at as u64;
-            match parse_record(&buf[at..end]) {
+            match parse_record(&buf[at..]) {
                 Ok(Some(r)) => {
                     at += r.stride();
                     out.push(r);
@@ -285,6 +317,28 @@ impl Reader {
             }
         }
         Ok(out)
+    }
+
+    /// Reads one more block of a segment, and says whether that got any further.
+    ///
+    /// False means the buffer already holds everything the file has here, either
+    /// because the read reached the end of the segment or because the file stops
+    /// short of it. Either way there is nothing left to ask for.
+    fn read_more(&self, offset: u64, buf: &mut Vec<u8>, want: &mut usize) -> Result<bool> {
+        let segment = LOG_PAGE_LEN as usize;
+        if *want >= segment {
+            return Ok(false);
+        }
+        *want = (*want + READ_BLOCK).min(segment);
+        let mut more = vec![0u8; *want];
+        let got =
+            rio::read_at(&self.file, offset, &mut more).map_err(|e| Error::from(e).at(offset))?;
+        more.truncate(got);
+        if more.len() <= buf.len() {
+            return Ok(false);
+        }
+        *buf = more;
+        Ok(true)
     }
 
     /// Where the live slot starts in the file.
