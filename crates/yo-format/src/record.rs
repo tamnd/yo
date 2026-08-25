@@ -16,13 +16,31 @@
 //! `stride` desynchronises on the first odd sized value, which is why there is a
 //! test for exactly that.
 //!
-//! **The trailer.** `07` section 4 says a per record checksum lives in the
-//! record's own trailer for records marked durable, and the field table in `06`
-//! does not list one. This module reconciles them: [`record_flags::CHECKSUMMED`]
-//! is the mark, and when it is set the last four bytes of the record are a
-//! CRC32C over everything before them. It is a flag rather than always on
-//! because in `none` mode nobody is going to read the record back off a disk,
-//! and four bytes plus a checksum on a sixty byte record is real money.
+//! **The trailer, and why it is not optional.** `07` section 4 says a per
+//! record checksum lives in the record's own trailer for records marked
+//! durable, and the field table in `06` does not list one. This module
+//! reconciles them: [`record_flags::CHECKSUMMED`] is the mark, and when it is
+//! set the last four bytes of the record are a CRC32C over everything before
+//! them, `len` included.
+//!
+//! It started out as a real choice, on the reasoning that in `none` mode nobody
+//! reads the record back off a disk and four bytes on a sixty byte record is
+//! real money. That reasoning is wrong, and the way it is wrong is worth
+//! keeping written down, because it is the sort of thing that reads as
+//! reasonable right up until a fuzzer finds it.
+//!
+//! The flag lives in the record. So a single bit flip in the flags byte turns
+//! the check off, and with it off there is nothing left to notice that the bit
+//! flipped. Worse than undetected: clearing the bit also moves the trailer
+//! boundary, so those four checksum bytes become four bytes of value, and a
+//! reader hands back a value four bytes longer than the one that was stored and
+//! is confident about it. A self describing checksum cannot describe its own
+//! absence.
+//!
+//! So [`RecordRef::parse`] refuses a record with the bit clear rather than
+//! believing it, and [`RecordHeader::fill`] always sets it. The flag stays in
+//! the layout so a later version can define what an unchecksummed record means
+//! with a second bit that is itself covered by something.
 
 use crate::{align_up, get_u8, get_u16, get_u32, get_u64, put_u8, put_u16, put_u32, put_u64};
 use yo_common::{Code, Error, Result, crc32c};
@@ -55,6 +73,11 @@ pub mod record_flags {
     /// The collection this record belongs to has a shape tag in the catalogue.
     pub const SHAPE_TAGGED: u8 = 1 << 3;
     /// The last four bytes are a CRC32C over everything before them.
+    ///
+    /// Always set on anything this version writes, and a record with it clear
+    /// is rejected rather than read. See the note at the top of this module:
+    /// a checksum whose own presence is announced by an unprotected bit is not
+    /// a checksum.
     pub const CHECKSUMMED: u8 = 1 << 4;
 }
 
@@ -170,6 +193,12 @@ pub const fn header_len(flags: u8) -> usize {
 }
 
 /// The trailer length implied by `flags`.
+///
+/// Always [`TRAILER_LEN`] for anything this version will accept. The flag is
+/// still read, because a record with it clear has to be rejected rather than
+/// reinterpreted, and [`RecordRef::parse`] is where that happens. See the note
+/// on [`record_flags::CHECKSUMMED`] for why the flag cannot be allowed to mean
+/// what it says.
 #[inline]
 #[must_use]
 pub const fn trailer_len(flags: u8) -> usize {
@@ -239,36 +268,39 @@ impl RecordHeader {
     /// [`Code::Invalid`] for an oversized key, [`Code::Full`] if `buf` is too
     /// small for the record.
     pub fn fill(&self, buf: &mut [u8], key: &[u8], value: &[u8]) -> Result<usize> {
-        let n = total_len(self.flags, key.len(), value.len())?;
+        // Set rather than checked. A caller that built a header by hand and
+        // forgot the flag would otherwise write a record that this crate's own
+        // parser refuses, and failing at read time for a mistake made at write
+        // time is the worst place to put the error.
+        let flags = self.flags | record_flags::CHECKSUMMED;
+        let n = total_len(flags, key.len(), value.len())?;
         if buf.len() < n {
             return Err(
                 Error::new(Code::Full, "the record does not fit in the buffer")
                     .with_detail(format!("need={n} have={}", buf.len())),
             );
         }
-        let h = header_len(self.flags);
+        let h = header_len(flags);
         put_u8(buf, 4, self.kind);
-        put_u8(buf, 5, self.flags);
+        put_u8(buf, 5, flags);
         put_u16(buf, 6, key.len() as u16);
         put_u64(buf, 8, self.prev);
-        if self.flags & record_flags::HAS_TTL != 0 {
+        if flags & record_flags::HAS_TTL != 0 {
             put_u64(buf, 16, self.ttl_ms);
         }
         buf[h..h + key.len()].copy_from_slice(key);
         let v = h + key.len();
         buf[v..v + value.len()].copy_from_slice(value);
 
-        if self.flags & record_flags::CHECKSUMMED != 0 {
-            // The `len` field is part of what the trailer covers, and it is not
-            // in the buffer yet, so it is fed in from the value that is about to
-            // go there. Doing it any other way means either writing `len` early,
-            // which breaks the ordering rule, or leaving the length out of the
-            // checksum, which leaves the one field a torn write is most likely
-            // to damage unprotected.
-            let c = crc32c(0, &(n as u32).to_le_bytes());
-            let c = crc32c(c, &buf[4..n - TRAILER_LEN]);
-            put_u32(buf, n - TRAILER_LEN, c);
-        }
+        // The `len` field is part of what the trailer covers, and it is not in
+        // the buffer yet, so it is fed in from the value that is about to go
+        // there. Doing it any other way means either writing `len` early, which
+        // breaks the ordering rule, or leaving the length out of the checksum,
+        // which leaves the one field a torn write is most likely to damage
+        // unprotected.
+        let c = crc32c(0, &(n as u32).to_le_bytes());
+        let c = crc32c(c, &buf[4..n - TRAILER_LEN]);
+        put_u32(buf, n - TRAILER_LEN, c);
         Ok(n)
     }
 }
@@ -327,6 +359,16 @@ impl<'a> RecordRef<'a> {
             return Ok(None);
         }
         let flags = get_u8(bytes, 5);
+        if flags & record_flags::CHECKSUMMED == 0 {
+            // Not "this record has no checksum". There is no such record, so
+            // this is a flipped bit in the flags byte, and it has to be caught
+            // here because clearing this particular bit is the one corruption
+            // the checksum cannot catch: it turns the checksum off.
+            return Err(
+                Error::new(Code::Corrupt, "a record with its checksum flag clear")
+                    .with_detail(format!("flags={flags:#04x}")),
+            );
+        }
         let h = header_len(flags);
         let t = trailer_len(flags);
         let klen = get_u16(bytes, 6) as usize;
@@ -612,8 +654,12 @@ mod tests {
         }
     }
 
+    /// A caller that builds a header by hand and forgets the flag gets the
+    /// checksum anyway. The alternative is a record that this crate's own parser
+    /// refuses, which turns a mistake made at write time into a failure at read
+    /// time, and that is the worst place to put it.
     #[test]
-    fn an_unchecksummed_record_is_four_bytes_smaller_and_parses() {
+    fn a_header_written_without_the_checksum_flag_gets_one_anyway() {
         let h = RecordHeader {
             kind: RecordKind::String.as_u8(),
             flags: 0,
@@ -621,9 +667,21 @@ mod tests {
             ttl_ms: 0,
         };
         let buf = write(h, b"k", b"v");
-        assert_eq!(get_u32(&buf, 0) as usize, HEADER_LEN + 2);
+        assert_eq!(get_u32(&buf, 0) as usize, HEADER_LEN + 2 + TRAILER_LEN);
+        assert_ne!(get_u8(&buf, 5) & record_flags::CHECKSUMMED, 0);
         let r = RecordRef::parse(&buf).unwrap().unwrap();
         assert_eq!(r.value, b"v");
+    }
+
+    /// Clearing the flag is the one corruption a checksum cannot catch, because
+    /// what it corrupts is the checksum itself. So the flag being clear is
+    /// treated as damage rather than as a record that chose not to have one.
+    #[test]
+    fn a_record_with_its_checksum_flag_cleared_is_corruption() {
+        let mut buf = write(RecordHeader::new(RecordKind::String), b"key", b"value");
+        buf[5] &= !record_flags::CHECKSUMMED;
+        let err = RecordRef::parse(&buf).unwrap_err();
+        assert_eq!(err.code(), Code::Corrupt);
     }
 
     #[test]
