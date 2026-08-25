@@ -876,7 +876,7 @@ impl<S: PageSink> Log<S> {
 impl<S: PageSink + PageSource> Log<S> {
     /// A log that continues from `at`, wherever `at` is.
     ///
-    /// This is what recovery calls, with the address [`replay`](crate::replay)
+    /// This is what recovery calls, with the address [`replay`](crate::replay())
     /// stopped at. It differs from [`Log::open`] in exactly one way, and that
     /// way is the whole reason it exists: when `at` falls in the middle of a
     /// page, the records already in that page are read back from the store into
