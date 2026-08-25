@@ -3,6 +3,7 @@ resolver = "3"
 members = [
     "crates/yo-alloc",
     "crates/yo-arena",
+    "crates/yo-capi",
     "crates/yo-cli",
     "crates/yo-common",
     "crates/yo-crash",
@@ -12,6 +13,7 @@ members = [
     "crates/yo-reader",
     "crates/yo-record",
     "crates/yo-shard",
+    "xtask",
 ]
 # The fuzz targets need nightly and a libfuzzer link, so they are their own
 # package rather than a member that would break `cargo build --workspace`.
@@ -31,6 +33,7 @@ authors = ["tamnd <tamnd87@gmail.com>"]
 [workspace.dependencies]
 yo-alloc = { path = "crates/yo-alloc", version = "0.2.0" }
 yo-arena = { path = "crates/yo-arena", version = "0.2.0" }
+yo-capi = { path = "crates/yo-capi", version = "0.2.0" }
 yo-cli = { path = "crates/yo-cli", version = "0.2.0" }
 yo-common = { path = "crates/yo-common", version = "0.2.0" }
 yo-crash = { path = "crates/yo-crash", version = "0.2.0" }

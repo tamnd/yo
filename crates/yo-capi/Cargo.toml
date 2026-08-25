@@ -1,0 +1,22 @@
+[package]
+name = "yo-capi"
+description = "The frozen C ABI for yo, the embedded knowledge engine"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+
+[lib]
+# rlib for the workspace's own tests, cdylib for every binding that dlopens it,
+# staticlib for the ones that link it into their own artifact.
+crate-type = ["rlib", "cdylib", "staticlib"]
+
+[dependencies]
+yo-common.workspace = true
+yo-index.workspace = true
+
+[lints]
+workspace = true
