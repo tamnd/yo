@@ -1,0 +1,24 @@
+[package]
+name = "yo-index"
+description = "The 64 byte index bucket, tag prefiltered probing, and dashtable style growth."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+yo-alloc = { workspace = true }
+yo-arena = { workspace = true }
+yo-common = { workspace = true }
+
+[dev-dependencies]
+criterion = { workspace = true }
+
+[lints]
+workspace = true
+
+[[bench]]
+name = "probe"
+harness = false
