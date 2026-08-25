@@ -133,19 +133,19 @@ unsafe fn crc32c_sse42(crc: u32, data: &[u8]) -> u32 {
     use core::arch::x86_64::{_mm_crc32_u8, _mm_crc32_u64};
 
     let mut c = !crc;
-    let mut chunks = data.chunks_exact(8);
-    for chunk in &mut chunks {
-        let v = u64::from_le_bytes([
-            chunk[0], chunk[1], chunk[2], chunk[3], chunk[4], chunk[5], chunk[6], chunk[7],
-        ]);
+    // `as_chunks` rather than `chunks_exact`, because the chunk size is a
+    // constant and this way the length is one too. The compiler stops emitting
+    // the bounds check that the eight byte load does not need.
+    let (words, rest) = data.as_chunks::<8>();
+    for chunk in words {
         // No unsafe block. These intrinsics are safe to call from a function
         // that carries the matching `#[target_feature]`, and wrapping them
         // anyway is an unused_unsafe warning on x86, which CI treats as an
         // error. The unsafety is at the call site in `crc32c`, where the
         // runtime feature check lives.
-        c = _mm_crc32_u64(c as u64, v) as u32;
+        c = _mm_crc32_u64(c as u64, u64::from_le_bytes(*chunk)) as u32;
     }
-    for &b in chunks.remainder() {
+    for &b in rest {
         c = _mm_crc32_u8(c, b);
     }
     !c
