@@ -1,0 +1,19 @@
+[package]
+name = "yo-common"
+description = "Ids, the generated error model, wyhash and the CRC family for yo."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+criterion = { workspace = true }
+
+[[bench]]
+name = "hash"
+harness = false

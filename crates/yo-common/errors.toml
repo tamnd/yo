@@ -1,0 +1,119 @@
+# The single source of the error model.
+#
+# Every binding generates its error enum from this file: the Rust enum in
+# yo-common, the C `yo_code` enum in yo.h, the Python exception hierarchy, the
+# TypeScript literal union, the Go sentinel values, the Java sealed interface.
+# Adding a variant here and nowhere else is the whole point (dx/03 section 2).
+#
+# `code` is a wire value and is frozen once released. Never renumber, never
+# reuse a retired number.
+#
+# `retryable` says whether the same call, unchanged, could succeed later. It is
+# a property of the error and not of the call site, which is why it lives here
+# rather than in a caller's judgement (P5).
+
+[[error]]
+name = "Ok"
+code = 0
+c_name = "YO_OK"
+retryable = false
+doc = "Not an error. Present so that the C enum has a zero value that means success."
+
+[[error]]
+name = "ShapeMismatch"
+code = 1
+c_name = "YO_ERR_SHAPE_MISMATCH"
+retryable = false
+doc = "The type used to open a collection does not match the type the collection was created with. The message carries both shape descriptions in full, not just the tags."
+url = "https://yo.tamnd.dev/errors/shape-mismatch"
+
+[[error]]
+name = "Locked"
+code = 2
+c_name = "YO_ERR_LOCKED"
+retryable = true
+doc = "Another process holds the writer lock on this file. Exactly one writer per file."
+url = "https://yo.tamnd.dev/errors/locked"
+
+[[error]]
+name = "Busy"
+code = 3
+c_name = "YO_ERR_BUSY"
+retryable = true
+doc = "The handle has live children. Closing a parent with live children closes nothing."
+url = "https://yo.tamnd.dev/errors/busy"
+
+[[error]]
+name = "NotFound"
+code = 4
+c_name = "YO_ERR_NOT_FOUND"
+retryable = false
+doc = "The key, field, member or node does not exist. This is a value and not a failure, and the typed API returns an Option rather than this error wherever it can."
+
+[[error]]
+name = "WrongType"
+code = 5
+c_name = "YO_ERR_WRONG_TYPE"
+retryable = false
+doc = "The key holds a different data structure than the operation expects. This is Redis WRONGTYPE."
+url = "https://yo.tamnd.dev/errors/wrong-type"
+
+[[error]]
+name = "AbiMismatch"
+code = 6
+c_name = "YO_ERR_ABI_MISMATCH"
+retryable = false
+doc = "The header the caller compiled against and the library it loaded disagree. The message names both versions."
+url = "https://yo.tamnd.dev/errors/abi-mismatch"
+
+[[error]]
+name = "Corrupt"
+code = 7
+c_name = "YO_ERR_CORRUPT"
+retryable = false
+doc = "A checksum failed or a structure is self-inconsistent. The message names the offset and what was expected there."
+url = "https://yo.tamnd.dev/errors/corrupt"
+
+[[error]]
+name = "Full"
+code = 8
+c_name = "YO_ERR_FULL"
+retryable = false
+doc = "A bounded resource is exhausted: the address space, a fixed table, or a configured memory limit."
+
+[[error]]
+name = "Io"
+code = 9
+c_name = "YO_ERR_IO"
+retryable = true
+doc = "The operating system refused an operation. The detail field carries errno and the path."
+
+[[error]]
+name = "Unsupported"
+code = 10
+c_name = "YO_ERR_UNSUPPORTED"
+retryable = false
+doc = "The operation is valid but this build or this platform does not implement it. The message says which build would."
+
+[[error]]
+name = "Invalid"
+code = 11
+c_name = "YO_ERR_INVALID"
+retryable = false
+doc = "The arguments are wrong. The position field points at which one."
+
+[[error]]
+name = "EpochStalled"
+code = 12
+c_name = "YO_ERR_EPOCH_STALLED"
+retryable = true
+doc = "An iterator has been open long enough to hold back reclamation. Finish it or drop it. The message carries the iterator age in microseconds."
+url = "https://yo.tamnd.dev/errors/epoch-stalled"
+
+[[error]]
+name = "VersionTooNew"
+code = 13
+c_name = "YO_ERR_VERSION_TOO_NEW"
+retryable = false
+doc = "The file's min_reader_version is higher than this build supports. The message names both numbers and the release that would read it."
+url = "https://yo.tamnd.dev/errors/version-too-new"
