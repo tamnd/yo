@@ -58,25 +58,41 @@ jobs:
   # Every unsafe block in the workspace, interpreted. Miri is slow, so the
   # arena's segment tests run at a reduced size through an environment variable
   # rather than being skipped.
+  #
+  # Tree borrows is stricter about aliasing than stacked borrows and catches a
+  # different class of mistake, so both are worth running. They used to run one
+  # after the other in a single job and that job took over an hour, which is
+  # long enough that a pull request sits waiting on it after everything else has
+  # gone green. They have nothing to say to each other, so they run as two jobs
+  # and a pull request waits for the slower of the two rather than for the sum.
   miri:
+    name: miri (${{ matrix.borrows }} borrows)
     runs-on: ubuntu-latest
+    strategy:
+      # One model failing is a real finding and the other model's result is
+      # still worth having, so a failure does not cancel its sibling.
+      fail-fast: false
+      matrix:
+        include:
+          - borrows: stacked
+            flags: -Zmiri-strict-provenance -Zmiri-disable-isolation
+          - borrows: tree
+            flags: -Zmiri-tree-borrows -Zmiri-disable-isolation
     steps:
       - uses: actions/checkout@v7.0.1
       - uses: dtolnay/rust-toolchain@nightly
         with:
           components: miri
       - uses: Swatinem/rust-cache@v2.9.2
+        with:
+          # Both jobs build the same tree with the same nightly, so without a
+          # key of their own they would race for one cache entry and each keep
+          # evicting the other's.
+          key: ${{ matrix.borrows }}
       - run: rm rust-toolchain.toml
-      - name: strict provenance and stacked borrows
-        run: cargo miri test --workspace --locked
+      - run: cargo miri test --workspace --locked
         env:
-          MIRIFLAGS: -Zmiri-strict-provenance -Zmiri-disable-isolation
-      # Tree borrows is stricter about aliasing than stacked borrows and catches
-      # a different class of mistake, so both are worth running.
-      - name: tree borrows
-        run: cargo miri test --workspace --locked
-        env:
-          MIRIFLAGS: -Zmiri-tree-borrows -Zmiri-disable-isolation
+          MIRIFLAGS: ${{ matrix.flags }}
 
   # The SPSC lane is the only lock free thing in the tree. Loom enumerates the
   # interleavings a weak memory model allows rather than hoping the test machine
