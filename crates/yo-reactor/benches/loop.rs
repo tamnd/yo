@@ -98,7 +98,7 @@ impl Engine for Lookup {
         Some(self.hashes[*work as usize])
     }
 
-    fn prefetch(&self, hash: u64) {
+    fn prefetch(&self, _work: &Self::Work, hash: u64) {
         if self.warm {
             self.map.prefetch(hash);
         }

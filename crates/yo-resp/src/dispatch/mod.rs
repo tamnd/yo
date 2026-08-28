@@ -144,6 +144,21 @@ impl Server {
         &mut self.dbs[i]
     }
 
+    /// One database, by index, without taking it mutably.
+    ///
+    /// What the prefetch stage needs. It runs for all 64 commands in a batch
+    /// before any of them executes, so it cannot hold the mutable borrow `run`
+    /// is about to want, and it does not need one: warming a cache line reads
+    /// nothing and changes nothing.
+    ///
+    /// # Panics
+    ///
+    /// As [`Server::db`].
+    #[must_use]
+    pub fn db_ref(&self, i: usize) -> &Strings {
+        &self.dbs[i]
+    }
+
     /// Take a new clock reading and give it to every database.
     ///
     /// Once per turn of the event loop, which is the only place time moves. A

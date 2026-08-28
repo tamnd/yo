@@ -13,6 +13,7 @@ authors.workspace = true
 yo-alloc = { workspace = true }
 yo-common = { workspace = true }
 yo-kv = { workspace = true }
+yo-reactor = { workspace = true }
 
 [dev-dependencies]
 criterion = { workspace = true }
@@ -22,4 +23,8 @@ workspace = true
 
 [[bench]]
 name = "codec"
+harness = false
+
+[[bench]]
+name = "engine"
 harness = false

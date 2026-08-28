@@ -33,7 +33,7 @@
 //! impl Engine for Counting {
 //!     type Work = u64;
 //!     fn key_hash(&self, w: &u64) -> Option<u64> { Some(*w) }
-//!     fn prefetch(&self, _hash: u64) {}
+//!     fn prefetch(&self, _w: &u64, _hash: u64) {}
 //!     fn run(&mut self, w: u64, _hash: Option<u64>) -> Flow { self.0 += w; Flow::Next }
 //!     fn flush(&mut self) {}
 //! }
