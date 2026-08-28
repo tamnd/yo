@@ -681,6 +681,10 @@ WHAT = {
     "crates.io:yodb-sys": "the raw declarations for its C library",
     "crates.io:yodb-macros": "its procedural macros",
     "pypi:yodb": "its Python binding",
+    # Keyed on the bare name, so npm's row is `core` and not `@yodb/core`. The
+    # scope is the namespace field, which is where the exception in `dx/12` §2
+    # lives; putting it in the key here would have hidden it in a second place.
+    "npm:core": "its Node.js binding",
     "pub.dev:yodb": "its Dart binding",
     "maven-central:yodb": "its Java binding",
     "nuget:Yodb": "its .NET binding",
@@ -692,6 +696,15 @@ WHAT = {
 
 REPO = "https://github.com/tamnd/yo"
 
+# The version every placeholder carries, in every ecosystem, at any one time.
+#
+# It is one constant and not a per-registry choice because `dx/12` §4 says the
+# engine and every binding share one number, and a placeholder wave is the
+# cheapest possible place to start keeping that promise. It moved 0.0.0 -> 0.0.1
+# on 2026-08-29 to correct the sentence npm was serving; the reason npm could
+# not simply be corrected in place is in `b_npm`.
+PLACEHOLDER_VERSION = os.environ.get("YODB_PLACEHOLDER_VERSION", "0.0.1")
+
 # §6 rule 5: the README's second line is the milestone the real release lands
 # at, so a reader who finds the placeholder learns when it stops being one.
 MILESTONE = "The real release lands at milestone DX6 (M7). Until then this package does nothing."
@@ -699,10 +712,17 @@ MILESTONE = "The real release lands at milestone DX6 (M7). Until then this packa
 # §6 rule 6: one symbol, and it raises this. Same sentence in every language,
 # because a user who hits it in two ecosystems should not have to work out
 # whether they are two different problems.
-RAISES = (
-    "yo is not usable yet. This is a reserved placeholder at 0.0.0; "
-    "see " + REPO
-)
+#
+# The version is interpolated rather than written into the string. It used to
+# read "at 0.0.0", which was true when the only placeholder version was 0.0.0
+# and became a lie the first time one of them was republished. A sentence that
+# describes the artifact it ships in has to be built from that artifact's
+# version or it will eventually disagree with the file it lives in.
+def raises_for(version: str) -> str:
+    return (
+        f"yo is not usable yet. This is a reserved placeholder at {version}; "
+        f"see {REPO}"
+    )
 
 
 def desc_for(row) -> str:
@@ -720,7 +740,7 @@ PLACEHOLDER_DESC = DESC_FORM.format(what="its <language> binding")
 
 def cmd_plan(args) -> int:
     rows = load(args.file)
-    version = os.environ.get("YODB_PLACEHOLDER_VERSION", "0.0.0")
+    version = PLACEHOLDER_VERSION
     todo = [r for r in rows if r.reserve and r.state == FREE]
     skip = [r for r in rows if r.reserve and r.state in (RESERVED, RELEASED)]
     block = [r for r in rows if r.reserve and r.state == BLOCKED]
@@ -874,6 +894,7 @@ def redact(text: str) -> str:
 
 
 def b_crates(row, root, version, desc):
+    raises = raises_for(version)
     _w(root, "Cargo.toml", f"""
 [package]
 name = "{row.name}"
@@ -900,7 +921,7 @@ categories = ["database"]
 #![deny(missing_docs)]
 
 /// The message every placeholder in every ecosystem raises with.
-pub const NOT_YET: &str = "{RAISES}";
+pub const NOT_YET: &str = "{raises}";
 
 /// Opens a database. Always panics: this version is a reserved placeholder.
 ///
@@ -926,6 +947,7 @@ mod tests {{
 
 
 def b_pypi(row, root, version, desc):
+    raises = raises_for(version)
     _w(root, "pyproject.toml", f"""
 [project]
 name = "{row.name}"
@@ -964,7 +986,7 @@ __all__ = ["NOT_YET", "open"]
 __version__ = "{version}"
 
 #: The message every placeholder in every ecosystem raises with.
-NOT_YET = "{RAISES}"
+NOT_YET = "{raises}"
 
 
 def open(path):  # noqa: A001 — matches the API this will eventually have
@@ -987,6 +1009,7 @@ def open(path):  # noqa: A001 — matches the API this will eventually have
 
 
 def b_pub(row, root, version, desc):
+    raises = raises_for(version)
     _w(root, "pubspec.yaml", f"""
 name: {row.name}
 version: {version}
@@ -1009,7 +1032,7 @@ environment:
 library;
 
 /// The message every placeholder in every ecosystem raises with.
-const String notYet = '{RAISES}';
+const String notYet = '{raises}';
 
 /// Opens a database. Always throws: this version is a reserved placeholder.
 ///
@@ -1045,6 +1068,7 @@ def b_maven(row, root, version, desc):
     detached OpenPGP signature over every file, which is why §7 step 6's key
     exists at all.
     """
+    raises = raises_for(version)
     gid, aid = row.namespace, row.name
     pkg = f"{gid}.{aid}".replace("-", "")
     _w(root, "pom.xml", f"""
@@ -1158,7 +1182,7 @@ package {pkg};
 public final class Yo {{
 
   /** The message every placeholder in every ecosystem raises with. */
-  public static final String NOT_YET = "{RAISES}";
+  public static final String NOT_YET = "{raises}";
 
   private Yo() {{}}
 
@@ -1229,6 +1253,7 @@ def b_nuget(row, root, version, desc):
     resolution but the casing shown on the site is whatever the first publish
     used, so it is worth getting right once.
     """
+    raises = raises_for(version)
     # `dotnet pack` reads its metadata from the csproj, so there is no separate
     # nuspec. A nuspec alongside a csproj is also legal and silently wins, which
     # is a good way to publish metadata you thought you had edited.
@@ -1278,7 +1303,7 @@ namespace {row.name};
 public static class Yo
 {{
     /// <summary>The message every placeholder in every ecosystem raises with.</summary>
-    public const string NotYet = "{RAISES}";
+    public const string NotYet = "{raises}";
 
     /// <summary>Opens a database. Always throws: this version is a reserved placeholder.</summary>
     /// <param name="path">Ignored.</param>
@@ -1334,15 +1359,17 @@ def b_npm(row, root, version, desc):
     is exactly the check `dx/12` §1 is for and exactly the reason a builder that
     generates the text beats a person retyping it.
 
-    The already-published `@yodb/core@0.0.0` is not corrected by this. npm never
+    `@yodb/core@0.0.0` still carries the old sentence and always will. npm never
     lets a version number be reused, not even after an unpublish inside the
-    72-hour window, so the choice was between burning the number and leaving one
-    divergent string in one ecosystem. The divergence is recorded in `dx/16` §6
-    and this builder is what stops it recurring at the next publish.
+    72-hour window, so the correction went out as 0.0.1 rather than over the top
+    of it, and every other ecosystem was moved to 0.0.1 in the same wave so that
+    one version number still means one artifact everywhere. `dx/16` §6.2 has the
+    account.
 
     The package name is `@yodb/core`, the one exception to one-name-everywhere,
     so it is assembled from the row's namespace rather than from its name.
     """
+    raises = raises_for(version)
     pkg = f"{row.namespace}/{row.name}"
 
     _w(root, "package.json", json.dumps({
@@ -1374,7 +1401,7 @@ def b_npm(row, root, version, desc):
 // Calling something is what tells you where you are.
 
 /** The message every placeholder in every ecosystem raises with. */
-export const NOT_YET = "{RAISES}";
+export const NOT_YET = "{raises}";
 
 /**
  * Opens a database. Always throws: this version is a reserved placeholder.
@@ -1427,7 +1454,7 @@ NEEDS = {
 
 def cmd_apply(args) -> int:
     rows = load(args.file)
-    version = os.environ.get("YODB_PLACEHOLDER_VERSION", "0.0.0")
+    version = PLACEHOLDER_VERSION
     reg = args.registry
 
     if reg not in BUILDERS:
@@ -1451,9 +1478,27 @@ def cmd_apply(args) -> int:
     # for something that cannot happen. Every other registry keeps the strict
     # rule, because there `unknown` means the probe could not ask.
     ok_states = {FREE, UNKNOWN} if reg == "maven-central" else {FREE}
+    # --republish adds the names we already hold. It exists because correcting
+    # the text inside a placeholder means shipping a new version of it, and the
+    # alternative to a flag here was doing that publish by hand, which is the
+    # exact process that produced the divergent npm string in the first place.
+    if args.republish:
+        # A seatbelt, not a formality. This command publishes placeholders and
+        # nothing else, so it may only ever push a 0.0.x. Without the check, a
+        # stale environment variable pointing at 0.0.1 could be pushed over a
+        # real 1.x, and on npm and pub.dev that moves the `latest` tag to it.
+        if not PLACEHOLDER_VERSION.startswith("0.0."):
+            print(
+                f"refusing to republish at {PLACEHOLDER_VERSION}: this command "
+                f"only ships placeholders, so the version has to be a 0.0.x. A "
+                f"real release goes out through `dx/12` §5, not through here.",
+                file=sys.stderr,
+            )
+            return 2
+        ok_states = ok_states | {RESERVED, RELEASED}
     todo = [r for r in rows if r.reserve and r.registry == reg and r.state in ok_states]
     if not todo:
-        print(f"nothing to do for {reg}: no rows in state {FREE}.")
+        print(f"nothing to do for {reg}: no rows in state {'/'.join(sorted(ok_states))}.")
         return 0
 
     print(f"registry:  {reg}")
@@ -1612,6 +1657,13 @@ def main() -> int:
         "--yes", action="store_true",
         help="actually publish. Without it, everything is built and checked "
              "and nothing leaves the machine.",
+    )
+    ap_apply.add_argument(
+        "--republish", action="store_true",
+        help="also act on rows already in state `reserved`, to push a new "
+             "placeholder version over an older one. Off by default, because "
+             "the ordinary job of this command is claiming names that are free "
+             "and republishing by accident spends a version number forever.",
     )
     ap_apply.set_defaults(fn=cmd_apply)
     ap_docs = sub.add_parser("docs")
