@@ -1,0 +1,22 @@
+[package]
+name = "yo-crash"
+description = "Crash injection for the log: a hundred thousand faults, zero silent corruptions."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+yo-common = { workspace = true }
+yo-format = { workspace = true }
+yo-reader = { workspace = true }
+yo-record = { workspace = true }
+
+[[bin]]
+name = "yo-crash"
+path = "src/bin/yo-crash.rs"

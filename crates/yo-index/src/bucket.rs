@@ -428,8 +428,19 @@ mod tests {
                     b.set(i, (i as u8) + 1, Addr::new(Space::Arena, 16));
                 }
             }
-            for tag in 0u16..256 {
-                let tag = tag as u8;
+            // Every tag natively. Under Miri the tags that mean something plus
+            // the ones that exercise the high bit of the SWAR word, which is
+            // where a match either works or does not: a hundred and twenty
+            // eight patterns against two hundred and fifty six tags is thirty
+            // two thousand laps of an interpreter to prove something a couple
+            // of thousand already proves.
+            const MIRI_TAGS: [u8; 14] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 0x40, 0x7f, 0x80, 0xff];
+            let tags: Vec<u8> = if cfg!(miri) {
+                MIRI_TAGS.to_vec()
+            } else {
+                (0..=255u8).collect()
+            };
+            for tag in tags {
                 let want: Vec<usize> = (0..SLOTS).filter(|&i| b.tags[i] == tag).collect();
                 let got: Vec<usize> = b.match_tag(tag).collect();
                 assert_eq!(got, want, "pattern {pattern:#b} tag {tag}");

@@ -13,6 +13,16 @@ name: deep
 # hours and seventeen minutes and was killed by the runner's own six hour
 # ceiling, which is a long time to wait to be told nothing. A job that hangs
 # should say so while somebody is still awake.
+#
+# Reproducing a Miri shard locally is one shard at a time:
+#
+#     MIRIFLAGS="-Zmiri-strict-provenance -Zmiri-disable-isolation" \
+#       cargo +nightly miri nextest run --locked -p yo-record --test-threads 4 \
+#         -E 'not test(/^compact::/)'
+#
+# One at a time and not the whole matrix at once. Miri holds the interpreted
+# program's whole heap, and eleven of them side by side will take every
+# gigabyte a laptop has and start swapping, which looks like a hang and is one.
 
 on:
   schedule:
@@ -44,7 +54,40 @@ jobs:
     outputs:
       run: ${{ github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'deep') }}
       ref: ${{ github.event.inputs.ref || github.ref }}
+      shards: ${{ steps.shards.outputs.list }}
     steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          ref: ${{ github.event.inputs.ref || github.ref }}
+      # The Miri matrix is one job per crate, and the list comes from the
+      # manifest rather than from a copy of it kept in this file. A crate added
+      # next month gets interpreted without anybody remembering to come back
+      # here, which is the only way a list like this stays true.
+      #
+      # `yo-record` is the exception and gets two shards, because its compaction
+      # tests are half the crate on their own and there is a limit to how far
+      # they can shrink. A `page_len` under 8192 is refused by the log config,
+      # and the number of records is what decides how many pages leave the
+      # resident window, so below about eight hundred records there is no stable
+      # region left and the pass has nothing to walk. Splitting them off is
+      # worth 90 seconds against 55 locally even with nextest already running
+      # four at a time. If that crate ever stops being the slowest, this special
+      # case should go.
+      - id: shards
+        run: |
+          rm rust-toolchain.toml
+          # The filter is its own field rather than part of an args string. A
+          # nextest filter needs single quotes around it in the shell, and a
+          # single quote inside this jq program would close the program instead,
+          # which is a syntax error the runner reports six lines away from the
+          # cause. The run step below adds the quotes where they belong.
+          echo "list=$(cargo metadata --no-deps --format-version 1 | jq -c '
+            [ .packages[].name
+              | select(. != "yo-record")
+              | {id: ., pkg: ., filter: ""} ]
+            + [ {id: "yo-record-compact", pkg: "yo-record", filter: "test(/^compact::/)"},
+                {id: "yo-record-rest", pkg: "yo-record", filter: "not test(/^compact::/)"} ]
+            | sort_by(.id)')" >> "$GITHUB_OUTPUT"
       - run: echo "deep checks requested for ${{ github.event.inputs.ref || github.ref }}"
 
   # Every unsafe block in the workspace, interpreted. Miri is slow, so the
@@ -52,20 +95,38 @@ jobs:
   # rather than being skipped: the scale goes away, the coverage does not.
   #
   # Tree borrows is stricter about aliasing than stacked borrows and catches a
-  # different class of mistake, so both are worth running. They have nothing to
-  # say to each other, so they are two jobs and the wait is the slower of the
-  # two rather than the sum.
+  # different class of mistake, so both are worth running.
+  #
+  # `cargo miri test --workspace` walks the crates one after another, so the
+  # wait is the sum of all of them and the workspace is only ever as fast as
+  # every crate added together. One job per crate makes the wait the slowest
+  # single crate instead. Interpreting the whole tree costs the same either way,
+  # it just does not all happen on one runner.
+  #
+  # Run through nextest rather than the built in harness, which is what gets a
+  # shard down from the sum of its tests to the slowest one. `cargo miri test`
+  # is one process, and libtest's threads do not help because Miri interprets
+  # threads on a single core. nextest runs each test as its own process, so the
+  # four cores a runner has are four tests being interpreted at once: `yo-record`
+  # locally went from 322.7 seconds to 121.2 at 359 percent CPU. Four Miri
+  # processes on the heaviest crate peaked at 865 MB between them, so the
+  # parallelism costs memory in megabytes and buys minutes.
+  #
+  # nextest does not run doctests. They still run in `ci.yml` on every push, so
+  # what is lost is the doctests being interpreted, not the doctests.
   miri:
     needs: wanted
     if: needs.wanted.outputs.run == 'true'
-    name: miri (${{ matrix.borrows }} borrows)
+    name: miri (${{ matrix.borrows }}, ${{ matrix.shard.id }})
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    timeout-minutes: 25
     strategy:
-      # One model failing is a real finding and the other model's result is
-      # still worth having, so a failure does not cancel its sibling.
+      # One shard failing is a real finding and every other shard's result is
+      # still worth having, so a failure does not cancel its siblings.
       fail-fast: false
       matrix:
+        borrows: [stacked, tree]
+        shard: ${{ fromJSON(needs.wanted.outputs.shards) }}
         include:
           - borrows: stacked
             flags: -Zmiri-strict-provenance -Zmiri-disable-isolation
@@ -78,16 +139,39 @@ jobs:
       - uses: dtolnay/rust-toolchain@nightly
         with:
           components: miri
+      - uses: taiki-e/install-action@v2.87.0
+        with:
+          tool: cargo-nextest
       - uses: Swatinem/rust-cache@v2.9.2
         with:
-          # Both jobs build the same tree with the same nightly, so without a
-          # key of their own they would race for one cache entry and each keep
-          # evicting the other's.
-          key: ${{ matrix.borrows }}
+          # Every shard builds a different subset of the tree with the same
+          # nightly, so without a key of its own they would race for one cache
+          # entry and each keep evicting the others'.
+          key: ${{ matrix.borrows }}-${{ matrix.shard.id }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: rm rust-toolchain.toml
-      - run: cargo miri test --workspace --locked
+      # Pinned to four rather than left to follow the core count, so that a
+      # bigger runner cannot quietly turn this into sixteen interpreters and an
+      # out of memory kill that reads like a hang.
+      - run: |
+          if [ -n "${{ matrix.shard.filter }}" ]; then
+            cargo miri nextest run --locked -p ${{ matrix.shard.pkg }} --test-threads 4 -E '${{ matrix.shard.filter }}'
+          else
+            cargo miri nextest run --locked -p ${{ matrix.shard.pkg }} --test-threads 4
+          fi
         env:
           MIRIFLAGS: ${{ matrix.flags }}
+
+  # Twenty four shards is twenty four check names, which is more than a branch
+  # protection rule wants to know about. This is the one to require.
+  miri-done:
+    needs: [wanted, miri]
+    if: always() && needs.wanted.outputs.run == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - run: |
+          echo "miri: ${{ needs.miri.result }}"
+          test "${{ needs.miri.result }}" = success
 
   # Fuzz targets are built and run briefly, so a target that stops compiling is
   # caught the next morning rather than the next time somebody remembers to run
@@ -96,21 +180,33 @@ jobs:
     needs: wanted
     if: needs.wanted.outputs.run == 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v7.0.1
         with:
           ref: ${{ needs.wanted.outputs.ref }}
       - uses: dtolnay/rust-toolchain@nightly
+      - uses: taiki-e/install-action@v2.87.0
+        with:
+          tool: cargo-fuzz
       - uses: Swatinem/rust-cache@v2.9.2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: rm rust-toolchain.toml
-      - run: cargo install cargo-fuzz --locked
       - run: cargo fuzz build
-      - name: sixty seconds per target
+      # All five at once rather than one after another. Each is a minute and
+      # they used to be five minutes in a row for no reason: they share nothing
+      # and a runner has four cores sitting idle through four of those minutes.
+      - name: sixty seconds per target, all of them at once
         run: |
+          pids=""
           for t in $(cargo fuzz list); do
-            cargo fuzz run "$t" -- -max_total_time=60 -rss_limit_mb=4096
+            cargo fuzz run "$t" -- -max_total_time=60 -rss_limit_mb=2048 &
+            pids="$pids $!"
           done
+          rc=0
+          for p in $pids; do wait "$p" || rc=1; done
+          exit $rc
       - uses: actions/upload-artifact@v7.0.1
         if: failure()
         with:
@@ -127,7 +223,7 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 45
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v7.0.1
         with:
@@ -143,7 +239,7 @@ jobs:
     needs: wanted
     if: needs.wanted.outputs.run == 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v7.0.1
         with:
@@ -159,7 +255,7 @@ jobs:
     needs: wanted
     if: needs.wanted.outputs.run == 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v7.0.1
         with:
