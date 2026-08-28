@@ -13,6 +13,7 @@ pub mod error;
 pub mod num;
 pub mod prefetch;
 pub mod wyhash;
+pub mod xxh3;
 
 pub use addr::{ADDR_BITS, Addr, MAX_OFFSET, OFFSET_BITS, SPACE_BITS, ShardId, Space};
 pub use crc::{SLOT_COUNT, crc16, crc32c, hash_tag, slot_of};
@@ -20,6 +21,7 @@ pub use error::{Code, Error, Result};
 pub use num::{i64_len, parse_i64, push_double, push_i64, push_u64};
 pub use prefetch::{prefetch, prefetch_read};
 pub use wyhash::{hash_key, tag_of, wyhash};
+pub use xxh3::hash64;
 
 /// The size of an index bucket, and the cache line the engine is built around.
 ///

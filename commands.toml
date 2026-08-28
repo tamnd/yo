@@ -21,7 +21,7 @@
 # wire is one of:
 #   verified      the argument order is checked against a real Redis
 #   unverified    the storage half is done and the argument order is not settled
-#   none          no dispatch layer for it yet
+#   none          no dispatch layer for it yet, and none needed to check it
 #
 # divergent names a row in divergences.toml. A command that has one and names a
 # row that is not there fails the check.
@@ -30,13 +30,14 @@
 
 [[group]]
 name = "string"
-expected = 25
+expected = 26
 status = "shipped"
 doc = "08 section 2"
-# 12 section 3 says 28. Counting the group honestly gives 25 distinct names,
-# which is 22 classic ones plus 8.4's MSETEX and DELEX and 8.8's INCREX. The
-# extra three in the spec look like SUBSTR and the SET option forms being
-# counted separately. The spec number comes down at the M2 wrap up.
+# 12 section 3 says 28. A real Redis 8.8 answers COMMAND LIST FILTERBY ACLCAT
+# string with 26, which is 22 classic names plus 8.4's MSETEX, DELEX and DIGEST
+# and 8.8's INCREX. The extra two in the spec look like SUBSTR and the SET
+# option forms being counted separately. The spec number comes down to 26 at
+# the M2 wrap up.
 
 [[group]]
 name = "bitmap"
@@ -140,7 +141,7 @@ bounded = "inherent"
 status = "shipped"
 wire = "none"
 divergent = "D-8"
-notes = "One record written, one freed. NX, XX and IFEQ all decide against a single probe, and GET reports what that probe found whether or not the write went ahead."
+notes = "One record written, one freed. NX, XX and the four IF forms all decide against a single probe, and GET reports what that probe found whether or not the write went ahead. IFNE holds on a key that is not there, since a key that is not there is not equal to anything."
 
 [[command]]
 name = "GET"
@@ -382,9 +383,9 @@ arity = -4
 plan = "point"
 bounded = "inherent"
 status = "shipped"
-wire = "unverified"
+wire = "verified"
 divergent = "D-8"
-notes = "MSET with a deadline, and KEEPTTL is per key. The storage half is done. The argument order has to be checked against a real 8.4 before the dispatch layer ships it."
+notes = "MSETEX numkeys key value [key value ...] [NX|XX] [EX|PX|EXAT|PXAT|KEEPTTL], checked against a real 8.8. The condition is over the whole set: NX needs every key missing and XX needs every key present, and a partial match writes nothing. With no expiration option it clears the deadline the way plain SET does."
 
 [[command]]
 name = "DELEX"
@@ -394,16 +395,28 @@ arity = -2
 plan = "point"
 bounded = "inherent"
 status = "shipped"
-wire = "unverified"
-notes = "Compare and delete, the other half of SET IFEQ. The comparison is against the string the client would have read, so an int encoded 42 is equal to 42 and not to 042."
+wire = "verified"
+notes = "DELEX key [IFEQ v|IFNE v|IFDEQ d|IFDNE d], checked against a real 8.8. Compare and delete, the other half of SET IFEQ. The comparison is against the string the client would have read, so an int encoded 42 is equal to 42 and not to 042."
+
+[[command]]
+name = "DIGEST"
+group = "string"
+since = "8.4.0"
+arity = 2
+plan = "point"
+bounded = "inherent"
+status = "shipped"
+wire = "verified"
+notes = "The XXH3 of the value as sixteen hex characters. It exists so IFDEQ is worth using: a client comparing against a megabyte value sends eight bytes instead of the value. The number is bit for bit Redis's, checked against a real 8.8 at every length the algorithm branches on."
 
 [[command]]
 name = "INCREX"
 group = "string"
 since = "8.8.0"
-arity = -4
+arity = -2
 plan = "point"
 bounded = "inherent"
 status = "shipped"
-wire = "unverified"
-notes = "A windowed rate limiter in one command. The window starts only when the key was not there, so a burst inside one window expires together at the deadline the first call set rather than each call pushing it out."
+wire = "verified"
+divergent = "D-11"
+notes = "INCREX key [BYINT n|BYFLOAT f] [SATURATE] [LBOUND l] [UBOUND u] [EX|PX|EXAT|PXAT|PERSIST] [ENX], checked against a real 8.8. A counter with a bound, a saturation policy and four things it can do to the deadline. The reply is the value and the amount applied, and a refused increment reports zero applied and does not create the key."

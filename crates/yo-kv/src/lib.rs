@@ -17,12 +17,21 @@
 //!
 //! # What is here so far
 //!
-//! The string type, which is the first row of M2, and all 25 of its commands.
+//! The string type, which is the first row of M2, and all 26 of its commands.
 //! Lists, sets, hashes and the sorted set follow the same shape and land in M3.
+//!
+//! The four commands Redis added in 8.4 and 8.8 are the interesting ones and
+//! they were checked against a real 8.8 rather than written from the
+//! documentation. [`Strings::digest`] is the XXH3 of a value, and it is bit for
+//! bit Redis's number, which is what makes [`Compare::DigestEqual`] worth
+//! anything: a client comparing against a large value sends eight bytes instead
+//! of the value. [`Strings::increx`] is not the rate limiter it looks like at
+//! first, it is a counter with a bound, a saturation policy and four things it
+//! can do to the deadline, and the rate limiter is one setting of it.
 //!
 //! # Divergences
 //!
-//! Three, all recorded in `divergences.toml` rather than left to be discovered.
+//! Four, all recorded in `divergences.toml` rather than left to be discovered.
 //!
 //! A string is capped at [`strings::STRING_MAX`] rather than Redis's 512 MiB,
 //! because a value lives in one arena segment until the log backed band lands in
@@ -31,16 +40,23 @@
 //! again is maintenance slice work in M5. And `LCS` refuses a table over
 //! [`LCS_MAX_CELLS`], where Redis has no explicit limit and fails on the
 //! allocation instead, which on a server that has overcommitted is a kill rather
-//! than an error.
+//! than an error. And the float counters count in `f64` where Redis counts in
+//! the C `long double`, which is eighty bit on x86-64 and a hundred and twenty
+//! eight bit on aarch64, so Redis does not agree with itself across machines
+//! and we agree with ourselves everywhere.
 
 #![deny(missing_docs)]
 
 pub mod clock;
+pub mod cond;
+pub mod counter;
 pub mod lcs;
 pub mod strings;
 pub mod value;
 
 pub use clock::Clock;
+pub use cond::Compare;
+pub use counter::{Counted, IncrEx, IncrExpire, Num};
 pub use lcs::{Idx as LcsIdx, LCS_MAX_CELLS, Match as LcsMatch};
 pub use strings::{Exists, Expire, KEY_MAX, STRING_MAX, SetOptions, SetOutcome, Strings};
 pub use value::{EMBSTR_MAX, Encoding, Str};

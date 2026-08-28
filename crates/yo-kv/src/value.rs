@@ -202,6 +202,35 @@ impl Str<'_> {
             Str::Bytes(b) => parse_i64(b),
         }
     }
+
+    /// The XXH3 of the value's string form, which is Redis's `DIGEST`.
+    ///
+    /// An int encoded value hashes its digits and not the eight bytes the
+    /// record holds, because the digest a client compares against is the digest
+    /// of what a client would have read.
+    #[must_use]
+    pub fn digest(&self) -> u64 {
+        match self {
+            Str::Bytes(b) => yo_common::xxh3::hash64(b),
+            // Twenty bytes at the most, and the alternative is a second
+            // formatter that writes into a stack buffer for a path nobody calls
+            // in a loop.
+            Str::Int(_) => yo_common::xxh3::hash64(&self.to_vec()),
+        }
+    }
+
+    /// Whether this value's string form is exactly `want`.
+    ///
+    /// `IFEQ` compares against what the client would have read, so an int
+    /// encoded 42 is equal to `"42"` and not to `"042"`. Doing that without
+    /// materialising the digits is why the integer arm exists.
+    #[inline]
+    pub(crate) fn eq_bytes(&self, want: &[u8]) -> bool {
+        match self {
+            Str::Bytes(b) => *b == want,
+            Str::Int(n) => parse_i64(want) == Some(*n),
+        }
+    }
 }
 
 /// How many bytes a record holding this value will occupy.

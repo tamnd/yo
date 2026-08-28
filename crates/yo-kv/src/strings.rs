@@ -11,10 +11,11 @@
 //! matching on a value rather than on a string (P5).
 
 use crate::clock::Clock;
+use crate::cond::Compare;
+use crate::counter::{self, Counted, IncrEx, IncrExpire, Num};
 use crate::lcs;
 use crate::value::{self, Encoding, Str};
 use std::borrow::Cow;
-use yo_common::num::parse_i64;
 use yo_common::{Code, Error, Result};
 use yo_index::RawMap;
 
@@ -79,11 +80,12 @@ pub struct SetOptions<'a> {
     pub exists: Exists,
     /// `EX`, `PX`, `EXAT`, `PXAT` or `KEEPTTL`.
     pub expire: Expire,
-    /// `IFEQ`: store only if the current value is exactly these bytes.
+    /// `IFEQ`, `IFNE`, `IFDEQ` or `IFDNE`.
     ///
     /// Redis 8.4's compare and set. A missing key never compares equal, so
-    /// `IFEQ` on a key that is not there does not store.
-    pub compare: Option<&'a [u8]>,
+    /// `IFEQ` on a key that is not there does not store, and `IFNE` on one
+    /// does.
+    pub compare: Option<Compare<'a>>,
     /// `GET`: hand back what was there, whether or not the write happened.
     pub get: bool,
 }
@@ -118,10 +120,31 @@ impl<'a> SetOptions<'a> {
         self
     }
 
-    /// This, but only if the current value is exactly `bytes`.
+    /// This, but only if the current value is exactly `bytes`. `IFEQ`.
     #[must_use]
     pub const fn if_equal(mut self, bytes: &'a [u8]) -> SetOptions<'a> {
-        self.compare = Some(bytes);
+        self.compare = Some(Compare::Equal(bytes));
+        self
+    }
+
+    /// This, but only if the current value is not exactly `bytes`. `IFNE`.
+    #[must_use]
+    pub const fn if_not_equal(mut self, bytes: &'a [u8]) -> SetOptions<'a> {
+        self.compare = Some(Compare::NotEqual(bytes));
+        self
+    }
+
+    /// This, but only against a value whose digest is `d`. `IFDEQ`.
+    #[must_use]
+    pub const fn if_digest(mut self, d: u64) -> SetOptions<'a> {
+        self.compare = Some(Compare::DigestEqual(d));
+        self
+    }
+
+    /// This, but only against a value whose digest is not `d`. `IFDNE`.
+    #[must_use]
+    pub const fn if_not_digest(mut self, d: u64) -> SetOptions<'a> {
+        self.compare = Some(Compare::DigestNotEqual(d));
         self
     }
 
@@ -311,11 +334,13 @@ impl Strings {
 
     // ---------------------------------------------------------------- writing
 
-    /// `SET key value [NX|XX] [GET] [IFEQ old] [EX s|PX ms|EXAT s|PXAT ms|KEEPTTL]`.
+    /// `SET key value [NX|XX] [GET] [IFEQ v|IFNE v|IFDEQ d|IFDNE d]
+    /// [EX s|PX ms|EXAT s|PXAT ms|KEEPTTL]`.
     ///
     /// The order the conditions are tested in is Redis's: the key is looked at
-    /// once, `NX`, `XX` and `IFEQ` all decide against that one look, and `GET`
-    /// reports what was there whether or not the write went ahead.
+    /// once, `NX`, `XX` and the four `IF` forms all decide against that one
+    /// look, and `GET` reports what was there whether or not the write went
+    /// ahead.
     pub fn set(&mut self, key: &[u8], val: &[u8], opts: SetOptions<'_>) -> Result<SetOutcome> {
         check_len(key, val.len())?;
         self.reap(key);
@@ -334,8 +359,8 @@ impl Strings {
         };
         let matches = match opts.compare {
             // A key that is not there is not equal to anything, including the
-            // empty string.
-            Some(want) => present.is_some_and(|rec| value::read(rec).eq_bytes(want)),
+            // empty string, and the `NE` forms read that the other way round.
+            Some(c) => c.holds(present.map(value::read)),
             None => true,
         };
         if !allowed || !matches {
@@ -620,28 +645,44 @@ impl Strings {
         }
         let mut text = Vec::with_capacity(32);
         yo_common::num::push_double(&mut text, next);
-        self.store_raw(key, &text, deadline);
+        self.store_text(key, &text, deadline);
         Ok(next)
     }
 
     // ------------------------------------------------------------------- 8.4+
 
-    /// `MSETEX`, which is `MSET` with a deadline on every key it writes.
+    /// `MSETEX numkeys key value [key value ...] [NX|XX]
+    /// [EX s|PX ms|EXAT s|PXAT ms|KEEPTTL]`.
     ///
-    /// Redis 8.4. [`Expire::Keep`] leaves each key's own deadline alone, which
-    /// is what `KEEPTTL` means everywhere else, and [`Expire::Clear`] makes this
-    /// the same thing as [`Strings::mset`].
+    /// Redis 8.4. `MSET` with a condition and a shared deadline, and the
+    /// condition is over the whole set rather than per key: `NX` needs every
+    /// key to be missing and `XX` needs every one to be present, and a partial
+    /// match writes nothing and answers false. Without an expiration option the
+    /// deadline is cleared, the same way plain `SET` clears it, and
+    /// [`Expire::Keep`] is `KEEPTTL`, which leaves each key its own.
     ///
-    /// The argument order on the wire is not settled here. That is deliberate:
-    /// this is the storage half and it takes pairs and a deadline, and the order
-    /// the client writes them in is the dispatch layer's business and has to be
-    /// checked against a real 8.4 before it ships.
-    pub fn msetex(&mut self, pairs: &[(&[u8], &[u8])], expire: Expire) -> Result<()> {
+    /// A duplicate key inside one call is not an error and the last value wins.
+    pub fn msetex(
+        &mut self,
+        pairs: &[(&[u8], &[u8])],
+        exists: Exists,
+        expire: Expire,
+    ) -> Result<bool> {
         for &(k, v) in pairs {
             check_len(k, v.len())?;
         }
-        for &(k, v) in pairs {
+        for &(k, _) in pairs {
             self.reap(k);
+        }
+        let allowed = match exists {
+            Exists::Always => true,
+            Exists::IfMissing => pairs.iter().all(|&(k, _)| !self.map.contains(k)),
+            Exists::IfPresent => pairs.iter().all(|&(k, _)| self.map.contains(k)),
+        };
+        if !allowed {
+            return Ok(false);
+        }
+        for &(k, v) in pairs {
             let deadline = match expire {
                 Expire::Clear => None,
                 Expire::At(ms) => Some(ms),
@@ -649,10 +690,10 @@ impl Strings {
             };
             self.store(k, v, deadline);
         }
-        Ok(())
+        Ok(true)
     }
 
-    /// `DELEX`, which deletes a key only if its value is what the caller thinks.
+    /// `DELEX key [IFEQ v|IFNE v|IFDEQ d|IFDNE d]`.
     ///
     /// Redis 8.4's compare and delete, the other half of `SET ... IFEQ`. The
     /// point of it is the read modify write nobody was doing correctly: a client
@@ -661,57 +702,98 @@ impl Strings {
     /// plus `MULTI` costs a round trip to avoid it.
     ///
     /// `None` compares against nothing and deletes unconditionally, which is
-    /// plain `DEL` for one key.
-    pub fn delex(&mut self, key: &[u8], compare: Option<&[u8]>) -> bool {
+    /// plain `DEL` for one key. A key that is not there answers false whatever
+    /// the condition says, including the `NE` forms that a missing key
+    /// satisfies, because there is still nothing to delete.
+    pub fn delex(&mut self, key: &[u8], compare: Option<Compare<'_>>) -> bool {
         self.reap(key);
         let matches = match compare {
-            Some(want) => self
-                .map
-                .get(key)
-                .is_some_and(|rec| value::read(rec).eq_bytes(want)),
-            None => self.map.contains(key),
+            Some(c) => c.holds(self.peek(key)),
+            None => true,
         };
         matches && self.map.del(key)
     }
 
-    /// `INCREX`, a windowed rate limiter in one command.
+    /// `DIGEST key`, the XXH3 of the value.
+    ///
+    /// Redis 8.4, and the reason it exists is `IFDEQ`: a client that wants to
+    /// compare and swap against a large value sends eight bytes instead of the
+    /// value. `None` is a key that is not there, which is a nil reply.
+    pub fn digest(&mut self, key: &[u8]) -> Option<u64> {
+        self.reap(key);
+        self.peek(key).map(|v| v.digest())
+    }
+
+    /// `INCREX key [BYINT n|BYFLOAT f] [SATURATE] [LBOUND l] [UBOUND u]
+    /// [EX s|PX ms|EXAT s|PXAT ms|PERSIST] [ENX]`.
     ///
     /// Redis 8.8, and the first Redis primitive that implements a workload
-    /// rather than a data structure. The counter goes up by `by`, and the window
-    /// is started only when the key was not there, so a burst of a hundred calls
-    /// inside one window all expire together at the deadline the first one set
-    /// rather than each one pushing the deadline out.
+    /// rather than a data structure. What it replaces is `INCR` followed by
+    /// `EXPIRE`, which is two round trips, or a Lua script, which is one round
+    /// trip and a script cache.
     ///
-    /// The idiom this replaces is `INCR` followed by `EXPIRE ... NX`, which is
-    /// two round trips, or a Lua script, which is one round trip and a script
-    /// cache. Here it is one probe, and it is a single record operation the way
-    /// `08` section 2 says it should be.
+    /// The rate limiter is `INCREX key EX window ENX`: the counter goes up, and
+    /// the window is started only when the key had no deadline, so a burst
+    /// inside one window expires together at the deadline the first call set
+    /// rather than each call pushing it out. The quota counter is `UBOUND`
+    /// without `SATURATE`, which refuses rather than clamping and reports zero
+    /// applied. The stock level is `LBOUND 0 SATURATE`, which takes what it can.
     ///
-    /// Answers the count and the deadline the window ends at.
-    pub fn increx(&mut self, key: &[u8], by: i64, window_ms: i64) -> Result<(i64, u64)> {
-        if window_ms <= 0 {
-            return Err(invalid_expire("increx"));
-        }
+    /// A refused increment writes nothing at all: it does not create the key and
+    /// it does not touch the deadline of a key that was there.
+    pub fn increx(&mut self, key: &[u8], opts: IncrEx) -> Result<Counted> {
         check_len(key, 0)?;
         self.reap(key);
-        match self.map.get(key) {
-            // Inside a window that is already running, so the deadline it was
-            // given stands.
-            Some(rec) if value::expire_at(rec).is_some() => {
-                let deadline = value::expire_at(rec).expect("matched on Some just above");
-                let next = self.incrby(key, by)?;
-                Ok((next, deadline))
+
+        let (current, had_deadline) = match self.map.get(key) {
+            Some(rec) => {
+                let v = value::read(rec);
+                let now = if opts.by.is_int() {
+                    Num::Int(
+                        v.as_int()
+                            .ok_or_else(|| Error::new(Code::Invalid, NOT_AN_INT))?,
+                    )
+                } else {
+                    let text = v.to_vec();
+                    Num::Float(
+                        parse_f64(&text).ok_or_else(|| Error::new(Code::Invalid, NOT_A_FLOAT))?,
+                    )
+                };
+                (now, value::expire_at(rec))
             }
-            // A key with no deadline is a counter somebody else made, and a new
-            // window starts on it rather than it counting forever.
-            _ => {
-                let at = self.deadline_in(window_ms, "increx")?;
-                let next = self.incrby(key, by)?;
-                let bytes = self.peek(key).expect("just written").to_vec();
-                self.store(key, &bytes, Some(at));
-                Ok((next, at))
+            None => (
+                if opts.by.is_int() {
+                    Num::Int(0)
+                } else {
+                    Num::Float(0.0)
+                },
+                None,
+            ),
+        };
+
+        let out = counter::apply(current, &opts)?;
+        if !out.stored {
+            return Ok(out);
+        }
+
+        let deadline = match opts.expire {
+            IncrExpire::Keep => had_deadline,
+            IncrExpire::Persist => None,
+            IncrExpire::At(ms) => Some(ms),
+            IncrExpire::AtIfNone(ms) => had_deadline.or(Some(ms)),
+        };
+        match out.value {
+            Num::Int(n) => self.store_int(key, n, deadline),
+            Num::Float(f) => {
+                // Stored as text and never as an integer, for the same reason
+                // `INCRBYFLOAT` is: Redis reports `embstr` afterwards even when
+                // the number came out whole.
+                let mut text = Vec::with_capacity(32);
+                yo_common::num::push_double(&mut text, f);
+                self.store_text(key, &text, deadline);
             }
         }
+        Ok(out)
     }
 
     /// `LCS key1 key2`, the longest common subsequence itself.
@@ -789,11 +871,31 @@ impl Strings {
         });
     }
 
-    /// Store `val` under `key` as text, never as an integer.
+    /// Store `val` under `key` as text, choosing `embstr` or `raw` by length
+    /// but never int encoding it.
     ///
-    /// `APPEND`, `SETRANGE` and `INCRBYFLOAT` all leave a `raw` string behind in
-    /// Redis even when the result reads as a number, and `OBJECT ENCODING` is
-    /// tested on exactly that.
+    /// This is what the float counters do. `INCRBYFLOAT k 1` on `5` leaves `6`,
+    /// and a real server reports `embstr` for it and not `int`, because the
+    /// result went through Redis's own formatter and straight into a string
+    /// object without being offered to `tryObjectEncoding`.
+    fn store_text(&mut self, key: &[u8], val: &[u8], deadline: Option<u64>) {
+        let enc = if val.len() <= value::EMBSTR_MAX {
+            Encoding::Embstr
+        } else {
+            Encoding::Raw
+        };
+        let len = value::record_len(enc, val.len(), deadline.is_some());
+        self.map.set_with(key, len, |out| {
+            value::write_record(out, enc, val, deadline);
+        });
+    }
+
+    /// Store `val` under `key` as a `raw` string whatever its length.
+    ///
+    /// `APPEND` and `SETRANGE` both leave `raw` behind in Redis even for a four
+    /// byte result, because they build the value with `sdscatlen` and the
+    /// object never goes back through the encoder. `OBJECT ENCODING` is tested
+    /// on exactly that.
     fn store_raw(&mut self, key: &[u8], val: &[u8], deadline: Option<u64>) {
         let len = value::record_len(Encoding::Raw, val.len(), deadline.is_some());
         self.map.set_with(key, len, |out| {
@@ -821,24 +923,6 @@ impl Strings {
 impl Default for Strings {
     fn default() -> Strings {
         Strings::new()
-    }
-}
-
-impl Str<'_> {
-    /// Whether this value's string form is exactly `want`.
-    ///
-    /// Used by `IFEQ`, which compares against what the client would have read.
-    /// An int encoded 42 is equal to `"42"` and not to `"042"`, and doing this
-    /// without materialising the digits is why the integer arm exists.
-    #[inline]
-    fn eq_bytes(&self, want: &[u8]) -> bool {
-        match self {
-            Str::Bytes(b) => *b == want,
-            Str::Int(n) => match parse_i64(want) {
-                Some(w) => *n == w,
-                None => false,
-            },
-        }
     }
 }
 
@@ -1301,7 +1385,7 @@ mod tests {
         s.set_plain(b"n", b"5").unwrap();
         assert_eq!(s.incrbyfloat(b"n", 1.0).unwrap(), 6.0);
         assert_eq!(got(&mut s, b"n").as_deref(), Some(&b"6"[..]));
-        assert_eq!(s.encoding(b"n"), Some(Encoding::Raw));
+        assert_eq!(s.encoding(b"n"), Some(Encoding::Embstr));
 
         s.set_plain(b"t", b"hello").unwrap();
         let e = s.incrbyfloat(b"t", 1.0).unwrap_err();
@@ -1343,72 +1427,193 @@ mod tests {
     }
 
     #[test]
-    fn msetex_puts_the_same_deadline_on_every_key() {
+    fn msetex_writes_all_of_them_or_none() {
         let mut s = store();
         let pairs = [(&b"a"[..], &b"1"[..]), (&b"b"[..], &b"2"[..])];
-        s.msetex(&pairs, Expire::At(3_000)).unwrap();
+        assert!(s.msetex(&pairs, Exists::Always, Expire::At(3_000)).unwrap());
         assert_eq!(s.expire_at(b"a"), Some(3_000));
         assert_eq!(s.expire_at(b"b"), Some(3_000));
-        // KEEPTTL leaves each key with whatever it already had, which here is
-        // one key with a deadline and one without.
-        s.set_plain(b"b", b"9").unwrap();
-        s.msetex(&pairs, Expire::Keep).unwrap();
-        assert_eq!(s.expire_at(b"a"), Some(3_000));
+
+        // The condition is over the whole set. One key present is enough to
+        // stop NX, and one key missing is enough to stop XX, and neither
+        // writes anything on the way to finding out.
+        assert!(!s.msetex(&pairs, Exists::IfMissing, Expire::Clear).unwrap());
+        assert_eq!(s.expire_at(b"a"), Some(3_000), "a failed NX still wrote");
+        s.del(b"b");
+        assert!(!s.msetex(&pairs, Exists::IfPresent, Expire::Clear).unwrap());
+        assert!(!s.exists(b"b"), "a failed XX still wrote");
+        assert!(s.msetex(&pairs, Exists::IfMissing, Expire::Clear).is_ok());
+
+        // KEEPTTL leaves each key whatever it had, which here is one with a
+        // deadline and one without.
+        s.set(b"a", b"1", SetOptions::PLAIN.expiring(Expire::At(9_000)))
+            .unwrap();
+        assert!(s.msetex(&pairs, Exists::Always, Expire::Keep).unwrap());
+        assert_eq!(s.expire_at(b"a"), Some(9_000));
         assert_eq!(s.expire_at(b"b"), None);
-        assert_eq!(got(&mut s, b"b").as_deref(), Some(&b"2"[..]));
-        // And with no deadline at all it is MSET.
-        s.msetex(&pairs, Expire::Clear).unwrap();
+        // With no expiration option at all it clears, the way plain SET does.
+        assert!(s.msetex(&pairs, Exists::Always, Expire::Clear).unwrap());
         assert_eq!(s.expire_at(b"a"), None);
+    }
+
+    #[test]
+    fn msetex_lets_the_last_of_a_duplicated_key_win() {
+        let mut s = store();
+        let pairs = [(&b"k"[..], &b"1"[..]), (&b"k"[..], &b"2"[..])];
+        assert!(s.msetex(&pairs, Exists::Always, Expire::Clear).unwrap());
+        assert_eq!(got(&mut s, b"k").as_deref(), Some(&b"2"[..]));
     }
 
     #[test]
     fn delex_deletes_only_what_it_was_told_to() {
         let mut s = store();
         s.set_plain(b"k", b"v").unwrap();
-        assert!(!s.delex(b"k", Some(b"other")));
+        assert!(!s.delex(b"k", Some(Compare::Equal(b"other"))));
         assert!(s.exists(b"k"), "a failed compare deleted the key");
-        assert!(s.delex(b"k", Some(b"v")));
+        assert!(s.delex(b"k", Some(Compare::Equal(b"v"))));
         assert!(!s.exists(b"k"));
-        // A key that is not there compares equal to nothing at all.
-        assert!(!s.delex(b"k", Some(b"v")));
+        // A key that is not there has nothing to delete, including under the
+        // conditions a missing key satisfies.
+        assert!(!s.delex(b"k", Some(Compare::Equal(b"v"))));
+        assert!(!s.delex(b"k", Some(Compare::NotEqual(b"v"))));
         assert!(!s.delex(b"k", None));
         s.set_plain(b"k", b"v").unwrap();
         assert!(s.delex(b"k", None));
         // Int encoded, so the compare is against the digits.
         s.set_plain(b"n", b"42").unwrap();
-        assert!(!s.delex(b"n", Some(b"042")));
-        assert!(s.delex(b"n", Some(b"42")));
+        assert!(!s.delex(b"n", Some(Compare::Equal(b"042"))));
+        assert!(s.delex(b"n", Some(Compare::Equal(b"42"))));
     }
 
     #[test]
-    fn increx_starts_one_window_and_counts_inside_it() {
+    fn the_four_conditions_agree_with_a_real_server() {
         let mut s = store();
-        let (n, at) = s.increx(b"k", 1, 500).unwrap();
-        assert_eq!((n, at), (1, 1_500));
-        // Every call inside the window reports the deadline the first one set.
+        // SET IFNE on a key that is not there stores, because a key that is
+        // not there is not equal to anything.
+        assert!(
+            s.set(b"m", b"v", SetOptions::PLAIN.if_not_equal(b"other"))
+                .unwrap()
+                .stored
+        );
+        // The digest forms are the value forms with the value hashed.
+        let d = s.digest(b"m").expect("just written");
+        assert_eq!(d, yo_common::xxh3::hash64(b"v"));
+        assert!(
+            !s.set(b"m", b"x", SetOptions::PLAIN.if_not_digest(d))
+                .unwrap()
+                .stored
+        );
+        assert!(
+            s.set(b"m", b"x", SetOptions::PLAIN.if_digest(d))
+                .unwrap()
+                .stored
+        );
+        assert_eq!(got(&mut s, b"m").as_deref(), Some(&b"x"[..]));
+        assert_eq!(s.digest(b"gone"), None);
+        let d = s.digest(b"m").expect("still there");
+        assert!(s.delex(b"m", Some(Compare::DigestEqual(d))));
+    }
+
+    #[test]
+    fn increx_counts_and_leaves_the_deadline_alone() {
+        let mut s = store();
+        let c = s.increx(b"k", IncrEx::PLAIN).unwrap();
+        assert_eq!(
+            (c.value, c.applied, c.stored),
+            (Num::Int(1), Num::Int(1), true)
+        );
+        assert_eq!(s.expire_at(b"k"), None, "a plain INCREX set a deadline");
+        assert_eq!(s.encoding(b"k"), Some(Encoding::Int));
+
+        // An expiration option sets one, and a later plain call keeps it.
+        s.increx(b"k", IncrEx::PLAIN.expiring(IncrExpire::At(2_000)))
+            .unwrap();
+        assert_eq!(s.expire_at(b"k"), Some(2_000));
+        s.increx(b"k", IncrEx::PLAIN).unwrap();
+        assert_eq!(s.expire_at(b"k"), Some(2_000));
+        // PERSIST drops it.
+        s.increx(b"k", IncrEx::PLAIN.expiring(IncrExpire::Persist))
+            .unwrap();
+        assert_eq!(s.expire_at(b"k"), None);
+    }
+
+    #[test]
+    fn increx_with_enx_is_the_rate_limiter() {
+        let mut s = store();
+        // The window starts on the call that found no deadline, and every call
+        // inside it leaves the deadline where the first one put it.
+        let c = s
+            .increx(b"k", IncrEx::PLAIN.expiring(IncrExpire::AtIfNone(1_500)))
+            .unwrap();
+        assert_eq!(c.value, Num::Int(1));
+        assert_eq!(s.expire_at(b"k"), Some(1_500));
         s.clock_mut().set(1_200);
-        let (n, at) = s.increx(b"k", 1, 500).unwrap();
-        assert_eq!((n, at), (2, 1_500), "the window was pushed out");
+        let c = s
+            .increx(b"k", IncrEx::PLAIN.expiring(IncrExpire::AtIfNone(1_700)))
+            .unwrap();
+        assert_eq!(c.value, Num::Int(2));
+        assert_eq!(s.expire_at(b"k"), Some(1_500), "the window was pushed out");
         // Past the deadline the counter and the window both start again.
         s.clock_mut().set(1_500);
-        let (n, at) = s.increx(b"k", 1, 500).unwrap();
-        assert_eq!((n, at), (1, 2_000));
+        let c = s
+            .increx(b"k", IncrEx::PLAIN.expiring(IncrExpire::AtIfNone(2_000)))
+            .unwrap();
+        assert_eq!(c.value, Num::Int(1));
+        assert_eq!(s.expire_at(b"k"), Some(2_000));
         assert_eq!(s.expired_keys(), 1);
     }
 
     #[test]
-    fn increx_takes_over_a_counter_that_has_no_window() {
+    fn a_refused_increx_writes_nothing_at_all() {
         let mut s = store();
-        s.set_plain(b"k", b"5").unwrap();
-        let (n, at) = s.increx(b"k", 2, 250).unwrap();
-        assert_eq!((n, at), (7, 1_250));
-        assert_eq!(s.expire_at(b"k"), Some(1_250));
-        assert_eq!(s.encoding(b"k"), Some(Encoding::Int));
+        let quota = IncrEx::PLAIN
+            .by(Num::Int(10))
+            .between(None, Some(Num::Int(5)));
+        let c = s.increx(b"k", quota).unwrap();
+        assert_eq!(
+            (c.value, c.applied, c.stored),
+            (Num::Int(0), Num::Int(0), false)
+        );
+        assert!(!s.exists(b"k"), "a refused increment created the key");
 
-        assert!(s.increx(b"k", 1, 0).is_err());
-        assert!(s.increx(b"k", 1, -1).is_err());
+        // The same increment with SATURATE lands on the bound and does create
+        // it, which is the difference a client tells by the second number.
+        let c = s.increx(b"k", quota.saturating()).unwrap();
+        assert_eq!((c.value, c.applied), (Num::Int(5), Num::Int(5)));
+        assert!(s.exists(b"k"));
+
+        // A refusal on a key that was already there leaves its deadline alone.
+        s.set(b"q", b"1", SetOptions::PLAIN.expiring(Expire::At(4_000)))
+            .unwrap();
+        let c = s
+            .increx(b"q", quota.expiring(IncrExpire::At(9_000)))
+            .unwrap();
+        assert!(!c.stored);
+        assert_eq!(s.expire_at(b"q"), Some(4_000));
+        assert_eq!(got(&mut s, b"q").as_deref(), Some(&b"1"[..]));
+    }
+
+    #[test]
+    fn increx_by_float_stores_text_the_way_incrbyfloat_does() {
+        let mut s = store();
+        let c = s.increx(b"f", IncrEx::PLAIN.by(Num::Float(1.5))).unwrap();
+        assert_eq!((c.value, c.applied), (Num::Float(1.5), Num::Float(1.5)));
+        assert_eq!(got(&mut s, b"f").as_deref(), Some(&b"1.5"[..]));
+        // An int encoded key counted in floats stops being int encoded, which
+        // is what a real server reports afterwards.
+        s.set_plain(b"n", b"5").unwrap();
+        assert_eq!(s.encoding(b"n"), Some(Encoding::Int));
+        s.increx(b"n", IncrEx::PLAIN.by(Num::Float(0.5))).unwrap();
+        assert_eq!(s.encoding(b"n"), Some(Encoding::Embstr));
+        assert_eq!(got(&mut s, b"n").as_deref(), Some(&b"5.5"[..]));
+    }
+
+    #[test]
+    fn increx_refuses_a_value_that_is_not_a_number() {
+        let mut s = store();
         s.set_plain(b"t", b"hello").unwrap();
-        assert!(s.increx(b"t", 1, 100).is_err());
+        assert!(s.increx(b"t", IncrEx::PLAIN).is_err());
+        assert!(s.increx(b"t", IncrEx::PLAIN.by(Num::Float(1.0))).is_err());
     }
 
     #[test]
