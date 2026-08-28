@@ -764,6 +764,26 @@ mod tests {
         assert_eq!(sink.in_flight(), 0, "the read left something outstanding");
     }
 
+    /// Turns the loop until the sink says `upto` is durable, and gives up
+    /// rather than hanging if it never gets there.
+    ///
+    /// How many turns that takes is a property of the backend and not of the
+    /// caller. The portable one does the write and the fsync inside the call
+    /// that submits them, so the first poll after a sync already has the
+    /// answer. Real io_uring needs at least two: one to pick the write
+    /// completion up, which is what lets the fsync go out at all, and another
+    /// to pick the fsync completion up. A test that polls once is a test that
+    /// only passes off Linux, which is how this one first went out.
+    fn poll_until_durable(sink: &mut LogFile, upto: u64) {
+        for _ in 0..100_000 {
+            sink.poll().unwrap();
+            if sink.durable_upto() >= upto {
+                return;
+            }
+        }
+        panic!("polled to the cap and {upto} is still not durable");
+    }
+
     /// A sync in ring mode is a request, not an answer. Nothing is durable
     /// until the poll that picks the fsync up.
     #[test]
@@ -781,8 +801,7 @@ mod tests {
             0,
             "a sync that has not landed is not one"
         );
-        sink.poll().unwrap();
-        assert_eq!(sink.durable_upto(), 64);
+        poll_until_durable(&mut sink, 64);
 
         // And an idle shard still does not touch the device.
         for _ in 0..10 {
@@ -836,7 +855,13 @@ mod tests {
 
             log.advance_epoch();
             log.commit_pending().unwrap();
-            log.poll().unwrap();
+            let last = parked.iter().copied().max().unwrap();
+            for _ in 0..100_000 {
+                log.poll().unwrap();
+                if log.durable_upto() >= last {
+                    break;
+                }
+            }
             assert!(
                 parked.iter().all(|&at| at <= log.durable_upto()),
                 "somebody is still parked after the commit landed"
