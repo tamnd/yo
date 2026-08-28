@@ -49,12 +49,17 @@ pub trait Engine {
     /// hashed once per batch rather than once per walk.
     fn key_hash(&self, work: &Self::Work) -> Option<u64>;
 
-    /// Ask the cache for whatever `run` is about to load for this hash.
+    /// Ask the cache for whatever `run` is about to load for this work.
     ///
     /// Usually one call to the index's own prefetch. It has to be cheap and it
     /// has to read nothing, because it runs for all 64 commands before the
     /// first one executes.
-    fn prefetch(&self, hash: u64);
+    ///
+    /// The work comes with the hash because a hash on its own does not say
+    /// which structure to warm. Two commands in one batch can carry the same
+    /// key into different databases, and later into different types, so the
+    /// engine needs the command to know which index the bucket is in.
+    fn prefetch(&self, work: &Self::Work, hash: u64);
 
     /// Execute one command.
     ///
@@ -316,7 +321,7 @@ impl<E: Engine> Reactor<E> {
             for w in &self.pending {
                 let h = self.engine.key_hash(w);
                 if let Some(h) = h {
-                    self.engine.prefetch(h);
+                    self.engine.prefetch(w, h);
                 }
                 self.hashes.push(h);
             }
@@ -403,7 +408,7 @@ impl<E: Engine> Reactor<E> {
         self.epochs.enter(self.id);
         let hash = self.engine.key_hash(&work);
         if let Some(h) = hash {
-            self.engine.prefetch(h);
+            self.engine.prefetch(&work, h);
         }
         let flow = self.engine.run(work, hash);
         self.epochs.leave(self.id);
@@ -434,7 +439,7 @@ impl<E: Engine> Reactor<E> {
         for w in &self.pending {
             let h = self.engine.key_hash(w);
             if let Some(h) = h {
-                self.engine.prefetch(h);
+                self.engine.prefetch(w, h);
             }
             self.hashes.push(h);
         }
@@ -580,7 +585,7 @@ mod tests {
             if *work == KEYLESS { None } else { Some(*work) }
         }
 
-        fn prefetch(&self, hash: u64) {
+        fn prefetch(&self, _work: &u64, hash: u64) {
             self.push(Step::Prefetch(hash));
         }
 

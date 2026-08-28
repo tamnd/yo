@@ -80,21 +80,43 @@
 //! # Ok::<(), yo_resp::ProtocolError>(())
 //! ```
 //!
+//! # Driving it from the loop
+//!
+//! [`engine`] is the piece between the two: connections, read buffers, framing
+//! and one write per connection per batch, put on `yo_reactor::Engine` so the
+//! loop can run commands without knowing what a command is. It is where a
+//! server becomes possible, and it works over anything that implements
+//! [`engine::Sink`], which is a socket in production and a `Vec` in a test.
+//!
+//! ```
+//! use yo_reactor::Reactor;
+//! use yo_resp::engine::{Recorder, Wire, pump};
+//!
+//! let mut r = Reactor::inline(Wire::new(Recorder::new()));
+//! let conn = r.engine_mut().accept();
+//!
+//! r.engine_mut().feed(conn, b"*1\r\n$4\r\nPING\r\n");
+//! pump(&mut r, &mut Vec::new());
+//! assert_eq!(r.engine().sink().sent(conn), b"+PONG\r\n");
+//! ```
+//!
 //! # What is not here
 //!
-//! Connections, sockets, and buffers that grow themselves. This crate turns
-//! bytes into arguments, runs them, and turns values into bytes. The reactor
-//! owns the sockets and `04` section 7 owns the reactor.
+//! Sockets. This crate turns bytes into arguments, runs them, turns values into
+//! bytes, and says which connection they belong to. Reading and writing the
+//! bytes themselves is the ring's job, and `04` section 7 owns the ring.
 
 #![deny(missing_docs)]
 
 pub mod dispatch;
+pub mod engine;
 pub mod error;
 pub mod frame;
 pub mod proto;
 pub mod reply;
 pub mod request;
 
+pub use engine::{Cmd, ConnId, Sink, Wire};
 pub use error::ProtocolError;
 pub use frame::Frame;
 pub use proto::{Limits, Proto};
