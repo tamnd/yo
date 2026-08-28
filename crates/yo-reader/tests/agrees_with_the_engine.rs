@@ -207,8 +207,13 @@ fn the_two_checksums_are_the_same_function() {
     // CPU instruction where it has one. If these ever disagree, every checksum
     // in the file is a coin flip, so it is worth checking over more than the
     // one published test vector.
+    //
+    // Each lap checksums the whole buffer again, so this is quadratic in the
+    // length and Miri feels every byte of it. A hundred and twenty bytes still
+    // crosses the eight and sixteen byte chunking boundaries both
+    // implementations have, which is where a disagreement would live.
     let mut data = Vec::new();
-    for n in 0..600usize {
+    for n in 0..if cfg!(miri) { 120usize } else { 600usize } {
         data.push((n * 31 + 7) as u8);
         assert_eq!(
             yo_reader::crc::crc32c(0, &data),

@@ -596,8 +596,19 @@ mod tests {
 
     #[test]
     fn a_trial_is_the_same_trial_every_time_it_runs() {
-        let a = run(4242, Shape::default()).unwrap();
-        let b = run(4242, Shape::default()).unwrap();
+        // A smaller shape under Miri. Determinism is a property of the seed
+        // and the code, not of the size, so two hundred records prove no more
+        // than forty do and cost five times as much to interpret.
+        let shape = if cfg!(miri) {
+            Shape {
+                records: 40,
+                ..Shape::default()
+            }
+        } else {
+            Shape::default()
+        };
+        let a = run(4242, shape).unwrap();
+        let b = run(4242, shape).unwrap();
         assert_eq!(a.fault, b.fault);
         assert_eq!(a.written, b.written);
         assert_eq!(a.acknowledged, b.acknowledged);

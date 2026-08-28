@@ -251,14 +251,24 @@ mod tests {
     /// is the shape a benchmark loop produces.
     #[test]
     fn sequential_keys_spread_over_buckets() {
-        let buckets = 1024usize;
+        // What both assertions actually depend on is the ratio of keys to
+        // buckets, not the size of either. A hundred keys per bucket is what
+        // makes an empty bucket damning and three times the mean a real
+        // outlier, so Miri keeps the ratio and shrinks the table. Sixty four
+        // buckets and sixty four hundred keys is the same claim about the same
+        // low bits at a fifteenth of the interpreted work.
+        let (buckets, keys): (usize, u32) = if cfg!(miri) {
+            (64, 6_400)
+        } else {
+            (1024, 100_000)
+        };
         let mut counts = vec![0u32; buckets];
-        for i in 0..100_000u32 {
+        for i in 0..keys {
             let k = format!("key:{i}");
             counts[(hash_key(k.as_bytes()) as usize) & (buckets - 1)] += 1;
         }
         let max = *counts.iter().max().unwrap();
-        let mean = 100_000 / buckets as u32;
+        let mean = keys / buckets as u32;
         assert!(max < mean * 3, "worst bucket {max} against mean {mean}");
         assert!(counts.iter().all(|&c| c > 0), "some bucket got nothing");
     }

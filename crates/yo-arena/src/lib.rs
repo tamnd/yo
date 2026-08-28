@@ -501,7 +501,12 @@ mod tests {
         let addrs: Vec<Addr> = (0..100).map(|_| a.put(&chunk).unwrap()).collect();
         assert!(a.segment_count() > 1, "never grew");
         for addr in addrs {
-            assert!(a.get(addr, chunk.len()).iter().all(|&b| b == 7));
+            // Compared as slices rather than with a byte at a time loop. Both
+            // check all six megabytes, but slice equality on bytes bottoms out
+            // in memcmp, which Miri runs as a shim instead of interpreting, and
+            // that is the difference between this test taking four minutes
+            // under Miri and taking seconds. Nothing is skipped to get it.
+            assert_eq!(a.get(addr, chunk.len()), chunk.as_slice());
         }
     }
 
