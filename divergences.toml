@@ -1,0 +1,88 @@
+# The divergence register.
+#
+# Every place yo is knowingly not Redis, in one file, machine readable, checked
+# by `cargo xtask check`. This exists because the alternative, a compatibility
+# claim with unlisted exceptions, is how every Redis compatible product loses
+# its users' trust exactly once.
+#
+# A new divergence needs a row here in the same commit that creates it. Any
+# command marked `divergent = true` in commands.toml must name a row that is in
+# this file, and every row here must be named by something, so a divergence
+# cannot be added and then quietly forgotten and a row cannot outlive the thing
+# it described.
+#
+# `status` is one of:
+#   permanent   this is the design, and it is not going to change
+#   until        it goes away when the milestone named in `resolved_by` lands
+
+[[divergence]]
+id = "D-1"
+title = "OBJECT ENCODING returns skiplist for a counted B+ tree"
+reason = "The string is an encoding name that clients test for, not a structural claim. Returning a novel string breaks tools for no benefit."
+status = "permanent"
+spec = "12 section 2"
+
+[[divergence]]
+id = "D-2"
+title = "VLINKS returns partition neighbours in permissive mode"
+reason = "There is no HNSW graph to walk, so there are no layer by layer links to report. The partition neighbours are the honest answer to the question the command is asking."
+status = "permanent"
+spec = "10 section 9"
+
+[[divergence]]
+id = "D-3"
+title = "GRAPH.QUERY is not supported"
+reason = "By decision. The whole point of the product is that there is no query language to learn, so shipping one anyway to claim a compatibility box would be shipping the thing we said we would not."
+status = "permanent"
+spec = "11 section 7"
+
+[[divergence]]
+id = "D-4"
+title = "DEBUG subcommands outside the tested subset return ERR"
+reason = "They are internal to Redis's implementation and several of them report on structures that do not exist here."
+status = "permanent"
+spec = "12 section 10"
+
+[[divergence]]
+id = "D-5"
+title = "CONFIG parameters with no yo analogue are accepted and ignored"
+reason = "CONFIG GET returns the stored value, so configuration management tools round trip. Refusing them instead would break every tool that writes a whole config file."
+status = "permanent"
+spec = "12 section 10"
+
+[[divergence]]
+id = "D-6"
+title = "MEMORY USAGE reports yo's own accounting"
+reason = "The numbers are smaller and they are real. The method is documented rather than the number being adjusted to look like Redis's."
+status = "permanent"
+spec = "12 section 10"
+
+[[divergence]]
+id = "D-7"
+title = "Latency characteristics differ under SPOP, LPOP and LINSERT"
+reason = "They are faster. Listed because a test that asserts a shape of latency rather than a bound on it may notice."
+status = "permanent"
+spec = "12 section 10"
+
+[[divergence]]
+id = "D-8"
+title = "A string is capped just under 2 MiB rather than at 512 MiB"
+reason = "A value lives in one arena segment and the arena hands out at most one segment in one piece. A value past the cap is a YO_ERR_FULL carrying Redis's own message, not a panic."
+status = "until"
+resolved_by = "M5"
+spec = "06 section 2"
+
+[[divergence]]
+id = "D-9"
+title = "Expiry is lazy only"
+reason = "A key past its deadline is dropped when something touches it, at the exact millisecond. A key nobody ever touches again holds its memory until the active cycle in the maintenance slice lands."
+status = "until"
+resolved_by = "M5"
+spec = "14 section 1"
+
+[[divergence]]
+id = "D-10"
+title = "LCS refuses a table larger than 64 million cells"
+reason = "Redis has no explicit limit and fails on the allocation instead, which on a server that has overcommitted is a kill rather than an error. LCS on two large strings is the easiest accidental denial of service in the string group, so the limit is a number and the failure is the same failure on every machine."
+status = "permanent"
+spec = "08 section 2"

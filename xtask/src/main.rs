@@ -10,12 +10,21 @@
 //! `check` is what CI runs. Generated files are checked in so that a binding
 //! generator does not need a Rust toolchain to read the model, and the diff check
 //! is what stops checked in from turning into stale.
+//!
+//! `check` also reads the two registry files. `commands.toml` is the command
+//! audit and it gates: a command with no storage plan does not ship.
+//! `divergences.toml` is the register of every place yo is knowingly not Redis,
+//! and a command that claims a divergence has to name a row that is in it. Both
+//! rules are in `12` sections 3 and 10, and neither is worth writing down
+//! unless something enforces it.
 
 mod emit_header;
 mod emit_model;
 mod errors;
 mod json;
 mod model;
+mod registry;
+mod toml;
 
 use std::path::{Path, PathBuf};
 use std::{fs, process};
@@ -86,7 +95,7 @@ fn generate() {
 
 fn check() {
     let root = root();
-    let mut bad = Vec::new();
+    let mut bad: Vec<&str> = Vec::new();
     for a in ARTIFACTS {
         let dest = root.join(a.path);
         let want = (a.render)();
@@ -103,10 +112,29 @@ fn check() {
             }
         }
     }
+    let registry = registry::problems();
+    if registry.is_empty() {
+        println!("ok       commands.toml and divergences.toml");
+    } else {
+        println!("BAD      commands.toml and divergences.toml");
+        for p in &registry {
+            println!("  {p}");
+        }
+    }
+
     if !bad.is_empty() {
         eprintln!();
         eprintln!("{} generated file(s) do not match the model.", bad.len());
         eprintln!("Run `cargo xtask generate` and commit the result.");
+    }
+    if !registry.is_empty() {
+        eprintln!();
+        eprintln!(
+            "{} problem(s) in the command audit. A command with no storage plan does not ship, and a divergence needs a row in the register.",
+            registry.len()
+        );
+    }
+    if !bad.is_empty() || !registry.is_empty() {
         process::exit(1);
     }
 }
