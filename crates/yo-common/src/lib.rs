@@ -1,5 +1,5 @@
 //! Shared vocabulary for the whole engine: addresses, ids, the error model,
-//! and the two hash families.
+//! the two hash families, and the cache hint the batch walk is built on.
 //!
 //! Everything here is used on the hot path, so the rules are strict. No
 //! allocation outside the error path, no dependencies, and every constant that
@@ -10,11 +10,13 @@
 pub mod addr;
 pub mod crc;
 pub mod error;
+pub mod prefetch;
 pub mod wyhash;
 
 pub use addr::{ADDR_BITS, Addr, MAX_OFFSET, OFFSET_BITS, SPACE_BITS, ShardId, Space};
 pub use crc::{SLOT_COUNT, crc16, crc32c, hash_tag, slot_of};
 pub use error::{Code, Error, Result};
+pub use prefetch::{prefetch, prefetch_read};
 pub use wyhash::{hash_key, tag_of, wyhash};
 
 /// The size of an index bucket, and the cache line the engine is built around.

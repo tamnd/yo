@@ -10,6 +10,7 @@ members = [
     "crates/yo-file",
     "crates/yo-format",
     "crates/yo-index",
+    "crates/yo-reactor",
     "crates/yo-reader",
     "crates/yo-record",
     "crates/yo-resp",
@@ -42,6 +43,7 @@ yo-crash = { path = "crates/yo-crash", version = "0.3.1" }
 yo-file = { path = "crates/yo-file", version = "0.3.1" }
 yo-format = { path = "crates/yo-format", version = "0.3.1" }
 yo-index = { path = "crates/yo-index", version = "0.3.1" }
+yo-reactor = { path = "crates/yo-reactor", version = "0.3.1" }
 yo-reader = { path = "crates/yo-reader", version = "0.3.1" }
 yo-record = { path = "crates/yo-record", version = "0.3.1" }
 yo-resp = { path = "crates/yo-resp", version = "0.3.1" }
