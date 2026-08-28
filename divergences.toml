@@ -93,3 +93,26 @@ title = "The float counters count in f64 rather than in the C long double"
 reason = "INCRBYFLOAT and INCREX BYFLOAT use a long double in Redis, which is eighty bit on x86-64 and a hundred and twenty eight bit on aarch64, so Redis already does not agree with itself across machines. f64 gives the same answer everywhere. A value that needs more than seventeen significant digits differs, and nothing else does."
 status = "permanent"
 spec = "08 section 2"
+
+[[divergence]]
+id = "D-12"
+title = "HELLO and INFO report the server as redis 8.8.0"
+reason = "Every client library in the world branches on that pair to decide which commands exist, and a driver that reads yo there falls back to its oldest code path or refuses to connect outright. The honest answer is in the yo_version field of INFO, next to redis_version, and nothing else in the engine claims to be Redis."
+status = "permanent"
+spec = "12 section 9"
+
+[[divergence]]
+id = "D-13"
+title = "COMMAND INFO sends empty tips, key specs and subcommands"
+reason = "The first, last and step triple is filled in and correct, which is what a cluster aware client routes on, and COMMAND GETKEYS answers for the one command whose keys are not where the triple says. The three fields after it describe request policies and key flags that nothing in this engine has yet, and an invented answer is worse than an empty one because a client that finds the field trusts it."
+status = "until"
+resolved_by = "M6"
+spec = "12 section 9"
+
+[[divergence]]
+id = "D-14"
+title = "CONFIG reports nine settings and refuses a change to any of them"
+reason = "A real server carries hundreds of settings and lets a client change most of them at runtime. Nine of them mean something here, and none of them can move yet, so CONFIG GET answers about those nine and CONFIG SET accepts a write that changes nothing and refuses one that does not. The refusal uses the same sentence a real server uses for a setting that really is immutable. Accepting a change nothing acts on would be worse: a client that sets maxmemory and gets an OK has been told it has a limit."
+status = "until"
+resolved_by = "M5"
+spec = "12 section 9"

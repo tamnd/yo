@@ -794,6 +794,7 @@ name = "xtask"
 version = "0.3.1"
 dependencies = [
  "yo-common",
+ "yo-resp",
 ]
 
 [[package]]
@@ -917,7 +918,9 @@ name = "yo-resp"
 version = "0.3.1"
 dependencies = [
  "criterion",
+ "yo-alloc",
  "yo-common",
+ "yo-kv",
 ]
 
 [[package]]

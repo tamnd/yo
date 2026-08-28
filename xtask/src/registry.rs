@@ -15,11 +15,27 @@ use std::collections::BTreeSet;
 use std::fs;
 
 /// The storage plans a command may claim (`12` section 3).
-const PLANS: &[&str] = &["point", "cursor", "merge", "metadata", "whole-value"];
+const PLANS: &[&str] = &[
+    "point",
+    "cursor",
+    "merge",
+    "metadata",
+    "whole-value",
+    "none",
+];
+/// The groups whose commands are allowed to claim the `none` plan.
+///
+/// A command that touches no key has no storage plan to state, and there are
+/// exactly two groups that can honestly say so. Anywhere else it is a command
+/// whose plan nobody has worked out, which is the thing `12` section 3 exists
+/// to stop.
+const PLANLESS_GROUPS: &[&str] = &["connection", "server"];
 /// The bound or materialise verdicts.
 const BOUNDED: &[&str] = &["inherent", "yes", "risk"];
 /// Whether a command is implemented, and how far up it reaches.
 const STATUSES: &[&str] = &["shipped", "planned"];
+/// The same for a group, which can also be halfway through.
+const GROUP_STATUSES: &[&str] = &["shipped", "partial", "planned"];
 /// How far the argument order has been checked.
 const WIRE: &[&str] = &["verified", "unverified", "none"];
 /// What a divergence row promises.
@@ -41,7 +57,71 @@ pub fn problems() -> Vec<String> {
 
     let ids = check_divergences(&divergences, &mut bad);
     check_commands(&commands, &ids, &mut bad);
+    check_table(&commands, &mut bad);
     bad
+}
+
+/// The dispatch table and the audit have to say the same thing about the same
+/// command.
+///
+/// Two files describing one command is two files that will disagree, and the
+/// interesting direction is not the obvious one. A command missing from
+/// `commands.toml` is a command that shipped without a storage plan, which is
+/// the gate from `12` section 3. A row claiming `wire = "verified"` for a
+/// command nothing dispatches is a claim about an argument order that no code
+/// has, which is worse than an unverified row because it reads as done.
+fn check_table(tables: &[Table], bad: &mut Vec<String>) {
+    let rows: Vec<&Table> = tables.iter().filter(|t| t.name == "command").collect();
+    let row = |name: &str| {
+        let upper = name.to_uppercase();
+        rows.iter()
+            .copied()
+            .find(|t| t.str("name").unwrap_or_default() == upper)
+    };
+
+    for spec in yo_resp::dispatch::COMMANDS {
+        let Some(t) = row(spec.name) else {
+            bad.push(format!(
+                "commands.toml: {} is dispatched and is not listed",
+                spec.name.to_uppercase()
+            ));
+            continue;
+        };
+        let name = spec.name.to_uppercase();
+        let arity = t.get("arity").and_then(|v| v.as_int()).unwrap_or_default();
+        if arity != i64::from(spec.arity) {
+            bad.push(format!(
+                "commands.toml line {}: {name} has arity {arity} and the dispatch table has {}",
+                t.line, spec.arity
+            ));
+        }
+        let group = t.str("group").unwrap_or_default();
+        if group != spec.group {
+            bad.push(format!(
+                "commands.toml line {}: {name} is in group {group} and the dispatch table says {}",
+                t.line, spec.group
+            ));
+        }
+        for (key, want) in [("status", "shipped"), ("wire", "verified")] {
+            let got = t.str(key).unwrap_or_default();
+            if got != want {
+                bad.push(format!(
+                    "commands.toml line {}: {name} is dispatched and has {key} = {got}",
+                    t.line
+                ));
+            }
+        }
+    }
+
+    for t in rows {
+        let name = t.str("name").unwrap_or_default();
+        if t.str("wire") == Ok("verified") && yo_resp::dispatch::lookup(name.as_bytes()).is_none() {
+            bad.push(format!(
+                "commands.toml line {}: {name} says its wire is verified and nothing dispatches it",
+                t.line
+            ));
+        }
+    }
 }
 
 fn read(path: &std::path::Path) -> Result<Vec<Table>, String> {
@@ -155,12 +235,19 @@ fn check_commands(tables: &[Table], ids: &BTreeSet<String>, bad: &mut Vec<String
                 t.line
             ));
         }
-        counted.push((group, name.clone()));
+        counted.push((group.clone(), name.clone()));
 
-        one_of(t, "plan", PLANS, &name, bad);
+        let plan = one_of(t, "plan", PLANS, &name, bad);
         one_of(t, "bounded", BOUNDED, &name, bad);
         one_of(t, "wire", WIRE, &name, bad);
         let status = one_of(t, "status", STATUSES, &name, bad);
+
+        if plan.as_deref() == Some("none") && !PLANLESS_GROUPS.contains(&group.as_str()) {
+            bad.push(format!(
+                "commands.toml line {}: {name} claims no storage plan and is in group {group}, which is not one of {PLANLESS_GROUPS:?}",
+                t.line
+            ));
+        }
 
         // The gate from `12` section 3, in the only form that means anything.
         if status.as_deref() == Some("shipped") && t.get("plan").is_none() {
@@ -230,9 +317,9 @@ fn check_group_budgets(groups: &[&Table], counted: &[(String, String)], bad: &mu
             continue;
         };
         let status = g.str("status").unwrap_or_default();
-        if !STATUSES.contains(&status) {
+        if !GROUP_STATUSES.contains(&status) {
             bad.push(format!(
-                "commands.toml line {}: group {name} has status {status}, which is not one of {STATUSES:?}",
+                "commands.toml line {}: group {name} has status {status}, which is not one of {GROUP_STATUSES:?}",
                 g.line
             ));
         }
@@ -245,7 +332,15 @@ fn check_group_budgets(groups: &[&Table], counted: &[(String, String)], bad: &mu
         }
         if status == "planned" && have != 0 {
             bad.push(format!(
-                "commands.toml line {}: group {name} is planned and already lists {have} commands, so it is shipped",
+                "commands.toml line {}: group {name} is planned and already lists {have} commands, so it is partial",
+                g.line
+            ));
+        }
+        // A group being worked through has to be somewhere between the two, or
+        // its status is a stale answer to a question that has moved on.
+        if status == "partial" && (have == 0 || have >= expected) {
+            bad.push(format!(
+                "commands.toml line {}: group {name} is partial and lists {have} of {expected}",
                 g.line
             ));
         }
@@ -391,6 +486,78 @@ mod tests {
         check_commands(&tables, &BTreeSet::new(), &mut bad);
         assert!(
             bad.iter().any(|b| b.contains("28 commands and lists 1")),
+            "{bad:?}"
+        );
+    }
+
+    /// A group being worked through says so, and says it with a number that is
+    /// actually between the two ends.
+    #[test]
+    fn a_partial_group_that_is_really_finished_or_really_empty_is_caught() {
+        for (expected, listed, want) in [(1, 1, "lists 1 of 1"), (9, 0, "lists 0 of 9")] {
+            let mut text = format!(
+                "[[group]]\nname = \"server\"\nexpected = {expected}\nstatus = \"partial\"\n\n"
+            );
+            for _ in 0..listed {
+                text.push_str(
+                    "[[command]]\nname = \"INFO\"\ngroup = \"server\"\nsince = \"1.0.0\"\n\
+                     arity = -1\nplan = \"none\"\nbounded = \"inherent\"\nstatus = \"shipped\"\n\
+                     wire = \"unverified\"\n\n",
+                );
+            }
+            let tables = toml::parse(&text).unwrap();
+            let mut bad = Vec::new();
+            check_commands(&tables, &BTreeSet::new(), &mut bad);
+            assert!(bad.iter().any(|b| b.contains(want)), "{bad:?}");
+        }
+    }
+
+    /// The escape hatch for a command that touches no key stays where it
+    /// belongs, or it is a way to ship anything without a plan.
+    #[test]
+    fn a_command_with_no_plan_outside_the_two_groups_is_caught() {
+        let tables = toml::parse(
+            "[[group]]\nname = \"string\"\nexpected = 1\nstatus = \"shipped\"\n\n\
+             [[command]]\nname = \"GET\"\ngroup = \"string\"\nsince = \"1.0.0\"\narity = 2\n\
+             plan = \"none\"\nbounded = \"inherent\"\nstatus = \"shipped\"\nwire = \"verified\"\n",
+        )
+        .unwrap();
+        let mut bad = Vec::new();
+        check_commands(&tables, &BTreeSet::new(), &mut bad);
+        assert!(
+            bad.iter().any(|b| b.contains("claims no storage plan")),
+            "{bad:?}"
+        );
+    }
+
+    /// The dispatch table and the file, in both directions.
+    #[test]
+    fn the_table_and_the_file_agree_about_every_command() {
+        // A row that claims a verified argument order for a command nothing
+        // runs, which is the claim that reads as done and is not.
+        let tables = toml::parse(
+            "[[command]]\nname = \"XADD\"\ngroup = \"stream\"\nsince = \"5.0.0\"\narity = -5\n\
+             plan = \"point\"\nbounded = \"inherent\"\nstatus = \"shipped\"\nwire = \"verified\"\n",
+        )
+        .unwrap();
+        let mut bad = Vec::new();
+        check_table(&tables, &mut bad);
+        assert!(
+            bad.iter().any(|b| b.contains("nothing dispatches it")),
+            "{bad:?}"
+        );
+        // And an arity that drifted, which is the one that produces a client
+        // that routes a command to the wrong place rather than an error.
+        let tables = toml::parse(
+            "[[command]]\nname = \"GET\"\ngroup = \"string\"\nsince = \"1.0.0\"\narity = 3\n\
+             plan = \"point\"\nbounded = \"inherent\"\nstatus = \"shipped\"\nwire = \"verified\"\n",
+        )
+        .unwrap();
+        let mut bad = Vec::new();
+        check_table(&tables, &mut bad);
+        assert!(
+            bad.iter()
+                .any(|b| b.contains("GET has arity 3 and the dispatch table has 2")),
             "{bad:?}"
         );
     }

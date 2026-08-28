@@ -397,16 +397,26 @@ impl Strings {
     pub fn setex(&mut self, key: &[u8], seconds: i64, val: &[u8]) -> Result<()> {
         let ms = seconds
             .checked_mul(1000)
-            .ok_or_else(|| invalid_expire("SETEX"))?;
-        self.psetex(key, ms, val)
+            .ok_or_else(|| invalid_expire("setex"))?;
+        self.set_expiring(key, ms, val, "setex")
     }
 
     /// `PSETEX key milliseconds value`.
     pub fn psetex(&mut self, key: &[u8], millis: i64, val: &[u8]) -> Result<()> {
+        self.set_expiring(key, millis, val, "psetex")
+    }
+
+    /// The body both of those share.
+    ///
+    /// The command name is carried in rather than taken from whichever method
+    /// does the work, because the message is the caller's: a `SETEX` with a bad
+    /// time to live says `setex` even though the milliseconds are handled here,
+    /// and a client that matches on the text gets the command it sent.
+    fn set_expiring(&mut self, key: &[u8], millis: i64, val: &[u8], what: &str) -> Result<()> {
         if millis <= 0 {
-            return Err(invalid_expire("PSETEX"));
+            return Err(invalid_expire(what));
         }
-        let at = self.deadline_in(millis, "psetex")?;
+        let at = self.deadline_in(millis, what)?;
         self.set(key, val, SetOptions::PLAIN.expiring(Expire::At(at)))?;
         Ok(())
     }
@@ -639,9 +649,11 @@ impl Strings {
     /// afterwards even when the number came out whole.
     pub fn incrbyfloat(&mut self, key: &[u8], by: f64) -> Result<f64> {
         check_len(key, 0)?;
-        if !by.is_finite() {
-            return Err(Error::new(Code::Invalid, NOT_A_FLOAT));
-        }
+        // An infinite increment is not refused up front. Redis parses it,
+        // performs the addition and reports the sum, so `INCRBYFLOAT k inf`
+        // says the increment would produce infinity rather than that the
+        // increment is not a float, and the check below is the one that says
+        // it.
         self.reap(key);
         let (current, deadline) = match self.map.get(key) {
             Some(rec) => {
@@ -1160,7 +1172,17 @@ mod tests {
     #[test]
     fn setex_refuses_a_time_to_live_that_is_not_one() {
         let mut s = store();
-        assert!(s.setex(b"k", 0, b"v").is_err());
+        // The command in the message is the one that was called, lower cased,
+        // even though `SETEX` hands the milliseconds to the same body `PSETEX`
+        // uses.
+        assert_eq!(
+            s.setex(b"k", 0, b"v").unwrap_err().message(),
+            "invalid expire time in 'setex' command"
+        );
+        assert_eq!(
+            s.psetex(b"k", 0, b"v").unwrap_err().message(),
+            "invalid expire time in 'psetex' command"
+        );
         assert!(s.setex(b"k", -1, b"v").is_err());
         assert_eq!(got(&mut s, b"k"), None);
         s.setex(b"k", 10, b"v").unwrap();
@@ -1388,8 +1410,19 @@ mod tests {
         s.set_plain(b"t", b"hello").unwrap();
         let e = s.incrbyfloat(b"t", 1.0).unwrap_err();
         assert_eq!(e.message(), NOT_A_FLOAT);
-        assert!(s.incrbyfloat(b"k", f64::NAN).is_err());
-        assert!(s.incrbyfloat(b"k", f64::INFINITY).is_err());
+        // An increment that cannot land anywhere is reported as the sum it
+        // would have produced, which is the sentence a real server sends and
+        // not the one about the argument.
+        assert_eq!(
+            s.incrbyfloat(b"k", f64::INFINITY).unwrap_err().message(),
+            "increment would produce NaN or Infinity"
+        );
+        assert_eq!(
+            s.incrbyfloat(b"k", f64::NAN).unwrap_err().message(),
+            "increment would produce NaN or Infinity"
+        );
+        // And the key it could not increment is left as it was.
+        assert_eq!(got(&mut s, b"k").as_deref(), Some(&b"10.6"[..]));
     }
 
     #[test]

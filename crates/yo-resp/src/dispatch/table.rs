@@ -1,0 +1,631 @@
+//! The command table: what each command is called, how many arguments it
+//! takes, where its keys are, and what `COMMAND` reports about it.
+//!
+//! Every field here was read out of a running Redis 8.8 with `COMMAND INFO`
+//! rather than written from the documentation, because this is the table a
+//! client library builds its own routing from. A cluster aware client asks
+//! `COMMAND` where the keys are and then decides which node to send a command
+//! to, so an arity or a key position that is off by one does not produce a
+//! wrong error message, it produces a client that sends `MSET` to the wrong
+//! shard. The summaries are ours, since those are the one field nobody parses.
+//!
+//! `cargo xtask check` compares this table against `commands.toml` in both
+//! directions, so a command cannot be dispatched without a storage plan and
+//! cannot claim `wire = "verified"` without an entry here.
+
+/// Everything `COMMAND` has to be able to say about one command.
+#[derive(Debug, Clone, Copy)]
+pub struct Spec {
+    /// The name, lower case, which is how `COMMAND` reports it whatever case
+    /// the client used.
+    pub name: &'static str,
+    /// Redis's arity: a positive number is exact, a negative one is a minimum
+    /// of its magnitude, and both count the command name itself.
+    pub arity: i32,
+    /// The command flags, in the order `COMMAND INFO` lists them.
+    pub flags: &'static [&'static str],
+    /// The first argument that is a key, or zero when there are none.
+    pub first_key: i32,
+    /// The last argument that is a key, negative counting back from the end.
+    pub last_key: i32,
+    /// How far apart the keys are, for the commands that take pairs.
+    pub step: i32,
+    /// The ACL categories, which are what `COMMAND LIST FILTERBY ACLCAT` reads.
+    pub acl: &'static [&'static str],
+    /// The Redis this command first appeared in.
+    pub since: &'static str,
+    /// The cost, in the shape `COMMAND DOCS` uses.
+    pub complexity: &'static str,
+    /// One line about what it does, in our words.
+    pub summary: &'static str,
+    /// The group in `commands.toml`, which is how the two files are compared.
+    pub group: &'static str,
+}
+
+/// Read only, fast, one key at argument one, which is most of the getters.
+const READ_FAST: &[&str] = &["readonly", "fast"];
+/// A write that allocates, fast, one key at argument one.
+const WRITE_FAST_OOM: &[&str] = &["write", "denyoom", "fast"];
+/// A write that allocates and is not counted as fast.
+const WRITE_OOM: &[&str] = &["write", "denyoom"];
+/// The read side categories.
+const AC_READ_FAST: &[&str] = &["@read", "@string", "@fast"];
+/// The read side categories for the ones that walk the value.
+const AC_READ_SLOW: &[&str] = &["@read", "@string", "@slow"];
+/// The write side categories.
+const AC_WRITE_FAST: &[&str] = &["@write", "@string", "@fast"];
+/// The write side categories for the ones that are not counted as fast.
+const AC_WRITE_SLOW: &[&str] = &["@write", "@string", "@slow"];
+/// The connection commands' categories.
+const AC_CONN: &[&str] = &["@fast", "@connection"];
+
+/// Every command this server answers, in the order the groups ship.
+pub static COMMANDS: &[Spec] = &[
+    // ------------------------------------------------------------- strings
+    Spec {
+        name: "set",
+        arity: -3,
+        flags: WRITE_OOM,
+        first_key: 1,
+        last_key: 1,
+        step: 1,
+        acl: AC_WRITE_SLOW,
+        since: "1.0.0",
+        complexity: "O(1)",
+        summary: "Set a key to a string value, whatever it held before.",
+        group: "string",
+    },
+    Spec {
+        name: "get",
+        arity: 2,
+        flags: READ_FAST,
+        first_key: 1,
+        last_key: 1,
+        step: 1,
+        acl: AC_READ_FAST,
+        since: "1.0.0",
+        complexity: "O(1)",
+        summary: "The string value of a key.",
+        group: "string",
+    },
+    Spec {
+        name: "getset",
+        arity: 3,
+        flags: WRITE_FAST_OOM,
+        first_key: 1,
+        last_key: 1,
+        step: 1,
+        acl: AC_WRITE_FAST,
+        since: "1.0.0",
+        complexity: "O(1)",
+        summary: "Set a key and hand back what it held.",
+        group: "string",
+    },
+    Spec {
+        name: "getdel",
+        arity: 2,
+        flags: &["write", "fast"],
+        first_key: 1,
+        last_key: 1,
+        step: 1,
+        acl: AC_WRITE_FAST,
+        since: "6.2.0",
+        complexity: "O(1)",
+        summary: "Read a key and delete it in the same step.",
+        group: "string",
+    },
+    Spec {
+        name: "getex",
+        arity: -2,
+        flags: &["write", "fast"],
+        first_key: 1,
+        last_key: 1,
+        step: 1,
+        acl: AC_WRITE_FAST,
+        since: "6.2.0",
+        complexity: "O(1)",
+        summary: "Read a key and change its deadline in the same step.",
+        group: "string",
+    },
+    Spec {
+        name: "setnx",
+        arity: 3,
+        flags: WRITE_FAST_OOM,
+        first_key: 1,
+        last_key: 1,
+        step: 1,
+        acl: AC_WRITE_FAST,
+        since: "1.0.0",
+        complexity: "O(1)",
+        summary: "Set a key only if it is not there.",
+        group: "string",
+    },
+    Spec {
+        name: "setex",
+        arity: 4,
+        flags: WRITE_OOM,
+        first_key: 1,
+        last_key: 1,
+        step: 1,
+        acl: AC_WRITE_SLOW,
+        since: "2.0.0",
+        complexity: "O(1)",
+        summary: "Set a key and give it a deadline in seconds.",
+        group: "string",
+    },
+    Spec {
+        name: "psetex",
+        arity: 4,
+        flags: WRITE_OOM,
+        first_key: 1,
+        last_key: 1,
+        step: 1,
+        acl: AC_WRITE_SLOW,
+        since: "2.6.0",
+        complexity: "O(1)",
+        summary: "Set a key and give it a deadline in milliseconds.",
+        group: "string",
+    },
+    Spec {
+        name: "mset",
+        arity: -3,
+        flags: WRITE_OOM,
+        first_key: 1,
+        last_key: -1,
+        step: 2,
+        acl: AC_WRITE_SLOW,
+        since: "1.0.1",
+        complexity: "O(N) with N the number of keys",
+        summary: "Set several keys, all of them or none.",
+        group: "string",
+    },
+    Spec {
+        name: "msetnx",
+        arity: -3,
+        flags: WRITE_OOM,
+        first_key: 1,
+        last_key: -1,
+        step: 2,
+        acl: AC_WRITE_SLOW,
+        since: "1.0.1",
+        complexity: "O(N) with N the number of keys",
+        summary: "Set several keys only if none of them are there.",
+        group: "string",
+    },
+    Spec {
+        name: "mget",
+        arity: -2,
+        flags: READ_FAST,
+        first_key: 1,
+        last_key: -1,
+        step: 1,
+        acl: AC_READ_FAST,
+        since: "1.0.0",
+        complexity: "O(N) with N the number of keys",
+        summary: "The values of several keys, in the order asked for.",
+        group: "string",
+    },
+    Spec {
+        name: "append",
+        arity: 3,
+        flags: WRITE_FAST_OOM,
+        first_key: 1,
+        last_key: 1,
+        step: 1,
+        acl: AC_WRITE_FAST,
+        since: "2.0.0",
+        complexity: "O(M) with M the length of the value being appended",
+        summary: "Add to the end of a string, creating it if it is not there.",
+        group: "string",
+    },
+    Spec {
+        name: "strlen",
+        arity: 2,
+        flags: READ_FAST,
+        first_key: 1,
+        last_key: 1,
+        step: 1,
+        acl: AC_READ_FAST,
+        since: "2.2.0",
+        complexity: "O(1)",
+        summary: "How long a string value is, without reading it.",
+        group: "string",
+    },
+    Spec {
+        name: "setrange",
+        arity: 4,
+        flags: WRITE_OOM,
+        first_key: 1,
+        last_key: 1,
+        step: 1,
+        acl: AC_WRITE_SLOW,
+        since: "2.2.0",
+        complexity: "O(M) with M the length of the replacement",
+        summary: "Overwrite part of a string at an offset, zero filling the gap.",
+        group: "string",
+    },
+    Spec {
+        name: "getrange",
+        arity: 4,
+        flags: &["readonly"],
+        first_key: 1,
+        last_key: 1,
+        step: 1,
+        acl: AC_READ_SLOW,
+        since: "2.4.0",
+        complexity: "O(N) with N the length of the answer",
+        summary: "Part of a string, by an inclusive range that may count backwards.",
+        group: "string",
+    },
+    Spec {
+        name: "substr",
+        arity: 4,
+        flags: &["readonly"],
+        first_key: 1,
+        last_key: 1,
+        step: 1,
+        acl: AC_READ_SLOW,
+        since: "1.0.0",
+        complexity: "O(N) with N the length of the answer",
+        summary: "GETRANGE under the name it had before 2.4.",
+        group: "string",
+    },
+    Spec {
+        name: "incr",
+        arity: 2,
+        flags: WRITE_FAST_OOM,
+        first_key: 1,
+        last_key: 1,
+        step: 1,
+        acl: AC_WRITE_FAST,
+        since: "1.0.0",
+        complexity: "O(1)",
+        summary: "Add one, starting from zero if the key is not there.",
+        group: "string",
+    },
+    Spec {
+        name: "decr",
+        arity: 2,
+        flags: WRITE_FAST_OOM,
+        first_key: 1,
+        last_key: 1,
+        step: 1,
+        acl: AC_WRITE_FAST,
+        since: "1.0.0",
+        complexity: "O(1)",
+        summary: "Take one away, starting from zero if the key is not there.",
+        group: "string",
+    },
+    Spec {
+        name: "incrby",
+        arity: 3,
+        flags: WRITE_FAST_OOM,
+        first_key: 1,
+        last_key: 1,
+        step: 1,
+        acl: AC_WRITE_FAST,
+        since: "1.0.0",
+        complexity: "O(1)",
+        summary: "Add a number, starting from zero if the key is not there.",
+        group: "string",
+    },
+    Spec {
+        name: "decrby",
+        arity: 3,
+        flags: WRITE_FAST_OOM,
+        first_key: 1,
+        last_key: 1,
+        step: 1,
+        acl: AC_WRITE_FAST,
+        since: "1.0.0",
+        complexity: "O(1)",
+        summary: "Take a number away, starting from zero if the key is not there.",
+        group: "string",
+    },
+    Spec {
+        name: "incrbyfloat",
+        arity: 3,
+        flags: WRITE_FAST_OOM,
+        first_key: 1,
+        last_key: 1,
+        step: 1,
+        acl: AC_WRITE_FAST,
+        since: "2.6.0",
+        complexity: "O(1)",
+        summary: "Add a float, starting from zero if the key is not there.",
+        group: "string",
+    },
+    Spec {
+        name: "lcs",
+        arity: -3,
+        flags: &["readonly"],
+        first_key: 1,
+        last_key: 2,
+        step: 1,
+        acl: AC_READ_SLOW,
+        since: "7.0.0",
+        complexity: "O(N*M) with N and M the lengths of the two values",
+        summary: "The longest subsequence two string values have in common.",
+        group: "string",
+    },
+    Spec {
+        name: "msetex",
+        arity: -4,
+        flags: &["write", "denyoom", "movablekeys"],
+        first_key: 0,
+        last_key: 0,
+        step: 0,
+        acl: AC_WRITE_SLOW,
+        since: "8.4.0",
+        complexity: "O(N) with N the number of keys",
+        summary: "Set several keys with one deadline and one condition over all of them.",
+        group: "string",
+    },
+    Spec {
+        name: "delex",
+        arity: -2,
+        flags: &["write", "fast"],
+        first_key: 1,
+        last_key: 1,
+        step: 1,
+        acl: AC_WRITE_FAST,
+        since: "8.4.0",
+        complexity: "O(1) by value, O(N) by digest",
+        summary: "Delete a key only if it still holds what the caller thinks.",
+        group: "string",
+    },
+    Spec {
+        name: "digest",
+        arity: 2,
+        flags: READ_FAST,
+        first_key: 1,
+        last_key: 1,
+        step: 1,
+        acl: AC_READ_FAST,
+        since: "8.4.0",
+        complexity: "O(N) with N the length of the value",
+        summary: "The XXH3 of a string value, as sixteen hex characters.",
+        group: "string",
+    },
+    Spec {
+        name: "increx",
+        arity: -2,
+        flags: WRITE_FAST_OOM,
+        first_key: 1,
+        last_key: 1,
+        step: 1,
+        acl: AC_WRITE_FAST,
+        since: "8.8.0",
+        complexity: "O(1)",
+        summary: "Count, with a bound, a saturation policy and a deadline.",
+        group: "string",
+    },
+    // ---------------------------------------------------------- connection
+    Spec {
+        name: "ping",
+        arity: -1,
+        flags: &["fast"],
+        first_key: 0,
+        last_key: 0,
+        step: 0,
+        acl: AC_CONN,
+        since: "1.0.0",
+        complexity: "O(1)",
+        summary: "Ask whether the server is answering.",
+        group: "connection",
+    },
+    Spec {
+        name: "echo",
+        arity: 2,
+        flags: &["loading", "stale", "fast"],
+        first_key: 0,
+        last_key: 0,
+        step: 0,
+        acl: AC_CONN,
+        since: "1.0.0",
+        complexity: "O(1)",
+        summary: "Send a string back unchanged.",
+        group: "connection",
+    },
+    Spec {
+        name: "hello",
+        arity: -1,
+        flags: &[
+            "noscript",
+            "loading",
+            "stale",
+            "fast",
+            "no_auth",
+            "allow_busy",
+        ],
+        first_key: 0,
+        last_key: 0,
+        step: 0,
+        acl: AC_CONN,
+        since: "6.0.0",
+        complexity: "O(1)",
+        summary: "Agree on a protocol version and describe the server.",
+        group: "connection",
+    },
+    Spec {
+        name: "select",
+        arity: 2,
+        flags: &["loading", "stale", "fast"],
+        first_key: 0,
+        last_key: 0,
+        step: 0,
+        acl: AC_CONN,
+        since: "1.0.0",
+        complexity: "O(1)",
+        summary: "Choose which database this connection works in.",
+        group: "connection",
+    },
+    Spec {
+        name: "reset",
+        arity: 1,
+        flags: &[
+            "noscript",
+            "loading",
+            "stale",
+            "fast",
+            "no_auth",
+            "allow_busy",
+        ],
+        first_key: 0,
+        last_key: 0,
+        step: 0,
+        acl: AC_CONN,
+        since: "6.2.0",
+        complexity: "O(1)",
+        summary: "Put the connection back the way it was opened.",
+        group: "connection",
+    },
+    Spec {
+        name: "quit",
+        arity: -1,
+        flags: &[
+            "noscript",
+            "loading",
+            "stale",
+            "fast",
+            "no_auth",
+            "allow_busy",
+        ],
+        first_key: 0,
+        last_key: 0,
+        step: 0,
+        acl: AC_CONN,
+        since: "1.0.0",
+        complexity: "O(1)",
+        summary: "Close the connection after the replies already queued.",
+        group: "connection",
+    },
+    // -------------------------------------------------------------- server
+    // COMMAND is in the connection ACL category and in the server group, which
+    // is not a contradiction: the category is about what a connection is
+    // allowed to do and the group is about what the command is about. The group
+    // is the one reported by COMMAND DOCS, so it is the one that has to match.
+    Spec {
+        name: "command",
+        arity: -1,
+        flags: &["loading", "stale"],
+        first_key: 0,
+        last_key: 0,
+        step: 0,
+        acl: &["@slow", "@connection"],
+        since: "2.8.13",
+        complexity: "O(N) with N the number of commands",
+        summary: "What this server can do, in the shape client libraries read.",
+        group: "server",
+    },
+    Spec {
+        name: "config",
+        arity: -2,
+        flags: &[],
+        first_key: 0,
+        last_key: 0,
+        step: 0,
+        acl: &["@slow"],
+        since: "2.0.0",
+        complexity: "Depends on the subcommand.",
+        summary: "Read and change the settings a running server exposes.",
+        group: "server",
+    },
+    Spec {
+        name: "info",
+        arity: -1,
+        flags: &["loading", "stale"],
+        first_key: 0,
+        last_key: 0,
+        step: 0,
+        acl: &["@slow", "@dangerous"],
+        since: "1.0.0",
+        complexity: "O(1)",
+        summary: "The server's own numbers, in sections.",
+        group: "server",
+    },
+];
+
+/// The command called `name`, whatever case the client spelled it in.
+///
+/// Linear over a table of this size, which is a handful of length compares
+/// against a table that fits in one page and is in cache because the previous
+/// command looked at it too. A hash would be a hash of the name plus a probe,
+/// and the name is already in a register. The table grows to about 250 by M8,
+/// at which point this becomes a perfect hash built at compile time, and the
+/// signature does not change when it does.
+#[must_use]
+pub fn lookup(name: &[u8]) -> Option<&'static Spec> {
+    COMMANDS
+        .iter()
+        .find(|c| c.name.len() == name.len() && c.name.as_bytes().eq_ignore_ascii_case(name))
+}
+
+/// Whether `n` arguments, counting the name, satisfy this command's arity.
+#[must_use]
+pub fn arity_ok(spec: &Spec, n: usize) -> bool {
+    let n = n as i32;
+    if spec.arity >= 0 {
+        n == spec.arity
+    } else {
+        n >= -spec.arity
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_name_is_lower_case_and_appears_once() {
+        let mut seen = std::collections::BTreeSet::new();
+        for c in COMMANDS {
+            assert_eq!(
+                c.name,
+                c.name.to_lowercase(),
+                "{} is not lower case",
+                c.name
+            );
+            assert!(seen.insert(c.name), "{} is in the table twice", c.name);
+        }
+    }
+
+    #[test]
+    fn lookup_ignores_case_and_does_not_match_a_prefix() {
+        assert_eq!(lookup(b"GET").unwrap().name, "get");
+        assert_eq!(lookup(b"gEt").unwrap().name, "get");
+        assert!(lookup(b"ge").is_none());
+        assert!(lookup(b"gets").is_none());
+    }
+
+    #[test]
+    fn arity_counts_the_command_name() {
+        let get = lookup(b"get").unwrap();
+        assert!(!arity_ok(get, 1));
+        assert!(arity_ok(get, 2));
+        assert!(!arity_ok(get, 3));
+
+        // A negative arity is a minimum, which is how SET takes its options.
+        let set = lookup(b"set").unwrap();
+        assert!(!arity_ok(set, 2));
+        assert!(arity_ok(set, 3));
+        assert!(arity_ok(set, 9));
+    }
+
+    /// A key spec that is wrong sends a cluster client to the wrong node, so
+    /// the pair commands are worth stating twice.
+    #[test]
+    fn the_pair_commands_step_two_keys_at_a_time() {
+        for name in [b"mset".as_slice(), b"msetnx"] {
+            let c = lookup(name).unwrap();
+            assert_eq!((c.first_key, c.last_key, c.step), (1, -1, 2));
+        }
+        let mget = lookup(b"mget").unwrap();
+        assert_eq!((mget.first_key, mget.last_key, mget.step), (1, -1, 1));
+        // MSETEX counts its keys in an argument, so there is no static spec
+        // for them and a client has to ask with COMMAND GETKEYS.
+        let msetex = lookup(b"msetex").unwrap();
+        assert_eq!((msetex.first_key, msetex.last_key, msetex.step), (0, 0, 0));
+        assert!(msetex.flags.contains(&"movablekeys"));
+    }
+}
