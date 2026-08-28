@@ -396,6 +396,16 @@ impl<S: Sink> Wire<S> {
         self.ready.len()
     }
 
+    /// Connections with a reply that has not gone out yet.
+    ///
+    /// Non zero means a socket was full and what is left is being held for a
+    /// later flush, which a driver waiting on readability needs to know: there
+    /// is work here that no incoming byte will ever wake it up for.
+    #[must_use]
+    pub fn owed(&self) -> usize {
+        self.dirty.len()
+    }
+
     /// Decoders in the pool, which is the high water mark of one batch.
     #[must_use]
     pub fn decoders(&self) -> usize {

@@ -13,6 +13,7 @@
 //! code.
 
 mod check;
+mod poll;
 mod serve;
 
 use std::net::SocketAddr;
