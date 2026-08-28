@@ -231,12 +231,6 @@ impl Server {
             self.bury_dead();
             self.forget_closed();
 
-            // Housekeeping goes after the batch and not before it, so a turn
-            // that has commands waiting answers them first. It does nothing at
-            // all unless a segment has gone half dead, and asking costs a
-            // comparison, so this is not a reason to stay awake.
-            self.reactor.engine_mut().maintain();
-
             if worked {
                 idle = 0;
             } else {

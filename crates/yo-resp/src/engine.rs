@@ -668,14 +668,22 @@ impl<S: Sink> Wire<S> {
         self.server.refresh_clock();
     }
 
-    /// Do one turn's worth of housekeeping.
+    /// Do one batch's worth of housekeeping.
     ///
     /// Today that is one segment of arena compaction at most, which is what
     /// stops a server that rewrites the same keys from holding every version of
     /// them. It is separate from [`Wire::tick`] because the clock has to move
-    /// before a batch runs and this does not: it can wait for a quiet moment,
-    /// and the driver decides when that is.
-    pub fn maintain(&mut self) -> usize {
+    /// before a batch runs and this does not: it can wait until the replies are
+    /// out, and the driver decides when that is.
+    ///
+    /// Per batch and not per turn of the loop. A turn can carry one command or
+    /// a thousand, so a per turn call means the rate at which garbage is
+    /// collected has nothing to do with the rate at which it is made, and on a
+    /// saturated server the second one wins. That was measured: with this on
+    /// the loop's turn the server settled at seven segments for six segments'
+    /// worth of keys, which is where an unloaded process running the same
+    /// writes settled at six.
+    pub fn maintain(&mut self) -> Option<usize> {
         self.server.compact_step()
     }
 }
@@ -784,10 +792,16 @@ pub fn pump<S: Sink>(reactor: &mut Reactor<Wire<S>>, batch: &mut Vec<Cmd>) -> us
         }
         ran += reactor.execute_all(batch.drain(..));
         reactor.engine_mut().flush();
+        // After the replies are out, so the batch that made the garbage is not
+        // the batch that waits for it to be collected.
+        reactor.engine_mut().maintain();
     }
     // Once more, for a connection with something to say and nothing to run: a
     // protocol error, or a socket that was full the last time round.
     reactor.engine_mut().flush();
+    // And once for a turn that ran nothing at all, which is where a server that
+    // has gone quiet catches up on what the last busy turn left behind.
+    reactor.engine_mut().maintain();
     ran
 }
 
