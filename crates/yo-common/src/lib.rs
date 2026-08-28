@@ -8,6 +8,7 @@
 #![deny(missing_docs)]
 
 pub mod addr;
+pub mod blake3;
 pub mod crc;
 pub mod error;
 pub mod glob;
