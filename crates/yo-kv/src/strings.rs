@@ -261,7 +261,7 @@ impl Strings {
     /// something compacts. This is that something, and it does at most one
     /// segment per call so that the loop can afford to ask every turn.
     #[inline]
-    pub fn compact_step(&mut self) -> usize {
+    pub fn compact_step(&mut self) -> Option<usize> {
         self.map.compact_step()
     }
 

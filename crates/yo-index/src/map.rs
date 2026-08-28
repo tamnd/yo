@@ -365,19 +365,22 @@ impl RawMap {
         moved
     }
 
-    /// Compact one segment if one is worth compacting, and return how many
-    /// records moved.
+    /// Compact one segment if one is worth compacting, and say how many records
+    /// moved.
+    ///
+    /// `None` means there was no candidate. It is not the same as `Some(0)`,
+    /// which is a segment whose every record had already been overwritten: that
+    /// one gave two megabytes back without moving anything, and a caller
+    /// deciding whether to go round again needs to be told so.
     ///
     /// This is the whole maintenance contract: at most one segment per call, so
     /// a caller that runs it once per turn of the loop pays a bounded amount
     /// and never a full pass over the arena. Zero means there was nothing to
     /// do, and finding that out is one comparison against the running dead byte
     /// total.
-    pub fn compact_step(&mut self) -> usize {
-        match self.arena.worst_candidate() {
-            Some(seg) => self.compact_segment(seg),
-            None => 0,
-        }
+    pub fn compact_step(&mut self) -> Option<usize> {
+        let seg = self.arena.worst_candidate()?;
+        Some(self.compact_segment(seg))
     }
 }
 

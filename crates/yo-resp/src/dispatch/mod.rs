@@ -220,27 +220,26 @@ impl Server {
     }
 
     /// Give one database's dead space back, if any database has enough of it to
-    /// be worth the move. Returns how many records were moved.
+    /// be worth the move. `None` when no database had a candidate.
     ///
-    /// Once per turn of the loop, next to the clock. Overwriting a key writes a
-    /// new record and counts the old one dead, so without this a server holds
-    /// everything it has ever written: 400000 sets over 100000 keys measured at
-    /// 742 bytes a key against Redis at 144 for the same load, and the whole
-    /// difference was dead records nothing ever came back for.
+    /// Once per batch, next to the clock. Overwriting a key writes a new record
+    /// and counts the old one dead, so without this a server holds everything
+    /// it has ever written: 400000 sets over 100000 keys measured at 742 bytes
+    /// a key against Redis at 144 for the same load, and the whole difference
+    /// was dead records nothing ever came back for.
     ///
     /// At most one segment moves per call and the search starts one database
     /// further along each time, so the cost of asking is a comparison per
     /// database and the cost of acting is bounded by a segment.
-    pub fn compact_step(&mut self) -> usize {
+    pub fn compact_step(&mut self) -> Option<usize> {
         for turn in 0..self.dbs.len() {
             let i = (self.next_db + turn) % self.dbs.len();
-            let moved = self.dbs[i].compact_step();
-            if moved > 0 {
+            if let Some(moved) = self.dbs[i].compact_step() {
                 self.next_db = (i + 1) % self.dbs.len();
-                return moved;
+                return Some(moved);
             }
         }
-        0
+        None
     }
 }
 
