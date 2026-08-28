@@ -953,6 +953,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "yodb"
+version = "0.3.1"
+dependencies = [
+ "criterion",
+ "yo-common",
+ "yo-index",
+ "yo-shape",
+]
+
+[[package]]
 name = "zerocopy"
 version = "0.8.56"
 source = "registry+https://github.com/rust-lang/crates.io-index"

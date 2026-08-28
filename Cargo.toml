@@ -1,6 +1,7 @@
 [workspace]
 resolver = "3"
 members = [
+    "crates/yo",
     "crates/yo-alloc",
     "crates/yo-arena",
     "crates/yo-capi",
@@ -37,6 +38,8 @@ authors = ["tamnd <tamnd87@gmail.com>"]
 
 [workspace.dependencies]
 yo-alloc = { path = "crates/yo-alloc", version = "0.3.1" }
+# The library is `yo`, the package on crates.io is `yodb`.
+yodb = { path = "crates/yo", version = "0.3.1" }
 yo-arena = { path = "crates/yo-arena", version = "0.3.1" }
 yo-capi = { path = "crates/yo-capi", version = "0.3.1" }
 yo-cli = { path = "crates/yo-cli", version = "0.3.1" }

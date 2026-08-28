@@ -1,0 +1,31 @@
+[package]
+name = "yodb"
+description = "The embedded API: typed handles over one file, with no query language"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+
+# The crate is `yodb` on crates.io because `yo` is taken, and the library is
+# `yo` because `use yo::open` is what a person types.
+[lib]
+name = "yo"
+path = "src/lib.rs"
+
+[dependencies]
+yo-common.workspace = true
+yo-index.workspace = true
+yo-shape.workspace = true
+
+[dev-dependencies]
+criterion = { workspace = true }
+
+[lints]
+workspace = true
+
+[[bench]]
+name = "typed"
+harness = false
