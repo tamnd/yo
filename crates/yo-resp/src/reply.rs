@@ -80,6 +80,15 @@ impl Out {
         self.buf.len()
     }
 
+    /// How much room it is holding, which is what it costs the process.
+    ///
+    /// A reply buffer keeps its capacity between batches on purpose, so `len`
+    /// is what a client is owed and this is what the memory report owes.
+    #[inline]
+    pub fn capacity(&self) -> usize {
+        self.buf.capacity()
+    }
+
     /// Whether nothing is pending.
     #[inline]
     pub fn is_empty(&self) -> bool {

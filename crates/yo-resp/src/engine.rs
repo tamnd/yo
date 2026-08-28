@@ -209,6 +209,11 @@ struct Conn {
     gone: bool,
     /// Already on the dirty list.
     dirty: bool,
+    /// What the two buffers were holding the last time anybody counted.
+    ///
+    /// The connection's share of `INFO memory`, kept here so that reporting it
+    /// is a subtraction against this rather than a walk over every connection.
+    held: usize,
 }
 
 impl Conn {
@@ -228,7 +233,15 @@ impl Conn {
             skip: false,
             gone: false,
             dirty: false,
+            held: 0,
         })
+    }
+
+    /// What the two buffers cost the process, which is the room they are
+    /// holding and not the bytes in use: both keep their capacity between
+    /// batches on purpose.
+    fn size(&self) -> usize {
+        self.buf.capacity() + self.out.capacity()
     }
 
     /// Back to how it was at accept time, buffers kept.
@@ -249,12 +262,28 @@ impl Conn {
 
     /// Drop what the framing has already read, when nothing points into it.
     ///
-    /// A command's arguments are offsets into this buffer and a half read
-    /// command's resume state is another, so this only runs when there is
-    /// neither: after a batch, which is where a pipelining connection spends
-    /// most of its life.
+    /// A framed command's arguments are offsets from the front of this buffer,
+    /// so this waits for the batch to run. After a batch is where a pipelining
+    /// connection spends most of its life, so that is not much of a wait.
+    ///
+    /// A half read command is not in the way. Its decoder was handed
+    /// `buf[head..]` and every offset it kept is from the front of that slice,
+    /// and `head` does not move until the command is complete, so the bytes it
+    /// is waiting on are exactly the bytes this keeps. They arrive at the front
+    /// instead of at `head` and the decoder cannot tell the difference.
+    ///
+    /// Waiting for it anyway is what made a read buffer grow to everything the
+    /// connection had ever sent. The framing loop only ever stops on an
+    /// incomplete command, and a buffer that ends on a command boundary gives
+    /// one of those on the next turn round: an empty slice, nothing decoded,
+    /// `Step::Incomplete`. So a connection that is exactly up to date always had
+    /// a decoder parked on it, this always returned early, and `head` walked
+    /// forward with the bytes behind it kept forever. Measured on server3, four
+    /// connections sending 100000 sets each held 16 MiB of read buffer apiece,
+    /// and fifty connections sending 8000 each held 1 MiB apiece: in both cases
+    /// every byte the connection had ever sent.
     fn compact(&mut self) {
-        if self.pending > 0 || self.partial.is_some() || self.head == 0 {
+        if self.pending > 0 || self.head == 0 {
             return;
         }
         if self.head == self.buf.len() {
@@ -354,8 +383,10 @@ impl<S: Sink> Wire<S> {
         self.server.stats.clients += 1;
         self.server.stats.connections += 1;
 
-        match self.free.pop() {
+        let at = match self.free.pop() {
             Some(at) => {
+                // A reused slot keeps its buffers, so what it holds is already
+                // counted and this only puts the id back in service.
                 self.conns[at as usize].reset(id);
                 at
             }
@@ -364,7 +395,9 @@ impl<S: Sink> Wire<S> {
                 yo_alloc::allow(|| self.conns.push(conn));
                 (self.conns.len() - 1) as ConnId
             }
-        }
+        };
+        self.note_size(at);
+        at
     }
 
     /// The peer went away.
@@ -412,6 +445,15 @@ impl<S: Sink> Wire<S> {
         self.argvs.len()
     }
 
+    /// What every connection's read and reply buffers are holding.
+    ///
+    /// The walk is fine here because this is a test and a report, and the
+    /// number the running server uses is the one kept by `note_size`.
+    #[must_use]
+    pub fn buffer_bytes(&self) -> usize {
+        self.conns.iter().map(Conn::size).sum()
+    }
+
     /// Take bytes off a connection and frame whatever commands they complete.
     ///
     /// Anything left over stays in the connection's buffer, half a command
@@ -429,6 +471,25 @@ impl<S: Sink> Wire<S> {
             yo_alloc::allow(|| c.buf.extend_from_slice(bytes));
         }
         self.frame(conn);
+        self.note_size(conn);
+    }
+
+    /// Tell the server what this connection's buffers are holding now, if it
+    /// has changed since the last time anybody asked.
+    ///
+    /// Once per read and once per flush, which is where a buffer can grow, and
+    /// two loads and a compare when nothing has moved. The alternative is a
+    /// walk over every connection on a turn of the loop, which puts the cost of
+    /// a report nobody has asked for on the command path.
+    fn note_size(&mut self, conn: ConnId) {
+        let c = &mut self.conns[conn as usize];
+        let now = c.size();
+        if now == c.held {
+            return;
+        }
+        let delta = now as isize - c.held as isize;
+        c.held = now;
+        self.server.note_conn_bytes(delta);
     }
 
     /// Move as many complete commands as possible out of the read buffer.
@@ -594,6 +655,7 @@ impl<S: Sink> Wire<S> {
         } else {
             c.compact();
         }
+        self.note_size(conn);
         false
     }
 
@@ -969,6 +1031,71 @@ mod tests {
             decoders <= BATCH_MAX + 1,
             "{decoders} decoders for 32 commands"
         );
+    }
+
+    /// The read buffer holds what has not been dealt with yet and nothing else.
+    ///
+    /// A client that pipelines sixteen commands, waits for the sixteen replies
+    /// and goes again is what `redis-benchmark -P 16` does and what half of the
+    /// clients in the world do. Every one of those rounds leaves the buffer
+    /// exactly caught up, and a buffer that never drops what it has already
+    /// dealt with grows to everything the connection has ever sent: 16 MiB
+    /// apiece on server3 for four connections sending 100000 sets each.
+    #[test]
+    fn a_pipelining_client_does_not_grow_the_read_buffer() {
+        let (mut r, conn, mut batch) = engine();
+        let mut round = Vec::new();
+        for i in 0..16 {
+            round.extend(wire(&[b"SET", format!("k{i}").as_bytes(), b"v"]));
+        }
+
+        r.engine_mut().feed(conn, &round);
+        pump(&mut r, &mut batch);
+        r.engine_mut().sink_mut().clear();
+        let after_one = r.engine().buffer_bytes();
+
+        // A thousand rounds is sixteen thousand commands and about a megabyte
+        // of wire bytes, which is a hundred times what the buffer starts with.
+        for _ in 0..1000 {
+            r.engine_mut().feed(conn, &round);
+            pump(&mut r, &mut batch);
+            r.engine_mut().sink_mut().clear();
+        }
+
+        assert_eq!(
+            r.engine().buffer_bytes(),
+            after_one,
+            "the buffers grew over a thousand rounds of the same sixteen commands"
+        );
+        assert!(
+            r.engine().server().memory_bytes() >= after_one,
+            "the buffers are counted in what the server reports"
+        );
+    }
+
+    /// Half a command in the buffer is the case compaction has to be careful
+    /// about, because the decoder holding it kept offsets into those bytes.
+    #[test]
+    fn a_command_split_across_reads_survives_compaction() {
+        let (mut r, conn, mut batch) = engine();
+        let cmd = wire(&[b"SET", b"key", b"value"]);
+        let (head, tail) = cmd.split_at(cmd.len() - 4);
+
+        // A complete command, so that there is something in front to drop, then
+        // most of a second one.
+        r.engine_mut().feed(conn, &wire(&[b"PING"]));
+        r.engine_mut().feed(conn, head);
+        pump(&mut r, &mut batch);
+        assert_eq!(r.engine().sink().sent(conn), b"+PONG\r\n");
+
+        // The rest of it arrives after the buffer has been compacted under it.
+        r.engine_mut().feed(conn, tail);
+        pump(&mut r, &mut batch);
+        assert_eq!(r.engine().sink().sent(conn), b"+PONG\r\n+OK\r\n");
+
+        r.engine_mut().feed(conn, &wire(&[b"GET", b"key"]));
+        pump(&mut r, &mut batch);
+        assert!(r.engine().sink().sent(conn).ends_with(b"$5\r\nvalue\r\n"));
     }
 
     /// The two walks are the reactor's, not this module's, so the test is that

@@ -111,6 +111,8 @@ pub struct Server {
     /// Where the next maintenance turn starts looking, so that a database
     /// under constant write load cannot hold the other fifteen's space.
     next_db: usize,
+    /// What the connections are holding, kept by the engine.
+    conn_bytes: usize,
     /// The numbers the reactor keeps for `INFO`.
     pub stats: Stats,
 }
@@ -125,6 +127,7 @@ impl Server {
             clock,
             started_ms: clock.now_ms(),
             next_db: 0,
+            conn_bytes: 0,
             stats: Stats::default(),
         }
     }
@@ -137,6 +140,7 @@ impl Server {
             clock,
             started_ms: clock.now_ms(),
             next_db: 0,
+            conn_bytes: 0,
             stats: Stats::default(),
         }
     }
@@ -186,10 +190,27 @@ impl Server {
         self.clock.now_ms().saturating_sub(self.started_ms) / 1000
     }
 
-    /// Bytes held by every database's index and arena.
+    /// Bytes held by every database's index and arena, plus the read and reply
+    /// buffers of every connection.
+    ///
+    /// The buffers are in here because they are real and because Redis counts
+    /// its own, so leaving them out would make the one number people compare
+    /// flattering rather than true. They are not a database, so nothing in the
+    /// keyspace can change them and the engine has to say when they move.
     #[must_use]
     pub fn memory_bytes(&self) -> usize {
-        self.dbs.iter().map(Strings::memory_bytes).sum()
+        self.dbs.iter().map(Strings::memory_bytes).sum::<usize>() + self.conn_bytes
+    }
+
+    /// Note that the connections are holding `delta` bytes more than they were,
+    /// or fewer when it is negative.
+    ///
+    /// A delta and not a total because the alternative is a walk over every
+    /// connection, and the walk would have to happen on a turn of the loop
+    /// rather than when `INFO` asks, which puts the cost of a report on the
+    /// command path of a server nobody is asking.
+    pub fn note_conn_bytes(&mut self, delta: isize) {
+        self.conn_bytes = self.conn_bytes.saturating_add_signed(delta);
     }
 
     /// Keys reclaimed by running into them after their deadline.
