@@ -201,7 +201,8 @@ jobs:
       # here wants to be fuzzed against musl. `rustc -vV` is the host this job is
       # actually running on and is right whoever assembled the toolchain.
       - id: host
-        run: echo "triple=$(rustc -vV | sed -n 's/^host: //p')" >> "$GITHUB_OUTPUT"
+        run: |
+          echo "triple=$(rustc -vV | sed -n 's/^host: //p')" >> "$GITHUB_OUTPUT"
       - run: cargo fuzz build --target ${{ steps.host.outputs.triple }}
       # All five at once rather than one after another. Each is a minute and
       # they used to be five minutes in a row for no reason: they share nothing
