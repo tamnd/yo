@@ -53,13 +53,33 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       run: ${{ steps.decide.outputs.run }}
-      ref: ${{ github.event.inputs.ref || github.ref }}
+      ref: ${{ steps.pick.outputs.ref }}
       shards: ${{ steps.shards.outputs.list }}
       borrows: ${{ steps.decide.outputs.borrows }}
     steps:
+      # A pull request is checked out at its head and not at `refs/pull/N/merge`.
+      # The merge ref stops existing the moment the pull request is merged, and
+      # merging as soon as the local checks are green means this workflow is
+      # often still queued when that happens, so half the deep runs failed in
+      # checkout with `couldn't find remote ref` and told nobody anything about
+      # the code. The head ref is permanent.
+      - id: pick
+        env:
+          INPUT: ${{ github.event.inputs.ref }}
+          NUMBER: ${{ github.event.pull_request.number }}
+          REF: ${{ github.ref }}
+        run: |
+          set -u
+          if [ -n "$INPUT" ]; then
+            echo "ref=$INPUT" >> "$GITHUB_OUTPUT"
+          elif [ -n "$NUMBER" ]; then
+            echo "ref=refs/pull/$NUMBER/head" >> "$GITHUB_OUTPUT"
+          else
+            echo "ref=$REF" >> "$GITHUB_OUTPUT"
+          fi
       - uses: actions/checkout@v7.0.1
         with:
-          ref: ${{ github.event.inputs.ref || github.ref }}
+          ref: ${{ steps.pick.outputs.ref }}
           # Deep enough to diff a pull request against its base and against the
           # commit the last run already covered.
           fetch-depth: 0
