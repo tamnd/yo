@@ -1,0 +1,30 @@
+[package]
+name = "yo-uring"
+description = "The per shard submission ring: io_uring on Linux, the same state machine with synchronous storage everywhere else."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+
+[dependencies]
+yo-common = { workspace = true }
+libc = { workspace = true }
+
+# Linux only, and raw. `16` section 0 picks this crate and rules out anything
+# with an executor in it, which is the whole of R10 and R11. Nothing here is
+# behind a feature, because a ring that is optional is a ring that nobody tests.
+[target.'cfg(target_os = "linux")'.dependencies]
+io-uring = "0.7.14"
+
+[dev-dependencies]
+criterion = { workspace = true }
+
+[lints]
+workspace = true
+
+[[bench]]
+name = "ring"
+harness = false

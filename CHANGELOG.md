@@ -8,6 +8,11 @@ While the major is 0, a minor release may break anything, including the on-disk 
 
 ### Added
 
+- **`yo-uring`, the per shard submission ring.** The second piece of M2 and the thing the last open M1 exit gate row is waiting on, because that row asks for SQPoll and SQPoll is io_uring. One ring per shard, four thousand and ninety six entries, storage and network submissions on the same ring told apart by the user data tag, which is `04` section 7 exactly.
+- **Parked state instead of an async runtime.** A submission that has not finished has its caller's state in a slot, and the next turn of the loop picks it up when the completion arrives. There is no future here, no waker, no executor and no `.await`, which is what `16` section 0 means when it disqualifies anything with an executor in it. The VLDB 2026 io_uring ladder is 16.5 thousand transactions a second when every submission is waited on and 183 thousand when the execution is restructured this way, so the parking is the design rather than an optimisation.
+- **A tag that makes a stale completion detectable.** Eight bits of kind, twenty four of slot, thirty two of generation. The kind routes storage against network with no lookup. The generation is the correctness part: a slot is reused the moment it is freed, so without it the completion for a cancelled read lands on an unrelated connection and nobody ever finds out why.
+- **The same state machine on macOS and Windows, not a gate and not a stub.** `04` section 7 asks for synchronous storage off Linux with the shape kept, so that is what is there. `Features::is_uring` says which of the two produced a row, because a benchmark number that does not say which kernel path it took is a number that will eventually be wrong.
+
 - **`yo-resp`, the RESP2 and RESP3 codec.** The first piece of M2. Requests decode into ranges over the connection's own read buffer, so a command sees the bytes the kernel delivered and nothing is copied on the way in. Replies are written straight out as wire bytes with no intermediate value, which is Y18. Multibulk and inline requests, every RESP2 and RESP3 type, Redis's own limits, and Redis's own protocol error text character for character.
 - **One reply path for both protocols.** A command writes a map, a set or a push and the RESP2 downgrade happens in the codec rather than in the command. That is one place to test instead of three hundred, and it is what stops a command from working on one protocol and not the other.
 - **A resume state on the request decoder.** A value that arrives in ten thousand pieces is scanned once rather than ten thousand times. Without it a slow link makes the parser quadratic in the size of the value, which is a real denial of service on a real network rather than a theoretical one.
@@ -17,7 +22,7 @@ While the major is 0, a minor release may break anything, including the on-disk 
 
 ### Fixed
 
-- **Two hundred megabytes of build artifacts were committed to the repository.** The fuzz directory is excluded from the workspace and has a build directory of its own, and `.gitignore` said `/target`, which is anchored to the root and did not cover it. 895 object files were tracked. They are untracked now and the pattern covers any depth. The history still carries them, so a clone is still large until somebody decides whether a rewrite is worth it.
+- **Two hundred megabytes of build artifacts were committed to the repository.** The fuzz directory is excluded from the workspace and has a build directory of its own, and `.gitignore` said `/target`, which is anchored to the root and did not cover it. 895 object files were tracked. They are untracked now and the pattern covers any depth. The history has been rewritten to drop them as well, so a fresh clone is 824 KB rather than 53 MB. Every file in every commit is byte for byte what it was, only the commit hashes moved, and the four release tags were rewritten and force pushed along with `main`. A commit hash written down before 2026-08-28 will not resolve, which is the price of the rewrite and is worth it once.
 
 ## 0.3.0 — 2026-08-28
 

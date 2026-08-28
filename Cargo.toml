@@ -14,6 +14,7 @@ members = [
     "crates/yo-record",
     "crates/yo-resp",
     "crates/yo-shard",
+    "crates/yo-uring",
     "xtask",
 ]
 # The fuzz targets need nightly and a libfuzzer link, so they are their own
@@ -45,6 +46,7 @@ yo-reader = { path = "crates/yo-reader", version = "0.3.0" }
 yo-record = { path = "crates/yo-record", version = "0.3.0" }
 yo-resp = { path = "crates/yo-resp", version = "0.3.0" }
 yo-shard = { path = "crates/yo-shard", version = "0.3.0" }
+yo-uring = { path = "crates/yo-uring", version = "0.3.0" }
 
 criterion = "0.8"
 libc = "0.2"
