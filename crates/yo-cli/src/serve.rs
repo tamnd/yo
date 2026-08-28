@@ -37,10 +37,24 @@
 //! still owed, because a socket that was full is retried on a timer and not on
 //! an event.
 
+//! # Two doors into the same loop
+//!
+//! A TCP port and, on Unix, a socket file. Same engine, same batch, same
+//! everything above the descriptor: the only difference is which listener
+//! accepted the connection, and by the time it is a `ConnId` nothing further up
+//! can tell. The socket file is there because the loopback round trip is what
+//! bounds every wire number this project publishes (`bench/00` section 4.2) and
+//! a Unix socket does not pay for the TCP stack, so it is the cheapest thing
+//! that moves the ceiling rather than the engine.
+
 use std::io::{self, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
+
+#[cfg(unix)]
+use std::os::unix::net::{UnixListener, UnixStream};
 
 use yo_reactor::Reactor;
 use yo_resp::engine::{Cmd, ConnId, Sink, Wire, pump};
@@ -80,10 +94,130 @@ const OWED_WAIT: Duration = Duration::from_millis(1);
 /// a connection.
 const LISTENER: u64 = u64::MAX;
 
+/// The token the socket file listener is registered under.
+///
+/// One below the other one, for the same reason: ids come from a free list that
+/// starts at zero and there are not four billion connections.
+const UNIX_LISTENER: u64 = u64::MAX - 1;
+
+/// One accepted connection, whichever door it came in through.
+///
+/// An enum and not a boxed trait object, because the read and the write are on
+/// the hot path and this way both stay direct calls. On Windows there is one
+/// variant, which the compiler is welcome to notice.
+enum Sock {
+    Tcp(TcpStream),
+    #[cfg(unix)]
+    Unix(UnixStream),
+}
+
+impl Read for Sock {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        match self {
+            Sock::Tcp(s) => s.read(buf),
+            #[cfg(unix)]
+            Sock::Unix(s) => s.read(buf),
+        }
+    }
+}
+
+impl Write for Sock {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        match self {
+            Sock::Tcp(s) => s.write(buf),
+            #[cfg(unix)]
+            Sock::Unix(s) => s.write(buf),
+        }
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        match self {
+            Sock::Tcp(s) => s.flush(),
+            #[cfg(unix)]
+            Sock::Unix(s) => s.flush(),
+        }
+    }
+}
+
+#[cfg(unix)]
+impl std::os::fd::AsRawFd for Sock {
+    fn as_raw_fd(&self) -> std::os::fd::RawFd {
+        match self {
+            Sock::Tcp(s) => s.as_raw_fd(),
+            Sock::Unix(s) => s.as_raw_fd(),
+        }
+    }
+}
+
+/// A door the server is listening at.
+enum Door {
+    Tcp(TcpListener),
+    #[cfg(unix)]
+    /// The listener and the path it has to unlink on the way out, because a
+    /// socket file outlives the process that made it and the next start would
+    /// find the address in use.
+    Unix(UnixListener, PathBuf),
+}
+
+impl Door {
+    /// Take one waiting connection, already set up the way the loop wants it.
+    fn accept(&self) -> io::Result<Sock> {
+        match self {
+            Door::Tcp(l) => {
+                let (stream, _) = l.accept()?;
+                stream.set_nonblocking(true)?;
+                // Redis sets this and so does everything that talks to it.
+                // Without it a reply waits for the next packet's worth of data
+                // that a request response client is never going to send, which
+                // turns a 50 microsecond round trip into a 40 millisecond one.
+                let _ = stream.set_nodelay(true);
+                Ok(Sock::Tcp(stream))
+            }
+            #[cfg(unix)]
+            Door::Unix(l, _) => {
+                let (stream, _) = l.accept()?;
+                stream.set_nonblocking(true)?;
+                // No Nagle on a Unix socket, because there is no TCP under it.
+                Ok(Sock::Unix(stream))
+            }
+        }
+    }
+
+    /// The token this door is reported under.
+    fn token(&self) -> u64 {
+        match self {
+            Door::Tcp(_) => LISTENER,
+            #[cfg(unix)]
+            Door::Unix(..) => UNIX_LISTENER,
+        }
+    }
+}
+
+#[cfg(unix)]
+impl std::os::fd::AsRawFd for Door {
+    fn as_raw_fd(&self) -> std::os::fd::RawFd {
+        match self {
+            Door::Tcp(l) => l.as_raw_fd(),
+            Door::Unix(l, _) => l.as_raw_fd(),
+        }
+    }
+}
+
+impl Drop for Door {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        if let Door::Unix(_, path) = self {
+            // Ours to remove, because we made it. A failure here means somebody
+            // else already did, which is the outcome this wanted anyway.
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
 /// The sockets, indexed by the connection id the engine handed out.
 #[derive(Default)]
 struct Net {
-    streams: Vec<Option<TcpStream>>,
+    streams: Vec<Option<Sock>>,
     /// Connections whose socket failed, to be told to the engine after the
     /// batch rather than in the middle of it.
     dead: Vec<ConnId>,
@@ -94,7 +228,7 @@ struct Net {
 
 impl Net {
     /// Put a freshly accepted socket at the id the engine gave it.
-    fn attach(&mut self, conn: ConnId, stream: TcpStream) {
+    fn attach(&mut self, conn: ConnId, stream: Sock) {
         if self.streams.len() <= conn as usize {
             self.streams.resize_with(conn as usize + 1, || None);
         }
@@ -154,9 +288,9 @@ impl Sink for Net {
     }
 }
 
-/// A bound listener with the engine behind it.
+/// The doors, with the engine behind them.
 pub struct Server {
-    listener: TcpListener,
+    doors: Vec<Door>,
     reactor: Reactor<Wire<Net>>,
     poller: Poller,
     /// The batch the reactor runs, kept across turns so no turn allocates.
@@ -167,18 +301,35 @@ pub struct Server {
 }
 
 impl Server {
-    /// Bind, and hand back a server that has accepted nothing yet.
+    /// Bind whichever doors were asked for, and hand back a server that has
+    /// accepted nothing yet.
     ///
     /// # Errors
     ///
-    /// Whatever `bind` says, which is usually the port being taken.
-    pub fn bind(addr: SocketAddr) -> io::Result<Server> {
-        let listener = TcpListener::bind(addr)?;
-        listener.set_nonblocking(true)?;
+    /// Whatever `bind` says, and an error of its own when neither a port nor a
+    /// path was given, because a server nobody can reach is not a server.
+    pub fn open(addr: Option<SocketAddr>, path: Option<PathBuf>) -> io::Result<Server> {
+        let mut doors = Vec::new();
+        if let Some(addr) = addr {
+            let listener = TcpListener::bind(addr)?;
+            listener.set_nonblocking(true)?;
+            doors.push(Door::Tcp(listener));
+        }
+        if let Some(path) = path {
+            doors.push(unix_door(&path)?);
+        }
+        if doors.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "nothing to listen on: give a port, a socket file, or both",
+            ));
+        }
         let mut poller = Poller::new()?;
-        poller.add(&listener, LISTENER)?;
+        for door in &doors {
+            poller.add(door, door.token())?;
+        }
         Ok(Server {
-            listener,
+            doors,
             reactor: Reactor::inline(Wire::new(Net::default())),
             poller,
             batch: Vec::with_capacity(64),
@@ -194,7 +345,15 @@ impl Server {
     ///
     /// Whatever the socket says.
     pub fn local_addr(&self) -> io::Result<SocketAddr> {
-        self.listener.local_addr()
+        for door in &self.doors {
+            if let Door::Tcp(l) = door {
+                return l.local_addr();
+            }
+        }
+        Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "this server has no port, only a socket file",
+        ))
     }
 
     /// Turn the loop until `stop` is set.
@@ -217,10 +376,10 @@ impl Server {
 
             let mut worked = false;
             for at in 0..self.ready.len() {
-                if self.ready[at] == LISTENER {
-                    self.accept_ready()?;
-                } else {
-                    self.read_conn(self.ready[at] as ConnId);
+                match self.ready[at] {
+                    LISTENER => self.accept_ready(LISTENER)?,
+                    UNIX_LISTENER => self.accept_ready(UNIX_LISTENER)?,
+                    token => self.read_conn(token as ConnId),
                 }
                 worked = true;
             }
@@ -240,18 +399,14 @@ impl Server {
         Ok(())
     }
 
-    /// Take every connection that is waiting.
-    fn accept_ready(&mut self) -> io::Result<()> {
+    /// Take every connection waiting at one door.
+    fn accept_ready(&mut self, token: u64) -> io::Result<()> {
+        let Some(at) = self.doors.iter().position(|d| d.token() == token) else {
+            return Ok(());
+        };
         loop {
-            match self.listener.accept() {
-                Ok((stream, _)) => {
-                    stream.set_nonblocking(true)?;
-                    // Redis sets this and so does everything that talks to it.
-                    // Without it a reply waits for the next packet's worth of
-                    // data that a request response client is never going to
-                    // send, which turns a 50 microsecond round trip into a 40
-                    // millisecond one.
-                    let _ = stream.set_nodelay(true);
+            match self.doors[at].accept() {
+                Ok(stream) => {
                     let conn = self.reactor.engine_mut().accept();
                     // Registered before the socket is handed over, because
                     // after that the sink owns it and this is the last look.
@@ -319,6 +474,49 @@ impl Server {
     }
 }
 
+/// Bind a socket file, clearing one left behind by a process that is gone.
+///
+/// A socket file outlives the process that made it, so a server that was killed
+/// leaves a path that `bind` refuses. Removing it blind would let a second
+/// server steal a running one's socket, so the stale case is told from the live
+/// one by connecting: something that answers is somebody else's and the error
+/// stands, and something that does not is a leftover and is removed.
+#[cfg(unix)]
+fn unix_door(path: &Path) -> io::Result<Door> {
+    let listener = match UnixListener::bind(path) {
+        Ok(l) => l,
+        Err(e) if e.kind() == io::ErrorKind::AddrInUse => {
+            if UnixStream::connect(path).is_ok() {
+                return Err(io::Error::new(
+                    io::ErrorKind::AddrInUse,
+                    format!(
+                        "{} is a live socket, something is already serving on it",
+                        path.display()
+                    ),
+                ));
+            }
+            std::fs::remove_file(path)?;
+            UnixListener::bind(path)?
+        }
+        Err(e) => return Err(e),
+    };
+    listener.set_nonblocking(true)?;
+    Ok(Door::Unix(listener, path.to_path_buf()))
+}
+
+/// There are no socket files here, so asking for one is an error and not a
+/// silent fallback to a port nobody asked for.
+#[cfg(not(unix))]
+fn unix_door(path: &Path) -> io::Result<Door> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        format!(
+            "{}: this platform has no unix sockets, so serve on a port",
+            path.display()
+        ),
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -342,8 +540,11 @@ mod tests {
     /// under it belong to the thread that made them: one shard, one thread, no
     /// locks (Y1). That is the design and not a limitation of the test.
     fn served(client: impl FnOnce(SocketAddr) + Send + 'static) {
-        let mut server =
-            Server::bind("127.0.0.1:0".parse().expect("a literal address")).expect("a free port");
+        let mut server = Server::open(
+            Some("127.0.0.1:0".parse().expect("a literal address")),
+            None,
+        )
+        .expect("a free port");
         let addr = server.local_addr().expect("bound");
         let stop = Arc::new(AtomicBool::new(false));
         let flag = Arc::clone(&stop);
@@ -503,5 +704,155 @@ mod tests {
                 .expect("sent");
             assert_eq!(read_exact(&mut last, 7), b"$1\r\n8\r\n");
         });
+    }
+
+    #[cfg(unix)]
+    mod unix {
+        use super::*;
+        use std::os::unix::net::UnixStream;
+
+        /// A path in the temporary directory that no other test is using.
+        ///
+        /// Named after the test rather than after a random number, because a
+        /// leftover from a crashed run should be recognisable and should be
+        /// reused rather than accumulating.
+        fn socket_path(name: &str) -> PathBuf {
+            let mut p = std::env::temp_dir();
+            p.push(format!("yodb-test-{name}-{}.sock", std::process::id()));
+            let _ = std::fs::remove_file(&p);
+            p
+        }
+
+        /// The same harness as `served`, over a socket file.
+        fn served_unix(name: &str, client: impl FnOnce(PathBuf) + Send + 'static) {
+            let path = socket_path(name);
+            let mut server = Server::open(None, Some(path.clone())).expect("a fresh path");
+            let stop = Arc::new(AtomicBool::new(false));
+            let flag = Arc::clone(&stop);
+            let theirs = path.clone();
+
+            let thread = std::thread::spawn(move || {
+                let _stopper = Stopper(flag);
+                client(theirs);
+            });
+
+            server.run(&stop).expect("the listener stays up");
+            if let Err(panic) = thread.join() {
+                std::panic::resume_unwind(panic);
+            }
+        }
+
+        #[test]
+        fn a_client_gets_its_replies_over_a_socket_file() {
+            served_unix("replies", |path| {
+                let mut client = UnixStream::connect(&path).expect("the server is listening");
+                client
+                    .set_read_timeout(Some(Duration::from_secs(10)))
+                    .expect("a timeout the platform accepts");
+
+                client.write_all(b"*1\r\n$4\r\nPING\r\n").expect("sent");
+                assert_eq!(read_exact(&mut client, 7), b"+PONG\r\n");
+
+                client
+                    .write_all(b"*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$5\r\nvalue\r\n")
+                    .expect("sent");
+                assert_eq!(read_exact(&mut client, 5), b"+OK\r\n");
+
+                client
+                    .write_all(b"*2\r\n$3\r\nGET\r\n$1\r\nk\r\n")
+                    .expect("sent");
+                assert_eq!(read_exact(&mut client, 11), b"$5\r\nvalue\r\n");
+            });
+        }
+
+        /// Both doors, one keyspace. A client on the port and a client on the
+        /// socket file are talking to the same engine, which is the thing that
+        /// would be easy to get wrong by running two of anything.
+        #[test]
+        fn the_port_and_the_socket_file_are_the_same_server() {
+            let path = socket_path("both");
+            let mut server = Server::open(
+                Some("127.0.0.1:0".parse().expect("a literal address")),
+                Some(path.clone()),
+            )
+            .expect("a free port and a fresh path");
+            let addr = server.local_addr().expect("bound");
+            let stop = Arc::new(AtomicBool::new(false));
+            let flag = Arc::clone(&stop);
+
+            let thread = std::thread::spawn(move || {
+                let _stopper = Stopper(flag);
+                let mut over_tcp = connect(addr);
+                over_tcp
+                    .write_all(b"*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$4\r\nboth\r\n")
+                    .expect("sent");
+                assert_eq!(read_exact(&mut over_tcp, 5), b"+OK\r\n");
+
+                let mut over_file = UnixStream::connect(&path).expect("listening there too");
+                over_file
+                    .set_read_timeout(Some(Duration::from_secs(10)))
+                    .expect("a timeout the platform accepts");
+                over_file
+                    .write_all(b"*2\r\n$3\r\nGET\r\n$1\r\nk\r\n")
+                    .expect("sent");
+                assert_eq!(read_exact(&mut over_file, 10), b"$4\r\nboth\r\n");
+            });
+
+            server.run(&stop).expect("the listener stays up");
+            if let Err(panic) = thread.join() {
+                std::panic::resume_unwind(panic);
+            }
+        }
+
+        /// A socket file left behind by a process that is gone is not a reason
+        /// to refuse to start.
+        #[test]
+        fn a_leftover_socket_file_is_cleared() {
+            let path = socket_path("leftover");
+            {
+                let _first = Server::open(None, Some(path.clone())).expect("a fresh path");
+            }
+            // The first server is dropped, which unlinks it, so put a file
+            // back by hand. Dropping a UnixListener closes the descriptor and
+            // leaves the path, which is exactly the state a killed process
+            // leaves behind.
+            drop(std::os::unix::net::UnixListener::bind(&path).expect("bound"));
+            assert!(path.exists(), "the leftover is there");
+
+            let second = Server::open(None, Some(path.clone()));
+            assert!(second.is_ok(), "{:?}", second.err());
+        }
+
+        /// A socket file with a server on it is somebody else's.
+        #[test]
+        fn a_live_socket_file_is_not_stolen() {
+            let path = socket_path("live");
+            let _first = Server::open(None, Some(path.clone())).expect("a fresh path");
+            let e = match Server::open(None, Some(path.clone())) {
+                Ok(_) => panic!("something is already serving there"),
+                Err(e) => e,
+            };
+            assert_eq!(e.kind(), io::ErrorKind::AddrInUse, "{e}");
+        }
+
+        /// The path goes away with the server that made it.
+        #[test]
+        fn the_socket_file_is_removed_on_the_way_out() {
+            let path = socket_path("cleanup");
+            {
+                let _server = Server::open(None, Some(path.clone())).expect("a fresh path");
+                assert!(path.exists(), "it is there while the server is");
+            }
+            assert!(!path.exists(), "and gone once the server is dropped");
+        }
+
+        #[test]
+        fn a_server_with_no_door_is_refused() {
+            let e = match Server::open(None, None) {
+                Ok(_) => panic!("nothing to listen on"),
+                Err(e) => e,
+            };
+            assert_eq!(e.kind(), io::ErrorKind::InvalidInput);
+        }
     }
 }

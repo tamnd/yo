@@ -28,15 +28,19 @@ yodb, an embedded knowledge engine
 
 usage:
   yodb check FILE [--quick] [--quiet]
-  yodb serve [--bind ADDR] [--port PORT]
+  yodb serve [--bind ADDR] [--port PORT] [--unixsocket PATH] [--no-port]
 
   check    read a .yo file and report anything wrong with it. Never writes.
              --quick   skip the records and read only the headers
              --quiet   print findings and the summary, nothing else
 
   serve    speak RESP on a socket, so a Redis client can talk to it.
-             --bind    address to listen on, 127.0.0.1 by default
-             --port    port to listen on, 6379 by default
+             --bind        address to listen on, 127.0.0.1 by default
+             --port        port to listen on, 6379 by default
+             --unixsocket  also listen on a socket file, which skips the
+                           TCP stack and is the faster way in for a client
+                           on the same machine
+             --no-port     no TCP at all, socket file only
 
 exit codes:
   0  nothing wrong
@@ -169,6 +173,8 @@ fn check_command(args: &[&str]) -> ExitCode {
 fn serve_command(args: &[&str]) -> ExitCode {
     let mut bind = DEFAULT_BIND.to_string();
     let mut port = DEFAULT_PORT;
+    let mut unixsocket: Option<std::path::PathBuf> = None;
+    let mut tcp = true;
 
     let mut at = 0;
     while at < args.len() {
@@ -179,7 +185,8 @@ fn serve_command(args: &[&str]) -> ExitCode {
                 print!("{USAGE}");
                 return ExitCode::SUCCESS;
             }
-            "--bind" | "--port" => {
+            "--no-port" => tcp = false,
+            "--bind" | "--port" | "--unixsocket" => {
                 let Some(value) = args.get(at) else {
                     eprintln!("yodb serve: {arg} needs a value");
                     return ExitCode::from(2);
@@ -187,6 +194,8 @@ fn serve_command(args: &[&str]) -> ExitCode {
                 at += 1;
                 if arg == "--bind" {
                     bind = (*value).to_string();
+                } else if arg == "--unixsocket" {
+                    unixsocket = Some(std::path::PathBuf::from(*value));
                 } else {
                     match value.parse() {
                         Ok(p) => port = p,
@@ -208,19 +217,40 @@ fn serve_command(args: &[&str]) -> ExitCode {
         eprintln!("yodb serve: {bind} is not an address to listen on");
         return ExitCode::from(2);
     };
+    if !tcp && unixsocket.is_none() {
+        eprintln!("yodb serve: --no-port with no --unixsocket leaves nothing to connect to");
+        return ExitCode::from(2);
+    }
 
-    let mut server = match serve::Server::bind(addr) {
+    let want = if tcp { Some(addr) } else { None };
+    let mut server = match serve::Server::open(want, unixsocket.clone()) {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("yodb serve: {addr}: {e}");
+            eprintln!("yodb serve: {e}");
             return ExitCode::from(2);
         }
     };
 
     // What it actually bound to, which is the only way to find out when the
     // port asked for was zero.
-    let bound = server.local_addr().unwrap_or(addr);
-    println!("yodb {} listening on {bound}", env!("CARGO_PKG_VERSION"));
+    let version = env!("CARGO_PKG_VERSION");
+    match (tcp, &unixsocket) {
+        (true, Some(path)) => {
+            let bound = server.local_addr().unwrap_or(addr);
+            println!(
+                "yodb {version} listening on {bound} and on {}",
+                path.display()
+            );
+        }
+        (true, None) => {
+            let bound = server.local_addr().unwrap_or(addr);
+            println!("yodb {version} listening on {bound}");
+        }
+        (false, Some(path)) => {
+            println!("yodb {version} listening on {}", path.display());
+        }
+        (false, None) => unreachable!("refused above"),
+    }
 
     // Nothing sets this yet. Ctrl-C ends the process, and there is no state to
     // flush until the file arrives in M5, which is when a shutdown that waits
