@@ -370,12 +370,7 @@ mod tests {
         let first = put(&mut log, &mut idx, b"survivor", b"the only copy");
         // Push it out of the resident window.
         for i in 0..400u32 {
-            put(
-                &mut log,
-                &mut idx,
-                &nkey("filler", i),
-                &[0u8; 60],
-            );
+            put(&mut log, &mut idx, &nkey("filler", i), &[0u8; 60]);
         }
         log.commit_pending().unwrap();
         assert!(first < log.head(), "the record never became stable");
