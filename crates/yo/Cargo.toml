@@ -18,6 +18,7 @@ path = "src/lib.rs"
 [dependencies]
 yo-common.workspace = true
 yo-index.workspace = true
+yo-kv.workspace = true
 yo-shape.workspace = true
 
 [dev-dependencies]
@@ -28,4 +29,8 @@ workspace = true
 
 [[bench]]
 name = "typed"
+harness = false
+
+[[bench]]
+name = "inline"
 harness = false

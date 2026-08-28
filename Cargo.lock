@@ -959,6 +959,7 @@ dependencies = [
  "criterion",
  "yo-common",
  "yo-index",
+ "yo-kv",
  "yo-shape",
 ]
 
