@@ -920,6 +920,7 @@ name = "yo-resp"
 version = "0.3.1"
 dependencies = [
  "criterion",
+ "libc",
  "yo-alloc",
  "yo-common",
  "yo-kv",

@@ -52,6 +52,7 @@
 //! it, because a shard thread that allocates aborts.
 
 mod args;
+mod cpu;
 mod keyspace;
 mod scripting;
 mod server;
@@ -912,6 +913,47 @@ mod tests {
         assert!(clients.contains("connected_clients:0"), "{clients}");
         assert!(!clients.contains("redis_version"), "{clients}");
         assert_eq!(f.run(&[b"INFO", b"nosuch"]), "$0\r\n\r\n");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn info_cpu_reports_processor_time_that_was_really_measured() {
+        let mut f = Fixture::new();
+        let cpu = f.run(&[b"INFO", b"cpu"]);
+        assert!(cpu.contains("# CPU"), "{cpu}");
+        // Redis's unit/info-command asks for this one by name in three tests.
+        assert!(cpu.contains("used_cpu_user:"), "{cpu}");
+        assert!(cpu.contains("used_cpu_sys:"), "{cpu}");
+        assert!(cpu.contains("used_cpu_user_children:0.000000"), "{cpu}");
+        assert!(!cpu.contains("redis_version"), "{cpu}");
+
+        // It is a measurement and not a constant, so it goes up when work
+        // happens. A tight loop rather than a sleep, because sleeping is the
+        // one thing that does not move this number.
+        let before = used_cpu_user(&cpu);
+        let mut n = 0u64;
+        let mut rounds = 0;
+        while used_cpu_user(&f.run(&[b"INFO", b"cpu"])) <= before {
+            for i in 0..1_000_000u64 {
+                n = n.wrapping_add(i.wrapping_mul(i));
+            }
+            rounds += 1;
+            // A bound rather than a spin, so a platform where this number does
+            // not move fails here instead of hanging. Even a clock with whole
+            // millisecond granularity gets there in the first round or two.
+            assert!(rounds < 1_000, "cpu time never moved, n is {n}");
+        }
+    }
+
+    /// Pull `used_cpu_user` back out of an `INFO cpu` reply.
+    #[cfg(unix)]
+    fn used_cpu_user(info: &str) -> f64 {
+        info.lines()
+            .find_map(|l| l.strip_prefix("used_cpu_user:"))
+            .expect("no used_cpu_user in the reply")
+            .trim()
+            .parse()
+            .expect("used_cpu_user is not a number")
     }
 
     /// The safety net under the rule that a body checks its arguments before
