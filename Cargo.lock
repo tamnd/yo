@@ -876,6 +876,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "yo-resp"
+version = "0.3.0"
+dependencies = [
+ "criterion",
+ "yo-common",
+]
+
+[[package]]
 name = "yo-shard"
 version = "0.3.0"
 dependencies = [

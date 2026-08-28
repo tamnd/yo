@@ -12,6 +12,7 @@ members = [
     "crates/yo-index",
     "crates/yo-reader",
     "crates/yo-record",
+    "crates/yo-resp",
     "crates/yo-shard",
     "xtask",
 ]
@@ -42,6 +43,7 @@ yo-format = { path = "crates/yo-format", version = "0.3.0" }
 yo-index = { path = "crates/yo-index", version = "0.3.0" }
 yo-reader = { path = "crates/yo-reader", version = "0.3.0" }
 yo-record = { path = "crates/yo-record", version = "0.3.0" }
+yo-resp = { path = "crates/yo-resp", version = "0.3.0" }
 yo-shard = { path = "crates/yo-shard", version = "0.3.0" }
 
 criterion = "0.8"
