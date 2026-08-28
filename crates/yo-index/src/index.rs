@@ -162,6 +162,24 @@ impl Index {
         (hash as usize) & (SEGMENT_BUCKETS - 1)
     }
 
+    /// Ask the cache for the bucket `hash` is going to land in.
+    ///
+    /// The first of the two walks in `04` section 3. It costs one instruction,
+    /// it reads nothing, and it is the difference between a batch of 64 lookups
+    /// paying 64 serial cache misses and paying them overlapped. Only the first
+    /// bucket is asked for: the directory entry and the segment header are on
+    /// the way to it anyway, and an overflow bucket is a 1 in a few hundred
+    /// event that is not worth a second hint.
+    ///
+    /// Calling this and then never doing the lookup is allowed and wastes a
+    /// little bandwidth. Calling it with a hash from a different key is also
+    /// allowed and does the same, which is the whole reason a hint is a hint.
+    #[inline(always)]
+    pub fn prefetch(&self, hash: u64) {
+        let seg = &self.segs[self.dir[self.dir_index(hash)] as usize];
+        yo_common::prefetch(&seg.buckets[Self::bucket_index(hash)]);
+    }
+
     /// Find the address stored under `key`.
     ///
     /// The hot path, and the one M0's four nanosecond gate measures. One load

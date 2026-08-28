@@ -102,11 +102,36 @@ impl RawMap {
         self.index.is_empty()
     }
 
+    /// The hash this map files `key` under.
+    ///
+    /// Public because the batch walk in `04` section 3 hashes on the first walk
+    /// and looks up on the second, and the alternative is hashing every key
+    /// twice to keep the seed a private detail.
+    #[inline]
+    #[must_use]
+    pub fn hash_of(key: &[u8]) -> u64 {
+        wyhash(key, 0)
+    }
+
+    /// Ask the cache for the bucket `hash` will be looked up in.
+    #[inline]
+    pub fn prefetch(&self, hash: u64) {
+        self.index.prefetch(hash);
+    }
+
     /// The value stored under `key`.
     #[inline]
     pub fn get(&self, key: &[u8]) -> Option<&[u8]> {
-        let h = wyhash(key, 0);
-        let addr = self.index.get(h, key, &Records { arena: &self.arena })?;
+        self.get_hashed(Self::hash_of(key), key)
+    }
+
+    /// The value stored under `key`, whose hash the caller already has.
+    ///
+    /// The second walk's entry point. `hash` has to be [`RawMap::hash_of`] of
+    /// this key: a hash from somewhere else is not unsafe, it just misses.
+    #[inline]
+    pub fn get_hashed(&self, hash: u64, key: &[u8]) -> Option<&[u8]> {
+        let addr = self.index.get(hash, key, &Records { arena: &self.arena })?;
         Some(self.value_at(addr))
     }
 

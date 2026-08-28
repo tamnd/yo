@@ -875,6 +875,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "yo-reactor"
+version = "0.3.1"
+dependencies = [
+ "criterion",
+ "yo-common",
+ "yo-index",
+ "yo-shard",
+]
+
+[[package]]
 name = "yo-reader"
 version = "0.3.1"
 dependencies = [

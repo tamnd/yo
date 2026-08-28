@@ -1,0 +1,25 @@
+[package]
+name = "yo-reactor"
+description = "The shard loop: six stages, a batch of 64, and a two walk prefetch, with no executor under it."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+
+[dependencies]
+yo-common = { workspace = true }
+yo-shard = { workspace = true }
+
+[dev-dependencies]
+criterion = { workspace = true }
+yo-index = { workspace = true }
+
+[lints]
+workspace = true
+
+[[bench]]
+name = "loop"
+harness = false
