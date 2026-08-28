@@ -475,9 +475,21 @@ impl<S: Sink> Wire<S> {
     }
 
     /// A decoder from the pool, or a new one the first time round.
+    ///
+    /// The one from the pool is reset before it goes out, because a decoder can
+    /// come back to the pool part way through a command: a protocol error stops
+    /// framing where it is, and a connection that hangs up with half a command
+    /// in its buffer hands its decoder back too. Either one leaves a resume
+    /// point behind, and a resume point is an offset into a buffer that is
+    /// about to stop being the same buffer. A decoder taken here is always
+    /// starting a command, never continuing one, since a continuation comes off
+    /// the connection's own `partial` and never off the pool.
     fn take_decoder(&mut self) -> u32 {
         match self.spare.pop() {
-            Some(slot) => slot,
+            Some(slot) => {
+                self.argvs[slot as usize].reset();
+                slot
+            }
             None => yo_alloc::allow(|| {
                 self.argvs.push(Argv::with_capacity(ARGV_HINT));
                 (self.argvs.len() - 1) as u32
@@ -847,6 +859,39 @@ mod tests {
         assert!(sent.starts_with(b"-ERR Protocol error: "), "{sent:?}");
         assert!(r.engine().sink().was_closed(conn));
         assert_eq!(r.engine().clients(), 0);
+    }
+
+    /// Redis's own `unit/protocol` walks a list of malformed frames, each on a
+    /// fresh connection, which means every one of them after the first runs on
+    /// a decoder that came back to the pool part way through a command.
+    #[test]
+    fn a_decoder_that_came_back_mid_command_starts_the_next_one_clean() {
+        let (mut r, conn, mut batch) = engine();
+        // Stops inside the third argument, on a length that is not a length.
+        r.engine_mut()
+            .feed(conn, b"*3\r\n$3\r\nSET\r\n$1\r\nx\r\n$blabla\r\n");
+        pump(&mut r, &mut batch);
+        let sent = r.engine().sink().sent(conn);
+        assert!(
+            sent.starts_with(b"-ERR Protocol error: invalid bulk length"),
+            "{sent:?}"
+        );
+
+        // The slot that decoder was in is now the slot the next connection
+        // gets, and it has to be at the start of a command and not half way
+        // through the one that went wrong.
+        r.engine_mut().sink_mut().clear();
+        let next = r.engine_mut().accept();
+        r.engine_mut().feed(next, &wire(&[b"GET", b"k"]));
+        pump(&mut r, &mut batch);
+        assert_eq!(r.engine().sink().sent(next), b"$-1\r\n");
+
+        r.engine_mut().sink_mut().clear();
+        let third = r.engine_mut().accept();
+        r.engine_mut().feed(third, b"*1\r\n+notabulk\r\n");
+        pump(&mut r, &mut batch);
+        let sent = r.engine().sink().sent(third);
+        assert!(sent.starts_with(b"-ERR Protocol error: "), "{sent:?}");
     }
 
     /// A client that hangs up mid batch is the case that gets a server killed:
