@@ -12,7 +12,7 @@ Benchmark numbers published so far are development measurements taken on a machi
 
 ## Packages
 
-There is nothing to install. Every package below is published at `0.0.0`, holds a name, and raises the moment you call anything in it.
+There is nothing to install. Every package below is published at `0.0.1`, holds a name, and raises the moment you call anything in it.
 
 | | Command | Repository |
 |---|---|---|
@@ -22,7 +22,7 @@ There is nothing to install. Every package below is published at `0.0.0`, holds 
 | Go | `go get github.com/tamnd/yo-go` | [yo-go](https://github.com/tamnd/yo-go) |
 | Java | `com.tamnd:yodb` | [yo-java](https://github.com/tamnd/yo-java) |
 | .NET | `dotnet add package Yodb` | [yo-dotnet](https://github.com/tamnd/yo-dotnet) |
-| Swift | `.package(url: "https://github.com/tamnd/yo-swift", from: "0.0.0")` | [yo-swift](https://github.com/tamnd/yo-swift) |
+| Swift | `.package(url: "https://github.com/tamnd/yo-swift", from: "0.0.1")` | [yo-swift](https://github.com/tamnd/yo-swift) |
 | Dart | `dart pub add yodb` | [yo-dart](https://github.com/tamnd/yo-dart) |
 | C, C++ | nothing published; the library ships as `libyo` | [yo-c](https://github.com/tamnd/yo-c) |
 
