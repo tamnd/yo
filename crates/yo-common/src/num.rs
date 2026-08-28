@@ -144,6 +144,29 @@ pub fn parse_i64(s: &[u8]) -> Option<i64> {
 /// The largest magnitude Redis's `double2ll` will turn into an integer.
 const DOUBLE_INT_LIMIT: f64 = 4_503_599_627_370_496.0; // 2^52
 
+/// Redis's `getLongDoubleFromObject`, as far as the difference is observable.
+///
+/// A float argument and a float value are parsed by the same rules, and the
+/// rules are stricter than Rust's `str::parse`: no leading or trailing
+/// whitespace at all, and `nan` is refused where the infinities are not. Redis
+/// refuses NaN because every command that takes a float goes on to store the
+/// result, and a stored NaN compares false against itself forever after.
+///
+/// This lives here for the same reason [`parse_i64`] does. It is not a codec
+/// question, it is the same question the string type asks of a stored value,
+/// and the storage layer cannot reach into the wire layer to ask it.
+pub fn parse_f64(s: &[u8]) -> Option<f64> {
+    if s.is_empty() || s[0].is_ascii_whitespace() {
+        return None;
+    }
+    let text = core::str::from_utf8(s).ok()?;
+    if text.trim() != text {
+        return None;
+    }
+    let v: f64 = text.parse().ok()?;
+    if v.is_nan() { None } else { Some(v) }
+}
+
 /// Appends a double the way Redis 8 writes one.
 ///
 /// Redis stopped using `%.17g` in 7.0 and now writes a double in two cases: a
@@ -273,6 +296,22 @@ mod tests {
         // exists going downwards.
         assert_eq!(parse_i64(b"0"), Some(0));
         assert_eq!(parse_i64(b"-9223372036854775808"), Some(i64::MIN));
+    }
+
+    #[test]
+    fn the_float_parser_refuses_what_redis_refuses() {
+        assert_eq!(parse_f64(b"3.5"), Some(3.5));
+        assert_eq!(parse_f64(b"-0"), Some(-0.0));
+        assert_eq!(parse_f64(b"3.0e3"), Some(3000.0));
+        assert_eq!(parse_f64(b"inf"), Some(f64::INFINITY));
+        assert_eq!(parse_f64(b"-inf"), Some(f64::NEG_INFINITY));
+        // No whitespace anywhere, nothing trailing, and no NaN, because a
+        // stored NaN compares false against itself for the rest of time.
+        assert_eq!(parse_f64(b" 3.5"), None);
+        assert_eq!(parse_f64(b"3.5 "), None);
+        assert_eq!(parse_f64(b"3.5x"), None);
+        assert_eq!(parse_f64(b""), None);
+        assert_eq!(parse_f64(b"nan"), None);
     }
 
     #[test]

@@ -46,9 +46,9 @@ impl Num {
     fn as_int(self, what: &str) -> Result<i64> {
         match self {
             Num::Int(n) => Ok(n),
-            Num::Float(_) => Err(Error::new(
+            Num::Float(_) => Err(Error::fmt(
                 Code::Invalid,
-                format!("{what} is not an integer or out of range"),
+                format_args!("{what} is not an integer or out of range"),
             )),
         }
     }
@@ -176,6 +176,9 @@ pub fn apply(current: Num, opts: &IncrEx) -> Result<Counted> {
             let now = current.as_int("value")?;
             let lo = opts.lower.map_or(Ok(i64::MIN), |b| b.as_int("LBOUND"))?;
             let hi = opts.upper.map_or(Ok(i64::MAX), |b| b.as_int("UBOUND"))?;
+            if lo > hi {
+                return Err(bounds_crossed());
+            }
             let want = now.checked_add(by);
             let out = match want {
                 Some(v) if v >= lo && v <= hi => Some(v),
@@ -209,6 +212,9 @@ pub fn apply(current: Num, opts: &IncrEx) -> Result<Counted> {
             };
             let lo = opts.lower.map_or(Ok(f64::MIN), |b| b.as_float("LBOUND"))?;
             let hi = opts.upper.map_or(Ok(f64::MAX), |b| b.as_float("UBOUND"))?;
+            if lo > hi {
+                return Err(bounds_crossed());
+            }
             let want = now + by;
             let out = if want.is_finite() && want >= lo && want <= hi {
                 Some(want)
@@ -233,6 +239,15 @@ pub fn apply(current: Num, opts: &IncrEx) -> Result<Counted> {
             })
         }
     }
+}
+
+/// What a real 8.8 says when the range is empty.
+///
+/// It refuses rather than treating it as a range nothing fits in, which is the
+/// right call: a caller that has its bounds the wrong way round has a bug, and
+/// silently refusing every increment forever is a hard bug to find.
+fn bounds_crossed() -> Error {
+    Error::new(Code::Invalid, "LBOUND can't be greater than UBOUND")
 }
 
 #[cfg(test)]
@@ -299,6 +314,19 @@ mod tests {
         let down = apply(int(i64::MIN), &IncrEx::PLAIN.by(int(-1)).saturating()).unwrap();
         assert_eq!(down.value, int(i64::MIN));
         assert_eq!(down.applied, int(0));
+    }
+
+    #[test]
+    fn bounds_the_wrong_way_round_are_refused_rather_than_obeyed() {
+        // `INCREX c UBOUND 5 LBOUND 10` on a real 8.8.
+        let opts = IncrEx::PLAIN.between(Some(int(10)), Some(int(5)));
+        let e = apply(int(0), &opts).unwrap_err();
+        assert_eq!(e.message(), "LBOUND can't be greater than UBOUND");
+
+        let f = IncrEx::PLAIN
+            .by(Num::Float(1.0))
+            .between(Some(Num::Float(10.0)), Some(Num::Float(5.0)));
+        assert!(apply(Num::Float(0.0), &f).is_err());
     }
 
     #[test]

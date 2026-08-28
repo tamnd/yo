@@ -36,6 +36,8 @@ While the major is 0, a minor release may break anything, including the on-disk 
 
 ### Fixed
 
+- **Building an error message would have aborted the server.** An error carries a `String`, a shard thread that allocates aborts, and every error message in `yo-kv` is built on a shard thread, so the first client to send `INCR` at a key holding a word would have taken the process down with it. It has not happened yet only because the reactor is not wired to the string type, which is the next pull request. Constructing an error is now allowed to touch the heap, since an error is by definition off the path the hundred and fifty nanosecond budget is about, and `Error::fmt` exists for the messages that need formatting because `format!` allocates before the constructor ever sees it.
+- **`INCREX` obeyed a range it should have refused.** `LBOUND 10 UBOUND 5` is a range nothing fits in, and refusing every increment forever is a hard bug to find in a caller that has its arguments the wrong way round. A real 8.8 answers `ERR LBOUND can't be greater than UBOUND` and now so does this.
 - **`INCRBYFLOAT` stored `raw` where Redis stores `embstr`.** A float counter that lands on a short result gets `tryObjectEncoding` run over it on the way in, the same as `SET` does, so `SET k 5` followed by `INCRBYFLOAT k 1` leaves `embstr` and not `raw`. `APPEND` and `SETRANGE` really do leave `raw` even for four bytes, which is what made the wrong behaviour look right. The old test asserted the bug, so it was locked in until `INCREX BYFLOAT` was written from what a real server reports and the two disagreed.
 - **`parse_i64` accepted `-0`, which Redis does not.** Redis's `string2ll` tests its zero case against the length of the whole string, so the minus sign pushes `-0` past it and into the one to nine gate, which it fails. That is not only a parsing detail, because the same rules decide whether a string is stored int encoded. Left alone, `SET k -0` would have been stored as the integer zero and `GET k` would have handed back `0` for a value the client wrote as `-0`.
 
@@ -50,6 +52,8 @@ Four new ones, all in the string type, all listed here rather than left to be di
 
 ### Internal
 
+- **`MSET`, `MSETNX` and `MSETEX` take an iterator of pairs rather than a slice.** The wire layer has its pairs as positions in the connection's read buffer, so a slice would mean collecting them into a `Vec` before the call. `MSET` is one of the four commands M2 is measured on and a shard thread that allocates aborts, so an API that forces an allocation to call it is the wrong API. The iterator is walked twice, which is why it has to be `Clone`, and an iterator over borrowed slices is two words to copy.
+- **`parse_f64` moved from `yo-kv` to `yo-common`, next to `parse_i64`.** Same reason the integer one moved out of `yo-resp`: whether an argument is a float and whether a stored value is a float are the same question, and the answer should not live in a layer the other one cannot reach.
 - **`num.rs` moved from `yo-resp` to `yo-common`.** Whether a bulk length parses and whether a string is stored int encoded are the same `string2ll` question, and the answer should not live in the wire layer where the storage layer cannot reach it without depending on the protocol. `yo_resp::num` still resolves and still means what it meant.
 
 ### Performance
