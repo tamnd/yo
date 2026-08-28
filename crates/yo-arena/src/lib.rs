@@ -592,6 +592,25 @@ impl Arena {
             .collect()
     }
 
+    /// How many segments have passed [`Arena::COMPACT_RATIO`].
+    ///
+    /// The same test as [`Arena::compaction_candidates`] without the vector.
+    /// The compactor asks this to size its next slice of work and the answer it
+    /// wants is a depth, not a list, and it asks on a path that is not allowed
+    /// to allocate.
+    ///
+    /// Free segments are skipped before their header is touched rather than
+    /// after. A free segment has given its pages back, so reading its header to
+    /// find out it has nothing dead in it would fault two megabytes back in to
+    /// answer a question about a segment that is empty.
+    pub fn candidate_count(&self) -> usize {
+        let threshold = (SEGMENT_SIZE as f64 * Self::COMPACT_RATIO) as u64;
+        (0..self.segs.len())
+            .filter(|&i| i != self.cur && !self.segs[i].free)
+            .filter(|&i| self.segs[i].header().dead_bytes >= threshold)
+            .count()
+    }
+
     /// The candidate with the most dead bytes, or `None` if there is nothing
     /// worth moving.
     ///
