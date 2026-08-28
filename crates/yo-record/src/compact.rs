@@ -395,7 +395,14 @@ mod tests {
         let mut idx = Map::default();
         // One key, written over and over. Every copy but the last is garbage,
         // which is the workload lookup based compaction is for.
-        let rounds = 4000u32;
+        //
+        // Four thousand is about fifteen 8 KiB pages. Miri writes twelve
+        // hundred, which is four and a half, so pages still leave the three
+        // page resident window and the pass still has more than a page of
+        // stable region to walk. There is a floor here and it is not far below:
+        // under about eight hundred records nothing has been evicted, there is
+        // no stable region, and the test passes while checking nothing.
+        let rounds: u32 = if cfg!(miri) { 1_200 } else { 4_000 };
         for i in 0..rounds {
             put(&mut log, &mut idx, b"hot", &i.to_le_bytes());
         }
@@ -422,7 +429,14 @@ mod tests {
 
         // A mix: some keys written once, some written many times. Then compact
         // the whole stable region and check every survivor.
-        for round in 0..40u32 {
+        //
+        // Forty rounds over eighty keys is about thirty two pages. Miri does
+        // twenty rounds, which is sixteen, and the count of keys does not move
+        // because it is what decides how many survivors `check_all` has to find.
+        // Rounds are the repetition and pages are the coverage, so this is the
+        // one of the two that can go.
+        let rounds: u32 = if cfg!(miri) { 20 } else { 40 };
+        for round in 0..rounds {
             for k in 0..80u32 {
                 let key = format!("key{k}").into_bytes();
                 let value = format!("round{round}value{k}").into_bytes();
