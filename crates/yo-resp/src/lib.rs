@@ -68,7 +68,6 @@
 
 pub mod error;
 pub mod frame;
-pub mod num;
 pub mod proto;
 pub mod reply;
 pub mod request;
@@ -78,6 +77,13 @@ pub use frame::Frame;
 pub use proto::{Limits, Proto};
 pub use reply::Out;
 pub use request::{Argv, Step};
+/// Redis's own integer and double text, shared with the string type.
+///
+/// This module lives in `yo-common` because the codec is not the only thing
+/// that needs it: whether a string is stored int encoded is decided by the same
+/// `string2ll` rules that decide whether a bulk length parses. Re-exported here
+/// so that `yo_resp::num` keeps meaning what it meant.
+pub use yo_common::num;
 
 #[cfg(test)]
 mod tests {

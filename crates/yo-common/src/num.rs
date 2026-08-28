@@ -103,10 +103,20 @@ pub fn parse_i64(s: &[u8]) -> Option<i64> {
     if digits.is_empty() {
         return None;
     }
-    // A leading zero is only ever a whole number zero. `007` is not seven here
-    // and it is not seven in Redis either.
+    // A leading zero is only ever a whole number zero, and only a positive one.
+    // `007` is not seven here and it is not seven in Redis either, and `-0` is
+    // not a number in either: `string2ll` tests its zero case against the length
+    // of the whole string, so the minus sign puts `-0` past it and into the one
+    // to nine gate, which it fails. That matters beyond parsing, because this is
+    // also what decides whether a string is stored int encoded. Accepting `-0`
+    // would store it as the integer zero, and `GET` would then hand the client
+    // back `0` for a value it wrote as `-0`.
     if digits[0] == b'0' {
-        return if digits.len() == 1 { Some(0) } else { None };
+        return if digits.len() == 1 && !negative {
+            Some(0)
+        } else {
+            None
+        };
     }
     let mut v: u64 = 0;
     for &c in digits {
@@ -251,6 +261,8 @@ mod tests {
             b"1a",
             b"a",
             b"1.0",
+            b"-0",
+            b"-00",
             b"9223372036854775808",
             b"-9223372036854775809",
             b"99999999999999999999999",
@@ -260,7 +272,6 @@ mod tests {
         // The one leading zero that is a number, and the one negative that only
         // exists going downwards.
         assert_eq!(parse_i64(b"0"), Some(0));
-        assert_eq!(parse_i64(b"-0"), Some(0));
         assert_eq!(parse_i64(b"-9223372036854775808"), Some(i64::MIN));
     }
 

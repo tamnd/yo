@@ -12,6 +12,13 @@ While the major is 0, a minor release may break anything, including the on-disk 
 
 ### Added
 
+- **`yo-kv`, where the data structures actually live.** One method per Redis command, taking and returning ordinary Rust values, with no protocol anywhere near it. The wire calls into this and the embedded API calls into this, so there is one `INCR` rather than two that drift apart (Y23). An embedded program calls `Strings::incr` and gets back an `i64` or a `yo_common::Error`, without serialising a command, crossing a socket or parsing a reply.
+- **The string type, which is the first row of M2.** Twenty one commands: `SET` with `NX`, `XX`, `GET`, `KEEPTTL`, `EX`, `PX`, `EXAT`, `PXAT` and Redis 8.4's `IFEQ`, then `GET`, `GETSET`, `GETDEL`, `GETEX`, `SETNX`, `SETEX`, `PSETEX`, `MSET`, `MSETNX`, `MGET`, `APPEND`, `STRLEN`, `SETRANGE`, `GETRANGE`, `SUBSTR`, `INCR`, `DECR`, `INCRBY`, `DECRBY` and `INCRBYFLOAT`.
+- **A one byte header in front of every string.** Encoding in two bits, a deadline flag in a third, and eight bytes of deadline only for the keys that have one, which most do not. The alternative is a side table for the TTL, and a side table is a second cache miss on a path whose whole budget is one miss.
+- **`INCR` that does not touch the arena.** An int encoded value stores the eight bytes of the integer rather than its digits, so incrementing it is a probe, an add and an eight byte store back into the record the probe landed on. No allocation, no free, no second record and no rehash. There is a test that increments a key a thousand times and asserts the arena's live byte count did not move.
+- **`RawMap::set_with` and `RawMap::value_mut`.** The first lets a caller write straight into the record instead of building the value in a scratch buffer and having it copied in again, which is one memcpy per `SET` rather than two. The second is what makes the `INCR` path above possible.
+- **`OBJECT ENCODING` that matches Redis, including the parts that look like bugs.** `SET k 007` is `embstr` and gives back `007`, `SET k 42` is `int`, the `embstr` boundary is 44 bytes, `APPEND` onto an existing key leaves `raw` even when the result reads as a number, and `APPEND` onto a key that is not there does not, because Redis runs the new value through `tryObjectEncoding` on create.
+- **A clock that only moves when it is told to.** `04` section 5 says there is no global clock read on the data path, so the shard reads the clock once per turn of the loop and all 64 commands in that batch compare against the same number. A clock read is tens of nanoseconds against a budget of a hundred and fifty, and paying it per command means paying it 64 times for an answer that did not change. Every expiry test in the crate drives a fixed clock instead of sleeping.
 - **`yo-reactor`, the shard loop.** `04` section 2 is nine lines of pseudocode and this is those nine lines with the bookkeeping filled in. Six stages in one order forever: submit, drain a batch, enter the epoch, walk the batch twice, leave and flush, then completions and a bounded maintenance slice. There is no executor under it, no future, no waker and no work stealing. The loop is the scheduler.
 - **The two walk batch.** A batch is 64 commands, and it is walked once to hash every key and ask the cache for the bucket that hash selects, then once to run them. Valkey and Redis 8.4 both use a window of 16 because they hold a lock across it and other threads can invalidate a line inside it, and Y1 removes both of those reasons. On a ten million key map the second walk is worth 13 percent on aarch64 and 20 percent on x86-64, and on a hundred thousand key map it is worth nothing on either because there was never a miss to hide.
 - **A break that does not throw work away.** A command whose key set is not known until something earlier in the batch has finished, which is a `MULTI` body, a `WAIT` or a blocking form, ends the batch where it stands. What was already drained behind it waits for the next turn rather than being executed cold or dropped.
@@ -19,6 +26,21 @@ While the major is 0, a minor release may break anything, including the on-disk 
 - **A maintenance budget in instructions rather than in wall clock.** Reading a clock is a syscall or at best a serialising instruction, and a wall clock slice does a different amount of work on a busy machine than on an idle one, so the tail it produces cannot be reproduced. A unit budget is a subtraction, and a pass that overshoots does so by one item instead of by however long that item took.
 - **A software prefetch hint in `yo-common`.** One instruction on x86-64 and one on aarch64, nothing at all anywhere else, and nothing under Miri. It reads no memory and has no effect a program can observe, which is why the tests for it can only check that.
 - **`Index::prefetch` and `RawMap::{hash_of, prefetch, get_hashed}`.** The first walk hashes a key and warms its bucket, the second walk looks it up with the hash it already has. A key in a batch is hashed once rather than once per walk.
+
+### Fixed
+
+- **`parse_i64` accepted `-0`, which Redis does not.** Redis's `string2ll` tests its zero case against the length of the whole string, so the minus sign pushes `-0` past it and into the one to nine gate, which it fails. That is not only a parsing detail, because the same rules decide whether a string is stored int encoded. Left alone, `SET k -0` would have been stored as the integer zero and `GET k` would have handed back `0` for a value the client wrote as `-0`.
+
+### Known divergences
+
+Two, both in the string type, both listed here rather than left to be discovered.
+
+- A string is capped just under 2 MiB rather than at Redis's 512 MiB, because a value lives in one arena segment. The band above that is the log region in `06` section 2 and lands with tiering in M5, at which point the cap goes up to Redis's. A value past the cap is a `YO_ERR_FULL` carrying Redis's own message and not a panic.
+- Expiry is lazy only. A key past its deadline is dropped when something touches it, and it is dropped at the exact millisecond, since a deadline equal to now has passed. The active cycle that would reclaim a key nobody ever touches again is maintenance slice work and lands in M5.
+
+### Internal
+
+- **`num.rs` moved from `yo-resp` to `yo-common`.** Whether a bulk length parses and whether a string is stored int encoded are the same `string2ll` question, and the answer should not live in the wire layer where the storage layer cannot reach it without depending on the protocol. `yo_resp::num` still resolves and still means what it meant.
 
 ### Performance
 

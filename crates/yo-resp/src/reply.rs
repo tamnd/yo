@@ -21,8 +21,8 @@
 //! protocol check in three hundred command implementations, and the failure
 //! mode of that is a command that works on one protocol and not the other.
 
-use crate::num::{i64_len, push_double, push_i64, push_u64};
 use crate::proto::Proto;
+use yo_common::num::{i64_len, push_double, push_i64, push_u64};
 
 /// A reply buffer for one connection.
 ///
