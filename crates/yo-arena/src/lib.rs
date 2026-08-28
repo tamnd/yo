@@ -47,13 +47,6 @@ pub const ALIGN: usize = 16;
 /// [`Arena::alloc`] returns `None` rather than growing a segment to fit.
 pub const MAX_ALLOC: usize = SEGMENT_SIZE - HEADER_SIZE;
 
-/// Free segments that keep their pages, waiting to be bumped through again.
-///
-/// One. A store that is compacting is usually about to want a segment, and
-/// refaulting two megabytes to hand it straight back is work for nothing. Two
-/// would be four megabytes held against a store on the chance that it grows.
-const HOT_FREE: usize = 1;
-
 const _: () = {
     assert!(SEGMENT_SIZE == 1 << SEGMENT_SHIFT);
     assert!(HEADER_SIZE.is_multiple_of(ALIGN));
@@ -78,20 +71,17 @@ const _: () = assert!(size_of::<Header>() == HEADER_SIZE);
 
 struct Segment {
     base: NonNull<u8>,
-    /// On the free list, waiting to be bumped through again.
+    /// Whether this segment is on the free list.
     ///
     /// Out here rather than in the header because the header is in the segment,
     /// and a segment that has given its pages back answers a read of its header
     /// by faulting one of them straight back in. Anything that looks at every
     /// segment has to be able to skip the free ones without touching them.
+    /// On the free list, and therefore with its pages handed back: the mapping
+    /// stays, so every address in it is as valid as it was, but nothing may be
+    /// read out of it before it is written. The kernel refills on the first
+    /// touch and what it refills with is not what was there.
     free: bool,
-    /// The pages are still ours and still real.
-    ///
-    /// False once [`Segment::decay`] has handed them back. The mapping stays,
-    /// so every address in it is as valid as it was, but nothing may be read
-    /// out of it before it is written: the kernel refills on the first touch
-    /// and what it refills with is not what was there.
-    resident: bool,
 }
 
 impl Segment {
@@ -142,11 +132,7 @@ impl Segment {
             }
         }
 
-        Segment {
-            base,
-            free: false,
-            resident: true,
-        }
+        Segment { base, free: false }
     }
 
     /// Hand the pages back to the kernel, keeping the mapping.
@@ -169,7 +155,7 @@ impl Segment {
     /// there is no `madvise` at all, so those platforms hold the pages. That
     /// costs address space that was already reserved and nothing else.
     fn decay(&mut self) {
-        self.resident = false;
+        self.free = true;
         // Miri has no kernel to ask, as in `new`.
         #[cfg(all(target_os = "linux", not(miri)))]
         {
@@ -189,12 +175,11 @@ impl Segment {
 
     /// Put a header back on a segment coming off the free list.
     ///
-    /// Unconditional, because a decayed segment reads as zeroes and a warm one
-    /// reads as whatever [`Arena::reclaim`] left, and writing five fields is
-    /// cheaper than working out which of the two this is.
+    /// Unconditional, because a segment that has given its pages back reads as
+    /// zeroes and the header has to be there before anything is bumped into
+    /// it.
     fn revive(&mut self) {
         self.free = false;
-        self.resident = true;
         // SAFETY: as `new`. The mapping was never given up, only its pages.
         unsafe {
             self.base.cast::<Header>().write(Header {
@@ -260,8 +245,6 @@ pub struct Arena {
     /// Dead bytes across every segment, so that deciding whether compaction is
     /// worth doing is one comparison rather than a walk over the headers.
     dead_total: u64,
-    /// How many of `free_segs` have given their pages back.
-    decayed: usize,
     _not_send_sync: PhantomData<*mut ()>,
 }
 
@@ -289,7 +272,6 @@ impl Arena {
             allocated: 0,
             free_segs: Vec::new(),
             dead_total: 0,
-            decayed: 0,
             _not_send_sync: PhantomData,
         }
     }
@@ -299,11 +281,9 @@ impl Arena {
     fn push_segment(&mut self) {
         let next = match self.free_segs.pop() {
             Some(seg) => {
-                // Warm or decayed, it gets a fresh header either way, which is
-                // what makes the two cases the same from here on.
-                if !self.segs[seg].resident {
-                    self.decayed -= 1;
-                }
+                // Its pages went back to the kernel when it was freed, so the
+                // header has to be written again before anything is bumped
+                // into it.
                 self.segs[seg].revive();
                 seg
             }
@@ -548,18 +528,15 @@ impl Arena {
         h.dead_bytes = 0;
         h.epoch_retired = 0;
         h.flags = 0;
-        self.segs[seg].free = true;
-
-        // One segment stays warm and the rest give their pages back. The
-        // decayed ones go to the front so that the warm one is what the next
-        // allocation gets: the list is popped from the back.
-        if self.free_segs.len() < HOT_FREE {
-            yo_alloc::allow(|| self.free_segs.push(seg));
-        } else {
-            self.segs[seg].decay();
-            self.decayed += 1;
-            yo_alloc::allow(|| self.free_segs.insert(0, seg));
-        }
+        // Every free segment gives its pages back, with none kept warm. Keeping
+        // one warm was tried, on the reasoning that a store which is compacting
+        // is usually about to want a segment and refaulting two megabytes to
+        // hand it straight back is work for nothing. It cost 4 MB of resident
+        // set on the standard load, which is more than the whole margin the
+        // memory gate was missing by, and the work it saves is one madvise and
+        // one huge page fault per two megabytes written.
+        self.segs[seg].decay();
+        yo_alloc::allow(|| self.free_segs.push(seg));
     }
 
     /// Dead bytes across every segment.
@@ -676,10 +653,11 @@ impl Arena {
         (self.resident_segments() * SEGMENT_SIZE) as u64
     }
 
-    /// Segments whose pages are real.
+    /// Segments whose pages are real, which is every segment that is not on the
+    /// free list.
     #[inline]
     pub fn resident_segments(&self) -> usize {
-        self.segs.len() - self.decayed
+        self.segs.len() - self.free_segs.len()
     }
 
     /// Bytes still free in the segment currently being bumped.
@@ -898,14 +876,14 @@ mod tests {
         assert!(addr.offset() < SEGMENT_SIZE as u64);
     }
 
-    /// A free segment past the first gives its pages back, and comes back from
-    /// that intact when something wants it again.
+    /// A free segment gives its pages back, and comes back from that intact
+    /// when something wants it again.
     ///
     /// The pages are the point. An emptied segment that keeps them is two
     /// megabytes of a store's own garbage counted against it by `ps` and by
     /// `INFO memory` for holding nothing.
     #[test]
-    fn free_segments_past_the_first_give_their_pages_back() {
+    fn a_free_segment_gives_its_pages_back() {
         let mut a = Arena::new();
         let chunk = vec![7u8; 256 * 1024];
         while a.segment_count() < 4 {
@@ -914,23 +892,17 @@ mod tests {
         let held = a.reserved_bytes();
 
         a.reclaim(0);
-        assert_eq!(
-            a.reserved_bytes(),
-            held,
-            "the first free segment stays warm"
-        );
-
         a.reclaim(1);
         a.reclaim(2);
         assert_eq!(a.free_segments(), 3);
         assert_eq!(
             a.reserved_bytes(),
-            held - 2 * SEGMENT_SIZE as u64,
-            "two of the three should have gone back to the kernel"
+            held - 3 * SEGMENT_SIZE as u64,
+            "all three should have gone back to the kernel"
         );
 
-        // Take all three, which means bumping through two that were decayed,
-        // and read back out of the last one to prove the pages came back.
+        // Take all three back, and read out of the last one to prove the pages
+        // came with them.
         while a.free_segments() > 0 {
             a.put(&chunk).unwrap();
         }
