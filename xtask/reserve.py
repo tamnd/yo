@@ -41,6 +41,14 @@ UA = "yo-name-audit (+https://github.com/tamnd/yo)"
 TIMEOUT = 20
 IDENTITY = "tamnd"
 
+# The version every placeholder is published at, in one place because it moves.
+# It was 0.0.0 until a registry that will not take the same version twice had to
+# be republished, and it will move again for the same reason. Three probes used
+# to compare against a literal 0.0.0 to tell "our placeholder" from "a real
+# release", and after the republish all three quietly started reading our own
+# empty packages as shipped software.
+PLACEHOLDER = os.environ.get("YODB_PLACEHOLDER_VERSION", "0.0.1")
+
 # ---------------------------------------------------------------------------
 # states
 # ---------------------------------------------------------------------------
@@ -90,6 +98,17 @@ def get_json(url: str, headers: dict[str, str] | None = None):
 # probes — each returns (state, note)
 # ---------------------------------------------------------------------------
 
+def held_state(version: str) -> str:
+    """What a name we hold is in, given the version published under it.
+
+    A placeholder is not a release. The package exists so that nobody else can
+    take the name and there is no yo inside it, so the row says `reserved` until
+    a real version replaces it, at which point it says `released` on its own
+    without anybody editing this file.
+    """
+    return RESERVED if version == PLACEHOLDER else RELEASED
+
+
 def p_crates(name: str, _ns: str):
     code, d = get_json(f"https://crates.io/api/v1/crates/{name}")
     if code is None:
@@ -103,7 +122,7 @@ def p_crates(name: str, _ns: str):
             who = ",".join(u.get("login", "?") for u in owners["users"])
         ours = IDENTITY in who
         v = d["crate"].get("max_version", "?")
-        return (RELEASED if ours else BLOCKED), f"v{v} owner={who or '?'}"
+        return (held_state(v) if ours else BLOCKED), f"v{v} owner={who or '?'}"
     return UNKNOWN, f"http {code}"
 
 
@@ -130,7 +149,7 @@ def p_pypi(name: str, _ns: str):
         v = info.get("version", "?")
         urls = info.get("project_urls") or {}
         if _ours_by_repo(urls.get("Repository") or info.get("home_page") or ""):
-            return (RESERVED if v == "0.0.0" else RELEASED), f"v{v}, repository is ours"
+            return held_state(v), f"v{v}, repository is ours"
         return BLOCKED, f"v{v} by {info.get('author') or info.get('maintainer') or '?'}"
     return UNKNOWN, f"http {code}"
 
@@ -269,7 +288,7 @@ def p_pub(name: str, _ns: str):
             ours = _ours_by_repo(spec.get("repository") or spec.get("homepage") or "")
             note = f"v{v}, no publisher set, repository is ours" if ours else f"v{v}"
         if ours:
-            return (RESERVED if v == "0.0.0" else RELEASED), note
+            return held_state(v), note
         return BLOCKED, note
     return UNKNOWN, f"http {code}"
 
@@ -323,7 +342,7 @@ def p_nuget(name: str, _ns: str):
     if isinstance(authors, list):
         authors = ",".join(authors)
     if _ours_by_repo(entry.get("projectUrl") or "") or IDENTITY in authors:
-        return (RESERVED if version == "0.0.0" else RELEASED), f"v{version} by {authors}"
+        return held_state(version), f"v{version} by {authors}"
     return BLOCKED, f"v{version} by {authors or '?'}"
 
 
@@ -699,10 +718,16 @@ MILESTONE = "The real release lands at milestone DX6 (M7). Until then this packa
 # §6 rule 6: one symbol, and it raises this. Same sentence in every language,
 # because a user who hits it in two ecosystems should not have to work out
 # whether they are two different problems.
-RAISES = (
-    "yo is not usable yet. This is a reserved placeholder at 0.0.0; "
-    "see " + REPO
-)
+def raises_for(version: str) -> str:
+    """The sentence, carrying the version of the package it is compiled into.
+
+    It used to name 0.0.0 in a constant, which stopped being true the moment the
+    placeholders were republished at 0.0.1 and left every binding in every
+    language telling users the version of a package that was no longer on the
+    registry. The version is the one useful thing in the sentence, since it is
+    how a reader works out whether what they installed is the empty one.
+    """
+    return f"yo is not usable yet. This is a reserved placeholder at {version}; see {REPO}"
 
 
 def desc_for(row) -> str:
@@ -720,7 +745,7 @@ PLACEHOLDER_DESC = DESC_FORM.format(what="its <language> binding")
 
 def cmd_plan(args) -> int:
     rows = load(args.file)
-    version = os.environ.get("YODB_PLACEHOLDER_VERSION", "0.0.0")
+    version = PLACEHOLDER
     todo = [r for r in rows if r.reserve and r.state == FREE]
     skip = [r for r in rows if r.reserve and r.state in (RESERVED, RELEASED)]
     block = [r for r in rows if r.reserve and r.state == BLOCKED]
@@ -900,7 +925,7 @@ categories = ["database"]
 #![deny(missing_docs)]
 
 /// The message every placeholder in every ecosystem raises with.
-pub const NOT_YET: &str = "{RAISES}";
+pub const NOT_YET: &str = "{raises_for(version)}";
 
 /// Opens a database. Always panics: this version is a reserved placeholder.
 ///
@@ -964,7 +989,7 @@ __all__ = ["NOT_YET", "open"]
 __version__ = "{version}"
 
 #: The message every placeholder in every ecosystem raises with.
-NOT_YET = "{RAISES}"
+NOT_YET = "{raises_for(version)}"
 
 
 def open(path):  # noqa: A001 — matches the API this will eventually have
@@ -1009,7 +1034,7 @@ environment:
 library;
 
 /// The message every placeholder in every ecosystem raises with.
-const String notYet = '{RAISES}';
+const String notYet = '{raises_for(version)}';
 
 /// Opens a database. Always throws: this version is a reserved placeholder.
 ///
@@ -1158,7 +1183,7 @@ package {pkg};
 public final class Yo {{
 
   /** The message every placeholder in every ecosystem raises with. */
-  public static final String NOT_YET = "{RAISES}";
+  public static final String NOT_YET = "{raises_for(version)}";
 
   private Yo() {{}}
 
@@ -1278,7 +1303,7 @@ namespace {row.name};
 public static class Yo
 {{
     /// <summary>The message every placeholder in every ecosystem raises with.</summary>
-    public const string NotYet = "{RAISES}";
+    public const string NotYet = "{raises_for(version)}";
 
     /// <summary>Opens a database. Always throws: this version is a reserved placeholder.</summary>
     /// <param name="path">Ignored.</param>
@@ -1374,7 +1399,7 @@ def b_npm(row, root, version, desc):
 // Calling something is what tells you where you are.
 
 /** The message every placeholder in every ecosystem raises with. */
-export const NOT_YET = "{RAISES}";
+export const NOT_YET = "{raises_for(version)}";
 
 /**
  * Opens a database. Always throws: this version is a reserved placeholder.
@@ -1427,7 +1452,7 @@ NEEDS = {
 
 def cmd_apply(args) -> int:
     rows = load(args.file)
-    version = os.environ.get("YODB_PLACEHOLDER_VERSION", "0.0.0")
+    version = PLACEHOLDER
     reg = args.registry
 
     if reg not in BUILDERS:
