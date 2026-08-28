@@ -556,9 +556,18 @@ fn info(server: &Server, args: Args<'_>, out: &mut Out) {
         if want("memory") {
             let _ = write!(
                 s,
-                "# Memory\r\nused_memory:{}\r\nmaxmemory:0\r\n\
+                "# Memory\r\nused_memory:{}\r\nused_memory_dataset:{}\r\n\
+                 used_memory_overhead:{}\r\nmem_arena_bytes:{}\r\n\
+                 mem_arena_segments:{}\r\nmem_index_bytes:{}\r\n\
+                 mem_client_buffers:{}\r\nmaxmemory:0\r\n\
                  maxmemory_policy:noeviction\r\n\r\n",
                 server.memory_bytes(),
+                server.dataset_bytes(),
+                server.memory_bytes() - server.dataset_bytes(),
+                server.arena_bytes(),
+                server.segment_count(),
+                server.index_bytes(),
+                server.conn_bytes(),
             );
         }
         if want("stats") {
