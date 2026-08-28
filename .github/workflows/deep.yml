@@ -63,13 +63,15 @@ jobs:
       # next month gets interpreted without anybody remembering to come back
       # here, which is the only way a list like this stays true.
       #
-      # `yo-record` is the exception and gets two shards. Its compaction tests
-      # are half the crate on their own and they cannot be made smaller: a
-      # `page_len` under 8192 is refused, and the number of records is what
-      # decides how many pages leave the resident window, so a smaller workload
-      # leaves no stable region to compact. Splitting them off is the only way
-      # that crate stops setting the wall clock for the whole workflow. If it
-      # ever stops being the slowest, this special case should go.
+      # `yo-record` is the exception and gets two shards, because its compaction
+      # tests are half the crate on their own and there is a limit to how far
+      # they can shrink. A `page_len` under 8192 is refused by the log config,
+      # and the number of records is what decides how many pages leave the
+      # resident window, so below about eight hundred records there is no stable
+      # region left and the pass has nothing to walk. Splitting them off is
+      # worth 90 seconds against 55 locally even with nextest already running
+      # four at a time. If that crate ever stops being the slowest, this special
+      # case should go.
       - id: shards
         run: |
           rm rust-toolchain.toml
@@ -77,8 +79,8 @@ jobs:
             [ .packages[].name
               | select(. != "yo-record")
               | {id: ., args: "--locked -p \(.)"} ]
-            + [ {id: "yo-record-compact", args: "--locked -p yo-record --lib compact::"},
-                {id: "yo-record-rest", args: "--locked -p yo-record -- --skip compact::"} ]
+            + [ {id: "yo-record-compact", args: "--locked -p yo-record -E 'test(/^compact::/)'"},
+                {id: "yo-record-rest", args: "--locked -p yo-record -E 'not test(/^compact::/)'"} ]
             | sort_by(.id)')" >> "$GITHUB_OUTPUT"
       - run: echo "deep checks requested for ${{ github.event.inputs.ref || github.ref }}"
 
@@ -94,6 +96,18 @@ jobs:
   # every crate added together. One job per crate makes the wait the slowest
   # single crate instead. Interpreting the whole tree costs the same either way,
   # it just does not all happen on one runner.
+  #
+  # Run through nextest rather than the built in harness, which is what gets a
+  # shard down from the sum of its tests to the slowest one. `cargo miri test`
+  # is one process, and libtest's threads do not help because Miri interprets
+  # threads on a single core. nextest runs each test as its own process, so the
+  # four cores a runner has are four tests being interpreted at once: `yo-record`
+  # locally went from 322.7 seconds to 121.2 at 359 percent CPU. Four Miri
+  # processes on the heaviest crate peaked at 865 MB between them, so the
+  # parallelism costs memory in megabytes and buys minutes.
+  #
+  # nextest does not run doctests. They still run in `ci.yml` on every push, so
+  # what is lost is the doctests being interpreted, not the doctests.
   miri:
     needs: wanted
     if: needs.wanted.outputs.run == 'true'
@@ -119,6 +133,9 @@ jobs:
       - uses: dtolnay/rust-toolchain@nightly
         with:
           components: miri
+      - uses: taiki-e/install-action@v2.87.0
+        with:
+          tool: cargo-nextest
       - uses: Swatinem/rust-cache@v2.9.2
         with:
           # Every shard builds a different subset of the tree with the same
@@ -127,7 +144,10 @@ jobs:
           key: ${{ matrix.borrows }}-${{ matrix.shard.id }}
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: rm rust-toolchain.toml
-      - run: cargo miri test ${{ matrix.shard.args }}
+      # Pinned to four rather than left to follow the core count, so that a
+      # bigger runner cannot quietly turn this into sixteen interpreters and an
+      # out of memory kill that reads like a hang.
+      - run: cargo miri nextest run ${{ matrix.shard.args }} --test-threads 4
         env:
           MIRIFLAGS: ${{ matrix.flags }}
 
@@ -149,21 +169,33 @@ jobs:
     needs: wanted
     if: needs.wanted.outputs.run == 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v7.0.1
         with:
           ref: ${{ needs.wanted.outputs.ref }}
       - uses: dtolnay/rust-toolchain@nightly
+      - uses: taiki-e/install-action@v2.87.0
+        with:
+          tool: cargo-fuzz
       - uses: Swatinem/rust-cache@v2.9.2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: rm rust-toolchain.toml
-      - run: cargo install cargo-fuzz --locked
       - run: cargo fuzz build
-      - name: sixty seconds per target
+      # All five at once rather than one after another. Each is a minute and
+      # they used to be five minutes in a row for no reason: they share nothing
+      # and a runner has four cores sitting idle through four of those minutes.
+      - name: sixty seconds per target, all of them at once
         run: |
+          pids=""
           for t in $(cargo fuzz list); do
-            cargo fuzz run "$t" -- -max_total_time=60 -rss_limit_mb=4096
+            cargo fuzz run "$t" -- -max_total_time=60 -rss_limit_mb=2048 &
+            pids="$pids $!"
           done
+          rc=0
+          for p in $pids; do wait "$p" || rc=1; done
+          exit $rc
       - uses: actions/upload-artifact@v7.0.1
         if: failure()
         with:
