@@ -22,10 +22,6 @@ Nothing yet.
 - **`yo-crash`.** Crash injection with an exact oracle: lose everything, lose a prefix, reorder, tear at sector granularity, scatter, and flip a bit, against an image that only holds what a sync covered. Every damaged image is read twice, by recovery and by the independent reader, and compared record by record and on where the walk stops. Seeded with splitmix64, so a failure is a seed somebody can type in.
 - **A `crash` CI job**, running a fifth of the gate across four shapes on fixed seeds. Fixed rather than drawn from the clock, because a job that picks its own seeds fails once a month on a seed nobody wrote down.
 
-### Changed
-
-- **The miri CI job runs its two borrow models as two jobs rather than one job doing both in sequence.** Miri had become the long pole on every pull request by a wide margin, over an hour while the other eleven jobs finished inside twenty minutes. Stacked borrows and tree borrows have nothing to say to each other, so a pull request now waits for the slower of the two rather than for their sum. On the first run under the split the two came in at 43 and 40 minutes side by side. The check name changes from `miri` to `miri (stacked borrows)` and `miri (tree borrows)`, and `fail-fast` is off so one model failing still leaves the other model's answer on the same run.
-
 ### Fixed
 
 - **A `yo-format` test never finished under Miri.** Flipping every bit of a 16 KiB superblock slot and decoding after each one is sixteen thousand iterations, each copying and checksumming 16 KiB. Natively that is a few milliseconds. Interpreted it did not finish inside a CI job's six hour ceiling, and it took a nightly Miri run with it. Under Miri the walk is now a stride of 601 bytes plus nine offsets visited by hand, which is 37 seconds; every ordinary run still flips every byte.
