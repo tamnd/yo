@@ -1,10 +1,10 @@
-//! The `yo` command line tool.
+//! The `yodb` command line tool.
 //!
 //! One subcommand so far, `check`, which is the M1 deliverable. The others
 //! arrive with the milestones that need them.
 //!
 //! Argument parsing is done by hand rather than with a library. That is a
-//! choice worth defending exactly once, here: `yo check` is the tool you run
+//! choice worth defending exactly once, here: `yodb check` is the tool you run
 //! when a database will not start, and a tool for that moment that pulls in a
 //! dependency tree is a tool that can fail to build on the machine where you
 //! need it. It parses three flags. When this grows a server and a benchmark
@@ -18,10 +18,10 @@ use std::process::ExitCode;
 use check::Severity;
 
 const USAGE: &str = "\
-yo, an embedded knowledge engine
+yodb, an embedded knowledge engine
 
 usage:
-  yo check FILE [--quick] [--quiet]
+  yodb check FILE [--quick] [--quiet]
 
   check    read a .yo file and report anything wrong with it. Never writes.
              --quick   skip the records and read only the headers
@@ -72,19 +72,19 @@ fn check_command(args: &[&str]) -> ExitCode {
                 return ExitCode::SUCCESS;
             }
             other if other.starts_with('-') => {
-                eprintln!("yo check: no such option: {other}");
+                eprintln!("yodb check: no such option: {other}");
                 return ExitCode::from(2);
             }
             other if path.is_none() => path = Some(PathBuf::from(other)),
             other => {
-                eprintln!("yo check: takes one file, and was also given {other}");
+                eprintln!("yodb check: takes one file, and was also given {other}");
                 return ExitCode::from(2);
             }
         }
     }
 
     let Some(path) = path else {
-        eprintln!("yo check: which file?\n");
+        eprintln!("yodb check: which file?\n");
         eprint!("{USAGE}");
         return ExitCode::from(2);
     };
@@ -95,7 +95,7 @@ fn check_command(args: &[&str]) -> ExitCode {
             // Getting here means the file could not be opened far enough to say
             // anything at all, which is a different thing from a file with
             // problems in it and gets a different exit code.
-            eprintln!("yo check: {}: {e}", path.display());
+            eprintln!("yodb check: {}: {e}", path.display());
             return ExitCode::from(2);
         }
     };

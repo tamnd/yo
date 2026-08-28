@@ -267,7 +267,7 @@ pub fn seal(slot: &mut [u8]) -> u32 {
 /// Returns the slot index, 0 or 1, and its decoded header. Higher `seq` wins,
 /// and a slot that fails to decode does not get a vote. Both failing is the one
 /// case that is not recoverable here, and the two errors are returned so that
-/// `yo check` can print them both instead of guessing which one the user cares
+/// `yodb check` can print them both instead of guessing which one the user cares
 /// about.
 ///
 /// # Errors

@@ -37,7 +37,7 @@
 //! memory, so this exercises page headers, record framing, group commit and
 //! replay. The superblock flip is a different mechanism with a different
 //! argument, it is dual slotted and ordered by two syncs, and it is covered by
-//! its own tests in `yo-file` and by `yo check`. A run that reports zero
+//! its own tests in `yo-file` and by `yodb check`. A run that reports zero
 //! violations here is a statement about `06` and not about the whole file.
 //!
 //! # Example

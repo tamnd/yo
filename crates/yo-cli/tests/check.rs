@@ -1,4 +1,4 @@
-//! `yo check` against files that are fine and files that are not.
+//! `yodb check` against files that are fine and files that are not.
 //!
 //! The interesting tests here are the ones that break a file in a way no
 //! checksum can notice. Anyone can catch a flipped bit. Catching a segment that
@@ -75,14 +75,14 @@ fn good_file(path: &Path, count: u64, shards: u32) {
     drop(db);
 }
 
-/// Runs `yo check` and hands back the exit code and everything it printed.
+/// Runs `yodb check` and hands back the exit code and everything it printed.
 fn run(path: &Path, extra: &[&str]) -> (i32, String) {
-    let out = Command::new(env!("CARGO_BIN_EXE_yo"))
+    let out = Command::new(env!("CARGO_BIN_EXE_yodb"))
         .arg("check")
         .arg(path)
         .args(extra)
         .output()
-        .expect("run yo check");
+        .expect("run yodb check");
     let mut text = String::from_utf8_lossy(&out.stdout).into_owned();
     text.push_str(&String::from_utf8_lossy(&out.stderr));
     (out.status.code().unwrap_or(-1), text)
@@ -307,22 +307,22 @@ fn a_truncated_file_is_found() {
 
 #[test]
 fn the_help_comes_out_without_a_file() {
-    let out = Command::new(env!("CARGO_BIN_EXE_yo"))
+    let out = Command::new(env!("CARGO_BIN_EXE_yodb"))
         .arg("--help")
         .output()
         .unwrap();
     assert!(out.status.success());
     let text = String::from_utf8_lossy(&out.stdout);
-    assert!(text.contains("yo check FILE"), "{text}");
+    assert!(text.contains("yodb check FILE"), "{text}");
     assert!(text.contains("Never writes"), "{text}");
 
-    let out = Command::new(env!("CARGO_BIN_EXE_yo"))
+    let out = Command::new(env!("CARGO_BIN_EXE_yodb"))
         .arg("check")
         .output()
         .unwrap();
     assert_eq!(out.status.code(), Some(2));
 
-    let out = Command::new(env!("CARGO_BIN_EXE_yo"))
+    let out = Command::new(env!("CARGO_BIN_EXE_yodb"))
         .arg("frobnicate")
         .output()
         .unwrap();
