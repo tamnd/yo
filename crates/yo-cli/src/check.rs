@@ -1,4 +1,4 @@
-//! `yo check`: everything that can be said about a file without changing it.
+//! `yodb check`: everything that can be said about a file without changing it.
 //!
 //! The checker reads with [`yo_reader`], which shares no code with the engine.
 //! That is the whole reason it is trustworthy. A checker built on the engine's

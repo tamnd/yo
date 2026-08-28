@@ -14,7 +14,7 @@
 //!
 //! The first two are indistinguishable and both mean stop. The third is
 //! distinguishable and also means stop, but it is worth telling the caller
-//! about, which is what [`ReplayReport::truncated_at`] is for: `yo check`
+//! about, which is what [`ReplayReport::truncated_at`] is for: `yodb check`
 //! prints it and recovery truncates to it.
 //!
 //! **There is no write ahead log.** Not as a simplification, as a consequence.

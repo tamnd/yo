@@ -3,7 +3,7 @@
 //! This crate is the written form of `07-yo-file-format.md`. It knows how to
 //! turn each structure into bytes and how to read it back, and it knows nothing
 //! about files, memory, shards or the engine. That separation is deliberate:
-//! the engine and `yo check` both encode with this crate, and the independent
+//! the engine and `yodb check` both encode with this crate, and the independent
 //! minimal reader deliberately does not, so a change here that is not also a
 //! change to the specification shows up as the two disagreeing.
 //!

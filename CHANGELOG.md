@@ -6,6 +6,10 @@ While the major is 0, a minor release may break anything, including the on-disk 
 
 ## Unreleased
 
+### Changed
+
+- **The executable is `yodb`, not `yo`.** `yo` on PATH is Yeoman's and has been for over a decade, and it is Yeoman's on Homebrew core, Chocolatey and the AUR, so shipping a binary called `yo` means shipping a collision into every channel we would want to publish through. Only the executable moves. The crate is `yodb`, the library is `libyo`, the header is `yo.h`, the symbols are `yo_*` and the file extension is still `.yo`.
+
 ### Added
 
 - **`yo-reactor`, the shard loop.** `04` section 2 is nine lines of pseudocode and this is those nine lines with the bookkeeping filled in. Six stages in one order forever: submit, drain a batch, enter the epoch, walk the batch twice, leave and flush, then completions and a bounded maintenance slice. There is no executor under it, no future, no waker and no work stealing. The loop is the scheduler.

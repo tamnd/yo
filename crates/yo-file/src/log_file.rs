@@ -347,7 +347,7 @@ impl LogFile {
     /// The header says how much of the payload has been written, so a page with
     /// four kilobytes of records in it costs one block to read rather than the
     /// whole 32 MiB. A header that does not decode means the caller is looking
-    /// at damage, and then the whole region comes back so that `yo check` has
+    /// at damage, and then the whole region comes back so that `yodb check` has
     /// something to look at.
     fn read_page(&self, off: u64) -> Option<Box<[u8]>> {
         let mut head = [0u8; PAGE_HEADER_LEN];

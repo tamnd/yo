@@ -12,7 +12,7 @@ authors.workspace = true
 workspace = true
 
 [dependencies]
-# `yo check` reads the file with the independent reader rather than the engine,
+# `yodb check` reads the file with the independent reader rather than the engine,
 # on purpose. A checker that shares its idea of the format with the thing that
 # wrote the file agrees with it about everything, including the mistakes.
 yo-reader = { workspace = true }
@@ -25,6 +25,11 @@ yo-file = { workspace = true }
 yo-format = { workspace = true }
 yo-record = { workspace = true }
 
+# The executable is `yodb`, not `yo`. `yo` on PATH is Yeoman's, and is Yeoman's
+# on Homebrew core, Chocolatey and the AUR, so shipping `yo` means shipping a
+# collision into every one of those channels. Only the executable moves: the
+# crate is yodb, the library is libyo, the header is yo.h, the symbols are yo_*
+# and the extension is .yo. dx/16 section 3.3 has the probe this came from.
 [[bin]]
-name = "yo"
+name = "yodb"
 path = "src/main.rs"
