@@ -774,18 +774,18 @@ dependencies = [
 
 [[package]]
 name = "xtask"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "yo-common",
 ]
 
 [[package]]
 name = "yo-alloc"
-version = "0.2.0"
+version = "0.3.0"
 
 [[package]]
 name = "yo-arena"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "criterion",
  "libc",
@@ -795,7 +795,7 @@ dependencies = [
 
 [[package]]
 name = "yo-capi"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "yo-common",
  "yo-index",
@@ -803,7 +803,7 @@ dependencies = [
 
 [[package]]
 name = "yo-cli"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "yo-file",
  "yo-format",
@@ -813,14 +813,14 @@ dependencies = [
 
 [[package]]
 name = "yo-common"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "criterion",
 ]
 
 [[package]]
 name = "yo-crash"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "yo-common",
  "yo-format",
@@ -830,7 +830,7 @@ dependencies = [
 
 [[package]]
 name = "yo-file"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "criterion",
  "libc",
@@ -841,14 +841,14 @@ dependencies = [
 
 [[package]]
 name = "yo-format"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "yo-common",
 ]
 
 [[package]]
 name = "yo-index"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "criterion",
  "yo-alloc",
@@ -858,7 +858,7 @@ dependencies = [
 
 [[package]]
 name = "yo-reader"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "yo-common",
  "yo-file",
@@ -868,7 +868,7 @@ dependencies = [
 
 [[package]]
 name = "yo-record"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "criterion",
  "yo-common",
@@ -877,7 +877,7 @@ dependencies = [
 
 [[package]]
 name = "yo-shard"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "criterion",
  "libc",

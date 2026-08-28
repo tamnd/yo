@@ -6,11 +6,27 @@ While the major is 0, a minor release may break anything, including the on-disk 
 
 ## Unreleased
 
+Nothing yet.
+
+## 0.3.0 — 2026-08-28
+
+**Milestone: DX0, the ABI contract.** No engine work. This is the surface every binding will sit on, described once and generated from that description, so that the header, the error codes and the machine readable model cannot drift apart. RELEASING.md gives a minor to every engine or DX milestone, and this is the first DX one.
+
 ### Added
 
 - **`yo-capi`, the C ABI, and `include/yo.h` generated from one model.** Every binding this project will ever have sits on this surface, so it is described once in `xtask/src/model.rs` and `crates/yo-common/errors.toml` and the header, the error code spellings and the machine readable `api.model.json` are all emitted from it. A generated file that somebody edited by hand is a header that no longer matches the library, so `cargo xtask check` regenerates all of it and CI fails on a diff.
 - **A `capi` CI job that compiles the header the way a caller would.** Two compilers, gcc and clang, every dialect they support, warnings as errors, and then the example is linked and run. A header that compiles and a library that works are two different claims and this checks both.
 - **`examples/c`, a hello world and the build script that produces it.** Not a snippet in a README. Something a caller can run, which is the only version of an example that stays true.
+- **`cargo xtask` as an alias, so the command is the same everywhere.** In CI, in the contributing guide and in muscle memory. `cargo run -p xtask --` in one place and `cargo xtask` in another is how a documented command stops matching the one people type.
+
+### Fixed
+
+- **The fuzz job built against the wrong target and stopped compiling.** `cargo fuzz build` defaults `--target` to the platform the cargo-fuzz binary itself was built for. install-action does not carry cargo-fuzz and falls back to cargo-binstall, which fetches the musl build, so on a gnu runner the default came out as `x86_64-unknown-linux-musl` and the build died on a missing musl std with a sanitizer error on top. The target is now whatever `rustc -vV` reports as the host, which stays right however the toolchain was assembled.
+- **A workflow file that does not parse produced a run with no jobs in it.** A failure with nothing to click on, no log, and no indication of which file broke, which is the worst failure mode this CI has because the thing that broke is invisible in the check list. One unquoted colon in a `run:` line was enough to do it. The style job now parses every workflow file before anything else runs.
+
+### Known gaps
+
+- The ABI is at `YO_ABI_VERSION_MINOR` 1 and nothing depends on it yet. It is a contract with no callers, which is the point of doing it before the callers exist, but it also means none of it has been exercised by a real binding.
 
 ## 0.2.0 — 2026-08-28
 
