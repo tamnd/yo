@@ -34,16 +34,33 @@ const VALUE: &[u8] = b"0123456789abcdef0123456789abcdef";
 
 /// Keys per shard. At 32 bytes of value this is well past any cache, which is
 /// the case that matters. Anything smaller measures the L2 and flatters us.
-const KEYS: usize = 1_000_000;
+fn keys() -> usize {
+    if smoke() { 1_000 } else { 1_000_000 }
+}
 
 /// Operations one shard performs per measured round. Big enough that one job
 /// dispatch, which is a few hundred nanoseconds, is under a thousandth of the
 /// total.
-const ROUND: usize = 100_000;
+fn round() -> usize {
+    if smoke() { 100 } else { 100_000 }
+}
 
-/// Stride through the keyspace. Coprime with `KEYS`, so it visits everything,
-/// and large enough that the hardware prefetcher gets nothing out of it.
-const STRIDE: usize = 7919;
+/// Stride through the keyspace. Coprime with the key count, so it visits
+/// everything, and large enough that the hardware prefetcher gets nothing out
+/// of it.
+fn stride() -> usize {
+    if smoke() { 7 } else { 7919 }
+}
+
+/// Whether this is CI checking the benchmark still runs rather than a box
+/// measuring something.
+///
+/// A million keys on every core, filled twice, is minutes of a runner spent
+/// proving nothing that a thousand keys does not prove just as well. Anything
+/// that wants real numbers leaves `YO_BENCH_SMOKE` unset.
+fn smoke() -> bool {
+    std::env::var_os("YO_BENCH_SMOKE").is_some()
+}
 
 fn key(i: usize) -> Vec<u8> {
     let mut buf = KeyBuf::new();
@@ -96,7 +113,7 @@ fn thread_counts() -> Vec<usize> {
     v
 }
 
-/// A runtime with `shards` shards, each holding `KEYS` keys of its own.
+/// A runtime with `shards` shards, each holding `keys()` keys of its own.
 ///
 /// Every shard gets the same key range on purpose. The point of `owned` is to
 /// measure the map without any crossing, so which shard holds which key does
@@ -108,15 +125,16 @@ fn filled(shards: usize) -> Runtime<RawMap> {
         .submitters(shards + 4)
         .build(|_| RawMap::new());
     let sub = rt.submitter();
+    let keys = keys();
     for s in 0..shards {
-        sub.send(s, |ctx| {
-            for i in 0..KEYS {
+        sub.send(s, move |ctx| {
+            for i in 0..keys {
                 ctx.state.set(&key(i), VALUE);
             }
         });
     }
     for s in 0..shards {
-        assert_eq!(sub.call(s, |ctx| ctx.state.len()), KEYS);
+        assert_eq!(sub.call(s, |ctx| ctx.state.len()), keys);
     }
     rt.release(sub);
     rt
@@ -130,12 +148,13 @@ where
 {
     let sub = rt.submitter();
     let (tx, rx) = mpsc::channel::<Duration>();
+    let stride = stride();
     for s in 0..shards {
         let tx = tx.clone();
         sub.send(s, move |ctx| {
             let start = Instant::now();
             for r in 0..rounds {
-                body(&mut ctx.state, s.wrapping_mul(STRIDE).wrapping_add(r));
+                body(&mut ctx.state, s.wrapping_mul(stride).wrapping_add(r));
             }
             let _ = tx.send(start.elapsed());
         });
@@ -148,7 +167,8 @@ where
 
 fn bench_owned(c: &mut Criterion) {
     let mut g = c.benchmark_group("owned");
-    g.throughput(Throughput::Elements(ROUND as u64));
+    let (keys, round, stride) = (keys(), round(), stride());
+    g.throughput(Throughput::Elements(round as u64));
     g.sample_size(10);
     g.measurement_time(Duration::from_secs(10));
 
@@ -158,13 +178,13 @@ fn bench_owned(c: &mut Criterion) {
     for shards in thread_counts() {
         g.bench_with_input(BenchmarkId::new("get", shards), &shards, |b, &shards| {
             b.iter_custom(|iters| {
-                fan_out(&rt, shards, iters as usize, |m, seed| {
-                    let mut i = seed % KEYS;
+                fan_out(&rt, shards, iters as usize, move |m, seed| {
+                    let mut i = seed % keys;
                     let mut k = KeyBuf::new();
-                    for _ in 0..ROUND {
-                        i += STRIDE;
-                        if i >= KEYS {
-                            i -= KEYS;
+                    for _ in 0..round {
+                        i += stride;
+                        if i >= keys {
+                            i -= keys;
                         }
                         k.set(i);
                         black_box(m.get(black_box(k.as_bytes())));
@@ -175,13 +195,13 @@ fn bench_owned(c: &mut Criterion) {
 
         g.bench_with_input(BenchmarkId::new("set", shards), &shards, |b, &shards| {
             b.iter_custom(|iters| {
-                fan_out(&rt, shards, iters as usize, |m, seed| {
-                    let mut i = seed % KEYS;
+                fan_out(&rt, shards, iters as usize, move |m, seed| {
+                    let mut i = seed % keys;
                     let mut k = KeyBuf::new();
-                    for _ in 0..ROUND {
-                        i += STRIDE;
-                        if i >= KEYS {
-                            i -= KEYS;
+                    for _ in 0..round {
+                        i += stride;
+                        if i >= keys {
+                            i -= keys;
                         }
                         k.set(i);
                         black_box(m.set(black_box(k.as_bytes()), VALUE));
@@ -196,6 +216,7 @@ fn bench_owned(c: &mut Criterion) {
 fn bench_routed(c: &mut Criterion) {
     let mut g = c.benchmark_group("routed");
     g.sample_size(10);
+    let (keys, stride) = (keys(), stride());
 
     let shards = thread_counts().last().copied().unwrap_or(1);
     let rt = Arc::new(filled(shards));
@@ -214,7 +235,7 @@ fn bench_routed(c: &mut Criterion) {
                         std::thread::spawn(move || {
                             let sub = rt.submitter();
                             let start = Instant::now();
-                            let mut i = t * STRIDE;
+                            let mut i = t * stride;
                             for _ in 0..iters {
                                 // One flat array rather than a vector of
                                 // vectors. Sixty five allocations per batch
@@ -223,7 +244,7 @@ fn bench_routed(c: &mut Criterion) {
                                 let mut batch = [0u8; 16 * BATCH];
                                 let mut k = KeyBuf::new();
                                 for slot in 0..BATCH {
-                                    i = (i + STRIDE) % KEYS;
+                                    i = (i + stride) % keys;
                                     k.set(i);
                                     batch[slot * 16..slot * 16 + 16].copy_from_slice(k.as_bytes());
                                 }

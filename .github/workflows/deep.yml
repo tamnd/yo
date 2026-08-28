@@ -52,13 +52,71 @@ jobs:
   wanted:
     runs-on: ubuntu-latest
     outputs:
-      run: ${{ github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'deep') }}
+      run: ${{ steps.decide.outputs.run }}
       ref: ${{ github.event.inputs.ref || github.ref }}
       shards: ${{ steps.shards.outputs.list }}
+      borrows: ${{ steps.decide.outputs.borrows }}
     steps:
       - uses: actions/checkout@v7.0.1
         with:
           ref: ${{ github.event.inputs.ref || github.ref }}
+          # Deep enough to diff a pull request against its base and against the
+          # commit the last run already covered.
+          fetch-depth: 0
+      # Whether to run at all, and how much Miri to run when we do.
+      #
+      # Two borrow models on every crate is 34 jobs and around 90 runner minutes
+      # for one push. That is the right amount for a nightly run and the wrong
+      # amount to sit through while working, so a pull request gets stacked
+      # borrows and the nightly run gets both. Stacked is the model the unsafe
+      # code was written against, tree borrows disagrees with it rarely, and
+      # when it does the nightly run says so the same day rather than the same
+      # minute.
+      #
+      # A push that only moves prose does not need any of this. That is not a
+      # nicety: a changelog line on a pull request that already ran deep costs
+      # seven minutes and tells nobody anything.
+      - id: decide
+        env:
+          EVENT: ${{ github.event_name }}
+          ACTION: ${{ github.event.action }}
+          LABELLED: ${{ contains(github.event.pull_request.labels.*.name, 'deep') }}
+          BASE: ${{ github.event.pull_request.base.sha }}
+          BEFORE: ${{ github.event.before }}
+        run: |
+          set -u
+          # Everything that is not a pull request runs the lot.
+          if [ "$EVENT" != "pull_request" ]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+            echo 'borrows=["stacked","tree"]' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo 'borrows=["stacked"]' >> "$GITHUB_OUTPUT"
+          if [ "$LABELLED" != "true" ]; then
+            echo "no deep label, skipping"
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # `prose_only <sha>` is true when nothing but markdown has changed
+          # since that commit. An unknown or unrelated commit, which is what a
+          # force push leaves behind, is not an answer, so it runs.
+          prose_only() {
+            git cat-file -e "$1^{commit}" 2>/dev/null || return 1
+            changed=$(git diff --name-only "$1" HEAD)
+            [ -n "$changed" ] || return 1
+            ! printf '%s\n' "$changed" | grep -qv '\.md$'
+          }
+          if prose_only "$BASE"; then
+            echo "the whole pull request is prose, skipping"
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if [ "$ACTION" = "synchronize" ] && prose_only "$BEFORE"; then
+            echo "this push is prose on top of a run that already happened, skipping"
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "run=true" >> "$GITHUB_OUTPUT"
       # The Miri matrix is one job per crate, and the list comes from the
       # manifest rather than from a copy of it kept in this file. A crate added
       # next month gets interpreted without anybody remembering to come back
@@ -95,7 +153,10 @@ jobs:
   # rather than being skipped: the scale goes away, the coverage does not.
   #
   # Tree borrows is stricter about aliasing than stacked borrows and catches a
-  # different class of mistake, so both are worth running.
+  # different class of mistake, so both are worth running, and the nightly run
+  # runs both. A pull request gets stacked only, because tree is also the slower
+  # of the two by about 60 percent and the same crate under both models is 34
+  # jobs for one push. The list comes from `wanted`.
   #
   # `cargo miri test --workspace` walks the crates one after another, so the
   # wait is the sum of all of them and the workspace is only ever as fast as
@@ -125,13 +186,8 @@ jobs:
       # still worth having, so a failure does not cancel its siblings.
       fail-fast: false
       matrix:
-        borrows: [stacked, tree]
+        borrows: ${{ fromJSON(needs.wanted.outputs.borrows) }}
         shard: ${{ fromJSON(needs.wanted.outputs.shards) }}
-        include:
-          - borrows: stacked
-            flags: -Zmiri-strict-provenance -Zmiri-disable-isolation
-          - borrows: tree
-            flags: -Zmiri-tree-borrows -Zmiri-disable-isolation
     steps:
       - uses: actions/checkout@v7.0.1
         with:
@@ -160,7 +216,14 @@ jobs:
             cargo miri nextest run --locked -p ${{ matrix.shard.pkg }} --test-threads 4
           fi
         env:
-          MIRIFLAGS: ${{ matrix.flags }}
+          # The flags used to live in a matrix `include`, which does not survive
+          # the borrow list being decided at run time: an include entry naming a
+          # value the matrix no longer has is a job of its own with no shard in
+          # it rather than a merge into nothing.
+          MIRIFLAGS: >-
+            ${{ matrix.borrows == 'tree'
+              && '-Zmiri-tree-borrows -Zmiri-disable-isolation'
+              || '-Zmiri-strict-provenance -Zmiri-disable-isolation' }}
 
   # Twenty four shards is twenty four check names, which is more than a branch
   # protection rule wants to know about. This is the one to require.
@@ -256,7 +319,19 @@ jobs:
           ref: ${{ needs.wanted.outputs.ref }}
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2.9.2
+      # Fat link time optimisation, one codegen unit and debug info are what the
+      # bench profile owes the numbers on the bench box. This job produces no
+      # numbers, so it owes them nothing and pays several minutes for them.
+      #
+      # `YO_BENCH_SMOKE` shrinks the inputs the same way. Filling a ten million
+      # key map to look it up once proves nothing that filling a thousand does
+      # not, and it is most of what this job was spending its time on.
       - run: cargo bench --workspace --locked -- --test
+        env:
+          CARGO_PROFILE_BENCH_LTO: "false"
+          CARGO_PROFILE_BENCH_CODEGEN_UNITS: "16"
+          CARGO_PROFILE_BENCH_DEBUG: "false"
+          YO_BENCH_SMOKE: "1"
 
   # The M1 exit gate, which is a hundred thousand injected faults with zero
   # silent corruptions. Every push runs twenty thousand in `ci.yml`, because
