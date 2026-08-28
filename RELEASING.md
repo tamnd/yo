@@ -8,7 +8,9 @@ While the major is 0, the guarantees are these and only these.
 
 **Minor** goes up when a milestone lands. `M0` is `0.1.0`, and every engine or DX milestone that merges takes the next minor. A minor may break anything: the Rust API, the C ABI, the on-disk format, the command set. That is what a zero major is for, and pretending otherwise would be worse than saying it plainly.
 
-**Patch** goes up for anything that lands between milestones. Fixes, benchmark corrections, documentation, a dependency bump. A patch never changes the on-disk format and never removes a public item.
+**Patch** goes up for anything that lands between milestones. Fixes, benchmark corrections, documentation, a dependency bump, CI. A patch never changes the on-disk format and never removes a public item. It is cut after a handful of pull requests rather than after each one, so a patch is usually two to five changes with one set of notes covering them.
+
+Put another way: a minor is only ever cut when a milestone is done, and everything in between is a patch.
 
 **The on-disk format is not frozen until `M6`.** Until then a minor may change it, and when it does the release notes say so under its own heading with the migration, if there is one. From `M6` on, a file written by any later version is readable by every version at or above its `min_reader_version`, and that is checked in CI by the independent reader.
 
@@ -16,7 +18,7 @@ While the major is 0, the guarantees are these and only these.
 
 ## Cutting one
 
-1. The milestone PR is green on all of CI, including the slow jobs, and has been built and tested on x86 as well as arm. The arm dev machine cannot see the crc intrinsic paths or the target specific lints.
+1. The PR is green on `ci`, and for a minor it is also green on `deep`. `deep` does not run on a pull request unless somebody asks for it, so put the `deep` label on the PR and wait for Miri, the fuzzers, the release matrix and the benchmark smoke run. A patch can go in on `ci` alone as long as the nightly `deep` run before it was green. Either way the tree has been built and tested on x86 as well as arm, because the arm dev machine cannot see the crc intrinsic paths or the target specific lints.
 2. Bump `workspace.package.version` in the root `Cargo.toml`, and the `version` on every path dependency in `[workspace.dependencies]` with it, then run `cargo update --workspace` so `Cargo.lock` agrees. The release workflow refuses a tag whose version does not match the manifest, so a half-done bump fails before anything is published rather than after.
 3. Add the release's section to `CHANGELOG.md`. Write it for somebody who was not in the room: what changed, why it changed, and what it costs them. Numbers get their machine and their profile next to them or they do not go in.
 4. Merge the PR.

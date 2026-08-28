@@ -1,5 +1,17 @@
 name: ci
 
+# What runs on every push and every pull request, and nothing else. The rule for
+# this file is that a pull request finds out in under three minutes, because a
+# check that takes longer than the time it takes to context switch is a check
+# people learn to ignore.
+#
+# Everything that cannot meet that budget lives in deep.yml, which runs nightly,
+# on demand against any branch, and on a pull request labelled `deep`. Miri,
+# fuzzing, the release test matrix, the benchmark smoke run and the cold build
+# from source are all there. None of them has ever caught something that only
+# appears between one commit and the next, and all of them were making the
+# common case slow.
+
 on:
   push:
     branches: [main]
@@ -8,7 +20,17 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  # Incremental artifacts are large, slow to save and restore, and useless
+  # across the fresh checkout every job gets. Turning them off makes the cache
+  # smaller and the build faster, which is the opposite of what the name
+  # suggests and is the right call on a runner.
   CARGO_INCREMENTAL: 0
+  # Debug info is most of what rustc emits and most of what the linker then has
+  # to chew through, and no CI job here reads a backtrace line number. Turning
+  # it off is the single biggest saving in this file, worth about a third of the
+  # wall clock on Windows and most of the cache size everywhere.
+  CARGO_PROFILE_DEV_DEBUG: 0
+  CARGO_PROFILE_TEST_DEBUG: 0
   RUSTFLAGS: -D warnings
 
 concurrency:
@@ -20,147 +42,85 @@ jobs:
   # under a minute instead of after the test matrix.
   style:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v7.0.1
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2.9.2
+        with:
+          # Only main writes the cache. A pull request reads main's and skips
+          # the upload, which is twenty to forty seconds a job that nobody was
+          # getting anything back for: the next pull request has a different
+          # cache key anyway.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets --all-features
 
+  # Debug only. The release matrix moved to deep.yml, because building the whole
+  # workspace twice was most of this job and a bug that shows up only under
+  # optimisation is a nightly problem rather than a per commit one.
   test:
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v7.0.1
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2.9.2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo test --workspace --locked
-      - run: cargo test --workspace --locked --release
 
   # The floor stays green too. Held about six months behind stable, and the
   # number lives in AUDIT-2026-08.md section 1 so there is one place to bump it.
   msrv:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v7.0.1
       - uses: dtolnay/rust-toolchain@1.94.0
       - uses: Swatinem/rust-cache@v2.9.2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       # rust-toolchain.toml pins the working toolchain, and it has to be out of
       # the way for this job to test what it says it tests.
       - run: rm rust-toolchain.toml
       - run: cargo test --workspace --locked
 
-  # Every unsafe block in the workspace, interpreted. Miri is slow, so the
-  # arena's segment tests run at a reduced size through an environment variable
-  # rather than being skipped.
-  #
-  # Tree borrows is stricter about aliasing than stacked borrows and catches a
-  # different class of mistake, so both are worth running. They used to run one
-  # after the other in a single job and that job took over an hour, which is
-  # long enough that a pull request sits waiting on it after everything else has
-  # gone green. They have nothing to say to each other, so they run as two jobs
-  # and a pull request waits for the slower of the two rather than for the sum.
-  miri:
-    name: miri (${{ matrix.borrows }} borrows)
-    runs-on: ubuntu-latest
-    strategy:
-      # One model failing is a real finding and the other model's result is
-      # still worth having, so a failure does not cancel its sibling.
-      fail-fast: false
-      matrix:
-        include:
-          - borrows: stacked
-            flags: -Zmiri-strict-provenance -Zmiri-disable-isolation
-          - borrows: tree
-            flags: -Zmiri-tree-borrows -Zmiri-disable-isolation
-    steps:
-      - uses: actions/checkout@v7.0.1
-      - uses: dtolnay/rust-toolchain@nightly
-        with:
-          components: miri
-      - uses: Swatinem/rust-cache@v2.9.2
-        with:
-          # Both jobs build the same tree with the same nightly, so without a
-          # key of their own they would race for one cache entry and each keep
-          # evicting the other's.
-          key: ${{ matrix.borrows }}
-      - run: rm rust-toolchain.toml
-      - run: cargo miri test --workspace --locked
-        env:
-          MIRIFLAGS: ${{ matrix.flags }}
-
   # The SPSC lane is the only lock free thing in the tree. Loom enumerates the
   # interleavings a weak memory model allows rather than hoping the test machine
-  # produces the interesting one.
+  # produces the interesting one. Cheap enough to stay on the fast path.
   loom:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v7.0.1
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2.9.2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo test -p yo-shard --release --locked --lib spsc::loom
         env:
           RUSTFLAGS: --cfg loom
           LOOM_MAX_PREEMPTIONS: "3"
 
-  # Fuzz targets are built on every pull request and run briefly, so a target
-  # that stops compiling is caught the same day rather than the next time
-  # somebody remembers to run the fuzzer.
-  fuzz:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7.0.1
-      - uses: dtolnay/rust-toolchain@nightly
-      - uses: Swatinem/rust-cache@v2.9.2
-      - run: rm rust-toolchain.toml
-      - run: cargo install cargo-fuzz --locked
-      - run: cargo fuzz build
-      - name: sixty seconds per target
-        run: |
-          for t in $(cargo fuzz list); do
-            cargo fuzz run "$t" -- -max_total_time=60 -rss_limit_mb=4096
-          done
-      - uses: actions/upload-artifact@v7.0.1
-        if: failure()
-        with:
-          name: fuzz-artifacts
-          path: fuzz/artifacts
-
   # Documentation is part of the interface. A broken intra doc link is a broken
   # link in the published API reference, so it fails the build.
   docs:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v7.0.1
       - uses: dtolnay/rust-toolchain@nightly
       - uses: Swatinem/rust-cache@v2.9.2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: rm rust-toolchain.toml
       - run: cargo doc --workspace --no-deps --all-features
         env:
           RUSTDOCFLAGS: -D warnings --cfg docsrs
-
-  # The benchmarks have to keep compiling and keep running. This does not
-  # measure anything, it runs one iteration of each so that a benchmark which
-  # panics or no longer builds is caught here rather than on the bench box.
-  bench-smoke:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7.0.1
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2.9.2
-      - run: cargo bench --workspace --locked -- --test
-
-  # Somebody with nothing but rustup should be able to clone and build. No
-  # cache, no toolchain file, no repository specific setup.
-  from-source:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7.0.1
-      - uses: dtolnay/rust-toolchain@stable
-      - run: cargo build --workspace --release --locked
-      - run: cargo test --workspace --release --locked --no-fail-fast
