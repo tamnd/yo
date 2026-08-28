@@ -12,8 +12,8 @@
 #   merge         reads more than one key and combines them
 #   metadata      answers from the header without reading the value
 #   whole-value   reads or rewrites the entire value
-#   none          touches no key at all, which only the connection and server
-#                 groups are allowed to claim
+#   none          touches no key at all, which only the connection, scripting
+#                 and server groups are allowed to claim
 #
 # bounded is one of:
 #   inherent      the answer is small whatever the value is
@@ -138,8 +138,12 @@ doc = "12 section 4"
 [[group]]
 name = "scripting"
 expected = 8
-status = "planned"
+status = "partial"
 doc = "12 section 7"
+# SCRIPT and FUNCTION are here in M2 with the subcommands that are exactly right
+# on a server with no interpreter, because Redis's own test suite says SCRIPT
+# FLUSH and FUNCTION FLUSH before every start_server block. The six that need
+# Lua, which is EVAL, EVALSHA, EVAL_RO, EVALSHA_RO, FCALL and FCALL_RO, are M6.
 
 [[group]]
 name = "connection"
@@ -496,6 +500,32 @@ bounded = "inherent"
 status = "shipped"
 wire = "verified"
 notes = "Answers string or none and nothing else yet, which is true rather than incomplete: there is nothing else in the store to answer with. It grows a case each time a type lands."
+
+# ------------------------------------------------------------------ scripting
+
+[[command]]
+name = "SCRIPT"
+group = "scripting"
+since = "2.6.0"
+arity = -2
+plan = "none"
+bounded = "inherent"
+status = "shipped"
+wire = "verified"
+divergent = "D-16"
+notes = "FLUSH, EXISTS and HELP. The cache is empty and there is nothing that can put anything in it, so flushing it is a no-op that is true and EXISTS answering zero is the true answer to the question it was asked. LOAD, KILL and DEBUG would need an interpreter to answer honestly and are not there at all."
+
+[[command]]
+name = "FUNCTION"
+group = "scripting"
+since = "7.0.0"
+arity = -2
+plan = "none"
+bounded = "inherent"
+status = "shipped"
+wire = "verified"
+divergent = "D-16"
+notes = "FLUSH, LIST, DELETE and HELP, all of which are exactly right with no libraries loaded. STATS is the one that looks answerable and is not, because a real server lists LUA in its engines map and there is no engine here to list, so an empty map would be a different answer rather than the same one."
 
 # ----------------------------------------------------------------- connection
 

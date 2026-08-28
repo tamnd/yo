@@ -53,6 +53,7 @@
 
 mod args;
 mod keyspace;
+mod scripting;
 mod server;
 mod strings;
 pub mod table;
@@ -283,6 +284,7 @@ pub fn execute(server: &mut Server, session: &mut Session, args: Args<'_>, out: 
             let db = session.db;
             keyspace::execute(&mut server.dbs[db], spec, args, out).map(|()| Flow::Continue)
         }
+        "scripting" => scripting::execute(spec, args, out).map(|()| Flow::Continue),
         _ => server::execute(server, session, spec, args, out),
     };
     match done {
@@ -431,6 +433,65 @@ mod tests {
         assert_eq!(
             f.run(&[b"FLUSHDB", b"sync", b"sync"]),
             "-ERR syntax error\r\n"
+        );
+    }
+
+    #[test]
+    fn the_script_cache_and_the_library_set_answer_for_being_empty() {
+        let mut f = Fixture::new();
+        assert_eq!(f.run(&[b"SCRIPT", b"FLUSH"]), "+OK\r\n");
+        assert_eq!(f.run(&[b"SCRIPT", b"FLUSH", b"async"]), "+OK\r\n");
+        assert_eq!(f.run(&[b"FUNCTION", b"FLUSH", b"SYNC"]), "+OK\r\n");
+        // Nothing is cached, so nothing is there, one answer per hash asked
+        // about.
+        assert_eq!(
+            f.run(&[b"SCRIPT", b"EXISTS", b"aaaa", b"bbbb"]),
+            "*2\r\n:0\r\n:0\r\n"
+        );
+        assert_eq!(f.run(&[b"FUNCTION", b"LIST"]), "*0\r\n");
+        assert_eq!(
+            f.run(&[b"FUNCTION", b"LIST", b"LIBRARYNAME", b"x", b"WITHCODE"]),
+            "*0\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"FUNCTION", b"DELETE", b"nosuch"]),
+            "-ERR Library not found\r\n"
+        );
+
+        // Redis's two messages here are its own, one per container, and one of
+        // them reads like a typo.
+        assert_eq!(
+            f.run(&[b"SCRIPT", b"FLUSH", b"nope"]),
+            "-ERR SCRIPT FLUSH only support SYNC|ASYNC option\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"FUNCTION", b"FLUSH", b"nope"]),
+            "-ERR FUNCTION FLUSH only supports SYNC|ASYNC option\r\n"
+        );
+        // A second argument after the mode is the generic one instead, because
+        // the count is checked before the word is looked at.
+        assert_eq!(
+            f.run(&[b"FUNCTION", b"FLUSH", b"sync", b"sync"]),
+            "-ERR unknown subcommand or wrong number of arguments for 'flush'. Try FUNCTION HELP.\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"FUNCTION", b"LIST", b"bogus"]),
+            "-ERR Unknown argument bogus\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"SCRIPT", b"EXISTS"]),
+            "-ERR wrong number of arguments for 'script|exists' command\r\n"
+        );
+
+        // The ones that need an interpreter are not here, and say so rather
+        // than answering OK to a load that loaded nothing.
+        assert_eq!(
+            f.run(&[b"SCRIPT", b"LOAD", b"return 1"]),
+            "-ERR unknown subcommand 'LOAD'. Try SCRIPT HELP.\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"FUNCTION", b"STATS"]),
+            "-ERR unknown subcommand 'STATS'. Try FUNCTION HELP.\r\n"
         );
     }
 

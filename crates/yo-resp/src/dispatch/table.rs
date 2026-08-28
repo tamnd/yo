@@ -461,6 +461,35 @@ pub static COMMANDS: &[Spec] = &[
         summary: "What kind of value is under a key, or none.",
         group: "keyspace",
     },
+    // ----------------------------------------------------------- scripting
+    // Both are containers with no flags and no keys of their own, which is what
+    // a real 8.10.1 reports: the flags live on the subcommands.
+    Spec {
+        name: "script",
+        arity: -2,
+        flags: &[],
+        first_key: 0,
+        last_key: 0,
+        step: 0,
+        acl: &["@slow"],
+        since: "2.6.0",
+        complexity: "O(1) for the subcommands that are here.",
+        summary: "The script cache, which is empty and stays empty until M6.",
+        group: "scripting",
+    },
+    Spec {
+        name: "function",
+        arity: -2,
+        flags: &[],
+        first_key: 0,
+        last_key: 0,
+        step: 0,
+        acl: &["@slow"],
+        since: "7.0.0",
+        complexity: "O(1) for the subcommands that are here.",
+        summary: "The function libraries, of which there are none until M6.",
+        group: "scripting",
+    },
     // ---------------------------------------------------------- connection
     Spec {
         name: "ping",

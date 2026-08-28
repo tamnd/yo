@@ -26,10 +26,16 @@ const PLANS: &[&str] = &[
 /// The groups whose commands are allowed to claim the `none` plan.
 ///
 /// A command that touches no key has no storage plan to state, and there are
-/// exactly two groups that can honestly say so. Anywhere else it is a command
-/// whose plan nobody has worked out, which is the thing `12` section 3 exists
-/// to stop.
-const PLANLESS_GROUPS: &[&str] = &["connection", "server"];
+/// three groups that can honestly say so. Anywhere else it is a command whose
+/// plan nobody has worked out, which is the thing `12` section 3 exists to
+/// stop.
+///
+/// Scripting is on the list for the two container commands and not for the six
+/// that run code. SCRIPT and FUNCTION are about a cache and a library set and
+/// never name a key. EVAL and the rest take their keys in an argument and are
+/// in the `merge` plan when they land, so adding the group here does not let
+/// them through without one.
+const PLANLESS_GROUPS: &[&str] = &["connection", "scripting", "server"];
 /// The bound or materialise verdicts.
 const BOUNDED: &[&str] = &["inherent", "yes", "risk"];
 /// Whether a command is implemented, and how far up it reaches.
