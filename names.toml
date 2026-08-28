@@ -1,0 +1,403 @@
+# names.toml — every name the `tamnd` publishing identity holds or intends to
+# hold. The declarative source for `dx/16` §4's table, `dx/12` §2's table, and
+# the weekly CI ownership check (`17` §6 check 5).
+#
+# GENERATED FIELDS: `state`, `probed` and `note` are rewritten by
+# `reserve.py audit`. Everything else is written by hand.
+#
+# state:  free      nothing published, we do not hold it
+#         reserved  we hold it, placeholder published (dx/16 §6)
+#         released  we hold it, a real version is published
+#         blocked   someone else holds it; use `fallback`
+#         fallback  we are on the fallback because the primary is blocked
+#         unknown   the probe failed — never treated as free
+#
+# reserve = false means the row is audited but deliberately never published to
+# (dx/16 §11): port-PR channels, and names we refuse to squat.
+
+[[name]]
+registry  = "crates.io"
+name      = "yodb"
+namespace = ""
+state     = "released"
+probed    = "2026-08-28"
+owner     = "tamnd"
+fallback  = ""
+note      = "v0.0.0 owner=tamnd"
+
+[[name]]
+registry  = "crates.io"
+name      = "yodb-sys"
+namespace = ""
+state     = "released"
+probed    = "2026-08-28"
+owner     = "tamnd"
+fallback  = ""
+note      = "v0.0.0 owner=tamnd"
+
+[[name]]
+registry  = "crates.io"
+name      = "yodb-macros"
+namespace = ""
+state     = "released"
+probed    = "2026-08-28"
+owner     = "tamnd"
+fallback  = ""
+note      = "v0.0.0 owner=tamnd"
+
+[[name]]
+registry  = "pypi"
+name      = "yodb"
+namespace = ""
+state     = "reserved"
+probed    = "2026-08-28"
+owner     = "tamnd"
+fallback  = ""
+note      = "v0.0.0, repository is ours"
+
+[[name]]
+registry  = "npm"
+name      = "core"
+namespace = "@yodb"
+state     = "released"
+probed    = "2026-08-28"
+owner     = "tamnd"
+fallback  = ""
+note      = "maintainers=tamnd"
+
+[[name]]
+registry  = "npm"
+name      = "yodb"
+namespace = ""
+state     = "blocked"
+probed    = "2026-08-28"
+owner     = "tamnd"
+fallback  = "@yodb/core"
+note      = "unpublished 2020-07-16; publish refused by npm's name-similarity filter, not by the tombstone"
+
+[[name]]
+registry  = "npm-scope"
+name      = "yodb"
+namespace = "@yodb"
+state     = "reserved"
+probed    = "2026-08-28"
+owner     = "tamnd"
+fallback  = ""
+note      = "org exists, 1 member(s)"
+
+[[name]]
+registry  = "npm-scope"
+name      = "tamnd"
+namespace = "@tamnd"
+state     = "reserved"
+probed    = "2026-08-28"
+owner     = "tamnd"
+fallback  = ""
+note      = "user scope of npm account tamnd, not an org"
+
+[[name]]
+registry  = "pub.dev"
+name      = "yodb"
+namespace = ""
+state     = "reserved"
+probed    = "2026-08-28"
+owner     = "tamnd"
+fallback  = ""
+note      = "v0.0.0, no publisher set, repository is ours"
+
+[[name]]
+registry  = "nuget"
+name      = "Yodb"
+namespace = ""
+state     = "reserved"
+probed    = "2026-08-28"
+owner     = "tamnd"
+fallback  = ""
+note      = "v0.0.0 by tamnd"
+
+[[name]]
+registry  = "maven-central"
+name      = "yodb"
+namespace = "com.tamnd"
+state     = "reserved"
+probed    = "2026-08-28"
+owner     = "tamnd"
+fallback  = "io.github.tamnd"
+note      = "in repo1 (authoritative)"
+
+[[name]]
+registry  = "cocoapods"
+name      = "Yodb"
+namespace = ""
+state     = "free"
+probed    = "2026-08-28"
+owner     = "tamnd"
+fallback  = ""
+note      = ""
+
+[[name]]
+registry  = "homebrew-core"
+name      = "yodb"
+namespace = ""
+state     = "free"
+probed    = "2026-08-28"
+owner     = "tamnd"
+fallback  = "tamnd/tap/yodb"
+note      = ""
+
+[[name]]
+registry  = "chocolatey"
+name      = "yodb"
+namespace = ""
+state     = "free"
+probed    = "2026-08-28"
+owner     = "tamnd"
+fallback  = ""
+note      = ""
+
+[[name]]
+registry  = "aur"
+name      = "yodb"
+namespace = ""
+state     = "free"
+probed    = "2026-08-28"
+owner     = "tamnd"
+fallback  = ""
+note      = ""
+
+[[name]]
+registry  = "aur"
+name      = "yodb-bin"
+namespace = ""
+state     = "free"
+probed    = "2026-08-28"
+owner     = "tamnd"
+fallback  = ""
+note      = ""
+
+[[name]]
+registry  = "snap"
+name      = "yodb"
+namespace = ""
+state     = "free"
+probed    = "2026-08-28"
+owner     = "tamnd"
+fallback  = ""
+note      = ""
+
+[[name]]
+registry  = "scoop-main"
+name      = "yodb"
+namespace = ""
+state     = "free"
+probed    = "2026-08-28"
+owner     = "tamnd"
+fallback  = "tamnd/scoop-bucket"
+note      = "Main bucket"
+
+[[name]]
+registry  = "docker-hub"
+name      = "yo"
+namespace = "tamnd"
+state     = "free"
+probed    = "2026-08-28"
+owner     = "tamnd"
+fallback  = ""
+note      = ""
+
+[[name]]
+registry  = "rubygems"
+name      = "yodb"
+namespace = ""
+state     = "free"
+probed    = "2026-08-28"
+owner     = "tamnd"
+fallback  = ""
+note      = ""
+
+[[name]]
+registry  = "hex"
+name      = "yodb"
+namespace = ""
+state     = "free"
+probed    = "2026-08-28"
+owner     = "tamnd"
+fallback  = ""
+note      = ""
+
+[[name]]
+registry  = "packagist"
+name      = "yodb"
+namespace = "tamnd"
+state     = "free"
+probed    = "2026-08-28"
+owner     = "tamnd"
+fallback  = ""
+note      = ""
+
+[[name]]
+registry  = "conda-forge"
+name      = "yodb"
+namespace = ""
+state     = "free"
+probed    = "2026-08-28"
+owner     = "tamnd"
+fallback  = ""
+note      = ""
+
+[[name]]
+registry  = "github"
+name      = "yo"
+namespace = "tamnd"
+state     = "reserved"
+probed    = "2026-08-28"
+owner     = "tamnd"
+fallback  = ""
+note      = "exists"
+
+[[name]]
+registry  = "github"
+name      = "yo-swift"
+namespace = "tamnd"
+state     = "reserved"
+probed    = "2026-08-28"
+owner     = "tamnd"
+fallback  = ""
+note      = "exists"
+
+[[name]]
+registry  = "github"
+name      = "yo-dart"
+namespace = "tamnd"
+state     = "reserved"
+probed    = "2026-08-28"
+owner     = "tamnd"
+fallback  = ""
+note      = "exists"
+
+[[name]]
+registry  = "github"
+name      = "homebrew-tap"
+namespace = "tamnd"
+state     = "reserved"
+probed    = "2026-08-28"
+owner     = "tamnd"
+fallback  = ""
+note      = "exists"
+
+[[name]]
+registry  = "github"
+name      = "scoop-bucket"
+namespace = "tamnd"
+state     = "reserved"
+probed    = "2026-08-28"
+owner     = "tamnd"
+fallback  = ""
+note      = "exists"
+
+[[name]]
+registry  = "github"
+name      = "yo-go"
+namespace = "tamnd"
+state     = "reserved"
+probed    = "2026-08-28"
+owner     = "tamnd"
+fallback  = ""
+note      = "exists"
+
+[[name]]
+registry  = "dns"
+name      = "tamnd.com"
+namespace = ""
+state     = "released"
+probed    = "2026-08-28"
+owner     = "tamnd"
+fallback  = ""
+note      = "elinore.ns.cloudflare.com."
+
+[[name]]
+registry  = "dns"
+name      = "tamnd.dev"
+namespace = ""
+state     = "released"
+probed    = "2026-08-28"
+owner     = "tamnd"
+fallback  = "yo.tamnd.com"
+note      = "elinore.ns.cloudflare.com."
+
+[[name]]
+registry  = "crates.io"
+name      = "yo"
+namespace = ""
+state     = "blocked"
+probed    = "2026-08-28"
+owner     = ""
+fallback  = ""
+note      = "v1.3.5 owner=Montekkundan"
+reserve   = false
+
+[[name]]
+registry  = "pypi"
+name      = "yo"
+namespace = ""
+state     = "blocked"
+probed    = "2026-08-28"
+owner     = ""
+fallback  = ""
+note      = "v1.13.1 by Oracle"
+reserve   = false
+
+[[name]]
+registry  = "pub.dev"
+name      = "yo"
+namespace = ""
+state     = "blocked"
+probed    = "2026-08-28"
+owner     = ""
+fallback  = ""
+note      = "v0.4.99"
+reserve   = false
+
+[[name]]
+registry  = "homebrew-core"
+name      = "yo"
+namespace = ""
+state     = "blocked"
+probed    = "2026-08-28"
+owner     = ""
+fallback  = ""
+note      = "CLI tool for running Yeoman generators"
+reserve   = false
+
+[[name]]
+registry  = "chocolatey"
+name      = "yo"
+namespace = ""
+state     = "blocked"
+probed    = "2026-08-28"
+owner     = ""
+fallback  = ""
+note      = "19 package versions"
+reserve   = false
+
+[[name]]
+registry  = "aur"
+name      = "yo"
+namespace = ""
+state     = "blocked"
+probed    = "2026-08-28"
+owner     = ""
+fallback  = ""
+note      = "CLI tool for running Yeoman generators"
+reserve   = false
+
+[[name]]
+registry  = "snap"
+name      = "yo"
+namespace = ""
+state     = "free"
+probed    = "2026-08-28"
+owner     = ""
+fallback  = ""
+note      = ""
+reserve   = false

@@ -1,0 +1,64 @@
+name: names
+
+# Do we still own the names we publish under. Once a week, and again on every
+# release.
+#
+# It is weekly rather than on every push because the answer changes for reasons
+# that have nothing to do with a commit. A registry transfers a name after an
+# inactivity policy fires, an account is suspended, a package is yanked by
+# somebody with the rights to do it. None of that arrives as a pull request, and
+# finding out during a release is finding out too late (`dx/16` §13.4).
+#
+# The other half of the check, `reserve docs`, is not here. It compares the name
+# table in `dx/12` against `names.toml`, and `dx/12` lives in a private
+# repository while this one is public. Running it here would mean storing a
+# token that can read the whole private spec tree in a public repository's
+# secrets, in order to enforce a documentation-consistency check. That is a bad
+# trade, so `docs` runs from the private side, where the credential to read the
+# public repository is the one every workflow already gets for free.
+
+on:
+  schedule:
+    # 04:00 UTC on Monday. An hour after deep.yml so the two are not competing
+    # for the same runner pool, and on a weekday so a failure is seen the same
+    # day rather than sitting all weekend.
+    - cron: "0 4 * * 1"
+  workflow_dispatch:
+  workflow_call:
+
+permissions:
+  contents: read
+
+concurrency:
+  # Not cancelled, because half an ownership audit is not an answer. Keyed on
+  # the ref so that a release calling this workflow is never made to queue
+  # behind the weekly run on main.
+  group: names-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  names:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: dtolnay/rust-toolchain@1.94.0
+      - uses: Swatinem/rust-cache@v2.9.2
+        with:
+          shared-key: xtask
+
+      # Through `cargo xtask` and not by calling the script, so the entrypoint
+      # the documentation names is the entrypoint something runs. The probe
+      # logic is Python and imports nothing outside the standard library, so
+      # there is no install step here and there should never be one.
+      - name: Are the names still ours
+        env:
+          # The automatic per-run token, not a stored secret. Its only job here
+          # is to lift GitHub's anonymous API limit of 60 requests an hour,
+          # which a shared runner pool can exhaust on somebody else's build and
+          # which turned six healthy repositories into six failures once
+          # already (`dx/16` §10 property 3). Every repository probed is public,
+          # so authenticating cannot change an answer, and this token can read
+          # nothing that `git clone` could not.
+          GH_TOKEN: ${{ github.token }}
+        run: cargo xtask reserve verify

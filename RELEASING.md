@@ -26,6 +26,20 @@ Put another way: a minor is only ever cut when a milestone is done, and everythi
 
 A tag is never moved and never deleted. If a release is wrong, the fix is the next patch.
 
+## Signing
+
+Two public keys are checked in under `keys/`, and both are published at <https://yo.tamnd.dev> as well. They are here before there is anything signed with them, which is the point: a key that appears in the same release as the first signature is a key nobody has had a chance to disagree with.
+
+`keys/minisign.pub`, key id `9551442DEC1CD552`, signs `SHA256SUMS` for the script installers. `keys/tamnd-signing-key.asc`, `tamnd <dev@tamnd.com>`, fingerprint `F737 055C 3ACD 3956 2FE2  6163 46D1 5643 1C21 8272`, expires 2029-08-27 and signs the Maven Central artifacts.
+
+The same fingerprints are on `keyserver.ubuntu.com` and `keys.openpgp.org`, neither of which we run. A key checked against a copy of itself on the same host proves nothing, so the check worth doing is that three places agree.
+
+## Names
+
+`cargo xtask reserve verify` asks every registry whether the names in `names.toml` are still ours, and `cargo xtask reserve docs` asks whether that file and `dx/12` section 2 still say the same thing. Both run weekly in `names.yml` and again on every release, and a release does not publish if either fails. The reasoning, the six-state machine and the reason the probes are Python rather than Rust are in `dx/16` section 10.
+
+`verify` uses three exit codes and the difference matters: 0 is held, 1 is a name lost or transferred, 2 is a probe that could not get an answer. Both non-zero codes stop a release, because a gate that cannot see a name must not wave it through, but only the first one means something is actually wrong.
+
 ## What a release note has to contain
 
 Every section carries whichever of these apply, in this order. Headings that have nothing under them are left out rather than filled with "none".
