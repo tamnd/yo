@@ -295,9 +295,9 @@ mod tests {
         assert!(bad.is_empty(), "{}", bad.join("\n"));
     }
 
-    /// The string group is the one that is shipped, and it is 25 and not the 28
-    /// in `12` section 3. If that ever changes, the spec and the file have to
-    /// change together.
+    /// The string group is the one that is shipped, and a real Redis 8.8 answers
+    /// 26 where `12` section 3 says 28. If that ever changes, the spec and the
+    /// file have to change together.
     #[test]
     fn the_string_group_is_complete() {
         let root = crate::root();
@@ -306,7 +306,7 @@ mod tests {
             .iter()
             .filter(|t| t.name == "command" && t.str("group").unwrap_or_default() == "string")
             .collect();
-        assert_eq!(strings.len(), 25);
+        assert_eq!(strings.len(), 26);
         for want in [
             "SET",
             "GET",
@@ -332,6 +332,7 @@ mod tests {
             "LCS",
             "MSETEX",
             "DELEX",
+            "DIGEST",
             "INCREX",
         ] {
             assert!(

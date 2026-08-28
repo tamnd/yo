@@ -86,3 +86,10 @@ title = "LCS refuses a table larger than 64 million cells"
 reason = "Redis has no explicit limit and fails on the allocation instead, which on a server that has overcommitted is a kill rather than an error. LCS on two large strings is the easiest accidental denial of service in the string group, so the limit is a number and the failure is the same failure on every machine."
 status = "permanent"
 spec = "08 section 2"
+
+[[divergence]]
+id = "D-11"
+title = "The float counters count in f64 rather than in the C long double"
+reason = "INCRBYFLOAT and INCREX BYFLOAT use a long double in Redis, which is eighty bit on x86-64 and a hundred and twenty eight bit on aarch64, so Redis already does not agree with itself across machines. f64 gives the same answer everywhere. A value that needs more than seventeen significant digits differs, and nothing else does."
+status = "permanent"
+spec = "08 section 2"
