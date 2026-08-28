@@ -25,6 +25,42 @@ use yo_common::{Addr, Space, wyhash};
 /// Bytes of length prefix in front of a record.
 const HDR: usize = 8;
 
+/// The least a single [`RawMap::compact_step`] walks.
+///
+/// A segment is two megabytes and evacuating one in a single call was a stop
+/// the world pause in the middle of a batch. At 64 byte values that is around
+/// twenty six thousand records, each one an index probe, a copy and an index
+/// write, and the replies behind it wait for all of them. It is why the write
+/// rows had a p99 of 3.9 milliseconds against Redis at 0.8 while the p50 was
+/// in line: the median command paid nothing and one command in a few thousand
+/// paid for the whole segment.
+///
+/// Sixty four kilobytes is a thirty second of a segment, which puts the worst
+/// call at a few hundred records. Smaller would be smoother and would spend
+/// more of the total on the fixed cost of picking up where the last call left
+/// off; this is the smallest size at which that overhead is still noise.
+///
+/// The budget is spent on how far the cursor moves and not on how many records
+/// move, because a segment can be entirely dead. Charging only for records
+/// that move would let one call walk two megabytes of headers for free, which
+/// is the pause this exists to prevent, just without the copying.
+const EVAC_FLOOR: usize = 64 * 1024;
+
+/// The most, which is a whole segment.
+///
+/// The cap is here so that the scaling below has an end, not because a segment
+/// is a good amount of work to do at once. Reaching it means the collector is
+/// sixteen times past the line it starts at, at which point the pause is the
+/// smaller problem.
+const EVAC_CEILING: usize = yo_arena::SEGMENT_SIZE;
+
+/// A segment that is partway through being evacuated, and how far it got.
+#[derive(Clone, Copy)]
+struct Evac {
+    seg: usize,
+    off: usize,
+}
+
 struct Record;
 
 impl Record {
@@ -79,6 +115,8 @@ impl Keys for Records<'_> {
 pub struct RawMap {
     index: Index,
     arena: Arena,
+    /// Where the last `compact_step` stopped, if it stopped partway.
+    evac: Option<Evac>,
 }
 
 impl RawMap {
@@ -87,6 +125,7 @@ impl RawMap {
         RawMap {
             index: Index::new(),
             arena: Arena::new(),
+            evac: None,
         }
     }
 
@@ -357,12 +396,29 @@ impl RawMap {
             // take the ground out from under the next allocation.
             return 0;
         }
+        let (moved, _) = self.evacuate(seg, yo_arena::HEADER_SIZE, usize::MAX);
+        self.arena.reclaim(seg);
+        moved
+    }
+
+    /// Walk `seg` from `from`, moving live records out, and stop once the walk
+    /// has covered `budget` bytes of it. Says how many records moved and where
+    /// to start again.
+    ///
+    /// The record that straddles the budget is finished rather than cut in
+    /// half, so the walk can go a little past what was asked for. The overrun
+    /// is one record and the budget is thousands of bytes.
+    ///
+    /// Nothing here reclaims. A segment is only empty once the walk reaches the
+    /// bump, and the caller is the one that knows whether it did.
+    fn evacuate(&mut self, seg: usize, from: usize, budget: usize) -> (usize, usize) {
         let base = (seg as u64) << yo_arena::SEGMENT_SHIFT;
         let bump = self.arena.recorded_bump(seg) as usize;
+        let stop = from.saturating_add(budget).min(bump);
 
         let mut moved = 0;
-        let mut off = yo_arena::HEADER_SIZE;
-        while off < bump {
+        let mut off = from;
+        while off < stop {
             let old = Addr::new(Space::Arena, base + off as u64);
             let (klen, vlen) = Record::lens(self.arena.get(old, HDR));
             let total = HDR + klen + vlen;
@@ -391,26 +447,87 @@ impl RawMap {
             self.arena.free(old, total);
             moved += 1;
         }
-        self.arena.reclaim(seg);
-        moved
+        (moved, off)
     }
 
-    /// Compact one segment if one is worth compacting, and say how many records
-    /// moved.
+    /// How much to walk on this call, given how far behind the collector is.
     ///
-    /// `None` means there was no candidate. It is not the same as `Some(0)`,
-    /// which is a segment whose every record had already been overwritten: that
-    /// one gave two megabytes back without moving anything, and a caller
-    /// deciding whether to go round again needs to be told so.
+    /// A fixed budget has to be either a good pause or a good collection rate
+    /// and it cannot be both. At 64 kilobytes a segment takes thirty two calls,
+    /// and a pipelined flood of writes makes garbage faster than one call per
+    /// batch gets it back: measured with variable sized values at pipeline 16,
+    /// the tail came down from 2.6 milliseconds to 1.6 and the process held 18
+    /// MB more, because segments queued up waiting their turn to be walked.
     ///
-    /// This is the whole maintenance contract: at most one segment per call, so
-    /// a caller that runs it once per turn of the loop pays a bounded amount
-    /// and never a full pass over the arena. Zero means there was nothing to
-    /// do, and finding that out is one comparison against the running dead byte
+    /// So the floor is what a command can be asked to wait for, and the depth
+    /// of that queue is what says how much more than the floor is needed to
+    /// keep up. One candidate is a store that is keeping up and pays the floor.
+    /// Nine is a store nine segments behind, and it walks nine slices.
+    ///
+    /// The queue and not the dead byte total. Dead bytes were tried first,
+    /// measured against the point compaction starts at, and that ratio cannot
+    /// see a backlog at all: the threshold is a fraction of what the arena
+    /// holds, so a collector that falls behind grows the arena, which raises
+    /// the threshold, which puts the ratio back where it was. It sat at the
+    /// floor through the whole flood and the 18 MB stayed exactly where it was.
+    /// A count of segments has no such denominator.
+    ///
+    /// Linear in the depth and not squared. This is a controller in a loop with
+    /// its own input, and a term that grows faster than the error is how one of
+    /// those starts to oscillate.
+    fn budget(&self) -> usize {
+        let behind = self.arena.candidate_count().max(1);
+        EVAC_FLOOR.saturating_mul(behind).min(EVAC_CEILING)
+    }
+
+    /// Do one bounded slice of compaction, and say how many records moved.
+    ///
+    /// `None` means there was no candidate and there is nothing in flight. It
+    /// is not the same as `Some(0)`, which is a slice that walked only records
+    /// that had already been overwritten: that one made progress and cost
+    /// something, and a caller deciding whether to go round again needs to be
+    /// told so.
+    ///
+    /// This is the whole maintenance contract: a bounded amount of work per
+    /// call, so a caller that runs it once per batch never pays for a full pass
+    /// over the arena and never pays for a whole segment either. Finding out
+    /// there is nothing to do is one comparison against the running dead byte
     /// total.
+    ///
+    /// A segment takes as many calls as it takes. Each one picks up where the
+    /// last stopped and only the call that reaches the end gives the two
+    /// megabytes back, so the space comes back in one lump at the end while the
+    /// cost of getting it back is spread over the batches in between. That is
+    /// the trade: a segment stays around a little longer than it used to, and
+    /// no single command waits for the whole of it.
+    ///
+    /// The segment in flight is finished before another is chosen, rather than
+    /// asking which segment is worst on every call. Otherwise a segment that is
+    /// three quarters evacuated could be put down in favour of a worse one and
+    /// never picked up, and the arena would fill with segments that are nearly
+    /// empty and never reclaimed.
     pub fn compact_step(&mut self) -> Option<usize> {
-        let seg = self.arena.worst_candidate()?;
-        Some(self.compact_segment(seg))
+        let (seg, from) = match self.evac {
+            Some(e) => (e.seg, e.off),
+            None => (self.arena.worst_candidate()?, yo_arena::HEADER_SIZE),
+        };
+        if seg == self.arena.current_segment() {
+            self.evac = None;
+            return Some(0);
+        }
+
+        // After the choice and not before it. The count is a walk over the
+        // segment headers, and a store with nothing to collect should not pay
+        // for one on every batch to be told there is nothing to collect.
+        let budget = self.budget();
+        let (moved, off) = self.evacuate(seg, from, budget);
+        if off >= self.arena.recorded_bump(seg) as usize {
+            self.arena.reclaim(seg);
+            self.evac = None;
+        } else {
+            self.evac = Some(Evac { seg, off });
+        }
+        Some(moved)
     }
 }
 
@@ -701,6 +818,145 @@ mod tests {
                 "key {i}"
             );
         }
+    }
+
+    /// A segment is evacuated over several calls, and it comes back only on the
+    /// call whose walk reaches the end of it.
+    ///
+    /// This is what the budget is for. One call used to copy every live record
+    /// in two megabytes, around twenty six thousand of them at 64 byte values,
+    /// and the whole batch of replies queued behind it waited for all of them.
+    /// That is where a p99 of 3.9 milliseconds on the write rows came from
+    /// while the p50 was in line with Redis: the median command paid nothing
+    /// and one command in a few thousand paid for a segment.
+    ///
+    /// The loop is also what catches a walk that restarts instead of resuming.
+    /// A restart would move records and look like progress, and it would spend
+    /// every call re-walking the dead space it made on the last one, so the
+    /// cursor would never reach the bump and the segment would never come back.
+    #[test]
+    fn a_segment_comes_back_over_several_calls() {
+        let mut m = RawMap::new();
+        let val = vec![b'z'; COMPACT_VAL];
+        const N: usize = COMPACT_N;
+        for i in 0..N {
+            m.set(&key(i), &val);
+        }
+        // Every other key, so the early segments are well past the dead ratio
+        // and there is still a live half to copy out.
+        for i in (0..N).step_by(2) {
+            m.del(&key(i));
+        }
+
+        let rec = (HDR + key(0).len() + COMPACT_VAL).next_multiple_of(yo_arena::ALIGN);
+        let per_call = m.budget() / rec + 1;
+        let free = m.arena().free_segments();
+
+        let moved = m.compact_step().expect("half of it is dead");
+        assert!(
+            moved <= per_call,
+            "one call moved {moved} records and the budget is {per_call}"
+        );
+        assert_eq!(
+            m.arena().free_segments(),
+            free,
+            "a segment came back before the walk reached the end of it"
+        );
+
+        let mut calls = 1;
+        while m.arena().free_segments() == free {
+            m.compact_step()
+                .expect("the segment in flight is not finished");
+            calls += 1;
+            assert!(calls < 1000, "the walk is not getting any further along");
+        }
+        assert!(calls > 2, "the whole segment came back in {calls} calls");
+
+        for i in 0..N {
+            let want = if i % 2 == 0 { None } else { Some(val.clone()) };
+            assert_eq!(m.get(&key(i)).map(<[u8]>::to_vec), want, "key {i}");
+        }
+    }
+
+    /// The budget grows with how far behind the collector is.
+    ///
+    /// A store with one segment waiting pays the floor, which is the pause a
+    /// command can be asked to wait for. One with a queue of them walks a slice
+    /// per segment in the queue, which is what keeps a pipelined write flood
+    /// from outrunning one call per batch and leaving the process holding the
+    /// segments that never got their turn.
+    #[test]
+    fn the_budget_scales_with_the_backlog() {
+        let mut m = RawMap::new();
+        let val = vec![b'z'; COMPACT_VAL];
+        const N: usize = COMPACT_N;
+        for i in 0..N {
+            m.set(&key(i), &val);
+        }
+        assert_eq!(m.budget(), EVAC_FLOOR, "nothing is waiting yet");
+
+        for i in 0..N {
+            m.del(&key(i));
+        }
+        let flooded = m.budget();
+        assert!(
+            flooded >= EVAC_FLOOR * m.arena().candidate_count(),
+            "{} segments are waiting and the budget is {flooded}",
+            m.arena().candidate_count()
+        );
+        assert!(
+            flooded > EVAC_FLOOR,
+            "every segment is dead and the budget is still the floor"
+        );
+        assert!(flooded <= EVAC_CEILING, "walked past a whole segment");
+    }
+
+    /// A segment that is partway through being evacuated is finished before a
+    /// worse one is started.
+    ///
+    /// Writes keep coming while a segment is being walked and they make dead
+    /// space elsewhere, so the answer to "which segment is worst" moves around
+    /// underneath a walk that takes thirty calls. Asking it again on every call
+    /// would let a segment be put down at nine tenths done in favour of one
+    /// that is slightly worse, and the arena would fill up with segments that
+    /// are nearly empty and never reclaimed.
+    ///
+    /// Here the first quarter of the keyspace is deleted so that the segment at
+    /// the front is the only candidate, one call starts on it, and then the
+    /// back half goes too so that another segment ties with it mid walk. The
+    /// tie goes to the later segment, so a walk that asked again would move to
+    /// it and leave the first one part done.
+    #[test]
+    fn the_segment_in_flight_is_finished_first() {
+        let mut m = RawMap::new();
+        let val = vec![b'z'; COMPACT_VAL];
+        const N: usize = COMPACT_N;
+        for i in 0..N {
+            m.set(&key(i), &val);
+        }
+        for i in 0..N / 4 {
+            m.del(&key(i));
+        }
+
+        let free = m.arena().free_segments();
+        let first = m.arena().worst_candidate().expect("the front is all dead");
+        m.compact_step().expect("there is a candidate");
+
+        for i in N / 2..N {
+            m.del(&key(i));
+        }
+        let worse = m.arena().worst_candidate().expect("the back is all dead");
+        assert_ne!(worse, first, "the test needs the answer to have moved");
+
+        while m.arena().free_segments() == free {
+            m.compact_step()
+                .expect("the segment in flight is not finished");
+        }
+        assert_eq!(
+            m.arena().recorded_bump(first),
+            yo_arena::HEADER_SIZE as u64,
+            "the segment that was in flight is not the one that came back"
+        );
     }
 
     /// A segment that compaction emptied is bumped through again rather than
