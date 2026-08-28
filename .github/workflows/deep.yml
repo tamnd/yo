@@ -204,9 +204,9 @@ jobs:
         run: |
           echo "triple=$(rustc -vV | sed -n 's/^host: //p')" >> "$GITHUB_OUTPUT"
       - run: cargo fuzz build --target ${{ steps.host.outputs.triple }}
-      # All five at once rather than one after another. Each is a minute and
-      # they used to be five minutes in a row for no reason: they share nothing
-      # and a runner has four cores sitting idle through four of those minutes.
+      # All of them at once rather than one after another. Each is a minute and
+      # they used to be a minute each in a row for no reason: they share nothing
+      # and a runner has cores sitting idle through all but one of them.
       - name: sixty seconds per target, all of them at once
         run: |
           pids=""
@@ -257,6 +257,37 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2.9.2
       - run: cargo bench --workspace --locked -- --test
+
+  # The M1 exit gate, which is a hundred thousand injected faults with zero
+  # silent corruptions. Every push runs twenty thousand in `ci.yml`, because
+  # twenty thousand catches a regression and fits in the budget. The gate number
+  # lives here instead, where the shapes can also be varied: page sizes on both
+  # sides of the default, a record count small enough that most trials land in
+  # the first page, and a run in sync mode where every append is its own
+  # durability boundary.
+  crash-gate:
+    needs: wanted
+    if: needs.wanted.outputs.run == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          ref: ${{ needs.wanted.outputs.ref }}
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2.9.2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - run: cargo build --release --locked -p yo-crash --bin yo-crash
+      # Seeds do not overlap between shapes, so a failure names one run and one
+      # seed and reproduces from the command line with no other setup.
+      - name: a hundred thousand faults, five shapes
+        run: |
+          ./target/release/yo-crash --trials 40000
+          ./target/release/yo-crash --trials 20000 --page-len 8192 --records 400 --seed 2000000
+          ./target/release/yo-crash --trials 20000 --page-len 65536 --records 800 --seed 3000000
+          ./target/release/yo-crash --trials 10000 --records 40 --seed 4000000
+          ./target/release/yo-crash --trials 10000 --sync --seed 5000000
 
   # Somebody with nothing but rustup should be able to clone and build. No
   # cache, no toolchain file, no repository specific setup. This is the one job

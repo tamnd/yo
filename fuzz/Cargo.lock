@@ -132,11 +132,11 @@ checksum = "e6e4313cd5fcd3dad5cafa179702e2b244f760991f45397d14d4ebf38247da75"
 
 [[package]]
 name = "yo-alloc"
-version = "0.2.0"
+version = "0.3.0"
 
 [[package]]
 name = "yo-arena"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "libc",
  "yo-alloc",
@@ -145,7 +145,24 @@ dependencies = [
 
 [[package]]
 name = "yo-common"
-version = "0.2.0"
+version = "0.3.0"
+
+[[package]]
+name = "yo-file"
+version = "0.3.0"
+dependencies = [
+ "libc",
+ "yo-common",
+ "yo-format",
+ "yo-record",
+]
+
+[[package]]
+name = "yo-format"
+version = "0.3.0"
+dependencies = [
+ "yo-common",
+]
 
 [[package]]
 name = "yo-fuzz"
@@ -155,13 +172,18 @@ dependencies = [
  "libfuzzer-sys",
  "yo-arena",
  "yo-common",
+ "yo-file",
+ "yo-format",
  "yo-index",
+ "yo-reader",
+ "yo-record",
+ "yo-resp",
  "yo-shard",
 ]
 
 [[package]]
 name = "yo-index"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "yo-alloc",
  "yo-arena",
@@ -169,8 +191,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "yo-reader"
+version = "0.3.0"
+
+[[package]]
+name = "yo-record"
+version = "0.3.0"
+dependencies = [
+ "yo-common",
+ "yo-format",
+]
+
+[[package]]
+name = "yo-resp"
+version = "0.3.0"
+dependencies = [
+ "yo-common",
+]
+
+[[package]]
 name = "yo-shard"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "libc",
  "yo-alloc",
