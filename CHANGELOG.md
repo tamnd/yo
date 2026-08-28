@@ -13,7 +13,10 @@ While the major is 0, a minor release may break anything, including the on-disk 
 ### Added
 
 - **`yo-kv`, where the data structures actually live.** One method per Redis command, taking and returning ordinary Rust values, with no protocol anywhere near it. The wire calls into this and the embedded API calls into this, so there is one `INCR` rather than two that drift apart (Y23). An embedded program calls `Strings::incr` and gets back an `i64` or a `yo_common::Error`, without serialising a command, crossing a socket or parsing a reply.
-- **The string type, which is the first row of M2.** Twenty one commands: `SET` with `NX`, `XX`, `GET`, `KEEPTTL`, `EX`, `PX`, `EXAT`, `PXAT` and Redis 8.4's `IFEQ`, then `GET`, `GETSET`, `GETDEL`, `GETEX`, `SETNX`, `SETEX`, `PSETEX`, `MSET`, `MSETNX`, `MGET`, `APPEND`, `STRLEN`, `SETRANGE`, `GETRANGE`, `SUBSTR`, `INCR`, `DECR`, `INCRBY`, `DECRBY` and `INCRBYFLOAT`.
+- **The string type, which is the first row of M2.** All 25 commands: `SET` with `NX`, `XX`, `GET`, `KEEPTTL`, `EX`, `PX`, `EXAT`, `PXAT` and Redis 8.4's `IFEQ`, then `GET`, `GETSET`, `GETDEL`, `GETEX`, `SETNX`, `SETEX`, `PSETEX`, `MSET`, `MSETNX`, `MGET`, `APPEND`, `STRLEN`, `SETRANGE`, `GETRANGE`, `SUBSTR`, `INCR`, `DECR`, `INCRBY`, `DECRBY`, `INCRBYFLOAT`, `LCS`, and Redis 8.4's `MSETEX` and `DELEX` and 8.8's `INCREX`.
+- **`LCS`, ported rather than reimplemented.** The backtrack is Redis's, quirks included, so the ranges `LCS IDX` reports land on the same bytes in the same order, `MINMATCHLEN` filters the same runs, and `len` is still the length of the whole subsequence and not the sum of what survived the filter. The documented `ohmytext` and `mynewtext` example comes out byte for byte.
+- **`INCREX`, a windowed rate limiter in one command.** The counter goes up and the window is started only when the key was not there, so a hundred calls inside one window all expire together at the deadline the first one set rather than each one pushing it out. What it replaces is `INCR` followed by `EXPIRE ... NX`, which is two round trips, or a Lua script, which is one round trip and a script cache.
+- **`DELEX`, compare and delete.** The other half of `SET ... IFEQ`, and the read modify write nobody was doing correctly: a client that reads a value, decides it is stale and deletes it can be beaten to the key in between, and `WATCH` plus `MULTI` costs a round trip to avoid that.
 - **A one byte header in front of every string.** Encoding in two bits, a deadline flag in a third, and eight bytes of deadline only for the keys that have one, which most do not. The alternative is a side table for the TTL, and a side table is a second cache miss on a path whose whole budget is one miss.
 - **`INCR` that does not touch the arena.** An int encoded value stores the eight bytes of the integer rather than its digits, so incrementing it is a probe, an add and an eight byte store back into the record the probe landed on. No allocation, no free, no second record and no rehash. There is a test that increments a key a thousand times and asserts the arena's live byte count did not move.
 - **`RawMap::set_with` and `RawMap::value_mut`.** The first lets a caller write straight into the record instead of building the value in a scratch buffer and having it copied in again, which is one memcpy per `SET` rather than two. The second is what makes the `INCR` path above possible.
@@ -33,10 +36,11 @@ While the major is 0, a minor release may break anything, including the on-disk 
 
 ### Known divergences
 
-Two, both in the string type, both listed here rather than left to be discovered.
+Three, all in the string type, all listed here rather than left to be discovered.
 
 - A string is capped just under 2 MiB rather than at Redis's 512 MiB, because a value lives in one arena segment. The band above that is the log region in `06` section 2 and lands with tiering in M5, at which point the cap goes up to Redis's. A value past the cap is a `YO_ERR_FULL` carrying Redis's own message and not a panic.
 - Expiry is lazy only. A key past its deadline is dropped when something touches it, and it is dropped at the exact millisecond, since a deadline equal to now has passed. The active cycle that would reclaim a key nobody ever touches again is maintenance slice work and lands in M5.
+- `LCS` refuses a table over 64 million cells, which is 256 MiB of counters and two strings of about eight thousand bytes each. Redis has no explicit limit and fails on the allocation instead, which on a server that has overcommitted is a kill rather than an error, and `LCS` on two large strings is the easiest accidental denial of service in the string group.
 
 ### Internal
 
