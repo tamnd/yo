@@ -9,7 +9,7 @@ While the major is 0, a minor release may break anything, including the on-disk 
 ### Added
 
 - **`yo-reactor`, the shard loop.** `04` section 2 is nine lines of pseudocode and this is those nine lines with the bookkeeping filled in. Six stages in one order forever: submit, drain a batch, enter the epoch, walk the batch twice, leave and flush, then completions and a bounded maintenance slice. There is no executor under it, no future, no waker and no work stealing. The loop is the scheduler.
-- **The two walk batch.** A batch is 64 commands, and it is walked once to hash every key and ask the cache for the bucket that hash selects, then once to run them. Valkey and Redis 8.4 both use a window of 16 because they hold a lock across it and other threads can invalidate a line inside it, and Y1 removes both of those reasons. On a ten million key map the second walk is worth 13 percent, and on a hundred thousand key map it is worth nothing because there was never a miss to hide.
+- **The two walk batch.** A batch is 64 commands, and it is walked once to hash every key and ask the cache for the bucket that hash selects, then once to run them. Valkey and Redis 8.4 both use a window of 16 because they hold a lock across it and other threads can invalidate a line inside it, and Y1 removes both of those reasons. On a ten million key map the second walk is worth 13 percent on aarch64 and 20 percent on x86-64, and on a hundred thousand key map it is worth nothing on either because there was never a miss to hide.
 - **A break that does not throw work away.** A command whose key set is not known until something earlier in the batch has finished, which is a `MULTI` body, a `WAIT` or a blocking form, ends the batch where it stands. What was already drained behind it waits for the next turn rather than being executed cold or dropped.
 - **Inline execution, which is the embedded path.** A caller who is already on the shard thread calls `execute` or `execute_all` and gets the same prefetch and the same dispatch the server path gets, so a command has one implementation rather than two that drift. Y23 asks for the same code and not the same idea.
 - **A maintenance budget in instructions rather than in wall clock.** Reading a clock is a syscall or at best a serialising instruction, and a wall clock slice does a different amount of work on a busy machine than on an idle one, so the tail it produces cannot be reproduced. A unit budget is a subtraction, and a pass that overshoots does so by one item instead of by however long that item took.
@@ -18,7 +18,9 @@ While the major is 0, a minor release may break anything, including the on-disk 
 
 ### Performance
 
-Numbers from an M4 MacBook Pro, aarch64, release profile with fat LTO, criterion at 20 samples. The map is `RawMap` with 32 byte values and the commands are lookups, so these are loop costs and not command costs.
+Release profile with fat LTO, criterion at 20 samples. The map is `RawMap` with 32 byte values and the commands are lookups, so these are loop costs and not command costs.
+
+M4 MacBook Pro, aarch64:
 
 | what | 100 thousand keys | 10 million keys |
 | --- | --- | --- |
@@ -27,7 +29,16 @@ Numbers from an M4 MacBook Pro, aarch64, release profile with fat LTO, criterion
 | `execute_all`, batch of 64, prefetch off | 11.8 ns per command | 18.1 ns per command |
 | `tick`, the same batch through the lane and the epoch | 17.8 ns per command | 21.7 ns per command |
 
-The gap between the last two rows is what the server path pays over the embedded one, and it includes the 64 pushes into the intake lane, which on a real server somebody else does on another thread.
+gamingpc, x86-64 on Windows with the gnu toolchain:
+
+| what | 100 thousand keys | 10 million keys |
+| --- | --- | --- |
+| `execute`, one command inline | 31.1 ns | 53.6 ns |
+| `execute_all`, batch of 64, prefetch on | 28.4 ns per command | 38.9 ns per command |
+| `execute_all`, batch of 64, prefetch off | 23.5 ns per command | 48.5 ns per command |
+| `tick`, the same batch through the lane and the epoch | 35.3 ns per command | 51.8 ns per command |
+
+The gap between the last two rows is what the server path pays over the embedded one, and it includes the 64 pushes into the intake lane, which on a real server somebody else does on another thread. The hundred thousand key row on Windows has the cold arm apparently ahead of the warm one, and that is noise rather than a finding, since the two intervals overlap across most of their range.
 
 ## 0.3.1 — 2026-08-28
 
