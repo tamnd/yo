@@ -16,6 +16,7 @@ use crate::counter::{self, Counted, IncrEx, IncrExpire, Num};
 use crate::lcs;
 use crate::value::{self, Encoding, Str};
 use std::borrow::Cow;
+use yo_common::num::parse_f64;
 use yo_common::{Code, Error, Result};
 use yo_index::RawMap;
 
@@ -460,11 +461,22 @@ impl Strings {
     ///
     /// Always succeeds, always overwrites, and always clears any deadline the
     /// keys had, which is `SET` without options applied to each pair in turn.
-    pub fn mset(&mut self, pairs: &[(&[u8], &[u8])]) -> Result<()> {
-        for &(k, v) in pairs {
+    ///
+    /// The pairs arrive as an iterator rather than a slice because the wire
+    /// layer has them as positions in the connection's read buffer, and a
+    /// slice would mean collecting them into a `Vec` first. `MSET` is on the
+    /// list of four commands M2 is measured on, and a shard thread that
+    /// allocates aborts, so an API that forces an allocation to call it is the
+    /// wrong API. The iterator is walked twice, which is why it has to be
+    /// `Clone`, and an iterator over borrowed slices is two words to copy.
+    pub fn mset<'k>(
+        &mut self,
+        pairs: impl Iterator<Item = (&'k [u8], &'k [u8])> + Clone,
+    ) -> Result<()> {
+        for (k, v) in pairs.clone() {
             check_len(k, v.len())?;
         }
-        for &(k, v) in pairs {
+        for (k, v) in pairs {
             self.store(k, v, None);
         }
         Ok(())
@@ -474,17 +486,20 @@ impl Strings {
     ///
     /// The whole set of keys is checked before anything is written, so a
     /// duplicate key inside one call does not defeat itself.
-    pub fn msetnx(&mut self, pairs: &[(&[u8], &[u8])]) -> Result<bool> {
-        for &(k, v) in pairs {
+    pub fn msetnx<'k>(
+        &mut self,
+        pairs: impl Iterator<Item = (&'k [u8], &'k [u8])> + Clone,
+    ) -> Result<bool> {
+        for (k, v) in pairs.clone() {
             check_len(k, v.len())?;
         }
-        for &(k, _) in pairs {
+        for (k, _) in pairs.clone() {
             self.reap(k);
             if self.map.contains(k) {
                 return Ok(false);
             }
         }
-        for &(k, v) in pairs {
+        for (k, v) in pairs {
             self.store(k, v, None);
         }
         Ok(true)
@@ -662,27 +677,27 @@ impl Strings {
     /// [`Expire::Keep`] is `KEEPTTL`, which leaves each key its own.
     ///
     /// A duplicate key inside one call is not an error and the last value wins.
-    pub fn msetex(
+    pub fn msetex<'k>(
         &mut self,
-        pairs: &[(&[u8], &[u8])],
+        pairs: impl Iterator<Item = (&'k [u8], &'k [u8])> + Clone,
         exists: Exists,
         expire: Expire,
     ) -> Result<bool> {
-        for &(k, v) in pairs {
+        for (k, v) in pairs.clone() {
             check_len(k, v.len())?;
         }
-        for &(k, _) in pairs {
+        for (k, _) in pairs.clone() {
             self.reap(k);
         }
         let allowed = match exists {
             Exists::Always => true,
-            Exists::IfMissing => pairs.iter().all(|&(k, _)| !self.map.contains(k)),
-            Exists::IfPresent => pairs.iter().all(|&(k, _)| self.map.contains(k)),
+            Exists::IfMissing => pairs.clone().all(|(k, _)| !self.map.contains(k)),
+            Exists::IfPresent => pairs.clone().all(|(k, _)| self.map.contains(k)),
         };
         if !allowed {
             return Ok(false);
         }
-        for &(k, v) in pairs {
+        for (k, v) in pairs {
             let deadline = match expire {
                 Expire::Clear => None,
                 Expire::At(ms) => Some(ms),
@@ -950,9 +965,9 @@ fn check_len(key: &[u8], len: usize) -> Result<()> {
 }
 
 fn invalid_expire(what: &str) -> Error {
-    Error::new(
+    Error::fmt(
         Code::Invalid,
-        format!("invalid expire time in '{what}' command"),
+        format_args!("invalid expire time in '{what}' command"),
     )
 }
 
@@ -978,23 +993,6 @@ fn range_of(len: usize, start: i64, end: i64) -> Option<(usize, usize)> {
     } else {
         Some((s as usize, e as usize))
     }
-}
-
-/// Parse a float the way Redis's `getLongDoubleFromObject` does.
-///
-/// Whitespace, an empty string, `nan` and anything with trailing rubbish are all
-/// refused. The infinities are accepted, because `INCRBYFLOAT k inf` is a thing
-/// Redis accepts on the way in and refuses on the way out.
-fn parse_f64(bytes: &[u8]) -> Option<f64> {
-    if bytes.is_empty() || bytes[0].is_ascii_whitespace() {
-        return None;
-    }
-    let text = core::str::from_utf8(bytes).ok()?;
-    if text.trim() != text {
-        return None;
-    }
-    let v: f64 = text.parse().ok()?;
-    if v.is_nan() { None } else { Some(v) }
 }
 
 #[cfg(test)]
@@ -1207,7 +1205,7 @@ mod tests {
     #[test]
     fn mset_writes_every_pair_and_msetnx_writes_none_of_them() {
         let mut s = store();
-        s.mset(&[(&b"a"[..], &b"1"[..]), (&b"b"[..], &b"2"[..])])
+        s.mset([(&b"a"[..], &b"1"[..]), (&b"b"[..], &b"2"[..])].into_iter())
             .unwrap();
         let vals = s.mget(&[&b"a"[..], &b"b"[..], &b"missing"[..]]);
         let vals: Vec<_> = vals.iter().map(|v| v.map(|v| v.to_vec())).collect();
@@ -1216,13 +1214,13 @@ mod tests {
         assert_eq!(vals[2], None);
 
         assert!(
-            !s.msetnx(&[(&b"b"[..], &b"9"[..]), (&b"c"[..], &b"3"[..])])
+            !s.msetnx([(&b"b"[..], &b"9"[..]), (&b"c"[..], &b"3"[..])].into_iter())
                 .unwrap()
         );
         assert_eq!(got(&mut s, b"c"), None, "msetnx wrote part of the set");
         assert_eq!(got(&mut s, b"b").as_deref(), Some(&b"2"[..]));
         assert!(
-            s.msetnx(&[(&b"c"[..], &b"3"[..]), (&b"d"[..], &b"4"[..])])
+            s.msetnx([(&b"c"[..], &b"3"[..]), (&b"d"[..], &b"4"[..])].into_iter())
                 .unwrap()
         );
         assert_eq!(got(&mut s, b"d").as_deref(), Some(&b"4"[..]));
@@ -1430,29 +1428,47 @@ mod tests {
     fn msetex_writes_all_of_them_or_none() {
         let mut s = store();
         let pairs = [(&b"a"[..], &b"1"[..]), (&b"b"[..], &b"2"[..])];
-        assert!(s.msetex(&pairs, Exists::Always, Expire::At(3_000)).unwrap());
+        assert!(
+            s.msetex(pairs.iter().copied(), Exists::Always, Expire::At(3_000))
+                .unwrap()
+        );
         assert_eq!(s.expire_at(b"a"), Some(3_000));
         assert_eq!(s.expire_at(b"b"), Some(3_000));
 
         // The condition is over the whole set. One key present is enough to
         // stop NX, and one key missing is enough to stop XX, and neither
         // writes anything on the way to finding out.
-        assert!(!s.msetex(&pairs, Exists::IfMissing, Expire::Clear).unwrap());
+        assert!(
+            !s.msetex(pairs.iter().copied(), Exists::IfMissing, Expire::Clear)
+                .unwrap()
+        );
         assert_eq!(s.expire_at(b"a"), Some(3_000), "a failed NX still wrote");
         s.del(b"b");
-        assert!(!s.msetex(&pairs, Exists::IfPresent, Expire::Clear).unwrap());
+        assert!(
+            !s.msetex(pairs.iter().copied(), Exists::IfPresent, Expire::Clear)
+                .unwrap()
+        );
         assert!(!s.exists(b"b"), "a failed XX still wrote");
-        assert!(s.msetex(&pairs, Exists::IfMissing, Expire::Clear).is_ok());
+        assert!(
+            s.msetex(pairs.iter().copied(), Exists::IfMissing, Expire::Clear)
+                .is_ok()
+        );
 
         // KEEPTTL leaves each key whatever it had, which here is one with a
         // deadline and one without.
         s.set(b"a", b"1", SetOptions::PLAIN.expiring(Expire::At(9_000)))
             .unwrap();
-        assert!(s.msetex(&pairs, Exists::Always, Expire::Keep).unwrap());
+        assert!(
+            s.msetex(pairs.iter().copied(), Exists::Always, Expire::Keep)
+                .unwrap()
+        );
         assert_eq!(s.expire_at(b"a"), Some(9_000));
         assert_eq!(s.expire_at(b"b"), None);
         // With no expiration option at all it clears, the way plain SET does.
-        assert!(s.msetex(&pairs, Exists::Always, Expire::Clear).unwrap());
+        assert!(
+            s.msetex(pairs.iter().copied(), Exists::Always, Expire::Clear)
+                .unwrap()
+        );
         assert_eq!(s.expire_at(b"a"), None);
     }
 
@@ -1460,7 +1476,10 @@ mod tests {
     fn msetex_lets_the_last_of_a_duplicated_key_win() {
         let mut s = store();
         let pairs = [(&b"k"[..], &b"1"[..]), (&b"k"[..], &b"2"[..])];
-        assert!(s.msetex(&pairs, Exists::Always, Expire::Clear).unwrap());
+        assert!(
+            s.msetex(pairs.iter().copied(), Exists::Always, Expire::Clear)
+                .unwrap()
+        );
         assert_eq!(got(&mut s, b"k").as_deref(), Some(&b"2"[..]));
     }
 

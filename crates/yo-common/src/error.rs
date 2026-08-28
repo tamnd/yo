@@ -6,7 +6,7 @@
 //! also carries so that nothing is lost crossing the boundary: a message, a
 //! position, a documentation URL, and a free form detail.
 
-use core::fmt;
+use std::fmt;
 
 include!(concat!(env!("OUT_DIR"), "/code.rs"));
 
@@ -26,10 +26,35 @@ pub struct Error {
 
 impl Error {
     /// A new error with just a message.
+    ///
+    /// The message is copied into a `String` here, and that allocation is
+    /// wrapped in [`yo_alloc::allow`] because a shard thread that allocates
+    /// aborts and an error is by definition off the path the budget is for. A
+    /// client that sends `INCR` at a key holding a word should get an error
+    /// back, not a server that stops answering everybody else.
+    ///
+    /// The wrap only covers what happens inside this call, so a caller that
+    /// builds its message with `format!` first has already allocated by the
+    /// time it gets here. Use [`Error::fmt`] for those.
     pub fn new(code: Code, message: impl Into<String>) -> Error {
         Error {
             code,
-            message: message.into(),
+            message: yo_alloc::allow(|| message.into()),
+            position: None,
+            detail: None,
+        }
+    }
+
+    /// A new error whose message needs formatting, built without allocating
+    /// outside the wrap.
+    ///
+    /// `Error::fmt(code, format_args!("no such thing: {name}"))` is the shape.
+    /// `format_args!` builds nothing, so the only allocation is the one this
+    /// does, and it happens where it is allowed to.
+    pub fn fmt(code: Code, args: fmt::Arguments<'_>) -> Error {
+        Error {
+            code,
+            message: yo_alloc::allow(|| fmt::format(args)),
             position: None,
             detail: None,
         }
@@ -49,7 +74,7 @@ impl Error {
     /// Attach machine readable detail, such as `errno=13 path=/var/lib/app.yo`.
     #[must_use]
     pub fn with_detail(mut self, detail: impl Into<String>) -> Error {
-        self.detail = Some(detail.into());
+        self.detail = Some(yo_alloc::allow(|| detail.into()));
         self
     }
 
@@ -169,6 +194,24 @@ mod tests {
         assert!(s.contains("expected an integer"), "{s}");
         assert!(s.contains("at 3"), "{s}");
         assert!(s.contains("got=abc"), "{s}");
+    }
+
+    /// The rule this is protecting is that a shard thread aborts when it
+    /// allocates, and an error message is a `String`. If building one were not
+    /// allowed, the first client to send `INCR` at a key holding a word would
+    /// take the server down with it, which is a worse failure than the one the
+    /// rule exists to prevent.
+    #[test]
+    fn building_an_error_is_allowed_where_allocating_is_not() {
+        yo_alloc::enter_no_alloc();
+        let e = Error::fmt(Code::Invalid, format_args!("no such thing: {}", "x"))
+            .with_detail("got=abc");
+        assert_eq!(e.message(), "no such thing: x");
+        // And the thread is still forbidden afterwards, because the wrap is
+        // around the allocation and not around the caller.
+        assert!(yo_alloc::is_forbidden());
+        yo_alloc::exit_no_alloc();
+        assert!(!yo_alloc::is_forbidden());
     }
 
     #[test]
