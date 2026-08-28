@@ -17,16 +17,25 @@
 //! and nothing above this file changes, because the engine already talks to a
 //! [`Sink`] rather than to a socket.
 //!
-//! # The scan
+//! # Asking instead of guessing
 //!
-//! One turn walks every open connection and tries to read. That is a syscall
-//! per idle connection per turn, which is the cost the ring exists to remove
-//! and which does not matter yet: the gate runs 50 connections, all of them
-//! busy. A thousand idle connections would make this loop the bottleneck, and
-//! the fix for that is the ring rather than a bigger buffer here.
+//! One turn used to walk every open connection and try to read from each one,
+//! which is a syscall per idle connection per turn. A profile of the gate run
+//! said what that costs: 2.26 `recvfrom` per command, most of them returning
+//! `EWOULDBLOCK`, and no waiting call anywhere in the trace. With 50 busy
+//! connections and one request in flight on each, about half the reads were the
+//! kernel being asked a question it had already answered.
 //!
-//! An idle turn backs off to a short sleep rather than spinning a core flat.
-//! A shard that owns a core busy polls, and this is not that shard yet.
+//! So the loop asks once per turn instead, through [`Poller`]: `epoll` on
+//! Linux, `kqueue` on macOS, and the old scan everywhere else. The listener is
+//! registered like any other source, which also takes the wasted `accept` off
+//! every turn.
+//!
+//! An idle turn waits in the kernel rather than sleeping on a timer, so a quiet
+//! server costs nothing and the first command after a quiet period is not
+//! waiting on a sleep to finish. The wait is kept short while any reply is
+//! still owed, because a socket that was full is retried on a timer and not on
+//! an event.
 
 use std::io::{self, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
@@ -36,6 +45,8 @@ use std::time::Duration;
 use yo_reactor::Reactor;
 use yo_resp::engine::{Cmd, ConnId, Sink, Wire, pump};
 
+use crate::poll::Poller;
+
 /// How much is read off one connection at a time.
 ///
 /// A pipeline of 64 `SET`s with sixteen byte keys and values is about four
@@ -43,14 +54,31 @@ use yo_resp::engine::{Cmd, ConnId, Sink, Wire, pump};
 /// does not go round again for the tail of one.
 const READ_CHUNK: usize = 16 * 1024;
 
-/// Turns with nothing to do before the loop starts sleeping between them.
+/// Turns with nothing to do before the loop starts waiting in the kernel.
+///
+/// A short spin first, because a request response client sends the next command
+/// as soon as it has the answer to the last one, and the answer left this
+/// process microseconds ago.
 const SPIN_TURNS: u32 = 256;
 
-/// How long an idle loop sleeps.
+/// How long an idle loop waits for something to arrive.
 ///
-/// Long enough that an idle server does not sit on a core, short enough that
-/// the first command after a quiet period is not waiting on it.
-const IDLE_SLEEP: Duration = Duration::from_micros(200);
+/// It comes back the moment anything does, so this is only how often a server
+/// with nothing to do wakes up to check the stop flag.
+const IDLE_WAIT: Duration = Duration::from_millis(20);
+
+/// The longest wait while a reply is still owed to a full socket.
+///
+/// Writability is not registered, so nothing arriving will wake the loop up to
+/// retry that write, and this is the timer it is retried on instead.
+const OWED_WAIT: Duration = Duration::from_millis(1);
+
+/// The token the listener is registered under.
+///
+/// Connections are registered under their own id, and ids come from a free list
+/// that starts at zero, so the top of the range is the one value that is never
+/// a connection.
+const LISTENER: u64 = u64::MAX;
 
 /// The sockets, indexed by the connection id the engine handed out.
 #[derive(Default)]
@@ -59,6 +87,9 @@ struct Net {
     /// Connections whose socket failed, to be told to the engine after the
     /// batch rather than in the middle of it.
     dead: Vec<ConnId>,
+    /// Connections whose socket has just been dropped, to be taken out of the
+    /// poller after the batch for the same reason.
+    gone: Vec<ConnId>,
 }
 
 impl Net {
@@ -119,6 +150,7 @@ impl Sink for Net {
         if let Some(slot) = self.streams.get_mut(conn as usize) {
             *slot = None;
         }
+        self.gone.push(conn);
     }
 }
 
@@ -126,10 +158,11 @@ impl Sink for Net {
 pub struct Server {
     listener: TcpListener,
     reactor: Reactor<Wire<Net>>,
+    poller: Poller,
     /// The batch the reactor runs, kept across turns so no turn allocates.
     batch: Vec<Cmd>,
-    /// The connections to scan this turn, kept for the same reason.
-    live: Vec<ConnId>,
+    /// The tokens the poller said were ready, kept for the same reason.
+    ready: Vec<u64>,
     buf: Vec<u8>,
 }
 
@@ -142,11 +175,14 @@ impl Server {
     pub fn bind(addr: SocketAddr) -> io::Result<Server> {
         let listener = TcpListener::bind(addr)?;
         listener.set_nonblocking(true)?;
+        let mut poller = Poller::new()?;
+        poller.add(&listener, LISTENER)?;
         Ok(Server {
             listener,
             reactor: Reactor::inline(Wire::new(Net::default())),
+            poller,
             batch: Vec::with_capacity(64),
-            live: Vec::with_capacity(64),
+            ready: Vec::with_capacity(64),
             buf: vec![0; READ_CHUNK],
         })
     }
@@ -170,29 +206,42 @@ impl Server {
     pub fn run(&mut self, stop: &AtomicBool) -> io::Result<()> {
         let mut idle = 0u32;
         while !stop.load(Ordering::Relaxed) {
-            let mut worked = self.accept_ready()?;
-            worked |= self.read_ready();
+            let wait = if idle <= SPIN_TURNS {
+                Duration::ZERO
+            } else if self.reactor.engine().owed() > 0 {
+                OWED_WAIT
+            } else {
+                IDLE_WAIT
+            };
+            self.poller.wait(&mut self.ready, wait)?;
+
+            let mut worked = false;
+            for at in 0..self.ready.len() {
+                if self.ready[at] == LISTENER {
+                    self.accept_ready()?;
+                } else {
+                    self.read_conn(self.ready[at] as ConnId);
+                }
+                worked = true;
+            }
 
             if pump(&mut self.reactor, &mut self.batch) > 0 {
                 worked = true;
             }
             self.bury_dead();
+            self.forget_closed();
 
             if worked {
                 idle = 0;
             } else {
                 idle = idle.saturating_add(1);
-                if idle > SPIN_TURNS {
-                    std::thread::sleep(IDLE_SLEEP);
-                }
             }
         }
         Ok(())
     }
 
-    /// Take every connection that is waiting, and say whether there was one.
-    fn accept_ready(&mut self) -> io::Result<bool> {
-        let mut any = false;
+    /// Take every connection that is waiting.
+    fn accept_ready(&mut self) -> io::Result<()> {
         loop {
             match self.listener.accept() {
                 Ok((stream, _)) => {
@@ -204,61 +253,68 @@ impl Server {
                     // millisecond one.
                     let _ = stream.set_nodelay(true);
                     let conn = self.reactor.engine_mut().accept();
+                    // Registered before the socket is handed over, because
+                    // after that the sink owns it and this is the last look.
+                    self.poller.add(&stream, u64::from(conn))?;
                     self.reactor.engine_mut().sink_mut().attach(conn, stream);
-                    any = true;
                 }
-                Err(e) if e.kind() == io::ErrorKind::WouldBlock => return Ok(any),
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => return Ok(()),
                 Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
                 Err(e) => return Err(e),
             }
         }
     }
 
-    /// Read from every open connection, and say whether anything arrived.
-    fn read_ready(&mut self) -> bool {
-        self.live.clear();
-        let open = self.reactor.engine().sink().streams.len();
-        for conn in 0..open as ConnId {
-            if self.reactor.engine().sink().is_open(conn) {
-                self.live.push(conn);
-            }
+    /// Read everything waiting on one connection.
+    fn read_conn(&mut self, conn: ConnId) {
+        // A token for a connection that closed earlier in this same turn, which
+        // the poller reported before it knew.
+        if !self.reactor.engine().sink().is_open(conn) {
+            return;
         }
-
-        let mut any = false;
-        for at in 0..self.live.len() {
-            let conn = self.live[at];
-            loop {
-                let read = self
-                    .reactor
-                    .engine_mut()
-                    .sink_mut()
-                    .read(conn, &mut self.buf);
-                match read {
-                    Some(0) => break,
-                    Some(n) => {
-                        self.reactor.engine_mut().feed(conn, &self.buf[..n]);
-                        any = true;
-                        // A short read means the socket is empty, so going
-                        // round again would only buy an extra `EWOULDBLOCK`.
-                        if n < self.buf.len() {
-                            break;
-                        }
-                    }
-                    None => {
-                        self.reactor.engine_mut().hangup(conn);
-                        any = true;
+        loop {
+            let read = self
+                .reactor
+                .engine_mut()
+                .sink_mut()
+                .read(conn, &mut self.buf);
+            match read {
+                Some(0) => break,
+                Some(n) => {
+                    self.reactor.engine_mut().feed(conn, &self.buf[..n]);
+                    // A short read means the socket is empty, so going round
+                    // again would only buy an extra `EWOULDBLOCK`.
+                    if n < self.buf.len() {
                         break;
                     }
                 }
+                None => {
+                    self.reactor.engine_mut().hangup(conn);
+                    break;
+                }
             }
         }
-        any
     }
 
     /// Tell the engine about the sockets that failed under a write.
     fn bury_dead(&mut self) {
         while let Some(conn) = self.reactor.engine_mut().sink_mut().dead.pop() {
             self.reactor.engine_mut().hangup(conn);
+        }
+    }
+
+    /// Take the connections that closed this turn out of the poller.
+    ///
+    /// On Linux and macOS closing the descriptor has already done it and this
+    /// is bookkeeping for the fallback, which has no kernel to keep the list
+    /// for it. An id that closed and was handed straight back out to a new
+    /// socket in the same turn is still open and is left alone, because what is
+    /// registered under it now is the new socket.
+    fn forget_closed(&mut self) {
+        while let Some(conn) = self.reactor.engine_mut().sink_mut().gone.pop() {
+            if !self.reactor.engine().sink().is_open(conn) {
+                self.poller.remove(u64::from(conn));
+            }
         }
     }
 }

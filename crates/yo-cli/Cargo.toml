@@ -23,6 +23,12 @@ yo-reader = { workspace = true }
 yo-reactor = { workspace = true }
 yo-resp = { workspace = true }
 
+# `yodb serve` asks the kernel which connections are ready rather than trying
+# every one of them, which is `epoll` on Linux and `kqueue` on macOS. Windows
+# keeps the scan and does not need this.
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }
+
 # The tests are the one place both sides are allowed in the same binary. They
 # build real files with the engine and then check them with the tool, which is
 # the only way to find out whether the tool would notice anything.
