@@ -542,7 +542,7 @@ mod tests {
     const QUEUED: u32 = 1000;
 
     #[cfg(miri)]
-    const SPREAD: u64 = 20_000;
+    const SPREAD: u64 = 4_000;
     #[cfg(not(miri))]
     const SPREAD: u64 = 100_000;
 

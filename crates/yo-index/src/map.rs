@@ -243,6 +243,10 @@ mod tests {
     // shrink under it. They stay large enough to force directory doublings,
     // segment splits and overflow chains, which is what these tests are for.
     // Only the scale goes away, not the coverage.
+    // Three thousand and not fewer. `splits() > 4` is the assertion and the
+    // splits go 1, 1, 2, 3, 3, 5 at 800, 1200, 1500, 2000, 2500 and 3000 keys,
+    // so this is already the smallest count that grows the directory the number
+    // of times the test asks about.
     #[cfg(miri)]
     const GROW_N: usize = 3_000;
     #[cfg(not(miri))]

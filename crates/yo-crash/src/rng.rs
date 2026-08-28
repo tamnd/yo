@@ -95,12 +95,19 @@ mod tests {
         // A generator with a bad constant can reach a fixed point and sit there,
         // and every trial after that is the same trial. That failure is silent
         // and it makes the whole run worthless, so it is worth one assertion.
+        //
+        // Ten thousand draws is instant natively and about fifty seconds under
+        // Miri, which is the slowest thing in this crate for the least reason:
+        // a generator that has settled repeats on the second draw, not the ten
+        // thousandth. Miri takes five hundred, which is still two orders of
+        // magnitude more than it takes to notice.
+        const N: usize = if cfg!(miri) { 500 } else { 10_000 };
         let mut r = Rng::new(0);
         let mut seen = std::collections::HashSet::new();
-        for _ in 0..10_000 {
+        for _ in 0..N {
             seen.insert(r.next_u64());
         }
-        assert_eq!(seen.len(), 10_000, "the stream repeats itself");
+        assert_eq!(seen.len(), N, "the stream repeats itself");
     }
 
     #[test]

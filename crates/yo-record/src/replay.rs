@@ -350,7 +350,12 @@ mod tests {
         // Every byte, not a sample. A checksum that covers most of a record is
         // not a checksum, and the cost of knowing rather than believing is a
         // few milliseconds.
-        let (log, want) = written(200);
+        //
+        // The flips are the point and there are only forty of them, one per
+        // byte of the record. What costs is the walk after each one, which is
+        // over the whole log, so Miri shortens the log rather than skipping
+        // flips: every byte still gets its turn.
+        let (log, want) = written(if cfg!(miri) { 60 } else { 200 });
         let (addr, _) = want[50];
         let len = 16 + 5 + "value number 50".len() + 4;
 

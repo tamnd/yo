@@ -493,7 +493,7 @@ mod tests {
     // are. A prime, so the stride does not fall into step with the four byte
     // fields and keep landing on the same byte of each.
     #[cfg(miri)]
-    const STEP: usize = 601;
+    const STEP: usize = 2039;
     #[cfg(not(miri))]
     const STEP: usize = 1;
 

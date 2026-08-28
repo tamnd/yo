@@ -44,7 +44,19 @@ jobs:
     outputs:
       run: ${{ github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'deep') }}
       ref: ${{ github.event.inputs.ref || github.ref }}
+      crates: ${{ steps.crates.outputs.list }}
     steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          ref: ${{ github.event.inputs.ref || github.ref }}
+      # The Miri matrix is one job per crate, and the list comes from the
+      # manifest rather than from a copy of it kept in this file. A crate added
+      # next month gets interpreted without anybody remembering to come back
+      # here, which is the only way a list like this stays true.
+      - id: crates
+        run: |
+          rm rust-toolchain.toml
+          echo "list=$(cargo metadata --no-deps --format-version 1 | jq -c '[.packages[].name] | sort')" >> "$GITHUB_OUTPUT"
       - run: echo "deep checks requested for ${{ github.event.inputs.ref || github.ref }}"
 
   # Every unsafe block in the workspace, interpreted. Miri is slow, so the
@@ -52,20 +64,26 @@ jobs:
   # rather than being skipped: the scale goes away, the coverage does not.
   #
   # Tree borrows is stricter about aliasing than stacked borrows and catches a
-  # different class of mistake, so both are worth running. They have nothing to
-  # say to each other, so they are two jobs and the wait is the slower of the
-  # two rather than the sum.
+  # different class of mistake, so both are worth running.
+  #
+  # `cargo miri test --workspace` walks the crates one after another, so the
+  # wait is the sum of all of them and the workspace is only ever as fast as
+  # every crate added together. One job per crate makes the wait the slowest
+  # single crate instead. Interpreting the whole tree costs the same either way,
+  # it just does not all happen on one runner.
   miri:
     needs: wanted
     if: needs.wanted.outputs.run == 'true'
-    name: miri (${{ matrix.borrows }} borrows)
+    name: miri (${{ matrix.borrows }}, ${{ matrix.crate }})
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    timeout-minutes: 45
     strategy:
-      # One model failing is a real finding and the other model's result is
-      # still worth having, so a failure does not cancel its sibling.
+      # One shard failing is a real finding and every other shard's result is
+      # still worth having, so a failure does not cancel its siblings.
       fail-fast: false
       matrix:
+        borrows: [stacked, tree]
+        crate: ${{ fromJSON(needs.wanted.outputs.crates) }}
         include:
           - borrows: stacked
             flags: -Zmiri-strict-provenance -Zmiri-disable-isolation
@@ -80,14 +98,26 @@ jobs:
           components: miri
       - uses: Swatinem/rust-cache@v2.9.2
         with:
-          # Both jobs build the same tree with the same nightly, so without a
-          # key of their own they would race for one cache entry and each keep
-          # evicting the other's.
-          key: ${{ matrix.borrows }}
+          # Every shard builds a different subset of the tree with the same
+          # nightly, so without a key of its own they would race for one cache
+          # entry and each keep evicting the others'.
+          key: ${{ matrix.borrows }}-${{ matrix.crate }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: rm rust-toolchain.toml
-      - run: cargo miri test --workspace --locked
+      - run: cargo miri test -p ${{ matrix.crate }} --locked
         env:
           MIRIFLAGS: ${{ matrix.flags }}
+
+  # Twenty two shards is twenty two check names, which is more than a branch
+  # protection rule wants to know about. This is the one to require.
+  miri-done:
+    needs: [wanted, miri]
+    if: always() && needs.wanted.outputs.run == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - run: |
+          echo "miri: ${{ needs.miri.result }}"
+          test "${{ needs.miri.result }}" = success
 
   # Fuzz targets are built and run briefly, so a target that stops compiling is
   # caught the next morning rather than the next time somebody remembers to run

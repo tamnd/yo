@@ -1448,8 +1448,11 @@ mod tests {
         .unwrap();
 
         // Enough to turn the ring several times, with sizes that vary so the
-        // sentinel lands at a different place in the block each flush.
-        for i in 0..600u32 {
+        // sentinel lands at a different place in the block each flush. Miri
+        // does half, which is still nearly two laps of a three slot ring and so
+        // still puts a live page on top of an older page's records, which is
+        // the only thing this test needs to be true.
+        for i in 0..if cfg!(miri) { 300u32 } else { 600u32 } {
             let value = vec![i as u8; 40 + (i as usize % 173)];
             log.append(&RecordHeader::new(RecordKind::String), b"key", &value)
                 .unwrap();
