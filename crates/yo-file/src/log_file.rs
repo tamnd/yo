@@ -717,6 +717,10 @@ mod tests {
 
     /// Ring mode is a different way to get the bytes there, not a different
     /// result. Same writes, same file, same reads back.
+    #[cfg_attr(
+        miri,
+        ignore = "a real ring and a real file, neither of which Miri has"
+    )]
     #[test]
     fn a_ringed_log_writes_the_same_bytes_as_a_plain_one() {
         let t = Tmp::new("ringsame");
@@ -745,6 +749,10 @@ mod tests {
 
     /// The one that would be a silent corruption if `page_bytes` did not wait.
     /// A read of a page with a write still in the ring has to see the write.
+    #[cfg_attr(
+        miri,
+        ignore = "a real ring and a real file, neither of which Miri has"
+    )]
     #[test]
     fn reading_a_page_waits_for_the_write_still_in_the_ring() {
         let t = Tmp::new("ringread");
@@ -786,6 +794,10 @@ mod tests {
 
     /// A sync in ring mode is a request, not an answer. Nothing is durable
     /// until the poll that picks the fsync up.
+    #[cfg_attr(
+        miri,
+        ignore = "a real ring and a real file, neither of which Miri has"
+    )]
     #[test]
     fn a_ringed_sync_does_not_claim_durability_by_itself() {
         let t = Tmp::new("ringdurable");
@@ -811,6 +823,10 @@ mod tests {
         assert_eq!(sink.syncs(), 1, "ten idle ticks and one real sync");
     }
 
+    #[cfg_attr(
+        miri,
+        ignore = "a real ring and a real file, neither of which Miri has"
+    )]
     #[test]
     fn a_log_switches_to_the_ring_before_its_first_write_and_not_after() {
         let t = Tmp::new("ringlate");
@@ -830,6 +846,10 @@ mod tests {
     /// The whole stack over the ring: records in, checkpoint, reopen, records
     /// out. Group commit still groups, and the parked callers still get their
     /// answer, they just get it from `poll` instead of from `sync`.
+    #[cfg_attr(
+        miri,
+        ignore = "a real ring and a real file, neither of which Miri has"
+    )]
     #[test]
     fn a_ringed_log_survives_being_closed_and_reopened() {
         let t = Tmp::new("ringreopen");
