@@ -68,6 +68,11 @@ pub enum Durability {
     /// Append, and write at page boundaries without asking for a sync. The
     /// operating system decides when it lands, so a process crash is survived
     /// and a machine crash is not.
+    ///
+    /// With an asynchronous sink the page boundary hands the bytes over and
+    /// submits them, and nothing waits for the completion. That is the same
+    /// promise reached the same way: the write is the kernel's problem from
+    /// there, and this mode never claimed to know when the kernel gets to it.
     Os,
     /// Append, and hold the reply until the containing page has been synced.
     /// One sync serves every commit in the page, which is the entire difference
@@ -411,11 +416,39 @@ impl<S: PageSink> Log<S> {
         &self.sink
     }
 
+    /// The sink, for a caller that needs to tell it something.
+    ///
+    /// [`PageSink`] covers what the log itself needs and nothing else, so
+    /// shutdown, checkpointing and anything a particular sink offers on top of
+    /// the trait come through here. The log's own invariants do not depend on
+    /// anything reachable this way, which is why handing it out is safe: what a
+    /// sink does with bytes it has already been given is between it and its
+    /// owner.
+    #[inline]
+    pub const fn sink_mut(&mut self) -> &mut S {
+        &mut self.sink
+    }
+
     /// The log address below which every record is durable.
     #[inline]
     #[must_use]
     pub fn durable_upto(&self) -> u64 {
         self.sink.durable_upto()
+    }
+
+    /// Lets the sink pick up whatever has finished.
+    ///
+    /// Once a turn of the shard loop. With a synchronous sink this does nothing
+    /// and costs a call. With an asynchronous one it is where [`Log::durable_upto`]
+    /// moves, and therefore where a caller parked on
+    /// [`CommitAction::WaitFor`] stops being parked.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the sink found out about since the last call.
+    #[inline]
+    pub fn poll(&mut self) -> Result<()> {
+        self.sink.poll()
     }
 
     /// Moves the shard's epoch on. `04` section 4's reclamation boundary.
@@ -586,7 +619,19 @@ impl<S: PageSink> Log<S> {
             Durability::Group => CommitAction::WaitFor(self.tail),
             Durability::Sync => {
                 self.commit_pending()?;
-                CommitAction::Reply
+                // A synchronous sink is already there, so the caller is
+                // answered now and this mode costs what it has always cost.
+                //
+                // An asynchronous one has only been asked, and answering here
+                // would be the reply before the fsync, which is the whole bug
+                // this mode exists to not have. So the caller parks on the
+                // address, exactly like group mode, and gets its answer from
+                // the same place. Same guarantee, reached later.
+                if self.sink.durable_upto() >= self.tail {
+                    CommitAction::Reply
+                } else {
+                    CommitAction::WaitFor(self.tail)
+                }
             }
         };
         Ok(Append {
@@ -638,7 +683,14 @@ impl<S: PageSink> Log<S> {
     fn close_page(&mut self, slot: usize) -> Result<()> {
         match self.cfg.durability {
             Durability::None => Ok(()),
-            Durability::Os => self.flush_slot(slot),
+            // The `poll` is what hands an asynchronous sink's submissions to
+            // the kernel, and this mode's promise is that the kernel has them.
+            // A page boundary is once per 32 MiB, so the call costs nothing
+            // anybody can measure. On a synchronous sink it does nothing at all.
+            Durability::Os => {
+                self.flush_slot(slot)?;
+                self.sink.poll()
+            }
             // A page that is about to stop being the tail is a page nobody will
             // ever append to again, so this is the last chance for the commits
             // in it to become durable together. That is group commit.

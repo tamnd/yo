@@ -72,6 +72,27 @@ pub trait PageSink {
     /// is as durable as it is ever going to be and parking a caller would be a
     /// wait that never ends.
     fn durable_upto(&self) -> u64;
+
+    /// Picks up whatever has finished since the last call.
+    ///
+    /// The shard loop calls this once a turn (`04` section 2, the completion
+    /// drain). A synchronous sink has nothing to do here and takes the default,
+    /// which is why this is not on the three implementations in this crate.
+    ///
+    /// An asynchronous sink does its whole state machine here: it walks the
+    /// completions, works out which writes landed, and moves
+    /// [`Self::durable_upto`] when the sync that covers them comes back. That is
+    /// the only place that address moves for such a sink, and it is why
+    /// [`Self::sync`] is allowed to return before anything is durable.
+    ///
+    /// # Errors
+    ///
+    /// The first failed operation this call found out about. The bytes are not
+    /// lost: the log still has the page and the caller decides whether to write
+    /// it again or to stop accepting writes.
+    fn poll(&mut self) -> Result<()> {
+        Ok(())
+    }
 }
 
 /// Where a page comes back from, once it has left memory.
