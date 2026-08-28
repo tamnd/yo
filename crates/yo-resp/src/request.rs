@@ -28,8 +28,8 @@
 //! and it is why the resume state exists at all.
 
 use crate::error::ProtocolError;
-use crate::num::parse_i64;
 use crate::proto::Limits;
+use yo_common::num::parse_i64;
 
 /// One argument: where it starts, how long it is, and which buffer it is in.
 #[derive(Debug, Clone, Copy)]

@@ -1,0 +1,17 @@
+[package]
+name = "yo-kv"
+description = "The Redis data structures, as plain Rust types with no protocol attached"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+
+[dependencies]
+yo-common.workspace = true
+yo-index.workspace = true
+
+[lints]
+workspace = true

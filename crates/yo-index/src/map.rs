@@ -141,6 +141,33 @@ impl RawMap {
         &self.arena.get(addr, HDR + klen + vlen)[HDR + klen..]
     }
 
+    /// The value stored under `key`, to be overwritten where it lies.
+    ///
+    /// The length cannot change, which is the whole reason this is safe to
+    /// offer. `INCR` on an integer encoded string is a probe, an add and a
+    /// store, and the store is eight bytes back into the record it came from
+    /// (`08` section 2). Going through [`RawMap::set`] instead would write a
+    /// fresh record and free the old one on every increment, which is an arena
+    /// append and a dead byte per operation for a value whose size never moves.
+    ///
+    /// There is no reader to tear. A map belongs to one shard thread and is not
+    /// `Sync`, so the only code that can observe a half written value is the
+    /// code doing the writing. When a replica stream or a snapshot reader starts
+    /// walking the arena from another thread, this becomes an epoch question and
+    /// the write becomes an install rather than an overwrite.
+    #[inline]
+    pub fn value_mut(&mut self, key: &[u8]) -> Option<&mut [u8]> {
+        self.value_mut_hashed(Self::hash_of(key), key)
+    }
+
+    /// [`RawMap::value_mut`] for a caller that already hashed the key.
+    #[inline]
+    pub fn value_mut_hashed(&mut self, hash: u64, key: &[u8]) -> Option<&mut [u8]> {
+        let addr = self.index.get(hash, key, &Records { arena: &self.arena })?;
+        let (klen, vlen) = Record::lens(self.arena.get(addr, HDR));
+        Some(&mut self.arena.get_mut(addr, HDR + klen + vlen)[HDR + klen..])
+    }
+
     /// Store `val` under `key`, returning the length of the value it replaced.
     ///
     /// Replacement always writes a fresh record rather than editing in place,
@@ -149,16 +176,59 @@ impl RawMap {
     /// reader that has already resolved the address would see a torn value. The
     /// in place path lands with the epoch machinery, not before it.
     pub fn set(&mut self, key: &[u8], val: &[u8]) -> Option<usize> {
+        self.set_with(key, val.len(), |buf| buf.copy_from_slice(val))
+    }
+
+    /// The largest record this map can store, key and value and header together.
+    ///
+    /// A value past this belongs in the log region rather than the arena, which
+    /// is `06` section 2's business and not this crate's.
+    #[inline]
+    #[must_use]
+    pub const fn max_record() -> usize {
+        yo_arena::MAX_ALLOC
+    }
+
+    /// Bytes of record header in front of the key.
+    #[inline]
+    #[must_use]
+    pub const fn header_len() -> usize {
+        HDR
+    }
+
+    /// Store a `vlen` byte value under `key`, written by `fill`.
+    ///
+    /// The same thing [`RawMap::set`] does, except that the caller writes
+    /// straight into the record instead of building the value somewhere else
+    /// first and having it copied in. A string with a one byte encoding tag in
+    /// front of it would otherwise be assembled in a scratch buffer and then
+    /// memcpy'd again, and two copies for one `SET` is one too many on a path
+    /// that is trying to be ten times faster than Redis.
+    ///
+    /// `fill` is handed exactly `vlen` bytes of uninitialised-looking storage.
+    /// It is arena memory that has been handed out before and freed, so its
+    /// contents are arbitrary and every byte of it must be written.
+    ///
+    /// # Panics
+    ///
+    /// If the whole record would exceed [`RawMap::max_record`].
+    pub fn set_with<F>(&mut self, key: &[u8], vlen: usize, fill: F) -> Option<usize>
+    where
+        F: FnOnce(&mut [u8]),
+    {
         assert!(key.len() <= u32::MAX as usize, "key too long");
-        assert!(val.len() <= u32::MAX as usize, "value too long");
-        let total = HDR + key.len() + val.len();
-        let (addr, buf) = self.arena.alloc(total).expect("arena out of space");
+        assert!(vlen <= u32::MAX as usize, "value too long");
+        let total = HDR + key.len() + vlen;
+        let (addr, buf) = self
+            .arena
+            .alloc(total)
+            .expect("record is larger than a segment");
         buf[0..4].copy_from_slice(&(key.len() as u32).to_le_bytes());
-        buf[4..8].copy_from_slice(&(val.len() as u32).to_le_bytes());
+        buf[4..8].copy_from_slice(&(vlen as u32).to_le_bytes());
         // The arena hands back a run padded up to its alignment, so index to
         // `total` rather than to the end of the slice.
         buf[HDR..HDR + key.len()].copy_from_slice(key);
-        buf[HDR + key.len()..total].copy_from_slice(val);
+        fill(&mut buf[HDR + key.len()..total]);
 
         let h = wyhash(key, 0);
         let old = {
@@ -341,6 +411,25 @@ mod tests {
         assert!(!m.del(b"a"));
         assert_eq!(m.get(b"a"), None);
         assert!(m.is_empty());
+    }
+
+    #[test]
+    fn a_value_can_be_overwritten_where_it_lies() {
+        let mut m = RawMap::new();
+        m.set(b"n", &7u64.to_le_bytes());
+        m.set(b"other", b"untouched");
+        let before = m.arena().live_bytes();
+
+        let v = m.value_mut(b"n").expect("the key is there");
+        v.copy_from_slice(&8u64.to_le_bytes());
+
+        assert_eq!(m.get(b"n"), Some(&8u64.to_le_bytes()[..]));
+        assert_eq!(m.get(b"other"), Some(&b"untouched"[..]));
+        // The point of the whole method: no second record and nothing dead.
+        assert_eq!(m.arena().live_bytes(), before);
+        assert_eq!(m.len(), 2);
+
+        assert!(m.value_mut(b"missing").is_none());
     }
 
     #[test]

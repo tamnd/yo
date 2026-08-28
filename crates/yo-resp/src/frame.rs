@@ -20,8 +20,8 @@
 //! [`ProtocolError::Unsupported`] rather than being silently mis-parsed.
 
 use crate::error::ProtocolError;
-use crate::num::parse_i64;
 use crate::proto::Limits;
+use yo_common::num::parse_i64;
 
 /// One reply, borrowed from the buffer it arrived in.
 #[derive(Debug, Clone, PartialEq)]
