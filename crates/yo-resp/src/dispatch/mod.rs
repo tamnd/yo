@@ -202,6 +202,52 @@ impl Server {
         self.dbs.iter().map(Strings::memory_bytes).sum::<usize>() + self.conn_bytes
     }
 
+    /// What the keyspace itself is holding, live records only.
+    ///
+    /// `used_memory` minus this is what the store costs to run: the index, the
+    /// space dead records are sitting in until compaction gets to them, and the
+    /// connections' buffers.
+    #[must_use]
+    pub fn dataset_bytes(&self) -> usize {
+        self.dbs
+            .iter()
+            .map(|db| db.map().arena().live_bytes() as usize)
+            .sum()
+    }
+
+    /// Bytes the arenas are holding, live and dead together.
+    #[must_use]
+    pub fn arena_bytes(&self) -> usize {
+        self.dbs
+            .iter()
+            .map(|db| db.map().arena().reserved_bytes() as usize)
+            .sum()
+    }
+
+    /// Bytes the indexes are holding.
+    #[must_use]
+    pub fn index_bytes(&self) -> usize {
+        self.dbs
+            .iter()
+            .map(|db| db.map().index().memory_bytes())
+            .sum()
+    }
+
+    /// Arena segments whose pages are real, across every database.
+    #[must_use]
+    pub fn segment_count(&self) -> usize {
+        self.dbs
+            .iter()
+            .map(|db| db.map().arena().resident_segments())
+            .sum()
+    }
+
+    /// What the connections' read and reply buffers are holding.
+    #[must_use]
+    pub const fn conn_bytes(&self) -> usize {
+        self.conn_bytes
+    }
+
     /// Note that the connections are holding `delta` bytes more than they were,
     /// or fewer when it is negative.
     ///
