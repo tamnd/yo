@@ -166,13 +166,35 @@ pub struct Arena {
     cur_start: *mut u8,
     /// Total live bytes handed out, for `INFO memory`.
     allocated: u64,
+    /// Segments with nothing live in them, ready to be bumped again.
+    ///
+    /// A segment goes on here only through [`Arena::reclaim`], which is only
+    /// called after compaction has moved every live record out of it. Reusing
+    /// the segment index is safe because every address that ever pointed into
+    /// it is dead: the index holds the new address of everything that moved,
+    /// and nothing else can name arena bytes.
+    free_segs: Vec<usize>,
+    /// Dead bytes across every segment, so that deciding whether compaction is
+    /// worth doing is one comparison rather than a walk over the headers.
+    dead_total: u64,
     _not_send_sync: PhantomData<*mut ()>,
 }
 
 impl Arena {
-    /// A new arena with one segment ready.
+    /// A new arena holding nothing at all.
+    ///
+    /// The first segment waits for the first allocation. A server has sixteen
+    /// databases and on almost every server fifteen of them stay empty for the
+    /// life of the process, so a segment each is thirty megabytes of address
+    /// space held for nobody and thirty megabytes added to what `INFO memory`
+    /// reports before a single key exists.
+    ///
+    /// The empty arena works because the bump cursor starts as three null
+    /// pointers and `cur_end - cur_ptr` is then zero, so the first `alloc`
+    /// cannot fit and takes the slow path, which is where segments come from.
+    /// No branch is added to the fast path for this.
     pub fn new() -> Arena {
-        let mut a = Arena {
+        Arena {
             segs: Vec::new(),
             cur: 0,
             cur_base_offset: 0,
@@ -180,17 +202,25 @@ impl Arena {
             cur_end: core::ptr::null_mut(),
             cur_start: core::ptr::null_mut(),
             allocated: 0,
+            free_segs: Vec::new(),
+            dead_total: 0,
             _not_send_sync: PhantomData,
-        };
-        a.push_segment();
-        a
+        }
     }
 
+    /// Start bumping a new segment: one off the free list if compaction has
+    /// emptied one, and a fresh allocation otherwise.
     fn push_segment(&mut self) {
-        let seg = Segment::new();
-        let base = seg.base.as_ptr();
-        yo_alloc::allow(|| self.segs.push(seg));
-        self.cur = self.segs.len() - 1;
+        let next = match self.free_segs.pop() {
+            Some(seg) => seg,
+            None => {
+                let seg = Segment::new();
+                yo_alloc::allow(|| self.segs.push(seg));
+                self.segs.len() - 1
+            }
+        };
+        let base = self.segs[next].base.as_ptr();
+        self.cur = next;
         self.cur_base_offset = (self.cur as u64) << SEGMENT_SHIFT;
         self.cur_start = base;
         // SAFETY: both offsets are within the `SEGMENT_SIZE` allocation.
@@ -198,6 +228,22 @@ impl Arena {
             self.cur_ptr = base.add(HEADER_SIZE);
             self.cur_end = base.add(SEGMENT_SIZE);
         }
+    }
+
+    /// Bytes a request of `len` actually takes: rounded up to [`ALIGN`], and
+    /// never zero.
+    ///
+    /// The floor is what lets an arena start with no segment at all. An empty
+    /// arena has a cursor with nothing between it and its end, so any request
+    /// bigger than nothing misses and takes the slow path, which is where a
+    /// segment comes from. Without the floor a zero length request would fit in
+    /// a segment that does not exist and hand back a slice built on a null
+    /// pointer. It is also the more honest answer: two zero length allocations
+    /// are two different things and deserve two different addresses.
+    #[inline(always)]
+    const fn slot(len: usize) -> usize {
+        let rounded = (len + (ALIGN - 1)) & !(ALIGN - 1);
+        if rounded == 0 { ALIGN } else { rounded }
     }
 
     /// Allocate `len` bytes and return their address and a writable view.
@@ -214,7 +260,7 @@ impl Arena {
     /// checkpoint calls before it writes.
     #[inline]
     pub fn alloc(&mut self, len: usize) -> Option<(Addr, &mut [u8])> {
-        let size = (len + (ALIGN - 1)) & !(ALIGN - 1);
+        let size = Self::slot(len);
         if size > MAX_ALLOC {
             return None;
         }
@@ -286,6 +332,28 @@ impl Arena {
         Some(addr)
     }
 
+    /// Copy a `len` byte run to a fresh allocation and return where it landed.
+    ///
+    /// What compaction moves a record with. The obvious way to write it is to
+    /// read the bytes into a `Vec` and then write the `Vec` back, and that is a
+    /// heap allocation per record on a thread that is not allowed one. This
+    /// goes arena to arena with one `memcpy` and no allocator call.
+    ///
+    /// # Panics
+    ///
+    /// As [`Arena::get`], and if `len` is over [`MAX_ALLOC`].
+    pub fn copy_within(&mut self, src: Addr, len: usize) -> Addr {
+        let from = self.resolve(src, len);
+        let (addr, out) = self
+            .alloc(len)
+            .expect("a run already in the arena fits in the arena");
+        // SAFETY: `from` is a `len` byte run inside a segment, `out` is a fresh
+        // `len` byte allocation, and a fresh allocation cannot overlap a run
+        // that is already live because the bump pointer only moves forward.
+        unsafe { core::ptr::copy_nonoverlapping(from, out.as_mut_ptr(), len) };
+        addr
+    }
+
     /// Read `len` bytes at `addr`.
     ///
     /// # Panics
@@ -343,16 +411,84 @@ impl Arena {
             Some(Space::Arena),
             "address does not point into the arena"
         );
-        let size = (len + (ALIGN - 1)) & !(ALIGN - 1);
+        let size = Self::slot(len);
         let seg = (addr.offset() >> SEGMENT_SHIFT) as usize;
         let s = &mut self.segs[seg];
         let h = s.header_mut();
+        let was = h.dead_bytes;
         h.dead_bytes = (h.dead_bytes + size as u64).min(SEGMENT_SIZE as u64);
+        // The running total takes what the segment actually took, not what was
+        // asked for, so that the clamp above cannot drift the two apart.
+        self.dead_total += h.dead_bytes - was;
         self.allocated = self.allocated.saturating_sub(size as u64);
     }
 
-    /// The dead byte fraction at which a segment is queued for compaction.
-    pub const COMPACT_RATIO: f64 = 0.5;
+    /// Put an emptied segment back on the free list.
+    ///
+    /// The caller has to have moved every live record out of it first, which is
+    /// what [`compaction_candidates`](Arena::compaction_candidates) exists to
+    /// pick a segment for. There is no way to check that here: the arena has
+    /// never known which of its bytes are live, only how many, which is the
+    /// whole reason allocation costs an add.
+    ///
+    /// The segment keeps its index and its memory. Only its header is reset, so
+    /// the next [`Arena::alloc`] that runs out of room bumps through this one
+    /// again instead of asking the system for two more megabytes. Without this
+    /// a server that overwrites the same keys grows without limit: aki's L11,
+    /// where the `*STORE` family ran at 0.30 to 0.55x because the arena was
+    /// grow only.
+    ///
+    /// # Panics
+    ///
+    /// If `seg` is the segment being bumped, which still has a live cursor
+    /// pointing into it.
+    pub fn reclaim(&mut self, seg: usize) {
+        assert_ne!(seg, self.cur, "cannot reclaim the segment being bumped");
+        debug_assert!(
+            !self.free_segs.contains(&seg),
+            "segment {seg} is already on the free list"
+        );
+        let h = self.segs[seg].header_mut();
+        self.dead_total -= h.dead_bytes;
+        h.bump = HEADER_SIZE as u64;
+        h.dead_bytes = 0;
+        h.epoch_retired = 0;
+        h.flags = 0;
+        yo_alloc::allow(|| self.free_segs.push(seg));
+    }
+
+    /// Dead bytes across every segment.
+    #[inline]
+    pub fn dead_bytes_total(&self) -> u64 {
+        self.dead_total
+    }
+
+    /// Segments that are empty and waiting to be bumped again.
+    #[inline]
+    pub fn free_segments(&self) -> usize {
+        self.free_segs.len()
+    }
+
+    /// The dead byte fraction at which a segment is worth compacting.
+    ///
+    /// A quarter and not a half. The number is a trade and both directions are
+    /// real: at a half a store holds twice what it is keeping, which loses the
+    /// memory column of M2's gate outright, and at a tenth every byte of
+    /// garbage costs nine bytes of copying to get back. A quarter holds about a
+    /// third more than it is keeping and copies three bytes per byte, and only
+    /// on the bytes that were overwritten in the first place. A workload that
+    /// writes each key once never compacts at all.
+    pub const COMPACT_RATIO: f64 = 0.25;
+
+    /// The fraction of everything held that has to be dead before compaction is
+    /// worth starting at all.
+    ///
+    /// The per segment ratio says which segment, this says whether. Without it
+    /// a store with one half dead segment out of forty compacts that segment,
+    /// gains 2 MiB it did not need and pays for it on a command path. With it,
+    /// nothing moves until the process is holding about a third more than it is
+    /// keeping.
+    pub const GARBAGE_RATIO: f64 = 0.25;
 
     /// Segments whose dead byte fraction has passed [`Arena::COMPACT_RATIO`].
     ///
@@ -366,6 +502,29 @@ impl Arena {
             .collect()
     }
 
+    /// The candidate with the most dead bytes, or `None` if there is nothing
+    /// worth moving.
+    ///
+    /// The emptiest segment first, because it is the one whose live records
+    /// cost the least to move and whose two megabytes come back either way.
+    ///
+    /// The first test is the one that runs on a healthy store, and it is a
+    /// single comparison against a counter that `free` keeps. Walking the
+    /// headers only happens once the store is actually holding garbage.
+    pub fn worst_candidate(&self) -> Option<usize> {
+        let enough = (self.reserved_bytes() as f64 * Self::GARBAGE_RATIO) as u64;
+        if self.dead_total < enough {
+            return None;
+        }
+        let threshold = (SEGMENT_SIZE as f64 * Self::COMPACT_RATIO) as u64;
+        (0..self.segs.len())
+            .filter(|&i| i != self.cur)
+            .map(|i| (self.segs[i].header().dead_bytes, i))
+            .filter(|&(dead, _)| dead >= threshold)
+            .max()
+            .map(|(_, i)| i)
+    }
+
     /// Dead bytes in one segment.
     pub fn dead_bytes(&self, seg: usize) -> u64 {
         self.segs[seg].header().dead_bytes
@@ -375,6 +534,12 @@ impl Arena {
     #[inline]
     pub fn segment_count(&self) -> usize {
         self.segs.len()
+    }
+
+    /// The segment being bumped, which is the one nothing may reclaim.
+    #[inline]
+    pub fn current_segment(&self) -> usize {
+        self.cur
     }
 
     /// Bytes handed out and not yet freed.
@@ -530,7 +695,9 @@ mod tests {
         assert!(a.alloc(MAX_ALLOC).is_some());
         let mut b = Arena::new();
         assert!(b.alloc(MAX_ALLOC + 1).is_none());
-        assert_eq!(b.segment_count(), 1, "a refusal must not allocate");
+        assert_eq!(b.segment_count(), 0, "a refusal must not allocate");
+        assert!(b.alloc(1).is_some());
+        assert_eq!(b.segment_count(), 1, "the first allocation takes a segment");
     }
 
     #[test]
@@ -572,6 +739,75 @@ mod tests {
             a.free(*addr, chunk.len());
         }
         assert_eq!(a.compaction_candidates(), vec![0]);
+    }
+
+    #[test]
+    fn a_reclaimed_segment_is_bumped_through_again() {
+        let mut a = Arena::new();
+        let chunk = vec![0u8; 256 * 1024];
+        while a.segment_count() < 2 {
+            a.put(&chunk).unwrap();
+        }
+        let held = a.segment_count();
+        a.reclaim(0);
+        assert_eq!(a.free_segments(), 1);
+        assert_eq!(a.dead_bytes_total(), 0, "reclaim clears the segment's dead");
+
+        // Fill the current segment. The next one has to be the reclaimed one,
+        // so nothing is asked of the system.
+        while a.free_segments() > 0 {
+            a.put(&chunk).unwrap();
+        }
+        assert_eq!(
+            a.segment_count(),
+            held,
+            "grew while holding an empty segment"
+        );
+        assert_eq!(a.current_segment(), 0);
+
+        // And it is being written from the top, not from where it was left.
+        let (addr, _) = a.alloc(16).unwrap();
+        assert!(addr.offset() < SEGMENT_SIZE as u64);
+    }
+
+    #[test]
+    fn nothing_moves_until_the_garbage_is_worth_it() {
+        let mut a = Arena::new();
+        let chunk = vec![0u8; 128 * 1024];
+        let mut addrs = Vec::new();
+        // Ten segments, with one of them half dead. That is 1 MiB of garbage
+        // against 20 MiB held, which is not worth a command path pause even
+        // though the segment itself is past the per segment ratio.
+        while a.segment_count() < 10 {
+            addrs.push(a.put(&chunk).unwrap());
+        }
+        for addr in addrs
+            .iter()
+            .filter(|x| x.offset() < SEGMENT_SIZE as u64)
+            .take(8)
+        {
+            a.free(*addr, chunk.len());
+        }
+        assert_eq!(a.compaction_candidates(), vec![0], "segment 0 is half dead");
+        assert_eq!(
+            a.worst_candidate(),
+            None,
+            "one segment in ten is not enough"
+        );
+
+        // Kill most of the rest and it becomes worth it.
+        for addr in addrs.iter().skip(16).take(80) {
+            a.free(*addr, chunk.len());
+        }
+        assert!(a.worst_candidate().is_some());
+    }
+
+    #[test]
+    #[should_panic(expected = "cannot reclaim the segment being bumped")]
+    fn the_segment_being_written_cannot_be_reclaimed() {
+        let mut a = Arena::new();
+        a.put(b"x").unwrap();
+        a.reclaim(a.current_segment());
     }
 
     #[test]
@@ -622,7 +858,10 @@ mod tests {
     #[test]
     #[should_panic(expected = "leaves segment")]
     fn a_run_that_leaves_its_segment_is_refused() {
-        let a = Arena::new();
+        let mut a = Arena::new();
+        // Something has to be in it, or the complaint is that the segment does
+        // not exist rather than that the run leaves it.
+        a.put(b"x").unwrap();
         a.get(Addr::new(Space::Arena, SEGMENT_SIZE as u64 - 8), 64);
     }
 

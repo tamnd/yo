@@ -108,6 +108,9 @@ pub struct Server {
     dbs: Vec<Strings>,
     clock: Clock,
     started_ms: u64,
+    /// Where the next maintenance turn starts looking, so that a database
+    /// under constant write load cannot hold the other fifteen's space.
+    next_db: usize,
     /// The numbers the reactor keeps for `INFO`.
     pub stats: Stats,
 }
@@ -121,6 +124,7 @@ impl Server {
             dbs: (0..DATABASES).map(|_| Strings::with_clock(clock)).collect(),
             clock,
             started_ms: clock.now_ms(),
+            next_db: 0,
             stats: Stats::default(),
         }
     }
@@ -132,6 +136,7 @@ impl Server {
             dbs: (0..DATABASES).map(|_| Strings::with_clock(clock)).collect(),
             clock,
             started_ms: clock.now_ms(),
+            next_db: 0,
             stats: Stats::default(),
         }
     }
@@ -191,6 +196,30 @@ impl Server {
     #[must_use]
     pub fn expired_keys(&self) -> u64 {
         self.dbs.iter().map(Strings::expired_keys).sum()
+    }
+
+    /// Give one database's dead space back, if any database has enough of it to
+    /// be worth the move. Returns how many records were moved.
+    ///
+    /// Once per turn of the loop, next to the clock. Overwriting a key writes a
+    /// new record and counts the old one dead, so without this a server holds
+    /// everything it has ever written: 400000 sets over 100000 keys measured at
+    /// 742 bytes a key against Redis at 144 for the same load, and the whole
+    /// difference was dead records nothing ever came back for.
+    ///
+    /// At most one segment moves per call and the search starts one database
+    /// further along each time, so the cost of asking is a comparison per
+    /// database and the cost of acting is bounded by a segment.
+    pub fn compact_step(&mut self) -> usize {
+        for turn in 0..self.dbs.len() {
+            let i = (self.next_db + turn) % self.dbs.len();
+            let moved = self.dbs[i].compact_step();
+            if moved > 0 {
+                self.next_db = (i + 1) % self.dbs.len();
+                return moved;
+            }
+        }
+        0
     }
 }
 
@@ -371,6 +400,41 @@ mod tests {
                 String::from_utf8_lossy(self.out.as_slice()).into_owned(),
             )
         }
+    }
+
+    /// What a client does all day: write the same keys again and again. Every
+    /// one of those writes leaves the previous record behind, so a server that
+    /// never compacts holds every version of every key it has ever been sent.
+    #[test]
+    fn rewriting_the_same_keys_does_not_grow_the_server() {
+        let mut f = Fixture::new();
+        let val = vec![b'v'; 1024];
+        let keys: Vec<Vec<u8>> = (0..64).map(|i| format!("key:{i}").into_bytes()).collect();
+
+        for k in &keys {
+            f.run(&[b"SET", k, &val]);
+        }
+        f.server.compact_step();
+        let after_first = f.server.memory_bytes();
+
+        // 64 KiB a pass, five hundred passes, and the same 64 keys at the end
+        // of it. Thirty two megabytes written to hold sixty four kilobytes,
+        // which is the shape of a real workload and is enough churn to fill
+        // sixteen segments if nothing ever comes back.
+        for _ in 0..500 {
+            for k in &keys {
+                f.run(&[b"SET", k, &val]);
+            }
+            f.server.compact_step();
+        }
+
+        assert!(
+            f.server.memory_bytes() <= after_first * 2,
+            "held {} after five hundred passes against {after_first} after one",
+            f.server.memory_bytes()
+        );
+        assert_eq!(f.run(&[b"DBSIZE"]), format!(":{}\r\n", keys.len()));
+        assert_eq!(f.run(&[b"STRLEN", b"key:7"]), ":1024\r\n");
     }
 
     #[test]

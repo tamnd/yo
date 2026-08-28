@@ -296,38 +296,88 @@ impl RawMap {
     }
 
     /// Move every live record out of `seg` and into the current segment, then
-    /// hand the segment back for retirement.
+    /// put the segment back on the arena's free list.
     ///
-    /// The F2 shape from `05` section 3.2: walk the index, not the arena,
-    /// because an allocation has exactly one referent and that referent is an
-    /// index entry. Copy, rewrite the entry, done. No forwarding pointers and
-    /// no read barrier.
+    /// Copy, rewrite the index entry, done. No forwarding pointers and no read
+    /// barrier, which is the F2 shape from `05` section 3.2 and is what an
+    /// allocation having exactly one referent buys.
+    ///
+    /// The walk is over the segment and not over the index. Both find the same
+    /// records, and the index walk is the one written in the spec, but it reads
+    /// the whole index to compact two megabytes: fine when this only ran in a
+    /// test, wrong once the event loop calls it, because the pause would then
+    /// grow with the size of the database rather than with the size of a
+    /// segment. Walking the segment costs one index probe per record in it and
+    /// does not care how many keys exist elsewhere.
+    ///
+    /// Records sit back to back from the header to the segment's bump, each one
+    /// rounded up to the arena's alignment, and every arena allocation is a
+    /// record, so the next one is always a known distance away. A record is
+    /// live when the index still points at this copy of it, and dead when it
+    /// points somewhere else or at nothing, which is exactly what an overwrite
+    /// and a delete leave behind.
+    ///
+    /// The reclaim at the end is the part that makes the space usable again.
+    /// Moving the records out only makes a segment empty, and an empty segment
+    /// that nothing ever bumps through again is still two megabytes the process
+    /// is holding.
     pub fn compact_segment(&mut self, seg: usize) -> usize {
+        if seg == self.arena.current_segment() {
+            // Its bump is a cursor, not a checkpoint, and reclaiming it would
+            // take the ground out from under the next allocation.
+            return 0;
+        }
         let base = (seg as u64) << yo_arena::SEGMENT_SHIFT;
-        let end = base + yo_arena::SEGMENT_SIZE as u64;
-        let victims: Vec<Addr> = self
-            .index
-            .addresses()
-            .filter(|a| a.space() == Some(Space::Arena))
-            .filter(|a| a.offset() >= base && a.offset() < end)
-            .collect();
+        let bump = self.arena.recorded_bump(seg) as usize;
 
         let mut moved = 0;
-        for old in victims {
+        let mut off = yo_arena::HEADER_SIZE;
+        while off < bump {
+            let old = Addr::new(Space::Arena, base + off as u64);
             let (klen, vlen) = Record::lens(self.arena.get(old, HDR));
             let total = HDR + klen + vlen;
-            let bytes = self.arena.get(old, total).to_vec();
-            let key = &bytes[HDR..HDR + klen];
-            let h = wyhash(key, 0);
-            let (new, buf) = self.arena.alloc(total).expect("arena out of space");
-            buf[..total].copy_from_slice(&bytes);
+            off += total.next_multiple_of(yo_arena::ALIGN);
+
+            let hash = {
+                let bytes = self.arena.get(old, HDR + klen);
+                wyhash(&bytes[HDR..], 0)
+            };
+            let live = {
+                let bytes = self.arena.get(old, HDR + klen);
+                let key = &bytes[HDR..];
+                let recs = Records { arena: &self.arena };
+                self.index.get(hash, key, &recs) == Some(old)
+            };
+            if !live {
+                continue;
+            }
+
+            let new = self.arena.copy_within(old, total);
+            let bytes = self.arena.get(new, HDR + klen);
+            let key = &bytes[HDR..];
             let recs = Records { arena: &self.arena };
-            let ok = self.index.relocate(h, key, new, &recs);
+            let ok = self.index.relocate(hash, key, new, &recs);
             debug_assert!(ok, "compaction lost an entry the index just handed us");
             self.arena.free(old, total);
             moved += 1;
         }
+        self.arena.reclaim(seg);
         moved
+    }
+
+    /// Compact one segment if one is worth compacting, and return how many
+    /// records moved.
+    ///
+    /// This is the whole maintenance contract: at most one segment per call, so
+    /// a caller that runs it once per turn of the loop pays a bounded amount
+    /// and never a full pass over the arena. Zero means there was nothing to
+    /// do, and finding that out is one comparison against the running dead byte
+    /// total.
+    pub fn compact_step(&mut self) -> usize {
+        match self.arena.worst_candidate() {
+            Some(seg) => self.compact_segment(seg),
+            None => 0,
+        }
     }
 }
 
@@ -511,6 +561,90 @@ mod tests {
             let want = if i % 2 == 0 { None } else { Some(val.clone()) };
             assert_eq!(m.get(&key(i)).map(|v| v.to_vec()), want, "key {i}");
         }
+    }
+
+    /// The bug this exists for: overwriting a key writes a new record and only
+    /// counts the old one dead, so without compaction a server that rewrites
+    /// the same keys holds every version of every one of them forever. Measured
+    /// on a real server before this, 400000 sets over 100000 keys came to 742
+    /// bytes a key for 64 byte values.
+    #[test]
+    fn rewriting_the_same_keys_stops_growing() {
+        let mut m = RawMap::new();
+        let val = vec![b'z'; COMPACT_VAL];
+        const N: usize = COMPACT_N;
+
+        for i in 0..N {
+            m.set(&key(i), &val);
+            m.compact_step();
+        }
+        let after_first_pass = m.arena().reserved_bytes();
+
+        // Nine more passes over the same keys, writing the same amount of data
+        // nine more times and keeping exactly as much of it.
+        for _ in 0..9 {
+            for i in 0..N {
+                m.set(&key(i), &val);
+                m.compact_step();
+            }
+        }
+        let after_ten = m.arena().reserved_bytes();
+
+        assert!(
+            after_ten <= after_first_pass * 2,
+            "held {after_ten} after ten passes against {after_first_pass} after one, \
+             which is the grow forever shape"
+        );
+        assert!(
+            after_ten < m.arena().live_bytes() * 2,
+            "held {after_ten} for {} live, which is more than the ratio allows",
+            m.arena().live_bytes()
+        );
+        for i in 0..N {
+            assert_eq!(
+                m.get(&key(i)).map(<[u8]>::to_vec),
+                Some(val.clone()),
+                "key {i}"
+            );
+        }
+    }
+
+    /// A segment that compaction emptied is bumped through again rather than
+    /// sitting there holding two megabytes.
+    #[test]
+    fn an_emptied_segment_is_used_again() {
+        let mut m = RawMap::new();
+        let val = vec![b'z'; COMPACT_VAL];
+        const N: usize = COMPACT_N;
+        for i in 0..N {
+            m.set(&key(i), &val);
+        }
+        for i in (0..N).step_by(2) {
+            m.del(&key(i));
+        }
+
+        let before = m.arena().segment_count();
+        let seg = m.arena().worst_candidate().expect("half of it is dead");
+        m.compact_segment(seg);
+        assert_eq!(
+            m.arena().free_segments(),
+            1,
+            "the segment did not come back"
+        );
+
+        // Write until the free segment has to be taken, and the count is where
+        // it was rather than one higher.
+        for i in N..N * 2 {
+            m.set(&key(i), &val);
+            if m.arena().free_segments() == 0 {
+                break;
+            }
+        }
+        assert_eq!(
+            m.arena().segment_count(),
+            before,
+            "asked the system for memory while holding an empty segment"
+        );
     }
 
     #[test]
