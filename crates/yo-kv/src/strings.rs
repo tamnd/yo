@@ -11,6 +11,7 @@
 //! matching on a value rather than on a string (P5).
 
 use crate::clock::Clock;
+use crate::lcs;
 use crate::value::{self, Encoding, Str};
 use std::borrow::Cow;
 use yo_common::num::parse_i64;
@@ -623,6 +624,136 @@ impl Strings {
         Ok(next)
     }
 
+    // ------------------------------------------------------------------- 8.4+
+
+    /// `MSETEX`, which is `MSET` with a deadline on every key it writes.
+    ///
+    /// Redis 8.4. [`Expire::Keep`] leaves each key's own deadline alone, which
+    /// is what `KEEPTTL` means everywhere else, and [`Expire::Clear`] makes this
+    /// the same thing as [`Strings::mset`].
+    ///
+    /// The argument order on the wire is not settled here. That is deliberate:
+    /// this is the storage half and it takes pairs and a deadline, and the order
+    /// the client writes them in is the dispatch layer's business and has to be
+    /// checked against a real 8.4 before it ships.
+    pub fn msetex(&mut self, pairs: &[(&[u8], &[u8])], expire: Expire) -> Result<()> {
+        for &(k, v) in pairs {
+            check_len(k, v.len())?;
+        }
+        for &(k, v) in pairs {
+            self.reap(k);
+            let deadline = match expire {
+                Expire::Clear => None,
+                Expire::At(ms) => Some(ms),
+                Expire::Keep => self.map.get(k).and_then(value::expire_at),
+            };
+            self.store(k, v, deadline);
+        }
+        Ok(())
+    }
+
+    /// `DELEX`, which deletes a key only if its value is what the caller thinks.
+    ///
+    /// Redis 8.4's compare and delete, the other half of `SET ... IFEQ`. The
+    /// point of it is the read modify write nobody was doing correctly: a client
+    /// that reads a value, decides it is stale and deletes it can be beaten to
+    /// the key by another client between the read and the delete, and `WATCH`
+    /// plus `MULTI` costs a round trip to avoid it.
+    ///
+    /// `None` compares against nothing and deletes unconditionally, which is
+    /// plain `DEL` for one key.
+    pub fn delex(&mut self, key: &[u8], compare: Option<&[u8]>) -> bool {
+        self.reap(key);
+        let matches = match compare {
+            Some(want) => self
+                .map
+                .get(key)
+                .is_some_and(|rec| value::read(rec).eq_bytes(want)),
+            None => self.map.contains(key),
+        };
+        matches && self.map.del(key)
+    }
+
+    /// `INCREX`, a windowed rate limiter in one command.
+    ///
+    /// Redis 8.8, and the first Redis primitive that implements a workload
+    /// rather than a data structure. The counter goes up by `by`, and the window
+    /// is started only when the key was not there, so a burst of a hundred calls
+    /// inside one window all expire together at the deadline the first one set
+    /// rather than each one pushing the deadline out.
+    ///
+    /// The idiom this replaces is `INCR` followed by `EXPIRE ... NX`, which is
+    /// two round trips, or a Lua script, which is one round trip and a script
+    /// cache. Here it is one probe, and it is a single record operation the way
+    /// `08` section 2 says it should be.
+    ///
+    /// Answers the count and the deadline the window ends at.
+    pub fn increx(&mut self, key: &[u8], by: i64, window_ms: i64) -> Result<(i64, u64)> {
+        if window_ms <= 0 {
+            return Err(invalid_expire("increx"));
+        }
+        check_len(key, 0)?;
+        self.reap(key);
+        match self.map.get(key) {
+            // Inside a window that is already running, so the deadline it was
+            // given stands.
+            Some(rec) if value::expire_at(rec).is_some() => {
+                let deadline = value::expire_at(rec).expect("matched on Some just above");
+                let next = self.incrby(key, by)?;
+                Ok((next, deadline))
+            }
+            // A key with no deadline is a counter somebody else made, and a new
+            // window starts on it rather than it counting forever.
+            _ => {
+                let at = self.deadline_in(window_ms, "increx")?;
+                let next = self.incrby(key, by)?;
+                let bytes = self.peek(key).expect("just written").to_vec();
+                self.store(key, &bytes, Some(at));
+                Ok((next, at))
+            }
+        }
+    }
+
+    /// `LCS key1 key2`, the longest common subsequence itself.
+    ///
+    /// A key that is not there is the empty string, which is Redis's reading and
+    /// not an error.
+    pub fn lcs(&mut self, a: &[u8], b: &[u8]) -> Result<Vec<u8>> {
+        let (x, y) = self.both(a, b);
+        lcs::string(&x, &y)
+    }
+
+    /// `LCS key1 key2 LEN`.
+    pub fn lcs_len(&mut self, a: &[u8], b: &[u8]) -> Result<usize> {
+        let (x, y) = self.both(a, b);
+        lcs::len(&x, &y)
+    }
+
+    /// `LCS key1 key2 IDX [MINMATCHLEN n]`.
+    ///
+    /// `WITHMATCHLEN` is not a parameter here because every run comes back with
+    /// its length attached. Whether that length reaches the client is the reply
+    /// writer's decision and not the store's.
+    pub fn lcs_idx(&mut self, a: &[u8], b: &[u8], minmatchlen: u32) -> Result<lcs::Idx> {
+        let (x, y) = self.both(a, b);
+        lcs::idx(&x, &y, minmatchlen)
+    }
+
+    /// Both values as bytes, for the one command that needs two keys at once.
+    ///
+    /// Copied rather than borrowed, which is the only place in this file that
+    /// copies a value it did not have to. `LCS` builds a table the size of the
+    /// product of the two lengths, so a pair of copies is not what makes it
+    /// expensive, and borrowing both at once through a `&mut self` reap is a
+    /// fight with the borrow checker for no measurable gain.
+    fn both(&mut self, a: &[u8], b: &[u8]) -> (Vec<u8>, Vec<u8>) {
+        self.reap(a);
+        self.reap(b);
+        let x = self.peek(a).map(|v| v.to_vec()).unwrap_or_default();
+        let y = self.peek(b).map(|v| v.to_vec()).unwrap_or_default();
+        (x, y)
+    }
+
     // ---------------------------------------------------------------- private
 
     /// The value under `key` without reaping first.
@@ -1209,6 +1340,106 @@ mod tests {
         s.clock_mut().set(2_000);
         assert!(!s.exists(b"k"));
         assert_eq!(s.strlen(b"k"), 0);
+    }
+
+    #[test]
+    fn msetex_puts_the_same_deadline_on_every_key() {
+        let mut s = store();
+        let pairs = [(&b"a"[..], &b"1"[..]), (&b"b"[..], &b"2"[..])];
+        s.msetex(&pairs, Expire::At(3_000)).unwrap();
+        assert_eq!(s.expire_at(b"a"), Some(3_000));
+        assert_eq!(s.expire_at(b"b"), Some(3_000));
+        // KEEPTTL leaves each key with whatever it already had, which here is
+        // one key with a deadline and one without.
+        s.set_plain(b"b", b"9").unwrap();
+        s.msetex(&pairs, Expire::Keep).unwrap();
+        assert_eq!(s.expire_at(b"a"), Some(3_000));
+        assert_eq!(s.expire_at(b"b"), None);
+        assert_eq!(got(&mut s, b"b").as_deref(), Some(&b"2"[..]));
+        // And with no deadline at all it is MSET.
+        s.msetex(&pairs, Expire::Clear).unwrap();
+        assert_eq!(s.expire_at(b"a"), None);
+    }
+
+    #[test]
+    fn delex_deletes_only_what_it_was_told_to() {
+        let mut s = store();
+        s.set_plain(b"k", b"v").unwrap();
+        assert!(!s.delex(b"k", Some(b"other")));
+        assert!(s.exists(b"k"), "a failed compare deleted the key");
+        assert!(s.delex(b"k", Some(b"v")));
+        assert!(!s.exists(b"k"));
+        // A key that is not there compares equal to nothing at all.
+        assert!(!s.delex(b"k", Some(b"v")));
+        assert!(!s.delex(b"k", None));
+        s.set_plain(b"k", b"v").unwrap();
+        assert!(s.delex(b"k", None));
+        // Int encoded, so the compare is against the digits.
+        s.set_plain(b"n", b"42").unwrap();
+        assert!(!s.delex(b"n", Some(b"042")));
+        assert!(s.delex(b"n", Some(b"42")));
+    }
+
+    #[test]
+    fn increx_starts_one_window_and_counts_inside_it() {
+        let mut s = store();
+        let (n, at) = s.increx(b"k", 1, 500).unwrap();
+        assert_eq!((n, at), (1, 1_500));
+        // Every call inside the window reports the deadline the first one set.
+        s.clock_mut().set(1_200);
+        let (n, at) = s.increx(b"k", 1, 500).unwrap();
+        assert_eq!((n, at), (2, 1_500), "the window was pushed out");
+        // Past the deadline the counter and the window both start again.
+        s.clock_mut().set(1_500);
+        let (n, at) = s.increx(b"k", 1, 500).unwrap();
+        assert_eq!((n, at), (1, 2_000));
+        assert_eq!(s.expired_keys(), 1);
+    }
+
+    #[test]
+    fn increx_takes_over_a_counter_that_has_no_window() {
+        let mut s = store();
+        s.set_plain(b"k", b"5").unwrap();
+        let (n, at) = s.increx(b"k", 2, 250).unwrap();
+        assert_eq!((n, at), (7, 1_250));
+        assert_eq!(s.expire_at(b"k"), Some(1_250));
+        assert_eq!(s.encoding(b"k"), Some(Encoding::Int));
+
+        assert!(s.increx(b"k", 1, 0).is_err());
+        assert!(s.increx(b"k", 1, -1).is_err());
+        s.set_plain(b"t", b"hello").unwrap();
+        assert!(s.increx(b"t", 1, 100).is_err());
+    }
+
+    #[test]
+    fn lcs_reads_two_keys_and_treats_a_missing_one_as_empty() {
+        let mut s = store();
+        s.set_plain(b"a", b"ohmytext").unwrap();
+        s.set_plain(b"b", b"mynewtext").unwrap();
+        assert_eq!(s.lcs(b"a", b"b").unwrap(), b"mytext");
+        assert_eq!(s.lcs_len(b"a", b"b").unwrap(), 6);
+        assert_eq!(s.lcs_idx(b"a", b"b", 4).unwrap().matches.len(), 1);
+        assert_eq!(s.lcs(b"a", b"missing").unwrap(), b"");
+        assert_eq!(s.lcs_len(b"missing", b"gone").unwrap(), 0);
+        // An int encoded value is compared as its digits.
+        s.set_plain(b"n", b"12345").unwrap();
+        s.set_plain(b"m", b"13579").unwrap();
+        assert_eq!(s.lcs(b"n", b"m").unwrap(), b"135");
+    }
+
+    #[test]
+    fn lcs_does_not_see_a_key_that_has_expired() {
+        let mut s = store();
+        s.set(
+            b"a",
+            b"hello",
+            SetOptions::PLAIN.expiring(Expire::At(1_100)),
+        )
+        .unwrap();
+        s.set_plain(b"b", b"hello").unwrap();
+        assert_eq!(s.lcs(b"a", b"b").unwrap(), b"hello");
+        s.clock_mut().set(1_100);
+        assert_eq!(s.lcs(b"a", b"b").unwrap(), b"");
     }
 
     #[test]
