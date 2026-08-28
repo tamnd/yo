@@ -124,3 +124,32 @@ jobs:
       - run: cargo doc --workspace --no-deps --all-features
         env:
           RUSTDOCFLAGS: -D warnings --cfg docsrs
+
+  # Crash injection. The full hundred thousand trial gate is a release step and
+  # takes half a minute on a quiet machine, which is too long to spend on every
+  # push, so this runs a fifth of it across four shapes instead. The shapes
+  # matter more than the count: a small page reaches a boundary every few
+  # records, a large one almost never does, forty records per trial means the
+  # fault usually lands in the first page, and sync durability leaves so little
+  # in flight that it exercises a different kind of wreckage from the default.
+  #
+  # Seeds are fixed rather than drawn from the clock. A job that picks its own
+  # seeds finds more, but it fails once a month on a seed nobody wrote down,
+  # which is not a bug report.
+  crash:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2.9.2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - run: cargo build --release --locked -p yo-crash --bin yo-crash
+      - name: twenty thousand faults, four shapes
+        run: |
+          ./target/release/yo-crash --trials 8000
+          ./target/release/yo-crash --trials 4000 --page-len 8192 --records 400 --seed 2000000
+          ./target/release/yo-crash --trials 4000 --page-len 65536 --records 800 --seed 3000000
+          ./target/release/yo-crash --trials 2000 --records 40 --seed 4000000
+          ./target/release/yo-crash --trials 2000 --sync --seed 5000000

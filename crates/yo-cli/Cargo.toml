@@ -1,0 +1,30 @@
+[package]
+name = "yo-cli"
+description = "The yo command line tool."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+# `yo check` reads the file with the independent reader rather than the engine,
+# on purpose. A checker that shares its idea of the format with the thing that
+# wrote the file agrees with it about everything, including the mistakes.
+yo-reader = { workspace = true }
+
+# The tests are the one place both sides are allowed in the same binary. They
+# build real files with the engine and then check them with the tool, which is
+# the only way to find out whether the tool would notice anything.
+[dev-dependencies]
+yo-file = { workspace = true }
+yo-format = { workspace = true }
+yo-record = { workspace = true }
+
+[[bin]]
+name = "yo"
+path = "src/main.rs"

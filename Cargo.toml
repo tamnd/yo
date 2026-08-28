@@ -3,8 +3,14 @@ resolver = "3"
 members = [
     "crates/yo-alloc",
     "crates/yo-arena",
+    "crates/yo-cli",
     "crates/yo-common",
+    "crates/yo-crash",
+    "crates/yo-file",
+    "crates/yo-format",
     "crates/yo-index",
+    "crates/yo-reader",
+    "crates/yo-record",
     "crates/yo-shard",
 ]
 # The fuzz targets need nightly and a libfuzzer link, so they are their own
@@ -14,7 +20,7 @@ exclude = ["fuzz"]
 [workspace.package]
 # One minor per milestone, patches in between, and nothing here promises
 # anything while the major is 0. See RELEASING.md.
-version = "0.1.1"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.94"
 license = "MIT OR Apache-2.0"
@@ -23,11 +29,17 @@ homepage = "https://yo.tamnd.dev"
 authors = ["tamnd <tamnd87@gmail.com>"]
 
 [workspace.dependencies]
-yo-alloc = { path = "crates/yo-alloc", version = "0.1.1" }
-yo-arena = { path = "crates/yo-arena", version = "0.1.1" }
-yo-common = { path = "crates/yo-common", version = "0.1.1" }
-yo-index = { path = "crates/yo-index", version = "0.1.1" }
-yo-shard = { path = "crates/yo-shard", version = "0.1.1" }
+yo-alloc = { path = "crates/yo-alloc", version = "0.2.0" }
+yo-arena = { path = "crates/yo-arena", version = "0.2.0" }
+yo-cli = { path = "crates/yo-cli", version = "0.2.0" }
+yo-common = { path = "crates/yo-common", version = "0.2.0" }
+yo-crash = { path = "crates/yo-crash", version = "0.2.0" }
+yo-file = { path = "crates/yo-file", version = "0.2.0" }
+yo-format = { path = "crates/yo-format", version = "0.2.0" }
+yo-index = { path = "crates/yo-index", version = "0.2.0" }
+yo-reader = { path = "crates/yo-reader", version = "0.2.0" }
+yo-record = { path = "crates/yo-record", version = "0.2.0" }
+yo-shard = { path = "crates/yo-shard", version = "0.2.0" }
 
 criterion = "0.8"
 libc = "0.2"

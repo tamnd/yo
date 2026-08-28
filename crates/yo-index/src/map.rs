@@ -235,14 +235,52 @@ impl Default for RawMap {
 mod tests {
     use super::*;
 
+    /// `key:` and the index zero padded to twelve digits.
+    ///
+    /// Written out by hand rather than with `format!`, which produces the same
+    /// bytes. Formatting is a lot of machinery for twelve digits, and Miri pays
+    /// per operation rather than per instruction, so under the interpreter one
+    /// `format!` costs a couple of milliseconds. `grows_through_many_splits`
+    /// calls this once per set, get, delete and contains, which is ten thousand
+    /// calls on its own, and that is twenty seconds of the ninety five this
+    /// crate's Miri shard used to take.
     fn key(i: usize) -> Vec<u8> {
-        format!("key:{i:012}").into_bytes()
+        let mut k = *b"key:000000000000";
+        let mut n = i;
+        let mut p = k.len() - 1;
+        while n > 0 {
+            k[p] = b'0' + (n % 10) as u8;
+            n /= 10;
+            p -= 1;
+        }
+        k.to_vec()
+    }
+
+    /// `v` and the index, unpadded, which is what `format!("v{i}")` gives.
+    fn val(i: usize) -> Vec<u8> {
+        let mut v = vec![b'v'];
+        if i == 0 {
+            v.push(b'0');
+            return v;
+        }
+        let start = v.len();
+        let mut n = i;
+        while n > 0 {
+            v.push(b'0' + (n % 10) as u8);
+            n /= 10;
+        }
+        v[start..].reverse();
+        v
     }
 
     // Miri is a few hundred times slower than the machine, so the counts below
     // shrink under it. They stay large enough to force directory doublings,
     // segment splits and overflow chains, which is what these tests are for.
     // Only the scale goes away, not the coverage.
+    // Three thousand and not fewer. `splits() > 4` is the assertion and the
+    // splits go 1, 1, 2, 3, 3, 5 at 800, 1200, 1500, 2000, 2500 and 3000 keys,
+    // so this is already the smallest count that grows the directory the number
+    // of times the test asks about.
     #[cfg(miri)]
     const GROW_N: usize = 3_000;
     #[cfg(not(miri))]
@@ -295,7 +333,7 @@ mod tests {
         let mut m = RawMap::new();
         const N: usize = GROW_N;
         for i in 0..N {
-            m.set(&key(i), format!("v{i}").as_bytes());
+            m.set(&key(i), &val(i));
         }
         assert_eq!(m.len(), N);
         assert!(
@@ -305,8 +343,8 @@ mod tests {
         );
         for i in 0..N {
             assert_eq!(
-                m.get(&key(i)).map(|v| v.to_vec()),
-                Some(format!("v{i}").into_bytes()),
+                m.get(&key(i)),
+                Some(val(i).as_slice()),
                 "lost key {i} after {} splits",
                 m.index().splits()
             );
