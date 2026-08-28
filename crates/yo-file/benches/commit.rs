@@ -34,7 +34,7 @@
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use std::hint::black_box;
 use std::path::PathBuf;
-use yo_file::{CreateOptions, LogFile, Yo};
+use yo_file::{CreateOptions, LogFile, RingConfig, Yo};
 use yo_format::{RecordHeader, RecordKind};
 use yo_record::{Durability, Log, LogConfig};
 
@@ -85,13 +85,24 @@ struct Fixture {
 
 impl Fixture {
     fn new(name: &str, durability: Durability) -> Fixture {
+        Fixture::build(name, durability, None)
+    }
+
+    fn ringed(name: &str, durability: Durability, config: &RingConfig) -> Fixture {
+        Fixture::build(name, durability, Some(config))
+    }
+
+    fn build(name: &str, durability: Durability, ring: Option<&RingConfig>) -> Fixture {
         let mut path = bench_dir();
         std::fs::create_dir_all(&path).expect("the benchmark directory");
         path.push(format!("yo-bench-commit-{name}-{}.yo", std::process::id()));
         let _ = std::fs::remove_file(&path);
 
         let mut db = Yo::create(&path, &CreateOptions::default()).expect("create");
-        let sink = db.log(0).expect("a log for shard 0");
+        let mut sink = db.log(0).expect("a log for shard 0");
+        if let Some(config) = ring {
+            sink.use_ring(config).expect("a ring");
+        }
         let log = Log::new(
             LogConfig {
                 shard: 0,
@@ -102,6 +113,18 @@ impl Fixture {
         )
         .expect("a log");
         Fixture { path, log }
+    }
+
+    /// Ends a batch and does not return until it is durable.
+    ///
+    /// The whole point of the ring is that `commit_pending` stops being the
+    /// place durability happens, so a benchmark that stopped there would be
+    /// timing a queue insertion and calling it a durable commit rate. The wait
+    /// is what makes the two columns the same measurement.
+    fn commit_durable(&mut self) {
+        self.log.commit_pending().expect("commit");
+        self.log.sink_mut().drain().expect("drain");
+        debug_assert!(self.log.durable_upto() >= self.log.tail());
     }
 }
 
@@ -189,5 +212,71 @@ fn commit_batch(c: &mut Criterion) {
     g.finish();
 }
 
-criterion_group!(benches, commit, commit_batch);
+/// The synchronous write path against the ring, in group mode, over the batch
+/// sizes that matter.
+///
+/// This is the M1 gate row and the reason `yo-uring` exists. The claim is that
+/// handing the bytes over and carrying on beats stopping the shard for every
+/// `pwrite`, and that the gap widens with the batch, because a batch of 4096 is
+/// 4096 chances to be stopped.
+///
+/// Read the two columns together with what the run says about itself. On Linux
+/// the ring column is io_uring. On macOS and Windows it is the portable backend
+/// from `04` section 7, which does the same writes synchronously behind the same
+/// state machine, so the two columns there differ by a memcpy and some
+/// bookkeeping and the ring one should be slightly worse. That is the expected
+/// result off Linux and it is not a regression, it is the platform. Only a
+/// Linux run is a gate row, which is why the mode is printed rather than
+/// assumed.
+fn commit_ring(c: &mut Criterion) {
+    let h = RecordHeader::new(RecordKind::String);
+    let value = [b'v'; 64];
+
+    // Once, before anything is measured. Inside the bench closure this would
+    // print on every sample and shred criterion's own output.
+    {
+        let probe = Fixture::ringed("probe", Durability::Group, &RingConfig::plain());
+        eprintln!(
+            "commit_ring: ring backend is {}",
+            if probe.log.sink().is_uring() {
+                "io_uring"
+            } else {
+                "the portable one, so the ring column here is not a gate row"
+            }
+        );
+    }
+
+    let mut g = c.benchmark_group("commit_ring");
+    for batch in [64usize, 512, 4096] {
+        g.throughput(Throughput::Elements(batch as u64));
+        for ring in [false, true] {
+            let name = if ring { "ring" } else { "pwrite" };
+            g.bench_with_input(
+                BenchmarkId::new(name, batch),
+                &(batch, ring),
+                |b, &(batch, ring)| {
+                    let tag = format!("{name}{batch}");
+                    let mut f = if ring {
+                        Fixture::ringed(&tag, Durability::Group, &RingConfig::plain())
+                    } else {
+                        Fixture::new(&tag, Durability::Group)
+                    };
+                    let mut keys = KeyBuf::new();
+                    let mut n = 0u64;
+                    b.iter(|| {
+                        for _ in 0..batch {
+                            n += 1;
+                            let a = f.log.append(&h, keys.set(n), &value).expect("append").addr;
+                            black_box(a);
+                        }
+                        f.commit_durable();
+                    });
+                },
+            );
+        }
+    }
+    g.finish();
+}
+
+criterion_group!(benches, commit, commit_batch, commit_ring);
 criterion_main!(benches);

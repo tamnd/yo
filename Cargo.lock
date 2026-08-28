@@ -854,6 +854,7 @@ dependencies = [
  "yo-common",
  "yo-format",
  "yo-record",
+ "yo-uring",
 ]
 
 [[package]]

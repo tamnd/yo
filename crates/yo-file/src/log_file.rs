@@ -22,13 +22,15 @@
 
 use crate::file::{Alloc, REGION_LEN, io_err};
 use crate::io as fio;
+use crate::ring::RingWriter;
 use std::cell::UnsafeCell;
 use std::collections::HashMap;
 use std::fs::File;
 use std::sync::{Arc, Mutex, PoisonError};
-use yo_common::Result;
+use yo_common::{Code, Error, Result};
 use yo_format::{PAGE_HEADER_LEN, PageHeader};
 use yo_record::{PageSink, PageSource, PageWrite};
+use yo_uring::RingConfig;
 
 /// Reads are rounded up to this, because a device does not do better than a
 /// block and a page that is nearly empty should not cost 32 MiB to look at.
@@ -108,6 +110,14 @@ pub struct LogFile {
     /// `page_addr` to file offset, for the pages this shard has written.
     regions: HashMap<u64, u64>,
     cache: UnsafeCell<Cache>,
+    /// Set by [`LogFile::use_ring`], and then every write goes through it
+    /// instead of through `pwrite`.
+    ///
+    /// In a cell for the same reason the cache is: [`PageSource::page_bytes`]
+    /// takes `&self` and has to wait for an outstanding write to that page
+    /// before it reads the page back, or it reads bytes the kernel has not put
+    /// there yet.
+    ring: Option<UnsafeCell<RingWriter>>,
     written_upto: u64,
     durable_upto: u64,
     writes: u64,
@@ -119,8 +129,9 @@ impl std::fmt::Debug for LogFile {
         f.debug_struct("LogFile")
             .field("shard", &self.shard)
             .field("regions", &self.regions.len())
+            .field("ring", &self.ring.is_some())
             .field("written_upto", &self.written_upto)
-            .field("durable_upto", &self.durable_upto)
+            .field("durable_upto", &self.durable_upto())
             .finish()
     }
 }
@@ -138,11 +149,66 @@ impl LogFile {
             alloc,
             regions,
             cache: UnsafeCell::new(Cache::new()),
+            ring: None,
             written_upto: 0,
             durable_upto: 0,
             writes: 0,
             syncs: 0,
         }
+    }
+
+    /// Moves this log's writes onto the submission ring.
+    ///
+    /// This is what `06` section 3 needs to reach two hundred thousand durable
+    /// commits a second. Without it the shard stops for every `pwrite` and every
+    /// `fdatasync`; with it the shard hands the bytes over and keeps going, and
+    /// a commit that is waiting on durability is parked on an address rather
+    /// than on a syscall.
+    ///
+    /// Call it before the first write. There is no reason to call it later and
+    /// the counters would not line up if you did.
+    ///
+    /// On Linux this is io_uring. On macOS and Windows it is the same state
+    /// machine over synchronous storage (`04` section 7), which is correct and
+    /// tested and slower, and [`LogFile::is_uring`] is how a benchmark row says
+    /// which of the two produced it.
+    ///
+    /// # Errors
+    ///
+    /// [`Code::Invalid`] if this log is already in ring mode or has already
+    /// written something, or whatever the ring says about the configuration and
+    /// the kernel.
+    pub fn use_ring(&mut self, config: &RingConfig) -> Result<()> {
+        if self.ring.is_some() {
+            return Err(Error::new(Code::Invalid, "this log is already on a ring"));
+        }
+        if self.writes > 0 {
+            return Err(Error::new(
+                Code::Invalid,
+                "a log switches to the ring before its first write, not after",
+            ));
+        }
+        let w = RingWriter::new(Arc::clone(&self.file), config)?;
+        self.ring = Some(UnsafeCell::new(w));
+        Ok(())
+    }
+
+    /// Whether this log is on a ring at all.
+    #[must_use]
+    pub const fn is_ringed(&self) -> bool {
+        self.ring.is_some()
+    }
+
+    /// Whether the ring under this log is a real io_uring, which off Linux it is
+    /// not.
+    ///
+    /// Every benchmark row carries this, because a number from the portable
+    /// backend and a number from io_uring are not the same measurement and a
+    /// table that does not say which is which is how you publish four wrong
+    /// numbers.
+    #[must_use]
+    pub fn is_uring(&self) -> bool {
+        self.read_ring(RingWriter::is_uring).unwrap_or(false)
     }
 
     /// Which shard this log belongs to.
@@ -167,17 +233,81 @@ impl LogFile {
         v
     }
 
+    /// Asks the ring something, if there is one.
+    fn read_ring<T>(&self, f: impl FnOnce(&RingWriter) -> T) -> Option<T> {
+        let cell = self.ring.as_ref()?;
+        // SAFETY: `LogFile` is not `Sync`, so there is one thread in here, and
+        // the only thing that hands out a `&mut` to the writer through a `&self`
+        // is `with_ring`, which does not nest with this.
+        Some(f(unsafe { &*cell.get() }))
+    }
+
+    /// Runs `f` against the ring, if there is one.
+    ///
+    /// The one place `&mut RingWriter` comes out of a `&self`. It has exactly
+    /// one caller, [`PageSource::page_bytes`], and the aliasing argument lives
+    /// here rather than being repeated at every accessor.
+    fn with_ring<T>(&self, f: impl FnOnce(&mut RingWriter) -> T) -> Option<T> {
+        let cell = self.ring.as_ref()?;
+        // SAFETY: `LogFile` is not `Sync`, so there is one thread in here. The
+        // `&mut` lives only for the call and nothing it returns borrows from the
+        // writer, so no second reference to it can be alive at the same time.
+        Some(f(unsafe { &mut *cell.get() }))
+    }
+
     /// How many byte ranges have been handed to the file.
     #[must_use]
     pub const fn writes(&self) -> u64 {
         self.writes
     }
 
-    /// How many syncs have been asked for. Group commit is the claim that this
-    /// stays far below the commit count.
+    /// How many syncs actually reached the device.
+    ///
+    /// Group commit is the claim that this stays far below the commit count. In
+    /// ring mode it is the ring's count, because that is where the decision to
+    /// issue one or skip one is made.
     #[must_use]
-    pub const fn syncs(&self) -> u64 {
-        self.syncs
+    pub fn syncs(&self) -> u64 {
+        self.read_ring(RingWriter::syncs).unwrap_or(self.syncs)
+    }
+
+    /// The log address below which everything has been handed over, durable or
+    /// not.
+    #[must_use]
+    pub const fn written_upto(&self) -> u64 {
+        self.written_upto
+    }
+
+    /// How many times a write had to wait for the ring.
+    ///
+    /// Zero in group mode, because the sync boundary has already drained
+    /// everything by the time the next page is staged. Anything else means the
+    /// ring is too shallow for the load or the device is behind.
+    #[must_use]
+    pub fn stalls(&self) -> u64 {
+        self.read_ring(RingWriter::stalls).unwrap_or(0)
+    }
+
+    /// Submissions the ring has not seen come back.
+    #[must_use]
+    pub fn in_flight(&self) -> u32 {
+        self.read_ring(RingWriter::in_flight).unwrap_or(0)
+    }
+
+    /// Waits for everything handed over to become durable.
+    ///
+    /// A no op without a ring, where a write is already durable by the time
+    /// [`PageSink::sync`] returns. With one this is the shutdown and checkpoint
+    /// path, and it is what a test calls before it looks at the file.
+    ///
+    /// # Errors
+    ///
+    /// The first failure found on the way.
+    pub fn drain(&mut self) -> Result<()> {
+        match self.ring.as_mut() {
+            Some(c) => c.get_mut().drain(),
+            None => Ok(()),
+        }
     }
 
     /// How much memory the read cache is holding.
@@ -246,17 +376,32 @@ impl LogFile {
 impl PageSink for LogFile {
     fn write(&mut self, w: PageWrite<'_>) -> Result<()> {
         let off = self.region_for(w.page_addr)?;
-        fio::write_at(&self.file, off + w.offset as u64, w.bytes)
-            .map_err(|e| io_err("could not write a log page", &e))?;
+        // Whatever was cached for this page is now behind the file. Dropping it
+        // is sound here and only here, because `write` holds `&mut self`. It
+        // happens before the write in ring mode too, since the write is out of
+        // this thread's hands the moment it is submitted.
+        self.cache.get_mut().forget(w.page_addr);
         self.writes += 1;
         self.written_upto = self.written_upto.max(w.covers_upto);
-        // Whatever was cached for this page is now behind the file. Dropping it
-        // is sound here and only here, because `write` holds `&mut self`.
-        self.cache.get_mut().forget(w.page_addr);
+        if let Some(c) = self.ring.as_mut() {
+            return c
+                .get_mut()
+                .write(w.page_addr, off + w.offset as u64, w.bytes, w.covers_upto);
+        }
+        fio::write_at(&self.file, off + w.offset as u64, w.bytes)
+            .map_err(|e| io_err("could not write a log page", &e))?;
         Ok(())
     }
 
     fn sync(&mut self) -> Result<()> {
+        if let Some(c) = self.ring.as_mut() {
+            // Records the address and returns. The ring issues the `fsync` from
+            // `poll`, once the writes it has to cover have landed, because
+            // io_uring runs a queued sync in parallel with the writes queued
+            // before it and a sync that overtakes them makes a durability claim
+            // about bytes that are not there.
+            return c.get_mut().sync();
+        }
         // Nothing has reached the file since the last sync, so there is nothing
         // for this one to make durable. Skipping it is not an optimisation for
         // its own sake: group commit runs off a timer, most ticks find an idle
@@ -279,12 +424,30 @@ impl PageSink for LogFile {
     }
 
     fn durable_upto(&self) -> u64 {
-        self.durable_upto
+        self.read_ring(RingWriter::durable_upto)
+            .unwrap_or(self.durable_upto)
+    }
+
+    fn poll(&mut self) -> Result<()> {
+        match self.ring.as_mut() {
+            Some(c) => c.get_mut().poll(),
+            // Without a ring there is nothing outstanding to hear about, since
+            // `write` and `sync` are finished by the time they return.
+            None => Ok(()),
+        }
     }
 }
 
 impl PageSource for LogFile {
     fn page_bytes(&self, page_addr: u64) -> Option<&[u8]> {
+        // A write to this page may still be in the ring, and a `pread` would
+        // then read what is under it rather than what was written. Waiting is
+        // the only honest answer, and it costs nothing on the path this is
+        // actually on: compaction and recovery read cold pages, which by
+        // definition have no write outstanding. A failure stays with the ring
+        // and comes out of the next `poll`, because there is no room for one
+        // here.
+        self.with_ring(RingWriter::quiesce);
         // SAFETY: `LogFile` is not `Sync`, so no other thread is in here. The
         // `&mut Cache` below lives only until the end of this call and no borrow
         // handed out to a caller is derived from it: the pointer that gets
@@ -550,6 +713,206 @@ mod tests {
         put_page(&mut sink, LOG_PAGE_LEN, 0x22);
         sink.sync().unwrap();
         assert_eq!(sink.syncs(), 2);
+    }
+
+    /// Ring mode is a different way to get the bytes there, not a different
+    /// result. Same writes, same file, same reads back.
+    #[cfg_attr(
+        miri,
+        ignore = "a real ring and a real file, neither of which Miri has"
+    )]
+    #[test]
+    fn a_ringed_log_writes_the_same_bytes_as_a_plain_one() {
+        let t = Tmp::new("ringsame");
+        let mut db = Yo::create(&t.0, &CreateOptions::default()).unwrap();
+        let mut sink = db.log(0).unwrap();
+        sink.use_ring(&RingConfig::plain().with_entries(64))
+            .unwrap();
+        assert!(sink.is_ringed());
+
+        for i in 0..8u64 {
+            put_page(&mut sink, i * LOG_PAGE_LEN, 0xc0 + i as u8);
+        }
+        sink.sync().unwrap();
+        sink.drain().unwrap();
+
+        assert_eq!(sink.region_count(), 8);
+        assert_eq!(sink.writes(), 8);
+        assert_eq!(sink.syncs(), 1, "eight pages, one sync");
+        assert_eq!(sink.durable_upto(), sink.written_upto());
+        for i in 0..8u64 {
+            let got = sink.page_bytes(i * LOG_PAGE_LEN).unwrap();
+            assert_eq!(got[PAGE_HEADER_LEN], 0xc0 + i as u8);
+            assert_eq!(PageHeader::decode(got).unwrap().used, 64);
+        }
+    }
+
+    /// The one that would be a silent corruption if `page_bytes` did not wait.
+    /// A read of a page with a write still in the ring has to see the write.
+    #[cfg_attr(
+        miri,
+        ignore = "a real ring and a real file, neither of which Miri has"
+    )]
+    #[test]
+    fn reading_a_page_waits_for_the_write_still_in_the_ring() {
+        let t = Tmp::new("ringread");
+        let mut db = Yo::create(&t.0, &CreateOptions::default()).unwrap();
+        let mut sink = db.log(0).unwrap();
+        sink.use_ring(&RingConfig::plain().with_entries(64))
+            .unwrap();
+
+        put_page(&mut sink, 0, 0x11);
+        put_page(&mut sink, LOG_PAGE_LEN, 0x22);
+        // No drain and no sync. Whatever is outstanding is outstanding.
+        assert_eq!(sink.page_bytes(0).unwrap()[PAGE_HEADER_LEN], 0x11);
+        assert_eq!(
+            sink.page_bytes(LOG_PAGE_LEN).unwrap()[PAGE_HEADER_LEN],
+            0x22
+        );
+        assert_eq!(sink.in_flight(), 0, "the read left something outstanding");
+    }
+
+    /// Turns the loop until the sink says `upto` is durable, and gives up
+    /// rather than hanging if it never gets there.
+    ///
+    /// How many turns that takes is a property of the backend and not of the
+    /// caller. The portable one does the write and the fsync inside the call
+    /// that submits them, so the first poll after a sync already has the
+    /// answer. Real io_uring needs at least two: one to pick the write
+    /// completion up, which is what lets the fsync go out at all, and another
+    /// to pick the fsync completion up. A test that polls once is a test that
+    /// only passes off Linux, which is how this one first went out.
+    fn poll_until_durable(sink: &mut LogFile, upto: u64) {
+        for _ in 0..100_000 {
+            sink.poll().unwrap();
+            if sink.durable_upto() >= upto {
+                return;
+            }
+        }
+        panic!("polled to the cap and {upto} is still not durable");
+    }
+
+    /// A sync in ring mode is a request, not an answer. Nothing is durable
+    /// until the poll that picks the fsync up.
+    #[cfg_attr(
+        miri,
+        ignore = "a real ring and a real file, neither of which Miri has"
+    )]
+    #[test]
+    fn a_ringed_sync_does_not_claim_durability_by_itself() {
+        let t = Tmp::new("ringdurable");
+        let mut db = Yo::create(&t.0, &CreateOptions::default()).unwrap();
+        let mut sink = db.log(0).unwrap();
+        sink.use_ring(&RingConfig::plain()).unwrap();
+
+        put_page(&mut sink, 0, 0x33);
+        assert_eq!(sink.written_upto(), 64);
+        sink.sync().unwrap();
+        assert_eq!(
+            sink.durable_upto(),
+            0,
+            "a sync that has not landed is not one"
+        );
+        poll_until_durable(&mut sink, 64);
+
+        // And an idle shard still does not touch the device.
+        for _ in 0..10 {
+            sink.sync().unwrap();
+            sink.poll().unwrap();
+        }
+        assert_eq!(sink.syncs(), 1, "ten idle ticks and one real sync");
+    }
+
+    #[cfg_attr(
+        miri,
+        ignore = "a real ring and a real file, neither of which Miri has"
+    )]
+    #[test]
+    fn a_log_switches_to_the_ring_before_its_first_write_and_not_after() {
+        let t = Tmp::new("ringlate");
+        let mut db = Yo::create(&t.0, &CreateOptions::default()).unwrap();
+        let mut sink = db.log(0).unwrap();
+        sink.use_ring(&RingConfig::plain()).unwrap();
+        assert!(sink.use_ring(&RingConfig::plain()).is_err(), "twice");
+
+        let mut plain = db.log(0).unwrap();
+        put_page(&mut plain, 0, 0x44);
+        assert!(
+            plain.use_ring(&RingConfig::plain()).is_err(),
+            "after a write"
+        );
+    }
+
+    /// The whole stack over the ring: records in, checkpoint, reopen, records
+    /// out. Group commit still groups, and the parked callers still get their
+    /// answer, they just get it from `poll` instead of from `sync`.
+    #[cfg_attr(
+        miri,
+        ignore = "a real ring and a real file, neither of which Miri has"
+    )]
+    #[test]
+    fn a_ringed_log_survives_being_closed_and_reopened() {
+        let t = Tmp::new("ringreopen");
+        let keys: Vec<String> = (0..50u32).map(|i| format!("key:{i}")).collect();
+        let values: Vec<String> = (0..50u32).map(|i| format!("value number {i}")).collect();
+
+        let (tail, epoch, addrs) = {
+            let mut db = Yo::create(&t.0, &CreateOptions::default()).unwrap();
+            let mut sink = db.log(0).unwrap();
+            sink.use_ring(&RingConfig::plain()).unwrap();
+            let mut log = Log::open(cfg(0), sink, 0).unwrap();
+            let h = RecordHeader::new(RecordKind::String);
+            let mut addrs = Vec::new();
+            let mut parked = Vec::new();
+            for (k, v) in keys.iter().zip(&values) {
+                let a = log.append(&h, k.as_bytes(), v.as_bytes()).unwrap();
+                addrs.push(a.addr);
+                if let yo_record::CommitAction::WaitFor(at) = a.action {
+                    parked.push(at);
+                }
+            }
+            assert_eq!(parked.len(), 50, "group mode answers nobody early");
+
+            log.advance_epoch();
+            log.commit_pending().unwrap();
+            let last = parked.iter().copied().max().unwrap();
+            for _ in 0..100_000 {
+                log.poll().unwrap();
+                if log.durable_upto() >= last {
+                    break;
+                }
+            }
+            assert!(
+                parked.iter().all(|&at| at <= log.durable_upto()),
+                "somebody is still parked after the commit landed"
+            );
+
+            let tail = log.tail();
+            let epoch = log.epoch();
+            let entries = [log.checkpoint_entry(0, 0, keys.len() as u64)];
+            drop(log);
+
+            db.checkpoint(&Checkpoint {
+                clean_shutdown: true,
+                ..Checkpoint::new(&entries)
+            })
+            .unwrap();
+            (tail, epoch, addrs)
+        };
+
+        let mut db = Yo::open(&t.0).unwrap();
+        assert!(db.was_clean());
+        let entry = db.checkpoint_entry(0).unwrap();
+        assert_eq!(entry.log_tail, tail);
+        assert_eq!(entry.epoch, epoch);
+
+        let sink = db.log(0).unwrap();
+        let log = Log::recover(cfg(0), sink, entry.log_tail).unwrap();
+        for ((a, k), v) in addrs.iter().zip(&keys).zip(&values) {
+            let r = log.read(*a).unwrap();
+            assert_eq!(r.key, k.as_bytes());
+            assert_eq!(r.value, v.as_bytes());
+        }
     }
 
     #[test]
