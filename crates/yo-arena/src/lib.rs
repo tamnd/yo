@@ -590,10 +590,18 @@ impl Arena {
     ///
     /// The per segment ratio says which segment, this says whether. Without it
     /// a store with one half dead segment out of forty compacts that segment,
-    /// gains 2 MiB it did not need and pays for it on a command path. With it,
-    /// nothing moves until the process is holding about a third more than it is
-    /// keeping.
-    pub const GARBAGE_RATIO: f64 = 0.25;
+    /// gains 2 MiB it did not need and pays for it on a command path.
+    ///
+    /// An eighth, which is where it stops mattering. In the steady state a
+    /// store holds about `live / (1 - this)`, so an eighth is a seventh more
+    /// than it is keeping. Going lower buys nothing, because below this the
+    /// binding constraint is [`Arena::COMPACT_RATIO`]: no segment qualifies
+    /// until one of them is a quarter dead, and until one does there is nothing
+    /// to compact however keen this is to start. Measured over 100000 keys of
+    /// 64 bytes rewritten between four and thirteen times, a quarter holds 7
+    /// segments, an eighth holds 6, and a sixteenth and a thirty second hold 7
+    /// again. Run time was the same to the tenth of a second at every one.
+    pub const GARBAGE_RATIO: f64 = 0.125;
 
     /// Segments whose dead byte fraction has passed [`Arena::COMPACT_RATIO`].
     ///
