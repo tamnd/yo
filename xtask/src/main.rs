@@ -5,6 +5,7 @@
 //! ```text
 //! cargo xtask generate   write api.model.json and include/yo.h
 //! cargo xtask check      regenerate in memory and fail on a diff
+//! cargo xtask reserve    the registry name audit, in xtask/reserve.py
 //! ```
 //!
 //! `check` is what CI runs. Generated files are checked in so that a binding
@@ -17,6 +18,12 @@
 //! and a command that claims a divergence has to name a row that is in it. Both
 //! rules are in `12` sections 3 and 10, and neither is worth writing down
 //! unless something enforces it.
+//!
+//! `reserve` is the odd one out: it is a Python program that this command only
+//! launches. `dx/16` §10 has the argument, and the short version is that doing
+//! it in Rust means an HTTP client, a TLS stack and a JSON parser in a
+//! workspace whose dependency list is short enough that a user can read it, for
+//! the sake of a tool that runs once a week.
 
 mod emit_header;
 mod emit_model;
@@ -60,13 +67,45 @@ fn main() {
     match cmd.as_deref() {
         Some("generate") => generate(),
         Some("check") => check(),
+        Some("reserve") => reserve(),
         Some(other) => {
             eprintln!("unknown command: {other}");
-            eprintln!("usage: cargo xtask [generate|check]");
+            eprintln!("usage: cargo xtask [generate|check|reserve]");
             process::exit(2);
         }
         None => {
-            eprintln!("usage: cargo xtask [generate|check]");
+            eprintln!("usage: cargo xtask [generate|check|reserve]");
+            process::exit(2);
+        }
+    }
+}
+
+/// Hands everything after `reserve` to `xtask/reserve.py` and exits with its
+/// status.
+///
+/// The exit code is forwarded rather than collapsed to zero or one, because
+/// `reserve verify` uses three of them and the difference is the point: 0 is
+/// held, 1 is a name lost or transferred, and 2 is a probe that could not get
+/// an answer at all. A wrapper that turned 2 into 1 would be reintroducing the
+/// bug `dx/16` §10 property 3 was written about.
+fn reserve() {
+    let script = root().join("xtask").join("reserve.py");
+    let args: Vec<String> = std::env::args().skip(2).collect();
+
+    // `python3` and not `python`. On a machine where both exist, `python` is as
+    // likely to be a 2.7 that dies on the first f-string as anything else, and
+    // the error it gives says "invalid syntax" rather than "wrong interpreter".
+    let status = process::Command::new("python3")
+        .arg(&script)
+        .args(&args)
+        .status();
+
+    match status {
+        Ok(s) => process::exit(s.code().unwrap_or(1)),
+        Err(e) => {
+            eprintln!("could not run {}: {e}", script.display());
+            eprintln!("It needs python3 on PATH and nothing else: no pip, no venv,");
+            eprintln!("no third-party packages. See dx/16 section 10.");
             process::exit(2);
         }
     }

@@ -155,6 +155,14 @@ const DOUBLE_INT_LIMIT: f64 = 4_503_599_627_370_496.0; // 2^52
 /// This lives here for the same reason [`parse_i64`] does. It is not a codec
 /// question, it is the same question the string type asks of a stored value,
 /// and the storage layer cannot reach into the wire layer to ask it.
+///
+/// It also takes hexadecimal, because `strtold` does and Redis inherits every
+/// bit of that. `INCRBYFLOAT` on a key holding `0x10` counts from sixteen on a
+/// real server, and `INCRBYFLOAT key 0x10` adds sixteen. Nobody designed that
+/// and it is unlikely anyone relies on it, but a client that sends it gets an
+/// answer from Redis and an error from us, and telling a client its value is
+/// not a valid float when the server next door accepts it is the kind of
+/// difference that gets found in production rather than in a test.
 pub fn parse_f64(s: &[u8]) -> Option<f64> {
     if s.is_empty() || s[0].is_ascii_whitespace() {
         return None;
@@ -163,8 +171,113 @@ pub fn parse_f64(s: &[u8]) -> Option<f64> {
     if text.trim() != text {
         return None;
     }
-    let v: f64 = text.parse().ok()?;
+    let v = if is_hex(text) {
+        parse_hex_f64(text)?
+    } else {
+        text.parse().ok()?
+    };
     if v.is_nan() { None } else { Some(v) }
+}
+
+/// Does this start the way a C hexadecimal float does?
+///
+/// Only the prefix is checked here. Whether the rest of it is a number at all
+/// is [`parse_hex_f64`]'s problem, and a string that starts `0x` and continues
+/// badly has to be refused rather than falling back to the decimal parser,
+/// which would read `0xzz` as a plain zero.
+fn is_hex(text: &str) -> bool {
+    let body = text.strip_prefix(['+', '-']).unwrap_or(text).as_bytes();
+    body.len() > 2 && body[0] == b'0' && (body[1] | 0x20) == b'x'
+}
+
+/// `0x1.8p1` and the rest of C's hexadecimal float syntax.
+///
+/// The binary exponent is optional, which it is not in a C source literal but
+/// is in `strtod`, so `0x10` on its own is sixteen. The mantissa is gathered
+/// into a `u64` until it is full and after that the digits only move the
+/// exponent, which costs nothing anyone will see: sixteen hex digits is more
+/// precision than a double has to give back.
+fn parse_hex_f64(text: &str) -> Option<f64> {
+    let (negative, rest) = match text.as_bytes()[0] {
+        b'-' => (true, &text[1..]),
+        b'+' => (false, &text[1..]),
+        _ => (false, text),
+    };
+    let body = &rest[2..]; // `is_hex` already checked the `0x`.
+
+    let mut mantissa: u64 = 0;
+    let mut exponent: i32 = 0;
+    let mut digits = 0usize;
+    let mut seen_point = false;
+    let mut at = 0usize;
+    let bytes = body.as_bytes();
+
+    while at < bytes.len() {
+        let c = bytes[at];
+        if c == b'.' {
+            if seen_point {
+                return None;
+            }
+            seen_point = true;
+            at += 1;
+            continue;
+        }
+        let Some(value) = (c as char).to_digit(16) else {
+            break;
+        };
+        digits += 1;
+        if mantissa <= u64::MAX >> 4 {
+            mantissa = (mantissa << 4) | u64::from(value);
+            if seen_point {
+                exponent -= 4;
+            }
+        } else if !seen_point {
+            // Past what a `u64` holds, a digit before the point is worth four
+            // more binary places and nothing else.
+            exponent += 4;
+        }
+        at += 1;
+    }
+    if digits == 0 {
+        return None;
+    }
+
+    if at < bytes.len() {
+        // A binary exponent, and it is the only thing allowed to be here.
+        if (bytes[at] | 0x20) != b'p' {
+            return None;
+        }
+        let written: i32 = rest[2 + at + 1..].parse().ok()?;
+        exponent = exponent.checked_add(written)?;
+    }
+
+    let value = (mantissa as f64) * exp2(exponent);
+    // An overflow to infinity is refused rather than stored. Redis refuses it
+    // too, at a much higher ceiling, and that gap is in the divergence register
+    // rather than pretended away here.
+    if !value.is_finite() {
+        return None;
+    }
+    Some(if negative { -value } else { value })
+}
+
+/// Two to the power of a whole number, without `std`.
+///
+/// `powi` is not in core, and the exponent can be far enough out that squaring
+/// up from one would take a while, so this walks the bits. A power that is out
+/// of range comes back as an infinity and the caller refuses it.
+fn exp2(mut n: i32) -> f64 {
+    let mut base = if n < 0 { 0.5 } else { 2.0 };
+    n = n.abs();
+    let mut out = 1.0f64;
+    while n > 0 {
+        if n & 1 == 1 {
+            out *= base;
+        }
+        base *= base;
+        n >>= 1;
+    }
+    out
 }
 
 /// Appends a double the way Redis 8 writes one.
@@ -312,6 +425,42 @@ mod tests {
         assert_eq!(parse_f64(b"3.5x"), None);
         assert_eq!(parse_f64(b""), None);
         assert_eq!(parse_f64(b"nan"), None);
+    }
+
+    #[test]
+    fn the_float_parser_takes_hexadecimal_because_strtold_does() {
+        // Every one of these was read off a real 8.10.1 before it was written
+        // down here.
+        assert_eq!(parse_f64(b"0x10"), Some(16.0));
+        assert_eq!(parse_f64(b"0X10"), Some(16.0));
+        assert_eq!(parse_f64(b"0X1p4"), Some(16.0));
+        assert_eq!(parse_f64(b"0x1.8p1"), Some(3.0));
+        assert_eq!(parse_f64(b"-0x1.8p1"), Some(-3.0));
+        assert_eq!(parse_f64(b"+0x10"), Some(16.0));
+        assert_eq!(parse_f64(b"0x1p-1"), Some(0.5));
+        assert_eq!(parse_f64(b"0xff"), Some(255.0));
+
+        // A string that starts like a hexadecimal number and then stops being
+        // one is refused rather than falling through to the decimal parser,
+        // which would read the leading zero and call it a day.
+        assert_eq!(parse_f64(b"0x"), None);
+        assert_eq!(parse_f64(b"0xzz"), None);
+        assert_eq!(parse_f64(b"0x1p"), None);
+        assert_eq!(parse_f64(b"0x1.2.3"), None);
+        assert_eq!(parse_f64(b"0x10x"), None);
+        assert_eq!(parse_f64(b"0x1p99999"), None);
+    }
+
+    #[test]
+    fn a_mantissa_longer_than_a_double_still_lands_in_the_right_place() {
+        // Seventeen hex digits, one more than a u64 holds. The digits past the
+        // end are worth four binary places each and nothing else, which is all
+        // a double can use them for anyway.
+        assert_eq!(
+            parse_f64(b"0x10000000000000000"),
+            Some(18446744073709551616.0)
+        );
+        assert_eq!(parse_f64(b"0x1p1024"), None);
     }
 
     #[test]

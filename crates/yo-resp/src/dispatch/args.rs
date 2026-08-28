@@ -171,6 +171,11 @@ pub fn invalid_expire(name: &str) -> Error {
 
 /// `ERR unknown command 'X', with args beginning with: 'a' 'b' `.
 ///
+/// With no arguments at all the sentence stops early, at `unknown command 'X'`,
+/// and that is a real difference and not a tidier way of saying the same thing.
+/// Redis 8.10.1 answers a bare `NOTACOMMAND` without the second clause, and we
+/// were sending it with an empty list hanging off the end.
+///
 /// Redis quotes each argument, separates them with a space and leaves the
 /// trailing one, which looks like an oversight and is not worth diverging
 /// over. It stops once the argument list reaches 128 bytes rather than echoing
@@ -190,7 +195,11 @@ pub fn unknown_command(args: Args<'_>) -> Error {
     yo_alloc::allow(|| {
         let mut msg = String::from("unknown command '");
         msg.push_str(&String::from_utf8_lossy(args.name()));
-        msg.push_str("', with args beginning with: ");
+        msg.push('\'');
+        if args.len() == 1 {
+            return Error::new(Code::Unsupported, msg);
+        }
+        msg.push_str(", with args beginning with: ");
         let start = msg.len();
         for i in 1..args.len() {
             let used = msg.len() - start;
@@ -250,6 +259,17 @@ mod tests {
             e.message(),
             "unknown command 'NOPE', with args beginning with: 'a' 'b' "
         );
+    }
+
+    #[test]
+    fn a_command_with_no_arguments_gets_the_short_sentence() {
+        let wire = encode(&[b"NOPE"]);
+        let mut argv = Argv::new();
+        argv.decode(&wire, &Limits::default()).unwrap();
+        let e = unknown_command(Args::new(&argv, &wire));
+        // Checked against a real 8.10.1. The second clause is not there at all,
+        // rather than being there with nothing after it.
+        assert_eq!(e.message(), "unknown command 'NOPE'");
     }
 
     #[test]

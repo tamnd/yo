@@ -68,8 +68,16 @@ jobs:
       - run: cargo test --workspace --locked
       - run: cargo test --workspace --locked --release
 
+  # `dx/12` §5 step 2: the release does not go out under a name the project has
+  # stopped owning. This calls the weekly workflow rather than repeating its two
+  # commands, so there is one definition of the check and no way for the release
+  # copy and the weekly copy to drift apart.
+  names:
+    needs: check
+    uses: ./.github/workflows/names.yml
+
   publish:
-    needs: [check, verify]
+    needs: [check, verify, names]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7.0.1
