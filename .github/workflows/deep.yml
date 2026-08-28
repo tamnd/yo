@@ -17,7 +17,8 @@ name: deep
 # Reproducing a Miri shard locally is one shard at a time:
 #
 #     MIRIFLAGS="-Zmiri-strict-provenance -Zmiri-disable-isolation" \
-#       cargo +nightly miri test --locked -p yo-record -- --skip compact::
+#       cargo +nightly miri nextest run --locked -p yo-record --test-threads 4 \
+#         -E 'not test(/^compact::/)'
 #
 # One at a time and not the whole matrix at once. Miri holds the interpreted
 # program's whole heap, and eleven of them side by side will take every
@@ -75,12 +76,17 @@ jobs:
       - id: shards
         run: |
           rm rust-toolchain.toml
+          # The filter is its own field rather than part of an args string. A
+          # nextest filter needs single quotes around it in the shell, and a
+          # single quote inside this jq program would close the program instead,
+          # which is a syntax error the runner reports six lines away from the
+          # cause. The run step below adds the quotes where they belong.
           echo "list=$(cargo metadata --no-deps --format-version 1 | jq -c '
             [ .packages[].name
               | select(. != "yo-record")
-              | {id: ., args: "--locked -p \(.)"} ]
-            + [ {id: "yo-record-compact", args: "--locked -p yo-record -E 'test(/^compact::/)'"},
-                {id: "yo-record-rest", args: "--locked -p yo-record -E 'not test(/^compact::/)'"} ]
+              | {id: ., pkg: ., filter: ""} ]
+            + [ {id: "yo-record-compact", pkg: "yo-record", filter: "test(/^compact::/)"},
+                {id: "yo-record-rest", pkg: "yo-record", filter: "not test(/^compact::/)"} ]
             | sort_by(.id)')" >> "$GITHUB_OUTPUT"
       - run: echo "deep checks requested for ${{ github.event.inputs.ref || github.ref }}"
 
@@ -113,7 +119,7 @@ jobs:
     if: needs.wanted.outputs.run == 'true'
     name: miri (${{ matrix.borrows }}, ${{ matrix.shard.id }})
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 25
     strategy:
       # One shard failing is a real finding and every other shard's result is
       # still worth having, so a failure does not cancel its siblings.
@@ -147,7 +153,12 @@ jobs:
       # Pinned to four rather than left to follow the core count, so that a
       # bigger runner cannot quietly turn this into sixteen interpreters and an
       # out of memory kill that reads like a hang.
-      - run: cargo miri nextest run ${{ matrix.shard.args }} --test-threads 4
+      - run: |
+          if [ -n "${{ matrix.shard.filter }}" ]; then
+            cargo miri nextest run --locked -p ${{ matrix.shard.pkg }} --test-threads 4 -E '${{ matrix.shard.filter }}'
+          else
+            cargo miri nextest run --locked -p ${{ matrix.shard.pkg }} --test-threads 4
+          fi
         env:
           MIRIFLAGS: ${{ matrix.flags }}
 
@@ -212,7 +223,7 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 45
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v7.0.1
         with:
@@ -228,7 +239,7 @@ jobs:
     needs: wanted
     if: needs.wanted.outputs.run == 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v7.0.1
         with:
@@ -244,7 +255,7 @@ jobs:
     needs: wanted
     if: needs.wanted.outputs.run == 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v7.0.1
         with:
