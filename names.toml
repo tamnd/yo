@@ -305,6 +305,101 @@ owner     = "tamnd"
 fallback  = ""
 note      = "exists"
 
+# The other nine repositories the project already owns. They were absent for no
+# better reason than that the first pass listed the ones that were being created
+# that day, so the weekly check watched six of the fifteen names a transfer or a
+# rename could take out from under us.
+
+[[name]]
+registry  = "github"
+name      = "yo-c"
+namespace = "tamnd"
+state     = "reserved"
+probed    = "2026-08-28"
+owner     = "tamnd"
+fallback  = ""
+note      = "exists"
+
+[[name]]
+registry  = "github"
+name      = "yo-python"
+namespace = "tamnd"
+state     = "reserved"
+probed    = "2026-08-28"
+owner     = "tamnd"
+fallback  = ""
+note      = "exists"
+
+[[name]]
+registry  = "github"
+name      = "yo-node"
+namespace = "tamnd"
+state     = "reserved"
+probed    = "2026-08-28"
+owner     = "tamnd"
+fallback  = ""
+note      = "exists"
+
+[[name]]
+registry  = "github"
+name      = "yo-java"
+namespace = "tamnd"
+state     = "reserved"
+probed    = "2026-08-28"
+owner     = "tamnd"
+fallback  = ""
+note      = "exists"
+
+[[name]]
+registry  = "github"
+name      = "yo-dotnet"
+namespace = "tamnd"
+state     = "reserved"
+probed    = "2026-08-28"
+owner     = "tamnd"
+fallback  = ""
+note      = "exists"
+
+[[name]]
+registry  = "github"
+name      = "yo-kit"
+namespace = "tamnd"
+state     = "reserved"
+probed    = "2026-08-28"
+owner     = "tamnd"
+fallback  = ""
+note      = "exists"
+
+[[name]]
+registry  = "github"
+name      = "yo-web"
+namespace = "tamnd"
+state     = "reserved"
+probed    = "2026-08-28"
+owner     = "tamnd"
+fallback  = ""
+note      = "exists"
+
+[[name]]
+registry  = "github"
+name      = "yo-bench"
+namespace = "tamnd"
+state     = "reserved"
+probed    = "2026-08-28"
+owner     = "tamnd"
+fallback  = ""
+note      = "exists"
+
+[[name]]
+registry  = "github"
+name      = "yo-compat"
+namespace = "tamnd"
+state     = "reserved"
+probed    = "2026-08-28"
+owner     = "tamnd"
+fallback  = ""
+note      = "exists"
+
 [[name]]
 registry  = "dns"
 name      = "tamnd.com"

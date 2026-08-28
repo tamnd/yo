@@ -631,7 +631,7 @@ bounded = "inherent"
 status = "shipped"
 wire = "verified"
 divergent = "D-12"
-notes = "Only the fields this layer can stand behind. There is no rdb_last_save_time because there is no save, and a field that is not there is a client falling back rather than a client believing a zero."
+notes = "Only the fields this layer can stand behind. There is no rdb_last_save_time because there is no save, and a field that is not there is a client falling back rather than a client believing a zero. The CPU section was absent for the same reason and is there now, from one getrusage call, because Redis's own unit/info-command asks for used_cpu_user by name and because a monitoring tool graphs it against wall clock to tell a busy server from a waiting one."
 
 [[command]]
 name = "DBSIZE"

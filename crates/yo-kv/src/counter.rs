@@ -192,7 +192,13 @@ pub fn apply(current: Num, opts: &IncrEx) -> Result<Counted> {
             Ok(match out {
                 Some(v) => Counted {
                     value: Num::Int(v),
-                    applied: Num::Int(v.saturating_sub(now)),
+                    // The result fits and the distance travelled to get there
+                    // may not, which only happens when `SATURATE` throws the
+                    // value across most of the range in one call: from near
+                    // `i64::MAX` down onto a bound near `i64::MIN`, or back.
+                    // Redis refuses that rather than reporting a wrapped
+                    // amount, and refusing means the key is not written either.
+                    applied: Num::Int(v.checked_sub(now).ok_or_else(applied_overflow)?),
                     stored: true,
                 },
                 None => Counted {
@@ -248,6 +254,17 @@ pub fn apply(current: Num, opts: &IncrEx) -> Result<Counted> {
 /// silently refusing every increment forever is a hard bug to find.
 fn bounds_crossed() -> Error {
     Error::new(Code::Invalid, "LBOUND can't be greater than UBOUND")
+}
+
+/// What a real 8.10.1 says when the amount applied would not fit in an `i64`.
+///
+/// The reply reports both the new value and how much of the increment was
+/// really applied, and `SATURATE` can land on a bound so far from where the
+/// value was that the distance between them does not fit. Reporting a wrapped
+/// number there would be worse than refusing: a client that adds `applied` to
+/// what it thought the value was would get an answer that is not the value.
+fn applied_overflow() -> Error {
+    Error::new(Code::Invalid, "applied increment would overflow")
 }
 
 #[cfg(test)]
@@ -314,6 +331,38 @@ mod tests {
         let down = apply(int(i64::MIN), &IncrEx::PLAIN.by(int(-1)).saturating()).unwrap();
         assert_eq!(down.value, int(i64::MIN));
         assert_eq!(down.applied, int(0));
+    }
+
+    #[test]
+    fn an_amount_applied_that_does_not_fit_is_refused_rather_than_wrapped() {
+        // Found by Redis's own unit/type/increx. The result lands on UBOUND,
+        // which fits, and the distance from where the value was to that bound
+        // is more than an i64 holds. A real 8.10.1 refuses and leaves the key
+        // alone, where we used to report a wrapped amount.
+        let opts = IncrEx::PLAIN
+            .by(int(1))
+            .between(None, Some(int(i64::MIN)))
+            .saturating();
+        let e = apply(int(i64::MAX - 7), &opts).unwrap_err();
+        assert_eq!(e.message(), "applied increment would overflow");
+
+        // The same distance the other way.
+        let up = IncrEx::PLAIN
+            .by(int(-1))
+            .between(Some(int(i64::MAX)), None)
+            .saturating();
+        assert!(apply(int(i64::MIN + 7), &up).is_err());
+
+        // A saturation that lands far away but still inside an i64 is fine, so
+        // this is about the amount and not about the distance being large.
+        let ok = IncrEx::PLAIN
+            .by(int(1))
+            .between(None, Some(int(i64::MIN + 8)))
+            .saturating();
+        let c = apply(int(-3), &ok).unwrap();
+        assert_eq!(c.value, int(i64::MIN + 8));
+        assert_eq!(c.applied, int(i64::MIN + 11));
+        assert!(c.stored);
     }
 
     #[test]

@@ -15,6 +15,10 @@ yo-common = { workspace = true }
 yo-kv = { workspace = true }
 yo-reactor = { workspace = true }
 
+# Only INFO cpu needs it, through one getrusage call, and only on Unix.
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }
+
 [dev-dependencies]
 criterion = { workspace = true }
 

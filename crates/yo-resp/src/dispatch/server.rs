@@ -16,7 +16,7 @@
 
 use super::args::{self, Args, is};
 use super::table::{self, Spec};
-use super::{DATABASES, Flow, Server, Session};
+use super::{DATABASES, Flow, Server, Session, cpu};
 use crate::proto::Proto;
 use crate::reply::Out;
 use core::fmt::Write;
@@ -508,9 +508,15 @@ fn config(server: &mut Server, args: Args<'_>, out: &mut Out) -> Result<()> {
 /// `INFO [section ...]`.
 ///
 /// Every number in here is one this layer can actually answer. There is no
-/// `rdb_last_save_time` because there is no save, and no `used_cpu_sys` because
-/// nothing measures it, and a field that is not there is a client falling back
-/// rather than a client believing a zero.
+/// `rdb_last_save_time` because there is no save, and a field that is not there
+/// is a client falling back rather than a client believing a zero.
+///
+/// The `CPU` section used to be missing for the same reason and is here now,
+/// because nothing measured it and then something did. It is one `getrusage`
+/// call in [`super::cpu`], and the reason it went in is that Redis's own
+/// `unit/info-command` tests fail without it: a monitoring tool graphs
+/// processor time against wall clock to decide whether a server is busy or
+/// waiting, so an absent field there is a real hole and not a tidy omission.
 fn info(server: &Server, args: Args<'_>, out: &mut Out) {
     let want = |section: &str| {
         args.len() == 1
@@ -564,6 +570,21 @@ fn info(server: &Server, args: Args<'_>, out: &mut Out) {
                 server.stats.commands,
                 server.expired_keys(),
             );
+        }
+        if want("cpu") {
+            // Two of Redis's six are not here. `used_cpu_sys_main_thread` and
+            // `used_cpu_user_main_thread` need `RUSAGE_THREAD`, which is Linux
+            // only, and reporting the process totals under a name that says
+            // main thread would be right on a single threaded server and wrong
+            // on the one this becomes.
+            if let Some(u) = cpu::usage() {
+                let _ = write!(
+                    s,
+                    "# CPU\r\nused_cpu_sys:{:.6}\r\nused_cpu_user:{:.6}\r\n\
+                     used_cpu_sys_children:{:.6}\r\nused_cpu_user_children:{:.6}\r\n\r\n",
+                    u.sys, u.user, u.sys_children, u.user_children,
+                );
+            }
         }
         if want("replication") {
             s.push_str("# Replication\r\nrole:master\r\nconnected_slaves:0\r\n\r\n");

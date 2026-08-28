@@ -1325,9 +1325,87 @@ JAVA_HOME = next(
 )
 
 
+def b_npm(row, root, version, desc):
+    """npm, through `npm publish`.
+
+    This builder exists because the npm placeholder was published by hand and
+    ended up carrying a different sentence from the other five. Nobody noticed
+    until the package was installed on a machine that had never seen it, which
+    is exactly the check `dx/12` §1 is for and exactly the reason a builder that
+    generates the text beats a person retyping it.
+
+    The already-published `@yodb/core@0.0.0` is not corrected by this. npm never
+    lets a version number be reused, not even after an unpublish inside the
+    72-hour window, so the choice was between burning the number and leaving one
+    divergent string in one ecosystem. The divergence is recorded in `dx/16` §6
+    and this builder is what stops it recurring at the next publish.
+
+    The package name is `@yodb/core`, the one exception to one-name-everywhere,
+    so it is assembled from the row's namespace rather than from its name.
+    """
+    pkg = f"{row.namespace}/{row.name}"
+
+    _w(root, "package.json", json.dumps({
+        "name": pkg,
+        "version": version,
+        "description": desc,
+        "license": LICENSE_LINE,
+        "homepage": REPO,
+        "repository": {"type": "git", "url": f"git+{REPO}.git"},
+        "bugs": {"url": f"{REPO}/issues"},
+        "author": row.owner,
+        "type": "module",
+        "main": "./index.js",
+        "exports": {".": "./index.js"},
+        "files": ["index.js", "README.md"],
+        "engines": {"node": ">=20"},
+        "keywords": ["database", "embedded", "placeholder"],
+        "publishConfig": {"access": "public"},
+    }, indent=2) + "\n")
+    _w(root, "README.md", _readme(desc, PLACEHOLDER_BODY))
+    _w(root, "index.js", f'''
+// {desc}
+//
+// {MILESTONE}
+//
+// Importing this module succeeds and does nothing, on purpose. A placeholder
+// that throws on import is a broken artifact in a stranger's dependency tree,
+// and that is a real cost to impose on somebody for the sake of holding a name.
+// Calling something is what tells you where you are.
+
+/** The message every placeholder in every ecosystem raises with. */
+export const NOT_YET = "{RAISES}";
+
+/**
+ * Opens a database. Always throws: this version is a reserved placeholder.
+ *
+ * It throws rather than returning undefined because an undefined here is
+ * indistinguishable from a database that failed to open.
+ */
+export function open(path) {{
+  throw new Error(NOT_YET);
+}}
+
+export default {{ NOT_YET, open }};
+'''.lstrip())
+
+    # npm reads the token from an .npmrc and not from a bare environment
+    # variable, and it expands ${NPM_TOKEN} inside one. Written into the build
+    # root rather than into ~/.npmrc so a publish run cannot leave a credential
+    # behind in the home directory of whatever machine it happened on.
+    _w(root, ".npmrc", "//registry.npmjs.org/:_authToken=${NPM_TOKEN}\n")
+
+    return (
+        [Step("pack and verify", ["npm", "pack", "--dry-run"], root)],
+        [Step("publish", ["npm", "publish", "--access", "public"], root,
+              loud=True)],
+    )
+
+
 BUILDERS = {
     "crates.io": b_crates,
     "pypi": b_pypi,
+    "npm": b_npm,
     "pub.dev": b_pub,
     "maven-central": b_maven,
     "nuget": b_nuget,
@@ -1337,6 +1415,7 @@ BUILDERS = {
 NEEDS = {
     "crates.io": ["CARGO_REGISTRY_TOKEN"],
     "pypi": ["UV_PUBLISH_TOKEN"],
+    "npm": ["NPM_TOKEN"],
     "pub.dev": ["PUB_CREDENTIALS"],
     "maven-central": [
         "MAVEN_CENTRAL_USERNAME", "MAVEN_CENTRAL_PASSWORD",
