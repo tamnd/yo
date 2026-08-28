@@ -1,4 +1,7 @@
-/target
+# Not `/target`. The fuzz directory is excluded from the workspace and so has a
+# build directory of its own, and the anchored form did not cover it, which is
+# how two hundred megabytes of object files ended up committed.
+target/
 **/*.rs.bk
 *.profraw
 /bench/results

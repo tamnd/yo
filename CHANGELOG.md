@@ -12,6 +12,12 @@ While the major is 0, a minor release may break anything, including the on-disk 
 - **One reply path for both protocols.** A command writes a map, a set or a push and the RESP2 downgrade happens in the codec rather than in the command. That is one place to test instead of three hundred, and it is what stops a command from working on one protocol and not the other.
 - **A resume state on the request decoder.** A value that arrives in ten thousand pieces is scanned once rather than ten thousand times. Without it a slow link makes the parser quadratic in the size of the value, which is a real denial of service on a real network rather than a theoretical one.
 - **A protocol fuzz target.** `12` section 11 point 3. It checks that no input panics or allocates from a count off the wire, that a decode reports exactly what it consumed, and that feeding the same bytes one at a time reaches the same verdict as feeding them all at once.
+- **A file fuzz target, which is the M1 exit gate the project did not have.** The gate is that the independent reader agrees with the engine on every file the fuzzer produces, and until now there was no fuzzer producing files. It builds a real `.yo` file from fuzzer chosen record shapes across up to four shards, walks it with the engine's own replay and with the independent reader, and compares both against what went in, then compares the superblock and the checkpoint entries field for field between the two sides.
+- **The hundred thousand fault crash gate, as a nightly job.** Every push runs twenty thousand faults, which catches a regression and fits the three minute budget. The gate number is a hundred thousand and now runs in `deep` across five shapes, so the number in the milestone is a number CI produces rather than one somebody ran once.
+
+### Fixed
+
+- **Two hundred megabytes of build artifacts were committed to the repository.** The fuzz directory is excluded from the workspace and has a build directory of its own, and `.gitignore` said `/target`, which is anchored to the root and did not cover it. 895 object files were tracked. They are untracked now and the pattern covers any depth. The history still carries them, so a clone is still large until somebody decides whether a rewrite is worth it.
 
 ## 0.3.0 — 2026-08-28
 

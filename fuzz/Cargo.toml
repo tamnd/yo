@@ -13,7 +13,11 @@ libfuzzer-sys = "0.4"
 arbitrary = { version = "1", features = ["derive"] }
 yo-arena = { path = "../crates/yo-arena" }
 yo-common = { path = "../crates/yo-common" }
+yo-file = { path = "../crates/yo-file" }
+yo-format = { path = "../crates/yo-format" }
 yo-index = { path = "../crates/yo-index" }
+yo-reader = { path = "../crates/yo-reader" }
+yo-record = { path = "../crates/yo-record" }
 yo-resp = { path = "../crates/yo-resp" }
 yo-shard = { path = "../crates/yo-shard" }
 
@@ -48,6 +52,13 @@ bench = false
 [[bin]]
 name = "resp"
 path = "fuzz_targets/resp.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "file"
+path = "fuzz_targets/file.rs"
 test = false
 doc = false
 bench = false
