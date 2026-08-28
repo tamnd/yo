@@ -103,9 +103,55 @@ pub(super) fn execute(
         "command" => command(args, out)?,
         "config" => config(server, args, out)?,
         "info" => info(server, args, out),
+        // A key that is past its deadline and has not been read since is still
+        // counted, which is what Redis does too: `DBSIZE` is the size of the
+        // dictionary and not a walk over it. Redis has an active expiry cycle
+        // that takes those keys out within a tick or so and we do not yet, so
+        // the two servers disagree for as long as a dead key sits unread. That
+        // gap closes with the maintenance slice rather than with a count here,
+        // because a count here would be O(N) on a command that is O(1)
+        // everywhere else.
+        "dbsize" => out.int(server.dbs[session.db].len() as i64),
+        "flushall" => {
+            flush_mode(args)?;
+            for db in &mut server.dbs {
+                db.clear();
+            }
+            out.ok();
+        }
+        "flushdb" => {
+            flush_mode(args)?;
+            server.dbs[session.db].clear();
+            out.ok();
+        }
         _ => return Err(args::unknown_command(args)),
     }
     Ok(Flow::Continue)
+}
+
+// ------------------------------------------------------------------- FLUSH
+
+/// Check the optional `ASYNC` or `SYNC` on `FLUSHALL` and `FLUSHDB`.
+///
+/// Both are accepted and neither changes anything. On a real server the choice
+/// is whether the freeing happens on the connection's thread or on the lazy
+/// free thread, and either way the keyspace is empty before the `OK` goes out.
+/// That is the whole of what a client can observe, and it is the same here,
+/// so taking the word and ignoring it is answering the question rather than
+/// pretending to.
+///
+/// # Errors
+///
+/// [`Code::Invalid`] for a third argument, or for a second that is neither
+/// word, which is what Redis says about both.
+fn flush_mode(args: Args<'_>) -> Result<()> {
+    if args.len() == 1 {
+        return Ok(());
+    }
+    if args.len() > 2 || !(is(args.get(1), b"async") || is(args.get(1), b"sync")) {
+        return Err(args::syntax());
+    }
+    Ok(())
 }
 
 // ------------------------------------------------------------------- HELLO

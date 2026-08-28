@@ -117,8 +117,11 @@ doc = "12 section 6"
 [[group]]
 name = "keyspace"
 expected = 20
-status = "planned"
+status = "partial"
 doc = "14"
+# DEL, UNLINK, EXISTS and TYPE are here in M2 and the other sixteen are in M3.
+# The four are not a random quarter of the group, they are what Redis's own test
+# suite needs before it will run one file.
 
 [[group]]
 name = "expiry"
@@ -442,6 +445,58 @@ wire = "verified"
 divergent = "D-11"
 notes = "INCREX key [BYINT n|BYFLOAT f] [SATURATE] [LBOUND l] [UBOUND u] [EX|PX|EXAT|PXAT|PERSIST] [ENX], checked against a real 8.8. A counter with a bound, a saturation policy and four things it can do to the deadline. The reply is the value and the amount applied, and a refused increment reports zero applied and does not create the key."
 
+# ------------------------------------------------------------------- keyspace
+#
+# Four of the twenty, and they are here in M2 rather than in M3 with the rest of
+# the group because Redis's own test suite cannot run a single file without
+# them. In external mode it says FLUSHALL before every start_server block and
+# gives up on the whole file if that fails, and most test bodies then say DEL to
+# get to a known state. The other sixteen land with the scans and the renames.
+
+[[command]]
+name = "DEL"
+group = "keyspace"
+since = "1.0.0"
+arity = -2
+plan = "point"
+bounded = "inherent"
+status = "shipped"
+wire = "verified"
+notes = "One probe and one free per key, and the reply is how many of them were there. A key named twice can only be deleted once, so the count is of keys removed and not of arguments matched."
+
+[[command]]
+name = "UNLINK"
+group = "keyspace"
+since = "4.0.0"
+arity = -2
+plan = "point"
+bounded = "inherent"
+status = "shipped"
+wire = "verified"
+notes = "The same body as DEL. On a real server the difference is which thread frees the memory, and what UNLINK promises a client is that the key is gone from the keyspace when the reply arrives, which is about visibility rather than about threads."
+
+[[command]]
+name = "EXISTS"
+group = "keyspace"
+since = "1.0.0"
+arity = -2
+plan = "metadata"
+bounded = "inherent"
+status = "shipped"
+wire = "verified"
+notes = "One probe per key, answering from the header without reading the value. A key named twice counts twice, which looks like a bug and is what Redis does."
+
+[[command]]
+name = "TYPE"
+group = "keyspace"
+since = "1.0.0"
+arity = 2
+plan = "metadata"
+bounded = "inherent"
+status = "shipped"
+wire = "verified"
+notes = "Answers string or none and nothing else yet, which is true rather than incomplete: there is nothing else in the store to answer with. It grows a case each time a type lands."
+
 # ----------------------------------------------------------------- connection
 
 [[command]]
@@ -547,3 +602,37 @@ status = "shipped"
 wire = "verified"
 divergent = "D-12"
 notes = "Only the fields this layer can stand behind. There is no rdb_last_save_time because there is no save, and a field that is not there is a client falling back rather than a client believing a zero."
+
+[[command]]
+name = "DBSIZE"
+group = "server"
+since = "1.0.0"
+arity = 1
+plan = "metadata"
+bounded = "inherent"
+status = "shipped"
+wire = "verified"
+divergent = "D-15"
+notes = "The size of the index, not a walk over it, which is what Redis does too. A key that is past its deadline and has not been read since is counted by both servers, and Redis then takes it out on its next active expiry tick where we wait for somebody to read it."
+
+[[command]]
+name = "FLUSHALL"
+group = "server"
+since = "1.0.0"
+arity = -1
+plan = "none"
+bounded = "inherent"
+status = "shipped"
+wire = "verified"
+notes = "A fresh index and a fresh arena per database rather than a walk that deletes each key in turn, because the one thing a client that has just said this is entitled to expect is the memory back. ASYNC and SYNC are both accepted and neither changes anything, since the keyspace is empty before the OK goes out either way."
+
+[[command]]
+name = "FLUSHDB"
+group = "server"
+since = "1.0.0"
+arity = -1
+plan = "none"
+bounded = "inherent"
+status = "shipped"
+wire = "verified"
+notes = "FLUSHALL on the one database this connection is on."

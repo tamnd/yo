@@ -116,3 +116,11 @@ reason = "A real server carries hundreds of settings and lets a client change mo
 status = "until"
 resolved_by = "M5"
 spec = "12 section 9"
+
+[[divergence]]
+id = "D-15"
+title = "DBSIZE counts a key that is past its deadline until somebody reads it"
+reason = "Both servers answer DBSIZE from the size of the index rather than by walking it, so both count keys that are past their deadline and have not been touched since. The difference is what happens next: Redis runs an active expiry cycle that takes a sample of them out every tick, and there is no active cycle here yet, so a dead key sits in the count until a read runs into it. Making DBSIZE walk the index instead would close the gap by turning an O(1) command into an O(N) one, which is the wrong trade for a number that is already approximate on a real server."
+status = "until"
+resolved_by = "M4"
+spec = "14 section 1"

@@ -102,6 +102,17 @@ impl RawMap {
         self.index.is_empty()
     }
 
+    /// Throw everything away and give the memory back.
+    ///
+    /// A fresh index and a fresh arena rather than a walk that deletes each key
+    /// in turn. Deleting one at a time would leave an arena the size of the
+    /// data that used to be in it and an index still grown to fit it, and the
+    /// one thing a client that has just said `FLUSHALL` is entitled to expect is
+    /// the memory back.
+    pub fn clear(&mut self) {
+        *self = RawMap::new();
+    }
+
     /// The hash this map files `key` under.
     ///
     /// Public because the batch walk in `04` section 3 hashes on the first walk
