@@ -124,3 +124,11 @@ reason = "Both servers answer DBSIZE from the size of the index rather than by w
 status = "until"
 resolved_by = "M4"
 spec = "14 section 1"
+
+[[divergence]]
+id = "D-16"
+title = "SCRIPT and FUNCTION answer for an empty cache and refuse the rest"
+reason = "There is no Lua here until M6, so nothing can be loaded and nothing can run. The subcommands that are exactly right on a server whose script cache and library set are empty are answered, which is SCRIPT FLUSH, SCRIPT EXISTS, FUNCTION FLUSH, FUNCTION LIST, FUNCTION DELETE and both HELPs. The ones that would need an interpreter are not there at all and report unknown subcommand, because an OK that did nothing is worse than an error: a client that loads a script and gets an OK believes it can call it. FUNCTION STATS is the borderline one and it is refused, since a real server lists LUA in its engines map and an empty map would be a different answer rather than the same one."
+status = "until"
+resolved_by = "M6"
+spec = "12 section 7"

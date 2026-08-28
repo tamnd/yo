@@ -590,7 +590,7 @@ fn info(server: &Server, args: Args<'_>, out: &mut Out) {
 // -------------------------------------------------------------------- help
 
 /// The `HELP` reply, which is an array of simple strings on both protocols.
-fn help(out: &mut Out, lines: &[&str]) {
+pub(super) fn help(out: &mut Out, lines: &[&str]) {
     out.array(lines.len());
     for line in lines {
         out.simple(line.as_bytes());
