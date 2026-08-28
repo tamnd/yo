@@ -10,7 +10,9 @@ homepage.workspace = true
 authors.workspace = true
 
 [dependencies]
+yo-alloc = { workspace = true }
 yo-common = { workspace = true }
+yo-kv = { workspace = true }
 
 [dev-dependencies]
 criterion = { workspace = true }

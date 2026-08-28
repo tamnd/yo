@@ -10,6 +10,7 @@ publish = false
 
 [dependencies]
 yo-common.workspace = true
+yo-resp.workspace = true
 
 [lints]
 workspace = true

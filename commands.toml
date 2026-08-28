@@ -12,6 +12,8 @@
 #   merge         reads more than one key and combines them
 #   metadata      answers from the header without reading the value
 #   whole-value   reads or rewrites the entire value
+#   none          touches no key at all, which only the connection and server
+#                 groups are allowed to claim
 #
 # bounded is one of:
 #   inherent      the answer is small whatever the value is
@@ -27,6 +29,19 @@
 # row that is not there fails the check.
 
 # ---------------------------------------------------------------- group budget
+#
+# A group's status is one of:
+#   shipped   every command in the group is listed here
+#   partial   some are, and the group is being worked through
+#   planned   none are yet
+#
+# The expected counts came out of a running Redis 8.8, from the group field of
+# COMMAND DOCS rather than from an ACL category. The two do not agree and the
+# group is the right one of the two: ACL counts every subcommand separately, so
+# it puts CLIENT at nineteen and OBJECT at five, and a container command is one
+# command to implement and one row here. The names on the left are ours and two
+# of them are splits of one of Redis's: what Redis calls generic is keyspace
+# plus expiry here, because they land in different milestones.
 
 [[group]]
 name = "string"
@@ -47,31 +62,31 @@ doc = "08 section 8"
 
 [[group]]
 name = "list"
-expected = 20
+expected = 22
 status = "planned"
 doc = "08 section 6"
 
 [[group]]
 name = "hash"
-expected = 27
+expected = 28
 status = "planned"
 doc = "08 section 3"
 
 [[group]]
 name = "set"
-expected = 16
+expected = 17
 status = "planned"
 doc = "08 section 4"
 
 [[group]]
 name = "zset"
-expected = 31
+expected = 35
 status = "planned"
 doc = "08 section 5"
 
 [[group]]
 name = "array"
-expected = 8
+expected = 18
 status = "planned"
 doc = "08 section 1"
 
@@ -83,31 +98,31 @@ doc = "08 section 7"
 
 [[group]]
 name = "hyperloglog"
-expected = 3
+expected = 5
 status = "planned"
 doc = "08 section 8"
 
 [[group]]
 name = "geo"
-expected = 8
+expected = 10
 status = "planned"
 doc = "08 section 8"
 
 [[group]]
 name = "pubsub"
-expected = 12
+expected = 9
 status = "planned"
 doc = "12 section 6"
 
 [[group]]
 name = "keyspace"
-expected = 23
+expected = 20
 status = "planned"
 doc = "14"
 
 [[group]]
 name = "expiry"
-expected = 12
+expected = 9
 status = "planned"
 doc = "14"
 
@@ -119,14 +134,20 @@ doc = "12 section 4"
 
 [[group]]
 name = "scripting"
-expected = 11
+expected = 8
 status = "planned"
 doc = "12 section 7"
 
 [[group]]
+name = "connection"
+expected = 8
+status = "partial"
+doc = "12 section 9"
+
+[[group]]
 name = "server"
-expected = 40
-status = "planned"
+expected = 31
+status = "partial"
 doc = "12 section 9"
 
 # --------------------------------------------------------------------- strings
@@ -139,7 +160,7 @@ arity = -3
 plan = "point"
 bounded = "inherent"
 status = "shipped"
-wire = "none"
+wire = "verified"
 divergent = "D-8"
 notes = "One record written, one freed. NX, XX and the four IF forms all decide against a single probe, and GET reports what that probe found whether or not the write went ahead. IFNE holds on a key that is not there, since a key that is not there is not equal to anything."
 
@@ -151,7 +172,7 @@ arity = 2
 plan = "point"
 bounded = "inherent"
 status = "shipped"
-wire = "none"
+wire = "verified"
 notes = "One probe. The value is handed back as a slice of the record it lives in, or as an integer that becomes digits only when the reply is written."
 
 [[command]]
@@ -162,7 +183,7 @@ arity = 3
 plan = "point"
 bounded = "inherent"
 status = "shipped"
-wire = "none"
+wire = "verified"
 notes = "The one string command that cannot avoid a copy, because the record the old value lived in is freed before the caller sees it."
 
 [[command]]
@@ -173,7 +194,7 @@ arity = 2
 plan = "point"
 bounded = "inherent"
 status = "shipped"
-wire = "none"
+wire = "verified"
 notes = "Copies for the same reason GETSET does."
 
 [[command]]
@@ -184,7 +205,7 @@ arity = -2
 plan = "point"
 bounded = "inherent"
 status = "shipped"
-wire = "none"
+wire = "verified"
 notes = "Adding or removing a deadline changes the record's length, so it is a rewrite and not an overwrite. Plain GETEX changes nothing and is a read."
 
 [[command]]
@@ -195,7 +216,7 @@ arity = 3
 plan = "point"
 bounded = "inherent"
 status = "shipped"
-wire = "none"
+wire = "verified"
 
 [[command]]
 name = "SETEX"
@@ -205,7 +226,7 @@ arity = 4
 plan = "point"
 bounded = "inherent"
 status = "shipped"
-wire = "none"
+wire = "verified"
 notes = "A zero or negative time to live is an error and not a delete."
 
 [[command]]
@@ -216,7 +237,7 @@ arity = 4
 plan = "point"
 bounded = "inherent"
 status = "shipped"
-wire = "none"
+wire = "verified"
 
 [[command]]
 name = "MSET"
@@ -226,7 +247,7 @@ arity = -3
 plan = "point"
 bounded = "inherent"
 status = "shipped"
-wire = "none"
+wire = "verified"
 divergent = "D-8"
 notes = "One point write per pair, in order."
 
@@ -238,7 +259,7 @@ arity = -3
 plan = "point"
 bounded = "inherent"
 status = "shipped"
-wire = "none"
+wire = "verified"
 divergent = "D-8"
 notes = "Every key is checked before anything is written, so a duplicate key inside one call does not defeat itself."
 
@@ -250,7 +271,7 @@ arity = -2
 plan = "point"
 bounded = "yes"
 status = "shipped"
-wire = "none"
+wire = "verified"
 notes = "Every dead key is reaped first, then the whole answer is read from a store nobody is going to mutate, which is what lets all the values borrow at once instead of being copied out one at a time."
 
 [[command]]
@@ -261,7 +282,7 @@ arity = 3
 plan = "whole-value"
 bounded = "risk"
 status = "shipped"
-wire = "none"
+wire = "verified"
 divergent = "D-8"
 notes = "Reads the value and writes it back with the tail attached, so repeated appends are quadratic in the final length. Redis amortises this with sds spare capacity and we do not yet. The band that fixes it is the log region in M5."
 
@@ -273,7 +294,7 @@ arity = 2
 plan = "metadata"
 bounded = "inherent"
 status = "shipped"
-wire = "none"
+wire = "verified"
 notes = "The record header carries the length, so nothing reads the value. An int encoded value counts its digits arithmetically rather than formatting them."
 
 [[command]]
@@ -284,7 +305,7 @@ arity = 4
 plan = "whole-value"
 bounded = "risk"
 status = "shipped"
-wire = "none"
+wire = "verified"
 divergent = "D-8"
 notes = "Same rewrite as APPEND, and a write past the end pads with zero bytes. A write of nothing to a key that is not there creates nothing and answers zero."
 
@@ -296,7 +317,7 @@ arity = 4
 plan = "point"
 bounded = "yes"
 status = "shipped"
-wire = "none"
+wire = "verified"
 notes = "Slices the record rather than copying it, except for an int encoded value whose digits do not exist anywhere until somebody asks."
 
 [[command]]
@@ -307,7 +328,7 @@ arity = 4
 plan = "point"
 bounded = "yes"
 status = "shipped"
-wire = "none"
+wire = "verified"
 notes = "The same command as GETRANGE under an older name, deprecated in Redis since 2.0.0 and still answered."
 
 [[command]]
@@ -318,7 +339,7 @@ arity = 2
 plan = "point"
 bounded = "inherent"
 status = "shipped"
-wire = "none"
+wire = "verified"
 notes = "One probe, one add, one eight byte store back into the record the probe landed on. No arena append, no free, no rehash. This is the command M2's gate is about."
 
 [[command]]
@@ -329,7 +350,7 @@ arity = 2
 plan = "point"
 bounded = "inherent"
 status = "shipped"
-wire = "none"
+wire = "verified"
 
 [[command]]
 name = "INCRBY"
@@ -339,7 +360,7 @@ arity = 3
 plan = "point"
 bounded = "inherent"
 status = "shipped"
-wire = "none"
+wire = "verified"
 
 [[command]]
 name = "DECRBY"
@@ -349,7 +370,7 @@ arity = 3
 plan = "point"
 bounded = "inherent"
 status = "shipped"
-wire = "none"
+wire = "verified"
 notes = "Carried through as a subtraction rather than turned into an addition, because negating first would overflow on i64::MIN."
 
 [[command]]
@@ -360,7 +381,7 @@ arity = 3
 plan = "whole-value"
 bounded = "inherent"
 status = "shipped"
-wire = "none"
+wire = "verified"
 notes = "The result is stored as text and never as an integer, because Redis reports embstr afterwards even when the number came out whole."
 
 [[command]]
@@ -420,3 +441,109 @@ status = "shipped"
 wire = "verified"
 divergent = "D-11"
 notes = "INCREX key [BYINT n|BYFLOAT f] [SATURATE] [LBOUND l] [UBOUND u] [EX|PX|EXAT|PXAT|PERSIST] [ENX], checked against a real 8.8. A counter with a bound, a saturation policy and four things it can do to the deadline. The reply is the value and the amount applied, and a refused increment reports zero applied and does not create the key."
+
+# ----------------------------------------------------------------- connection
+
+[[command]]
+name = "PING"
+group = "connection"
+since = "1.0.0"
+arity = -1
+plan = "none"
+bounded = "inherent"
+status = "shipped"
+wire = "verified"
+notes = "The table says a minimum of one and a real server then refuses a third argument as a wrong number of them, which the arity alone does not say."
+
+[[command]]
+name = "ECHO"
+group = "connection"
+since = "1.0.0"
+arity = 2
+plan = "none"
+bounded = "inherent"
+status = "shipped"
+wire = "verified"
+
+[[command]]
+name = "HELLO"
+group = "connection"
+since = "6.0.0"
+arity = -1
+plan = "none"
+bounded = "inherent"
+status = "shipped"
+wire = "verified"
+divergent = "D-12"
+notes = "AUTH is accepted for the default user with any password, which is how a real server with no requirepass behaves. The reply goes out in the protocol just agreed rather than the one the request arrived in."
+
+[[command]]
+name = "SELECT"
+group = "connection"
+since = "1.0.0"
+arity = 2
+plan = "none"
+bounded = "inherent"
+status = "shipped"
+wire = "verified"
+notes = "Sixteen databases, and the number is fixed for the life of the process, so CONFIG GET databases answers from a constant."
+
+[[command]]
+name = "RESET"
+group = "connection"
+since = "6.2.0"
+arity = 1
+plan = "none"
+bounded = "inherent"
+status = "shipped"
+wire = "verified"
+notes = "Puts the protocol back to RESP2 as well as the database back to zero, which is the half that is easy to miss and leaves a pooled connection speaking the wrong one."
+
+[[command]]
+name = "QUIT"
+group = "connection"
+since = "1.0.0"
+arity = -1
+plan = "none"
+bounded = "inherent"
+status = "shipped"
+wire = "verified"
+notes = "The reply is written before the socket closes, so this answers with a flow decision rather than doing anything to the connection itself."
+
+# --------------------------------------------------------------------- server
+
+[[command]]
+name = "COMMAND"
+group = "server"
+since = "2.8.13"
+arity = -1
+plan = "none"
+bounded = "inherent"
+status = "shipped"
+wire = "verified"
+divergent = "D-13"
+notes = "COUNT, LIST, INFO, DOCS, GETKEYS and HELP. GETKEYS is the one a cluster aware client routes on, so MSETEX, whose keys are not where the first, last and step triple says, is special cased there rather than being answered wrongly."
+
+[[command]]
+name = "CONFIG"
+group = "server"
+since = "2.0.0"
+arity = -2
+plan = "none"
+bounded = "inherent"
+status = "shipped"
+wire = "verified"
+divergent = "D-14"
+notes = "Every setting is fixed for the life of the process, so SET accepts a write that changes nothing and refuses everything else rather than pretending to have taken it."
+
+[[command]]
+name = "INFO"
+group = "server"
+since = "1.0.0"
+arity = -1
+plan = "none"
+bounded = "inherent"
+status = "shipped"
+wire = "verified"
+divergent = "D-12"
+notes = "Only the fields this layer can stand behind. There is no rdb_last_save_time because there is no save, and a field that is not there is a client falling back rather than a client believing a zero."

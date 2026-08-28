@@ -58,14 +58,37 @@
 //! for it. The replication client, the differential harness and this crate's
 //! own round trip tests do.
 //!
+//! # Running a command
+//!
+//! [`dispatch`] is the layer above both halves. It looks a command name up,
+//! checks its arity, and calls the same `yo-kv` method the embedded API calls,
+//! which is the placement rule Y23 is about: one implementation of `INCR`, two
+//! ways to reach it.
+//!
+//! ```
+//! use yo_resp::{Argv, Limits, Out, Proto};
+//! use yo_resp::dispatch::{Args, Server, Session, execute};
+//!
+//! let mut server = Server::new();
+//! let mut session = Session::new(1);
+//! let mut out = Out::new(Proto::Resp2);
+//! let wire = b"*1\r\n$4\r\nPING\r\n";
+//! let mut argv = Argv::new();
+//! argv.decode(wire, &Limits::default())?;
+//! execute(&mut server, &mut session, Args::new(&argv, wire), &mut out);
+//! assert_eq!(out.as_slice(), b"+PONG\r\n");
+//! # Ok::<(), yo_resp::ProtocolError>(())
+//! ```
+//!
 //! # What is not here
 //!
-//! Connections, sockets, buffers that grow themselves, and commands. This crate
-//! turns bytes into arguments and values into bytes, and nothing else. The
-//! reactor owns the sockets and `04` section 7 owns the reactor.
+//! Connections, sockets, and buffers that grow themselves. This crate turns
+//! bytes into arguments, runs them, and turns values into bytes. The reactor
+//! owns the sockets and `04` section 7 owns the reactor.
 
 #![deny(missing_docs)]
 
+pub mod dispatch;
 pub mod error;
 pub mod frame;
 pub mod proto;

@@ -105,6 +105,20 @@ impl Out {
         self.buf.drain(..n);
     }
 
+    /// Drops everything written after `len`, which has to be a length this
+    /// buffer reported earlier.
+    ///
+    /// The dispatcher takes the length before it runs a command and rolls back
+    /// to it when the command answers with an error, so a command that writes
+    /// half a reply and then fails cannot leave the half on the wire. Every
+    /// command is written to check its arguments before it writes anything,
+    /// and this is what makes that a property of the dispatcher rather than a
+    /// rule three hundred commands have to keep to.
+    #[inline]
+    pub fn truncate(&mut self, len: usize) {
+        self.buf.truncate(len);
+    }
+
     /// Reserves room for `n` more bytes.
     ///
     /// The presize half of Y18. Call it once with the whole reply's size before
@@ -169,6 +183,30 @@ impl Out {
         self.crlf();
     }
 
+    /// An error built from a prefix and a message that are not next to each
+    /// other in memory, with any line ending in the message turned into a
+    /// space.
+    ///
+    /// The prefix carries its own trailing space, so this is called with
+    /// `b"ERR "` or `b"WRONGTYPE "`. Joining the two halves first would mean
+    /// allocating a string on the failure path of a thread that is not allowed
+    /// to allocate, which is the whole reason this exists.
+    ///
+    /// The mapping of `\r` and `\n` to spaces is Redis's, and it is not
+    /// cosmetic: an error message can quote what the client sent, and a client
+    /// that sends a command name with a newline in it would otherwise be
+    /// writing its own frames into somebody's reply stream.
+    pub fn error_line(&mut self, prefix: &[u8], msg: &[u8]) {
+        self.buf.reserve(prefix.len() + msg.len() + 4);
+        self.buf.push(b'-');
+        self.buf.extend_from_slice(prefix);
+        for &b in msg {
+            self.buf
+                .push(if b == b'\r' || b == b'\n' { b' ' } else { b });
+        }
+        self.crlf();
+    }
+
     /// A blob error, RESP3's `!`, which may carry anything including newlines.
     ///
     /// Degrades to a normal error line in RESP2, with line endings turned into
@@ -216,6 +254,30 @@ impl Out {
         push_u64(&mut self.buf, digits as u64);
         self.crlf();
         push_i64(&mut self.buf, n);
+        self.crlf();
+    }
+
+    /// A bulk string holding a double in Redis's own formatting.
+    ///
+    /// `INCRBYFLOAT` replies with one of these in both protocols, so this is
+    /// not the same thing as [`Out::double`] and cannot be written in terms of
+    /// it.
+    ///
+    /// The length has to go in front of the digits and the digits cannot be
+    /// counted without writing them, so they are written first, the header is
+    /// appended behind them, and the two are rotated into place. A double is a
+    /// couple of dozen bytes at most, so the rotate is a few words, and nothing
+    /// is allocated to hold a number on its way into a buffer it is already in.
+    pub fn bulk_double(&mut self, d: f64) {
+        self.buf.reserve(48);
+        let start = self.buf.len();
+        push_double(&mut self.buf, d);
+        let digits = self.buf.len() - start;
+        self.buf.push(b'$');
+        push_u64(&mut self.buf, digits as u64);
+        self.crlf();
+        let header = self.buf.len() - start - digits;
+        self.buf[start..].rotate_right(header);
         self.crlf();
     }
 
@@ -295,22 +357,9 @@ impl Out {
             self.crlf();
             return;
         }
-        // RESP2 wants the length in front of the digits, and the digits cannot
-        // be counted without writing them. So they are written first, the
-        // header is appended behind them, and the two are rotated into order. A
-        // double is at most a couple of dozen bytes, so the rotate is a few
-        // words, and nothing is allocated to hold a number on its way into a
-        // buffer it is already in.
-        self.buf.reserve(48);
-        let start = self.buf.len();
-        push_double(&mut self.buf, d);
-        let digits = self.buf.len() - start;
-        self.buf.push(b'$');
-        push_u64(&mut self.buf, digits as u64);
-        self.crlf();
-        let header = self.buf.len() - start - digits;
-        self.buf[start..].rotate_right(header);
-        self.crlf();
+        // RESP2 has no double and gets the digits as a bulk string, which is
+        // the same thing `INCRBYFLOAT` replies with on both protocols.
+        self.bulk_double(d);
     }
 
     /// A boolean, RESP3's `#t` or `#f`.
