@@ -6,7 +6,11 @@ While the major is 0, a minor release may break anything, including the on-disk 
 
 ## Unreleased
 
-Nothing yet.
+### Added
+
+- **`yo-capi`, the C ABI, and `include/yo.h` generated from one model.** Every binding this project will ever have sits on this surface, so it is described once in `xtask/src/model.rs` and `crates/yo-common/errors.toml` and the header, the error code spellings and the machine readable `api.model.json` are all emitted from it. A generated file that somebody edited by hand is a header that no longer matches the library, so `cargo xtask check` regenerates all of it and CI fails on a diff.
+- **A `capi` CI job that compiles the header the way a caller would.** Two compilers, gcc and clang, every dialect they support, warnings as errors, and then the example is linked and run. A header that compiles and a library that works are two different claims and this checks both.
+- **`examples/c`, a hello world and the build script that produces it.** Not a snippet in a README. Something a caller can run, which is the only version of an example that stays true.
 
 ## 0.2.0 — 2026-08-28
 

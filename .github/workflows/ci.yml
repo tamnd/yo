@@ -57,6 +57,25 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets --all-features
+      # A workflow file that does not parse produces a run with no jobs in it,
+      # which reports as a failure with nothing to click on and no log. That is
+      # the worst failure mode CI has, because the thing that broke is invisible
+      # in the check list. One unquoted colon in a `run:` line is enough to do
+      # it. Parsing them here costs a second and puts the error next to the
+      # line number.
+      - name: the workflow files parse
+        run: |
+          python3 - <<'PY'
+          import sys, yaml, pathlib
+          bad = False
+          for p in sorted(pathlib.Path(".github/workflows").glob("*.yml")):
+              try:
+                  yaml.safe_load(p.read_text())
+              except yaml.YAMLError as e:
+                  bad = True
+                  print(f"{p}: {e}")
+          sys.exit(1 if bad else 0)
+          PY
 
   # Debug only. The release matrix moved to deep.yml, because building the whole
   # workspace twice was most of this job and a bug that shows up only under
@@ -153,3 +172,38 @@ jobs:
           ./target/release/yo-crash --trials 4000 --page-len 65536 --records 800 --seed 3000000
           ./target/release/yo-crash --trials 2000 --records 40 --seed 4000000
           ./target/release/yo-crash --trials 2000 --sync --seed 5000000
+
+  # The header and the model are generated, and a generated file that somebody
+  # edited by hand is a header that no longer matches the library. This job
+  # regenerates both and fails if the result differs from what is checked in.
+  generated:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2.9.2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - run: cargo xtask check
+
+  # The C header is the surface every binding sits on, so it gets compiled the
+  # way a caller would compile it: two compilers, every dialect they support,
+  # warnings as errors. Then the example is linked and run, because a header
+  # that compiles and a library that works are two different claims.
+  capi:
+    strategy:
+      fail-fast: false
+      matrix:
+        cc: [gcc, clang]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2.9.2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - run: examples/c/build.sh ${{ matrix.cc }}
+        env:
+          CXX: ${{ matrix.cc == 'gcc' && 'g++' || 'clang++' }}
