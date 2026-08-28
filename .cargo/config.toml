@@ -1,0 +1,4 @@
+# `cargo xtask` rather than `cargo run -p xtask`, so the command is the same in
+# CI, in the contributing guide and in muscle memory.
+[alias]
+xtask = "run --quiet --package xtask --"

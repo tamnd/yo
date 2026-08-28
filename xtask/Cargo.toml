@@ -1,0 +1,15 @@
+[package]
+name = "xtask"
+description = "Repository chores that have to be identical on every machine"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+yo-common.workspace = true
+
+[lints]
+workspace = true

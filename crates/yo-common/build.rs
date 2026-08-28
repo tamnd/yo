@@ -97,6 +97,33 @@ fn main() {
     }
     out.push_str("        }\n    }\n\n");
 
+    out.push_str("    /// The C ABI spelling with a trailing NUL, ready to cross the boundary.\n");
+    out.push_str("    ///\n");
+    out.push_str("    /// The C ABI needs NUL terminated strings and Rust literals are not,\n");
+    out.push_str("    /// so the terminator is put here where it is generated rather than in a\n");
+    out.push_str("    /// second table somebody has to keep in step by hand.\n");
+    out.push_str("    #[inline]\n");
+    out.push_str("    pub const fn c_name_z(self) -> &'static str {\n");
+    out.push_str("        match self {\n");
+    for e in &errors {
+        writeln!(out, "            Code::{} => \"{}\\0\",", e.name, e.c_name).unwrap();
+    }
+    out.push_str("        }\n    }\n\n");
+
+    out.push_str("    /// The documentation page with a trailing NUL, if there is one.\n");
+    out.push_str("    #[inline]\n");
+    out.push_str("    pub const fn url_z(self) -> Option<&'static str> {\n");
+    out.push_str("        match self {\n");
+    for e in &errors {
+        match &e.url {
+            Some(u) => {
+                writeln!(out, "            Code::{} => Some(\"{}\\0\"),", e.name, u).unwrap()
+            }
+            None => writeln!(out, "            Code::{} => None,", e.name).unwrap(),
+        }
+    }
+    out.push_str("        }\n    }\n\n");
+
     out.push_str("    /// The documentation page for this condition, if it has one.\n");
     out.push_str("    #[inline]\n");
     out.push_str("    pub const fn url(self) -> Option<&'static str> {\n");

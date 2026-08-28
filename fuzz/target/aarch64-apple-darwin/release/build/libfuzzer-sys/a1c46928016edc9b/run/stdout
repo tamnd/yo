@@ -347,6 +347,14 @@ cargo:rerun-if-env-changed=CXXFLAGS_aarch64_apple_darwin
 CXXFLAGS_aarch64_apple_darwin = None
 cargo:rerun-if-env-changed=CXXFLAGS_aarch64-apple-darwin
 CXXFLAGS_aarch64-apple-darwin = None
+exit status: 0
+exit status: 0
+exit status: 0
+exit status: 0
+exit status: 0
+exit status: 0
+exit status: 0
+exit status: 0
 cargo:rerun-if-env-changed=CXX_aarch64-apple-darwin
 CXX_aarch64-apple-darwin = None
 cargo:rerun-if-env-changed=CXX_aarch64_apple_darwin
@@ -383,14 +391,6 @@ cargo:rerun-if-env-changed=CXXFLAGS_aarch64_apple_darwin
 CXXFLAGS_aarch64_apple_darwin = None
 cargo:rerun-if-env-changed=CXXFLAGS_aarch64-apple-darwin
 CXXFLAGS_aarch64-apple-darwin = None
-exit status: 0
-exit status: 0
-exit status: 0
-exit status: 0
-exit status: 0
-exit status: 0
-exit status: 0
-exit status: 0
 cargo:rerun-if-env-changed=CXX_aarch64-apple-darwin
 CXX_aarch64-apple-darwin = None
 cargo:rerun-if-env-changed=CXX_aarch64_apple_darwin

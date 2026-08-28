@@ -193,7 +193,17 @@ jobs:
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: rm rust-toolchain.toml
-      - run: cargo fuzz build
+      # The target is named rather than left to cargo-fuzz, which defaults it to
+      # the platform its own binary was built for. install-action has no
+      # cargo-fuzz of its own and falls back to cargo-binstall, which fetches the
+      # musl build, so the default came out as x86_64-unknown-linux-musl and the
+      # build died on a missing musl std with a sanitizer error on top. Nothing
+      # here wants to be fuzzed against musl. `rustc -vV` is the host this job is
+      # actually running on and is right whoever assembled the toolchain.
+      - id: host
+        run: |
+          echo "triple=$(rustc -vV | sed -n 's/^host: //p')" >> "$GITHUB_OUTPUT"
+      - run: cargo fuzz build --target ${{ steps.host.outputs.triple }}
       # All five at once rather than one after another. Each is a minute and
       # they used to be five minutes in a row for no reason: they share nothing
       # and a runner has four cores sitting idle through four of those minutes.
@@ -201,7 +211,7 @@ jobs:
         run: |
           pids=""
           for t in $(cargo fuzz list); do
-            cargo fuzz run "$t" -- -max_total_time=60 -rss_limit_mb=2048 &
+            cargo fuzz run --target ${{ steps.host.outputs.triple }} "$t" -- -max_total_time=60 -rss_limit_mb=2048 &
             pids="$pids $!"
           done
           rc=0
