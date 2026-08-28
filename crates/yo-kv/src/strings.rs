@@ -227,6 +227,15 @@ impl Strings {
         self.map.is_empty()
     }
 
+    /// Throw every key away. This is `FLUSHDB` on one database.
+    ///
+    /// The expiry counter is not reset, because Redis does not reset it either:
+    /// `expired_keys` in `INFO stats` counts what this process has expired since
+    /// it started, and emptying a database is not expiring anything.
+    pub fn clear(&mut self) {
+        self.map.clear();
+    }
+
     /// Keys reclaimed by running into them after their deadline.
     ///
     /// Redis calls this `expired_keys` in `INFO stats` and counts both lazy and
@@ -1711,5 +1720,38 @@ mod tests {
         assert!(s.clock().now_ms() > 1_577_836_800_000);
         s.prefetch(Strings::hash_of(b"k"));
         assert_eq!(got(&mut s, b"k").as_deref(), Some(&b"v"[..]));
+    }
+
+    #[test]
+    fn clearing_hands_the_memory_back_and_not_only_the_keys() {
+        let mut s = store();
+        let empty = s.memory_bytes();
+        let big = vec![b'x'; 4_096];
+        for i in 0..2_000u32 {
+            s.set_plain(format!("k{i}").as_bytes(), &big).unwrap();
+        }
+        assert_eq!(s.len(), 2_000);
+        assert!(s.memory_bytes() > empty * 4, "the store should have grown");
+
+        // One key expires, so the counter has something in it to check.
+        s.setex(b"gone", 1, b"v").unwrap();
+        s.clock_mut().set(3_000);
+        assert!(got(&mut s, b"gone").is_none());
+        assert_eq!(s.expired_keys(), 1);
+
+        s.clear();
+        assert!(s.is_empty());
+        assert_eq!(s.len(), 0);
+        assert_eq!(got(&mut s, b"k0"), None);
+        // Back to what a fresh store costs, rather than an arena still the size
+        // of what used to be in it.
+        assert_eq!(s.memory_bytes(), empty);
+        // The expiry counter is not reset, because Redis does not reset it
+        // either. Emptying a database is not expiring anything.
+        assert_eq!(s.expired_keys(), 1);
+
+        // And it still works afterwards.
+        s.set_plain(b"after", b"v").unwrap();
+        assert_eq!(got(&mut s, b"after").as_deref(), Some(&b"v"[..]));
     }
 }

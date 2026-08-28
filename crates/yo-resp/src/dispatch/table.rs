@@ -58,6 +58,14 @@ const AC_WRITE_FAST: &[&str] = &["@write", "@string", "@fast"];
 const AC_WRITE_SLOW: &[&str] = &["@write", "@string", "@slow"];
 /// The connection commands' categories.
 const AC_CONN: &[&str] = &["@fast", "@connection"];
+/// The keyspace read side, which is `EXISTS` and `TYPE`.
+const AC_KEY_READ: &[&str] = &["@keyspace", "@read", "@fast"];
+/// `DEL`, which Redis does not count as fast because it frees on the spot.
+const AC_KEY_DEL: &[&str] = &["@keyspace", "@write", "@slow"];
+/// `UNLINK`, which Redis does count as fast because it does not.
+const AC_KEY_UNLINK: &[&str] = &["@keyspace", "@write", "@fast"];
+/// The two that empty a database, which are in the dangerous category.
+const AC_KEY_FLUSH: &[&str] = &["@keyspace", "@write", "@slow", "@dangerous"];
 
 /// Every command this server answers, in the order the groups ship.
 pub static COMMANDS: &[Spec] = &[
@@ -400,6 +408,59 @@ pub static COMMANDS: &[Spec] = &[
         summary: "Count, with a bound, a saturation policy and a deadline.",
         group: "string",
     },
+    // ------------------------------------------------------------ keyspace
+    Spec {
+        name: "del",
+        arity: -2,
+        flags: &["write"],
+        first_key: 1,
+        last_key: -1,
+        step: 1,
+        acl: AC_KEY_DEL,
+        since: "1.0.0",
+        complexity: "O(N) in the number of keys.",
+        summary: "Delete keys and say how many were there.",
+        group: "keyspace",
+    },
+    Spec {
+        name: "unlink",
+        arity: -2,
+        flags: &["write", "fast"],
+        first_key: 1,
+        last_key: -1,
+        step: 1,
+        acl: AC_KEY_UNLINK,
+        since: "4.0.0",
+        complexity: "O(1) per key, since the freeing is not on this thread.",
+        summary: "Delete keys and free them out of the way of the reply.",
+        group: "keyspace",
+    },
+    Spec {
+        name: "exists",
+        arity: -2,
+        flags: READ_FAST,
+        first_key: 1,
+        last_key: -1,
+        step: 1,
+        acl: AC_KEY_READ,
+        since: "1.0.0",
+        complexity: "O(N) in the number of keys.",
+        summary: "Count how many of these keys are there, naming one twice counting twice.",
+        group: "keyspace",
+    },
+    Spec {
+        name: "type",
+        arity: 2,
+        flags: READ_FAST,
+        first_key: 1,
+        last_key: 1,
+        step: 1,
+        acl: AC_KEY_READ,
+        since: "1.0.0",
+        complexity: "O(1)",
+        summary: "What kind of value is under a key, or none.",
+        group: "keyspace",
+    },
     // ---------------------------------------------------------- connection
     Spec {
         name: "ping",
@@ -542,6 +603,45 @@ pub static COMMANDS: &[Spec] = &[
         since: "1.0.0",
         complexity: "O(1)",
         summary: "The server's own numbers, in sections.",
+        group: "server",
+    },
+    Spec {
+        name: "dbsize",
+        arity: 1,
+        flags: READ_FAST,
+        first_key: 0,
+        last_key: 0,
+        step: 0,
+        acl: AC_KEY_READ,
+        since: "1.0.0",
+        complexity: "O(1)",
+        summary: "How many keys are in the database this connection is on.",
+        group: "server",
+    },
+    Spec {
+        name: "flushall",
+        arity: -1,
+        flags: &["write"],
+        first_key: 0,
+        last_key: 0,
+        step: 0,
+        acl: AC_KEY_FLUSH,
+        since: "1.0.0",
+        complexity: "O(N) in the number of keys in every database.",
+        summary: "Empty every database.",
+        group: "server",
+    },
+    Spec {
+        name: "flushdb",
+        arity: -1,
+        flags: &["write"],
+        first_key: 0,
+        last_key: 0,
+        step: 0,
+        acl: AC_KEY_FLUSH,
+        since: "1.0.0",
+        complexity: "O(N) in the number of keys in this database.",
+        summary: "Empty the database this connection is on.",
         group: "server",
     },
 ];

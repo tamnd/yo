@@ -52,6 +52,7 @@
 //! it, because a shard thread that allocates aborts.
 
 mod args;
+mod keyspace;
 mod server;
 mod strings;
 pub mod table;
@@ -273,11 +274,16 @@ pub fn execute(server: &mut Server, session: &mut Session, args: Args<'_>, out: 
     }
 
     let mark = out.len();
-    let done = if spec.group == "string" {
-        let db = session.db;
-        strings::execute(&mut server.dbs[db], spec, args, out).map(|()| Flow::Continue)
-    } else {
-        server::execute(server, session, spec, args, out)
+    let done = match spec.group {
+        "string" => {
+            let db = session.db;
+            strings::execute(&mut server.dbs[db], spec, args, out).map(|()| Flow::Continue)
+        }
+        "keyspace" => {
+            let db = session.db;
+            keyspace::execute(&mut server.dbs[db], spec, args, out).map(|()| Flow::Continue)
+        }
+        _ => server::execute(server, session, spec, args, out),
     };
     match done {
         Ok(flow) => flow,
@@ -374,6 +380,58 @@ mod tests {
         // The name is matched whatever case it came in, and so are the options.
         assert_eq!(f.run(&[b"set", b"k", b"v2", b"xx"]), "+OK\r\n");
         assert_eq!(f.run(&[b"GET", b"k"]), "$2\r\nv2\r\n");
+    }
+
+    #[test]
+    fn deleting_counts_keys_removed_and_existing_counts_arguments_matched() {
+        let mut f = Fixture::new();
+        f.run(&[b"MSET", b"a", b"1", b"b", b"2", b"c", b"3"]);
+        // A key named twice exists twice and can only be deleted once, and both
+        // of those are Redis's answers rather than tidier ones.
+        assert_eq!(f.run(&[b"EXISTS", b"a", b"a", b"nosuch"]), ":2\r\n");
+        assert_eq!(f.run(&[b"DEL", b"a", b"a", b"nosuch"]), ":1\r\n");
+        assert_eq!(f.run(&[b"EXISTS", b"a"]), ":0\r\n");
+        // UNLINK is the same body and reports the same way.
+        assert_eq!(f.run(&[b"UNLINK", b"b", b"c"]), ":2\r\n");
+        assert_eq!(f.run(&[b"DBSIZE"]), ":0\r\n");
+    }
+
+    #[test]
+    fn type_is_a_simple_string_and_says_none_for_a_key_that_is_not_there() {
+        let mut f = Fixture::new();
+        f.run(&[b"SET", b"k", b"v"]);
+        // A simple string on both protocols, which is unusual: most replies
+        // that carry a word are bulk strings.
+        assert_eq!(f.run(&[b"TYPE", b"k"]), "+string\r\n");
+        assert_eq!(f.run(&[b"TYPE", b"nosuch"]), "+none\r\n");
+    }
+
+    #[test]
+    fn flushing_empties_this_database_or_every_one_of_them() {
+        let mut f = Fixture::new();
+        f.run(&[b"SELECT", b"0"]);
+        f.run(&[b"MSET", b"a", b"1", b"b", b"2"]);
+        f.run(&[b"SELECT", b"1"]);
+        f.run(&[b"SET", b"c", b"3"]);
+        assert_eq!(f.run(&[b"DBSIZE"]), ":1\r\n");
+        // ASYNC and SYNC are both taken and neither changes anything, since the
+        // keyspace is empty before the OK goes out either way.
+        assert_eq!(f.run(&[b"FLUSHDB", b"async"]), "+OK\r\n");
+        assert_eq!(f.run(&[b"DBSIZE"]), ":0\r\n");
+        // Only database one was emptied.
+        f.run(&[b"SELECT", b"0"]);
+        assert_eq!(f.run(&[b"DBSIZE"]), ":2\r\n");
+        assert_eq!(f.run(&[b"FLUSHALL", b"SYNC"]), "+OK\r\n");
+        assert_eq!(f.run(&[b"DBSIZE"]), ":0\r\n");
+        f.run(&[b"SELECT", b"1"]);
+        assert_eq!(f.run(&[b"DBSIZE"]), ":0\r\n");
+        // Anything else after the name is a syntax error, and so is a third
+        // argument even when the second one is a word we take.
+        assert_eq!(f.run(&[b"FLUSHALL", b"nope"]), "-ERR syntax error\r\n");
+        assert_eq!(
+            f.run(&[b"FLUSHDB", b"sync", b"sync"]),
+            "-ERR syntax error\r\n"
+        );
     }
 
     #[test]
