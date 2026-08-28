@@ -25,6 +25,27 @@ fn key(i: usize) -> Vec<u8> {
 /// trip to DRAM.
 const SIZES: [usize; 4] = [1_000, 100_000, 1_000_000, 10_000_000];
 
+/// The sizes to actually run.
+///
+/// CI runs every benchmark once to check that it still builds and still runs,
+/// and gets nothing out of filling a ten million key map to look something up
+/// in it a single time. `YO_BENCH_SMOKE` is that run. Anything measuring
+/// anything leaves it unset.
+fn sizes() -> &'static [usize] {
+    if smoke() { &SIZES[..1] } else { &SIZES }
+}
+
+/// The sizes the fill benchmark builds a whole map for, which is the most
+/// expensive thing in this file and the first thing a smoke run should drop.
+fn fill_sizes() -> &'static [usize] {
+    const FILL: [usize; 2] = [100_000, 1_000_000];
+    if smoke() { &FILL[..0] } else { &FILL }
+}
+
+fn smoke() -> bool {
+    std::env::var_os("YO_BENCH_SMOKE").is_some()
+}
+
 fn bench_bucket(c: &mut Criterion) {
     let mut g = c.benchmark_group("bucket");
 
@@ -65,7 +86,7 @@ fn bench_map(c: &mut Criterion) {
     let mut g = c.benchmark_group("map");
     g.throughput(Throughput::Elements(1));
 
-    for n in SIZES {
+    for &n in sizes() {
         let mut m = RawMap::new();
         for i in 0..n {
             m.set(&key(i), b"0123456789abcdef0123456789abcdef");
@@ -93,7 +114,7 @@ fn bench_map(c: &mut Criterion) {
     // Set is measured on a fresh map per batch, because a set into a map that
     // is already at steady state is a different operation from a set that grows
     // the index, and mixing them gives a number that describes neither.
-    for n in [100_000usize, 1_000_000] {
+    for &n in fill_sizes() {
         g.bench_with_input(BenchmarkId::new("set_fill", n), &n, |bench, &n| {
             let keys: Vec<Vec<u8>> = (0..n).map(key).collect();
             bench.iter_batched_ref(
@@ -110,7 +131,7 @@ fn bench_map(c: &mut Criterion) {
 
     // Overwrite in place at steady state, which is the SET a Redis client
     // actually issues most of the time.
-    for n in SIZES {
+    for &n in sizes() {
         let mut m = RawMap::new();
         for i in 0..n {
             m.set(&key(i), b"0123456789abcdef0123456789abcdef");

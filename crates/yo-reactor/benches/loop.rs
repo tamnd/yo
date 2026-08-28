@@ -32,6 +32,20 @@ use yo_shard::spsc::{Sender, lane};
 /// would conclude the second walk is dead weight.
 const SIZES: [usize; 2] = [100_000, 10_000_000];
 
+/// The sizes to actually run.
+///
+/// CI runs every benchmark once to check that it still builds and still runs,
+/// and gets nothing out of filling a ten million key map three times to look
+/// something up in it once. `YO_BENCH_SMOKE` is that run, and anything
+/// measuring anything leaves it unset.
+fn sizes() -> &'static [usize] {
+    if std::env::var_os("YO_BENCH_SMOKE").is_some() {
+        &[1_000]
+    } else {
+        &SIZES
+    }
+}
+
 /// Commands per measured iteration, which is one full batch.
 const BATCH: usize = BATCH_MAX;
 
@@ -114,7 +128,7 @@ fn bench_inline(c: &mut Criterion) {
     let mut g = c.benchmark_group("inline");
     g.throughput(Throughput::Elements(1));
 
-    for n in SIZES {
+    for &n in sizes() {
         let mut r = Reactor::inline(Lookup::new(n, true));
         g.bench_with_input(BenchmarkId::new("execute", n), &n, |bench, _| {
             let mut i = 0u32;
@@ -132,7 +146,7 @@ fn bench_batch(c: &mut Criterion) {
     let mut g = c.benchmark_group("batch");
     g.throughput(Throughput::Elements(BATCH as u64));
 
-    for n in SIZES {
+    for &n in sizes() {
         // One map for both arms. Filling ten million keys twice to change one
         // boolean is a minute of a benchmark run spent on nothing.
         let mut r = Reactor::inline(Lookup::new(n, true));
@@ -156,7 +170,7 @@ fn bench_loop(c: &mut Criterion) {
     let mut g = c.benchmark_group("loop");
     g.throughput(Throughput::Elements(BATCH as u64));
 
-    for n in SIZES {
+    for &n in sizes() {
         // The lane is deep enough that a push never fails, and the batch is
         // pushed inside the measured closure because on the server path
         // somebody always pays for the handoff. It is the same cost in every
