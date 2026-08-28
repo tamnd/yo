@@ -605,6 +605,17 @@ impl<S: Sink> Wire<S> {
     pub fn tick(&mut self) {
         self.server.refresh_clock();
     }
+
+    /// Do one turn's worth of housekeeping.
+    ///
+    /// Today that is one segment of arena compaction at most, which is what
+    /// stops a server that rewrites the same keys from holding every version of
+    /// them. It is separate from [`Wire::tick`] because the clock has to move
+    /// before a batch runs and this does not: it can wait for a quiet moment,
+    /// and the driver decides when that is.
+    pub fn maintain(&mut self) -> usize {
+        self.server.compact_step()
+    }
 }
 
 impl<S: Sink> Engine for Wire<S> {

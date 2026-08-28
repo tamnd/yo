@@ -253,6 +253,18 @@ impl Strings {
         self.map.memory_bytes()
     }
 
+    /// Give back one segment's worth of space if one has gone mostly dead.
+    ///
+    /// Overwriting a key does not reuse its bytes, it writes the new record at
+    /// the bump pointer and counts the old one as dead, so a workload that sets
+    /// the same keys over and over holds far more than it is storing until
+    /// something compacts. This is that something, and it does at most one
+    /// segment per call so that the loop can afford to ask every turn.
+    #[inline]
+    pub fn compact_step(&mut self) -> usize {
+        self.map.compact_step()
+    }
+
     /// Ask the cache for the bucket this key will land in.
     ///
     /// The first of the loop's two walks (`04` section 3) calls this.
