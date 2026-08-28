@@ -1,0 +1,409 @@
+# The command audit, machine readable.
+#
+# Every command gets a storage plan and a bound or materialise verdict before it
+# ships, and `cargo xtask check` enforces that: a command with no storage plan
+# does not ship. This is the discipline aki's audit used over 250 commands, and
+# the reason it is a file rather than a document is that a document goes stale
+# and nobody notices.
+#
+# plan is one of:
+#   point         one record, found by key
+#   cursor        walks a structure, answers incrementally
+#   merge         reads more than one key and combines them
+#   metadata      answers from the header without reading the value
+#   whole-value   reads or rewrites the entire value
+#
+# bounded is one of:
+#   inherent      the answer is small whatever the value is
+#   yes           the answer could be large and is bounded rather than built
+#   risk          the cost follows the size of the value, and that is noted
+#
+# wire is one of:
+#   verified      the argument order is checked against a real Redis
+#   unverified    the storage half is done and the argument order is not settled
+#   none          no dispatch layer for it yet
+#
+# divergent names a row in divergences.toml. A command that has one and names a
+# row that is not there fails the check.
+
+# ---------------------------------------------------------------- group budget
+
+[[group]]
+name = "string"
+expected = 25
+status = "shipped"
+doc = "08 section 2"
+# 12 section 3 says 28. Counting the group honestly gives 25 distinct names,
+# which is 22 classic ones plus 8.4's MSETEX and DELEX and 8.8's INCREX. The
+# extra three in the spec look like SUBSTR and the SET option forms being
+# counted separately. The spec number comes down at the M2 wrap up.
+
+[[group]]
+name = "bitmap"
+expected = 7
+status = "planned"
+doc = "08 section 8"
+
+[[group]]
+name = "list"
+expected = 20
+status = "planned"
+doc = "08 section 6"
+
+[[group]]
+name = "hash"
+expected = 27
+status = "planned"
+doc = "08 section 3"
+
+[[group]]
+name = "set"
+expected = 16
+status = "planned"
+doc = "08 section 4"
+
+[[group]]
+name = "zset"
+expected = 31
+status = "planned"
+doc = "08 section 5"
+
+[[group]]
+name = "array"
+expected = 8
+status = "planned"
+doc = "08 section 1"
+
+[[group]]
+name = "stream"
+expected = 20
+status = "planned"
+doc = "08 section 7"
+
+[[group]]
+name = "hyperloglog"
+expected = 3
+status = "planned"
+doc = "08 section 8"
+
+[[group]]
+name = "geo"
+expected = 8
+status = "planned"
+doc = "08 section 8"
+
+[[group]]
+name = "pubsub"
+expected = 12
+status = "planned"
+doc = "12 section 6"
+
+[[group]]
+name = "keyspace"
+expected = 23
+status = "planned"
+doc = "14"
+
+[[group]]
+name = "expiry"
+expected = 12
+status = "planned"
+doc = "14"
+
+[[group]]
+name = "transactions"
+expected = 5
+status = "planned"
+doc = "12 section 4"
+
+[[group]]
+name = "scripting"
+expected = 11
+status = "planned"
+doc = "12 section 7"
+
+[[group]]
+name = "server"
+expected = 40
+status = "planned"
+doc = "12 section 9"
+
+# --------------------------------------------------------------------- strings
+
+[[command]]
+name = "SET"
+group = "string"
+since = "1.0.0"
+arity = -3
+plan = "point"
+bounded = "inherent"
+status = "shipped"
+wire = "none"
+divergent = "D-8"
+notes = "One record written, one freed. NX, XX and IFEQ all decide against a single probe, and GET reports what that probe found whether or not the write went ahead."
+
+[[command]]
+name = "GET"
+group = "string"
+since = "1.0.0"
+arity = 2
+plan = "point"
+bounded = "inherent"
+status = "shipped"
+wire = "none"
+notes = "One probe. The value is handed back as a slice of the record it lives in, or as an integer that becomes digits only when the reply is written."
+
+[[command]]
+name = "GETSET"
+group = "string"
+since = "1.0.0"
+arity = 3
+plan = "point"
+bounded = "inherent"
+status = "shipped"
+wire = "none"
+notes = "The one string command that cannot avoid a copy, because the record the old value lived in is freed before the caller sees it."
+
+[[command]]
+name = "GETDEL"
+group = "string"
+since = "6.2.0"
+arity = 2
+plan = "point"
+bounded = "inherent"
+status = "shipped"
+wire = "none"
+notes = "Copies for the same reason GETSET does."
+
+[[command]]
+name = "GETEX"
+group = "string"
+since = "6.2.0"
+arity = -2
+plan = "point"
+bounded = "inherent"
+status = "shipped"
+wire = "none"
+notes = "Adding or removing a deadline changes the record's length, so it is a rewrite and not an overwrite. Plain GETEX changes nothing and is a read."
+
+[[command]]
+name = "SETNX"
+group = "string"
+since = "1.0.0"
+arity = 3
+plan = "point"
+bounded = "inherent"
+status = "shipped"
+wire = "none"
+
+[[command]]
+name = "SETEX"
+group = "string"
+since = "2.0.0"
+arity = 4
+plan = "point"
+bounded = "inherent"
+status = "shipped"
+wire = "none"
+notes = "A zero or negative time to live is an error and not a delete."
+
+[[command]]
+name = "PSETEX"
+group = "string"
+since = "2.6.0"
+arity = 4
+plan = "point"
+bounded = "inherent"
+status = "shipped"
+wire = "none"
+
+[[command]]
+name = "MSET"
+group = "string"
+since = "1.0.1"
+arity = -3
+plan = "point"
+bounded = "inherent"
+status = "shipped"
+wire = "none"
+divergent = "D-8"
+notes = "One point write per pair, in order."
+
+[[command]]
+name = "MSETNX"
+group = "string"
+since = "1.0.1"
+arity = -3
+plan = "point"
+bounded = "inherent"
+status = "shipped"
+wire = "none"
+divergent = "D-8"
+notes = "Every key is checked before anything is written, so a duplicate key inside one call does not defeat itself."
+
+[[command]]
+name = "MGET"
+group = "string"
+since = "1.0.0"
+arity = -2
+plan = "point"
+bounded = "yes"
+status = "shipped"
+wire = "none"
+notes = "Every dead key is reaped first, then the whole answer is read from a store nobody is going to mutate, which is what lets all the values borrow at once instead of being copied out one at a time."
+
+[[command]]
+name = "APPEND"
+group = "string"
+since = "2.0.0"
+arity = 3
+plan = "whole-value"
+bounded = "risk"
+status = "shipped"
+wire = "none"
+divergent = "D-8"
+notes = "Reads the value and writes it back with the tail attached, so repeated appends are quadratic in the final length. Redis amortises this with sds spare capacity and we do not yet. The band that fixes it is the log region in M5."
+
+[[command]]
+name = "STRLEN"
+group = "string"
+since = "2.2.0"
+arity = 2
+plan = "metadata"
+bounded = "inherent"
+status = "shipped"
+wire = "none"
+notes = "The record header carries the length, so nothing reads the value. An int encoded value counts its digits arithmetically rather than formatting them."
+
+[[command]]
+name = "SETRANGE"
+group = "string"
+since = "2.2.0"
+arity = 4
+plan = "whole-value"
+bounded = "risk"
+status = "shipped"
+wire = "none"
+divergent = "D-8"
+notes = "Same rewrite as APPEND, and a write past the end pads with zero bytes. A write of nothing to a key that is not there creates nothing and answers zero."
+
+[[command]]
+name = "GETRANGE"
+group = "string"
+since = "2.4.0"
+arity = 4
+plan = "point"
+bounded = "yes"
+status = "shipped"
+wire = "none"
+notes = "Slices the record rather than copying it, except for an int encoded value whose digits do not exist anywhere until somebody asks."
+
+[[command]]
+name = "SUBSTR"
+group = "string"
+since = "1.0.0"
+arity = 4
+plan = "point"
+bounded = "yes"
+status = "shipped"
+wire = "none"
+notes = "The same command as GETRANGE under an older name, deprecated in Redis since 2.0.0 and still answered."
+
+[[command]]
+name = "INCR"
+group = "string"
+since = "1.0.0"
+arity = 2
+plan = "point"
+bounded = "inherent"
+status = "shipped"
+wire = "none"
+notes = "One probe, one add, one eight byte store back into the record the probe landed on. No arena append, no free, no rehash. This is the command M2's gate is about."
+
+[[command]]
+name = "DECR"
+group = "string"
+since = "1.0.0"
+arity = 2
+plan = "point"
+bounded = "inherent"
+status = "shipped"
+wire = "none"
+
+[[command]]
+name = "INCRBY"
+group = "string"
+since = "1.0.0"
+arity = 3
+plan = "point"
+bounded = "inherent"
+status = "shipped"
+wire = "none"
+
+[[command]]
+name = "DECRBY"
+group = "string"
+since = "1.0.0"
+arity = 3
+plan = "point"
+bounded = "inherent"
+status = "shipped"
+wire = "none"
+notes = "Carried through as a subtraction rather than turned into an addition, because negating first would overflow on i64::MIN."
+
+[[command]]
+name = "INCRBYFLOAT"
+group = "string"
+since = "2.6.0"
+arity = 3
+plan = "whole-value"
+bounded = "inherent"
+status = "shipped"
+wire = "none"
+notes = "The result is stored as text and never as an integer, because Redis reports embstr afterwards even when the number came out whole."
+
+[[command]]
+name = "LCS"
+group = "string"
+since = "7.0.0"
+arity = -3
+plan = "merge"
+bounded = "risk"
+status = "shipped"
+wire = "verified"
+divergent = "D-10"
+notes = "A table the size of the product of the two lengths, in time and in memory. The one string command that is not a probe and a store, and the one nobody should put on a hot path."
+
+[[command]]
+name = "MSETEX"
+group = "string"
+since = "8.4.0"
+arity = -4
+plan = "point"
+bounded = "inherent"
+status = "shipped"
+wire = "unverified"
+divergent = "D-8"
+notes = "MSET with a deadline, and KEEPTTL is per key. The storage half is done. The argument order has to be checked against a real 8.4 before the dispatch layer ships it."
+
+[[command]]
+name = "DELEX"
+group = "string"
+since = "8.4.0"
+arity = -2
+plan = "point"
+bounded = "inherent"
+status = "shipped"
+wire = "unverified"
+notes = "Compare and delete, the other half of SET IFEQ. The comparison is against the string the client would have read, so an int encoded 42 is equal to 42 and not to 042."
+
+[[command]]
+name = "INCREX"
+group = "string"
+since = "8.8.0"
+arity = -4
+plan = "point"
+bounded = "inherent"
+status = "shipped"
+wire = "unverified"
+notes = "A windowed rate limiter in one command. The window starts only when the key was not there, so a burst inside one window expires together at the deadline the first call set rather than each call pushing it out."
