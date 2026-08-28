@@ -8,7 +8,21 @@ While the major is 0, a minor release may break anything, including the on-disk 
 
 Nothing yet.
 
-## 0.1.0 — 2026-08-26
+## 0.1.1 — 2026-08-28
+
+A CI release. Nothing in the library changed, and a `0.1.0` file, API and ABI are all still exactly what they were. What changed is how long you wait to find out whether a change is good.
+
+### Changed
+
+- **CI is split into a fast path and a deep path, and the fast path is held to three minutes.** `ci.yml` runs on every push and every pull request: style, the debug test matrix on Linux, macOS and Windows, the MSRV floor, loom on the lane, and the docs build. `deep.yml` runs nightly, on demand against any ref, and on a pull request carrying the `deep` label: Miri under both borrow models, the fuzzers, the release test matrix, the benchmark smoke run, and the cold build from source. The reason is that a check slower than a context switch is a check people learn to route around, and the slow half was reaching six hours while the fast half was done in ninety seconds. Nothing was deleted. A milestone pull request carries the `deep` label and waits for all of it, which is now written into RELEASING.md.
+- **Debug info is off in CI and the cache is only written from main.** `CARGO_PROFILE_DEV_DEBUG=0` cuts what rustc emits and what the linker then has to chew through, which is worth about a third of the Windows wall clock and most of the cache size everywhere, and no CI job here reads a backtrace line number. `save-if` on the cache means a pull request reads main's cache and skips the upload, which was twenty to forty seconds a job spent saving something the next pull request would not have used.
+- **The debug and release test matrices are separate.** The test job used to build the whole workspace twice. The release half moved to `deep.yml`. A bug that only shows up under optimisation is real, it is just not worth paying for on every commit.
+- **The two Miri borrow models run as two jobs rather than one job doing both in sequence.** They have nothing to say to each other, so the wait is the slower of the two rather than their sum. The check name changes from `miri` to `miri (stacked borrows)` and `miri (tree borrows)`, and `fail-fast` is off so one model failing still leaves the other model's answer on the same run.
+- **Every job has a timeout.** A Miri job was killed by the runner's own six hour ceiling after sitting on a single test, which is a long time to wait to be told nothing. Miri gets 120 minutes and everything else less.
+
+### Known gaps
+
+- Miri and the fuzzers no longer gate an ordinary pull request. A patch that introduces undefined behaviour can now land and be caught the following morning by the nightly rather than before the merge. That is the trade the three minute budget is bought with, and the `deep` label is the way to pay it back on a change that deserves it.
 
 **Milestone: M0, Skeleton.** The parts every later milestone stands on, built first and on their own so that a mistake in them is found now rather than underneath a hundred thousand lines. Nothing here is a database yet. It is a workspace, a hash, an allocator, a bucket, a shard runtime and the CI that keeps them honest.
 

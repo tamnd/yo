@@ -1,0 +1,169 @@
+name: deep
+
+# The checks that cannot finish in the three minutes ci.yml is held to. Miri
+# under both borrow models, the fuzzers, the release test matrix, the benchmark
+# smoke run and a cold build from source with no cache and no toolchain file.
+#
+# They run nightly, on demand against any ref, and on a pull request carrying
+# the `deep` label. A milestone pull request should carry that label, because a
+# milestone is exactly when the format, the unsafe blocks and the benchmarks all
+# move at once. An ordinary patch does not need it.
+#
+# Every job has a timeout. On 2026-08-26 a Miri job sat on one test for five
+# hours and seventeen minutes and was killed by the runner's own six hour
+# ceiling, which is a long time to wait to be told nothing. A job that hangs
+# should say so while somebody is still awake.
+
+on:
+  schedule:
+    # 03:00 UTC, which is the quiet end of the runner queue.
+    - cron: "0 3 * * *"
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: The branch, tag or sha to run against
+        required: false
+        default: main
+  pull_request:
+    types: [opened, synchronize, reopened, labeled]
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  RUSTFLAGS: -D warnings
+
+concurrency:
+  group: deep-${{ github.event.inputs.ref || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # A pull request only gets these if somebody asked for them. Everything else
+  # that triggers this workflow runs the lot.
+  wanted:
+    runs-on: ubuntu-latest
+    outputs:
+      run: ${{ github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'deep') }}
+      ref: ${{ github.event.inputs.ref || github.ref }}
+    steps:
+      - run: echo "deep checks requested for ${{ github.event.inputs.ref || github.ref }}"
+
+  # Every unsafe block in the workspace, interpreted. Miri is slow, so the
+  # arena's segment tests and the format's bit flip sweeps run at a reduced size
+  # rather than being skipped: the scale goes away, the coverage does not.
+  #
+  # Tree borrows is stricter about aliasing than stacked borrows and catches a
+  # different class of mistake, so both are worth running. They have nothing to
+  # say to each other, so they are two jobs and the wait is the slower of the
+  # two rather than the sum.
+  miri:
+    needs: wanted
+    if: needs.wanted.outputs.run == 'true'
+    name: miri (${{ matrix.borrows }} borrows)
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    strategy:
+      # One model failing is a real finding and the other model's result is
+      # still worth having, so a failure does not cancel its sibling.
+      fail-fast: false
+      matrix:
+        include:
+          - borrows: stacked
+            flags: -Zmiri-strict-provenance -Zmiri-disable-isolation
+          - borrows: tree
+            flags: -Zmiri-tree-borrows -Zmiri-disable-isolation
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          ref: ${{ needs.wanted.outputs.ref }}
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: miri
+      - uses: Swatinem/rust-cache@v2.9.2
+        with:
+          # Both jobs build the same tree with the same nightly, so without a
+          # key of their own they would race for one cache entry and each keep
+          # evicting the other's.
+          key: ${{ matrix.borrows }}
+      - run: rm rust-toolchain.toml
+      - run: cargo miri test --workspace --locked
+        env:
+          MIRIFLAGS: ${{ matrix.flags }}
+
+  # Fuzz targets are built and run briefly, so a target that stops compiling is
+  # caught the next morning rather than the next time somebody remembers to run
+  # the fuzzer.
+  fuzz:
+    needs: wanted
+    if: needs.wanted.outputs.run == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          ref: ${{ needs.wanted.outputs.ref }}
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2.9.2
+      - run: rm rust-toolchain.toml
+      - run: cargo install cargo-fuzz --locked
+      - run: cargo fuzz build
+      - name: sixty seconds per target
+        run: |
+          for t in $(cargo fuzz list); do
+            cargo fuzz run "$t" -- -max_total_time=60 -rss_limit_mb=4096
+          done
+      - uses: actions/upload-artifact@v7.0.1
+        if: failure()
+        with:
+          name: fuzz-artifacts
+          path: fuzz/artifacts
+
+  # The optimised build, on all three platforms. A bug that only appears under
+  # optimisation is real and worth a job, it is just not worth one per commit.
+  test-release:
+    needs: wanted
+    if: needs.wanted.outputs.run == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          ref: ${{ needs.wanted.outputs.ref }}
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2.9.2
+      - run: cargo test --workspace --locked --release
+
+  # The benchmarks have to keep compiling and keep running. This does not
+  # measure anything, it runs one iteration of each so that a benchmark which
+  # panics or no longer builds is caught here rather than on the bench box.
+  bench-smoke:
+    needs: wanted
+    if: needs.wanted.outputs.run == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          ref: ${{ needs.wanted.outputs.ref }}
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2.9.2
+      - run: cargo bench --workspace --locked -- --test
+
+  # Somebody with nothing but rustup should be able to clone and build. No
+  # cache, no toolchain file, no repository specific setup. This is the one job
+  # here that is deliberately slow, because a cache would defeat its point.
+  from-source:
+    needs: wanted
+    if: needs.wanted.outputs.run == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          ref: ${{ needs.wanted.outputs.ref }}
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo build --workspace --release --locked
+      - run: cargo test --workspace --release --locked --no-fail-fast
