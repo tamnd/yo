@@ -47,6 +47,23 @@
 //! # Ok::<(), yo::Error>(())
 //! ```
 //!
+//! # The same store the wire talks to
+//!
+//! [`Db::strings`] is the Redis string keyspace and [`Db::counter`] is one key
+//! of it. A program that calls `incr` here runs the same code an `INCR` off a
+//! socket runs (Y23), without the socket, the parser or the reply, so the
+//! embedded API and a Redis client are two doors into one store rather than two
+//! stores that agree for now.
+//!
+//! ```
+//! let db = yo::open(yo::MEMORY)?;
+//! let hits = db.counter("hits");
+//!
+//! hits.incr()?;
+//! assert_eq!(db.strings().get("hits")?.as_deref(), Some(&b"1"[..]));
+//! # Ok::<(), yo::Error>(())
+//! ```
+//!
 //! # Zero copy is available, never mandatory
 //!
 //! [`Map::get`] hands back an owned value because that is what most code
@@ -72,11 +89,15 @@
 
 #![deny(missing_docs)]
 
+pub mod counter;
 pub mod db;
+pub mod keyspace;
 pub mod map;
 pub mod store;
 
+pub use counter::Counter;
 pub use db::{Db, MEMORY, open};
+pub use keyspace::Strings;
 pub use map::Map;
 pub use store::{Decode, Encode};
 pub use yo_common::{Code, Error, Result};

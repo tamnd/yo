@@ -1,4 +1,5 @@
-//! The database and the one call that opens it.
+//! The database, the one call that opens it, and the handle everything else
+//! reaches it through.
 
 use core::cell::RefCell;
 use std::rc::Rc;
@@ -7,6 +8,8 @@ use yo_common::{Code, Error, Result};
 use yo_index::RawMap;
 use yo_shape::{Desc, Tag};
 
+use crate::counter::Counter;
+use crate::keyspace::Strings;
 use crate::map::Map;
 use crate::store::Decode;
 
@@ -35,9 +38,13 @@ pub fn open(path: &str) -> Result<Db> {
         ));
     }
     Ok(Db {
-        inner: Rc::new(RefCell::new(Inner {
-            collections: Vec::new(),
-        })),
+        db: Handle {
+            inner: Rc::new(RefCell::new(Inner {
+                collections: Vec::new(),
+                strings: yo_kv::Strings::new(),
+                deadlines: false,
+            })),
+        },
     })
 }
 
@@ -53,7 +60,7 @@ pub fn open(path: &str) -> Result<Db> {
 /// arrive with it.
 #[derive(Clone)]
 pub struct Db {
-    inner: Rc<RefCell<Inner>>,
+    db: Handle,
 }
 
 impl core::fmt::Debug for Db {
@@ -66,14 +73,80 @@ impl core::fmt::Debug for Db {
     }
 }
 
+/// The database itself, which one thread owns and reaches through [`Handle`].
 pub(crate) struct Inner {
     pub(crate) collections: Vec<Collection>,
+    pub(crate) strings: yo_kv::Strings,
+    /// Whether any key has ever been given a deadline, which is exactly when
+    /// the clock's answer can be observed. See `keyspace`'s module docs.
+    pub(crate) deadlines: bool,
 }
 
 pub(crate) struct Collection {
     pub(crate) name: String,
     pub(crate) desc: Desc,
     pub(crate) data: RawMap,
+}
+
+/// A shared, cheap pointer to one database.
+///
+/// Every handle the user holds is one of these plus whatever names the thing
+/// it points at, so a `Map` is two words and an index and a `Counter` is two
+/// words and a key.
+#[derive(Clone)]
+pub(crate) struct Handle {
+    inner: Rc<RefCell<Inner>>,
+}
+
+impl Handle {
+    /// Run something against the database, with the clock brought up to date
+    /// first if any deadline exists to compare against.
+    pub(crate) fn run<R>(&self, f: impl FnOnce(&mut Inner) -> Result<R>) -> Result<R> {
+        let mut inner = self.inner.try_borrow_mut().map_err(|_| reentrant())?;
+        if inner.deadlines {
+            inner.strings.clock_mut().refresh();
+        }
+        f(&mut inner)
+    }
+
+    /// The same, for something that is about to create a deadline.
+    pub(crate) fn deadlines<R>(&self, f: impl FnOnce(&mut Inner) -> Result<R>) -> Result<R> {
+        let mut inner = self.inner.try_borrow_mut().map_err(|_| reentrant())?;
+        inner.deadlines = true;
+        inner.strings.clock_mut().refresh();
+        f(&mut inner)
+    }
+
+    /// A shared look at the database, which is what a read of a typed
+    /// collection needs and nothing more.
+    pub(crate) fn read<R>(&self, f: impl FnOnce(&Inner) -> Result<R>) -> Result<R> {
+        let inner = self.inner.try_borrow().map_err(|_| reentrant())?;
+        f(&inner)
+    }
+
+    /// A write that no deadline can be observed through, which is every write
+    /// to a typed collection so far. The clock is left where it is.
+    pub(crate) fn write<R>(&self, f: impl FnOnce(&mut Inner) -> Result<R>) -> Result<R> {
+        let mut inner = self.inner.try_borrow_mut().map_err(|_| reentrant())?;
+        f(&mut inner)
+    }
+
+    /// Whether two handles point at the same database.
+    pub(crate) fn is(&self, other: &Handle) -> bool {
+        Rc::ptr_eq(&self.inner, &other.inner)
+    }
+}
+
+/// The error a call made from inside another call's callback gets.
+///
+/// A database that panics because of how the caller nested two of its own
+/// methods is a database people stop trusting, so re-entrancy is an error
+/// value with a sentence attached rather than a `RefCell` panic.
+pub(crate) fn reentrant() -> Error {
+    Error::new(
+        Code::Invalid,
+        "this database is already in use by the call above this one. A closure passed to with() or update() cannot call back into the same database, so read what you need first and write after the closure returns",
+    )
 }
 
 impl Db {
@@ -91,41 +164,79 @@ impl Db {
     pub fn map<K: Decode, V: Decode>(&self, name: &str) -> Result<Map<K, V>> {
         let mut desc = Desc::new();
         desc.map(K::describe, V::describe);
-
         let tag = desc.tag();
-        let mut inner = self.borrow_mut()?;
-        let at = match inner.collections.iter().position(|c| c.name == name) {
-            Some(at) => {
-                yo_shape::check(name, &inner.collections[at].desc, &desc, None)?;
-                at
-            }
-            None => {
-                inner.collections.push(Collection {
-                    name: name.to_owned(),
-                    desc,
-                    data: RawMap::new(),
-                });
-                inner.collections.len() - 1
-            }
-        };
-        drop(inner);
-        Ok(Map::new(Rc::clone(&self.inner), at, tag))
+
+        let at =
+            self.db.write(
+                |inner| match inner.collections.iter().position(|c| c.name == name) {
+                    Some(at) => {
+                        yo_shape::check(name, &inner.collections[at].desc, &desc, None)?;
+                        Ok(at)
+                    }
+                    None => {
+                        inner.collections.push(Collection {
+                            name: name.to_owned(),
+                            desc,
+                            data: RawMap::new(),
+                        });
+                        Ok(inner.collections.len() - 1)
+                    }
+                },
+            )?;
+        Ok(Map::new(self.db.clone(), at, tag))
     }
 
-    /// The names of the collections in this database, in the order they were
-    /// first opened.
+    /// The Redis string keyspace.
+    ///
+    /// The same store a client reaches over RESP, reached without the socket,
+    /// the parser or the reply (Y23). Not a named collection, because in Redis
+    /// a string is not one: it is the keyspace itself.
+    ///
+    /// ```
+    /// let db = yo::open(yo::MEMORY)?;
+    /// assert_eq!(db.strings().incr("hits")?, 1);
+    /// # Ok::<(), yo::Error>(())
+    /// ```
+    #[must_use]
+    pub fn strings(&self) -> Strings {
+        Strings {
+            db: self.db.clone(),
+        }
+    }
+
+    /// A counter at one key, which is `15` section 2's `db.counter("hits")`.
+    ///
+    /// Sugar over [`Db::strings`] and worth having: a counter is the commonest
+    /// thing a string key is, and a handle that holds the key means the key is
+    /// spelled once rather than at every call site.
+    ///
+    /// ```
+    /// let db = yo::open(yo::MEMORY)?;
+    /// let hits = db.counter("hits");
+    ///
+    /// hits.incr()?;
+    /// hits.add(9)?;
+    /// assert_eq!(hits.get()?, 10);
+    /// # Ok::<(), yo::Error>(())
+    /// ```
+    #[must_use]
+    pub fn counter(&self, key: impl Into<Vec<u8>>) -> Counter {
+        Counter {
+            db: self.db.clone(),
+            key: key.into(),
+        }
+    }
+
+    /// The names of the typed collections in this database, in the order they
+    /// were first opened.
     ///
     /// # Errors
     ///
     /// [`Code::Invalid`] if called from inside a callback that is already
     /// holding this database.
     pub fn collections(&self) -> Result<Vec<String>> {
-        Ok(self
-            .borrow()?
-            .collections
-            .iter()
-            .map(|c| c.name.clone())
-            .collect())
+        self.db
+            .read(|inner| Ok(inner.collections.iter().map(|c| c.name.clone()).collect()))
     }
 
     /// The shape of a collection, if it exists.
@@ -135,37 +246,48 @@ impl Db {
     /// [`Code::Invalid`] if called from inside a callback that is already
     /// holding this database.
     pub fn shape(&self, name: &str) -> Result<Option<Tag>> {
-        Ok(self
-            .borrow()?
-            .collections
-            .iter()
-            .find(|c| c.name == name)
-            .map(|c| c.desc.tag()))
+        self.db.read(|inner| {
+            Ok(inner
+                .collections
+                .iter()
+                .find(|c| c.name == name)
+                .map(|c| c.desc.tag()))
+        })
     }
 
-    /// What this database is holding, index and arena together.
+    /// What this database is holding, index and arena together, across the
+    /// keyspace and every typed collection.
     ///
     /// # Errors
     ///
     /// [`Code::Invalid`] if called from inside a callback that is already
     /// holding this database.
     pub fn memory_bytes(&self) -> Result<usize> {
-        Ok(self
-            .borrow()?
-            .collections
-            .iter()
-            .map(|c| c.data.memory_bytes())
-            .sum())
+        self.db.read(|inner| {
+            Ok(inner.strings.memory_bytes()
+                + inner
+                    .collections
+                    .iter()
+                    .map(|c| c.data.memory_bytes())
+                    .sum::<usize>())
+        })
     }
 
-    fn borrow(&self) -> Result<core::cell::Ref<'_, Inner>> {
-        self.inner.try_borrow().map_err(|_| crate::map::reentrant())
+    /// Whether this database reads the clock on the data path.
+    ///
+    /// False until something is given a deadline, because until then the
+    /// clock's answer cannot change any reply. `04` section 5 is the reason
+    /// this is worth a method: a clock read is tens of nanoseconds against a
+    /// budget of a hundred and fifty.
+    #[must_use]
+    pub fn reads_the_clock(&self) -> bool {
+        self.db.read(|inner| Ok(inner.deadlines)).unwrap_or(false)
     }
 
-    fn borrow_mut(&self) -> Result<core::cell::RefMut<'_, Inner>> {
-        self.inner
-            .try_borrow_mut()
-            .map_err(|_| crate::map::reentrant())
+    /// Whether two databases are the same one.
+    #[must_use]
+    pub fn is(&self, other: &Db) -> bool {
+        self.db.is(&other.db)
     }
 }
 
@@ -220,6 +342,23 @@ mod tests {
         assert_eq!(db.collections().unwrap().len(), 2);
     }
 
+    /// A typed collection and the Redis keyspace do not see each other, which
+    /// is what the catalogue in `07` section 5 says: a collection is a name,
+    /// and the string type is the keyspace.
+    #[test]
+    fn a_typed_collection_and_the_keyspace_are_not_the_same_store() {
+        let db = open(MEMORY).unwrap();
+        let map = db.map::<String, u64>("hits").unwrap();
+        map.set("home", &1).unwrap();
+        db.strings().set("home", "elsewhere").unwrap();
+
+        assert_eq!(map.get("home").unwrap(), Some(1));
+        assert_eq!(
+            db.strings().get("home").unwrap().as_deref(),
+            Some(&b"elsewhere"[..])
+        );
+    }
+
     #[test]
     fn a_shape_can_be_read_back_and_an_unopened_name_has_none() {
         let db = open(MEMORY).unwrap();
@@ -241,6 +380,9 @@ mod tests {
                 .unwrap(),
             Some(3)
         );
+        assert!(db.is(&same));
+        assert!(!db.is(&open(MEMORY).unwrap()));
         assert!(db.memory_bytes().unwrap() > 0);
+        assert!(format!("{db:?}").contains("hits"));
     }
 }

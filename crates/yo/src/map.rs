@@ -1,28 +1,14 @@
 //! `Map<K, V>`, the first typed handle (`15` section 2).
 
-use core::cell::RefCell;
 use core::marker::PhantomData;
 use std::borrow::Borrow;
-use std::rc::Rc;
 
 use yo_common::{Code, Error, Result};
 use yo_index::RawMap;
 use yo_shape::Tag;
 
-use crate::db::Inner;
+use crate::db::Handle;
 use crate::store::{Decode, Encode};
-
-/// The error a call made from inside another call's callback gets.
-///
-/// A database that panics because of how the caller nested two of its own
-/// methods is a database people stop trusting, so re-entrancy is an error
-/// value with a sentence attached rather than a `RefCell` panic.
-pub(crate) fn reentrant() -> Error {
-    Error::new(
-        Code::Invalid,
-        "this database is already in use by the call above this one. A closure passed to with() or update() cannot call back into the same database, so read what you need first and write after the closure returns",
-    )
-}
 
 /// A map from `K` to `V`.
 ///
@@ -50,7 +36,7 @@ pub(crate) fn reentrant() -> Error {
 /// # Ok::<(), yo::Error>(())
 /// ```
 pub struct Map<K, V> {
-    inner: Rc<RefCell<Inner>>,
+    db: Handle,
     at: usize,
     tag: Tag,
     /// `fn() -> (K, V)` rather than `(K, V)` so that the handle's auto traits
@@ -61,7 +47,7 @@ pub struct Map<K, V> {
 impl<K, V> Clone for Map<K, V> {
     fn clone(&self) -> Map<K, V> {
         Map {
-            inner: Rc::clone(&self.inner),
+            db: self.db.clone(),
             at: self.at,
             tag: self.tag,
             marker: PhantomData,
@@ -72,18 +58,17 @@ impl<K, V> Clone for Map<K, V> {
 impl<K, V> core::fmt::Debug for Map<K, V> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         let name = self
-            .inner
-            .try_borrow()
-            .map(|inner| inner.collections[self.at].name.clone())
+            .db
+            .read(|inner| Ok(inner.collections[self.at].name.clone()))
             .unwrap_or_else(|_| "?".to_owned());
         f.debug_struct("Map").field("name", &name).finish()
     }
 }
 
 impl<K: Decode, V: Decode> Map<K, V> {
-    pub(crate) fn new(inner: Rc<RefCell<Inner>>, at: usize, tag: Tag) -> Map<K, V> {
+    pub(crate) fn new(db: Handle, at: usize, tag: Tag) -> Map<K, V> {
         Map {
-            inner,
+            db,
             at,
             tag,
             marker: PhantomData,
@@ -256,13 +241,11 @@ impl<K: Decode, V: Decode> Map<K, V> {
     }
 
     fn read<R>(&self, f: impl FnOnce(&crate::db::Collection) -> Result<R>) -> Result<R> {
-        let inner = self.inner.try_borrow().map_err(|_| reentrant())?;
-        f(&inner.collections[self.at])
+        self.db.read(|inner| f(&inner.collections[self.at]))
     }
 
     fn write<R>(&self, f: impl FnOnce(&mut crate::db::Collection) -> Result<R>) -> Result<R> {
-        let mut inner = self.inner.try_borrow_mut().map_err(|_| reentrant())?;
-        f(&mut inner.collections[self.at])
+        self.db.write(|inner| f(&mut inner.collections[self.at]))
     }
 }
 
