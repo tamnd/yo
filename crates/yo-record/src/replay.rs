@@ -208,6 +208,24 @@ mod tests {
     const PAGE: usize = 8192;
     const PAYLOAD: usize = PAGE - PAGE_HEADER_LEN;
 
+    /// A prefix and a decimal number, the same bytes `format!` would give.
+    ///
+    /// Hand written for the same reason as the copy in `compact.rs`: Miri
+    /// charges per operation, and the formatting machinery costs milliseconds
+    /// per call where this costs microseconds.
+    fn nkey(prefix: &str, n: u32) -> Vec<u8> {
+        let mut out = prefix.as_bytes().to_vec();
+        push_num(&mut out, n);
+        out
+    }
+
+    fn push_num(out: &mut Vec<u8>, n: u32) {
+        if n >= 10 {
+            push_num(out, n / 10);
+        }
+        out.push(b'0' + (n % 10) as u8);
+    }
+
     /// A log with `n` records in it, flushed, plus what went in.
     fn written(n: u32) -> (Log<MemorySink>, Vec<(u64, Vec<u8>)>) {
         let mut log = Log::new(
@@ -224,10 +242,8 @@ mod tests {
         let h = RecordHeader::new(RecordKind::String);
         let mut want = Vec::new();
         for i in 0..n {
-            let value = format!("value number {i}").into_bytes();
-            let a = log
-                .append(&h, format!("key{i}").as_bytes(), &value)
-                .unwrap();
+            let value = nkey("value number ", i);
+            let a = log.append(&h, &nkey("key", i), &value).unwrap();
             want.push((a.addr, value));
         }
         log.commit_pending().unwrap();
@@ -298,8 +314,7 @@ mod tests {
         .unwrap();
         let h = RecordHeader::new(RecordKind::String);
         for i in 0..600u32 {
-            log.append(&h, format!("key{i}").as_bytes(), &[0u8; 40])
-                .unwrap();
+            log.append(&h, &nkey("key", i), &[0u8; 40]).unwrap();
             if i % 100 == 0 {
                 log.advance_epoch();
             }

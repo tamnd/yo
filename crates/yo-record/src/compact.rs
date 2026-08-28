@@ -309,6 +309,25 @@ mod tests {
         .unwrap()
     }
 
+    /// A prefix and a decimal number, the same bytes `format!` would give.
+    ///
+    /// Written by hand because Miri charges per operation rather than per
+    /// instruction, and the formatting machinery is a couple of milliseconds of
+    /// interpreted work for what is three digits. The tests below call this
+    /// about six thousand times, so it is worth a dozen lines here.
+    fn nkey(prefix: &str, n: u32) -> Vec<u8> {
+        let mut out = prefix.as_bytes().to_vec();
+        push_num(&mut out, n);
+        out
+    }
+
+    fn push_num(out: &mut Vec<u8>, n: u32) {
+        if n >= 10 {
+            push_num(out, n / 10);
+        }
+        out.push(b'0' + (n % 10) as u8);
+    }
+
     /// Writes `key` and keeps the index in step, which is what the shard does.
     fn put(log: &mut Log<MemorySink>, idx: &mut Map, key: &[u8], value: &[u8]) -> u64 {
         let a = log
@@ -354,7 +373,7 @@ mod tests {
             put(
                 &mut log,
                 &mut idx,
-                format!("filler{i}").as_bytes(),
+                &nkey("filler", i),
                 &[0u8; 60],
             );
         }
@@ -438,8 +457,10 @@ mod tests {
         let rounds: u32 = if cfg!(miri) { 20 } else { 40 };
         for round in 0..rounds {
             for k in 0..80u32 {
-                let key = format!("key{k}").into_bytes();
-                let value = format!("round{round}value{k}").into_bytes();
+                let key = nkey("key", k);
+                let mut value = nkey("round", round);
+                value.extend_from_slice(b"value");
+                push_num(&mut value, k);
                 put(&mut log, &mut idx, &key, &value);
                 want.insert(key, value);
             }
@@ -470,7 +491,7 @@ mod tests {
         let mut log = log_of(Durability::Group);
         let mut idx = Map::default();
         for i in 0..600u32 {
-            put(&mut log, &mut idx, format!("k{i}").as_bytes(), &[7u8; 60]);
+            put(&mut log, &mut idx, &nkey("k", i), &[7u8; 60]);
         }
         log.commit_pending().unwrap();
 
@@ -494,7 +515,7 @@ mod tests {
         let mut log = log_of(Durability::Group);
         let mut idx = Map::default();
         for i in 0..400u32 {
-            put(&mut log, &mut idx, format!("k{i}").as_bytes(), &[0u8; 60]);
+            put(&mut log, &mut idx, &nkey("k", i), &[0u8; 60]);
         }
         log.commit_pending().unwrap();
         let target = log.compaction_target();
@@ -517,7 +538,7 @@ mod tests {
             .unwrap();
         idx.by_key.insert(b"gone".to_vec(), t.addr);
         for i in 0..400u32 {
-            put(&mut log, &mut idx, format!("k{i}").as_bytes(), &[0u8; 60]);
+            put(&mut log, &mut idx, &nkey("k", i), &[0u8; 60]);
         }
         log.commit_pending().unwrap();
 
@@ -551,7 +572,7 @@ mod tests {
         let a = log.append_bytes(&raw[..n]).unwrap();
 
         for i in 0..400u32 {
-            put(&mut log, &mut idx, format!("k{i}").as_bytes(), &[0u8; 60]);
+            put(&mut log, &mut idx, &nkey("k", i), &[0u8; 60]);
         }
         log.commit_pending().unwrap();
         assert!(a.addr < log.head());
@@ -638,7 +659,7 @@ mod tests {
                 )
                 .unwrap();
             for i in 0..400u32 {
-                put(&mut log, &mut idx, format!("k{i}").as_bytes(), &[0u8; 60]);
+                put(&mut log, &mut idx, &nkey("k", i), &[0u8; 60]);
             }
             log.commit_pending().unwrap();
             assert!(chunk.addr < log.head(), "the chunk never became stable");
@@ -662,7 +683,7 @@ mod tests {
         let mut log = log_of(Durability::Group);
         let mut idx = Map::default();
         for i in 0..200u32 {
-            put(&mut log, &mut idx, format!("k{i}").as_bytes(), &[0u8; 60]);
+            put(&mut log, &mut idx, &nkey("k", i), &[0u8; 60]);
         }
         log.commit_pending().unwrap();
         assert!(
