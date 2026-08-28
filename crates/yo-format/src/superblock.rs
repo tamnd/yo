@@ -489,6 +489,32 @@ mod tests {
     use super::*;
     use crate::DEFAULT_PAGE_SIZE;
 
+    // How far apart the bit flips in `a_flipped_bit_anywhere_in_the_slot_is_caught`
+    // are. A prime, so the stride does not fall into step with the four byte
+    // fields and keep landing on the same byte of each.
+    #[cfg(miri)]
+    const STEP: usize = 601;
+    #[cfg(not(miri))]
+    const STEP: usize = 1;
+
+    // The offsets a stride has no business missing: the ends of the magic, the
+    // version, the page size, the checksum's own four bytes, and the last byte
+    // of the slot.
+    #[cfg(miri)]
+    const BY_HAND: [usize; 9] = [
+        0,
+        15,
+        16,
+        20,
+        24,
+        CRC_OFFSET,
+        CRC_OFFSET + 3,
+        16382,
+        SUPERBLOCK_LEN - 1,
+    ];
+    #[cfg(not(miri))]
+    const BY_HAND: [usize; 0] = [];
+
     fn a_slot() -> ([u8; SUPERBLOCK_LEN], Superblock) {
         let sb = Superblock {
             page_size: DEFAULT_PAGE_SIZE,
@@ -555,7 +581,15 @@ mod tests {
         // Every byte, not a sample. Sixteen thousand checksums is a few
         // milliseconds and it is the difference between believing the checksum
         // covers the whole slot and knowing it.
-        for i in 0..SUPERBLOCK_LEN {
+        //
+        // Under Miri each of those iterations copies and then checksums 16 KiB
+        // interpreted rather than executed, and sixteen thousand of them do not
+        // finish inside a CI job's six hour ceiling. So Miri walks a stride and
+        // visits the offsets that mean something by hand. What Miri is here for
+        // is whether this code has undefined behaviour, and a stride runs every
+        // line of it. The claim that the checksum covers all 16 KiB is still
+        // checked on every ordinary run, which is where it belongs.
+        for i in (0..SUPERBLOCK_LEN).step_by(STEP).chain(BY_HAND) {
             let mut bad = good;
             bad[i] ^= 0x40;
             let err = Superblock::decode(&bad).unwrap_err();
