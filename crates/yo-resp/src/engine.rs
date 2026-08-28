@@ -63,6 +63,7 @@ use std::collections::VecDeque;
 use yo_reactor::{BATCH_MAX, Engine, Reactor};
 
 use crate::dispatch::{Args, Flow, Server, Session, execute, lookup};
+use crate::error::ProtocolError;
 use crate::proto::{Limits, Proto};
 use crate::reply::Out;
 use crate::request::{Argv, Step};
@@ -188,6 +189,22 @@ struct Conn {
     pending: u32,
     /// This connection is on its way out, once what is buffered has gone.
     closing: bool,
+    /// A protocol error waiting for the commands in front of it to answer.
+    ///
+    /// The framing finds the error before any of the batch it was framed with
+    /// has run, and writing the error there would put it in front of replies
+    /// the client is still owed. Redis answers in order, so this waits until
+    /// nothing is pending and goes out last.
+    deferred: Option<ProtocolError>,
+    /// Everything still queued for this connection is thrown away unanswered.
+    ///
+    /// `QUIT` sets this and a protocol error does not, which is the difference
+    /// between the two ways a connection ends. A client that pipelines `QUIT`
+    /// and then `SET` has said goodbye and then said something after it, and
+    /// Redis answers the goodbye and drops the rest. A client that sends two
+    /// good commands and then a malformed one gets both good ones answered,
+    /// because they were complete and correct before the stream went wrong.
+    skip: bool,
     /// The peer is gone, so there is nothing to answer and nothing to write.
     gone: bool,
     /// Already on the dirty list.
@@ -207,6 +224,8 @@ impl Conn {
             partial: None,
             pending: 0,
             closing: false,
+            deferred: None,
+            skip: false,
             gone: false,
             dirty: false,
         })
@@ -222,6 +241,8 @@ impl Conn {
         self.partial = None;
         self.pending = 0;
         self.closing = false;
+        self.deferred = None;
+        self.skip = false;
         self.gone = false;
         self.dirty = false;
     }
@@ -437,10 +458,11 @@ impl<S: Sink> Wire<S> {
                 }
                 Err(e) => {
                     self.spare.push(slot);
-                    self.scratch.clear();
-                    e.write_reply(&mut self.scratch);
                     let c = &mut self.conns[conn as usize];
-                    c.out.raw(&self.scratch);
+                    // Held rather than written, so it lands behind the replies
+                    // to the commands that were framed in front of it out of
+                    // the same read.
+                    c.deferred = Some(e);
                     // Redis closes after a protocol error and so do we: the two
                     // ends no longer agree on where the next command starts.
                     c.closing = true;
@@ -515,6 +537,14 @@ impl<S: Sink> Wire<S> {
                 return false;
             }
         }
+        // A protocol error goes out once everything in front of it has.
+        if self.conns[conn as usize].pending == 0
+            && let Some(e) = self.conns[conn as usize].deferred.take()
+        {
+            self.scratch.clear();
+            e.write_reply(&mut self.scratch);
+            self.conns[conn as usize].out.raw(&self.scratch);
+        }
 
         let taken = {
             let c = &self.conns[conn as usize];
@@ -582,10 +612,10 @@ impl<S: Sink> Engine for Wire<S> {
         let flow = {
             let c = &mut self.conns[cmd.conn as usize];
             c.pending -= 1;
-            if c.gone {
-                // Nobody to answer. The decoder still has to come back and the
-                // slot still has to be released, which is why this is not an
-                // early return.
+            if c.gone || c.skip {
+                // Nobody to answer, or nobody who should be. The decoder still
+                // has to come back and the slot still has to be released, which
+                // is why this is not an early return.
                 Flow::Continue
             } else {
                 let args = Args::new(&self.argvs[cmd.slot as usize], &c.buf[cmd.base..]);
@@ -601,7 +631,12 @@ impl<S: Sink> Engine for Wire<S> {
             }
         } else {
             if flow == Flow::Close {
-                self.conns[cmd.conn as usize].closing = true;
+                let c = &mut self.conns[cmd.conn as usize];
+                c.closing = true;
+                // Anything the client pipelined behind the `QUIT` was sent
+                // before it knew the answer, and running it would be acting on
+                // a connection that has already been said goodbye to.
+                c.skip = true;
             }
             self.soil(cmd.conn);
         }
@@ -752,6 +787,53 @@ mod tests {
         let again = r.engine_mut().accept();
         assert_eq!(again, conn);
         assert_eq!(r.engine().clients(), 1);
+    }
+
+    /// Redis's own unit/quit, which caught this: we answered the `QUIT` and
+    /// then ran the `SET` behind it.
+    #[test]
+    fn what_a_client_pipelined_behind_quit_is_never_run() {
+        let (mut r, conn, mut batch) = engine();
+        let mut stream = wire(&[b"QUIT"]);
+        stream.extend(wire(&[b"SET", b"foo", b"bar"]));
+        r.engine_mut().feed(conn, &stream);
+        // Both were framed, because framing happens before anything runs.
+        assert_eq!(r.engine().ready(), 2);
+        pump(&mut r, &mut batch);
+
+        // One reply and not two, and the connection is gone.
+        assert_eq!(r.engine().sink().sent(conn), b"+OK\r\n");
+        assert!(r.engine().sink().was_closed(conn));
+
+        // And the write never happened, which is the part a client can see
+        // after it reconnects. The recorder is cleared first because the next
+        // connection lands back in the slot this one just left, and what was
+        // written to the slot before is still sitting in it.
+        r.engine_mut().sink_mut().clear();
+        let next = r.engine_mut().accept();
+        r.engine_mut().feed(next, &wire(&[b"GET", b"foo"]));
+        pump(&mut r, &mut batch);
+        assert_eq!(r.engine().sink().sent(next), b"$-1\r\n");
+    }
+
+    /// The other way a connection ends, which does not throw anything away.
+    #[test]
+    fn commands_that_arrived_before_a_protocol_error_are_still_answered() {
+        let (mut r, conn, mut batch) = engine();
+        let mut stream = wire(&[b"SET", b"k", b"v"]);
+        stream.extend(wire(&[b"GET", b"k"]));
+        stream.extend_from_slice(b"*1\r\n+notabulk\r\n");
+        r.engine_mut().feed(conn, &stream);
+        pump(&mut r, &mut batch);
+
+        // Both good commands were complete and correct before the stream went
+        // wrong, so both are answered and the error comes after them.
+        let sent = r.engine().sink().sent(conn);
+        assert!(
+            sent.starts_with(b"+OK\r\n$1\r\nv\r\n-ERR Protocol error: "),
+            "{sent:?}"
+        );
+        assert!(r.engine().sink().was_closed(conn));
     }
 
     #[test]
