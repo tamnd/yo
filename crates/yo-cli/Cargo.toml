@@ -17,6 +17,12 @@ workspace = true
 # wrote the file agrees with it about everything, including the mistakes.
 yo-reader = { workspace = true }
 
+# `yodb serve` is the socket in front of the engine. The engine writes into a
+# sink and this crate is where that sink is a socket, which keeps the protocol
+# crate free of any idea of what a network is.
+yo-reactor = { workspace = true }
+yo-resp = { workspace = true }
+
 # The tests are the one place both sides are allowed in the same binary. They
 # build real files with the engine and then check them with the tool, which is
 # the only way to find out whether the tool would notice anything.
