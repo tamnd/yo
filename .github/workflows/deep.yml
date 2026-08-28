@@ -13,6 +13,15 @@ name: deep
 # hours and seventeen minutes and was killed by the runner's own six hour
 # ceiling, which is a long time to wait to be told nothing. A job that hangs
 # should say so while somebody is still awake.
+#
+# Reproducing a Miri shard locally is one shard at a time:
+#
+#     MIRIFLAGS="-Zmiri-strict-provenance -Zmiri-disable-isolation" \
+#       cargo +nightly miri test --locked -p yo-record -- --skip compact::
+#
+# One at a time and not the whole matrix at once. Miri holds the interpreted
+# program's whole heap, and eleven of them side by side will take every
+# gigabyte a laptop has and start swapping, which looks like a hang and is one.
 
 on:
   schedule:
@@ -44,7 +53,7 @@ jobs:
     outputs:
       run: ${{ github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'deep') }}
       ref: ${{ github.event.inputs.ref || github.ref }}
-      crates: ${{ steps.crates.outputs.list }}
+      shards: ${{ steps.shards.outputs.list }}
     steps:
       - uses: actions/checkout@v7.0.1
         with:
@@ -53,10 +62,24 @@ jobs:
       # manifest rather than from a copy of it kept in this file. A crate added
       # next month gets interpreted without anybody remembering to come back
       # here, which is the only way a list like this stays true.
-      - id: crates
+      #
+      # `yo-record` is the exception and gets two shards. Its compaction tests
+      # are half the crate on their own and they cannot be made smaller: a
+      # `page_len` under 8192 is refused, and the number of records is what
+      # decides how many pages leave the resident window, so a smaller workload
+      # leaves no stable region to compact. Splitting them off is the only way
+      # that crate stops setting the wall clock for the whole workflow. If it
+      # ever stops being the slowest, this special case should go.
+      - id: shards
         run: |
           rm rust-toolchain.toml
-          echo "list=$(cargo metadata --no-deps --format-version 1 | jq -c '[.packages[].name] | sort')" >> "$GITHUB_OUTPUT"
+          echo "list=$(cargo metadata --no-deps --format-version 1 | jq -c '
+            [ .packages[].name
+              | select(. != "yo-record")
+              | {id: ., args: "--locked -p \(.)"} ]
+            + [ {id: "yo-record-compact", args: "--locked -p yo-record --lib compact::"},
+                {id: "yo-record-rest", args: "--locked -p yo-record -- --skip compact::"} ]
+            | sort_by(.id)')" >> "$GITHUB_OUTPUT"
       - run: echo "deep checks requested for ${{ github.event.inputs.ref || github.ref }}"
 
   # Every unsafe block in the workspace, interpreted. Miri is slow, so the
@@ -74,7 +97,7 @@ jobs:
   miri:
     needs: wanted
     if: needs.wanted.outputs.run == 'true'
-    name: miri (${{ matrix.borrows }}, ${{ matrix.crate }})
+    name: miri (${{ matrix.borrows }}, ${{ matrix.shard.id }})
     runs-on: ubuntu-latest
     timeout-minutes: 45
     strategy:
@@ -83,7 +106,7 @@ jobs:
       fail-fast: false
       matrix:
         borrows: [stacked, tree]
-        crate: ${{ fromJSON(needs.wanted.outputs.crates) }}
+        shard: ${{ fromJSON(needs.wanted.outputs.shards) }}
         include:
           - borrows: stacked
             flags: -Zmiri-strict-provenance -Zmiri-disable-isolation
@@ -101,14 +124,14 @@ jobs:
           # Every shard builds a different subset of the tree with the same
           # nightly, so without a key of its own they would race for one cache
           # entry and each keep evicting the others'.
-          key: ${{ matrix.borrows }}-${{ matrix.crate }}
+          key: ${{ matrix.borrows }}-${{ matrix.shard.id }}
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: rm rust-toolchain.toml
-      - run: cargo miri test -p ${{ matrix.crate }} --locked
+      - run: cargo miri test ${{ matrix.shard.args }}
         env:
           MIRIFLAGS: ${{ matrix.flags }}
 
-  # Twenty two shards is twenty two check names, which is more than a branch
+  # Twenty four shards is twenty four check names, which is more than a branch
   # protection rule wants to know about. This is the one to require.
   miri-done:
     needs: [wanted, miri]
