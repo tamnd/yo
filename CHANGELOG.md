@@ -6,7 +6,12 @@ While the major is 0, a minor release may break anything, including the on-disk 
 
 ## Unreleased
 
-Nothing yet.
+### Added
+
+- **`yo-resp`, the RESP2 and RESP3 codec.** The first piece of M2. Requests decode into ranges over the connection's own read buffer, so a command sees the bytes the kernel delivered and nothing is copied on the way in. Replies are written straight out as wire bytes with no intermediate value, which is Y18. Multibulk and inline requests, every RESP2 and RESP3 type, Redis's own limits, and Redis's own protocol error text character for character.
+- **One reply path for both protocols.** A command writes a map, a set or a push and the RESP2 downgrade happens in the codec rather than in the command. That is one place to test instead of three hundred, and it is what stops a command from working on one protocol and not the other.
+- **A resume state on the request decoder.** A value that arrives in ten thousand pieces is scanned once rather than ten thousand times. Without it a slow link makes the parser quadratic in the size of the value, which is a real denial of service on a real network rather than a theoretical one.
+- **A protocol fuzz target.** `12` section 11 point 3. It checks that no input panics or allocates from a count off the wire, that a decode reports exactly what it consumed, and that feeding the same bytes one at a time reaches the same verdict as feeding them all at once.
 
 ## 0.3.0 — 2026-08-28
 

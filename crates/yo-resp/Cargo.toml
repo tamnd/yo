@@ -1,0 +1,23 @@
+[package]
+name = "yo-resp"
+description = "The RESP2 and RESP3 codec: borrowed request frames in, wire bytes out, no allocation on the hot path."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+
+[dependencies]
+yo-common = { workspace = true }
+
+[dev-dependencies]
+criterion = { workspace = true }
+
+[lints]
+workspace = true
+
+[[bench]]
+name = "codec"
+harness = false

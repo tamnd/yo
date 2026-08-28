@@ -14,6 +14,7 @@ arbitrary = { version = "1", features = ["derive"] }
 yo-arena = { path = "../crates/yo-arena" }
 yo-common = { path = "../crates/yo-common" }
 yo-index = { path = "../crates/yo-index" }
+yo-resp = { path = "../crates/yo-resp" }
 yo-shard = { path = "../crates/yo-shard" }
 
 [[bin]]
@@ -40,6 +41,13 @@ bench = false
 [[bin]]
 name = "lane"
 path = "fuzz_targets/lane.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "resp"
+path = "fuzz_targets/resp.rs"
 test = false
 doc = false
 bench = false
