@@ -924,6 +924,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "yo-shape"
+version = "0.3.1"
+dependencies = [
+ "yo-common",
+]
+
+[[package]]
 name = "yo-shard"
 version = "0.3.1"
 dependencies = [

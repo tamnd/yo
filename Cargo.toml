@@ -15,6 +15,7 @@ members = [
     "crates/yo-reader",
     "crates/yo-record",
     "crates/yo-resp",
+    "crates/yo-shape",
     "crates/yo-shard",
     "crates/yo-uring",
     "xtask",
@@ -49,6 +50,7 @@ yo-reactor = { path = "crates/yo-reactor", version = "0.3.1" }
 yo-reader = { path = "crates/yo-reader", version = "0.3.1" }
 yo-record = { path = "crates/yo-record", version = "0.3.1" }
 yo-resp = { path = "crates/yo-resp", version = "0.3.1" }
+yo-shape = { path = "crates/yo-shape", version = "0.3.1" }
 yo-shard = { path = "crates/yo-shard", version = "0.3.1" }
 yo-uring = { path = "crates/yo-uring", version = "0.3.1" }
 
