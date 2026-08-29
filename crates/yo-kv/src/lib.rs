@@ -19,11 +19,12 @@
 //!
 //! The string type, which is the first row of M2, and all 26 of its commands.
 //!
-//! The set, which is the first row of M3, in ten of its seventeen commands:
+//! The set, which is the first row of M3, in all seventeen of its commands:
 //! `SADD`, `SREM`, `SCARD`, `SISMEMBER`, `SMISMEMBER`, `SMEMBERS`, `SPOP`,
-//! `SRANDMEMBER`, `SSCAN` and `SMOVE`. What is left is the seven algebra
-//! commands and their store forms. A [`Set`] is one of three representations
-//! and moves between them
+//! `SRANDMEMBER`, `SSCAN`, `SMOVE`, `SINTER`, `SINTERCARD`, `SUNION`, `SDIFF`
+//! and the three store forms. What is left on the set is not commands, it is
+//! the inline and native bands of the size ladder. A [`Set`] is one of three
+//! representations and moves between them
 //! on the same rules Redis uses, and [`Keyspace`] is where a key gets to be
 //! something other than a string: the record holds a number, the number points
 //! into a [`Slab`], and every path that deletes a key or writes over one frees
@@ -97,7 +98,7 @@ pub use lcs::{Idx as LcsIdx, LCS_MAX_CELLS, Match as LcsMatch};
 pub use listpack::{Entry, Listpack, Malformed};
 pub use scan::{Cursor, MAX_PARTS};
 pub use set::{Limits as SetLimits, Member, Set};
-pub use setops::{Plan, Table};
+pub use setops::Plan;
 pub use slab::{MAX_SLOTS, Slab};
 pub use strings::{Exists, Expire, KEY_MAX, STRING_MAX, SetOptions, SetOutcome};
 pub use ttl::{Deadlines, MAX_AT};

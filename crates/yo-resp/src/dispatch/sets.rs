@@ -39,6 +39,10 @@ use crate::reply::Out;
 const BAD_POP_COUNT: &str = "value is out of range, must be positive";
 /// What Redis says when a scan cursor is not a number.
 const BAD_CURSOR: &str = "invalid cursor";
+/// `SINTERCARD`'s three, which are its own sentences and not the usual ones.
+const BAD_NUMKEYS: &str = "numkeys should be greater than 0";
+const TOO_MANY_KEYS: &str = "Number of keys can't be greater than number of args";
+const BAD_LIMIT: &str = "LIMIT can't be negative";
 /// What `SSCAN` walks when the client does not say.
 const SCAN_COUNT: usize = 10;
 
@@ -121,6 +125,29 @@ pub(super) fn execute(db: &mut Keyspace, spec: &Spec, args: Args<'_>, out: &mut 
             args.get(3),
         )?)),
         "sscan" => scan(db, args, out)?,
+        // The algebra. The three that answer members write them before their
+        // own header, the same way SSCAN does and for the same reason: the
+        // count is what the walk produced, and finding it out first means
+        // running the whole operation twice.
+        "sinter" | "sunion" | "sdiff" => {
+            let start = out.len();
+            let mut n = 0;
+            let keys = keys(args, 1);
+            let mut take = |m: &[u8]| {
+                out.bulk(m);
+                n += 1;
+            };
+            match spec.name {
+                "sinter" => db.sinter(keys, 0, &mut take)?,
+                "sunion" => db.sunion(keys, &mut take)?,
+                _ => db.sdiff(keys, &mut take)?,
+            };
+            out.close_set(start, n);
+        }
+        "sintercard" => out.int(count(intercard(db, args)?)),
+        "sinterstore" => out.int(count(db.sinterstore(args.get(1), keys(args, 2))?)),
+        "sunionstore" => out.int(count(db.sunionstore(args.get(1), keys(args, 2))?)),
+        "sdiffstore" => out.int(count(db.sdiffstore(args.get(1), keys(args, 2))?)),
         other => unreachable!("{other} is not a set command"),
     }
     Ok(())
@@ -227,10 +254,56 @@ fn matches(pattern: Option<&[u8]>, m: Member<'_>) -> bool {
     }
 }
 
+/// `SINTERCARD numkeys key [key ...] [LIMIT limit]`.
+///
+/// The only set command that is told how many keys it has rather than taking
+/// the rest of the line, because `LIMIT` comes after them and there would
+/// otherwise be no way to tell a key named `LIMIT` from the option.
+///
+/// A limit of zero is no limit, which is Redis's reading and is the same value
+/// [`Keyspace::sintercard`] uses for it, so it goes straight through.
+fn intercard(db: &mut Keyspace, args: Args<'_>) -> Result<usize> {
+    let numkeys = match parse_i64(args.get(1)) {
+        Some(n) if n > 0 => usize::try_from(n).unwrap_or(usize::MAX),
+        _ => return Err(Error::new(Code::Invalid, BAD_NUMKEYS)),
+    };
+    // Checked against what is actually on the line rather than trusted, because
+    // a count that runs off the end would otherwise read arguments that are not
+    // there.
+    if numkeys > args.len() - 2 {
+        return Err(Error::new(Code::Invalid, TOO_MANY_KEYS));
+    }
+
+    let end = 2 + numkeys;
+    let mut limit = 0usize;
+    if end < args.len() {
+        if args.len() != end + 2 || !args::is(args.get(end), b"limit") {
+            return Err(args::syntax());
+        }
+        limit = match args.int(end + 1)? {
+            n if n >= 0 => usize::try_from(n).unwrap_or(usize::MAX),
+            _ => return Err(Error::new(Code::Invalid, BAD_LIMIT)),
+        };
+    }
+    db.sintercard(rest(args, 2, end), limit)
+}
+
 /// Every argument after the key, which for these commands is every member.
 #[inline]
 fn members(args: Args<'_>) -> impl Iterator<Item = &[u8]> + Clone {
-    (2..args.len()).map(move |i| args.get(i))
+    rest(args, 2, args.len())
+}
+
+/// Every argument from `from` on, which for the algebra commands is every key.
+#[inline]
+fn keys(args: Args<'_>, from: usize) -> impl Iterator<Item = &[u8]> + Clone {
+    rest(args, from, args.len())
+}
+
+/// Arguments `from` up to `end`, as the borrowed slices they already are.
+#[inline]
+fn rest(args: Args<'_>, from: usize, end: usize) -> impl Iterator<Item = &[u8]> + Clone {
+    (from..end).map(move |i| args.get(i))
 }
 
 /// One member as the client sees it.

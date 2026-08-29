@@ -35,6 +35,7 @@ use yo_common::Result;
 use crate::keyspace::{Keyspace, wrong_type};
 use crate::scan::Cursor;
 use crate::set::{Member, Set};
+use crate::setops;
 use crate::strings;
 use crate::value::{self, Kind};
 
@@ -371,6 +372,192 @@ impl Keyspace {
             self.drop_key(source);
         }
         Ok(true)
+    }
+
+    /// `SINTER key [key ...]`, and `SINTERCARD`'s limit.
+    ///
+    /// Zero for a limit means no limit. The count comes back whether or not the
+    /// caller collected anything, so [`Keyspace::sintercard`] is this with a
+    /// callback that throws its argument away.
+    pub fn sinter<'k, F>(
+        &mut self,
+        keys: impl Iterator<Item = &'k [u8]>,
+        limit: usize,
+        f: F,
+    ) -> Result<usize>
+    where
+        F: FnMut(&[u8]),
+    {
+        let slots = self.set_slots(keys)?;
+        // A key that is not there is an empty set, and an empty set anywhere is
+        // an empty intersection. That is the whole answer rather than a
+        // shortcut to it, and it is why a missing key is not an error.
+        if slots.is_empty() || slots.iter().any(Option::is_none) {
+            return Ok(0);
+        }
+        let sets = self.bodies_of(&slots);
+        Ok(setops::inter(&sets, limit, f))
+    }
+
+    /// `SINTERCARD numkeys key [key ...] [LIMIT limit]`.
+    pub fn sintercard<'k>(
+        &mut self,
+        keys: impl Iterator<Item = &'k [u8]>,
+        limit: usize,
+    ) -> Result<usize> {
+        self.sinter(keys, limit, |_| {})
+    }
+
+    /// `SUNION key [key ...]`.
+    ///
+    /// A key that is not there contributes nothing and is dropped rather than
+    /// emptying the answer, which is the opposite of what it does to an
+    /// intersection and is right for the same reason: an empty set adds no
+    /// members and removes none.
+    pub fn sunion<'k, F>(&mut self, keys: impl Iterator<Item = &'k [u8]>, f: F) -> Result<usize>
+    where
+        F: FnMut(&[u8]),
+    {
+        let slots = self.set_slots(keys)?;
+        let sets = self.bodies_of(&slots);
+        Ok(setops::union(&sets, f))
+    }
+
+    /// `SDIFF key [key ...]`.
+    ///
+    /// The first key is the one being walked, so a first key that is not there
+    /// is an empty answer whatever the rest hold. A later key that is not there
+    /// takes nothing away and is dropped.
+    pub fn sdiff<'k, F>(&mut self, keys: impl Iterator<Item = &'k [u8]>, f: F) -> Result<usize>
+    where
+        F: FnMut(&[u8]),
+    {
+        let slots = self.set_slots(keys)?;
+        let Some(Some(_)) = slots.first() else {
+            return Ok(0);
+        };
+        let sets = self.bodies_of(&slots);
+        Ok(setops::diff(&sets, f))
+    }
+
+    /// `SINTERSTORE destination key [key ...]`. Answers the size of the result.
+    pub fn sinterstore<'k>(
+        &mut self,
+        destination: &[u8],
+        keys: impl Iterator<Item = &'k [u8]>,
+    ) -> Result<usize> {
+        let slots = self.set_slots(keys)?;
+        let built = if slots.is_empty() || slots.iter().any(Option::is_none) {
+            None
+        } else {
+            let sets = self.bodies_of(&slots);
+            // The smallest input, which is an upper bound on any intersection.
+            let upper = sets.iter().map(|s| s.len()).min().unwrap_or(0);
+            setops::collect(upper, &self.limits, |f| {
+                setops::inter(&sets, 0, f);
+            })
+        };
+        Ok(self.put_set(destination, built))
+    }
+
+    /// `SUNIONSTORE destination key [key ...]`.
+    pub fn sunionstore<'k>(
+        &mut self,
+        destination: &[u8],
+        keys: impl Iterator<Item = &'k [u8]>,
+    ) -> Result<usize> {
+        let slots = self.set_slots(keys)?;
+        let built = {
+            let sets = self.bodies_of(&slots);
+            // Everything, since a union of sets that share nothing is all of
+            // them. Presizing to that is right and being wrong about it costs a
+            // conversion rather than a wrong answer.
+            let upper = sets.iter().map(|s| s.len()).sum();
+            setops::collect(upper, &self.limits, |f| {
+                setops::union(&sets, f);
+            })
+        };
+        Ok(self.put_set(destination, built))
+    }
+
+    /// `SDIFFSTORE destination key [key ...]`.
+    pub fn sdiffstore<'k>(
+        &mut self,
+        destination: &[u8],
+        keys: impl Iterator<Item = &'k [u8]>,
+    ) -> Result<usize> {
+        let slots = self.set_slots(keys)?;
+        let built = match slots.first() {
+            Some(Some(_)) => {
+                let sets = self.bodies_of(&slots);
+                let upper = sets[0].len();
+                setops::collect(upper, &self.limits, |f| {
+                    setops::diff(&sets, f);
+                })
+            }
+            _ => None,
+        };
+        Ok(self.put_set(destination, built))
+    }
+
+    /// Reap and resolve every key, in order, to the slot its set is in.
+    ///
+    /// `None` for a key that is not there, and an error the moment any key
+    /// holds something that is not a set. Failing on the first bad key rather
+    /// than at the end is what stops `SINTERSTORE d a not-a-set` from writing
+    /// the destination before it finds out.
+    ///
+    /// This allocates, once, for a vector of `k` slots. Every command that
+    /// calls it is answering about a whole collection and [`crate::setops`]
+    /// allocates a bigger one for its own bookkeeping, so this is not the thing
+    /// on the path Y1 is about. It is also what makes the borrow work: reaping
+    /// needs `&mut self` and reading the bodies needs `&self`, so the keys have
+    /// to be resolved before any body is looked at.
+    fn set_slots<'k>(&mut self, keys: impl Iterator<Item = &'k [u8]>) -> Result<Vec<Option<u32>>> {
+        let mut out = Vec::with_capacity(keys.size_hint().0);
+        for key in keys {
+            out.push(self.set_slot(key)?);
+        }
+        Ok(out)
+    }
+
+    /// The bodies those slots point at, with the keys that were not there gone.
+    #[inline]
+    fn bodies_of(&self, slots: &[Option<u32>]) -> Vec<&Set> {
+        slots.iter().flatten().map(|&at| self.set_at(at)).collect()
+    }
+
+    /// Put a set under `key`, replacing whatever was there.
+    ///
+    /// No set means delete the key, because an empty set does not exist. That
+    /// is what makes `SINTERSTORE d a b` with an empty intersection delete `d`
+    /// and answer zero rather than leave an empty set that `EXISTS` says one
+    /// for, and it is why [`setops::collect`] hands back an `Option`.
+    ///
+    /// The destination is allowed to be one of the sources. It is safe because
+    /// the result was built whole before this was called, so nothing here can
+    /// touch a body that is still being read. Doing it the other way round,
+    /// clearing the destination first and filling it as the walk goes, is the
+    /// shape that makes `SINTERSTORE s s a` answer nothing.
+    ///
+    /// Whatever the key held is freed first, through the one funnel, and any
+    /// deadline it had goes with it. Redis's store forms clear the TTL for the
+    /// same reason `SET` does: the value under the key is not the value the
+    /// expiry was set on.
+    fn put_set(&mut self, key: &[u8], set: Option<Set>) -> usize {
+        let Some(set) = set else {
+            self.drop_key(key);
+            return 0;
+        };
+        self.free_body(key);
+        let len = set.len();
+        let at = self.sets.insert(set);
+        let record = value::slot_record_len(false);
+        self.map.set_with(key, record, |out| {
+            value::write_slot_record(out, Kind::Set, at, None);
+        });
+        self.bodies += 1;
+        len
     }
 
     /// Hand the set under `key` to `f`, or hand it `None` if there is no key.
@@ -1012,6 +1199,232 @@ mod tests {
         assert_eq!(
             d.get(b"k").expect("still a string").map(|v| v.to_vec()),
             Some(b"v".to_vec())
+        );
+    }
+
+    /// Every algebra command, collected and sorted, so a test says what came
+    /// back rather than what order it came back in.
+    fn algebra(d: &mut Keyspace, op: &str, keys: &[&[u8]]) -> Vec<String> {
+        let mut got = Vec::new();
+        let mut take = |m: &[u8]| got.push(String::from_utf8_lossy(m).into_owned());
+        let n = match op {
+            "inter" => d.sinter(keys.iter().copied(), 0, &mut take),
+            "union" => d.sunion(keys.iter().copied(), &mut take),
+            "diff" => d.sdiff(keys.iter().copied(), &mut take),
+            other => unreachable!("{other}"),
+        }
+        .expect("sets");
+        assert_eq!(n, got.len(), "the count and the members disagree");
+        got.sort();
+        got
+    }
+
+    #[test]
+    fn the_algebra_answers_what_the_sets_share_and_do_not() {
+        let mut d = db();
+        add(&mut d, b"a", &[b"1", b"2", b"3"]);
+        add(&mut d, b"b", &[b"2", b"3", b"4"]);
+        add(&mut d, b"c", &[b"3", b"4", b"5"]);
+
+        assert_eq!(algebra(&mut d, "inter", &[b"a", b"b", b"c"]), ["3"]);
+        assert_eq!(
+            algebra(&mut d, "union", &[b"a", b"b", b"c"]),
+            ["1", "2", "3", "4", "5"]
+        );
+        assert_eq!(algebra(&mut d, "diff", &[b"a", b"b"]), ["1"]);
+        assert_eq!(
+            algebra(&mut d, "diff", &[b"a"]),
+            ["1", "2", "3"],
+            "one set is that set"
+        );
+        assert_eq!(
+            d.sintercard([b"a".as_slice(), b"b"].into_iter(), 0)
+                .expect("sets"),
+            2
+        );
+        assert_eq!(
+            d.sintercard([b"a".as_slice(), b"b"].into_iter(), 1)
+                .expect("sets"),
+            1,
+            "and a limit stops it early"
+        );
+    }
+
+    /// A key that is not there is an empty set, and an empty set does three
+    /// different things to the three operations.
+    #[test]
+    fn a_key_that_is_not_there_is_an_empty_set_everywhere() {
+        let mut d = db();
+        add(&mut d, b"a", &[b"1", b"2"]);
+
+        assert!(algebra(&mut d, "inter", &[b"a", b"nope"]).is_empty());
+        assert!(algebra(&mut d, "inter", &[b"nope", b"a"]).is_empty());
+        assert_eq!(algebra(&mut d, "union", &[b"a", b"nope"]), ["1", "2"]);
+        assert_eq!(algebra(&mut d, "diff", &[b"a", b"nope"]), ["1", "2"]);
+        assert!(
+            algebra(&mut d, "diff", &[b"nope", b"a"]).is_empty(),
+            "nothing minus anything is nothing"
+        );
+        assert!(algebra(&mut d, "union", &[b"nope"]).is_empty());
+        assert_eq!(d.len(), 1, "and none of that made a key");
+    }
+
+    #[test]
+    fn a_store_form_writes_the_answer_and_says_how_big_it_is() {
+        let mut d = db();
+        add(&mut d, b"a", &[b"1", b"2", b"3"]);
+        add(&mut d, b"b", &[b"2", b"3", b"4"]);
+
+        assert_eq!(
+            d.sinterstore(b"d", [b"a".as_slice(), b"b"].into_iter())
+                .expect("sets"),
+            2
+        );
+        assert_eq!(members(&mut d, b"d"), ["2", "3"]);
+        assert_eq!(
+            d.sunionstore(b"d", [b"a".as_slice(), b"b"].into_iter())
+                .expect("sets"),
+            4
+        );
+        assert_eq!(members(&mut d, b"d"), ["1", "2", "3", "4"]);
+        assert_eq!(
+            d.sdiffstore(b"d", [b"a".as_slice(), b"b"].into_iter())
+                .expect("sets"),
+            1
+        );
+        assert_eq!(members(&mut d, b"d"), ["1"]);
+        // An all integer answer stores as an intset, because the destination
+        // picks its representation from what actually went into it.
+        assert_eq!(d.encoding_name(b"d"), Some(Encoding::Intset.name()));
+    }
+
+    /// The rule that makes an empty answer different from an empty set: the
+    /// destination is deleted rather than left holding nothing.
+    #[test]
+    fn a_store_form_of_nothing_deletes_the_destination() {
+        let mut d = db();
+        add(&mut d, b"a", &[b"1"]);
+        add(&mut d, b"b", &[b"2"]);
+        add(&mut d, b"d", &[b"old"]);
+
+        assert_eq!(
+            d.sinterstore(b"d", [b"a".as_slice(), b"b"].into_iter())
+                .expect("sets"),
+            0
+        );
+        assert_eq!(d.kind_of(b"d"), None, "the destination went, not emptied");
+        assert!(!d.exists(b"d"));
+
+        // And the same for a difference that takes everything away, and for a
+        // source that is not there at all.
+        add(&mut d, b"d", &[b"old"]);
+        assert_eq!(
+            d.sdiffstore(b"d", [b"a".as_slice(), b"a"].into_iter())
+                .expect("sets"),
+            0
+        );
+        assert!(!d.exists(b"d"));
+        add(&mut d, b"d", &[b"old"]);
+        assert_eq!(
+            d.sunionstore(b"d", [b"nope".as_slice()].into_iter())
+                .expect("sets"),
+            0
+        );
+        assert!(!d.exists(b"d"));
+    }
+
+    /// The destination is allowed to be one of the sources, which only works
+    /// because the answer is built whole before anything is written.
+    #[test]
+    fn a_store_form_can_write_over_one_of_its_own_sources() {
+        let mut d = db();
+        add(&mut d, b"a", &[b"1", b"2", b"3"]);
+        add(&mut d, b"b", &[b"2", b"3", b"4"]);
+
+        assert_eq!(
+            d.sinterstore(b"a", [b"a".as_slice(), b"b"].into_iter())
+                .expect("sets"),
+            2
+        );
+        assert_eq!(members(&mut d, b"a"), ["2", "3"]);
+
+        // The same key named twice is not a special case either.
+        assert_eq!(
+            d.sunionstore(b"a", [b"a".as_slice(), b"a"].into_iter())
+                .expect("sets"),
+            2
+        );
+        assert_eq!(members(&mut d, b"a"), ["2", "3"]);
+    }
+
+    /// A destination that held something else is overwritten rather than
+    /// refused, which is what Redis does and is the same rule `SET` follows.
+    #[test]
+    fn a_store_form_overwrites_whatever_the_destination_held() {
+        let mut d = db();
+        add(&mut d, b"a", &[b"1", b"2"]);
+        d.set_plain(b"d", b"a string").expect("room");
+        assert!(d.set_expiry(b"d", Some(9_999_999)));
+
+        assert_eq!(
+            d.sunionstore(b"d", [b"a".as_slice()].into_iter())
+                .expect("sets"),
+            2
+        );
+        assert_eq!(d.kind_of(b"d"), Some(Kind::Set));
+        assert_eq!(members(&mut d, b"d"), ["1", "2"]);
+        assert_eq!(d.expire_at(b"d"), None, "and the deadline went with it");
+    }
+
+    /// A bad key anywhere in the list fails the whole command, and it fails
+    /// before the destination is touched rather than after.
+    #[test]
+    fn the_algebra_answers_wrongtype_before_it_writes_anything() {
+        let mut d = db();
+        add(&mut d, b"a", &[b"1"]);
+        d.set_plain(b"str", b"v").expect("room");
+        add(&mut d, b"d", &[b"old"]);
+
+        assert!(
+            d.sinter([b"a".as_slice(), b"str"].into_iter(), 0, |_| ())
+                .is_err()
+        );
+        assert!(d.sunion([b"str".as_slice()].into_iter(), |_| ()).is_err());
+        assert!(
+            d.sdiff([b"a".as_slice(), b"str"].into_iter(), |_| ())
+                .is_err()
+        );
+        assert!(
+            d.sinterstore(b"d", [b"a".as_slice(), b"str"].into_iter())
+                .is_err()
+        );
+        assert_eq!(members(&mut d, b"d"), ["old"], "and left it alone");
+    }
+
+    /// Sets across all three representations, since the algebra is the only
+    /// place where members have to cross from one to another.
+    #[test]
+    fn the_algebra_works_across_the_representations() {
+        let mut d = db();
+        let big: Vec<Vec<u8>> = (0..600).map(|i| i.to_string().into_bytes()).collect();
+        let refs: Vec<&[u8]> = big.iter().map(Vec::as_slice).collect();
+        d.sadd(b"table", refs.iter().copied()).expect("a set");
+        add(&mut d, b"ints", &[b"1", b"2", b"999"]);
+        add(&mut d, b"packed", &[b"2", b"3", b"x"]);
+        assert_eq!(d.encoding_name(b"table"), Some(Encoding::Hashtable.name()));
+        assert_eq!(d.encoding_name(b"ints"), Some(Encoding::Intset.name()));
+        assert_eq!(d.encoding_name(b"packed"), Some(Encoding::Listpack.name()));
+
+        // A member of the intset is a number that has no digits anywhere and
+        // the table holds that same member as its digits, so this only finds
+        // anything if the two agree about what a member is.
+        assert_eq!(algebra(&mut d, "inter", &[b"ints", b"table"]), ["1", "2"]);
+        assert_eq!(algebra(&mut d, "inter", &[b"packed", b"table"]), ["2", "3"]);
+        assert_eq!(algebra(&mut d, "inter", &[b"ints", b"packed"]), ["2"]);
+        assert_eq!(algebra(&mut d, "diff", &[b"ints", b"table"]), ["999"]);
+        assert_eq!(
+            algebra(&mut d, "union", &[b"ints", b"packed"]),
+            ["1", "2", "3", "999", "x"]
         );
     }
 
