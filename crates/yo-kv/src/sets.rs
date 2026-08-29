@@ -221,6 +221,51 @@ impl Keyspace {
         Ok(out)
     }
 
+    /// `SPOP key [count]`, as a borrow rather than a copy. Answers how many.
+    ///
+    /// The same draw as [`Keyspace::spop_n`] and none of the allocating. Each
+    /// member is handed to `f` where it lies and taken out afterwards, so the
+    /// bytes go from the set into the reply buffer and nothing is built in
+    /// between. `spop_n` answers a `Vec` of `Vec`s, which is one allocation and
+    /// then one more per member, and that is the right shape for an embedded
+    /// caller who wants the answer in one piece and the wrong shape for a
+    /// thread that must not allocate.
+    ///
+    /// That garbage is the whole of `SPOP`'s gate row. aki came in at 0.58x at
+    /// P16 and 0.29x at P1 on this command, and the loss was never in the draw:
+    /// the draw is an index into an array and a swap with the last row. It was
+    /// in the allocation a member on the way out.
+    ///
+    /// Drawing from the length that is left rather than the length it started
+    /// with is what makes the members distinct with no test for it, the same
+    /// reason [`Keyspace::spop_n`] gives.
+    pub fn spop_into<F>(&mut self, key: &[u8], count: usize, mut f: F) -> Result<usize>
+    where
+        F: FnMut(Member<'_>),
+    {
+        let Some(at) = self.set_slot(key)? else {
+            return Ok(0);
+        };
+        let take = count.min(self.set_at(at).len());
+        for _ in 0..take {
+            // Borrowed apart rather than through `set_at`, for the reason
+            // `srandmember_n` gives: drawing and reading are alive at the same
+            // time and a method taking `&self` would hold the whole database.
+            let rng = &mut self.rng;
+            let set = self.sets.get(at).expect("the record points at its body");
+            let pick = rng.below(set.len());
+            f(set.at(pick).expect("the draw was under the length"));
+            self.sets
+                .get_mut(at)
+                .expect("the record points at its body")
+                .drop_at(pick);
+        }
+        if self.set_at(at).is_empty() {
+            self.drop_key(key);
+        }
+        Ok(take)
+    }
+
     /// `SRANDMEMBER key`, as a borrow rather than a copy.
     ///
     /// The member is handed to `f` where it lies, so the single draw form
@@ -893,6 +938,22 @@ mod tests {
         d.sadd(key, refs.iter().copied()).expect("a set");
     }
 
+    /// `many`, and integers instead of names when asked, so a test can reach
+    /// the intset band as well as the other two.
+    fn fill(d: &mut Keyspace, key: &[u8], n: usize, ints: bool) {
+        let owned: Vec<Vec<u8>> = (0..n)
+            .map(|i| {
+                if ints {
+                    i.to_string().into_bytes()
+                } else {
+                    format!("m{i}").into_bytes()
+                }
+            })
+            .collect();
+        let refs: Vec<&[u8]> = owned.iter().map(Vec::as_slice).collect();
+        d.sadd(key, refs.iter().copied()).expect("a set");
+    }
+
     fn drawn(d: &mut Keyspace, key: &[u8], count: i64) -> Vec<String> {
         let mut out = Vec::new();
         d.srandmember_n(key, count, |m| {
@@ -951,6 +1012,75 @@ mod tests {
             "and zero is none"
         );
         assert_eq!(d.scard(b"s").expect("a set"), 6);
+    }
+
+    #[test]
+    fn the_borrowing_draw_pops_the_same_set_the_copying_one_does() {
+        // Same seed, same set, same members in the same order. If the two ever
+        // disagree then the wire and the embedded API answer differently for
+        // the same command, which is the one thing there is no excuse for.
+        for n in [4usize, 100, 300] {
+            let mut a = db();
+            a.seed(20_260_829);
+            many(&mut a, b"s", n);
+            let copied = a.spop_n(b"s", n).expect("a set");
+
+            let mut b = db();
+            b.seed(20_260_829);
+            many(&mut b, b"s", n);
+            let mut borrowed = Vec::new();
+            b.spop_into(b"s", n, |m| borrowed.push(m.to_vec()))
+                .expect("a set");
+
+            assert_eq!(copied, borrowed, "{n} members drew differently");
+            assert!(!b.exists(b"s"), "the last member took the key");
+            assert_eq!(b.sets.len(), 0, "and the body");
+        }
+    }
+
+    #[test]
+    fn the_borrowing_draw_allocates_nothing() {
+        // Every representation, because each takes a member out its own way:
+        // the intset shifts an array of integers, the listpack shifts bytes,
+        // and the table moves its last row into the hole. Also the whole set
+        // rather than part of it, so the key deletion at the end is inside the
+        // measurement and not just the draw.
+        for n in [4usize, 100, 300] {
+            for ints in [false, true] {
+                let mut d = db();
+                fill(&mut d, b"s", n, ints);
+                let (drawn, allocs) = crate::tally::counted(|| {
+                    let mut bytes = 0;
+                    let mut count = 0;
+                    d.spop_into(b"s", n, |m| {
+                        // Read the member here rather than keep it, which is
+                        // what the reply buffer does with it on the wire.
+                        bytes += m.byte_len();
+                        count += 1;
+                    })
+                    .expect("a set");
+                    (bytes, count)
+                });
+                assert_eq!(drawn.1, n, "{n} members, ints {ints}");
+                assert!(drawn.0 > 0, "the members came back empty");
+                assert_eq!(
+                    allocs, 0,
+                    "{n} members, ints {ints}: {allocs} allocations on the way out"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_copying_draw_allocates_a_member_at_a_time() {
+        // The other half of it. `spop_n` stays for the embedded caller who
+        // wants the answer in one piece, and this is what that shape costs,
+        // which is the whole reason the borrowing draw exists.
+        let mut d = db();
+        many(&mut d, b"s", 100);
+        let (got, allocs) = crate::tally::counted(|| d.spop_n(b"s", 100).expect("a set"));
+        assert_eq!(got.len(), 100);
+        assert!(allocs >= 100, "only {allocs} allocations for a hundred");
     }
 
     #[test]

@@ -450,6 +450,36 @@ impl Set {
         }
     }
 
+    /// Take out the member at `index` without building it into a `Vec` first.
+    ///
+    /// The same removal as [`Set::remove_at`] for a caller that has already read
+    /// the member and does not need it handed back. That caller is `SPOP` on the
+    /// wire, which reads with [`Set::at`], writes the bytes straight into the
+    /// reply buffer, and only then calls this. It is an allocation a member
+    /// saved on the one command in the set whose whole cost is the allocating.
+    ///
+    /// [`Set::remove_at`] stays for the embedded API, where the caller wants the
+    /// bytes and has nowhere to put them.
+    pub fn drop_at(&mut self, index: usize) -> bool {
+        match &mut self.body {
+            Body::Ints(s) => match s.get(index) {
+                Some(v) => {
+                    s.remove(v);
+                    true
+                }
+                None => false,
+            },
+            Body::Packed(lp) => {
+                if index >= lp.len() {
+                    return false;
+                }
+                lp.delete(index, 1);
+                true
+            }
+            Body::Table(t) => t.remove_at(index).is_some(),
+        }
+    }
+
     /// Whether an intset plus one non integer member would still be a listpack.
     ///
     /// Three tests, and the first is the asymmetric one: the count is compared

@@ -88,17 +88,36 @@ pub(super) fn execute(db: &mut Keyspace, spec: &Spec, args: Args<'_>, out: &mut 
         // an array, because it can hand back the same member three times and a
         // set would silently lose two of them. Redis draws the line in the same
         // place and this is why.
+        // Both forms go through the borrowing draw, which reads the member where
+        // it lies and takes it out afterwards, so a pop writes the bytes into
+        // this buffer and allocates nothing on the way. `Keyspace::spop` and
+        // `spop_n` answer a `Vec` and a `Vec` of `Vec`s and are still the right
+        // shape for an embedded caller who wants the answer in one piece.
         "spop" => match args.len() {
-            2 => match db.spop(args.get(1))? {
-                Some(m) => out.bulk(&m),
-                None => out.nil(),
-            },
-            3 => {
-                let got = db.spop_n(args.get(1), pop_count(args.get(2))?)?;
-                out.set(got.len());
-                for m in &got {
-                    out.bulk(m);
+            2 => {
+                // The header is not known until the draw has happened, because
+                // a key that is not there is a nil and not an empty set, so it
+                // is written after the fact from the count that came back.
+                let start = out.len();
+                let mut got = false;
+                db.spop_into(args.get(1), 1, |m| {
+                    write_member(out, m);
+                    got = true;
+                })?;
+                if !got {
+                    out.nil();
                 }
+                debug_assert!(out.len() > start, "a reply went out either way");
+            }
+            3 => {
+                let want = pop_count(args.get(2))?;
+                let start = out.len();
+                let mut n = 0;
+                db.spop_into(args.get(1), want, |m| {
+                    write_member(out, m);
+                    n += 1;
+                })?;
+                out.close_set(start, n);
             }
             _ => return Err(args::syntax()),
         },
