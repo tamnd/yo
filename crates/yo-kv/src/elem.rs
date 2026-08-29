@@ -68,10 +68,12 @@
 //! back when the dead share crosses a half and there are at least a few thousand
 //! of them, which is a rewrite of the blob and a walk over the rows to move
 //! their offsets, and until then they are counted and reported rather than
-//! pretended away.
+//! pretended away. That accounting lives in [`crate::blob`], because a hash's
+//! values want exactly the same thing and there should be one copy of it.
 
 use yo_common::{hash_key, tag_of};
 
+use crate::blob::Blob;
 use crate::scan::Cursor;
 
 /// The most rows one table holds.
@@ -139,9 +141,12 @@ pub struct Elements<V> {
     /// The rows, in insertion order, with no holes.
     rows: Vec<Row<V>>,
     /// Every live name, back to back, and some dead ones.
-    names: Vec<u8>,
-    /// Bytes in `names` that no row points at any more.
-    dead: usize,
+    ///
+    /// The length stays in [`NameRef`] rather than in a [`crate::blob::Span`],
+    /// because sixteen bits of it is what keeps a row at twelve bytes and a name
+    /// that needs more than sixteen bits is a value someone put in the wrong
+    /// place.
+    names: Blob,
 }
 
 impl<V: Copy> Default for Elements<V> {
@@ -160,8 +165,7 @@ impl<V: Copy> Elements<V> {
         Elements {
             slots: Box::new([]),
             rows: Vec::new(),
-            names: Vec::new(),
-            dead: 0,
+            names: Blob::new(),
         }
     }
 
@@ -329,6 +333,17 @@ impl<V: Copy> Elements<V> {
         self.rows.iter().map(|r| (self.name_of(r), &r.value))
     }
 
+    /// Every payload, to be changed in place, with no names in the way.
+    ///
+    /// A hash keeps its values in a blob of its own and the payload is where
+    /// they are, so when that blob compacts every one of those references has to
+    /// move. The names are deliberately not offered here: this borrows the rows
+    /// mutably, and handing out a name at the same time would borrow the name
+    /// blob as well for no caller that wants it.
+    pub fn payloads_mut(&mut self) -> impl Iterator<Item = &mut V> {
+        self.rows.iter_mut().map(|r| &mut r.value)
+    }
+
     /// Walk part of the table and say where to resume.
     ///
     /// This is `SSCAN`, `HSCAN` and `ZSCAN`. It reads downward from the cursor,
@@ -378,7 +393,6 @@ impl<V: Copy> Elements<V> {
     pub fn clear(&mut self) {
         self.rows.clear();
         self.names.clear();
-        self.dead = 0;
         for slot in &mut self.slots {
             *slot = EMPTY;
         }
@@ -392,7 +406,7 @@ impl<V: Copy> Elements<V> {
     pub fn memory_bytes(&self) -> usize {
         self.slots.len() * size_of::<u32>()
             + self.rows.capacity() * size_of::<Row<V>>()
-            + self.names.capacity()
+            + self.names.memory_bytes()
     }
 
     /// Name bytes no row points at any more.
@@ -402,7 +416,7 @@ impl<V: Copy> Elements<V> {
     #[inline]
     #[must_use]
     pub const fn dead_name_bytes(&self) -> usize {
-        self.dead
+        self.names.dead()
     }
 
     /// Row index for a name, or nothing.
@@ -462,7 +476,7 @@ impl<V: Copy> Elements<V> {
             self.rows.swap(at, last);
         }
         let row = self.rows.pop().expect("the table was not empty");
-        self.dead += row.name.len as usize;
+        self.names.release(row.name.len as usize);
         self.maybe_compact_names();
         row.value
     }
@@ -554,10 +568,8 @@ impl<V: Copy> Elements<V> {
 
     /// Append a name to the blob.
     fn push_name(&mut self, name: &[u8]) -> NameRef {
-        let at = u32::try_from(self.names.len()).expect("the blob is under 4 GiB");
-        self.names.extend_from_slice(name);
         NameRef {
-            at,
+            at: self.names.push(name),
             len: u16::try_from(name.len()).expect("the caller checked NAME_MAX"),
         }
     }
@@ -565,29 +577,23 @@ impl<V: Copy> Elements<V> {
     /// The bytes of one row's name.
     #[inline]
     fn name_of(&self, row: &Row<V>) -> &[u8] {
-        let at = row.name.at as usize;
-        &self.names[at..at + row.name.len as usize]
+        self.names.read(row.name.at, row.name.len as usize)
     }
 
     /// Give the dead name bytes back once there are more of them than live ones.
     ///
-    /// Half is the same line the arena's collector starts at for the same
-    /// reason: below it the copy costs more than the bytes are worth, and above
-    /// it a collection that has been rewritten holds more blob than it is using.
+    /// The line and the floor are the blob's, and walking in row order is what
+    /// leaves a name walk sequential afterwards.
     fn maybe_compact_names(&mut self) {
-        if self.dead < 4096 || self.dead * 2 < self.names.len() {
+        if !self.names.worth_compacting() {
             return;
         }
-        let mut fresh = Vec::with_capacity(self.names.len() - self.dead);
-        for row in &mut self.rows {
-            let at = row.name.at as usize;
-            let len = row.name.len as usize;
-            let to = u32::try_from(fresh.len()).expect("the blob only ever shrinks here");
-            fresh.extend_from_slice(&self.names[at..at + len]);
-            row.name.at = to;
-        }
-        self.names = fresh;
-        self.dead = 0;
+        let rows = &mut self.rows;
+        self.names.compact(|keep| {
+            for row in rows.iter_mut() {
+                keep.moved(&mut row.name.at, row.name.len as usize);
+            }
+        });
     }
 }
 
