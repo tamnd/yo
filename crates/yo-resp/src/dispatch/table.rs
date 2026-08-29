@@ -77,8 +77,11 @@ const AC_HASH_WRITE_FAST: &[&str] = &["@write", "@hash", "@fast"];
 const AC_CONN: &[&str] = &["@fast", "@connection"];
 /// The keyspace read side, which is `EXISTS` and `TYPE`.
 const AC_KEY_READ: &[&str] = &["@keyspace", "@read", "@fast"];
-/// `DEL`, which Redis does not count as fast because it frees on the spot.
-const AC_KEY_DEL: &[&str] = &["@keyspace", "@write", "@slow"];
+/// The keyspace writes that are allowed to cost what the value costs. `DEL`
+/// frees on the spot and `COPY` clones a body, and `RENAME` is in here with
+/// them even though it moves thirteen bytes, because Redis says slow for it and
+/// this list is Redis's list rather than ours.
+const AC_KEY_WRITE_SLOW: &[&str] = &["@keyspace", "@write", "@slow"];
 /// `UNLINK`, which Redis does count as fast because it does not, and the
 /// expiry writers, which move a deadline and never touch a value.
 const AC_KEY_WRITE_FAST: &[&str] = &["@keyspace", "@write", "@fast"];
@@ -1027,7 +1030,7 @@ pub static COMMANDS: &[Spec] = &[
         first_key: 1,
         last_key: -1,
         step: 1,
-        acl: AC_KEY_DEL,
+        acl: AC_KEY_WRITE_SLOW,
         since: "1.0.0",
         complexity: "O(N) in the number of keys.",
         summary: "Delete keys and say how many were there.",
@@ -1070,6 +1073,62 @@ pub static COMMANDS: &[Spec] = &[
         since: "1.0.0",
         complexity: "O(1)",
         summary: "What kind of value is under a key, or none.",
+        group: "keyspace",
+    },
+    Spec {
+        name: "touch",
+        arity: -2,
+        flags: READ_FAST,
+        first_key: 1,
+        last_key: -1,
+        step: 1,
+        acl: AC_KEY_READ,
+        since: "3.2.1",
+        complexity: "O(N) in the number of keys.",
+        summary: "Count how many of these keys are there, and move them up the eviction order.",
+        group: "keyspace",
+    },
+    // Two keys and not one, which is the 1 2 1 in the key positions. Every other
+    // row in this group names a range that runs to the end of the arguments.
+    Spec {
+        name: "rename",
+        arity: 3,
+        flags: &["write"],
+        first_key: 1,
+        last_key: 2,
+        step: 1,
+        acl: AC_KEY_WRITE_SLOW,
+        since: "1.0.0",
+        complexity: "O(1)",
+        summary: "Move a key to another name, over whatever was there.",
+        group: "keyspace",
+    },
+    Spec {
+        name: "renamenx",
+        arity: 3,
+        flags: WRITE_FAST,
+        first_key: 1,
+        last_key: 2,
+        step: 1,
+        acl: AC_KEY_WRITE_FAST,
+        since: "1.0.0",
+        complexity: "O(1)",
+        summary: "Move a key to another name, but only if that name is free.",
+        group: "keyspace",
+    },
+    // `denyoom` and no `fast`, because this is the one command in the group that
+    // allocates a whole second value.
+    Spec {
+        name: "copy",
+        arity: -3,
+        flags: &["write", "denyoom"],
+        first_key: 1,
+        last_key: 2,
+        step: 1,
+        acl: AC_KEY_WRITE_SLOW,
+        since: "6.2.0",
+        complexity: "O(N) in the size of the value.",
+        summary: "Copy a value to another key, in this database or another one.",
         group: "keyspace",
     },
     // The four writers take an optional NX, XX, GT or LT, which is the -3 in
@@ -1417,6 +1476,22 @@ pub static COMMANDS: &[Spec] = &[
         since: "1.0.0",
         complexity: "O(N) in the number of keys in this database.",
         summary: "Empty the database this connection is on.",
+        group: "server",
+    },
+    // No ACL category but `@fast`, which is Redis's answer and reads like an
+    // omission. It is not: the categories are about what a command can reach and
+    // this one reaches nothing.
+    Spec {
+        name: "time",
+        arity: 1,
+        flags: &["loading", "stale", "fast"],
+        first_key: 0,
+        last_key: 0,
+        step: 0,
+        acl: &["@fast"],
+        since: "2.6.0",
+        complexity: "O(1)",
+        summary: "The server's clock, as seconds and microseconds.",
         group: "server",
     },
 ];

@@ -157,7 +157,7 @@ impl Encoding {
 }
 
 /// The packed band, at two elements a field or at three.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct Packed {
     lp: Listpack,
     /// Whether there is a deadline element after every value.
@@ -319,7 +319,7 @@ fn push_text(lp: &mut Listpack, t: Text<'_>) {
 }
 
 /// The native band: interned field names, values in a blob of their own.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct Table {
     fields: Elements<Span>,
     values: Blob,
@@ -415,14 +415,14 @@ impl Table {
 }
 
 /// The two representations.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 enum Body {
     Packed(Packed),
     Table(Table),
 }
 
 /// A hash of fields to values.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Hash {
     body: Body,
 }

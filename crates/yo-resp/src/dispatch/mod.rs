@@ -404,9 +404,10 @@ pub fn execute(server: &mut Server, session: &mut Session, args: Args<'_>, out: 
             let db = session.db;
             hashes::execute(&mut server.dbs[db], spec, args, out).map(|()| Flow::Continue)
         }
+        // Every database and not the one the session is on, because `COPY` takes
+        // a `DB n` and writes into a database nobody selected.
         "keyspace" => {
-            let db = session.db;
-            keyspace::execute(&mut server.dbs[db], spec, args, out).map(|()| Flow::Continue)
+            keyspace::execute(&mut server.dbs, session.db, spec, args, out).map(|()| Flow::Continue)
         }
         "scripting" => scripting::execute(spec, args, out).map(|()| Flow::Continue),
         _ => server::execute(server, session, spec, args, out),
@@ -565,6 +566,172 @@ mod tests {
         // that carry a word are bulk strings.
         assert_eq!(f.run(&[b"TYPE", b"k"]), "+string\r\n");
         assert_eq!(f.run(&[b"TYPE", b"nosuch"]), "+none\r\n");
+    }
+
+    #[test]
+    fn touch_counts_the_way_exists_counts() {
+        let mut f = Fixture::new();
+        f.run(&[b"MSET", b"a", b"1", b"b", b"2"]);
+        assert_eq!(f.run(&[b"TOUCH", b"a", b"b"]), ":2\r\n");
+        assert_eq!(
+            f.run(&[b"TOUCH", b"a", b"a"]),
+            ":2\r\n",
+            "twice counts twice"
+        );
+        assert_eq!(f.run(&[b"TOUCH", b"a", b"nosuch"]), ":1\r\n");
+        assert_eq!(f.run(&[b"TOUCH", b"nosuch"]), ":0\r\n");
+    }
+
+    #[test]
+    fn a_rename_moves_the_deadline_with_the_value_and_drops_the_one_it_lands_on() {
+        let mut f = Fixture::new();
+        f.run(&[b"SET", b"a", b"v1", b"EX", b"100"]);
+        f.run(&[b"SET", b"b", b"v2", b"EX", b"500"]);
+
+        assert_eq!(f.run(&[b"RENAME", b"a", b"b"]), "+OK\r\n");
+        assert_eq!(f.run(&[b"GET", b"b"]), "$2\r\nv1\r\n");
+        assert_eq!(
+            f.run(&[b"TTL", b"b"]),
+            ":100\r\n",
+            "the source's and not b's"
+        );
+        assert_eq!(f.run(&[b"EXISTS", b"a"]), ":0\r\n");
+    }
+
+    #[test]
+    fn a_rename_with_no_source_is_an_error_and_not_a_zero() {
+        let mut f = Fixture::new();
+        assert_eq!(f.run(&[b"RENAME", b"a", b"b"]), "-ERR no such key\r\n");
+        // The source is checked before the destination, so this is the error
+        // and not the zero RENAMENX would otherwise answer for a taken name.
+        assert_eq!(f.run(&[b"RENAMENX", b"a", b"a"]), "-ERR no such key\r\n");
+    }
+
+    #[test]
+    fn renamenx_refuses_a_taken_name_including_the_one_it_already_has() {
+        let mut f = Fixture::new();
+        f.run(&[b"MSET", b"a", b"v1", b"b", b"v2"]);
+
+        assert_eq!(f.run(&[b"RENAMENX", b"a", b"b"]), ":0\r\n");
+        assert_eq!(f.run(&[b"GET", b"b"]), "$2\r\nv2\r\n");
+        // Renaming onto itself is 0 here and OK for plain RENAME, which is the
+        // one call the two disagree about and neither does any work for.
+        assert_eq!(f.run(&[b"RENAMENX", b"a", b"a"]), ":0\r\n");
+        assert_eq!(f.run(&[b"RENAME", b"a", b"a"]), "+OK\r\n");
+        assert_eq!(f.run(&[b"RENAMENX", b"a", b"c"]), ":1\r\n");
+        assert_eq!(f.run(&[b"GET", b"c"]), "$2\r\nv1\r\n");
+    }
+
+    #[test]
+    fn renaming_a_set_does_not_touch_a_member() {
+        let mut f = Fixture::new();
+        for i in 0..300 {
+            f.run(&[b"SADD", b"s", format!("m{i}").as_bytes()]);
+        }
+        let before = f.server.memory_bytes();
+
+        assert_eq!(f.run(&[b"RENAME", b"s", b"t"]), "+OK\r\n");
+        assert_eq!(f.run(&[b"SCARD", b"t"]), ":300\r\n");
+        assert_eq!(f.run(&[b"TYPE", b"t"]), "+set\r\n");
+        assert!(
+            f.server.memory_bytes().abs_diff(before) < 256,
+            "the members were copied: {} against {before}",
+            f.server.memory_bytes()
+        );
+    }
+
+    #[test]
+    fn a_copy_is_a_second_value_and_not_a_second_name() {
+        let mut f = Fixture::new();
+        f.run(&[b"SADD", b"s", b"m1", b"m2"]);
+
+        assert_eq!(f.run(&[b"COPY", b"s", b"t"]), ":1\r\n");
+        f.run(&[b"SADD", b"t", b"m3"]);
+        assert_eq!(f.run(&[b"SCARD", b"s"]), ":2\r\n", "the original is intact");
+        assert_eq!(f.run(&[b"SCARD", b"t"]), ":3\r\n");
+    }
+
+    #[test]
+    fn a_copy_refuses_a_taken_destination_until_it_is_told_it_can_have_it() {
+        let mut f = Fixture::new();
+        f.run(&[b"SET", b"a", b"v1", b"EX", b"100"]);
+        f.run(&[b"SET", b"b", b"v2"]);
+
+        assert_eq!(f.run(&[b"COPY", b"a", b"b"]), ":0\r\n");
+        assert_eq!(f.run(&[b"GET", b"b"]), "$2\r\nv2\r\n");
+        assert_eq!(f.run(&[b"COPY", b"a", b"b", b"REPLACE"]), ":1\r\n");
+        assert_eq!(f.run(&[b"GET", b"b"]), "$2\r\nv1\r\n");
+        assert_eq!(f.run(&[b"TTL", b"b"]), ":100\r\n", "the deadline came too");
+        assert_eq!(f.run(&[b"COPY", b"nosuch", b"z"]), ":0\r\n");
+    }
+
+    #[test]
+    fn a_copy_into_another_database_is_a_copy_and_onto_itself_there_is_too() {
+        let mut f = Fixture::new();
+        f.run(&[b"SET", b"a", b"v1"]);
+
+        // Same key, different database, so this is not the same object and is
+        // an ordinary copy. Same key in the same database is the error below.
+        assert_eq!(f.run(&[b"COPY", b"a", b"a", b"DB", b"1"]), ":1\r\n");
+        f.run(&[b"SELECT", b"1"]);
+        assert_eq!(f.run(&[b"GET", b"a"]), "$2\r\nv1\r\n");
+        assert_eq!(
+            f.run(&[b"COPY", b"a", b"a", b"DB", b"0"]),
+            ":0\r\n",
+            "taken"
+        );
+        assert_eq!(
+            f.run(&[b"COPY", b"a", b"a", b"DB", b"0", b"REPLACE"]),
+            ":1\r\n"
+        );
+    }
+
+    #[test]
+    fn copy_checks_its_options_before_it_looks_for_anything() {
+        let mut f = Fixture::new();
+        // No key exists at all, and every one of these is still the option
+        // complaint rather than a zero, which is the order a real server uses.
+        assert_eq!(
+            f.run(&[b"COPY", b"a", b"b", b"DB", b"99"]),
+            "-ERR DB index is out of range\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"COPY", b"a", b"b", b"DB", b"-1"]),
+            "-ERR DB index is out of range\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"COPY", b"a", b"b", b"DB", b"x"]),
+            "-ERR value is not an integer or out of range\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"COPY", b"a", b"b", b"nonsense"]),
+            "-ERR syntax error\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"COPY", b"a", b"a"]),
+            "-ERR source and destination objects are the same\r\n"
+        );
+        // Repeated, reordered and lowercased, and the last DB wins.
+        assert_eq!(
+            f.run(&[b"COPY", b"a", b"b", b"dB", b"1", b"rEpLaCe", b"db", b"2"]),
+            ":0\r\n"
+        );
+    }
+
+    #[test]
+    fn time_is_two_bulk_strings_and_moves() {
+        let mut f = Fixture::new();
+        let first = f.run(&[b"TIME"]);
+        assert!(first.starts_with("*2\r\n$"), "got {first}");
+        let parts: Vec<&str> = first.split("\r\n").collect();
+        let secs: i64 = parts[2].parse().expect("seconds as decimal text");
+        let micros: i64 = parts[4].parse().expect("microseconds as decimal text");
+        assert!(secs > 1_700_000_000, "a real wall clock, got {secs}");
+        assert!((0..1_000_000).contains(&micros), "got {micros}");
+        // The coarse clock the keyspace uses is a cached millisecond that a
+        // background tick refreshes, so a TIME built on it would answer the
+        // same microsecond twice in a row here.
+        assert_ne!(first, f.run(&[b"TIME"]));
     }
 
     #[test]

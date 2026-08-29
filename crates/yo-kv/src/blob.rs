@@ -59,7 +59,7 @@ pub struct Span {
 const FLOOR: usize = 4096;
 
 /// Bytes belonging to one collection, appended to and occasionally rebuilt.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct Blob {
     bytes: Vec<u8>,
     dead: usize,

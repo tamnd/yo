@@ -20,10 +20,21 @@ use super::args::{self, Args};
 use super::table::Spec;
 use crate::reply::Out;
 use yo_common::{Code, Error, Result};
-use yo_kv::{Applied, Ask, Cond, Keyspace, MAX_AT};
+use yo_kv::{Applied, Ask, Cond, Keyspace, MAX_AT, Moved};
 
 /// Milliseconds in a second, which is the whole of what the p in `PTTL` means.
 const SECOND: i64 = 1000;
+
+/// What `COPY` says for a `DB` that names a database this server does not have.
+///
+/// A negative number lands here too rather than in the integer parser, because
+/// `-1` is a perfectly good integer and is not a database.
+const DB_OUT_OF_RANGE: &str = "DB index is out of range";
+
+/// And what it says when the source and the destination are the same thing.
+///
+/// The same key in the same database, so `COPY a a DB 1` never reaches this.
+const SAME_OBJECT: &str = "source and destination objects are the same";
 
 /// What Redis says when `NX` is given alongside any of the other three.
 const NX_WITH_OTHERS: &str = "NX and XX, GT or LT options at the same time are not compatible";
@@ -59,7 +70,21 @@ const OBJECT_HELP: &[&str] = &[
 ];
 
 /// Run one keyspace command.
-pub(super) fn execute(db: &mut Keyspace, spec: &Spec, args: Args<'_>, out: &mut Out) -> Result<()> {
+///
+/// Every database and not one, because `COPY key dst DB n` writes into a
+/// database the connection is not on. Everything else here takes `at` and looks
+/// no further, and the borrow of the slice ends at the top of each arm.
+pub(super) fn execute(
+    dbs: &mut [Keyspace],
+    at: usize,
+    spec: &Spec,
+    args: Args<'_>,
+    out: &mut Out,
+) -> Result<()> {
+    if spec.name == "copy" {
+        return copy(dbs, at, args, out);
+    }
+    let db = &mut dbs[at];
     match spec.name {
         // `UNLINK` is `DEL` with the freeing moved to a background thread on a
         // real server. Ours frees on the spot, which is what `UNLINK` promises
@@ -96,12 +121,100 @@ pub(super) fn execute(db: &mut Keyspace, spec: &Spec, args: Args<'_>, out: &mut 
             // strings and this one is not.
             out.simple(name);
         }
+        // A key named twice counts twice here as well, and on a real server the
+        // difference between this and `EXISTS` is that this moves the key up the
+        // eviction order. There is no eviction yet, so the two are the same walk
+        // and the day it lands the bump goes in the store and not here.
+        "touch" => out.int(db.touch((1..args.len()).map(|i| args.get(i))) as i64),
+        "rename" | "renamenx" => rename(db, spec.name, args, out)?,
         "expire" | "pexpire" | "expireat" | "pexpireat" => expire(db, spec.name, args, out)?,
         "persist" => out.int(i64::from(db.persist(args.get(1)))),
         "ttl" | "pttl" | "expiretime" | "pexpiretime" => ask(db, spec.name, args, out),
         "object" => object(db, args, out)?,
         other => unreachable!("keyspace command with no body: {other}"),
     }
+    Ok(())
+}
+
+/// `RENAME src dst` and `RENAMENX src dst`.
+///
+/// Both answer an error for a source that is not there, which is unusual: every
+/// other command in this file treats a missing key as an ordinary answer. It is
+/// the same sentence for both and it is checked before anything else, so
+/// `RENAMENX nope nope` is `no such key` and not zero.
+fn rename(db: &mut Keyspace, name: &str, args: Args<'_>, out: &mut Out) -> Result<()> {
+    let nx = name == "renamenx";
+    let done = db.rename(args.get(1), args.get(2), nx).found()?;
+    if nx {
+        out.int(i64::from(done == Moved::Ok));
+    } else {
+        out.ok();
+    }
+    Ok(())
+}
+
+/// `COPY src dst [DB n] [REPLACE]`.
+///
+/// The order the four ways this can fail are checked in is the order a real
+/// server checks them, and it is not the order you would write from scratch.
+/// The options are parsed first, so a bad `DB` is refused before anyone asks
+/// whether the source exists. Then source and destination being the same thing
+/// is an error. Only then does a missing source become the ordinary zero.
+///
+/// Being the same thing means the same key in the same database, so
+/// `COPY a a DB 1` is a real copy and `COPY a a DB 0` from database zero is
+/// the error. That is why the check is down here and not next to the argument
+/// parsing: it needs to know which database was asked for.
+fn copy(dbs: &mut [Keyspace], at: usize, args: Args<'_>, out: &mut Out) -> Result<()> {
+    let (src, dst) = (args.get(1), args.get(2));
+    let mut into = at;
+    let mut replace = false;
+    let mut i = 3;
+    while i < args.len() {
+        let arg = args.get(i);
+        if args::is(arg, b"replace") {
+            replace = true;
+            i += 1;
+            continue;
+        }
+        if !args::is(arg, b"db") || i + 1 >= args.len() {
+            return Err(args::syntax());
+        }
+        // A last one wins rather than a refusal, because `COPY a b DB 1 DB 2`
+        // lands in database two on a real server and does not complain.
+        let n = args.int(i + 1)?;
+        into = usize::try_from(n)
+            .ok()
+            .filter(|n| *n < dbs.len())
+            .ok_or_else(|| Error::new(Code::Invalid, DB_OUT_OF_RANGE))?;
+        i += 2;
+    }
+    if into == at && src == dst {
+        return Err(Error::new(Code::Invalid, SAME_OBJECT));
+    }
+    let done = if into == at {
+        dbs[at].copy(src, dst, replace)
+    } else {
+        // Two databases, so the value comes out of one standing on its own
+        // before the other is touched. The borrow of the first ends with the
+        // export, which is the reason the pair exists as two calls.
+        //
+        // The destination is asked about first, which is the opposite order from
+        // the single database path above and answers the same thing. Export
+        // clones the body, so asking first is the difference between a refused
+        // copy of a million member set costing nothing and costing the set.
+        if !replace && dbs[into].exists(dst) {
+            out.int(0);
+            return Ok(());
+        }
+        let Some(rec) = dbs[at].export(src) else {
+            out.int(0);
+            return Ok(());
+        };
+        dbs[into].import(dst, rec);
+        Moved::Ok
+    };
+    out.int(i64::from(done == Moved::Ok));
     Ok(())
 }
 
