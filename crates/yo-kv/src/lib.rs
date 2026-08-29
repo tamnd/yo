@@ -71,10 +71,12 @@
 
 #![deny(missing_docs)]
 
+pub mod blob;
 pub mod clock;
 pub mod cond;
 pub mod counter;
 pub mod elem;
+pub mod hash;
 pub mod intset;
 pub mod keyspace;
 pub mod lcs;
@@ -88,10 +90,12 @@ pub mod strings;
 pub mod ttl;
 pub mod value;
 
+pub use blob::{Blob, Span};
 pub use clock::Clock;
 pub use cond::Compare;
 pub use counter::{Counted, IncrEx, IncrExpire, Num};
 pub use elem::{Elements, Full, MAX_ROWS, NAME_MAX};
+pub use hash::{Hash, Limits as HashLimits};
 pub use intset::Intset;
 pub use keyspace::Keyspace;
 pub use lcs::{Idx as LcsIdx, LCS_MAX_CELLS, Match as LcsMatch};

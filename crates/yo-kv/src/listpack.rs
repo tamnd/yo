@@ -121,6 +121,20 @@ impl Entry<'_> {
         }
     }
 
+    /// How many bytes a client would see, without formatting anything.
+    ///
+    /// This is `HSTRLEN` and `STRLEN`, which both have to answer for a value
+    /// stored as an integer, and neither of them should have to write the digits
+    /// out to count them.
+    #[must_use]
+    #[inline]
+    pub fn byte_len(&self) -> usize {
+        match self {
+            Entry::Int(n) => yo_common::num::i64_len(*n),
+            Entry::Str(s) => s.len(),
+        }
+    }
+
     /// The element as bytes, allocating only for an integer.
     #[must_use]
     pub fn to_vec(&self) -> Vec<u8> {
