@@ -1966,6 +1966,343 @@ mod tests {
         );
     }
 
+    #[test]
+    fn hgetdel_hands_the_value_out_and_then_takes_the_field() {
+        let mut f = Fixture::new();
+        f.run(&[b"HSET", b"h", b"a", b"1", b"b", b"2"]);
+        assert_eq!(
+            f.run(&[b"HGETDEL", b"h", b"FIELDS", b"2", b"a", b"nope"]),
+            "*2\r\n$1\r\n1\r\n$-1\r\n",
+            "positional, so the field that was not there is a nil in its place"
+        );
+        assert_eq!(f.run(&[b"HLEN", b"h"]), ":1\r\n");
+        assert_eq!(
+            f.run(&[b"HGETDEL", b"nokey", b"FIELDS", b"1", b"a"]),
+            "*1\r\n$-1\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"HGETDEL", b"h", b"FIELDS", b"1", b"b"]),
+            "*1\r\n$1\r\n2\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"EXISTS", b"h"]),
+            ":0\r\n",
+            "and the last field took the key"
+        );
+    }
+
+    #[test]
+    fn hgetex_reads_and_moves_the_deadline_in_one_command() {
+        let mut f = Fixture::new();
+        f.run(&[b"HSET", b"h", b"a", b"1"]);
+        assert_eq!(
+            f.run(&[b"HGETEX", b"h", b"FIELDS", b"1", b"a"]),
+            "*1\r\n$1\r\n1\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"HTTL", b"h", b"FIELDS", b"1", b"a"]),
+            "*1\r\n:-1\r\n",
+            "no option means leave it alone, which is the one place this is not GETEX"
+        );
+
+        f.run(&[b"HGETEX", b"h", b"EX", b"100", b"FIELDS", b"1", b"a"]);
+        assert_eq!(
+            f.run(&[b"HTTL", b"h", b"FIELDS", b"1", b"a"]),
+            "*1\r\n:100\r\n"
+        );
+        f.run(&[b"HGETEX", b"h", b"FIELDS", b"1", b"a"]);
+        assert_eq!(
+            f.run(&[b"HTTL", b"h", b"FIELDS", b"1", b"a"]),
+            "*1\r\n:100\r\n",
+            "and a plain read really does leave it alone"
+        );
+        assert_eq!(
+            f.run(&[b"HGETEX", b"h", b"PERSIST", b"FIELDS", b"1", b"a"]),
+            "*1\r\n$1\r\n1\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"HTTL", b"h", b"FIELDS", b"1", b"a"]),
+            "*1\r\n:-1\r\n"
+        );
+
+        assert_eq!(
+            f.run(&[b"HGETEX", b"h", b"EXAT", b"1", b"FIELDS", b"1", b"a"]),
+            "*1\r\n$1\r\n1\r\n",
+            "the value goes out before the deadline that has already gone is applied"
+        );
+        assert_eq!(f.run(&[b"EXISTS", b"h"]), ":0\r\n");
+        assert_eq!(
+            f.run(&[b"HGETEX", b"nokey", b"EX", b"100", b"FIELDS", b"1", b"a"]),
+            "*1\r\n$-1\r\n"
+        );
+    }
+
+    #[test]
+    fn hsetex_writes_all_of_it_or_none_of_it() {
+        let mut f = Fixture::new();
+        assert_eq!(
+            f.run(&[b"HSETEX", b"h", b"FIELDS", b"1", b"a", b"1"]),
+            ":1\r\n"
+        );
+        assert_eq!(f.run(&[b"HGET", b"h", b"a"]), "$1\r\n1\r\n");
+        assert_eq!(
+            f.run(&[
+                b"HSETEX", b"h", b"FNX", b"FIELDS", b"2", b"a", b"9", b"new", b"9"
+            ]),
+            ":0\r\n",
+            "FNX wants every field named to be missing"
+        );
+        assert_eq!(f.run(&[b"HGET", b"h", b"a"]), "$1\r\n1\r\n");
+        assert_eq!(
+            f.run(&[b"HEXISTS", b"h", b"new"]),
+            ":0\r\n",
+            "and none of the list was written"
+        );
+        assert_eq!(
+            f.run(&[
+                b"HSETEX", b"h", b"FXX", b"FIELDS", b"2", b"a", b"9", b"nope", b"9"
+            ]),
+            ":0\r\n",
+            "and FXX wants every one of them to be there"
+        );
+        assert_eq!(f.run(&[b"HGET", b"h", b"a"]), "$1\r\n1\r\n");
+        assert_eq!(
+            f.run(&[b"HSETEX", b"h", b"FXX", b"FIELDS", b"1", b"a", b"9"]),
+            ":1\r\n"
+        );
+        assert_eq!(f.run(&[b"HGET", b"h", b"a"]), "$1\r\n9\r\n");
+
+        assert_eq!(
+            f.run(&[b"HSETEX", b"gone", b"FXX", b"FIELDS", b"1", b"a", b"1"]),
+            ":0\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"EXISTS", b"gone"]),
+            ":0\r\n",
+            "a key with no fields cannot meet FXX and is not created trying"
+        );
+    }
+
+    #[test]
+    fn hsetex_clears_the_deadline_unless_it_is_told_to_keep_it() {
+        let mut f = Fixture::new();
+        f.run(&[b"HSETEX", b"h", b"EX", b"100", b"FIELDS", b"1", b"a", b"1"]);
+        assert_eq!(
+            f.run(&[b"HTTL", b"h", b"FIELDS", b"1", b"a"]),
+            "*1\r\n:100\r\n"
+        );
+
+        f.run(&[b"HSETEX", b"h", b"KEEPTTL", b"FIELDS", b"1", b"a", b"2"]);
+        assert_eq!(f.run(&[b"HGET", b"h", b"a"]), "$1\r\n2\r\n");
+        assert_eq!(
+            f.run(&[b"HTTL", b"h", b"FIELDS", b"1", b"a"]),
+            "*1\r\n:100\r\n",
+            "KEEPTTL put back what the write cleared"
+        );
+
+        f.run(&[b"HSETEX", b"h", b"FIELDS", b"1", b"a", b"3"]);
+        assert_eq!(
+            f.run(&[b"HTTL", b"h", b"FIELDS", b"1", b"a"]),
+            "*1\r\n:-1\r\n",
+            "and without it a write clears the deadline the way HSET does"
+        );
+
+        // Any order, because Redis reads these in a loop and not in a fixed
+        // sequence.
+        assert_eq!(
+            f.run(&[
+                b"HSETEX", b"h", b"PX", b"100000", b"FXX", b"FIELDS", b"1", b"a", b"4"
+            ]),
+            ":1\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"HTTL", b"h", b"FIELDS", b"1", b"a"]),
+            "*1\r\n:100\r\n"
+        );
+
+        assert_eq!(
+            f.run(&[b"HSETEX", b"h", b"EXAT", b"1", b"FIELDS", b"1", b"a", b"5"]),
+            ":1\r\n",
+            "written, and not the separate code the HEXPIRE family has for this"
+        );
+        assert_eq!(
+            f.run(&[b"EXISTS", b"h"]),
+            ":0\r\n",
+            "and storing it and then removing it emptied the hash"
+        );
+    }
+
+    #[test]
+    fn the_last_three_hash_commands_word_their_mistakes_their_own_way() {
+        let mut f = Fixture::new();
+        f.run(&[b"HSET", b"h", b"a", b"1"]);
+        for (bad, want) in [
+            // HGETDEL has three sentences of its own for these three mistakes.
+            (
+                &[b"HGETDEL".as_slice(), b"h", b"FIELDS", b"0", b"a"][..],
+                "-ERR Number of fields must be a positive integer",
+            ),
+            (
+                &[b"HGETDEL".as_slice(), b"h", b"FIELDS", b"2", b"a"][..],
+                "-ERR The `numfields` parameter must match the number of arguments",
+            ),
+            (
+                &[b"HGETDEL".as_slice(), b"h", b"FIELD", b"1", b"a"][..],
+                "-ERR Mandatory argument FIELDS is missing or not at the right position",
+            ),
+            // And HGETEX and HSETEX have three different ones between them.
+            (
+                &[b"HGETEX".as_slice(), b"h", b"FIELDS", b"0", b"a"][..],
+                "-ERR invalid number of fields",
+            ),
+            (
+                &[b"HGETEX".as_slice(), b"h", b"FIELDS", b"2", b"a"][..],
+                "-ERR wrong number of arguments",
+            ),
+            (
+                &[b"HGETEX".as_slice(), b"h", b"FIELD", b"1", b"a"][..],
+                "-ERR unknown argument: FIELD",
+            ),
+            (
+                &[
+                    b"HGETEX".as_slice(),
+                    b"h",
+                    b"KEEPTTL",
+                    b"FIELDS",
+                    b"1",
+                    b"a",
+                ][..],
+                "-ERR unknown argument: KEEPTTL",
+            ),
+            (
+                &[
+                    b"HGETEX".as_slice(),
+                    b"h",
+                    b"EX",
+                    b"100",
+                    b"PERSIST",
+                    b"FIELDS",
+                    b"1",
+                    b"a",
+                ][..],
+                "-ERR Only one of EX, PX, EXAT, PXAT or PERSIST arguments can be specified",
+            ),
+            (
+                &[
+                    b"HSETEX".as_slice(),
+                    b"h",
+                    b"EX",
+                    b"1",
+                    b"KEEPTTL",
+                    b"FIELDS",
+                    b"1",
+                    b"a",
+                    b"1",
+                ][..],
+                "-ERR Only one of EX, PX, EXAT, PXAT or KEEPTTL arguments can be specified",
+            ),
+            (
+                &[
+                    b"HSETEX".as_slice(),
+                    b"h",
+                    b"FNX",
+                    b"FXX",
+                    b"FIELDS",
+                    b"1",
+                    b"a",
+                    b"1",
+                ][..],
+                "-ERR Only one of FXX or FNX arguments can be specified",
+            ),
+            (
+                &[
+                    b"HSETEX".as_slice(),
+                    b"h",
+                    b"FIELDS",
+                    b"2",
+                    b"a",
+                    b"1",
+                    b"b",
+                ][..],
+                "-ERR wrong number of arguments",
+            ),
+            (
+                &[
+                    b"HGETEX".as_slice(),
+                    b"h",
+                    b"EX",
+                    b"-1",
+                    b"FIELDS",
+                    b"1",
+                    b"a",
+                ][..],
+                "-ERR invalid expire time, must be >= 0",
+            ),
+            (
+                &[
+                    b"HGETEX".as_slice(),
+                    b"h",
+                    b"PXAT",
+                    b"99999999999999",
+                    b"FIELDS",
+                    b"1",
+                    b"a",
+                ][..],
+                "-ERR invalid expire time in 'hgetex' command",
+            ),
+            (
+                &[
+                    b"HSETEX".as_slice(),
+                    b"h",
+                    b"EX",
+                    b"abc",
+                    b"FIELDS",
+                    b"1",
+                    b"a",
+                    b"1",
+                ][..],
+                "-ERR value is not an integer or out of range",
+            ),
+        ] {
+            let reply = f.run(bad);
+            assert!(reply.starts_with(want), "wanted {want}, got {reply}");
+            assert!(!reply.contains('*'), "an array header went out in front");
+        }
+        assert_eq!(
+            f.run(&[b"HGET", b"h", b"a"]),
+            "$1\r\n1\r\n",
+            "and not one of them wrote anything"
+        );
+        assert_eq!(
+            f.run(&[b"HTTL", b"h", b"FIELDS", b"1", b"a"]),
+            "*1\r\n:-1\r\n"
+        );
+    }
+
+    #[test]
+    fn the_last_three_hash_commands_say_wrongtype_and_write_nothing() {
+        let mut f = Fixture::new();
+        f.run(&[b"SET", b"str", b"v"]);
+        let wrong = "-WRONGTYPE Operation against a key holding the wrong kind of value\r\n";
+        for cmd in [
+            &[b"HGETDEL".as_slice(), b"str", b"FIELDS", b"1", b"f"][..],
+            &[b"HGETEX".as_slice(), b"str", b"FIELDS", b"1", b"f"][..],
+            &[
+                b"HGETEX".as_slice(),
+                b"str",
+                b"EX",
+                b"100",
+                b"FIELDS",
+                b"1",
+                b"f",
+            ][..],
+            &[b"HSETEX".as_slice(), b"str", b"FIELDS", b"1", b"f", b"v"][..],
+        ] {
+            assert_eq!(f.run(cmd), wrong, "{:?}", cmd[0]);
+        }
+        assert_eq!(f.run(&[b"GET", b"str"]), "$1\r\nv\r\n");
+    }
+
     /// The one integer of a single element array reply.
     fn int_reply(reply: &str) -> i64 {
         let body = reply

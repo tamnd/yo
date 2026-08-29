@@ -289,6 +289,184 @@ impl Keyspace {
         Ok(())
     }
 
+    /// `HGETDEL key FIELDS numfields field [field ...]`.
+    ///
+    /// The value goes out and the field goes away, in that order, which is the
+    /// whole command: a client that wants both without a race would otherwise
+    /// send `HGET` and `HDEL` and hope. One call of `f` per field asked for,
+    /// including the ones that were not there, because the reply is positional
+    /// the way `HMGET`'s is.
+    ///
+    /// The key goes when the last field does.
+    pub fn hgetdel<'a, F>(
+        &mut self,
+        key: &[u8],
+        fields: impl Iterator<Item = &'a [u8]>,
+        mut f: F,
+    ) -> Result<()>
+    where
+        F: FnMut(Option<Text<'_>>),
+    {
+        let Some(slot) = self.hash_slot(key)? else {
+            for _ in fields {
+                f(None);
+            }
+            return Ok(());
+        };
+        for field in fields {
+            let hash = self.hash_at_mut(slot);
+            f(hash.get(field));
+            hash.remove(field);
+        }
+        if self.hash_at(slot).is_empty() {
+            self.drop_key(key);
+        }
+        Ok(())
+    }
+
+    /// `HGETEX key [EX s | PX ms | EXAT ts | PXAT ts | PERSIST] FIELDS ...`.
+    ///
+    /// The read and the deadline change in one command, which is what makes it
+    /// worth having: a plain `HSET` clears the deadline on the field it writes,
+    /// so there is no way to touch a field's expiry and see its value with the
+    /// commands that were there before.
+    ///
+    /// [`strings::Expire::Keep`] is a plain `HGETEX` with no option, and it is
+    /// the default here rather than `Clear`, which is the one place this
+    /// disagrees with `SET`. `Clear` is `PERSIST` and `At` is the other four.
+    ///
+    /// A deadline that has already gone deletes the field, and the value still
+    /// goes out, because the read happened first. The key goes with the last
+    /// field.
+    pub fn hgetex<'a, F>(
+        &mut self,
+        key: &[u8],
+        expire: strings::Expire,
+        fields: impl Iterator<Item = &'a [u8]>,
+        mut f: F,
+    ) -> Result<()>
+    where
+        F: FnMut(Option<Text<'_>>),
+    {
+        // Before anything is read, because Redis rejects the whole command
+        // rather than expiring the fields it got to first.
+        check_at(expire)?;
+        let Some(slot) = self.hash_slot(key)? else {
+            for _ in fields {
+                f(None);
+            }
+            return Ok(());
+        };
+        let now = self.clock.now_ms();
+        for field in fields {
+            let hash = self.hash_at_mut(slot);
+            f(hash.get(field));
+            match expire {
+                strings::Expire::Keep => {}
+                strings::Expire::Clear => {
+                    hash.persist(field);
+                }
+                // A deadline that has already gone answers Deleted and takes the
+                // field with it, which needs nothing here: the value went out
+                // above, before the field did, and the empty check below is
+                // what notices if that was the last one.
+                strings::Expire::At(at) => {
+                    hash.expire(field, at, Cond::Always, now);
+                }
+            }
+        }
+        if self.hash_at(slot).is_empty() {
+            self.drop_key(key);
+        }
+        Ok(())
+    }
+
+    /// `HSETEX key [FNX | FXX] [EX .. | KEEPTTL] FIELDS n field value [..]`.
+    ///
+    /// Answers whether it wrote, which is all of it or none of it. `FNX` wants
+    /// every field named to be missing and `FXX` wants every one of them to be
+    /// there, so a list where one field disagrees writes nothing at all. That is
+    /// stricter than `HSETNX`, which is per field, and it is what makes this
+    /// usable as a compare and set over a group of fields.
+    ///
+    /// [`strings::Expire::Clear`] is a plain `HSETEX` and is the default, since
+    /// a write clears the deadline on the field it writes anyway. `Keep` is
+    /// `KEEPTTL` and has to put the deadline back afterwards for that reason.
+    ///
+    /// A deadline that has already gone still answers written, unlike the
+    /// `HEXPIRE` family which has a separate code for it. The fields are stored
+    /// and then removed, and if that empties the hash the key goes too, so
+    /// `HSETEX key EXAT 1` on a key that did not exist leaves it not existing.
+    pub fn hsetex<'a>(
+        &mut self,
+        key: &[u8],
+        exists: strings::Exists,
+        expire: strings::Expire,
+        pairs: impl Iterator<Item = (&'a [u8], &'a [u8])> + Clone,
+    ) -> Result<bool> {
+        for (f, v) in pairs.clone() {
+            strings::check_len(key, f.len())?;
+            strings::check_len(key, v.len())?;
+        }
+        check_at(expire)?;
+
+        let slot = self.hash_slot(key)?;
+        // The condition is answered before a single field is written, because
+        // it is about the whole list. A key that is not there has every field
+        // missing, so FXX fails on it and FNX passes without creating it yet.
+        let met = match exists {
+            strings::Exists::Always => true,
+            strings::Exists::IfMissing => {
+                slot.is_none_or(|at| pairs.clone().all(|(f, _)| !self.hash_at(at).contains(f)))
+            }
+            strings::Exists::IfPresent => {
+                slot.is_some_and(|at| pairs.clone().all(|(f, _)| self.hash_at(at).contains(f)))
+            }
+        };
+        if !met {
+            return Ok(false);
+        }
+        let slot = match slot {
+            Some(at) => at,
+            None => {
+                if pairs.clone().next().is_none() {
+                    return Ok(false);
+                }
+                self.new_hash(key, pairs.clone().count())
+            }
+        };
+
+        let limits = self.hash_limits;
+        let now = self.clock.now_ms();
+        for (field, value) in pairs {
+            let hash = self.hash_at_mut(slot);
+            // KEEPTTL has to read the deadline first, because the write is what
+            // clears it. There is no band where the value can be replaced with
+            // the deadline left alone, and adding one would be a second way to
+            // write a field.
+            let kept = match expire {
+                strings::Expire::Keep => hash.deadline(field),
+                _ => Ask::NoField,
+            };
+            hash.set(field, value, &limits);
+            match expire {
+                strings::Expire::Clear => {}
+                strings::Expire::Keep => {
+                    if let Ask::At(at) = kept {
+                        hash.expire(field, at, Cond::Always, now);
+                    }
+                }
+                strings::Expire::At(at) => {
+                    hash.expire(field, at, Cond::Always, now);
+                }
+            }
+        }
+        if self.hash_at(slot).is_empty() {
+            self.drop_key(key);
+        }
+        Ok(true)
+    }
+
     /// `HLEN key`.
     pub fn hlen(&mut self, key: &[u8]) -> Result<usize> {
         match self.hash_slot(key)? {
@@ -582,6 +760,19 @@ impl Keyspace {
         });
         self.bodies += 1;
         at
+    }
+}
+
+/// Refuses a deadline past the ceiling before the command touches anything.
+///
+/// Both `HGETEX` and `HSETEX` take the deadline as an option rather than as the
+/// argument it is in the `HEXPIRE` family, and both have to answer for it
+/// before they have read or written a field, since Redis refuses the whole
+/// command rather than half doing it.
+fn check_at(expire: strings::Expire) -> Result<()> {
+    match expire {
+        strings::Expire::At(at) if !ttl::valid_at(at) => Err(Error::new(Code::Invalid, BAD_EXPIRE)),
+        _ => Ok(()),
     }
 }
 
@@ -1088,6 +1279,336 @@ mod tests {
         assert_eq!(d.encoding_name(b"h"), Some("hashtable"));
         d.clock_mut().advance(1_000_000);
         assert_eq!(d.hlen(b"h").expect("ok"), 300, "nothing had a deadline");
+    }
+
+    /// `HGETDEL`, as the strings it handed back.
+    fn getdel(d: &mut Keyspace, key: &[u8], fields: &[&[u8]]) -> Vec<Option<String>> {
+        let mut out = Vec::new();
+        d.hgetdel(key, fields.iter().copied(), |t| {
+            out.push(t.map(|t| text(&t)));
+        })
+        .expect("a hash");
+        out
+    }
+
+    /// `HGETEX`, the same way.
+    fn getex(
+        d: &mut Keyspace,
+        key: &[u8],
+        expire: strings::Expire,
+        fields: &[&[u8]],
+    ) -> Vec<Option<String>> {
+        let mut out = Vec::new();
+        d.hgetex(key, expire, fields.iter().copied(), |t| {
+            out.push(t.map(|t| text(&t)));
+        })
+        .expect("a hash");
+        out
+    }
+
+    /// `HSETEX`, with the two options spelled out.
+    fn setex(
+        d: &mut Keyspace,
+        key: &[u8],
+        exists: strings::Exists,
+        expire: strings::Expire,
+        pairs: &[(&[u8], &[u8])],
+    ) -> bool {
+        d.hsetex(key, exists, expire, pairs.iter().copied())
+            .expect("a hash")
+    }
+
+    #[test]
+    fn getdel_hands_the_value_back_and_then_takes_the_field() {
+        let mut d = db();
+        set(&mut d, b"h", &[(b"a", b"1"), (b"b", b"2"), (b"c", b"3")]);
+        assert_eq!(
+            getdel(&mut d, b"h", &[b"a", b"nope"]),
+            [Some("1".to_owned()), None],
+            "positional, so a field that was not there is a hole and not a gap"
+        );
+        assert_eq!(all(&mut d, b"h").len(), 2);
+        assert_eq!(
+            getdel(&mut d, b"gone", &[b"a", b"b"]),
+            [None, None],
+            "and a missing key is all nils"
+        );
+        assert_eq!(d.kind_of(b"gone"), None, "which did not create it");
+
+        getdel(&mut d, b"h", &[b"b", b"c"]);
+        assert_eq!(d.kind_of(b"h"), None, "the last field took the key with it");
+    }
+
+    #[test]
+    fn getdel_takes_the_deadline_with_the_field() {
+        let mut d = db();
+        set(&mut d, b"h", &[(b"a", b"1"), (b"b", b"2")]);
+        expire(&mut d, b"h", 5_000, &[b"a"]);
+        assert_eq!(getdel(&mut d, b"h", &[b"a"]), [Some("1".to_owned())]);
+        set(&mut d, b"h", &[(b"a", b"9")]);
+        assert_eq!(
+            ttl_of(&mut d, b"h", &[b"a"]),
+            [Ask::NoDeadline],
+            "the field came back without the deadline it had"
+        );
+    }
+
+    #[test]
+    fn getex_reads_and_moves_the_deadline_in_one_go() {
+        let mut d = db();
+        set(&mut d, b"h", &[(b"a", b"1")]);
+        assert_eq!(
+            getex(&mut d, b"h", strings::Expire::Keep, &[b"a"]),
+            [Some("1".to_owned())]
+        );
+        assert_eq!(ttl_of(&mut d, b"h", &[b"a"]), [Ask::NoDeadline]);
+
+        getex(&mut d, b"h", strings::Expire::At(5_000), &[b"a"]);
+        assert_eq!(ttl_of(&mut d, b"h", &[b"a"]), [Ask::At(5_000)]);
+        assert_eq!(
+            getex(&mut d, b"h", strings::Expire::Keep, &[b"a"]),
+            [Some("1".to_owned())],
+            "and a plain read is Keep and not Clear, which is the one place this disagrees with SET"
+        );
+        assert_eq!(ttl_of(&mut d, b"h", &[b"a"]), [Ask::At(5_000)]);
+
+        getex(&mut d, b"h", strings::Expire::Clear, &[b"a"]);
+        assert_eq!(ttl_of(&mut d, b"h", &[b"a"]), [Ask::NoDeadline]);
+    }
+
+    #[test]
+    fn getex_hands_back_the_value_of_a_field_it_is_about_to_expire() {
+        let mut d = db();
+        set(&mut d, b"h", &[(b"a", b"1"), (b"b", b"2")]);
+        assert_eq!(
+            getex(&mut d, b"h", strings::Expire::At(1), &[b"a"]),
+            [Some("1".to_owned())],
+            "the read happened before the deadline was applied"
+        );
+        assert_eq!(get(&mut d, b"h", b"a"), None);
+        assert_eq!(d.hlen(b"h").expect("ok"), 1);
+
+        getex(&mut d, b"h", strings::Expire::At(1), &[b"b"]);
+        assert_eq!(d.kind_of(b"h"), None, "and the last one took the key");
+    }
+
+    #[test]
+    fn setex_writes_all_of_it_or_none_of_it() {
+        let mut d = db();
+        assert!(setex(
+            &mut d,
+            b"h",
+            strings::Exists::Always,
+            strings::Expire::Clear,
+            &[(b"a", b"1")]
+        ));
+        assert_eq!(get(&mut d, b"h", b"a"), Some("1".to_owned()));
+
+        assert!(
+            !setex(
+                &mut d,
+                b"h",
+                strings::Exists::IfMissing,
+                strings::Expire::Clear,
+                &[(b"a", b"9"), (b"new", b"9")]
+            ),
+            "FNX wants every field named to be missing, and a is not"
+        );
+        assert_eq!(get(&mut d, b"h", b"a"), Some("1".to_owned()));
+        assert_eq!(
+            get(&mut d, b"h", b"new"),
+            None,
+            "and none of it was written"
+        );
+
+        assert!(
+            !setex(
+                &mut d,
+                b"h",
+                strings::Exists::IfPresent,
+                strings::Expire::Clear,
+                &[(b"a", b"9"), (b"nope", b"9")]
+            ),
+            "and FXX wants every one of them to be there"
+        );
+        assert_eq!(get(&mut d, b"h", b"a"), Some("1".to_owned()));
+
+        assert!(setex(
+            &mut d,
+            b"h",
+            strings::Exists::IfPresent,
+            strings::Expire::Clear,
+            &[(b"a", b"9")]
+        ));
+        assert_eq!(get(&mut d, b"h", b"a"), Some("9".to_owned()));
+    }
+
+    #[test]
+    fn setex_on_a_key_that_is_not_there_makes_it_only_when_it_can() {
+        let mut d = db();
+        assert!(
+            !setex(
+                &mut d,
+                b"gone",
+                strings::Exists::IfPresent,
+                strings::Expire::Clear,
+                &[(b"a", b"1")]
+            ),
+            "FXX cannot be met by a key with no fields at all"
+        );
+        assert_eq!(d.kind_of(b"gone"), None, "and it was not created");
+
+        assert!(setex(
+            &mut d,
+            b"fresh",
+            strings::Exists::IfMissing,
+            strings::Expire::Clear,
+            &[(b"a", b"1")]
+        ));
+        assert_eq!(get(&mut d, b"fresh", b"a"), Some("1".to_owned()));
+    }
+
+    #[test]
+    fn setex_keeps_the_deadline_only_when_it_is_asked_to() {
+        let mut d = db();
+        set(&mut d, b"h", &[(b"a", b"1")]);
+        expire(&mut d, b"h", 5_000, &[b"a"]);
+
+        setex(
+            &mut d,
+            b"h",
+            strings::Exists::Always,
+            strings::Expire::Keep,
+            &[(b"a", b"2")],
+        );
+        assert_eq!(get(&mut d, b"h", b"a"), Some("2".to_owned()));
+        assert_eq!(
+            ttl_of(&mut d, b"h", &[b"a"]),
+            [Ask::At(5_000)],
+            "KEEPTTL put back what the write cleared"
+        );
+
+        setex(
+            &mut d,
+            b"h",
+            strings::Exists::Always,
+            strings::Expire::Clear,
+            &[(b"a", b"3")],
+        );
+        assert_eq!(
+            ttl_of(&mut d, b"h", &[b"a"]),
+            [Ask::NoDeadline],
+            "and without it the write clears the deadline the way HSET does"
+        );
+
+        setex(
+            &mut d,
+            b"h",
+            strings::Exists::Always,
+            strings::Expire::At(9_000),
+            &[(b"a", b"4")],
+        );
+        assert_eq!(ttl_of(&mut d, b"h", &[b"a"]), [Ask::At(9_000)]);
+    }
+
+    #[test]
+    fn setex_with_a_deadline_that_has_gone_stores_and_then_removes() {
+        let mut d = db();
+        assert!(
+            setex(
+                &mut d,
+                b"h",
+                strings::Exists::Always,
+                strings::Expire::At(1),
+                &[(b"a", b"1")]
+            ),
+            "written, and not the separate code the HEXPIRE family has for this"
+        );
+        assert_eq!(
+            d.kind_of(b"h"),
+            None,
+            "so a key that did not exist is still not there"
+        );
+
+        set(&mut d, b"h", &[(b"keeper", b"1")]);
+        setex(
+            &mut d,
+            b"h",
+            strings::Exists::Always,
+            strings::Expire::At(1),
+            &[(b"a", b"1")],
+        );
+        assert_eq!(d.hlen(b"h").expect("ok"), 1, "and the rest of it survives");
+    }
+
+    #[test]
+    fn setex_refuses_a_deadline_past_the_ceiling_before_writing_anything() {
+        let mut d = db();
+        set(&mut d, b"h", &[(b"a", b"1")]);
+        let err = d
+            .hsetex(
+                b"h",
+                strings::Exists::Always,
+                strings::Expire::At(crate::ttl::MAX_AT + 1),
+                [(b"a".as_slice(), b"2".as_slice())].into_iter(),
+            )
+            .expect_err("past the ceiling");
+        assert_eq!(err.code(), Code::Invalid);
+        assert_eq!(get(&mut d, b"h", b"a"), Some("1".to_owned()));
+    }
+
+    #[test]
+    fn the_last_three_hash_commands_say_wrongtype_and_write_nothing() {
+        let mut d = db();
+        d.set_plain(b"s", b"v").expect("room");
+        assert!(
+            d.hgetdel(b"s", [b"a".as_slice()].into_iter(), |_| {})
+                .is_err()
+        );
+        assert!(
+            d.hgetex(
+                b"s",
+                strings::Expire::Keep,
+                [b"a".as_slice()].into_iter(),
+                |_| {}
+            )
+            .is_err()
+        );
+        assert!(
+            d.hsetex(
+                b"s",
+                strings::Exists::Always,
+                strings::Expire::Clear,
+                [(b"a".as_slice(), b"1".as_slice())].into_iter(),
+            )
+            .is_err()
+        );
+        assert_eq!(d.kind_of(b"s"), Some(Kind::String));
+    }
+
+    #[test]
+    fn the_last_three_reach_a_table_the_same_way_they_reach_a_listpack() {
+        let mut d = db();
+        for i in 0..300u32 {
+            set(&mut d, b"h", &[(format!("f{i}").as_bytes(), b"v")]);
+        }
+        assert_eq!(d.encoding_name(b"h"), Some("hashtable"));
+
+        setex(
+            &mut d,
+            b"h",
+            strings::Exists::Always,
+            strings::Expire::At(5_000),
+            &[(b"f0", b"x")],
+        );
+        assert_eq!(ttl_of(&mut d, b"h", &[b"f0"]), [Ask::At(5_000)]);
+        assert_eq!(
+            getex(&mut d, b"h", strings::Expire::Clear, &[b"f0"]),
+            [Some("x".to_owned())]
+        );
+        assert_eq!(ttl_of(&mut d, b"h", &[b"f0"]), [Ask::NoDeadline]);
+        assert_eq!(getdel(&mut d, b"h", &[b"f0"]), [Some("x".to_owned())]);
+        assert_eq!(d.hlen(b"h").expect("ok"), 299);
     }
 
     #[test]
