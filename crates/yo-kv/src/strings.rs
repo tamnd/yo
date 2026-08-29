@@ -184,10 +184,22 @@ impl Keyspace {
     // ---------------------------------------------------------------- reading
 
     /// `GET key`.
+    ///
+    /// One probe of the map for the whole command. It used to be three, because
+    /// the reap looked the key up to see whether it was dead, the type check
+    /// looked it up to see whether it was a string, and the read looked it up
+    /// again to read it, and all three walked a bucket for the same record.
+    /// [`Keyspace::live_rec`] hands back where that record is and the rest is
+    /// two arena reads at a known address.
     pub fn get(&mut self, key: &[u8]) -> Result<Option<Str<'_>>> {
-        self.reap(key);
-        self.string_only(key)?;
-        Ok(self.peek(key))
+        let Some(addr) = self.live_rec(key) else {
+            return Ok(None);
+        };
+        let rec = self.map.value_at(addr);
+        if value::kind(rec) != Kind::String {
+            return Err(wrong_type());
+        }
+        Ok(Some(value::read(rec)))
     }
 
     /// `MGET key [key ...]`.
@@ -214,8 +226,9 @@ impl Keyspace {
     /// Redis gives nil for the odd key out rather than failing the ninety nine
     /// good ones alongside it.
     pub fn mget_one(&mut self, key: &[u8]) -> Option<Str<'_>> {
-        self.reap(key);
-        self.peek(key)
+        let addr = self.live_rec(key)?;
+        let rec = self.map.value_at(addr);
+        (value::kind(rec) == Kind::String).then(|| value::read(rec))
     }
 
     /// `STRLEN key`, which is zero for a key that is not there.
@@ -225,8 +238,7 @@ impl Keyspace {
 
     /// `EXISTS key`, for one key.
     pub fn exists(&mut self, key: &[u8]) -> bool {
-        self.reap(key);
-        self.map.contains(key)
+        self.live_rec(key).is_some()
     }
 
     /// How a string is stored, which is `OBJECT ENCODING` for a string key.
@@ -237,8 +249,8 @@ impl Keyspace {
     /// [`Keyspace::set_encoding`] asks the body, and
     /// [`Keyspace::encoding_name`] is the command that routes between them.
     pub fn encoding(&mut self, key: &[u8]) -> Option<Encoding> {
-        self.reap(key);
-        let rec = self.map.get(key)?;
+        let addr = self.live_rec(key)?;
+        let rec = self.map.value_at(addr);
         if value::kind(rec) != Kind::String {
             return None;
         }
@@ -247,8 +259,8 @@ impl Keyspace {
 
     /// The key's deadline as an absolute unix millisecond, if it has one.
     pub fn expire_at(&mut self, key: &[u8]) -> Option<u64> {
-        self.reap(key);
-        value::expire_at(self.map.get(key)?)
+        let addr = self.live_rec(key)?;
+        value::expire_at(self.map.value_at(addr))
     }
 
     /// `GETRANGE key start end`, and `SUBSTR`, which is the same command.
@@ -261,9 +273,7 @@ impl Keyspace {
     /// Borrowed for a string, owned for an integer, because an integer's digits
     /// do not exist anywhere until somebody asks for them.
     pub fn getrange(&mut self, key: &[u8], start: i64, end: i64) -> Result<Cow<'_, [u8]>> {
-        self.reap(key);
-        self.string_only(key)?;
-        let Some(v) = self.peek(key) else {
+        let Some(v) = self.get(key)? else {
             return Ok(Cow::Borrowed(&[]));
         };
         Ok(match v {

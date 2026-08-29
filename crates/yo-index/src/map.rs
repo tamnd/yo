@@ -185,8 +185,35 @@ impl RawMap {
         Some(self.value_at(addr))
     }
 
+    /// Where `key`'s record is, for a caller that has to look at it twice.
+    ///
+    /// A `GET` has to know whether the key is past its deadline before it can
+    /// answer, and then has to read the value it just decided about. Asking
+    /// [`RawMap::get`] twice is two hashes and two probes for one record, and a
+    /// probe is the expensive half of a command. This hands back the address
+    /// instead, and [`RawMap::value_at`] reads it with no probe at all.
+    ///
+    /// The address is good until the next write to this map. Anything that
+    /// inserts, deletes or compacts can move a record, and an address held
+    /// across one of those reads whatever is at that spot now. Hold it for the
+    /// length of one command and no longer.
     #[inline]
-    fn value_at(&self, addr: Addr) -> &[u8] {
+    pub fn find(&self, key: &[u8]) -> Option<Addr> {
+        self.find_hashed(Self::hash_of(key), key)
+    }
+
+    /// [`RawMap::find`] for a caller that already hashed the key.
+    #[inline]
+    pub fn find_hashed(&self, hash: u64, key: &[u8]) -> Option<Addr> {
+        self.index.get(hash, key, &Records { arena: &self.arena })
+    }
+
+    /// The value at an address this map handed out, with no probe.
+    ///
+    /// See [`RawMap::find`] for how long an address is worth holding.
+    #[inline]
+    #[must_use]
+    pub fn value_at(&self, addr: Addr) -> &[u8] {
         let (klen, vlen) = Record::lens(self.arena.get(addr, HDR));
         &self.arena.get(addr, HDR + klen + vlen)[HDR + klen..]
     }
