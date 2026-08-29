@@ -1546,6 +1546,52 @@ export default {{ NOT_YET, open }};
     )
 
 
+# Docker Hub caps the short description at 100 characters and truncates rather
+# than refusing, so this is written to stand on its own instead of being the
+# first hundred characters of the long one, which cut off mid-clause.
+SHORT_DESC = (
+    "Placeholder holding a name for yo, an embedded multi-model database in "
+    "Rust. Not yet usable."
+)
+
+# Written into the build root and run there. It is a separate file rather than a
+# few lines of shell because the token has to be exchanged for a JWT first and
+# the error you get for skipping that step says nothing about it.
+DESCRIBE_PY = '''\
+import json, os, urllib.request
+
+SHORT = {short!r}
+REPO_PATH = "{repo}"
+
+
+def api(path, body=None, method="GET", token=None):
+    req = urllib.request.Request(
+        "https://hub.docker.com/v2/" + path,
+        data=json.dumps(body).encode() if body is not None else None,
+        method=method,
+        headers={{"Content-Type": "application/json"}} | (
+            {{"Authorization": "Bearer " + token}} if token else {{}}),
+    )
+    with urllib.request.urlopen(req) as r:
+        return json.load(r)
+
+
+# The registry push authenticates with the access token directly. This API does
+# not: it wants the token exchanged for a JWT, and answers 401 with no hint if
+# you send the token, which reads like a bad token and is not one.
+jwt = api("auth/token", {{
+    "identifier": os.environ["DOCKERHUB_USERNAME"],
+    "secret": os.environ["DOCKERHUB_TOKEN"],
+}}, method="POST")["access_token"]
+
+assert len(SHORT) <= 100, len(SHORT)
+d = api("repositories/" + REPO_PATH + "/",
+        {{"description": SHORT, "full_description": open("README.md").read()}},
+        method="PATCH", token=jwt)
+print("description:", d["description"])
+'''
+
+
 def b_docker(row, root, version, desc):
     """Docker Hub, through `docker buildx build --push`.
 
@@ -1616,6 +1662,15 @@ ENTRYPOINT ["/yodb"]
 
     _w(root, "README.md", _readme(desc, PLACEHOLDER_BODY))
 
+    # §6 rule 5 says the registry page opens with the description and the
+    # milestone. Every other registry takes both from metadata inside the
+    # artifact. Docker Hub takes neither from the image, so without this step
+    # Docker would be the one ecosystem where that rule silently does not hold,
+    # which is the exact shape of divergence the rest of this file exists to
+    # stop. The page is set from the same `desc` and README as everywhere else
+    # rather than typed into the web form, for the same reason.
+    _w(root, "describe.py", DESCRIBE_PY.format(repo=tag, short=SHORT_DESC))
+
     # Docker reads credentials from a config.json and does not expand
     # environment variables inside one, so unlike the .npmrc above this file
     # holds the real thing. It is written 0600 into the build root, which is a
@@ -1678,11 +1733,14 @@ ENTRYPOINT ["/yodb"]
                  f"&& docker run --rm {row.name}-placeholder-check:{version} "
                  f"2>&1 | grep -qxF {shlex.quote(raises)}"], root),
         ],
-        [Step("build and push", [
-            "docker", "buildx", "build", "--builder", BUILDX_BUILDER,
-            "--platform", plat, "--push",
-            "-t", f"{tag}:{version}", "-t", f"{tag}:latest", ".",
-        ], root, env=env, loud=True)],
+        [
+            Step("build and push", [
+                "docker", "buildx", "build", "--builder", BUILDX_BUILDER,
+                "--platform", plat, "--push",
+                "-t", f"{tag}:{version}", "-t", f"{tag}:latest", ".",
+            ], root, env=env, loud=True),
+            Step("describe", [sys.executable, "describe.py"], root, loud=True),
+        ],
     )
 
 
