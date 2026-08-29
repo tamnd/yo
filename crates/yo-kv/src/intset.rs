@@ -16,6 +16,11 @@
 //! from a set of integers, and it is why this exists as a third representation
 //! rather than everything small going in a listpack.
 //!
+//! Measured, on a set of five hundred and twelve small integers, that is 2.0
+//! bytes a member against the listpack's 3.0 and the element table's 24.0. The
+//! header is the only thing between it and exactly two, and it is amortised away
+//! by about sixty members.
+//!
 //! Both header fields are little endian whatever the machine is, because Redis
 //! writes them that way: `intrev32ifbe` is a no-op on a little endian host and a
 //! byte swap on a big endian one, so the bytes on the wire and in the file are
@@ -30,17 +35,43 @@
 //! are not nine cache misses, and above the threshold the set converts and stops
 //! paying it at all.
 //!
-//! That last paragraph is an argument and not a measurement, which in this
-//! project is a warning sign: L6 put a positional probe at 70 ns and it measured
-//! 13, and K11's crossover does not exist. `benches/intset.rs` is the bench that
-//! settles it, against the listpack below the threshold and the element table
-//! above it, and this comment gets replaced with its numbers once it has run on
-//! a box nobody else is using.
+//! That paragraph used to be an argument with no measurement behind it, which in
+//! this project is a warning sign: L6 put a positional probe at 70 ns and it
+//! measured 13, and K11's crossover does not exist. `benches/intset.rs` settled
+//! it. Minimum per iteration on an M3 laptop, membership against a member that
+//! is there, at the sizes either side of the ceiling:
 //!
-//! Sorted also means an insert memmoves the tail. That is a few hundred bytes at
-//! this size and it buys the thing that matters more: a fill in ascending order,
-//! which is the common shape, hits the "greater than the last member" test in
-//! front of the search and never binary searches or moves anything at all.
+//! ```text
+//!   members     intset     listpack     element table
+//!         8     4.6 ns       6.2 ns            7.7 ns
+//!        64     6.6 ns      29.5 ns           10.2 ns
+//!       128     7.7 ns      60.7 ns           10.2 ns
+//!       512    10.4 ns     239.3 ns            9.0 ns
+//! ```
+//!
+//! So the search is affordable, and the number that makes the case is not the
+//! one against the table. Doubling the set three times costs the intset about
+//! 3 ns in total, which is what a search that stays in cache looks like. What
+//! the intset is actually replacing below the ceiling is the listpack, and there
+//! it is eight times quicker at 128 members and pulling away, because a listpack
+//! walks and this does not.
+//!
+//! The crossover with the element table lands almost exactly on Redis's ceiling.
+//! At 128 the intset wins by a quarter, at 512 the table wins by a seventh, and
+//! 512 is where a real server gives up on the intset anyway. That is a better
+//! outcome than the argument deserved, and it was not predicted here: the guess
+//! was that the search would be affordable, not that the constant Redis picked
+//! in 2011 would sit on the crossover.
+//!
+//! Sorted also means an insert memmoves the tail, and that turns out not to
+//! matter at these sizes. A scattered fill, where every add lands in the middle,
+//! measured 6.47 ns a member at 128 against an ascending fill's 6.46, and the
+//! two only separate at 512 where scattered costs 5.26 against 4.44. Four
+//! kilobytes is not a memmove worth avoiding. The reason the ascending case is
+//! still worth having, and worth a test, is a shape argument and not a timing
+//! one: a fill in ascending order hits the "greater than the last member" test in
+//! front of the search, so it never searches and never moves anything, and
+//! `an_ascending_fill_never_moves_anything` asserts that rather than timing it.
 //!
 //! # Widening
 //!

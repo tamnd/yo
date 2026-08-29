@@ -22,6 +22,16 @@
 //! time, so the number to read is the minimum per iteration across samples, out
 //! of `target/criterion/<group>/<id>/new/sample.json` as `min(times[i]/iters[i])`.
 //! That is stable run to run where the mean is not.
+//!
+//! It has one hole, and the first run walked straight into it. The hit benches
+//! rotate through the members so that a search is measured at every depth, and
+//! the rule assumes a sample covers enough iterations to see all of them. At
+//! 4096 members criterion's first sample of `listpack_hit` was 374 iterations,
+//! which only ever touched the first 374 entries, so the minimum came out at
+//! 177 ns against a real cost nearer 2600. Check `min(iters)` against the member
+//! count before believing a rotating bench, and throw the row out if it is
+//! smaller. Nothing here depends on that row, because a listpack never holds
+//! 4096 members.
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use std::hint::black_box;
