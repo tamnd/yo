@@ -114,6 +114,28 @@ def get_json(url: str, headers: dict[str, str] | None = None):
 # probes — each returns (state, note)
 # ---------------------------------------------------------------------------
 
+def is_placeholder(version: str) -> bool:
+    """Whether a published version is one of ours holding a name.
+
+    This was `version == PLACEHOLDER`, and that test is wrong every time a wave
+    moves the number. The previous placeholder does not stop existing when a new
+    one is published: crates.io, NuGet and Docker Hub all still hand it back,
+    either as one entry in a list or as the newest one an index has caught up to
+    yet. So on the day 0.0.2 went out, an index still serving 0.0.1 read our own
+    empty package as shipped software and `audit` moved two rows to `released`.
+
+    The same shape did this once before, when three probes compared against a
+    literal `0.0.0` and the wave to 0.0.1 left all three misreading. That was
+    fixed by putting the constant in one place, which made it correct until the
+    next wave and no longer. The constant was never the problem: a version being
+    a placeholder is not a fact about which one is current.
+
+    §6 rule 1 is the actual predicate and it has been all along. A placeholder is
+    a `0.0.x`, a real release never is, and that stays true across every wave.
+    """
+    return version.startswith("0.0.")
+
+
 def held_state(version: str) -> str:
     """What a name we hold is in, given the version published under it.
 
@@ -122,7 +144,7 @@ def held_state(version: str) -> str:
     a real version replaces it, at which point it says `released` on its own
     without anybody editing this file.
     """
-    return RESERVED if version == PLACEHOLDER else RELEASED
+    return RESERVED if is_placeholder(version) else RELEASED
 
 
 def p_crates(name: str, _ns: str):
@@ -201,8 +223,22 @@ def p_npm(name: str, ns: str):
                 f"filter, not by the tombstone"
             )
         who = ",".join(m.get("name", "?") for m in maint)
-        ours = IDENTITY in who
-        return (RELEASED if ours else BLOCKED), f"maintainers={who or '?'}"
+        if IDENTITY not in who:
+            return BLOCKED, f"maintainers={who or '?'}"
+        # This used to return `released` for anything with our name on it,
+        # without ever looking at what was published under it. `@yodb/core` has
+        # held nothing but a placeholder since the day it was created and the
+        # row said `released` for every one of them, which is the one
+        # distinction the six states exist to keep. Every other probe over a
+        # name we hold goes through `held_state`; this was the only one that
+        # decided for itself, and being the only one is why nothing caught it.
+        #
+        # `dist-tags.latest` rather than the largest key in `versions`, which
+        # sorts as a string: "0.0.10" would lose to "0.0.9".
+        latest = (d.get("dist-tags") or {}).get("latest")
+        if not latest:
+            return UNKNOWN, f"maintainers={who}, no dist-tag to read a version from"
+        return held_state(latest), f"v{latest} maintainers={who}"
     return UNKNOWN, f"http {code}"
 
 
@@ -491,10 +527,15 @@ def p_dockerhub(name: str, ns: str):
     if code != 200 or not tags:
         return UNKNOWN, f"account {who}, tags http {code}"
     names = {t.get("name") for t in tags.get("results") or []}
-    real = sorted(n for n in names if n and n not in {"latest", PLACEHOLDER})
+    # Docker Hub keeps every tag ever pushed, so this list holds the whole
+    # history of the reservation and not just the current one. Excluding only
+    # the version being published today read our own 0.0.1 as a real release the
+    # moment 0.0.2 went up beside it.
+    held = sorted(n for n in names if n and is_placeholder(n))
+    real = sorted(n for n in names if n and n != "latest" and not is_placeholder(n))
     if real:
         return RELEASED, f"account {who}, tags {', '.join(real[:3])}"
-    return RESERVED, f"account {who}, {PLACEHOLDER}"
+    return RESERVED, f"account {who}, {', '.join(held) or 'no image yet'}"
 
 
 def p_ghcr(name: str, ns: str):

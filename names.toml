@@ -28,7 +28,7 @@ state     = "reserved"
 probed    = "2026-08-29"
 owner     = "tamnd"
 fallback  = ""
-note      = "v0.0.1 owner=tamnd"
+note      = "v0.0.2 owner=tamnd"
 
 [[name]]
 registry  = "crates.io"
@@ -38,7 +38,7 @@ state     = "reserved"
 probed    = "2026-08-29"
 owner     = "tamnd"
 fallback  = ""
-note      = "v0.0.1 owner=tamnd"
+note      = "v0.0.2 owner=tamnd"
 
 [[name]]
 registry  = "crates.io"
@@ -48,7 +48,7 @@ state     = "reserved"
 probed    = "2026-08-29"
 owner     = "tamnd"
 fallback  = ""
-note      = "v0.0.1 owner=tamnd"
+note      = "v0.0.2 owner=tamnd"
 
 [[name]]
 registry  = "pypi"
@@ -58,17 +58,17 @@ state     = "reserved"
 probed    = "2026-08-29"
 owner     = "tamnd"
 fallback  = ""
-note      = "v0.0.1, repository is ours"
+note      = "v0.0.2, repository is ours"
 
 [[name]]
 registry  = "npm"
 name      = "core"
 namespace = "@yodb"
-state     = "released"
+state     = "reserved"
 probed    = "2026-08-29"
 owner     = "tamnd"
 fallback  = ""
-note      = "maintainers=tamnd"
+note      = "v0.0.2 maintainers=tamnd"
 
 [[name]]
 registry  = "npm"
@@ -108,7 +108,7 @@ state     = "reserved"
 probed    = "2026-08-29"
 owner     = "tamnd"
 fallback  = ""
-note      = "v0.0.1, no publisher set, repository is ours"
+note      = "v0.0.2, publisher tamnd.com"
 
 [[name]]
 registry  = "nuget"
@@ -208,7 +208,7 @@ state     = "reserved"
 probed    = "2026-08-29"
 owner     = "tamnd87"
 fallback  = ""
-note      = "account tamnd87, 0.0.1"
+note      = "account tamnd87, 0.0.1, 0.0.2"
 
 [[name]]
 registry  = "docker-hub"
