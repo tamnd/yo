@@ -76,12 +76,19 @@
 
 use crate::Elements;
 
-/// A set is an element table with nothing stored against a member.
+/// The operand of everything below: an element table, nothing against a member.
 ///
 /// Set algebra reads names and never payloads, so this is not generic. A hash or
 /// a sorted set is not an operand of `SINTER` and pretending otherwise would put
 /// a type parameter in every signature here to no end.
-pub type Set = Elements<()>;
+///
+/// This is a table and not a [`crate::Set`], which is a narrower thing than the
+/// name it used to have suggested. A real set is one of three representations
+/// and only the largest of them is this, so the algebra either grows arms for
+/// the other two or takes something that can produce members whatever it is.
+/// That is the next piece of work and this alias gets to keep an honest name
+/// until then.
+pub type Table = Elements<()>;
 
 /// How to answer a set operation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -104,7 +111,7 @@ pub enum Plan {
 /// Always a probe, for the reason in the module doc. When the partitioned band
 /// gives us something sorted to merge there will be a choice to make here, and
 /// until then there is not one.
-pub fn inter<F>(sets: &[&Set], limit: usize, f: F) -> usize
+pub fn inter<F>(sets: &[&Table], limit: usize, f: F) -> usize
 where
     F: FnMut(&[u8]),
 {
@@ -117,7 +124,7 @@ where
 /// only way to find out where they cross and the only way to check that they
 /// agree on the answer. It is public because a caller that knows the shape of its
 /// own data knows more about it than [`inter`] can see from the sets alone.
-pub fn inter_with<F>(how: Plan, sets: &[&Set], limit: usize, f: F) -> usize
+pub fn inter_with<F>(how: Plan, sets: &[&Table], limit: usize, f: F) -> usize
 where
     F: FnMut(&[u8]),
 {
@@ -136,7 +143,7 @@ where
 /// is going to fail will usually fail against the smallest of the others, and
 /// asking that one first is what turns `k - 1` questions per member into closer
 /// to one.
-fn inter_probe<F>(sets: &[&Set], limit: usize, mut f: F) -> usize
+fn inter_probe<F>(sets: &[&Table], limit: usize, mut f: F) -> usize
 where
     F: FnMut(&[u8]),
 {
@@ -148,7 +155,7 @@ where
     for (name, _) in sets[first].iter() {
         // Hashed once, asked k-1 times. Without this the hash is paid per
         // question and it is the same bytes every time.
-        let h = Set::hash_of(name);
+        let h = Table::hash_of(name);
         if rest.iter().all(|&i| sets[i].contains_hashed(h, name)) {
             f(name);
             found += 1;
@@ -166,7 +173,7 @@ where
 /// raises it, so a member with the full count is in all of them. Members that
 /// are not in the first set are never entered at all, which keeps the table no
 /// bigger than the first set and is why the first set is the smallest one.
-fn inter_accumulate<F>(sets: &[&Set], limit: usize, mut f: F) -> usize
+fn inter_accumulate<F>(sets: &[&Table], limit: usize, mut f: F) -> usize
 where
     F: FnMut(&[u8]),
 {
@@ -207,7 +214,7 @@ where
 /// There is no plan to choose here. A union has to read every member of every
 /// set whatever it does, so the only question is what it does with each one, and
 /// the answer is one insertion into a table that is also the duplicate check.
-pub fn union<F>(sets: &[&Set], mut f: F) -> usize
+pub fn union<F>(sets: &[&Table], mut f: F) -> usize
 where
     F: FnMut(&[u8]),
 {
@@ -233,7 +240,7 @@ where
 /// walked whether we like it or not, so the only choice is how each member is
 /// checked, and a member that is in the second set is never asked about the
 /// third.
-pub fn diff<F>(sets: &[&Set], mut f: F) -> usize
+pub fn diff<F>(sets: &[&Table], mut f: F) -> usize
 where
     F: FnMut(&[u8]),
 {
@@ -245,7 +252,7 @@ where
 
     let mut found = 0usize;
     for (name, _) in first.iter() {
-        let h = Set::hash_of(name);
+        let h = Table::hash_of(name);
         if !order.iter().any(|&i| rest[i].contains_hashed(h, name)) {
             f(name);
             found += 1;
@@ -260,7 +267,7 @@ where
 /// for an intersection or a difference and the sum for a union. Y18's rule, and
 /// the thing that stopped aki's `*STORE` family at 0.30x was that it was not
 /// applied.
-pub fn collect(upper: usize, run: impl FnOnce(&mut dyn FnMut(&[u8]))) -> Set {
+pub fn collect(upper: usize, run: impl FnOnce(&mut dyn FnMut(&[u8]))) -> Table {
     let mut out = Elements::<()>::with_capacity(upper);
     run(&mut |name| {
         out.insert(name, ()).expect("presized to an upper bound");
@@ -272,7 +279,7 @@ pub fn collect(upper: usize, run: impl FnOnce(&mut dyn FnMut(&[u8]))) -> Set {
 mod tests {
     use super::*;
 
-    fn set(members: &[&str]) -> Set {
+    fn set(members: &[&str]) -> Table {
         let mut s = Elements::new();
         for m in members {
             s.insert(m.as_bytes(), ()).expect("room");
@@ -330,7 +337,7 @@ mod tests {
     /// when a set grows past a threshold it cannot see.
     #[test]
     fn both_plans_give_the_same_answer_in_the_same_order() {
-        let sets: Vec<Set> = (0..9)
+        let sets: Vec<Table> = (0..9)
             .map(|s| {
                 let members: Vec<String> = (0..200)
                     .filter(|i| i % (s + 2) != 1)
@@ -339,7 +346,7 @@ mod tests {
                 set(&members.iter().map(String::as_str).collect::<Vec<_>>())
             })
             .collect();
-        let refs: Vec<&Set> = sets.iter().collect();
+        let refs: Vec<&Table> = sets.iter().collect();
 
         let probed = run(|f| inter_with(Plan::Probe, &refs, 0, f));
         let piled = run(|f| inter_with(Plan::Accumulate, &refs, 0, f));
@@ -379,8 +386,8 @@ mod tests {
     fn the_plans_agree_where_every_set_holds_everything() {
         let members: Vec<String> = (0..100).map(|i| format!("m{i}")).collect();
         let names: Vec<&str> = members.iter().map(String::as_str).collect();
-        let sets: Vec<Set> = (0..10).map(|_| set(&names)).collect();
-        let refs: Vec<&Set> = sets.iter().collect();
+        let sets: Vec<Table> = (0..10).map(|_| set(&names)).collect();
+        let refs: Vec<&Table> = sets.iter().collect();
 
         let probed = run(|f| inter_with(Plan::Probe, &refs, 0, f));
         assert_eq!(probed, members, "everything is in all ten");
@@ -404,8 +411,8 @@ mod tests {
     /// arbitrary bytes rather than text.
     #[test]
     fn members_that_are_not_text_work_the_same() {
-        let mut a = Set::new();
-        let mut b = Set::new();
+        let mut a = Table::new();
+        let mut b = Table::new();
         for m in [&b"\x00\xff"[..], b"\xc3\x28", b""] {
             a.insert(m, ()).expect("room");
         }
