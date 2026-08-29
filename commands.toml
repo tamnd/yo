@@ -69,7 +69,7 @@ doc = "08 section 6"
 [[group]]
 name = "hash"
 expected = 28
-status = "partial"
+status = "shipped"
 doc = "08 section 3"
 
 [[group]]
@@ -970,6 +970,39 @@ bounded = "inherent"
 status = "shipped"
 wire = "verified"
 notes = "Takes the deadline off and answers 1, without saying what it was. Worth knowing that a plain HSET does this too: writing a field clears its deadline, which has been Redis's rule since 7.4 and is the whole reason HGETEX exists as a command instead of a flag on HGET."
+
+[[command]]
+name = "HGETDEL"
+group = "hash"
+since = "8.0.0"
+arity = -5
+plan = "point"
+bounded = "inherent"
+status = "shipped"
+wire = "verified"
+notes = "The values positionally, then the fields go, and the key goes with the last of them. This one arrived years after the HEXPIRE family and words the same three numfields mistakes in three different sentences to it, which is upstream and is copied rather than tidied."
+
+[[command]]
+name = "HGETEX"
+group = "hash"
+since = "8.0.0"
+arity = -5
+plan = "point"
+bounded = "inherent"
+status = "shipped"
+wire = "verified"
+notes = "The value out first and the deadline applied second, which is what makes a past EXAT hand the value back and take the field anyway. Unlike GETEX, no option here means leave the deadline alone rather than clear it, and PERSIST is how you ask for it gone."
+
+[[command]]
+name = "HSETEX"
+group = "hash"
+since = "8.0.0"
+arity = -6
+plan = "point"
+bounded = "inherent"
+status = "shipped"
+wire = "verified"
+notes = "One answer for the whole list, because FNX and FXX are asked over every field named and not one at a time. KEEPTTL is needed because the write clears the deadline first, so the deadline is read before the value is stored and put back after."
 
 
 # ------------------------------------------------------------------ scripting

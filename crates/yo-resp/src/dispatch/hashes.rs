@@ -28,7 +28,7 @@
 
 use yo_common::{Code, Error, Result, glob_matches, parse_i64};
 use yo_kv::hash::Text;
-use yo_kv::{Ask, Cond, Cursor, Keyspace};
+use yo_kv::{Ask, Cond, Cursor, Exists, Expire, Keyspace, MAX_AT};
 
 use super::args::{self, Args};
 use super::table::Spec;
@@ -58,6 +58,27 @@ const FIELD_COUNT: &str = "wrong number of arguments";
 const BAD_NUMFIELDS: &str = "Parameter `numFields` should be greater than 0";
 /// A thousand milliseconds, for the commands that count in seconds.
 const SECOND: i64 = 1000;
+/// What `HGETDEL` says about a field count that is not one.
+///
+/// The last three hash commands were added years after the `HEXPIRE` family and
+/// they do not agree with it, or with each other, about how to phrase any of
+/// this. There are three wordings for the same three mistakes and they are all
+/// upstream, so they are all here.
+const DEL_BAD_COUNT: &str = "Number of fields must be a positive integer";
+/// And when its count does not match the fields.
+const DEL_MISMATCH: &str = "The `numfields` parameter must match the number of arguments";
+/// And when `FIELDS` is not where it should be.
+const DEL_NO_FIELDS: &str = "Mandatory argument FIELDS is missing or not at the right position";
+/// What `HGETEX` and `HSETEX` say about a field count that is not one.
+const EX_BAD_COUNT: &str = "invalid number of fields";
+/// And when their count does not match what follows.
+const EX_MISMATCH: &str = "wrong number of arguments";
+/// What `HGETEX` says when it is given two ways to set the same deadline.
+const GETEX_ONE_OF: &str = "Only one of EX, PX, EXAT, PXAT or PERSIST arguments can be specified";
+/// And `HSETEX`, which has `KEEPTTL` where `HGETEX` has `PERSIST`.
+const SETEX_ONE_OF: &str = "Only one of EX, PX, EXAT, PXAT or KEEPTTL arguments can be specified";
+/// And when it is given both of the field conditions.
+const SETEX_ONE_COND: &str = "Only one of FXX or FNX arguments can be specified";
 
 /// Run one hash command.
 pub(super) fn execute(db: &mut Keyspace, spec: &Spec, args: Args<'_>, out: &mut Out) -> Result<()> {
@@ -147,6 +168,9 @@ pub(super) fn execute(db: &mut Keyspace, spec: &Spec, args: Args<'_>, out: &mut 
         "httl" | "hpttl" | "hexpiretime" | "hpexpiretime" | "hpersist" => {
             ask(db, spec.name, args, out)?;
         }
+        "hgetdel" => getdel(db, args, out)?,
+        "hgetex" => getex(db, args, out)?,
+        "hsetex" => setex(db, args, out)?,
         other => unreachable!("{other} is not a hash command"),
     }
     Ok(())
@@ -279,13 +303,6 @@ fn scan(db: &mut Keyspace, args: Args<'_>, out: &mut Out) -> Result<()> {
 /// that has already gone, so `HEXPIRE key -1` is an error while `HEXPIRE key 0`
 /// deletes the field. Both messages are its, and they are different messages.
 fn expire(db: &mut Keyspace, name: &str, args: Args<'_>, out: &mut Out) -> Result<()> {
-    let by = args.int(2)?;
-    if by < 0 {
-        return Err(Error::new(Code::Invalid, BAD_EXPIRE));
-    }
-    let (cond, from) = condition(args, 3)?;
-    let fields = field_list(args, from, name)?;
-
     // The p is milliseconds and the at is absolute, which is the whole of the
     // difference between the four.
     let relative = matches!(name, "hexpire" | "hpexpire");
@@ -294,35 +311,43 @@ fn expire(db: &mut Keyspace, name: &str, args: Args<'_>, out: &mut Out) -> Resul
     } else {
         SECOND
     };
-    // Everything past here is in milliseconds. An overflow means a number no
-    // deadline could ever be, which is the out of range message and not the
-    // negative one, and it is checked before any field is touched.
-    let at = by
-        .checked_mul(scale)
-        .and_then(|ms| {
-            if relative {
-                ms.checked_add(db.clock().now_ms() as i64)
-            } else {
-                Some(ms)
-            }
-        })
-        .and_then(|ms| u64::try_from(ms).ok())
-        .ok_or_else(|| out_of_range(name))?;
+    let at = moment(args.int(2)?, scale, relative, name, db.clock().now_ms())?;
+    let (cond, from) = condition(args, 3)?;
+    let fields = field_list(args, from, name)?;
 
     out.array(fields.len());
     db.hexpire(args.get(1), at, cond, fields.iter(args), |applied| {
         out.int(applied as i64);
     })
-    .map_err(|e| {
-        // The store's own ceiling check, which the arithmetic above can reach
-        // without overflowing. Reported with the command name the way Redis
-        // reports it rather than with the store's wording.
-        if e.code() == Code::Invalid {
-            out_of_range(name)
-        } else {
-            e
-        }
-    })
+}
+
+/// The absolute millisecond a client's number means, or why it is not one.
+///
+/// `scale` turns the unit into milliseconds and `relative` says whether it
+/// counts from now or from the epoch, so all eight commands that take a deadline
+/// come through here.
+///
+/// The two failures are different messages and it is easy to get them backwards.
+/// A negative number is refused outright rather than read as a moment that has
+/// gone, so `HEXPIRE key -1` is an error where `HEXPIRE key 0` is a delete. A
+/// number past the ceiling names the command instead. Both are answered before
+/// any field is touched, because Redis refuses the whole command rather than
+/// expiring the fields it got to first.
+fn moment(by: i64, scale: i64, relative: bool, name: &str, now: u64) -> Result<u64> {
+    if by < 0 {
+        return Err(Error::new(Code::Invalid, BAD_EXPIRE));
+    }
+    by.checked_mul(scale)
+        .and_then(|ms| {
+            if relative {
+                ms.checked_add(now as i64)
+            } else {
+                Some(ms)
+            }
+        })
+        .and_then(|ms| u64::try_from(ms).ok())
+        .filter(|&ms| ms <= MAX_AT)
+        .ok_or_else(|| out_of_range(name))
 }
 
 /// `HTTL`, `HPTTL`, `HEXPIRETIME`, `HPEXPIRETIME` and `HPERSIST`.
@@ -373,6 +398,179 @@ fn ask(db: &mut Keyspace, name: &str, args: Args<'_>, out: &mut Out) -> Result<(
     })
 }
 
+/// `HGETDEL key FIELDS numfields field [field ...]`.
+///
+/// The value goes out and the field goes away, which a client could not do
+/// without a race before this existed. The reply is positional the way `HMGET`'s
+/// is, so a field that was not there is a nil in its own place.
+fn getdel(db: &mut Keyspace, args: Args<'_>, out: &mut Out) -> Result<()> {
+    if !args::is(args.get(2), b"fields") {
+        return Err(Error::new(Code::Invalid, DEL_NO_FIELDS));
+    }
+    let fields = ex_field_list(args, 2, 1, DEL_BAD_COUNT, DEL_MISMATCH)?;
+    out.array(fields.len());
+    db.hgetdel(args.get(1), fields.iter(args), |t| match t {
+        Some(t) => write_text(out, t),
+        None => out.nil(),
+    })
+}
+
+/// `HGETEX key [EX s | PX ms | EXAT ts | PXAT ts | PERSIST] FIELDS n f [f ...]`.
+///
+/// A plain `HGETEX` with no option leaves the deadline where it is, which is the
+/// one place this disagrees with `GETEX`, and it is why [`Expire::Keep`] is the
+/// default here rather than [`Expire::Clear`].
+fn getex(db: &mut Keyspace, args: Args<'_>, out: &mut Out) -> Result<()> {
+    let opts = options(db.clock().now_ms(), args, "hgetex")?;
+    let fields = ex_field_list(args, opts.fields_at, 1, EX_BAD_COUNT, EX_MISMATCH)?;
+    out.array(fields.len());
+    db.hgetex(args.get(1), opts.expire, fields.iter(args), |t| match t {
+        Some(t) => write_text(out, t),
+        None => out.nil(),
+    })
+}
+
+/// `HSETEX key [FNX|FXX] [EX .. | KEEPTTL] FIELDS n field value [field value]`.
+///
+/// One integer back, and it is all of it or none of it. The count after `FIELDS`
+/// is a count of pairs and not of arguments, which is the only place in the hash
+/// group where that word means something other than one argument each.
+fn setex(db: &mut Keyspace, args: Args<'_>, out: &mut Out) -> Result<()> {
+    let opts = options(db.clock().now_ms(), args, "hsetex")?;
+    let fields = ex_field_list(args, opts.fields_at, 2, EX_BAD_COUNT, EX_MISMATCH)?;
+    let wrote = db.hsetex(args.get(1), opts.exists, opts.expire, fields.pairs(args))?;
+    out.int(i64::from(wrote));
+    Ok(())
+}
+
+/// What `HGETEX` and `HSETEX` were asked for, and where their fields start.
+#[derive(Debug, Clone, Copy)]
+struct Options {
+    /// `FNX` or `FXX`, which only `HSETEX` has.
+    exists: Exists,
+    /// The deadline clause, whichever of the six spellings it arrived in.
+    expire: Expire,
+    /// The index of the `FIELDS` keyword.
+    fields_at: usize,
+}
+
+/// Read the option clause of `HGETEX` or `HSETEX`, up to `FIELDS`.
+///
+/// One loop rather than a fixed order, because Redis takes these in any order:
+/// `HSETEX key EX 100 FNX FIELDS 1 f v` is accepted and so is the other way
+/// round. An option it does not know is reported by name, which is these two
+/// commands' wording and not the `HEXPIRE` family's.
+///
+/// The two differ in one token each, `PERSIST` against `KEEPTTL`, and they say
+/// so in their own words when given two deadlines. Neither accepts the other's
+/// token: `HGETEX key KEEPTTL` is an unknown argument and not a syntax error.
+fn options(now: u64, args: Args<'_>, name: &str) -> Result<Options> {
+    let setting = name == "hsetex";
+    let mut opts = Options {
+        exists: Exists::Always,
+        // A write clears the deadline unless told otherwise, and a read leaves
+        // it alone unless told otherwise. Two commands, two defaults.
+        expire: if setting { Expire::Clear } else { Expire::Keep },
+        fields_at: 0,
+    };
+    let mut had_expire = false;
+    let mut had_exists = false;
+    let one_of = if setting { SETEX_ONE_OF } else { GETEX_ONE_OF };
+
+    let mut i = 2;
+    while i < args.len() {
+        let arg = args.get(i);
+        if args::is(arg, b"fields") {
+            opts.fields_at = i;
+            return Ok(opts);
+        }
+        // The unit and where it counts from, which is all four of these.
+        let clause = match arg {
+            a if args::is(a, b"ex") => Some((SECOND, true)),
+            a if args::is(a, b"px") => Some((1, true)),
+            a if args::is(a, b"exat") => Some((SECOND, false)),
+            a if args::is(a, b"pxat") => Some((1, false)),
+            _ => None,
+        };
+        if let Some((scale, relative)) = clause {
+            if had_expire {
+                return Err(Error::new(Code::Invalid, one_of));
+            }
+            had_expire = true;
+            opts.expire = Expire::At(moment(args.int(i + 1)?, scale, relative, name, now)?);
+            i += 2;
+            continue;
+        }
+        if (setting && args::is(arg, b"keepttl")) || (!setting && args::is(arg, b"persist")) {
+            if had_expire {
+                return Err(Error::new(Code::Invalid, one_of));
+            }
+            had_expire = true;
+            // KEEPTTL on a write and PERSIST on a read are opposites of each
+            // other and both are the other command's default, which reads
+            // oddly until you notice that a write clears and a read does not.
+            opts.expire = if setting { Expire::Keep } else { Expire::Clear };
+            i += 1;
+            continue;
+        }
+        if setting && (args::is(arg, b"fnx") || args::is(arg, b"fxx")) {
+            if had_exists {
+                return Err(Error::new(Code::Invalid, SETEX_ONE_COND));
+            }
+            had_exists = true;
+            opts.exists = if args::is(arg, b"fnx") {
+                Exists::IfMissing
+            } else {
+                Exists::IfPresent
+            };
+            i += 1;
+            continue;
+        }
+        return Err(unknown(arg));
+    }
+    // Every argument read and no FIELDS in them, which the arity check cannot
+    // catch because the option clause has no fixed width.
+    Err(args::wrong_arity(name))
+}
+
+/// `ERR unknown argument: x`, spelled the way the client sent it.
+fn unknown(arg: &[u8]) -> Error {
+    Error::fmt(
+        Code::Invalid,
+        format_args!("unknown argument: {}", String::from_utf8_lossy(arg)),
+    )
+}
+
+/// Read `FIELDS numfields ...` for the last three hash commands.
+///
+/// `step` is how many arguments a field takes, which is one everywhere except
+/// `HSETEX`, where the count is a count of pairs.
+///
+/// The messages are handed in because these three do not agree with the
+/// `HEXPIRE` family or with each other about how to word either mistake. That is
+/// upstream and it is what a client sees, so it is copied rather than tidied.
+fn ex_field_list(
+    args: Args<'_>,
+    at: usize,
+    step: usize,
+    bad_count: &str,
+    mismatch: &str,
+) -> Result<Fields> {
+    let Some(len) = parse_i64(args.get(at + 1))
+        .filter(|&n| n > 0)
+        .and_then(|n| usize::try_from(n).ok())
+    else {
+        return Err(Error::new(Code::Invalid, bad_count));
+    };
+    let from = at + 2;
+    // Checked, because a count near the top of a usize would wrap into a width
+    // that happens to match and take the walk past the end of the arguments.
+    if len.checked_mul(step).and_then(|w| from.checked_add(w)) != Some(args.len()) {
+        return Err(Error::new(Code::Invalid, mismatch));
+    }
+    Ok(Fields { from, len })
+}
+
 /// Where the fields of a field TTL command are, once `FIELDS numfields` is read.
 ///
 /// The count has to match what follows exactly. Redis checks it and refuses the
@@ -393,6 +591,18 @@ impl Fields {
     #[inline]
     fn iter(self, args: Args<'_>) -> impl Iterator<Item = &[u8]> {
         (self.from..self.from + self.len).map(move |i| args.get(i))
+    }
+
+    /// The same run read as pairs, which is what `HSETEX` counts.
+    ///
+    /// Clone, because the store walks the pairs once to check `FNX` or `FXX`
+    /// over the whole list before it writes any of them.
+    #[inline]
+    fn pairs(self, args: Args<'_>) -> impl Iterator<Item = (&[u8], &[u8])> + Clone {
+        (0..self.len).map(move |k| {
+            let at = self.from + k * 2;
+            (args.get(at), args.get(at + 1))
+        })
     }
 }
 
