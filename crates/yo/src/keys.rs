@@ -46,6 +46,20 @@
 //! name for one call is worse than no second name, so the wire has `TOUCH` for
 //! the clients that send it and this does not.
 //!
+//! # There is no cursor
+//!
+//! The wire has `SCAN` because a server cannot stop and walk a keyspace for one
+//! client while every other client waits, so it hands out a number and does the
+//! walk in pieces. Nothing here is in that position. [`Keys::each`] holds the
+//! database for as long as it runs and nothing else can write to it in the
+//! meantime, so it is one walk, it sees one version of the keyspace, and there
+//! is no cursor to hold and no duplicate to filter out.
+//!
+//! What that costs is that a walk of ten million keys is ten million calls
+//! before the next line of your program runs. That is the same trade `KEYS`
+//! makes and it is the right one here, because the thing on the other side of
+//! the call is your own code rather than a socket.
+//!
 //! # The typed collections are somewhere else
 //!
 //! A [`Map`](crate::Map) is a named collection and not a key in the keyspace, so
@@ -424,6 +438,96 @@ impl Keys {
         self.db
             .run(|inner| Ok(inner.strings.copy(src.as_ref(), dst.as_ref(), true)))
     }
+
+    /// Every key in the database, one call each. `KEYS *` without the reply.
+    ///
+    /// The key is handed over where it lies, so a walk of a million keys
+    /// allocates nothing at all. It is only borrowed for the length of the
+    /// call, which is what stops it from outliving the record it points into,
+    /// so anything you want to keep has to be copied out inside the closure.
+    ///
+    /// A key whose deadline has passed is not handed over, and it is deleted
+    /// once the walk has finished, so a walk is also the cheapest way to clear
+    /// out a database that has had a lot of things expire in it.
+    ///
+    /// ```
+    /// let db = yo::open(yo::MEMORY)?;
+    /// db.strings().set("a", "1")?;
+    /// db.strings().set("b", "2")?;
+    ///
+    /// let mut n = 0;
+    /// db.keys().each(|_| n += 1)?;
+    /// assert_eq!(n, 2);
+    /// # Ok::<(), yo::Error>(())
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// As [`Keys::exists`], which includes calling any method on this database
+    /// from inside the closure.
+    pub fn each(&self, mut f: impl FnMut(&[u8])) -> Result<()> {
+        self.db.run(|inner| {
+            inner.strings.keys(&mut f);
+            Ok(())
+        })
+    }
+
+    /// Every key, copied out into a vector. `KEYS *`.
+    ///
+    /// The convenient one, and the one that costs a key's worth of memory per
+    /// key. [`Keys::each`] is the same walk without that.
+    ///
+    /// # Errors
+    ///
+    /// As [`Keys::exists`].
+    pub fn all(&self) -> Result<Vec<Vec<u8>>> {
+        let mut out = Vec::new();
+        self.each(|key| out.push(key.to_vec()))?;
+        Ok(out)
+    }
+
+    /// Every key matching a glob pattern. `KEYS pattern`.
+    ///
+    /// The same `*`, `?`, `[abc]` and `\` that Redis matches with, so a pattern
+    /// that works against a Redis client works here.
+    ///
+    /// ```
+    /// let db = yo::open(yo::MEMORY)?;
+    /// db.strings().set("user:1", "alice")?;
+    /// db.strings().set("user:2", "bob")?;
+    /// db.strings().set("session:1", "x")?;
+    ///
+    /// assert_eq!(db.keys().matching("user:*")?.len(), 2);
+    /// # Ok::<(), yo::Error>(())
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// As [`Keys::exists`].
+    pub fn matching(&self, pattern: impl AsRef<[u8]>) -> Result<Vec<Vec<u8>>> {
+        let pattern = pattern.as_ref();
+        let mut out = Vec::new();
+        self.each(|key| {
+            if yo_common::glob_matches(pattern, key) {
+                out.push(key.to_vec());
+            }
+        })?;
+        Ok(out)
+    }
+
+    /// One key, chosen at random, or `None` if the database is empty.
+    /// `RANDOMKEY`.
+    ///
+    /// A constant number of loads whatever the database holds, because it picks
+    /// a place in the index and takes a key from there rather than walking to
+    /// find one.
+    ///
+    /// # Errors
+    ///
+    /// As [`Keys::exists`].
+    pub fn random(&self) -> Result<Option<Vec<u8>>> {
+        self.db.run(|inner| Ok(inner.strings.random_key()))
+    }
 }
 
 /// Both ways of applying a deadline answer the same question, so they say so in
@@ -682,5 +786,65 @@ mod tests {
 
         keys.expire_in("k", Duration::from_secs(60)).unwrap();
         assert!(db.reads_the_clock());
+    }
+
+    #[test]
+    fn a_walk_sees_every_key_whatever_it_holds() {
+        let db = open(MEMORY).unwrap();
+        let keys = db.keys();
+        assert!(keys.all().unwrap().is_empty());
+        assert_eq!(keys.random().unwrap(), None);
+
+        db.strings().set("a", "v").unwrap();
+        db.set("s").add("m").unwrap();
+        for i in 0..1_000 {
+            db.strings().set(format!("n:{i}"), "v").unwrap();
+        }
+
+        let mut all = keys.all().unwrap();
+        all.sort();
+        assert_eq!(all.len(), 1_002);
+        assert_eq!(all[0], b"a");
+        assert_eq!(keys.matching("n:*").unwrap().len(), 1_000);
+        assert_eq!(keys.matching("s").unwrap(), vec![b"s".to_vec()]);
+        assert!(keys.matching("nothing").unwrap().is_empty());
+
+        // A random key is one of the keys, and not the same one every time.
+        let mut picked = std::collections::HashSet::new();
+        for _ in 0..100 {
+            picked.insert(keys.random().unwrap().expect("the database is not empty"));
+        }
+        assert!(
+            picked.len() > 5,
+            "randomkey is stuck on {} keys",
+            picked.len()
+        );
+        assert!(picked.iter().all(|k| all.contains(k)));
+    }
+
+    #[test]
+    fn a_walk_does_not_hand_out_a_key_that_has_expired() {
+        let db = open(MEMORY).unwrap();
+        let keys = db.keys();
+        db.strings().set("alive", "v").unwrap();
+        db.strings().set("dead", "v").unwrap();
+        keys.expire_at("dead", UNIX_EPOCH + Duration::from_secs(1))
+            .unwrap();
+
+        assert_eq!(keys.all().unwrap(), vec![b"alive".to_vec()]);
+        assert_eq!(keys.random().unwrap(), Some(b"alive".to_vec()));
+    }
+
+    /// The closure holds the database, so a call back into it from inside the
+    /// walk is refused rather than deadlocked or, worse, allowed.
+    #[test]
+    fn a_walk_cannot_be_reentered() {
+        let db = open(MEMORY).unwrap();
+        let keys = db.keys();
+        db.strings().set("k", "v").unwrap();
+
+        let mut inner = Ok(true);
+        keys.each(|_| inner = keys.exists("k")).unwrap();
+        assert_eq!(inner.unwrap_err().code(), Code::Invalid);
     }
 }

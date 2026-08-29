@@ -26,6 +26,7 @@
 //! share a tag prefix and the prefilter would stop filtering.
 
 use crate::bucket::{Bucket, SLOTS};
+use crate::scan::{Cursor, PREFIX_BITS};
 use yo_common::{Addr, tag_of};
 
 /// Buckets in one index segment. Sixty four buckets is 4 KiB, which is one page
@@ -36,7 +37,7 @@ pub const SEGMENT_BUCKETS: usize = 64;
 pub const MAX_CHAIN: usize = 2;
 
 /// Bits available to the directory, below the tag.
-const DIR_BITS: u32 = 56;
+pub(crate) const DIR_BITS: u32 = 56;
 
 /// The deepest the directory may go. Past this the hash has no bits left to
 /// discriminate on and the only honest answer is a longer chain.
@@ -484,6 +485,53 @@ impl Index {
                     }
                 })
             })
+    }
+
+    /// Walk one bucket and its overflow chain, and say where to go next.
+    ///
+    /// This is the step [`Cursor`] exists for, and the reasoning behind the
+    /// number it hands back is in that module rather than here. The short of it
+    /// is that the walk goes in increasing prefix order, a segment covers a
+    /// contiguous run of prefixes, and a key's prefix is a function of its hash
+    /// and does not change when the directory doubles or a segment splits.
+    ///
+    /// One bucket a call and not one segment, because a segment is 64 buckets
+    /// and up to 448 entries, and a client that asked for ten of them should not
+    /// get all of those in one reply. The caller decides how many steps make a
+    /// batch.
+    ///
+    /// A cursor a client made up resumes at whatever it points at, which is what
+    /// Redis does. The alternative is remembering every cursor ever handed out.
+    pub fn scan(&self, from: Cursor, mut out: impl FnMut(Addr)) -> Cursor {
+        let g = u32::from(self.global_depth);
+        let prefix = from.prefix();
+        let bucket = from.bucket();
+        let dir_idx = (prefix >> (PREFIX_BITS - g)) as usize;
+        let seg = &self.segs[self.dir[dir_idx] as usize];
+
+        let mut b = &seg.buckets[bucket];
+        loop {
+            for i in 0..SLOTS {
+                if b.tag(i) != crate::bucket::EMPTY {
+                    out(b.addr(i));
+                }
+            }
+            match b.link() {
+                Some(n) => b = &seg.overflow[(n - 1) as usize],
+                None => break,
+            }
+        }
+
+        if bucket + 1 < SEGMENT_BUCKETS {
+            return Cursor::at(prefix, bucket + 1);
+        }
+        // The segment is done, so step over the whole run of prefixes it covers
+        // rather than over the one the cursor happens to name. Its local depth
+        // is what says how wide that run is, and rounding down to the start of
+        // the run first is what keeps this correct after a doubling that
+        // happened while the client was away.
+        let span = 1u64 << (PREFIX_BITS - u32::from(seg.local_depth));
+        Cursor::at((prefix & !(span - 1)) + span, 0)
     }
 
     /// Replace the address of an entry that is being moved by compaction.

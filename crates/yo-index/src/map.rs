@@ -19,6 +19,7 @@
 //! bucket and one for the record, not three.
 
 use crate::index::{Index, Keys};
+use crate::scan::Cursor;
 use yo_arena::Arena;
 use yo_common::{Addr, Space, wyhash};
 
@@ -410,6 +411,55 @@ impl RawMap {
         self.index.contains(h, key, &Records { arena: &self.arena })
     }
 
+    /// The key and the value at an address this map handed out.
+    ///
+    /// The pair rather than either one alone, because they are one contiguous
+    /// read: the header says how long the key is and the value starts where the
+    /// key ends, so asking for both costs what asking for one costs.
+    #[inline]
+    #[must_use]
+    pub fn entry_at(&self, addr: Addr) -> (&[u8], &[u8]) {
+        let (klen, vlen) = Record::lens(self.arena.get(addr, HDR));
+        let bytes = self.arena.get(addr, HDR + klen + vlen);
+        (&bytes[HDR..HDR + klen], &bytes[HDR + klen..])
+    }
+
+    /// Walk a batch of the map, and say where the next batch starts.
+    ///
+    /// This is `SCAN`. `budget` is how many entries the caller would like, and
+    /// it is a floor and not a ceiling: the walk stops at the first bucket
+    /// boundary past it, so a batch of ten can come back with fifteen. Redis's
+    /// `COUNT` behaves the same way and for the same reason, which is that a
+    /// bucket is the smallest unit a cursor can name.
+    ///
+    /// A budget of zero still does one bucket, so a caller that keeps passing
+    /// the cursor back always finishes rather than spinning on the same number.
+    ///
+    /// The guarantee, in full: a key that is present for the whole walk is
+    /// handed to `out` at least once. A key added or removed partway through may
+    /// or may not appear, and a key may appear twice. The reasoning is in
+    /// [`Cursor`], and the part worth knowing here is that none of it depends on
+    /// the map holding still between calls.
+    pub fn scan(&self, from: Cursor, budget: usize, mut out: impl FnMut(&[u8], &[u8])) -> Cursor {
+        // The index and the arena are separate fields, so the walk can hold one
+        // and the closure the other. That is what keeps this allocation free:
+        // there is no list of addresses in between.
+        let arena = &self.arena;
+        let mut at = from;
+        let mut seen = 0usize;
+        loop {
+            at = self.index.scan(at, |addr| {
+                let (klen, vlen) = Record::lens(arena.get(addr, HDR));
+                let bytes = arena.get(addr, HDR + klen + vlen);
+                out(&bytes[HDR..HDR + klen], &bytes[HDR + klen..]);
+                seen += 1;
+            });
+            if at.is_end() || seen >= budget {
+                return at;
+            }
+        }
+    }
+
     /// The index, for stats and for compaction.
     pub fn index(&self) -> &Index {
         &self.index
@@ -603,6 +653,7 @@ impl Default for RawMap {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::{HashMap, HashSet};
 
     /// `key:` and the index zero padded to twelve digits.
     ///
@@ -1120,5 +1171,201 @@ mod tests {
         let before = m.writes();
         m.clear();
         assert!(m.writes() > before, "clear went backwards or stood still");
+    }
+
+    /// Enough keys to have split several times, so a walk crosses segments of
+    /// different local depths rather than staying inside one.
+    #[cfg(miri)]
+    const SCAN_N: usize = 400;
+    #[cfg(not(miri))]
+    const SCAN_N: usize = 20_000;
+
+    #[test]
+    fn a_walk_of_an_empty_map_ends_on_the_first_call() {
+        let m = RawMap::new();
+        let mut seen = 0;
+        let at = m.scan(Cursor::START, 1000, |_, _| seen += 1);
+        assert_eq!(seen, 0);
+        assert!(
+            at.is_end(),
+            "an empty map took more than one call to finish"
+        );
+    }
+
+    /// The plain case, and the one every other guarantee is stated against: no
+    /// writes during the walk, so every key comes back once and no key comes
+    /// back twice.
+    #[test]
+    fn a_quiet_walk_returns_every_key_exactly_once() {
+        let mut m = RawMap::new();
+        for i in 0..SCAN_N {
+            m.set(&key(i), &val(i));
+        }
+
+        let mut counts: HashMap<Vec<u8>, usize> = HashMap::new();
+        let mut at = Cursor::START;
+        let mut calls = 0;
+        loop {
+            at = m.scan(at, 1, |k, v| {
+                // Both borrows are shared, so the walk can look the key up
+                // while it is handing it over. The pair arriving together is
+                // the point: a bucket walk that read the header of one record
+                // and the body of the next would still pass a key only check.
+                assert_eq!(m.get(k), Some(v), "the value came back on the wrong key");
+                *counts.entry(k.to_vec()).or_default() += 1;
+            });
+            calls += 1;
+            assert!(calls < 1_000_000, "the cursor is not advancing");
+            if at.is_end() {
+                break;
+            }
+        }
+
+        assert_eq!(
+            counts.len(),
+            SCAN_N,
+            "the walk missed keys or invented them"
+        );
+        for i in 0..SCAN_N {
+            assert_eq!(counts.get(&key(i)).copied(), Some(1), "key {i}");
+        }
+    }
+
+    /// A budget is a floor and not a ceiling, and asking for everything at once
+    /// is one call.
+    #[test]
+    fn a_budget_big_enough_finishes_in_one_call() {
+        let mut m = RawMap::new();
+        for i in 0..SCAN_N {
+            m.set(&key(i), &val(i));
+        }
+
+        let mut seen = 0;
+        let at = m.scan(Cursor::START, usize::MAX, |_, _| seen += 1);
+        assert_eq!(seen, SCAN_N);
+        assert!(at.is_end());
+    }
+
+    /// The guarantee that matters: the map grows underneath the walk, the
+    /// directory doubles and segments split, and a key that was there the whole
+    /// time still comes back.
+    ///
+    /// Written the way a client uses it, which is a cursor held across calls
+    /// with other work happening in between, because the failure this is looking
+    /// for is a cursor that means one thing before a split and another after.
+    #[test]
+    fn a_walk_survives_the_map_growing_underneath_it() {
+        let mut m = RawMap::new();
+        // The keys that are there throughout. Named apart from the ones added
+        // during the walk so the two are easy to tell apart in the assertion.
+        for i in 0..SCAN_N {
+            m.set(&key(i), &val(i));
+        }
+        let depth_before = m.index().global_depth();
+
+        let mut seen: HashSet<Vec<u8>> = HashSet::new();
+        let mut at = Cursor::START;
+        let mut added = SCAN_N;
+        loop {
+            at = m.scan(at, 8, |k, _| {
+                seen.insert(k.to_vec());
+            });
+            if at.is_end() {
+                break;
+            }
+            // Between one call and the next, which is where a client would be.
+            for _ in 0..64 {
+                m.set(&key(added), &val(added));
+                added += 1;
+            }
+        }
+
+        assert!(
+            m.index().global_depth() > depth_before,
+            "the directory never doubled, so this test proved nothing"
+        );
+        for i in 0..SCAN_N {
+            assert!(
+                seen.contains(&key(i)),
+                "key {i} was there throughout and never came back"
+            );
+        }
+    }
+
+    /// Deletes during a walk are the other half of the same guarantee. A key
+    /// that survives to the end still comes back, whatever happened to its
+    /// neighbours.
+    #[test]
+    fn a_walk_survives_keys_being_deleted_underneath_it() {
+        let mut m = RawMap::new();
+        for i in 0..SCAN_N {
+            m.set(&key(i), &val(i));
+        }
+
+        let mut seen: HashSet<Vec<u8>> = HashSet::new();
+        let mut at = Cursor::START;
+        let mut next_gone = 1;
+        loop {
+            at = m.scan(at, 8, |k, _| {
+                seen.insert(k.to_vec());
+            });
+            if at.is_end() {
+                break;
+            }
+            // Every odd key goes, a few at a time. The even ones are what the
+            // assertion is about.
+            for _ in 0..16 {
+                if next_gone < SCAN_N {
+                    m.del(&key(next_gone));
+                    next_gone += 2;
+                }
+            }
+        }
+
+        for i in (0..SCAN_N).step_by(2) {
+            assert!(
+                seen.contains(&key(i)),
+                "key {i} was never deleted and never came back"
+            );
+        }
+    }
+
+    /// A cursor names a place in the keyspace and not a place in memory, so a
+    /// walk started partway through returns everything from there on.
+    ///
+    /// The prefix is what says where that is. Starting at prefix `p` resumes in
+    /// the segment holding `p`, which begins at or before it, so every key whose
+    /// own prefix is `p` or higher is still ahead of the walk.
+    #[test]
+    fn a_walk_that_starts_partway_returns_everything_from_there_on() {
+        let mut m = RawMap::new();
+        for i in 0..SCAN_N {
+            m.set(&key(i), &val(i));
+        }
+
+        let half = 1u64 << (crate::scan::PREFIX_BITS - 1);
+        let mut seen: HashSet<Vec<u8>> = HashSet::new();
+        let at = m.scan(Cursor::at(half, 0), usize::MAX, |k, _| {
+            seen.insert(k.to_vec());
+        });
+        assert!(at.is_end());
+
+        let mut expected = 0;
+        for i in 0..SCAN_N {
+            let k = key(i);
+            if Cursor::prefix_of(RawMap::hash_of(&k)) >= half {
+                expected += 1;
+                assert!(
+                    seen.contains(&k),
+                    "key {i} is past the cursor and did not come back"
+                );
+            }
+        }
+        // Both halves of the keyspace have keys in them, or the assertion above
+        // is checking nothing.
+        assert!(
+            expected > 0 && expected < SCAN_N,
+            "the split point was degenerate"
+        );
     }
 }

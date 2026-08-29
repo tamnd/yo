@@ -19,11 +19,18 @@
 use super::args::{self, Args};
 use super::table::Spec;
 use crate::reply::Out;
-use yo_common::{Code, Error, Result};
-use yo_kv::{Applied, Ask, Cond, Keyspace, MAX_AT, Moved};
+use yo_common::{Code, Error, Result, glob_matches};
+use yo_kv::{Applied, Ask, Cond, KeyCursor, Keyspace, Kind, MAX_AT, Moved};
 
 /// Milliseconds in a second, which is the whole of what the p in `PTTL` means.
 const SECOND: i64 = 1000;
+
+/// What a cursor that is not a number gets, which is its own sentence and not
+/// the usual one about integers.
+const BAD_CURSOR: &str = "invalid cursor";
+
+/// The `COUNT` a `SCAN` uses when it is not given one, which is Redis's ten.
+const SCAN_COUNT: usize = 10;
 
 /// What `COPY` says for a `DB` that names a database this server does not have.
 ///
@@ -131,9 +138,128 @@ pub(super) fn execute(
         "persist" => out.int(i64::from(db.persist(args.get(1)))),
         "ttl" | "pttl" | "expiretime" | "pexpiretime" => ask(db, spec.name, args, out),
         "object" => object(db, args, out)?,
+        "scan" => scan(db, args, out)?,
+        "keys" => keys(db, args.get(1), out),
+        "randomkey" => match db.random_key() {
+            Some(key) => out.bulk(&key),
+            None => out.nil(),
+        },
         other => unreachable!("keyspace command with no body: {other}"),
     }
     Ok(())
+}
+
+/// `SCAN cursor [MATCH pattern] [COUNT count] [TYPE type]`.
+///
+/// The cursor names a place in the keyspace and not a place in memory, so it
+/// stays right across a resize and a client can hold one for as long as it
+/// likes. What it does not do is stay right across a `SELECT`, because two
+/// databases are two keyspaces and a position in one means nothing in the
+/// other. Redis has the same rule and neither server enforces it, since the
+/// only thing a cursor from elsewhere can do is answer the wrong keys.
+///
+/// `COUNT` is a floor and not a ceiling, and a batch can come back empty with a
+/// cursor that is not zero. That is the one thing a client has to get right and
+/// it is the same thing Redis asks of it.
+///
+/// An unknown `TYPE` is not an error. Redis compares the word against the type
+/// of each key it walks past, so a type nothing can hold matches nothing and
+/// the scan runs to the end answering nothing, which is what happens here.
+fn scan(db: &mut Keyspace, args: Args<'_>, out: &mut Out) -> Result<()> {
+    let cursor = parse_cursor(args.get(1))?;
+    let mut pattern = None;
+    let mut count = SCAN_COUNT;
+    let mut ty = None;
+    let mut impossible = false;
+    let mut i = 2;
+    while i < args.len() {
+        let rest = args.len() - i;
+        if args::is(args.get(i), b"match") && rest >= 2 {
+            pattern = Some(args.get(i + 1));
+        } else if args::is(args.get(i), b"count") && rest >= 2 {
+            // A count under one is a syntax error and not a range error, which
+            // is the odder of the two answers and is Redis's.
+            count = match args.int(i + 1)? {
+                n if n >= 1 => usize::try_from(n).unwrap_or(usize::MAX),
+                _ => return Err(args::syntax()),
+            };
+        } else if args::is(args.get(i), b"type") && rest >= 2 {
+            match kind_named(args.get(i + 1)) {
+                Some(k) => ty = Some(k),
+                None => impossible = true,
+            }
+        } else {
+            return Err(args::syntax());
+        }
+        i += 2;
+    }
+
+    // The same shape as `SSCAN`: the keys are written first because the walk is
+    // what produces the cursor, and the cursor is moved in front of them
+    // afterwards. Nothing goes out before the arguments have all been checked,
+    // which is what lets a failed command roll back cleanly.
+    out.array(2);
+    let at = out.len();
+    let mut n = 0;
+    let next = db.scan(cursor, count, ty, |key| {
+        if impossible || pattern.is_some_and(|p| !glob_matches(p, key)) {
+            return;
+        }
+        out.bulk(key);
+        n += 1;
+    });
+    out.close_array(at, n);
+    let listed = out.len() - at;
+    out.bulk_u64(next.raw());
+    let cursor = out.len() - at - listed;
+    out.hoist(at, cursor);
+    Ok(())
+}
+
+/// `KEYS pattern`.
+///
+/// One walk of every key in the database with the shard doing nothing else,
+/// which is the command's whole reputation and is deserved. It is here because
+/// tooling and Redis's own test suite both want it, and `SCAN` is the answer
+/// for anything that runs against a database somebody is using.
+fn keys(db: &mut Keyspace, pattern: &[u8], out: &mut Out) {
+    let at = out.len();
+    let mut n = 0;
+    db.keys(|key| {
+        if glob_matches(pattern, key) {
+            out.bulk(key);
+            n += 1;
+        }
+    });
+    out.close_array(at, n);
+}
+
+/// The type a `TYPE` option names, or `None` for a word that is not a type.
+///
+/// Case insensitive, because Redis compares with `strcasecmp` and `TYPE Set`
+/// works there.
+fn kind_named(arg: &[u8]) -> Option<Kind> {
+    [
+        Kind::String,
+        Kind::Hash,
+        Kind::Set,
+        Kind::Zset,
+        Kind::List,
+        Kind::Stream,
+    ]
+    .into_iter()
+    .find(|kind| args::is(arg, kind.name().as_bytes()))
+}
+
+/// A cursor as the client sent it back.
+///
+/// Unsigned, because ours uses the top bits and Redis parses a cursor with
+/// `strtoull` too.
+fn parse_cursor(arg: &[u8]) -> Result<KeyCursor> {
+    match std::str::from_utf8(arg).ok().and_then(|s| s.parse().ok()) {
+        Some(raw) => Ok(KeyCursor::from_raw(raw)),
+        None => Err(Error::new(Code::Invalid, BAD_CURSOR)),
+    }
 }
 
 /// `RENAME src dst` and `RENAMENX src dst`.
