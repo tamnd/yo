@@ -185,6 +185,20 @@ impl Meta {
         Meta::new(Kind::String, enc, has_expiry)
     }
 
+    /// The byte for a value that lives in a slab, with the record holding a
+    /// number that says where.
+    ///
+    /// The encoding bits are written as zero and mean nothing here. A set's
+    /// encoding is which of the three representations it is in, and that is a
+    /// property of the body and not of the record, so `OBJECT ENCODING` follows
+    /// the number and asks. Keeping a copy of it in these two bits would want
+    /// the record rewritten every time a set was promoted, for a command nobody
+    /// calls in a loop, and two places to disagree about the same fact.
+    #[inline]
+    pub const fn slot(kind: Kind, has_expiry: bool) -> Meta {
+        Meta::new(kind, Encoding::Int, has_expiry)
+    }
+
     /// Read the byte back.
     ///
     /// An unknown encoding is impossible from our own writer, so the two spare
@@ -369,6 +383,43 @@ pub fn write_int_record(out: &mut [u8], n: i64, expire_at: Option<u64>) {
         at += 8;
     }
     out[at..at + INT_LEN].copy_from_slice(&n.to_le_bytes());
+}
+
+/// Bytes of slab number, which is how a record points at a body.
+const SLOT_LEN: usize = 4;
+
+/// How many bytes a record pointing at a slab slot occupies.
+#[inline]
+pub fn slot_record_len(has_expiry: bool) -> usize {
+    (if has_expiry { 1 + 8 } else { 1 }) + SLOT_LEN
+}
+
+/// Write a record that points at `slot` in the slab for `kind`.
+///
+/// `out` must be exactly [`slot_record_len`] long.
+#[inline]
+pub fn write_slot_record(out: &mut [u8], kind: Kind, slot: u32, expire_at: Option<u64>) {
+    out[0] = Meta::slot(kind, expire_at.is_some()).byte();
+    let mut at = 1;
+    if let Some(ms) = expire_at {
+        out[at..at + 8].copy_from_slice(&ms.to_le_bytes());
+        at += 8;
+    }
+    out[at..at + SLOT_LEN].copy_from_slice(&slot.to_le_bytes());
+}
+
+/// The slab number in a record that has one.
+///
+/// # Panics
+///
+/// If the record is not one [`write_slot_record`] wrote, which is a caller that
+/// did not read the kind first.
+#[inline]
+pub fn slot(rec: &[u8]) -> u32 {
+    let at = Meta::from_byte(rec[0]).payload_at();
+    let mut b = [0u8; SLOT_LEN];
+    b.copy_from_slice(&rec[at..at + SLOT_LEN]);
+    u32::from_le_bytes(b)
 }
 
 /// The type a record holds.

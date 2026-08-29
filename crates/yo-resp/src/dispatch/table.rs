@@ -56,6 +56,14 @@ const AC_READ_SLOW: &[&str] = &["@read", "@string", "@slow"];
 const AC_WRITE_FAST: &[&str] = &["@write", "@string", "@fast"];
 /// The write side categories for the ones that are not counted as fast.
 const AC_WRITE_SLOW: &[&str] = &["@write", "@string", "@slow"];
+/// A write that frees rather than allocates, so Redis does not mark it denyoom.
+const WRITE_FAST: &[&str] = &["write", "fast"];
+/// The set read side, for the ones that answer without walking the members.
+const AC_SET_READ_FAST: &[&str] = &["@read", "@set", "@fast"];
+/// The set read side for the ones that walk the members.
+const AC_SET_READ_SLOW: &[&str] = &["@read", "@set", "@slow"];
+/// The set write side.
+const AC_SET_WRITE_FAST: &[&str] = &["@write", "@set", "@fast"];
 /// The connection commands' categories.
 const AC_CONN: &[&str] = &["@fast", "@connection"];
 /// The keyspace read side, which is `EXISTS` and `TYPE`.
@@ -407,6 +415,85 @@ pub static COMMANDS: &[Spec] = &[
         complexity: "O(1)",
         summary: "Count, with a bound, a saturation policy and a deadline.",
         group: "string",
+    },
+    // ----------------------------------------------------------------- sets
+    Spec {
+        name: "sadd",
+        arity: -3,
+        flags: WRITE_FAST_OOM,
+        first_key: 1,
+        last_key: 1,
+        step: 1,
+        acl: AC_SET_WRITE_FAST,
+        since: "1.0.0",
+        complexity: "O(N) with N the number of members being added",
+        summary: "Add members to a set, creating it if it is not there.",
+        group: "set",
+    },
+    Spec {
+        name: "srem",
+        arity: -3,
+        flags: WRITE_FAST,
+        first_key: 1,
+        last_key: 1,
+        step: 1,
+        acl: AC_SET_WRITE_FAST,
+        since: "1.0.0",
+        complexity: "O(N) with N the number of members being removed",
+        summary: "Take members out of a set, deleting the key if none are left.",
+        group: "set",
+    },
+    Spec {
+        name: "scard",
+        arity: 2,
+        flags: READ_FAST,
+        first_key: 1,
+        last_key: 1,
+        step: 1,
+        acl: AC_SET_READ_FAST,
+        since: "1.0.0",
+        complexity: "O(1)",
+        summary: "How many members a set has.",
+        group: "set",
+    },
+    Spec {
+        name: "sismember",
+        arity: 3,
+        flags: READ_FAST,
+        first_key: 1,
+        last_key: 1,
+        step: 1,
+        acl: AC_SET_READ_FAST,
+        since: "1.0.0",
+        complexity: "O(1)",
+        summary: "Whether a member is in a set.",
+        group: "set",
+    },
+    Spec {
+        name: "smismember",
+        arity: -3,
+        flags: READ_FAST,
+        first_key: 1,
+        last_key: 1,
+        step: 1,
+        acl: AC_SET_READ_FAST,
+        since: "6.2.0",
+        complexity: "O(N) with N the number of members being asked about",
+        summary: "Whether each of several members is in a set, in the order asked.",
+        group: "set",
+    },
+    Spec {
+        name: "smembers",
+        arity: 2,
+        flags: &["readonly"],
+        first_key: 1,
+        last_key: 1,
+        step: 1,
+        acl: AC_SET_READ_SLOW,
+        since: "1.0.0",
+        complexity: "O(N) with N the size of the set",
+        summary: "Every member of a set.",
+        group: "set",
     },
     // ------------------------------------------------------------ keyspace
     Spec {

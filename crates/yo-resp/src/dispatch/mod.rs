@@ -56,6 +56,7 @@ mod cpu;
 mod keyspace;
 mod scripting;
 mod server;
+mod sets;
 mod strings;
 pub mod table;
 
@@ -379,6 +380,10 @@ pub fn execute(server: &mut Server, session: &mut Session, args: Args<'_>, out: 
         "string" => {
             let db = session.db;
             strings::execute(&mut server.dbs[db], spec, args, out).map(|()| Flow::Continue)
+        }
+        "set" => {
+            let db = session.db;
+            sets::execute(&mut server.dbs[db], spec, args, out).map(|()| Flow::Continue)
         }
         "keyspace" => {
             let db = session.db;
@@ -1118,5 +1123,143 @@ mod tests {
         f.run(&[b"NOPE"]);
         f.run(&[b"GET"]);
         assert_eq!(f.server.stats.commands, 3);
+    }
+
+    #[test]
+    fn a_set_goes_from_bytes_to_bytes() {
+        let mut f = Fixture::new();
+        assert_eq!(f.run(&[b"SADD", b"s", b"a", b"b", b"c"]), ":3\r\n");
+        assert_eq!(f.run(&[b"SADD", b"s", b"b", b"d"]), ":1\r\n");
+        assert_eq!(f.run(&[b"SCARD", b"s"]), ":4\r\n");
+        assert_eq!(f.run(&[b"SISMEMBER", b"s", b"a"]), ":1\r\n");
+        assert_eq!(f.run(&[b"SISMEMBER", b"s", b"z"]), ":0\r\n");
+        assert_eq!(f.run(&[b"TYPE", b"s"]), "+set\r\n");
+        assert_eq!(
+            f.run(&[b"SMISMEMBER", b"s", b"a", b"z", b"d"]),
+            "*3\r\n:1\r\n:0\r\n:1\r\n"
+        );
+        assert_eq!(f.run(&[b"SREM", b"s", b"a", b"z"]), ":1\r\n");
+        assert_eq!(f.run(&[b"SCARD", b"s"]), ":3\r\n");
+    }
+
+    #[test]
+    fn a_set_command_at_a_key_that_is_not_there_answers_empty() {
+        let mut f = Fixture::new();
+        assert_eq!(f.run(&[b"SCARD", b"nope"]), ":0\r\n");
+        assert_eq!(f.run(&[b"SISMEMBER", b"nope", b"a"]), ":0\r\n");
+        assert_eq!(f.run(&[b"SREM", b"nope", b"a"]), ":0\r\n");
+        assert_eq!(f.run(&[b"SMEMBERS", b"nope"]), "*0\r\n");
+        assert_eq!(
+            f.run(&[b"SMISMEMBER", b"nope", b"a", b"b"]),
+            "*2\r\n:0\r\n:0\r\n"
+        );
+        assert_eq!(f.run(&[b"DBSIZE"]), ":0\r\n", "and made nothing");
+    }
+
+    #[test]
+    fn smembers_answers_a_set_on_resp3_and_an_array_on_resp2() {
+        // Not cosmetic. A RESP3 client that gets a `~` hands the caller a set
+        // and one that gets a `*` hands it a list, without either of them being
+        // told which command was sent.
+        let mut f = Fixture::new();
+        f.run(&[b"SADD", b"s", b"one"]);
+        assert_eq!(f.run(&[b"SMEMBERS", b"s"]), "*1\r\n$3\r\none\r\n");
+
+        f.run(&[b"HELLO", b"3"]);
+        assert_eq!(f.run(&[b"SMEMBERS", b"s"]), "~1\r\n$3\r\none\r\n");
+    }
+
+    #[test]
+    fn an_integer_member_comes_back_as_the_digits_it_never_stored() {
+        // An intset holds the number, so these digits exist for the first time
+        // in the reply buffer.
+        let mut f = Fixture::new();
+        f.run(&[b"SADD", b"s", b"42"]);
+        assert_eq!(f.run(&[b"SMEMBERS", b"s"]), "*1\r\n$2\r\n42\r\n");
+        assert_eq!(f.run(&[b"SISMEMBER", b"s", b"42"]), ":1\r\n");
+        assert_eq!(
+            f.run(&[b"SISMEMBER", b"s", b"042"]),
+            ":0\r\n",
+            "the member is the bytes and not the number they parse to"
+        );
+    }
+
+    #[test]
+    fn the_wrong_command_at_the_wrong_type_says_so_both_ways() {
+        let mut f = Fixture::new();
+        f.run(&[b"SET", b"str", b"v"]);
+        f.run(&[b"SADD", b"set", b"a"]);
+
+        let wrong = "-WRONGTYPE Operation against a key holding the wrong kind of value\r\n";
+        assert_eq!(f.run(&[b"SADD", b"str", b"a"]), wrong);
+        assert_eq!(f.run(&[b"SCARD", b"str"]), wrong);
+        assert_eq!(f.run(&[b"SMEMBERS", b"str"]), wrong);
+        assert_eq!(f.run(&[b"SMISMEMBER", b"str", b"a"]), wrong);
+        assert_eq!(f.run(&[b"GET", b"set"]), wrong);
+        assert_eq!(f.run(&[b"APPEND", b"set", b"x"]), wrong);
+        assert_eq!(f.run(&[b"INCR", b"set"]), wrong);
+        assert_eq!(f.run(&[b"STRLEN", b"set"]), wrong);
+
+        // MGET is the one that does not, because Redis gives nil for the odd
+        // key out rather than failing the good keys next to it.
+        assert_eq!(
+            f.run(&[b"MGET", b"str", b"set", b"nope"]),
+            "*3\r\n$1\r\nv\r\n$-1\r\n$-1\r\n"
+        );
+        // And plain SET overwrites any type, which takes the body with it.
+        assert_eq!(f.run(&[b"SET", b"set", b"now a string"]), "+OK\r\n");
+        assert_eq!(f.run(&[b"TYPE", b"set"]), "+string\r\n");
+    }
+
+    #[test]
+    fn a_wrongtype_leaves_nothing_half_written() {
+        // SMISMEMBER writes an array header and then one reply per member, so
+        // it is the first command in the server that could get a header out in
+        // front of an error if it checked its key in the wrong order.
+        let mut f = Fixture::new();
+        f.run(&[b"SET", b"k", b"v"]);
+        let reply = f.run(&[b"SMISMEMBER", b"k", b"a", b"b"]);
+        assert!(reply.starts_with("-WRONGTYPE"), "got {reply}");
+        assert!(!reply.contains('*'), "an array header went out in front");
+    }
+
+    #[test]
+    fn emptying_a_set_takes_the_key_with_it() {
+        let mut f = Fixture::new();
+        f.run(&[b"SADD", b"s", b"a", b"b"]);
+        assert_eq!(f.run(&[b"DBSIZE"]), ":1\r\n");
+        assert_eq!(f.run(&[b"SREM", b"s", b"a", b"b"]), ":2\r\n");
+        assert_eq!(f.run(&[b"EXISTS", b"s"]), ":0\r\n");
+        assert_eq!(f.run(&[b"TYPE", b"s"]), "+none\r\n");
+        assert_eq!(f.run(&[b"DBSIZE"]), ":0\r\n");
+    }
+
+    /// The leak a set can spring that nothing on the wire would ever show: the
+    /// key goes, the body does not, and `DBSIZE` looks right the whole time.
+    #[test]
+    fn churning_sets_does_not_grow_the_server() {
+        let mut f = Fixture::new();
+        let members: Vec<Vec<u8>> = (0..200).map(|i| format!("m{i}").into_bytes()).collect();
+        let args: Vec<&[u8]> = std::iter::once(&b"SADD"[..])
+            .chain(std::iter::once(&b"s"[..]))
+            .chain(members.iter().map(Vec::as_slice))
+            .collect();
+
+        f.run(&args);
+        f.run(&[b"DEL", b"s"]);
+        f.server.compact_step();
+        let after_first = f.server.memory_bytes();
+
+        for _ in 0..200 {
+            f.run(&args);
+            f.run(&[b"DEL", b"s"]);
+            f.server.compact_step();
+        }
+        assert_eq!(f.run(&[b"DBSIZE"]), ":0\r\n");
+        assert!(
+            f.server.memory_bytes() <= after_first * 2,
+            "held {} after two hundred passes against {after_first} after one",
+            f.server.memory_bytes()
+        );
     }
 }

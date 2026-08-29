@@ -75,8 +75,13 @@ doc = "08 section 3"
 [[group]]
 name = "set"
 expected = 17
-status = "planned"
+status = "partial"
 doc = "08 section 4"
+# Six of the seventeen are here: SADD, SREM, SCARD, SISMEMBER, SMISMEMBER and
+# SMEMBERS. What is left is the three that pick a member at random, SPOP,
+# SRANDMEMBER and SSCAN, the seven algebra commands and their store forms, and
+# SMOVE. The six that are here are the ones the other eleven are built on, and
+# they are what a compatibility suite needs before it will run a set file.
 
 [[group]]
 name = "zset"
@@ -499,7 +504,76 @@ plan = "metadata"
 bounded = "inherent"
 status = "shipped"
 wire = "verified"
-notes = "Answers string or none and nothing else yet, which is true rather than incomplete: there is nothing else in the store to answer with. It grows a case each time a type lands."
+notes = "Answers string, set or none. It grows a case each time a type lands."
+
+
+# ------------------------------------------------------------------------ sets
+
+[[command]]
+name = "SADD"
+group = "set"
+since = "1.0.0"
+arity = -3
+plan = "point"
+bounded = "inherent"
+status = "shipped"
+wire = "verified"
+notes = "One key lookup, then the members go into the body the record points at. A set that does not exist yet is created from the whole argument list rather than from the first member, which is Redis's setTypeCreate: a thousand members at once builds a hashtable straight away instead of building an intset, converting it to a listpack and converting that to a hashtable. Adding nothing to a key that is not there creates nothing, since an empty set does not exist."
+
+[[command]]
+name = "SREM"
+group = "set"
+since = "1.0.0"
+arity = -3
+plan = "point"
+bounded = "inherent"
+status = "shipped"
+wire = "verified"
+notes = "One key lookup for the whole argument list. Removing the last member deletes the key, which is Redis's rule and not a tidy up: an empty set is not a thing that can exist, so EXISTS answers zero straight after. Removing never moves a set back down to a smaller representation, which Redis does not do either."
+
+[[command]]
+name = "SCARD"
+group = "set"
+since = "1.0.0"
+arity = 2
+plan = "metadata"
+bounded = "inherent"
+status = "shipped"
+wire = "verified"
+notes = "The count the body already keeps, in all three representations, so it is a key lookup and a load and never a walk."
+
+[[command]]
+name = "SISMEMBER"
+group = "set"
+since = "1.0.0"
+arity = 3
+plan = "point"
+bounded = "inherent"
+status = "shipped"
+wire = "verified"
+notes = "A binary search in an intset, a linear walk in a listpack and a hash lookup in the element table. The listpack walk is the fast one at the sizes a listpack is used at, which is measured in benches/intset.rs rather than assumed."
+
+[[command]]
+name = "SMISMEMBER"
+group = "set"
+since = "6.2.0"
+arity = -3
+plan = "point"
+bounded = "inherent"
+status = "shipped"
+wire = "verified"
+notes = "One key lookup for every member asked about rather than one each, which is the only reason this exists over sending SISMEMBER in a pipeline. The reply is written straight out a member at a time, so the command allocates nothing whatever the argument count."
+
+[[command]]
+name = "SMEMBERS"
+group = "set"
+since = "1.0.0"
+arity = 2
+plan = "whole-value"
+bounded = "risk"
+status = "shipped"
+wire = "verified"
+notes = "The whole set, which is the risk the bound field is naming: a client that sends this at a set of a million members gets a million member reply and there is no cursor in front of it. That is Redis's behaviour and the reason SSCAN exists. The members are written from where they lie, and an integer member is formatted here rather than stored as digits, so a set of a thousand integers stays two kilobytes in memory."
 
 # ------------------------------------------------------------------ scripting
 

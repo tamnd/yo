@@ -18,7 +18,17 @@
 //! # What is here so far
 //!
 //! The string type, which is the first row of M2, and all 26 of its commands.
-//! Lists, sets, hashes and the sorted set follow the same shape and land in M3.
+//!
+//! The set, which is the first row of M3, in the six commands that the other
+//! eleven are built on: `SADD`, `SREM`, `SCARD`, `SISMEMBER`, `SMISMEMBER` and
+//! `SMEMBERS`. A [`Set`] is one of three representations and moves between them
+//! on the same rules Redis uses, and [`Keyspace`] is where a key gets to be
+//! something other than a string: the record holds a number, the number points
+//! into a [`Slab`], and every path that deletes a key or writes over one frees
+//! what it was pointing at. That last part is why `WRONGTYPE` exists as of this
+//! milestone. There was no way to trigger it while a string was all there was.
+//!
+//! Lists, hashes and the sorted set follow the same shape and land in M3 too.
 //!
 //! The pieces of M3 that are here already are the ones every collection shares.
 //! [`Elements`] is the element table a hash, a set and a sorted set are all
@@ -69,6 +79,7 @@ pub mod listpack;
 pub mod scan;
 pub mod set;
 pub mod setops;
+pub mod sets;
 pub mod slab;
 pub mod strings;
 pub mod ttl;
@@ -83,7 +94,7 @@ pub use keyspace::Keyspace;
 pub use lcs::{Idx as LcsIdx, LCS_MAX_CELLS, Match as LcsMatch};
 pub use listpack::{Entry, Listpack, Malformed};
 pub use scan::{Cursor, MAX_PARTS};
-pub use set::{Limits as SetLimits, Set};
+pub use set::{Limits as SetLimits, Member, Set};
 pub use setops::{Plan, Table};
 pub use slab::{MAX_SLOTS, Slab};
 pub use strings::{Exists, Expire, KEY_MAX, STRING_MAX, SetOptions, SetOutcome};
