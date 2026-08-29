@@ -82,4 +82,4 @@ pub use scan::{Cursor, MAX_PARTS};
 pub use setops::{Plan, Set};
 pub use strings::{Exists, Expire, KEY_MAX, STRING_MAX, SetOptions, SetOutcome};
 pub use ttl::{Deadlines, MAX_AT};
-pub use value::{EMBSTR_MAX, Encoding, Str};
+pub use value::{EMBSTR_MAX, Encoding, Kind, Str};

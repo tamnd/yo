@@ -23,6 +23,15 @@
 //! `embstr` there means the value was allocated next to its object header, a
 //! distinction `yo` does not have because every value is already next to its
 //! key.
+//!
+//! # The type tag
+//!
+//! The meta byte also says which type the key holds, in three bits that were
+//! spare. That is what `TYPE` reads and it is what a command will read before it
+//! decides whether it is looking at its own type or at somebody else's, and both
+//! of those want the answer to come out of the byte the lookup already fetched
+//! rather than out of a second structure. A string is zero, so nothing written
+//! before the tag existed reads back as anything else.
 
 use yo_common::num::{parse_i64, push_i64};
 
@@ -72,6 +81,66 @@ impl Encoding {
     }
 }
 
+/// What `TYPE` calls a key, and what the meta byte's tag holds.
+///
+/// The numbers are the same numbers `yo_format::ValueType` uses on disk, so that
+/// saving a key is a copy of the tag rather than a translation of it. There is a
+/// test at the bottom of this file holding the two in step, and it takes a dev
+/// dependency on `yo-format` for no other reason.
+///
+/// The list is shorter than the on disk one because some of those are the same
+/// thing in memory. A bitmap is a string and a HyperLogLog is a string, in Redis
+/// as much as here, and `TYPE` on either answers `string`. The catalog draws
+/// finer lines because a reader wants to know what a blob meant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Kind {
+    /// A string, and everything Redis stores as one.
+    String = 0,
+    /// A hash.
+    Hash = 1,
+    /// A set.
+    Set = 2,
+    /// A sorted set.
+    Zset = 3,
+    /// A list.
+    List = 4,
+    /// A stream.
+    Stream = 5,
+}
+
+impl Kind {
+    /// The word `TYPE` replies with.
+    #[inline]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Kind::String => "string",
+            Kind::Hash => "hash",
+            Kind::Set => "set",
+            Kind::Zset => "zset",
+            Kind::List => "list",
+            Kind::Stream => "stream",
+        }
+    }
+
+    /// The kind for a three bit tag.
+    ///
+    /// Six of the eight patterns are spoken for. The other two cannot come out
+    /// of our own writer, and they fall to `String` for the same reason an
+    /// unknown encoding falls to `raw`: it is the reading that hands the bytes
+    /// back rather than the one that reinterprets them.
+    #[inline]
+    const fn from_bits(bits: u8) -> Kind {
+        match bits {
+            KIND_HASH => Kind::Hash,
+            KIND_SET => Kind::Set,
+            KIND_ZSET => Kind::Zset,
+            KIND_LIST => Kind::List,
+            KIND_STREAM => Kind::Stream,
+            _ => Kind::String,
+        }
+    }
+}
+
 /// Bits 0 and 1 of the meta byte: which encoding.
 const ENC_MASK: u8 = 0b0000_0011;
 const ENC_INT: u8 = 0;
@@ -79,6 +148,17 @@ const ENC_EMBSTR: u8 = 1;
 const ENC_RAW: u8 = 2;
 /// Bit 2: whether eight bytes of deadline follow the meta byte.
 const HAS_EXPIRY: u8 = 0b0000_0100;
+/// Bits 3, 4 and 5: which type the key holds. Bits 6 and 7 are still spare.
+///
+/// String is zero, so every record written before the tag existed reads back as
+/// a string, which is what it was.
+const KIND_MASK: u8 = 0b0011_1000;
+const KIND_SHIFT: u32 = 3;
+const KIND_HASH: u8 = 1;
+const KIND_SET: u8 = 2;
+const KIND_ZSET: u8 = 3;
+const KIND_LIST: u8 = 4;
+const KIND_STREAM: u8 = 5;
 
 /// Bytes of integer payload, which is a whole `i64` and never its digits.
 const INT_LEN: usize = 8;
@@ -88,15 +168,21 @@ const INT_LEN: usize = 8;
 pub struct Meta(u8);
 
 impl Meta {
-    /// Build the byte for an encoding and the presence of a deadline.
+    /// Build the byte for a type, an encoding and the presence of a deadline.
     #[inline]
-    pub const fn new(enc: Encoding, has_expiry: bool) -> Meta {
+    pub const fn new(kind: Kind, enc: Encoding, has_expiry: bool) -> Meta {
         let bits = match enc {
             Encoding::Int => ENC_INT,
             Encoding::Embstr => ENC_EMBSTR,
             Encoding::Raw => ENC_RAW,
         };
-        Meta(bits | if has_expiry { HAS_EXPIRY } else { 0 })
+        Meta(bits | ((kind as u8) << KIND_SHIFT) | if has_expiry { HAS_EXPIRY } else { 0 })
+    }
+
+    /// The byte for a string, which is what everything in `strings.rs` writes.
+    #[inline]
+    pub const fn string(enc: Encoding, has_expiry: bool) -> Meta {
+        Meta::new(Kind::String, enc, has_expiry)
     }
 
     /// Read the byte back.
@@ -123,6 +209,12 @@ impl Meta {
             ENC_EMBSTR => Encoding::Embstr,
             _ => Encoding::Raw,
         }
+    }
+
+    /// Which type this key holds.
+    #[inline]
+    pub const fn kind(self) -> Kind {
+        Kind::from_bits((self.0 & KIND_MASK) >> KIND_SHIFT)
     }
 
     /// Whether a deadline follows.
@@ -251,7 +343,7 @@ pub fn record_len(enc: Encoding, payload: usize, has_expiry: bool) -> usize {
 /// already established that they parse by choosing that encoding.
 #[inline]
 pub fn write_record(out: &mut [u8], enc: Encoding, bytes: &[u8], expire_at: Option<u64>) {
-    out[0] = Meta::new(enc, expire_at.is_some()).byte();
+    out[0] = Meta::string(enc, expire_at.is_some()).byte();
     let mut at = 1;
     if let Some(ms) = expire_at {
         out[at..at + 8].copy_from_slice(&ms.to_le_bytes());
@@ -270,13 +362,19 @@ pub fn write_record(out: &mut [u8], enc: Encoding, bytes: &[u8], expire_at: Opti
 /// Write a record whose value is an integer the caller already has.
 #[inline]
 pub fn write_int_record(out: &mut [u8], n: i64, expire_at: Option<u64>) {
-    out[0] = Meta::new(Encoding::Int, expire_at.is_some()).byte();
+    out[0] = Meta::string(Encoding::Int, expire_at.is_some()).byte();
     let mut at = 1;
     if let Some(ms) = expire_at {
         out[at..at + 8].copy_from_slice(&ms.to_le_bytes());
         at += 8;
     }
     out[at..at + INT_LEN].copy_from_slice(&n.to_le_bytes());
+}
+
+/// The type a record holds.
+#[inline]
+pub fn kind(rec: &[u8]) -> Kind {
+    Meta::from_byte(rec[0]).kind()
 }
 
 /// The deadline in a record, if it has one.
@@ -360,17 +458,91 @@ mod tests {
         assert_eq!(Encoding::of(&[b'x'; EMBSTR_MAX + 1]), Encoding::Raw);
     }
 
+    const KINDS: [Kind; 6] = [
+        Kind::String,
+        Kind::Hash,
+        Kind::Set,
+        Kind::Zset,
+        Kind::List,
+        Kind::Stream,
+    ];
+
     #[test]
     fn the_meta_byte_survives_a_round_trip() {
-        for enc in [Encoding::Int, Encoding::Embstr, Encoding::Raw] {
-            for expiry in [false, true] {
-                let m = Meta::new(enc, expiry);
-                let back = Meta::from_byte(m.byte());
-                assert_eq!(back.encoding(), enc);
-                assert_eq!(back.has_expiry(), expiry);
-                assert_eq!(back.payload_at(), if expiry { 9 } else { 1 });
+        for kind in KINDS {
+            for enc in [Encoding::Int, Encoding::Embstr, Encoding::Raw] {
+                for expiry in [false, true] {
+                    let m = Meta::new(kind, enc, expiry);
+                    let back = Meta::from_byte(m.byte());
+                    assert_eq!(back.kind(), kind);
+                    assert_eq!(back.encoding(), enc);
+                    assert_eq!(back.has_expiry(), expiry);
+                    assert_eq!(back.payload_at(), if expiry { 9 } else { 1 });
+                }
             }
         }
+    }
+
+    #[test]
+    fn the_three_fields_of_the_meta_byte_do_not_reach_into_each_other() {
+        // Thirty six combinations, all of which have to come out of one byte
+        // with nothing borrowed from a neighbour. A tag that overlapped the
+        // expiry bit would read the payload at the wrong offset, which is a
+        // corrupt value rather than a wrong answer.
+        let mut seen = std::collections::HashSet::new();
+        for kind in KINDS {
+            for enc in [Encoding::Int, Encoding::Embstr, Encoding::Raw] {
+                for expiry in [false, true] {
+                    assert!(
+                        seen.insert(Meta::new(kind, enc, expiry).byte()),
+                        "{kind:?} {enc:?} {expiry} collides with something else"
+                    );
+                }
+            }
+        }
+        assert_eq!(seen.len(), 36);
+    }
+
+    #[test]
+    fn a_record_written_before_the_tag_existed_is_a_string() {
+        // Bits 3 to 7 were zero in every record M2 wrote, and zero is String.
+        // This is the whole reason String is zero, so it is worth a test that
+        // fails if somebody renumbers the enum alphabetically one day.
+        assert_eq!(Kind::String as u8, 0);
+        assert_eq!(Meta::from_byte(0b0000_0101).kind(), Kind::String);
+        assert_eq!(Meta::from_byte(0b0000_0101).encoding(), Encoding::Embstr);
+        assert!(Meta::from_byte(0b0000_0101).has_expiry());
+    }
+
+    #[test]
+    fn the_tag_is_the_number_the_file_format_uses() {
+        use yo_format::catalog::ValueType;
+        // Not a translation table, an assertion that no translation is needed.
+        // If these ever diverge, saving a key has to map between them, and the
+        // mapping is the kind of thing that gets one arm wrong.
+        assert_eq!(Kind::String as u8, ValueType::String as u8);
+        assert_eq!(Kind::Hash as u8, ValueType::Hash as u8);
+        assert_eq!(Kind::Set as u8, ValueType::Set as u8);
+        assert_eq!(Kind::Zset as u8, ValueType::Zset as u8);
+        assert_eq!(Kind::List as u8, ValueType::List as u8);
+        assert_eq!(Kind::Stream as u8, ValueType::Stream as u8);
+        // And the words agree, because both of them end up on a wire.
+        for k in KINDS {
+            let v = ValueType::from_u8(k as u8).expect("the catalog knows this one");
+            assert_eq!(k.name(), v.redis_name(), "{k:?}");
+        }
+    }
+
+    #[test]
+    fn a_string_record_is_tagged_as_one() {
+        for text in [&b"42"[..], b"hello", &[b'z'; 100]] {
+            for expire in [None, Some(9_000u64)] {
+                assert_eq!(kind(&record(text, expire)), Kind::String);
+            }
+        }
+        let mut v = vec![0u8; record_len(Encoding::Int, 0, false)];
+        write_int_record(&mut v, 7, None);
+        assert_eq!(kind(&v), Kind::String);
     }
 
     fn record(bytes: &[u8], expire: Option<u64>) -> Vec<u8> {
@@ -453,5 +625,21 @@ mod tests {
         // reinterpret eight bytes of somebody's string as a number.
         let m = Meta::from_byte(0b11);
         assert_eq!(m.encoding(), Encoding::Raw);
+    }
+
+    #[test]
+    fn an_unknown_type_tag_reads_as_a_string() {
+        // Six of eight patterns are used, and the other two answer String for
+        // the same reason: handing the bytes back is the harmless reading.
+        assert_eq!(Meta::from_byte(6 << 3).kind(), Kind::String);
+        assert_eq!(Meta::from_byte(7 << 3).kind(), Kind::String);
+    }
+
+    #[test]
+    fn the_top_two_bits_are_still_free() {
+        // Whatever lands in them next must not disturb the tag, so this is the
+        // check that the tag is three bits and not five.
+        assert_eq!(Meta::from_byte(0b1100_0000).kind(), Kind::String);
+        assert_eq!(Meta::from_byte(0b1101_0000).kind(), Kind::Set);
     }
 }

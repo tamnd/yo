@@ -3,7 +3,7 @@
 //! This is the `dict` a Redis `SELECT` picks between, and one of these is what a
 //! shard owns. It was called `Strings` while strings were the only thing in it,
 //! which was accurate for M2 and stopped being accurate the moment a set needed
-//! somewhere to live. Nothing here changed in the rename beyond the name.
+//! somewhere to live.
 //!
 //! The commands hang off this as separate `impl` blocks, one file per type, so
 //! that `SET` lives in [`strings`](crate::strings) next to the other twenty five
@@ -21,6 +21,7 @@
 use yo_index::RawMap;
 
 use crate::Clock;
+use crate::value::{self, Kind};
 
 /// One database: every key, whatever type it holds.
 pub struct Keyspace {
@@ -76,6 +77,28 @@ impl Keyspace {
     #[inline]
     pub fn is_empty(&self) -> bool {
         self.map.is_empty()
+    }
+
+    /// What `key` holds, or `None` if there is nothing under it.
+    ///
+    /// This is `TYPE`. A key past its deadline is reaped first, so a dead key
+    /// answers `None` and not the type it used to be.
+    ///
+    /// One lookup, because the tag and the deadline are both in the record the
+    /// lookup returned. Reading the kind out before the reap rather than after
+    /// is what keeps it to one.
+    pub fn kind_of(&mut self, key: &[u8]) -> Option<Kind> {
+        let now = self.clock.now_ms();
+        let (kind, dead) = self
+            .map
+            .get(key)
+            .map(|rec| (value::kind(rec), value::is_expired(rec, now)))?;
+        if dead {
+            self.map.del(key);
+            self.expired += 1;
+            return None;
+        }
+        Some(kind)
     }
 
     /// Throw every key away. This is `FLUSHDB` on one database.
@@ -135,5 +158,38 @@ impl Keyspace {
 impl Default for Keyspace {
     fn default() -> Keyspace {
         Keyspace::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn db() -> Keyspace {
+        Keyspace::with_clock(Clock::fixed(1_000))
+    }
+
+    #[test]
+    fn type_answers_string_for_a_string_and_nothing_for_a_missing_key() {
+        let mut d = db();
+        d.set_plain(b"k", b"v").expect("room");
+        assert_eq!(d.kind_of(b"k"), Some(Kind::String));
+        assert_eq!(d.kind_of(b"nope"), None);
+    }
+
+    #[test]
+    fn type_does_not_report_a_key_whose_deadline_has_gone() {
+        let mut d = db();
+        d.psetex(b"k", 100, b"v").expect("room");
+        assert_eq!(d.kind_of(b"k"), Some(Kind::String));
+
+        d.clock_mut().advance(100);
+        assert_eq!(
+            d.kind_of(b"k"),
+            None,
+            "the deadline was 1100 and it is 1100"
+        );
+        assert_eq!(d.len(), 0, "and asking reaped it rather than leaving it");
+        assert_eq!(d.expired_keys(), 1);
     }
 }

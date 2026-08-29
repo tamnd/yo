@@ -11,9 +11,9 @@
 //! `DEL` to get to a known state. A compatibility suite that cannot start is
 //! not a compatibility suite, so these landed early.
 //!
-//! `TYPE` answers `string` or `none` and nothing else yet, which is true rather
-//! than incomplete: there is nothing else in the store to answer with. It grows
-//! a case each time a type lands.
+//! `TYPE` reads the tag in the record's meta byte, so it answers whatever the
+//! key actually holds and does not grow a case each time a type lands. Today
+//! that is `string` or `none`, because a string is all there is to hold.
 
 use super::args::Args;
 use super::table::Spec;
@@ -50,10 +50,9 @@ pub(super) fn execute(db: &mut Keyspace, spec: &Spec, args: Args<'_>, out: &mut 
             out.int(found);
         }
         "type" => {
-            let name: &[u8] = if db.exists(args.get(1)) {
-                b"string"
-            } else {
-                b"none"
+            let name = match db.kind_of(args.get(1)) {
+                Some(k) => k.name().as_bytes(),
+                None => &b"none"[..],
             };
             // A simple string on both protocols, which is unusual enough to be
             // worth saying out loud: most replies that carry a word are bulk
