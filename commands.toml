@@ -125,7 +125,11 @@ doc = "14"
 # DEL, UNLINK, EXISTS and TYPE landed in M2 and the rest are in M3. The four were
 # not a random quarter of the group, they are what Redis's own test suite needs
 # before it will run one file. OBJECT is here now because the size ladder is not
-# finished until a client can see which rung a key is on.
+# finished until a client can see which rung a key is on. RENAME, RENAMENX, COPY
+# and TOUCH came next because none of them needs anything the store did not
+# already have. KEYS, SCAN and RANDOMKEY are the ones that do: the index has no
+# iteration of any kind, so those three want a cursor over the buckets that
+# survives a resize, and that is its own change rather than three more rows.
 
 [[group]]
 name = "expiry"
@@ -615,6 +619,50 @@ bounded = "inherent"
 status = "shipped"
 wire = "verified"
 notes = "ENCODING is the one worth having and the other three are here because clients call them without thinking. It is the only window a client has onto the size ladder, so it is the command that says whether our ladder is really Redis's ladder, and it is why the thresholds behind it are the one thing CONFIG SET can move. A missing key answers nil on all four rather than an error, which reads like a bug and is what 8.10.1 does. REFCOUNT is always 1, because 8.10.1 answers 1 for a small integer too rather than the huge shared count it used to. IDLETIME is always 0 and FREQ is always the not an LFU policy complaint, and both will stay that way until there is eviction to track."
+
+[[command]]
+name = "TOUCH"
+group = "keyspace"
+since = "3.2.1"
+arity = -2
+plan = "metadata"
+bounded = "inherent"
+status = "shipped"
+wire = "verified"
+notes = "The same walk EXISTS makes, including a key named twice counting twice. On a real server the difference is that this moves each key up the eviction order, and there is no eviction here yet, so the day it lands the bump goes in the store and this command does not change."
+
+[[command]]
+name = "RENAME"
+group = "keyspace"
+since = "1.0.0"
+arity = 3
+plan = "metadata"
+bounded = "inherent"
+status = "shipped"
+wire = "verified"
+notes = "The body never moves. A set or a hash is a slot number sitting in a record, and a slot number under a different key is the same set, so this writes the source's record bytes under the destination and deletes the source record without freeing anything. Renaming a set of a million members writes thirteen bytes. The deadline travels with the source and the destination's own deadline goes with the value it belonged to, which falls out of moving the whole record rather than being a rule applied on top. A missing source is an error and not a zero, which is unusual in this group, and it is checked before anything else, so RENAMENX nope nope is no such key rather than zero. Redis calls this slow and it is not, and the flag is Redis's to set."
+
+[[command]]
+name = "RENAMENX"
+group = "keyspace"
+since = "1.0.0"
+arity = 3
+plan = "metadata"
+bounded = "inherent"
+status = "shipped"
+wire = "verified"
+notes = "RENAME that refuses a destination that is already there. A key renamed onto itself is refused too, because the destination does exist and a key is not new because it is the one you already had, where plain RENAME onto itself is OK and keeps the deadline."
+
+[[command]]
+name = "COPY"
+group = "keyspace"
+since = "6.2.0"
+arity = -3
+plan = "whole-value"
+bounded = "risk"
+status = "shipped"
+wire = "verified"
+notes = "The one command in the group that costs what the value is worth. Two records pointing at one slot would be one set answering to two names and SADD to either would show up in both, so the body is cloned, which is Redis's cost too and there is no version of COPY that avoids it. DB n writes into a database the connection is not on, which is why the store splits this into an export that lifts a value out standing on its own and an import that puts one down, and the same pair is what MOVE, DUMP and RESTORE will want. The four failure modes are checked in an order nobody would write from scratch: the options first, so a bad DB is refused before anyone asks whether the source exists, then source and destination being the same object, and only then a missing source becoming the ordinary zero. Same object means same key in the same database, so COPY a a DB 1 is a real copy and COPY a a DB 0 from database zero is the error. A destination whose deadline has gone counts as free, which is the only answer consistent with EXISTS saying zero for the same key."
 
 
 # ------------------------------------------------------------------------ sets
@@ -1282,3 +1330,14 @@ bounded = "inherent"
 status = "shipped"
 wire = "verified"
 notes = "FLUSHALL on the one database this connection is on."
+
+[[command]]
+name = "TIME"
+group = "server"
+since = "2.6.0"
+arity = 1
+plan = "none"
+bounded = "inherent"
+status = "shipped"
+wire = "verified"
+notes = "Two bulk strings and not one integer, seconds and then microseconds within that second, both as decimal text. It reads the wall clock and not the coarse cached millisecond the keyspace uses, because the coarse one is refreshed on a tick and a client that calls TIME twice and gets the same microsecond has been lied to. The ACL categories are @fast and nothing else, which reads like an omission and is not: the categories say what a command can reach and this one reaches nothing."

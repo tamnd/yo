@@ -20,6 +20,7 @@ use super::{DATABASES, Flow, Server, Session, cpu};
 use crate::proto::Proto;
 use crate::reply::Out;
 use core::fmt::Write;
+use std::time::{SystemTime, UNIX_EPOCH};
 use yo_common::num::parse_i64;
 use yo_common::{Code, Error, Result, glob};
 use yo_kv::Keyspace;
@@ -160,9 +161,30 @@ pub(super) fn execute(
             server.dbs[session.db].clear();
             out.ok();
         }
+        "time" => time(out),
         _ => return Err(args::unknown_command(args)),
     }
     Ok(Flow::Continue)
+}
+
+/// `TIME`, which is two bulk strings and not one integer.
+///
+/// Seconds first and then microseconds within that second, both written out as
+/// decimal text, which is a shape nobody would choose today and is the shape
+/// every client library parses.
+///
+/// It reads the wall clock rather than the coarse clock the keyspace uses. The
+/// coarse one is a cached millisecond that a background tick refreshes, which is
+/// the right trade for deciding whether a key has expired and the wrong one for
+/// a command whose entire job is to say what time it is. A client that calls
+/// `TIME` twice in a row and gets the same microsecond has been lied to.
+fn time(out: &mut Out) {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
+    out.array(2);
+    out.bulk(now.as_secs().to_string().as_bytes());
+    out.bulk(now.subsec_micros().to_string().as_bytes());
 }
 
 // ------------------------------------------------------------------- FLUSH

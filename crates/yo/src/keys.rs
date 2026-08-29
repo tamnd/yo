@@ -38,6 +38,14 @@
 //! reports. The first call here that creates one turns that on for good, so it
 //! is worth knowing that this is where the tens of nanoseconds come from.
 //!
+//! # There is no touch
+//!
+//! Redis has a `TOUCH`, and on a real server it counts the keys that are there
+//! and moves each of them up the eviction order. There is no eviction here, so
+//! all it could do is count, and [`Keys::count`] already does that. A second
+//! name for one call is worse than no second name, so the wire has `TOUCH` for
+//! the clients that send it and this does not.
+//!
 //! # The typed collections are somewhere else
 //!
 //! A [`Map`](crate::Map) is a named collection and not a key in the keyspace, so
@@ -48,7 +56,7 @@
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use yo_common::{Code, Error, Result};
-use yo_kv::{Applied, Ask, Cond, Kind, MAX_AT};
+use yo_kv::{Applied, Ask, Cond, Kind, MAX_AT, Moved};
 
 use crate::db::Handle;
 
@@ -344,6 +352,78 @@ impl Keys {
     pub fn persist(&self, key: impl AsRef<[u8]>) -> Result<bool> {
         self.db.run(|inner| Ok(inner.strings.persist(key.as_ref())))
     }
+
+    /// Move a key to another name, over whatever was there. `RENAME`.
+    ///
+    /// The value does not move and is not copied. A set or a hash is a slot
+    /// number sitting in a record, and the same slot number under a different
+    /// key is the same set, so this writes a new record and deletes the old one
+    /// however large the value is. Renaming a set of a million members writes
+    /// thirteen bytes.
+    ///
+    /// The deadline travels with the source, and whatever the destination had
+    /// goes away with the value it belonged to. A key renamed onto itself is
+    /// [`Moved::Ok`] and keeps its deadline.
+    ///
+    /// [`Moved::Taken`] cannot happen here, which is what
+    /// [`Keys::rename_if_new`] is for.
+    ///
+    /// # Errors
+    ///
+    /// As [`Keys::exists`].
+    pub fn rename(&self, src: impl AsRef<[u8]>, dst: impl AsRef<[u8]>) -> Result<Moved> {
+        self.db
+            .run(|inner| Ok(inner.strings.rename(src.as_ref(), dst.as_ref(), false)))
+    }
+
+    /// Move a key to another name, but only if that name is free. `RENAMENX`.
+    ///
+    /// A key renamed onto itself is [`Moved::Taken`], because the destination
+    /// does exist and a key is not new because it is the one you already had.
+    /// That is the one place this and [`Keys::rename`] disagree about a call
+    /// neither of them has to do any work for.
+    ///
+    /// # Errors
+    ///
+    /// As [`Keys::exists`].
+    pub fn rename_if_new(&self, src: impl AsRef<[u8]>, dst: impl AsRef<[u8]>) -> Result<Moved> {
+        self.db
+            .run(|inner| Ok(inner.strings.rename(src.as_ref(), dst.as_ref(), true)))
+    }
+
+    /// Copy a value to another key, leaving the destination alone if it is
+    /// already there. `COPY`.
+    ///
+    /// This is the one call here that costs what the value is worth. Two keys
+    /// cannot share a body, because then adding a member to one would show up in
+    /// the other, so the body is cloned. [`Keys::rename`] is the call that moves
+    /// a large value for nothing, and it is the one to reach for when the old
+    /// name is not wanted afterwards.
+    ///
+    /// The deadline is copied too, so a copy of a key with ten seconds left has
+    /// ten seconds left. A destination whose deadline has already gone counts as
+    /// free.
+    ///
+    /// # Errors
+    ///
+    /// As [`Keys::exists`].
+    pub fn copy(&self, src: impl AsRef<[u8]>, dst: impl AsRef<[u8]>) -> Result<Moved> {
+        self.db
+            .run(|inner| Ok(inner.strings.copy(src.as_ref(), dst.as_ref(), false)))
+    }
+
+    /// Copy a value to another key, over whatever was there. `COPY REPLACE`.
+    ///
+    /// [`Moved::Taken`] cannot happen here, the same way it cannot happen for
+    /// [`Keys::rename`].
+    ///
+    /// # Errors
+    ///
+    /// As [`Keys::exists`].
+    pub fn copy_over(&self, src: impl AsRef<[u8]>, dst: impl AsRef<[u8]>) -> Result<Moved> {
+        self.db
+            .run(|inner| Ok(inner.strings.copy(src.as_ref(), dst.as_ref(), true)))
+    }
 }
 
 /// Both ways of applying a deadline answer the same question, so they say so in
@@ -403,6 +483,47 @@ mod tests {
         assert_eq!(keys.kind("k").unwrap(), Some(Kind::String));
         assert!(keys.del("k").unwrap());
         assert!(!keys.exists("k").unwrap());
+    }
+
+    #[test]
+    fn a_rename_carries_the_deadline_and_a_copy_is_a_second_value() {
+        let db = open(MEMORY).unwrap();
+        let keys = db.keys();
+        db.strings().set("a", "v1").unwrap();
+        keys.expire_in("a", Duration::from_secs(100)).unwrap();
+        db.strings().set("b", "v2").unwrap();
+
+        assert_eq!(keys.rename("a", "b").unwrap(), Moved::Ok);
+        assert_eq!(db.strings().get("b").unwrap().as_deref(), Some(&b"v1"[..]));
+        assert!(keys.ttl("b").unwrap().left().is_some(), "a's and not b's");
+        assert!(!keys.exists("a").unwrap());
+
+        db.set("s").add("m1").unwrap();
+        assert_eq!(keys.copy("s", "t").unwrap(), Moved::Ok);
+        db.set("t").add("m2").unwrap();
+        assert_eq!(db.set("s").len().unwrap(), 1, "the original is intact");
+        assert_eq!(db.set("t").len().unwrap(), 2);
+    }
+
+    #[test]
+    fn the_three_answers_a_move_can_give_are_three_and_not_two() {
+        let db = open(MEMORY).unwrap();
+        let keys = db.keys();
+        db.strings().set("a", "v1").unwrap();
+        db.strings().set("b", "v2").unwrap();
+
+        // Missing and Taken both mean nothing happened, and a caller that has
+        // to tell them apart should not need a second call to find out which.
+        assert_eq!(keys.rename_if_new("nosuch", "z").unwrap(), Moved::Missing);
+        assert_eq!(keys.rename_if_new("a", "b").unwrap(), Moved::Taken);
+        assert_eq!(keys.copy("a", "b").unwrap(), Moved::Taken);
+        assert_eq!(db.strings().get("b").unwrap().as_deref(), Some(&b"v2"[..]));
+
+        assert_eq!(keys.copy_over("a", "b").unwrap(), Moved::Ok);
+        assert_eq!(db.strings().get("b").unwrap().as_deref(), Some(&b"v1"[..]));
+        // Onto itself is the one call the two renames disagree about.
+        assert_eq!(keys.rename("a", "a").unwrap(), Moved::Ok);
+        assert_eq!(keys.rename_if_new("a", "a").unwrap(), Moved::Taken);
     }
 
     #[test]

@@ -134,7 +134,7 @@ struct Row<V> {
 ///
 /// The payload is whatever the collection needs. A set uses `()`, a hash uses
 /// the value address and the TTL slot, a sorted set uses the score.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Elements<V> {
     /// Tag in the top byte, row index in the low 24 bits, [`EMPTY`] for nothing.
     slots: Box<[u32]>,

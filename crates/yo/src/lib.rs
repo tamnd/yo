@@ -128,3 +128,8 @@ pub use yo_kv::{Member, Str};
 // What `TYPE` answers, which [`Keys::kind`] hands back as a type rather than as
 // the word Redis prints.
 pub use yo_kv::Kind;
+// What a rename or a copy did. Three answers and not two, because a destination
+// that was already taken is a different thing from a source that was not there,
+// and a caller that has to tell them apart should not have to make a second call
+// to find out which it got.
+pub use yo_kv::Moved;

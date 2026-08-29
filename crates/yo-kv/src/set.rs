@@ -184,7 +184,7 @@ impl Encoding {
 }
 
 /// The three representations.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 enum Body {
     Ints(Intset),
     Packed(Listpack),
@@ -192,7 +192,7 @@ enum Body {
 }
 
 /// A set of members.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Set {
     body: Body,
 }
