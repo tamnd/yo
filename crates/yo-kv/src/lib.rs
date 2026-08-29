@@ -50,6 +50,7 @@
 pub mod clock;
 pub mod cond;
 pub mod counter;
+pub mod elem;
 pub mod lcs;
 pub mod strings;
 pub mod value;
@@ -57,6 +58,7 @@ pub mod value;
 pub use clock::Clock;
 pub use cond::Compare;
 pub use counter::{Counted, IncrEx, IncrExpire, Num};
+pub use elem::{Elements, Full, MAX_ROWS, NAME_MAX};
 pub use lcs::{Idx as LcsIdx, LCS_MAX_CELLS, Match as LcsMatch};
 pub use strings::{Exists, Expire, KEY_MAX, STRING_MAX, SetOptions, SetOutcome, Strings};
 pub use value::{EMBSTR_MAX, Encoding, Str};
