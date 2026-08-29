@@ -20,7 +20,18 @@ use super::args::{self, Args};
 use super::table::Spec;
 use crate::reply::Out;
 use yo_common::{Code, Error, Result};
-use yo_kv::Keyspace;
+use yo_kv::{Applied, Ask, Cond, Keyspace, MAX_AT};
+
+/// Milliseconds in a second, which is the whole of what the p in `PTTL` means.
+const SECOND: i64 = 1000;
+
+/// What Redis says when `NX` is given alongside any of the other three.
+const NX_WITH_OTHERS: &str =
+    "NX and XX, GT or LT options at the same time are not compatible";
+
+/// And when `GT` and `LT` are given together, which is the one pair that
+/// contradicts itself without `NX` being involved.
+const GT_WITH_LT: &str = "GT and LT options at the same time are not compatible";
 
 /// What `OBJECT FREQ` says on a server that is not counting accesses.
 ///
@@ -86,10 +97,152 @@ pub(super) fn execute(db: &mut Keyspace, spec: &Spec, args: Args<'_>, out: &mut 
             // strings and this one is not.
             out.simple(name);
         }
+        "expire" | "pexpire" | "expireat" | "pexpireat" => expire(db, spec.name, args, out)?,
+        "persist" => out.int(i64::from(db.persist(args.get(1)))),
+        "ttl" | "pttl" | "expiretime" | "pexpiretime" => ask(db, spec.name, args, out),
         "object" => object(db, args, out)?,
         other => unreachable!("keyspace command with no body: {other}"),
     }
     Ok(())
+}
+
+/// `EXPIRE`, `PEXPIRE`, `EXPIREAT` and `PEXPIREAT`.
+///
+/// `key ttl [NX|XX|GT|LT]`, and the four differ only in what the number means:
+/// seconds or milliseconds, and counted from now or from the epoch. All four
+/// become one absolute millisecond here, which is the same shape the hash field
+/// versions take and for the same reason, so there is one place the condition
+/// rules are applied and four commands that cannot drift apart.
+///
+/// The reply is 1 or 0 and it cannot tell you which of the two things happened
+/// when it says 1: the deadline went on, or the deadline had already passed and
+/// the key went away. The store answers that distinction and the wire throws it
+/// away, because that is what Redis puts on the wire.
+fn expire(db: &mut Keyspace, name: &str, args: Args<'_>, out: &mut Out) -> Result<()> {
+    let relative = matches!(name, "expire" | "pexpire");
+    let scale = if matches!(name, "pexpire" | "pexpireat") {
+        1
+    } else {
+        SECOND
+    };
+    let at = moment(args.int(2)?, scale, relative, name, db.clock().now_ms())?;
+    let cond = condition(args)?;
+    out.int(match db.expire(args.get(1), at, cond) {
+        // Nothing there, or the condition said no. Redis does not distinguish.
+        Applied::Missing | Applied::NotMet => 0,
+        Applied::Ok | Applied::Deleted => 1,
+    });
+    Ok(())
+}
+
+/// The absolute millisecond a client's number means, or why it is not one.
+///
+/// Unlike the hash field commands, a negative number is fine here and means a
+/// moment that has already gone, which deletes the key. `EXPIRE key -1` is a
+/// delete on a real server and has been for years, so the only failure is the
+/// arithmetic overflowing, which is exactly the check Redis makes.
+///
+/// The clamp at the top is D-17. Redis holds a key's deadline in a full signed
+/// long and takes `PEXPIREAT key 9223372036854775807`. A record here holds it in
+/// forty six bits, so anything past that becomes the year 4199, which is not the
+/// number the client named and is the same behaviour: the key does not expire.
+/// The command succeeds either way and only `PTTL` can tell the difference.
+fn moment(by: i64, scale: i64, relative: bool, name: &str, now: u64) -> Result<u64> {
+    let ms = by
+        .checked_mul(scale)
+        .and_then(|ms| {
+            if relative {
+                ms.checked_add(now as i64)
+            } else {
+                Some(ms)
+            }
+        })
+        .ok_or_else(|| {
+            Error::new(
+                Code::Invalid,
+                format!("invalid expire time in '{name}' command"),
+            )
+        })?;
+    // A moment before the epoch is a moment that has gone, so it clamps to zero
+    // rather than failing. Zero is in the past for every clock this will ever
+    // run against, which is what makes that clamp safe to make silently.
+    Ok(ms.clamp(0, MAX_AT as i64) as u64)
+}
+
+/// `NX`, `XX`, `GT` and `LT`, of which the four writers take any number.
+///
+/// It reads as one keyword and it is a set, which is the shape Redis gave it and
+/// is worth spelling out. `EXPIRE key 100 XX GT` is legal and means both, the
+/// same keyword twice is legal and means once, and two of them that contradict
+/// each other are a named error rather than a generic syntax one.
+///
+/// Only two pairs are legal, `XX GT` and `XX LT`, and `XX GT` says the same
+/// thing as `GT` on its own because `GT` already refuses a key with no deadline.
+/// So the five states below are the whole of it.
+fn condition(args: Args<'_>) -> Result<Cond> {
+    let (mut nx, mut xx, mut gt, mut lt) = (false, false, false, false);
+    for i in 3..args.len() {
+        let arg = args.get(i);
+        match arg {
+            a if args::is(a, b"nx") => nx = true,
+            a if args::is(a, b"xx") => xx = true,
+            a if args::is(a, b"gt") => gt = true,
+            a if args::is(a, b"lt") => lt = true,
+            _ => {
+                return Err(Error::new(
+                    Code::Invalid,
+                    format!("Unsupported option {}", String::from_utf8_lossy(arg)),
+                ));
+            }
+        }
+    }
+    if nx && (xx || gt || lt) {
+        return Err(Error::new(Code::Invalid, NX_WITH_OTHERS));
+    }
+    if gt && lt {
+        return Err(Error::new(Code::Invalid, GT_WITH_LT));
+    }
+    Ok(match (nx, xx, gt, lt) {
+        (true, ..) => Cond::NotSet,
+        (_, _, true, _) => Cond::Greater,
+        (_, true, _, true) => Cond::LessAndSet,
+        (_, _, _, true) => Cond::Less,
+        (_, true, ..) => Cond::AlreadySet,
+        _ => Cond::Always,
+    })
+}
+
+/// `TTL`, `PTTL`, `EXPIRETIME` and `PEXPIRETIME`.
+///
+/// One question in four units. The first pair answer what is left and the second
+/// pair answer when it falls due, and both pairs use the same -2 for a key that
+/// is not there and -1 for a key with no deadline, so only a real answer is ever
+/// converted.
+///
+/// Both seconds forms round to nearest, so four hundred milliseconds left
+/// answers 0 and six hundred answers 1. The hash field versions of these
+/// commands round up instead, which is not something anyone would guess and is
+/// what 8.10.1 does: `HPEXPIRE h 400 FIELDS 1 f` then `HTTL` answers 1 where
+/// `PEXPIRE k 400` then `TTL` answers 0. Two commands, two roundings, checked
+/// against a real server rather than reasoned about.
+fn ask(db: &mut Keyspace, name: &str, args: Args<'_>, out: &mut Out) {
+    let now = db.clock().now_ms();
+    let asked = db.deadline_of(args.get(1));
+    let millis = name == "pttl" || name == "pexpiretime";
+    let ms = if name == "ttl" || name == "pttl" {
+        asked.remaining_ms(now)
+    } else {
+        match asked {
+            Ask::Missing => -2,
+            Ask::NoDeadline => -1,
+            Ask::At(at) => at as i64,
+        }
+    };
+    out.int(if millis || ms < 0 {
+        ms
+    } else {
+        (ms + SECOND / 2) / SECOND
+    });
 }
 
 /// `OBJECT ENCODING | REFCOUNT | IDLETIME | FREQ key`, and `OBJECT HELP`.

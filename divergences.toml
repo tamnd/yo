@@ -132,3 +132,10 @@ reason = "There is no Lua here until M6, so nothing can be loaded and nothing ca
 status = "until"
 resolved_by = "M6"
 spec = "12 section 7"
+
+[[divergence]]
+id = "D-17"
+title = "PEXPIREAT clamps a deadline past the year 4199"
+reason = "Redis holds a key's deadline in a full signed long, so PEXPIREAT key 9223372036854775807 stores that number and PTTL reads it back. A record here holds the deadline in forty six bits, which runs out in the year 4199, so anything past that is clamped to the top of the range. The command answers 1 either way and the key does not expire either way, so the only thing a client can see is PTTL naming a different absurd number than the absurd number it asked for. The alternative is refusing the command, which would break a client that uses a large constant to mean never, and the other alternative is widening the record, which would cost eighteen bits on every key that has a deadline to hold a range no clock will reach."
+status = "permanent"
+spec = "08 section 4"

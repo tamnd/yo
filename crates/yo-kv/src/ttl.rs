@@ -73,6 +73,12 @@ pub const fn valid_at(ms: u64) -> bool {
 }
 
 /// The condition on a deadline being set, which is `NX`, `XX`, `GT` or `LT`.
+///
+/// A hash field command takes exactly one of the four keywords. `EXPIRE` on a
+/// whole key takes a set of them and accepts two, `XX GT` and `XX LT`, which is
+/// where [`Cond::LessAndSet`] comes from. `XX GT` is not a sixth case because
+/// `GT` already refuses a key with no deadline, so it means the same thing as
+/// `GT` alone.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Cond {
     /// No condition. Set it whatever was there.
@@ -86,6 +92,12 @@ pub enum Cond {
     Greater,
     /// Only if it moves the deadline earlier, or there was none.
     Less,
+    /// Only if there is one now and this moves it earlier.
+    ///
+    /// `XX LT` on a key. It is a separate case because `LT` on its own accepts a
+    /// key with no deadline, on the reading that no deadline is infinitely far
+    /// away, and `XX` is what takes that reading away.
+    LessAndSet,
 }
 
 /// What setting a deadline did.
@@ -98,11 +110,19 @@ pub enum Cond {
 /// protocol layer because they are semantics: whether a past deadline deletes the
 /// field or stores it is a decision about the data structure, and the reply just
 /// reports it.
+///
+/// `EXPIRE` on a whole key produces the same four outcomes and reports them with
+/// two numbers instead of four, so [`Keyspace::expire`] answers this and the wire
+/// folds it. `EXPIRE` cannot tell you whether the key went away or the deadline
+/// went on, and this can.
+///
+/// [`Keyspace::expire`]: crate::Keyspace::expire
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Applied {
-    /// No such field. Redis replies -2, and does the same for a hash that is not
-    /// there at all, because a missing key and an empty hash are the same thing.
-    NoField = -2,
+    /// No such field, or no such key. Redis replies -2 for a field, and does the
+    /// same for a hash that is not there at all, because a missing key and an
+    /// empty hash are the same thing.
+    Missing = -2,
     /// The condition was not met, so nothing changed. Redis replies 0.
     NotMet = 0,
     /// Set or updated. Redis replies 1.
@@ -117,13 +137,18 @@ pub enum Applied {
 ///
 /// Redis's `HFE_GET_*` and `HFE_PERSIST_*` codes, which agree with each other on
 /// -2 and -1 and are the same two questions.
+///
+/// `TTL` and `PTTL` on a whole key ask the same three way question and answer it
+/// with the same two sentinels, so this says field or key rather than field. A
+/// key that is not there is -2 and a key with no deadline is -1, which is what
+/// makes the hash field commands and the key commands one shape and not two.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Ask {
-    /// No such field. Redis replies -2.
-    NoField,
-    /// The field is there and has no deadline. Redis replies -1.
+    /// No such field, or no such key. Redis replies -2.
+    Missing,
+    /// It is there and has no deadline. Redis replies -1.
     NoDeadline,
-    /// The field is there and has one.
+    /// It is there and has one.
     At(u64),
 }
 
@@ -136,7 +161,7 @@ impl Ask {
     #[must_use]
     pub const fn remaining_ms(self, now: u64) -> i64 {
         match self {
-            Ask::NoField => -2,
+            Ask::Missing => -2,
             Ask::NoDeadline => -1,
             Ask::At(at) if at <= now => -2,
             // The arm above leaves `at > now`, and a deadline is under 2^46, so
@@ -318,7 +343,7 @@ impl Deadlines {
     /// What `HTTL` and `HPERSIST` want to know about a row.
     ///
     /// The caller has already established the field exists, so this never answers
-    /// [`Ask::NoField`]. That case belongs to the table, not here.
+    /// [`Ask::Missing`]. That case belongs to the table, not here.
     #[inline]
     #[must_use]
     pub fn ask(&self, row: usize) -> Ask {
@@ -398,7 +423,7 @@ impl Deadlines {
 /// has a [`Deadlines`] reaches it through [`Deadlines::set`], and the band that
 /// does not calls this and then writes the number itself.
 ///
-/// Never answers [`Applied::NoField`], since establishing that the field exists
+/// Never answers [`Applied::Missing`], since establishing that the field exists
 /// is what the caller did to have a `prev` to pass in.
 #[must_use]
 pub const fn decide(prev: Option<u64>, at: u64, cond: Cond, now: u64) -> Applied {
@@ -422,12 +447,12 @@ pub const fn decide(prev: Option<u64>, at: u64, cond: Cond, now: u64) -> Applied
 const fn allowed(prev: Option<u64>, at: u64, cond: Cond) -> bool {
     match (prev, cond) {
         (_, Cond::Always) => true,
-        (None, Cond::AlreadySet | Cond::Greater) => false,
+        (None, Cond::AlreadySet | Cond::Greater | Cond::LessAndSet) => false,
         (None, Cond::NotSet | Cond::Less) => true,
         (Some(_), Cond::NotSet) => false,
         (Some(_), Cond::AlreadySet) => true,
         (Some(p), Cond::Greater) => p < at,
-        (Some(p), Cond::Less) => p > at,
+        (Some(p), Cond::Less | Cond::LessAndSet) => p > at,
     }
 }
 
@@ -618,7 +643,7 @@ mod tests {
 
     #[test]
     fn what_is_left_is_what_redis_replies() {
-        assert_eq!(Ask::NoField.remaining_ms(0), -2);
+        assert_eq!(Ask::Missing.remaining_ms(0), -2);
         assert_eq!(Ask::NoDeadline.remaining_ms(0), -1);
         assert_eq!(Ask::At(5000).remaining_ms(1000), 4000);
         assert_eq!(Ask::At(5000).remaining_ms(5000), -2, "due now is gone");

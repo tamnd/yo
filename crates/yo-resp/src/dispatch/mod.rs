@@ -190,6 +190,20 @@ impl Server {
         }
     }
 
+    /// Move every clock here to `ms` by hand, for tests about expiry.
+    ///
+    /// A test cannot wait a hundred seconds and a test that waits a hundred
+    /// milliseconds is a test that fails on a loaded machine, so time moves on
+    /// request. The system clock underneath will overwrite this on the next
+    /// [`Server::refresh_clock`], which is why this is only useful in a test
+    /// that drives commands directly rather than through the event loop.
+    pub fn set_clock_ms(&mut self, ms: u64) {
+        self.clock.set(ms);
+        for db in &mut self.dbs {
+            db.clock_mut().set(ms);
+        }
+    }
+
     /// Seconds since this server was built.
     #[must_use]
     pub fn uptime_secs(&self) -> u64 {
@@ -551,6 +565,204 @@ mod tests {
         // that carry a word are bulk strings.
         assert_eq!(f.run(&[b"TYPE", b"k"]), "+string\r\n");
         assert_eq!(f.run(&[b"TYPE", b"nosuch"]), "+none\r\n");
+    }
+
+    #[test]
+    fn a_key_deadline_goes_on_and_comes_back_in_all_four_units() {
+        let mut f = Fixture::new();
+        f.run(&[b"SET", b"k", b"v"]);
+        assert_eq!(f.run(&[b"TTL", b"k"]), ":-1\r\n", "there and no deadline");
+        assert_eq!(f.run(&[b"TTL", b"nosuch"]), ":-2\r\n", "not there at all");
+
+        assert_eq!(f.run(&[b"EXPIRE", b"k", b"100"]), ":1\r\n");
+        assert_eq!(f.run(&[b"TTL", b"k"]), ":100\r\n");
+        let ms = int(&f.run(&[b"PTTL", b"k"]));
+        assert!((99_000..=100_000).contains(&ms), "got {ms}");
+
+        // The absolute pair, derived from the same one number the store kept.
+        let at = int(&f.run(&[b"EXPIRETIME", b"k"]));
+        let at_ms = int(&f.run(&[b"PEXPIRETIME", b"k"]));
+        assert_eq!(at, (at_ms + 500) / 1000);
+        assert!(at_ms > 1_700_000_000_000, "an absolute moment, got {at_ms}");
+
+        assert_eq!(f.run(&[b"PERSIST", b"k"]), ":1\r\n");
+        assert_eq!(f.run(&[b"TTL", b"k"]), ":-1\r\n");
+        assert_eq!(
+            f.run(&[b"PERSIST", b"k"]),
+            ":0\r\n",
+            "nothing to take off the second time"
+        );
+        assert_eq!(f.run(&[b"PERSIST", b"nosuch"]), ":0\r\n");
+        assert_eq!(
+            f.run(&[b"GET", b"k"]),
+            "$1\r\nv\r\n",
+            "and the value went through all of that untouched"
+        );
+    }
+
+    #[test]
+    fn every_type_can_be_given_a_deadline_and_it_is_the_same_deadline() {
+        let mut f = Fixture::new();
+        f.run(&[b"SET", b"str", b"v"]);
+        f.run(&[b"SADD", b"set", b"a", b"b"]);
+        f.run(&[b"HSET", b"hash", b"f", b"v"]);
+
+        for key in [b"str".as_slice(), b"set", b"hash"] {
+            assert_eq!(f.run(&[b"EXPIRE", key, b"100"]), ":1\r\n");
+            assert_eq!(f.run(&[b"TTL", key]), ":100\r\n");
+        }
+        // The body is not touched by any of that, which is the whole reason the
+        // deadline lives in the record and the body lives somewhere else.
+        assert_eq!(f.run(&[b"SCARD", b"set"]), ":2\r\n");
+        assert_eq!(f.run(&[b"HGET", b"hash", b"f"]), "$1\r\nv\r\n");
+        assert_eq!(f.run(&[b"GET", b"str"]), "$1\r\nv\r\n");
+    }
+
+    #[test]
+    fn a_deadline_that_has_already_gone_deletes_the_key_now() {
+        let mut f = Fixture::new();
+        for key in [b"a".as_slice(), b"b", b"c", b"d"] {
+            f.run(&[b"SET", key, b"v"]);
+        }
+        // Four ways of naming a moment that has passed, and all four are a
+        // delete answering 1 rather than an error. Zero is a moment, minus one
+        // is a moment, and the hash field commands refuse the negative one.
+        assert_eq!(f.run(&[b"EXPIRE", b"a", b"0"]), ":1\r\n");
+        assert_eq!(f.run(&[b"EXPIRE", b"b", b"-1"]), ":1\r\n");
+        assert_eq!(f.run(&[b"EXPIREAT", b"c", b"1"]), ":1\r\n");
+        assert_eq!(f.run(&[b"PEXPIREAT", b"d", b"1"]), ":1\r\n");
+        assert_eq!(f.run(&[b"DBSIZE"]), ":0\r\n");
+        assert_eq!(
+            f.run(&[b"EXPIRE", b"a", b"100"]),
+            ":0\r\n",
+            "and the key really went, so there is nothing to put a deadline on"
+        );
+    }
+
+    #[test]
+    fn the_four_conditions_decide_whether_the_deadline_moves() {
+        let mut f = Fixture::new();
+        f.run(&[b"SET", b"k", b"v"]);
+
+        assert_eq!(f.run(&[b"EXPIRE", b"k", b"100", b"XX"]), ":0\r\n");
+        assert_eq!(f.run(&[b"TTL", b"k"]), ":-1\r\n", "and XX left it alone");
+        assert_eq!(f.run(&[b"EXPIRE", b"k", b"100", b"GT"]), ":0\r\n");
+        assert_eq!(
+            f.run(&[b"EXPIRE", b"k", b"100", b"LT"]),
+            ":1\r\n",
+            "no deadline reads as infinitely far away, so LT passes where GT fails"
+        );
+
+        assert_eq!(f.run(&[b"EXPIRE", b"k", b"50", b"NX"]), ":0\r\n");
+        assert_eq!(f.run(&[b"EXPIRE", b"k", b"50", b"GT"]), ":0\r\n");
+        assert_eq!(f.run(&[b"TTL", b"k"]), ":100\r\n");
+        assert_eq!(f.run(&[b"EXPIRE", b"k", b"50", b"LT"]), ":1\r\n");
+        assert_eq!(f.run(&[b"EXPIRE", b"k", b"200", b"GT"]), ":1\r\n");
+        assert_eq!(f.run(&[b"TTL", b"k"]), ":200\r\n");
+
+        // The condition is answered before the past check, so this is a 0 and
+        // the key survives. The other order would delete it.
+        assert_eq!(f.run(&[b"EXPIRE", b"k", b"0", b"NX"]), ":0\r\n");
+        assert_eq!(f.run(&[b"EXISTS", b"k"]), ":1\r\n");
+        assert_eq!(f.run(&[b"EXPIRE", b"k", b"0", b"XX"]), ":1\r\n");
+        assert_eq!(f.run(&[b"EXISTS", b"k"]), ":0\r\n", "and XX let it through");
+    }
+
+    #[test]
+    fn the_conditions_are_a_set_and_not_a_keyword() {
+        let mut f = Fixture::new();
+        f.run(&[b"SET", b"k", b"v"]);
+
+        assert_eq!(f.run(&[b"EXPIRE", b"k", b"100", b"nx"]), ":1\r\n");
+        assert_eq!(
+            f.run(&[b"EXPIRE", b"k", b"100", b"nx", b"nx"]),
+            ":0\r\n",
+            "the same keyword twice means it once, and NX now has a deadline to fail on"
+        );
+
+        // XX with LT is the one pair that is not either of them on its own: LT
+        // alone would accept a key with no deadline and this does not.
+        assert_eq!(f.run(&[b"EXPIRE", b"k", b"200", b"xx", b"gt"]), ":1\r\n");
+        assert_eq!(f.run(&[b"TTL", b"k"]), ":200\r\n");
+        assert_eq!(f.run(&[b"EXPIRE", b"k", b"100", b"gt", b"xx"]), ":0\r\n");
+        assert_eq!(f.run(&[b"EXPIRE", b"k", b"100", b"XX", b"LT"]), ":1\r\n");
+        assert_eq!(f.run(&[b"TTL", b"k"]), ":100\r\n");
+        f.run(&[b"PERSIST", b"k"]);
+        assert_eq!(
+            f.run(&[b"EXPIRE", b"k", b"100", b"XX", b"LT"]),
+            ":0\r\n",
+            "where LT on its own would have taken it"
+        );
+        assert_eq!(f.run(&[b"EXPIRE", b"k", b"100", b"LT"]), ":1\r\n");
+    }
+
+    #[test]
+    fn a_key_is_gone_once_its_moment_passes() {
+        let mut f = Fixture::new();
+        f.run(&[b"SET", b"k", b"v"]);
+        f.run(&[b"EXPIRE", b"k", b"100"]);
+
+        let at = int(&f.run(&[b"PEXPIRETIME", b"k"]));
+        f.server.set_clock_ms(at as u64 + 1);
+        assert_eq!(f.run(&[b"GET", b"k"]), "$-1\r\n");
+        assert_eq!(f.run(&[b"TTL", b"k"]), ":-2\r\n");
+        assert_eq!(f.run(&[b"EXISTS", b"k"]), ":0\r\n");
+        assert_eq!(f.run(&[b"DBSIZE"]), ":0\r\n");
+    }
+
+    #[test]
+    fn the_expiry_commands_refuse_what_a_real_server_refuses() {
+        let mut f = Fixture::new();
+        f.run(&[b"SET", b"k", b"v"]);
+        for (bad, want) in [
+            (
+                &[b"EXPIRE".as_slice(), b"k", b"soon"][..],
+                "-ERR value is not an integer or out of range\r\n",
+            ),
+            (
+                &[b"EXPIRE", b"k", b"100", b"MAYBE"],
+                "-ERR Unsupported option MAYBE\r\n",
+            ),
+            (
+                &[b"EXPIRE", b"k", b"100", b"NX", b"XX"],
+                "-ERR NX and XX, GT or LT options at the same time are not compatible\r\n",
+            ),
+            (
+                &[b"EXPIRE", b"k", b"100", b"NX", b"GT"],
+                "-ERR NX and XX, GT or LT options at the same time are not compatible\r\n",
+            ),
+            (
+                &[b"EXPIRE", b"k", b"100", b"GT", b"LT", b"GT"],
+                "-ERR GT and LT options at the same time are not compatible\r\n",
+            ),
+            // Seconds that overflow when multiplied into milliseconds. Every
+            // message names the command it came from.
+            (
+                &[b"EXPIRE", b"k", b"9223372036854775807"],
+                "-ERR invalid expire time in 'expire' command\r\n",
+            ),
+            (
+                &[b"EXPIREAT", b"k", b"9223372036854775807"],
+                "-ERR invalid expire time in 'expireat' command\r\n",
+            ),
+            (
+                &[b"PEXPIRE", b"k", b"9223372036854775807"],
+                "-ERR invalid expire time in 'pexpire' command\r\n",
+            ),
+        ] {
+            assert_eq!(f.run(bad), want, "for {bad:?}");
+        }
+        assert_eq!(
+            f.run(&[b"TTL", b"k"]),
+            ":-1\r\n",
+            "and none of those put a deadline on anything"
+        );
+
+        // The one of the four that has no arithmetic to overflow. Redis takes
+        // it and holds the number as given, and a record here holds forty six
+        // bits, so it lands in the year 4199 instead. D-17.
+        assert_eq!(f.run(&[b"PEXPIREAT", b"k", b"9223372036854775807"]), ":1\r\n");
+        assert_eq!(f.run(&[b"PEXPIRETIME", b"k"]), ":70368744177663\r\n");
     }
 
     #[test]
@@ -2494,6 +2706,18 @@ mod tests {
     }
 
     /// The one integer of a single element array reply.
+    /// The number out of a plain integer reply.
+    ///
+    /// [`int_reply`] is the same thing wrapped in a one element array, which is
+    /// the shape every hash field command answers in.
+    fn int(reply: &str) -> i64 {
+        let body = reply
+            .strip_prefix(':')
+            .and_then(|s| s.strip_suffix("\r\n"))
+            .unwrap_or_else(|| panic!("wanted an integer, got {reply}"));
+        body.parse().expect("an integer")
+    }
+
     fn int_reply(reply: &str) -> i64 {
         let body = reply
             .strip_prefix("*1\r\n:")
