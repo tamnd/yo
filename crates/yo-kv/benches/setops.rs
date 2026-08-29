@@ -35,7 +35,7 @@
 
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use std::hint::black_box;
-use yo_kv::setops::{self, Plan, Set};
+use yo_kv::setops::{self, Plan, Table};
 
 /// Big enough that a set does not sit in L2, so a probe is a real miss and not a
 /// cache hit dressed as one.
@@ -56,10 +56,10 @@ fn ks() -> &'static [usize] {
 /// `keep` sets how much of each set the sets have in common. Every set gets the
 /// same first `keep` members and then its own, so the overlap is exact and the
 /// same at every k.
-fn build(k: usize, keep: usize) -> Vec<Set> {
+fn build(k: usize, keep: usize) -> Vec<Table> {
     (0..k)
         .map(|s| {
-            let mut set = Set::with_capacity(N);
+            let mut set = Table::with_capacity(N);
             for i in 0..keep {
                 set.insert(format!("shared:{i:012}").as_bytes(), ())
                     .expect("room");
@@ -83,7 +83,7 @@ fn bench_crossover(c: &mut Criterion) {
     for (shape, keep) in [("dense", N * 9 / 10), ("sparse", N / 100)] {
         for &k in ks() {
             let sets = build(k, keep);
-            let refs: Vec<&Set> = sets.iter().collect();
+            let refs: Vec<&Table> = sets.iter().collect();
 
             for (name, how) in [("probe", Plan::Probe), ("accumulate", Plan::Accumulate)] {
                 g.bench_with_input(
@@ -115,7 +115,7 @@ fn bench_union_and_diff(c: &mut Criterion) {
 
     for &k in ks() {
         let sets = build(k, N / 2);
-        let refs: Vec<&Set> = sets.iter().collect();
+        let refs: Vec<&Table> = sets.iter().collect();
 
         g.bench_with_input(BenchmarkId::new("union", k), &k, |b, _| {
             b.iter(|| {
@@ -147,7 +147,7 @@ fn bench_store(c: &mut Criterion) {
 
     for &k in ks() {
         let sets = build(k, N * 9 / 10);
-        let refs: Vec<&Set> = sets.iter().collect();
+        let refs: Vec<&Table> = sets.iter().collect();
         let upper = refs.iter().map(|s| s.len()).min().unwrap_or(0);
 
         g.bench_with_input(BenchmarkId::new("interstore", k), &k, |b, _| {

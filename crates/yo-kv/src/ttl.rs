@@ -90,8 +90,8 @@ pub enum Cond {
 
 /// What setting a deadline did.
 ///
-/// Not called `Set`, because [`setops::Set`](crate::setops::Set) is a set and two
-/// types with that name in one crate is a trap for whoever reads it next.
+/// Not called `Set`, because [`crate::Set`] is a set and two types with that
+/// name in one crate is a trap for whoever reads it next.
 ///
 /// The numbers are Redis's, from the `SetExRes` enum in `t_hash.c`, and they are
 /// what `HEXPIRE` puts in its reply array. They are here rather than in the
