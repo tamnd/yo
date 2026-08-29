@@ -38,19 +38,52 @@
 //! split. `HSET h field v1` and then `HSET h field v2` writes eight bytes of row
 //! and the new value, and touches the field's name not at all.
 //!
-//! # What this does not have yet
+//! # Field TTL
 //!
-//! Field TTL. [`crate::ttl::Deadlines`] is built and waiting for it, and when it
-//! lands the listpack band gains a third element per field and reports
-//! `listpackex`, the way Redis does. Doing it now would mean a step of three
-//! through a structure that has no deadlines in it.
+//! A field can be given its own deadline, which is the `HEXPIRE` family, and the
+//! two bands pay for it differently.
+//!
+//! The packed band grows a third element per field the first time any field of
+//! that hash is given one, holding the deadline in unix milliseconds or a zero
+//! for no deadline. That is what Redis does and it is why `OBJECT ENCODING`
+//! grows a third answer, `listpackex`. Everything below stays single path
+//! because the walk takes a step of two or of three rather than there being two
+//! copies of the code, and a hash that never sees `HEXPIRE` never widens.
+//!
+//! The table band hands the job to [`Deadlines`], a side array indexed by row
+//! position that allocates nothing until the first deadline. [`crate::ttl`] is
+//! where the reasoning for that lives, including why it is indexed by the row
+//! and not by a number in the row.
+//!
+//! Widening is one way in both bands, the same as promotion: a hash whose last
+//! deadline has been taken off keeps the shape, because going back would mean
+//! rewriting the whole thing to save a byte a field on a hash that has already
+//! shown it uses deadlines.
+//!
+//! # Expiry is lazy here too
+//!
+//! A field past its deadline is still sitting in the structure until something
+//! looks at it. [`Hash::reap`] is that look, it is called by the keyspace before
+//! any hash command runs, and it is guarded by one comparison against the
+//! earliest deadline in the hash, so a hash with no field TTL pays a load and a
+//! branch and nothing else. Every read path below can therefore treat what it
+//! finds as live, which is what keeps `HGET` the shape it was before any of this
+//! landed.
+//!
+//! A write clears a field's deadline. `HSET` on a field that had one leaves it
+//! with no deadline, which is Redis's rule since 7.4 and is the reason `HGETEX`
+//! exists to read a field without disturbing it.
 
-use yo_common::num::parse_i64;
+use yo_common::num::{self, parse_i64};
 
 use crate::blob::{Blob, Span};
 use crate::elem::Elements;
 use crate::listpack::{self, Listpack};
 use crate::scan::Cursor;
+use crate::ttl::{Applied, Ask, Cond, Deadlines, decide};
+
+/// No deadline, the same sentinel [`crate::ttl`] uses and for the same reason.
+const NONE: u64 = u64::MAX;
 
 /// A field name or a value, as it is stored.
 ///
@@ -88,11 +121,17 @@ impl Default for Limits {
     }
 }
 
-/// Which of the two a hash is in, which is what `OBJECT ENCODING` reports.
+/// Which representation a hash is in, which is what `OBJECT ENCODING` reports.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Encoding {
     /// One packed blob of alternating fields and values, walked linearly.
     Listpack,
+    /// The same blob widened to three elements a field, the third a deadline.
+    ///
+    /// Not a third band, which is the point: it is the packed band with a wider
+    /// step, and a hash arrives here by being given a field deadline rather than
+    /// by growing.
+    ListpackEx,
     /// The element table, with the values in a blob beside it.
     Hashtable,
 }
@@ -104,7 +143,170 @@ impl Encoding {
     pub const fn name(self) -> &'static str {
         match self {
             Encoding::Listpack => "listpack",
+            Encoding::ListpackEx => "listpackex",
             Encoding::Hashtable => "hashtable",
+        }
+    }
+}
+
+/// The packed band, at two elements a field or at three.
+#[derive(Debug)]
+struct Packed {
+    lp: Listpack,
+    /// Whether there is a deadline element after every value.
+    ///
+    /// One bool rather than two variants of a band, so that everything reached
+    /// through [`Packed::step`] is written once and a hash without field TTL
+    /// runs the same code a hash with it does.
+    ex: bool,
+    /// A lower bound on the earliest deadline here, or [`NONE`].
+    ///
+    /// Leans early for the reason [`Deadlines::soonest`] gives: it goes down
+    /// when a deadline is set and does not go back up when one is taken off, so
+    /// [`Hash::reap`] can walk for nothing but cannot sleep through an expiry.
+    soonest: u64,
+}
+
+impl Packed {
+    fn new() -> Packed {
+        Packed {
+            lp: Listpack::new(),
+            ex: false,
+            soonest: NONE,
+        }
+    }
+
+    /// Two elements a field, or three once any field has a deadline.
+    #[inline]
+    const fn step(&self) -> usize {
+        if self.ex { 3 } else { 2 }
+    }
+
+    #[inline]
+    fn len(&self) -> usize {
+        self.lp.len() / self.step()
+    }
+
+    /// Where `field`'s name is, which is also where its row starts.
+    #[inline]
+    fn find(&self, field: &[u8]) -> Option<usize> {
+        self.lp.find(field, self.step())
+    }
+
+    /// The deadline on the row starting at `at`, if it has one.
+    fn deadline(&self, at: usize) -> Option<u64> {
+        if !self.ex {
+            return None;
+        }
+        match self.lp.get(at + 2) {
+            // A field with no deadline holds a zero rather than the slot being
+            // left out, so the rows stay three wide and the step stays a
+            // constant. Redis writes the same zero.
+            Some(Text::Int(n)) => u64::try_from(n).ok().filter(|&at| at != 0),
+            // A deadline goes in as digits and a listpack holds digits as a
+            // number, so nothing else is a shape this band can be in.
+            _ => None,
+        }
+    }
+
+    /// Write a deadline, or a zero for none, onto the row starting at `at`.
+    fn write_deadline(&mut self, at: usize, deadline: u64) {
+        debug_assert!(self.ex, "widen before writing a deadline");
+        let mut buf = [0u8; num::DIGITS_MAX];
+        self.lp.replace(at + 2, num::u64_digits(&mut buf, deadline));
+    }
+
+    /// Store `value` against `field` and say whether the field is new.
+    fn set(&mut self, field: &[u8], value: &[u8]) -> bool {
+        match self.find(field) {
+            Some(at) => {
+                self.lp.replace(at + 1, value);
+                if self.ex {
+                    // A write clears the deadline. Redis's rule, and the reason
+                    // HGETEX is a command rather than a flag on HGET.
+                    self.write_deadline(at, 0);
+                }
+                false
+            }
+            None => {
+                self.lp.push(field);
+                self.lp.push(value);
+                if self.ex {
+                    self.lp.push(b"0");
+                }
+                true
+            }
+        }
+    }
+
+    /// Take the whole row starting at `at` out.
+    #[inline]
+    fn remove_at(&mut self, at: usize) -> bool {
+        self.lp.delete(at, self.step())
+    }
+
+    /// Grow the third element, which is where `listpackex` starts.
+    fn widen(&mut self) {
+        if self.ex {
+            return;
+        }
+        let mut fresh = Listpack::new();
+        let mut pair = self.lp.iter();
+        while let (Some(field), Some(value)) = (pair.next(), pair.next()) {
+            push_text(&mut fresh, field);
+            push_text(&mut fresh, value);
+            fresh.push(b"0");
+        }
+        self.lp = fresh;
+        self.ex = true;
+    }
+
+    /// The earliest deadline actually here, or [`NONE`].
+    ///
+    /// A walk, so only [`Hash::reap`] calls it, and only once it has walked the
+    /// whole thing anyway and knows the bound it was carrying is stale.
+    fn earliest(&self) -> u64 {
+        let mut soonest = NONE;
+        let mut at = 0;
+        while at < self.lp.len() {
+            if let Some(deadline) = self.deadline(at) {
+                soonest = soonest.min(deadline);
+            }
+            at += self.step();
+        }
+        soonest
+    }
+
+    /// Drop every field whose deadline has passed, and say how many went.
+    fn reap(&mut self, now: u64) -> usize {
+        let mut gone = 0;
+        let mut at = 0;
+        while at < self.lp.len() {
+            match self.deadline(at) {
+                Some(deadline) if deadline <= now => {
+                    self.remove_at(at);
+                    gone += 1;
+                }
+                // Only step past a row that survived, because taking one out
+                // moves the next row into this position.
+                _ => at += self.step(),
+            }
+        }
+        gone
+    }
+}
+
+/// Put an entry back into a listpack, writing the digits of a number once.
+///
+/// The only caller is [`Packed::widen`], which is copying a listpack it already
+/// holds, so a number that went in as a number comes back out as one and is
+/// stored as one again.
+fn push_text(lp: &mut Listpack, t: Text<'_>) {
+    match t {
+        Text::Str(s) => lp.push(s),
+        Text::Int(n) => {
+            let mut buf = [0u8; num::DIGITS_MAX];
+            lp.push(num::i64_digits(&mut buf, n));
         }
     }
 }
@@ -114,6 +316,13 @@ impl Encoding {
 struct Table {
     fields: Elements<Span>,
     values: Blob,
+    /// One slot per row once any field has a deadline, and nothing before then.
+    ///
+    /// It has to be told about every row this table gains or loses, in the same
+    /// order, or the deadlines after a hole belong to the wrong fields. That is
+    /// what the `inserted` and `removed` calls below are, and there is a test in
+    /// [`crate::ttl`] that fails when one goes missing.
+    ttl: Deadlines,
 }
 
 impl Table {
@@ -123,6 +332,7 @@ impl Table {
             // Sixteen bytes a value is a guess and being wrong about it costs a
             // realloc, which is what a guess is allowed to cost.
             values: Blob::with_capacity(hint.saturating_mul(16)),
+            ttl: Deadlines::new(),
         }
     }
 
@@ -134,14 +344,20 @@ impl Table {
     /// Store `value` against `field` and say whether the field is new.
     fn set(&mut self, field: &[u8], value: &[u8]) -> bool {
         let span = self.values.push_span(value);
-        if let Some(slot) = self.fields.get_mut(field) {
+        if let Some(row) = self.fields.index_of(field) {
+            let slot = self.fields.at_mut(row).expect("the probe found it");
             let old = std::mem::replace(slot, span);
             self.values.release_span(old);
+            // A write clears the deadline, the same as in the packed band.
+            self.ttl.clear(row);
             self.settle();
             return false;
         }
         match self.fields.insert(field, span) {
-            Ok(_) => true,
+            Ok(_) => {
+                self.ttl.inserted();
+                true
+            }
             Err(_) => {
                 // A field name over NAME_MAX or a table at MAX_ROWS. The value
                 // bytes are already in the blob, so they are given back rather
@@ -154,14 +370,27 @@ impl Table {
     }
 
     fn remove(&mut self, field: &[u8]) -> bool {
-        match self.fields.remove(field) {
-            Some(span) => {
-                self.values.release_span(span);
-                self.settle();
+        match self.fields.index_of(field) {
+            Some(row) => {
+                self.remove_at(row);
                 true
             }
             None => false,
         }
+    }
+
+    /// Take the row at `row` out, keeping the deadlines lined up with it.
+    ///
+    /// The one place a row leaves this table, so that the swap remove and the
+    /// deadline that has to follow it cannot drift apart in a later edit.
+    fn remove_at(&mut self, row: usize) {
+        let span = self
+            .fields
+            .remove_at(row)
+            .expect("the caller found the row");
+        self.values.release_span(span);
+        self.ttl.removed(row);
+        self.settle();
     }
 
     /// Give the dead value bytes back once there are more of them than live.
@@ -181,7 +410,7 @@ impl Table {
 /// The two representations.
 #[derive(Debug)]
 enum Body {
-    Packed(Listpack),
+    Packed(Packed),
     Table(Table),
 }
 
@@ -202,7 +431,7 @@ impl Hash {
     #[must_use]
     pub fn new() -> Hash {
         Hash {
-            body: Body::Packed(Listpack::new()),
+            body: Body::Packed(Packed::new()),
         }
     }
 
@@ -226,7 +455,8 @@ impl Hash {
     #[inline]
     #[must_use]
     pub const fn encoding(&self) -> Encoding {
-        match self.body {
+        match &self.body {
+            Body::Packed(p) if p.ex => Encoding::ListpackEx,
             Body::Packed(_) => Encoding::Listpack,
             Body::Table(_) => Encoding::Hashtable,
         }
@@ -237,9 +467,7 @@ impl Hash {
     #[must_use]
     pub fn len(&self) -> usize {
         match &self.body {
-            // Two elements a field, and a listpack that held an odd number of
-            // them would be a bug somewhere above rather than a half field.
-            Body::Packed(lp) => lp.len() / 2,
+            Body::Packed(p) => p.len(),
             Body::Table(t) => t.fields.len(),
         }
     }
@@ -255,12 +483,15 @@ impl Hash {
     }
 
     /// What is stored against `field`. This is `HGET`.
+    ///
+    /// A field past its deadline is still here until [`Hash::reap`] runs, and
+    /// the keyspace runs it before any command, so what this finds is live.
     #[must_use]
     pub fn get(&self, field: &[u8]) -> Option<Text<'_>> {
         match &self.body {
-            Body::Packed(lp) => {
-                let at = lp.find(field, 2)?;
-                lp.get(at + 1)
+            Body::Packed(p) => {
+                let at = p.find(field)?;
+                p.lp.get(at + 1)
             }
             Body::Table(t) => t.get(field).map(Text::Str),
         }
@@ -270,7 +501,7 @@ impl Hash {
     #[must_use]
     pub fn contains(&self, field: &[u8]) -> bool {
         match &self.body {
-            Body::Packed(lp) => lp.find(field, 2).is_some(),
+            Body::Packed(p) => p.find(field).is_some(),
             Body::Table(t) => t.fields.contains(field),
         }
     }
@@ -296,9 +527,10 @@ impl Hash {
     #[must_use]
     pub fn at(&self, index: usize) -> Option<(Text<'_>, Text<'_>)> {
         match &self.body {
-            Body::Packed(lp) => {
-                let field = lp.get(index * 2)?;
-                let value = lp.get(index * 2 + 1)?;
+            Body::Packed(p) => {
+                let at = index * p.step();
+                let field = p.lp.get(at)?;
+                let value = p.lp.get(at + 1)?;
                 Some((field, value))
             }
             Body::Table(t) => {
@@ -345,25 +577,21 @@ impl Hash {
     ///
     /// Answers whether the field is new, which is the number `HSET` reports.
     pub fn set(&mut self, field: &[u8], value: &[u8], limits: &Limits) -> bool {
-        if let Body::Packed(lp) = &mut self.body {
+        if let Body::Packed(p) = &mut self.body {
             // Redis checks both sides against the value limit before it writes,
             // in hashTypeTryConversion, so a pair too long for the band converts
             // the hash and is never briefly stored in a listpack that should not
             // hold it.
             if field.len() > limits.max_listpack_value || value.len() > limits.max_listpack_value {
                 self.become_table(1);
-            } else if let Some(at) = lp.find(field, 2) {
-                lp.replace(at + 1, value);
-                return false;
             } else {
-                lp.push(field);
-                lp.push(value);
+                let fresh = p.set(field, value);
                 // Strictly greater, so the 128th field is still a listpack and
                 // the 129th is not.
-                if lp.len() / 2 > limits.max_listpack_entries {
+                if fresh && p.len() > limits.max_listpack_entries {
                     self.become_table(0);
                 }
-                return true;
+                return fresh;
             }
         }
         match &mut self.body {
@@ -377,13 +605,174 @@ impl Hash {
     /// Never demotes, which is Y4's one-way rule and Redis's behaviour.
     pub fn remove(&mut self, field: &[u8]) -> bool {
         match &mut self.body {
-            Body::Packed(lp) => match lp.find(field, 2) {
-                // The field and its value go together, and they are adjacent,
-                // which is the whole reason the pair is stored this way round.
-                Some(at) => lp.delete(at, 2),
+            Body::Packed(p) => match p.find(field) {
+                // The field, its value and its deadline go together and they are
+                // adjacent, which is the whole reason a row is stored this way
+                // round.
+                Some(at) => p.remove_at(at),
                 None => false,
             },
             Body::Table(t) => t.remove(field),
+        }
+    }
+
+    /// The earliest deadline any field here has, or `None`.
+    ///
+    /// A bound and not the answer, which [`crate::ttl`] explains: it can be
+    /// earlier than the truth and never later, so acting on it wastes a walk at
+    /// worst and cannot miss an expiry. M5's active cycle is the other caller.
+    #[inline]
+    #[must_use]
+    pub fn soonest_deadline(&self) -> Option<u64> {
+        match &self.body {
+            Body::Packed(p) if p.soonest == NONE => None,
+            Body::Packed(p) => Some(p.soonest),
+            Body::Table(t) => t.ttl.soonest(),
+        }
+    }
+
+    /// Drop every field whose deadline has passed, and say how many went.
+    ///
+    /// The keyspace calls this before every hash command, so it has to be cheap
+    /// on a hash that has no deadlines at all, and it is: one load and one
+    /// comparison. Only a hash that has actually been given a deadline that has
+    /// actually passed pays for the walk.
+    ///
+    /// The caller deletes the key when this empties the hash, the same way it
+    /// does after an `HDEL` that takes the last field, because an empty hash is
+    /// not a thing Redis stores.
+    pub fn reap(&mut self, now: u64) -> usize {
+        match self.soonest_deadline() {
+            Some(soonest) if soonest <= now => {}
+            _ => return 0,
+        }
+        match &mut self.body {
+            Body::Packed(p) => {
+                let gone = p.reap(now);
+                // The bound has been leaning early and this walk is the one that
+                // knows the truth, so it is the one that pays to fix it.
+                p.soonest = p.earliest();
+                gone
+            }
+            Body::Table(t) => {
+                let mut gone = 0;
+                let mut row = 0;
+                while row < t.fields.len() {
+                    if t.ttl.is_expired(row, now) {
+                        // The last row moves into this one, so stay put and look
+                        // at whatever landed here.
+                        t.remove_at(row);
+                        gone += 1;
+                    } else {
+                        row += 1;
+                    }
+                }
+                t.ttl.refresh_soonest();
+                gone
+            }
+        }
+    }
+
+    /// Put a deadline on `field`, in absolute unix milliseconds.
+    ///
+    /// This is the whole `HEXPIRE` family, which all turn their argument into an
+    /// absolute millisecond before they get here. [`Applied::Deleted`] means the
+    /// deadline had already passed and the field has been taken out, which is
+    /// what makes `HEXPIRE key 0 FIELDS 1 f` a roundabout `HDEL`.
+    ///
+    /// The caller has already checked `at` against [`crate::ttl::MAX_AT`],
+    /// because Redis rejects the whole command rather than failing field by
+    /// field.
+    pub fn expire(&mut self, field: &[u8], at: u64, cond: Cond, now: u64) -> Applied {
+        match &mut self.body {
+            Body::Packed(p) => {
+                let Some(row) = p.find(field) else {
+                    return Applied::NoField;
+                };
+                let applied = decide(p.deadline(row), at, cond, now);
+                match applied {
+                    Applied::Ok => {
+                        // Widening moves every row, so the position has to be
+                        // found again. It happens once in the life of a hash.
+                        if !p.ex {
+                            p.widen();
+                        }
+                        let row = p.find(field).expect("widening kept every field");
+                        p.write_deadline(row, at);
+                        p.soonest = p.soonest.min(at);
+                    }
+                    Applied::Deleted => {
+                        p.remove_at(row);
+                    }
+                    Applied::NoField | Applied::NotMet => {}
+                }
+                applied
+            }
+            Body::Table(t) => {
+                let Some(row) = t.fields.index_of(field) else {
+                    return Applied::NoField;
+                };
+                let applied = t.ttl.set(row, at, cond, now);
+                if applied == Applied::Deleted {
+                    t.remove_at(row);
+                }
+                applied
+            }
+        }
+    }
+
+    /// What deadline `field` has. This is `HTTL` and its relatives.
+    #[must_use]
+    pub fn deadline(&self, field: &[u8]) -> Ask {
+        match &self.body {
+            Body::Packed(p) => match p.find(field) {
+                None => Ask::NoField,
+                Some(at) => match p.deadline(at) {
+                    Some(at) => Ask::At(at),
+                    None => Ask::NoDeadline,
+                },
+            },
+            Body::Table(t) => match t.fields.index_of(field) {
+                None => Ask::NoField,
+                Some(row) => t.ttl.ask(row),
+            },
+        }
+    }
+
+    /// Take `field`'s deadline off. This is `HPERSIST`.
+    ///
+    /// [`Ask::NoDeadline`] means there was nothing to take off, which is the -1
+    /// Redis replies, and [`Ask::At`] hands back what was there.
+    pub fn persist(&mut self, field: &[u8]) -> Ask {
+        match &mut self.body {
+            Body::Packed(p) => {
+                let Some(at) = p.find(field) else {
+                    return Ask::NoField;
+                };
+                match p.deadline(at) {
+                    Some(was) => {
+                        p.write_deadline(at, 0);
+                        Ask::At(was)
+                    }
+                    None => Ask::NoDeadline,
+                }
+            }
+            Body::Table(t) => match t.fields.index_of(field) {
+                None => Ask::NoField,
+                Some(row) => t.ttl.clear(row),
+            },
+        }
+    }
+
+    /// How many fields carry a deadline.
+    #[must_use]
+    pub fn deadline_count(&self) -> usize {
+        match &self.body {
+            Body::Packed(p) if !p.ex => 0,
+            Body::Packed(p) => (0..p.len())
+                .filter(|i| p.deadline(i * p.step()).is_some())
+                .count(),
+            Body::Table(t) => t.ttl.len(),
         }
     }
 
@@ -391,8 +780,10 @@ impl Hash {
     #[must_use]
     pub fn memory_bytes(&self) -> usize {
         match &self.body {
-            Body::Packed(lp) => lp.byte_len(),
-            Body::Table(t) => t.fields.memory_bytes() + t.values.memory_bytes(),
+            Body::Packed(p) => p.lp.byte_len(),
+            Body::Table(t) => {
+                t.fields.memory_bytes() + t.values.memory_bytes() + t.ttl.memory_bytes()
+            }
         }
     }
 
@@ -411,18 +802,28 @@ impl Hash {
 
     /// Move to the table band, with room for `extra` more fields than are here.
     fn become_table(&mut self, extra: usize) {
-        let Body::Packed(lp) = &self.body else {
+        let Body::Packed(p) = &self.body else {
             return;
         };
-        let mut t = Table::new(lp.len() / 2 + extra);
-        let mut pair = lp.iter();
-        while let (Some(field), Some(value)) = (pair.next(), pair.next()) {
+        let mut t = Table::new(p.len() + extra);
+        for i in 0..p.len() {
+            let at = i * p.step();
+            let (Some(field), Some(value)) = (p.lp.get(at), p.lp.get(at + 1)) else {
+                break;
+            };
             // A listpack holds a field that looks like a number as a number, and
             // the table holds names as bytes, so this is where the digits get
             // written. Once, on promotion, and never again.
             let f = field.to_vec();
             let v = value.to_vec();
             t.set(&f, &v);
+            // The deadline comes over with the field. Set through Deadlines
+            // rather than written straight in, so the array gets allocated and
+            // the bound gets moved exactly the way an HEXPIRE would do it.
+            if let Some(deadline) = p.deadline(at) {
+                let row = t.fields.index_of(&f).expect("just inserted");
+                t.ttl.set(row, deadline, Cond::Always, 0);
+            }
         }
         self.body = Body::Table(t);
     }
@@ -720,6 +1121,277 @@ mod tests {
         }
         assert_eq!(small.encoding(), Encoding::Hashtable);
         assert_eq!(small.len(), 200);
+    }
+
+    /// Filled with `n` fields under `limits`, `f0` through `f{n-1}`.
+    fn filled(n: u32, limits: &Limits) -> Hash {
+        let mut h = Hash::new();
+        for i in 0..n {
+            h.set(
+                format!("f{i}").as_bytes(),
+                format!("v{i}").as_bytes(),
+                limits,
+            );
+        }
+        h
+    }
+
+    #[test]
+    fn the_packed_band_widens_the_first_time_a_field_is_given_a_deadline() {
+        let mut h = filled(3, &SMALL);
+        assert_eq!(h.encoding(), Encoding::Listpack);
+        assert_eq!(h.deadline(b"f1"), Ask::NoDeadline);
+
+        assert_eq!(h.expire(b"f1", 5000, Cond::Always, 0), Applied::Ok);
+        assert_eq!(h.encoding(), Encoding::ListpackEx, "three wide now");
+
+        // And everything that was there is still there, still paired up.
+        assert_eq!(h.len(), 3);
+        assert_eq!(
+            pairs(&h),
+            [
+                ("f0".to_owned(), "v0".to_owned()),
+                ("f1".to_owned(), "v1".to_owned()),
+                ("f2".to_owned(), "v2".to_owned()),
+            ]
+        );
+        assert_eq!(h.deadline(b"f1"), Ask::At(5000));
+        assert_eq!(h.deadline(b"f0"), Ask::NoDeadline, "and only that one");
+        assert_eq!(h.deadline(b"nope"), Ask::NoField);
+        assert_eq!(h.deadline_count(), 1);
+        assert_eq!(h.soonest_deadline(), Some(5000));
+    }
+
+    #[test]
+    fn the_table_band_keeps_deadlines_beside_the_rows() {
+        let mut h = filled(3, &AS_TABLE);
+        assert_eq!(h.encoding(), Encoding::Hashtable);
+        assert_eq!(h.expire(b"f1", 5000, Cond::Always, 0), Applied::Ok);
+        assert_eq!(
+            h.encoding(),
+            Encoding::Hashtable,
+            "the table has nothing to widen"
+        );
+        assert_eq!(h.deadline(b"f1"), Ask::At(5000));
+        assert_eq!(h.deadline(b"f0"), Ask::NoDeadline);
+        assert_eq!(h.deadline(b"nope"), Ask::NoField);
+        assert_eq!(h.deadline_count(), 1);
+        assert_eq!(h.soonest_deadline(), Some(5000));
+    }
+
+    #[test]
+    fn a_field_is_reaped_only_once_its_moment_has_passed() {
+        for limits in [&SMALL, &AS_TABLE] {
+            let mut h = filled(3, limits);
+            h.expire(b"f1", 1000, Cond::Always, 0);
+
+            assert_eq!(h.reap(999), 0, "not yet");
+            assert_eq!(h.len(), 3);
+            assert!(h.contains(b"f1"), "and it is still readable until then");
+
+            assert_eq!(h.reap(1000), 1, "the deadline itself has passed");
+            assert_eq!(h.len(), 2);
+            assert!(!h.contains(b"f1"));
+            assert!(h.contains(b"f0") && h.contains(b"f2"), "and only that one");
+            assert_eq!(h.reap(1000), 0, "twice takes nothing");
+            assert_eq!(h.soonest_deadline(), None, "the bound is exact again");
+        }
+    }
+
+    #[test]
+    fn a_hash_with_no_deadlines_is_reaped_without_a_walk() {
+        for limits in [&SMALL, &AS_TABLE] {
+            let mut h = filled(50, limits);
+            assert_eq!(h.soonest_deadline(), None);
+            assert_eq!(h.reap(u64::MAX), 0);
+            assert_eq!(h.len(), 50);
+        }
+    }
+
+    #[test]
+    fn a_write_clears_the_deadline_it_wrote_over() {
+        for limits in [&SMALL, &AS_TABLE] {
+            let mut h = filled(3, limits);
+            h.expire(b"f1", 1000, Cond::Always, 0);
+            assert_eq!(h.deadline(b"f1"), Ask::At(1000));
+
+            assert!(!h.set(b"f1", b"fresh", limits), "not a new field");
+            assert_eq!(
+                h.deadline(b"f1"),
+                Ask::NoDeadline,
+                "and HSET took the deadline off"
+            );
+            assert_eq!(h.reap(u64::MAX), 0, "so nothing expires it");
+            assert_eq!(h.get(b"f1").map(text), Some(b"fresh".to_vec()));
+        }
+    }
+
+    #[test]
+    fn a_deadline_already_past_deletes_the_field_instead_of_being_stored() {
+        for limits in [&SMALL, &AS_TABLE] {
+            let mut h = filled(3, limits);
+            assert_eq!(h.expire(b"f1", 500, Cond::Always, 500), Applied::Deleted);
+            assert!(!h.contains(b"f1"));
+            assert_eq!(h.len(), 2);
+            assert_eq!(h.deadline_count(), 0);
+            assert_eq!(h.expire(b"gone", 9000, Cond::Always, 0), Applied::NoField);
+        }
+    }
+
+    #[test]
+    fn the_conditions_reach_both_bands_the_same_way() {
+        for limits in [&SMALL, &AS_TABLE] {
+            let mut h = filled(2, limits);
+            assert_eq!(h.expire(b"f0", 1000, Cond::AlreadySet, 0), Applied::NotMet);
+            assert_eq!(h.deadline(b"f0"), Ask::NoDeadline);
+            assert_eq!(h.expire(b"f0", 1000, Cond::NotSet, 0), Applied::Ok);
+            assert_eq!(h.expire(b"f0", 2000, Cond::NotSet, 0), Applied::NotMet);
+            assert_eq!(h.expire(b"f0", 500, Cond::Greater, 0), Applied::NotMet);
+            assert_eq!(h.expire(b"f0", 2000, Cond::Greater, 0), Applied::Ok);
+            assert_eq!(h.deadline(b"f0"), Ask::At(2000));
+            // The condition is checked before the past deadline is, so this is
+            // a 0 and the field survives rather than being deleted.
+            assert_eq!(h.expire(b"f0", 0, Cond::NotSet, 5), Applied::NotMet);
+            assert!(h.contains(b"f0"));
+        }
+    }
+
+    #[test]
+    fn persisting_takes_the_deadline_off_and_says_what_was_there() {
+        for limits in [&SMALL, &AS_TABLE] {
+            let mut h = filled(3, limits);
+            h.expire(b"f1", 1000, Cond::Always, 0);
+
+            assert_eq!(h.persist(b"f1"), Ask::At(1000));
+            assert_eq!(
+                h.persist(b"f1"),
+                Ask::NoDeadline,
+                "twice is -1, not an error"
+            );
+            assert_eq!(h.persist(b"gone"), Ask::NoField);
+            assert_eq!(h.deadline_count(), 0);
+            assert_eq!(h.reap(u64::MAX), 0, "and it does not expire any more");
+            assert_eq!(h.len(), 3);
+        }
+    }
+
+    /// The one that would silently give a deadline to the wrong field.
+    #[test]
+    fn deadlines_follow_their_fields_through_a_removal() {
+        for limits in [&SMALL, &AS_TABLE] {
+            let mut h = filled(5, limits);
+            // Each field's deadline is derived from its own name, so a deadline
+            // that has drifted is visible rather than merely plausible.
+            for i in 0..5u32 {
+                assert_eq!(
+                    h.expire(
+                        format!("f{i}").as_bytes(),
+                        1000 + u64::from(i),
+                        Cond::Always,
+                        0
+                    ),
+                    Applied::Ok
+                );
+            }
+            // The table swap removes, so taking a middle field out moves the
+            // last row into the hole.
+            assert!(h.remove(b"f1"));
+
+            assert_eq!(h.len(), 4);
+            for i in [0u32, 2, 3, 4] {
+                assert_eq!(
+                    h.deadline(format!("f{i}").as_bytes()),
+                    Ask::At(1000 + u64::from(i)),
+                    "f{i} kept someone else's deadline"
+                );
+            }
+            assert_eq!(h.deadline_count(), 4);
+        }
+    }
+
+    #[test]
+    fn a_deadline_comes_over_with_its_field_on_promotion() {
+        let mut h = Hash::new();
+        for i in 0..128u32 {
+            h.set(format!("f{i}").as_bytes(), b"v", &SMALL);
+        }
+        h.expire(b"f7", 4000, Cond::Always, 0);
+        h.expire(b"f9", 2000, Cond::Always, 0);
+        assert_eq!(h.encoding(), Encoding::ListpackEx);
+
+        h.set(b"one more", b"v", &SMALL);
+        assert_eq!(h.encoding(), Encoding::Hashtable, "and now it is a table");
+
+        assert_eq!(h.len(), 129);
+        assert_eq!(h.deadline(b"f7"), Ask::At(4000));
+        assert_eq!(h.deadline(b"f9"), Ask::At(2000));
+        assert_eq!(h.deadline(b"f8"), Ask::NoDeadline);
+        assert_eq!(h.deadline_count(), 2);
+        assert_eq!(h.soonest_deadline(), Some(2000));
+
+        assert_eq!(h.reap(3000), 1, "f9 and not f7");
+        assert!(!h.contains(b"f9") && h.contains(b"f7"));
+    }
+
+    #[test]
+    fn a_widened_hash_still_scans_and_draws_every_pair_once() {
+        for hint in [0usize, 2000] {
+            let mut h = Hash::with_hint(hint, &SMALL);
+            for i in 0..100u32 {
+                h.set(
+                    format!("f{i}").as_bytes(),
+                    format!("v{i}").as_bytes(),
+                    &SMALL,
+                );
+            }
+            h.expire(b"f42", 9000, Cond::Always, 0);
+
+            let mut seen: Vec<(String, String)> = Vec::new();
+            let mut cursor = Cursor::START;
+            loop {
+                cursor = h.scan(cursor, 7, |f, v| {
+                    seen.push((
+                        String::from_utf8(text(f)).expect("utf8"),
+                        String::from_utf8(text(v)).expect("utf8"),
+                    ));
+                });
+                if cursor.is_end() {
+                    break;
+                }
+            }
+            seen.sort();
+            assert_eq!(seen.len(), 100, "at hint {hint}");
+            assert_eq!(seen, pairs(&h), "at hint {hint}");
+
+            // And the draw positions still pair a field with its own value.
+            for i in 0..h.len() {
+                let (f, v) = h.at(i).expect("under the length");
+                let f = String::from_utf8(text(f)).expect("utf8");
+                let v = String::from_utf8(text(v)).expect("utf8");
+                assert_eq!(
+                    v,
+                    f.replace('f', "v"),
+                    "row {i} paired wrongly at hint {hint}"
+                );
+            }
+        }
+    }
+
+    /// Reaping takes every field that is due, including two in a row, which is
+    /// where a walk that stepped past the row it just removed would go wrong.
+    #[test]
+    fn a_run_of_expired_fields_all_go_together() {
+        for limits in [&SMALL, &AS_TABLE] {
+            let mut h = filled(6, limits);
+            for i in [1u32, 2, 3] {
+                h.expire(format!("f{i}").as_bytes(), 100, Cond::Always, 0);
+            }
+            assert_eq!(h.reap(200), 3);
+            assert_eq!(h.len(), 3);
+            for i in [0u32, 4, 5] {
+                assert!(h.contains(format!("f{i}").as_bytes()), "f{i} went too");
+            }
+        }
     }
 
     #[test]

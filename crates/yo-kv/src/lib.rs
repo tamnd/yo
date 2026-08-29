@@ -19,6 +19,9 @@
 //!
 //! The string type, which is the first row of M2, and all 26 of its commands.
 //!
+//! The hash, in both of its representations and with field TTL, which is the
+//! `HEXPIRE` family and the third answer `OBJECT ENCODING` can give.
+//!
 //! The set, which is the first row of M3, in all seventeen of its commands:
 //! `SADD`, `SREM`, `SCARD`, `SISMEMBER`, `SMISMEMBER`, `SMEMBERS`, `SPOP`,
 //! `SRANDMEMBER`, `SSCAN`, `SMOVE`, `SINTER`, `SINTERCARD`, `SUNION`, `SDIFF`
@@ -106,5 +109,5 @@ pub use set::{Limits as SetLimits, Member, Set};
 pub use setops::Plan;
 pub use slab::{MAX_SLOTS, Slab};
 pub use strings::{Exists, Expire, KEY_MAX, STRING_MAX, SetOptions, SetOutcome};
-pub use ttl::{Deadlines, MAX_AT};
+pub use ttl::{Applied, Ask, Cond, Deadlines, MAX_AT};
 pub use value::{EMBSTR_MAX, Encoding, Kind, Str};

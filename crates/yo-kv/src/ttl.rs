@@ -344,13 +344,12 @@ impl Deadlines {
         );
         self.check();
         let prev = self.get(row);
-        if !allowed(prev, at, cond) {
-            return Applied::NotMet;
-        }
-        if at <= now {
-            // Redis clears nothing here: it deletes the field, and the field
-            // taking its deadline with it is the caller calling removed().
-            return Applied::Deleted;
+        match decide(prev, at, cond, now) {
+            Applied::Ok => {}
+            // Redis clears nothing on a past deadline: it deletes the field, and
+            // the field taking its deadline with it is the caller calling
+            // removed().
+            other => return other,
         }
         if self.at.is_empty() {
             // First deadline in this collection. This is the allocation Y20 is
@@ -389,6 +388,29 @@ impl Deadlines {
     pub fn memory_bytes(&self) -> usize {
         self.at.capacity() * size_of::<u64>()
     }
+}
+
+/// What setting this deadline over that one does, before anything is stored.
+///
+/// Public because a hash in the listpack band keeps its deadlines in the
+/// listpack rather than in a [`Deadlines`], and the rule about what `NX`, `XX`,
+/// `GT` and `LT` allow has to be one rule and not one per band. The band that
+/// has a [`Deadlines`] reaches it through [`Deadlines::set`], and the band that
+/// does not calls this and then writes the number itself.
+///
+/// Never answers [`Applied::NoField`], since establishing that the field exists
+/// is what the caller did to have a `prev` to pass in.
+#[must_use]
+pub const fn decide(prev: Option<u64>, at: u64, cond: Cond, now: u64) -> Applied {
+    if !allowed(prev, at, cond) {
+        return Applied::NotMet;
+    }
+    // The condition is checked first, so HEXPIRE 0 XX on a field with no
+    // deadline is 0 and not 2, and the field survives it.
+    if at <= now {
+        return Applied::Deleted;
+    }
+    Applied::Ok
 }
 
 /// Whether the condition lets this deadline replace that one.

@@ -28,7 +28,7 @@
 
 use yo_common::{Code, Error, Result, glob_matches, parse_i64};
 use yo_kv::hash::Text;
-use yo_kv::{Cursor, Keyspace};
+use yo_kv::{Ask, Cond, Cursor, Keyspace};
 
 use super::args::{self, Args};
 use super::table::Spec;
@@ -42,6 +42,22 @@ const NOT_AN_INT: &str = "value is not an integer or out of range";
 const NOT_A_FLOAT: &str = "value is not a valid float";
 /// What `HSCAN` walks when the client does not say.
 const SCAN_COUNT: usize = 10;
+/// What the `HEXPIRE` family says about a negative time.
+///
+/// Not the same message an out of range one gets, which is easy to miss: a
+/// negative argument is refused outright rather than being read as a moment that
+/// has already passed, so `HEXPIRE key -1` is an error where `HEXPIRE key 0` is
+/// a delete.
+const BAD_EXPIRE: &str = "invalid expire time, must be >= 0";
+/// And what it says when the count of fields does not match the fields.
+///
+/// Redis leaves the command name off this one where it puts it on every other
+/// arity message, which reads like an oversight and is what a client sees.
+const FIELD_COUNT: &str = "wrong number of arguments";
+/// And when `numfields` is not a count at all.
+const BAD_NUMFIELDS: &str = "Parameter `numFields` should be greater than 0";
+/// A thousand milliseconds, for the commands that count in seconds.
+const SECOND: i64 = 1000;
 
 /// Run one hash command.
 pub(super) fn execute(db: &mut Keyspace, spec: &Spec, args: Args<'_>, out: &mut Out) -> Result<()> {
@@ -124,6 +140,13 @@ pub(super) fn execute(db: &mut Keyspace, spec: &Spec, args: Args<'_>, out: &mut 
         }
         "hrandfield" => randfield(db, args, out)?,
         "hscan" => scan(db, args, out)?,
+        // The field TTL family. All four setters turn into one absolute
+        // millisecond and all five readers turn into one question, which is why
+        // there are two helpers here and not nine.
+        "hexpire" | "hpexpire" | "hexpireat" | "hpexpireat" => expire(db, spec.name, args, out)?,
+        "httl" | "hpttl" | "hexpiretime" | "hpexpiretime" | "hpersist" => {
+            ask(db, spec.name, args, out)?;
+        }
         other => unreachable!("{other} is not a hash command"),
     }
     Ok(())
@@ -243,6 +266,171 @@ fn scan(db: &mut Keyspace, args: Args<'_>, out: &mut Out) -> Result<()> {
     let cursor = out.len() - at - body;
     out.hoist(at, cursor);
     Ok(())
+}
+
+/// `HEXPIRE`, `HPEXPIRE`, `HEXPIREAT` and `HPEXPIREAT`.
+///
+/// `key ttl [NX|XX|GT|LT] FIELDS numfields field [field ...]`, and the four
+/// differ only in what the number means: seconds or milliseconds, and from now
+/// or from the epoch. All four become one absolute millisecond here, so the
+/// store has one method and the condition rules are applied in one place.
+///
+/// Redis refuses a negative number outright rather than reading it as a moment
+/// that has already gone, so `HEXPIRE key -1` is an error while `HEXPIRE key 0`
+/// deletes the field. Both messages are its, and they are different messages.
+fn expire(db: &mut Keyspace, name: &str, args: Args<'_>, out: &mut Out) -> Result<()> {
+    let by = args.int(2)?;
+    if by < 0 {
+        return Err(Error::new(Code::Invalid, BAD_EXPIRE));
+    }
+    let (cond, from) = condition(args, 3)?;
+    let fields = field_list(args, from, name)?;
+
+    // The p is milliseconds and the at is absolute, which is the whole of the
+    // difference between the four.
+    let relative = matches!(name, "hexpire" | "hpexpire");
+    let scale = if matches!(name, "hpexpire" | "hpexpireat") {
+        1
+    } else {
+        SECOND
+    };
+    // Everything past here is in milliseconds. An overflow means a number no
+    // deadline could ever be, which is the out of range message and not the
+    // negative one, and it is checked before any field is touched.
+    let at = by
+        .checked_mul(scale)
+        .and_then(|ms| {
+            if relative {
+                ms.checked_add(db.clock().now_ms() as i64)
+            } else {
+                Some(ms)
+            }
+        })
+        .and_then(|ms| u64::try_from(ms).ok())
+        .ok_or_else(|| out_of_range(name))?;
+
+    out.array(fields.len());
+    db.hexpire(args.get(1), at, cond, fields.iter(args), |applied| {
+        out.int(applied as i64);
+    })
+    .map_err(|e| {
+        // The store's own ceiling check, which the arithmetic above can reach
+        // without overflowing. Reported with the command name the way Redis
+        // reports it rather than with the store's wording.
+        if e.code() == Code::Invalid {
+            out_of_range(name)
+        } else {
+            e
+        }
+    })
+}
+
+/// `HTTL`, `HPTTL`, `HEXPIRETIME`, `HPEXPIRETIME` and `HPERSIST`.
+///
+/// `key FIELDS numfields field [field ...]` for all five. The first four are the
+/// same question answered in four units, and `HPERSIST` asks the same question
+/// and then takes the deadline off, which is why it is here and not with the
+/// writers: its reply is built out of the same three cases.
+fn ask(db: &mut Keyspace, name: &str, args: Args<'_>, out: &mut Out) -> Result<()> {
+    let fields = field_list(args, 2, name)?;
+    out.array(fields.len());
+    let now = db.clock().now_ms();
+    if name == "hpersist" {
+        return db.hpersist(args.get(1), fields.iter(args), |asked| {
+            out.int(match asked {
+                Ask::NoField => -2,
+                Ask::NoDeadline => -1,
+                // Redis replies 1 for a deadline taken off and does not say
+                // what it was, so the moment is dropped here.
+                Ask::At(_) => 1,
+            });
+        });
+    }
+    // What is left against when it falls due, and seconds against
+    // milliseconds. The two sentinels, -2 and -1, are the same in every unit,
+    // so only a real answer is converted.
+    let left = name == "httl" || name == "hpttl";
+    let millis = name == "hpttl" || name == "hpexpiretime";
+    db.httl(args.get(1), fields.iter(args), |asked| {
+        let ms = if left {
+            asked.remaining_ms(now)
+        } else {
+            match asked {
+                Ask::NoField => -2,
+                Ask::NoDeadline => -1,
+                Ask::At(at) => at as i64,
+            }
+        };
+        out.int(if millis || ms < 0 {
+            ms
+        } else {
+            // Rounded up, so a field with half a second left answers 1 and not
+            // 0, which is what Redis does and is the answer a client can act
+            // on. i64::div_ceil is still unstable, and this arm has already
+            // established that the number is not negative.
+            (ms + SECOND - 1) / SECOND
+        });
+    })
+}
+
+/// Where the fields of a field TTL command are, once `FIELDS numfields` is read.
+///
+/// The count has to match what follows exactly. Redis checks it and refuses the
+/// command, which matters more than it looks: a client that miscounted has sent
+/// a command that would otherwise silently expire the wrong number of fields.
+#[derive(Debug, Clone, Copy)]
+struct Fields {
+    from: usize,
+    len: usize,
+}
+
+impl Fields {
+    #[inline]
+    const fn len(self) -> usize {
+        self.len
+    }
+
+    #[inline]
+    fn iter(self, args: Args<'_>) -> impl Iterator<Item = &[u8]> {
+        (self.from..self.from + self.len).map(move |i| args.get(i))
+    }
+}
+
+/// Read `FIELDS numfields field [field ...]` starting at `at`.
+fn field_list(args: Args<'_>, at: usize, name: &str) -> Result<Fields> {
+    if !args::is(args.get(at), b"fields") {
+        return Err(args::wrong_arity(name));
+    }
+    let n = args.int(at + 1)?;
+    if n < 1 {
+        return Err(Error::new(Code::Invalid, BAD_NUMFIELDS));
+    }
+    let len = usize::try_from(n).unwrap_or(usize::MAX);
+    let from = at + 2;
+    if args.len() != from + len {
+        return Err(Error::new(Code::Invalid, FIELD_COUNT));
+    }
+    Ok(Fields { from, len })
+}
+
+/// The optional `NX`, `XX`, `GT` or `LT`, and where the rest starts.
+fn condition(args: Args<'_>, at: usize) -> Result<(Cond, usize)> {
+    let cond = match args.get(at) {
+        a if args::is(a, b"nx") => Cond::NotSet,
+        a if args::is(a, b"xx") => Cond::AlreadySet,
+        a if args::is(a, b"gt") => Cond::Greater,
+        a if args::is(a, b"lt") => Cond::Less,
+        _ => return Ok((Cond::Always, at)),
+    };
+    Ok((cond, at + 1))
+}
+
+/// `ERR invalid expire time in 'x' command`, which is the out of range one.
+fn out_of_range(name: &str) -> Error {
+    Error::new(
+        Code::Invalid,
+        format!("invalid expire time in '{name}' command"),
+    )
 }
 
 /// The field and value pairs of an `HSET`, without collecting them.
