@@ -37,7 +37,7 @@ use yo_common::num::{parse_f64, parse_i64};
 use yo_common::{Code, Error, Result};
 
 use crate::hash::{Hash, Text};
-use crate::keyspace::{Keyspace, wrong_type};
+use crate::keyspace::Keyspace;
 use crate::scan::Cursor;
 use crate::strings;
 use crate::ttl::{self, Applied, Ask, Cond};
@@ -705,11 +705,8 @@ impl Keyspace {
     /// This is the one place a hash command finds its body, so it is the one
     /// place that has to reap first and answer `WRONGTYPE` for another type.
     fn hash_slot(&mut self, key: &[u8]) -> Result<Option<u32>> {
-        self.reap(key);
-        let at = match self.map.get(key) {
-            None => return Ok(None),
-            Some(rec) if value::kind(rec) == Kind::Hash => value::slot(rec),
-            Some(_) => return Err(wrong_type()),
+        let Some(at) = self.live_slot(key, Kind::Hash)? else {
+            return Ok(None);
         };
         // And now the fields, which is the second half of lazy expiry. It runs
         // here rather than in every command so that there is one place a hash

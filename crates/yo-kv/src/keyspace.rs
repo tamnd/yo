@@ -20,7 +20,7 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use yo_common::{Code, Error, Rng};
+use yo_common::{Code, Error, Result, Rng};
 use yo_index::RawMap;
 
 use crate::Clock;
@@ -337,6 +337,40 @@ impl Keyspace {
             self.drop_key(key);
             self.expired += 1;
         }
+    }
+
+    /// The slot under `key`, having thrown the key away first if it is dead.
+    ///
+    /// `None` for a key that is not there or that was and is now reaped, and
+    /// `WRONGTYPE` for a key holding something other than `want`.
+    ///
+    /// One probe of the map, where a [`Keyspace::reap`] followed by a `get`
+    /// costs two. That pair is how every collection command used to start, so a
+    /// pipeline of sixty four `SADD` on one key hashed and probed for that key a
+    /// hundred and twenty eight times to do sixty four inserts. The reap has to
+    /// read the record and the command has to read the same record, and there
+    /// was never a reason for those to be two visits.
+    ///
+    /// It answers a number rather than the record it just read because of the
+    /// borrow checker and not because a number is nicer. A method that hands
+    /// back a borrow of the map on one path and takes a mutable borrow to reap
+    /// on the other is the case the borrow checker still refuses without
+    /// Polonius. A slot is four bytes and copies out, so the borrow ends here
+    /// and the caller reaches its body through the slab.
+    pub(crate) fn live_slot(&mut self, key: &[u8], want: Kind) -> Result<Option<u32>> {
+        let now = self.clock.now_ms();
+        let Some(rec) = self.map.get(key) else {
+            return Ok(None);
+        };
+        if value::is_expired(rec, now) {
+            self.drop_key(key);
+            self.expired += 1;
+            return Ok(None);
+        }
+        if value::kind(rec) != want {
+            return Err(wrong_type());
+        }
+        Ok(Some(value::slot(rec)))
     }
 
     /// Throw every key away. This is `FLUSHDB` on one database.

@@ -12,7 +12,7 @@
 //! keyspace reads the clock only once something in it has a deadline. Those two
 //! rows are what that rule is worth.
 
-use criterion::{Criterion, Throughput, criterion_group, criterion_main};
+use criterion::{BatchSize, Criterion, Throughput, criterion_group, criterion_main};
 use std::hint::black_box;
 use std::time::Duration;
 use yo::MEMORY;
@@ -167,6 +167,80 @@ fn bench_mset(c: &mut Criterion) {
     g.finish();
 }
 
+/// A set of `n` members under `s`, for the rows that empty one.
+fn set_of(n: usize) -> yo_kv::Keyspace {
+    let mut store = yo_kv::Keyspace::new();
+    let members: Vec<String> = (0..n).map(|i| format!("m{i}")).collect();
+    store
+        .sadd(b"s", members.iter().map(|m| m.as_bytes()))
+        .expect("a set");
+    store
+}
+
+/// The two set shapes on the hot key gate row, `SADD` onto one key and `SPOP`
+/// off it. Both are `store/` rows, because the typed set API is not here yet.
+///
+/// `sadd/hot` is a single member onto one key over and over, which is the shape
+/// with no spread to exploit and the one aki came in at 0.82x on. The set is
+/// held at a thousand members so the row measures the lookup and the membership
+/// check rather than the growth of an ever larger table.
+///
+/// The two `spop` rows are the two draws: the copying one an embedded caller
+/// gets, which builds a `Vec` per member, and the borrowing one the wire takes,
+/// which writes each member where the caller wants it and allocates nothing.
+/// The gap between them is what `SPOP` used to pay on every reply.
+fn bench_sets(c: &mut Criterion) {
+    let mut g = c.benchmark_group("sadd");
+    g.throughput(Throughput::Elements(1));
+
+    g.bench_function("store/hot", |b| {
+        let mut store = set_of(1_000);
+        // Built up front, because a `format!` inside the timed loop would be an
+        // allocation a call and this row exists to measure the ones inside.
+        let members: Vec<String> = (0..1_024).map(|i| format!("m{i}")).collect();
+        let mut i = 0usize;
+        b.iter(|| {
+            i = (i + 1) & 1_023;
+            black_box(
+                store
+                    .sadd(b"s", std::iter::once(members[i].as_bytes()))
+                    .expect("a set"),
+            )
+        });
+    });
+    g.finish();
+
+    // A thousand members a call, so the setup that refills the set is not what
+    // is being timed.
+    const POP: usize = 1_000;
+    let mut g = c.benchmark_group("spop");
+    g.throughput(Throughput::Elements(POP as u64));
+
+    g.bench_function("store/copy", |b| {
+        b.iter_batched_ref(
+            || set_of(POP),
+            |store| black_box(store.spop_n(b"s", POP).expect("a set").len()),
+            BatchSize::LargeInput,
+        );
+    });
+
+    g.bench_function("store/into", |b| {
+        b.iter_batched_ref(
+            || set_of(POP),
+            |store| {
+                let mut bytes = 0;
+                store
+                    .spop_into(b"s", POP, |m| bytes += m.byte_len())
+                    .expect("a set");
+                black_box(bytes)
+            },
+            BatchSize::LargeInput,
+        );
+    });
+
+    g.finish();
+}
+
 /// What the clock policy saves, measured rather than asserted.
 ///
 /// Both rows are the same `GET` on the same store. The second one has had one
@@ -203,6 +277,7 @@ criterion_group!(
     bench_set,
     bench_incr,
     bench_mset,
+    bench_sets,
     bench_clock
 );
 criterion_main!(benches);
