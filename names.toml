@@ -84,21 +84,21 @@ note      = "unpublished 2020-07-16; publish refused by npm's name-similarity fi
 registry  = "npm-scope"
 name      = "yodb"
 namespace = "@yodb"
-state     = "unknown"
+state     = "reserved"
 probed    = "2026-08-29"
 owner     = "tamnd"
 fallback  = ""
-note      = "not anonymously probeable; needs NPM_TOKEN"
+note      = "org exists, 1 member(s)"
 
 [[name]]
 registry  = "npm-scope"
 name      = "tamnd"
 namespace = "@tamnd"
-state     = "unknown"
+state     = "reserved"
 probed    = "2026-08-29"
 owner     = "tamnd"
 fallback  = ""
-note      = "not anonymously probeable; needs NPM_TOKEN"
+note      = "user scope of npm account tamnd, not an org"
 
 [[name]]
 registry  = "pub.dev"
@@ -118,7 +118,7 @@ state     = "reserved"
 probed    = "2026-08-29"
 owner     = "tamnd"
 fallback  = ""
-note      = "v0.0.1 by tamnd"
+note      = "v0.0.2 by tamnd"
 
 [[name]]
 registry  = "maven-central"
@@ -134,11 +134,11 @@ note      = "in repo1 (authoritative)"
 registry  = "cocoapods"
 name      = "Yodb"
 namespace = ""
-state     = "free"
+state     = "reserved"
 probed    = "2026-08-29"
 owner     = "tamnd"
 fallback  = ""
-note      = ""
+note      = "v0.0.2 owners=tamnd"
 
 [[name]]
 registry  = "homebrew-core"

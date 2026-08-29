@@ -593,10 +593,45 @@ def p_conda(name: str, _ns: str):
 
 
 def p_cocoapods(name: str, _ns: str):
-    code, _ = get(f"https://trunk.cocoapods.org/api/v1/pods/{name}")
-    if code == 0:
+    """Whether the pod exists, and if it does, whether it is ours.
+
+    The second half of that sentence was missing. This returned `blocked` for
+    any HTTP 200, so the minute `Yodb 0.0.2` was published the row went
+    `free -> blocked` and the regression check reported our own pod as a name
+    somebody else had taken. Fourth time: `p_npm`, `p_pypi` and `p_nuget` each
+    shipped with exactly this shape and each was fixed on its own. A probe that
+    can see a name is taken and cannot see by whom is not finished, and writing
+    one is apparently the default rather than the mistake.
+
+    Trunk answers with the owners and every version in one document, so both
+    halves are one request. `blocked` needs positive evidence of a stranger.
+    """
+    code, d = get_json(f"https://trunk.cocoapods.org/api/v1/pods/{name}")
+    if code is None:
         return UNKNOWN, "unreachable"
-    return (FREE, "") if code == 404 else (BLOCKED, f"http {code}")
+    if code == 404:
+        return FREE, ""
+    if code != 200 or not isinstance(d, dict):
+        return UNKNOWN, f"http {code}"
+
+    owners = d.get("owners") or []
+    who = ",".join(o.get("name") or o.get("email") or "?" for o in owners)
+    ours = any(
+        (o.get("name") == IDENTITY) or (o.get("email") or "").endswith("@tamnd.com")
+        for o in owners
+    )
+    if not ours:
+        return BLOCKED, f"owners={who or '?'}"
+
+    # Newest by publication time and not by position: trunk returns them in
+    # publication order today, which is a fact about trunk rather than a
+    # promise, and `max()` over a version string would put 0.0.9 above 0.0.10
+    # the same way npm's would.
+    versions = [v for v in (d.get("versions") or []) if v.get("name")]
+    if not versions:
+        return UNKNOWN, f"owners={who}, no version to read"
+    latest = max(versions, key=lambda v: v.get("created_at") or "")["name"]
+    return held_state(latest), f"v{latest} owners={who}"
 
 
 def p_github_repo(name: str, ns: str):
