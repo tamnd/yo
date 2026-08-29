@@ -1041,6 +1041,196 @@ mod tests {
     }
 
     #[test]
+    fn object_says_which_rung_of_the_ladder_a_key_is_on() {
+        let mut f = Fixture::new();
+        f.run(&[b"SET", b"s", b"hello"]);
+        f.run(&[b"SET", b"n", b"123"]);
+        f.run(&[b"SADD", b"si", b"1", b"2", b"3"]);
+        f.run(&[b"SADD", b"ss", b"a", b"b"]);
+        f.run(&[b"HSET", b"h", b"f", b"v"]);
+        for (key, want) in [
+            (b"s".as_slice(), "embstr"),
+            (b"n", "int"),
+            (b"si", "intset"),
+            (b"ss", "listpack"),
+            (b"h", "listpack"),
+        ] {
+            let reply = f.run(&[b"OBJECT", b"ENCODING", key]);
+            assert_eq!(reply, format!("${}\r\n{want}\r\n", want.len()));
+        }
+
+        // A field deadline widens the blob rather than promoting it, and this
+        // is the only place a client can see that happen.
+        f.run(&[b"HEXPIRE", b"h", b"100", b"FIELDS", b"1", b"f"]);
+        assert_eq!(
+            f.run(&[b"OBJECT", b"ENCODING", b"h"]),
+            "$10\r\nlistpackex\r\n"
+        );
+
+        assert_eq!(f.run(&[b"OBJECT", b"REFCOUNT", b"s"]), ":1\r\n");
+        assert_eq!(f.run(&[b"OBJECT", b"IDLETIME", b"s"]), ":0\r\n");
+        assert!(f.run(&[b"OBJECT", b"HELP"]).starts_with("*14\r\n+OBJECT "));
+    }
+
+    #[test]
+    fn object_answers_nil_for_a_key_that_is_not_there() {
+        let mut f = Fixture::new();
+        for sub in [b"ENCODING".as_slice(), b"REFCOUNT", b"IDLETIME", b"FREQ"] {
+            assert_eq!(
+                f.run(&[b"OBJECT", sub, b"nokey"]),
+                "$-1\r\n",
+                "a nil and not an error, which is what 8.10.1 does"
+            );
+        }
+        // And the key is looked up before FREQ has its complaint, so the
+        // complaint only reaches a key that exists.
+        f.run(&[b"SET", b"s", b"v"]);
+        assert!(
+            f.run(&[b"OBJECT", b"FREQ", b"s"])
+                .starts_with("-ERR An LFU maxmemory policy is not"),
+        );
+        assert_eq!(
+            f.run(&[b"OBJECT", b"NOPE", b"s"]),
+            "-ERR unknown subcommand 'NOPE'. Try OBJECT HELP.\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"OBJECT", b"ENCODING"]),
+            "-ERR wrong number of arguments for 'object|encoding' command\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"OBJECT", b"ENCODING", b"s", b"extra"]),
+            "-ERR wrong number of arguments for 'object|encoding' command\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"OBJECT"]),
+            "-ERR wrong number of arguments for 'object' command\r\n"
+        );
+    }
+
+    #[test]
+    fn config_moves_the_ladder_and_object_encoding_agrees() {
+        let mut f = Fixture::new();
+        assert_eq!(
+            f.run(&[b"CONFIG", b"GET", b"hash-max-listpack-entries"]),
+            "*2\r\n$25\r\nhash-max-listpack-entries\r\n$3\r\n512\r\n",
+            "512 and not the 128 everyone remembers, which is what 8.10.1 says"
+        );
+        // The old spelling is the same number under a different name, and a
+        // glob that catches both sends both.
+        assert_eq!(
+            f.run(&[b"CONFIG", b"GET", b"hash-max-ziplist-entries"]),
+            "*2\r\n$24\r\nhash-max-ziplist-entries\r\n$3\r\n512\r\n"
+        );
+        assert!(
+            f.run(&[b"CONFIG", b"GET", b"hash-max-*"])
+                .starts_with("*8\r\n")
+        );
+        assert!(
+            f.run(&[b"CONFIG", b"GET", b"set-max-*"])
+                .starts_with("*6\r\n")
+        );
+
+        f.run(&[b"HSET", b"h", b"a", b"1", b"b", b"2", b"c", b"3"]);
+        assert_eq!(f.run(&[b"OBJECT", b"ENCODING", b"h"]), "$8\r\nlistpack\r\n");
+
+        assert_eq!(
+            f.run(&[b"CONFIG", b"SET", b"hash-max-ziplist-entries", b"2"]),
+            "+OK\r\n",
+            "written under the old name and read back under the new one"
+        );
+        assert_eq!(
+            f.run(&[b"CONFIG", b"GET", b"hash-max-listpack-entries"]),
+            "*2\r\n$25\r\nhash-max-listpack-entries\r\n$1\r\n2\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"OBJECT", b"ENCODING", b"h"]),
+            "$8\r\nlistpack\r\n",
+            "the hash that already exists is left exactly where it was"
+        );
+        f.run(&[b"HSET", b"h2", b"a", b"1", b"b", b"2", b"c", b"3"]);
+        assert_eq!(
+            f.run(&[b"OBJECT", b"ENCODING", b"h2"]),
+            "$9\r\nhashtable\r\n",
+            "and the next one built goes straight to a table"
+        );
+
+        // The set has three of these and all three move.
+        f.run(&[b"CONFIG", b"SET", b"set-max-intset-entries", b"2"]);
+        f.run(&[b"SADD", b"s", b"1", b"2", b"3"]);
+        assert_eq!(f.run(&[b"OBJECT", b"ENCODING", b"s"]), "$8\r\nlistpack\r\n");
+        f.run(&[b"CONFIG", b"SET", b"set-max-listpack-value", b"2"]);
+        f.run(&[b"SADD", b"s2", b"abcdefgh"]);
+        assert_eq!(
+            f.run(&[b"OBJECT", b"ENCODING", b"s2"]),
+            "$9\r\nhashtable\r\n"
+        );
+    }
+
+    #[test]
+    fn config_set_takes_all_of_the_ladder_or_none_of_it() {
+        let mut f = Fixture::new();
+        assert_eq!(
+            f.run(&[
+                b"CONFIG",
+                b"SET",
+                b"hash-max-listpack-entries",
+                b"7",
+                b"set-max-listpack-entries",
+                b"abc"
+            ]),
+            "-ERR CONFIG SET failed (possibly related to argument 'set-max-listpack-entries') - argument couldn't be parsed into an integer\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"CONFIG", b"GET", b"hash-max-listpack-entries"]),
+            "*2\r\n$25\r\nhash-max-listpack-entries\r\n$3\r\n512\r\n",
+            "the pair in front of the bad one did not go in"
+        );
+        // The name in the complaint is the one that was typed, so the old
+        // spelling comes back as the old spelling.
+        assert_eq!(
+            f.run(&[b"CONFIG", b"SET", b"hash-max-ziplist-entries", b"abc"]),
+            "-ERR CONFIG SET failed (possibly related to argument 'hash-max-ziplist-entries') - argument couldn't be parsed into an integer\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"CONFIG", b"SET", b"set-max-intset-entries", b"-1"]),
+            "-ERR CONFIG SET failed (possibly related to argument 'set-max-intset-entries') - argument must be between 0 and 9223372036854775807 inclusive\r\n"
+        );
+        // A number past what an i64 holds is the parse complaint and not the
+        // range one, which is upstream reading it before it checks it.
+        assert_eq!(
+            f.run(&[
+                b"CONFIG",
+                b"SET",
+                b"set-max-intset-entries",
+                b"99999999999999999999"
+            ]),
+            "-ERR CONFIG SET failed (possibly related to argument 'set-max-intset-entries') - argument couldn't be parsed into an integer\r\n"
+        );
+        assert_eq!(
+            f.run(&[
+                b"CONFIG",
+                b"SET",
+                b"set-max-intset-entries",
+                b"9223372036854775807"
+            ]),
+            "+OK\r\n"
+        );
+    }
+
+    #[test]
+    fn a_setting_moved_on_one_database_moved_on_all_of_them() {
+        let mut f = Fixture::new();
+        f.run(&[b"CONFIG", b"SET", b"hash-max-listpack-entries", b"1"]);
+        f.run(&[b"SELECT", b"3"]);
+        f.run(&[b"HSET", b"h", b"a", b"1", b"b", b"2"]);
+        assert_eq!(
+            f.run(&[b"OBJECT", b"ENCODING", b"h"]),
+            "$9\r\nhashtable\r\n",
+            "these are one server wide number in Redis, whatever a Keyspace carries"
+        );
+    }
+
+    #[test]
     fn info_reports_the_numbers_it_can_stand_behind() {
         let mut f = Fixture::new();
         f.run(&[b"MSET", b"a", b"1", b"b", b"2"]);

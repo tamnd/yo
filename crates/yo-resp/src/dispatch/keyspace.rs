@@ -16,11 +16,37 @@
 //! that is `string`, `set` or `none`, and the day the hash lands it is `hash`
 //! too without a line here changing.
 
-use super::args::Args;
+use super::args::{self, Args};
 use super::table::Spec;
 use crate::reply::Out;
-use yo_common::Result;
+use yo_common::{Code, Error, Result};
 use yo_kv::Keyspace;
+
+/// What `OBJECT FREQ` says on a server that is not counting accesses.
+///
+/// Which is every server here, because there is no eviction yet, so this is the
+/// only thing it can say. Redis says it too whenever the policy is not an LFU
+/// one, and the second half about switching at runtime is upstream's wording
+/// and not ours.
+const NOT_LFU: &str = "An LFU maxmemory policy is not selected, access frequency not tracked. Please note that when switching between policies at runtime LRU and LFU data will take some time to adjust.";
+
+/// The text `OBJECT HELP` prints, one line an entry.
+const OBJECT_HELP: &[&str] = &[
+    "OBJECT <subcommand> [<arg> [value] [opt] ...]. Subcommands are:",
+    "ENCODING <key>",
+    "    Return the kind of internal representation used in order to store the value",
+    "    associated with a <key>.",
+    "FREQ <key>",
+    "    Return the access frequency index of the <key>. The returned integer is",
+    "    proportional to the logarithm of the real access frequency.",
+    "IDLETIME <key>",
+    "    Return the idle time of the <key>, that is the approximated number of",
+    "    seconds elapsed since the last access to the value.",
+    "REFCOUNT <key>",
+    "    Return the number of references of the value associated with the key.",
+    "HELP",
+    "    Print this help.",
+];
 
 /// Run one keyspace command.
 pub(super) fn execute(db: &mut Keyspace, spec: &Spec, args: Args<'_>, out: &mut Out) -> Result<()> {
@@ -60,7 +86,73 @@ pub(super) fn execute(db: &mut Keyspace, spec: &Spec, args: Args<'_>, out: &mut 
             // strings and this one is not.
             out.simple(name);
         }
+        "object" => object(db, args, out)?,
         other => unreachable!("keyspace command with no body: {other}"),
+    }
+    Ok(())
+}
+
+/// `OBJECT ENCODING | REFCOUNT | IDLETIME | FREQ key`, and `OBJECT HELP`.
+///
+/// `ENCODING` is the one worth having and the other three are here because
+/// clients call them without thinking. It is the only window onto the size
+/// ladder from outside, so it is the command that says whether the ladder is
+/// really Redis's ladder: a set of three numbers has to say `intset` and a hash
+/// of two hundred fields has to say `listpack`, at the same counts a real server
+/// says them at.
+///
+/// A missing key answers nil rather than an error, on all four. That reads like
+/// a bug and it is what 8.10.1 does, checked rather than assumed, and it used to
+/// be `no such key` years ago which is where the confusion comes from.
+fn object(db: &mut Keyspace, args: Args<'_>, out: &mut Out) -> Result<()> {
+    let sub = args.get(1);
+    if args::is(sub, b"help") {
+        if args.len() != 2 {
+            return Err(args::unknown_subcommand(sub, "OBJECT"));
+        }
+        out.array(OBJECT_HELP.len());
+        for line in OBJECT_HELP {
+            out.simple(line.as_bytes());
+        }
+        return Ok(());
+    }
+
+    let named = ["encoding", "refcount", "idletime", "freq"]
+        .into_iter()
+        .find(|n| args::is(sub, n.as_bytes()));
+    let Some(named) = named else {
+        return Err(args::unknown_subcommand(sub, "OBJECT"));
+    };
+    // The arity in the table is a minimum, so the count of a subcommand that
+    // takes exactly one key is checked here, and the name of the command it
+    // complains about is the container and the subcommand joined by a pipe.
+    if args.len() != 3 {
+        return Err(args::wrong_arity_sub("object", named));
+    }
+    // The lookup happens before FREQ refuses, so `OBJECT FREQ missing` is a nil
+    // and not the policy complaint. Same order as Redis, which reaches for the
+    // key first and asks about the policy after.
+    let key = args.get(2);
+    if !db.exists(key) {
+        out.nil();
+        return Ok(());
+    }
+    match named {
+        "encoding" => {
+            let name = db
+                .encoding_name(key)
+                .expect("the key is there, so it has an encoding");
+            out.bulk(name.as_bytes());
+        }
+        // One reference, always. Redis shares the small integers and answers a
+        // huge number for those, or it did: 8.10.1 answers 1 for `SET k 123`
+        // like it does for everything else, so 1 is the whole answer here.
+        "refcount" => out.int(1),
+        // Nothing is tracking access time, and zero is what a key just touched
+        // would say anyway, which is every key by the time this reaches it.
+        "idletime" => out.int(0),
+        "freq" => return Err(Error::new(Code::Unsupported, NOT_LFU)),
+        other => unreachable!("no body for object {other}"),
     }
     Ok(())
 }

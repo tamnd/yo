@@ -22,6 +22,7 @@ use crate::reply::Out;
 use core::fmt::Write;
 use yo_common::num::parse_i64;
 use yo_common::{Code, Error, Result, glob};
+use yo_kv::Keyspace;
 
 /// What we tell a client we are.
 ///
@@ -34,14 +35,13 @@ const REPORTED_SERVER: &str = "redis";
 /// The Redis version we answer 100 percent of, which is what `HELLO` reports.
 const REPORTED_VERSION: &str = "8.8.0";
 
-/// The settings `CONFIG GET` reports.
+/// The settings that are fixed for the life of the process.
 ///
-/// All of them are fixed for the life of the process in this milestone, so
-/// `CONFIG SET` accepts a write that changes nothing and refuses everything
-/// else rather than pretending to have taken it. A client that sets
-/// `appendonly no` on a server that already has no append only file gets an
-/// `OK` and is telling the truth; one that sets `appendonly yes` gets told it
-/// cannot, which is better than an `OK` and no file.
+/// `CONFIG SET` accepts a write to one of these that changes nothing and
+/// refuses everything else rather than pretending to have taken it. A client
+/// that sets `appendonly no` on a server that already has no append only file
+/// gets an `OK` and is telling the truth; one that sets `appendonly yes` gets
+/// told it cannot, which is better than an `OK` and no file.
 const SETTINGS: &[(&str, &str)] = &[
     ("appendonly", "no"),
     ("appendfsync", "everysec"),
@@ -52,6 +52,42 @@ const SETTINGS: &[(&str, &str)] = &[
     ("proto-max-bulk-len", "536870912"),
     ("save", ""),
     ("timeout", "0"),
+];
+
+/// Which number on the size ladder a settings name refers to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Knob {
+    SetIntsetEntries,
+    SetListpackEntries,
+    SetListpackValue,
+    HashListpackEntries,
+    HashListpackValue,
+}
+
+/// The settings that move the size ladder, which are the ones that really move.
+///
+/// These decide where a collection stops being a packed blob and becomes an
+/// element table, so they decide what `OBJECT ENCODING` answers, and a client
+/// that reads `OBJECT ENCODING` after setting one of these expects the two to
+/// agree. That is the whole reason they are writable when nothing else here is.
+///
+/// The `ziplist` spellings are the names these had before Redis renamed them
+/// and it still answers to both, so this does too. Two names, one number: a
+/// `CONFIG SET hash-max-ziplist-entries 4` shows up under the listpack name
+/// too, which was checked against 8.10.1 rather than assumed.
+///
+/// Moving one of these leaves every collection that already exists exactly as
+/// it is, and only decides what the next write builds. Redis does the same, and
+/// it is the reason `CONFIG SET set-max-listpack-entries 0` does not rewrite
+/// the keyspace.
+const LADDER: &[(&str, Knob)] = &[
+    ("hash-max-listpack-entries", Knob::HashListpackEntries),
+    ("hash-max-listpack-value", Knob::HashListpackValue),
+    ("hash-max-ziplist-entries", Knob::HashListpackEntries),
+    ("hash-max-ziplist-value", Knob::HashListpackValue),
+    ("set-max-intset-entries", Knob::SetIntsetEntries),
+    ("set-max-listpack-entries", Knob::SetListpackEntries),
+    ("set-max-listpack-value", Knob::SetListpackValue),
 ];
 
 /// Run one connection or server command.
@@ -433,6 +469,56 @@ fn write_spec(out: &mut Out, spec: &Spec) {
 
 // ------------------------------------------------------------------ CONFIG
 
+/// What a ladder setting is set to now.
+fn read_knob(db: &Keyspace, knob: Knob) -> usize {
+    match knob {
+        Knob::SetIntsetEntries => db.limits().max_intset_entries,
+        Knob::SetListpackEntries => db.limits().max_listpack_entries,
+        Knob::SetListpackValue => db.limits().max_listpack_value,
+        Knob::HashListpackEntries => db.hash_limits().max_listpack_entries,
+        Knob::HashListpackValue => db.hash_limits().max_listpack_value,
+    }
+}
+
+/// Move one ladder setting on one database.
+fn write_knob(db: &mut Keyspace, knob: Knob, n: usize) {
+    let mut set = *db.limits();
+    let mut hash = *db.hash_limits();
+    match knob {
+        Knob::SetIntsetEntries => set.max_intset_entries = n,
+        Knob::SetListpackEntries => set.max_listpack_entries = n,
+        Knob::SetListpackValue => set.max_listpack_value = n,
+        Knob::HashListpackEntries => hash.max_listpack_entries = n,
+        Knob::HashListpackValue => hash.max_listpack_value = n,
+    }
+    db.set_limits(set);
+    db.set_hash_limits(hash);
+}
+
+/// The two things a real server says about a number it will not take.
+///
+/// Both name the setting the client typed and not the one it is an alias for,
+/// so `hash-max-ziplist-entries` comes back saying `hash-max-ziplist-entries`.
+/// A value past the range of an `i64` is the parse complaint and not the range
+/// one, which is upstream reading it before it checks it.
+fn bad_setting(name: &str, parsed: bool) -> Error {
+    if parsed {
+        Error::fmt(
+            Code::Invalid,
+            format_args!(
+                "CONFIG SET failed (possibly related to argument '{name}') - argument must be between 0 and 9223372036854775807 inclusive"
+            ),
+        )
+    } else {
+        Error::fmt(
+            Code::Invalid,
+            format_args!(
+                "CONFIG SET failed (possibly related to argument '{name}') - argument couldn't be parsed into an integer"
+            ),
+        )
+    }
+}
+
 /// `CONFIG GET|SET|RESETSTAT|REWRITE|HELP`.
 fn config(server: &mut Server, args: Args<'_>, out: &mut Out) -> Result<()> {
     let sub = args.get(1);
@@ -443,11 +529,20 @@ fn config(server: &mut Server, args: Args<'_>, out: &mut Out) -> Result<()> {
         let wanted =
             |name: &str| (2..args.len()).any(|i| glob::matches(args.get(i), name.as_bytes()));
         // A setting that two patterns both ask for is sent once, which is what
-        // makes this a count of settings rather than a count of matches.
-        out.map(SETTINGS.iter().filter(|(k, _)| wanted(k)).count());
-        for (k, v) in SETTINGS.iter().filter(|(k, _)| wanted(k)) {
+        // makes this a count of settings rather than a count of matches. The
+        // two spellings of a ladder setting are two settings by that rule, so
+        // `CONFIG GET hash-max-*` sends the listpack name and the ziplist name
+        // and the same number under both, which is what a real server does.
+        let fixed = SETTINGS.iter().filter(|(k, _)| wanted(k));
+        let ladder = LADDER.iter().filter(|(k, _)| wanted(k));
+        out.map(fixed.clone().count() + ladder.clone().count());
+        for (k, v) in fixed {
             out.bulk(k.as_bytes());
             out.bulk(v.as_bytes());
+        }
+        for (k, knob) in ladder {
+            out.bulk(k.as_bytes());
+            out.bulk_int(read_knob(server.db_ref(0), *knob) as i64);
         }
     } else if is(sub, b"SET") {
         // Too few is a wrong number of arguments and an odd number is a syntax
@@ -461,9 +556,30 @@ fn config(server: &mut Server, args: Args<'_>, out: &mut Out) -> Result<()> {
         if !args.len().is_multiple_of(2) {
             return Err(args::syntax());
         }
+        // Every pair is checked before any of them is applied, because a real
+        // server takes the whole `CONFIG SET` or none of it. `CONFIG SET
+        // hash-max-listpack-entries 7 set-max-listpack-entries abc` leaves the
+        // hash setting where it was, which was checked rather than assumed.
+        let mut writes = [None; 8];
+        let mut count = 0;
         let mut i = 2;
         while i < args.len() {
             let (name, value) = (args.get(i), args.get(i + 1));
+            i += 2;
+            if let Some((k, knob)) = LADDER.iter().find(|(k, _)| is(name, k.as_bytes())) {
+                let Some(n) = parse_i64(value).filter(|&n| n >= 0) else {
+                    return Err(bad_setting(k, parse_i64(value).is_some()));
+                };
+                if count == writes.len() {
+                    // Eight pairs is more than the five settings there are, so
+                    // getting here means a name was given twice enough times to
+                    // fill it, and the last one would have won anyway.
+                    return Err(args::syntax());
+                }
+                writes[count] = Some((*knob, n as usize));
+                count += 1;
+                continue;
+            }
             let Some((k, v)) = SETTINGS.iter().find(|(k, _)| is(name, k.as_bytes())) else {
                 return Err(yo_alloc::allow(|| {
                     Error::fmt(
@@ -483,7 +599,14 @@ fn config(server: &mut Server, args: Args<'_>, out: &mut Out) -> Result<()> {
                     ),
                 ));
             }
-            i += 2;
+        }
+        // Every database, because these are one server wide number in Redis and
+        // the fact that a `Keyspace` carries its own copy is ours and not the
+        // client's problem.
+        for (knob, n) in writes.iter().flatten() {
+            for at in 0..DATABASES {
+                write_knob(server.db(at), *knob, *n);
+            }
         }
         out.ok();
     } else if is(sub, b"RESETSTAT") {
