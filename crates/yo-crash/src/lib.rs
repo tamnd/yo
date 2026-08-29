@@ -52,11 +52,13 @@
 
 pub mod fault;
 pub mod reader;
-pub mod rng;
 pub mod sink;
 pub mod trial;
 
 pub use fault::Fault;
-pub use rng::Rng;
+// The generator moved to `yo-common` when the set commands needed one too, and
+// it is re-exported here because every seed in this crate's own documentation
+// and tests reaches for `yo_crash::Rng`.
 pub use sink::{CrashSink, Image};
 pub use trial::{Outcome, Shape, Violation};
+pub use yo_common::Rng;

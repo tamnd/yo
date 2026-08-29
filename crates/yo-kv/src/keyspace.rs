@@ -18,7 +18,9 @@
 //! is reached by sending that thread a command, which is Y1, and it is why
 //! nothing here takes a lock or an atomic.
 
-use yo_common::{Code, Error};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+use yo_common::{Code, Error, Rng};
 use yo_index::RawMap;
 
 use crate::Clock;
@@ -43,7 +45,17 @@ pub struct Keyspace {
     pub(crate) bodies: usize,
     /// Where a set changes representation.
     pub(crate) limits: set::Limits,
+    /// Where `SPOP` and `SRANDMEMBER` draw from.
+    pub(crate) rng: Rng,
 }
+
+/// How many databases this process has made.
+///
+/// Mixed into a new database's seed so that the eight shards a server starts in
+/// the same millisecond do not all draw the same members in the same order. It
+/// is the only atomic in this file and it is touched once per database rather
+/// than once per command, so it is not on any path Y1 cares about.
+static MADE: AtomicU64 = AtomicU64::new(0);
 
 impl Keyspace {
     /// An empty database on the system clock.
@@ -55,6 +67,7 @@ impl Keyspace {
     /// An empty database on a clock of the caller's choosing.
     #[must_use]
     pub fn with_clock(clock: Clock) -> Keyspace {
+        let made = MADE.fetch_add(1, Ordering::Relaxed);
         Keyspace {
             map: RawMap::new(),
             clock,
@@ -62,7 +75,24 @@ impl Keyspace {
             sets: Slab::new(),
             bodies: 0,
             limits: set::Limits::DEFAULT,
+            rng: Rng::new(clock.now_ms() ^ made.wrapping_mul(0x9e37_79b9_7f4a_7c15)),
         }
+    }
+
+    /// Pin what `SPOP` and `SRANDMEMBER` draw.
+    ///
+    /// A database seeds itself from the clock and a counter, which is what a
+    /// server wants and what a test cannot assert against. Every test in this
+    /// crate that cares which member comes back calls this first, the same way
+    /// every expiry test drives a fixed clock, and for the same reason: the one
+    /// input that makes a result unrepeatable is better handed in than reached
+    /// for.
+    ///
+    /// It is public because reproducing a bug report is the same problem. A
+    /// seed printed in a crash report is worth having somewhere to put.
+    #[inline]
+    pub const fn seed(&mut self, seed: u64) {
+        self.rng = Rng::new(seed);
     }
 
     /// Where a set changes representation, which is three `CONFIG` values.

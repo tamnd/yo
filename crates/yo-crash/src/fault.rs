@@ -21,8 +21,8 @@
 //! already durable. Losing that data is allowed. Handing it back as if it were
 //! fine is not, and that is the one thing this harness exists to catch.
 
-use crate::rng::Rng;
 use crate::sink::{CrashSink, Image};
+use yo_common::Rng;
 
 /// The unit a device promises not to tear.
 ///

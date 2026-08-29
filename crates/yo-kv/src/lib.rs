@@ -19,9 +19,11 @@
 //!
 //! The string type, which is the first row of M2, and all 26 of its commands.
 //!
-//! The set, which is the first row of M3, in the six commands that the other
-//! eleven are built on: `SADD`, `SREM`, `SCARD`, `SISMEMBER`, `SMISMEMBER` and
-//! `SMEMBERS`. A [`Set`] is one of three representations and moves between them
+//! The set, which is the first row of M3, in ten of its seventeen commands:
+//! `SADD`, `SREM`, `SCARD`, `SISMEMBER`, `SMISMEMBER`, `SMEMBERS`, `SPOP`,
+//! `SRANDMEMBER`, `SSCAN` and `SMOVE`. What is left is the seven algebra
+//! commands and their store forms. A [`Set`] is one of three representations
+//! and moves between them
 //! on the same rules Redis uses, and [`Keyspace`] is where a key gets to be
 //! something other than a string: the record holds a number, the number points
 //! into a [`Slab`], and every path that deletes a key or writes over one frees

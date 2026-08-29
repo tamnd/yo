@@ -28,9 +28,12 @@
 //! Redis's and between them they cover every case, because a key is a set, or
 //! another type, or absent.
 
+use std::collections::HashSet;
+
 use yo_common::Result;
 
 use crate::keyspace::{Keyspace, wrong_type};
+use crate::scan::Cursor;
 use crate::set::{Member, Set};
 use crate::strings;
 use crate::value::{self, Kind};
@@ -155,6 +158,219 @@ impl Keyspace {
             return Ok(None);
         };
         Ok(Some(self.set_at(at).iter()))
+    }
+
+    /// `SPOP key`. Takes one member out at random and hands it back.
+    ///
+    /// This is the one set command that has to allocate, because the member it
+    /// answers with is the member it just took out of the structure holding it.
+    /// [`Keyspace::srandmember`] is the same draw without the removal and does
+    /// not allocate, which is why the two are not one method with a flag.
+    ///
+    /// The key goes when the last member does, the same as `SREM`.
+    pub fn spop(&mut self, key: &[u8]) -> Result<Option<Vec<u8>>> {
+        let Some(at) = self.set_slot(key)? else {
+            return Ok(None);
+        };
+        // A set in the keyspace is never empty, so there is always something to
+        // draw and the draw is always in range.
+        let len = self.set_at(at).len();
+        let pick = self.rng.below(len);
+        let got = self
+            .sets
+            .get_mut(at)
+            .expect("the record points at its body")
+            .remove_at(pick);
+        if self.set_at(at).is_empty() {
+            self.drop_key(key);
+        }
+        Ok(got)
+    }
+
+    /// `SPOP key count`. Takes `count` members out, or all of them if there are
+    /// fewer than that.
+    ///
+    /// Drawing from the length that is left rather than from the length it
+    /// started with is what makes the members distinct without a single test
+    /// for it. Each removal moves some other member into the hole it made and
+    /// shortens the set by one, so the next draw is over exactly the members
+    /// that are still there and every one of them is equally likely.
+    pub fn spop_n(&mut self, key: &[u8], count: usize) -> Result<Vec<Vec<u8>>> {
+        let Some(at) = self.set_slot(key)? else {
+            return Ok(Vec::new());
+        };
+        let take = count.min(self.set_at(at).len());
+        let mut out = Vec::with_capacity(take);
+        for _ in 0..take {
+            // The length is read again every turn rather than counted down,
+            // because the removal is what changed it and reading it twice is a
+            // load off a line that is already here.
+            let pick = self.rng.below(self.set_at(at).len());
+            out.push(
+                self.sets
+                    .get_mut(at)
+                    .expect("the record points at its body")
+                    .remove_at(pick)
+                    .expect("the draw was under the length"),
+            );
+        }
+        if self.set_at(at).is_empty() {
+            self.drop_key(key);
+        }
+        Ok(out)
+    }
+
+    /// `SRANDMEMBER key`, as a borrow rather than a copy.
+    ///
+    /// The member is handed to `f` where it lies, so the single draw form
+    /// allocates nothing at all: the bytes go from the set into the reply
+    /// buffer and an integer member is never written as digits anywhere in
+    /// between. That is the whole of the gate row this command has on M3, where
+    /// the loss against Redis was in the garbage rather than in the draw.
+    ///
+    /// `f` is handed `None` when the key is not there, which is a nil reply and
+    /// not an empty one.
+    pub fn srandmember<R>(
+        &mut self,
+        key: &[u8],
+        f: impl FnOnce(Option<Member<'_>>) -> R,
+    ) -> Result<R> {
+        let Some(at) = self.set_slot(key)? else {
+            return Ok(f(None));
+        };
+        let pick = self.rng.below(self.sets.get(at).expect("a body").len());
+        Ok(f(self.set_at(at).at(pick)))
+    }
+
+    /// `SRANDMEMBER key count`, which is three different commands wearing one
+    /// name.
+    ///
+    /// A negative count is the with repeats form: exactly that many members,
+    /// drawn one at a time, and the same member can come back more than once.
+    /// It is the only form that can answer more members than the set holds.
+    ///
+    /// A positive count is distinct members, at most as many as the set holds,
+    /// and it is drawn two different ways depending on how much of the set is
+    /// being asked for. Wanting more than a third of it is a walk of the whole
+    /// set picking each member with the probability that leaves the right
+    /// number at the end, which is Knuth's selection sampling and needs no
+    /// memory at all. Wanting less than that is drawing positions and throwing
+    /// away the repeats, which needs somewhere to remember what has been drawn
+    /// and is the only thing here that allocates.
+    ///
+    /// Both are `O(count)`, which is the point of having two. Selection
+    /// sampling alone would walk a million members to answer `SRANDMEMBER key
+    /// 3`, and rejection alone would draw forever as the count approached the
+    /// size. Redis splits the same way at the same ratio.
+    pub fn srandmember_n<F>(&mut self, key: &[u8], count: i64, mut f: F) -> Result<()>
+    where
+        F: FnMut(Member<'_>),
+    {
+        let Some(at) = self.set_slot(key)? else {
+            return Ok(());
+        };
+        // The two fields are borrowed apart rather than through `set_at`,
+        // because drawing and reading have to be alive at the same time and a
+        // method taking `&self` would hold the whole database.
+        let rng = &mut self.rng;
+        let set = self.sets.get(at).expect("the record points at its body");
+        let len = set.len();
+
+        let Ok(want) = usize::try_from(count) else {
+            let repeats = usize::try_from(count.unsigned_abs()).unwrap_or(usize::MAX);
+            for _ in 0..repeats {
+                f(set
+                    .at(rng.below(len))
+                    .expect("the draw was under the length"));
+            }
+            return Ok(());
+        };
+        if want >= len {
+            for m in set.iter() {
+                f(m);
+            }
+            return Ok(());
+        }
+        if want.saturating_mul(3) > len {
+            let mut need = want;
+            for i in 0..len {
+                if rng.below(len - i) < need {
+                    f(set.at(i).expect("i is under the length"));
+                    need -= 1;
+                }
+            }
+            return Ok(());
+        }
+        let mut drawn = HashSet::with_capacity(want);
+        while drawn.len() < want {
+            let i = rng.below(len);
+            if drawn.insert(i) {
+                f(set.at(i).expect("the draw was under the length"));
+            }
+        }
+        Ok(())
+    }
+
+    /// `SSCAN key cursor`. Walks part of the set and says where to resume.
+    ///
+    /// A missing key is a finished scan and not an error, which is what lets a
+    /// client loop on the cursor without checking whether the key survived the
+    /// walk. `MATCH` is not here: filtering the members is the caller's, so
+    /// that the pattern is run against the member where it lies rather than
+    /// against a copy made to be filtered.
+    pub fn sscan<F>(&mut self, key: &[u8], cursor: Cursor, count: usize, f: F) -> Result<Cursor>
+    where
+        F: FnMut(Member<'_>),
+    {
+        let Some(at) = self.set_slot(key)? else {
+            return Ok(Cursor::END);
+        };
+        Ok(self.set_at(at).scan(cursor, count, f))
+    }
+
+    /// `SMOVE source destination member`. Answers whether it moved.
+    ///
+    /// The order of the checks is Redis's and it is not the order it looks like
+    /// it should be. A source that is not there answers zero without ever
+    /// looking at what the destination holds, so `SMOVE nothing a-string m` is
+    /// a zero and not a `WRONGTYPE`, and a source that is there checks both
+    /// types before it moves anything.
+    ///
+    /// Moving a member onto its own set is a no op that still answers whether
+    /// the member was there, which is the one case where a `1` means nothing
+    /// changed.
+    pub fn smove(&mut self, source: &[u8], destination: &[u8], member: &[u8]) -> Result<bool> {
+        let Some(from) = self.set_slot(source)? else {
+            return Ok(false);
+        };
+        let onto = self.set_slot(destination)?;
+        if source == destination {
+            return Ok(self.set_at(from).contains(member));
+        }
+        if !self
+            .sets
+            .get_mut(from)
+            .expect("the record points at its body")
+            .remove(member)
+        {
+            return Ok(false);
+        }
+        // The destination is filled before the source is emptied, so the slot
+        // the source is about to give back cannot be handed straight to the
+        // destination underneath the index this is holding.
+        let limits = self.limits;
+        let at = match onto {
+            Some(at) => at,
+            None => self.new_set(destination, member, 1),
+        };
+        self.sets
+            .get_mut(at)
+            .expect("the record points at its body")
+            .add(member, &limits);
+        if self.set_at(from).is_empty() {
+            self.drop_key(source);
+        }
+        Ok(true)
     }
 
     /// Hand the set under `key` to `f`, or hand it `None` if there is no key.
@@ -481,6 +697,322 @@ mod tests {
         assert_eq!(d.sadd(b"s", refs.iter().copied()).expect("a set"), 1000);
         assert_eq!(d.set_encoding(b"s"), Some(Encoding::Hashtable));
         assert_eq!(d.scard(b"s").expect("a set"), 1000);
+    }
+
+    /// A set of `n` members named `m0` up, which is a table past 128.
+    fn many(d: &mut Keyspace, key: &[u8], n: usize) {
+        let owned: Vec<Vec<u8>> = (0..n).map(|i| format!("m{i}").into_bytes()).collect();
+        let refs: Vec<&[u8]> = owned.iter().map(Vec::as_slice).collect();
+        d.sadd(key, refs.iter().copied()).expect("a set");
+    }
+
+    fn drawn(d: &mut Keyspace, key: &[u8], count: i64) -> Vec<String> {
+        let mut out = Vec::new();
+        d.srandmember_n(key, count, |m| {
+            out.push(String::from_utf8(m.to_vec()).expect("utf8 in these tests"));
+        })
+        .expect("a set");
+        out
+    }
+
+    #[test]
+    fn popping_takes_a_member_out_and_the_key_with_the_last_one() {
+        let mut d = db();
+        add(&mut d, b"s", &[b"a", b"b"]);
+        let first = d.spop(b"s").expect("a set").expect("two members");
+        assert_eq!(d.scard(b"s").expect("a set"), 1);
+
+        let second = d.spop(b"s").expect("a set").expect("one member");
+        assert_ne!(first, second, "the same member came back twice");
+        assert!(!d.exists(b"s"), "the last member took the key");
+        assert_eq!(d.sets.len(), 0, "and the body");
+        assert_eq!(d.spop(b"s").expect("gone is not an error"), None);
+    }
+
+    #[test]
+    fn popping_a_count_empties_a_set_without_repeating_itself() {
+        // In all three representations, because the table moves its last row
+        // into the hole and the other two shift, and a draw that assumed either
+        // one would repeat a member or run off the end.
+        for n in [4usize, 100, 300] {
+            let mut d = db();
+            many(&mut d, b"s", n);
+            let got = d.spop_n(b"s", n + 10).expect("a set");
+            assert_eq!(got.len(), n, "asked for more than there was");
+            let mut sorted = got.clone();
+            sorted.sort();
+            sorted.dedup();
+            assert_eq!(sorted.len(), n, "a member came back twice");
+            assert!(!d.exists(b"s"));
+            assert_eq!(d.sets.len(), 0);
+        }
+    }
+
+    #[test]
+    fn popping_part_of_a_set_leaves_the_rest_of_it() {
+        let mut d = db();
+        many(&mut d, b"s", 10);
+        let got = d.spop_n(b"s", 4).expect("a set");
+        assert_eq!(got.len(), 4);
+        assert_eq!(d.scard(b"s").expect("a set"), 6);
+        for m in &got {
+            assert!(!d.sismember(b"s", m).expect("a set"), "still there");
+        }
+        assert_eq!(
+            d.spop_n(b"s", 0).expect("a set").len(),
+            0,
+            "and zero is none"
+        );
+        assert_eq!(d.scard(b"s").expect("a set"), 6);
+    }
+
+    #[test]
+    fn a_pinned_seed_draws_the_same_members_twice() {
+        // The one input that makes a result unrepeatable, handed in rather than
+        // reached for. Without this there is nothing to assert about a draw
+        // except that something came back.
+        let mut runs = Vec::new();
+        for _ in 0..2 {
+            let mut d = db();
+            d.seed(20_260_828);
+            many(&mut d, b"s", 50);
+            runs.push(d.spop_n(b"s", 10).expect("a set"));
+        }
+        assert_eq!(runs[0], runs[1]);
+    }
+
+    #[test]
+    fn a_single_draw_reaches_every_member_and_removes_none() {
+        let mut d = db();
+        d.seed(7);
+        add(&mut d, b"s", &[b"a", b"b", b"c"]);
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..200 {
+            let got = d
+                .srandmember(b"s", |m| m.map(|m| m.to_vec()))
+                .expect("a set")
+                .expect("a member");
+            seen.insert(got);
+        }
+        assert_eq!(seen.len(), 3, "a draw that never reaches a member");
+        assert_eq!(d.scard(b"s").expect("a set"), 3, "and nothing was taken");
+
+        assert!(
+            d.srandmember(b"nope", |m| m.map(|m| m.to_vec()))
+                .expect("missing is fine")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn a_negative_count_repeats_itself_and_a_positive_one_does_not() {
+        let mut d = db();
+        d.seed(11);
+        add(&mut d, b"s", &[b"a", b"b", b"c"]);
+
+        let with_repeats = drawn(&mut d, b"s", -20);
+        assert_eq!(with_repeats.len(), 20, "more members than the set holds");
+
+        let mut distinct = drawn(&mut d, b"s", 2);
+        distinct.sort();
+        distinct.dedup();
+        assert_eq!(distinct.len(), 2);
+    }
+
+    #[test]
+    fn asking_for_more_than_the_set_holds_answers_all_of_it_once() {
+        let mut d = db();
+        d.seed(3);
+        add(&mut d, b"s", &[b"a", b"b", b"c"]);
+        let mut got = drawn(&mut d, b"s", 99);
+        got.sort();
+        assert_eq!(got, ["a", "b", "c"]);
+        assert_eq!(drawn(&mut d, b"s", 0).len(), 0);
+        assert_eq!(drawn(&mut d, b"nope", 5).len(), 0);
+        assert_eq!(drawn(&mut d, b"nope", -5).len(), 0);
+    }
+
+    #[test]
+    fn both_ways_of_drawing_distinct_members_are_distinct_and_uniform() {
+        // The two branches of `srandmember_n`, either side of the third. A
+        // thousand members and a draw of two hits the rejection branch, and the
+        // same set with a draw of nine hundred hits the selection walk.
+        let mut d = db();
+        d.seed(99);
+        many(&mut d, b"s", 1000);
+
+        for count in [2, 100, 400, 900] {
+            let got = drawn(&mut d, b"s", count);
+            let mut sorted = got.clone();
+            sorted.sort();
+            sorted.dedup();
+            assert_eq!(
+                sorted.len(),
+                got.len(),
+                "a draw of {count} repeated a member"
+            );
+            assert_eq!(got.len(), count as usize);
+        }
+
+        // And every member is reachable by both, which a walk that stopped
+        // early or a draw that never reached the top would not manage.
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..40 {
+            seen.extend(drawn(&mut d, b"s", 900));
+            seen.extend(drawn(&mut d, b"s", 2));
+        }
+        assert_eq!(seen.len(), 1000, "some member is never drawn");
+        assert_eq!(d.scard(b"s").expect("a set"), 1000, "and none were taken");
+    }
+
+    #[test]
+    fn a_scan_walks_a_set_of_any_size_exactly_once() {
+        for n in [3usize, 100, 500] {
+            let mut d = db();
+            many(&mut d, b"s", n);
+            let mut seen = Vec::new();
+            let mut c = Cursor::START;
+            let mut turns = 0;
+            loop {
+                c = d
+                    .sscan(b"s", c, 10, |m| seen.push(m.to_vec()))
+                    .expect("a set");
+                turns += 1;
+                assert!(turns < 200, "the scan did not finish for {n} members");
+                if c.is_end() {
+                    break;
+                }
+            }
+            seen.sort();
+            seen.dedup();
+            assert_eq!(seen.len(), n, "a scan of {n} members missed one");
+        }
+    }
+
+    #[test]
+    fn a_scan_of_a_key_that_is_not_there_is_a_finished_scan() {
+        let mut d = db();
+        let mut hit = 0;
+        let c = d
+            .sscan(b"nope", Cursor::START, 10, |_| hit += 1)
+            .expect("ok");
+        assert!(c.is_end());
+        assert_eq!(hit, 0);
+    }
+
+    #[test]
+    fn a_scan_returns_everything_that_was_there_the_whole_time() {
+        // The guarantee, tested the way it is written: members removed during
+        // the walk may or may not come back, but the ones that never moved have
+        // to. The table band is the only one that walks in windows, so this is
+        // five hundred members.
+        let mut d = db();
+        many(&mut d, b"s", 500);
+        let mut seen = Vec::new();
+        let mut c = Cursor::START;
+        let mut turns = 0;
+        loop {
+            c = d
+                .sscan(b"s", c, 10, |m| seen.push(m.to_vec()))
+                .expect("a set");
+            // Take one out every turn, from the half of the set this test has
+            // promised nothing about.
+            let victim = format!("m{}", 400 + turns).into_bytes();
+            d.srem(b"s", [victim.as_slice()].into_iter())
+                .expect("a set");
+            turns += 1;
+            if c.is_end() {
+                break;
+            }
+        }
+        seen.sort();
+        seen.dedup();
+        for i in 0..400 {
+            let m = format!("m{i}").into_bytes();
+            assert!(seen.binary_search(&m).is_ok(), "m{i} was never returned");
+        }
+    }
+
+    #[test]
+    fn moving_a_member_takes_it_off_one_set_and_puts_it_on_another() {
+        let mut d = db();
+        add(&mut d, b"a", &[b"x", b"y"]);
+        add(&mut d, b"b", &[b"z"]);
+
+        assert!(d.smove(b"a", b"b", b"x").expect("two sets"));
+        assert_eq!(members(&mut d, b"a"), ["y"]);
+        assert_eq!(members(&mut d, b"b"), ["x", "z"]);
+
+        assert!(
+            !d.smove(b"a", b"b", b"gone").expect("two sets"),
+            "a member that is not in the source does not move"
+        );
+        assert!(
+            d.smove(b"a", b"b", b"y").expect("two sets"),
+            "and the last one still moves"
+        );
+        assert!(!d.exists(b"a"), "the source went with its last member");
+        assert_eq!(d.sets.len(), 1, "and so did its body");
+        assert_eq!(members(&mut d, b"b"), ["x", "y", "z"]);
+    }
+
+    #[test]
+    fn moving_onto_a_destination_that_is_not_there_makes_it() {
+        let mut d = db();
+        add(&mut d, b"a", &[b"x", b"y"]);
+        assert!(d.smove(b"a", b"b", b"x").expect("a set"));
+        assert_eq!(d.kind_of(b"b"), Some(Kind::Set));
+        assert_eq!(members(&mut d, b"b"), ["x"]);
+        assert_eq!(d.sets.len(), 2);
+    }
+
+    #[test]
+    fn moving_a_member_onto_its_own_set_changes_nothing() {
+        let mut d = db();
+        add(&mut d, b"a", &[b"x", b"y"]);
+        assert!(d.smove(b"a", b"a", b"x").expect("a set"), "it is there");
+        assert!(!d.smove(b"a", b"a", b"z").expect("a set"), "it is not");
+        assert_eq!(members(&mut d, b"a"), ["x", "y"]);
+    }
+
+    #[test]
+    fn moving_checks_the_types_in_the_order_redis_checks_them() {
+        let mut d = db();
+        d.set_plain(b"str", b"v").expect("room");
+        add(&mut d, b"s", &[b"x"]);
+
+        assert!(
+            !d.smove(b"nope", b"str", b"x").expect("no source, no error"),
+            "a missing source answers zero without looking at the destination"
+        );
+        assert_eq!(
+            d.smove(b"str", b"s", b"x").expect_err("no").code(),
+            Code::WrongType
+        );
+        assert_eq!(
+            d.smove(b"s", b"str", b"x").expect_err("no").code(),
+            Code::WrongType
+        );
+        assert_eq!(
+            members(&mut d, b"s"),
+            ["x"],
+            "and the failed move left the source alone"
+        );
+    }
+
+    #[test]
+    fn the_new_commands_answer_wrongtype_at_a_string() {
+        let mut d = db();
+        d.set_plain(b"k", b"v").expect("room");
+        assert!(d.spop(b"k").is_err());
+        assert!(d.spop_n(b"k", 2).is_err());
+        assert!(d.srandmember(b"k", |m| m.is_some()).is_err());
+        assert!(d.srandmember_n(b"k", 2, |_| ()).is_err());
+        assert!(d.sscan(b"k", Cursor::START, 10, |_| ()).is_err());
+        assert_eq!(
+            d.get(b"k").expect("still a string").map(|v| v.to_vec()),
+            Some(b"v".to_vec())
+        );
     }
 
     #[test]

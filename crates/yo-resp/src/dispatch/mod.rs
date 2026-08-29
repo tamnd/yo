@@ -1234,6 +1234,227 @@ mod tests {
         assert_eq!(f.run(&[b"DBSIZE"]), ":0\r\n");
     }
 
+    /// Pull the cursor and the members out of one `SSCAN` reply.
+    ///
+    /// Crude on purpose. A test that walked a set through a real client would
+    /// be testing the client, and what these tests are about is the shape of
+    /// the bytes and the fact that a walk sees every member once.
+    fn split_scan(reply: &str) -> (String, Vec<String>) {
+        let mut lines = reply.split("\r\n");
+        assert_eq!(lines.next(), Some("*2"), "got {reply}");
+        lines.next().expect("the cursor header");
+        let cursor = lines.next().expect("the cursor").to_owned();
+        let header = lines.next().expect("the member header");
+        let n: usize = header[1..].parse().expect("a member count");
+        let mut members = Vec::with_capacity(n);
+        for _ in 0..n {
+            lines.next().expect("a member header");
+            members.push(lines.next().expect("a member").to_owned());
+        }
+        (cursor, members)
+    }
+
+    #[test]
+    fn popping_takes_a_member_off_the_set_and_hands_it_back() {
+        let mut f = Fixture::new();
+        f.run(&[b"SADD", b"s", b"a", b"b", b"c", b"d"]);
+
+        let one = f.run(&[b"SPOP", b"s"]);
+        assert!(
+            ["$1\r\na\r\n", "$1\r\nb\r\n", "$1\r\nc\r\n", "$1\r\nd\r\n"].contains(&one.as_str()),
+            "got {one}"
+        );
+        assert_eq!(f.run(&[b"SCARD", b"s"]), ":3\r\n");
+
+        // A count takes that many, and the last one takes the key with it.
+        let (_, rest) = ("", f.run(&[b"SPOP", b"s", b"3"]));
+        assert!(rest.starts_with("*3\r\n"), "got {rest}");
+        assert_eq!(f.run(&[b"EXISTS", b"s"]), ":0\r\n");
+        // And a pop at a key that is not there is a nil, not an empty bulk.
+        assert_eq!(f.run(&[b"SPOP", b"s"]), "$-1\r\n");
+        assert_eq!(f.run(&[b"SPOP", b"s", b"2"]), "*0\r\n");
+    }
+
+    #[test]
+    fn the_two_draws_disagree_about_the_reply_type_and_they_are_right_to() {
+        // The one place in the server where the reply type carries something
+        // the command name does not. SPOP's members are distinct so a RESP3
+        // client can build a set out of them. SRANDMEMBER with a negative count
+        // can hand back the same member three times, and a set would lose two.
+        let mut f = Fixture::new();
+        f.run(&[b"HELLO", b"3"]);
+        f.run(&[b"SADD", b"s", b"a", b"b", b"c"]);
+
+        assert!(f.run(&[b"SPOP", b"s", b"2"]).starts_with("~2\r\n"));
+        // And a positive count is an array too, since Redis makes it one.
+        assert!(f.run(&[b"SRANDMEMBER", b"s", b"1"]).starts_with("*1\r\n"));
+
+        // A negative count against a set of one is where the difference bites:
+        // the same member three times, which is a three element reply and would
+        // have been a one element reply if it had gone out as a set.
+        f.run(&[b"SADD", b"one", b"z"]);
+        assert_eq!(
+            f.run(&[b"SRANDMEMBER", b"one", b"-3"]),
+            "*3\r\n$1\r\nz\r\n$1\r\nz\r\n$1\r\nz\r\n"
+        );
+    }
+
+    #[test]
+    fn drawing_a_member_removes_nothing_and_says_nil_at_a_missing_key() {
+        let mut f = Fixture::new();
+        f.run(&[b"SADD", b"s", b"only"]);
+        assert_eq!(f.run(&[b"SRANDMEMBER", b"s"]), "$4\r\nonly\r\n");
+        assert_eq!(f.run(&[b"SRANDMEMBER", b"s"]), "$4\r\nonly\r\n");
+        assert_eq!(f.run(&[b"SCARD", b"s"]), ":1\r\n");
+
+        assert_eq!(f.run(&[b"SRANDMEMBER", b"nope"]), "$-1\r\n");
+        // The count form answers an empty array rather than a nil, which is the
+        // pair of answers Redis gives and is not the pair it looks like.
+        assert_eq!(f.run(&[b"SRANDMEMBER", b"nope", b"3"]), "*0\r\n");
+        assert_eq!(f.run(&[b"SRANDMEMBER", b"nope", b"-3"]), "*0\r\n");
+        // Asking for more than is there answers all of it once and not padding.
+        assert_eq!(f.run(&[b"SRANDMEMBER", b"s", b"9"]), "*1\r\n$4\r\nonly\r\n");
+    }
+
+    #[test]
+    fn a_pop_count_that_is_not_a_positive_number_says_so() {
+        let mut f = Fixture::new();
+        f.run(&[b"SADD", b"s", b"a"]);
+        let bad = "-ERR value is out of range, must be positive\r\n";
+        assert_eq!(f.run(&[b"SPOP", b"s", b"-1"]), bad);
+        assert_eq!(f.run(&[b"SPOP", b"s", b"abc"]), bad);
+        assert_eq!(f.run(&[b"SCARD", b"s"]), ":1\r\n", "and took nothing");
+        // Zero is allowed and is a real answer rather than an error.
+        assert_eq!(f.run(&[b"SPOP", b"s", b"0"]), "*0\r\n");
+        assert_eq!(f.run(&[b"EXISTS", b"s"]), ":1\r\n");
+    }
+
+    #[test]
+    fn a_scan_walks_a_set_of_any_size_exactly_once() {
+        let mut f = Fixture::new();
+        let members: Vec<Vec<u8>> = (0..300).map(|i| format!("m{i}").into_bytes()).collect();
+        let args: Vec<&[u8]> = [&b"SADD"[..], &b"s"[..]]
+            .into_iter()
+            .chain(members.iter().map(Vec::as_slice))
+            .collect();
+        f.run(&args);
+
+        let mut seen = Vec::new();
+        let mut cursor = "0".to_owned();
+        loop {
+            let reply = f.run(&[b"SSCAN", b"s", cursor.as_bytes()]);
+            let (next, got) = split_scan(&reply);
+            seen.extend(got);
+            cursor = next;
+            if cursor == "0" {
+                break;
+            }
+        }
+        seen.sort();
+        seen.dedup();
+        assert_eq!(seen.len(), 300, "a walk saw a member twice or missed one");
+
+        // A set small enough to be a listpack answers in one call whatever
+        // cursor it was handed, which is what Redis does for that encoding.
+        f.run(&[b"SADD", b"small", b"a", b"b", b"c"]);
+        let (cursor, got) = split_scan(&f.run(&[b"SSCAN", b"small", b"0", b"COUNT", b"1"]));
+        assert_eq!(cursor, "0");
+        assert_eq!(got.len(), 3);
+        // And a key that is not there is a finished scan of nothing.
+        assert_eq!(f.run(&[b"SSCAN", b"nope", b"0"]), "*2\r\n$1\r\n0\r\n*0\r\n");
+    }
+
+    #[test]
+    fn a_scan_takes_match_and_count_and_refuses_anything_else() {
+        let mut f = Fixture::new();
+        f.run(&[b"SADD", b"s", b"aa", b"ab", b"ba", b"12", b"13"]);
+
+        let (_, got) = split_scan(&f.run(&[b"SSCAN", b"s", b"0", b"MATCH", b"a*"]));
+        let mut got = got;
+        got.sort();
+        assert_eq!(got, ["aa", "ab"]);
+
+        // An integer member has no digits stored anywhere, so MATCH is the one
+        // place a scan pays to write some.
+        let (_, got) = split_scan(&f.run(&[b"SSCAN", b"s", b"0", b"MATCH", b"1?"]));
+        let mut got = got;
+        got.sort();
+        assert_eq!(got, ["12", "13"]);
+
+        assert_eq!(f.run(&[b"SSCAN", b"s", b"abc"]), "-ERR invalid cursor\r\n");
+        assert_eq!(f.run(&[b"SSCAN", b"s", b"-1"]), "-ERR invalid cursor\r\n");
+        assert_eq!(
+            f.run(&[b"SSCAN", b"s", b"0", b"NOPE", b"1"]),
+            "-ERR syntax error\r\n"
+        );
+        // A count under one is a syntax error and not a range error, which is
+        // the odder of Redis's two answers and the reason it is copied exactly.
+        assert_eq!(
+            f.run(&[b"SSCAN", b"s", b"0", b"COUNT", b"0"]),
+            "-ERR syntax error\r\n"
+        );
+    }
+
+    #[test]
+    fn moving_a_member_takes_it_off_one_set_and_puts_it_on_another() {
+        let mut f = Fixture::new();
+        f.run(&[b"SADD", b"src", b"a", b"b"]);
+        f.run(&[b"SADD", b"dst", b"c"]);
+
+        assert_eq!(f.run(&[b"SMOVE", b"src", b"dst", b"a"]), ":1\r\n");
+        assert_eq!(f.run(&[b"SISMEMBER", b"src", b"a"]), ":0\r\n");
+        assert_eq!(f.run(&[b"SISMEMBER", b"dst", b"a"]), ":1\r\n");
+        // A member that is not in the source is a zero and moves nothing.
+        assert_eq!(f.run(&[b"SMOVE", b"src", b"dst", b"zz"]), ":0\r\n");
+        assert_eq!(f.run(&[b"SCARD", b"dst"]), ":2\r\n");
+
+        // A destination that does not exist gets made, and a source that runs
+        // out goes away.
+        assert_eq!(f.run(&[b"SMOVE", b"src", b"fresh", b"b"]), ":1\r\n");
+        assert_eq!(f.run(&[b"EXISTS", b"src"]), ":0\r\n");
+        assert_eq!(f.run(&[b"SMEMBERS", b"fresh"]), "*1\r\n$1\r\nb\r\n");
+    }
+
+    #[test]
+    fn moving_checks_the_types_in_the_order_redis_checks_them() {
+        // Not the order it looks like it should be. A source that is not there
+        // answers zero without ever looking at the destination, so this is a
+        // zero and not a WRONGTYPE even though the destination is a string.
+        let mut f = Fixture::new();
+        f.run(&[b"SET", b"str", b"v"]);
+        f.run(&[b"SADD", b"set", b"a"]);
+
+        let wrong = "-WRONGTYPE Operation against a key holding the wrong kind of value\r\n";
+        assert_eq!(f.run(&[b"SMOVE", b"nope", b"str", b"a"]), ":0\r\n");
+        assert_eq!(f.run(&[b"SMOVE", b"str", b"set", b"a"]), wrong);
+        assert_eq!(f.run(&[b"SMOVE", b"set", b"str", b"a"]), wrong);
+        assert_eq!(f.run(&[b"SPOP", b"str"]), wrong);
+        assert_eq!(f.run(&[b"SRANDMEMBER", b"str"]), wrong);
+        assert_eq!(f.run(&[b"SSCAN", b"str", b"0"]), wrong);
+        assert_eq!(
+            f.run(&[b"SISMEMBER", b"set", b"a"]),
+            ":1\r\n",
+            "and none of that moved anything"
+        );
+    }
+
+    #[test]
+    fn a_scan_leaves_nothing_half_written_when_its_arguments_are_wrong() {
+        // SSCAN writes an outer array header before it walks, so it is the
+        // command most likely to get bytes out in front of an error.
+        let mut f = Fixture::new();
+        f.run(&[b"SADD", b"s", b"a"]);
+        for bad in [
+            &[b"SSCAN".as_slice(), b"s", b"abc"][..],
+            &[b"SSCAN".as_slice(), b"s", b"0", b"COUNT", b"nope"][..],
+            &[b"SSCAN".as_slice(), b"s", b"0", b"MATCH"][..],
+        ] {
+            let reply = f.run(bad);
+            assert!(reply.starts_with("-ERR"), "got {reply}");
+            assert!(!reply.contains('*'), "an array header went out in front");
+        }
+    }
+
     /// The leak a set can spring that nothing on the wire would ever show: the
     /// key goes, the body does not, and `DBSIZE` looks right the whole time.
     #[test]
