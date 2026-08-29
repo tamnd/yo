@@ -36,7 +36,15 @@ run() {   # run <label> <image> <script>
   echo "=============================================================="
   echo "== $label   ($image)"
   echo "=============================================================="
-  out=$(docker run --rm --network host -w /w "$image" bash -c "$script" 2>&1)
+  # -e V, and not interpolation at the call site. Every case body below is a
+  # single-quoted string, so a `$V` written in one is literal here and unset
+  # inside the container, and it expands to nothing rather than to an error.
+  # That is what the first run of the parameterised version did: Java asked for
+  # `<version></version>` and Go for `yo-go@v`, both of which failed with
+  # messages about the artifact rather than about the empty string, and Dart
+  # asked for an empty `version:` in its pubspec and passed anyway because
+  # `dart pub add` never reads it. One of those three would not have been found.
+  out=$(docker run --rm --network host -e V="$V" -w /w "$image" bash -c "$script" 2>&1)
   rc=$?
   echo "$out"
   echo "-- exit $rc"
@@ -180,7 +188,7 @@ import PackageDescription
 let package = Package(
   name: "t",
   platforms: [.macOS(.v14)],
-  dependencies: [.package(url: "https://github.com/tamnd/yo-swift", from: "'"$V"'")],
+  dependencies: [.package(url: "https://github.com/tamnd/yo-swift", from: "$V")],
   targets: [.executableTarget(name: "t", dependencies: [.product(name: "Yodb", package: "yo-swift")])])
 EOF
   cat > Sources/t/main.swift <<EOF
