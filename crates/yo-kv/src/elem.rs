@@ -223,6 +223,21 @@ impl<V: Copy> Elements<V> {
         self.find(name).is_some()
     }
 
+    /// Which row this name is in, for a caller keeping an array beside the rows.
+    ///
+    /// A hash's field deadlines are indexed by row position rather than by a
+    /// number in the row (`crate::ttl` says why), so `HEXPIRE` needs the position
+    /// the probe found rather than the payload it found there. That is the only
+    /// caller, and it is why this is a position and not a payload.
+    ///
+    /// The position is only good until the next insert or remove, since a remove
+    /// moves the last row into the hole.
+    #[inline]
+    #[must_use]
+    pub fn index_of(&self, name: &[u8]) -> Option<usize> {
+        self.find(name)
+    }
+
     /// The hash of a name, for a caller about to ask several tables about it.
     ///
     /// `SINTER` over k sets asks the same question k times, and hashing the
@@ -307,6 +322,15 @@ impl<V: Copy> Elements<V> {
     pub fn at(&self, idx: usize) -> Option<(&[u8], &V)> {
         let row = self.rows.get(idx)?;
         Some((self.name_of(row), &row.value))
+    }
+
+    /// The payload at `idx`, to be written over.
+    ///
+    /// The companion to [`Elements::index_of`], for a caller that has probed
+    /// once and wants to use the position it found rather than probe again.
+    #[inline]
+    pub fn at_mut(&mut self, idx: usize) -> Option<&mut V> {
+        self.rows.get_mut(idx).map(|r| &mut r.value)
     }
 
     /// Take the row at `idx` out and hand back its name and payload.

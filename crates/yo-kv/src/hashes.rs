@@ -40,6 +40,7 @@ use crate::hash::{Hash, Text};
 use crate::keyspace::{Keyspace, wrong_type};
 use crate::scan::Cursor;
 use crate::strings;
+use crate::ttl::{self, Applied, Ask, Cond};
 use crate::value::{self, Kind};
 
 /// What Redis says when a field does not hold a number.
@@ -48,6 +49,8 @@ const NOT_AN_INT: &str = "hash value is not an integer";
 const NOT_A_FLOAT: &str = "hash value is not a float";
 /// And when the sum leaves the range.
 const WOULD_OVERFLOW: &str = "increment or decrement would overflow";
+/// And when a field deadline lands past the year it stops fitting.
+const BAD_EXPIRE: &str = "invalid expire time, must be >= 0";
 
 impl Keyspace {
     /// `HSET key field value [field value ...]`. Answers how many were new.
@@ -187,6 +190,103 @@ impl Keyspace {
             self.drop_key(key);
         }
         Ok(gone)
+    }
+
+    /// `HEXPIREAT` and the three commands that turn into it.
+    ///
+    /// `at` is an absolute unix millisecond, which is what `HEXPIRE`,
+    /// `HPEXPIRE` and `HEXPIREAT` all become before they get here, and one call
+    /// of `f` happens per field asked for because the reply is positional.
+    ///
+    /// The deadline is checked against [`ttl::MAX_AT`] before any field is
+    /// touched, because Redis rejects the whole command rather than failing
+    /// field by field, and a command that names ten fields either sets all ten
+    /// or errors.
+    ///
+    /// A key that is not there answers [`Applied::NoField`] for every field,
+    /// which is the -2 Redis replies, because a missing key and an empty hash
+    /// are the same thing. The key goes when the last field does, which happens
+    /// when the deadline given has already passed.
+    pub fn hexpire<'a, F>(
+        &mut self,
+        key: &[u8],
+        at: u64,
+        cond: Cond,
+        fields: impl Iterator<Item = &'a [u8]>,
+        mut f: F,
+    ) -> Result<()>
+    where
+        F: FnMut(Applied),
+    {
+        if !ttl::valid_at(at) {
+            return Err(Error::new(Code::Invalid, BAD_EXPIRE));
+        }
+        let Some(slot) = self.hash_slot(key)? else {
+            for _ in fields {
+                f(Applied::NoField);
+            }
+            return Ok(());
+        };
+        let now = self.clock.now_ms();
+        let mut emptied = false;
+        for field in fields {
+            let hash = self.hash_at_mut(slot);
+            let applied = hash.expire(field, at, cond, now);
+            emptied = hash.is_empty();
+            f(applied);
+        }
+        if emptied {
+            self.drop_key(key);
+        }
+        Ok(())
+    }
+
+    /// `HTTL` and its relatives, one call of `f` per field asked for.
+    ///
+    /// What comes back is when the deadline falls due. Turning that into what is
+    /// left, and into seconds where the command asks for seconds, is the reply
+    /// layer's job, because [`Ask::remaining_ms`] is where that arithmetic lives
+    /// and it needs the moment being asked at.
+    pub fn httl<'a, F>(
+        &mut self,
+        key: &[u8],
+        fields: impl Iterator<Item = &'a [u8]>,
+        mut f: F,
+    ) -> Result<()>
+    where
+        F: FnMut(Ask),
+    {
+        let slot = self.hash_slot(key)?;
+        for field in fields {
+            match slot {
+                Some(at) => f(self.hash_at(at).deadline(field)),
+                None => f(Ask::NoField),
+            }
+        }
+        Ok(())
+    }
+
+    /// `HPERSIST key FIELDS numfields field [field ...]`.
+    ///
+    /// [`Ask::At`] means the deadline that was there has been taken off, which
+    /// the reply layer reports as 1.
+    pub fn hpersist<'a, F>(
+        &mut self,
+        key: &[u8],
+        fields: impl Iterator<Item = &'a [u8]>,
+        mut f: F,
+    ) -> Result<()>
+    where
+        F: FnMut(Ask),
+    {
+        let slot = self.hash_slot(key)?;
+        for field in fields {
+            match slot {
+                Some(at) => f(self.hash_at_mut(at).persist(field)),
+                None => f(Ask::NoField),
+            }
+        }
+        Ok(())
     }
 
     /// `HLEN key`.
@@ -428,11 +528,35 @@ impl Keyspace {
     /// place that has to reap first and answer `WRONGTYPE` for another type.
     fn hash_slot(&mut self, key: &[u8]) -> Result<Option<u32>> {
         self.reap(key);
-        match self.map.get(key) {
-            None => Ok(None),
-            Some(rec) if value::kind(rec) == Kind::Hash => Ok(Some(value::slot(rec))),
-            Some(_) => Err(wrong_type()),
+        let at = match self.map.get(key) {
+            None => return Ok(None),
+            Some(rec) if value::kind(rec) == Kind::Hash => value::slot(rec),
+            Some(_) => return Err(wrong_type()),
+        };
+        // And now the fields, which is the second half of lazy expiry. It runs
+        // here rather than in every command so that there is one place a hash
+        // becomes live, and it is a load and a comparison on a hash that has
+        // never been given a field deadline, which is nearly all of them.
+        let now = self.clock.now_ms();
+        let hash = self
+            .hashes
+            .get_mut(at)
+            .expect("the record points at its body");
+        if hash.reap(now) > 0 && hash.is_empty() {
+            // The last field expiring deletes the key, exactly as the last HDEL
+            // does, because an empty hash is not a thing Redis stores.
+            self.drop_key(key);
+            return Ok(None);
         }
+        Ok(Some(at))
+    }
+
+    /// The body in a slot the record pointed at, to be written.
+    #[inline]
+    fn hash_at_mut(&mut self, at: u32) -> &mut Hash {
+        self.hashes
+            .get_mut(at)
+            .expect("the record points at its body")
     }
 
     /// The body in a slot the record pointed at.
@@ -488,6 +612,22 @@ mod tests {
         d.hgetall(key, |f, v| out.push((text(&f), text(&v))))
             .expect("a hash");
         out.sort();
+        out
+    }
+
+    fn expire(d: &mut Keyspace, key: &[u8], at: u64, fields: &[&[u8]]) -> Vec<Applied> {
+        let mut out = Vec::new();
+        d.hexpire(key, at, Cond::Always, fields.iter().copied(), |a| {
+            out.push(a);
+        })
+        .expect("a hash");
+        out
+    }
+
+    fn ttl_of(d: &mut Keyspace, key: &[u8], fields: &[&[u8]]) -> Vec<Ask> {
+        let mut out = Vec::new();
+        d.httl(key, fields.iter().copied(), |a| out.push(a))
+            .expect("a hash");
         out
     }
 
@@ -798,6 +938,156 @@ mod tests {
             d.hrandfield(b"gone", |p| p.is_none()).expect("ok"),
             "and a missing key draws a nil"
         );
+    }
+
+    #[test]
+    fn a_field_deadline_goes_on_and_is_reported_back() {
+        let mut d = db();
+        set(&mut d, b"h", &[(b"a", b"1"), (b"b", b"2")]);
+        assert_eq!(
+            expire(&mut d, b"h", 5_000, &[b"a", b"nope"]),
+            [Applied::Ok, Applied::NoField],
+            "one call per field, in the order asked"
+        );
+        assert_eq!(
+            ttl_of(&mut d, b"h", &[b"a", b"b", b"nope"]),
+            [Ask::At(5_000), Ask::NoDeadline, Ask::NoField]
+        );
+        assert_eq!(
+            d.encoding_name(b"h"),
+            Some("listpackex"),
+            "and the band widened to hold it"
+        );
+    }
+
+    #[test]
+    fn a_field_is_gone_the_next_time_the_key_is_touched() {
+        let mut d = db();
+        set(&mut d, b"h", &[(b"a", b"1"), (b"b", b"2")]);
+        expire(&mut d, b"h", 2_000, &[b"a"]);
+
+        assert_eq!(d.hlen(b"h").expect("ok"), 2, "still there at 1000");
+        d.clock_mut().advance(1_000);
+        assert_eq!(d.hlen(b"h").expect("ok"), 1, "and gone at 2000");
+        assert_eq!(get(&mut d, b"h", b"a"), None);
+        assert_eq!(get(&mut d, b"h", b"b").as_deref(), Some("2"));
+        assert_eq!(all(&mut d, b"h"), [("b".to_owned(), "2".to_owned())]);
+    }
+
+    #[test]
+    fn the_key_goes_when_its_last_field_expires() {
+        let mut d = db();
+        set(&mut d, b"h", &[(b"a", b"1")]);
+        expire(&mut d, b"h", 2_000, &[b"a"]);
+        assert_eq!(d.kind_of(b"h"), Some(Kind::Hash));
+
+        d.clock_mut().advance(1_000);
+        assert_eq!(d.hlen(b"h").expect("ok"), 0);
+        assert_eq!(d.kind_of(b"h"), None, "an empty hash is not stored");
+        assert_eq!(d.len(), 0);
+    }
+
+    /// `HEXPIRE key 0` is a roundabout `HDEL`, and taking the last field with it
+    /// takes the key.
+    #[test]
+    fn a_deadline_already_past_deletes_the_field_now() {
+        let mut d = db();
+        set(&mut d, b"h", &[(b"a", b"1"), (b"b", b"2")]);
+        assert_eq!(expire(&mut d, b"h", 500, &[b"a"]), [Applied::Deleted]);
+        assert_eq!(d.hlen(b"h").expect("ok"), 1);
+
+        assert_eq!(expire(&mut d, b"h", 500, &[b"b"]), [Applied::Deleted]);
+        assert_eq!(d.kind_of(b"h"), None);
+    }
+
+    #[test]
+    fn persisting_puts_the_field_back_to_no_deadline() {
+        let mut d = db();
+        set(&mut d, b"h", &[(b"a", b"1")]);
+        expire(&mut d, b"h", 5_000, &[b"a"]);
+
+        let mut out = Vec::new();
+        d.hpersist(
+            b"h",
+            [b"a".as_slice(), b"nope".as_slice()].into_iter(),
+            |a| {
+                out.push(a);
+            },
+        )
+        .expect("ok");
+        assert_eq!(out, [Ask::At(5_000), Ask::NoField]);
+        assert_eq!(ttl_of(&mut d, b"h", &[b"a"]), [Ask::NoDeadline]);
+
+        d.clock_mut().advance(100_000);
+        assert_eq!(d.hlen(b"h").expect("ok"), 1, "and it outlives its deadline");
+    }
+
+    #[test]
+    fn a_missing_key_answers_no_field_for_every_field_it_was_asked() {
+        let mut d = db();
+        assert_eq!(
+            expire(&mut d, b"gone", 5_000, &[b"a", b"b"]),
+            [Applied::NoField, Applied::NoField]
+        );
+        assert_eq!(
+            ttl_of(&mut d, b"gone", &[b"a", b"b"]),
+            [Ask::NoField, Ask::NoField]
+        );
+        assert_eq!(d.kind_of(b"gone"), None, "and asking did not create it");
+    }
+
+    #[test]
+    fn a_deadline_past_the_ceiling_is_refused_before_any_field_moves() {
+        let mut d = db();
+        set(&mut d, b"h", &[(b"a", b"1")]);
+        let err = d
+            .hexpire(
+                b"h",
+                crate::ttl::MAX_AT + 1,
+                Cond::Always,
+                [b"a".as_slice()].into_iter(),
+                |_| unreachable!("no field is reached"),
+            )
+            .expect_err("past the ceiling");
+        assert_eq!(err.code(), Code::Invalid);
+        assert_eq!(ttl_of(&mut d, b"h", &[b"a"]), [Ask::NoDeadline]);
+    }
+
+    #[test]
+    fn every_field_ttl_command_says_wrongtype_and_writes_nothing() {
+        let mut d = db();
+        d.set_plain(b"s", b"v").expect("room");
+        assert!(
+            d.hexpire(
+                b"s",
+                5_000,
+                Cond::Always,
+                [b"a".as_slice()].into_iter(),
+                |_| { unreachable!("nothing is reached") }
+            )
+            .is_err()
+        );
+        assert!(d.httl(b"s", [b"a".as_slice()].into_iter(), |_| {}).is_err());
+        assert!(
+            d.hpersist(b"s", [b"a".as_slice()].into_iter(), |_| {})
+                .is_err()
+        );
+        assert_eq!(
+            d.kind_of(b"s"),
+            Some(Kind::String),
+            "and the string is intact"
+        );
+    }
+
+    #[test]
+    fn a_hash_that_never_expires_a_field_is_untouched_by_all_of_this() {
+        let mut d = db();
+        for i in 0..300u32 {
+            set(&mut d, b"h", &[(format!("f{i}").as_bytes(), b"v")]);
+        }
+        assert_eq!(d.encoding_name(b"h"), Some("hashtable"));
+        d.clock_mut().advance(1_000_000);
+        assert_eq!(d.hlen(b"h").expect("ok"), 300, "nothing had a deadline");
     }
 
     #[test]

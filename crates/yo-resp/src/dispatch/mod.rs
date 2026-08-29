@@ -1693,6 +1693,288 @@ mod tests {
         }
     }
 
+    #[test]
+    fn a_field_deadline_goes_on_and_comes_back_in_all_four_units() {
+        let mut f = Fixture::new();
+        f.run(&[b"HSET", b"h", b"a", b"1", b"b", b"2"]);
+        assert_eq!(
+            f.run(&[b"HEXPIRE", b"h", b"100", b"FIELDS", b"1", b"a"]),
+            "*1\r\n:1\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"HTTL", b"h", b"FIELDS", b"3", b"a", b"b", b"nope"]),
+            "*3\r\n:100\r\n:-1\r\n:-2\r\n",
+            "one answer per field, and the two sentinels are TTL's own"
+        );
+
+        // The same deadline in the other three units, all of them derived from
+        // the one number the store kept.
+        let ms = int_reply(&f.run(&[b"HPTTL", b"h", b"FIELDS", b"1", b"a"]));
+        assert!((99_000..=100_000).contains(&ms), "got {ms}");
+        let at = int_reply(&f.run(&[b"HEXPIRETIME", b"h", b"FIELDS", b"1", b"a"]));
+        let at_ms = int_reply(&f.run(&[b"HPEXPIRETIME", b"h", b"FIELDS", b"1", b"a"]));
+        assert_eq!(at, at_ms.div_euclid(1000) + i64::from(at_ms % 1000 != 0));
+        assert!(at_ms > 1_700_000_000_000, "an absolute moment, got {at_ms}");
+
+        assert_eq!(
+            f.run(&[b"HPERSIST", b"h", b"FIELDS", b"3", b"a", b"b", b"nope"]),
+            "*3\r\n:1\r\n:-1\r\n:-2\r\n",
+            "one for the deadline taken off, and it does not say what it was"
+        );
+        assert_eq!(
+            f.run(&[b"HTTL", b"h", b"FIELDS", b"1", b"a"]),
+            "*1\r\n:-1\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"HGET", b"h", b"a"]),
+            "$1\r\n1\r\n",
+            "and the field is still there with the value it had"
+        );
+    }
+
+    #[test]
+    fn a_deadline_that_has_already_gone_deletes_the_field_now() {
+        let mut f = Fixture::new();
+        f.run(&[b"HSET", b"h", b"a", b"1", b"b", b"2"]);
+        assert_eq!(
+            f.run(&[b"HEXPIREAT", b"h", b"1", b"FIELDS", b"1", b"a"]),
+            "*1\r\n:2\r\n",
+            "two, and not one, because nothing was stored"
+        );
+        assert_eq!(f.run(&[b"HGET", b"h", b"a"]), "$-1\r\n");
+        assert_eq!(f.run(&[b"HLEN", b"h"]), ":1\r\n");
+
+        assert_eq!(
+            f.run(&[b"HPEXPIREAT", b"h", b"1", b"FIELDS", b"1", b"b"]),
+            "*1\r\n:2\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"EXISTS", b"h"]),
+            ":0\r\n",
+            "and the last field going took the key with it"
+        );
+
+        // Zero is a delete and not an error, where minus one is an error. That
+        // is Redis's split and it is easy to get backwards.
+        f.run(&[b"HSET", b"h", b"a", b"1"]);
+        assert_eq!(
+            f.run(&[b"HEXPIRE", b"h", b"0", b"FIELDS", b"1", b"a"]),
+            "*1\r\n:2\r\n"
+        );
+    }
+
+    #[test]
+    fn a_field_is_gone_once_its_moment_passes() {
+        let mut f = Fixture::new();
+        f.run(&[b"HSET", b"h", b"a", b"1", b"b", b"2"]);
+        assert_eq!(
+            f.run(&[b"HPEXPIRE", b"h", b"20", b"FIELDS", b"1", b"a"]),
+            "*1\r\n:1\r\n"
+        );
+        assert_eq!(f.run(&[b"HGET", b"h", b"a"]), "$1\r\n1\r\n", "not yet");
+
+        // Time moves once per turn of the event loop and nowhere else, so a
+        // test moves it by hand rather than by sleeping. There is nothing to
+        // sleep for: the deadline is a number and so is the clock.
+        f.server.db(0).clock_mut().advance(60);
+        assert_eq!(f.run(&[b"HLEN", b"h"]), ":1\r\n");
+        assert_eq!(f.run(&[b"HGET", b"h", b"a"]), "$-1\r\n");
+        assert_eq!(
+            f.run(&[b"HGETALL", b"h"]),
+            "*2\r\n$1\r\nb\r\n$1\r\n2\r\n",
+            "and the walks do not hand back a field that has expired"
+        );
+    }
+
+    #[test]
+    fn a_missing_key_answers_the_no_field_sentinel_for_every_field() {
+        let mut f = Fixture::new();
+        for cmd in [
+            &[
+                b"HEXPIRE".as_slice(),
+                b"nokey",
+                b"100",
+                b"FIELDS",
+                b"2",
+                b"a",
+                b"b",
+            ][..],
+            &[b"HTTL".as_slice(), b"nokey", b"FIELDS", b"2", b"a", b"b"][..],
+            &[b"HPTTL".as_slice(), b"nokey", b"FIELDS", b"2", b"a", b"b"][..],
+            &[
+                b"HEXPIRETIME".as_slice(),
+                b"nokey",
+                b"FIELDS",
+                b"2",
+                b"a",
+                b"b",
+            ][..],
+            &[
+                b"HPERSIST".as_slice(),
+                b"nokey",
+                b"FIELDS",
+                b"2",
+                b"a",
+                b"b",
+            ][..],
+        ] {
+            assert_eq!(f.run(cmd), "*2\r\n:-2\r\n:-2\r\n", "{:?}", cmd[0]);
+        }
+    }
+
+    #[test]
+    fn writing_a_field_clears_the_deadline_that_was_on_it() {
+        let mut f = Fixture::new();
+        f.run(&[b"HSET", b"h", b"a", b"1"]);
+        f.run(&[b"HEXPIRE", b"h", b"100", b"FIELDS", b"1", b"a"]);
+        f.run(&[b"HSET", b"h", b"a", b"2"]);
+        assert_eq!(
+            f.run(&[b"HTTL", b"h", b"FIELDS", b"1", b"a"]),
+            "*1\r\n:-1\r\n",
+            "Redis has done this since 7.4, and it is why HGETEX exists"
+        );
+    }
+
+    #[test]
+    fn the_four_conditions_reach_the_store_the_way_they_were_written() {
+        let mut f = Fixture::new();
+        f.run(&[b"HSET", b"h", b"a", b"1"]);
+        assert_eq!(
+            f.run(&[b"HEXPIRE", b"h", b"100", b"XX", b"FIELDS", b"1", b"a"]),
+            "*1\r\n:0\r\n",
+            "XX on a field with no deadline changes nothing"
+        );
+        assert_eq!(
+            f.run(&[b"HEXPIRE", b"h", b"100", b"NX", b"FIELDS", b"1", b"a"]),
+            "*1\r\n:1\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"HEXPIRE", b"h", b"200", b"NX", b"FIELDS", b"1", b"a"]),
+            "*1\r\n:0\r\n",
+            "and NX will not move one that is already there"
+        );
+        assert_eq!(
+            f.run(&[b"HEXPIRE", b"h", b"50", b"GT", b"FIELDS", b"1", b"a"]),
+            "*1\r\n:0\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"HEXPIRE", b"h", b"500", b"GT", b"FIELDS", b"1", b"a"]),
+            "*1\r\n:1\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"HEXPIRE", b"h", b"50", b"LT", b"FIELDS", b"1", b"a"]),
+            "*1\r\n:1\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"HTTL", b"h", b"FIELDS", b"1", b"a"]),
+            "*1\r\n:50\r\n"
+        );
+    }
+
+    #[test]
+    fn the_field_ttl_family_leaves_nothing_half_written_on_a_bad_argument() {
+        let mut f = Fixture::new();
+        f.run(&[b"HSET", b"h", b"a", b"1"]);
+        for (bad, want) in [
+            (
+                &[b"HEXPIRE".as_slice(), b"h", b"-1", b"FIELDS", b"1", b"a"][..],
+                "-ERR invalid expire time, must be >= 0",
+            ),
+            (
+                &[
+                    b"HEXPIRE".as_slice(),
+                    b"h",
+                    b"9999999999999999",
+                    b"FIELDS",
+                    b"1",
+                    b"a",
+                ][..],
+                "-ERR invalid expire time in 'hexpire' command",
+            ),
+            (
+                &[b"HEXPIRE".as_slice(), b"h", b"100", b"FIELD", b"1", b"a"][..],
+                "-ERR wrong number of arguments for 'hexpire' command",
+            ),
+            (
+                &[b"HEXPIRE".as_slice(), b"h", b"100", b"FIELDS", b"0", b"a"][..],
+                "-ERR Parameter `numFields` should be greater than 0",
+            ),
+            (
+                &[b"HEXPIRE".as_slice(), b"h", b"100", b"FIELDS", b"2", b"a"][..],
+                "-ERR wrong number of arguments",
+            ),
+            (
+                &[b"HTTL".as_slice(), b"h", b"FIELDS", b"3", b"a", b"b"][..],
+                "-ERR wrong number of arguments",
+            ),
+        ] {
+            let reply = f.run(bad);
+            assert!(reply.starts_with(want), "wanted {want}, got {reply}");
+            assert!(!reply.contains('*'), "an array header went out in front");
+        }
+        assert_eq!(
+            f.run(&[b"HTTL", b"h", b"FIELDS", b"1", b"a"]),
+            "*1\r\n:-1\r\n",
+            "and not one of them put a deadline on anything"
+        );
+    }
+
+    #[test]
+    fn every_field_ttl_command_says_wrongtype_and_writes_nothing() {
+        let mut f = Fixture::new();
+        f.run(&[b"SET", b"str", b"v"]);
+        let wrong = "-WRONGTYPE Operation against a key holding the wrong kind of value\r\n";
+
+        for cmd in [
+            &[b"HEXPIRE".as_slice(), b"str", b"100", b"FIELDS", b"1", b"f"][..],
+            &[
+                b"HPEXPIRE".as_slice(),
+                b"str",
+                b"100",
+                b"FIELDS",
+                b"1",
+                b"f",
+            ][..],
+            &[
+                b"HEXPIREAT".as_slice(),
+                b"str",
+                b"9999999999",
+                b"FIELDS",
+                b"1",
+                b"f",
+            ][..],
+            &[
+                b"HPEXPIREAT".as_slice(),
+                b"str",
+                b"9999999999999",
+                b"FIELDS",
+                b"1",
+                b"f",
+            ][..],
+            &[b"HTTL".as_slice(), b"str", b"FIELDS", b"1", b"f"][..],
+            &[b"HPTTL".as_slice(), b"str", b"FIELDS", b"1", b"f"][..],
+            &[b"HEXPIRETIME".as_slice(), b"str", b"FIELDS", b"1", b"f"][..],
+            &[b"HPEXPIRETIME".as_slice(), b"str", b"FIELDS", b"1", b"f"][..],
+            &[b"HPERSIST".as_slice(), b"str", b"FIELDS", b"1", b"f"][..],
+        ] {
+            assert_eq!(f.run(cmd), wrong, "{:?}", cmd[0]);
+        }
+        assert_eq!(
+            f.run(&[b"GET", b"str"]),
+            "$1\r\nv\r\n",
+            "and none of them touched the value"
+        );
+    }
+
+    /// The one integer of a single element array reply.
+    fn int_reply(reply: &str) -> i64 {
+        let body = reply
+            .strip_prefix("*1\r\n:")
+            .and_then(|s| s.strip_suffix("\r\n"))
+            .unwrap_or_else(|| panic!("wanted one integer, got {reply}"));
+        body.parse().expect("an integer")
+    }
+
     /// The cursor and the flat items of a scan reply.
     fn scan_reply(reply: &str) -> (String, Vec<String>) {
         let mut lines = reply.split("\r\n");

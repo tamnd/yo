@@ -872,6 +872,105 @@ status = "shipped"
 wire = "verified"
 notes = "Only the element table walks in windows. A listpack answers with every pair and a finished cursor, ignoring the cursor it was given, which is what Redis does for the same encoding and is safe because promotion is one way. MATCH is matched against the field and never the value, and it decides how many pairs there are as the walk goes, so the reply header and the cursor in front of it are both written behind the body and rotated into place. NOVALUES is 7.4 and is not a shortcut for HKEYS: it still walks in windows, so it is the only way to page through the fields of a large hash without pulling every value across the wire too."
 
+[[command]]
+name = "HEXPIRE"
+group = "hash"
+since = "7.4.0"
+arity = -6
+plan = "point"
+bounded = "inherent"
+status = "shipped"
+wire = "verified"
+notes = "A field has no header to keep a deadline in, the way a key does, so the deadline goes beside the field instead. In the packed band the blob widens from two elements a field to three and OBJECT ENCODING starts saying listpackex, which is Redis's own answer for the same shape. In the table band a side array is allocated the first time any field of that hash gets a deadline, so a hash that never uses this carries three words and no allocation. Both bands go through one copy of the NX, XX, GT and LT rule, because two copies means one of them is wrong. Widening is one way, like promotion: a hash whose last deadline came off keeps the wider shape rather than rewriting itself to save a byte a field."
+
+[[command]]
+name = "HPEXPIRE"
+group = "hash"
+since = "7.4.0"
+arity = -6
+plan = "point"
+bounded = "inherent"
+status = "shipped"
+wire = "verified"
+notes = "The same command counting in milliseconds. All four setters normalise to one absolute millisecond before anything is touched, so there is one implementation and the difference between them is two booleans at the door."
+
+[[command]]
+name = "HEXPIREAT"
+group = "hash"
+since = "7.4.0"
+arity = -6
+plan = "point"
+bounded = "inherent"
+status = "shipped"
+wire = "verified"
+notes = "Absolute rather than relative, which is the only thing that separates it from HEXPIRE once the seconds are multiplied out. A deadline already past deletes the field and answers 2 rather than storing a number that is dead on arrival, and if that was the last field the key goes with it."
+
+[[command]]
+name = "HPEXPIREAT"
+group = "hash"
+since = "7.4.0"
+arity = -6
+plan = "point"
+bounded = "inherent"
+status = "shipped"
+wire = "verified"
+notes = "Absolute and in milliseconds, which is the form the other three are turned into. Redis has two different error messages here and they were checked against a real 8.10.1 rather than read off the documentation: a negative number is invalid expire time, must be >= 0, and one too large to be a moment is invalid expire time in the command, named."
+
+[[command]]
+name = "HTTL"
+group = "hash"
+since = "7.4.0"
+arity = -5
+plan = "point"
+bounded = "inherent"
+status = "shipped"
+wire = "verified"
+notes = "Minus two for a field that is not there and minus one for a field with no deadline, which is the same pair of answers TTL gives for a key. The seconds round up, so a field with half a second left answers 1 and not 0, and that was confirmed on a real server rather than assumed."
+
+[[command]]
+name = "HPTTL"
+group = "hash"
+since = "7.4.0"
+arity = -5
+plan = "point"
+bounded = "inherent"
+status = "shipped"
+wire = "verified"
+notes = "The same walk in milliseconds, with no rounding to do."
+
+[[command]]
+name = "HEXPIRETIME"
+group = "hash"
+since = "7.4.0"
+arity = -5
+plan = "point"
+bounded = "inherent"
+status = "shipped"
+wire = "verified"
+notes = "The moment rather than what is left of it. All five readers share one walk and two booleans decide the arithmetic, which is why there are two helpers behind these nine commands and not nine."
+
+[[command]]
+name = "HPEXPIRETIME"
+group = "hash"
+since = "7.4.0"
+arity = -5
+plan = "point"
+bounded = "inherent"
+status = "shipped"
+wire = "verified"
+notes = "The stored number handed straight back, since a deadline is already an absolute millisecond."
+
+[[command]]
+name = "HPERSIST"
+group = "hash"
+since = "7.4.0"
+arity = -5
+plan = "point"
+bounded = "inherent"
+status = "shipped"
+wire = "verified"
+notes = "Takes the deadline off and answers 1, without saying what it was. Worth knowing that a plain HSET does this too: writing a field clears its deadline, which has been Redis's rule since 7.4 and is the whole reason HGETEX exists as a command instead of a flag on HGET."
+
 
 # ------------------------------------------------------------------ scripting
 
