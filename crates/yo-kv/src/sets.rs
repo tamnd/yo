@@ -32,7 +32,7 @@ use std::collections::HashSet;
 
 use yo_common::Result;
 
-use crate::keyspace::{Keyspace, wrong_type};
+use crate::keyspace::Keyspace;
 use crate::scan::Cursor;
 use crate::set::{Member, Set};
 use crate::setops;
@@ -628,12 +628,7 @@ impl Keyspace {
     /// that is not a set. Every command above starts here, so the three cases a
     /// key can be in are decided once.
     fn set_slot(&mut self, key: &[u8]) -> Result<Option<u32>> {
-        self.reap(key);
-        match self.map.get(key) {
-            None => Ok(None),
-            Some(rec) if value::kind(rec) == Kind::Set => Ok(Some(value::slot(rec))),
-            Some(_) => Err(wrong_type()),
-        }
+        self.live_slot(key, Kind::Set)
     }
 
     /// The body in a slot the record pointed at.
