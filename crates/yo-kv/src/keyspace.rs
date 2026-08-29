@@ -24,6 +24,7 @@ use yo_common::{Code, Error, Rng};
 use yo_index::RawMap;
 
 use crate::Clock;
+use crate::hash::{self, Hash};
 use crate::set::{self, Set};
 use crate::slab::Slab;
 use crate::value::{self, Kind};
@@ -36,6 +37,14 @@ pub struct Keyspace {
     pub(crate) expired: u64,
     /// Every set in this database, addressed by the number in its record.
     pub(crate) sets: Slab<Set>,
+    /// Every hash in this database, addressed the same way.
+    ///
+    /// A slab per type rather than one slab of an enum, so that a record's four
+    /// bytes index a `Hash` directly and reaching one is a load and not a load
+    /// followed by a discriminant check. The type tag in the record already
+    /// says which slab to look in, so the discriminant would be a second copy
+    /// of a fact the record has.
+    pub(crate) hashes: Slab<Hash>,
     /// How many keys hold something that is not a string.
     ///
     /// This exists so that a database of nothing but strings, which is every
@@ -45,6 +54,8 @@ pub struct Keyspace {
     pub(crate) bodies: usize,
     /// Where a set changes representation.
     pub(crate) limits: set::Limits,
+    /// Where a hash changes representation.
+    pub(crate) hash_limits: hash::Limits,
     /// Where `SPOP` and `SRANDMEMBER` draw from.
     pub(crate) rng: Rng,
 }
@@ -73,8 +84,10 @@ impl Keyspace {
             clock,
             expired: 0,
             sets: Slab::new(),
+            hashes: Slab::new(),
             bodies: 0,
             limits: set::Limits::DEFAULT,
+            hash_limits: hash::Limits::DEFAULT,
             rng: Rng::new(clock.now_ms() ^ made.wrapping_mul(0x9e37_79b9_7f4a_7c15)),
         }
     }
@@ -109,6 +122,21 @@ impl Keyspace {
     #[inline]
     pub const fn set_limits(&mut self, limits: set::Limits) {
         self.limits = limits;
+    }
+
+    /// Where a hash changes representation, which is two `CONFIG` values.
+    #[inline]
+    pub const fn hash_limits(&self) -> &hash::Limits {
+        &self.hash_limits
+    }
+
+    /// Change where a hash changes representation.
+    ///
+    /// Same rule as the set: moving these leaves every hash that already exists
+    /// exactly as it is, and only decides what the next `HSET` builds.
+    #[inline]
+    pub const fn set_hash_limits(&mut self, limits: hash::Limits) {
+        self.hash_limits = limits;
     }
 
     /// The clock expiry compares against.
@@ -182,6 +210,21 @@ impl Keyspace {
         Some(self.sets.get(at)?.encoding())
     }
 
+    /// How a hash is represented, or `None` if `key` is not a hash.
+    ///
+    /// The same shape as [`Keyspace::set_encoding`] and for the same reason: the
+    /// record holds a slot number and the body is the thing that knows which of
+    /// the two it currently is.
+    pub fn hash_encoding(&mut self, key: &[u8]) -> Option<hash::Encoding> {
+        self.reap(key);
+        let rec = self.map.get(key)?;
+        if value::kind(rec) != Kind::Hash {
+            return None;
+        }
+        let at = value::slot(rec);
+        Some(self.hashes.get(at)?.encoding())
+    }
+
     /// `OBJECT ENCODING key`, as the word Redis puts on the wire.
     ///
     /// One place that knows every type's answer, so that adding the hash means
@@ -191,6 +234,7 @@ impl Keyspace {
         match self.kind_of(key)? {
             Kind::String => self.encoding(key).map(value::Encoding::name),
             Kind::Set => self.set_encoding(key).map(set::Encoding::name),
+            Kind::Hash => self.hash_encoding(key).map(hash::Encoding::name),
             other => unreachable!("nothing can store a {} yet", other.name()),
         }
     }
@@ -220,11 +264,14 @@ impl Keyspace {
                 let bytes = value::read(rec).to_vec();
                 self.store(key, &bytes, at);
             }
-            Kind::Set => {
+            // Every body type writes the same record: a tag and a slot number.
+            // The body is not touched and does not need to be, which is the
+            // whole point of keeping it out of the record.
+            kind @ (Kind::Set | Kind::Hash) => {
                 let slot = value::slot(rec);
                 let len = value::slot_record_len(at.is_some());
                 self.map.set_with(key, len, |out| {
-                    value::write_slot_record(out, Kind::Set, slot, at);
+                    value::write_slot_record(out, kind, slot, at);
                 });
             }
             other => unreachable!("nothing can store a {} yet", other.name()),
@@ -256,6 +303,11 @@ impl Keyspace {
             Kind::Set => {
                 let at = value::slot(rec);
                 self.sets.remove(at);
+                self.bodies -= 1;
+            }
+            Kind::Hash => {
+                let at = value::slot(rec);
+                self.hashes.remove(at);
                 self.bodies -= 1;
             }
             other => unreachable!("nothing can store a {} yet", other.name()),
@@ -295,6 +347,7 @@ impl Keyspace {
     pub fn clear(&mut self) {
         self.map.clear();
         self.sets.clear();
+        self.hashes.clear();
         self.bodies = 0;
     }
 
@@ -315,6 +368,8 @@ impl Keyspace {
         self.map.memory_bytes()
             + self.sets.memory_bytes()
             + self.sets.iter().map(Set::memory_bytes).sum::<usize>()
+            + self.hashes.memory_bytes()
+            + self.hashes.iter().map(Hash::memory_bytes).sum::<usize>()
     }
 
     /// Give back one segment's worth of space if one has gone mostly dead.

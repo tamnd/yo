@@ -69,7 +69,7 @@ doc = "08 section 6"
 [[group]]
 name = "hash"
 expected = 28
-status = "planned"
+status = "partial"
 doc = "08 section 3"
 
 [[group]]
@@ -693,6 +693,185 @@ bounded = "inherent"
 status = "shipped"
 wire = "verified"
 notes = "Presized from the first set, which is an upper bound on what a difference can keep."
+
+# ---------------------------------------------------------------------- hashes
+
+[[command]]
+name = "HSET"
+group = "hash"
+since = "2.0.0"
+arity = -4
+plan = "point"
+bounded = "inherent"
+status = "shipped"
+wire = "verified"
+notes = "One key lookup, then the pairs go into the body the record points at. A hash that does not exist yet is sized from the whole argument list, so an HSET with a thousand pairs builds the element table straight away instead of filling a listpack and converting it. Writing a field that is already there rewrites eight bytes of row and the new value and does not touch the field name at all, because the names are interned per collection."
+
+[[command]]
+name = "HSETNX"
+group = "hash"
+since = "2.0.0"
+arity = 4
+plan = "point"
+bounded = "inherent"
+status = "shipped"
+wire = "verified"
+notes = "Per field and not per key, unlike SETNX, so it writes into a hash that already exists as long as that one field is missing. One lookup for the probe and the write together."
+
+[[command]]
+name = "HMSET"
+group = "hash"
+since = "2.0.0"
+arity = -4
+plan = "point"
+bounded = "inherent"
+status = "shipped"
+wire = "verified"
+notes = "The same write as HSET with an OK instead of a count. Deprecated since 4.0 and still sent by a great deal of client code, so it shares the implementation rather than being left out or being an alias that drifts."
+
+[[command]]
+name = "HGET"
+group = "hash"
+since = "2.0.0"
+arity = 3
+plan = "point"
+bounded = "inherent"
+status = "shipped"
+wire = "verified"
+notes = "A linear walk with a step of two in a listpack, so a value is never matched as a field, and one probe in the element table. The value is written from where it lies and a value stored as an integer is formatted into the reply buffer rather than into the hash."
+
+[[command]]
+name = "HMGET"
+group = "hash"
+since = "2.0.0"
+arity = -3
+plan = "point"
+bounded = "inherent"
+status = "shipped"
+wire = "verified"
+notes = "One key lookup for every field asked about rather than one each, which is the only reason this exists over HGET in a pipeline. The reply is positional, so a field that is not there gets a nil and not a gap, and a key that is not there answers all nils rather than an empty array."
+
+[[command]]
+name = "HDEL"
+group = "hash"
+since = "2.0.0"
+arity = -3
+plan = "point"
+bounded = "inherent"
+status = "shipped"
+wire = "verified"
+notes = "One key lookup for the whole argument list. Removing the last field deletes the key, since an empty hash cannot exist. The value bytes are handed back to the hash's blob as dead rather than moved out of it, and the blob is rebuilt once the dead outnumber the live."
+
+[[command]]
+name = "HLEN"
+group = "hash"
+since = "2.0.0"
+arity = 2
+plan = "metadata"
+bounded = "inherent"
+status = "shipped"
+wire = "verified"
+notes = "The count the body already keeps, in both representations, so it is a key lookup and a load and never a walk."
+
+[[command]]
+name = "HEXISTS"
+group = "hash"
+since = "2.0.0"
+arity = 3
+plan = "point"
+bounded = "inherent"
+status = "shipped"
+wire = "verified"
+notes = "The HGET probe without the value, which matters in the listpack band where not reading the value is the whole saving."
+
+[[command]]
+name = "HSTRLEN"
+group = "hash"
+since = "3.2.0"
+arity = 3
+plan = "metadata"
+bounded = "inherent"
+status = "shipped"
+wire = "verified"
+notes = "A value held as an integer answers with how many digits it would take, counted rather than formatted, so this never writes a number out just to measure it. A missing field is zero and not a nil, which is Redis's answer and reads oddly until you notice it matches STRLEN on a missing key."
+
+[[command]]
+name = "HGETALL"
+group = "hash"
+since = "2.0.0"
+arity = 2
+plan = "whole-value"
+bounded = "risk"
+status = "shipped"
+wire = "verified"
+notes = "The whole hash, which is the risk the bound field names: a client that sends this at a hash of a million fields gets a million pair reply and there is no cursor in front of it. That is Redis's behaviour and the reason HSCAN exists. It answers a map on RESP3 and the same pairs flattened on RESP2, and the count comes from the body the walk is about to read rather than from a second lookup."
+
+[[command]]
+name = "HKEYS"
+group = "hash"
+since = "2.0.0"
+arity = 2
+plan = "whole-value"
+bounded = "risk"
+status = "shipped"
+wire = "verified"
+notes = "The same walk as HGETALL with the values dropped. It is not cheaper in the listpack band, where the values are in the way whatever is done with them, and it is cheaper in the table band, where the values are in a blob nothing touches."
+
+[[command]]
+name = "HVALS"
+group = "hash"
+since = "2.0.0"
+arity = 2
+plan = "whole-value"
+bounded = "risk"
+status = "shipped"
+wire = "verified"
+notes = "The same walk with the fields dropped."
+
+[[command]]
+name = "HINCRBY"
+group = "hash"
+since = "2.0.0"
+arity = 4
+plan = "point"
+bounded = "inherent"
+status = "shipped"
+wire = "verified"
+notes = "A field that is not there counts as zero and is created, which is what makes this the counter primitive it gets used as. The overflow is checked before the write rather than wrapped and stored, so a sum that leaves the range is an error and leaves the field holding exactly what it held."
+
+[[command]]
+name = "HINCRBYFLOAT"
+group = "hash"
+since = "2.6.0"
+arity = 4
+plan = "point"
+bounded = "inherent"
+status = "shipped"
+wire = "verified"
+notes = "The same rules with the float errors. An infinite increment is not refused up front: Redis parses it, does the addition and then reports that the result is not finite, so the message is about the result and not about the argument. The reply is a bulk string on both protocols and never a double, because the exact digits are the point and a client that got a double back would have to trust its own formatting to round trip."
+
+[[command]]
+name = "HRANDFIELD"
+group = "hash"
+since = "6.2.0"
+arity = -2
+plan = "point"
+bounded = "risk"
+status = "shipped"
+wire = "verified"
+notes = "A positive count is Knuth's selection sampling, one walk taking each field with the probability that leaves the right number, needing no memory at all. SRANDMEMBER splits its positive form two ways because a set can be millions of members and a draw of three should not walk them; a hash builds the whole answer either way, so there is nothing for a second strategy to save. A negative count repeats itself and answers an array rather than a map, since a map would silently lose the repeats. WITHVALUES nests each pair on RESP3 and flattens it on RESP2, which is Redis's split and the only place in this group where the protocols disagree about the shape rather than the type."
+
+[[command]]
+name = "HSCAN"
+group = "hash"
+since = "2.8.0"
+arity = -3
+plan = "point"
+bounded = "inherent"
+status = "shipped"
+wire = "verified"
+notes = "Only the element table walks in windows. A listpack answers with every pair and a finished cursor, ignoring the cursor it was given, which is what Redis does for the same encoding and is safe because promotion is one way. MATCH is matched against the field and never the value, and it decides how many pairs there are as the walk goes, so the reply header and the cursor in front of it are both written behind the body and rotated into place. NOVALUES is 7.4 and is not a shortcut for HKEYS: it still walks in windows, so it is the only way to page through the fields of a large hash without pulling every value across the wire too."
+
 
 # ------------------------------------------------------------------ scripting
 

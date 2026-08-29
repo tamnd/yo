@@ -1,0 +1,820 @@
+//! The hash commands.
+//!
+//! One method per Redis command on [`Keyspace`], the same arrangement the set
+//! and string commands use. The hash itself, and the choice between the two
+//! representations it can be in, is [`crate::hash`]. This file is what the wire
+//! and the embedded API both call.
+//!
+//! # Where a hash lives
+//!
+//! Exactly where a set lives. The record under the key holds a type tag and four
+//! bytes saying which slot of the database's hash slab the body is in, and
+//! reaching it is one key lookup and one dependent load. The two slabs are
+//! separate rather than one slab of an enum, because the record's tag already
+//! says which one to look in and a discriminant on the body would be a second
+//! copy of a fact that is already there.
+//!
+//! The same two invariants hold, and both are about not leaking. Every path that
+//! deletes a key goes through `drop_key` and every path that writes over one
+//! goes through `free_body`. And a hash that loses its last field is deleted
+//! rather than stored empty, because an empty hash does not exist in Redis:
+//! `HDEL` taking the last field makes `EXISTS` answer zero.
+//!
+//! # Returning a field's value
+//!
+//! A value in the listpack band may be stored as an integer, so there is no
+//! `&[u8]` to hand back for it without writing the digits somewhere first. The
+//! reading commands take a closure and hand it a [`Text`] instead, which the
+//! reply layer formats straight into the output buffer. That is Y18, and it is
+//! why `HGET` is not simply `-> Option<&[u8]>`.
+//!
+//! # Errors
+//!
+//! Every command here answers `WRONGTYPE` for a key holding something that is
+//! not a hash, and treats a missing key as an empty one.
+
+use yo_common::num::{parse_f64, parse_i64};
+use yo_common::{Code, Error, Result};
+
+use crate::hash::{Hash, Text};
+use crate::keyspace::{Keyspace, wrong_type};
+use crate::scan::Cursor;
+use crate::strings;
+use crate::value::{self, Kind};
+
+/// What Redis says when a field does not hold a number.
+const NOT_AN_INT: &str = "hash value is not an integer";
+/// And when it does not hold a float.
+const NOT_A_FLOAT: &str = "hash value is not a float";
+/// And when the sum leaves the range.
+const WOULD_OVERFLOW: &str = "increment or decrement would overflow";
+
+impl Keyspace {
+    /// `HSET key field value [field value ...]`. Answers how many were new.
+    ///
+    /// The pairs arrive as an iterator for the reason `SADD`'s members do: the
+    /// wire layer has them as positions in the connection's read buffer, and
+    /// collecting them into a slice first would be an allocation per command on
+    /// a shard thread.
+    ///
+    /// Redis's parser rejects an odd number of arguments before this is reached.
+    /// The embedded API has no parser in front of it, so an empty iterator does
+    /// not create the key, the same guard `SADD` has.
+    pub fn hset<'a>(
+        &mut self,
+        key: &[u8],
+        pairs: impl Iterator<Item = (&'a [u8], &'a [u8])> + Clone,
+    ) -> Result<usize> {
+        for (f, v) in pairs.clone() {
+            strings::check_len(key, f.len())?;
+            strings::check_len(key, v.len())?;
+        }
+        let at = match self.hash_slot(key)? {
+            Some(at) => at,
+            None => {
+                if pairs.clone().next().is_none() {
+                    return Ok(0);
+                }
+                let hint = pairs.clone().count();
+                self.new_hash(key, hint)
+            }
+        };
+
+        // Copied out so the body can be borrowed mutably for the whole loop
+        // rather than once a pair.
+        let limits = self.hash_limits;
+        let hash = self
+            .hashes
+            .get_mut(at)
+            .expect("the record points at its body");
+        let mut added = 0;
+        for (field, value) in pairs {
+            if hash.set(field, value, &limits) {
+                added += 1;
+            }
+        }
+        Ok(added)
+    }
+
+    /// `HSETNX key field value`. Answers whether it was written.
+    ///
+    /// Unlike `SETNX` this is per field and not per key, so it writes into a
+    /// hash that already exists as long as that one field is missing.
+    pub fn hsetnx(&mut self, key: &[u8], field: &[u8], value: &[u8]) -> Result<bool> {
+        strings::check_len(key, field.len())?;
+        strings::check_len(key, value.len())?;
+        let at = match self.hash_slot(key)? {
+            Some(at) => {
+                if self.hash_at(at).contains(field) {
+                    return Ok(false);
+                }
+                at
+            }
+            None => self.new_hash(key, 1),
+        };
+        let limits = self.hash_limits;
+        self.hashes
+            .get_mut(at)
+            .expect("the record points at its body")
+            .set(field, value, &limits);
+        Ok(true)
+    }
+
+    /// `HGET key field`, as a borrow rather than a copy.
+    ///
+    /// `f` is handed `None` for a missing key and for a missing field alike,
+    /// because both are a nil reply and the caller has no reason to tell them
+    /// apart. `HEXISTS` is the command that does.
+    pub fn hget<R>(
+        &mut self,
+        key: &[u8],
+        field: &[u8],
+        f: impl FnOnce(Option<Text<'_>>) -> R,
+    ) -> Result<R> {
+        let Some(at) = self.hash_slot(key)? else {
+            return Ok(f(None));
+        };
+        Ok(f(self.hash_at(at).get(field)))
+    }
+
+    /// `HMGET key field [field ...]`, one call of `f` per field asked for.
+    ///
+    /// Every field gets a call, including the ones that are not there, because
+    /// the reply is positional: a client sending three fields gets three
+    /// entries back and matches them up by position. A missing key answers all
+    /// nils rather than an empty array for the same reason.
+    pub fn hmget<'a, F>(
+        &mut self,
+        key: &[u8],
+        fields: impl Iterator<Item = &'a [u8]>,
+        mut f: F,
+    ) -> Result<()>
+    where
+        F: FnMut(Option<Text<'_>>),
+    {
+        let slot = self.hash_slot(key)?;
+        for field in fields {
+            match slot {
+                Some(at) => f(self.hash_at(at).get(field)),
+                None => f(None),
+            }
+        }
+        Ok(())
+    }
+
+    /// `HDEL key field [field ...]`. Answers how many were there.
+    ///
+    /// The key goes when the last field does.
+    pub fn hdel<'a>(
+        &mut self,
+        key: &[u8],
+        fields: impl Iterator<Item = &'a [u8]>,
+    ) -> Result<usize> {
+        let Some(at) = self.hash_slot(key)? else {
+            return Ok(0);
+        };
+        let hash = self
+            .hashes
+            .get_mut(at)
+            .expect("the record points at its body");
+        let mut gone = 0;
+        for field in fields {
+            if hash.remove(field) {
+                gone += 1;
+            }
+        }
+        if hash.is_empty() {
+            self.drop_key(key);
+        }
+        Ok(gone)
+    }
+
+    /// `HLEN key`.
+    pub fn hlen(&mut self, key: &[u8]) -> Result<usize> {
+        match self.hash_slot(key)? {
+            Some(at) => Ok(self.hash_at(at).len()),
+            None => Ok(0),
+        }
+    }
+
+    /// `HEXISTS key field`.
+    pub fn hexists(&mut self, key: &[u8], field: &[u8]) -> Result<bool> {
+        match self.hash_slot(key)? {
+            Some(at) => Ok(self.hash_at(at).contains(field)),
+            None => Ok(false),
+        }
+    }
+
+    /// `HSTRLEN key field`, without writing the value anywhere.
+    ///
+    /// A value held as an integer answers with how many digits it would take,
+    /// counted rather than formatted, which is what [`Text::byte_len`] is for.
+    pub fn hstrlen(&mut self, key: &[u8], field: &[u8]) -> Result<usize> {
+        match self.hash_slot(key)? {
+            Some(at) => Ok(self.hash_at(at).value_len(field).unwrap_or(0)),
+            None => Ok(0),
+        }
+    }
+
+    /// `HGETALL key`, `HKEYS key` and `HVALS key`, which differ only in what
+    /// the caller does with each pair.
+    ///
+    /// One method for the three because the walk is the whole of the work and
+    /// three copies of it would be three chances for one of them to drift. The
+    /// caller taking a pair and using half of it costs nothing, since neither
+    /// half is formatted until something asks for it.
+    ///
+    /// `Ok(false)` means the key was not there, which is an empty reply for all
+    /// three and never a nil.
+    pub fn hgetall<F>(&mut self, key: &[u8], mut f: F) -> Result<bool>
+    where
+        F: FnMut(Text<'_>, Text<'_>),
+    {
+        self.with_hash(key, |hash| match hash {
+            Some(h) => {
+                for (field, value) in h.iter() {
+                    f(field, value);
+                }
+                true
+            }
+            None => false,
+        })
+    }
+
+    /// Hand the hash under `key` to `f`, or hand it `None` if there is no key.
+    ///
+    /// The same thing [`Keyspace::with_set`] is for, and here it matters more.
+    /// `HGETALL` on RESP3 answers a map, whose header carries the pair count, so
+    /// the wire layer needs the length and then the pairs. Going back through
+    /// [`Keyspace::hlen`] for the header would be a second key lookup on the
+    /// command that is most likely to be in a loop.
+    ///
+    /// A callback rather than a returned `&Hash` because the reap happens under
+    /// `&mut self` and a borrow carved out of that cannot outlive the call.
+    pub fn with_hash<R>(&mut self, key: &[u8], f: impl FnOnce(Option<&Hash>) -> R) -> Result<R> {
+        let at = self.hash_slot(key)?;
+        Ok(f(at.map(|at| self.hash_at(at))))
+    }
+
+    /// `HSCAN key cursor [COUNT n]`, with the cursor to resume from.
+    ///
+    /// `NOVALUES` is the caller's business: it gets both halves and drops the
+    /// one it does not want, exactly as `HKEYS` does.
+    pub fn hscan<F>(&mut self, key: &[u8], cursor: Cursor, count: usize, f: F) -> Result<Cursor>
+    where
+        F: FnMut(Text<'_>, Text<'_>),
+    {
+        let Some(at) = self.hash_slot(key)? else {
+            return Ok(Cursor::END);
+        };
+        Ok(self.hash_at(at).scan(cursor, count, f))
+    }
+
+    /// `HINCRBY key field increment`. Answers the sum.
+    ///
+    /// A field that is not there counts as zero and is created, which is what
+    /// makes this the counter primitive it is used as. A field holding
+    /// something that is not an integer is an error and leaves the hash exactly
+    /// as it was, and so is a sum that leaves the range: Redis checks the
+    /// overflow before the write rather than wrapping and storing the wrap.
+    pub fn hincrby(&mut self, key: &[u8], field: &[u8], by: i64) -> Result<i64> {
+        strings::check_len(key, field.len())?;
+        let at = match self.hash_slot(key)? {
+            Some(at) => at,
+            None => self.new_hash(key, 1),
+        };
+        let current = match self.hash_at(at).get(field) {
+            Some(Text::Int(n)) => n,
+            Some(Text::Str(s)) => {
+                parse_i64(s).ok_or_else(|| Error::new(Code::Invalid, NOT_AN_INT))?
+            }
+            None => 0,
+        };
+        let next = current
+            .checked_add(by)
+            .ok_or_else(|| Error::new(Code::Invalid, WOULD_OVERFLOW))?;
+
+        let mut buf = [0u8; yo_common::num::DIGITS_MAX];
+        let text = yo_common::num::i64_digits(&mut buf, next);
+        let limits = self.hash_limits;
+        self.hashes
+            .get_mut(at)
+            .expect("the record points at its body")
+            .set(field, text, &limits);
+        Ok(next)
+    }
+
+    /// `HINCRBYFLOAT key field increment`. Answers the sum.
+    ///
+    /// The same rules with the float versions of the errors. An infinite
+    /// increment is not refused up front, for the reason `INCRBYFLOAT` gives:
+    /// Redis parses it, does the addition and then reports that the result is
+    /// not finite, so `HINCRBYFLOAT k f inf` says the increment would produce
+    /// infinity and not that the increment is not a float.
+    pub fn hincrbyfloat(&mut self, key: &[u8], field: &[u8], by: f64) -> Result<f64> {
+        strings::check_len(key, field.len())?;
+        let at = match self.hash_slot(key)? {
+            Some(at) => at,
+            None => self.new_hash(key, 1),
+        };
+        let current = match self.hash_at(at).get(field) {
+            Some(Text::Int(n)) => n as f64,
+            Some(Text::Str(s)) => {
+                parse_f64(s).ok_or_else(|| Error::new(Code::Invalid, NOT_A_FLOAT))?
+            }
+            None => 0.0,
+        };
+        let next = current + by;
+        if !next.is_finite() {
+            return Err(Error::new(
+                Code::Invalid,
+                "increment would produce NaN or Infinity",
+            ));
+        }
+
+        let mut text = Vec::with_capacity(32);
+        yo_common::num::push_double(&mut text, next);
+        let limits = self.hash_limits;
+        self.hashes
+            .get_mut(at)
+            .expect("the record points at its body")
+            .set(field, &text, &limits);
+        Ok(next)
+    }
+
+    /// `HRANDFIELD key`, as a borrow.
+    ///
+    /// `f` is handed `None` when the key is not there, which is a nil and not
+    /// an empty reply.
+    pub fn hrandfield<R>(
+        &mut self,
+        key: &[u8],
+        f: impl FnOnce(Option<(Text<'_>, Text<'_>)>) -> R,
+    ) -> Result<R> {
+        let Some(at) = self.hash_slot(key)? else {
+            return Ok(f(None));
+        };
+        let pick = self.rng.below(self.hash_at(at).len());
+        Ok(f(self.hash_at(at).at(pick)))
+    }
+
+    /// `HRANDFIELD key count`, which is two commands wearing one name.
+    ///
+    /// A negative count is the with repeats form: exactly that many fields,
+    /// drawn one at a time, and the same field can come back more than once. It
+    /// is the only form that can answer more fields than the hash holds.
+    ///
+    /// A positive count is distinct fields, at most as many as the hash holds.
+    /// `SRANDMEMBER` splits its distinct form two ways because a set can be
+    /// millions of members and drawing three of them should not walk all of
+    /// them. A hash draws differently: Redis's own `HRANDFIELD` with a positive
+    /// count builds the whole answer either way, so this walks the fields once
+    /// and takes each with the probability that leaves the right number at the
+    /// end. That is Knuth's selection sampling, it needs no memory at all, and
+    /// it is `O(len)` rather than `O(count)`.
+    ///
+    /// A shuffle is deliberately not done. Redis does not promise an order here
+    /// and the walk order is not the insertion order once a field has been
+    /// removed, so shuffling would buy a guarantee nobody is owed at the price
+    /// of an allocation.
+    pub fn hrandfield_n<F>(&mut self, key: &[u8], count: i64, mut f: F) -> Result<()>
+    where
+        F: FnMut(Text<'_>, Text<'_>),
+    {
+        let Some(at) = self.hash_slot(key)? else {
+            return Ok(());
+        };
+        // Borrowed apart rather than through `hash_at`, because drawing and
+        // reading have to be alive at the same time and a method taking `&self`
+        // would hold the whole database.
+        let rng = &mut self.rng;
+        let hash = self.hashes.get(at).expect("the record points at its body");
+        let len = hash.len();
+
+        let Ok(want) = usize::try_from(count) else {
+            let repeats = usize::try_from(count.unsigned_abs()).unwrap_or(usize::MAX);
+            for _ in 0..repeats {
+                let (field, value) = hash
+                    .at(rng.below(len))
+                    .expect("the draw was under the length");
+                f(field, value);
+            }
+            return Ok(());
+        };
+
+        let mut left = want.min(len);
+        let mut seen = len;
+        for i in 0..len {
+            if left == 0 {
+                break;
+            }
+            // Take this one with probability left/seen, which is what leaves
+            // exactly `left` taken by the end whatever the draws come out as.
+            if rng.below(seen) < left {
+                let (field, value) = hash.at(i).expect("i is under the length");
+                f(field, value);
+                left -= 1;
+            }
+            seen -= 1;
+        }
+        Ok(())
+    }
+
+    // ------------------------------------------------------------------ inside
+
+    /// The slot `key`'s hash is in, or `None` if there is no such key.
+    ///
+    /// This is the one place a hash command finds its body, so it is the one
+    /// place that has to reap first and answer `WRONGTYPE` for another type.
+    fn hash_slot(&mut self, key: &[u8]) -> Result<Option<u32>> {
+        self.reap(key);
+        match self.map.get(key) {
+            None => Ok(None),
+            Some(rec) if value::kind(rec) == Kind::Hash => Ok(Some(value::slot(rec))),
+            Some(_) => Err(wrong_type()),
+        }
+    }
+
+    /// The body in a slot the record pointed at.
+    ///
+    /// Panicking here means a record outlived its body, which is the one bug the
+    /// slab deliberately does not carry a generation counter to catch, so this
+    /// is where it would be caught instead.
+    #[inline]
+    fn hash_at(&self, at: u32) -> &Hash {
+        self.hashes.get(at).expect("the record points at its body")
+    }
+
+    /// Make an empty hash under `key` and answer which slot it went in.
+    ///
+    /// The hint only picks the representation to start in, so that an `HSET`
+    /// with a thousand pairs builds a table once instead of filling a listpack
+    /// and then converting it.
+    fn new_hash(&mut self, key: &[u8], hint: usize) -> u32 {
+        let at = self.hashes.insert(Hash::with_hint(hint, &self.hash_limits));
+        let len = value::slot_record_len(false);
+        self.map.set_with(key, len, |out| {
+            value::write_slot_record(out, Kind::Hash, at, None);
+        });
+        self.bodies += 1;
+        at
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::Clock;
+    use crate::hash::Encoding;
+
+    fn db() -> Keyspace {
+        Keyspace::with_clock(Clock::fixed(1_000))
+    }
+
+    fn set(d: &mut Keyspace, key: &[u8], pairs: &[(&[u8], &[u8])]) -> usize {
+        d.hset(key, pairs.iter().copied()).expect("a hash")
+    }
+
+    fn get(d: &mut Keyspace, key: &[u8], field: &[u8]) -> Option<String> {
+        d.hget(key, field, |t| t.map(|t| text(&t))).expect("a hash")
+    }
+
+    fn text(t: &Text<'_>) -> String {
+        String::from_utf8(t.to_vec()).expect("utf8 in these tests")
+    }
+
+    fn all(d: &mut Keyspace, key: &[u8]) -> Vec<(String, String)> {
+        let mut out = Vec::new();
+        d.hgetall(key, |f, v| out.push((text(&f), text(&v))))
+            .expect("a hash");
+        out.sort();
+        out
+    }
+
+    #[test]
+    fn setting_a_field_on_a_key_that_is_not_there_makes_it() {
+        let mut d = db();
+        assert_eq!(set(&mut d, b"h", &[(b"f", b"v")]), 1);
+        assert_eq!(d.kind_of(b"h"), Some(Kind::Hash));
+        assert_eq!(get(&mut d, b"h", b"f").as_deref(), Some("v"));
+    }
+
+    #[test]
+    fn writing_a_field_again_is_not_a_new_field() {
+        let mut d = db();
+        assert_eq!(set(&mut d, b"h", &[(b"f", b"one"), (b"g", b"two")]), 2);
+        assert_eq!(set(&mut d, b"h", &[(b"f", b"three")]), 0, "f was there");
+        assert_eq!(get(&mut d, b"h", b"f").as_deref(), Some("three"));
+        assert_eq!(d.hlen(b"h").expect("a hash"), 2);
+    }
+
+    #[test]
+    fn an_empty_write_does_not_make_a_key() {
+        let mut d = db();
+        let none: [(&[u8], &[u8]); 0] = [];
+        assert_eq!(d.hset(b"h", none.iter().copied()).expect("ok"), 0);
+        assert_eq!(d.kind_of(b"h"), None, "an empty hash does not exist");
+    }
+
+    #[test]
+    fn losing_the_last_field_loses_the_key() {
+        let mut d = db();
+        set(&mut d, b"h", &[(b"f", b"v"), (b"g", b"w")]);
+        assert_eq!(d.hdel(b"h", [b"f".as_slice()].into_iter()).expect("ok"), 1);
+        assert_eq!(d.kind_of(b"h"), Some(Kind::Hash), "g is still there");
+        assert_eq!(d.hdel(b"h", [b"g".as_slice()].into_iter()).expect("ok"), 1);
+        assert_eq!(d.kind_of(b"h"), None, "and now nothing is");
+        assert_eq!(d.len(), 0);
+    }
+
+    #[test]
+    fn every_command_says_wrongtype_for_a_string() {
+        let mut d = db();
+        d.set_plain(b"s", b"v").expect("room");
+
+        assert_eq!(
+            d.hset(b"s", [(b"f".as_slice(), b"v".as_slice())].into_iter())
+                .unwrap_err()
+                .code(),
+            Code::WrongType
+        );
+        assert!(d.hget(b"s", b"f", |_| ()).is_err());
+        assert!(d.hdel(b"s", [b"f".as_slice()].into_iter()).is_err());
+        assert!(d.hlen(b"s").is_err());
+        assert!(d.hexists(b"s", b"f").is_err());
+        assert!(d.hstrlen(b"s", b"f").is_err());
+        assert!(d.hgetall(b"s", |_, _| ()).is_err());
+        assert!(d.hsetnx(b"s", b"f", b"v").is_err());
+        assert!(d.hincrby(b"s", b"f", 1).is_err());
+        assert!(d.hincrbyfloat(b"s", b"f", 1.0).is_err());
+        assert!(d.hrandfield(b"s", |_| ()).is_err());
+        assert!(d.hrandfield_n(b"s", 1, |_, _| ()).is_err());
+        assert!(d.hscan(b"s", Cursor::START, 10, |_, _| ()).is_err());
+        assert!(
+            d.hmget(b"s", [b"f".as_slice()].into_iter(), |_| ())
+                .is_err()
+        );
+
+        assert_eq!(
+            d.kind_of(b"s"),
+            Some(Kind::String),
+            "and none of them wrote anything"
+        );
+    }
+
+    #[test]
+    fn a_missing_key_reads_as_an_empty_hash() {
+        let mut d = db();
+        assert_eq!(d.hlen(b"nope").expect("ok"), 0);
+        assert!(!d.hexists(b"nope", b"f").expect("ok"));
+        assert_eq!(d.hstrlen(b"nope", b"f").expect("ok"), 0);
+        assert_eq!(get(&mut d, b"nope", b"f"), None);
+        assert!(!d.hgetall(b"nope", |_, _| ()).expect("ok"));
+        assert_eq!(
+            d.hdel(b"nope", [b"f".as_slice()].into_iter()).expect("ok"),
+            0
+        );
+    }
+
+    #[test]
+    fn hmget_answers_once_per_field_asked_for() {
+        let mut d = db();
+        set(&mut d, b"h", &[(b"a", b"1"), (b"c", b"3")]);
+
+        let mut got = Vec::new();
+        d.hmget(b"h", [b"a".as_slice(), b"b", b"c"].into_iter(), |t| {
+            got.push(t.map(|t| text(&t)));
+        })
+        .expect("a hash");
+        assert_eq!(
+            got,
+            vec![Some("1".into()), None, Some("3".into())],
+            "the reply is positional, so b gets a nil and not a gap"
+        );
+
+        let mut missing = Vec::new();
+        d.hmget(b"gone", [b"a".as_slice(), b"b"].into_iter(), |t| {
+            missing.push(t.is_none());
+        })
+        .expect("no key");
+        assert_eq!(missing, vec![true, true], "a missing key is all nils");
+    }
+
+    #[test]
+    fn hsetnx_writes_only_a_field_that_is_not_there() {
+        let mut d = db();
+        assert!(d.hsetnx(b"h", b"f", b"one").expect("ok"), "made the key");
+        assert!(!d.hsetnx(b"h", b"f", b"two").expect("ok"), "f was there");
+        assert_eq!(get(&mut d, b"h", b"f").as_deref(), Some("one"));
+        assert!(
+            d.hsetnx(b"h", b"g", b"two").expect("ok"),
+            "and it is per field, not per key"
+        );
+        assert_eq!(d.hlen(b"h").expect("ok"), 2);
+    }
+
+    #[test]
+    fn hstrlen_counts_a_number_without_writing_it() {
+        let mut d = db();
+        set(&mut d, b"h", &[(b"n", b"-12345"), (b"s", b"hello")]);
+        assert_eq!(d.hstrlen(b"h", b"n").expect("ok"), 6);
+        assert_eq!(d.hstrlen(b"h", b"s").expect("ok"), 5);
+        assert_eq!(d.hstrlen(b"h", b"nope").expect("ok"), 0);
+    }
+
+    #[test]
+    fn incrementing_counts_up_from_nothing_and_refuses_what_is_not_a_number() {
+        let mut d = db();
+        assert_eq!(d.hincrby(b"h", b"n", 5).expect("ok"), 5, "absent is zero");
+        assert_eq!(d.hincrby(b"h", b"n", -7).expect("ok"), -2);
+        assert_eq!(get(&mut d, b"h", b"n").as_deref(), Some("-2"));
+
+        set(&mut d, b"h", &[(b"s", b"words")]);
+        let err = d.hincrby(b"h", b"s", 1).unwrap_err();
+        assert_eq!(err.code(), Code::Invalid);
+        assert_eq!(err.message(), NOT_AN_INT);
+        assert_eq!(
+            get(&mut d, b"h", b"s").as_deref(),
+            Some("words"),
+            "and it left the field alone"
+        );
+    }
+
+    #[test]
+    fn an_increment_that_leaves_the_range_is_refused_and_not_wrapped() {
+        let mut d = db();
+        let max = i64::MAX.to_string();
+        set(&mut d, b"h", &[(b"n", max.as_bytes())]);
+        let err = d.hincrby(b"h", b"n", 1).unwrap_err();
+        assert_eq!(err.message(), WOULD_OVERFLOW);
+        assert_eq!(
+            get(&mut d, b"h", b"n").as_deref(),
+            Some(max.as_str()),
+            "the field still holds what it held"
+        );
+    }
+
+    #[test]
+    fn incrementing_by_a_float_reports_the_sum_and_refuses_infinity() {
+        let mut d = db();
+        assert!((d.hincrbyfloat(b"h", b"f", 10.5).expect("ok") - 10.5).abs() < 1e-9);
+        assert!((d.hincrbyfloat(b"h", b"f", 0.1).expect("ok") - 10.6).abs() < 1e-9);
+
+        let err = d.hincrbyfloat(b"h", b"f", f64::INFINITY).unwrap_err();
+        assert_eq!(err.message(), "increment would produce NaN or Infinity");
+
+        set(&mut d, b"h", &[(b"s", b"words")]);
+        assert_eq!(
+            d.hincrbyfloat(b"h", b"s", 1.0).unwrap_err().message(),
+            NOT_A_FLOAT
+        );
+    }
+
+    #[test]
+    fn a_hash_promotes_in_the_keyspace_and_object_encoding_says_so() {
+        let mut d = db();
+        set(&mut d, b"h", &[(b"f", b"v")]);
+        assert_eq!(d.hash_encoding(b"h"), Some(Encoding::Listpack));
+        assert_eq!(d.encoding_name(b"h"), Some("listpack"));
+
+        for i in 0..200u32 {
+            let f = format!("field-{i}");
+            set(&mut d, b"h", &[(f.as_bytes(), b"v")]);
+        }
+        assert_eq!(d.hash_encoding(b"h"), Some(Encoding::Hashtable));
+        assert_eq!(d.encoding_name(b"h"), Some("hashtable"));
+        assert_eq!(d.hlen(b"h").expect("ok"), 201);
+        assert_eq!(
+            d.hash_encoding(b"missing"),
+            None,
+            "and a key that is not a hash has no hash encoding"
+        );
+    }
+
+    #[test]
+    fn a_hash_survives_being_given_a_deadline_and_goes_when_it_passes() {
+        let mut d = db();
+        set(&mut d, b"h", &[(b"f", b"v"), (b"g", b"w")]);
+        assert!(d.set_expiry(b"h", Some(1_100)));
+        assert_eq!(
+            all(&mut d, b"h"),
+            vec![("f".into(), "v".into()), ("g".into(), "w".into())],
+            "writing the record did not touch the body"
+        );
+
+        d.clock_mut().advance(100);
+        assert_eq!(d.kind_of(b"h"), None);
+        assert_eq!(d.len(), 0);
+        assert_eq!(d.expired_keys(), 1);
+    }
+
+    #[test]
+    fn writing_a_string_over_a_hash_gives_the_body_back() {
+        let mut d = db();
+        for i in 0..300u32 {
+            let f = format!("field-{i}");
+            set(&mut d, b"h", &[(f.as_bytes(), b"a value of some length")]);
+        }
+        assert_eq!(d.hashes.len(), 1);
+        let held = d.memory_bytes();
+        d.set_plain(b"h", b"now a string").expect("room");
+
+        assert_eq!(d.kind_of(b"h"), Some(Kind::String));
+        // The slot rather than the byte count, because the byte count is mostly
+        // the arena and the arena does not give a segment back until it is
+        // compacted. A body that kept its slot would be reachable forever and
+        // is the exact leak `free_body` exists to stop.
+        assert_eq!(d.hashes.len(), 0, "the body went with the record");
+        assert!(d.memory_bytes() < held, "and its bytes went with it");
+    }
+
+    #[test]
+    fn a_scan_walks_a_hash_in_the_keyspace_exactly_once() {
+        let mut d = db();
+        for i in 0..500u32 {
+            let f = format!("field-{i}");
+            let v = format!("value-{i}");
+            set(&mut d, b"h", &[(f.as_bytes(), v.as_bytes())]);
+        }
+
+        let mut seen: Vec<(String, String)> = Vec::new();
+        let mut cursor = Cursor::START;
+        loop {
+            cursor = d
+                .hscan(b"h", cursor, 32, |f, v| seen.push((text(&f), text(&v))))
+                .expect("a hash");
+            if cursor == Cursor::END {
+                break;
+            }
+        }
+        seen.sort();
+        seen.dedup();
+        assert_eq!(seen.len(), 500, "every field once and only once");
+        for (f, v) in &seen {
+            assert_eq!(
+                f.strip_prefix("field-"),
+                v.strip_prefix("value-"),
+                "and paired with its own value"
+            );
+        }
+    }
+
+    #[test]
+    fn a_draw_takes_the_count_asked_for_and_repeats_only_when_told_to() {
+        let mut d = db();
+        d.seed(7);
+        for i in 0..10u32 {
+            let f = format!("f{i}");
+            set(&mut d, b"h", &[(f.as_bytes(), b"v")]);
+        }
+
+        let mut got = Vec::new();
+        d.hrandfield_n(b"h", 4, |f, _| got.push(text(&f)))
+            .expect("ok");
+        assert_eq!(got.len(), 4);
+        got.sort();
+        got.dedup();
+        assert_eq!(got.len(), 4, "a positive count is distinct");
+
+        let mut over = Vec::new();
+        d.hrandfield_n(b"h", 25, |f, _| over.push(text(&f)))
+            .expect("ok");
+        assert_eq!(over.len(), 10, "and never more than the hash holds");
+
+        let mut with_repeats = Vec::new();
+        d.hrandfield_n(b"h", -25, |f, _| with_repeats.push(text(&f)))
+            .expect("ok");
+        assert_eq!(
+            with_repeats.len(),
+            25,
+            "a negative count is exactly that many, repeats and all"
+        );
+
+        let one = d
+            .hrandfield(b"h", |p| p.map(|(f, _)| text(&f)))
+            .expect("ok");
+        assert!(one.is_some());
+        assert!(
+            d.hrandfield(b"gone", |p| p.is_none()).expect("ok"),
+            "and a missing key draws a nil"
+        );
+    }
+
+    #[test]
+    fn a_flush_takes_the_hashes_with_it() {
+        let mut d = db();
+        for i in 0..200u32 {
+            let f = format!("field-{i}");
+            set(&mut d, b"h", &[(f.as_bytes(), b"v")]);
+        }
+        set(&mut d, b"other", &[(b"f", b"v")]);
+        d.clear();
+
+        assert_eq!(d.len(), 0);
+        assert_eq!(d.kind_of(b"h"), None);
+        // Writing again reuses the slab from the start rather than growing past
+        // the slots the cleared hashes had.
+        set(&mut d, b"h", &[(b"f", b"v")]);
+        assert_eq!(d.hlen(b"h").expect("ok"), 1);
+    }
+}

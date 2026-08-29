@@ -77,6 +77,7 @@ pub mod cond;
 pub mod counter;
 pub mod elem;
 pub mod hash;
+pub mod hashes;
 pub mod intset;
 pub mod keyspace;
 pub mod lcs;
