@@ -14,6 +14,11 @@
 #
 # reserve = false means the row is audited but deliberately never published to
 # (dx/16 §11): port-PR channels, and names we refuse to squat.
+#
+# verdict = "<state>" pins a state a probe cannot reach, for a registry with no
+# endpoint that answers the question. It is honoured only where the probe says
+# `unknown`, so it can never hide a name being taken. `note` is then written by
+# hand as well and says how the verdict was established.
 
 [[name]]
 registry  = "crates.io"
@@ -198,12 +203,23 @@ note      = "Main bucket"
 [[name]]
 registry  = "docker-hub"
 name      = "yo"
+namespace = "tamnd87"
+state     = "reserved"
+probed    = "2026-08-29"
+owner     = "tamnd87"
+fallback  = ""
+note      = "account tamnd87, 0.0.1"
+
+[[name]]
+registry  = "docker-hub"
+name      = "yo"
 namespace = "tamnd"
-state     = "free"
+state     = "blocked"
 probed    = "2026-08-29"
 owner     = "tamnd"
-fallback  = ""
-note      = ""
+fallback  = "tamnd87/yo"
+note      = "refused at signup 2026-08-29; no read API shows it, so who holds it is not knowable"
+verdict   = "blocked"
 
 [[name]]
 registry  = "rubygems"

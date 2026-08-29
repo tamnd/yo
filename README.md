@@ -25,9 +25,10 @@ There is nothing to install. Every package below is published at `0.0.1`, holds 
 | Swift | `.package(url: "https://github.com/tamnd/yo-swift", from: "0.0.1")` | [yo-swift](https://github.com/tamnd/yo-swift) |
 | Dart | `dart pub add yodb` | [yo-dart](https://github.com/tamnd/yo-dart) |
 | C, C++ | nothing published; the library ships as `libyo` | [yo-c](https://github.com/tamnd/yo-c) |
+| Docker | `docker run tamnd87/yo` | here |
 
 The command is `yodb` and not `yo`, because `yo` on `PATH` belongs to Yeoman. Only the executable and the environment variables take that prefix. The C library stays `libyo`, the header stays `yo.h`, the symbols stay `yo_*` and the file extension stays `.yo`.
 
-npm is the one place the name is not plain `yodb`: npm refused the unscoped name under its similarity filter, so the package is `@yodb/core`. Every other registry is `yodb`.
+Two registries are not plain `yodb`. npm refused the unscoped name under its similarity filter, so the package is `@yodb/core`. Docker Hub refused the account name `tamnd` at signup, so the image is under `tamnd87` and is `tamnd87/yo`. Everywhere else is `yodb`.
 
 Each of these was installed on a machine that had never seen it before this table was written, rather than being copied out of a build script.

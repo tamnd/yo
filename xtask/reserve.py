@@ -24,10 +24,12 @@ from __future__ import annotations
 
 import argparse
 import atexit
+import base64
 import functools
 import json
 import os
 import re
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -40,6 +42,20 @@ from typing import Callable
 UA = "yo-name-audit (+https://github.com/tamnd/yo)"
 TIMEOUT = 20
 IDENTITY = "tamnd"
+
+# Docker Hub is the one registry where the account is not `tamnd`. The name was
+# refused at signup on 2026-08-29 and it is not visible through any read API, so
+# there is nothing to point at and no way to find out who has it. The account is
+# `tamnd87` and the image is `tamnd87/yo`, which is the second exception to
+# one-name-everywhere after npm's `@yodb/core`. It lives here rather than being
+# derived from a row's `owner`, because a probe that trusted the file to say who
+# owns a name could never report that a name had been taken from us.
+DOCKER_IDENTITY = "tamnd87"
+
+# Named so that a machine which already has one does not get a second, and so
+# that a stale one can be found and deleted by hand. `docker buildx create` with
+# no name invents one, which makes both of those harder than they need to be.
+BUILDX_BUILDER = "yo-placeholder"
 
 # The version every placeholder is published at, in one place because it moves.
 # It was 0.0.0 until a registry that will not take the same version twice had to
@@ -432,11 +448,53 @@ def p_scoop(name: str, _ns: str):
     return (FREE, "Main bucket") if code == 404 else (BLOCKED, "in Main")
 
 
-def p_dockerhub(_name: str, ns: str):
-    code, _ = get(f"https://hub.docker.com/v2/users/{ns}/")
+def p_dockerhub(name: str, ns: str):
+    """Docker Hub, where a namespace is an account and cannot be probed.
+
+    This used to read a 404 from `v2/users/{ns}/` as FREE, and it reported
+    `tamnd` free on 2026-08-29. Signup then refused `tamnd`. Docker Hub has no
+    public endpoint that separates "nobody has this" from "you may not have
+    this": `v2/users/`, `v2/orgs/` and the publisher API all 404 for a refused
+    name and for a name nobody has ever asked for, and `v2/repositories/{ns}/`
+    and the registry auth service answer 200 for every string on earth. The only
+    oracle is the signup form, which is a write.
+
+    So a 404 is now UNKNOWN and not FREE. It is the weaker claim, and it is the
+    true one. The cost of the old answer was a name in the audit table that read
+    as ours for the taking for as long as nobody tried, which is `dx/16` §7.3
+    again: a reading that looks like a measurement and is not one.
+
+    A 200 is the one direction the endpoint can actually answer: somebody holds
+    it, and it says who. If that somebody is us the name is held, and whether it
+    is `reserved` or `released` follows from the image under it, not from the
+    account.
+    """
+    code, d = get_json(f"https://hub.docker.com/v2/users/{ns}/")
     if code == 0:
         return UNKNOWN, "unreachable"
-    return (FREE, "") if code == 404 else (BLOCKED, f"http {code}")
+    if code == 404:
+        return UNKNOWN, "no public account; only signup can tell free from refused"
+    if code != 200 or not d:
+        return UNKNOWN, f"http {code}"
+    who = d.get("username") or "?"
+    if who != DOCKER_IDENTITY:
+        return BLOCKED, f"account {who}"
+    code, tags = get_json(
+        f"https://hub.docker.com/v2/repositories/{ns}/{name}/tags/?page_size=100"
+    )
+    if code == 404:
+        # The account is ours, so every repository under it is ours to create
+        # and nobody else can take this name. That is the whole reservation on
+        # Docker Hub; the image is only there so `docker run` says the same
+        # sentence the other bindings raise.
+        return RESERVED, f"account {who}, no image yet"
+    if code != 200 or not tags:
+        return UNKNOWN, f"account {who}, tags http {code}"
+    names = {t.get("name") for t in tags.get("results") or []}
+    real = sorted(n for n in names if n and n not in {"latest", PLACEHOLDER})
+    if real:
+        return RELEASED, f"account {who}, tags {', '.join(real[:3])}"
+    return RESERVED, f"account {who}, {PLACEHOLDER}"
 
 
 def p_rubygems(name: str, _ns: str):
@@ -583,6 +641,11 @@ class Row:
     fallback: str = ""
     note: str = ""
     reserve: bool = True  # false = audited but never published to (§11)
+    # A state established by hand, for a name whose registry has no endpoint
+    # that can answer the question. It is honoured only where the probe comes
+    # back `unknown`; anything a probe can actually see still wins, so a stale
+    # verdict cannot hide a name being taken out from under us.
+    verdict: str = ""
 
     def key(self) -> str:
         return f"{self.registry}:{self.namespace or '-'}/{self.name}"
@@ -607,6 +670,8 @@ def dump(path: str, rows: list[Row], header: str) -> None:
             out.append(f'{f.ljust(w)} = "{esc(getattr(r, f))}"')
         if not r.reserve:
             out.append(f'{"reserve".ljust(w)} = false')
+        if r.verdict:
+            out.append(f'{"verdict".ljust(w)} = "{esc(r.verdict)}"')
         out.append("")
     with open(path, "w") as fh:
         fh.write("\n".join(out).rstrip() + "\n")
@@ -628,7 +693,12 @@ HEADER = """\
 #         unknown   the probe failed — never treated as free
 #
 # reserve = false means the row is audited but deliberately never published to
-# (dx/16 §11): port-PR channels, and names we refuse to squat.\
+# (dx/16 §11): port-PR channels, and names we refuse to squat.
+#
+# verdict = "<state>" pins a state a probe cannot reach, for a registry with no
+# endpoint that answers the question. It is honoured only where the probe says
+# `unknown`, so it can never hide a name being taken. `note` is then written by
+# hand as well and says how the verdict was established.\
 """
 
 
@@ -653,6 +723,16 @@ def cmd_audit(args) -> int:
             print(f"  {r.key().ljust(width)}  no probe for registry {r.registry!r}")
             continue
         state, note = probe(r.name, r.namespace)
+        if r.verdict and state == UNKNOWN:
+            # A probe that could not see is not evidence against something a
+            # person established some other way. Docker Hub refusing `tamnd` at
+            # signup is a fact; `v2/users/tamnd/` returning 404 afterwards is
+            # not a contradiction of it, it is the same silence that a name
+            # nobody has ever asked for gives back.
+            print(f"= {r.key().ljust(width)}  {r.verdict.ljust(8)}  "
+                  f"{r.note}  (by hand; probe says {state})")
+            r.state, r.probed = r.verdict, today
+            continue
         old = r.state
         flag = " "
         if old and old != state:
@@ -703,6 +783,12 @@ WHAT = {
     "pub.dev:yodb": "its Dart binding",
     "maven-central:yodb": "its Java binding",
     "nuget:Yodb": "its .NET binding",
+    # Keyed on the bare name, so npm's row is `core` and not `@yodb/core`, and
+    # Docker Hub's is `yo` and not `tamnd87/yo`. Both namespaces are exceptions
+    # to one-name-everywhere and both live in the row's `namespace` field;
+    # putting either one in this key would hide the exception in a second place.
+    "npm:core": "its Node.js binding",
+    "docker-hub:yo": "the server, as a container image",
     "cocoapods:Yodb": "its Swift binding",
     "rubygems:yodb": "its Ruby binding",
     "hex:yodb": "its Elixir binding",
@@ -1427,6 +1513,146 @@ export default {{ NOT_YET, open }};
     )
 
 
+def b_docker(row, root, version, desc):
+    """Docker Hub, through `docker buildx build --push`.
+
+    The image is not what holds the name. Owning the account holds it: every
+    repository under `tamnd87` is ours to create and nobody else can make one
+    there. The image exists so that `docker run tamnd87/yo` answers with the
+    same sentence the other seven bindings raise, instead of "not found", which
+    is what somebody who read the README and tried it would otherwise get.
+
+    It is `scratch` plus one static binary, about 1.2 MB, because a placeholder
+    that pulls a 70 MB base image to print one line is charging a stranger real
+    bandwidth for our name. The binary is cross-compiled in the builder stage
+    rather than emulated, so `linux/amd64` and `linux/arm64` both come out of
+    one pass on either kind of machine and neither needs QEMU.
+
+    It exits 1. Everything else in this file raises, and an image that printed
+    the sentence and exited 0 would pass a health check.
+    """
+    tag = f"{row.namespace}/{row.name}"
+    raises = raises_for(version)
+
+    _w(root, "main.go", f'''
+// {desc}
+//
+// {MILESTONE}
+package main
+
+import (
+	"fmt"
+	"os"
+)
+
+// notYet is the message every placeholder in every yo ecosystem carries.
+const notYet = "{raises}"
+
+func main() {{
+	fmt.Fprintln(os.Stderr, notYet)
+	// Non-zero, for the same reason the library bindings raise instead of
+	// returning nil: a caller that does not check is told anyway.
+	os.Exit(1)
+}}
+'''.lstrip())
+
+    _w(root, "go.mod", f"module {row.name}\n\ngo 1.25\n")
+
+    # CGO off and the symbol table stripped is what makes the binary runnable on
+    # `scratch`, which has no libc and no dynamic loader to find one with.
+    _w(root, "Dockerfile", f'''
+# syntax=docker/dockerfile:1
+
+FROM --platform=$BUILDPLATFORM golang:1.25-alpine AS build
+ARG TARGETOS
+ARG TARGETARCH
+WORKDIR /src
+COPY go.mod main.go ./
+RUN CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH \\
+    go build -trimpath -ldflags="-s -w" -o /yodb .
+
+FROM scratch
+COPY --from=build /yodb /yodb
+LABEL org.opencontainers.image.title="{tag}" \\
+      org.opencontainers.image.description="{desc}" \\
+      org.opencontainers.image.version="{version}" \\
+      org.opencontainers.image.source="{REPO}" \\
+      org.opencontainers.image.licenses="{LICENSE_LINE}"
+ENTRYPOINT ["/yodb"]
+'''.lstrip())
+
+    _w(root, "README.md", _readme(desc, PLACEHOLDER_BODY))
+
+    # Docker reads credentials from a config.json and does not expand
+    # environment variables inside one, so unlike the .npmrc above this file
+    # holds the real thing. It is written 0600 into the build root, which is a
+    # temporary directory, for the same reason the .npmrc is: a publish run must
+    # not leave a credential in the home directory of the machine it ran on.
+    auth = base64.b64encode(
+        f"{os.environ['DOCKERHUB_USERNAME']}:{os.environ['DOCKERHUB_TOKEN']}".encode()
+    ).decode()
+    cfg = _w(root, ".docker/config.json", json.dumps(
+        {"auths": {"https://index.docker.io/v1/": {"auth": auth}}}, indent=2) + "\n")
+    os.chmod(cfg, 0o600)
+    dcfg = os.path.join(root, ".docker")
+    env = {"DOCKER_CONFIG": dcfg}
+
+    # DOCKER_CONFIG is not just where the credential lives. It is also where
+    # docker finds per-user CLI plugins and where buildx keeps the list of
+    # builder instances, so pointing it at a directory holding only a
+    # config.json takes buildx away and then takes its builders away. Both
+    # failures land on the push step alone, after the same flags worked twice in
+    # the checks: first `unknown flag: --builder`, then `no builder found`.
+    # Neither error mentions DOCKER_CONFIG.
+    #
+    # So everything in the real directory is linked across and only config.json
+    # is replaced. The isolation that is wanted here is of the credential, not
+    # of the tool.
+    real = os.environ.get("DOCKER_CONFIG") or os.path.expanduser("~/.docker")
+    if os.path.isdir(real):
+        for entry in os.listdir(real):
+            if entry != "config.json":
+                os.symlink(os.path.join(real, entry), os.path.join(dcfg, entry))
+
+    plat = "linux/amd64,linux/arm64"
+    # A manifest list needs the container driver. The default `docker` driver
+    # builds one platform and refuses to export two, with an error that reads
+    # like a flag problem rather than a builder problem. Created here if it is
+    # missing so the first run on a new machine works.
+    ensure = ["sh", "-c",
+              f"docker buildx inspect {BUILDX_BUILDER} >/dev/null 2>&1 || "
+              f"docker buildx create --name {BUILDX_BUILDER} "
+              f"--driver docker-container --bootstrap"]
+
+    return (
+        [
+            Step("builder", ensure, root),
+            # Builds both platforms and throws the result away. It is the whole
+            # publish minus the push, which is the only check worth having here.
+            Step("build both platforms", [
+                "docker", "buildx", "build", "--builder", BUILDX_BUILDER,
+                "--platform", plat, ".",
+            ], root),
+            # Builds one platform, runs it, and requires the whole line back.
+            # Every other builder here checks that an artifact packs; none of
+            # them check what it says, which is how npm shipped a different
+            # sentence from the other five for a day. An image can be run, so
+            # this one is checked, and `-x` means a sentence with something
+            # appended to it fails too.
+            Step("run it and read the message", ["sh", "-c",
+                 f"docker buildx build --builder {BUILDX_BUILDER} --load "
+                 f"-t {row.name}-placeholder-check:{version} . >/dev/null 2>&1 "
+                 f"&& docker run --rm {row.name}-placeholder-check:{version} "
+                 f"2>&1 | grep -qxF {shlex.quote(raises)}"], root),
+        ],
+        [Step("build and push", [
+            "docker", "buildx", "build", "--builder", BUILDX_BUILDER,
+            "--platform", plat, "--push",
+            "-t", f"{tag}:{version}", "-t", f"{tag}:latest", ".",
+        ], root, env=env, loud=True)],
+    )
+
+
 BUILDERS = {
     "crates.io": b_crates,
     "pypi": b_pypi,
@@ -1434,6 +1660,7 @@ BUILDERS = {
     "pub.dev": b_pub,
     "maven-central": b_maven,
     "nuget": b_nuget,
+    "docker-hub": b_docker,
 }
 
 # The credential each builder needs before it is worth starting.
@@ -1447,6 +1674,7 @@ NEEDS = {
         "MAVEN_GPG_KEY_ID", "MAVEN_GPG_PASSPHRASE",
     ],
     "nuget": ["NUGET_API_KEY"],
+    "docker-hub": ["DOCKERHUB_USERNAME", "DOCKERHUB_TOKEN"],
 }
 
 
@@ -1476,9 +1704,33 @@ def cmd_apply(args) -> int:
     # for something that cannot happen. Every other registry keeps the strict
     # rule, because there `unknown` means the probe could not ask.
     ok_states = {FREE, UNKNOWN} if reg == "maven-central" else {FREE}
+    if reg == "docker-hub":
+        # The second documented exception, and it is structural rather than a
+        # gap in a probe. A Docker Hub namespace is an account, so once the
+        # account exists every repository under it is already ours and this row
+        # can never read `free` again. Waiting for `free` would wait for the
+        # reservation to be undone.
+        ok_states = {RESERVED, UNKNOWN}
+    if args.republish:
+        # A seatbelt, not a formality. This command publishes placeholders and
+        # nothing else, so it may only ever push a 0.0.x. Without the check a
+        # stale YODB_PLACEHOLDER_VERSION could be pushed over a real release,
+        # and on npm, pub.dev and Docker Hub that moves `latest` to it.
+        if not version.startswith("0.0."):
+            print(
+                f"refusing to republish at {version}: this command publishes "
+                f"placeholders and a placeholder is a 0.0.x. Cut a real "
+                f"release with the release workflow, not with this.",
+                file=sys.stderr,
+            )
+            return 2
+        ok_states = ok_states | {RESERVED, RELEASED}
     todo = [r for r in rows if r.reserve and r.registry == reg and r.state in ok_states]
     if not todo:
-        print(f"nothing to do for {reg}: no rows in state {FREE}.")
+        print(
+            f"nothing to do for {reg}: no rows in state "
+            f"{', '.join(sorted(ok_states))}."
+        )
         return 0
 
     print(f"registry:  {reg}")
@@ -1637,6 +1889,11 @@ def main() -> int:
         "--yes", action="store_true",
         help="actually publish. Without it, everything is built and checked "
              "and nothing leaves the machine.",
+    )
+    ap_apply.add_argument(
+        "--republish", action="store_true",
+        help="also act on names already held, to move them to a new "
+             "placeholder version. Refuses anything that is not a 0.0.x.",
     )
     ap_apply.set_defaults(fn=cmd_apply)
     ap_docs = sub.add_parser("docs")
