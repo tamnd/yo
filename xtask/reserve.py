@@ -63,7 +63,7 @@ BUILDX_BUILDER = "yo-placeholder"
 # to compare against a literal 0.0.0 to tell "our placeholder" from "a real
 # release", and after the republish all three quietly started reading our own
 # empty packages as shipped software.
-PLACEHOLDER = os.environ.get("YODB_PLACEHOLDER_VERSION", "0.0.1")
+PLACEHOLDER = os.environ.get("YODB_PLACEHOLDER_VERSION", "0.0.2")
 
 # ---------------------------------------------------------------------------
 # states
@@ -1830,22 +1830,71 @@ end
     _w(root, "README.md", _readme(desc, PLACEHOLDER_BODY))
 
     # The check the lint does not do. `pod spec lint` says the sources compile;
-    # this says they carry the sentence, by reading the tag the podspec points
-    # at rather than any local checkout. Without it CocoaPods could ship a pod
-    # that builds, imports and stays quiet, which is the divergence npm shipped
-    # for a day and the one Docker Hub's registry page nearly shipped again.
-    sentence = shlex.quote(raises)
-    src = f"{SWIFT_REPO}/raw/{tag}/Sources/Yodb"
-    carries = (
-        f"git ls-remote --tags {SWIFT_REPO}.git refs/tags/{tag} | grep -q . && "
-        f"curl -fsSL {src}/Yodb.swift {src}/YoError.swift {src}/YoCode.swift "
-        f"| grep -qF {sentence}"
-    )
+    # this says they say something, by resolving the tag the podspec points at
+    # and calling into it. Without it CocoaPods could ship a pod that builds,
+    # imports and stays quiet, which is the divergence npm shipped for a day and
+    # the one Docker Hub's registry page nearly shipped again.
+    #
+    # The first version of this grepped the three source files at the tag over
+    # HTTP, and it failed against a package that does carry the sentence: the
+    # string is built from two adjacent literals so the line breaks after "at ".
+    # Which is the lesson again in miniature. Reading the source is a proxy for
+    # what the code does, and a proxy that a line break can flip is not one. So
+    # it resolves and runs, the same as the Docker builder runs its image.
+    #
+    # `exact:` and not `from:`. `from:` would happily satisfy itself with a
+    # later tag, and then the thing checked would not be the thing pushed.
+    _w(root, "check/Package.swift", f'''
+// swift-tools-version:6.0
+import PackageDescription
+
+let package = Package(
+    name: "check",
+    // Required, and the error if it is missing reads like a bug in the
+    // dependency rather than a gap here: "the executable 'check' requires
+    // macos 10.13, but depends on the product 'Yodb' which requires macos
+    // 14.0". A consumer that names no floor gets SwiftPM's ancient default.
+    // Ignored on Linux, where platform constraints do not apply at all.
+    platforms: [.macOS(.v14)],
+    dependencies: [.package(url: "{SWIFT_REPO}", exact: "{tag}")],
+    targets: [.executableTarget(
+        name: "check",
+        dependencies: [.product(name: "Yodb", package: "yo-swift")])]
+)
+'''.lstrip())
+
+    _w(root, "check/Sources/check/main.swift", '''
+import Yodb
+
+do {
+    try Yodb.open("x.yo")
+} catch {
+    print(error)
+}
+'''.lstrip())
+
+    check_root = os.path.join(root, "check")
 
     return (
         [
-            Step("the tag exists and its sources carry the sentence",
-                 ["sh", "-c", carries], root),
+            Step("resolve the tag the podspec points at, and call into it",
+                 ["sh", "-c",
+                  f"swift run 2>&1 | grep -qF {shlex.quote(raises)}"],
+                 check_root),
+            # Builds an app against the pod once per declared platform, which
+            # means a simulator runtime installed for each. This machine has
+            # only iOS, so tvOS, watchOS and visionOS stop here with "Could not
+            # find a `tvos` simulator" and the three runtimes are about 25 GB to
+            # fetch. `pod trunk push` runs the same lint and has no way to
+            # narrow it, so that is a real precondition for publishing and not
+            # just for checking.
+            #
+            # The podspec still declares all five, because Package.swift does
+            # and a podspec that quietly claimed fewer would be a second answer
+            # to the same question. Those four slices are built on every commit
+            # by yo-swift's own CI against `generic/platform=` destinations,
+            # which need no simulator at all, so the compile is proven; what is
+            # missing here is a second proof of it on this laptop.
             Step("lint the podspec against the tag it points at", [
                 "pod", "spec", "lint", f"{row.name}.podspec", "--no-clean",
             ], root),

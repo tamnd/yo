@@ -21,7 +21,12 @@
 # and /usr/lib/dart/bin. The first run of this script did that and reported
 # "cargo: command not found" as if the crate were broken.
 
-WANT='yo is not usable yet. This is a reserved placeholder at 0.0.1; see https://github.com/tamnd/yo'
+# One version, interpolated everywhere below. It used to be written out in
+# seven places, which is six chances for a wave to move the registries and
+# leave this script grepping for a sentence nothing says any more.
+V=0.0.2
+
+WANT="yo is not usable yet. This is a reserved placeholder at $V; see https://github.com/tamnd/yo"
 
 pass=0; fail=0
 
@@ -74,7 +79,7 @@ run dotnet mcr.microsoft.com/dotnet/sdk:9.0 '
 
 run dart dart:stable '
   mkdir -p t/lib && cd t &&
-  printf "name: t\nversion: 0.0.1\nenvironment:\n  sdk: ^3.0.0\n" > pubspec.yaml &&
+  printf "name: t\nversion: $V\nenvironment:\n  sdk: ^3.0.0\n" > pubspec.yaml &&
   dart pub add yodb >/dev/null 2>&1 &&
   mkdir -p bin &&
   printf "import \"package:yodb/yodb.dart\" as yodb;\nvoid main(){ try { yodb.open(\"x.yo\"); } catch (e) { print(e); } }\n" > bin/t.dart &&
@@ -89,7 +94,7 @@ run java maven:3-eclipse-temurin-21 '
   <groupId>t</groupId><artifactId>t</artifactId><version>1</version>
   <properties><maven.compiler.release>21</maven.compiler.release></properties>
   <dependencies>
-    <dependency><groupId>com.tamnd</groupId><artifactId>yodb</artifactId><version>0.0.1</version></dependency>
+    <dependency><groupId>com.tamnd</groupId><artifactId>yodb</artifactId><version>$V</version></dependency>
   </dependencies>
 </project>
 EOF
@@ -108,26 +113,19 @@ EOF
   java -cp "out:$(cat cp.txt)" T 2>&1 | tail -5
 '
 
-# Go and Swift have no registry and no placeholder release, so there is no
-# canonical message to grep for. What is being asked of them is narrower and is
-# the whole of what dx/12 section 1 promises: can a stranger with only the
-# toolchain resolve the dependency the install matrix tells them to write.
-probe() {   # probe <label> <image> <script>
-  local label=$1 image=$2 script=$3
-  echo
-  echo "=============================================================="
-  echo "== $label   ($image)   [resolution probe, no message expected]"
-  echo "=============================================================="
-  docker run --rm --network host -w /w "$image" bash -c "$script" 2>&1
-  echo "-- exit $?"
-}
+# There was a second helper here, `probe`, which ran a case and printed what
+# happened without deciding anything. Go and Swift used it, because neither had
+# a message to grep for: Go's module was empty and Swift's package had no entry
+# point. Both have one now, both are `run` cases below, and the helper is gone
+# with them. A run that reports and does not decide is a run whose result nobody
+# reads, and dx/12 section 1 asks for a verdict per ecosystem, not a transcript.
 
 # Promoted from a resolution probe to a real verdict on 2026-08-29. On the
 # 08-28 run this could only be a probe, because the module had no package in it
 # and so had no message to check. It has both now.
 run go golang:1.26 '
   go mod init t >/dev/null 2>&1
-  GOFLAGS=-mod=mod go get github.com/tamnd/yo-go@v0.0.1 2>&1 | tail -3
+  GOFLAGS=-mod=mod go get github.com/tamnd/yo-go@v$V 2>&1 | tail -3
   cat > main.go <<EOF
 package main
 
@@ -155,7 +153,7 @@ echo
 echo "=============================================================="
 echo "== docker   (tamnd87/yo, on the host)"
 echo "=============================================================="
-docker rmi -f tamnd87/yo:latest tamnd87/yo:0.0.1 >/dev/null 2>&1
+docker rmi -f tamnd87/yo:latest "tamnd87/yo:$V" >/dev/null 2>&1
 out=$(docker run --rm tamnd87/yo 2>&1); rc=$?
 echo "$out"
 echo "-- exit $rc"
@@ -167,25 +165,29 @@ else
   fail=$((fail+1))
 fi
 
-# Two Package.swift files, because they answer two different questions. The
-# first is what dx/12 section 1 tells a user to write and it is the one that
-# matters. The second says whether the failure is the missing tag or the code.
-probe swift swift:6.2 '
-  mkdir -p t/Sources/t && cd t && printf "" > Sources/t/main.swift
-  write() {
-    cat > Package.swift <<EOF
+# Promoted from a resolution probe to a real verdict on 2026-08-29, for the same
+# reason Go was: the package now has something to say. Until 0.0.2 it had no
+# entry point at all, so "resolves and builds" was the whole of what could be
+# asked of it, and this was two Package.swift files that told apart a missing
+# tag from broken code. One form now, the one the install matrix documents,
+# because a check that passes when either of two spellings works cannot tell you
+# which one a reader would have typed.
+run swift swift:6.2 '
+  mkdir -p t/Sources/t && cd t &&
+  cat > Package.swift <<EOF
 // swift-tools-version:6.0
 import PackageDescription
 let package = Package(
   name: "t",
-  dependencies: [.package(url: "https://github.com/tamnd/yo-swift", $1)],
+  platforms: [.macOS(.v14)],
+  dependencies: [.package(url: "https://github.com/tamnd/yo-swift", from: "'"$V"'")],
   targets: [.executableTarget(name: "t", dependencies: [.product(name: "Yodb", package: "yo-swift")])])
 EOF
-  }
-  echo "--- as the install matrix documents it: from: \"0.0.1\""
-  write "from: \"0.0.1\"" ; swift build 2>&1 | tail -4
-  echo "--- same package pinned to the branch instead"
-  write "branch: \"main\"" ; swift build 2>&1 | tail -4
+  cat > Sources/t/main.swift <<EOF
+import Yodb
+do { try Yodb.open("x.yo") } catch { print(error) }
+EOF
+  swift run 2>&1 | tail -6
 '
 
 echo
