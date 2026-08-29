@@ -761,7 +761,10 @@ mod tests {
         // The one of the four that has no arithmetic to overflow. Redis takes
         // it and holds the number as given, and a record here holds forty six
         // bits, so it lands in the year 4199 instead. D-17.
-        assert_eq!(f.run(&[b"PEXPIREAT", b"k", b"9223372036854775807"]), ":1\r\n");
+        assert_eq!(
+            f.run(&[b"PEXPIREAT", b"k", b"9223372036854775807"]),
+            ":1\r\n"
+        );
         assert_eq!(f.run(&[b"PEXPIRETIME", b"k"]), ":70368744177663\r\n");
     }
 

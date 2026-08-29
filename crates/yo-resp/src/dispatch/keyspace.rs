@@ -26,8 +26,7 @@ use yo_kv::{Applied, Ask, Cond, Keyspace, MAX_AT};
 const SECOND: i64 = 1000;
 
 /// What Redis says when `NX` is given alongside any of the other three.
-const NX_WITH_OTHERS: &str =
-    "NX and XX, GT or LT options at the same time are not compatible";
+const NX_WITH_OTHERS: &str = "NX and XX, GT or LT options at the same time are not compatible";
 
 /// And when `GT` and `LT` are given together, which is the one pair that
 /// contradicts itself without `NX` being involved.

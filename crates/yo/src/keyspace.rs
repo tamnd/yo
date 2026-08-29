@@ -181,6 +181,9 @@ impl Strings {
     /// How long a key has left, or `None` if it has no deadline or is not
     /// there. `PTTL`.
     ///
+    /// [`Keys::ttl`](crate::Keys::ttl) is the one that tells those two apart,
+    /// and it works on a key of any type rather than only on a string.
+    ///
     /// # Errors
     ///
     /// As [`Strings::get`].
