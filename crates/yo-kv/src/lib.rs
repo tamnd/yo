@@ -25,10 +25,10 @@
 //! The set, which is the first row of M3, in all seventeen of its commands:
 //! `SADD`, `SREM`, `SCARD`, `SISMEMBER`, `SMISMEMBER`, `SMEMBERS`, `SPOP`,
 //! `SRANDMEMBER`, `SSCAN`, `SMOVE`, `SINTER`, `SINTERCARD`, `SUNION`, `SDIFF`
-//! and the three store forms. What is left on the set is not commands, it is
-//! the inline and native bands of the size ladder. A [`Set`] is one of three
-//! representations and moves between them
-//! on the same rules Redis uses, and [`Keyspace`] is where a key gets to be
+//! and the three store forms. A [`Set`] is one of three representations and
+//! moves between them on the same rules Redis uses, with `OBJECT ENCODING`
+//! saying which one it is on and the five `CONFIG` thresholds moving the lines.
+//! [`Keyspace`] is where a key gets to be
 //! something other than a string: the record holds a number, the number points
 //! into a [`Slab`], and every path that deletes a key or writes over one frees
 //! what it was pointing at. That last part is why `WRONGTYPE` exists as of this
@@ -91,6 +91,8 @@ pub mod setops;
 pub mod sets;
 pub mod slab;
 pub mod strings;
+#[cfg(test)]
+mod tally;
 pub mod ttl;
 pub mod value;
 
