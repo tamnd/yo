@@ -117,6 +117,19 @@ pub struct RawMap {
     arena: Arena,
     /// Where the last `compact_step` stopped, if it stopped partway.
     evac: Option<Evac>,
+    /// How many times anything in here has been written to.
+    ///
+    /// A caller that resolved a key once and wants to skip resolving it again
+    /// needs to know whether anything could have moved in between, and the
+    /// honest answer is any write at all. Every method that takes `&mut self`
+    /// bumps this, including the in place ones, so the question a caller asks is
+    /// "has this map been written since" and not "has this map been written in a
+    /// way I thought would matter".
+    ///
+    /// It lives here rather than in the caller because there are eleven places
+    /// in `yo-kv` that write to a map and one place here that could be missed,
+    /// and a missed invalidation is a stale answer rather than a slow one.
+    writes: u64,
 }
 
 impl RawMap {
@@ -126,7 +139,20 @@ impl RawMap {
             index: Index::new(),
             arena: Arena::new(),
             evac: None,
+            writes: 0,
         }
+    }
+
+    /// How many times this map has been written to.
+    ///
+    /// Two reads of this with the same value either side of some work mean
+    /// nothing in the map moved, so an address or a slot resolved before the
+    /// first read is still the right one after the second. It never goes
+    /// backwards, including across [`RawMap::clear`].
+    #[inline]
+    #[must_use]
+    pub const fn writes(&self) -> u64 {
+        self.writes
     }
 
     /// How many keys are stored.
@@ -149,7 +175,12 @@ impl RawMap {
     /// one thing a client that has just said `FLUSHALL` is entitled to expect is
     /// the memory back.
     pub fn clear(&mut self) {
+        // Carried across the reset and bumped, because a counter that went back
+        // to zero here could land on a value a memo was already holding and
+        // read as "nothing moved" on the one call where everything did.
+        let writes = self.writes;
         *self = RawMap::new();
+        self.writes = writes + 1;
     }
 
     /// The hash this map files `key` under.
@@ -240,6 +271,7 @@ impl RawMap {
     /// [`RawMap::value_mut`] for a caller that already hashed the key.
     #[inline]
     pub fn value_mut_hashed(&mut self, hash: u64, key: &[u8]) -> Option<&mut [u8]> {
+        self.writes += 1;
         let addr = self.index.get(hash, key, &Records { arena: &self.arena })?;
         let (klen, vlen) = Record::lens(self.arena.get(addr, HDR));
         Some(&mut self.arena.get_mut(addr, HDR + klen + vlen)[HDR + klen..])
@@ -287,6 +319,7 @@ impl RawMap {
     where
         F: FnOnce(&mut [u8]),
     {
+        self.writes += 1;
         assert!(key.len() <= u32::MAX as usize, "key too long");
         assert!(vlen <= u32::MAX as usize, "value too long");
         let total = HDR + key.len() + vlen;
@@ -354,6 +387,7 @@ impl RawMap {
 
     /// Remove `key`, returning whether it was there.
     pub fn del(&mut self, key: &[u8]) -> bool {
+        self.writes += 1;
         let h = wyhash(key, 0);
         let addr = {
             let recs = Records { arena: &self.arena };
@@ -418,6 +452,7 @@ impl RawMap {
     /// that nothing ever bumps through again is still two megabytes the process
     /// is holding.
     pub fn compact_segment(&mut self, seg: usize) -> usize {
+        self.writes += 1;
         if seg == self.arena.current_segment() {
             // Its bump is a cursor, not a checkpoint, and reclaiming it would
             // take the ground out from under the next allocation.
@@ -534,6 +569,7 @@ impl RawMap {
     /// never picked up, and the arena would fill with segments that are nearly
     /// empty and never reclaimed.
     pub fn compact_step(&mut self) -> Option<usize> {
+        self.writes += 1;
         let (seg, from) = match self.evac {
             Some(e) => (e.seg, e.off),
             None => (self.arena.worst_candidate()?, yo_arena::HEADER_SIZE),
@@ -1040,5 +1076,49 @@ mod tests {
             assert_eq!(m.get(k), Some(&b"v"[..]));
         }
         assert_eq!(m.len(), inserted.len());
+    }
+
+    /// Whatever memoizes against this counter is only correct if every way of
+    /// writing to the map moves it. A method that mutates and does not is not a
+    /// slow memo, it is a wrong answer, so this asserts on the whole `&mut self`
+    /// surface rather than on the ones that look like they matter.
+    #[test]
+    fn every_way_of_writing_moves_the_counter() {
+        let mut m = RawMap::new();
+        let mut last = m.writes();
+        let mut moved = |m: &RawMap, what: &str| {
+            assert!(m.writes() > last, "{what} did not move the counter");
+            last = m.writes();
+        };
+
+        m.set(b"k", b"v");
+        moved(&m, "set");
+        m.set_with(b"k", 1, |b| b[0] = b'w');
+        moved(&m, "set_with");
+        m.value_mut(b"k");
+        moved(&m, "value_mut");
+        m.value_mut_hashed(RawMap::hash_of(b"k"), b"k");
+        moved(&m, "value_mut_hashed");
+        m.compact_step();
+        moved(&m, "compact_step");
+        m.compact_segment(0);
+        moved(&m, "compact_segment");
+        m.del(b"k");
+        moved(&m, "del");
+    }
+
+    /// `clear` replaces the map with a fresh one, and a fresh one starts at
+    /// zero. A memo taken at write 3 against a map that went back to 0 and
+    /// climbed to 3 again would read as still valid on the one call where every
+    /// key in the map had been thrown away.
+    #[test]
+    fn clearing_does_not_send_the_counter_backwards() {
+        let mut m = RawMap::new();
+        for i in 0..10u32 {
+            m.set(&i.to_le_bytes(), b"v");
+        }
+        let before = m.writes();
+        m.clear();
+        assert!(m.writes() > before, "clear went backwards or stood still");
     }
 }

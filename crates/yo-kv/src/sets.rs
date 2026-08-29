@@ -1569,4 +1569,99 @@ mod tests {
         d.del(b"s");
         assert!(d.memory_bytes() < after, "and go away again");
     }
+
+    /// The sharp version of the memo hazard. `a` is resolved and remembered, so
+    /// something is holding a slab slot number for it. Deleting `a` frees that
+    /// slot and the next set created takes it, so a memo that survived the
+    /// delete would answer questions about `a` with `b`'s members. It is not a
+    /// stale count, it is another key's data under the name of a key that is
+    /// gone.
+    #[test]
+    fn a_deleted_key_does_not_answer_with_whatever_took_its_slot() {
+        let mut d = db();
+        add(&mut d, b"a", &[b"x", b"y", b"z"]);
+        assert_eq!(d.scard(b"a").expect("a set"), 3);
+
+        d.del(b"a");
+        add(&mut d, b"b", &[b"one"]);
+
+        assert_eq!(d.scard(b"a").expect("gone"), 0);
+        assert!(!d.sismember(b"a", b"x").expect("gone"));
+        assert_eq!(d.scard(b"b").expect("a set"), 1);
+    }
+
+    /// Same shape, one step further: the name comes back holding another type.
+    /// A memo that answered from what it remembered would say the set is still
+    /// there and hand back a slot that now belongs to a hash.
+    #[test]
+    fn a_key_that_comes_back_as_another_type_is_wrongtype() {
+        let mut d = db();
+        add(&mut d, b"k", &[b"x"]);
+        assert_eq!(d.scard(b"k").expect("a set"), 1);
+
+        d.del(b"k");
+        d.hset(b"k", [(&b"f"[..], &b"v"[..])].into_iter())
+            .expect("a hash");
+
+        let err = d.scard(b"k").expect_err("a hash is not a set");
+        assert_eq!(err.code(), Code::WrongType);
+    }
+
+    /// A deadline passes without anyone writing to the map, so it is the one
+    /// thing a write counter cannot see. The answer is that a dated key is
+    /// never remembered in the first place, and this is what says so.
+    #[test]
+    fn a_key_with_a_deadline_still_expires_after_it_has_been_read() {
+        let mut d = db();
+        add(&mut d, b"k", &[b"x", b"y"]);
+        assert_eq!(d.scard(b"k").expect("a set"), 2);
+
+        assert!(d.set_expiry(b"k", Some(1_500)));
+        assert_eq!(d.scard(b"k").expect("still alive"), 2);
+
+        d.clock_mut().advance(600);
+        assert_eq!(d.scard(b"k").expect("past its deadline"), 0);
+        assert!(!d.sismember(b"k", b"x").expect("past its deadline"));
+    }
+
+    /// Two keys alternating, which is what a pipeline that is not on one key
+    /// looks like. Each one has to answer for itself, so the comparison is the
+    /// key bytes and not the hash.
+    #[test]
+    fn two_keys_in_a_row_do_not_answer_for_each_other() {
+        let mut d = db();
+        add(&mut d, b"a", &[b"1"]);
+        add(&mut d, b"b", &[b"1", b"2", b"3"]);
+        for _ in 0..8 {
+            assert_eq!(d.scard(b"a").expect("a set"), 1);
+            assert_eq!(d.scard(b"b").expect("a set"), 3);
+        }
+    }
+
+    /// `FLUSHDB` throws the map away and builds a fresh one, and a fresh one
+    /// starts its write counter over. Nothing may survive that.
+    #[test]
+    fn a_flush_does_not_leave_the_last_key_behind() {
+        let mut d = db();
+        add(&mut d, b"k", &[b"x"]);
+        assert_eq!(d.scard(b"k").expect("a set"), 1);
+
+        d.clear();
+        assert_eq!(d.scard(b"k").expect("flushed"), 0);
+    }
+
+    /// A key too long to remember is a key that is looked up every time, which
+    /// is the old behaviour and has to keep working rather than fall through a
+    /// branch that assumes something was written down.
+    #[test]
+    fn a_key_longer_than_the_memo_still_works() {
+        let mut d = db();
+        let long = vec![b'k'; 200];
+        add(&mut d, &long, &[b"x", b"y"]);
+        for _ in 0..4 {
+            assert_eq!(d.scard(&long).expect("a set"), 2);
+        }
+        d.del(&long);
+        assert_eq!(d.scard(&long).expect("gone"), 0);
+    }
 }
