@@ -371,6 +371,61 @@ fn bench_clock(c: &mut Criterion) {
     g.finish();
 }
 
+/// What a deadline costs, and what the size of the value has to do with it.
+///
+/// The claim in `keys`'s docs is that a deadline sits in the key's record and
+/// never touches the value, so the three `expire/` rows put one on a short
+/// string, on a set of one member and on a set of ten thousand. If the claim
+/// holds they are the same number and the last one does not grow with the set.
+fn bench_expiry(c: &mut Criterion) {
+    let mut g = c.benchmark_group("expire");
+    g.throughput(Throughput::Elements(1));
+
+    let hour = Duration::from_secs(3_600);
+
+    g.bench_function("string", |b| {
+        let db = yo::open(MEMORY).expect("in memory always opens");
+        db.strings().set("k", "v").expect("room");
+        let keys = db.keys();
+        b.iter(|| black_box(keys.expire_in("k", hour).expect("a key")));
+    });
+
+    for members in [1usize, 10_000] {
+        g.bench_function(format!("set/{members}"), |b| {
+            let (db, s) = api_set_of(members, 0);
+            s.add("m0").expect("room");
+            let keys = db.keys();
+            b.iter(|| black_box(keys.expire_in("s", hour).expect("a key")));
+        });
+    }
+
+    g.bench_function("ttl", |b| {
+        let db = yo::open(MEMORY).expect("in memory always opens");
+        db.strings().set("k", "v").expect("room");
+        let keys = db.keys();
+        keys.expire_in("k", hour).expect("a key");
+        b.iter(|| black_box(keys.ttl("k").expect("a key")));
+    });
+
+    // Off and on again, because a persist that finds nothing to take is the
+    // cheap half of the call and would flatter the row on its own. Read this
+    // one as a pair and not as one call: a deadline is five more bytes in the
+    // record, so the loop grows the record and shrinks it back every time,
+    // which is the worst thing you can ask an arena to do and is why the
+    // number is several times either call on its own.
+    g.bench_function("persist", |b| {
+        let db = yo::open(MEMORY).expect("in memory always opens");
+        db.strings().set("k", "v").expect("room");
+        let keys = db.keys();
+        b.iter(|| {
+            keys.expire_in("k", hour).expect("a key");
+            black_box(keys.persist("k").expect("a key"))
+        });
+    });
+
+    g.finish();
+}
+
 criterion_group!(
     benches,
     bench_get,
@@ -378,6 +433,7 @@ criterion_group!(
     bench_incr,
     bench_mset,
     bench_sets,
+    bench_expiry,
     bench_clock
 );
 criterion_main!(benches);

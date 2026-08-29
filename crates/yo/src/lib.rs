@@ -106,6 +106,7 @@
 
 pub mod counter;
 pub mod db;
+pub mod keys;
 pub mod keyspace;
 pub mod map;
 pub mod sets;
@@ -113,6 +114,7 @@ pub mod store;
 
 pub use counter::Counter;
 pub use db::{Db, MEMORY, open};
+pub use keys::{Keys, Ttl, When};
 pub use keyspace::Strings;
 pub use map::Map;
 pub use sets::{Set, Sets};
@@ -123,3 +125,6 @@ pub use yo_shape::{Desc, Shape, Tag};
 // before this and not nameable, so a caller could take one and could not write
 // down the type of what they had taken.
 pub use yo_kv::{Member, Str};
+// What `TYPE` answers, which [`Keys::kind`] hands back as a type rather than as
+// the word Redis prints.
+pub use yo_kv::Kind;

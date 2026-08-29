@@ -9,6 +9,7 @@ use yo_index::RawMap;
 use yo_shape::{Desc, Tag};
 
 use crate::counter::Counter;
+use crate::keys::Keys;
 use crate::keyspace::Strings;
 use crate::map::Map;
 use crate::sets::{Set, Sets};
@@ -262,6 +263,28 @@ impl Db {
         Set {
             sets: self.sets(),
             key: key.into(),
+        }
+    }
+
+    /// Every command that works on a key whatever the key holds.
+    ///
+    /// `DEL`, `EXISTS` and `TYPE`, and the whole expiry family. These are the
+    /// ones that belong to the keyspace rather than to a type, which is why
+    /// they are not on [`Db::strings`] or [`Db::sets`]: a deadline sits in the
+    /// key's record and does not care what the record points at.
+    ///
+    /// ```
+    /// use std::time::Duration;
+    ///
+    /// let db = yo::open(yo::MEMORY)?;
+    /// db.set("online").add("alice")?;
+    /// db.keys().expire_in("online", Duration::from_secs(60))?;
+    /// # Ok::<(), yo::Error>(())
+    /// ```
+    #[must_use]
+    pub fn keys(&self) -> Keys {
+        Keys {
+            db: self.db.clone(),
         }
     }
 
