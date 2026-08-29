@@ -58,6 +58,89 @@ pub struct Keyspace {
     pub(crate) hash_limits: hash::Limits,
     /// Where `SPOP` and `SRANDMEMBER` draw from.
     pub(crate) rng: Rng,
+    /// The last collection key that was resolved, for the command behind it.
+    memo: Memo,
+}
+
+/// Where the last collection key resolved to, if it still resolves there.
+///
+/// Y13 says a batch of `SADD` on one key should be one table growth check, and
+/// the same argument applies a step earlier: it should be one resolve. A
+/// resolve is a hash, a bucket walk and a record read, and on a hot key every
+/// command in the batch was paying for all three to be told the same answer the
+/// command in front of it got.
+///
+/// One entry and not a cache, because one entry is the shape of the problem.
+/// Single key `SADD` is the case with no spread to exploit, so the only reuse
+/// there is to find is the command immediately before, and a bigger structure
+/// would cost a lookup to avoid a lookup.
+///
+/// It holds a slot and not an address. A slot is an index into the slab for its
+/// type and stays right for as long as the key is there, where an address is
+/// only good until the next write. That is also why nothing here memoizes a
+/// string: a string lives in the record itself and moves when the record does.
+struct Memo {
+    /// What the map's write counter said when this was taken.
+    writes: u64,
+    /// Whether there is anything here. Separate from the length because the
+    /// empty key is a key, and `SADD "" m` is a command Redis accepts.
+    live: bool,
+    /// The type the key held, so a hit can still answer `WRONGTYPE`.
+    kind: Kind,
+    /// Where the body is in the slab for `kind`.
+    slot: u32,
+    /// How much of `key` is the key.
+    len: u8,
+    key: [u8; Memo::MAX],
+}
+
+impl Memo {
+    /// The longest key worth remembering.
+    ///
+    /// Thirty two bytes is half a cache line and covers every hot key anyone
+    /// writes down, including the `myset:{tag}` the generators send. A longer
+    /// key is not memoized rather than heap allocated, because the whole point
+    /// of this is to not touch memory it does not have to.
+    const MAX: usize = 32;
+
+    const fn empty() -> Memo {
+        Memo {
+            writes: 0,
+            live: false,
+            kind: Kind::String,
+            slot: 0,
+            len: 0,
+            key: [0; Memo::MAX],
+        }
+    }
+
+    /// What `key` resolved to last time, if that answer still stands.
+    ///
+    /// `writes` is the map's counter now. Any write at all since this was taken
+    /// and the answer is thrown away, which is stricter than it has to be and is
+    /// the version that cannot be wrong.
+    #[inline]
+    fn get(&self, writes: u64, key: &[u8]) -> Option<(Kind, u32)> {
+        if !self.live || self.writes != writes || key.len() != self.len as usize {
+            return None;
+        }
+        (self.key[..key.len()] == *key).then_some((self.kind, self.slot))
+    }
+
+    /// Remember that `key` is at `slot`.
+    #[inline]
+    fn put(&mut self, writes: u64, key: &[u8], kind: Kind, slot: u32) {
+        if key.len() > Memo::MAX {
+            self.live = false;
+            return;
+        }
+        self.writes = writes;
+        self.live = true;
+        self.kind = kind;
+        self.slot = slot;
+        self.len = key.len() as u8;
+        self.key[..key.len()].copy_from_slice(key);
+    }
 }
 
 /// How many databases this process has made.
@@ -89,6 +172,7 @@ impl Keyspace {
             limits: set::Limits::DEFAULT,
             hash_limits: hash::Limits::DEFAULT,
             rng: Rng::new(clock.now_ms() ^ made.wrapping_mul(0x9e37_79b9_7f4a_7c15)),
+            memo: Memo::empty(),
         }
     }
 
@@ -379,7 +463,17 @@ impl Keyspace {
     /// on the other is the case the borrow checker still refuses without
     /// Polonius. A slot is four bytes and copies out, so the borrow ends here
     /// and the caller reaches its body through the slab.
+    ///
+    /// And no probe at all when the command in front of it asked for the same
+    /// key and nothing has been written since, which is the [`Memo`] and is what
+    /// Y13 asks for on single key `SADD`.
     pub(crate) fn live_slot(&mut self, key: &[u8], want: Kind) -> Result<Option<u32>> {
+        if let Some((kind, slot)) = self.memo.get(self.map.writes(), key) {
+            if kind != want {
+                return Err(wrong_type());
+            }
+            return Ok(Some(slot));
+        }
         let now = self.clock.now_ms();
         let Some(rec) = self.map.get(key) else {
             return Ok(None);
@@ -392,7 +486,15 @@ impl Keyspace {
         if value::kind(rec) != want {
             return Err(wrong_type());
         }
-        Ok(Some(value::slot(rec)))
+        let slot = value::slot(rec);
+        // A key with a deadline is not memoized. The memo is invalidated by
+        // writes and a deadline passes without one, so remembering a dated key
+        // would be remembering it past the moment it should have been reaped.
+        let dated = value::expire_at(rec).is_some();
+        if !dated {
+            self.memo.put(self.map.writes(), key, want, slot);
+        }
+        Ok(Some(slot))
     }
 
     /// Throw every key away. This is `FLUSHDB` on one database.

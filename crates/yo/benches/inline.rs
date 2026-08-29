@@ -177,6 +177,25 @@ fn set_of(n: usize) -> yo_kv::Keyspace {
     store
 }
 
+/// [`set_of`], with a keyspace around it.
+///
+/// The difference matters more than it looks. A store holding one key has its
+/// whole index in L1, so looking that key up costs nothing and a row measured
+/// there says nothing about what a lookup costs. Put the same set in a database
+/// with a hundred thousand other keys in it and the bucket is a cache miss,
+/// which is what a lookup actually is on any real keyspace and what the memo in
+/// `Keyspace` exists to skip.
+fn crowded_set_of(n: usize, others: usize) -> yo_kv::Keyspace {
+    let mut store = set_of(n);
+    for i in 0..others {
+        let k = key(i);
+        store
+            .set_plain(k.as_bytes(), k.as_bytes())
+            .expect("room for a record");
+    }
+    store
+}
+
 /// The two set shapes on the hot key gate row, `SADD` onto one key and `SPOP`
 /// off it. Both are `store/` rows, because the typed set API is not here yet.
 ///
@@ -197,6 +216,23 @@ fn bench_sets(c: &mut Criterion) {
         let mut store = set_of(1_000);
         // Built up front, because a `format!` inside the timed loop would be an
         // allocation a call and this row exists to measure the ones inside.
+        let members: Vec<String> = (0..1_024).map(|i| format!("m{i}")).collect();
+        let mut i = 0usize;
+        b.iter(|| {
+            i = (i + 1) & 1_023;
+            black_box(
+                store
+                    .sadd(b"s", std::iter::once(members[i].as_bytes()))
+                    .expect("a set"),
+            )
+        });
+    });
+
+    // The same row with a hundred thousand other keys in the database, which is
+    // where a lookup stops being free. Everything between the two numbers is
+    // the probe the memo skips.
+    g.bench_function("store/hot-crowded", |b| {
+        let mut store = crowded_set_of(1_000, 100_000);
         let members: Vec<String> = (0..1_024).map(|i| format!("m{i}")).collect();
         let mut i = 0usize;
         b.iter(|| {
