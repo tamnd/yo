@@ -96,6 +96,7 @@ pub mod strings;
 mod tally;
 pub mod ttl;
 pub mod value;
+pub mod walk;
 
 pub use blob::{Blob, Span};
 pub use clock::Clock;
@@ -115,3 +116,7 @@ pub use slab::{MAX_SLOTS, Slab};
 pub use strings::{Exists, Expire, KEY_MAX, STRING_MAX, SetOptions, SetOutcome};
 pub use ttl::{Applied, Ask, Cond, Deadlines, MAX_AT};
 pub use value::{EMBSTR_MAX, Encoding, Kind, Str};
+// Where a keyspace walk has got to, which is a different number from the
+// [`Cursor`] a collection walk hands back and is named apart from it so that a
+// caller holding both cannot pass one where the other was meant.
+pub use yo_index::Cursor as KeyCursor;

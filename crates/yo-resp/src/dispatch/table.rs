@@ -77,6 +77,11 @@ const AC_HASH_WRITE_FAST: &[&str] = &["@write", "@hash", "@fast"];
 const AC_CONN: &[&str] = &["@fast", "@connection"];
 /// The keyspace read side, which is `EXISTS` and `TYPE`.
 const AC_KEY_READ: &[&str] = &["@keyspace", "@read", "@fast"];
+/// The keyspace reads that walk something, which is `SCAN` and `RANDOMKEY`.
+const AC_KEY_READ_SLOW: &[&str] = &["@keyspace", "@read", "@slow"];
+/// And `KEYS`, which is the same walk without a bound on it and is the one read
+/// in this group Redis calls dangerous.
+const AC_KEY_READ_ALL: &[&str] = &["@keyspace", "@read", "@slow", "@dangerous"];
 /// The keyspace writes that are allowed to cost what the value costs. `DEL`
 /// frees on the spot and `COPY` clones a body, and `RENAME` is in here with
 /// them even though it moves thirteen bytes, because Redis says slow for it and
@@ -1086,6 +1091,48 @@ pub static COMMANDS: &[Spec] = &[
         since: "3.2.1",
         complexity: "O(N) in the number of keys.",
         summary: "Count how many of these keys are there, and move them up the eviction order.",
+        group: "keyspace",
+    },
+    // The three that look at keys nobody named. No key positions on any of
+    // them, which is what the zeroes say, and it is also why a cluster client
+    // sends them to a node rather than to a slot.
+    Spec {
+        name: "scan",
+        arity: -2,
+        flags: &["readonly"],
+        first_key: 0,
+        last_key: 0,
+        step: 0,
+        acl: AC_KEY_READ_SLOW,
+        since: "2.8.0",
+        complexity: "O(1) a call, O(N) for a whole iteration",
+        summary: "Walk part of the keyspace and say where to carry on from.",
+        group: "keyspace",
+    },
+    Spec {
+        name: "keys",
+        arity: 2,
+        flags: &["readonly"],
+        first_key: 0,
+        last_key: 0,
+        step: 0,
+        acl: AC_KEY_READ_ALL,
+        since: "1.0.0",
+        complexity: "O(N) in the number of keys.",
+        summary: "Every key matching a pattern, in one reply.",
+        group: "keyspace",
+    },
+    Spec {
+        name: "randomkey",
+        arity: 1,
+        flags: &["readonly"],
+        first_key: 0,
+        last_key: 0,
+        step: 0,
+        acl: AC_KEY_READ_SLOW,
+        since: "1.0.0",
+        complexity: "O(1)",
+        summary: "One key from the database, chosen at random.",
         group: "keyspace",
     },
     // Two keys and not one, which is the 1 2 1 in the key positions. Every other

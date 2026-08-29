@@ -119,23 +119,25 @@ doc = "12 section 6"
 
 [[group]]
 name = "keyspace"
-expected = 20
+expected = 29
 status = "partial"
 doc = "14"
+# Twenty nine is what 8.10.1 answers for its generic group once the five OBJECT
+# subcommands are counted as the one command they are dispatched as. The nine
+# expiry commands are in here rather than in a group of their own, because a
+# deadline lives in the key's record and EXPIRE is dispatched down the same path
+# DEL is. There was an expiry group in this file that listed none of them and
+# claimed nine, which was two names for one group and a count nobody could check.
+# What is left after the twenty one below is DUMP, RESTORE, MIGRATE, MOVE, SORT,
+# SORT_RO, WAIT and WAITAOF, and the first two of those want the file format.
 # DEL, UNLINK, EXISTS and TYPE landed in M2 and the rest are in M3. The four were
 # not a random quarter of the group, they are what Redis's own test suite needs
 # before it will run one file. OBJECT is here now because the size ladder is not
 # finished until a client can see which rung a key is on. RENAME, RENAMENX, COPY
 # and TOUCH came next because none of them needs anything the store did not
-# already have. KEYS, SCAN and RANDOMKEY are the ones that do: the index has no
-# iteration of any kind, so those three want a cursor over the buckets that
-# survives a resize, and that is its own change rather than three more rows.
-
-[[group]]
-name = "expiry"
-expected = 9
-status = "planned"
-doc = "14"
+# already have. KEYS, SCAN and RANDOMKEY needed a cursor over the index that
+# survives a resize, which is the one thing on this list that was a change to
+# the index rather than three more rows, and it landed with them.
 
 [[group]]
 name = "transactions"
@@ -663,6 +665,39 @@ bounded = "risk"
 status = "shipped"
 wire = "verified"
 notes = "The one command in the group that costs what the value is worth. Two records pointing at one slot would be one set answering to two names and SADD to either would show up in both, so the body is cloned, which is Redis's cost too and there is no version of COPY that avoids it. DB n writes into a database the connection is not on, which is why the store splits this into an export that lifts a value out standing on its own and an import that puts one down, and the same pair is what MOVE, DUMP and RESTORE will want. The four failure modes are checked in an order nobody would write from scratch: the options first, so a bad DB is refused before anyone asks whether the source exists, then source and destination being the same object, and only then a missing source becoming the ordinary zero. Same object means same key in the same database, so COPY a a DB 1 is a real copy and COPY a a DB 0 from database zero is the error. A destination whose deadline has gone counts as free, which is the only answer consistent with EXISTS saying zero for the same key."
+
+[[command]]
+name = "SCAN"
+group = "keyspace"
+since = "2.8.0"
+arity = -2
+plan = "cursor"
+bounded = "yes"
+status = "shipped"
+wire = "verified"
+notes = "The cursor names a place in the keyspace rather than a place in memory, which is what lets a client hold one across a resize. Redis walks a power of two table that doubles by adding a bit at the top of the bucket index, so it needs reverse binary iteration to keep the two halves of a split bucket next to each other. Ours doubles the directory by copying each entry into two neighbouring slots, so a bit is added at the bottom and a left aligned 48 bit hash prefix is the same number before a doubling and after one. Walking in increasing prefix order is then enough, and a segment that splits partway through a walk can produce a duplicate and never a miss, which is exactly what the contract allows. COUNT is a floor and not a ceiling because a bucket is the smallest unit a cursor can name, so a batch can come back with more keys than asked for, or with none at all and a cursor that is not zero. TYPE is compared case insensitively against the type of each key walked past, so a type nothing can hold matches nothing rather than being an error, which is Redis's behaviour. A key past its deadline is skipped and not reaped, because the walk takes a shared borrow of the keyspace and the active expiry cycle collects it anyway."
+
+[[command]]
+name = "KEYS"
+group = "keyspace"
+since = "1.0.0"
+arity = 2
+plan = "cursor"
+bounded = "risk"
+status = "shipped"
+wire = "verified"
+notes = "The same walk SCAN makes with no bound on it and no chance of a duplicate, since nothing can split the index while it is running. The risk in the bound field is the command's whole reputation and it is deserved: a database of ten million keys is ten million keys in one reply with the shard doing nothing else. It is here because Redis's own test suite and every piece of tooling want it, and because SCAN is the answer for anything running against a database somebody is using. The embedded API has each instead, which is the same walk handing each key over where it lies, so a walk of a million keys allocates nothing."
+
+[[command]]
+name = "RANDOMKEY"
+group = "keyspace"
+since = "1.0.0"
+arity = 1
+plan = "cursor"
+bounded = "inherent"
+status = "shipped"
+wire = "verified"
+notes = "A random position in the index and a key from the bucket that lands in, which is a constant number of loads whatever the database holds. Uniform within a bucket and only roughly uniform across the keyspace, since a bucket holding two keys and one holding twelve are equally likely to be landed on, and Redis is biased the same way for the same reason. Reservoir sampling within the bucket rather than the first key in it, or it would answer the same key every time for as long as the bucket held still. Sixty four tries before it falls back to a full walk, which is what makes a database that has had almost all of it deleted answer the key that is left rather than nil."
 
 
 # ------------------------------------------------------------------------ sets

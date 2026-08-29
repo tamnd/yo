@@ -735,6 +735,133 @@ mod tests {
     }
 
     #[test]
+    fn a_keyspace_scan_walks_every_key_once() {
+        let mut f = Fixture::new();
+        for i in 0..500 {
+            f.run(&[b"SET", format!("k{i}").as_bytes(), b"v"]);
+        }
+
+        let mut seen: Vec<String> = Vec::new();
+        let mut cursor = "0".to_owned();
+        let mut calls = 0;
+        loop {
+            let (next, keys) = scan_reply(&f.run(&[b"SCAN", cursor.as_bytes(), b"COUNT", b"32"]));
+            seen.extend(keys);
+            cursor = next;
+            calls += 1;
+            assert!(calls < 10_000, "the cursor is not advancing");
+            if cursor == "0" {
+                break;
+            }
+        }
+
+        seen.sort();
+        seen.dedup();
+        assert_eq!(seen.len(), 500, "every key once and only once");
+        // And more than one call to get them, or the COUNT is being ignored and
+        // the loop above proved nothing about resuming.
+        assert!(calls > 1, "500 keys came back in one batch");
+    }
+
+    #[test]
+    fn a_scan_narrows_by_pattern_and_by_type() {
+        let mut f = Fixture::new();
+        f.run(&[b"SET", b"str", b"v"]);
+        f.run(&[b"SADD", b"members", b"a"]);
+        f.run(&[b"HSET", b"fields", b"f", b"v"]);
+
+        let all = |f: &mut Fixture, args: &[&[u8]]| {
+            let mut out: Vec<String> = Vec::new();
+            let mut cursor = "0".to_owned();
+            loop {
+                let mut line: Vec<&[u8]> = vec![b"SCAN", cursor.as_bytes()];
+                line.extend_from_slice(args);
+                let (next, keys) = scan_reply(&f.run(&line));
+                out.extend(keys);
+                cursor = next;
+                if cursor == "0" {
+                    break;
+                }
+            }
+            out.sort();
+            out
+        };
+
+        assert_eq!(all(&mut f, &[]), ["fields", "members", "str"]);
+        assert_eq!(all(&mut f, &[b"MATCH", b"*e*"]), ["fields", "members"]);
+        assert_eq!(all(&mut f, &[b"TYPE", b"set"]), ["members"]);
+        // Case insensitive, the same as Redis's own comparison.
+        assert_eq!(all(&mut f, &[b"TYPE", b"HASH"]), ["fields"]);
+        // A type nothing can hold is not an error, it just matches nothing.
+        assert!(all(&mut f, &[b"TYPE", b"list"]).is_empty());
+        assert!(all(&mut f, &[b"TYPE", b"banana"]).is_empty());
+        // Both filters at once, and they are an and rather than an or.
+        assert!(all(&mut f, &[b"MATCH", b"str*", b"TYPE", b"set"]).is_empty());
+    }
+
+    #[test]
+    fn a_scan_says_what_is_wrong_with_it() {
+        let mut f = Fixture::new();
+        assert_eq!(f.run(&[b"SCAN", b"nope"]), "-ERR invalid cursor\r\n");
+        assert_eq!(f.run(&[b"SCAN", b"-1"]), "-ERR invalid cursor\r\n");
+        assert_eq!(f.run(&[b"SCAN", b"0", b"MATCH"]), "-ERR syntax error\r\n");
+        assert_eq!(
+            f.run(&[b"SCAN", b"0", b"COUNT", b"0"]),
+            "-ERR syntax error\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"SCAN", b"0", b"COUNT", b"x"]),
+            "-ERR value is not an integer or out of range\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"SCAN", b"0", b"WAT", b"1"]),
+            "-ERR syntax error\r\n"
+        );
+        // A cursor the client made up is a cursor. It resumes somewhere
+        // arbitrary and answers whatever is there, which is what Redis does and
+        // is the only behaviour that does not need the server to remember every
+        // cursor it has handed out.
+        assert!(f.run(&[b"SCAN", b"18446744073709551615"]).starts_with("*2"));
+    }
+
+    #[test]
+    fn keys_and_randomkey_look_at_the_whole_database() {
+        let mut f = Fixture::new();
+        assert_eq!(f.run(&[b"KEYS", b"*"]), "*0\r\n");
+        assert_eq!(f.run(&[b"RANDOMKEY"]), "$-1\r\n");
+
+        for name in ["one", "two", "three"] {
+            f.run(&[b"SET", name.as_bytes(), b"v"]);
+        }
+        assert_eq!(sorted(&f.run(&[b"KEYS", b"*"])), ["one", "three", "two"]);
+        assert_eq!(sorted(&f.run(&[b"KEYS", b"t*"])), ["three", "two"]);
+        assert_eq!(f.run(&[b"KEYS", b"nothing"]), "*0\r\n");
+
+        for _ in 0..50 {
+            let got = f.run(&[b"RANDOMKEY"]);
+            assert!(
+                ["$3\r\none\r\n", "$3\r\ntwo\r\n", "$5\r\nthree\r\n"].contains(&got.as_str()),
+                "got {got}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_walk_does_not_answer_keys_that_have_expired() {
+        let mut f = Fixture::new();
+        f.run(&[b"SET", b"alive", b"v"]);
+        f.run(&[b"SET", b"dead", b"v", b"PX", b"1"]);
+        f.server.db(0).clock_mut().advance(2);
+
+        assert_eq!(f.run(&[b"KEYS", b"*"]), "*1\r\n$5\r\nalive\r\n");
+        let (_, keys) = scan_reply(&f.run(&[b"SCAN", b"0", b"COUNT", b"1000"]));
+        assert_eq!(keys, ["alive"]);
+        for _ in 0..20 {
+            assert_eq!(f.run(&[b"RANDOMKEY"]), "$5\r\nalive\r\n");
+        }
+    }
+
+    #[test]
     fn a_key_deadline_goes_on_and_comes_back_in_all_four_units() {
         let mut f = Fixture::new();
         f.run(&[b"SET", b"k", b"v"]);
