@@ -497,6 +497,28 @@ def p_dockerhub(name: str, ns: str):
     return RESERVED, f"account {who}, {PLACEHOLDER}"
 
 
+def p_ghcr(name: str, ns: str):
+    """GHCR, which cannot be read without a credential at all.
+
+    Its token endpoint answers 403 for `tamnd/yo`, for `tamnd/does-not-exist`
+    and for `homebrew/core`, which is as public as a package gets. So there is
+    no anonymous reading of GHCR, not even a wrong one, and this returns
+    `unknown` on purpose rather than being left out of PROBES. A registry with
+    no probe prints as an oversight; a registry with a probe that says what was
+    tried and why it cannot answer prints as a decision.
+
+    What holds the name is not a GHCR fact anyway. A GHCR namespace is a GitHub
+    namespace, so `ghcr.io/tamnd/*` is held by owning the GitHub account, which
+    the `github:tamnd/*` rows already check every run. That is why this row
+    carries a hand-set verdict.
+
+    A real probe is possible with GITHUB_DEPLOY_TOKEN as the bearer. It is not
+    done here because `audit` is the one command that runs with no credentials,
+    which is what makes it safe to run anywhere and on a schedule.
+    """
+    return UNKNOWN, "GHCR is not anonymously readable; held via the GitHub account"
+
+
 def p_rubygems(name: str, _ns: str):
     code, d = get_json(f"https://rubygems.org/api/v1/gems/{name}.json")
     if code == 0:
@@ -589,6 +611,7 @@ PROBES: dict[str, Callable[[str, str], tuple[str, str]]] = {
     "snap": p_snap,
     "scoop-main": p_scoop,
     "docker-hub": p_dockerhub,
+    "ghcr": p_ghcr,
     "rubygems": p_rubygems,
     "hex": p_hex,
     "packagist": p_packagist,
@@ -605,7 +628,8 @@ PROBES: dict[str, Callable[[str, str], tuple[str, str]]] = {
 # category for one audit run and reported a stranger's maintainer list as this
 # project's. A row that names a namespace a probe cannot use is a bug in the
 # file, so it fails the run rather than producing a confident wrong answer.
-NAMESPACED = {"npm", "npm-scope", "maven-central", "docker-hub", "packagist", "github"}
+NAMESPACED = {"npm", "npm-scope", "maven-central", "docker-hub", "ghcr",
+              "packagist", "github"}
 
 
 def check_namespaces(rows) -> list[str]:
@@ -866,6 +890,15 @@ def cmd_verify(args) -> int:
         if probe is None:
             continue
         state, note = probe(r.name, r.namespace)
+        if r.verdict and state == UNKNOWN:
+            # Same rule as `audit`: a probe that could not see is not evidence,
+            # and a name held by a fact no endpoint exposes would otherwise sit
+            # in "could not be checked" forever and block every release.
+            print(f"= {r.key().ljust(width)}  {r.verdict.ljust(8)}  "
+                  f"{r.note}  (by hand)")
+            if r.verdict not in (RESERVED, RELEASED):
+                bad.append((r, r.verdict, r.note))
+            continue
         ok = state in (RESERVED, RELEASED)
         mark = "  " if ok else ("? " if state == UNKNOWN else "! ")
         print(f"{mark}{r.key().ljust(width)}  {state.ljust(8)}  {note}")
@@ -1815,14 +1848,11 @@ def cmd_docs(args) -> int:
             continue
         # The forms a name legitimately takes in prose: bare, namespaced, and
         # for Maven the coordinate rather than the artifact id on its own.
-        forms = {r.name, f"{r.namespace}/{r.name}", f"{r.namespace}:{r.name}",
-                 f"{r.namespace}"}
+        forms = _forms(r)
         if not (forms & mentioned):
             problems.append(f"{r.key()} is held and dx/12 §2 does not mention it")
 
-    known = {r.name for r in rows} | {r.namespace for r in rows if r.namespace}
-    known |= {f"{r.namespace}/{r.name}" for r in rows if r.namespace}
-    known |= {f"{r.namespace}:{r.name}" for r in rows if r.namespace}
+    known = set().union(*(_forms(r) for r in rows)) - {""}
     # Names in the table that no row backs. Anything that is not plausibly a
     # package name is skipped rather than guessed at: the column also carries
     # commands, paths and file extensions.
@@ -1846,10 +1876,32 @@ def cmd_docs(args) -> int:
 # a repository is a URL, a domain is infrastructure, and a scope is a prefix on
 # the names already listed. They are audited in `dx/16` §2.2 instead, and a
 # check that demanded them here would be enforcing a table nobody wants.
+# Registries whose names are written with a host in front of them, because that
+# is how a reader types them. `tamnd/yo` and `ghcr.io/tamnd/yo` are the same
+# name and the table is allowed to say either.
+DOC_HOSTS = {"docker-hub": "docker.io", "ghcr": "ghcr.io"}
+
+
+def _forms(r) -> set[str]:
+    """Every spelling of a name that legitimately appears in prose.
+
+    Bare, namespaced with a slash, namespaced with a colon for Maven
+    coordinates, the namespace on its own, and host-qualified for the two
+    container registries.
+    """
+    f = {r.name, r.namespace}
+    if r.namespace:
+        f |= {f"{r.namespace}/{r.name}", f"{r.namespace}:{r.name}"}
+        host = DOC_HOSTS.get(r.registry)
+        if host:
+            f.add(f"{host}/{r.namespace}/{r.name}")
+    return f
+
+
 DOC_REGISTRIES = {
     "crates.io", "pypi", "npm", "pub.dev", "nuget", "maven-central",
     "cocoapods", "homebrew-core", "chocolatey", "aur", "snap", "scoop-main",
-    "docker-hub", "rubygems", "hex", "packagist", "conda-forge",
+    "docker-hub", "ghcr", "rubygems", "hex", "packagist", "conda-forge",
 }
 
 # Tokens in dx/12 §2 that are deliberately not registry names: commands, paths,

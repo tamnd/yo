@@ -222,6 +222,17 @@ note      = "refused at signup 2026-08-29; no read API shows it, so who holds it
 verdict   = "blocked"
 
 [[name]]
+registry  = "ghcr"
+name      = "yo"
+namespace = "tamnd"
+state     = "reserved"
+probed    = "2026-08-29"
+owner     = "tamnd"
+fallback  = ""
+note      = "a GHCR namespace is a GitHub namespace, so this follows from github:tamnd/yo; no image pushed yet"
+verdict   = "reserved"
+
+[[name]]
 registry  = "rubygems"
 name      = "yodb"
 namespace = ""
