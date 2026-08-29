@@ -26,6 +26,10 @@ name = "elem"
 harness = false
 
 [[bench]]
+name = "intset"
+harness = false
+
+[[bench]]
 name = "listpack"
 harness = false
 
