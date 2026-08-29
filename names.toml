@@ -208,7 +208,7 @@ state     = "reserved"
 probed    = "2026-08-29"
 owner     = "tamnd87"
 fallback  = ""
-note      = "placeholder 0.0.1"
+note      = "account tamnd87, 0.0.1"
 
 [[name]]
 registry  = "docker-hub"

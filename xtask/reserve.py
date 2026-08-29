@@ -738,7 +738,7 @@ def cmd_audit(args) -> int:
             print(f"  {b}", file=sys.stderr)
         return 2
     today = date.today().isoformat()
-    changed, regressed = [], []
+    changed, regressed, unreadable = [], [], []
 
     width = max(len(r.key()) for r in rows)
     for r in rows:
@@ -758,6 +758,23 @@ def cmd_audit(args) -> int:
             r.state, r.probed = r.verdict, today
             continue
         old = r.state
+        if state == UNKNOWN and old and old != UNKNOWN:
+            # A probe that failed does not get to overwrite one that worked.
+            #
+            # GitHub's anonymous rate limit is 60 an hour and this file has 15
+            # GitHub rows in it, so a second audit inside the hour turns every
+            # one of them `unknown` and writes that down. The record then says
+            # the project does not know whether it owns fifteen repositories it
+            # has owned all along, and it says so with today's date on it.
+            #
+            # `probed` is deliberately left alone too. It means the date of the
+            # last answer, not the date of the last attempt, and a stale date is
+            # the signal that something has not been checked in a while. Today's
+            # date on a failed reading destroys exactly that signal.
+            unreadable.append((r, note))
+            print(f"? {r.key().ljust(width)}  {old.ljust(8)}  "
+                  f"keeping {old} from {r.probed}: {note}")
+            continue
         flag = " "
         if old and old != state:
             if (old, state) in REGRESSIONS:
@@ -775,7 +792,18 @@ def cmd_audit(args) -> int:
     for r in rows:
         tally[r.state] = tally.get(r.state, 0) + 1
     print("  " + "  ".join(f"{k}={v}" for k, v in sorted(tally.items())))
-    print(f"  {len(rows)} rows, {len(changed)} changed, {len(regressed)} regressed")
+    print(f"  {len(rows)} rows, {len(changed)} changed, {len(regressed)} regressed, "
+          f"{len(unreadable)} kept from a previous run")
+
+    if unreadable:
+        # Not an error. The file still says what it said and the rows are marked,
+        # so the next run that can reach the registry settles it. It is printed
+        # because a run where a third of the probes failed is a different run
+        # from one where they all worked, and the tally alone would not say so.
+        print(f"\n  {len(unreadable)} row(s) could not be read this time and "
+              f"kept their previous state:")
+        for r, note in unreadable:
+            print(f"    {r.key()}: {note}")
 
     if regressed:
         print("\nREGRESSED — a name we were counting on is gone:", file=sys.stderr)
