@@ -26,3 +26,7 @@ harness = false
 [[bench]]
 name = "listpack"
 harness = false
+
+[[bench]]
+name = "setops"
+harness = false
