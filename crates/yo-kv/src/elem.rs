@@ -72,6 +72,8 @@
 
 use yo_common::{hash_key, tag_of};
 
+use crate::scan::Cursor;
+
 /// The most rows one table holds.
 ///
 /// A slot packs a tag and a row index into 32 bits, which leaves 24 bits for the
@@ -302,6 +304,48 @@ impl<V: Copy> Elements<V> {
     /// pointer chasing.
     pub fn iter(&self) -> impl Iterator<Item = (&[u8], &V)> {
         self.rows.iter().map(|r| (self.name_of(r), &r.value))
+    }
+
+    /// Walk part of the table and say where to resume.
+    ///
+    /// This is `SSCAN`, `HSCAN` and `ZSCAN`. It reads downward from the cursor,
+    /// hands each element to `f`, and stops after `count` of them or at the
+    /// bottom, whichever comes first. A returned cursor that is
+    /// [`Cursor::is_end`] means the collection has been walked.
+    ///
+    /// Downward is what makes the guarantee hold while the collection is being
+    /// written, and [`crate::scan`] is where the argument for that lives. `count`
+    /// is a hint in Redis and a limit here, and a zero is read as one, because a
+    /// scan that returns nothing and the same cursor is a client that never
+    /// finishes.
+    ///
+    /// This band is one partition, so a cursor from a partitioned layout is
+    /// rebased onto it before anything is read.
+    pub fn scan<F>(&self, cursor: Cursor, count: usize, mut f: F) -> Cursor
+    where
+        F: FnMut(&[u8], &V),
+    {
+        if self.rows.is_empty() {
+            return Cursor::END;
+        }
+        let here = cursor.rebase(1);
+        let top = self.rows.len() - 1;
+        // A cursor from before a run of removals can name a row that is no
+        // longer there. Everything above the end has been walked already or was
+        // never there, so the top is the honest place to carry on from.
+        let mut at = match here.idx() {
+            Some(idx) => (idx as usize).min(top),
+            None => top,
+        };
+        for _ in 0..count.max(1) {
+            let row = &self.rows[at];
+            f(self.name_of(row), &row.value);
+            if at == 0 {
+                return Cursor::END;
+            }
+            at -= 1;
+        }
+        Cursor::at(1, 0, at as u64)
     }
 
     /// Throw everything away and keep the allocations.
@@ -785,6 +829,101 @@ mod tests {
         }
         assert_eq!(s.slots.iter().filter(|v| **v != EMPTY).count(), s.len());
         const { assert!(MAX_ROWS < 0x00FF_FFFF, "a row index is never all ones") }
+    }
+
+    /// Collect a whole scan, a page at a time, the way a client loops.
+    fn scan_all(s: &Set, page: usize) -> Vec<Vec<u8>> {
+        let mut out = Vec::new();
+        let mut c = Cursor::START;
+        loop {
+            c = s.scan(c, page, |n, ()| out.push(n.to_vec()));
+            if c.is_end() {
+                return out;
+            }
+        }
+    }
+
+    #[test]
+    fn a_scan_of_a_still_collection_returns_everything_once() {
+        let names: Vec<Vec<u8>> = (0..300u32).map(|i| format!("m{i}").into_bytes()).collect();
+        let mut s = Set::new();
+        for n in &names {
+            s.insert(n, ()).expect("room");
+        }
+        for page in [1, 7, 10, 1000] {
+            let mut seen = scan_all(&s, page);
+            assert_eq!(seen.len(), names.len(), "page {page} returned a duplicate");
+            seen.sort();
+            let mut want = names.clone();
+            want.sort();
+            assert_eq!(seen, want, "page {page}");
+        }
+    }
+
+    #[test]
+    fn scanning_an_empty_collection_is_over_immediately() {
+        let s = Set::new();
+        let mut hit = 0;
+        assert!(s.scan(Cursor::START, 10, |_, ()| hit += 1).is_end());
+        assert_eq!(hit, 0);
+    }
+
+    /// The guarantee, which is the only reason the walk goes downward. Members
+    /// are removed while the scan is running, and every member that was there
+    /// the whole time has to come back at least once. Duplicates are allowed and
+    /// are not what this is checking.
+    #[test]
+    fn a_scan_never_misses_a_member_that_stayed() {
+        let names: Vec<Vec<u8>> = (0..400u32).map(|i| format!("m{i}").into_bytes()).collect();
+        let mut s = Set::new();
+        for n in &names {
+            s.insert(n, ()).expect("room");
+        }
+
+        // Every seventh member goes away, a few at a time, in the middle of the
+        // scan. Removal moves the top row into the hole, so this is the case
+        // that would break an upward walk.
+        let doomed: Vec<Vec<u8>> = names.iter().step_by(7).cloned().collect();
+        let mut gone = 0usize;
+        let mut seen: Vec<Vec<u8>> = Vec::new();
+        let mut c = Cursor::START;
+        loop {
+            c = s.scan(c, 9, |n, ()| seen.push(n.to_vec()));
+            for n in doomed.iter().skip(gone).take(3) {
+                s.remove(n);
+            }
+            gone = (gone + 3).min(doomed.len());
+            if c.is_end() {
+                break;
+            }
+        }
+
+        for n in &names {
+            if doomed.contains(n) {
+                continue;
+            }
+            assert!(
+                seen.contains(n),
+                "{} was there all along",
+                String::from_utf8_lossy(n)
+            );
+        }
+    }
+
+    /// A cursor that names a row past the end, because the collection shrank
+    /// under it, carries on rather than panicking or ending early.
+    #[test]
+    fn a_stale_cursor_is_answered_and_not_refused() {
+        let s = set(&[b"a", b"b", b"c"]);
+        let mut seen = Vec::new();
+        let c = s.scan(Cursor::at(1, 0, 900), 2, |n, ()| seen.push(n.to_vec()));
+        assert_eq!(seen, vec![b"c".to_vec(), b"b".to_vec()]);
+        assert_eq!(c.idx(), Some(0));
+
+        // And one from a layout this band does not have.
+        let mut also = Vec::new();
+        s.scan(Cursor::at(16, 9, 4), 99, |n, ()| also.push(n.to_vec()));
+        assert_eq!(also.len(), 3);
     }
 
     /// The two ways to take an element out have to agree, because `SPOP` uses
