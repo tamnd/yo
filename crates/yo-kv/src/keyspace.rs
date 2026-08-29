@@ -20,7 +20,7 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use yo_common::{Code, Error, Result, Rng};
+use yo_common::{Addr, Code, Error, Result, Rng};
 use yo_index::RawMap;
 
 use crate::Clock;
@@ -337,6 +337,28 @@ impl Keyspace {
             self.drop_key(key);
             self.expired += 1;
         }
+    }
+
+    /// Where `key`'s record is, having thrown the key away first if it is dead.
+    ///
+    /// The same fold as [`Keyspace::live_slot`] for a caller that wants the
+    /// record itself rather than a slot number, which is every string command.
+    /// `GET` used to be a reap, then a type check, then a read, and each of the
+    /// three hashed the key and walked a bucket for the same record. It is one
+    /// walk now and two arena reads, and an arena read at a known address is a
+    /// load.
+    ///
+    /// The address dies at the next write, which is why this is `pub(crate)`
+    /// and why every caller reads it and drops it inside one command.
+    pub(crate) fn live_rec(&mut self, key: &[u8]) -> Option<Addr> {
+        let now = self.clock.now_ms();
+        let addr = self.map.find(key)?;
+        if value::is_expired(self.map.value_at(addr), now) {
+            self.drop_key(key);
+            self.expired += 1;
+            return None;
+        }
+        Some(addr)
     }
 
     /// The slot under `key`, having thrown the key away first if it is dead.
