@@ -67,6 +67,7 @@ pub mod listpack;
 pub mod scan;
 pub mod setops;
 pub mod strings;
+pub mod ttl;
 pub mod value;
 
 pub use clock::Clock;
@@ -78,4 +79,5 @@ pub use listpack::{Entry, Listpack, Malformed};
 pub use scan::{Cursor, MAX_PARTS};
 pub use setops::{Plan, Set};
 pub use strings::{Exists, Expire, KEY_MAX, STRING_MAX, SetOptions, SetOutcome, Strings};
+pub use ttl::{Deadlines, MAX_AT};
 pub use value::{EMBSTR_MAX, Encoding, Str};
