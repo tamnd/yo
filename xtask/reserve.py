@@ -849,6 +849,11 @@ WHAT = {
 
 REPO = "https://github.com/tamnd/yo"
 
+# CocoaPods does not host sources. A podspec names a git repository and a tag
+# and the pod is whatever is in that tree, so the Swift binding's repository is
+# part of the publish and not just a link in the metadata.
+SWIFT_REPO = "https://github.com/tamnd/yo-swift"
+
 # §6 rule 5: the README's second line is the milestone the real release lands
 # at, so a reader who finds the placeholder learns when it stops being one.
 MILESTONE = "The real release lands at milestone DX6 (M7). Until then this package does nothing."
@@ -1772,6 +1777,87 @@ ENTRYPOINT ["/yodb"]
     )
 
 
+def b_cocoapods(row, root, version, desc):
+    """CocoaPods, through `pod trunk push`.
+
+    The odd one out, because the artifact is not built here. A podspec is a
+    pointer: it names a git repository and a tag, and CocoaPods fetches the
+    sources from there. So this builder writes the pointer and the check step
+    compiles what it points at, which means the thing being validated is
+    `tamnd/yo-swift` at tag `{version}` and not anything in this directory.
+
+    That has a consequence worth stating rather than discovering. Every other
+    builder here can satisfy §6 rule 6 on its own, because it writes the symbol
+    that raises. This one cannot. If the tag it points at has no such symbol,
+    `pod spec lint` still passes — a package that compiles and does nothing is a
+    valid pod — and CocoaPods becomes the one ecosystem where a user who follows
+    the install table gets silence instead of the sentence. The lint is not a
+    check for that, so `pod spec lint` is followed by one that is.
+    """
+    tag = version
+    raises = raises_for(version)
+
+    # Both licence files are in the repository and the pod is under both, but
+    # `:file` takes exactly one. Naming MIT there and the pair in `:type` is the
+    # usual way to spell a dual licence in a podspec, and it is what the pod's
+    # own LICENSE-APACHE says the other half is.
+    _w(root, f"{row.name}.podspec", f'''
+Pod::Spec.new do |s|
+  s.name     = "{row.name}"
+  s.version  = "{version}"
+  s.summary  = "{desc}"
+  s.homepage = "{REPO}"
+  s.license  = {{ :type => "{LICENSE_LINE}", :file => "LICENSE-MIT" }}
+
+  # A per-service address, because CocoaPods publishes the author email in the
+  # pod's public metadata where anyone can read it.
+  s.author   = {{ "{IDENTITY}" => "cocoapods@tamnd.com" }}
+
+  s.source       = {{ :git => "{SWIFT_REPO}.git", :tag => s.version.to_s }}
+  s.source_files = "Sources/Yodb/**/*.swift"
+
+  # Mirrors Package.swift. A podspec that claimed a lower floor than the package
+  # would be a second answer to the same question, and the two would drift.
+  s.swift_versions            = ["6.0"]
+  s.osx.deployment_target     = "14.0"
+  s.ios.deployment_target     = "17.0"
+  s.tvos.deployment_target    = "17.0"
+  s.watchos.deployment_target = "10.0"
+  s.visionos.deployment_target = "1.0"
+end
+'''.lstrip())
+
+    _w(root, "README.md", _readme(desc, PLACEHOLDER_BODY))
+
+    # The check the lint does not do. `pod spec lint` says the sources compile;
+    # this says they carry the sentence, by reading the tag the podspec points
+    # at rather than any local checkout. Without it CocoaPods could ship a pod
+    # that builds, imports and stays quiet, which is the divergence npm shipped
+    # for a day and the one Docker Hub's registry page nearly shipped again.
+    sentence = shlex.quote(raises)
+    src = f"{SWIFT_REPO}/raw/{tag}/Sources/Yodb"
+    carries = (
+        f"git ls-remote --tags {SWIFT_REPO}.git refs/tags/{tag} | grep -q . && "
+        f"curl -fsSL {src}/Yodb.swift {src}/YoError.swift {src}/YoCode.swift "
+        f"| grep -qF {sentence}"
+    )
+
+    return (
+        [
+            Step("the tag exists and its sources carry the sentence",
+                 ["sh", "-c", carries], root),
+            Step("lint the podspec against the tag it points at", [
+                "pod", "spec", "lint", f"{row.name}.podspec", "--no-clean",
+            ], root),
+        ],
+        [
+            Step("push to trunk", [
+                "pod", "trunk", "push", f"{row.name}.podspec",
+            ], root, loud=True),
+        ],
+    )
+
+
 BUILDERS = {
     "crates.io": b_crates,
     "pypi": b_pypi,
@@ -1780,6 +1866,7 @@ BUILDERS = {
     "maven-central": b_maven,
     "nuget": b_nuget,
     "docker-hub": b_docker,
+    "cocoapods": b_cocoapods,
 }
 
 # The credential each builder needs before it is worth starting.
@@ -1794,6 +1881,11 @@ NEEDS = {
     ],
     "nuget": ["NUGET_API_KEY"],
     "docker-hub": ["DOCKERHUB_USERNAME", "DOCKERHUB_TOKEN"],
+    # `pod` reads this one out of the environment by itself, so unlike npm and
+    # Docker nothing has to be written to disk for it. It is listed here so a run
+    # with an unverified trunk session stops before the lint rather than after
+    # it, since the lint is minutes of compiling for every platform.
+    "cocoapods": ["COCOAPODS_TRUNK_TOKEN"],
 }
 
 

@@ -12,7 +12,9 @@ Benchmark numbers published so far are development measurements taken on a machi
 
 ## Packages
 
-There is nothing to install. Every package below is published at `0.0.1`, holds a name, and raises the moment you call anything in it.
+There is nothing to install. Every package below is published at `0.0.1` and holds a name, and calling anything in one raises with the same sentence naming the version you have.
+
+Swift is the exception and it is a gap rather than a decision. That package carries the error type, the code table and the version constants and no entry point at all, so there is nothing in it to call and nothing that raises. It resolves and it builds, which is all it has ever been checked for.
 
 | | Command | Repository |
 |---|---|---|
