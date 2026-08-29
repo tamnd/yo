@@ -65,6 +65,7 @@ pub mod elem;
 pub mod lcs;
 pub mod listpack;
 pub mod scan;
+pub mod setops;
 pub mod strings;
 pub mod value;
 
@@ -75,5 +76,6 @@ pub use elem::{Elements, Full, MAX_ROWS, NAME_MAX};
 pub use lcs::{Idx as LcsIdx, LCS_MAX_CELLS, Match as LcsMatch};
 pub use listpack::{Entry, Listpack, Malformed};
 pub use scan::{Cursor, MAX_PARTS};
+pub use setops::{Plan, Set};
 pub use strings::{Exists, Expire, KEY_MAX, STRING_MAX, SetOptions, SetOutcome, Strings};
 pub use value::{EMBSTR_MAX, Encoding, Str};

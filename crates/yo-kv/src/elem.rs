@@ -219,6 +219,29 @@ impl<V: Copy> Elements<V> {
         self.find(name).is_some()
     }
 
+    /// The hash of a name, for a caller about to ask several tables about it.
+    ///
+    /// `SINTER` over k sets asks the same question k times, and hashing the
+    /// member once instead of k times is the difference between the hash being
+    /// noise and it being most of the work. Pair it with
+    /// [`Elements::contains_hashed`].
+    #[inline]
+    #[must_use]
+    pub fn hash_of(name: &[u8]) -> u64 {
+        hash(name)
+    }
+
+    /// Whether this name is here, with its hash already in hand.
+    ///
+    /// The hash must be [`Elements::hash_of`] of the same bytes. Anything else
+    /// gives a wrong answer rather than an error, which is why this takes the
+    /// name too and compares it: a caller cannot fake membership with a number.
+    #[inline]
+    #[must_use]
+    pub fn contains_hashed(&self, h: u64, name: &[u8]) -> bool {
+        self.find_hashed(h, name).is_some()
+    }
+
     /// Store `value` against `name`, and say what was there before.
     ///
     /// `None` means the element is new, which is the number `SADD` and `HSET`
