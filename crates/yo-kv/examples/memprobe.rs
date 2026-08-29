@@ -12,7 +12,7 @@
 //! Keys, value length, and how many times to write the whole set. The live
 //! number should not move between one pass and ten. The reserved number moving
 //! between one pass and ten is the arena holding what it has already replaced.
-use yo_kv::{SetOptions, Strings};
+use yo_kv::{Keyspace, SetOptions};
 
 fn arg(n: usize, default: usize) -> usize {
     std::env::args()
@@ -27,7 +27,7 @@ fn main() {
     let rounds = arg(3, 1);
 
     let val = vec![b'x'; vlen];
-    let mut s = Strings::new();
+    let mut s = Keyspace::new();
     for _ in 0..rounds {
         for i in 0..keys {
             let key = format!("key:{i:012}");

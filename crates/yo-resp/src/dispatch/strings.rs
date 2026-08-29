@@ -1,6 +1,6 @@
 //! The string commands, from the wire.
 //!
-//! Every body here parses its arguments, calls one method on [`Strings`], and
+//! Every body here parses its arguments, calls one method on [`Keyspace`], and
 //! writes one reply. There is no logic about what a command means in this file,
 //! because that logic is in `yo-kv` where the embedded API reaches it too (Y23).
 //! What is here is the part that only the wire has: which keyword goes where,
@@ -28,7 +28,7 @@ use super::table::Spec;
 use crate::reply::Out;
 use yo_common::num::{parse_f64, parse_i64};
 use yo_common::{Code, Error, Result, xxh3};
-use yo_kv::{Compare, Exists, Expire, IncrEx, IncrExpire, Num, SetOptions, Str, Strings};
+use yo_kv::{Compare, Exists, Expire, IncrEx, IncrExpire, Keyspace, Num, SetOptions, Str};
 
 /// What Redis says when a digest is not sixteen hexadecimal characters.
 const BAD_DIGEST: &str = "must be exactly 16 hexadecimal characters";
@@ -49,7 +49,7 @@ const LEN_AND_IDX: &str = "If you want both the length and indexes, please just 
 /// to a switch on the length and then a compare; the table grows to about two
 /// hundred and fifty commands by M8 and this becomes a jump through an index
 /// stored in the [`Spec`], which does not change any of the bodies.
-pub(super) fn execute(db: &mut Strings, spec: &Spec, args: Args<'_>, out: &mut Out) -> Result<()> {
+pub(super) fn execute(db: &mut Keyspace, spec: &Spec, args: Args<'_>, out: &mut Out) -> Result<()> {
     match spec.name {
         "get" => match db.get(args.get(1)) {
             Some(v) => write_str(out, v),
@@ -84,7 +84,7 @@ pub(super) fn execute(db: &mut Strings, spec: &Spec, args: Args<'_>, out: &mut O
             out.int(i64::from(db.msetnx(pairs(args, 1, n))?));
         }
         "mget" => {
-            // One key at a time rather than `Strings::mget`, which collects the
+            // One key at a time rather than `Keyspace::mget`, which collects the
             // answers into a `Vec` for a caller that wants them all at once.
             // The wire wants them one at a time and in order, and a `Vec` here
             // would be an allocation per call on a thread that must not.
@@ -168,7 +168,7 @@ fn pair_count(args: Args<'_>, name: &str) -> Result<usize> {
 /// `count` key and value pairs starting at argument `from`.
 ///
 /// Borrowed straight out of the read buffer and never collected, which is what
-/// [`Strings::mset`] takes an iterator for.
+/// [`Keyspace::mset`] takes an iterator for.
 fn pairs<'a>(
     args: Args<'a>,
     from: usize,
@@ -280,7 +280,7 @@ fn unit_bit(unit: Unit) -> u16 {
 
 /// `SET key value [NX|XX] [GET] [EX s|PX ms|EXAT ts|PXAT ts|KEEPTTL]
 /// [IFEQ v|IFNE v|IFDEQ d|IFDNE d]`.
-fn set(db: &mut Strings, args: Args<'_>, out: &mut Out) -> Result<()> {
+fn set(db: &mut Keyspace, args: Args<'_>, out: &mut Out) -> Result<()> {
     let (key, val) = (args.get(1), args.get(2));
     let mut opts = SetOptions::PLAIN;
     let mut seen = 0u16;
@@ -381,7 +381,7 @@ fn condition<'a>(keyword: &[u8], arg: &'a [u8]) -> Result<Compare<'a>> {
 // ------------------------------------------------------------------- GETEX
 
 /// `GETEX key [EX s|PX ms|EXAT ts|PXAT ts|PERSIST]`.
-fn getex(db: &mut Strings, args: Args<'_>, out: &mut Out) -> Result<()> {
+fn getex(db: &mut Keyspace, args: Args<'_>, out: &mut Out) -> Result<()> {
     let key = args.get(1);
     let mut seen = 0u16;
     let mut expire: Option<(Unit, usize)> = None;
@@ -428,7 +428,7 @@ fn getex(db: &mut Strings, args: Args<'_>, out: &mut Out) -> Result<()> {
 
 /// `MSETEX numkeys key value [key value ...] [NX|XX]
 /// [EX s|PX ms|EXAT ts|PXAT ts|KEEPTTL]`.
-fn msetex(db: &mut Strings, args: Args<'_>, out: &mut Out) -> Result<()> {
+fn msetex(db: &mut Keyspace, args: Args<'_>, out: &mut Out) -> Result<()> {
     let n = parse_i64(args.get(1))
         .filter(|&n| n > 0)
         .and_then(|n| usize::try_from(n).ok())
@@ -484,7 +484,7 @@ fn msetex(db: &mut Strings, args: Args<'_>, out: &mut Out) -> Result<()> {
 /// The arity in the table is a minimum of two, and a real server then refuses
 /// anything that is not two or four arguments as a wrong number of them rather
 /// than as a syntax error.
-fn delex(db: &mut Strings, args: Args<'_>, out: &mut Out) -> Result<()> {
+fn delex(db: &mut Keyspace, args: Args<'_>, out: &mut Out) -> Result<()> {
     if args.len() != 2 && args.len() != 4 {
         return Err(args::wrong_arity("delex"));
     }
@@ -508,7 +508,7 @@ fn delex(db: &mut Strings, args: Args<'_>, out: &mut Out) -> Result<()> {
 /// Unlike `SET`, `INCREX` refuses a keyword it has already seen. It is a newer
 /// command and it was written with a stricter parser, and a client that sends
 /// `BYINT 1 BYINT 2` has a bug either way.
-fn increx(db: &mut Strings, args: Args<'_>, out: &mut Out) -> Result<()> {
+fn increx(db: &mut Keyspace, args: Args<'_>, out: &mut Out) -> Result<()> {
     /// `BYINT` or `BYFLOAT`.
     const BY: u16 = 1 << 9;
     /// `SATURATE`.
@@ -637,7 +637,7 @@ fn write_num(out: &mut Out, n: Num) {
 ///
 /// `MINMATCHLEN` and `WITHMATCHLEN` without `IDX` are accepted and ignored,
 /// which is what a real server does.
-fn lcs(db: &mut Strings, args: Args<'_>, out: &mut Out) -> Result<()> {
+fn lcs(db: &mut Keyspace, args: Args<'_>, out: &mut Out) -> Result<()> {
     let (a, b) = (args.get(1), args.get(2));
     let (mut want_len, mut want_idx, mut with_len) = (false, false, false);
     let mut minmatchlen = 0u32;

@@ -67,7 +67,7 @@ use crate::error::ProtocolError;
 use crate::proto::{Limits, Proto};
 use crate::reply::Out;
 use crate::request::{Argv, Step};
-use yo_kv::Strings;
+use yo_kv::Keyspace;
 
 /// Which connection. An index, reused after a connection closes.
 pub type ConnId = u32;
@@ -703,7 +703,7 @@ impl<S: Sink> Engine for Wire<S> {
         // them means a hash list per command and that is the batch's own job
         // once multi key commands are worth measuring.
         let key = args.opt(spec.first_key as usize)?;
-        Some(Strings::hash_of(key))
+        Some(Keyspace::hash_of(key))
     }
 
     fn prefetch(&self, cmd: &Cmd, hash: u64) {

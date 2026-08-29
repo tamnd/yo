@@ -19,10 +19,10 @@ use super::args::Args;
 use super::table::Spec;
 use crate::reply::Out;
 use yo_common::Result;
-use yo_kv::Strings;
+use yo_kv::Keyspace;
 
 /// Run one keyspace command.
-pub(super) fn execute(db: &mut Strings, spec: &Spec, args: Args<'_>, out: &mut Out) -> Result<()> {
+pub(super) fn execute(db: &mut Keyspace, spec: &Spec, args: Args<'_>, out: &mut Out) -> Result<()> {
     match spec.name {
         // `UNLINK` is `DEL` with the freeing moved to a background thread on a
         // real server. Ours frees on the spot, which is what `UNLINK` promises

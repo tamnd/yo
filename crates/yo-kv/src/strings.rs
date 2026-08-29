@@ -1,5 +1,10 @@
 //! The string type and its commands.
 //!
+//! The commands are an `impl` block on [`Keyspace`] rather than methods on some
+//! per type object, because a key belongs to the database and not to a type.
+//! Everything in this file is about strings; everything that is about the
+//! database whatever it holds is in [`keyspace`](crate::keyspace).
+//!
 //! One method per Redis command, taking and returning ordinary Rust values.
 //! There is no command enum here and no dispatch: this is the layer the wire
 //! calls into and the layer the embedded API calls into, and Y23 says those two
@@ -10,9 +15,9 @@
 //! verbatim, and a [`Code`] alongside it, because the embedded caller should be
 //! matching on a value rather than on a string (P5).
 
-use crate::clock::Clock;
 use crate::cond::Compare;
 use crate::counter::{self, Counted, IncrEx, IncrExpire, Num};
+use crate::keyspace::Keyspace;
 use crate::lcs;
 use crate::value::{self, Encoding, Str};
 use std::borrow::Cow;
@@ -170,116 +175,12 @@ pub struct SetOutcome {
     pub previous: Option<Vec<u8>>,
 }
 
-/// A shard's strings.
+/// The string commands.
 ///
-/// Not `Sync`, like everything else that hangs off a shard. One of these
-/// belongs to one thread and is reached by sending that thread a command.
-pub struct Strings {
-    map: RawMap,
-    clock: Clock,
-    /// Keys that were found dead on the way to answering something else.
-    expired: u64,
-}
-
-impl Strings {
-    /// An empty store on the system clock.
-    pub fn new() -> Strings {
-        Strings::with_clock(Clock::system())
-    }
-
-    /// An empty store on a clock of the caller's choosing.
-    pub fn with_clock(clock: Clock) -> Strings {
-        Strings {
-            map: RawMap::new(),
-            clock,
-            expired: 0,
-        }
-    }
-
-    /// The clock expiry compares against.
-    #[inline]
-    pub const fn clock(&self) -> &Clock {
-        &self.clock
-    }
-
-    /// The clock, to refresh once per turn of the loop.
-    #[inline]
-    pub const fn clock_mut(&mut self) -> &mut Clock {
-        &mut self.clock
-    }
-
-    /// The map underneath, for statistics and for compaction.
-    #[inline]
-    pub const fn map(&self) -> &RawMap {
-        &self.map
-    }
-
-    /// How many keys are stored, including any that are dead and not yet
-    /// noticed. This is Redis's `DBSIZE`, which counts the same way.
-    #[inline]
-    pub fn len(&self) -> usize {
-        self.map.len()
-    }
-
-    /// Whether anything is stored.
-    #[inline]
-    pub fn is_empty(&self) -> bool {
-        self.map.is_empty()
-    }
-
-    /// Throw every key away. This is `FLUSHDB` on one database.
-    ///
-    /// The expiry counter is not reset, because Redis does not reset it either:
-    /// `expired_keys` in `INFO stats` counts what this process has expired since
-    /// it started, and emptying a database is not expiring anything.
-    pub fn clear(&mut self) {
-        self.map.clear();
-    }
-
-    /// Keys reclaimed by running into them after their deadline.
-    ///
-    /// Redis calls this `expired_keys` in `INFO stats` and counts both lazy and
-    /// active expiry into it. Only lazy expiry exists so far, so only lazy
-    /// expiry is counted, and the active cycle in the maintenance slice will add
-    /// to the same number when it lands (`14` section 1).
-    #[inline]
-    pub const fn expired_keys(&self) -> u64 {
-        self.expired
-    }
-
-    /// Bytes held by the index and the arena.
-    #[inline]
-    pub fn memory_bytes(&self) -> usize {
-        self.map.memory_bytes()
-    }
-
-    /// Give back one segment's worth of space if one has gone mostly dead.
-    ///
-    /// Overwriting a key does not reuse its bytes, it writes the new record at
-    /// the bump pointer and counts the old one as dead, so a workload that sets
-    /// the same keys over and over holds far more than it is storing until
-    /// something compacts. This is that something, and it does at most one
-    /// segment per call so that the loop can afford to ask every turn.
-    #[inline]
-    pub fn compact_step(&mut self) -> Option<usize> {
-        self.map.compact_step()
-    }
-
-    /// Ask the cache for the bucket this key will land in.
-    ///
-    /// The first of the loop's two walks (`04` section 3) calls this.
-    #[inline]
-    pub fn prefetch(&self, hash: u64) {
-        self.map.prefetch(hash);
-    }
-
-    /// The hash this store files `key` under.
-    #[inline]
-    #[must_use]
-    pub fn hash_of(key: &[u8]) -> u64 {
-        RawMap::hash_of(key)
-    }
-
+/// These hang off the database rather than off a per type object, because a
+/// key belongs to the database: `GET` against a set has to be able to see that
+/// it is a set.
+impl Keyspace {
     // ---------------------------------------------------------------- reading
 
     /// `GET key`.
@@ -297,7 +198,7 @@ impl Strings {
         for k in keys {
             self.reap(k);
         }
-        let me: &Strings = self;
+        let me: &Keyspace = self;
         keys.iter().map(|k| me.peek(k)).collect()
     }
 
@@ -968,12 +869,6 @@ impl Strings {
     }
 }
 
-impl Default for Strings {
-    fn default() -> Strings {
-        Strings::new()
-    }
-}
-
 /// Add or subtract, refusing to wrap.
 #[inline]
 fn step(n: i64, by: i64, subtract: bool) -> Result<i64> {
@@ -1031,15 +926,16 @@ fn range_of(len: usize, start: i64, end: i64) -> Option<(usize, usize)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::clock::Clock;
     use crate::value::EMBSTR_MAX;
 
     /// A store on a fixed clock, so expiry is a function of what the test does
     /// and not of how long the test takes to run.
-    fn store() -> Strings {
-        Strings::with_clock(Clock::fixed(1_000))
+    fn store() -> Keyspace {
+        Keyspace::with_clock(Clock::fixed(1_000))
     }
 
-    fn got(s: &mut Strings, key: &[u8]) -> Option<Vec<u8>> {
+    fn got(s: &mut Keyspace, key: &[u8]) -> Option<Vec<u8>> {
         s.get(key).map(|v| v.to_vec())
     }
 
@@ -1722,7 +1618,7 @@ mod tests {
 
     #[test]
     fn the_store_reports_what_it_is_holding() {
-        let mut s = Strings::new();
+        let mut s = Keyspace::new();
         assert!(s.is_empty());
         assert!(s.memory_bytes() > 0, "an empty index still has buckets");
         s.set_plain(b"k", b"v").unwrap();
@@ -1730,7 +1626,7 @@ mod tests {
         assert_eq!(s.len(), 1);
         // The clock is the system one, so it is somewhere after 2020.
         assert!(s.clock().now_ms() > 1_577_836_800_000);
-        s.prefetch(Strings::hash_of(b"k"));
+        s.prefetch(Keyspace::hash_of(b"k"));
         assert_eq!(got(&mut s, b"k").as_deref(), Some(&b"v"[..]));
     }
 
