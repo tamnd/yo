@@ -83,6 +83,56 @@ pub const fn i64_len(n: i64) -> usize {
     }
 }
 
+/// A buffer big enough for the digits of any `i64` or `u64`, sign included.
+///
+/// Twenty digits for `18446744073709551615` and one more for the minus sign
+/// that `-9223372036854775808` needs.
+pub const DIGITS_MAX: usize = U64_DIGITS + 1;
+
+/// The digits of `n`, written backwards into `buf`, and where they start.
+///
+/// One digit a pass rather than the two [`push_u64`] does, because these two
+/// are not on the reply path and the pair table is only worth its branch when
+/// it is.
+fn fill_back(buf: &mut [u8; DIGITS_MAX], n: u64) -> usize {
+    let mut at = DIGITS_MAX;
+    let mut v = n;
+    loop {
+        at -= 1;
+        buf[at] = b'0' + (v % 10) as u8;
+        v /= 10;
+        if v == 0 {
+            return at;
+        }
+    }
+}
+
+/// The decimal digits of `n`, written into the back of `buf`.
+///
+/// The same answer [`push_i64`] gives, for a caller that has nowhere to put a
+/// `Vec`. `SSCAN key 0 MATCH 1*` has to run a glob over a member that is stored
+/// as a number and has no digits anywhere, and doing that through a `Vec` would
+/// be an allocation per member on a thread that must not allocate.
+pub fn i64_digits(buf: &mut [u8; DIGITS_MAX], n: i64) -> &[u8] {
+    let mut at = fill_back(buf, n.unsigned_abs());
+    if n < 0 {
+        at -= 1;
+        buf[at] = b'-';
+    }
+    &buf[at..]
+}
+
+/// The decimal digits of `n`, written into the back of `buf`.
+///
+/// The unsigned form, for the numbers that genuinely do not fit in an `i64`. A
+/// scan cursor is one: ours packs a partition count into the top bits, so a
+/// large enough collection hands the client a number with bit 63 set and
+/// reporting it as a signed integer would report it as negative.
+pub fn u64_digits(buf: &mut [u8; DIGITS_MAX], n: u64) -> &[u8] {
+    let at = fill_back(buf, n);
+    &buf[at..]
+}
+
 /// Parses a signed decimal integer the way Redis's `string2ll` does.
 ///
 /// Returns `None` for anything it would reject, which includes an empty slice,
@@ -381,6 +431,32 @@ mod tests {
             if n == u64::MAX {
                 break;
             }
+        }
+    }
+
+    #[test]
+    fn the_stack_form_writes_what_the_vec_form_writes() {
+        // Two implementations of the same digits is the shape of bug that only
+        // shows at one boundary, so this checks them against each other rather
+        // than against a literal.
+        let mut buf = [0u8; DIGITS_MAX];
+        let mut n: i64 = 0;
+        for _ in 0..19 {
+            for probe in [n, -n, n + 1, n - 1] {
+                assert_eq!(i64_digits(&mut buf, probe), text(probe).as_bytes());
+            }
+            n = n.saturating_mul(10).max(9);
+        }
+        assert_eq!(i64_digits(&mut buf, i64::MIN), text(i64::MIN).as_bytes());
+        assert_eq!(i64_digits(&mut buf, i64::MAX), text(i64::MAX).as_bytes());
+        assert_eq!(i64_digits(&mut buf, 0), b"0", "and zero is one digit");
+
+        // And the unsigned form past where the signed one stops, which is the
+        // whole reason it is there.
+        for probe in [0, 1, u64::MAX, 1 << 63, i64::MAX as u64 + 1] {
+            let mut v = Vec::new();
+            push_u64(&mut v, probe);
+            assert_eq!(u64_digits(&mut buf, probe), v.as_slice(), "{probe}");
         }
     }
 

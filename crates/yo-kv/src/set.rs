@@ -49,6 +49,7 @@
 use crate::elem::Elements;
 use crate::intset::Intset;
 use crate::listpack::{self, Listpack};
+use crate::scan::Cursor;
 use yo_common::num::{i64_len, parse_i64};
 
 /// A set member: bytes as they lie, or an integer not yet formatted.
@@ -219,6 +220,36 @@ impl Set {
     /// Every member.
     pub fn iter(&self) -> impl Iterator<Item = Member<'_>> {
         (0..self.len()).map(|i| self.at(i).expect("index is under the length"))
+    }
+
+    /// Walk part of the set and say where to resume. This is `SSCAN`.
+    ///
+    /// Only the table band walks in windows. An intset or a listpack hands back
+    /// every member in one call and a cursor of [`Cursor::END`], ignoring the
+    /// cursor it was given, which is what Redis does for the same two encodings
+    /// and for the same reason: a hundred and twenty eight members is smaller
+    /// than the reply header arithmetic to split them up, and a set that small
+    /// cannot block the loop long enough for the split to be worth anything.
+    ///
+    /// Ignoring the cursor is safe rather than merely convenient, because
+    /// promotion is one way. A set that gave a client a table cursor is still a
+    /// table when the client comes back, so the only way to arrive here with a
+    /// cursor from somewhere else is for the key to have been deleted and
+    /// remade underneath the scan, and returning everything to that client
+    /// returns a member twice at worst, which the guarantee allows.
+    pub fn scan<F>(&self, cursor: Cursor, count: usize, mut f: F) -> Cursor
+    where
+        F: FnMut(Member<'_>),
+    {
+        match &self.body {
+            Body::Table(t) => t.scan(cursor, count, |name, ()| f(Member::Str(name))),
+            _ => {
+                for m in self.iter() {
+                    f(m);
+                }
+                Cursor::END
+            }
+        }
     }
 
     /// Bytes held by whichever representation this is.
@@ -676,6 +707,46 @@ mod tests {
         assert_eq!(members(&s), ["042", "42"]);
         assert!(s.contains(b"42"));
         assert!(s.contains(b"042"));
+    }
+
+    #[test]
+    fn the_small_bands_answer_a_scan_in_one_go() {
+        for s in [of(&["1", "2", "3"]), of(&["a", "b", "c"])] {
+            let mut seen = Vec::new();
+            // A count of one, which the table band would honour and these two
+            // do not, and a cursor from nowhere, which these two ignore.
+            let next = s.scan(Cursor::at(1, 0, 99), 1, |m| seen.push(m.to_vec()));
+            assert!(next.is_end(), "{:?} split a scan up", s.encoding());
+            assert_eq!(seen.len(), 3);
+        }
+    }
+
+    #[test]
+    fn the_table_band_walks_a_scan_in_windows_and_misses_nothing() {
+        let mut s = Set::new();
+        for i in 0..300 {
+            s.add(format!("m{i}").as_bytes(), &Limits::DEFAULT);
+        }
+        assert_eq!(s.encoding(), Encoding::Hashtable);
+
+        let mut seen = Vec::new();
+        let mut c = Cursor::START;
+        let mut turns = 0;
+        loop {
+            c = s.scan(c, 7, |m| seen.push(m.to_vec()));
+            turns += 1;
+            assert!(turns < 100, "the scan did not finish");
+            if c.is_end() {
+                break;
+            }
+        }
+        assert!(
+            turns > 1,
+            "a window of seven over three hundred took one turn"
+        );
+        seen.sort();
+        seen.dedup();
+        assert_eq!(seen.len(), 300, "every member came back at least once");
     }
 
     #[test]

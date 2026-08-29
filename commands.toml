@@ -77,11 +77,13 @@ name = "set"
 expected = 17
 status = "partial"
 doc = "08 section 4"
-# Six of the seventeen are here: SADD, SREM, SCARD, SISMEMBER, SMISMEMBER and
-# SMEMBERS. What is left is the three that pick a member at random, SPOP,
-# SRANDMEMBER and SSCAN, the seven algebra commands and their store forms, and
-# SMOVE. The six that are here are the ones the other eleven are built on, and
-# they are what a compatibility suite needs before it will run a set file.
+# Ten of the seventeen are here: SADD, SREM, SCARD, SISMEMBER, SMISMEMBER,
+# SMEMBERS, SPOP, SRANDMEMBER, SSCAN and SMOVE. What is left is the seven
+# algebra commands and their store forms, SINTER, SUNION, SDIFF, SINTERCARD,
+# SINTERSTORE, SUNIONSTORE and SDIFFSTORE. Everything a compatibility suite
+# needs to run a set file end to end is here now apart from the algebra, since
+# a suite that cannot pop a member or walk a set with a cursor stops on its
+# first file whatever else is implemented.
 
 [[group]]
 name = "zset"
@@ -574,6 +576,50 @@ bounded = "risk"
 status = "shipped"
 wire = "verified"
 notes = "The whole set, which is the risk the bound field is naming: a client that sends this at a set of a million members gets a million member reply and there is no cursor in front of it. That is Redis's behaviour and the reason SSCAN exists. The members are written from where they lie, and an integer member is formatted here rather than stored as digits, so a set of a thousand integers stays two kilobytes in memory."
+
+[[command]]
+name = "SPOP"
+group = "set"
+since = "1.0.0"
+arity = -2
+plan = "point"
+bounded = "inherent"
+status = "shipped"
+wire = "verified"
+notes = "One draw is a random position and a remove at that position, which every representation does in constant time because a remove moves the last member into the hole rather than shifting anything. A count draws again from the length that is left each turn, so the members come back distinct with no test for it and no bias. The reply for a count is a set and not an array, since the members are distinct and a RESP3 client can safely build one out of them."
+
+[[command]]
+name = "SRANDMEMBER"
+group = "set"
+since = "1.0.0"
+arity = -2
+plan = "point"
+bounded = "risk"
+status = "shipped"
+wire = "verified"
+notes = "A positive count splits at a third of the set. Above that it is Knuth's selection sampling, one walk picking each member with the probability that leaves the right number, needing no memory at all. Below it, positions are drawn and repeats thrown away, which needs a set sized to the count and not to the collection. Both are O(count), where selection alone would walk a million members to answer a draw of three and rejection alone would draw forever as the count approached the size. A negative count repeats itself, so it answers an array and not a set: a set would silently lose the repeats."
+
+[[command]]
+name = "SMOVE"
+group = "set"
+since = "1.0.0"
+arity = 4
+plan = "point"
+bounded = "inherent"
+status = "shipped"
+wire = "verified"
+notes = "Two keys, and the check order is Redis's rather than the one it looks like it should be. A source that is not there answers zero without ever looking at the destination, so SMOVE nothing a-string m is a zero and not a WRONGTYPE. The destination is filled before the source is emptied, so a slot the source is about to give back cannot be handed straight to the destination underneath the index this is holding."
+
+[[command]]
+name = "SSCAN"
+group = "set"
+since = "2.8.0"
+arity = -3
+plan = "point"
+bounded = "inherent"
+status = "shipped"
+wire = "verified"
+notes = "Only the element table walks in windows. An intset or a listpack answers with every member and a finished cursor, ignoring the cursor it was given, which is what Redis does for the same two encodings and is safe because promotion is one way: a set that gave out a table cursor is still a table. The table walks downward so that an insert lands above the cursor and a removal moves the top row down into the hole, since nothing ever moves a row upward and that is the case the guarantee forbids. MATCH decides how many members there are as the walk goes, so the reply header and the cursor in front of it are both written behind the body and rotated into place."
 
 # ------------------------------------------------------------------ scripting
 

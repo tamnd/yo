@@ -32,8 +32,8 @@ use yo_format::{RecordHeader, RecordKind};
 use yo_record::{Durability, Log, LogConfig, replay};
 
 use crate::fault::Fault;
-use crate::rng::Rng;
 use crate::sink::{CrashSink, Image};
+use yo_common::Rng;
 
 /// How a trial is shaped.
 #[derive(Debug, Clone, Copy)]

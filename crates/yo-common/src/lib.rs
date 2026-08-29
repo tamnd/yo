@@ -14,6 +14,7 @@ pub mod error;
 pub mod glob;
 pub mod num;
 pub mod prefetch;
+pub mod rng;
 pub mod wyhash;
 pub mod xxh3;
 
@@ -21,8 +22,11 @@ pub use addr::{ADDR_BITS, Addr, MAX_OFFSET, OFFSET_BITS, SPACE_BITS, ShardId, Sp
 pub use crc::{SLOT_COUNT, crc16, crc32c, hash_tag, slot_of};
 pub use error::{Code, Error, Result};
 pub use glob::matches as glob_matches;
-pub use num::{i64_len, parse_i64, push_double, push_i64, push_u64};
+pub use num::{
+    DIGITS_MAX, i64_digits, i64_len, parse_i64, push_double, push_i64, push_u64, u64_digits,
+};
 pub use prefetch::{prefetch, prefetch_read};
+pub use rng::Rng;
 pub use wyhash::{hash_key, tag_of, wyhash};
 pub use xxh3::hash64;
 

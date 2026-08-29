@@ -22,7 +22,7 @@
 //! mode of that is a command that works on one protocol and not the other.
 
 use crate::proto::Proto;
-use yo_common::num::{i64_len, push_double, push_i64, push_u64};
+use yo_common::num::{DIGITS_MAX, i64_len, push_double, push_i64, push_u64, u64_digits};
 
 /// A reply buffer for one connection.
 ///
@@ -266,6 +266,17 @@ impl Out {
         self.crlf();
     }
 
+    /// A bulk string holding the decimal form of `n`, unsigned.
+    ///
+    /// Not the same as [`Out::bulk_int`] for the numbers with bit 63 set, which
+    /// is the only reason it exists: a scan cursor packs a partition count into
+    /// the top bits, so a big enough collection hands back a number that the
+    /// signed path would report as negative and no client would send back.
+    pub fn bulk_u64(&mut self, n: u64) {
+        let mut digits = [0u8; DIGITS_MAX];
+        self.bulk(u64_digits(&mut digits, n));
+    }
+
     /// A bulk string holding a double in Redis's own formatting.
     ///
     /// `INCRBYFLOAT` replies with one of these in both protocols, so this is
@@ -394,6 +405,48 @@ impl Out {
     #[inline]
     pub fn array(&mut self, n: usize) {
         self.header(b'*', n);
+    }
+
+    /// Move the last `tail` bytes back to `start`, so that something written
+    /// after a reply ends up in front of it.
+    ///
+    /// Not every reply knows how long it is before it has been written. `SSCAN`
+    /// walks a window of the set and drops the members that do not match its
+    /// pattern, so the count is only true once the last member has been looked
+    /// at, and it answers with a cursor that the same walk produced. The
+    /// alternatives are both worse: walking the window twice runs the glob
+    /// twice, and collecting the members first is an allocation per call on a
+    /// thread that must not allocate.
+    ///
+    /// Redis solves this with a linked list of reply nodes it can patch in
+    /// place. There is one flat buffer here, so the piece that belongs in front
+    /// is written behind and the two are rotated past each other, which is the
+    /// trick [`Out::bulk_double`] already uses and costs one move of bytes that
+    /// were about to be moved to a socket anyway.
+    ///
+    /// # Panics
+    ///
+    /// If `start` is past the end, or `tail` is longer than what follows it.
+    pub fn hoist(&mut self, start: usize, tail: usize) {
+        assert!(
+            start + tail <= self.buf.len(),
+            "hoisted more than was written"
+        );
+        self.buf[start..].rotate_right(tail);
+    }
+
+    /// An array header for the elements written since `start`, which has to be
+    /// a length this buffer reported earlier.
+    ///
+    /// [`Out::hoist`] is why this can be called after the elements rather than
+    /// before them.
+    pub fn close_array(&mut self, start: usize, n: usize) {
+        let body = self.buf.len() - start;
+        self.buf.push(b'*');
+        push_u64(&mut self.buf, n as u64);
+        self.crlf();
+        let header = self.buf.len() - start - body;
+        self.hoist(start, header);
     }
 
     /// A map header for `n` pairs. The caller writes `2 * n` elements next,
@@ -568,6 +621,50 @@ mod tests {
             one(Proto::Resp2, |o| o.bulk_int(i64::MIN)),
             "$20\r\n-9223372036854775808\r\n"
         );
+    }
+
+    #[test]
+    fn an_array_can_be_headed_after_its_elements_are_written() {
+        let (two, three) = both(|o| {
+            let start = o.len();
+            o.bulk(b"a");
+            o.bulk(b"bb");
+            o.close_array(start, 2);
+        });
+        assert_eq!(two, three);
+        assert_eq!(two, "*2\r\n$1\r\na\r\n$2\r\nbb\r\n");
+
+        // And it leaves whatever was already in the buffer where it was, which
+        // is the part a rotate can get wrong.
+        assert_eq!(
+            one(Proto::Resp2, |o| {
+                o.int(1);
+                let start = o.len();
+                o.bulk(b"x");
+                o.close_array(start, 1);
+            }),
+            ":1\r\n*1\r\n$1\r\nx\r\n"
+        );
+
+        // An empty one, and a header of more than one digit, which is where the
+        // rotate distance stops being a constant.
+        assert_eq!(
+            one(Proto::Resp2, |o| {
+                let start = o.len();
+                o.close_array(start, 0);
+            }),
+            "*0\r\n"
+        );
+        let long = one(Proto::Resp2, |o| {
+            let start = o.len();
+            for _ in 0..100 {
+                o.int(7);
+            }
+            o.close_array(start, 100);
+        });
+        assert!(long.starts_with("*100\r\n:7\r\n"));
+        assert!(long.ends_with(":7\r\n"));
+        assert_eq!(long.len(), "*100\r\n".len() + 100 * ":7\r\n".len());
     }
 
     #[test]

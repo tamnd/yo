@@ -1,15 +1,24 @@
 //! A random number generator you can write down.
 //!
-//! The whole harness is worthless if a failure cannot be reproduced. A trial
-//! that fails prints its seed, and running that seed again has to produce the
-//! same trial, byte for byte, on any machine and any target. That rules out
-//! anything seeded from the clock, anything that consults the operating system,
-//! and anything whose output depends on the width of a pointer.
+//! Two parts of the engine need one and they want the same thing from it. The
+//! crash harness is worthless if a failure cannot be reproduced: a trial that
+//! fails prints its seed, and running that seed again has to produce the same
+//! trial, byte for byte, on any machine and any target. `SPOP` and
+//! `SRANDMEMBER` want the same property for the same reason, because a test
+//! that cannot say which member comes back can only assert that something did.
+//! Between them that rules out anything seeded from the clock, anything that
+//! consults the operating system, and anything whose output depends on the
+//! width of a pointer.
 //!
 //! So this is `splitmix64`, which is nine lines and has no state beyond a
-//! `u64`. It is not cryptographic and does not need to be. The property under
-//! test is a durability invariant, and an adversary who can predict where the
-//! next fault lands is welcome to.
+//! `u64`. It is not cryptographic and does not need to be. Neither caller is
+//! keeping a secret, and an adversary who can predict which member `SPOP`
+//! returns is welcome to, the same way they are on a real server: Redis draws
+//! from `random()` seeded from the clock and the pid.
+//!
+//! It lives here rather than in either crate that uses it because the second
+//! caller would otherwise have copied it, and two copies of a generator is two
+//! chances for one of them to get a constant wrong.
 
 /// A seeded stream of numbers, reproducible everywhere.
 #[derive(Debug, Clone)]
