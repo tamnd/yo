@@ -13,5 +13,12 @@ authors.workspace = true
 yo-common.workspace = true
 yo-index.workspace = true
 
+[dev-dependencies]
+criterion = { workspace = true }
+
 [lints]
 workspace = true
+
+[[bench]]
+name = "elem"
+harness = false
