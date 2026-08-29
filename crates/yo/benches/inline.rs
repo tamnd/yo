@@ -196,8 +196,26 @@ fn crowded_set_of(n: usize, others: usize) -> yo_kv::Keyspace {
     store
 }
 
+/// The same two, through the embedded set API.
+///
+/// `set_of` and `crowded_set_of` built by hand, so the `api/` rows measure the
+/// same database the `store/` rows do and the only difference between the two
+/// numbers is the handle, the borrow and the `AsRef`.
+fn api_set_of(n: usize, others: usize) -> (yo::Db, yo::Set) {
+    let db = yo::open(MEMORY).expect("in memory always opens");
+    let s = db.set("s");
+    let members: Vec<String> = (0..n).map(|i| format!("m{i}")).collect();
+    s.add_many(&members).expect("a set");
+    let keys = db.strings();
+    for i in 0..others {
+        let k = key(i);
+        keys.set(&k, &k).expect("room for a record");
+    }
+    (db, s)
+}
+
 /// The two set shapes on the hot key gate row, `SADD` onto one key and `SPOP`
-/// off it. Both are `store/` rows, because the typed set API is not here yet.
+/// off it.
 ///
 /// `sadd/hot` is a single member onto one key over and over, which is the shape
 /// with no spread to exploit and the one aki came in at 0.82x on. The set is
@@ -244,6 +262,40 @@ fn bench_sets(c: &mut Criterion) {
             )
         });
     });
+
+    // The same two rows through `db.set("s")`. The gap against the `store/`
+    // rows above is what the embedded API costs, and it is meant to be nothing.
+    g.bench_function("api/hot", |b| {
+        let (_db, s) = api_set_of(1_000, 0);
+        let members: Vec<String> = (0..1_024).map(|i| format!("m{i}")).collect();
+        let mut i = 0usize;
+        b.iter(|| {
+            i = (i + 1) & 1_023;
+            black_box(s.add(&members[i]).expect("a set"))
+        });
+    });
+
+    g.bench_function("api/hot-crowded", |b| {
+        let (_db, s) = api_set_of(1_000, 100_000);
+        let members: Vec<String> = (0..1_024).map(|i| format!("m{i}")).collect();
+        let mut i = 0usize;
+        b.iter(|| {
+            i = (i + 1) & 1_023;
+            black_box(s.add(&members[i]).expect("a set"))
+        });
+    });
+
+    // Membership, which is the read half of the hot key shape and the one an
+    // embedded caller reaches for most.
+    g.bench_function("api/contains", |b| {
+        let (_db, s) = api_set_of(1_000, 100_000);
+        let members: Vec<String> = (0..1_024).map(|i| format!("m{i}")).collect();
+        let mut i = 0usize;
+        b.iter(|| {
+            i = (i + 1) & 1_023;
+            black_box(s.contains(&members[i]).expect("a set"))
+        });
+    });
     g.finish();
 
     // A thousand members a call, so the setup that refills the set is not what
@@ -270,6 +322,18 @@ fn bench_sets(c: &mut Criterion) {
                     .expect("a set");
                 black_box(bytes)
             },
+            BatchSize::LargeInput,
+        );
+    });
+
+    // The embedded draw, which is the copying one plus a `Vec` of them. There
+    // is no borrowing form of this on the API and there should not be: a pop
+    // hands back the member it just took out of the structure that was holding
+    // it, so there is nothing left to borrow from.
+    g.bench_function("api/pop_n", |b| {
+        b.iter_batched_ref(
+            || api_set_of(POP, 0),
+            |(_db, s)| black_box(s.pop_n(POP).expect("a set").len()),
             BatchSize::LargeInput,
         );
     });
