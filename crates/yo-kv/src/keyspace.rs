@@ -27,6 +27,7 @@ use crate::Clock;
 use crate::hash::{self, Hash};
 use crate::set::{self, Set};
 use crate::slab::Slab;
+use crate::ttl::{self, Applied, Ask, Cond};
 use crate::value::{self, Kind};
 
 /// One database: every key, whatever type it holds.
@@ -331,9 +332,9 @@ impl Keyspace {
     /// where it is, which is why this writes through the map instead of taking
     /// the free the body path an overwrite takes.
     ///
-    /// This is what `EXPIRE`, `PEXPIRE`, `EXPIREAT` and `PERSIST` will call when
-    /// they land. They are not here yet because until now the only type was the
-    /// string and `SET` and `GETEX` between them covered every case.
+    /// This is the raw write. [`Keyspace::expire`] and [`Keyspace::persist`] are
+    /// what `EXPIRE` and its family call, and they come through here once they
+    /// have worked out whether the deadline is allowed to move.
     pub fn set_expiry(&mut self, key: &[u8], at: Option<u64>) -> bool {
         self.reap(key);
         let Some(rec) = self.map.get(key) else {
@@ -360,6 +361,72 @@ impl Keyspace {
             }
             other => unreachable!("nothing can store a {} yet", other.name()),
         }
+        true
+    }
+
+    /// The key's deadline, as the three way answer `TTL` and `PTTL` are built on.
+    ///
+    /// [`Ask::Missing`] for a key that is not there, [`Ask::NoDeadline`] for one
+    /// that is and has no deadline, and the absolute millisecond otherwise. A key
+    /// past its deadline is reaped on the way through, so it answers `Missing`
+    /// and not the moment that has gone.
+    pub fn deadline_of(&mut self, key: &[u8]) -> Ask {
+        let Some(addr) = self.live_rec(key) else {
+            return Ask::Missing;
+        };
+        match value::expire_at(self.map.value_at(addr)) {
+            Some(at) => Ask::At(at),
+            None => Ask::NoDeadline,
+        }
+    }
+
+    /// Move `key`'s deadline to `at`, if `cond` lets it.
+    ///
+    /// This is `EXPIRE`, `PEXPIRE`, `EXPIREAT` and `PEXPIREAT`, which differ only
+    /// in the unit and the origin of the number. All four turn it into one
+    /// absolute millisecond before they get here, so the condition rules live in
+    /// one place and the four commands cannot drift apart.
+    ///
+    /// A deadline that has already passed deletes the key rather than being
+    /// stored, and the answer says so. `EXPIRE` cannot report the difference
+    /// because it replies 1 either way, but the caller is not always `EXPIRE`,
+    /// and a delete is a different thing from a deadline.
+    ///
+    /// The condition is checked before the past check, which is the order Redis
+    /// uses and is the one that matters: `EXPIRE key 0 XX` on a key with no
+    /// deadline answers 0 and leaves the key alone, rather than deleting it.
+    pub fn expire(&mut self, key: &[u8], at: u64, cond: Cond) -> Applied {
+        let prev = match self.deadline_of(key) {
+            Ask::Missing => return Applied::Missing,
+            Ask::NoDeadline => None,
+            Ask::At(at) => Some(at),
+        };
+        let done = ttl::decide(prev, at, cond, self.clock.now_ms());
+        match done {
+            Applied::Ok => {
+                self.set_expiry(key, Some(at));
+            }
+            // The structure that answered `Deleted` for a field only holds
+            // deadlines, so its caller has to remove the field. Here the caller
+            // is us and the key is ours, so it goes now.
+            Applied::Deleted => {
+                self.drop_key(key);
+            }
+            Applied::Missing | Applied::NotMet => {}
+        }
+        done
+    }
+
+    /// Take `key`'s deadline off. Answers whether there was one to take.
+    ///
+    /// This is `PERSIST`, and the reply is the same 0 for a key that is not there
+    /// and a key that was never going to expire, which is Redis's answer and not
+    /// a shortcut here.
+    pub fn persist(&mut self, key: &[u8]) -> bool {
+        if !matches!(self.deadline_of(key), Ask::At(_)) {
+            return false;
+        }
+        self.set_expiry(key, None);
         true
     }
 

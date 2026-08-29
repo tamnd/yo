@@ -694,7 +694,7 @@ impl Hash {
         match &mut self.body {
             Body::Packed(p) => {
                 let Some(row) = p.find(field) else {
-                    return Applied::NoField;
+                    return Applied::Missing;
                 };
                 let applied = decide(p.deadline(row), at, cond, now);
                 match applied {
@@ -711,13 +711,13 @@ impl Hash {
                     Applied::Deleted => {
                         p.remove_at(row);
                     }
-                    Applied::NoField | Applied::NotMet => {}
+                    Applied::Missing | Applied::NotMet => {}
                 }
                 applied
             }
             Body::Table(t) => {
                 let Some(row) = t.fields.index_of(field) else {
-                    return Applied::NoField;
+                    return Applied::Missing;
                 };
                 let applied = t.ttl.set(row, at, cond, now);
                 if applied == Applied::Deleted {
@@ -733,14 +733,14 @@ impl Hash {
     pub fn deadline(&self, field: &[u8]) -> Ask {
         match &self.body {
             Body::Packed(p) => match p.find(field) {
-                None => Ask::NoField,
+                None => Ask::Missing,
                 Some(at) => match p.deadline(at) {
                     Some(at) => Ask::At(at),
                     None => Ask::NoDeadline,
                 },
             },
             Body::Table(t) => match t.fields.index_of(field) {
-                None => Ask::NoField,
+                None => Ask::Missing,
                 Some(row) => t.ttl.ask(row),
             },
         }
@@ -754,7 +754,7 @@ impl Hash {
         match &mut self.body {
             Body::Packed(p) => {
                 let Some(at) = p.find(field) else {
-                    return Ask::NoField;
+                    return Ask::Missing;
                 };
                 match p.deadline(at) {
                     Some(was) => {
@@ -765,7 +765,7 @@ impl Hash {
                 }
             }
             Body::Table(t) => match t.fields.index_of(field) {
-                None => Ask::NoField,
+                None => Ask::Missing,
                 Some(row) => t.ttl.clear(row),
             },
         }
@@ -1173,7 +1173,7 @@ mod tests {
         );
         assert_eq!(h.deadline(b"f1"), Ask::At(5000));
         assert_eq!(h.deadline(b"f0"), Ask::NoDeadline, "and only that one");
-        assert_eq!(h.deadline(b"nope"), Ask::NoField);
+        assert_eq!(h.deadline(b"nope"), Ask::Missing);
         assert_eq!(h.deadline_count(), 1);
         assert_eq!(h.soonest_deadline(), Some(5000));
     }
@@ -1190,7 +1190,7 @@ mod tests {
         );
         assert_eq!(h.deadline(b"f1"), Ask::At(5000));
         assert_eq!(h.deadline(b"f0"), Ask::NoDeadline);
-        assert_eq!(h.deadline(b"nope"), Ask::NoField);
+        assert_eq!(h.deadline(b"nope"), Ask::Missing);
         assert_eq!(h.deadline_count(), 1);
         assert_eq!(h.soonest_deadline(), Some(5000));
     }
@@ -1250,7 +1250,7 @@ mod tests {
             assert!(!h.contains(b"f1"));
             assert_eq!(h.len(), 2);
             assert_eq!(h.deadline_count(), 0);
-            assert_eq!(h.expire(b"gone", 9000, Cond::Always, 0), Applied::NoField);
+            assert_eq!(h.expire(b"gone", 9000, Cond::Always, 0), Applied::Missing);
         }
     }
 
@@ -1284,7 +1284,7 @@ mod tests {
                 Ask::NoDeadline,
                 "twice is -1, not an error"
             );
-            assert_eq!(h.persist(b"gone"), Ask::NoField);
+            assert_eq!(h.persist(b"gone"), Ask::Missing);
             assert_eq!(h.deadline_count(), 0);
             assert_eq!(h.reap(u64::MAX), 0, "and it does not expire any more");
             assert_eq!(h.len(), 3);

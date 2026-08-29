@@ -506,6 +506,106 @@ wire = "verified"
 notes = "Answers string, set or none. It grows a case each time a type lands."
 
 [[command]]
+name = "EXPIRE"
+group = "keyspace"
+since = "1.0.0"
+arity = -3
+plan = "metadata"
+bounded = "inherent"
+status = "shipped"
+wire = "verified"
+notes = "A deadline lives in the key's record rather than beside it, so this rewrites the record and never touches the value. For a string that means copying the bytes across, and for a set or a hash it is five bytes or thirteen, because the body sits in a slab and the record only holds a slot number. The condition keywords are a set and not a keyword, which does not read that way: EXPIRE key 100 XX GT is legal and means both, the same one twice means it once, and NX with any other or GT with LT are named errors rather than a generic syntax one. Only XX LT says anything the four keywords cannot say on their own, since GT already refuses a key with no deadline."
+
+[[command]]
+name = "PEXPIRE"
+group = "keyspace"
+since = "2.6.0"
+arity = -3
+plan = "metadata"
+bounded = "inherent"
+status = "shipped"
+wire = "verified"
+notes = "EXPIRE counted in milliseconds. All four writers turn their number into one absolute millisecond before anything is stored, so the condition rules are applied in one place and the four cannot drift apart."
+
+[[command]]
+name = "EXPIREAT"
+group = "keyspace"
+since = "1.2.0"
+arity = -3
+plan = "metadata"
+bounded = "inherent"
+status = "shipped"
+wire = "verified"
+notes = "Absolute rather than relative. A deadline already gone deletes the key and still answers 1, which is the one thing the reply cannot tell a client: whether the deadline went on or the key went away. The store knows the difference and the wire throws it away, because that is what Redis puts on the wire."
+
+[[command]]
+name = "PEXPIREAT"
+group = "keyspace"
+since = "2.6.0"
+arity = -3
+plan = "metadata"
+bounded = "inherent"
+status = "shipped"
+wire = "verified"
+divergent = "D-17"
+notes = "The only one of the four with no arithmetic to overflow, so it is the only one that can name a moment past what a record can hold. Redis takes PEXPIREAT key 9223372036854775807 and holds it in a full signed long. A record here holds forty six bits, so it clamps to the year 4199 and the key does not expire either way."
+
+[[command]]
+name = "PERSIST"
+group = "keyspace"
+since = "2.2.0"
+arity = 2
+plan = "metadata"
+bounded = "inherent"
+status = "shipped"
+wire = "verified"
+notes = "Answers 0 for a key with no deadline and 0 for a key that is not there, which are the same answer to a client and different states in the store. Redis does not separate them either."
+
+[[command]]
+name = "TTL"
+group = "keyspace"
+since = "1.0.0"
+arity = 2
+plan = "metadata"
+bounded = "inherent"
+status = "shipped"
+wire = "verified"
+notes = "Rounds to nearest, so four hundred milliseconds left answers 0 and six hundred answers 1. HTTL rounds up on the same question about a field, which is not something anyone would guess and is what 8.10.1 does, checked against a real server rather than reasoned about."
+
+[[command]]
+name = "PTTL"
+group = "keyspace"
+since = "2.6.0"
+arity = 2
+plan = "metadata"
+bounded = "inherent"
+status = "shipped"
+wire = "verified"
+notes = "TTL in milliseconds, which is the number the store actually holds, so this is the one with no rounding in it at all."
+
+[[command]]
+name = "EXPIRETIME"
+group = "keyspace"
+since = "7.0.0"
+arity = 2
+plan = "metadata"
+bounded = "inherent"
+status = "shipped"
+wire = "verified"
+notes = "When it falls due rather than how long is left, and it rounds to nearest the same way TTL does."
+
+[[command]]
+name = "PEXPIRETIME"
+group = "keyspace"
+since = "7.0.0"
+arity = 2
+plan = "metadata"
+bounded = "inherent"
+status = "shipped"
+wire = "verified"
+notes = "The deadline exactly as the record holds it, with nothing derived and nothing rounded."
+
+[[command]]
 name = "OBJECT"
 group = "keyspace"
 since = "2.2.3"

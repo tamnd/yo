@@ -363,7 +363,7 @@ fn ask(db: &mut Keyspace, name: &str, args: Args<'_>, out: &mut Out) -> Result<(
     if name == "hpersist" {
         return db.hpersist(args.get(1), fields.iter(args), |asked| {
             out.int(match asked {
-                Ask::NoField => -2,
+                Ask::Missing => -2,
                 Ask::NoDeadline => -1,
                 // Redis replies 1 for a deadline taken off and does not say
                 // what it was, so the moment is dropped here.
@@ -381,7 +381,7 @@ fn ask(db: &mut Keyspace, name: &str, args: Args<'_>, out: &mut Out) -> Result<(
             asked.remaining_ms(now)
         } else {
             match asked {
-                Ask::NoField => -2,
+                Ask::Missing => -2,
                 Ask::NoDeadline => -1,
                 Ask::At(at) => at as i64,
             }

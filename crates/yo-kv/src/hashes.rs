@@ -203,7 +203,7 @@ impl Keyspace {
     /// field by field, and a command that names ten fields either sets all ten
     /// or errors.
     ///
-    /// A key that is not there answers [`Applied::NoField`] for every field,
+    /// A key that is not there answers [`Applied::Missing`] for every field,
     /// which is the -2 Redis replies, because a missing key and an empty hash
     /// are the same thing. The key goes when the last field does, which happens
     /// when the deadline given has already passed.
@@ -223,7 +223,7 @@ impl Keyspace {
         }
         let Some(slot) = self.hash_slot(key)? else {
             for _ in fields {
-                f(Applied::NoField);
+                f(Applied::Missing);
             }
             return Ok(());
         };
@@ -260,7 +260,7 @@ impl Keyspace {
         for field in fields {
             match slot {
                 Some(at) => f(self.hash_at(at).deadline(field)),
-                None => f(Ask::NoField),
+                None => f(Ask::Missing),
             }
         }
         Ok(())
@@ -283,7 +283,7 @@ impl Keyspace {
         for field in fields {
             match slot {
                 Some(at) => f(self.hash_at_mut(at).persist(field)),
-                None => f(Ask::NoField),
+                None => f(Ask::Missing),
             }
         }
         Ok(())
@@ -446,7 +446,7 @@ impl Keyspace {
             // write a field.
             let kept = match expire {
                 strings::Expire::Keep => hash.deadline(field),
-                _ => Ask::NoField,
+                _ => Ask::Missing,
             };
             hash.set(field, value, &limits);
             match expire {
@@ -1134,12 +1134,12 @@ mod tests {
         set(&mut d, b"h", &[(b"a", b"1"), (b"b", b"2")]);
         assert_eq!(
             expire(&mut d, b"h", 5_000, &[b"a", b"nope"]),
-            [Applied::Ok, Applied::NoField],
+            [Applied::Ok, Applied::Missing],
             "one call per field, in the order asked"
         );
         assert_eq!(
             ttl_of(&mut d, b"h", &[b"a", b"b", b"nope"]),
-            [Ask::At(5_000), Ask::NoDeadline, Ask::NoField]
+            [Ask::At(5_000), Ask::NoDeadline, Ask::Missing]
         );
         assert_eq!(
             d.encoding_name(b"h"),
@@ -1203,7 +1203,7 @@ mod tests {
             },
         )
         .expect("ok");
-        assert_eq!(out, [Ask::At(5_000), Ask::NoField]);
+        assert_eq!(out, [Ask::At(5_000), Ask::Missing]);
         assert_eq!(ttl_of(&mut d, b"h", &[b"a"]), [Ask::NoDeadline]);
 
         d.clock_mut().advance(100_000);
@@ -1215,11 +1215,11 @@ mod tests {
         let mut d = db();
         assert_eq!(
             expire(&mut d, b"gone", 5_000, &[b"a", b"b"]),
-            [Applied::NoField, Applied::NoField]
+            [Applied::Missing, Applied::Missing]
         );
         assert_eq!(
             ttl_of(&mut d, b"gone", &[b"a", b"b"]),
-            [Ask::NoField, Ask::NoField]
+            [Ask::Missing, Ask::Missing]
         );
         assert_eq!(d.kind_of(b"gone"), None, "and asking did not create it");
     }
