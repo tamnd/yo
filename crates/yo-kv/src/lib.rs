@@ -20,11 +20,16 @@
 //! The string type, which is the first row of M2, and all 26 of its commands.
 //! Lists, sets, hashes and the sorted set follow the same shape and land in M3.
 //!
-//! The two pieces of M3 that are here already are the ones every collection
-//! shares. [`Elements`] is the element table a hash, a set and a sorted set are
-//! all built out of, and [`Cursor`] is the scan cursor they all hand back to a
+//! The pieces of M3 that are here already are the ones every collection shares.
+//! [`Elements`] is the element table a hash, a set and a sorted set are all
+//! built out of, and [`Cursor`] is the scan cursor they all hand back to a
 //! client. Neither is a set or a hash on its own, and both are where the
 //! decisions that make those fast were made.
+//!
+//! [`Listpack`] is the band underneath both of them. A collection of a few dozen
+//! elements does not want an index at all, so up to a hundred and twenty eight
+//! it is one packed blob walked linearly, in Redis's own byte layout so that an
+//! RDB export is a copy and `OBJECT ENCODING` can honestly say `listpack`.
 //!
 //! The four commands Redis added in 8.4 and 8.8 are the interesting ones and
 //! they were checked against a real 8.8 rather than written from the
@@ -58,6 +63,7 @@ pub mod cond;
 pub mod counter;
 pub mod elem;
 pub mod lcs;
+pub mod listpack;
 pub mod scan;
 pub mod strings;
 pub mod value;
@@ -67,6 +73,7 @@ pub use cond::Compare;
 pub use counter::{Counted, IncrEx, IncrExpire, Num};
 pub use elem::{Elements, Full, MAX_ROWS, NAME_MAX};
 pub use lcs::{Idx as LcsIdx, LCS_MAX_CELLS, Match as LcsMatch};
+pub use listpack::{Entry, Listpack, Malformed};
 pub use scan::{Cursor, MAX_PARTS};
 pub use strings::{Exists, Expire, KEY_MAX, STRING_MAX, SetOptions, SetOutcome, Strings};
 pub use value::{EMBSTR_MAX, Encoding, Str};
