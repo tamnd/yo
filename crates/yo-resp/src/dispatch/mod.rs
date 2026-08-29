@@ -53,6 +53,7 @@
 
 mod args;
 mod cpu;
+mod hashes;
 mod keyspace;
 mod scripting;
 mod server;
@@ -384,6 +385,10 @@ pub fn execute(server: &mut Server, session: &mut Session, args: Args<'_>, out: 
         "set" => {
             let db = session.db;
             sets::execute(&mut server.dbs[db], spec, args, out).map(|()| Flow::Continue)
+        }
+        "hash" => {
+            let db = session.db;
+            hashes::execute(&mut server.dbs[db], spec, args, out).map(|()| Flow::Continue)
         }
         "keyspace" => {
             let db = session.db;
@@ -1453,6 +1458,255 @@ mod tests {
             assert!(reply.starts_with("-ERR"), "got {reply}");
             assert!(!reply.contains('*'), "an array header went out in front");
         }
+    }
+
+    #[test]
+    fn a_hash_writes_reads_and_deletes_its_fields() {
+        let mut f = Fixture::new();
+        assert_eq!(f.run(&[b"HSET", b"h", b"a", b"1", b"b", b"2"]), ":2\r\n");
+        assert_eq!(f.run(&[b"HSET", b"h", b"a", b"9"]), ":0\r\n", "a was there");
+        assert_eq!(f.run(&[b"HGET", b"h", b"a"]), "$1\r\n9\r\n");
+        assert_eq!(f.run(&[b"HGET", b"h", b"nope"]), "$-1\r\n");
+        assert_eq!(f.run(&[b"HGET", b"nokey", b"a"]), "$-1\r\n");
+        assert_eq!(f.run(&[b"HLEN", b"h"]), ":2\r\n");
+        assert_eq!(f.run(&[b"HEXISTS", b"h", b"a"]), ":1\r\n");
+        assert_eq!(f.run(&[b"HEXISTS", b"h", b"nope"]), ":0\r\n");
+        assert_eq!(f.run(&[b"HSTRLEN", b"h", b"a"]), ":1\r\n");
+        assert_eq!(f.run(&[b"HSTRLEN", b"h", b"nope"]), ":0\r\n");
+
+        // The value the client sent is `9`, so HGET h b must not find the `2`
+        // that is a value. A search with a step of one would have.
+        assert_eq!(f.run(&[b"HGET", b"h", b"2"]), "$-1\r\n");
+
+        assert_eq!(f.run(&[b"HDEL", b"h", b"a", b"nope"]), ":1\r\n");
+        assert_eq!(f.run(&[b"HDEL", b"h", b"b"]), ":1\r\n");
+        assert_eq!(
+            f.run(&[b"EXISTS", b"h"]),
+            ":0\r\n",
+            "and losing the last field lost the key"
+        );
+    }
+
+    #[test]
+    fn hgetall_answers_a_map_on_resp3_and_the_same_pairs_flat_on_resp2() {
+        let mut f = Fixture::new();
+        f.run(&[b"HSET", b"h", b"a", b"1"]);
+        assert_eq!(f.run(&[b"HGETALL", b"h"]), "*2\r\n$1\r\na\r\n$1\r\n1\r\n");
+        assert_eq!(f.run(&[b"HGETALL", b"nokey"]), "*0\r\n");
+        assert_eq!(f.run(&[b"HKEYS", b"h"]), "*1\r\n$1\r\na\r\n");
+        assert_eq!(f.run(&[b"HVALS", b"h"]), "*1\r\n$1\r\n1\r\n");
+        assert_eq!(f.run(&[b"HKEYS", b"nokey"]), "*0\r\n");
+
+        f.run(&[b"HELLO", b"3"]);
+        assert_eq!(f.run(&[b"HGETALL", b"h"]), "%1\r\n$1\r\na\r\n$1\r\n1\r\n");
+        assert_eq!(
+            f.run(&[b"HGETALL", b"nokey"]),
+            "%0\r\n",
+            "a missing key is the empty hash and never a nil"
+        );
+        assert_eq!(
+            f.run(&[b"HKEYS", b"h"]),
+            "*1\r\n$1\r\na\r\n",
+            "and the two that answer one side stay arrays"
+        );
+    }
+
+    #[test]
+    fn hmget_answers_once_per_field_and_hmset_answers_ok() {
+        let mut f = Fixture::new();
+        assert_eq!(f.run(&[b"HMSET", b"h", b"a", b"1", b"c", b"3"]), "+OK\r\n");
+        assert_eq!(
+            f.run(&[b"HMGET", b"h", b"a", b"b", b"c"]),
+            "*3\r\n$1\r\n1\r\n$-1\r\n$1\r\n3\r\n",
+            "the reply is positional, so b is a nil and not a gap"
+        );
+        assert_eq!(
+            f.run(&[b"HMGET", b"nokey", b"a", b"b"]),
+            "*2\r\n$-1\r\n$-1\r\n",
+            "and a missing key is all nils rather than an empty array"
+        );
+
+        assert_eq!(f.run(&[b"HSETNX", b"h", b"a", b"9"]), ":0\r\n");
+        assert_eq!(f.run(&[b"HSETNX", b"h", b"z", b"9"]), ":1\r\n");
+        assert_eq!(f.run(&[b"HGET", b"h", b"a"]), "$1\r\n1\r\n");
+    }
+
+    #[test]
+    fn a_hash_counts_up_and_says_so_when_it_cannot() {
+        let mut f = Fixture::new();
+        assert_eq!(f.run(&[b"HINCRBY", b"h", b"n", b"5"]), ":5\r\n");
+        assert_eq!(f.run(&[b"HINCRBY", b"h", b"n", b"-7"]), ":-2\r\n");
+        assert_eq!(f.run(&[b"HGET", b"h", b"n"]), "$2\r\n-2\r\n");
+        assert_eq!(
+            f.run(&[b"HINCRBYFLOAT", b"h", b"f", b"10.5"]),
+            "$4\r\n10.5\r\n",
+            "a bulk string and not a double, on both protocols"
+        );
+
+        f.run(&[b"HSET", b"h", b"s", b"words"]);
+        let bad = f.run(&[b"HINCRBY", b"h", b"s", b"1"]);
+        assert!(
+            bad.starts_with("-ERR hash value is not an integer"),
+            "{bad}"
+        );
+        let bad = f.run(&[b"HINCRBY", b"h", b"n", b"nope"]);
+        assert!(
+            bad.starts_with("-ERR value is not an integer"),
+            "a bad argument is not yet a hash value, {bad}"
+        );
+        assert_eq!(
+            f.run(&[b"HGET", b"h", b"s"]),
+            "$5\r\nwords\r\n",
+            "and neither of them wrote anything"
+        );
+    }
+
+    #[test]
+    fn a_hash_scan_walks_every_pair_once_and_novalues_drops_half_of_it() {
+        let mut f = Fixture::new();
+        for i in 0..500 {
+            let field = format!("field-{i}");
+            let value = format!("value-{i}");
+            f.run(&[b"HSET", b"h", field.as_bytes(), value.as_bytes()]);
+        }
+
+        let mut seen: Vec<String> = Vec::new();
+        let mut cursor = "0".to_owned();
+        loop {
+            let reply = f.run(&[b"HSCAN", b"h", cursor.as_bytes(), b"COUNT", b"32"]);
+            let (next, items) = scan_reply(&reply);
+            assert_eq!(items.len() % 2, 0, "a pair went out half written");
+            for pair in items.chunks(2) {
+                assert_eq!(
+                    pair[0].strip_prefix("field-"),
+                    pair[1].strip_prefix("value-"),
+                    "a field came back with someone else's value"
+                );
+                seen.push(pair[0].clone());
+            }
+            cursor = next;
+            if cursor == "0" {
+                break;
+            }
+        }
+        seen.sort();
+        seen.dedup();
+        assert_eq!(seen.len(), 500, "every field once and only once");
+
+        let (_, items) = scan_reply(&f.run(&[b"HSCAN", b"h", b"0", b"NOVALUES", b"COUNT", b"32"]));
+        assert!(
+            items.iter().all(|s| s.starts_with("field-")),
+            "NOVALUES still sent the values"
+        );
+
+        let (_, one) = scan_reply(&f.run(&[
+            b"HSCAN",
+            b"h",
+            b"0",
+            b"MATCH",
+            b"field-499",
+            b"COUNT",
+            b"1000",
+        ]));
+        assert_eq!(one, ["field-499", "value-499"], "MATCH is on the field");
+    }
+
+    #[test]
+    fn hrandfield_draws_what_it_was_asked_for_and_nests_values_on_resp3() {
+        let mut f = Fixture::new();
+        f.run(&[b"HSET", b"h", b"a", b"1"]);
+        assert_eq!(f.run(&[b"HRANDFIELD", b"h"]), "$1\r\na\r\n");
+        assert_eq!(f.run(&[b"HRANDFIELD", b"nokey"]), "$-1\r\n");
+        assert_eq!(f.run(&[b"HRANDFIELD", b"nokey", b"3"]), "*0\r\n");
+        assert_eq!(
+            f.run(&[b"HRANDFIELD", b"h", b"3"]),
+            "*1\r\n$1\r\na\r\n",
+            "a positive count is capped at the size of the hash"
+        );
+        assert_eq!(
+            f.run(&[b"HRANDFIELD", b"h", b"-3"]),
+            "*3\r\n$1\r\na\r\n$1\r\na\r\n$1\r\na\r\n",
+            "and a negative one repeats itself"
+        );
+        assert_eq!(
+            f.run(&[b"HRANDFIELD", b"h", b"1", b"WITHVALUES"]),
+            "*2\r\n$1\r\na\r\n$1\r\n1\r\n",
+            "flat on RESP2"
+        );
+
+        f.run(&[b"HELLO", b"3"]);
+        assert_eq!(
+            f.run(&[b"HRANDFIELD", b"h", b"1", b"WITHVALUES"]),
+            "*1\r\n*2\r\n$1\r\na\r\n$1\r\n1\r\n",
+            "and nested on RESP3, but still an array and never a map"
+        );
+    }
+
+    #[test]
+    fn every_hash_command_says_wrongtype_and_writes_nothing() {
+        let mut f = Fixture::new();
+        f.run(&[b"SET", b"str", b"v"]);
+        let wrong = "-WRONGTYPE Operation against a key holding the wrong kind of value\r\n";
+
+        for cmd in [
+            &[b"HSET".as_slice(), b"str", b"f", b"v"][..],
+            &[b"HMSET".as_slice(), b"str", b"f", b"v"][..],
+            &[b"HSETNX".as_slice(), b"str", b"f", b"v"][..],
+            &[b"HGET".as_slice(), b"str", b"f"][..],
+            &[b"HMGET".as_slice(), b"str", b"f"][..],
+            &[b"HDEL".as_slice(), b"str", b"f"][..],
+            &[b"HLEN".as_slice(), b"str"][..],
+            &[b"HEXISTS".as_slice(), b"str", b"f"][..],
+            &[b"HSTRLEN".as_slice(), b"str", b"f"][..],
+            &[b"HGETALL".as_slice(), b"str"][..],
+            &[b"HKEYS".as_slice(), b"str"][..],
+            &[b"HVALS".as_slice(), b"str"][..],
+            &[b"HINCRBY".as_slice(), b"str", b"f", b"1"][..],
+            &[b"HINCRBYFLOAT".as_slice(), b"str", b"f", b"1"][..],
+            &[b"HRANDFIELD".as_slice(), b"str"][..],
+            &[b"HRANDFIELD".as_slice(), b"str", b"2"][..],
+            &[b"HSCAN".as_slice(), b"str", b"0"][..],
+        ] {
+            let reply = f.run(cmd);
+            assert_eq!(reply, wrong, "{:?}", cmd[0]);
+        }
+        assert_eq!(
+            f.run(&[b"GET", b"str"]),
+            "$1\r\nv\r\n",
+            "and none of them touched the value"
+        );
+    }
+
+    #[test]
+    fn a_hash_scan_leaves_nothing_half_written_when_its_arguments_are_wrong() {
+        let mut f = Fixture::new();
+        f.run(&[b"HSET", b"h", b"f", b"v"]);
+        for bad in [
+            &[b"HSCAN".as_slice(), b"h", b"abc"][..],
+            &[b"HSCAN".as_slice(), b"h", b"0", b"COUNT", b"nope"][..],
+            &[b"HSCAN".as_slice(), b"h", b"0", b"COUNT", b"0"][..],
+            &[b"HSCAN".as_slice(), b"h", b"0", b"MATCH"][..],
+        ] {
+            let reply = f.run(bad);
+            assert!(reply.starts_with("-ERR"), "got {reply}");
+            assert!(!reply.contains('*'), "an array header went out in front");
+        }
+    }
+
+    /// The cursor and the flat items of a scan reply.
+    fn scan_reply(reply: &str) -> (String, Vec<String>) {
+        let mut lines = reply.split("\r\n");
+        assert_eq!(lines.next(), Some("*2"), "got {reply}");
+        lines.next().expect("the cursor header");
+        let cursor = lines.next().expect("a cursor").to_owned();
+        let header = lines.next().expect("an item count");
+        let n: usize = header[1..].parse().expect("a count");
+        let mut items = Vec::with_capacity(n);
+        for _ in 0..n {
+            lines.next().expect("an item header");
+            items.push(lines.next().expect("an item").to_owned());
+        }
+        (cursor, items)
     }
 
     /// The members of a set reply, sorted, since none of these promise an
