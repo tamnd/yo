@@ -49,11 +49,11 @@
 //!
 //! # The same store the wire talks to
 //!
-//! [`Db::strings`] is the Redis string keyspace and [`Db::counter`] is one key
-//! of it. A program that calls `incr` here runs the same code an `INCR` off a
-//! socket runs (Y23), without the socket, the parser or the reply, so the
-//! embedded API and a Redis client are two doors into one store rather than two
-//! stores that agree for now.
+//! [`Db::strings`] is the Redis string keyspace and [`Db::sets`] is the set
+//! commands over the same one. A program that calls `incr` here runs the same
+//! code an `INCR` off a socket runs (Y23), without the socket, the parser or the
+//! reply, so the embedded API and a Redis client are two doors into one store
+//! rather than two stores that agree for now.
 //!
 //! ```
 //! let db = yo::open(yo::MEMORY)?;
@@ -61,6 +61,21 @@
 //!
 //! hits.incr()?;
 //! assert_eq!(db.strings().get("hits")?.as_deref(), Some(&b"1"[..]));
+//! # Ok::<(), yo::Error>(())
+//! ```
+//!
+//! Where a Redis command works on one key for its whole life, there is a handle
+//! that holds the key: [`Db::counter`] for a counter and [`Db::set`] for a set.
+//! Those are sugar and they are worth having, because a name spelled once is a
+//! name that cannot be misspelled at the third call site.
+//!
+//! ```
+//! let db = yo::open(yo::MEMORY)?;
+//! let online = db.set("online");
+//!
+//! online.add("alice")?;
+//! online.add("bob")?;
+//! assert_eq!(online.len()?, 2);
 //! # Ok::<(), yo::Error>(())
 //! ```
 //!
@@ -93,12 +108,18 @@ pub mod counter;
 pub mod db;
 pub mod keyspace;
 pub mod map;
+pub mod sets;
 pub mod store;
 
 pub use counter::Counter;
 pub use db::{Db, MEMORY, open};
 pub use keyspace::Strings;
 pub use map::Map;
+pub use sets::{Set, Sets};
 pub use store::{Decode, Encode};
 pub use yo_common::{Code, Error, Result};
 pub use yo_shape::{Desc, Shape, Tag};
+// The two views a borrowing read hands to its closure. They were reachable
+// before this and not nameable, so a caller could take one and could not write
+// down the type of what they had taken.
+pub use yo_kv::{Member, Str};

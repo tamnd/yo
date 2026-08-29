@@ -11,6 +11,7 @@ use yo_shape::{Desc, Tag};
 use crate::counter::Counter;
 use crate::keyspace::Strings;
 use crate::map::Map;
+use crate::sets::{Set, Sets};
 use crate::store::Decode;
 
 /// The path that means "no file at all", which is a real path and not a flag
@@ -223,6 +224,43 @@ impl Db {
     pub fn counter(&self, key: impl Into<Vec<u8>>) -> Counter {
         Counter {
             db: self.db.clone(),
+            key: key.into(),
+        }
+    }
+
+    /// Every Redis set command, with the key as the first argument.
+    ///
+    /// The same store `SADD` off a socket reaches. Like [`Db::strings`] this is
+    /// not a named collection, because in Redis a set is not one: it is a key in
+    /// the keyspace that happens to hold a set.
+    ///
+    /// ```
+    /// let db = yo::open(yo::MEMORY)?;
+    /// db.sets().add_many("online", &["alice", "bob"])?;
+    /// assert_eq!(db.sets().len_of("online")?, 2);
+    /// # Ok::<(), yo::Error>(())
+    /// ```
+    #[must_use]
+    pub fn sets(&self) -> Sets {
+        Sets {
+            db: self.db.clone(),
+        }
+    }
+
+    /// A set at one key, which is the same sugar [`Db::counter`] is.
+    ///
+    /// ```
+    /// let db = yo::open(yo::MEMORY)?;
+    /// let online = db.set("online");
+    ///
+    /// online.add("alice")?;
+    /// assert!(online.contains("alice")?);
+    /// # Ok::<(), yo::Error>(())
+    /// ```
+    #[must_use]
+    pub fn set(&self, key: impl Into<Vec<u8>>) -> Set {
+        Set {
+            sets: self.sets(),
             key: key.into(),
         }
     }
