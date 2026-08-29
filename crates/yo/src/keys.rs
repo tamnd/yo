@@ -446,6 +446,10 @@ impl Keys {
     /// call, which is what stops it from outliving the record it points into,
     /// so anything you want to keep has to be copied out inside the closure.
     ///
+    /// A key whose deadline has passed is not handed over, and it is deleted
+    /// once the walk has finished, so a walk is also the cheapest way to clear
+    /// out a database that has had a lot of things expire in it.
+    ///
     /// ```
     /// let db = yo::open(yo::MEMORY)?;
     /// db.strings().set("a", "1")?;

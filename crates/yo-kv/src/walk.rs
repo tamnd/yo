@@ -6,19 +6,24 @@
 //! bite and a number it can come back with. `RANDOMKEY` wants one key and does
 //! not want to look at the others to find it.
 //!
-//! # Nothing here writes
+//! # A walk reaps what it walks past
 //!
-//! A key past its deadline is skipped and not reaped, which is the one place in
-//! this crate where a dead key is left where it lies. Every other read takes
-//! `&mut self` and drops it on the way through, and these three take `&self` so
-//! that a walk can hand the caller a borrow of a key that is still in the map.
-//! Deleting during the walk would mean copying every key out first, which is
-//! the allocation the whole design is avoiding, and it would turn `KEYS` on a
-//! read replica into a write.
+//! A key past its deadline is skipped, and then it is deleted once the walk has
+//! finished. It cannot be deleted while the walk is running, because the walk
+//! holds a shared borrow of the index for as long as it is handing out borrowed
+//! keys, so the dead names go in a list and the deletes happen after. The list
+//! is empty in the ordinary case and only ever holds keys that were already
+//! dead, so a database with nothing expiring in it allocates nothing.
 //!
-//! Nothing leaks from that. The active expiry cycle collects dead keys whether
-//! or not anything read them, and the next ordinary read of one of these keys
-//! reaps it the usual way.
+//! This matters because there is no active expiry cycle yet, so a key nobody
+//! reads again is a key nobody collects. Without the reap, `SET k v PX 50` and
+//! a wait would leave `DBSIZE` answering one more than Redis answers, which is
+//! the difference a side by side run against 8.10.1 actually turned up. Redis
+//! collects that key from its own cycle within a hundred milliseconds, and a
+//! walk finding it is the closest thing we have until the cycle lands in M5.
+//!
+//! The cost is that these three take `&mut self` rather than `&self`, which is
+//! what every other read in this crate already takes for the same reason.
 //!
 //! # `COUNT` is a floor
 //!
@@ -62,22 +67,26 @@ impl Keyspace {
     /// back twice. That is Redis's contract and a client written against Redis
     /// already copes with all three.
     pub fn scan(
-        &self,
+        &mut self,
         from: KeyCursor,
         budget: usize,
         ty: Option<Kind>,
         mut out: impl FnMut(&[u8]),
     ) -> KeyCursor {
         let now = self.clock.now_ms();
-        self.map.scan(from, budget, |key, rec| {
+        let mut dead = Vec::new();
+        let next = self.map.scan(from, budget, |key, rec| {
             if value::is_expired(rec, now) {
+                dead.push(key.to_vec());
                 return;
             }
             if ty.is_some_and(|want| value::kind(rec) != want) {
                 return;
             }
             out(key);
-        })
+        });
+        self.reap_all(dead);
+        next
     }
 
     /// Every key in the database, once each.
@@ -91,8 +100,20 @@ impl Keyspace {
     /// One walk with an unbounded budget rather than a loop over [`Keyspace::scan`],
     /// which is the same walk without the chance of a duplicate, because nothing
     /// can split the index while this is running.
-    pub fn keys(&self, out: impl FnMut(&[u8])) {
+    pub fn keys(&mut self, out: impl FnMut(&[u8])) {
         self.scan(KeyCursor::START, usize::MAX, None, out);
+    }
+
+    /// Drop the dead keys a walk went past, now that the walk has let go.
+    ///
+    /// The count goes up by one per key, the same as a lazy reap on an ordinary
+    /// read, because `INFO stats` reports one number for both and Redis counts
+    /// its active cycle into it too.
+    fn reap_all(&mut self, dead: Vec<Vec<u8>>) {
+        for key in dead {
+            self.drop_key(&key);
+            self.expired += 1;
+        }
     }
 
     /// One key, chosen at random, or `None` if the database is empty.
@@ -135,8 +156,10 @@ impl Keyspace {
         let rng = &mut self.rng;
         let mut seen = 0usize;
         let mut pick = None;
+        let mut dead = Vec::new();
         self.map.scan(from, budget, |key, rec| {
             if value::is_expired(rec, now) {
+                dead.push(key.to_vec());
                 return;
             }
             seen += 1;
@@ -144,6 +167,7 @@ impl Keyspace {
                 pick = Some(key.to_vec());
             }
         });
+        self.reap_all(dead);
         pick
     }
 }
@@ -163,7 +187,7 @@ mod tests {
         d.set_plain(key, b"v").expect("room for a record");
     }
 
-    fn keys_of(db: &Keyspace) -> HashSet<Vec<u8>> {
+    fn keys_of(db: &mut Keyspace) -> HashSet<Vec<u8>> {
         let mut out = HashSet::new();
         db.keys(|k| {
             out.insert(k.to_vec());
@@ -174,7 +198,7 @@ mod tests {
     #[test]
     fn an_empty_database_has_nothing_to_walk() {
         let mut db = db();
-        assert!(keys_of(&db).is_empty());
+        assert!(keys_of(&mut db).is_empty());
         assert_eq!(db.random_key(), None);
         assert!(db.scan(KeyCursor::START, 10, None, |_| {}).is_end());
     }
@@ -198,7 +222,7 @@ mod tests {
         let unique: HashSet<Vec<u8>> = seen.iter().cloned().collect();
         assert_eq!(unique.len(), 2_000);
         assert_eq!(seen.len(), 2_000, "a quiet scan returned a key twice");
-        assert_eq!(unique, keys_of(&db));
+        assert_eq!(unique, keys_of(&mut db));
     }
 
     #[test]
@@ -228,19 +252,24 @@ mod tests {
     }
 
     #[test]
-    fn a_key_past_its_deadline_is_walked_past_and_not_deleted() {
+    fn a_key_past_its_deadline_is_collected_by_the_walk() {
         let mut db = db();
         put(&mut db, b"alive");
         put(&mut db, b"dead");
         assert!(db.set_expiry(b"dead", Some(1_000_500)));
 
         db.clock_mut().advance(1_000);
-        assert_eq!(keys_of(&db), HashSet::from([b"alive".to_vec()]));
-        // Still in the map, because a walk takes a shared borrow and cannot
-        // delete anything. The next ordinary read is what collects it.
-        assert_eq!(db.len(), 2);
-        assert_eq!(db.kind_of(b"dead"), None);
+        let before = db.expired_keys();
+        assert_eq!(keys_of(&mut db), HashSet::from([b"alive".to_vec()]));
+        // Gone from the map and counted, so `DBSIZE` after a walk answers what
+        // Redis answers after its active cycle has been round.
         assert_eq!(db.len(), 1);
+        assert_eq!(db.expired_keys(), before + 1);
+
+        // And the walk is the only thing that touched it, so a second walk has
+        // nothing left to collect and does not count it twice.
+        assert_eq!(keys_of(&mut db), HashSet::from([b"alive".to_vec()]));
+        assert_eq!(db.expired_keys(), before + 1);
     }
 
     #[test]
@@ -250,7 +279,7 @@ mod tests {
             put(&mut db, format!("k{i}").as_bytes());
         }
 
-        let all = keys_of(&db);
+        let all = keys_of(&mut db);
         let mut picked = HashSet::new();
         for _ in 0..200 {
             let k = db.random_key().expect("the database is not empty");
