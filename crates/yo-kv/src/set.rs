@@ -50,10 +50,83 @@ use crate::elem::Elements;
 use crate::intset::Intset;
 use crate::listpack::{self, Listpack};
 use crate::scan::Cursor;
-use yo_common::num::{i64_len, parse_i64};
+use yo_common::num::{DIGITS_MAX, i64_digits, i64_len, parse_i64};
 
 /// A set member: bytes as they lie, or an integer not yet formatted.
 pub type Member<'a> = listpack::Entry<'a>;
+
+/// A member on its way to being asked about, in every form the three
+/// representations want it in.
+///
+/// Set algebra walks one set and asks every other set the same question about
+/// each member, and the three representations do not want the question in the
+/// same shape. An intset wants a number, a listpack wants bytes and a number
+/// because it holds both kinds, and an element table wants bytes and their
+/// hash. Asking through [`Set::contains`] would redo all of that per question:
+/// a parse for the intset, another parse inside the listpack, and a hash per
+/// table. This does each once per member and then asks `k - 1` times.
+///
+/// The hash is computed whether or not any operand is a table, which is waste
+/// when none is. It is waste worth taking, because the sets where it is wasted
+/// are an intset or a listpack, which are capped at a few hundred members, and
+/// an operation over sets that small is finished before the saving could have
+/// been measured. The sets where the hash pays are the large ones, and those
+/// are tables by definition.
+#[derive(Debug, Clone, Copy)]
+pub struct Needle<'a> {
+    /// The member as bytes, which for an integer member is a caller's buffer.
+    bytes: &'a [u8],
+    /// The number it is, if it is one, under the same rule that decides whether
+    /// a set stores it as one.
+    int: Option<i64>,
+    /// What an element table would key it under.
+    hash: u64,
+}
+
+impl<'a> Needle<'a> {
+    /// A needle from bytes, which is what a command line argument is.
+    #[must_use]
+    pub fn new(bytes: &'a [u8]) -> Needle<'a> {
+        Needle {
+            bytes,
+            int: parse_i64(bytes),
+            hash: Elements::<()>::hash_of(bytes),
+        }
+    }
+
+    /// A needle from a member walked out of a set.
+    ///
+    /// `digits` is where an integer member's text goes, because an intset holds
+    /// the number and the digits do not exist anywhere until somebody writes
+    /// them. It is the caller's buffer rather than a field so that the needle
+    /// stays a borrow and the buffer is written once per member rather than
+    /// allocated once per member.
+    ///
+    /// A member that came out as bytes is still parsed, because the set being
+    /// asked may be an intset and `SINTER ints strings` has to find the members
+    /// they share. A member that came out as a number is not, which is the
+    /// whole saving.
+    #[must_use]
+    pub fn of(member: Member<'a>, digits: &'a mut [u8; DIGITS_MAX]) -> Needle<'a> {
+        match member {
+            Member::Str(s) => Needle::new(s),
+            Member::Int(n) => {
+                let bytes = i64_digits(digits, n);
+                Needle {
+                    bytes,
+                    int: Some(n),
+                    hash: Elements::<()>::hash_of(bytes),
+                }
+            }
+        }
+    }
+
+    /// The member as bytes, which is what a caller collecting an answer wants.
+    #[must_use]
+    pub const fn bytes(&self) -> &'a [u8] {
+        self.bytes
+    }
+}
 
 /// Where the encodings change over.
 ///
@@ -200,6 +273,21 @@ impl Set {
             Body::Ints(s) => parse_i64(member).is_some_and(|v| s.contains(v)),
             Body::Packed(lp) => lp.find(member, 1).is_some(),
             Body::Table(t) => t.contains(member),
+        }
+    }
+
+    /// The same question asked with the work already done. See [`Needle`].
+    ///
+    /// This is what set algebra probes with. Every arm is the arm
+    /// [`Set::contains`] would have taken, with the parse and the hash lifted
+    /// out of it, so the two cannot disagree about what a member is.
+    #[must_use]
+    #[inline]
+    pub fn has(&self, needle: &Needle<'_>) -> bool {
+        match &self.body {
+            Body::Ints(s) => needle.int.is_some_and(|v| s.contains(v)),
+            Body::Packed(lp) => lp.find_parsed(needle.bytes, needle.int, 1).is_some(),
+            Body::Table(t) => t.contains_hashed(needle.hash, needle.bytes),
         }
     }
 

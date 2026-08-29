@@ -441,8 +441,24 @@ impl Out {
     /// [`Out::hoist`] is why this can be called after the elements rather than
     /// before them.
     pub fn close_array(&mut self, start: usize, n: usize) {
+        self.close(b'*', start, n);
+    }
+
+    /// The same for a set, which is what the algebra commands answer.
+    ///
+    /// `SINTER` cannot count its own reply in advance any more than `SSCAN`
+    /// can. The answer is however many members survived a walk over the
+    /// smallest set, and finding that out ahead of writing it means running the
+    /// whole operation twice.
+    pub fn close_set(&mut self, start: usize, n: usize) {
+        self.close(if self.proto.is_resp3() { b'~' } else { b'*' }, start, n);
+    }
+
+    /// Write a header of `tag` for `n` elements behind the elements, then move
+    /// it in front of them.
+    fn close(&mut self, tag: u8, start: usize, n: usize) {
         let body = self.buf.len() - start;
-        self.buf.push(b'*');
+        self.buf.push(tag);
         push_u64(&mut self.buf, n as u64);
         self.crlf();
         let header = self.buf.len() - start - body;

@@ -64,6 +64,9 @@ const AC_SET_READ_FAST: &[&str] = &["@read", "@set", "@fast"];
 const AC_SET_READ_SLOW: &[&str] = &["@read", "@set", "@slow"];
 /// The set write side.
 const AC_SET_WRITE_FAST: &[&str] = &["@write", "@set", "@fast"];
+/// The set write side for the ones that walk whole sets to decide what to
+/// write, which is the whole `*STORE` family.
+const AC_SET_WRITE_SLOW: &[&str] = &["@write", "@set", "@slow"];
 /// The connection commands' categories.
 const AC_CONN: &[&str] = &["@fast", "@connection"];
 /// The keyspace read side, which is `EXISTS` and `TYPE`.
@@ -545,6 +548,101 @@ pub static COMMANDS: &[Spec] = &[
         since: "2.8.0",
         complexity: "O(1) a call, O(N) for a whole iteration",
         summary: "Walk part of a set and say where to carry on from.",
+        group: "set",
+    },
+    Spec {
+        name: "sinter",
+        arity: -2,
+        flags: &["readonly"],
+        first_key: 1,
+        last_key: -1,
+        step: 1,
+        acl: AC_SET_READ_SLOW,
+        since: "1.0.0",
+        complexity: "O(N*M) worst case, N the smallest set and M the number of sets",
+        summary: "The members every one of these sets has.",
+        group: "set",
+    },
+    Spec {
+        name: "sintercard",
+        arity: -3,
+        // The only set command whose keys are counted rather than positioned,
+        // so the legacy key range cannot describe it and Redis reports zeroes
+        // in these three fields too. A client that wants the keys reads the key
+        // specs, which is what the count is for.
+        flags: &["readonly"],
+        first_key: 0,
+        last_key: 0,
+        step: 0,
+        acl: AC_SET_READ_SLOW,
+        since: "7.0.0",
+        complexity: "O(N*M) worst case, N the smallest set and M the number of sets",
+        summary: "How many members every one of these sets has, up to a limit.",
+        group: "set",
+    },
+    Spec {
+        name: "sinterstore",
+        arity: -3,
+        flags: WRITE_OOM,
+        first_key: 1,
+        last_key: -1,
+        step: 1,
+        acl: AC_SET_WRITE_SLOW,
+        since: "1.0.0",
+        complexity: "O(N*M) worst case, N the smallest set and M the number of sets",
+        summary: "Store the members every one of these sets has.",
+        group: "set",
+    },
+    Spec {
+        name: "sunion",
+        arity: -2,
+        flags: &["readonly"],
+        first_key: 1,
+        last_key: -1,
+        step: 1,
+        acl: AC_SET_READ_SLOW,
+        since: "1.0.0",
+        complexity: "O(N) in the total number of members",
+        summary: "The members any of these sets has, each once.",
+        group: "set",
+    },
+    Spec {
+        name: "sunionstore",
+        arity: -3,
+        flags: WRITE_OOM,
+        first_key: 1,
+        last_key: -1,
+        step: 1,
+        acl: AC_SET_WRITE_SLOW,
+        since: "1.0.0",
+        complexity: "O(N) in the total number of members",
+        summary: "Store the members any of these sets has.",
+        group: "set",
+    },
+    Spec {
+        name: "sdiff",
+        arity: -2,
+        flags: &["readonly"],
+        first_key: 1,
+        last_key: -1,
+        step: 1,
+        acl: AC_SET_READ_SLOW,
+        since: "1.0.0",
+        complexity: "O(N) in the total number of members",
+        summary: "The members of the first set that no later set has.",
+        group: "set",
+    },
+    Spec {
+        name: "sdiffstore",
+        arity: -3,
+        flags: WRITE_OOM,
+        first_key: 1,
+        last_key: -1,
+        step: 1,
+        acl: AC_SET_WRITE_SLOW,
+        since: "1.0.0",
+        complexity: "O(N) in the total number of members",
+        summary: "Store the members of the first set that no later set has.",
         group: "set",
     },
     // ------------------------------------------------------------ keyspace

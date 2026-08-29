@@ -289,7 +289,18 @@ impl Listpack {
     /// need a second structure down here.
     #[must_use]
     pub fn find(&self, needle: &[u8], step: usize) -> Option<usize> {
-        let as_int = parse_i64(needle);
+        self.find_parsed(needle, parse_i64(needle), step)
+    }
+
+    /// The same walk with the needle already parsed.
+    ///
+    /// Set algebra asks one member of one set about every other set, so the
+    /// parse would otherwise happen once per question about the same bytes. It
+    /// is also the only form that can answer about a member which was never
+    /// text: an intset holds the number and the digits do not exist anywhere
+    /// until somebody writes them.
+    #[must_use]
+    pub fn find_parsed(&self, needle: &[u8], as_int: Option<i64>, step: usize) -> Option<usize> {
         let step = step.max(1);
         // Counted down rather than `at % step`, because `step` is a runtime value
         // and the remainder compiles to a real division on every element. That is

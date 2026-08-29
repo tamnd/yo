@@ -1455,6 +1455,162 @@ mod tests {
         }
     }
 
+    /// The members of a set reply, sorted, since none of these promise an
+    /// order and a test that asserted one would be asserting an accident.
+    fn sorted(reply: &str) -> Vec<String> {
+        let mut lines = reply.split("\r\n");
+        let header = lines.next().expect("a header");
+        assert!(
+            header.starts_with('*') || header.starts_with('~'),
+            "got {reply}"
+        );
+        let n: usize = header[1..].parse().expect("a member count");
+        let mut got = Vec::with_capacity(n);
+        for _ in 0..n {
+            lines.next().expect("a member header");
+            got.push(lines.next().expect("a member").to_owned());
+        }
+        got.sort();
+        got
+    }
+
+    #[test]
+    fn the_algebra_answers_what_the_sets_share_and_do_not() {
+        let mut f = Fixture::new();
+        f.run(&[b"SADD", b"a", b"1", b"2", b"3"]);
+        f.run(&[b"SADD", b"b", b"2", b"3", b"4"]);
+        f.run(&[b"SADD", b"c", b"3", b"4", b"5"]);
+
+        assert_eq!(sorted(&f.run(&[b"SINTER", b"a", b"b", b"c"])), ["3"]);
+        assert_eq!(
+            sorted(&f.run(&[b"SUNION", b"a", b"b", b"c"])),
+            ["1", "2", "3", "4", "5"]
+        );
+        assert_eq!(sorted(&f.run(&[b"SDIFF", b"a", b"b"])), ["1"]);
+        assert_eq!(sorted(&f.run(&[b"SINTER", b"a"])), ["1", "2", "3"]);
+
+        // A key that is not there is an empty set, which empties an
+        // intersection and does nothing at all to a union.
+        assert_eq!(f.run(&[b"SINTER", b"a", b"nope"]), "*0\r\n");
+        assert_eq!(sorted(&f.run(&[b"SUNION", b"a", b"nope"])), ["1", "2", "3"]);
+        assert_eq!(f.run(&[b"SDIFF", b"nope", b"a"]), "*0\r\n");
+        assert_eq!(f.run(&[b"DBSIZE"]), ":3\r\n", "and none of it made a key");
+    }
+
+    #[test]
+    fn the_algebra_answers_a_set_on_resp3_and_an_array_on_resp2() {
+        let mut f = Fixture::new();
+        f.run(&[b"SADD", b"a", b"x"]);
+        assert_eq!(f.run(&[b"SINTER", b"a"]), "*1\r\n$1\r\nx\r\n");
+        assert_eq!(f.run(&[b"SUNION", b"a"]), "*1\r\n$1\r\nx\r\n");
+        assert_eq!(f.run(&[b"SDIFF", b"a"]), "*1\r\n$1\r\nx\r\n");
+
+        f.run(&[b"HELLO", b"3"]);
+        assert_eq!(f.run(&[b"SINTER", b"a"]), "~1\r\n$1\r\nx\r\n");
+        assert_eq!(f.run(&[b"SUNION", b"a"]), "~1\r\n$1\r\nx\r\n");
+        assert_eq!(f.run(&[b"SDIFF", b"a"]), "~1\r\n$1\r\nx\r\n");
+        assert_eq!(f.run(&[b"SINTER", b"nope"]), "~0\r\n");
+    }
+
+    #[test]
+    fn a_store_form_writes_a_key_and_answers_how_big_it_is() {
+        let mut f = Fixture::new();
+        f.run(&[b"SADD", b"a", b"1", b"2", b"3"]);
+        f.run(&[b"SADD", b"b", b"2", b"3", b"4"]);
+
+        assert_eq!(f.run(&[b"SINTERSTORE", b"d", b"a", b"b"]), ":2\r\n");
+        assert_eq!(sorted(&f.run(&[b"SMEMBERS", b"d"])), ["2", "3"]);
+        assert_eq!(f.run(&[b"SUNIONSTORE", b"d", b"a", b"b"]), ":4\r\n");
+        assert_eq!(sorted(&f.run(&[b"SMEMBERS", b"d"])), ["1", "2", "3", "4"]);
+        assert_eq!(f.run(&[b"SDIFFSTORE", b"d", b"a", b"b"]), ":1\r\n");
+        assert_eq!(f.run(&[b"SMEMBERS", b"d"]), "*1\r\n$1\r\n1\r\n");
+
+        // An empty answer deletes the destination rather than leaving an empty
+        // set behind, and the destination may be one of the sources.
+        assert_eq!(f.run(&[b"SDIFFSTORE", b"d", b"a", b"a"]), ":0\r\n");
+        assert_eq!(f.run(&[b"EXISTS", b"d"]), ":0\r\n");
+        assert_eq!(f.run(&[b"SINTERSTORE", b"a", b"a", b"b"]), ":2\r\n");
+        assert_eq!(sorted(&f.run(&[b"SMEMBERS", b"a"])), ["2", "3"]);
+
+        // And a destination holding something else is overwritten, the same way
+        // SET overwrites, rather than refused.
+        f.run(&[b"SET", b"str", b"v"]);
+        assert_eq!(f.run(&[b"SUNIONSTORE", b"str", b"b"]), ":3\r\n");
+        assert_eq!(f.run(&[b"TYPE", b"str"]), "+set\r\n");
+    }
+
+    #[test]
+    fn sintercard_counts_without_building_and_stops_at_a_limit() {
+        let mut f = Fixture::new();
+        f.run(&[b"SADD", b"a", b"1", b"2", b"3", b"4"]);
+        f.run(&[b"SADD", b"b", b"2", b"3", b"4", b"5"]);
+
+        assert_eq!(f.run(&[b"SINTERCARD", b"2", b"a", b"b"]), ":3\r\n");
+        assert_eq!(
+            f.run(&[b"SINTERCARD", b"2", b"a", b"b", b"LIMIT", b"2"]),
+            ":2\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"SINTERCARD", b"2", b"a", b"b", b"LIMIT", b"0"]),
+            ":3\r\n",
+            "a limit of zero is no limit"
+        );
+        assert_eq!(f.run(&[b"SINTERCARD", b"1", b"a"]), ":4\r\n");
+        assert_eq!(f.run(&[b"SINTERCARD", b"2", b"a", b"nope"]), ":0\r\n");
+
+        // The counted keys are what make its three error messages its own.
+        assert_eq!(
+            f.run(&[b"SINTERCARD", b"0", b"a"]),
+            "-ERR numkeys should be greater than 0\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"SINTERCARD", b"abc", b"a"]),
+            "-ERR numkeys should be greater than 0\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"SINTERCARD", b"3", b"a", b"b"]),
+            "-ERR Number of keys can't be greater than number of args\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"SINTERCARD", b"2", b"a", b"b", b"LIMIT", b"-1"]),
+            "-ERR LIMIT can't be negative\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"SINTERCARD", b"2", b"a", b"b", b"NOPE", b"1"]),
+            "-ERR syntax error\r\n"
+        );
+        // A key really can be called LIMIT, which is why the count exists.
+        f.run(&[b"SADD", b"LIMIT", b"2"]);
+        assert_eq!(f.run(&[b"SINTERCARD", b"2", b"a", b"LIMIT"]), ":1\r\n");
+    }
+
+    #[test]
+    fn the_algebra_answers_wrongtype_before_it_writes_anything() {
+        let mut f = Fixture::new();
+        f.run(&[b"SADD", b"a", b"1"]);
+        f.run(&[b"SADD", b"d", b"old"]);
+        f.run(&[b"SET", b"str", b"v"]);
+
+        let wrong = "-WRONGTYPE Operation against a key holding the wrong kind of value\r\n";
+        for bad in [
+            &[b"SINTER".as_slice(), b"a", b"str"][..],
+            &[b"SUNION".as_slice(), b"str"][..],
+            &[b"SDIFF".as_slice(), b"a", b"str"][..],
+            &[b"SINTERCARD".as_slice(), b"2", b"a", b"str"][..],
+            &[b"SINTERSTORE".as_slice(), b"d", b"a", b"str"][..],
+            &[b"SUNIONSTORE".as_slice(), b"d", b"str"][..],
+            &[b"SDIFFSTORE".as_slice(), b"d", b"a", b"str"][..],
+        ] {
+            let reply = f.run(bad);
+            assert_eq!(reply, wrong, "for {:?}", bad[0]);
+        }
+        assert_eq!(
+            f.run(&[b"SMEMBERS", b"d"]),
+            "*1\r\n$3\r\nold\r\n",
+            "and the destination was left alone every time"
+        );
+    }
+
     /// The leak a set can spring that nothing on the wire would ever show: the
     /// key goes, the body does not, and `DBSIZE` looks right the whole time.
     #[test]

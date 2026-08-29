@@ -75,15 +75,11 @@ doc = "08 section 3"
 [[group]]
 name = "set"
 expected = 17
-status = "partial"
+status = "shipped"
 doc = "08 section 4"
-# Ten of the seventeen are here: SADD, SREM, SCARD, SISMEMBER, SMISMEMBER,
-# SMEMBERS, SPOP, SRANDMEMBER, SSCAN and SMOVE. What is left is the seven
-# algebra commands and their store forms, SINTER, SUNION, SDIFF, SINTERCARD,
-# SINTERSTORE, SUNIONSTORE and SDIFFSTORE. Everything a compatibility suite
-# needs to run a set file end to end is here now apart from the algebra, since
-# a suite that cannot pop a member or walk a set with a cursor stops on its
-# first file whatever else is implemented.
+# All seventeen are here. What is left on the set is not commands, it is the
+# inline and native bands of the size ladder and the escalation of a hot key,
+# and neither of those changes an answer.
 
 [[group]]
 name = "zset"
@@ -620,6 +616,83 @@ bounded = "inherent"
 status = "shipped"
 wire = "verified"
 notes = "Only the element table walks in windows. An intset or a listpack answers with every member and a finished cursor, ignoring the cursor it was given, which is what Redis does for the same two encodings and is safe because promotion is one way: a set that gave out a table cursor is still a table. The table walks downward so that an insert lands above the cursor and a removal moves the top row down into the hole, since nothing ever moves a row upward and that is the case the guarantee forbids. MATCH decides how many members there are as the walk goes, so the reply header and the cursor in front of it are both written behind the body and rotated into place."
+
+[[command]]
+name = "SINTER"
+group = "set"
+since = "1.0.0"
+arity = -2
+plan = "whole-value"
+bounded = "risk"
+status = "shipped"
+wire = "verified"
+notes = "A probe and never a merge, which is not the plan K11 pre-registered. It predicted a crossover at k around 7 on the assumption that a probe question is much dearer than a counting touch, and benches/setops.rs says both cost about 25 ns because a counting touch hashes its member and makes its own random access. Probe wins at every k from 2 to 16 and the two lines converge without crossing. The crossover comes back when the partitioned band gives us sorted arrays to walk in lockstep, whose touch is a pointer step with no hash anywhere, and that is M4. The counting plan stays reachable so the merge has a control to beat."
+
+[[command]]
+name = "SINTERCARD"
+group = "set"
+since = "7.0.0"
+arity = -3
+plan = "whole-value"
+bounded = "inherent"
+status = "shipped"
+wire = "verified"
+notes = "The same walk with a callback that throws the members away, so the count is the only thing built. LIMIT stops it as soon as it has enough, which is the reason to send this rather than SINTER and a length. The keys are counted rather than positioned, because LIMIT comes after them and there would otherwise be no way to tell a key named LIMIT from the option, and that is why the legacy key range in COMMAND is zeroes here the way it is in Redis."
+
+[[command]]
+name = "SINTERSTORE"
+group = "set"
+since = "1.0.0"
+arity = -3
+plan = "whole-value"
+bounded = "inherent"
+status = "shipped"
+wire = "verified"
+notes = "The destination is presized once from the smallest input, which is an upper bound on any intersection and is Y18's rule. What stopped aki's STORE family at 0.30x was that the rule was not applied. The result is built whole before anything is written, so the destination is allowed to be one of the sources: clearing it first and filling it as the walk goes is the shape that makes SINTERSTORE s s a answer nothing. An empty result deletes the destination rather than leaving an empty set, because an empty set does not exist."
+
+[[command]]
+name = "SUNION"
+group = "set"
+since = "1.0.0"
+arity = -2
+plan = "whole-value"
+bounded = "risk"
+status = "shipped"
+wire = "verified"
+notes = "No plan to choose. A union reads every member of every set whatever it does, so the only question is what it does with each one, and the answer is one insertion into a table that is also the duplicate check. A key that is not there contributes nothing rather than emptying the answer, which is the opposite of what it does to an intersection and is right for the same reason."
+
+[[command]]
+name = "SUNIONSTORE"
+group = "set"
+since = "1.0.0"
+arity = -3
+plan = "whole-value"
+bounded = "inherent"
+status = "shipped"
+wire = "verified"
+notes = "Presized to the sum of the inputs, since a union of sets that share nothing is all of them. Being wrong about that costs a conversion and not a wrong answer."
+
+[[command]]
+name = "SDIFF"
+group = "set"
+since = "1.0.0"
+arity = -2
+plan = "whole-value"
+bounded = "risk"
+status = "shipped"
+wire = "verified"
+notes = "Always a probe and never anything else. The first set is the one being walked whether we like it or not, so the only choice is how each member is checked, and the later sets are asked smallest first because a member that is going to be found will usually be found in the smallest of them. A first key that is not there is an empty answer whatever the rest hold, and a later key that is not there takes nothing away."
+
+[[command]]
+name = "SDIFFSTORE"
+group = "set"
+since = "1.0.0"
+arity = -3
+plan = "whole-value"
+bounded = "inherent"
+status = "shipped"
+wire = "verified"
+notes = "Presized from the first set, which is an upper bound on what a difference can keep."
 
 # ------------------------------------------------------------------ scripting
 

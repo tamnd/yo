@@ -62,33 +62,38 @@
 //! # Ordering
 //!
 //! Every operation returns members in the order the first relevant set holds
-//! them, which is insertion order. Redis makes no ordering promise for any of
-//! these, and picking the order the data is already in means the walk is
-//! sequential and there is nothing to sort.
+//! them, which is insertion order for a listpack or a table and ascending for an
+//! intset. Redis makes no ordering promise for any of these, and picking the
+//! order the data is already in means the walk is sequential and there is
+//! nothing to sort.
+//!
+//! # The three representations
+//!
+//! The operand is a [`Set`], which is one of three things, and not the element
+//! table it used to be. The walked set gives up members through the same
+//! [`Set::iter`] everything else uses, and the questioned sets answer through
+//! [`Set::has`], which is [`Set::contains`] with the parse and the hash lifted
+//! out into a [`Needle`] so they happen once per member rather than once per
+//! question.
+//!
+//! What that buys is that the algebra never has to know what it is holding. It
+//! also means the members cross between representations correctly, which is not
+//! automatic: an intset member is a number that has no digits anywhere, and a
+//! table stores that same member as its digits, so `SINTER ints table` only
+//! finds anything because the needle carries both forms.
 //!
 //! # Presizing
 //!
 //! The `*STORE` forms hand the destination a size before they start filling it,
 //! taken from the smallest input, which is Y18's rule and an upper bound on any
 //! intersection. `05` section 3.1 wants that to be one arena bump. Until the
-//! arena is under this, [`Elements::with_capacity`] is the same promise with a
+//! arena is under this, the destination's own hint is the same promise with a
 //! different allocator behind it.
 
-use crate::Elements;
+use yo_common::num::DIGITS_MAX;
 
-/// The operand of everything below: an element table, nothing against a member.
-///
-/// Set algebra reads names and never payloads, so this is not generic. A hash or
-/// a sorted set is not an operand of `SINTER` and pretending otherwise would put
-/// a type parameter in every signature here to no end.
-///
-/// This is a table and not a [`crate::Set`], which is a narrower thing than the
-/// name it used to have suggested. A real set is one of three representations
-/// and only the largest of them is this, so the algebra either grows arms for
-/// the other two or takes something that can produce members whatever it is.
-/// That is the next piece of work and this alias gets to keep an honest name
-/// until then.
-pub type Table = Elements<()>;
+use crate::Elements;
+use crate::set::{Limits, Needle, Set};
 
 /// How to answer a set operation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -111,7 +116,7 @@ pub enum Plan {
 /// Always a probe, for the reason in the module doc. When the partitioned band
 /// gives us something sorted to merge there will be a choice to make here, and
 /// until then there is not one.
-pub fn inter<F>(sets: &[&Table], limit: usize, f: F) -> usize
+pub fn inter<F>(sets: &[&Set], limit: usize, f: F) -> usize
 where
     F: FnMut(&[u8]),
 {
@@ -124,7 +129,7 @@ where
 /// only way to find out where they cross and the only way to check that they
 /// agree on the answer. It is public because a caller that knows the shape of its
 /// own data knows more about it than [`inter`] can see from the sets alone.
-pub fn inter_with<F>(how: Plan, sets: &[&Table], limit: usize, f: F) -> usize
+pub fn inter_with<F>(how: Plan, sets: &[&Set], limit: usize, f: F) -> usize
 where
     F: FnMut(&[u8]),
 {
@@ -143,7 +148,7 @@ where
 /// is going to fail will usually fail against the smallest of the others, and
 /// asking that one first is what turns `k - 1` questions per member into closer
 /// to one.
-fn inter_probe<F>(sets: &[&Table], limit: usize, mut f: F) -> usize
+fn inter_probe<F>(sets: &[&Set], limit: usize, mut f: F) -> usize
 where
     F: FnMut(&[u8]),
 {
@@ -151,13 +156,14 @@ where
     order.sort_unstable_by_key(|&i| sets[i].len());
     let (&first, rest) = order.split_first().expect("not empty");
 
+    let mut digits = [0u8; DIGITS_MAX];
     let mut found = 0usize;
-    for (name, _) in sets[first].iter() {
-        // Hashed once, asked k-1 times. Without this the hash is paid per
-        // question and it is the same bytes every time.
-        let h = Table::hash_of(name);
-        if rest.iter().all(|&i| sets[i].contains_hashed(h, name)) {
-            f(name);
+    for m in sets[first].iter() {
+        // Parsed and hashed once, asked k-1 times. Without this both are paid
+        // per question about the same member. See [`Needle`].
+        let needle = Needle::of(m, &mut digits);
+        if rest.iter().all(|&i| sets[i].has(&needle)) {
+            f(needle.bytes());
             found += 1;
             if limit != 0 && found == limit {
                 break;
@@ -173,7 +179,7 @@ where
 /// raises it, so a member with the full count is in all of them. Members that
 /// are not in the first set are never entered at all, which keeps the table no
 /// bigger than the first set and is why the first set is the smallest one.
-fn inter_accumulate<F>(sets: &[&Table], limit: usize, mut f: F) -> usize
+fn inter_accumulate<F>(sets: &[&Set], limit: usize, mut f: F) -> usize
 where
     F: FnMut(&[u8]),
 {
@@ -181,13 +187,15 @@ where
     order.sort_unstable_by_key(|&i| sets[i].len());
     let (&first, rest) = order.split_first().expect("not empty");
 
+    let mut digits = [0u8; DIGITS_MAX];
     let mut seen = Elements::<u32>::with_capacity(sets[first].len());
-    for (name, _) in sets[first].iter() {
-        seen.insert(name, 1).expect("no larger than its source");
+    for m in sets[first].iter() {
+        seen.insert(text(m, &mut digits), 1)
+            .expect("no larger than its source");
     }
     for &i in rest {
-        for (name, _) in sets[i].iter() {
-            if let Some(count) = seen.get_mut(name) {
+        for m in sets[i].iter() {
+            if let Some(count) = seen.get_mut(text(m, &mut digits)) {
                 *count += 1;
             }
         }
@@ -197,7 +205,8 @@ where
     // the order the caller sees does not depend on which plan ran.
     let k = sets.len() as u32;
     let mut found = 0usize;
-    for (name, _) in sets[first].iter() {
+    for m in sets[first].iter() {
+        let name = text(m, &mut digits);
         if seen.get(name) == Some(&k) {
             f(name);
             found += 1;
@@ -209,22 +218,42 @@ where
     found
 }
 
+/// A member as the bytes a table keys on.
+///
+/// The counting plan and the union never ask another set a question, so they
+/// want a member's bytes and nothing else. Going through a [`Needle`] would
+/// parse and hash for nobody, since the table they are about to touch hashes it
+/// again on the way in.
+#[inline]
+fn text<'a>(m: crate::set::Member<'a>, digits: &'a mut [u8; DIGITS_MAX]) -> &'a [u8] {
+    match m {
+        crate::set::Member::Str(s) => s,
+        crate::set::Member::Int(n) => yo_common::num::i64_digits(digits, n),
+    }
+}
+
 /// Every member of any of the sets, each once, in the order they are met.
 ///
 /// There is no plan to choose here. A union has to read every member of every
 /// set whatever it does, so the only question is what it does with each one, and
 /// the answer is one insertion into a table that is also the duplicate check.
-pub fn union<F>(sets: &[&Table], mut f: F) -> usize
+pub fn union<F>(sets: &[&Set], mut f: F) -> usize
 where
     F: FnMut(&[u8]),
 {
     // The result is at most everything, and presizing to the largest input is
     // the cheap half of that bound without pretending to know the overlap.
     let biggest = sets.iter().map(|s| s.len()).max().unwrap_or(0);
+    let mut digits = [0u8; DIGITS_MAX];
     let mut seen = Elements::<()>::with_capacity(biggest);
     let mut found = 0usize;
     for s in sets {
-        for (name, _) in s.iter() {
+        for m in s.iter() {
+            // The bytes are the duplicate check, which is what makes the same
+            // member found in two representations one member: an intset's 42
+            // and a table's `42` key the same, and `042` keys as itself,
+            // because that is the same rule that decided how each was stored.
+            let name = text(m, &mut digits);
             if seen.insert(name, ()).is_ok_and(|was| was.is_none()) {
                 f(name);
                 found += 1;
@@ -240,7 +269,7 @@ where
 /// walked whether we like it or not, so the only choice is how each member is
 /// checked, and a member that is in the second set is never asked about the
 /// third.
-pub fn diff<F>(sets: &[&Table], mut f: F) -> usize
+pub fn diff<F>(sets: &[&Set], mut f: F) -> usize
 where
     F: FnMut(&[u8]),
 {
@@ -250,11 +279,12 @@ where
     let mut order: Vec<usize> = (0..rest.len()).collect();
     order.sort_unstable_by_key(|&i| rest[i].len());
 
+    let mut digits = [0u8; DIGITS_MAX];
     let mut found = 0usize;
-    for (name, _) in first.iter() {
-        let h = Table::hash_of(name);
-        if !order.iter().any(|&i| rest[i].contains_hashed(h, name)) {
-            f(name);
+    for m in first.iter() {
+        let needle = Needle::of(m, &mut digits);
+        if !order.iter().any(|&i| rest[i].has(&needle)) {
+            f(needle.bytes());
             found += 1;
         }
     }
@@ -267,10 +297,33 @@ where
 /// for an intersection or a difference and the sum for a union. Y18's rule, and
 /// the thing that stopped aki's `*STORE` family at 0.30x was that it was not
 /// applied.
-pub fn collect(upper: usize, run: impl FnOnce(&mut dyn FnMut(&[u8]))) -> Table {
-    let mut out = Elements::<()>::with_capacity(upper);
-    run(&mut |name| {
-        out.insert(name, ()).expect("presized to an upper bound");
+///
+/// Nothing comes back when nothing was found, because an empty set is not a
+/// thing that can exist. That is not a tidy up either: `SINTERSTORE d a b` with
+/// an empty intersection deletes `d` and answers zero, so the caller needs the
+/// difference between a set of no members and no set, and this is where it is.
+///
+/// The result picks its own representation from its first member and `upper`,
+/// through the same [`Set::with_hint`] `SADD` uses, so intersecting two intsets
+/// stores an intset rather than storing a table that happens to hold digits.
+/// The members arrive as bytes and that is enough to decide it, because the
+/// rule that made a member an integer on the way in is the rule that reads it
+/// as one on the way out.
+pub fn collect(
+    upper: usize,
+    limits: &Limits,
+    run: impl FnOnce(&mut dyn FnMut(&[u8])),
+) -> Option<Set> {
+    let mut out: Option<Set> = None;
+    run(&mut |name| match &mut out {
+        Some(s) => {
+            s.add(name, limits);
+        }
+        None => {
+            let mut s = Set::with_hint(name, upper, limits);
+            s.add(name, limits);
+            out = Some(s);
+        }
     });
     out
 }
@@ -278,14 +331,48 @@ pub fn collect(upper: usize, run: impl FnOnce(&mut dyn FnMut(&[u8]))) -> Table {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::set::Encoding;
 
-    fn set(members: &[&str]) -> Table {
-        let mut s = Elements::new();
+    /// A set holding these members, in whatever representation it picks.
+    fn set(members: &[&str]) -> Set {
+        of(members.iter().map(|m| m.as_bytes()))
+    }
+
+    /// The same from bytes, for the members that are not text.
+    fn of<'a>(members: impl IntoIterator<Item = &'a [u8]>) -> Set {
+        let mut s = Set::new();
         for m in members {
-            s.insert(m.as_bytes(), ()).expect("room");
+            s.add(m, &Limits::DEFAULT);
         }
         s
     }
+
+    /// A set forced past a band, so that a test can pick which representation
+    /// its operands are in rather than take whatever the member count gives.
+    fn banded(members: &[&str], limits: &Limits) -> Set {
+        let mut s = Set::new();
+        for m in members {
+            s.add(m.as_bytes(), limits);
+        }
+        s
+    }
+
+    /// Limits that put a set of any size in each of the three bands.
+    const AS_INTSET: Limits = Limits {
+        max_intset_entries: usize::MAX,
+        max_listpack_entries: usize::MAX,
+        max_listpack_value: usize::MAX,
+    };
+    const AS_LISTPACK: Limits = Limits {
+        max_intset_entries: 0,
+        max_listpack_entries: usize::MAX,
+        max_listpack_value: usize::MAX,
+    };
+    const AS_TABLE: Limits = Limits {
+        max_intset_entries: 0,
+        max_listpack_entries: 0,
+        max_listpack_value: 0,
+    };
 
     fn run<F>(op: F) -> Vec<String>
     where
@@ -337,7 +424,7 @@ mod tests {
     /// when a set grows past a threshold it cannot see.
     #[test]
     fn both_plans_give_the_same_answer_in_the_same_order() {
-        let sets: Vec<Table> = (0..9)
+        let sets: Vec<Set> = (0..9)
             .map(|s| {
                 let members: Vec<String> = (0..200)
                     .filter(|i| i % (s + 2) != 1)
@@ -346,7 +433,7 @@ mod tests {
                 set(&members.iter().map(String::as_str).collect::<Vec<_>>())
             })
             .collect();
-        let refs: Vec<&Table> = sets.iter().collect();
+        let refs: Vec<&Set> = sets.iter().collect();
 
         let probed = run(|f| inter_with(Plan::Probe, &refs, 0, f));
         let piled = run(|f| inter_with(Plan::Accumulate, &refs, 0, f));
@@ -386,8 +473,8 @@ mod tests {
     fn the_plans_agree_where_every_set_holds_everything() {
         let members: Vec<String> = (0..100).map(|i| format!("m{i}")).collect();
         let names: Vec<&str> = members.iter().map(String::as_str).collect();
-        let sets: Vec<Table> = (0..10).map(|_| set(&names)).collect();
-        let refs: Vec<&Table> = sets.iter().collect();
+        let sets: Vec<Set> = (0..10).map(|_| set(&names)).collect();
+        let refs: Vec<&Set> = sets.iter().collect();
 
         let probed = run(|f| inter_with(Plan::Probe, &refs, 0, f));
         assert_eq!(probed, members, "everything is in all ten");
@@ -399,26 +486,113 @@ mod tests {
     fn a_store_form_builds_a_set_of_the_result() {
         let a = set(&["a", "b", "c"]);
         let b = set(&["b", "c", "d"]);
-        let out = collect(a.len().min(b.len()), |f| {
+        let out = collect(a.len().min(b.len()), &Limits::DEFAULT, |f| {
             inter(&[&a, &b], 0, f);
-        });
+        })
+        .expect("two members is a set");
         assert_eq!(out.len(), 2);
         assert!(out.contains(b"b") && out.contains(b"c"));
         assert!(!out.contains(b"a"));
+    }
+
+    /// A result of nothing is no set at all, which is the difference the STORE
+    /// forms need: an empty intersection deletes the destination rather than
+    /// leaving an empty set behind that EXISTS would answer one for.
+    #[test]
+    fn a_store_form_of_nothing_is_nothing() {
+        let a = set(&["a"]);
+        let b = set(&["b"]);
+        assert!(
+            collect(1, &Limits::DEFAULT, |f| {
+                inter(&[&a, &b], 0, f);
+            })
+            .is_none()
+        );
+    }
+
+    /// The destination picks its own representation from what went into it, so
+    /// intersecting two intsets stores an intset and not a table of digits.
+    #[test]
+    fn a_store_form_keeps_the_representation_its_members_deserve() {
+        let a = set(&["1", "2", "3"]);
+        let b = set(&["2", "3", "4"]);
+        assert_eq!(a.encoding(), Encoding::Intset);
+        let out = collect(3, &Limits::DEFAULT, |f| {
+            inter(&[&a, &b], 0, f);
+        })
+        .expect("two members");
+        assert_eq!(out.encoding(), Encoding::Intset);
+        assert!(out.contains(b"2") && out.contains(b"3"));
+
+        // And a union with one string in it does not, because one member that
+        // is not a number is all it takes.
+        let c = set(&["x"]);
+        let out = collect(4, &Limits::DEFAULT, |f| {
+            union(&[&a, &c], f);
+        })
+        .expect("four members");
+        assert_ne!(out.encoding(), Encoding::Intset);
+        assert!(out.contains(b"1") && out.contains(b"x"));
+    }
+
+    /// The one that could not have worked before this: an intset member is a
+    /// number with no digits anywhere and a table stores that same member as
+    /// its digits, so every pairing of the three representations has to agree
+    /// about what a member is or the answers come back empty.
+    #[test]
+    fn the_three_representations_intersect_each_other() {
+        let names = ["1", "2", "3", "4"];
+        let others = ["3", "4", "5", "6"];
+        let bands = [
+            ("intset", AS_INTSET),
+            ("listpack", AS_LISTPACK),
+            ("table", AS_TABLE),
+        ];
+        for (ln, left) in bands {
+            for (rn, right) in bands {
+                let a = banded(&names, &left);
+                let b = banded(&others, &right);
+                let mut got = run(|f| inter(&[&a, &b], 0, f));
+                got.sort();
+                assert_eq!(got, ["3", "4"], "{ln} against {rn}");
+
+                let mut got = run(|f| union(&[&a, &b], f));
+                got.sort();
+                assert_eq!(got, ["1", "2", "3", "4", "5", "6"], "{ln} with {rn}");
+
+                let mut got = run(|f| diff(&[&a, &b], f));
+                got.sort();
+                assert_eq!(got, ["1", "2"], "{ln} without {rn}");
+            }
+        }
+    }
+
+    /// A member that looks like a number and a member that does not quite are
+    /// two different members, and which one a set stored is decided by the same
+    /// rule the algebra reads it back by.
+    #[test]
+    fn a_number_and_its_untidy_spelling_stay_two_members() {
+        let a = banded(&["42", "042", "-0"], &AS_LISTPACK);
+        let b = banded(&["42"], &AS_INTSET);
+        assert_eq!(run(|f| inter(&[&a, &b], 0, f)), vec!["42"]);
+        let mut got = run(|f| diff(&[&a, &b], f));
+        got.sort();
+        assert_eq!(got, ["-0", "042"]);
+        let mut got = run(|f| union(&[&a, &b], f));
+        got.sort();
+        assert_eq!(
+            got,
+            ["-0", "042", "42"],
+            "and the union does not merge them"
+        );
     }
 
     /// The members are the same bytes whatever they contain, and a set holds
     /// arbitrary bytes rather than text.
     #[test]
     fn members_that_are_not_text_work_the_same() {
-        let mut a = Table::new();
-        let mut b = Table::new();
-        for m in [&b"\x00\xff"[..], b"\xc3\x28", b""] {
-            a.insert(m, ()).expect("room");
-        }
-        for m in [&b"\xc3\x28"[..], b""] {
-            b.insert(m, ()).expect("room");
-        }
+        let a = of([&b"\x00\xff"[..], b"\xc3\x28", b""]);
+        let b = of([&b"\xc3\x28"[..], b""]);
         let mut got: Vec<Vec<u8>> = Vec::new();
         let n = inter(&[&a, &b], 0, |m| got.push(m.to_vec()));
         assert_eq!(n, 2);
