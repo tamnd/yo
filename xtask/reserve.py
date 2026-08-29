@@ -1857,14 +1857,27 @@ Pod::Spec.new do |s|
   s.source       = {{ :git => "{SWIFT_REPO}.git", :tag => s.version.to_s }}
   s.source_files = "Sources/Yodb/**/*.swift"
 
-  # Mirrors Package.swift. A podspec that claimed a lower floor than the package
-  # would be a second answer to the same question, and the two would drift.
+  # Two platforms, where Package.swift declares five. The floors that are here
+  # match it exactly; tvOS, watchOS and visionOS are absent, and that is a
+  # deliberate narrowing rather than a claim about the sources.
+  #
+  # `pod trunk push` runs `pod spec lint`, which builds an app against the pod
+  # once per declared platform and needs a simulator runtime for each. Only the
+  # iOS one is installed on the machine that publishes, the other three are
+  # about 25 GB, and there is no flag on `pod trunk push` to narrow the lint. So
+  # declaring five here means publishing nothing at all until that download
+  # happens, and a pod that exists on two platforms holds the name better than a
+  # pod that exists nowhere.
+  #
+  # What it costs: a CocoaPods user on tvOS is told this pod does not support
+  # their platform, when the sources build there fine and yo-swift's CI proves
+  # it on every commit against `generic/platform=` destinations that need no
+  # simulator. That is a divergence between the two ways in to one set of
+  # sources, and it is the reason this is written down rather than left to be
+  # noticed. It closes at the next wave, from a machine that has the runtimes.
   s.swift_versions            = ["6.0"]
   s.osx.deployment_target     = "14.0"
   s.ios.deployment_target     = "17.0"
-  s.tvos.deployment_target    = "17.0"
-  s.watchos.deployment_target = "10.0"
-  s.visionos.deployment_target = "1.0"
 end
 '''.lstrip())
 
@@ -1923,19 +1936,12 @@ do {
                   f"swift run 2>&1 | grep -qF {shlex.quote(raises)}"],
                  check_root),
             # Builds an app against the pod once per declared platform, which
-            # means a simulator runtime installed for each. This machine has
-            # only iOS, so tvOS, watchOS and visionOS stop here with "Could not
-            # find a `tvos` simulator" and the three runtimes are about 25 GB to
-            # fetch. `pod trunk push` runs the same lint and has no way to
-            # narrow it, so that is a real precondition for publishing and not
-            # just for checking.
-            #
-            # The podspec still declares all five, because Package.swift does
-            # and a podspec that quietly claimed fewer would be a second answer
-            # to the same question. Those four slices are built on every commit
-            # by yo-swift's own CI against `generic/platform=` destinations,
-            # which need no simulator at all, so the compile is proven; what is
-            # missing here is a second proof of it on this laptop.
+            # means a simulator runtime installed for each. That is why the
+            # podspec above declares two platforms and Package.swift declares
+            # five: this lint is not only the check, it is also the first half
+            # of `pod trunk push`, which runs it again server side and has no
+            # flag to narrow it. A platform named in the podspec is a platform
+            # the publishing machine must have a runtime for.
             Step("lint the podspec against the tag it points at", [
                 "pod", "spec", "lint", f"{row.name}.podspec", "--no-clean",
             ], root),
@@ -1960,6 +1966,12 @@ BUILDERS = {
 }
 
 # The credential each builder needs before it is worth starting.
+#
+# Every one of these is needed to publish. Some are needed earlier than that:
+# Maven signs during the build, and npm and Docker write a config file from
+# theirs before anything runs. `BUILD_NEEDS` below is the subset a run that
+# publishes nothing still cannot do without, and it is what a dry run is
+# checked against.
 NEEDS = {
     "crates.io": ["CARGO_REGISTRY_TOKEN"],
     "pypi": ["UV_PUBLISH_TOKEN"],
@@ -1972,10 +1984,28 @@ NEEDS = {
     "nuget": ["NUGET_API_KEY"],
     "docker-hub": ["DOCKERHUB_USERNAME", "DOCKERHUB_TOKEN"],
     # `pod` reads this one out of the environment by itself, so unlike npm and
-    # Docker nothing has to be written to disk for it. It is listed here so a run
-    # with an unverified trunk session stops before the lint rather than after
-    # it, since the lint is minutes of compiling for every platform.
+    # Docker nothing has to be written to disk for it.
     "cocoapods": ["COCOAPODS_TRUNK_TOKEN"],
+}
+
+# What a run without `--yes` genuinely cannot proceed without.
+#
+# This is not a convenience. Gating the dry run on the publish credential made
+# `apply <reg>` unusable in exactly the situation it is most wanted: before the
+# credential exists, when what you want to know is whether the package builds
+# and says the right thing. The CocoaPods podspec was narrowed from five
+# platforms to two and the narrowing could not be checked, because the trunk
+# session it does not need was unverified. A dry run publishes nothing, and
+# refusing to do it teaches the habit of reaching for `--yes` to find out.
+#
+# Anything absent from this table has an empty list, which is the common case.
+# Maven is here because `b_maven` signs the artifacts as part of the build and
+# fails at gpg rather than at the upload; npm and Docker are here because both
+# write an auth file before the first step runs.
+BUILD_NEEDS = {
+    "maven-central": ["MAVEN_GPG_KEY_ID", "MAVEN_GPG_PASSPHRASE"],
+    "npm": ["NPM_TOKEN"],
+    "docker-hub": ["DOCKERHUB_USERNAME", "DOCKERHUB_TOKEN"],
 }
 
 
@@ -1993,10 +2023,20 @@ def cmd_apply(args) -> int:
         )
         return 2
 
-    missing = [v for v in NEEDS[reg] if not os.environ.get(v)]
+    wanted = NEEDS[reg] if args.yes else BUILD_NEEDS.get(reg, [])
+    missing = [v for v in wanted if not os.environ.get(v)]
     if missing:
         print(f"missing credential(s): {', '.join(missing)}. Run `yoenv`.", file=sys.stderr)
         return 2
+
+    # Said once, up front, rather than discovered at the last step. A dry run
+    # that is going to be unpublishable when it finishes should say so before it
+    # spends the minutes, and it is still worth running: the build and the check
+    # are the parts that fail.
+    if not args.yes:
+        later = [v for v in NEEDS[reg] if not os.environ.get(v)]
+        if later:
+            print(f"note: {', '.join(later)} not set, so --yes would refuse this run.")
 
     # `free` is the normal precondition. Maven Central is the exception and it
     # is a documented one: Central publishes artifacts and does not expose
