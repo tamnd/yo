@@ -22,3 +22,7 @@ workspace = true
 [[bench]]
 name = "elem"
 harness = false
+
+[[bench]]
+name = "listpack"
+harness = false
