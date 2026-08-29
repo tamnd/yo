@@ -51,7 +51,7 @@ impl Counter {
     ///
     /// [`Code::Invalid`] if the key holds something that is not an integer.
     pub fn get(&self) -> Result<i64> {
-        self.db.run(|inner| match inner.strings.get(&self.key) {
+        self.db.run(|inner| match inner.strings.get(&self.key)? {
             Some(v) => v.as_int().ok_or_else(not_a_number),
             None => Ok(0),
         })

@@ -17,9 +17,9 @@
 
 use crate::cond::Compare;
 use crate::counter::{self, Counted, IncrEx, IncrExpire, Num};
-use crate::keyspace::Keyspace;
+use crate::keyspace::{Keyspace, wrong_type};
 use crate::lcs;
-use crate::value::{self, Encoding, Str};
+use crate::value::{self, Encoding, Kind, Str};
 use std::borrow::Cow;
 use yo_common::num::parse_f64;
 use yo_common::{Code, Error, Result};
@@ -184,9 +184,10 @@ impl Keyspace {
     // ---------------------------------------------------------------- reading
 
     /// `GET key`.
-    pub fn get(&mut self, key: &[u8]) -> Option<Str<'_>> {
+    pub fn get(&mut self, key: &[u8]) -> Result<Option<Str<'_>>> {
         self.reap(key);
-        self.peek(key)
+        self.string_only(key)?;
+        Ok(self.peek(key))
     }
 
     /// `MGET key [key ...]`.
@@ -202,9 +203,24 @@ impl Keyspace {
         keys.iter().map(|k| me.peek(k)).collect()
     }
 
+    /// One key of an `MGET`, which is nil rather than an error for a key that
+    /// holds another type.
+    ///
+    /// [`Keyspace::mget`] collects the whole answer into a `Vec` for a caller
+    /// that wants it in one piece. The wire wants the keys one at a time and in
+    /// order, and a `Vec` there would be an allocation per call on a thread that
+    /// must not allocate, so the dispatcher walks the keys itself and calls this
+    /// for each. It is not `get`, because `MGET` does not answer `WRONGTYPE`:
+    /// Redis gives nil for the odd key out rather than failing the ninety nine
+    /// good ones alongside it.
+    pub fn mget_one(&mut self, key: &[u8]) -> Option<Str<'_>> {
+        self.reap(key);
+        self.peek(key)
+    }
+
     /// `STRLEN key`, which is zero for a key that is not there.
-    pub fn strlen(&mut self, key: &[u8]) -> usize {
-        self.get(key).map_or(0, |v| v.len())
+    pub fn strlen(&mut self, key: &[u8]) -> Result<usize> {
+        Ok(self.get(key)?.map_or(0, |v| v.len()))
     }
 
     /// `EXISTS key`, for one key.
@@ -213,10 +229,19 @@ impl Keyspace {
         self.map.contains(key)
     }
 
-    /// `OBJECT ENCODING key`.
+    /// How a string is stored, which is `OBJECT ENCODING` for a string key.
+    ///
+    /// `None` for a key that is not there and for a key holding another type,
+    /// because the two encoding bits in a record only mean anything when the
+    /// record is the value. A set keeps its representation in its body, so
+    /// [`Keyspace::set_encoding`] asks the body, and
+    /// [`Keyspace::encoding_name`] is the command that routes between them.
     pub fn encoding(&mut self, key: &[u8]) -> Option<Encoding> {
         self.reap(key);
         let rec = self.map.get(key)?;
+        if value::kind(rec) != Kind::String {
+            return None;
+        }
         Some(value::Meta::from_byte(rec[0]).encoding())
     }
 
@@ -235,12 +260,13 @@ impl Keyspace {
     ///
     /// Borrowed for a string, owned for an integer, because an integer's digits
     /// do not exist anywhere until somebody asks for them.
-    pub fn getrange(&mut self, key: &[u8], start: i64, end: i64) -> Cow<'_, [u8]> {
+    pub fn getrange(&mut self, key: &[u8], start: i64, end: i64) -> Result<Cow<'_, [u8]>> {
         self.reap(key);
+        self.string_only(key)?;
         let Some(v) = self.peek(key) else {
-            return Cow::Borrowed(&[]);
+            return Ok(Cow::Borrowed(&[]));
         };
-        match v {
+        Ok(match v {
             Str::Bytes(b) => match range_of(b.len(), start, end) {
                 Some((s, e)) => Cow::Borrowed(&b[s..e]),
                 None => Cow::Borrowed(&[]),
@@ -252,7 +278,7 @@ impl Keyspace {
                     None => Cow::Owned(Vec::new()),
                 }
             }
-        }
+        })
     }
 
     // ---------------------------------------------------------------- writing
@@ -267,6 +293,12 @@ impl Keyspace {
     pub fn set(&mut self, key: &[u8], val: &[u8], opts: SetOptions<'_>) -> Result<SetOutcome> {
         check_len(key, val.len())?;
         self.reap(key);
+        if opts.get || opts.compare.is_some() {
+            // Plain `SET` overwrites whatever was there, but the forms that read
+            // the old value first cannot: there is nothing to hand back and
+            // nothing to compare against. Redis answers WRONGTYPE for both.
+            self.string_only(key)?;
+        }
 
         let present = self.map.get(key);
         let mut out = SetOutcome::default();
@@ -349,21 +381,23 @@ impl Keyspace {
     }
 
     /// `GETDEL key`.
-    pub fn getdel(&mut self, key: &[u8]) -> Option<Vec<u8>> {
+    pub fn getdel(&mut self, key: &[u8]) -> Result<Option<Vec<u8>>> {
         self.reap(key);
-        let had = self.map.get(key).map(|rec| value::read(rec).to_vec());
+        self.string_only(key)?;
+        let had = self.peek(key).map(|v| v.to_vec());
         if had.is_some() {
-            self.map.del(key);
+            self.drop_key(key);
         }
-        had
+        Ok(had)
     }
 
     /// `GETEX key [EX s|PX ms|EXAT s|PXAT ms|PERSIST]`.
     ///
     /// [`Expire::Keep`] is plain `GETEX`, which reads without touching the
     /// deadline, and [`Expire::Clear`] is `GETEX PERSIST`.
-    pub fn getex(&mut self, key: &[u8], expire: Expire) -> Option<Str<'_>> {
+    pub fn getex(&mut self, key: &[u8], expire: Expire) -> Result<Option<Str<'_>>> {
         self.reap(key);
+        self.string_only(key)?;
         if expire != Expire::Keep {
             let current = self.map.get(key).and_then(value::expire_at);
             let wanted = match expire {
@@ -380,13 +414,16 @@ impl Keyspace {
                 self.store(key, &bytes, wanted);
             }
         }
-        self.peek(key)
+        Ok(self.peek(key))
     }
 
     /// `DEL key`, for one key. Answers whether it was there.
+    ///
+    /// Any type, and it takes the body with it. `DEL` is the one command that
+    /// genuinely does not care what it is deleting.
     pub fn del(&mut self, key: &[u8]) -> bool {
         self.reap(key);
-        self.map.del(key)
+        self.drop_key(key)
     }
 
     /// `MSET key value [key value ...]`.
@@ -444,6 +481,7 @@ impl Keyspace {
     /// is Redis's behaviour: `APPEND` is not a fresh `SET`.
     pub fn append(&mut self, key: &[u8], tail: &[u8]) -> Result<usize> {
         self.reap(key);
+        self.string_only(key)?;
         let Some(rec) = self.map.get(key) else {
             check_len(key, tail.len())?;
             self.store(key, tail, None);
@@ -466,6 +504,7 @@ impl Keyspace {
     /// checks.
     pub fn setrange(&mut self, key: &[u8], offset: usize, val: &[u8]) -> Result<usize> {
         self.reap(key);
+        self.string_only(key)?;
         if val.is_empty() {
             return Ok(self.peek(key).map_or(0, |v| v.len()));
         }
@@ -533,6 +572,16 @@ impl Keyspace {
         let mut deadline: Option<u64> = None;
         let mut dead = false;
         if let Some(rec) = self.map.value_mut_hashed(hash, key) {
+            // The type check is inside the probe rather than in front of it,
+            // which is what the other writers do with `string_only`. The kind is
+            // three bits of the same byte the expiry flag is in, and that byte
+            // has already been loaded by the time this is asked, so here it is
+            // free. In front of the probe it measured at one and a half
+            // nanoseconds on a command that runs in eighteen, which is eight per
+            // cent of the number M2's gate is written against.
+            if value::kind(rec) != Kind::String {
+                return Err(wrong_type());
+            }
             if value::is_expired(rec, now) {
                 dead = true;
             } else {
@@ -555,7 +604,7 @@ impl Keyspace {
         }
 
         if dead {
-            self.map.del(key);
+            self.drop_key(key);
             self.expired += 1;
             deadline = None;
         }
@@ -577,6 +626,7 @@ impl Keyspace {
         // increment is not a float, and the check below is the one that says
         // it.
         self.reap(key);
+        self.string_only(key)?;
         let (current, deadline) = match self.map.get(key) {
             Some(rec) => {
                 let text = value::read(rec).to_vec();
@@ -660,7 +710,7 @@ impl Keyspace {
             Some(c) => c.holds(self.peek(key)),
             None => true,
         };
-        matches && self.map.del(key)
+        matches && self.drop_key(key)
     }
 
     /// `DIGEST key`, the XXH3 of the value.
@@ -668,9 +718,10 @@ impl Keyspace {
     /// Redis 8.4, and the reason it exists is `IFDEQ`: a client that wants to
     /// compare and swap against a large value sends eight bytes instead of the
     /// value. `None` is a key that is not there, which is a nil reply.
-    pub fn digest(&mut self, key: &[u8]) -> Option<u64> {
+    pub fn digest(&mut self, key: &[u8]) -> Result<Option<u64>> {
         self.reap(key);
-        self.peek(key).map(|v| v.digest())
+        self.string_only(key)?;
+        Ok(self.peek(key).map(|v| v.digest()))
     }
 
     /// `INCREX key [BYINT n|BYFLOAT f] [SATURATE] [LBOUND l] [UBOUND u]
@@ -693,6 +744,7 @@ impl Keyspace {
     pub fn increx(&mut self, key: &[u8], opts: IncrEx) -> Result<Counted> {
         check_len(key, 0)?;
         self.reap(key);
+        self.string_only(key)?;
 
         let (current, had_deadline) = match self.map.get(key) {
             Some(rec) => {
@@ -750,13 +802,13 @@ impl Keyspace {
     /// A key that is not there is the empty string, which is Redis's reading and
     /// not an error.
     pub fn lcs(&mut self, a: &[u8], b: &[u8]) -> Result<Vec<u8>> {
-        let (x, y) = self.both(a, b);
+        let (x, y) = self.both(a, b)?;
         lcs::string(&x, &y)
     }
 
     /// `LCS key1 key2 LEN`.
     pub fn lcs_len(&mut self, a: &[u8], b: &[u8]) -> Result<usize> {
-        let (x, y) = self.both(a, b);
+        let (x, y) = self.both(a, b)?;
         lcs::len(&x, &y)
     }
 
@@ -766,7 +818,7 @@ impl Keyspace {
     /// its length attached. Whether that length reaches the client is the reply
     /// writer's decision and not the store's.
     pub fn lcs_idx(&mut self, a: &[u8], b: &[u8], minmatchlen: u32) -> Result<lcs::Idx> {
-        let (x, y) = self.both(a, b);
+        let (x, y) = self.both(a, b)?;
         lcs::idx(&x, &y, minmatchlen)
     }
 
@@ -777,44 +829,72 @@ impl Keyspace {
     /// product of the two lengths, so a pair of copies is not what makes it
     /// expensive, and borrowing both at once through a `&mut self` reap is a
     /// fight with the borrow checker for no measurable gain.
-    fn both(&mut self, a: &[u8], b: &[u8]) -> (Vec<u8>, Vec<u8>) {
+    fn both(&mut self, a: &[u8], b: &[u8]) -> Result<(Vec<u8>, Vec<u8>)> {
         self.reap(a);
         self.reap(b);
+        self.string_only(a)?;
+        self.string_only(b)?;
         let x = self.peek(a).map(|v| v.to_vec()).unwrap_or_default();
         let y = self.peek(b).map(|v| v.to_vec()).unwrap_or_default();
-        (x, y)
+        Ok((x, y))
     }
 
     // ---------------------------------------------------------------- private
 
-    /// The value under `key` without reaping first.
+    /// The string under `key` without reaping first.
     ///
     /// Every public read reaps before calling this, so a caller that skips the
     /// reap would be reading a value the clock says is gone.
+    ///
+    /// A key holding something else answers `None` and not the first few bytes
+    /// of a slab number read as a string. That is the right answer for `MGET`,
+    /// which Redis documents as giving nil for a key of the wrong type rather
+    /// than failing the whole command, and it is not the right answer for `GET`,
+    /// which is why the readers that owe a `WRONGTYPE` ask
+    /// [`Keyspace::string_only`] first.
     #[inline]
     fn peek(&self, key: &[u8]) -> Option<Str<'_>> {
-        Some(value::read(self.map.get(key)?))
+        let rec = self.map.get(key)?;
+        if value::kind(rec) != Kind::String {
+            return None;
+        }
+        Some(value::read(rec))
     }
 
-    /// Drop `key` if its deadline has passed.
+    /// Fail with `WRONGTYPE` if `key` holds something that is not a string.
     ///
-    /// This is lazy expiry and it is half of the story. The other half is the
-    /// active cycle in the maintenance slice, which is what stops a key nobody
-    /// ever reads again from holding its memory forever (`14` section 1).
+    /// A missing key passes, because every string command treats a missing key
+    /// as an empty one and none of them care what type it is not.
+    ///
+    /// The early return is the point. A database with no sets, no hashes and no
+    /// lists in it cannot be holding the wrong type under any key, so the check
+    /// is one branch on a counter this struct already has in cache, and no
+    /// lookup at all. Once one set exists every string command pays a lookup it
+    /// did not pay before, which is the cost of being able to say no.
+    ///
+    /// [`Keyspace::count`] does not use this and reads the kind out of the
+    /// record its own probe returned instead. Both are correct and the reason
+    /// for the difference is measured rather than stylistic: `INCR` runs in
+    /// eighteen nanoseconds and the branch here cost it one and a half of them,
+    /// where inside the probe the byte is already loaded and it costs nothing.
+    /// Every other writer is long enough that it does not show, so they take the
+    /// version that reads as one line.
     #[inline]
-    fn reap(&mut self, key: &[u8]) {
-        let now = self.clock.now_ms();
-        let dead = self.map.get(key).is_some_and(|r| value::is_expired(r, now));
-        if dead {
-            self.map.del(key);
-            self.expired += 1;
+    fn string_only(&self, key: &[u8]) -> Result<()> {
+        if self.bodies == 0 {
+            return Ok(());
+        }
+        match self.map.get(key) {
+            Some(rec) if value::kind(rec) != Kind::String => Err(wrong_type()),
+            _ => Ok(()),
         }
     }
 
     /// Store `val` under `key`, choosing the encoding from the bytes.
-    fn store(&mut self, key: &[u8], val: &[u8], deadline: Option<u64>) {
+    pub(crate) fn store(&mut self, key: &[u8], val: &[u8], deadline: Option<u64>) {
         let enc = Encoding::of(val);
         let len = value::record_len(enc, val.len(), deadline.is_some());
+        self.free_body(key);
         self.map.set_with(key, len, |out| {
             value::write_record(out, enc, val, deadline);
         });
@@ -834,6 +914,7 @@ impl Keyspace {
             Encoding::Raw
         };
         let len = value::record_len(enc, val.len(), deadline.is_some());
+        self.free_body(key);
         self.map.set_with(key, len, |out| {
             value::write_record(out, enc, val, deadline);
         });
@@ -847,6 +928,7 @@ impl Keyspace {
     /// on exactly that.
     fn store_raw(&mut self, key: &[u8], val: &[u8], deadline: Option<u64>) {
         let len = value::record_len(Encoding::Raw, val.len(), deadline.is_some());
+        self.free_body(key);
         self.map.set_with(key, len, |out| {
             value::write_record(out, Encoding::Raw, val, deadline);
         });
@@ -855,6 +937,7 @@ impl Keyspace {
     /// Store an integer the caller already has, without formatting it first.
     fn store_int(&mut self, key: &[u8], n: i64, deadline: Option<u64>) {
         let len = value::record_len(Encoding::Int, 0, deadline.is_some());
+        self.free_body(key);
         self.map.set_with(key, len, |out| {
             value::write_int_record(out, n, deadline);
         });
@@ -881,8 +964,12 @@ fn step(n: i64, by: i64, subtract: bool) -> Result<i64> {
 }
 
 /// Refuse a key or a value this band cannot hold.
+///
+/// Not string only. The key limit is the keyspace's and applies to every type,
+/// and a set member is held the same way a string is, so [`crate::sets`] checks
+/// against this rather than growing a second copy of the same two numbers.
 #[inline]
-fn check_len(key: &[u8], len: usize) -> Result<()> {
+pub(crate) fn check_len(key: &[u8], len: usize) -> Result<()> {
     if key.len() > KEY_MAX {
         return Err(Error::new(Code::Full, KEY_TOO_LONG));
     }
@@ -936,7 +1023,9 @@ mod tests {
     }
 
     fn got(s: &mut Keyspace, key: &[u8]) -> Option<Vec<u8>> {
-        s.get(key).map(|v| v.to_vec())
+        s.get(key)
+            .expect("a string in these tests")
+            .map(|v| v.to_vec())
     }
 
     #[test]
@@ -945,7 +1034,7 @@ mod tests {
         assert_eq!(got(&mut s, b"k"), None);
         s.set_plain(b"k", b"hello").unwrap();
         assert_eq!(got(&mut s, b"k").as_deref(), Some(&b"hello"[..]));
-        assert_eq!(s.strlen(b"k"), 5);
+        assert_eq!(s.strlen(b"k").expect("a string"), 5);
         assert_eq!(s.len(), 1);
         s.set_plain(b"k", b"bye").unwrap();
         assert_eq!(got(&mut s, b"k").as_deref(), Some(&b"bye"[..]));
@@ -1115,26 +1204,40 @@ mod tests {
             .unwrap();
         // Plain GETEX leaves the deadline alone.
         assert_eq!(
-            s.getex(b"k", Expire::Keep).map(|v| v.to_vec()).as_deref(),
+            s.getex(b"k", Expire::Keep)
+                .expect("a string")
+                .map(|v| v.to_vec())
+                .as_deref(),
             Some(&b"v"[..])
         );
         assert_eq!(s.expire_at(b"k"), Some(5_000));
         // PERSIST clears it.
-        assert!(s.getex(b"k", Expire::Clear).is_some());
+        assert!(s.getex(b"k", Expire::Clear).expect("a string").is_some());
         assert_eq!(s.expire_at(b"k"), None);
         // And a new deadline replaces it.
-        assert!(s.getex(b"k", Expire::At(7_000)).is_some());
+        assert!(
+            s.getex(b"k", Expire::At(7_000))
+                .expect("a string")
+                .is_some()
+        );
         assert_eq!(s.expire_at(b"k"), Some(7_000));
         assert_eq!(got(&mut s, b"k").as_deref(), Some(&b"v"[..]));
-        assert!(s.getex(b"missing", Expire::At(7_000)).is_none());
+        assert!(
+            s.getex(b"missing", Expire::At(7_000))
+                .expect("a string")
+                .is_none()
+        );
     }
 
     #[test]
     fn getdel_hands_the_value_over_and_keeps_nothing() {
         let mut s = store();
         s.set_plain(b"k", b"v").unwrap();
-        assert_eq!(s.getdel(b"k").as_deref(), Some(&b"v"[..]));
-        assert_eq!(s.getdel(b"k"), None);
+        assert_eq!(
+            s.getdel(b"k").expect("a string").as_deref(),
+            Some(&b"v"[..])
+        );
+        assert_eq!(s.getdel(b"k").expect("a string"), None);
         assert_eq!(s.len(), 0);
         s.set_plain(b"k", b"v").unwrap();
         assert!(s.del(b"k"));
@@ -1207,18 +1310,21 @@ mod tests {
     fn getrange_counts_from_both_ends_and_clamps() {
         let mut s = store();
         s.set_plain(b"k", b"This is a string").unwrap();
-        assert_eq!(&*s.getrange(b"k", 0, 3), b"This");
-        assert_eq!(&*s.getrange(b"k", -3, -1), b"ing");
-        assert_eq!(&*s.getrange(b"k", 0, -1), b"This is a string");
-        assert_eq!(&*s.getrange(b"k", 10, 100), b"string");
+        assert_eq!(&*s.getrange(b"k", 0, 3).expect("a string"), b"This");
+        assert_eq!(&*s.getrange(b"k", -3, -1).expect("a string"), b"ing");
+        assert_eq!(
+            &*s.getrange(b"k", 0, -1).expect("a string"),
+            b"This is a string"
+        );
+        assert_eq!(&*s.getrange(b"k", 10, 100).expect("a string"), b"string");
         // A start past the end, and a range that runs backwards, are both empty.
-        assert_eq!(&*s.getrange(b"k", 100, 200), b"");
-        assert_eq!(&*s.getrange(b"k", 5, 2), b"");
-        assert_eq!(&*s.getrange(b"missing", 0, -1), b"");
+        assert_eq!(&*s.getrange(b"k", 100, 200).expect("a string"), b"");
+        assert_eq!(&*s.getrange(b"k", 5, 2).expect("a string"), b"");
+        assert_eq!(&*s.getrange(b"missing", 0, -1).expect("a string"), b"");
         // An int encoded value ranges over its digits.
         s.set_plain(b"n", b"12345").unwrap();
-        assert_eq!(&*s.getrange(b"n", 1, 3), b"234");
-        assert_eq!(&*s.getrange(b"n", 9, 9), b"");
+        assert_eq!(&*s.getrange(b"n", 1, 3).expect("a string"), b"234");
+        assert_eq!(&*s.getrange(b"n", 9, 9).expect("a string"), b"");
     }
 
     #[test]
@@ -1360,7 +1466,7 @@ mod tests {
     fn exists_and_strlen_agree_with_get() {
         let mut s = store();
         assert!(!s.exists(b"k"));
-        assert_eq!(s.strlen(b"k"), 0);
+        assert_eq!(s.strlen(b"k").expect("a string"), 0);
         s.set(
             b"k",
             b"12345",
@@ -1368,10 +1474,10 @@ mod tests {
         )
         .unwrap();
         assert!(s.exists(b"k"));
-        assert_eq!(s.strlen(b"k"), 5);
+        assert_eq!(s.strlen(b"k").expect("a string"), 5);
         s.clock_mut().set(2_000);
         assert!(!s.exists(b"k"));
-        assert_eq!(s.strlen(b"k"), 0);
+        assert_eq!(s.strlen(b"k").expect("a string"), 0);
     }
 
     #[test]
@@ -1465,7 +1571,7 @@ mod tests {
                 .stored
         );
         // The digest forms are the value forms with the value hashed.
-        let d = s.digest(b"m").expect("just written");
+        let d = s.digest(b"m").expect("a string").expect("just written");
         assert_eq!(d, yo_common::xxh3::hash64(b"v"));
         assert!(
             !s.set(b"m", b"x", SetOptions::PLAIN.if_not_digest(d))
@@ -1478,8 +1584,8 @@ mod tests {
                 .stored
         );
         assert_eq!(got(&mut s, b"m").as_deref(), Some(&b"x"[..]));
-        assert_eq!(s.digest(b"gone"), None);
-        let d = s.digest(b"m").expect("still there");
+        assert_eq!(s.digest(b"gone").expect("a string"), None);
+        let d = s.digest(b"m").expect("a string").expect("still there");
         assert!(s.delex(b"m", Some(Compare::DigestEqual(d))));
     }
 

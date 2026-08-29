@@ -101,7 +101,7 @@ impl Strings {
         f: impl FnOnce(Str<'_>) -> R,
     ) -> Result<Option<R>> {
         self.db
-            .run(|inner| Ok(inner.strings.get(key.as_ref()).map(f)))
+            .run(|inner| Ok(inner.strings.get(key.as_ref())?.map(f)))
     }
 
     /// Whether a key is there and has not expired.
@@ -120,7 +120,7 @@ impl Strings {
     ///
     /// As [`Strings::get`].
     pub fn len_of(&self, key: impl AsRef<[u8]>) -> Result<usize> {
-        self.db.run(|inner| Ok(inner.strings.strlen(key.as_ref())))
+        self.db.run(|inner| inner.strings.strlen(key.as_ref()))
     }
 
     /// Store a value, clearing any deadline the key had. Plain `SET`.
@@ -214,7 +214,7 @@ impl Strings {
     ///
     /// As [`Strings::get`].
     pub fn take(&self, key: impl AsRef<[u8]>) -> Result<Option<Vec<u8>>> {
-        self.db.run(|inner| Ok(inner.strings.getdel(key.as_ref())))
+        self.db.run(|inner| inner.strings.getdel(key.as_ref()))
     }
 
     /// Remove a key, and say whether it was there. `DEL`.
@@ -262,7 +262,7 @@ impl Strings {
         self.db.run(|inner| {
             Ok(keys
                 .iter()
-                .map(|k| inner.strings.get(k.as_ref()).map(|v| v.to_vec()))
+                .map(|k| inner.strings.mget_one(k.as_ref()).map(|v| v.to_vec()))
                 .collect())
         })
     }

@@ -51,7 +51,7 @@ const LEN_AND_IDX: &str = "If you want both the length and indexes, please just 
 /// stored in the [`Spec`], which does not change any of the bodies.
 pub(super) fn execute(db: &mut Keyspace, spec: &Spec, args: Args<'_>, out: &mut Out) -> Result<()> {
     match spec.name {
-        "get" => match db.get(args.get(1)) {
+        "get" => match db.get(args.get(1))? {
             Some(v) => write_str(out, v),
             None => out.nil(),
         },
@@ -60,7 +60,7 @@ pub(super) fn execute(db: &mut Keyspace, spec: &Spec, args: Args<'_>, out: &mut 
             Some(v) => out.bulk(&v),
             None => out.nil(),
         },
-        "getdel" => match db.getdel(args.get(1)) {
+        "getdel" => match db.getdel(args.get(1))? {
             Some(v) => out.bulk(&v),
             None => out.nil(),
         },
@@ -90,14 +90,14 @@ pub(super) fn execute(db: &mut Keyspace, spec: &Spec, args: Args<'_>, out: &mut 
             // would be an allocation per call on a thread that must not.
             out.array(args.len() - 1);
             for i in 1..args.len() {
-                match db.get(args.get(i)) {
+                match db.mget_one(args.get(i)) {
                     Some(v) => write_str(out, v),
                     None => out.nil(),
                 }
             }
         }
         "append" => out.int(count(db.append(args.get(1), args.get(2))?)),
-        "strlen" => out.int(count(db.strlen(args.get(1)))),
+        "strlen" => out.int(count(db.strlen(args.get(1))?)),
         "setrange" => {
             let offset =
                 usize::try_from(args.int(2)?).map_err(|_| Error::new(Code::Invalid, BAD_OFFSET))?;
@@ -107,7 +107,7 @@ pub(super) fn execute(db: &mut Keyspace, spec: &Spec, args: Args<'_>, out: &mut 
         // still ships both as separate entries in its table.
         "getrange" | "substr" => {
             let (start, end) = (args.int(2)?, args.int(3)?);
-            out.bulk(&db.getrange(args.get(1), start, end));
+            out.bulk(&db.getrange(args.get(1), start, end)?);
         }
         "incr" => out.int(db.incr(args.get(1))?),
         "decr" => out.int(db.decr(args.get(1))?),
@@ -119,7 +119,7 @@ pub(super) fn execute(db: &mut Keyspace, spec: &Spec, args: Args<'_>, out: &mut 
         "lcs" => lcs(db, args, out)?,
         "msetex" => msetex(db, args, out)?,
         "delex" => delex(db, args, out)?,
-        "digest" => match db.digest(args.get(1)) {
+        "digest" => match db.digest(args.get(1))? {
             Some(h) => out.bulk(&xxh3::hex(h)),
             None => out.nil(),
         },
@@ -417,7 +417,7 @@ fn getex(db: &mut Keyspace, args: Args<'_>, out: &mut Out) -> Result<()> {
         None if seen & bits::PERSIST != 0 => Expire::Clear,
         None => Expire::Keep,
     };
-    match db.getex(key, wanted) {
+    match db.getex(key, wanted)? {
         Some(v) => write_str(out, v),
         None => out.nil(),
     }

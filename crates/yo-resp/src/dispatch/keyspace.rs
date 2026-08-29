@@ -13,7 +13,8 @@
 //!
 //! `TYPE` reads the tag in the record's meta byte, so it answers whatever the
 //! key actually holds and does not grow a case each time a type lands. Today
-//! that is `string` or `none`, because a string is all there is to hold.
+//! that is `string`, `set` or `none`, and the day the hash lands it is `hash`
+//! too without a line here changing.
 
 use super::args::Args;
 use super::table::Spec;

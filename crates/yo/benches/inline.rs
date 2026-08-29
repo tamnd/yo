@@ -60,7 +60,12 @@ fn bench_get(c: &mut Criterion) {
     g.bench_function("store", |b| {
         b.iter(|| {
             at = (at + 1) & 63;
-            black_box(store.get(sample[at].as_bytes()).map(|v| v.len()))
+            black_box(
+                store
+                    .get(sample[at].as_bytes())
+                    .expect("a string")
+                    .map(|v| v.len()),
+            )
         });
     });
 
