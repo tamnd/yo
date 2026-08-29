@@ -1071,6 +1071,22 @@ pub static COMMANDS: &[Spec] = &[
         summary: "What kind of value is under a key, or none.",
         group: "keyspace",
     },
+    // A container command, so no keys and no flags of its own: the key is the
+    // subcommand's and a real server reports it on `object|encoding` rather
+    // than here. `@slow` is the whole ACL, checked against 8.10.1.
+    Spec {
+        name: "object",
+        arity: -2,
+        flags: &[],
+        first_key: 0,
+        last_key: 0,
+        step: 0,
+        acl: &["@slow"],
+        since: "2.2.3",
+        complexity: "O(1)",
+        summary: "Look at the machinery under a key rather than at its value.",
+        group: "keyspace",
+    },
     // ----------------------------------------------------------- scripting
     // Both are containers with no flags and no keys of their own, which is what
     // a real 8.10.1 reports: the flags live on the subcommands.

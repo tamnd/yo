@@ -1008,13 +1008,13 @@ mod tests {
         assert_eq!(d.hash_encoding(b"h"), Some(Encoding::Listpack));
         assert_eq!(d.encoding_name(b"h"), Some("listpack"));
 
-        for i in 0..200u32 {
+        for i in 0..600u32 {
             let f = format!("field-{i}");
             set(&mut d, b"h", &[(f.as_bytes(), b"v")]);
         }
         assert_eq!(d.hash_encoding(b"h"), Some(Encoding::Hashtable));
         assert_eq!(d.encoding_name(b"h"), Some("hashtable"));
-        assert_eq!(d.hlen(b"h").expect("ok"), 201);
+        assert_eq!(d.hlen(b"h").expect("ok"), 601);
         assert_eq!(
             d.hash_encoding(b"missing"),
             None,
@@ -1273,12 +1273,12 @@ mod tests {
     #[test]
     fn a_hash_that_never_expires_a_field_is_untouched_by_all_of_this() {
         let mut d = db();
-        for i in 0..300u32 {
+        for i in 0..600u32 {
             set(&mut d, b"h", &[(format!("f{i}").as_bytes(), b"v")]);
         }
         assert_eq!(d.encoding_name(b"h"), Some("hashtable"));
         d.clock_mut().advance(1_000_000);
-        assert_eq!(d.hlen(b"h").expect("ok"), 300, "nothing had a deadline");
+        assert_eq!(d.hlen(b"h").expect("ok"), 600, "nothing had a deadline");
     }
 
     /// `HGETDEL`, as the strings it handed back.
@@ -1589,7 +1589,7 @@ mod tests {
     #[test]
     fn the_last_three_reach_a_table_the_same_way_they_reach_a_listpack() {
         let mut d = db();
-        for i in 0..300u32 {
+        for i in 0..600u32 {
             set(&mut d, b"h", &[(format!("f{i}").as_bytes(), b"v")]);
         }
         assert_eq!(d.encoding_name(b"h"), Some("hashtable"));
@@ -1608,7 +1608,7 @@ mod tests {
         );
         assert_eq!(ttl_of(&mut d, b"h", &[b"f0"]), [Ask::NoDeadline]);
         assert_eq!(getdel(&mut d, b"h", &[b"f0"]), [Some("x".to_owned())]);
-        assert_eq!(d.hlen(b"h").expect("ok"), 299);
+        assert_eq!(d.hlen(b"h").expect("ok"), 599);
     }
 
     #[test]

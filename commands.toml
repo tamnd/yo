@@ -122,9 +122,10 @@ name = "keyspace"
 expected = 20
 status = "partial"
 doc = "14"
-# DEL, UNLINK, EXISTS and TYPE are here in M2 and the other sixteen are in M3.
-# The four are not a random quarter of the group, they are what Redis's own test
-# suite needs before it will run one file.
+# DEL, UNLINK, EXISTS and TYPE landed in M2 and the rest are in M3. The four were
+# not a random quarter of the group, they are what Redis's own test suite needs
+# before it will run one file. OBJECT is here now because the size ladder is not
+# finished until a client can see which rung a key is on.
 
 [[group]]
 name = "expiry"
@@ -503,6 +504,17 @@ bounded = "inherent"
 status = "shipped"
 wire = "verified"
 notes = "Answers string, set or none. It grows a case each time a type lands."
+
+[[command]]
+name = "OBJECT"
+group = "keyspace"
+since = "2.2.3"
+arity = -2
+plan = "metadata"
+bounded = "inherent"
+status = "shipped"
+wire = "verified"
+notes = "ENCODING is the one worth having and the other three are here because clients call them without thinking. It is the only window a client has onto the size ladder, so it is the command that says whether our ladder is really Redis's ladder, and it is why the thresholds behind it are the one thing CONFIG SET can move. A missing key answers nil on all four rather than an error, which reads like a bug and is what 8.10.1 does. REFCOUNT is always 1, because 8.10.1 answers 1 for a small integer too rather than the huge shared count it used to. IDLETIME is always 0 and FREQ is always the not an LFU policy complaint, and both will stay that way until there is eviction to track."
 
 
 # ------------------------------------------------------------------------ sets

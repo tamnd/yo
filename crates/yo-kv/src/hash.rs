@@ -12,7 +12,7 @@
 //! | f | v | f | v | f | v ... |-->| element table + a value blob    |
 //! | ~2 B a side, walked        |   | one probe, no cap               |
 //! +---------------------------+   +---------------------------------+
-//!   to 128 fields, 64 B a side
+//!   to 512 fields, 64 B a side
 //! ```
 //!
 //! Promotion is one-way and upward, which is Y4. The set has three bands because
@@ -108,9 +108,16 @@ pub struct Limits {
 }
 
 impl Limits {
-    /// Redis's defaults: 128 and 64.
+    /// Redis's defaults: 512 and 64.
+    ///
+    /// The count is 512 and not the 128 everyone remembers, and everyone
+    /// remembers 128 because that is what it was for years. Read off a running
+    /// 8.10.1 with nothing in its config file rather than off the documentation,
+    /// which is the only way to be sure of a number like this. It matters
+    /// because a hash of two hundred fields answers `listpack` there, so it has
+    /// to answer `listpack` here too.
     pub const DEFAULT: Limits = Limits {
-        max_listpack_entries: 128,
+        max_listpack_entries: 512,
         max_listpack_value: 64,
     };
 }
@@ -843,6 +850,15 @@ mod tests {
 
     /// A hash that never leaves the listpack band.
     const SMALL: Limits = Limits::DEFAULT;
+    /// A hash that promotes on the 129th field.
+    ///
+    /// The default used to be this and the promotion tests used to lean on it.
+    /// They say the number themselves now, because a test of where the line is
+    /// should not move when the default does.
+    const AT_128: Limits = Limits {
+        max_listpack_entries: 128,
+        max_listpack_value: 64,
+    };
     /// A hash that is a table from its second field.
     const AS_TABLE: Limits = Limits {
         max_listpack_entries: 1,
@@ -925,22 +941,22 @@ mod tests {
     fn it_promotes_on_the_count_and_on_the_length() {
         let mut h = Hash::new();
         for i in 0..128u32 {
-            h.set(format!("f{i}").as_bytes(), b"v", &SMALL);
+            h.set(format!("f{i}").as_bytes(), b"v", &AT_128);
         }
         assert_eq!(h.encoding(), Encoding::Listpack, "128 is still a listpack");
-        h.set(b"one more", b"v", &SMALL);
+        h.set(b"one more", b"v", &AT_128);
         assert_eq!(h.encoding(), Encoding::Hashtable, "and 129 is not");
         assert_eq!(h.len(), 129);
 
         // Either side being too long converts on its own, at any count.
         let long = vec![b'x'; 65];
         let mut by_value = Hash::new();
-        by_value.set(b"f", &long, &SMALL);
+        by_value.set(b"f", &long, &AT_128);
         assert_eq!(by_value.encoding(), Encoding::Hashtable);
         assert_eq!(by_value.get(b"f").map(text), Some(long.clone()));
 
         let mut by_field = Hash::new();
-        by_field.set(&long, b"v", &SMALL);
+        by_field.set(&long, b"v", &AT_128);
         assert_eq!(by_field.encoding(), Encoding::Hashtable);
         assert_eq!(by_field.get(&long).map(text), Some(b"v".to_vec()));
     }
@@ -954,13 +970,13 @@ mod tests {
             h.set(
                 format!("{i}").as_bytes(),
                 format!("{}", i * 2).as_bytes(),
-                &SMALL,
+                &AT_128,
             );
         }
         assert_eq!(h.encoding(), Encoding::Listpack);
         let before = pairs(&h);
 
-        h.set(b"last", b"one", &SMALL);
+        h.set(b"last", b"one", &AT_128);
         assert_eq!(h.encoding(), Encoding::Hashtable);
 
         let mut after = pairs(&h);
@@ -979,7 +995,7 @@ mod tests {
     fn it_never_demotes() {
         let mut h = Hash::new();
         for i in 0..200u32 {
-            h.set(format!("f{i}").as_bytes(), b"v", &SMALL);
+            h.set(format!("f{i}").as_bytes(), b"v", &AT_128);
         }
         assert_eq!(h.encoding(), Encoding::Hashtable);
         for i in 0..199u32 {
@@ -1115,9 +1131,9 @@ mod tests {
         assert_eq!(big.encoding(), Encoding::Hashtable);
         assert_eq!(big.get(b"a").map(text), Some(b"1".to_vec()));
 
-        let mut small = Hash::with_hint(2, &SMALL);
+        let mut small = Hash::with_hint(2, &AT_128);
         for i in 0..200u32 {
-            small.set(format!("f{i}").as_bytes(), b"v", &SMALL);
+            small.set(format!("f{i}").as_bytes(), b"v", &AT_128);
         }
         assert_eq!(small.encoding(), Encoding::Hashtable);
         assert_eq!(small.len(), 200);
@@ -1313,13 +1329,13 @@ mod tests {
     fn a_deadline_comes_over_with_its_field_on_promotion() {
         let mut h = Hash::new();
         for i in 0..128u32 {
-            h.set(format!("f{i}").as_bytes(), b"v", &SMALL);
+            h.set(format!("f{i}").as_bytes(), b"v", &AT_128);
         }
         h.expire(b"f7", 4000, Cond::Always, 0);
         h.expire(b"f9", 2000, Cond::Always, 0);
         assert_eq!(h.encoding(), Encoding::ListpackEx);
 
-        h.set(b"one more", b"v", &SMALL);
+        h.set(b"one more", b"v", &AT_128);
         assert_eq!(h.encoding(), Encoding::Hashtable, "and now it is a table");
 
         assert_eq!(h.len(), 129);
