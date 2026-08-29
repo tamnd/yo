@@ -41,7 +41,7 @@ pub fn open(path: &str) -> Result<Db> {
         db: Handle {
             inner: Rc::new(RefCell::new(Inner {
                 collections: Vec::new(),
-                strings: yo_kv::Strings::new(),
+                strings: yo_kv::Keyspace::new(),
                 deadlines: false,
             })),
         },
@@ -76,7 +76,7 @@ impl core::fmt::Debug for Db {
 /// The database itself, which one thread owns and reaches through [`Handle`].
 pub(crate) struct Inner {
     pub(crate) collections: Vec<Collection>,
-    pub(crate) strings: yo_kv::Strings,
+    pub(crate) strings: yo_kv::Keyspace,
     /// Whether any key has ever been given a deadline, which is exactly when
     /// the clock's answer can be observed. See `keyspace`'s module docs.
     pub(crate) deadlines: bool,

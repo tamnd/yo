@@ -2,7 +2,7 @@
 //!
 //! `bench/00` gives a point read 150 ns in process, and the number is only
 //! meaningful if it is measured where a program actually calls (Y23). So every
-//! group here has a `store/` row calling [`yo_kv::Strings`] straight and an
+//! group here has a `store/` row calling [`yo_kv::Keyspace`] straight and an
 //! `api/` row calling the same command through `db.strings()`. The gap between
 //! them is everything the embedded API adds: the handle, the borrow, the
 //! `AsRef` and the clock policy. It is meant to be nothing.
@@ -33,8 +33,8 @@ fn keys() -> usize {
 }
 
 /// The same keyspace filled twice, once through each door.
-fn filled(n: usize) -> (yo_kv::Strings, yo::Db) {
-    let mut store = yo_kv::Strings::new();
+fn filled(n: usize) -> (yo_kv::Keyspace, yo::Db) {
+    let mut store = yo_kv::Keyspace::new();
     let db = yo::open(MEMORY).expect("in memory always opens");
     let keys = db.strings();
     for i in 0..n {
@@ -89,7 +89,7 @@ fn bench_set(c: &mut Criterion) {
     g.throughput(Throughput::Elements(1));
 
     g.bench_function("store", |b| {
-        let mut store = yo_kv::Strings::new();
+        let mut store = yo_kv::Keyspace::new();
         let mut i = 0usize;
         b.iter(|| {
             i = (i + 1) % n;
@@ -117,7 +117,7 @@ fn bench_incr(c: &mut Criterion) {
     g.throughput(Throughput::Elements(1));
 
     g.bench_function("store", |b| {
-        let mut store = yo_kv::Strings::new();
+        let mut store = yo_kv::Keyspace::new();
         b.iter(|| black_box(store.incr(b"hits").expect("a counter")));
     });
 
@@ -145,7 +145,7 @@ fn bench_mset(c: &mut Criterion) {
     g.throughput(Throughput::Elements(pairs.len() as u64));
 
     g.bench_function("store", |b| {
-        let mut store = yo_kv::Strings::new();
+        let mut store = yo_kv::Keyspace::new();
         b.iter(|| {
             store
                 .mset(pairs.iter().map(|(k, v)| (k.as_bytes(), v.as_bytes())))

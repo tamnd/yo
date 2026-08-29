@@ -1,7 +1,7 @@
 //! The Redis string keyspace, from the embedded side.
 //!
 //! This is Y23 where you can see it. A program that calls [`Strings::incr`]
-//! reaches the same `yo_kv::Strings::incr` that `INCR` off a socket reaches,
+//! reaches the same `yo_kv::Keyspace::incr` that `INCR` off a socket reaches,
 //! not a second implementation that agrees with it today. The difference
 //! between the two callers is a socket, a parser and a reply, and this side
 //! pays none of them: an embedded `INCR` is a probe, an add and a store.

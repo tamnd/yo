@@ -685,7 +685,7 @@ mod tests {
     ///
     /// This is the case the in place path has to refuse rather than the case it
     /// is for, and it is the one that would corrupt a record if it took it: the
-    /// value here is a `Strings` record, whose deadline is inside the value, so
+    /// value here is a keyspace record, whose deadline is inside the value, so
     /// two values of the same visible length are two different record lengths.
     #[test]
     fn a_longer_value_moves_and_the_index_follows_it() {

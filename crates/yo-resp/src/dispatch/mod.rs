@@ -64,7 +64,7 @@ pub use table::{COMMANDS, Spec, arity_ok, lookup};
 
 use crate::reply::Out;
 use yo_common::{Code, Error};
-use yo_kv::{Clock, Strings};
+use yo_kv::{Clock, Keyspace};
 
 /// How many databases a server has.
 ///
@@ -105,7 +105,7 @@ pub struct Stats {
 /// this a server rather than a shard is that it is the whole of what a
 /// connection can address.
 pub struct Server {
-    dbs: Vec<Strings>,
+    dbs: Vec<Keyspace>,
     clock: Clock,
     started_ms: u64,
     /// Where the next maintenance turn starts looking, so that a database
@@ -123,7 +123,9 @@ impl Server {
     pub fn new() -> Server {
         let clock = Clock::system();
         Server {
-            dbs: (0..DATABASES).map(|_| Strings::with_clock(clock)).collect(),
+            dbs: (0..DATABASES)
+                .map(|_| Keyspace::with_clock(clock))
+                .collect(),
             clock,
             started_ms: clock.now_ms(),
             next_db: 0,
@@ -136,7 +138,9 @@ impl Server {
     #[must_use]
     pub fn with_clock(clock: Clock) -> Server {
         Server {
-            dbs: (0..DATABASES).map(|_| Strings::with_clock(clock)).collect(),
+            dbs: (0..DATABASES)
+                .map(|_| Keyspace::with_clock(clock))
+                .collect(),
             clock,
             started_ms: clock.now_ms(),
             next_db: 0,
@@ -152,7 +156,7 @@ impl Server {
     /// If `i` is not a database. `SELECT` is the only way a client changes the
     /// index and it checks, so an index that is out of range here is a bug in
     /// the caller and not something a client can ask for.
-    pub fn db(&mut self, i: usize) -> &mut Strings {
+    pub fn db(&mut self, i: usize) -> &mut Keyspace {
         &mut self.dbs[i]
     }
 
@@ -167,7 +171,7 @@ impl Server {
     ///
     /// As [`Server::db`].
     #[must_use]
-    pub fn db_ref(&self, i: usize) -> &Strings {
+    pub fn db_ref(&self, i: usize) -> &Keyspace {
         &self.dbs[i]
     }
 
@@ -199,7 +203,7 @@ impl Server {
     /// keyspace can change them and the engine has to say when they move.
     #[must_use]
     pub fn memory_bytes(&self) -> usize {
-        self.dbs.iter().map(Strings::memory_bytes).sum::<usize>() + self.conn_bytes
+        self.dbs.iter().map(Keyspace::memory_bytes).sum::<usize>() + self.conn_bytes
     }
 
     /// What the keyspace itself is holding, live records only.
@@ -262,7 +266,7 @@ impl Server {
     /// Keys reclaimed by running into them after their deadline.
     #[must_use]
     pub fn expired_keys(&self) -> u64 {
-        self.dbs.iter().map(Strings::expired_keys).sum()
+        self.dbs.iter().map(Keyspace::expired_keys).sum()
     }
 
     /// Give one database's dead space back, if any database has enough of it to

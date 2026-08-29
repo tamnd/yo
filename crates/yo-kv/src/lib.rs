@@ -10,7 +10,7 @@
 //! the typed API above it turning generics into calls.
 //!
 //! What that buys is worth being clear about. An embedded program calls
-//! [`Strings::incr`] and gets an `i64` or a [`yo_common::Error`]. It does not
+//! [`Keyspace::incr`] and gets an `i64` or a [`yo_common::Error`]. It does not
 //! serialise a command, it does not cross a socket, and it does not parse a
 //! reply. That is the whole point of P1 and it is why the sub 150 nanosecond
 //! number in `bench/00` is measured through here and not through a client.
@@ -33,10 +33,10 @@
 //!
 //! The four commands Redis added in 8.4 and 8.8 are the interesting ones and
 //! they were checked against a real 8.8 rather than written from the
-//! documentation. [`Strings::digest`] is the XXH3 of a value, and it is bit for
+//! documentation. [`Keyspace::digest`] is the XXH3 of a value, and it is bit for
 //! bit Redis's number, which is what makes [`Compare::DigestEqual`] worth
 //! anything: a client comparing against a large value sends eight bytes instead
-//! of the value. [`Strings::increx`] is not the rate limiter it looks like at
+//! of the value. [`Keyspace::increx`] is not the rate limiter it looks like at
 //! first, it is a counter with a bound, a saturation policy and four things it
 //! can do to the deadline, and the rate limiter is one setting of it.
 //!
@@ -62,6 +62,7 @@ pub mod clock;
 pub mod cond;
 pub mod counter;
 pub mod elem;
+pub mod keyspace;
 pub mod lcs;
 pub mod listpack;
 pub mod scan;
@@ -74,10 +75,11 @@ pub use clock::Clock;
 pub use cond::Compare;
 pub use counter::{Counted, IncrEx, IncrExpire, Num};
 pub use elem::{Elements, Full, MAX_ROWS, NAME_MAX};
+pub use keyspace::Keyspace;
 pub use lcs::{Idx as LcsIdx, LCS_MAX_CELLS, Match as LcsMatch};
 pub use listpack::{Entry, Listpack, Malformed};
 pub use scan::{Cursor, MAX_PARTS};
 pub use setops::{Plan, Set};
-pub use strings::{Exists, Expire, KEY_MAX, STRING_MAX, SetOptions, SetOutcome, Strings};
+pub use strings::{Exists, Expire, KEY_MAX, STRING_MAX, SetOptions, SetOutcome};
 pub use ttl::{Deadlines, MAX_AT};
 pub use value::{EMBSTR_MAX, Encoding, Str};
