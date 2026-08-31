@@ -55,7 +55,7 @@
 use core::cmp::Ordering;
 use core::ops::Range;
 
-use yo_common::num::{DIGITS_MAX, i64_digits, parse_f64, push_double};
+use yo_common::num::{DIGITS_MAX, DOUBLE_MAX, i64_digits, parse_f64, write_double};
 
 use crate::elem::Elements;
 use crate::listpack::{self, Listpack};
@@ -606,13 +606,11 @@ impl Zset {
             });
         if packable {
             let mut lp = Listpack::new();
-            let mut text = Vec::new();
+            let mut score_buf = [0u8; DOUBLE_MAX];
             for &row in &rows {
                 let (name, score) = members.at(row as usize).expect("in range");
-                text.clear();
-                push_double(&mut text, *score);
                 lp.push(name);
-                lp.push(&text);
+                lp.push(write_double(&mut score_buf, *score));
             }
             return Some(Zset {
                 body: Body::Packed(lp),
@@ -658,8 +656,11 @@ impl Zset {
 
 /// Put a member and its score into a listpack at the position it belongs.
 fn packed_insert(lp: &mut Listpack, member: &[u8], score: f64) {
-    let mut text = Vec::new();
-    push_double(&mut text, score);
+    // On the stack, not in a `Vec`. A double is at most `DOUBLE_MAX` bytes and
+    // this runs on every packed `ZADD` and `ZINCRBY`, so a fresh allocation here
+    // is a malloc and a free per member added to a small sorted set.
+    let mut score_buf = [0u8; DOUBLE_MAX];
+    let text = write_double(&mut score_buf, score);
     let mut digits = [0u8; DIGITS_MAX];
     let mut at = 0;
     while let (Some(m), Some(s)) = (lp.get(at * 2), lp.get(at * 2 + 1)) {
@@ -671,10 +672,10 @@ fn packed_insert(lp: &mut Listpack, member: &[u8], score: f64) {
     }
     if at * 2 == lp.len() {
         lp.push(member);
-        lp.push(&text);
+        lp.push(text);
     } else {
         lp.insert(at * 2, member);
-        lp.insert(at * 2 + 1, &text);
+        lp.insert(at * 2 + 1, text);
     }
 }
 

@@ -498,11 +498,22 @@ impl Keyspace {
             return Ok(tail.len());
         };
         let deadline = value::expire_at(rec);
-        let mut joined = value::read(rec).to_vec();
-        check_len(key, joined.len() + tail.len())?;
+        // The database's one scratch buffer, for the reason `LMOVE` uses it:
+        // building the new value needs the old bytes in hand while `store_raw`
+        // wants `&mut self`, and a `Vec` per call is a malloc and a free on the
+        // command a log writer sends in a loop. Taken out and put back on every
+        // path, so an early return leaves it as it was found.
+        let mut joined = std::mem::take(&mut self.scratch);
+        joined.clear();
+        value::read(rec).write_to(&mut joined);
+        if let Err(e) = check_len(key, joined.len() + tail.len()) {
+            self.scratch = joined;
+            return Err(e);
+        }
         joined.extend_from_slice(tail);
         let len = joined.len();
         self.store_raw(key, &joined, deadline);
+        self.scratch = joined;
         Ok(len)
     }
 
@@ -523,9 +534,17 @@ impl Keyspace {
             .ok_or_else(|| Error::new(Code::Invalid, BAD_OFFSET))?;
         check_len(key, end)?;
 
-        let (mut bytes, deadline) = match self.map.get(key) {
-            Some(rec) => (value::read(rec).to_vec(), value::expire_at(rec)),
-            None => (Vec::new(), None),
+        // The same scratch buffer [`Keyspace::append`] uses, for the same
+        // reason. `SETRANGE` in a loop is how a client keeps a fixed layout
+        // record in one key.
+        let mut bytes = std::mem::take(&mut self.scratch);
+        bytes.clear();
+        let deadline = match self.map.get(key) {
+            Some(rec) => {
+                value::read(rec).write_to(&mut bytes);
+                value::expire_at(rec)
+            }
+            None => None,
         };
         if bytes.len() < end {
             bytes.resize(end, 0);
@@ -533,6 +552,7 @@ impl Keyspace {
         bytes[offset..end].copy_from_slice(val);
         let len = bytes.len();
         self.store_raw(key, &bytes, deadline);
+        self.scratch = bytes;
         Ok(len)
     }
 
@@ -652,9 +672,9 @@ impl Keyspace {
                 "increment would produce NaN or Infinity",
             ));
         }
-        let mut text = Vec::with_capacity(32);
-        yo_common::num::push_double(&mut text, next);
-        self.store_text(key, &text, deadline);
+        let mut buf = [0u8; yo_common::num::DOUBLE_MAX];
+        let text = yo_common::num::write_double(&mut buf, next);
+        self.store_text(key, text, deadline);
         Ok(next)
     }
 
@@ -799,9 +819,9 @@ impl Keyspace {
                 // Stored as text and never as an integer, for the same reason
                 // `INCRBYFLOAT` is: Redis reports `embstr` afterwards even when
                 // the number came out whole.
-                let mut text = Vec::with_capacity(32);
-                yo_common::num::push_double(&mut text, f);
-                self.store_text(key, &text, deadline);
+                let mut buf = [0u8; yo_common::num::DOUBLE_MAX];
+                let text = yo_common::num::write_double(&mut buf, f);
+                self.store_text(key, text, deadline);
             }
         }
         Ok(out)
@@ -1302,6 +1322,72 @@ mod tests {
         s.append(b"t", b"b").unwrap();
         assert_eq!(s.expire_at(b"t"), Some(4_000));
         assert_eq!(got(&mut s, b"t").as_deref(), Some(&b"ab"[..]));
+    }
+
+    /// `APPEND` in a loop is how a client writes a log into one key, so the
+    /// copy of the old value it has to make must not be a fresh `Vec` every
+    /// time. The value keeps growing here, so the scratch buffer and the index
+    /// are both still allowed to grow, which is why this counts a ceiling rather
+    /// than zero. Before the scratch buffer it was a hundred and change.
+    #[test]
+    fn append_reuses_its_buffer_instead_of_allocating_per_call() {
+        let mut s = store();
+        s.append(b"k", b"start").expect("room");
+        let (_, allocs) = crate::tally::counted(|| {
+            for _ in 0..100 {
+                s.append(b"k", b"0123456789").expect("room");
+            }
+        });
+        assert!(
+            allocs < 20,
+            "append allocated {allocs} times in a hundred, so it is still copying into a new Vec"
+        );
+        assert_eq!(got(&mut s, b"k").map(|v| v.len()), Some(1005));
+    }
+
+    /// The same claim for `SETRANGE`, which is easier to state because the value
+    /// does not grow: writing over the same five bytes of the same key a hundred
+    /// times has nothing left to allocate for.
+    #[test]
+    fn setrange_stops_allocating_once_its_buffer_is_grown() {
+        let mut s = store();
+        s.set_plain(b"k", b"Hello World").expect("room");
+        s.setrange(b"k", 6, b"Redis").expect("room");
+        let (_, allocs) = crate::tally::counted(|| {
+            for _ in 0..100 {
+                s.setrange(b"k", 6, b"Redis").expect("room");
+            }
+        });
+        assert_eq!(allocs, 0, "setrange allocated {allocs} times in a hundred");
+        assert_eq!(got(&mut s, b"k").as_deref(), Some(&b"Hello Redis"[..]));
+    }
+
+    /// `EXPIRE` on a string rewrites the record, which means holding the value
+    /// while it does. A cache that sets a deadline on every write sends as many
+    /// of these as it does `SET`.
+    #[test]
+    fn expiry_on_a_string_stops_allocating_once_its_buffer_is_grown() {
+        let mut s = store();
+        s.set_plain(b"k", b"a value of some length").expect("room");
+        // Far enough out that the key is still there at the end. A deadline in
+        // the past is reaped, and a reaped key is a different test.
+        const FUTURE: u64 = 4_000_000_000_000;
+        s.set_expiry(b"k", Some(FUTURE));
+        let (_, allocs) = crate::tally::counted(|| {
+            for i in 0..100 {
+                // A different deadline each time, because the same one is a no
+                // op that never reaches the rewrite.
+                s.set_expiry(b"k", Some(FUTURE + i));
+            }
+        });
+        assert_eq!(
+            allocs, 0,
+            "set_expiry allocated {allocs} times in a hundred"
+        );
+        assert_eq!(
+            got(&mut s, b"k").as_deref(),
+            Some(&b"a value of some length"[..])
+        );
     }
 
     #[test]
