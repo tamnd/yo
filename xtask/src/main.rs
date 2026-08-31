@@ -68,16 +68,67 @@ fn main() {
         Some("generate") => generate(),
         Some("check") => check(),
         Some("reserve") => reserve(),
+        Some("cross") => cross(),
         Some(other) => {
             eprintln!("unknown command: {other}");
-            eprintln!("usage: cargo xtask [generate|check|reserve]");
+            eprintln!("usage: cargo xtask [generate|check|reserve|cross]");
             process::exit(2);
         }
         None => {
-            eprintln!("usage: cargo xtask [generate|check|reserve]");
+            eprintln!("usage: cargo xtask [generate|check|reserve|cross]");
             process::exit(2);
         }
     }
+}
+
+/// The targets `cross` lints for, which are the two the developer laptop is
+/// not.
+///
+/// Nothing here is built or linked. Clippy stops after analysis, so a target
+/// needs its standard library and nothing else, and `rustup target add` is the
+/// whole setup.
+const CROSS: &[&str] = &["x86_64-pc-windows-msvc", "x86_64-unknown-linux-gnu"];
+
+/// Run clippy for the platforms this machine is not.
+///
+/// Three release runs in a row went red on a lint that cannot fire on a mac:
+/// an `if let` over a one variant enum, a loop around it that never loops, a
+/// closure that only ever answers `Some`. Every one of them was in code behind
+/// `#[cfg(unix)]` or beside it, every one took a push and a wait to find, and
+/// every fix traded one of them for the next. This finds all three in about a
+/// minute without leaving the laptop.
+///
+/// `--all-targets` is deliberately not passed. It pulls in criterion, whose
+/// `alloca` has a C build script that needs a real MSVC to build, and the benches
+/// are not where the platform code is anyway.
+fn cross() {
+    let mut bad = false;
+    for target in CROSS {
+        println!("clippy {target}");
+        let status = process::Command::new(env!("CARGO"))
+            .current_dir(root())
+            .args([
+                "clippy",
+                "--workspace",
+                "--all-features",
+                "--target",
+                target,
+            ])
+            .status();
+        match status {
+            Ok(s) if s.success() => {}
+            Ok(_) => bad = true,
+            Err(e) => {
+                eprintln!("could not run cargo clippy for {target}: {e}");
+                eprintln!("Add the target first: rustup target add {target}");
+                bad = true;
+            }
+        }
+    }
+    if bad {
+        process::exit(1);
+    }
+    println!("ok       every target lints clean");
 }
 
 /// Hands everything after `reserve` to `xtask/reserve.py` and exits with its
