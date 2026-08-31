@@ -285,10 +285,28 @@ impl Listpack {
     ///
     /// Linear, because the blob is linear. That is the whole design: at a
     /// hundred and twenty eight elements the walk is cheaper than the index that
-    /// would have avoided it.
+    /// would have avoided it. From whichever end is nearer, though, because a
+    /// list in this band holds eight kilobytes and that is four hundred odd
+    /// entries rather than a hundred and twenty eight, and `LINDEX key -1` on
+    /// one of those should not read all of it.
     #[must_use]
     pub fn get(&self, index: usize) -> Option<Entry<'_>> {
-        self.iter().nth(index)
+        let at = self.offset_of(index)?;
+        decode(&self.bytes[at..self.bytes.len() - 1]).map(|(e, _)| e)
+    }
+
+    /// A forward walk that starts at `index` rather than at the front.
+    ///
+    /// `LRANGE key 300 320` on a packed list would otherwise decode three
+    /// hundred entries and throw them away, which is what a `skip` on the walk
+    /// does.
+    pub fn iter_from(&self, index: usize) -> Iter<'_> {
+        Iter {
+            bytes: &self.bytes,
+            at: self
+                .offset_of(index)
+                .unwrap_or(self.bytes.len().saturating_sub(1)),
+        }
     }
 
     /// Every element, back to front.
@@ -417,19 +435,35 @@ impl Listpack {
     }
 
     /// Byte offset of the element at `index`, or nothing if it is past the end.
+    ///
+    /// Forward from the header or backward from the terminator, whichever is
+    /// the shorter walk. Going backward reads the length each entry carries
+    /// behind it, which is the same field [`Listpack::get_back`] reads and the
+    /// reason that field is there. A list in the packed band is eight kilobytes
+    /// and four hundred odd entries, not a hundred and twenty eight like the
+    /// other packed bands, so the half that this saves is worth having.
+    ///
+    /// [`Listpack::len`] is a header read at every size this crate builds: the
+    /// count field only stops being the count past sixty five thousand entries
+    /// and no band here comes close.
     fn offset_of(&self, index: usize) -> Option<usize> {
-        let mut at = HDR;
-        for _ in 0..index {
-            if at >= self.bytes.len() - 1 {
-                return None;
+        let n = self.len();
+        if index >= n {
+            return None;
+        }
+        if index * 2 <= n {
+            let mut at = HDR;
+            for _ in 0..index {
+                at += self.entry_bytes(at);
             }
-            at += self.entry_bytes(at);
+            return Some(at);
         }
-        if at >= self.bytes.len() - 1 {
-            None
-        } else {
-            Some(at)
+        let mut end = self.bytes.len() - 1;
+        for _ in index..n {
+            let len = read_backlen(&self.bytes[..end])?;
+            end = end.checked_sub(len + backlen_len(len))?;
         }
+        Some(end)
     }
 
     /// How many bytes the entry at `at` occupies, back length included.

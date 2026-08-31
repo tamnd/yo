@@ -132,11 +132,19 @@ fn bench_reach(c: &mut Criterion) {
         // walk. The gap between this row and the one above it is what the
         // descriptor cache would close, and it is the number that says whether
         // the cache is worth building.
+        //
+        // Over the middle half rather than sixty four consecutive positions,
+        // because consecutive positions all land in one chunk at one offset
+        // inside it, and a chunk holds four hundred odd elements. That measures
+        // whichever offset the midpoint happened to fall on. The stride is a
+        // prime that is not a factor of any chunk count here, so the position
+        // inside the chunk moves as well as the chunk does.
         g.bench_with_input(BenchmarkId::new("index_middle", n), &n, |b, _| {
+            let half = (n / 2).max(1);
             let mut i = 0usize;
             b.iter(|| {
-                i = (i + 1) & 63;
-                black_box(l.get(black_box(n / 2 + i)).map(|e| e.byte_len()))
+                i = (i + 7919) % half;
+                black_box(l.get(black_box(n / 4 + i)).map(|e| e.byte_len()))
             })
         });
 
@@ -150,12 +158,17 @@ fn bench_reach(c: &mut Criterion) {
         });
 
         // `LRANGE` over a window in the middle, which is a locate and then a
-        // sequential read, and is the shape a paging client actually sends.
+        // sequential read, and is the shape a paging client actually sends. The
+        // start moves over the middle half for the same reason the row above
+        // does.
         g.throughput(Throughput::Elements(100));
         g.bench_with_input(BenchmarkId::new("range_middle", n), &n, |b, _| {
+            let half = (n / 2).max(1);
+            let mut i = 0usize;
             b.iter(|| {
+                i = (i + 7919) % half;
                 let mut got = 0usize;
-                for e in l.range(black_box(n / 2), 100) {
+                for e in l.range(black_box(n / 4 + i), 100) {
                     got += e.byte_len();
                 }
                 got
