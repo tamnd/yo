@@ -1,7 +1,28 @@
 name: release
 
-# A tag is the only trigger. Nothing here runs on a branch, because a release
-# that can be produced from an untagged tree is a release nobody can point at.
+# A tag is what a release is cut from. Nothing here produces one from an
+# untagged tree, because a release nobody can point at is not a release.
+#
+# The manual trigger is the recovery path and it is not decoration. A tag push
+# runs the copy of this file that is *in the tag*, which is the one thing about
+# release workflows that surprises everyone once: a fix landed on main after a
+# tag was cut does not apply to that tag, ever, and the tag cannot be moved to
+# pick it up. v0.3.5 is the worked example. It was tagged before the publish
+# became a loop that waits out crates.io's rate limit, its own copy of this file
+# ran a plain `cargo publish --workspace`, and it stopped on the first refusal
+# with one crate of eighteen uploaded.
+#
+# So dispatching this from `main` with `tag:` set is how a half finished release
+# is finished: main's workflow, the tag's code. Both halves matter, and the
+# `ref:` on every checkout below is the half that makes it the tag's code.
+#
+# That also means `main` has to be allowed to deploy to the `crates.io`
+# environment. It was not, and the first attempt to use this path was refused in
+# one second by the deployment branch policy, which is a confusing failure
+# because the job never starts and so has no steps and no log. If this ever goes
+# back to only allowing `v*` tags then this input may as well be deleted, since
+# there is no ref it can be dispatched from that has both the fixed workflow and
+# the tagged code.
 on:
   push:
     tags: ["v*"]
