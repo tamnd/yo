@@ -664,6 +664,14 @@ impl<S: Sink> Wire<S> {
             }
             None => yo_alloc::allow(|| {
                 self.argvs.push(Argv::with_capacity(ARGV_HINT));
+                // Every slot handed out here comes back to `spare` exactly
+                // once, so `spare` never holds more than `argvs` has slots.
+                // Sizing it here means the pushes that give a slot back never
+                // touch the allocator, and those are on the command path while
+                // this is not: a decoder is made once per depth of pipelining
+                // the connection has ever reached. `spare` is empty right now,
+                // which is why we are down here at all.
+                self.spare.reserve(self.argvs.len());
                 (self.argvs.len() - 1) as u32
             }),
         }

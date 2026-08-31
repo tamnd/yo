@@ -526,7 +526,10 @@ impl Keys {
     ///
     /// As [`Keys::exists`].
     pub fn random(&self) -> Result<Option<Vec<u8>>> {
-        self.db.run(|inner| Ok(inner.strings.random_key()))
+        // The engine hands back a borrow of its scratch buffer and this is an
+        // owning API, so the copy happens here rather than in there.
+        self.db
+            .run(|inner| Ok(inner.strings.random_key().map(<[u8]>::to_vec)))
     }
 }
 

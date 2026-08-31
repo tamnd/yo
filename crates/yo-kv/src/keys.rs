@@ -228,12 +228,20 @@ impl Keyspace {
         // The record and not the value: a tag, a deadline and then either the
         // string itself or four bytes saying which slot the body is in. Copying
         // it out ends the borrow of the map so the write below can begin.
+        //
+        // Into the database's scratch buffer rather than a fresh `Vec`, because
+        // a record under a collection key is nine bytes and `RENAME` is not
+        // rare enough to pay a malloc and a free for nine bytes. Taken out and
+        // put back, so the map is free to be borrowed in between.
         let addr = self.map.find(src).expect("it was live a line ago");
-        let bytes = self.map.value_at(addr).to_vec();
+        let mut bytes = std::mem::take(&mut self.scratch);
+        bytes.clear();
+        bytes.extend_from_slice(self.map.value_at(addr));
         self.free_body(dst);
         self.map.set_with(dst, bytes.len(), |out| {
             out.copy_from_slice(&bytes);
         });
+        self.scratch = bytes;
         // `del` and not `drop_key`, which is the whole point. The body under the
         // source belongs to the destination now and freeing it here would take
         // it away from the key that just gained it.
@@ -350,6 +358,29 @@ mod tests {
         assert_eq!(d.rename(b"a", b"b", false), Moved::Ok);
         assert!(!d.exists(b"a"));
         assert_eq!(read(&mut d, b"b"), b"v1");
+    }
+
+    /// `RENAME` used to copy the source record into a fresh `Vec` so it could
+    /// let go of the map before writing, and that record is nine bytes when the
+    /// key holds a collection.
+    #[test]
+    fn a_rename_does_not_allocate_to_carry_the_record_across() {
+        let mut d = db();
+        put(&mut d, b"a", b"v1");
+        // Both names get used before the count starts, so the map has already
+        // made room for them and the loop below is renames and nothing else.
+        for _ in 0..4 {
+            assert_eq!(d.rename(b"a", b"b", false), Moved::Ok);
+            assert_eq!(d.rename(b"b", b"a", false), Moved::Ok);
+        }
+        let (_, allocs) = crate::tally::counted(|| {
+            for _ in 0..50 {
+                assert_eq!(d.rename(b"a", b"b", false), Moved::Ok);
+                assert_eq!(d.rename(b"b", b"a", false), Moved::Ok);
+            }
+        });
+        assert_eq!(allocs, 0, "rename allocated {allocs} times in a hundred");
+        assert_eq!(read(&mut d, b"a"), b"v1");
     }
 
     #[test]

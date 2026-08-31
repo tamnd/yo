@@ -135,7 +135,7 @@ pub(super) fn execute(
         "scan" => scan(db, args, out)?,
         "keys" => keys(db, args.get(1), out),
         "randomkey" => match db.random_key() {
-            Some(key) => out.bulk(&key),
+            Some(key) => out.bulk(key),
             None => out.nil(),
         },
         other => unreachable!("keyspace command with no body: {other}"),
