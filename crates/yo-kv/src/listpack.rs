@@ -11,17 +11,18 @@
 //! times gap. Half of that reproduces and half of it does not. A walk here does
 //! cost 1 to 2 ns an element, which is L6's number. A probe in our element table
 //! costs 8 ns and not 70, so the gap it was being compared against is not there,
-//! and at eight members the two are within noise of each other: 8.2 ns against
-//! 7.6 to find a member that is present, which the blob now wins, 4.2 against
-//! 10.3 to find one that is not, 0.4 ns an element against 1.3 to walk the whole
-//! thing, and 268 ns against 261 to build it. At a hundred and twenty eight the
-//! table is fifteen times faster to probe and the gap only widens from there.
-//! `benches/listpack.rs` is where those come from.
+//! and at eight members the blob is ahead on both of them: 8.2 ns against 7.0 to
+//! find a member that is present, 4.2 against 8.5 to find one that is not, 0.4 ns
+//! an element against 1.3 to walk the whole thing, and 268 ns against 261 to
+//! build it. At a hundred and twenty eight the table is six times faster to probe
+//! and the gap only widens from there. `benches/listpack.rs` is where those come
+//! from.
 //!
-//! The find numbers used to be much worse for the blob and were re-measured when
-//! the scan stopped decoding every element it walked past, which is written up on
-//! `scan_for` below. It does not change the conclusion, because the conclusion
-//! never rested on them.
+//! The find numbers used to be much worse for the blob and have been re-measured
+//! twice, once when the scan stopped decoding every element it walked past and
+//! again when it stopped waiting for the header byte to work out where the next
+//! element starts. Both are written up on `scan_for` below. Neither changes the
+//! conclusion, because the conclusion never rested on them.
 //!
 //! What the band is actually for is memory, and there the gap is real and the
 //! other way round. With an eleven byte member the blob costs 13.1 bytes an
@@ -156,20 +157,6 @@ impl Entry<'_> {
         let mut out = Vec::new();
         self.write_to(&mut out);
         out
-    }
-
-    /// Whether this element is the given bytes.
-    ///
-    /// An integer entry is compared as an integer, so the needle is parsed once
-    /// by the caller rather than the entry being formatted once per candidate.
-    #[must_use]
-    #[inline]
-    pub(crate) fn is(&self, needle: &[u8], as_int: Option<i64>) -> bool {
-        match (self, as_int) {
-            (Entry::Int(n), Some(v)) => *n == v,
-            (Entry::Int(_), None) => false,
-            (Entry::Str(s), _) => *s == needle,
-        }
     }
 }
 
@@ -374,6 +361,32 @@ impl Listpack {
     #[must_use]
     pub fn find_parsed(&self, needle: &[u8], as_int: Option<i64>, step: usize) -> Option<usize> {
         scan_for(self.entries(), needle, as_int, step)
+    }
+
+    /// Every place an element is, front to back, handed over as they are found.
+    ///
+    /// `limit` is how many elements may be looked at with 0 meaning all of them,
+    /// `hit` says whether to carry on, and what comes back is how many elements
+    /// were looked at. The walk itself is `scan_each` below.
+    pub fn find_each(
+        &self,
+        needle: &[u8],
+        as_int: Option<i64>,
+        limit: usize,
+        hit: &mut dyn FnMut(usize) -> bool,
+    ) -> usize {
+        scan_each(self.entries(), needle, as_int, limit, hit)
+    }
+
+    /// The same from the back, with indexes counted from the last element.
+    pub fn find_each_back(
+        &self,
+        needle: &[u8],
+        as_int: Option<i64>,
+        limit: usize,
+        hit: &mut dyn FnMut(usize) -> bool,
+    ) -> usize {
+        scan_each_back(self.entries(), needle, as_int, limit, hit)
     }
 
     /// Add an element at the end.
@@ -831,17 +844,104 @@ impl<'a> Needle<'a> {
 /// is exactly the kind of bug that hides for a year, and having a second copy of
 /// them here to save a call on a path that is cold in every list workload is a
 /// bad trade.
+///
+/// # What was left on the table by the first version of that
+///
+/// The walk above got to about 2.3 nanoseconds an element and stopped, and it
+/// stopped there because of one instruction. Stepping to the next element is
+/// `at += len + 2`, `len` comes out of the encoding byte that was just loaded,
+/// and the loaded value is therefore in the way of working out where the next
+/// load goes. Every element paid a load latency plus the arithmetic stacked on
+/// it before the element after it could start, which is about eight cycles, and
+/// nothing else in the loop mattered because everything else could run while that
+/// chain was resolving. It is not a throughput problem and no amount of removing
+/// instructions from the body would have touched it.
+///
+/// The way out is that on the path that matters the length is already known. An
+/// element is only compared when its length equals the needle's, and the needle's
+/// length has been in a register since before the loop started, so on that path
+/// the step can be written in terms of the needle instead of in terms of the
+/// byte that was just read. The next element's address is then worked out while
+/// this one is still being compared, and the loop halves to about four cycles an
+/// element. That is why the length test is a branch of its own below rather than
+/// the first half of the comparison, which is the shape it had and reads more
+/// naturally.
+///
+/// It only pays when the lengths do match, and on a list they either all match
+/// or none of them do, which is the same property the two word comparison in
+/// [`Needle`] leans on. A million element `LINSERT` went from 1.17 ms to 456 us
+/// on it and the bare search from 2.37 ms to 904 us, both on an M4.
 #[inline]
 pub(crate) fn scan_for(b: &[u8], needle: &[u8], as_int: Option<i64>, step: usize) -> Option<usize> {
+    let mut got = None;
     let needle = Needle::new(needle, as_int);
-    // Two walks out of one body. A list finds by stepping over every element and
-    // a hash steps over every other one, and carrying the counter for a step
-    // that is always one costs four instructions and a branch on the hottest
-    // loop in `LINSERT`. As a constant it folds away entirely.
+    // Four walks out of one body, and both const parameters earn their keep the
+    // same way. A list finds by stepping over every element and a hash steps
+    // over every other one, and carrying a counter for a step that is always one
+    // costs four instructions and a branch on the hottest loop in `LINSERT`.
+    // `LIMITED` is the same argument for `LPOS`'s `MAXLEN`, which every other
+    // caller passes as no limit at all. As constants both fold away entirely.
     if step <= 1 {
-        walk::<true>(b, &needle, 1)
+        walk::<true, false, _>(b, &needle, 1, 0, &mut |at| {
+            got = Some(at);
+            false
+        });
     } else {
-        walk::<false>(b, &needle, step)
+        walk::<false, false, _>(b, &needle, step, 0, &mut |at| {
+            got = Some(at);
+            false
+        });
+    }
+    got
+}
+
+/// Walk a run of entries handing back every `needle` in it, front to back.
+///
+/// This is [`scan_for`] without the stop on the first one, which is `LPOS` and
+/// `LREM` rather than `LINSERT`. `hit` is given each index as it is found and
+/// says whether to keep going, so a `COUNT` stops the walk where it is reached
+/// rather than after reading the rest of the list. `limit` is how many elements
+/// may be looked at, with 0 meaning no limit, which is `MAXLEN`.
+///
+/// What comes back is how many elements were looked at, which is what a caller
+/// spanning several runs of entries needs in order to carry one `MAXLEN` budget
+/// across all of them.
+#[inline]
+pub(crate) fn scan_each(
+    b: &[u8],
+    needle: &[u8],
+    as_int: Option<i64>,
+    limit: usize,
+    mut hit: &mut dyn FnMut(usize) -> bool,
+) -> usize {
+    let needle = Needle::new(needle, as_int);
+    if limit == 0 {
+        walk::<true, false, _>(b, &needle, 1, 0, &mut hit)
+    } else {
+        walk::<true, true, _>(b, &needle, 1, limit, &mut hit)
+    }
+}
+
+/// The same walk from the other end, with indexes counted from the back.
+///
+/// The index handed to `hit` is 0 for the last element, 1 for the one before
+/// it and so on, because this does not know how many elements are in front of
+/// the run it was given and the caller does. `LPOS` with a negative rank is the
+/// only thing that wants this, and it wants it because a rank of -1 has to find
+/// the last match without reading past it.
+#[inline]
+pub(crate) fn scan_each_back(
+    b: &[u8],
+    needle: &[u8],
+    as_int: Option<i64>,
+    limit: usize,
+    mut hit: &mut dyn FnMut(usize) -> bool,
+) -> usize {
+    let needle = Needle::new(needle, as_int);
+    if limit == 0 {
+        walk_back::<false, _>(b, &needle, 0, &mut hit)
+    } else {
+        walk_back::<true, _>(b, &needle, limit, &mut hit)
     }
 }
 
@@ -892,9 +992,30 @@ fn head_at(b: &[u8], at: usize) -> Option<(usize, usize, bool)> {
     })
 }
 
-/// The scan itself, with `EVERY` saying whether `step` is worth carrying.
+/// The scan itself, with `EVERY` saying whether `step` is worth carrying and
+/// `LIMITED` whether `limit` is.
+///
+/// `hit` is a generic and it was a `&mut dyn` first, on the reasoning that it is
+/// only reached on a match and so is called a handful of times against a million
+/// iterations of the body around it. That reasoning is right about a long list
+/// and wrong about a short one. A blob holds at most a hundred and twenty eight
+/// elements and the thing it does all day is find one that is there, so the call
+/// is not one in a million, it is one in four, and it cost 12 percent on the
+/// eight member row in `benches/listpack.rs`. As a generic the sink for a find
+/// inlines back to a store and a break, which is what the loop had before it took
+/// a sink at all. It is two copies of this function and not more, because every
+/// caller that wants every match already goes through a `&mut dyn` of its own.
+///
+/// What comes back is how many elements were looked at, which for the single
+/// answer case is not interesting and folds away with everything else.
 #[inline]
-fn walk<const EVERY: bool>(b: &[u8], needle: &Needle<'_>, step: usize) -> Option<usize> {
+fn walk<const EVERY: bool, const LIMITED: bool, F: FnMut(usize) -> bool>(
+    b: &[u8],
+    needle: &Needle<'_>,
+    step: usize,
+    limit: usize,
+    hit: &mut F,
+) -> usize {
     let want = needle.len;
     let mut at = 0usize;
     let mut idx = 0usize;
@@ -904,6 +1025,9 @@ fn walk<const EVERY: bool>(b: &[u8], needle: &Needle<'_>, step: usize) -> Option
     // more than the comparison it was guarding.
     let mut until = 0usize;
     while at < b.len() {
+        if LIMITED && idx == limit {
+            break;
+        }
         let tag = b[at];
         // The one encoding a list is actually made of, given a path with nothing
         // in it. A string of sixty three bytes or less is a one byte header, and
@@ -920,18 +1044,37 @@ fn walk<const EVERY: bool>(b: &[u8], needle: &Needle<'_>, step: usize) -> Option
         // than anything done to the comparison inside it.
         if EVERY && tag & 0xC0 == 0x80 {
             let len = (tag & 0x3F) as usize;
-            if len == want && needle.is(b.get(at + 1..at + 1 + len)?) {
-                return Some(idx);
+            if len != want {
+                at += len + 2;
+                idx += 1;
+                continue;
             }
-            at += len + 2;
+            let Some(p) = b.get(at + 1..at + 1 + want) else {
+                break;
+            };
+            let matched = needle.is(p);
+            // `want` rather than `len`, which are the same number here and are
+            // not the same instruction: one of them is in the way of the next
+            // load and the other has been in a register all along. It halves the
+            // loop. `scan_for` above has the long version.
+            at += want + 2;
             idx += 1;
+            if matched && !hit(idx - 1) {
+                break;
+            }
             continue;
         }
-        let (hdr, len, text) = head_at(b, at)?;
+        let Some((hdr, len, text)) = head_at(b, at) else {
+            break;
+        };
         let total = hdr + len;
+        let mut matched = false;
         if EVERY || until == 0 {
-            let hit = if text {
-                len == want && needle.is(b.get(at + hdr..at + total)?)
+            matched = if text {
+                let Some(p) = b.get(at + hdr..at + total) else {
+                    break;
+                };
+                len == want && needle.is(p)
             } else {
                 // `at` is inside `b`, which is the loop condition, so this
                 // slice is always there.
@@ -939,9 +1082,6 @@ fn walk<const EVERY: bool>(b: &[u8], needle: &Needle<'_>, step: usize) -> Option
                     .num
                     .is_some_and(|v| matches!(decode(&b[at..]), Some((Entry::Int(n), _)) if n == v))
             };
-            if hit {
-                return Some(idx);
-            }
             if !EVERY {
                 until = step;
             }
@@ -951,8 +1091,77 @@ fn walk<const EVERY: bool>(b: &[u8], needle: &Needle<'_>, step: usize) -> Option
         }
         at += total + backlen_len(total);
         idx += 1;
+        if matched && !hit(idx - 1) {
+            break;
+        }
     }
-    None
+    idx
+}
+
+/// The same walk from the back, which only a list ever asks for.
+///
+/// No `EVERY`, because the caller that steps is a hash and a hash has no back to
+/// walk from. The step from one entry to the one in front of it is the back
+/// length that ends where this entry starts, and reading it is a byte and a
+/// branch in the case that covers everything up to a hundred and twenty seven
+/// bytes, which is every element the fast path in [`walk`] handles and then
+/// some. Longer than that and it falls back to [`read_backlen`], which is the
+/// leftward walk.
+#[inline]
+fn walk_back<const LIMITED: bool, F: FnMut(usize) -> bool>(
+    b: &[u8],
+    needle: &Needle<'_>,
+    limit: usize,
+    hit: &mut F,
+) -> usize {
+    let want = needle.len;
+    let mut at = b.len();
+    let mut idx = 0usize;
+    while at > 0 {
+        if LIMITED && idx == limit {
+            break;
+        }
+        // A back length of one byte has its top bit clear and holds the whole
+        // value, which is what `write_backlen_into` writes and what makes this
+        // one load rather than a loop.
+        let last = b[at - 1];
+        let (total, blen) = if last < 128 {
+            (usize::from(last), 1)
+        } else {
+            let Some(t) = read_backlen(&b[..at]) else {
+                break;
+            };
+            (t, backlen_len(t))
+        };
+        let Some(start) = at.checked_sub(total + blen) else {
+            break;
+        };
+        let tag = b[start];
+        let matched = if tag & 0xC0 == 0x80 {
+            let len = usize::from(tag & 0x3F);
+            match b.get(start + 1..start + 1 + len) {
+                Some(p) => len == want && needle.is(p),
+                None => break,
+            }
+        } else {
+            match head_at(b, start) {
+                Some((hdr, len, true)) => match b.get(start + hdr..start + hdr + len) {
+                    Some(p) => len == want && needle.is(p),
+                    None => break,
+                },
+                Some((_, _, false)) => needle.num.is_some_and(
+                    |v| matches!(decode(&b[start..]), Some((Entry::Int(n), _)) if n == v),
+                ),
+                None => break,
+            }
+        };
+        at = start;
+        idx += 1;
+        if matched && !hit(idx - 1) {
+            break;
+        }
+    }
+    idx
 }
 
 /// How many bytes the back length of an entry of `len` bytes takes.
@@ -1200,11 +1409,8 @@ mod tests {
         assert_eq!(lp.find(b"1", 1), None, "01 is not 1");
     }
 
-    /// The scan has a short path for the one encoding a list is made of and a
-    /// general one for the other thirteen, and the danger with two paths is that
-    /// they disagree about some element neither author had in mind. So this
-    /// builds a blob holding every encoding, at every length that changes which
-    /// path an element takes, and asks for each of them in turn.
+    /// One of every encoding, at every length that changes which path through
+    /// the scan an element takes.
     ///
     /// The lengths are the ones that matter to the comparison rather than
     /// arbitrary: nothing, under a word, exactly a word, between one and two
@@ -1212,10 +1418,10 @@ mod tests {
     /// and past two where it stops being a whole answer and becomes a filter in
     /// front of `memcmp`. Sixty three and sixty four are the last length with a
     /// one byte header and the first with two, which is the boundary the short
-    /// path is drawn on.
-    #[test]
-    #[allow(clippy::too_many_lines)]
-    fn both_paths_through_the_scan_agree_about_every_encoding() {
+    /// path is drawn on, and a hundred and twenty seven and a hundred and twenty
+    /// eight are where the back length grows a second byte, which is the
+    /// boundary the backward walk is drawn on.
+    fn every_encoding() -> Vec<Vec<u8>> {
         let mut members: Vec<Vec<u8>> = Vec::new();
         // One of each integer encoding, including the boundaries where Redis
         // steps up to a wider one and both signs of each.
@@ -1236,8 +1442,9 @@ mod tests {
         ] {
             members.push(n.to_string().into_bytes());
         }
-        // And a string at every length the comparison treats differently.
-        for len in [0usize, 1, 7, 8, 9, 15, 16, 17, 31, 63, 64, 100, 200] {
+        for len in [
+            0usize, 1, 7, 8, 9, 15, 16, 17, 31, 63, 64, 100, 125, 126, 127, 128, 200,
+        ] {
             let mut v = vec![b'a'; len];
             // A varying tail, so that two different lengths are not two
             // prefixes of each other and the length check is doing work rather
@@ -1247,6 +1454,25 @@ mod tests {
             }
             members.push(v);
         }
+        members
+    }
+
+    /// The scan has a short path for the one encoding a list is made of and a
+    /// general one for the other thirteen, and the danger with two paths is that
+    /// they disagree about some element neither author had in mind. So this
+    /// builds a blob holding every encoding, at every length that changes which
+    /// path an element takes, and asks for each of them in turn.
+    ///
+    /// The lengths are the ones that matter to the comparison rather than
+    /// arbitrary: nothing, under a word, exactly a word, between one and two
+    /// words where the two window compare covers the whole value, exactly two,
+    /// and past two where it stops being a whole answer and becomes a filter in
+    /// front of `memcmp`. Sixty three and sixty four are the last length with a
+    /// one byte header and the first with two, which is the boundary the short
+    /// path is drawn on.
+    #[test]
+    fn both_paths_through_the_scan_agree_about_every_encoding() {
+        let members = every_encoding();
         let lp = of(&members.iter().map(Vec::as_slice).collect::<Vec<_>>());
         assert_eq!(lp.len(), members.len());
         for (at, m) in members.iter().enumerate() {
@@ -1291,6 +1517,102 @@ mod tests {
             };
             assert_eq!(lp.find(m, 2), want, "member {at} under a step of two");
         }
+    }
+
+    /// The backward walk finds its way from one entry to the one in front of it
+    /// through the back length rather than through a header, so it is a third
+    /// path over the same bytes and it has to agree with the other two about all
+    /// of them. Every member is asked for from the back and has to come back at
+    /// the position the forward walk gives it.
+    #[test]
+    fn the_backward_scan_agrees_with_the_forward_one_about_every_encoding() {
+        let members = every_encoding();
+        let lp = of(&members.iter().map(Vec::as_slice).collect::<Vec<_>>());
+        let n = members.len();
+        for (at, m) in members.iter().enumerate() {
+            let mut got = Vec::new();
+            lp.find_each_back(m, parse_i64(m), 0, &mut |back| {
+                got.push(n - back - 1);
+                true
+            });
+            assert_eq!(got, vec![at], "member {at} from the back");
+        }
+        for miss in [
+            b"aaaaaaaaaaaa".as_slice(),
+            b"baaaaaa7".as_slice(),
+            b"aaaaaaa9".as_slice(),
+            b"128".as_slice(),
+            b"-2".as_slice(),
+        ] {
+            let mut got = 0usize;
+            lp.find_each_back(miss, parse_i64(miss), 0, &mut |_| {
+                got += 1;
+                true
+            });
+            assert_eq!(got, 0, "{miss:?} is not in here");
+        }
+    }
+
+    /// Both walks over a blob where the same value is in it several times, which
+    /// is what `LPOS` and `LREM` are actually for and what the single answer
+    /// scan never exercises. The stop and the budget are checked here too, since
+    /// they are the two things the walk carries that a find does not.
+    #[test]
+    fn a_walk_over_every_match_gives_them_all_in_order_from_either_end() {
+        let members: Vec<Vec<u8>> = (0..30)
+            .map(|i| {
+                if i % 4 == 0 {
+                    b"x".to_vec()
+                } else {
+                    format!("element:{i:08}").into_bytes()
+                }
+            })
+            .collect();
+        let lp = of(&members.iter().map(Vec::as_slice).collect::<Vec<_>>());
+        let want: Vec<usize> = (0..30).filter(|i| i % 4 == 0).collect();
+
+        let mut got = Vec::new();
+        let looked = lp.find_each(b"x", None, 0, &mut |at| {
+            got.push(at);
+            true
+        });
+        assert_eq!(got, want);
+        assert_eq!(looked, 30, "no budget means the whole thing is read");
+
+        let mut got = Vec::new();
+        lp.find_each_back(b"x", None, 0, &mut |back| {
+            got.push(29 - back);
+            true
+        });
+        got.reverse();
+        assert_eq!(got, want, "the same matches, found the other way round");
+
+        // A stop after two, which must not read the rest.
+        let mut got = Vec::new();
+        let looked = lp.find_each(b"x", None, 0, &mut |at| {
+            got.push(at);
+            got.len() < 2
+        });
+        assert_eq!(got, vec![0, 4]);
+        assert_eq!(looked, 5, "the walk stopped where the second match was");
+
+        // And a budget, which is `MAXLEN`: ten elements looked at reaches the
+        // matches at 0, 4 and 8 and nothing after them.
+        let mut got = Vec::new();
+        let looked = lp.find_each(b"x", None, 10, &mut |at| {
+            got.push(at);
+            true
+        });
+        assert_eq!(got, vec![0, 4, 8]);
+        assert_eq!(looked, 10);
+
+        let mut got = Vec::new();
+        let looked = lp.find_each_back(b"x", None, 10, &mut |back| {
+            got.push(29 - back);
+            true
+        });
+        assert_eq!(got, vec![28, 24, 20], "ten from the back is 20 up");
+        assert_eq!(looked, 10);
     }
 
     /// A hash in this band is field, value, field, value, and a field lookup has
