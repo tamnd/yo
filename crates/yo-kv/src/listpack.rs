@@ -70,7 +70,7 @@
 //!
 //! [`crate::chunk`] holds the same entries in a run with a cursor at each end
 //! rather than in a blob with a header, so it needs the encoding and not the
-//! container. [`entry_len`], [`write_entry`], [`decode`] and [`read_backlen`]
+//! container. `entry_len`, `write_entry`, `decode` and `read_backlen`
 //! are `pub(crate)` for that, and they are the only things a second holder of
 //! these bytes needs. Two copies of the fourteen encodings is how a list and a
 //! set end up disagreeing about what `SADD s 1` stored.
