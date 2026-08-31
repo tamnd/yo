@@ -49,7 +49,7 @@
 use yo_common::num::DIGITS_MAX;
 use yo_common::num::i64_digits;
 use yo_common::{Error, Result, glob_matches, parse_i64};
-use yo_kv::{Aggregate, Keyspace, Member, Query, ZAdd, ZBound, ZOp};
+use yo_kv::{Aggregate, Keyspace, Member, Query, ZAdd, ZBound, ZEnd, ZOp};
 
 use super::args::{self, Args};
 use super::scan;
@@ -82,6 +82,13 @@ const BAD_LIMIT: &str = "LIMIT can't be negative";
 /// `NOVALUES` anywhere but `HSCAN`, which is where Redis reads the option and
 /// then says who it was meant for.
 const NOVALUES_IS_HSCAN: &str = "NOVALUES option can only be used in HSCAN";
+/// What `ZPOPMIN key -1` and `ZPOPMIN key x` both say, which is the range error
+/// and not the usual one about integers.
+const BAD_POP_COUNT: &str = "value is out of range, must be positive";
+/// What the two multi key pops say about a key count they will not take.
+pub(super) const BAD_NUMKEYS: &str = "numkeys should be greater than 0";
+/// And about a `COUNT` they will not take.
+pub(super) const BAD_MPOP_COUNT: &str = "count should be greater than 0";
 
 /// Run one sorted set command.
 ///
@@ -208,6 +215,8 @@ pub(super) fn execute(db: &mut Keyspace, spec: &Spec, args: Args<'_>, out: &mut 
         "zintercard" => out.int(count(intercard(db, args)?)),
         "zrandmember" => randmember(db, args, out)?,
         "zscan" => zscan(db, args, out)?,
+        "zpopmin" | "zpopmax" => pop(db, end_of_name(spec.name), args, out)?,
+        "zmpop" => mpop(db, args, out)?,
         // The table and this match are checked against each other by
         // `cargo xtask check`, so a name reaching here is a table row without a
         // handler and there is nothing sensible to answer.
@@ -752,6 +761,138 @@ fn zscan(db: &mut Keyspace, args: Args<'_>, out: &mut Out) -> Result<()> {
         })?;
         Ok((next, n))
     })
+}
+
+/// `ZPOPMIN key [count]` and `ZPOPMAX key [count]`.
+///
+/// The two forms answer different shapes and it is the presence of the count
+/// that decides which, not its value. Without one the reply is a flat member and
+/// score, and `ZPOPMIN nokey` is an empty array rather than a null, which is the
+/// one place a sorted set pop and a list pop disagree. With one the reply is a
+/// list of pairs, nested on RESP3 and flattened on RESP2, and `ZPOPMIN key 0` is
+/// an empty array the same way a missing key is.
+///
+/// A count that is not a whole number at least zero is the range error and not
+/// the usual complaint about integers, so `ZPOPMIN key x` and `ZPOPMIN key -1`
+/// give the same answer.
+fn pop(db: &mut Keyspace, end: ZEnd, args: Args<'_>, out: &mut Out) -> Result<()> {
+    let want = match args.len() {
+        2 => None,
+        3 => match args.int(2) {
+            Ok(n) if n >= 0 => Some(usize::try_from(n).unwrap_or(usize::MAX)),
+            _ => return Err(Error::new(yo_common::Code::Invalid, BAD_POP_COUNT)),
+        },
+        _ => return Err(args::syntax()),
+    };
+    let nested = want.is_some() && out.proto().is_resp3();
+    let start = out.len();
+    let mut n = 0;
+    db.zpop(args.get(1), end, want.unwrap_or(1), |m, sc| {
+        if nested {
+            out.array(2);
+        }
+        write_member(out, m);
+        out.double(sc);
+        n += 1;
+    })?;
+    // The form without a count is one flat pair, so two elements or none. The
+    // form with one is as many pairs as were popped, which is that many elements
+    // nested and twice that many flat.
+    out.close_array(start, if nested { n } else { n * 2 });
+    Ok(())
+}
+
+/// `ZMPOP numkeys key [key ...] MIN|MAX [COUNT count]`.
+///
+/// The same shape `LMPOP` has and the same parse, down to a key count that runs
+/// past the arguments being a plain syntax error: the word that should have been
+/// the direction is swallowed as a key and there is no direction left to read.
+///
+/// The pairs are nested on both protocols here, unlike [`pop`], because the
+/// reply already has a key name in front of them and there is nothing left to
+/// flatten into.
+fn mpop(db: &mut Keyspace, args: Args<'_>, out: &mut Out) -> Result<()> {
+    let (end, from, to, want) = parse_mpop(args, 1)?;
+    for i in from..to {
+        let key = args.get(i);
+        // `ZCARD` and not a pop that reports nothing, because the name of the
+        // key that answered goes out in front of the members and has to be
+        // written before them. A key of another type is an error here, the same
+        // as it would be if it were the only key named.
+        if db.zcard(key)? == 0 {
+            continue;
+        }
+        out.array(2);
+        out.bulk(key);
+        let mark = out.len();
+        let n = db.zpop(key, end, want, |m, sc| {
+            out.array(2);
+            write_member(out, m);
+            out.double(sc);
+        })?;
+        out.close_array(mark, n);
+        return Ok(());
+    }
+    // A null array and not a null, the same as `LMPOP`, so a RESP2 client sees
+    // `*-1` where the reply would have been a two element array.
+    out.nil_array();
+    Ok(())
+}
+
+/// The parse `ZMPOP` and `BZMPOP` share, starting at the argument holding the
+/// key count.
+///
+/// Answers the end to pop from, the range of arguments holding the keys, and how
+/// many to take.
+///
+/// # Errors
+///
+/// A key count that is not a positive number, one that leaves no room for the
+/// direction, a direction that is not `MIN` or `MAX`, and a count that is not a
+/// positive number.
+pub(super) fn parse_mpop(args: Args<'_>, at: usize) -> Result<(ZEnd, usize, usize, usize)> {
+    let numkeys = match args.int(at) {
+        Ok(n) if n > 0 => usize::try_from(n).unwrap_or(usize::MAX),
+        _ => return Err(Error::new(yo_common::Code::Invalid, BAD_NUMKEYS)),
+    };
+    let from = at + 1;
+    if numkeys >= args.len() - from {
+        return Err(args::syntax());
+    }
+    let to = from + numkeys;
+    let end = end_of(args.get(to))?;
+    let mut want = 1usize;
+    if to + 1 < args.len() {
+        if args.len() != to + 3 || !args::is(args.get(to + 1), b"count") {
+            return Err(args::syntax());
+        }
+        want = match args.int(to + 2) {
+            Ok(n) if n > 0 => usize::try_from(n).unwrap_or(usize::MAX),
+            _ => return Err(Error::new(yo_common::Code::Invalid, BAD_MPOP_COUNT)),
+        };
+    }
+    Ok((end, from, to, want))
+}
+
+/// `MIN` or `MAX`, and a syntax error for anything else.
+pub(super) fn end_of(arg: &[u8]) -> Result<ZEnd> {
+    if args::is(arg, b"min") {
+        Ok(ZEnd::Min)
+    } else if args::is(arg, b"max") {
+        Ok(ZEnd::Max)
+    } else {
+        Err(args::syntax())
+    }
+}
+
+/// Which end a command's own name asks for, which is the whole difference
+/// between `ZPOPMIN` and `ZPOPMAX` and between the two that block.
+pub(super) fn end_of_name(name: &str) -> ZEnd {
+    if name.ends_with("min") {
+        ZEnd::Min
+    } else {
+        ZEnd::Max
+    }
 }
 
 /// Whether a member survives a `MATCH` pattern.

@@ -4621,6 +4621,181 @@ mod tests {
         );
     }
 
+    /// The count is what decides the shape, and its value is not.
+    #[test]
+    fn a_sorted_set_pop_changes_shape_when_it_is_given_a_count() {
+        let mut f = Fixture::new();
+        f.run(&[b"ZADD", b"z", b"1", b"a", b"2", b"b", b"3", b"c"]);
+        // No count, so one flat pair, and the score is a bulk string on RESP2.
+        assert_eq!(f.run(&[b"ZPOPMIN", b"z"]), "*2\r\n$1\r\na\r\n$1\r\n1\r\n");
+        assert_eq!(f.run(&[b"ZPOPMAX", b"z"]), "*2\r\n$1\r\nc\r\n$1\r\n3\r\n");
+        f.run(&[b"ZADD", b"z", b"1", b"a", b"3", b"c"]);
+        // A count, so pairs, and on RESP2 they are flattened into one run.
+        assert_eq!(
+            f.run(&[b"ZPOPMIN", b"z", b"2"]),
+            "*4\r\n$1\r\na\r\n$1\r\n1\r\n$1\r\nb\r\n$1\r\n2\r\n"
+        );
+        // An empty array rather than a null, which is where a sorted set pop and
+        // a list pop part company, and the same answer a count of zero gives.
+        assert_eq!(f.run(&[b"ZPOPMIN", b"nokey"]), "*0\r\n");
+        assert_eq!(f.run(&[b"ZPOPMIN", b"nokey", b"2"]), "*0\r\n");
+        assert_eq!(f.run(&[b"ZPOPMIN", b"z", b"0"]), "*0\r\n");
+        // The last member takes the key with it.
+        assert_eq!(
+            f.run(&[b"ZPOPMIN", b"z", b"9"]),
+            "*2\r\n$1\r\nc\r\n$1\r\n3\r\n"
+        );
+        assert_eq!(f.run(&[b"EXISTS", b"z"]), ":0\r\n");
+
+        f.run(&[b"ZADD", b"z", b"1", b"a", b"2", b"b"]);
+        f.out = Out::new(Proto::Resp3);
+        assert_eq!(f.run(&[b"ZPOPMIN", b"z"]), "*2\r\n$1\r\na\r\n,1\r\n");
+        assert_eq!(
+            f.run(&[b"ZPOPMIN", b"z", b"1"]),
+            "*1\r\n*2\r\n$1\r\nb\r\n,2\r\n"
+        );
+        f.out = Out::new(Proto::Resp2);
+        // Both of these are the range error rather than the usual sentence about
+        // integers, which is the odd answer and so the one worth copying.
+        let bad = "-ERR value is out of range, must be positive\r\n";
+        assert_eq!(f.run(&[b"ZPOPMIN", b"z", b"x"]), bad);
+        assert_eq!(f.run(&[b"ZPOPMIN", b"z", b"-1"]), bad);
+        assert_eq!(
+            f.run(&[b"ZPOPMIN", b"z", b"1", b"2"]),
+            "-ERR syntax error\r\n"
+        );
+    }
+
+    /// `ZMPOP`, which is `LMPOP` with scores and the same parse.
+    #[test]
+    fn a_multi_key_pop_names_the_key_that_answered_and_nests_its_pairs() {
+        let mut f = Fixture::new();
+        f.run(&[b"ZADD", b"z", b"1", b"a", b"2", b"b", b"3", b"c"]);
+        assert_eq!(
+            f.run(&[b"ZMPOP", b"2", b"nokey", b"z", b"MIN"]),
+            "*2\r\n$1\r\nz\r\n*1\r\n*2\r\n$1\r\na\r\n$1\r\n1\r\n"
+        );
+        // Nested on RESP2 as well, because the key name is already in front of
+        // the pairs and there is nothing left to flatten into.
+        assert_eq!(
+            f.run(&[b"ZMPOP", b"1", b"z", b"MAX", b"COUNT", b"2"]),
+            "*2\r\n$1\r\nz\r\n*2\r\n*2\r\n$1\r\nc\r\n$1\r\n3\r\n*2\r\n$1\r\nb\r\n$1\r\n2\r\n"
+        );
+        // A null array and not a null, the same as LMPOP.
+        assert_eq!(f.run(&[b"ZMPOP", b"1", b"nokey", b"MIN"]), "*-1\r\n");
+        f.out = Out::new(Proto::Resp3);
+        assert_eq!(f.run(&[b"ZMPOP", b"1", b"nokey", b"MIN"]), "_\r\n");
+        f.out = Out::new(Proto::Resp2);
+        let numkeys = "-ERR numkeys should be greater than 0\r\n";
+        for bad in [
+            &[b"ZMPOP".as_slice(), b"0", b"z", b"MIN"][..],
+            &[b"ZMPOP", b"-1", b"z", b"MIN"],
+            &[b"ZMPOP", b"x", b"z", b"MIN"],
+        ] {
+            assert_eq!(f.run(bad), numkeys, "{:?}", bad[1]);
+        }
+        let count = "-ERR count should be greater than 0\r\n";
+        for bad in [
+            &[b"ZMPOP".as_slice(), b"1", b"z", b"MIN", b"COUNT", b"0"][..],
+            &[b"ZMPOP", b"1", b"z", b"MIN", b"COUNT", b"-1"],
+            &[b"ZMPOP", b"1", b"z", b"MIN", b"COUNT", b"x"],
+        ] {
+            assert_eq!(f.run(bad), count, "{:?}", bad[5]);
+        }
+        let syntax = "-ERR syntax error\r\n";
+        for bad in [
+            // Two keys named and one given, so the word that should have been
+            // the direction is a key and there is no direction left.
+            &[b"ZMPOP".as_slice(), b"2", b"z", b"MIN"][..],
+            &[b"ZMPOP", b"1", b"z", b"SIDEWAYS"],
+            &[b"ZMPOP", b"1", b"z", b"MIN", b"junk"],
+            &[b"ZMPOP", b"1", b"z", b"MIN", b"COUNT", b"1", b"junk"],
+        ] {
+            assert_eq!(f.run(bad), syntax, "{bad:?}");
+        }
+    }
+
+    /// The three that wait, when there is something there and they do not have
+    /// to. `BZPOPMIN` is the one reply in the group that is three flat elements.
+    #[test]
+    fn the_sorted_set_pops_that_wait_answer_like_the_ones_they_wrap() {
+        let mut f = Fixture::new();
+        f.run(&[b"ZADD", b"z", b"1", b"a", b"2", b"b", b"3", b"c"]);
+        assert_eq!(
+            f.flow(&[b"BZPOPMIN", b"nokey", b"z", b"0"]),
+            (
+                Flow::Continue,
+                "*3\r\n$1\r\nz\r\n$1\r\na\r\n$1\r\n1\r\n".to_owned()
+            )
+        );
+        assert_eq!(
+            f.run(&[b"BZPOPMAX", b"z", b"0"]),
+            "*3\r\n$1\r\nz\r\n$1\r\nc\r\n$1\r\n3\r\n"
+        );
+        f.run(&[b"ZADD", b"z", b"1", b"a", b"3", b"c"]);
+        assert_eq!(
+            f.run(&[
+                b"BZMPOP", b"0", b"2", b"nokey", b"z", b"MIN", b"COUNT", b"2"
+            ]),
+            "*2\r\n$1\r\nz\r\n*2\r\n*2\r\n$1\r\na\r\n$1\r\n1\r\n*2\r\n$1\r\nb\r\n$1\r\n2\r\n"
+        );
+        f.out = Out::new(Proto::Resp3);
+        assert_eq!(
+            f.run(&[b"BZPOPMIN", b"z", b"0"]),
+            "*3\r\n$1\r\nz\r\n$1\r\nc\r\n,3\r\n"
+        );
+        f.out = Out::new(Proto::Resp2);
+        // Nothing to take, so the client is parked and nothing was written.
+        assert_eq!(
+            f.flow(&[b"BZPOPMIN", b"z", b"0"]),
+            (Flow::Block, String::new())
+        );
+        assert_eq!(
+            f.flow(&[b"BZMPOP", b"0", b"1", b"z", b"MIN"]),
+            (Flow::Block, String::new())
+        );
+        // The timeout is read before the key count, so this complains about the
+        // timeout and not about the count.
+        assert_eq!(
+            f.run(&[b"BZMPOP", b"abc", b"0", b"z", b"MIN"]),
+            "-ERR timeout is not a float or out of range\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"BZMPOP", b"0", b"0", b"z", b"MIN"]),
+            "-ERR numkeys should be greater than 0\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"BZPOPMIN", b"z", b"-1"]),
+            "-ERR timeout is negative\r\n"
+        );
+    }
+
+    /// A parked sorted set client is served by whatever puts a member under one
+    /// of its keys, and is not served by something of another type landing
+    /// there.
+    #[test]
+    fn a_parked_sorted_set_client_waits_for_a_member_and_not_for_a_key() {
+        let mut f = Fixture::new();
+        assert_eq!(f.flow(&[b"BZPOPMIN", b"z", b"0"]).0, Flow::Block);
+        assert_eq!(f.server.waiters().len(), 1);
+        // A string under the key is not what it asked for, so it stays parked
+        // rather than being handed a WRONGTYPE on a command that was accepted.
+        f.run(&[b"SET", b"z", b"v"]);
+        let mut out = Out::new(Proto::Resp2);
+        assert!(!f.server.serve_waiter(0, 0, &mut out));
+        assert!(out.as_slice().is_empty());
+        f.run(&[b"DEL", b"z"]);
+        f.run(&[b"ZADD", b"z", b"5", b"m"]);
+        assert!(f.server.serve_waiter(0, 0, &mut out));
+        assert_eq!(
+            core::str::from_utf8(out.as_slice()).expect("ascii"),
+            "*3\r\n$1\r\nz\r\n$1\r\nm\r\n$1\r\n5\r\n"
+        );
+        // And the member is gone, which is what makes a queue of workers on a
+        // sorted set work at all.
+        assert_eq!(f.run(&[b"EXISTS", b"z"]), ":0\r\n");
+    }
+
     #[test]
     fn every_sorted_set_command_says_wrongtype_and_writes_nothing() {
         let mut f = Fixture::new();
@@ -4656,6 +4831,12 @@ mod tests {
             &[b"ZINTERCARD", b"1", b"s"],
             &[b"ZRANDMEMBER", b"s"],
             &[b"ZSCAN", b"s", b"0"],
+            &[b"ZPOPMIN", b"s"],
+            &[b"ZPOPMAX", b"s", b"2"],
+            &[b"ZMPOP", b"1", b"s", b"MIN"],
+            &[b"BZPOPMIN", b"s", b"0"],
+            &[b"BZPOPMAX", b"s", b"0"],
+            &[b"BZMPOP", b"0", b"1", b"s", b"MIN"],
         ] {
             assert_eq!(f.run(cmd), wrong, "{:?}", cmd[0]);
         }

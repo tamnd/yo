@@ -133,3 +133,7 @@ pub use yo_index::Cursor as KeyCursor;
 pub use zset::{Bound as ZBound, Lex, Limits as ZsetLimits, Zset};
 pub use zsetops::{Aggregate, Op as ZOp, Operand};
 pub use zsets::{By, Gate, Move, Query, Window, ZAdd};
+// Which end of a sorted set a pop works from. Renamed on the way out because
+// `From` is in every Rust prelude and a second one under that name would be a
+// trap for every file that imports this crate with a glob.
+pub use zsets::From as ZEnd;

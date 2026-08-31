@@ -43,11 +43,12 @@
 //! rule about when to look.
 
 use yo_common::{Code, Error, Result, num};
-use yo_kv::{End, Entry, Keyspace};
+use yo_kv::{End, Entry, Keyspace, Member, ZEnd};
 
 use super::args::{self, Args};
 use super::lists::{BAD_MPOP_COUNT, BAD_NUMKEYS, end_of};
 use super::table::Spec;
+use super::zsets;
 use super::{Flow, Server, Session};
 use crate::reply::Out;
 
@@ -107,6 +108,23 @@ pub(super) fn execute(
             )
         }
         "blmpop" => mpop(args, now)?,
+        // The sorted set three, which are the same three shapes again with a
+        // different collection under them. `BZPOPMIN` reads its keys up to the
+        // timeout the way `BLPOP` does, and `BZMPOP` counts them the way
+        // `BLMPOP` does.
+        "bzpopmin" | "bzpopmax" => {
+            let end = zsets::end_of_name(spec.name);
+            let deadline = timeout(args.get(last), now)?;
+            (deadline, Block::zpop((1..last).map(|i| args.get(i)), end))
+        }
+        "bzmpop" => {
+            let deadline = timeout(args.get(1), now)?;
+            let (end, from, to, count) = zsets::parse_mpop(args, 2)?;
+            (
+                deadline,
+                Block::zmpop((from..to).map(|i| args.get(i)), end, count),
+            )
+        }
         // The table and this match are checked against each other by
         // `cargo xtask check`, so a name reaching here is a table row without a
         // handler and there is nothing sensible to answer.
@@ -198,6 +216,11 @@ enum Want {
     Move { dst: Vec<u8>, from: End, to: End },
     /// `BLMPOP`: up to `count` elements off the first key that has any.
     Mpop { end: End, count: usize },
+    /// `BZPOPMIN` and `BZPOPMAX`: one member and its score off the first sorted
+    /// set that has one, with the reply saying which key that turned out to be.
+    ZPop { end: ZEnd },
+    /// `BZMPOP`: up to `count` members off the first sorted set that has any.
+    ZMpop { end: ZEnd, count: usize },
 }
 
 impl Want {
@@ -252,6 +275,42 @@ impl Want {
                 }
                 Ok(false)
             }
+            // Three elements and not two, because `BZPOPMIN` puts the key, the
+            // member and the score side by side rather than pairing the last
+            // two. That is Redis's shape and it is not the shape `ZPOPMIN` has.
+            Want::ZPop { end } => {
+                for key in keys {
+                    if !zready(db, key, strict)? {
+                        continue;
+                    }
+                    out.array(3);
+                    out.bulk(key);
+                    db.zpop(key, *end, 1, |m, sc| {
+                        member(out, m);
+                        out.double(sc);
+                    })?;
+                    return Ok(true);
+                }
+                Ok(false)
+            }
+            Want::ZMpop { end, count } => {
+                for key in keys {
+                    if !zready(db, key, strict)? {
+                        continue;
+                    }
+                    out.array(2);
+                    out.bulk(key);
+                    let mark = out.len();
+                    let n = db.zpop(key, *end, *count, |m, sc| {
+                        out.array(2);
+                        member(out, m);
+                        out.double(sc);
+                    })?;
+                    out.close_array(mark, n);
+                    return Ok(true);
+                }
+                Ok(false)
+            }
             // The source's length first, so that an empty source never reaches
             // the destination's type check. `BLMOVE empty string LEFT RIGHT 0.1`
             // times out on a running Redis rather than answering `WRONGTYPE`,
@@ -293,12 +352,30 @@ fn ready(db: &mut Keyspace, key: &[u8], strict: bool) -> Result<bool> {
     }
 }
 
+/// The same for a sorted set, which has its own emptiness to ask about.
+fn zready(db: &mut Keyspace, key: &[u8], strict: bool) -> Result<bool> {
+    match db.zcard(key) {
+        Ok(n) => Ok(n > 0),
+        Err(e) if strict => Err(e),
+        Err(_) => Ok(false),
+    }
+}
+
 /// One element as the client sees it, the same as [`super::lists`] writes it.
 #[inline]
 fn element(out: &mut Out, e: Entry<'_>) {
     match e {
         Entry::Int(n) => out.bulk_int(n),
         Entry::Str(s) => out.bulk(s),
+    }
+}
+
+/// One member as the client sees it, the same as [`super::zsets`] writes it.
+#[inline]
+fn member(out: &mut Out, m: Member<'_>) {
+    match m {
+        Member::Int(n) => out.bulk_int(n),
+        Member::Str(s) => out.bulk(s),
     }
 }
 
@@ -327,6 +404,22 @@ impl Block {
         Block {
             keys: owned(keys),
             want: Want::Mpop { end, count },
+        }
+    }
+
+    /// `BZPOPMIN` and `BZPOPMAX`.
+    fn zpop<'a>(keys: impl Iterator<Item = &'a [u8]>, end: ZEnd) -> Block {
+        Block {
+            keys: owned(keys),
+            want: Want::ZPop { end },
+        }
+    }
+
+    /// `BZMPOP`.
+    fn zmpop<'a>(keys: impl Iterator<Item = &'a [u8]>, end: ZEnd, count: usize) -> Block {
+        Block {
+            keys: owned(keys),
+            want: Want::ZMpop { end, count },
         }
     }
 

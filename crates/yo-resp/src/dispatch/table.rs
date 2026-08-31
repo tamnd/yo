@@ -99,6 +99,11 @@ const AC_ZSET_WRITE_FAST: &[&str] = &["@write", "@sortedset", "@fast"];
 /// The sorted set write side for the ones whose cost is the size of the window
 /// they touch, which is the removals and `ZRANGESTORE`.
 const AC_ZSET_WRITE_SLOW: &[&str] = &["@write", "@sortedset", "@slow"];
+/// The two sorted set pops that can wait, which Redis counts as fast because
+/// each of them takes one member.
+const AC_ZSET_BLOCKING_FAST: &[&str] = &["@write", "@sortedset", "@fast", "@blocking"];
+/// And `BZMPOP`, whose cost is the number of keys named and the count popped.
+const AC_ZSET_BLOCKING_SLOW: &[&str] = &["@write", "@sortedset", "@slow", "@blocking"];
 /// Read only and not counted as fast, for a command whose keys are counted
 /// rather than positioned, so a client has to read the key specs to route it.
 const READ_MOVABLE: &[&str] = &["readonly", "movablekeys"];
@@ -1736,6 +1741,90 @@ pub static COMMANDS: &[Spec] = &[
         since: "2.8.0",
         complexity: "O(1) per call, O(N) over a full walk",
         summary: "Walk the members and their scores a batch at a time.",
+        group: "zset",
+    },
+    // The pops. Redis calls the two single key ones fast even though they cost a
+    // logarithm, on the grounds that the logarithm is of a size a client chose.
+    Spec {
+        name: "zpopmin",
+        arity: -2,
+        flags: WRITE_FAST,
+        first_key: 1,
+        last_key: 1,
+        step: 1,
+        acl: AC_ZSET_WRITE_FAST,
+        since: "5.0.0",
+        complexity: "O(log(N)*M) with M the number of members popped",
+        summary: "Take the lowest scoring members off and answer them.",
+        group: "zset",
+    },
+    Spec {
+        name: "zpopmax",
+        arity: -2,
+        flags: WRITE_FAST,
+        first_key: 1,
+        last_key: 1,
+        step: 1,
+        acl: AC_ZSET_WRITE_FAST,
+        since: "5.0.0",
+        complexity: "O(log(N)*M) with M the number of members popped",
+        summary: "Take the highest scoring members off and answer them.",
+        group: "zset",
+    },
+    // Keys behind a count, so the same three zeroes `LMPOP` has, and `write`
+    // without `denyoom` because a pop cannot grow the keyspace.
+    Spec {
+        name: "zmpop",
+        arity: -4,
+        flags: &["write", "movablekeys"],
+        first_key: 0,
+        last_key: 0,
+        step: 0,
+        acl: AC_ZSET_WRITE_SLOW,
+        since: "7.0.0",
+        complexity: "O(K) + O(M*log(N)) with K the keys named and M the count popped",
+        summary: "Pop from the first of several sorted sets that has anything in it.",
+        group: "zset",
+    },
+    // The three that wait. `blocking` is what the dispatcher branches on, the
+    // same as it is for the five list ones.
+    Spec {
+        name: "bzpopmin",
+        arity: -3,
+        flags: &["write", "blocking", "fast"],
+        first_key: 1,
+        last_key: -2,
+        step: 1,
+        acl: AC_ZSET_BLOCKING_FAST,
+        since: "5.0.0",
+        complexity: "O(log(N)) with N the size of the sorted set that answers",
+        summary: "Take the lowest scoring member off the first sorted set that has one, waiting if none does.",
+        group: "zset",
+    },
+    Spec {
+        name: "bzpopmax",
+        arity: -3,
+        flags: &["write", "blocking", "fast"],
+        first_key: 1,
+        last_key: -2,
+        step: 1,
+        acl: AC_ZSET_BLOCKING_FAST,
+        since: "5.0.0",
+        complexity: "O(log(N)) with N the size of the sorted set that answers",
+        summary: "Take the highest scoring member off the first sorted set that has one, waiting if none does.",
+        group: "zset",
+    },
+    Spec {
+        name: "bzmpop",
+        arity: -5,
+        flags: &["write", "blocking", "movablekeys"],
+        first_key: 0,
+        last_key: 0,
+        step: 0,
+        acl: AC_ZSET_BLOCKING_SLOW,
+        since: "7.0.0",
+        complexity: "O(K) + O(M*log(N)) with K the keys named and M the count popped",
+        summary: "Pop from the first of several sorted sets that has anything, waiting if none does.",
         group: "zset",
     },
     // ------------------------------------------------------------ keyspace

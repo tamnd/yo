@@ -89,11 +89,12 @@ doc = "08 section 4"
 [[group]]
 name = "zset"
 expected = 35
-status = "partial"
+status = "shipped"
 doc = "08 section 5"
-# The type and the keyspace layer are done, all 35 commands' worth, and the wire
-# is going out in batches the way the list went. What is here is the ten that
-# answer about one member or count without walking a range.
+# All thirty five are here, keyspace and wire both. The wire went out in five
+# batches the way the list did: the ten that answer about one member or count,
+# the ten range spellings, the algebra and the draw and the scan, and then the
+# six pops with the three that wait among them.
 
 [[group]]
 name = "array"
@@ -1772,6 +1773,72 @@ bounded = "inherent"
 status = "shipped"
 wire = "verified"
 notes = "The guarantee is the one every scan gives: a member that was there for the whole walk is seen at least once. A listpack sorted set comes back whole with a cursor of zero, since a listpack has no stable position to resume from and 128 members is not worth a resume. This is the one sorted set reply where a score is not a double on RESP3, because a scan answers pairs of bulk strings whatever the protocol, which is Redis's shape and the same one HSCAN has."
+
+[[command]]
+name = "ZPOPMIN"
+group = "zset"
+since = "5.0.0"
+arity = -2
+plan = "point"
+bounded = "inherent"
+status = "shipped"
+wire = "verified"
+notes = "The presence of the count decides the reply shape and its value does not. Without a count the answer is one flat member and score, and with one it is a list of pairs, nested on RESP3 and flattened on RESP2. A missing key answers an empty array rather than a null, which is where a sorted set pop and a list pop part company, and ZPOPMIN key 0 answers the same empty array a missing key does. A count that is negative or is not a number at all gets value is out of range, must be positive rather than the usual sentence about integers."
+
+[[command]]
+name = "ZPOPMAX"
+group = "zset"
+since = "5.0.0"
+arity = -2
+plan = "point"
+bounded = "inherent"
+status = "shipped"
+wire = "verified"
+notes = "ZPOPMIN from the other end and the same code. Nothing is collected on the way out: the member is handed to the writer and only then removed, so a pop of a thousand members allocates nothing."
+
+[[command]]
+name = "ZMPOP"
+group = "zset"
+since = "7.0.0"
+arity = -4
+plan = "merge"
+bounded = "inherent"
+status = "shipped"
+wire = "verified"
+notes = "The keys are behind a count, so COMMAND INFO reports no key positions and a cluster client has to ask COMMAND GETKEYS. The first key holding anything is the one that is popped and a key of another type anywhere in the list is an error even when an earlier key would have answered. The pairs are nested on both protocols, unlike ZPOPMIN with a count, because the reply already has the key name in front of them and there is nothing left to flatten into. Nothing to pop is a null array and not a null."
+
+[[command]]
+name = "BZPOPMIN"
+group = "zset"
+since = "5.0.0"
+arity = -3
+plan = "point"
+bounded = "inherent"
+status = "shipped"
+wire = "verified"
+notes = "ZPOPMIN with a wait, and the reply is three elements side by side rather than a key and a pair: the key, the member and the score. That is not the shape ZPOPMIN has and it is Redis's. A key that holds something other than a sorted set is an error when the command arrives and is skipped when a parked client is retried, so a ZADD to a key somebody is blocked on serves them and a SET to it leaves them waiting."
+
+[[command]]
+name = "BZPOPMAX"
+group = "zset"
+since = "5.0.0"
+arity = -3
+plan = "point"
+bounded = "inherent"
+status = "shipped"
+wire = "verified"
+notes = "BZPOPMIN from the other end and the same code. On a timeout it answers a null array and not a null member, which a RESP2 client can see as *-1 rather than $-1."
+
+[[command]]
+name = "BZMPOP"
+group = "zset"
+since = "7.0.0"
+arity = -5
+plan = "merge"
+bounded = "inherent"
+status = "shipped"
+wire = "verified"
+notes = "ZMPOP with a wait, and the same parse shifted along by one. The timeout is read before the key count, so BZMPOP abc 1 k MIN complains about the timeout and not about the count. A key count that leaves no room for the direction is a plain syntax error, because the word that should have been MIN or MAX is swallowed as a key and there is nothing left to read."
 
 
 # ------------------------------------------------------------------ scripting
