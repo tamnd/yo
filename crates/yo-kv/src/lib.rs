@@ -41,8 +41,18 @@
 //! the element it inserted. It is the variable width scheme Y19 settles on, it
 //! reproduces K14's eight inserts per byte, and like aki's own first slice of
 //! this it ships proven and wired to nothing: the representation that stores a
-//! list by key rather than by position is the partitioned band, and that is the
-//! next piece of M4 rather than this one.
+//! list by key rather than by position is the partitioned band below, and the
+//! wiring is a later piece of M4 than either of them.
+//!
+//! [`Parts`] is the partitioned band, which is what a collection becomes once it
+//! is too large to be one element table. It is P tables with a member's
+//! partition taken out of its hash, and in front of them the descriptor cache
+//! `05` calls mandatory, which is what lets an operation know how the elements
+//! are spread without adding up all P of them. What partitioning is really for is
+//! the merge, the growth and the reclaim, none of which want to touch a million
+//! element table at once. The cache turned out not to be the locality problem it
+//! reads as, and `benches/parts.rs` has the measurement and the module doc has
+//! the argument.
 //!
 //! The pieces of M3 that are here already are the ones every collection shares.
 //! [`Elements`] is the element table a hash, a set and a sorted set are all
@@ -101,6 +111,7 @@ pub mod list;
 pub mod listpack;
 pub mod lists;
 pub mod orderkey;
+pub mod parts;
 pub mod rank;
 pub mod scan;
 pub mod set;
@@ -131,6 +142,7 @@ pub use lcs::{Idx as LcsIdx, LCS_MAX_CELLS, Match as LcsMatch};
 pub use list::{Limits as ListLimits, List};
 pub use listpack::{Entry, Listpack, Malformed};
 pub use lists::End;
+pub use parts::{PART_MIN, PARTITION_AT, Parts};
 pub use rank::Rank;
 pub use scan::{Cursor, MAX_PARTS};
 pub use set::{Limits as SetLimits, Member, Set};
