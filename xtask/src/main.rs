@@ -1,11 +1,13 @@
 //! Repository chores that need to be the same on every machine.
 //!
-//! Two commands and no configuration:
+//! No configuration anywhere in here, and the commands are:
 //!
 //! ```text
 //! cargo xtask generate   write api.model.json and include/yo.h
 //! cargo xtask check      regenerate in memory and fail on a diff
 //! cargo xtask reserve    the registry name audit, in xtask/reserve.py
+//! cargo xtask cross      clippy for the two targets this laptop is not
+//! cargo xtask alloc      what allocates on a command path, in xtask/alloc.py
 //! ```
 //!
 //! `check` is what CI runs. Generated files are checked in so that a binding
@@ -19,11 +21,19 @@
 //! rules are in `12` sections 3 and 10, and neither is worth writing down
 //! unless something enforces it.
 //!
-//! `reserve` is the odd one out: it is a Python program that this command only
-//! launches. `dx/16` §10 has the argument, and the short version is that doing
-//! it in Rust means an HTTP client, a TLS stack and a JSON parser in a
-//! workspace whose dependency list is short enough that a user can read it, for
-//! the sake of a tool that runs once a week.
+//! `reserve` and `alloc` are the odd ones out: they are Python programs that
+//! this command only launches. `dx/16` §10 has the argument, and the short
+//! version is that doing them in Rust means an HTTP client, a TLS stack and a
+//! JSON parser in a workspace whose dependency list is short enough that a user
+//! can read it, for the sake of tools that run once a week.
+//!
+//! `alloc` is the instrument behind the Y7 work. It builds `yodb`, starts it
+//! with the allocation check in report mode, sends a few thousand commands
+//! covering every type and prints one line per place that allocated on a
+//! command path. It lives here rather than in a test because it needs a server
+//! and a socket, and it lives in the repository rather than in somebody's `tmp`
+//! because a list of violations is worth nothing if the next person cannot
+//! produce the same one.
 
 mod emit_header;
 mod emit_model;
@@ -67,15 +77,16 @@ fn main() {
     match cmd.as_deref() {
         Some("generate") => generate(),
         Some("check") => check(),
-        Some("reserve") => reserve(),
+        Some("reserve") => python("reserve.py"),
         Some("cross") => cross(),
+        Some("alloc") => python("alloc.py"),
         Some(other) => {
             eprintln!("unknown command: {other}");
-            eprintln!("usage: cargo xtask [generate|check|reserve|cross]");
+            eprintln!("usage: cargo xtask [generate|check|reserve|cross|alloc]");
             process::exit(2);
         }
         None => {
-            eprintln!("usage: cargo xtask [generate|check|reserve|cross]");
+            eprintln!("usage: cargo xtask [generate|check|reserve|cross|alloc]");
             process::exit(2);
         }
     }
@@ -131,16 +142,16 @@ fn cross() {
     println!("ok       every target lints clean");
 }
 
-/// Hands everything after `reserve` to `xtask/reserve.py` and exits with its
-/// status.
+/// Hands everything after the subcommand to a script in `xtask/` and exits with
+/// its status.
 ///
 /// The exit code is forwarded rather than collapsed to zero or one, because
 /// `reserve verify` uses three of them and the difference is the point: 0 is
 /// held, 1 is a name lost or transferred, and 2 is a probe that could not get
 /// an answer at all. A wrapper that turned 2 into 1 would be reintroducing the
 /// bug `dx/16` §10 property 3 was written about.
-fn reserve() {
-    let script = root().join("xtask").join("reserve.py");
+fn python(name: &str) {
+    let script = root().join("xtask").join(name);
     let args: Vec<String> = std::env::args().skip(2).collect();
 
     // `python3` and not `python`. On a machine where both exist, `python` is as
