@@ -139,3 +139,17 @@ title = "PEXPIREAT clamps a deadline past the year 4199"
 reason = "Redis holds a key's deadline in a full signed long, so PEXPIREAT key 9223372036854775807 stores that number and PTTL reads it back. A record here holds the deadline in forty six bits, which runs out in the year 4199, so anything past that is clamped to the top of the range. The command answers 1 either way and the key does not expire either way, so the only thing a client can see is PTTL naming a different absurd number than the absurd number it asked for. The alternative is refusing the command, which would break a client that uses a large constant to mean never, and the other alternative is widening the record, which would cost eighteen bits on every key that has a deadline to hold a range no clock will reach."
 status = "permanent"
 spec = "08 section 4"
+
+[[divergence]]
+id = "D-18"
+title = "An array holds four gigabytes of long values per key and one gigabyte per value"
+reason = "Values of eight bytes or more go into one growable blob per key and the position word points into it with a thirty two bit start and a thirty bit length, which is what makes an array cost eight bytes and the payload per element where Redis pays a tagged pointer and a malloc header on top. The price is those two ceilings, and a write that would cross either is refused with an error rather than truncated. Redis has no such limit because it allocates each value on its own. Four gigabytes of long values in one array key is already past what a single key should hold, and the refusal is loud, so a client that hits it finds out rather than reading back a value it did not write."
+status = "permanent"
+spec = "08 section 1"
+
+[[divergence]]
+id = "D-19"
+title = "A slice goes dense on how wide it is as well as how full it is"
+reason = "Redis turns a sparse slice into a dense one once it holds more than ten elements, whatever indices those elements sit at. Sparse costs about ten bytes an element here and dense costs eight bytes for every position in the window it covers, so ten elements spread over a thousand positions are eight kilobytes dense and a hundred bytes sparse. A slice here goes dense only when it is over that count and its span is at most twice its population, which is the same rule read as a memory question rather than a count. Nothing a client can ask reports which of the two a slice is in, so the only difference this makes is the number OBJECT and MEMORY USAGE report, and it makes that number smaller."
+status = "permanent"
+spec = "08 section 1"

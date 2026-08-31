@@ -29,6 +29,7 @@
 
 use yo_common::Result;
 
+use crate::array::Array;
 use crate::hash::Hash;
 use crate::keyspace::Keyspace;
 use crate::list::List;
@@ -59,6 +60,7 @@ impl Record {
             Body::Hash(_) => Kind::Hash,
             Body::List(_) => Kind::List,
             Body::Zset(_) => Kind::Zset,
+            Body::Array(_) => Kind::Array,
         }
     }
 
@@ -69,7 +71,7 @@ impl Record {
     }
 }
 
-/// The five things a record can be, owned rather than borrowed.
+/// The six things a record can be, owned rather than borrowed.
 ///
 /// One variant per type that a key can hold, and that is the point: the day a
 /// sixth type lands, the compiler names this file. It did not before, because
@@ -83,6 +85,7 @@ enum Body {
     Hash(Hash),
     List(List),
     Zset(Zset),
+    Array(Array),
 }
 
 /// What a rename or a copy did.
@@ -138,6 +141,12 @@ impl Keyspace {
                     .expect("the record points at its body")
                     .clone(),
             ),
+            Kind::Array => Body::Array(
+                self.arrays
+                    .get(value::slot(rec))
+                    .expect("the record points at its body")
+                    .clone(),
+            ),
             // A stream is the one type a key can hold that nothing can put
             // there yet, so this arm is the only one left and it names it.
             Kind::Stream => unreachable!("nothing can store a stream yet"),
@@ -179,6 +188,12 @@ impl Keyspace {
                 let slot = self.zsets.insert(zset);
                 self.bodies += 1;
                 self.write_slot(key, Kind::Zset, slot, at);
+            }
+            Body::Array(array) => {
+                self.free_body(key);
+                let slot = self.arrays.insert(array);
+                self.bodies += 1;
+                self.write_slot(key, Kind::Array, slot, at);
             }
         }
     }

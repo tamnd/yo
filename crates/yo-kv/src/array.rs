@@ -1,0 +1,1305 @@
+//! A sparse array: a sequence indexed by a `u64`, with holes.
+//!
+//! This is the type behind the `AR*` commands Redis added in 8.9, and it is the
+//! only collection here whose index is unsigned. A list is indexed from either
+//! end and `-1` is the last element. An array is indexed by position in a space
+//! that runs to `2^64 - 2`, so `-1` is not the end of anything, it is an error,
+//! and most of that space is empty at any moment.
+//!
+//! ```text
+//!   slices, sorted by id, binary searched
+//! +---------+---------+-------------------+---------+
+//! | id 0    | id 7    |        ...        | id 9e12 |
+//! | sparse  | dense   |                   | sparse  |
+//! +---------+---------+-------------------+---------+
+//!      \                                        /
+//!       \--- offsets and words -----------------/
+//!                     |
+//!             +-------------------------------+
+//!             | one blob per array, for the   |
+//!             | values too long to inline     |
+//!             +-------------------------------+
+//! ```
+//!
+//! # Two numbers that are not the same number
+//!
+//! [`Array::len`] is the highest populated index plus one and [`Array::count`]
+//! is how many indices are populated. `ARSET k 1000000 x` gives a length of a
+//! million and one and a count of one. Every other collection here has one
+//! number for both and it is worth saying out loud, because a caller that
+//! reaches for the wrong one gets an answer rather than an error.
+//!
+//! # Where the slices live
+//!
+//! Redis keeps a flat directory of slice pointers indexed by slice id, and then
+//! a second structure over that for when the ids get far apart, because a flat
+//! array indexed by `idx >> 12` is nine billion entries for an index of nine
+//! trillion. Here it is one `Vec` of `(id, slice)` kept sorted and binary
+//! searched, which covers the whole index space in one structure with no
+//! second mode to get wrong, and costs a handful of compares on a get instead
+//! of one load. A key with a thousand slices is ten compares, and a key with a
+//! thousand slices is four million elements, so the compares are noise next to
+//! what the caller is doing with the data.
+//!
+//! # Where the values live
+//!
+//! A value of eight bytes or more is a slice of one blob owned by the array, and
+//! everything shorter is inlined in the word itself. Redis heap allocates each
+//! of those, paying a malloc header and the rounding on every one. One blob per
+//! key pays the bytes and nothing else, at the cost of having to compact when
+//! enough of it is dead. See [`Word`] for the four things a word can be.
+
+use std::cmp::Ordering;
+
+use yo_common::num;
+use yo_common::{Code, Error, Result};
+
+/// How many indices one slice covers.
+///
+/// Redis's `AR_SLICE_SIZE_DEFAULT`, and unlike Redis it is not configurable,
+/// because the two settings either side of the default were not worth a branch
+/// in `slice_of` and nobody has ever reported tuning them.
+pub const SLICE_SIZE: u64 = 4096;
+
+/// `SLICE_SIZE` as a shift, so the divide is a shift.
+const SLICE_BITS: u32 = SLICE_SIZE.trailing_zeros();
+
+/// The most elements a slice holds while staying sparse.
+///
+/// Redis's `AR_SPARSE_KMAX_DEFAULT`. Above this a slice is worth an index, below
+/// it the pairs are cheaper than the holes.
+const SPARSE_MAX: usize = 10;
+
+/// The fewest elements a dense slice keeps before going back to pairs.
+///
+/// Redis's `AR_SPARSE_KMIN_DEFAULT`. It is half of `SPARSE_MAX` rather than
+/// equal to it so that a slice sitting on the line does not rebuild itself on
+/// every other write.
+const SPARSE_MIN: usize = 5;
+
+/// The largest index an array will accept.
+///
+/// Redis reserves `UINT64_MAX` as "no insert has happened yet" in the cursor
+/// that `ARINSERT` and `ARNEXT` share, so it is not a position anything can be
+/// written to, and `ARSET k 18446744073709551615 v` is an error rather than a
+/// write. Keeping the same ceiling here keeps that cursor able to mean the same
+/// thing when it lands.
+pub const INDEX_MAX: u64 = u64::MAX - 1;
+
+/// Room for the longest text an [`Element`] can turn into.
+///
+/// The float is the long one, and it is the widest double plus the `.0` that
+/// gets appended to one that came out looking like an integer.
+pub const ELEMENT_MAX: usize = num::DOUBLE_MAX + 2;
+
+/// What is stored at one index, in whichever form it was worth keeping.
+///
+/// Handing back the stored form rather than bytes is Y18: a value that went in
+/// as `12345` is held as an `i64` and formatted once, into the reply buffer, at
+/// the moment the reply is built. Use [`Element::text`] to get the bytes when
+/// the caller has nowhere better to put them.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Element<'a> {
+    /// A value that was written as an integer and is held as one.
+    Int(i64),
+    /// A value that was written as a decimal and round trips as a double.
+    Float(f64),
+    /// A string long enough to live in the array's blob, borrowed from it.
+    Str(&'a [u8]),
+    /// A string of seven bytes or fewer, which was packed into the word and so
+    /// has nowhere to be borrowed from.
+    Short(Short),
+}
+
+impl<'a> Element<'a> {
+    /// The bytes a client would see, written into `buf` if they are not stored
+    /// anywhere already.
+    ///
+    /// A blob string is already bytes and comes back borrowed with `buf`
+    /// untouched. Everything else has to be written somewhere, and it goes into
+    /// the caller's stack buffer rather than a `Vec`, because the caller needs
+    /// the length before it can write the bulk header and a shard thread that
+    /// allocates aborts.
+    pub fn text<'b>(&'b self, buf: &'b mut [u8; ELEMENT_MAX]) -> &'b [u8]
+    where
+        'a: 'b,
+    {
+        match *self {
+            // The two cases with nothing to do, borrowed straight through.
+            Element::Str(s) => s,
+            Element::Short(ref s) => s.as_bytes(),
+            Element::Int(i) => {
+                let mut digits = [0u8; num::DIGITS_MAX];
+                let text = num::i64_digits(&mut digits, i);
+                let n = text.len();
+                buf[..n].copy_from_slice(text);
+                &buf[..n]
+            }
+            Element::Float(d) => {
+                let mut wide = [0u8; num::DOUBLE_MAX];
+                let text = num::write_double(&mut wide, d);
+                let mut n = text.len();
+                buf[..n].copy_from_slice(text);
+                // Redis's `arFormatFloat`: a stored double that prints without a
+                // dot or an exponent gets `.0` put back on, so that a value
+                // written as `1.0` does not read back as `1`. Nothing that
+                // reached this branch was written as `1`, because the integer
+                // encoding takes those first.
+                if !text.iter().any(|&c| c == b'.' || c == b'e' || c == b'E') {
+                    buf[n] = b'.';
+                    buf[n + 1] = b'0';
+                    n += 2;
+                }
+                &buf[..n]
+            }
+        }
+    }
+}
+
+/// A string short enough that it was stored inside the word.
+///
+/// It exists because an [`Element`] borrows and there is nothing to borrow
+/// from: the bytes were in the eight bytes that were read, and unpacking them
+/// somewhere is unavoidable. Carrying them by value in the element is seven
+/// bytes on the caller's stack, which is cheaper than the alternative of making
+/// every reader pass in a scratch buffer for the case where the value is short.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct Short {
+    buf: [u8; INLINE_MAX],
+    len: u8,
+}
+
+impl Short {
+    /// The bytes, as they were written.
+    #[must_use]
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.buf[..usize::from(self.len)]
+    }
+}
+
+impl core::fmt::Debug for Short {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "{:?}", String::from_utf8_lossy(self.as_bytes()))
+    }
+}
+
+/// One stored value, in eight bytes, or the empty slot.
+///
+/// The low two bits are a tag and the rest is payload, which is Redis's tagged
+/// pointer scheme with the pointer replaced by an offset into the array's own
+/// blob. That replacement is the whole memory argument: Redis pays eight bytes
+/// of pointer plus a malloc header plus rounding for every value of eight bytes
+/// or more, and this pays eight bytes plus the payload.
+///
+/// ```text
+///   tag 00  offset into the blob: length in bits 2..32, start in bits 32..64
+///   tag 01  a signed integer in the top 62 bits
+///   tag 10  an f64 with its low two bits cleared
+///   tag 11  a string of up to seven bytes: length in bits 2..5, bytes from 8
+/// ```
+///
+/// [`Word::EMPTY`] is all zeroes, which is unambiguous: a blob word always has a
+/// length of at least eight so its payload is never zero, and the other three
+/// tags are non zero by construction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Word(u64);
+
+/// Values of this many bytes and up go in the blob, and shorter ones inline.
+const INLINE_MAX: usize = 7;
+
+/// The largest blob one array can hold, because a start has to fit 32 bits.
+const BLOB_MAX: usize = u32::MAX as usize;
+
+/// The longest single value, because a length has to fit the other 30 bits.
+///
+/// A gigabyte, and a client cannot send one anyway: `proto-max-bulk-len` caps a
+/// bulk string at 512 megabytes, so nothing that gets here can be over this. It
+/// is checked rather than assumed because the embedded API does not go through
+/// the protocol and can hand over whatever it likes.
+const VALUE_MAX: usize = (1 << 30) - 1;
+
+const TAG_MASK: u64 = 0b11;
+const TAG_BLOB: u64 = 0;
+const TAG_INT: u64 = 1;
+const TAG_FLOAT: u64 = 2;
+const TAG_STR: u64 = 3;
+
+/// The range of integers that fits the 62 bit payload, which is Redis's
+/// `arIntFits`. Anything outside it is kept as the text it arrived as.
+const INT_LO: i64 = -(1 << 61);
+const INT_HI: i64 = (1 << 61) - 1;
+
+impl Word {
+    /// Nothing is stored here.
+    const EMPTY: Word = Word(0);
+
+    const fn is_empty(self) -> bool {
+        self.0 == 0
+    }
+
+    const fn tag(self) -> u64 {
+        self.0 & TAG_MASK
+    }
+
+    const fn from_int(i: i64) -> Word {
+        Word(((i as u64) << 2) | TAG_INT)
+    }
+
+    const fn to_int(self) -> i64 {
+        // Arithmetic shift, so the sign comes back with it.
+        (self.0 as i64) >> 2
+    }
+
+    const fn from_float_bits(bits: u64) -> Word {
+        Word((bits & !TAG_MASK) | TAG_FLOAT)
+    }
+
+    const fn to_float(self) -> f64 {
+        f64::from_bits(self.0 & !TAG_MASK)
+    }
+
+    fn from_short(s: &[u8]) -> Word {
+        let mut v = TAG_STR | ((s.len() as u64) << 2);
+        for (i, &b) in s.iter().enumerate() {
+            v |= u64::from(b) << (8 * (i + 1));
+        }
+        Word(v)
+    }
+
+    const fn short_len(self) -> usize {
+        ((self.0 >> 2) & 0b111) as usize
+    }
+
+    fn to_short(self) -> Short {
+        let n = self.short_len();
+        let mut buf = [0u8; INLINE_MAX];
+        for (i, out) in buf.iter_mut().take(n).enumerate() {
+            *out = ((self.0 >> (8 * (i + 1))) & 0xff) as u8;
+        }
+        Short { buf, len: n as u8 }
+    }
+
+    const fn from_blob(start: usize, len: usize) -> Word {
+        Word(((start as u64) << 32) | ((len as u64) << 2) | TAG_BLOB)
+    }
+
+    const fn blob_span(self) -> (usize, usize) {
+        let start = (self.0 >> 32) as usize;
+        let len = ((self.0 >> 2) & 0x3fff_ffff) as usize;
+        (start, len)
+    }
+}
+
+/// The one slice of the index space that holds anything, in whichever layout
+/// fits it.
+#[derive(Debug, Clone)]
+struct Slice {
+    /// How many of the words are populated. Never zero: an empty slice is
+    /// dropped rather than kept, so that `len` does not have to walk past any.
+    count: u16,
+    layout: Layout,
+}
+
+/// The two ways a slice holds its words.
+///
+/// Both carry a `Vec<Word>`, which is what lets blob compaction walk every word
+/// in the array without caring which layout it is looking at.
+#[derive(Debug, Clone)]
+enum Layout {
+    /// Offsets and words in parallel, sorted by offset, binary searched.
+    ///
+    /// Ten bytes an element and no cost for the holes, which is what a slice
+    /// with a handful of scattered elements wants.
+    Sparse { offs: Vec<u16>, words: Vec<Word> },
+    /// A window of consecutive positions, with `offset` the position of
+    /// `words[0]`.
+    ///
+    /// Eight bytes a position including the holes, so this only wins when the
+    /// populated positions are close together. The window is kept trimmed of
+    /// leading and trailing empties, which is what makes the highest populated
+    /// offset derivable rather than stored.
+    Dense { offset: u16, words: Vec<Word> },
+}
+
+impl Slice {
+    /// Every word in the slice, for the one walk that rewrites them all: blob
+    /// compaction.
+    fn words_mut(&mut self) -> &mut [Word] {
+        match &mut self.layout {
+            Layout::Sparse { words, .. } | Layout::Dense { words, .. } => words,
+        }
+    }
+
+    /// The highest populated offset. The slice is never empty, so there is one.
+    fn high(&self) -> u16 {
+        match &self.layout {
+            Layout::Sparse { offs, .. } => *offs.last().expect("a slice is never empty"),
+            // Trimmed, so the last word is populated.
+            Layout::Dense { offset, words } => offset + (words.len() as u16) - 1,
+        }
+    }
+
+    fn get(&self, off: u16) -> Word {
+        match &self.layout {
+            Layout::Sparse { offs, words } => match offs.binary_search(&off) {
+                Ok(at) => words[at],
+                Err(_) => Word::EMPTY,
+            },
+            Layout::Dense { offset, words } => {
+                if off < *offset {
+                    return Word::EMPTY;
+                }
+                let at = usize::from(off - offset);
+                words.get(at).copied().unwrap_or(Word::EMPTY)
+            }
+        }
+    }
+
+    /// Writes a word, and answers with what was there before.
+    fn put(&mut self, off: u16, w: Word) -> Word {
+        let old = match &mut self.layout {
+            Layout::Sparse { offs, words } => match offs.binary_search(&off) {
+                Ok(at) => std::mem::replace(&mut words[at], w),
+                Err(at) => {
+                    offs.insert(at, off);
+                    words.insert(at, w);
+                    Word::EMPTY
+                }
+            },
+            Layout::Dense { offset, words } => {
+                if off < *offset {
+                    // Growing downwards moves the window, which is a memmove
+                    // bounded by the slice: 32 KiB at the very worst and zero on
+                    // the ascending writes that are what an array is normally
+                    // filled by.
+                    let gap = usize::from(*offset - off);
+                    words.splice(0..0, std::iter::repeat_n(Word::EMPTY, gap));
+                    *offset = off;
+                    std::mem::replace(&mut words[0], w)
+                } else {
+                    let at = usize::from(off - *offset);
+                    if at >= words.len() {
+                        words.resize(at + 1, Word::EMPTY);
+                    }
+                    std::mem::replace(&mut words[at], w)
+                }
+            }
+        };
+        if old.is_empty() {
+            self.count += 1;
+        }
+        old
+    }
+
+    /// Clears a position, and answers with what was there.
+    fn take(&mut self, off: u16) -> Word {
+        let old = match &mut self.layout {
+            Layout::Sparse { offs, words } => match offs.binary_search(&off) {
+                Ok(at) => {
+                    offs.remove(at);
+                    words.remove(at)
+                }
+                Err(_) => Word::EMPTY,
+            },
+            Layout::Dense { offset, words } => {
+                if off < *offset {
+                    Word::EMPTY
+                } else {
+                    let at = usize::from(off - *offset);
+                    match words.get_mut(at) {
+                        Some(slot) => std::mem::replace(slot, Word::EMPTY),
+                        None => Word::EMPTY,
+                    }
+                }
+            }
+        };
+        if !old.is_empty() {
+            self.count -= 1;
+            self.trim();
+        }
+        old
+    }
+
+    /// Drops the empties off both ends of a dense window.
+    ///
+    /// This is what keeps [`Slice::high`] derivable, and it is also why a dense
+    /// slice that has been emptied from the middle out does not keep paying for
+    /// the positions nobody is using any more.
+    fn trim(&mut self) {
+        let Layout::Dense { offset, words } = &mut self.layout else {
+            return;
+        };
+        while words.last().is_some_and(|w| w.is_empty()) {
+            words.pop();
+        }
+        let lead = words.iter().take_while(|w| w.is_empty()).count();
+        if lead > 0 {
+            words.drain(..lead);
+            *offset += lead as u16;
+        }
+    }
+
+    /// The number of positions a dense window would have to cover.
+    fn span(&self) -> usize {
+        match &self.layout {
+            Layout::Sparse { offs, .. } => match (offs.first(), offs.last()) {
+                (Some(lo), Some(hi)) => usize::from(hi - lo) + 1,
+                _ => 0,
+            },
+            Layout::Dense { words, .. } => words.len(),
+        }
+    }
+
+    /// Moves the slice to whichever layout now fits it.
+    ///
+    /// Redis promotes on the count alone, at more than ten elements, which can
+    /// put eleven elements in a thirty two kilobyte window. Promotion is a
+    /// memory question and not a count question, so this asks about the span
+    /// too: dense is eight bytes a position and sparse is ten bytes an element,
+    /// so dense only wins while the positions are within about twice the count
+    /// of each other.
+    fn rebalance(&mut self) {
+        let count = usize::from(self.count);
+        match &self.layout {
+            Layout::Sparse { .. } => {
+                if count > SPARSE_MAX && self.span() <= count * 2 {
+                    self.make_dense();
+                }
+            }
+            Layout::Dense { .. } => {
+                if count <= SPARSE_MIN || self.span() > count * 4 {
+                    self.make_sparse();
+                }
+            }
+        }
+    }
+
+    fn make_dense(&mut self) {
+        let Layout::Sparse { offs, words } = &self.layout else {
+            return;
+        };
+        let base = offs[0];
+        let span = self.span();
+        let mut window = vec![Word::EMPTY; span];
+        for (&off, &w) in offs.iter().zip(words) {
+            window[usize::from(off - base)] = w;
+        }
+        self.layout = Layout::Dense {
+            offset: base,
+            words: window,
+        };
+    }
+
+    fn make_sparse(&mut self) {
+        let Layout::Dense { offset, words } = &self.layout else {
+            return;
+        };
+        let mut offs = Vec::with_capacity(usize::from(self.count));
+        let mut vals = Vec::with_capacity(usize::from(self.count));
+        for (i, &w) in words.iter().enumerate() {
+            if !w.is_empty() {
+                offs.push(offset + (i as u16));
+                vals.push(w);
+            }
+        }
+        self.layout = Layout::Sparse { offs, words: vals };
+    }
+
+    fn memory_bytes(&self) -> usize {
+        match &self.layout {
+            Layout::Sparse { offs, words } => {
+                offs.capacity() * 2 + words.capacity() * size_of::<Word>()
+            }
+            Layout::Dense { words, .. } => words.capacity() * size_of::<Word>(),
+        }
+    }
+}
+
+/// A sparse array of values, indexed by a `u64`.
+#[derive(Debug, Clone, Default)]
+pub struct Array {
+    /// Populated slices, sorted by slice id and binary searched. No slice in
+    /// here is empty.
+    slices: Vec<(u64, Slice)>,
+    /// Every value of eight bytes or more, back to back.
+    blob: Vec<u8>,
+    /// How much of the blob is no longer pointed at by any word.
+    dead: usize,
+    /// How many indices are populated, kept rather than counted because
+    /// `ARCOUNT` is documented as O(1).
+    count: u64,
+}
+
+/// How dead a blob has to get before it is worth rewriting.
+///
+/// Half, with a floor so that a small array does not compact on every overwrite.
+/// Compaction is one pass over the words and one pass over the live bytes, and
+/// paying that when a quarter of a kilobyte is dead would cost more than the
+/// kilobyte.
+const COMPACT_MIN: usize = 4096;
+
+impl Array {
+    /// A new, empty array.
+    #[must_use]
+    pub fn new() -> Array {
+        Array::default()
+    }
+
+    /// The highest populated index plus one, which is `ARLEN`.
+    ///
+    /// Zero for an empty array, and note that this is not the number of
+    /// elements. See [`Array::count`] for that.
+    #[must_use]
+    pub fn len(&self) -> u64 {
+        match self.slices.last() {
+            Some((id, slice)) => id * SLICE_SIZE + u64::from(slice.high()) + 1,
+            None => 0,
+        }
+    }
+
+    /// How many indices are populated, which is `ARCOUNT`.
+    #[must_use]
+    pub const fn count(&self) -> u64 {
+        self.count
+    }
+
+    /// Whether anything is stored at all.
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.count == 0
+    }
+
+    /// The value at `idx`, or none if that position is a hole.
+    ///
+    /// A missing key and a hole are the same answer to a client, which is why
+    /// there is one `None` here and not two.
+    #[must_use]
+    pub fn get(&self, idx: u64) -> Option<Element<'_>> {
+        let (id, off) = split(idx);
+        let at = self.find(id).ok()?;
+        let w = self.slices[at].1.get(off);
+        self.decode(w)
+    }
+
+    /// Writes `val` at `idx`, and answers whether that position was empty.
+    ///
+    /// The count of newly filled positions is what `ARSET` and `ARMSET` reply
+    /// with, so the boolean is the useful return rather than the old value.
+    ///
+    /// # Errors
+    ///
+    /// [`Code::Full`] when the blob of long values would pass four gigabytes,
+    /// which is a recorded divergence: Redis heap allocates each of those and
+    /// has no per key ceiling.
+    pub fn set(&mut self, idx: u64, val: &[u8]) -> Result<bool> {
+        let w = self.encode(val)?;
+        let (id, off) = split(idx);
+        let at = match self.find(id) {
+            Ok(at) => at,
+            Err(at) => {
+                self.slices.insert(
+                    at,
+                    (
+                        id,
+                        Slice {
+                            count: 0,
+                            layout: Layout::Sparse {
+                                offs: Vec::new(),
+                                words: Vec::new(),
+                            },
+                        },
+                    ),
+                );
+                at
+            }
+        };
+        let old = self.slices[at].1.put(off, w);
+        self.slices[at].1.rebalance();
+        self.retire(old);
+        self.maybe_compact();
+        if old.is_empty() {
+            self.count += 1;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
+    /// Clears `idx`, and answers whether anything was there.
+    pub fn del(&mut self, idx: u64) -> bool {
+        let (id, off) = split(idx);
+        let Ok(at) = self.find(id) else {
+            return false;
+        };
+        let old = self.slices[at].1.take(off);
+        if old.is_empty() {
+            return false;
+        }
+        self.retire(old);
+        self.count -= 1;
+        if self.slices[at].1.count == 0 {
+            self.slices.remove(at);
+        } else {
+            self.slices[at].1.rebalance();
+        }
+        self.maybe_compact();
+        true
+    }
+
+    /// Clears every populated index in `lo..=hi`, and answers how many there
+    /// were.
+    ///
+    /// The cost is in the slices the range touches and not in the width of the
+    /// range, so `ARDELRANGE k 0 18446744073709551614` on a key holding three
+    /// elements is three deletes and not a walk of the index space.
+    pub fn delete_range(&mut self, lo: u64, hi: u64) -> u64 {
+        if lo > hi {
+            return 0;
+        }
+        let (lo_id, lo_off) = split(lo);
+        let (hi_id, hi_off) = split(hi);
+        let first = match self.find(lo_id) {
+            Ok(at) | Err(at) => at,
+        };
+        let mut gone = 0;
+        let mut at = first;
+        while at < self.slices.len() && self.slices[at].0 <= hi_id {
+            let id = self.slices[at].0;
+            // A slice strictly inside the range loses everything, and the two on
+            // the ends lose the part that is in it.
+            let from = if id == lo_id { lo_off } else { 0 };
+            let to = if id == hi_id {
+                hi_off
+            } else {
+                (SLICE_SIZE - 1) as u16
+            };
+            gone += self.clear_within(at, from, to);
+            if self.slices[at].1.count == 0 {
+                self.slices.remove(at);
+            } else {
+                self.slices[at].1.rebalance();
+                at += 1;
+            }
+        }
+        self.count -= gone;
+        self.maybe_compact();
+        self.maybe_compact_slices();
+        gone
+    }
+
+    /// What the array is holding on the heap, for `MEMORY USAGE`.
+    #[must_use]
+    pub fn memory_bytes(&self) -> usize {
+        self.slices.capacity() * size_of::<(u64, Slice)>()
+            + self
+                .slices
+                .iter()
+                .map(|(_, s)| s.memory_bytes())
+                .sum::<usize>()
+            + self.blob.capacity()
+    }
+
+    /// Which entry holds slice `id`, or where it would be inserted.
+    fn find(&self, id: u64) -> core::result::Result<usize, usize> {
+        self.slices.binary_search_by(|(have, _)| {
+            if *have < id {
+                Ordering::Less
+            } else if *have > id {
+                Ordering::Greater
+            } else {
+                Ordering::Equal
+            }
+        })
+    }
+
+    /// Clears `from..=to` inside one slice, and answers how many went.
+    ///
+    /// The dead blob bytes are counted up here and added to the array's total
+    /// afterwards, rather than collected into a list of words and retired one by
+    /// one, because the list would be an allocation on the delete path and the
+    /// only thing a retired word has left to say is how many bytes it held.
+    fn clear_within(&mut self, at: usize, from: u16, to: u16) -> u64 {
+        let slice = &mut self.slices[at].1;
+        let mut gone = 0u64;
+        let mut dead = 0usize;
+        match &mut slice.layout {
+            Layout::Sparse { offs, words } => {
+                let lo = offs.partition_point(|&o| o < from);
+                let hi = offs.partition_point(|&o| o <= to);
+                // Every word a sparse slice holds is populated, so the range is
+                // the count.
+                for w in &words[lo..hi] {
+                    gone += 1;
+                    if w.tag() == TAG_BLOB {
+                        dead += w.blob_span().1;
+                    }
+                }
+                offs.drain(lo..hi);
+                words.drain(lo..hi);
+            }
+            Layout::Dense { offset, words } => {
+                let base = *offset;
+                let lo = usize::from(from.saturating_sub(base));
+                if to >= base && lo < words.len() {
+                    let hi = usize::from(to - base).min(words.len() - 1);
+                    for w in &mut words[lo..=hi] {
+                        if !w.is_empty() {
+                            gone += 1;
+                            if w.tag() == TAG_BLOB {
+                                dead += w.blob_span().1;
+                            }
+                            *w = Word::EMPTY;
+                        }
+                    }
+                }
+            }
+        }
+        slice.count -= gone as u16;
+        slice.trim();
+        self.dead += dead;
+        gone
+    }
+
+    /// Gives back whatever blob space a word was using.
+    fn retire(&mut self, w: Word) {
+        if !w.is_empty() && w.tag() == TAG_BLOB {
+            self.dead += w.blob_span().1;
+        }
+    }
+
+    /// Turns bytes into the smallest word that holds them.
+    fn encode(&mut self, val: &[u8]) -> Result<Word> {
+        if let Some(i) = num::parse_i64(val)
+            && (INT_LO..=INT_HI).contains(&i)
+        {
+            return Ok(Word::from_int(i));
+        }
+        if let Some(w) = float_word(val) {
+            return Ok(w);
+        }
+        if val.len() <= INLINE_MAX {
+            return Ok(Word::from_short(val));
+        }
+        if val.len() > VALUE_MAX {
+            return Err(Error::new(Code::Full, VALUE_TOO_LONG));
+        }
+        if self.blob.len() + val.len() > BLOB_MAX {
+            self.compact();
+        }
+        if self.blob.len() + val.len() > BLOB_MAX {
+            return Err(Error::new(Code::Full, BLOB_TOO_LONG));
+        }
+        let start = self.blob.len();
+        self.blob.extend_from_slice(val);
+        Ok(Word::from_blob(start, val.len()))
+    }
+
+    fn decode(&self, w: Word) -> Option<Element<'_>> {
+        if w.is_empty() {
+            return None;
+        }
+        Some(match w.tag() {
+            TAG_INT => Element::Int(w.to_int()),
+            TAG_FLOAT => Element::Float(w.to_float()),
+            TAG_STR => Element::Short(w.to_short()),
+            _ => {
+                let (start, len) = w.blob_span();
+                Element::Str(&self.blob[start..start + len])
+            }
+        })
+    }
+
+    /// Rewrites the blob with the dead bytes gone, and points every word at
+    /// where its value landed.
+    fn compact(&mut self) {
+        let mut fresh = Vec::with_capacity(self.blob.len() - self.dead);
+        for (_, slice) in &mut self.slices {
+            for w in slice.words_mut() {
+                if w.is_empty() || w.tag() != TAG_BLOB {
+                    continue;
+                }
+                let (start, len) = w.blob_span();
+                let to = fresh.len();
+                fresh.extend_from_slice(&self.blob[start..start + len]);
+                *w = Word::from_blob(to, len);
+            }
+        }
+        self.blob = fresh;
+        self.dead = 0;
+    }
+
+    fn maybe_compact(&mut self) {
+        if self.dead >= COMPACT_MIN && self.dead * 2 >= self.blob.len() {
+            self.compact();
+        }
+    }
+
+    /// Gives back the directory space a mass delete freed.
+    ///
+    /// `Vec::remove` leaves the capacity behind, and a key that had a million
+    /// slices and now has one should not still be holding sixteen megabytes of
+    /// directory.
+    fn maybe_compact_slices(&mut self) {
+        if self.slices.capacity() > 16 && self.slices.capacity() > self.slices.len() * 4 {
+            self.slices.shrink_to_fit();
+        }
+    }
+}
+
+/// The message when one key's long values pass four gigabytes in total.
+pub const BLOB_TOO_LONG: &str = "array values exceed the four gigabyte per key limit";
+
+/// The message when one value on its own passes a gigabyte.
+pub const VALUE_TOO_LONG: &str = "array value exceeds the one gigabyte limit";
+
+/// Splits an index into the slice that holds it and the offset inside.
+#[inline]
+const fn split(idx: u64) -> (u64, u16) {
+    (idx >> SLICE_BITS, (idx & (SLICE_SIZE - 1)) as u16)
+}
+
+/// Whether these bytes round trip exactly through an inline double.
+///
+/// This is `arTryEncodeFloat`, and the round trip is the point rather than an
+/// optimisation. `3.140` parses to the same double as `3.14` and prints back as
+/// `3.14`, so storing it as a number would change what the client wrote. Only a
+/// value that prints back byte for byte is allowed to become a number, and
+/// everything else stays a string.
+fn float_word(val: &[u8]) -> Option<Word> {
+    // The cheap filter first: optional minus, then digits with exactly one dot.
+    // Nothing else can survive the round trip, and this skips the parse for the
+    // overwhelming majority of values that are not numbers at all.
+    let body = match val.first() {
+        Some(b'-') if val.len() > 1 => &val[1..],
+        Some(_) => val,
+        None => return None,
+    };
+    let mut dots = 0;
+    for &c in body {
+        match c {
+            b'.' => dots += 1,
+            b'0'..=b'9' => {}
+            _ => return None,
+        }
+    }
+    if dots != 1 {
+        return None;
+    }
+
+    let d = num::parse_f64(val)?;
+    if !d.is_finite() {
+        return None;
+    }
+    // The low two bits of the payload are the tag, so the value that gets stored
+    // is the input with those cleared, and it is that value that has to print
+    // back to the input. Most decimals do not survive that, which is the design
+    // working: `3.14` loses three units in the last place and prints back as
+    // something else, so it stays a string.
+    let trunc = f64::from_bits(d.to_bits() & !TAG_MASK);
+    let mut buf = [0u8; ELEMENT_MAX];
+    let el = Element::Float(trunc);
+    if el.text(&mut buf) == val {
+        Some(Word::from_float_bits(trunc.to_bits()))
+    } else {
+        None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The bytes a client would see for whatever is at `idx`.
+    fn read(a: &Array, idx: u64) -> Option<Vec<u8>> {
+        let el = a.get(idx)?;
+        let mut buf = [0u8; ELEMENT_MAX];
+        Some(el.text(&mut buf).to_vec())
+    }
+
+    fn set(a: &mut Array, idx: u64, val: &[u8]) -> bool {
+        a.set(idx, val).expect("a value that fits")
+    }
+
+    #[test]
+    fn a_value_comes_back_the_way_it_went_in() {
+        let mut a = Array::new();
+        assert!(set(&mut a, 0, b"hello"));
+        assert!(set(&mut a, 1, b"a much longer value than fits in a word"));
+        assert!(set(&mut a, 2, b"42"));
+        assert!(set(&mut a, 3, b"1.5"));
+        assert!(set(&mut a, 4, b""));
+
+        assert_eq!(read(&a, 0).as_deref(), Some(&b"hello"[..]));
+        assert_eq!(
+            read(&a, 1).as_deref(),
+            Some(&b"a much longer value than fits in a word"[..])
+        );
+        assert_eq!(read(&a, 2).as_deref(), Some(&b"42"[..]));
+        assert_eq!(read(&a, 3).as_deref(), Some(&b"1.5"[..]));
+        assert_eq!(read(&a, 4).as_deref(), Some(&b""[..]));
+        assert_eq!(read(&a, 5), None);
+    }
+
+    /// The length and the count are different numbers, and this is the test
+    /// that says so.
+    #[test]
+    fn the_length_is_the_high_water_mark_and_the_count_is_the_population() {
+        let mut a = Array::new();
+        assert_eq!(a.len(), 0);
+        assert_eq!(a.count(), 0);
+        assert!(a.is_empty());
+
+        set(&mut a, 1_000_000, b"x");
+        assert_eq!(a.len(), 1_000_001);
+        assert_eq!(a.count(), 1);
+        assert!(!a.is_empty());
+
+        set(&mut a, 5, b"y");
+        assert_eq!(a.len(), 1_000_001, "a lower index does not move the length");
+        assert_eq!(a.count(), 2);
+
+        a.del(1_000_000);
+        assert_eq!(a.len(), 6, "and the length comes back down when it goes");
+        assert_eq!(a.count(), 1);
+    }
+
+    /// Writing over a position is not a new position.
+    #[test]
+    fn an_overwrite_does_not_count_as_a_fill() {
+        let mut a = Array::new();
+        assert!(set(&mut a, 7, b"first"));
+        assert!(!set(&mut a, 7, b"second"));
+        assert_eq!(a.count(), 1);
+        assert_eq!(read(&a, 7).as_deref(), Some(&b"second"[..]));
+    }
+
+    #[test]
+    fn deleting_the_last_element_leaves_nothing_behind() {
+        let mut a = Array::new();
+        set(&mut a, 3, b"x");
+        assert!(a.del(3));
+        assert!(!a.del(3), "and a second delete finds nothing");
+        assert!(a.is_empty());
+        assert_eq!(a.len(), 0);
+        assert!(a.slices.is_empty(), "the slice went with the last element");
+    }
+
+    /// The whole 64 bit index space, not just the part a `Vec` could index.
+    #[test]
+    fn the_index_space_runs_to_the_top() {
+        let mut a = Array::new();
+        set(&mut a, 0, b"low");
+        set(&mut a, INDEX_MAX, b"high");
+        assert_eq!(read(&a, INDEX_MAX).as_deref(), Some(&b"high"[..]));
+        assert_eq!(a.count(), 2);
+        assert_eq!(a.len(), u64::MAX, "the highest index plus one");
+        // And it is two slices, not four thousand billion of them.
+        assert_eq!(a.slices.len(), 2);
+    }
+
+    /// A slice earns a dense window by being full enough to want one, and gives
+    /// it back when it is not.
+    #[test]
+    fn a_slice_changes_layout_when_the_shape_of_it_changes() {
+        let mut a = Array::new();
+        for i in 0..SPARSE_MAX as u64 {
+            set(&mut a, i, b"x");
+        }
+        assert!(
+            matches!(a.slices[0].1.layout, Layout::Sparse { .. }),
+            "ten scattered elements do not want an index"
+        );
+
+        set(&mut a, 10, b"x");
+        assert!(
+            matches!(a.slices[0].1.layout, Layout::Dense { .. }),
+            "eleven consecutive ones do"
+        );
+
+        // Spread the same elements out and the window stops being worth it.
+        for i in 0..8 {
+            a.del(i);
+        }
+        assert!(
+            matches!(a.slices[0].1.layout, Layout::Sparse { .. }),
+            "three left is under the floor"
+        );
+        assert_eq!(a.count(), 3);
+        assert_eq!(read(&a, 10).as_deref(), Some(&b"x"[..]));
+    }
+
+    /// Eleven elements spread across a slice stay sparse, which is where this
+    /// parts company with Redis.
+    #[test]
+    fn a_wide_slice_stays_sparse_however_many_elements_it_has() {
+        let mut a = Array::new();
+        for i in 0..40 {
+            set(&mut a, i * 100, b"x");
+        }
+        assert!(
+            matches!(a.slices[0].1.layout, Layout::Sparse { .. }),
+            "forty elements over four thousand positions is not a window"
+        );
+        for i in 0..40 {
+            assert_eq!(read(&a, i * 100).as_deref(), Some(&b"x"[..]), "at {i}");
+        }
+    }
+
+    /// A dense window is filled from the top down as well as the bottom up.
+    #[test]
+    fn a_dense_window_grows_downwards_too() {
+        let mut a = Array::new();
+        for i in (0..20u64).rev() {
+            set(&mut a, i, b"v");
+        }
+        assert!(matches!(a.slices[0].1.layout, Layout::Dense { .. }));
+        for i in 0..20 {
+            assert_eq!(read(&a, i).as_deref(), Some(&b"v"[..]), "at {i}");
+        }
+        assert_eq!(a.count(), 20);
+        assert_eq!(a.len(), 20);
+    }
+
+    #[test]
+    fn a_range_delete_costs_what_it_touches_and_not_what_it_spans() {
+        let mut a = Array::new();
+        set(&mut a, 1, b"a");
+        set(&mut a, 500_000, b"b");
+        set(&mut a, INDEX_MAX, b"c");
+
+        // The widest range there is, against three elements.
+        assert_eq!(a.delete_range(0, INDEX_MAX), 3);
+        assert!(a.is_empty());
+        assert!(a.slices.is_empty());
+        assert_eq!(a.delete_range(0, INDEX_MAX), 0, "and again finds nothing");
+    }
+
+    #[test]
+    fn a_range_delete_takes_the_ends_and_leaves_the_rest() {
+        let mut a = Array::new();
+        for i in 0..30_000u64 {
+            set(&mut a, i, b"x");
+        }
+        assert_eq!(a.delete_range(100, 29_899), 29_800);
+        assert_eq!(a.count(), 200);
+        assert_eq!(read(&a, 99).as_deref(), Some(&b"x"[..]));
+        assert_eq!(read(&a, 100), None);
+        assert_eq!(read(&a, 29_899), None);
+        assert_eq!(read(&a, 29_900).as_deref(), Some(&b"x"[..]));
+        assert_eq!(a.len(), 30_000);
+    }
+
+    #[test]
+    fn a_backwards_range_deletes_nothing() {
+        let mut a = Array::new();
+        set(&mut a, 5, b"x");
+        assert_eq!(a.delete_range(9, 4), 0);
+        assert_eq!(a.count(), 1);
+    }
+
+    /// A value that is an integer is held as one, and one that is not is not.
+    ///
+    /// This is the compatibility requirement rather than an implementation
+    /// detail: `007` is not the number seven, because it does not print back as
+    /// `007`, and an implementation that normalised it would hand a client
+    /// different bytes than it was given.
+    #[test]
+    fn only_a_value_that_prints_back_the_same_becomes_a_number() {
+        let cases: &[(&[u8], bool)] = &[
+            (b"0", true),
+            (b"42", true),
+            (b"-42", true),
+            (b"9007199254740993", true),
+            (b"007", false),
+            (b"+7", false),
+            (b"-0", false),
+            (b" 7", false),
+            (b"7 ", false),
+            (b"", false),
+        ];
+        for &(val, want) in cases {
+            let mut a = Array::new();
+            set(&mut a, 0, val);
+            let is_int = matches!(a.get(0), Some(Element::Int(_)));
+            assert_eq!(is_int, want, "{}", String::from_utf8_lossy(val));
+            assert_eq!(read(&a, 0).as_deref(), Some(val), "round trip");
+        }
+    }
+
+    /// The same rule for the doubles, and it rejects most of them.
+    #[test]
+    fn only_a_double_that_prints_back_the_same_is_stored_as_one() {
+        let cases: &[(&[u8], bool)] = &[
+            (b"1.0", true),
+            (b"1.5", true),
+            (b"-2.25", true),
+            (b"0.0", true),
+            // Three units in the last place go missing when the tag bits are
+            // cleared, so this one prints back as something else.
+            (b"3.14", false),
+            (b"1.10", false),
+            (b"-0.0", false),
+            (b"1.", false),
+            (b".5", false),
+            (b"1e5", false),
+            (b"nan", false),
+            (b"inf", false),
+        ];
+        for &(val, want) in cases {
+            let mut a = Array::new();
+            set(&mut a, 0, val);
+            let is_float = matches!(a.get(0), Some(Element::Float(_)));
+            assert_eq!(is_float, want, "{}", String::from_utf8_lossy(val));
+            assert_eq!(read(&a, 0).as_deref(), Some(val), "round trip");
+        }
+    }
+
+    /// Long values live in one blob, and the blob gets rewritten when enough of
+    /// it is dead.
+    #[test]
+    fn the_blob_is_compacted_once_enough_of_it_is_dead() {
+        let mut a = Array::new();
+        let long = vec![b'a'; 64];
+        for i in 0..1000 {
+            set(&mut a, i, &long);
+        }
+        let full = a.blob.len();
+        assert_eq!(full, 64_000);
+
+        // Overwrite every one of them with a value that does not need the blob.
+        for i in 0..1000 {
+            set(&mut a, i, b"short");
+        }
+        assert!(a.blob.len() < full / 2, "{} bytes left", a.blob.len());
+        assert_eq!(a.count(), 1000);
+        for i in 0..1000 {
+            assert_eq!(read(&a, i).as_deref(), Some(&b"short"[..]), "at {i}");
+        }
+    }
+
+    /// Compaction moves the live bytes, so every word that pointed into the
+    /// blob has to be moved with them.
+    #[test]
+    fn compaction_keeps_the_values_that_survive_it() {
+        let mut a = Array::new();
+        for i in 0..2000u64 {
+            let val = format!("value number {i} padded out past the inline limit");
+            set(&mut a, i, val.as_bytes());
+        }
+        // Kill the even ones, which is enough dead bytes to trigger a rewrite.
+        for i in (0..2000u64).step_by(2) {
+            a.del(i);
+        }
+        assert!(a.dead * 2 < a.blob.len(), "the blob was rewritten");
+        for i in (1..2000u64).step_by(2) {
+            let want = format!("value number {i} padded out past the inline limit");
+            assert_eq!(read(&a, i).as_deref(), Some(want.as_bytes()), "at {i}");
+        }
+    }
+
+    #[test]
+    fn a_value_over_the_ceiling_is_an_error_and_not_a_panic() {
+        let mut a = Array::new();
+        let huge = vec![b'x'; VALUE_MAX + 1];
+        let e = a.set(0, &huge).unwrap_err();
+        assert_eq!(e.code(), Code::Full);
+        assert_eq!(e.message(), VALUE_TOO_LONG);
+        assert!(a.is_empty(), "and nothing was written");
+    }
+
+    /// Every word encoding, through the eight bytes and back.
+    #[test]
+    fn a_word_holds_what_it_was_given() {
+        assert!(Word::EMPTY.is_empty());
+        for i in [0i64, 1, -1, INT_LO, INT_HI, 12345, -99999] {
+            let w = Word::from_int(i);
+            assert!(!w.is_empty());
+            assert_eq!(w.tag(), TAG_INT);
+            assert_eq!(w.to_int(), i, "{i}");
+        }
+        for d in [0.0f64, 1.5, -2.25, 1e300] {
+            let bits = d.to_bits() & !TAG_MASK;
+            let w = Word::from_float_bits(bits);
+            assert!(!w.is_empty());
+            assert_eq!(w.tag(), TAG_FLOAT);
+            assert_eq!(w.to_float().to_bits(), bits);
+        }
+        for s in [&b""[..], b"a", b"abc", b"1234567"] {
+            let w = Word::from_short(s);
+            assert!(!w.is_empty(), "{s:?}");
+            assert_eq!(w.tag(), TAG_STR);
+            assert_eq!(w.to_short().as_bytes(), s);
+        }
+        let w = Word::from_blob(4_000_000_000, 1_000_000);
+        assert_eq!(w.tag(), TAG_BLOB);
+        assert_eq!(w.blob_span(), (4_000_000_000, 1_000_000));
+        assert!(!w.is_empty());
+    }
+
+    #[test]
+    fn what_it_holds_is_what_it_says_it_holds() {
+        let mut a = Array::new();
+        assert_eq!(a.memory_bytes(), 0);
+        for i in 0..1000u64 {
+            set(&mut a, i * 7, b"a value past the inline limit");
+        }
+        let held = a.memory_bytes();
+        assert!(held > 29_000, "{held} bytes for 29 kilobytes of values");
+        a.delete_range(0, u64::MAX - 1);
+        assert!(
+            a.memory_bytes() < held / 2,
+            "{} bytes left of {held}",
+            a.memory_bytes()
+        );
+    }
+
+    /// A thousand writes in a random order against a plain map, to catch the
+    /// promotion, demotion, window and blob paths interacting.
+    #[test]
+    fn it_agrees_with_a_map_over_a_scramble_of_writes() {
+        use std::collections::BTreeMap;
+
+        let mut a = Array::new();
+        let mut want: BTreeMap<u64, Vec<u8>> = BTreeMap::new();
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+
+        for step in 0..20_000u64 {
+            let idx = next() % 20_000;
+            match step % 5 {
+                0..=2 => {
+                    let val = format!("v{step}");
+                    let was_new = set(&mut a, idx, val.as_bytes());
+                    assert_eq!(was_new, want.insert(idx, val.into_bytes()).is_none());
+                }
+                3 => {
+                    assert_eq!(a.del(idx), want.remove(&idx).is_some());
+                }
+                _ => {
+                    let hi = idx + (next() % 500);
+                    let gone = a.delete_range(idx, hi);
+                    let keys: Vec<u64> = want.range(idx..=hi).map(|(k, _)| *k).collect();
+                    assert_eq!(gone, keys.len() as u64);
+                    for k in keys {
+                        want.remove(&k);
+                    }
+                }
+            }
+            assert_eq!(a.count(), want.len() as u64, "count after step {step}");
+        }
+
+        assert_eq!(
+            a.len(),
+            want.keys().next_back().map_or(0, |k| k + 1),
+            "the high water mark"
+        );
+        for (&idx, val) in &want {
+            assert_eq!(read(&a, idx).as_deref(), Some(&val[..]), "at {idx}");
+        }
+    }
+}
