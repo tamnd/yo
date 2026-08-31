@@ -651,6 +651,44 @@ impl Keyspace {
         Ok(Some(slot))
     }
 
+    /// Where `key` is, when either of two types will do.
+    ///
+    /// Every input to a sorted set operation may be a sorted set or a plain set,
+    /// which is Redis's rule and means the type check there is a membership test
+    /// rather than an equality. The kind comes back with the slot because the
+    /// caller has to know which slab the number indexes.
+    pub(crate) fn live_slot_either(
+        &mut self,
+        key: &[u8],
+        a: Kind,
+        b: Kind,
+    ) -> Result<Option<(Kind, u32)>> {
+        if let Some((kind, slot)) = self.memo.get(self.map.writes(), key) {
+            if kind != a && kind != b {
+                return Err(wrong_type());
+            }
+            return Ok(Some((kind, slot)));
+        }
+        let now = self.clock.now_ms();
+        let Some(rec) = self.map.get(key) else {
+            return Ok(None);
+        };
+        if value::is_expired(rec, now) {
+            self.drop_key(key);
+            self.expired += 1;
+            return Ok(None);
+        }
+        let kind = value::kind(rec);
+        if kind != a && kind != b {
+            return Err(wrong_type());
+        }
+        let slot = value::slot(rec);
+        if value::expire_at(rec).is_none() {
+            self.memo.put(self.map.writes(), key, kind, slot);
+        }
+        Ok(Some((kind, slot)))
+    }
+
     /// Throw every key away. This is `FLUSHDB` on one database.
     ///
     /// The expiry counter is not reset, because Redis does not reset it either:
