@@ -1066,10 +1066,13 @@ mod tests {
             m.compact_step()
                 .expect("the segment in flight is not finished");
         }
-        assert_eq!(
-            m.arena().recorded_bump(first),
-            yo_arena::HEADER_SIZE as u64,
+        assert!(
+            m.arena().is_free(first),
             "the segment that was in flight is not the one that came back"
+        );
+        assert!(
+            !m.arena().is_free(worse),
+            "the walk moved to the segment that tied with it partway through"
         );
     }
 

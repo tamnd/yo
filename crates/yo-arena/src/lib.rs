@@ -551,6 +551,19 @@ impl Arena {
         self.free_segs.len()
     }
 
+    /// Whether one segment is on the free list.
+    ///
+    /// The flag lives beside the mapping and not in it, because on Linux a free
+    /// segment has given its pages back and everything in it, header included,
+    /// reads as zeroes until something bumps through it again. Asking the
+    /// header whether a segment is free would therefore answer one thing on
+    /// Linux and another on macOS, which is exactly the sort of question this
+    /// exists to stop a caller from asking.
+    #[inline]
+    pub fn is_free(&self, seg: usize) -> bool {
+        self.segs[seg].free
+    }
+
     /// The dead byte fraction at which a segment is worth compacting.
     ///
     /// A quarter and not a half. The number is a trade and both directions are

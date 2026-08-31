@@ -108,6 +108,10 @@ impl Poller {
 /// The loop runs a batch of 64 commands, so more ready connections than this in
 /// one turn is more work than a turn wants anyway. What is left is still ready
 /// and comes back on the next call.
+///
+/// The fallback backend has no event array to size, so on a platform that uses
+/// it this number would be dead code.
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "ios"))]
 const EVENTS: usize = 64;
 
 #[cfg(any(target_os = "macos", target_os = "ios"))]
