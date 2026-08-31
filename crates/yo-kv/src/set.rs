@@ -213,6 +213,23 @@ enum Body {
 #[derive(Debug, Clone)]
 pub struct Set {
     body: Body,
+    /// Whether an all integer set has passed `set-max-intset-entries`.
+    ///
+    /// This is where Redis rehashes the members into a dictionary and starts
+    /// answering `hashtable` to `OBJECT ENCODING`. Nothing is rehashed here,
+    /// because [`Intset`] holds a large set in runs and stays at two to eight
+    /// bytes a member where a table would cost thirty, so the only thing the
+    /// ceiling still decides is the word.
+    ///
+    /// It is a flag and not a comparison against the length because the ceiling
+    /// is configurable and [`Set::encoding`] is not handed the configuration. It
+    /// is also one way, like every promotion here: a set that has been called a
+    /// hashtable once does not go back to being called an intset when members
+    /// are removed, which is Y4 and is what Redis does.
+    ///
+    /// Only ever true while [`Body::Ints`] is the body. Every other body already
+    /// knows what to answer.
+    ints_past_limit: bool,
 }
 
 impl Set {
@@ -225,6 +242,7 @@ impl Set {
     pub fn new() -> Set {
         Set {
             body: Body::Ints(Intset::new()),
+            ints_past_limit: false,
         }
     }
 
@@ -235,15 +253,27 @@ impl Set {
     /// a thousand arguments builds a table once rather than converting twice on
     /// the way there. `hint` is only a hint and being wrong about it costs a
     /// conversion and no correctness.
+    ///
+    /// An integer first member sends it to the intset even when the count is
+    /// past `set-max-intset-entries`, where Redis would go straight to a
+    /// dictionary. A large set of integers is the case the runs exist for, and
+    /// building a table and never leaving it would give up the whole saving on
+    /// the one call that said in advance it was going to matter. The listpack
+    /// band in between is still honoured, because a set that small has nothing
+    /// to save and a server configured that way expects a listpack.
     #[must_use]
     pub fn with_hint(first: &[u8], hint: usize, limits: &Limits) -> Set {
-        if parse_i64(first).is_some() && hint <= limits.max_intset_entries {
+        let ints = parse_i64(first).is_some()
+            && (hint <= limits.max_intset_entries || hint > limits.max_listpack_entries);
+        if ints {
             Set {
                 body: Body::Ints(Intset::with_capacity(hint)),
+                ints_past_limit: hint > limits.max_intset_entries,
             }
         } else if hint <= limits.max_listpack_entries {
             Set {
                 body: Body::Packed(Listpack::new()),
+                ints_past_limit: false,
             }
         } else if hint > PARTITION_AT {
             // A caller that says up front it is about to load a million members
@@ -253,19 +283,28 @@ impl Set {
             // rather than anything incorrect.
             Set {
                 body: Body::Split(Parts::with_parts(parts_for(hint))),
+                ints_past_limit: false,
             }
         } else {
             Set {
                 body: Body::Table(Elements::with_capacity(hint)),
+                ints_past_limit: false,
             }
         }
     }
 
     /// Which representation this is in.
+    ///
+    /// Four bodies and three words, and the intset accounts for two of the
+    /// missing ones. The partitioned body answers `hashtable` because it is one,
+    /// and an intset past `set-max-intset-entries` answers `hashtable` because
+    /// that is what a real server would have turned into by then, even though
+    /// nothing here was rehashed.
     #[inline]
     #[must_use]
     pub const fn encoding(&self) -> Encoding {
         match self.body {
+            Body::Ints(_) if self.ints_past_limit => Encoding::Hashtable,
             Body::Ints(_) => Encoding::Intset,
             Body::Packed(_) => Encoding::Listpack,
             Body::Table(_) | Body::Split(_) => Encoding::Hashtable,
@@ -372,6 +411,36 @@ impl Set {
         match &self.body {
             Body::Table(t) => t.scan(cursor, count, |name, ()| f(Member::Str(name))),
             Body::Split(p) => p.scan(cursor, count, |name, ()| f(Member::Str(name))),
+            // An intset past the ceiling is the one thing outside the table
+            // band that a single reply cannot hold. Redis has a dictionary by
+            // this point and walks it in windows, and a set of a million
+            // integers answering `SSCAN` with a million members in one go would
+            // be a several megabyte reply and a loop iteration nobody could
+            // measure. So it walks in windows too, and by index, which the runs
+            // answer in a walk down their tree rather than a walk along them.
+            //
+            // Downward, which is the direction the element table walks and for
+            // the same reason. Positions in a sorted array shift when a member
+            // below them goes, so an upward walk would miss a member for every
+            // one removed behind it, and `SSCAN` followed by `SREM` on what it
+            // found is the commonest thing anyone does with this command.
+            // Walking down means those removals are all above the cursor, where
+            // they cost nothing.
+            Body::Ints(s) if self.ints_past_limit && !s.is_empty() => {
+                let top = s.len() - 1;
+                let mut at = match cursor.rebase(1).idx() {
+                    Some(idx) => (idx as usize).min(top),
+                    None => top,
+                };
+                for _ in 0..count.max(1) {
+                    f(Member::Int(s.at(at)));
+                    if at == 0 {
+                        return Cursor::END;
+                    }
+                    at -= 1;
+                }
+                Cursor::at(1, 0, at as u64)
+            }
             _ => {
                 for m in self.iter() {
                     f(m);
@@ -435,10 +504,21 @@ impl Set {
                         return false;
                     }
                     // Strictly greater, so the 512th member is still an intset
-                    // and the 513th is not. And it becomes a table rather than
-                    // a listpack, because anything past 512 is past 128 too.
+                    // and the 513th is what a real server would call a
+                    // hashtable. Nothing is rewritten, only the word changes.
+                    //
+                    // Unless the ceilings have been configured the wrong way
+                    // round, where a set past the intset ceiling is still under
+                    // the listpack one and a real server puts it in a listpack.
+                    // That set is a handful of members and there is no memory
+                    // argument for keeping it here, so it goes where it would
+                    // have gone.
                     if s.len() > limits.max_intset_entries {
-                        self.become_table(0);
+                        if self.ints_fit_a_listpack_alone(limits) {
+                            self.become_listpack();
+                        } else {
+                            self.ints_past_limit = true;
+                        }
                     }
                     return true;
                 }
@@ -561,14 +641,37 @@ impl Set {
         let Body::Ints(s) = &self.body else {
             return false;
         };
+        s.len() < limits.max_listpack_entries
+            && member.len() <= limits.max_listpack_value
+            && self.ints_are_short_enough(limits)
+    }
+
+    /// Whether this intset on its own would fit a listpack.
+    ///
+    /// The same question with no new member in it, which is what an intset that
+    /// has just passed `set-max-intset-entries` asks. It only ever answers yes
+    /// when the two ceilings have been configured the wrong way round, because
+    /// 512 is not under 128, and a server run that way expects a listpack there.
+    fn ints_fit_a_listpack_alone(&self, limits: &Limits) -> bool {
+        let Body::Ints(s) = &self.body else {
+            return false;
+        };
+        s.len() <= limits.max_listpack_entries && self.ints_are_short_enough(limits)
+    }
+
+    /// Whether every member, written as digits, is under the listpack ceiling.
+    fn ints_are_short_enough(&self, limits: &Limits) -> bool {
+        let Body::Ints(s) = &self.body else {
+            return false;
+        };
+        // The two ends bound the digits of everything between them, so there is
+        // nothing to walk.
         let widest = s
             .min()
             .map(i64_len)
             .unwrap_or(0)
             .max(s.max().map(i64_len).unwrap_or(0));
-        s.len() < limits.max_listpack_entries
-            && member.len() <= limits.max_listpack_value
-            && widest <= limits.max_listpack_value
+        widest <= limits.max_listpack_value
     }
 
     /// Rewrite as a listpack, which only an intset ever does.

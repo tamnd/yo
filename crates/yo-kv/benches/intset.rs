@@ -193,5 +193,83 @@ fn bench_memory(c: &mut Criterion) {
     g.finish();
 }
 
-criterion_group!(benches, bench_contains, bench_fill, bench_memory);
+/// Sizes for the rows that only the intset runs in.
+///
+/// The listpack and the element table are not measured here because one of them
+/// cannot reach these counts and the other has already been measured against the
+/// intset at the sizes where the choice between them is live. What is being
+/// asked is a different question: whether the runs keep the cost flat as the set
+/// grows, or whether picking the run quietly turns a search into a walk.
+const BIG: [usize; 3] = [4_096, 100_000, 1_000_000];
+
+fn big_sizes() -> &'static [usize] {
+    if std::env::var_os("YO_BENCH_SMOKE").is_some() {
+        &BIG[..1]
+    } else {
+        &BIG
+    }
+}
+
+fn bench_runs(c: &mut Criterion) {
+    let mut g = c.benchmark_group("intset_runs");
+    g.sample_size(20);
+
+    for &n in big_sizes() {
+        let vals = members(n);
+        let mut shuffled = vals.clone();
+        shuffled.sort_by_key(|v| v.wrapping_mul(2_654_435_761));
+        let mut is = Intset::new();
+        for &v in &shuffled {
+            is.add(v);
+        }
+        println!(
+            "  runs at {n}: {} runs, {:.2} B/member",
+            is.runs(),
+            is.memory_bytes() as f64 / n as f64,
+        );
+
+        g.throughput(Throughput::Elements(1));
+        g.bench_with_input(BenchmarkId::new("contains_hit", n), &n, |b, _| {
+            let mut i = 0;
+            b.iter(|| {
+                i = (i + 1) % vals.len();
+                black_box(is.contains(black_box(vals[i])))
+            });
+        });
+        g.bench_with_input(BenchmarkId::new("contains_miss", n), &n, |b, _| {
+            let miss = interior_miss(n);
+            b.iter(|| black_box(is.contains(black_box(miss))));
+        });
+        // What `SRANDMEMBER` and `SPOP` pay. One array answers this by
+        // multiplying, so it is the one thing the runs made harder and the one
+        // worth watching.
+        g.bench_with_input(BenchmarkId::new("at", n), &n, |b, _| {
+            let mut i = 0usize;
+            b.iter(|| {
+                i = (i + 2_654_435_761) % n;
+                black_box(is.at(black_box(i)))
+            });
+        });
+
+        g.throughput(Throughput::Elements(n as u64));
+        g.bench_with_input(BenchmarkId::new("fill_scattered", n), &n, |b, _| {
+            b.iter(|| {
+                let mut is = Intset::with_capacity(n);
+                for &v in &shuffled {
+                    is.add(black_box(v));
+                }
+                black_box(is.len())
+            });
+        });
+    }
+    g.finish();
+}
+
+criterion_group!(
+    benches,
+    bench_contains,
+    bench_fill,
+    bench_memory,
+    bench_runs
+);
 criterion_main!(benches);
