@@ -32,6 +32,14 @@ type Set = Elements<()>;
 /// slot the real hash will put there.
 type Hash = Elements<u64>;
 
+/// A sorted set: a score against a member.
+///
+/// This is the payload that made the split worth doing, because it is the one
+/// with an alignment stricter than the row's, and it is the one that has to be
+/// checked for what the split costs. A member and its score are in two arrays
+/// now rather than one, so a walk that reads both is two sequential streams.
+type Scored = Elements<f64>;
+
 fn name(i: usize) -> Vec<u8> {
     format!("member:{i:012}").into_bytes()
 }
@@ -133,6 +141,29 @@ fn bench_probe(c: &mut Criterion) {
                 black_box(h.insert(black_box(&over[i]), 7)).ok()
             })
         });
+    }
+
+    // A walk that reads the name and the payload together, which is `ZRANGE`
+    // with scores and the one shape the split payload could plausibly hurt: the
+    // member and its score are in two arrays now instead of one. Two sequential
+    // streams rather than one, which a prefetcher covers, against four bytes an
+    // element of padding that the single array was paying.
+    for &n in sizes() {
+        let mut z = Scored::with_capacity(n);
+        for i in 0..n {
+            z.insert(&name(i), i as f64).expect("room");
+        }
+        g.throughput(Throughput::Elements(n as u64));
+        g.bench_with_input(BenchmarkId::new("score_walk", n), &n, |b, _| {
+            b.iter(|| {
+                let mut got = 0.0f64;
+                for (m, &sc) in z.iter() {
+                    got += sc + m.len() as f64;
+                }
+                got
+            })
+        });
+        g.throughput(Throughput::Elements(1));
     }
 
     g.finish();

@@ -11,12 +11,15 @@
 //! that turns a name into a row index.
 //!
 //! ```text
-//!   slots            rows                      names
-//! +--------+       +--------------+--------+  +--------------------------+
-//! | tag|idx| ----> | name off,len | payload|  | fieldbytesmemberbytes... |
-//! +--------+       +--------------+--------+  +--------------------------+
-//!  one load         one load                   only touched on a tag hit
+//!   slots            rows            payloads   names
+//! +--------+       +--------------+  +-------+  +--------------------------+
+//! | tag|idx| ----> | name off,len |  | score |  | fieldbytesmemberbytes... |
+//! +--------+       +--------------+  +-------+  +--------------------------+
+//!  one load         one load          same idx   only touched on a tag hit
 //! ```
+//!
+//! The payload sits beside the row rather than in it, so that a score's eight
+//! byte alignment does not put four bytes of padding on every member.
 //!
 //! Three properties come out of that shape and all three are the reason for it.
 //!
@@ -114,8 +117,7 @@ struct NameRef {
     len: u16,
 }
 
-/// One element: where its name is, where it wanted to sit, and what is stored
-/// against it.
+/// One element: where its name is and where it wanted to sit.
 ///
 /// `home` is the low 32 bits of the name's hash, which is where the slot for
 /// this row would sit in an empty table. Four bytes to hold it, and what they
@@ -123,11 +125,12 @@ struct NameRef {
 /// of those walk slots and ask each one where it wanted to be, and asking the
 /// blob instead means a random cache miss per slot examined, on the two
 /// operations where there is no reply to send that would have paid for it.
+///
+/// The payload is deliberately not in here. See [`Elements::vals`].
 #[derive(Debug, Clone, Copy)]
-struct Row<V> {
+struct Row {
     name: NameRef,
     home: u32,
-    value: V,
 }
 
 /// An open addressed table of elements, keyed by name, dense in insertion order.
@@ -139,7 +142,20 @@ pub struct Elements<V> {
     /// Tag in the top byte, row index in the low 24 bits, [`EMPTY`] for nothing.
     slots: Box<[u32]>,
     /// The rows, in insertion order, with no holes.
-    rows: Vec<Row<V>>,
+    rows: Vec<Row>,
+    /// The payloads, one per row and at the same index.
+    ///
+    /// Beside the rows rather than inside them, because a payload with a
+    /// stricter alignment than the row's four bytes pays for that alignment on
+    /// every element. A sorted set's score is the case that matters: eight byte
+    /// aligned, so a row holding one is twenty four bytes to carry twenty, and
+    /// the four wasted bytes are per member. Split, the pair is twenty and there
+    /// is no padding anywhere. A set pays nothing for this either way, because
+    /// `Vec<()>` does not allocate.
+    ///
+    /// It costs the walks a second array, which is a second sequential stream
+    /// and not a second random access, so the prefetcher covers it.
+    vals: Vec<V>,
     /// Every live name, back to back, and some dead ones.
     ///
     /// The length stays in [`NameRef`] rather than in a [`crate::blob::Span`],
@@ -165,6 +181,7 @@ impl<V: Copy> Elements<V> {
         Elements {
             slots: Box::new([]),
             rows: Vec::new(),
+            vals: Vec::new(),
             names: Blob::new(),
         }
     }
@@ -179,6 +196,7 @@ impl<V: Copy> Elements<V> {
         let mut e = Elements::new();
         if n > 0 {
             e.rows.reserve(n);
+            e.vals.reserve(n);
             e.grow_to(slots_for(n));
         }
         e
@@ -203,7 +221,7 @@ impl<V: Copy> Elements<V> {
     #[must_use]
     pub fn get(&self, name: &[u8]) -> Option<&V> {
         let at = self.find(name)?;
-        Some(&self.rows[at].value)
+        Some(&self.vals[at])
     }
 
     /// The payload, to be changed in place.
@@ -213,7 +231,7 @@ impl<V: Copy> Elements<V> {
     #[inline]
     pub fn get_mut(&mut self, name: &[u8]) -> Option<&mut V> {
         let at = self.find(name)?;
-        Some(&mut self.rows[at].value)
+        Some(&mut self.vals[at])
     }
 
     /// Whether this name is here at all. `SISMEMBER` and `HEXISTS`.
@@ -274,7 +292,7 @@ impl<V: Copy> Elements<V> {
         }
         let h = hash(name);
         if let Some(at) = self.find_hashed(h, name) {
-            return Ok(Some(std::mem::replace(&mut self.rows[at].value, value)));
+            return Ok(Some(std::mem::replace(&mut self.vals[at], value)));
         }
         if self.rows.len() >= MAX_ROWS {
             return Err(Full::Rows);
@@ -285,8 +303,8 @@ impl<V: Copy> Elements<V> {
         self.rows.push(Row {
             name: name_ref,
             home: h as u32,
-            value,
         });
+        self.vals.push(value);
         self.put_slot(h, at);
         Ok(None)
     }
@@ -321,7 +339,7 @@ impl<V: Copy> Elements<V> {
     #[must_use]
     pub fn at(&self, idx: usize) -> Option<(&[u8], &V)> {
         let row = self.rows.get(idx)?;
-        Some((self.name_of(row), &row.value))
+        Some((self.name_of(row), &self.vals[idx]))
     }
 
     /// The payload at `idx`, to be written over.
@@ -330,7 +348,7 @@ impl<V: Copy> Elements<V> {
     /// once and wants to use the position it found rather than probe again.
     #[inline]
     pub fn at_mut(&mut self, idx: usize) -> Option<&mut V> {
-        self.rows.get_mut(idx).map(|r| &mut r.value)
+        self.vals.get_mut(idx)
     }
 
     /// Take the row at `idx` out and hand back its name and payload.
@@ -354,7 +372,10 @@ impl<V: Copy> Elements<V> {
     /// the row array front to back, which is one stream of cache lines and no
     /// pointer chasing.
     pub fn iter(&self) -> impl Iterator<Item = (&[u8], &V)> {
-        self.rows.iter().map(|r| (self.name_of(r), &r.value))
+        self.rows
+            .iter()
+            .zip(&self.vals)
+            .map(|(r, v)| (self.name_of(r), v))
     }
 
     /// Every payload, to be changed in place, with no names in the way.
@@ -365,7 +386,7 @@ impl<V: Copy> Elements<V> {
     /// mutably, and handing out a name at the same time would borrow the name
     /// blob as well for no caller that wants it.
     pub fn payloads_mut(&mut self) -> impl Iterator<Item = &mut V> {
-        self.rows.iter_mut().map(|r| &mut r.value)
+        self.vals.iter_mut()
     }
 
     /// Walk part of the table and say where to resume.
@@ -401,7 +422,7 @@ impl<V: Copy> Elements<V> {
         };
         for _ in 0..count.max(1) {
             let row = &self.rows[at];
-            f(self.name_of(row), &row.value);
+            f(self.name_of(row), &self.vals[at]);
             if at == 0 {
                 return Cursor::END;
             }
@@ -416,6 +437,7 @@ impl<V: Copy> Elements<V> {
     /// is `SINTERSTORE` over the same destination in a loop.
     pub fn clear(&mut self) {
         self.rows.clear();
+        self.vals.clear();
         self.names.clear();
         for slot in &mut self.slots {
             *slot = EMPTY;
@@ -428,9 +450,7 @@ impl<V: Copy> Elements<V> {
     /// counted by the arena and not twice here.
     #[must_use]
     pub fn memory_bytes(&self) -> usize {
-        self.slots.len() * size_of::<u32>()
-            + self.rows.capacity() * size_of::<Row<V>>()
-            + self.names.memory_bytes()
+        self.slot_bytes() + self.row_bytes() + self.names.memory_bytes()
     }
 
     /// What the slot array costs on its own, for the memory measurements.
@@ -443,7 +463,7 @@ impl<V: Copy> Elements<V> {
     /// the slack a doubling `Vec` is holding is memory this table is using.
     #[must_use]
     pub fn row_bytes(&self) -> usize {
-        self.rows.capacity() * size_of::<Row<V>>()
+        self.rows.capacity() * size_of::<Row>() + self.vals.capacity() * size_of::<V>()
     }
 
     /// What the name blob costs on its own, live bytes and dead ones together.
@@ -517,11 +537,13 @@ impl<V: Copy> Elements<V> {
             let moved = self.rows[last].home;
             self.repoint(moved, last, at);
             self.rows.swap(at, last);
+            self.vals.swap(at, last);
         }
         let row = self.rows.pop().expect("the table was not empty");
+        let value = self.vals.pop().expect("a payload per row");
         self.names.release(row.name.len as usize);
         self.maybe_compact_names();
-        row.value
+        value
     }
 
     /// Close the slot holding `row`, and shift the run behind it back.
@@ -588,6 +610,7 @@ impl<V: Copy> Elements<V> {
     fn reserve_one(&mut self) {
         let want = self.rows.len() + 1;
         crate::grow::reserve(&mut self.rows, 1);
+        crate::grow::reserve(&mut self.vals, 1);
         if want * LOAD_DEN > self.slots.len() * LOAD_NUM {
             self.grow_to(slots_for(want));
         }
@@ -626,7 +649,7 @@ impl<V: Copy> Elements<V> {
 
     /// The bytes of one row's name.
     #[inline]
-    fn name_of(&self, row: &Row<V>) -> &[u8] {
+    fn name_of(&self, row: &Row) -> &[u8] {
         self.names.read(row.name.at, row.name.len as usize)
     }
 
@@ -1026,13 +1049,23 @@ mod tests {
     }
 
     /// The row is the thing there are a million of, so its size is a decision
-    /// and not an accident. Six bytes of name reference, four of home slot, and
-    /// whatever the collection stores.
+    /// and not an accident. Six bytes of name reference and four of home slot,
+    /// with two of padding that the name offset's alignment forces and nothing
+    /// can be done about.
+    ///
+    /// The payload is in an array of its own, so a score costs its eight bytes
+    /// and not twelve. That is the whole reason for the split and it is worth a
+    /// test, because putting the score back in the row would compile.
     #[test]
-    fn a_row_is_twelve_bytes_plus_its_payload() {
-        assert_eq!(size_of::<Row<()>>(), 12);
-        assert_eq!(size_of::<Row<u32>>(), 16);
-        assert_eq!(size_of::<Row<u64>>(), 24);
+    fn a_row_is_twelve_bytes_whatever_the_collection_stores() {
+        assert_eq!(size_of::<Row>(), 12);
+        assert_eq!(size_of::<Row>() + size_of::<()>(), 12, "a set member");
+        assert_eq!(size_of::<Row>() + size_of::<f64>(), 20, "a sorted set");
+        assert_eq!(
+            size_of::<Row>() + size_of::<crate::blob::Span>(),
+            20,
+            "a hash field"
+        );
     }
 
     #[test]

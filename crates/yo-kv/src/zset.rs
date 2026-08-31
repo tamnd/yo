@@ -845,9 +845,12 @@ mod tests {
         let Body::Table(t) = &z.body else {
             panic!("forty thousand members is not a listpack");
         };
+        // Twelve bytes of row and eight of score, so twenty five leaves room for
+        // the growth policy's quarter and none for a payload that has crept back
+        // inside the row and brought four bytes of padding with it.
         assert!(
-            t.members.row_bytes() < n * 30,
-            "the row array holds {} for {n} rows of twenty four bytes",
+            t.members.row_bytes() < n * 25,
+            "the row and score arrays hold {} for {n} members",
             t.members.row_bytes()
         );
         assert!(
