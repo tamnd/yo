@@ -459,16 +459,45 @@ impl Chunk {
         }
     }
 
+    /// A forward walk that starts at `index` rather than at the front.
+    ///
+    /// `LRANGE` in the middle of a list lands in the middle of a chunk, and the
+    /// only other way to start there is to walk the entries in front of it and
+    /// throw them away. This finds the byte offset by whichever end is closer
+    /// and hands back a walk from there.
+    #[must_use]
+    pub fn iter_from(&self, index: usize) -> Iter<'_> {
+        let at = self.offset_of(index).unwrap_or(self.tail);
+        Iter {
+            bytes: &self.bytes[self.head..self.tail],
+            at: at - self.head,
+        }
+    }
+
     /// Where the entry at `index` starts, or nothing if there is no such entry.
+    ///
+    /// From whichever end of the chunk is closer. A chunk holds up to five
+    /// hundred and twelve entries, and half of them is the difference between
+    /// a microsecond and half of one on a `LINDEX` that lands in the middle of
+    /// a big list. Going backward is what the length behind each entry is for,
+    /// and it is the same field `iter_back` reads.
     fn offset_of(&self, index: usize) -> Option<usize> {
         if index >= self.count {
             return None;
         }
-        let mut at = self.head;
-        for _ in 0..index {
-            at += self.step(at)?;
+        if index * 2 <= self.count {
+            let mut at = self.head;
+            for _ in 0..index {
+                at += self.step(at)?;
+            }
+            return Some(at);
         }
-        Some(at)
+        let mut end = self.tail;
+        for _ in index..self.count {
+            let len = read_backlen(&self.bytes[self.head..end])?;
+            end = end.checked_sub(len + backlen_len(len))?;
+        }
+        Some(end)
     }
 
     /// Where the last entry starts.

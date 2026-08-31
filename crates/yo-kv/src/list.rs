@@ -40,6 +40,7 @@
 //! stored as an integer is handed over as one and formatted once, into the reply
 //! buffer, at the moment the reply is built. That is Y18 again.
 
+use std::cell::RefCell;
 use std::collections::VecDeque;
 
 use crate::chunk::{CHUNK_BYTES, Chunk};
@@ -283,7 +284,7 @@ impl List {
     /// list reads a hundred elements and not five hundred thousand.
     pub fn range(&self, start: usize, count: usize) -> impl Iterator<Item = Element<'_>> {
         let (packed, chunks) = match &self.body {
-            Body::Packed(lp) => (Some(lp.iter().skip(start).take(count)), None),
+            Body::Packed(lp) => (Some(lp.iter_from(start).take(count)), None),
             Body::Chunks(d) => (None, Some(d.range(start, count))),
         };
         packed
@@ -643,11 +644,30 @@ fn lone(value: &[u8], front: bool) -> Chunk {
 /// The length is carried rather than summed because `LLEN` is a command and
 /// summing a thousand chunk counts to answer it would be a walk of the whole
 /// list to say how long it is.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 struct Deque {
     chunks: VecDeque<Chunk>,
     len: usize,
+    /// Where each chunk starts, so that finding an index is a binary search
+    /// over the ring rather than a walk along it. See [`Deque::locate`].
+    ///
+    /// Behind a cell because it is filled in by reads, and the reads that want
+    /// it take `&self`. Nothing outside this thread can see it: a shard owns
+    /// its keyspace and `yo-shard` has a test that the type system says so.
+    starts: RefCell<VecDeque<i64>>,
 }
+
+/// Two rings are the same when they hold the same elements in the same chunks.
+///
+/// Written out rather than derived because the start index is a cache, and a
+/// list that has been read is not a different list from one that has not.
+impl PartialEq for Deque {
+    fn eq(&self, other: &Deque) -> bool {
+        self.len == other.len && self.chunks == other.chunks
+    }
+}
+
+impl Eq for Deque {}
 
 impl Deque {
     /// An empty ring.
@@ -655,6 +675,7 @@ impl Deque {
         Deque {
             chunks: VecDeque::new(),
             len: 0,
+            starts: RefCell::new(VecDeque::new()),
         }
     }
 
@@ -668,16 +689,22 @@ impl Deque {
     fn adopt(&mut self, lp: &Listpack) {
         self.len = lp.len();
         self.chunks.push_back(Chunk::adopt(lp.entries(), lp.len()));
+        self.tail_added();
     }
 
     /// What the whole ring costs.
     ///
     /// A chunk counts its own header, because it is sitting in the ring's own
     /// allocation, so what is left to add is the slots the ring is holding empty
-    /// for the chunks it does not have yet.
+    /// for the chunks it does not have yet. The start index goes in as well,
+    /// because it is eight bytes a chunk that the list would not otherwise be
+    /// holding, and a structure that hides part of itself from `MEMORY USAGE`
+    /// is worse than one that costs a little more.
     fn memory_bytes(&self) -> usize {
         let spare = self.chunks.capacity() - self.chunks.len();
-        self.chunks.iter().map(Chunk::memory_bytes).sum::<usize>() + spare * size_of::<Chunk>()
+        self.chunks.iter().map(Chunk::memory_bytes).sum::<usize>()
+            + spare * size_of::<Chunk>()
+            + self.starts.borrow().capacity() * size_of::<i64>()
     }
 
     /// The first element.
@@ -711,13 +738,11 @@ impl Deque {
     /// listpack headers nobody asked for.
     fn range(&self, start: usize, count: usize) -> impl Iterator<Item = Element<'_>> {
         let (chunk, within) = self.locate(start).unwrap_or((self.chunks.len(), 0));
-        self.chunks
-            .iter()
-            .skip(chunk)
-            .flat_map(Chunk::iter)
-            // At most one chunk's worth, because `locate` already put us in the
-            // right chunk and `within` is a position inside it.
-            .skip(within)
+        let first = self.chunks.get(chunk).map(|c| c.iter_from(within));
+        first
+            .into_iter()
+            .flatten()
+            .chain(self.chunks.iter().skip(chunk + 1).flat_map(Chunk::iter))
             .take(count)
     }
 
@@ -728,31 +753,128 @@ impl Deque {
 
     /// Which chunk holds the element at `index`, and where in that chunk.
     ///
-    /// From whichever end is closer, because a list is a queue and the two
-    /// interesting indexes are near the ends. This is the walk the descriptor
-    /// cache in `08` section 5 turns into a lookup, and it is not written yet.
+    /// This used to walk the ring from whichever end was closer, which is fine
+    /// for a queue and terrible for anything that reads the middle: a million
+    /// element list is a few thousand chunks, and a `LINDEX` halfway along it
+    /// stepped over half of them to get there. That was two and a half
+    /// microseconds against a hundred and thirty nanoseconds for the same call
+    /// near an end.
+    ///
+    /// Now the ring carries where each chunk starts and the lookup is a binary
+    /// search. `08` section 6 puts it as chunk count arithmetic plus one chunk
+    /// walk, and the arithmetic is this.
+    ///
+    /// The starts are in their own coordinate system, whose origin is wherever
+    /// the head chunk happened to be when the index was last built. What a
+    /// lookup uses is the difference between two entries and never an entry on
+    /// its own, so the origin can be anything, and that is what makes work at
+    /// the front free: pushing an element on to the head chunk moves that
+    /// chunk's start back by one and leaves every other entry correct, where an
+    /// index of real positions would have had to add one to all of them.
+    ///
+    /// Only the first `starts.len()` chunks are described. A mutation in the
+    /// middle of the ring cuts the index back to the chunk it touched and
+    /// nothing more, so the mutation itself never walks, and the next lookup
+    /// that needs the rest pays for it once.
     fn locate(&self, index: usize) -> Option<(usize, usize)> {
         if index >= self.len {
             return None;
         }
-        if index * 2 <= self.len {
-            let mut at = index;
-            for (i, c) in self.chunks.iter().enumerate() {
-                if at < c.len() {
-                    return Some((i, at));
-                }
-                at -= c.len();
-            }
-        } else {
-            let mut back = self.len - index - 1;
-            for (i, c) in self.chunks.iter().enumerate().rev() {
-                if back < c.len() {
-                    return Some((i, c.len() - back - 1));
-                }
-                back -= c.len();
-            }
+        // The two end chunks are answered by a comparison each, before any of
+        // the above. A list is a queue and the position a client asks for is
+        // usually near an end, and a binary search over a few thousand entries
+        // is eleven scattered loads to say what one subtraction already knew.
+        // Without this the index made `LINDEX mylist 3` half again as slow as
+        // the walk it replaced.
+        let head = self.chunks.front()?.len();
+        if index < head {
+            return Some((0, index));
         }
-        None
+        let last = self.chunks.len() - 1;
+        let before_tail = self.len - self.chunks[last].len();
+        if index >= before_tail {
+            return Some((last, index - before_tail));
+        }
+        let mut starts = self.starts.borrow_mut();
+        if starts.is_empty() {
+            starts.push_back(0);
+        }
+        // Carry the index on from where the last lookup or the last mutation
+        // left it, and only as far as this index needs. A read near the front
+        // of a ring that was just cut does not describe the whole ring to
+        // answer.
+        let want = starts[0] + index as i64;
+        loop {
+            let last = starts.len() - 1;
+            let end = starts[last] + self.chunks[last].len() as i64;
+            if end > want || starts.len() == self.chunks.len() {
+                break;
+            }
+            starts.push_back(end);
+        }
+        // The last chunk that starts at or before the wanted position. An empty
+        // chunk starts where the next one does, and this lands on the later of
+        // the two, which is the one holding the element.
+        let at = starts.partition_point(|&s| s <= want) - 1;
+        Some((at, (want - starts[at]) as usize))
+    }
+
+    /// Forget where every chunk from `from` onward starts.
+    ///
+    /// Cheap on purpose. Every mutation in the middle of the ring calls this
+    /// and none of them rebuild anything, because the next lookup will.
+    #[inline]
+    fn cut(&mut self, from: usize) {
+        let keep = from.min(self.chunks.len());
+        let starts = self.starts.get_mut();
+        if starts.len() > keep {
+            starts.truncate(keep);
+        }
+    }
+
+    /// The head chunk's first element moved `by` places later.
+    ///
+    /// Negative for a push, positive for a pop. One subtraction, whatever the
+    /// ring is holding, which is the whole point of the floating origin.
+    #[inline]
+    fn head_moved(&mut self, by: i64) {
+        if let Some(first) = self.starts.get_mut().front_mut() {
+            *first += by;
+        }
+    }
+
+    /// A chunk holding `len` elements went on the front of the ring.
+    #[inline]
+    fn head_added(&mut self, len: usize) {
+        let starts = self.starts.get_mut();
+        if let Some(&first) = starts.front() {
+            starts.push_front(first - len as i64);
+        }
+    }
+
+    /// The head chunk left the ring, with everything that was in it.
+    #[inline]
+    fn head_dropped(&mut self) {
+        self.starts.get_mut().pop_front();
+    }
+
+    /// A chunk went on the back of the ring.
+    ///
+    /// Described only if everything before it already is, which is the case
+    /// that matters: a list being filled with `RPUSH` grows a chunk at a time
+    /// and never invalidates anything, so the index is complete by the time
+    /// anybody reads the middle of it.
+    #[inline]
+    fn tail_added(&mut self) {
+        let n = self.chunks.len();
+        let before = if n >= 2 { self.chunks[n - 2].len() } else { 0 };
+        let starts = self.starts.get_mut();
+        if n == 1 && starts.is_empty() {
+            starts.push_back(0);
+        } else if starts.len() + 1 == n {
+            let last = starts[n - 2];
+            starts.push_back(last + before as i64);
+        }
     }
 
     /// Put `value` at the front, in the head chunk or in a new one.
@@ -761,6 +883,7 @@ impl Deque {
             && head.push_front(value)
         {
             self.len += 1;
+            self.head_moved(-1);
             return;
         }
         // The chunk that was the head stops being an end, so it gives back the
@@ -768,11 +891,13 @@ impl Deque {
         // holding nothing is one every walk from that end has to step over.
         if self.chunks.front().is_some_and(Chunk::is_empty) {
             self.chunks.pop_front();
+            self.head_dropped();
         } else if let Some(head) = self.chunks.front_mut() {
             head.seal();
         }
         self.chunks.push_front(lone(value, true));
         self.len += 1;
+        self.head_added(1);
     }
 
     /// Put `value` at the back, in the tail chunk or in a new one.
@@ -785,11 +910,13 @@ impl Deque {
         }
         if self.chunks.back().is_some_and(Chunk::is_empty) {
             self.chunks.pop_back();
+            self.cut(self.chunks.len());
         } else if let Some(tail) = self.chunks.back_mut() {
             tail.seal();
         }
         self.chunks.push_back(lone(value, false));
         self.len += 1;
+        self.tail_added();
     }
 
     /// Put `value` in at `index`, splitting a chunk if it will not take it.
@@ -815,6 +942,8 @@ impl Deque {
         };
         if self.chunks[i].insert_at(within, value) {
             self.len += 1;
+            // Chunk `i` still starts where it did. Everything after it moved.
+            self.cut(i + 1);
             return true;
         }
         let mut rest = self.chunks[i].split_off(within);
@@ -825,6 +954,7 @@ impl Deque {
             self.chunks.insert(i + 1, lone(value, false));
         }
         self.len += 1;
+        self.cut(i + 1);
         true
     }
 
@@ -839,6 +969,12 @@ impl Deque {
         self.len -= 1;
         if self.chunks[i].is_empty() && self.chunks.len() > 1 {
             self.chunks.remove(i);
+            // The chunk that takes its place starts where the empty one did,
+            // so `i` is still right, but keeping it would be an argument and
+            // cutting it is a memory write.
+            self.cut(i);
+        } else {
+            self.cut(i + 1);
         }
         true
     }
@@ -852,6 +988,8 @@ impl Deque {
             return false;
         };
         if self.chunks[i].replace_at(within, value) {
+            // One element out and one in, so no chunk moved and the index is
+            // still true. This is the common case and it costs nothing.
             return true;
         }
         let mut rest = self.chunks[i].split_off(within);
@@ -866,6 +1004,7 @@ impl Deque {
         if self.chunks[i].is_empty() && self.chunks.len() > 1 {
             self.chunks.remove(i);
         }
+        self.cut(i);
         true
     }
 
@@ -885,10 +1024,12 @@ impl Deque {
                 front -= held;
                 self.len -= held;
                 self.chunks.pop_front();
+                self.head_dropped();
             } else {
                 let took = self.chunks[0].drop_front_n(front);
                 self.len -= took;
                 front -= took;
+                self.head_moved(took as i64);
                 if took == 0 {
                     break;
                 }
@@ -903,6 +1044,7 @@ impl Deque {
                 back -= held;
                 self.len -= held;
                 self.chunks.pop_back();
+                self.cut(self.chunks.len());
             } else {
                 let last = self.chunks.len() - 1;
                 let took = self.chunks[last].drop_back_n(back);
@@ -923,9 +1065,12 @@ impl Deque {
         if !head.drop_front() {
             return false;
         }
+        let gone = head.is_empty();
         self.len -= 1;
-        if head.is_empty() && self.chunks.len() > 1 {
+        self.head_moved(1);
+        if gone && self.chunks.len() > 1 {
             self.chunks.pop_front();
+            self.head_dropped();
         }
         true
     }
@@ -938,11 +1083,43 @@ impl Deque {
         if !tail.drop_back() {
             return false;
         }
+        let gone = tail.is_empty();
         self.len -= 1;
-        if tail.is_empty() && self.chunks.len() > 1 {
+        if gone && self.chunks.len() > 1 {
             self.chunks.pop_back();
+            self.cut(self.chunks.len());
         }
         true
+    }
+
+    /// Every start the index claims to know, checked against a walk.
+    ///
+    /// The index is maintained by hand at nine call sites and a wrong entry
+    /// would hand back the wrong element without anything else noticing, so
+    /// the tests that mutate a ring call this rather than trusting the
+    /// argument that the call sites are right.
+    #[cfg(test)]
+    fn index_is_true(&self) {
+        let starts = self.starts.borrow();
+        assert!(
+            starts.len() <= self.chunks.len(),
+            "the index describes {} chunks and the ring holds {}",
+            starts.len(),
+            self.chunks.len()
+        );
+        let Some(&base) = starts.front() else {
+            return;
+        };
+        let mut real = 0usize;
+        for (i, &s) in starts.iter().enumerate() {
+            assert_eq!(
+                s - base,
+                real as i64,
+                "chunk {i} is indexed at {} and starts at {real}",
+                s - base
+            );
+            real += self.chunks[i].len();
+        }
     }
 }
 
@@ -1303,6 +1480,86 @@ mod tests {
         }
     }
 
+    /// The same over a packed list, which seeks by walking the blob from
+    /// whichever end is nearer rather than by finding a chunk. A list in this
+    /// band holds eight kilobytes, which is four hundred odd elements and not
+    /// the hundred and twenty eight the other packed bands stop at, so the half
+    /// of the blob that the two ended seek saves is worth having and the seam
+    /// between the two directions is worth checking at every position.
+    #[test]
+    fn a_packed_window_lands_in_the_right_place_from_either_end() {
+        let limits = Limits::default();
+        let mut l = List::new();
+        for i in 0..400 {
+            l.push_back(format!("e{i:0>9}").as_bytes(), &limits);
+        }
+        assert_eq!(l.encoding(), Encoding::Listpack);
+        let all_of_it = all(&l);
+
+        for start in 0..=400 {
+            assert_eq!(
+                l.get(start).map(|e| e.to_vec()).as_ref(),
+                all_of_it.get(start),
+                "element {start}"
+            );
+            for count in [0usize, 1, 7, 130, 400] {
+                let got: Vec<Vec<u8>> = l.range(start, count).map(|e| e.to_vec()).collect();
+                let want = &all_of_it[start.min(400)..(start + count).min(400)];
+                assert_eq!(got, want, "{count} from {start}");
+            }
+        }
+    }
+
+    /// The chunk start index has a floating origin so that work at the front of
+    /// the list costs it nothing, which is the one part of it that is clever
+    /// enough to be wrong. This is the shape that would catch it: a queue being
+    /// drained and refilled at the head while something reads the middle, where
+    /// an index of real positions would need every entry rewritten on every
+    /// push and this one moves a single number.
+    #[test]
+    fn reading_the_middle_survives_a_head_that_keeps_moving() {
+        let limits = Limits::default();
+        let mut l = List::new();
+        let mut want: Vec<Vec<u8>> = Vec::new();
+        for i in 0..2000 {
+            let v = format!("e{i}:{}", "p".repeat(100)).into_bytes();
+            l.push_back(&v, &limits);
+            want.push(v);
+        }
+        assert_eq!(l.encoding(), Encoding::Quicklist);
+
+        for round in 0..400 {
+            // Enough pushes and pops to walk the head chunk across its own
+            // boundary in both directions rather than only inside it.
+            if round % 3 == 0 {
+                for k in 0..7 {
+                    let v = format!("h{round}:{k}:{}", "q".repeat(100)).into_bytes();
+                    l.push_front(&v, &limits);
+                    want.insert(0, v);
+                }
+            } else {
+                for _ in 0..5 {
+                    assert_eq!(l.pop_front(&limits), Some(want.remove(0)));
+                }
+            }
+            assert_eq!(l.len(), want.len(), "length after round {round}");
+            for at in [0, 1, want.len() / 3, want.len() / 2, want.len() - 1] {
+                assert_eq!(
+                    l.get(at).map(|e| e.to_vec()).as_ref(),
+                    Some(&want[at]),
+                    "element {at} after round {round}"
+                );
+            }
+            let mid = want.len() / 2;
+            let got: Vec<Vec<u8>> = l.range(mid, 30).map(|e| e.to_vec()).collect();
+            assert_eq!(got, want[mid..mid + 30], "the window after round {round}");
+            let Body::Chunks(d) = &l.body else {
+                panic!("the list left the chunked band");
+            };
+            d.index_is_true();
+        }
+    }
+
     #[test]
     fn setting_an_element_replaces_only_that_one() {
         for mut l in both_bands(50) {
@@ -1614,6 +1871,23 @@ mod tests {
                 _ => {}
             }
             assert_eq!(l.len(), want.len(), "length after round {round}");
+            // Read at both ends and in the middle every round. That builds the
+            // chunk start index back up after whatever the round did to it, so
+            // the audit below is checking a filled index and not an empty one,
+            // and a stale entry shows up here as the wrong element rather than
+            // as nothing at all.
+            if !want.is_empty() {
+                for at in [0, want.len() / 2, want.len() - 1] {
+                    assert_eq!(
+                        l.get(at).map(|e| e.to_vec()).as_ref(),
+                        Some(&want[at]),
+                        "element {at} after round {round}"
+                    );
+                }
+            }
+            if let Body::Chunks(d) = &l.body {
+                d.index_is_true();
+            }
             match l.encoding() {
                 Encoding::Listpack => packed += 1,
                 Encoding::Quicklist => chunked += 1,
