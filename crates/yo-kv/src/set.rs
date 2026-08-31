@@ -1,26 +1,36 @@
-//! A set, in whichever of the three representations currently fits it.
+//! A set, in whichever representation currently fits it.
 //!
-//! A set is one of an [`Intset`], a [`Listpack`] or an [`Elements`] table, and
-//! which one is not a choice this file gets to make freely. `OBJECT ENCODING`
-//! has to answer `intset`, `listpack` or `hashtable` at exactly the sizes a real
-//! server answers them, because clients and test suites read it (`08` §1), so
-//! the promotion rules here are Redis's rules and they were read off `t_set.c`
-//! in the 8.10.1 tarball rather than reasoned out from what each structure is
-//! good at.
+//! A set is one of an [`Intset`], a [`Listpack`], an [`Elements`] table or a
+//! [`Parts`] band, and which one is not a choice this file gets to make freely.
+//! `OBJECT ENCODING` has to answer `intset`, `listpack` or `hashtable` at exactly
+//! the sizes a real server answers them, because clients and test suites read it
+//! (`08` §1), so the promotion rules here are Redis's rules and they were read
+//! off `t_set.c` in the 8.10.1 tarball rather than reasoned out from what each
+//! structure is good at.
 //!
 //! ```text
-//!   all integers          small, any bytes        everything else
-//! +-----------------+   +------------------+   +-------------------+
-//! | intset          |-->| listpack         |-->| element table     |
-//! | 2 B a member    |   | ~2 B + payload   |   | one probe, no cap |
-//! +-----------------+   +------------------+   +-------------------+
-//!    to 512 members         to 128 members
+//!  all integers        small, any bytes      everything else       large
+//! +-------------+   +------------------+   +---------------+   +-----------+
+//! | intset      |-->| listpack         |-->| element table |-->| partition |
+//! | 2 B member  |   | ~2 B + payload   |   | one probe     |   | band      |
+//! +-------------+   +------------------+   +---------------+   +-----------+
+//!  to 512 members     to 128 members                            past 262144
+//!                                          <------- both say `hashtable` ---->
 //! ```
+//!
+//! The fourth step is the one Redis does not have, and it is invisible on
+//! purpose. A set past 262,144 members becomes several element tables rather than
+//! one, which is what makes the merges and the growth pauses bounded, and it
+//! still answers `hashtable` because a client that gets a fourth word back from
+//! `OBJECT ENCODING` is a client whose assertions break. What partitioning
+//! changes is how a large set is stored, not what it is. See [`crate::parts`].
 //!
 //! Promotion is one-way and upward, which is Y4. A set that has been a hash
 //! table does not go back to an intset when it shrinks, and neither does Redis's:
 //! a set that demoted on the way down would rewrite itself on every second
-//! operation for a workload that adds and removes across a threshold.
+//! operation for a workload that adds and removes across a threshold. The band
+//! follows the same rule for the same reason, so a set hovering at the partition
+//! threshold rehashes once rather than on every other `SREM`.
 //!
 //! # The rules, and the two that are not obvious
 //!
@@ -49,6 +59,7 @@
 use crate::elem::Elements;
 use crate::intset::Intset;
 use crate::listpack::{self, Listpack};
+use crate::parts::{PARTITION_AT, Parts, parts_for};
 use crate::scan::Cursor;
 use yo_common::num::{DIGITS_MAX, i64_digits, i64_len, parse_i64};
 
@@ -183,12 +194,19 @@ impl Encoding {
     }
 }
 
-/// The three representations.
+/// The four representations, of which `OBJECT ENCODING` can see three.
+///
+/// [`Body::Split`] is the partitioned band and it is deliberately invisible from
+/// outside. Redis has three set encodings and a client that gets a fourth word
+/// back from `OBJECT ENCODING` is a client whose assertions break, so a split set
+/// answers `hashtable` like the table it was. What partitioning changes is how a
+/// large set is stored and merged, not what it is.
 #[derive(Debug, Clone)]
 enum Body {
     Ints(Intset),
     Packed(Listpack),
     Table(Elements<()>),
+    Split(Parts<()>),
 }
 
 /// A set of members.
@@ -227,6 +245,15 @@ impl Set {
             Set {
                 body: Body::Packed(Listpack::new()),
             }
+        } else if hint > PARTITION_AT {
+            // A caller that says up front it is about to load a million members
+            // should not build one table, fill it past the threshold and then
+            // rehash the lot into partitions. The hint is only a hint, and being
+            // wrong about it here costs a set with more partitions than it needs
+            // rather than anything incorrect.
+            Set {
+                body: Body::Split(Parts::with_parts(parts_for(hint))),
+            }
         } else {
             Set {
                 body: Body::Table(Elements::with_capacity(hint)),
@@ -241,7 +268,7 @@ impl Set {
         match self.body {
             Body::Ints(_) => Encoding::Intset,
             Body::Packed(_) => Encoding::Listpack,
-            Body::Table(_) => Encoding::Hashtable,
+            Body::Table(_) | Body::Split(_) => Encoding::Hashtable,
         }
     }
 
@@ -252,6 +279,7 @@ impl Set {
             Body::Ints(s) => s.len(),
             Body::Packed(lp) => lp.len(),
             Body::Table(t) => t.len(),
+            Body::Split(p) => p.len(),
         }
     }
 
@@ -273,6 +301,7 @@ impl Set {
             Body::Ints(s) => parse_i64(member).is_some_and(|v| s.contains(v)),
             Body::Packed(lp) => lp.find(member, 1).is_some(),
             Body::Table(t) => t.contains(member),
+            Body::Split(p) => p.contains(member),
         }
     }
 
@@ -288,6 +317,7 @@ impl Set {
             Body::Ints(s) => needle.int.is_some_and(|v| s.contains(v)),
             Body::Packed(lp) => lp.find_parsed(needle.bytes, needle.int, 1).is_some(),
             Body::Table(t) => t.contains_hashed(needle.hash, needle.bytes),
+            Body::Split(p) => p.contains_hashed(needle.hash, needle.bytes),
         }
     }
 
@@ -302,6 +332,7 @@ impl Set {
             Body::Ints(s) => s.get(index).map(Member::Int),
             Body::Packed(lp) => lp.get(index),
             Body::Table(t) => t.at(index).map(|(name, _)| Member::Str(name)),
+            Body::Split(p) => p.at(index).map(|(name, _)| Member::Str(name)),
         }
     }
 
@@ -312,7 +343,8 @@ impl Set {
 
     /// Walk part of the set and say where to resume. This is `SSCAN`.
     ///
-    /// Only the table band walks in windows. An intset or a listpack hands back
+    /// Only the table and the partitioned band walk in windows. An intset or a
+    /// listpack hands back
     /// every member in one call and a cursor of [`Cursor::END`], ignoring the
     /// cursor it was given, which is what Redis does for the same two encodings
     /// and for the same reason: a hundred and twenty eight members is smaller
@@ -320,17 +352,26 @@ impl Set {
     /// cannot block the loop long enough for the split to be worth anything.
     ///
     /// Ignoring the cursor is safe rather than merely convenient, because
-    /// promotion is one way. A set that gave a client a table cursor is still a
-    /// table when the client comes back, so the only way to arrive here with a
-    /// cursor from somewhere else is for the key to have been deleted and
+    /// promotion is one way. A set that gave a client a listpack cursor is not
+    /// going to be a listpack again, so the only way to arrive at those two arms
+    /// with a cursor from somewhere else is for the key to have been deleted and
     /// remade underneath the scan, and returning everything to that client
     /// returns a member twice at worst, which the guarantee allows.
+    ///
+    /// A table cursor arriving at the band is the one crossing that does happen,
+    /// because a set can split part way through a client's scan. That is handled
+    /// rather than ignored: a table cursor names one partition, and
+    /// [`Cursor::rebase`] reads the widening and restarts the walk at the top of
+    /// the new layout, so the client sees some members a second time and misses
+    /// none. Repeats are what the `SCAN` guarantee gives up in exchange for
+    /// surviving a resize, and a set only splits once.
     pub fn scan<F>(&self, cursor: Cursor, count: usize, mut f: F) -> Cursor
     where
         F: FnMut(Member<'_>),
     {
         match &self.body {
             Body::Table(t) => t.scan(cursor, count, |name, ()| f(Member::Str(name))),
+            Body::Split(p) => p.scan(cursor, count, |name, ()| f(Member::Str(name))),
             _ => {
                 for m in self.iter() {
                     f(m);
@@ -347,6 +388,7 @@ impl Set {
             Body::Ints(s) => s.memory_bytes(),
             Body::Packed(lp) => lp.byte_len(),
             Body::Table(t) => t.memory_bytes(),
+            Body::Split(p) => p.memory_bytes(),
         }
     }
 
@@ -355,7 +397,26 @@ impl Set {
     /// This is `setTypeAdd`, arm for arm.
     pub fn add(&mut self, member: &[u8], limits: &Limits) -> bool {
         match &mut self.body {
-            Body::Table(t) => return t.insert(member, ()).is_ok_and(|old| old.is_none()),
+            Body::Table(t) => {
+                let new = t.insert(member, ()).is_ok_and(|old| old.is_none());
+                // Checked after the insert rather than before, so the set that
+                // splits is the one that has actually outgrown a table and not
+                // the one that is about to.
+                if t.len() > PARTITION_AT {
+                    self.become_split();
+                }
+                return new;
+            }
+            Body::Split(p) => {
+                let new = p.insert(member, ()).is_ok_and(|old| old.is_none());
+                // Asked rather than decided, because growing is a rehash of the
+                // whole set and the band leaves the timing to whoever knows
+                // whether this is one write or the middle of a bulk load.
+                if let Some(want) = p.wants_parts() {
+                    p.grow_to(want);
+                }
+                return new;
+            }
             Body::Packed(lp) => {
                 if lp.find(member, 1).is_some() {
                     return false;
@@ -407,6 +468,10 @@ impl Set {
                 t.insert(member, ())
                     .expect("the table was sized for this one");
             }
+            Body::Split(p) => {
+                p.insert(member, ())
+                    .expect("the band was sized for this one");
+            }
             Body::Ints(_) => unreachable!("no promotion ever lands on an intset"),
         }
     }
@@ -422,6 +487,7 @@ impl Set {
                 None => false,
             },
             Body::Table(t) => t.remove(member).is_some(),
+            Body::Split(p) => p.remove(member).is_some(),
         }
     }
 
@@ -447,6 +513,7 @@ impl Set {
                 Some(out)
             }
             Body::Table(t) => t.take_at(index).map(|(name, ())| name),
+            Body::Split(p) => p.take_at(index).map(|(name, ())| name),
         }
     }
 
@@ -477,6 +544,7 @@ impl Set {
                 true
             }
             Body::Table(t) => t.remove_at(index).is_some(),
+            Body::Split(p) => p.remove_at(index).is_some(),
         }
     }
 
@@ -537,6 +605,20 @@ impl Set {
         }
         self.body = Body::Table(t);
     }
+
+    /// Spread an element table over partitions.
+    ///
+    /// One way, like every other promotion here. A set that drops back under the
+    /// threshold keeps its partitions, which is Y4's rule and Redis's behaviour
+    /// for the encodings it does expose: the cost of a representation is paid
+    /// when it is entered, and paying it again on the way back out turns one
+    /// `SREM` at the boundary into a rehash of the whole set.
+    fn become_split(&mut self) {
+        if let Body::Table(t) = &self.body {
+            let p = Parts::from_table(t, parts_for(t.len()));
+            self.body = Body::Split(p);
+        }
+    }
 }
 
 impl Default for Set {
@@ -555,6 +637,138 @@ mod tests {
             assert!(s.add(m.as_bytes(), &Limits::DEFAULT), "{m} was new");
         }
         s
+    }
+
+    /// Everything about the partitioned band that needs a real set past the real
+    /// threshold, in one test, because building 262,145 members is the expensive
+    /// part and there is no reason to pay for it four times.
+    #[test]
+    fn a_set_past_the_threshold_splits_without_the_client_being_able_to_tell() {
+        let limits = Limits::DEFAULT;
+        let mut s = Set::new();
+        // One short of the threshold. Still one table: the check is strictly
+        // greater, so the set that splits is the one that has outgrown a table
+        // and not the one that is about to.
+        for i in 0..PARTITION_AT {
+            assert!(s.add(format!("m{i}").as_bytes(), &limits));
+        }
+        assert!(matches!(s.body, Body::Table(_)));
+        assert_eq!(s.len(), PARTITION_AT);
+
+        // The member that tips it over.
+        assert!(s.add(b"tipping", &limits));
+        assert!(matches!(s.body, Body::Split(_)), "it should have split");
+        assert_eq!(s.len(), PARTITION_AT + 1);
+
+        // And the client cannot tell. This is the whole point: Redis has three
+        // set encodings and a fourth word here breaks every suite that reads it.
+        assert_eq!(s.encoding(), Encoding::Hashtable);
+        assert_eq!(s.encoding().name(), "hashtable");
+
+        // Every member survived the rehash, asked both ways.
+        assert!(s.contains(b"tipping"));
+        assert!(s.contains(b"m0"));
+        assert!(s.contains(b"m262143"));
+        assert!(!s.contains(b"m262144"));
+        assert!(s.has(&Needle::new(b"m1000")));
+        assert!(!s.has(&Needle::new(b"nothing")));
+
+        // A rewrite is still not an add.
+        assert!(!s.add(b"m0", &limits));
+        assert_eq!(s.len(), PARTITION_AT + 1);
+
+        // Removing goes back through the same partition it went into, and the
+        // band never demotes however far the set shrinks.
+        assert!(s.remove(b"tipping"));
+        assert!(!s.remove(b"tipping"));
+        assert_eq!(s.len(), PARTITION_AT);
+        assert!(matches!(s.body, Body::Split(_)), "promotion is one way");
+        assert_eq!(s.encoding(), Encoding::Hashtable);
+
+        // The draw `SPOP` and `SRANDMEMBER` run on reaches the last position,
+        // which is the one that has to land in the highest non empty partition.
+        let last = s.at(s.len() - 1).expect("inside the set").to_vec();
+        assert!(s.contains(&last));
+        assert!(s.at(s.len()).is_none());
+        assert_eq!(s.remove_at(s.len() - 1), Some(last.clone()));
+        assert!(!s.contains(&last));
+        assert!(s.drop_at(0));
+        assert_eq!(s.len(), PARTITION_AT - 2);
+
+        // And a full scan sees every member exactly once.
+        let mut seen = 0usize;
+        let mut cursor = Cursor::START;
+        let mut rounds = 0;
+        loop {
+            cursor = s.scan(cursor, 1_000, |_| seen += 1);
+            rounds += 1;
+            assert!(rounds < 100_000, "the scan is not finishing");
+            if cursor.is_end() {
+                break;
+            }
+        }
+        assert_eq!(seen, s.len());
+    }
+
+    /// The crossing that actually happens in production: a client holding a
+    /// cursor from before the split. It has to see every member that stayed, and
+    /// repeats are what the `SCAN` guarantee gives up in exchange.
+    #[test]
+    fn a_scan_survives_the_set_splitting_underneath_it() {
+        let limits = Limits::DEFAULT;
+        let mut s = Set::new();
+        for i in 0..PARTITION_AT {
+            s.add(format!("m{i}").as_bytes(), &limits);
+        }
+        assert!(matches!(s.body, Body::Table(_)));
+
+        let mut seen = Vec::new();
+        let cursor = s.scan(Cursor::START, 5_000, |m| seen.push(m.to_vec()));
+        assert!(!cursor.is_end(), "the scan should have stopped part way");
+
+        s.add(b"tipping", &limits);
+        assert!(matches!(s.body, Body::Split(_)));
+
+        let mut cursor = cursor;
+        let mut rounds = 0;
+        loop {
+            cursor = s.scan(cursor, 5_000, |m| seen.push(m.to_vec()));
+            rounds += 1;
+            assert!(rounds < 100_000, "the scan is not finishing");
+            if cursor.is_end() {
+                break;
+            }
+        }
+        seen.sort_unstable();
+        seen.dedup();
+        assert_eq!(
+            seen.len(),
+            PARTITION_AT + 1,
+            "the split lost a member the client was entitled to"
+        );
+    }
+
+    #[test]
+    fn a_hint_past_the_threshold_builds_the_band_up_front() {
+        let limits = Limits::DEFAULT;
+        // A caller loading a million members should not fill one table, cross the
+        // threshold and then rehash the lot.
+        let s = Set::with_hint(b"first", 1_000_000, &limits);
+        assert!(matches!(s.body, Body::Split(_)));
+        assert_eq!(s.encoding(), Encoding::Hashtable);
+        assert!(s.is_empty());
+
+        // A hint at the threshold is still one table, matching the add path.
+        let s = Set::with_hint(b"first", PARTITION_AT, &limits);
+        assert!(matches!(s.body, Body::Table(_)));
+
+        // And a hint is only a hint: the band takes members like anything else.
+        let mut s = Set::with_hint(b"a", 1_000_000, &limits);
+        assert!(s.add(b"a", &limits));
+        assert!(!s.add(b"a", &limits));
+        assert!(s.contains(b"a"));
+        assert_eq!(s.len(), 1);
+        assert_eq!(s.at(0).map(|m| m.to_vec()), Some(b"a".to_vec()));
     }
 
     fn members(s: &Set) -> Vec<String> {
