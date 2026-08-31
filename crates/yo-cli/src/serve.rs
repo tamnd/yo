@@ -346,8 +346,12 @@ impl Server {
     /// Whatever the socket says.
     pub fn local_addr(&self) -> io::Result<SocketAddr> {
         for door in &self.doors {
-            if let Door::Tcp(l) = door {
-                return l.local_addr();
+            // A match and not an `if let`, because on a platform with no unix
+            // sockets `Door` has one variant and an `if let` over it is a lint.
+            match door {
+                Door::Tcp(l) => return l.local_addr(),
+                #[cfg(unix)]
+                Door::Unix(..) => {}
             }
         }
         Err(io::Error::new(
