@@ -52,6 +52,7 @@
 //! it, because a shard thread that allocates aborts.
 
 mod args;
+mod blocking;
 mod cpu;
 mod hashes;
 mod keyspace;
@@ -63,6 +64,7 @@ mod strings;
 pub mod table;
 
 pub use args::Args;
+pub use blocking::{Parked, Waiters};
 pub use table::{COMMANDS, Spec, arity_ok, lookup};
 
 use crate::reply::Out;
@@ -84,6 +86,13 @@ pub enum Flow {
     Continue,
     /// Write what is buffered and then close, which is what `QUIT` asks for.
     Close,
+    /// Nothing was written and nothing is owed yet.
+    ///
+    /// The client is on the waiter list and its reply comes when a key it named
+    /// has something in it or when its deadline passes, whichever happens first.
+    /// Until then the connection stops reading commands, because a client that
+    /// is waiting for an answer is not a client that has sent another question.
+    Block,
 }
 
 /// The numbers `INFO` reports that this layer cannot see for itself.
@@ -116,6 +125,8 @@ pub struct Server {
     next_db: usize,
     /// What the connections are holding, kept by the engine.
     conn_bytes: usize,
+    /// Clients parked on a blocking command.
+    waiters: Waiters,
     /// The numbers the reactor keeps for `INFO`.
     pub stats: Stats,
 }
@@ -133,6 +144,7 @@ impl Server {
             started_ms: clock.now_ms(),
             next_db: 0,
             conn_bytes: 0,
+            waiters: Waiters::default(),
             stats: Stats::default(),
         }
     }
@@ -148,6 +160,7 @@ impl Server {
             started_ms: clock.now_ms(),
             next_db: 0,
             conn_bytes: 0,
+            waiters: Waiters::default(),
             stats: Stats::default(),
         }
     }
@@ -392,7 +405,16 @@ pub fn execute(server: &mut Server, session: &mut Session, args: Args<'_>, out: 
     }
 
     let mark = out.len();
-    let done = match spec.group {
+    // Before the group, because the five that block are list commands and would
+    // otherwise land in `lists`, which is handed one database and nothing that
+    // could park a client. The flag is the right thing to branch on rather than
+    // a list of names: it is what `COMMAND INFO` reports about exactly these
+    // commands, and the sorted set and stream ones that arrive later carry it
+    // too.
+    let done = if spec.flags.contains(&"blocking") {
+        blocking::execute(server, session, spec, args, out)
+    } else {
+        match spec.group {
         "string" => {
             let db = session.db;
             strings::execute(&mut server.dbs[db], spec, args, out).map(|()| Flow::Continue)
@@ -416,6 +438,7 @@ pub fn execute(server: &mut Server, session: &mut Session, args: Args<'_>, out: 
         }
         "scripting" => scripting::execute(spec, args, out).map(|()| Flow::Continue),
         _ => server::execute(server, session, spec, args, out),
+        }
     };
     match done {
         Ok(flow) => flow,
@@ -3611,6 +3634,162 @@ mod tests {
         }
         assert_eq!(f.run(&[b"GET", b"str"]), "$1\r\nv\r\n");
         assert_eq!(f.run(&[b"EXISTS", b"d"]), ":0\r\n");
+    }
+
+    /// A timeout is not an integer and it is not an ordinary float either: the
+    /// three sentences it can answer with are its own, and which one a given
+    /// argument gets is not what reading the code would suggest.
+    #[test]
+    fn a_timeout_has_three_ways_of_being_wrong() {
+        let mut f = Fixture::new();
+        let not_float = "-ERR timeout is not a float or out of range\r\n";
+        let range = "-ERR timeout is out of range\r\n";
+        for (bad, want) in [
+            (&[b"BLPOP".as_slice(), b"k", b"abc"][..], not_float),
+            (&[b"BLPOP", b"k", b"nan"], not_float),
+            (&[b"BLPOP", b"k", b""], not_float),
+            // Whitespace on either side, which `strtold` would take and Redis
+            // does not.
+            (&[b"BLPOP", b"k", b" 1"], not_float),
+            (&[b"BLPOP", b"k", b"1 "], not_float),
+            (&[b"BLPOP", b"k", b"-1"], "-ERR timeout is negative\r\n"),
+            (&[b"BLPOP", b"k", b"-0.1"], "-ERR timeout is negative\r\n"),
+            // These three parse, so they are not the not-a-float error, and all
+            // three are further off than an i64 of milliseconds reaches.
+            (&[b"BLPOP", b"k", b"1e400"], range),
+            (&[b"BLPOP", b"k", b"inf"], range),
+            (&[b"BLPOP", b"k", b"9999999999999999"], range),
+            (&[b"BRPOP", b"k", b"abc"], not_float),
+            (&[b"BLMOVE", b"a", b"b", b"LEFT", b"RIGHT", b"abc"], not_float),
+            (&[b"BRPOPLPUSH", b"a", b"b", b"-1"], "-ERR timeout is negative\r\n"),
+            (&[b"BLMPOP", b"abc", b"1", b"k", b"LEFT"], not_float),
+        ] {
+            assert_eq!(f.run(bad), want, "for {bad:?}");
+        }
+    }
+
+    /// A timeout of exactly zero means no timeout, and there are two ways of
+    /// writing exactly zero.
+    #[test]
+    fn a_zero_timeout_waits_and_the_smallest_positive_one_does_not() {
+        let mut f = Fixture::new();
+        for timeout in [b"0".as_slice(), b"0.0", b"-0.0"] {
+            let (flow, out) = f.flow(&[b"BLPOP", b"k", timeout]);
+            assert_eq!(flow, Flow::Block, "for {timeout:?}");
+            assert!(out.is_empty(), "for {timeout:?}");
+        }
+        // Positive, so it is a real deadline, and the deadline is this
+        // millisecond. Nothing is written here either: the reply comes from the
+        // sweep, which is the engine's and not this layer's.
+        let (flow, out) = f.flow(&[b"BLPOP", b"k", b"0.0000001"]);
+        assert_eq!(flow, Flow::Block);
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn a_blocking_command_that_can_be_answered_answers_like_the_one_it_wraps() {
+        let mut f = Fixture::new();
+        f.run(&[b"RPUSH", b"L", b"a", b"b", b"c", b"d", b"e"]);
+
+        // The one difference from LPOP: the reply names the key that answered,
+        // which is what makes BLPOP over several keys usable.
+        assert_eq!(
+            f.flow(&[b"BLPOP", b"nope", b"L", b"0"]),
+            (Flow::Continue, "*2\r\n$1\r\nL\r\n$1\r\na\r\n".to_owned())
+        );
+        assert_eq!(f.run(&[b"BRPOP", b"L", b"0"]), "*2\r\n$1\r\nL\r\n$1\r\ne\r\n");
+        assert_eq!(
+            f.run(&[b"BLMPOP", b"0", b"2", b"nope", b"L", b"LEFT", b"COUNT", b"2"]),
+            "*2\r\n$1\r\nL\r\n*2\r\n$1\r\nb\r\n$1\r\nc\r\n"
+        );
+        assert_eq!(f.run(&[b"BLMOVE", b"L", b"D", b"LEFT", b"RIGHT", b"0"]), "$1\r\nd\r\n");
+        assert_eq!(f.run(&[b"EXISTS", b"L"]), ":0\r\n", "and the key went with it");
+        assert_eq!(f.run(&[b"LRANGE", b"D", b"0", b"-1"]), "*1\r\n$1\r\nd\r\n");
+        // Onto itself, which is how a list is rotated and is a real thing to ask
+        // a blocking move for.
+        f.run(&[b"RPUSH", b"D", b"x"]);
+        assert_eq!(f.run(&[b"BRPOPLPUSH", b"D", b"D", b"0"]), "$1\r\nx\r\n");
+        assert_eq!(f.run(&[b"LRANGE", b"D", b"0", b"-1"]), "*2\r\n$1\r\nx\r\n$1\r\nd\r\n");
+    }
+
+    #[test]
+    fn blmpop_reads_its_count_and_its_key_count_the_way_lmpop_does() {
+        let mut f = Fixture::new();
+        f.run(&[b"RPUSH", b"k", b"a"]);
+        for (bad, want) in [
+            (
+                &[b"BLMPOP".as_slice(), b"0", b"0", b"k", b"LEFT"][..],
+                "-ERR numkeys should be greater than 0\r\n",
+            ),
+            (
+                &[b"BLMPOP", b"0", b"-1", b"k", b"LEFT"],
+                "-ERR numkeys should be greater than 0\r\n",
+            ),
+            // Two keys named and one given, so the word that should have been
+            // the direction is a key and there is no direction left.
+            (&[b"BLMPOP", b"0", b"2", b"k", b"LEFT"], "-ERR syntax error\r\n"),
+            (&[b"BLMPOP", b"0", b"1", b"k", b"SIDEWAYS"], "-ERR syntax error\r\n"),
+            (&[b"BLMPOP", b"0", b"1", b"k", b"LEFT", b"COUNT"], "-ERR syntax error\r\n"),
+            (
+                &[b"BLMPOP", b"0", b"1", b"k", b"LEFT", b"COUNT", b"2", b"x"],
+                "-ERR syntax error\r\n",
+            ),
+            // A count that is not a number at all gets the same sentence a zero
+            // or a negative one gets, rather than the usual one about integers.
+            (
+                &[b"BLMPOP", b"0", b"1", b"k", b"LEFT", b"COUNT", b"0"],
+                "-ERR count should be greater than 0\r\n",
+            ),
+            (
+                &[b"BLMPOP", b"0", b"1", b"k", b"LEFT", b"COUNT", b"abc"],
+                "-ERR count should be greater than 0\r\n",
+            ),
+        ] {
+            assert_eq!(f.run(bad), want, "for {bad:?}");
+        }
+        assert_eq!(f.run(&[b"LLEN", b"k"]), ":1\r\n", "and none of them popped");
+    }
+
+    #[test]
+    fn a_blocking_move_reads_its_directions_before_its_timeout() {
+        let mut f = Fixture::new();
+        // Both are wrong. Redis checks the directions first, so this is the
+        // syntax error and not a complaint about the timeout.
+        assert_eq!(
+            f.run(&[b"BLMOVE", b"a", b"b", b"UP", b"DOWN", b"abc"]),
+            "-ERR syntax error\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"BLMOVE", b"a", b"b", b"LEFT", b"DOWN", b"0.05"]),
+            "-ERR syntax error\r\n"
+        );
+    }
+
+    /// The four ways a blocking command sees a key of another type, and the one
+    /// way it does not.
+    #[test]
+    fn a_blocking_command_errors_on_a_wrong_type_rather_than_waiting_on_it() {
+        let mut f = Fixture::new();
+        f.run(&[b"SET", b"S", b"v"]);
+        f.run(&[b"RPUSH", b"D", b"x"]);
+        let wrong = "-WRONGTYPE Operation against a key holding the wrong kind of value\r\n";
+
+        assert_eq!(f.run(&[b"BLPOP", b"S", b"0"]), wrong);
+        // Every key is checked even when an earlier one would have blocked, so
+        // an empty key in front of a string does not hide it.
+        assert_eq!(f.run(&[b"BLPOP", b"E", b"S", b"0"]), wrong);
+        assert_eq!(f.run(&[b"BRPOP", b"S", b"0"]), wrong);
+        assert_eq!(f.run(&[b"BLMPOP", b"0", b"1", b"S", b"LEFT"]), wrong);
+        assert_eq!(f.run(&[b"BRPOPLPUSH", b"S", b"D", b"0"]), wrong);
+        // The destination, which is only reached because the source has
+        // something in it.
+        assert_eq!(f.run(&[b"BRPOPLPUSH", b"D", b"S", b"0"]), wrong);
+        assert_eq!(f.run(&[b"LRANGE", b"D", b"0", b"-1"]), "*1\r\n$1\r\nx\r\n");
+
+        // And the one that does not: an empty source means the destination is
+        // never looked at, so this waits rather than erroring, and on a real
+        // server it times out.
+        assert_eq!(f.flow(&[b"BLMOVE", b"E", b"S", b"LEFT", b"RIGHT", b"0.1"]).0, Flow::Block);
     }
 
     /// The same churn the set and the string get, because a list that leaks a

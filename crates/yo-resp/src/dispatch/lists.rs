@@ -38,8 +38,8 @@ use crate::reply::Out;
 /// use instead of the usual one.
 const BAD_POP_COUNT: &str = "value is out of range, must be positive";
 /// `LMPOP`'s two, which are its own sentences and not the usual ones.
-const BAD_NUMKEYS: &str = "numkeys should be greater than 0";
-const BAD_MPOP_COUNT: &str = "count should be greater than 0";
+pub(super) const BAD_NUMKEYS: &str = "numkeys should be greater than 0";
+pub(super) const BAD_MPOP_COUNT: &str = "count should be greater than 0";
 /// What `LPOS` says about the two options that may not be negative.
 const BAD_COUNT: &str = "COUNT can't be negative";
 const BAD_MAXLEN: &str = "MAXLEN can't be negative";
@@ -269,7 +269,7 @@ fn moved(
 }
 
 /// `LEFT` or `RIGHT`, and a syntax error for anything else.
-fn end_of(arg: &[u8]) -> Result<End> {
+pub(super) fn end_of(arg: &[u8]) -> Result<End> {
     if args::is(arg, b"left") {
         Ok(End::Left)
     } else if args::is(arg, b"right") {

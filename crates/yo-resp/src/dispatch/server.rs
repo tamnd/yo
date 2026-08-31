@@ -693,9 +693,10 @@ fn info(server: &Server, args: Args<'_>, out: &mut Out) {
         if want("clients") {
             let _ = write!(
                 s,
-                "# Clients\r\nconnected_clients:{}\r\nblocked_clients:0\r\n\
+                "# Clients\r\nconnected_clients:{}\r\nblocked_clients:{}\r\n\
                  cluster_connections:0\r\n\r\n",
                 server.stats.clients,
+                server.waiters().len(),
             );
         }
         if want("memory") {
