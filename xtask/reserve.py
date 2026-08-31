@@ -41,13 +41,11 @@ UA = "yo-name-audit (+https://github.com/tamnd/yo)"
 TIMEOUT = 20
 IDENTITY = "tamnd"
 
-# The version every placeholder is published at, in one place because it moves.
-# It was 0.0.0 until a registry that will not take the same version twice had to
-# be republished, and it will move again for the same reason. Three probes used
-# to compare against a literal 0.0.0 to tell "our placeholder" from "a real
-# release", and after the republish all three quietly started reading our own
-# empty packages as shipped software.
-PLACEHOLDER = os.environ.get("YODB_PLACEHOLDER_VERSION", "0.0.1")
+# The version the next placeholder publish goes out at, which is a publishing
+# input and nothing else. It moves every time a registry that will not take the
+# same version twice has to be republished, and it has moved twice already:
+# 0.0.0, then 0.0.1, then 0.0.2.
+PLACEHOLDER = os.environ.get("YODB_PLACEHOLDER_VERSION", "0.0.2")
 
 # ---------------------------------------------------------------------------
 # states
@@ -105,8 +103,21 @@ def held_state(version: str) -> str:
     take the name and there is no yo inside it, so the row says `reserved` until
     a real version replaces it, at which point it says `released` on its own
     without anybody editing this file.
+
+    The test is the version series and not equality against one constant. This
+    used to compare against a literal 0.0.0, and when a registry that will not
+    take the same version twice forced a republish at 0.0.1 every placeholder
+    quietly started reading as shipped software. #67 fixed that by putting the
+    version in a constant, and then the same thing happened again the next time
+    the constant moved and the republish went out at 0.0.2, because a constant
+    somebody has to remember to bump is the bug rather than the fix.
+
+    Nothing real will ever be a 0.0.z. The first real publish of any of these
+    names lands at milestone DX6 (M7) and takes the engine's own version, which
+    is already past 0.3, so the series is a fact about the release plan rather
+    than a value anyone has to keep in step.
     """
-    return RESERVED if version == PLACEHOLDER else RELEASED
+    return RESERVED if version.startswith("0.0.") else RELEASED
 
 
 def p_crates(name: str, _ns: str):
@@ -439,43 +450,115 @@ def p_dockerhub(_name: str, ns: str):
     return (FREE, "") if code == 404 else (BLOCKED, f"http {code}")
 
 
+# The five probes below all used to read "the package exists" as "somebody else
+# has it", which is right up until the day we publish and then says our own name
+# was taken out from under us. `cocoapods:Yodb` was the one that got there first,
+# and it went from `free` to `blocked` the run after the placeholder went out.
+# Every one of these registries publishes its owners, so each of them asks who
+# rather than whether, and hands the version to `held_state` the way the probes
+# that were already right do.
+
+
+def ours(names) -> bool:
+    """Whether a registry's owner list names us.
+
+    Exact rather than a substring of the joined list, because `tamnd` is a
+    substring of plenty of handles somebody else could hold and reading one of
+    those as ours is the one mistake this file exists to prevent.
+    """
+    return IDENTITY in {str(n).strip().lower() for n in names}
+
+
 def p_rubygems(name: str, _ns: str):
     code, d = get_json(f"https://rubygems.org/api/v1/gems/{name}.json")
     if code == 0:
         return UNKNOWN, "unreachable"
     if code == 404:
         return FREE, ""
-    if d:
-        return BLOCKED, f"v{d.get('version','?')}"
-    return UNKNOWN, f"http {code}"
+    if not d:
+        return UNKNOWN, f"http {code}"
+    v = d.get("version", "?")
+    # Owners are a second request because the gem document does not carry them.
+    # `authors` is a free text field the publisher writes and is not ownership.
+    ocode, owners = get_json(f"https://rubygems.org/api/v1/gems/{name}/owners.json")
+    if ocode == 0 or not isinstance(owners, list):
+        return UNKNOWN, f"v{v}, owners unreadable"
+    handles = [o.get("handle", "?") for o in owners]
+    who = ",".join(handles)
+    return (held_state(v) if ours(handles) else BLOCKED), f"v{v} owner={who or '?'}"
 
 
 def p_hex(name: str, _ns: str):
-    code, _ = get(f"https://hex.pm/api/packages/{name}")
+    code, d = get_json(f"https://hex.pm/api/packages/{name}")
     if code == 0:
         return UNKNOWN, "unreachable"
-    return (FREE, "") if code == 404 else (BLOCKED, f"http {code}")
+    if code == 404:
+        return FREE, ""
+    if not d:
+        return UNKNOWN, f"http {code}"
+    v = d.get("latest_version", "?")
+    names = [o.get("username", "?") for o in (d.get("owners") or [])]
+    who = ",".join(names)
+    return (held_state(v) if ours(names) else BLOCKED), f"v{v} owner={who or '?'}"
 
 
 def p_packagist(name: str, ns: str):
-    code, _ = get(f"https://repo.packagist.org/p2/{ns}/{name}.json")
+    # The metadata API rather than the `repo.packagist.org` mirror the mirror
+    # serves composer, because only this one carries the maintainer list.
+    code, d = get_json(f"https://packagist.org/packages/{ns}/{name}.json")
     if code == 0:
         return UNKNOWN, "unreachable"
-    return (FREE, "") if code == 404 else (BLOCKED, f"http {code}")
+    if code == 404:
+        return FREE, ""
+    pkg = (d or {}).get("package")
+    if not pkg:
+        return UNKNOWN, f"http {code}"
+    # Newest first, and the branch aliases come back with the releases, written
+    # either `dev-main` or `2.x-dev` depending on which end the branch name is.
+    # A tagged version is the only thing here that starts with a digit and holds
+    # no letters, so that is the test rather than a list of alias spellings.
+    v = next(
+        (k for k in (pkg.get("versions") or {}) if re.fullmatch(r"v?[\d.]+", k)),
+        "?",
+    )
+    names = [m.get("name", "?") for m in (pkg.get("maintainers") or [])]
+    who = ",".join(names)
+    return (held_state(v) if ours(names) else BLOCKED), f"v{v} owner={who or '?'}"
 
 
 def p_conda(name: str, _ns: str):
-    code, _ = get(f"https://api.anaconda.org/package/conda-forge/{name}")
+    code, d = get_json(f"https://api.anaconda.org/package/conda-forge/{name}")
     if code == 0:
         return UNKNOWN, "unreachable"
-    return (FREE, "") if code == 404 else (BLOCKED, f"http {code}")
+    if code == 404:
+        return FREE, ""
+    if not d:
+        return UNKNOWN, f"http {code}"
+    v = d.get("latest_version", "?")
+    # conda-forge owns every package on the channel, so the owner field says
+    # `conda-forge` whoever wrote the recipe and cannot answer this. What can is
+    # where the recipe points: a feedstock of ours names this repository, and a
+    # stranger's package that happens to be called yodb does not.
+    home = f"{d.get('dev_url') or ''} {d.get('home') or ''}"
+    ours = f"github.com/{IDENTITY}/yo" in home
+    return (held_state(v) if ours else BLOCKED), f"v{v} home={d.get('home') or '?'}"
 
 
 def p_cocoapods(name: str, _ns: str):
-    code, _ = get(f"https://trunk.cocoapods.org/api/v1/pods/{name}")
+    code, d = get_json(f"https://trunk.cocoapods.org/api/v1/pods/{name}")
     if code == 0:
         return UNKNOWN, "unreachable"
-    return (FREE, "") if code == 404 else (BLOCKED, f"http {code}")
+    if code == 404:
+        return FREE, ""
+    if not d:
+        return UNKNOWN, f"http {code}"
+    # Newest last, and a pod with owners but no versions is one somebody claimed
+    # on trunk and never pushed to.
+    vs = [r.get("name", "?") for r in (d.get("versions") or [])]
+    v = vs[-1] if vs else "?"
+    names = [o.get("name", "?") for o in (d.get("owners") or [])]
+    who = ",".join(names)
+    return (held_state(v) if ours(names) else BLOCKED), f"v{v} owner={who or '?'}"
 
 
 def p_github_repo(name: str, ns: str):
