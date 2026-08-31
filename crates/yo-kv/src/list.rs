@@ -31,7 +31,7 @@
 //! converts **back** when it shrinks, which no other collection here does. Redis
 //! only converts back once the list is under **half** the limit, so that a
 //! workload sitting exactly on the boundary does not rebuild itself on every
-//! other command, and [`List::shrunk`] is that rule.
+//! other command, and `List::shrunk` is that rule.
 //!
 //! # Elements
 //!

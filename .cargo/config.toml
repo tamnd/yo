@@ -2,3 +2,9 @@
 # CI, in the contributing guide and in muscle memory.
 [alias]
 xtask = "run --quiet --package xtask --"
+
+# The CI docs job denies warnings, so a broken intra doc link is a red build and
+# not a note nobody reads. It is set here as well so that `cargo doc` on a laptop
+# fails in the same place rather than passing and leaving the discovery to CI.
+[env]
+RUSTDOCFLAGS = "-D warnings --cfg docsrs"

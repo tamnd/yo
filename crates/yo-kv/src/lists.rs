@@ -12,7 +12,7 @@
 //! Every index a client sends is signed and counts from the back when it is
 //! negative, and every range is inclusive at both ends. Both of those are Redis
 //! rules that no structure below here should have to know about, so they are
-//! turned into an offset and a count in [`at`] and [`window`] and the list sees
+//! turned into an offset and a count in `at` and `window` and the list sees
 //! nothing but `usize`.
 //!
 //! # An empty list is not a list

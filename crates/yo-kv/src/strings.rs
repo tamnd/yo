@@ -189,7 +189,7 @@ impl Keyspace {
     /// the reap looked the key up to see whether it was dead, the type check
     /// looked it up to see whether it was a string, and the read looked it up
     /// again to read it, and all three walked a bucket for the same record.
-    /// [`Keyspace::live_rec`] hands back where that record is and the rest is
+    /// `Keyspace::live_rec` hands back where that record is and the rest is
     /// two arena reads at a known address.
     pub fn get(&mut self, key: &[u8]) -> Result<Option<Str<'_>>> {
         let Some(addr) = self.live_rec(key) else {
