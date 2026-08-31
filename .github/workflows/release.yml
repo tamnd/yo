@@ -99,7 +99,10 @@ jobs:
   crates:
     needs: [check, verify, names]
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    # Long, because the publish waits out crates.io's rate limit on a new crate
+    # name rather than failing on it, and eighteen new names is hours the first
+    # time. Every release after this one finishes in the first few minutes.
+    timeout-minutes: 330
     # The token lives on an environment and not loose in the repository secrets,
     # so it is reachable from this job and from nothing else, and so the review
     # rules and the audit log are the environment's rather than being absent.
@@ -151,11 +154,68 @@ jobs:
         if: steps.done.outputs.left != '0'
         run: cargo publish --workspace --locked --dry-run ${{ steps.done.outputs.exclude }}
 
+      # crates.io rate limits a brand new crate name far harder than a new
+      # version of one that already exists: roughly one every ten minutes
+      # against one a minute, and the first release of this workspace is
+      # eighteen new names at once. `cargo publish --workspace` stops dead on
+      # the first 429, so without this the release goes out one crate per manual
+      # re-run and takes eighteen of them.
+      #
+      # So the publish is a loop. Each pass asks crates.io what is still missing,
+      # publishes what it can, and when it is turned away it reads the time
+      # crates.io named in the refusal and sleeps until then. Progress is
+      # measured against the registry rather than against what cargo thinks it
+      # did, so a pass that uploads three crates and then gets refused is three
+      # crates of progress and not a failure. This is nearly free from the second
+      # release onwards, where nothing is a new name and the first pass finishes.
       - name: Publish
         if: steps.done.outputs.left != '0'
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-        run: cargo publish --workspace --locked --no-verify ${{ steps.done.outputs.exclude }}
+        run: |
+          set -o pipefail
+          v="${{ needs.check.outputs.version }}"
+          all=$(cargo metadata --no-deps --format-version 1 \
+            | jq -r '.packages[] | select(.publish != []) | .name')
+          deadline=$(( $(date +%s) + 5 * 60 * 60 ))
+          pass=0
+          while :; do
+            pass=$((pass + 1))
+            exclude=""
+            left=0
+            for p in $all; do
+              code=$(curl -sS -o /dev/null -w '%{http_code}' \
+                -H 'user-agent: yo release workflow (https://github.com/tamnd/yo)' \
+                "https://crates.io/api/v1/crates/$p/$v")
+              case "$code" in
+                200) exclude="$exclude --exclude $p" ;;
+                404) left=$((left + 1)) ;;
+                *) echo "crates.io answered $code for $p, not guessing" >&2; exit 1 ;;
+              esac
+            done
+            if [ "$left" = 0 ]; then
+              echo "pass $pass: everything is up"
+              break
+            fi
+            echo "pass $pass: $left still to publish"
+            if cargo publish --workspace --locked --no-verify $exclude 2>&1 | tee out.txt; then
+              continue
+            fi
+            # Anything that is not the rate limit is a real failure and stops here.
+            grep -q '429 Too Many Requests' out.txt || exit 1
+            # crates.io names the second it will take the next one, so wait for
+            # that rather than guessing an interval that is wrong either way.
+            when=$(sed -n 's/.*Please try again after \(.*\) and see.*/\1/p' out.txt | head -1)
+            next=$(date -d "$when" +%s 2>/dev/null || echo 0)
+            now=$(date +%s)
+            [ "$next" -gt "$now" ] || next=$((now + 600))
+            if [ "$next" -gt "$deadline" ]; then
+              echo "the next window is past this job's five hours, re-run it" >&2
+              exit 1
+            fi
+            echo "rate limited, waiting $((next - now))s until $when"
+            sleep $((next - now + 5))
+          done
 
       # `names.toml` says `free` for a name until something is published under
       # it, and after this job seventeen of those rows are wrong. Nothing here

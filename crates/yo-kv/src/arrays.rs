@@ -637,7 +637,7 @@ impl Keyspace {
     ///
     /// # Errors
     ///
-    /// [`Code::NoSuchKey`] for a key that is not there, which is the one array
+    /// [`Code::Invalid`] carrying `no such key` for a key that is not there, which is the one array
     /// command that treats a missing key as a mistake rather than as an empty
     /// array. It is reporting on a structure, and there is no structure.
     pub fn arinfo(&mut self, key: &[u8], full: bool) -> Result<Info> {

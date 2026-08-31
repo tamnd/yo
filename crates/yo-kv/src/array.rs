@@ -47,7 +47,7 @@
 //! everything shorter is inlined in the word itself. Redis heap allocates each
 //! of those, paying a malloc header and the rounding on every one. One blob per
 //! key pays the bytes and nothing else, at the cost of having to compact when
-//! enough of it is dead. See [`Word`] for the four things a word can be.
+//! enough of it is dead. See `Word` for the four things a word can be.
 
 use std::cmp::Ordering;
 
