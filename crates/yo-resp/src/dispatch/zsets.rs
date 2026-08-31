@@ -46,10 +46,13 @@
 //! one place in this group where the two protocols disagree about the shape of
 //! a reply rather than the type of one value in it.
 
-use yo_common::{Error, Result};
-use yo_kv::{Keyspace, Member, Query, ZAdd, ZBound};
+use yo_common::num::DIGITS_MAX;
+use yo_common::num::i64_digits;
+use yo_common::{Error, Result, glob_matches, parse_i64};
+use yo_kv::{Aggregate, Keyspace, Member, Query, ZAdd, ZBound, ZOp};
 
 use super::args::{self, Args};
+use super::scan;
 use super::table::Spec;
 use crate::reply::Out;
 
@@ -70,6 +73,15 @@ const LIMIT_NEEDS_BY: &str =
 /// `WITHSCORES` on a lexical range, where Redis refuses it even though it could
 /// answer, because every score in a lexical range is meant to be the same one.
 const SCORES_NOT_BYLEX: &str = "syntax error, WITHSCORES not supported in combination with BYLEX";
+/// A weight that is not a number. Its own sentence, because a weight is not a
+/// score and a client that sent the wrong one wants to know which it was.
+const BAD_WEIGHT: &str = "weight value is not a float";
+/// `ZINTERCARD` with a limit that is negative, and with a limit that is not a
+/// number at all, which Redis answers with the same sentence.
+const BAD_LIMIT: &str = "LIMIT can't be negative";
+/// `NOVALUES` anywhere but `HSCAN`, which is where Redis reads the option and
+/// then says who it was meant for.
+const NOVALUES_IS_HSCAN: &str = "NOVALUES option can only be used in HSCAN";
 
 /// Run one sorted set command.
 ///
@@ -162,6 +174,40 @@ pub(super) fn execute(db: &mut Keyspace, spec: &Spec, args: Args<'_>, out: &mut 
             let q = Query::lex(lex(args.get(2))?, lex(args.get(3))?);
             out.int(count(db.zremrange(args.get(1), &q)?));
         }
+        // The algebra. The three that answer members write them before their
+        // own header, the same way SINTER does: the count is what the walk
+        // produced, and finding it out first means running the whole operation
+        // twice.
+        "zunion" | "zinter" | "zdiff" => {
+            let op = op_of(spec.name);
+            let a = Algebra::parse(spec.name, op, args, 1, Scores::Allowed)?;
+            let nested = a.withscores && out.proto().is_resp3();
+            let start = out.len();
+            let mut n = 0;
+            db.zsetop(op, a.keys(args), &a.weights, a.agg, |m, sc| {
+                if nested {
+                    out.array(2);
+                }
+                write_member(out, m);
+                if a.withscores {
+                    out.double(sc);
+                }
+                n += 1;
+            })?;
+            // A flat WITHSCORES reply on RESP2 is twice as many elements as
+            // there are members, and a nested one on RESP3 is exactly as many,
+            // which is the same split the range commands have.
+            out.close_array(start, if nested || !a.withscores { n } else { n * 2 });
+        }
+        "zunionstore" | "zinterstore" | "zdiffstore" => {
+            let op = op_of(spec.name);
+            let a = Algebra::parse(spec.name, op, args, 2, Scores::Refused)?;
+            let got = db.zsetop_store(op, args.get(1), a.keys(args), &a.weights, a.agg)?;
+            out.int(count(got));
+        }
+        "zintercard" => out.int(count(intercard(db, args)?)),
+        "zrandmember" => randmember(db, args, out)?,
+        "zscan" => zscan(db, args, out)?,
         // The table and this match are checked against each other by
         // `cargo xtask check`, so a name reaching here is a table row without a
         // handler and there is nothing sensible to answer.
@@ -470,6 +516,261 @@ fn parse_range<'a>(form: Form, args: Args<'a>, key: usize) -> Result<(Query<'a>,
         );
     }
     Ok((q, withscores))
+}
+
+/// Which algebra a name asks for.
+fn op_of(name: &str) -> ZOp {
+    match name {
+        "zunion" | "zunionstore" => ZOp::Union,
+        "zinter" | "zinterstore" => ZOp::Inter,
+        _ => ZOp::Diff,
+    }
+}
+
+/// Whether the spelling being parsed takes `WITHSCORES`.
+#[derive(PartialEq, Eq)]
+enum Scores {
+    /// `ZUNION`, `ZINTER` and `ZDIFF`, which answer members.
+    Allowed,
+    /// The three store forms, which answer a count and keep the scores anyway.
+    Refused,
+}
+
+/// Everything the six algebra commands are told, once.
+struct Algebra {
+    /// Where the keys start, which is after the count of them.
+    from: usize,
+    /// And where they stop, which is where the options begin.
+    to: usize,
+    /// One per key or none at all, which is what the store reads as all ones.
+    weights: Vec<f64>,
+    /// What to do when a member is in more than one input.
+    agg: Aggregate,
+    /// Whether the reply carries the scores.
+    withscores: bool,
+}
+
+impl Algebra {
+    /// `<numkeys> key [key ...] [WEIGHTS w [w ...]] [AGGREGATE SUM|MIN|MAX] [WITHSCORES]`,
+    /// starting at `at`, which is one for the read forms and two for the stores.
+    ///
+    /// The count of keys comes first because `WEIGHTS` comes after them and
+    /// there would otherwise be no way to tell a key named `WEIGHTS` from the
+    /// option. It is checked against what is actually on the line rather than
+    /// trusted, since a count that runs off the end would read arguments that
+    /// are not there.
+    ///
+    /// `ZDIFF` takes neither `WEIGHTS` nor `AGGREGATE`, because a difference
+    /// keeps the first input's scores and never combines two of them, so there
+    /// is nothing for either option to do and Redis calls both a syntax error.
+    fn parse(name: &str, op: ZOp, args: Args<'_>, at: usize, scores: Scores) -> Result<Algebra> {
+        let numkeys = args.int(at)?;
+        if numkeys < 1 {
+            return Err(Error::fmt(
+                yo_common::Code::Invalid,
+                format_args!("at least 1 input key is needed for '{name}' command"),
+            ));
+        }
+        let numkeys = usize::try_from(numkeys).unwrap_or(usize::MAX);
+        let from = at + 1;
+        // Redis calls a count that is bigger than the line a plain syntax
+        // error rather than a complaint about the count, which reads oddly and
+        // is what it says.
+        if numkeys > args.len() - from {
+            return Err(args::syntax());
+        }
+        let to = from + numkeys;
+
+        let mut got = Algebra {
+            from,
+            to,
+            weights: Vec::new(),
+            agg: Aggregate::Sum,
+            withscores: false,
+        };
+        let combines = op != ZOp::Diff;
+        let mut i = to;
+        while i < args.len() {
+            let rest = args.len() - i;
+            if combines && args::is(args.get(i), b"weights") && rest > numkeys {
+                got.weights.reserve_exact(numkeys);
+                for k in 0..numkeys {
+                    let arg = args.get(i + 1 + k);
+                    let Some(w) = yo_common::num::parse_f64(arg) else {
+                        return Err(Error::new(yo_common::Code::Invalid, BAD_WEIGHT));
+                    };
+                    got.weights.push(w);
+                }
+                i += 1 + numkeys;
+            } else if combines && args::is(args.get(i), b"aggregate") && rest >= 2 {
+                let word = args.get(i + 1);
+                got.agg = if args::is(word, b"sum") {
+                    Aggregate::Sum
+                } else if args::is(word, b"min") {
+                    Aggregate::Min
+                } else if args::is(word, b"max") {
+                    Aggregate::Max
+                } else {
+                    return Err(args::syntax());
+                };
+                i += 2;
+            } else if scores == Scores::Allowed && args::is(args.get(i), b"withscores") {
+                got.withscores = true;
+                i += 1;
+            } else {
+                return Err(args::syntax());
+            }
+        }
+        Ok(got)
+    }
+
+    /// The keys, which are the slice of the line the count named.
+    fn keys<'a>(&self, args: Args<'a>) -> impl Iterator<Item = &'a [u8]> {
+        (self.from..self.to).map(move |i| args.get(i))
+    }
+}
+
+/// `ZINTERCARD numkeys key [key ...] [LIMIT limit]`.
+///
+/// A limit of zero is no limit, which is Redis's reading and is the value the
+/// store uses for it too, so it goes straight through. A limit that is negative
+/// and a limit that is not a number at all get the same sentence, which looks
+/// like a mistake in Redis and is copied because a client may be matching on it.
+fn intercard(db: &mut Keyspace, args: Args<'_>) -> Result<usize> {
+    // Its own parse rather than [`Algebra`], because LIMIT is the one option
+    // that command takes and none of the three that command takes.
+    let numkeys = args.int(1)?;
+    if numkeys < 1 {
+        return Err(Error::new(
+            yo_common::Code::Invalid,
+            "at least 1 input key is needed for 'zintercard' command",
+        ));
+    }
+    let numkeys = usize::try_from(numkeys).unwrap_or(usize::MAX);
+    if numkeys > args.len() - 2 {
+        return Err(args::syntax());
+    }
+    let end = 2 + numkeys;
+    let mut limit = 0usize;
+    if end < args.len() {
+        if args.len() != end + 2 || !args::is(args.get(end), b"limit") {
+            return Err(args::syntax());
+        }
+        limit = match parse_i64(args.get(end + 1)) {
+            Some(n) if n >= 0 => usize::try_from(n).unwrap_or(usize::MAX),
+            _ => return Err(Error::new(yo_common::Code::Invalid, BAD_LIMIT)),
+        };
+    }
+    db.zintercard((2..end).map(|i| args.get(i)), limit)
+}
+
+/// `ZRANDMEMBER key [count [WITHSCORES]]`.
+///
+/// Without a count it answers one member or nothing, and with one it answers an
+/// array that can be empty. That is two reply types out of one command and it
+/// is why the arity is split here rather than inside the store.
+///
+/// A negative count draws with replacement and answers exactly as many as it
+/// was asked for, a positive one draws without and answers at most as many as
+/// there are, and zero answers an empty array either way.
+fn randmember(db: &mut Keyspace, args: Args<'_>, out: &mut Out) -> Result<()> {
+    if args.len() == 2 {
+        let mut wrote = false;
+        db.zrandmember(args.get(1), 1, |m, _| {
+            write_member(out, m);
+            wrote = true;
+        })?;
+        if !wrote {
+            out.nil();
+        }
+        return Ok(());
+    }
+    let withscores = match args.len() {
+        3 => false,
+        4 if args::is(args.get(3), b"withscores") => true,
+        _ => return Err(args::syntax()),
+    };
+    let want = args.int(2)?;
+    let nested = withscores && out.proto().is_resp3();
+    let start = out.len();
+    let mut n = 0;
+    db.zrandmember(args.get(1), want, |m, sc| {
+        if nested {
+            out.array(2);
+        }
+        write_member(out, m);
+        if withscores {
+            out.double(sc);
+        }
+        n += 1;
+    })?;
+    out.close_array(start, if nested || !withscores { n } else { n * 2 });
+    Ok(())
+}
+
+/// `ZSCAN key cursor [MATCH pattern] [COUNT count]`.
+///
+/// The one place a score does not go out as a double on RESP3. A scan answers
+/// pairs of bulk strings whatever the protocol, which is Redis's shape and is
+/// the same one `HSCAN` has, so this writes the digits rather than calling
+/// [`Out::double`].
+fn zscan(db: &mut Keyspace, args: Args<'_>, out: &mut Out) -> Result<()> {
+    let cursor = scan::parse_cursor(args.get(2))?;
+    let mut pattern = None;
+    let mut count = scan::COUNT;
+    let mut i = 3;
+    while i < args.len() {
+        let rest = args.len() - i;
+        if args::is(args.get(i), b"match") && rest >= 2 {
+            pattern = Some(args.get(i + 1));
+        } else if args::is(args.get(i), b"count") && rest >= 2 {
+            // A count under one is a syntax error and not a range error, which
+            // is the odder of the two answers and so the one worth copying.
+            count = match args.int(i + 1)? {
+                n if n >= 1 => usize::try_from(n).unwrap_or(usize::MAX),
+                _ => return Err(args::syntax()),
+            };
+        } else if args::is(args.get(i), b"novalues") {
+            // Read and then refused, which is Redis's answer for every scan
+            // that is not HSCAN.
+            return Err(Error::new(yo_common::Code::Invalid, NOVALUES_IS_HSCAN));
+        } else {
+            return Err(args::syntax());
+        }
+        i += 2;
+    }
+
+    scan::reply(out, |out| {
+        let mut n = 0;
+        let next = db.zscan(args.get(1), cursor, count, |m, sc| {
+            if !matches(pattern, m) {
+                return;
+            }
+            write_member(out, m);
+            out.bulk_double(sc);
+            n += 2;
+        })?;
+        Ok((next, n))
+    })
+}
+
+/// Whether a member survives a `MATCH` pattern.
+///
+/// A member held as an integer has no digits anywhere, so this is the one place
+/// a scan pays to write some, into twenty one bytes of stack rather than into a
+/// `Vec` that would be an allocation per member. It is on the `MATCH` path only.
+#[inline]
+fn matches(pattern: Option<&[u8]>, m: Member<'_>) -> bool {
+    let Some(pattern) = pattern else {
+        return true;
+    };
+    match m {
+        Member::Str(s) => glob_matches(pattern, s),
+        Member::Int(n) => {
+            let mut buf = [0u8; DIGITS_MAX];
+            glob_matches(pattern, i64_digits(&mut buf, n))
+        }
+    }
 }
 
 /// A count as the wire wants it.

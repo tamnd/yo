@@ -1674,6 +1674,105 @@ status = "shipped"
 wire = "verified"
 notes = "The lexical removal, and the third of the three that share a parse with the reads. Three separate window calculations would have been three chances to get an exclusive bound wrong in exactly one of them."
 
+[[command]]
+name = "ZUNION"
+group = "zset"
+since = "6.2.0"
+arity = -3
+plan = "merge"
+bounded = "risk"
+status = "shipped"
+wire = "verified"
+notes = "The accumulator is the result rather than something the result is copied out of, so a union gathers into an unordered element table and the order is put on it once at the end, by sorting row numbers and filling the tree by appending. A plain set is a legal input because Redis says it is, and it behaves as a sorted set in which every member scores one. A key that is not there keeps its place in the input list rather than being dropped, since WEIGHTS is positional and dropping it would line the weights up against the wrong keys."
+
+[[command]]
+name = "ZINTER"
+group = "zset"
+since = "6.2.0"
+arity = -3
+plan = "merge"
+bounded = "risk"
+status = "shipped"
+wire = "verified"
+notes = "The same gather with the smallest input walked first, which is Y18's rule and is what stopped aki's version at a fraction of the speed. The answer can only be as big as the smallest input, so that is what the accumulator is presized from."
+
+[[command]]
+name = "ZDIFF"
+group = "zset"
+since = "6.2.0"
+arity = -3
+plan = "merge"
+bounded = "risk"
+status = "shipped"
+wire = "verified"
+notes = "Takes neither WEIGHTS nor AGGREGATE, because a difference keeps the first input's scores and never combines two of them, so there is nothing for either option to do. Redis calls both a syntax error and so does this."
+
+[[command]]
+name = "ZUNIONSTORE"
+group = "zset"
+since = "2.0.0"
+arity = -4
+plan = "merge"
+bounded = "inherent"
+status = "shipped"
+wire = "verified"
+notes = "The gather with the walk left off and a store put on. The result is built whole before the destination is touched, so the destination is allowed to be one of the sources and ZUNIONSTORE z 2 z y reads the old body. An empty result deletes the destination rather than leaving an empty sorted set behind, because an empty one does not exist."
+
+[[command]]
+name = "ZINTERSTORE"
+group = "zset"
+since = "2.0.0"
+arity = -4
+plan = "merge"
+bounded = "inherent"
+status = "shipped"
+wire = "verified"
+notes = "ZINTER with the store, and the same rule about the destination naming its own source."
+
+[[command]]
+name = "ZDIFFSTORE"
+group = "zset"
+since = "6.2.0"
+arity = -4
+plan = "merge"
+bounded = "inherent"
+status = "shipped"
+wire = "verified"
+notes = "ZDIFF with the store. The count it answers is the size of what was written and not the size of the difference before the destination was cleared, which are the same number and would not be if the destination were cleared first."
+
+[[command]]
+name = "ZINTERCARD"
+group = "zset"
+since = "7.0.0"
+arity = -3
+plan = "merge"
+bounded = "inherent"
+status = "shipped"
+wire = "verified"
+notes = "Counting does not need any of the ordering an intersection needs, so this does not go through the gather at all: nothing is stored, no score is worked out, and a limit stops the walk the moment it is reached. That is the whole reason the command exists and it is why it is not ZINTER with the members thrown away."
+
+[[command]]
+name = "ZRANDMEMBER"
+group = "zset"
+since = "6.2.0"
+arity = -2
+plan = "point"
+bounded = "inherent"
+status = "shipped"
+wire = "verified"
+notes = "A positive count draws without replacement with a partial shuffle of the row numbers, not a retry loop, because a retry loop on a count near the size of the set spends most of its time drawing members it already has. A negative count draws with replacement and answers exactly as many as asked for. A count at or over the size hands back the whole set in storage order, which is what Redis does and saves shuffling in order to return everything anyway. Without a count at all it answers one member or a nil, which is a different reply type from the empty array a count of zero gives."
+
+[[command]]
+name = "ZSCAN"
+group = "zset"
+since = "2.8.0"
+arity = -3
+plan = "cursor"
+bounded = "inherent"
+status = "shipped"
+wire = "verified"
+notes = "The guarantee is the one every scan gives: a member that was there for the whole walk is seen at least once. A listpack sorted set comes back whole with a cursor of zero, since a listpack has no stable position to resume from and 128 members is not worth a resume. This is the one sorted set reply where a score is not a double on RESP3, because a scan answers pairs of bulk strings whatever the protocol, which is Redis's shape and the same one HSCAN has."
+
 
 # ------------------------------------------------------------------ scripting
 
