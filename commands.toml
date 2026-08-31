@@ -408,7 +408,7 @@ plan = "whole-value"
 bounded = "inherent"
 status = "shipped"
 wire = "verified"
-notes = "The result is stored as text and never as an integer, because Redis reports embstr afterwards even when the number came out whole."
+notes = "The result is stored as text and never as an integer, because Redis reports embstr afterwards even when the number came out whole. The reply is written by a different printer from every other double in the server: it goes through ld2string in its human mode rather than d2string, and human mode is a fixed point conversion, so INCRBYFLOAT of ten to the thirtieth answers a one and thirty zeros where ZSCORE would answer 1e+30 for the same number."
 
 [[command]]
 name = "LCS"

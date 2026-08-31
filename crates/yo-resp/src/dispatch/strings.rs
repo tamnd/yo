@@ -115,7 +115,7 @@ pub(super) fn execute(db: &mut Keyspace, spec: &Spec, args: Args<'_>, out: &mut 
         "decrby" => out.int(db.decrby(args.get(1), args.int(2)?)?),
         // A bulk string on both protocols, not a RESP3 double. Redis has never
         // changed this one and a client that parses the digits would break.
-        "incrbyfloat" => out.bulk_double(db.incrbyfloat(args.get(1), args.float(2)?)?),
+        "incrbyfloat" => out.human_double(db.incrbyfloat(args.get(1), args.float(2)?)?),
         "lcs" => lcs(db, args, out)?,
         "msetex" => msetex(db, args, out)?,
         "delex" => delex(db, args, out)?,

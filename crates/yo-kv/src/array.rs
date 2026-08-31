@@ -1559,7 +1559,9 @@ mod tests {
             // cleared, so this one prints back as something else.
             (b"3.14", false),
             (b"1.10", false),
-            (b"-0.0", false),
+            // Negative zero keeps its sign through the printer, so `-0` comes
+            // back and `arFormatFloat` puts the `.0` on the end of it.
+            (b"-0.0", true),
             (b"1.", false),
             (b".5", false),
             (b"1e5", false),

@@ -5480,4 +5480,49 @@ mod tests {
         assert!(map.contains("$5\r\ncount\r\n:1\r\n"), "{map}");
         assert!(map.contains("$14\r\navg-dense-size\r\n,0\r\n"), "{map}");
     }
+
+    #[test]
+    fn a_double_on_the_wire_is_written_the_way_redis_writes_one() {
+        let mut f = Fixture::new();
+        // Whole numbers up to two to the sixty second come back as integers,
+        // and past that the digit generator takes over and uses an exponent.
+        for (score, want) in [
+            ("3", "3"),
+            ("3.5", "3.5"),
+            ("0.3", "0.3"),
+            ("1e30", "1e+30"),
+            ("1e19", "1e+19"),
+            ("1e-7", "1e-7"),
+            ("0.000001", "0.000001"),
+            ("4611686018427387904", "4611686018427387904"),
+            ("-0", "-0"),
+        ] {
+            f.run(&[b"ZADD", b"z", score.as_bytes(), b"m"]);
+            assert_eq!(
+                f.run(&[b"ZSCORE", b"z", b"m"]),
+                format!("${}\r\n{want}\r\n", want.len()),
+                "score {score}"
+            );
+        }
+
+        // The same bytes on RESP3, where the reply is a double rather than a
+        // bulk string.
+        let mut g = Fixture::new();
+        g.run(&[b"HELLO", b"3"]);
+        g.run(&[b"ZADD", b"z", b"1e30", b"m"]);
+        assert_eq!(g.run(&[b"ZSCORE", b"z", b"m"]), ",1e+30\r\n");
+        // The two float increments are not this printer. They go through
+        // ld2string in its human mode, which is a fixed point conversion with
+        // the trailing zeros taken off, so they never write an exponent, and
+        // they reply with a bulk string on both protocols.
+        assert_eq!(
+            g.run(&[b"INCRBYFLOAT", b"s", b"1e30"]),
+            "$31\r\n1000000000000000000000000000000\r\n"
+        );
+        assert_eq!(g.run(&[b"INCRBYFLOAT", b"t", b"0.1"]), "$3\r\n0.1\r\n");
+        assert_eq!(
+            g.run(&[b"HINCRBYFLOAT", b"h", b"f", b"1e19"]),
+            "$20\r\n10000000000000000000\r\n"
+        );
+    }
 }
