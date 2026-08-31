@@ -62,6 +62,7 @@ mod server;
 mod sets;
 mod strings;
 pub mod table;
+mod zsets;
 
 pub use args::Args;
 pub use blocking::{Parked, Waiters};
@@ -430,6 +431,10 @@ pub fn execute(server: &mut Server, session: &mut Session, args: Args<'_>, out: 
             "list" => {
                 let db = session.db;
                 lists::execute(&mut server.dbs[db], spec, args, out).map(|()| Flow::Continue)
+            }
+            "zset" => {
+                let db = session.db;
+                zsets::execute(&mut server.dbs[db], spec, args, out).map(|()| Flow::Continue)
             }
             // Every database and not the one the session is on, because `COPY` takes
             // a `DB n` and writes into a database nobody selected.
@@ -3845,6 +3850,244 @@ mod tests {
         for _ in 0..200 {
             f.run(&args);
             f.run(&[b"LTRIM", b"k", b"1", b"0"]);
+            f.server.compact_step();
+        }
+        assert_eq!(f.run(&[b"DBSIZE"]), ":0\r\n");
+        assert!(
+            f.server.memory_bytes() <= after_first * 2,
+            "held {} after two hundred passes against {after_first} after one",
+            f.server.memory_bytes()
+        );
+    }
+
+    // ------------------------------------------------------------ sorted set
+
+    #[test]
+    fn a_sorted_set_takes_scores_and_gives_them_back() {
+        let mut f = Fixture::new();
+        assert_eq!(f.run(&[b"ZADD", b"z", b"1", b"a", b"2", b"b"]), ":2\r\n");
+        assert_eq!(f.run(&[b"ZADD", b"z", b"1", b"a", b"3", b"c"]), ":1\r\n");
+        assert_eq!(f.run(&[b"ZCARD", b"z"]), ":3\r\n");
+        assert_eq!(f.run(&[b"ZSCORE", b"z", b"b"]), "$1\r\n2\r\n");
+        assert_eq!(f.run(&[b"ZSCORE", b"z", b"nope"]), "$-1\r\n");
+        assert_eq!(f.run(&[b"ZSCORE", b"nokey", b"b"]), "$-1\r\n");
+        assert_eq!(
+            f.run(&[b"ZMSCORE", b"z", b"a", b"nope", b"c"]),
+            "*3\r\n$1\r\n1\r\n$-1\r\n$1\r\n3\r\n"
+        );
+        assert_eq!(f.run(&[b"ZREM", b"z", b"a", b"nope"]), ":1\r\n");
+        assert_eq!(f.run(&[b"ZCARD", b"z"]), ":2\r\n");
+        // The key goes when the last member does.
+        assert_eq!(f.run(&[b"ZREM", b"z", b"b", b"c"]), ":2\r\n");
+        assert_eq!(f.run(&[b"EXISTS", b"z"]), ":0\r\n");
+    }
+
+    #[test]
+    fn a_score_is_a_double_on_resp3_and_digits_on_resp2() {
+        let mut f = Fixture::new();
+        f.run(&[b"ZADD", b"z", b"1.5", b"a", b"inf", b"b", b"-inf", b"c"]);
+        assert_eq!(f.run(&[b"ZSCORE", b"z", b"a"]), "$3\r\n1.5\r\n");
+        assert_eq!(f.run(&[b"ZSCORE", b"z", b"b"]), "$3\r\ninf\r\n");
+        assert_eq!(f.run(&[b"ZSCORE", b"z", b"c"]), "$4\r\n-inf\r\n");
+
+        f.out = Out::new(Proto::Resp3);
+        assert_eq!(f.run(&[b"ZSCORE", b"z", b"a"]), ",1.5\r\n");
+        assert_eq!(f.run(&[b"ZSCORE", b"z", b"b"]), ",inf\r\n");
+        assert_eq!(f.run(&[b"ZSCORE", b"z", b"c"]), ",-inf\r\n");
+        assert_eq!(f.run(&[b"ZSCORE", b"z", b"nope"]), "_\r\n");
+    }
+
+    #[test]
+    fn the_zadd_options_gate_what_gets_written() {
+        let mut f = Fixture::new();
+        f.run(&[b"ZADD", b"z", b"5", b"a"]);
+        // NX leaves a member that is there alone, XX will not create one.
+        assert_eq!(f.run(&[b"ZADD", b"z", b"NX", b"9", b"a"]), ":0\r\n");
+        assert_eq!(f.run(&[b"ZSCORE", b"z", b"a"]), "$1\r\n5\r\n");
+        assert_eq!(f.run(&[b"ZADD", b"z", b"XX", b"9", b"new"]), ":0\r\n");
+        assert_eq!(f.run(&[b"EXISTS", b"z"]), ":1\r\n");
+        // GT and LT only move a score one way.
+        assert_eq!(f.run(&[b"ZADD", b"z", b"GT", b"CH", b"3", b"a"]), ":0\r\n");
+        assert_eq!(f.run(&[b"ZADD", b"z", b"GT", b"CH", b"7", b"a"]), ":1\r\n");
+        assert_eq!(f.run(&[b"ZADD", b"z", b"LT", b"CH", b"9", b"a"]), ":0\r\n");
+        // CH counts a moved score and plain ZADD does not.
+        assert_eq!(f.run(&[b"ZADD", b"z", b"1", b"a", b"1", b"b"]), ":1\r\n");
+        assert_eq!(
+            f.run(&[b"ZADD", b"z", b"CH", b"2", b"a", b"2", b"c"]),
+            ":2\r\n"
+        );
+    }
+
+    #[test]
+    fn zadd_incr_answers_a_score_or_nothing_at_all() {
+        let mut f = Fixture::new();
+        assert_eq!(f.run(&[b"ZADD", b"z", b"INCR", b"5", b"m"]), "$1\r\n5\r\n");
+        assert_eq!(f.run(&[b"ZADD", b"z", b"INCR", b"2", b"m"]), "$1\r\n7\r\n");
+        // A gate that refuses is the string nil, because the reply it stands in
+        // for is a score.
+        assert_eq!(
+            f.run(&[b"ZADD", b"z", b"NX", b"INCR", b"2", b"m"]),
+            "$-1\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"ZADD", b"z", b"XX", b"INCR", b"2", b"gone"]),
+            "$-1\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"ZADD", b"z", b"GT", b"INCR", b"-1", b"m"]),
+            "$-1\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"ZADD", b"z", b"GT", b"INCR", b"1", b"m"]),
+            "$1\r\n8\r\n"
+        );
+        assert_eq!(f.run(&[b"ZINCRBY", b"z", b"2", b"m"]), "$2\r\n10\r\n");
+        assert_eq!(f.run(&[b"ZINCRBY", b"z", b"1", b"fresh"]), "$1\r\n1\r\n");
+    }
+
+    #[test]
+    fn the_two_infinities_will_not_be_added_together() {
+        let mut f = Fixture::new();
+        f.run(&[b"ZADD", b"z", b"inf", b"m"]);
+        let nan = "-ERR resulting score is not a number (NaN)\r\n";
+        assert_eq!(f.run(&[b"ZINCRBY", b"z", b"-inf", b"m"]), nan);
+        assert_eq!(f.run(&[b"ZADD", b"z", b"INCR", b"-inf", b"m"]), nan);
+        assert_eq!(f.run(&[b"ZSCORE", b"z", b"m"]), "$3\r\ninf\r\n");
+        // And a key made for an increment that then fails does not stay behind.
+        assert_eq!(f.run(&[b"ZINCRBY", b"gone", b"1", b"m"]), "$1\r\n1\r\n");
+    }
+
+    #[test]
+    fn zadd_says_its_mistakes_the_way_redis_says_them() {
+        let mut f = Fixture::new();
+        // The pairs are counted before the options are looked at, so this is a
+        // syntax error about having none and not a complaint about NX and XX.
+        assert_eq!(
+            f.run(&[b"ZADD", b"z", b"NX", b"XX"]),
+            "-ERR syntax error\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"ZADD", b"z", b"NX", b"XX", b"1", b"a"]),
+            "-ERR XX and NX options at the same time are not compatible\r\n"
+        );
+        let gtlt = "-ERR GT, LT, and/or NX options at the same time are not compatible\r\n";
+        assert_eq!(f.run(&[b"ZADD", b"z", b"NX", b"GT", b"1", b"a"]), gtlt);
+        assert_eq!(f.run(&[b"ZADD", b"z", b"GT", b"LT", b"1", b"a"]), gtlt);
+        assert_eq!(
+            f.run(&[b"ZADD", b"z", b"INCR", b"1", b"a", b"2", b"b"]),
+            "-ERR INCR option supports a single increment-element pair\r\n"
+        );
+        // An odd number of arguments after the options.
+        assert_eq!(
+            f.run(&[b"ZADD", b"z", b"1", b"a", b"2"]),
+            "-ERR syntax error\r\n"
+        );
+        // Every score is read before the first is stored.
+        assert_eq!(
+            f.run(&[b"ZADD", b"z", b"1", b"a", b"nonsense", b"b"]),
+            "-ERR value is not a valid float\r\n"
+        );
+        assert_eq!(f.run(&[b"EXISTS", b"z"]), ":0\r\n");
+    }
+
+    #[test]
+    fn a_rank_says_where_a_member_sits_from_either_end() {
+        let mut f = Fixture::new();
+        f.run(&[b"ZADD", b"z", b"1", b"a", b"2", b"b", b"3", b"c"]);
+        assert_eq!(f.run(&[b"ZRANK", b"z", b"a"]), ":0\r\n");
+        assert_eq!(f.run(&[b"ZRANK", b"z", b"c"]), ":2\r\n");
+        assert_eq!(f.run(&[b"ZREVRANK", b"z", b"c"]), ":0\r\n");
+        assert_eq!(f.run(&[b"ZREVRANK", b"z", b"a"]), ":2\r\n");
+        // WITHSCORE changes both shapes: the answer and the nothing.
+        assert_eq!(
+            f.run(&[b"ZRANK", b"z", b"b", b"WITHSCORE"]),
+            "*2\r\n:1\r\n$1\r\n2\r\n"
+        );
+        assert_eq!(f.run(&[b"ZRANK", b"z", b"nope"]), "$-1\r\n");
+        assert_eq!(f.run(&[b"ZRANK", b"z", b"nope", b"WITHSCORE"]), "*-1\r\n");
+        assert_eq!(f.run(&[b"ZRANK", b"nokey", b"a", b"WITHSCORE"]), "*-1\r\n");
+        // A bad option is a syntax error and one argument too many is an arity
+        // error, which is Redis's split.
+        assert_eq!(
+            f.run(&[b"ZRANK", b"z", b"b", b"bogus"]),
+            "-ERR syntax error\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"ZREVRANK", b"z", b"b", b"WITHSCORE", b"more"]),
+            "-ERR wrong number of arguments for 'zrevrank' command\r\n"
+        );
+    }
+
+    #[test]
+    fn the_two_counts_read_their_two_kinds_of_bound() {
+        let mut f = Fixture::new();
+        f.run(&[b"ZADD", b"z", b"1", b"a", b"2", b"b", b"3", b"c"]);
+        assert_eq!(f.run(&[b"ZCOUNT", b"z", b"-inf", b"+inf"]), ":3\r\n");
+        assert_eq!(f.run(&[b"ZCOUNT", b"z", b"2", b"3"]), ":2\r\n");
+        assert_eq!(f.run(&[b"ZCOUNT", b"z", b"(1", b"3"]), ":2\r\n");
+        assert_eq!(f.run(&[b"ZCOUNT", b"z", b"(1", b"(3"]), ":1\r\n");
+        assert_eq!(f.run(&[b"ZCOUNT", b"nokey", b"-inf", b"+inf"]), ":0\r\n");
+        assert_eq!(
+            f.run(&[b"ZCOUNT", b"z", b"bogus", b"3"]),
+            "-ERR min or max is not a float\r\n"
+        );
+
+        f.run(&[b"ZADD", b"l", b"0", b"a", b"0", b"b", b"0", b"c"]);
+        assert_eq!(f.run(&[b"ZLEXCOUNT", b"l", b"-", b"+"]), ":3\r\n");
+        assert_eq!(f.run(&[b"ZLEXCOUNT", b"l", b"[a", b"(c"]), ":2\r\n");
+        assert_eq!(f.run(&[b"ZLEXCOUNT", b"l", b"(a", b"+"]), ":2\r\n");
+        // A bare member is not a bound, because a member can start with any
+        // byte and there would be no way to say the bracket if it were optional.
+        assert_eq!(
+            f.run(&[b"ZLEXCOUNT", b"l", b"a", b"c"]),
+            "-ERR min or max not valid string range item\r\n"
+        );
+    }
+
+    #[test]
+    fn every_sorted_set_command_says_wrongtype_and_writes_nothing() {
+        let mut f = Fixture::new();
+        f.run(&[b"SET", b"s", b"v"]);
+        let wrong = "-WRONGTYPE Operation against a key holding the wrong kind of value\r\n";
+        for cmd in [
+            &[b"ZADD".as_slice(), b"s", b"1", b"a"][..],
+            &[b"ZINCRBY", b"s", b"1", b"a"],
+            &[b"ZCARD", b"s"],
+            &[b"ZSCORE", b"s", b"a"],
+            &[b"ZMSCORE", b"s", b"a"],
+            &[b"ZREM", b"s", b"a"],
+            &[b"ZRANK", b"s", b"a"],
+            &[b"ZREVRANK", b"s", b"a"],
+            &[b"ZCOUNT", b"s", b"1", b"2"],
+            &[b"ZLEXCOUNT", b"s", b"-", b"+"],
+        ] {
+            assert_eq!(f.run(cmd), wrong, "{:?}", cmd[0]);
+        }
+        assert_eq!(f.run(&[b"GET", b"s"]), "$1\r\nv\r\n");
+    }
+
+    /// The same churn the set, the string and the list get, because a sorted
+    /// set that leaks a tree node per add looks exactly like one that does not
+    /// until it has run for an afternoon.
+    #[test]
+    fn churning_sorted_sets_does_not_grow_the_server() {
+        let mut f = Fixture::new();
+        let members: Vec<Vec<u8>> = (0..200).map(|i| format!("m{i}").into_bytes()).collect();
+        let scores: Vec<Vec<u8>> = (0..200).map(|i| format!("{i}").into_bytes()).collect();
+        let mut args: Vec<&[u8]> = vec![b"ZADD", b"z"];
+        for i in 0..200 {
+            args.push(&scores[i]);
+            args.push(&members[i]);
+        }
+
+        f.run(&args);
+        f.run(&[b"DEL", b"z"]);
+        f.server.compact_step();
+        let after_first = f.server.memory_bytes();
+
+        for _ in 0..200 {
+            f.run(&args);
+            f.run(&[b"DEL", b"z"]);
             f.server.compact_step();
         }
         assert_eq!(f.run(&[b"DBSIZE"]), ":0\r\n");

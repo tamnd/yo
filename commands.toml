@@ -89,8 +89,11 @@ doc = "08 section 4"
 [[group]]
 name = "zset"
 expected = 35
-status = "planned"
+status = "partial"
 doc = "08 section 5"
+# The type and the keyspace layer are done, all 35 commands' worth, and the wire
+# is going out in batches the way the list went. What is here is the ten that
+# answer about one member or count without walking a range.
 
 [[group]]
 name = "array"
@@ -1448,6 +1451,118 @@ bounded = "inherent"
 status = "shipped"
 wire = "verified"
 notes = "LMPOP with a wait, and the same parse shifted along by one. The timeout is read before the key count, so BLMPOP abc 0 k LEFT complains about the timeout and not about the count. A COUNT that is not a number at all gets the same sentence a zero or a negative one gets, which is count should be greater than 0 rather than the usual message about integers."
+
+# ------------------------------------------------------------------ sorted set
+
+[[command]]
+name = "ZADD"
+group = "zset"
+since = "1.2.0"
+arity = -4
+plan = "point"
+bounded = "inherent"
+status = "shipped"
+wire = "verified"
+notes = "One key lookup for the whole pair list, then a hash probe and a tree descent per pair. Every score is parsed before the first one is stored, so ZADD key 1 a nonsense b adds nothing at all, which is Redis's answer and the only behaviour that makes the command safe to retry. The option parse has one surprise in it and it is Redis's: the pairs are counted before the incompatible options are looked at, so ZADD key NX XX is a syntax error about having no pairs rather than the complaint about NX and XX. GT and LT are worked out before the add and not after, because both are questions about the score that is already there."
+
+[[command]]
+name = "ZINCRBY"
+group = "zset"
+since = "1.2.0"
+arity = 4
+plan = "point"
+bounded = "inherent"
+status = "shipped"
+wire = "verified"
+notes = "ZADD INCR without the gates, and the same code underneath, because a version of this that did its own add would be a second place the NaN rule lives. Infinity plus its opposite is refused and the score is left alone, since a NaN compares equal to nothing including itself and a sorted set is nothing but comparisons. A key that was created for an increment that then fails is deleted again, so a refused ZINCRBY leaves no empty sorted set behind."
+
+[[command]]
+name = "ZCARD"
+group = "zset"
+since = "1.2.0"
+arity = 2
+plan = "metadata"
+bounded = "inherent"
+status = "shipped"
+wire = "verified"
+notes = "The length is held in whichever band the sorted set is on and neither has to be walked to find it."
+
+[[command]]
+name = "ZSCORE"
+group = "zset"
+since = "1.2.0"
+arity = 3
+plan = "point"
+bounded = "inherent"
+status = "shipped"
+wire = "verified"
+notes = "A hash probe on the element table and nothing else, because a score is a property of a member and not a question about order. This is the half of the sorted set the tree is not involved in, and it is why the tree holds row numbers rather than scores."
+
+[[command]]
+name = "ZMSCORE"
+group = "zset"
+since = "6.2.0"
+arity = -3
+plan = "point"
+bounded = "inherent"
+status = "shipped"
+wire = "verified"
+notes = "ZSCORE once per member, with the keyspace memo answering the second and later lookups without going back to the map. The reply is written a score at a time straight into the out buffer, so asking about a thousand members allocates nothing."
+
+[[command]]
+name = "ZREM"
+group = "zset"
+since = "1.2.0"
+arity = -3
+plan = "point"
+bounded = "inherent"
+status = "shipped"
+wire = "verified"
+notes = "A probe to find the member, a search to find where it sits, and then the removal renumbers whichever row moved into the hole. That last part is the whole reason the tree can be updated in place rather than rebuilt: the element table fills a hole with its last row, so exactly one row number in the tree changes and the search that finds it is the same search everything else uses. The key goes when the last member goes."
+
+[[command]]
+name = "ZRANK"
+group = "zset"
+since = "2.0.0"
+arity = -3
+plan = "point"
+bounded = "inherent"
+status = "shipped"
+wire = "verified"
+notes = "A probe for the score and then a descent for the position, which is the two structures answering the two halves of one question. WITHSCORE changes the shape of the answer both ways: the rank becomes a two element array and a member that is not there becomes the array nil rather than the string one, and a RESP2 client tells those apart. An argument too many is the arity error and a bad option is the syntax one, which is Redis's split and reads backwards until you notice the option is optional."
+
+[[command]]
+name = "ZREVRANK"
+group = "zset"
+since = "2.0.0"
+arity = -3
+plan = "point"
+bounded = "inherent"
+status = "shipped"
+wire = "verified"
+notes = "ZRANK counted from the other end, which is the length minus the rank minus one and not a second search."
+
+[[command]]
+name = "ZCOUNT"
+group = "zset"
+since = "2.0.0"
+arity = 4
+plan = "point"
+bounded = "inherent"
+status = "shipped"
+wire = "verified"
+notes = "Two descents and a subtraction. This is ZRANGEBYSCORE with the walk left off, and it is the same Query the range commands build, which is why an exclusive bound cannot be right in one of them and wrong in the other."
+
+[[command]]
+name = "ZLEXCOUNT"
+group = "zset"
+since = "2.8.9"
+arity = 4
+plan = "point"
+bounded = "inherent"
+status = "shipped"
+wire = "verified"
+notes = "ZCOUNT against the other kind of bound. A lexical range only means anything when every member has the same score, which the command does not check and Redis does not either, because the order is by score and then by member and the answer is well defined either way."
 
 
 # ------------------------------------------------------------------ scripting
