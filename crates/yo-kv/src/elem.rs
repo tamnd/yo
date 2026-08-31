@@ -279,6 +279,28 @@ impl<V: Copy> Elements<V> {
         self.find_hashed(h, name).is_some()
     }
 
+    /// Which row this name is in, with its hash already in hand.
+    #[inline]
+    #[must_use]
+    pub fn index_of_hashed(&self, h: u64, name: &[u8]) -> Option<usize> {
+        self.find_hashed(h, name)
+    }
+
+    /// What is stored against this name, with its hash already in hand.
+    #[inline]
+    #[must_use]
+    pub fn get_hashed(&self, h: u64, name: &[u8]) -> Option<&V> {
+        let at = self.find_hashed(h, name)?;
+        Some(&self.vals[at])
+    }
+
+    /// The payload to be changed in place, with the hash already in hand.
+    #[inline]
+    pub fn get_hashed_mut(&mut self, h: u64, name: &[u8]) -> Option<&mut V> {
+        let at = self.find_hashed(h, name)?;
+        Some(&mut self.vals[at])
+    }
+
     /// Store `value` against `name`, and say what was there before.
     ///
     /// `None` means the element is new, which is the number `SADD` and `HSET`
@@ -287,10 +309,18 @@ impl<V: Copy> Elements<V> {
     /// message from the layer above, which is the one that knows which command
     /// is being answered.
     pub fn insert(&mut self, name: &[u8], value: V) -> Result<Option<V>, Full> {
+        self.insert_hashed(hash(name), name, value)
+    }
+
+    /// Store `value` against `name`, with its hash already in hand.
+    ///
+    /// The partitioned band hashes once to pick a partition and would otherwise
+    /// hash again to place the row inside it, which on a short member is most of
+    /// the write.
+    pub fn insert_hashed(&mut self, h: u64, name: &[u8], value: V) -> Result<Option<V>, Full> {
         if name.len() > NAME_MAX {
             return Err(Full::Name);
         }
-        let h = hash(name);
         if let Some(at) = self.find_hashed(h, name) {
             return Ok(Some(std::mem::replace(&mut self.vals[at], value)));
         }
@@ -314,6 +344,13 @@ impl<V: Copy> Elements<V> {
     /// `SREM`, `HDEL` and the removing half of `SPOP`.
     pub fn remove(&mut self, name: &[u8]) -> Option<V> {
         let at = self.find(name)?;
+        Some(self.remove_row(at))
+    }
+
+    /// Take an element out, with its hash already in hand.
+    #[inline]
+    pub fn remove_hashed(&mut self, h: u64, name: &[u8]) -> Option<V> {
+        let at = self.find_hashed(h, name)?;
         Some(self.remove_row(at))
     }
 

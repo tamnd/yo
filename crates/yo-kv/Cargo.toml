@@ -47,5 +47,9 @@ name = "orderkey"
 harness = false
 
 [[bench]]
+name = "parts"
+harness = false
+
+[[bench]]
 name = "setops"
 harness = false

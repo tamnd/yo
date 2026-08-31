@@ -76,13 +76,20 @@ const PART_MASK: u64 = 0xFFF;
 /// Forty bits for the row index, which is more than any one partition holds.
 const IDX_MASK: u64 = (1 << PART_SHIFT) - 1;
 
-/// The most partitions a cursor can name.
+/// The most partitions a collection may have.
 ///
-/// Twelve bits. The partitioned band starts at 262,144 elements and `P` is a
-/// power of two that is never 2, so a collection would have to be enormous
-/// before this mattered, and a cursor is a wire format where a spare bit is
-/// worth more than a partition count nobody will reach.
-pub const MAX_PARTS: u32 = PART_MASK as u32 + 1;
+/// Two thousand and forty eight, and the missing factor of two is worth a
+/// sentence because it is the sort of thing that looks like a typo. The field is
+/// twelve bits, so it holds 0 through 4,095, but zero is spoken for: a cursor
+/// that has not been anywhere yet is all zeroes and has to read as one partition
+/// rather than as none. That leaves 1 through 4,095, and a layout is always a
+/// power of two, so the largest one that fits is 2,048 rather than 4,096.
+///
+/// Storing `parts - 1` would win the bit back and it is not worth it. A cursor
+/// is a wire format, a client holds one across a reconnect, and changing what the
+/// bits mean to reach a layout that needs 134 million elements in one collection
+/// is a bad trade. Above that ceiling the partitions simply get larger.
+pub const MAX_PARTS: u32 = (PART_MASK as u32 + 1) >> 1;
 
 impl Cursor {
     /// Start at the beginning, which for a downward walk is the top.
@@ -194,14 +201,19 @@ impl Cursor {
 }
 
 /// Pack the three fields, clamping the two that come from outside.
+///
+/// Both clamp to [`MAX_PARTS`] rather than to the width of the field. A count
+/// above the ceiling is a client making something up, and answering it with the
+/// largest layout that can actually exist is saner than answering it with a
+/// number no collection will ever have been laid out on.
 const fn pack(parts: u32, part: u32, idx_plus_one: u64) -> u64 {
-    let parts = if parts as u64 > PART_MASK {
-        PART_MASK
+    let parts = if parts > MAX_PARTS {
+        MAX_PARTS as u64
     } else {
         parts as u64
     };
-    let part = if part as u64 > PART_MASK {
-        PART_MASK
+    let part = if part >= MAX_PARTS {
+        (MAX_PARTS - 1) as u64
     } else {
         part as u64
     };
