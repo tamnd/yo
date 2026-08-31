@@ -397,7 +397,11 @@ impl Keyspace {
             Kind::Hash => self.hash_encoding(key).map(hash::Encoding::name),
             Kind::List => self.list_encoding(key).map(list::Encoding::name),
             Kind::Zset => self.zset_encoding(key).map(zset::Encoding::name),
-            other => unreachable!("nothing can store a {} yet", other.name()),
+            // Named rather than caught, so that the next type to land is a
+            // build error here and not a panic on a live server. That is not
+            // hypothetical: `COPY` of a list took the shard down for exactly as
+            // long as its own match had a catch all at the bottom.
+            Kind::Stream => unreachable!("nothing can store a stream yet"),
         }
     }
 
@@ -436,7 +440,8 @@ impl Keyspace {
                     value::write_slot_record(out, kind, slot, at);
                 });
             }
-            other => unreachable!("nothing can store a {} yet", other.name()),
+            // Named rather than caught, as above.
+            Kind::Stream => unreachable!("nothing can store a stream yet"),
         }
         true
     }
@@ -548,7 +553,8 @@ impl Keyspace {
                 self.zsets.remove(at);
                 self.bodies -= 1;
             }
-            other => unreachable!("nothing can store a {} yet", other.name()),
+            // Named rather than caught, as above.
+            Kind::Stream => unreachable!("nothing can store a stream yet"),
         }
     }
 

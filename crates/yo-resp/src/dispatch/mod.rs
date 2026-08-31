@@ -780,6 +780,54 @@ mod tests {
         assert_eq!(f.run(&[b"SCARD", b"t"]), ":3\r\n");
     }
 
+    /// Every type a key can hold, copied, because two of them used to panic.
+    ///
+    /// `COPY` reads the value out of the source through one match on the type
+    /// tag, and that match had a catch all at the bottom from back when a set
+    /// and a hash were the only bodies. The list and the sorted set landed after
+    /// it and nobody came back, so `COPY mylist other` took the shard down. It
+    /// is an ordinary command against a type the server supports everywhere
+    /// else, so this walks all five rather than the two that were broken: the
+    /// point is that the next type cannot land the same way.
+    #[test]
+    fn every_type_can_be_copied() {
+        let mut f = Fixture::new();
+        f.run(&[b"SET", b"str", b"v1"]);
+        f.run(&[b"SADD", b"set", b"m1"]);
+        f.run(&[b"HSET", b"hash", b"f", b"v"]);
+        f.run(&[b"RPUSH", b"list", b"a", b"b"]);
+        f.run(&[b"ZADD", b"zset", b"1", b"m1"]);
+
+        for name in [
+            &b"str"[..],
+            &b"set"[..],
+            &b"hash"[..],
+            &b"list"[..],
+            &b"zset"[..],
+        ] {
+            let dst = [name, b":copy"].concat();
+            assert_eq!(
+                f.run(&[b"COPY", name, &dst]),
+                ":1\r\n",
+                "copying {}",
+                String::from_utf8_lossy(name)
+            );
+            assert_eq!(f.run(&[b"TYPE", name]), f.run(&[b"TYPE", &dst]));
+        }
+
+        assert_eq!(f.run(&[b"LRANGE", b"list:copy", b"0", b"-1"]), {
+            let mut want = String::from("*2\r\n");
+            want.push_str("$1\r\na\r\n$1\r\nb\r\n");
+            want
+        });
+        assert_eq!(f.run(&[b"ZSCORE", b"zset:copy", b"m1"]), "$1\r\n1\r\n");
+
+        // And the copy is its own value, not a second name for the source.
+        f.run(&[b"RPUSH", b"list:copy", b"c"]);
+        assert_eq!(f.run(&[b"LLEN", b"list"]), ":2\r\n");
+        assert_eq!(f.run(&[b"LLEN", b"list:copy"]), ":3\r\n");
+    }
+
     #[test]
     fn a_copy_refuses_a_taken_destination_until_it_is_told_it_can_have_it() {
         let mut f = Fixture::new();
