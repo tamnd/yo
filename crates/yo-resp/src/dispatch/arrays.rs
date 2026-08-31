@@ -20,8 +20,9 @@
 //! a number that does not fit an `i64`, which is why the replies here go
 //! through [`Out::uint`].
 
-use yo_common::Result;
-use yo_kv::arrays::parse_index;
+use yo_common::num::parse_i64;
+use yo_common::{Code, Error, Result};
+use yo_kv::arrays::{parse_index, parse_seek_index};
 use yo_kv::{ArrayElement, Keyspace};
 
 use super::args::{self, Args};
@@ -50,7 +51,7 @@ pub(super) fn execute(db: &mut Keyspace, spec: &Spec, args: Args<'_>, out: &mut 
             out.uint(db.armset(args.get(1), pairs)?);
         }
         "arget" => {
-            let index = parse_index(args.get(2))?;
+            let index = index_after_type(db, args.get(1), args.get(2))?;
             match db.arget(args.get(1), index)? {
                 Some(e) => element(out, e),
                 None => out.nil(),
@@ -58,7 +59,7 @@ pub(super) fn execute(db: &mut Keyspace, spec: &Spec, args: Args<'_>, out: &mut 
         }
         "armget" => {
             for i in 2..args.len() {
-                parse_index(args.get(i))?;
+                index_after_type(db, args.get(1), args.get(i))?;
             }
             out.array(args.len() - 2);
             let indices = (2..args.len()).map(|i| parse_index(args.get(i)).unwrap_or(0));
@@ -103,9 +104,99 @@ pub(super) fn execute(db: &mut Keyspace, spec: &Spec, args: Args<'_>, out: &mut 
             });
             out.uint(db.ardelrange(args.get(1), ranges)?);
         }
+        "arinsert" => {
+            let values = (2..args.len()).map(|i| args.get(i));
+            out.uint(db.arinsert(args.get(1), values)?);
+        }
+        "arring" => {
+            // Redis reads the size before it looks at the key, so a bad size
+            // against a string is a bad size and not a wrong type.
+            let size =
+                parse_i64(args.get(2)).ok_or_else(|| Error::new(Code::Invalid, "invalid size"))?;
+            if size <= 0 {
+                return Err(Error::new(Code::Invalid, "size must be positive"));
+            }
+            let values = (3..args.len()).map(|i| args.get(i));
+            out.uint(db.arring(args.get(1), size as u64, values)?);
+        }
+        "arnext" => match db.arnext(args.get(1))? {
+            Some(index) => out.uint(index),
+            // The cursor is at the top of the space and there is no next index
+            // to name, which is the one thing this command cannot answer with a
+            // number.
+            None => out.nil(),
+        },
+        "arseek" => {
+            let index = parse_seek_index(args.get(2))?;
+            out.uint(u64::from(db.arseek(args.get(1), index)?));
+        }
+        "arlastitems" => {
+            let count = args
+                .int(2)
+                .map_err(|_| Error::new(Code::Invalid, "invalid COUNT"))?;
+            // Nothing asked for is an empty reply, and Redis answers it before
+            // it has read the option or looked at the key, so this does too.
+            if count <= 0 {
+                out.array(0);
+                return Ok(());
+            }
+            let newest_first = match args.len() {
+                3 => false,
+                4 if args::is(args.get(3), b"REV") => true,
+                4 => return Err(args::syntax()),
+                _ => return Err(args::wrong_arity(spec.name)),
+            };
+            let mark = out.len();
+            let n = db.arlastitems(args.get(1), count as u64, newest_first, |el| reply(out, el))?;
+            out.close_array(mark, usize::try_from(n).unwrap_or(usize::MAX));
+        }
+        "arscan" => {
+            let start = parse_index(args.get(2))?;
+            let end = parse_index(args.get(3))?;
+            let limit = match args.len() {
+                4 => u64::MAX,
+                6 if args::is(args.get(4), b"LIMIT") => {
+                    let n = args.int(5)?;
+                    if n <= 0 {
+                        return Err(Error::new(Code::Invalid, "LIMIT must be positive"));
+                    }
+                    n as u64
+                }
+                6 => return Err(args::syntax()),
+                _ => return Err(args::wrong_arity(spec.name)),
+            };
+            let mark = out.len();
+            let n = db.arscan(args.get(1), start, end, limit, |index, el| {
+                // A pair per element rather than a flat list, so a client can
+                // read the reply without knowing whether it asked for a limit.
+                out.array(2);
+                out.uint(index);
+                element(out, el);
+            })?;
+            out.close_array(mark, usize::try_from(n).unwrap_or(usize::MAX));
+        }
         other => unreachable!("the table sent {other} to the array group"),
     }
     Ok(())
+}
+
+/// An index, but with the type of the key reported first when it is a bad one.
+///
+/// `ARGET` and `ARMGET` are the only two array commands that look the key up
+/// before they read the index, so `ARGET stringkey -1` is a wrong type where
+/// `ARSET stringkey -1 v` is a bad index. The difference is visible to a client
+/// and there is no reasoning behind it beyond the order the two commands happen
+/// to be written in, so this reproduces it without paying for it: the type is
+/// only looked at once the index has already failed, and the ordinary path is
+/// still one lookup.
+fn index_after_type(db: &mut Keyspace, key: &[u8], bytes: &[u8]) -> Result<u64> {
+    match parse_index(bytes) {
+        Ok(index) => Ok(index),
+        Err(e) => {
+            db.arlen(key)?;
+            Err(e)
+        }
+    }
 }
 
 /// One element, or a null for a hole.

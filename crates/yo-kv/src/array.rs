@@ -513,6 +513,69 @@ impl Slice {
             Layout::Dense { words, .. } => words.capacity() * size_of::<Word>(),
         }
     }
+
+    /// Hands every populated offset in `from..=to` to `f`, in whichever
+    /// direction was asked for, and stops early when `f` says to.
+    ///
+    /// Both layouts cost what is in the window rather than how wide it is. A
+    /// sparse slice binary searches for the first entry in range and walks its
+    /// entries, and a dense one walks the part of its window that overlaps and
+    /// skips the holes, which is the whole reason a scan of the entire index
+    /// space over a key holding three elements is three visits.
+    ///
+    /// Answers whether the caller should carry on to the next slice.
+    fn window<F>(&self, from: u16, to: u16, reverse: bool, f: &mut F) -> bool
+    where
+        F: FnMut(u16, Word) -> bool,
+    {
+        match &self.layout {
+            Layout::Sparse { offs, words } => {
+                // Sorted, and no entry is ever empty, so the two ends of the
+                // window are two binary searches and everything between them is
+                // a hit.
+                let a = offs.partition_point(|&o| o < from);
+                let b = offs.partition_point(|&o| o <= to);
+                if reverse {
+                    for i in (a..b).rev() {
+                        if !f(offs[i], words[i]) {
+                            return false;
+                        }
+                    }
+                } else {
+                    for i in a..b {
+                        if !f(offs[i], words[i]) {
+                            return false;
+                        }
+                    }
+                }
+            }
+            Layout::Dense { offset, words } => {
+                let base = *offset;
+                let end = base + (words.len() as u16) - 1;
+                if to < base || from > end {
+                    return true;
+                }
+                let a = usize::from(from.max(base) - base);
+                let b = usize::from(to.min(end) - base);
+                let window = &words[a..=b];
+                let at = |i: usize| base + ((a + i) as u16);
+                if reverse {
+                    for (i, w) in window.iter().enumerate().rev() {
+                        if !w.is_empty() && !f(at(i), *w) {
+                            return false;
+                        }
+                    }
+                } else {
+                    for (i, w) in window.iter().enumerate() {
+                        if !w.is_empty() && !f(at(i), *w) {
+                            return false;
+                        }
+                    }
+                }
+            }
+        }
+        true
+    }
 }
 
 /// A sparse array of values, indexed by a `u64`.
@@ -528,6 +591,16 @@ pub struct Array {
     /// How many indices are populated, kept rather than counted because
     /// `ARCOUNT` is documented as O(1).
     count: u64,
+    /// The last index `ARINSERT` or `ARRING` wrote to, or none when neither has
+    /// written yet.
+    ///
+    /// This is the array's own cursor and it is nothing to do with where the
+    /// elements are. `ARSET` does not move it, so an array filled by `ARSET`
+    /// and then appended to with `ARINSERT` gets its first append at index
+    /// zero, on top of whatever was there. Redis holds the same thing as a
+    /// `u64` with `UINT64_MAX` meaning not set, which is also why that index is
+    /// not addressable.
+    insert: Option<u64>,
 }
 
 /// How dead a blob has to get before it is worth rewriting.
@@ -685,6 +758,241 @@ impl Array {
         self.maybe_compact();
         self.maybe_compact_slices();
         gone
+    }
+
+    /// The index the next `ARINSERT` would write to, which is `ARNEXT`.
+    ///
+    /// None when the cursor has run out of space, which happens only after an
+    /// `ARSEEK` to the very top: the next append would have nowhere to go, and
+    /// Redis answers a null rather than an index it cannot honour.
+    #[must_use]
+    pub const fn next_index(&self) -> Option<u64> {
+        match self.insert {
+            None => Some(0),
+            Some(i) if i >= INDEX_MAX => None,
+            Some(i) => Some(i + 1),
+        }
+    }
+
+    /// Points the cursor so that the next append lands on `idx`, which is
+    /// `ARSEEK`.
+    ///
+    /// Seeking to zero is not the same as seeking to one less than one: it puts
+    /// the cursor back in the state it was in before anything was appended,
+    /// which is also the state `ARRING` reads as "do not reshape me".
+    pub const fn seek(&mut self, idx: u64) {
+        self.insert = if idx == 0 { None } else { Some(idx - 1) };
+    }
+
+    /// Appends `values` at consecutive indices from the cursor, which is
+    /// `ARINSERT`, and answers where the last one landed.
+    ///
+    /// # Errors
+    ///
+    /// [`Code::Invalid`] with [`INSERT_OVERFLOW`] when the batch would run off
+    /// the top of the index space, checked before any of it is written so that
+    /// a batch either lands whole or not at all.
+    pub fn append<'v>(&mut self, values: impl Iterator<Item = &'v [u8]> + Clone) -> Result<u64> {
+        let n = values.clone().count() as u64;
+        let over = || Error::new(Code::Invalid, INSERT_OVERFLOW);
+        let start = self.next_index().ok_or_else(over)?;
+        if n == 0 {
+            return Ok(self.insert.unwrap_or(0));
+        }
+        let last = start.checked_add(n - 1).filter(|l| *l <= INDEX_MAX);
+        let last = last.ok_or_else(over)?;
+        for (i, v) in values.enumerate() {
+            self.set(start + i as u64, v)?;
+        }
+        self.insert = Some(last);
+        Ok(last)
+    }
+
+    /// Writes `values` into a ring of `size` positions, which is `ARRING`, and
+    /// answers where the last one landed.
+    ///
+    /// The ring is not a structure, it is an agreement about indices: writes go
+    /// to the cursor plus one modulo the size, so a ring of ten holds indices
+    /// zero to nine and the eleventh write goes back over the first. Changing
+    /// the size between calls is the only expensive case, because the positions
+    /// that survive have to be renumbered so that they stay in order, and that
+    /// is the `O(N + M)` in the command's complexity.
+    ///
+    /// # Errors
+    ///
+    /// Whatever [`Array::set`] can fail with, which is the two size ceilings.
+    pub fn ring<'v>(&mut self, size: u64, values: impl Iterator<Item = &'v [u8]>) -> Result<u64> {
+        debug_assert!(size > 0, "the caller refuses a size of zero");
+        let old_span = self.len();
+        // A reshape is needed when the ring shrank, and when it grew after it
+        // had already wrapped, because otherwise the next write would go back
+        // over the oldest position instead of using the room that was just
+        // added. An explicit seek to zero says where the next write goes, so it
+        // is honoured rather than reshaped around.
+        let keep = if old_span == 0 || size == old_span {
+            0
+        } else if size < old_span {
+            size
+        } else if self.insert.is_some() && self.next_cursor() < old_span {
+            old_span
+        } else {
+            0
+        };
+        if keep > 0 {
+            self.rework(old_span, keep)?;
+        }
+
+        let mut cursor = self.insert.unwrap_or(0);
+        for v in values {
+            cursor = self.next_cursor();
+            if cursor >= size {
+                cursor %= size;
+            }
+            self.set(cursor, v)?;
+            self.insert = Some(cursor);
+        }
+        Ok(cursor)
+    }
+
+    /// Where the next ring write goes before the size is applied to it.
+    ///
+    /// Wrapping, because a cursor sitting on the last addressable index steps to
+    /// the reserved one, and the modulo in [`Array::ring`] brings it back into
+    /// the ring anyway. Redis relies on the same wrap.
+    const fn next_cursor(&self) -> u64 {
+        match self.insert {
+            None => 0,
+            Some(i) => i.wrapping_add(1),
+        }
+    }
+
+    /// Renumbers the ring so the positions that survive a size change stay in
+    /// order, oldest at zero.
+    ///
+    /// The walk goes backwards from the cursor and stops at the first hole, so
+    /// a ring that somebody has been deleting out of keeps its newest unbroken
+    /// run and not a scattering either side of a gap.
+    fn rework(&mut self, old_span: u64, keep: u64) -> Result<()> {
+        let anchor = match self.insert {
+            None => old_span - 1,
+            Some(i) => i % old_span,
+        };
+        let back = |i: u64| if i == 0 { old_span - 1 } else { i - 1 };
+        let forward = |i: u64| if i + 1 == old_span { 0 } else { i + 1 };
+
+        let mut kept = 0;
+        let mut src = anchor;
+        while kept < keep && self.get(src).is_some() {
+            kept += 1;
+            src = back(src);
+        }
+        // The walk stopped one past the oldest one it kept.
+        src = forward(src);
+
+        let mut fresh = Array::new();
+        for dst in 0..kept {
+            let mut buf = [0u8; ELEMENT_MAX];
+            let el = self.get(src).expect("the walk stopped at the first hole");
+            fresh.set(dst, el.text(&mut buf))?;
+            src = forward(src);
+        }
+        fresh.insert = kept.checked_sub(1);
+        *self = fresh;
+        Ok(())
+    }
+
+    /// The last `count` positions from the cursor, which is `ARLASTITEMS`, and
+    /// answers how many that turned out to be.
+    ///
+    /// Positions and not elements, so a hole inside the window is reported as
+    /// one, and the walk wraps at the bottom of the array back to the top. `f`
+    /// is called oldest first, or newest first when `newest_first`.
+    pub fn last_items<F>(&self, count: u64, newest_first: bool, mut f: F) -> u64
+    where
+        F: FnMut(Option<Element<'_>>),
+    {
+        let steps = count.min(self.count);
+        if steps == 0 {
+            return 0;
+        }
+        let span = self.len();
+        // With no cursor the tail of the array is the anchor, which is what
+        // makes this answer something sensible for an array nobody has
+        // appended to. A cursor past the end of the array is left where it is
+        // rather than folded in, so the positions above the array read as the
+        // holes they are.
+        let anchor = self.insert.unwrap_or(span - 1);
+        // The backwards walk is at most two descending runs: from the anchor
+        // down towards zero, and then, if it ran out, from the top of the array
+        // downwards. Naming the two runs is what lets this answer in
+        // chronological order without collecting the positions first.
+        let near = steps.min(anchor + 1);
+        let wrapped = steps - near;
+        let near_lo = anchor - (near - 1);
+        let wrapped_lo = span - wrapped;
+
+        let mut emit = |i: u64| f(self.get(i));
+        if newest_first {
+            (near_lo..=anchor).rev().for_each(&mut emit);
+            (wrapped_lo..span).rev().for_each(&mut emit);
+        } else {
+            (wrapped_lo..span).for_each(&mut emit);
+            (near_lo..=anchor).for_each(&mut emit);
+        }
+        steps
+    }
+
+    /// Hands every populated index in `start..=end` to `f`, which is `ARSCAN`.
+    ///
+    /// Low to high, or high to low when the two ends come the other way round.
+    /// `f` answers whether to keep going, which is how `LIMIT` stops the walk
+    /// without the walk knowing what a limit is. Holes are skipped rather than
+    /// reported, which is the whole difference between this and `ARGETRANGE`,
+    /// and it is why this one needs no cap: the cost is the elements it finds
+    /// and the slices it has to look in, not the width of the range.
+    pub fn scan<F>(&self, start: u64, end: u64, mut f: F)
+    where
+        F: FnMut(u64, Element<'_>) -> bool,
+    {
+        let reverse = start > end;
+        let (lo, hi) = if reverse { (end, start) } else { (start, end) };
+        let (lo_id, lo_off) = split(lo);
+        let (hi_id, hi_off) = split(hi);
+        let first = match self.find(lo_id) {
+            Ok(at) | Err(at) => at,
+        };
+        let last = match self.find(hi_id) {
+            Ok(at) => at + 1,
+            Err(at) => at,
+        };
+
+        let mut visit = |at: usize| {
+            let (id, slice) = &self.slices[at];
+            let from = if *id == lo_id { lo_off } else { 0 };
+            let to = if *id == hi_id {
+                hi_off
+            } else {
+                (SLICE_SIZE - 1) as u16
+            };
+            let base = id * SLICE_SIZE;
+            slice.window(from, to, reverse, &mut |off, w| {
+                let el = self.decode(w).expect("a populated word decodes");
+                f(base + u64::from(off), el)
+            })
+        };
+        if reverse {
+            for at in (first..last).rev() {
+                if !visit(at) {
+                    return;
+                }
+            }
+        } else {
+            for at in first..last {
+                if !visit(at) {
+                    return;
+                }
+            }
+        }
     }
 
     /// What the array is holding on the heap, for `MEMORY USAGE`.
@@ -852,6 +1160,13 @@ pub const BLOB_TOO_LONG: &str = "array values exceed the four gigabyte per key l
 /// The message when one value on its own passes a gigabyte.
 pub const VALUE_TOO_LONG: &str = "array value exceeds the one gigabyte limit";
 
+/// What `ARINSERT` says when the cursor has nowhere left to go.
+///
+/// Redis's words. This is not the same error `ARSET` gives for the same
+/// underlying problem, which is Redis's doing and worth keeping: one of them is
+/// about an index the client named and the other is about a cursor it did not.
+pub const INSERT_OVERFLOW: &str = "insert index overflow";
+
 /// Splits an index into the slice that holds it and the offset inside.
 #[inline]
 const fn split(idx: u64) -> (u64, u16) {
@@ -918,6 +1233,38 @@ mod tests {
 
     fn set(a: &mut Array, idx: u64, val: &[u8]) -> bool {
         a.set(idx, val).expect("a value that fits")
+    }
+
+    /// Everything the scan finds, as index and bytes.
+    fn scan(a: &Array, start: u64, end: u64, limit: usize) -> Vec<(u64, Vec<u8>)> {
+        let mut got = Vec::new();
+        a.scan(start, end, |i, el| {
+            let mut buf = [0u8; ELEMENT_MAX];
+            got.push((i, el.text(&mut buf).to_vec()));
+            got.len() < limit
+        });
+        got
+    }
+
+    /// What `ARLASTITEMS` would reply, holes included.
+    fn last(a: &Array, count: u64, newest_first: bool) -> Vec<Option<Vec<u8>>> {
+        let mut got = Vec::new();
+        let n = a.last_items(count, newest_first, |el| {
+            got.push(el.map(|e| {
+                let mut buf = [0u8; ELEMENT_MAX];
+                e.text(&mut buf).to_vec()
+            }));
+        });
+        assert_eq!(n as usize, got.len(), "the count is what it emitted");
+        got
+    }
+
+    fn append(a: &mut Array, vals: &[&[u8]]) -> Result<u64> {
+        a.append(vals.iter().copied())
+    }
+
+    fn ring(a: &mut Array, size: u64, vals: &[&[u8]]) -> u64 {
+        a.ring(size, vals.iter().copied()).expect("values that fit")
     }
 
     #[test]
@@ -1301,5 +1648,206 @@ mod tests {
         for (&idx, val) in &want {
             assert_eq!(read(&a, idx).as_deref(), Some(&val[..]), "at {idx}");
         }
+    }
+
+    #[test]
+    fn a_scan_finds_the_elements_and_steps_over_the_holes() {
+        let mut a = Array::new();
+        set(&mut a, 0, b"a");
+        set(&mut a, 5, b"b");
+        // Three slices apart, so this also proves the walk moves between them.
+        set(&mut a, SLICE_SIZE * 2 + 7, b"c");
+
+        let all = vec![
+            (0, b"a".to_vec()),
+            (5, b"b".to_vec()),
+            (SLICE_SIZE * 2 + 7, b"c".to_vec()),
+        ];
+        // The whole index space costs three visits and not eighteen quintillion,
+        // which is why this one needs no cap where ARGETRANGE does.
+        assert_eq!(scan(&a, 0, INDEX_MAX, usize::MAX), all);
+        let mut backwards = all.clone();
+        backwards.reverse();
+        assert_eq!(scan(&a, INDEX_MAX, 0, usize::MAX), backwards);
+
+        // A window inside one slice, a window that lands on nothing, and a
+        // limit that stops the walk early.
+        assert_eq!(scan(&a, 1, 5, usize::MAX), all[1..2].to_vec());
+        assert_eq!(scan(&a, 6, SLICE_SIZE, usize::MAX), Vec::new());
+        assert_eq!(scan(&a, 0, INDEX_MAX, 2), all[..2].to_vec());
+        assert_eq!(scan(&Array::new(), 0, INDEX_MAX, usize::MAX), Vec::new());
+    }
+
+    /// A dense slice has holes inside its window and a sparse one does not, so
+    /// the walk has to be right in both layouts.
+    #[test]
+    fn a_scan_reads_both_layouts_the_same_way() {
+        let mut a = Array::new();
+        for i in 0..40u64 {
+            set(&mut a, i, format!("v{i}").as_bytes());
+        }
+        for i in (0..40u64).step_by(2) {
+            a.del(i);
+        }
+        let odd: Vec<(u64, Vec<u8>)> = (1..40u64)
+            .step_by(2)
+            .map(|i| (i, format!("v{i}").into_bytes()))
+            .collect();
+        assert_eq!(scan(&a, 0, 100, usize::MAX), odd);
+
+        // Now the same twenty elements spread far enough apart that the slice
+        // has to be sparse, and the answer is the same shape.
+        let mut b = Array::new();
+        for i in (1..40u64).step_by(2) {
+            set(&mut b, i, format!("v{i}").as_bytes());
+        }
+        assert_eq!(scan(&b, 0, 100, usize::MAX), odd);
+    }
+
+    #[test]
+    fn the_cursor_moves_only_when_something_appends_to_it() {
+        let mut a = Array::new();
+        assert_eq!(a.next_index(), Some(0));
+        // A plain write does not move it, which is why the first append lands on
+        // top of what ARSET put at zero.
+        set(&mut a, 0, b"set");
+        assert_eq!(a.next_index(), Some(0));
+        assert_eq!(append(&mut a, &[b"x", b"y"]).expect("room"), 1);
+        assert_eq!(read(&a, 0).as_deref(), Some(&b"x"[..]));
+        assert_eq!(a.next_index(), Some(2));
+
+        // A seek says where the next append goes, not where the cursor is.
+        a.seek(100);
+        assert_eq!(a.next_index(), Some(100));
+        assert_eq!(append(&mut a, &[b"z"]).expect("room"), 100);
+        assert_eq!(read(&a, 100).as_deref(), Some(&b"z"[..]));
+        a.seek(0);
+        assert_eq!(a.next_index(), Some(0));
+    }
+
+    #[test]
+    fn an_append_that_would_run_off_the_top_writes_nothing() {
+        let mut a = Array::new();
+        a.seek(INDEX_MAX - 1);
+        let e = append(&mut a, &[b"x", b"y", b"z"]).unwrap_err();
+        assert_eq!(e.code(), Code::Invalid);
+        assert_eq!(e.message(), INSERT_OVERFLOW);
+        assert_eq!(a.count(), 0, "and none of the batch landed");
+
+        // The last index is reachable, and the cursor is finished afterwards.
+        assert_eq!(append(&mut a, &[b"x", b"y"]).expect("room"), INDEX_MAX);
+        assert_eq!(a.next_index(), None);
+        assert_eq!(
+            append(&mut a, &[b"z"]).unwrap_err().message(),
+            INSERT_OVERFLOW
+        );
+    }
+
+    #[test]
+    fn a_ring_wraps_round_at_its_size() {
+        let mut a = Array::new();
+        assert_eq!(ring(&mut a, 3, &[b"a", b"b", b"c"]), 2);
+        assert_eq!(ring(&mut a, 3, &[b"d", b"e"]), 1);
+        assert_eq!(a.len(), 3, "it never grows past the size it was given");
+        assert_eq!(a.count(), 3);
+        assert_eq!(read(&a, 0).as_deref(), Some(&b"d"[..]));
+        assert_eq!(read(&a, 1).as_deref(), Some(&b"e"[..]));
+        assert_eq!(read(&a, 2).as_deref(), Some(&b"c"[..]));
+    }
+
+    /// A ring that changes size keeps the newest run and renumbers it, so that
+    /// reading it back in index order is still reading it in the order it
+    /// arrived.
+    #[test]
+    fn a_ring_that_changes_size_is_renumbered_oldest_first() {
+        let mut a = Array::new();
+        ring(&mut a, 3, &[b"a", b"b", b"c", b"d", b"e"]);
+        // Holding d e c at 0 1 2, so the newest three in order are c d e.
+        assert_eq!(ring(&mut a, 5, &[b"f"]), 3);
+        assert_eq!(
+            (0..4).map(|i| read(&a, i)).collect::<Vec<_>>(),
+            vec![
+                Some(b"c".to_vec()),
+                Some(b"d".to_vec()),
+                Some(b"e".to_vec()),
+                Some(b"f".to_vec())
+            ]
+        );
+
+        // And shrinking drops the oldest of them.
+        let mut b = Array::new();
+        ring(&mut b, 3, &[b"a", b"b", b"c", b"d", b"e"]);
+        assert_eq!(ring(&mut b, 2, &[b"f"]), 0);
+        assert_eq!(b.count(), 2);
+        assert_eq!(read(&b, 0).as_deref(), Some(&b"f"[..]));
+        assert_eq!(read(&b, 1).as_deref(), Some(&b"e"[..]));
+    }
+
+    /// The rebuild stops at the first hole, so a ring somebody has deleted out
+    /// of keeps its newest unbroken run rather than a scattering.
+    #[test]
+    fn a_hole_cuts_what_a_resize_keeps() {
+        let mut a = Array::new();
+        ring(&mut a, 4, &[b"a", b"b", b"c", b"d", b"e"]);
+        // Holding e b c d with the cursor on 0, and now c is gone.
+        a.del(2);
+        assert_eq!(ring(&mut a, 8, &[b"f"]), 2);
+        // The walk back from e reached the hole where c was, so b did not
+        // survive it and d and e did.
+        assert_eq!(
+            (0..3).map(|i| read(&a, i)).collect::<Vec<_>>(),
+            vec![
+                Some(b"d".to_vec()),
+                Some(b"e".to_vec()),
+                Some(b"f".to_vec())
+            ]
+        );
+    }
+
+    #[test]
+    fn the_last_items_walk_wraps_and_reports_the_holes() {
+        let mut a = Array::new();
+        ring(&mut a, 4, &[b"a", b"b", b"c", b"d", b"e"]);
+        // Holding e b c d, with the cursor on 0, so the newest is e and the
+        // walk has to wrap to find the three before it.
+        assert_eq!(
+            last(&a, 3, false),
+            vec![
+                Some(b"c".to_vec()),
+                Some(b"d".to_vec()),
+                Some(b"e".to_vec())
+            ]
+        );
+        assert_eq!(
+            last(&a, 3, true),
+            vec![
+                Some(b"e".to_vec()),
+                Some(b"d".to_vec()),
+                Some(b"c".to_vec())
+            ]
+        );
+        // More than there is gets everything and no more.
+        assert_eq!(last(&a, 99, false).len(), 4);
+        assert_eq!(last(&a, 0, false), Vec::new());
+        assert_eq!(last(&Array::new(), 5, false), Vec::new());
+
+        // With no cursor the tail of the array is the anchor, and a position
+        // inside the window that holds nothing is reported as a hole.
+        let mut b = Array::new();
+        set(&mut b, 0, b"a");
+        set(&mut b, 2, b"c");
+        assert_eq!(last(&b, 5, false), vec![None, Some(b"c".to_vec())]);
+    }
+
+    /// The cursor is part of the value, so a copy of an array is a copy of
+    /// where it was up to.
+    #[test]
+    fn a_copy_of_an_array_remembers_the_cursor() {
+        let mut a = Array::new();
+        append(&mut a, &[b"x", b"y"]).expect("room");
+        let mut b = a.clone();
+        assert_eq!(b.next_index(), Some(2));
+        assert_eq!(append(&mut b, &[b"z"]).expect("room"), 2);
+        assert_eq!(a.next_index(), Some(2), "and the two do not share it");
     }
 }

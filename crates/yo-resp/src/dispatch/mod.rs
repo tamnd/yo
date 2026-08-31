@@ -5223,8 +5223,172 @@ mod tests {
             &[b"ARCOUNT".as_ref(), b"s"][..],
             &[b"ARDEL".as_ref(), b"s", b"0"][..],
             &[b"ARDELRANGE".as_ref(), b"s", b"0", b"1"][..],
+            &[b"ARINSERT".as_ref(), b"s", b"x"][..],
+            &[b"ARRING".as_ref(), b"s", b"4", b"x"][..],
+            &[b"ARNEXT".as_ref(), b"s"][..],
+            &[b"ARSEEK".as_ref(), b"s", b"1"][..],
+            &[b"ARLASTITEMS".as_ref(), b"s", b"1"][..],
+            &[b"ARSCAN".as_ref(), b"s", b"0", b"1"][..],
         ] {
             assert_eq!(f.run(cmd), wrong, "{}", String::from_utf8_lossy(cmd[0]));
         }
+    }
+
+    /// Two of the array commands look the key up before they read the index and
+    /// the rest read the index first, so the same broken argument gets two
+    /// different errors depending on which command it went to.
+    #[test]
+    fn a_bad_index_reports_the_type_only_where_redis_reports_it() {
+        let mut f = Fixture::new();
+        f.run(&[b"SET", b"s", b"v"]);
+        let wrong = "-WRONGTYPE Operation against a key holding the wrong kind of value\r\n";
+        let bad = "-ERR invalid array index\r\n";
+        assert_eq!(f.run(&[b"ARGET", b"s", b"-1"]), wrong);
+        assert_eq!(f.run(&[b"ARMGET", b"s", b"0", b"-1"]), wrong);
+        assert_eq!(f.run(&[b"ARSET", b"s", b"-1", b"x"]), bad);
+        assert_eq!(f.run(&[b"ARDEL", b"s", b"-1"]), bad);
+        assert_eq!(f.run(&[b"ARSCAN", b"s", b"-1", b"0"]), bad);
+        // And on a key that is an array the index is just an index.
+        f.run(&[b"ARSET", b"a", b"0", b"x"]);
+        assert_eq!(f.run(&[b"ARGET", b"a", b"-1"]), bad);
+        assert_eq!(f.run(&[b"ARGET", b"nope", b"-1"]), bad);
+    }
+
+    #[test]
+    fn an_append_follows_a_cursor_the_client_can_move() {
+        let mut f = Fixture::new();
+        assert_eq!(f.run(&[b"ARNEXT", b"nope"]), ":0\r\n");
+        assert_eq!(f.run(&[b"ARINSERT", b"a", b"x", b"y"]), ":1\r\n");
+        assert_eq!(f.run(&[b"ARNEXT", b"a"]), ":2\r\n");
+        assert_eq!(f.run(&[b"ARINSERT", b"a", b"z"]), ":2\r\n");
+        assert_eq!(f.run(&[b"ARGET", b"a", b"2"]), "$1\r\nz\r\n");
+
+        // A seek says where the next one goes, and a missing key has no cursor
+        // to move and is not created by the asking.
+        assert_eq!(f.run(&[b"ARSEEK", b"nope", b"5"]), ":0\r\n");
+        assert_eq!(f.run(&[b"EXISTS", b"nope"]), ":0\r\n");
+        assert_eq!(f.run(&[b"ARSEEK", b"a", b"100"]), ":1\r\n");
+        assert_eq!(f.run(&[b"ARNEXT", b"a"]), ":100\r\n");
+        assert_eq!(f.run(&[b"ARINSERT", b"a", b"far"]), ":100\r\n");
+        assert_eq!(f.run(&[b"ARSEEK", b"a", b"0"]), ":1\r\n");
+        assert_eq!(f.run(&[b"ARNEXT", b"a"]), ":0\r\n");
+
+        // The top of the space is the one index only ARSEEK will take, and it
+        // leaves the cursor with nowhere to go.
+        assert_eq!(f.run(&[b"ARSEEK", b"a", b"18446744073709551615"]), ":1\r\n");
+        assert_eq!(f.run(&[b"ARNEXT", b"a"]), "$-1\r\n");
+        assert_eq!(
+            f.run(&[b"ARINSERT", b"a", b"x"]),
+            "-ERR insert index overflow\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"ARSET", b"a", b"18446744073709551615", b"x"]),
+            "-ERR invalid array index\r\n"
+        );
+    }
+
+    #[test]
+    fn a_ring_keeps_the_newest_and_renumbers_them_when_it_is_resized() {
+        let mut f = Fixture::new();
+        assert_eq!(f.run(&[b"ARRING", b"r", b"3", b"a", b"b", b"c"]), ":2\r\n");
+        assert_eq!(f.run(&[b"ARRING", b"r", b"3", b"d", b"e"]), ":1\r\n");
+        assert_eq!(f.run(&[b"ARLEN", b"r"]), ":3\r\n");
+        assert_eq!(
+            f.run(&[b"ARGETRANGE", b"r", b"0", b"2"]),
+            "*3\r\n$1\r\nd\r\n$1\r\ne\r\n$1\r\nc\r\n"
+        );
+        // Growing it after it has wrapped puts the survivors back in the order
+        // they arrived, which is the whole point of paying for the rebuild.
+        assert_eq!(f.run(&[b"ARRING", b"r", b"5", b"f"]), ":3\r\n");
+        assert_eq!(
+            f.run(&[b"ARGETRANGE", b"r", b"0", b"3"]),
+            "*4\r\n$1\r\nc\r\n$1\r\nd\r\n$1\r\ne\r\n$1\r\nf\r\n"
+        );
+        // The size is read before the key, so a bad one is a bad size wherever
+        // it is sent.
+        assert_eq!(
+            f.run(&[b"ARRING", b"r", b"0", b"x"]),
+            "-ERR size must be positive\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"ARRING", b"r", b"big", b"x"]),
+            "-ERR invalid size\r\n"
+        );
+    }
+
+    #[test]
+    fn the_last_items_walk_back_from_the_cursor_and_report_the_holes() {
+        let mut f = Fixture::new();
+        assert_eq!(f.run(&[b"ARLASTITEMS", b"nope", b"5"]), "*0\r\n");
+        f.run(&[b"ARRING", b"r", b"4", b"a", b"b", b"c", b"d", b"e"]);
+        assert_eq!(
+            f.run(&[b"ARLASTITEMS", b"r", b"3"]),
+            "*3\r\n$1\r\nc\r\n$1\r\nd\r\n$1\r\ne\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"ARLASTITEMS", b"r", b"3", b"rev"]),
+            "*3\r\n$1\r\ne\r\n$1\r\nd\r\n$1\r\nc\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"ARLASTITEMS", b"r", b"99"]),
+            "*4\r\n$1\r\nb\r\n$1\r\nc\r\n$1\r\nd\r\n$1\r\ne\r\n",
+            "more than there is gets what there is"
+        );
+        // Nothing asked for is an empty reply, and Redis answers that before it
+        // has read the option or looked at the key.
+        assert_eq!(f.run(&[b"ARLASTITEMS", b"r", b"0", b"junk"]), "*0\r\n");
+        assert_eq!(
+            f.run(&[b"ARLASTITEMS", b"r", b"1", b"junk"]),
+            "-ERR syntax error\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"ARLASTITEMS", b"r", b"nine"]),
+            "-ERR invalid COUNT\r\n"
+        );
+
+        // With no cursor the tail of the array is the anchor, and a hole inside
+        // the window is reported as one.
+        f.run(&[b"ARMSET", b"h", b"0", b"x", b"2", b"z"]);
+        assert_eq!(
+            f.run(&[b"ARLASTITEMS", b"h", b"5"]),
+            "*2\r\n$-1\r\n$1\r\nz\r\n"
+        );
+    }
+
+    #[test]
+    fn a_scan_answers_pairs_for_what_is_there_and_skips_what_is_not() {
+        let mut f = Fixture::new();
+        assert_eq!(f.run(&[b"ARSCAN", b"nope", b"0", b"10"]), "*0\r\n");
+        f.run(&[b"ARMSET", b"a", b"0", b"x", b"7", b"y", b"1000000", b"z"]);
+        // The whole index space, which ARGETRANGE refuses and this one answers
+        // in three visits because holes cost nothing.
+        assert_eq!(
+            f.run(&[b"ARSCAN", b"a", b"0", b"18446744073709551614"]),
+            "*3\r\n*2\r\n:0\r\n$1\r\nx\r\n*2\r\n:7\r\n$1\r\ny\r\n*2\r\n:1000000\r\n$1\r\nz\r\n"
+        );
+        assert_eq!(
+            f.run(&[
+                b"ARSCAN",
+                b"a",
+                b"18446744073709551614",
+                b"0",
+                b"LIMIT",
+                b"1"
+            ]),
+            "*1\r\n*2\r\n:1000000\r\n$1\r\nz\r\n"
+        );
+        assert_eq!(f.run(&[b"ARSCAN", b"a", b"1", b"6"]), "*0\r\n");
+        assert_eq!(
+            f.run(&[b"ARSCAN", b"a", b"0", b"10", b"LIMIT", b"0"]),
+            "-ERR LIMIT must be positive\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"ARSCAN", b"a", b"0", b"10", b"NOPE", b"1"]),
+            "-ERR syntax error\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"ARSCAN", b"a", b"0", b"10", b"LIMIT"]),
+            "-ERR wrong number of arguments for 'arscan' command\r\n"
+        );
     }
 }

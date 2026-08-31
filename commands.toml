@@ -1942,7 +1942,73 @@ plan = "point"
 bounded = "inherent"
 status = "shipped"
 wire = "verified"
-notes = "The cost is the elements it touches and not the span it was asked about, because a range that covers whole slices drops those slices whole. A range whose start is above its end deletes nothing rather than being read the other way round."
+notes = "The cost is the elements it touches and not the span it was asked about, because a range that covers whole slices drops those slices whole. A pair may come in either order and the two ends are sorted before the delete, which is not what ARGETRANGE does with a reversed pair."
+
+[[command]]
+name = "ARINSERT"
+group = "array"
+since = "8.8.0"
+arity = -3
+plan = "point"
+bounded = "inherent"
+status = "shipped"
+wire = "verified"
+notes = "Appends at the insert cursor, which starts at zero and is moved by nothing except ARINSERT, ARRING and ARSEEK. A batch that would run off the top of the index space is refused before any of it lands, so the array is never left half written."
+
+[[command]]
+name = "ARRING"
+group = "array"
+since = "8.8.0"
+arity = -4
+plan = "point"
+bounded = "inherent"
+status = "shipped"
+wire = "verified"
+notes = "A ring buffer built out of indices rather than out of a structure, so writes go to the cursor plus one modulo the size given. Changing the size between calls renumbers the run that survives so that reading it back in index order is still reading it in the order it arrived, and the rebuild stops at the first hole. The size is read before the key, so a bad size against a string is a bad size and not a wrong type."
+
+[[command]]
+name = "ARNEXT"
+group = "array"
+since = "8.8.0"
+arity = 2
+plan = "metadata"
+bounded = "inherent"
+status = "shipped"
+wire = "verified"
+notes = "Where the next append would go. Zero for a key that is not there and zero for a cursor nothing has moved yet, which are the same answer because they mean the same thing, and a null once the cursor has been parked at the top of the space and there is no honest index to name."
+
+[[command]]
+name = "ARSEEK"
+group = "array"
+since = "8.8.0"
+arity = 3
+plan = "metadata"
+bounded = "inherent"
+status = "shipped"
+wire = "verified"
+notes = "Points the cursor. A missing key answers zero and is not created, because an array with nothing in it is not a key here. This is the only array command that takes two to the sixty four minus one as an index, and it takes it because the log that rebuilds a database has to be able to say the terminal state."
+
+[[command]]
+name = "ARLASTITEMS"
+group = "array"
+since = "8.8.0"
+arity = -3
+plan = "cursor"
+bounded = "inherent"
+status = "shipped"
+wire = "verified"
+notes = "The newest positions walking back from the cursor, wrapping at the bottom of the array back to the top, oldest first unless REV. Positions and not elements, so a hole inside the window comes back as a null. A count of zero or less is an empty reply and Redis answers it before it has read the option or looked at the key, which is visible when both are wrong."
+
+[[command]]
+name = "ARSCAN"
+group = "array"
+since = "8.8.0"
+arity = -4
+plan = "cursor"
+bounded = "inherent"
+status = "shipped"
+wire = "verified"
+notes = "Index and value pairs for everything a range holds, holes skipped, reversed when the start is above the end. It needs none of the million position cap ARGETRANGE has because the cost is the elements found and the slices they sit in, not the width of the range, so a scan of the whole index space over a key holding three elements is three visits."
 
 
 # ------------------------------------------------------------------ scripting
