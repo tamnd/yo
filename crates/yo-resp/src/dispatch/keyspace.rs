@@ -17,20 +17,14 @@
 //! too without a line here changing.
 
 use super::args::{self, Args};
+use super::scan;
 use super::table::Spec;
 use crate::reply::Out;
 use yo_common::{Code, Error, Result, glob_matches};
-use yo_kv::{Applied, Ask, Cond, KeyCursor, Keyspace, Kind, MAX_AT, Moved};
+use yo_kv::{Applied, Ask, Cond, Keyspace, Kind, MAX_AT, Moved};
 
 /// Milliseconds in a second, which is the whole of what the p in `PTTL` means.
 const SECOND: i64 = 1000;
-
-/// What a cursor that is not a number gets, which is its own sentence and not
-/// the usual one about integers.
-const BAD_CURSOR: &str = "invalid cursor";
-
-/// The `COUNT` a `SCAN` uses when it is not given one, which is Redis's ten.
-const SCAN_COUNT: usize = 10;
 
 /// What `COPY` says for a `DB` that names a database this server does not have.
 ///
@@ -166,9 +160,9 @@ pub(super) fn execute(
 /// of each key it walks past, so a type nothing can hold matches nothing and
 /// the scan runs to the end answering nothing, which is what happens here.
 fn scan(db: &mut Keyspace, args: Args<'_>, out: &mut Out) -> Result<()> {
-    let cursor = parse_cursor(args.get(1))?;
+    let cursor = scan::parse_cursor(args.get(1))?;
     let mut pattern = None;
-    let mut count = SCAN_COUNT;
+    let mut count = scan::COUNT;
     let mut ty = None;
     let mut impossible = false;
     let mut i = 2;
@@ -194,26 +188,22 @@ fn scan(db: &mut Keyspace, args: Args<'_>, out: &mut Out) -> Result<()> {
         i += 2;
     }
 
-    // The same shape as `SSCAN`: the keys are written first because the walk is
-    // what produces the cursor, and the cursor is moved in front of them
-    // afterwards. Nothing goes out before the arguments have all been checked,
-    // which is what lets a failed command roll back cleanly.
-    out.array(2);
-    let at = out.len();
-    let mut n = 0;
-    let next = db.scan(cursor, count, ty, |key| {
-        if impossible || pattern.is_some_and(|p| !glob_matches(p, key)) {
-            return;
-        }
-        out.bulk(key);
-        n += 1;
-    });
-    out.close_array(at, n);
-    let listed = out.len() - at;
-    out.bulk_u64(next.raw());
-    let cursor = out.len() - at - listed;
-    out.hoist(at, cursor);
-    Ok(())
+    // The keys are written first because the walk is what produces the cursor,
+    // and the cursor is moved in front of them afterwards. Nothing goes out
+    // before the arguments have all been checked, which is what lets a failed
+    // command roll back cleanly. See [`scan::reply`], which is all of that and
+    // is shared with the three collection scans.
+    scan::reply(out, |out| {
+        let mut n = 0;
+        let next = db.scan(cursor, count, ty, |key| {
+            if impossible || pattern.is_some_and(|p| !glob_matches(p, key)) {
+                return;
+            }
+            out.bulk(key);
+            n += 1;
+        });
+        Ok((next, n))
+    })
 }
 
 /// `KEYS pattern`.
@@ -255,13 +245,6 @@ fn kind_named(arg: &[u8]) -> Option<Kind> {
 ///
 /// Unsigned, because ours uses the top bits and Redis parses a cursor with
 /// `strtoull` too.
-fn parse_cursor(arg: &[u8]) -> Result<KeyCursor> {
-    match std::str::from_utf8(arg).ok().and_then(|s| s.parse().ok()) {
-        Some(raw) => Ok(KeyCursor::from_raw(raw)),
-        None => Err(Error::new(Code::Invalid, BAD_CURSOR)),
-    }
-}
-
 /// `RENAME src dst` and `RENAMENX src dst`.
 ///
 /// Both answer an error for a source that is not there, which is unusual: every
