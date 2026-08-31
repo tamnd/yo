@@ -4044,6 +4044,291 @@ mod tests {
         );
     }
 
+    /// The three ways `ZRANGE` can be asked for a window, forwards and back.
+    ///
+    /// Every byte in here was read off a real 8.10.1 rather than worked out,
+    /// because the interesting part of this command is not what it selects, it
+    /// is which of the two ends the client is expected to name first.
+    #[test]
+    fn one_range_command_selects_by_rank_or_score_or_name() {
+        let mut f = Fixture::new();
+        f.run(&[b"ZADD", b"z", b"1", b"a", b"2", b"b", b"3", b"c"]);
+        assert_eq!(
+            f.run(&[b"ZRANGE", b"z", b"0", b"-1"]),
+            "*3\r\n$1\r\na\r\n$1\r\nb\r\n$1\r\nc\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"ZRANGE", b"z", b"-2", b"-1"]),
+            "*2\r\n$1\r\nb\r\n$1\r\nc\r\n"
+        );
+        assert_eq!(f.run(&[b"ZRANGE", b"z", b"5", b"9"]), "*0\r\n");
+        assert_eq!(f.run(&[b"ZRANGE", b"nokey", b"0", b"-1"]), "*0\r\n");
+        // REV over ranks reverses the walk and leaves the two arguments alone,
+        // because a rank counts from the end the walk starts at.
+        assert_eq!(
+            f.run(&[b"ZRANGE", b"z", b"0", b"-1", b"REV"]),
+            "*3\r\n$1\r\nc\r\n$1\r\nb\r\n$1\r\na\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"ZRANGE", b"z", b"(1", b"+inf", b"BYSCORE"]),
+            "*2\r\n$1\r\nb\r\n$1\r\nc\r\n"
+        );
+        // And REV over scores does swap them, since a bound does not count from
+        // anywhere. This is the one line of the parse that tells the two apart.
+        assert_eq!(
+            f.run(&[b"ZRANGE", b"z", b"+inf", b"(1", b"BYSCORE", b"REV"]),
+            "*2\r\n$1\r\nc\r\n$1\r\nb\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"ZRANGE", b"z", b"-", b"+", b"BYLEX"]),
+            "*3\r\n$1\r\na\r\n$1\r\nb\r\n$1\r\nc\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"ZRANGE", b"z", b"+", b"-", b"BYLEX", b"REV"]),
+            "*3\r\n$1\r\nc\r\n$1\r\nb\r\n$1\r\na\r\n"
+        );
+    }
+
+    /// The older spellings, which are the same six windows with the mode in the
+    /// name and the high end named first on the three that go backwards.
+    #[test]
+    fn the_older_range_spellings_name_their_high_end_first() {
+        let mut f = Fixture::new();
+        f.run(&[b"ZADD", b"z", b"1", b"a", b"2", b"b", b"3", b"c"]);
+        assert_eq!(
+            f.run(&[b"ZREVRANGE", b"z", b"0", b"-1"]),
+            "*3\r\n$1\r\nc\r\n$1\r\nb\r\n$1\r\na\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"ZREVRANGE", b"z", b"0", b"0", b"WITHSCORES"]),
+            "*2\r\n$1\r\nc\r\n$1\r\n3\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"ZRANGEBYSCORE", b"z", b"(1", b"3"]),
+            "*2\r\n$1\r\nb\r\n$1\r\nc\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"ZREVRANGEBYSCORE", b"z", b"3", b"(1"]),
+            "*2\r\n$1\r\nc\r\n$1\r\nb\r\n"
+        );
+        // The two arguments the wrong way round is an empty answer and not an
+        // error, which is what the swap being in the parse rather than in the
+        // window buys.
+        assert_eq!(f.run(&[b"ZREVRANGEBYSCORE", b"z", b"(1", b"3"]), "*0\r\n");
+        assert_eq!(
+            f.run(&[b"ZRANGEBYLEX", b"z", b"[a", b"(c"]),
+            "*2\r\n$1\r\na\r\n$1\r\nb\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"ZREVRANGEBYLEX", b"z", b"(c", b"[a"]),
+            "*2\r\n$1\r\nb\r\n$1\r\na\r\n"
+        );
+        // BYSCORE, BYLEX and REV mean nothing to these, so they are not another
+        // way of spelling the mode, they are a syntax error.
+        for cmd in [
+            &[b"ZREVRANGE".as_slice(), b"z", b"0", b"-1", b"BYSCORE"][..],
+            &[b"ZRANGEBYSCORE", b"z", b"1", b"3", b"REV"],
+            &[b"ZRANGEBYLEX", b"z", b"[a", b"[c", b"BYLEX"],
+        ] {
+            assert_eq!(f.run(cmd), "-ERR syntax error\r\n", "{:?}", cmd[0]);
+        }
+    }
+
+    /// `LIMIT` and `WITHSCORES`, which every one of these commands reads and
+    /// only some of them accept.
+    #[test]
+    fn limit_and_withscores_are_read_by_all_of_them_and_refused_afterwards() {
+        let mut f = Fixture::new();
+        f.run(&[b"ZADD", b"z", b"1", b"a", b"2", b"b", b"3", b"c"]);
+        assert_eq!(
+            f.run(&[
+                b"ZRANGE", b"z", b"-inf", b"+inf", b"BYSCORE", b"LIMIT", b"1", b"1"
+            ]),
+            "*1\r\n$1\r\nb\r\n"
+        );
+        // A negative offset skips past everything, a negative count is no bound.
+        assert_eq!(
+            f.run(&[
+                b"ZRANGE", b"z", b"-inf", b"+inf", b"BYSCORE", b"LIMIT", b"-1", b"2"
+            ]),
+            "*0\r\n"
+        );
+        assert_eq!(
+            f.run(&[
+                b"ZRANGE", b"z", b"-inf", b"+inf", b"BYSCORE", b"LIMIT", b"0", b"-1"
+            ]),
+            "*3\r\n$1\r\na\r\n$1\r\nb\r\n$1\r\nc\r\n"
+        );
+        // The two options in either order, which falls out of the parse loop.
+        let both = "*4\r\n$1\r\na\r\n$1\r\n1\r\n$1\r\nb\r\n$1\r\n2\r\n";
+        assert_eq!(
+            f.run(&[
+                b"ZRANGEBYSCORE",
+                b"z",
+                b"1",
+                b"3",
+                b"WITHSCORES",
+                b"LIMIT",
+                b"0",
+                b"2"
+            ]),
+            both
+        );
+        assert_eq!(
+            f.run(&[
+                b"ZRANGEBYSCORE",
+                b"z",
+                b"1",
+                b"3",
+                b"LIMIT",
+                b"0",
+                b"2",
+                b"WITHSCORES"
+            ]),
+            both
+        );
+        // LIMIT on a range by rank is refused after the whole option list has
+        // been read, so this complains about LIMIT and not about WITHSCORES.
+        let needs_by = "-ERR syntax error, LIMIT is only supported in combination with either BYSCORE or BYLEX\r\n";
+        assert_eq!(
+            f.run(&[
+                b"ZREVRANGE",
+                b"z",
+                b"0",
+                b"-1",
+                b"WITHSCORES",
+                b"LIMIT",
+                b"0",
+                b"1"
+            ]),
+            needs_by
+        );
+        assert_eq!(
+            f.run(&[b"ZRANGE", b"z", b"0", b"-1", b"LIMIT", b"0", b"1"]),
+            needs_by
+        );
+        let not_bylex = "-ERR syntax error, WITHSCORES not supported in combination with BYLEX\r\n";
+        assert_eq!(
+            f.run(&[b"ZRANGE", b"z", b"-", b"+", b"BYLEX", b"WITHSCORES"]),
+            not_bylex
+        );
+        assert_eq!(
+            f.run(&[b"ZRANGEBYLEX", b"z", b"[a", b"[c", b"WITHSCORES"]),
+            not_bylex
+        );
+        // Two modes at once, an option nobody knows, a LIMIT missing its count,
+        // and the three number errors, which are three different sentences.
+        for cmd in [
+            &[
+                b"ZRANGE".as_slice(),
+                b"z",
+                b"0",
+                b"-1",
+                b"BYSCORE",
+                b"BYLEX",
+            ][..],
+            &[b"ZRANGE", b"z", b"0", b"-1", b"junk"],
+            &[b"ZRANGEBYSCORE", b"z", b"1", b"3", b"LIMIT", b"0"],
+        ] {
+            assert_eq!(f.run(cmd), "-ERR syntax error\r\n", "{cmd:?}");
+        }
+        assert_eq!(
+            f.run(&[b"ZRANGEBYSCORE", b"z", b"bad", b"3"]),
+            "-ERR min or max is not a float\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"ZRANGEBYLEX", b"z", b"a", b"[c"]),
+            "-ERR min or max not valid string range item\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"ZRANGEBYSCORE", b"z", b"1", b"3", b"LIMIT", b"a", b"2"]),
+            "-ERR value is not an integer or out of range\r\n"
+        );
+    }
+
+    /// `WITHSCORES` is the one place in this group where the two protocols
+    /// disagree about the shape of the reply and not just the type of a value.
+    #[test]
+    fn withscores_nests_on_resp3_and_flattens_on_resp2() {
+        let mut f = Fixture::new();
+        f.run(&[b"ZADD", b"z", b"1", b"a", b"2", b"b", b"3", b"c"]);
+        assert_eq!(
+            f.run(&[b"ZRANGE", b"z", b"0", b"-1", b"WITHSCORES"]),
+            "*6\r\n$1\r\na\r\n$1\r\n1\r\n$1\r\nb\r\n$1\r\n2\r\n$1\r\nc\r\n$1\r\n3\r\n"
+        );
+        f.out = Out::new(Proto::Resp3);
+        assert_eq!(
+            f.run(&[b"ZRANGE", b"z", b"0", b"-1", b"WITHSCORES"]),
+            "*3\r\n*2\r\n$1\r\na\r\n,1\r\n*2\r\n$1\r\nb\r\n,2\r\n*2\r\n$1\r\nc\r\n,3\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"ZRANGE", b"z", b"0", b"-1"]),
+            "*3\r\n$1\r\na\r\n$1\r\nb\r\n$1\r\nc\r\n"
+        );
+    }
+
+    /// The store form, which is the same parse with the destination in front.
+    #[test]
+    fn a_range_store_writes_the_window_into_another_key() {
+        let mut f = Fixture::new();
+        f.run(&[b"ZADD", b"z", b"1", b"a", b"2", b"b", b"3", b"c"]);
+        assert_eq!(f.run(&[b"ZRANGESTORE", b"d", b"z", b"0", b"-1"]), ":3\r\n");
+        // A window that selects nothing deletes the destination rather than
+        // leaving an empty sorted set, because an empty one does not exist.
+        assert_eq!(f.run(&[b"ZRANGESTORE", b"d", b"z", b"5", b"9"]), ":0\r\n");
+        assert_eq!(f.run(&[b"EXISTS", b"d"]), ":0\r\n");
+        assert_eq!(
+            f.run(&[b"ZRANGESTORE", b"d", b"z", b"(1", b"+inf", b"BYSCORE"]),
+            ":2\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"ZRANGE", b"d", b"0", b"-1", b"WITHSCORES"]),
+            "*4\r\n$1\r\nb\r\n$1\r\n2\r\n$1\r\nc\r\n$1\r\n3\r\n"
+        );
+        // The destination is allowed to be the source, because the result is
+        // built whole before anything is written over.
+        assert_eq!(f.run(&[b"ZRANGESTORE", b"z", b"z", b"1", b"2"]), ":2\r\n");
+        assert_eq!(
+            f.run(&[b"ZRANGE", b"z", b"0", b"-1", b"WITHSCORES"]),
+            "*4\r\n$1\r\nb\r\n$1\r\n2\r\n$1\r\nc\r\n$1\r\n3\r\n"
+        );
+        // It takes every option ZRANGE takes except WITHSCORES, which is a
+        // plain syntax error here and not the sentence about BYLEX.
+        assert_eq!(
+            f.run(&[b"ZRANGESTORE", b"d", b"z", b"0", b"-1", b"WITHSCORES"]),
+            "-ERR syntax error\r\n"
+        );
+    }
+
+    /// The three removals, which are the read side's window with the walk
+    /// turned into a removal and no options at all.
+    #[test]
+    fn the_three_removals_share_their_window_with_the_reads() {
+        let mut f = Fixture::new();
+        f.run(&[b"ZADD", b"z", b"1", b"a", b"2", b"b", b"3", b"c"]);
+        assert_eq!(f.run(&[b"ZREMRANGEBYRANK", b"z", b"0", b"0"]), ":1\r\n");
+        assert_eq!(
+            f.run(&[b"ZRANGE", b"z", b"0", b"-1"]),
+            "*2\r\n$1\r\nb\r\n$1\r\nc\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"ZREMRANGEBYSCORE", b"z", b"(2", b"+inf"]),
+            ":1\r\n"
+        );
+        assert_eq!(f.run(&[b"ZRANGE", b"z", b"0", b"-1"]), "*1\r\n$1\r\nb\r\n");
+        // The last member going takes the key with it.
+        assert_eq!(f.run(&[b"ZREMRANGEBYLEX", b"z", b"-", b"+"]), ":1\r\n");
+        assert_eq!(f.run(&[b"EXISTS", b"z"]), ":0\r\n");
+        assert_eq!(
+            f.run(&[b"ZREMRANGEBYRANK", b"nokey", b"0", b"-1"]),
+            ":0\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"ZREMRANGEBYRANK", b"z", b"0", b"x"]),
+            "-ERR value is not an integer or out of range\r\n"
+        );
+    }
+
     #[test]
     fn every_sorted_set_command_says_wrongtype_and_writes_nothing() {
         let mut f = Fixture::new();
@@ -4060,6 +4345,16 @@ mod tests {
             &[b"ZREVRANK", b"s", b"a"],
             &[b"ZCOUNT", b"s", b"1", b"2"],
             &[b"ZLEXCOUNT", b"s", b"-", b"+"],
+            &[b"ZRANGE", b"s", b"0", b"-1"],
+            &[b"ZREVRANGE", b"s", b"0", b"-1"],
+            &[b"ZRANGEBYSCORE", b"s", b"1", b"2"],
+            &[b"ZREVRANGEBYSCORE", b"s", b"2", b"1"],
+            &[b"ZRANGEBYLEX", b"s", b"-", b"+"],
+            &[b"ZREVRANGEBYLEX", b"s", b"+", b"-"],
+            &[b"ZRANGESTORE", b"d", b"s", b"0", b"-1"],
+            &[b"ZREMRANGEBYRANK", b"s", b"0", b"-1"],
+            &[b"ZREMRANGEBYSCORE", b"s", b"1", b"2"],
+            &[b"ZREMRANGEBYLEX", b"s", b"-", b"+"],
         ] {
             assert_eq!(f.run(cmd), wrong, "{:?}", cmd[0]);
         }
