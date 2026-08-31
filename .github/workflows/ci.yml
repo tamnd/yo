@@ -57,6 +57,14 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets --all-features
+      # Would this tree publish. Not the real dry run, which builds every crate
+      # from its own tarball and costs minutes; this is the manifest half of it,
+      # which is where the failures actually are. A path dependency with no
+      # version, a missing description, a keyword crates.io will not take: all
+      # of those are refused here in about a second. Finding them at the tag
+      # instead means a version number that has been used and cannot be reused,
+      # so the fix is a release nobody wanted to cut.
+      - run: cargo package --workspace --no-verify --allow-dirty
       # A workflow file that does not parse produces a run with no jobs in it,
       # which reports as a failure with nothing to click on and no log. That is
       # the worst failure mode CI has, because the thing that broke is invisible

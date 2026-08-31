@@ -22,9 +22,23 @@ Put another way: a minor is only ever cut when a milestone is done, and everythi
 2. Bump `workspace.package.version` in the root `Cargo.toml`, and the `version` on every path dependency in `[workspace.dependencies]` with it, then run `cargo update --workspace` so `Cargo.lock` agrees. The release workflow refuses a tag whose version does not match the manifest, so a half-done bump fails before anything is published rather than after.
 3. Add the release's section to `CHANGELOG.md`. Write it for somebody who was not in the room: what changed, why it changed, and what it costs them. Numbers get their machine and their profile next to them or they do not go in.
 4. Merge the PR.
-5. Tag the merge commit `vX.Y.Z` and push the tag. The `release` workflow takes it from there: it re-runs the gate jobs against the tag, then publishes the GitHub release with the changelog section as its body.
+5. Tag the merge commit `vX.Y.Z` and push the tag. The `release` workflow takes it from there: it re-runs the gate jobs against the tag, publishes every crate to crates.io, and then publishes the GitHub release with the changelog section as its body.
 
 A tag is never moved and never deleted. If a release is wrong, the fix is the next patch.
+
+## crates.io
+
+The whole workspace goes up, not just `yodb`. crates.io has no way to publish a crate without publishing what it depends on, so the seventeen `yo-*` members are part of every release whether or not anybody is meant to depend on them directly. Only `xtask` stays out, because it is `publish = false`.
+
+The credential is `CARGO_REGISTRY_TOKEN` on the `crates.io` environment, scoped to publish-new and publish-update. It is on an environment and not in the repository secrets so that exactly one job can see it and so the audit log has somebody's name against each use. The environment's deployment policy allows `v*` tags and nothing else, so a branch cannot reach the token even if a workflow on that branch asks for it. That also means a manual `workflow_dispatch` re-run has to be started from the tag rather than from `main`, or the publish step will be refused before it starts.
+
+crates.io goes first and the GitHub release goes second. The release notes tell people to add a dependency, and a release that says so before the crate is there is a broken instruction for however long the gap lasts.
+
+Two things make a failure recoverable rather than terminal. The `ci` style job runs `cargo package --workspace --no-verify` on every pull request, which refuses a manifest crates.io would refuse, so the version number is never burned on a missing description. And the release job asks crates.io which crates are already up at this version and excludes them, so a run that dies on the ninth upload is fixed by re-running the job rather than by cutting another version. Eighteen uploads are not a transaction and pretending otherwise is how a half-published release becomes a permanent one.
+
+After the first release that claims the `yo-*` names, run `cargo xtask reserve audit` on `main` and commit the result. Those rows say `free` in `names.toml` until something is published under them, and the release cannot fix the file it was cut from. The workflow prints the reminder in its run summary.
+
+Trusted publishing is the thing to move to next. crates.io will take a GitHub Actions OIDC identity instead of a stored token, which removes the only long-lived credential in this repository, but it is configured per crate on crates.io and a crate has to exist before it can be configured. So the first release goes out on the token and the second one should not.
 
 ## Signing
 

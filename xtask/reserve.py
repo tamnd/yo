@@ -628,7 +628,12 @@ HEADER = """\
 #         unknown   the probe failed — never treated as free
 #
 # reserve = false means the row is audited but deliberately never published to
-# (dx/16 §11): port-PR channels, and names we refuse to squat.\
+# (dx/16 §11): port-PR channels, and names we refuse to squat.
+#
+# The seventeen `yo-*` rows on crates.io are not reservations. They are the
+# workspace members `yodb` is built out of, and crates.io has no way to publish
+# a crate without publishing everything it depends on, so the release workflow
+# claims them the first time it runs. They sit at `free` until it does.\
 """
 
 
@@ -1571,6 +1576,11 @@ def cmd_docs(args) -> int:
     known = {r.name for r in rows} | {r.namespace for r in rows if r.namespace}
     known |= {f"{r.namespace}/{r.name}" for r in rows if r.namespace}
     known |= {f"{r.namespace}:{r.name}" for r in rows if r.namespace}
+    # A fallback is a name too, and it is the one the document prints when the
+    # primary is blocked. Leaving it out made `tamnd87/yo` read as a name no row
+    # backed, when the row backing it is the Docker Hub row that has it as its
+    # fallback, which is exactly what the column is for.
+    known |= {r.fallback for r in rows if r.fallback}
     # Names in the table that no row backs. Anything that is not plausibly a
     # package name is skipped rather than guessed at: the column also carries
     # commands, paths and file extensions.
@@ -1608,6 +1618,10 @@ DOC_NOT_A_NAME = {
     "tamnd", "tamnd/tap/yodb", "tamnd.yodb", "yodb-bin", "com.tamnd:yodb",
     "github.com/tamnd/yo-go", "github.com/tamnd/yo-swift", "Yodb", "yo",
     "yo.tamnd.dev", "install.sh", "0.0.0",
+    # GHCR is addressed by the repository, so this is the `github:tamnd/yo` row
+    # written as a pull URL rather than a name of its own. Same reasoning as the
+    # two `github.com/` entries above it.
+    "ghcr.io/tamnd/yo",
 }
 
 
