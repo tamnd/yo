@@ -14,6 +14,11 @@
 #
 # reserve = false means the row is audited but deliberately never published to
 # (dx/16 §11): port-PR channels, and names we refuse to squat.
+#
+# The seventeen `yo-*` rows on crates.io are not reservations. They are the
+# workspace members `yodb` is built out of, and crates.io has no way to publish
+# a crate without publishing everything it depends on, so the release workflow
+# claims them the first time it runs. They sit at `free` until it does.
 
 [[name]]
 registry  = "crates.io"
@@ -44,6 +49,176 @@ probed    = "2026-08-29"
 owner     = "tamnd"
 fallback  = ""
 note      = "v0.0.1 owner=tamnd"
+
+[[name]]
+registry  = "crates.io"
+name      = "yo-alloc"
+namespace = ""
+state     = "free"
+probed    = "2026-08-31"
+owner     = ""
+fallback  = ""
+note      = "workspace member, published by the release workflow"
+
+[[name]]
+registry  = "crates.io"
+name      = "yo-arena"
+namespace = ""
+state     = "free"
+probed    = "2026-08-31"
+owner     = ""
+fallback  = ""
+note      = "workspace member, published by the release workflow"
+
+[[name]]
+registry  = "crates.io"
+name      = "yo-capi"
+namespace = ""
+state     = "free"
+probed    = "2026-08-31"
+owner     = ""
+fallback  = ""
+note      = "workspace member, published by the release workflow"
+
+[[name]]
+registry  = "crates.io"
+name      = "yo-cli"
+namespace = ""
+state     = "free"
+probed    = "2026-08-31"
+owner     = ""
+fallback  = ""
+note      = "workspace member, published by the release workflow"
+
+[[name]]
+registry  = "crates.io"
+name      = "yo-common"
+namespace = ""
+state     = "free"
+probed    = "2026-08-31"
+owner     = ""
+fallback  = ""
+note      = "workspace member, published by the release workflow"
+
+[[name]]
+registry  = "crates.io"
+name      = "yo-crash"
+namespace = ""
+state     = "free"
+probed    = "2026-08-31"
+owner     = ""
+fallback  = ""
+note      = "workspace member, published by the release workflow"
+
+[[name]]
+registry  = "crates.io"
+name      = "yo-file"
+namespace = ""
+state     = "free"
+probed    = "2026-08-31"
+owner     = ""
+fallback  = ""
+note      = "workspace member, published by the release workflow"
+
+[[name]]
+registry  = "crates.io"
+name      = "yo-format"
+namespace = ""
+state     = "free"
+probed    = "2026-08-31"
+owner     = ""
+fallback  = ""
+note      = "workspace member, published by the release workflow"
+
+[[name]]
+registry  = "crates.io"
+name      = "yo-index"
+namespace = ""
+state     = "free"
+probed    = "2026-08-31"
+owner     = ""
+fallback  = ""
+note      = "workspace member, published by the release workflow"
+
+[[name]]
+registry  = "crates.io"
+name      = "yo-kv"
+namespace = ""
+state     = "free"
+probed    = "2026-08-31"
+owner     = ""
+fallback  = ""
+note      = "workspace member, published by the release workflow"
+
+[[name]]
+registry  = "crates.io"
+name      = "yo-reactor"
+namespace = ""
+state     = "free"
+probed    = "2026-08-31"
+owner     = ""
+fallback  = ""
+note      = "workspace member, published by the release workflow"
+
+[[name]]
+registry  = "crates.io"
+name      = "yo-reader"
+namespace = ""
+state     = "free"
+probed    = "2026-08-31"
+owner     = ""
+fallback  = ""
+note      = "workspace member, published by the release workflow"
+
+[[name]]
+registry  = "crates.io"
+name      = "yo-record"
+namespace = ""
+state     = "free"
+probed    = "2026-08-31"
+owner     = ""
+fallback  = ""
+note      = "workspace member, published by the release workflow"
+
+[[name]]
+registry  = "crates.io"
+name      = "yo-resp"
+namespace = ""
+state     = "free"
+probed    = "2026-08-31"
+owner     = ""
+fallback  = ""
+note      = "workspace member, published by the release workflow"
+
+[[name]]
+registry  = "crates.io"
+name      = "yo-shape"
+namespace = ""
+state     = "free"
+probed    = "2026-08-31"
+owner     = ""
+fallback  = ""
+note      = "workspace member, published by the release workflow"
+
+[[name]]
+registry  = "crates.io"
+name      = "yo-shard"
+namespace = ""
+state     = "free"
+probed    = "2026-08-31"
+owner     = ""
+fallback  = ""
+note      = "workspace member, published by the release workflow"
+
+[[name]]
+registry  = "crates.io"
+name      = "yo-uring"
+namespace = ""
+state     = "free"
+probed    = "2026-08-31"
+owner     = ""
+fallback  = ""
+note      = "workspace member, published by the release workflow"
 
 [[name]]
 registry  = "pypi"
@@ -202,7 +377,7 @@ namespace = "tamnd"
 state     = "free"
 probed    = "2026-08-29"
 owner     = "tamnd"
-fallback  = ""
+fallback  = "tamnd87/yo"
 note      = ""
 
 [[name]]

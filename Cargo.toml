@@ -35,6 +35,14 @@ license = "MIT OR Apache-2.0"
 repository = "https://github.com/tamnd/yo"
 homepage = "https://yo.tamnd.dev"
 authors = ["tamnd <tamnd87@gmail.com>"]
+# The registry page for a crate nobody has heard of is the only thing most
+# people will read about it, and by default it is the description and nothing
+# else. These three fill it in, and they are inherited rather than repeated
+# because the same seventeen crates are all one project and a per-crate set of
+# keywords would be seventeen chances to say something slightly different.
+readme = "README.md"
+keywords = ["database", "redis", "embedded", "key-value", "storage"]
+categories = ["database-implementations", "data-structures", "caching"]
 
 [workspace.dependencies]
 yo-alloc = { path = "crates/yo-alloc", version = "0.3.4" }

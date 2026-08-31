@@ -16,8 +16,19 @@ env:
   CARGO_INCREMENTAL: 0
   RUSTFLAGS: -D warnings
 
+# Read by default and written by the one job that has to write. The publishing
+# credential is not a GitHub permission at all, it is the environment secret on
+# the `crates` job, so nothing here needs to be widened for it.
 permissions:
-  contents: write
+  contents: read
+
+# Two tags pushed close together would otherwise race each other through the
+# same publish, and the loser would be the one that finds the version already
+# uploaded. Not cancelled, because cancelling a run halfway through eighteen
+# uploads is the worst of both.
+concurrency:
+  group: release-${{ inputs.tag || github.ref }}
+  cancel-in-progress: false
 
 jobs:
   # The tag, the version in Cargo.toml and the changelog have to agree before
@@ -76,9 +87,94 @@ jobs:
     needs: check
     uses: ./.github/workflows/names.yml
 
-  publish:
+  # crates.io, before the GitHub release rather than after it. The release notes
+  # tell people to add a dependency, and a release that says so while the crate
+  # is not there yet is a broken instruction for however long the gap lasts.
+  #
+  # Everything in the workspace goes up, not just `yodb`. crates.io has no way
+  # to publish a crate without publishing what it depends on, so the seventeen
+  # members are part of the release whether or not anyone is meant to depend on
+  # them directly. `dx/12` §2 has the row saying so. `xtask` is `publish = false`
+  # and stays out on its own.
+  crates:
     needs: [check, verify, names]
     runs-on: ubuntu-latest
+    timeout-minutes: 30
+    # The token lives on an environment and not loose in the repository secrets,
+    # so it is reachable from this job and from nothing else, and so the review
+    # rules and the audit log are the environment's rather than being absent.
+    environment: crates.io
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2.9.2
+        with:
+          save-if: false
+
+      # What is already up there at this version. A publish is not a transaction
+      # across eighteen crates: if the ninth upload fails on a network blip the
+      # first eight are permanent, and re-running the job would then die on
+      # "crate version already uploaded" without saying which one it meant. So
+      # ask first and exclude what is done, which makes re-running the job the
+      # fix for a partial release rather than a second failure.
+      - name: What is already published
+        id: done
+        run: |
+          v="${{ needs.check.outputs.version }}"
+          all=$(cargo metadata --no-deps --format-version 1 \
+            | jq -r '.packages[] | select(.publish != []) | .name')
+          exclude=""
+          n=0
+          left=0
+          for p in $all; do
+            n=$((n + 1))
+            code=$(curl -sS -o /dev/null -w '%{http_code}' \
+              -H 'user-agent: yo release workflow (https://github.com/tamnd/yo)' \
+              "https://crates.io/api/v1/crates/$p/$v")
+            case "$code" in
+              200) echo "$p $v is already up"; exclude="$exclude --exclude $p" ;;
+              404) left=$((left + 1)) ;;
+              *) echo "crates.io answered $code for $p, not guessing" >&2; exit 1 ;;
+            esac
+          done
+          echo "$left of $n still to publish"
+          echo "left=$left" >> "$GITHUB_OUTPUT"
+          echo "exclude=$exclude" >> "$GITHUB_OUTPUT"
+
+      # The real dry run, which packages each crate and builds it from its own
+      # tarball. It catches the file that was never committed and only compiles
+      # because it is sitting in the working tree, which the manifest check in
+      # `ci` cannot see. Slow, and worth it exactly once per release.
+      - name: Would it publish
+        if: steps.done.outputs.left != '0'
+        run: cargo publish --workspace --locked --dry-run ${{ steps.done.outputs.exclude }}
+
+      - name: Publish
+        if: steps.done.outputs.left != '0'
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: cargo publish --workspace --locked --no-verify ${{ steps.done.outputs.exclude }}
+
+      # `names.toml` says `free` for a name until something is published under
+      # it, and after this job seventeen of those rows are wrong. Nothing here
+      # can fix them, because the file lives in the commit the tag points at and
+      # a release does not push. So say it, in the summary, where whoever cut the
+      # release will read it.
+      - name: Remind
+        if: steps.done.outputs.left != '0'
+        run: |
+          echo "Run \`cargo xtask reserve audit\` on main and commit the result." \
+            >> "$GITHUB_STEP_SUMMARY"
+          echo "The \`yo-*\` rows in names.toml still say \`free\` and are now \`released\`." \
+            >> "$GITHUB_STEP_SUMMARY"
+
+  publish:
+    needs: [check, verify, names, crates]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v7.0.1
         with:
