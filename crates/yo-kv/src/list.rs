@@ -1408,6 +1408,68 @@ mod tests {
         assert!(held < 300 * 66 * 3, "{held} is three times the elements");
     }
 
+    /// What a list element costs on top of the bytes it holds.
+    ///
+    /// M4's exit gate asks for one byte or less per element and this is the
+    /// number that says whether that is where we are. Printed rather than
+    /// asserted, because the point is the breakdown and not a threshold. The
+    /// guard below is the part that runs every time.
+    ///
+    /// Three element lengths, because the answer is a fixed cost per element
+    /// plus a fixed cost per chunk, and one length cannot tell those apart.
+    #[test]
+    #[ignore = "a measurement, run it by name"]
+    fn measure_bytes_per_element() {
+        let limits = Limits::default();
+        for len in [8usize, 16, 64] {
+            for n in [128usize, 10_000, 1_000_000] {
+                let (l, payload) = weighed(n, len, &limits);
+                let total = l.memory_bytes();
+                println!(
+                    "n={n:<9} elem={len:<4} band={:<9} total={total:<11} payload={payload:<11} over_per_element={:.2}",
+                    l.encoding().name(),
+                    (total as f64 - payload as f64) / n as f64
+                );
+            }
+        }
+    }
+
+    /// A list of `n` elements of `len` bytes each, and what those bytes come to.
+    fn weighed(n: usize, len: usize, limits: &Limits) -> (List, usize) {
+        let mut l = List::new();
+        let mut payload = 0usize;
+        for i in 0..n {
+            // A letter in front so that the element is stored as a string. A
+            // listpack stores something that parses as an integer as one, which
+            // would be measuring the integer encoding rather than the ring.
+            let v = format!("e{i:0>w$}", w = len - 1);
+            debug_assert_eq!(v.len(), len);
+            payload += v.len();
+            l.push_back(v.as_bytes(), limits);
+        }
+        (l, payload)
+    }
+
+    /// The guard for the measurement above, at a size that runs every time.
+    ///
+    /// The threshold is loose on purpose: what it is here to catch is a chunk
+    /// that stopped giving its spare room back when it was sealed, or a ring
+    /// that started holding something per element, and either of those is a
+    /// multiple rather than a few percent.
+    #[test]
+    fn a_long_list_does_not_hold_much_more_than_it_stores() {
+        let limits = Limits::default();
+        let n = 100_000;
+        let (l, payload) = weighed(n, 16, &limits);
+        assert_eq!(l.encoding(), Encoding::Quicklist);
+        let total = l.memory_bytes();
+        assert!(
+            total < payload + n * 4,
+            "{total} bytes for {payload} of elements, which is {:.2} an element over",
+            (total as f64 - payload as f64) / n as f64
+        );
+    }
+
     /// An element bigger than a whole chunk gets a chunk of its own, which is
     /// what Redis calls a plain node. Without it the list would count an element
     /// that a chunk sized for something else had refused.
