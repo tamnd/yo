@@ -190,6 +190,52 @@ use crate::intset::Walk;
 use crate::set::{Limits, Needle, Set};
 use crate::{Elements, Intset};
 
+/// The tables a set operation fills in on its way to an answer.
+///
+/// A union walks everything into one table and lets the table be the duplicate
+/// check. An accumulating intersection counts into one. Both of those used to
+/// be built per call, which is a hash table out of the allocator on a command
+/// path, and it is the thing the text rows of the benchmark were mostly
+/// spending their time on.
+///
+/// So the tables belong to the caller now. A database keeps one of these and
+/// hands it in, the tables are cleared rather than dropped between calls, and a
+/// `SUNION` over sets no larger than the last one pays the allocator nothing at
+/// all. The memory that costs is one table as big as the largest union the
+/// database has been asked for, which is smaller than the answer it already had
+/// to build.
+///
+/// `setops_small`'s `union/text/k2` row, nanoseconds per operation over two
+/// text sets of eight members, went from 368.54 to 248.18 when the table
+/// stopped being built per call. That is 1.48 times on a command shaped like
+/// the ones people actually send. The integer rows do not move at all, because
+/// those take the merge plan and never build a table in the first place, which
+/// is the same split the `Small` work saw from the other side.
+///
+/// It is [`Default`], so a caller that does not care can pass
+/// `&mut Scratch::default()` and get exactly the old behaviour.
+#[derive(Debug, Default)]
+pub struct Scratch {
+    /// Where a union puts the members it has already emitted.
+    seen: Elements<()>,
+    /// Where an accumulating intersection counts how many sets have a member.
+    counts: Elements<u32>,
+}
+
+impl Scratch {
+    /// Empty tables that have not asked the allocator for anything yet.
+    #[must_use]
+    pub fn new() -> Scratch {
+        Scratch::default()
+    }
+
+    /// What the tables are holding on to, for `MEMORY USAGE` and for tests.
+    #[must_use]
+    pub fn memory_bytes(&self) -> usize {
+        self.seen.memory_bytes() + self.counts.memory_bytes()
+    }
+}
+
 /// How to answer a set operation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Plan {
@@ -216,11 +262,11 @@ pub enum Plan {
 ///
 /// A merge when every operand is an intset and a probe otherwise, which is a
 /// chooser with something to choose. See `plan_for`.
-pub fn inter<F>(sets: &[&Set], limit: usize, f: F) -> usize
+pub fn inter<F>(scratch: &mut Scratch, sets: &[&Set], limit: usize, f: F) -> usize
 where
     F: FnMut(&[u8]),
 {
-    inter_with(plan_for(sets), sets, limit, f)
+    inter_with(scratch, plan_for(sets), sets, limit, f)
 }
 
 /// Which plan the operands allow and deserve.
@@ -268,7 +314,7 @@ fn as_ints<'a>(sets: &[&'a Set]) -> Option<PerSet<&'a Intset>> {
 /// [`Plan::Merge`] falls back to a probe when the operands are not all intsets,
 /// because a caller asking for it has stated a preference and not a fact, and
 /// the fact wins.
-pub fn inter_with<F>(how: Plan, sets: &[&Set], limit: usize, f: F) -> usize
+pub fn inter_with<F>(scratch: &mut Scratch, how: Plan, sets: &[&Set], limit: usize, f: F) -> usize
 where
     F: FnMut(&[u8]),
 {
@@ -281,7 +327,7 @@ where
             None => inter_probe(sets, limit, f),
         },
         Plan::Probe => inter_probe(sets, limit, f),
-        Plan::Accumulate => inter_accumulate(sets, limit, f),
+        Plan::Accumulate => inter_accumulate(&mut scratch.counts, sets, limit, f),
     }
 }
 
@@ -391,7 +437,7 @@ where
 /// raises it, so a member with the full count is in all of them. Members that
 /// are not in the first set are never entered at all, which keeps the table no
 /// bigger than the first set and is why the first set is the smallest one.
-fn inter_accumulate<F>(sets: &[&Set], limit: usize, mut f: F) -> usize
+fn inter_accumulate<F>(seen: &mut Elements<u32>, sets: &[&Set], limit: usize, mut f: F) -> usize
 where
     F: FnMut(&[u8]),
 {
@@ -400,7 +446,8 @@ where
     let (&first, rest) = order.split_first().expect("not empty");
 
     let mut digits = [0u8; DIGITS_MAX];
-    let mut seen = Elements::<u32>::with_capacity(sets[first].len());
+    seen.clear();
+    seen.reserve(sets[first].len());
     for m in sets[first].iter() {
         seen.insert(text(m, &mut digits), 1)
             .expect("no larger than its source");
@@ -456,11 +503,11 @@ fn text<'a>(m: crate::set::Member<'a>, digits: &'a mut [u8; DIGITS_MAX]) -> &'a 
 /// visible from outside. The table walks the sets in turn, so it answers in the
 /// order each set holds its members, and the merge answers in ascending order
 /// across all of them. Redis promises neither.
-pub fn union<F>(sets: &[&Set], f: F) -> usize
+pub fn union<F>(scratch: &mut Scratch, sets: &[&Set], f: F) -> usize
 where
     F: FnMut(&[u8]),
 {
-    union_with(plan_for(sets), sets, f)
+    union_with(scratch, plan_for(sets), sets, f)
 }
 
 /// The same, with the plan named rather than assumed.
@@ -471,13 +518,13 @@ where
 ///
 /// There are only two plans here, so anything that is not [`Plan::Merge`] is the
 /// table, and a merge asked for over operands that cannot merge is the table too.
-pub fn union_with<F>(how: Plan, sets: &[&Set], f: F) -> usize
+pub fn union_with<F>(scratch: &mut Scratch, how: Plan, sets: &[&Set], f: F) -> usize
 where
     F: FnMut(&[u8]),
 {
     match (how, as_ints(sets)) {
         (Plan::Merge, Some(ints)) if !ints.is_empty() => union_merge(&ints, f),
-        _ => union_table(sets, f),
+        _ => union_table(&mut scratch.seen, sets, f),
     }
 }
 
@@ -511,7 +558,7 @@ where
 }
 
 /// Walk everything into one table, where the table is the duplicate check.
-fn union_table<F>(sets: &[&Set], mut f: F) -> usize
+fn union_table<F>(seen: &mut Elements<()>, sets: &[&Set], mut f: F) -> usize
 where
     F: FnMut(&[u8]),
 {
@@ -519,7 +566,8 @@ where
     // the cheap half of that bound without pretending to know the overlap.
     let biggest = sets.iter().map(|s| s.len()).max().unwrap_or(0);
     let mut digits = [0u8; DIGITS_MAX];
-    let mut seen = Elements::<()>::with_capacity(biggest);
+    seen.clear();
+    seen.reserve(biggest);
     let mut found = 0usize;
     for s in sets {
         for m in s.iter() {
@@ -740,23 +788,35 @@ mod tests {
         let a = set(&["a", "b", "c", "d"]);
         let b = set(&["b", "c", "d", "e"]);
         let c = set(&["c", "d", "e", "f"]);
-        let got = run(|f| inter(&[&a, &b, &c], 0, f));
+        let got = run(|f| inter(&mut Scratch::new(), &[&a, &b, &c], 0, f));
         assert_eq!(got, vec!["c", "d"]);
     }
 
     #[test]
     fn an_intersection_of_one_set_is_that_set() {
         let a = set(&["x", "y"]);
-        assert_eq!(run(|f| inter(&[&a], 0, f)), vec!["x", "y"]);
+        assert_eq!(
+            run(|f| inter(&mut Scratch::new(), &[&a], 0, f)),
+            vec!["x", "y"]
+        );
     }
 
     #[test]
     fn an_empty_set_anywhere_empties_the_intersection() {
         let a = set(&["a", "b"]);
         let empty = set(&[]);
-        assert_eq!(run(|f| inter(&[&a, &empty], 0, f)), Vec::<String>::new());
-        assert_eq!(run(|f| inter(&[&empty, &a], 0, f)), Vec::<String>::new());
-        assert_eq!(run(|f| inter(&[], 0, f)), Vec::<String>::new());
+        assert_eq!(
+            run(|f| inter(&mut Scratch::new(), &[&a, &empty], 0, f)),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            run(|f| inter(&mut Scratch::new(), &[&empty, &a], 0, f)),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            run(|f| inter(&mut Scratch::new(), &[], 0, f)),
+            Vec::<String>::new()
+        );
     }
 
     /// `SINTERCARD` stops as soon as it has enough, and stopping early must not
@@ -765,9 +825,19 @@ mod tests {
     fn a_limit_stops_the_intersection_early() {
         let a = set(&["a", "b", "c", "d", "e"]);
         let b = set(&["a", "b", "c", "d", "e"]);
-        assert_eq!(run(|f| inter(&[&a, &b], 2, f)), vec!["a", "b"]);
-        assert_eq!(run(|f| inter(&[&a, &b], 99, f)).len(), 5);
-        assert_eq!(run(|f| inter(&[&a, &b], 0, f)).len(), 5, "zero is no limit");
+        assert_eq!(
+            run(|f| inter(&mut Scratch::new(), &[&a, &b], 2, f)),
+            vec!["a", "b"]
+        );
+        assert_eq!(
+            run(|f| inter(&mut Scratch::new(), &[&a, &b], 99, f)).len(),
+            5
+        );
+        assert_eq!(
+            run(|f| inter(&mut Scratch::new(), &[&a, &b], 0, f)).len(),
+            5,
+            "zero is no limit"
+        );
     }
 
     /// The two plans are two ways to compute the same thing, so they have to
@@ -786,12 +856,12 @@ mod tests {
             .collect();
         let refs: Vec<&Set> = sets.iter().collect();
 
-        let probed = run(|f| inter_with(Plan::Probe, &refs, 0, f));
-        let piled = run(|f| inter_with(Plan::Accumulate, &refs, 0, f));
+        let probed = run(|f| inter_with(&mut Scratch::new(), Plan::Probe, &refs, 0, f));
+        let piled = run(|f| inter_with(&mut Scratch::new(), Plan::Accumulate, &refs, 0, f));
         assert_eq!(probed, piled);
         assert!(!probed.is_empty(), "the fixture should overlap");
         assert_eq!(
-            run(|f| inter(&refs, 0, f)),
+            run(|f| inter(&mut Scratch::new(), &refs, 0, f)),
             probed,
             "and so does the chooser"
         );
@@ -802,8 +872,14 @@ mod tests {
         let a = set(&["a", "b"]);
         let b = set(&["b", "c"]);
         let c = set(&["c", "d"]);
-        assert_eq!(run(|f| union(&[&a, &b, &c], f)), vec!["a", "b", "c", "d"]);
-        assert_eq!(run(|f| union(&[], f)), Vec::<String>::new());
+        assert_eq!(
+            run(|f| union(&mut Scratch::new(), &[&a, &b, &c], f)),
+            vec!["a", "b", "c", "d"]
+        );
+        assert_eq!(
+            run(|f| union(&mut Scratch::new(), &[], f)),
+            Vec::<String>::new()
+        );
     }
 
     #[test]
@@ -827,10 +903,13 @@ mod tests {
         let sets: Vec<Set> = (0..10).map(|_| set(&names)).collect();
         let refs: Vec<&Set> = sets.iter().collect();
 
-        let probed = run(|f| inter_with(Plan::Probe, &refs, 0, f));
+        let probed = run(|f| inter_with(&mut Scratch::new(), Plan::Probe, &refs, 0, f));
         assert_eq!(probed, members, "everything is in all ten");
-        assert_eq!(run(|f| inter_with(Plan::Accumulate, &refs, 0, f)), probed);
-        assert_eq!(run(|f| inter(&refs, 0, f)), probed);
+        assert_eq!(
+            run(|f| inter_with(&mut Scratch::new(), Plan::Accumulate, &refs, 0, f)),
+            probed
+        );
+        assert_eq!(run(|f| inter(&mut Scratch::new(), &refs, 0, f)), probed);
     }
 
     #[test]
@@ -838,7 +917,7 @@ mod tests {
         let a = set(&["a", "b", "c"]);
         let b = set(&["b", "c", "d"]);
         let out = collect(a.len().min(b.len()), &Limits::DEFAULT, |f| {
-            inter(&[&a, &b], 0, f);
+            inter(&mut Scratch::new(), &[&a, &b], 0, f);
         })
         .expect("two members is a set");
         assert_eq!(out.len(), 2);
@@ -855,7 +934,7 @@ mod tests {
         let b = set(&["b"]);
         assert!(
             collect(1, &Limits::DEFAULT, |f| {
-                inter(&[&a, &b], 0, f);
+                inter(&mut Scratch::new(), &[&a, &b], 0, f);
             })
             .is_none()
         );
@@ -869,7 +948,7 @@ mod tests {
         let b = set(&["2", "3", "4"]);
         assert_eq!(a.encoding(), Encoding::Intset);
         let out = collect(3, &Limits::DEFAULT, |f| {
-            inter(&[&a, &b], 0, f);
+            inter(&mut Scratch::new(), &[&a, &b], 0, f);
         })
         .expect("two members");
         assert_eq!(out.encoding(), Encoding::Intset);
@@ -879,7 +958,7 @@ mod tests {
         // is not a number is all it takes.
         let c = set(&["x"]);
         let out = collect(4, &Limits::DEFAULT, |f| {
-            union(&[&a, &c], f);
+            union(&mut Scratch::new(), &[&a, &c], f);
         })
         .expect("four members");
         assert_ne!(out.encoding(), Encoding::Intset);
@@ -905,11 +984,11 @@ mod tests {
             for (rn, right) in bands {
                 let a = left(&names);
                 let b = right(&others);
-                let mut got = run(|f| inter(&[&a, &b], 0, f));
+                let mut got = run(|f| inter(&mut Scratch::new(), &[&a, &b], 0, f));
                 got.sort();
                 assert_eq!(got, ["3", "4"], "{ln} against {rn}");
 
-                let mut got = run(|f| union(&[&a, &b], f));
+                let mut got = run(|f| union(&mut Scratch::new(), &[&a, &b], f));
                 got.sort();
                 assert_eq!(got, ["1", "2", "3", "4", "5", "6"], "{ln} with {rn}");
 
@@ -927,11 +1006,14 @@ mod tests {
     fn a_number_and_its_untidy_spelling_stay_two_members() {
         let a = banded(&["42", "042", "-0"], &AS_LISTPACK);
         let b = banded(&["42"], &AS_INTSET);
-        assert_eq!(run(|f| inter(&[&a, &b], 0, f)), vec!["42"]);
+        assert_eq!(
+            run(|f| inter(&mut Scratch::new(), &[&a, &b], 0, f)),
+            vec!["42"]
+        );
         let mut got = run(|f| diff(&[&a, &b], f));
         got.sort();
         assert_eq!(got, ["-0", "042"]);
-        let mut got = run(|f| union(&[&a, &b], f));
+        let mut got = run(|f| union(&mut Scratch::new(), &[&a, &b], f));
         got.sort();
         assert_eq!(
             got,
@@ -1004,10 +1086,14 @@ mod tests {
             let refs: Vec<&Set> = sets.iter().collect();
             assert_eq!(plan_for(&refs), Plan::Merge, "{what}");
 
-            let probed = run(|f| inter_with(Plan::Probe, &refs, 0, f));
-            assert_eq!(run(|f| inter(&refs, 0, f)), probed, "intersect {what}");
+            let probed = run(|f| inter_with(&mut Scratch::new(), Plan::Probe, &refs, 0, f));
             assert_eq!(
-                run(|f| inter_with(Plan::Accumulate, &refs, 0, f)),
+                run(|f| inter(&mut Scratch::new(), &refs, 0, f)),
+                probed,
+                "intersect {what}"
+            );
+            assert_eq!(
+                run(|f| inter_with(&mut Scratch::new(), Plan::Accumulate, &refs, 0, f)),
                 probed,
                 "and the count agrees, {what}"
             );
@@ -1023,7 +1109,7 @@ mod tests {
             let mut piled: Vec<String> = union_the_slow_way(&vals);
             piled.sort();
             for how in [Plan::Merge, Plan::Probe] {
-                let mut got = run(|f| union_with(how, &refs, f));
+                let mut got = run(|f| union_with(&mut Scratch::new(), how, &refs, f));
                 got.sort();
                 assert_eq!(got, piled, "union {what} by {how:?}");
             }
@@ -1059,9 +1145,12 @@ mod tests {
     fn a_merged_intersection_is_ascending_and_so_was_the_probe() {
         let a = ints(&[900, 5, 40, 7, 1000, 3]);
         let b = ints(&[1000, 3, 900, 8, 5]);
-        let got = run(|f| inter(&[&a, &b], 0, f));
+        let got = run(|f| inter(&mut Scratch::new(), &[&a, &b], 0, f));
         assert_eq!(got, vec!["3", "5", "900", "1000"]);
-        assert_eq!(run(|f| inter_with(Plan::Probe, &[&a, &b], 0, f)), got);
+        assert_eq!(
+            run(|f| inter_with(&mut Scratch::new(), Plan::Probe, &[&a, &b], 0, f)),
+            got
+        );
     }
 
     /// `SINTERCARD` stops early on the merge too, and stopping early does not
@@ -1072,9 +1161,18 @@ mod tests {
         let a = ints(&vals);
         let b = ints(&vals);
         assert_eq!(plan_for(&[&a, &b]), Plan::Merge);
-        assert_eq!(run(|f| inter(&[&a, &b], 3, f)), vec!["0", "1", "2"]);
-        assert_eq!(run(|f| inter(&[&a, &b], 0, f)).len(), 2_000);
-        assert_eq!(run(|f| inter(&[&a], 3, f)), vec!["0", "1", "2"]);
+        assert_eq!(
+            run(|f| inter(&mut Scratch::new(), &[&a, &b], 3, f)),
+            vec!["0", "1", "2"]
+        );
+        assert_eq!(
+            run(|f| inter(&mut Scratch::new(), &[&a, &b], 0, f)).len(),
+            2_000
+        );
+        assert_eq!(
+            run(|f| inter(&mut Scratch::new(), &[&a], 3, f)),
+            vec!["0", "1", "2"]
+        );
     }
 
     /// One set that is not an intset takes the whole operation back to a probe,
@@ -1084,11 +1182,14 @@ mod tests {
         let a = ints(&[1, 2, 3]);
         let b = tabled(&["2", "3", "4"]);
         assert_eq!(plan_for(&[&a, &b]), Plan::Probe);
-        assert_eq!(run(|f| inter(&[&a, &b], 0, f)), vec!["2", "3"]);
+        assert_eq!(
+            run(|f| inter(&mut Scratch::new(), &[&a, &b], 0, f)),
+            vec!["2", "3"]
+        );
         // And asking for the merge anyway gets the right answer rather than a
         // wrong one, because the fact beats the preference.
         assert_eq!(
-            run(|f| inter_with(Plan::Merge, &[&a, &b], 0, f)),
+            run(|f| inter_with(&mut Scratch::new(), Plan::Merge, &[&a, &b], 0, f)),
             vec!["2", "3"]
         );
     }
@@ -1109,7 +1210,10 @@ mod tests {
         assert!(a.ints().is_some(), "and an intset underneath it");
         let b = ints(&[4_998, 4_999, 5_000]);
         assert_eq!(plan_for(&[&a, &b]), Plan::Merge);
-        assert_eq!(run(|f| inter(&[&a, &b], 0, f)), vec!["4998", "4999"]);
+        assert_eq!(
+            run(|f| inter(&mut Scratch::new(), &[&a, &b], 0, f)),
+            vec!["4998", "4999"]
+        );
     }
 
     /// The members are the same bytes whatever they contain, and a set holds
@@ -1119,7 +1223,7 @@ mod tests {
         let a = of([&b"\x00\xff"[..], b"\xc3\x28", b""]);
         let b = of([&b"\xc3\x28"[..], b""]);
         let mut got: Vec<Vec<u8>> = Vec::new();
-        let n = inter(&[&a, &b], 0, |m| got.push(m.to_vec()));
+        let n = inter(&mut Scratch::new(), &[&a, &b], 0, |m| got.push(m.to_vec()));
         assert_eq!(n, 2);
         assert_eq!(got, vec![b"\xc3\x28".to_vec(), b"".to_vec()]);
     }
