@@ -30,6 +30,10 @@ name = "intset"
 harness = false
 
 [[bench]]
+name = "list"
+harness = false
+
+[[bench]]
 name = "listpack"
 harness = false
 

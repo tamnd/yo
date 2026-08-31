@@ -275,8 +275,21 @@ impl List {
     /// and stop can be negative, can be the wrong way round and can hang off
     /// either end, and every one of those turns into an empty reply rather than
     /// into an error.
+    ///
+    /// A window in the middle does not walk to its start. The packed band skips
+    /// entries because that is all a hundred and twenty eight of them costs, and
+    /// the chunked band steps over whole chunks and only decodes the ones it is
+    /// going to hand back. `LRANGE mylist 500000 500099` on a million element
+    /// list reads a hundred elements and not five hundred thousand.
     pub fn range(&self, start: usize, count: usize) -> impl Iterator<Item = Element<'_>> {
-        self.iter().skip(start).take(count)
+        let (packed, chunks) = match &self.body {
+            Body::Packed(lp) => (Some(lp.iter().skip(start).take(count)), None),
+            Body::Chunks(d) => (None, Some(d.range(start, count))),
+        };
+        packed
+            .into_iter()
+            .flatten()
+            .chain(chunks.into_iter().flatten())
     }
 
     /// Put `value` at the front.
@@ -686,6 +699,26 @@ impl Deque {
     /// A forward walk over every chunk in turn.
     fn iter(&self) -> impl Iterator<Item = Element<'_>> {
         self.chunks.iter().flat_map(Chunk::iter)
+    }
+
+    /// `count` elements from `start`, without walking to `start`.
+    ///
+    /// The chunks before the one holding `start` are stepped over as chunks, so
+    /// the only elements this decodes are the ones inside the chunk it lands in
+    /// and the ones it is going to return. A `skip` on the element walk decodes
+    /// every entry it passes, which turned a hundred element window in the
+    /// middle of a million element list into two milliseconds of reading
+    /// listpack headers nobody asked for.
+    fn range(&self, start: usize, count: usize) -> impl Iterator<Item = Element<'_>> {
+        let (chunk, within) = self.locate(start).unwrap_or((self.chunks.len(), 0));
+        self.chunks
+            .iter()
+            .skip(chunk)
+            .flat_map(Chunk::iter)
+            // At most one chunk's worth, because `locate` already put us in the
+            // right chunk and `within` is a position inside it.
+            .skip(within)
+            .take(count)
     }
 
     /// The same walk the other way, chunks in reverse and each one backward.
@@ -1240,6 +1273,32 @@ mod tests {
                 let got: Vec<Vec<u8>> = l.range(start, count).map(|e| e.to_vec()).collect();
                 let want = &all_of_it[start.min(50)..(start + count).min(50)];
                 assert_eq!(got, want, "{start} for {count} in {:?}", l.encoding());
+            }
+        }
+    }
+
+    /// A window that starts in the middle now steps over whole chunks to get
+    /// there instead of decoding every element on the way, so every start
+    /// position and every window that crosses a chunk boundary is worth
+    /// checking rather than the handful the case above uses.
+    #[test]
+    fn a_window_lands_in_the_right_place_whatever_chunk_it_starts_in() {
+        let limits = Limits::default();
+        let mut l = List::new();
+        // Long enough elements that this is many chunks and not one, and enough
+        // of them that a start position lands in the middle of a chunk, at the
+        // front of one, and at the back of one.
+        for i in 0..500 {
+            l.push_back(format!("e{i}:{}", "p".repeat(200)).as_bytes(), &limits);
+        }
+        assert_eq!(l.encoding(), Encoding::Quicklist);
+        let all_of_it = all(&l);
+
+        for start in 0..=500 {
+            for count in [0usize, 1, 7, 130, 500] {
+                let got: Vec<Vec<u8>> = l.range(start, count).map(|e| e.to_vec()).collect();
+                let want = &all_of_it[start.min(500)..(start + count).min(500)];
+                assert_eq!(got, want, "{count} from {start}");
             }
         }
     }
