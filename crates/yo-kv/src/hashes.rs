@@ -750,7 +750,11 @@ impl Keyspace {
     /// with a thousand pairs builds a table once instead of filling a listpack
     /// and then converting it.
     fn new_hash(&mut self, key: &[u8], hint: usize) -> u32 {
-        let at = self.hashes.insert(Hash::with_hint(hint, &self.hash_limits));
+        // The body and, every so often, the slab that holds it. See
+        // `yo_alloc::first_touch` for why this is the one allocation a command
+        // is allowed to make.
+        let at =
+            yo_alloc::first_touch(|| self.hashes.insert(Hash::with_hint(hint, &self.hash_limits)));
         let len = value::slot_record_len(false);
         self.map.set_with(key, len, |out| {
             value::write_slot_record(out, Kind::Hash, at, None);

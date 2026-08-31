@@ -95,8 +95,23 @@ pub struct Keyspace {
     ///
     /// It lives on the database and not on the caller because the callers are
     /// wire handlers that are handed a `&mut Keyspace` and nothing else.
+    ///
+    /// It starts at [`SCRATCH`] bytes rather than empty. An empty one grows on
+    /// the first command that uses it, and that growth is a real allocation on a
+    /// command path even though it happens once. Buying it here, where nobody is
+    /// waiting, makes the rule Y7 enforces true without an exception written for
+    /// it. A value larger than that still grows it, and that one is allocation
+    /// proportional to what the caller sent rather than overhead per command.
     pub(crate) scratch: Vec<u8>,
 }
+
+/// How big [`Keyspace::scratch`] starts.
+///
+/// A kibibyte, which covers a value of any ordinary size and costs one
+/// allocation per database. The number is not tuned and does not need to be: too
+/// small only means the buffer grows once more on some later command, and too
+/// large only means a kibibyte nobody used.
+const SCRATCH: usize = 1024;
 
 /// Where the last collection key resolved to, if it still resolves there.
 ///
@@ -218,7 +233,7 @@ impl Keyspace {
             zset_limits: zset::Limits::DEFAULT,
             rng: Rng::new(clock.now_ms() ^ made.wrapping_mul(0x9e37_79b9_7f4a_7c15)),
             memo: Memo::empty(),
-            scratch: Vec::new(),
+            scratch: Vec::with_capacity(SCRATCH),
         }
     }
 

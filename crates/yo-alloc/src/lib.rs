@@ -260,6 +260,28 @@ pub fn allow<T>(f: impl FnOnce() -> T) -> T {
     out
 }
 
+/// Run `f`, which is a key coming into existence for the first time.
+///
+/// [`allow`] with a name on it, and the name is the claim. Y7 says no allocation
+/// on a command path, and the first `SADD` to a key that was not there has to
+/// make a set somewhere. There is no arrangement of this code that avoids it and
+/// no reason to want one: it happens once per key rather than once per command,
+/// and a workload that creates a key on every command is one where the
+/// allocation is the smallest thing it is paying for.
+///
+/// So the rule this module enforces is the one that is actually true. Nothing on
+/// a command path allocates except a key being created, and every place that
+/// does is this call, which makes the list of them a grep rather than an
+/// argument.
+///
+/// This is the one way to misuse the module. Wrapping steady state work in it to
+/// stop an abort would leave the check passing and the rule broken, which is
+/// worse than not having the check.
+#[inline]
+pub fn first_touch<T>(f: impl FnOnce() -> T) -> T {
+    allow(f)
+}
+
 struct Restore(u32);
 
 impl Drop for Restore {
