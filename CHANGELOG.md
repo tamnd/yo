@@ -4,6 +4,53 @@ What each release changed, why, and what it costs you. The versioning rules and 
 
 While the major is 0, a minor release may break anything, including the on-disk format. The format is frozen at `M6`, not before.
 
+## 0.3.6 — 2026-09-01
+
+Nineteen pull requests, no milestone, so this is a patch. Two things run through it. The array group finished, which makes it 18 of 18 array commands and the fourth complete type. And a memory campaign that started as one measurement and turned into most of the release: a large integer set now costs a seventh of what it did, `LINSERT` and `LPOS` on a long list are five to fifteen times faster, and the allocator has been armed on the command path for the first time so there is a list of what still calls it.
+
+The `.yo` layout is untouched. A file written by 0.3.4 or 0.3.5 opens unchanged.
+
+The 0.3.5 release did reach crates.io in the end. It was tagged before the publish step became a loop that waits out the rate limit, so it stopped with one crate of eighteen uploaded and had to be recovered by dispatching the workflow from `main` against the tag. All eighteen crates are up at 0.3.5 now, and 0.3.6 is the first release where that path was in the tag from the start.
+
+### Added
+
+- **`ARGREP`, and with it the last of the eighteen array commands.** It searches a range of an array with up to two hundred and fifty textual predicates and answers the indexes that matched, or index and value pairs with `WITHVALUES`. `EXACT` is byte equality, `MATCH` is containment, `GLOB` is the pattern language `KEYS` uses, and `RE` is a POSIX extended regular expression.
+- **A POSIX extended regular expression engine in `yo-common`.** Redis gets its from TRE, which it vendors under `deps/tre`, and asks it for very little: extended syntax, no submatches, bytes rather than characters, optionally case insensitive, and a yes or no per element, with a backreference refused before it ever runs. So what had to exist was a boolean matcher over bytes, which is a few hundred lines, rather than a general purpose regex crate and its transitive dependencies linked into the C ABI and every language binding.
+- **The partitioned band, with a two level descriptor cache.** A collection past 262,144 elements stops being one element table and becomes P of them, each an ordinary table, with a member's partition taken out of bits 32 and up of its hash. It has to be those bits: a table already indexes its slot array with the low 32 bits of the same hash, so partitioning on the low bits would hand every member of a partition the same home slot and turn the table into a linked list. The set is the first collection wired onto it, and a client cannot tell that it happened, because a fourth word coming back from `OBJECT ENCODING` is a client whose assertions break and a split set answers `hashtable` like the table it was.
+- **The scheme B order key allocator for list inserts**, so an insert between two neighbours does not run out of room. That is M4's second scope line and Y19 in the locked decisions.
+- **`yo-alloc` is armed in `yodb`.** The module has existed since M0 and nothing called it, so Y7, no allocation on a command path, was enforced by nothing. `YO_ALLOC` is now `off`, `report` or `abort`, and a value that is none of those is an error rather than a quiet `off`, because somebody who typed `YO_ALLOC=abrot` believes the check is running. The guard sits around dispatch in the reactor's pump and covers running the commands and nothing else: framing before it and writing replies after it are both allowed the heap. Under the default mode the whole thing is one relaxed atomic load per batch.
+- **`yo_common::Small`, a list that stays on the stack until it does not fit.** Up to `N` elements it is an array in the caller's frame and past that it is an ordinary `Vec`. There is no unsafe in it, because everything it holds is `Copy` and the buffer can be filled with a copy of the first element rather than with `MaybeUninit`.
+- **`yo_alloc::first_touch`, which is the one exception to Y7 written down.** A key coming into existence has to build a body somewhere and no arrangement of this code avoids it. There are four calls, in `new_set`, `new_hash`, `new_list` and `new_zset`, so the exception is a grep rather than an argument.
+- **Measurement tests for what a set and a hash cost per element**, which M3's memory gate row asks for and which had no number against either half.
+
+### Changed
+
+- **A large integer set stays an intset rather than rehashing into a table.** Redis gives up on the intset at `set-max-intset-entries` and converts, which measured here at 24.60 to 30.92 bytes a member against the intset's 4.00, a twelvefold jump in memory for a set that got one member bigger. What forces it is that Redis has one array, and an insert into the middle of one sorted array memmoves the tail, so a million member set moves half a megabyte per `SADD`. Holding the members in runs fixes the memmove without paying the memory, so the conversion is not needed.
+- **Set intersection merges sorted arrays when it can, instead of probing.** An all integer set is an intset and an intset is exactly a sorted array, so whenever every operand is one there is something to walk in lockstep, where a touch is a pointer step and a comparison rather than a hash and a random access into a table. That covers most of what `SINTERSTORE` is actually called with.
+- **The list's pivot search reads entry headers instead of decoding elements**, and `LPOS` and `LREM` go through the same scan. The old walk was `iter().position(...)`, which ran the full fourteen way entry decoder and built an `Entry` for every element it was about to throw away.
+- **A packed entry is written into the blob rather than built in a `Vec` first.** Every edit to a listpack went through one `splice` that built the new entry in a fresh `Vec`, so every `RPUSH`, `LPUSH`, `HSET`, `SADD` and `ZADD` landing in the packed band paid a malloc and a free for a few dozen bytes that never outlived the call, on top of the memmove it was going to do anyway.
+- **The release workflow waits out crates.io's rate limit instead of failing on it.** A brand new crate name is limited roughly one every ten minutes against one a minute for a new version of an existing name, and the first release of this workspace was eighteen new names at once. Each pass now asks the registry what is still missing, publishes what it can, and on a refusal sleeps until the time crates.io named. Progress is measured against the registry rather than against what cargo thinks it did, so a pass that uploads three and is then turned away is three crates of progress. Anything that is not a 429 still stops the job.
+- **`cargo xtask reserve` asks a registry who holds a name rather than whether the name exists.** The audit was reporting `cocoapods:Yodb` as regressed from `free` to `blocked` on a pod whose owner list has exactly one entry and it is ours.
+
+### Fixed
+
+- **`APPEND`, `SETRANGE`, `EXPIRE` on a string, `ZADD`, `ZINCRBY`, `HINCRBYFLOAT`, `LREM` and `ZRANDMEMBER` no longer allocate per call.** Each of them built a `Vec` to hold something it needed for the length of one command: the old value while the new record was written, the text of a double, the indexes about to be removed, the permutation to draw from. The string cases go through the database's scratch buffer, the doubles go on the stack, `LREM` uses a `Small`, and `ZRANDMEMBER` gets an index buffer of its own.
+- **A multi key set operation no longer allocates once per key.** `SINTER`, `SUNION` and `SDIFF` each built a handful of vectors sized by the number of keys, and that number is two or three almost every time, so a `SINTER` over three small sets was doing about eleven allocations to hold about a dozen `usize`. It does none now.
+- **The database's scratch buffer starts at a kibibyte instead of empty**, so its first growth is not on a command path either.
+
+### Performance
+
+Development measurements on an Apple M4 in the release profile, not gate numbers on a qualified box.
+
+- **A large integer set, bytes per member.** 512 members went from 4.00 to 2.08, a thousand from 24.60 to 2.19, a hundred thousand from 30.92 to 3.53, and a million from 29.19 to 4.08. The three larger sizes were `hashtable` before and are `intset` now. A membership test at a million is 14.7 ns for a hit and 13.0 ns for a miss.
+- **`LINSERT` and the walks around it.** `linsert_middle` at a million elements went from 3.34 ms to 456 us over two changes, `find_far` at a million from 6.57 ms to 904 us, and `lpos_far` at a million from 5.53 ms to 1.02 ms. On a million element list the insert itself is 285 ns, so essentially all of that was the search.
+- **Filling a packed blob is a bit over twice as fast at every size.** `listpack_fill/8` went from 216 ns to 96, `/512` from 11.5 us to 4.62, and `list/push_back/1000` from 18.5 us to 11.5. The chunked band is untouched, because a chunk has always written into its own fixed array.
+- **Small set operations.** `inter/ints/k2` went from 69.50 ns to 44.23 and `inter/ints/k3` from 88.34 to 58.28. The text cases barely move, because those plans build a hash table sized by the members and that is what they spend their time on.
+
+### Known gaps
+
+`YO_ALLOC=abort` is not armed in CI yet, and cannot be until the thirteen sites the report still finds are dealt with. They are written up on #146. Three of them are the old value being copied out on `SET ... GET`, `GETDEL` and `COPY`, which is a signature question rather than a two line fix, since the value goes back out to the caller as an owned `Vec`. Four are the data structures growing because somebody put more into them, which needs a decision about whether the first touch claim covers them. The rest are small and specific and are each worth fixing.
+
 ## 0.3.5 — 2026-08-31
 
 Twenty three pull requests, no milestone, so this is a patch. It is a much bigger one than the two to five changes RELEASING.md describes, and the reason is worth writing down rather than glossing over: the thing that makes a release mean anything only landed in the middle of it. Nothing this project has ever tagged was published anywhere, so `cargo add yodb` at any version from 0.1.0 onwards resolved a name and no version. This is the first release that actually goes to crates.io, and eighteen crates go up with it.
