@@ -22,6 +22,21 @@
 /// this.
 #[must_use]
 pub fn matches(pattern: &[u8], text: &[u8]) -> bool {
+    matches_nocase(pattern, text, false)
+}
+
+/// Whether `text` matches `pattern`, optionally ignoring ASCII case.
+///
+/// `ARGREP GLOB` is the one caller that asks for the fold. Redis folds in three
+/// of the four places a byte is compared: a literal, an escaped literal and both
+/// ends of a range. The one it leaves alone is an escaped byte inside a class,
+/// so `[\A]` under `NOCASE` matches an `A` and not an `a`, which reads like an
+/// oversight and is old enough to be relied on.
+///
+/// The fold is ASCII only, deliberately, because the subject is arbitrary bytes
+/// and folding by a locale would make the answer depend on the machine.
+#[must_use]
+pub fn matches_nocase(pattern: &[u8], text: &[u8], nocase: bool) -> bool {
     let (mut p, mut t) = (0usize, 0usize);
     // Where to go back to when a `*` has to give up a byte. `None` until the
     // first star, which is what makes a pattern without one a straight walk.
@@ -43,20 +58,20 @@ pub fn matches(pattern: &[u8], text: &[u8]) -> bool {
                     continue;
                 }
                 b'[' => {
-                    let (next, hit) = class(pattern, p, text[t]);
+                    let (next, hit) = class(pattern, p, text[t], nocase);
                     if hit {
                         p = next;
                         step = true;
                     }
                 }
                 b'\\' if p + 1 < pattern.len() => {
-                    if pattern[p + 1] == text[t] {
+                    if same(pattern[p + 1], text[t], nocase) {
                         p += 2;
                         step = true;
                     }
                 }
                 c => {
-                    if c == text[t] {
+                    if same(c, text[t], nocase) {
                         p += 1;
                         step = true;
                     }
@@ -90,7 +105,7 @@ pub fn matches(pattern: &[u8], text: &[u8]) -> bool {
 /// with no closing bracket ends at the end of the pattern rather than being an
 /// error, which is Redis's reading and means a stray bracket in a key pattern
 /// is never a refusal.
-fn class(pattern: &[u8], p: usize, c: u8) -> (usize, bool) {
+fn class(pattern: &[u8], p: usize, c: u8, nocase: bool) -> (usize, bool) {
     let mut i = p + 1;
     let negate = i < pattern.len() && pattern[i] == b'^';
     if negate {
@@ -100,22 +115,41 @@ fn class(pattern: &[u8], p: usize, c: u8) -> (usize, bool) {
     while i < pattern.len() && pattern[i] != b']' {
         if pattern[i] == b'\\' && i + 1 < pattern.len() {
             i += 1;
+            // The one comparison Redis does not fold.
             hit |= pattern[i] == c;
             i += 1;
         } else if i + 2 < pattern.len() && pattern[i + 1] == b'-' && pattern[i + 2] != b']' {
             let (mut lo, mut hi) = (pattern[i], pattern[i + 2]);
+            // Redis puts the ends the right way round before it folds them and
+            // not after, so `[Z-a]` under NOCASE is the empty range `z` to `a`
+            // rather than the whole of the alphabet.
             if lo > hi {
                 core::mem::swap(&mut lo, &mut hi);
             }
+            let (lo, hi, c) = if nocase {
+                (fold(lo), fold(hi), fold(c))
+            } else {
+                (lo, hi, c)
+            };
             hit |= c >= lo && c <= hi;
             i += 3;
         } else {
-            hit |= pattern[i] == c;
+            hit |= same(pattern[i], c, nocase);
             i += 1;
         }
     }
     let next = if i < pattern.len() { i + 1 } else { i };
     (next, hit != negate)
+}
+
+/// One ASCII letter in lower case, and every other byte as it was.
+fn fold(b: u8) -> u8 {
+    b.to_ascii_lowercase()
+}
+
+/// Whether two bytes are the same, ASCII case aside when asked.
+fn same(a: u8, b: u8, nocase: bool) -> bool {
+    a == b || (nocase && fold(a) == fold(b))
 }
 
 #[cfg(test)]
@@ -178,6 +212,23 @@ mod tests {
         let pattern = b"*a*a*a*a*a*b";
         let text = vec![b'a'; 64];
         assert!(!matches(pattern, &text));
+    }
+
+    #[test]
+    fn nocase_folds_everything_except_an_escape_inside_a_class() {
+        assert!(matches_nocase(b"HELLO", b"hello", true));
+        assert!(matches_nocase(b"h*O", b"hello", true));
+        assert!(matches_nocase(b"h[AE]llo", b"hello", true));
+        assert!(matches_nocase(b"KEY[A-Z]", b"keyx", true));
+        assert!(matches_nocase(br"a\Bc", b"abc", true));
+        assert!(!matches_nocase(b"HELLO", b"hello", false));
+        // The odd one out. Redis compares an escaped class item raw, so the
+        // fold does not reach it.
+        assert!(!matches_nocase(br"a[\B]c", b"abc", true));
+        assert!(matches_nocase(br"a[\B]c", b"aBc", true));
+        // The ends of a range are put in order before they are folded, which
+        // makes this one empty rather than everything from Z to a.
+        assert!(!matches_nocase(b"[Z-a]", b"b", true));
     }
 
     /// Not an error, and not a match for a bracket that is not there.

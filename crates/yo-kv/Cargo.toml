@@ -13,6 +13,8 @@ keywords.workspace = true
 categories.workspace = true
 
 [dependencies]
+# Only so that ARGREP can say where its plan is allowed to reach the heap.
+yo-alloc.workspace = true
 yo-common.workspace = true
 yo-index.workspace = true
 

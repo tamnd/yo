@@ -366,6 +366,22 @@ impl Matcher {
         Matcher::default()
     }
 
+    /// Grows the scratch to what `re` will need, so that matching never does.
+    ///
+    /// A state is added at most once per step, so none of the four vectors can
+    /// go past the program size. Doing the growth here means the caller can put
+    /// every allocation `ARGREP` makes in the part of the command that reads the
+    /// arguments, and the walk over the elements allocates nothing at all.
+    pub fn reserve(&mut self, re: &Regex) {
+        let n = re.len();
+        if self.seen.len() < n {
+            self.seen.resize(n, 0);
+        }
+        for v in [&mut self.now, &mut self.next, &mut self.work] {
+            v.reserve_exact(n.saturating_sub(v.capacity()));
+        }
+    }
+
     /// Whether `re` matches anywhere in `hay`.
     ///
     /// Unanchored, which is what `regexec` without an anchor does and what

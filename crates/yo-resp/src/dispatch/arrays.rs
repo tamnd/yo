@@ -22,7 +22,7 @@
 
 use yo_common::num::{DOUBLE_MAX, parse_i64, write_g17};
 use yo_common::{Code, Error, Result};
-use yo_kv::arrays::{Aggregate, Op, parse_index, parse_seek_index};
+use yo_kv::arrays::{Aggregate, Grep, Op, Test, parse_grep_bound, parse_index, parse_seek_index};
 use yo_kv::{ArrayElement, Keyspace};
 
 use super::args::{self, Args};
@@ -172,6 +172,90 @@ pub(super) fn execute(db: &mut Keyspace, spec: &Spec, args: Args<'_>, out: &mut 
                 out.array(2);
                 out.uint(index);
                 element(out, el);
+            })?;
+            out.close_array(mark, usize::try_from(n).unwrap_or(usize::MAX));
+        }
+        "argrep" => {
+            // Both bounds are read before the plan is, so `ARGREP k x 0 EXACT`
+            // is a bad index and not a syntax error, whichever way round the
+            // two mistakes are written.
+            let start = parse_grep_bound(args.get(2))?;
+            let end = parse_grep_bound(args.get(3))?;
+            let mut grep = Grep::new();
+            let (mut all, mut nocase, mut withvalues) = (false, false, false);
+            let mut limit = u64::MAX;
+            // One pass, so predicates and options mix freely and the last of a
+            // repeated option wins. That is Redis's parser and it is the reason
+            // `ARGREP k 0 1 NOCASE RE a` and `ARGREP k 0 1 RE a NOCASE` are the
+            // same command.
+            let mut i = 4;
+            while i < args.len() {
+                let token = args.get(i);
+                let test = match token {
+                    t if args::is(t, b"EXACT") => Some(Test::Exact),
+                    t if args::is(t, b"MATCH") => Some(Test::Match),
+                    t if args::is(t, b"GLOB") => Some(Test::Glob),
+                    t if args::is(t, b"RE") => Some(Test::Re),
+                    _ => None,
+                };
+                if let Some(test) = test {
+                    if i + 1 >= args.len() {
+                        return Err(args::syntax());
+                    }
+                    grep.push(test, args.get(i + 1))?;
+                    i += 2;
+                    continue;
+                }
+                match token {
+                    t if args::is(t, b"LIMIT") => {
+                        if i + 1 >= args.len() {
+                            return Err(args::syntax());
+                        }
+                        let n = args.int(i + 1)?;
+                        if n <= 0 {
+                            return Err(Error::new(Code::Invalid, "LIMIT must be positive"));
+                        }
+                        limit = n as u64;
+                        i += 2;
+                    }
+                    t if args::is(t, b"AND") => {
+                        all = true;
+                        i += 1;
+                    }
+                    t if args::is(t, b"OR") => {
+                        all = false;
+                        i += 1;
+                    }
+                    t if args::is(t, b"WITHVALUES") => {
+                        withvalues = true;
+                        i += 1;
+                    }
+                    t if args::is(t, b"NOCASE") => {
+                        nocase = true;
+                        i += 1;
+                    }
+                    _ => return Err(args::syntax()),
+                }
+            }
+            // Asking for nothing is a syntax error rather than an empty reply,
+            // because a client that meant to send a predicate and lost it in a
+            // shell should hear about it.
+            if grep.is_empty() {
+                return Err(args::syntax());
+            }
+            grep.compile(all, nocase)?;
+            let mark = out.len();
+            let n = db.argrep(args.get(1), start, end, limit, &mut grep, |index, el| {
+                // A bare index unless the values were asked for, and a pair of
+                // index and value when they were. Either way one entry per hit,
+                // which is what the header at the end counts.
+                if withvalues {
+                    out.array(2);
+                }
+                out.uint(index);
+                if withvalues {
+                    element(out, el);
+                }
             })?;
             out.close_array(mark, usize::try_from(n).unwrap_or(usize::MAX));
         }

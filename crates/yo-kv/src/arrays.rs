@@ -22,7 +22,8 @@
 //! `ARDEL`.
 
 use yo_common::num::{parse_f64, parse_i64};
-use yo_common::{Code, Error, Result};
+use yo_common::re::{self, Matcher, Regex};
+use yo_common::{Code, Error, Result, glob};
 
 use crate::array::{Array, ELEMENT_MAX, Element, INDEX_MAX, Info};
 use crate::keyspace::Keyspace;
@@ -137,6 +138,273 @@ pub enum Aggregate {
     /// Nothing in the range was any use to the operation, which is a null. An
     /// empty range and a range of nothing but words both land here.
     None,
+}
+
+/// The most predicates one `ARGREP` will carry.
+///
+/// Redis's `ARGREP_MAX_PREDICATES`. The point of a ceiling is that every
+/// predicate is evaluated against every element the walk visits, so a command
+/// with a thousand of them is a way of asking one shard thread to do a thousand
+/// times the work for one reply.
+pub const GREP_MAX_PREDICATES: usize = 250;
+
+/// The longest regular expression `ARGREP` will compile.
+///
+/// Redis's `ARGREP_MAX_RE_LEN`, and the same reasoning: the compile happens on
+/// the thread that owns the keys.
+pub const GREP_MAX_RE_LEN: usize = 2048;
+
+/// One end of the range `ARGREP` searches.
+///
+/// `ARGREP` is the only array command that takes anything but a number here.
+/// `-` and `+` mean the two ends of the array as it is at the moment the
+/// command runs, which cannot be resolved while the arguments are being read
+/// because the key has not been looked at yet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Bound {
+    /// A position, read the way every other array index is read.
+    Index(u64),
+    /// `-`, which is index zero.
+    First,
+    /// `+`, which is the highest index the array has.
+    Last,
+}
+
+impl Bound {
+    /// The position this comes to for an array whose highest index is `max`.
+    fn resolve(self, max: u64) -> u64 {
+        match self {
+            Bound::Index(i) => i,
+            Bound::First => 0,
+            Bound::Last => max,
+        }
+    }
+}
+
+/// Reads one of `ARGREP`'s two bounds.
+///
+/// # Errors
+///
+/// [`BAD_INDEX`] for anything that is neither `-` nor `+` nor an index.
+pub fn parse_grep_bound(bytes: &[u8]) -> Result<Bound> {
+    match bytes {
+        b"-" => Ok(Bound::First),
+        b"+" => Ok(Bound::Last),
+        other => Ok(Bound::Index(parse_index(other)?)),
+    }
+}
+
+/// One test `ARGREP` applies to an element.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Test {
+    /// `EXACT`, the whole element and nothing else.
+    Exact,
+    /// `MATCH`, the pattern anywhere inside the element.
+    Match,
+    /// `GLOB`, the pattern read as a glob.
+    Glob,
+    /// `RE`, the pattern read as an extended regular expression.
+    Re,
+}
+
+/// What one `ARGREP` was asked to look for.
+///
+/// Built once per command and then asked about every element the walk visits,
+/// which is why the compiled regexes and the matcher's scratch space live here
+/// rather than being made per element.
+///
+/// # This one allocates
+///
+/// Every other command path here is allocation free, and `ARGREP` cannot be:
+/// compiling a regular expression means building a program, and the plan holds
+/// up to two hundred and fifty predicates. Redis allocates in the same two
+/// places for the same reasons. The allocations are wrapped in
+/// [`yo_alloc::allow`] and they all happen while the command is being read, so
+/// the walk itself is still allocation free however many elements it visits.
+pub struct Grep<'a> {
+    /// The tests in the order they were given, since `OR` stops at the first
+    /// one that holds and the cheap ones are usually written first.
+    tests: Vec<(Test, &'a [u8])>,
+    /// The compiled form of every `RE` pattern, in the same order as the `Re`
+    /// entries in `tests`.
+    regexes: Vec<Regex>,
+    /// The scratch the regex engine walks with, kept across elements.
+    matcher: Matcher,
+    /// `AND` rather than the default `OR`.
+    all: bool,
+    /// `NOCASE`, which folds ASCII letters in all four tests.
+    nocase: bool,
+}
+
+impl Default for Grep<'_> {
+    fn default() -> Self {
+        Grep::new()
+    }
+}
+
+impl<'a> Grep<'a> {
+    /// An empty plan, which is not a usable one until it has been told what to
+    /// look for and then [`Grep::compile`]d.
+    #[must_use]
+    pub fn new() -> Grep<'a> {
+        Grep {
+            tests: Vec::new(),
+            regexes: Vec::new(),
+            matcher: Matcher::new(),
+            all: false,
+            nocase: false,
+        }
+    }
+
+    /// Adds one predicate in the order it was written.
+    ///
+    /// # Errors
+    ///
+    /// [`Code::Invalid`] once there are [`GREP_MAX_PREDICATES`] of them, or for
+    /// an `RE` pattern longer than [`GREP_MAX_RE_LEN`]. Both are checked here
+    /// rather than at the end because Redis checks them as it reads, so a
+    /// command that is wrong in two ways reports whichever comes first.
+    pub fn push(&mut self, test: Test, pattern: &'a [u8]) -> Result<()> {
+        if self.tests.len() >= GREP_MAX_PREDICATES {
+            return Err(Error::fmt(
+                Code::Invalid,
+                format_args!("too many predicates, maximum is {GREP_MAX_PREDICATES}"),
+            ));
+        }
+        if test == Test::Re && pattern.len() > GREP_MAX_RE_LEN {
+            return Err(Error::fmt(
+                Code::Invalid,
+                format_args!("regular expression is too long, maximum is {GREP_MAX_RE_LEN} bytes"),
+            ));
+        }
+        yo_alloc::allow(|| self.tests.push((test, pattern)));
+        Ok(())
+    }
+
+    /// How many predicates the plan carries, since none at all is a syntax
+    /// error and the caller is the one that says so.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.tests.len()
+    }
+
+    /// Whether nothing has been asked for yet.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.tests.is_empty()
+    }
+
+    /// Settles the two global options and compiles the regular expressions.
+    ///
+    /// The compile is deliberately the last thing that happens while the command
+    /// is being read, because `NOCASE` is a global option that may come after
+    /// the pattern it applies to.
+    ///
+    /// # Errors
+    ///
+    /// [`Code::Invalid`] with the sentence Redis uses for an empty pattern, a
+    /// pattern that will not compile, or a pattern using a backreference.
+    pub fn compile(&mut self, all: bool, nocase: bool) -> Result<()> {
+        self.all = all;
+        self.nocase = nocase;
+        for (test, pattern) in &self.tests {
+            if *test != Test::Re {
+                continue;
+            }
+            if pattern.is_empty() {
+                return Err(Error::new(Code::Invalid, "regular expression is empty"));
+            }
+            match yo_alloc::allow(|| Regex::new(pattern, nocase)) {
+                Ok(re) => yo_alloc::allow(|| {
+                    // Grow the matcher's scratch to fit while allocating is
+                    // still allowed, so the walk over the elements does not.
+                    self.matcher.reserve(&re);
+                    self.regexes.push(re);
+                }),
+                // The one code that is Redis's own sentence rather than TRE's
+                // message, so it goes out on its own with nothing in front of
+                // it.
+                Err(re::Error::Unsupported) => {
+                    return Err(Error::new(Code::Invalid, re::Error::Unsupported.as_str()));
+                }
+                Err(e) => {
+                    return Err(Error::fmt(
+                        Code::Invalid,
+                        format_args!("invalid regular expression: {e}"),
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Whether the element's bytes answer the plan.
+    fn holds(&mut self, data: &[u8]) -> bool {
+        let mut re = 0;
+        for i in 0..self.tests.len() {
+            let (test, pattern) = self.tests[i];
+            let hit = match test {
+                Test::Exact => equal(data, pattern, self.nocase),
+                Test::Match => contains(data, pattern, self.nocase),
+                Test::Glob => glob::matches_nocase(pattern, data, self.nocase),
+                Test::Re => {
+                    let at = re;
+                    re += 1;
+                    self.matcher.is_match(&self.regexes[at], data)
+                }
+            };
+            // `OR` is done as soon as one holds and `AND` as soon as one does
+            // not, which is what makes putting the cheap test first worth
+            // something.
+            if hit != self.all {
+                return hit;
+            }
+        }
+        self.all
+    }
+}
+
+/// One ASCII letter folded down, and every other byte left alone.
+///
+/// Redis folds ASCII and only ASCII here, deliberately, so that the answer does
+/// not depend on a locale and an element holding arbitrary bytes cannot be read
+/// as text by accident.
+fn fold(b: u8) -> u8 {
+    b.to_ascii_lowercase()
+}
+
+/// Whether two strings of bytes are the same, ASCII case aside.
+fn equal(a: &[u8], b: &[u8], nocase: bool) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    if !nocase {
+        return a == b;
+    }
+    a.iter().zip(b).all(|(x, y)| fold(*x) == fold(*y))
+}
+
+/// Whether `needle` appears anywhere in `haystack`, ASCII case aside.
+fn contains(haystack: &[u8], needle: &[u8], nocase: bool) -> bool {
+    if needle.is_empty() {
+        return true;
+    }
+    if needle.len() > haystack.len() {
+        return false;
+    }
+    // Redis walks every offset and compares from it, and so does this. The
+    // first byte is checked before the rest of the window is looked at, which
+    // is the whole of the difference on a haystack that does not hold the
+    // needle.
+    let first = needle[0];
+    for at in 0..=haystack.len() - needle.len() {
+        let head = haystack[at];
+        let same = head == first || (nocase && fold(head) == fold(first));
+        if same && equal(&haystack[at..at + needle.len()], needle, nocase) {
+            return true;
+        }
+    }
+    false
 }
 
 /// An element as a whole number, for the bitwise operations.
@@ -570,6 +838,51 @@ impl Keyspace {
         Ok(seen)
     }
 
+    /// `ARGREP key start end predicate ... [AND | OR] [LIMIT n] [WITHVALUES] [NOCASE]`.
+    ///
+    /// [`Keyspace::arscan`]'s walk with a test in front of the callback, so it
+    /// costs the elements in the range and not its width. `f` is called with the
+    /// index and the element for everything that answers `grep`, at most `limit`
+    /// times, and the count is what came back.
+    ///
+    /// The two bounds arrive as [`Bound`] rather than as numbers because `+`
+    /// means the end of the array as it is now, which is not known until the key
+    /// has been found.
+    pub fn argrep<F>(
+        &mut self,
+        key: &[u8],
+        start: Bound,
+        end: Bound,
+        limit: u64,
+        grep: &mut Grep<'_>,
+        mut f: F,
+    ) -> Result<u64>
+    where
+        F: FnMut(u64, Element<'_>),
+    {
+        let Some(at) = self.array_slot(key)? else {
+            return Ok(0);
+        };
+        let array = self.array_at(at);
+        let len = array.len();
+        if len == 0 || limit == 0 {
+            return Ok(0);
+        }
+        let max = len - 1;
+        let mut hits = 0;
+        array.scan(start.resolve(max), end.resolve(max), |index, el| {
+            let mut buf = [0u8; ELEMENT_MAX];
+            if grep.holds(el.text(&mut buf)) {
+                f(index, el);
+                hits += 1;
+            }
+            // The limit counts what matched and not what was looked at, so a
+            // range full of misses is walked to its end.
+            hits < limit
+        });
+        Ok(hits)
+    }
+
     /// `AROP key start end OP [value]`, one number out of a whole range.
     ///
     /// The walk is [`Keyspace::arscan`]'s, so it costs the elements in the range
@@ -865,6 +1178,15 @@ mod tests {
             d.argetrange(b"s", 0, 1, |_| {}).unwrap_err().code(),
             Code::WrongType
         );
+        let mut grep = Grep::new();
+        grep.push(Test::Exact, b"v").expect("room for it");
+        grep.compile(false, false).expect("nothing to compile");
+        assert_eq!(
+            d.argrep(b"s", Bound::First, Bound::Last, 1, &mut grep, |_, _| {})
+                .unwrap_err()
+                .code(),
+            Code::WrongType
+        );
     }
 
     /// An index is unsigned, and the numbers a list would take are errors here.
@@ -1156,6 +1478,89 @@ mod tests {
         assert_eq!(
             d.arop(b"a", 100, 200, Op::Used, b"").expect("an array"),
             Aggregate::Int(0)
+        );
+    }
+
+    /// The four tests and the two ways of combining them.
+    #[test]
+    fn a_grep_tests_each_element_and_stops_where_it_is_told() {
+        let mut d = db();
+        set(&mut d, b"a", 0, &[b"alpha", b"beta", b"gamma", b"ALPHA"]);
+
+        let found = |d: &mut Keyspace, tests: &[(Test, &[u8])], all, nocase, limit| {
+            let mut grep = Grep::new();
+            for (test, pattern) in tests {
+                grep.push(*test, pattern).expect("room for it");
+            }
+            grep.compile(all, nocase).expect("a pattern that compiles");
+            let mut hits = Vec::new();
+            d.argrep(b"a", Bound::First, Bound::Last, limit, &mut grep, |i, _| {
+                hits.push(i);
+            })
+            .expect("an array");
+            hits
+        };
+
+        let exact: &[(Test, &[u8])] = &[(Test::Exact, b"alpha")];
+        assert_eq!(found(&mut d, exact, false, false, u64::MAX), [0]);
+        assert_eq!(found(&mut d, exact, false, true, u64::MAX), [0, 3]);
+        let inside: &[(Test, &[u8])] = &[(Test::Match, b"mm")];
+        assert_eq!(found(&mut d, inside, false, false, u64::MAX), [2]);
+        let glob: &[(Test, &[u8])] = &[(Test::Glob, b"*a")];
+        assert_eq!(found(&mut d, glob, false, false, u64::MAX), [0, 1, 2]);
+        let re: &[(Test, &[u8])] = &[(Test::Re, b"^[bg]")];
+        assert_eq!(found(&mut d, re, false, false, u64::MAX), [1, 2]);
+
+        // OR takes the union and AND the intersection, and the limit counts
+        // what matched rather than what was looked at.
+        let two: &[(Test, &[u8])] = &[(Test::Glob, b"*a"), (Test::Exact, b"ALPHA")];
+        assert_eq!(found(&mut d, two, false, false, u64::MAX), [0, 1, 2, 3]);
+        assert_eq!(found(&mut d, two, true, false, u64::MAX), []);
+        assert_eq!(found(&mut d, two, false, false, 2), [0, 1]);
+    }
+
+    /// The patterns that are refused, in Redis's words.
+    #[test]
+    fn a_grep_says_why_a_pattern_is_no_good() {
+        let mut grep = Grep::new();
+        grep.push(Test::Re, b"").expect("room for it");
+        assert_eq!(
+            grep.compile(false, false).unwrap_err().message(),
+            "regular expression is empty"
+        );
+
+        let mut grep = Grep::new();
+        grep.push(Test::Re, b"(a").expect("room for it");
+        assert_eq!(
+            grep.compile(false, false).unwrap_err().message(),
+            "invalid regular expression: Missing ')'"
+        );
+
+        // The one that is Redis's own sentence rather than TRE's message, so it
+        // goes out without anything in front of it.
+        let mut grep = Grep::new();
+        grep.push(Test::Re, br"(a)\1").expect("room for it");
+        assert_eq!(
+            grep.compile(false, false).unwrap_err().message(),
+            "regular expression backreferences are not supported"
+        );
+
+        let long = vec![b'a'; GREP_MAX_RE_LEN + 1];
+        assert_eq!(
+            Grep::new().push(Test::Re, &long).unwrap_err().message(),
+            "regular expression is too long, maximum is 2048 bytes"
+        );
+        // The same pattern is fine under any of the other three, which do not
+        // compile anything.
+        assert!(Grep::new().push(Test::Exact, &long).is_ok());
+
+        let mut grep = Grep::new();
+        for _ in 0..GREP_MAX_PREDICATES {
+            grep.push(Test::Exact, b"x").expect("room for it");
+        }
+        assert_eq!(
+            grep.push(Test::Exact, b"x").unwrap_err().message(),
+            "too many predicates, maximum is 250"
         );
     }
 

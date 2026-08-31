@@ -99,7 +99,7 @@ doc = "08 section 5"
 [[group]]
 name = "array"
 expected = 18
-status = "partial"
+status = "shipped"
 doc = "08 section 1"
 
 [[group]]
@@ -2009,6 +2009,18 @@ bounded = "inherent"
 status = "shipped"
 wire = "verified"
 notes = "Index and value pairs for everything a range holds, holes skipped, reversed when the start is above the end. It needs none of the million position cap ARGETRANGE has because the cost is the elements found and the slices they sit in, not the width of the range, so a scan of the whole index space over a key holding three elements is three visits."
+
+[[command]]
+name = "ARGREP"
+group = "array"
+since = "8.8.0"
+arity = -6
+plan = "cursor"
+bounded = "yes"
+status = "shipped"
+wire = "verified"
+divergent = "D-22"
+notes = "ARSCAN's walk with up to two hundred and fifty predicates in front of the reply, combined with OR unless AND was asked for, answering the indexes that matched or index and value pairs with WITHVALUES. EXACT is byte equality, MATCH is containment, GLOB is the pattern language KEYS uses and RE is a POSIX extended regular expression. The two bounds take - and + for the two ends of the array as well as an index, and they are read before the rest of the command, so a bad index beats a syntax error whichever way round the two are written. LIMIT counts what matched and not what was looked at, which is why this is the one array walk that is bounded by the option rather than inherently."
 
 [[command]]
 name = "AROP"
