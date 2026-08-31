@@ -102,6 +102,7 @@ pub mod ttl;
 pub mod value;
 pub mod walk;
 pub mod zset;
+pub mod zsetops;
 pub mod zsets;
 
 pub use blob::{Blob, Span};
@@ -130,4 +131,5 @@ pub use value::{EMBSTR_MAX, Encoding, Kind, Str};
 // caller holding both cannot pass one where the other was meant.
 pub use yo_index::Cursor as KeyCursor;
 pub use zset::{Bound as ZBound, Lex, Limits as ZsetLimits, Zset};
+pub use zsetops::{Aggregate, Op as ZOp, Operand};
 pub use zsets::{By, Gate, Move, Query, Window, ZAdd};

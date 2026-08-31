@@ -30,20 +30,41 @@
 //! there are and [`Keyspace::zwalk`] hands them over one at a time. The memo in
 //! the keyspace means the second call does not resolve the key again.
 //!
+//! # The commands over more than one key
+//!
+//! `ZUNION`, `ZINTER`, `ZDIFF` and their three store forms all come through
+//! [`Keyspace::zsetop`] or [`Keyspace::zsetop_store`], because the only thing
+//! that separates them is which members survive and that is [`crate::zsetops`]'s
+//! decision, not this file's. What is decided here is which keys they are
+//! allowed to name. A plain set is a sorted set where every score is one, so
+//! `ZUNIONSTORE d 2 zs plain` is legal and every input resolves through
+//! `live_slot_either`. A key that is not there stays in place as
+//! [`Operand::Missing`] rather than being dropped, because `WEIGHTS` is
+//! positional and closing the gap would hand every later input the wrong
+//! weight.
+//!
+//! `ZINTERCARD` is not `ZINTER` with the members thrown away, because it can
+//! stop at its limit and never has to work out a single score.
+//!
 //! # Errors
 //!
 //! Every command here answers `WRONGTYPE` for a key holding something that is
 //! not a sorted set, and treats a missing key as an empty one, which between
 //! them cover every case because a key is a sorted set, or another type, or
-//! absent.
+//! absent. The commands over several keys resolve every key before they build
+//! anything, so `ZUNIONSTORE d 2 z not-a-zset` leaves `d` alone rather than
+//! finding out too late.
 
+use yo_common::num::DIGITS_MAX;
 use yo_common::{Code, Error, Result};
 
+use crate::elem::Elements;
 use crate::keyspace::Keyspace;
 use crate::scan::Cursor;
 use crate::strings;
 use crate::value::{self, Kind};
 use crate::zset::{Added, Bound, Lex, Member, Zset};
+use crate::zsetops::{self, Aggregate, Op, Operand};
 
 /// Which members a `ZADD` is allowed to touch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -592,6 +613,159 @@ impl Keyspace {
             return Ok(Cursor::END);
         };
         Ok(self.zset_at(at).scan(cursor, count, f))
+    }
+
+    /// `ZUNION`, `ZINTER` and `ZDIFF`, which differ only in `op`.
+    ///
+    /// The members come out in rank order, which means the result has to be put
+    /// in order before any of it can be handed over, and that is what the return
+    /// value's ordering costs. `ZINTERCARD` exists precisely because counting
+    /// does not need any of that, and it does not come through here.
+    pub fn zsetop<'k, F>(
+        &mut self,
+        op: Op,
+        keys: impl Iterator<Item = &'k [u8]>,
+        weights: &[f64],
+        agg: Aggregate,
+        f: F,
+    ) -> Result<usize>
+    where
+        F: FnMut(Member<'_>, f64),
+    {
+        let slots = self.operand_slots(keys)?;
+        let got = zsetops::gather(op, &self.operands_of(&slots), weights, agg);
+        let limits = self.zset_limits;
+        let Some(z) = Zset::from_elements(got, &limits) else {
+            return Ok(0);
+        };
+        let len = z.len();
+        z.walk(0, len, false, f);
+        Ok(len)
+    }
+
+    /// `ZUNIONSTORE`, `ZINTERSTORE` and `ZDIFFSTORE`.
+    ///
+    /// The destination is allowed to be one of the sources, which is safe for
+    /// the reason `SINTERSTORE` gives: the result is built whole before the
+    /// destination is touched, so nothing here writes over a body that is still
+    /// being read.
+    pub fn zsetop_store<'k>(
+        &mut self,
+        op: Op,
+        destination: &[u8],
+        keys: impl Iterator<Item = &'k [u8]>,
+        weights: &[f64],
+        agg: Aggregate,
+    ) -> Result<usize> {
+        let slots = self.operand_slots(keys)?;
+        let got = zsetops::gather(op, &self.operands_of(&slots), weights, agg);
+        let limits = self.zset_limits;
+        Ok(self.put_zset(destination, Zset::from_elements(got, &limits)))
+    }
+
+    /// `ZINTERCARD numkeys key [key ...] [LIMIT limit]`.
+    ///
+    /// Nothing is stored and no score is worked out, and a limit stops the walk
+    /// as soon as it is reached, which is the only reason this is not `ZINTER`
+    /// with the members thrown away.
+    pub fn zintercard<'k>(
+        &mut self,
+        keys: impl Iterator<Item = &'k [u8]>,
+        limit: usize,
+    ) -> Result<usize> {
+        let slots = self.operand_slots(keys)?;
+        Ok(zsetops::intercard(&self.operands_of(&slots), limit))
+    }
+
+    /// `ZRANGESTORE destination source <the arguments of ZRANGE>`.
+    ///
+    /// The window is copied rather than moved, because the destination may be
+    /// the source and because the source keeps its members either way. An empty
+    /// window deletes the destination, which is what `ZRANGESTORE d s 5 1` does
+    /// and is the same rule every store form follows.
+    pub fn zrangestore(
+        &mut self,
+        destination: &[u8],
+        source: &[u8],
+        q: &Query<'_>,
+    ) -> Result<usize> {
+        let built = match self.zset_slot(source)? {
+            None => None,
+            Some(at) => {
+                let z = self.zset_at(at);
+                let w = window(z, q);
+                let mut got = Elements::with_capacity(w.count.max(16));
+                let mut digits = [0u8; DIGITS_MAX];
+                // In rank order whichever way the query walked, because the
+                // destination is a sorted set and puts them in score order
+                // regardless. `REV` decides which members are taken, not what
+                // order they end up in.
+                let from = if w.rev { w.from + 1 - w.count } else { w.from };
+                z.walk(from, w.count, false, |m, s| {
+                    let _ = got.insert(member_bytes(m, &mut digits), s);
+                });
+                let limits = self.zset_limits;
+                Zset::from_elements(got, &limits)
+            }
+        };
+        Ok(self.put_zset(destination, built))
+    }
+
+    /// Where each key is and what type it holds, keeping the ones that are not
+    /// there in place.
+    ///
+    /// In place and not dropped, because `WEIGHTS` is positional: a missing
+    /// second key still has a second weight, and closing the gap would hand
+    /// every later input the wrong one.
+    fn operand_slots<'k>(
+        &mut self,
+        keys: impl Iterator<Item = &'k [u8]>,
+    ) -> Result<Vec<Option<(Kind, u32)>>> {
+        let mut out = Vec::with_capacity(keys.size_hint().0);
+        for key in keys {
+            out.push(self.live_slot_either(key, Kind::Zset, Kind::Set)?);
+        }
+        Ok(out)
+    }
+
+    /// The bodies those slots point at, as things the algebra can ask questions
+    /// of.
+    fn operands_of(&self, slots: &[Option<(Kind, u32)>]) -> Vec<Operand<'_>> {
+        slots
+            .iter()
+            .map(|got| match got {
+                Some((Kind::Zset, at)) => Operand::Zset(self.zset_at(*at)),
+                Some((Kind::Set, at)) => {
+                    Operand::Set(self.sets.get(*at).expect("the record points at its body"))
+                }
+                _ => Operand::Missing,
+            })
+            .collect()
+    }
+
+    /// Put a sorted set under `key`, replacing whatever was there.
+    ///
+    /// Nothing means delete the key, because an empty sorted set does not exist.
+    /// That is what makes `ZINTERSTORE d a b` with an empty intersection delete
+    /// `d` and answer zero rather than leave something `EXISTS` says one for.
+    ///
+    /// Whatever the key held is freed first, through the one funnel, and any
+    /// deadline it had goes with it, because the value under the key is not the
+    /// value the expiry was set on.
+    fn put_zset(&mut self, key: &[u8], z: Option<Zset>) -> usize {
+        let Some(z) = z else {
+            self.drop_key(key);
+            return 0;
+        };
+        self.free_body(key);
+        let len = z.len();
+        let at = self.zsets.insert(z);
+        let record = value::slot_record_len(false);
+        self.map.set_with(key, record, |out| {
+            value::write_slot_record(out, Kind::Zset, at, None);
+        });
+        self.bodies += 1;
+        len
     }
 
     /// The slot `key`'s sorted set is in, or `None` if there is no such key.
@@ -1311,5 +1485,364 @@ mod tests {
             k.memory_bytes() < held,
             "the sorted set's body was not freed"
         );
+    }
+
+    /// Everything in a key, in rank order, as pairs.
+    fn all(k: &mut Keyspace, key: &[u8]) -> Vec<(String, f64)> {
+        let q = Query::rank(0, -1);
+        let w = k.zwindow(key, &q).unwrap();
+        let mut out = Vec::new();
+        let mut digits = [0u8; DIGITS_MAX];
+        k.zwalk(key, w, |m, s| {
+            out.push((
+                String::from_utf8(member_bytes(m, &mut digits).to_vec()).unwrap(),
+                s,
+            ));
+        })
+        .unwrap();
+        out
+    }
+
+    /// What one of the non storing forms answers, in the order it answered.
+    fn got(
+        k: &mut Keyspace,
+        op: Op,
+        keys: &[&[u8]],
+        weights: &[f64],
+        agg: Aggregate,
+    ) -> Vec<(String, f64)> {
+        let mut out = Vec::new();
+        let mut digits = [0u8; DIGITS_MAX];
+        let n = k
+            .zsetop(op, keys.iter().copied(), weights, agg, |m, s| {
+                out.push((
+                    String::from_utf8(member_bytes(m, &mut digits).to_vec()).unwrap(),
+                    s,
+                ));
+            })
+            .unwrap();
+        assert_eq!(out.len(), n, "the count and the walk disagree");
+        out
+    }
+
+    #[test]
+    fn a_union_adds_the_scores_of_a_member_that_is_in_both() {
+        let mut k = ks();
+        add(&mut k, b"a", &[(1.0, b"x"), (2.0, b"y")]);
+        add(&mut k, b"b", &[(10.0, b"y"), (3.0, b"z")]);
+        assert_eq!(
+            got(&mut k, Op::Union, &[b"a", b"b"], &[], Aggregate::Sum),
+            [("x".into(), 1.0), ("z".into(), 3.0), ("y".into(), 12.0)]
+        );
+    }
+
+    #[test]
+    fn an_intersection_keeps_only_what_every_input_has() {
+        let mut k = ks();
+        add(&mut k, b"a", &[(1.0, b"x"), (2.0, b"y"), (3.0, b"z")]);
+        add(&mut k, b"b", &[(5.0, b"y"), (5.0, b"z")]);
+        add(&mut k, b"c", &[(7.0, b"z")]);
+        assert_eq!(
+            got(&mut k, Op::Inter, &[b"a", b"b", b"c"], &[], Aggregate::Sum),
+            [("z".into(), 15.0)]
+        );
+        assert_eq!(
+            got(&mut k, Op::Inter, &[b"a", b"b", b"c"], &[], Aggregate::Min),
+            [("z".into(), 3.0)]
+        );
+        assert_eq!(
+            got(&mut k, Op::Inter, &[b"a", b"b", b"c"], &[], Aggregate::Max),
+            [("z".into(), 7.0)]
+        );
+    }
+
+    #[test]
+    fn a_difference_takes_the_first_input_and_removes_the_rest() {
+        let mut k = ks();
+        add(&mut k, b"a", &[(1.0, b"x"), (2.0, b"y"), (3.0, b"z")]);
+        add(&mut k, b"b", &[(99.0, b"y")]);
+        assert_eq!(
+            got(&mut k, Op::Diff, &[b"a", b"b"], &[], Aggregate::Sum),
+            [("x".into(), 1.0), ("z".into(), 3.0)]
+        );
+    }
+
+    #[test]
+    fn a_missing_key_keeps_its_place_so_the_weights_stay_lined_up() {
+        let mut k = ks();
+        add(&mut k, b"a", &[(1.0, b"x")]);
+        add(&mut k, b"c", &[(1.0, b"x")]);
+        // The second weight belongs to the key that is not there, and the third
+        // to `c`. Dropping the gap would give `c` the 10 and answer 11.
+        let out = got(
+            &mut k,
+            Op::Union,
+            &[b"a", b"gone", b"c"],
+            &[2.0, 10.0, 3.0],
+            Aggregate::Sum,
+        );
+        assert_eq!(out, [("x".into(), 5.0)]);
+    }
+
+    #[test]
+    fn a_plain_set_counts_as_every_score_being_one() {
+        let mut k = ks();
+        add(&mut k, b"z", &[(5.0, b"x")]);
+        k.sadd(b"s", [b"x".as_slice(), b"y".as_slice()].into_iter())
+            .unwrap();
+        assert_eq!(
+            got(&mut k, Op::Union, &[b"z", b"s"], &[], Aggregate::Sum),
+            [("y".into(), 1.0), ("x".into(), 6.0)]
+        );
+        assert_eq!(
+            got(&mut k, Op::Inter, &[b"z", b"s"], &[], Aggregate::Min),
+            [("x".into(), 1.0)]
+        );
+    }
+
+    #[test]
+    fn a_store_writes_the_result_and_answers_its_size() {
+        let mut k = ks();
+        add(&mut k, b"a", &[(1.0, b"x"), (2.0, b"y")]);
+        add(&mut k, b"b", &[(10.0, b"y")]);
+        assert_eq!(
+            k.zsetop_store(
+                Op::Union,
+                b"d",
+                [b"a".as_slice(), b"b".as_slice()].into_iter(),
+                &[],
+                Aggregate::Sum
+            )
+            .unwrap(),
+            2
+        );
+        assert_eq!(all(&mut k, b"d"), [("x".into(), 1.0), ("y".into(), 12.0)]);
+        assert_eq!(k.zscore(b"d", b"y").unwrap(), Some(12.0));
+        assert_eq!(k.zrank(b"d", b"y", false).unwrap(), Some((1, 12.0)));
+    }
+
+    #[test]
+    fn a_store_onto_one_of_its_own_sources_still_reads_the_old_body() {
+        let mut k = ks();
+        add(&mut k, b"a", &[(1.0, b"x"), (2.0, b"y")]);
+        add(&mut k, b"b", &[(10.0, b"y")]);
+        assert_eq!(
+            k.zsetop_store(
+                Op::Union,
+                b"a",
+                [b"a".as_slice(), b"b".as_slice()].into_iter(),
+                &[],
+                Aggregate::Sum
+            )
+            .unwrap(),
+            2
+        );
+        assert_eq!(all(&mut k, b"a"), [("x".into(), 1.0), ("y".into(), 12.0)]);
+    }
+
+    #[test]
+    fn a_store_with_nothing_in_it_deletes_the_destination() {
+        let mut k = ks();
+        add(&mut k, b"a", &[(1.0, b"x")]);
+        add(&mut k, b"b", &[(1.0, b"y")]);
+        add(&mut k, b"d", &[(1.0, b"old")]);
+        assert_eq!(
+            k.zsetop_store(
+                Op::Inter,
+                b"d",
+                [b"a".as_slice(), b"b".as_slice()].into_iter(),
+                &[],
+                Aggregate::Sum
+            )
+            .unwrap(),
+            0
+        );
+        assert!(!k.exists(b"d"));
+    }
+
+    #[test]
+    fn a_store_clears_the_deadline_the_destination_was_carrying() {
+        let mut k = ks();
+        add(&mut k, b"a", &[(1.0, b"x")]);
+        add(&mut k, b"d", &[(1.0, b"old")]);
+        assert!(k.set_expiry(b"d", Some(u64::MAX / 2)));
+        k.zsetop_store(
+            Op::Union,
+            b"d",
+            [b"a".as_slice()].into_iter(),
+            &[],
+            Aggregate::Sum,
+        )
+        .unwrap();
+        assert_eq!(all(&mut k, b"d"), [("x".into(), 1.0)]);
+        assert_eq!(k.expire_at(b"d"), None);
+    }
+
+    #[test]
+    fn the_algebra_refuses_a_key_holding_something_that_is_neither() {
+        let mut k = ks();
+        add(&mut k, b"a", &[(1.0, b"x")]);
+        k.set(b"s", b"hello", strings::SetOptions::default())
+            .unwrap();
+        assert_eq!(
+            k.zsetop(
+                Op::Union,
+                [b"a".as_slice(), b"s".as_slice()].into_iter(),
+                &[],
+                Aggregate::Sum,
+                |_, _| {}
+            )
+            .unwrap_err()
+            .code(),
+            Code::WrongType
+        );
+        // And the destination is untouched, because the keys are all resolved
+        // before anything is built.
+        assert!(!k.exists(b"d"));
+        assert_eq!(
+            k.zsetop_store(
+                Op::Union,
+                b"d",
+                [b"a".as_slice(), b"s".as_slice()].into_iter(),
+                &[],
+                Aggregate::Sum
+            )
+            .unwrap_err()
+            .code(),
+            Code::WrongType
+        );
+        assert!(!k.exists(b"d"));
+    }
+
+    #[test]
+    fn intercard_counts_without_building_anything_and_stops_at_the_limit() {
+        let mut k = ks();
+        add(
+            &mut k,
+            b"a",
+            &[(1.0, b"w"), (2.0, b"x"), (3.0, b"y"), (4.0, b"z")],
+        );
+        add(&mut k, b"b", &[(1.0, b"x"), (1.0, b"y"), (1.0, b"z")]);
+        assert_eq!(
+            k.zintercard([b"a".as_slice(), b"b".as_slice()].into_iter(), 0)
+                .unwrap(),
+            3
+        );
+        assert_eq!(
+            k.zintercard([b"a".as_slice(), b"b".as_slice()].into_iter(), 2)
+                .unwrap(),
+            2
+        );
+        assert_eq!(
+            k.zintercard([b"a".as_slice(), b"gone".as_slice()].into_iter(), 0)
+                .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn a_range_store_copies_a_window_and_leaves_the_source_alone() {
+        let mut k = ks();
+        add(
+            &mut k,
+            b"z",
+            &[(1.0, b"a"), (2.0, b"b"), (3.0, b"c"), (4.0, b"d")],
+        );
+        assert_eq!(k.zrangestore(b"d", b"z", &Query::rank(1, 2)).unwrap(), 2);
+        assert_eq!(all(&mut k, b"d"), [("b".into(), 2.0), ("c".into(), 3.0)]);
+        assert_eq!(k.zcard(b"z").unwrap(), 4);
+    }
+
+    #[test]
+    fn a_reverse_range_store_picks_the_same_members_and_orders_them_the_same() {
+        let mut k = ks();
+        add(
+            &mut k,
+            b"z",
+            &[(1.0, b"a"), (2.0, b"b"), (3.0, b"c"), (4.0, b"d")],
+        );
+        // REV picks which members, not what order they end up in, because the
+        // destination is a sorted set and a sorted set has one order.
+        assert_eq!(
+            k.zrangestore(b"d", b"z", &Query::rank(0, 1).rev(true))
+                .unwrap(),
+            2
+        );
+        assert_eq!(all(&mut k, b"d"), [("c".into(), 3.0), ("d".into(), 4.0)]);
+    }
+
+    #[test]
+    fn a_range_store_by_score_takes_the_bounds_the_range_would_have() {
+        let mut k = ks();
+        add(
+            &mut k,
+            b"z",
+            &[(1.0, b"a"), (2.0, b"b"), (3.0, b"c"), (4.0, b"d")],
+        );
+        let q = Query::score(Bound::closed(2.0), Bound::open(4.0));
+        assert_eq!(k.zrangestore(b"d", b"z", &q).unwrap(), 2);
+        assert_eq!(all(&mut k, b"d"), [("b".into(), 2.0), ("c".into(), 3.0)]);
+    }
+
+    #[test]
+    fn a_range_store_of_an_empty_window_deletes_the_destination() {
+        let mut k = ks();
+        add(&mut k, b"z", &[(1.0, b"a")]);
+        add(&mut k, b"d", &[(1.0, b"old")]);
+        assert_eq!(k.zrangestore(b"d", b"z", &Query::rank(5, 9)).unwrap(), 0);
+        assert!(!k.exists(b"d"));
+        assert_eq!(
+            k.zrangestore(b"d", b"gone", &Query::rank(0, -1)).unwrap(),
+            0
+        );
+        assert!(!k.exists(b"d"));
+    }
+
+    #[test]
+    fn a_range_store_onto_its_own_source_keeps_the_window() {
+        let mut k = ks();
+        add(
+            &mut k,
+            b"z",
+            &[(1.0, b"a"), (2.0, b"b"), (3.0, b"c"), (4.0, b"d")],
+        );
+        assert_eq!(k.zrangestore(b"z", b"z", &Query::rank(1, 2)).unwrap(), 2);
+        assert_eq!(all(&mut k, b"z"), [("b".into(), 2.0), ("c".into(), 3.0)]);
+    }
+
+    #[test]
+    fn a_big_result_comes_out_on_the_table_band_in_the_right_order() {
+        let mut k = ks();
+        let names: Vec<String> = (0..3000).map(|i| format!("member-{i:05}")).collect();
+        for (i, name) in names.iter().enumerate() {
+            add(&mut k, b"a", &[((i % 17) as f64, name.as_bytes())]);
+        }
+        for name in names.iter().step_by(3) {
+            add(&mut k, b"b", &[(100.0, name.as_bytes())]);
+        }
+        let n = k
+            .zsetop_store(
+                Op::Union,
+                b"d",
+                [b"a".as_slice(), b"b".as_slice()].into_iter(),
+                &[],
+                Aggregate::Sum,
+            )
+            .unwrap();
+        assert_eq!(n, 3000);
+        assert_eq!(
+            k.zset_encoding(b"d").map(crate::zset::Encoding::name),
+            Some("skiplist")
+        );
+        let out = all(&mut k, b"d");
+        assert_eq!(out.len(), 3000);
+        let mut want = out.clone();
+        want.sort_by(|x, y| x.1.partial_cmp(&y.1).unwrap().then_with(|| x.0.cmp(&y.0)));
+        assert_eq!(out, want, "the result came out in the wrong order");
+        for (i, name) in names.iter().enumerate() {
+            let base = (i % 17) as f64;
+            let want = if i % 3 == 0 { base + 100.0 } else { base };
+            assert_eq!(k.zscore(b"d", name.as_bytes()).unwrap(), Some(want));
+        }
     }
 }

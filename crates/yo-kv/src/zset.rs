@@ -567,6 +567,68 @@ impl Zset {
         }
     }
 
+    /// Build a sorted set out of a member to score table that is in no order.
+    ///
+    /// This is what the algebra next door hands back. `ZUNIONSTORE` works out
+    /// every member's final score in a table that knows nothing about order,
+    /// because a member appearing in a fourth input should be a hash probe and
+    /// not a pair of tree descents, and then this puts the whole thing in order
+    /// once at the end.
+    ///
+    /// The table is not read and copied, it is moved in and becomes the sorted
+    /// set. Every member's bytes were written when the first input holding that
+    /// member was walked and they are never touched again, which is the thing
+    /// that makes a union of four large sets one pass over each of them and one
+    /// sort, rather than a pass and a rebuild.
+    ///
+    /// Answers nothing for an empty table, because an empty sorted set does not
+    /// exist and the caller's key should be deleted rather than made.
+    #[must_use]
+    pub fn from_elements(members: Elements<f64>, limits: &Limits) -> Option<Zset> {
+        let n = members.len();
+        if n == 0 {
+            return None;
+        }
+        // Row numbers put in order, which is a sort of four byte integers with
+        // an indirection in the comparison rather than a sort of the members
+        // themselves. Nothing is moved but the numbers.
+        let mut rows: Vec<u32> = (0..n as u32).collect();
+        rows.sort_unstable_by(|&a, &b| {
+            let (a_name, a_score) = members.at(a as usize).expect("in range");
+            let (b_name, b_score) = members.at(b as usize).expect("in range");
+            cmp_key(*a_score, a_name, *b_score, b_name)
+        });
+        // Small enough to stay packed, which is worth checking because a
+        // `ZINTERSTORE` of two large sets very often produces a small one.
+        let packable = n <= limits.max_listpack_entries
+            && rows.iter().all(|&r| {
+                members.at(r as usize).expect("in range").0.len() <= limits.max_listpack_value
+            });
+        if packable {
+            let mut lp = Listpack::new();
+            let mut text = Vec::new();
+            for &row in &rows {
+                let (name, score) = members.at(row as usize).expect("in range");
+                text.clear();
+                push_double(&mut text, *score);
+                lp.push(name);
+                lp.push(&text);
+            }
+            return Some(Zset {
+                body: Body::Packed(lp),
+            });
+        }
+        let mut order = Rank::new();
+        // Already in order, so every row goes on the end and the tree never
+        // compares anything.
+        for (at, &row) in rows.iter().enumerate() {
+            order.insert_at(at, row);
+        }
+        Some(Zset {
+            body: Body::Table(Table { members, order }),
+        })
+    }
+
     /// Move to the table, which is one way and does not come back.
     fn promote(&mut self) {
         let Body::Packed(lp) = &self.body else { return };
