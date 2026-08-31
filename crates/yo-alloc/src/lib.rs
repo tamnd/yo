@@ -42,28 +42,52 @@
 //! flag is never set and the allocator's check is the same false it would be on
 //! any other thread.
 //!
-//! # What it found the first time it was armed
+//! # Getting the list
 //!
 //! `yodb` installs this and `pump` wraps its dispatch in [`guard`], so
-//! `YO_ALLOC=report yodb serve` answers the question. Driven with about seventy
-//! commands covering every type, it reported 31 distinct sites, and they are not
-//! one problem:
+//! `YO_ALLOC=report yodb serve` answers the question, and `cargo xtask alloc`
+//! is that with a server, a workload and a parser around it. It builds a debug
+//! `yodb`, drives it with about nine thousand commands covering every type and
+//! prints one line per distinct site. Debug on purpose: release inlines the
+//! interesting frames into each other and the report comes back naming
+//! `serve_command` for everything.
 //!
-//! Most of them are the first touch of a key. Creating a set, hash, list or
+//! Run it before touching anything here. The first list it produced contained
+//! sites that a narrower workload had not reached, and it contradicted what had
+//! already been written down about what was left. A report mode exists so that
+//! the list is measured rather than argued about, and that only works if it is
+//! the list you actually look at.
+//!
+//! # What it found, and the two piles it sorts into
+//!
+//! The first arming reported 31 distinct sites, and they were never one
+//! problem.
+//!
+//! Most of them were the first touch of a key. Creating a set, hash, list or
 //! zset allocates the body, and the slab that holds bodies of that type doubles
 //! when it fills. That is real allocation on a command path and it is also the
-//! only sensible place for it, so those sites want a claim written down and an
-//! [`allow`] around them rather than a fix.
+//! only sensible place for it, so those sites wanted a claim written down and a
+//! [`first_touch`] around them rather than a fix. They have one now.
 //!
-//! The rest are the ones worth having: a `to_vec` of the value in `APPEND`,
-//! `SETRANGE`, `EXPIRE` and `DUMP`, a `Vec` built per call to hold the operands
-//! of a set operation, a boxed `dyn FnMut` in the intersection, and a number
-//! rendered into a fresh `Vec` in `LMOVE` and in `ZADD`. Every one of those is
-//! per command and in steady state, which is exactly what Y7 is about.
+//! The rest were the ones worth having: a `to_vec` of the value in `APPEND`,
+//! `SETRANGE` and `EXPIRE`, a `Vec` built per call to hold the operands of a
+//! set operation, a `Vec` of indices in `LREM`, a permutation buffer in
+//! `ZRANDMEMBER`, an owned key out of `RANDOMKEY`, the record copy in `RENAME`
+//! and the engine's own list of free decoder slots. Every one of those was per
+//! command and in steady state, which is exactly what Y7 is about, and every one
+//! of them is gone.
 //!
-//! So the order is: report first, sort the list into the two piles, fix the
-//! second pile and annotate the first, and only then turn [`Mode::Abort`] on for
-//! a build that has to stay clean.
+//! What is left is nine sites in three groups. Four are a collection growing
+//! because somebody put more in it, which is proportional to the data rather
+//! than per command and is arguably the same claim [`first_touch`] makes. One is
+//! the `ZRANDMEMBER` buffer reaching the size of the largest set it has been
+//! asked about. Three are a `to_vec` of a previous value, which is a signature
+//! question rather than a code question, because the embedded API says
+//! `Option<Vec<u8>>` and an owning API has to own something.
+//!
+//! So the order is: report first, sort the list into the piles, fix the ones
+//! that are per command and annotate the ones that are not, and only then turn
+//! [`Mode::Abort`] on for a build that has to stay clean.
 //!
 //! # Using it
 //!
