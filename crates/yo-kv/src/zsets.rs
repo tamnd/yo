@@ -1,0 +1,1315 @@
+//! The sorted set commands.
+//!
+//! One method per Redis command on [`Keyspace`], the same arrangement the string,
+//! set, hash and list commands use and for the same reason: a key belongs to the
+//! database and not to a type, so `ZADD` against a string has to be able to see
+//! that it is a string. The sorted set itself, and the choice between its two
+//! representations, is [`crate::zset`]. This file is what the wire and the
+//! embedded API both call.
+//!
+//! # Every range command is the same command
+//!
+//! There are nine ways to ask a sorted set for a run of members. `ZRANGE` alone
+//! has three, once `BYSCORE` and `BYLEX` are counted, and then `REV` doubles
+//! them and `ZREVRANGE`, `ZREVRANGEBYSCORE` and `ZREVRANGEBYLEX` exist as older
+//! spellings of the same thing. `ZRANGESTORE` is a tenth, and the three
+//! `ZREMRANGE` forms are three more, and `ZCOUNT` and `ZLEXCOUNT` are two of
+//! those with the walk left off.
+//!
+//! Writing fourteen of those separately is fourteen chances to get an exclusive
+//! bound or a negative index wrong in one of them. So there is one [`Query`],
+//! and every one of those commands is a `Query` turned into a [`Window`], which
+//! is a rank, a count and a direction. What a command does with the window is
+//! all that separates it from the others: walk it, count it, remove it, or walk
+//! it into another key.
+//!
+//! Two calls and not one, because the wire needs the count before it needs the
+//! members: a RESP array writes its length first, and a reply that collected the
+//! members into a `Vec` in order to count them would allocate on the read path,
+//! which is the thing `Y1` is about. So [`Keyspace::zwindow`] answers how many
+//! there are and [`Keyspace::zwalk`] hands them over one at a time. The memo in
+//! the keyspace means the second call does not resolve the key again.
+//!
+//! # Errors
+//!
+//! Every command here answers `WRONGTYPE` for a key holding something that is
+//! not a sorted set, and treats a missing key as an empty one, which between
+//! them cover every case because a key is a sorted set, or another type, or
+//! absent.
+
+use yo_common::{Code, Error, Result};
+
+use crate::keyspace::Keyspace;
+use crate::scan::Cursor;
+use crate::strings;
+use crate::value::{self, Kind};
+use crate::zset::{Added, Bound, Lex, Member, Zset};
+
+/// Which members a `ZADD` is allowed to touch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Gate {
+    /// Add and update both. Plain `ZADD`.
+    #[default]
+    Always,
+    /// Only add members that are not there. `ZADD NX`.
+    IfMissing,
+    /// Only update members that are there. `ZADD XX`.
+    IfPresent,
+}
+
+/// Which way a `ZADD` is allowed to move a score it already has.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Move {
+    /// Either way. Plain `ZADD`.
+    #[default]
+    Any,
+    /// Only up. `ZADD GT`.
+    Up,
+    /// Only down. `ZADD LT`.
+    Down,
+}
+
+/// What a `ZADD` was asked to do.
+///
+/// `NX` with `GT` or `LT` is refused by the parser rather than here, because a
+/// gate that only lets new members through and a rule about which way an
+/// existing score may move cannot both apply to the same member and Redis calls
+/// that a syntax error.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ZAdd {
+    /// `NX` or `XX`.
+    pub gate: Gate,
+    /// `GT` or `LT`.
+    pub only: Move,
+    /// `CH`, which counts changed scores as well as new members.
+    pub changed: bool,
+}
+
+/// Which end of a sorted set a command works from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum From {
+    /// The lowest score. `ZPOPMIN`, and `ZMPOP MIN`.
+    Min,
+    /// The highest score. `ZPOPMAX`, and `ZMPOP MAX`.
+    Max,
+}
+
+/// What a range is measured in.
+#[derive(Debug, Clone, Copy)]
+pub enum By<'a> {
+    /// Positions, where a negative one counts from the end. `ZRANGE k 0 -1`.
+    Rank {
+        /// The first position, inclusive.
+        start: i64,
+        /// The last position, inclusive.
+        stop: i64,
+    },
+    /// Scores. `ZRANGEBYSCORE`, and `ZRANGE ... BYSCORE`.
+    Score {
+        /// The lowest score wanted.
+        min: Bound,
+        /// The highest score wanted.
+        max: Bound,
+    },
+    /// Members, which is only meaningful when every score is the same.
+    /// `ZRANGEBYLEX`, and `ZRANGE ... BYLEX`.
+    Lex {
+        /// The first member wanted.
+        min: Lex<'a>,
+        /// The last member wanted.
+        max: Lex<'a>,
+    },
+}
+
+/// A run of members, however it was asked for.
+///
+/// `min` and `max` are always the low end and the high end of the range itself,
+/// whichever order the command wrote them in. `REV` reverses the walk, it does
+/// not reverse the range, which is why `ZRANGEBYSCORE k 1 5` and
+/// `ZREVRANGEBYSCORE k 5 1` cover the same members.
+#[derive(Debug, Clone, Copy)]
+pub struct Query<'a> {
+    /// What the range is measured in.
+    pub by: By<'a>,
+    /// Walk from the high end down. `REV`, and the `ZREV` spellings.
+    pub rev: bool,
+    /// How many to skip once the range is found. `LIMIT`'s first number.
+    pub offset: usize,
+    /// How many to take, or all of them. `LIMIT`'s second number, where Redis's
+    /// negative count means all.
+    pub count: Option<usize>,
+}
+
+impl<'a> Query<'a> {
+    /// A plain `ZRANGE key start stop`.
+    #[must_use]
+    pub const fn rank(start: i64, stop: i64) -> Query<'a> {
+        Query {
+            by: By::Rank { start, stop },
+            rev: false,
+            offset: 0,
+            count: None,
+        }
+    }
+
+    /// A plain `ZRANGEBYSCORE key min max`.
+    #[must_use]
+    pub const fn score(min: Bound, max: Bound) -> Query<'a> {
+        Query {
+            by: By::Score { min, max },
+            rev: false,
+            offset: 0,
+            count: None,
+        }
+    }
+
+    /// A plain `ZRANGEBYLEX key min max`.
+    #[must_use]
+    pub const fn lex(min: Lex<'a>, max: Lex<'a>) -> Query<'a> {
+        Query {
+            by: By::Lex { min, max },
+            rev: false,
+            offset: 0,
+            count: None,
+        }
+    }
+
+    /// The same query walked from the other end.
+    #[must_use]
+    pub const fn rev(mut self, rev: bool) -> Query<'a> {
+        self.rev = rev;
+        self
+    }
+
+    /// The same query with a `LIMIT` on it.
+    #[must_use]
+    pub const fn limit(mut self, offset: usize, count: Option<usize>) -> Query<'a> {
+        self.offset = offset;
+        self.count = count;
+        self
+    }
+}
+
+/// Where a run of members starts, how long it is, and which way it goes.
+///
+/// This is what every range command reduces to, and it is a rank rather than a
+/// pair of members because the tree answers in ranks. `from` is the first member
+/// the walk hands over, so on a reverse walk it is the high end and the walk
+/// counts down.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Window {
+    /// The rank the walk starts at.
+    pub from: usize,
+    /// How many members the walk hands over.
+    pub count: usize,
+    /// Whether the walk counts down.
+    pub rev: bool,
+}
+
+/// A score that is not a number, which no command may store.
+fn nan() -> Error {
+    Error::new(Code::Invalid, "resulting score is not a number (NaN)")
+}
+
+impl Keyspace {
+    /// `ZADD key [NX|XX] [GT|LT] [CH] score member [score member ...]`.
+    ///
+    /// Answers how many members were added, or how many were added or changed if
+    /// `CH` was given, which is the only thing `CH` does.
+    ///
+    /// The pairs arrive as an iterator and not a slice, the way `SADD`'s members
+    /// do, because the wire layer has them as positions in the connection's read
+    /// buffer and a slice would mean collecting them first. It is walked more
+    /// than once, which is why it has to be `Clone`.
+    pub fn zadd<'m, I>(&mut self, key: &[u8], pairs: I, opts: ZAdd) -> Result<usize>
+    where
+        I: Iterator<Item = (f64, &'m [u8])> + Clone,
+    {
+        for (score, m) in pairs.clone() {
+            strings::check_len(key, m.len())?;
+            if score.is_nan() {
+                return Err(nan());
+            }
+        }
+        let at = match self.zset_slot(key)? {
+            Some(at) => at,
+            None => {
+                // A key is not created for a `ZADD XX` that cannot add anything,
+                // and it is not created for an empty pair list either. Redis's
+                // parser rejects `ZADD k` before it gets this far, but the
+                // embedded API has no parser in front of it and an empty sorted
+                // set left behind would be a key that exists and holds nothing.
+                if opts.gate == Gate::IfPresent || pairs.clone().next().is_none() {
+                    return Ok(0);
+                }
+                self.new_zset(key)
+            }
+        };
+        let limits = self.zset_limits;
+        let z = self
+            .zsets
+            .get_mut(at)
+            .expect("the record points at its body");
+        let mut added = 0usize;
+        let mut changed = 0usize;
+        for (score, m) in pairs {
+            let Some(want) = gated(z, m, score, opts) else {
+                continue;
+            };
+            // The element table being full means twenty four million members in
+            // one key. Nothing was stored, so nothing is counted.
+            if z.add(m, score, &limits) == Added::Full {
+                continue;
+            }
+            match want {
+                Added::New => added += 1,
+                Added::Changed => changed += 1,
+                _ => {}
+            }
+        }
+        // A `ZADD XX` on a key that did not exist never got here, so the only
+        // way to be holding an empty sorted set is a pair list that turned out
+        // to be empty after the gate, and that key was ours to make.
+        if z.is_empty() {
+            self.drop_key(key);
+        }
+        Ok(if opts.changed { added + changed } else { added })
+    }
+
+    /// `ZADD key ... INCR score member`, and `ZINCRBY key increment member`.
+    ///
+    /// Answers the member's new score, or nothing at all if a gate refused it,
+    /// which is the nil `ZADD INCR` replies with and is why this is one method
+    /// rather than an `INCR` flag on [`Keyspace::zadd`] that would have to
+    /// return two different shapes.
+    ///
+    /// `ZINCRBY` is this with no gate, where the answer is never nil.
+    pub fn zincrby(
+        &mut self,
+        key: &[u8],
+        member: &[u8],
+        by: f64,
+        opts: ZAdd,
+    ) -> Result<Option<f64>> {
+        strings::check_len(key, member.len())?;
+        if by.is_nan() {
+            return Err(nan());
+        }
+        let at = match self.zset_slot(key)? {
+            Some(at) => at,
+            None => {
+                if opts.gate == Gate::IfPresent {
+                    return Ok(None);
+                }
+                self.new_zset(key)
+            }
+        };
+        let limits = self.zset_limits;
+        let z = self
+            .zsets
+            .get_mut(at)
+            .expect("the record points at its body");
+        let now = z.score(member);
+        let want = now.unwrap_or(0.0) + by;
+        // Infinity plus its opposite. Redis refuses this and leaves the score
+        // alone rather than storing a NaN nothing could ever compare against.
+        if want.is_nan() {
+            if z.is_empty() {
+                self.drop_key(key);
+            }
+            return Err(nan());
+        }
+        let allowed = match (now, opts.gate, opts.only) {
+            (Some(_), Gate::IfMissing, _) | (None, Gate::IfPresent, _) => false,
+            (Some(was), _, Move::Up) => want > was,
+            (Some(was), _, Move::Down) => want < was,
+            _ => true,
+        };
+        if !allowed || z.add(member, want, &limits) == Added::Full {
+            if z.is_empty() {
+                self.drop_key(key);
+            }
+            return Ok(None);
+        }
+        Ok(Some(want))
+    }
+
+    /// `ZCARD key`.
+    pub fn zcard(&mut self, key: &[u8]) -> Result<usize> {
+        Ok(match self.zset_slot(key)? {
+            Some(at) => self.zset_at(at).len(),
+            None => 0,
+        })
+    }
+
+    /// `ZSCORE key member`.
+    pub fn zscore(&mut self, key: &[u8], member: &[u8]) -> Result<Option<f64>> {
+        Ok(match self.zset_slot(key)? {
+            Some(at) => self.zset_at(at).score(member),
+            None => None,
+        })
+    }
+
+    /// `ZMSCORE key member [member ...]`, which is `ZSCORE` in bulk.
+    ///
+    /// One key lookup for the whole call rather than one per member, which is
+    /// the only reason the command exists.
+    pub fn zmscore<'m>(
+        &mut self,
+        key: &[u8],
+        members: impl Iterator<Item = &'m [u8]>,
+        out: &mut Vec<Option<f64>>,
+    ) -> Result<()> {
+        out.clear();
+        let Some(at) = self.zset_slot(key)? else {
+            out.extend(members.map(|_| None));
+            return Ok(());
+        };
+        let z = self.zset_at(at);
+        out.extend(members.map(|m| z.score(m)));
+        Ok(())
+    }
+
+    /// `ZREM key member [member ...]`. Answers how many were there.
+    ///
+    /// A sorted set that loses its last member loses its key too, because an
+    /// empty sorted set does not exist in Redis.
+    pub fn zrem<'m>(
+        &mut self,
+        key: &[u8],
+        members: impl Iterator<Item = &'m [u8]>,
+    ) -> Result<usize> {
+        let Some(at) = self.zset_slot(key)? else {
+            return Ok(0);
+        };
+        let z = self
+            .zsets
+            .get_mut(at)
+            .expect("the record points at its body");
+        let mut gone = 0;
+        for m in members {
+            if z.remove(m) {
+                gone += 1;
+            }
+        }
+        if z.is_empty() {
+            self.drop_key(key);
+        }
+        Ok(gone)
+    }
+
+    /// `ZRANK key member [WITHSCORE]`, and `ZREVRANK` with `rev` set.
+    ///
+    /// The score comes back whether it was asked for or not, because finding the
+    /// rank already read it and handing it over costs nothing.
+    pub fn zrank(&mut self, key: &[u8], member: &[u8], rev: bool) -> Result<Option<(usize, f64)>> {
+        let Some(at) = self.zset_slot(key)? else {
+            return Ok(None);
+        };
+        let z = self.zset_at(at);
+        let Some(rank) = z.rank(member) else {
+            return Ok(None);
+        };
+        let score = z.score(member).unwrap_or(0.0);
+        Ok(Some((if rev { z.len() - 1 - rank } else { rank }, score)))
+    }
+
+    /// How many members a query covers, and where they start.
+    ///
+    /// Every range command starts here. It is separate from [`Keyspace::zwalk`]
+    /// because a RESP array writes its length before its members, and a reply
+    /// that collected the members in order to count them would allocate on the
+    /// read path.
+    pub fn zwindow(&mut self, key: &[u8], q: &Query<'_>) -> Result<Window> {
+        let Some(at) = self.zset_slot(key)? else {
+            return Ok(Window::default());
+        };
+        Ok(window(self.zset_at(at), q))
+    }
+
+    /// Hand over the members a window covers, in order, without collecting them.
+    ///
+    /// The window is the caller's rather than the query's, so that a caller that
+    /// has already asked [`Keyspace::zwindow`] does not compute it twice, and so
+    /// that `ZRANGESTORE` can walk a window it has already narrowed.
+    pub fn zwalk<F>(&mut self, key: &[u8], w: Window, f: F) -> Result<()>
+    where
+        F: FnMut(Member<'_>, f64),
+    {
+        let Some(at) = self.zset_slot(key)? else {
+            return Ok(());
+        };
+        self.zset_at(at).walk(w.from, w.count, w.rev, f);
+        Ok(())
+    }
+
+    /// `ZCOUNT`, `ZLEXCOUNT`, and the count half of any other range command.
+    pub fn zcount(&mut self, key: &[u8], q: &Query<'_>) -> Result<usize> {
+        Ok(self.zwindow(key, q)?.count)
+    }
+
+    /// `ZREMRANGEBYRANK`, `ZREMRANGEBYSCORE` and `ZREMRANGEBYLEX`, which differ
+    /// only in what the query was measured in.
+    ///
+    /// Answers how many went. The window is taken out from its high end down, so
+    /// that every rank still to be removed is the rank it was when the window
+    /// was worked out.
+    pub fn zremrange(&mut self, key: &[u8], q: &Query<'_>) -> Result<usize> {
+        let Some(at) = self.zset_slot(key)? else {
+            return Ok(0);
+        };
+        let w = window(self.zset_at(at), q);
+        let z = self
+            .zsets
+            .get_mut(at)
+            .expect("the record points at its body");
+        // A reverse window starts at its high end, so normalise to the low one
+        // and then count down from the top of it either way.
+        let low = if w.rev { w.from + 1 - w.count } else { w.from };
+        for i in (0..w.count).rev() {
+            z.remove_at(low + i);
+        }
+        if z.is_empty() {
+            self.drop_key(key);
+        }
+        Ok(w.count)
+    }
+
+    /// `ZPOPMIN key [count]` and `ZPOPMAX key [count]`.
+    ///
+    /// Nothing is collected. The member at the end is handed to `f`, which
+    /// writes it wherever it is going, and only then is it removed, which is why
+    /// this does not allocate where `SPOP` has to.
+    pub fn zpop<F>(&mut self, key: &[u8], end: From, count: usize, mut f: F) -> Result<usize>
+    where
+        F: FnMut(Member<'_>, f64),
+    {
+        let Some(at) = self.zset_slot(key)? else {
+            return Ok(0);
+        };
+        let z = self
+            .zsets
+            .get_mut(at)
+            .expect("the record points at its body");
+        let count = count.min(z.len());
+        for _ in 0..count {
+            // Always rank zero or the last rank, because taking one out moves
+            // everything above it down and the next one to go is at the same
+            // place again.
+            let rank = if end == From::Min { 0 } else { z.len() - 1 };
+            let Some((m, s)) = z.at(rank) else { break };
+            f(m, s);
+            z.remove_at(rank);
+        }
+        if z.is_empty() {
+            self.drop_key(key);
+        }
+        Ok(count)
+    }
+
+    /// `ZPOPMIN key` and `ZPOPMAX key`, as an owned member for a caller that has
+    /// nowhere to write it yet.
+    ///
+    /// This is what `BZPOPMIN` needs: a worker that has been parked has no reply
+    /// buffer open at the moment the member becomes available, so this one has
+    /// to allocate where [`Keyspace::zpop`] does not.
+    pub fn zpop_one(&mut self, key: &[u8], end: From) -> Result<Option<(Vec<u8>, f64)>> {
+        let mut got = None;
+        let mut name = [0u8; yo_common::num::DIGITS_MAX];
+        self.zpop(key, end, 1, |m, s| {
+            got = Some((member_bytes(m, &mut name).to_vec(), s));
+        })?;
+        Ok(got)
+    }
+
+    /// `ZRANDMEMBER key [count]`.
+    ///
+    /// A positive count draws without replacement and answers at most as many as
+    /// there are, and a negative one draws with replacement and answers exactly
+    /// as many as asked for, which is Redis's rule and is why the count is
+    /// signed here rather than paired with a flag.
+    ///
+    /// The draw without replacement is a partial shuffle of the row numbers and
+    /// not a retry loop, because a retry loop on a count near the size of the set
+    /// spends most of its time drawing members it already has.
+    pub fn zrandmember<F>(&mut self, key: &[u8], count: i64, mut f: F) -> Result<usize>
+    where
+        F: FnMut(Member<'_>, f64),
+    {
+        let Some(at) = self.zset_slot(key)? else {
+            return Ok(0);
+        };
+        let len = self.zset_at(at).len();
+        if len == 0 || count == 0 {
+            return Ok(0);
+        }
+        if count < 0 {
+            let want = count.unsigned_abs() as usize;
+            for _ in 0..want {
+                let pick = self.rng.below(len);
+                let Some((m, s)) = self.zset_at(at).pick(pick) else {
+                    break;
+                };
+                f(m, s);
+            }
+            return Ok(want);
+        }
+        let want = (count as usize).min(len);
+        // Whole set, in storage order, which is what Redis does for a count at
+        // or over the size and which saves shuffling in order to hand back
+        // everything anyway.
+        if want == len {
+            for i in 0..len {
+                let Some((m, s)) = self.zset_at(at).pick(i) else {
+                    break;
+                };
+                f(m, s);
+            }
+            return Ok(len);
+        }
+        let mut rows: Vec<usize> = (0..len).collect();
+        for i in 0..want {
+            let pick = i + self.rng.below(len - i);
+            rows.swap(i, pick);
+            let Some((m, s)) = self.zset_at(at).pick(rows[i]) else {
+                break;
+            };
+            f(m, s);
+        }
+        Ok(want)
+    }
+
+    /// `ZSCAN key cursor [COUNT count]`.
+    ///
+    /// A small sorted set comes back whole with a cursor of [`Cursor::END`], the
+    /// same guarantee `SSCAN` and `HSCAN` give, because a listpack has no stable
+    /// position to resume from and 128 members is not worth a resume.
+    pub fn zscan<F>(&mut self, key: &[u8], cursor: Cursor, count: usize, f: F) -> Result<Cursor>
+    where
+        F: FnMut(Member<'_>, f64),
+    {
+        let Some(at) = self.zset_slot(key)? else {
+            return Ok(Cursor::END);
+        };
+        Ok(self.zset_at(at).scan(cursor, count, f))
+    }
+
+    /// The slot `key`'s sorted set is in, or `None` if there is no such key.
+    #[inline]
+    fn zset_slot(&mut self, key: &[u8]) -> Result<Option<u32>> {
+        self.live_slot(key, Kind::Zset)
+    }
+
+    /// The body in a slot the record pointed at.
+    ///
+    /// Panicking here means a record outlived its body, which is the bug the
+    /// two invariants in [`crate::sets`] are there to make impossible.
+    #[inline]
+    fn zset_at(&self, at: u32) -> &Zset {
+        self.zsets.get(at).expect("the record points at its body")
+    }
+
+    /// Make an empty sorted set under `key` and answer which slot it went in.
+    ///
+    /// No hint, unlike a set. A sorted set starts packed whatever is going into
+    /// it, and the first `ZADD` that crosses either threshold promotes it, so
+    /// counting the pairs in advance would only move the same work earlier.
+    fn new_zset(&mut self, key: &[u8]) -> u32 {
+        let at = self.zsets.insert(Zset::new());
+        let len = value::slot_record_len(false);
+        self.map.set_with(key, len, |out| {
+            value::write_slot_record(out, Kind::Zset, at, None);
+        });
+        self.bodies += 1;
+        at
+    }
+}
+
+/// What a `ZADD` of one pair would do, or nothing if a gate refuses it.
+///
+/// This is worked out before the add rather than from what the add answered,
+/// because `GT` and `LT` have to see the old score to know whether the new one
+/// is allowed at all, and by then the add has already stored it.
+fn gated(z: &Zset, member: &[u8], score: f64, opts: ZAdd) -> Option<Added> {
+    match z.score(member) {
+        None => match opts.gate {
+            Gate::IfPresent => None,
+            // A new member is added whatever `GT` or `LT` say, because there is
+            // no old score for them to be about.
+            _ => Some(Added::New),
+        },
+        Some(was) => {
+            if opts.gate == Gate::IfMissing {
+                return None;
+            }
+            let ok = match opts.only {
+                Move::Any => true,
+                Move::Up => score > was,
+                Move::Down => score < was,
+            };
+            if !ok {
+                return None;
+            }
+            // An unchanged score is not a change, which is what stops `CH` from
+            // counting a member that was written over with what it already had.
+            Some(if score == was {
+                Added::Same
+            } else {
+                Added::Changed
+            })
+        }
+    }
+}
+
+/// Turn a query into the run of ranks it covers.
+fn window(z: &Zset, q: &Query<'_>) -> Window {
+    let len = z.len();
+    let range = match q.by {
+        By::Rank { start, stop } => {
+            // A rank range is already in the direction it will be walked, so a
+            // reverse one counts its ends from the top rather than being found
+            // and then flipped.
+            let (from, count) = rank_span(start, stop, len);
+            if q.rev {
+                return apply_limit(
+                    Window {
+                        from: len - from - 1,
+                        count,
+                        rev: true,
+                    },
+                    q,
+                    true,
+                );
+            }
+            return apply_limit(
+                Window {
+                    from,
+                    count,
+                    rev: false,
+                },
+                q,
+                true,
+            );
+        }
+        By::Score { min, max } => z.window_by_score(min, max),
+        By::Lex { min, max } => z.window_by_lex(min, max),
+    };
+    let count = range.end - range.start;
+    let from = if q.rev {
+        range.end.saturating_sub(1)
+    } else {
+        range.start
+    };
+    apply_limit(
+        Window {
+            from,
+            count,
+            rev: q.rev,
+        },
+        q,
+        false,
+    )
+}
+
+/// Move a window along by `LIMIT`'s offset and cut it to its count.
+///
+/// `ZRANGE key 0 -1 REV LIMIT 1 2` is the second and third from the top, so the
+/// offset walks in the direction of the walk and not up the ranks.
+///
+/// A rank range has already had its ends clamped, and Redis does not accept a
+/// `LIMIT` on one anyway, so `skip` says to leave it alone rather than the
+/// caller passing an offset of zero and a count of none and hoping.
+fn apply_limit(w: Window, q: &Query<'_>, skip: bool) -> Window {
+    if skip {
+        return w;
+    }
+    let offset = q.offset.min(w.count);
+    let count = q.count.unwrap_or(usize::MAX).min(w.count - offset);
+    let from = if w.rev {
+        w.from.saturating_sub(offset)
+    } else {
+        w.from + offset
+    };
+    Window {
+        from,
+        count,
+        rev: w.rev,
+    }
+}
+
+/// Turn an inclusive `start` and `stop` into an offset from the front and a
+/// count, clamping every out of range case rather than erroring.
+///
+/// The same rule `LRANGE` uses, and the same reason: a start before the front is
+/// the front, a stop past the end is the end, and a start after the stop is
+/// nothing at all.
+fn rank_span(start: i64, stop: i64, len: usize) -> (usize, usize) {
+    if len == 0 {
+        return (0, 0);
+    }
+    let len = len as i64;
+    let from = if start < 0 {
+        (len + start).max(0)
+    } else {
+        start.min(len)
+    };
+    let to = if stop < 0 {
+        len + stop
+    } else {
+        stop.min(len - 1)
+    };
+    if to < from {
+        return (from as usize, 0);
+    }
+    (from as usize, (to - from + 1) as usize)
+}
+
+/// The bytes of a member, which for one the listpack stored as an integer are
+/// the caller's buffer.
+fn member_bytes<'a>(m: Member<'a>, digits: &'a mut [u8; yo_common::num::DIGITS_MAX]) -> &'a [u8] {
+    match m {
+        Member::Str(s) => s,
+        Member::Int(n) => yo_common::num::i64_digits(digits, n),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use yo_common::num::DIGITS_MAX;
+
+    fn ks() -> Keyspace {
+        Keyspace::new()
+    }
+
+    /// Add a run of pairs the plain way.
+    fn add(k: &mut Keyspace, key: &[u8], pairs: &[(f64, &[u8])]) -> usize {
+        k.zadd(key, pairs.iter().copied(), ZAdd::default()).unwrap()
+    }
+
+    /// Every member a query covers, as names.
+    fn names(k: &mut Keyspace, key: &[u8], q: &Query<'_>) -> Vec<String> {
+        let w = k.zwindow(key, q).unwrap();
+        let mut out = Vec::new();
+        let mut digits = [0u8; DIGITS_MAX];
+        k.zwalk(key, w, |m, _| {
+            out.push(String::from_utf8(member_bytes(m, &mut digits).to_vec()).unwrap());
+        })
+        .unwrap();
+        assert_eq!(
+            out.len(),
+            w.count,
+            "the window said {} and the walk gave {}",
+            w.count,
+            out.len()
+        );
+        out
+    }
+
+    #[test]
+    fn a_missing_key_is_an_empty_sorted_set() {
+        let mut k = ks();
+        assert_eq!(k.zcard(b"nope").unwrap(), 0);
+        assert_eq!(k.zscore(b"nope", b"m").unwrap(), None);
+        assert_eq!(k.zrank(b"nope", b"m", false).unwrap(), None);
+        assert_eq!(k.zrem(b"nope", [b"m".as_slice()].into_iter()).unwrap(), 0);
+        assert_eq!(
+            names(&mut k, b"nope", &Query::rank(0, -1)),
+            Vec::<String>::new()
+        );
+        assert!(!k.exists(b"nope"));
+    }
+
+    #[test]
+    fn a_key_holding_something_else_is_a_wrongtype() {
+        let mut k = ks();
+        k.set(b"s", b"hello", strings::SetOptions::default())
+            .unwrap();
+        assert_eq!(k.zcard(b"s").unwrap_err().code(), Code::WrongType);
+        assert_eq!(
+            k.zadd(b"s", [(1.0, b"m".as_slice())].into_iter(), ZAdd::default())
+                .unwrap_err()
+                .code(),
+            Code::WrongType
+        );
+        assert_eq!(k.zscore(b"s", b"m").unwrap_err().code(), Code::WrongType);
+    }
+
+    #[test]
+    fn adding_answers_how_many_were_new() {
+        let mut k = ks();
+        assert_eq!(add(&mut k, b"z", &[(1.0, b"a"), (2.0, b"b")]), 2);
+        assert_eq!(add(&mut k, b"z", &[(1.0, b"a"), (3.0, b"c")]), 1);
+        assert_eq!(k.zcard(b"z").unwrap(), 3);
+        assert_eq!(k.zscore(b"z", b"c").unwrap(), Some(3.0));
+        assert_eq!(k.kind_of(b"z").map(Kind::name), Some("zset"));
+        assert_eq!(k.encoding_name(b"z"), Some("listpack"));
+    }
+
+    #[test]
+    fn the_ch_flag_counts_moved_scores_too() {
+        let mut k = ks();
+        add(&mut k, b"z", &[(1.0, b"a"), (2.0, b"b")]);
+        let ch = ZAdd {
+            changed: true,
+            ..ZAdd::default()
+        };
+        // One score moved, one stayed, one member is new.
+        let pairs = [
+            (9.0, b"a".as_slice()),
+            (2.0, b"b".as_slice()),
+            (3.0, b"c".as_slice()),
+        ];
+        assert_eq!(k.zadd(b"z", pairs.into_iter(), ch).unwrap(), 2);
+        assert_eq!(k.zadd(b"z", pairs.into_iter(), ZAdd::default()).unwrap(), 0);
+    }
+
+    #[test]
+    fn the_gates_let_the_right_members_through() {
+        let mut k = ks();
+        add(&mut k, b"z", &[(1.0, b"a")]);
+        let nx = ZAdd {
+            gate: Gate::IfMissing,
+            ..ZAdd::default()
+        };
+        let xx = ZAdd {
+            gate: Gate::IfPresent,
+            ..ZAdd::default()
+        };
+        assert_eq!(
+            k.zadd(b"z", [(5.0, b"a".as_slice())].into_iter(), nx)
+                .unwrap(),
+            0
+        );
+        assert_eq!(k.zscore(b"z", b"a").unwrap(), Some(1.0));
+        assert_eq!(
+            k.zadd(b"z", [(5.0, b"b".as_slice())].into_iter(), nx)
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            k.zadd(b"z", [(7.0, b"c".as_slice())].into_iter(), xx)
+                .unwrap(),
+            0
+        );
+        assert_eq!(k.zscore(b"z", b"c").unwrap(), None);
+        assert_eq!(
+            k.zadd(b"z", [(7.0, b"a".as_slice())].into_iter(), xx)
+                .unwrap(),
+            0
+        );
+        assert_eq!(k.zscore(b"z", b"a").unwrap(), Some(7.0));
+        // XX on a key that does not exist does not create it.
+        assert_eq!(
+            k.zadd(b"gone", [(1.0, b"a".as_slice())].into_iter(), xx)
+                .unwrap(),
+            0
+        );
+        assert!(!k.exists(b"gone"));
+    }
+
+    #[test]
+    fn gt_and_lt_only_move_a_score_one_way() {
+        let mut k = ks();
+        add(&mut k, b"z", &[(5.0, b"a")]);
+        let gt = ZAdd {
+            only: Move::Up,
+            changed: true,
+            ..ZAdd::default()
+        };
+        let lt = ZAdd {
+            only: Move::Down,
+            changed: true,
+            ..ZAdd::default()
+        };
+        assert_eq!(
+            k.zadd(b"z", [(3.0, b"a".as_slice())].into_iter(), gt)
+                .unwrap(),
+            0
+        );
+        assert_eq!(k.zscore(b"z", b"a").unwrap(), Some(5.0));
+        assert_eq!(
+            k.zadd(b"z", [(9.0, b"a".as_slice())].into_iter(), gt)
+                .unwrap(),
+            1
+        );
+        assert_eq!(k.zscore(b"z", b"a").unwrap(), Some(9.0));
+        assert_eq!(
+            k.zadd(b"z", [(9.0, b"a".as_slice())].into_iter(), lt)
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            k.zadd(b"z", [(2.0, b"a".as_slice())].into_iter(), lt)
+                .unwrap(),
+            1
+        );
+        assert_eq!(k.zscore(b"z", b"a").unwrap(), Some(2.0));
+        // A member that is not there is added whatever GT says.
+        assert_eq!(
+            k.zadd(b"z", [(1.0, b"new".as_slice())].into_iter(), gt)
+                .unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn incrementing_adds_to_what_is_there_or_to_nothing() {
+        let mut k = ks();
+        let plain = ZAdd::default();
+        assert_eq!(k.zincrby(b"z", b"a", 5.0, plain).unwrap(), Some(5.0));
+        assert_eq!(k.zincrby(b"z", b"a", -2.5, plain).unwrap(), Some(2.5));
+        assert_eq!(k.zscore(b"z", b"a").unwrap(), Some(2.5));
+        let nx = ZAdd {
+            gate: Gate::IfMissing,
+            ..ZAdd::default()
+        };
+        assert_eq!(k.zincrby(b"z", b"a", 1.0, nx).unwrap(), None);
+        assert_eq!(k.zscore(b"z", b"a").unwrap(), Some(2.5));
+        let xx = ZAdd {
+            gate: Gate::IfPresent,
+            ..ZAdd::default()
+        };
+        assert_eq!(k.zincrby(b"z", b"never", 1.0, xx).unwrap(), None);
+        assert!(k.zscore(b"z", b"never").unwrap().is_none());
+        let gt = ZAdd {
+            only: Move::Up,
+            ..ZAdd::default()
+        };
+        assert_eq!(k.zincrby(b"z", b"a", -1.0, gt).unwrap(), None);
+        assert_eq!(k.zincrby(b"z", b"a", 1.0, gt).unwrap(), Some(3.5));
+    }
+
+    #[test]
+    fn a_score_that_is_not_a_number_is_refused() {
+        let mut k = ks();
+        let plain = ZAdd::default();
+        assert_eq!(
+            k.zadd(b"z", [(f64::NAN, b"a".as_slice())].into_iter(), plain)
+                .unwrap_err()
+                .code(),
+            Code::Invalid
+        );
+        assert!(!k.exists(b"z"));
+        k.zincrby(b"z", b"a", f64::INFINITY, plain).unwrap();
+        let err = k.zincrby(b"z", b"a", f64::NEG_INFINITY, plain).unwrap_err();
+        assert_eq!(err.code(), Code::Invalid);
+        // The score is left exactly as it was rather than stored as a NaN.
+        assert_eq!(k.zscore(b"z", b"a").unwrap(), Some(f64::INFINITY));
+    }
+
+    #[test]
+    fn a_sorted_set_that_loses_its_last_member_loses_its_key() {
+        let mut k = ks();
+        add(&mut k, b"z", &[(1.0, b"a"), (2.0, b"b")]);
+        assert_eq!(
+            k.zrem(b"z", [b"a".as_slice(), b"b".as_slice()].into_iter())
+                .unwrap(),
+            2
+        );
+        assert!(!k.exists(b"z"));
+        assert_eq!(k.zcard(b"z").unwrap(), 0);
+    }
+
+    #[test]
+    fn ranks_count_from_both_ends() {
+        let mut k = ks();
+        add(&mut k, b"z", &[(1.0, b"a"), (2.0, b"b"), (3.0, b"c")]);
+        assert_eq!(k.zrank(b"z", b"a", false).unwrap(), Some((0, 1.0)));
+        assert_eq!(k.zrank(b"z", b"c", false).unwrap(), Some((2, 3.0)));
+        assert_eq!(k.zrank(b"z", b"a", true).unwrap(), Some((2, 1.0)));
+        assert_eq!(k.zrank(b"z", b"c", true).unwrap(), Some((0, 3.0)));
+        assert_eq!(k.zrank(b"z", b"nope", false).unwrap(), None);
+    }
+
+    #[test]
+    fn a_rank_range_clamps_every_way_it_can_be_wrong() {
+        let mut k = ks();
+        add(&mut k, b"z", &[(1.0, b"a"), (2.0, b"b"), (3.0, b"c")]);
+        assert_eq!(names(&mut k, b"z", &Query::rank(0, -1)), ["a", "b", "c"]);
+        assert_eq!(names(&mut k, b"z", &Query::rank(1, 1)), ["b"]);
+        assert_eq!(names(&mut k, b"z", &Query::rank(-2, -1)), ["b", "c"]);
+        assert_eq!(names(&mut k, b"z", &Query::rank(-99, 99)), ["a", "b", "c"]);
+        assert_eq!(
+            names(&mut k, b"z", &Query::rank(2, 1)),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            names(&mut k, b"z", &Query::rank(5, 9)),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            names(&mut k, b"z", &Query::rank(0, -1).rev(true)),
+            ["c", "b", "a"]
+        );
+        assert_eq!(
+            names(&mut k, b"z", &Query::rank(0, 1).rev(true)),
+            ["c", "b"]
+        );
+    }
+
+    #[test]
+    fn a_score_range_walks_either_way_and_takes_a_limit() {
+        let mut k = ks();
+        add(
+            &mut k,
+            b"z",
+            &[(1.0, b"a"), (2.0, b"b"), (3.0, b"c"), (4.0, b"d")],
+        );
+        let all = Query::score(
+            Bound::closed(f64::NEG_INFINITY),
+            Bound::closed(f64::INFINITY),
+        );
+        assert_eq!(names(&mut k, b"z", &all), ["a", "b", "c", "d"]);
+        assert_eq!(names(&mut k, b"z", &all.rev(true)), ["d", "c", "b", "a"]);
+        assert_eq!(
+            names(
+                &mut k,
+                b"z",
+                &Query::score(Bound::closed(2.0), Bound::closed(3.0))
+            ),
+            ["b", "c"]
+        );
+        assert_eq!(
+            names(
+                &mut k,
+                b"z",
+                &Query::score(Bound::open(2.0), Bound::open(4.0))
+            ),
+            ["c"]
+        );
+        // LIMIT walks in the direction of the walk, so the reverse one skips
+        // from the top.
+        assert_eq!(names(&mut k, b"z", &all.limit(1, Some(2))), ["b", "c"]);
+        assert_eq!(
+            names(&mut k, b"z", &all.rev(true).limit(1, Some(2))),
+            ["c", "b"]
+        );
+        assert_eq!(
+            names(&mut k, b"z", &all.limit(9, Some(2))),
+            Vec::<String>::new()
+        );
+        assert_eq!(names(&mut k, b"z", &all.limit(2, None)), ["c", "d"]);
+        assert_eq!(
+            k.zcount(b"z", &Query::score(Bound::closed(2.0), Bound::closed(3.0)))
+                .unwrap(),
+            2
+        );
+    }
+
+    #[test]
+    fn a_member_range_orders_by_member_when_every_score_is_the_same() {
+        let mut k = ks();
+        add(
+            &mut k,
+            b"z",
+            &[(0.0, b"a"), (0.0, b"b"), (0.0, b"c"), (0.0, b"d")],
+        );
+        assert_eq!(
+            names(&mut k, b"z", &Query::lex(Lex::Min, Lex::Max)),
+            ["a", "b", "c", "d"]
+        );
+        assert_eq!(
+            names(&mut k, b"z", &Query::lex(Lex::Incl(b"b"), Lex::Incl(b"c"))),
+            ["b", "c"]
+        );
+        assert_eq!(
+            names(&mut k, b"z", &Query::lex(Lex::Excl(b"a"), Lex::Excl(b"d"))),
+            ["b", "c"]
+        );
+        assert_eq!(
+            names(&mut k, b"z", &Query::lex(Lex::Min, Lex::Max).rev(true)),
+            ["d", "c", "b", "a"]
+        );
+        assert_eq!(
+            k.zcount(b"z", &Query::lex(Lex::Incl(b"b"), Lex::Max))
+                .unwrap(),
+            3
+        );
+    }
+
+    #[test]
+    fn removing_a_range_takes_out_exactly_what_the_walk_would_have_given() {
+        let mut k = ks();
+        for (q, left) in [
+            (Query::rank(0, 1), vec!["c", "d", "e"]),
+            (Query::rank(-2, -1), vec!["a", "b", "c"]),
+            (
+                Query::score(Bound::closed(2.0), Bound::closed(4.0)),
+                vec!["a", "e"],
+            ),
+            (
+                Query::lex(Lex::Incl(b"b"), Lex::Excl(b"d")),
+                vec!["a", "d", "e"],
+            ),
+            (Query::rank(0, -1).rev(true), vec![]),
+        ] {
+            k.del(b"z");
+            add(
+                &mut k,
+                b"z",
+                &[
+                    (1.0, b"a"),
+                    (2.0, b"b"),
+                    (3.0, b"c"),
+                    (4.0, b"d"),
+                    (5.0, b"e"),
+                ],
+            );
+            let want = names(&mut k, b"z", &q).len();
+            assert_eq!(k.zremrange(b"z", &q).unwrap(), want, "{q:?}");
+            assert_eq!(names(&mut k, b"z", &Query::rank(0, -1)), left, "{q:?}");
+        }
+        // The key went with the last member.
+        assert!(!k.exists(b"z"));
+    }
+
+    #[test]
+    fn popping_takes_from_the_end_it_was_told_to() {
+        let mut k = ks();
+        add(&mut k, b"z", &[(1.0, b"a"), (2.0, b"b"), (3.0, b"c")]);
+        let mut got = Vec::new();
+        let mut digits = [0u8; DIGITS_MAX];
+        k.zpop(b"z", From::Min, 2, |m, s| {
+            got.push((
+                String::from_utf8(member_bytes(m, &mut digits).to_vec()).unwrap(),
+                s,
+            ));
+        })
+        .unwrap();
+        assert_eq!(got, [("a".to_string(), 1.0), ("b".to_string(), 2.0)]);
+        assert_eq!(
+            k.zpop_one(b"z", From::Max).unwrap(),
+            Some((b"c".to_vec(), 3.0))
+        );
+        assert!(!k.exists(b"z"));
+        // A count past the end takes what there is and no more.
+        add(&mut k, b"z", &[(1.0, b"a")]);
+        assert_eq!(k.zpop(b"z", From::Max, 99, |_, _| {}).unwrap(), 1);
+        assert!(!k.exists(b"z"));
+        assert_eq!(k.zpop_one(b"z", From::Min).unwrap(), None);
+    }
+
+    #[test]
+    fn a_random_draw_is_with_or_without_replacement_by_the_sign_of_the_count() {
+        let mut k = ks();
+        add(&mut k, b"z", &[(1.0, b"a"), (2.0, b"b"), (3.0, b"c")]);
+        let mut digits = [0u8; DIGITS_MAX];
+        let mut seen = Vec::new();
+        k.zrandmember(b"z", 2, |m, _| {
+            seen.push(String::from_utf8(member_bytes(m, &mut digits).to_vec()).unwrap());
+        })
+        .unwrap();
+        assert_eq!(seen.len(), 2);
+        seen.sort();
+        seen.dedup();
+        assert_eq!(seen.len(), 2, "a positive count does not repeat a member");
+        // A count past the size is the whole set and not a repeat of it.
+        let mut all = Vec::new();
+        k.zrandmember(b"z", 99, |m, _| {
+            all.push(String::from_utf8(member_bytes(m, &mut digits).to_vec()).unwrap());
+        })
+        .unwrap();
+        all.sort();
+        assert_eq!(all, ["a", "b", "c"]);
+        // A negative count answers exactly as many as asked for and may repeat.
+        let mut many = 0;
+        k.zrandmember(b"z", -10, |_, _| many += 1).unwrap();
+        assert_eq!(many, 10);
+        assert_eq!(k.zrandmember(b"nope", 3, |_, _| {}).unwrap(), 0);
+    }
+
+    #[test]
+    fn a_scan_of_either_band_walks_every_member_once() {
+        let mut k = ks();
+        for entries in [8usize, 4096] {
+            k.del(b"z");
+            let pairs: Vec<(f64, Vec<u8>)> = (0..entries)
+                .map(|i| (i as f64, format!("m{i:05}").into_bytes()))
+                .collect();
+            k.zadd(
+                b"z",
+                pairs.iter().map(|(s, m)| (*s, m.as_slice())),
+                ZAdd::default(),
+            )
+            .unwrap();
+            let mut seen = Vec::new();
+            let mut digits = [0u8; DIGITS_MAX];
+            let mut cursor = Cursor::START;
+            loop {
+                cursor = k
+                    .zscan(b"z", cursor, 16, |m, _| {
+                        seen.push(
+                            String::from_utf8(member_bytes(m, &mut digits).to_vec()).unwrap(),
+                        );
+                    })
+                    .unwrap();
+                if cursor.is_end() {
+                    break;
+                }
+            }
+            seen.sort();
+            seen.dedup();
+            assert_eq!(seen.len(), entries, "{entries} members");
+        }
+    }
+
+    #[test]
+    fn a_big_sorted_set_promotes_and_still_answers_every_rank() {
+        let mut k = ks();
+        let pairs: Vec<(f64, Vec<u8>)> = (0..5_000)
+            .map(|i| (f64::from(i), format!("m{i:05}").into_bytes()))
+            .collect();
+        assert_eq!(
+            k.zadd(
+                b"z",
+                pairs.iter().map(|(s, m)| (*s, m.as_slice())),
+                ZAdd::default()
+            )
+            .unwrap(),
+            5_000
+        );
+        assert_eq!(k.encoding_name(b"z"), Some("skiplist"));
+        assert_eq!(k.zcard(b"z").unwrap(), 5_000);
+        assert_eq!(
+            k.zrank(b"z", b"m02500", false).unwrap(),
+            Some((2_500, 2500.0))
+        );
+        let q = Query::score(Bound::closed(1000.0), Bound::open(1010.0));
+        assert_eq!(k.zcount(b"z", &q).unwrap(), 10);
+        assert_eq!(
+            names(&mut k, b"z", &q).first().map(String::as_str),
+            Some("m01000")
+        );
+        // Everything still lines up after a few thousand removals.
+        assert_eq!(k.zremrange(b"z", &Query::rank(0, 2_499)).unwrap(), 2_500);
+        assert_eq!(k.zcard(b"z").unwrap(), 2_500);
+        assert_eq!(k.zrank(b"z", b"m02500", false).unwrap(), Some((0, 2500.0)));
+        assert_eq!(k.zrank(b"z", b"m00000", false).unwrap(), None);
+    }
+
+    #[test]
+    fn a_deadline_on_a_sorted_set_leaves_its_members_alone() {
+        let mut k = ks();
+        add(&mut k, b"z", &[(1.0, b"a"), (2.0, b"b")]);
+        assert!(k.set_expiry(b"z", Some(u64::MAX / 2)));
+        assert_eq!(k.zcard(b"z").unwrap(), 2);
+        assert_eq!(k.zscore(b"z", b"b").unwrap(), Some(2.0));
+        assert!(k.set_expiry(b"z", None));
+        assert_eq!(k.zcard(b"z").unwrap(), 2);
+    }
+
+    #[test]
+    fn writing_a_string_over_a_sorted_set_gives_its_body_back() {
+        let mut k = ks();
+        add(&mut k, b"z", &[(1.0, b"a")]);
+        let held = k.memory_bytes();
+        k.set(b"z", b"now a string", strings::SetOptions::default())
+            .unwrap();
+        assert_eq!(k.kind_of(b"z").map(Kind::name), Some("string"));
+        assert!(
+            k.memory_bytes() < held,
+            "the sorted set's body was not freed"
+        );
+    }
+}
