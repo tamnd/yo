@@ -158,7 +158,7 @@ impl Entry<'_> {
     /// by the caller rather than the entry being formatted once per candidate.
     #[must_use]
     #[inline]
-    fn is(&self, needle: &[u8], as_int: Option<i64>) -> bool {
+    pub(crate) fn is(&self, needle: &[u8], as_int: Option<i64>) -> bool {
         match (self, as_int) {
             (Entry::Int(n), Some(v)) => *n == v,
             (Entry::Int(_), None) => false,
@@ -289,6 +289,20 @@ impl Listpack {
     #[must_use]
     pub fn get(&self, index: usize) -> Option<Entry<'_>> {
         self.iter().nth(index)
+    }
+
+    /// Every element, back to front.
+    ///
+    /// The trailing length on each entry is what makes this cost the same per
+    /// element as the forward walk. `LPOS` with a negative rank counts matches
+    /// from the tail and stops when it has enough, so walking forward and
+    /// keeping the answers would be the wrong shape as well as the wrong cost.
+    pub fn iter_back(&self) -> RevIter<'_> {
+        let entries = self.entries();
+        RevIter {
+            bytes: entries,
+            at: entries.len(),
+        }
     }
 
     /// The element at a position, counting from the back.
@@ -477,6 +491,29 @@ impl<'a> Iterator for Iter<'a> {
         }
         let (entry, len) = decode(&self.bytes[self.at..self.bytes.len() - 1])?;
         self.at += len + backlen_len(len);
+        Some(entry)
+    }
+}
+
+/// A backward walk.
+#[derive(Debug)]
+pub struct RevIter<'a> {
+    bytes: &'a [u8],
+    at: usize,
+}
+
+impl<'a> Iterator for RevIter<'a> {
+    type Item = Entry<'a>;
+
+    #[inline]
+    fn next(&mut self) -> Option<Entry<'a>> {
+        if self.at == 0 {
+            return None;
+        }
+        let len = read_backlen(&self.bytes[..self.at])?;
+        let start = self.at.checked_sub(len + backlen_len(len))?;
+        let (entry, _) = decode(&self.bytes[start..self.at])?;
+        self.at = start;
         Some(entry)
     }
 }

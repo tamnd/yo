@@ -97,6 +97,26 @@ impl Chunk {
         }
     }
 
+    /// A chunk of its own for one element too big for an ordinary one.
+    ///
+    /// A list element can be half a gigabyte and a chunk is eight kilobytes, so
+    /// something has to give. Redis calls this a plain node and so does this:
+    /// the chunk is exactly the size of the element, it is full the moment it is
+    /// made, and every push against it is refused, which puts the next element
+    /// in a chunk of its own rather than growing this one to hold both.
+    #[must_use]
+    pub fn plain(value: &[u8]) -> Chunk {
+        let mut c = Chunk {
+            bytes: vec![0; entry_len(value)],
+            head: 0,
+            tail: 0,
+            count: 0,
+        };
+        let put = c.push_back(value);
+        debug_assert!(put, "a chunk sized for one element refused it");
+        c
+    }
+
     /// A chunk holding entries somebody else already encoded.
     ///
     /// The promotion out of the packed band, where the bytes in question are a
@@ -217,13 +237,7 @@ impl Chunk {
     /// The element at `index` from the front.
     #[must_use]
     pub fn get(&self, index: usize) -> Option<Entry<'_>> {
-        if index >= self.count {
-            return None;
-        }
-        let mut at = self.head;
-        for _ in 0..index {
-            at += self.step(at)?;
-        }
+        let at = self.offset_of(index)?;
         decode(&self.bytes[at..self.tail]).map(|(e, _)| e)
     }
 
@@ -254,6 +268,159 @@ impl Chunk {
         true
     }
 
+    /// Drop the first `n` elements.
+    ///
+    /// A walk of `n` entries and one move of the head cursor, with no bytes
+    /// touched at all, which is what makes `LTRIM` of the front of a long list
+    /// cost the walk and nothing else. Stops early and says how many it really
+    /// dropped if the chunk runs out first.
+    pub fn drop_front_n(&mut self, n: usize) -> usize {
+        let mut at = self.head;
+        let took = n.min(self.count);
+        for _ in 0..took {
+            let Some(step) = self.step(at) else {
+                break;
+            };
+            at += step;
+        }
+        self.count -= took;
+        self.head = at;
+        took
+    }
+
+    /// Drop the last `n` elements.
+    pub fn drop_back_n(&mut self, n: usize) -> usize {
+        let took = n.min(self.count);
+        for _ in 0..took {
+            let Some(at) = self.back_at() else {
+                break;
+            };
+            self.tail = at;
+            self.count -= 1;
+        }
+        took
+    }
+
+    /// Put `value` in at `index`, pushing what was there along.
+    ///
+    /// Says no when the chunk has no room, which the deque above answers by
+    /// splitting the chunk and asking one of the halves. The bytes on one side
+    /// of the hole do have to move, because the elements between the cursors are
+    /// a run, but it is whichever side is shorter and it is at most the size of
+    /// a chunk. That is the same move a quicklist makes for an insert and the
+    /// difference is that a list only inserts in the middle when a client asks
+    /// it to, where a quicklist does it on every `LPOP`.
+    pub fn insert_at(&mut self, index: usize, value: &[u8]) -> bool {
+        if index > self.count {
+            return false;
+        }
+        if index == self.count {
+            return self.push_back(value);
+        }
+        if index == 0 {
+            return self.push_front(value);
+        }
+        if self.count >= CHUNK_ENTRIES {
+            return false;
+        }
+        let need = entry_len(value);
+        let Some(at) = self.offset_of(index) else {
+            return false;
+        };
+        // Move the front half back or the back half forward, whichever end has
+        // the room, preferring the shorter side when both do.
+        let front = need <= self.head;
+        let back = self.tail + need <= self.bytes.len();
+        let at = if (front && !back) || (front && back && index * 2 <= self.count) {
+            self.bytes.copy_within(self.head..at, self.head - need);
+            self.head -= need;
+            at - need
+        } else if back {
+            self.bytes.copy_within(at..self.tail, at + need);
+            self.tail += need;
+            at
+        } else {
+            // No room at either end but perhaps room in total, in which case the
+            // shift makes some and the offset has to be found again.
+            if !self.shift(need, false) {
+                return false;
+            }
+            let at = self.offset_of(index).expect("the entries did not move");
+            self.bytes.copy_within(at..self.tail, at + need);
+            self.tail += need;
+            at
+        };
+        write_entry(&mut self.bytes[at..], value);
+        self.count += 1;
+        true
+    }
+
+    /// Take the element at `index` out, closing the gap behind it.
+    pub fn remove_at(&mut self, index: usize) -> bool {
+        if index >= self.count {
+            return false;
+        }
+        if index == 0 {
+            return self.drop_front();
+        }
+        if index + 1 == self.count {
+            return self.drop_back();
+        }
+        let Some(at) = self.offset_of(index) else {
+            return false;
+        };
+        let Some(span) = self.step(at) else {
+            return false;
+        };
+        // Close the gap from whichever side is shorter, the same as an insert.
+        if index * 2 <= self.count {
+            self.bytes.copy_within(self.head..at, self.head + span);
+            self.head += span;
+        } else {
+            self.bytes.copy_within(at + span..self.tail, at);
+            self.tail -= span;
+        }
+        self.count -= 1;
+        true
+    }
+
+    /// Put `value` where the element at `index` was.
+    ///
+    /// The common case is a value the same size as the one it replaces, which is
+    /// written where it lies. Anything else is a remove and an insert, and it
+    /// can fail for the same reason an insert can.
+    pub fn replace_at(&mut self, index: usize, value: &[u8]) -> bool {
+        let Some(at) = self.offset_of(index) else {
+            return false;
+        };
+        let need = entry_len(value);
+        if self.step(at) == Some(need) {
+            write_entry(&mut self.bytes[at..], value);
+            return true;
+        }
+        // Insert first and remove after, because an insert is the half that can
+        // fail and undoing it would mean holding the old bytes somewhere.
+        if !self.insert_at(index, value) {
+            return false;
+        }
+        self.remove_at(index + 1)
+    }
+
+    /// Split this chunk in two, keeping the first `index` elements.
+    ///
+    /// The entries are a run in one encoding, so the tail of the run is already
+    /// a chunk's worth of bytes and the split is one copy. This is how an insert
+    /// into a full chunk gets its room: the deque splits at the insertion point
+    /// and both halves come back with space.
+    #[must_use]
+    pub fn split_off(&mut self, index: usize) -> Chunk {
+        let at = self.offset_of(index).unwrap_or(self.tail);
+        let rest = Chunk::adopt(&self.bytes[at..self.tail], self.count - index);
+        self.tail = at;
+        self.count = index;
+        rest
+    }
+
     /// Give back the room this chunk was keeping for pushes it will not see.
     ///
     /// Called when a chunk stops being an end of the list. It is a copy of the
@@ -276,6 +443,32 @@ impl Chunk {
             bytes: &self.bytes[self.head..self.tail],
             at: 0,
         }
+    }
+
+    /// The same walk the other way.
+    ///
+    /// Every entry carries its own length behind it, which is what the back
+    /// cursor reads to find the entry before it, so this costs the same per
+    /// element as the forward walk rather than being a forward walk per element.
+    /// `LPOS` with a negative rank is the reason it exists.
+    #[must_use]
+    pub fn iter_back(&self) -> RevIter<'_> {
+        RevIter {
+            bytes: &self.bytes[self.head..self.tail],
+            at: self.tail - self.head,
+        }
+    }
+
+    /// Where the entry at `index` starts, or nothing if there is no such entry.
+    fn offset_of(&self, index: usize) -> Option<usize> {
+        if index >= self.count {
+            return None;
+        }
+        let mut at = self.head;
+        for _ in 0..index {
+            at += self.step(at)?;
+        }
+        Some(at)
     }
 
     /// Where the last entry starts.
@@ -311,6 +504,29 @@ impl<'a> Iterator for Iter<'a> {
         }
         let (entry, len) = decode(&self.bytes[self.at..])?;
         self.at += len + backlen_len(len);
+        Some(entry)
+    }
+}
+
+/// A backward walk over a chunk.
+#[derive(Debug)]
+pub struct RevIter<'a> {
+    bytes: &'a [u8],
+    at: usize,
+}
+
+impl<'a> Iterator for RevIter<'a> {
+    type Item = Entry<'a>;
+
+    #[inline]
+    fn next(&mut self) -> Option<Entry<'a>> {
+        if self.at == 0 {
+            return None;
+        }
+        let len = read_backlen(&self.bytes[..self.at])?;
+        let start = self.at.checked_sub(len + backlen_len(len))?;
+        let (entry, _) = decode(&self.bytes[start..self.at])?;
+        self.at = start;
         Some(entry)
     }
 }
@@ -495,5 +711,116 @@ mod tests {
             assert!(c.drop_back());
             assert_eq!(c.back().unwrap().to_vec(), b"first");
         }
+    }
+
+    /// A chunk with room at both ends, so that an insert can choose a side.
+    fn abcde() -> Chunk {
+        let mut c = Chunk::for_back();
+        for m in [b"c", b"d", b"e"] {
+            assert!(c.push_back(m));
+        }
+        for m in [b"b", b"a"] {
+            assert!(c.push_front(m));
+        }
+        c
+    }
+
+    #[test]
+    fn an_insert_lands_where_it_was_asked_to_from_either_side() {
+        for at in 0..=5 {
+            let mut c = abcde();
+            assert!(c.insert_at(at, b"new"), "inserting at {at}");
+            let mut want: Vec<Vec<u8>> = [b"a", b"b", b"c", b"d", b"e"]
+                .iter()
+                .map(|m| m.to_vec())
+                .collect();
+            want.insert(at, b"new".to_vec());
+            assert_eq!(all(&c), want, "inserting at {at}");
+            assert_eq!(c.len(), 6);
+        }
+        let mut c = abcde();
+        assert!(!c.insert_at(6, b"new"), "past the end is not an insert");
+    }
+
+    #[test]
+    fn a_remove_closes_the_gap_from_either_side() {
+        for at in 0..5 {
+            let mut c = abcde();
+            assert!(c.remove_at(at), "removing at {at}");
+            let mut want: Vec<Vec<u8>> = [b"a", b"b", b"c", b"d", b"e"]
+                .iter()
+                .map(|m| m.to_vec())
+                .collect();
+            want.remove(at);
+            assert_eq!(all(&c), want, "removing at {at}");
+            assert_eq!(c.len(), 4);
+            assert_eq!(c.back().unwrap().to_vec(), want[3]);
+        }
+        let mut c = abcde();
+        assert!(!c.remove_at(5));
+    }
+
+    /// The same length, a longer one and a shorter one, because only the first
+    /// is written where the old element lay.
+    #[test]
+    fn a_replace_takes_a_value_of_any_length() {
+        for value in [&b"z"[..], &b"much longer than what was there"[..], b"7"] {
+            for at in 0..5 {
+                let mut c = abcde();
+                assert!(c.replace_at(at, value), "replacing at {at}");
+                let mut want: Vec<Vec<u8>> = [b"a", b"b", b"c", b"d", b"e"]
+                    .iter()
+                    .map(|m| m.to_vec())
+                    .collect();
+                want[at] = value.to_vec();
+                assert_eq!(all(&c), want, "replacing at {at}");
+                assert_eq!(c.len(), 5);
+            }
+        }
+        let mut c = abcde();
+        assert!(!c.replace_at(5, b"z"));
+    }
+
+    #[test]
+    fn dropping_many_from_an_end_is_the_walk_and_nothing_else() {
+        let mut c = abcde();
+        assert_eq!(c.drop_front_n(2), 2);
+        assert_eq!(all(&c), vec![b"c".to_vec(), b"d".to_vec(), b"e".to_vec()]);
+        assert_eq!(c.drop_back_n(2), 2);
+        assert_eq!(all(&c), vec![b"c".to_vec()]);
+        assert_eq!(c.drop_front_n(9), 1, "it stops when it runs out");
+        assert!(c.is_empty());
+        assert_eq!(c.drop_back_n(3), 0);
+    }
+
+    #[test]
+    fn a_split_leaves_both_halves_readable_and_with_room() {
+        for at in 0..=5 {
+            let mut c = abcde();
+            let mut rest = c.split_off(at);
+            let want: Vec<Vec<u8>> = [b"a", b"b", b"c", b"d", b"e"]
+                .iter()
+                .map(|m| m.to_vec())
+                .collect();
+            assert_eq!(all(&c), want[..at].to_vec(), "the front half of {at}");
+            assert_eq!(all(&rest), want[at..].to_vec(), "the back half of {at}");
+            assert_eq!(c.len() + rest.len(), 5);
+            assert!(rest.push_back(b"more"), "the back half has no room");
+            assert_eq!(rest.back().unwrap().to_vec(), b"more");
+        }
+    }
+
+    /// An insert into a chunk that is full at both ends is refused, and the
+    /// split is what the deque does about it.
+    #[test]
+    fn a_full_chunk_refuses_an_insert_and_a_split_fixes_it() {
+        let mut c = Chunk::for_back();
+        let big = vec![b'x'; 500];
+        while c.push_back(&big) {}
+        let held = c.len();
+        assert!(!c.insert_at(held / 2, &big));
+        let mut rest = c.split_off(held / 2);
+        assert!(c.push_back(&big) || rest.push_front(&big));
+        assert_eq!(c.len() + rest.len(), held + 1);
     }
 }

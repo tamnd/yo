@@ -4,6 +4,15 @@ What each release changed, why, and what it costs you. The versioning rules and 
 
 While the major is 0, a minor release may break anything, including the on-disk format. The format is frozen at `M6`, not before.
 
+## Unreleased
+
+### Added
+
+- **Everything a list command needs to change a list in the middle.** The list type could be pushed and popped and read, which covers the queue and the stack and nothing else. It can now insert at an index or beside a pivot, overwrite an element, find one, list the positions of one with a rank, a count and a maximum scan, remove a number of matches from either end, trim to a window, and walk backwards. That is `LINSERT`, `LSET`, `LPOS`, `LREM`, `LTRIM` and the negative index half of `LRANGE`, all of it in the library and none of it on the wire yet.
+- **A chunk can be cut in half in one copy.** Inserting into the middle of a full chunk splits it, which in Redis is `_quicklistSplitNode`, and the entries are already a contiguous run in the encoding the new chunk wants, so the split is one `Chunk::adopt` of the tail and two integer writes on the head. A replace whose new value encodes to the same length is written straight over the old one and never splits at all.
+- **A band change is checked on the exact size the list will be.** A list converts back down to a listpack only when it is one chunk and under half the limit, which is Redis's hysteresis, so a list sitting on the boundary does not rebuild itself on every second command. `LSET` has to work out the size after the write rather than before it, because the element it replaces may be shorter or longer than the one going in.
+- **The list is checked against a `Vec` for four thousand rounds, twice.** A fixed sequence of pushes, inserts, sets, pops, trims and removes runs against a `Vec<Vec<u8>>` that says what the answer is, with the contents and the backward walk compared every twenty five rounds. It runs once at the default limits, where a list this size stays packed the whole way, and once at a `list-max-listpack-size` of 8, where it crosses the band in both directions several hundred times and every split and join gets walked.
+
 ## 0.3.2 — 2026-08-31
 
 Sixty one pull requests and no milestone, so this is a patch, and it is a much bigger one than the rule in RELEASING.md intends. The cadence slipped while M2 and M3 were both moving at once and the honest fix is to cut what is there rather than to keep waiting for a milestone to close. M2 now has a server a Redis client can talk to and M3 has sets and hashes complete, but neither has passed its exit gate, so the minor that carries them is still to come.

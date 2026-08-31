@@ -254,9 +254,34 @@ impl List {
             .chain(chunks.into_iter().flatten())
     }
 
+    /// The same walk the other way.
+    ///
+    /// Both bands keep a length behind every element, so this costs what the
+    /// forward walk costs. `LPOS` with a negative rank is what wants it.
+    pub fn iter_back(&self) -> impl Iterator<Item = Element<'_>> {
+        let (packed, chunks) = match &self.body {
+            Body::Packed(lp) => (Some(lp.iter_back()), None),
+            Body::Chunks(d) => (None, Some(d.iter_back())),
+        };
+        packed
+            .into_iter()
+            .flatten()
+            .chain(chunks.into_iter().flatten())
+    }
+
+    /// `count` elements starting at `start`, which is `LRANGE`.
+    ///
+    /// Both ends are already normalised by the caller, because the wire's start
+    /// and stop can be negative, can be the wrong way round and can hang off
+    /// either end, and every one of those turns into an empty reply rather than
+    /// into an error.
+    pub fn range(&self, start: usize, count: usize) -> impl Iterator<Item = Element<'_>> {
+        self.iter().skip(start).take(count)
+    }
+
     /// Put `value` at the front.
     pub fn push_front(&mut self, value: &[u8], limits: &Limits) {
-        self.grow_for(value, limits);
+        self.grow_by(value, limits);
         match &mut self.body {
             Body::Packed(lp) => lp.insert(0, value),
             Body::Chunks(d) => d.push_front(value),
@@ -265,11 +290,203 @@ impl List {
 
     /// Put `value` at the back.
     pub fn push_back(&mut self, value: &[u8], limits: &Limits) {
-        self.grow_for(value, limits);
+        self.grow_by(value, limits);
         match &mut self.body {
             Body::Packed(lp) => lp.push(value),
             Body::Chunks(d) => d.push_back(value),
         }
+    }
+
+    /// Put `value` in at `index`, pushing what was there along, which is the
+    /// half of `LINSERT` that already knows where the pivot was.
+    ///
+    /// An index equal to the length appends. Anything past that is nothing.
+    pub fn insert(&mut self, index: usize, value: &[u8], limits: &Limits) -> bool {
+        if index > self.len() {
+            return false;
+        }
+        self.grow_by(value, limits);
+        match &mut self.body {
+            Body::Packed(lp) => {
+                lp.insert(index, value);
+                true
+            }
+            Body::Chunks(d) => d.insert_at(index, value),
+        }
+    }
+
+    /// Put `value` next to the first `pivot` in the list, which is `LINSERT`.
+    ///
+    /// Gives back the new length, or nothing when the pivot is not there, which
+    /// is the difference between the reply being a length and being `-1`.
+    pub fn insert_at_pivot(
+        &mut self,
+        pivot: &[u8],
+        value: &[u8],
+        before: bool,
+        limits: &Limits,
+    ) -> Option<usize> {
+        let at = self.find(pivot)?;
+        let at = if before { at } else { at + 1 };
+        self.insert(at, value, limits).then(|| self.len())
+    }
+
+    /// Put `value` where the element at `index` is, which is `LSET`.
+    pub fn set(&mut self, index: usize, value: &[u8], limits: &Limits) -> bool {
+        if index >= self.len() {
+            return false;
+        }
+        // What the blob would weigh after the swap, which is not what it weighs
+        // now plus the new element: the old one is going away. Getting this
+        // wrong would promote a list that still fits and then keep it promoted,
+        // because a list only converts back under half the limit.
+        if let Body::Packed(lp) = &self.body {
+            let old = lp.get(index).map_or(0, |e| e.byte_len());
+            let after = lp.byte_len() + crate::listpack::entry_len(value) - old;
+            self.grow_to(after, self.len(), limits);
+        }
+        match &mut self.body {
+            Body::Packed(lp) => lp.replace(index, value),
+            Body::Chunks(d) => d.replace_at(index, value),
+        }
+    }
+
+    /// Where the first `value` is, front to back.
+    #[must_use]
+    pub fn find(&self, value: &[u8]) -> Option<usize> {
+        let as_int = yo_common::num::parse_i64(value);
+        self.iter().position(|e| e.is(value, as_int))
+    }
+
+    /// Where `value` is, as many times as asked, which is `LPOS`.
+    ///
+    /// `rank` is which match to start at and which way to look: 1 is the first
+    /// from the front, -1 the first from the back, 2 the second from the front.
+    /// `count` is how many to give back with 0 meaning all of them, and `maxlen`
+    /// is how many elements may be compared before giving up, with 0 meaning no
+    /// limit. The indexes handed back are always from the front, whichever way
+    /// the walk went, because that is what the client can use.
+    ///
+    /// The answers go into `out` rather than into a fresh vector, because this
+    /// runs on a shard thread and a shard thread that allocates aborts.
+    pub fn positions(
+        &self,
+        value: &[u8],
+        rank: i64,
+        count: usize,
+        maxlen: usize,
+        out: &mut Vec<usize>,
+    ) {
+        if rank == 0 {
+            return;
+        }
+        let as_int = yo_common::num::parse_i64(value);
+        let len = self.len();
+        let skip = rank.unsigned_abs() as usize - 1;
+        let mut seen = 0usize;
+        let mut looked = 0usize;
+        // One loop over one of the two walks, with the index worked out from
+        // whichever end the walk started at.
+        let mut take = |at: usize, e: Element<'_>, out: &mut Vec<usize>| -> bool {
+            looked += 1;
+            if e.is(value, as_int) {
+                seen += 1;
+                if seen > skip {
+                    out.push(at);
+                    if count != 0 && out.len() >= count {
+                        return false;
+                    }
+                }
+            }
+            maxlen == 0 || looked < maxlen
+        };
+        if rank > 0 {
+            for (at, e) in self.iter().enumerate() {
+                if !take(at, e, out) {
+                    break;
+                }
+            }
+        } else {
+            for (back, e) in self.iter_back().enumerate() {
+                if !take(len - back - 1, e, out) {
+                    break;
+                }
+            }
+        }
+    }
+
+    /// Take out up to `count` elements equal to `value`, which is `LREM`.
+    ///
+    /// A positive count works from the front, a negative one from the back, and
+    /// zero means every one of them. Gives back how many went.
+    pub fn remove(&mut self, count: i64, value: &[u8], limits: &Limits) -> usize {
+        let as_int = yo_common::num::parse_i64(value);
+        let want = if count == 0 {
+            usize::MAX
+        } else {
+            count.unsigned_abs() as usize
+        };
+        // Collected first and removed after, because removing during the walk
+        // moves the elements the walk has not reached yet. Highest index first
+        // so that the ones still to go do not move either.
+        let mut hits = Vec::new();
+        if count >= 0 {
+            for (at, e) in self.iter().enumerate() {
+                if e.is(value, as_int) {
+                    hits.push(at);
+                    if hits.len() >= want {
+                        break;
+                    }
+                }
+            }
+            hits.reverse();
+        } else {
+            let len = self.len();
+            for (back, e) in self.iter_back().enumerate() {
+                if e.is(value, as_int) {
+                    hits.push(len - back - 1);
+                    if hits.len() >= want {
+                        break;
+                    }
+                }
+            }
+        }
+        for at in &hits {
+            self.remove_at(*at);
+        }
+        self.shrunk(limits);
+        hits.len()
+    }
+
+    /// Take out the element at `index`.
+    ///
+    /// The band is left alone, because a caller taking several out in a row
+    /// would otherwise convert between them. Everything public that removes
+    /// finishes with [`List::shrunk`].
+    fn remove_at(&mut self, index: usize) -> bool {
+        match &mut self.body {
+            Body::Packed(lp) => lp.delete(index, 1),
+            Body::Chunks(d) => d.remove_at(index),
+        }
+    }
+
+    /// Keep `count` elements starting at `start` and drop the rest, which is
+    /// `LTRIM`.
+    ///
+    /// Both ends are normalised by the caller, the same as [`List::range`], and
+    /// a count of zero empties the list, which on the wire deletes the key.
+    pub fn trim(&mut self, start: usize, count: usize, limits: &Limits) {
+        let len = self.len();
+        let start = start.min(len);
+        let keep = count.min(len - start);
+        match &mut self.body {
+            Body::Packed(lp) => {
+                lp.delete(start + keep, len - start - keep);
+                lp.delete(0, start);
+            }
+            Body::Chunks(d) => d.trim(start, keep),
+        }
+        self.shrunk(limits);
     }
 
     /// Drop the first element, and say whether there was one.
@@ -277,48 +494,52 @@ impl List {
     /// The read and the removal are separate so that `LPOP` on the wire can
     /// write the element straight into the reply buffer and then drop it,
     /// which is the same split [`crate::set::Set::drop_at`] exists for.
-    pub fn drop_front(&mut self) -> bool {
-        match &mut self.body {
+    pub fn drop_front(&mut self, limits: &Limits) -> bool {
+        let gone = match &mut self.body {
             Body::Packed(lp) => lp.delete(0, 1),
             Body::Chunks(d) => d.drop_front(),
-        }
+        };
+        self.shrunk(limits);
+        gone
     }
 
     /// Drop the last element, and say whether there was one.
-    pub fn drop_back(&mut self) -> bool {
-        match &mut self.body {
+    pub fn drop_back(&mut self, limits: &Limits) -> bool {
+        let gone = match &mut self.body {
             Body::Packed(lp) => {
                 let last = lp.len().checked_sub(1);
                 last.is_some_and(|at| lp.delete(at, 1))
             }
             Body::Chunks(d) => d.drop_back(),
-        }
+        };
+        self.shrunk(limits);
+        gone
     }
 
     /// Take the first element out and hand it back.
     ///
     /// The embedded API's `LPOP`, where the caller wants the bytes and has
     /// nowhere to put them.
-    pub fn pop_front(&mut self) -> Option<Vec<u8>> {
+    pub fn pop_front(&mut self, limits: &Limits) -> Option<Vec<u8>> {
         let out = self.front()?.to_vec();
-        self.drop_front();
+        self.drop_front(limits);
         Some(out)
     }
 
     /// Take the last element out and hand it back.
-    pub fn pop_back(&mut self) -> Option<Vec<u8>> {
+    pub fn pop_back(&mut self, limits: &Limits) -> Option<Vec<u8>> {
         let out = self.back()?.to_vec();
-        self.drop_back();
+        self.drop_back(limits);
         Some(out)
     }
 
     /// Go back to one blob if the list has shrunk far enough to deserve it.
     ///
-    /// Called after anything that removes elements. Redis converts back only
+    /// Called by everything here that removes elements. Redis converts back only
     /// below half the limit, so that a list sitting on the boundary does not
     /// rebuild itself on every other command, and it only converts a quicklist
     /// that is down to one node. Both of those are here.
-    pub fn shrunk(&mut self, limits: &Limits) {
+    fn shrunk(&mut self, limits: &Limits) {
         let Body::Chunks(d) = &self.body else {
             return;
         };
@@ -343,17 +564,22 @@ impl List {
         self.body = Body::Packed(lp);
     }
 
-    /// Promote out of the packed band if `value` would not fit in it.
+    /// Promote out of the packed band if one more `value` would not fit in it.
     ///
-    /// Asked before the push rather than after, because a listpack that has
+    /// Asked before the write rather than after, because a listpack that has
     /// already been grown past the limit and is then converted has done the
     /// work twice.
-    fn grow_for(&mut self, value: &[u8], limits: &Limits) {
+    fn grow_by(&mut self, value: &[u8], limits: &Limits) {
         let Body::Packed(lp) = &self.body else {
             return;
         };
         let after = lp.byte_len() + crate::listpack::entry_len(value);
-        if !limits.exceeded(after, lp.len() + 1) {
+        self.grow_to(after, lp.len() + 1, limits);
+    }
+
+    /// Promote out of the packed band if a list of this size does not fit it.
+    fn grow_to(&mut self, bytes: usize, entries: usize, limits: &Limits) {
+        if !matches!(self.body, Body::Packed(_)) || !limits.exceeded(bytes, entries) {
             return;
         }
         let Body::Packed(lp) = std::mem::replace(&mut self.body, Body::Chunks(Deque::new())) else {
@@ -364,6 +590,30 @@ impl List {
         };
         d.adopt(&lp);
     }
+}
+
+/// A chunk of its own holding nothing but `value`, at the end asked for.
+///
+/// An element too big for an ordinary chunk gets one sized to it, which is what
+/// Redis calls a plain node. Without this a value over eight kilobytes would be
+/// refused by a chunk that had just been made for it and the list would count an
+/// element it does not hold.
+fn lone(value: &[u8], front: bool) -> Chunk {
+    if crate::listpack::entry_len(value) > CHUNK_BYTES {
+        return Chunk::plain(value);
+    }
+    let mut c = if front {
+        Chunk::for_front()
+    } else {
+        Chunk::for_back()
+    };
+    let put = if front {
+        c.push_front(value)
+    } else {
+        c.push_back(value)
+    };
+    debug_assert!(put, "an empty chunk refused the only element in it");
+    c
 }
 
 /// A ring of chunks, with the list's length kept beside it.
@@ -420,34 +670,47 @@ impl Deque {
 
     /// The element at `index`, chunks first and elements second.
     fn get(&self, index: usize) -> Option<Element<'_>> {
-        if index >= self.len {
-            return None;
-        }
-        // From whichever end is closer, because a list is a queue and the two
-        // interesting indexes are near the ends.
-        if index * 2 <= self.len {
-            let mut at = index;
-            for c in &self.chunks {
-                if at < c.len() {
-                    return c.get(at);
-                }
-                at -= c.len();
-            }
-        } else {
-            let mut back = self.len - index - 1;
-            for c in self.chunks.iter().rev() {
-                if back < c.len() {
-                    return c.get(c.len() - back - 1);
-                }
-                back -= c.len();
-            }
-        }
-        None
+        let (i, within) = self.locate(index)?;
+        self.chunks[i].get(within)
     }
 
     /// A forward walk over every chunk in turn.
     fn iter(&self) -> impl Iterator<Item = Element<'_>> {
         self.chunks.iter().flat_map(Chunk::iter)
+    }
+
+    /// The same walk the other way, chunks in reverse and each one backward.
+    fn iter_back(&self) -> impl Iterator<Item = Element<'_>> {
+        self.chunks.iter().rev().flat_map(Chunk::iter_back)
+    }
+
+    /// Which chunk holds the element at `index`, and where in that chunk.
+    ///
+    /// From whichever end is closer, because a list is a queue and the two
+    /// interesting indexes are near the ends. This is the walk the descriptor
+    /// cache in `08` section 5 turns into a lookup, and it is not written yet.
+    fn locate(&self, index: usize) -> Option<(usize, usize)> {
+        if index >= self.len {
+            return None;
+        }
+        if index * 2 <= self.len {
+            let mut at = index;
+            for (i, c) in self.chunks.iter().enumerate() {
+                if at < c.len() {
+                    return Some((i, at));
+                }
+                at -= c.len();
+            }
+        } else {
+            let mut back = self.len - index - 1;
+            for (i, c) in self.chunks.iter().enumerate().rev() {
+                if back < c.len() {
+                    return Some((i, c.len() - back - 1));
+                }
+                back -= c.len();
+            }
+        }
+        None
     }
 
     /// Put `value` at the front, in the head chunk or in a new one.
@@ -459,13 +722,14 @@ impl Deque {
             return;
         }
         // The chunk that was the head stops being an end, so it gives back the
-        // room it was keeping.
-        if let Some(head) = self.chunks.front_mut() {
+        // room it was keeping. One that is empty goes instead, because a chunk
+        // holding nothing is one every walk from that end has to step over.
+        if self.chunks.front().is_some_and(Chunk::is_empty) {
+            self.chunks.pop_front();
+        } else if let Some(head) = self.chunks.front_mut() {
             head.seal();
         }
-        let mut fresh = Chunk::for_front();
-        fresh.push_front(value);
-        self.chunks.push_front(fresh);
+        self.chunks.push_front(lone(value, true));
         self.len += 1;
     }
 
@@ -477,13 +741,136 @@ impl Deque {
             self.len += 1;
             return;
         }
-        if let Some(tail) = self.chunks.back_mut() {
+        if self.chunks.back().is_some_and(Chunk::is_empty) {
+            self.chunks.pop_back();
+        } else if let Some(tail) = self.chunks.back_mut() {
             tail.seal();
         }
-        let mut fresh = Chunk::for_back();
-        fresh.push_back(value);
-        self.chunks.push_back(fresh);
+        self.chunks.push_back(lone(value, false));
         self.len += 1;
+    }
+
+    /// Put `value` in at `index`, splitting a chunk if it will not take it.
+    ///
+    /// A chunk that refuses is split at the insertion point, which leaves two
+    /// chunks with room between them for what would not fit. That is Redis's
+    /// `_quicklistSplitNode` and the reason is the same: the alternative is
+    /// pushing the rest of the list along one chunk at a time.
+    fn insert_at(&mut self, index: usize, value: &[u8]) -> bool {
+        if index > self.len {
+            return false;
+        }
+        if index == 0 {
+            self.push_front(value);
+            return true;
+        }
+        if index == self.len {
+            self.push_back(value);
+            return true;
+        }
+        let Some((i, within)) = self.locate(index) else {
+            return false;
+        };
+        if self.chunks[i].insert_at(within, value) {
+            self.len += 1;
+            return true;
+        }
+        let mut rest = self.chunks[i].split_off(within);
+        // Both halves have room now unless the element needs a chunk of its own.
+        let put = self.chunks[i].push_back(value) || rest.push_front(value);
+        self.chunks.insert(i + 1, rest);
+        if !put {
+            self.chunks.insert(i + 1, lone(value, false));
+        }
+        self.len += 1;
+        true
+    }
+
+    /// Take the element at `index` out.
+    fn remove_at(&mut self, index: usize) -> bool {
+        let Some((i, within)) = self.locate(index) else {
+            return false;
+        };
+        if !self.chunks[i].remove_at(within) {
+            return false;
+        }
+        self.len -= 1;
+        if self.chunks[i].is_empty() && self.chunks.len() > 1 {
+            self.chunks.remove(i);
+        }
+        true
+    }
+
+    /// Put `value` where the element at `index` is.
+    ///
+    /// A replacement that does not fit is the same split an insert does, with
+    /// the element being replaced dropped off the front of the second half.
+    fn replace_at(&mut self, index: usize, value: &[u8]) -> bool {
+        let Some((i, within)) = self.locate(index) else {
+            return false;
+        };
+        if self.chunks[i].replace_at(within, value) {
+            return true;
+        }
+        let mut rest = self.chunks[i].split_off(within);
+        rest.drop_front();
+        let put = self.chunks[i].push_back(value) || rest.push_front(value);
+        if !rest.is_empty() {
+            self.chunks.insert(i + 1, rest);
+        }
+        if !put {
+            self.chunks.insert(i + 1, lone(value, false));
+        }
+        if self.chunks[i].is_empty() && self.chunks.len() > 1 {
+            self.chunks.remove(i);
+        }
+        true
+    }
+
+    /// Keep `keep` elements from `start` and drop everything else.
+    ///
+    /// Whole chunks at either end go without their bytes being touched, and the
+    /// two chunks the range ends inside move a cursor. A trim of a million
+    /// element list down to ten is the walk over the chunk list and two walks
+    /// inside a chunk.
+    fn trim(&mut self, start: usize, keep: usize) {
+        let mut front = start;
+        while front > 0 {
+            let Some(held) = self.chunks.front().map(Chunk::len) else {
+                break;
+            };
+            if held <= front && self.chunks.len() > 1 {
+                front -= held;
+                self.len -= held;
+                self.chunks.pop_front();
+            } else {
+                let took = self.chunks[0].drop_front_n(front);
+                self.len -= took;
+                front -= took;
+                if took == 0 {
+                    break;
+                }
+            }
+        }
+        let mut back = self.len - keep.min(self.len);
+        while back > 0 {
+            let Some(held) = self.chunks.back().map(Chunk::len) else {
+                break;
+            };
+            if held <= back && self.chunks.len() > 1 {
+                back -= held;
+                self.len -= held;
+                self.chunks.pop_back();
+            } else {
+                let last = self.chunks.len() - 1;
+                let took = self.chunks[last].drop_back_n(back);
+                self.len -= took;
+                back -= took;
+                if took == 0 {
+                    break;
+                }
+            }
+        }
     }
 
     /// Drop the first element, dropping the chunk with it if it was the last.
@@ -523,6 +910,25 @@ mod tests {
 
     fn all(l: &List) -> Vec<Vec<u8>> {
         l.iter().map(|e| e.to_vec()).collect()
+    }
+
+    /// The same list in both bands, so a test can run its case over each.
+    ///
+    /// The elements differ in length between the two, because that is the only
+    /// thing that decides which band a list of a given length is in, so every
+    /// test over this compares against the list it was handed rather than
+    /// against a literal.
+    fn both_bands(n: usize) -> [List; 2] {
+        let limits = Limits::default();
+        let mut packed = List::new();
+        let mut chunks = List::new();
+        for i in 0..n {
+            packed.push_back(format!("e{i}").as_bytes(), &limits);
+            chunks.push_back(format!("e{i}:{}", "p".repeat(400)).as_bytes(), &limits);
+        }
+        assert_eq!(packed.encoding(), Encoding::Listpack);
+        assert_eq!(chunks.encoding(), Encoding::Quicklist);
+        [packed, chunks]
     }
 
     /// A list of `n` elements, each long enough that `n` of them do not fit the
@@ -569,12 +975,12 @@ mod tests {
         for m in [b"a", b"b", b"c"] {
             l.push_back(m, &limits);
         }
-        assert_eq!(l.pop_front().unwrap(), b"a");
-        assert_eq!(l.pop_back().unwrap(), b"c");
+        assert_eq!(l.pop_front(&limits).unwrap(), b"a");
+        assert_eq!(l.pop_back(&limits).unwrap(), b"c");
         assert_eq!(all(&l), vec![b"b".to_vec()]);
-        assert_eq!(l.pop_front().unwrap(), b"b");
-        assert!(l.pop_front().is_none());
-        assert!(l.pop_back().is_none());
+        assert_eq!(l.pop_front(&limits).unwrap(), b"b");
+        assert!(l.pop_front(&limits).is_none());
+        assert!(l.pop_back(&limits).is_none());
         assert!(l.is_empty());
     }
 
@@ -613,8 +1019,8 @@ mod tests {
         assert_eq!(l.len(), 302);
         assert_eq!(l.front().unwrap().to_vec(), b"first");
         assert_eq!(l.back().unwrap().to_vec(), b"last");
-        assert_eq!(l.pop_front().unwrap(), b"first");
-        assert_eq!(l.pop_back().unwrap(), b"last");
+        assert_eq!(l.pop_front(&limits).unwrap(), b"first");
+        assert_eq!(l.pop_back(&limits).unwrap(), b"last");
         assert_eq!(l.len(), 300);
         assert_eq!(
             l.front().unwrap().to_vec(),
@@ -634,7 +1040,7 @@ mod tests {
         }
         for i in 0..5000 {
             assert_eq!(
-                l.pop_front().unwrap(),
+                l.pop_front(&limits).unwrap(),
                 format!("job:{i:0>40}").into_bytes(),
                 "job {i} came back in the wrong place"
             );
@@ -653,7 +1059,7 @@ mod tests {
         }
         for i in (0..2000).rev() {
             assert_eq!(
-                l.pop_front().unwrap(),
+                l.pop_front(&limits).unwrap(),
                 format!("frame:{i:0>40}").into_bytes()
             );
         }
@@ -677,8 +1083,7 @@ mod tests {
         let mut l = chunked(300);
         let limits = Limits::default();
         while l.len() > 200 {
-            l.drop_back();
-            l.shrunk(&limits);
+            l.drop_back(&limits);
         }
         assert_eq!(
             l.encoding(),
@@ -686,8 +1091,7 @@ mod tests {
             "under the limit is not under half of it"
         );
         while l.len() > 50 {
-            l.drop_back();
-            l.shrunk(&limits);
+            l.drop_back(&limits);
         }
         assert_eq!(l.encoding(), Encoding::Listpack);
         assert_eq!(l.len(), 50);
@@ -707,8 +1111,7 @@ mod tests {
         let mut l = chunked(300);
         let limits = Limits::default();
         while l.len() > 20 {
-            l.drop_back();
-            l.shrunk(&limits);
+            l.drop_back(&limits);
         }
         assert_eq!(l.encoding(), Encoding::Listpack);
         for i in 0..300 {
@@ -784,5 +1187,383 @@ mod tests {
         let held = l.memory_bytes();
         assert!(held > 300 * 66, "{held} is less than the elements");
         assert!(held < 300 * 66 * 3, "{held} is three times the elements");
+    }
+
+    /// An element bigger than a whole chunk gets a chunk of its own, which is
+    /// what Redis calls a plain node. Without it the list would count an element
+    /// that a chunk sized for something else had refused.
+    #[test]
+    fn an_element_too_big_for_a_chunk_gets_one_of_its_own() {
+        let mut l = List::new();
+        let limits = Limits::default();
+        let huge = vec![b'h'; 20_000];
+        l.push_back(&huge, &limits);
+        assert_eq!(l.len(), 1);
+        assert_eq!(l.encoding(), Encoding::Quicklist);
+        assert_eq!(l.front().unwrap().to_vec(), huge);
+        l.push_back(b"after", &limits);
+        l.push_front(b"before", &limits);
+        assert_eq!(l.len(), 3);
+        assert_eq!(l.get(1).unwrap().to_vec(), huge);
+        assert_eq!(l.back().unwrap().to_vec(), b"after");
+        assert_eq!(l.front().unwrap().to_vec(), b"before");
+        assert_eq!(l.pop_front(&limits).unwrap(), b"before");
+        assert_eq!(l.pop_front(&limits).unwrap(), huge);
+    }
+
+    #[test]
+    fn the_walk_backward_is_the_walk_forward_reversed() {
+        for mut l in [List::new(), chunked(400)] {
+            let limits = Limits::default();
+            l.push_back(b"tail", &limits);
+            let mut want = all(&l);
+            want.reverse();
+            let got: Vec<Vec<u8>> = l.iter_back().map(|e| e.to_vec()).collect();
+            assert_eq!(got, want, "{:?}", l.encoding());
+        }
+    }
+
+    #[test]
+    fn a_range_is_the_window_it_was_asked_for() {
+        for l in both_bands(50) {
+            let all_of_it = all(&l);
+            for (start, count) in [(0, 0), (0, 5), (3, 4), (48, 9), (50, 3), (0, 50)] {
+                let got: Vec<Vec<u8>> = l.range(start, count).map(|e| e.to_vec()).collect();
+                let want = &all_of_it[start.min(50)..(start + count).min(50)];
+                assert_eq!(got, want, "{start} for {count} in {:?}", l.encoding());
+            }
+        }
+    }
+
+    #[test]
+    fn setting_an_element_replaces_only_that_one() {
+        for mut l in both_bands(50) {
+            let limits = Limits::default();
+            let before = all(&l);
+            let band = l.encoding();
+            for at in [0usize, 1, 25, 49] {
+                let mut want = before.clone();
+                for value in [
+                    &b"z"[..],
+                    &b"a much longer element than the one there"[..],
+                    b"42",
+                ] {
+                    assert!(l.set(at, value, &limits), "setting {at} in {band:?}");
+                    want[at] = value.to_vec();
+                    assert_eq!(all(&l), want, "setting {at} to {value:?} in {band:?}");
+                }
+                l.set(at, &before[at], &limits);
+            }
+            assert!(!l.set(50, b"z", &limits), "past the end is not a set");
+            assert_eq!(all(&l), before);
+        }
+    }
+
+    #[test]
+    fn an_insert_goes_where_the_pivot_is() {
+        for mut l in both_bands(50) {
+            let limits = Limits::default();
+            let before = all(&l);
+            let band = l.encoding();
+            let pivot = before[25].clone();
+            assert_eq!(
+                l.insert_at_pivot(&pivot, b"before", true, &limits),
+                Some(51)
+            );
+            assert_eq!(
+                l.insert_at_pivot(&pivot, b"after", false, &limits),
+                Some(52)
+            );
+            assert_eq!(l.get(25).unwrap().to_vec(), b"before", "{band:?}");
+            assert_eq!(l.get(26).unwrap().to_vec(), pivot, "{band:?}");
+            assert_eq!(l.get(27).unwrap().to_vec(), b"after", "{band:?}");
+            assert_eq!(l.len(), 52);
+            assert_eq!(
+                l.insert_at_pivot(b"nothing like it", b"x", true, &limits),
+                None
+            );
+            assert_eq!(l.len(), 52);
+        }
+    }
+
+    #[test]
+    fn an_insert_by_index_takes_both_ends_and_the_middle() {
+        for at in [0usize, 1, 200, 399, 400] {
+            let mut l = chunked(400);
+            let limits = Limits::default();
+            let mut want = all(&l);
+            assert!(l.insert(at, b"new", &limits), "inserting at {at}");
+            want.insert(at, b"new".to_vec());
+            assert_eq!(all(&l), want, "inserting at {at}");
+            assert_eq!(l.len(), 401);
+        }
+        let mut l = chunked(400);
+        assert!(!l.insert(401, b"new", &Limits::default()));
+    }
+
+    #[test]
+    fn removing_by_value_counts_from_the_end_it_was_told_to() {
+        let build = || {
+            let mut l = List::new();
+            let limits = Limits::default();
+            for i in 0..40 {
+                l.push_back(
+                    if i % 3 == 0 {
+                        b"x".to_vec()
+                    } else {
+                        format!("e{i}").into_bytes()
+                    }
+                    .as_slice(),
+                    &limits,
+                );
+            }
+            l
+        };
+        let limits = Limits::default();
+
+        let mut l = build();
+        assert_eq!(l.remove(0, b"x", &limits), 14, "every one of them");
+        assert!(!all(&l).contains(&b"x".to_vec()));
+        assert_eq!(l.len(), 26);
+
+        let mut l = build();
+        assert_eq!(l.remove(2, b"x", &limits), 2);
+        assert_eq!(l.len(), 38);
+        assert_eq!(l.get(0).unwrap().to_vec(), b"e1", "the first two went");
+
+        let mut l = build();
+        assert_eq!(l.remove(-2, b"x", &limits), 2);
+        assert_eq!(l.get(0).unwrap().to_vec(), b"x", "the last two went");
+        assert_eq!(l.back().unwrap().to_vec(), b"e38");
+
+        let mut l = build();
+        assert_eq!(l.remove(99, b"x", &limits), 14, "more than there are");
+        assert_eq!(l.remove(1, b"nothing like it", &limits), 0);
+    }
+
+    #[test]
+    fn a_trim_keeps_the_window_and_nothing_else() {
+        for (start, count) in [
+            (0usize, 400usize),
+            (0, 10),
+            (390, 10),
+            (100, 200),
+            (0, 0),
+            (399, 1),
+        ] {
+            let mut l = chunked(400);
+            let limits = Limits::default();
+            let want = all(&l)[start..start + count].to_vec();
+            l.trim(start, count, &limits);
+            assert_eq!(all(&l), want, "keeping {count} from {start}");
+            assert_eq!(l.len(), count);
+        }
+    }
+
+    /// A trim that leaves a handful takes the list back to one blob, which is
+    /// the shrinking rule reached the other way.
+    #[test]
+    fn a_trim_that_leaves_a_handful_goes_back_to_one_blob() {
+        let mut l = chunked(400);
+        let limits = Limits::default();
+        l.trim(10, 5, &limits);
+        assert_eq!(l.encoding(), Encoding::Listpack);
+        assert_eq!(l.len(), 5);
+        assert_eq!(
+            l.get(0).unwrap().to_vec(),
+            format!("value:{:0>60}", 10).into_bytes()
+        );
+    }
+
+    #[test]
+    fn a_position_is_counted_from_the_end_the_rank_asked_for() {
+        for mut l in [List::new(), chunked(300)] {
+            let limits = Limits::default();
+            let band = l.encoding();
+            for m in [b"a", b"b", b"a", b"c", b"a"] {
+                l.push_back(m, &limits);
+            }
+            let base = l.len() - 5;
+            let mut out = Vec::new();
+
+            l.positions(b"a", 1, 1, 0, &mut out);
+            assert_eq!(out, vec![base], "{band:?}");
+
+            out.clear();
+            l.positions(b"a", 2, 1, 0, &mut out);
+            assert_eq!(out, vec![base + 2], "the second from the front");
+
+            out.clear();
+            l.positions(b"a", -1, 1, 0, &mut out);
+            assert_eq!(out, vec![base + 4], "the first from the back");
+
+            out.clear();
+            l.positions(b"a", -2, 1, 0, &mut out);
+            assert_eq!(out, vec![base + 2], "the second from the back");
+
+            out.clear();
+            l.positions(b"a", 1, 0, 0, &mut out);
+            assert_eq!(out, vec![base, base + 2, base + 4], "all of them");
+
+            out.clear();
+            l.positions(b"a", -1, 0, 0, &mut out);
+            assert_eq!(out, vec![base + 4, base + 2, base], "all of them backward");
+
+            out.clear();
+            l.positions(b"a", 1, 2, 0, &mut out);
+            assert_eq!(out, vec![base, base + 2], "two of them");
+
+            out.clear();
+            l.positions(b"nothing like it", 1, 0, 0, &mut out);
+            assert!(out.is_empty());
+
+            out.clear();
+            l.positions(b"a", 0, 0, 0, &mut out);
+            assert!(out.is_empty(), "a rank of zero is not a rank");
+        }
+    }
+
+    /// `MAXLEN` bounds the comparisons and not the answers, so a match past it
+    /// is not found however few answers have been collected.
+    #[test]
+    fn maxlen_stops_the_walk_rather_than_the_answers() {
+        let mut l = List::new();
+        let limits = Limits::default();
+        for i in 0..20 {
+            l.push_back(
+                if i == 15 {
+                    b"x".to_vec()
+                } else {
+                    format!("e{i}").into_bytes()
+                }
+                .as_slice(),
+                &limits,
+            );
+        }
+        let mut out = Vec::new();
+        l.positions(b"x", 1, 0, 10, &mut out);
+        assert!(out.is_empty(), "ten comparisons do not reach the sixteenth");
+        out.clear();
+        l.positions(b"x", 1, 0, 16, &mut out);
+        assert_eq!(out, vec![15]);
+        out.clear();
+        l.positions(b"x", -1, 0, 5, &mut out);
+        assert_eq!(out, vec![15], "five from the back does reach it");
+    }
+
+    /// Every operation against a plain `Vec`, over a mix of element sizes that
+    /// crosses the band boundary in both directions several times. A model test
+    /// rather than more cases, because the interesting bugs here are the ones
+    /// where a chunk splits and an index moves and the length stops agreeing.
+    #[test]
+    fn a_long_run_of_operations_agrees_with_a_vec() {
+        // Twice, because the default limits keep a list of this size packed the
+        // whole way and never walk the code that splits and joins chunks. A
+        // `list-max-listpack-size` of 8 is a real setting and it puts the band
+        // change within reach of a few pushes, so the second run crosses it in
+        // both directions hundreds of times.
+        let (_, chunked) = model_run(&Limits::default());
+        assert_eq!(chunked, 0, "the default limits should not chunk this list");
+        let (packed, chunked) = model_run(&Limits::of(8));
+        assert!(packed > 200, "{packed} rounds packed");
+        assert!(chunked > 200, "{chunked} rounds chunked");
+    }
+
+    /// Four thousand rounds of a fixed sequence of list operations against a
+    /// `Vec` that says what the answer is, and the two band counts it saw.
+    fn model_run(limits: &Limits) -> (usize, usize) {
+        let mut l = List::new();
+        let mut want: Vec<Vec<u8>> = Vec::new();
+        // A fixed sequence rather than a random one, so a failure is a failure
+        // every time it is run.
+        let mut seed = 0x2064_u64;
+        let mut next = move || {
+            seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+            (seed >> 33) as usize
+        };
+        let (mut packed, mut chunked) = (0, 0);
+        for round in 0..4000 {
+            let n = next();
+            let value = match n % 4 {
+                0 => format!("{}", n % 97).into_bytes(),
+                1 => vec![b'a' + (n % 26) as u8; 1 + n % 40],
+                2 => vec![b'z'; 200 + n % 400],
+                _ => format!("e{round}").into_bytes(),
+            };
+            match n % 9 {
+                0 => {
+                    l.push_front(&value, limits);
+                    want.insert(0, value);
+                }
+                1 | 2 => {
+                    l.push_back(&value, limits);
+                    want.push(value);
+                }
+                3 if !want.is_empty() => {
+                    let at = n % want.len();
+                    assert!(l.insert(at, &value, limits));
+                    want.insert(at, value);
+                }
+                4 if !want.is_empty() => {
+                    let at = n % want.len();
+                    assert!(l.set(at, &value, limits));
+                    want[at] = value;
+                }
+                5 if !want.is_empty() => {
+                    assert_eq!(l.pop_front(limits), Some(want.remove(0)));
+                }
+                6 if !want.is_empty() => {
+                    assert_eq!(l.pop_back(limits), want.pop());
+                }
+                7 if want.len() > 4 => {
+                    let start = n % (want.len() - 2);
+                    let keep = 1 + n % (want.len() - start);
+                    l.trim(start, keep, limits);
+                    want = want[start..start + keep].to_vec();
+                }
+                8 if !want.is_empty() => {
+                    let needle = want[n % want.len()].clone();
+                    let count = [0i64, 1, -1, 3][n % 4];
+                    let gone = l.remove(count, &needle, limits);
+                    let mut hits: Vec<usize> = want
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, m)| **m == needle)
+                        .map(|(i, _)| i)
+                        .collect();
+                    if count < 0 {
+                        hits.reverse();
+                    }
+                    if count != 0 {
+                        hits.truncate(count.unsigned_abs() as usize);
+                    }
+                    assert_eq!(gone, hits.len(), "round {round}");
+                    hits.sort_unstable();
+                    for at in hits.iter().rev() {
+                        want.remove(*at);
+                    }
+                }
+                _ => {}
+            }
+            assert_eq!(l.len(), want.len(), "length after round {round}");
+            match l.encoding() {
+                Encoding::Listpack => packed += 1,
+                Encoding::Quicklist => chunked += 1,
+            }
+            if round % 25 == 0 {
+                assert_eq!(all(&l), want, "contents after round {round}");
+                let mut back = all(&l);
+                back.reverse();
+                let walked: Vec<Vec<u8>> = l.iter_back().map(|e| e.to_vec()).collect();
+                assert_eq!(walked, back, "the backward walk after round {round}");
+                if let Some(first) = want.first() {
+                    assert_eq!(l.front().unwrap().to_vec(), *first);
+                    assert_eq!(l.back().unwrap().to_vec(), *want.last().unwrap());
+                    assert_eq!(l.find(first), Some(0));
+                }
+            }
+        }
+        assert_eq!(all(&l), want);
+        (packed, chunked)
     }
 }
