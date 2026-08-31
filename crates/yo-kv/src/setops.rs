@@ -183,6 +183,7 @@
 //! arena is under this, the destination's own hint is the same promise with a
 //! different allocator behind it.
 
+use yo_common::Small;
 use yo_common::num::DIGITS_MAX;
 
 use crate::intset::Walk;
@@ -242,8 +243,18 @@ fn plan_for(sets: &[&Set]) -> Plan {
     }
 }
 
+/// How many operands fit without the allocator.
+///
+/// A set operation over more than eight keys is a thing somebody wrote on
+/// purpose and is rare enough that the spill is the right answer for it. Two or
+/// three is what almost every one of these is.
+pub(crate) const INLINE_KEYS: usize = 8;
+
+/// A list of one thing per operand, on the stack for the usual `k`.
+pub(crate) type PerSet<T> = Small<T, INLINE_KEYS>;
+
 /// Every operand as an intset, or `None` if any of them is something else.
-fn as_ints<'a>(sets: &[&'a Set]) -> Option<Vec<&'a Intset>> {
+fn as_ints<'a>(sets: &[&'a Set]) -> Option<PerSet<&'a Intset>> {
     sets.iter().map(|s| s.ints()).collect()
 }
 
@@ -311,10 +322,10 @@ fn inter_merge<F>(sets: &[&Intset], limit: usize, mut f: F) -> usize
 where
     F: FnMut(&[u8]),
 {
-    let mut order: Vec<usize> = (0..sets.len()).collect();
+    let mut order: PerSet<usize> = (0..sets.len()).collect();
     order.sort_unstable_by_key(|&i| sets[i].len());
     let mut driver = sets[order[0]].walk();
-    let mut others: Vec<Walk<'_>> = order[1..].iter().map(|&i| sets[i].walk()).collect();
+    let mut others: PerSet<Walk<'_>> = order[1..].iter().map(|&i| sets[i].walk()).collect();
 
     let mut digits = [0u8; DIGITS_MAX];
     let mut found = 0usize;
@@ -353,7 +364,7 @@ fn inter_probe<F>(sets: &[&Set], limit: usize, mut f: F) -> usize
 where
     F: FnMut(&[u8]),
 {
-    let mut order: Vec<usize> = (0..sets.len()).collect();
+    let mut order: PerSet<usize> = (0..sets.len()).collect();
     order.sort_unstable_by_key(|&i| sets[i].len());
     let (&first, rest) = order.split_first().expect("not empty");
 
@@ -384,7 +395,7 @@ fn inter_accumulate<F>(sets: &[&Set], limit: usize, mut f: F) -> usize
 where
     F: FnMut(&[u8]),
 {
-    let mut order: Vec<usize> = (0..sets.len()).collect();
+    let mut order: PerSet<usize> = (0..sets.len()).collect();
     order.sort_unstable_by_key(|&i| sets[i].len());
     let (&first, rest) = order.split_first().expect("not empty");
 
@@ -482,7 +493,7 @@ fn union_merge<F>(sets: &[&Intset], mut f: F) -> usize
 where
     F: FnMut(&[u8]),
 {
-    let mut walks: Vec<Walk<'_>> = sets.iter().map(|s| s.walk()).collect();
+    let mut walks: PerSet<Walk<'_>> = sets.iter().map(|s| s.walk()).collect();
     let mut digits = [0u8; DIGITS_MAX];
     let mut found = 0usize;
     while let Some(low) = walks.iter().filter_map(Walk::peek).min() {
@@ -565,7 +576,7 @@ where
 {
     let (first, rest) = sets.split_first().expect("not empty");
     let mut walk = first.walk();
-    let mut others: Vec<Walk<'_>> = rest.iter().map(|s| s.walk()).collect();
+    let mut others: PerSet<Walk<'_>> = rest.iter().map(|s| s.walk()).collect();
     let mut digits = [0u8; DIGITS_MAX];
     let mut found = 0usize;
     while let Some(v) = walk.peek() {
@@ -594,7 +605,7 @@ where
     let Some((first, rest)) = sets.split_first() else {
         return 0;
     };
-    let mut order: Vec<usize> = (0..rest.len()).collect();
+    let mut order: PerSet<usize> = (0..rest.len()).collect();
     order.sort_unstable_by_key(|&i| rest[i].len());
 
     let mut digits = [0u8; DIGITS_MAX];

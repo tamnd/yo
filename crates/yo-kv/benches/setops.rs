@@ -337,11 +337,72 @@ fn bench_merge(c: &mut Criterion) {
     g.finish();
 }
 
+/// The small end, where the per key bookkeeping was most of the command.
+///
+/// Every row above is two hundred thousand members a set, which is a scale where
+/// a handful of mallocs disappears into the walk. The commands people actually
+/// send are `SINTER tag:a tag:b` over a few dozen members each, and there the
+/// five little vectors a set operation used to build before it started were
+/// comparable to the work itself.
+///
+/// Both representations, because they take different plans: integers merge and
+/// text probes, and only one of them is free of a hash table.
+fn bench_small(c: &mut Criterion) {
+    let mut g = c.benchmark_group("setops_small");
+
+    for &n in &[8usize, 64] {
+        for &k in &[2usize, 3] {
+            let ints = build_ints(k, n, n / 2, Spread::Banded);
+            let int_refs: Vec<&Set> = ints.iter().collect();
+            let text = build_small_text(k, n, n / 2);
+            let text_refs: Vec<&Set> = text.iter().collect();
+
+            for (what, refs) in [("ints", &int_refs), ("text", &text_refs)] {
+                let id = format!("{what}/k{k}");
+                g.bench_with_input(BenchmarkId::new("inter", &id), &n, |b, _| {
+                    b.iter(|| {
+                        let mut c = 0usize;
+                        setops::inter(black_box(refs), 0, |_| c += 1);
+                        c
+                    })
+                });
+                g.bench_with_input(BenchmarkId::new("union", &id), &n, |b, _| {
+                    b.iter(|| {
+                        let mut c = 0usize;
+                        setops::union(black_box(refs), |_| c += 1);
+                        c
+                    })
+                });
+            }
+        }
+    }
+
+    g.finish();
+}
+
+/// [`build`] at a size small enough that the sets stay packed rather than
+/// becoming tables, which is what a real tag set looks like.
+fn build_small_text(k: usize, n: usize, keep: usize) -> Vec<Set> {
+    (0..k)
+        .map(|s| {
+            let mut set = Set::new();
+            for i in 0..keep {
+                set.add(format!("shared:{i}").as_bytes(), &SetLimits::DEFAULT);
+            }
+            for i in keep..n {
+                set.add(format!("own:{s}:{i}").as_bytes(), &SetLimits::DEFAULT);
+            }
+            set
+        })
+        .collect()
+}
+
 criterion_group!(
     benches,
     bench_crossover,
     bench_union_and_diff,
     bench_store,
-    bench_merge
+    bench_merge,
+    bench_small
 );
 criterion_main!(benches);

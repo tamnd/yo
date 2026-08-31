@@ -625,7 +625,7 @@ impl Default for Intset {
 /// Stepping is a pointer step and nothing else, which is what makes a merge a
 /// different order of cost from a probe. `setops.rs` explains what that buys and
 /// has the numbers.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 pub struct Walk<'a> {
     set: &'a Intset,
     /// Which run. Equal to the run count once the cursor is past the end.
