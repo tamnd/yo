@@ -25,9 +25,10 @@
 
 use yo_common::num::{DIGITS_MAX, i64_digits};
 use yo_common::{Code, Error, Result, glob_matches, parse_i64};
-use yo_kv::{Cursor, Keyspace, Member};
+use yo_kv::{Keyspace, Member};
 
 use super::args::{self, Args};
+use super::scan;
 use super::table::Spec;
 use crate::reply::Out;
 
@@ -37,14 +38,10 @@ use crate::reply::Out;
 /// number at all, which looks like a mistake and is what `getRangeLongFromObject`
 /// does when a command hands it a message to use.
 const BAD_POP_COUNT: &str = "value is out of range, must be positive";
-/// What Redis says when a scan cursor is not a number.
-const BAD_CURSOR: &str = "invalid cursor";
 /// `SINTERCARD`'s three, which are its own sentences and not the usual ones.
 const BAD_NUMKEYS: &str = "numkeys should be greater than 0";
 const TOO_MANY_KEYS: &str = "Number of keys can't be greater than number of args";
 const BAD_LIMIT: &str = "LIMIT can't be negative";
-/// What `SSCAN` walks when the client does not say.
-const SCAN_COUNT: usize = 10;
 
 /// Run one set command.
 pub(super) fn execute(db: &mut Keyspace, spec: &Spec, args: Args<'_>, out: &mut Out) -> Result<()> {
@@ -182,9 +179,9 @@ pub(super) fn execute(db: &mut Keyspace, spec: &Spec, args: Args<'_>, out: &mut 
 /// the integer path, because ours packs a partition count into the top bits and
 /// a large enough collection would make it wider than an `i64`.
 fn scan(db: &mut Keyspace, args: Args<'_>, out: &mut Out) -> Result<()> {
-    let cursor = parse_cursor(args.get(2))?;
+    let cursor = scan::parse_cursor(args.get(2))?;
     let mut pattern = None;
-    let mut count = SCAN_COUNT;
+    let mut count = scan::COUNT;
     let mut i = 3;
     while i < args.len() {
         let rest = args.len() - i;
@@ -204,27 +201,19 @@ fn scan(db: &mut Keyspace, args: Args<'_>, out: &mut Out) -> Result<()> {
         i += 2;
     }
 
-    // The reply is built into a scratch position and the cursor is written
-    // first, so the header for the members cannot go out until the walk is
-    // over. Nothing is written before the arguments have all been checked,
-    // which is what lets the dispatcher roll a failed command back cleanly.
-    out.array(2);
-    let at = out.len();
-    let mut n = 0;
-    let next = db.sscan(args.get(1), cursor, count, |m| {
-        if matches(pattern, m) {
-            write_member(out, m);
-            n += 1;
-        }
-    })?;
-    out.close_array(at, n);
-    // And the cursor goes in front of the members the same way their header
-    // went in front of them, because the walk is what produced it.
-    let members = out.len() - at;
-    out.bulk_u64(next.raw());
-    let cursor = out.len() - at - members;
-    out.hoist(at, cursor);
-    Ok(())
+    // Nothing is written before the arguments have all been checked, which is
+    // what lets the dispatcher roll a failed command back cleanly. The shape
+    // around the walk is [`scan::reply`] and is shared with the other three.
+    scan::reply(out, |out| {
+        let mut n = 0;
+        let next = db.sscan(args.get(1), cursor, count, |m| {
+            if matches(pattern, m) {
+                write_member(out, m);
+                n += 1;
+            }
+        })?;
+        Ok((next, n))
+    })
 }
 
 /// A `SPOP` count, which cannot be negative and cannot be something else.
@@ -233,25 +222,6 @@ fn pop_count(arg: &[u8]) -> Result<usize> {
         Some(n) if n >= 0 => Ok(usize::try_from(n).unwrap_or(usize::MAX)),
         _ => Err(Error::new(Code::Invalid, BAD_POP_COUNT)),
     }
-}
-
-/// A cursor as the client sent it back.
-///
-/// Unsigned, because ours uses the top bits, and Redis parses a cursor with
-/// `strtoull` too. Anything else is `invalid cursor`, which is its own sentence
-/// and not the usual one about integers.
-fn parse_cursor(arg: &[u8]) -> Result<Cursor> {
-    if arg.is_empty() || !arg.iter().all(u8::is_ascii_digit) {
-        return Err(Error::new(Code::Invalid, BAD_CURSOR));
-    }
-    let mut raw: u64 = 0;
-    for b in arg {
-        raw = raw
-            .checked_mul(10)
-            .and_then(|v| v.checked_add(u64::from(b - b'0')))
-            .ok_or_else(|| Error::new(Code::Invalid, BAD_CURSOR))?;
-    }
-    Ok(Cursor::from_raw(raw))
 }
 
 /// Whether a member survives a `MATCH` pattern.

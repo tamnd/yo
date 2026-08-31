@@ -28,20 +28,19 @@
 
 use yo_common::{Code, Error, Result, glob_matches, parse_i64};
 use yo_kv::hash::Text;
-use yo_kv::{Ask, Cond, Cursor, Exists, Expire, Keyspace, MAX_AT};
+use yo_kv::{Ask, Cond, Exists, Expire, Keyspace, MAX_AT};
 
 use super::args::{self, Args};
+use super::scan;
 use super::table::Spec;
 use crate::reply::Out;
 
 /// What Redis says when a scan cursor is not a number.
-const BAD_CURSOR: &str = "invalid cursor";
 /// What Redis says when `HINCRBY` is given something that is not an integer.
 const NOT_AN_INT: &str = "value is not an integer or out of range";
 /// And `HINCRBYFLOAT`.
 const NOT_A_FLOAT: &str = "value is not a valid float";
 /// What `HSCAN` walks when the client does not say.
-const SCAN_COUNT: usize = 10;
 /// What the `HEXPIRE` family says about a negative time.
 ///
 /// Not the same message an out of range one gets, which is easy to miss: a
@@ -239,9 +238,9 @@ fn randfield(db: &mut Keyspace, args: Args<'_>, out: &mut Out) -> Result<()> {
 /// `MATCH` matches the field and never the value, which is what a client would
 /// assume and worth stating because the same walk has both in hand.
 fn scan(db: &mut Keyspace, args: Args<'_>, out: &mut Out) -> Result<()> {
-    let cursor = parse_cursor(args.get(2))?;
+    let cursor = scan::parse_cursor(args.get(2))?;
     let mut pattern = None;
-    let mut count = SCAN_COUNT;
+    let mut count = scan::COUNT;
     let mut novalues = false;
     let mut i = 3;
     while i < args.len() {
@@ -268,28 +267,21 @@ fn scan(db: &mut Keyspace, args: Args<'_>, out: &mut Out) -> Result<()> {
 
     // Nothing goes out until every argument has been checked, which is what
     // lets the dispatcher roll a failed command back cleanly.
-    out.array(2);
-    let at = out.len();
-    let mut n = 0;
-    let next = db.hscan(args.get(1), cursor, count, |field, value| {
-        if !matches(pattern, field) {
-            return;
-        }
-        write_text(out, field);
-        n += 1;
-        if !novalues {
-            write_text(out, value);
+    scan::reply(out, |out| {
+        let mut n = 0;
+        let next = db.hscan(args.get(1), cursor, count, |field, value| {
+            if !matches(pattern, field) {
+                return;
+            }
+            write_text(out, field);
             n += 1;
-        }
-    })?;
-    out.close_array(at, n);
-    // And the cursor goes in front of the pairs the same way their header went
-    // in front of them, because the walk is what produced it.
-    let body = out.len() - at;
-    out.bulk_u64(next.raw());
-    let cursor = out.len() - at - body;
-    out.hoist(at, cursor);
-    Ok(())
+            if !novalues {
+                write_text(out, value);
+                n += 1;
+            }
+        })?;
+        Ok((next, n))
+    })
 }
 
 /// `HEXPIRE`, `HPEXPIRE`, `HEXPIREAT` and `HPEXPIREAT`.
@@ -687,14 +679,6 @@ fn incr_int(arg: &[u8]) -> Result<i64> {
 /// An `HINCRBYFLOAT` amount, on the same rule.
 fn incr_float(arg: &[u8]) -> Result<f64> {
     yo_common::num::parse_f64(arg).ok_or_else(|| Error::new(Code::Invalid, NOT_A_FLOAT))
-}
-
-/// A cursor as the client sent it back.
-fn parse_cursor(arg: &[u8]) -> Result<Cursor> {
-    match std::str::from_utf8(arg).ok().and_then(|s| s.parse().ok()) {
-        Some(raw) => Ok(Cursor::from_raw(raw)),
-        None => Err(Error::new(Code::Invalid, BAD_CURSOR)),
-    }
 }
 
 /// Whether a field passes the `MATCH` pattern, if there is one.

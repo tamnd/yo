@@ -57,6 +57,7 @@ mod cpu;
 mod hashes;
 mod keyspace;
 mod lists;
+mod scan;
 mod scripting;
 mod server;
 mod sets;
