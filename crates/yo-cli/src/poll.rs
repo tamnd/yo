@@ -10,15 +10,22 @@
 //! question it had already answered.
 //!
 //! This asks the kernel once per turn instead. `epoll` on Linux, `kqueue` on
-//! macOS, and everywhere else the old scan, which is still correct and is what
-//! Windows gets until there is a Windows box in the gate that needs better.
+//! macOS, `WSAPoll` on Windows, and on anything else the old scan, which is
+//! still correct and is nobody's platform today.
+//!
+//! Windows had the scan until the tests below said it could not. They assert
+//! that a quiet connection is not reported, which is the whole point of the
+//! module, and the scan reports everything it has ever been handed. Two tests
+//! failing on one platform is not a Windows problem to leave for later, it is
+//! this module keeping a promise on two platforms out of three.
 //!
 //! # Level triggered on purpose
 //!
-//! Both backends register for readability only and both are level triggered, so
-//! a connection with bytes still in it is reported again next turn. That is the
-//! same contract the scan had, which means the loop above did not have to learn
-//! anything new: read until the socket says it is empty, and come back.
+//! Every backend registers for readability only and every one of them is level
+//! triggered, so a connection with bytes still in it is reported again next
+//! turn. That is the same contract the scan had, which means the loop above did
+//! not have to learn anything new: read until the socket says it is empty, and
+//! come back.
 //!
 //! # Writes are not registered
 //!
@@ -38,16 +45,24 @@ use std::io;
 use std::time::Duration;
 
 /// Something with a handle the kernel will accept, which on Unix is a file
-/// descriptor and elsewhere is nothing, because the fallback does not need one.
+/// descriptor.
 #[cfg(unix)]
 pub trait Source: std::os::fd::AsRawFd {}
 #[cfg(unix)]
 impl<T: std::os::fd::AsRawFd> Source for T {}
 
+/// Something with a handle the kernel will accept, which on Windows is a
+/// socket and not a file handle, because the two are different kinds of number
+/// there and only one of them can be polled.
+#[cfg(windows)]
+pub trait Source: std::os::windows::io::AsRawSocket {}
+#[cfg(windows)]
+impl<T: std::os::windows::io::AsRawSocket> Source for T {}
+
 /// Something with a handle the kernel will accept.
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 pub trait Source {}
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 impl<T> Source for T {}
 
 /// Asks the kernel which registered sources are readable.
@@ -82,7 +97,8 @@ impl Poller {
     ///
     /// Called after the socket behind it has already been closed, because
     /// closing a descriptor takes it out of an `epoll` set and a `kqueue` on
-    /// its own. Only the fallback has anything to do here.
+    /// its own. The backends that keep the registration list themselves, which
+    /// is Windows and the scan, are the ones with work to do here.
     pub fn remove(&mut self, token: u64) {
         self.inner.remove(token);
     }
@@ -109,8 +125,9 @@ impl Poller {
 /// one turn is more work than a turn wants anyway. What is left is still ready
 /// and comes back on the next call.
 ///
-/// The fallback backend has no event array to size, so on a platform that uses
-/// it this number would be dead code.
+/// Windows and the scan hand over their whole registration list on every call
+/// and have no separate event array to size, so on those two this number would
+/// be dead code.
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "ios"))]
 const EVENTS: usize = 64;
 
@@ -118,8 +135,10 @@ const EVENTS: usize = 64;
 use bsd as backend;
 #[cfg(target_os = "linux")]
 use linux as backend;
-#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "ios")))]
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "ios", windows)))]
 use scan as backend;
+#[cfg(windows)]
+use win as backend;
 
 use backend::Inner;
 
@@ -305,14 +324,115 @@ mod bsd {
     }
 }
 
-/// Everywhere else, which today means Windows: the scan this replaced.
+/// `WSAPoll`, for Windows.
+///
+/// The odd one out: `epoll` and `kqueue` are objects the kernel keeps and this
+/// is an array the caller keeps and hands over on every call. So `remove` has
+/// work to do here, where on the other two closing the socket is enough, and
+/// the array is walked twice per turn rather than never. At the connection
+/// counts this server sees that is nothing against the syscall per idle
+/// connection it replaces, and if it ever is not, the answer is IOCP and a
+/// different shape of loop rather than a faster walk.
+///
+/// A socket is a `SOCKET` and not a file handle. They are different numbers on
+/// this platform and only one of them can be polled, which is why [`Source`]
+/// asks for `AsRawSocket` here.
+#[cfg(windows)]
+mod win {
+    use super::Source;
+    use std::io;
+    use std::time::Duration;
+    use windows_sys::Win32::Networking::WinSock::{
+        POLLRDNORM, WSAGetLastError, WSAPOLLFD, WSAPoll,
+    };
+
+    pub struct Inner {
+        /// The array `WSAPoll` is handed, and the token for each row beside it.
+        ///
+        /// Two vectors and not one of pairs, because the first has to be one
+        /// contiguous run of `WSAPOLLFD` for the call and a vector of pairs is
+        /// not that.
+        fds: Vec<WSAPOLLFD>,
+        tokens: Vec<u64>,
+    }
+
+    impl Inner {
+        pub fn new() -> io::Result<Inner> {
+            Ok(Inner {
+                fds: Vec::new(),
+                tokens: Vec::new(),
+            })
+        }
+
+        pub fn add(&mut self, src: &impl Source, token: u64) -> io::Result<()> {
+            // `POLLRDNORM` and not `POLLIN`, because `POLLIN` here is that plus
+            // `POLLRDBAND`, which is out of band data this server never reads.
+            self.fds.push(WSAPOLLFD {
+                fd: src.as_raw_socket() as usize,
+                events: POLLRDNORM,
+                revents: 0,
+            });
+            self.tokens.push(token);
+            Ok(())
+        }
+
+        pub fn remove(&mut self, token: u64) {
+            if let Some(i) = self.tokens.iter().position(|t| *t == token) {
+                // Order does not matter, so the last row moves into the hole
+                // rather than everything above it moving down.
+                self.fds.swap_remove(i);
+                self.tokens.swap_remove(i);
+            }
+        }
+
+        pub fn wait(&mut self, out: &mut Vec<u64>, timeout: Duration) -> io::Result<()> {
+            // `WSAPoll` refuses an empty array rather than treating it as a
+            // sleep, so the sleep is here. This is the state the server is in
+            // between its last connection closing and its next one arriving,
+            // which for a listener that is always registered is never, and for
+            // a poller with nothing in it at all is the moment before the doors
+            // open.
+            if self.fds.is_empty() {
+                if !timeout.is_zero() {
+                    std::thread::sleep(timeout);
+                }
+                return Ok(());
+            }
+            let ms = i32::try_from(timeout.as_millis()).unwrap_or(i32::MAX);
+            let n = {
+                let len = u32::try_from(self.fds.len()).unwrap_or(u32::MAX);
+                // SAFETY: the array is ours, it is `len` rows long, and the
+                // call writes only to the `revents` field of each row.
+                unsafe { WSAPoll(self.fds.as_mut_ptr(), len, ms) }
+            };
+            if n < 0 {
+                // SAFETY: a call with no arguments that reads thread local
+                // state the failing call just wrote.
+                return Err(io::Error::from_raw_os_error(unsafe { WSAGetLastError() }));
+            }
+            for (row, token) in self.fds.iter().zip(&self.tokens) {
+                // Readable, and also hung up or in error, because both of those
+                // are the loop's business: a read on a closed socket is how the
+                // connection finds out it is closed. `revents` is reported
+                // whatever was asked for, which is why the mask here is wider
+                // than the one in `add`.
+                if row.revents != 0 {
+                    out.push(*token);
+                }
+            }
+            Ok(())
+        }
+    }
+}
+
+/// Everywhere else, which today is nowhere: the scan this replaced.
 ///
 /// It reports every registered token every time, so the loop above reads from
 /// every open connection and finds out the hard way which ones had something.
-/// That is what the server did before this module existed, so the fallback is
-/// not a downgrade, it is the previous behaviour kept where there is nothing
-/// better wired up yet.
-#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "ios")))]
+/// That is what the server did before this module existed, so it is not a
+/// downgrade, it is the previous behaviour kept for a platform that is neither
+/// unix nor Windows and that nobody has asked for.
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "ios", windows)))]
 mod scan {
     use super::Source;
     use std::io;
@@ -350,7 +470,15 @@ mod scan {
     }
 }
 
+/// What a poller promises, which is that a source with nothing on it is not
+/// reported.
+///
+/// Compiled for the three platforms that have a real backend, because the scan
+/// cannot make that promise and these tests are the promise written down. On a
+/// platform that falls through to the scan there is nothing here to run, which
+/// is the honest state of affairs rather than a test that asserts less.
 #[cfg(test)]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "ios", windows))]
 mod tests {
     use super::*;
     use std::io::{Read, Write};

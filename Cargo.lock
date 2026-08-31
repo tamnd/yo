@@ -824,6 +824,7 @@ name = "yo-cli"
 version = "0.3.3"
 dependencies = [
  "libc",
+ "windows-sys",
  "yo-file",
  "yo-format",
  "yo-reactor",
