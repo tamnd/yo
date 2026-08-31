@@ -9,13 +9,19 @@
 //! `05` section 4.1 argues for this band on speed, citing L6: a dense positional
 //! structure probes in about 70 ns where a listpack walk costs 1 to 2 ns, a fifty
 //! times gap. Half of that reproduces and half of it does not. A walk here does
-//! cost 1.9 ns an element, which is L6's number. A probe in our element table
-//! costs 13 ns and not 70, so the gap it was being compared against is not there,
-//! and at eight members the table wins on every operation: 13.7 ns against 25.2
-//! to find a member that is present, 5.6 against 43.9 to find one that is not,
-//! 0.5 ns an element against 1.9 to walk the whole thing, and 240 ns against 280
-//! to build it. At a hundred and twenty eight the table is twenty times faster to
-//! probe. There is no crossover. `benches/listpack.rs` is where those come from.
+//! cost 1 to 2 ns an element, which is L6's number. A probe in our element table
+//! costs 8 ns and not 70, so the gap it was being compared against is not there,
+//! and at eight members the two are within noise of each other: 8.2 ns against
+//! 7.6 to find a member that is present, which the blob now wins, 4.2 against
+//! 10.3 to find one that is not, 0.4 ns an element against 1.3 to walk the whole
+//! thing, and 268 ns against 261 to build it. At a hundred and twenty eight the
+//! table is fifteen times faster to probe and the gap only widens from there.
+//! `benches/listpack.rs` is where those come from.
+//!
+//! The find numbers used to be much worse for the blob and were re-measured when
+//! the scan stopped decoding every element it walked past, which is written up on
+//! `scan_for` below. It does not change the conclusion, because the conclusion
+//! never rested on them.
 //!
 //! What the band is actually for is memory, and there the gap is real and the
 //! other way round. With an eleven byte member the blob costs 13.1 bytes an
@@ -367,22 +373,7 @@ impl Listpack {
     /// until somebody writes them.
     #[must_use]
     pub fn find_parsed(&self, needle: &[u8], as_int: Option<i64>, step: usize) -> Option<usize> {
-        let step = step.max(1);
-        // Counted down rather than `at % step`, because `step` is a runtime value
-        // and the remainder compiles to a real division on every element. That is
-        // twenty cycles to answer a question about a two element cycle, and it
-        // cost more than the comparison it was guarding.
-        let mut until = 0usize;
-        for (at, e) in self.iter().enumerate() {
-            if until == 0 {
-                if e.is(needle, as_int) {
-                    return Some(at);
-                }
-                until = step;
-            }
-            until -= 1;
-        }
-        None
+        scan_for(self.entries(), needle, as_int, step)
     }
 
     /// Add an element at the end.
@@ -722,6 +713,248 @@ pub(crate) fn decode(b: &[u8]) -> Option<(Entry<'_>, usize)> {
     Some((Entry::Str(s), at + len))
 }
 
+/// Eight bytes of `s` starting at `at`, as a number.
+///
+/// The caller has already checked that they are there, so the `try_into` cannot
+/// fail and the compiler knows it, which is what keeps this to one unaligned
+/// load on every target this runs on.
+#[inline(always)]
+fn word(s: &[u8], at: usize) -> u64 {
+    u64::from_le_bytes(s[at..at + 8].try_into().expect("eight bytes"))
+}
+
+/// The needle of a scan, with everything that does not change worked out once.
+///
+/// This exists because of what the generated code looked like without it. The
+/// comparison started as a length check, a first byte check and then `a == b`,
+/// which is a call to `memcmp`, and on the workload that actually matters none
+/// of the first two filter anything: list elements are overwhelmingly a fixed
+/// shape with a varying tail, so a million of them called `element:00000000`
+/// through `element:00999999` are all the same length and all start with the
+/// same letter. Every element paid for the call.
+///
+/// Comparing whole words instead fixes that, and eight bytes from each end
+/// covers any length up to sixteen exactly, because at that length the two
+/// windows overlap and between them cover the whole value. Longer than sixteen
+/// and the two words are a filter in front of the call rather than a
+/// replacement for it, which is fine, since a value agreeing on both ends and
+/// differing in the middle is rare enough to be worth a `memcmp` when it turns
+/// up.
+///
+/// Working the two words out here rather than in the loop is not a
+/// micro-optimisation, it is two loads an element. Left inline the compiler
+/// reloads them from the needle every time round, because the calls further down
+/// the body could have written to it as far as it knows, and it has no way to
+/// prove otherwise.
+struct Needle<'a> {
+    bytes: &'a [u8],
+    /// The length, which is the first thing every element is rejected on.
+    len: usize,
+    /// The first and last eight bytes, both zero and never looked at when the
+    /// value is shorter than eight bytes.
+    head: u64,
+    tail: u64,
+    /// What the value is as a number, if it is one. An element stored under an
+    /// integer encoding can only match this.
+    num: Option<i64>,
+}
+
+impl<'a> Needle<'a> {
+    fn new(bytes: &'a [u8], num: Option<i64>) -> Needle<'a> {
+        let len = bytes.len();
+        let wide = len >= 8;
+        Needle {
+            bytes,
+            len,
+            head: if wide { word(bytes, 0) } else { 0 },
+            tail: if wide { word(bytes, len - 8) } else { 0 },
+            num,
+        }
+    }
+
+    /// Whether a string payload of the same length is this value.
+    ///
+    /// `always` rather than `inline`, and it is worth saying why, because this
+    /// is the difference between three and a half nanoseconds an element and one
+    /// and a half. Left to its own judgement the compiler kept this out of line,
+    /// so the scan below made a call per element, spilled around it, and paid
+    /// more to set the arguments up than the comparison itself costs.
+    ///
+    /// Every length here is taken from `p` and not from the needle, which reads
+    /// like a pointless difference and is not. The caller has already checked
+    /// that they are equal, but nothing in the types says so, so a bound written
+    /// in terms of the needle is a bound the compiler has to check against `p`
+    /// all over again, and it emitted a second comparison and a panic landing pad
+    /// on the hot path to do it. Written this way the check that lets the first
+    /// word be read is the same check that says the value is long enough to have
+    /// two words at all.
+    #[inline(always)]
+    fn is(&self, p: &[u8]) -> bool {
+        debug_assert_eq!(p.len(), self.len, "the caller checks the length first");
+        let n = p.len();
+        if n < 8 {
+            return p == self.bytes;
+        }
+        word(p, 0) == self.head
+            && word(p, n - 8) == self.tail
+            && (n <= 16 || p[8..n - 8] == self.bytes[8..n - 8])
+    }
+}
+
+/// Walk a run of entries looking for `needle`, and say which one it was.
+///
+/// `b` is entries and nothing else, which is what a chunk holds and what a
+/// listpack holds between its header and its terminator, so both callers get the
+/// same walk. `step` is the hash trick: a field lookup over field, value, field,
+/// value is a find with a step of two.
+///
+/// # Why this is not the obvious walk
+///
+/// The obvious walk is `self.iter().position(|e| e.is(needle, as_int))`, which
+/// is what this was, and it costs about 6.7 nanoseconds an element. That is
+/// twenty seven cycles to answer "are these bytes those bytes", and almost none
+/// of it is the comparison. Every step ran the whole of [`decode`], which is a
+/// fourteen way match with a bounds checked read per header byte, built an
+/// [`Entry`] out of what it found, handed that back through the iterator, and
+/// only then compared. On a million element `LINSERT` that is three and a third
+/// milliseconds of work to reach an insert that takes two hundred and eighty
+/// five nanoseconds.
+///
+/// So the walk below never builds an `Entry` and never reads a payload it is not
+/// about to compare. The header alone says how long the entry is, the length
+/// rejects most elements with one comparison, and what gets past that is
+/// compared as two words rather than as a call. See [`Needle`] for that half of
+/// it.
+///
+/// The integer arm is the rare one and it is deliberately left to `decode`. It
+/// is four sign extensions of different widths, getting one of them subtly wrong
+/// is exactly the kind of bug that hides for a year, and having a second copy of
+/// them here to save a call on a path that is cold in every list workload is a
+/// bad trade.
+#[inline]
+pub(crate) fn scan_for(b: &[u8], needle: &[u8], as_int: Option<i64>, step: usize) -> Option<usize> {
+    let needle = Needle::new(needle, as_int);
+    // Two walks out of one body. A list finds by stepping over every element and
+    // a hash steps over every other one, and carrying the counter for a step
+    // that is always one costs four instructions and a branch on the hottest
+    // loop in `LINSERT`. As a constant it folds away entirely.
+    if step <= 1 {
+        walk::<true>(b, &needle, 1)
+    } else {
+        walk::<false>(b, &needle, step)
+    }
+}
+
+/// How long the entry at `at` is, split into its header and its payload, and
+/// whether the payload is text.
+///
+/// Every encoding except the short string, which the walk below handles itself.
+/// An integer encoding is entirely header, so its payload length is zero and it
+/// can never match a string of any length.
+///
+/// Out of line on purpose, and it is not because this is rare in general, it is
+/// because of what having it inline did to the loop it was in. Thirteen arms
+/// need registers, and the register allocator paid for them by spilling the
+/// needle's two comparison words to the stack and reloading them on every single
+/// element, including the overwhelming majority that never reach this function
+/// at all. A call on the encodings a list does not use is a good trade for two
+/// loads on the ones it does.
+#[inline(never)]
+fn head_at(b: &[u8], at: usize) -> Option<(usize, usize, bool)> {
+    let tag = *b.get(at)?;
+    Some(match tag {
+        0x00..=0x7F => (1, 0, false),
+        0x80..=0xBF => (1, (tag & 0x3F) as usize, true),
+        0xC0..=0xDF => (2, 0, false),
+        0xE0..=0xEF => (
+            2,
+            (usize::from(tag & 0x0F) << 8) | usize::from(*b.get(at + 1)?),
+            true,
+        ),
+        0xF0 => (
+            5,
+            u32::from_le_bytes([
+                *b.get(at + 1)?,
+                *b.get(at + 2)?,
+                *b.get(at + 3)?,
+                *b.get(at + 4)?,
+            ]) as usize,
+            true,
+        ),
+        0xF1 => (3, 0, false),
+        0xF2 => (4, 0, false),
+        0xF3 => (5, 0, false),
+        0xF4 => (9, 0, false),
+        // 0xF5 to 0xFE are unused by Redis and 0xFF is the terminator, which is
+        // not in this run. Either way there is nothing after it that can be read
+        // as an entry.
+        _ => return None,
+    })
+}
+
+/// The scan itself, with `EVERY` saying whether `step` is worth carrying.
+#[inline]
+fn walk<const EVERY: bool>(b: &[u8], needle: &Needle<'_>, step: usize) -> Option<usize> {
+    let want = needle.len;
+    let mut at = 0usize;
+    let mut idx = 0usize;
+    // Counted down rather than `idx % step`, because `step` is a runtime value
+    // and the remainder compiles to a real division on every element. That is
+    // twenty cycles to answer a question about a two element cycle, and it cost
+    // more than the comparison it was guarding.
+    let mut until = 0usize;
+    while at < b.len() {
+        let tag = b[at];
+        // The one encoding a list is actually made of, given a path with nothing
+        // in it. A string of sixty three bytes or less is a one byte header, and
+        // its total is at most sixty four so its back length is one byte too,
+        // which means stepping to the next element is an add of a number that
+        // came straight out of the tag. No second read, no table, and one branch
+        // instead of the five the general match below needs.
+        //
+        // The general walk is not slow because of how many instructions it runs.
+        // It is slow because of how many of its branches are taken: a core
+        // retires about one taken branch a cycle, and a five way tag match that
+        // ends in a four way back length match spends more time being fetched
+        // than being executed. Straightening the common case out is worth more
+        // than anything done to the comparison inside it.
+        if EVERY && tag & 0xC0 == 0x80 {
+            let len = (tag & 0x3F) as usize;
+            if len == want && needle.is(b.get(at + 1..at + 1 + len)?) {
+                return Some(idx);
+            }
+            at += len + 2;
+            idx += 1;
+            continue;
+        }
+        let (hdr, len, text) = head_at(b, at)?;
+        let total = hdr + len;
+        if EVERY || until == 0 {
+            let hit = if text {
+                len == want && needle.is(b.get(at + hdr..at + total)?)
+            } else {
+                // `at` is inside `b`, which is the loop condition, so this
+                // slice is always there.
+                needle
+                    .num
+                    .is_some_and(|v| matches!(decode(&b[at..]), Some((Entry::Int(n), _)) if n == v))
+            };
+            if hit {
+                return Some(idx);
+            }
+            if !EVERY {
+                until = step;
+            }
+        }
+        if !EVERY {
+            until -= 1;
+        }
+        at += total + backlen_len(total);
+        idx += 1;
+    }
+    None
+}
+
 /// How many bytes the back length of an entry of `len` bytes takes.
 ///
 /// Seven bits a byte, so the boundaries are `2^7 - 1`, `2^14 - 1` and so on, and
@@ -965,6 +1198,99 @@ mod tests {
         assert_eq!(lp.find(b"beta", 1), Some(3));
         assert_eq!(lp.find(b"gamma", 1), None);
         assert_eq!(lp.find(b"1", 1), None, "01 is not 1");
+    }
+
+    /// The scan has a short path for the one encoding a list is made of and a
+    /// general one for the other thirteen, and the danger with two paths is that
+    /// they disagree about some element neither author had in mind. So this
+    /// builds a blob holding every encoding, at every length that changes which
+    /// path an element takes, and asks for each of them in turn.
+    ///
+    /// The lengths are the ones that matter to the comparison rather than
+    /// arbitrary: nothing, under a word, exactly a word, between one and two
+    /// words where the two window compare covers the whole value, exactly two,
+    /// and past two where it stops being a whole answer and becomes a filter in
+    /// front of `memcmp`. Sixty three and sixty four are the last length with a
+    /// one byte header and the first with two, which is the boundary the short
+    /// path is drawn on.
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn both_paths_through_the_scan_agree_about_every_encoding() {
+        let mut members: Vec<Vec<u8>> = Vec::new();
+        // One of each integer encoding, including the boundaries where Redis
+        // steps up to a wider one and both signs of each.
+        for n in [
+            0i64,
+            127,
+            -1,
+            4095,
+            -4096,
+            32767,
+            -32768,
+            8_388_607,
+            -8_388_608,
+            2_147_483_647,
+            -2_147_483_648,
+            i64::MAX,
+            i64::MIN,
+        ] {
+            members.push(n.to_string().into_bytes());
+        }
+        // And a string at every length the comparison treats differently.
+        for len in [0usize, 1, 7, 8, 9, 15, 16, 17, 31, 63, 64, 100, 200] {
+            let mut v = vec![b'a'; len];
+            // A varying tail, so that two different lengths are not two
+            // prefixes of each other and the length check is doing work rather
+            // than being the only thing that separates them.
+            if len > 0 {
+                v[len - 1] = b'0' + (len % 10) as u8;
+            }
+            members.push(v);
+        }
+        let lp = of(&members.iter().map(Vec::as_slice).collect::<Vec<_>>());
+        assert_eq!(lp.len(), members.len());
+        for (at, m) in members.iter().enumerate() {
+            assert_eq!(lp.find(m, 1), Some(at), "member {at} went missing");
+        }
+        // And a handful that are not there, each one a near miss of something
+        // that is: a different length, the same length with a different first
+        // byte, and the same length with a different last byte.
+        for miss in [
+            b"aaaaaaaaaaaa".as_slice(),
+            b"baaaaaa7".as_slice(),
+            b"aaaaaaa9".as_slice(),
+            b"128".as_slice(),
+            b"-2".as_slice(),
+        ] {
+            assert_eq!(lp.find(miss, 1), None, "{miss:?} is not in here");
+        }
+    }
+
+    /// The same blob under a step of two, which is the other instantiation of
+    /// the walk and the one a hash uses. Nothing at an odd position may be
+    /// found, whatever it is encoded as.
+    #[test]
+    fn a_stepped_scan_agrees_with_itself_about_every_encoding() {
+        let members: Vec<Vec<u8>> = (0..40i32)
+            .map(|i| {
+                if i % 3 == 0 {
+                    (i64::from(i) * 1000 - 20_000).to_string().into_bytes()
+                } else {
+                    format!("field:{i:0width$}", width = (i % 20) as usize).into_bytes()
+                }
+            })
+            .collect();
+        let lp = of(&members.iter().map(Vec::as_slice).collect::<Vec<_>>());
+        for (at, m) in members.iter().enumerate() {
+            let want = if at % 2 == 0 {
+                // Every member here is distinct, so an even one is found where
+                // it is and an odd one is not found at all.
+                Some(at)
+            } else {
+                None
+            };
+            assert_eq!(lp.find(m, 2), want, "member {at} under a step of two");
+        }
     }
 
     /// A hash in this band is field, value, field, value, and a field lookup has

@@ -436,6 +436,19 @@ impl Chunk {
         self.bytes.shrink_to_fit();
     }
 
+    /// Where `value` is in this chunk, or nothing.
+    ///
+    /// The same walk [`crate::listpack::Listpack::find_parsed`] does and the
+    /// same code, because a chunk is the same entries in a run with a cursor at
+    /// each end rather than a blob with a header. `LINSERT` on a long list is
+    /// almost entirely this call repeated over a few thousand chunks, so it
+    /// reads headers and rejects on length rather than decoding every element
+    /// into an [`crate::listpack::Entry`] on the way past.
+    #[must_use]
+    pub fn find(&self, value: &[u8], as_int: Option<i64>) -> Option<usize> {
+        crate::listpack::scan_for(&self.bytes[self.head..self.tail], value, as_int, 1)
+    }
+
     /// A forward walk over what is here.
     #[must_use]
     pub fn iter(&self) -> Iter<'_> {

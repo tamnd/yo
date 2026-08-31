@@ -366,10 +366,19 @@ impl List {
     }
 
     /// Where the first `value` is, front to back.
+    ///
+    /// This is what `LINSERT` spends its time in, and on a long list it is
+    /// essentially all of it: the insert itself is a couple of hundred
+    /// nanoseconds and the pivot search in front of it is however long the list
+    /// is. So it goes to the band rather than through the element walk, and the
+    /// band reads entry headers instead of decoding elements.
     #[must_use]
     pub fn find(&self, value: &[u8]) -> Option<usize> {
         let as_int = yo_common::num::parse_i64(value);
-        self.iter().position(|e| e.is(value, as_int))
+        match &self.body {
+            Body::Packed(lp) => lp.find_parsed(value, as_int, 1),
+            Body::Chunks(d) => d.find(value, as_int),
+        }
     }
 
     /// Where `value` is, as many times as asked, which is `LPOS`.
@@ -726,6 +735,23 @@ impl Deque {
     /// A forward walk over every chunk in turn.
     fn iter(&self) -> impl Iterator<Item = Element<'_>> {
         self.chunks.iter().flat_map(Chunk::iter)
+    }
+
+    /// Where the first `value` is, counting from the front of the ring.
+    ///
+    /// Chunk by chunk, with a running base, rather than element by element. A
+    /// chunk that does not hold the value costs one call and one walk of its own
+    /// bytes, and the ring never builds an element for anything it is only
+    /// stepping over.
+    fn find(&self, value: &[u8], as_int: Option<i64>) -> Option<usize> {
+        let mut base = 0usize;
+        for c in &self.chunks {
+            if let Some(at) = c.find(value, as_int) {
+                return Some(base + at);
+            }
+            base += c.len();
+        }
+        None
     }
 
     /// `count` elements from `start`, without walking to `start`.
@@ -1644,6 +1670,47 @@ mod tests {
             assert!(!l.set(50, b"z", &limits), "past the end is not a set");
             assert_eq!(all(&l), before);
         }
+    }
+
+    /// The pivot search stopped walking elements and started reading entry
+    /// headers, and it runs over a ring of chunks rather than one blob, so the
+    /// two things it could get wrong are the offset it adds for the chunks in
+    /// front of the one it found the value in, and an element whose encoding
+    /// takes the long way through the scan.
+    ///
+    /// So this puts every kind of element in a list long enough to be several
+    /// hundred chunks, of mixed lengths so that the chunk boundaries fall in
+    /// awkward places, and asks for each of them by value. Every answer has to be
+    /// the position the element is actually at, which is checked against the
+    /// element walk rather than against a number written down here.
+    #[test]
+    fn a_pivot_is_found_at_the_right_position_across_a_ring_of_chunks() {
+        let limits = Limits::default();
+        let mut l = List::new();
+        let mut want: Vec<Vec<u8>> = Vec::new();
+        for i in 0..4_000usize {
+            // Four shapes, cycling: a plain number, a number too big for the
+            // small encodings, a short string and a long one. The lengths vary
+            // with the index so that no two chunks break in the same place.
+            let v = match i % 4 {
+                0 => i.to_string().into_bytes(),
+                1 => (i64::MAX - i as i64).to_string().into_bytes(),
+                2 => format!("v{i:0width$}", width = 1 + i % 30).into_bytes(),
+                _ => format!("value:{i}:{}", "x".repeat(40 + i % 90)).into_bytes(),
+            };
+            l.push_back(&v, &limits);
+            want.push(v);
+        }
+        assert_eq!(l.encoding(), Encoding::Quicklist, "this needs the ring");
+        assert_eq!(l.len(), want.len());
+        for (at, v) in want.iter().enumerate() {
+            assert_eq!(l.find(v), Some(at), "element {at} is not where it is");
+        }
+        assert_eq!(l.find(b"not in here at all"), None);
+        // A near miss of a real element at both ends of it, which is what the
+        // two word comparison is for and what it would get wrong if it only
+        // looked at one end.
+        assert_eq!(l.find(b"v2000000000000000000000000000002"), None);
     }
 
     #[test]
