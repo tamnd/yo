@@ -43,8 +43,17 @@
 use std::cell::RefCell;
 use std::collections::VecDeque;
 
+use yo_common::Small;
+
 use crate::chunk::{CHUNK_BYTES, Chunk};
 use crate::listpack::{Entry, Listpack};
+
+/// How many `LREM` hits fit without the allocator.
+///
+/// `LREM key 1 value` and `LREM key -1 value` are what this command is for, and
+/// a count past a handful is somebody clearing every copy out of a long list,
+/// where one allocation is not what it is paying for.
+const HITS: usize = 8;
 
 /// A list element: bytes as they lie, or an integer not yet formatted.
 pub type Element<'a> = Entry<'a>;
@@ -468,7 +477,12 @@ impl List {
         // Collected first and removed after, because removing during the walk
         // moves the elements the walk has not reached yet. Highest index first
         // so that the ones still to go do not move either.
-        let mut hits = Vec::new();
+        //
+        // On the stack up to `HITS`, because the count `LREM` is given is one
+        // or two in almost every use of it and a `Vec` for one `usize` is a
+        // malloc and a free on a command path. `LREM key 0 value` on a list
+        // holding many copies spills, which is the right answer for it.
+        let mut hits: Small<usize, HITS> = Small::new();
         if count >= 0 {
             match &self.body {
                 Body::Packed(lp) => lp.find_each(value, as_int, 0, &mut |at| {

@@ -588,7 +588,15 @@ impl Keyspace {
             }
             return Ok(len);
         }
-        let mut rows: Vec<usize> = (0..len).collect();
+        // The database's index buffer rather than a fresh `Vec`, for the reason
+        // the byte scratch exists: a partial shuffle needs somewhere to hold the
+        // permutation while it draws from it, and building that somewhere out of
+        // the allocator on every `ZRANDMEMBER` is a malloc and a free on a
+        // command a sampler sends in a loop. Taken out and put back, so an early
+        // return leaves it as it was found.
+        let mut rows = std::mem::take(&mut self.rows);
+        rows.clear();
+        rows.extend(0..len);
         for i in 0..want {
             let pick = i + self.rng.below(len - i);
             rows.swap(i, pick);
@@ -597,6 +605,7 @@ impl Keyspace {
             };
             f(m, s);
         }
+        self.rows = rows;
         Ok(want)
     }
 
@@ -981,6 +990,51 @@ mod tests {
             out.len()
         );
         out
+    }
+
+    /// A positive count under the size of the set does a partial shuffle, and
+    /// the permutation that needs used to be a fresh `Vec` every call. Sampling
+    /// is a thing callers do in a loop, so the first call is allowed to grow the
+    /// buffer and none after it may allocate at all.
+    #[test]
+    fn zrandmember_stops_allocating_once_its_buffer_is_grown() {
+        let mut k = ks();
+        add(
+            &mut k,
+            b"z",
+            &[(1.0, b"a"), (2.0, b"b"), (3.0, b"c"), (4.0, b"d")],
+        );
+        k.zrandmember(b"z", 2, |_, _| {}).expect("a sorted set");
+        let (_, allocs) = crate::tally::counted(|| {
+            for _ in 0..100 {
+                k.zrandmember(b"z", 2, |_, _| {}).expect("a sorted set");
+            }
+        });
+        assert_eq!(
+            allocs, 0,
+            "zrandmember allocated {allocs} times in a hundred"
+        );
+    }
+
+    /// The buffer is put back on the way out, so the call after it sees a
+    /// buffer rather than an empty one, and both answer with what they were
+    /// asked for.
+    #[test]
+    fn zrandmember_hands_its_buffer_back() {
+        let mut k = ks();
+        add(&mut k, b"z", &[(1.0, b"a"), (2.0, b"b"), (3.0, b"c")]);
+        for _ in 0..3 {
+            let mut seen = Vec::new();
+            let n = k
+                .zrandmember(b"z", 2, |m, _| {
+                    let mut digits = [0u8; DIGITS_MAX];
+                    seen.push(String::from_utf8(member_bytes(m, &mut digits).to_vec()).unwrap());
+                })
+                .expect("a sorted set");
+            assert_eq!(n, 2);
+            assert_eq!(seen.len(), 2);
+            assert_ne!(seen[0], seen[1], "a positive count draws without replacing");
+        }
     }
 
     #[test]

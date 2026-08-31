@@ -775,6 +775,38 @@ mod tests {
         assert_eq!(all(&mut d, b"q"), ["b", "c", "a"]);
     }
 
+    /// `LREM` used to build a `Vec` to hold the indices it was about to remove,
+    /// and the count it is given is one in almost every use of it, so that was
+    /// an allocation to hold a single `usize`.
+    #[test]
+    fn lrem_does_not_allocate_to_remove_a_handful() {
+        let mut d = db();
+        // Built up front, so the loop below is a hundred `LREM` calls and
+        // nothing else. Pushing inside it would make the key over and over,
+        // and making a key is an allocation this is not asking about.
+        let many: Vec<&[u8]> = (0..100).map(|_| b"gone".as_slice()).collect();
+        rpush(&mut d, b"l", &many);
+        rpush(&mut d, b"l", &[b"keep"]);
+        let (_, allocs) = crate::tally::counted(|| {
+            for _ in 0..100 {
+                assert_eq!(d.lrem(b"l", 1, b"gone").expect("a list"), 1);
+            }
+        });
+        assert_eq!(allocs, 0, "lrem allocated {allocs} times in a hundred");
+        assert_eq!(all(&mut d, b"l"), ["keep"]);
+    }
+
+    /// And it still answers when the hits do not fit on the stack.
+    #[test]
+    fn lrem_with_more_hits_than_fit_inline_still_removes_all_of_them() {
+        let mut d = db();
+        let many: Vec<&[u8]> = (0..40).map(|_| b"x".as_slice()).collect();
+        rpush(&mut d, b"l", &many);
+        rpush(&mut d, b"l", &[b"keep"]);
+        assert_eq!(d.lrem(b"l", 0, b"x").expect("a list"), 40);
+        assert_eq!(all(&mut d, b"l"), ["keep"]);
+    }
+
     #[test]
     fn lmove_checks_the_destination_before_taking_anything() {
         let mut d = db();
