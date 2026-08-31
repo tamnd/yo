@@ -4,6 +4,18 @@ What each release changed, why, and what it costs you. The versioning rules and 
 
 While the major is 0, a minor release may break anything, including the on-disk format. The format is frozen at `M6`, not before.
 
+## Unreleased
+
+### Changed
+
+- **Comparing two short byte strings no longer calls `memcmp`.** `a == b` on two slices is a call into the platform's `memcmp`, which is the right answer for a megabyte and the wrong one for a key. `yo_common::bytes_eq` compares in machine words and stays inline, with the last word overlapping the one before it so that nineteen bytes is three loads and no tail loop. It is used at the three places the hot path always goes through: the key comparison in the index, the member comparison in the element table, and the memo in the keyspace.
+- **An integer reply is formatted into a copy of a length the compiler can see.** `push_u64` was building the digits from the back of a twenty byte buffer and copying `buf[i..]`, a length only known at run time, which is a call into `memmove` that costs more to enter than it does to move a digit. The digits now go in from the front and the whole buffer is copied and cut back, and `i64_len` counts digits with `ilog10` rather than a loop of divides.
+
+### Added
+
+- **Engine bench rows for the hot key shape, `engine/sadd` and `engine/srandmember`.** Both fill `set:hot` with 100000 members before the measured runs start, which is past every representation boundary, so the row measures the shape a hot key has in a benchmark that has been running for ten seconds rather than the listpack it passed through on the way there. The member `SADD` adds is one that is already there, which is the steady state of the gate row, because memtier draws from a fixed range and a run long enough to measure spends most of itself adding members the set already holds.
+- **`YO_SPIN_FILL` in the `spin` profiling target.** It puts N members in the command's key before the loop starts, so `spin` can be pointed at the same hot key shape the bench measures.
+
 ## 0.3.2 — 2026-08-31
 
 Sixty one pull requests and no milestone, so this is a patch, and it is a much bigger one than the rule in RELEASING.md intends. The cadence slipped while M2 and M3 were both moving at once and the honest fix is to cut what is there rather than to keep waiting for a milestone to close. M2 now has a server a Redis client can talk to and M3 has sets and hashes complete, but neither has passed its exit gate, so the minor that carries them is still to come.

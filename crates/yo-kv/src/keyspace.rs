@@ -20,7 +20,7 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use yo_common::{Addr, Code, Error, Result, Rng};
+use yo_common::{Addr, Code, Error, Result, Rng, bytes_eq};
 use yo_index::RawMap;
 
 use crate::Clock;
@@ -125,7 +125,11 @@ impl Memo {
         if !self.live || self.writes != writes || key.len() != self.len as usize {
             return None;
         }
-        (self.key[..key.len()] == *key).then_some((self.kind, self.slot))
+        // `bytes_eq` and not `==`, which is a call into the platform's `memcmp`
+        // for a key of a length the compiler cannot see. This is the one
+        // comparison the hot key path always does, and on a profile of `SADD`
+        // it was most of what the lookup cost.
+        bytes_eq(&self.key[..key.len()], key).then_some((self.kind, self.slot))
     }
 
     /// Remember that `key` is at `slot`.

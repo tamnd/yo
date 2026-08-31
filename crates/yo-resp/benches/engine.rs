@@ -73,6 +73,21 @@ fn ready(sink: Null) -> (Reactor<Wire<Null>>, ConnId, Vec<Cmd>) {
 }
 
 fn bench_command(c: &mut Criterion, name: &str, args: &[&[u8]]) {
+    bench_over(c, name, args, |_, _| {});
+}
+
+/// The same, with a chance to put something in the database first.
+///
+/// `fill` is handed the engine and the connection before the measured runs
+/// start, and whatever it feeds is pumped and thrown away. The set rows need
+/// this because a draw from a set nobody has added to measures the reply for an
+/// empty key, which is not the row anyone means.
+fn bench_over(
+    c: &mut Criterion,
+    name: &str,
+    args: &[&[u8]],
+    fill: impl Fn(&mut Reactor<Wire<Null>>, ConnId),
+) {
     let mut g = c.benchmark_group(format!("engine/{name}"));
 
     for depth in [1usize, 16, 64] {
@@ -80,6 +95,7 @@ fn bench_command(c: &mut Criterion, name: &str, args: &[&[u8]]) {
         g.throughput(Throughput::Elements(depth as u64));
         g.bench_function(format!("p{depth}"), |b| {
             let (mut r, conn, mut batch) = ready(Null::default());
+            fill(&mut r, conn);
             b.iter(|| {
                 r.engine_mut().feed(conn, black_box(&stream));
                 black_box(pump(&mut r, &mut batch))
@@ -88,6 +104,27 @@ fn bench_command(c: &mut Criterion, name: &str, args: &[&[u8]]) {
     }
 
     g.finish();
+}
+
+/// How many members the hot set holds before the set rows start.
+///
+/// Past every representation boundary, so the row measures the shape a hot key
+/// actually has in a benchmark that ran for ten seconds rather than the
+/// listpack it passed through on the way there.
+const HOT: usize = 100_000;
+
+/// Fill `set:hot` with [`HOT`] members, a batch at a time.
+fn fill_hot(r: &mut Reactor<Wire<Null>>, conn: ConnId) {
+    let mut batch = Vec::new();
+    for chunk in 0..HOT / 64 {
+        let mut stream = Vec::new();
+        for i in 0..64 {
+            let m = format!("member:{:012}", chunk * 64 + i);
+            stream.extend_from_slice(&wire(&[b"SADD", b"set:hot", m.as_bytes()]));
+        }
+        r.engine_mut().feed(conn, &stream);
+        pump(r, &mut batch);
+    }
 }
 
 fn bench_set(c: &mut Criterion) {
@@ -104,6 +141,31 @@ fn bench_get(c: &mut Criterion) {
 
 fn bench_incr(c: &mut Criterion) {
     bench_command(c, "incr", &[b"INCR", b"hits"]);
+}
+
+/// The hot key shape: every command in the batch on the same set.
+///
+/// The member is one that is already there, which is the steady state of the
+/// gate row. memtier draws its members from a fixed range, so a run long enough
+/// to be measured spends most of itself adding members the set already holds,
+/// and the insert is the rare case rather than the common one.
+fn bench_sadd(c: &mut Criterion) {
+    bench_over(
+        c,
+        "sadd",
+        &[b"SADD", b"set:hot", b"member:000000000001"],
+        fill_hot,
+    );
+}
+
+/// The draw, which is the read half of the same shape.
+///
+/// `SPOP` is not here because it consumes what it reads, so a bench that runs
+/// until the numbers settle would spend the end of itself measuring how fast we
+/// say the set is empty. `yo`'s `inline` bench pops against a fixture rebuilt
+/// per batch, and this row is the same walk without the removal.
+fn bench_srandmember(c: &mut Criterion) {
+    bench_over(c, "srandmember", &[b"SRANDMEMBER", b"set:hot"], fill_hot);
 }
 
 /// Sixteen connections with one command each against one connection with
@@ -147,5 +209,13 @@ fn bench_fanout(c: &mut Criterion) {
     g.finish();
 }
 
-criterion_group!(benches, bench_set, bench_get, bench_incr, bench_fanout);
+criterion_group!(
+    benches,
+    bench_set,
+    bench_get,
+    bench_incr,
+    bench_sadd,
+    bench_srandmember,
+    bench_fanout
+);
 criterion_main!(benches);

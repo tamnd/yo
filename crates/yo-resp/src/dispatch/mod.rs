@@ -852,7 +852,11 @@ mod tests {
         f.run(&[b"SET", b"alive", b"v"]);
         f.run(&[b"SET", b"dead", b"v", b"PX", b"1"]);
         f.server.db(0).clock_mut().advance(2);
-        assert_eq!(f.run(&[b"DBSIZE"]), ":2\r\n", "nothing has collected it yet");
+        assert_eq!(
+            f.run(&[b"DBSIZE"]),
+            ":2\r\n",
+            "nothing has collected it yet"
+        );
 
         assert_eq!(f.run(&[b"KEYS", b"*"]), "*1\r\n$5\r\nalive\r\n");
         let (_, keys) = scan_reply(&f.run(&[b"SCAN", b"0", b"COUNT", b"1000"]));
