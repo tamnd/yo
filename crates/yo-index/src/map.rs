@@ -21,7 +21,7 @@
 use crate::index::{Index, Keys};
 use crate::scan::Cursor;
 use yo_arena::Arena;
-use yo_common::{Addr, Space, wyhash};
+use yo_common::{Addr, Space, bytes_eq, wyhash};
 
 /// Bytes of length prefix in front of a record.
 const HDR: usize = 8;
@@ -94,7 +94,7 @@ impl Keys for Records<'_> {
             return false;
         }
         let bytes = self.arena.get(addr, HDR + klen);
-        &bytes[HDR..] == key
+        bytes_eq(&bytes[HDR..], key)
     }
 }
 

@@ -10,6 +10,7 @@
 pub mod addr;
 pub mod blake3;
 pub mod crc;
+pub mod eq;
 pub mod error;
 pub mod glob;
 pub mod num;
@@ -20,6 +21,7 @@ pub mod xxh3;
 
 pub use addr::{ADDR_BITS, Addr, MAX_OFFSET, OFFSET_BITS, SPACE_BITS, ShardId, Space};
 pub use crc::{SLOT_COUNT, crc16, crc32c, hash_tag, slot_of};
+pub use eq::bytes_eq;
 pub use error::{Code, Error, Result};
 pub use glob::matches as glob_matches;
 pub use num::{

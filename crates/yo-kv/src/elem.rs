@@ -71,7 +71,7 @@
 //! pretended away. That accounting lives in [`crate::blob`], because a hash's
 //! values want exactly the same thing and there should be one copy of it.
 
-use yo_common::{hash_key, tag_of};
+use yo_common::{bytes_eq, hash_key, tag_of};
 
 use crate::blob::Blob;
 use crate::scan::Cursor;
@@ -469,7 +469,7 @@ impl<V: Copy> Elements<V> {
             }
             if slot >> 24 == u32::from(tag) {
                 let row = (slot & 0x00FF_FFFF) as usize;
-                if self.name_of(&self.rows[row]) == name {
+                if bytes_eq(self.name_of(&self.rows[row]), name) {
                     return Some(row);
                 }
             }
