@@ -149,6 +149,17 @@ impl std::os::fd::AsRawFd for Sock {
     }
 }
 
+/// The same handle for the poller on Windows, where a socket is its own kind of
+/// number and not a file handle.
+#[cfg(windows)]
+impl std::os::windows::io::AsRawSocket for Sock {
+    fn as_raw_socket(&self) -> std::os::windows::io::RawSocket {
+        match self {
+            Sock::Tcp(s) => s.as_raw_socket(),
+        }
+    }
+}
+
 /// A door the server is listening at.
 enum Door {
     Tcp(TcpListener),
@@ -223,6 +234,15 @@ impl std::os::fd::AsRawFd for Door {
         match self {
             Door::Tcp(l) => l.as_raw_fd(),
             Door::Unix(l, _) => l.as_raw_fd(),
+        }
+    }
+}
+
+#[cfg(windows)]
+impl std::os::windows::io::AsRawSocket for Door {
+    fn as_raw_socket(&self) -> std::os::windows::io::RawSocket {
+        match self {
+            Door::Tcp(l) => l.as_raw_socket(),
         }
     }
 }
