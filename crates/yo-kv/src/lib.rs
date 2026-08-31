@@ -101,6 +101,7 @@ mod tally;
 pub mod ttl;
 pub mod value;
 pub mod walk;
+pub mod zset;
 
 pub use blob::{Blob, Span};
 pub use clock::Clock;
@@ -127,3 +128,4 @@ pub use value::{EMBSTR_MAX, Encoding, Kind, Str};
 // [`Cursor`] a collection walk hands back and is named apart from it so that a
 // caller holding both cannot pass one where the other was meant.
 pub use yo_index::Cursor as KeyCursor;
+pub use zset::{Bound as ZBound, Lex, Limits as ZsetLimits, Zset};
