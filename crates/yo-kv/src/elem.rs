@@ -433,6 +433,25 @@ impl<V: Copy> Elements<V> {
             + self.names.memory_bytes()
     }
 
+    /// What the slot array costs on its own, for the memory measurements.
+    #[must_use]
+    pub fn slot_bytes(&self) -> usize {
+        self.slots.len() * size_of::<u32>()
+    }
+
+    /// What the row array costs on its own, capacity and not length, because
+    /// the slack a doubling `Vec` is holding is memory this table is using.
+    #[must_use]
+    pub fn row_bytes(&self) -> usize {
+        self.rows.capacity() * size_of::<Row<V>>()
+    }
+
+    /// What the name blob costs on its own, live bytes and dead ones together.
+    #[must_use]
+    pub fn name_bytes(&self) -> usize {
+        self.names.memory_bytes()
+    }
+
     /// Name bytes no row points at any more.
     ///
     /// Reported rather than hidden, because a set that has been written and
@@ -560,8 +579,15 @@ impl<V: Copy> Elements<V> {
     }
 
     /// Make sure there is room for one more before it is inserted.
+    ///
+    /// The row array grows by [`crate::grow`]'s policy rather than by `Vec`'s,
+    /// because a doubling row array on a large collection is the single largest
+    /// piece of memory nobody asked for in the whole structure. The slot array
+    /// keeps its power of two, which is not a policy, it is what makes the
+    /// probe a mask instead of a division.
     fn reserve_one(&mut self) {
         let want = self.rows.len() + 1;
+        crate::grow::reserve(&mut self.rows, 1);
         if want * LOAD_DEN > self.slots.len() * LOAD_NUM {
             self.grow_to(slots_for(want));
         }

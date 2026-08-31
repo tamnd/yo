@@ -124,6 +124,10 @@ impl Blob {
     #[inline]
     pub fn push(&mut self, bytes: &[u8]) -> u32 {
         let at = u32::try_from(self.bytes.len()).expect("the blob is under 4 GiB");
+        // By [`crate::grow`]'s policy and not by `Vec`'s, for the same reason
+        // the row array above it grows that way: a blob holding the names of a
+        // large collection is megabytes, and half of a doubled one is air.
+        crate::grow::reserve(&mut self.bytes, bytes.len());
         self.bytes.extend_from_slice(bytes);
         at
     }

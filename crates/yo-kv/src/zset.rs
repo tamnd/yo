@@ -763,6 +763,110 @@ impl Table {
 mod tests {
     use super::*;
 
+    /// What a sorted set actually costs per member, which is M4's exit gate and
+    /// was an argument rather than a number until this was written.
+    ///
+    /// Run it with `cargo test -p yo-kv --release measure_bytes_per_entry --
+    /// --ignored --nocapture`. It is ignored because a million members is not
+    /// something every `cargo test` should pay for, and it prints rather than
+    /// asserts because the number it prints is the thing being reported. The
+    /// bound that guards against a regression is
+    /// [`a_large_sorted_set_does_not_hold_much_more_than_it_stores`], which is
+    /// small enough to run every time.
+    #[test]
+    #[ignore = "a measurement, run it by name"]
+    fn measure_bytes_per_entry() {
+        // The packed band first, at the largest size it is allowed to reach.
+        let mut lp = Zset::new();
+        let mut lp_payload = 0usize;
+        for i in 0..128 {
+            let m = format!("member:{i:09}");
+            lp_payload += m.len();
+            lp.add(m.as_bytes(), i as f64, &Limits::DEFAULT);
+        }
+        println!(
+            "packed n=128 total={} payload={lp_payload} overhead_per_entry={:.2}",
+            lp.memory_bytes(),
+            (lp.memory_bytes() as f64 - lp_payload as f64) / 128.0
+        );
+        // And the table band, at four sizes, because the answer used to depend
+        // on how close the count was to a power of two and that is exactly the
+        // thing being fixed.
+        for n in [10_000usize, 100_000, 600_000, 1_000_000] {
+            let (z, payload) = filled(n);
+            let total = z.memory_bytes();
+            let scores = n * 8;
+            let (slots, rows, names, tree) = match &z.body {
+                Body::Table(t) => (
+                    t.members.slot_bytes(),
+                    t.members.row_bytes(),
+                    t.members.name_bytes(),
+                    t.order.bytes(),
+                ),
+                Body::Packed(_) => (0, 0, 0, 0),
+            };
+            let per = |b: usize| b as f64 / n as f64;
+            println!(
+                "table n={n} total={total} slots={:.2}/e rows={:.2}/e names={:.2}/e tree={:.2}/e overhead_per_entry={:.2}",
+                per(slots),
+                per(rows),
+                per(names),
+                per(tree),
+                (total as f64 - payload as f64 - scores as f64) / n as f64
+            );
+        }
+    }
+
+    /// `n` members named `member:` and nine digits, so sixteen bytes each, and
+    /// what those names weigh.
+    fn filled(n: usize) -> (Zset, usize) {
+        let mut z = Zset::new();
+        let mut payload = 0usize;
+        for i in 0..n {
+            let m = format!("member:{i:09}");
+            payload += m.len();
+            z.add(m.as_bytes(), i as f64, &Limits::DEFAULT);
+        }
+        (z, payload)
+    }
+
+    /// The guard on the measurement above.
+    ///
+    /// Forty thousand members is a count nowhere near a power of two, which is
+    /// the case that used to be worst: a row array and a name blob that had both
+    /// just doubled held nearly twice what they were storing, and the slack was
+    /// more than everything else in the structure put together. Both grow by a
+    /// quarter now, so the bound below is one a doubling array cannot meet and
+    /// this test fails if either of them goes back to `Vec`'s policy.
+    #[test]
+    fn a_large_sorted_set_does_not_hold_much_more_than_it_stores() {
+        let n = 40_000usize;
+        let (z, payload) = filled(n);
+        let Body::Table(t) = &z.body else {
+            panic!("forty thousand members is not a listpack");
+        };
+        assert!(
+            t.members.row_bytes() < n * 30,
+            "the row array holds {} for {n} rows of twenty four bytes",
+            t.members.row_bytes()
+        );
+        assert!(
+            t.members.name_bytes() < payload + payload / 4,
+            "the name blob holds {} for {payload} bytes of names",
+            t.members.name_bytes()
+        );
+        // The tree is the part that already meets the gate and the part most
+        // likely to be quietly broken by a change to the element table, so it
+        // is worth pinning: three and a bit bytes a member, which is the row
+        // number plus its share of a branch node at a fanout of a hundred and
+        // twenty eight.
+        assert!(
+            t.order.bytes() < n * 4,
+            "the tree holds {} for {n} members",
+            t.order.bytes()
+        );
+    }
+
     /// A set built by adding in whatever order, checked against a model.
     fn built(pairs: &[(&str, f64)], limits: &Limits) -> Zset {
         let mut z = Zset::new();

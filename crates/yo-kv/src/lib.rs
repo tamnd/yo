@@ -80,6 +80,7 @@ pub mod clock;
 pub mod cond;
 pub mod counter;
 pub mod elem;
+pub mod grow;
 pub mod hash;
 pub mod hashes;
 pub mod intset;
