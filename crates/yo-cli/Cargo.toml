@@ -15,6 +15,10 @@ categories.workspace = true
 workspace = true
 
 [dependencies]
+# The global allocator, which is an application's choice and never a library's,
+# so this is where it gets made. Off unless YO_ALLOC says otherwise.
+yo-alloc = { workspace = true }
+
 # `yodb check` reads the file with the independent reader rather than the engine,
 # on purpose. A checker that shares its idea of the format with the thing that
 # wrote the file agrees with it about everything, including the mistakes.

@@ -42,6 +42,11 @@ usage:
                            on the same machine
              --no-port     no TCP at all, socket file only
 
+environment:
+  YO_ALLOC  what to do when a command path allocates. off by default, which
+            is the check turned off. report prints each place it happens once
+            and carries on. abort stops the process on the first one.
+
 exit codes:
   0  nothing wrong
   1  something wrong
@@ -58,7 +63,38 @@ const DEFAULT_PORT: u16 = 6379;
 /// another machine should be a thing somebody typed on purpose.
 const DEFAULT_BIND: &str = "127.0.0.1";
 
+/// The allocator that enforces Y7, no heap on a command path.
+///
+/// Installed here because picking a global allocator belongs to the program and
+/// not to any library it links. It forwards everything to the system allocator
+/// and does nothing else until `YO_ALLOC` asks it to, so a release build of
+/// `yodb` behaves exactly as it did before this line existed.
+#[global_allocator]
+static ALLOC: yo_alloc::YoAlloc = yo_alloc::YoAlloc::new();
+
 fn main() -> ExitCode {
+    // Before anything else, because it decides what happens for the rest of the
+    // process and a value nobody understands has to be an error rather than a
+    // quiet off. Somebody typing YO_ALLOC=abrot believes the check is running.
+    if yo_alloc::set_mode_from_env().is_none() {
+        eprintln!("yodb: YO_ALLOC is off, report or abort");
+        return ExitCode::from(2);
+    }
+
+    let code = run();
+
+    // The tally, for a run that reaches the end. `serve` normally does not,
+    // because Ctrl-C ends the process rather than the loop, so in practice this
+    // is for `check` and for a server that was told to stop. Each site already
+    // printed itself on the way past.
+    if yo_alloc::mode() == yo_alloc::Mode::Report {
+        let (sites, total) = yo_alloc::seen();
+        eprintln!("yodb: {total} allocation(s) on a command path, at {sites} place(s)");
+    }
+    code
+}
+
+fn run() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut rest: Vec<&str> = args.iter().map(String::as_str).collect();
 
