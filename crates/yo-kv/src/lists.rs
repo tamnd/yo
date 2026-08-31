@@ -467,7 +467,10 @@ impl Keyspace {
     /// because the band it belongs in is decided by bytes rather than by count
     /// and the first push finds that out for free.
     fn new_list(&mut self, key: &[u8]) -> u32 {
-        let at = self.lists.insert(List::new());
+        // The body and, every so often, the slab that holds it. See
+        // `yo_alloc::first_touch` for why this is the one allocation a command
+        // is allowed to make.
+        let at = yo_alloc::first_touch(|| self.lists.insert(List::new()));
         let len = value::slot_record_len(false);
         self.map.set_with(key, len, |out| {
             value::write_slot_record(out, Kind::List, at, None);

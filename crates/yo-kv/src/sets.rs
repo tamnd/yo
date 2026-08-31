@@ -656,7 +656,11 @@ impl Keyspace {
     /// Redis's `setTypeCreate`, so that a `SADD` with a thousand arguments
     /// builds a table once instead of converting twice on the way there.
     fn new_set(&mut self, key: &[u8], first: &[u8], hint: usize) -> u32 {
-        let at = self.sets.insert(Set::with_hint(first, hint, &self.limits));
+        // The body and, every so often, the slab that holds it. See
+        // `yo_alloc::first_touch` for why this is the one allocation a command
+        // is allowed to make.
+        let at =
+            yo_alloc::first_touch(|| self.sets.insert(Set::with_hint(first, hint, &self.limits)));
         let len = value::slot_record_len(false);
         self.map.set_with(key, len, |out| {
             value::write_slot_record(out, Kind::Set, at, None);

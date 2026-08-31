@@ -789,7 +789,10 @@ impl Keyspace {
     /// it, and the first `ZADD` that crosses either threshold promotes it, so
     /// counting the pairs in advance would only move the same work earlier.
     fn new_zset(&mut self, key: &[u8]) -> u32 {
-        let at = self.zsets.insert(Zset::new());
+        // The body and, every so often, the slab that holds it. See
+        // `yo_alloc::first_touch` for why this is the one allocation a command
+        // is allowed to make.
+        let at = yo_alloc::first_touch(|| self.zsets.insert(Zset::new()));
         let len = value::slot_record_len(false);
         self.map.set_with(key, len, |out| {
             value::write_slot_record(out, Kind::Zset, at, None);
