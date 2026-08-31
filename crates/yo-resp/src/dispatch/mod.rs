@@ -52,6 +52,7 @@
 //! it, because a shard thread that allocates aborts.
 
 mod args;
+mod arrays;
 mod blocking;
 mod cpu;
 mod hashes;
@@ -448,7 +449,7 @@ pub fn execute(server: &mut Server, session: &mut Session, args: Args<'_>, out: 
     // `COPY`, `SWAPDB` and `FLUSHALL` reach a database nobody selected, so the
     // two groups that hold them mark all of them rather than the session's.
     server.dirty |= match spec.group {
-        "string" | "set" | "hash" | "list" | "zset" => 1u64 << session.db,
+        "string" | "set" | "hash" | "list" | "zset" | "array" => 1u64 << session.db,
         _ => ALL_DATABASES,
     };
 
@@ -482,6 +483,10 @@ pub fn execute(server: &mut Server, session: &mut Session, args: Args<'_>, out: 
             "zset" => {
                 let db = session.db;
                 zsets::execute(&mut server.dbs[db], spec, args, out).map(|()| Flow::Continue)
+            }
+            "array" => {
+                let db = session.db;
+                arrays::execute(&mut server.dbs[db], spec, args, out).map(|()| Flow::Continue)
             }
             // Every database and not the one the session is on, because `COPY` takes
             // a `DB n` and writes into a database nobody selected.
@@ -5017,5 +5022,209 @@ mod tests {
             "held {} after two hundred passes against {after_first} after one",
             f.server.memory_bytes()
         );
+    }
+
+    // ----------------------------------------------------------------- array
+
+    #[test]
+    fn an_array_writes_at_any_index_and_reads_back_what_it_sent() {
+        let mut f = Fixture::new();
+        // Three consecutive positions from a high index, and the reply is how
+        // many of them were empty before rather than how many were written.
+        assert_eq!(
+            f.run(&[b"ARSET", b"a", b"1000", b"x", b"y", b"z"]),
+            ":3\r\n"
+        );
+        assert_eq!(f.run(&[b"ARSET", b"a", b"1000", b"X", b"Y"]), ":0\r\n");
+        assert_eq!(f.run(&[b"ARGET", b"a", b"1000"]), "$1\r\nX\r\n");
+        assert_eq!(f.run(&[b"ARGET", b"a", b"1002"]), "$1\r\nz\r\n");
+        // A hole and a key that is not there are the same answer.
+        assert_eq!(f.run(&[b"ARGET", b"a", b"999"]), "$-1\r\n");
+        assert_eq!(f.run(&[b"ARGET", b"nope", b"0"]), "$-1\r\n");
+        assert_eq!(
+            f.run(&[b"ARMGET", b"a", b"1002", b"999", b"1000"]),
+            "*3\r\n$1\r\nz\r\n$-1\r\n$1\r\nX\r\n"
+        );
+        // Scattered pairs in one command, last write wins within it.
+        assert_eq!(f.run(&[b"ARMSET", b"a", b"5", b"p", b"5", b"q"]), ":1\r\n");
+        assert_eq!(f.run(&[b"ARGET", b"a", b"5"]), "$1\r\nq\r\n");
+    }
+
+    /// The two numbers an array reports are not the same number, and one of
+    /// them does not fit a signed integer.
+    #[test]
+    fn the_length_is_the_high_water_mark_and_the_count_is_the_population() {
+        let mut f = Fixture::new();
+        assert_eq!(f.run(&[b"ARLEN", b"nope"]), ":0\r\n");
+        assert_eq!(f.run(&[b"ARCOUNT", b"nope"]), ":0\r\n");
+        f.run(&[b"ARMSET", b"a", b"0", b"x", b"9", b"y"]);
+        assert_eq!(f.run(&[b"ARLEN", b"a"]), ":10\r\n");
+        assert_eq!(f.run(&[b"ARCOUNT", b"a"]), ":2\r\n");
+        // Deleting in the middle leaves the high water mark where it was.
+        assert_eq!(f.run(&[b"ARDEL", b"a", b"0"]), ":1\r\n");
+        assert_eq!(f.run(&[b"ARLEN", b"a"]), ":10\r\n");
+        assert_eq!(f.run(&[b"ARCOUNT", b"a"]), ":1\r\n");
+
+        // The top of the space is addressable, and its length is a number with
+        // bit sixty three set, so the reply has to be unsigned or it comes back
+        // negative.
+        f.run(&[b"ARSET", b"top", b"18446744073709551614", b"z"]);
+        assert_eq!(f.run(&[b"ARLEN", b"top"]), ":18446744073709551615\r\n");
+        assert_eq!(f.run(&[b"ARCOUNT", b"top"]), ":1\r\n");
+        // And one past it does not exist, so a write that would reach it fails
+        // before any of it lands.
+        assert_eq!(
+            f.run(&[b"ARSET", b"over", b"18446744073709551614", b"a", b"b"]),
+            "-ERR array index overflow\r\n"
+        );
+        assert_eq!(f.run(&[b"EXISTS", b"over"]), ":0\r\n");
+    }
+
+    /// One reply per position and not one per element, which is the whole
+    /// reason the range is capped.
+    #[test]
+    fn a_range_read_answers_for_the_holes_too_and_is_capped_at_a_million() {
+        let mut f = Fixture::new();
+        f.run(&[b"ARSET", b"a", b"1", b"x"]);
+        assert_eq!(
+            f.run(&[b"ARGETRANGE", b"a", b"0", b"3"]),
+            "*4\r\n$-1\r\n$1\r\nx\r\n$-1\r\n$-1\r\n"
+        );
+        // The two ends may come in either order, and the answer is reversed
+        // rather than empty.
+        assert_eq!(
+            f.run(&[b"ARGETRANGE", b"a", b"3", b"0"]),
+            "*4\r\n$-1\r\n$-1\r\n$1\r\nx\r\n$-1\r\n"
+        );
+        // A key that is not there reads like an array of nothing but holes.
+        assert_eq!(
+            f.run(&[b"ARGETRANGE", b"nope", b"0", b"1"]),
+            "*2\r\n$-1\r\n$-1\r\n"
+        );
+        // A range wider than a million positions is refused and not trimmed,
+        // because against a missing key it is a request for as many nulls as
+        // the range is wide.
+        assert_eq!(
+            f.run(&[b"ARGETRANGE", b"nope", b"0", b"18446744073709551614"]),
+            "-ERR range exceeds maximum of 1000000 items\r\n"
+        );
+    }
+
+    /// Every index in the argument list is read before the key is touched, so
+    /// a bad one at the end leaves nothing half written.
+    #[test]
+    fn a_bad_index_late_in_the_line_writes_none_of_the_earlier_ones() {
+        let mut f = Fixture::new();
+        assert_eq!(
+            f.run(&[b"ARMSET", b"a", b"0", b"x", b"-1", b"y"]),
+            "-ERR invalid array index\r\n"
+        );
+        assert_eq!(f.run(&[b"EXISTS", b"a"]), ":0\r\n");
+        f.run(&[b"ARSET", b"a", b"0", b"x", b"y", b"z"]);
+        assert_eq!(
+            f.run(&[b"ARDEL", b"a", b"0", b"01"]),
+            "-ERR invalid array index\r\n"
+        );
+        assert_eq!(f.run(&[b"ARCOUNT", b"a"]), ":3\r\n");
+        // An index is unsigned here, so the numbers a list would take are not
+        // the last element, they are errors.
+        assert_eq!(
+            f.run(&[b"ARGET", b"a", b"-1"]),
+            "-ERR invalid array index\r\n"
+        );
+        // And a pair list with an odd tail is an arity error rather than a
+        // syntax one.
+        assert_eq!(
+            f.run(&[b"ARMSET", b"a", b"0", b"x", b"1"]),
+            "-ERR wrong number of arguments for 'armset' command\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"ARDELRANGE", b"a", b"0", b"1", b"2"]),
+            "-ERR wrong number of arguments for 'ardelrange' command\r\n"
+        );
+    }
+
+    #[test]
+    fn a_range_delete_costs_the_elements_and_takes_the_key_when_it_empties() {
+        let mut f = Fixture::new();
+        f.run(&[b"ARSET", b"a", b"0", b"0", b"1", b"2", b"3", b"4"]);
+        assert_eq!(f.run(&[b"ARDELRANGE", b"a", b"3", b"1"]), ":3\r\n");
+        assert_eq!(f.run(&[b"ARCOUNT", b"a"]), ":2\r\n");
+        // Two ranges in one command, and the second one covers the whole space
+        // without walking it.
+        assert_eq!(
+            f.run(&[
+                b"ARDELRANGE",
+                b"a",
+                b"100",
+                b"200",
+                b"0",
+                b"18446744073709551614"
+            ]),
+            ":2\r\n"
+        );
+        assert_eq!(f.run(&[b"EXISTS", b"a"]), ":0\r\n");
+        assert_eq!(f.run(&[b"ARDELRANGE", b"nope", b"0", b"1"]), ":0\r\n");
+        assert_eq!(f.run(&[b"ARDEL", b"nope", b"0"]), ":0\r\n");
+    }
+
+    /// A value goes out as the bytes it came in as, whichever of the three ways
+    /// the array found to store it.
+    #[test]
+    fn a_value_comes_back_byte_for_byte_however_it_was_packed() {
+        let mut f = Fixture::new();
+        let long = vec![b'v'; 200];
+        f.run(&[
+            b"ARMSET", b"a", b"0", b"42", b"1", b"007", b"2", b"3.5", b"3", b"3.14", b"4",
+            b"short", b"5", &long, b"6", b"-0",
+        ]);
+        // 42 is an integer, 007 is not one because it does not print back the
+        // same, 3.5 survives a double and 3.14 does not, and the last two are a
+        // word packed string and a blob.
+        assert_eq!(
+            f.run(&[b"ARGETRANGE", b"a", b"0", b"6"]),
+            format!(
+                "*7\r\n$2\r\n42\r\n$3\r\n007\r\n$3\r\n3.5\r\n$4\r\n3.14\r\n$5\r\nshort\r\n$200\r\n{}\r\n$2\r\n-0\r\n",
+                String::from_utf8_lossy(&long)
+            )
+        );
+    }
+
+    #[test]
+    fn an_array_is_a_type_and_an_encoding_a_client_can_see() {
+        let mut f = Fixture::new();
+        f.run(&[b"ARSET", b"a", b"0", b"x"]);
+        assert_eq!(f.run(&[b"TYPE", b"a"]), "+array\r\n");
+        assert_eq!(
+            f.run(&[b"OBJECT", b"ENCODING", b"a"]),
+            "$12\r\nsliced-array\r\n"
+        );
+        // And it is a body like any other, so the key commands work on it.
+        assert_eq!(f.run(&[b"EXPIRE", b"a", b"100"]), ":1\r\n");
+        assert_eq!(f.run(&[b"PERSIST", b"a"]), ":1\r\n");
+        assert_eq!(f.run(&[b"COPY", b"a", b"b"]), ":1\r\n");
+        assert_eq!(f.run(&[b"ARGET", b"b", b"0"]), "$1\r\nx\r\n");
+        assert_eq!(f.run(&[b"RENAME", b"a", b"c"]), "+OK\r\n");
+        assert_eq!(f.run(&[b"ARCOUNT", b"c"]), ":1\r\n");
+    }
+
+    #[test]
+    fn every_array_command_refuses_a_key_holding_something_else() {
+        let mut f = Fixture::new();
+        f.run(&[b"SET", b"s", b"v"]);
+        let wrong = "-WRONGTYPE Operation against a key holding the wrong kind of value\r\n";
+        for cmd in [
+            &[b"ARSET".as_ref(), b"s", b"0", b"x"][..],
+            &[b"ARMSET".as_ref(), b"s", b"0", b"x"][..],
+            &[b"ARGET".as_ref(), b"s", b"0"][..],
+            &[b"ARMGET".as_ref(), b"s", b"0"][..],
+            &[b"ARGETRANGE".as_ref(), b"s", b"0", b"1"][..],
+            &[b"ARLEN".as_ref(), b"s"][..],
+            &[b"ARCOUNT".as_ref(), b"s"][..],
+            &[b"ARDEL".as_ref(), b"s", b"0"][..],
+            &[b"ARDELRANGE".as_ref(), b"s", b"0", b"1"][..],
+        ] {
+            assert_eq!(f.run(cmd), wrong, "{}", String::from_utf8_lossy(cmd[0]));
+        }
     }
 }

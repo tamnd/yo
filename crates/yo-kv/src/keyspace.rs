@@ -24,6 +24,7 @@ use yo_common::{Addr, Code, Error, Result, Rng, bytes_eq};
 use yo_index::RawMap;
 
 use crate::Clock;
+use crate::array::Array;
 use crate::hash::{self, Hash};
 use crate::list::{self, List};
 use crate::set::{self, Set};
@@ -52,6 +53,8 @@ pub struct Keyspace {
     pub(crate) lists: Slab<List>,
     /// Every sorted set in this database, addressed the same way.
     pub(crate) zsets: Slab<Zset>,
+    /// Every sparse array in this database, addressed the same way.
+    pub(crate) arrays: Slab<Array>,
     /// How many keys hold something that is not a string.
     ///
     /// This exists so that a database of nothing but strings, which is every
@@ -185,6 +188,7 @@ impl Keyspace {
             hashes: Slab::new(),
             lists: Slab::new(),
             zsets: Slab::new(),
+            arrays: Slab::new(),
             bodies: 0,
             limits: set::Limits::DEFAULT,
             hash_limits: hash::Limits::DEFAULT,
@@ -397,6 +401,8 @@ impl Keyspace {
             Kind::Hash => self.hash_encoding(key).map(hash::Encoding::name),
             Kind::List => self.list_encoding(key).map(list::Encoding::name),
             Kind::Zset => self.zset_encoding(key).map(zset::Encoding::name),
+            // The one type with one encoding, so there is nothing to ask.
+            Kind::Array => Some("sliced-array"),
             // Named rather than caught, so that the next type to land is a
             // build error here and not a panic on a live server. That is not
             // hypothetical: `COPY` of a list took the shard down for exactly as
@@ -433,7 +439,7 @@ impl Keyspace {
             // Every body type writes the same record: a tag and a slot number.
             // The body is not touched and does not need to be, which is the
             // whole point of keeping it out of the record.
-            kind @ (Kind::Set | Kind::Hash | Kind::List | Kind::Zset) => {
+            kind @ (Kind::Set | Kind::Hash | Kind::List | Kind::Zset | Kind::Array) => {
                 let slot = value::slot(rec);
                 let len = value::slot_record_len(at.is_some());
                 self.map.set_with(key, len, |out| {
@@ -551,6 +557,11 @@ impl Keyspace {
             Kind::Zset => {
                 let at = value::slot(rec);
                 self.zsets.remove(at);
+                self.bodies -= 1;
+            }
+            Kind::Array => {
+                let at = value::slot(rec);
+                self.arrays.remove(at);
                 self.bodies -= 1;
             }
             // Named rather than caught, as above.
@@ -706,6 +717,7 @@ impl Keyspace {
         self.hashes.clear();
         self.lists.clear();
         self.zsets.clear();
+        self.arrays.clear();
         self.bodies = 0;
     }
 
@@ -732,6 +744,8 @@ impl Keyspace {
             + self.lists.iter().map(List::memory_bytes).sum::<usize>()
             + self.zsets.memory_bytes()
             + self.zsets.iter().map(Zset::memory_bytes).sum::<usize>()
+            + self.arrays.memory_bytes()
+            + self.arrays.iter().map(Array::memory_bytes).sum::<usize>()
     }
 
     /// Give back one segment's worth of space if one has gone mostly dead.

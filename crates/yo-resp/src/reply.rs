@@ -22,7 +22,7 @@
 //! mode of that is a command that works on one protocol and not the other.
 
 use crate::proto::Proto;
-use yo_common::num::{DIGITS_MAX, i64_len, push_double, push_i64, push_u64, u64_digits};
+use yo_common::num::{DIGITS_MAX, i64_len, push_double, push_i64, push_u64, u64_digits, u64_len};
 
 /// A reply buffer for one connection.
 ///
@@ -240,6 +240,21 @@ impl Out {
         self.buf.reserve(i64_len(n) + 3);
         self.buf.push(b':');
         push_i64(&mut self.buf, n);
+        self.crlf();
+    }
+
+    /// An unsigned integer, `:n\r\n`.
+    ///
+    /// Not the same as [`Out::int`] for the numbers with bit 63 set, and that is
+    /// the only reason it exists. `ARLEN` on a key with something at the top of
+    /// the index space is eighteen quintillion, which the signed path would put
+    /// on the wire as a negative number. Redis has the same pair of writers and
+    /// uses the unsigned one for exactly these replies.
+    #[inline]
+    pub fn uint(&mut self, n: u64) {
+        self.buf.reserve(u64_len(n) + 3);
+        self.buf.push(b':');
+        push_u64(&mut self.buf, n);
         self.crlf();
     }
 

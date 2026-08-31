@@ -104,6 +104,17 @@ const AC_ZSET_WRITE_SLOW: &[&str] = &["@write", "@sortedset", "@slow"];
 const AC_ZSET_BLOCKING_FAST: &[&str] = &["@write", "@sortedset", "@fast", "@blocking"];
 /// And `BZMPOP`, whose cost is the number of keys named and the count popped.
 const AC_ZSET_BLOCKING_SLOW: &[&str] = &["@write", "@sortedset", "@slow", "@blocking"];
+/// The array read side, for the ones whose cost is the number of indices named
+/// and not the size of the array.
+const AC_ARRAY_READ_FAST: &[&str] = &["@read", "@array", "@fast"];
+/// The array read side for `ARGETRANGE`, which answers once per position in the
+/// range and so costs the range rather than the population.
+const AC_ARRAY_READ_SLOW: &[&str] = &["@read", "@array", "@slow"];
+/// The array write side.
+const AC_ARRAY_WRITE_FAST: &[&str] = &["@write", "@array", "@fast"];
+/// The array write side for `ARDELRANGE`, the one array command Redis does not
+/// mark fast.
+const AC_ARRAY_WRITE_SLOW: &[&str] = &["@write", "@array", "@slow"];
 /// Read only and not counted as fast, for a command whose keys are counted
 /// rather than positioned, so a client has to read the key specs to route it.
 const READ_MOVABLE: &[&str] = &["readonly", "movablekeys"];
@@ -1826,6 +1837,124 @@ pub static COMMANDS: &[Spec] = &[
         complexity: "O(K) + O(M*log(N)) with K the keys named and M the count popped",
         summary: "Pop from the first of several sorted sets that has anything, waiting if none does.",
         group: "zset",
+    },
+    // --------------------------------------------------------------- array
+    Spec {
+        name: "arset",
+        arity: -4,
+        flags: WRITE_FAST_OOM,
+        first_key: 1,
+        last_key: 1,
+        step: 1,
+        acl: AC_ARRAY_WRITE_FAST,
+        since: "8.8.0",
+        complexity: "O(N) with N the number of values",
+        summary: "Write values into consecutive positions from an index.",
+        group: "array",
+    },
+    Spec {
+        name: "armset",
+        arity: -4,
+        flags: WRITE_FAST_OOM,
+        first_key: 1,
+        last_key: 1,
+        step: 1,
+        acl: AC_ARRAY_WRITE_FAST,
+        since: "8.8.0",
+        complexity: "O(N) with N the number of pairs",
+        summary: "Write index and value pairs, which need not be neighbours.",
+        group: "array",
+    },
+    Spec {
+        name: "arget",
+        arity: 3,
+        flags: READ_FAST,
+        first_key: 1,
+        last_key: 1,
+        step: 1,
+        acl: AC_ARRAY_READ_FAST,
+        since: "8.8.0",
+        complexity: "O(1)",
+        summary: "The value at one index, or a null if nothing is there.",
+        group: "array",
+    },
+    Spec {
+        name: "armget",
+        arity: -3,
+        flags: READ_FAST,
+        first_key: 1,
+        last_key: 1,
+        step: 1,
+        acl: AC_ARRAY_READ_FAST,
+        since: "8.8.0",
+        complexity: "O(N) with N the number of indices",
+        summary: "The values at the indices named, in the order named.",
+        group: "array",
+    },
+    Spec {
+        name: "argetrange",
+        arity: 4,
+        flags: READ_SLOW,
+        first_key: 1,
+        last_key: 1,
+        step: 1,
+        acl: AC_ARRAY_READ_SLOW,
+        since: "8.8.0",
+        complexity: "O(N) with N the length of the range",
+        summary: "One reply per position between two indices, holes included.",
+        group: "array",
+    },
+    Spec {
+        name: "arlen",
+        arity: 2,
+        flags: READ_FAST,
+        first_key: 1,
+        last_key: 1,
+        step: 1,
+        acl: AC_ARRAY_READ_FAST,
+        since: "8.8.0",
+        complexity: "O(1)",
+        summary: "The highest populated index plus one.",
+        group: "array",
+    },
+    Spec {
+        name: "arcount",
+        arity: 2,
+        flags: READ_FAST,
+        first_key: 1,
+        last_key: 1,
+        step: 1,
+        acl: AC_ARRAY_READ_FAST,
+        since: "8.8.0",
+        complexity: "O(1)",
+        summary: "How many indices hold something.",
+        group: "array",
+    },
+    Spec {
+        name: "ardel",
+        arity: -3,
+        flags: WRITE_FAST,
+        first_key: 1,
+        last_key: 1,
+        step: 1,
+        acl: AC_ARRAY_WRITE_FAST,
+        since: "8.8.0",
+        complexity: "O(N) with N the number of indices",
+        summary: "Empty the indices named and say how many held something.",
+        group: "array",
+    },
+    Spec {
+        name: "ardelrange",
+        arity: -4,
+        flags: WRITE_SLOW,
+        first_key: 1,
+        last_key: 1,
+        step: 1,
+        acl: AC_ARRAY_WRITE_SLOW,
+        since: "8.8.0",
+        complexity: "O(N) with N the elements touched, not the span asked for",
+        summary: "Empty one or more ranges of indices.",
+        group: "array",
     },
     // ------------------------------------------------------------ keyspace
     Spec {

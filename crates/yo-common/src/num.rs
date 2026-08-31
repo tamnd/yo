@@ -378,6 +378,60 @@ pub fn push_double(out: &mut Vec<u8>, d: f64) {
     let _ = write!(sink, "{d}");
 }
 
+/// Room for the longest thing [`push_double`] can write.
+///
+/// Rust's printer never switches to an exponent, so the widest output is a
+/// number small enough to need every leading zero: the smallest subnormal is
+/// `0.` and then three hundred and twenty three digits. The largest magnitude is
+/// shorter than that, at three hundred and nine digits and a sign.
+pub const DOUBLE_MAX: usize = 352;
+
+/// Writes a double into a fixed buffer, byte for byte what [`push_double`]
+/// would append.
+///
+/// This exists for the one caller that has to know what the digits would be
+/// without having anywhere to put them: the array type stores a value as a
+/// double only when the double prints back as the exact bytes the client sent,
+/// so it formats a candidate, compares, and usually throws it away. Doing that
+/// through a `Vec` would be an allocation per write on a shard thread.
+pub fn write_double(buf: &mut [u8; DOUBLE_MAX], d: f64) -> &[u8] {
+    let mut sink = SliceSink { buf, at: 0 };
+    if d.is_nan() {
+        let _ = sink.write_str("nan");
+    } else if d.is_infinite() {
+        let _ = sink.write_str(if d > 0.0 { "inf" } else { "-inf" });
+    } else if d.fract() == 0.0 && d.abs() <= DOUBLE_INT_LIMIT {
+        let mut digits = [0u8; DIGITS_MAX];
+        let text = i64_digits(&mut digits, d as i64);
+        let n = text.len();
+        sink.buf[..n].copy_from_slice(text);
+        sink.at = n;
+    } else {
+        let _ = write!(sink, "{d}");
+    }
+    let at = sink.at;
+    &buf[..at]
+}
+
+/// A `core::fmt::Write` that fills a fixed buffer and stops when it is full.
+///
+/// Running out of room cannot happen here, because [`DOUBLE_MAX`] is sized for
+/// the widest double there is, and it is handled rather than asserted so that a
+/// mistake in that reasoning truncates a number instead of killing a shard.
+struct SliceSink<'a> {
+    buf: &'a mut [u8; DOUBLE_MAX],
+    at: usize,
+}
+
+impl core::fmt::Write for SliceSink<'_> {
+    fn write_str(&mut self, s: &str) -> core::fmt::Result {
+        let n = s.len().min(self.buf.len() - self.at);
+        self.buf[self.at..self.at + n].copy_from_slice(&s.as_bytes()[..n]);
+        self.at += n;
+        Ok(())
+    }
+}
+
 /// A `core::fmt::Write` that appends UTF-8 to a byte buffer.
 ///
 /// The float printer only speaks `fmt::Write` and the reply buffer is bytes.
@@ -572,5 +626,64 @@ mod tests {
             push_double(&mut v, d);
             assert_eq!(String::from_utf8(v).unwrap(), want, "writing {d}");
         }
+    }
+
+    /// The two double writers have to agree, because one is used to predict the
+    /// other.
+    ///
+    /// The array type decides whether a value can be stored as a double by
+    /// formatting it with `write_double` and checking the bytes against what the
+    /// client sent, and then the reply comes out of `push_double`. If they ever
+    /// disagreed, a value would go in as a number and come back out as
+    /// different text.
+    #[test]
+    fn the_two_double_writers_agree() {
+        let mut cases = vec![
+            0.0,
+            -0.0,
+            1.0,
+            -1.0,
+            3.5,
+            0.1,
+            -0.1,
+            1e-320,
+            f64::MIN_POSITIVE,
+            f64::MAX,
+            f64::MIN,
+            DOUBLE_INT_LIMIT,
+            -DOUBLE_INT_LIMIT,
+            DOUBLE_INT_LIMIT + 2.0,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            f64::NAN,
+        ];
+        // A spread of ordinary values, so the agreement is not only about the
+        // corners that were thought of in advance.
+        for i in -400..400 {
+            cases.push(f64::from(i) / 7.0);
+            cases.push(f64::from(i) * 1e12);
+        }
+        for d in cases {
+            let mut v = Vec::new();
+            push_double(&mut v, d);
+            let mut buf = [0u8; DOUBLE_MAX];
+            assert_eq!(write_double(&mut buf, d), &v[..], "writing {d}");
+        }
+    }
+
+    /// The fixed buffer is big enough for the widest double there is.
+    ///
+    /// `write_double` truncates rather than panicking if it is not, so a bad
+    /// constant would show up as a wrong answer somewhere far away instead of
+    /// here.
+    #[test]
+    fn the_fixed_buffer_holds_the_widest_double() {
+        let mut widest = 0;
+        for d in [f64::MIN, f64::MAX, f64::from_bits(1), -f64::from_bits(1)] {
+            let mut v = Vec::new();
+            push_double(&mut v, d);
+            widest = widest.max(v.len());
+        }
+        assert!(widest <= DOUBLE_MAX, "{widest} bytes needs more than room");
     }
 }

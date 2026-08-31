@@ -74,6 +74,8 @@
 
 #![deny(missing_docs)]
 
+pub mod array;
+pub mod arrays;
 pub mod blob;
 pub mod chunk;
 pub mod clock;
@@ -106,6 +108,7 @@ pub mod zset;
 pub mod zsetops;
 pub mod zsets;
 
+pub use array::{Array, Element as ArrayElement, INDEX_MAX, SLICE_SIZE};
 pub use blob::{Blob, Span};
 pub use clock::Clock;
 pub use cond::Compare;

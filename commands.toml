@@ -99,7 +99,7 @@ doc = "08 section 5"
 [[group]]
 name = "array"
 expected = 18
-status = "planned"
+status = "partial"
 doc = "08 section 1"
 
 [[group]]
@@ -1839,6 +1839,110 @@ bounded = "inherent"
 status = "shipped"
 wire = "verified"
 notes = "ZMPOP with a wait, and the same parse shifted along by one. The timeout is read before the key count, so BZMPOP abc 1 k MIN complains about the timeout and not about the count. A key count that leaves no room for the direction is a plain syntax error, because the word that should have been MIN or MAX is swallowed as a key and there is nothing left to read."
+
+
+# ---------------------------------------------------------------------- array
+
+[[command]]
+name = "ARSET"
+group = "array"
+since = "8.8.0"
+arity = -4
+plan = "point"
+bounded = "inherent"
+status = "shipped"
+wire = "verified"
+divergent = "D-18"
+notes = "One key lookup and then a write per value into consecutive positions from the index given. The reply is how many of those positions were empty before, so overwriting ten values in place answers zero. A value of seven bytes or less lives in the position word itself, an integer that fits sixty one bits and a double that prints back as the exact bytes the client sent live there too, and everything else goes into one growable blob per key."
+
+[[command]]
+name = "ARMSET"
+group = "array"
+since = "8.8.0"
+arity = -4
+plan = "point"
+bounded = "inherent"
+status = "shipped"
+wire = "verified"
+divergent = "D-19"
+notes = "ARSET for positions that are not neighbours. Every index in the argument list is parsed before the key is touched, so a bad index in the last pair writes none of the earlier ones."
+
+[[command]]
+name = "ARGET"
+group = "array"
+since = "8.8.0"
+arity = 3
+plan = "point"
+bounded = "inherent"
+status = "shipped"
+wire = "verified"
+notes = "A binary search over the slice directory and then one index into the slice, so it does not care where in the sixty four bit index space the index sits. A hole and a missing key are both a null, which is the same answer HGET gives for a missing field."
+
+[[command]]
+name = "ARMGET"
+group = "array"
+since = "8.8.0"
+arity = -3
+plan = "point"
+bounded = "inherent"
+status = "shipped"
+wire = "verified"
+notes = "ARGET once per index named, with the array header found once. The reply has one entry per index asked for and holes come back as nulls, so the client can line the answers up with what it asked without counting."
+
+[[command]]
+name = "ARGETRANGE"
+group = "array"
+since = "8.8.0"
+arity = 4
+plan = "cursor"
+bounded = "yes"
+status = "shipped"
+wire = "verified"
+notes = "One reply per position and not per element, which is why the range is capped at a million positions and refused rather than trimmed above that. Without the cap a range over the whole space against a missing key is eighteen quintillion nulls, and Redis says in as many words that the limit is not tunable."
+
+[[command]]
+name = "ARLEN"
+group = "array"
+since = "8.8.0"
+arity = 2
+plan = "metadata"
+bounded = "inherent"
+status = "shipped"
+wire = "verified"
+notes = "The highest populated index plus one, read off the last slice in the directory. It is not the population and it does not go down when an element in the middle is deleted, though deleting the highest one does bring it down. The reply is unsigned, because an array with something at the top of the index space has a length that does not fit a signed integer."
+
+[[command]]
+name = "ARCOUNT"
+group = "array"
+since = "8.8.0"
+arity = 2
+plan = "metadata"
+bounded = "inherent"
+status = "shipped"
+wire = "verified"
+notes = "How many indices hold something, kept as a counter on the array rather than summed over the slices, so it is the same cost whatever shape the array is in."
+
+[[command]]
+name = "ARDEL"
+group = "array"
+since = "8.8.0"
+arity = -3
+plan = "point"
+bounded = "inherent"
+status = "shipped"
+wire = "verified"
+notes = "Empties the positions named and answers how many of them held something. A slice that loses its last element is dropped, and a key that loses its last element is deleted, which is the rule every collection here follows."
+
+[[command]]
+name = "ARDELRANGE"
+group = "array"
+since = "8.8.0"
+arity = -4
+plan = "point"
+bounded = "inherent"
+status = "shipped"
+wire = "verified"
+notes = "The cost is the elements it touches and not the span it was asked about, because a range that covers whole slices drops those slices whole. A range whose start is above its end deletes nothing rather than being read the other way round."
 
 
 # ------------------------------------------------------------------ scripting

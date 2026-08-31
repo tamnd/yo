@@ -106,6 +106,8 @@ pub enum Kind {
     List = 4,
     /// A stream.
     Stream = 5,
+    /// A sparse array.
+    Array = 6,
 }
 
 impl Kind {
@@ -119,13 +121,14 @@ impl Kind {
             Kind::Zset => "zset",
             Kind::List => "list",
             Kind::Stream => "stream",
+            Kind::Array => "array",
         }
     }
 
     /// The kind for a three bit tag.
     ///
-    /// Six of the eight patterns are spoken for. The other two cannot come out
-    /// of our own writer, and they fall to `String` for the same reason an
+    /// Seven of the eight patterns are spoken for. The last one cannot come out
+    /// of our own writer, and it falls to `String` for the same reason an
     /// unknown encoding falls to `raw`: it is the reading that hands the bytes
     /// back rather than the one that reinterprets them.
     #[inline]
@@ -136,6 +139,7 @@ impl Kind {
             KIND_ZSET => Kind::Zset,
             KIND_LIST => Kind::List,
             KIND_STREAM => Kind::Stream,
+            KIND_ARRAY => Kind::Array,
             _ => Kind::String,
         }
     }
@@ -159,6 +163,7 @@ const KIND_SET: u8 = 2;
 const KIND_ZSET: u8 = 3;
 const KIND_LIST: u8 = 4;
 const KIND_STREAM: u8 = 5;
+const KIND_ARRAY: u8 = 6;
 
 /// Bytes of integer payload, which is a whole `i64` and never its digits.
 const INT_LEN: usize = 8;
@@ -509,13 +514,14 @@ mod tests {
         assert_eq!(Encoding::of(&[b'x'; EMBSTR_MAX + 1]), Encoding::Raw);
     }
 
-    const KINDS: [Kind; 6] = [
+    const KINDS: [Kind; 7] = [
         Kind::String,
         Kind::Hash,
         Kind::Set,
         Kind::Zset,
         Kind::List,
         Kind::Stream,
+        Kind::Array,
     ];
 
     #[test]
@@ -536,7 +542,7 @@ mod tests {
 
     #[test]
     fn the_three_fields_of_the_meta_byte_do_not_reach_into_each_other() {
-        // Thirty six combinations, all of which have to come out of one byte
+        // Forty two combinations, all of which have to come out of one byte
         // with nothing borrowed from a neighbour. A tag that overlapped the
         // expiry bit would read the payload at the wrong offset, which is a
         // corrupt value rather than a wrong answer.
@@ -551,7 +557,7 @@ mod tests {
                 }
             }
         }
-        assert_eq!(seen.len(), 36);
+        assert_eq!(seen.len(), KINDS.len() * 6);
     }
 
     #[test]
@@ -577,6 +583,7 @@ mod tests {
         assert_eq!(Kind::Zset as u8, ValueType::Zset as u8);
         assert_eq!(Kind::List as u8, ValueType::List as u8);
         assert_eq!(Kind::Stream as u8, ValueType::Stream as u8);
+        assert_eq!(Kind::Array as u8, ValueType::Array as u8);
         // And the words agree, because both of them end up on a wire.
         for k in KINDS {
             let v = ValueType::from_u8(k as u8).expect("the catalog knows this one");
@@ -682,7 +689,7 @@ mod tests {
     fn an_unknown_type_tag_reads_as_a_string() {
         // Six of eight patterns are used, and the other two answer String for
         // the same reason: handing the bytes back is the harmless reading.
-        assert_eq!(Meta::from_byte(6 << 3).kind(), Kind::String);
+        assert_eq!(Meta::from_byte(6 << 3).kind(), Kind::Array);
         assert_eq!(Meta::from_byte(7 << 3).kind(), Kind::String);
     }
 
