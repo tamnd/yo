@@ -36,6 +36,14 @@
 //!
 //! Lists, hashes and the sorted set follow the same shape and land in M3 too.
 //!
+//! [`orderkey`] is the allocator that decides what sort key a list element gets,
+//! which is the piece that stops `LINSERT` from renumbering everything behind
+//! the element it inserted. It is the variable width scheme Y19 settles on, it
+//! reproduces K14's eight inserts per byte, and like aki's own first slice of
+//! this it ships proven and wired to nothing: the representation that stores a
+//! list by key rather than by position is the partitioned band, and that is the
+//! next piece of M4 rather than this one.
+//!
 //! The pieces of M3 that are here already are the ones every collection shares.
 //! [`Elements`] is the element table a hash, a set and a sorted set are all
 //! built out of, and [`Cursor`] is the scan cursor they all hand back to a
@@ -92,6 +100,7 @@ pub mod lcs;
 pub mod list;
 pub mod listpack;
 pub mod lists;
+pub mod orderkey;
 pub mod rank;
 pub mod scan;
 pub mod set;

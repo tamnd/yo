@@ -43,5 +43,9 @@ name = "listpack"
 harness = false
 
 [[bench]]
+name = "orderkey"
+harness = false
+
+[[bench]]
 name = "setops"
 harness = false
