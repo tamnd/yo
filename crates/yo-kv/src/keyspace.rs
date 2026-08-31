@@ -30,6 +30,7 @@ use crate::set::{self, Set};
 use crate::slab::Slab;
 use crate::ttl::{self, Applied, Ask, Cond};
 use crate::value::{self, Kind};
+use crate::zset::{self, Zset};
 
 /// One database: every key, whatever type it holds.
 pub struct Keyspace {
@@ -49,6 +50,8 @@ pub struct Keyspace {
     pub(crate) hashes: Slab<Hash>,
     /// Every list in this database, addressed the same way.
     pub(crate) lists: Slab<List>,
+    /// Every sorted set in this database, addressed the same way.
+    pub(crate) zsets: Slab<Zset>,
     /// How many keys hold something that is not a string.
     ///
     /// This exists so that a database of nothing but strings, which is every
@@ -62,6 +65,8 @@ pub struct Keyspace {
     pub(crate) hash_limits: hash::Limits,
     /// Where a list changes representation.
     pub(crate) list_limits: list::Limits,
+    /// Where a sorted set changes representation.
+    pub(crate) zset_limits: zset::Limits,
     /// Where `SPOP` and `SRANDMEMBER` draw from.
     pub(crate) rng: Rng,
     /// The last collection key that was resolved, for the command behind it.
@@ -179,10 +184,12 @@ impl Keyspace {
             sets: Slab::new(),
             hashes: Slab::new(),
             lists: Slab::new(),
+            zsets: Slab::new(),
             bodies: 0,
             limits: set::Limits::DEFAULT,
             hash_limits: hash::Limits::DEFAULT,
             list_limits: list::Limits::default(),
+            zset_limits: zset::Limits::DEFAULT,
             rng: Rng::new(clock.now_ms() ^ made.wrapping_mul(0x9e37_79b9_7f4a_7c15)),
             memo: Memo::empty(),
         }
@@ -250,6 +257,21 @@ impl Keyspace {
     #[inline]
     pub const fn set_list_limits(&mut self, limits: list::Limits) {
         self.list_limits = limits;
+    }
+
+    /// Where a sorted set changes representation, which is two `CONFIG` values.
+    #[inline]
+    pub const fn zset_limits(&self) -> &zset::Limits {
+        &self.zset_limits
+    }
+
+    /// Change where a sorted set changes representation.
+    ///
+    /// Same rule as the other three: this decides what the next `ZADD` builds
+    /// and leaves every sorted set that already exists exactly as it is.
+    #[inline]
+    pub const fn set_zset_limits(&mut self, limits: zset::Limits) {
+        self.zset_limits = limits;
     }
 
     /// The clock expiry compares against.
@@ -352,6 +374,17 @@ impl Keyspace {
         Some(self.lists.get(at)?.encoding())
     }
 
+    /// How a sorted set is represented, or `None` if `key` is not one.
+    pub fn zset_encoding(&mut self, key: &[u8]) -> Option<zset::Encoding> {
+        self.reap(key);
+        let rec = self.map.get(key)?;
+        if value::kind(rec) != Kind::Zset {
+            return None;
+        }
+        let at = value::slot(rec);
+        Some(self.zsets.get(at)?.encoding())
+    }
+
     /// `OBJECT ENCODING key`, as the word Redis puts on the wire.
     ///
     /// One place that knows every type's answer, so that adding the hash means
@@ -363,6 +396,7 @@ impl Keyspace {
             Kind::Set => self.set_encoding(key).map(set::Encoding::name),
             Kind::Hash => self.hash_encoding(key).map(hash::Encoding::name),
             Kind::List => self.list_encoding(key).map(list::Encoding::name),
+            Kind::Zset => self.zset_encoding(key).map(zset::Encoding::name),
             other => unreachable!("nothing can store a {} yet", other.name()),
         }
     }
@@ -395,7 +429,7 @@ impl Keyspace {
             // Every body type writes the same record: a tag and a slot number.
             // The body is not touched and does not need to be, which is the
             // whole point of keeping it out of the record.
-            kind @ (Kind::Set | Kind::Hash | Kind::List) => {
+            kind @ (Kind::Set | Kind::Hash | Kind::List | Kind::Zset) => {
                 let slot = value::slot(rec);
                 let len = value::slot_record_len(at.is_some());
                 self.map.set_with(key, len, |out| {
@@ -507,6 +541,11 @@ impl Keyspace {
             Kind::List => {
                 let at = value::slot(rec);
                 self.lists.remove(at);
+                self.bodies -= 1;
+            }
+            Kind::Zset => {
+                let at = value::slot(rec);
+                self.zsets.remove(at);
                 self.bodies -= 1;
             }
             other => unreachable!("nothing can store a {} yet", other.name()),
@@ -622,6 +661,7 @@ impl Keyspace {
         self.sets.clear();
         self.hashes.clear();
         self.lists.clear();
+        self.zsets.clear();
         self.bodies = 0;
     }
 
@@ -646,6 +686,8 @@ impl Keyspace {
             + self.hashes.iter().map(Hash::memory_bytes).sum::<usize>()
             + self.lists.memory_bytes()
             + self.lists.iter().map(List::memory_bytes).sum::<usize>()
+            + self.zsets.memory_bytes()
+            + self.zsets.iter().map(Zset::memory_bytes).sum::<usize>()
     }
 
     /// Give back one segment's worth of space if one has gone mostly dead.
