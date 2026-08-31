@@ -16,6 +16,7 @@ pub mod error;
 pub mod glob;
 pub mod num;
 pub mod prefetch;
+pub mod re;
 pub mod rng;
 pub mod wyhash;
 pub mod xxh3;
