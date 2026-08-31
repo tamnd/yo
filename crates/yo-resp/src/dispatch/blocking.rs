@@ -323,7 +323,7 @@ impl Want {
                 }
                 match db.lmove(src, dst, *from, *to) {
                     Ok(Some(v)) => {
-                        out.bulk(&v);
+                        out.bulk(v);
                         Ok(true)
                     }
                     // The source had something in it a line ago and this is the

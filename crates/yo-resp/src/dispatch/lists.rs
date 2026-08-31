@@ -262,7 +262,7 @@ fn moved(
     out: &mut Out,
 ) -> Result<()> {
     match db.lmove(src, dst, from, to)? {
-        Some(v) => out.bulk(&v),
+        Some(v) => out.bulk(v),
         None => out.nil(),
     }
     Ok(())

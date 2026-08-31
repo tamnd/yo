@@ -409,16 +409,41 @@ impl Keyspace {
     /// borrow from. Moving the bytes from one list to the other without the
     /// copy would need both bodies borrowed at once, and the destination may be
     /// the source.
-    pub fn lmove(&mut self, src: &[u8], dst: &[u8], from: End, to: End) -> Result<Option<Vec<u8>>> {
+    ///
+    /// The copy is not an allocation, though, which is the difference between
+    /// this and the first version of it. The element goes into the database's
+    /// one scratch buffer and the answer borrows that, so a queue that runs
+    /// `RPOPLPUSH` in a loop does no allocator work at all after the first
+    /// call, where before it did a malloc and a free per element. The answer
+    /// borrows the database until the caller is done with it, which is what
+    /// both callers want anyway: they write it to the reply and drop it.
+    pub fn lmove(&mut self, src: &[u8], dst: &[u8], from: End, to: End) -> Result<Option<&[u8]>> {
         // The destination's type is checked before anything is taken, so that
         // `LMOVE list string LEFT LEFT` is a `WRONGTYPE` with the source
         // untouched rather than an element that has gone nowhere.
         self.list_slot(dst)?;
-        let Some(got) = self.pop(src, from)? else {
-            return Ok(None);
+        // Taken out of the database and put back at the end of every path, so
+        // that `pop_into` and `push` can have `&mut self` while the bytes are
+        // in hand. The buffer is empty for the duration and nothing else looks
+        // at it, so a path that returns early leaves it exactly as it found it.
+        let mut buf = std::mem::take(&mut self.scratch);
+        buf.clear();
+        let took = self.pop_into(src, from, 1, |e| e.write_to(&mut buf));
+        let moved = match took {
+            Ok(n) => n,
+            Err(e) => {
+                self.scratch = buf;
+                return Err(e);
+            }
         };
-        self.push(dst, to, std::iter::once(got.as_slice()))?;
-        Ok(Some(got))
+        if moved == 0 {
+            self.scratch = buf;
+            return Ok(None);
+        }
+        let pushed = self.push(dst, to, std::iter::once(buf.as_slice()));
+        self.scratch = buf;
+        pushed?;
+        Ok(Some(&self.scratch))
     }
 
     /// The slot `key`'s list is in, or `None` if there is no such key.
@@ -703,7 +728,7 @@ mod tests {
         let mut d = db();
         rpush(&mut d, b"src", &[b"a", b"b"]);
         let got = d.lmove(b"src", b"dst", End::Right, End::Left).expect("ok");
-        assert_eq!(got.as_deref(), Some(&b"b"[..]));
+        assert_eq!(got, Some(&b"b"[..]));
         assert_eq!(all(&mut d, b"src"), ["a"]);
         assert_eq!(all(&mut d, b"dst"), ["b"]);
     }
@@ -726,6 +751,25 @@ mod tests {
             None
         );
         assert_eq!(d.kind_of(b"dst"), None);
+    }
+
+    /// `RPOPLPUSH` in a loop is what a work queue is, so the element that moves
+    /// must not cost a malloc and a free every time round. The first call is
+    /// allowed to grow the scratch buffer and everything after it is not.
+    #[test]
+    fn lmove_stops_allocating_once_its_buffer_is_grown() {
+        let mut d = db();
+        rpush(&mut d, b"q", &[b"a", b"b", b"c"]);
+        // Warm up. This one may grow the scratch buffer, and on a fresh
+        // database it also makes the destination.
+        d.lmove(b"q", b"q", End::Right, End::Left).expect("ok");
+        let (_, allocs) = crate::tally::counted(|| {
+            for _ in 0..100 {
+                d.lmove(b"q", b"q", End::Right, End::Left).expect("ok");
+            }
+        });
+        assert_eq!(allocs, 0, "lmove allocated {allocs} times in a hundred");
+        assert_eq!(all(&mut d, b"q"), ["b", "c", "a"]);
     }
 
     #[test]
