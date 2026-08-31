@@ -103,6 +103,20 @@ pub struct Keyspace {
     /// it. A value larger than that still grows it, and that one is allocation
     /// proportional to what the caller sent rather than overhead per command.
     pub(crate) scratch: Vec<u8>,
+
+    /// The same idea for indices rather than bytes.
+    ///
+    /// `ZRANDMEMBER` with a positive count under the size of the set does a
+    /// partial Fisher-Yates, and that needs the permutation somewhere while it
+    /// draws from it. One buffer, cleared and refilled, rather than one `Vec`
+    /// per call, because sampling is a thing callers do in a loop.
+    ///
+    /// It does not start at a capacity, unlike [`Keyspace::scratch`]. There is
+    /// no size to guess: the buffer has to be as long as the set, so the first
+    /// call on a set larger than anything seen before grows it whatever it was
+    /// given to start with. That growth is proportional to the data rather than
+    /// per command.
+    pub(crate) rows: Vec<usize>,
 }
 
 /// How big [`Keyspace::scratch`] starts.
@@ -234,6 +248,7 @@ impl Keyspace {
             rng: Rng::new(clock.now_ms() ^ made.wrapping_mul(0x9e37_79b9_7f4a_7c15)),
             memo: Memo::empty(),
             scratch: Vec::with_capacity(SCRATCH),
+            rows: Vec::new(),
         }
     }
 
