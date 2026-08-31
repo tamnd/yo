@@ -118,6 +118,11 @@ impl Rows {
         u32::from(self.at[at]) | u32::from(self.at[at + 1]) << 8 | u32::from(self.at[at + 2]) << 16
     }
 
+    fn set(&mut self, i: usize, row: u32) {
+        let at = i * 3;
+        self.at[at..at + 3].copy_from_slice(&row.to_le_bytes()[..3]);
+    }
+
     fn push(&mut self, row: u32) {
         self.at.extend_from_slice(&row.to_le_bytes()[..3]);
     }
@@ -392,6 +397,38 @@ impl Rank {
         }
         self.len -= 1;
         row
+    }
+
+    /// Write a different row number at a rank, leaving the order alone.
+    ///
+    /// This exists because the element table is dense: taking a row out of it
+    /// moves the last row into the hole, so one element that nobody asked about
+    /// gets a new number on every removal, and the tree has to be told. It is a
+    /// renumbering and not a move, so the caller is promising that the element
+    /// now at `row` sorts exactly where the one that was there did.
+    ///
+    /// # Panics
+    ///
+    /// If the rank is past the end.
+    pub fn set_at(&mut self, rank: usize, row: u32) {
+        assert!(rank < self.len, "rank {rank} is past the end of {}", self.len);
+        let mut node = self.root;
+        let mut at = rank;
+        for _ in 0..self.depth {
+            let b = &mut self.branches[node as usize];
+            let mut i = 0;
+            while at >= b.counts[i] as usize && i + 1 < b.kids.len() {
+                at -= b.counts[i] as usize;
+                i += 1;
+            }
+            // A separator holds the first row of its subtree, so a row that is
+            // first in one is first in every one above it too.
+            if at == 0 {
+                b.firsts[i] = row;
+            }
+            node = b.kids[i];
+        }
+        self.leaves[node as usize].rows.set(at, row);
     }
 
     /// Walk rows in order from a rank.
