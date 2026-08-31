@@ -380,6 +380,23 @@ impl Set {
         (0..self.len()).map(|i| self.at(i).expect("index is under the length"))
     }
 
+    /// The members as a sorted array of integers, when that is what this is.
+    ///
+    /// The one place the representation is not an implementation detail, and it
+    /// is here for [`crate::setops`]: two sorted arrays intersect by stepping
+    /// through both of them with no hash anywhere, which is a different order of
+    /// cost from asking a table a question per member. That was worth nothing
+    /// while an all integer set turned into a table at five hundred and twelve
+    /// members, and it is worth a great deal now that it does not.
+    #[inline]
+    #[must_use]
+    pub const fn ints(&self) -> Option<&Intset> {
+        match &self.body {
+            Body::Ints(s) => Some(s),
+            _ => None,
+        }
+    }
+
     /// Walk part of the set and say where to resume. This is `SSCAN`.
     ///
     /// Only the table and the partitioned band walk in windows. An intset or a

@@ -23,6 +23,17 @@
 //! as a control, and it behaves: probe stays flat near 5 ms from k of 2 to 16
 //! while accumulate goes from 18 ms to 80 ms.
 //!
+//! # The other group, which is the merge
+//!
+//! `setops_ints` is the same thing over integer sets, where a third plan is
+//! available because an intset is a sorted array. It has a shape the text group
+//! does not, `striped`, and that shape is the reason it is worth reading the two
+//! groups separately. A merge's whole advantage is what it can skip, so a
+//! benchmark that only ever lays the sets out in a way that skips well is a
+//! benchmark that will agree with whatever the merge does. `striped` is the
+//! layout that cannot skip at all, and the first version of the merge lost to
+//! the probe on it by nine times.
+//!
 //! # Reading these on a machine someone else is using
 //!
 //! The laptop these were taken on runs at a load average of 4 or 5 from other
@@ -165,5 +176,172 @@ fn bench_store(c: &mut Criterion) {
     g.finish();
 }
 
-criterion_group!(benches, bench_crossover, bench_union_and_diff, bench_store);
+/// Where each set's unshared members sit relative to the other sets'.
+///
+/// This is the whole difference between a merge that is much faster and a merge
+/// that is a little faster, so it is a parameter rather than a decision made once
+/// and forgotten.
+#[derive(Clone, Copy)]
+enum Spread {
+    /// Each set's own members in its own range, above every other set's.
+    ///
+    /// The best case for a seek: a cursor that lands in another set's range can
+    /// step over the whole range in one binary search, so the merge never reads
+    /// most of the members at all.
+    Banded,
+    /// Every set's own members drawn from one range, striped so they never
+    /// collide.
+    ///
+    /// The worst case for a seek. Every member of every set lies between two
+    /// members of every other set, so there is nothing to skip and the merge
+    /// pays a step per member. Here so that the banded row cannot be read as the
+    /// only answer.
+    Striped,
+}
+
+/// Integer sets of `n` members, sharing their first `keep`.
+///
+/// The same shape as [`build`] and the same overlap, with the members as numbers
+/// instead of text so that every set is an intset and there is something to
+/// merge. The shared members are the low numbers and the rest are laid out by
+/// `how`.
+fn build_ints(k: usize, n: usize, keep: usize, how: Spread) -> Vec<Set> {
+    (0..k)
+        .map(|s| {
+            let mut set = Set::new();
+            for i in 0..keep {
+                set.add(i.to_string().as_bytes(), &SetLimits::DEFAULT);
+            }
+            for i in keep..n {
+                let m = match how {
+                    Spread::Banded => (s + 1) * 10_000_000 + i,
+                    // Widened by `k` rather than a constant so the stripes stay
+                    // disjoint however many sets there are.
+                    Spread::Striped => 10_000_000 + i * k + s,
+                };
+                set.add(m.to_string().as_bytes(), &SetLimits::DEFAULT);
+            }
+            assert!(set.ints().is_some(), "every operand has to be an intset");
+            set
+        })
+        .collect()
+}
+
+/// The merge against the probe, on the operands the merge is possible on.
+///
+/// The claim is that a touch which is a pointer step and a comparison is a
+/// different order of cost from one that hashes and lands in a table at random,
+/// and this is where that stops being a claim. Same overlap, same counts and the
+/// same `k` as the text rows above, so the two groups can be read against each
+/// other.
+///
+/// `skewed` is the row the leapfrog exists for: a small set against a large one,
+/// where the merge should touch a few members of the big set and skip the rest
+/// while the probe reads every member of the small set and hashes it.
+///
+/// `striped` is the same sets as `sparse` with nothing to skip, which is the
+/// merge's worst case and the honest floor under the other rows. Without it the
+/// group would only ever measure the layout the merge likes.
+fn bench_merge(c: &mut Criterion) {
+    let mut g = c.benchmark_group("setops_ints");
+    g.sample_size(10);
+
+    for (shape, sizes, keep, spread) in [
+        ("dense", (N, N), N * 9 / 10, Spread::Banded),
+        ("sparse", (N, N), N / 100, Spread::Banded),
+        ("striped", (N, N), N / 100, Spread::Striped),
+        ("skewed", (N / 1_000, N), N / 2_000, Spread::Banded),
+    ] {
+        for &k in ks() {
+            let mut sets = build_ints(k, sizes.1, keep, spread);
+            // The first operand is the small one in the skewed row, which is
+            // the set both plans start from.
+            if sizes.0 != sizes.1 {
+                sets[0] = build_ints(1, sizes.0, keep, spread).remove(0);
+            }
+            let refs: Vec<&Set> = sets.iter().collect();
+
+            for (name, how) in [
+                ("merge", Plan::Merge),
+                ("probe", Plan::Probe),
+                ("accumulate", Plan::Accumulate),
+            ] {
+                g.bench_with_input(
+                    BenchmarkId::new(format!("{shape}_{name}"), k),
+                    &k,
+                    |b, _| {
+                        b.iter(|| {
+                            let mut n = 0usize;
+                            setops::inter_with(how, black_box(&refs), 0, |_| n += 1);
+                            n
+                        })
+                    },
+                );
+            }
+        }
+    }
+
+    // The other two, each plan against the other over the same sets, because a
+    // merge measured on integers and a table measured on text would be two
+    // different inputs and no comparison at all.
+    for &k in ks() {
+        let sets = build_ints(k, N, N / 2, Spread::Striped);
+        let refs: Vec<&Set> = sets.iter().collect();
+
+        // Named for what each one actually is: the union falls back to a
+        // counting table and the difference falls back to a probe.
+        for (name, how) in [("union_merge", Plan::Merge), ("union_table", Plan::Probe)] {
+            g.bench_with_input(BenchmarkId::new(name, k), &k, |b, _| {
+                b.iter(|| {
+                    let mut n = 0usize;
+                    setops::union_with(how, black_box(&refs), |_| n += 1);
+                    n
+                })
+            });
+        }
+        for (name, how) in [("diff_merge", Plan::Merge), ("diff_probe", Plan::Probe)] {
+            g.bench_with_input(BenchmarkId::new(name, k), &k, |b, _| {
+                b.iter(|| {
+                    let mut n = 0usize;
+                    setops::diff_with(how, black_box(&refs), |_| n += 1);
+                    n
+                })
+            });
+        }
+    }
+
+    // `SINTERSTORE` on integers, which is the row aki lost worst at 0.30x and
+    // the row where the two halves help each other: a merge hands its members
+    // over ascending, and ascending is the one order an intset takes at the tail
+    // of its last run instead of memmoving something.
+    for &k in ks() {
+        let sets = build_ints(k, N, N * 9 / 10, Spread::Banded);
+        let refs: Vec<&Set> = sets.iter().collect();
+        let upper = refs.iter().map(|s| s.len()).min().unwrap_or(0);
+
+        for (name, how) in [
+            ("interstore_merge", Plan::Merge),
+            ("interstore_probe", Plan::Probe),
+        ] {
+            g.bench_with_input(BenchmarkId::new(name, k), &k, |b, _| {
+                b.iter(|| {
+                    setops::collect(upper, &SetLimits::DEFAULT, |f| {
+                        setops::inter_with(how, black_box(&refs), 0, f);
+                    })
+                    .map_or(0, |s| s.len())
+                })
+            });
+        }
+    }
+
+    g.finish();
+}
+
+criterion_group!(
+    benches,
+    bench_crossover,
+    bench_union_and_diff,
+    bench_store,
+    bench_merge
+);
 criterion_main!(benches);

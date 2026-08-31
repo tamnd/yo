@@ -135,7 +135,7 @@ pub use cond::Compare;
 pub use counter::{Counted, IncrEx, IncrExpire, Num};
 pub use elem::{Elements, Full, MAX_ROWS, NAME_MAX};
 pub use hash::{Hash, Limits as HashLimits};
-pub use intset::Intset;
+pub use intset::{Intset, Walk};
 pub use keys::{Moved, Record};
 pub use keyspace::Keyspace;
 pub use lcs::{Idx as LcsIdx, LCS_MAX_CELLS, Match as LcsMatch};
