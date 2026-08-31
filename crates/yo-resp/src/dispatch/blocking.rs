@@ -149,7 +149,10 @@ fn mpop(args: Args<'_>, now: u64) -> Result<(Option<u64>, Block)> {
             _ => return Err(Error::new(Code::Invalid, BAD_MPOP_COUNT)),
         };
     }
-    Ok((deadline, Block::mpop((3..at).map(|i| args.get(i)), end, want)))
+    Ok((
+        deadline,
+        Block::mpop((3..at).map(|i| args.get(i)), end, want),
+    ))
 }
 
 /// The moment to give up at, or `None` for a wait with no end to it.
