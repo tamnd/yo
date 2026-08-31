@@ -610,13 +610,13 @@ impl Keyspace {
             ));
         }
 
-        let mut text = Vec::with_capacity(32);
-        yo_common::num::push_double(&mut text, next);
+        let mut buf = [0u8; yo_common::num::DOUBLE_MAX];
+        let text = yo_common::num::write_double(&mut buf, next);
         let limits = self.hash_limits;
         self.hashes
             .get_mut(at)
             .expect("the record points at its body")
-            .set(field, &text, &limits);
+            .set(field, text, &limits);
         Ok(next)
     }
 

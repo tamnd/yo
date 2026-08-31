@@ -77,16 +77,23 @@ pub struct Keyspace {
     /// One buffer for the commands that have to hold an element while the
     /// structure it came out of is being written.
     ///
-    /// [`Keyspace::lmove`] is the only user today and it is the reason this is
-    /// here: it takes an element out of one list and puts it into another, so
-    /// there is a moment where the bytes belong to nothing, and the borrow it
-    /// would need to avoid that is a borrow of two lists at once when the two
-    /// lists may be the same one. A `Vec` per call is the obvious way to cover
-    /// that moment and it is a malloc and a free on a command that a queue
-    /// sends millions of. This is the same `Vec` every time, cleared rather
-    /// than freed, so the steady state is no allocator call at all.
+    /// [`Keyspace::lmove`] is the reason this is here: it takes an element out
+    /// of one list and puts it into another, so there is a moment where the
+    /// bytes belong to nothing, and the borrow it would need to avoid that is a
+    /// borrow of two lists at once when the two lists may be the same one. A
+    /// `Vec` per call is the obvious way to cover that moment and it is a malloc
+    /// and a free on a command that a queue sends millions of. This is the same
+    /// `Vec` every time, cleared rather than freed, so the steady state is no
+    /// allocator call at all.
     ///
-    /// It lives on the database and not on the caller because both callers are
+    /// [`Keyspace::append`], [`Keyspace::setrange`] and the string arm of
+    /// [`Keyspace::set_expiry`] use it for the same shape of problem: each of
+    /// them has to hold the old value while it writes the new record, and each
+    /// of them was doing that with a fresh `Vec` of the whole value. They cannot
+    /// overlap, because each one puts the buffer back before it returns and one
+    /// command runs at a time.
+    ///
+    /// It lives on the database and not on the caller because the callers are
     /// wire handlers that are handed a `&mut Keyspace` and nothing else.
     pub(crate) scratch: Vec<u8>,
 }
@@ -449,8 +456,14 @@ impl Keyspace {
         // Read what has to survive out of the record before writing over it.
         match value::kind(rec) {
             Kind::String => {
-                let bytes = value::read(rec).to_vec();
+                // Through the scratch buffer rather than a fresh `Vec`, since
+                // `EXPIRE` on a string is a command a cache sends as often as
+                // the `SET` before it.
+                let mut bytes = std::mem::take(&mut self.scratch);
+                bytes.clear();
+                value::read(rec).write_to(&mut bytes);
                 self.store(key, &bytes, at);
+                self.scratch = bytes;
             }
             // Every body type writes the same record: a tag and a slot number.
             // The body is not touched and does not need to be, which is the
