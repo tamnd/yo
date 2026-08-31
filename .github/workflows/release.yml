@@ -10,6 +10,10 @@ on:
       tag:
         description: The tag to build the release from
         required: true
+      dry_run:
+        description: Build and check every package, publish none of them
+        type: boolean
+        default: false
 
 env:
   CARGO_TERM_COLOR: always
@@ -27,6 +31,11 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.v.outputs.version }}
+      # The flags every registry job below passes to `apply`, decided once here
+      # rather than five times. A tag push has no inputs at all, so `dry_run` is
+      # empty and this is the publishing form; only a hand-started run can be
+      # anything else, which is the right way round.
+      flags: ${{ steps.v.outputs.flags }}
     steps:
       - uses: actions/checkout@v7.0.1
         with:
@@ -36,6 +45,11 @@ jobs:
           tag="${{ inputs.tag || github.ref_name }}"
           version="${tag#v}"
           echo "version=$version" >> "$GITHUB_OUTPUT"
+          if [ "${{ inputs.dry_run }}" = "true" ]; then
+            echo "flags=--republish" >> "$GITHUB_OUTPUT"
+          else
+            echo "flags=--yes --republish" >> "$GITHUB_OUTPUT"
+          fi
           manifest=$(grep -m1 '^version = ' Cargo.toml | cut -d'"' -f2)
           if [ "$manifest" != "$version" ]; then
             echo "tag $tag says $version, Cargo.toml says $manifest" >&2
@@ -102,3 +116,164 @@ jobs:
             --title "v${{ needs.check.outputs.version }}" \
             --notes-file release-notes.md \
             --verify-tag
+
+  # ---------------------------------------------------------------------------
+  # Registries, one job each, none of them holding a credential.
+  #
+  # Each of these authenticates with a token GitHub mints for this run and that
+  # expires within the hour. `dx/16` §9 asks for the long-lived tokens to be
+  # deleted; these jobs are what makes deleting them possible, so a token that
+  # still appears below is a token that cannot be deleted yet.
+  #
+  # `id-token: write` sits on each job rather than at the top of the file. The
+  # release job above needs `contents: write` and nothing else, and a file-wide
+  # permission to mint OIDC assertions would hand that reach to every job here
+  # including the ones that only read.
+  #
+  # `environment: release` is deliberate and is not about secrets, since none of
+  # these jobs reads one. It is the human gate. `reserve.py` was built so a
+  # permanent publish takes a person typing `--yes` for one registry at a time,
+  # and moving publishing into CI would throw that away for nothing; a required
+  # reviewer on this environment buys it back. All five registries pin their
+  # trust to this environment name, so removing it here does not loosen the gate,
+  # it stops every publish from being authorized at all.
+  #
+  # `--republish` is correct today and will fail loudly when it stops being.
+  # Every name below holds a `0.0.x` placeholder, and `apply` acts on `free` rows
+  # only without it. The flag refuses any version that is not a `0.0.x`, so the
+  # first real release stops here rather than quietly doing the placeholder
+  # thing to a version that is not one. That is the intended way to find out.
+  #
+  # YODB_PLACEHOLDER_VERSION comes from the tag. Without it `reserve.py` uses its
+  # own default, which is whatever the last wave was, and the run would either
+  # republish the version already out or fail at the registry for reusing a
+  # number. The tag is the only thing that should decide this.
+
+  pypi:
+    needs: [check, verify, names]
+    runs-on: ubuntu-latest
+    environment: release
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      YODB_PLACEHOLDER_VERSION: ${{ needs.check.outputs.version }}
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+      - uses: astral-sh/setup-uv@v5.4.2
+      # No credential. `uv publish` detects the OIDC environment and exchanges
+      # for a token itself, and passing one would take the classic path instead.
+      - run: python3 xtask/reserve.py apply pypi ${{ needs.check.outputs.flags }}
+
+  crates-io:
+    needs: [check, verify, names]
+    runs-on: ubuntu-latest
+    environment: release
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      YODB_PLACEHOLDER_VERSION: ${{ needs.check.outputs.version }}
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+      - uses: dtolnay/rust-toolchain@stable
+      # Exchanges the id token for a crates.io token good for under an hour. The
+      # variable it fills is the same one the workstation path reads, so nothing
+      # in `reserve.py` knows the difference.
+      - uses: rust-lang/crates-io-auth-action@v1
+        id: auth
+      # Three crates, three publishes, and each needs its own trusted publisher
+      # configured on crates.io. One `apply` per crate is not possible today:
+      # `apply` takes a registry and does every row it has for it, which is what
+      # is wanted here.
+      - run: python3 xtask/reserve.py apply crates.io ${{ needs.check.outputs.flags }}
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+
+  npm:
+    needs: [check, verify, names]
+    runs-on: ubuntu-latest
+    environment: release
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      YODB_PLACEHOLDER_VERSION: ${{ needs.check.outputs.version }}
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+      # npm 11 or later, which is what knows how to do this at all. The node
+      # version is pinned for that reason and not for anything the package needs;
+      # the placeholder is three files and no build.
+      - uses: actions/setup-node@v4.4.0
+        with:
+          node-version: "24"
+          registry-url: https://registry.npmjs.org
+      - run: npm --version
+      # No NPM_TOKEN, and `b_npm` writes no .npmrc when it sees an OIDC
+      # environment. An .npmrc naming an unset token does not fail loudly here:
+      # npm takes the classic path whenever it finds an auth line, authenticates
+      # as nobody, and reports it as a permissions problem on the package.
+      - run: python3 xtask/reserve.py apply npm ${{ needs.check.outputs.flags }}
+
+  nuget:
+    needs: [check, verify, names]
+    runs-on: ubuntu-latest
+    environment: release
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      YODB_PLACEHOLDER_VERSION: ${{ needs.check.outputs.version }}
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+      - uses: actions/setup-dotnet@v4.3.1
+        with:
+          dotnet-version: "9.0"
+      # Exchanges the id token for a single-use key valid about an hour, so it
+      # goes immediately before the push rather than at the top of the job.
+      - uses: NuGet/login@v1
+        id: login
+        with:
+          user: tamnd
+      - run: python3 xtask/reserve.py apply nuget ${{ needs.check.outputs.flags }}
+        env:
+          NUGET_API_KEY: ${{ steps.login.outputs.NUGET_API_KEY }}
+
+  pub-dev:
+    needs: [check, verify, names]
+    runs-on: ubuntu-latest
+    environment: release
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      YODB_PLACEHOLDER_VERSION: ${{ needs.check.outputs.version }}
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+      - uses: dart-lang/setup-dart@v1.7.1
+      # Done here rather than left to the action, because what the action does
+      # internally is a thing to look up and this is a thing to read. The
+      # audience is what pub.dev checks; an id token minted for anything else is
+      # a valid token that pub.dev will not accept.
+      #
+      # pub.dev is also the reason this whole file is the trigger rather than a
+      # workflow of its own: it permits automated publishing only from a run
+      # started by a tag push matching the pattern configured on the package,
+      # which is `v{{version}}`.
+      - name: Exchange the id token for a pub.dev credential
+        run: |
+          token=$(curl -sf -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=https://pub.dev" | jq -r .value)
+          test -n "$token" && test "$token" != null
+          echo "$token" | dart pub token add https://pub.dev
+      - run: python3 xtask/reserve.py apply pub.dev ${{ needs.check.outputs.flags }}
