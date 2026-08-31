@@ -518,6 +518,16 @@ impl Waiters {
         }
     }
 
+    /// The database the waiter at `at` blocked on.
+    ///
+    /// # Panics
+    ///
+    /// As [`Waiters::at`].
+    #[must_use]
+    pub fn db_of(&self, at: usize) -> usize {
+        self.list[at].db
+    }
+
     /// Take a waiter off the list.
     ///
     /// # Panics
@@ -634,6 +644,10 @@ impl Server {
     ///
     /// If `at` is not a waiter.
     pub fn serve_waiter(&mut self, at: usize, now: u64, out: &mut Out) -> bool {
+        // Serving a waiter pops an element, which makes garbage, and it happens
+        // outside `execute` so nothing else has marked the database for the
+        // maintenance turn.
+        self.dirty |= 1u64 << self.waiters.db_of(at);
         self.waiters.try_serve(at, &mut self.dbs, now, out)
     }
 }

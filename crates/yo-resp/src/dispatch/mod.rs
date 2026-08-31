@@ -81,6 +81,19 @@ use yo_kv::{Clock, Keyspace};
 /// needs it not to be.
 pub const DATABASES: usize = 16;
 
+/// Every database's bit in [`Server::dirty`], which is what a fresh server
+/// starts on so that the first maintenance turn asks all of them.
+///
+/// A `u64` holds sixteen bits with room to spare, and the assertion below is
+/// what turns raising [`DATABASES`] past sixty four into a build failure rather
+/// than a shift that silently drops the databases past the end.
+const ALL_DATABASES: u64 = if DATABASES == 64 {
+    u64::MAX
+} else {
+    (1u64 << DATABASES) - 1
+};
+const _: () = assert!(DATABASES <= 64);
+
 /// What the connection should do after a command.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Flow {
@@ -125,6 +138,16 @@ pub struct Server {
     /// Where the next maintenance turn starts looking, so that a database
     /// under constant write load cannot hold the other fifteen's space.
     next_db: usize,
+    /// One bit per database, set when a command ran against it.
+    ///
+    /// The maintenance turn after every batch used to ask all sixteen
+    /// databases whether they had anything to collect, and asking costs a load
+    /// and a store in each one. Fifteen of those are cold lines on a server
+    /// where every client is on database zero, which is every server, and the
+    /// answer is no every time. This is the cheap half of the question: a
+    /// database nobody has touched since it last said no cannot have started
+    /// saying yes.
+    dirty: u64,
     /// What the connections are holding, kept by the engine.
     conn_bytes: usize,
     /// Clients parked on a blocking command.
@@ -145,6 +168,7 @@ impl Server {
             clock,
             started_ms: clock.now_ms(),
             next_db: 0,
+            dirty: ALL_DATABASES,
             conn_bytes: 0,
             waiters: Waiters::default(),
             stats: Stats::default(),
@@ -161,6 +185,7 @@ impl Server {
             clock,
             started_ms: clock.now_ms(),
             next_db: 0,
+            dirty: ALL_DATABASES,
             conn_bytes: 0,
             waiters: Waiters::default(),
             stats: Stats::default(),
@@ -175,6 +200,9 @@ impl Server {
     /// index and it checks, so an index that is out of range here is a bug in
     /// the caller and not something a client can ask for.
     pub fn db(&mut self, i: usize) -> &mut Keyspace {
+        // The borrow is mutable, so assume it is used. Anything that only reads
+        // has [`Server::db_ref`] and does not come through here.
+        self.dirty |= 1u64 << i;
         &mut self.dbs[i]
     }
 
@@ -316,10 +344,17 @@ impl Server {
     pub fn compact_step(&mut self) -> Option<usize> {
         for turn in 0..self.dbs.len() {
             let i = (self.next_db + turn) % self.dbs.len();
+            // Nothing has run against this database since it last said it had
+            // nothing to collect, so it still has nothing to collect and the
+            // line it lives on stays where it is.
+            if self.dirty & (1 << i) == 0 {
+                continue;
+            }
             if let Some(moved) = self.dbs[i].compact_step() {
                 self.next_db = (i + 1) % self.dbs.len();
                 return Some(moved);
             }
+            self.dirty &= !(1u64 << i);
         }
         None
     }
@@ -405,6 +440,17 @@ pub fn execute(server: &mut Server, session: &mut Session, args: Args<'_>, out: 
         write_error(out, &args::wrong_arity(spec.name));
         return Flow::Continue;
     }
+
+    // Which databases the maintenance turn after this batch has to ask. Marked
+    // for every command and not only for the writes, because a read can make
+    // garbage too: a `GET` on a key whose expiry has passed reaps it, and the
+    // record it dropped is exactly the kind of thing the collector is for.
+    // `COPY`, `SWAPDB` and `FLUSHALL` reach a database nobody selected, so the
+    // two groups that hold them mark all of them rather than the session's.
+    server.dirty |= match spec.group {
+        "string" | "set" | "hash" | "list" | "zset" => 1u64 << session.db,
+        _ => ALL_DATABASES,
+    };
 
     let mark = out.len();
     // Before the group, because the five that block are list commands and would
@@ -563,6 +609,56 @@ mod tests {
         );
         assert_eq!(f.run(&[b"DBSIZE"]), format!(":{}\r\n", keys.len()));
         assert_eq!(f.run(&[b"STRLEN", b"key:7"]), ":1024\r\n");
+    }
+
+    /// The same churn on a database nobody starts on, either side of a quiet
+    /// spell long enough for the maintenance turn to stop asking about it.
+    ///
+    /// The turn after each batch skips a database that has already said it has
+    /// nothing to collect and has not been touched since, which is what keeps a
+    /// server whose clients are all on database zero from loading and storing
+    /// in the other fifteen every batch to be told no. Two things could go
+    /// wrong with that. A database might never be marked at all, so this uses
+    /// database nine, which nothing marks by accident. And a database whose
+    /// mark was cleared might never get it back, so this drains the collector
+    /// until it says there is nothing left, checks the mark really is gone, and
+    /// then writes another thirty two megabytes through the same sixty four
+    /// keys. If either went wrong the server would hold all of it.
+    #[test]
+    fn a_database_nobody_started_on_is_still_collected() {
+        let mut f = Fixture::new();
+        assert_eq!(f.run(&[b"SELECT", b"9"]), "+OK\r\n");
+        let val = vec![b'v'; 1024];
+        let keys: Vec<Vec<u8>> = (0..64).map(|i| format!("key:{i}").into_bytes()).collect();
+
+        for k in &keys {
+            f.run(&[b"SET", k, &val]);
+        }
+        while f.server.compact_step().is_some() {}
+        assert_eq!(
+            f.server.dirty & (1 << 9),
+            0,
+            "database nine was drained and should not be asked again until it is written to"
+        );
+        let after_first = f.server.memory_bytes();
+
+        for _ in 0..500 {
+            for k in &keys {
+                f.run(&[b"SET", k, &val]);
+            }
+            f.server.compact_step();
+        }
+
+        assert!(
+            f.server.memory_bytes() <= after_first * 2,
+            "held {} after five hundred passes against {after_first} after one",
+            f.server.memory_bytes()
+        );
+        assert_eq!(f.run(&[b"DBSIZE"]), format!(":{}\r\n", keys.len()));
+        assert_eq!(f.run(&[b"STRLEN", b"key:7"]), ":1024\r\n");
+        // And nothing landed anywhere else on the way.
+        f.run(&[b"SELECT", b"0"]);
+        assert_eq!(f.run(&[b"DBSIZE"]), ":0\r\n");
     }
 
     #[test]
