@@ -128,34 +128,53 @@ impl Keyspace {
     /// reason. What it is not is skewed towards any particular key, which is
     /// what matters for the thing `RANDOMKEY` is actually used for, which is
     /// sampling a live database to see what is in it.
-    pub fn random_key(&mut self) -> Option<Vec<u8>> {
+    ///
+    /// The answer borrows the database's scratch buffer, so it is good until the
+    /// next call and the caller copies it if it wants to keep it. That is what
+    /// takes the allocation off the command: sampling is a thing callers do in a
+    /// loop, and a key name is a handful of bytes that used to cost a malloc and
+    /// a free every time round.
+    pub fn random_key(&mut self) -> Option<&[u8]> {
         if self.map.is_empty() {
             return None;
         }
+        let mut found = false;
         for _ in 0..TRIES {
             let from = KeyCursor::from_raw(self.rng.next_u64());
-            if let Some(key) = self.sample(from, 0) {
-                return Some(key);
+            if self.sample(from, 0) {
+                found = true;
+                break;
             }
         }
         // Every bucket that was tried was empty or held nothing but dead keys.
         // A full walk is the only answer left that can tell an unlucky run of
         // tries from a database whose keys have all expired.
-        self.sample(KeyCursor::START, usize::MAX)
+        if !found {
+            found = self.sample(KeyCursor::START, usize::MAX);
+        }
+        // Written out rather than returned from inside the loop because the
+        // answer borrows `self` and the next turn of the loop wants it back.
+        found.then_some(self.scratch.as_slice())
     }
 
-    /// One key from the walk starting at `from`, uniform among the keys it sees.
+    /// Walk from `from` and leave one key in the scratch buffer, `true` if there
+    /// was one.
     ///
     /// Reservoir sampling, which is the version that needs one pass and one
     /// slot of memory. Taking the first key instead would answer the same key
     /// every time for as long as the bucket held still.
-    fn sample(&mut self, from: KeyCursor, budget: usize) -> Option<Vec<u8>> {
+    ///
+    /// The slot is the scratch buffer, taken out for the walk and put back
+    /// after it, because the closure has to hold it while `self.map` is
+    /// borrowed by the scan.
+    fn sample(&mut self, from: KeyCursor, budget: usize) -> bool {
         let now = self.clock.now_ms();
         // Named separately so the closure borrows the counter and not the whole
         // keyspace, which the walk is holding.
         let rng = &mut self.rng;
+        let mut buf = std::mem::take(&mut self.scratch);
         let mut seen = 0usize;
-        let mut pick = None;
+        let mut found = false;
         let mut dead = Vec::new();
         self.map.scan(from, budget, |key, rec| {
             if value::is_expired(rec, now) {
@@ -164,11 +183,14 @@ impl Keyspace {
             }
             seen += 1;
             if rng.below(seen) == 0 {
-                pick = Some(key.to_vec());
+                buf.clear();
+                buf.extend_from_slice(key);
+                found = true;
             }
         });
+        self.scratch = buf;
         self.reap_all(dead);
-        pick
+        found
     }
 }
 
@@ -282,7 +304,9 @@ mod tests {
         let all = keys_of(&mut db);
         let mut picked = HashSet::new();
         for _ in 0..200 {
-            let k = db.random_key().expect("the database is not empty");
+            // Copied out, because the answer borrows the buffer the next draw
+            // writes into.
+            let k = db.random_key().expect("the database is not empty").to_vec();
             assert!(
                 all.contains(&k),
                 "randomkey answered a key that is not there"
@@ -296,6 +320,27 @@ mod tests {
             picked.len() > 10,
             "only {} distinct keys in 200 draws",
             picked.len()
+        );
+    }
+
+    /// `RANDOMKEY` used to hand back an owned key, which is a malloc and a free
+    /// on a command whose whole job is to be called in a loop.
+    #[test]
+    fn randomkey_does_not_allocate() {
+        let mut db = db();
+        for i in 0..500u32 {
+            put(&mut db, format!("k{i}").as_bytes());
+        }
+        // Nothing here has expired, so the walk never has a key to reap and the
+        // only thing left that could allocate is the answer itself.
+        let (_, allocs) = crate::tally::counted(|| {
+            for _ in 0..200 {
+                assert!(db.random_key().is_some(), "the database is not empty");
+            }
+        });
+        assert_eq!(
+            allocs, 0,
+            "randomkey allocated {allocs} times in two hundred"
         );
     }
 
@@ -313,7 +358,7 @@ mod tests {
 
         // One key in a directory that grew to hold five thousand, so every
         // random try misses and the fallback walk is what answers.
-        assert_eq!(db.random_key().as_deref(), Some(&b"k4242"[..]));
+        assert_eq!(db.random_key(), Some(&b"k4242"[..]));
     }
 
     #[test]
