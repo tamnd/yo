@@ -75,6 +75,7 @@
 #![deny(missing_docs)]
 
 pub mod blob;
+pub mod chunk;
 pub mod clock;
 pub mod cond;
 pub mod counter;
@@ -85,6 +86,7 @@ pub mod intset;
 pub mod keys;
 pub mod keyspace;
 pub mod lcs;
+pub mod list;
 pub mod listpack;
 pub mod scan;
 pub mod set;
@@ -108,6 +110,7 @@ pub use intset::Intset;
 pub use keys::{Moved, Record};
 pub use keyspace::Keyspace;
 pub use lcs::{Idx as LcsIdx, LCS_MAX_CELLS, Match as LcsMatch};
+pub use list::{Limits as ListLimits, List};
 pub use listpack::{Entry, Listpack, Malformed};
 pub use scan::{Cursor, MAX_PARTS};
 pub use set::{Limits as SetLimits, Member, Set};

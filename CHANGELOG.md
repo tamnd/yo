@@ -4,6 +4,14 @@ What each release changed, why, and what it costs you. The versioning rules and 
 
 While the major is 0, a minor release may break anything, including the on-disk format. The format is frozen at `M6`, not before.
 
+## Unreleased
+
+### Added
+
+- **The list type, in the two representations Redis has and one it does not.** A list is one listpack while it is under eight kilobytes, which is what `list-max-listpack-size -2` means and why a list of a thousand short strings is still one blob, and it is a ring of chunks after that. `OBJECT ENCODING` answers `listpack` and `quicklist` the same as Redis does, and the boundary in both directions is Redis's own: a list converts back to a listpack only once it is under half the limit and only once it is down to a single node, which is the hysteresis that stops a list sitting on the boundary from rebuilding itself on every second command.
+- **A chunk is a run of entries with a cursor at each end, not a listpack.** A quicklist node is a listpack, and taking the first element out of a listpack moves every byte behind it left, so Redis pays a memmove on every `LPOP` of a long list. A chunk holds the same entries in the same encoding and keeps a head cursor and a tail cursor, so a pop at either end moves a cursor and touches nothing the other end owns. A push at the end that has no room left slides the live bytes over once and splits what is free between the two ends, which is what keeps a list that is pushed and popped at the same end from allocating a chunk per push.
+- **The listpack element codec is shared rather than copied.** `entry_len`, `write_entry`, `decode` and the back length pair are internal to `yo-kv` now instead of private to the listpack, so the chunk encodes an element exactly the way the listpack does. That is what makes promoting a list out of the packed band a single copy of the listpack's entry region rather than a walk that re-encodes every element, and it is what keeps an integer stored as an integer across the band change.
+
 ## 0.3.2 — 2026-08-31
 
 Sixty one pull requests and no milestone, so this is a patch, and it is a much bigger one than the rule in RELEASING.md intends. The cadence slipped while M2 and M3 were both moving at once and the honest fix is to cut what is there rather than to keep waiting for a milestone to close. M2 now has a server a Redis client can talk to and M3 has sets and hashes complete, but neither has passed its exit gate, so the minor that carries them is still to come.

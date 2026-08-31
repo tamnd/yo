@@ -65,6 +65,15 @@
 //! for the collection, since Redis makes it configurable per type and the
 //! thresholds have to keep matching `hash-max-listpack-entries` and its
 //! neighbours. This module holds elements and says how many bytes they cost.
+//!
+//! # The element codec is shared
+//!
+//! [`crate::chunk`] holds the same entries in a run with a cursor at each end
+//! rather than in a blob with a header, so it needs the encoding and not the
+//! container. [`entry_len`], [`write_entry`], [`decode`] and [`read_backlen`]
+//! are `pub(crate)` for that, and they are the only things a second holder of
+//! these bytes needs. Two copies of the fourteen encodings is how a list and a
+//! set end up disagreeing about what `SADD s 1` stored.
 
 use yo_common::{parse_i64, push_i64};
 
@@ -222,6 +231,17 @@ impl Listpack {
     #[must_use]
     pub fn as_bytes(&self) -> &[u8] {
         &self.bytes
+    }
+
+    /// The entry region on its own, without the header or the terminator.
+    ///
+    /// [`crate::chunk`] holds entries in exactly this encoding, so promoting a
+    /// list out of the packed band is one copy of this slice rather than a walk
+    /// that re-encodes every element.
+    #[inline]
+    #[must_use]
+    pub(crate) fn entries(&self) -> &[u8] {
+        &self.bytes[HDR..self.bytes.len() - 1]
     }
 
     /// How many elements.
@@ -544,13 +564,42 @@ fn encode<'b>(v: &[u8], buf: &'b mut [u8; 16]) -> (&'b [u8], bool) {
     (head, true)
 }
 
+/// How many bytes an entry for `v` takes, its back length included.
+///
+/// The chunk has to know before it writes, because a chunk that runs out of
+/// room halfway through an entry has no way to put itself back.
+#[inline]
+pub(crate) fn entry_len(v: &[u8]) -> usize {
+    let mut buf = [0u8; 16];
+    let (head, payload) = encode(v, &mut buf);
+    let len = head.len() + if payload { v.len() } else { 0 };
+    len + backlen_len(len)
+}
+
+/// Write one entry into `dst`, and say how many bytes it took.
+///
+/// `dst` must be at least [`entry_len`] long, which every caller knows because
+/// it asked first.
+#[inline]
+pub(crate) fn write_entry(dst: &mut [u8], v: &[u8]) -> usize {
+    let mut buf = [0u8; 16];
+    let (head, payload) = encode(v, &mut buf);
+    dst[..head.len()].copy_from_slice(head);
+    let mut at = head.len();
+    if payload {
+        dst[at..at + v.len()].copy_from_slice(v);
+        at += v.len();
+    }
+    at + write_backlen_into(&mut dst[at..], at)
+}
+
 /// Read one entry, and say how many bytes it took before its back length.
 ///
 /// Inlined on purpose. It hands back a fat enum and a length, and left out of
 /// line that pair goes through memory once per element, which is most of what a
 /// walk costs.
 #[inline]
-fn decode(b: &[u8]) -> Option<(Entry<'_>, usize)> {
+pub(crate) fn decode(b: &[u8]) -> Option<(Entry<'_>, usize)> {
     let first = *b.first()?;
     // A string encoding's payload starts after its length, so both arms below
     // hand back the same pair and the caller does not care which it was.
@@ -609,7 +658,7 @@ fn decode(b: &[u8]) -> Option<(Entry<'_>, usize)> {
 /// against the real ones in the tests rather than taken on trust, because a
 /// listpack whose back lengths are a byte out is one Redis walks off the end of.
 #[inline]
-const fn backlen_len(len: usize) -> usize {
+pub(crate) const fn backlen_len(len: usize) -> usize {
     if len <= 127 {
         1
     } else if len <= 16383 {
@@ -628,38 +677,30 @@ const fn backlen_len(len: usize) -> usize {
 /// The first byte holds the high seven bits and every later byte has its top bit
 /// set, which is what lets it be read from the right hand end leftward.
 fn write_backlen(out: &mut Vec<u8>, len: usize) {
-    match backlen_len(len) {
-        1 => out.push(len as u8),
-        2 => {
-            out.push((len >> 7) as u8);
-            out.push((len & 127) as u8 | 128);
-        }
-        3 => {
-            out.push((len >> 14) as u8);
-            out.push(((len >> 7) & 127) as u8 | 128);
-            out.push((len & 127) as u8 | 128);
-        }
-        4 => {
-            out.push((len >> 21) as u8);
-            out.push(((len >> 14) & 127) as u8 | 128);
-            out.push(((len >> 7) & 127) as u8 | 128);
-            out.push((len & 127) as u8 | 128);
-        }
-        _ => {
-            out.push((len >> 28) as u8);
-            out.push(((len >> 21) & 127) as u8 | 128);
-            out.push(((len >> 14) & 127) as u8 | 128);
-            out.push(((len >> 7) & 127) as u8 | 128);
-            out.push((len & 127) as u8 | 128);
-        }
+    let mut buf = [0u8; 5];
+    let n = write_backlen_into(&mut buf, len);
+    out.extend_from_slice(&buf[..n]);
+}
+
+/// The same, into a slice, for a holder that is not growing a `Vec`.
+#[inline]
+fn write_backlen_into(dst: &mut [u8], len: usize) -> usize {
+    let n = backlen_len(len);
+    // High seven bits first, then seven at a time downward, and every byte
+    // after the first carries the continuation bit that stops the leftward
+    // walk from running past the front of the entry.
+    for (i, b) in dst[..n].iter_mut().enumerate() {
+        let shift = 7 * (n - 1 - i);
+        *b = ((len >> shift) & 127) as u8 | if i == 0 { 0 } else { 128 };
     }
+    n
 }
 
 /// Read a back length that ends at the last byte of `upto`.
 ///
 /// Walks left while the top bit is set, seven bits at a time, which is the
 /// mirror image of how it was written.
-fn read_backlen(upto: &[u8]) -> Option<usize> {
+pub(crate) fn read_backlen(upto: &[u8]) -> Option<usize> {
     let mut val = 0usize;
     let mut shift = 0u32;
     let mut at = upto.len().checked_sub(1)?;
