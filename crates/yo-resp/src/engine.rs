@@ -937,7 +937,18 @@ pub fn pump<S: Sink>(reactor: &mut Reactor<Wire<S>>, batch: &mut Vec<Cmd>) -> us
         if reactor.engine_mut().take_ready(batch, BATCH_MAX) == 0 {
             break;
         }
+        // The command path, and therefore the thing Y7 is about. The guard is
+        // what arms `yo-alloc`, and it covers dispatch and nothing else: framing
+        // before it and writing the replies after it are both allowed to reach
+        // for the heap, and only running the commands is not.
+        //
+        // It goes here rather than around the whole loop because `take_ready`
+        // and `flush` are on the other side of that line, and because a batch is
+        // the unit a caller can reason about. Under the default mode this is one
+        // relaxed load.
+        let armed = yo_alloc::guard();
         ran += reactor.execute_all(batch.drain(..));
+        drop(armed);
         reactor.engine_mut().flush();
         // After the replies are out, so the batch that made the garbage is not
         // the batch that waits for it to be collected.

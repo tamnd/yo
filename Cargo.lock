@@ -825,6 +825,7 @@ version = "0.3.5"
 dependencies = [
  "libc",
  "windows-sys",
+ "yo-alloc",
  "yo-file",
  "yo-format",
  "yo-reactor",
