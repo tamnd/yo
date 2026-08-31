@@ -639,6 +639,65 @@ mod tests {
         s
     }
 
+    /// What a set actually costs per member, which is half of M3's memory gate
+    /// row and was an argument rather than a number until this was written.
+    ///
+    /// Run it with `cargo test -p yo-kv --release measure_bytes_per_member --
+    /// --ignored --nocapture`. Ignored because a million members is not
+    /// something every `cargo test` should pay for, and it prints rather than
+    /// asserts because the number it prints is the thing being reported.
+    ///
+    /// Two shapes, because the gate names one of them and the other is what
+    /// most sets actually hold. Integers first, at every band an all integer
+    /// set passes through, and then strings, which never see the intset at all.
+    #[test]
+    #[ignore = "a measurement, run it by name"]
+    fn measure_bytes_per_member() {
+        let limits = Limits::DEFAULT;
+        for n in [512usize, 1_000, 100_000, 1_000_000] {
+            let mut s = Set::new();
+            for i in 0..n {
+                s.add(i.to_string().as_bytes(), &limits);
+            }
+            println!(
+                "int   n={n:<9} band={:<10} total={:<10} per_member={:.2}",
+                band(&s),
+                s.memory_bytes(),
+                s.memory_bytes() as f64 / n as f64
+            );
+        }
+        // Sixteen byte members, so the payload is a round number and the
+        // overhead is whatever is above it.
+        for n in [128usize, 1_000, 100_000, 1_000_000] {
+            let mut s = Set::new();
+            let mut payload = 0usize;
+            for i in 0..n {
+                let m = format!("member:{i:09}");
+                payload += m.len();
+                s.add(m.as_bytes(), &limits);
+            }
+            let total = s.memory_bytes();
+            println!(
+                "bytes n={n:<9} band={:<10} total={total:<10} payload={payload:<9} per_member={:.2} over_per_member={:.2}",
+                band(&s),
+                total as f64 / n as f64,
+                (total as f64 - payload as f64) / n as f64
+            );
+        }
+    }
+
+    /// Which of the four a set is in, spelled out rather than through
+    /// [`Set::encoding`], which folds the two table bands into one word because
+    /// that is what `OBJECT ENCODING` has to say.
+    fn band(s: &Set) -> &'static str {
+        match &s.body {
+            Body::Ints(_) => "intset",
+            Body::Packed(_) => "listpack",
+            Body::Table(_) => "table",
+            Body::Split(_) => "split",
+        }
+    }
+
     /// Everything about the partitioned band that needs a real set past the real
     /// threshold, in one test, because building 262,145 members is the expensive
     /// part and there is no reason to pay for it four times.

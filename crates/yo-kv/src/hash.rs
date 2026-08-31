@@ -848,6 +848,49 @@ pub fn stores_as_int(bytes: &[u8]) -> bool {
 mod tests {
     use super::*;
 
+    /// What a hash actually costs per field, which is the other half of M3's
+    /// memory gate row and was an argument rather than a number until this was
+    /// written.
+    ///
+    /// Run it with `cargo test -p yo-kv --release measure_bytes_per_field --
+    /// --ignored --nocapture`. Ignored and printing for the same reasons the
+    /// set and sorted set measurements next to it are.
+    ///
+    /// The gate is sixteen bytes a field, and the payload has to be named for
+    /// that to mean anything, so this uses an eight byte field and an eight
+    /// byte value. Sixteen bytes a field is then a hash that holds what it
+    /// stores and nothing else, which nothing can reach, so the number to read
+    /// is the overhead column and the gate is really thirty two total.
+    #[test]
+    #[ignore = "a measurement, run it by name"]
+    fn measure_bytes_per_field() {
+        let limits = Limits::DEFAULT;
+        for n in [512usize, 1_000, 100_000, 1_000_000] {
+            let mut h = Hash::new();
+            let mut payload = 0usize;
+            for i in 0..n {
+                let f = format!("f{i:07}");
+                let v = format!("v{i:07}");
+                payload += f.len() + v.len();
+                h.set(f.as_bytes(), v.as_bytes(), &limits);
+            }
+            let total = h.memory_bytes();
+            let (fields, values) = match &h.body {
+                Body::Table(t) => (t.fields.memory_bytes(), t.values.memory_bytes()),
+                Body::Packed(_) => (0, 0),
+            };
+            let per = |b: usize| b as f64 / n as f64;
+            println!(
+                "n={n:<9} band={:<9} total={total:<10} payload={payload:<9} fields={:.2}/f values={:.2}/f per_field={:.2} over_per_field={:.2}",
+                if fields == 0 { "listpack" } else { "table" },
+                per(fields),
+                per(values),
+                per(total),
+                (total as f64 - payload as f64) / n as f64
+            );
+        }
+    }
+
     /// A hash that never leaves the listpack band.
     const SMALL: Limits = Limits::DEFAULT;
     /// A hash that promotes on the 129th field.
