@@ -2010,6 +2010,30 @@ status = "shipped"
 wire = "verified"
 notes = "Index and value pairs for everything a range holds, holes skipped, reversed when the start is above the end. It needs none of the million position cap ARGETRANGE has because the cost is the elements found and the slices they sit in, not the width of the range, so a scan of the whole index space over a key holding three elements is three visits."
 
+[[command]]
+name = "AROP"
+group = "array"
+since = "8.8.0"
+arity = -5
+plan = "cursor"
+bounded = "inherent"
+status = "shipped"
+wire = "verified"
+divergent = "D-21"
+notes = "One number out of a range, under one of eight operations. SUM, MIN and MAX read what parses as a number and ignore the rest, and answer a null when nothing in the range did. AND, OR and XOR truncate a float toward zero, skip anything that will not fit a signed sixty four bit integer, and answer a null when they saw no integer. MATCH and USED count rather than aggregate, so a missing key is a zero for those two and a null for the other six. The aggregate replies go through the seventeen significant digit printer Redis uses for them, which is why AROP says 0.29999999999999999 where ZSCORE says 0.3 for the same number."
+
+[[command]]
+name = "ARINFO"
+group = "array"
+since = "8.8.0"
+arity = -2
+plan = "metadata"
+bounded = "inherent"
+status = "shipped"
+wire = "verified"
+divergent = "D-20"
+notes = "Seven fields about the key, or twelve with FULL. It is the one array command where a missing key is an error rather than an empty answer, which is deliberate on Redis's part: this is a question about a key that exists. The seven short fields are all struct reads, so the short form is constant time, and only FULL walks the directory to average the slices."
+
 
 # ------------------------------------------------------------------ scripting
 

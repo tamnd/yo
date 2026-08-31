@@ -995,6 +995,48 @@ impl Array {
         }
     }
 
+    /// What `ARINFO` says about the array.
+    ///
+    /// The per layout numbers cost a walk of the directory and are only filled
+    /// in when `full`, which is the same split Redis makes and for the same
+    /// reason: the seven cheap numbers are all read off fields.
+    #[must_use]
+    pub fn info(&self, full: bool) -> Info {
+        let mut info = Info {
+            count: self.count,
+            len: self.len(),
+            // The terminal cursor reports zero here rather than the null
+            // `ARNEXT` gives, which is Redis's choice and not ours.
+            next_insert: self.next_index().unwrap_or(0),
+            slices: self.slices.len() as u64,
+            directory_size: self.slices.capacity() as u64,
+            slice_size: SLICE_SIZE,
+            ..Info::default()
+        };
+        if !full {
+            return info;
+        }
+        let (mut window, mut filled, mut room) = (0u64, 0u64, 0u64);
+        for (_, slice) in &self.slices {
+            match &slice.layout {
+                Layout::Dense { words, .. } => {
+                    info.dense_slices += 1;
+                    window += words.len() as u64;
+                    filled += u64::from(slice.count);
+                }
+                Layout::Sparse { offs, .. } => {
+                    info.sparse_slices += 1;
+                    room += offs.capacity() as u64;
+                }
+            }
+        }
+        let ratio = |a: u64, b: u64| if b == 0 { 0.0 } else { a as f64 / b as f64 };
+        info.avg_dense_size = ratio(window, info.dense_slices);
+        info.avg_dense_fill = ratio(filled, window);
+        info.avg_sparse_size = ratio(room, info.sparse_slices);
+        info
+    }
+
     /// What the array is holding on the heap, for `MEMORY USAGE`.
     #[must_use]
     pub fn memory_bytes(&self) -> usize {
@@ -1152,6 +1194,38 @@ impl Array {
             self.slices.shrink_to_fit();
         }
     }
+}
+
+/// What `ARINFO` reports, which is the shape of the array and not its contents.
+///
+/// Three of these describe our directory rather than Redis's, which is D-20:
+/// the slice count and the two directory numbers are about a sorted vector of
+/// slices where Redis has a growable table and, past a point, a second level
+/// above it. Everything else means the same thing in both.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct Info {
+    /// How many indices hold something.
+    pub count: u64,
+    /// The highest populated index plus one.
+    pub len: u64,
+    /// Where the next append would go, and zero when there is nowhere.
+    pub next_insert: u64,
+    /// How many slices the array is made of.
+    pub slices: u64,
+    /// How many slots the directory has room for.
+    pub directory_size: u64,
+    /// How many indices one slice covers.
+    pub slice_size: u64,
+    /// How many slices are holding a window of consecutive positions.
+    pub dense_slices: u64,
+    /// How many are holding offsets and words in parallel.
+    pub sparse_slices: u64,
+    /// The mean width of a dense window, in positions.
+    pub avg_dense_size: f64,
+    /// How much of that width is populated, between zero and one.
+    pub avg_dense_fill: f64,
+    /// The mean number of entries a sparse slice has room for.
+    pub avg_sparse_size: f64,
 }
 
 /// The message when one key's long values pass four gigabytes in total.
