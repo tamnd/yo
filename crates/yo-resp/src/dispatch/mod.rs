@@ -4330,6 +4330,297 @@ mod tests {
         );
     }
 
+    /// The algebra, which is one gather and three names for it.
+    #[test]
+    fn the_three_algebra_commands_combine_scores_and_order_the_answer_once() {
+        let mut f = Fixture::new();
+        f.run(&[b"ZADD", b"z", b"1", b"a", b"2", b"b", b"3", b"c"]);
+        f.run(&[b"ZADD", b"y", b"10", b"b", b"20", b"d"]);
+        assert_eq!(
+            f.run(&[b"ZUNION", b"2", b"z", b"y"]),
+            "*4\r\n$1\r\na\r\n$1\r\nc\r\n$1\r\nb\r\n$1\r\nd\r\n"
+        );
+        // The scores are added where a member is in both, and the answer comes
+        // out in the order those combined scores put it in.
+        assert_eq!(
+            f.run(&[b"ZUNION", b"2", b"z", b"y", b"WITHSCORES"]),
+            "*8\r\n$1\r\na\r\n$1\r\n1\r\n$1\r\nc\r\n$1\r\n3\r\n$1\r\nb\r\n$2\r\n12\r\n$1\r\nd\r\n$2\r\n20\r\n"
+        );
+        assert_eq!(
+            f.run(&[
+                b"ZUNION",
+                b"2",
+                b"z",
+                b"y",
+                b"WEIGHTS",
+                b"2",
+                b"3",
+                b"WITHSCORES"
+            ]),
+            "*8\r\n$1\r\na\r\n$1\r\n2\r\n$1\r\nc\r\n$1\r\n6\r\n$1\r\nb\r\n$2\r\n34\r\n$1\r\nd\r\n$2\r\n60\r\n"
+        );
+        assert_eq!(
+            f.run(&[
+                b"ZUNION",
+                b"2",
+                b"z",
+                b"y",
+                b"AGGREGATE",
+                b"MIN",
+                b"WITHSCORES"
+            ]),
+            "*8\r\n$1\r\na\r\n$1\r\n1\r\n$1\r\nb\r\n$1\r\n2\r\n$1\r\nc\r\n$1\r\n3\r\n$1\r\nd\r\n$2\r\n20\r\n"
+        );
+        assert_eq!(
+            f.run(&[
+                b"ZUNION",
+                b"2",
+                b"z",
+                b"y",
+                b"AGGREGATE",
+                b"MAX",
+                b"WITHSCORES"
+            ]),
+            "*8\r\n$1\r\na\r\n$1\r\n1\r\n$1\r\nc\r\n$1\r\n3\r\n$1\r\nb\r\n$2\r\n10\r\n$1\r\nd\r\n$2\r\n20\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"ZINTER", b"2", b"z", b"y", b"WITHSCORES"]),
+            "*2\r\n$1\r\nb\r\n$2\r\n12\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"ZDIFF", b"2", b"z", b"y", b"WITHSCORES"]),
+            "*4\r\n$1\r\na\r\n$1\r\n1\r\n$1\r\nc\r\n$1\r\n3\r\n"
+        );
+        assert_eq!(f.run(&[b"ZUNION", b"1", b"nokey"]), "*0\r\n");
+        // A plain set is an input, and it behaves as a sorted set in which
+        // every member scores one.
+        f.run(&[b"SADD", b"p", b"a", b"d"]);
+        assert_eq!(
+            f.run(&[b"ZUNION", b"2", b"z", b"p", b"WITHSCORES"]),
+            "*8\r\n$1\r\nd\r\n$1\r\n1\r\n$1\r\na\r\n$1\r\n2\r\n$1\r\nb\r\n$1\r\n2\r\n$1\r\nc\r\n$1\r\n3\r\n"
+        );
+        // A difference never combines two scores, so it has nothing for either
+        // of the two options to do and refuses both.
+        for cmd in [
+            &[
+                b"ZDIFF".as_slice(),
+                b"2",
+                b"z",
+                b"y",
+                b"WEIGHTS",
+                b"1",
+                b"1",
+            ][..],
+            &[b"ZDIFF", b"2", b"z", b"y", b"AGGREGATE", b"MIN"],
+        ] {
+            assert_eq!(f.run(cmd), "-ERR syntax error\r\n", "{cmd:?}");
+        }
+    }
+
+    /// The count of keys, which is what lets a key be named `WEIGHTS`.
+    #[test]
+    fn the_algebra_counts_its_keys_and_says_so_when_the_count_is_wrong() {
+        let mut f = Fixture::new();
+        f.run(&[b"ZADD", b"z", b"1", b"a"]);
+        f.run(&[b"ZADD", b"y", b"2", b"b"]);
+        // Redis names the command in this one, so each spelling says its own.
+        assert_eq!(
+            f.run(&[b"ZUNION", b"0", b"z"]),
+            "-ERR at least 1 input key is needed for 'zunion' command\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"ZUNION", b"-1", b"z"]),
+            "-ERR at least 1 input key is needed for 'zunion' command\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"ZINTERCARD", b"0", b"z"]),
+            "-ERR at least 1 input key is needed for 'zintercard' command\r\n"
+        );
+        // A count bigger than the line is a plain syntax error, which reads
+        // oddly and is what Redis says.
+        assert_eq!(
+            f.run(&[b"ZUNION", b"3", b"z", b"y"]),
+            "-ERR syntax error\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"ZUNION", b"x", b"z"]),
+            "-ERR value is not an integer or out of range\r\n"
+        );
+        // A WEIGHTS list that is not one per key is a syntax error, and a
+        // weight that is not a number gets a sentence of its own.
+        assert_eq!(
+            f.run(&[b"ZUNION", b"2", b"z", b"y", b"WEIGHTS", b"1"]),
+            "-ERR syntax error\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"ZUNION", b"2", b"z", b"y", b"WEIGHTS", b"a", b"b"]),
+            "-ERR weight value is not a float\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"ZUNION", b"2", b"z", b"y", b"AGGREGATE", b"NOPE"]),
+            "-ERR syntax error\r\n"
+        );
+    }
+
+    /// The three store forms, which answer a count and take no WITHSCORES.
+    #[test]
+    fn the_algebra_stores_answer_a_count_and_delete_an_empty_destination() {
+        let mut f = Fixture::new();
+        f.run(&[b"ZADD", b"z", b"1", b"a", b"2", b"b", b"3", b"c"]);
+        f.run(&[b"ZADD", b"y", b"10", b"b", b"20", b"d"]);
+        assert_eq!(f.run(&[b"ZUNIONSTORE", b"d", b"2", b"z", b"y"]), ":4\r\n");
+        assert_eq!(
+            f.run(&[b"ZRANGE", b"d", b"0", b"-1", b"WITHSCORES"]),
+            "*8\r\n$1\r\na\r\n$1\r\n1\r\n$1\r\nc\r\n$1\r\n3\r\n$1\r\nb\r\n$2\r\n12\r\n$1\r\nd\r\n$2\r\n20\r\n"
+        );
+        assert_eq!(f.run(&[b"ZINTERSTORE", b"d", b"2", b"z", b"y"]), ":1\r\n");
+        assert_eq!(f.run(&[b"ZDIFFSTORE", b"d", b"2", b"z", b"y"]), ":2\r\n");
+        // An empty result deletes the destination rather than leaving an empty
+        // sorted set, because an empty one does not exist.
+        assert_eq!(
+            f.run(&[b"ZINTERSTORE", b"d", b"2", b"z", b"nokey"]),
+            ":0\r\n"
+        );
+        assert_eq!(f.run(&[b"EXISTS", b"d"]), ":0\r\n");
+        // The destination is allowed to name its own source.
+        assert_eq!(f.run(&[b"ZUNIONSTORE", b"z", b"2", b"z", b"y"]), ":4\r\n");
+        assert_eq!(f.run(&[b"ZCARD", b"z"]), ":4\r\n");
+        for cmd in [
+            &[
+                b"ZUNIONSTORE".as_slice(),
+                b"d",
+                b"2",
+                b"z",
+                b"y",
+                b"WITHSCORES",
+            ][..],
+            &[
+                b"ZDIFFSTORE",
+                b"d",
+                b"2",
+                b"z",
+                b"y",
+                b"WEIGHTS",
+                b"1",
+                b"1",
+            ],
+        ] {
+            assert_eq!(f.run(cmd), "-ERR syntax error\r\n", "{cmd:?}");
+        }
+    }
+
+    /// `ZINTERCARD`, which counts without building anything.
+    #[test]
+    fn intercard_counts_and_stops_at_its_limit() {
+        let mut f = Fixture::new();
+        f.run(&[b"ZADD", b"z", b"1", b"a", b"2", b"b", b"3", b"c"]);
+        f.run(&[b"ZADD", b"y", b"10", b"b", b"20", b"c", b"30", b"d"]);
+        assert_eq!(f.run(&[b"ZINTERCARD", b"2", b"z", b"y"]), ":2\r\n");
+        // A limit of zero is no limit, which is Redis's reading of it.
+        assert_eq!(
+            f.run(&[b"ZINTERCARD", b"2", b"z", b"y", b"LIMIT", b"0"]),
+            ":2\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"ZINTERCARD", b"2", b"z", b"y", b"LIMIT", b"1"]),
+            ":1\r\n"
+        );
+        // A negative limit and a limit that is not a number at all get the same
+        // sentence, which looks like a mistake in Redis and is copied as one.
+        let bad = "-ERR LIMIT can't be negative\r\n";
+        assert_eq!(
+            f.run(&[b"ZINTERCARD", b"2", b"z", b"y", b"LIMIT", b"-1"]),
+            bad
+        );
+        assert_eq!(
+            f.run(&[b"ZINTERCARD", b"2", b"z", b"y", b"LIMIT", b"x"]),
+            bad
+        );
+        for cmd in [
+            &[b"ZINTERCARD".as_slice(), b"3", b"z", b"y"][..],
+            &[b"ZINTERCARD", b"2", b"z", b"y", b"LIMIT"],
+            &[b"ZINTERCARD", b"2", b"z", b"y", b"junk", b"1"],
+        ] {
+            assert_eq!(f.run(cmd), "-ERR syntax error\r\n", "{cmd:?}");
+        }
+    }
+
+    /// `ZRANDMEMBER`, which answers two different shapes out of one name.
+    #[test]
+    fn a_draw_answers_one_member_or_an_array_of_them() {
+        let mut f = Fixture::new();
+        f.run(&[b"ZADD", b"z", b"1", b"a", b"2", b"b", b"3", b"c"]);
+        // No count is one member or a nil, a count is an array that may be
+        // empty, and those are two reply types the client has to tell apart.
+        assert_eq!(f.run(&[b"ZRANDMEMBER", b"nokey"]), "$-1\r\n");
+        assert_eq!(f.run(&[b"ZRANDMEMBER", b"nokey", b"3"]), "*0\r\n");
+        assert_eq!(f.run(&[b"ZRANDMEMBER", b"z", b"0"]), "*0\r\n");
+        assert!(f.run(&[b"ZRANDMEMBER", b"z"]).starts_with("$1\r\n"));
+        // A positive count draws without replacement, so a count over the size
+        // answers the whole set and never a member twice.
+        let all = f.run(&[b"ZRANDMEMBER", b"z", b"10"]);
+        assert!(all.starts_with("*3\r\n"), "{all}");
+        for m in ["a", "b", "c"] {
+            assert!(all.contains(m), "{all}");
+        }
+        // A negative one draws with replacement and answers exactly as many as
+        // it was asked for, whatever the size of the set.
+        assert!(
+            f.run(&[b"ZRANDMEMBER", b"z", b"-5"]).starts_with("*5\r\n"),
+            "five draws with replacement"
+        );
+        assert!(
+            f.run(&[b"ZRANDMEMBER", b"z", b"2", b"WITHSCORES"])
+                .starts_with("*4\r\n"),
+            "two pairs, flat on RESP2"
+        );
+        f.out = Out::new(Proto::Resp3);
+        let got = f.run(&[b"ZRANDMEMBER", b"z", b"2", b"WITHSCORES"]);
+        assert!(got.starts_with("*2\r\n*2\r\n"), "{got}");
+        assert_eq!(f.run(&[b"ZRANDMEMBER", b"nokey"]), "_\r\n");
+        f.out = Out::new(Proto::Resp2);
+        assert_eq!(
+            f.run(&[b"ZRANDMEMBER", b"z", b"2", b"junk"]),
+            "-ERR syntax error\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"ZRANDMEMBER", b"z", b"x"]),
+            "-ERR value is not an integer or out of range\r\n"
+        );
+    }
+
+    /// `ZSCAN`, and the one sorted set reply where a score is not a double.
+    #[test]
+    fn a_sorted_set_scan_answers_pairs_of_strings_on_both_protocols() {
+        let mut f = Fixture::new();
+        f.run(&[b"ZADD", b"z", b"1", b"a", b"2", b"b", b"3", b"c"]);
+        let all = "*2\r\n$1\r\n0\r\n*6\r\n$1\r\na\r\n$1\r\n1\r\n$1\r\nb\r\n$1\r\n2\r\n$1\r\nc\r\n$1\r\n3\r\n";
+        assert_eq!(f.run(&[b"ZSCAN", b"z", b"0"]), all);
+        assert_eq!(f.run(&[b"ZSCAN", b"z", b"0", b"COUNT", b"10"]), all);
+        assert_eq!(
+            f.run(&[b"ZSCAN", b"z", b"0", b"MATCH", b"a*"]),
+            "*2\r\n$1\r\n0\r\n*2\r\n$1\r\na\r\n$1\r\n1\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"ZSCAN", b"nokey", b"0"]),
+            "*2\r\n$1\r\n0\r\n*0\r\n"
+        );
+        // A score stays a bulk string on RESP3, which is the one place the two
+        // protocols agree about a score and everywhere else they do not.
+        f.out = Out::new(Proto::Resp3);
+        assert_eq!(f.run(&[b"ZSCAN", b"z", b"0"]), all);
+        f.out = Out::new(Proto::Resp2);
+        assert_eq!(
+            f.run(&[b"ZSCAN", b"z", b"0", b"NOVALUES"]),
+            "-ERR NOVALUES option can only be used in HSCAN\r\n"
+        );
+        assert_eq!(f.run(&[b"ZSCAN", b"z", b"-1"]), "-ERR invalid cursor\r\n");
+        assert_eq!(
+            f.run(&[b"ZSCAN", b"z", b"0", b"COUNT", b"0"]),
+            "-ERR syntax error\r\n"
+        );
+    }
+
     #[test]
     fn every_sorted_set_command_says_wrongtype_and_writes_nothing() {
         let mut f = Fixture::new();
@@ -4356,6 +4647,15 @@ mod tests {
             &[b"ZREMRANGEBYRANK", b"s", b"0", b"-1"],
             &[b"ZREMRANGEBYSCORE", b"s", b"1", b"2"],
             &[b"ZREMRANGEBYLEX", b"s", b"-", b"+"],
+            &[b"ZUNION", b"1", b"s"],
+            &[b"ZINTER", b"1", b"s"],
+            &[b"ZDIFF", b"1", b"s"],
+            &[b"ZUNIONSTORE", b"d", b"1", b"s"],
+            &[b"ZINTERSTORE", b"d", b"1", b"s"],
+            &[b"ZDIFFSTORE", b"d", b"1", b"s"],
+            &[b"ZINTERCARD", b"1", b"s"],
+            &[b"ZRANDMEMBER", b"s"],
+            &[b"ZSCAN", b"s", b"0"],
         ] {
             assert_eq!(f.run(cmd), wrong, "{:?}", cmd[0]);
         }

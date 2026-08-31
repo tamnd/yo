@@ -99,6 +99,11 @@ const AC_ZSET_WRITE_FAST: &[&str] = &["@write", "@sortedset", "@fast"];
 /// The sorted set write side for the ones whose cost is the size of the window
 /// they touch, which is the removals and `ZRANGESTORE`.
 const AC_ZSET_WRITE_SLOW: &[&str] = &["@write", "@sortedset", "@slow"];
+/// Read only and not counted as fast, for a command whose keys are counted
+/// rather than positioned, so a client has to read the key specs to route it.
+const READ_MOVABLE: &[&str] = &["readonly", "movablekeys"];
+/// The same for a write, which is the three store forms.
+const WRITE_MOVABLE: &[&str] = &["write", "denyoom", "movablekeys"];
 /// The connection commands' categories.
 const AC_CONN: &[&str] = &["@fast", "@connection"];
 /// The keyspace read side, which is `EXISTS` and `TYPE`.
@@ -610,8 +615,9 @@ pub static COMMANDS: &[Spec] = &[
         // The only set command whose keys are counted rather than positioned,
         // so the legacy key range cannot describe it and Redis reports zeroes
         // in these three fields too. A client that wants the keys reads the key
-        // specs, which is what the count is for.
-        flags: &["readonly"],
+        // specs, which is what the count is for, and movablekeys is how it is
+        // told to go and read them.
+        flags: READ_MOVABLE,
         first_key: 0,
         last_key: 0,
         step: 0,
@@ -1613,6 +1619,123 @@ pub static COMMANDS: &[Spec] = &[
         since: "2.8.9",
         complexity: "O(log(N)+M) with M the number of members removed",
         summary: "Remove the members that fall between two names.",
+        group: "zset",
+    },
+    Spec {
+        name: "zunion",
+        arity: -3,
+        flags: READ_MOVABLE,
+        first_key: 0,
+        last_key: 0,
+        step: 0,
+        acl: AC_ZSET_READ_SLOW,
+        since: "6.2.0",
+        complexity: "O(N)+O(M*log(M)) with N the total number of members and M the number in the answer",
+        summary: "Every member of these sorted sets, with the scores combined.",
+        group: "zset",
+    },
+    Spec {
+        name: "zinter",
+        arity: -3,
+        flags: READ_MOVABLE,
+        first_key: 0,
+        last_key: 0,
+        step: 0,
+        acl: AC_ZSET_READ_SLOW,
+        since: "6.2.0",
+        complexity: "O(N)+O(M*log(M)) with N the total number of members and M the number in the answer",
+        summary: "Only the members all of these sorted sets have, with the scores combined.",
+        group: "zset",
+    },
+    Spec {
+        name: "zdiff",
+        arity: -3,
+        flags: READ_MOVABLE,
+        first_key: 0,
+        last_key: 0,
+        step: 0,
+        acl: AC_ZSET_READ_SLOW,
+        since: "6.2.0",
+        complexity: "O(N)+O(M*log(M)) with N the total number of members and M the number in the answer",
+        summary: "The members of the first that none of the rest have.",
+        group: "zset",
+    },
+    Spec {
+        name: "zunionstore",
+        arity: -4,
+        flags: WRITE_MOVABLE,
+        first_key: 1,
+        last_key: 1,
+        step: 1,
+        acl: AC_ZSET_WRITE_SLOW,
+        since: "2.0.0",
+        complexity: "O(N)+O(M*log(M)) with N the total number of members and M the number in the answer",
+        summary: "Store the union in another key and say how big it is.",
+        group: "zset",
+    },
+    Spec {
+        name: "zinterstore",
+        arity: -4,
+        flags: WRITE_MOVABLE,
+        first_key: 1,
+        last_key: 1,
+        step: 1,
+        acl: AC_ZSET_WRITE_SLOW,
+        since: "2.0.0",
+        complexity: "O(N)+O(M*log(M)) with N the total number of members and M the number in the answer",
+        summary: "Store the intersection in another key and say how big it is.",
+        group: "zset",
+    },
+    Spec {
+        name: "zdiffstore",
+        arity: -4,
+        flags: WRITE_MOVABLE,
+        first_key: 1,
+        last_key: 1,
+        step: 1,
+        acl: AC_ZSET_WRITE_SLOW,
+        since: "6.2.0",
+        complexity: "O(N)+O(M*log(M)) with N the total number of members and M the number in the answer",
+        summary: "Store the difference in another key and say how big it is.",
+        group: "zset",
+    },
+    Spec {
+        name: "zintercard",
+        arity: -3,
+        flags: READ_MOVABLE,
+        first_key: 0,
+        last_key: 0,
+        step: 0,
+        acl: AC_ZSET_READ_SLOW,
+        since: "7.0.0",
+        complexity: "O(N*M) worst case, N the smallest input and M the number of inputs",
+        summary: "How many members the intersection would have, without building it.",
+        group: "zset",
+    },
+    Spec {
+        name: "zrandmember",
+        arity: -2,
+        flags: READ_SLOW,
+        first_key: 1,
+        last_key: 1,
+        step: 1,
+        acl: AC_ZSET_READ_SLOW,
+        since: "6.2.0",
+        complexity: "O(N) with N the number of members drawn",
+        summary: "Draw members at random, with or without replacement.",
+        group: "zset",
+    },
+    Spec {
+        name: "zscan",
+        arity: -3,
+        flags: READ_SLOW,
+        first_key: 1,
+        last_key: 1,
+        step: 1,
+        acl: AC_ZSET_READ_SLOW,
+        since: "2.8.0",
+        complexity: "O(1) per call, O(N) over a full walk",
+        summary: "Walk the members and their scores a batch at a time.",
         group: "zset",
     },
     // ------------------------------------------------------------ keyspace
