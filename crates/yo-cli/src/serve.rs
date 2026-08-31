@@ -160,6 +160,30 @@ enum Door {
 }
 
 impl Door {
+    /// The listener behind this door, when the door is a port and not a socket
+    /// file.
+    ///
+    /// This is a method and not a `match` at the one place that needs it,
+    /// because on a platform with no unix sockets `Door` has a single variant
+    /// and every shape of that `match` written inline is a lint: an `if let` is
+    /// irrefutable, a loop around it never loops, and a closure that only ever
+    /// answers `Some` is a `map` wearing a `find_map`. Behind a call the caller
+    /// reads the same on every platform and clippy has nothing to say.
+    fn tcp(&self) -> Option<&TcpListener> {
+        #[cfg(unix)]
+        {
+            match self {
+                Door::Tcp(l) => Some(l),
+                Door::Unix(..) => None,
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let Door::Tcp(l) = self;
+            Some(l)
+        }
+    }
+
     /// Take one waiting connection, already set up the way the loop wants it.
     fn accept(&self) -> io::Result<Sock> {
         match self {
@@ -345,19 +369,13 @@ impl Server {
     ///
     /// Whatever the socket says.
     pub fn local_addr(&self) -> io::Result<SocketAddr> {
-        for door in &self.doors {
-            // A match and not an `if let`, because on a platform with no unix
-            // sockets `Door` has one variant and an `if let` over it is a lint.
-            match door {
-                Door::Tcp(l) => return l.local_addr(),
-                #[cfg(unix)]
-                Door::Unix(..) => {}
-            }
+        match self.doors.iter().find_map(Door::tcp) {
+            Some(l) => l.local_addr(),
+            None => Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "this server has no port, only a socket file",
+            )),
         }
-        Err(io::Error::new(
-            io::ErrorKind::NotFound,
-            "this server has no port, only a socket file",
-        ))
     }
 
     /// Turn the loop until `stop` is set.

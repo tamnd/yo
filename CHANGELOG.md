@@ -6,7 +6,13 @@ While the major is 0, a minor release may break anything, including the on-disk 
 
 ## Unreleased
 
+### Fixed
+
+- **`local_addr` lints clean on Windows, this time for real.** Picking the TCP door out of the list is one `match` on a mac and a lint on Windows, where `Door` has a single variant, and the last two attempts each traded one lint for the next: an irrefutable `if let`, then a loop that never loops, then a closure that only ever answers `Some`. It is a `Door::tcp` method now with the platform difference inside it, so the caller reads the same everywhere.
+
 ### Added
+
+- **`cargo xtask cross`, which lints for the platforms the laptop is not.** Three release runs in a row went red on a lint that cannot fire on a mac, and each one cost a push and a wait to find. Clippy stops after analysis, so linting for another target needs that target's standard library and nothing else, and `rustup target add` is the whole setup. This runs the workspace through clippy for `x86_64-pc-windows-msvc` and `x86_64-unknown-linux-gnu` in about a minute. It does not pass `--all-targets`, because that pulls in criterion, whose `alloca` has a C build script that wants a real MSVC, and the benches are not where the platform code is.
 
 - **Everything a list command needs to change a list in the middle.** The list type could be pushed and popped and read, which covers the queue and the stack and nothing else. It can now insert at an index or beside a pivot, overwrite an element, find one, list the positions of one with a rank, a count and a maximum scan, remove a number of matches from either end, trim to a window, and walk backwards. That is `LINSERT`, `LSET`, `LPOS`, `LREM`, `LTRIM` and the negative index half of `LRANGE`, all of it in the library and none of it on the wire yet.
 - **A chunk can be cut in half in one copy.** Inserting into the middle of a full chunk splits it, which in Redis is `_quicklistSplitNode`, and the entries are already a contiguous run in the encoding the new chunk wants, so the split is one `Chunk::adopt` of the tail and two integer writes on the head. A replace whose new value encodes to the same length is written straight over the old one and never splits at all.
