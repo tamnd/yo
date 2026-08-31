@@ -25,6 +25,7 @@ use yo_index::RawMap;
 
 use crate::Clock;
 use crate::hash::{self, Hash};
+use crate::list::{self, List};
 use crate::set::{self, Set};
 use crate::slab::Slab;
 use crate::ttl::{self, Applied, Ask, Cond};
@@ -46,6 +47,8 @@ pub struct Keyspace {
     /// says which slab to look in, so the discriminant would be a second copy
     /// of a fact the record has.
     pub(crate) hashes: Slab<Hash>,
+    /// Every list in this database, addressed the same way.
+    pub(crate) lists: Slab<List>,
     /// How many keys hold something that is not a string.
     ///
     /// This exists so that a database of nothing but strings, which is every
@@ -57,6 +60,8 @@ pub struct Keyspace {
     pub(crate) limits: set::Limits,
     /// Where a hash changes representation.
     pub(crate) hash_limits: hash::Limits,
+    /// Where a list changes representation.
+    pub(crate) list_limits: list::Limits,
     /// Where `SPOP` and `SRANDMEMBER` draw from.
     pub(crate) rng: Rng,
     /// The last collection key that was resolved, for the command behind it.
@@ -173,9 +178,11 @@ impl Keyspace {
             expired: 0,
             sets: Slab::new(),
             hashes: Slab::new(),
+            lists: Slab::new(),
             bodies: 0,
             limits: set::Limits::DEFAULT,
             hash_limits: hash::Limits::DEFAULT,
+            list_limits: list::Limits::default(),
             rng: Rng::new(clock.now_ms() ^ made.wrapping_mul(0x9e37_79b9_7f4a_7c15)),
             memo: Memo::empty(),
         }
@@ -226,6 +233,23 @@ impl Keyspace {
     #[inline]
     pub const fn set_hash_limits(&mut self, limits: hash::Limits) {
         self.hash_limits = limits;
+    }
+
+    /// Where a list changes representation, which is one `CONFIG` value.
+    #[inline]
+    pub const fn list_limits(&self) -> &list::Limits {
+        &self.list_limits
+    }
+
+    /// Change where a list changes representation.
+    ///
+    /// Same rule again: this decides what the next `LPUSH` builds and leaves
+    /// every list that already exists alone. `list-max-listpack-size` is one
+    /// number rather than two, and [`list::Limits::of`] is what turns it into
+    /// the pair this holds.
+    #[inline]
+    pub const fn set_list_limits(&mut self, limits: list::Limits) {
+        self.list_limits = limits;
     }
 
     /// The clock expiry compares against.
@@ -314,6 +338,20 @@ impl Keyspace {
         Some(self.hashes.get(at)?.encoding())
     }
 
+    /// How a list is represented, or `None` if `key` is not a list.
+    ///
+    /// The same shape as [`Keyspace::set_encoding`], and the same argument for
+    /// asking the body rather than reading a copy out of the record.
+    pub fn list_encoding(&mut self, key: &[u8]) -> Option<list::Encoding> {
+        self.reap(key);
+        let rec = self.map.get(key)?;
+        if value::kind(rec) != Kind::List {
+            return None;
+        }
+        let at = value::slot(rec);
+        Some(self.lists.get(at)?.encoding())
+    }
+
     /// `OBJECT ENCODING key`, as the word Redis puts on the wire.
     ///
     /// One place that knows every type's answer, so that adding the hash means
@@ -324,6 +362,7 @@ impl Keyspace {
             Kind::String => self.encoding(key).map(value::Encoding::name),
             Kind::Set => self.set_encoding(key).map(set::Encoding::name),
             Kind::Hash => self.hash_encoding(key).map(hash::Encoding::name),
+            Kind::List => self.list_encoding(key).map(list::Encoding::name),
             other => unreachable!("nothing can store a {} yet", other.name()),
         }
     }
@@ -356,7 +395,7 @@ impl Keyspace {
             // Every body type writes the same record: a tag and a slot number.
             // The body is not touched and does not need to be, which is the
             // whole point of keeping it out of the record.
-            kind @ (Kind::Set | Kind::Hash) => {
+            kind @ (Kind::Set | Kind::Hash | Kind::List) => {
                 let slot = value::slot(rec);
                 let len = value::slot_record_len(at.is_some());
                 self.map.set_with(key, len, |out| {
@@ -463,6 +502,11 @@ impl Keyspace {
             Kind::Hash => {
                 let at = value::slot(rec);
                 self.hashes.remove(at);
+                self.bodies -= 1;
+            }
+            Kind::List => {
+                let at = value::slot(rec);
+                self.lists.remove(at);
                 self.bodies -= 1;
             }
             other => unreachable!("nothing can store a {} yet", other.name()),
@@ -577,6 +621,7 @@ impl Keyspace {
         self.map.clear();
         self.sets.clear();
         self.hashes.clear();
+        self.lists.clear();
         self.bodies = 0;
     }
 
@@ -599,6 +644,8 @@ impl Keyspace {
             + self.sets.iter().map(Set::memory_bytes).sum::<usize>()
             + self.hashes.memory_bytes()
             + self.hashes.iter().map(Hash::memory_bytes).sum::<usize>()
+            + self.lists.memory_bytes()
+            + self.lists.iter().map(List::memory_bytes).sum::<usize>()
     }
 
     /// Give back one segment's worth of space if one has gone mostly dead.

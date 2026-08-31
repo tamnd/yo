@@ -367,33 +367,41 @@ impl List {
     /// limit. The indexes handed back are always from the front, whichever way
     /// the walk went, because that is what the client can use.
     ///
-    /// The answers go into `out` rather than into a fresh vector, because this
-    /// runs on a shard thread and a shard thread that allocates aborts.
+    /// Each answer is handed to `found` as it is discovered, and the number of
+    /// them comes back, because this runs on a shard thread and a shard thread
+    /// that allocates aborts. The wire writes each position straight into the
+    /// reply buffer and never holds a list of them at all.
+    ///
+    /// `found` is a `dyn` call rather than a generic, so that the two walks
+    /// below stay one body. Monomorphising this over the sink would double a
+    /// function whose whole cost is the comparison inside it.
     pub fn positions(
         &self,
         value: &[u8],
         rank: i64,
         count: usize,
         maxlen: usize,
-        out: &mut Vec<usize>,
-    ) {
+        found: &mut dyn FnMut(usize),
+    ) -> usize {
         if rank == 0 {
-            return;
+            return 0;
         }
         let as_int = yo_common::num::parse_i64(value);
         let len = self.len();
         let skip = rank.unsigned_abs() as usize - 1;
         let mut seen = 0usize;
         let mut looked = 0usize;
+        let mut hits = 0usize;
         // One loop over one of the two walks, with the index worked out from
         // whichever end the walk started at.
-        let mut take = |at: usize, e: Element<'_>, out: &mut Vec<usize>| -> bool {
+        let mut take = |at: usize, e: Element<'_>| -> bool {
             looked += 1;
             if e.is(value, as_int) {
                 seen += 1;
                 if seen > skip {
-                    out.push(at);
-                    if count != 0 && out.len() >= count {
+                    found(at);
+                    hits += 1;
+                    if count != 0 && hits >= count {
                         return false;
                     }
                 }
@@ -402,17 +410,18 @@ impl List {
         };
         if rank > 0 {
             for (at, e) in self.iter().enumerate() {
-                if !take(at, e, out) {
+                if !take(at, e) {
                     break;
                 }
             }
         } else {
             for (back, e) in self.iter_back().enumerate() {
-                if !take(len - back - 1, e, out) {
+                if !take(len - back - 1, e) {
                     break;
                 }
             }
         }
+        hits
     }
 
     /// Take out up to `count` elements equal to `value`, which is `LREM`.
@@ -1386,39 +1395,39 @@ mod tests {
             let base = l.len() - 5;
             let mut out = Vec::new();
 
-            l.positions(b"a", 1, 1, 0, &mut out);
+            l.positions(b"a", 1, 1, 0, &mut |at| out.push(at));
             assert_eq!(out, vec![base], "{band:?}");
 
             out.clear();
-            l.positions(b"a", 2, 1, 0, &mut out);
+            l.positions(b"a", 2, 1, 0, &mut |at| out.push(at));
             assert_eq!(out, vec![base + 2], "the second from the front");
 
             out.clear();
-            l.positions(b"a", -1, 1, 0, &mut out);
+            l.positions(b"a", -1, 1, 0, &mut |at| out.push(at));
             assert_eq!(out, vec![base + 4], "the first from the back");
 
             out.clear();
-            l.positions(b"a", -2, 1, 0, &mut out);
+            l.positions(b"a", -2, 1, 0, &mut |at| out.push(at));
             assert_eq!(out, vec![base + 2], "the second from the back");
 
             out.clear();
-            l.positions(b"a", 1, 0, 0, &mut out);
+            l.positions(b"a", 1, 0, 0, &mut |at| out.push(at));
             assert_eq!(out, vec![base, base + 2, base + 4], "all of them");
 
             out.clear();
-            l.positions(b"a", -1, 0, 0, &mut out);
+            l.positions(b"a", -1, 0, 0, &mut |at| out.push(at));
             assert_eq!(out, vec![base + 4, base + 2, base], "all of them backward");
 
             out.clear();
-            l.positions(b"a", 1, 2, 0, &mut out);
+            l.positions(b"a", 1, 2, 0, &mut |at| out.push(at));
             assert_eq!(out, vec![base, base + 2], "two of them");
 
             out.clear();
-            l.positions(b"nothing like it", 1, 0, 0, &mut out);
+            l.positions(b"nothing like it", 1, 0, 0, &mut |at| out.push(at));
             assert!(out.is_empty());
 
             out.clear();
-            l.positions(b"a", 0, 0, 0, &mut out);
+            l.positions(b"a", 0, 0, 0, &mut |at| out.push(at));
             assert!(out.is_empty(), "a rank of zero is not a rank");
         }
     }
@@ -1441,13 +1450,13 @@ mod tests {
             );
         }
         let mut out = Vec::new();
-        l.positions(b"x", 1, 0, 10, &mut out);
+        l.positions(b"x", 1, 0, 10, &mut |at| out.push(at));
         assert!(out.is_empty(), "ten comparisons do not reach the sixteenth");
         out.clear();
-        l.positions(b"x", 1, 0, 16, &mut out);
+        l.positions(b"x", 1, 0, 16, &mut |at| out.push(at));
         assert_eq!(out, vec![15]);
         out.clear();
-        l.positions(b"x", -1, 0, 5, &mut out);
+        l.positions(b"x", -1, 0, 5, &mut |at| out.push(at));
         assert_eq!(out, vec![15], "five from the back does reach it");
     }
 
