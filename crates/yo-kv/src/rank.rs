@@ -106,7 +106,9 @@ struct Rows {
 
 impl Rows {
     fn with_room() -> Self {
-        Self { at: Vec::with_capacity(LEAF_MAX * 3) }
+        Self {
+            at: Vec::with_capacity(LEAF_MAX * 3),
+        }
     }
 
     fn len(&self) -> usize {
@@ -240,7 +242,11 @@ impl Rank {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            leaves: vec![Leaf { rows: Rows::with_room(), prev: NIL, next: NIL }],
+            leaves: vec![Leaf {
+                rows: Rows::with_room(),
+                prev: NIL,
+                next: NIL,
+            }],
             branches: Vec::new(),
             free_leaves: Vec::new(),
             free_branches: Vec::new(),
@@ -351,7 +357,11 @@ impl Rank {
     /// If the rank is past the end. Ranks up to and including [`Rank::len`] are
     /// fine, because appending is inserting at the end.
     pub fn insert_at(&mut self, rank: usize, row: u32) {
-        assert!(rank <= self.len, "rank {rank} is past the end of {}", self.len);
+        assert!(
+            rank <= self.len,
+            "rank {rank} is past the end of {}",
+            self.len
+        );
         let split = if self.depth == 0 {
             self.leaf_insert(self.root, rank, row)
         } else {
@@ -381,7 +391,11 @@ impl Rank {
     ///
     /// If the rank is past the end.
     pub fn remove_at(&mut self, rank: usize) -> u32 {
-        assert!(rank < self.len, "rank {rank} is past the end of {}", self.len);
+        assert!(
+            rank < self.len,
+            "rank {rank} is past the end of {}",
+            self.len
+        );
         let row = if self.depth == 0 {
             let leaf = &mut self.leaves[self.root as usize];
             leaf.rows.remove(rank)
@@ -411,7 +425,11 @@ impl Rank {
     ///
     /// If the rank is past the end.
     pub fn set_at(&mut self, rank: usize, row: u32) {
-        assert!(rank < self.len, "rank {rank} is past the end of {}", self.len);
+        assert!(
+            rank < self.len,
+            "rank {rank} is past the end of {}",
+            self.len
+        );
         let mut node = self.root;
         let mut at = rank;
         for _ in 0..self.depth {
@@ -438,20 +456,40 @@ impl Rank {
     #[must_use]
     pub fn iter_from(&self, rank: usize) -> Walk<'_> {
         if rank >= self.len {
-            return Walk { tree: self, leaf: NIL, at: 0, left: 0 };
+            return Walk {
+                tree: self,
+                leaf: NIL,
+                at: 0,
+                left: 0,
+            };
         }
         let (leaf, at) = self.find(rank);
-        Walk { tree: self, leaf, at, left: self.len - rank }
+        Walk {
+            tree: self,
+            leaf,
+            at,
+            left: self.len - rank,
+        }
     }
 
     /// Walk rows backwards from a rank.
     #[must_use]
     pub fn iter_back_from(&self, rank: usize) -> Back<'_> {
         if rank >= self.len {
-            return Back { tree: self, leaf: NIL, at: 0, left: 0 };
+            return Back {
+                tree: self,
+                leaf: NIL,
+                at: 0,
+                left: 0,
+            };
         }
         let (leaf, at) = self.find(rank);
-        Back { tree: self, leaf, at, left: rank + 1 }
+        Back {
+            tree: self,
+            leaf,
+            at,
+            left: rank + 1,
+        }
     }
 
     /// Insert into a leaf, and say what came out of it if it was full.
@@ -468,7 +506,11 @@ impl Rank {
             let new = self.take_leaf();
             self.leaves[new as usize].rows.push(row);
             self.link_after(id, new);
-            return Some(Split { node: new, count: 1, first: row });
+            return Some(Split {
+                node: new,
+                count: 1,
+                first: row,
+            });
         }
         // Same at the other end, except that what moves is the full leaf rather
         // than the new row, because the parent already has this node in its kid
@@ -482,7 +524,11 @@ impl Rank {
             self.leaves[new as usize].rows = full;
             self.leaves[id as usize].rows.push(row);
             self.link_after(id, new);
-            return Some(Split { node: new, count, first });
+            return Some(Split {
+                node: new,
+                count,
+                first,
+            });
         }
         let new = self.take_leaf();
         let tail = self.leaves[id as usize].rows.split_off(LEAF_MAX / 2);
@@ -491,11 +537,17 @@ impl Rank {
         if at <= LEAF_MAX / 2 {
             self.leaves[id as usize].rows.insert(at, row);
         } else {
-            self.leaves[new as usize].rows.insert(at - LEAF_MAX / 2, row);
+            self.leaves[new as usize]
+                .rows
+                .insert(at - LEAF_MAX / 2, row);
         }
         let first = self.leaves[new as usize].rows.get(0);
         let count = self.leaves[new as usize].rows.len() as u32;
-        Some(Split { node: new, count, first })
+        Some(Split {
+            node: new,
+            count,
+            first,
+        })
     }
 
     /// Insert under a branch, and say what came out of it if it was full.
@@ -557,7 +609,11 @@ impl Rank {
         b.kids = kids;
         b.counts = counts;
         b.firsts = firsts;
-        Some(Split { node: new, count, first })
+        Some(Split {
+            node: new,
+            count,
+            first,
+        })
     }
 
     /// Remove from under a branch and put right whatever that emptied.
@@ -702,7 +758,11 @@ impl Rank {
         if let Some(id) = self.free_leaves.pop() {
             return id;
         }
-        self.leaves.push(Leaf { rows: Rows::with_room(), prev: NIL, next: NIL });
+        self.leaves.push(Leaf {
+            rows: Rows::with_room(),
+            prev: NIL,
+            next: NIL,
+        });
         (self.leaves.len() - 1) as u32
     }
 
@@ -718,7 +778,11 @@ impl Rank {
         if let Some(id) = self.free_branches.pop() {
             return id;
         }
-        self.branches.push(Branch { kids: Vec::new(), counts: Vec::new(), firsts: Vec::new() });
+        self.branches.push(Branch {
+            kids: Vec::new(),
+            counts: Vec::new(),
+            firsts: Vec::new(),
+        });
         (self.branches.len() - 1) as u32
     }
 
@@ -844,7 +908,10 @@ mod tests {
     /// but the root has something in it, and the links agree with the tree.
     fn sound(tree: &Rank) {
         let total = check(tree, tree.root, tree.depth);
-        assert_eq!(total, tree.len, "the root's counts do not add up to the length");
+        assert_eq!(
+            total, tree.len,
+            "the root's counts do not add up to the length"
+        );
         let mut walked = 0;
         let mut at = tree.head;
         let mut prev = NIL;
@@ -867,8 +934,15 @@ mod tests {
         let mut total = 0;
         for (i, &kid) in b.kids.iter().enumerate() {
             let under = check(tree, kid, level - 1);
-            assert_eq!(under, b.counts[i] as usize, "a count does not match what is under it");
-            assert_eq!(b.firsts[i], tree.first_of(kid, level - 1), "a first row is stale");
+            assert_eq!(
+                under, b.counts[i] as usize,
+                "a count does not match what is under it"
+            );
+            assert_eq!(
+                b.firsts[i],
+                tree.first_of(kid, level - 1),
+                "a first row is stale"
+            );
             total += under;
         }
         total

@@ -415,29 +415,28 @@ pub fn execute(server: &mut Server, session: &mut Session, args: Args<'_>, out: 
         blocking::execute(server, session, spec, args, out)
     } else {
         match spec.group {
-        "string" => {
-            let db = session.db;
-            strings::execute(&mut server.dbs[db], spec, args, out).map(|()| Flow::Continue)
-        }
-        "set" => {
-            let db = session.db;
-            sets::execute(&mut server.dbs[db], spec, args, out).map(|()| Flow::Continue)
-        }
-        "hash" => {
-            let db = session.db;
-            hashes::execute(&mut server.dbs[db], spec, args, out).map(|()| Flow::Continue)
-        }
-        "list" => {
-            let db = session.db;
-            lists::execute(&mut server.dbs[db], spec, args, out).map(|()| Flow::Continue)
-        }
-        // Every database and not the one the session is on, because `COPY` takes
-        // a `DB n` and writes into a database nobody selected.
-        "keyspace" => {
-            keyspace::execute(&mut server.dbs, session.db, spec, args, out).map(|()| Flow::Continue)
-        }
-        "scripting" => scripting::execute(spec, args, out).map(|()| Flow::Continue),
-        _ => server::execute(server, session, spec, args, out),
+            "string" => {
+                let db = session.db;
+                strings::execute(&mut server.dbs[db], spec, args, out).map(|()| Flow::Continue)
+            }
+            "set" => {
+                let db = session.db;
+                sets::execute(&mut server.dbs[db], spec, args, out).map(|()| Flow::Continue)
+            }
+            "hash" => {
+                let db = session.db;
+                hashes::execute(&mut server.dbs[db], spec, args, out).map(|()| Flow::Continue)
+            }
+            "list" => {
+                let db = session.db;
+                lists::execute(&mut server.dbs[db], spec, args, out).map(|()| Flow::Continue)
+            }
+            // Every database and not the one the session is on, because `COPY` takes
+            // a `DB n` and writes into a database nobody selected.
+            "keyspace" => keyspace::execute(&mut server.dbs, session.db, spec, args, out)
+                .map(|()| Flow::Continue),
+            "scripting" => scripting::execute(spec, args, out).map(|()| Flow::Continue),
+            _ => server::execute(server, session, spec, args, out),
         }
     };
     match done {
@@ -3660,8 +3659,14 @@ mod tests {
             (&[b"BLPOP", b"k", b"inf"], range),
             (&[b"BLPOP", b"k", b"9999999999999999"], range),
             (&[b"BRPOP", b"k", b"abc"], not_float),
-            (&[b"BLMOVE", b"a", b"b", b"LEFT", b"RIGHT", b"abc"], not_float),
-            (&[b"BRPOPLPUSH", b"a", b"b", b"-1"], "-ERR timeout is negative\r\n"),
+            (
+                &[b"BLMOVE", b"a", b"b", b"LEFT", b"RIGHT", b"abc"],
+                not_float,
+            ),
+            (
+                &[b"BRPOPLPUSH", b"a", b"b", b"-1"],
+                "-ERR timeout is negative\r\n",
+            ),
             (&[b"BLMPOP", b"abc", b"1", b"k", b"LEFT"], not_float),
         ] {
             assert_eq!(f.run(bad), want, "for {bad:?}");
@@ -3697,19 +3702,34 @@ mod tests {
             f.flow(&[b"BLPOP", b"nope", b"L", b"0"]),
             (Flow::Continue, "*2\r\n$1\r\nL\r\n$1\r\na\r\n".to_owned())
         );
-        assert_eq!(f.run(&[b"BRPOP", b"L", b"0"]), "*2\r\n$1\r\nL\r\n$1\r\ne\r\n");
         assert_eq!(
-            f.run(&[b"BLMPOP", b"0", b"2", b"nope", b"L", b"LEFT", b"COUNT", b"2"]),
+            f.run(&[b"BRPOP", b"L", b"0"]),
+            "*2\r\n$1\r\nL\r\n$1\r\ne\r\n"
+        );
+        assert_eq!(
+            f.run(&[
+                b"BLMPOP", b"0", b"2", b"nope", b"L", b"LEFT", b"COUNT", b"2"
+            ]),
             "*2\r\n$1\r\nL\r\n*2\r\n$1\r\nb\r\n$1\r\nc\r\n"
         );
-        assert_eq!(f.run(&[b"BLMOVE", b"L", b"D", b"LEFT", b"RIGHT", b"0"]), "$1\r\nd\r\n");
-        assert_eq!(f.run(&[b"EXISTS", b"L"]), ":0\r\n", "and the key went with it");
+        assert_eq!(
+            f.run(&[b"BLMOVE", b"L", b"D", b"LEFT", b"RIGHT", b"0"]),
+            "$1\r\nd\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"EXISTS", b"L"]),
+            ":0\r\n",
+            "and the key went with it"
+        );
         assert_eq!(f.run(&[b"LRANGE", b"D", b"0", b"-1"]), "*1\r\n$1\r\nd\r\n");
         // Onto itself, which is how a list is rotated and is a real thing to ask
         // a blocking move for.
         f.run(&[b"RPUSH", b"D", b"x"]);
         assert_eq!(f.run(&[b"BRPOPLPUSH", b"D", b"D", b"0"]), "$1\r\nx\r\n");
-        assert_eq!(f.run(&[b"LRANGE", b"D", b"0", b"-1"]), "*2\r\n$1\r\nx\r\n$1\r\nd\r\n");
+        assert_eq!(
+            f.run(&[b"LRANGE", b"D", b"0", b"-1"]),
+            "*2\r\n$1\r\nx\r\n$1\r\nd\r\n"
+        );
     }
 
     #[test]
@@ -3727,9 +3747,18 @@ mod tests {
             ),
             // Two keys named and one given, so the word that should have been
             // the direction is a key and there is no direction left.
-            (&[b"BLMPOP", b"0", b"2", b"k", b"LEFT"], "-ERR syntax error\r\n"),
-            (&[b"BLMPOP", b"0", b"1", b"k", b"SIDEWAYS"], "-ERR syntax error\r\n"),
-            (&[b"BLMPOP", b"0", b"1", b"k", b"LEFT", b"COUNT"], "-ERR syntax error\r\n"),
+            (
+                &[b"BLMPOP", b"0", b"2", b"k", b"LEFT"],
+                "-ERR syntax error\r\n",
+            ),
+            (
+                &[b"BLMPOP", b"0", b"1", b"k", b"SIDEWAYS"],
+                "-ERR syntax error\r\n",
+            ),
+            (
+                &[b"BLMPOP", b"0", b"1", b"k", b"LEFT", b"COUNT"],
+                "-ERR syntax error\r\n",
+            ),
             (
                 &[b"BLMPOP", b"0", b"1", b"k", b"LEFT", b"COUNT", b"2", b"x"],
                 "-ERR syntax error\r\n",
@@ -3789,7 +3818,11 @@ mod tests {
         // And the one that does not: an empty source means the destination is
         // never looked at, so this waits rather than erroring, and on a real
         // server it times out.
-        assert_eq!(f.flow(&[b"BLMOVE", b"E", b"S", b"LEFT", b"RIGHT", b"0.1"]).0, Flow::Block);
+        assert_eq!(
+            f.flow(&[b"BLMOVE", b"E", b"S", b"LEFT", b"RIGHT", b"0.1"])
+                .0,
+            Flow::Block
+        );
     }
 
     /// The same churn the set and the string get, because a list that leaks a

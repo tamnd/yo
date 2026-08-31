@@ -1357,7 +1357,8 @@ mod tests {
         r.engine_mut().feed(a, &wire(&[b"BLPOP", b"q", b"0"]));
         pump(&mut r, &mut batch);
 
-        r.engine_mut().feed(b, &wire(&[b"RPUSH", b"elsewhere", b"x"]));
+        r.engine_mut()
+            .feed(b, &wire(&[b"RPUSH", b"elsewhere", b"x"]));
         r.engine_mut().feed(b, &wire(&[b"SADD", b"q", b"x"]));
         pump(&mut r, &mut batch);
 
@@ -1386,7 +1387,10 @@ mod tests {
             .feed(c, &wire(&[b"RPUSH", b"q", b"first", b"second"]));
         pump(&mut r, &mut batch);
 
-        assert_eq!(r.engine().sink().sent(a), b"*2\r\n$1\r\nq\r\n$5\r\nfirst\r\n");
+        assert_eq!(
+            r.engine().sink().sent(a),
+            b"*2\r\n$1\r\nq\r\n$5\r\nfirst\r\n"
+        );
         assert_eq!(
             r.engine().sink().sent(b),
             b"*2\r\n$1\r\nq\r\n$6\r\nsecond\r\n"
@@ -1433,7 +1437,8 @@ mod tests {
     fn a_waiter_is_served_between_two_pipelined_pushes() {
         let (mut r, a, mut batch) = engine();
         let b = r.engine_mut().accept();
-        r.engine_mut().feed(a, &wire(&[b"BLPOP", b"p1", b"p2", b"0"]));
+        r.engine_mut()
+            .feed(a, &wire(&[b"BLPOP", b"p1", b"p2", b"0"]));
         pump(&mut r, &mut batch);
 
         let mut stream = wire(&[b"RPUSH", b"p2", b"second"]);
@@ -1446,9 +1451,15 @@ mod tests {
             b"*2\r\n$2\r\np2\r\n$6\r\nsecond\r\n"
         );
         // Which leaves the key it named first holding what was pushed to it.
-        r.engine_mut().feed(b, &wire(&[b"LRANGE", b"p1", b"0", b"-1"]));
+        r.engine_mut()
+            .feed(b, &wire(&[b"LRANGE", b"p1", b"0", b"-1"]));
         pump(&mut r, &mut batch);
-        assert!(r.engine().sink().sent(b).ends_with(b"*1\r\n$5\r\nfirst\r\n"));
+        assert!(
+            r.engine()
+                .sink()
+                .sent(b)
+                .ends_with(b"*1\r\n$5\r\nfirst\r\n")
+        );
     }
 
     /// A `BLMOVE` that serves itself is a push, so it wakes the client waiting
@@ -1471,7 +1482,10 @@ mod tests {
         pump(&mut r, &mut batch);
 
         assert_eq!(r.engine().sink().sent(a), b"$5\r\nchain\r\n");
-        assert_eq!(r.engine().sink().sent(b), b"*2\r\n$1\r\ny\r\n$5\r\nchain\r\n");
+        assert_eq!(
+            r.engine().sink().sent(b),
+            b"*2\r\n$1\r\ny\r\n$5\r\nchain\r\n"
+        );
         assert_eq!(r.engine().server().waiters().len(), 0);
     }
 
@@ -1552,7 +1566,8 @@ mod tests {
         assert_eq!(r.engine().sink().sent(a), b"*-1\r\n");
 
         r.engine_mut().feed(b, &wire(&[b"RPUSH", b"q", b"late"]));
-        r.engine_mut().feed(b, &wire(&[b"LRANGE", b"q", b"0", b"-1"]));
+        r.engine_mut()
+            .feed(b, &wire(&[b"LRANGE", b"q", b"0", b"-1"]));
         pump(&mut r, &mut batch);
         assert_eq!(r.engine().sink().sent(a), b"*-1\r\n", "nothing more");
         assert!(r.engine().sink().sent(b).ends_with(b"*1\r\n$4\r\nlate\r\n"));
@@ -1580,7 +1595,8 @@ mod tests {
         let again = r.engine_mut().accept();
         assert_eq!(again, a);
         r.engine_mut().feed(b, &wire(&[b"RPUSH", b"q", b"x"]));
-        r.engine_mut().feed(again, &wire(&[b"LRANGE", b"q", b"0", b"-1"]));
+        r.engine_mut()
+            .feed(again, &wire(&[b"LRANGE", b"q", b"0", b"-1"]));
         pump(&mut r, &mut batch);
         assert_eq!(r.engine().sink().sent(again), b"*1\r\n$1\r\nx\r\n");
     }

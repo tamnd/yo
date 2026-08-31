@@ -76,7 +76,10 @@ pub struct Limits {
 
 impl Limits {
     /// Redis's defaults: 128 and 64.
-    pub const DEFAULT: Limits = Limits { max_listpack_entries: 128, max_listpack_value: 64 };
+    pub const DEFAULT: Limits = Limits {
+        max_listpack_entries: 128,
+        max_listpack_value: 64,
+    };
 }
 
 impl Default for Limits {
@@ -229,7 +232,9 @@ impl Zset {
     /// An empty sorted set, in the packed band.
     #[must_use]
     pub fn new() -> Zset {
-        Zset { body: Body::Packed(Listpack::new()) }
+        Zset {
+            body: Body::Packed(Listpack::new()),
+        }
     }
 
     /// How many members are in here.
@@ -299,7 +304,9 @@ impl Zset {
             }
             self.promote();
         }
-        let Body::Table(t) = &mut self.body else { unreachable!("promoted above") };
+        let Body::Table(t) = &mut self.body else {
+            unreachable!("promoted above")
+        };
         t.add(member, score)
     }
 
@@ -445,7 +452,11 @@ impl Zset {
                 Ordering::Equal => min.open,
                 Ordering::Greater => false,
             };
-            if before { Ordering::Greater } else { Ordering::Less }
+            if before {
+                Ordering::Greater
+            } else {
+                Ordering::Less
+            }
         });
         let end = self.seek(|score, _| {
             let inside = match cmp_score(score, max.at) {
@@ -453,7 +464,11 @@ impl Zset {
                 Ordering::Equal => !max.open,
                 Ordering::Greater => false,
             };
-            if inside { Ordering::Greater } else { Ordering::Less }
+            if inside {
+                Ordering::Greater
+            } else {
+                Ordering::Less
+            }
         });
         start..end.max(start)
     }
@@ -530,7 +545,12 @@ impl Zset {
     }
 
     /// Walk members for `ZSCAN`, in whatever order the storage has them in.
-    pub fn scan<F: FnMut(Member<'_>, f64)>(&self, cursor: Cursor, count: usize, mut f: F) -> Cursor {
+    pub fn scan<F: FnMut(Member<'_>, f64)>(
+        &self,
+        cursor: Cursor,
+        count: usize,
+        mut f: F,
+    ) -> Cursor {
         match &self.body {
             Body::Packed(lp) => {
                 for at in 0..lp.len() / 2 {
@@ -715,7 +735,10 @@ mod tests {
     }
 
     const PACKED: Limits = Limits::DEFAULT;
-    const TABLE: Limits = Limits { max_listpack_entries: 0, max_listpack_value: 64 };
+    const TABLE: Limits = Limits {
+        max_listpack_entries: 0,
+        max_listpack_value: 64,
+    };
 
     #[test]
     fn an_empty_set_answers_nothing() {
@@ -726,7 +749,10 @@ mod tests {
         assert_eq!(z.score(b"nobody"), None);
         assert_eq!(z.rank(b"nobody"), None);
         assert!(z.at(0).is_none());
-        assert_eq!(z.window_by_score(Bound::closed(f64::NEG_INFINITY), Bound::closed(0.0)), 0..0);
+        assert_eq!(
+            z.window_by_score(Bound::closed(f64::NEG_INFINITY), Bound::closed(0.0)),
+            0..0
+        );
     }
 
     #[test]
@@ -742,7 +768,12 @@ mod tests {
     #[test]
     fn a_tie_on_score_is_broken_by_the_member() {
         for limits in [&PACKED, &TABLE] {
-            let pairs = [("beta", 1.0), ("alpha", 1.0), ("gamma", 1.0), ("Alpha", 1.0)];
+            let pairs = [
+                ("beta", 1.0),
+                ("alpha", 1.0),
+                ("gamma", 1.0),
+                ("Alpha", 1.0),
+            ];
             let z = built(&pairs, limits);
             let names: Vec<String> = listed(&z).into_iter().map(|(m, _)| m).collect();
             assert_eq!(names, ["Alpha", "alpha", "beta", "gamma"]);
@@ -797,7 +828,11 @@ mod tests {
             // with the right score.
             for j in i + 1..64 {
                 let name = format!("m{j:03}");
-                assert_eq!(z.score(name.as_bytes()), Some(f64::from(j)), "score of {name}");
+                assert_eq!(
+                    z.score(name.as_bytes()),
+                    Some(f64::from(j)),
+                    "score of {name}"
+                );
                 assert_eq!(
                     z.rank(name.as_bytes()),
                     Some((j - i - 1) as usize),
@@ -809,7 +844,10 @@ mod tests {
 
     #[test]
     fn a_set_promotes_when_it_outgrows_the_packed_band() {
-        let limits = Limits { max_listpack_entries: 4, max_listpack_value: 64 };
+        let limits = Limits {
+            max_listpack_entries: 4,
+            max_listpack_value: 64,
+        };
         let mut z = Zset::new();
         for i in 0..4u32 {
             z.add(format!("m{i}").as_bytes(), f64::from(i), &limits);
@@ -828,7 +866,10 @@ mod tests {
 
     #[test]
     fn a_member_too_long_for_the_packed_band_promotes_on_its_own() {
-        let limits = Limits { max_listpack_entries: 128, max_listpack_value: 8 };
+        let limits = Limits {
+            max_listpack_entries: 128,
+            max_listpack_value: 8,
+        };
         let mut z = Zset::new();
         z.add(b"short", 1.0, &limits);
         assert_eq!(z.encoding(), Encoding::Listpack);
@@ -843,17 +884,35 @@ mod tests {
         for limits in [&PACKED, &TABLE] {
             let pairs = [("a", 1.0), ("b", 2.0), ("c", 2.0), ("d", 3.0), ("e", 4.0)];
             let z = built(&pairs, limits);
-            assert_eq!(z.window_by_score(Bound::closed(2.0), Bound::closed(3.0)), 1..4);
-            assert_eq!(z.window_by_score(Bound::open(2.0), Bound::closed(3.0)), 3..4);
-            assert_eq!(z.window_by_score(Bound::closed(2.0), Bound::open(3.0)), 1..3);
+            assert_eq!(
+                z.window_by_score(Bound::closed(2.0), Bound::closed(3.0)),
+                1..4
+            );
+            assert_eq!(
+                z.window_by_score(Bound::open(2.0), Bound::closed(3.0)),
+                3..4
+            );
+            assert_eq!(
+                z.window_by_score(Bound::closed(2.0), Bound::open(3.0)),
+                1..3
+            );
             assert_eq!(z.window_by_score(Bound::open(1.0), Bound::open(4.0)), 1..4);
             assert_eq!(
-                z.window_by_score(Bound::closed(f64::NEG_INFINITY), Bound::closed(f64::INFINITY)),
+                z.window_by_score(
+                    Bound::closed(f64::NEG_INFINITY),
+                    Bound::closed(f64::INFINITY)
+                ),
                 0..5
             );
             // A range with nothing in it is empty and not backwards.
-            assert_eq!(z.window_by_score(Bound::closed(3.0), Bound::closed(2.0)), 3..3);
-            assert_eq!(z.window_by_score(Bound::closed(9.0), Bound::closed(10.0)), 5..5);
+            assert_eq!(
+                z.window_by_score(Bound::closed(3.0), Bound::closed(2.0)),
+                3..3
+            );
+            assert_eq!(
+                z.window_by_score(Bound::closed(9.0), Bound::closed(10.0)),
+                5..5
+            );
         }
     }
 
@@ -912,7 +971,13 @@ mod tests {
     /// removals against a `Vec` that says what the answer is.
     #[test]
     fn a_run_of_everything_agrees_with_a_model() {
-        for limits in [&PACKED, &Limits { max_listpack_entries: 8, max_listpack_value: 64 }] {
+        for limits in [
+            &PACKED,
+            &Limits {
+                max_listpack_entries: 8,
+                max_listpack_value: 64,
+            },
+        ] {
             let mut z = Zset::new();
             let mut model: Vec<(String, f64)> = Vec::new();
             let mut seed = 0x8765_4321_9ABC_DEF0u64;
@@ -973,7 +1038,9 @@ mod tests {
         // eight, four more for the open addressed slot, and the member bytes
         // themselves. The row array and the slot array are both powers of two,
         // so at a hundred thousand members a third of both is slack.
-        let Body::Table(t) = &z.body else { panic!("a hundred thousand members is not a listpack") };
+        let Body::Table(t) = &z.body else {
+            panic!("a hundred thousand members is not a listpack")
+        };
         let per_order = t.order.bytes() as f64 / f64::from(n);
         assert!(per_order < 3.4, "{per_order} bytes an element in the tree");
         let per = z.memory_bytes() as f64 / f64::from(n);
