@@ -150,6 +150,20 @@ spec = "08 section 1"
 [[divergence]]
 id = "D-19"
 title = "A slice goes dense on how wide it is as well as how full it is"
-reason = "Redis turns a sparse slice into a dense one once it holds more than ten elements, whatever indices those elements sit at. Sparse costs about ten bytes an element here and dense costs eight bytes for every position in the window it covers, so ten elements spread over a thousand positions are eight kilobytes dense and a hundred bytes sparse. A slice here goes dense only when it is over that count and its span is at most twice its population, which is the same rule read as a memory question rather than a count. Nothing a client can ask reports which of the two a slice is in, so the only difference this makes is the number OBJECT and MEMORY USAGE report, and it makes that number smaller."
+reason = "Redis turns a sparse slice into a dense one once it holds more than ten elements, whatever indices those elements sit at. Sparse costs about ten bytes an element here and dense costs eight bytes for every position in the window it covers, so ten elements spread over a thousand positions are eight kilobytes dense and a hundred bytes sparse. A slice here goes dense only when it is over that count and its span is at most twice its population, which is the same rule read as a memory question rather than a count. The only commands that report which of the two a slice is in are ARINFO FULL and the numbers OBJECT and MEMORY USAGE give back, and the difference it makes to those last two is that the number is smaller."
+status = "permanent"
+spec = "08 section 1"
+
+[[divergence]]
+id = "D-20"
+title = "ARINFO describes our directory, and super-dir-entries is always zero"
+reason = "The first three fields ARINFO reports are the count, the length and the next insert index, and those are properties of the array a client wrote and they match Redis exactly. Everything after them describes how the array is laid out, and the layout is not the same one Redis has, so slices, directory-size, dense-slices, sparse-slices and the three averages are honest numbers about our structure rather than the same numbers a real server would print. The clearest case is super-dir-entries, which counts the second directory level Redis grows above the first one when a single level would waste too much room. There is no second level here, so the field is always zero. It is still in the reply because a client reading the map by field name should find every field it expects rather than have to handle a missing one, and a zero reads correctly as no second level."
+status = "permanent"
+spec = "08 section 1"
+
+[[divergence]]
+id = "D-21"
+title = "AROP adds in a double where Redis adds in a long double"
+reason = "SUM, MIN and MAX accumulate in a C long double on Redis, which is a plain sixty four bit double on arm64 and an eighty bit extended on x86-64, so Redis's own answer to the same AROP already depends on which machine it is running on. This accumulates in an f64 everywhere, which is the arm64 answer. The difference only shows up in the last digits of a long sum of values that do not add exactly, and it never shows up at all for MIN, MAX or for sums that stay inside what a double holds exactly. Matching the x86-64 answer would mean carrying a software extended precision accumulator on every platform to reproduce a number Redis itself does not reproduce across its own builds."
 status = "permanent"
 spec = "08 section 1"

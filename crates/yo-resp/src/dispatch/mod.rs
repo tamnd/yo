@@ -5229,6 +5229,8 @@ mod tests {
             &[b"ARSEEK".as_ref(), b"s", b"1"][..],
             &[b"ARLASTITEMS".as_ref(), b"s", b"1"][..],
             &[b"ARSCAN".as_ref(), b"s", b"0", b"1"][..],
+            &[b"AROP".as_ref(), b"s", b"0", b"1", b"SUM"][..],
+            &[b"ARINFO".as_ref(), b"s"][..],
         ] {
             assert_eq!(f.run(cmd), wrong, "{}", String::from_utf8_lossy(cmd[0]));
         }
@@ -5390,5 +5392,92 @@ mod tests {
             f.run(&[b"ARSCAN", b"a", b"0", b"10", b"LIMIT"]),
             "-ERR wrong number of arguments for 'arscan' command\r\n"
         );
+    }
+
+    #[test]
+    fn an_op_reduces_a_range_to_one_number() {
+        let mut f = Fixture::new();
+        f.run(&[b"ARSET", b"a", b"0", b"1", b"2.5", b"word", b"-4"]);
+        assert_eq!(
+            f.run(&[b"AROP", b"a", b"0", b"10", b"SUM"]),
+            "$4\r\n-0.5\r\n"
+        );
+        assert_eq!(f.run(&[b"AROP", b"a", b"0", b"10", b"min"]), "$2\r\n-4\r\n");
+        assert_eq!(
+            f.run(&[b"AROP", b"a", b"0", b"10", b"MAX"]),
+            "$3\r\n2.5\r\n"
+        );
+        assert_eq!(f.run(&[b"AROP", b"a", b"0", b"10", b"USED"]), ":4\r\n");
+        assert_eq!(
+            f.run(&[b"AROP", b"a", b"0", b"10", b"MATCH", b"word"]),
+            ":1\r\n"
+        );
+        // An aggregate is written with seventeen significant digits, which is
+        // Redis's own choice and not what a score comes back as.
+        f.run(&[b"ARSET", b"t", b"0", b"0.1", b"0.2"]);
+        assert_eq!(
+            f.run(&[b"AROP", b"t", b"0", b"10", b"SUM"]),
+            "$19\r\n0.30000000000000004\r\n"
+        );
+        assert_eq!(f.run(&[b"ZADD", b"z", b"0.3", b"m"]), ":1\r\n");
+        assert_eq!(f.run(&[b"ZSCORE", b"z", b"m"]), "$3\r\n0.3\r\n");
+
+        // Nothing to work with is a null, and a missing key is a null for the
+        // aggregates and a zero for the two that count.
+        f.run(&[b"ARSET", b"w", b"0", b"word"]);
+        assert_eq!(f.run(&[b"AROP", b"w", b"0", b"10", b"SUM"]), "$-1\r\n");
+        assert_eq!(f.run(&[b"AROP", b"nope", b"0", b"10", b"SUM"]), "$-1\r\n");
+        assert_eq!(f.run(&[b"AROP", b"nope", b"0", b"10", b"USED"]), ":0\r\n");
+
+        assert_eq!(
+            f.run(&[b"AROP", b"a", b"0", b"10", b"NOPE"]),
+            "-ERR unknown operation\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"AROP", b"a", b"0", b"10", b"MATCH"]),
+            "-ERR MATCH requires a value argument\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"AROP", b"a", b"0", b"10", b"SUM", b"extra"]),
+            "-ERR wrong number of arguments for 'arop' command\r\n"
+        );
+    }
+
+    #[test]
+    fn the_info_is_a_map_and_a_missing_key_is_an_error() {
+        let mut f = Fixture::new();
+        assert_eq!(f.run(&[b"ARINFO", b"nope"]), "-ERR no such key\r\n");
+        f.run(&[b"ARINSERT", b"a", b"x", b"y"]);
+        let short = f.run(&[b"ARINFO", b"a"]);
+        assert!(
+            short.starts_with("*14\r\n"),
+            "seven pairs on RESP2: {short}"
+        );
+        assert!(short.contains("$5\r\ncount\r\n:2\r\n"), "{short}");
+        assert!(
+            short.contains("$17\r\nnext-insert-index\r\n:2\r\n"),
+            "{short}"
+        );
+        assert!(short.contains("$10\r\nslice-size\r\n:4096\r\n"), "{short}");
+        let full = f.run(&[b"ARINFO", b"a", b"full"]);
+        assert!(full.starts_with("*24\r\n"), "twelve pairs: {full}");
+        // Two values one apart are held sparsely, so the dense count is zero and
+        // the two dense averages have nothing to average.
+        assert!(full.contains("$12\r\ndense-slices\r\n:0\r\n"), "{full}");
+        assert!(full.contains("$13\r\nsparse-slices\r\n:1\r\n"), "{full}");
+        assert!(
+            full.contains("$14\r\navg-dense-size\r\n$1\r\n0\r\n"),
+            "{full}"
+        );
+        assert_eq!(f.run(&[b"ARINFO", b"a", b"nope"]), "-ERR syntax error\r\n");
+
+        // On RESP3 the same reply is a map and the averages are doubles.
+        let mut g = Fixture::new();
+        g.run(&[b"HELLO", b"3"]);
+        g.run(&[b"ARINSERT", b"a", b"x"]);
+        let map = g.run(&[b"ARINFO", b"a", b"FULL"]);
+        assert!(map.starts_with("%12\r\n"), "{map}");
+        assert!(map.contains("$5\r\ncount\r\n:1\r\n"), "{map}");
+        assert!(map.contains("$14\r\navg-dense-size\r\n,0\r\n"), "{map}");
     }
 }

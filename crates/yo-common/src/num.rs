@@ -413,6 +413,92 @@ pub fn write_double(buf: &mut [u8; DOUBLE_MAX], d: f64) -> &[u8] {
     &buf[..at]
 }
 
+/// Writes a double the way C's `%.17g` writes one, which is what `AROP`
+/// replies with.
+///
+/// Redis formats an aggregate through `ld2string` in its automatic mode, and
+/// that mode is a plain `%.17Lg`, so this is the one reply in the whole server
+/// that is not a shortest round trip printer. The difference is visible: three
+/// tenths comes back as `0.29999999999999999` here and as `0.3` from `ZSCORE`,
+/// because seventeen significant digits of the nearest double to three tenths
+/// really are those.
+///
+/// `%g` picks between the two forms the way C says: the exponent form when the
+/// decimal exponent is below minus four or at least the precision, the plain
+/// form otherwise, and trailing zeros come off either way.
+pub fn write_g17(buf: &mut [u8; DOUBLE_MAX], d: f64) -> &[u8] {
+    /// Seventeen significant digits is sixteen after the point.
+    const AFTER: usize = 16;
+    if d.is_nan() {
+        buf[..3].copy_from_slice(b"nan");
+        return &buf[..3];
+    }
+    if d.is_infinite() {
+        let word: &[u8] = if d > 0.0 { b"inf" } else { b"-inf" };
+        buf[..word.len()].copy_from_slice(word);
+        return &buf[..word.len()];
+    }
+    // The exponent C would use is the one the value has after it has been
+    // rounded to seventeen digits, so it has to come from the rounding and not
+    // from a logarithm: 9.9999999999999999e-5 rounds up into the next decade.
+    let mut scratch = [0u8; DOUBLE_MAX];
+    let mut sink = SliceSink {
+        buf: &mut scratch,
+        at: 0,
+    };
+    let _ = write!(sink, "{d:.AFTER$e}");
+    let end = sink.at;
+    let split = scratch[..end]
+        .iter()
+        .position(|&c| c == b'e')
+        .expect("the exponent form always has one");
+    let exp = parse_i64(&scratch[split + 1..end]).expect("a written exponent parses") as i32;
+
+    if !(-4..17).contains(&exp) {
+        // The exponent form, and C writes at least two exponent digits where
+        // Rust writes as few as one.
+        let mantissa = trim_zeros(&scratch[..split]);
+        let n = mantissa.len();
+        buf[..n].copy_from_slice(mantissa);
+        let mut sink = SliceSink { buf, at: n };
+        let sign = if exp < 0 { '-' } else { '+' };
+        let _ = write!(sink, "e{sign}{:02}", exp.unsigned_abs());
+        let at = sink.at;
+        return &buf[..at];
+    }
+    // The plain form, whose precision is what is left of the seventeen digits
+    // once the integer part has had its share.
+    let places = usize::try_from(AFTER as i32 - exp).unwrap_or(0);
+    let mut sink = SliceSink { buf, at: 0 };
+    let _ = write!(sink, "{d:.places$}");
+    let at = sink.at;
+    let n = trim_zeros(&buf[..at]).len();
+    &buf[..n]
+}
+
+/// The same digits [`write_g17`] would write, appended.
+pub fn push_g17(out: &mut Vec<u8>, d: f64) {
+    let mut buf = [0u8; DOUBLE_MAX];
+    out.extend_from_slice(write_g17(&mut buf, d));
+}
+
+/// Takes the trailing zeros off a fixed point number, and the point with them
+/// when nothing is left after it.
+///
+/// A number with no point in it is left alone, because the zeros in `1700` are
+/// not trailing anything.
+fn trim_zeros(text: &[u8]) -> &[u8] {
+    if !text.contains(&b'.') {
+        return text;
+    }
+    let end = text.iter().rposition(|&c| c != b'0').unwrap_or(0);
+    if text[end] == b'.' {
+        &text[..end]
+    } else {
+        &text[..=end]
+    }
+}
+
 /// A `core::fmt::Write` that fills a fixed buffer and stops when it is full.
 ///
 /// Running out of room cannot happen here, because [`DOUBLE_MAX`] is sized for
@@ -685,5 +771,55 @@ mod tests {
             widest = widest.max(v.len());
         }
         assert!(widest <= DOUBLE_MAX, "{widest} bytes needs more than room");
+    }
+
+    /// Seventeen significant digits, the two forms, and the trailing zeros off
+    /// both of them.
+    ///
+    /// The expected bytes here are what C's `%.17g` prints, which is what Redis
+    /// replies to `AROP` with, and it is not what the rest of the server writes
+    /// for a double: three tenths is `0.29999999999999999` in this printer and
+    /// `0.3` in the other one.
+    #[test]
+    fn the_aggregate_printer_writes_seventeen_significant_digits() {
+        let cases: &[(f64, &str)] = &[
+            (0.0, "0"),
+            (-0.0, "-0"),
+            (1.0, "1"),
+            (-1.0, "-1"),
+            (0.5, "0.5"),
+            (0.1, "0.10000000000000001"),
+            (0.3, "0.29999999999999999"),
+            (0.1 + 0.2, "0.30000000000000004"),
+            (1.0 / 3.0, "0.33333333333333331"),
+            (0.0001, "0.0001"),
+            // Below a ten thousandth is where the exponent form starts, and C
+            // writes two exponent digits where Rust would write one.
+            (1.5e-5, "1.5e-05"),
+            (1e-5, "1.0000000000000001e-05"),
+            (1e16, "10000000000000000"),
+            // And it starts again once the digits run out at seventeen.
+            (1e17, "1e+17"),
+            (1e30, "1e+30"),
+            (-1e30, "-1e+30"),
+            (1e100, "1e+100"),
+            (f64::MAX, "1.7976931348623157e+308"),
+            (f64::from_bits(1), "4.9406564584124654e-324"),
+            (12345678901234567.0, "12345678901234568"),
+            (f64::INFINITY, "inf"),
+            (f64::NEG_INFINITY, "-inf"),
+            (f64::NAN, "nan"),
+        ];
+        for &(d, want) in cases {
+            let mut buf = [0u8; DOUBLE_MAX];
+            assert_eq!(
+                core::str::from_utf8(write_g17(&mut buf, d)).unwrap(),
+                want,
+                "writing {d}"
+            );
+            let mut v = Vec::new();
+            push_g17(&mut v, d);
+            assert_eq!(String::from_utf8(v).unwrap(), want, "appending {d}");
+        }
     }
 }

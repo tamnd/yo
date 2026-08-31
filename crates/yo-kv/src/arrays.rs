@@ -21,9 +21,10 @@
 //! collection here follows and the reason `EXISTS` answers zero after the last
 //! `ARDEL`.
 
+use yo_common::num::{parse_f64, parse_i64};
 use yo_common::{Code, Error, Result};
 
-use crate::array::{Array, Element, INDEX_MAX};
+use crate::array::{Array, ELEMENT_MAX, Element, INDEX_MAX, Info};
 use crate::keyspace::Keyspace;
 use crate::strings;
 use crate::value::{self, Kind};
@@ -99,6 +100,80 @@ fn parse_ull(bytes: &[u8], allow_max: bool) -> Result<u64> {
         return Err(bad());
     }
     Ok(n)
+}
+
+/// The aggregations `AROP` knows how to do.
+///
+/// They are all order independent, which is why the walk can go whichever way
+/// the two ends point without the answer changing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Op {
+    /// Add up everything that is a number.
+    Sum,
+    /// The smallest of them.
+    Min,
+    /// The largest of them.
+    Max,
+    /// Bitwise and over everything that is a whole number.
+    And,
+    /// Bitwise or.
+    Or,
+    /// Bitwise exclusive or.
+    Xor,
+    /// How many elements are exactly these bytes.
+    Match,
+    /// How many positions in the range hold anything at all.
+    Used,
+}
+
+/// What an [`Op`] came to.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Aggregate {
+    /// A count or a bitwise result, which goes back as an integer.
+    Int(i64),
+    /// A sum or an end of the range, which goes back as a string of digits
+    /// because it may not be a whole number.
+    Num(f64),
+    /// Nothing in the range was any use to the operation, which is a null. An
+    /// empty range and a range of nothing but words both land here.
+    None,
+}
+
+/// An element as a whole number, for the bitwise operations.
+///
+/// A float is truncated towards zero the way Redis does it, and one that will
+/// not fit is skipped rather than saturated, because a saturated value would
+/// quietly poison an `AND` with a row of ones.
+fn as_int(el: Element<'_>) -> Option<i64> {
+    match el {
+        Element::Int(n) => Some(n),
+        Element::Float(d) => whole(d),
+        _ => {
+            let mut buf = [0u8; ELEMENT_MAX];
+            let text = el.text(&mut buf);
+            parse_i64(text).or_else(|| whole(parse_f64(text)?))
+        }
+    }
+}
+
+/// An element as a number, for the arithmetic operations.
+fn as_num(el: Element<'_>) -> Option<f64> {
+    match el {
+        Element::Int(n) => Some(n as f64),
+        Element::Float(d) => Some(d),
+        _ => {
+            let mut buf = [0u8; ELEMENT_MAX];
+            parse_f64(el.text(&mut buf))
+        }
+    }
+}
+
+/// A double as the integer it truncates to, or nothing when it does not.
+fn whole(d: f64) -> Option<i64> {
+    if d.is_nan() || d < -(2f64.powi(63)) || d >= 2f64.powi(63) {
+        return None;
+    }
+    Some(d as i64)
 }
 
 impl Keyspace {
@@ -493,6 +568,83 @@ impl Keyspace {
             });
         }
         Ok(seen)
+    }
+
+    /// `AROP key start end OP [value]`, one number out of a whole range.
+    ///
+    /// The walk is [`Keyspace::arscan`]'s, so it costs the elements in the range
+    /// and not its width, and every operation here is order independent so the
+    /// direction the ends came in does not matter.
+    pub fn arop(
+        &mut self,
+        key: &[u8],
+        start: u64,
+        end: u64,
+        op: Op,
+        want: &[u8],
+    ) -> Result<Aggregate> {
+        let Some(at) = self.array_slot(key)? else {
+            // A count of nothing is zero and an aggregate of nothing is a null,
+            // which is the difference between asking how many and asking what.
+            return Ok(match op {
+                Op::Match | Op::Used => Aggregate::Int(0),
+                _ => Aggregate::None,
+            });
+        };
+        let mut counted = 0i64;
+        let mut bits: Option<i64> = None;
+        let mut num: Option<f64> = None;
+        self.array_at(at).scan(start, end, |_, el| {
+            match op {
+                Op::Used => counted += 1,
+                Op::Match => {
+                    let mut buf = [0u8; ELEMENT_MAX];
+                    if el.text(&mut buf) == want {
+                        counted += 1;
+                    }
+                }
+                Op::And | Op::Or | Op::Xor => {
+                    if let Some(i) = as_int(el) {
+                        bits = Some(match (bits, op) {
+                            (None, _) => i,
+                            (Some(acc), Op::And) => acc & i,
+                            (Some(acc), Op::Or) => acc | i,
+                            (Some(acc), _) => acc ^ i,
+                        });
+                    }
+                }
+                Op::Sum | Op::Min | Op::Max => {
+                    if let Some(d) = as_num(el) {
+                        num = Some(match (num, op) {
+                            (None, _) => d,
+                            (Some(acc), Op::Sum) => acc + d,
+                            (Some(acc), Op::Min) => acc.min(d),
+                            (Some(acc), _) => acc.max(d),
+                        });
+                    }
+                }
+            }
+            true
+        });
+        Ok(match op {
+            Op::Match | Op::Used => Aggregate::Int(counted),
+            Op::And | Op::Or | Op::Xor => bits.map_or(Aggregate::None, Aggregate::Int),
+            _ => num.map_or(Aggregate::None, Aggregate::Num),
+        })
+    }
+
+    /// `ARINFO key [FULL]`, the shape of the array.
+    ///
+    /// # Errors
+    ///
+    /// [`Code::NoSuchKey`] for a key that is not there, which is the one array
+    /// command that treats a missing key as a mistake rather than as an empty
+    /// array. It is reporting on a structure, and there is no structure.
+    pub fn arinfo(&mut self, key: &[u8], full: bool) -> Result<Info> {
+        let Some(at) = self.array_slot(key)? else {
+            return Err(crate::keys::no_such_key());
+        };
+        Ok(self.array_at(at).info(full))
     }
 
     /// Where `key`'s array is, or `None` if there is no such key.
@@ -935,6 +1087,115 @@ mod tests {
             d.arscan(b"s", 0, 1, 1, |_, _| {}).unwrap_err().code(),
             Code::WrongType
         );
+    }
+
+    fn op(d: &mut Keyspace, key: &[u8], op: Op, want: &[u8]) -> Aggregate {
+        d.arop(key, 0, INDEX_MAX, op, want).expect("an array")
+    }
+
+    #[test]
+    fn the_arithmetic_ops_read_what_they_can_and_ignore_the_rest() {
+        let mut d = db();
+        set(&mut d, b"a", 0, &[b"1", b"2.5", b"word", b"-4"]);
+        assert_eq!(op(&mut d, b"a", Op::Sum, b""), Aggregate::Num(-0.5));
+        assert_eq!(op(&mut d, b"a", Op::Min, b""), Aggregate::Num(-4.0));
+        assert_eq!(op(&mut d, b"a", Op::Max, b""), Aggregate::Num(2.5));
+        assert_eq!(op(&mut d, b"a", Op::Used, b""), Aggregate::Int(4));
+        assert_eq!(op(&mut d, b"a", Op::Match, b"word"), Aggregate::Int(1));
+        assert_eq!(op(&mut d, b"a", Op::Match, b"1"), Aggregate::Int(1));
+        assert_eq!(op(&mut d, b"a", Op::Match, b"1.0"), Aggregate::Int(0));
+
+        // A range holding nothing numeric is a null and not a zero, because
+        // zero is an answer and there is no answer.
+        set(&mut d, b"w", 0, &[b"word", b"other"]);
+        assert_eq!(op(&mut d, b"w", Op::Sum, b""), Aggregate::None);
+        assert_eq!(op(&mut d, b"w", Op::Used, b""), Aggregate::Int(2));
+
+        // A missing key counts as nothing, which is a number for the two that
+        // count and a null for the ones that aggregate.
+        assert_eq!(op(&mut d, b"nope", Op::Used, b""), Aggregate::Int(0));
+        assert_eq!(op(&mut d, b"nope", Op::Match, b"x"), Aggregate::Int(0));
+        assert_eq!(op(&mut d, b"nope", Op::Sum, b""), Aggregate::None);
+        assert_eq!(op(&mut d, b"nope", Op::And, b""), Aggregate::None);
+    }
+
+    /// The bitwise ops take the whole part of a float and skip anything that
+    /// cannot be one, so a word in the middle of a range does not turn an AND
+    /// into a zero.
+    #[test]
+    fn the_bitwise_ops_truncate_and_skip() {
+        let mut d = db();
+        set(&mut d, b"a", 0, &[b"12", b"10.9", b"word"]);
+        assert_eq!(op(&mut d, b"a", Op::And, b""), Aggregate::Int(8));
+        assert_eq!(op(&mut d, b"a", Op::Or, b""), Aggregate::Int(14));
+        assert_eq!(op(&mut d, b"a", Op::Xor, b""), Aggregate::Int(6));
+
+        // Negative floats truncate towards zero and not downwards, and one that
+        // will not fit an integer at all is left out.
+        set(&mut d, b"b", 0, &[b"-2.7", b"1e30"]);
+        assert_eq!(op(&mut d, b"b", Op::Xor, b""), Aggregate::Int(-2));
+        set(&mut d, b"c", 0, &[b"1e30"]);
+        assert_eq!(op(&mut d, b"c", Op::And, b""), Aggregate::None);
+    }
+
+    /// The range is a range, so an op can be asked about part of an array.
+    #[test]
+    fn an_op_only_reads_the_range_it_was_given() {
+        let mut d = db();
+        set(&mut d, b"a", 0, &[b"1", b"2", b"3", b"4"]);
+        assert_eq!(
+            d.arop(b"a", 1, 2, Op::Sum, b"").expect("an array"),
+            Aggregate::Num(5.0)
+        );
+        // And the ends may come either way round, because none of these care
+        // which order they see the elements in.
+        assert_eq!(
+            d.arop(b"a", 2, 1, Op::Sum, b"").expect("an array"),
+            Aggregate::Num(5.0)
+        );
+        assert_eq!(
+            d.arop(b"a", 100, 200, Op::Used, b"").expect("an array"),
+            Aggregate::Int(0)
+        );
+    }
+
+    #[test]
+    fn the_info_describes_the_shape_and_a_missing_key_is_an_error() {
+        let mut d = db();
+        assert_eq!(
+            d.arinfo(b"nope", false).unwrap_err().message(),
+            "no such key"
+        );
+
+        // Forty consecutive positions is one dense slice, and one element far
+        // away is a second slice holding a single entry.
+        set(
+            &mut d,
+            b"a",
+            0,
+            &(0..40).map(|_| b"v".as_ref()).collect::<Vec<_>>(),
+        );
+        set(&mut d, b"a", 100_000, &[b"far"]);
+        d.arinsert(b"a", [b"x".as_ref()].into_iter()).expect("room");
+
+        let info = d.arinfo(b"a", true).expect("an array");
+        assert_eq!(info.count, 41);
+        assert_eq!(info.len, 100_001);
+        assert_eq!(info.next_insert, 1, "the append landed on zero");
+        assert_eq!(info.slices, 2);
+        assert_eq!(info.slice_size, 4096);
+        assert!(info.directory_size >= info.slices);
+        assert_eq!(info.dense_slices, 1);
+        assert_eq!(info.sparse_slices, 1);
+        assert_eq!(info.avg_dense_size, 40.0);
+        assert_eq!(info.avg_dense_fill, 1.0);
+        assert!(info.avg_sparse_size >= 1.0);
+
+        // Without FULL the per layout numbers are not walked for and read zero.
+        let cheap = d.arinfo(b"a", false).expect("an array");
+        assert_eq!(cheap.count, 41);
+        assert_eq!(cheap.dense_slices, 0);
+        assert_eq!(cheap.avg_dense_fill, 0.0);
     }
 
     /// An array is a body like any other, so the shared key commands work on it.

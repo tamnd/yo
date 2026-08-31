@@ -20,9 +20,9 @@
 //! a number that does not fit an `i64`, which is why the replies here go
 //! through [`Out::uint`].
 
-use yo_common::num::parse_i64;
+use yo_common::num::{DOUBLE_MAX, parse_i64, write_g17};
 use yo_common::{Code, Error, Result};
-use yo_kv::arrays::{parse_index, parse_seek_index};
+use yo_kv::arrays::{Aggregate, Op, parse_index, parse_seek_index};
 use yo_kv::{ArrayElement, Keyspace};
 
 use super::args::{self, Args};
@@ -174,6 +174,80 @@ pub(super) fn execute(db: &mut Keyspace, spec: &Spec, args: Args<'_>, out: &mut 
                 element(out, el);
             })?;
             out.close_array(mark, usize::try_from(n).unwrap_or(usize::MAX));
+        }
+        "arop" => {
+            let start = parse_index(args.get(2))?;
+            let end = parse_index(args.get(3))?;
+            let op = match args.get(4) {
+                w if args::is(w, b"SUM") => Op::Sum,
+                w if args::is(w, b"MIN") => Op::Min,
+                w if args::is(w, b"MAX") => Op::Max,
+                w if args::is(w, b"AND") => Op::And,
+                w if args::is(w, b"OR") => Op::Or,
+                w if args::is(w, b"XOR") => Op::Xor,
+                w if args::is(w, b"MATCH") => Op::Match,
+                w if args::is(w, b"USED") => Op::Used,
+                _ => return Err(Error::new(Code::Invalid, "unknown operation")),
+            };
+            // MATCH is the only one that takes a value, and it says so in its
+            // own words rather than as an arity error.
+            if op == Op::Match {
+                if args.len() != 6 {
+                    return Err(Error::new(Code::Invalid, "MATCH requires a value argument"));
+                }
+            } else if args.len() != 5 {
+                return Err(args::wrong_arity(spec.name));
+            }
+            match db.arop(args.get(1), start, end, op, args.get(5))? {
+                Aggregate::Int(n) => out.int(n),
+                Aggregate::Num(d) => {
+                    // Redis prints an aggregate with seventeen significant
+                    // digits and not with the shortest round trip printer every
+                    // other reply uses, so this is the one place those two
+                    // disagree.
+                    let mut buf = [0u8; DOUBLE_MAX];
+                    out.bulk(write_g17(&mut buf, d));
+                }
+                Aggregate::None => out.nil(),
+            }
+        }
+        "arinfo" => {
+            let full = match args.len() {
+                2 => false,
+                3 if args::is(args.get(2), b"FULL") => true,
+                _ => return Err(args::syntax()),
+            };
+            let info = db.arinfo(args.get(1), full)?;
+            out.map(if full { 12 } else { 7 });
+            out.bulk(b"count");
+            out.uint(info.count);
+            out.bulk(b"len");
+            out.uint(info.len);
+            out.bulk(b"next-insert-index");
+            out.uint(info.next_insert);
+            out.bulk(b"slices");
+            out.uint(info.slices);
+            out.bulk(b"directory-size");
+            out.uint(info.directory_size);
+            out.bulk(b"super-dir-entries");
+            // Redis grows a second level above the directory once one level is
+            // wasteful. We do not have one, and the number is here so that a
+            // client reading the map finds the field it expects (D-20).
+            out.uint(0);
+            out.bulk(b"slice-size");
+            out.uint(info.slice_size);
+            if full {
+                out.bulk(b"dense-slices");
+                out.uint(info.dense_slices);
+                out.bulk(b"sparse-slices");
+                out.uint(info.sparse_slices);
+                out.bulk(b"avg-dense-size");
+                out.double(info.avg_dense_size);
+                out.bulk(b"avg-dense-fill");
+                out.double(info.avg_dense_fill);
+                out.bulk(b"avg-sparse-size");
+                out.double(info.avg_sparse_size);
+            }
         }
         other => unreachable!("the table sent {other} to the array group"),
     }
