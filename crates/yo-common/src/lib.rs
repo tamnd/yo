@@ -18,6 +18,7 @@ pub mod num;
 pub mod prefetch;
 pub mod re;
 pub mod rng;
+pub mod small;
 pub mod wyhash;
 pub mod xxh3;
 
@@ -31,6 +32,7 @@ pub use num::{
 };
 pub use prefetch::{prefetch, prefetch_read};
 pub use rng::Rng;
+pub use small::Small;
 pub use wyhash::{hash_key, tag_of, wyhash};
 pub use xxh3::hash64;
 

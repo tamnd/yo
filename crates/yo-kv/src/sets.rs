@@ -35,7 +35,7 @@ use yo_common::Result;
 use crate::keyspace::Keyspace;
 use crate::scan::Cursor;
 use crate::set::{Member, Set};
-use crate::setops;
+use crate::setops::{self, PerSet};
 use crate::strings;
 use crate::value::{self, Kind};
 
@@ -552,14 +552,23 @@ impl Keyspace {
     /// than at the end is what stops `SINTERSTORE d a not-a-set` from writing
     /// the destination before it finds out.
     ///
-    /// This allocates, once, for a vector of `k` slots. Every command that
-    /// calls it is answering about a whole collection and [`crate::setops`]
-    /// allocates a bigger one for its own bookkeeping, so this is not the thing
-    /// on the path Y1 is about. It is also what makes the borrow work: reaping
-    /// needs `&mut self` and reading the bodies needs `&self`, so the keys have
-    /// to be resolved before any body is looked at.
-    fn set_slots<'k>(&mut self, keys: impl Iterator<Item = &'k [u8]>) -> Result<Vec<Option<u32>>> {
-        let mut out = Vec::with_capacity(keys.size_hint().0);
+    /// This is what makes the borrow work: reaping needs `&mut self` and reading
+    /// the bodies needs `&self`, so the keys have to be resolved before any body
+    /// is looked at.
+    ///
+    /// It used to be a `Vec` and therefore a malloc and a free on every one of
+    /// these commands, which is a real cost on the small end: a `SINTER` of two
+    /// eight member sets does a couple of hundred nanoseconds of work and was
+    /// paying for five allocations across this, [`Keyspace::bodies_of`] and
+    /// [`crate::setops`]'s own bookkeeping. `Small` keeps the usual `k` on the
+    /// stack and spills for the rare command that names more keys than that.
+    fn set_slots<'k>(
+        &mut self,
+        keys: impl Iterator<Item = &'k [u8]>,
+    ) -> Result<PerSet<Option<u32>>> {
+        // Pushed rather than collected, because `set_slot` can fail and the
+        // failure has to come out as an error rather than stop the walk quietly.
+        let mut out = PerSet::new();
         for key in keys {
             out.push(self.set_slot(key)?);
         }
@@ -568,7 +577,7 @@ impl Keyspace {
 
     /// The bodies those slots point at, with the keys that were not there gone.
     #[inline]
-    fn bodies_of(&self, slots: &[Option<u32>]) -> Vec<&Set> {
+    fn bodies_of(&self, slots: &[Option<u32>]) -> PerSet<&Set> {
         slots.iter().flatten().map(|&at| self.set_at(at)).collect()
     }
 
@@ -1064,6 +1073,60 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The `k` sized bookkeeping a set operation does before it starts is gone.
+    /// It used to be five vectors across `set_slots`, `bodies_of` and `setops`,
+    /// each a malloc and a free, on a command whose real work over three eight
+    /// member sets is a couple of hundred nanoseconds.
+    ///
+    /// On integer sets that leaves nothing at all, because the merge walks the
+    /// sorted arrays and needs no table. On the other representations `SUNION`
+    /// and `SDIFF` still build one hash table each to dedupe with, which is
+    /// sized by the members rather than by the number of keys and is the
+    /// algorithm rather than the bookkeeping.
+    #[test]
+    fn a_small_set_operation_stops_paying_per_key() {
+        for (ints, want) in [(true, 0), (false, 6)] {
+            let mut d = db();
+            fill(&mut d, b"a", 8, ints);
+            fill(&mut d, b"b", 8, ints);
+            fill(&mut d, b"c", 8, ints);
+            let keys: [&[u8]; 3] = [b"a", b"b", b"c"];
+
+            let (found, allocs) = crate::tally::counted(|| {
+                let mut n = 0;
+                d.sinter(keys.iter().copied(), 0, |_| n += 1).expect("sets");
+                d.sunion(keys.iter().copied(), |_| n += 1).expect("sets");
+                d.sdiff(keys.iter().copied(), |_| n += 1).expect("sets");
+                n
+            });
+            assert!(found > 0, "ints {ints}: the operations found nothing");
+            assert_eq!(
+                allocs, want,
+                "ints {ints}: {allocs} allocations for three ops, wanted {want}"
+            );
+        }
+    }
+
+    /// And past the inline room it still works, which is the half of `Small`
+    /// that only the rare command reaches.
+    #[test]
+    fn a_wide_set_operation_still_answers() {
+        let wide = crate::setops::INLINE_KEYS + 3;
+        let mut d = db();
+        let names: Vec<Vec<u8>> = (0..wide).map(|i| format!("k{i}").into_bytes()).collect();
+        for name in &names {
+            fill(&mut d, name, 8, true);
+        }
+        let keys = || names.iter().map(|k| k.as_slice());
+        let mut inter = 0;
+        d.sinter(keys(), 0, |_| inter += 1).expect("sets");
+        // Every set holds the same eight members, so they all survive.
+        assert_eq!(inter, 8);
+        let mut union = 0;
+        d.sunion(keys(), |_| union += 1).expect("sets");
+        assert_eq!(union, 8);
     }
 
     #[test]
