@@ -479,24 +479,58 @@ impl Listpack {
     /// The one edit primitive: drop some bytes, put some back, fix the header.
     ///
     /// Everything that changes the blob goes through here, so there is one place
-    /// that can leave the length or the count wrong and it is eleven lines long.
+    /// that can leave the length or the count wrong.
+    ///
+    /// It writes the new entry into the blob rather than building it in a `Vec`
+    /// and handing that to `Vec::splice`. The `Vec` was a malloc and a free on
+    /// every `RPUSH`, `LPUSH`, `HSET`, `SADD` and `ZADD` that landed in the
+    /// packed band, which is most of them, for a buffer of a few dozen bytes
+    /// that never outlived the call. Making the hole first and then writing the
+    /// head, the payload and the back length straight into it costs one
+    /// `copy_within` of the tail, which `Vec::splice` was doing as well as the
+    /// allocation.
     fn splice(&mut self, at: usize, remove: usize, insert: Option<&[u8]>, delta: i32) {
         let mut buf = [0u8; 16];
-        let encoded: Vec<u8> = match insert {
+        // Both halves of the new entry, measured before anything moves. An
+        // integer entry is entirely in its head and has no payload, which is
+        // what `encode` says with its second answer.
+        let (head, body) = match insert {
             Some(v) => {
                 let (head, payload) = encode(v, &mut buf);
-                let mut e = Vec::with_capacity(head.len() + v.len() + 5);
-                e.extend_from_slice(head);
-                if payload {
-                    e.extend_from_slice(v);
-                }
-                let len = e.len();
-                write_backlen(&mut e, len);
-                e
+                (head, if payload { v } else { &[][..] })
             }
-            None => Vec::new(),
+            None => (&[][..], &[][..]),
         };
-        self.bytes.splice(at..at + remove, encoded);
+        let entry = head.len() + body.len();
+        // A pure removal puts nothing back, so it has no back length either.
+        let add = if entry == 0 {
+            0
+        } else {
+            entry + backlen_len(entry)
+        };
+
+        // Size the hole before writing into it. Growing moves the tail rightward
+        // and shrinking moves it leftward, and `copy_within` is a `memmove` in
+        // both directions, so an overlap reads what it should either way.
+        let old = self.bytes.len();
+        match add.cmp(&remove) {
+            std::cmp::Ordering::Greater => {
+                self.bytes.resize(old + (add - remove), 0);
+                self.bytes.copy_within(at + remove..old, at + add);
+            }
+            std::cmp::Ordering::Less => {
+                self.bytes.copy_within(at + remove..old, at + add);
+                self.bytes.truncate(old - (remove - add));
+            }
+            std::cmp::Ordering::Equal => {}
+        }
+        if add > 0 {
+            let hole = &mut self.bytes[at..at + add];
+            hole[..head.len()].copy_from_slice(head);
+            hole[head.len()..entry].copy_from_slice(body);
+            write_backlen_into(&mut hole[entry..], entry);
+        }
+
         let total = self.bytes.len();
         self.set_total(total);
         let count = i64::from(u16::from_le_bytes([self.bytes[4], self.bytes[5]]));
@@ -1185,17 +1219,10 @@ pub(crate) const fn backlen_len(len: usize) -> usize {
     }
 }
 
-/// Append the back length for an entry of `len` bytes.
+/// Write the back length for an entry of `len` bytes, and say how long it was.
 ///
 /// The first byte holds the high seven bits and every later byte has its top bit
 /// set, which is what lets it be read from the right hand end leftward.
-fn write_backlen(out: &mut Vec<u8>, len: usize) {
-    let mut buf = [0u8; 5];
-    let n = write_backlen_into(&mut buf, len);
-    out.extend_from_slice(&buf[..n]);
-}
-
-/// The same, into a slice, for a holder that is not growing a `Vec`.
 #[inline]
 fn write_backlen_into(dst: &mut [u8], len: usize) -> usize {
     let n = backlen_len(len);
@@ -1245,6 +1272,49 @@ mod tests {
 
     fn all(lp: &Listpack) -> Vec<Vec<u8>> {
         lp.iter().map(|e| e.to_vec()).collect()
+    }
+
+    /// Every edit used to build the new entry in a `Vec` and throw it away, so
+    /// a blob with room in it still paid a malloc and a free per write. These
+    /// three shapes are the whole of `splice`: an edit that grows the blob, one
+    /// that shrinks it, and one that leaves it the same size. None of them may
+    /// touch the allocator once the blob's own buffer is big enough.
+    #[test]
+    fn editing_a_blob_that_has_room_does_not_allocate() {
+        let mut lp = Listpack::new();
+        for i in 0..200 {
+            lp.push(format!("member:{i:04}").as_bytes());
+        }
+        // Down to a hundred and back up, so the buffer is at its high water
+        // mark and nothing below measures growth.
+        lp.delete(100, 100);
+        for i in 0..100 {
+            lp.push(format!("member:{i:04}").as_bytes());
+        }
+
+        // Built up here rather than inside the count, because `format!` is an
+        // allocation of the test's own and would drown out what is measured.
+        let names: Vec<(Vec<u8>, Vec<u8>)> = (0..100)
+            .map(|i| {
+                (
+                    format!("other:{i:05}").into_bytes(),
+                    format!("member:{i:04}").into_bytes(),
+                )
+            })
+            .collect();
+
+        let (_, allocs) = crate::tally::counted(|| {
+            for (i, (other, original)) in names.iter().enumerate() {
+                // Same length, so the blob does not change size at all.
+                lp.replace(i, other);
+                // Shorter, then back to the original length.
+                lp.replace(i, b"x");
+                lp.replace(i, original);
+            }
+        });
+        assert_eq!(allocs, 0, "editing allocated {allocs} times");
+        assert_eq!(lp.len(), 200);
+        assert_eq!(lp.get(0), Some(Entry::Str(b"member:0000")));
     }
 
     #[test]
@@ -1358,10 +1428,11 @@ mod tests {
     #[test]
     fn the_back_length_reads_the_same_as_it_was_written() {
         for len in [1usize, 127, 128, 16382, 16383, 16384, 2_097_150, 2_097_151] {
-            let mut out = Vec::new();
-            write_backlen(&mut out, len);
+            let mut buf = [0u8; 5];
+            let n = write_backlen_into(&mut buf, len);
+            let out = &buf[..n];
             assert_eq!(out.len(), backlen_len(len), "length {len}");
-            assert_eq!(read_backlen(&out), Some(len), "length {len}");
+            assert_eq!(read_backlen(out), Some(len), "length {len}");
         }
     }
 

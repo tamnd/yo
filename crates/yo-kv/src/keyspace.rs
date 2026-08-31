@@ -74,6 +74,21 @@ pub struct Keyspace {
     pub(crate) rng: Rng,
     /// The last collection key that was resolved, for the command behind it.
     memo: Memo,
+    /// One buffer for the commands that have to hold an element while the
+    /// structure it came out of is being written.
+    ///
+    /// [`Keyspace::lmove`] is the only user today and it is the reason this is
+    /// here: it takes an element out of one list and puts it into another, so
+    /// there is a moment where the bytes belong to nothing, and the borrow it
+    /// would need to avoid that is a borrow of two lists at once when the two
+    /// lists may be the same one. A `Vec` per call is the obvious way to cover
+    /// that moment and it is a malloc and a free on a command that a queue
+    /// sends millions of. This is the same `Vec` every time, cleared rather
+    /// than freed, so the steady state is no allocator call at all.
+    ///
+    /// It lives on the database and not on the caller because both callers are
+    /// wire handlers that are handed a `&mut Keyspace` and nothing else.
+    pub(crate) scratch: Vec<u8>,
 }
 
 /// Where the last collection key resolved to, if it still resolves there.
@@ -196,6 +211,7 @@ impl Keyspace {
             zset_limits: zset::Limits::DEFAULT,
             rng: Rng::new(clock.now_ms() ^ made.wrapping_mul(0x9e37_79b9_7f4a_7c15)),
             memo: Memo::empty(),
+            scratch: Vec::new(),
         }
     }
 
