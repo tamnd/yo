@@ -4,6 +4,35 @@ What each release changed, why, and what it costs you. The versioning rules and 
 
 While the major is 0, a minor release may break anything, including the on-disk format. The format is frozen at `M6`, not before.
 
+## 0.3.4 — 2026-08-31
+
+Three pull requests, no milestone, so this is a patch. It is also the release 0.3.3 was meant to be, for the second time running and for the same underlying reason: a platform the code was not written on.
+
+`v0.3.3` is a tag in git and it is not a release. Its build went red on `windows-latest` because two poller tests assert that a connection nobody is talking to does not get reported as ready, and Windows was running the fallback backend, which reports every registered socket every time. The publish step never ran, so nothing was ever published under 0.3.3 and nothing ever will be. Everything listed under 0.3.3 below is in this release.
+
+The `.yo` layout is untouched.
+
+### Added
+
+- **The list commands are on the wire.** Seventeen of the twenty two: `LPUSH`, `RPUSH`, `LPUSHX`, `RPUSHX`, `LPOP`, `RPOP`, `LLEN`, `LRANGE`, `LINDEX`, `LSET`, `LINSERT`, `LREM`, `LTRIM`, `LPOS`, `RPOPLPUSH`, `LMOVE` and `LMPOP`. The five that are missing are the blocking ones, `BLPOP`, `BRPOP`, `BLMOVE`, `BRPOPLPUSH` and `BLMPOP`, and none of them is missing because the list cannot answer it. They need a client that can be parked and woken, which is machinery the blocking sorted set and stream reads want as well, so it is one piece of work rather than five.
+- **Nothing is collected on the way out.** `LRANGE`, the count form of `LPOP` and `LPOS ... COUNT n` write elements straight into the connection's out buffer as they walk, and the array header goes on afterwards and is rotated into place behind the body. An `LRANGE` over ten thousand elements never builds a ten thousand element `Vec` on the shard thread, which is the same trick `SSCAN` already used.
+- **A real poller on Windows.** `yodb serve` asks `epoll` on Linux and `kqueue` on macOS which connections are ready, and on Windows it was falling through to a scan that tries every registered connection on every turn. That is one syscall per idle connection per loop, which is the cost the poller exists to avoid, and it also means a thousand connection server on Windows does a thousand times the work of the same server on Linux while sitting still. It is `WSAPoll` now, one feature of `windows-sys` and not the whole generated Windows API.
+
+### Fixed
+
+- **The two poller tests that were red on Windows.** They assert that a quiet connection is not reported and that a listener is ready only when somebody is waiting, and neither can be true under a backend that reports everything. Skipping them on Windows was the cheap fix and it would have recorded the slow loop as green, so the backend changed instead.
+- **The docs job, which had been red since the list work went in.** Eight intra doc links in `yo-kv` pointed at private items, and rustdoc will not resolve a link a reader of the public page cannot follow. They are code spans now. `RUSTDOCFLAGS` only had the deny in CI, so `cargo doc` on a laptop printed eight warnings and exited zero, which is how this got merged twice without anyone noticing. It is in `.cargo/config.toml` now.
+
+### Changed
+
+- **`LPOP key` and `LPOP key 2` return different kinds of nothing, and so does everything else with two shapes.** The reply differences were read off a running Redis 8.8 rather than off the documentation, and the one place the documentation is wrong is `LMPOP` with nothing to pop, which the docs call a nil and the wire sends as a null array. That was a real bug in the first draft, found by sending 138 commands to both servers over a raw socket and comparing the bytes, in RESP2 and again in RESP3. All 138 match.
+
+### Known gaps
+
+- No M4 exit gate row has a number yet. The list is reachable from a client now, so a benchmark can finally see it, and a baseline run against Redis 8.10.1 and Valkey 9.1.1 is what the next patch should carry.
+- The zset half of M4, the counted B+ tree and the Scheme B order keys, has not been started.
+- M2 and M3 are both still open on their exit gates, which is why this is a patch and not a minor. That has been true for four patches now.
+
 ## 0.3.3 — 2026-08-31
 
 Three pull requests, no milestone, so this is a patch. It is also the release 0.3.2 was meant to be.

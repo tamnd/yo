@@ -28,7 +28,7 @@ exclude = ["fuzz"]
 [workspace.package]
 # One minor per milestone, patches in between, and nothing here promises
 # anything while the major is 0. See RELEASING.md.
-version = "0.3.3"
+version = "0.3.4"
 edition = "2024"
 rust-version = "1.94"
 license = "MIT OR Apache-2.0"
@@ -37,25 +37,25 @@ homepage = "https://yo.tamnd.dev"
 authors = ["tamnd <tamnd87@gmail.com>"]
 
 [workspace.dependencies]
-yo-alloc = { path = "crates/yo-alloc", version = "0.3.3" }
+yo-alloc = { path = "crates/yo-alloc", version = "0.3.4" }
 # The library is `yo`, the package on crates.io is `yodb`.
-yodb = { path = "crates/yo", version = "0.3.3" }
-yo-arena = { path = "crates/yo-arena", version = "0.3.3" }
-yo-capi = { path = "crates/yo-capi", version = "0.3.3" }
-yo-cli = { path = "crates/yo-cli", version = "0.3.3" }
-yo-common = { path = "crates/yo-common", version = "0.3.3" }
-yo-crash = { path = "crates/yo-crash", version = "0.3.3" }
-yo-file = { path = "crates/yo-file", version = "0.3.3" }
-yo-format = { path = "crates/yo-format", version = "0.3.3" }
-yo-index = { path = "crates/yo-index", version = "0.3.3" }
-yo-kv = { path = "crates/yo-kv", version = "0.3.3" }
-yo-reactor = { path = "crates/yo-reactor", version = "0.3.3" }
-yo-reader = { path = "crates/yo-reader", version = "0.3.3" }
-yo-record = { path = "crates/yo-record", version = "0.3.3" }
-yo-resp = { path = "crates/yo-resp", version = "0.3.3" }
-yo-shape = { path = "crates/yo-shape", version = "0.3.3" }
-yo-shard = { path = "crates/yo-shard", version = "0.3.3" }
-yo-uring = { path = "crates/yo-uring", version = "0.3.3" }
+yodb = { path = "crates/yo", version = "0.3.4" }
+yo-arena = { path = "crates/yo-arena", version = "0.3.4" }
+yo-capi = { path = "crates/yo-capi", version = "0.3.4" }
+yo-cli = { path = "crates/yo-cli", version = "0.3.4" }
+yo-common = { path = "crates/yo-common", version = "0.3.4" }
+yo-crash = { path = "crates/yo-crash", version = "0.3.4" }
+yo-file = { path = "crates/yo-file", version = "0.3.4" }
+yo-format = { path = "crates/yo-format", version = "0.3.4" }
+yo-index = { path = "crates/yo-index", version = "0.3.4" }
+yo-kv = { path = "crates/yo-kv", version = "0.3.4" }
+yo-reactor = { path = "crates/yo-reactor", version = "0.3.4" }
+yo-reader = { path = "crates/yo-reader", version = "0.3.4" }
+yo-record = { path = "crates/yo-record", version = "0.3.4" }
+yo-resp = { path = "crates/yo-resp", version = "0.3.4" }
+yo-shape = { path = "crates/yo-shape", version = "0.3.4" }
+yo-shard = { path = "crates/yo-shard", version = "0.3.4" }
+yo-uring = { path = "crates/yo-uring", version = "0.3.4" }
 
 criterion = "0.8"
 libc = "0.2"
