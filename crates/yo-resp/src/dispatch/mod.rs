@@ -5229,6 +5229,7 @@ mod tests {
             &[b"ARSEEK".as_ref(), b"s", b"1"][..],
             &[b"ARLASTITEMS".as_ref(), b"s", b"1"][..],
             &[b"ARSCAN".as_ref(), b"s", b"0", b"1"][..],
+            &[b"ARGREP".as_ref(), b"s", b"0", b"1", b"EXACT", b"v"][..],
             &[b"AROP".as_ref(), b"s", b"0", b"1", b"SUM"][..],
             &[b"ARINFO".as_ref(), b"s"][..],
         ] {
@@ -5250,6 +5251,7 @@ mod tests {
         assert_eq!(f.run(&[b"ARSET", b"s", b"-1", b"x"]), bad);
         assert_eq!(f.run(&[b"ARDEL", b"s", b"-1"]), bad);
         assert_eq!(f.run(&[b"ARSCAN", b"s", b"-1", b"0"]), bad);
+        assert_eq!(f.run(&[b"ARGREP", b"s", b"-1", b"0", b"EXACT", b"v"]), bad);
         // And on a key that is an array the index is just an index.
         f.run(&[b"ARSET", b"a", b"0", b"x"]);
         assert_eq!(f.run(&[b"ARGET", b"a", b"-1"]), bad);
@@ -5392,6 +5394,149 @@ mod tests {
             f.run(&[b"ARSCAN", b"a", b"0", b"10", b"LIMIT"]),
             "-ERR wrong number of arguments for 'arscan' command\r\n"
         );
+    }
+
+    #[test]
+    fn a_grep_answers_the_indexes_whose_elements_match() {
+        let mut f = Fixture::new();
+        assert_eq!(
+            f.run(&[b"ARGREP", b"nope", b"0", b"10", b"EXACT", b"x"]),
+            "*0\r\n"
+        );
+        f.run(&[b"ARSET", b"a", b"0", b"alpha", b"beta", b"gamma", b"ALPHA"]);
+
+        // The two bounds take the ends of the array as well as an index, and a
+        // reversed range is walked backwards the way ARSCAN walks one.
+        assert_eq!(
+            f.run(&[b"ARGREP", b"a", b"-", b"+", b"GLOB", b"*a"]),
+            "*3\r\n:0\r\n:1\r\n:2\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"ARGREP", b"a", b"+", b"-", b"GLOB", b"*a"]),
+            "*3\r\n:2\r\n:1\r\n:0\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"ARGREP", b"a", b"1", b"2", b"GLOB", b"*a"]),
+            "*2\r\n:1\r\n:2\r\n"
+        );
+
+        // One test each. NOCASE reaches all four of them and it may be written
+        // after the pattern it applies to.
+        assert_eq!(
+            f.run(&[b"ARGREP", b"a", b"-", b"+", b"EXACT", b"alpha"]),
+            "*1\r\n:0\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"ARGREP", b"a", b"-", b"+", b"EXACT", b"alpha", b"NOCASE"]),
+            "*2\r\n:0\r\n:3\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"ARGREP", b"a", b"-", b"+", b"MATCH", b"mm"]),
+            "*1\r\n:2\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"ARGREP", b"a", b"-", b"+", b"RE", b"^[bg]"]),
+            "*2\r\n:1\r\n:2\r\n"
+        );
+
+        // OR is the default and AND has to be asked for, and either way the
+        // last of a repeated option wins.
+        let both: &[&[u8]] = &[
+            b"ARGREP", b"a", b"-", b"+", b"EXACT", b"beta", b"MATCH", b"al",
+        ];
+        assert_eq!(f.run(both), "*2\r\n:0\r\n:1\r\n");
+        assert_eq!(
+            f.run(&[
+                b"ARGREP", b"a", b"-", b"+", b"EXACT", b"beta", b"MATCH", b"al", b"AND"
+            ]),
+            "*0\r\n"
+        );
+        assert_eq!(
+            f.run(&[
+                b"ARGREP", b"a", b"-", b"+", b"EXACT", b"beta", b"MATCH", b"al", b"AND", b"OR"
+            ]),
+            "*2\r\n:0\r\n:1\r\n"
+        );
+
+        // WITHVALUES turns each hit into a pair, and LIMIT counts the hits and
+        // not the positions it had to look at.
+        assert_eq!(
+            f.run(&[
+                b"ARGREP",
+                b"a",
+                b"-",
+                b"+",
+                b"MATCH",
+                b"a",
+                b"WITHVALUES",
+                b"LIMIT",
+                b"2"
+            ]),
+            "*2\r\n*2\r\n:0\r\n$5\r\nalpha\r\n*2\r\n:1\r\n$4\r\nbeta\r\n"
+        );
+        assert_eq!(
+            f.run(&[
+                b"ARGREP", b"a", b"-", b"+", b"EXACT", b"ALPHA", b"LIMIT", b"1"
+            ]),
+            "*1\r\n:3\r\n"
+        );
+    }
+
+    /// Everything ARGREP refuses, in the order it refuses it.
+    #[test]
+    fn a_grep_reports_a_broken_command_the_way_redis_does() {
+        let mut f = Fixture::new();
+        f.run(&[b"ARSET", b"a", b"0", b"alpha"]);
+        let syntax = "-ERR syntax error\r\n";
+
+        // The bounds are read before the plan, so a bad index beats a bad
+        // predicate whichever way round the two are written.
+        assert_eq!(
+            f.run(&[b"ARGREP", b"a", b"-1", b"0", b"NOPE", b"x"]),
+            "-ERR invalid array index\r\n"
+        );
+        assert_eq!(f.run(&[b"ARGREP", b"a", b"0", b"1", b"NOPE", b"x"]), syntax);
+        // A keyword with nothing after it, and a command that asks for nothing.
+        assert_eq!(
+            f.run(&[b"ARGREP", b"a", b"0", b"1", b"NOCASE", b"EXACT"]),
+            syntax
+        );
+        assert_eq!(
+            f.run(&[b"ARGREP", b"a", b"0", b"1", b"EXACT", b"x", b"LIMIT"]),
+            syntax
+        );
+        assert_eq!(
+            f.run(&[b"ARGREP", b"a", b"0", b"1", b"NOCASE", b"WITHVALUES"]),
+            syntax,
+            "a command with no predicate in it at all"
+        );
+        assert_eq!(
+            f.run(&[b"ARGREP", b"a", b"0", b"1", b"EXACT", b"x", b"LIMIT", b"0"]),
+            "-ERR LIMIT must be positive\r\n"
+        );
+        assert_eq!(
+            f.run(&[
+                b"ARGREP", b"a", b"0", b"1", b"EXACT", b"x", b"LIMIT", b"nine"
+            ]),
+            "-ERR value is not an integer or out of range\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"ARGREP", b"a", b"0", b"1", b"RE", b""]),
+            "-ERR regular expression is empty\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"ARGREP", b"a", b"0", b"1", b"RE", b"(a"]),
+            "-ERR invalid regular expression: Missing ')'\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"ARGREP", b"a", b"0", b"1", b"RE", br"(a)\1"]),
+            "-ERR regular expression backreferences are not supported\r\n"
+        );
+        // The arity is minus six, so a predicate keyword with no pattern after
+        // it is short by one and never reaches the parser.
+        let arity = "-ERR wrong number of arguments for 'argrep' command\r\n";
+        assert_eq!(f.run(&[b"ARGREP", b"a", b"0", b"1", b"EXACT"]), arity);
+        assert_eq!(f.run(&[b"ARGREP", b"a", b"0", b"1"]), arity);
     }
 
     #[test]
