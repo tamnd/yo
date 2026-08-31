@@ -440,8 +440,13 @@ impl Keyspace {
         if slots.is_empty() || slots.iter().any(Option::is_none) {
             return Ok(0);
         }
+        // Taken out and put back, so the tables the intersection fills in are
+        // the database's and not a pair the allocator hands out per call.
+        let mut scratch = std::mem::take(&mut self.setops);
         let sets = self.bodies_of(&slots);
-        Ok(setops::inter(&sets, limit, f))
+        let n = setops::inter(&mut scratch, &sets, limit, f);
+        self.setops = scratch;
+        Ok(n)
     }
 
     /// `SINTERCARD numkeys key [key ...] [LIMIT limit]`.
@@ -464,8 +469,14 @@ impl Keyspace {
         F: FnMut(&[u8]),
     {
         let slots = self.set_slots(keys)?;
+        // The database's table rather than one per call, for the reason in
+        // `setops::Scratch`: a union walks everything into a hash table, and
+        // building that table was most of what a `SUNION` over text sets did.
+        let mut scratch = std::mem::take(&mut self.setops);
         let sets = self.bodies_of(&slots);
-        Ok(setops::union(&sets, f))
+        let n = setops::union(&mut scratch, &sets, f);
+        self.setops = scratch;
+        Ok(n)
     }
 
     /// `SDIFF key [key ...]`.
@@ -492,6 +503,7 @@ impl Keyspace {
         keys: impl Iterator<Item = &'k [u8]>,
     ) -> Result<usize> {
         let slots = self.set_slots(keys)?;
+        let mut scratch = std::mem::take(&mut self.setops);
         let built = if slots.is_empty() || slots.iter().any(Option::is_none) {
             None
         } else {
@@ -499,9 +511,10 @@ impl Keyspace {
             // The smallest input, which is an upper bound on any intersection.
             let upper = sets.iter().map(|s| s.len()).min().unwrap_or(0);
             setops::collect(upper, &self.limits, |f| {
-                setops::inter(&sets, 0, f);
+                setops::inter(&mut scratch, &sets, 0, f);
             })
         };
+        self.setops = scratch;
         Ok(self.put_set(destination, built))
     }
 
@@ -512,6 +525,7 @@ impl Keyspace {
         keys: impl Iterator<Item = &'k [u8]>,
     ) -> Result<usize> {
         let slots = self.set_slots(keys)?;
+        let mut scratch = std::mem::take(&mut self.setops);
         let built = {
             let sets = self.bodies_of(&slots);
             // Everything, since a union of sets that share nothing is all of
@@ -519,9 +533,10 @@ impl Keyspace {
             // conversion rather than a wrong answer.
             let upper = sets.iter().map(|s| s.len()).sum();
             setops::collect(upper, &self.limits, |f| {
-                setops::union(&sets, f);
+                setops::union(&mut scratch, &sets, f);
             })
         };
+        self.setops = scratch;
         Ok(self.put_set(destination, built))
     }
 
@@ -694,6 +709,51 @@ mod tests {
             .collect();
         v.sort();
         v
+    }
+
+    /// `SUNION` built a hash table out of the allocator on every call, and over
+    /// text sets that table was most of what the command did.
+    #[test]
+    fn a_union_over_text_sets_does_not_allocate_once_its_table_is_warm() {
+        let mut d = db();
+        add(&mut d, b"a", &[b"alpha", b"beta", b"gamma", b"delta"]);
+        add(&mut d, b"b", &[b"gamma", b"delta", b"epsilon", b"zeta"]);
+        // One call to grow the table to the size of this union. Everything
+        // after it reuses what that one bought.
+        assert_eq!(d.sunion([b"a".as_slice(), b"b"].into_iter(), |_| {}), Ok(6));
+        let (_, allocs) = crate::tally::counted(|| {
+            for _ in 0..50 {
+                assert_eq!(d.sunion([b"a".as_slice(), b"b"].into_iter(), |_| {}), Ok(6));
+            }
+        });
+        assert_eq!(allocs, 0, "sunion allocated {allocs} times in fifty");
+    }
+
+    /// And it still answers when the union is bigger than any before it, which
+    /// is the case the reserve is there for.
+    #[test]
+    fn a_union_larger_than_the_last_one_grows_the_table_and_is_still_right() {
+        let mut d = db();
+        add(&mut d, b"a", &[b"one", b"two"]);
+        add(&mut d, b"b", &[b"two", b"three"]);
+        assert_eq!(d.sunion([b"a".as_slice(), b"b"].into_iter(), |_| {}), Ok(3));
+
+        let many: Vec<Vec<u8>> = (0..500).map(|i| format!("m{i}").into_bytes()).collect();
+        let refs: Vec<&[u8]> = many.iter().map(Vec::as_slice).collect();
+        add(&mut d, b"c", &refs);
+        let mut seen = Vec::new();
+        assert_eq!(
+            d.sunion([b"a".as_slice(), b"c"].into_iter(), |m| seen
+                .push(m.to_vec())),
+            Ok(502)
+        );
+        seen.sort();
+        seen.dedup();
+        assert_eq!(seen.len(), 502, "every member came back once");
+
+        // And back down again, which is the direction that would break if the
+        // table were only ever grown and not cleared.
+        assert_eq!(d.sunion([b"a".as_slice(), b"b"].into_iter(), |_| {}), Ok(3));
     }
 
     #[test]

@@ -194,12 +194,31 @@ impl<V: Copy> Elements<V> {
     #[must_use]
     pub fn with_capacity(n: usize) -> Elements<V> {
         let mut e = Elements::new();
-        if n > 0 {
-            e.rows.reserve(n);
-            e.vals.reserve(n);
-            e.grow_to(slots_for(n));
-        }
+        e.reserve(n);
         e
+    }
+
+    /// Room for `n` elements in a table that already exists.
+    ///
+    /// [`Elements::with_capacity`] for a table being reused rather than built.
+    /// A scratch table that is cleared and refilled on every call keeps
+    /// whatever it grew to last time, so this does nothing at all unless the
+    /// run coming up is bigger than any run before it, which is what takes the
+    /// allocator off a `SUNION` sent in a loop.
+    ///
+    /// The slot array is only rebuilt when it could not hold `n` at the load
+    /// factor, rather than whenever a size is named. Rebuilding it to the size
+    /// it already is would be an allocation asked for by a call whose whole
+    /// point is to avoid one.
+    pub fn reserve(&mut self, n: usize) {
+        if n == 0 {
+            return;
+        }
+        self.rows.reserve(n.saturating_sub(self.rows.len()));
+        self.vals.reserve(n.saturating_sub(self.vals.len()));
+        if n * LOAD_DEN > self.slots.len() * LOAD_NUM {
+            self.grow_to(slots_for(n));
+        }
     }
 
     /// How many elements are here.

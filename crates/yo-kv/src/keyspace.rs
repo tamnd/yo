@@ -117,6 +117,21 @@ pub struct Keyspace {
     /// given to start with. That growth is proportional to the data rather than
     /// per command.
     pub(crate) rows: Vec<usize>,
+
+    /// The tables set algebra fills in, kept rather than built per call.
+    ///
+    /// Same idea again, one level up: a union walks everything into a hash
+    /// table and lets the table be the duplicate check, and building that table
+    /// was the largest single allocation left on any command path. See
+    /// [`setops::Scratch`], which is where the two tables and the argument for
+    /// them live.
+    ///
+    /// It is one table per database and not one per command, so a database that
+    /// has answered a union over a million members holds a million member table
+    /// until it answers a smaller one. That is the trade and it is the right way
+    /// round: the same database had to build that table anyway, and the version
+    /// that threw it away afterwards built it again on the next call.
+    pub(crate) setops: crate::setops::Scratch,
 }
 
 /// How big [`Keyspace::scratch`] starts.
@@ -249,6 +264,7 @@ impl Keyspace {
             memo: Memo::empty(),
             scratch: Vec::with_capacity(SCRATCH),
             rows: Vec::new(),
+            setops: crate::setops::Scratch::new(),
         }
     }
 

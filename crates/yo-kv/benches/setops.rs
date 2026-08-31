@@ -103,9 +103,14 @@ fn bench_crossover(c: &mut Criterion) {
                     BenchmarkId::new(format!("{shape}_{name}"), k),
                     &k,
                     |b, _| {
+                        // Outside `iter`, because a database keeps this table
+                        // between calls and a bench that rebuilt it every
+                        // iteration would be timing an allocation production
+                        // does not make.
+                        let mut sc = setops::Scratch::new();
                         b.iter(|| {
                             let mut n = 0usize;
-                            setops::inter_with(how, black_box(&refs), 0, |_| n += 1);
+                            setops::inter_with(&mut sc, how, black_box(&refs), 0, |_| n += 1);
                             n
                         })
                     },
@@ -131,9 +136,10 @@ fn bench_union_and_diff(c: &mut Criterion) {
         let refs: Vec<&Set> = sets.iter().collect();
 
         g.bench_with_input(BenchmarkId::new("union", k), &k, |b, _| {
+            let mut sc = setops::Scratch::new();
             b.iter(|| {
                 let mut n = 0usize;
-                setops::union(black_box(&refs), |_| n += 1);
+                setops::union(&mut sc, black_box(&refs), |_| n += 1);
                 n
             })
         });
@@ -164,9 +170,10 @@ fn bench_store(c: &mut Criterion) {
         let upper = refs.iter().map(|s| s.len()).min().unwrap_or(0);
 
         g.bench_with_input(BenchmarkId::new("interstore", k), &k, |b, _| {
+            let mut sc = setops::Scratch::new();
             b.iter(|| {
                 setops::collect(upper, &SetLimits::DEFAULT, |f| {
-                    setops::inter(black_box(&refs), 0, f);
+                    setops::inter(&mut sc, black_box(&refs), 0, f);
                 })
                 .map_or(0, |s| s.len())
             })
@@ -270,9 +277,10 @@ fn bench_merge(c: &mut Criterion) {
                     BenchmarkId::new(format!("{shape}_{name}"), k),
                     &k,
                     |b, _| {
+                        let mut sc = setops::Scratch::new();
                         b.iter(|| {
                             let mut n = 0usize;
-                            setops::inter_with(how, black_box(&refs), 0, |_| n += 1);
+                            setops::inter_with(&mut sc, how, black_box(&refs), 0, |_| n += 1);
                             n
                         })
                     },
@@ -292,9 +300,10 @@ fn bench_merge(c: &mut Criterion) {
         // counting table and the difference falls back to a probe.
         for (name, how) in [("union_merge", Plan::Merge), ("union_table", Plan::Probe)] {
             g.bench_with_input(BenchmarkId::new(name, k), &k, |b, _| {
+                let mut sc = setops::Scratch::new();
                 b.iter(|| {
                     let mut n = 0usize;
-                    setops::union_with(how, black_box(&refs), |_| n += 1);
+                    setops::union_with(&mut sc, how, black_box(&refs), |_| n += 1);
                     n
                 })
             });
@@ -324,9 +333,10 @@ fn bench_merge(c: &mut Criterion) {
             ("interstore_probe", Plan::Probe),
         ] {
             g.bench_with_input(BenchmarkId::new(name, k), &k, |b, _| {
+                let mut sc = setops::Scratch::new();
                 b.iter(|| {
                     setops::collect(upper, &SetLimits::DEFAULT, |f| {
-                        setops::inter_with(how, black_box(&refs), 0, f);
+                        setops::inter_with(&mut sc, how, black_box(&refs), 0, f);
                     })
                     .map_or(0, |s| s.len())
                 })
@@ -360,16 +370,18 @@ fn bench_small(c: &mut Criterion) {
             for (what, refs) in [("ints", &int_refs), ("text", &text_refs)] {
                 let id = format!("{what}/k{k}");
                 g.bench_with_input(BenchmarkId::new("inter", &id), &n, |b, _| {
+                    let mut sc = setops::Scratch::new();
                     b.iter(|| {
                         let mut c = 0usize;
-                        setops::inter(black_box(refs), 0, |_| c += 1);
+                        setops::inter(&mut sc, black_box(refs), 0, |_| c += 1);
                         c
                     })
                 });
                 g.bench_with_input(BenchmarkId::new("union", &id), &n, |b, _| {
+                    let mut sc = setops::Scratch::new();
                     b.iter(|| {
                         let mut c = 0usize;
-                        setops::union(black_box(refs), |_| c += 1);
+                        setops::union(&mut sc, black_box(refs), |_| c += 1);
                         c
                     })
                 });
