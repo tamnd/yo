@@ -398,6 +398,15 @@ impl List {
     /// `found` is a `dyn` call rather than a generic, so that the two walks
     /// below stay one body. Monomorphising this over the sink would double a
     /// function whose whole cost is the comparison inside it.
+    ///
+    /// Like [`List::find`] this goes to the band rather than through the element
+    /// walk, and for the same reason: an `LPOS` that is not answered by the
+    /// first few elements reads the list, and reading the list one decoded
+    /// [`Element`] at a time costs about three times what reading it as entry
+    /// headers does. The walk carries the `MAXLEN` budget itself rather than
+    /// counting elements out here, because counting them out here means the
+    /// budget is only checked between calls into the band, which on a ring is
+    /// once a chunk.
     pub fn positions(
         &self,
         value: &[u8],
@@ -411,37 +420,35 @@ impl List {
         }
         let as_int = yo_common::num::parse_i64(value);
         let len = self.len();
-        let skip = rank.unsigned_abs() as usize - 1;
-        let mut seen = 0usize;
-        let mut looked = 0usize;
+        let mut skip = rank.unsigned_abs() as usize - 1;
         let mut hits = 0usize;
-        // One loop over one of the two walks, with the index worked out from
-        // whichever end the walk started at.
-        let mut take = |at: usize, e: Element<'_>| -> bool {
-            looked += 1;
-            if e.is(value, as_int) {
-                seen += 1;
-                if seen > skip {
-                    found(at);
-                    hits += 1;
-                    if count != 0 && hits >= count {
-                        return false;
-                    }
+        {
+            // What to do with a match, wherever the walk found it. A rank past
+            // the first drops matches on the floor until it has dropped enough,
+            // which is why this cannot be the walk's own counter.
+            let mut take = |at: usize| -> bool {
+                if skip > 0 {
+                    skip -= 1;
+                    return true;
                 }
-            }
-            maxlen == 0 || looked < maxlen
-        };
-        if rank > 0 {
-            for (at, e) in self.iter().enumerate() {
-                if !take(at, e) {
-                    break;
-                }
-            }
-        } else {
-            for (back, e) in self.iter_back().enumerate() {
-                if !take(len - back - 1, e) {
-                    break;
-                }
+                found(at);
+                hits += 1;
+                count == 0 || hits < count
+            };
+            if rank > 0 {
+                match &self.body {
+                    Body::Packed(lp) => lp.find_each(value, as_int, maxlen, &mut take),
+                    Body::Chunks(d) => d.find_each(value, as_int, maxlen, &mut take),
+                };
+            } else {
+                // The backward walk counts from the last element and the client
+                // wants indexes from the first, so they are turned round here
+                // and nowhere below.
+                let mut back = |at: usize| take(len - at - 1);
+                match &self.body {
+                    Body::Packed(lp) => lp.find_each_back(value, as_int, maxlen, &mut back),
+                    Body::Chunks(d) => d.find_each_back(value, as_int, maxlen, &mut back),
+                };
             }
         }
         hits
@@ -463,25 +470,29 @@ impl List {
         // so that the ones still to go do not move either.
         let mut hits = Vec::new();
         if count >= 0 {
-            for (at, e) in self.iter().enumerate() {
-                if e.is(value, as_int) {
+            match &self.body {
+                Body::Packed(lp) => lp.find_each(value, as_int, 0, &mut |at| {
                     hits.push(at);
-                    if hits.len() >= want {
-                        break;
-                    }
-                }
-            }
+                    hits.len() < want
+                }),
+                Body::Chunks(d) => d.find_each(value, as_int, 0, &mut |at| {
+                    hits.push(at);
+                    hits.len() < want
+                }),
+            };
             hits.reverse();
         } else {
             let len = self.len();
-            for (back, e) in self.iter_back().enumerate() {
-                if e.is(value, as_int) {
-                    hits.push(len - back - 1);
-                    if hits.len() >= want {
-                        break;
-                    }
-                }
-            }
+            match &self.body {
+                Body::Packed(lp) => lp.find_each_back(value, as_int, 0, &mut |at| {
+                    hits.push(len - at - 1);
+                    hits.len() < want
+                }),
+                Body::Chunks(d) => d.find_each_back(value, as_int, 0, &mut |at| {
+                    hits.push(len - at - 1);
+                    hits.len() < want
+                }),
+            };
         }
         for at in &hits {
             self.remove_at(*at);
@@ -752,6 +763,66 @@ impl Deque {
             base += c.len();
         }
         None
+    }
+
+    /// Every place `value` is, front to back, with indexes from the front.
+    ///
+    /// One `limit` is spent across the whole ring rather than per chunk, which
+    /// is what makes `LPOS`'s `MAXLEN` mean the same thing here as it does on a
+    /// list small enough to still be one blob.
+    fn find_each(
+        &self,
+        value: &[u8],
+        as_int: Option<i64>,
+        limit: usize,
+        hit: &mut dyn FnMut(usize) -> bool,
+    ) -> usize {
+        let mut base = 0usize;
+        let mut looked = 0usize;
+        for c in &self.chunks {
+            if limit != 0 && looked >= limit {
+                break;
+            }
+            let at = base;
+            let mut on = true;
+            looked += c.find_each(value, as_int, limit.saturating_sub(looked), &mut |i| {
+                on = hit(at + i);
+                on
+            });
+            base += c.len();
+            if !on {
+                break;
+            }
+        }
+        looked
+    }
+
+    /// The same from the back, with indexes counted from the last element.
+    fn find_each_back(
+        &self,
+        value: &[u8],
+        as_int: Option<i64>,
+        limit: usize,
+        hit: &mut dyn FnMut(usize) -> bool,
+    ) -> usize {
+        let mut base = 0usize;
+        let mut looked = 0usize;
+        for c in self.chunks.iter().rev() {
+            if limit != 0 && looked >= limit {
+                break;
+            }
+            let at = base;
+            let mut on = true;
+            looked += c.find_each_back(value, as_int, limit.saturating_sub(looked), &mut |i| {
+                on = hit(at + i);
+                on
+            });
+            base += c.len();
+            if !on {
+                break;
+            }
+        }
+        looked
     }
 
     /// `count` elements from `start`, without walking to `start`.
@@ -1711,6 +1782,120 @@ mod tests {
         // two word comparison is for and what it would get wrong if it only
         // looked at one end.
         assert_eq!(l.find(b"v2000000000000000000000000000002"), None);
+    }
+
+    /// `LPOS` reads the same headers the pivot search does, and over a ring it
+    /// has two more things to get wrong: the offset for the chunks in front of
+    /// this one, and the same offset counted the other way for a negative rank.
+    /// A ring of several hundred chunks with a match every seventh element
+    /// catches an off by one in either of them, and every answer is checked
+    /// against the element walk rather than against a number written down here.
+    #[test]
+    fn positions_agree_with_the_element_walk_across_a_ring_of_chunks() {
+        let limits = Limits::default();
+        let mut l = List::new();
+        for i in 0..4_000usize {
+            let v = if i % 7 == 0 {
+                b"wanted".to_vec()
+            } else {
+                format!("element:{i:0width$}", width = 8 + i % 40).into_bytes()
+            };
+            l.push_back(&v, &limits);
+        }
+        assert_eq!(l.encoding(), Encoding::Quicklist, "this needs the ring");
+        let want: Vec<usize> = (0..4_000).filter(|i| i % 7 == 0).collect();
+
+        let mut got = Vec::new();
+        assert_eq!(
+            l.positions(b"wanted", 1, 0, 0, &mut |at| got.push(at)),
+            want.len()
+        );
+        assert_eq!(got, want);
+
+        // The same from the back, which walks the chunks in reverse and turns
+        // every index round twice.
+        let mut got = Vec::new();
+        l.positions(b"wanted", -1, 0, 0, &mut |at| got.push(at));
+        got.reverse();
+        assert_eq!(got, want, "the same matches, found the other way round");
+
+        // A rank in the middle, forward and back, which drops matches before
+        // handing any over.
+        let mut got = Vec::new();
+        l.positions(b"wanted", 4, 3, 0, &mut |at| got.push(at));
+        assert_eq!(got, want[3..6].to_vec());
+        let mut got = Vec::new();
+        l.positions(b"wanted", -4, 3, 0, &mut |at| got.push(at));
+        let mut tail = want[want.len() - 6..want.len() - 3].to_vec();
+        tail.reverse();
+        assert_eq!(got, tail);
+
+        // And a budget, which has to be spent across the whole ring rather than
+        // per chunk: a thousand elements reaches every match under a thousand.
+        let mut got = Vec::new();
+        l.positions(b"wanted", 1, 0, 1_000, &mut |at| got.push(at));
+        assert_eq!(
+            got,
+            want.iter()
+                .copied()
+                .filter(|&i| i < 1_000)
+                .collect::<Vec<_>>()
+        );
+        let mut got = Vec::new();
+        l.positions(b"wanted", -1, 0, 1_000, &mut |at| got.push(at));
+        got.reverse();
+        assert_eq!(
+            got,
+            want.iter()
+                .copied()
+                .filter(|&i| i >= 3_000)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// `LREM` reads the same headers and then removes what it found, so on a
+    /// ring the thing it can get wrong is an index that was right when it was
+    /// collected and stale by the time it is used.
+    #[test]
+    fn removing_across_a_ring_takes_out_exactly_what_was_asked_for() {
+        let limits = Limits::default();
+        let build = || {
+            let mut l = List::new();
+            for i in 0..3_000usize {
+                let v = if i % 5 == 0 {
+                    b"gone".to_vec()
+                } else {
+                    format!("element:{i:0width$}", width = 8 + i % 30).into_bytes()
+                };
+                l.push_back(&v, &limits);
+            }
+            assert_eq!(l.encoding(), Encoding::Quicklist, "this needs the ring");
+            l
+        };
+        let kept: Vec<Vec<u8>> = (0..3_000usize)
+            .filter(|i| i % 5 != 0)
+            .map(|i| format!("element:{i:0width$}", width = 8 + i % 30).into_bytes())
+            .collect();
+
+        let mut l = build();
+        assert_eq!(l.remove(0, b"gone", &limits), 600);
+        assert_eq!(all(&l), kept);
+
+        // From the front, which takes the first ten and leaves the rest.
+        let mut l = build();
+        assert_eq!(l.remove(10, b"gone", &limits), 10);
+        assert_eq!(l.len(), 2_990);
+        assert_eq!(l.find(b"gone"), Some(40), "the eleventh was at 50");
+
+        // And from the back, which takes the last ten.
+        let mut l = build();
+        assert_eq!(l.remove(-10, b"gone", &limits), 10);
+        assert_eq!(l.len(), 2_990);
+        let mut last = 0usize;
+        l.positions(b"gone", -1, 1, 0, &mut |at| last = at);
+        // The last ten matches were at 2950 up, so 2945 is now the last one and
+        // nothing in front of it moved.
+        assert_eq!(last, 2_945);
     }
 
     #[test]

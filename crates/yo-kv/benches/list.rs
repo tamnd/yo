@@ -157,6 +157,31 @@ fn bench_reach(c: &mut Criterion) {
             b.iter(|| black_box(l.find(black_box(&last))))
         });
 
+        // The same distance as `LPOS`, which is the whole list read and one
+        // answer handed back. It is a separate row from `find_far` because it
+        // carries a rank, a count and a `MAXLEN` budget that the pivot search
+        // does not, and the question is whether carrying them costs anything.
+        g.bench_with_input(BenchmarkId::new("lpos_far", n), &n, |b, _| {
+            b.iter(|| {
+                let mut at = 0usize;
+                l.positions(black_box(&last), 1, 1, 0, &mut |p| at = p);
+                black_box(at)
+            })
+        });
+
+        // And `LPOS` with a negative rank for something at the front, which is
+        // the whole list read the other way. The backward walk steps by back
+        // lengths rather than by headers, so this is the row that says whether
+        // the two directions cost the same.
+        let first = value(0);
+        g.bench_with_input(BenchmarkId::new("lpos_far_back", n), &n, |b, _| {
+            b.iter(|| {
+                let mut at = 0usize;
+                l.positions(black_box(&first), -1, 1, 0, &mut |p| at = p);
+                black_box(at)
+            })
+        });
+
         // `LRANGE` over a window in the middle, which is a locate and then a
         // sequential read, and is the shape a paging client actually sends. The
         // start moves over the middle half for the same reason the row above

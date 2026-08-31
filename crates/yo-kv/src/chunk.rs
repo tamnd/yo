@@ -449,6 +449,38 @@ impl Chunk {
         crate::listpack::scan_for(&self.bytes[self.head..self.tail], value, as_int, 1)
     }
 
+    /// Every place `value` is in this chunk, front to back.
+    ///
+    /// `limit` caps how many elements are looked at with 0 meaning no cap, `hit`
+    /// says whether to carry on, and what comes back is how many elements were
+    /// looked at so a caller walking a ring can carry one budget across it.
+    pub fn find_each(
+        &self,
+        value: &[u8],
+        as_int: Option<i64>,
+        limit: usize,
+        hit: &mut dyn FnMut(usize) -> bool,
+    ) -> usize {
+        crate::listpack::scan_each(&self.bytes[self.head..self.tail], value, as_int, limit, hit)
+    }
+
+    /// The same from the back, with indexes counted from the last element here.
+    pub fn find_each_back(
+        &self,
+        value: &[u8],
+        as_int: Option<i64>,
+        limit: usize,
+        hit: &mut dyn FnMut(usize) -> bool,
+    ) -> usize {
+        crate::listpack::scan_each_back(
+            &self.bytes[self.head..self.tail],
+            value,
+            as_int,
+            limit,
+            hit,
+        )
+    }
+
     /// A forward walk over what is here.
     #[must_use]
     pub fn iter(&self) -> Iter<'_> {
