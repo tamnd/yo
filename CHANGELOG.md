@@ -4,18 +4,6 @@ What each release changed, why, and what it costs you. The versioning rules and 
 
 While the major is 0, a minor release may break anything, including the on-disk format. The format is frozen at `M6`, not before.
 
-## Unreleased
-
-### Changed
-
-- **Comparing two short byte strings no longer calls `memcmp`.** `a == b` on two slices is a call into the platform's `memcmp`, which is the right answer for a megabyte and the wrong one for a key. `yo_common::bytes_eq` compares in machine words and stays inline, with the last word overlapping the one before it so that nineteen bytes is three loads and no tail loop. It is used at the three places the hot path always goes through: the key comparison in the index, the member comparison in the element table, and the memo in the keyspace.
-- **An integer reply is formatted into a copy of a length the compiler can see.** `push_u64` was building the digits from the back of a twenty byte buffer and copying `buf[i..]`, a length only known at run time, which is a call into `memmove` that costs more to enter than it does to move a digit. The digits now go in from the front and the whole buffer is copied and cut back, and `i64_len` counts digits with `ilog10` rather than a loop of divides.
-
-### Added
-
-- **Engine bench rows for the hot key shape, `engine/sadd` and `engine/srandmember`.** Both fill `set:hot` with 100000 members before the measured runs start, which is past every representation boundary, so the row measures the shape a hot key has in a benchmark that has been running for ten seconds rather than the listpack it passed through on the way there. The member `SADD` adds is one that is already there, which is the steady state of the gate row, because memtier draws from a fixed range and a run long enough to measure spends most of itself adding members the set already holds.
-- **`YO_SPIN_FILL` in the `spin` profiling target.** It puts N members in the command's key before the loop starts, so `spin` can be pointed at the same hot key shape the bench measures.
-
 ## 0.3.2 — 2026-08-31
 
 Sixty one pull requests and no milestone, so this is a patch, and it is a much bigger one than the rule in RELEASING.md intends. The cadence slipped while M2 and M3 were both moving at once and the honest fix is to cut what is there rather than to keep waiting for a milestone to close. M2 now has a server a Redis client can talk to and M3 has sets and hashes complete, but neither has passed its exit gate, so the minor that carries them is still to come.
@@ -32,6 +20,9 @@ The `.yo` layout is untouched. The record header in the arena gained a type tag 
 - **The compaction threshold is an eighth dead rather than a quarter.** In the steady state a store holds about live divided by one minus this ratio, so a quarter was holding a third more than it was keeping and an eighth holds a seventh more. Measured over 100000 keys of 64 bytes rewritten four to thirteen times, that is 2 MB. Lower buys nothing, because below an eighth no segment qualifies until one of them is a quarter dead.
 - **Maintenance runs once per batch rather than once per turn of the loop.** A turn carries one command or a thousand depending on how many clients are pipelining, so the rate at which garbage was collected had nothing to do with the rate at which it was made, and on a saturated server the second one wins. The same 400000 sets settled at seven segments on the server and six in a process running the writes directly, and the difference was entirely that the server never caught up.
 - **A pull request is checked out at its head and not at `refs/pull/N/merge`.** The merge ref stops existing the moment the pull request is merged, and merging as soon as the local checks are green means the jobs that were still running lose the ref out from under them.
+
+- **Comparing two short byte strings no longer calls `memcmp`.** `a == b` on two slices is a call into the platform's `memcmp`, which is the right answer for a megabyte and the wrong one for a key. `yo_common::bytes_eq` compares in machine words and stays inline, with the last word overlapping the one before it so that nineteen bytes is three loads and no tail loop. It is used at the three places the hot path always goes through: the key comparison in the index, the member comparison in the element table, and the memo in the keyspace.
+- **An integer reply is formatted into a copy of a length the compiler can see.** `push_u64` was building the digits from the back of a twenty byte buffer and copying `buf[i..]`, a length only known at run time, which is a call into `memmove` that costs more to enter than it does to move a digit. The digits now go in from the front and the whole buffer is copied and cut back, and `i64_len` counts digits with `ilog10` rather than a loop of divides.
 
 ### Added
 
@@ -93,6 +84,9 @@ The `.yo` layout is untouched. The record header in the arena gained a type tag 
 - **Sets and keys on the embedded side.** `db.sets()` is the keyspace shape with the key as the first argument and `db.set("online")` holds the key for you, the same two doors the strings already had. Every read that hands back members comes in both forms, `members()` allocating a `Vec` per member and `for_each()` handing each one over where it lies, which matters because a set of integers is stored as integers and walking a million of them with `members` formats a million numbers. `Keys` is the handle for the commands that belong to no type, with `exists`, `count`, `kind`, `del`, `expire_in`, `expire_at`, `ttl`, `deadline` and `persist`, and `ttl` answers an enum with three variants rather than Redis's three answers packed into one integer, because a key that is gone and a key that is never going away are different things and code that confuses them deletes the wrong data.
 - **Two sets from two different databases cannot be intersected with each other.** Without the check a handle from elsewhere contributes its key and not its contents, so the answer is computed against whatever this database happens to hold under that name. That is not an error and not an empty result, it is a plausible wrong one, and there is a test with a decoy in it that would pass if the check were removed and the answer were merely empty.
 - **`INFO` says where the memory went.** `used_memory` is one number and one number cannot tell you whether a store is holding too much because its records are fat, because nothing has come back for the ones it overwrote, or because its clients are sitting on buffers. `used_memory_dataset` and `used_memory_overhead` are Redis's names for the same split, and `mem_arena` and `mem_index` are ours and named so nobody mistakes them for something Redis reports. There is a CPU section now as well, with four of Redis's six numbers, because the two that are missing need `RUSAGE_THREAD` and reporting process totals under a thread's name would be a wrong number rather than a missing one.
+
+- **Engine bench rows for the hot key shape, `engine/sadd` and `engine/srandmember`.** Both fill `set:hot` with 100000 members before the measured runs start, which is past every representation boundary, so the row measures the shape a hot key has in a benchmark that has been running for ten seconds rather than the listpack it passed through on the way there. The member `SADD` adds is one that is already there, which is the steady state of the gate row, because memtier draws from a fixed range and a run long enough to measure spends most of itself adding members the set already holds.
+- **`YO_SPIN_FILL` in the `spin` profiling target.** It puts N members in the command's key before the loop starts, so `spin` can be pointed at the same hot key shape the bench measures.
 
 ### Fixed
 
@@ -198,6 +192,12 @@ Giving a segment back over many calls instead of one is the other half. Compacti
 #### One probe where there were two or three
 
 `GET` used to look a key up three times, once to see whether the deadline had passed, once to check the type and once to read it, each of which is its own cache miss on a database that does not fit in cache. In process on a hundred thousand keys it goes from 77 ns to 35 ns, best run against best run, and the ratio is worth more than either number because the box was not quiet. Every set and hash command started with a reap and then a get for the same reason, and folding those took a hot key `SADD` from 47.0 ns to 29.1 ns on an M1, which is the single member onto one key shape that has no spread to exploit. `SPOP` was allocating a `Vec` per member on the way out and copying all of it into the reply buffer, and it now writes each member straight from the set into the buffer, which the tests check with a counting allocator rather than by assertion: the borrowing draw allocates zero times for a whole set in each of the three representations.
+
+#### Two calls that were not doing any work
+
+A profile of `SADD` against a set that already holds the member spent seven percent of the command inside the platform's `memcmp` and eleven percent inside its `memmove`. The `memcmp` is `a == b` on two byte slices, which the index probe, the element table probe and the keyspace memo each do to check that the key they landed on is the key they were asked for, and for nineteen bytes the call and the length dispatch inside it are most of the cost. The `memmove` is the integer reply, where a `:0` went out of line to move one byte because the length of the copy was only known at run time.
+
+Both are gone from the profile. The minimum of seven interleaved runs on a laptop that was not quiet, before against after: `SADD` on a hot key 71.5 to 70.0 ns, `SRANDMEMBER` 74.6 to 72.0, `SET` 69.6 to 69.5, `INCR` 59.8 to 56.7, `GET` on a missing key 37.7 to 37.2. `INCR` moves most because it pays for both, and `SET` barely moves because its reply is a constant and its key is compared once. These are development numbers on a machine that has other work on it, not gate numbers.
 
 #### What the structures cost
 
