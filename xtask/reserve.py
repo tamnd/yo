@@ -1646,7 +1646,16 @@ export default {{ NOT_YET, open }};
     # variable, and it expands ${NPM_TOKEN} inside one. Written into the build
     # root rather than into ~/.npmrc so a publish run cannot leave a credential
     # behind in the home directory of whatever machine it happened on.
-    _w(root, ".npmrc", "//registry.npmjs.org/:_authToken=${NPM_TOKEN}\n")
+    #
+    # Not written at all under trusted publishing, and that is not a tidiness
+    # point. npm picks the classic token path whenever it finds an auth line and
+    # only falls back to OIDC when it does not, so an .npmrc naming an unset
+    # ${NPM_TOKEN} does not fail loudly — it authenticates as nobody and the
+    # error talks about permissions on the package. The npm docs list exactly
+    # this as the usual reason trusted publishing "does not work" after it has
+    # been configured correctly.
+    if not oidc():
+        _w(root, ".npmrc", "//registry.npmjs.org/:_authToken=${NPM_TOKEN}\n")
 
     return (
         [Step("pack and verify", ["npm", "pack", "--dry-run"], root)],
@@ -2000,6 +2009,19 @@ BUILDERS = {
     "cocoapods": b_cocoapods,
 }
 
+def oidc() -> bool:
+    """Whether this run can mint short-lived credentials from GitHub.
+
+    `ACTIONS_ID_TOKEN_REQUEST_URL` and not `GITHUB_ACTIONS`, because the two
+    answer different questions. Every job on Actions sets the second one; only a
+    job that was actually granted `id-token: write` gets the first. Keying off
+    the weaker signal would make a workflow that forgot the permission look like
+    a workflow that does not need a credential, and it would fail at the upload
+    with whatever the registry says about anonymous requests.
+    """
+    return bool(os.environ.get("ACTIONS_ID_TOKEN_REQUEST_URL"))
+
+
 # The credential each builder needs before it is worth starting.
 #
 # Every one of these is needed to publish. Some are needed earlier than that:
@@ -2043,6 +2065,34 @@ BUILD_NEEDS = {
     "docker-hub": ["DOCKERHUB_USERNAME", "DOCKERHUB_TOKEN"],
 }
 
+# What each registry stops needing when GitHub can mint a credential for it.
+#
+# Two shapes hide behind one table. PyPI, npm and pub.dev need *nothing*: `uv
+# publish` and `npm publish` detect the OIDC environment themselves and exchange
+# a token without being told to, and pub.dev's is placed in the pub cache by the
+# workflow before this runs. crates.io and NuGet still read an environment
+# variable, but the workflow fills it from a short-lived key that a GitHub
+# action exchanged for the id token, so the *name* is unchanged and the thing
+# behind it lives under an hour. That is why they are absent here: the check
+# that the variable is set is still the right check.
+#
+# Maven Central and Docker Hub are absent because neither offers this at all,
+# and their tokens are the two that survive §9's deletion pass.
+OIDC_FREE = {
+    "pypi": ["UV_PUBLISH_TOKEN"],
+    "npm": ["NPM_TOKEN"],
+    "pub.dev": ["PUB_CREDENTIALS"],
+}
+
+
+def needs_for(reg: str, publishing: bool) -> list[str]:
+    """The credentials this particular run cannot proceed without."""
+    wanted = list(NEEDS[reg]) if publishing else list(BUILD_NEEDS.get(reg, []))
+    if oidc():
+        free = OIDC_FREE.get(reg, ())
+        wanted = [v for v in wanted if v not in free]
+    return wanted
+
 
 def cmd_apply(args) -> int:
     rows = load(args.file)
@@ -2058,8 +2108,7 @@ def cmd_apply(args) -> int:
         )
         return 2
 
-    wanted = NEEDS[reg] if args.yes else BUILD_NEEDS.get(reg, [])
-    missing = [v for v in wanted if not os.environ.get(v)]
+    missing = [v for v in needs_for(reg, args.yes) if not os.environ.get(v)]
     if missing:
         print(f"missing credential(s): {', '.join(missing)}. Run `yoenv`.", file=sys.stderr)
         return 2
@@ -2069,7 +2118,7 @@ def cmd_apply(args) -> int:
     # spends the minutes, and it is still worth running: the build and the check
     # are the parts that fail.
     if not args.yes:
-        later = [v for v in NEEDS[reg] if not os.environ.get(v)]
+        later = [v for v in needs_for(reg, True) if not os.environ.get(v)]
         if later:
             print(f"note: {', '.join(later)} not set, so --yes would refuse this run.")
 
