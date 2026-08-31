@@ -10,6 +10,7 @@
 pub mod addr;
 pub mod blake3;
 pub mod crc;
+pub mod dtoa;
 pub mod eq;
 pub mod error;
 pub mod glob;

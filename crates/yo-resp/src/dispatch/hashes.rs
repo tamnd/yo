@@ -156,7 +156,7 @@ pub(super) fn execute(db: &mut Keyspace, spec: &Spec, args: Args<'_>, out: &mut 
         // what the client sees and what the next read returns.
         "hincrbyfloat" => {
             let by = incr_float(args.get(3))?;
-            out.bulk_double(db.hincrbyfloat(args.get(1), args.get(2), by)?);
+            out.human_double(db.hincrbyfloat(args.get(1), args.get(2), by)?);
         }
         "hrandfield" => randfield(db, args, out)?,
         "hscan" => scan(db, args, out)?,

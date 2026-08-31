@@ -22,7 +22,9 @@
 //! mode of that is a command that works on one protocol and not the other.
 
 use crate::proto::Proto;
-use yo_common::num::{DIGITS_MAX, i64_len, push_double, push_i64, push_u64, u64_digits, u64_len};
+use yo_common::num::{
+    DIGITS_MAX, i64_len, push_double, push_human, push_i64, push_u64, u64_digits, u64_len,
+};
 
 /// A reply buffer for one connection.
 ///
@@ -294,9 +296,9 @@ impl Out {
 
     /// A bulk string holding a double in Redis's own formatting.
     ///
-    /// `INCRBYFLOAT` replies with one of these in both protocols, so this is
-    /// not the same thing as [`Out::double`] and cannot be written in terms of
-    /// it.
+    /// A score written into a flat RESP2 reply arrives here rather than at
+    /// [`Out::double`], because there is no protocol choice left to make by
+    /// then.
     ///
     /// The length has to go in front of the digits and the digits cannot be
     /// counted without writing them, so they are written first, the header is
@@ -304,9 +306,26 @@ impl Out {
     /// couple of dozen bytes at most, so the rotate is a few words, and nothing
     /// is allocated to hold a number on its way into a buffer it is already in.
     pub fn bulk_double(&mut self, d: f64) {
+        self.bulk_written(|buf| push_double(buf, d));
+    }
+
+    /// A bulk string holding a double the way the two float increments write
+    /// one.
+    ///
+    /// `INCRBYFLOAT` and `HINCRBYFLOAT` go through `ld2string` in its human
+    /// mode where every other double goes through `d2string`, and the two
+    /// disagree about large and small magnitudes: this one never writes an
+    /// exponent. Both of them reply with a bulk string on RESP2 and on RESP3
+    /// alike, so unlike [`Out::double`] there is no protocol branch here.
+    pub fn human_double(&mut self, d: f64) {
+        self.bulk_written(|buf| push_human(buf, d));
+    }
+
+    /// A bulk string whose contents are written by `f` and measured after.
+    fn bulk_written(&mut self, f: impl FnOnce(&mut Vec<u8>)) {
         self.buf.reserve(48);
         let start = self.buf.len();
-        push_double(&mut self.buf, d);
+        f(&mut self.buf);
         let digits = self.buf.len() - start;
         self.buf.push(b'$');
         push_u64(&mut self.buf, digits as u64);

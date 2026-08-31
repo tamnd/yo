@@ -207,7 +207,14 @@ pub fn parse_i64(s: &[u8]) -> Option<i64> {
 }
 
 /// The largest magnitude Redis's `double2ll` will turn into an integer.
-const DOUBLE_INT_LIMIT: f64 = 4_503_599_627_370_496.0; // 2^52
+///
+/// `double2ll` refuses anything outside `LLONG_MAX / 2`, which as a double is
+/// exactly two to the sixty second, and then checks that the value survives a
+/// round trip through a `long long`. Everything inside that range and integral
+/// is written with the integer printer rather than the digit generator, and
+/// that decision is visible: at this magnitude the digit generator would switch
+/// to an exponent.
+const DOUBLE_INT_LIMIT: f64 = 4_611_686_018_427_387_904.0; // 2^62
 
 /// Redis's `getLongDoubleFromObject`, as far as the difference is observable.
 ///
@@ -345,20 +352,51 @@ fn exp2(mut n: i32) -> f64 {
     out
 }
 
+/// Room for the longest thing [`write_double`] or [`write_g17`] can write.
+///
+/// Both of them are bounded by the same thing, a mantissa of seventeen digits
+/// with a handful of zeros or a `.` and an exponent around it, and neither can
+/// reach thirty two bytes. It is worth saying out loud that this used to be
+/// three hundred and fifty two, because Rust's printer writes every leading
+/// zero of a subnormal, and the port of Redis's own printer is what shrank it.
+pub const DOUBLE_MAX: usize = 32;
+
+const _: () = assert!(DOUBLE_MAX >= crate::dtoa::MAX);
+
 /// Appends a double the way Redis 8 writes one.
 ///
-/// Redis stopped using `%.17g` in 7.0 and now writes a double in two cases: a
-/// value that is exactly an integer within two to the fifty second is written
-/// as an integer, and everything else goes through a shortest round trip
-/// printer. Rust's own `Display` for `f64` is the same kind of shortest round
-/// trip printer, so the bytes agree for every value either of them is likely to
-/// be handed. The one place they can still differ is very large or very small
-/// magnitudes, where the C printer switches to an exponent and Rust does not,
-/// and that is recorded rather than worked around.
+/// This is `d2string`. Redis stopped using `%.17g` in 7.0 and now writes a
+/// double in two cases: a value that is exactly an integer inside two to the
+/// sixty second is written with the integer printer, and everything else goes
+/// through the Grisu2 in [`crate::dtoa`]. Zero is checked before either of
+/// them, which is the only reason negative zero comes back as `-0` rather than
+/// as `0`.
 ///
 /// The infinities and NaN are written as bare words because that is what RESP3
 /// says and what RESP2 clients have always been given.
 pub fn push_double(out: &mut Vec<u8>, d: f64) {
+    let mut buf = [0u8; DOUBLE_MAX];
+    out.extend_from_slice(write_double(&mut buf, d));
+}
+
+/// Appends a double the way `INCRBYFLOAT` and `HINCRBYFLOAT` write one, which
+/// is not the way everything else does.
+///
+/// Those two go through `ld2string` in its human mode rather than through
+/// `d2string`, and the human mode is `%.17Lf` with the trailing zeros taken off
+/// and a lone `-0` turned back into `0`. Being a fixed point conversion it never
+/// writes an exponent, so `INCRBYFLOAT key 1e30` answers a one and thirty zeros
+/// where `ZSCORE` would answer `1e+30` for the same number.
+///
+/// The digits are the shortest ones rather than seventeen decimal places of the
+/// `f64`, and that is the closer answer rather than the lazier one. Redis holds
+/// the value in a long double, so `%.17Lf` of one tenth is `0.10000000000000000`
+/// and comes back as `0.1` once the zeros are stripped. Seventeen decimal places
+/// of the `f64` would be `0.10000000000000001`, which is a worse match for the
+/// same reason D-11 gives: the extra width is what makes the long double print
+/// cleanly, and shortest digits land on the same text without pretending to have
+/// it.
+pub fn push_human(out: &mut Vec<u8>, d: f64) {
     if d.is_nan() {
         out.extend_from_slice(b"nan");
         return;
@@ -367,6 +405,8 @@ pub fn push_double(out: &mut Vec<u8>, d: f64) {
         out.extend_from_slice(if d > 0.0 { b"inf" } else { b"-inf" });
         return;
     }
+    // Negative zero loses its sign here, which is the one thing the human mode
+    // says out loud and `d2string` does the other way round.
     if d.fract() == 0.0 && d.abs() <= DOUBLE_INT_LIMIT {
         push_i64(out, d as i64);
         return;
@@ -378,39 +418,46 @@ pub fn push_double(out: &mut Vec<u8>, d: f64) {
     let _ = write!(sink, "{d}");
 }
 
-/// Room for the longest thing [`push_double`] can write.
-///
-/// Rust's printer never switches to an exponent, so the widest output is a
-/// number small enough to need every leading zero: the smallest subnormal is
-/// `0.` and then three hundred and twenty three digits. The largest magnitude is
-/// shorter than that, at three hundred and nine digits and a sign.
-pub const DOUBLE_MAX: usize = 352;
-
 /// Writes a double into a fixed buffer, byte for byte what [`push_double`]
 /// would append.
 ///
-/// This exists for the one caller that has to know what the digits would be
-/// without having anywhere to put them: the array type stores a value as a
+/// The two are the same code now, and this is the one that does the work,
+/// because the digit generator wants somewhere to put eighteen digits before it
+/// knows how many of them it is going to keep. The caller that needs it as a
+/// buffer rather than as a reply is the array type, which stores a value as a
 /// double only when the double prints back as the exact bytes the client sent,
-/// so it formats a candidate, compares, and usually throws it away. Doing that
-/// through a `Vec` would be an allocation per write on a shard thread.
+/// so it formats a candidate, compares, and usually throws it away.
 pub fn write_double(buf: &mut [u8; DOUBLE_MAX], d: f64) -> &[u8] {
-    let mut sink = SliceSink { buf, at: 0 };
+    // Zero first, so that the sign of a negative zero survives. The integer
+    // path below would lose it and Redis checks in this order for that reason.
+    if d == 0.0 {
+        let n = if d.is_sign_negative() {
+            buf[..2].copy_from_slice(b"-0");
+            2
+        } else {
+            buf[0] = b'0';
+            1
+        };
+        return &buf[..n];
+    }
     if d.is_nan() {
-        let _ = sink.write_str("nan");
-    } else if d.is_infinite() {
-        let _ = sink.write_str(if d > 0.0 { "inf" } else { "-inf" });
-    } else if d.fract() == 0.0 && d.abs() <= DOUBLE_INT_LIMIT {
+        buf[..3].copy_from_slice(b"nan");
+        return &buf[..3];
+    }
+    if d.is_infinite() {
+        let text: &[u8] = if d > 0.0 { b"inf" } else { b"-inf" };
+        buf[..text.len()].copy_from_slice(text);
+        return &buf[..text.len()];
+    }
+    if d.fract() == 0.0 && d.abs() <= DOUBLE_INT_LIMIT {
         let mut digits = [0u8; DIGITS_MAX];
         let text = i64_digits(&mut digits, d as i64);
         let n = text.len();
-        sink.buf[..n].copy_from_slice(text);
-        sink.at = n;
-    } else {
-        let _ = write!(sink, "{d}");
+        buf[..n].copy_from_slice(text);
+        return &buf[..n];
     }
-    let at = sink.at;
-    &buf[..at]
+    let n = crate::dtoa::dtoa(d, buf);
+    &buf[..n]
 }
 
 /// Writes a double the way C's `%.17g` writes one, which is what `AROP`
@@ -698,11 +745,21 @@ mod tests {
     fn doubles_are_written_the_way_redis_writes_them() {
         let cases: &[(f64, &str)] = &[
             (0.0, "0"),
-            (-0.0, "0"),
+            // Redis checks for zero before it checks for an integer, so this
+            // keeps its sign where the integer printer would have dropped it.
+            (-0.0, "-0"),
             (3.0, "3"),
             (-3.0, "-3"),
             (3.5, "3.5"),
             (0.1, "0.1"),
+            // The integer printer reaches two to the sixty second, and past it
+            // the digit generator takes over and switches to an exponent.
+            (4.611686018427388e18, "4611686018427387904"),
+            (1e19, "1e+19"),
+            (1e30, "1e+30"),
+            (1e-7, "1e-7"),
+            (1e-6, "0.000001"),
+            (5e-324, "5e-324"),
             (f64::INFINITY, "inf"),
             (f64::NEG_INFINITY, "-inf"),
             (f64::NAN, "nan"),
@@ -712,6 +769,44 @@ mod tests {
             push_double(&mut v, d);
             assert_eq!(String::from_utf8(v).unwrap(), want, "writing {d}");
         }
+    }
+
+    /// The human printer is the other one, and the difference is the exponent.
+    ///
+    /// `INCRBYFLOAT` and `HINCRBYFLOAT` are the only two commands that use it,
+    /// and the reason it exists as a separate thing is the last four rows: a
+    /// fixed point conversion has no exponent form to switch to, so a magnitude
+    /// that comes back as `1e+30` from a score comes back written out in full
+    /// from an increment.
+    #[test]
+    fn the_increment_printer_never_writes_an_exponent() {
+        let cases: &[(f64, &str)] = &[
+            (0.0, "0"),
+            // The human mode says so explicitly, where `d2string` keeps it.
+            (-0.0, "0"),
+            (3.0, "3"),
+            (3.5, "3.5"),
+            (0.1, "0.1"),
+            (10.5, "10.5"),
+            (0.30000000000000004, "0.30000000000000004"),
+            (1e30, "1000000000000000000000000000000"),
+            (1e19, "10000000000000000000"),
+            (1e-7, "0.0000001"),
+            (f64::INFINITY, "inf"),
+            (f64::NEG_INFINITY, "-inf"),
+            (f64::NAN, "nan"),
+        ];
+        for &(d, want) in cases {
+            let mut v = Vec::new();
+            push_human(&mut v, d);
+            assert_eq!(String::from_utf8(v).unwrap(), want, "writing {d}");
+        }
+        // The smallest subnormal, which is where the lack of an exponent form
+        // costs the most: `0.` and then three hundred and twenty four places.
+        let mut v = Vec::new();
+        push_human(&mut v, 5e-324);
+        assert_eq!(v.len(), 326);
+        assert!(v.starts_with(b"0.0") && v.ends_with(b"5"));
     }
 
     /// The two double writers have to agree, because one is used to predict the
