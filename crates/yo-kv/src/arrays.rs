@@ -59,6 +59,23 @@ pub const GETRANGE_MAX: u64 = 1_000_000;
 ///
 /// [`Code::Invalid`] with Redis's own message, for anything else.
 pub fn parse_index(bytes: &[u8]) -> Result<u64> {
+    parse_ull(bytes, false)
+}
+
+/// Reads the one index that may be `2^64 - 1`, which is `ARSEEK`'s.
+///
+/// Seeking to the top of the space is how the cursor gets into the state where
+/// the next append has nowhere to go, and that state has to be reachable from a
+/// command because the log that rebuilds a database is made of commands.
+///
+/// # Errors
+///
+/// [`Code::Invalid`] with Redis's own message, the same as [`parse_index`].
+pub fn parse_seek_index(bytes: &[u8]) -> Result<u64> {
+    parse_ull(bytes, true)
+}
+
+fn parse_ull(bytes: &[u8], allow_max: bool) -> Result<u64> {
     let bad = || Error::new(Code::Invalid, BAD_INDEX);
     if bytes.is_empty() || bytes.len() > 20 {
         return Err(bad());
@@ -78,7 +95,7 @@ pub fn parse_index(bytes: &[u8]) -> Result<u64> {
             .and_then(|n| n.checked_add(u64::from(c - b'0')))
             .ok_or_else(bad)?;
     }
-    if n > INDEX_MAX {
+    if n > INDEX_MAX && !allow_max {
         return Err(bad());
     }
     Ok(n)
@@ -331,6 +348,153 @@ impl Keyspace {
         Ok(gone)
     }
 
+    /// `ARINSERT key value [value ...]`, which appends at the cursor.
+    ///
+    /// Answers the index the last value landed on. The cursor starts at zero
+    /// and a plain `ARSET` never moves it, so an array somebody has written by
+    /// index and then appended to will have the first append land on top of
+    /// index zero. That is Redis's behaviour and it is the reason `ARSEEK`
+    /// exists.
+    ///
+    /// # Errors
+    ///
+    /// [`Code::Invalid`] when the batch would run off the top of the index
+    /// space, checked before any of it is written.
+    pub fn arinsert<'v>(
+        &mut self,
+        key: &[u8],
+        values: impl Iterator<Item = &'v [u8]> + Clone,
+    ) -> Result<u64> {
+        for v in values.clone() {
+            strings::check_len(key, v.len())?;
+        }
+        let at = match self.array_slot(key)? {
+            Some(at) => at,
+            // A new array has its cursor at zero, so the append below cannot
+            // fail on one and cannot leave an empty key behind.
+            None => self.new_array(key),
+        };
+        self.arrays
+            .get_mut(at)
+            .expect("the record points at its body")
+            .append(values)
+    }
+
+    /// `ARRING key size value [value ...]`, a ring buffer over the indices.
+    ///
+    /// Answers the index the last value landed on. `size` has to be at least
+    /// one, which the caller checks because Redis reports a bad size before it
+    /// has even looked at the key.
+    pub fn arring<'v>(
+        &mut self,
+        key: &[u8],
+        size: u64,
+        values: impl Iterator<Item = &'v [u8]> + Clone,
+    ) -> Result<u64> {
+        debug_assert!(size > 0, "the caller checks the size");
+        for v in values.clone() {
+            strings::check_len(key, v.len())?;
+        }
+        let at = match self.array_slot(key)? {
+            Some(at) => at,
+            None => self.new_array(key),
+        };
+        self.arrays
+            .get_mut(at)
+            .expect("the record points at its body")
+            .ring(size, values)
+    }
+
+    /// `ARNEXT key`, where the next append would go.
+    ///
+    /// Zero for a key that is not there and zero for a cursor nothing has moved
+    /// yet, which are the same answer because they mean the same thing. `None`
+    /// is the null a client sees when the cursor has run out of index space and
+    /// there is no honest answer to give.
+    pub fn arnext(&mut self, key: &[u8]) -> Result<Option<u64>> {
+        Ok(match self.array_slot(key)? {
+            Some(at) => self.array_at(at).next_index(),
+            None => Some(0),
+        })
+    }
+
+    /// `ARSEEK key index`, which points the cursor.
+    ///
+    /// Answers whether there was a key to point. A missing key answers false
+    /// and is not created, because an array with nothing in it is not a key
+    /// here and an error would be worse: the caller asked to move a cursor, and
+    /// the honest answer is that there was no cursor to move.
+    ///
+    /// `index` is the one place in the array commands where `2^64 - 1` is a
+    /// legal argument. It leaves the cursor in the terminal state, which is
+    /// what the rewritten command has to say to reproduce that state on load.
+    pub fn arseek(&mut self, key: &[u8], index: u64) -> Result<bool> {
+        let Some(at) = self.array_slot(key)? else {
+            return Ok(false);
+        };
+        self.arrays
+            .get_mut(at)
+            .expect("the record points at its body")
+            .seek(index);
+        Ok(true)
+    }
+
+    /// `ARLASTITEMS key count [REV]`, the newest positions from the cursor.
+    ///
+    /// `f` is called once per position, oldest first unless `newest_first`, and
+    /// a hole inside the window is a `None` rather than something skipped. The
+    /// count is answered so the caller can close its array header.
+    pub fn arlastitems<F>(
+        &mut self,
+        key: &[u8],
+        count: u64,
+        newest_first: bool,
+        f: F,
+    ) -> Result<u64>
+    where
+        F: FnMut(Option<Element<'_>>),
+    {
+        Ok(match self.array_slot(key)? {
+            Some(at) => self.array_at(at).last_items(count, newest_first, f),
+            None => 0,
+        })
+    }
+
+    /// `ARSCAN key start end [LIMIT count]`, the elements and not the positions.
+    ///
+    /// `f` is called with the index and the element for everything populated in
+    /// the range, low to high or high to low depending on which way round the
+    /// ends came in, and at most `limit` times. Answers how many that was.
+    ///
+    /// Unlike [`Keyspace::argetrange`] this has no ceiling on the range, and it
+    /// does not need one: holes cost nothing, so `ARSCAN k 0 18446744073709551614`
+    /// against a key holding three elements is three visits and not eighteen
+    /// quintillion.
+    pub fn arscan<F>(
+        &mut self,
+        key: &[u8],
+        start: u64,
+        end: u64,
+        limit: u64,
+        mut f: F,
+    ) -> Result<u64>
+    where
+        F: FnMut(u64, Element<'_>),
+    {
+        let Some(at) = self.array_slot(key)? else {
+            return Ok(0);
+        };
+        let mut seen = 0;
+        if limit > 0 {
+            self.array_at(at).scan(start, end, |index, el| {
+                f(index, el);
+                seen += 1;
+                seen < limit
+            });
+        }
+        Ok(seen)
+    }
+
     /// Where `key`'s array is, or `None` if there is no such key.
     ///
     /// # Errors
@@ -579,6 +743,198 @@ mod tests {
             assert_eq!(e.code(), Code::Invalid, "{}", String::from_utf8_lossy(bad));
             assert_eq!(e.message(), BAD_INDEX);
         }
+    }
+
+    fn insert(d: &mut Keyspace, key: &[u8], vals: &[&[u8]]) -> u64 {
+        d.arinsert(key, vals.iter().copied()).expect("an array")
+    }
+
+    /// What a client would see back from `ARSCAN`.
+    fn scan(d: &mut Keyspace, key: &[u8], start: u64, end: u64, limit: u64) -> Vec<(u64, Vec<u8>)> {
+        let mut got = Vec::new();
+        let n = d
+            .arscan(key, start, end, limit, |i, el| {
+                let mut buf = [0u8; ELEMENT_MAX];
+                got.push((i, el.text(&mut buf).to_vec()));
+            })
+            .expect("an array");
+        assert_eq!(n as usize, got.len(), "the count matches what it emitted");
+        got
+    }
+
+    /// What a client would see back from `ARLASTITEMS`, holes included.
+    fn last(d: &mut Keyspace, key: &[u8], count: u64, rev: bool) -> Vec<Option<Vec<u8>>> {
+        let mut got = Vec::new();
+        let n = d
+            .arlastitems(key, count, rev, |el| {
+                got.push(el.map(|e| {
+                    let mut buf = [0u8; ELEMENT_MAX];
+                    e.text(&mut buf).to_vec()
+                }));
+            })
+            .expect("an array");
+        assert_eq!(n as usize, got.len());
+        got
+    }
+
+    #[test]
+    fn an_insert_makes_the_key_and_walks_the_cursor_along() {
+        let mut d = db();
+        assert_eq!(d.arnext(b"a").expect("no key"), Some(0), "and nothing made");
+        assert_eq!(d.kind_of(b"a"), None);
+
+        assert_eq!(insert(&mut d, b"a", &[b"x", b"y"]), 1);
+        assert_eq!(d.kind_of(b"a"), Some(Kind::Array));
+        assert_eq!(d.arnext(b"a").expect("an array"), Some(2));
+        assert_eq!(insert(&mut d, b"a", &[b"z"]), 2);
+        assert_eq!(read(&mut d, b"a", 2).as_deref(), Some(&b"z"[..]));
+        assert_eq!(d.arcount(b"a").expect("an array"), 3);
+    }
+
+    /// A seek says where the next append goes, and seeking to zero puts the
+    /// cursor back to where it was before anything was appended.
+    #[test]
+    fn a_seek_moves_the_cursor_and_a_missing_key_has_none_to_move() {
+        let mut d = db();
+        assert!(!d.arseek(b"a", 10).expect("no key"), "and none was made");
+        assert_eq!(d.kind_of(b"a"), None);
+
+        insert(&mut d, b"a", &[b"x"]);
+        assert!(d.arseek(b"a", 10).expect("an array"));
+        assert_eq!(d.arnext(b"a").expect("an array"), Some(10));
+        assert_eq!(insert(&mut d, b"a", &[b"y"]), 10);
+        assert!(d.arseek(b"a", 0).expect("an array"));
+        assert_eq!(d.arnext(b"a").expect("an array"), Some(0));
+        assert_eq!(insert(&mut d, b"a", &[b"Y"]), 0, "back over the first one");
+    }
+
+    /// The top of the space is a state the cursor can be left in, and once it is
+    /// there `ARNEXT` has no honest answer and an append has nowhere to go.
+    #[test]
+    fn the_cursor_can_be_parked_where_nothing_more_will_fit() {
+        let mut d = db();
+        insert(&mut d, b"a", &[b"x"]);
+        assert!(d.arseek(b"a", u64::MAX).expect("an array"));
+        assert_eq!(d.arnext(b"a").expect("an array"), None);
+        let e = d.arinsert(b"a", [b"y".as_ref()].into_iter()).unwrap_err();
+        assert_eq!(e.code(), Code::Invalid);
+        assert_eq!(e.message(), "insert index overflow");
+
+        // And the top index itself is reachable, one below that.
+        assert!(d.arseek(b"a", INDEX_MAX).expect("an array"));
+        assert_eq!(insert(&mut d, b"a", &[b"y"]), INDEX_MAX);
+        assert_eq!(d.arnext(b"a").expect("an array"), None);
+    }
+
+    /// Only `ARSEEK` takes the reserved top of the index space, and it takes it
+    /// because a rewritten command has to be able to say it.
+    #[test]
+    fn the_reserved_index_is_readable_for_one_command_only() {
+        assert_eq!(
+            parse_seek_index(b"18446744073709551615").expect("the top"),
+            u64::MAX
+        );
+        assert_eq!(
+            parse_index(b"18446744073709551615").unwrap_err().message(),
+            BAD_INDEX
+        );
+        assert_eq!(
+            parse_seek_index(b"18446744073709551616")
+                .unwrap_err()
+                .message(),
+            BAD_INDEX
+        );
+        assert_eq!(parse_seek_index(b"-1").unwrap_err().message(), BAD_INDEX);
+        assert_eq!(parse_seek_index(b"0").expect("zero"), 0);
+    }
+
+    #[test]
+    fn a_ring_wraps_and_the_key_holds_no_more_than_its_size() {
+        let mut d = db();
+        let vals: Vec<&[u8]> = vec![b"a", b"b", b"c", b"d", b"e"];
+        assert_eq!(d.arring(b"r", 3, vals.into_iter()).expect("an array"), 1);
+        assert_eq!(d.arlen(b"r").expect("an array"), 3);
+        assert_eq!(d.arcount(b"r").expect("an array"), 3);
+        assert_eq!(read(&mut d, b"r", 0).as_deref(), Some(&b"d"[..]));
+        assert_eq!(read(&mut d, b"r", 1).as_deref(), Some(&b"e"[..]));
+        assert_eq!(read(&mut d, b"r", 2).as_deref(), Some(&b"c"[..]));
+
+        // The three it holds, oldest first, which is what the ring is for.
+        assert_eq!(
+            last(&mut d, b"r", 3, false),
+            vec![
+                Some(b"c".to_vec()),
+                Some(b"d".to_vec()),
+                Some(b"e".to_vec())
+            ]
+        );
+        assert_eq!(last(&mut d, b"r", 1, true), vec![Some(b"e".to_vec())]);
+    }
+
+    #[test]
+    fn the_last_items_of_a_missing_key_are_none_at_all() {
+        let mut d = db();
+        assert_eq!(last(&mut d, b"nope", 10, false), Vec::new());
+        set(&mut d, b"a", 0, &[b"x"]);
+        assert_eq!(last(&mut d, b"a", 0, false), Vec::new());
+    }
+
+    #[test]
+    fn a_scan_skips_the_holes_and_stops_at_the_limit() {
+        let mut d = db();
+        d.armset(
+            b"a",
+            [
+                (0u64, b"x".as_ref()),
+                (7, b"y".as_ref()),
+                (1_000_000_000, b"z".as_ref()),
+            ]
+            .into_iter(),
+        )
+        .expect("an array");
+
+        let all = vec![
+            (0, b"x".to_vec()),
+            (7, b"y".to_vec()),
+            (1_000_000_000, b"z".to_vec()),
+        ];
+        // The whole index space, which ARGETRANGE would refuse and this one
+        // answers in three visits.
+        assert_eq!(scan(&mut d, b"a", 0, INDEX_MAX, u64::MAX), all);
+        let mut back = all.clone();
+        back.reverse();
+        assert_eq!(scan(&mut d, b"a", INDEX_MAX, 0, u64::MAX), back);
+        assert_eq!(scan(&mut d, b"a", 0, INDEX_MAX, 2), all[..2].to_vec());
+        assert_eq!(scan(&mut d, b"a", 1, 6, u64::MAX), Vec::new());
+        assert_eq!(scan(&mut d, b"nope", 0, INDEX_MAX, u64::MAX), Vec::new());
+    }
+
+    #[test]
+    fn the_cursor_commands_refuse_a_key_holding_something_else() {
+        let mut d = db();
+        d.set_plain(b"s", b"v").expect("a string");
+        assert_eq!(d.arnext(b"s").unwrap_err().code(), Code::WrongType);
+        assert_eq!(d.arseek(b"s", 1).unwrap_err().code(), Code::WrongType);
+        assert_eq!(
+            d.arinsert(b"s", [b"x".as_ref()].into_iter())
+                .unwrap_err()
+                .code(),
+            Code::WrongType
+        );
+        assert_eq!(
+            d.arring(b"s", 4, [b"x".as_ref()].into_iter())
+                .unwrap_err()
+                .code(),
+            Code::WrongType
+        );
+        assert_eq!(
+            d.arlastitems(b"s", 1, false, |_| {}).unwrap_err().code(),
+            Code::WrongType
+        );
+        assert_eq!(
+            d.arscan(b"s", 0, 1, 1, |_, _| {}).unwrap_err().code(),
+            Code::WrongType
+        );
     }
 
     /// An array is a body like any other, so the shared key commands work on it.
