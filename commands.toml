@@ -1564,6 +1564,116 @@ status = "shipped"
 wire = "verified"
 notes = "ZCOUNT against the other kind of bound. A lexical range only means anything when every member has the same score, which the command does not check and Redis does not either, because the order is by score and then by member and the answer is well defined either way."
 
+[[command]]
+name = "ZRANGE"
+group = "zset"
+since = "1.2.0"
+arity = -4
+plan = "cursor"
+bounded = "risk"
+status = "shipped"
+wire = "verified"
+notes = "Nine spellings of a range go through one parse and produce one Query, and this is the one that can say all of it: three by-modes, REV on any of them, LIMIT on the two that take bounds and WITHSCORES on the two that are not lexical. The window is measured before anything is walked, so the array header goes out in front of the members and the read path never builds a list. ZRANGE key 0 -1 is still the whole set on the wire, which is the risk the verdict names and is the same one LRANGE carries, since a client asking for everything gets everything. WITHSCORES nests each pair on RESP3 and flattens it on RESP2, which is the one place in this group where the two protocols disagree about the shape of a reply rather than the type of one value in it."
+
+[[command]]
+name = "ZREVRANGE"
+group = "zset"
+since = "1.2.0"
+arity = -4
+plan = "cursor"
+bounded = "risk"
+status = "shipped"
+wire = "verified"
+notes = "ZRANGE with REV and no options, and the same code underneath. It still reads the WITHSCORES and LIMIT tokens and then refuses LIMIT afterwards, because that is what Redis does and a client that sends ZREVRANGE key 0 -1 WITHSCORES LIMIT 0 1 expects to hear about LIMIT rather than about the word after it."
+
+[[command]]
+name = "ZRANGEBYSCORE"
+group = "zset"
+since = "1.0.5"
+arity = -4
+plan = "cursor"
+bounded = "risk"
+status = "shipped"
+wire = "verified"
+notes = "Two descents to find the ends of the window and then a walk between them, so the cost is the size of the answer and not the size of the set. An exclusive bound is a bound on the same descent and not a member skipped afterwards."
+
+[[command]]
+name = "ZREVRANGEBYSCORE"
+group = "zset"
+since = "2.2.0"
+arity = -4
+plan = "cursor"
+bounded = "risk"
+status = "shipped"
+wire = "verified"
+notes = "The same window backwards, and it names its high end first, which ZRANGE key min max BYSCORE REV does not. That swap is one line in the parse and it is the only difference between the two spellings."
+
+[[command]]
+name = "ZRANGEBYLEX"
+group = "zset"
+since = "2.8.9"
+arity = -4
+plan = "cursor"
+bounded = "risk"
+status = "shipped"
+wire = "verified"
+notes = "The lexical bounds, which are the four shapes a member bound can take: a minus for the low end, a plus for the high one, a bracket for inclusive and a paren for exclusive. Anything else is min or max not valid string range item, which is a different error from the one a bad score bound gives."
+
+[[command]]
+name = "ZREVRANGEBYLEX"
+group = "zset"
+since = "2.8.9"
+arity = -4
+plan = "cursor"
+bounded = "risk"
+status = "shipped"
+wire = "verified"
+notes = "ZRANGEBYLEX backwards with its high end named first. Redis refuses WITHSCORES on any lexical range even though it could answer it, and the refusal is a sentence of its own rather than a plain syntax error, so it is copied as one."
+
+[[command]]
+name = "ZRANGESTORE"
+group = "zset"
+since = "6.2.0"
+arity = -5
+plan = "whole-value"
+bounded = "inherent"
+status = "shipped"
+wire = "verified"
+notes = "The same parse with the destination in front, and the one spelling that does not take WITHSCORES at all, because the destination is a sorted set and keeps the scores whatever is asked for. The result is built whole before the destination is written, so ZRANGESTORE z z 1 2 reads the old body and is safe. A window that comes out empty deletes the destination rather than leaving an empty sorted set behind."
+
+[[command]]
+name = "ZREMRANGEBYRANK"
+group = "zset"
+since = "2.0.0"
+arity = 4
+plan = "whole-value"
+bounded = "inherent"
+status = "shipped"
+wire = "verified"
+notes = "The same Query the read side builds, with the walk turned into a removal. A negative index counts back from the end before anything is removed, so the window is decided once against the length the command started with."
+
+[[command]]
+name = "ZREMRANGEBYSCORE"
+group = "zset"
+since = "1.2.0"
+arity = 4
+plan = "whole-value"
+bounded = "inherent"
+status = "shipped"
+wire = "verified"
+notes = "By-mode in the name and no options at all, so the arity check is the whole of the syntax. The key is deleted when the last member goes."
+
+[[command]]
+name = "ZREMRANGEBYLEX"
+group = "zset"
+since = "2.8.9"
+arity = 4
+plan = "whole-value"
+bounded = "inherent"
+status = "shipped"
+wire = "verified"
+notes = "The lexical removal, and the third of the three that share a parse with the reads. Three separate window calculations would have been three chances to get an exclusive bound wrong in exactly one of them."
+
 
 # ------------------------------------------------------------------ scripting
 
