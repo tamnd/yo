@@ -422,6 +422,13 @@ impl Intset {
         self.runs.iter().flat_map(Run::iter)
     }
 
+    /// A cursor on the smallest member, for a merge. See [`Walk`].
+    #[inline]
+    #[must_use]
+    pub fn walk(&self) -> Walk<'_> {
+        Walk::new(self)
+    }
+
     /// Add `v`. Answers whether it was not already there.
     pub fn add(&mut self, v: i64) -> bool {
         let i = self.run_for(v);
@@ -598,6 +605,103 @@ impl Intset {
 impl Default for Intset {
     fn default() -> Intset {
         Intset::new()
+    }
+}
+
+/// A cursor over the members that only ever moves forward.
+///
+/// [`Intset::iter`] is enough to read a set out, and it is not enough to merge
+/// two of them, because a merge needs to skip. Intersecting a set of ten with a
+/// set of a million should touch ten members of the big one and not a million,
+/// and that is [`Walk::seek`], which jumps to the first member at or past a
+/// value instead of stepping to it.
+///
+/// Forward only, and that is the whole reason it is worth having. A cursor that
+/// could go backwards would have to binary search the entire set on every seek.
+/// This one searches from where it already is, so a merge that walks two sets in
+/// lockstep pays one comparison a member in the common case and only searches
+/// when it actually skipped something.
+///
+/// Stepping is a pointer step and nothing else, which is what makes a merge a
+/// different order of cost from a probe. `setops.rs` explains what that buys and
+/// has the numbers.
+#[derive(Debug, Clone)]
+pub struct Walk<'a> {
+    set: &'a Intset,
+    /// Which run. Equal to the run count once the cursor is past the end.
+    run: usize,
+    /// How far into that run. Always under the run's length except when the
+    /// cursor is past the end, where the pair is `(runs.len(), 0)`.
+    off: usize,
+}
+
+impl<'a> Walk<'a> {
+    /// A cursor on the smallest member.
+    fn new(set: &'a Intset) -> Walk<'a> {
+        let mut w = Walk {
+            set,
+            run: 0,
+            off: 0,
+        };
+        w.settle();
+        w
+    }
+
+    /// The member the cursor is on, or `None` past the end.
+    #[inline]
+    #[must_use]
+    pub fn peek(&self) -> Option<i64> {
+        (self.run < self.set.runs.len()).then(|| self.set.runs[self.run].at(self.off))
+    }
+
+    /// Move to the next member.
+    #[inline]
+    pub fn bump(&mut self) {
+        self.off += 1;
+        self.settle();
+    }
+
+    /// Move to the first member that is not under `v`, without going backwards.
+    ///
+    /// A seek to a value the cursor is already at or past does nothing, which is
+    /// what makes this safe to call in a loop that does not know whether it has
+    /// moved.
+    pub fn seek(&mut self, v: i64) {
+        match self.peek() {
+            Some(cur) if cur < v => {}
+            // Already there, or there is nothing left to seek to.
+            _ => return,
+        }
+        // The runs hold disjoint ranges in ascending order, so the run is the
+        // first one at or after this one whose largest member is not under `v`.
+        // Searching from `run + 1` rather than from the start is what keeps a
+        // seek near the cursor cheap: a merge that steps through both sets
+        // together never leaves its current run.
+        if self.set.maxima[self.run] < v {
+            let after = &self.set.maxima[self.run + 1..];
+            let hop = after.partition_point(|&m| m < v);
+            self.run += 1 + hop;
+            if self.run >= self.set.runs.len() {
+                self.run = self.set.runs.len();
+                self.off = 0;
+                return;
+            }
+            self.off = 0;
+        }
+        self.off = self.set.runs[self.run].lower_bound(v, self.off);
+        self.settle();
+    }
+
+    /// Step off the end of a run onto the next one.
+    ///
+    /// A loop rather than a test because an empty set is one empty run, and that
+    /// is the only time two runs in a row have nothing to land on.
+    #[inline]
+    fn settle(&mut self) {
+        while self.run < self.set.runs.len() && self.off >= self.set.runs[self.run].len() {
+            self.run += 1;
+            self.off = 0;
+        }
     }
 }
 
@@ -811,6 +915,26 @@ impl Run {
         self.bytes.drain(from..from + w);
         self.set_len(self.len() - 1);
         true
+    }
+
+    /// The first member at or past `v`, searching only from `from`.
+    ///
+    /// [`Walk::seek`]'s inner half, and the reason it takes a lower bound rather
+    /// than reusing [`Run::search`]: a cursor never goes backwards, so
+    /// everything before where it already is has been ruled out and searching it
+    /// again is work with a known answer. On a merge that steps through two sets
+    /// together the range is one or two members wide.
+    fn lower_bound(&self, v: i64, from: usize) -> usize {
+        let (mut lo, mut hi) = (from, self.len());
+        while lo < hi {
+            let mid = lo.midpoint(hi);
+            if self.at(mid) < v {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        lo
     }
 
     /// Where `v` is, or where it would go.
