@@ -31,8 +31,10 @@ use yo_common::Result;
 
 use crate::hash::Hash;
 use crate::keyspace::Keyspace;
+use crate::list::List;
 use crate::set::Set;
 use crate::value::{self, Kind};
+use crate::zset::Zset;
 
 /// Everything under one key, lifted out so it can be put somewhere else.
 ///
@@ -55,6 +57,8 @@ impl Record {
             Body::String(_) => Kind::String,
             Body::Set(_) => Kind::Set,
             Body::Hash(_) => Kind::Hash,
+            Body::List(_) => Kind::List,
+            Body::Zset(_) => Kind::Zset,
         }
     }
 
@@ -65,12 +69,20 @@ impl Record {
     }
 }
 
-/// The three things a record can be, owned rather than borrowed.
+/// The five things a record can be, owned rather than borrowed.
+///
+/// One variant per type that a key can hold, and that is the point: the day a
+/// sixth type lands, the compiler names this file. It did not before, because
+/// the match in [`Keyspace::export`] had a catch all arm at the bottom, and a
+/// catch all in front of an enum the rest of the crate keeps growing is a hole
+/// that reports itself as a panic on a live server rather than as a build error.
 #[derive(Debug, Clone)]
 enum Body {
     String(Vec<u8>),
     Set(Set),
     Hash(Hash),
+    List(List),
+    Zset(Zset),
 }
 
 /// What a rename or a copy did.
@@ -114,7 +126,21 @@ impl Keyspace {
                     .expect("the record points at its body")
                     .clone(),
             ),
-            other => unreachable!("nothing can store a {} yet", other.name()),
+            Kind::List => Body::List(
+                self.lists
+                    .get(value::slot(rec))
+                    .expect("the record points at its body")
+                    .clone(),
+            ),
+            Kind::Zset => Body::Zset(
+                self.zsets
+                    .get(value::slot(rec))
+                    .expect("the record points at its body")
+                    .clone(),
+            ),
+            // A stream is the one type a key can hold that nothing can put
+            // there yet, so this arm is the only one left and it names it.
+            Kind::Stream => unreachable!("nothing can store a stream yet"),
         };
         Some(Record { body, expire_at })
     }
@@ -141,6 +167,18 @@ impl Keyspace {
                 let slot = self.hashes.insert(hash);
                 self.bodies += 1;
                 self.write_slot(key, Kind::Hash, slot, at);
+            }
+            Body::List(list) => {
+                self.free_body(key);
+                let slot = self.lists.insert(list);
+                self.bodies += 1;
+                self.write_slot(key, Kind::List, slot, at);
+            }
+            Body::Zset(zset) => {
+                self.free_body(key);
+                let slot = self.zsets.insert(zset);
+                self.bodies += 1;
+                self.write_slot(key, Kind::Zset, slot, at);
             }
         }
     }
@@ -263,6 +301,8 @@ impl Moved {
 mod tests {
     use super::*;
     use crate::Clock;
+    use crate::End;
+    use crate::zsets::ZAdd;
 
     fn db() -> Keyspace {
         Keyspace::with_clock(Clock::fixed(1_000_000))
@@ -473,6 +513,68 @@ mod tests {
         assert_eq!(d.copy(b"a", b"s", true), Moved::Ok);
         assert_eq!(d.sets.len(), 0, "the set went when the string arrived");
         assert_eq!(d.kind_of(b"s"), Some(Kind::String));
+    }
+
+    /// `COPY` of a list, which used to take the server down with it.
+    ///
+    /// The catch all arm at the bottom of `export` was written when a set and a
+    /// hash were the only bodies there were, and the list and the sorted set
+    /// arrived past it without anybody coming back here. So `COPY mylist other`
+    /// reached `unreachable!` and panicked the shard, from a command any client
+    /// can send, against a type the server otherwise supports completely.
+    ///
+    /// The copy has to be a copy and not a second name for the same body, which
+    /// is the other half of what this checks: pushing to the destination must
+    /// not show up in the source.
+    #[test]
+    fn a_list_can_be_copied_and_the_copy_is_its_own() {
+        let mut d = db();
+        d.push(b"l", End::Left, [b"a".as_ref(), b"b".as_ref()].into_iter())
+            .expect("a list");
+
+        assert_eq!(d.copy(b"l", b"m", false), Moved::Ok);
+        assert_eq!(d.kind_of(b"m"), Some(Kind::List));
+        assert_eq!(d.llen(b"m").expect("a list"), 2);
+
+        d.push(b"m", End::Left, [b"c".as_ref()].into_iter())
+            .expect("a list");
+        assert_eq!(d.llen(b"l").expect("a list"), 2, "the source did not grow");
+        assert_eq!(d.llen(b"m").expect("a list"), 3);
+    }
+
+    /// The same for a sorted set, which had the same hole for the same reason.
+    #[test]
+    fn a_zset_can_be_copied_and_the_copy_is_its_own() {
+        let mut d = db();
+        d.zadd(b"z", [(1.0, b"m1".as_ref())].into_iter(), ZAdd::default())
+            .expect("a zset");
+
+        assert_eq!(d.copy(b"z", b"y", false), Moved::Ok);
+        assert_eq!(d.kind_of(b"y"), Some(Kind::Zset));
+        assert_eq!(d.zscore(b"y", b"m1").expect("a zset"), Some(1.0));
+
+        d.zadd(b"y", [(2.0, b"m2".as_ref())].into_iter(), ZAdd::default())
+            .expect("a zset");
+        assert_eq!(d.zcard(b"z").expect("a zset"), 1, "the source did not grow");
+        assert_eq!(d.zcard(b"y").expect("a zset"), 2);
+    }
+
+    /// A copy over a key that held a list gives the list back.
+    ///
+    /// The leak this guards against is the same one the set version guards
+    /// against: a record written over a body that nothing freed leaves a slab
+    /// slot reachable and never reused, and nothing about the server looks wrong
+    /// afterwards.
+    #[test]
+    fn copying_over_a_list_frees_the_list() {
+        let mut d = db();
+        put(&mut d, b"a", b"v1");
+        d.push(b"l", End::Left, [b"x".as_ref()].into_iter())
+            .expect("a list");
+
+        assert_eq!(d.copy(b"a", b"l", true), Moved::Ok);
+        assert_eq!(d.kind_of(b"l"), Some(Kind::String));
+        assert_eq!(read(&mut d, b"l"), b"v1");
     }
 
     #[test]
