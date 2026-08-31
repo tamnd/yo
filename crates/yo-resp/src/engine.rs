@@ -209,6 +209,22 @@ struct Conn {
     gone: bool,
     /// Already on the dirty list.
     dirty: bool,
+    /// This client is parked on a blocking command.
+    ///
+    /// While it is set, framing stops: whatever the client pipelined behind its
+    /// `BLPOP` stays in the read buffer unread, which is what a client waiting
+    /// for an answer means and is what Redis does with the same bytes.
+    blocked: bool,
+    /// Commands framed before it blocked and not run yet.
+    ///
+    /// A batch is framed before any of it runs, so a `BLPOP` can be the first of
+    /// sixty four commands and the other sixty three are already on their way to
+    /// the reactor when it parks. They come back here and go to the front of the
+    /// queue when the client wakes up, in the order they arrived.
+    ///
+    /// They are still counted in `pending`, which is what stops the read buffer
+    /// being compacted under the offsets they hold.
+    parked: Vec<Cmd>,
     /// What the two buffers were holding the last time anybody counted.
     ///
     /// The connection's share of `INFO memory`, kept here so that reporting it
@@ -233,6 +249,8 @@ impl Conn {
             skip: false,
             gone: false,
             dirty: false,
+            blocked: false,
+            parked: Vec::new(),
             held: 0,
         })
     }
@@ -258,6 +276,9 @@ impl Conn {
         self.skip = false;
         self.gone = false;
         self.dirty = false;
+        self.blocked = false;
+        // The room it took stays, the way the two buffers' does.
+        self.parked.clear();
     }
 
     /// Drop what the framing has already read, when nothing points into it.
@@ -412,8 +433,81 @@ impl<S: Sink> Wire<S> {
         }
         c.gone = true;
         c.closing = true;
-        if c.pending == 0 {
+        // A parked client holds its own commands, and those commands are what
+        // `pending` counts, so leaving it parked here would leave the slot owed
+        // to a connection that is never going to be answered. They go back to
+        // the queue and run as the no-ops a gone connection's commands are.
+        if c.blocked {
+            self.unpark(conn);
+        }
+        if self.conns[conn as usize].pending == 0 {
             self.release(conn);
+        }
+    }
+
+    /// The client is not waiting any more: give it back its commands.
+    ///
+    /// The ones it had already sent go to the front of the queue in the order
+    /// they arrived, ahead of anything any other connection has waiting, because
+    /// they were framed before any of that was. Then framing starts again on
+    /// whatever arrived while it was parked.
+    fn unpark(&mut self, conn: ConnId) {
+        let mut parked = {
+            let c = &mut self.conns[conn as usize];
+            c.blocked = false;
+            core::mem::take(&mut c.parked)
+        };
+        // Back to front, since each one goes on the front.
+        while let Some(cmd) = parked.pop() {
+            if self.ready.len() == self.ready.capacity() {
+                yo_alloc::allow(|| self.ready.reserve(BATCH_MAX));
+            }
+            self.ready.push_front(cmd);
+        }
+        // Empty now, and back where it lives so its room is not paid for twice.
+        self.conns[conn as usize].parked = parked;
+        if !self.conns[conn as usize].closing {
+            self.frame(conn);
+        }
+    }
+
+    /// Answer everybody who can be answered, and let go of everybody whose
+    /// deadline has passed.
+    ///
+    /// The walk is over the waiter list rather than over the connections, so it
+    /// costs what blocking costs and not what the server costs. Every caller
+    /// checks that somebody is parked before calling, which is the load and the
+    /// branch a server with nobody blocked pays.
+    fn serve_waiters(&mut self) {
+        let now = self.server.now_ms();
+        let mut at = 0;
+        while at < self.server.waiters().len() {
+            let p = self.server.waiters().at(at);
+            {
+                let c = &self.conns[p.conn as usize];
+                // The slot is reused and the client id is not. `release`
+                // forgets waiters, so this should never fire; it is here
+                // because being wrong about it writes a reply into somebody
+                // else's socket rather than dropping one.
+                if !c.live || c.session.id() != p.client {
+                    self.server.waiters_mut().drop_at(at);
+                    continue;
+                }
+            }
+            // The engine cannot reach the databases and the server cannot reach
+            // the connections, so the two halves are taken apart here and the
+            // one buffer this waiter needs is handed over.
+            let served = {
+                let Wire { server, conns, .. } = self;
+                server.serve_waiter(at, now, &mut conns[p.conn as usize].out)
+            };
+            if served {
+                self.server.waiters_mut().drop_at(at);
+                self.unpark(p.conn);
+                self.soil(p.conn);
+            } else {
+                at += 1;
+            }
         }
     }
 
@@ -493,7 +587,14 @@ impl<S: Sink> Wire<S> {
     }
 
     /// Move as many complete commands as possible out of the read buffer.
+    ///
+    /// Nothing at all while the client is parked. The bytes stay where they are
+    /// and `head` does not move, so a client that pipelines `BLPOP` and then
+    /// `PING` gets the `PING` answered when the `BLPOP` is, and in that order.
     fn frame(&mut self, conn: ConnId) {
+        if self.conns[conn as usize].blocked {
+            return;
+        }
         loop {
             let base = self.conns[conn as usize].head;
             let slot = match self.conns[conn as usize].partial.take() {
@@ -592,10 +693,17 @@ impl<S: Sink> Wire<S> {
             }
             c.live = false;
             c.dirty = false;
+            c.blocked = false;
             c.out.clear();
             c.buf.clear();
             c.head = 0;
         }
+        // Before the slot goes back, because the slot is handed out again and a
+        // waiter on a client that has gone would then be a waiter pointing at
+        // somebody else's connection. The id is what makes it findable and the
+        // id is about to stop being this connection's.
+        let client = self.conns[conn as usize].session.id();
+        self.server.waiters_mut().forget(client);
         self.server.stats.clients = self.server.stats.clients.saturating_sub(1);
         self.sink.closed(conn);
         yo_alloc::allow(|| self.free.push(conn));
@@ -712,6 +820,15 @@ impl<S: Sink> Engine for Wire<S> {
     }
 
     fn run(&mut self, cmd: Cmd, _hash: Option<u64>) -> yo_reactor::Flow {
+        // Framed with the batch that blocked, so it is a command the client sent
+        // before it knew it would be waiting. It keeps its decoder and it keeps
+        // its place in `pending`, which is what stops the buffer it points into
+        // being compacted while it waits.
+        if self.conns[cmd.conn as usize].blocked {
+            yo_alloc::allow(|| self.conns[cmd.conn as usize].parked.push(cmd));
+            return yo_reactor::Flow::Next;
+        }
+
         let flow = {
             let c = &mut self.conns[cmd.conn as usize];
             c.pending -= 1;
@@ -733,20 +850,50 @@ impl<S: Sink> Engine for Wire<S> {
                 self.release(cmd.conn);
             }
         } else {
-            if flow == Flow::Close {
-                let c = &mut self.conns[cmd.conn as usize];
-                c.closing = true;
-                // Anything the client pipelined behind the `QUIT` was sent
-                // before it knew the answer, and running it would be acting on
-                // a connection that has already been said goodbye to.
-                c.skip = true;
+            match flow {
+                Flow::Close => {
+                    let c = &mut self.conns[cmd.conn as usize];
+                    c.closing = true;
+                    // Anything the client pipelined behind the `QUIT` was sent
+                    // before it knew the answer, and running it would be acting
+                    // on a connection that has already been said goodbye to.
+                    c.skip = true;
+                    self.soil(cmd.conn);
+                }
+                // Nothing was written, so there is nothing to flush and no
+                // reason to put this connection on the dirty list. The waiter
+                // carries the slot from here on, and it needs to know which one:
+                // the command layer only ever saw the client id.
+                Flow::Block => {
+                    self.conns[cmd.conn as usize].blocked = true;
+                    let client = self.conns[cmd.conn as usize].session.id();
+                    self.server.waiters_mut().bind(client, cmd.conn);
+                }
+                Flow::Continue => self.soil(cmd.conn),
             }
-            self.soil(cmd.conn);
+        }
+
+        // After each command and not once per batch. A client blocked on two
+        // keys and woken by `RPUSH b` then `RPUSH a` in one pipeline has to
+        // answer with `b`, because that is the push that was in front of it, and
+        // it can only do that if it was served in between the two.
+        if !self.server.waiters().is_empty() {
+            self.serve_waiters();
         }
         yo_reactor::Flow::Next
     }
 
     fn flush(&mut self) {
+        // The deadline sweep, and it is here because this is the one thing the
+        // driver calls on a turn that ran nothing at all. A client whose timeout
+        // passes while the server is idle is answered within the loop's idle
+        // wait, which is 20ms and is finer than the 10hz Redis checks its own
+        // blocked clients at.
+        if !self.server.waiters().is_empty() {
+            self.server.refresh_clock();
+            self.serve_waiters();
+        }
+
         // Taken and put back so the loop below can reach the rest of the
         // engine. The capacity comes back with it, so this is not an
         // allocation.
@@ -822,6 +969,21 @@ mod tests {
 
     fn engine() -> (Reactor<Wire<Recorder>>, ConnId, Vec<Cmd>) {
         let mut r = Reactor::inline(Wire::new(Recorder::new()));
+        let conn = r.engine_mut().accept();
+        (r, conn, Vec::new())
+    }
+
+    /// Where the fixed clock a blocking test moves by hand starts.
+    const START_MS: u64 = 1_000_000;
+
+    /// The same, on a clock the test moves rather than the system's.
+    ///
+    /// A test about a timeout cannot wait for one: waiting a hundred
+    /// milliseconds is a test that fails on a loaded machine and waiting a
+    /// hundred seconds is not a test.
+    fn timed() -> (Reactor<Wire<Recorder>>, ConnId, Vec<Cmd>) {
+        let server = crate::dispatch::Server::with_clock(yo_kv::Clock::fixed(START_MS));
+        let mut r = Reactor::inline(Wire::with_server(server, Recorder::new()));
         let conn = r.engine_mut().accept();
         (r, conn, Vec::new())
     }
@@ -1146,6 +1308,307 @@ mod tests {
             self.sent.extend_from_slice(&bytes[..n]);
             n
         }
+    }
+
+    /// A blocking command that does not block costs nothing: no waiter, no
+    /// allocation, the same three lines the non blocking one runs.
+    #[test]
+    fn a_blpop_on_a_list_with_something_in_it_never_waits() {
+        let (mut r, conn, mut batch) = engine();
+        r.engine_mut().feed(conn, &wire(&[b"RPUSH", b"q", b"a"]));
+        r.engine_mut().feed(conn, &wire(&[b"BLPOP", b"q", b"0"]));
+        pump(&mut r, &mut batch);
+
+        assert_eq!(
+            r.engine().sink().sent(conn),
+            b":1\r\n*2\r\n$1\r\nq\r\n$1\r\na\r\n"
+        );
+        assert_eq!(r.engine().server().waiters().len(), 0);
+    }
+
+    /// The whole point: a client with nothing to pop is answered later, by
+    /// somebody else's command.
+    #[test]
+    fn a_parked_client_is_answered_by_another_connections_push() {
+        let (mut r, a, mut batch) = engine();
+        let b = r.engine_mut().accept();
+
+        r.engine_mut().feed(a, &wire(&[b"BLPOP", b"q", b"0"]));
+        pump(&mut r, &mut batch);
+        assert!(r.engine().sink().sent(a).is_empty(), "nothing to say yet");
+        assert_eq!(r.engine().server().waiters().len(), 1);
+
+        r.engine_mut().feed(b, &wire(&[b"RPUSH", b"q", b"one"]));
+        pump(&mut r, &mut batch);
+
+        assert_eq!(r.engine().sink().sent(a), b"*2\r\n$1\r\nq\r\n$3\r\none\r\n");
+        // The push still reports the length it made, even though the element was
+        // gone again before the reply was written.
+        assert_eq!(r.engine().sink().sent(b), b":1\r\n");
+        assert_eq!(r.engine().server().waiters().len(), 0);
+    }
+
+    /// A push to a key nobody named, and a key of another type on a key
+    /// somebody did: neither is a wake up, and the client stays parked.
+    #[test]
+    fn only_a_list_arriving_under_a_named_key_wakes_a_waiter() {
+        let (mut r, a, mut batch) = engine();
+        let b = r.engine_mut().accept();
+        r.engine_mut().feed(a, &wire(&[b"BLPOP", b"q", b"0"]));
+        pump(&mut r, &mut batch);
+
+        r.engine_mut().feed(b, &wire(&[b"RPUSH", b"elsewhere", b"x"]));
+        r.engine_mut().feed(b, &wire(&[b"SADD", b"q", b"x"]));
+        pump(&mut r, &mut batch);
+
+        assert!(r.engine().sink().sent(a).is_empty());
+        assert_eq!(r.engine().server().waiters().len(), 1, "still waiting");
+        // And the set is intact, so the waiter did not take anything out of it
+        // on its way past.
+        assert_eq!(r.engine().sink().sent(b), b":1\r\n:1\r\n");
+    }
+
+    /// Two workers on one queue, which is what `BLPOP` is for. They are served
+    /// in the order they arrived and not in whatever order the list is walked.
+    #[test]
+    fn two_parked_clients_are_served_in_the_order_they_arrived() {
+        let (mut r, a, mut batch) = engine();
+        let b = r.engine_mut().accept();
+        let c = r.engine_mut().accept();
+
+        r.engine_mut().feed(a, &wire(&[b"BLPOP", b"q", b"0"]));
+        pump(&mut r, &mut batch);
+        r.engine_mut().feed(b, &wire(&[b"BLPOP", b"q", b"0"]));
+        pump(&mut r, &mut batch);
+        assert_eq!(r.engine().server().waiters().len(), 2);
+
+        r.engine_mut()
+            .feed(c, &wire(&[b"RPUSH", b"q", b"first", b"second"]));
+        pump(&mut r, &mut batch);
+
+        assert_eq!(r.engine().sink().sent(a), b"*2\r\n$1\r\nq\r\n$5\r\nfirst\r\n");
+        assert_eq!(
+            r.engine().sink().sent(b),
+            b"*2\r\n$1\r\nq\r\n$6\r\nsecond\r\n"
+        );
+        assert_eq!(r.engine().server().waiters().len(), 0);
+    }
+
+    /// A client waiting for an answer is not a client that has sent another
+    /// question, so what it pipelined behind its `BLPOP` waits for the `BLPOP`.
+    #[test]
+    fn what_a_client_pipelined_behind_a_block_waits_for_the_block() {
+        let (mut r, a, mut batch) = engine();
+        let b = r.engine_mut().accept();
+
+        // Framed together, so the `PING` is already on its way to the reactor
+        // when the `BLPOP` in front of it parks.
+        let mut stream = wire(&[b"BLPOP", b"q", b"0"]);
+        stream.extend(wire(&[b"PING"]));
+        r.engine_mut().feed(a, &stream);
+        pump(&mut r, &mut batch);
+        assert!(
+            r.engine().sink().sent(a).is_empty(),
+            "the PING went out in front of the answer it was sent behind"
+        );
+
+        // And one that arrives while it is parked is not even framed.
+        r.engine_mut().feed(a, &wire(&[b"ECHO", b"after"]));
+        pump(&mut r, &mut batch);
+        assert!(r.engine().sink().sent(a).is_empty());
+
+        r.engine_mut().feed(b, &wire(&[b"RPUSH", b"q", b"x"]));
+        pump(&mut r, &mut batch);
+        assert_eq!(
+            r.engine().sink().sent(a),
+            b"*2\r\n$1\r\nq\r\n$1\r\nx\r\n+PONG\r\n$5\r\nafter\r\n"
+        );
+    }
+
+    /// Redis serves parked clients after every command rather than once per
+    /// turn of the loop, and a pipeline is where the difference shows: the
+    /// waiter has to be served between the two pushes, so it answers with the
+    /// key the first push filled and not with the one it named first.
+    #[test]
+    fn a_waiter_is_served_between_two_pipelined_pushes() {
+        let (mut r, a, mut batch) = engine();
+        let b = r.engine_mut().accept();
+        r.engine_mut().feed(a, &wire(&[b"BLPOP", b"p1", b"p2", b"0"]));
+        pump(&mut r, &mut batch);
+
+        let mut stream = wire(&[b"RPUSH", b"p2", b"second"]);
+        stream.extend(wire(&[b"RPUSH", b"p1", b"first"]));
+        r.engine_mut().feed(b, &stream);
+        pump(&mut r, &mut batch);
+
+        assert_eq!(
+            r.engine().sink().sent(a),
+            b"*2\r\n$2\r\np2\r\n$6\r\nsecond\r\n"
+        );
+        // Which leaves the key it named first holding what was pushed to it.
+        r.engine_mut().feed(b, &wire(&[b"LRANGE", b"p1", b"0", b"-1"]));
+        pump(&mut r, &mut batch);
+        assert!(r.engine().sink().sent(b).ends_with(b"*1\r\n$5\r\nfirst\r\n"));
+    }
+
+    /// A `BLMOVE` that serves itself is a push, so it wakes the client waiting
+    /// on the key it pushed to, in the same moment and without a turn of the
+    /// loop in between.
+    #[test]
+    fn a_waiter_woken_by_another_waiter() {
+        let (mut r, a, mut batch) = engine();
+        let b = r.engine_mut().accept();
+        let c = r.engine_mut().accept();
+
+        r.engine_mut()
+            .feed(a, &wire(&[b"BLMOVE", b"x", b"y", b"LEFT", b"RIGHT", b"0"]));
+        pump(&mut r, &mut batch);
+        r.engine_mut().feed(b, &wire(&[b"BLPOP", b"y", b"0"]));
+        pump(&mut r, &mut batch);
+        assert_eq!(r.engine().server().waiters().len(), 2);
+
+        r.engine_mut().feed(c, &wire(&[b"RPUSH", b"x", b"chain"]));
+        pump(&mut r, &mut batch);
+
+        assert_eq!(r.engine().sink().sent(a), b"$5\r\nchain\r\n");
+        assert_eq!(r.engine().sink().sent(b), b"*2\r\n$1\r\ny\r\n$5\r\nchain\r\n");
+        assert_eq!(r.engine().server().waiters().len(), 0);
+    }
+
+    /// A waiter on one database is not woken by a push on another, even though
+    /// the key has the same name.
+    #[test]
+    fn a_waiter_is_only_woken_on_the_database_it_blocked_on() {
+        let (mut r, a, mut batch) = engine();
+        let b = r.engine_mut().accept();
+        r.engine_mut().feed(a, &wire(&[b"SELECT", b"3"]));
+        r.engine_mut().feed(a, &wire(&[b"BLPOP", b"q", b"0"]));
+        pump(&mut r, &mut batch);
+        assert_eq!(r.engine().sink().sent(a), b"+OK\r\n");
+
+        r.engine_mut().feed(b, &wire(&[b"RPUSH", b"q", b"wrongdb"]));
+        pump(&mut r, &mut batch);
+        assert_eq!(r.engine().sink().sent(a), b"+OK\r\n", "still waiting");
+
+        r.engine_mut().feed(b, &wire(&[b"SELECT", b"3"]));
+        r.engine_mut().feed(b, &wire(&[b"RPUSH", b"q", b"rightdb"]));
+        pump(&mut r, &mut batch);
+        assert!(r.engine().sink().sent(a).ends_with(b"$7\r\nrightdb\r\n"));
+    }
+
+    /// The deadline sweep, which runs on a turn that has nothing else to do.
+    #[test]
+    fn a_client_that_waited_long_enough_gets_a_null_array() {
+        let (mut r, conn, mut batch) = timed();
+        r.engine_mut().feed(conn, &wire(&[b"BLPOP", b"q", b"30"]));
+        pump(&mut r, &mut batch);
+        assert!(r.engine().sink().sent(conn).is_empty());
+
+        r.engine_mut().server_mut().set_clock_ms(START_MS + 29_999);
+        pump(&mut r, &mut batch);
+        assert!(
+            r.engine().sink().sent(conn).is_empty(),
+            "a millisecond short"
+        );
+
+        r.engine_mut().server_mut().set_clock_ms(START_MS + 30_000);
+        pump(&mut r, &mut batch);
+        // A null array and not a null string, which a RESP2 client can see.
+        assert_eq!(r.engine().sink().sent(conn), b"*-1\r\n");
+        assert_eq!(r.engine().server().waiters().len(), 0);
+    }
+
+    /// The four that answer with something other than a two element array all
+    /// answer a timeout the same way, which is not what the reply shape would
+    /// suggest and is what Redis does.
+    #[test]
+    fn every_blocking_command_times_out_with_the_same_null_array() {
+        for cmd in [
+            &[b"BLPOP".as_slice(), b"q", b"0.001"][..],
+            &[b"BRPOP", b"q", b"0.001"],
+            &[b"BLMOVE", b"q", b"d", b"LEFT", b"RIGHT", b"0.001"],
+            &[b"BRPOPLPUSH", b"q", b"d", b"0.001"],
+            &[b"BLMPOP", b"0.001", b"1", b"q", b"LEFT"],
+        ] {
+            let (mut r, conn, mut batch) = timed();
+            r.engine_mut().feed(conn, &wire(cmd));
+            pump(&mut r, &mut batch);
+            r.engine_mut().server_mut().set_clock_ms(START_MS + 1);
+            pump(&mut r, &mut batch);
+            assert_eq!(r.engine().sink().sent(conn), b"*-1\r\n", "for {cmd:?}");
+        }
+    }
+
+    /// A client that gave up does not go on holding a claim on the queue: the
+    /// element that arrives after it stays where it was put.
+    #[test]
+    fn a_waiter_that_timed_out_does_not_eat_a_later_push() {
+        let (mut r, a, mut batch) = timed();
+        let b = r.engine_mut().accept();
+        r.engine_mut().feed(a, &wire(&[b"BLPOP", b"q", b"1"]));
+        pump(&mut r, &mut batch);
+        r.engine_mut().server_mut().set_clock_ms(START_MS + 1000);
+        pump(&mut r, &mut batch);
+        assert_eq!(r.engine().sink().sent(a), b"*-1\r\n");
+
+        r.engine_mut().feed(b, &wire(&[b"RPUSH", b"q", b"late"]));
+        r.engine_mut().feed(b, &wire(&[b"LRANGE", b"q", b"0", b"-1"]));
+        pump(&mut r, &mut batch);
+        assert_eq!(r.engine().sink().sent(a), b"*-1\r\n", "nothing more");
+        assert!(r.engine().sink().sent(b).ends_with(b"*1\r\n$4\r\nlate\r\n"));
+    }
+
+    /// A `BLPOP key 0` has no deadline, so nothing but the connection closing
+    /// will ever take it off the list. That makes the close path the one that
+    /// has to be right, or a waiter outlives its client and the slot it names
+    /// gets handed to somebody else.
+    #[test]
+    fn a_client_that_goes_away_while_it_waits_takes_its_waiter_with_it() {
+        let (mut r, a, mut batch) = engine();
+        let b = r.engine_mut().accept();
+        r.engine_mut().feed(a, &wire(&[b"BLPOP", b"q", b"0"]));
+        pump(&mut r, &mut batch);
+        assert_eq!(r.engine().server().waiters().len(), 1);
+
+        r.engine_mut().hangup(a);
+        pump(&mut r, &mut batch);
+        assert_eq!(r.engine().server().waiters().len(), 0);
+        assert_eq!(r.engine().clients(), 1);
+
+        // The slot is handed straight back out, which is what the waiter would
+        // have been pointing at.
+        let again = r.engine_mut().accept();
+        assert_eq!(again, a);
+        r.engine_mut().feed(b, &wire(&[b"RPUSH", b"q", b"x"]));
+        r.engine_mut().feed(again, &wire(&[b"LRANGE", b"q", b"0", b"-1"]));
+        pump(&mut r, &mut batch);
+        assert_eq!(r.engine().sink().sent(again), b"*1\r\n$1\r\nx\r\n");
+    }
+
+    /// The same, with commands the client had already sent sitting behind the
+    /// block. Those are what `pending` counts, so a close that forgets them is a
+    /// connection slot that never comes back.
+    #[test]
+    fn a_hangup_while_parked_gives_back_the_slot_and_the_decoders() {
+        let (mut r, a, mut batch) = engine();
+        let mut stream = wire(&[b"BLPOP", b"q", b"0"]);
+        stream.extend(wire(&[b"PING"]));
+        stream.extend(wire(&[b"PING"]));
+        r.engine_mut().feed(a, &stream);
+        pump(&mut r, &mut batch);
+
+        let decoders = r.engine().decoders();
+        r.engine_mut().hangup(a);
+        pump(&mut r, &mut batch);
+
+        assert_eq!(r.engine().clients(), 0);
+        assert!(r.engine().sink().was_closed(a));
+        assert_eq!(r.engine().decoders(), decoders, "the pool came back whole");
+        let again = r.engine_mut().accept();
+        assert_eq!(again, a);
+        r.engine_mut().feed(again, &wire(&[b"PING"]));
+        pump(&mut r, &mut batch);
+        assert_eq!(r.engine().sink().sent(again), b"+PONG\r\n");
     }
 
     #[test]

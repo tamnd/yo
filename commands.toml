@@ -63,14 +63,13 @@ doc = "08 section 8"
 [[group]]
 name = "list"
 expected = 22
-status = "partial"
+status = "shipped"
 doc = "08 section 6"
-# Seventeen of the twenty two. The five that are missing are BLPOP, BRPOP,
-# BLMOVE, BRPOPLPUSH and BLMPOP, and none of them is missing because the list
-# cannot answer them. They need a client that can be parked on a key and woken
-# when something is pushed to it, and there is no such thing in the server yet.
-# That is its own piece of work and it is the same piece of work the blocking
-# stream and sorted set reads need, so it lands once rather than five times.
+# All twenty two, the five blocking ones included. What a parked client costs is
+# a copy of the keys it named and a walk over the waiter list per command, and
+# the walk is behind a check that anybody is parked at all, so a server with no
+# blocked clients pays a load and a branch. The machinery is not list shaped and
+# the blocking stream and sorted set reads will use the same registry.
 
 [[group]]
 name = "hash"
@@ -1394,6 +1393,61 @@ bounded = "inherent"
 status = "shipped"
 wire = "verified"
 notes = "The keys are behind a count, so COMMAND INFO reports no key positions and a cluster client has to ask COMMAND GETKEYS. The first key holding anything is the one that is popped, which is the point: one round trip instead of an LLEN per key and then an LPOP. A key of another type anywhere in the list is an error even when an earlier key would have answered."
+
+[[command]]
+name = "BLPOP"
+group = "list"
+since = "2.0.0"
+arity = -3
+plan = "merge"
+bounded = "inherent"
+status = "shipped"
+wire = "verified"
+notes = "LPOP with a client that can be parked. What is kept while it waits is the command and not the client: the keys it named, what it meant to do with them and when to give up, so waking it is running the same attempt again against a database that has changed since. A timeout of exactly zero is no timeout, and -0.0 is exactly zero, so BLPOP k -0.0 waits forever while BLPOP k -0.1 is an error. The reply names the key that answered, which is the one difference from LPOP."
+
+[[command]]
+name = "BRPOP"
+group = "list"
+since = "2.0.0"
+arity = -3
+plan = "merge"
+bounded = "inherent"
+status = "shipped"
+wire = "verified"
+notes = "BLPOP off the other end. Every key is type checked even when an earlier one is empty, so BRPOP empty string 0 is a WRONGTYPE rather than a wait, and a key that somebody turns into a set while a client is parked on it does not wake that client and does not error at it either: the wake condition is that the key holds a list with something in it, and anything else leaves the client waiting until its own deadline."
+
+[[command]]
+name = "BLMOVE"
+group = "list"
+since = "6.2.0"
+arity = 6
+plan = "point"
+bounded = "inherent"
+status = "shipped"
+wire = "verified"
+notes = "LMOVE with a wait on the source. The destination is only looked at once there is something to move, so BLMOVE empty string LEFT RIGHT 0.1 times out rather than answering WRONGTYPE, which is the one place the type check order is visible from outside. A waiter that serves itself wakes the next one in the same moment, so a chain of BLMOVE clients passes an element along without a turn of the loop in between."
+
+[[command]]
+name = "BRPOPLPUSH"
+group = "list"
+since = "2.2.0"
+arity = 4
+plan = "point"
+bounded = "inherent"
+status = "shipped"
+wire = "verified"
+notes = "BLMOVE RIGHT LEFT under the older name, and it is the same code. On a timeout it answers a null array and not a null string, even though what it sends when it succeeds is a single element, which a RESP2 client can see: *-1 and not $-1. All five of the blocking list commands do that."
+
+[[command]]
+name = "BLMPOP"
+group = "list"
+since = "7.0.0"
+arity = -5
+plan = "merge"
+bounded = "inherent"
+status = "shipped"
+wire = "verified"
+notes = "LMPOP with a wait, and the same parse shifted along by one. The timeout is read before the key count, so BLMPOP abc 0 k LEFT complains about the timeout and not about the count. A COUNT that is not a number at all gets the same sentence a zero or a negative one gets, which is count should be greater than 0 rather than the usual message about integers."
 
 
 # ------------------------------------------------------------------ scripting

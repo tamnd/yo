@@ -87,6 +87,9 @@ const AC_LIST_READ_SLOW: &[&str] = &["@read", "@list", "@slow"];
 const AC_LIST_WRITE_FAST: &[&str] = &["@write", "@list", "@fast"];
 /// The list write side for the ones whose cost is the length of the list.
 const AC_LIST_WRITE_SLOW: &[&str] = &["@write", "@list", "@slow"];
+/// The five that can wait, which carry a category of their own so that an ACL
+/// can say "this user may not park a connection" without naming five commands.
+const AC_LIST_WRITE_BLOCKING: &[&str] = &["@write", "@list", "@slow", "@blocking"];
 /// The connection commands' categories.
 const AC_CONN: &[&str] = &["@fast", "@connection"];
 /// The keyspace read side, which is `EXISTS` and `TYPE`.
@@ -1265,6 +1268,81 @@ pub static COMMANDS: &[Spec] = &[
         since: "7.0.0",
         complexity: "O(N+M) with N the number of keys and M the count popped",
         summary: "Pop from the first of several lists that has anything in it.",
+        group: "list",
+    },
+    // The five that wait. `blocking` is what the dispatcher branches on to send
+    // them somewhere that can park a client, so it is load bearing here rather
+    // than only being reported.
+    //
+    // `BLPOP` and `BRPOP` take their keys up to the timeout, which is the one
+    // shape in the list group where `last_key` is negative: everything from
+    // argument one to the second from last.
+    Spec {
+        name: "blpop",
+        arity: -3,
+        flags: &["write", "blocking"],
+        first_key: 1,
+        last_key: -2,
+        step: 1,
+        acl: AC_LIST_WRITE_BLOCKING,
+        since: "2.0.0",
+        complexity: "O(N) with N the number of keys named",
+        summary: "Pop the head of the first list that has anything, waiting if none does.",
+        group: "list",
+    },
+    Spec {
+        name: "brpop",
+        arity: -3,
+        flags: &["write", "blocking"],
+        first_key: 1,
+        last_key: -2,
+        step: 1,
+        acl: AC_LIST_WRITE_BLOCKING,
+        since: "2.0.0",
+        complexity: "O(N) with N the number of keys named",
+        summary: "Pop the tail of the first list that has anything, waiting if none does.",
+        group: "list",
+    },
+    // Redis marks the two that push somewhere `denyoom` and does not mark the
+    // pops, because these are the blocking commands that can grow the keyspace.
+    Spec {
+        name: "blmove",
+        arity: 6,
+        flags: &["write", "denyoom", "blocking"],
+        first_key: 1,
+        last_key: 2,
+        step: 1,
+        acl: AC_LIST_WRITE_BLOCKING,
+        since: "6.2.0",
+        complexity: "O(1)",
+        summary: "Move an element between two lists, waiting for one to arrive.",
+        group: "list",
+    },
+    Spec {
+        name: "brpoplpush",
+        arity: 4,
+        flags: &["write", "denyoom", "blocking"],
+        first_key: 1,
+        last_key: 2,
+        step: 1,
+        acl: AC_LIST_WRITE_BLOCKING,
+        since: "2.2.0",
+        complexity: "O(1)",
+        summary: "Move a tail element to another list's head, waiting for one to arrive.",
+        group: "list",
+    },
+    // Keys behind a count again, so the same three zeroes `LMPOP` has.
+    Spec {
+        name: "blmpop",
+        arity: -5,
+        flags: &["write", "blocking", "movablekeys"],
+        first_key: 0,
+        last_key: 0,
+        step: 0,
+        acl: AC_LIST_WRITE_BLOCKING,
+        since: "7.0.0",
+        complexity: "O(N+M) with N the number of keys and M the count popped",
+        summary: "Pop from the first of several lists that has anything, waiting if none does.",
         group: "list",
     },
     // ------------------------------------------------------------ keyspace
