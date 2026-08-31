@@ -55,6 +55,7 @@ mod args;
 mod cpu;
 mod hashes;
 mod keyspace;
+mod lists;
 mod scripting;
 mod server;
 mod sets;
@@ -403,6 +404,10 @@ pub fn execute(server: &mut Server, session: &mut Session, args: Args<'_>, out: 
         "hash" => {
             let db = session.db;
             hashes::execute(&mut server.dbs[db], spec, args, out).map(|()| Flow::Continue)
+        }
+        "list" => {
+            let db = session.db;
+            lists::execute(&mut server.dbs[db], spec, args, out).map(|()| Flow::Continue)
         }
         // Every database and not the one the session is on, because `COPY` takes
         // a `DB n` and writes into a database nobody selected.
@@ -3222,6 +3227,412 @@ mod tests {
         for _ in 0..200 {
             f.run(&args);
             f.run(&[b"DEL", b"s"]);
+            f.server.compact_step();
+        }
+        assert_eq!(f.run(&[b"DBSIZE"]), ":0\r\n");
+        assert!(
+            f.server.memory_bytes() <= after_first * 2,
+            "held {} after two hundred passes against {after_first} after one",
+            f.server.memory_bytes()
+        );
+    }
+
+    /// A RESP2 array of bulk strings, which is what most of the list replies
+    /// are and what writing them out by hand in every assertion looks like.
+    fn bulks(parts: &[&str]) -> String {
+        let mut s = format!("*{}\r\n", parts.len());
+        for p in parts {
+            s.push_str(&format!("${}\r\n{p}\r\n", p.len()));
+        }
+        s
+    }
+
+    #[test]
+    fn a_list_is_pushed_from_both_ends_and_the_left_one_reverses() {
+        let mut f = Fixture::new();
+        // Each element in turn goes at the head, so the last one sent is at the
+        // front when it is over. That reads like a bug in the client and it is
+        // what every Redis has always done.
+        assert_eq!(f.run(&[b"LPUSH", b"k", b"a", b"b", b"c"]), ":3\r\n");
+        assert_eq!(
+            f.run(&[b"LRANGE", b"k", b"0", b"-1"]),
+            bulks(&["c", "b", "a"])
+        );
+        assert_eq!(f.run(&[b"RPUSH", b"k", b"d"]), ":4\r\n");
+        assert_eq!(f.run(&[b"LLEN", b"k"]), ":4\r\n");
+        assert_eq!(f.run(&[b"LPOP", b"k"]), "$1\r\nc\r\n");
+        assert_eq!(f.run(&[b"RPOP", b"k"]), "$1\r\nd\r\n");
+        assert_eq!(f.run(&[b"LRANGE", b"k", b"0", b"-1"]), bulks(&["b", "a"]));
+        assert_eq!(f.run(&[b"TYPE", b"k"]), "+list\r\n");
+    }
+
+    #[test]
+    fn the_x_pushes_refuse_to_bring_a_list_back_to_life() {
+        let mut f = Fixture::new();
+        assert_eq!(f.run(&[b"LPUSHX", b"k", b"a"]), ":0\r\n");
+        assert_eq!(f.run(&[b"RPUSHX", b"k", b"a"]), ":0\r\n");
+        assert_eq!(f.run(&[b"EXISTS", b"k"]), ":0\r\n");
+        f.run(&[b"RPUSH", b"k", b"a"]);
+        assert_eq!(f.run(&[b"LPUSHX", b"k", b"z"]), ":2\r\n");
+        assert_eq!(f.run(&[b"RPUSHX", b"k", b"y"]), ":3\r\n");
+        assert_eq!(
+            f.run(&[b"LRANGE", b"k", b"0", b"-1"]),
+            bulks(&["z", "a", "y"])
+        );
+    }
+
+    /// The four ways a pop can come back with nothing, which are three
+    /// different replies and a RESP2 client can tell all of them apart.
+    #[test]
+    fn an_empty_pop_is_a_different_nothing_with_a_count_and_without() {
+        let mut f = Fixture::new();
+        assert_eq!(f.run(&[b"LPOP", b"nope"]), "$-1\r\n");
+        assert_eq!(f.run(&[b"LPOP", b"nope", b"2"]), "*-1\r\n");
+        assert_eq!(f.run(&[b"RPOP", b"nope"]), "$-1\r\n");
+        assert_eq!(f.run(&[b"RPOP", b"nope", b"2"]), "*-1\r\n");
+        f.run(&[b"RPUSH", b"k", b"a", b"b", b"c"]);
+        // A count of zero against a list that is there is an empty array and
+        // not a null array, which is the fourth answer.
+        assert_eq!(f.run(&[b"LPOP", b"k", b"0"]), "*0\r\n");
+        assert_eq!(f.run(&[b"LPOP", b"k", b"1"]), bulks(&["a"]));
+        // More than there is takes what there is and the key goes with it.
+        assert_eq!(f.run(&[b"RPOP", b"k", b"9"]), bulks(&["c", "b"]));
+        assert_eq!(f.run(&[b"EXISTS", b"k"]), ":0\r\n");
+    }
+
+    #[test]
+    fn a_pop_count_has_its_own_sentence_and_a_third_argument_is_an_arity_error() {
+        let mut f = Fixture::new();
+        f.run(&[b"RPUSH", b"k", b"a"]);
+        let range = "-ERR value is out of range, must be positive\r\n";
+        assert_eq!(f.run(&[b"LPOP", b"k", b"-1"]), range);
+        assert_eq!(f.run(&[b"LPOP", b"k", b"abc"]), range);
+        assert_eq!(f.run(&[b"RPOP", b"k", b"-1"]), range);
+        // Redis calls this an arity error and not a syntax error, which is a
+        // distinction it does not always make.
+        assert_eq!(
+            f.run(&[b"LPOP", b"k", b"1", b"2"]),
+            "-ERR wrong number of arguments for 'lpop' command\r\n"
+        );
+        assert_eq!(f.run(&[b"LLEN", b"k"]), ":1\r\n");
+    }
+
+    #[test]
+    fn a_range_takes_negative_ends_and_clamps_the_ones_that_run_off() {
+        let mut f = Fixture::new();
+        f.run(&[b"RPUSH", b"k", b"a", b"b", b"c"]);
+        assert_eq!(
+            f.run(&[b"LRANGE", b"k", b"0", b"-1"]),
+            bulks(&["a", "b", "c"])
+        );
+        assert_eq!(f.run(&[b"LRANGE", b"k", b"-2", b"-1"]), bulks(&["b", "c"]));
+        assert_eq!(f.run(&[b"LRANGE", b"k", b"1", b"1"]), bulks(&["b"]));
+        assert_eq!(f.run(&[b"LRANGE", b"k", b"5", b"10"]), "*0\r\n");
+        assert_eq!(f.run(&[b"LRANGE", b"k", b"2", b"1"]), "*0\r\n");
+        assert_eq!(
+            f.run(&[b"LRANGE", b"k", b"-100", b"100"]),
+            bulks(&["a", "b", "c"])
+        );
+        // A key that is not there is an empty range and not a nil, which is the
+        // one place a list disagrees with a set.
+        assert_eq!(f.run(&[b"LRANGE", b"nope", b"0", b"-1"]), "*0\r\n");
+        assert_eq!(
+            f.run(&[b"LRANGE", b"k", b"a", b"b"]),
+            "-ERR value is not an integer or out of range\r\n"
+        );
+    }
+
+    #[test]
+    fn an_index_reads_and_writes_from_whichever_end_is_nearer() {
+        let mut f = Fixture::new();
+        f.run(&[b"RPUSH", b"k", b"a", b"b", b"c"]);
+        assert_eq!(f.run(&[b"LINDEX", b"k", b"0"]), "$1\r\na\r\n");
+        assert_eq!(f.run(&[b"LINDEX", b"k", b"-1"]), "$1\r\nc\r\n");
+        assert_eq!(f.run(&[b"LINDEX", b"k", b"99"]), "$-1\r\n");
+        assert_eq!(f.run(&[b"LINDEX", b"nope", b"0"]), "$-1\r\n");
+        assert_eq!(f.run(&[b"LSET", b"k", b"-1", b"z"]), "+OK\r\n");
+        assert_eq!(
+            f.run(&[b"LRANGE", b"k", b"0", b"-1"]),
+            bulks(&["a", "b", "z"])
+        );
+        // Both ways of missing are errors here rather than a nil, because a
+        // list is never empty and there is nothing else the reply could be.
+        assert_eq!(
+            f.run(&[b"LSET", b"k", b"99", b"z"]),
+            "-ERR index out of range\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"LSET", b"nope", b"0", b"z"]),
+            "-ERR no such key\r\n"
+        );
+    }
+
+    #[test]
+    fn linsert_says_three_things_with_one_signed_number() {
+        let mut f = Fixture::new();
+        // Zero for a key that is not there, which is not the same as minus one
+        // for a pivot that is not in a list that is.
+        assert_eq!(
+            f.run(&[b"LINSERT", b"nope", b"BEFORE", b"a", b"x"]),
+            ":0\r\n"
+        );
+        f.run(&[b"RPUSH", b"k", b"a", b"b"]);
+        assert_eq!(f.run(&[b"LINSERT", b"k", b"before", b"a", b"X"]), ":3\r\n");
+        assert_eq!(f.run(&[b"LINSERT", b"k", b"AFTER", b"b", b"Y"]), ":4\r\n");
+        assert_eq!(
+            f.run(&[b"LRANGE", b"k", b"0", b"-1"]),
+            bulks(&["X", "a", "b", "Y"])
+        );
+        assert_eq!(
+            f.run(&[b"LINSERT", b"k", b"BEFORE", b"zz", b"x"]),
+            ":-1\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"LINSERT", b"k", b"SIDEWAYS", b"a", b"x"]),
+            "-ERR syntax error\r\n"
+        );
+    }
+
+    #[test]
+    fn lrem_counts_in_three_directions_and_takes_the_key_when_it_empties() {
+        let mut f = Fixture::new();
+        f.run(&[b"RPUSH", b"k", b"a", b"b", b"a", b"c", b"a"]);
+        assert_eq!(f.run(&[b"LREM", b"k", b"2", b"a"]), ":2\r\n");
+        assert_eq!(
+            f.run(&[b"LRANGE", b"k", b"0", b"-1"]),
+            bulks(&["b", "c", "a"])
+        );
+        assert_eq!(f.run(&[b"LREM", b"k", b"-1", b"a"]), ":1\r\n");
+        assert_eq!(f.run(&[b"LRANGE", b"k", b"0", b"-1"]), bulks(&["b", "c"]));
+        assert_eq!(f.run(&[b"LREM", b"k", b"0", b"b"]), ":1\r\n");
+        assert_eq!(f.run(&[b"LREM", b"k", b"0", b"c"]), ":1\r\n");
+        assert_eq!(f.run(&[b"EXISTS", b"k"]), ":0\r\n");
+        assert_eq!(f.run(&[b"LREM", b"nope", b"0", b"a"]), ":0\r\n");
+    }
+
+    #[test]
+    fn ltrim_keeps_a_window_and_an_empty_one_deletes_the_key() {
+        let mut f = Fixture::new();
+        f.run(&[b"RPUSH", b"k", b"a", b"b", b"c", b"d"]);
+        assert_eq!(f.run(&[b"LTRIM", b"k", b"1", b"-2"]), "+OK\r\n");
+        assert_eq!(f.run(&[b"LRANGE", b"k", b"0", b"-1"]), bulks(&["b", "c"]));
+        // `LTRIM k 1 0` is the documented way to empty a list, so it has to
+        // leave `EXISTS` answering zero rather than leaving an empty one.
+        assert_eq!(f.run(&[b"LTRIM", b"k", b"1", b"0"]), "+OK\r\n");
+        assert_eq!(f.run(&[b"EXISTS", b"k"]), ":0\r\n");
+        assert_eq!(f.run(&[b"LTRIM", b"nope", b"0", b"-1"]), "+OK\r\n");
+    }
+
+    #[test]
+    fn lpos_walks_from_either_end_and_stops_where_it_is_told() {
+        let mut f = Fixture::new();
+        f.run(&[b"RPUSH", b"p", b"a", b"b", b"c", b"a", b"b", b"c", b"a"]);
+        assert_eq!(f.run(&[b"LPOS", b"p", b"a"]), ":0\r\n");
+        assert_eq!(f.run(&[b"LPOS", b"p", b"a", b"RANK", b"-1"]), ":6\r\n");
+        assert_eq!(f.run(&[b"LPOS", b"p", b"a", b"RANK", b"2"]), ":3\r\n");
+        assert_eq!(
+            f.run(&[b"LPOS", b"p", b"a", b"COUNT", b"2"]),
+            "*2\r\n:0\r\n:3\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"LPOS", b"p", b"a", b"RANK", b"-1", b"COUNT", b"0"]),
+            "*3\r\n:6\r\n:3\r\n:0\r\n"
+        );
+        // MAXLEN counts elements looked at and not matches found, so three
+        // stops after `a b c` and finds the one match in it.
+        assert_eq!(
+            f.run(&[b"LPOS", b"p", b"a", b"COUNT", b"0", b"MAXLEN", b"3"]),
+            "*1\r\n:0\r\n"
+        );
+        // Nothing found is three different replies depending on how it was
+        // asked and whether the key is there at all.
+        assert_eq!(f.run(&[b"LPOS", b"p", b"zz"]), "$-1\r\n");
+        assert_eq!(f.run(&[b"LPOS", b"p", b"zz", b"COUNT", b"0"]), "*0\r\n");
+        assert_eq!(f.run(&[b"LPOS", b"nope", b"a"]), "$-1\r\n");
+        assert_eq!(f.run(&[b"LPOS", b"nope", b"a", b"COUNT", b"2"]), "*0\r\n");
+    }
+
+    #[test]
+    fn lpos_words_its_three_mistakes_the_way_redis_does() {
+        let mut f = Fixture::new();
+        f.run(&[b"RPUSH", b"p", b"a"]);
+        // The whole sentence and not a prefix, because the older wording of it
+        // is still all over the internet and clients match on the text.
+        assert_eq!(
+            f.run(&[b"LPOS", b"p", b"a", b"RANK", b"0"]),
+            "-ERR RANK can't be zero: use 1 to start from the first match, 2 from the second ... or use negative to start from the end of the list\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"LPOS", b"p", b"a", b"COUNT", b"-1"]),
+            "-ERR COUNT can't be negative\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"LPOS", b"p", b"a", b"MAXLEN", b"-1"]),
+            "-ERR MAXLEN can't be negative\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"LPOS", b"p", b"a", b"RANK"]),
+            "-ERR syntax error\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"LPOS", b"p", b"a", b"FOO", b"1"]),
+            "-ERR syntax error\r\n"
+        );
+    }
+
+    #[test]
+    fn a_move_takes_from_one_end_and_gives_to_another_even_on_one_key() {
+        let mut f = Fixture::new();
+        f.run(&[b"RPUSH", b"k", b"a", b"b", b"c"]);
+        assert_eq!(f.run(&[b"RPOPLPUSH", b"k", b"d"]), "$1\r\nc\r\n");
+        assert_eq!(f.run(&[b"LRANGE", b"k", b"0", b"-1"]), bulks(&["a", "b"]));
+        assert_eq!(f.run(&[b"LRANGE", b"d", b"0", b"-1"]), bulks(&["c"]));
+        assert_eq!(
+            f.run(&[b"LMOVE", b"k", b"d", b"LEFT", b"RIGHT"]),
+            "$1\r\na\r\n"
+        );
+        assert_eq!(f.run(&[b"LRANGE", b"d", b"0", b"-1"]), bulks(&["c", "a"]));
+        // The same key twice is the documented way to rotate a list and falls
+        // out of taking the element before deciding where to put it.
+        f.run(&[b"DEL", b"r"]);
+        f.run(&[b"RPUSH", b"r", b"1", b"2", b"3"]);
+        assert_eq!(f.run(&[b"RPOPLPUSH", b"r", b"r"]), "$1\r\n3\r\n");
+        assert_eq!(
+            f.run(&[b"LRANGE", b"r", b"0", b"-1"]),
+            bulks(&["3", "1", "2"])
+        );
+        assert_eq!(
+            f.run(&[b"LMOVE", b"nope", b"d", b"LEFT", b"LEFT"]),
+            "$-1\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"LMOVE", b"r", b"d", b"LEFT", b"SIDEWAYS"]),
+            "-ERR syntax error\r\n"
+        );
+    }
+
+    #[test]
+    fn a_move_checks_the_destination_before_it_takes_anything() {
+        let mut f = Fixture::new();
+        f.run(&[b"RPUSH", b"k", b"a", b"b"]);
+        f.run(&[b"SET", b"str", b"v"]);
+        assert_eq!(
+            f.run(&[b"LMOVE", b"k", b"str", b"LEFT", b"LEFT"]),
+            "-WRONGTYPE Operation against a key holding the wrong kind of value\r\n"
+        );
+        // The element is still where it was, rather than having gone nowhere.
+        assert_eq!(f.run(&[b"LRANGE", b"k", b"0", b"-1"]), bulks(&["a", "b"]));
+    }
+
+    #[test]
+    fn lmpop_answers_from_the_first_key_that_has_anything() {
+        let mut f = Fixture::new();
+        f.run(&[b"RPUSH", b"b", b"1", b"2", b"3"]);
+        // The name of the key that answered comes back with the elements,
+        // because the client cannot work out which one it was.
+        assert_eq!(
+            f.run(&[b"LMPOP", b"2", b"a", b"b", b"LEFT", b"COUNT", b"2"]),
+            "*2\r\n$1\r\nb\r\n*2\r\n$1\r\n1\r\n$1\r\n2\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"LMPOP", b"2", b"a", b"b", b"RIGHT"]),
+            "*2\r\n$1\r\nb\r\n*1\r\n$1\r\n3\r\n"
+        );
+        assert_eq!(f.run(&[b"EXISTS", b"b"]), ":0\r\n");
+        // A null array and not a null, even though what it stands in for is an
+        // array holding a key name and then another array.
+        assert_eq!(f.run(&[b"LMPOP", b"2", b"a", b"b", b"LEFT"]), "*-1\r\n");
+    }
+
+    #[test]
+    fn lmpop_has_its_own_words_for_a_count_and_for_a_key_count() {
+        let mut f = Fixture::new();
+        f.run(&[b"RPUSH", b"k", b"a"]);
+        assert_eq!(
+            f.run(&[b"LMPOP", b"0", b"k", b"LEFT"]),
+            "-ERR numkeys should be greater than 0\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"LMPOP", b"-1", b"k", b"LEFT"]),
+            "-ERR numkeys should be greater than 0\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"LMPOP", b"1", b"k", b"LEFT", b"COUNT", b"0"]),
+            "-ERR count should be greater than 0\r\n"
+        );
+        // A key count that eats the direction is a syntax error and not a
+        // sentence about key counts, because the direction is simply not there.
+        assert_eq!(
+            f.run(&[b"LMPOP", b"3", b"k", b"LEFT"]),
+            "-ERR syntax error\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"LMPOP", b"1", b"k", b"LEFT", b"COUNT", b"1", b"x"]),
+            "-ERR syntax error\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"LMPOP", b"1", b"k", b"LEFT", b"FOO", b"1"]),
+            "-ERR syntax error\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"LMPOP", b"1", b"k", b"SIDEWAYS"]),
+            "-ERR syntax error\r\n"
+        );
+        assert_eq!(f.run(&[b"LLEN", b"k"]), ":1\r\n");
+    }
+
+    #[test]
+    fn every_list_command_says_wrongtype_and_writes_nothing() {
+        let mut f = Fixture::new();
+        f.run(&[b"SET", b"str", b"v"]);
+        let wrong = "-WRONGTYPE Operation against a key holding the wrong kind of value\r\n";
+        for cmd in [
+            &[b"LPUSH".as_slice(), b"str", b"a"][..],
+            &[b"RPUSH", b"str", b"a"],
+            &[b"LPUSHX", b"str", b"a"],
+            &[b"RPUSHX", b"str", b"a"],
+            &[b"LPOP", b"str"],
+            &[b"LPOP", b"str", b"2"],
+            &[b"RPOP", b"str"],
+            &[b"LLEN", b"str"],
+            &[b"LRANGE", b"str", b"0", b"-1"],
+            &[b"LINDEX", b"str", b"0"],
+            &[b"LSET", b"str", b"0", b"a"],
+            &[b"LINSERT", b"str", b"BEFORE", b"a", b"b"],
+            &[b"LREM", b"str", b"0", b"a"],
+            &[b"LTRIM", b"str", b"0", b"-1"],
+            &[b"LPOS", b"str", b"a"],
+            &[b"LPOS", b"str", b"a", b"COUNT", b"0"],
+            &[b"RPOPLPUSH", b"str", b"d"],
+            &[b"LMOVE", b"str", b"d", b"LEFT", b"LEFT"],
+            &[b"LMPOP", b"1", b"str", b"LEFT"],
+        ] {
+            assert_eq!(f.run(cmd), wrong, "{:?}", String::from_utf8_lossy(cmd[0]));
+        }
+        assert_eq!(f.run(&[b"GET", b"str"]), "$1\r\nv\r\n");
+        assert_eq!(f.run(&[b"EXISTS", b"d"]), ":0\r\n");
+    }
+
+    /// The same churn the set and the string get, because a list that leaks a
+    /// chunk per push looks exactly like one that does not until it has run for
+    /// an afternoon.
+    #[test]
+    fn churning_lists_does_not_grow_the_server() {
+        let mut f = Fixture::new();
+        let vals: Vec<Vec<u8>> = (0..200).map(|i| format!("v{i}").into_bytes()).collect();
+        let args: Vec<&[u8]> = [&b"RPUSH"[..], &b"k"[..]]
+            .into_iter()
+            .chain(vals.iter().map(Vec::as_slice))
+            .collect();
+
+        f.run(&args);
+        f.run(&[b"DEL", b"k"]);
+        f.server.compact_step();
+        let after_first = f.server.memory_bytes();
+
+        for _ in 0..200 {
+            f.run(&args);
+            f.run(&[b"LTRIM", b"k", b"1", b"0"]);
             f.server.compact_step();
         }
         assert_eq!(f.run(&[b"DBSIZE"]), ":0\r\n");

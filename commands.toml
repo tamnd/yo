@@ -63,8 +63,14 @@ doc = "08 section 8"
 [[group]]
 name = "list"
 expected = 22
-status = "planned"
+status = "partial"
 doc = "08 section 6"
+# Seventeen of the twenty two. The five that are missing are BLPOP, BRPOP,
+# BLMOVE, BRPOPLPUSH and BLMPOP, and none of them is missing because the list
+# cannot answer them. They need a client that can be parked on a key and woken
+# when something is pushed to it, and there is no such thing in the server yet.
+# That is its own piece of work and it is the same piece of work the blocking
+# stream and sorted set reads need, so it lands once rather than five times.
 
 [[group]]
 name = "hash"
@@ -1198,6 +1204,196 @@ bounded = "inherent"
 status = "shipped"
 wire = "verified"
 notes = "One answer for the whole list, because FNX and FXX are asked over every field named and not one at a time. KEEPTTL is needed because the write clears the deadline first, so the deadline is read before the value is stored and put back after."
+
+
+# ---------------------------------------------------------------------- lists
+
+[[command]]
+name = "LPUSH"
+group = "list"
+since = "1.0.0"
+arity = -3
+plan = "point"
+bounded = "inherent"
+status = "shipped"
+wire = "verified"
+notes = "One key lookup for the whole argument list, then the elements go into the body the record points at. A list that does not exist yet starts packed and stays that way until it crosses list-max-listpack-size, which is the same one way promotion a set and a hash have. Each element in turn goes at the head, so LPUSH k a b c leaves the list holding c b a, and that reads like a bug and is what Redis does."
+
+[[command]]
+name = "RPUSH"
+group = "list"
+since = "1.0.0"
+arity = -3
+plan = "point"
+bounded = "inherent"
+status = "shipped"
+wire = "verified"
+notes = "LPUSH from the other end. The tail is the cheaper end in the packed band, because appending to a listpack does not move the elements already in it, and both ends cost the same once the list is a chain of chunks."
+
+[[command]]
+name = "LPUSHX"
+group = "list"
+since = "2.2.0"
+arity = -3
+plan = "point"
+bounded = "inherent"
+status = "shipped"
+wire = "verified"
+notes = "The same push behind a key lookup that answers zero rather than creating anything. It exists so that a producer can refuse to bring a queue back to life after a consumer drained it, which is a race a GET followed by an LPUSH cannot close."
+
+[[command]]
+name = "RPUSHX"
+group = "list"
+since = "2.2.0"
+arity = -3
+plan = "point"
+bounded = "inherent"
+status = "shipped"
+wire = "verified"
+notes = "LPUSHX from the other end."
+
+[[command]]
+name = "LPOP"
+group = "list"
+since = "1.0.0"
+arity = -2
+plan = "point"
+bounded = "inherent"
+status = "shipped"
+wire = "verified"
+notes = "Each element is handed to the reply while it is still in the list and dropped straight after, so a LPOP of a thousand never builds a thousand of anything on the shard thread. The two reply shapes are different and not one shape with a length: without a count a missing key is a null and with one it is a null array, which a RESP2 client can tell apart on the wire. The key goes when the last element does."
+
+[[command]]
+name = "RPOP"
+group = "list"
+since = "1.0.0"
+arity = -2
+plan = "point"
+bounded = "inherent"
+status = "shipped"
+wire = "verified"
+notes = "LPOP from the other end."
+
+[[command]]
+name = "LLEN"
+group = "list"
+since = "1.0.0"
+arity = 2
+plan = "metadata"
+bounded = "inherent"
+status = "shipped"
+wire = "verified"
+notes = "A field on the list in both bands, so it is a load and not a walk of the chunks."
+
+[[command]]
+name = "LRANGE"
+group = "list"
+since = "1.0.0"
+arity = 4
+plan = "cursor"
+bounded = "risk"
+status = "shipped"
+wire = "verified"
+notes = "The range is walked straight into the reply buffer and the array header is written behind it, so nothing is collected on the way out. LRANGE key 0 -1 over a list of ten million is still ten million elements on the wire, which is the risk the verdict names and the reason the descriptor cache in K10 matters: today reaching the start of the range walks the chunks in front of it."
+
+[[command]]
+name = "LINDEX"
+group = "list"
+since = "1.0.0"
+arity = 3
+plan = "cursor"
+bounded = "inherent"
+status = "shipped"
+wire = "verified"
+notes = "A negative index counts from the back and the walk starts at the nearer end, so LINDEX key -1 is as cheap as LINDEX key 0. In the chunked band it is a walk of chunk headers and not of elements, and it becomes a lookup once the counted tree in K10 lands."
+
+[[command]]
+name = "LSET"
+group = "list"
+since = "1.0.0"
+arity = 4
+plan = "point"
+bounded = "inherent"
+status = "shipped"
+wire = "verified"
+notes = "The one list write with two errors and no boolean, because both ways of missing are errors on the wire: no such key for a key that is not there and index out of range for an index the list does not reach. A list is never empty, so those are the only two."
+
+[[command]]
+name = "LINSERT"
+group = "list"
+since = "2.2.0"
+arity = 5
+plan = "point"
+bounded = "inherent"
+status = "shipped"
+wire = "verified"
+notes = "Three answers in one signed number: the new length, minus one when the pivot is not there and zero when the key is not there. That is Redis's choice and a bad one, and it is on the wire and cannot be changed."
+
+[[command]]
+name = "LREM"
+group = "list"
+since = "1.0.0"
+arity = 4
+plan = "whole-value"
+bounded = "inherent"
+status = "shipped"
+wire = "verified"
+notes = "A positive count removes that many from the front, a negative one that many from the back and zero removes every match, which is three directions in one argument. The key goes if the list ends up empty."
+
+[[command]]
+name = "LTRIM"
+group = "list"
+since = "1.0.0"
+arity = 4
+plan = "whole-value"
+bounded = "inherent"
+status = "shipped"
+wire = "verified"
+notes = "A window that selects nothing deletes the key, which is not tidying up: LTRIM k 1 0 is the documented way to empty a list and it has to leave EXISTS answering zero. In the chunked band the chunks wholly outside the window are dropped rather than walked element by element."
+
+[[command]]
+name = "LPOS"
+group = "list"
+since = "6.0.6"
+arity = -3
+plan = "cursor"
+bounded = "yes"
+status = "shipped"
+wire = "verified"
+notes = "The positions go into the reply as they are found, so LPOS key x COUNT 0 over a list with ten thousand matches never builds a list of ten thousand numbers anywhere. MAXLEN is the bound and it is the client's to set. Three replies for what looks like one outcome: a null with no COUNT, an empty array with one, and an empty array again for a key that is not there."
+
+[[command]]
+name = "RPOPLPUSH"
+group = "list"
+since = "1.2.0"
+arity = 3
+plan = "point"
+bounded = "inherent"
+status = "shipped"
+wire = "verified"
+notes = "LMOVE with both ends fixed, kept as its own name because it is the one every client library still sends. The element is copied once, for the reason SPOP gives: what comes back has no structure left to borrow from."
+
+[[command]]
+name = "LMOVE"
+group = "list"
+since = "6.2.0"
+arity = 5
+plan = "point"
+bounded = "inherent"
+status = "shipped"
+wire = "verified"
+notes = "The destination's type is checked before anything is taken, so LMOVE list string LEFT LEFT is a WRONGTYPE with the source untouched rather than an element that has gone nowhere. The source and the destination being the same key is not a case to work around, it is LMOVE k k LEFT RIGHT, which is how a list is rotated and what a round robin scheduler is built out of."
+
+[[command]]
+name = "LMPOP"
+group = "list"
+since = "7.0.0"
+arity = -4
+plan = "merge"
+bounded = "inherent"
+status = "shipped"
+wire = "verified"
+notes = "The keys are behind a count, so COMMAND INFO reports no key positions and a cluster client has to ask COMMAND GETKEYS. The first key holding anything is the one that is popped, which is the point: one round trip instead of an LLEN per key and then an LPOP. A key of another type anywhere in the list is an error even when an earlier key would have answered."
 
 
 # ------------------------------------------------------------------ scripting
