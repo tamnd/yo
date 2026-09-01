@@ -676,6 +676,30 @@ wire = "verified"
 notes = "The one command in the group that costs what the value is worth. Two records pointing at one slot would be one set answering to two names and SADD to either would show up in both, so the body is cloned, which is Redis's cost too and there is no version of COPY that avoids it. DB n writes into a database the connection is not on, which is why the store splits this into an export that lifts a value out standing on its own and an import that puts one down, and the same pair is what MOVE, DUMP and RESTORE will want. The four failure modes are checked in an order nobody would write from scratch: the options first, so a bad DB is refused before anyone asks whether the source exists, then source and destination being the same object, and only then a missing source becoming the ordinary zero. Same object means same key in the same database, so COPY a a DB 1 is a real copy and COPY a a DB 0 from database zero is the error. A destination whose deadline has gone counts as free, which is the only answer consistent with EXISTS saying zero for the same key."
 
 [[command]]
+name = "SORT"
+group = "keyspace"
+since = "1.0.0"
+arity = -2
+divergent = "D-24"
+plan = "whole-value"
+bounded = "risk"
+status = "shipped"
+wire = "verified"
+notes = "The one command in the group that reads keys nobody named. BY and GET are not globs, they are templates: the first star is replaced with the element and the result is a key name, so a sort of ten thousand elements with a BY and a GET reads twenty thousand other keys. That is why it carries movablekeys, why Redis marks it not deterministic, and why SORT_RO exists as the readonly half. It is also why this is the one read path in the engine that copies the elements out before it does anything: the ordering is decided by reading other keys and reading another key needs the database the elements are borrowed from, so the borrow has to end first. Redis has the same problem and pays it by holding refcounted pointers, which is the same copy charged to whoever wrote the value. A BY pattern with no star cannot name a key per element so it means do not sort, except over a set with a STORE, where the result would otherwise differ between two servers holding the same members and Redis forces an alphabetic sort instead. Ties are broken by comparing the elements, always, so there is no case where the answer depends on the order the elements happened to be in. A lookup that lands on a key of the wrong type is a miss rather than an error, because a pattern is a guess about a naming convention and one key that does not fit it should not fail a command over the whole collection."
+
+[[command]]
+name = "SORT_RO"
+group = "keyspace"
+since = "7.0.0"
+arity = -2
+divergent = "D-24"
+plan = "whole-value"
+bounded = "risk"
+status = "shipped"
+wire = "verified"
+notes = "SORT without STORE, which is the whole difference. It exists so that a replica can answer a sort and so that a client with readonly permissions can ask for one, since SORT itself has to be a write command for the sake of an option most callers never use. STORE is not a word this parser knows, so SORT_RO k STORE d is a syntax error and not a permission error, which is what Redis answers too."
+
+[[command]]
 name = "SCAN"
 group = "keyspace"
 since = "2.8.0"

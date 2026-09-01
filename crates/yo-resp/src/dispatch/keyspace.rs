@@ -21,6 +21,7 @@ use super::scan;
 use super::table::Spec;
 use crate::reply::Out;
 use yo_common::{Code, Error, Result, glob_matches};
+use yo_kv::sort::Sort;
 use yo_kv::{Applied, Ask, Cond, Keyspace, Kind, MAX_AT, Moved};
 
 /// Milliseconds in a second, which is the whole of what the p in `PTTL` means.
@@ -138,6 +139,7 @@ pub(super) fn execute(
         "object" => object(db, args, out)?,
         "scan" => scan(db, args, out)?,
         "keys" => keys(db, args.get(1), out),
+        "sort" | "sort_ro" => sort(db, spec.name, args, out)?,
         "randomkey" => match db.random_key() {
             Some(key) => out.bulk(key),
             None => out.nil(),
@@ -328,6 +330,80 @@ fn copy(dbs: &mut [Keyspace], at: usize, args: Args<'_>, out: &mut Out) -> Resul
         Moved::Ok
     };
     out.int(i64::from(done == Moved::Ok));
+    Ok(())
+}
+
+/// `SORT key [BY pattern] [LIMIT offset count] [GET pattern ...] [ASC|DESC]
+/// [ALPHA] [STORE destination]`, and `SORT_RO` without the last one.
+///
+/// The options can come in any order and any of them can be given more than
+/// once, in which case the last one wins. That is not a design, it is what
+/// falls out of Redis's parser being a loop over the arguments with an
+/// assignment in each arm, and clients rely on it.
+///
+/// `ASC` is not stored anywhere because it is the default and its only job is
+/// to undo a `DESC` that came before it.
+///
+/// `GET` is the one option that accumulates rather than replaces, so
+/// `GET # GET w_*` asks for two things per element and not for the second one
+/// twice. The patterns are collected into a small vector, which is the one
+/// allocation this parser makes and only when a `GET` was given at all.
+fn sort(db: &mut Keyspace, name: &str, args: Args<'_>, out: &mut Out) -> Result<()> {
+    let read_only = name == "sort_ro";
+    let key = args.get(1);
+    let mut opts = Sort::default();
+    let mut get: Vec<&[u8]> = Vec::new();
+    let mut store: Option<&[u8]> = None;
+    let mut i = 2;
+    while i < args.len() {
+        let arg = args.get(i);
+        let rest = args.len() - i;
+        if args::is(arg, b"asc") {
+            opts.desc = false;
+        } else if args::is(arg, b"desc") {
+            opts.desc = true;
+        } else if args::is(arg, b"alpha") {
+            opts.alpha = true;
+        } else if args::is(arg, b"by") && rest >= 2 {
+            opts.by = Some(args.get(i + 1));
+            i += 2;
+            continue;
+        } else if args::is(arg, b"get") && rest >= 2 {
+            get.push(args.get(i + 1));
+            i += 2;
+            continue;
+        } else if args::is(arg, b"limit") && rest >= 3 {
+            opts.limit = Some((args.int(i + 1)?, args.int(i + 2)?));
+            i += 3;
+            continue;
+        } else if args::is(arg, b"store") && rest >= 2 && !read_only {
+            store = Some(args.get(i + 1));
+            i += 2;
+            continue;
+        } else {
+            // Which is where `SORT_RO k STORE d` lands, because `STORE` is not a
+            // word `SORT_RO` knows. Redis answers the same syntax error rather
+            // than one that names the option, since to its parser there is no
+            // option there to name.
+            return Err(args::syntax());
+        }
+        i += 1;
+    }
+    opts.get = &get;
+
+    match store {
+        Some(dst) => out.int(i64::try_from(db.sort_store(key, dst, &opts)?).unwrap_or(i64::MAX)),
+        None => {
+            let rows = db.sort(key, &opts)?;
+            out.array(rows.len());
+            for row in rows {
+                match row {
+                    Some(v) => out.bulk(&v),
+                    None => out.nil(),
+                }
+            }
+        }
+    }
     Ok(())
 }
 
