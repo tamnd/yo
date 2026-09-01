@@ -28,6 +28,17 @@
 //! is thrown out without reading the name bytes at all, and the name is only
 //! compared when the tag says it is worth comparing.
 //!
+//! Eight slots at a time, not one. The slot array is walked in aligned groups of
+//! [`group::WIDTH`], and one group compare answers the tag question for all
+//! eight at once and hands back a bit per slot. That is [`crate::group`], and
+//! the reason it exists is that the memory a slot array costs and the length of
+//! a probe through it are the same number seen twice: slots per element is one
+//! over the load, and an unsuccessful linear probe costs about half of one plus
+//! one over the square of one minus the load. One slot at a time, the array
+//! could not be made smaller without being made slower. A group probe touches
+//! about one group whatever the load is, which is what makes the array's size a
+//! choice again.
+//!
 //! A walk is sequential. `HGETALL`, `SMEMBERS` and `HSCAN` read the row array
 //! front to back with no pointer chasing, which is the difference between the
 //! 13.6 nanoseconds a field walk actually costs and the number a linked
@@ -50,11 +61,21 @@
 //!
 //! The slot the removed member sat in is closed by writing a marker over it,
 //! and the marker is the empty one rather than the dead one whenever it can
-//! prove no probe ever ran past the slot, which is when the slot after it is
-//! already empty. A run of markers directly behind that one is cleared too, by
-//! the same argument applied to each in turn. So the common shapes leave nothing
-//! behind at all: a set filled and then drained collects its own markers on the
-//! way down, and a table with short runs in it almost never writes one.
+//! prove no probe ever ran past the slot. A probe stops at the first group with
+//! an empty slot in it, so the proof is one question about the group the slot is
+//! in: if it already has an empty, nothing ever went past it. Every marker in
+//! that group goes back to empty at the same time and by the same argument, not
+//! just the one being cleared, which is what makes a set filled and then drained
+//! collect after itself.
+//!
+//! What that leaves behind is the groups that were completely full, because a
+//! probe really did go past one of those and a marker in it is holding the path
+//! open. At three quarters full that is about one group in ten, so a drained set
+//! ends with a few percent of its slots marked rather than none of them. It used
+//! to be none, when a removal shifted the run behind it back one slot at a time,
+//! and a few percent is the price of the group probe. It is a small one: almost
+//! every group still has an empty in it, so a miss against a drained set is
+//! still one group.
 //!
 //! What is left over is counted and it counts against the load exactly as a live
 //! member does, so a table churned in place rebuilds on the same schedule as one
@@ -100,6 +121,7 @@
 use yo_common::{bytes_eq, hash_key, tag_of};
 
 use crate::blob::Blob;
+use crate::group;
 use crate::scan::Cursor;
 
 /// The most rows one table holds.
@@ -651,19 +673,26 @@ impl<V: Copy> Elements<V> {
         }
         let mask = self.slots.len() - 1;
         let tag = tag_of(h);
-        let mut at = (h as usize) & mask;
+        let mut at = self.group_of(h as usize & mask);
         loop {
-            let slot = self.slots[at];
-            if slot == EMPTY {
-                return None;
-            }
-            if slot >> 24 == u32::from(tag) {
-                let row = slot & ROW;
+            let slots = &self.slots[at..at + group::WIDTH];
+            let mut hits = group::tags(slots, tag);
+            while hits != 0 {
+                let i = hits.trailing_zeros() as usize;
+                hits &= hits - 1;
+                let row = slots[i] & ROW;
+                // A marker cannot be a hit on a tag, because `tag_of` never
+                // answers zero and a marker's top byte is zero, and the empty
+                // one is caught here on the one tag in two hundred and fifty six
+                // that is all ones.
                 if row != ROW && bytes_eq(self.name_of(&self.rows[row as usize]), name) {
                     return Some(row as usize);
                 }
             }
-            at = (at + 1) & mask;
+            if group::empty(slots, EMPTY) != 0 {
+                return None;
+            }
+            at = (at + group::WIDTH) & mask;
         }
     }
 
@@ -676,10 +705,14 @@ impl<V: Copy> Elements<V> {
     /// after wherever this lands.
     fn put_slot(&mut self, h: u64, row: u32) {
         let mask = self.slots.len() - 1;
-        let mut at = (h as usize) & mask;
-        while self.slots[at] & ROW != ROW {
-            at = (at + 1) & mask;
-        }
+        let mut at = self.group_of(h as usize & mask);
+        let at = loop {
+            let free = group::free(&self.slots[at..at + group::WIDTH], ROW);
+            if free != 0 {
+                break at + free.trailing_zeros() as usize;
+            }
+            at = (at + group::WIDTH) & mask;
+        };
         if self.slots[at] == TOMB {
             self.dead -= 1;
         }
@@ -717,21 +750,24 @@ impl<V: Copy> Elements<V> {
     /// Otherwise the slot becomes a [`TOMB`], which says keep going and counts
     /// against the load until the next rebuild.
     fn clear_slot(&mut self, row: usize) {
-        let mask = self.slots.len() - 1;
         let at = self.slot_of(row);
-        if self.slots[(at + 1) & mask] != EMPTY {
+        let group = at & !(group::WIDTH - 1);
+        let slots = &self.slots[group..group + group::WIDTH];
+        if group::empty(slots, EMPTY) == 0 {
             self.slots[at] = TOMB;
             self.dead += 1;
             return;
         }
+        // This group already stops a probe, so nothing ever went past it and
+        // every marker in it is holding a place nobody is coming back for. They
+        // all go, not just the one being cleared, which is what makes a set
+        // filled and then drained collect after itself.
         self.slots[at] = EMPTY;
-        // This terminates on the slot just emptied at the latest, so an array of
-        // nothing but markers is walked once and not forever.
-        let mut back = at.wrapping_sub(1) & mask;
-        while self.slots[back] == TOMB {
-            self.slots[back] = EMPTY;
-            self.dead -= 1;
-            back = back.wrapping_sub(1) & mask;
+        for i in group..group + group::WIDTH {
+            if self.slots[i] == TOMB {
+                self.slots[i] = EMPTY;
+                self.dead -= 1;
+            }
         }
     }
 
@@ -752,14 +788,29 @@ impl<V: Copy> Elements<V> {
     fn slot_of(&self, row: usize) -> usize {
         let mask = self.slots.len() - 1;
         let want = u32::try_from(row).expect("a row index fits in 24 bits");
-        let mut at = self.home_of(row, mask);
+        let mut at = self.group_of(self.home_of(row, mask));
         loop {
-            debug_assert!(self.slots[at] != EMPTY, "the row being moved has a slot");
-            if self.slots[at] & ROW == want {
-                return at;
+            let slots = &self.slots[at..at + group::WIDTH];
+            let hit = group::rows(slots, ROW, want);
+            if hit != 0 {
+                return at + hit.trailing_zeros() as usize;
             }
-            at = (at + 1) & mask;
+            debug_assert!(
+                group::empty(slots, EMPTY) == 0,
+                "the row being looked for has a slot at or before the first gap"
+            );
+            at = (at + group::WIDTH) & mask;
         }
+    }
+
+    /// Where the group holding slot `at` starts.
+    ///
+    /// The slot array is a power of two and never shorter than [`group::WIDTH`],
+    /// so every group is aligned, there is no partial one at the end, and this
+    /// is one and rather than a division.
+    #[inline(always)]
+    const fn group_of(&self, at: usize) -> usize {
+        at & !(group::WIDTH - 1)
     }
 
     /// Make sure there is room for one more before it is inserted.
@@ -798,10 +849,14 @@ impl<V: Copy> Elements<V> {
                 continue;
             }
             let row = (slot & ROW) as usize;
-            let mut at = self.home_of(row, mask);
-            while self.slots[at] != EMPTY {
-                at = (at + 1) & mask;
-            }
+            let mut at = self.group_of(self.home_of(row, mask));
+            let at = loop {
+                let free = group::empty(&self.slots[at..at + group::WIDTH], EMPTY);
+                if free != 0 {
+                    break at + free.trailing_zeros() as usize;
+                }
+                at = (at + group::WIDTH) & mask;
+            };
             self.slots[at] = slot;
         }
     }
@@ -1335,11 +1390,22 @@ mod tests {
         }
     }
 
-    /// A drain collects after itself. Every removal that meets an empty slot on
-    /// its right takes the markers behind it with it, and by the time the last
-    /// member is gone there is nothing left in the array at all.
+    /// A drain collects most of what it leaves behind.
+    ///
+    /// A removal from a group that has an empty slot in it clears every marker
+    /// in that group, so as a set empties the markers go with it. What is left
+    /// at the end is the groups that were completely full when the drain
+    /// started, because a probe does go past one of those and a marker there is
+    /// still holding the path open. At three quarters full that is about one
+    /// group in ten, which is what the bound below is, and it is loose because
+    /// it is checking an order of magnitude rather than a formula.
+    ///
+    /// It used to be none at all, when a removal shifted the run behind it back
+    /// instead. That is the price of the group probe and it is a small one: a
+    /// few percent of slots holding a marker means almost every group still has
+    /// an empty in it, so a miss against the drained set is still one group.
     #[test]
-    fn emptying_a_set_a_member_at_a_time_leaves_nothing_behind() {
+    fn emptying_a_set_a_member_at_a_time_leaves_almost_nothing_behind() {
         let names: Vec<Vec<u8>> = (0..2000u32).map(|i| format!("m{i}").into_bytes()).collect();
         let mut s = Set::new();
         for name in &names {
@@ -1350,8 +1416,17 @@ mod tests {
             assert!(s.remove(name).is_some(), "{name:?} was there");
         }
         assert!(s.is_empty());
-        assert_eq!(s.dead, 0, "the drain cleared its own markers");
-        assert!(s.slots.iter().all(|v| *v == EMPTY));
+        assert!(
+            s.dead * 5 < slots,
+            "the drain left {} markers in {slots} slots",
+            s.dead
+        );
+        assert_eq!(
+            s.dead,
+            s.slots.iter().filter(|v| **v == TOMB).count(),
+            "the count is what is actually in the array"
+        );
+        assert!(s.slots.iter().all(|v| *v == EMPTY || *v == TOMB));
         for name in &names {
             assert!(!s.contains(name), "{name:?} came back");
         }
