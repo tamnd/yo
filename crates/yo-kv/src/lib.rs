@@ -101,6 +101,7 @@ pub mod clock;
 pub mod cond;
 pub mod counter;
 pub mod elem;
+pub mod evict;
 pub mod grow;
 pub mod hash;
 pub mod hashes;

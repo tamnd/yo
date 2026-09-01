@@ -487,6 +487,69 @@ impl Index {
             })
     }
 
+    /// Addresses from one segment picked at random, until `out` says stop.
+    ///
+    /// Eviction does not need a fair sample and it cannot afford a real one. It
+    /// needs a handful of keys that are not correlated with each other, quickly,
+    /// and it runs again in a moment if the handful was a bad one. Redis picks a
+    /// random slot in its table and takes a run of consecutive ones from there.
+    /// This is the same idea against a different shape: one segment, then a run
+    /// of consecutive buckets from a random start inside it.
+    ///
+    /// `r` is one draw from the caller's generator and both coordinates come out
+    /// of it, the segment from the top half and the bucket from the bottom.
+    /// Splitting one number rather than asking for two is worth it because this
+    /// is called in a loop and the generator is the same one `SPOP` uses.
+    ///
+    /// The segment is picked uniformly rather than by walking in from a random
+    /// prefix, and that is the whole reason this is not just [`Index::scan`]
+    /// from a made up cursor. A prefix picked uniformly lands in a segment in
+    /// proportion to how much of the prefix space that segment covers, and a
+    /// segment that has never split covers a great deal of it while holding no
+    /// more keys than any other. Sampling that way would look at the keys in
+    /// shallow segments over and over and barely ever look at the rest. Segments
+    /// all split at the same fullness, so picking between them evenly is close
+    /// to picking between keys evenly, which is as close as this needs to get.
+    ///
+    /// Walking forward through the segment rather than stopping at the first
+    /// bucket is what makes this work on a sparse map. A bucket holds seven
+    /// entries and a segment holds sixty four buckets, so a database with two
+    /// keys in it has two buckets that are worth looking in and sixty two that
+    /// are not, and a sampler that gave up after one would come back with
+    /// nothing almost every time. Walking on costs nothing when the map is full,
+    /// because the first bucket already answers.
+    ///
+    /// How many it hands over is the caller's decision and not an argument, which
+    /// is what `out` answering false is for. A count here would be the wrong
+    /// number: the caller is filtering, and under a `volatile` policy on a
+    /// database of mostly permanent keys it may have to look at forty of them to
+    /// find five it can use. Counting entries handed over rather than entries
+    /// kept would stop the walk at the first bucket and report that there is
+    /// nothing to evict, on a database that has plenty.
+    ///
+    /// The bound is the segment. Whatever the caller does, this looks in each of
+    /// the sixty four buckets at most once and then stops, so a caller that never
+    /// says stop still terminates. It can hand back nothing, when the segment it
+    /// picked is empty, and the caller decides whether that is worth another draw.
+    pub fn sample(&self, r: u64, mut out: impl FnMut(Addr) -> bool) {
+        let seg = &self.segs[(r >> 32) as usize % self.segs.len()];
+        let first = (r as usize) % SEGMENT_BUCKETS;
+        for step in 0..SEGMENT_BUCKETS {
+            let mut b = &seg.buckets[(first + step) % SEGMENT_BUCKETS];
+            loop {
+                for i in 0..SLOTS {
+                    if b.tag(i) != crate::bucket::EMPTY && !out(b.addr(i)) {
+                        return;
+                    }
+                }
+                match b.link() {
+                    Some(n) => b = &seg.overflow[(n - 1) as usize],
+                    None => break,
+                }
+            }
+        }
+    }
+
     /// Walk one bucket and its overflow chain, and say where to go next.
     ///
     /// This is the step [`Cursor`] exists for, and the reasoning behind the

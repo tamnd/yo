@@ -63,6 +63,9 @@ enum Knob {
     SetListpackValue,
     HashListpackEntries,
     HashListpackValue,
+    MaxmemorySamples,
+    LfuLogFactor,
+    LfuDecayTime,
 }
 
 /// The settings that move the size ladder, which are the ones that really move.
@@ -81,11 +84,21 @@ enum Knob {
 /// it is, and only decides what the next write builds. Redis does the same, and
 /// it is the reason `CONFIG SET set-max-listpack-entries 0` does not rewrite
 /// the keyspace.
+///
+/// The three eviction numbers are in here too, which stretches the name a
+/// little. They belong with these rather than with the immutable settings for
+/// the same reason: a client that sets one and then reads `OBJECT FREQ` or
+/// watches `evicted_keys` expects the two to agree. `maxmemory-samples` says how
+/// many keys a round of sampling looks at, and the two `lfu` numbers set what
+/// the counter under an LFU policy actually measures.
 const LADDER: &[(&str, Knob)] = &[
     ("hash-max-listpack-entries", Knob::HashListpackEntries),
     ("hash-max-listpack-value", Knob::HashListpackValue),
     ("hash-max-ziplist-entries", Knob::HashListpackEntries),
     ("hash-max-ziplist-value", Knob::HashListpackValue),
+    ("lfu-decay-time", Knob::LfuDecayTime),
+    ("lfu-log-factor", Knob::LfuLogFactor),
+    ("maxmemory-samples", Knob::MaxmemorySamples),
     ("set-max-intset-entries", Knob::SetIntsetEntries),
     ("set-max-listpack-entries", Knob::SetListpackEntries),
     ("set-max-listpack-value", Knob::SetListpackValue),
@@ -531,6 +544,9 @@ fn read_knob(db: &Keyspace, knob: Knob) -> usize {
         Knob::SetListpackValue => db.limits().max_listpack_value,
         Knob::HashListpackEntries => db.hash_limits().max_listpack_entries,
         Knob::HashListpackValue => db.hash_limits().max_listpack_value,
+        Knob::MaxmemorySamples => db.samples(),
+        Knob::LfuLogFactor => db.lfu().log_factor as usize,
+        Knob::LfuDecayTime => db.lfu().decay_minutes as usize,
     }
 }
 
@@ -538,15 +554,23 @@ fn read_knob(db: &Keyspace, knob: Knob) -> usize {
 fn write_knob(db: &mut Keyspace, knob: Knob, n: usize) {
     let mut set = *db.limits();
     let mut hash = *db.hash_limits();
+    let mut lfu = db.lfu();
     match knob {
         Knob::SetIntsetEntries => set.max_intset_entries = n,
         Knob::SetListpackEntries => set.max_listpack_entries = n,
         Knob::SetListpackValue => set.max_listpack_value = n,
         Knob::HashListpackEntries => hash.max_listpack_entries = n,
         Knob::HashListpackValue => hash.max_listpack_value = n,
+        Knob::MaxmemorySamples => db.set_samples(n),
+        // Saturating rather than wrapping, because these two are read as `u32`
+        // and a client is free to send a number that does not fit. Redis clamps
+        // `lfu-log-factor` and `lfu-decay-time` to the same width.
+        Knob::LfuLogFactor => lfu.log_factor = u32::try_from(n).unwrap_or(u32::MAX),
+        Knob::LfuDecayTime => lfu.decay_minutes = u32::try_from(n).unwrap_or(u32::MAX),
     }
     db.set_limits(set);
     db.set_hash_limits(hash);
+    db.set_lfu(lfu);
 }
 
 /// The two things a real server says about a number it will not take.
@@ -619,7 +643,7 @@ fn config(server: &mut Server, args: Args<'_>, out: &mut Out) -> Result<()> {
         // server takes the whole `CONFIG SET` or none of it. `CONFIG SET
         // hash-max-listpack-entries 7 set-max-listpack-entries abc` leaves the
         // hash setting where it was, which was checked rather than assumed.
-        let mut writes = [None; 8];
+        let mut writes = [None; 16];
         let mut count = 0;
         let mut policy = None;
         let mut i = 2;
@@ -646,7 +670,7 @@ fn config(server: &mut Server, args: Args<'_>, out: &mut Out) -> Result<()> {
                     return Err(bad_setting(k, parse_i64(value).is_some()));
                 };
                 if count == writes.len() {
-                    // Eight pairs is more than the five settings there are, so
+                    // Sixteen pairs is more than the ten names there are, so
                     // getting here means a name was given twice enough times to
                     // fill it, and the last one would have won anyway.
                     return Err(args::syntax());
@@ -779,10 +803,12 @@ fn info(server: &Server, args: Args<'_>, out: &mut Out) {
             let _ = write!(
                 s,
                 "# Stats\r\ntotal_connections_received:{}\r\n\
-                 total_commands_processed:{}\r\nexpired_keys:{}\r\n\r\n",
+                 total_commands_processed:{}\r\nexpired_keys:{}\r\n\
+                 evicted_keys:{}\r\n\r\n",
                 server.stats.connections,
                 server.stats.commands,
                 server.expired_keys(),
+                server.evicted_keys(),
             );
         }
         if want("cpu") {

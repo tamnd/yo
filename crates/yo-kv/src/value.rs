@@ -280,9 +280,15 @@ impl Meta {
 
     /// Whether an access field follows the deadline.
     ///
-    /// False only for a record written before the field existed, which is what
-    /// lets an older file open rather than be misread. Everything this crate
-    /// writes now sets it.
+    /// Everything this crate writes sets it, so in a running server it is always
+    /// true and the reader that checks it is checking something that cannot
+    /// happen. It is here anyway because a bit in the byte costs nothing and the
+    /// alternative was a flag day: without it, the day the field arrived, every
+    /// reader had to agree with every writer at exactly the same moment.
+    ///
+    /// It is not a file format concern. These records live in the arena and
+    /// never reach a file, and the on disk record in `yo_format` has its own
+    /// layout and its own versioning.
     #[inline]
     pub const fn has_access(self) -> bool {
         self.0 & HAS_ACCESS != 0
