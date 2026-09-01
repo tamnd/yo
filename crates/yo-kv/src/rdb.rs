@@ -96,6 +96,35 @@
 //! the only thing that ever reached it was a payload from a real server, which
 //! is the case that matters most.
 //!
+//! # Taking the blob back
+//!
+//! A payload for a sorted set on the packed band goes the other way too. The
+//! blob that arrives is the layout that band uses, so it moves in whole rather
+//! than being added a member at a time, and the difference is not small: adding
+//! costs a scan to see whether the member is already there and a second scan to
+//! find where it belongs, both over everything added so far, so it is the square
+//! of the count twice over with a memmove on each one. A hundred member sorted
+//! set restored in 534 us and restores in 4.6 us.
+//!
+//! The blob is checked before it is taken. This band answers a rank query by
+//! position and by nothing else, so a payload that says it is a sorted set while
+//! not being sorted would answer `ZRANGE` with the wrong members and never say
+//! why, and a payload with the same member twice would report a length nothing
+//! else agrees with. One pass rules out both, since strictly increasing means no
+//! two members compare equal on the score and then equal on the bytes. A blob
+//! that fails the check, or that is past this server's limits, is handed back
+//! and walked, which is what the reader did with every payload before this.
+//!
+//! A sorted set past the band is sized from the count now, the way a set and a
+//! hash already were. It used to start packed whatever the count said, fill to
+//! the band limit at a scan a member, and throw the listpack away. A thousand
+//! member sorted set restored in 1.23 ms and restores in 88 us.
+//!
+//! What is left is the hash, which has the same shape of problem for the same
+//! reason and is not fixed here. Its blob is not sorted, so ruling out a
+//! duplicate field is not free the way it is for a sorted set, and that wants
+//! its own change rather than being smuggled into this one.
+//!
 //! # Compression
 //!
 //! Redis compresses strings over twenty bytes with LZF when `rdbcompression` is
@@ -731,7 +760,10 @@ fn read_set_listpack(r: &mut Reader<'_>, limits: &set::Limits) -> Result<Body, B
 
 fn read_zset(r: &mut Reader<'_>, limits: &zset::Limits, binary: bool) -> Result<Body, Bad> {
     let n = non_empty(r.len()?)?;
-    let mut zset = Zset::new();
+    // Sized from the count, the way `read_set` and `read_hash` are. A sorted set
+    // that is going to end up on the table should start there, rather than fill
+    // the packed band to its limit at a scan a member and then throw it away.
+    let mut zset = Zset::with_hint(n, limits);
     for _ in 0..n {
         let member = r.str()?;
         let score = if binary {
@@ -750,7 +782,16 @@ fn read_zset_listpack(r: &mut Reader<'_>, limits: &zset::Limits) -> Result<Body,
     if lp.is_empty() || lp.len() % 2 != 0 {
         return Err(Bad::Format);
     }
-    let mut zset = Zset::new();
+    // The payload is already the layout the packed band uses, so the fast answer
+    // is to take it whole rather than to add a member at a time. `from_packed`
+    // hands the blob back when it will not have it, and then the walk below
+    // rebuilds it, which is what happens to a payload that is out of order or
+    // past this server's limits.
+    let lp = match Zset::from_packed(lp, limits) {
+        Ok(zset) => return Ok(Body::Zset(zset)),
+        Err(lp) => lp,
+    };
+    let mut zset = Zset::with_hint(lp.len() / 2, limits);
     let mut member = [0u8; DIGITS_MAX];
     let mut score = [0u8; DIGITS_MAX];
     // Walked and not indexed. A listpack has no offset table, so asking it for
