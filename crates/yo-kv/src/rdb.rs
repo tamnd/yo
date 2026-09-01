@@ -120,10 +120,21 @@
 //! the band limit at a scan a member, and throw the listpack away. A thousand
 //! member sorted set restored in 1.23 ms and restores in 88 us.
 //!
-//! What is left is the hash, which has the same shape of problem for the same
-//! reason and is not fixed here. Its blob is not sorted, so ruling out a
-//! duplicate field is not free the way it is for a sorted set, and that wants
-//! its own change rather than being smuggled into this one.
+//! The hash gets the same treatment, and the only hard part was the bit the
+//! sorted set got for free. A sorted set blob is ordered, so one pass proving it
+//! is strictly increasing also proves no member is in it twice. A hash blob is
+//! in insertion order, and a repeated field would give a hash whose `HLEN`
+//! counts both rows and whose `HGET` and `HDEL` only ever reach the first, so
+//! the length would disagree with `HGETALL` and a delete would leave the field
+//! behind. `Hash::from_packed` rules that out by hashing each field into a
+//! stack array and sorting it, which is one pass and a sort rather than the
+//! square of the count, and a collision costs a fallback to the walk and not a
+//! wrong answer. A hundred field hash restored in 62.8 us and restores in 5.8.
+//!
+//! Only the two element form. The band with a deadline after every value is not
+//! handed over, for the same reason `Hash::packed_bytes` will not copy it on
+//! the way out: that column has its own type byte and its own header, and a hash
+//! that has been widened once keeps the third element per field forever after.
 //!
 //! # Compression
 //!
@@ -891,6 +902,18 @@ fn read_hash_listpack(
     if lp.is_empty() || lp.len() % step != 0 {
         return Err(Bad::Format);
     }
+    // The payload is already the layout the packed band uses, so take it whole
+    // rather than set a field at a time. Only the two element form: the deadline
+    // column is a band this cannot hand over, for the reason `packed_bytes`
+    // refuses to copy it on the way out.
+    let lp = if with_ttl {
+        lp
+    } else {
+        match Hash::from_packed(lp, limits) {
+            Ok(hash) => return Ok(Body::Hash(hash)),
+            Err(lp) => lp,
+        }
+    };
     let mut hash = Hash::with_hint(lp.len() / step, limits);
     let mut field_buf = [0u8; DIGITS_MAX];
     let mut value_buf = [0u8; DIGITS_MAX];

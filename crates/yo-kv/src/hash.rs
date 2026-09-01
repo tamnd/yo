@@ -80,6 +80,26 @@
 //! A write clears a field's deadline. `HSET` on a field that had one leaves it
 //! with no deadline, which is Redis's rule since 7.4 and is the reason `HGETEX`
 //! exists to read a field without disturbing it.
+//!
+//! # The blob goes both ways
+//!
+//! The listpack this band holds is byte for byte what Redis's `HASH_LISTPACK` is,
+//! which is why `Hash::packed_bytes` hands it to `DUMP` uncopied. Read
+//! backwards, that says a `RESTORE` should move the blob in whole rather than
+//! set a field at a time, and it is worth much more coming in than going out:
+//! setting a field scans everything already there to see whether it is a repeat,
+//! so a hundred fields is five thousand comparisons to build something that
+//! arrived ready to use.
+//!
+//! `Hash::from_packed` is that, and the one thing it has to prove is that no
+//! field is in the blob twice, because `Packed::find` answers with the first
+//! row that matches and stops. It proves it by hashing every field into a stack
+//! array and sorting that, one pass and a sort, no allocation, and a collision
+//! costs a fallback to the walk rather than a wrong answer. Anything it will not
+//! take is handed back so the caller can walk it without parsing it again.
+//!
+//! Only the band without deadlines. `packed_bytes` will not copy the wider one
+//! out and this will not take one in, and it is the same reason both times.
 
 use yo_common::num::{self, parse_i64};
 
@@ -91,6 +111,17 @@ use crate::ttl::{Applied, Ask, Cond, Deadlines, decide};
 
 /// No deadline, the same sentinel [`crate::ttl`] uses and for the same reason.
 const NONE: u64 = u64::MAX;
+
+/// The most fields `Hash::from_packed` will check for a repeat in one go.
+///
+/// It is the size of a stack array, so it has to be a constant, and it is
+/// [`Limits::DEFAULT`]'s field count because that is the largest hash a stock
+/// server will hand over on this band. A blob with more fields than this is
+/// walked instead of adopted, which is only slower and never wrong, and it can
+/// only come from a server with `hash-max-listpack-entries` raised above the
+/// default. Four kilobytes of stack for the length of one `RESTORE` is a fair
+/// price for taking the square out of the common case.
+const CHECK_MAX: usize = Limits::DEFAULT.max_listpack_entries;
 
 /// A field name or a value, as it is stored.
 ///
@@ -315,6 +346,18 @@ impl Packed {
 /// The only caller is [`Packed::widen`], which is copying a listpack it already
 /// holds, so a number that went in as a number comes back out as one and is
 /// stored as one again.
+/// The bytes an entry stands for, writing the digits of a number into `digits`.
+///
+/// A listpack holds something that looks like an integer as an integer, so the
+/// field `10` comes back out as a number and has to be turned back into the two
+/// bytes it was written as before anything compares or hashes it.
+fn bytes_of<'a>(t: Text<'a>, digits: &'a mut [u8; num::DIGITS_MAX]) -> &'a [u8] {
+    match t {
+        Text::Str(s) => s,
+        Text::Int(n) => num::i64_digits(digits, n),
+    }
+}
+
 fn push_text(lp: &mut Listpack, t: Text<'_>) {
     match t {
         Text::Str(s) => lp.push(s),
@@ -463,6 +506,84 @@ impl Hash {
                 body: Body::Table(Table::new(hint)),
             }
         }
+    }
+
+    /// Take a listpack that is already in this band's layout, if it really is.
+    ///
+    /// The blob a `RESTORE` carries for a `HASH_LISTPACK` is byte for byte what
+    /// this band holds, so the fast answer is to move it in whole rather than to
+    /// set a field at a time. Setting costs a scan of everything already there to
+    /// see whether the field is a repeat, so a hundred fields is five thousand
+    /// comparisons to build a thing that arrived ready to use.
+    ///
+    /// The blob comes back on refusal so that a caller who has to walk it after
+    /// all does not have to parse it a second time.
+    ///
+    /// What has to be ruled out is a repeated field, because `Packed::find`
+    /// answers with the first row that matches and stops. A blob holding the same
+    /// field twice would give a hash whose `HLEN` counts both and whose `HGET`
+    /// and `HDEL` only ever reach one, so the length would disagree with
+    /// `HGETALL` and a delete would leave the field behind. The sorted set got
+    /// this for nothing in #192 because its blob is ordered and strictly
+    /// increasing rules out a repeat on the way past, and a hash blob is in
+    /// insertion order, so it has to be looked for on purpose.
+    ///
+    /// It is looked for by hashing each field into a stack array and sorting
+    /// that, which is one pass and a sort rather than the square of the count,
+    /// and allocates nothing. A hash collision costs a fallback to the walk and
+    /// not a wrong answer, and over at most [`CHECK_MAX`] fields a 64 bit
+    /// collision is not going to happen. The array is why there is a cap: a blob
+    /// with more fields than that is walked, which is what every blob did before
+    /// this, and the cap is Redis's own default for this band so a hash from a
+    /// stock server is always under it.
+    pub(crate) fn from_packed(lp: Listpack, limits: &Limits) -> Result<Hash, Listpack> {
+        let n = lp.len();
+        if n == 0 || !n.is_multiple_of(2) {
+            return Err(lp);
+        }
+        let fields = n / 2;
+        if fields > limits.max_listpack_entries || fields > CHECK_MAX {
+            return Err(lp);
+        }
+        let mut marks = [0u64; CHECK_MAX];
+        let ok = {
+            let mut field_digits = [0u8; num::DIGITS_MAX];
+            let mut value_digits = [0u8; num::DIGITS_MAX];
+            let mut walk = lp.iter();
+            let mut i = 0;
+            loop {
+                let Some(field) = walk.next() else { break true };
+                // The count is even, checked above, so there is always a value
+                // behind a field.
+                let Some(value) = walk.next() else {
+                    break false;
+                };
+                let name = bytes_of(field, &mut field_digits);
+                if name.len() > limits.max_listpack_value {
+                    break false;
+                }
+                marks[i] = Elements::<u32>::hash_of(name);
+                i += 1;
+                if bytes_of(value, &mut value_digits).len() > limits.max_listpack_value {
+                    break false;
+                }
+            }
+        };
+        if !ok {
+            return Err(lp);
+        }
+        let marks = &mut marks[..fields];
+        marks.sort_unstable();
+        if marks.windows(2).any(|pair| pair[0] == pair[1]) {
+            return Err(lp);
+        }
+        Ok(Hash {
+            body: Body::Packed(Packed {
+                lp,
+                ex: false,
+                soonest: NONE,
+            }),
+        })
     }
 
     /// Which representation this is in.
@@ -947,6 +1068,104 @@ mod tests {
 
     fn text(t: Text<'_>) -> Vec<u8> {
         t.to_vec()
+    }
+
+    /// A listpack in the layout `HASH_LISTPACK` arrives in.
+    fn packed(rows: &[(&[u8], &[u8])]) -> Listpack {
+        let mut lp = Listpack::new();
+        for (f, v) in rows {
+            lp.push(f);
+            lp.push(v);
+        }
+        lp
+    }
+
+    #[test]
+    fn a_payload_in_this_layout_is_taken_whole() {
+        // `10` and `9` go in as numbers, because that is what a listpack does
+        // with anything that looks like one, and they have to come back out as
+        // the bytes they were written as.
+        let rows: &[(&[u8], &[u8])] = &[
+            (b"a", b"1"),
+            (b"b", b"two"),
+            (b"10", b"ten"),
+            (b"9", b""),
+            (b"", b"empty field name"),
+        ];
+        let h = Hash::from_packed(packed(rows), &SMALL).expect("this band can hold it");
+        assert_eq!(h.encoding(), Encoding::Listpack);
+        assert_eq!(h.len(), rows.len());
+        for (f, v) in rows {
+            assert_eq!(h.get(f).map(text).as_deref(), Some(*v), "field {f:?}");
+        }
+        assert_eq!(h.soonest_deadline(), None);
+        // And it behaves like one built a field at a time after it lands.
+        let mut h = h;
+        assert!(h.remove(b"10"));
+        assert_eq!(h.len(), rows.len() - 1);
+        assert_eq!(h.get(b"10"), None);
+        assert!(!h.set(b"a", b"other", &SMALL));
+        assert_eq!(h.get(b"a").map(text).as_deref(), Some(&b"other"[..]));
+    }
+
+    #[test]
+    fn a_blob_this_band_cannot_hold_is_handed_back() {
+        let long = vec![b'x'; SMALL.max_listpack_value + 1];
+        let cases: Vec<(&str, Listpack)> = vec![
+            (
+                "the same field twice",
+                packed(&[(b"a", b"1"), (b"a", b"2")]),
+            ),
+            (
+                "the same field twice as a number",
+                packed(&[(b"7", b"1"), (b"7", b"2")]),
+            ),
+            ("a field past the value limit", packed(&[(&long, b"1")])),
+            ("a value past the value limit", packed(&[(b"a", &long)])),
+            ("empty", Listpack::new()),
+            ("an odd count", {
+                let mut lp = packed(&[(b"a", b"1")]);
+                lp.push(b"b");
+                lp
+            }),
+        ];
+        for (why, lp) in cases {
+            assert!(
+                Hash::from_packed(lp, &SMALL).is_err(),
+                "{why} should have been handed back"
+            );
+        }
+
+        // And more fields than the band takes, which is the limit talking and
+        // not the stack array.
+        let rows: Vec<(Vec<u8>, Vec<u8>)> = (0..3)
+            .map(|i| (format!("f{i}").into_bytes(), b"v".to_vec()))
+            .collect();
+        let borrowed: Vec<(&[u8], &[u8])> = rows
+            .iter()
+            .map(|(f, v)| (f.as_slice(), v.as_slice()))
+            .collect();
+        assert!(Hash::from_packed(packed(&borrowed), &AS_TABLE).is_err());
+        assert!(Hash::from_packed(packed(&borrowed), &SMALL).is_ok());
+    }
+
+    #[test]
+    fn a_blob_with_more_fields_than_the_check_array_is_handed_back() {
+        // The cap is a stack array and not a limit anybody configured, so a
+        // server with `hash-max-listpack-entries` raised past it still has to be
+        // correct, which here means walking rather than adopting.
+        let wide = Limits {
+            max_listpack_entries: CHECK_MAX * 2,
+            max_listpack_value: 64,
+        };
+        let rows: Vec<(Vec<u8>, Vec<u8>)> = (0..CHECK_MAX + 1)
+            .map(|i| (format!("f{i:05}").into_bytes(), b"v".to_vec()))
+            .collect();
+        let borrowed: Vec<(&[u8], &[u8])> = rows
+            .iter()
+            .map(|(f, v)| (f.as_slice(), v.as_slice()))
+            .collect();
+        assert!(Hash::from_packed(packed(&borrowed), &wide).is_err());
     }
 
     fn pairs(h: &Hash) -> Vec<(String, String)> {
