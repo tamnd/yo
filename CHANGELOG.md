@@ -4,6 +4,30 @@ What each release changed, why, and what it costs you. The versioning rules and 
 
 While the major is 0, a minor release may break anything, including the on-disk format. The format is frozen at `M6`, not before.
 
+## 0.3.7 — 2026-09-01
+
+Four pull requests, no milestone, so this is a patch. It is the end of the allocation campaign that 0.3.6 started. The report that came out of that release listed thirteen places where serving a command asked the allocator for memory, and this release takes that list to zero and then makes it a check that runs on every push, so it cannot quietly come back.
+
+The `.yo` layout is untouched. A file written by any 0.3.x opens unchanged.
+
+### Added
+
+- **`cargo xtask alloc`, and it is a CI job.** It builds a debug `yodb` with the allocation check in report mode, sends about nine thousand commands covering every type, and fails if anything on a command path asked for memory. The workload is a Python file in the repository rather than a shell pipeline somebody remembers, so widening it is an edit and not an act of archaeology. Debug on purpose: a release build inlines the interesting frames into each other and every site comes back naming `serve_command`, which tells nobody anything.
+- **Three named claims in `yo-alloc`, for the allocations that are not bugs.** `first_touch` is a key coming into existence, `for_the_data` is a collection growing because more was put in it, and `high_water` is a buffer the database keeps reaching a size it has never been asked for before. They are all `allow` underneath and the only difference is what they assert, which is the point: `git grep first_touch` stays a list of the places a key is created, rather than a list of everywhere somebody wanted the check to be quiet.
+- **`Keyspace::set_with` and `Keyspace::getdel_with`.** The owning `set` and `getdel` stay for the embedded caller who wants a `Vec` back. The `_with` pair hands the old value to a closure where it still lies in the record, before the write or the delete goes over it, which is what the wire wants because it copies that value into a reply and never looks at it again.
+
+### Changed
+
+- **The union's hash table is kept in the database instead of built per call.** `SUNION`, `SUNIONSTORE`, `SINTER` and `SDIFF` all needed somewhere to check for duplicates and all four built it, filled it and dropped it inside one command. The table now belongs to the database and is cleared rather than freed, so it grows when a union is larger than every union before it and not otherwise. That is 1.48x on a `SUNION` over two text sets on the arm dev machine, which is a development measurement and not a gate number.
+- **`yo_alloc::allow` is a relaxed load of a static when no thread has ever been marked**, which is every shipped binary and every benchmark. It had to become nearly free because a claim belongs where the growth is, and the union's growth is per member rather than per call, so the guard sits around the insert inside the walk. A guard around the whole walk would be one call instead of thousands and would also hide whatever the caller's closure does, which is the reply buffer for `SUNION` and the destination set for `SUNIONSTORE`. The report is worth more than that.
+- **`COPY` settles the destination before it copies anything.** It used to export the source and then find out whether it was allowed to write, which is the difference between a refused copy of a million member set costing nothing and costing the set. A string is now copied as a record, deadline and all, through the database's scratch buffer, so `COPY` over a string allocates nothing at all.
+
+### Fixed
+
+- **`SET ... GET`, `GETSET`, `GETDEL`, `GETEX`, `INCRBYFLOAT`, `RANDOMKEY`, `RENAME`, the string arm of `COPY` and every command that frees a decoder no longer allocate.** They were the rest of the report. Most were a `to_vec` holding a value across a write that was about to go over it, which the scratch buffer or a `_with` closure removes. `INCRBYFLOAT` was reading its own value out to a `Vec` before parsing it, and an int encoded value has no digits to parse anyway, so that arm converts instead of formatting and then parsing back.
+- **`COPY k k` no longer frees the body and then writes a record pointing at it.** The wire never asked, because Redis refuses `COPY k k` with an error and so does the dispatch, but the embedded caller can ask and got the worst of the answers available. It now answers the same pair `RENAME` does: taken without `REPLACE`, fine with it, and the key is left alone either way.
+- **The `setops_small` benchmark group had two rows claiming the same identifier**, so criterion panicked on the duplicate and the sixty four member rows had never been measured at all. That also means the nightly benchmark smoke run was failing on it rather than smoking anything.
+
 ## 0.3.6 — 2026-09-01
 
 Nineteen pull requests, no milestone, so this is a patch. Two things run through it. The array group finished, which makes it 18 of 18 array commands and the fourth complete type. And a memory campaign that started as one measurement and turned into most of the release: a large integer set now costs a seventh of what it did, `LINSERT` and `LPOS` on a long list are five to fifteen times faster, and the allocator has been armed on the command path for the first time so there is a list of what still calls it.
