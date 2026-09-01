@@ -4,6 +4,38 @@ What each release changed, why, and what it costs you. The versioning rules and 
 
 While the major is 0, a minor release may break anything, including the on-disk format. The format is frozen at `M6`, not before.
 
+## 0.3.11 — 2026-09-01
+
+Five pull requests, no milestone, so this is a patch. The keyspace group is finished, and the rest of it is what happened when the new commands got pointed at a real Redis instead of at our own tests.
+
+The `.yo` layout is untouched. A file written by any 0.3.x opens unchanged.
+
+The headline is not the new command. It is that `RESTORE` was refusing every payload a current Redis produces, and that nothing had noticed because everything on both sides of the check was ours.
+
+### Added
+
+- **MIGRATE, which finishes the keyspace group at 29 of 29.** It is `DUMP` here and `RESTORE` there with a client connection in between, and it is synchronous and blocking because Redis's is. Everything goes out in one write, the `AUTH` and the `SELECT` and one `RESTORE` per key that is actually present, so a failing `SELECT` does not leave the `RESTORE`s behind it unsent. Keys are independent and only the first complaint is reported, which is what `MIGRATE` has always done and is the reason the reply is one line rather than a list. Sockets are cached, sixty four of them with a ten second idle timeout, and a non-timeout error gets one retry because a cached socket that the far side closed is the ordinary case and not an error worth surfacing.
+
+### Fixed
+
+- **RESTORE turned down every payload a real Redis 8.10.1 produces.** One constant was doing two jobs. We stamp RDB version 12 on what we write and the reader compared the incoming version against that same 12, so anything newer was refused, with an error saying the checksum was wrong when the checksum was fine. Those are opposite questions: what we write is a promise about how old a server can be and still understand us, so it wants to be as low as it can go, and what we read is a statement about how new a server can be before a type byte might not mean what it used to, so it wants to be as high as has actually been checked. It is two constants now, `VERSION` at 12 and `READS_UP_TO` at 15, and 15 is what a Redis 8.10.1 puts in the footer read off one over a socket rather than out of a header file. This is the kind of bug that only a real server finds, because every payload our tests had ever seen was one we wrote.
+
+### Performance
+
+Development measurements unless the machine is named. None of these are gate numbers.
+
+- **DUMP copies the blob when there is one to copy, on the dev arm machine.** Our listpack and intset are byte compatible with Redis's own on purpose, so a value already sitting in one packed blob is now the blob with a length in front of it rather than a walk that decodes every element and encodes it again. At a hundred elements, walked against copied: a set of text 7.57 to 3.41 us, a set of integers 1.32 to 0.57, a hash 24.94 to 3.95 and a sorted set 21.04 to 3.82. The same rows at a thousand elements are past every packed band and so are the walk in both runs, and they moved by under one percent, so nothing here was paid for by the values that do not benefit. Which type byte a value gets is decided by the word `OBJECT ENCODING` answers with and not by the body underneath it, so there is one rule and one place to read it, and a hash widened for field deadlines is never copied because that band keeps a third element per field after the last deadline is gone.
+- **Restoring a sorted set went from 534 us to 4.6 us at a hundred members, on the dev arm machine.** That is 116x, and 16x at a thousand members where it went from 1.23 ms to 88 us. The reader was building the sorted set a member at a time, and on the packed band that costs a scan to see whether the member is already there and a second scan to find where it belongs, both over everything added so far, with a memmove on each one. The payload is Redis's own `ZSET_LISTPACK`, which is byte for byte the layout that band uses, so it moves in whole now. It is checked first, because the band answers a rank query by position and by nothing else, and one pass over the blob proves it is sorted and rules out duplicates at the same time, since strictly increasing means no two members compare equal on the score and then equal on the bytes. A blob that fails is handed back and walked exactly as before.
+- **SPOP at a million members went from 5.98 ms to 3.95 ms, on gamingpc.** Three passes interleaved against main at twenty seconds a measurement. Removing a member used to close its slot by shifting the run behind it back one slot at a time, computing a home slot for every slot it walked over, and it writes a marker over the slot instead. The old objection to a marker was that a table answering an empty set by walking a million of them is slower than the structure it replaced, and that is handled two ways: the marker is the empty one rather than the dead one whenever nothing ever probed past that slot, so a set filled and then drained collects its own markers on the way down, and the markers count against the load exactly as live members do, so a table churned in place rebuilds on the same schedule as one that only grows.
+- **Two quadratics taken out of listpack walks.** There is no offset table in a listpack, so asking it for element `i` walks from the front and asking it for every element in turn costs the square of the count. The hash and sorted set readers both did that, and so did the promotion from the packed band to the table, which is on the ordinary `ZADD` path and not only on `RESTORE`. A hundred field hash loaded in 81 us and loads in 60.
+- **A measurement that looked like a regression and was not.** The `SPOP` A/B showed `score_walk` twenty percent slower on a first pass at eight seconds a measurement. At twenty seconds and three passes the branch lands inside main's own run to run spread, and there was never a mechanism for it either, since that walk goes over rows and the change is entirely in the slot array. `draw` is about three percent slower and does hold across all three passes, so it is recorded rather than dismissed, but it has no mechanism either and three percent of five nanoseconds against a third of six milliseconds is a trade worth taking.
+
+### Known
+
+- **Restoring a hash has the same disease the sorted set had, at ten times the per field cost.** 61 us for a hundred fields against 69 us for a thousand. Its blob is not sorted, so ruling out a duplicate field is not free the way it is for a sorted set, and adopting a blob with a field in it twice would give a hash whose `HLEN` disagrees with `HGETALL`. It needs a single pass that hashes each field and looks for a collision in a stack table, which is its own change and is filed as #193.
+- **RESTORE checks IDLETIME and FREQ and then drops them, which is still D-26.** Unchanged from 0.3.10 and it resolves at M5.
+- **M3 is gated on memory and on nothing else.** The command surface is done. A byte member set costs 34.83 bytes a member at a million against G8's three over payload, and a hash 38.09 a field against sixteen. Roughly 2.7 bytes of that is a slot array that has just doubled and is fixed by exact sizing, and the rest wants byte members held in sorted runs the way the intset already holds integers.
+
 ## 0.3.10 — 2026-09-01
 
 Five pull requests, no milestone, so this is a patch. It is the keyspace group getting to within one command of finished, plus one number changed in the growth policy that takes two and a half bytes a member off every large collection.
