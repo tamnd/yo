@@ -152,22 +152,33 @@ impl Argv {
             if buf[0] != b'*' {
                 return self.inline(buf, limits);
             }
-            let Some((line, after)) = line_at(buf, 1, ProtocolError::InvalidMultibulkLength)?
-            else {
-                // No end to the count line yet. A client that keeps sending
-                // digits and never a newline is not going to become valid, and
-                // the pending bytes are being held for it, so there is a bound.
-                return if buf.len() > limits.max_inline {
-                    Err(ProtocolError::TooBigMbulkCount)
-                } else {
-                    Ok(Step::Incomplete)
-                };
+            // The two arms agree on a `u64` and the slow one folds a negative
+            // into zero, because `*-1` and `*0` are the same command with
+            // nothing in it and neither is ever above the limit.
+            let (count, after) = match digits_at(buf, 1) {
+                Some(got) => got,
+                None => {
+                    let Some((line, after)) =
+                        line_at(buf, 1, ProtocolError::InvalidMultibulkLength)?
+                    else {
+                        // No end to the count line yet. A client that keeps
+                        // sending digits and never a newline is not going to
+                        // become valid, and the pending bytes are being held for
+                        // it, so there is a bound.
+                        return if buf.len() > limits.max_inline {
+                            Err(ProtocolError::TooBigMbulkCount)
+                        } else {
+                            Ok(Step::Incomplete)
+                        };
+                    };
+                    let n = parse_i64(line).ok_or(ProtocolError::InvalidMultibulkLength)?;
+                    (n.max(0) as u64, after)
+                }
             };
-            let count = parse_i64(line).ok_or(ProtocolError::InvalidMultibulkLength)?;
-            if count > limits.max_multibulk as i64 {
+            if count > limits.max_multibulk as u64 {
                 return Err(ProtocolError::InvalidMultibulkLength);
             }
-            if count <= 0 {
+            if count == 0 {
                 // `*0` and `*-1` are both a command with nothing in it. Redis
                 // consumes them and replies to neither.
                 return Ok(Step::Command { consumed: after });
@@ -186,19 +197,29 @@ impl Argv {
             if kind != b'$' {
                 return Err(ProtocolError::ExpectedDollar(kind));
             }
-            let Some((line, after)) =
-                line_at(buf, self.next + 1, ProtocolError::InvalidBulkLength)?
-            else {
-                return if buf.len() - self.next > limits.max_inline {
-                    Err(ProtocolError::TooBigBulkCount)
-                } else {
-                    Ok(Step::Incomplete)
-                };
+            let (len, after) = match digits_at(buf, self.next + 1) {
+                Some(got) => got,
+                None => {
+                    let Some((line, after)) =
+                        line_at(buf, self.next + 1, ProtocolError::InvalidBulkLength)?
+                    else {
+                        return if buf.len() - self.next > limits.max_inline {
+                            Err(ProtocolError::TooBigBulkCount)
+                        } else {
+                            Ok(Step::Incomplete)
+                        };
+                    };
+                    let n = parse_i64(line).ok_or(ProtocolError::InvalidBulkLength)?;
+                    if n < 0 {
+                        return Err(ProtocolError::InvalidBulkLength);
+                    }
+                    (n as u64, after)
+                }
             };
-            let len = parse_i64(line).ok_or(ProtocolError::InvalidBulkLength)?;
-            if len < 0 || len > limits.max_bulk as i64 {
+            if len > limits.max_bulk as u64 {
                 return Err(ProtocolError::InvalidBulkLength);
             }
+            // The limit above is what makes this cast safe on a 32 bit target.
             let len = len as usize;
             // The body and its trailing CRLF, which is not optional and is not
             // checked here: a client that lies about it desynchronises itself
@@ -358,6 +379,51 @@ const fn hex(b: u8) -> Option<u8> {
 /// stricter than Redis: Redis finds the `\r`, assumes the `\n` and carries on,
 /// which desynchronises a byte later with a different message. Both ends close
 /// the connection either way, so what differs is the text and not the outcome.
+/// The plain positive number at `from`, and where the line after it starts.
+///
+/// One pass over the digits instead of two. The general path finds the `\r`, and
+/// then `parse_i64` walks the same one to three bytes again to turn them into a
+/// number, which is two loops and two bounds checks per byte to read a length
+/// that is almost always a single digit. This reads a byte and accumulates it in
+/// the same step, and there are three of these per `GET` off the wire.
+///
+/// `None` is not an error. It means this is not the shape the fast path handles,
+/// which covers a line that has not arrived yet, a negative number, a leading
+/// zero and anything malformed, and the caller answers it by taking the general
+/// path. That path already knows which of `Incomplete`, `TooBigBulkCount` and
+/// `InvalidBulkLength` each of those is, and there is no value in writing those
+/// rules down twice. Being wrong here costs the second pass this exists to
+/// avoid, on a command that is about to be refused anyway.
+///
+/// The leading zero rule is `string2ll`'s and it is why `$007` is an error in
+/// Redis and an error here. It is enforced by refusing rather than by accepting,
+/// so the general path stays the only place that decides.
+fn digits_at(buf: &[u8], from: usize) -> Option<(u64, usize)> {
+    let mut at = from;
+    let mut v: u64 = 0;
+    while let Some(&c) = buf.get(at) {
+        if !c.is_ascii_digit() {
+            break;
+        }
+        // Nineteen digits is where the twentieth may not fit in a `u64`. No
+        // caller here accepts a number within many orders of magnitude of that,
+        // so this is an overflow guard rather than a limit, and the general path
+        // is welcome to the case.
+        if at - from == 19 {
+            return None;
+        }
+        v = v * 10 + u64::from(c - b'0');
+        at += 1;
+    }
+    if at == from || (at - from > 1 && buf[from] == b'0') {
+        return None;
+    }
+    if buf.get(at) != Some(&b'\r') || buf.get(at + 1) != Some(&b'\n') {
+        return None;
+    }
+    Some((v, at + 2))
+}
+
 fn line_at(
     buf: &[u8],
     from: usize,
@@ -553,11 +619,70 @@ mod tests {
             ),
             (b"*2\r\n$x\r\n", ProtocolError::InvalidBulkLength),
             (b"*2\r\n$-1\r\n", ProtocolError::InvalidBulkLength),
+            // A leading zero is not a length, which is `string2ll`'s rule and
+            // therefore Redis's. It is here because it is the one rule the fast
+            // path in `digits_at` could accept by accident, and `$003\r\nGET`
+            // parsing as a three byte argument would be a divergence nobody
+            // would find until a client sent one.
+            (b"*2\r\n$007\r\n", ProtocolError::InvalidBulkLength),
+            (b"*2\r\n$00\r\n", ProtocolError::InvalidBulkLength),
         ];
         for &(buf, want) in cases {
             let mut argv = Argv::new();
             assert_eq!(argv.decode(buf, &Limits::default()), Err(want), "{buf:?}");
         }
+    }
+
+    /// The fast length scanner and the general path have to agree, byte for
+    /// byte, on every number a client can send.
+    ///
+    /// `digits_at` is an optimisation and an optimisation that changes an answer
+    /// is a bug. It answers `None` for anything it does not want, and the whole
+    /// of its correctness is that `None` means the general path runs and decides
+    /// exactly what it decided before. This walks a length through both.
+    #[test]
+    fn the_fast_length_scanner_agrees_with_the_general_path() {
+        for n in [0usize, 1, 9, 10, 99, 100, 4096, 65535, 1_000_000] {
+            let digits = n.to_string();
+            let body = vec![b'v'; n];
+            let mut buf = format!("*1\r\n${}\r\n", digits).into_bytes();
+            buf.extend_from_slice(&body);
+            buf.extend_from_slice(b"\r\n");
+
+            // What the scanner says about the length line on its own.
+            let at = 4 + 1;
+            assert_eq!(
+                digits_at(&buf, at),
+                Some((n as u64, at + digits.len() + 2)),
+                "the scanner refused {digits}"
+            );
+
+            let (args, consumed) = one(&buf).expect("a whole command");
+            assert_eq!(args, vec![body], "{digits} came back wrong");
+            assert_eq!(consumed, buf.len());
+        }
+    }
+
+    /// Everything the fast scanner is supposed to hand back, and why.
+    #[test]
+    fn the_fast_length_scanner_refuses_what_it_does_not_understand() {
+        // A line that has not arrived, a line with no newline after its return,
+        // no digits at all, a negative, a leading zero, and a number too long
+        // to be sure of in a `u64`.
+        for buf in [
+            &b"7"[..],
+            b"7\r",
+            b"7\rx",
+            b"\r\n",
+            b"-1\r\n",
+            b"01\r\n",
+            b"00\r\n",
+            b"99999999999999999999\r\n",
+        ] {
+            assert_eq!(digits_at(buf, 0), None, "{buf:?}");
+        }
+        // And the one that looks like a leading zero and is not.
+        assert_eq!(digits_at(b"0\r\n", 0), Some((0, 3)));
     }
 
     /// A count of two billion must be refused before anything is reserved for
