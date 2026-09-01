@@ -261,6 +261,20 @@ impl Zset {
         }
     }
 
+    /// The bytes behind a sorted set on the packed band, for `DUMP` to copy.
+    ///
+    /// Member and score alternate in here exactly as `ZSET_LISTPACK` wants them,
+    /// because the band was built to Redis's layout, so the payload is these
+    /// bytes with a length in front. `None` on the tree, where there is no blob
+    /// and the members have to be walked.
+    #[inline]
+    pub(crate) fn packed_bytes(&self) -> Option<&[u8]> {
+        match &self.body {
+            Body::Packed(lp) => Some(lp.as_bytes()),
+            Body::Table(_) => None,
+        }
+    }
+
     /// What this is holding on to, in bytes.
     #[must_use]
     pub fn memory_bytes(&self) -> usize {

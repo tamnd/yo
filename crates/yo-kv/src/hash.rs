@@ -476,6 +476,22 @@ impl Hash {
         }
     }
 
+    /// The bytes behind a hash on the packed band, for `DUMP` to copy.
+    ///
+    /// Field and value alternate in here exactly as `HASH_LISTPACK` wants them.
+    /// `None` on the table, and `None` on the wider band as well: the deadline
+    /// column has its own type byte and its own header, and a hash that has been
+    /// widened once keeps the third element per field even after every deadline
+    /// has been taken off again, so the blob is only ever safe to copy when
+    /// there is no deadline column at all.
+    #[inline]
+    pub(crate) fn packed_bytes(&self) -> Option<&[u8]> {
+        match &self.body {
+            Body::Packed(p) if !p.ex => Some(p.lp.as_bytes()),
+            _ => None,
+        }
+    }
+
     /// How many fields. This is `HLEN`.
     #[inline]
     #[must_use]
