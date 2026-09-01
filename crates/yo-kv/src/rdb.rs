@@ -491,6 +491,34 @@ impl<'a> Reader<'a> {
         Ok(s)
     }
 
+    /// How many elements follow, refusing a count the payload cannot hold.
+    ///
+    /// The count in a payload is four bytes wide and the payload is whatever
+    /// length it happens to be, so nothing in the format stops one from claiming
+    /// two billion members. Every reader that takes a count then hands it to a
+    /// `with_hint`, which is the whole point of a hint, and a hint of two billion
+    /// asks the allocator for thirty four gigabytes before a single element has
+    /// been read. That is not a hypothetical: it is what a `RESTORE` of a
+    /// truncated payload did, and on Linux the allocator refused and the process
+    /// went down, which turns a bad payload from one client into an outage for
+    /// everybody.
+    ///
+    /// The bound is the bytes that are left. An element takes at least one byte
+    /// however it is encoded, so a count past what remains cannot be honest, and
+    /// checking it here means every reader gets the check rather than the ones
+    /// somebody remembered. It is deliberately loose: it is not trying to work
+    /// out the real minimum for each type, only to keep an allocation in the same
+    /// order of magnitude as the bytes that arrived.
+    ///
+    /// Zero is refused with it, for the reason [`non_empty`] gives.
+    fn count(&mut self) -> Result<usize, Bad> {
+        let n = non_empty(self.len()?)?;
+        if n > self.buf.len() - self.at {
+            return Err(Bad::Format);
+        }
+        Ok(n)
+    }
+
     /// A length, refusing the `11` forms that are not lengths at all.
     fn len(&mut self) -> Result<usize, Bad> {
         match self.len_or_encoding()? {
@@ -683,7 +711,7 @@ fn non_empty(n: usize) -> Result<usize, Bad> {
 }
 
 fn read_list(r: &mut Reader<'_>, limits: &list::Limits) -> Result<Body, Bad> {
-    let n = non_empty(r.len()?)?;
+    let n = r.count()?;
     let mut list = List::new();
     for _ in 0..n {
         list.push_back(&r.str()?, limits);
@@ -697,7 +725,7 @@ fn read_list(r: &mut Reader<'_>, limits: &list::Limits) -> Result<Body, Bad> {
 /// too long to pack, and both of them are written as one string, so the only
 /// difference is whether the string is parsed or pushed.
 fn read_quicklist(r: &mut Reader<'_>, limits: &list::Limits) -> Result<Body, Bad> {
-    let nodes = non_empty(r.len()?)?;
+    let nodes = r.count()?;
     let mut list = List::new();
     for _ in 0..nodes {
         let container = r.len_or_encoding()?.0;
@@ -721,7 +749,7 @@ fn read_quicklist(r: &mut Reader<'_>, limits: &list::Limits) -> Result<Body, Bad
 }
 
 fn read_set(r: &mut Reader<'_>, limits: &set::Limits) -> Result<Body, Bad> {
-    let n = non_empty(r.len()?)?;
+    let n = r.count()?;
     let first = r.str()?;
     // The hint and the first member together are what decide the band, so the
     // first member is read before the set is built rather than after.
@@ -759,7 +787,7 @@ fn read_set_listpack(r: &mut Reader<'_>, limits: &set::Limits) -> Result<Body, B
 }
 
 fn read_zset(r: &mut Reader<'_>, limits: &zset::Limits, binary: bool) -> Result<Body, Bad> {
-    let n = non_empty(r.len()?)?;
+    let n = r.count()?;
     // Sized from the count, the way `read_set` and `read_hash` are. A sorted set
     // that is going to end up on the table should start there, rather than fill
     // the packed band to its limit at a scan a member and then throw it away.
@@ -808,7 +836,7 @@ fn read_zset_listpack(r: &mut Reader<'_>, limits: &zset::Limits) -> Result<Body,
 }
 
 fn read_hash(r: &mut Reader<'_>, limits: &hash::Limits) -> Result<Body, Bad> {
-    let n = non_empty(r.len()?)?;
+    let n = r.count()?;
     let mut hash = Hash::with_hint(n, limits);
     for _ in 0..n {
         let field = r.str()?;
@@ -824,7 +852,7 @@ fn read_hash(r: &mut Reader<'_>, limits: &hash::Limits) -> Result<Body, Bad> {
 /// distance from it, plus one so that a zero can mean no deadline at all.
 fn read_hash_metadata(r: &mut Reader<'_>, limits: &hash::Limits, now: u64) -> Result<Body, Bad> {
     let soonest = u64::from_le_bytes(r.take(8)?.try_into().expect("eight bytes"));
-    let n = non_empty(r.len()?)?;
+    let n = r.count()?;
     let mut hash = Hash::with_hint(n, limits);
     for _ in 0..n {
         let ttl = r.len_or_encoding()?.0;
@@ -1337,6 +1365,55 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// A count bigger than the payload is refused before anything is reserved.
+    ///
+    /// [`arbitrary_bytes_are_an_error_and_not_a_panic`] already sends these
+    /// bytes and could not catch this, for two reasons worth writing down. An
+    /// out of memory abort is not a panic, so a test that only says nothing
+    /// panics will watch the process die and report nothing. And the dev machine
+    /// overcommits, so the reservation succeeded there and only ever failed on
+    /// Linux and Windows, which is to say in CI on the release tag and nowhere a
+    /// person would see it.
+    ///
+    /// The bytes are the ones that did it. `0x80` opens a thirty two bit length
+    /// and the four after it are the length, so the count comes out as
+    /// `0x80808080`, and a row sixteen bytes wide makes that a request for
+    /// thirty four gigabytes from a six byte payload.
+    #[test]
+    fn a_count_past_the_payload_is_refused_before_anything_is_reserved() {
+        let (s, h, l, z) = limits();
+        let all = Limits {
+            set: &s,
+            hash: &h,
+            list: &l,
+            zset: &z,
+        };
+        for kind in [T_SET, T_HASH, T_ZSET_2, T_ZSET, T_LIST_QUICKLIST_2] {
+            let payload = seal(vec![kind, 0x80, 0x80, 0x80, 0x80, 0x80]);
+            assert_eq!(
+                load(&payload, all, 0).err(),
+                Some(Bad::Format),
+                "type {kind} took a count of 0x80808080 from six bytes"
+            );
+        }
+
+        // The bound is the bytes that are left and not a fixed ceiling, so a
+        // count that is small in absolute terms is still refused when the
+        // payload cannot possibly hold it. Ten members and nothing after the
+        // count to hold them.
+        let mut body = vec![T_SET];
+        put_len(&mut body, 10);
+        assert_eq!(load(&seal(body), all, 0).err(), Some(Bad::Format));
+
+        // And a count the payload can hold is read, so the bound is not simply
+        // refusing everything.
+        let mut body = vec![T_SET];
+        put_len(&mut body, 2);
+        put_str(&mut body, b"a");
+        put_str(&mut body, b"b");
+        assert!(load(&seal(body), all, 0).is_ok());
     }
 
     #[test]
