@@ -18,6 +18,15 @@
 //! and the checksum is here because `RESTORE` takes bytes from a client and a
 //! client is allowed to be wrong.
 //!
+//! # Two version numbers and not one
+//!
+//! The version we stamp on a payload and the version we will read are different
+//! numbers, because they are answers to opposite questions. What we write is a
+//! promise about how old a server can be and still understand us, so it is as
+//! low as it can be. What we read is a statement about how new a server can be
+//! before a type byte might not mean what it used to, so it is as high as has
+//! actually been checked. [`VERSION`] and [`READS_UP_TO`] say which is which.
+//!
 //! # It has to be Redis's bytes, not ours
 //!
 //! Nothing here is an internal format we get to choose. `MIGRATE` sends this to
@@ -112,8 +121,29 @@ use crate::zset::{self, Zset};
 ///
 /// Redis refuses a payload whose version is above its own, so this being right
 /// is the difference between a payload another server will look at and one it
-/// throws away without reading.
+/// throws away without reading. Lower is friendlier, and twelve is as low as
+/// this can go: it is the version that introduced the hash with field deadlines,
+/// which is a shape this server writes.
 pub const VERSION: u16 = 12;
+
+/// The highest version in a footer this server will still read.
+///
+/// A different number from [`VERSION`], and the two mean opposite things. What
+/// we write is a promise about how old a server can be and still understand us.
+/// What we read is a statement about how new a server can be before we stop
+/// trusting that a type byte still means what it used to.
+///
+/// Fifteen because that is what a Redis 8.10.1 stamps on a payload, read off one
+/// over a socket rather than out of a header file. Refusing it is not a small
+/// bug: it means `RESTORE` turns down every payload a current server produces,
+/// with a message about the checksum that sends the reader to entirely the wrong
+/// place. That is what this constant existing separately is here to stop.
+///
+/// It goes up when a newer server has been checked and not before. The guard is
+/// worth keeping rather than removing, because the day Redis reuses a type byte
+/// for a different layout, refusing to read it is the only safe answer and a
+/// wrong value is worse than no value.
+pub const READS_UP_TO: u16 = 15;
 
 /// The footer: two bytes of version and eight of checksum.
 const FOOTER: usize = 10;
@@ -210,7 +240,7 @@ fn unseal(payload: &[u8]) -> Result<&[u8], Bad> {
     let split = payload.len() - FOOTER;
     let (body, foot) = payload.split_at(split);
     let version = u16::from_le_bytes([foot[0], foot[1]]);
-    if version > VERSION {
+    if version > READS_UP_TO {
         return Err(Bad::Footer);
     }
     let stored = u64::from_le_bytes(foot[2..].try_into().expect("ten byte footer, eight left"));
@@ -1198,6 +1228,44 @@ mod tests {
             zset: &z,
         };
         assert_eq!(load(&payload, all, 0).unwrap_err(), Bad::Footer);
+    }
+
+    /// Every version up to the one a current Redis stamps is read, and the one
+    /// after it is not.
+    ///
+    /// This is the check that was missing when `RESTORE` was turning down every
+    /// payload a real 8.10.1 produced. The old code compared against the version
+    /// it writes, which is deliberately old so that old servers accept us, so
+    /// making one number do both jobs meant refusing everything modern.
+    #[test]
+    fn a_payload_is_read_up_to_the_version_that_has_been_checked() {
+        let rec = Record::new(Body::String(b"hello".to_vec()), None);
+        let (s, h, l, z) = limits();
+        let all = Limits {
+            set: &s,
+            hash: &h,
+            list: &l,
+            zset: &z,
+        };
+        for stamp in [VERSION, READS_UP_TO, READS_UP_TO + 1] {
+            let mut payload = dump(&rec).expect("a string has an RDB shape");
+            let n = payload.len();
+            payload[n - 10..n - 8].copy_from_slice(&stamp.to_le_bytes());
+            let crc = crc64(0, &payload[..n - 8]);
+            payload[n - 8..].copy_from_slice(&crc.to_le_bytes());
+            let got = load(&payload, all, 0);
+            if stamp > READS_UP_TO {
+                assert_eq!(got.unwrap_err(), Bad::Footer, "{stamp} should be refused");
+            } else {
+                assert!(got.is_ok(), "{stamp} should be read");
+            }
+        }
+        const {
+            assert!(
+                VERSION <= READS_UP_TO,
+                "a server that cannot read what it writes is no use to anybody"
+            )
+        };
     }
 
     #[test]
