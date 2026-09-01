@@ -311,6 +311,26 @@ impl Set {
         }
     }
 
+    /// The bytes behind a set that is stored the way Redis stores it.
+    ///
+    /// `DUMP` writes these straight out instead of walking the members, so this
+    /// exists for [`crate::rdb`] and for nothing else. The word this answers
+    /// against is [`Set::encoding`] and not the body, so a set that calls itself
+    /// a hashtable is walked even on the rare occasion its members are still in
+    /// one intset run. Keeping those two in step is what makes the rule sayable:
+    /// whatever `OBJECT ENCODING` says, that is the type byte the payload gets.
+    ///
+    /// `None` for a set with no such shape, which is the table, the partitioned
+    /// body and an intset that has split into runs.
+    #[inline]
+    pub(crate) fn packed_bytes(&self) -> Option<&[u8]> {
+        match &self.body {
+            Body::Ints(s) if !self.ints_past_limit => s.as_bytes(),
+            Body::Packed(lp) => Some(lp.as_bytes()),
+            _ => None,
+        }
+    }
+
     /// How many members. This is `SCARD`.
     #[inline]
     pub fn len(&self) -> usize {

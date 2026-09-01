@@ -129,7 +129,7 @@ doc = "12 section 6"
 [[group]]
 name = "keyspace"
 expected = 29
-status = "partial"
+status = "shipped"
 doc = "14"
 # Twenty nine is what 8.10.1 answers for its generic group once the five OBJECT
 # subcommands are counted as the one command they are dispatched as. The nine
@@ -137,12 +137,11 @@ doc = "14"
 # deadline lives in the key's record and EXPIRE is dispatched down the same path
 # DEL is. There was an expiry group in this file that listed none of them and
 # claimed nine, which was two names for one group and a count nobody could check.
-# What is left is MIGRATE, which is RESTORE with a client connection in front of
-# it, so it is the one command in the group that has to talk to another server
-# and it waits on that rather than on the file format. DUMP and RESTORE brought
-# the format in and MIGRATE is the third of the three that wanted it. MOVE,
-# SORT, SORT_RO, WAIT and WAITAOF were the rest of it and they landed together
-# because none of them needs anything the store did not already have.
+# Nothing is left. MIGRATE came last and it is the only command in the group
+# that talks to another server, which is why it needed the file format DUMP and
+# RESTORE brought in and a socket on top of that. MOVE, SORT, SORT_RO, WAIT and
+# WAITAOF were the rest of it and they landed together because none of them
+# needs anything the store did not already have.
 # DEL, UNLINK, EXISTS and TYPE landed in M2 and the rest are in M3. The four were
 # not a random quarter of the group, they are what Redis's own test suite needs
 # before it will run one file. OBJECT is here now because the size ladder is not
@@ -793,6 +792,17 @@ status = "shipped"
 wire = "verified"
 divergent = "D-26"
 notes = "The reader is deliberately not the mirror of the writer. We do not choose what arrives, so it accepts every encoding a modern Redis emits, which means the quicklist, the three listpack forms, the intset, both sorted set forms and both hash forms with field deadlines, and LZF decompression on top because rdbcompression is on by default and a payload from a real server is full of compressed strings. The check order is the whole of what a client can see and it is not the order the arguments read in: every option is parsed first, then the busy key check, then the time to live, then the footer, then the bytes, so a key that is already there is refused before anybody looks at the payload. IDLETIME and FREQ are exclusive by a trick worth copying exactly, since neither word is rejected for being the wrong one and each is only accepted while the other is unset, so the second of the two falls through to the plain syntax error. A deadline that has already gone deletes and answers OK, and it does that after the payload has been parsed, because a client that sent bad bytes and a stale deadline should be told about the bytes. An empty collection is refused rather than created, which is Redis's emptykey error and the same rule that makes SREM of the last member delete the key."
+
+[[command]]
+name = "MIGRATE"
+group = "keyspace"
+since = "2.6.0"
+arity = -6
+plan = "whole-value"
+bounded = "risk"
+status = "shipped"
+wire = "verified"
+notes = "A DUMP here, a RESTORE there and a socket in between, which is why it came after both of those and not before. Everything goes down the wire in one write, the AUTH if there is one, then a SELECT if the socket is not already on the right database, then a RESTORE for each key that is actually here, and the replies are read back in that order. Pipelining the lot has a consequence that looks like a bug and is what a real server does, since a SELECT that fails does not stop the RESTOREs behind it, so migrating into a database index the peer does not have tells the client about the SELECT while the values quietly land wherever the peer happened to be. Each key stands on its own, so one refused key leaves itself here and lets the others go, and only the first complaint is reported. The socket is kept for the next migration to the same place, sixty four of them and ten seconds of idleness each, which are Redis's numbers, and one that has seen any error is dropped rather than handed out with half a reply still in it. The three IOERR lines were read off a real server rather than off the source, and the surprise is that a refused connect and a name that does not resolve both come out as the write error, because a real server hands the name to a non blocking connect and only notices on the first write."
 
 
 # ------------------------------------------------------------------------ sets

@@ -18,6 +18,15 @@
 //! and the checksum is here because `RESTORE` takes bytes from a client and a
 //! client is allowed to be wrong.
 //!
+//! # Two version numbers and not one
+//!
+//! The version we stamp on a payload and the version we will read are different
+//! numbers, because they are answers to opposite questions. What we write is a
+//! promise about how old a server can be and still understand us, so it is as
+//! low as it can be. What we read is a statement about how new a server can be
+//! before a type byte might not mean what it used to, so it is as high as has
+//! actually been checked. [`VERSION`] and [`READS_UP_TO`] say which is which.
+//!
 //! # It has to be Redis's bytes, not ours
 //!
 //! Nothing here is an internal format we get to choose. `MIGRATE` sends this to
@@ -35,12 +44,86 @@
 //! elements, because every one of those loads into Redis 8.2 and one shape per
 //! kind is one shape to get right.
 //!
-//! The cost of that choice is real and it is named here rather than hidden: a
-//! set held as a listpack could go out as `SET_LISTPACK` with a memcpy of the
-//! bytes, since [`crate::listpack`] is byte compatible with Redis's on purpose,
-//! and instead it goes out element by element. That is the obvious next
-//! optimisation and it wants its own measurement, so it is not bundled in with
-//! being correct first.
+//! # Copying the blob when there is one
+//!
+//! That is the shape for values that are stored as a structure. A value that is
+//! already sitting in one packed blob does not go through it, because
+//! [`crate::listpack`] and [`crate::intset`] are byte compatible with Redis's
+//! own on purpose, so the payload for one of those is the blob with a length in
+//! front of it. A small set, a small hash and a small sorted set are one memcpy
+//! each instead of a walk that decodes every element and encodes it again, and
+//! they are the overwhelming majority of what `DUMP` and `MIGRATE` are pointed
+//! at.
+//!
+//! The rule for which type byte a value gets is the same word `OBJECT ENCODING`
+//! answers with and not the body underneath it, so a set that calls itself a
+//! hashtable is walked even in the corner where its members happen to still be
+//! in one intset run. There is one rule and one place to read it.
+//!
+//! A hash that has been widened for field deadlines is not copied. That band
+//! carries a third element per field and keeps it after the last deadline has
+//! been taken off, so the blob it holds is not the blob `HASH_LISTPACK` means
+//! and the walk is what makes it one.
+//!
+//! What that is worth, from `benches/rdb.rs` at a hundred elements, walked
+//! against copied:
+//!
+//! ```text
+//!   set of text      7.57 us    3.41 us    2.2x
+//!   set of integers  1.32 us    0.57 us    2.3x
+//!   hash            24.94 us    3.95 us    6.3x
+//!   sorted set      21.04 us    3.82 us    5.5x
+//! ```
+//!
+//! The same rows at a thousand elements, which is past every packed band and is
+//! therefore the walk in both runs, moved by under one percent, so nothing here
+//! was paid for by the values that do not benefit. What is left on the copied
+//! rows is a checksum over the payload and one allocation to put it in, and both
+//! of those are paid whichever way the payload was built, which is why the hash
+//! and the sorted set gain more than the two sets do: their walk was the more
+//! expensive one, not their copy the cheaper.
+//!
+//! The load side pays about five percent for this on a hash and a sorted set,
+//! because a listpack entry has to be decoded where a count prefixed element is
+//! read straight off a length. Copying the blob is not free on the way back in
+//! and the trade is still worth making, since a payload is written once and this
+//! is a five percent loss against a five hundred percent gain.
+//!
+//! The load side also stopped asking a listpack for element `i`. There is no
+//! offset table in a listpack, so `get(i)` walks from the front and a loop that
+//! asks for every element in turn costs the square of the count. A hundred field
+//! hash loaded in 81 us and loads in 60. That was there before any of this and
+//! the only thing that ever reached it was a payload from a real server, which
+//! is the case that matters most.
+//!
+//! # Taking the blob back
+//!
+//! A payload for a sorted set on the packed band goes the other way too. The
+//! blob that arrives is the layout that band uses, so it moves in whole rather
+//! than being added a member at a time, and the difference is not small: adding
+//! costs a scan to see whether the member is already there and a second scan to
+//! find where it belongs, both over everything added so far, so it is the square
+//! of the count twice over with a memmove on each one. A hundred member sorted
+//! set restored in 534 us and restores in 4.6 us.
+//!
+//! The blob is checked before it is taken. This band answers a rank query by
+//! position and by nothing else, so a payload that says it is a sorted set while
+//! not being sorted would answer `ZRANGE` with the wrong members and never say
+//! why, and a payload with the same member twice would report a length nothing
+//! else agrees with. One pass rules out both, since strictly increasing means no
+//! two members compare equal on the score and then equal on the bytes. A blob
+//! that fails the check, or that is past this server's limits, is handed back
+//! and walked, which is what the reader did with every payload before this.
+//!
+//! A sorted set past the band is sized from the count now, the way a set and a
+//! hash already were. It used to start packed whatever the count said, fill to
+//! the band limit at a scan a member, and throw the listpack away. A thousand
+//! member sorted set restored in 1.23 ms and restores in 88 us.
+//!
+//! What is left is the hash, which has the same shape of problem for the same
+//! reason and is not fixed here. Its blob is not sorted, so ruling out a
+//! duplicate field is not free the way it is for a sorted set, and that wants
+//! its own change rather than being smuggled into this one.
 //!
 //! # Compression
 //!
@@ -67,8 +150,29 @@ use crate::zset::{self, Zset};
 ///
 /// Redis refuses a payload whose version is above its own, so this being right
 /// is the difference between a payload another server will look at and one it
-/// throws away without reading.
+/// throws away without reading. Lower is friendlier, and twelve is as low as
+/// this can go: it is the version that introduced the hash with field deadlines,
+/// which is a shape this server writes.
 pub const VERSION: u16 = 12;
+
+/// The highest version in a footer this server will still read.
+///
+/// A different number from [`VERSION`], and the two mean opposite things. What
+/// we write is a promise about how old a server can be and still understand us.
+/// What we read is a statement about how new a server can be before we stop
+/// trusting that a type byte still means what it used to.
+///
+/// Fifteen because that is what a Redis 8.10.1 stamps on a payload, read off one
+/// over a socket rather than out of a header file. Refusing it is not a small
+/// bug: it means `RESTORE` turns down every payload a current server produces,
+/// with a message about the checksum that sends the reader to entirely the wrong
+/// place. That is what this constant existing separately is here to stop.
+///
+/// It goes up when a newer server has been checked and not before. The guard is
+/// worth keeping rather than removing, because the day Redis reuses a type byte
+/// for a different layout, refusing to read it is the only safe answer and a
+/// wrong value is worse than no value.
+pub const READS_UP_TO: u16 = 15;
 
 /// The footer: two bytes of version and eight of checksum.
 const FOOTER: usize = 10;
@@ -165,7 +269,7 @@ fn unseal(payload: &[u8]) -> Result<&[u8], Bad> {
     let split = payload.len() - FOOTER;
     let (body, foot) = payload.split_at(split);
     let version = u16::from_le_bytes([foot[0], foot[1]]);
-    if version > VERSION {
+    if version > READS_UP_TO {
         return Err(Bad::Footer);
     }
     let stored = u64::from_le_bytes(foot[2..].try_into().expect("ten byte footer, eight left"));
@@ -204,21 +308,37 @@ pub(crate) fn dump(rec: &Record) -> Option<Vec<u8>> {
                 put_entry(&mut out, element);
             }
         }
-        Body::Set(set) => {
-            out.push(T_SET);
-            put_len(&mut out, set.len() as u64);
-            for member in set.iter() {
-                put_entry(&mut out, member);
+        Body::Set(set) => match (set.encoding(), set.packed_bytes()) {
+            (set::Encoding::Intset, Some(blob)) => {
+                out.push(T_SET_INTSET);
+                put_str(&mut out, blob);
             }
-        }
-        Body::Zset(zset) => {
-            out.push(T_ZSET_2);
-            put_len(&mut out, zset.len() as u64);
-            zset.walk(0, zset.len(), false, |member, score| {
-                put_entry(&mut out, member);
-                out.extend_from_slice(&score.to_le_bytes());
-            });
-        }
+            (set::Encoding::Listpack, Some(blob)) => {
+                out.push(T_SET_LISTPACK);
+                put_str(&mut out, blob);
+            }
+            _ => {
+                out.push(T_SET);
+                put_len(&mut out, set.len() as u64);
+                for member in set.iter() {
+                    put_entry(&mut out, member);
+                }
+            }
+        },
+        Body::Zset(zset) => match zset.packed_bytes() {
+            Some(blob) => {
+                out.push(T_ZSET_LISTPACK);
+                put_str(&mut out, blob);
+            }
+            None => {
+                out.push(T_ZSET_2);
+                put_len(&mut out, zset.len() as u64);
+                zset.walk(0, zset.len(), false, |member, score| {
+                    put_entry(&mut out, member);
+                    out.extend_from_slice(&score.to_le_bytes());
+                });
+            }
+        },
         Body::Hash(hash) => put_hash(&mut out, hash),
         Body::Array(_) => return None,
     }
@@ -235,6 +355,11 @@ pub(crate) fn dump(rec: &Record) -> Option<Vec<u8>> {
 /// a zero and everything else is a small number rather than a full timestamp.
 fn put_hash(out: &mut Vec<u8>, hash: &Hash) {
     let Some(soonest) = hash.soonest_deadline() else {
+        if let Some(blob) = hash.packed_bytes() {
+            out.push(T_HASH_LISTPACK);
+            put_str(out, blob);
+            return;
+        }
         out.push(T_HASH);
         put_len(out, hash.len() as u64);
         for (field, value) in hash.iter() {
@@ -635,7 +760,10 @@ fn read_set_listpack(r: &mut Reader<'_>, limits: &set::Limits) -> Result<Body, B
 
 fn read_zset(r: &mut Reader<'_>, limits: &zset::Limits, binary: bool) -> Result<Body, Bad> {
     let n = non_empty(r.len()?)?;
-    let mut zset = Zset::new();
+    // Sized from the count, the way `read_set` and `read_hash` are. A sorted set
+    // that is going to end up on the table should start there, rather than fill
+    // the packed band to its limit at a scan a member and then throw it away.
+    let mut zset = Zset::with_hint(n, limits);
     for _ in 0..n {
         let member = r.str()?;
         let score = if binary {
@@ -654,12 +782,25 @@ fn read_zset_listpack(r: &mut Reader<'_>, limits: &zset::Limits) -> Result<Body,
     if lp.is_empty() || lp.len() % 2 != 0 {
         return Err(Bad::Format);
     }
-    let mut zset = Zset::new();
+    // The payload is already the layout the packed band uses, so the fast answer
+    // is to take it whole rather than to add a member at a time. `from_packed`
+    // hands the blob back when it will not have it, and then the walk below
+    // rebuilds it, which is what happens to a payload that is out of order or
+    // past this server's limits.
+    let lp = match Zset::from_packed(lp, limits) {
+        Ok(zset) => return Ok(Body::Zset(zset)),
+        Err(lp) => lp,
+    };
+    let mut zset = Zset::with_hint(lp.len() / 2, limits);
     let mut member = [0u8; DIGITS_MAX];
     let mut score = [0u8; DIGITS_MAX];
-    for i in (0..lp.len()).step_by(2) {
-        let name = text(lp.get(i).ok_or(Bad::Format)?, &mut member).to_vec();
-        let at = text(lp.get(i + 1).ok_or(Bad::Format)?, &mut score);
+    // Walked and not indexed. A listpack has no offset table, so asking it for
+    // element `i` costs a walk from the front and asking it for every element in
+    // turn costs the square of the count.
+    let mut walk = lp.iter();
+    while let Some(entry) = walk.next() {
+        let name = text(entry, &mut member).to_vec();
+        let at = text(walk.next().ok_or(Bad::Format)?, &mut score);
         let at = num::parse_f64(at).ok_or(Bad::Format)?;
         zset.add(&name, at, limits);
     }
@@ -725,14 +866,17 @@ fn read_hash_listpack(
     let mut hash = Hash::with_hint(lp.len() / step, limits);
     let mut field_buf = [0u8; DIGITS_MAX];
     let mut value_buf = [0u8; DIGITS_MAX];
-    for i in (0..lp.len()).step_by(step) {
-        let field = text(lp.get(i).ok_or(Bad::Format)?, &mut field_buf).to_vec();
-        let value = text(lp.get(i + 1).ok_or(Bad::Format)?, &mut value_buf).to_vec();
+    // Walked and not indexed, for the reason `read_zset_listpack` gives: element
+    // `i` of a listpack costs a walk from the front.
+    let mut walk = lp.iter();
+    while let Some(entry) = walk.next() {
+        let field = text(entry, &mut field_buf).to_vec();
+        let value = text(walk.next().ok_or(Bad::Format)?, &mut value_buf).to_vec();
         // The packed form holds the deadline as an absolute time, not as a
         // distance from the header, which is the one place the two hash layouts
         // disagree about the same number.
         let at = if with_ttl {
-            match lp.get(i + 2).ok_or(Bad::Format)? {
+            match walk.next().ok_or(Bad::Format)? {
                 Entry::Int(0) => None,
                 Entry::Int(n) => Some(u64::try_from(n).map_err(|_| Bad::Format)?),
                 Entry::Str(_) => return Err(Bad::Format),
@@ -789,7 +933,7 @@ fn text<'a>(entry: Entry<'a>, buf: &'a mut [u8; DIGITS_MAX]) -> &'a [u8] {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ttl::Cond;
+    use crate::ttl::{Ask, Cond};
 
     fn limits() -> (set::Limits, hash::Limits, list::Limits, zset::Limits) {
         (
@@ -946,15 +1090,89 @@ mod tests {
     fn a_hash_with_no_deadlines_uses_the_plain_type() {
         let l = hash::Limits::DEFAULT;
         let mut hash = Hash::new();
-        hash.set(b"one", b"1", &l);
-        hash.set(b"two", b"2", &l);
+        // Past the packed band, so this is the table and there is no blob to
+        // copy. The small case is the listpack one and it is tested below.
+        for i in 0..1000 {
+            hash.set(format!("f{i}").as_bytes(), b"1", &l);
+        }
+        assert_eq!(hash.encoding(), hash::Encoding::Hashtable);
         let rec = Record::new(Body::Hash(hash.clone()), None);
         assert_eq!(dump(&rec).expect("a hash has an RDB shape")[0], T_HASH);
         let Body::Hash(back) = round_trip(Body::Hash(hash)) else {
             panic!("a hash came back as something else");
         };
-        assert_eq!(back.len(), 2);
-        assert_eq!(back.get(b"one").map(|v| v.byte_len()), Some(1));
+        assert_eq!(back.len(), 1000);
+        assert_eq!(back.get(b"f7").map(|v| v.byte_len()), Some(1));
+    }
+
+    /// A value that is one packed blob goes out as the blob.
+    ///
+    /// The type byte is the thing being pinned here. Every one of these round
+    /// trips already, through the walk, and the point of the check is that it is
+    /// no longer going through the walk.
+    #[test]
+    fn a_packed_value_goes_out_as_its_blob() {
+        let (sl, hl, _, zl) = limits();
+        let mut hash = Hash::new();
+        hash.set(b"one", b"1", &hl);
+        hash.set(b"two", b"2", &hl);
+        assert_eq!(hash.encoding(), hash::Encoding::Listpack);
+
+        let mut set = Set::new();
+        set.add(b"alpha", &sl);
+        set.add(b"beta", &sl);
+        assert_eq!(set.encoding(), set::Encoding::Listpack);
+
+        let mut ints = Set::new();
+        ints.add(b"1", &sl);
+        ints.add(b"9", &sl);
+        assert_eq!(ints.encoding(), set::Encoding::Intset);
+
+        let mut zset = Zset::new();
+        zset.add(b"a", 1.5, &zl);
+        assert_eq!(zset.encoding(), zset::Encoding::Listpack);
+
+        for (want, body) in [
+            (T_HASH_LISTPACK, Body::Hash(hash)),
+            (T_SET_LISTPACK, Body::Set(set)),
+            (T_SET_INTSET, Body::Set(ints)),
+            (T_ZSET_LISTPACK, Body::Zset(zset)),
+        ] {
+            let rec = Record::new(body.clone(), None);
+            let payload = dump(&rec).expect("a packed value has an RDB shape");
+            assert_eq!(payload[0], want, "wrong type byte for {body:?}");
+            // And the walk is gone, not merely bypassed: what comes back has to
+            // be the same value or the copy was of the wrong bytes.
+            assert_eq!(
+                format!("{:?}", round_trip(body.clone())),
+                format!("{body:?}")
+            );
+        }
+    }
+
+    /// A hash that has been widened for deadlines is walked even once they have
+    /// all gone, because the blob it holds still has the third element per field
+    /// and `HASH_LISTPACK` has no room for it.
+    #[test]
+    fn a_widened_hash_is_not_copied() {
+        let l = hash::Limits::DEFAULT;
+        let mut hash = Hash::new();
+        hash.set(b"one", b"1", &l);
+        hash.expire(b"one", 5_000, Cond::Always, 0);
+        hash.persist(b"one");
+        // The bound leans early and only a reap that walks puts it right, so
+        // this is what it takes to get a hash that is on the wider band and has
+        // nothing left to say about deadlines.
+        hash.reap(6_000);
+        assert_eq!(hash.encoding(), hash::Encoding::ListpackEx);
+        assert_eq!(hash.soonest_deadline(), None);
+        let rec = Record::new(Body::Hash(hash.clone()), None);
+        assert_eq!(dump(&rec).expect("a hash has an RDB shape")[0], T_HASH);
+        let Body::Hash(back) = round_trip(Body::Hash(hash)) else {
+            panic!("a hash came back as something else");
+        };
+        assert_eq!(back.len(), 1);
+        assert_eq!(back.deadline(b"one"), Ask::NoDeadline);
     }
 
     #[test]
@@ -1051,6 +1269,44 @@ mod tests {
             zset: &z,
         };
         assert_eq!(load(&payload, all, 0).unwrap_err(), Bad::Footer);
+    }
+
+    /// Every version up to the one a current Redis stamps is read, and the one
+    /// after it is not.
+    ///
+    /// This is the check that was missing when `RESTORE` was turning down every
+    /// payload a real 8.10.1 produced. The old code compared against the version
+    /// it writes, which is deliberately old so that old servers accept us, so
+    /// making one number do both jobs meant refusing everything modern.
+    #[test]
+    fn a_payload_is_read_up_to_the_version_that_has_been_checked() {
+        let rec = Record::new(Body::String(b"hello".to_vec()), None);
+        let (s, h, l, z) = limits();
+        let all = Limits {
+            set: &s,
+            hash: &h,
+            list: &l,
+            zset: &z,
+        };
+        for stamp in [VERSION, READS_UP_TO, READS_UP_TO + 1] {
+            let mut payload = dump(&rec).expect("a string has an RDB shape");
+            let n = payload.len();
+            payload[n - 10..n - 8].copy_from_slice(&stamp.to_le_bytes());
+            let crc = crc64(0, &payload[..n - 8]);
+            payload[n - 8..].copy_from_slice(&crc.to_le_bytes());
+            let got = load(&payload, all, 0);
+            if stamp > READS_UP_TO {
+                assert_eq!(got.unwrap_err(), Bad::Footer, "{stamp} should be refused");
+            } else {
+                assert!(got.is_ok(), "{stamp} should be read");
+            }
+        }
+        const {
+            assert!(
+                VERSION <= READS_UP_TO,
+                "a server that cannot read what it writes is no use to anybody"
+            )
+        };
     }
 
     #[test]

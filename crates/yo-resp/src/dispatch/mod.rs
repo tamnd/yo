@@ -58,6 +58,7 @@ mod cpu;
 mod hashes;
 mod keyspace;
 mod lists;
+mod migrate;
 mod scan;
 mod scripting;
 mod server;
@@ -205,6 +206,11 @@ pub struct Server {
     expire_ms: u64,
     /// Clients parked on a blocking command.
     waiters: Waiters,
+    /// Sockets `MIGRATE` is holding open to the servers it has talked to.
+    ///
+    /// Empty on a server nobody has migrated a key out of, which is nearly all
+    /// of them, and it costs a vector's three words to be empty.
+    peers: migrate::Peers,
     /// The numbers the reactor keeps for `INFO`.
     pub stats: Stats,
 }
@@ -229,6 +235,7 @@ impl Server {
             expire_db: 0,
             expire_ms: 0,
             waiters: Waiters::default(),
+            peers: migrate::Peers::default(),
             stats: Stats::default(),
         }
     }
@@ -251,6 +258,7 @@ impl Server {
             expire_db: 0,
             expire_ms: 0,
             waiters: Waiters::default(),
+            peers: migrate::Peers::default(),
             stats: Stats::default(),
         }
     }
@@ -766,6 +774,12 @@ pub fn execute(server: &mut Server, session: &mut Session, args: Args<'_>, out: 
             "array" => {
                 let db = session.db;
                 arrays::execute(&mut server.dbs[db], spec, args, out).map(|()| Flow::Continue)
+            }
+            // The one keyspace command that needs more than the databases,
+            // because the socket it talks down is held on the server between
+            // commands and not opened again for each one.
+            "keyspace" if spec.name == "migrate" => {
+                migrate::execute(server, session.db, args, out).map(|()| Flow::Continue)
             }
             // Every database and not the one the session is on, because `COPY` takes
             // a `DB n` and writes into a database nobody selected.
