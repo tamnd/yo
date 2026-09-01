@@ -45,7 +45,7 @@
 use yo_common::{Code, Error, Result, num};
 use yo_kv::{End, Entry, Keyspace, Member, ZEnd};
 
-use super::args::{self, Args};
+use super::args::{self, Args, NOT_AN_INT};
 use super::lists::{BAD_MPOP_COUNT, BAD_NUMKEYS, end_of};
 use super::table::Spec;
 use super::zsets;
@@ -58,6 +58,17 @@ const NOT_A_FLOAT: &str = "timeout is not a float or out of range";
 const NEGATIVE: &str = "timeout is negative";
 /// And about one so far away that milliseconds do not fit in an `i64`.
 const OUT_OF_RANGE: &str = "timeout is out of range";
+/// `WAIT` and `WAITAOF` take their timeout in whole milliseconds rather than in
+/// seconds, so a timeout they cannot read is a different complaint again.
+const TIMEOUT_NOT_AN_INT: &str = "timeout is not an integer or out of range";
+/// What `WAITAOF` says about a `numlocal` that is neither of the two it takes.
+const NOT_ZERO_OR_ONE: &str = "value is out of range, value must between 0 and 1";
+/// And about a negative `numreplicas`.
+const NOT_POSITIVE: &str = "value is out of range, must be positive";
+/// And what it says when asked to wait for a file the server does not keep. The
+/// full stop at the end is Redis's and is the one message in the group that has
+/// one, which is why it is worth writing down rather than tidying up.
+const NO_AOF: &str = "WAITAOF cannot be used when numlocal is set but appendonly is disabled.";
 
 /// Run one blocking command.
 ///
@@ -77,6 +88,13 @@ pub(super) fn execute(
     args: Args<'_>,
     out: &mut Out,
 ) -> Result<Flow> {
+    // The two that wait on replication rather than on a key. They are here
+    // because they carry the blocking flag and that flag is what routes a
+    // command to this file, and they leave immediately because there is nothing
+    // for them to wait for yet. See [`replication`] for what they answer.
+    if spec.name == "wait" || spec.name == "waitaof" {
+        return replication(spec.name, args, out).map(|()| Flow::Continue);
+    }
     let now = server.now_ms();
     let last = args.len() - 1;
     let (deadline, block) = match spec.name {
@@ -171,6 +189,72 @@ fn mpop(args: Args<'_>, now: u64) -> Result<(Option<u64>, Block)> {
         deadline,
         Block::mpop((3..at).map(|i| args.get(i)), end, want),
     ))
+}
+
+/// `WAIT numreplicas timeout` and `WAITAOF numlocal numreplicas timeout`.
+///
+/// Both of them ask the same question, which is whether this connection's writes
+/// have got somewhere durable, and both of them answer zero here. There are no
+/// replicas because there is no replication, and there is no append only file
+/// because `appendonly` is fixed at `no`, so nothing can ever move either count
+/// off zero and there is nothing to wait for. Redis in the same state gives the
+/// same numbers, it just takes the timeout to do it, and that is registered as
+/// D-25.
+///
+/// What is not a formality is the argument checking, because that is what a
+/// client sees when it gets something wrong, and the three numbers are read by
+/// three different Redis helpers with three different complaints. `numlocal` is
+/// a range and says so. `numreplicas` is a positive number for `WAITAOF` and any
+/// number at all for `WAIT`, where a negative one is accepted and satisfied on
+/// the spot because zero replicas is already more than it asked for. The timeout
+/// is milliseconds here and not the seconds the list commands take, so it does
+/// not go through [`timeout`] above, and a negative one is refused with its own
+/// message rather than the range one.
+fn replication(name: &str, args: Args<'_>, out: &mut Out) -> Result<()> {
+    let aof = name == "waitaof";
+    // `WAITAOF` has one number in front of the two `WAIT` has, and everything
+    // after it is in the same place, so the offset is the whole difference.
+    let at = usize::from(aof);
+    let mut wants_local = false;
+    if aof {
+        let local = whole(args.get(1))?;
+        if !(0..=1).contains(&local) {
+            return Err(Error::new(Code::Invalid, NOT_ZERO_OR_ONE));
+        }
+        wants_local = local == 1;
+    }
+    let replicas = whole(args.get(at + 1))?;
+    if aof && replicas < 0 {
+        return Err(Error::new(Code::Invalid, NOT_POSITIVE));
+    }
+    let ms = whole(args.get(at + 2)).map_err(|_| Error::new(Code::Invalid, TIMEOUT_NOT_AN_INT))?;
+    if ms < 0 {
+        return Err(Error::new(Code::Invalid, NEGATIVE));
+    }
+    // The one complaint here that is about the server rather than about the
+    // arguments, and the reason it comes last is that Redis reads all three
+    // arguments before it looks at itself. `appendonly` is `no` here and cannot
+    // be set, so asking to wait for a local copy is asking for something that
+    // cannot happen rather than something that has not happened yet.
+    if wants_local {
+        return Err(Error::new(Code::Invalid, NO_AOF));
+    }
+    if aof {
+        // Two integers and not a map, whichever protocol is in use. The local
+        // count is first and it is zero for the same reason the other one is:
+        // this server has no append only file to be behind.
+        out.array(2);
+        out.int(0);
+        out.int(0);
+    } else {
+        out.int(0);
+    }
+    Ok(())
+}
+
+/// A whole number argument, with the message Redis gives when it is not one.
+fn whole(arg: &[u8]) -> Result<i64> {
+    num::parse_i64(arg).ok_or_else(|| Error::new(Code::Invalid, NOT_AN_INT))
 }
 
 /// The moment to give up at, or `None` for a wait with no end to it.

@@ -87,8 +87,12 @@ pub(super) fn execute(
     args: Args<'_>,
     out: &mut Out,
 ) -> Result<()> {
-    if spec.name == "copy" {
-        return copy(dbs, at, args, out);
+    // The two that reach a database nobody selected, and the reason this
+    // function is handed every database rather than one.
+    match spec.name {
+        "copy" => return copy(dbs, at, args, out),
+        "move" => return move_key(dbs, at, args, out),
+        _ => {}
     }
     let db = &mut dbs[at];
     match spec.name {
@@ -330,6 +334,49 @@ fn copy(dbs: &mut [Keyspace], at: usize, args: Args<'_>, out: &mut Out) -> Resul
         Moved::Ok
     };
     out.int(i64::from(done == Moved::Ok));
+    Ok(())
+}
+
+/// `MOVE key db`.
+///
+/// `COPY key key DB n` with the source deleted, except that it does not go
+/// through `COPY`, because a move does not need the clone. The store splits a
+/// value coming out of a database into two calls for exactly this reason: an
+/// export leaves the key where it is and clones the body, and a take pulls the
+/// body out of the slab and deletes the key. Moving a set of a million members
+/// through the export would build a second set of a million members and then
+/// throw the first one away a line later.
+///
+/// Both failure modes answer zero rather than complaining: a source that is not
+/// there, and a destination that is. What is an error is a database index that
+/// is not one, and moving a key into the database it is already in, which Redis
+/// calls the same object error and which is checked before the keys are looked
+/// at at all.
+///
+/// The destination is asked about first, which is the opposite of the order
+/// Redis checks in and answers the same thing both ways round. Here it is not
+/// about cost, it is that a take that has to be put back is not something this
+/// can do: the body is out of the slab by then and the key is gone.
+fn move_key(dbs: &mut [Keyspace], at: usize, args: Args<'_>, out: &mut Out) -> Result<()> {
+    let key = args.get(1);
+    let n = args.int(2)?;
+    let into = usize::try_from(n)
+        .ok()
+        .filter(|n| *n < dbs.len())
+        .ok_or_else(|| Error::new(Code::Invalid, DB_OUT_OF_RANGE))?;
+    if into == at {
+        return Err(Error::new(Code::Invalid, SAME_OBJECT));
+    }
+    if dbs[into].exists(key) {
+        out.int(0);
+        return Ok(());
+    }
+    let Some(rec) = dbs[at].take(key) else {
+        out.int(0);
+        return Ok(());
+    };
+    dbs[into].import(key, rec);
+    out.int(1);
     Ok(())
 }
 

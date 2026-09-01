@@ -1239,6 +1239,155 @@ mod tests {
     }
 
     #[test]
+    fn move_takes_the_key_out_of_one_database_and_puts_it_in_another() {
+        let mut f = Fixture::new();
+        assert_eq!(f.run(&[b"RPUSH", b"l", b"a", b"b"]), ":2\r\n");
+        assert_eq!(f.run(&[b"MOVE", b"l", b"1"]), ":1\r\n");
+        assert_eq!(f.run(&[b"EXISTS", b"l"]), ":0\r\n");
+        assert_eq!(f.run(&[b"SELECT", b"1"]), "+OK\r\n");
+        assert_eq!(
+            f.run(&[b"LRANGE", b"l", b"0", b"-1"]),
+            "*2\r\n$1\r\na\r\n$1\r\nb\r\n"
+        );
+        // And back, which proves the body survived the trip rather than being
+        // rebuilt from a copy that happened to look the same.
+        assert_eq!(f.run(&[b"MOVE", b"l", b"0"]), ":1\r\n");
+        assert_eq!(f.run(&[b"EXISTS", b"l"]), ":0\r\n");
+    }
+
+    #[test]
+    fn move_answers_zero_when_either_end_says_no() {
+        let mut f = Fixture::new();
+        assert_eq!(f.run(&[b"MOVE", b"nope", b"1"]), ":0\r\n");
+        assert_eq!(f.run(&[b"SET", b"a", b"here"]), "+OK\r\n");
+        assert_eq!(f.run(&[b"SELECT", b"1"]), "+OK\r\n");
+        assert_eq!(f.run(&[b"SET", b"a", b"there"]), "+OK\r\n");
+        assert_eq!(f.run(&[b"SELECT", b"0"]), "+OK\r\n");
+        // The destination is taken, so nothing moves and the source is still
+        // there with what it had.
+        assert_eq!(f.run(&[b"MOVE", b"a", b"1"]), ":0\r\n");
+        assert_eq!(f.run(&[b"GET", b"a"]), "$4\r\nhere\r\n");
+        assert_eq!(f.run(&[b"SELECT", b"1"]), "+OK\r\n");
+        assert_eq!(f.run(&[b"GET", b"a"]), "$5\r\nthere\r\n");
+    }
+
+    #[test]
+    fn move_refuses_a_database_that_is_not_one_and_the_one_it_is_on() {
+        let mut f = Fixture::new();
+        assert_eq!(
+            f.run(&[b"MOVE", b"a", b"0"]),
+            "-ERR source and destination objects are the same\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"MOVE", b"a", b"99"]),
+            "-ERR DB index is out of range\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"MOVE", b"a", b"-1"]),
+            "-ERR DB index is out of range\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"MOVE", b"a", b"x"]),
+            "-ERR value is not an integer or out of range\r\n"
+        );
+    }
+
+    #[test]
+    fn swapdb_swaps_what_two_connections_would_see() {
+        let mut f = Fixture::new();
+        assert_eq!(f.run(&[b"SET", b"k", b"zero"]), "+OK\r\n");
+        assert_eq!(f.run(&[b"SELECT", b"1"]), "+OK\r\n");
+        assert_eq!(f.run(&[b"SET", b"k", b"one"]), "+OK\r\n");
+        assert_eq!(f.run(&[b"SELECT", b"0"]), "+OK\r\n");
+
+        assert_eq!(f.run(&[b"SWAPDB", b"0", b"1"]), "+OK\r\n");
+        // Still on database zero, and database zero is a different database.
+        assert_eq!(f.run(&[b"GET", b"k"]), "$3\r\none\r\n");
+        assert_eq!(f.run(&[b"SELECT", b"1"]), "+OK\r\n");
+        assert_eq!(f.run(&[b"GET", b"k"]), "$4\r\nzero\r\n");
+        // A database swapped with itself is fine and changes nothing.
+        assert_eq!(f.run(&[b"SWAPDB", b"1", b"1"]), "+OK\r\n");
+        assert_eq!(f.run(&[b"GET", b"k"]), "$4\r\nzero\r\n");
+    }
+
+    #[test]
+    fn swapdb_says_which_index_it_could_not_read() {
+        let mut f = Fixture::new();
+        assert_eq!(
+            f.run(&[b"SWAPDB", b"x", b"1"]),
+            "-ERR invalid first DB index\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"SWAPDB", b"0", b"y"]),
+            "-ERR invalid second DB index\r\n"
+        );
+        // A number too big to be an index on a server that keeps one in an int
+        // is the same complaint, and a plausible one that is not ours is the
+        // range complaint instead. The split is Redis's.
+        assert_eq!(
+            f.run(&[b"SWAPDB", b"99999999999999", b"1"]),
+            "-ERR invalid first DB index\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"SWAPDB", b"0", b"99"]),
+            "-ERR DB index is out of range\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"SWAPDB", b"-1", b"0"]),
+            "-ERR DB index is out of range\r\n"
+        );
+    }
+
+    #[test]
+    fn wait_answers_zero_replicas_without_waiting() {
+        let mut f = Fixture::new();
+        assert_eq!(f.run(&[b"SET", b"a", b"v"]), "+OK\r\n");
+        assert_eq!(f.run(&[b"WAIT", b"0", b"0"]), ":0\r\n");
+        // A replica that is never going to arrive, and a timeout that would be
+        // a real wait on a server that had one.
+        assert_eq!(f.run(&[b"WAIT", b"3", b"1000"]), ":0\r\n");
+        // Negative replicas is not an error, because zero is already more than
+        // it asked for.
+        assert_eq!(f.run(&[b"WAIT", b"-1", b"0"]), ":0\r\n");
+        assert_eq!(
+            f.run(&[b"WAIT", b"x", b"0"]),
+            "-ERR value is not an integer or out of range\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"WAIT", b"0", b"-1"]),
+            "-ERR timeout is negative\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"WAIT", b"0", b"1.5"]),
+            "-ERR timeout is not an integer or out of range\r\n"
+        );
+    }
+
+    #[test]
+    fn waitaof_answers_two_zeroes_and_refuses_a_local_wait() {
+        let mut f = Fixture::new();
+        assert_eq!(f.run(&[b"WAITAOF", b"0", b"0", b"0"]), "*2\r\n:0\r\n:0\r\n");
+        assert_eq!(
+            f.run(&[b"WAITAOF", b"1", b"0", b"0"]),
+            "-ERR WAITAOF cannot be used when numlocal is set but appendonly is disabled.\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"WAITAOF", b"2", b"0", b"0"]),
+            "-ERR value is out of range, value must between 0 and 1\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"WAITAOF", b"0", b"-1", b"0"]),
+            "-ERR value is out of range, must be positive\r\n"
+        );
+        // The arguments are all read before the server looks at itself, so a
+        // bad timeout beats the append only complaint even with numlocal set.
+        assert_eq!(
+            f.run(&[b"WAITAOF", b"1", b"0", b"-5"]),
+            "-ERR timeout is negative\r\n"
+        );
+    }
+
+    #[test]
     fn copy_checks_its_options_before_it_looks_for_anything() {
         let mut f = Fixture::new();
         // No key exists at all, and every one of these is still the option

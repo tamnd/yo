@@ -139,6 +139,15 @@ const AC_KEY_WRITE_SLOW: &[&str] = &["@keyspace", "@write", "@slow"];
 const AC_KEY_WRITE_FAST: &[&str] = &["@keyspace", "@write", "@fast"];
 /// The two that empty a database, which are in the dangerous category.
 const AC_KEY_FLUSH: &[&str] = &["@keyspace", "@write", "@slow", "@dangerous"];
+/// `SWAPDB`, which is fast and dangerous at the same time. It is two pointer
+/// writes and it changes what every connected client is looking at, so Redis
+/// puts it in `@fast` and in `@dangerous` and both are right.
+const AC_SWAPDB: &[&str] = &["@keyspace", "@write", "@fast", "@dangerous"];
+/// `WAIT` and `WAITAOF`, which are the two commands that block on something
+/// that is not a key. They are not in `@keyspace` at all, because they name no
+/// key and read nothing, and they carry `@blocking` for the same reason the
+/// five list commands do.
+const AC_WAIT: &[&str] = &["@slow", "@blocking", "@connection"];
 /// `SORT`, which names three type categories because it takes any of the three
 /// and a write because of `STORE`. Redis leaves `@keyspace` off both of these
 /// even though the command lives in that group, and this list is Redis's.
@@ -2244,6 +2253,51 @@ pub static COMMANDS: &[Spec] = &[
         summary: "Copy a value to another key, in this database or another one.",
         group: "keyspace",
     },
+    // `COPY` with the source deleted, and the only command in the group whose
+    // second argument is a database rather than a key. The key spec is one key
+    // at argument one and the database index is not a key, which is why this
+    // does not look like `COPY` above it.
+    Spec {
+        name: "move",
+        arity: 3,
+        flags: WRITE_FAST,
+        first_key: 1,
+        last_key: 1,
+        step: 1,
+        acl: AC_KEY_WRITE_FAST,
+        since: "1.0.0",
+        complexity: "O(1)",
+        summary: "Move a key to another database, if it is not already there.",
+        group: "keyspace",
+    },
+    // The two that block on replication rather than on a key, so they name no
+    // key at all and the three zeroes below are not a placeholder.
+    Spec {
+        name: "wait",
+        arity: 3,
+        flags: &["blocking"],
+        first_key: 0,
+        last_key: 0,
+        step: 0,
+        acl: AC_WAIT,
+        since: "3.0.0",
+        complexity: "O(1)",
+        summary: "Wait for this connection's writes to reach a number of replicas.",
+        group: "keyspace",
+    },
+    Spec {
+        name: "waitaof",
+        arity: 4,
+        flags: &["blocking"],
+        first_key: 0,
+        last_key: 0,
+        step: 0,
+        acl: AC_WAIT,
+        since: "7.2.0",
+        complexity: "O(1)",
+        summary: "Wait for this connection's writes to reach the append only files.",
+        group: "keyspace",
+    },
     // The two whose keys cannot be read off the command. `SORT k BY w_* GET d_*`
     // touches every key those two patterns name and a client cannot know which
     // ones without the data, so both carry `movablekeys` and Redis's own key
@@ -2620,6 +2674,22 @@ pub static COMMANDS: &[Spec] = &[
         since: "1.0.0",
         complexity: "O(N) in the number of keys in this database.",
         summary: "Empty the database this connection is on.",
+        group: "server",
+    },
+    // In the server group and not the keyspace one, which is Redis's answer and
+    // is the right one: it names no key, it takes two database indexes, and what
+    // it changes is what every connected client is looking at.
+    Spec {
+        name: "swapdb",
+        arity: 3,
+        flags: WRITE_FAST,
+        first_key: 0,
+        last_key: 0,
+        step: 0,
+        acl: AC_SWAPDB,
+        since: "4.0.0",
+        complexity: "O(N) in the number of clients watching or blocked on either.",
+        summary: "Swap two databases, so every client on one sees the other.",
         group: "server",
     },
     // No ACL category but `@fast`, which is Redis's answer and reads like an

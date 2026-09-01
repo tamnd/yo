@@ -36,6 +36,19 @@ const PLANS: &[&str] = &[
 /// in the `merge` plan when they land, so adding the group here does not let
 /// them through without one.
 const PLANLESS_GROUPS: &[&str] = &["connection", "scripting", "server"];
+/// The commands allowed to claim the `none` plan outside those groups.
+///
+/// Two of them, and they are named one by one rather than by widening the group
+/// list, because the keyspace group is where the commands that do touch keys
+/// live and letting it through wholesale would let `DEL` ship without a plan.
+///
+/// `WAIT` and `WAITAOF` are in Redis's generic group, which is this group, and
+/// they name no key and read nothing. They ask about replication and about the
+/// append only file, which are both facts about the server rather than about a
+/// value, and Redis puts them in the `@connection` ACL category for exactly that
+/// reason. Their group is where it is so that the count in `commands.toml`
+/// matches what a real server answers, and the honest plan for them is `none`.
+const PLANLESS_COMMANDS: &[&str] = &["WAIT", "WAITAOF"];
 /// The bound or materialise verdicts.
 const BOUNDED: &[&str] = &["inherent", "yes", "risk"];
 /// Whether a command is implemented, and how far up it reaches.
@@ -248,7 +261,10 @@ fn check_commands(tables: &[Table], ids: &BTreeSet<String>, bad: &mut Vec<String
         one_of(t, "wire", WIRE, &name, bad);
         let status = one_of(t, "status", STATUSES, &name, bad);
 
-        if plan.as_deref() == Some("none") && !PLANLESS_GROUPS.contains(&group.as_str()) {
+        if plan.as_deref() == Some("none")
+            && !PLANLESS_GROUPS.contains(&group.as_str())
+            && !PLANLESS_COMMANDS.contains(&name.as_str())
+        {
             bad.push(format!(
                 "commands.toml line {}: {name} claims no storage plan and is in group {group}, which is not one of {PLANLESS_GROUPS:?}",
                 t.line

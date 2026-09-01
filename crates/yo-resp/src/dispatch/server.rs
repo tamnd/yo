@@ -257,6 +257,23 @@ pub(super) fn execute(
             server.dbs[session.db].clear();
             out.ok();
         }
+        // Two databases change places and no key moves. A database here is a
+        // value in a slice, so this is the slice's own swap and it costs two
+        // pointer sized writes whatever is in either of them, which is what
+        // makes `SWAPDB` fast and dangerous at the same time.
+        //
+        // No connection is told. A client on database zero is still on database
+        // zero and is now looking at what used to be database one, which is the
+        // whole point of the command and is why Redis calls it dangerous. A
+        // client parked in `BLPOP` remembers the database index it blocked on
+        // and not the database, so it wakes up against the swapped in one, which
+        // is Redis's behaviour and falls out of the index being what is stored.
+        "swapdb" => {
+            let first = db_index(args.get(1), "invalid first DB index")?;
+            let second = db_index(args.get(2), "invalid second DB index")?;
+            server.dbs.swap(first, second);
+            out.ok();
+        }
         "time" => time(out),
         _ => return Err(args::unknown_command(args)),
     }
@@ -306,6 +323,26 @@ fn flush_mode(args: Args<'_>) -> Result<()> {
         return Err(args::syntax());
     }
     Ok(())
+}
+
+/// One of `SWAPDB`'s two database indexes, with Redis's two different
+/// complaints about it.
+///
+/// A word that is not a number, or a number too big to be a database index on a
+/// server that stores the index in a C `int`, gets the caller's message, which
+/// says which of the two arguments was wrong. A number that is a plausible index
+/// and is not one of ours gets the same out of range message `SELECT` gives. The
+/// split looks arbitrary and it is Redis's, and the reason for it is that the
+/// first check happens while reading the argument and the second happens inside
+/// the swap, so only the first one knows which argument it was looking at.
+fn db_index(arg: &[u8], bad: &'static str) -> Result<usize> {
+    let n = parse_i64(arg)
+        .filter(|n| i32::try_from(*n).is_ok())
+        .ok_or_else(|| Error::new(Code::Invalid, bad))?;
+    usize::try_from(n)
+        .ok()
+        .filter(|n| *n < DATABASES)
+        .ok_or_else(|| Error::new(Code::Invalid, "DB index is out of range"))
 }
 
 // ------------------------------------------------------------------- HELLO

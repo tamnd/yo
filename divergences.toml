@@ -188,3 +188,11 @@ title = "SORT ALPHA compares bytes and not the server's collation"
 reason = "Redis compares strings with strcoll when there is no STORE and with a byte compare when there is, because a stored result has to be the same on every replica. It calls setlocale(LC_COLLATE, \"\") at startup, so the order SORT ALPHA puts two strings in is a property of the environment the server was started in and not of the data, and the same server started twice under two locales answers differently. strcoll also stops at the first zero byte, so two members that differ only after a zero compare equal. This compares bytes everywhere, which is the STORE behaviour applied to every call, is what a client already gets from Redis under the C locale that almost every deployment runs, and is the only choice that makes the answer reproducible."
 status = "permanent"
 spec = "05 section 4"
+
+[[divergence]]
+id = "D-25"
+title = "WAIT and WAITAOF answer at once instead of waiting out the timeout"
+reason = "Both commands ask whether this connection's writes have got somewhere durable, and both of them can only ever answer zero here. There is no replication, so no replica has acknowledged anything, and appendonly is fixed at no and cannot be set, so there is no local file to be behind either. Redis in the same state gives the same numbers and gets there by blocking the client for the whole timeout first, because on a real server a replica could connect and acknowledge during that window. Nothing can arrive here during that window, so waiting would be a sleep with a known answer at the end of it, and the one thing it would buy is that a test measuring how long WAIT 1 100 takes would see a hundred milliseconds. The numbers a client reads are identical either way, and this goes away by itself the day replication lands, at which point the wait becomes real rather than a formality."
+status = "until"
+resolved_by = "M8"
+spec = "12 section 8"
