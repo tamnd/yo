@@ -26,6 +26,7 @@ use yo_index::RawMap;
 use crate::Clock;
 use crate::access::{Access, Lfu, Policy};
 use crate::array::Array;
+use crate::evict;
 use crate::hash::{self, Hash};
 use crate::list::{self, List};
 use crate::set::{self, Set};
@@ -40,6 +41,13 @@ pub struct Keyspace {
     pub(crate) clock: Clock,
     /// Keys that were found dead on the way to answering something else.
     pub(crate) expired: u64,
+    /// Keys thrown away to make room, which is a different number entirely.
+    ///
+    /// Redis keeps `expired_keys` and `evicted_keys` apart in `INFO` and the
+    /// distinction is the one people watch: expiry is the client getting what it
+    /// asked for, and eviction is the server deciding it cannot keep a promise
+    /// nobody asked it to break.
+    pub(crate) evicted: u64,
     /// Every set in this database, addressed by the number in its record.
     pub(crate) sets: Slab<Set>,
     /// Every hash in this database, addressed the same way.
@@ -80,6 +88,11 @@ pub struct Keyspace {
     pub(crate) policy: Policy,
     /// The two numbers the LFU counter moves by, which are `CONFIG` values.
     pub(crate) lfu: Lfu,
+    /// How many keys a round of eviction sampling looks at.
+    ///
+    /// `maxmemory-samples`, carried per database for the same reason the policy
+    /// is. See [`evict::SAMPLES`] for why the default is five.
+    pub(crate) samples: usize,
     /// Where `SPOP` and `SRANDMEMBER` draw from.
     pub(crate) rng: Rng,
     /// The last collection key that was resolved, for the command behind it.
@@ -151,6 +164,22 @@ pub struct Keyspace {
 /// small only means the buffer grows once more on some later command, and too
 /// large only means a kibibyte nobody used.
 const SCRATCH: usize = 1024;
+
+/// How many segments one call to [`Keyspace::victim`] will draw from.
+///
+/// A round is a whole segment, and a segment is sixty four buckets of seven
+/// entries each before its overflow chains are counted, so one round almost
+/// always answers. The retries are for the case where a round came back with
+/// nothing usable, which happens when the segment it drew was empty or when a
+/// `volatile` policy filtered out everything in it.
+///
+/// Four rather than more, because the case that would want more is the case no
+/// number of rounds can fix. A `volatile` policy on a database where nothing has
+/// a deadline has no eligible key anywhere, and every round of it is wasted work
+/// on a path where a client is waiting. Redis does not have this problem because
+/// it keeps a second dictionary of just the keys with deadlines and samples that
+/// one directly, which is the real answer here too and is not this change.
+const ROUNDS: usize = 4;
 
 /// Where the last collection key resolved to, if it still resolves there.
 ///
@@ -278,6 +307,7 @@ impl Keyspace {
             map: RawMap::new(),
             clock,
             expired: 0,
+            evicted: 0,
             sets: Slab::new(),
             hashes: Slab::new(),
             lists: Slab::new(),
@@ -290,6 +320,7 @@ impl Keyspace {
             zset_limits: zset::Limits::DEFAULT,
             policy: Policy::default(),
             lfu: Lfu::DEFAULT,
+            samples: evict::SAMPLES,
             rng: Rng::new(clock.now_ms() ^ made.wrapping_mul(0x9e37_79b9_7f4a_7c15)),
             memo: Memo::empty(),
             scratch: Vec::with_capacity(SCRATCH),
@@ -1047,6 +1078,111 @@ impl Keyspace {
         self.expired
     }
 
+    /// Keys thrown away to make room.
+    ///
+    /// Redis calls this `evicted_keys` in `INFO stats`. It stays at zero under
+    /// `noeviction`, which is the whole point of that policy, and a monitoring
+    /// dashboard that sees it move on a server configured that way is looking at
+    /// a bug rather than at load.
+    #[inline]
+    pub const fn evicted_keys(&self) -> u64 {
+        self.evicted
+    }
+
+    /// How many keys a round of eviction sampling looks at.
+    #[inline]
+    pub const fn samples(&self) -> usize {
+        self.samples
+    }
+
+    /// Set how many keys a round of eviction sampling looks at.
+    ///
+    /// Zero is not refused here, because the caller doing the refusing is
+    /// `CONFIG SET` and it has a message to produce. A zero that reaches here
+    /// samples one bucket and takes the best of it, because the loop runs its
+    /// body before it checks, which is a better answer than dividing by nothing.
+    #[inline]
+    pub const fn set_samples(&mut self, samples: usize) {
+        self.samples = samples;
+    }
+
+    /// Throw away one key, chosen by the policy. Answers whether one went.
+    ///
+    /// This is one step and not a loop on purpose. The caller is the thing that
+    /// knows how much room it needs back, and a loop in here would either take
+    /// too much or have to be told the same number twice. It also means the
+    /// caller can put a bound on how long it spends evicting before it answers
+    /// the client, which matters because the client is waiting on a write that
+    /// this is making room for.
+    ///
+    /// It answers false without doing anything under `noeviction`, and also when
+    /// a `volatile` policy is set on a database where nothing has a deadline.
+    /// Those are the same answer to the caller and they mean the same thing: this
+    /// server cannot give memory back and is about to have to refuse a write.
+    pub fn evict_one(&mut self) -> bool {
+        let Some(addr) = self.victim() else {
+            return false;
+        };
+        // The key has to outlive the borrow that found it, because deleting is a
+        // write and the address came out of a read. One copy into the scratch
+        // buffer rather than a `Vec` per eviction, for the reason written on
+        // [`Keyspace::scratch`]: this runs in a loop when it runs at all.
+        let mut buf = core::mem::take(&mut self.scratch);
+        buf.clear();
+        buf.extend_from_slice(self.map.entry_at(addr).0);
+        let gone = self.drop_key(&buf);
+        self.scratch = buf;
+        if gone {
+            self.evicted += 1;
+        }
+        gone
+    }
+
+    /// Where the key this policy would throw away lives, if there is one.
+    ///
+    /// The sampling loop. It draws buckets until it has looked at `samples` keys
+    /// the policy would consider, scores each one, and hands back the best. See
+    /// [`evict`] for what the score means and [`yo_index::RawMap::sample`] for
+    /// why a bucket is the unit.
+    ///
+    /// The round cap is the part that is not obvious. A database with a hundred
+    /// keys in a directory sized for a million is mostly empty buckets, and a
+    /// `volatile` policy on a database where nothing has a deadline has no
+    /// eligible keys at all however many buckets it looks in. Without the cap the
+    /// second case is an infinite loop, and it is not a rare configuration, it is
+    /// the classic eviction surprise. With it, the worst case is a fixed number
+    /// of cache misses and a false, which is exactly what the caller needs to
+    /// hear.
+    ///
+    /// A key past its deadline is skipped rather than taken. It is dead memory
+    /// and evicting it would look like a win, but it would be counted as an
+    /// eviction when it is an expiry, and those two numbers are watched
+    /// separately for a reason. Lazy expiry takes it the next time anything asks
+    /// for it, and the active cycle takes it before that.
+    fn victim(&mut self) -> Option<Addr> {
+        if matches!(self.policy, Policy::NoEviction) || self.map.is_empty() {
+            return None;
+        }
+        let now = self.clock.now_ms();
+        let (policy, lfu, want) = (self.policy, self.lfu, self.samples);
+        let mut best = evict::Best::EMPTY;
+        let mut seen = 0usize;
+        for _ in 0..ROUNDS {
+            let r = self.rng.next_u64();
+            self.map.sample(r, |_key, rec, addr| {
+                if !value::is_expired(rec, now) && evict::eligible(rec, policy) {
+                    seen += 1;
+                    best.offer(addr, evict::score(rec, policy, now, lfu));
+                }
+                seen < want
+            });
+            if seen >= want {
+                break;
+            }
+        }
+        (!best.is_empty()).then_some(best.addr)
+    }
+
     /// Bytes held by the index, the arena and every body hanging off them.
     #[inline]
     pub fn memory_bytes(&self) -> usize {
@@ -1250,5 +1386,139 @@ mod tests {
         d.set_plain(b"cold", b"v").expect("room");
         d.clock_mut().advance(60_000 * 10);
         assert!(d.freq(b"cold").expect("there") < start);
+    }
+
+    /// Nothing goes under `noeviction`, which is the only promise that policy
+    /// makes and the reason it is the default.
+    #[test]
+    fn noeviction_evicts_nothing() {
+        let mut d = db();
+        for i in 0..200u32 {
+            d.set_plain(format!("k{i}").as_bytes(), b"v").expect("room");
+        }
+        assert!(!d.evict_one());
+        assert_eq!(d.len(), 200);
+        assert_eq!(d.evicted_keys(), 0);
+    }
+
+    /// A volatile policy on a database where nothing has a deadline is the
+    /// classic surprise: it looks configured and it cannot free a byte.
+    #[test]
+    fn a_volatile_policy_with_no_deadlines_anywhere_cannot_evict() {
+        let mut d = db();
+        d.set_policy(Policy::VolatileLru);
+        for i in 0..200u32 {
+            d.set_plain(format!("k{i}").as_bytes(), b"v").expect("room");
+        }
+        assert!(!d.evict_one(), "it found a key it had no business taking");
+        assert_eq!(d.len(), 200);
+
+        // Give one key a deadline and it becomes the only thing that can go,
+        // however many rounds of sampling that takes.
+        let deadline = d.clock().now_ms() + 100_000;
+        d.set_expiry(b"k7", Some(deadline));
+        assert!(d.evict_one());
+        assert!(!d.exists(b"k7"));
+        assert_eq!(d.evicted_keys(), 1);
+    }
+
+    /// The direction of the score, which is the thing worth pinning. A test that
+    /// only checked something was evicted would pass just as happily on a cache
+    /// that keeps the cold keys and throws away the hot ones.
+    #[test]
+    fn the_stale_key_goes_before_the_fresh_one() {
+        let mut d = db();
+        d.set_policy(Policy::AllKeysLru);
+        // Two keys is a small enough database that a bucket holds both of them
+        // and the pick is between them rather than between whatever turned up.
+        d.set_plain(b"cold", b"v").expect("room");
+        d.clock_mut().advance(600_000);
+        d.set_plain(b"hot", b"v").expect("room");
+
+        assert!(d.evict_one());
+        assert!(!d.exists(b"cold"), "it kept the stale one");
+        assert!(d.exists(b"hot"), "it took the fresh one");
+    }
+
+    /// Under `volatile-ttl` the ordering is by deadline and not by use, so the
+    /// key about to expire anyway is the one that goes.
+    #[test]
+    fn the_soonest_deadline_goes_first() {
+        let mut d = db();
+        d.set_policy(Policy::VolatileTtl);
+        let now = d.clock().now_ms();
+        d.set_plain(b"soon", b"v").expect("room");
+        d.set_plain(b"later", b"v").expect("room");
+        d.set_expiry(b"soon", Some(now + 10_000));
+        d.set_expiry(b"later", Some(now + 900_000));
+
+        assert!(d.evict_one());
+        assert!(!d.exists(b"soon"));
+        assert!(d.exists(b"later"));
+    }
+
+    /// Under LFU the key nobody reads goes, even though it was written more
+    /// recently than the one that survives. That is the difference between the
+    /// two families and it is invisible to a test written against the clock.
+    #[test]
+    fn the_least_used_key_goes_under_lfu() {
+        let mut d = db();
+        d.set_policy(Policy::AllKeysLfu);
+        d.seed(11);
+        d.set_plain(b"popular", b"v").expect("room");
+        for _ in 0..300 {
+            d.get(b"popular").expect("a string").expect("still there");
+        }
+        // Written after the reads above, so under any clock policy this would be
+        // the freshest key in the database and the last thing to go.
+        d.set_plain(b"ignored", b"v").expect("room");
+
+        assert!(d.evict_one());
+        assert!(!d.exists(b"ignored"));
+        assert!(d.exists(b"popular"));
+    }
+
+    /// Sampling has to keep working when almost every bucket it looks in is
+    /// empty, which is what a database looks like after most of it is deleted.
+    #[test]
+    fn a_nearly_empty_database_still_gives_up_a_key() {
+        let mut d = db();
+        d.set_policy(Policy::AllKeysRandom);
+        for i in 0..4000u32 {
+            d.set_plain(format!("k{i}").as_bytes(), b"v").expect("room");
+        }
+        for i in 0..3999u32 {
+            d.drop_key(format!("k{i}").as_bytes());
+        }
+        assert_eq!(d.len(), 1);
+
+        // One key in a directory sized for four thousand. It may take more than
+        // one round to land on it, and it may take more than one call, but the
+        // rounds are bounded and so is this loop.
+        let mut went = false;
+        for _ in 0..500 {
+            if d.evict_one() {
+                went = true;
+                break;
+            }
+        }
+        assert!(went, "sampling never found the one key that was left");
+        assert_eq!(d.len(), 0);
+        assert!(!d.evict_one(), "and an empty database has nothing to give");
+    }
+
+    /// Eviction and expiry are counted apart, so a key that was already dead
+    /// when sampling found it is not billed as an eviction.
+    #[test]
+    fn a_dead_key_is_not_evicted() {
+        let mut d = db();
+        d.set_policy(Policy::AllKeysLru);
+        let now = d.clock().now_ms();
+        d.set_plain(b"k", b"v").expect("room");
+        d.set_expiry(b"k", Some(now + 1000));
+        d.clock_mut().advance(5000);
+
+        assert!(!d.evict_one(), "it evicted a key that was already dead");
+        assert_eq!(d.evicted_keys(), 0);
     }
 }

@@ -493,6 +493,23 @@ impl RawMap {
         }
     }
 
+    /// Entries picked at random, for eviction sampling, until `out` says stop.
+    ///
+    /// The key, the value and the address of each, because a caller choosing a
+    /// victim needs all three: the value to score it, the key to delete it, and
+    /// the address to delete it by without a second probe. `out` answers whether
+    /// to keep going. [`Index::sample`] is where the argument for all of it lives,
+    /// including why the budget is the caller's and why this can hand back
+    /// nothing at all.
+    pub fn sample(&self, r: u64, mut out: impl FnMut(&[u8], &[u8], Addr) -> bool) {
+        let arena = &self.arena;
+        self.index.sample(r, |addr| {
+            let (klen, vlen) = Record::lens(arena.get(addr, HDR));
+            let bytes = arena.get(addr, HDR + klen + vlen);
+            out(&bytes[HDR..HDR + klen], &bytes[HDR + klen..], addr)
+        });
+    }
+
     /// The index, for stats and for compaction.
     pub fn index(&self) -> &Index {
         &self.index
@@ -1200,6 +1217,65 @@ mod tests {
     /// The exception, pinned so that it stays a decision rather than becoming a
     /// habit. An in place stamp leaves the counter alone, and everything the
     /// caller resolved before it is still right after it.
+    #[test]
+    fn sampling_hands_back_real_entries_and_stops_when_told() {
+        let mut m = RawMap::new();
+        for i in 0..2000u32 {
+            m.set(format!("k{i}").as_bytes(), format!("v{i}").as_bytes());
+        }
+
+        // Whatever it hands over is really in the map, key and value together,
+        // and the address it gives is the address that key resolves to.
+        let mut count = 0usize;
+        m.sample(0x1234_5678_9abc_def0, |key, val, addr| {
+            assert_eq!(m.get(key), Some(val));
+            assert_eq!(m.find(key), Some(addr));
+            count += 1;
+            count < 5
+        });
+        assert_eq!(count, 5, "it did not stop when it was told to");
+
+        // A caller that never says stop still terminates, because the segment is
+        // the bound and not the caller.
+        let mut all = 0usize;
+        m.sample(0, |_, _, _| {
+            all += 1;
+            true
+        });
+        assert!(all > 0, "it found nothing in a map of two thousand keys");
+        assert!(
+            all < m.len(),
+            "one segment and not the whole map, got {all} of {}",
+            m.len()
+        );
+    }
+
+    #[test]
+    fn sampling_a_sparse_map_still_finds_something() {
+        // The case a sampler that looked in one bucket would get wrong. Two keys
+        // in a map sized for two thousand is sixty two empty buckets for every
+        // two that are worth looking in.
+        let mut m = RawMap::new();
+        for i in 0..2000u32 {
+            m.set(format!("k{i}").as_bytes(), b"v");
+        }
+        for i in 0..1998u32 {
+            m.del(format!("k{i}").as_bytes());
+        }
+        assert_eq!(m.len(), 2);
+
+        // Not every draw lands in the segment those two are in, so this is about
+        // whether it ever finds them rather than whether it always does.
+        let mut found = 0usize;
+        for r in 0..200u64 {
+            m.sample(r.wrapping_mul(0x9e37_79b9_7f4a_7c15), |_, _, _| {
+                found += 1;
+                true
+            });
+        }
+        assert!(found > 0, "two hundred draws and it never found either key");
+    }
+
     #[test]
     fn stamping_a_value_in_place_is_not_a_write() {
         let mut m = RawMap::new();

@@ -330,6 +330,12 @@ impl Server {
         self.dbs.iter().map(Keyspace::expired_keys).sum()
     }
 
+    /// Keys thrown away to make room, which is the other number entirely.
+    #[must_use]
+    pub fn evicted_keys(&self) -> u64 {
+        self.dbs.iter().map(Keyspace::evicted_keys).sum()
+    }
+
     /// Give one database's dead space back, if any database has enough of it to
     /// be worth the move. `None` when no database had a candidate.
     ///
@@ -1706,7 +1712,7 @@ mod tests {
         // A pattern matches more than one, and a setting two patterns both ask
         // for is still sent once.
         let both = f.run(&[b"CONFIG", b"GET", b"maxmemory*", b"maxmemory"]);
-        assert!(both.starts_with("*4\r\n"), "{both}");
+        assert!(both.starts_with("*6\r\n"), "{both}");
         assert_eq!(f.run(&[b"CONFIG", b"GET", b"nosuch"]), "*0\r\n");
         assert_eq!(f.run(&[b"CONFIG", b"SET", b"appendonly", b"no"]), "+OK\r\n");
         assert_eq!(
@@ -1786,6 +1792,58 @@ mod tests {
             f.run(&[b"CONFIG", b"GET", b"hash-max-listpack-entries"]),
             "*2\r\n$25\r\nhash-max-listpack-entries\r\n$3\r\n512\r\n"
         );
+    }
+
+    #[test]
+    fn the_three_eviction_numbers_read_back_too() {
+        let mut f = Fixture::new();
+        for (name, default, set) in [
+            ("maxmemory-samples", "5", "12"),
+            ("lfu-log-factor", "10", "3"),
+            ("lfu-decay-time", "1", "60"),
+        ] {
+            let get = || {
+                format!(
+                    "*2\r\n${}\r\n{name}\r\n${}\r\n{default}\r\n",
+                    name.len(),
+                    default.len()
+                )
+            };
+            assert_eq!(f.run(&[b"CONFIG", b"GET", name.as_bytes()]), get());
+            assert_eq!(
+                f.run(&[b"CONFIG", b"SET", name.as_bytes(), set.as_bytes()]),
+                "+OK\r\n"
+            );
+            assert_eq!(
+                f.run(&[b"CONFIG", b"GET", name.as_bytes()]),
+                format!(
+                    "*2\r\n${}\r\n{name}\r\n${}\r\n{set}\r\n",
+                    name.len(),
+                    set.len()
+                )
+            );
+            // A number that is not a number is refused with the same sentence
+            // every other number gets, which names the setting the client typed.
+            assert_eq!(
+                f.run(&[b"CONFIG", b"SET", name.as_bytes(), b"soon"]),
+                format!(
+                    "-ERR CONFIG SET failed (possibly related to argument '{name}') - argument couldn't be parsed into an integer\r\n"
+                )
+            );
+        }
+    }
+
+    #[test]
+    fn evicted_keys_and_expired_keys_are_different_numbers() {
+        let mut f = Fixture::new();
+        // Nothing has been evicted and nothing can be under the default policy,
+        // so this stays at zero while the other one moves.
+        f.run(&[b"SET", b"gone", b"v", b"PX", b"1"]);
+        f.server.db(0).clock_mut().advance(20);
+        f.run(&[b"GET", b"gone"]);
+        let info = f.run(&[b"INFO", b"stats"]);
+        assert!(info.contains("expired_keys:1"), "{info}");
+        assert!(info.contains("evicted_keys:0"), "{info}");
     }
 
     #[test]
