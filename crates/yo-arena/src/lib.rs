@@ -650,6 +650,32 @@ impl Arena {
             .map(|(_, i)| i)
     }
 
+    /// The same pick with both ratios ignored: any segment holding anything
+    /// dead will do, and the one holding the most goes first.
+    ///
+    /// This is for a store that has run into a memory limit, where the two
+    /// ratios are answering the wrong question. They exist to stop a healthy
+    /// store paying for copying it does not need, and they are right about that:
+    /// evacuating a segment that is a twentieth dead copies nineteen twentieths
+    /// of two megabytes to get one twentieth back. At the limit that trade turns
+    /// over. The alternative to the copying is refusing the client's write, and
+    /// a hundred kilobytes bought with two megabytes of copying is a hundred
+    /// kilobytes the server did not have.
+    ///
+    /// There is no cheap first test here, on purpose. The walk over the headers
+    /// costs a load per segment and this is only called when the server is over
+    /// its limit and about to start throwing keys away, which is not a path
+    /// where the cost of one load per segment is what matters.
+    #[must_use]
+    pub fn any_candidate(&self) -> Option<usize> {
+        (0..self.segs.len())
+            .filter(|&i| i != self.cur && !self.segs[i].free)
+            .map(|i| (self.segs[i].header().dead_bytes, i))
+            .filter(|&(dead, _)| dead > 0)
+            .max()
+            .map(|(_, i)| i)
+    }
+
     /// Dead bytes in one segment.
     pub fn dead_bytes(&self, seg: usize) -> u64 {
         self.segs[seg].header().dead_bytes
@@ -877,6 +903,38 @@ mod tests {
             a.free(*addr, chunk.len());
         }
         assert_eq!(a.compaction_candidates(), vec![0]);
+    }
+
+    #[test]
+    fn a_barely_dead_segment_is_a_candidate_only_under_pressure() {
+        let mut a = Arena::new();
+        let chunk = vec![0u8; 128 * 1024];
+        let mut addrs = Vec::new();
+        while a.segment_count() < 2 {
+            addrs.push(a.put(&chunk).unwrap());
+        }
+        // One chunk of sixteen, which is a sixteenth of the segment and is well
+        // under both ratios.
+        let one = *addrs
+            .iter()
+            .find(|x| x.offset() < SEGMENT_SIZE as u64)
+            .expect("segment 0 holds something");
+        a.free(one, chunk.len());
+        assert_eq!(a.worst_candidate(), None, "not worth collecting");
+        assert_eq!(a.any_candidate(), Some(0), "worth collecting at a limit");
+    }
+
+    #[test]
+    fn a_segment_with_nothing_dead_in_it_is_never_a_candidate() {
+        let mut a = Arena::new();
+        let chunk = vec![0u8; 128 * 1024];
+        while a.segment_count() < 2 {
+            a.put(&chunk).unwrap();
+        }
+        // Nothing has been freed, so there is nothing to gain from moving
+        // anything and the answer is the same however hard the caller is
+        // looking. A store that writes each key once never compacts at all.
+        assert_eq!(a.any_candidate(), None);
     }
 
     #[test]
