@@ -48,17 +48,39 @@
 //! lands on a live row, which is fine at 90 percent occupancy and unbounded on a
 //! set that has been drained down to its last member.
 //!
-//! The slot the removed member sat in is closed by shifting the run behind it
-//! back, not by leaving a tombstone. A tombstone is cheaper on the delete and it
-//! is the wrong trade here: `SPOP` in a loop empties a set, and a table that
-//! answers an empty set by walking a million tombstones is slower than the
-//! structure it replaced.
+//! The slot the removed member sat in is closed by writing a marker over it,
+//! and the marker is the empty one rather than the dead one whenever it can
+//! prove no probe ever ran past the slot, which is when the slot after it is
+//! already empty. A run of markers directly behind that one is cleared too, by
+//! the same argument applied to each in turn. So the common shapes leave nothing
+//! behind at all: a set filled and then drained collects its own markers on the
+//! way down, and a table with short runs in it almost never writes one.
 //!
-//! Neither the removal nor the shift reads a name, because every row carries the
-//! slot it wanted. Three bytes a row for that, packed in beside the name length,
-//! and it took a pop at a hundred thousand members from 123 ns to 25.7 ns, which
-//! is the difference between a random trip into the name blob per slot examined
-//! and no trip at all.
+//! What is left over is counted and it counts against the load exactly as a live
+//! member does, so a table churned in place rebuilds on the same schedule as one
+//! that only grows and can never fill up with markers. That count is also what
+//! bounds a probe, and the bound is easier than it looks: a removal turns a full
+//! slot into a marker or into an empty one, so the two together never go up, so
+//! a probe is never longer than it was at the moment the table was fullest.
+//!
+//! It is not free, and the case where it is not is a table drained and then read
+//! from. Shifting the run back really did give the slot up, so a set emptied
+//! from a million down to ten used to answer a miss like a table holding ten,
+//! and now it answers like a table that once held a million, which is under
+//! three slots looked at either way and is the whole of the trade.
+//!
+//! This used to shift the run behind the hole back instead, which leaves no
+//! marker and costs a walk over that run with a home slot computed for every
+//! slot in it. The marker is two writes and the shift was the single most
+//! expensive thing on the removal path. Nothing here allocates, on either side
+//! of the change, because a removal is on a command path and `cargo xtask alloc`
+//! is the gate that says a command path allocates nothing.
+//!
+//! Neither the removal nor the marker reads a name, because every row carries
+//! the slot it wanted. Three bytes a row for that, packed in beside the name
+//! length, and it took a pop at a hundred thousand members from 123 ns to
+//! 25.7 ns, which is the difference between a random trip into the name blob per
+//! slot examined and no trip at all.
 //!
 //! # Names
 //!
@@ -96,15 +118,28 @@ pub const MAX_ROWS: usize = 0x00FF_FFFE;
 /// own length in two bytes rather than four.
 pub const NAME_MAX: usize = u16::MAX as usize;
 
-/// An empty slot. No live slot can hold this, because a live row index is at
-/// most [`MAX_ROWS`] and the tag occupies the byte above it.
-const EMPTY: u32 = u32::MAX;
+/// The low twenty four bits of a slot, which are the row index.
+const ROW: u32 = 0x00FF_FFFF;
+
+/// A slot nothing has ever been written to. A probe stops here.
+const EMPTY: u32 = 0xFFFF_FFFF;
+
+/// A slot something was written to and then removed from. A probe keeps going.
+///
+/// Both markers have all twenty four row bits set and a live row index never
+/// does, because [`MAX_ROWS`] is one short of that, so `slot & ROW == ROW` tells
+/// a marker of either kind from a live slot in two instructions. Doing it that
+/// way rather than by stealing the top bit is what keeps the tag a full eight
+/// bits: a seven bit tag would double the rate at which a probe reads a row it
+/// is about to reject, and the probe is the hottest path in the engine.
+const TOMB: u32 = 0x00FF_FFFF;
 
 /// How full the slot array is allowed to get before it doubles.
 ///
 /// Three quarters is where linear probing is still short and the array is not
 /// mostly air. The run length at this load is under three on average, which is
-/// inside one cache line of slots.
+/// inside one cache line of slots. Markers count towards it, because a marker is
+/// a slot a probe has to look at and step over.
 const LOAD_NUM: usize = 3;
 const LOAD_DEN: usize = 4;
 
@@ -188,8 +223,14 @@ impl Row {
 /// the value address and the TTL slot, a sorted set uses the score.
 #[derive(Debug, Clone)]
 pub struct Elements<V> {
-    /// Tag in the top byte, row index in the low 24 bits, [`EMPTY`] for nothing.
+    /// Tag in the top byte, row index in the low 24 bits, or [`EMPTY`]/[`TOMB`].
     slots: Box<[u32]>,
+    /// How many slots hold [`TOMB`].
+    ///
+    /// These count against the load exactly as live rows do, which is what stops
+    /// a table written and removed from in place filling up with them, and it is
+    /// also what a drained table watches to know when to rebuild.
+    dead: usize,
     /// The rows, in insertion order, with no holes.
     rows: Vec<Row>,
     /// The payloads, one per row and at the same index.
@@ -229,6 +270,7 @@ impl<V: Copy> Elements<V> {
     pub fn new() -> Elements<V> {
         Elements {
             slots: Box::new([]),
+            dead: 0,
             rows: Vec::new(),
             vals: Vec::new(),
             names: Blob::new(),
@@ -265,7 +307,7 @@ impl<V: Copy> Elements<V> {
         }
         self.rows.reserve(n.saturating_sub(self.rows.len()));
         self.vals.reserve(n.saturating_sub(self.vals.len()));
-        if n * LOAD_DEN > self.slots.len() * LOAD_NUM {
+        if (n + self.dead) * LOAD_DEN > self.slots.len() * LOAD_NUM {
             self.grow_to(slots_for(n));
         }
     }
@@ -544,6 +586,7 @@ impl<V: Copy> Elements<V> {
         for slot in &mut self.slots {
             *slot = EMPTY;
         }
+        self.dead = 0;
     }
 
     /// What this table costs, not counting anything the payload points at.
@@ -595,6 +638,12 @@ impl<V: Copy> Elements<V> {
     /// One load from the slot array. The tag in the top byte throws out a
     /// collision on the low bits without touching the row, so the name
     /// comparison below runs about once per hit and not once per probe.
+    ///
+    /// The stop is [`EMPTY`] and only [`EMPTY`], because a [`TOMB`] means
+    /// something used to be here and whatever probed past it is still behind it.
+    /// A marker cannot be mistaken for a match: its row bits are all ones and no
+    /// row index is, so the check that rejects it is on the arm the tag already
+    /// agreed with, which is one comparison in two hundred and fifty six.
     #[inline]
     fn find_hashed(&self, h: u64, name: &[u8]) -> Option<usize> {
         if self.rows.is_empty() {
@@ -609,21 +658,30 @@ impl<V: Copy> Elements<V> {
                 return None;
             }
             if slot >> 24 == u32::from(tag) {
-                let row = (slot & 0x00FF_FFFF) as usize;
-                if bytes_eq(self.name_of(&self.rows[row]), name) {
-                    return Some(row);
+                let row = slot & ROW;
+                if row != ROW && bytes_eq(self.name_of(&self.rows[row as usize]), name) {
+                    return Some(row as usize);
                 }
             }
             at = (at + 1) & mask;
         }
     }
 
-    /// Put a row index in the first slot the probe reaches.
+    /// Put a row index in the first free slot the probe reaches.
+    ///
+    /// Free rather than empty, so an insert takes a marker back as soon as it
+    /// meets one. That is correct because the caller has already probed for this
+    /// name and not found it, and because a later probe for the same name walks
+    /// these slots in this order and stops only at an [`EMPTY`], which is at or
+    /// after wherever this lands.
     fn put_slot(&mut self, h: u64, row: u32) {
         let mask = self.slots.len() - 1;
         let mut at = (h as usize) & mask;
-        while self.slots[at] != EMPTY {
+        while self.slots[at] & ROW != ROW {
             at = (at + 1) & mask;
+        }
+        if self.slots[at] == TOMB {
+            self.dead -= 1;
         }
         self.slots[at] = (u32::from(tag_of(h)) << 24) | row;
     }
@@ -648,55 +706,57 @@ impl<V: Copy> Elements<V> {
         value
     }
 
-    /// Close the slot holding `row`, and shift the run behind it back.
+    /// Close the slot holding `row`.
     ///
-    /// Linear probing means a run of occupied slots is a chain, and punching a
-    /// hole in the middle of one hides everything behind it. Shifting the run
-    /// back keeps every probe correct and leaves no tombstone, which matters
-    /// because `SPOP` in a loop deletes every element a set ever had.
+    /// A slot whose neighbour is already [`EMPTY`] is a slot nothing ever probed
+    /// past, because a probe stops at the first empty one, so it can go straight
+    /// back to empty and cost nothing. Any run of markers directly behind it goes
+    /// with it, since the same argument now holds for each of them in turn, and
+    /// that is what makes a drain collect after itself.
+    ///
+    /// Otherwise the slot becomes a [`TOMB`], which says keep going and counts
+    /// against the load until the next rebuild.
     fn clear_slot(&mut self, row: usize) {
         let mask = self.slots.len() - 1;
-        let mut at = self.home_of(row, mask);
-        loop {
-            let slot = self.slots[at];
-            debug_assert!(slot != EMPTY, "the row being removed has a slot");
-            if slot != EMPTY && (slot & 0x00FF_FFFF) as usize == row {
-                break;
-            }
-            at = (at + 1) & mask;
+        let at = self.slot_of(row);
+        if self.slots[(at + 1) & mask] != EMPTY {
+            self.slots[at] = TOMB;
+            self.dead += 1;
+            return;
         }
         self.slots[at] = EMPTY;
-
-        // Everything behind the hole that probed past it has to move up, or it
-        // becomes unreachable.
-        let mut hole = at;
-        let mut scan = (at + 1) & mask;
-        while self.slots[scan] != EMPTY {
-            let slot = self.slots[scan];
-            let idx = (slot & 0x00FF_FFFF) as usize;
-            let home = self.home_of(idx, mask);
-            // True when the slot's home is at or behind the hole, meaning it
-            // probed over the hole to get here and would not be found now.
-            if (scan.wrapping_sub(home) & mask) >= (scan.wrapping_sub(hole) & mask) {
-                self.slots[hole] = slot;
-                self.slots[scan] = EMPTY;
-                hole = scan;
-            }
-            scan = (scan + 1) & mask;
+        // This terminates on the slot just emptied at the latest, so an array of
+        // nothing but markers is walked once and not forever.
+        let mut back = at.wrapping_sub(1) & mask;
+        while self.slots[back] == TOMB {
+            self.slots[back] = EMPTY;
+            self.dead -= 1;
+            back = back.wrapping_sub(1) & mask;
         }
     }
 
     /// Point the slot holding `from` at `to` instead.
     fn repoint(&mut self, from: usize, to: usize) {
+        let at = self.slot_of(from);
+        let to = u32::try_from(to).expect("a row index fits in 24 bits");
+        self.slots[at] = (self.slots[at] & !ROW) | to;
+    }
+
+    /// Which slot holds `row`.
+    ///
+    /// The row says where it wanted to sit, so this walks the same slots the
+    /// name would have walked without ever reading the name, and it matches on
+    /// the row index rather than on the tag because the tag is the one thing a
+    /// row does not keep. A marker cannot match, because its row bits are all
+    /// ones and no row index is.
+    fn slot_of(&self, row: usize) -> usize {
         let mask = self.slots.len() - 1;
-        let mut at = self.home_of(from, mask);
+        let want = u32::try_from(row).expect("a row index fits in 24 bits");
+        let mut at = self.home_of(row, mask);
         loop {
-            let slot = self.slots[at];
-            debug_assert!(slot != EMPTY, "the row being moved has a slot");
-            if slot != EMPTY && (slot & 0x00FF_FFFF) as usize == from {
-                self.slots[at] =
-                    (slot & 0xFF00_0000) | u32::try_from(to).expect("a row index fits in 24 bits");
-                return;
+            debug_assert!(self.slots[at] != EMPTY, "the row being moved has a slot");
+            if self.slots[at] & ROW == want {
+                return at;
             }
             at = (at + 1) & mask;
         }
@@ -713,7 +773,11 @@ impl<V: Copy> Elements<V> {
         let want = self.rows.len() + 1;
         crate::grow::reserve(&mut self.rows, 1);
         crate::grow::reserve(&mut self.vals, 1);
-        if want * LOAD_DEN > self.slots.len() * LOAD_NUM {
+        // The markers are in here because they are what a probe has to walk
+        // past, so a table churned in place rebuilds on the same schedule as one
+        // that only grows. A rebuild the markers alone triggered comes back the
+        // same size or smaller and clears every one of them.
+        if (want + self.dead) * LOAD_DEN > self.slots.len() * LOAD_NUM {
             self.grow_to(slots_for(want));
         }
     }
@@ -728,11 +792,12 @@ impl<V: Copy> Elements<V> {
         let slots = slots.max(MIN_SLOTS).next_power_of_two();
         let mask = slots - 1;
         let old = std::mem::replace(&mut self.slots, vec![EMPTY; slots].into_boxed_slice());
+        self.dead = 0;
         for &slot in &old {
-            if slot == EMPTY {
+            if slot & ROW == ROW {
                 continue;
             }
-            let row = (slot & 0x00FF_FFFF) as usize;
+            let row = (slot & ROW) as usize;
             let mut at = self.home_of(row, mask);
             while self.slots[at] != EMPTY {
                 at = (at + 1) & mask;
@@ -1176,17 +1241,167 @@ mod tests {
         assert!(s.contains(b"a"));
     }
 
-    /// The empty marker is all ones, and a live slot cannot be all ones however
-    /// the tag comes out, because a row index only ever occupies 24 bits and the
-    /// table refuses to hold enough rows to fill them.
+    /// Both markers have their row bits all ones and a live slot never does,
+    /// however the tag comes out, because the table refuses to hold enough rows
+    /// to fill twenty four bits.
     #[test]
-    fn no_live_slot_can_look_empty() {
+    fn no_live_slot_can_look_like_a_marker() {
         let mut s = Set::new();
         for i in 0..2000u32 {
             s.insert(format!("m{i}").as_bytes(), ()).expect("room");
         }
-        assert_eq!(s.slots.iter().filter(|v| **v != EMPTY).count(), s.len());
-        const { assert!(MAX_ROWS < 0x00FF_FFFF, "a row index is never all ones") }
+        let live = s.slots.iter().filter(|v| **v & ROW != ROW).count();
+        assert_eq!(live, s.len());
+        assert_eq!(s.dead, 0, "nothing has been removed yet");
+        const { assert!(MAX_ROWS < ROW as usize, "a row index is never all ones") }
+    }
+
+    /// Every live row is reachable by name and by row index, every slot is one
+    /// of the three things a slot may be, and there is always somewhere for a
+    /// probe to stop.
+    fn check(s: &Set, names: &[Vec<u8>]) {
+        assert_eq!(s.len(), names.len());
+        let mut live = 0usize;
+        let mut dead = 0usize;
+        for &slot in &s.slots {
+            if slot == EMPTY {
+            } else if slot == TOMB {
+                dead += 1;
+            } else {
+                assert!(slot & ROW != ROW, "a slot is live, empty or dead");
+                assert!(((slot & ROW) as usize) < s.len(), "a live slot names a row");
+                live += 1;
+            }
+        }
+        assert_eq!(live, s.len(), "one live slot per row and no more");
+        assert_eq!(dead, s.dead, "the dead count is what is in the array");
+        assert!(
+            s.len() + s.dead <= s.slots.len() * LOAD_NUM / LOAD_DEN,
+            "there is always an empty slot left for a probe to stop at"
+        );
+        for (i, name) in names.iter().enumerate() {
+            assert_eq!(
+                s.index_of(name),
+                Some(i),
+                "{name:?} is not where it was put"
+            );
+            assert!(s.slot_of(i) < s.slots.len(), "row {i} has no slot");
+        }
+    }
+
+    #[test]
+    fn a_removal_leaves_the_table_whole() {
+        let names: Vec<Vec<u8>> = (0..500u32).map(|i| format!("m{i}").into_bytes()).collect();
+        let mut s = Set::new();
+        for name in &names {
+            s.insert(name, ()).expect("room");
+        }
+
+        // Every third one out, back to front, so the dense row array's swap
+        // never moves something that has already been checked.
+        let mut live = names.clone();
+        for i in (0..live.len()).rev().step_by(3) {
+            let gone = live.swap_remove(i);
+            assert!(s.remove(&gone).is_some(), "{gone:?} was there");
+        }
+        check(&s, &live);
+        for name in names.iter().filter(|n| !live.contains(n)) {
+            assert!(!s.contains(name), "{name:?} came back");
+        }
+    }
+
+    /// The case the marker count exists for. Without it this loop leaves an
+    /// array with no empty slot in it and the next probe never stops.
+    #[test]
+    fn a_table_churned_in_place_does_not_fill_up_with_markers() {
+        let mut s = Set::new();
+        for i in 0..1000u32 {
+            s.insert(format!("m{i}").as_bytes(), ()).expect("room");
+        }
+        let slots = s.slots.len();
+
+        for i in 1000..100_000u32 {
+            let gone = format!("m{}", i - 1000);
+            assert!(s.remove(gone.as_bytes()).is_some());
+            s.insert(format!("m{i}").as_bytes(), ()).expect("room");
+            assert_eq!(s.len(), 1000);
+        }
+        assert_eq!(s.slots.len(), slots, "the array is the size it started at");
+        let live: Vec<Vec<u8>> = (99_000..100_000u32)
+            .map(|i| format!("m{i}").into_bytes())
+            .collect();
+        for name in &live {
+            assert!(s.contains(name), "{name:?} is missing after the churn");
+        }
+    }
+
+    /// A drain collects after itself. Every removal that meets an empty slot on
+    /// its right takes the markers behind it with it, and by the time the last
+    /// member is gone there is nothing left in the array at all.
+    #[test]
+    fn emptying_a_set_a_member_at_a_time_leaves_nothing_behind() {
+        let names: Vec<Vec<u8>> = (0..2000u32).map(|i| format!("m{i}").into_bytes()).collect();
+        let mut s = Set::new();
+        for name in &names {
+            s.insert(name, ()).expect("room");
+        }
+        let slots = s.slots.len();
+        for name in &names {
+            assert!(s.remove(name).is_some(), "{name:?} was there");
+        }
+        assert!(s.is_empty());
+        assert_eq!(s.dead, 0, "the drain cleared its own markers");
+        assert!(s.slots.iter().all(|v| *v == EMPTY));
+        for name in &names {
+            assert!(!s.contains(name), "{name:?} came back");
+        }
+
+        // And refilling reuses the array rather than growing past it.
+        for name in &names {
+            s.insert(name, ()).expect("room");
+        }
+        check(&s, &names);
+        assert_eq!(s.slots.len(), slots, "the array is the size it was");
+    }
+
+    /// The invariant the probe bound rests on. Live plus dead never goes up on a
+    /// removal, so an unsuccessful probe is never longer after one than before.
+    #[test]
+    fn a_removal_never_makes_the_array_fuller() {
+        let names: Vec<Vec<u8>> = (0..3000u32).map(|i| format!("m{i}").into_bytes()).collect();
+        let mut s = Set::new();
+        for name in &names {
+            s.insert(name, ()).expect("room");
+        }
+        let mut was = s.len() + s.dead;
+        // Out of order, so the runs are broken up rather than eaten from one end.
+        for i in (0..names.len()).rev().step_by(7) {
+            s.remove(&names[i]).expect("was there");
+            let now = s.len() + s.dead;
+            assert!(
+                now <= was,
+                "{now} occupied against {was} before the removal"
+            );
+            was = now;
+        }
+    }
+
+    #[test]
+    fn a_rebuild_clears_the_markers() {
+        let mut s = Set::new();
+        for i in 0..1000u32 {
+            s.insert(format!("m{i}").as_bytes(), ()).expect("room");
+        }
+        // Out of order, so most of these leave a marker rather than clearing one.
+        for i in (0..1000u32).step_by(2) {
+            s.remove(format!("m{i}").as_bytes()).expect("was there");
+        }
+        assert!(s.dead > 0, "some of those removals left a marker");
+        s.grow_to(s.slots.len() * 2);
+        assert_eq!(s.dead, 0, "and a rebuild took all of them");
+        for i in (1..1000u32).step_by(2) {
+            assert!(s.contains(format!("m{i}").as_bytes()));
+        }
     }
 
     /// Collect a whole scan, a page at a time, the way a client loops.
