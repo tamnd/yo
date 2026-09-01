@@ -931,9 +931,18 @@ impl<S: Sink> Engine for Wire<S> {
     fn maintain(&mut self, budget: &mut yo_reactor::Budget) {
         // The clock is the first thing the maintenance slice does, because
         // everything else in it compares against a time.
-        if budget.spend(1) {
-            self.tick();
+        if !budget.spend(1) {
+            return;
         }
+        self.tick();
+        // Then the dead keys, which is what stops a cache that writes with a
+        // deadline and never reads back from holding every key it has ever
+        // written. One unit a key looked at, so the slice bounds the sweep the
+        // same way it bounds everything else in here, and a server where nothing
+        // has a deadline spends nothing at all.
+        let looks = budget.left() as usize;
+        let spent = self.server.expire_slice(looks);
+        budget.spend(u32::try_from(spent).unwrap_or(u32::MAX));
     }
 }
 
