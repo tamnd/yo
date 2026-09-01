@@ -30,10 +30,26 @@ use crate::evict;
 use crate::hash::{self, Hash};
 use crate::list::{self, List};
 use crate::set::{self, Set};
-use crate::slab::Slab;
+use crate::slab::{Bytes, Slab};
 use crate::ttl::{self, Applied, Ask, Cond};
 use crate::value::{self, Kind};
 use crate::zset::{self, Zset};
+
+/// Every collection already answered this question, and this is the answer said
+/// once more in a shape the slab can ask for without knowing what it is holding.
+///
+/// Here rather than in the five type files because it is one fact about the
+/// keyspace and not five facts about five types, and because a reader looking
+/// for how the memory total is kept should find it next to the slabs it counts.
+macro_rules! bytes {
+    ($($t:ty),*) => { $(impl Bytes for $t {
+        #[inline]
+        fn memory_bytes(&self) -> usize {
+            <$t>::memory_bytes(self)
+        }
+    })* };
+}
+bytes!(Set, Hash, List, Zset, Array);
 
 /// One database: every key, whatever type it holds.
 pub struct Keyspace {
@@ -1184,19 +1200,60 @@ impl Keyspace {
     }
 
     /// Bytes held by the index, the arena and every body hanging off them.
+    ///
+    /// Asks every collection, so this is O(the number of collections) and is for
+    /// the places that want the number exactly and are asked for it rarely:
+    /// `INFO memory`, `MEMORY USAGE` and the tests.
+    /// [`Keyspace::settled_memory_bytes`] is the one a memory limit uses.
     #[inline]
     pub fn memory_bytes(&self) -> usize {
+        self.slab_bytes()
+            + self.sets.value_bytes()
+            + self.hashes.value_bytes()
+            + self.lists.value_bytes()
+            + self.zsets.value_bytes()
+            + self.arrays.value_bytes()
+    }
+
+    /// The same number, asked only of the collections that could have moved.
+    ///
+    /// See [`Slab::track_bytes`] for how that is known. With tracking on this
+    /// costs what the batch touched instead of what the database holds, which is
+    /// what lets a server with a `maxmemory` ask once a batch. With tracking off
+    /// it is [`Keyspace::memory_bytes`] and the two cannot disagree, because
+    /// they are the same sum over the same values either way.
+    #[inline]
+    pub fn settled_memory_bytes(&mut self) -> usize {
+        self.slab_bytes()
+            + self.sets.settled_bytes()
+            + self.hashes.settled_bytes()
+            + self.lists.settled_bytes()
+            + self.zsets.settled_bytes()
+            + self.arrays.settled_bytes()
+    }
+
+    /// Start or stop keeping the running total in every slab.
+    ///
+    /// One call for all five, because a limit is a property of the server and
+    /// not of a type, and a database tracking its sets but not its hashes would
+    /// answer a number that is neither of the two things it could mean.
+    pub fn track_memory(&mut self, on: bool) {
+        self.sets.track_bytes(on);
+        self.hashes.track_bytes(on);
+        self.lists.track_bytes(on);
+        self.zsets.track_bytes(on);
+        self.arrays.track_bytes(on);
+    }
+
+    /// The index, the arena and the slot arrays, none of which need asking twice.
+    #[inline]
+    fn slab_bytes(&self) -> usize {
         self.map.memory_bytes()
-            + self.sets.memory_bytes()
-            + self.sets.iter().map(Set::memory_bytes).sum::<usize>()
-            + self.hashes.memory_bytes()
-            + self.hashes.iter().map(Hash::memory_bytes).sum::<usize>()
-            + self.lists.memory_bytes()
-            + self.lists.iter().map(List::memory_bytes).sum::<usize>()
-            + self.zsets.memory_bytes()
-            + self.zsets.iter().map(Zset::memory_bytes).sum::<usize>()
-            + self.arrays.memory_bytes()
-            + self.arrays.iter().map(Array::memory_bytes).sum::<usize>()
+            + self.sets.slot_bytes()
+            + self.hashes.slot_bytes()
+            + self.lists.slot_bytes()
+            + self.zsets.slot_bytes()
+            + self.arrays.slot_bytes()
     }
 
     /// Give back one segment's worth of space if one has gone mostly dead.
