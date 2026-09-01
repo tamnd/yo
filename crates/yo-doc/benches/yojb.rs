@@ -1,0 +1,164 @@
+//! What reaching one field of a document costs, and what putting one together
+//! costs.
+//!
+//! The claim the encoding is built on is that a path read is a few header reads
+//! and a seek, and that the size of the document does not come into it. That is
+//! the claim G15 turns into a gate: an indexed path equality lookup in the same
+//! cost class as `HGET`. The index half of that comes later, but the half that
+//! is here, reaching the field once the document is in hand, is measured now so
+//! that the gate has a floor to stand on.
+//!
+//! The rows to watch:
+//!
+//!   - `get` against the member count. A binary search is logarithmic, so this
+//!     should climb slowly and never step.
+//!   - `get` against the payload size at a fixed member count. This should be
+//!     flat, because a lookup reads the entry table and the keys and never the
+//!     value region.
+//!   - `path` at four levels against a one level `get`. Four times a bit more
+//!     than one, and no allocation either way.
+//!
+//! # Reading these on a machine someone else is using
+//!
+//! Same rule as `yo-kv`'s benches: criterion's mean picks up whatever else the
+//! box is doing, so the comparable number is the minimum per iteration across
+//! samples, out of `target/criterion/<group>/<id>/new/sample.json`.
+
+use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
+use std::hint::black_box;
+use yo_doc::{Builder, Value};
+
+/// An object of `n` members, each holding a string of `pad` bytes.
+fn object(n: usize, pad: usize) -> (Vec<u8>, Vec<String>) {
+    let names: Vec<String> = (0..n).map(|i| format!("field{i:04}")).collect();
+    let filler = "x".repeat(pad);
+    let mut b = Builder::new();
+    b.begin_object().expect("open");
+    for name in &names {
+        b.key(name.as_bytes()).expect("key");
+        b.text(&filler).expect("value");
+    }
+    b.end_object().expect("close");
+    (b.finish().expect("finished").to_vec(), names)
+}
+
+/// A lookup against the number of members, at a payload small enough that the
+/// whole document is in cache.
+fn bench_get(c: &mut Criterion) {
+    let mut g = c.benchmark_group("yojb/get");
+    for n in [4usize, 16, 64, 256, 1024] {
+        let (bytes, names) = object(n, 8);
+        let v = Value::new(&bytes).expect("readable");
+        g.bench_with_input(BenchmarkId::from_parameter(n), &n, |b, _| {
+            let mut i = 0usize;
+            b.iter(|| {
+                i = (i + 1) % n;
+                black_box(v.get(black_box(names[i].as_bytes())))
+            });
+        });
+    }
+    g.finish();
+}
+
+/// The same lookup against the size of the values, at a fixed member count.
+///
+/// The whole point of an entry table with a header copy in it is that this row
+/// is flat. If it climbs, a lookup is touching the value region and the layout
+/// is wrong.
+fn bench_get_over_payload(c: &mut Criterion) {
+    let mut g = c.benchmark_group("yojb/get_padded");
+    for pad in [8usize, 64, 512, 4096] {
+        let (bytes, names) = object(32, pad);
+        let v = Value::new(&bytes).expect("readable");
+        g.bench_with_input(BenchmarkId::from_parameter(pad), &pad, |b, _| {
+            let mut i = 0usize;
+            b.iter(|| {
+                i = (i + 1) % names.len();
+                black_box(v.get(black_box(names[i].as_bytes())))
+            });
+        });
+    }
+    g.finish();
+}
+
+/// A four level path against the one level lookup it is made of.
+fn bench_path(c: &mut Criterion) {
+    let mut b = Builder::new();
+    b.begin_object().expect("open");
+    b.key(b"order").expect("key");
+    b.begin_object().expect("open");
+    b.key(b"lines").expect("key");
+    b.begin_array().expect("open");
+    for i in 0..16i64 {
+        b.begin_object().expect("open");
+        b.key(b"sku").expect("key");
+        b.int(i).expect("value");
+        b.key(b"note").expect("key");
+        b.text("a line with enough text on it to move the offsets about")
+            .expect("value");
+        b.end_object().expect("close");
+    }
+    b.end_array().expect("close");
+    b.end_object().expect("close");
+    b.key(b"id").expect("key");
+    b.int(99).expect("value");
+    b.end_object().expect("close");
+    let bytes = b.finish().expect("finished").to_vec();
+    let v = Value::new(&bytes).expect("readable");
+
+    let mut g = c.benchmark_group("yojb/path");
+    g.bench_function("one_level", |b| {
+        b.iter(|| black_box(v.path(black_box("$.id"))));
+    });
+    g.bench_function("four_levels", |b| {
+        b.iter(|| black_box(v.path(black_box("$.order.lines[9].sku"))));
+    });
+    g.finish();
+}
+
+/// Putting a document together, which is what a write costs before it reaches
+/// the log.
+fn bench_build(c: &mut Criterion) {
+    let mut g = c.benchmark_group("yojb/build");
+    for n in [4usize, 16, 64, 256] {
+        let names: Vec<String> = (0..n).map(|i| format!("field{i:04}")).collect();
+        g.bench_with_input(BenchmarkId::from_parameter(n), &n, |b, _| {
+            let mut builder = Builder::new();
+            b.iter(|| {
+                builder.clear();
+                builder.begin_object().expect("open");
+                for (i, name) in names.iter().enumerate() {
+                    builder.key(name.as_bytes()).expect("key");
+                    builder.int(i as i64).expect("value");
+                }
+                builder.end_object().expect("close");
+                black_box(builder.finish().expect("finished").len())
+            });
+        });
+    }
+    g.finish();
+}
+
+/// Checking a whole document, which is what a read of bytes nobody trusts
+/// costs.
+fn bench_validate(c: &mut Criterion) {
+    let mut g = c.benchmark_group("yojb/validate");
+    for n in [16usize, 256] {
+        let (bytes, _) = object(n, 16);
+        let v = Value::new(&bytes).expect("readable");
+        g.bench_with_input(BenchmarkId::from_parameter(n), &n, |b, _| {
+            b.iter(|| black_box(v.validate()));
+        });
+    }
+    g.finish();
+}
+
+criterion_group!(
+    benches,
+    bench_get,
+    bench_get_over_payload,
+    bench_path,
+    bench_build,
+    bench_validate
+);
+criterion_main!(benches);

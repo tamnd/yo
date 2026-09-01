@@ -15,7 +15,7 @@
 # reserve = false means the row is audited but deliberately never published to
 # (dx/16 §11): port-PR channels, and names we refuse to squat.
 #
-# The seventeen `yo-*` rows on crates.io are not reservations. They are the
+# The eighteen `yo-*` rows on crates.io are not reservations. They are the
 # workspace members `yodb` is built out of, and crates.io has no way to publish
 # a crate without publishing everything it depends on, so the release workflow
 # claims them the first time it runs. They sit at `free` until it does.
@@ -109,6 +109,16 @@ probed    = "2026-09-01"
 owner     = ""
 fallback  = ""
 note      = "v0.3.9 owner=tamnd"
+
+[[name]]
+registry  = "crates.io"
+name      = "yo-doc"
+namespace = ""
+state     = "free"
+probed    = "2026-09-01"
+owner     = ""
+fallback  = ""
+note      = "new workspace member, the release workflow claims it"
 
 [[name]]
 registry  = "crates.io"
