@@ -9,6 +9,7 @@ use yo_index::RawMap;
 use yo_shape::{Desc, Tag};
 
 use crate::counter::Counter;
+use crate::doc::{Docs, Document, Documents};
 use crate::keys::Keys;
 use crate::keyspace::Strings;
 use crate::map::Map;
@@ -87,7 +88,94 @@ pub(crate) struct Inner {
 pub(crate) struct Collection {
     pub(crate) name: String,
     pub(crate) desc: Desc,
-    pub(crate) data: RawMap,
+    pub(crate) data: Data,
+}
+
+/// What a collection holds, which is decided by the handle it was opened
+/// through and never changes afterwards.
+///
+/// One catalogue covers both kinds rather than two, because a name is a name:
+/// opening `orders` as a map and then as a document collection has to be the
+/// same refusal as opening it as a map of the wrong type, and it is, since the
+/// shapes differ and [`yo_shape::check`] compares them before this is reached.
+// The two variants are different sizes and that is the point. A map is the hot
+// path and it stays where it is, so the one that would have made this enum wide
+// is the one behind a pointer.
+#[allow(clippy::large_enum_variant)]
+pub(crate) enum Data {
+    Map(RawMap),
+    /// Boxed because a document collection carries its indexes and its build
+    /// buffer, and a map should not pay for the size of one.
+    Docs(Box<Documents>),
+}
+
+impl Data {
+    pub(crate) fn memory_bytes(&self) -> usize {
+        match self {
+            Data::Map(m) => m.memory_bytes(),
+            Data::Docs(d) => d.docs.memory_bytes(),
+        }
+    }
+
+    /// The map inside, for a handle that was handed out against one.
+    ///
+    /// # Panics
+    ///
+    /// Never, from outside: a `Map<K, V>` handle only exists for a collection
+    /// whose shape is a map, and a shape cannot change under a name.
+    #[track_caller]
+    pub(crate) fn map(&self) -> &RawMap {
+        match self {
+            Data::Map(m) => m,
+            Data::Docs(_) => wrong_kind(),
+        }
+    }
+
+    /// The same, for a write.
+    ///
+    /// # Panics
+    ///
+    /// The same as [`Data::map`].
+    #[track_caller]
+    pub(crate) fn map_mut(&mut self) -> &mut RawMap {
+        match self {
+            Data::Map(m) => m,
+            Data::Docs(_) => wrong_kind(),
+        }
+    }
+
+    /// The documents inside, for a handle that was handed out against them.
+    ///
+    /// # Panics
+    ///
+    /// The same as [`Data::map`].
+    #[track_caller]
+    pub(crate) fn docs(&self) -> &yo_doc::Docs {
+        match self {
+            Data::Docs(d) => &d.docs,
+            Data::Map(_) => wrong_kind(),
+        }
+    }
+
+    /// The same, for a write.
+    ///
+    /// # Panics
+    ///
+    /// The same as [`Data::map`].
+    #[track_caller]
+    pub(crate) fn docs_mut(&mut self) -> &mut Documents {
+        match self {
+            Data::Docs(d) => d,
+            Data::Map(_) => wrong_kind(),
+        }
+    }
+}
+
+#[track_caller]
+fn wrong_kind() -> ! {
+    panic!(
+        "this handle and the collection it names hold different things, which the shape check is there to make impossible. Please report this as a bug"
+    )
 }
 
 /// A shared, cheap pointer to one database.
@@ -139,6 +227,14 @@ impl Handle {
     }
 }
 
+/// Put the indexes `T` declares on a collection.
+fn declare<T: Document>(data: &mut Documents) -> Result<()> {
+    for (path, kind) in T::INDEXES {
+        data.docs.create_index_bytes(path.as_bytes(), *kind)?;
+    }
+    Ok(())
+}
+
 /// The error a call made from inside another call's callback gets.
 ///
 /// A database that panics because of how the caller nested two of its own
@@ -179,13 +275,75 @@ impl Db {
                         inner.collections.push(Collection {
                             name: name.to_owned(),
                             desc,
-                            data: RawMap::new(),
+                            data: Data::Map(RawMap::new()),
                         });
                         Ok(inner.collections.len() - 1)
                     }
                 },
             )?;
         Ok(Map::new(self.db.clone(), at, tag))
+    }
+
+    /// Open a collection of documents, creating it if this is the first time.
+    ///
+    /// `T` is the collection's shape, exactly as it is for [`Db::map`], and it
+    /// also carries the indexes: every field the type marked with `#[yo(index)]`
+    /// or one of its friends is declared here, so a collection cannot be opened
+    /// without the indexes its queries need.
+    ///
+    /// ```
+    /// use yo::Yo;
+    ///
+    /// #[derive(Yo)]
+    /// struct Order {
+    ///     #[yo(id)]
+    ///     id: u64,
+    ///     #[yo(index)]
+    ///     status: String,
+    /// }
+    ///
+    /// let db = yo::open(yo::MEMORY)?;
+    /// let orders = db.docs::<Order>("orders")?;
+    ///
+    /// orders.put(&Order { id: 7, status: "open".to_owned() })?;
+    /// assert_eq!(orders.find(Order::STATUS, "open")?.len(), 1);
+    /// # Ok::<(), yo::Error>(())
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// [`Code::ShapeMismatch`] when the name is already a collection of another
+    /// shape, and [`Code::Invalid`] for a declared index whose path is not one.
+    pub fn docs<T: Document>(&self, name: &str) -> Result<Docs<T>> {
+        let mut desc = Desc::new();
+        T::describe(&mut desc);
+        let tag = desc.tag();
+
+        let at =
+            self.db.write(
+                |inner| match inner.collections.iter().position(|c| c.name == name) {
+                    Some(at) => {
+                        yo_shape::check(name, &inner.collections[at].desc, &desc, None)?;
+                        // The shape matched, so the indexes are the ones already
+                        // here and declaring them again is nothing at all. This runs
+                        // anyway because it is what will create them on a collection
+                        // read back off disk in M5.
+                        declare::<T>(inner.collections[at].data.docs_mut())?;
+                        Ok(at)
+                    }
+                    None => {
+                        let mut data = Documents::new();
+                        declare::<T>(&mut data)?;
+                        inner.collections.push(Collection {
+                            name: name.to_owned(),
+                            desc,
+                            data: Data::Docs(Box::new(data)),
+                        });
+                        Ok(inner.collections.len() - 1)
+                    }
+                },
+            )?;
+        Ok(Docs::new(self.db.clone(), at, tag))
     }
 
     /// The Redis string keyspace.
