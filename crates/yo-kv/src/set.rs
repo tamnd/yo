@@ -823,9 +823,17 @@ mod tests {
     /// something every `cargo test` should pay for, and it prints rather than
     /// asserts because the number it prints is the thing being reported.
     ///
-    /// Two shapes, because the gate names one of them and the other is what
-    /// most sets actually hold. Integers first, at every band an all integer
-    /// set passes through, and then strings, which never see the intset at all.
+    /// Three shapes, because the gate names one of them and the other two are
+    /// what most sets actually hold. Integers first, at every band an all
+    /// integer set passes through, then the same counts of integers scattered
+    /// over a wide range, then strings, which never see the intset at all.
+    ///
+    /// The scattered row is there because the dense one is the most favourable
+    /// input this structure will ever be given and a gate read off it would be
+    /// a gate read off the easy case. `0..n` is sorted, contiguous and arrives
+    /// in order, so every run fills to `RUN_MAX` and never splits. Real integer
+    /// sets are ids with holes in them, arriving in whatever order the writer
+    /// had, and the number that matters is the one they produce.
     #[test]
     #[ignore = "a measurement, run it by name"]
     fn measure_bytes_per_member() {
@@ -840,6 +848,24 @@ mod tests {
                 band(&s),
                 s.memory_bytes(),
                 s.memory_bytes() as f64 / n as f64
+            );
+        }
+        // The same counts, scattered over a range sixteen times as wide and
+        // arriving out of order. A cheap multiplicative shuffle rather than a
+        // real generator, because what this needs is holes and disorder and not
+        // statistical quality.
+        for n in [512usize, 1_000, 100_000, 1_000_000] {
+            let mut s = Set::new();
+            for i in 0..n {
+                let v = (i as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15) % (n as u64 * 16);
+                s.add(v.to_string().as_bytes(), &limits);
+            }
+            println!(
+                "sparse n={n:<9} band={:<10} total={:<10} members={:<9} per_member={:.2}",
+                band(&s),
+                s.memory_bytes(),
+                s.len(),
+                s.memory_bytes() as f64 / s.len() as f64
             );
         }
         // Sixteen byte members, so the payload is a round number and the
