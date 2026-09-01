@@ -4,6 +4,18 @@ What each release changed, why, and what it costs you. The versioning rules and 
 
 While the major is 0, a minor release may break anything, including the on-disk format. The format is frozen at `M6`, not before.
 
+## 0.3.12 — 2026-09-01
+
+Two pull requests and both are fixes, so this is a patch. It exists because 0.3.10 and 0.3.11 were both tagged with a crash in them and a tag never moves, so neither of those two reached crates.io. Use this one.
+
+The `.yo` layout is untouched. A file written by any 0.3.x opens unchanged.
+
+### Fixed
+
+- **A RESTORE payload could take the server down by claiming more elements than it contained.** An element count in an RDB payload is four bytes wide and the payload is whatever length it happens to be, so nothing in the format stops a six byte payload from saying it holds two billion members. Every reader that takes a count hands it straight to a sizing hint, which is the whole point of a hint, and a hint of two billion reserves thirty four gigabytes before a single element has been read. On Linux the allocator refuses and the process aborts, which turns one bad payload from one client into an outage for everybody. The count is now checked against the bytes that are left, since an element takes at least one byte however it is encoded, and it is checked in one place so every reader gets it rather than the ones somebody remembered. The bound is deliberately loose. It is not trying to work out the true minimum for each type, only to keep an allocation in the same order of magnitude as the bytes that arrived.
+- **Two things kept that from being caught, and both are worth writing down.** There was already a test throwing arbitrary bytes at the reader, and it could not catch this because an out of memory abort is not a panic, so a test that only asserts nothing panics will watch the process die and report nothing. And macOS overcommits, so the reservation succeeded on the development machine and only ever failed on Linux and Windows, which is to say in CI on the release tag and nowhere a person would see it before then.
+- **The Windows job was red on a test that was asserting a property of the runner.** A `MIGRATE` at a port nothing is listening on gets one of two IOERR lines depending on what the host does with a packet sent at a closed port. A machine that answers with a reset makes the connect fail immediately, which is reported as a write failure because that is the message a real server gives for it. A machine whose firewall drops the packet never answers at all and the connect times out, which is the connect line. The Windows runners drop and everything else resets. The test pinned the write line and now accepts either, and what it still pins is what a client can act on, which is that the failure is an IOERR and that the key is still here to try again with.
+
 ## 0.3.11 — 2026-09-01
 
 Five pull requests, no milestone, so this is a patch. The keyspace group is finished, and the rest of it is what happened when the new commands got pointed at a real Redis instead of at our own tests.
