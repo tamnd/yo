@@ -771,7 +771,7 @@ impl<V: Copy> Elements<V> {
         crate::grow::reserve(&mut self.vals, 1);
         if want * LOAD_DEN > self.slots.len() * LOAD_NUM {
             let need = slots_for(want);
-            let next = crate::grow::next_capacity(self.slots.len(), need, size_of::<u32>());
+            let next = (self.slots.len() + self.slots.len() / 2).max(need);
             self.grow_to(next);
         }
     }
