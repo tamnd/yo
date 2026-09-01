@@ -554,6 +554,20 @@ impl Hash {
         }
     }
 
+    /// The deadline on the field at `index`, if it has one.
+    ///
+    /// The positional twin of [`Hash::deadline`], which takes a field name.
+    /// `DUMP` is what wants this: it is already walking by index and looking the
+    /// name back up to ask about its deadline would mean formatting every
+    /// integer field into digits just to hand them straight back.
+    #[must_use]
+    pub fn deadline_at(&self, index: usize) -> Option<u64> {
+        match &self.body {
+            Body::Packed(p) => p.deadline(index * p.step()),
+            Body::Table(t) => t.ttl.get(index),
+        }
+    }
+
     /// Every field and its value, in insertion order.
     pub fn iter(&self) -> impl Iterator<Item = (Text<'_>, Text<'_>)> {
         (0..self.len()).map(|i| self.at(i).expect("index is under the length"))

@@ -1,6 +1,6 @@
-//! CRC16 for slot placement and CRC32C for integrity.
+//! CRC16 for slot placement, CRC32C for integrity, CRC64 for the file format.
 //!
-//! Two different polynomials for two different jobs. CRC16 is Redis's XMODEM
+//! Three different polynomials for three different jobs. CRC16 is Redis's XMODEM
 //! variant and it exists here because `slot = crc16(key) & 0x3FFF` is how a key
 //! reaches a shard (`04` section 1). Getting it wrong does not corrupt anything,
 //! it just makes us incompatible with every Redis cluster client, so the hash
@@ -8,6 +8,12 @@
 //!
 //! CRC32C is Castagnoli, the same polynomial SSE4.2 and the ARM CRC extension
 //! implement in hardware, and it is what guards pages and superblocks (`07`).
+//!
+//! CRC64 is the Jones polynomial and it is here for one reason only: it is the
+//! eight bytes on the end of an RDB payload, so `DUMP` cannot produce something
+//! a real Redis will accept and `RESTORE` cannot reject a corrupt payload
+//! without it. Nothing else in the engine uses it, and nothing else should,
+//! because CRC32C has hardware behind it and this does not.
 
 // ---------------------------------------------------------------------------
 // CRC16 / XMODEM, polynomial 0x1021, initial value 0, not reflected.
@@ -151,6 +157,48 @@ unsafe fn crc32c_sse42(crc: u32, data: &[u8]) -> u32 {
     !c
 }
 
+// ---------------------------------------------------------------------------
+// CRC64 / Jones, polynomial 0xad93d23594c935a9, reflected as 0x95ac9329ac4bc9b5.
+// ---------------------------------------------------------------------------
+
+const fn crc64_table() -> [u64; 256] {
+    let mut table = [0u64; 256];
+    let mut i = 0usize;
+    while i < 256 {
+        let mut crc = i as u64;
+        let mut bit = 0;
+        while bit < 8 {
+            crc = if crc & 1 != 0 {
+                (crc >> 1) ^ 0x95AC_9329_AC4B_C9B5
+            } else {
+                crc >> 1
+            };
+            bit += 1;
+        }
+        table[i] = crc;
+        i += 1;
+    }
+    table
+}
+
+static CRC64_TABLE: [u64; 256] = crc64_table();
+
+/// CRC64 over `data`, continuing from `crc`. Start with 0.
+///
+/// The variant Redis puts on the end of an RDB payload. Published descriptions
+/// of crc-64-jones give it an initial value of all ones, and Redis's own source
+/// comment says so too, but the function Redis actually calls starts from the
+/// value handed in and that value is zero. Copy the code, not the comment, or
+/// every payload we produce fails somebody else's checksum.
+#[inline]
+pub fn crc64(crc: u64, data: &[u8]) -> u64 {
+    let mut c = crc;
+    for &b in data {
+        c = (c >> 8) ^ CRC64_TABLE[((c ^ b as u64) & 0xff) as usize];
+    }
+    c
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -208,5 +256,20 @@ mod tests {
         let one_shot = crc32c(0, &buf);
         let split = crc32c(crc32c(0, &buf[..100]), &buf[100..]);
         assert_eq!(one_shot, split);
+    }
+
+    /// The value Redis prints from its own self test in `crc64.c`. This is the
+    /// whole reason the function is here, so if it moves nothing we produce is
+    /// worth sending anywhere.
+    #[test]
+    fn crc64_matches_the_redis_self_test() {
+        assert_eq!(crc64(0, b"123456789"), 0xe9c6_d914_c4b8_d9ca);
+        assert_eq!(crc64(0, b""), 0);
+    }
+
+    #[test]
+    fn crc64_is_resumable() {
+        let buf: Vec<u8> = (0..256u32).map(|i| i as u8).collect();
+        assert_eq!(crc64(0, &buf), crc64(crc64(0, &buf[..100]), &buf[100..]));
     }
 }

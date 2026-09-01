@@ -845,6 +845,24 @@ mod tests {
             self.flow(parts).1
         }
 
+        /// Run one command and answer with the bytes exactly as written.
+        ///
+        /// [`Fixture::run`] goes through `from_utf8_lossy`, which is fine for
+        /// every reply that is text and destroys a `DUMP` payload, since a
+        /// payload is arbitrary bytes and a checksum on the end of them.
+        fn raw(&mut self, parts: &[&[u8]]) -> Vec<u8> {
+            let wire = encode(parts);
+            self.argv.decode(&wire, &Limits::default()).unwrap();
+            self.out.clear();
+            execute(
+                &mut self.server,
+                &mut self.session,
+                Args::new(&self.argv, &wire),
+                &mut self.out,
+            );
+            self.out.as_slice().to_vec()
+        }
+
         /// Move every clock in the server on by `ms`.
         fn advance(&mut self, ms: u64) {
             for db in 0..DATABASES {
@@ -1384,6 +1402,231 @@ mod tests {
         assert_eq!(
             f.run(&[b"WAITAOF", b"1", b"0", b"-5"]),
             "-ERR timeout is negative\r\n"
+        );
+    }
+
+    /// The bytes inside a bulk reply, with the header and the trailing break
+    /// taken off. Every `DUMP` test needs this and none of them care how the
+    /// length was written.
+    fn payload(reply: &[u8]) -> Vec<u8> {
+        let head = reply.windows(2).position(|w| w == b"\r\n").unwrap();
+        reply[head + 2..reply.len() - 2].to_vec()
+    }
+
+    #[test]
+    fn a_value_survives_a_dump_and_a_restore() {
+        let mut f = Fixture::new();
+        f.run(&[b"SET", b"s", b"hello"]);
+        f.run(&[b"RPUSH", b"l", b"a", b"b", b"c"]);
+        f.run(&[b"SADD", b"t", b"1", b"2", b"3"]);
+        f.run(&[b"SADD", b"u", b"x", b"y"]);
+        f.run(&[b"HSET", b"h", b"f", b"1", b"g", b"2"]);
+        f.run(&[b"ZADD", b"z", b"1.5", b"a", b"2.5", b"b"]);
+
+        for key in [&b"s"[..], b"l", b"t", b"u", b"h", b"z"] {
+            let mut copy = key.to_vec();
+            copy.push(b'2');
+            let bytes = payload(&f.raw(&[b"DUMP", key]));
+            assert_eq!(f.run(&[b"RESTORE", &copy, b"0", &bytes]), "+OK\r\n");
+            assert_eq!(f.run(&[b"TYPE", &copy]), f.run(&[b"TYPE", key]));
+        }
+
+        assert_eq!(f.run(&[b"GET", b"s2"]), "$5\r\nhello\r\n");
+        assert_eq!(
+            f.run(&[b"LRANGE", b"l2", b"0", b"-1"]),
+            "*3\r\n$1\r\na\r\n$1\r\nb\r\n$1\r\nc\r\n"
+        );
+        assert_eq!(sorted(&f.run(&[b"SMEMBERS", b"t2"])), ["1", "2", "3"]);
+        assert_eq!(sorted(&f.run(&[b"SMEMBERS", b"u2"])), ["x", "y"]);
+        assert_eq!(f.run(&[b"HGET", b"h2", b"g"]), "$1\r\n2\r\n");
+        assert_eq!(f.run(&[b"ZSCORE", b"z2", b"b"]), "$3\r\n2.5\r\n");
+        // The encoding survives too, since the payload names the plainest legal
+        // type and the loader puts the value back on the rung it belongs on.
+        assert_eq!(
+            f.run(&[b"OBJECT", b"ENCODING", b"t2"]),
+            f.run(&[b"OBJECT", b"ENCODING", b"t"])
+        );
+    }
+
+    #[test]
+    fn a_dumped_hash_keeps_its_field_deadlines() {
+        let mut f = Fixture::new();
+        f.run(&[b"HSET", b"h", b"keep", b"1", b"go", b"2"]);
+        assert_eq!(
+            f.run(&[b"HEXPIRE", b"h", b"100", b"FIELDS", b"1", b"go"]),
+            "*1\r\n:1\r\n"
+        );
+        let bytes = payload(&f.raw(&[b"DUMP", b"h"]));
+        assert_eq!(f.run(&[b"RESTORE", b"h2", b"0", &bytes]), "+OK\r\n");
+        assert_eq!(
+            f.run(&[b"HTTL", b"h2", b"FIELDS", b"2", b"keep", b"go"]),
+            "*2\r\n:-1\r\n:100\r\n"
+        );
+    }
+
+    #[test]
+    fn dump_leaves_the_deadline_behind_and_restore_is_given_a_new_one() {
+        let mut f = Fixture::new();
+        f.run(&[b"SET", b"a", b"v", b"EX", b"100"]);
+        let bytes = payload(&f.raw(&[b"DUMP", b"a"]));
+        assert_eq!(f.run(&[b"RESTORE", b"b", b"0", &bytes]), "+OK\r\n");
+        assert_eq!(f.run(&[b"TTL", b"b"]), ":-1\r\n");
+        assert_eq!(f.run(&[b"RESTORE", b"c", b"5000", &bytes]), "+OK\r\n");
+        assert_eq!(f.run(&[b"TTL", b"c"]), ":5\r\n");
+        // An absolute deadline that has already gone is not an error. The key is
+        // not created and the reply is the same OK a live one gets.
+        assert_eq!(
+            f.run(&[b"RESTORE", b"d", b"1", &bytes, b"ABSTTL"]),
+            "+OK\r\n"
+        );
+        assert_eq!(f.run(&[b"EXISTS", b"d"]), ":0\r\n");
+    }
+
+    #[test]
+    fn dump_answers_nothing_for_a_key_that_is_not_there() {
+        let mut f = Fixture::new();
+        assert_eq!(f.run(&[b"DUMP", b"nope"]), "$-1\r\n");
+        f.run(&[b"SET", b"gone", b"v", b"PX", b"10"]);
+        f.advance(50);
+        assert_eq!(f.run(&[b"DUMP", b"gone"]), "$-1\r\n");
+    }
+
+    #[test]
+    fn restore_refuses_a_key_that_is_there_unless_it_is_told_to_replace() {
+        let mut f = Fixture::new();
+        f.run(&[b"SET", b"a", b"first"]);
+        f.run(&[b"SET", b"b", b"second"]);
+        let bytes = payload(&f.raw(&[b"DUMP", b"b"]));
+        assert_eq!(
+            f.run(&[b"RESTORE", b"a", b"0", &bytes]),
+            "-BUSYKEY Target key name already exists.\r\n"
+        );
+        assert_eq!(f.run(&[b"GET", b"a"]), "$5\r\nfirst\r\n");
+        assert_eq!(
+            f.run(&[b"RESTORE", b"a", b"0", &bytes, b"REPLACE"]),
+            "+OK\r\n"
+        );
+        assert_eq!(f.run(&[b"GET", b"a"]), "$6\r\nsecond\r\n");
+    }
+
+    /// The busy key comes before the payload, which is not the order the
+    /// arguments read in. Whether a key is taken should not depend on whether
+    /// the bytes behind it happened to be good.
+    #[test]
+    fn restore_asks_about_the_key_before_it_looks_at_the_bytes() {
+        let mut f = Fixture::new();
+        f.run(&[b"SET", b"a", b"v"]);
+        assert_eq!(
+            f.run(&[b"RESTORE", b"a", b"0", b"rubbish"]),
+            "-BUSYKEY Target key name already exists.\r\n"
+        );
+        // And the options come before even that, so a bad FREQ beats the busy
+        // key the same way a bad DB beats a missing source in COPY.
+        assert_eq!(
+            f.run(&[b"RESTORE", b"a", b"0", b"rubbish", b"FREQ", b"300"]),
+            "-ERR Invalid FREQ value, must be >= 0 and <= 255\r\n"
+        );
+    }
+
+    #[test]
+    fn restore_can_tell_a_bad_footer_from_bad_bytes() {
+        let mut f = Fixture::new();
+        f.run(&[b"SET", b"a", b"hello"]);
+        let good = payload(&f.raw(&[b"DUMP", b"a"]));
+
+        let mut flipped = good.clone();
+        flipped[2] ^= 0x40;
+        assert_eq!(
+            f.run(&[b"RESTORE", b"b", b"0", &flipped]),
+            "-ERR DUMP payload version or checksum are wrong\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"RESTORE", b"b", b"0", b"short"]),
+            "-ERR DUMP payload version or checksum are wrong\r\n"
+        );
+        // A footer that is right over a body that is not. The type byte says
+        // string and there is nothing behind it, so the checksum agrees and the
+        // value does not exist.
+        let mut truncated = good[..1].to_vec();
+        truncated.extend_from_slice(&good[good.len() - 10..good.len() - 8]);
+        let crc = yo_common::crc::crc64(0, &truncated);
+        truncated.extend_from_slice(&crc.to_le_bytes());
+        assert_eq!(
+            f.run(&[b"RESTORE", b"b", b"0", &truncated]),
+            "-ERR Bad data format\r\n"
+        );
+        assert_eq!(f.run(&[b"EXISTS", b"b"]), ":0\r\n");
+    }
+
+    #[test]
+    fn restore_checks_the_three_numbers_a_client_can_get_wrong() {
+        let mut f = Fixture::new();
+        f.run(&[b"SET", b"a", b"v"]);
+        let bytes = payload(&f.raw(&[b"DUMP", b"a"]));
+        assert_eq!(
+            f.run(&[b"RESTORE", b"b", b"-1", &bytes]),
+            "-ERR Invalid TTL value, must be >= 0\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"RESTORE", b"b", b"0", &bytes, b"IDLETIME", b"-1"]),
+            "-ERR Invalid IDLETIME value, must be >= 0\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"RESTORE", b"b", b"0", &bytes, b"FREQ", b"256"]),
+            "-ERR Invalid FREQ value, must be >= 0 and <= 255\r\n"
+        );
+        // Both are accepted and both are then dropped, which is D-26.
+        assert_eq!(
+            f.run(&[b"RESTORE", b"b", b"0", &bytes, b"IDLETIME", b"90"]),
+            "+OK\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"RESTORE", b"c", b"0", &bytes, b"FREQ", b"200", b"REPLACE"]),
+            "+OK\r\n"
+        );
+    }
+
+    /// Neither word is refused for being the wrong one. Each is only accepted
+    /// while the other is unset, so the second of the two falls through to the
+    /// plain syntax error rather than getting a message of its own.
+    #[test]
+    fn restore_takes_idletime_or_freq_and_not_both() {
+        let mut f = Fixture::new();
+        f.run(&[b"SET", b"a", b"v"]);
+        let bytes = payload(&f.raw(&[b"DUMP", b"a"]));
+        assert_eq!(
+            f.run(&[
+                b"RESTORE",
+                b"b",
+                b"0",
+                &bytes,
+                b"IDLETIME",
+                b"1",
+                b"FREQ",
+                b"2"
+            ]),
+            "-ERR syntax error\r\n"
+        );
+        assert_eq!(
+            f.run(&[
+                b"RESTORE",
+                b"b",
+                b"0",
+                &bytes,
+                b"FREQ",
+                b"2",
+                b"IDLETIME",
+                b"1"
+            ]),
+            "-ERR syntax error\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"RESTORE", b"b", b"0", &bytes, b"FREQ"]),
+            "-ERR syntax error\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"RESTORE", b"b", b"0", &bytes, b"NOSUCH"]),
+            "-ERR syntax error\r\n"
         );
     }
 

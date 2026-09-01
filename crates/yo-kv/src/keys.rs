@@ -33,6 +33,15 @@
 //! is what `MOVE` needs. `MOVE` through `export` would clone a set of a million
 //! members and then throw the original away a line later, so the two are
 //! separate calls rather than one call with a flag.
+//!
+//! # And the same pair again, with bytes in the middle
+//!
+//! `DUMP` and `RESTORE` are the same shape one step further out. A record is a
+//! value standing on its own inside this process, and a payload is a value
+//! standing on its own outside it, so [`Keyspace::dump`] is an export followed
+//! by [`crate::rdb`] and [`Keyspace::restore`] is `rdb` followed by an import.
+//! The deadline is the one thing that does not make the trip, because `DUMP`
+//! drops it and `RESTORE` is given a fresh one.
 
 use yo_common::Result;
 
@@ -40,6 +49,7 @@ use crate::array::Array;
 use crate::hash::Hash;
 use crate::keyspace::Keyspace;
 use crate::list::List;
+use crate::rdb;
 use crate::set::Set;
 use crate::value::{self, Kind};
 use crate::zset::Zset;
@@ -58,6 +68,20 @@ pub struct Record {
 }
 
 impl Record {
+    /// A record built from parts, for a caller that has both.
+    ///
+    /// [`crate::rdb`] is that caller and there is no other. A record normally
+    /// comes out of a database and this is the one way to make one that never
+    /// was in a database, which is what a payload arriving from a client is.
+    pub(crate) const fn new(body: Body, expire_at: Option<u64>) -> Record {
+        Record { body, expire_at }
+    }
+
+    /// What it holds, for the code that has to write it down.
+    pub(crate) const fn body(&self) -> &Body {
+        &self.body
+    }
+
     /// What type this is, which the caller usually knows and sometimes does not.
     #[must_use]
     pub const fn kind(&self) -> Kind {
@@ -86,7 +110,7 @@ impl Record {
 /// catch all in front of an enum the rest of the crate keeps growing is a hole
 /// that reports itself as a panic on a live server rather than as a build error.
 #[derive(Debug, Clone)]
-enum Body {
+pub(crate) enum Body {
     String(Vec<u8>),
     Set(Set),
     Hash(Hash),
@@ -251,6 +275,73 @@ impl Keyspace {
                 self.write_slot(key, Kind::Array, slot, at);
             }
         }
+    }
+
+    /// `DUMP key`, which is a value on its own with a checksum on the end.
+    ///
+    /// `None` for a key that is not there, and for a key holding something with
+    /// no RDB shape, which today is only the sparse array and which no command
+    /// on the wire can create. Both answer the null bulk that `DUMP` gives for a
+    /// missing key, so a client cannot tell them apart and there is nothing here
+    /// for it to tell apart yet.
+    ///
+    /// The deadline is deliberately left behind. Redis's `DUMP` does the same
+    /// and the reason is that a payload has no idea how long it will be in
+    /// flight, so carrying an absolute deadline would arrive already expired and
+    /// carrying a relative one would quietly extend it. `RESTORE` takes the ttl
+    /// as an argument instead, which puts the decision on whoever knows.
+    pub fn dump(&mut self, key: &[u8]) -> Option<Vec<u8>> {
+        let rec = self.export(key)?;
+        rdb::dump(&rec)
+    }
+
+    /// `RESTORE key ttl payload`, with `replace` for the `REPLACE` option.
+    ///
+    /// [`Moved::Taken`] for a key that is already there without `REPLACE`, which
+    /// is checked before the payload is looked at because that is the order
+    /// Redis checks in and a busy key should not depend on whether the bytes
+    /// behind it happened to be good.
+    ///
+    /// The clone in `export` is not paid here. The payload is parsed straight
+    /// into a body and that body goes into the slab, so restoring a set of a
+    /// million members builds one set.
+    ///
+    /// # Errors
+    ///
+    /// [`rdb::Bad::Footer`] when the version is from the future or the checksum
+    /// does not match, and [`rdb::Bad::Format`] when the bytes were intact and
+    /// still did not describe anything this server can hold. The wire layer has
+    /// a different message for each and clients depend on the difference.
+    pub fn restore(
+        &mut self,
+        key: &[u8],
+        payload: &[u8],
+        expire_at: Option<u64>,
+        replace: bool,
+    ) -> std::result::Result<Moved, rdb::Bad> {
+        if !replace && self.exists(key) {
+            return Ok(Moved::Taken);
+        }
+        let limits = rdb::Limits {
+            set: &self.limits,
+            hash: &self.hash_limits,
+            list: &self.list_limits,
+            zset: &self.zset_limits,
+        };
+        let now = self.clock.now_ms();
+        let body = rdb::load(payload, limits, now)?;
+        // A deadline that has already gone means there is nothing to create, and
+        // the payload is still parsed first rather than skipped. A client that
+        // sent bad bytes and a stale deadline should be told about the bytes,
+        // and finding out only when the deadline is fixed is a bad afternoon.
+        if expire_at.is_some_and(|at| at <= now) {
+            // A no op unless `REPLACE` was given, since a key that was there
+            // without it has already been refused above.
+            self.del(key);
+            return Ok(Moved::Ok);
+        }
+        self.import(key, Record::new(body, expire_at));
+        Ok(Moved::Ok)
     }
 
     /// `RENAME src dst`, and `RENAMENX` when `only_if_new`.

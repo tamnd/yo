@@ -21,6 +21,7 @@ use super::scan;
 use super::table::Spec;
 use crate::reply::Out;
 use yo_common::{Code, Error, Result, glob_matches};
+use yo_kv::rdb::Bad;
 use yo_kv::sort::Sort;
 use yo_kv::{Applied, Ask, Cond, Keyspace, Kind, MAX_AT, Moved};
 
@@ -37,6 +38,32 @@ const DB_OUT_OF_RANGE: &str = "DB index is out of range";
 ///
 /// The same key in the same database, so `COPY a a DB 1` never reaches this.
 const SAME_OBJECT: &str = "source and destination objects are the same";
+
+/// What `RESTORE` says about a key that is already there without `REPLACE`.
+///
+/// The full stop is Redis's and so is the prefix. `BUSYKEY` is a code a client
+/// branches on, the same way it branches on `WRONGTYPE`, which is why this is
+/// written where it is decided rather than turned into an [`Error`].
+const BUSY_KEY: &[u8] = b"BUSYKEY Target key name already exists.";
+
+/// What `RESTORE` says about a negative ttl.
+const BAD_TTL: &str = "Invalid TTL value, must be >= 0";
+
+/// And about a negative `IDLETIME`.
+const BAD_IDLETIME: &str = "Invalid IDLETIME value, must be >= 0";
+
+/// And about a `FREQ` outside the byte an LFU counter fits in.
+const BAD_FREQ: &str = "Invalid FREQ value, must be >= 0 and <= 255";
+
+/// What `RESTORE` says when the footer is wrong, whichever half of it.
+///
+/// One message for two conditions, which is Redis's choice and is the right one:
+/// a client that gets this has bytes it should not send again, and knowing
+/// whether the version or the checksum was the problem does not change that.
+const BAD_FOOTER: &str = "DUMP payload version or checksum are wrong";
+
+/// And when the footer was fine and the rest was not.
+const BAD_PAYLOAD: &str = "Bad data format";
 
 /// What Redis says when `NX` is given alongside any of the other three.
 const NX_WITH_OTHERS: &str = "NX and XX, GT or LT options at the same time are not compatible";
@@ -144,6 +171,11 @@ pub(super) fn execute(
         "scan" => scan(db, args, out)?,
         "keys" => keys(db, args.get(1), out),
         "sort" | "sort_ro" => sort(db, spec.name, args, out)?,
+        "dump" => match db.dump(args.get(1)) {
+            Some(payload) => out.bulk(&payload),
+            None => out.nil(),
+        },
+        "restore" => restore(db, args, out)?,
         "randomkey" => match db.random_key() {
             Some(key) => out.bulk(key),
             None => out.nil(),
@@ -334,6 +366,86 @@ fn copy(dbs: &mut [Keyspace], at: usize, args: Args<'_>, out: &mut Out) -> Resul
         Moved::Ok
     };
     out.int(i64::from(done == Moved::Ok));
+    Ok(())
+}
+
+/// `RESTORE key ttl payload [REPLACE] [ABSTTL] [IDLETIME n] [FREQ n]`.
+///
+/// The order the four checks happen in is the whole of what a client can see
+/// here, and it is not the order they read in. Every option is parsed first,
+/// then the busy key, then the ttl, then the footer, then the bytes. So a
+/// `RESTORE` at a key that exists is refused before anybody looks at the
+/// payload, which matters: whether a key is busy should not depend on whether
+/// the bytes behind it happened to be good.
+///
+/// `IDLETIME` and `FREQ` cannot both be given, and the way Redis says so is
+/// worth copying exactly. Neither word is rejected for being the wrong one, they
+/// are only accepted while the other has not been seen, so the second of the two
+/// falls through to the syntax error rather than getting a message of its own.
+///
+/// A ttl is milliseconds from now unless `ABSTTL`, in which case it is a unix
+/// time, and a zero means no deadline at all in both readings.
+fn restore(db: &mut Keyspace, args: Args<'_>, out: &mut Out) -> Result<()> {
+    let key = args.get(1);
+    let mut replace = false;
+    let mut absolute = false;
+    let mut idle = -1i64;
+    let mut freq = -1i64;
+    let mut i = 4;
+    while i < args.len() {
+        let arg = args.get(i);
+        let more = args.len() - i - 1;
+        if args::is(arg, b"replace") {
+            replace = true;
+        } else if args::is(arg, b"absttl") {
+            absolute = true;
+        } else if args::is(arg, b"idletime") && more >= 1 && freq == -1 {
+            idle = args.int(i + 1)?;
+            if idle < 0 {
+                return Err(Error::new(Code::Invalid, BAD_IDLETIME));
+            }
+            i += 1;
+        } else if args::is(arg, b"freq") && more >= 1 && idle == -1 {
+            freq = args.int(i + 1)?;
+            if !(0..=255).contains(&freq) {
+                return Err(Error::new(Code::Invalid, BAD_FREQ));
+            }
+            i += 1;
+        } else {
+            return Err(args::syntax());
+        }
+        i += 1;
+    }
+    if !replace && db.exists(key) {
+        out.error(BUSY_KEY);
+        return Ok(());
+    }
+    let ttl = args.int(2)?;
+    if ttl < 0 {
+        return Err(Error::new(Code::Invalid, BAD_TTL));
+    }
+    let now = db.clock().now_ms();
+    let ttl = ttl as u64;
+    let expire_at = match ttl {
+        0 => None,
+        // Clamped rather than refused, because Redis does not check this at all
+        // and a client that asks for a deadline past the end of the range should
+        // get the end of the range and not an error nobody else gives.
+        _ if absolute => Some(ttl.min(MAX_AT)),
+        _ => Some(now.saturating_add(ttl).min(MAX_AT)),
+    };
+    // Both numbers are checked and then dropped, which is D-26. They set the
+    // eviction metadata on a real server, and the store has readers for that
+    // metadata and no writer, so a restored key starts with the idle time and
+    // the counter any new key gets. The checking is not wasted work even so,
+    // because the four messages above are the whole of what a client can see
+    // about these two options today.
+    let _ = (idle, freq);
+    match db.restore(key, args.get(3), expire_at, replace) {
+        Ok(_) => out.ok(),
+        Err(Bad::Footer) => return Err(Error::new(Code::Invalid, BAD_FOOTER)),
+        Err(Bad::Format) => return Err(Error::new(Code::Invalid, BAD_PAYLOAD)),
+    }
     Ok(())
 }
 

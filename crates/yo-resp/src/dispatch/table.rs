@@ -143,6 +143,11 @@ const AC_KEY_FLUSH: &[&str] = &["@keyspace", "@write", "@slow", "@dangerous"];
 /// writes and it changes what every connected client is looking at, so Redis
 /// puts it in `@fast` and in `@dangerous` and both are right.
 const AC_SWAPDB: &[&str] = &["@keyspace", "@write", "@fast", "@dangerous"];
+/// `RESTORE`, which is dangerous for a reason worth saying out loud: it is the
+/// one command that takes bytes from a client and turns them into a value
+/// without any command ever having built it. `DUMP` is only `@read`, because
+/// reading a value out is no more than reading it.
+const AC_RESTORE: &[&str] = &["@keyspace", "@write", "@slow", "@dangerous"];
 /// `WAIT` and `WAITAOF`, which are the two commands that block on something
 /// that is not a key. They are not in `@keyspace` at all, because they name no
 /// key and read nothing, and they carry `@blocking` for the same reason the
@@ -2296,6 +2301,35 @@ pub static COMMANDS: &[Spec] = &[
         since: "7.2.0",
         complexity: "O(1)",
         summary: "Wait for this connection's writes to reach the append only files.",
+        group: "keyspace",
+    },
+    // The two that speak the file format. A payload is a value standing on its
+    // own outside the process, so these are the only two commands in the group
+    // that move a value rather than a name.
+    Spec {
+        name: "dump",
+        arity: 2,
+        flags: READ_SLOW,
+        first_key: 1,
+        last_key: 1,
+        step: 1,
+        acl: AC_KEY_READ_SLOW,
+        since: "2.6.0",
+        complexity: "O(1) to find the key, then O(N) in the size of the value.",
+        summary: "Serialize a value into a payload another server can load.",
+        group: "keyspace",
+    },
+    Spec {
+        name: "restore",
+        arity: -4,
+        flags: &["write", "denyoom"],
+        first_key: 1,
+        last_key: 1,
+        step: 1,
+        acl: AC_RESTORE,
+        since: "2.6.0",
+        complexity: "O(1) to find the key, then O(N) in the size of the payload.",
+        summary: "Create a key from a payload produced by DUMP.",
         group: "keyspace",
     },
     // The two whose keys cannot be read off the command. `SORT k BY w_* GET d_*`
