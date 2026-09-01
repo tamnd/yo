@@ -62,7 +62,8 @@ use std::collections::VecDeque;
 
 use yo_reactor::{BATCH_MAX, Engine, Reactor};
 
-use crate::dispatch::{Args, Flow, Server, Session, execute, lookup};
+use crate::dispatch::table::{self, lookup_index};
+use crate::dispatch::{self, Args, Flow, Server, Session};
 use crate::error::ProtocolError;
 use crate::proto::{Limits, Proto};
 use crate::reply::Out;
@@ -94,6 +95,17 @@ pub struct Cmd {
     conn: ConnId,
     slot: u32,
     base: usize,
+    /// Which command this is, as a position in the command table.
+    ///
+    /// Resolved once, here, because the name is otherwise looked up twice more
+    /// on the way to running it: once to work out which key to prefetch and once
+    /// to dispatch. A position rather than a reference because this struct is
+    /// queued by the thousand and two bytes is what it costs.
+    ///
+    /// Past the end of the table for a name that is no command, which needs no
+    /// flag of its own and no `Option`, because that is what the lookup already
+    /// answers and what the dispatcher already has a reply for.
+    spec: u16,
 }
 
 impl Cmd {
@@ -617,7 +629,21 @@ impl<S: Sink> Wire<S> {
                         if self.ready.len() == self.ready.capacity() {
                             yo_alloc::allow(|| self.ready.reserve(BATCH_MAX));
                         }
-                        self.ready.push_back(Cmd { conn, slot, base });
+                        // Here and not later, because the name is in front of
+                        // the argument list that was just decoded and this is
+                        // the last place that holds both it and nothing else to
+                        // do. Everything downstream takes the number.
+                        let spec = {
+                            let c = &self.conns[conn as usize];
+                            let args = Args::new(&self.argvs[slot as usize], &c.buf[base..]);
+                            lookup_index(args.name())
+                        };
+                        self.ready.push_back(Cmd {
+                            conn,
+                            slot,
+                            base,
+                            spec,
+                        });
                         self.conns[conn as usize].pending += 1;
                     }
                 }
@@ -814,12 +840,16 @@ impl<S: Sink> Engine for Wire<S> {
     type Work = Cmd;
 
     fn key_hash(&self, cmd: &Cmd) -> Option<u64> {
-        let c = &self.conns[cmd.conn as usize];
-        let args = Args::new(&self.argvs[cmd.slot as usize], &c.buf[cmd.base..]);
-        let spec = lookup(args.name())?;
+        // Before the argument list is built, because most of the commands that
+        // get this far and answer `None` answer it on the spec alone, and
+        // building an `Args` to then throw it away is the sort of thing that
+        // does not show up in a profile and does show up in a total.
+        let spec = table::at(cmd.spec)?;
         if spec.first_key <= 0 {
             return None;
         }
+        let c = &self.conns[cmd.conn as usize];
+        let args = Args::new(&self.argvs[cmd.slot as usize], &c.buf[cmd.base..]);
         // The first key only. A command with more than one, which is `MSET` and
         // `MGET`, warms the first and takes the miss on the rest; warming all of
         // them means a hash list per command and that is the batch's own job
@@ -853,7 +883,8 @@ impl<S: Sink> Engine for Wire<S> {
                 Flow::Continue
             } else {
                 let args = Args::new(&self.argvs[cmd.slot as usize], &c.buf[cmd.base..]);
-                execute(&mut self.server, &mut c.session, args, &mut c.out)
+                let spec = table::at(cmd.spec);
+                dispatch::resolved(&mut self.server, &mut c.session, spec, args, &mut c.out)
             }
         };
 
