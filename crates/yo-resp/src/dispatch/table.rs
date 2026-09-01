@@ -139,6 +139,26 @@ const AC_KEY_WRITE_SLOW: &[&str] = &["@keyspace", "@write", "@slow"];
 const AC_KEY_WRITE_FAST: &[&str] = &["@keyspace", "@write", "@fast"];
 /// The two that empty a database, which are in the dangerous category.
 const AC_KEY_FLUSH: &[&str] = &["@keyspace", "@write", "@slow", "@dangerous"];
+/// `SORT`, which names three type categories because it takes any of the three
+/// and a write because of `STORE`. Redis leaves `@keyspace` off both of these
+/// even though the command lives in that group, and this list is Redis's.
+const AC_SORT_WRITE: &[&str] = &[
+    "@write",
+    "@set",
+    "@sortedset",
+    "@list",
+    "@slow",
+    "@dangerous",
+];
+/// `SORT_RO`, which is the same list with the write turned into a read.
+const AC_SORT_READ: &[&str] = &[
+    "@read",
+    "@set",
+    "@sortedset",
+    "@list",
+    "@slow",
+    "@dangerous",
+];
 
 /// Every command this server answers, in the order the groups ship.
 pub static COMMANDS: &[Spec] = &[
@@ -2222,6 +2242,37 @@ pub static COMMANDS: &[Spec] = &[
         since: "6.2.0",
         complexity: "O(N) in the size of the value.",
         summary: "Copy a value to another key, in this database or another one.",
+        group: "keyspace",
+    },
+    // The two whose keys cannot be read off the command. `SORT k BY w_* GET d_*`
+    // touches every key those two patterns name and a client cannot know which
+    // ones without the data, so both carry `movablekeys` and Redis's own key
+    // specs give the same answer: the first key, and the STORE destination if
+    // there is one.
+    Spec {
+        name: "sort",
+        arity: -2,
+        flags: WRITE_MOVABLE,
+        first_key: 1,
+        last_key: 1,
+        step: 1,
+        acl: AC_SORT_WRITE,
+        since: "1.0.0",
+        complexity: "O(N+M*log(M)) with N elements and M returned.",
+        summary: "Sort a list, set or sorted set, optionally into another key.",
+        group: "keyspace",
+    },
+    Spec {
+        name: "sort_ro",
+        arity: -2,
+        flags: READ_MOVABLE,
+        first_key: 1,
+        last_key: 1,
+        step: 1,
+        acl: AC_SORT_READ,
+        since: "7.0.0",
+        complexity: "O(N+M*log(M)) with N elements and M returned.",
+        summary: "Sort a list, set or sorted set, without the STORE option.",
         group: "keyspace",
     },
     // The four writers take an optional NX, XX, GT or LT, which is the -3 in

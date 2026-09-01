@@ -1158,6 +1158,87 @@ mod tests {
     }
 
     #[test]
+    fn sort_takes_its_options_in_any_order_and_the_last_one_wins() {
+        let mut f = Fixture::new();
+        f.run(&[b"RPUSH", b"l", b"3", b"1", b"2"]);
+        assert_eq!(
+            f.run(&[b"SORT", b"l"]),
+            "*3\r\n$1\r\n1\r\n$1\r\n2\r\n$1\r\n3\r\n"
+        );
+        // DESC then ASC is ASC, because the only thing ASC does is undo a DESC.
+        assert_eq!(
+            f.run(&[b"SORT", b"l", b"DESC", b"asc"]),
+            "*3\r\n$1\r\n1\r\n$1\r\n2\r\n$1\r\n3\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"sort", b"l", b"LIMIT", b"1", b"1", b"DESC"]),
+            "*1\r\n$1\r\n2\r\n"
+        );
+    }
+
+    #[test]
+    fn sort_reads_a_key_per_element_for_by_and_for_get() {
+        let mut f = Fixture::new();
+        f.run(&[b"RPUSH", b"l", b"a", b"b"]);
+        f.run(&[b"MSET", b"w_a", b"2", b"w_b", b"1", b"d_b", b"bee"]);
+        // `b` weighs less so it comes first, and its `GET` hits where `a`'s
+        // misses, which is a nil in the middle of the array and not a short one.
+        assert_eq!(
+            f.run(&[b"SORT", b"l", b"BY", b"w_*", b"GET", b"#", b"GET", b"d_*"]),
+            "*4\r\n$1\r\nb\r\n$3\r\nbee\r\n$1\r\na\r\n$-1\r\n"
+        );
+    }
+
+    #[test]
+    fn sort_store_writes_a_list_and_answers_its_length() {
+        let mut f = Fixture::new();
+        f.run(&[b"RPUSH", b"l", b"3", b"1", b"2"]);
+        assert_eq!(f.run(&[b"SORT", b"l", b"STORE", b"out"]), ":3\r\n");
+        assert_eq!(f.run(&[b"TYPE", b"out"]), "+list\r\n");
+        assert_eq!(
+            f.run(&[b"LRANGE", b"out", b"0", b"-1"]),
+            "*3\r\n$1\r\n1\r\n$1\r\n2\r\n$1\r\n3\r\n"
+        );
+        // An empty result takes the destination with it rather than leaving a
+        // list that holds nothing.
+        assert_eq!(f.run(&[b"SORT", b"missing", b"STORE", b"out"]), ":0\r\n");
+        assert_eq!(f.run(&[b"EXISTS", b"out"]), ":0\r\n");
+    }
+
+    #[test]
+    fn sort_ro_does_not_know_the_word_store() {
+        let mut f = Fixture::new();
+        f.run(&[b"RPUSH", b"l", b"2", b"1"]);
+        assert_eq!(f.run(&[b"SORT_RO", b"l"]), "*2\r\n$1\r\n1\r\n$1\r\n2\r\n");
+        assert_eq!(
+            f.run(&[b"SORT_RO", b"l", b"STORE", b"d"]),
+            "-ERR syntax error\r\n"
+        );
+        assert_eq!(f.run(&[b"EXISTS", b"d"]), ":0\r\n");
+    }
+
+    #[test]
+    fn sort_refuses_what_it_cannot_sort() {
+        let mut f = Fixture::new();
+        assert_eq!(f.run(&[b"SORT", b"nosuchkey"]), "*0\r\n");
+        f.run(&[b"SET", b"s", b"x"]);
+        assert_eq!(
+            f.run(&[b"SORT", b"s"]),
+            "-WRONGTYPE Operation against a key holding the wrong kind of value\r\n"
+        );
+        f.run(&[b"RPUSH", b"words", b"one", b"two"]);
+        assert_eq!(
+            f.run(&[b"SORT", b"words"]),
+            "-ERR One or more scores can't be converted into double\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"SORT", b"words", b"ALPHA"]),
+            "*2\r\n$3\r\none\r\n$3\r\ntwo\r\n"
+        );
+        assert_eq!(f.run(&[b"SORT", b"words", b"BY"]), "-ERR syntax error\r\n");
+    }
+
+    #[test]
     fn copy_checks_its_options_before_it_looks_for_anything() {
         let mut f = Fixture::new();
         // No key exists at all, and every one of these is still the option

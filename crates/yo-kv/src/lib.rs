@@ -121,6 +121,7 @@ pub mod set;
 pub mod setops;
 pub mod sets;
 pub mod slab;
+pub mod sort;
 pub mod strings;
 #[cfg(test)]
 mod tally;

@@ -181,3 +181,10 @@ title = "maxmemory is honoured to within one two megabyte segment"
 reason = "Redis allocates every value through jemalloc and gets the pages back as soon as a key is freed, so a maxmemory of four megabytes is a real four megabytes. Records here live in arena segments of two megabytes and a segment only stops counting when compaction has moved the last live record out of it, so evicting keys moves the number in two megabyte steps rather than smoothly. What a client sees is that a server told to hold four hundred megabytes holds four hundred megabytes give or take one segment, which is a quarter of a percent, and a server told to hold four megabytes may settle at two. The alternative is a smaller segment, which costs a syscall and a header per two megabytes of keyspace on every server whether or not it has a limit, to buy precision that only matters to a limit small enough to be a test rather than a deployment."
 status = "permanent"
 spec = "14 section 5"
+
+[[divergence]]
+id = "D-24"
+title = "SORT ALPHA compares bytes and not the server's collation"
+reason = "Redis compares strings with strcoll when there is no STORE and with a byte compare when there is, because a stored result has to be the same on every replica. It calls setlocale(LC_COLLATE, \"\") at startup, so the order SORT ALPHA puts two strings in is a property of the environment the server was started in and not of the data, and the same server started twice under two locales answers differently. strcoll also stops at the first zero byte, so two members that differ only after a zero compare equal. This compares bytes everywhere, which is the STORE behaviour applied to every call, is what a client already gets from Redis under the C locale that almost every deployment runs, and is the only choice that makes the answer reproducible."
+status = "permanent"
+spec = "05 section 4"
