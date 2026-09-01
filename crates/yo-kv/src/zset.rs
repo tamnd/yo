@@ -632,7 +632,7 @@ impl Zset {
         let Body::Packed(lp) = &self.body else { return };
         let n = lp.len() / 2;
         let mut table = Table {
-            members: Elements::with_capacity(n.next_power_of_two().max(16)),
+            members: Elements::with_capacity(n),
             order: Rank::new(),
         };
         // The listpack is already in order, so every member goes on the end of

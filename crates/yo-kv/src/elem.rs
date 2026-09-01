@@ -124,8 +124,42 @@ const LONG_NAME: usize = 255;
 /// How many bytes a long name's length prefix takes.
 const PREFIX: usize = 2;
 
-/// How many bits of the home slot a row keeps.
+/// How many bits of a name's hash a row keeps to say where it wanted to sit.
 const HOME_BITS: u32 = 24;
+
+/// Those bits on their own.
+const HOME_MASK: usize = (1 << HOME_BITS) - 1;
+
+/// The hash bits a row keeps.
+#[inline(always)]
+const fn home_bits(h: u64) -> usize {
+    (h as usize) & HOME_MASK
+}
+
+/// Where a name lands in a table of `m` slots.
+///
+/// A multiply and a shift rather than a mask, which is what lets `m` be the size
+/// the table actually needs instead of the next power of two above it. See the
+/// note on [`slots_for`] for what that is worth, and it is worth a lot: at eight
+/// hundred thousand members a masked table holds two million and ninety seven
+/// thousand slots to serve one million and eighty thousand, and eight bytes a
+/// member of the ten it spends are air.
+///
+/// The three cycles this costs over an `and` land in front of a load that misses
+/// cache, which is the only reason the trade is available at all.
+#[inline(always)]
+const fn slot_of(bits: usize, m: usize) -> usize {
+    ((bits as u64 * m as u64) >> HOME_BITS) as usize
+}
+
+/// How far forward from `from` to `to`, the long way round if it has to be.
+///
+/// The modular distance a mask used to give for nothing. Both arguments are
+/// already inside the table, so this is a subtract and a conditional add.
+#[inline(always)]
+const fn ahead(from: usize, to: usize, m: usize) -> usize {
+    if to >= from { to - from } else { to + m - from }
+}
 
 /// One element: where its name is and where it wanted to sit.
 ///
@@ -140,12 +174,13 @@ const HOME_BITS: u32 = 24;
 /// instead means a random cache miss per slot examined, on the two operations
 /// where there is no reply to send that would have paid for it.
 ///
-/// Twenty four bits of it is every bit that matters until the slot array passes
-/// sixteen million, which is a table holding twelve million elements. Past there
-/// [`Elements::home_of`] hashes the name instead, and that is the right place for
-/// the cost to land: the partitioned band splits a collection at a quarter of a
-/// million, so a table that large is one partition of a set with two hundred
-/// million members in it.
+/// Twenty four bits is enough of the hash at every table size, because
+/// [`slot_of`] scales those bits across the table rather than masking them down
+/// to it. Every placement in this file goes through that one function, so the
+/// answer is the same one the insert gave whatever the table is. Above sixteen
+/// million slots the twenty four bits stop naming every slot and some of them are
+/// never anybody's home, which costs a little clustering on a table holding
+/// twelve million elements and nothing at all below it.
 ///
 /// The payload is deliberately not in here. See [`Elements::vals`].
 #[derive(Debug, Clone, Copy)]
@@ -162,9 +197,10 @@ impl Row {
     #[inline]
     fn new(at: u32, len: usize, h: u64) -> Row {
         let len = u32::try_from(len.min(LONG_NAME)).expect("LONG_NAME is one byte");
+        let bits = u32::try_from(home_bits(h)).expect("HOME_BITS is under 32");
         Row {
             at,
-            packed: ((h as u32 & ((1 << HOME_BITS) - 1)) << 8) | len,
+            packed: (bits << 8) | len,
         }
     }
 
@@ -600,9 +636,9 @@ impl<V: Copy> Elements<V> {
         if self.rows.is_empty() {
             return None;
         }
-        let mask = self.slots.len() - 1;
+        let m = self.slots.len();
         let tag = tag_of(h);
-        let mut at = (h as usize) & mask;
+        let mut at = slot_of(home_bits(h), m);
         loop {
             let slot = self.slots[at];
             if slot == EMPTY {
@@ -614,16 +650,22 @@ impl<V: Copy> Elements<V> {
                     return Some(row);
                 }
             }
-            at = (at + 1) & mask;
+            at += 1;
+            if at == m {
+                at = 0;
+            }
         }
     }
 
     /// Put a row index in the first slot the probe reaches.
     fn put_slot(&mut self, h: u64, row: u32) {
-        let mask = self.slots.len() - 1;
-        let mut at = (h as usize) & mask;
+        let m = self.slots.len();
+        let mut at = slot_of(home_bits(h), m);
         while self.slots[at] != EMPTY {
-            at = (at + 1) & mask;
+            at += 1;
+            if at == m {
+                at = 0;
+            }
         }
         self.slots[at] = (u32::from(tag_of(h)) << 24) | row;
     }
@@ -655,41 +697,47 @@ impl<V: Copy> Elements<V> {
     /// back keeps every probe correct and leaves no tombstone, which matters
     /// because `SPOP` in a loop deletes every element a set ever had.
     fn clear_slot(&mut self, row: usize) {
-        let mask = self.slots.len() - 1;
-        let mut at = self.home_of(row, mask);
+        let m = self.slots.len();
+        let mut at = self.home_of(row, m);
         loop {
             let slot = self.slots[at];
             debug_assert!(slot != EMPTY, "the row being removed has a slot");
             if slot != EMPTY && (slot & 0x00FF_FFFF) as usize == row {
                 break;
             }
-            at = (at + 1) & mask;
+            at += 1;
+            if at == m {
+                at = 0;
+            }
         }
         self.slots[at] = EMPTY;
 
         // Everything behind the hole that probed past it has to move up, or it
         // becomes unreachable.
         let mut hole = at;
-        let mut scan = (at + 1) & mask;
+        let mut scan = if at + 1 == m { 0 } else { at + 1 };
         while self.slots[scan] != EMPTY {
             let slot = self.slots[scan];
             let idx = (slot & 0x00FF_FFFF) as usize;
-            let home = self.home_of(idx, mask);
+            let home = self.home_of(idx, m);
             // True when the slot's home is at or behind the hole, meaning it
             // probed over the hole to get here and would not be found now.
-            if (scan.wrapping_sub(home) & mask) >= (scan.wrapping_sub(hole) & mask) {
+            if ahead(home, scan, m) >= ahead(hole, scan, m) {
                 self.slots[hole] = slot;
                 self.slots[scan] = EMPTY;
                 hole = scan;
             }
-            scan = (scan + 1) & mask;
+            scan += 1;
+            if scan == m {
+                scan = 0;
+            }
         }
     }
 
     /// Point the slot holding `from` at `to` instead.
     fn repoint(&mut self, from: usize, to: usize) {
-        let mask = self.slots.len() - 1;
-        let mut at = self.home_of(from, mask);
+        let m = self.slots.len();
+        let mut at = self.home_of(from, m);
         loop {
             let slot = self.slots[at];
             debug_assert!(slot != EMPTY, "the row being moved has a slot");
@@ -698,23 +746,33 @@ impl<V: Copy> Elements<V> {
                     (slot & 0xFF00_0000) | u32::try_from(to).expect("a row index fits in 24 bits");
                 return;
             }
-            at = (at + 1) & mask;
+            at += 1;
+            if at == m {
+                at = 0;
+            }
         }
     }
 
     /// Make sure there is room for one more before it is inserted.
     ///
-    /// The row array grows by [`crate::grow`]'s policy rather than by `Vec`'s,
-    /// because a doubling row array on a large collection is the single largest
-    /// piece of memory nobody asked for in the whole structure. The slot array
-    /// keeps its power of two, which is not a policy, it is what makes the
-    /// probe a mask instead of a division.
+    /// Both arrays grow by [`crate::grow`]'s policy rather than by `Vec`'s or by
+    /// doubling, because on a large collection the slack in either of them is
+    /// the largest piece of memory nobody asked for in the whole structure.
+    ///
+    /// [`slots_for`] says the smallest table that would hold `want` at the load
+    /// factor, which at the moment this fires is the table there already, and
+    /// then the growth policy is what actually decides the step. So the load
+    /// runs between three fifths and three quarters rather than between three
+    /// eighths and three quarters, and the slot array is rebuilt more often for
+    /// a smaller step each time.
     fn reserve_one(&mut self) {
         let want = self.rows.len() + 1;
         crate::grow::reserve(&mut self.rows, 1);
         crate::grow::reserve(&mut self.vals, 1);
         if want * LOAD_DEN > self.slots.len() * LOAD_NUM {
-            self.grow_to(slots_for(want));
+            let need = slots_for(want);
+            let next = crate::grow::next_capacity(self.slots.len(), need, size_of::<u32>());
+            self.grow_to(next);
         }
     }
 
@@ -725,49 +783,31 @@ impl<V: Copy> Elements<V> {
     /// tag is already in the old slot and the home is already in the row, so a
     /// growth reads two flat arrays and hashes nothing.
     fn grow_to(&mut self, slots: usize) {
-        let slots = slots.max(MIN_SLOTS).next_power_of_two();
-        let mask = slots - 1;
-        let old = std::mem::replace(&mut self.slots, vec![EMPTY; slots].into_boxed_slice());
+        let m = slots.max(MIN_SLOTS);
+        let old = std::mem::replace(&mut self.slots, vec![EMPTY; m].into_boxed_slice());
         for &slot in &old {
             if slot == EMPTY {
                 continue;
             }
             let row = (slot & 0x00FF_FFFF) as usize;
-            let mut at = self.home_of(row, mask);
+            let mut at = self.home_of(row, m);
             while self.slots[at] != EMPTY {
-                at = (at + 1) & mask;
+                at += 1;
+                if at == m {
+                    at = 0;
+                }
             }
             self.slots[at] = slot;
         }
     }
 
-    /// Where the row at `idx` wanted to sit, in a table with this `mask`.
+    /// Where the row at `idx` wanted to sit, in a table of `m` slots.
     ///
-    /// One comparison against a number the caller already had in a register, and
-    /// then a field of a row it was going to read anyway. The other arm is for a
-    /// table with more slots than a row has bits to name one, which costs a hash
-    /// and a trip into the blob and is the reason the row is eight bytes rather
-    /// than twelve for everybody else.
-    ///
-    /// The arms are split and the cold one is kept out of line because this is
-    /// called once per slot of the run behind a removal. Left as one function it
-    /// has a hash call in it, the call stops it being inlined into that loop, and
-    /// a pop of a thousand members measured 52 percent slower.
+    /// A field of a row this was going to read anyway, scaled across the table
+    /// by the one function every placement in here goes through.
     #[inline(always)]
-    fn home_of(&self, idx: usize, mask: usize) -> usize {
-        let row = self.rows[idx];
-        if mask < 1 << HOME_BITS {
-            row.home() & mask
-        } else {
-            self.home_by_hash(&row, mask)
-        }
-    }
-
-    /// Where a row wanted to sit in a table too large for the packed bits.
-    #[cold]
-    #[inline(never)]
-    fn home_by_hash(&self, row: &Row, mask: usize) -> usize {
-        hash(self.name_of(row)) as usize & mask
+    fn home_of(&self, idx: usize, m: usize) -> usize {
+        slot_of(self.rows[idx].home(), m)
     }
 
     /// Append a name to the blob and say where it went.
@@ -870,10 +910,15 @@ fn hash(name: &[u8]) -> u64 {
 }
 
 /// How many slots `n` elements need at the load factor.
+///
+/// The number itself and not the next power of two above it, which is the whole
+/// point of [`slot_of`]. Rounding up to a power of two costs on average a third
+/// of the slot array and at the worst point half of it, and the worst point is
+/// not rare: eight hundred thousand members want one million and eighty thousand
+/// slots and a masked table gives them two million and ninety seven thousand, so
+/// the array sits at a load of 0.39 holding eight bytes a member of air.
 fn slots_for(n: usize) -> usize {
-    ((n * LOAD_DEN) / LOAD_NUM + 1)
-        .max(MIN_SLOTS)
-        .next_power_of_two()
+    ((n * LOAD_DEN) / LOAD_NUM + 1).max(MIN_SLOTS)
 }
 
 #[cfg(test)]
