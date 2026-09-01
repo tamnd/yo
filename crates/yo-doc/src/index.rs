@@ -1,20 +1,26 @@
-//! Equality indexes over a path into a document (`09` section 4).
+//! Indexes over a path into a document (`09` sections 4 and 5).
 //!
 //! A collection can find a document by its id already, because the primary
 //! table is keyed by it. An index is what makes it findable by what is inside
 //! it: one element table per indexed path, keyed by the value at that path,
 //! holding the ids of the documents that have it.
 //!
+//! An index answers equality, and an ordered one answers ranges as well.
+//!
 //! ```
+//! use std::ops::Bound;
 //! use yo_doc::{Builder, Docs, Key};
 //!
 //! let mut docs = Docs::new();
 //! docs.create_index("$.status")?;
-//! for (id, status) in [("a", "open"), ("b", "shut"), ("c", "open")] {
+//! docs.create_ordered_index("$.price")?;
+//! for (id, status, price) in [("a", "open", 30), ("b", "shut", 10), ("c", "open", 20)] {
 //!     let mut b = Builder::new();
 //!     b.begin_object()?;
 //!     b.key(b"status")?;
 //!     b.text(status)?;
+//!     b.key(b"price")?;
+//!     b.int(price)?;
 //!     b.end_object()?;
 //!     let bytes = b.finish()?.to_vec();
 //!     docs.put_bytes(id.as_bytes(), &bytes)?;
@@ -24,6 +30,13 @@
 //! docs.find("$.status", &Key::text("open"), |id, _| found.push(id.to_vec()))?;
 //! found.sort();
 //! assert_eq!(found, [b"a".to_vec(), b"c".to_vec()]);
+//!
+//! // Cheapest first, up to and including twenty.
+//! let mut upto = Vec::new();
+//! docs.range("$.price", Bound::Unbounded, Bound::Included(&Key::int(20)), |id, _| {
+//!     upto.push(id.to_vec())
+//! })?;
+//! assert_eq!(upto, [b"b".to_vec(), b"c".to_vec()]);
 //! # Ok::<(), yo_common::Error>(())
 //! ```
 //!
@@ -41,13 +54,27 @@
 //! "probe each equality index, intersect the smallest result first", and there
 //! is nothing to build for it.
 //!
+//! The order an ordered index walks is the counted B+ tree from `08` section 5,
+//! which is what a sorted set ranks with. That tree holds row numbers and asks
+//! the caller to compare, so it took no changes at all to put index keys under
+//! it instead of zset members. It costs about three bytes per distinct value,
+//! and a range is one descent and then a link hop per leaf, so the cost of a
+//! range is the size of the answer rather than the size of the collection.
+//!
+//! The key table stays unordered either way, because it is a hash's field table
+//! and a hash is not ordered. The order is a separate structure over its row
+//! numbers, which is the same split the sorted set makes rather than a second
+//! design.
+//!
 //! # What a key is
 //!
 //! [`Key`] is the value at the path with a tag byte in front of it, so a
 //! document with the string `"7"` at a path and one with the number seven do
 //! not land on the same key. Numbers are stored big endian with the sign bit
-//! flipped, which orders them correctly as bytes. Nothing here needs that
-//! ordering, but the ordered index does and it costs nothing to have it now.
+//! flipped, and floats with the sign bit set for positives and every bit flipped
+//! for negatives, both of which order correctly read as bytes. Equality does not
+//! need that, but it means the tree can compare keys with `memcmp` and never
+//! decode one.
 //!
 //! An integer and a float that names the same integer, `7` and `7.0`, get the
 //! same key. A caller asking for seven means seven, and JSON has one number
@@ -56,8 +83,18 @@
 //!
 //! Where this encoding is not enough is ordering across the two number tags: a
 //! float that is not a whole number sorts after every integer rather than among
-//! them. Equality does not care and the ordered index is not an element table,
-//! so it will carry its own key encoding rather than stretch this one.
+//! them, so a range over a path holding a mix of the two is ordered within each
+//! tag and not across them. A path in a real collection holds one type, so this
+//! has not bitten yet, but it is a real limitation and not a rounding error, and
+//! the way out is a single numeric tag with a lossless order preserving encoding
+//! rather than the two exact ones here. That is a format change, so it has to be
+//! settled before the freeze at the end of M6 rather than after it.
+//!
+//! Types do not interleave either: everything with a smaller tag sorts before
+//! everything with a larger one, so nulls, then booleans, then numbers, then
+//! strings. That one is on purpose. A range over a path is a range over one
+//! type, and a total order across types has to pick an arbitrary answer to
+//! whether a string is above or below a number.
 //!
 //! # What is not indexed
 //!
@@ -67,10 +104,13 @@
 //! documents have a given scalar there, and neither of those documents does.
 //! Indexing each element of an array is the separate `array` kind.
 
+use core::cmp::Ordering;
+use core::ops::Bound;
+
 use yo_common::num::i64_digits;
 use yo_common::small::Small;
 use yo_common::{Code, Error, Result};
-use yo_kv::{Elements, Set, SetLimits, Slab};
+use yo_kv::{Elements, Rank, Set, SetLimits, Slab, rank};
 
 use crate::head::Kind;
 use crate::read::Value;
@@ -262,6 +302,16 @@ fn whole(v: f64) -> Option<i64> {
     if n as f64 == v { Some(n) } else { None }
 }
 
+/// What an index can be asked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IndexKind {
+    /// One value at a time. A table from key to posting list and nothing else.
+    Equality,
+    /// One value at a time, or every value between two of them. The same table
+    /// with a counted B+ tree over its rows.
+    Ordered,
+}
+
 /// One index, over one path.
 #[derive(Debug)]
 pub struct PathIndex {
@@ -271,6 +321,14 @@ pub struct PathIndex {
     path: Box<[u8]>,
     /// The key to the slab slot its posting list sits in.
     keys: Elements<u32>,
+    /// The rows of `keys` in key order, for an ordered index, and nothing at all
+    /// for an equality one.
+    ///
+    /// The table above is unordered, because it is a hash's field table. The
+    /// order lives here instead of being a property of the table, which is the
+    /// same split a sorted set makes: the members are in an element table and
+    /// the rank is a separate tree over its row numbers.
+    order: Option<Rank>,
     /// The posting lists. A slab rather than a payload beside the row, because
     /// [`Elements`] moves its last row into the hole on a removal and a posting
     /// list is not `Copy`.
@@ -281,10 +339,14 @@ pub struct PathIndex {
 
 impl PathIndex {
     /// An empty index over `path`, which has already been checked to parse.
-    pub(crate) fn new(path: &[u8]) -> PathIndex {
+    pub(crate) fn new(path: &[u8], kind: IndexKind) -> PathIndex {
         PathIndex {
             path: path.into(),
             keys: Elements::new(),
+            order: match kind {
+                IndexKind::Equality => None,
+                IndexKind::Ordered => Some(Rank::new()),
+            },
             posts: Slab::new(),
             postings: 0,
         }
@@ -294,6 +356,16 @@ impl PathIndex {
     #[must_use]
     pub fn path(&self) -> &[u8] {
         &self.path
+    }
+
+    /// What this index can be asked.
+    #[must_use]
+    pub fn kind(&self) -> IndexKind {
+        if self.order.is_some() {
+            IndexKind::Ordered
+        } else {
+            IndexKind::Equality
+        }
     }
 
     /// How many distinct values are filed.
@@ -336,6 +408,77 @@ impl PathIndex {
         self.get(key).map_or(0, Set::len)
     }
 
+    /// Every key between `lo` and `hi` with the documents filed under it, in
+    /// order.
+    ///
+    /// One descent of the tree and then a link per leaf, so a range of a
+    /// thousand keys costs one search and a handful of hops. An equality index
+    /// has no order to walk and answers nothing at all rather than pretending to
+    /// have a range; the layer above turns that into an error, because a range
+    /// query that silently finds nothing is worse than one that says no.
+    #[must_use]
+    pub fn range(&self, lo: Bound<&Key>, hi: Bound<&Key>) -> Ranged<'_> {
+        let Some((order, start, left)) = self.span(lo, hi) else {
+            return Ranged {
+                index: self,
+                walk: None,
+                left: 0,
+            };
+        };
+        Ranged {
+            index: self,
+            walk: Some(order.iter_from(start)),
+            left,
+        }
+    }
+
+    /// [`PathIndex::range`] backwards, largest key first.
+    #[must_use]
+    pub fn range_rev(&self, lo: Bound<&Key>, hi: Bound<&Key>) -> RangedRev<'_> {
+        let Some((order, start, left)) = self.span(lo, hi) else {
+            return RangedRev {
+                index: self,
+                walk: None,
+                left: 0,
+            };
+        };
+        RangedRev {
+            index: self,
+            walk: Some(order.iter_back_from(start + left - 1)),
+            left,
+        }
+    }
+
+    /// How many documents are filed under any key between `lo` and `hi`.
+    ///
+    /// This reads the keys in the range and not the documents, so it costs the
+    /// number of distinct values rather than the number of postings.
+    #[must_use]
+    pub fn count_in(&self, lo: Bound<&Key>, hi: Bound<&Key>) -> usize {
+        self.range(lo, hi).map(|(_, set)| set.len()).sum()
+    }
+
+    /// Where a range starts and how many keys are in it, or `None` if there is
+    /// no order to walk or nothing in the range.
+    fn span(&self, lo: Bound<&Key>, hi: Bound<&Key>) -> Option<(&Rank, usize, usize)> {
+        let order = self.order.as_ref()?;
+        let keys = &self.keys;
+        let start = match lo {
+            Bound::Unbounded => 0,
+            Bound::Included(k) => rank_of(order, keys, k.as_bytes()),
+            Bound::Excluded(k) => rank_after(order, keys, k.as_bytes()),
+        };
+        let end = match hi {
+            Bound::Unbounded => keys.len(),
+            Bound::Included(k) => rank_after(order, keys, k.as_bytes()),
+            Bound::Excluded(k) => rank_of(order, keys, k.as_bytes()),
+        };
+        if end <= start {
+            return None;
+        }
+        Some((order, start, end - start))
+    }
+
     /// File `id` under `key`.
     pub(crate) fn add(&mut self, key: &[u8], id: &[u8]) -> Result<()> {
         if let Some(&slot) = self.keys.get(key) {
@@ -348,6 +491,7 @@ impl PathIndex {
         let mut set = Set::new();
         set.add(id, &SetLimits::DEFAULT);
         let slot = self.posts.insert(set);
+        let row = self.keys.len() as u32;
         if self.keys.insert(key, slot).is_err() {
             self.posts.remove(slot);
             return Err(Error::new(
@@ -355,40 +499,173 @@ impl PathIndex {
                 "the index cannot hold another distinct value",
             ));
         }
+        let PathIndex { keys, order, .. } = self;
+        if let Some(order) = order {
+            // The key is in the table already and not in the tree, so the search
+            // compares it against every other key and lands where it belongs.
+            let at = rank_of(order, keys, key);
+            order.insert_at(at, row);
+        }
         self.postings += 1;
         Ok(())
     }
 
     /// Take `id` out from under `key`, and drop the key if it was the last one.
     pub(crate) fn take(&mut self, key: &[u8], id: &[u8]) {
-        let Some(&slot) = self.keys.get(key) else {
+        let Some(row) = self.keys.index_of(key) else {
             return;
         };
+        let slot = *self.keys.at(row).expect("a row that was just found").1;
         let set = self.posts.get_mut(slot).expect("a row points at its list");
         if !set.remove(id) {
             return;
         }
         self.postings -= 1;
-        if set.is_empty() {
-            self.posts.remove(slot);
-            self.keys.remove(key);
+        if !set.is_empty() {
+            return;
+        }
+        self.posts.remove(slot);
+        self.untrack(key, row);
+        self.keys.remove_at(row);
+    }
+
+    /// Take `row` out of the tree, and tell the tree about the row the element
+    /// table is about to renumber.
+    ///
+    /// The table is dense, so taking a row out moves the last row into the hole
+    /// and one key nobody asked about gets a new number. Where that key sits has
+    /// to be found before anything moves, because afterwards the tree is holding
+    /// a number that means something else. This is the same dance a sorted set
+    /// does, for the same reason.
+    ///
+    /// An equality index has no tree and nothing to do here.
+    fn untrack(&mut self, key: &[u8], row: usize) {
+        let PathIndex { keys, order, .. } = self;
+        let Some(order) = order else {
+            return;
+        };
+        let rank = rank_of(order, keys, key);
+        let last = keys.len() - 1;
+        let moved = if last == row {
+            None
+        } else {
+            let name = keys.at(last).expect("the last row").0;
+            Some(order.seek(|other| {
+                let (other_name, _) = keys.at(other as usize).expect("a row the tree holds");
+                name.cmp(other_name)
+            }))
+        };
+        order.remove_at(rank);
+        if let Some(at) = moved {
+            // Everything above the hole shifted down by one when the row came
+            // out of the tree.
+            let at = if at > rank { at - 1 } else { at };
+            order.set_at(at, row as u32);
         }
     }
 
-    /// Throw everything filed away and keep the path.
+    /// Throw everything filed away and keep the path and the kind.
     pub(crate) fn clear(&mut self) {
         self.keys.clear();
         self.posts.clear();
         self.postings = 0;
+        if let Some(order) = &mut self.order {
+            *order = Rank::new();
+        }
     }
 
-    /// What the index costs, posting lists included.
+    /// What the index costs, posting lists and the order included.
     #[must_use]
     pub fn memory_bytes(&self) -> usize {
         self.keys.memory_bytes()
             + self.posts.slot_bytes()
             + self.posts.iter().map(Set::memory_bytes).sum::<usize>()
+            + self.order.as_ref().map_or(0, Rank::bytes)
     }
+}
+
+/// Keys in order with their posting lists, from [`PathIndex::range`].
+pub struct Ranged<'a> {
+    index: &'a PathIndex,
+    walk: Option<rank::Walk<'a>>,
+    left: usize,
+}
+
+impl<'a> Iterator for Ranged<'a> {
+    type Item = (&'a [u8], &'a Set);
+
+    fn next(&mut self) -> Option<(&'a [u8], &'a Set)> {
+        if self.left == 0 {
+            return None;
+        }
+        let row = self.walk.as_mut()?.next()?;
+        self.left -= 1;
+        entry(self.index, row)
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (self.left, Some(self.left))
+    }
+}
+
+impl ExactSizeIterator for Ranged<'_> {}
+
+/// Keys in reverse order with their posting lists, from
+/// [`PathIndex::range_rev`].
+pub struct RangedRev<'a> {
+    index: &'a PathIndex,
+    walk: Option<rank::Back<'a>>,
+    left: usize,
+}
+
+impl<'a> Iterator for RangedRev<'a> {
+    type Item = (&'a [u8], &'a Set);
+
+    fn next(&mut self) -> Option<(&'a [u8], &'a Set)> {
+        if self.left == 0 {
+            return None;
+        }
+        let row = self.walk.as_mut()?.next()?;
+        self.left -= 1;
+        entry(self.index, row)
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (self.left, Some(self.left))
+    }
+}
+
+impl ExactSizeIterator for RangedRev<'_> {}
+
+/// The rank `key` sits at in `order`, or would sit at.
+///
+/// A free function rather than a method because every caller has the tree and
+/// the table split out of the index already, either because it is about to
+/// write to the tree while reading the table or because it is holding a borrow
+/// of the tree it means to keep.
+fn rank_of(order: &Rank, keys: &Elements<u32>, key: &[u8]) -> usize {
+    order.seek(|row| {
+        let (name, _) = keys.at(row as usize).expect("a row the tree holds");
+        key.cmp(name)
+    })
+}
+
+/// The rank one past `key`, which is where it sits when it is not there and one
+/// to the right of it when it is.
+fn rank_after(order: &Rank, keys: &Elements<u32>, key: &[u8]) -> usize {
+    order.seek(|row| {
+        let (name, _) = keys.at(row as usize).expect("a row the tree holds");
+        match key.cmp(name) {
+            Ordering::Less => Ordering::Less,
+            Ordering::Equal | Ordering::Greater => Ordering::Greater,
+        }
+    })
+}
+
+/// The key and the posting list a tree row names.
+fn entry(index: &PathIndex, row: u32) -> Option<(&[u8], &Set)> {
+    let (name, &slot) = index.keys.at(row as usize)?;
+    Some((name, index.posts.get(slot)?))
 }
 
 /// Hand every id in `set` to `f` as bytes.
@@ -462,9 +739,185 @@ mod tests {
         assert_eq!(format!("{:?}", Key::int(0)), "8000000000000000");
     }
 
+    /// An ordered index over `$.n` holding the integers given, one document per
+    /// integer, named after it.
+    fn ordered(ns: impl IntoIterator<Item = i64>) -> PathIndex {
+        let mut index = PathIndex::new(b"$.n", IndexKind::Ordered);
+        for n in ns {
+            index
+                .add(Key::int(n).as_bytes(), n.to_string().as_bytes())
+                .expect("room");
+        }
+        index
+    }
+
+    /// The keys a range walks, decoded back to the integers they came from.
+    fn walked(index: &PathIndex, lo: Bound<&Key>, hi: Bound<&Key>) -> Vec<i64> {
+        let out: Vec<i64> = index.range(lo, hi).map(|(k, _)| unorder_int(k)).collect();
+        let mut back: Vec<i64> = index
+            .range_rev(lo, hi)
+            .map(|(k, _)| unorder_int(k))
+            .collect();
+        back.reverse();
+        assert_eq!(out, back, "backwards is forwards read the other way");
+        out
+    }
+
+    /// The integer an INT key was made from.
+    fn unorder_int(key: &[u8]) -> i64 {
+        assert_eq!(key[0], TAG_INT, "these tests only file integers");
+        let bytes: [u8; 8] = key[1..9].try_into().expect("eight bytes");
+        (u64::from_be_bytes(bytes) ^ (1 << 63)) as i64
+    }
+
+    #[test]
+    fn an_ordered_index_walks_its_keys_in_order() {
+        // Written in an order that is neither sorted nor reverse sorted, and
+        // over enough keys to push the tree past one leaf.
+        let index = ordered((0..500i64).map(|i| (i * 137) % 500 - 250));
+        assert_eq!(index.len(), 500);
+        assert_eq!(index.kind(), IndexKind::Ordered);
+
+        let all = walked(&index, Bound::Unbounded, Bound::Unbounded);
+        assert_eq!(all, (-250..250).collect::<Vec<i64>>());
+
+        let (lo, hi) = (Key::int(-3), Key::int(4));
+        assert_eq!(
+            walked(&index, Bound::Included(&lo), Bound::Excluded(&hi)),
+            [-3, -2, -1, 0, 1, 2, 3]
+        );
+        assert_eq!(
+            walked(&index, Bound::Excluded(&lo), Bound::Included(&hi)),
+            [-2, -1, 0, 1, 2, 3, 4]
+        );
+        assert_eq!(
+            walked(&index, Bound::Unbounded, Bound::Excluded(&Key::int(-247))),
+            [-250, -249, -248]
+        );
+        assert_eq!(
+            walked(&index, Bound::Included(&Key::int(247)), Bound::Unbounded),
+            [247, 248, 249]
+        );
+    }
+
+    #[test]
+    fn a_range_that_names_nothing_is_empty_rather_than_wrong() {
+        let index = ordered([10i64, 20, 30]);
+        let (lo, hi) = (Key::int(20), Key::int(20));
+        assert!(walked(&index, Bound::Excluded(&lo), Bound::Excluded(&hi)).is_empty());
+        assert_eq!(
+            walked(&index, Bound::Included(&lo), Bound::Included(&hi)),
+            [20]
+        );
+        // Backwards bounds, which a caller can hand over by accident.
+        assert!(
+            walked(
+                &index,
+                Bound::Included(&Key::int(30)),
+                Bound::Excluded(&Key::int(10))
+            )
+            .is_empty()
+        );
+        // Between two keys that are there, and past both ends.
+        assert!(
+            walked(
+                &index,
+                Bound::Included(&Key::int(21)),
+                Bound::Excluded(&Key::int(29))
+            )
+            .is_empty()
+        );
+        assert!(walked(&index, Bound::Included(&Key::int(31)), Bound::Unbounded).is_empty());
+        assert!(walked(&index, Bound::Unbounded, Bound::Excluded(&Key::int(10))).is_empty());
+        assert_eq!(index.count_in(Bound::Unbounded, Bound::Unbounded), 3);
+    }
+
+    #[test]
+    fn an_equality_index_has_no_range_and_says_so_by_being_empty() {
+        let mut index = PathIndex::new(b"$.n", IndexKind::Equality);
+        index.add(Key::int(1).as_bytes(), b"a").expect("room");
+        assert_eq!(index.kind(), IndexKind::Equality);
+        assert_eq!(index.range(Bound::Unbounded, Bound::Unbounded).count(), 0);
+        assert_eq!(index.count_in(Bound::Unbounded, Bound::Unbounded), 0);
+        assert_eq!(index.count(&Key::int(1)), 1, "equality still works");
+    }
+
+    #[test]
+    fn removing_keys_from_an_ordered_index_keeps_the_rest_in_order() {
+        // Every removal moves the element table's last row into the hole, so the
+        // tree is holding a row number that has come to mean a different key.
+        // This is the test that the renumbering is told to it.
+        let mut index = ordered(0..200i64);
+        for n in (0..200i64).step_by(3) {
+            index.take(Key::int(n).as_bytes(), n.to_string().as_bytes());
+        }
+        let left: Vec<i64> = (0..200i64).filter(|n| n % 3 != 0).collect();
+        assert_eq!(index.len(), left.len());
+        assert_eq!(walked(&index, Bound::Unbounded, Bound::Unbounded), left);
+
+        // And the keys still find their own posting lists after all that.
+        for n in &left {
+            assert_eq!(index.count(&Key::int(*n)), 1, "{n} lost its list");
+        }
+        for n in (0..200i64).step_by(3) {
+            assert_eq!(index.count(&Key::int(n)), 0, "{n} kept one");
+        }
+    }
+
+    #[test]
+    fn an_ordered_index_that_is_emptied_and_refilled_is_still_ordered() {
+        let mut index = ordered(0..64i64);
+        for n in 0..64i64 {
+            index.take(Key::int(n).as_bytes(), n.to_string().as_bytes());
+        }
+        assert!(index.is_empty());
+        assert_eq!(index.postings(), 0);
+        assert!(walked(&index, Bound::Unbounded, Bound::Unbounded).is_empty());
+
+        for n in (0..32i64).rev() {
+            index
+                .add(Key::int(n).as_bytes(), n.to_string().as_bytes())
+                .expect("room");
+        }
+        assert_eq!(
+            walked(&index, Bound::Unbounded, Bound::Unbounded),
+            (0..32).collect::<Vec<i64>>()
+        );
+
+        index.clear();
+        assert_eq!(index.kind(), IndexKind::Ordered, "a clear keeps the kind");
+        assert!(index.is_empty());
+        index.add(Key::int(9).as_bytes(), b"9").expect("room");
+        assert_eq!(walked(&index, Bound::Unbounded, Bound::Unbounded), [9]);
+    }
+
+    #[test]
+    fn a_key_with_many_documents_counts_once_in_the_order() {
+        let mut index = PathIndex::new(b"$.n", IndexKind::Ordered);
+        for i in 0..100 {
+            index
+                .add(
+                    Key::int(i64::from(i % 5)).as_bytes(),
+                    format!("d{i}").as_bytes(),
+                )
+                .expect("room");
+        }
+        assert_eq!(index.len(), 5, "five distinct values");
+        assert_eq!(index.postings(), 100);
+        assert_eq!(
+            walked(&index, Bound::Unbounded, Bound::Unbounded),
+            [0, 1, 2, 3, 4]
+        );
+        assert_eq!(index.count_in(Bound::Unbounded, Bound::Unbounded), 100);
+        assert_eq!(
+            index.count_in(Bound::Included(&Key::int(1)), Bound::Included(&Key::int(2))),
+            40
+        );
+    }
+
     #[test]
     fn the_last_document_under_a_key_takes_the_key_with_it() {
-        let mut index = PathIndex::new(b"$.status");
+        let mut index = PathIndex::new(b"$.status", IndexKind::Equality);
         let open = Key::text("open");
         index.add(open.as_bytes(), b"a").expect("room");
         index.add(open.as_bytes(), b"b").expect("room");
@@ -483,7 +936,7 @@ mod tests {
 
     #[test]
     fn filing_the_same_document_twice_files_it_once() {
-        let mut index = PathIndex::new(b"$.status");
+        let mut index = PathIndex::new(b"$.status", IndexKind::Equality);
         let open = Key::text("open");
         index.add(open.as_bytes(), b"a").expect("room");
         index.add(open.as_bytes(), b"a").expect("room");
@@ -494,7 +947,7 @@ mod tests {
 
     #[test]
     fn taking_out_something_that_was_never_filed_changes_nothing() {
-        let mut index = PathIndex::new(b"$.status");
+        let mut index = PathIndex::new(b"$.status", IndexKind::Equality);
         let open = Key::text("open");
         index.add(open.as_bytes(), b"a").expect("room");
         index.take(open.as_bytes(), b"never");
@@ -505,7 +958,7 @@ mod tests {
 
     #[test]
     fn a_posting_list_of_numbers_reads_back_as_bytes() {
-        let mut index = PathIndex::new(b"$.customer");
+        let mut index = PathIndex::new(b"$.customer", IndexKind::Equality);
         let key = Key::int(4);
         for id in ["11", "2", "333"] {
             index.add(key.as_bytes(), id.as_bytes()).expect("room");

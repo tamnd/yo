@@ -19,6 +19,9 @@
 //!     the same per matching document whatever the collection holds and `scan`
 //!     has to read all of it, so the gap between the two rows should widen by
 //!     the same factor the collection grows by.
+//!   - `index/range` against `index/range_scan`, the same shape one level up.
+//!     The window is 256 documents at both collection sizes, so `range` should
+//!     be the same number twice and the scan should not be.
 //!   - `index/put` at zero, one and four indexes. The gap is a path lookup and a
 //!     set write per index, and it should be a fixed cost per index rather than
 //!     something that grows with the collection.
@@ -31,6 +34,7 @@
 
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use std::hint::black_box;
+use std::ops::Bound;
 use yo_doc::{Builder, Docs, Key, Value};
 
 /// An object of `n` members, each holding a string of `pad` bytes.
@@ -282,6 +286,50 @@ fn bench_index(c: &mut Criterion) {
 
         g.bench_with_input(BenchmarkId::new("count", n), &n, |b, _| {
             b.iter(|| black_box(docs.count("$.status", black_box(&key)).expect("indexed")));
+        });
+    }
+
+    // A window of 256 out of the collection, through the tree and by walking.
+    // `seq` is unique, so the answer is the same size at both collection sizes
+    // and the `range` row should be flat while the `range_scan` row is not.
+    for n in [1024usize, 16_384] {
+        let mut docs = filled(n, 0);
+        docs.create_ordered_index("$.seq").expect("ordered");
+        let (lo, hi) = (Key::int(100), Key::int(356));
+        let (lo, hi) = (Bound::Included(&lo), Bound::Excluded(&hi));
+        assert_eq!(docs.count_range("$.seq", lo, hi).expect("ordered"), 256);
+
+        g.bench_with_input(BenchmarkId::new("range", n), &n, |b, _| {
+            b.iter(|| {
+                let mut sum = 0i64;
+                docs.range("$.seq", black_box(lo), black_box(hi), |_, d| {
+                    sum += d.get(b"tier").and_then(|v| v.as_int()).expect("a tier");
+                })
+                .expect("ordered");
+                black_box(sum)
+            });
+        });
+
+        g.bench_with_input(BenchmarkId::new("range_scan", n), &n, |b, _| {
+            b.iter(|| {
+                let mut sum = 0i64;
+                for (_, d) in docs.iter() {
+                    let seq = d.get(b"seq").and_then(|v| v.as_int()).expect("a seq");
+                    if (100..356).contains(&seq) {
+                        sum += d.get(b"tier").and_then(|v| v.as_int()).expect("a tier");
+                    }
+                }
+                black_box(sum)
+            });
+        });
+
+        g.bench_with_input(BenchmarkId::new("count_range", n), &n, |b, _| {
+            b.iter(|| {
+                black_box(
+                    docs.count_range("$.seq", black_box(lo), black_box(hi))
+                        .expect("ordered"),
+                )
+            });
         });
     }
 
