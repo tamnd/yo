@@ -28,15 +28,22 @@
 //! accident. `HSET h a b` followed by `HGET h b` finds nothing, which is right,
 //! and a search with a step of one would have found the `b` that is a value.
 //!
-//! In the table band a row's payload is a [`Span`] into a [`Blob`] the hash owns.
-//! That is `05` section 4.2's element per row: a value is bytes in a shared
-//! stretch, not an allocation of its own, and rewriting one appends and abandons
-//! rather than moving everything after it. The abandoned bytes are counted and
-//! come back when they outnumber the live ones.
+//! In the table band a row's payload is an offset into a [`Blob`] the hash owns,
+//! and the value's length is written into the blob in front of the bytes rather
+//! than carried next to the offset. That is `05` section 4.2's element per row: a
+//! value is bytes in a shared stretch, not an allocation of its own, and
+//! rewriting one appends and abandons rather than moving everything after it. The
+//! abandoned bytes are counted and come back when they outnumber the live ones.
 //!
 //! Field names are interned by the element table, which is the point of the
-//! split. `HSET h field v1` and then `HSET h field v2` writes eight bytes of row
-//! and the new value, and touches the field's name not at all.
+//! split. `HSET h field v1` and then `HSET h field v2` writes four bytes of
+//! offset and the new value, and touches the field's name not at all.
+//!
+//! What a field costs, then, is eight bytes of row, four of offset, one of value
+//! length, about five of slot array, and the field name and the value themselves.
+//! Twelve of those eighteen are the two arrays and the only way past them is to
+//! stop interning field names, which would put the name back in front of every
+//! value and pay for it again on every rewrite.
 //!
 //! # Field TTL
 //!
@@ -76,7 +83,7 @@
 
 use yo_common::num::{self, parse_i64};
 
-use crate::blob::{Blob, Span};
+use crate::blob::Blob;
 use crate::elem::Elements;
 use crate::listpack::{self, Listpack};
 use crate::scan::Cursor;
@@ -321,7 +328,7 @@ fn push_text(lp: &mut Listpack, t: Text<'_>) {
 /// The native band: interned field names, values in a blob of their own.
 #[derive(Debug, Clone)]
 struct Table {
-    fields: Elements<Span>,
+    fields: Elements<u32>,
     values: Blob,
     /// One slot per row once any field has a deadline, and nothing before then.
     ///
@@ -345,22 +352,22 @@ impl Table {
 
     #[inline]
     fn get(&self, field: &[u8]) -> Option<&[u8]> {
-        self.fields.get(field).map(|&span| self.values.span(span))
+        self.fields.get(field).map(|&at| self.values.sized(at))
     }
 
     /// Store `value` against `field` and say whether the field is new.
     fn set(&mut self, field: &[u8], value: &[u8]) -> bool {
-        let span = self.values.push_span(value);
+        let at = self.values.push_sized(value);
         if let Some(row) = self.fields.index_of(field) {
             let slot = self.fields.at_mut(row).expect("the probe found it");
-            let old = std::mem::replace(slot, span);
-            self.values.release_span(old);
+            let old = std::mem::replace(slot, at);
+            self.values.release_sized(old);
             // A write clears the deadline, the same as in the packed band.
             self.ttl.clear(row);
             self.settle();
             return false;
         }
-        match self.fields.insert(field, span) {
+        match self.fields.insert(field, at) {
             Ok(_) => {
                 self.ttl.inserted();
                 true
@@ -369,7 +376,7 @@ impl Table {
                 // A field name over NAME_MAX or a table at MAX_ROWS. The value
                 // bytes are already in the blob, so they are given back rather
                 // than left as a leak nothing accounts for.
-                self.values.release_span(span);
+                self.values.release_sized(at);
                 self.settle();
                 false
             }
@@ -391,11 +398,11 @@ impl Table {
     /// The one place a row leaves this table, so that the swap remove and the
     /// deadline that has to follow it cannot drift apart in a later edit.
     fn remove_at(&mut self, row: usize) {
-        let span = self
+        let at = self
             .fields
             .remove_at(row)
             .expect("the caller found the row");
-        self.values.release_span(span);
+        self.values.release_sized(at);
         self.ttl.removed(row);
         self.settle();
     }
@@ -407,8 +414,8 @@ impl Table {
         }
         let fields = &mut self.fields;
         self.values.compact(|keep| {
-            for span in fields.payloads_mut() {
-                keep.moved_span(span);
+            for at in fields.payloads_mut() {
+                keep.moved_sized(at);
             }
         });
     }
@@ -522,7 +529,7 @@ impl Hash {
     pub fn value_len(&self, field: &[u8]) -> Option<usize> {
         match &self.body {
             Body::Packed(_) => self.get(field).map(|v| v.byte_len()),
-            Body::Table(t) => t.fields.get(field).map(|s| s.len as usize),
+            Body::Table(t) => t.fields.get(field).map(|&at| t.values.sized_len(at)),
         }
     }
 
@@ -541,8 +548,8 @@ impl Hash {
                 Some((field, value))
             }
             Body::Table(t) => {
-                let (name, span) = t.fields.at(index)?;
-                Some((Text::Str(name), Text::Str(t.values.span(*span))))
+                let (name, at) = t.fields.at(index)?;
+                Some((Text::Str(name), Text::Str(t.values.sized(*at))))
             }
         }
     }
@@ -567,8 +574,8 @@ impl Hash {
         match &self.body {
             Body::Table(t) => {
                 let values = &t.values;
-                t.fields.scan(cursor, count, |name, span| {
-                    f(Text::Str(name), Text::Str(values.span(*span)));
+                t.fields.scan(cursor, count, |name, at| {
+                    f(Text::Str(name), Text::Str(values.sized(*at)));
                 })
             }
             Body::Packed(_) => {

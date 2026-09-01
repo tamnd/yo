@@ -21,11 +21,18 @@
 //!
 //! [`Blob::push`] hands back an offset and nothing else, and [`Blob::read`] takes
 //! an offset and a length. The reference is the caller's to shape, which is not
-//! ceremony: [`crate::Elements`] keeps a name's length in one byte so a row stays
-//! eight, and a hash value cannot be capped at two hundred and fifty five bytes
-//! or at sixty four kilobytes either, because Redis lets one be half a gigabyte.
-//! One blob, two reference layouts, and neither of them is a compromise with the
-//! other.
+//! ceremony, because the two callers want different shapes and neither of them
+//! is a compromise with the other.
+//!
+//! [`crate::Elements`] has eight spare bits in a row it is trying to keep at
+//! eight bytes, so it keeps a name's length in those and its reference is the
+//! offset on its own. A hash value has no spare bits anywhere and cannot be
+//! capped at two hundred and fifty five bytes either, because Redis lets one be
+//! half a gigabyte, so [`Blob::push_sized`] writes the length into the blob in
+//! front of the bytes and its reference is also the offset on its own. One byte
+//! of prefix for a value under two hundred and fifty five bytes and five for
+//! anything longer, which is a byte per field against the four a length beside
+//! the offset would cost.
 //!
 //! [`Span`] is here for the callers that have no reason to pack it tighter.
 //!
@@ -58,6 +65,31 @@ pub struct Span {
 
 /// Dead bytes below this are left alone whatever the ratio says.
 const FLOOR: usize = 4096;
+
+/// The shortest run whose length goes in front of it in five bytes, not one.
+const LONG: usize = 255;
+
+/// How many bytes a long run's length prefix takes, the marker included.
+const LONG_PREFIX: usize = 5;
+
+/// How far past `at` the bytes start, and how many of them there are.
+///
+/// The prefix is one byte holding the length, or the marker followed by the
+/// length in four. Two hundred and fifty five is the marker rather than a
+/// length, so a run of exactly that many bytes takes the long form and pays four
+/// bytes it did not have to. That is one length out of the whole range and it
+/// buys a check that is a compare against a constant.
+#[inline]
+fn sized_head(bytes: &[u8], at: usize) -> (usize, usize) {
+    let head = usize::from(bytes[at]);
+    if head < LONG {
+        return (1, head);
+    }
+    let head: [u8; 4] = bytes[at + 1..at + LONG_PREFIX]
+        .try_into()
+        .expect("four bytes of length behind the marker");
+    (LONG_PREFIX, u32::from_le_bytes(head) as usize)
+}
 
 /// Bytes belonging to one collection, appended to and occasionally rebuilt.
 #[derive(Debug, Default, Clone)]
@@ -144,6 +176,64 @@ impl Blob {
             at: self.push(bytes),
             len: u32::try_from(bytes.len()).expect("no one value is 4 GiB"),
         }
+    }
+
+    /// Append `bytes` behind their own length and say where the length went.
+    ///
+    /// For the caller that has nowhere else to keep a length. The offset alone
+    /// is the whole reference, which is four bytes rather than the eight a
+    /// [`Span`] costs, against one byte in the blob for anything under two
+    /// hundred and fifty five and five for anything longer.
+    ///
+    /// # Panics
+    ///
+    /// If the blob would pass four gigabytes, or `bytes` is longer than one.
+    pub fn push_sized(&mut self, bytes: &[u8]) -> u32 {
+        if bytes.len() < LONG {
+            let head = [u8::try_from(bytes.len()).expect("under LONG")];
+            let at = self.push(&head);
+            self.push(bytes);
+            return at;
+        }
+        let len = u32::try_from(bytes.len()).expect("no one value is 4 GiB");
+        let mut head = [0u8; LONG_PREFIX];
+        head[0] = u8::try_from(LONG).expect("LONG is one byte");
+        head[1..].copy_from_slice(&len.to_le_bytes());
+        let at = self.push(&head);
+        self.push(bytes);
+        at
+    }
+
+    /// The bytes a [`Blob::push_sized`] offset points at.
+    ///
+    /// # Panics
+    ///
+    /// If `at` is not the start of a run that was pushed with its length.
+    #[inline]
+    #[must_use]
+    pub fn sized(&self, at: u32) -> &[u8] {
+        let at = at as usize;
+        let (skip, len) = sized_head(&self.bytes, at);
+        &self.bytes[at + skip..at + skip + len]
+    }
+
+    /// How long a [`Blob::push_sized`] run is, without reading it.
+    ///
+    /// This is what `HSTRLEN` asks. It used to be free, because the length was
+    /// in the reference, and now it is one byte off the front of the value. That
+    /// byte is on the same cache line as the value itself, so the answer costs
+    /// the miss the caller would have taken to read the value anyway.
+    #[inline]
+    #[must_use]
+    pub fn sized_len(&self, at: u32) -> usize {
+        sized_head(&self.bytes, at as usize).1
+    }
+
+    /// Say that a [`Blob::push_sized`] run is not pointed at any more.
+    #[inline]
+    pub fn release_sized(&mut self, at: u32) {
+        let (skip, len) = sized_head(&self.bytes, at as usize);
+        self.release(skip + len);
     }
 
     /// The `len` bytes at `at`.
@@ -251,6 +341,17 @@ impl Keep<'_> {
         self.moved(&mut span.at, len);
     }
 
+    /// The same for a [`Blob::push_sized`] run, prefix and all.
+    ///
+    /// The length is in the bytes being moved rather than in the reference, so
+    /// it is read off the old copy, which is the whole reason [`Keep::peek`] is
+    /// here.
+    #[inline]
+    pub fn moved_sized(&mut self, at: &mut u32) {
+        let (skip, len) = sized_head(self.old, *at as usize);
+        self.moved(at, skip + len);
+    }
+
     /// The `len` bytes at `at`, as they were before the rebuild started.
     ///
     /// A reference whose length is written into the bytes rather than held
@@ -285,6 +386,63 @@ mod tests {
         assert_eq!(b.span(three), b"a longer value than the first one");
         assert_eq!(b.len(), 5 + 33);
         assert_eq!(b.dead(), 0);
+    }
+
+    #[test]
+    fn a_length_written_in_front_reads_back_at_every_length() {
+        let mut b = Blob::new();
+        let lens = [0usize, 1, 2, 100, 253, 254, 255, 256, 257, 70_000];
+        let at: Vec<u32> = lens
+            .iter()
+            .enumerate()
+            .map(|(i, &n)| {
+                let byte = u8::try_from(i).expect("ten of them");
+                b.push_sized(&vec![byte; n])
+            })
+            .collect();
+
+        for (i, (&n, &at)) in lens.iter().zip(&at).enumerate() {
+            let byte = u8::try_from(i).expect("ten of them");
+            assert_eq!(b.sized_len(at), n, "the length came back wrong");
+            assert_eq!(b.sized(at), &vec![byte; n][..], "the bytes came back wrong");
+        }
+
+        // One byte of prefix under the marker and five at it and above.
+        let short: usize = lens.iter().filter(|&&n| n < 255).map(|&n| n + 1).sum();
+        let long: usize = lens.iter().filter(|&&n| n >= 255).map(|&n| n + 5).sum();
+        assert_eq!(b.len(), short + long);
+    }
+
+    #[test]
+    fn a_run_that_carries_its_own_length_moves_with_it() {
+        let mut b = Blob::new();
+        // Long and short mixed, so the rebuild has to read both prefix forms off
+        // the copy it is reading from rather than the one it is writing.
+        let mut live: Vec<u32> = Vec::new();
+        for i in 0..100u32 {
+            let n = if i % 3 == 0 { 300 } else { 40 };
+            let byte = u8::try_from(i % 251).expect("under 251");
+            let first = b.push_sized(&vec![byte; n]);
+            b.release_sized(first);
+            live.push(b.push_sized(&vec![byte; n]));
+        }
+        assert!(b.worth_compacting());
+        let before = b.len();
+
+        b.compact(|k| {
+            for at in &mut live {
+                k.moved_sized(at);
+            }
+        });
+
+        assert_eq!(b.dead(), 0);
+        assert_eq!(b.len() * 2, before, "the dead half went and no more");
+        for (i, &at) in live.iter().enumerate() {
+            let i = u32::try_from(i).expect("a hundred of them");
+            let n = if i % 3 == 0 { 300 } else { 40 };
+            let byte = u8::try_from(i % 251).expect("under 251");
+            assert_eq!(b.sized(at), &vec![byte; n][..], "a reference moved wrongly");
+        }
     }
 
     #[test]
