@@ -944,9 +944,10 @@ impl Keyspace {
 
     /// Drop `key` if its deadline has passed.
     ///
-    /// This is lazy expiry and it is half of the story. The other half is the
-    /// active cycle in the maintenance slice, which is what stops a key nobody
-    /// ever reads again from holding its memory forever (`14` section 1).
+    /// This is lazy expiry and it is half of the story. The other half is
+    /// [`Keyspace::expire_cycle`], which the maintenance slice runs and which is
+    /// what stops a key nobody ever reads again from holding its memory forever
+    /// (`14` section 1).
     ///
     /// Every public read calls this first, whatever type it is reading, which
     /// is why it is here and not in the file for any one type.
@@ -1146,9 +1147,10 @@ impl Keyspace {
     /// Keys reclaimed by running into them after their deadline.
     ///
     /// Redis calls this `expired_keys` in `INFO stats` and counts both lazy and
-    /// active expiry into it. Only lazy expiry exists so far, so only lazy
-    /// expiry is counted, and the active cycle in the maintenance slice will add
-    /// to the same number when it lands (`14` section 1).
+    /// active expiry into it, and so does this. [`Keyspace::expire_cycle`] is
+    /// the active half and it counts into the same number, which is what makes
+    /// this the total a dashboard can compare against a write rate rather than
+    /// the share of it that happened to be reclaimed by a read.
     #[inline]
     pub const fn expired_keys(&self) -> u64 {
         self.expired

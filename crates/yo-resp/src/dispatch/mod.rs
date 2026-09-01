@@ -193,6 +193,16 @@ pub struct Server {
     /// compaction move at different rates and sharing one would make the
     /// database that gets compacted depend on how many keys were evicted.
     evict_db: usize,
+    /// Which database the next active expiry sweep starts at.
+    ///
+    /// A third cursor for the same reason there is a second one. A sweep runs on
+    /// every turn of the loop and compaction runs when there is dead space, so
+    /// sharing a cursor would make which database gets swept depend on which one
+    /// was last collected.
+    expire_db: usize,
+    /// The millisecond the last active expiry sweep ran on, so the next one on
+    /// the same millisecond does not bother.
+    expire_ms: u64,
     /// Clients parked on a blocking command.
     waiters: Waiters,
     /// The numbers the reactor keeps for `INFO`.
@@ -216,6 +226,8 @@ impl Server {
             maxmemory: 0,
             used: 0,
             evict_db: 0,
+            expire_db: 0,
+            expire_ms: 0,
             waiters: Waiters::default(),
             stats: Stats::default(),
         }
@@ -236,6 +248,8 @@ impl Server {
             maxmemory: 0,
             used: 0,
             evict_db: 0,
+            expire_db: 0,
+            expire_ms: 0,
             waiters: Waiters::default(),
             stats: Stats::default(),
         }
@@ -510,6 +524,61 @@ impl Server {
         false
     }
 
+    /// The sweep the shard loop calls, at most once a millisecond.
+    ///
+    /// The gate is the whole difference between this and [`Server::expire_step`].
+    /// A maintenance slice runs on every turn of the loop and a turn is a
+    /// hundred nanoseconds, so an ungated sweep would draw a fresh sample ten
+    /// thousand times per millisecond and spend a real share of the shard on
+    /// looking for keys that cannot have died since the last look. Nothing in a
+    /// database changes fast enough to be worth asking about more often than the
+    /// clock can tell the difference, and the clock here is milliseconds.
+    ///
+    /// A millisecond is also far finer than Redis, whose slow cycle runs at ten
+    /// hertz, so this is not the thing that decides how promptly memory comes
+    /// back. What it decides is that an idle server sweeps a thousand times a
+    /// second rather than a million.
+    pub fn expire_slice(&mut self, budget: usize) -> usize {
+        let now = self.clock.now_ms();
+        if now == self.expire_ms {
+            return 0;
+        }
+        self.expire_ms = now;
+        self.expire_step(budget)
+    }
+
+    /// Sweep dead keys out of the databases, spending at most `budget` looks.
+    ///
+    /// Answers what it spent, so the caller can charge its maintenance slice for
+    /// it. See [`yo_kv::expiry`] for why the budget is in keys looked at.
+    ///
+    /// Round robin from its own cursor, and every database gets offered whatever
+    /// is left of the budget rather than a sixteenth of it each, so a server on
+    /// database zero only, which is nearly every server, spends the whole slice
+    /// where the keys are. The fifteen empty ones cost a comparison apiece
+    /// because a database with no key carrying a deadline says so without
+    /// drawing anything.
+    ///
+    /// The cursor moves to the database after whichever one did the work, so two
+    /// busy databases take turns instead of the lower numbered one starving the
+    /// other.
+    pub fn expire_step(&mut self, budget: usize) -> usize {
+        let mut spent = 0;
+        for turn in 0..self.dbs.len() {
+            if spent >= budget {
+                break;
+            }
+            let i = (self.expire_db + turn) % self.dbs.len();
+            let c = self.dbs[i].expire_cycle(budget - spent);
+            spent += c.examined;
+            if c.expired > 0 {
+                self.expire_db = (i + 1) % self.dbs.len();
+                self.dirty |= 1u64 << i;
+            }
+        }
+        spent
+    }
+
     /// One slice of compaction for a server that is over its limit.
     ///
     /// Takes the databases in the same order [`Server::compact_step`] does and
@@ -774,6 +843,13 @@ mod tests {
         /// Run one command and answer with the bytes it wrote.
         fn run(&mut self, parts: &[&[u8]]) -> String {
             self.flow(parts).1
+        }
+
+        /// Move every clock in the server on by `ms`.
+        fn advance(&mut self, ms: u64) {
+            for db in 0..DATABASES {
+                self.server.db(db).clock_mut().advance(ms);
+            }
         }
 
         /// The same, with what the connection should do next.
@@ -2498,6 +2574,95 @@ mod tests {
         assert!(clients.contains("connected_clients:0"), "{clients}");
         assert!(!clients.contains("redis_version"), "{clients}");
         assert_eq!(f.run(&[b"INFO", b"nosuch"]), "$0\r\n\r\n");
+    }
+
+    /// A cache that writes with a deadline and never reads back used to hold
+    /// every key it had ever written, because lazy expiry needs somebody to walk
+    /// past a key before it can reclaim it and nobody ever did.
+    #[test]
+    fn the_active_sweep_reclaims_keys_no_client_comes_back_for() {
+        let mut f = Fixture::new();
+        for i in 0..3_000u32 {
+            f.run(&[b"SET", format!("d{i}").as_bytes(), b"v", b"PX", b"50"]);
+        }
+        for i in 0..1_000u32 {
+            f.run(&[b"SET", format!("k{i}").as_bytes(), b"v"]);
+        }
+        assert_eq!(f.run(&[b"DBSIZE"]), ":4000\r\n");
+        f.advance(100);
+        assert_eq!(
+            f.run(&[b"DBSIZE"]),
+            ":4000\r\n",
+            "DBSIZE counts records and nothing has read past the dead ones yet"
+        );
+
+        // What the shard loop does, one slice at a time.
+        let mut spent = 0;
+        for _ in 0..2_000 {
+            spent += f.server.expire_step(4096);
+            if f.run(&[b"DBSIZE"]) == ":1000\r\n" {
+                break;
+            }
+        }
+        assert_eq!(f.run(&[b"DBSIZE"]), ":1000\r\n", "spent {spent} looks");
+        assert!(f.run(&[b"INFO", b"stats"]).contains("expired_keys:3000"));
+        for i in 0..1_000u32 {
+            assert_eq!(
+                f.run(&[b"GET", format!("k{i}").as_bytes()]),
+                "$1\r\nv\r\n",
+                "it took a key that had no deadline"
+            );
+        }
+    }
+
+    #[test]
+    fn a_sweep_of_a_server_with_no_deadlines_anywhere_costs_nothing() {
+        let mut f = Fixture::new();
+        for i in 0..2_000u32 {
+            f.run(&[b"SET", format!("k{i}").as_bytes(), b"v"]);
+        }
+        assert_eq!(f.server.expire_step(4096), 0);
+        // And one database having them does not make the other fifteen pay.
+        f.run(&[b"SELECT", b"3"]);
+        f.run(&[b"SET", b"x", b"v", b"PX", b"50"]);
+        f.advance(100);
+        for _ in 0..64 {
+            f.server.expire_step(4096);
+        }
+        assert_eq!(f.run(&[b"DBSIZE"]), ":0\r\n");
+        f.run(&[b"SELECT", b"0"]);
+        assert_eq!(f.run(&[b"DBSIZE"]), ":2000\r\n");
+        assert_eq!(f.server.expire_step(4096), 0, "and it is quiet again");
+    }
+
+    /// The gate, which is what stops a maintenance slice that runs every hundred
+    /// nanoseconds from drawing a sample every hundred nanoseconds.
+    #[test]
+    fn the_sweep_the_loop_calls_runs_at_most_once_a_millisecond() {
+        let mut f = Fixture::new();
+        for i in 0..500u32 {
+            f.run(&[b"SET", format!("d{i}").as_bytes(), b"v", b"PX", b"50"]);
+        }
+        f.advance(100);
+        let at = f.server.db(0).clock().now_ms();
+        f.server.set_clock_ms(at);
+        // A small budget, so that one slice cannot finish the job and a second
+        // one having nothing to do would mean the gate and not an empty
+        // database.
+        assert!(f.server.expire_slice(8) > 0, "the first one works");
+        for _ in 0..1_000 {
+            assert_eq!(
+                f.server.expire_slice(8),
+                0,
+                "the millisecond has not moved and neither should this"
+            );
+        }
+        assert!(
+            f.server.db(0).expires() > 400,
+            "there is plenty left to take"
+        );
+        f.server.set_clock_ms(at + 1);
+        assert!(f.server.expire_slice(8) > 0, "and then it goes again");
     }
 
     /// `expires=` used to be a hardcoded zero, which meant a dashboard watching
