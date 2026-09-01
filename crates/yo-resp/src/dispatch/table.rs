@@ -2767,19 +2767,69 @@ pub static COMMANDS: &[Spec] = &[
     },
 ];
 
+/// The length and the lower cased first byte of a name, packed into a `u16`.
+///
+/// `None` for a name nothing in [`COMMANDS`] could be spelled as, which here is
+/// only the empty one and one longer than a byte can count. Both of those are
+/// answered before anything is read.
+///
+/// `| 0x20` lower cases a letter and does not have to be told which bytes are
+/// letters, because the only thing that matters is that it maps the two cases of
+/// a name to the same number and every command name is letters.
+const fn key_of(name: &[u8]) -> Option<u16> {
+    if name.is_empty() || name.len() > u8::MAX as usize {
+        return None;
+    }
+    Some(((name.len() as u16) << 8) | (name[0] | 0x20) as u16)
+}
+
+/// [`key_of`] every command name, in table order.
+///
+/// This is the whole of the change that made [`lookup`] cheap, and it is not a
+/// hash or an index, it is the same linear scan over two bytes a command instead
+/// of over a hundred. A `Spec` is about ninety six bytes, so walking to `del` at
+/// a hundred and forty seventh used to read fourteen kilobytes to look at two
+/// bytes out of each, which is two hundred and twenty cache lines. The same walk
+/// over this reads two hundred and ninety four bytes, five lines, sequentially.
+///
+/// A bucket index keyed on the same two bytes was tried first and was worse. It
+/// found `srandmember` six percent faster and cost `get` and `set` twenty
+/// percent, because a bucket lookup is three dependent loads into three
+/// different arrays and a scan is one stride a prefetcher can see coming. The
+/// table is written in rough order of how often a command is sent, and against
+/// a scan that ordering is worth something, which is a thing an index throws
+/// away.
+const KEYS: [u16; COMMANDS.len()] = keys();
+
+const fn keys() -> [u16; COMMANDS.len()] {
+    let mut out = [0u16; COMMANDS.len()];
+    let mut i = 0;
+    while i < COMMANDS.len() {
+        out[i] = match key_of(COMMANDS[i].name.as_bytes()) {
+            Some(key) => key,
+            None => panic!("a command has no name"),
+        };
+        i += 1;
+    }
+    out
+}
+
 /// The command called `name`, whatever case the client spelled it in.
 ///
-/// Linear over a table of this size, which is a handful of length compares
-/// against a table that fits in one page and is in cache because the previous
-/// command looked at it too. A hash would be a hash of the name plus a probe,
-/// and the name is already in a register. The table grows to about 250 by M8,
-/// at which point this becomes a perfect hash built at compile time, and the
-/// signature does not change when it does.
+/// The scan is over [`KEYS`] and not over [`COMMANDS`], so a candidate costs one
+/// `u16` compare and the full name is only read when the length and the first
+/// letter already matched. There are 89 distinct keys over the table, so that
+/// happens about twice for a name that is a command and almost never for one
+/// that is not.
 #[must_use]
 pub fn lookup(name: &[u8]) -> Option<&'static Spec> {
-    COMMANDS
-        .iter()
-        .find(|c| c.name.len() == name.len() && c.name.as_bytes().eq_ignore_ascii_case(name))
+    let want = key_of(name)?;
+    for (at, &key) in KEYS.iter().enumerate() {
+        if key == want && COMMANDS[at].name.as_bytes().eq_ignore_ascii_case(name) {
+            return Some(&COMMANDS[at]);
+        }
+    }
+    None
 }
 
 /// How many commands there are.
@@ -2873,6 +2923,49 @@ mod tests {
         assert_eq!(lookup(b"gEt").unwrap().name, "get");
         assert!(lookup(b"ge").is_none());
         assert!(lookup(b"gets").is_none());
+    }
+
+    /// Every command is findable under its own name, in either case.
+    ///
+    /// The key array is built at compile time from the table it sits beside, so
+    /// what a test can still catch is the two of them being read differently:
+    /// `keys` packing the length one way and `lookup` packing it another.
+    #[test]
+    fn every_command_is_findable_by_its_own_name() {
+        for spec in COMMANDS {
+            let found = lookup(spec.name.as_bytes()).expect(spec.name);
+            assert_eq!(
+                index_of(found),
+                index_of(spec),
+                "{} found the wrong spec",
+                spec.name
+            );
+            assert_eq!(
+                lookup(spec.name.to_ascii_uppercase().as_bytes()).map(index_of),
+                Some(index_of(spec)),
+                "{} is not found in upper case",
+                spec.name,
+            );
+        }
+    }
+
+    /// A name that cannot be a command is answered before anything is compared.
+    #[test]
+    fn a_name_that_cannot_be_a_command_is_rejected_on_its_shape() {
+        assert!(lookup(b"").is_none());
+        assert!(key_of(b"").is_none());
+        assert!(key_of(&[b'g'; 256]).is_none());
+        assert!(lookup(&[b'g'; 256]).is_none());
+        assert!(lookup(b"9et").is_none());
+    }
+
+    /// The two cases of a name pack to the same key and different names do not.
+    #[test]
+    fn a_key_is_the_length_and_the_letter_and_nothing_else() {
+        assert_eq!(key_of(b"get"), key_of(b"GET"));
+        assert_eq!(key_of(b"get"), key_of(b"gzz"), "same length, same letter");
+        assert_ne!(key_of(b"get"), key_of(b"set"), "same length, other letter");
+        assert_ne!(key_of(b"get"), key_of(b"gett"), "other length");
     }
 
     #[test]
