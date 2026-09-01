@@ -1019,6 +1019,31 @@ mod tests {
     /// byte value. Sixteen bytes a field is then a hash that holds what it
     /// stores and nothing else, which nothing can reach, so the number to read
     /// is the overhead column and the gate is really thirty two total.
+    ///
+    /// At a million fields it prints 38.09 total against a payload of 16, so
+    /// 22.09 of overhead, and the columns say where all of it is. Slots 8.39,
+    /// rows 12.26, names 8.20, values 9.24. Two of those four are nearly all
+    /// payload: names is the eight byte field name plus 0.20 of blob slack and
+    /// values is the eight byte value plus 1.24. The overhead is the other two
+    /// plus that slack, and it breaks down as a four byte slot at 2.1 slots a
+    /// field, an eight byte row, and the four byte offset into the value
+    /// blob that the table carries beside its rows.
+    ///
+    /// Slots is 8.39 rather than 5.33 only because the slot array rounds up to a
+    /// power of two, and a million fields wants 1.33 million slots and gets
+    /// 2.09 million, so the table sits at 0.48 load. Sizing it exactly would
+    /// save 3.06 bytes a field, and #178's control run already priced that at
+    /// roughly nothing on a hit and eighteen to twenty percent on a miss.
+    ///
+    /// That is worth knowing because it says the gate cannot be reached by
+    /// tuning. Even with the slot array sized exactly and no blob slack at all
+    /// the three arrays come to 5.33 plus 8 plus 4, which is 17.33, and the bar
+    /// is 16. One of the three has to go rather than shrink. The one that looks
+    /// removable is the value offset: a field's name and its value could sit
+    /// back to back in one blob, and then the row's `at` finds both and the
+    /// four byte column disappears. What that costs is a length for the value,
+    /// which is a byte in the blob for anything under 128 rather than four
+    /// beside every row.
     #[test]
     #[ignore = "a measurement, run it by name"]
     fn measure_bytes_per_field() {
@@ -1033,19 +1058,23 @@ mod tests {
                 h.set(f.as_bytes(), v.as_bytes(), &limits);
             }
             let total = h.memory_bytes();
-            let (fields, values) = match &h.body {
-                Body::Table(t) => (t.fields.memory_bytes(), t.values.memory_bytes()),
-                Body::Packed(_) => (0, 0),
-            };
             let per = |b: usize| b as f64 / n as f64;
-            println!(
-                "n={n:<9} band={:<9} total={total:<10} payload={payload:<9} fields={:.2}/f values={:.2}/f per_field={:.2} over_per_field={:.2}",
-                if fields == 0 { "listpack" } else { "table" },
-                per(fields),
-                per(values),
-                per(total),
-                (total as f64 - payload as f64) / n as f64
-            );
+            match &h.body {
+                Body::Table(t) => println!(
+                    "table    n={n:<9} total={total:<10} payload={payload:<9} per_field={:.2} over_per_field={:.2} slots={:.2} rows={:.2} names={:.2} values={:.2}",
+                    per(total),
+                    per(total - payload),
+                    per(t.fields.slot_bytes()),
+                    per(t.fields.row_bytes()),
+                    per(t.fields.name_bytes()),
+                    per(t.values.memory_bytes()),
+                ),
+                Body::Packed(_) => println!(
+                    "listpack n={n:<9} total={total:<10} payload={payload:<9} per_field={:.2} over_per_field={:.2}",
+                    per(total),
+                    per(total - payload),
+                ),
+            }
         }
     }
 
