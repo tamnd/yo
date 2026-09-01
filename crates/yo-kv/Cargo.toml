@@ -31,6 +31,10 @@ name = "elem"
 harness = false
 
 [[bench]]
+name = "grow"
+harness = false
+
+[[bench]]
 name = "intset"
 harness = false
 
