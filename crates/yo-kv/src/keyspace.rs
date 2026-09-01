@@ -80,6 +80,23 @@ pub struct Keyspace {
     pub(crate) zsets: Slab<Zset>,
     /// Every sparse array in this database, addressed the same way.
     pub(crate) arrays: Slab<Array>,
+    /// How many live keys carry a deadline.
+    ///
+    /// Redis keeps a whole second dictionary of these, `db->expires`, and this
+    /// is one number off the front of it. It answers the two questions the
+    /// number alone can answer, and both of them matter. `INFO keyspace` reports
+    /// it as `expires=`, where this used to print a hardcoded zero. And a
+    /// `volatile` policy that is about to sample for a victim can find out in
+    /// one comparison that there is no eligible key anywhere, rather than
+    /// drawing four rounds of buckets to be told the same thing by every key in
+    /// them, on a path where a client is waiting for the write it is making room
+    /// for.
+    ///
+    /// It is kept exact and not as an estimate, because `INFO` reporting a
+    /// number that is nearly right is worse than reporting nothing. Every record
+    /// written goes through [`Keyspace::write_rec`] and every record deleted
+    /// goes through [`Keyspace::del_rec`], and those two are the whole of it.
+    pub(crate) expires: usize,
     /// How many keys hold something that is not a string.
     ///
     /// This exists so that a database of nothing but strings, which is every
@@ -324,6 +341,7 @@ impl Keyspace {
             clock,
             expired: 0,
             evicted: 0,
+            expires: 0,
             sets: Slab::new(),
             hashes: Slab::new(),
             lists: Slab::new(),
@@ -443,10 +461,48 @@ impl Keyspace {
         fill: impl FnOnce(&mut [u8]),
     ) -> Option<usize> {
         let a = self.access_for_write(key);
-        self.map.set_with(key, len, |out| {
-            fill(out);
-            value::set_access(out, a);
-        })
+        // What the count of keys with deadlines has to move by, worked out from
+        // the one bit in the record that says so, on both sides of the write.
+        // Two byte reads on a path that has just written the record and had the
+        // old one in cache to overwrite it, which is what a count that has to be
+        // exact costs. The alternative is a second lookup per write to ask the
+        // same question, and that is not a trade worth making for a number.
+        let mut had = false;
+        let mut has = false;
+        let out = self.map.set_with(
+            key,
+            len,
+            |old| had = value::has_expiry(old),
+            |out| {
+                fill(out);
+                value::set_access(out, a);
+                has = value::has_expiry(out);
+            },
+        );
+        match (had, has) {
+            (false, true) => self.expires += 1,
+            (true, false) => self.expires -= 1,
+            _ => {}
+        }
+        out
+    }
+
+    /// Take `key` out of the map, keeping the deadline count right.
+    ///
+    /// The other half of [`Keyspace::write_rec`], and every path that removes a
+    /// record goes through one of the two. That is `DEL`, lazy expiry, eviction
+    /// and the source key of a `RENAME`, and the last one is why this is not
+    /// simply folded into [`Keyspace::drop_key`]: a rename hands the body to the
+    /// destination and must not free it, so it deletes the source record without
+    /// dropping the key, and it still has to be counted.
+    #[inline]
+    pub(crate) fn del_rec(&mut self, key: &[u8]) -> bool {
+        let mut had = false;
+        let gone = self.map.del_with(key, |old| had = value::has_expiry(old));
+        if had {
+            self.expires -= 1;
+        }
+        gone
     }
 
     /// What the access field of a record about to be written should say.
@@ -883,7 +939,7 @@ impl Keyspace {
     #[inline]
     pub(crate) fn drop_key(&mut self, key: &[u8]) -> bool {
         self.free_body(key);
-        self.map.del(key)
+        self.del_rec(key)
     }
 
     /// Drop `key` if its deadline has passed.
@@ -1072,7 +1128,10 @@ impl Keyspace {
     ///
     /// The expiry counter is not reset, because Redis does not reset it either:
     /// `expired_keys` in `INFO stats` counts what this process has expired since
-    /// it started, and emptying a database is not expiring anything.
+    /// it started, and emptying a database is not expiring anything. The count of
+    /// keys that carry a deadline is a different number and it does go to zero,
+    /// because it is a fact about what is in the database right now and there is
+    /// nothing in it.
     pub fn clear(&mut self) {
         self.map.clear();
         self.sets.clear();
@@ -1081,6 +1140,7 @@ impl Keyspace {
         self.zsets.clear();
         self.arrays.clear();
         self.bodies = 0;
+        self.expires = 0;
     }
 
     /// Keys reclaimed by running into them after their deadline.
@@ -1103,6 +1163,16 @@ impl Keyspace {
     #[inline]
     pub const fn evicted_keys(&self) -> u64 {
         self.evicted
+    }
+
+    /// How many live keys carry a deadline.
+    ///
+    /// This is what `INFO keyspace` reports as `expires=`, and it is the live
+    /// count rather than a running total: a key that gets a `TTL` and then has it
+    /// taken away with `PERSIST` is in it and then is not.
+    #[inline]
+    pub const fn expires(&self) -> usize {
+        self.expires
     }
 
     /// How many keys a round of eviction sampling looks at.
@@ -1177,6 +1247,15 @@ impl Keyspace {
     /// for it, and the active cycle takes it before that.
     fn victim(&mut self) -> Option<Addr> {
         if matches!(self.policy, Policy::NoEviction) || self.map.is_empty() {
+            return None;
+        }
+        // The classic eviction surprise, answered before it costs anything. A
+        // `volatile` policy on a database where no key has a deadline has no
+        // eligible key anywhere, and the loop below can only find that out by
+        // drawing four rounds of buckets and being told so by every key in them,
+        // on a path where a client is waiting for the write this is making room
+        // for. The count knows.
+        if self.policy.volatile_only() && self.expires == 0 {
             return None;
         }
         let now = self.clock.now_ms();
@@ -1487,6 +1566,95 @@ mod tests {
         assert!(d.evict_one());
         assert!(!d.exists(b"k7"));
         assert_eq!(d.evicted_keys(), 1);
+    }
+
+    /// The count against a walk, over everything that can move it. If these two
+    /// ever disagree the count is worse than useless, because `INFO` would be
+    /// reporting a number that looks like a measurement.
+    #[test]
+    fn the_deadline_count_says_what_a_walk_of_the_keyspace_says() {
+        let mut d = db();
+        let now = d.clock().now_ms();
+        let check = |d: &mut Keyspace, note: &str| {
+            let mut names = Vec::new();
+            d.keys(|k| names.push(k.to_vec()));
+            let walked = names
+                .iter()
+                .filter(|k| matches!(d.deadline_of(k), Ask::At(_)))
+                .count();
+            assert_eq!(d.expires(), walked, "{note}");
+        };
+
+        for i in 0..40u32 {
+            d.set_plain(format!("s{i}").as_bytes(), b"v").expect("room");
+            d.sadd(format!("c{i}").as_bytes(), [b"m".as_slice()].into_iter())
+                .expect("room");
+        }
+        check(&mut d, "nothing has a deadline yet");
+        assert_eq!(d.expires(), 0);
+
+        // On, on again with a different deadline, and off.
+        for i in (0..40u32).step_by(2) {
+            d.set_expiry(format!("s{i}").as_bytes(), Some(now + 500_000));
+            d.set_expiry(format!("c{i}").as_bytes(), Some(now + 500_000));
+        }
+        check(&mut d, "half of each type has one");
+        assert_eq!(d.expires(), 40);
+        for i in (0..40u32).step_by(4) {
+            d.set_expiry(format!("s{i}").as_bytes(), Some(now + 900_000));
+        }
+        check(&mut d, "moving a deadline is not gaining one");
+        assert_eq!(d.expires(), 40);
+        for i in (0..40u32).step_by(4) {
+            d.set_expiry(format!("c{i}").as_bytes(), None);
+        }
+        check(&mut d, "and PERSIST gives them back");
+        assert_eq!(d.expires(), 30);
+
+        // Written over, which is the path where the record loses its deadline
+        // without anybody saying so.
+        d.set_plain(b"s2", b"fresh").expect("room");
+        check(&mut d, "a plain SET drops the deadline it wrote over");
+
+        // Renamed, deleted, expired and evicted.
+        d.rename(b"s6", b"s6new", false);
+        check(&mut d, "a rename moved one rather than losing it");
+        d.drop_key(b"s6new");
+        d.drop_key(b"c2");
+        check(&mut d, "two deleted");
+        d.psetex(b"gone", 50, b"v").expect("room");
+        check(&mut d, "and one more with a short deadline");
+        d.clock_mut().advance(60);
+        assert_eq!(d.kind_of(b"gone"), None, "which the read reaped");
+        check(&mut d, "so the count lost it too");
+        d.set_policy(Policy::VolatileRandom);
+        assert!(d.evict_one());
+        check(&mut d, "eviction under a volatile policy takes one of them");
+
+        d.clear();
+        assert_eq!(d.expires(), 0, "and FLUSHDB takes the lot");
+    }
+
+    /// The point of the count on the eviction path. A volatile policy with
+    /// nothing to evict answers on the comparison rather than on four rounds of
+    /// buckets, and it has to still answer `false`.
+    #[test]
+    fn a_volatile_policy_asks_the_count_before_it_samples() {
+        let mut d = db();
+        d.set_policy(Policy::VolatileLfu);
+        for i in 0..500u32 {
+            d.set_plain(format!("k{i}").as_bytes(), b"v").expect("room");
+        }
+        assert_eq!(d.expires(), 0);
+        assert!(!d.evict_one(), "nothing is eligible and nothing went");
+        assert_eq!(d.len(), 500);
+
+        // And the fast path gets out of the way the moment one key qualifies.
+        d.set_expiry(b"k123", Some(d.clock().now_ms() + 100_000));
+        assert_eq!(d.expires(), 1);
+        assert!(d.evict_one());
+        assert!(!d.exists(b"k123"));
+        assert_eq!(d.expires(), 0, "and the count went with it");
     }
 
     /// The direction of the score, which is the thing worth pinning. A test that

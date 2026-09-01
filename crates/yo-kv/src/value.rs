@@ -578,6 +578,17 @@ pub fn expire_at(rec: &[u8]) -> Option<u64> {
     Some(u64::from_le_bytes(b))
 }
 
+/// Whether a record carries a deadline at all, without reading it.
+///
+/// One byte where [`expire_at`] reads nine, which is the difference between a
+/// question worth asking on every write and one that is not. The count of keys
+/// with deadlines is kept up to date on every record written and every record
+/// deleted, and all it ever needs is this bit.
+#[inline]
+pub fn has_expiry(rec: &[u8]) -> bool {
+    Meta::from_byte(rec[0]).has_expiry()
+}
+
 /// Whether a record's deadline has passed at `now_ms`.
 ///
 /// A deadline exactly equal to now has passed, which is Redis's reading: a key
