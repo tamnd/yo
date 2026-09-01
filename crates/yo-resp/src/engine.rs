@@ -800,6 +800,12 @@ impl<S: Sink> Wire<S> {
     /// worth of keys, which is where an unloaded process running the same
     /// writes settled at six.
     pub fn maintain(&mut self) -> Option<usize> {
+        // Before the compaction and not after it, because the reading the next
+        // batch judges its limit against should be the one taken after the last
+        // batch's writes rather than the one taken after this call's collecting.
+        // Both are true, and the first is the one that is a batch old at worst.
+        // Nothing at all on a server with no `maxmemory`, which is the default.
+        self.server.refresh_memory();
         self.server.compact_step()
     }
 }

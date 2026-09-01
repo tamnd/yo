@@ -95,6 +95,25 @@ const ALL_DATABASES: u64 = if DATABASES == 64 {
 };
 const _: () = assert!(DATABASES <= 64);
 
+/// How many keys one command throws away before it leaves the rest to the next.
+///
+/// A bound and not a loop to the end, because this runs in front of a client
+/// that is waiting for its reply, and a server a long way over its limit would
+/// otherwise hold that client for as long as it took to walk all the way back
+/// under. Sixty four is a batch's worth of commands, so a server that went over
+/// by what one batch allocated comes back under in one command, and a server
+/// whose limit was just cut in half works through it over the next few thousand
+/// rather than in one long stall. Redis bounds the same loop by a time slice
+/// instead of a count and hands the rest to a timer; there is no timer here, so
+/// the rest goes to the next command that runs.
+const EVICT_BUDGET: usize = 64;
+
+/// What a server says to a command that would allocate when it has no room.
+///
+/// Redis's `shared.oomerr`, word for word including the full stop, because
+/// clients match on the `OOM` prefix and people match on the sentence.
+const OOM: &[u8] = b"command not allowed when used memory > 'maxmemory'.";
+
 /// What the connection should do after a command.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Flow {
@@ -151,6 +170,29 @@ pub struct Server {
     dirty: u64,
     /// What the connections are holding, kept by the engine.
     conn_bytes: usize,
+    /// The `maxmemory` limit in bytes, zero when there is not one.
+    ///
+    /// Zero is the default and it is the whole reason the check in front of
+    /// every write is one comparison against a field that is already warm.
+    maxmemory: u64,
+    /// What [`Server::memory_bytes`] said at the last maintenance turn.
+    ///
+    /// The reading is a walk over every collection in every database and cannot
+    /// go on a command path, so the command path reads this instead and is at
+    /// most one batch behind. What that costs is overshoot: a server can end a
+    /// batch holding one batch's worth of allocation more than its limit before
+    /// anything notices. A batch is 64 commands, so that is bounded by what 64
+    /// commands can allocate and not by how long the server runs.
+    ///
+    /// Only kept up to date when there is a limit to judge it against. A server
+    /// with no `maxmemory` never reads it and never pays for it.
+    used: usize,
+    /// Which database the next eviction draws from.
+    ///
+    /// Its own cursor and not [`Server::next_db`], because eviction and
+    /// compaction move at different rates and sharing one would make the
+    /// database that gets compacted depend on how many keys were evicted.
+    evict_db: usize,
     /// Clients parked on a blocking command.
     waiters: Waiters,
     /// The numbers the reactor keeps for `INFO`.
@@ -171,6 +213,9 @@ impl Server {
             next_db: 0,
             dirty: ALL_DATABASES,
             conn_bytes: 0,
+            maxmemory: 0,
+            used: 0,
+            evict_db: 0,
             waiters: Waiters::default(),
             stats: Stats::default(),
         }
@@ -188,6 +233,9 @@ impl Server {
             next_db: 0,
             dirty: ALL_DATABASES,
             conn_bytes: 0,
+            maxmemory: 0,
+            used: 0,
+            evict_db: 0,
             waiters: Waiters::default(),
             stats: Stats::default(),
         }
@@ -336,6 +384,125 @@ impl Server {
         self.dbs.iter().map(Keyspace::evicted_keys).sum()
     }
 
+    /// The `maxmemory` limit in bytes, zero when there is not one.
+    #[must_use]
+    pub const fn maxmemory(&self) -> u64 {
+        self.maxmemory
+    }
+
+    /// Set the limit, and take a reading straight away.
+    ///
+    /// The reading is here rather than left to the next maintenance turn because
+    /// a client that sets the limit and sends a write in the same batch expects
+    /// the write to be judged against the limit it just set, and because the
+    /// cached number is meaningless until the first time there is a limit to
+    /// compare it with.
+    pub fn set_maxmemory(&mut self, bytes: u64) {
+        self.maxmemory = bytes;
+        self.used = self.memory_bytes();
+    }
+
+    /// Take a fresh memory reading, which the maintenance turn does once a batch.
+    ///
+    /// Nothing at all when there is no limit, which is the default and is every
+    /// server that has not asked for one.
+    pub fn refresh_memory(&mut self) {
+        if self.maxmemory != 0 {
+            self.used = self.memory_bytes();
+        }
+    }
+
+    /// Make room under the `maxmemory` limit, throwing keys away if that is what
+    /// it takes. Answers whether there is anything left it could throw away.
+    ///
+    /// Redis runs the same thing from `processCommand` before every command and
+    /// so does this: a client that writes has to be judged at the moment it
+    /// writes, not a batch later, or the limit is a suggestion.
+    ///
+    /// Three things happen in the loop and all three are needed. Eviction picks
+    /// a key and drops it. Compaction gives the pages back, because dropping a
+    /// key marks its record dead and returns nothing on its own, so a loop that
+    /// only evicted would throw the whole keyspace away and watch the number
+    /// stay where it was. The reading is taken again each time round, because
+    /// the two of them together are the only thing that moves it.
+    ///
+    /// # Why running out of budget is not a no
+    ///
+    /// `false` means there was nothing left to evict, which is `noeviction`, or
+    /// a `volatile` policy on a database where nothing has a deadline, or a
+    /// keyspace that is already empty. It does not mean the server is still over
+    /// its limit, and that difference is Redis's: `performEvictions` answers
+    /// `EVICT_FAIL` only when it has run out of things to delete, and
+    /// `processCommand` refuses the client on that and on nothing else. Running
+    /// out of time part way through a job it is doing well comes back as
+    /// `EVICT_RUNNING` and the command goes through, because a server that is
+    /// evicting steadily and refusing every write while it does it is worse for
+    /// the client than a little overshoot.
+    ///
+    /// # What the limit is worth
+    ///
+    /// Space comes back a segment at a time and a segment is two megabytes, so
+    /// this holds a server to its limit give or take a segment. A `maxmemory` of
+    /// a few hundred megabytes gets what it asked for. A `maxmemory` of four
+    /// megabytes is asking for a precision this store does not have.
+    pub fn make_room(&mut self) -> bool {
+        if self.maxmemory == 0 || self.used as u64 <= self.maxmemory {
+            return true;
+        }
+        // The cached reading is a batch old and the batch may have compacted
+        // since, so take a fresh one before throwing anything away. This is the
+        // one place that pays for a reading on a command path, and it only pays
+        // when the last reading said the server was already over.
+        self.used = self.memory_bytes();
+        let mut budget = EVICT_BUDGET;
+        while self.used as u64 > self.maxmemory {
+            if !self.evict_step() {
+                return false;
+            }
+            self.compact_hard_step();
+            self.used = self.memory_bytes();
+            budget -= 1;
+            if budget == 0 {
+                break;
+            }
+        }
+        true
+    }
+
+    /// Throw one key away, from whichever database has one to give.
+    ///
+    /// Round robin from a cursor rather than always starting at database zero,
+    /// so a server using more than one of them does not empty the first before
+    /// touching the second. Almost every server is on database zero only, where
+    /// this is one call that answers and fifteen that say the map is empty.
+    fn evict_step(&mut self) -> bool {
+        for turn in 0..self.dbs.len() {
+            let i = (self.evict_db + turn) % self.dbs.len();
+            if self.dbs[i].evict_one() {
+                self.evict_db = (i + 1) % self.dbs.len();
+                self.dirty |= 1u64 << i;
+                return true;
+            }
+        }
+        false
+    }
+
+    /// One slice of compaction for a server that is over its limit.
+    ///
+    /// Takes the databases in the same order [`Server::compact_step`] does and
+    /// stops at the first one that had something to move, and it asks with the
+    /// ratios off. See [`Keyspace::compact_hard`] for what that changes.
+    fn compact_hard_step(&mut self) -> Option<usize> {
+        for turn in 0..self.dbs.len() {
+            let i = (self.next_db + turn) % self.dbs.len();
+            if let Some(moved) = self.dbs[i].compact_hard() {
+                self.next_db = (i + 1) % self.dbs.len();
+                return Some(moved);
+            }
+        }
+        None
+    }
+
     /// Give one database's dead space back, if any database has enough of it to
     /// be worth the move. `None` when no database had a candidate.
     ///
@@ -448,6 +615,20 @@ pub fn execute(server: &mut Server, session: &mut Session, args: Args<'_>, out: 
         return Flow::Continue;
     }
 
+    // The limit first, so a server with no `maxmemory`, which is the default and
+    // is nearly all of them, pays one comparison against a field that is already
+    // warm. Every command and not only the writes, because that is where Redis
+    // puts it: making room is the server's job whatever the client asked for,
+    // and the flag only decides who gets told no when there is no room to make.
+    //
+    // The flag is Redis's own `denyoom` and the list of commands carrying it is
+    // Redis's list, so a command that only frees is let through with nothing
+    // left, which is what lets a client dig itself out with `DEL`.
+    if server.maxmemory != 0 && !server.make_room() && spec.flags.contains(&"denyoom") {
+        out.error_line(b"OOM ", OOM);
+        return Flow::Continue;
+    }
+
     // Which databases the maintenance turn after this batch has to ask. Marked
     // for every command and not only for the writes, because a read can make
     // garbage too: a `GET` on a key whose expiry has passed reaps it, and the
@@ -516,8 +697,11 @@ pub fn execute(server: &mut Server, session: &mut Session, args: Args<'_>, out: 
 ///
 /// The prefix is what a client branches on, and there are only two of them in
 /// this milestone: `WRONGTYPE` for a command sent at the wrong kind of value,
-/// and `ERR` for everything else. The two errors that need a third, `NOPROTO`
-/// and `WRONGPASS`, are written by `HELLO` itself.
+/// and `ERR` for everything else. The three errors that need a different one,
+/// `NOPROTO`, `WRONGPASS` and `OOM`, are written where they are decided rather
+/// than routed through here. `OOM` is not a [`Code`] of its own because
+/// [`Code::Full`] already covers the string that is too long for
+/// `proto-max-bulk-len`, and that one goes out as `ERR` on a real server.
 fn write_error(out: &mut Out, e: &Error) {
     let prefix: &[u8] = match e.code() {
         Code::WrongType => b"WRONGTYPE ",
@@ -1831,6 +2015,134 @@ mod tests {
                 )
             );
         }
+    }
+
+    #[test]
+    fn the_memory_limit_reads_back_in_bytes_whatever_the_unit_was() {
+        let mut f = Fixture::new();
+        assert_eq!(
+            f.run(&[b"CONFIG", b"GET", b"maxmemory"]),
+            "*2\r\n$9\r\nmaxmemory\r\n$1\r\n0\r\n",
+            "no limit is the default"
+        );
+        // The pairing is Redis's and it is a trap: the bare letter is a power of
+        // ten and the one with the b is a power of two.
+        for (typed, bytes) in [
+            (&b"1024"[..], "1024"),
+            (b"1k", "1000"),
+            (b"1kb", "1024"),
+            (b"1M", "1000000"),
+            (b"1Mb", "1048576"),
+            (b"1gb", "1073741824"),
+            (b"100mb", "104857600"),
+        ] {
+            assert_eq!(f.run(&[b"CONFIG", b"SET", b"maxmemory", typed]), "+OK\r\n");
+            assert_eq!(
+                f.run(&[b"CONFIG", b"GET", b"maxmemory"]),
+                format!("*2\r\n$9\r\nmaxmemory\r\n${}\r\n{bytes}\r\n", bytes.len()),
+                "set {}",
+                String::from_utf8_lossy(typed)
+            );
+        }
+        assert!(
+            f.run(&[b"INFO", b"memory"]).contains("maxmemory:104857600"),
+            "the report agrees with the setting"
+        );
+
+        // A unit nobody has heard of, and a negative number, which is not a very
+        // large one however it is spelled.
+        for bad in [&b"1tb"[..], b"-1", b"", b"lots"] {
+            assert_eq!(
+                f.run(&[b"CONFIG", b"SET", b"maxmemory", bad]),
+                "-ERR CONFIG SET failed (possibly related to argument 'maxmemory') - argument must be a memory value\r\n",
+                "refused {}",
+                String::from_utf8_lossy(bad)
+            );
+        }
+        assert!(
+            f.run(&[b"INFO", b"memory"]).contains("maxmemory:104857600"),
+            "and the refusal left the old one alone"
+        );
+    }
+
+    #[test]
+    fn a_write_is_refused_when_there_is_no_room_and_nothing_to_evict() {
+        let mut f = Fixture::new();
+        f.run(&[b"SET", b"here", b"already"]);
+        // A byte, which is under what an empty server holds, so nothing this
+        // command could do would get it under. The default policy is
+        // `noeviction`, so nothing is what it does.
+        f.run(&[b"CONFIG", b"SET", b"maxmemory", b"1"]);
+        assert_eq!(
+            f.run(&[b"SET", b"k", b"v"]),
+            "-OOM command not allowed when used memory > 'maxmemory'.\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"LPUSH", b"l", b"v"]),
+            "-OOM command not allowed when used memory > 'maxmemory'.\r\n"
+        );
+        // Reading is allowed, and so is the one thing that would help.
+        assert_eq!(f.run(&[b"GET", b"here"]), "$7\r\nalready\r\n");
+        assert_eq!(f.run(&[b"DEL", b"here"]), ":1\r\n");
+        assert!(f.run(&[b"INFO", b"stats"]).contains("evicted_keys:0"));
+
+        // Taking the limit away lets the write through again.
+        f.run(&[b"CONFIG", b"SET", b"maxmemory", b"0"]);
+        assert_eq!(f.run(&[b"SET", b"k", b"v"]), "+OK\r\n");
+    }
+
+    #[test]
+    fn an_allkeys_policy_makes_room_instead_of_refusing() {
+        let mut f = Fixture::new();
+        let val = vec![b'v'; 256];
+        for i in 0..24000u32 {
+            let k = format!("key:{i:08}");
+            f.run(&[b"SET", k.as_bytes(), &val]);
+        }
+        let full = f.server.memory_bytes();
+        assert!(
+            full > 3 * 1024 * 1024,
+            "the arena is several segments: {full}"
+        );
+
+        // Two megabytes under what it is holding, which is one segment's worth,
+        // so getting there means giving a whole segment back and not just
+        // dropping a few records.
+        let limit = full - 2 * 1024 * 1024;
+        f.run(&[b"CONFIG", b"SET", b"maxmemory-policy", b"allkeys-lru"]);
+        f.run(&[
+            b"CONFIG",
+            b"SET",
+            b"maxmemory",
+            limit.to_string().as_bytes(),
+        ]);
+
+        // Writes keep working the whole way down. The budget means one command
+        // does not do it all, so this runs until the server has settled and
+        // checks that nothing was refused on the way.
+        for i in 0..2000u32 {
+            let k = format!("new:{i:08}");
+            assert_eq!(
+                f.run(&[b"SET", k.as_bytes(), &val]),
+                "+OK\r\n",
+                "write {i} was refused"
+            );
+            f.server.refresh_memory();
+            if f.server.memory_bytes() <= limit {
+                break;
+            }
+        }
+        assert!(
+            f.server.memory_bytes() <= limit,
+            "it never got under: {} against {limit}",
+            f.server.memory_bytes()
+        );
+        let info = f.run(&[b"INFO", b"stats"]);
+        assert!(!info.contains("evicted_keys:0"), "{info}");
+        assert!(
+            f.run(&[b"DBSIZE"]) != ":0\r\n",
+            "and it did not empty the database to get there"
+        );
     }
 
     #[test]

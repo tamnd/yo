@@ -49,7 +49,6 @@ const SETTINGS: &[(&str, &str)] = &[
     ("appendfsync", "everysec"),
     ("databases", "16"),
     ("io-threads", "1"),
-    ("maxmemory", "0"),
     ("proto-max-bulk-len", "536870912"),
     ("save", ""),
     ("timeout", "0"),
@@ -115,6 +114,58 @@ const LADDER: &[(&str, Knob)] = &[
 /// their access field stays there and means something different from the moment
 /// the policy changes, which is what the `OBJECT FREQ` error text warns about.
 const MAXMEMORY_POLICY: &str = "maxmemory-policy";
+
+/// How much the server is allowed to hold before it starts evicting.
+///
+/// Also on its own, and for the third different reason. It is not immutable,
+/// it is not on the size ladder and it is the only setting whose value is not a
+/// plain integer: a client writes `maxmemory 100mb` and means a hundred and
+/// four million bytes, so it needs a parser of its own.
+///
+/// Zero means no limit, which is the default and is what makes the check in
+/// front of every write one comparison. Setting it to a number smaller than
+/// what the server is already holding is allowed and is a real thing to do: the
+/// next write that would allocate evicts until it fits or is refused, which is
+/// what the `maxmemory-policy` decides between.
+const MAXMEMORY: &str = "maxmemory";
+
+/// Read a byte count the way `CONFIG SET maxmemory` reads one.
+///
+/// This is Redis's `memtoull`. Digits, then an optional unit that is not case
+/// sensitive: nothing or `b` is bytes, `k` is a thousand and `kb` is a kibibyte,
+/// and the same pairing again for `m` and `g`. The two spellings meaning
+/// different numbers is a trap and it is Redis's trap, so it is repeated here
+/// rather than tidied up.
+///
+/// A unit that overflows clamps rather than failing, which is upstream's
+/// `ULLONG_MAX` arm. There is no sign: a leading minus is refused before the
+/// digits are read, so `maxmemory -1` is not a very large number.
+fn parse_memory(value: &[u8]) -> Option<u64> {
+    let split = value
+        .iter()
+        .position(|b| !b.is_ascii_digit())
+        .unwrap_or(value.len());
+    let (digits, unit) = value.split_at(split);
+    if digits.is_empty() {
+        return None;
+    }
+    let mul: u64 = match unit {
+        [] => 1,
+        u if u.eq_ignore_ascii_case(b"b") => 1,
+        u if u.eq_ignore_ascii_case(b"k") => 1000,
+        u if u.eq_ignore_ascii_case(b"kb") => 1024,
+        u if u.eq_ignore_ascii_case(b"m") => 1000 * 1000,
+        u if u.eq_ignore_ascii_case(b"mb") => 1024 * 1024,
+        u if u.eq_ignore_ascii_case(b"g") => 1000 * 1000 * 1000,
+        u if u.eq_ignore_ascii_case(b"gb") => 1024 * 1024 * 1024,
+        _ => return None,
+    };
+    let mut n: u64 = 0;
+    for d in digits {
+        n = n.saturating_mul(10).saturating_add(u64::from(d - b'0'));
+    }
+    Some(n.saturating_mul(mul))
+}
 
 /// Every policy name, joined the way `CONFIG SET` lists them when it refuses one.
 ///
@@ -614,7 +665,13 @@ fn config(server: &mut Server, args: Args<'_>, out: &mut Out) -> Result<()> {
         let fixed = SETTINGS.iter().filter(|(k, _)| wanted(k));
         let ladder = LADDER.iter().filter(|(k, _)| wanted(k));
         let policy = wanted(MAXMEMORY_POLICY);
-        out.map(fixed.clone().count() + ladder.clone().count() + usize::from(policy));
+        let limit = wanted(MAXMEMORY);
+        out.map(
+            fixed.clone().count()
+                + ladder.clone().count()
+                + usize::from(policy)
+                + usize::from(limit),
+        );
         for (k, v) in fixed {
             out.bulk(k.as_bytes());
             out.bulk(v.as_bytes());
@@ -626,6 +683,13 @@ fn config(server: &mut Server, args: Args<'_>, out: &mut Out) -> Result<()> {
         if policy {
             out.bulk(MAXMEMORY_POLICY.as_bytes());
             out.bulk(server.db_ref(0).policy().name().as_bytes());
+        }
+        if limit {
+            // Back as a plain number of bytes whatever the client typed to set
+            // it, which is what a real server does: `CONFIG SET maxmemory 1gb`
+            // reads back as 1073741824.
+            out.bulk(MAXMEMORY.as_bytes());
+            out.bulk_int(server.maxmemory() as i64);
         }
     } else if is(sub, b"SET") {
         // Too few is a wrong number of arguments and an odd number is a syntax
@@ -646,10 +710,23 @@ fn config(server: &mut Server, args: Args<'_>, out: &mut Out) -> Result<()> {
         let mut writes = [None; 16];
         let mut count = 0;
         let mut policy = None;
+        let mut limit = None;
         let mut i = 2;
         while i < args.len() {
             let (name, value) = (args.get(i), args.get(i + 1));
             i += 2;
+            if is(name, MAXMEMORY.as_bytes()) {
+                let Some(bytes) = parse_memory(value) else {
+                    return Err(Error::fmt(
+                        Code::Invalid,
+                        format_args!(
+                            "CONFIG SET failed (possibly related to argument '{MAXMEMORY}') - argument must be a memory value"
+                        ),
+                    ));
+                };
+                limit = Some(bytes);
+                continue;
+            }
             if is(name, MAXMEMORY_POLICY.as_bytes()) {
                 // Named twice in one command, the last one wins, which is the
                 // same rule the ladder settings follow and is what a real server
@@ -711,6 +788,14 @@ fn config(server: &mut Server, args: Args<'_>, out: &mut Out) -> Result<()> {
             for at in 0..DATABASES {
                 server.db(at).set_policy(p);
             }
+        }
+        // Last, so that a `CONFIG SET maxmemory 1mb maxmemory-policy allkeys-lru`
+        // has the policy in place before the limit that will act on it. The two
+        // in the other order would run the first eviction under whatever the
+        // policy used to be, which for a fresh server is `noeviction` and would
+        // refuse the next write instead of making room for it.
+        if let Some(bytes) = limit {
+            server.set_maxmemory(bytes);
         }
         out.ok();
     } else if is(sub, b"RESETSTAT") {
@@ -787,7 +872,7 @@ fn info(server: &Server, args: Args<'_>, out: &mut Out) {
                 "# Memory\r\nused_memory:{}\r\nused_memory_dataset:{}\r\n\
                  used_memory_overhead:{}\r\nmem_arena_bytes:{}\r\n\
                  mem_arena_segments:{}\r\nmem_index_bytes:{}\r\n\
-                 mem_client_buffers:{}\r\nmaxmemory:0\r\n\
+                 mem_client_buffers:{}\r\nmaxmemory:{}\r\n\
                  maxmemory_policy:{}\r\n\r\n",
                 server.memory_bytes(),
                 server.dataset_bytes(),
@@ -796,6 +881,7 @@ fn info(server: &Server, args: Args<'_>, out: &mut Out) {
                 server.segment_count(),
                 server.index_bytes(),
                 server.conn_bytes(),
+                server.maxmemory(),
                 server.db_ref(0).policy().name(),
             );
         }

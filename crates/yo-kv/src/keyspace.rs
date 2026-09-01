@@ -1211,6 +1211,16 @@ impl Keyspace {
         self.map.compact_step()
     }
 
+    /// The same, for a store that is over a memory limit and has to give pages
+    /// back rather than wait for a segment to be worth collecting.
+    ///
+    /// See [`RawMap::compact_hard`] for why the choice of segment changes and
+    /// why it only changes under pressure.
+    #[inline]
+    pub fn compact_hard(&mut self) -> Option<usize> {
+        self.map.compact_hard()
+    }
+
     /// Ask the cache for the bucket this key will land in.
     ///
     /// The first of the loop's two walks (`04` section 3) calls this.

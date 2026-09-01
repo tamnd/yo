@@ -669,10 +669,37 @@ impl RawMap {
     /// never picked up, and the arena would fill with segments that are nearly
     /// empty and never reclaimed.
     pub fn compact_step(&mut self) -> Option<usize> {
+        self.compact(false)
+    }
+
+    /// One slice of compaction for a store that has run out of room.
+    ///
+    /// The same work, choosing between segments the way
+    /// [`Arena::any_candidate`](yo_arena::Arena::any_candidate) chooses rather
+    /// than the way [`Arena::worst_candidate`](yo_arena::Arena::worst_candidate)
+    /// does, so a segment holding a single dead record is still worth
+    /// evacuating. The reason is written on `any_candidate`: at a memory limit
+    /// the copying is cheaper than the alternative, which is telling a client no.
+    ///
+    /// A segment already in flight is finished first either way, so switching
+    /// between this and [`RawMap::compact_step`] cannot leave a segment half
+    /// evacuated forever.
+    pub fn compact_hard(&mut self) -> Option<usize> {
+        self.compact(true)
+    }
+
+    fn compact(&mut self, hard: bool) -> Option<usize> {
         self.writes += 1;
         let (seg, from) = match self.evac {
             Some(e) => (e.seg, e.off),
-            None => (self.arena.worst_candidate()?, yo_arena::HEADER_SIZE),
+            None => {
+                let pick = if hard {
+                    self.arena.any_candidate()?
+                } else {
+                    self.arena.worst_candidate()?
+                };
+                (pick, yo_arena::HEADER_SIZE)
+            }
         };
         if seg == self.arena.current_segment() {
             self.evac = None;
@@ -1038,6 +1065,46 @@ mod tests {
 
         for i in 0..N {
             let want = if i % 2 == 0 { None } else { Some(val.clone()) };
+            assert_eq!(m.get(&key(i)).map(<[u8]>::to_vec), want, "key {i}");
+        }
+    }
+
+    /// A store barely holding any garbage collects nothing until it is asked to.
+    ///
+    /// The two ratios are the whole reason [`RawMap::compact_hard`] exists. A
+    /// server under a memory limit needs the pages back whatever the ratios
+    /// think of the trade, and a server that is not under one should not pay for
+    /// copying that buys it a few kilobytes.
+    #[test]
+    fn a_store_with_little_dead_in_it_only_collects_when_pushed() {
+        let mut m = RawMap::new();
+        let val = vec![b'z'; COMPACT_VAL];
+        const N: usize = COMPACT_N;
+        for i in 0..N {
+            m.set(&key(i), &val);
+        }
+        // One key in fifty, which is well under the eighth of everything held
+        // that compaction normally waits for.
+        for i in (0..N).step_by(50) {
+            m.del(&key(i));
+        }
+
+        assert_eq!(m.compact_step(), None, "not worth collecting");
+        let free = m.arena().free_segments();
+        let mut calls = 0;
+        while m.arena().free_segments() == free {
+            assert!(
+                m.compact_hard().is_some(),
+                "there is a segment holding something dead"
+            );
+            calls += 1;
+            assert!(calls < 1000, "the walk is not getting any further along");
+        }
+        // Everything still reads back, which is the thing that matters: the
+        // records that were live in the segment that came back were moved and
+        // their index entries were moved with them.
+        for i in 0..N {
+            let want = if i % 50 == 0 { None } else { Some(val.clone()) };
             assert_eq!(m.get(&key(i)).map(<[u8]>::to_vec), want, "key {i}");
         }
     }
