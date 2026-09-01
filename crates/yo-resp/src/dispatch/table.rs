@@ -120,6 +120,12 @@ const AC_ARRAY_WRITE_SLOW: &[&str] = &["@write", "@array", "@slow"];
 const READ_MOVABLE: &[&str] = &["readonly", "movablekeys"];
 /// The same for a write, which is the three store forms.
 const WRITE_MOVABLE: &[&str] = &["write", "denyoom", "movablekeys"];
+/// `MIGRATE`, which is the one movable key write that is not `denyoom`.
+///
+/// It only ever frees here, since the local key goes away and nothing arrives,
+/// so a server with no room left can still migrate its way out of trouble. That
+/// is the same reasoning that leaves the flag off `DEL`.
+const MIGRATE_FLAGS: &[&str] = &["write", "movablekeys"];
 /// The connection commands' categories.
 const AC_CONN: &[&str] = &["@fast", "@connection"];
 /// The keyspace read side, which is `EXISTS` and `TYPE`.
@@ -2330,6 +2336,23 @@ pub static COMMANDS: &[Spec] = &[
         since: "2.6.0",
         complexity: "O(1) to find the key, then O(N) in the size of the payload.",
         summary: "Create a key from a payload produced by DUMP.",
+        group: "keyspace",
+    },
+    // And the third one, which is the other two with a socket in between. Its
+    // keys are movable for the same reason `SORT`'s are, though for a plainer
+    // reason: the `KEYS` option moves them from argument three to everything
+    // after the word, so where they are depends on what was written.
+    Spec {
+        name: "migrate",
+        arity: -6,
+        flags: MIGRATE_FLAGS,
+        first_key: 3,
+        last_key: 3,
+        step: 1,
+        acl: AC_RESTORE,
+        since: "2.6.0",
+        complexity: "A DUMP and a DEL here, a RESTORE there, and the bytes in between.",
+        summary: "Move a key to another server.",
         group: "keyspace",
     },
     // The two whose keys cannot be read off the command. `SORT k BY w_* GET d_*`
