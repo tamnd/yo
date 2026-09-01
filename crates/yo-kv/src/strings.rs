@@ -210,7 +210,14 @@ impl Keyspace {
     /// values borrow from it at once instead of being copied out one at a time.
     pub fn mget<'a>(&'a mut self, keys: &[&[u8]]) -> Vec<Option<Str<'a>>> {
         for k in keys {
-            self.reap(k);
+            // `live_rec` rather than `reap`, which does the same reap and also
+            // stamps the eviction clock. The reading pass below cannot, because
+            // it holds a shared borrow of the whole database so that every value
+            // it returns can borrow from it at once. The wire does not come
+            // through here at all, it walks the keys itself and calls
+            // [`Keyspace::mget_one`], so without this the same command would
+            // stamp from one entry point and not from the other.
+            self.live_rec(k);
         }
         let me: &Keyspace = self;
         keys.iter().map(|k| me.peek(k)).collect()
@@ -238,8 +245,13 @@ impl Keyspace {
     }
 
     /// `EXISTS key`, for one key.
+    ///
+    /// Asking whether a key is there does not count as using it, which is
+    /// Redis's rule and not a nicety. A health check that runs `EXISTS` over a
+    /// list of keys every second would otherwise be enough on its own to make
+    /// all of them look like the hottest keys in the database.
     pub fn exists(&mut self, key: &[u8]) -> bool {
-        self.live_rec(key).is_some()
+        self.live_rec_untouched(key).is_some()
     }
 
     /// How a string is stored, which is `OBJECT ENCODING` for a string key.
@@ -249,8 +261,10 @@ impl Keyspace {
     /// record is the value. A set keeps its representation in its body, so
     /// [`Keyspace::set_encoding`] asks the body, and
     /// [`Keyspace::encoding_name`] is the command that routes between them.
+    ///
+    /// Every `OBJECT` subcommand looks without touching, so this does too.
     pub fn encoding(&mut self, key: &[u8]) -> Option<Encoding> {
-        let addr = self.live_rec(key)?;
+        let addr = self.live_rec_untouched(key)?;
         let rec = self.map.value_at(addr);
         if value::kind(rec) != Kind::String {
             return None;
@@ -259,8 +273,11 @@ impl Keyspace {
     }
 
     /// The key's deadline as an absolute unix millisecond, if it has one.
+    ///
+    /// `EXPIRETIME` and `PEXPIRETIME`, which do not count as using the key. See
+    /// [`Keyspace::deadline_of`].
     pub fn expire_at(&mut self, key: &[u8]) -> Option<u64> {
-        let addr = self.live_rec(key)?;
+        let addr = self.live_rec_untouched(key)?;
         value::expire_at(self.map.value_at(addr))
     }
 
@@ -991,7 +1008,7 @@ impl Keyspace {
         let enc = Encoding::of(val);
         let len = value::record_len(enc, val.len(), deadline.is_some());
         self.free_body(key);
-        self.map.set_with(key, len, |out| {
+        self.write_rec(key, len, |out| {
             value::write_record(out, enc, val, deadline);
         });
     }
@@ -1011,7 +1028,7 @@ impl Keyspace {
         };
         let len = value::record_len(enc, val.len(), deadline.is_some());
         self.free_body(key);
-        self.map.set_with(key, len, |out| {
+        self.write_rec(key, len, |out| {
             value::write_record(out, enc, val, deadline);
         });
     }
@@ -1025,7 +1042,7 @@ impl Keyspace {
     fn store_raw(&mut self, key: &[u8], val: &[u8], deadline: Option<u64>) {
         let len = value::record_len(Encoding::Raw, val.len(), deadline.is_some());
         self.free_body(key);
-        self.map.set_with(key, len, |out| {
+        self.write_rec(key, len, |out| {
             value::write_record(out, Encoding::Raw, val, deadline);
         });
     }
@@ -1034,7 +1051,7 @@ impl Keyspace {
     fn store_int(&mut self, key: &[u8], n: i64, deadline: Option<u64>) {
         let len = value::record_len(Encoding::Int, 0, deadline.is_some());
         self.free_body(key);
-        self.map.set_with(key, len, |out| {
+        self.write_rec(key, len, |out| {
             value::write_int_record(out, n, deadline);
         });
     }

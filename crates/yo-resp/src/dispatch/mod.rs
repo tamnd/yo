@@ -1740,6 +1740,83 @@ mod tests {
     }
 
     #[test]
+    fn the_eviction_policy_reads_back_what_was_written_to_it() {
+        let mut f = Fixture::new();
+        assert_eq!(
+            f.run(&[b"CONFIG", b"GET", b"maxmemory-policy"]),
+            "*2\r\n$16\r\nmaxmemory-policy\r\n$10\r\nnoeviction\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"CONFIG", b"SET", b"maxmemory-policy", b"AllKeys-LFU"]),
+            "+OK\r\n",
+            "the name is matched without regard to case, like every other one"
+        );
+        assert_eq!(
+            f.run(&[b"CONFIG", b"GET", b"maxmemory-policy"]),
+            "*2\r\n$16\r\nmaxmemory-policy\r\n$11\r\nallkeys-lfu\r\n"
+        );
+        // And INFO agrees with CONFIG, which it did not when it was a literal.
+        assert!(
+            f.run(&[b"INFO", b"memory"])
+                .contains("maxmemory_policy:allkeys-lfu"),
+            "INFO and CONFIG disagree about the policy"
+        );
+        // The refusal names every legal value in the order the real server's
+        // enum table lists them, because a client comparing the message compares
+        // the whole string.
+        assert_eq!(
+            f.run(&[b"CONFIG", b"SET", b"maxmemory-policy", b"garbage"]),
+            "-ERR CONFIG SET failed (possibly related to argument 'maxmemory-policy') - argument(s) must be one of the following: volatile-lru, volatile-lfu, volatile-random, volatile-ttl, volatile-lrm, allkeys-lru, allkeys-lfu, allkeys-random, allkeys-lrm, noeviction\r\n"
+        );
+        // A bad pair leaves the good one in the same command alone, and the
+        // policy is checked by the same pass that checks the numbers.
+        assert_eq!(
+            f.run(&[b"CONFIG", b"GET", b"maxmemory-policy"]),
+            "*2\r\n$16\r\nmaxmemory-policy\r\n$11\r\nallkeys-lfu\r\n"
+        );
+        f.run(&[
+            b"CONFIG",
+            b"SET",
+            b"hash-max-listpack-entries",
+            b"7",
+            b"maxmemory-policy",
+            b"nonsense",
+        ]);
+        assert_eq!(
+            f.run(&[b"CONFIG", b"GET", b"hash-max-listpack-entries"]),
+            "*2\r\n$25\r\nhash-max-listpack-entries\r\n$3\r\n512\r\n"
+        );
+    }
+
+    #[test]
+    fn the_object_subcommands_follow_the_policy() {
+        let mut f = Fixture::new();
+        f.run(&[b"SET", b"s", b"v"]);
+        // Under the default the clock is kept and the counter is not, and under
+        // an LFU policy it is the other way round. Each subcommand refuses on
+        // the side where its reading of the three bytes means nothing.
+        assert_eq!(f.run(&[b"OBJECT", b"IDLETIME", b"s"]), ":0\r\n");
+        assert!(
+            f.run(&[b"OBJECT", b"FREQ", b"s"])
+                .starts_with("-ERR An LFU maxmemory policy is not selected"),
+        );
+
+        f.run(&[b"CONFIG", b"SET", b"maxmemory-policy", b"allkeys-lfu"]);
+        assert!(
+            f.run(&[b"OBJECT", b"IDLETIME", b"s"])
+                .starts_with("-ERR An LFU maxmemory policy is selected"),
+        );
+        // The key was written under a clock policy, so what comes back is that
+        // clock read as a counter. It is a number and not an error, which is the
+        // point: switching at runtime does not invalidate anything, it only makes
+        // the old field mean something else until the key is used again.
+        assert!(
+            f.run(&[b"OBJECT", b"FREQ", b"s"]).starts_with(':'),
+            "FREQ should answer under an LFU policy"
+        );
+    }
+
+    #[test]
     fn object_says_which_rung_of_the_ladder_a_key_is_on() {
         let mut f = Fixture::new();
         f.run(&[b"SET", b"s", b"hello"]);

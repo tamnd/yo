@@ -622,7 +622,7 @@ impl Keyspace {
         let len = set.len();
         let at = self.sets.insert(set);
         let record = value::slot_record_len(false);
-        self.map.set_with(key, record, |out| {
+        self.write_rec(key, record, |out| {
             value::write_slot_record(out, Kind::Set, at, None);
         });
         self.bodies += 1;
@@ -677,7 +677,7 @@ impl Keyspace {
         let at =
             yo_alloc::first_touch(|| self.sets.insert(Set::with_hint(first, hint, &self.limits)));
         let len = value::slot_record_len(false);
-        self.map.set_with(key, len, |out| {
+        self.write_rec(key, len, |out| {
             value::write_slot_record(out, Kind::Set, at, None);
         });
         self.bodies += 1;

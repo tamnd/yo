@@ -24,6 +24,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use yo_common::num::parse_i64;
 use yo_common::{Code, Error, Result, glob};
 use yo_kv::Keyspace;
+use yo_kv::access::Policy;
 
 /// What we tell a client we are.
 ///
@@ -49,7 +50,6 @@ const SETTINGS: &[(&str, &str)] = &[
     ("databases", "16"),
     ("io-threads", "1"),
     ("maxmemory", "0"),
-    ("maxmemory-policy", "noeviction"),
     ("proto-max-bulk-len", "536870912"),
     ("save", ""),
     ("timeout", "0"),
@@ -90,6 +90,38 @@ const LADDER: &[(&str, Knob)] = &[
     ("set-max-listpack-entries", Knob::SetListpackEntries),
     ("set-max-listpack-value", Knob::SetListpackValue),
 ];
+
+/// The setting that decides which way the access field on every record is read.
+///
+/// It is on its own rather than in [`SETTINGS`] or [`LADDER`] because it is the
+/// only writable setting that is not a number, and rather than immutable because
+/// it really moves: a client that sets it and then reads `OBJECT FREQ` expects
+/// the two to agree, which is the same argument the size ladder makes.
+///
+/// Setting it changes nothing about the keys already stored. Whatever is in
+/// their access field stays there and means something different from the moment
+/// the policy changes, which is what the `OBJECT FREQ` error text warns about.
+const MAXMEMORY_POLICY: &str = "maxmemory-policy";
+
+/// Every policy name, joined the way `CONFIG SET` lists them when it refuses one.
+///
+/// This is a formatter and not a string because the error path should not touch
+/// the allocator, and it walks [`Policy::ALL`] rather than spelling the ten names
+/// out again so the two cannot drift apart. The order is the order in Redis's own
+/// enum table, which is the whole reason `Policy::ALL` is written down.
+struct PolicyNames;
+
+impl core::fmt::Display for PolicyNames {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        for (at, policy) in Policy::ALL.iter().enumerate() {
+            if at > 0 {
+                f.write_str(", ")?;
+            }
+            f.write_str(policy.name())?;
+        }
+        Ok(())
+    }
+}
 
 /// Run one connection or server command.
 pub(super) fn execute(
@@ -557,7 +589,8 @@ fn config(server: &mut Server, args: Args<'_>, out: &mut Out) -> Result<()> {
         // and the same number under both, which is what a real server does.
         let fixed = SETTINGS.iter().filter(|(k, _)| wanted(k));
         let ladder = LADDER.iter().filter(|(k, _)| wanted(k));
-        out.map(fixed.clone().count() + ladder.clone().count());
+        let policy = wanted(MAXMEMORY_POLICY);
+        out.map(fixed.clone().count() + ladder.clone().count() + usize::from(policy));
         for (k, v) in fixed {
             out.bulk(k.as_bytes());
             out.bulk(v.as_bytes());
@@ -565,6 +598,10 @@ fn config(server: &mut Server, args: Args<'_>, out: &mut Out) -> Result<()> {
         for (k, knob) in ladder {
             out.bulk(k.as_bytes());
             out.bulk_int(read_knob(server.db_ref(0), *knob) as i64);
+        }
+        if policy {
+            out.bulk(MAXMEMORY_POLICY.as_bytes());
+            out.bulk(server.db_ref(0).policy().name().as_bytes());
         }
     } else if is(sub, b"SET") {
         // Too few is a wrong number of arguments and an odd number is a syntax
@@ -584,10 +621,26 @@ fn config(server: &mut Server, args: Args<'_>, out: &mut Out) -> Result<()> {
         // hash setting where it was, which was checked rather than assumed.
         let mut writes = [None; 8];
         let mut count = 0;
+        let mut policy = None;
         let mut i = 2;
         while i < args.len() {
             let (name, value) = (args.get(i), args.get(i + 1));
             i += 2;
+            if is(name, MAXMEMORY_POLICY.as_bytes()) {
+                // Named twice in one command, the last one wins, which is the
+                // same rule the ladder settings follow and is what a real server
+                // does with any setting repeated in a single `CONFIG SET`.
+                let Some(p) = Policy::parse(value) else {
+                    return Err(Error::fmt(
+                        Code::Invalid,
+                        format_args!(
+                            "CONFIG SET failed (possibly related to argument '{MAXMEMORY_POLICY}') - argument(s) must be one of the following: {PolicyNames}"
+                        ),
+                    ));
+                };
+                policy = Some(p);
+                continue;
+            }
             if let Some((k, knob)) = LADDER.iter().find(|(k, _)| is(name, k.as_bytes())) {
                 let Some(n) = parse_i64(value).filter(|&n| n >= 0) else {
                     return Err(bad_setting(k, parse_i64(value).is_some()));
@@ -628,6 +681,11 @@ fn config(server: &mut Server, args: Args<'_>, out: &mut Out) -> Result<()> {
         for (knob, n) in writes.iter().flatten() {
             for at in 0..DATABASES {
                 write_knob(server.db(at), *knob, *n);
+            }
+        }
+        if let Some(p) = policy {
+            for at in 0..DATABASES {
+                server.db(at).set_policy(p);
             }
         }
         out.ok();
@@ -706,7 +764,7 @@ fn info(server: &Server, args: Args<'_>, out: &mut Out) {
                  used_memory_overhead:{}\r\nmem_arena_bytes:{}\r\n\
                  mem_arena_segments:{}\r\nmem_index_bytes:{}\r\n\
                  mem_client_buffers:{}\r\nmaxmemory:0\r\n\
-                 maxmemory_policy:noeviction\r\n\r\n",
+                 maxmemory_policy:{}\r\n\r\n",
                 server.memory_bytes(),
                 server.dataset_bytes(),
                 server.memory_bytes() - server.dataset_bytes(),
@@ -714,6 +772,7 @@ fn info(server: &Server, args: Args<'_>, out: &mut Out) {
                 server.segment_count(),
                 server.index_bytes(),
                 server.conn_bytes(),
+                server.db_ref(0).policy().name(),
             );
         }
         if want("stats") {

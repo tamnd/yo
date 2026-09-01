@@ -976,7 +976,7 @@ impl Keyspace {
     fn new_array(&mut self, key: &[u8]) -> u32 {
         let at = self.arrays.insert(Array::new());
         let len = value::slot_record_len(false);
-        self.map.set_with(key, len, |out| {
+        self.write_rec(key, len, |out| {
             value::write_slot_record(out, Kind::Array, at, None);
         });
         self.bodies += 1;

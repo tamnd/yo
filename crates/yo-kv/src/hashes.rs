@@ -756,7 +756,7 @@ impl Keyspace {
         let at =
             yo_alloc::first_touch(|| self.hashes.insert(Hash::with_hint(hint, &self.hash_limits)));
         let len = value::slot_record_len(false);
-        self.map.set_with(key, len, |out| {
+        self.write_rec(key, len, |out| {
             value::write_slot_record(out, Kind::Hash, at, None);
         });
         self.bodies += 1;

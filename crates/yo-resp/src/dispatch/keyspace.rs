@@ -44,13 +44,17 @@ const NX_WITH_OTHERS: &str = "NX and XX, GT or LT options at the same time are n
 /// contradicts itself without `NX` being involved.
 const GT_WITH_LT: &str = "GT and LT options at the same time are not compatible";
 
-/// What `OBJECT FREQ` says on a server that is not counting accesses.
+/// What `OBJECT FREQ` says when the policy is not an LFU one.
 ///
-/// Which is every server here, because there is no eviction yet, so this is the
-/// only thing it can say. Redis says it too whenever the policy is not an LFU
-/// one, and the second half about switching at runtime is upstream's wording
-/// and not ours.
+/// The two readings share one field, so under any other policy those bits are a
+/// clock and reporting them as a frequency would be reporting a number that
+/// means nothing. The second half, about switching at runtime taking time to
+/// adjust, is upstream's wording and it is a description of exactly that.
 const NOT_LFU: &str = "An LFU maxmemory policy is not selected, access frequency not tracked. Please note that when switching between policies at runtime LRU and LFU data will take some time to adjust.";
+
+/// What `OBJECT IDLETIME` says when the policy is an LFU one, which is the same
+/// sentence the other way round.
+const IS_LFU: &str = "An LFU maxmemory policy is selected, idle time not tracked. Please note that when switching between policies at runtime LRU and LFU data will take some time to adjust.";
 
 /// The text `OBJECT HELP` prints, one line an entry.
 const OBJECT_HELP: &[&str] = &[
@@ -522,10 +526,23 @@ fn object(db: &mut Keyspace, args: Args<'_>, out: &mut Out) -> Result<()> {
         // huge number for those, or it did: 8.10.1 answers 1 for `SET k 123`
         // like it does for everything else, so 1 is the whole answer here.
         "refcount" => out.int(1),
-        // Nothing is tracking access time, and zero is what a key just touched
-        // would say anyway, which is every key by the time this reaches it.
-        "idletime" => out.int(0),
-        "freq" => return Err(Error::new(Code::Unsupported, NOT_LFU)),
+        // Seconds since the key was last used. Asking is not using, so the
+        // number does not reset itself by being read, and it counts from the
+        // moment the key was written for a key nothing has read since.
+        "idletime" => {
+            if !db.policy().is_clock() {
+                return Err(Error::new(Code::Unsupported, IS_LFU));
+            }
+            let idle = db.idle_secs(key).expect("the key is there");
+            out.int(i64::try_from(idle).unwrap_or(i64::MAX));
+        }
+        "freq" => {
+            if !db.policy().is_lfu() {
+                return Err(Error::new(Code::Unsupported, NOT_LFU));
+            }
+            let freq = db.freq(key).expect("the key is there");
+            out.int(i64::from(freq));
+        }
         other => unreachable!("no body for object {other}"),
     }
     Ok(())

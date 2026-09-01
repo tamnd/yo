@@ -238,7 +238,7 @@ impl Keyspace {
         bytes.clear();
         bytes.extend_from_slice(self.map.value_at(addr));
         self.free_body(dst);
-        self.map.set_with(dst, bytes.len(), |out| {
+        self.write_rec(dst, bytes.len(), |out| {
             out.copy_from_slice(&bytes);
         });
         self.scratch = bytes;
@@ -296,7 +296,7 @@ impl Keyspace {
             bytes.clear();
             bytes.extend_from_slice(self.map.value_at(addr));
             self.free_body(dst);
-            self.map.set_with(dst, bytes.len(), |out| {
+            self.write_rec(dst, bytes.len(), |out| {
                 out.copy_from_slice(&bytes);
             });
             self.scratch = bytes;
@@ -324,7 +324,7 @@ impl Keyspace {
     /// spell it out.
     fn write_slot(&mut self, key: &[u8], kind: Kind, slot: u32, at: Option<u64>) {
         let len = value::slot_record_len(at.is_some());
-        self.map.set_with(key, len, |out| {
+        self.write_rec(key, len, |out| {
             value::write_slot_record(out, kind, slot, at);
         });
     }

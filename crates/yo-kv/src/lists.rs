@@ -472,7 +472,7 @@ impl Keyspace {
         // is allowed to make.
         let at = yo_alloc::first_touch(|| self.lists.insert(List::new()));
         let len = value::slot_record_len(false);
-        self.map.set_with(key, len, |out| {
+        self.write_rec(key, len, |out| {
             value::write_slot_record(out, Kind::List, at, None);
         });
         self.bodies += 1;

@@ -24,6 +24,7 @@ use yo_common::{Addr, Code, Error, Result, Rng, bytes_eq};
 use yo_index::RawMap;
 
 use crate::Clock;
+use crate::access::{Access, Lfu, Policy};
 use crate::array::Array;
 use crate::hash::{self, Hash};
 use crate::list::{self, List};
@@ -70,6 +71,15 @@ pub struct Keyspace {
     pub(crate) list_limits: list::Limits,
     /// Where a sorted set changes representation.
     pub(crate) zset_limits: zset::Limits,
+    /// What this database would evict, and therefore what a read writes back.
+    ///
+    /// One server wide setting in Redis, carried per database here for the same
+    /// reason the size ladder is: a `Keyspace` is reached without a server and
+    /// has to be able to answer on its own. `CONFIG SET maxmemory-policy` writes
+    /// it to all of them.
+    pub(crate) policy: Policy,
+    /// The two numbers the LFU counter moves by, which are `CONFIG` values.
+    pub(crate) lfu: Lfu,
     /// Where `SPOP` and `SRANDMEMBER` draw from.
     pub(crate) rng: Rng,
     /// The last collection key that was resolved, for the command behind it.
@@ -155,10 +165,17 @@ const SCRATCH: usize = 1024;
 /// there is to find is the command immediately before, and a bigger structure
 /// would cost a lookup to avoid a lookup.
 ///
-/// It holds a slot and not an address. A slot is an index into the slab for its
-/// type and stays right for as long as the key is there, where an address is
-/// only good until the next write. That is also why nothing here memoizes a
-/// string: a string lives in the record itself and moves when the record does.
+/// It holds a slot rather than reaching the body through an address, because a
+/// slot is an index into the slab for its type and stays right for as long as
+/// the key is there. That is also why nothing here memoizes a string: a string
+/// lives in the record itself and moves when the record does.
+///
+/// It does carry the record's address alongside, and that is safe for a narrower
+/// reason than the slot is. An address is only good until the next write, and
+/// this whole memo is thrown away by the next write, so inside the window where
+/// the memo answers at all the address is exactly as valid as the slot. What it
+/// buys is the eviction stamp: a memo hit skips the probe, and without an address
+/// the stamp would have to put the probe back and there would be no memo left.
 ///
 /// What it is worth is measured rather than argued about, by the pair of rows
 /// `engine/sadd` and `engine/sadd-alternating` in `yo-resp`'s `engine` bench.
@@ -176,6 +193,8 @@ struct Memo {
     kind: Kind,
     /// Where the body is in the slab for `kind`.
     slot: u32,
+    /// Where the record is, for the stamp a hit still owes.
+    addr: Addr,
     /// How much of `key` is the key.
     len: u8,
     key: [u8; Memo::MAX],
@@ -196,6 +215,7 @@ impl Memo {
             live: false,
             kind: Kind::String,
             slot: 0,
+            addr: Addr::NONE,
             len: 0,
             key: [0; Memo::MAX],
         }
@@ -207,7 +227,7 @@ impl Memo {
     /// and the answer is thrown away, which is stricter than it has to be and is
     /// the version that cannot be wrong.
     #[inline]
-    fn get(&self, writes: u64, key: &[u8]) -> Option<(Kind, u32)> {
+    fn get(&self, writes: u64, key: &[u8]) -> Option<(Kind, u32, Addr)> {
         if !self.live || self.writes != writes || key.len() != self.len as usize {
             return None;
         }
@@ -215,12 +235,12 @@ impl Memo {
         // for a key of a length the compiler cannot see. This is the one
         // comparison the hot key path always does, and on a profile of `SADD`
         // it was most of what the lookup cost.
-        bytes_eq(&self.key[..key.len()], key).then_some((self.kind, self.slot))
+        bytes_eq(&self.key[..key.len()], key).then_some((self.kind, self.slot, self.addr))
     }
 
-    /// Remember that `key` is at `slot`.
+    /// Remember that `key` is at `slot`, in the record at `addr`.
     #[inline]
-    fn put(&mut self, writes: u64, key: &[u8], kind: Kind, slot: u32) {
+    fn put(&mut self, writes: u64, key: &[u8], kind: Kind, slot: u32, addr: Addr) {
         if key.len() > Memo::MAX {
             self.live = false;
             return;
@@ -229,6 +249,7 @@ impl Memo {
         self.live = true;
         self.kind = kind;
         self.slot = slot;
+        self.addr = addr;
         self.len = key.len() as u8;
         self.key[..key.len()].copy_from_slice(key);
     }
@@ -267,6 +288,8 @@ impl Keyspace {
             hash_limits: hash::Limits::DEFAULT,
             list_limits: list::Limits::default(),
             zset_limits: zset::Limits::DEFAULT,
+            policy: Policy::default(),
+            lfu: Lfu::DEFAULT,
             rng: Rng::new(clock.now_ms() ^ made.wrapping_mul(0x9e37_79b9_7f4a_7c15)),
             memo: Memo::empty(),
             scratch: Vec::with_capacity(SCRATCH),
@@ -289,6 +312,151 @@ impl Keyspace {
     #[inline]
     pub const fn seed(&mut self, seed: u64) {
         self.rng = Rng::new(seed);
+    }
+
+    /// What this database would evict, which is `CONFIG GET maxmemory-policy`.
+    #[inline]
+    #[must_use]
+    pub const fn policy(&self) -> Policy {
+        self.policy
+    }
+
+    /// Change what this database would evict.
+    ///
+    /// Every key already stored keeps whatever is in its access field, which is
+    /// why Redis warns on `OBJECT FREQ` that switching at runtime takes time to
+    /// adjust. Under the new policy those bits mean something else, and the only
+    /// honest thing to do about it is to let them be corrected by use. A key
+    /// nobody has touched since the switch reads as freshly used rather than as
+    /// stale, which is the safe direction: the other one evicts the working set
+    /// on the first pass after an operator changes a setting.
+    #[inline]
+    pub const fn set_policy(&mut self, policy: Policy) {
+        self.policy = policy;
+    }
+
+    /// The two numbers the LFU counter moves by, which are two `CONFIG` values.
+    #[inline]
+    #[must_use]
+    pub const fn lfu(&self) -> Lfu {
+        self.lfu
+    }
+
+    /// Change how fast the LFU counter climbs and decays.
+    #[inline]
+    pub const fn set_lfu(&mut self, lfu: Lfu) {
+        self.lfu = lfu;
+    }
+
+    /// Seconds since `key` was last used, which is `OBJECT IDLETIME`.
+    ///
+    /// `None` for a key that is not there. A key that has never been stamped
+    /// reads as zero rather than as ancient, which is what
+    /// [`Access::is_unset`] is for.
+    ///
+    /// This does not count as a use. Redis looks the key up with its no touch
+    /// flag here, and it has to: a diagnostic that resets the number it reports
+    /// would answer zero every time it was asked.
+    pub fn idle_secs(&mut self, key: &[u8]) -> Option<u64> {
+        let addr = self.live_rec_untouched(key)?;
+        let now = self.clock.now_ms();
+        Some(self.access_at(addr).idle_secs(now))
+    }
+
+    /// How often `key` is used, which is `OBJECT FREQ`.
+    ///
+    /// The eight bit counter, decayed to now, on the same terms as
+    /// [`Keyspace::idle_secs`]: `None` for a key that is not there, and asking
+    /// is not using.
+    ///
+    /// The caller is the one that has to check the policy first. This reports
+    /// what the bits say, and under a policy that is not LFU they say something
+    /// else, which is a refusal on the wire rather than a number.
+    pub fn freq(&mut self, key: &[u8]) -> Option<u8> {
+        let addr = self.live_rec_untouched(key)?;
+        let (now, lfu) = (self.clock.now_ms(), self.lfu);
+        Some(self.access_at(addr).freq(now, lfu))
+    }
+
+    /// Write a record under `key`, with the access field the policy wants on it.
+    ///
+    /// Every record this crate writes goes through here, which is the point of
+    /// it. A record is written fresh whenever a key is created and whenever a
+    /// string's value changes, and a fresh record starts with the blank field
+    /// [`value::write_record`] leaves behind. Blank reads as freshly used, which
+    /// is right at the moment of writing and wrong a minute later, so something
+    /// has to stamp it and this is the only place that knows the clock.
+    ///
+    /// Redis stamps at the same moment, in `createObject`, and for the same
+    /// reason.
+    pub(crate) fn write_rec(
+        &mut self,
+        key: &[u8],
+        len: usize,
+        fill: impl FnOnce(&mut [u8]),
+    ) -> Option<usize> {
+        let a = self.access_for_write(key);
+        self.map.set_with(key, len, |out| {
+            fill(out);
+            value::set_access(out, a);
+        })
+    }
+
+    /// What the access field of a record about to be written should say.
+    ///
+    /// Under the eight policies that read the field as a clock this is the time,
+    /// with no probe and no thought: writing a key is using it, and under the LRM
+    /// pair writing it is the only thing that counts as using it.
+    ///
+    /// Under LFU it is the counter that is already there, carried across the
+    /// rewrite unchanged. Unchanged rather than incremented, because the lookup
+    /// that resolved the key for this write already counted the access, and
+    /// counting it twice would rank a key that is written more highly than a key
+    /// that is read the same number of times. A key that is not there yet starts
+    /// at [`crate::access::LFU_INIT`], which is where Redis starts a new object.
+    ///
+    /// The probe is the reason this is written as two cases rather than one. It
+    /// is paid only under an LFU policy, so the default policy and every other
+    /// one write a record for exactly what it cost before.
+    fn access_for_write(&mut self, key: &[u8]) -> Access {
+        let now = self.clock.now_ms();
+        if !self.policy.is_lfu() {
+            return Access::lru(now);
+        }
+        match self.map.get(key).and_then(value::access) {
+            Some(a) if !a.is_unset() => a,
+            _ => Access::lfu(now),
+        }
+    }
+
+    /// The access field of the record at `addr`, or the unset one for a record
+    /// written before the field existed.
+    #[inline]
+    fn access_at(&self, addr: Addr) -> Access {
+        value::access(self.map.value_at(addr)).unwrap_or_default()
+    }
+
+    /// Write the access field back to the record at `addr`.
+    ///
+    /// The whole reason the field exists, and it runs on nearly every command,
+    /// so what it does is a load, an arithmetic step and a three byte store into
+    /// a cache line the caller has just read. It does not count as a write to the
+    /// map, because nothing moves and counting it would throw the [`Memo`] away
+    /// once per command. See [`RawMap::value_at_mut`].
+    ///
+    /// The LFU arm reads before it writes, because the counter it produces is a
+    /// function of the counter that is there. The clock arm does not, because the
+    /// time is the time whatever the record used to say.
+    #[inline]
+    fn stamp(&mut self, addr: Addr) {
+        let now = self.clock.now_ms();
+        if self.policy.is_lfu() {
+            let (lfu, current) = (self.lfu, self.access_at(addr));
+            let next = current.touched(now, lfu, &mut self.rng);
+            value::set_access(self.map.value_at_mut(addr), next);
+        } else {
+            value::set_access(self.map.value_at_mut(addr), Access::lru(now));
+        }
     }
 
     /// Where a set changes representation, which is three `CONFIG` values.
@@ -393,6 +561,13 @@ impl Keyspace {
     /// One lookup, because the tag and the deadline are both in the record the
     /// lookup returned. Reading the kind out before the reap rather than after
     /// is what keeps it to one.
+    ///
+    /// It does not go through the lookup that stamps, and so it leaves the
+    /// eviction clock where it was, which is right and is worth saying rather than
+    /// leaving to be inferred from the shape of the code. `TYPE` is one of the
+    /// commands Redis looks up with its no touch flag, along with the `OBJECT`
+    /// subcommands underneath this, which read through `reap` for the same
+    /// reason.
     pub fn kind_of(&mut self, key: &[u8]) -> Option<Kind> {
         let now = self.clock.now_ms();
         let (kind, dead) = self
@@ -524,7 +699,7 @@ impl Keyspace {
             kind @ (Kind::Set | Kind::Hash | Kind::List | Kind::Zset | Kind::Array) => {
                 let slot = value::slot(rec);
                 let len = value::slot_record_len(at.is_some());
-                self.map.set_with(key, len, |out| {
+                self.write_rec(key, len, |out| {
                     value::write_slot_record(out, kind, slot, at);
                 });
             }
@@ -540,8 +715,14 @@ impl Keyspace {
     /// that is and has no deadline, and the absolute millisecond otherwise. A key
     /// past its deadline is reaped on the way through, so it answers `Missing`
     /// and not the moment that has gone.
+    ///
+    /// Asking when a key dies is not using it, so this does not stamp the
+    /// eviction clock. Redis reads the key with its no touch flag here for the
+    /// same reason, and it matters more than it looks: a client polling `TTL` on
+    /// a key would otherwise keep that key at the top of the working set for as
+    /// long as it kept asking whether it was about to go.
     pub fn deadline_of(&mut self, key: &[u8]) -> Ask {
-        let Some(addr) = self.live_rec(key) else {
+        let Some(addr) = self.live_rec_untouched(key) else {
             return Ask::Missing;
         };
         match value::expire_at(self.map.value_at(addr)) {
@@ -687,7 +868,33 @@ impl Keyspace {
     ///
     /// The address dies at the next write, which is why this is `pub(crate)`
     /// and why every caller reads it and drops it inside one command.
+    ///
+    /// Finding a key counts as using it, so this stamps the access field on the
+    /// way past under every policy that wants it stamped, which is eight of the
+    /// ten. A command that has to look at a key without using it calls
+    /// [`Keyspace::live_rec_untouched`] instead, and the list of those is short
+    /// and is Redis's list rather than ours.
     pub(crate) fn live_rec(&mut self, key: &[u8]) -> Option<Addr> {
+        let addr = self.live_rec_untouched(key)?;
+        if self.policy.stamps_on_read() {
+            self.stamp(addr);
+        }
+        Some(addr)
+    }
+
+    /// [`Keyspace::live_rec`] for a command that is asking about a key rather
+    /// than using it.
+    ///
+    /// `TYPE`, `EXISTS`, the `TTL` family and every `OBJECT` subcommand look
+    /// without touching, which is Redis's `LOOKUP_NOTOUCH` and is not an
+    /// optimisation. `OBJECT IDLETIME` that counted as a use would report zero
+    /// every time, and `EXISTS` in a health check loop would keep a dead key at
+    /// the top of the working set forever.
+    ///
+    /// Untouched means the access field only. A key past its deadline is still
+    /// reaped here, because a command asking whether a key exists has to be told
+    /// that it does not.
+    pub(crate) fn live_rec_untouched(&mut self, key: &[u8]) -> Option<Addr> {
         let now = self.clock.now_ms();
         let addr = self.map.find(key)?;
         if value::is_expired(self.map.value_at(addr), now) {
@@ -721,16 +928,29 @@ impl Keyspace {
     /// key and nothing has been written since, which is the [`Memo`] and is what
     /// Y13 asks for on single key `SADD`.
     pub(crate) fn live_slot(&mut self, key: &[u8], want: Kind) -> Result<Option<u32>> {
-        if let Some((kind, slot)) = self.memo.get(self.map.writes(), key) {
+        // A memo hit skips the record, so the stamp has to happen on the way out
+        // of it as well. It is the same address every time, which is what makes
+        // this cheap: no probe, just the store. Getting this wrong is the trap
+        // worth naming, because the key that hits the memo most often is the
+        // hottest key in the database, and it is the one that would have looked
+        // steadily more idle the harder it was used.
+        if let Some((kind, slot, addr)) = self.memo.get(self.map.writes(), key) {
             if kind != want {
                 return Err(wrong_type());
             }
+            if self.policy.stamps_on_read() {
+                self.stamp(addr);
+            }
             return Ok(Some(slot));
         }
+        // `find` and then `value_at` rather than `get`, which is the same two
+        // steps, so that the address is still in hand for the stamp below. `get`
+        // would mean probing a second time for a record already read.
         let now = self.clock.now_ms();
-        let Some(rec) = self.map.get(key) else {
+        let Some(addr) = self.map.find(key) else {
             return Ok(None);
         };
+        let rec = self.map.value_at(addr);
         if value::is_expired(rec, now) {
             self.drop_key(key);
             self.expired += 1;
@@ -743,9 +963,14 @@ impl Keyspace {
         // A key with a deadline is not memoized. The memo is invalidated by
         // writes and a deadline passes without one, so remembering a dated key
         // would be remembering it past the moment it should have been reaped.
+        // Both of these are read off the record before the stamp, which needs it
+        // mutably and is the end of this borrow.
         let dated = value::expire_at(rec).is_some();
+        if self.policy.stamps_on_read() {
+            self.stamp(addr);
+        }
         if !dated {
-            self.memo.put(self.map.writes(), key, want, slot);
+            self.memo.put(self.map.writes(), key, want, slot, addr);
         }
         Ok(Some(slot))
     }
@@ -762,16 +987,20 @@ impl Keyspace {
         a: Kind,
         b: Kind,
     ) -> Result<Option<(Kind, u32)>> {
-        if let Some((kind, slot)) = self.memo.get(self.map.writes(), key) {
+        if let Some((kind, slot, addr)) = self.memo.get(self.map.writes(), key) {
             if kind != a && kind != b {
                 return Err(wrong_type());
+            }
+            if self.policy.stamps_on_read() {
+                self.stamp(addr);
             }
             return Ok(Some((kind, slot)));
         }
         let now = self.clock.now_ms();
-        let Some(rec) = self.map.get(key) else {
+        let Some(addr) = self.map.find(key) else {
             return Ok(None);
         };
+        let rec = self.map.value_at(addr);
         if value::is_expired(rec, now) {
             self.drop_key(key);
             self.expired += 1;
@@ -782,8 +1011,12 @@ impl Keyspace {
             return Err(wrong_type());
         }
         let slot = value::slot(rec);
-        if value::expire_at(rec).is_none() {
-            self.memo.put(self.map.writes(), key, kind, slot);
+        let dated = value::expire_at(rec).is_some();
+        if self.policy.stamps_on_read() {
+            self.stamp(addr);
+        }
+        if !dated {
+            self.memo.put(self.map.writes(), key, kind, slot, addr);
         }
         Ok(Some((kind, slot)))
     }
@@ -907,5 +1140,115 @@ mod tests {
         );
         assert_eq!(d.len(), 0, "and asking reaped it rather than leaving it");
         assert_eq!(d.expired_keys(), 1);
+    }
+
+    /// The default policy evicts nothing and still keeps the clock, which is
+    /// Redis's behaviour and is the configuration nearly every server runs.
+    #[test]
+    fn the_clock_runs_under_the_default_policy() {
+        let mut d = db();
+        assert_eq!(d.policy(), Policy::NoEviction);
+        d.set_plain(b"k", b"v").expect("room");
+        assert_eq!(d.idle_secs(b"k"), Some(0));
+
+        d.clock_mut().advance(60_000);
+        assert_eq!(d.idle_secs(b"k"), Some(60), "a minute of nobody asking");
+
+        d.get(b"k").expect("a string").expect("still there");
+        assert_eq!(d.idle_secs(b"k"), Some(0), "and reading it is using it");
+    }
+
+    /// The commands that ask about a key rather than use it. Getting this wrong
+    /// makes `OBJECT IDLETIME` answer zero every time it is called, because
+    /// calling it would be the most recent use.
+    #[test]
+    fn asking_about_a_key_is_not_using_it() {
+        let mut d = db();
+        d.set_plain(b"k", b"v").expect("room");
+        d.clock_mut().advance(30_000);
+
+        assert!(d.exists(b"k"));
+        assert_eq!(d.kind_of(b"k"), Some(Kind::String));
+        assert_eq!(d.encoding_name(b"k"), Some("embstr"));
+        assert_eq!(d.deadline_of(b"k"), Ask::NoDeadline);
+        assert_eq!(d.expire_at(b"k"), None);
+        assert_eq!(d.idle_secs(b"k"), Some(30));
+
+        assert_eq!(
+            d.idle_secs(b"k"),
+            Some(30),
+            "and asking twice is still not using it"
+        );
+    }
+
+    /// Least recently modified is the one policy where a read must leave the
+    /// clock where it is, because the clock is the only thing it measures.
+    #[test]
+    fn a_read_moves_the_clock_under_lru_and_leaves_it_under_lrm() {
+        for (policy, idle_after_read) in [(Policy::AllKeysLru, 0), (Policy::AllKeysLrm, 45)] {
+            let mut d = db();
+            d.set_policy(policy);
+            d.set_plain(b"k", b"v").expect("room");
+            d.clock_mut().advance(45_000);
+
+            d.get(b"k").expect("a string").expect("still there");
+            assert_eq!(
+                d.idle_secs(b"k"),
+                Some(idle_after_read),
+                "{}",
+                policy.name()
+            );
+
+            // Both of them move it on a write, which is the whole of what LRM
+            // is measuring and is a side effect of the resolve under LRU.
+            d.set_plain(b"k", b"w").expect("room");
+            assert_eq!(
+                d.idle_secs(b"k"),
+                Some(0),
+                "{} after a write",
+                policy.name()
+            );
+        }
+    }
+
+    /// The trap the memo sets. A hit skips the record entirely, so a stamp that
+    /// only happened on a miss would leave the hottest key in the database
+    /// looking steadily more idle the harder it was used.
+    #[test]
+    fn the_hot_key_path_still_stamps() {
+        let mut d = db();
+        d.set_policy(Policy::AllKeysLru);
+        d.sadd(b"s", [&b"a"[..]].into_iter()).expect("room");
+
+        // Warm the memo, then run the key hard with nothing written in between,
+        // which is the case the memo exists for.
+        d.scard(b"s").expect("a set");
+        d.clock_mut().advance(120_000);
+        for _ in 0..64 {
+            d.scard(b"s").expect("a set");
+        }
+        assert_eq!(d.idle_secs(b"s"), Some(0), "the memo swallowed the stamp");
+    }
+
+    /// Under LFU the same bits are a counter, and it climbs with use rather than
+    /// resetting to now.
+    #[test]
+    fn the_counter_climbs_under_an_lfu_policy() {
+        let mut d = db();
+        d.set_policy(Policy::AllKeysLfu);
+        d.seed(7);
+        d.set_plain(b"k", b"v").expect("room");
+        let start = d.freq(b"k").expect("there");
+
+        for _ in 0..200 {
+            d.get(b"k").expect("a string").expect("still there");
+        }
+        let hot = d.freq(b"k").expect("there");
+        assert!(hot > start, "{hot} did not climb from {start}");
+
+        // And a key nobody reads decays rather than holding its place forever.
+        d.set_plain(b"cold", b"v").expect("room");
+        d.clock_mut().advance(60_000 * 10);
+        assert!(d.freq(b"cold").expect("there") < start);
     }
 }
