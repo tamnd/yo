@@ -1,0 +1,28 @@
+[package]
+name = "yo-vector"
+description = "RaBitQ quantisation and the partition index yo searches vectors with"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+# The seeded generator, because a rotation that cannot be rebuilt from the seed
+# in the catalogue is a rotation that has to be written to the file.
+yo-common.workspace = true
+
+[dev-dependencies]
+criterion = { workspace = true }
+
+[[bench]]
+name = "rabitq"
+harness = false
+
+[lints]
+workspace = true
