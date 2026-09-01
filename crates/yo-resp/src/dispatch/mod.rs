@@ -146,6 +146,57 @@ pub struct Stats {
     pub commands: u64,
 }
 
+/// One command's counters, for `INFO commandstats`.
+///
+/// Three of Redis's five. `usec` and `usec_per_call` are not here because
+/// nothing times a command, and timing one means two clock reads around a call
+/// that takes tens of nanoseconds to begin with. Redis pays that because Redis
+/// has room for it; this does not, and a zero under a name that says microseconds
+/// is worse than an absent field, which is the same rule the rest of `INFO`
+/// follows.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct CommandStat {
+    /// Times the command ran, whatever it answered.
+    pub calls: u64,
+    /// Times it was turned away before it ran, which is the wrong number of
+    /// arguments or no room under `maxmemory`.
+    pub rejected: u64,
+    /// Times it ran and answered with an error.
+    pub failed: u64,
+}
+
+impl CommandStat {
+    /// Whether this command has ever been seen.
+    ///
+    /// A row that has not is left out of the reply, which is what Redis does and
+    /// is why the section is a handful of lines on a working server rather than
+    /// one line per command in the table.
+    const fn seen(&self) -> bool {
+        self.calls != 0 || self.rejected != 0 || self.failed != 0
+    }
+}
+
+/// A counter per command, indexed the way [`table::index_of`] says.
+///
+/// A flat array and not a map, because the dispatcher is already holding the
+/// spec and the spec's position in the table is two addresses subtracted. That
+/// makes the counting a load, an add and a store on a row the previous command
+/// of the same name has already pulled into cache.
+struct CommandStats(Box<[CommandStat]>);
+
+impl Default for CommandStats {
+    fn default() -> CommandStats {
+        CommandStats(vec![CommandStat::default(); table::count()].into_boxed_slice())
+    }
+}
+
+impl CommandStats {
+    /// The row for one command.
+    fn at(&mut self, spec: &'static Spec) -> &mut CommandStat {
+        &mut self.0[table::index_of(spec)]
+    }
+}
+
 /// Everything a server holds.
 ///
 /// One of these per shard thread, not one per process: the databases inside are
@@ -213,6 +264,8 @@ pub struct Server {
     peers: migrate::Peers,
     /// The numbers the reactor keeps for `INFO`.
     pub stats: Stats,
+    /// A counter per command, for `INFO commandstats`.
+    cmdstats: CommandStats,
 }
 
 impl Server {
@@ -237,6 +290,7 @@ impl Server {
             waiters: Waiters::default(),
             peers: migrate::Peers::default(),
             stats: Stats::default(),
+            cmdstats: CommandStats::default(),
         }
     }
 
@@ -260,6 +314,7 @@ impl Server {
             waiters: Waiters::default(),
             peers: migrate::Peers::default(),
             stats: Stats::default(),
+            cmdstats: CommandStats::default(),
         }
     }
 
@@ -404,6 +459,20 @@ impl Server {
     #[must_use]
     pub fn evicted_keys(&self) -> u64 {
         self.dbs.iter().map(Keyspace::evicted_keys).sum()
+    }
+
+    /// Every command that has been seen, with its counters.
+    ///
+    /// Only the ones that have. A server reports a handful of lines rather than
+    /// one per command in the table, which is what Redis does and is the
+    /// difference between a section a person can read and one they cannot.
+    pub fn command_stats(&self) -> impl Iterator<Item = (&'static str, CommandStat)> {
+        self.cmdstats
+            .0
+            .iter()
+            .enumerate()
+            .filter(|(_, row)| row.seen())
+            .map(|(at, row)| (table::name_at(at), *row))
     }
 
     /// The `maxmemory` limit in bytes, zero when there is not one.
@@ -711,6 +780,7 @@ pub fn execute(server: &mut Server, session: &mut Session, args: Args<'_>, out: 
         return Flow::Continue;
     };
     if !arity_ok(spec, args.len()) {
+        server.cmdstats.at(spec).rejected += 1;
         write_error(out, &args::wrong_arity(spec.name));
         return Flow::Continue;
     }
@@ -725,6 +795,7 @@ pub fn execute(server: &mut Server, session: &mut Session, args: Args<'_>, out: 
     // Redis's list, so a command that only frees is let through with nothing
     // left, which is what lets a client dig itself out with `DEL`.
     if server.maxmemory != 0 && !server.make_room() && spec.flags.contains(&"denyoom") {
+        server.cmdstats.at(spec).rejected += 1;
         out.error_line(b"OOM ", OOM);
         return Flow::Continue;
     }
@@ -789,14 +860,31 @@ pub fn execute(server: &mut Server, session: &mut Session, args: Args<'_>, out: 
             _ => server::execute(server, session, spec, args, out),
         }
     };
-    match done {
+    let flow = match done {
         Ok(flow) => flow,
         Err(e) => {
             out.truncate(mark);
             write_error(out, &e);
             Flow::Continue
         }
+    };
+
+    // Counted here and not before the call, which is where Redis counts it, so
+    // that `INFO commandstats` leaves out the `INFO` that asked for it in the
+    // same way theirs does.
+    //
+    // Failure is read off the reply rather than off the `Result`, because the
+    // two are not the same set. A command that ran out of arguments comes back
+    // as an `Err` and a command that was sent the wrong password writes its own
+    // error line and comes back `Ok`, and both of those are a call that failed.
+    // The first byte at the mark is what a client would branch on, and it is `-`
+    // for an error on either protocol and `!` for RESP3's long form.
+    let row = server.cmdstats.at(spec);
+    row.calls += 1;
+    if matches!(out.as_slice().get(mark), Some(b'-' | b'!')) {
+        row.failed += 1;
     }
+    flow
 }
 
 /// The error line for an error value.
@@ -3061,6 +3149,107 @@ mod tests {
         assert!(clients.contains("connected_clients:0"), "{clients}");
         assert!(!clients.contains("redis_version"), "{clients}");
         assert_eq!(f.run(&[b"INFO", b"nosuch"]), "$0\r\n\r\n");
+    }
+
+    /// The sections a bare `INFO` gives back, and the ones you have to ask for.
+    ///
+    /// This is Redis's `unit/info-command` written against the fixture. Every
+    /// assertion in it is one of theirs, in their order, and the two fields it
+    /// turns on are the two that suite was failing on: `master_repl_offset`,
+    /// which is in the default set, and `rejected_calls`, which is not.
+    #[test]
+    fn commandstats_is_asked_for_and_replication_is_not() {
+        let mut f = Fixture::new();
+        for arg in ["", "all", "default", "everything"] {
+            let info = if arg.is_empty() {
+                f.run(&[b"INFO"])
+            } else {
+                f.run(&[b"INFO", arg.as_bytes()])
+            };
+            assert!(info.contains("redis_version"), "{arg}: {info}");
+            assert!(info.contains("used_cpu_user"), "{arg}: {info}");
+            assert!(info.contains("used_memory"), "{arg}: {info}");
+            assert!(!info.contains("sentinel_tilt"), "{arg}: {info}");
+            let asked = arg == "all" || arg == "everything";
+            assert_eq!(
+                info.contains("rejected_calls"),
+                asked,
+                "{arg} should{} carry the command counters: {info}",
+                if asked { "" } else { " not" }
+            );
+        }
+
+        let cpu = f.run(&[b"INFO", b"cpu"]);
+        assert!(cpu.contains("used_cpu_user"), "{cpu}");
+        assert!(!cpu.contains("used_memory"), "{cpu}");
+
+        // Their case, to make the point that a section name is not case
+        // sensitive any more than a command name is.
+        let stats = f.run(&[b"INFO", b"commandSTATS"]);
+        assert!(!stats.contains("used_memory"), "{stats}");
+        assert!(stats.contains("rejected_calls"), "{stats}");
+
+        // Two sections named, and neither of them pulls in a third.
+        let pair = f.run(&[b"INFO", b"cpu", b"sentinel"]);
+        assert!(pair.contains("used_cpu_user"), "{pair}");
+        assert!(!pair.contains("master_repl_offset"), "{pair}");
+
+        let with_all = f.run(&[b"INFO", b"cpu", b"all"]);
+        assert!(with_all.contains("used_memory"), "{with_all}");
+        assert!(with_all.contains("master_repl_offset"), "{with_all}");
+        assert!(with_all.contains("rejected_calls"), "{with_all}");
+        // A section named twice is still written once.
+        assert_eq!(
+            with_all.matches("used_cpu_user_children").count(),
+            1,
+            "{with_all}"
+        );
+
+        let with_default = f.run(&[b"INFO", b"cpu", b"default"]);
+        assert!(with_default.contains("used_memory"), "{with_default}");
+        assert!(
+            with_default.contains("master_repl_offset"),
+            "{with_default}"
+        );
+        assert!(!with_default.contains("rejected_calls"), "{with_default}");
+        assert_eq!(
+            with_default.matches("used_cpu_user_children").count(),
+            1,
+            "{with_default}"
+        );
+    }
+
+    /// The three counters, each on the path that raises it.
+    ///
+    /// `calls` on a command that worked, `failed_calls` on one that ran and
+    /// answered with an error, and `rejected_calls` on one that never ran at
+    /// all. The last two are the pair that is easy to collapse into one number
+    /// and that Redis keeps apart, because a client sending the wrong number of
+    /// arguments and a client asking for a list element that is not there are
+    /// not the same problem.
+    #[test]
+    fn a_command_counts_what_it_did_separately_from_what_it_refused() {
+        let mut f = Fixture::new();
+        f.run(&[b"SET", b"k", b"v"]);
+        f.run(&[b"SET", b"k", b"w"]);
+        // Ran, and answered with an error, because `k` is not a list.
+        f.run(&[b"LPUSH", b"k", b"x"]);
+        // Never ran: `LPUSH` takes at least three arguments.
+        f.run(&[b"LPUSH", b"k"]);
+
+        let stats = f.run(&[b"INFO", b"commandstats"]);
+        assert!(
+            stats.contains("cmdstat_set:calls=2,rejected_calls=0,failed_calls=0"),
+            "{stats}"
+        );
+        assert!(
+            stats.contains("cmdstat_lpush:calls=1,rejected_calls=1,failed_calls=1"),
+            "{stats}"
+        );
+        assert!(
+            !stats.contains("cmdstat_zadd"),
+            "a command nobody has sent has no row: {stats}"
+        );
     }
 
     /// A cache that writes with a deadline and never reads back used to hold
