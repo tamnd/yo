@@ -1,19 +1,19 @@
 //! How recently a key was used, and how often, in twenty four bits.
 //!
-//! Eviction has to pick a victim, and the eight policies pick one by asking one
-//! of two questions about every candidate: when was this last read, or how often
-//! is it read. Redis answers both out of a single twenty four bit field on the
-//! object, reading it one way under an LRU policy and the other way under an
-//! LFU one, and this is that field.
+//! Eviction has to pick a victim, and the ten policies pick one by asking one of
+//! three questions about every candidate: when was this last read, when was it
+//! last written, or how often is it read. Redis answers all three out of a single
+//! twenty four bit field on the object, reading it one way under an LFU policy
+//! and the other way under everything else, and this is that field.
 //!
 //! ```text
-//! LRU  +-------------------------------------------+
-//!      | seconds since the epoch, low 24 bits      |
-//!      +-------------------------------------------+
+//! clock  +-------------------------------------------+
+//!        | seconds since the epoch, low 24 bits      |
+//!        +-------------------------------------------+
 //!
-//! LFU  +---------------------------+---------------+
-//!      | minutes, low 16 bits      | counter, u8   |
-//!      +---------------------------+---------------+
+//! LFU    +---------------------------+---------------+
+//!        | minutes, low 16 bits      | counter, u8   |
+//!        +---------------------------+---------------+
 //! ```
 //!
 //! The two readings share the field because a key is only ever under one policy
@@ -21,6 +21,24 @@
 //! reading is garbage under the new one. Redis says so in the error text on
 //! `OBJECT FREQ`, which tells the operator that switching will take some time to
 //! adjust, and that sentence is a description of exactly this.
+//!
+//! # Least recently modified
+//!
+//! There are ten policies rather than the eight most people can name.
+//! `volatile-lrm` and `allkeys-lrm` arrived in 8.8 and they are the reason the
+//! top box above is labelled clock rather than LRU. They store the same seconds
+//! in the same bits and are read by the same subtraction. The only difference is
+//! when the field is written: least recently used stamps it on every lookup,
+//! least recently modified stamps it only when the value changes, so a key that
+//! is read a million times and written once is a good victim under LRM and a bad
+//! one under LRU.
+//!
+//! The thing worth writing down is that the clock is kept under all eight of the
+//! non LFU policies and not just under the two LRU ones. Redis stamps it on every
+//! lookup under `noeviction` and under the random policies too, which is why
+//! `OBJECT IDLETIME` gives a real answer on a default server that is never going
+//! to evict anything. Assuming otherwise is easy and it makes `OBJECT IDLETIME`
+//! answer zero forever.
 //!
 //! # Why the arithmetic is copied rather than improved
 //!
@@ -120,7 +138,7 @@ impl Default for Lfu {
 /// What a server does when it runs out of room, and therefore which reading of
 /// [`Access`] is the live one.
 ///
-/// The eight are Redis's eight and the names are the strings `maxmemory-policy`
+/// The ten are Redis's ten and the names are the strings `maxmemory-policy`
 /// takes. They vary along two axes that are worth separating, because most of
 /// the code downstream only cares about one of them: which keys are eligible,
 /// and how a victim is chosen from among them.
@@ -131,6 +149,12 @@ impl Default for Lfu {
 /// TTL cannot evict anything at all, so it behaves as [`Policy::NoEviction`] and
 /// starts refusing writes, and that surprises people often enough that it is
 /// worth saying here.
+///
+/// Ten and not the eight everyone knows. `volatile-lrm` and `allkeys-lrm` are
+/// least recently modified, they are in 8.8 and therefore in the version we
+/// claim to be, and they are easy to miss because most of what is written about
+/// Redis eviction predates them. They share the clock with the LRU pair and
+/// differ in one rule: a read does not move it. See [`Policy::stamps_on_read`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Policy {
     /// Evict nothing and refuse the write instead. Redis's default, and this
@@ -144,6 +168,8 @@ pub enum Policy {
     AllKeysLfu,
     /// Any key, chosen at random.
     AllKeysRandom,
+    /// Any key, least recently modified first.
+    AllKeysLrm,
     /// Keys with a deadline, least recently used first.
     VolatileLru,
     /// Keys with a deadline, least frequently used first.
@@ -152,6 +178,8 @@ pub enum Policy {
     VolatileRandom,
     /// Keys with a deadline, soonest to expire first.
     VolatileTtl,
+    /// Keys with a deadline, least recently modified first.
+    VolatileLrm,
 }
 
 impl Policy {
@@ -163,12 +191,33 @@ impl Policy {
             Policy::AllKeysLru => "allkeys-lru",
             Policy::AllKeysLfu => "allkeys-lfu",
             Policy::AllKeysRandom => "allkeys-random",
+            Policy::AllKeysLrm => "allkeys-lrm",
             Policy::VolatileLru => "volatile-lru",
             Policy::VolatileLfu => "volatile-lfu",
             Policy::VolatileRandom => "volatile-random",
             Policy::VolatileTtl => "volatile-ttl",
+            Policy::VolatileLrm => "volatile-lrm",
         }
     }
+
+    /// Every policy, in the order Redis lists them.
+    ///
+    /// The order is not ours to pick. `CONFIG SET maxmemory-policy garbage`
+    /// fails with a message that names the legal values, and a client comparing
+    /// that message against a real server compares the whole string, so the
+    /// order in `config.c` is the order here.
+    pub const ALL: [Policy; 10] = [
+        Policy::VolatileLru,
+        Policy::VolatileLfu,
+        Policy::VolatileRandom,
+        Policy::VolatileTtl,
+        Policy::VolatileLrm,
+        Policy::AllKeysLru,
+        Policy::AllKeysLfu,
+        Policy::AllKeysRandom,
+        Policy::AllKeysLrm,
+        Policy::NoEviction,
+    ];
 
     /// The policy a `CONFIG SET maxmemory-policy` argument names.
     ///
@@ -176,17 +225,8 @@ impl Policy {
     /// that sends `ALLKEYS-LRU` is not wrong.
     #[must_use]
     pub fn parse(s: &[u8]) -> Option<Policy> {
-        const ALL: [Policy; 8] = [
-            Policy::NoEviction,
-            Policy::AllKeysLru,
-            Policy::AllKeysLfu,
-            Policy::AllKeysRandom,
-            Policy::VolatileLru,
-            Policy::VolatileLfu,
-            Policy::VolatileRandom,
-            Policy::VolatileTtl,
-        ];
-        ALL.into_iter()
+        Policy::ALL
+            .into_iter()
             .find(|p| s.eq_ignore_ascii_case(p.name().as_bytes()))
     }
 
@@ -199,6 +239,7 @@ impl Policy {
                 | Policy::VolatileLfu
                 | Policy::VolatileRandom
                 | Policy::VolatileTtl
+                | Policy::VolatileLrm
         )
     }
 
@@ -212,23 +253,59 @@ impl Policy {
         matches!(self, Policy::AllKeysLfu | Policy::VolatileLfu)
     }
 
-    /// Whether the access field is being read as a clock, which is the question
-    /// `OBJECT IDLETIME` asks.
+    /// Whether a victim is picked by how recently the key was used.
     #[must_use]
     pub const fn is_lru(self) -> bool {
         matches!(self, Policy::AllKeysLru | Policy::VolatileLru)
     }
 
-    /// Whether a read has to write anything back to the key it read.
+    /// Whether a victim is picked by how recently the key was written.
     ///
-    /// False for five of the eight, and that is the point of asking. Under
-    /// `noeviction` and the two random policies there is nothing to maintain, so
-    /// a `GET` does not touch the record it just read and the read path stays a
-    /// read path. Only the four LRU and LFU policies pay for the bookkeeping,
-    /// and only while they are selected.
+    /// The same clock as [`Policy::is_lru`] read the same way. The pair differ
+    /// only in when the clock is set, which is [`Policy::stamps_on_read`].
     #[must_use]
-    pub const fn tracks_access(self) -> bool {
-        self.is_lru() || self.is_lfu()
+    pub const fn is_lrm(self) -> bool {
+        matches!(self, Policy::AllKeysLrm | Policy::VolatileLrm)
+    }
+
+    /// Whether the access field holds a clock, which is the question `OBJECT
+    /// IDLETIME` asks before it answers.
+    ///
+    /// True for eight of the ten. Only an LFU policy packs something else in
+    /// there, and reporting those bits as an idle time would be reporting a
+    /// number that means nothing.
+    #[must_use]
+    pub const fn is_clock(self) -> bool {
+        !self.is_lfu()
+    }
+
+    /// Whether reading a key writes the access field back to it.
+    ///
+    /// True for eight of the ten, which is not the answer this had before and
+    /// is the answer Redis gives. It is tempting to think `noeviction` and the
+    /// random policies have nothing to maintain on a read, and that is true of
+    /// eviction and false of the field: Redis stamps the clock on every lookup
+    /// under all of them, which is why `OBJECT IDLETIME` tells the truth on a
+    /// default server that will never evict anything.
+    ///
+    /// The two LRM policies are the exception, and they are the whole reason
+    /// they exist. Least recently modified wants the clock to say when the value
+    /// was last written, so a read that moved it would erase the only thing the
+    /// policy is measuring.
+    #[must_use]
+    pub const fn stamps_on_read(self) -> bool {
+        !self.is_lrm()
+    }
+
+    /// Whether writing a key writes the access field back to it.
+    ///
+    /// True for all ten, by two different routes. Under LRM it is the point.
+    /// Under the other eight a write resolves the key first and that resolve is
+    /// a read like any other, so the stamp has already happened by the time the
+    /// value changes.
+    #[must_use]
+    pub const fn stamps_on_write(self) -> bool {
+        true
     }
 }
 
@@ -634,21 +711,30 @@ mod tests {
     /// client never asked for, and neither end would notice.
     #[test]
     fn every_policy_name_survives_a_round_trip() {
-        for name in [
-            "noeviction",
-            "allkeys-lru",
-            "allkeys-lfu",
-            "allkeys-random",
+        // Written out rather than taken from `ALL`, because a test that reads
+        // its expectations out of the thing it is testing agrees with a typo.
+        // The order is Redis's own, which is what the CONFIG SET error message
+        // has to list them in.
+        let names = [
             "volatile-lru",
             "volatile-lfu",
             "volatile-random",
             "volatile-ttl",
-        ] {
+            "volatile-lrm",
+            "allkeys-lru",
+            "allkeys-lfu",
+            "allkeys-random",
+            "allkeys-lrm",
+            "noeviction",
+        ];
+        for name in names {
             let p =
                 Policy::parse(name.as_bytes()).unwrap_or_else(|| panic!("{name} did not parse"));
             assert_eq!(p.name(), name);
             assert_eq!(Policy::parse(name.to_uppercase().as_bytes()), Some(p));
         }
+        let listed: Vec<&str> = Policy::ALL.iter().map(|p| p.name()).collect();
+        assert_eq!(listed, names, "ALL is Redis's order and is all of them");
         assert_eq!(Policy::parse(b"allkeys"), None);
         assert_eq!(Policy::parse(b""), None);
         assert_eq!(Policy::parse(b"allkeys-lru "), None, "no trimming here");
@@ -678,30 +764,52 @@ mod tests {
     #[test]
     fn the_default_is_to_refuse_the_write_rather_than_lose_data() {
         assert_eq!(Policy::default(), Policy::NoEviction);
-        assert!(!Policy::default().tracks_access());
+        // It still keeps the clock, which is why OBJECT IDLETIME answers on a
+        // default server that will never evict anything.
+        assert!(Policy::default().stamps_on_read());
+        assert!(Policy::default().is_clock());
     }
 
-    /// The two axes each policy sits on, spelled out once so that a name added
-    /// or a `matches!` arm edited has to be edited here too.
+    /// The axes each policy sits on, spelled out once so that a name added or a
+    /// `matches!` arm edited has to be edited here too.
     #[test]
     fn each_policy_is_on_the_axes_its_name_says() {
-        for (p, volatile, lru, lfu) in [
-            (Policy::NoEviction, false, false, false),
-            (Policy::AllKeysLru, false, true, false),
-            (Policy::AllKeysLfu, false, false, true),
-            (Policy::AllKeysRandom, false, false, false),
-            (Policy::VolatileLru, true, true, false),
-            (Policy::VolatileLfu, true, false, true),
-            (Policy::VolatileRandom, true, false, false),
-            (Policy::VolatileTtl, true, false, false),
+        for (p, volatile, lru, lfu, lrm) in [
+            (Policy::VolatileLru, true, true, false, false),
+            (Policy::VolatileLfu, true, false, true, false),
+            (Policy::VolatileRandom, true, false, false, false),
+            (Policy::VolatileTtl, true, false, false, false),
+            (Policy::VolatileLrm, true, false, false, true),
+            (Policy::AllKeysLru, false, true, false, false),
+            (Policy::AllKeysLfu, false, false, true, false),
+            (Policy::AllKeysRandom, false, false, false, false),
+            (Policy::AllKeysLrm, false, false, false, true),
+            (Policy::NoEviction, false, false, false, false),
         ] {
             let n = p.name();
             assert_eq!(p.volatile_only(), volatile, "{n} volatile");
             assert_eq!(p.is_lru(), lru, "{n} lru");
             assert_eq!(p.is_lfu(), lfu, "{n} lfu");
-            // Five of the eight have nothing to maintain on a read, which is
-            // what keeps the read path a read path under those five.
-            assert_eq!(p.tracks_access(), lru || lfu, "{n} tracking");
+            assert_eq!(p.is_lrm(), lrm, "{n} lrm");
+            // The field is a clock under everything except LFU, and a read
+            // moves it under everything except LRM. Those are two different
+            // questions with two different answers and it is worth pinning both.
+            assert_eq!(p.is_clock(), !lfu, "{n} clock");
+            assert_eq!(p.stamps_on_read(), !lrm, "{n} stamps on read");
+            assert!(p.stamps_on_write(), "{n} stamps on write");
         }
+    }
+
+    /// Least recently modified is the pair that catches people out, so the rule
+    /// that separates it from least recently used gets its own test.
+    #[test]
+    fn only_the_lrm_pair_ignores_a_read() {
+        for p in Policy::ALL {
+            assert_eq!(p.stamps_on_read(), !p.is_lrm(), "{}", p.name());
+        }
+        // And they read the field the same way once it is set, because it is
+        // the same clock. Only the moment it is written apart.
+        assert!(Policy::AllKeysLrm.is_clock());
+        assert!(Policy::AllKeysLru.is_clock());
     }
 }
