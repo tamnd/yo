@@ -242,10 +242,13 @@ impl Keyspace {
             out.copy_from_slice(&bytes);
         });
         self.scratch = bytes;
-        // `del` and not `drop_key`, which is the whole point. The body under the
-        // source belongs to the destination now and freeing it here would take
-        // it away from the key that just gained it.
-        self.map.del(src);
+        // `del_rec` and not `drop_key`, which is the whole point. The body under
+        // the source belongs to the destination now and freeing it here would
+        // take it away from the key that just gained it. It still goes through
+        // `del_rec` rather than straight at the map, because the record is going
+        // away either way and the count of keys with deadlines has to hear about
+        // it.
+        self.del_rec(src);
         Moved::Ok
     }
 

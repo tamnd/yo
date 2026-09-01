@@ -313,7 +313,7 @@ impl RawMap {
 
     /// Store `val` under `key`, returning the length of the value it replaced.
     pub fn set(&mut self, key: &[u8], val: &[u8]) -> Option<usize> {
-        self.set_with(key, val.len(), |buf| buf.copy_from_slice(val))
+        self.set_with(key, val.len(), |_| {}, |buf| buf.copy_from_slice(val))
     }
 
     /// The largest record this map can store, key and value and header together.
@@ -346,11 +346,20 @@ impl RawMap {
     /// It is arena memory that has been handed out before and freed, so its
     /// contents are arbitrary and every byte of it must be written.
     ///
+    /// `peek` is handed the value that was already under `key`, if there was
+    /// one, before anything is written over it. It exists because the caller
+    /// keeps counts that depend on what the old value was, and this is the only
+    /// place those bytes can be read for free: both paths through here have
+    /// already loaded the old record's header to find out how long it is, so the
+    /// value is in cache and would otherwise cost a second lookup to see. A
+    /// caller with nothing to ask passes an empty closure and pays nothing.
+    ///
     /// # Panics
     ///
     /// If the whole record would exceed [`RawMap::max_record`].
-    pub fn set_with<F>(&mut self, key: &[u8], vlen: usize, fill: F) -> Option<usize>
+    pub fn set_with<P, F>(&mut self, key: &[u8], vlen: usize, peek: P, fill: F) -> Option<usize>
     where
+        P: FnOnce(&[u8]),
         F: FnOnce(&mut [u8]),
     {
         self.writes += 1;
@@ -387,6 +396,11 @@ impl RawMap {
         if let Some(addr) = self.index.get(h, key, &Records { arena: &self.arena }) {
             let (klen, old_vlen) = Record::lens(self.arena.get(addr, HDR));
             debug_assert_eq!(klen, key.len(), "the index matched a different key");
+            // Before `fill`, because the in place path writes over exactly the
+            // bytes `peek` is being handed. Once, and here rather than next to
+            // the free below, because this is the branch that knows the key was
+            // there and both paths out of it go past this line.
+            peek(&self.arena.get(addr, HDR + klen + old_vlen)[HDR + klen..]);
             if old_vlen == vlen {
                 let rec = self.arena.get_mut(addr, total);
                 fill(&mut rec[HDR + klen..]);
@@ -420,7 +434,22 @@ impl RawMap {
     }
 
     /// Remove `key`, returning whether it was there.
+    #[inline]
     pub fn del(&mut self, key: &[u8]) -> bool {
+        self.del_with(key, |_| {})
+    }
+
+    /// Remove `key`, showing its value to `peek` first, and return whether it
+    /// was there.
+    ///
+    /// The sibling of [`RawMap::set_with`], and it exists for the same reason.
+    /// This already reads the record's header to find out how long it is before
+    /// handing the bytes back to the arena, so the value is in cache and a
+    /// caller who keeps a count that depends on what was removed can read it
+    /// here for the price of a closure call. Asking with a [`RawMap::get`] first
+    /// would be a second lookup for a question this one already knows the answer
+    /// to. `peek` is not called when the key was not there.
+    pub fn del_with<P: FnOnce(&[u8])>(&mut self, key: &[u8], peek: P) -> bool {
         self.writes += 1;
         let h = wyhash(key, 0);
         let addr = {
@@ -430,6 +459,7 @@ impl RawMap {
         match addr {
             Some(a) => {
                 let (k, v) = Record::lens(self.arena.get(a, HDR));
+                peek(&self.arena.get(a, HDR + k + v)[HDR + k..]);
                 self.arena.free(a, HDR + k + v);
                 true
             }
@@ -1267,7 +1297,7 @@ mod tests {
 
         m.set(b"k", b"v");
         moved(&m, "set");
-        m.set_with(b"k", 1, |b| b[0] = b'w');
+        m.set_with(b"k", 1, |_| {}, |b| b[0] = b'w');
         moved(&m, "set_with");
         m.value_mut(b"k");
         moved(&m, "value_mut");

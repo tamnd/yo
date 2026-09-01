@@ -2500,6 +2500,34 @@ mod tests {
         assert_eq!(f.run(&[b"INFO", b"nosuch"]), "$0\r\n\r\n");
     }
 
+    /// `expires=` used to be a hardcoded zero, which meant a dashboard watching
+    /// how much of a cache is volatile was reading a constant.
+    #[test]
+    fn info_keyspace_counts_the_keys_that_have_a_deadline() {
+        let mut f = Fixture::new();
+        f.run(&[b"MSET", b"a", b"1", b"b", b"2", b"c", b"3"]);
+        assert!(
+            f.run(&[b"INFO", b"keyspace"])
+                .contains("db0:keys=3,expires=0"),
+            "none of them has one yet"
+        );
+        f.run(&[b"EXPIRE", b"a", b"1000"]);
+        f.run(&[b"EXPIRE", b"b", b"1000"]);
+        let two = f.run(&[b"INFO", b"keyspace"]);
+        assert!(two.contains("db0:keys=3,expires=2"), "{two}");
+        f.run(&[b"PERSIST", b"a"]);
+        f.run(&[b"DEL", b"b"]);
+        let none = f.run(&[b"INFO", b"keyspace"]);
+        assert!(none.contains("db0:keys=2,expires=0"), "{none}");
+
+        // Each database answers for itself, the way Redis reports it.
+        f.run(&[b"SELECT", b"1"]);
+        f.run(&[b"SET", b"x", b"1", b"EX", b"1000"]);
+        let both = f.run(&[b"INFO", b"keyspace"]);
+        assert!(both.contains("db0:keys=2,expires=0"), "{both}");
+        assert!(both.contains("db1:keys=1,expires=1"), "{both}");
+    }
+
     #[cfg(unix)]
     #[test]
     fn info_cpu_reports_processor_time_that_was_really_measured() {

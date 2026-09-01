@@ -920,11 +920,12 @@ fn info(server: &Server, args: Args<'_>, out: &mut Out) {
             for i in 0..DATABASES {
                 let keys = server.dbs[i].len();
                 if keys > 0 {
-                    // How many of them have a deadline is not counted yet. The
-                    // active expiry cycle counts it when it lands, and until
-                    // then a zero here is the honest answer to a question
-                    // nothing has asked the keyspace.
-                    let _ = write!(s, "db{i}:keys={keys},expires=0,avg_ttl=0\r\n");
+                    // `avg_ttl` is still a zero, and Redis reports a zero there
+                    // too on a server that has never run its active expiry
+                    // cycle, because the number is a running estimate that cycle
+                    // produces rather than something anybody measures on demand.
+                    let expires = server.dbs[i].expires();
+                    let _ = write!(s, "db{i}:keys={keys},expires={expires},avg_ttl=0\r\n");
                 }
             }
             s.push_str("\r\n");
