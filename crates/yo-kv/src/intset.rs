@@ -17,6 +17,11 @@
 //! from a set of integers, and it is why this exists as a third representation
 //! rather than everything small going in a listpack.
 //!
+//! Two byte width is not only for sets of small numbers. Past one run a run
+//! stores its members as distances from a base of its own rather than as
+//! themselves, so a set of billions is still two bytes a member. That is the
+//! frame of reference, and the `Run` type is where it is explained.
+//!
 //! Measured, on a set of five hundred and twelve small integers, that is 2.0
 //! bytes a member against the listpack's 3.0 and the element table's 24.0. The
 //! header is the only thing between it and exactly two, and it is amortised away
@@ -78,34 +83,51 @@
 //! `measure_bytes_per_member`:
 //!
 //! ```text
-//!   members     before                after
-//!       512     4.00  intset          2.08  intset
-//!     1,000    24.60  hashtable       2.19  intset
-//!   100,000    30.92  hashtable       3.53  intset
-//! 1,000,000    29.19  hashtable       4.08  intset
+//!   members     one array          the runs     and the frame
+//!       512     4.00  intset       2.09         2.11
+//!     1,000    24.60  hashtable    2.22         2.25
+//!   100,000    30.92  hashtable    3.57         2.26
+//! 1,000,000    29.19  hashtable    4.11         2.21
 //! ```
 //!
-//! The 4.08 at a million is not slack, it is the width. Values up to a million
-//! need four byte slots, so four bytes a member is the floor there and the
-//! overhead above it is eight hundredths of a byte. Two bytes a member is only
-//! reachable by a set whose members fit an `i16`, and the 2.08 at 512 is that
-//! case.
+//! The four bytes a member the larger sizes used to cost was not slack, it was
+//! the width: values up to a million need four byte slots, so four bytes was the
+//! floor and the overhead above it was eight hundredths of a byte. Getting under
+//! it meant making the width smaller rather than the overhead, which is what the
+//! frame of reference does, and it is the whole of the last column.
+//!
+//! The frame costs eight bytes a run, which is the base sitting in the `Run`
+//! next to the buffer, and that is the two hundredths of a byte the first two
+//! rows go backwards by. It is a bad trade on a set of small integers, which had
+//! no width to save, and it pays for itself several hundred times over on
+//! anything bigger.
+//!
+//! Filled in scattered order rather than ascending the answer is much the same,
+//! 2.11, 2.24, 2.23 and 2.28, against 4.33 at a million before the frame. That
+//! matters more than the ascending row does, because a run whose members arrive
+//! out of order is the one that has to widen, and it is the shape a real
+//! keyspace has.
 //!
 //! What it costs in time, from `intset_runs` in `benches/intset.rs`:
 //!
 //! ```text
 //!                    4,096     100,000     1,000,000
-//!   contains hit   10.8 ns     13.2 ns       14.7 ns
-//!   contains miss   9.0 ns     10.8 ns       13.0 ns
-//!   member at k     3.2 ns      8.3 ns       11.2 ns
+//!   contains hit   11.4 ns     13.0 ns       14.9 ns
+//!   contains miss   9.3 ns     10.3 ns       12.7 ns
+//!   member at k     3.5 ns      7.2 ns       10.4 ns
 //!   runs                15         390          3906
-//!   bytes a member    2.17        4.13          4.17
 //! ```
 //!
+//! Against the same benchmark before the frame that is 3 to 5 percent slower at
+//! 4,096 and 3 to 12 percent quicker at 100,000 and a million. The slower end is
+//! the subtract the frame adds. The quicker end is the set being half the size
+//! it was, which at 4,096 buys nothing because both fit in cache anyway, and at
+//! a million buys more than the subtract costs.
+//!
 //! End to end through [`crate::Set`], a set of a million integers filled in
-//! scattered order went from 30.71 bytes a member to 4.17, and `SADD` went from
-//! 72.6 ns to 49.8. Membership went the other way, 13.6 ns to 14.7, which is the
-//! price of the two searches and is what the memory bought.
+//! scattered order went from 30.71 bytes a member to 2.28, and `SADD` went from
+//! 72.6 ns to 49.8. Membership went the other way, 13.6 ns to about 15, which is
+//! the price of the two searches and is what the memory bought.
 //!
 //! That last number was 40.5 ns at first, which would not have been a trade
 //! worth making, and the fix is the maxima array: picking the run by asking
@@ -318,7 +340,12 @@ impl Intset {
     #[must_use]
     pub fn as_bytes(&self) -> Option<&[u8]> {
         match self.runs.as_slice() {
-            [run] => Some(run.as_bytes()),
+            // The base check is a backstop rather than a case that comes up on
+            // the way here. A run only takes a base once the set has more than
+            // one of them, and a set drained back down to one run gives its
+            // frame up on the way, so a one run set with a base should not
+            // exist. This is cheaper than being sure of that.
+            [run] if run.base == 0 => Some(run.as_bytes()),
             _ => None,
         }
     }
@@ -350,6 +377,10 @@ impl Intset {
     /// The widest and not one number for the set, because width is per run here.
     /// This is what a caller asking "how wide did this set have to get" means,
     /// and no search uses it.
+    ///
+    /// It is the width of the stored offset and not of the value, so a set of
+    /// integers around a billion reports two once it has split into runs. That
+    /// is the point of the frame of reference the runs are packed against.
     #[must_use]
     pub fn width(&self) -> usize {
         self.runs
@@ -432,7 +463,10 @@ impl Intset {
     /// Add `v`. Answers whether it was not already there.
     pub fn add(&mut self, v: i64) -> bool {
         let i = self.run_for(v);
-        if !self.runs[i].add(v) {
+        // A one run set never moves its base, so its bytes stay a Redis intset
+        // and `as_bytes` stays a borrow. See [`Run`].
+        let rebase = self.runs.len() > 1;
+        if !self.runs[i].add(v, rebase) {
             return false;
         }
         self.total += 1;
@@ -483,14 +517,19 @@ impl Intset {
         let n = self.runs[i].len();
         let half = n / 2;
         let src = &self.runs[i];
-        // The members are ascending, so the two ends bound the width of
+        // The members are ascending, so the two ends bound the frame of
         // everything between them and there is nothing to scan.
-        let w = width_of(src.at(half)).max(width_of(src.at(n - 1)));
-        let mut hi = Run::with_width(w, n - half);
+        let (base, w) = frame(src.at(half), src.at(n - 1));
+        let mut hi = Run::with_base(base, w, n - half);
         for k in half..n {
             hi.push_back(src.at(k));
         }
         self.runs[i].truncate(half);
+        // Both halves cover a narrower range than the run they came out of, and
+        // the upper one was built knowing that. This is where the lower one
+        // finds out, and it is the whole reason a split is where the frames get
+        // tight: an ascending fill splits every run exactly once.
+        self.runs[i].rebase();
         // The lower half keeps the buffer the whole run had, which is twice
         // what it now holds, and an ascending fill splits every run exactly
         // once and then never touches the lower half again. Left alone that is
@@ -537,6 +576,12 @@ impl Intset {
         let src = self.runs.remove(hi);
         self.maxima.remove(hi);
         self.runs[lo].append(&src);
+        // A set drained back down to one run gives up its frame, so that it is
+        // a Redis intset again and [`Intset::as_bytes`] is a borrow rather than
+        // a rebuild. See [`Run`] for why one run never carries a base.
+        if self.runs.len() == 1 {
+            self.runs[0].unframe();
+        }
         self.maxima[lo] = top_of(&self.runs[lo]);
         self.rebuild_ranks();
     }
@@ -719,29 +764,51 @@ impl PartialEq for Intset {
 
 impl Eq for Intset {}
 
-/// One run: a complete intset in Redis's own layout.
+/// One run: a complete intset in Redis's own layout, offset from a base.
+///
+/// The base is what takes a run of large integers down to two bytes a member.
+/// A run holds at most [`RUN_MAX`] members out of a set that may hold millions,
+/// so the values inside one run are close together whatever the set as a whole
+/// spans: a million members scattered over sixteen million values leave every
+/// run covering a few thousand of them. Stored as themselves those need four
+/// bytes each, and stored as their distance from the middle of the run's own
+/// range they need two.
+///
+/// The base is the middle of that range rather than the bottom of it, which is
+/// worth a sentence because it is not obvious. The stored offsets are read back
+/// through the same signed readers Redis uses, so a base at the bottom would
+/// only ever use the positive half of the width and hold a span of thirty two
+/// thousand at two bytes. Centred, the offsets run either side of zero and the
+/// same two bytes hold a span of sixty five thousand. It also leaves room on
+/// both sides for the members still to arrive rather than only above.
+///
+/// A base of zero is a run that is byte for byte a Redis intset, and a run only
+/// takes a base once the set it belongs to has more than one of them. That is
+/// deliberate: a set a default configured server would still call an intset
+/// stays one array in Redis's own layout, so [`Intset::as_bytes`] is still a
+/// borrow rather than a rebuild, and the frame only appears past the point
+/// where Redis has stopped having an intset at all.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Run {
     /// The header and the members, in Redis's own layout, so that handing this
-    /// to an RDB writer is a copy.
+    /// to an RDB writer is a copy when the base is zero.
     bytes: Vec<u8>,
+    /// What every stored member is measured from.
+    base: i64,
 }
 
 impl Run {
     /// An empty run at the narrowest width.
     fn new() -> Run {
-        let mut bytes = Vec::with_capacity(HEADER);
-        bytes.extend_from_slice(&W16.to_le_bytes());
-        bytes.extend_from_slice(&0u32.to_le_bytes());
-        Run { bytes }
+        Run::with_base(0, W16 as usize, 0)
     }
 
-    /// An empty run at `w` bytes a member with room for `n` of them.
-    fn with_width(w: u32, n: usize) -> Run {
-        let mut bytes = Vec::with_capacity(HEADER + n * w as usize);
-        bytes.extend_from_slice(&w.to_le_bytes());
+    /// An empty run against `base`, `w` bytes a member, with room for `n`.
+    fn with_base(base: i64, w: usize, n: usize) -> Run {
+        let mut bytes = Vec::with_capacity(HEADER + n * w);
+        bytes.extend_from_slice(&(w as u32).to_le_bytes());
         bytes.extend_from_slice(&0u32.to_le_bytes());
-        Run { bytes }
+        Run { bytes, base }
     }
 
     /// Read a blob written by us or by a real server. See [`Intset::from_bytes`].
@@ -763,6 +830,7 @@ impl Run {
         }
         let s = Run {
             bytes: bytes.to_vec(),
+            base: 0,
         };
         for i in 1..count {
             if s.at(i - 1) >= s.at(i) {
@@ -811,7 +879,23 @@ impl Run {
     /// The member at `index`, counting from the smallest.
     #[inline]
     fn at(&self, index: usize) -> i64 {
-        let w = self.width();
+        self.base + self.raw(index)
+    }
+
+    /// What is stored at `index`, which is the member less the base.
+    #[inline]
+    fn raw(&self, index: usize) -> i64 {
+        self.raw_w(index, self.width())
+    }
+
+    /// [`Run::raw`] for a caller that already knows the width.
+    ///
+    /// The width lives in the buffer, so reading it is a load, and a binary
+    /// search that reads it at every step reads the same four bytes nine times.
+    /// Out here it is read once and the search compares stored offsets against
+    /// a stored offset rather than adding the base back nine times.
+    #[inline]
+    fn raw_w(&self, index: usize, w: usize) -> i64 {
         let at = HEADER + index * w;
         let raw = &self.bytes[at..at + w];
         match w {
@@ -819,6 +903,16 @@ impl Run {
             4 => i64::from(i32::from_le_bytes(raw.try_into().expect("four bytes"))),
             _ => i64::from_le_bytes(raw.try_into().expect("eight bytes")),
         }
+    }
+
+    /// Whether `v` is inside the frame this run is packed against.
+    ///
+    /// A value outside it is not a member, because every member is inside it,
+    /// and saying so costs a subtract and a compare instead of a search.
+    #[inline]
+    fn framed(&self, v: i64) -> bool {
+        v.checked_sub(self.base)
+            .is_some_and(|off| width_of(off) as usize <= self.width())
     }
 
     /// The smallest member, or `None` if there are none.
@@ -836,9 +930,7 @@ impl Run {
     /// Whether `v` is a member.
     #[inline]
     fn contains(&self, v: i64) -> bool {
-        // A value too wide for this run's members cannot be one of them, and
-        // saying so costs a compare instead of a search.
-        width_of(v) <= self.width() as u32 && self.search(v).is_ok()
+        self.framed(v) && self.search(v).is_ok()
     }
 
     /// Every member, smallest first.
@@ -852,10 +944,12 @@ impl Run {
     }
 
     /// Add `v`. Answers whether it was not already there.
-    fn add(&mut self, v: i64) -> bool {
-        let w = width_of(v);
-        if w > self.width() as u32 {
-            self.widen_and_add(v, w);
+    ///
+    /// `rebase` is whether this run is allowed to move its base, which it is
+    /// only once the set has more than one run. See [`Run`].
+    fn add(&mut self, v: i64, rebase: bool) -> bool {
+        if !self.framed(v) {
+            self.refit_and_add(v, rebase);
             return true;
         }
         match self.search(v) {
@@ -875,7 +969,7 @@ impl Run {
         let w = self.width();
         let at = self.bytes.len();
         self.grow_by(w);
-        write_at(&mut self.bytes, at, w, v);
+        write_at(&mut self.bytes, at, w, v - self.base);
         self.set_len(self.len() + 1);
     }
 
@@ -883,11 +977,11 @@ impl Run {
     fn append(&mut self, other: &Run) {
         self.reserve_members(other.len());
         for v in other.iter() {
-            // Through `add` and not `push_back`, because `other` may hold wider
-            // members than this run has room for and widening is `add`'s job.
+            // Through `add` and not `push_back`, because `other` may hold
+            // members outside this run's frame and refitting is `add`'s job.
             // Every one of them is past the last member, so the range test in
             // front of the search answers and nothing moves.
-            self.add(v);
+            self.add(v, true);
         }
     }
 
@@ -904,7 +998,7 @@ impl Run {
 
     /// Remove `v`. Answers whether it was there.
     fn remove(&mut self, v: i64) -> bool {
-        if width_of(v) > self.width() as u32 {
+        if !self.framed(v) {
             return false;
         }
         let Ok(at) = self.search(v) else {
@@ -925,16 +1019,32 @@ impl Run {
     /// again is work with a known answer. On a merge that steps through two sets
     /// together the range is one or two members wide.
     fn lower_bound(&self, v: i64, from: usize) -> usize {
+        let w = self.width();
+        let off = self.offset_of(v);
         let (mut lo, mut hi) = (from, self.len());
         while lo < hi {
             let mid = lo.midpoint(hi);
-            if self.at(mid) < v {
+            if self.raw_w(mid, w) < off {
                 lo = mid + 1;
             } else {
                 hi = mid;
             }
         }
         lo
+    }
+
+    /// `v` as this run would store it, saturating rather than wrapping.
+    ///
+    /// A search compares stored offsets against a stored offset, so the base
+    /// comes off the value it is looking for once instead of going back onto
+    /// every member the search touches. Saturating is right here and not just
+    /// convenient: a value too far from the base to subtract at all is a value
+    /// past every member on that side, and the saturated offset is past every
+    /// stored offset on that side too, so the search lands where it should.
+    #[inline]
+    fn offset_of(&self, v: i64) -> i64 {
+        v.checked_sub(self.base)
+            .unwrap_or(if v < self.base { i64::MIN } else { i64::MAX })
     }
 
     /// Where `v` is, or where it would go.
@@ -948,19 +1058,21 @@ impl Run {
         if n == 0 {
             return Err(0);
         }
-        if v > self.at(n - 1) {
+        let w = self.width();
+        let off = self.offset_of(v);
+        if off > self.raw_w(n - 1, w) {
             return Err(n);
         }
-        if v < self.at(0) {
+        if off < self.raw_w(0, w) {
             return Err(0);
         }
         let (mut lo, mut hi) = (0usize, n - 1);
         while lo <= hi {
             let mid = lo.midpoint(hi);
-            let cur = self.at(mid);
-            if v > cur {
+            let cur = self.raw_w(mid, w);
+            if off > cur {
                 lo = mid + 1;
-            } else if v < cur {
+            } else if off < cur {
                 // `mid` is at least one here, because `v` is not under the
                 // first member and so cannot be under member zero.
                 hi = mid - 1;
@@ -971,32 +1083,83 @@ impl Run {
         Err(lo)
     }
 
-    /// Rewrite every member at `w` bytes and put `v` at whichever end it belongs.
+    /// Rewrite every member against a frame that holds `v` too, and add `v`.
     ///
-    /// Back to front, so that a member is read before the wider write that would
-    /// have covered it. `v` is outside the range of everything here, which is
-    /// what being too wide means, so it goes at the front if it is negative and
-    /// at the back if it is not, with no search.
-    fn widen_and_add(&mut self, v: i64, w: u32) {
+    /// `v` is outside the frame everything here is packed against, so it is not
+    /// a member and it is not in the middle: it is under the smallest or over
+    /// the largest, and either way there is no search.
+    ///
+    /// The members go out to a fixed buffer and come back rather than being
+    /// shuffled where they lie. The old code could move them in place because a
+    /// widen only ever moved a member to a higher offset, so back to front was
+    /// safe. A refit can narrow as well as widen, and it can shift the members
+    /// up by one at the same time, and there is no single direction that is
+    /// safe for all of those. A run is capped at [`RUN_MAX`] members so the
+    /// buffer is a known four kilobytes, and this runs once per couple of
+    /// hundred inserts and never on the ascending fill.
+    fn refit_and_add(&mut self, v: i64, rebase: bool) {
         let n = self.len();
-        let old = self.width();
-        let neww = w as usize;
-        self.bytes.resize(HEADER + (n + 1) * neww, 0);
-        let ahead = usize::from(v < 0);
-        for i in (0..n).rev() {
-            let at = HEADER + i * old;
-            let raw = &self.bytes[at..at + old];
-            let val = match old {
-                2 => i64::from(i16::from_le_bytes(raw.try_into().expect("two bytes"))),
-                4 => i64::from(i32::from_le_bytes(raw.try_into().expect("four bytes"))),
-                _ => i64::from_le_bytes(raw.try_into().expect("eight bytes")),
-            };
-            write_at(&mut self.bytes, HEADER + (i + ahead) * neww, neww, val);
+        let mut held = [0i64; RUN_MAX + 2];
+        for (i, slot) in held.iter_mut().enumerate().take(n) {
+            *slot = self.at(i);
         }
-        let end = if ahead == 1 { 0 } else { n };
-        write_at(&mut self.bytes, HEADER + end * neww, neww, v);
-        self.bytes[0..4].copy_from_slice(&w.to_le_bytes());
-        self.set_len(n + 1);
+        let ahead = usize::from(n > 0 && v < held[0]);
+        if ahead == 1 {
+            held.copy_within(0..n, 1);
+        }
+        held[if ahead == 1 { 0 } else { n }] = v;
+        self.repack(&held[..n + 1], rebase);
+    }
+
+    /// Repack against the tightest frame for the members that are here.
+    ///
+    /// Called after a split, where both halves cover a narrower range than the
+    /// run they came out of and neither of them knows it yet.
+    fn rebase(&mut self) {
+        let n = self.len();
+        let mut held = [0i64; RUN_MAX + 2];
+        for (i, slot) in held.iter_mut().enumerate().take(n) {
+            *slot = self.at(i);
+        }
+        self.repack(&held[..n], true);
+    }
+
+    /// Give up the frame and store the members as themselves.
+    ///
+    /// Called when a set shrinks back to one run, which is the one shape that
+    /// has to stay byte for byte a Redis intset. It costs whatever the wider
+    /// width costs, on a set small enough that the difference is a few hundred
+    /// bytes, and it buys back a borrow on every save.
+    fn unframe(&mut self) {
+        if self.base == 0 {
+            return;
+        }
+        let n = self.len();
+        let mut held = [0i64; RUN_MAX + 2];
+        for (i, slot) in held.iter_mut().enumerate().take(n) {
+            *slot = self.at(i);
+        }
+        self.repack(&held[..n], false);
+    }
+
+    /// Write `members` out against the tightest frame that holds them.
+    fn repack(&mut self, members: &[i64], rebase: bool) {
+        let (base, w) = match members {
+            [] => (0, W16 as usize),
+            [only] => (if rebase { *only } else { 0 }, {
+                let off = if rebase { 0 } else { *only };
+                width_of(off) as usize
+            }),
+            [lo, .., hi] if rebase => frame(*lo, *hi),
+            [lo, .., hi] => (0, width_of(*lo).max(width_of(*hi)) as usize),
+        };
+        self.base = base;
+        self.bytes.resize(HEADER + members.len() * w, 0);
+        self.bytes[0..4].copy_from_slice(&(w as u32).to_le_bytes());
+        for (i, &v) in members.iter().enumerate() {
+            write_at(&mut self.bytes, HEADER + i * w, w, v - base);
+        }
+        self.set_len(members.len());
     }
 
     /// Open a slot at `at` and put `v` in it.
@@ -1006,7 +1169,7 @@ impl Run {
         let old = self.bytes.len();
         self.grow_by(w);
         self.bytes.copy_within(from..old, from + w);
-        write_at(&mut self.bytes, from, w, v);
+        write_at(&mut self.bytes, from, w, v - self.base);
         self.set_len(self.len() + 1);
     }
 
@@ -1042,6 +1205,27 @@ impl Run {
 #[inline]
 fn top_of(r: &Run) -> i64 {
     r.max().unwrap_or(i64::MAX)
+}
+
+/// The base and width that hold every value from `lo` to `hi`.
+///
+/// The base is the middle of the range and not the bottom of it, because the
+/// offsets are read back through signed readers: from the bottom they would only
+/// use the positive half of the width and two bytes would hold a span of thirty
+/// two thousand, and from the middle they use both halves and two bytes hold
+/// sixty five thousand.
+///
+/// A range too wide to subtract at all is a run holding both ends of the
+/// sixty four bit line, which no frame helps with, so it gets no base and the
+/// widest width.
+#[inline]
+fn frame(lo: i64, hi: i64) -> (i64, usize) {
+    let Some(span) = hi.checked_sub(lo) else {
+        return (0, W64 as usize);
+    };
+    let base = lo + span / 2;
+    let w = width_of(lo - base).max(width_of(hi - base));
+    (base, w as usize)
 }
 
 /// The narrowest width that holds `v`.
@@ -1080,6 +1264,120 @@ mod tests {
 
     fn members(s: &Intset) -> Vec<i64> {
         s.iter().collect()
+    }
+
+    /// The frame is the whole memory argument, so this is the row that says it
+    /// worked. A billion apart is far outside two byte range and the set still
+    /// stores its members in two bytes each, because no one run spans more than
+    /// a few thousand of them.
+    #[test]
+    fn a_set_of_large_integers_still_stores_them_in_two_bytes() {
+        let mut s = Intset::new();
+        for i in 0..10_000i64 {
+            s.add(1_000_000_000 + i * 3);
+        }
+        assert_eq!(s.width(), W16 as usize, "every run is two bytes a member");
+        assert!(
+            s.byte_len() < 10_000 * 2 + s.runs() * 16,
+            "{} bytes for ten thousand members over {} runs",
+            s.byte_len(),
+            s.runs()
+        );
+        for i in 0..10_000i64 {
+            assert!(s.contains(1_000_000_000 + i * 3), "member {i}");
+            assert!(!s.contains(1_000_000_000 + i * 3 + 1), "gap after {i}");
+        }
+        assert_eq!(s.len(), 10_000);
+    }
+
+    /// A member arriving under a run's smallest moves the frame down rather
+    /// than widening it, which is the direction the old widen path never had to
+    /// think about.
+    #[test]
+    fn a_member_under_the_frame_moves_it_instead_of_widening_it() {
+        let mut s = Intset::new();
+        // Past the ceiling, so the runs and the frames exist at all.
+        for i in 0..2_000i64 {
+            s.add(500_000 + i * 100);
+        }
+        let before = s.width();
+        for i in 0..50i64 {
+            assert!(s.add(500_000 - 1 - i), "{i} is new and under everything");
+        }
+        assert_eq!(s.width(), before, "still two bytes a member");
+        assert_eq!(s.min(), Some(500_000 - 50));
+        assert_eq!(s.len(), 2_050);
+        for i in 0..50i64 {
+            assert!(s.contains(500_000 - 1 - i));
+        }
+    }
+
+    /// Negative members, which is where a centred base and a signed reader
+    /// could disagree with each other and nothing else would notice.
+    #[test]
+    fn the_frame_holds_negative_members_too() {
+        let mut s = Intset::new();
+        for i in 0..3_000i64 {
+            s.add(-2_000_000_000 + i * 7);
+        }
+        assert_eq!(s.width(), W16 as usize);
+        assert_eq!(s.min(), Some(-2_000_000_000));
+        assert_eq!(s.max(), Some(-2_000_000_000 + 2_999 * 7));
+        for i in 0..3_000i64 {
+            assert!(s.contains(-2_000_000_000 + i * 7), "member {i}");
+        }
+        assert_eq!(members(&s).len(), 3_000);
+    }
+
+    /// A run holding both ends of the sixty four bit line, which no frame helps
+    /// with and which the subtraction cannot even be done on.
+    #[test]
+    fn a_span_too_wide_to_subtract_gets_no_frame() {
+        assert_eq!(frame(i64::MIN, i64::MAX), (0, W64 as usize));
+        let mut s = Intset::new();
+        for i in 0..600i64 {
+            s.add(i);
+        }
+        s.add(i64::MIN);
+        s.add(i64::MAX);
+        assert_eq!(s.width(), W64 as usize, "the widest run holds both ends");
+        assert!(s.contains(i64::MIN) && s.contains(i64::MAX) && s.contains(300));
+        assert_eq!(s.len(), 602);
+    }
+
+    /// A set small enough for a real server to call it an intset hands over the
+    /// same bytes it always did, whatever its members are, because a one run set
+    /// never takes a base.
+    #[test]
+    fn a_one_run_set_is_still_a_redis_intset() {
+        let s = of(&[1_000_000_000, 1_000_000_001, 2_000_000_000]);
+        let bytes = s.as_bytes().expect("one run");
+        assert_eq!(
+            Intset::from_bytes(bytes).expect("a real server could read this"),
+            s
+        );
+        assert_eq!(s.width(), W32 as usize, "no base, so the values decide");
+    }
+
+    #[test]
+    fn a_set_drained_back_to_one_run_is_a_redis_intset_again() {
+        let mut s = Intset::new();
+        for i in 0..4_000i64 {
+            s.add(1_000_000_000 + i * 3);
+        }
+        assert!(s.runs.len() > 1, "several runs to start with");
+        assert!(s.as_bytes().is_none(), "framed, so not a Redis intset");
+        for i in 100..4_000i64 {
+            s.remove(1_000_000_000 + i * 3);
+        }
+        sound(&s);
+        assert_eq!(s.runs.len(), 1, "the merges took it back to one run");
+        let bytes = s.as_bytes().expect("one run, so the frame is gone");
+        assert_eq!(
+            Intset::from_bytes(bytes).expect("a real server could read this"),
+            s
+        );
+        assert_eq!(s.len(), 100);
     }
 
     /// Everything the runs have to keep true, checked in one place so that a
@@ -1350,7 +1648,7 @@ mod tests {
         let mut r = Run::new();
         for i in 0..100i64 {
             assert_eq!(r.search(i), Err(i as usize), "{i} appends");
-            r.add(i);
+            r.add(i, false);
         }
         assert_eq!(r.len(), 100);
     }
