@@ -397,9 +397,18 @@ impl Server {
     /// the write to be judged against the limit it just set, and because the
     /// cached number is meaningless until the first time there is a limit to
     /// compare it with.
+    ///
+    /// Turning the limit on also turns on the running total every slab keeps of
+    /// what its collections hold, and turning it off turns that back off, so a
+    /// server with no limit is not paying to count something nobody reads. The
+    /// first reading after switching it on is the walk that the total starts
+    /// from, and it is the only walk.
     pub fn set_maxmemory(&mut self, bytes: u64) {
         self.maxmemory = bytes;
-        self.used = self.memory_bytes();
+        for db in &mut self.dbs {
+            db.track_memory(bytes != 0);
+        }
+        self.used = self.settled_memory();
     }
 
     /// Take a fresh memory reading, which the maintenance turn does once a batch.
@@ -408,8 +417,22 @@ impl Server {
     /// server that has not asked for one.
     pub fn refresh_memory(&mut self) {
         if self.maxmemory != 0 {
-            self.used = self.memory_bytes();
+            self.used = self.settled_memory();
         }
+    }
+
+    /// [`Server::memory_bytes`], asked the cheap way.
+    ///
+    /// The same number. The difference is that this asks each database only
+    /// about the collections that could have moved since the last time, which is
+    /// what a batch touched rather than what the server holds, so it can be
+    /// asked once a batch and again on every command that is over the limit.
+    fn settled_memory(&mut self) -> usize {
+        self.dbs
+            .iter_mut()
+            .map(Keyspace::settled_memory_bytes)
+            .sum::<usize>()
+            + self.conn_bytes
     }
 
     /// Make room under the `maxmemory` limit, throwing keys away if that is what
@@ -450,17 +473,17 @@ impl Server {
             return true;
         }
         // The cached reading is a batch old and the batch may have compacted
-        // since, so take a fresh one before throwing anything away. This is the
-        // one place that pays for a reading on a command path, and it only pays
-        // when the last reading said the server was already over.
-        self.used = self.memory_bytes();
+        // since, so take a fresh one before throwing anything away. It is the
+        // settled reading and not the walk, so what this costs is the handful of
+        // collections the last batch touched and not the whole database.
+        self.used = self.settled_memory();
         let mut budget = EVICT_BUDGET;
         while self.used as u64 > self.maxmemory {
             if !self.evict_step() {
                 return false;
             }
             self.compact_hard_step();
-            self.used = self.memory_bytes();
+            self.used = self.settled_memory();
             budget -= 1;
             if budget == 0 {
                 break;
@@ -2142,6 +2165,88 @@ mod tests {
         assert!(
             f.run(&[b"DBSIZE"]) != ":0\r\n",
             "and it did not empty the database to get there"
+        );
+    }
+
+    #[test]
+    fn the_running_total_and_the_walk_agree_on_a_mixed_keyspace() {
+        // The limit is judged against a number kept as the collections move,
+        // rather than found by asking all of them, and the two have to be the
+        // same number or the limit is enforced against a fiction. This does the
+        // things that move it, which is growing a collection, shrinking one,
+        // changing its representation, deleting it and reusing its slot, across
+        // all five types, and checks the two against each other as it goes.
+        let mut f = Fixture::new();
+        f.run(&[b"CONFIG", b"SET", b"maxmemory", b"1gb"]);
+        let big = vec![b'v'; 200];
+
+        for i in 0..400u32 {
+            let n = i.to_string();
+            let n = n.as_bytes();
+            f.run(&[b"SADD", b"s", n]);
+            f.run(&[b"SADD", b"s2", &big]);
+            f.run(&[b"HSET", b"h", n, &big]);
+            f.run(&[b"RPUSH", b"l", &big]);
+            f.run(&[b"ZADD", b"z", n, n]);
+            f.run(&[b"ARSET", b"a", n, &big]);
+            if i % 7 == 0 {
+                f.run(&[b"SREM", b"s", n]);
+                f.run(&[b"HDEL", b"h", n]);
+                f.run(&[b"LPOP", b"l"]);
+                f.run(&[b"ZREM", b"z", n]);
+                f.run(&[b"ARDEL", b"a", n]);
+            }
+            if i % 53 == 0 {
+                // Every type deleted and made again, so a slot goes on the free
+                // list and comes back holding something else.
+                f.run(&[b"DEL", b"s2"]);
+            }
+            assert_eq!(
+                f.server.settled_memory(),
+                f.server.memory_bytes(),
+                "after round {i}"
+            );
+        }
+
+        // The run has to have built something, or the two numbers agreeing is
+        // two zeroes agreeing.
+        assert_eq!(f.run(&[b"DBSIZE"]), ":6\r\n");
+        assert!(
+            f.server.memory_bytes() > 512 * 1024,
+            "{}",
+            f.server.memory_bytes()
+        );
+
+        // And it survives the collections going away entirely.
+        f.run(&[b"FLUSHALL"]);
+        assert_eq!(f.server.settled_memory(), f.server.memory_bytes());
+    }
+
+    #[test]
+    fn taking_the_limit_away_stops_the_counting_and_putting_it_back_starts_again() {
+        // A server with no limit does not keep the running total, so setting a
+        // limit on a database that is already full has to start it from a walk.
+        // If it did not, the first reading would be zero and the server would
+        // think it had all the room in the world.
+        let mut f = Fixture::new();
+        for i in 0..200u32 {
+            let n = i.to_string();
+            f.run(&[b"SADD", b"s", n.as_bytes()]);
+            f.run(&[b"HSET", b"h", n.as_bytes(), b"value"]);
+        }
+        f.run(&[b"CONFIG", b"SET", b"maxmemory", b"1gb"]);
+        assert_eq!(f.server.settled_memory(), f.server.memory_bytes());
+
+        f.run(&[b"CONFIG", b"SET", b"maxmemory", b"0"]);
+        for i in 200..400u32 {
+            let n = i.to_string();
+            f.run(&[b"SADD", b"s", n.as_bytes()]);
+        }
+        f.run(&[b"CONFIG", b"SET", b"maxmemory", b"1gb"]);
+        assert_eq!(
+            f.server.settled_memory(),
+            f.server.memory_bytes(),
+            "the writes it was not watching are in the number it started from"
         );
     }
 

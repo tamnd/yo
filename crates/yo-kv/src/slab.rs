@@ -50,8 +50,36 @@
 //! What the slab does promise is that [`Slab::remove`] on a slot that is already
 //! free answers `None` and leaves the free list alone, so a double free is inert
 //! rather than a loop in the list.
+//!
+//! # Knowing what it costs without asking everything
+//!
+//! Adding up what the values hold means asking every one of them, and a server
+//! with a `maxmemory` has to know that number often enough that walking a
+//! million sets to find it is not an option. So the slab can be asked to keep a
+//! running total instead.
+//!
+//! The trick is that a value can only change through [`Slab::get_mut`], which is
+//! also the only way in, so the slab sees every collection that is about to
+//! move before it moves. When tracking is on it takes that value's bytes back
+//! out of the total and writes the slot down. Nothing is added back until
+//! somebody asks for the number, and then only the slots on that list are asked
+//! again. A batch touches a handful of collections, so reading the total costs a
+//! handful of questions rather than one per key.
+//!
+//! Tracking is off until something turns it on, and off it costs one predictable
+//! branch on the way into `get_mut`. A server with no memory limit never needs
+//! the number and never pays for it.
 
 use std::mem;
+
+/// What one value in a slab is holding, so the slab can keep a total of it.
+///
+/// This is the same `memory_bytes` every collection already had, named as a
+/// trait so the slab can ask without knowing which of them it is holding.
+pub trait Bytes {
+    /// Bytes this value holds, not counting the slot it sits in.
+    fn memory_bytes(&self) -> usize;
+}
 
 /// The number that means no slot, which is the end of the free list.
 const NONE: u32 = u32::MAX;
@@ -78,9 +106,25 @@ pub struct Slab<T> {
     free: u32,
     /// How many slots are filled, which is not `slots.len()`.
     len: usize,
+    /// Bytes held by the values in the slots that are not on `soiled`.
+    ///
+    /// Only a real number while `track` is on. Off, it is zero and nobody reads
+    /// it.
+    clean: usize,
+    /// Slots reached mutably since the last reading, whose bytes are therefore
+    /// not in `clean` and have to be asked for again.
+    soiled: Vec<u32>,
+    /// One bit a slot, set while that slot is on `soiled`.
+    ///
+    /// A bit and not a byte because this is one per collection key and the
+    /// memory bar counts. A list rather than a scan of the bits because a
+    /// reading has to cost what the batch touched and not what the slab holds.
+    mark: Vec<u64>,
+    /// Whether the three above are being kept up to date.
+    track: bool,
 }
 
-impl<T> Slab<T> {
+impl<T: Bytes> Slab<T> {
     /// An empty slab, which has not allocated anything.
     #[must_use]
     pub fn new() -> Slab<T> {
@@ -88,6 +132,10 @@ impl<T> Slab<T> {
             slots: Vec::new(),
             free: NONE,
             len: 0,
+            clean: 0,
+            soiled: Vec::new(),
+            mark: Vec::new(),
+            track: false,
         }
     }
 
@@ -96,8 +144,7 @@ impl<T> Slab<T> {
     pub fn with_capacity(n: usize) -> Slab<T> {
         Slab {
             slots: Vec::with_capacity(n),
-            free: NONE,
-            len: 0,
+            ..Slab::new()
         }
     }
 
@@ -131,12 +178,17 @@ impl<T> Slab<T> {
                 unreachable!("the free list only ever points at free slots");
             };
             self.free = next;
+            // Before the value goes in, so the slot the total is told about is
+            // still the empty one and nothing gets taken out for a value that
+            // was never counted.
+            self.soil(at as u32);
             self.slots[at] = Slot::Filled(value);
             self.len += 1;
             return at as u32;
         }
         assert!(self.slots.len() < MAX_SLOTS, "slab is full");
         let at = self.slots.len() as u32;
+        self.soil(at);
         self.slots.push(Slot::Filled(value));
         self.len += 1;
         at
@@ -152,8 +204,15 @@ impl<T> Slab<T> {
     }
 
     /// The value at `at`, to be changed in place.
+    ///
+    /// This is the only way to change a value, which is what lets the running
+    /// total be a total rather than a guess: whatever the caller does with the
+    /// reference, the slab already knows it has to ask this slot again.
     #[inline]
     pub fn get_mut(&mut self, at: u32) -> Option<&mut T> {
+        if self.track && (at as usize) < self.slots.len() {
+            self.soil(at);
+        }
         match self.slots.get_mut(at as usize) {
             Some(Slot::Filled(v)) => Some(v),
             _ => None,
@@ -165,6 +224,9 @@ impl<T> Slab<T> {
     /// Answers `None` if the slot was already free, without touching the free
     /// list, so freeing twice is inert rather than a loop.
     pub fn remove(&mut self, at: u32) -> Option<T> {
+        if self.track && (at as usize) < self.slots.len() {
+            self.soil(at);
+        }
         match self.slots.get_mut(at as usize) {
             Some(slot @ Slot::Filled(_)) => {
                 let taken = mem::replace(slot, Slot::Free(self.free));
@@ -198,18 +260,90 @@ impl<T> Slab<T> {
         self.slots = Vec::new();
         self.free = NONE;
         self.len = 0;
+        self.clean = 0;
+        self.soiled = Vec::new();
+        self.mark = Vec::new();
     }
 
     /// What the slots themselves cost, not counting what the values point at.
-    ///
-    /// The caller adds the values, because only the caller knows how to ask
-    /// them. A slab of sets sums `Set::memory_bytes` over [`Slab::iter`].
-    pub fn memory_bytes(&self) -> usize {
+    pub fn slot_bytes(&self) -> usize {
         self.slots.capacity() * mem::size_of::<Slot<T>>()
+    }
+
+    /// What the values are holding, asked of every one of them.
+    ///
+    /// The honest walk, for the places that want the number exactly and do not
+    /// care what it costs to get: `INFO memory`, `MEMORY USAGE` and the tests.
+    /// It does not touch the running total and does not need it to be on.
+    pub fn value_bytes(&self) -> usize {
+        self.iter().map(T::memory_bytes).sum()
+    }
+
+    /// The same number, asked only of the values that could have changed.
+    ///
+    /// With tracking on this asks the slots touched since the last call and no
+    /// others, which is what makes a `maxmemory` server able to afford the
+    /// question once a batch. With tracking off it is [`Slab::value_bytes`].
+    pub fn settled_bytes(&mut self) -> usize {
+        if !self.track {
+            return self.value_bytes();
+        }
+        while let Some(at) = self.soiled.pop() {
+            self.mark[at as usize / 64] &= !(1u64 << (at % 64));
+            if let Some(Slot::Filled(v)) = self.slots.get(at as usize) {
+                self.clean += v.memory_bytes();
+            }
+        }
+        self.clean
+    }
+
+    /// Start or stop keeping the running total.
+    ///
+    /// Starting costs one walk, because a total has to start from somewhere and
+    /// the slab may already be holding a million sets when the client sets the
+    /// limit. Stopping costs nothing and gives the two lists back.
+    ///
+    /// Setting it to what it already is does nothing at all, which matters
+    /// because `CONFIG SET maxmemory` on a server that already had one would
+    /// otherwise pay for that walk every time.
+    pub fn track_bytes(&mut self, on: bool) {
+        if on == self.track {
+            return;
+        }
+        self.track = on;
+        self.soiled = Vec::new();
+        self.mark = Vec::new();
+        self.clean = if on { self.value_bytes() } else { 0 };
+    }
+
+    /// Take a slot's bytes back out of the total and write the slot down.
+    ///
+    /// Called before the slot changes and not after, so the value it asks is the
+    /// one the total was told about. A slot already written down is left alone,
+    /// which is why the same key written sixty four times in a batch costs one
+    /// question and not sixty four.
+    #[inline]
+    fn soil(&mut self, at: u32) {
+        if !self.track {
+            return;
+        }
+        let word = at as usize / 64;
+        let bit = 1u64 << (at % 64);
+        if word >= self.mark.len() {
+            self.mark.resize(word + 1, 0);
+        }
+        if self.mark[word] & bit != 0 {
+            return;
+        }
+        self.mark[word] |= bit;
+        self.soiled.push(at);
+        if let Some(Slot::Filled(v)) = self.slots.get(at as usize) {
+            self.clean -= v.memory_bytes();
+        }
     }
 }
 
-impl<T> Default for Slab<T> {
+impl<T: Bytes> Default for Slab<T> {
     fn default() -> Slab<T> {
         Slab::new()
     }
@@ -219,13 +353,40 @@ impl<T> Default for Slab<T> {
 mod tests {
     use super::*;
 
+    // Length and not capacity, so a test can say what it expects without
+    // knowing how a `Vec` doubles.
+    impl Bytes for String {
+        fn memory_bytes(&self) -> usize {
+            self.len()
+        }
+    }
+
+    impl Bytes for Vec<u8> {
+        fn memory_bytes(&self) -> usize {
+            self.len()
+        }
+    }
+
+    // For the tests that are about the free list rather than about bytes.
+    impl Bytes for i32 {
+        fn memory_bytes(&self) -> usize {
+            0
+        }
+    }
+
+    impl Bytes for u8 {
+        fn memory_bytes(&self) -> usize {
+            0
+        }
+    }
+
     #[test]
     fn a_new_slab_holds_nothing_and_has_allocated_nothing() {
         let s: Slab<String> = Slab::new();
         assert_eq!(s.len(), 0);
         assert!(s.is_empty());
         assert_eq!(s.get(0), None);
-        assert_eq!(s.memory_bytes(), 0);
+        assert_eq!(s.slot_bytes(), 0);
     }
 
     #[test]
@@ -364,14 +525,133 @@ mod tests {
         for i in 0..64 {
             s.insert(i);
         }
-        assert!(s.memory_bytes() >= 64 * mem::size_of::<Slot<i32>>());
+        assert!(s.slot_bytes() >= 64 * mem::size_of::<Slot<i32>>());
 
         s.clear();
         assert_eq!(s.len(), 0);
         assert!(s.is_empty());
-        assert_eq!(s.memory_bytes(), 0, "the vector went, not just the values");
+        assert_eq!(s.slot_bytes(), 0, "the vector went, not just the values");
         assert_eq!(s.get(0), None);
         assert_eq!(s.insert(1), 0, "numbering starts over");
+    }
+
+    #[test]
+    fn the_running_total_says_what_the_walk_says_whatever_was_done_to_it() {
+        // The only property that matters. Everything else in the tracking is an
+        // implementation of it, so the test is a long run of every operation
+        // there is with the two numbers checked against each other after each
+        // one. A missed bookkeeping step in insert, get_mut or remove shows up
+        // here as a difference and nowhere else.
+        let mut s: Slab<String> = Slab::new();
+        s.track_bytes(true);
+        let mut live: Vec<u32> = Vec::new();
+        let mut n = 0usize;
+        for step in 0..500 {
+            match step % 5 {
+                0 | 1 => {
+                    n += 1;
+                    live.push(s.insert("x".repeat(n % 17)));
+                }
+                2 | 3 => {
+                    if let Some(&at) = live.get(step % live.len().max(1)) {
+                        s.get_mut(at).expect("filled").push('y');
+                    }
+                }
+                _ => {
+                    if !live.is_empty() {
+                        let at = live.swap_remove(step % live.len());
+                        s.remove(at);
+                    }
+                }
+            }
+            assert_eq!(
+                s.settled_bytes(),
+                s.value_bytes(),
+                "after step {step}, which was a {}",
+                step % 5
+            );
+        }
+        assert!(n > 0 && !live.is_empty(), "the run did something");
+    }
+
+    #[test]
+    fn a_slot_written_over_and_over_is_only_asked_once_before_a_reading() {
+        // What makes the total affordable. Sixty four writes to the same key in
+        // a batch put it on the list once, so the reading at the end of the
+        // batch asks it once, and the reading is still right.
+        let mut s: Slab<String> = Slab::new();
+        s.track_bytes(true);
+        let a = s.insert(String::new());
+        let b = s.insert("bb".to_string());
+        assert_eq!(s.settled_bytes(), 2);
+
+        for _ in 0..64 {
+            s.get_mut(a).expect("filled").push('a');
+        }
+        assert_eq!(s.soiled.len(), 1, "one slot written down, not sixty four");
+        assert_eq!(s.settled_bytes(), 66);
+        assert_eq!(s.soiled.len(), 0, "and the list is empty again");
+        assert_eq!(s.get(b).map(String::as_str), Some("bb"));
+    }
+
+    #[test]
+    fn nothing_is_counted_until_the_total_is_switched_on() {
+        // Off, the slab still answers the question, it just walks for it. The
+        // first switch on is the walk the total starts from, and switching it on
+        // again when it is already on does not walk a second time.
+        let mut s: Slab<String> = Slab::new();
+        s.insert("abc".to_string());
+        s.insert("de".to_string());
+        assert_eq!(s.settled_bytes(), 5, "the walk, because nothing is tracked");
+        assert_eq!(s.clean, 0, "and it did not start a total behind our back");
+
+        s.track_bytes(true);
+        assert_eq!(s.clean, 5, "the walk it starts from");
+        s.track_bytes(true);
+        assert_eq!(s.clean, 5);
+
+        s.insert("fghi".to_string());
+        assert_eq!(s.settled_bytes(), 9);
+
+        s.track_bytes(false);
+        assert_eq!(s.clean, 0, "and it gave the bookkeeping back");
+        assert_eq!(s.settled_bytes(), 9, "walking again for the same answer");
+    }
+
+    #[test]
+    fn clearing_takes_the_total_with_it() {
+        // FLUSHALL. A total left behind after the values went would be a server
+        // that thinks it is holding an empty database's worth of sets.
+        let mut s: Slab<String> = Slab::new();
+        s.track_bytes(true);
+        for i in 0..10 {
+            s.insert("z".repeat(i));
+        }
+        assert_eq!(s.settled_bytes(), 45);
+
+        s.clear();
+        assert_eq!(s.settled_bytes(), 0);
+        assert_eq!(s.slot_bytes(), 0);
+
+        s.insert("new".to_string());
+        assert_eq!(s.settled_bytes(), 3, "and it counts again from there");
+    }
+
+    #[test]
+    fn a_reused_slot_is_counted_as_what_is_in_it_now() {
+        // The awkward one. A slot goes on the list when its value is removed and
+        // comes back filled with something else before anybody reads the total,
+        // so the reading has to ask the new value and not remember the old.
+        let mut s: Slab<String> = Slab::new();
+        s.track_bytes(true);
+        let a = s.insert("aaaaa".to_string());
+        assert_eq!(s.settled_bytes(), 5);
+
+        s.remove(a);
+        let b = s.insert("bb".to_string());
+        assert_eq!(b, a, "the same slot came back");
+        assert_eq!(s.settled_bytes(), 2);
+        assert_eq!(s.value_bytes(), 2);
     }
 
     #[test]
@@ -380,13 +660,13 @@ mod tests {
         // one after another is a shape a real server sees, and without reuse it
         // would leave ten thousand dead slots behind.
         let mut s = Slab::with_capacity(4);
-        let before = s.memory_bytes();
+        let before = s.slot_bytes();
         for i in 0..10_000 {
             let at = s.insert(i);
             assert_eq!(at, 0, "the same slot every time");
             assert_eq!(s.remove(at), Some(i));
         }
         assert_eq!(s.len(), 0);
-        assert_eq!(s.memory_bytes(), before);
+        assert_eq!(s.slot_bytes(), before);
     }
 }
