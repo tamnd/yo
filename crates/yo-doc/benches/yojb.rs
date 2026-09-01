@@ -4,9 +4,7 @@
 //! The claim the encoding is built on is that a path read is a few header reads
 //! and a seek, and that the size of the document does not come into it. That is
 //! the claim G15 turns into a gate: an indexed path equality lookup in the same
-//! cost class as `HGET`. The index half of that comes later, but the half that
-//! is here, reaching the field once the document is in hand, is measured now so
-//! that the gate has a floor to stand on.
+//! cost class as `HGET`.
 //!
 //! The rows to watch:
 //!
@@ -17,6 +15,13 @@
 //!     value region.
 //!   - `path` at four levels against a one level `get`. Four times a bit more
 //!     than one, and no allocation either way.
+//!   - `index/find` against `index/scan` at both collection sizes. `find` costs
+//!     the same per matching document whatever the collection holds and `scan`
+//!     has to read all of it, so the gap between the two rows should widen by
+//!     the same factor the collection grows by.
+//!   - `index/put` at zero, one and four indexes. The gap is a path lookup and a
+//!     set write per index, and it should be a fixed cost per index rather than
+//!     something that grows with the collection.
 //!
 //! # Reading these on a machine someone else is using
 //!
@@ -26,7 +31,7 @@
 
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use std::hint::black_box;
-use yo_doc::{Builder, Docs, Value};
+use yo_doc::{Builder, Docs, Key, Value};
 
 /// An object of `n` members, each holding a string of `pad` bytes.
 fn object(n: usize, pad: usize) -> (Vec<u8>, Vec<String>) {
@@ -205,6 +210,100 @@ fn bench_docs(c: &mut Criterion) {
     g.finish();
 }
 
+/// A record with four fields worth indexing and a bit of payload.
+fn record(i: usize) -> Vec<u8> {
+    let mut b = Builder::new();
+    b.begin_object().expect("open");
+    b.key(b"status").expect("key");
+    b.text(&format!("s{:03}", i % 64)).expect("value");
+    b.key(b"region").expect("key");
+    b.text(&format!("r{:03}", i % 16)).expect("value");
+    b.key(b"tier").expect("key");
+    b.int((i % 4) as i64).expect("value");
+    b.key(b"seq").expect("key");
+    b.int(i as i64).expect("value");
+    b.key(b"payload").expect("key");
+    b.text(&"x".repeat(64)).expect("value");
+    b.end_object().expect("close");
+    b.finish().expect("finished").to_vec()
+}
+
+/// A collection of `n` records, with the first `indexes` of the four paths
+/// declared before anything is written.
+fn filled(n: usize, indexes: usize) -> Docs {
+    let mut docs = Docs::with_capacity(n, 160);
+    for path in ["$.status", "$.region", "$.tier", "$.seq"]
+        .iter()
+        .take(indexes)
+    {
+        docs.create_index(path).expect("indexed");
+    }
+    for i in 0..n {
+        docs.put_bytes(format!("d:{i:08}").as_bytes(), &record(i))
+            .expect("put");
+    }
+    docs
+}
+
+fn bench_index(c: &mut Criterion) {
+    let mut g = c.benchmark_group("yojb/index");
+
+    // The point of an index, stated as a ratio rather than as a claim: the same
+    // answer, found through the index and found by walking the collection. The
+    // scan reads every document and the probe reads the ones that match, so the
+    // gap is whatever the selectivity is, and status is one in sixty four.
+    for n in [1024usize, 16_384] {
+        let docs = filled(n, 1);
+        let key = Key::text("s007");
+        assert_eq!(docs.count("$.status", &key).expect("indexed"), n / 64);
+
+        g.bench_with_input(BenchmarkId::new("find", n), &n, |b, _| {
+            b.iter(|| {
+                let mut sum = 0i64;
+                docs.find("$.status", black_box(&key), |_, d| {
+                    sum += d.get(b"seq").and_then(|v| v.as_int()).expect("a seq");
+                })
+                .expect("indexed");
+                black_box(sum)
+            });
+        });
+
+        g.bench_with_input(BenchmarkId::new("scan", n), &n, |b, _| {
+            b.iter(|| {
+                let mut sum = 0i64;
+                for (_, d) in docs.iter() {
+                    if d.get(b"status").and_then(|v| v.as_text()) == Some("s007") {
+                        sum += d.get(b"seq").and_then(|v| v.as_int()).expect("a seq");
+                    }
+                }
+                black_box(sum)
+            });
+        });
+
+        g.bench_with_input(BenchmarkId::new("count", n), &n, |b, _| {
+            b.iter(|| black_box(docs.count("$.status", black_box(&key)).expect("indexed")));
+        });
+    }
+
+    // What an index costs the write path, which is one path lookup each.
+    for indexes in [0usize, 1, 4] {
+        g.bench_with_input(BenchmarkId::new("put", indexes), &indexes, |b, &indexes| {
+            let mut docs = filled(1024, indexes);
+            let ids: Vec<String> = (0..1024).map(|i| format!("d:{i:08}")).collect();
+            let bytes = record(7);
+            let mut i = 0usize;
+            b.iter(|| {
+                i = (i + 1) % ids.len();
+                black_box(
+                    docs.put_bytes(black_box(ids[i].as_bytes()), black_box(&bytes))
+                        .expect("put"),
+                )
+            });
+        });
+    }
+    g.finish();
+}
+
 criterion_group!(
     benches,
     bench_get,
@@ -212,6 +311,7 @@ criterion_group!(
     bench_path,
     bench_build,
     bench_validate,
-    bench_docs
+    bench_docs,
+    bench_index
 );
 criterion_main!(benches);
