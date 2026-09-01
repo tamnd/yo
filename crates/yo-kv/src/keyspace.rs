@@ -80,23 +80,6 @@ pub struct Keyspace {
     pub(crate) zsets: Slab<Zset>,
     /// Every sparse array in this database, addressed the same way.
     pub(crate) arrays: Slab<Array>,
-    /// How many live keys carry a deadline.
-    ///
-    /// Redis keeps a whole second dictionary of these, `db->expires`, and this
-    /// is one number off the front of it. It answers the two questions the
-    /// number alone can answer, and both of them matter. `INFO keyspace` reports
-    /// it as `expires=`, where this used to print a hardcoded zero. And a
-    /// `volatile` policy that is about to sample for a victim can find out in
-    /// one comparison that there is no eligible key anywhere, rather than
-    /// drawing four rounds of buckets to be told the same thing by every key in
-    /// them, on a path where a client is waiting for the write it is making room
-    /// for.
-    ///
-    /// It is kept exact and not as an estimate, because `INFO` reporting a
-    /// number that is nearly right is worse than reporting nothing. Every record
-    /// written goes through [`Keyspace::write_rec`] and every record deleted
-    /// goes through [`Keyspace::del_rec`], and those two are the whole of it.
-    pub(crate) expires: usize,
     /// How many keys hold something that is not a string.
     ///
     /// This exists so that a database of nothing but strings, which is every
@@ -211,12 +194,13 @@ const SCRATCH: usize = 1024;
 /// nothing usable, which happens when the segment it drew was empty or when a
 /// `volatile` policy filtered out everything in it.
 ///
-/// Four rather than more, because the case that would want more is the case no
-/// number of rounds can fix. A `volatile` policy on a database where nothing has
-/// a deadline has no eligible key anywhere, and every round of it is wasted work
-/// on a path where a client is waiting. Redis does not have this problem because
-/// it keeps a second dictionary of just the keys with deadlines and samples that
-/// one directly, which is the real answer here too and is not this change.
+/// Four rather than more, because a round that comes back with nothing is
+/// telling you something a fifth round will not change. That used to be the
+/// wrong shape for the `volatile` policies, which could draw four rounds of
+/// keys with no deadline on a database that had almost none, on a path where a
+/// client is waiting. Those policies now draw from the second index of just the
+/// keys that carry a deadline, the way Redis draws from `db->expires`, so every
+/// key a round looks at is a key it is allowed to take.
 const ROUNDS: usize = 4;
 
 /// Where the last collection key resolved to, if it still resolves there.
@@ -346,7 +330,6 @@ impl Keyspace {
             clock,
             expired: 0,
             evicted: 0,
-            expires: 0,
             sets: Slab::new(),
             hashes: Slab::new(),
             lists: Slab::new(),
@@ -474,30 +457,23 @@ impl Keyspace {
         fill: impl FnOnce(&mut [u8]),
     ) -> Option<usize> {
         let a = self.access_for_write(key);
-        // What the count of keys with deadlines has to move by, worked out from
-        // the one bit in the record that says so, on both sides of the write.
-        // Two byte reads on a path that has just written the record and had the
-        // old one in cache to overwrite it, which is what a count that has to be
-        // exact costs. The alternative is a second lookup per write to ask the
-        // same question, and that is not a trade worth making for a number.
-        let mut had = false;
-        let mut has = false;
-        let out = self.map.set_with(
+        // The one bit in the record that says the key has a deadline, handed
+        // straight back to the map. What the map does with it is keep a second
+        // index of just those records, so the expire cycle and the volatile
+        // eviction policies have somewhere to sample from that is not the whole
+        // keyspace. Nothing here counts anything: the map's own count of marked
+        // records is the number, and a number kept in two places is a number
+        // that eventually disagrees with itself.
+        self.map.set_with(
             key,
             len,
-            |old| had = value::has_expiry(old),
+            |_| {},
             |out| {
                 fill(out);
                 value::set_access(out, a);
-                has = value::has_expiry(out);
+                value::has_expiry(out)
             },
-        );
-        match (had, has) {
-            (false, true) => self.expires += 1,
-            (true, false) => self.expires -= 1,
-            _ => {}
-        }
-        out
+        )
     }
 
     /// Take `key` out of the map, keeping the deadline count right.
@@ -510,12 +486,7 @@ impl Keyspace {
     /// dropping the key, and it still has to be counted.
     #[inline]
     pub(crate) fn del_rec(&mut self, key: &[u8]) -> bool {
-        let mut had = false;
-        let gone = self.map.del_with(key, |old| had = value::has_expiry(old));
-        if had {
-            self.expires -= 1;
-        }
-        gone
+        self.map.del(key)
     }
 
     /// What the access field of a record about to be written should say.
@@ -1155,7 +1126,6 @@ impl Keyspace {
         self.arrays.clear();
         self.pool.clear();
         self.bodies = 0;
-        self.expires = 0;
     }
 
     /// Keys reclaimed by running into them after their deadline.
@@ -1186,9 +1156,15 @@ impl Keyspace {
     /// This is what `INFO keyspace` reports as `expires=`, and it is the live
     /// count rather than a running total: a key that gets a `TTL` and then has it
     /// taken away with `PERSIST` is in it and then is not.
+    ///
+    /// The map keeps it, because the map keeps the second index these keys are
+    /// in. Nothing in this file counts it, which is deliberate: a count kept
+    /// alongside the thing it counts is a count that eventually disagrees with
+    /// it, and the one place that can be wrong should be the one place that owns
+    /// the entries.
     #[inline]
-    pub const fn expires(&self) -> usize {
-        self.expires
+    pub fn expires(&self) -> usize {
+        self.map.tagged_len()
     }
 
     /// How many keys a round of eviction sampling looks at.
@@ -1279,7 +1255,7 @@ impl Keyspace {
         // drawing four rounds of buckets and being told so by every key in them,
         // on a path where a client is waiting for the write this is making room
         // for. The count knows.
-        if self.policy.volatile_only() && self.expires == 0 {
+        if self.policy.volatile_only() && self.expires() == 0 {
             self.pool.clear();
             return None;
         }
@@ -1288,17 +1264,32 @@ impl Keyspace {
         if policy.is_random() {
             return self.draw(now, want);
         }
+        // Which index to draw from. The `volatile` policies can only take a key
+        // that has a deadline, and the map keeps a second index of exactly
+        // those, so drawing from the whole keyspace and then throwing most of it
+        // away is work with a cheaper alternative sitting right there. The
+        // `allkeys` policies draw from everything, because everything is
+        // eligible.
+        let volatile = policy.volatile_only();
         let mut seen = 0usize;
         for _ in 0..ROUNDS {
             let r = self.rng.next_u64();
             let pool = &mut self.pool;
-            self.map.sample(r, |key, rec, _addr| {
+            // By reference, so the same closure can go to either sampler. A
+            // `&mut F` is an `FnMut` when `F` is, which is what makes the two
+            // calls below one closure rather than two copies of it.
+            let mut offer = |key: &[u8], rec: &[u8], _addr: Addr| {
                 if !value::is_expired(rec, now) && evict::eligible(rec, policy) {
                     seen += 1;
                     pool.offer(key, evict::score(rec, policy, now, lfu));
                 }
                 seen < want
-            });
+            };
+            if volatile {
+                self.map.sample_tagged(r, &mut offer);
+            } else {
+                self.map.sample(r, &mut offer);
+            }
             if seen >= want {
                 break;
             }
@@ -1326,17 +1317,23 @@ impl Keyspace {
     /// key never has to be copied at all.
     fn draw(&mut self, now: u64, want: usize) -> Option<Addr> {
         let policy = self.policy;
+        let volatile = policy.volatile_only();
         let mut best = evict::Best::EMPTY;
         let mut seen = 0usize;
         for _ in 0..ROUNDS {
             let r = self.rng.next_u64();
-            self.map.sample(r, |_key, rec, addr| {
+            let mut offer = |_key: &[u8], rec: &[u8], addr: Addr| {
                 if !value::is_expired(rec, now) && evict::eligible(rec, policy) {
                     seen += 1;
                     best.offer(addr, evict::ANY);
                 }
                 seen < want
-            });
+            };
+            if volatile {
+                self.map.sample_tagged(r, &mut offer);
+            } else {
+                self.map.sample(r, &mut offer);
+            }
             if seen >= want {
                 break;
             }
@@ -1721,6 +1718,39 @@ mod tests {
         assert!(d.evict_one());
         assert!(!d.exists(b"k123"));
         assert_eq!(d.expires(), 0, "and the count went with it");
+    }
+
+    /// A needle in a haystack, which is the case sampling the whole keyspace
+    /// could not do.
+    ///
+    /// Fifty thousand keys and three of them with a deadline. Under a volatile
+    /// policy those three are the only ones that may go, and four rounds of
+    /// sixty four buckets drawn from the whole index would land on one of them
+    /// about once in a hundred tries. Drawn from the index of just the keys that
+    /// carry a deadline it is the only thing there is to land on.
+    ///
+    /// Three of them and not one, so that the test is about finding an eligible
+    /// key rather than about a table with a single entry in it.
+    #[test]
+    fn a_volatile_policy_finds_the_one_key_in_a_database_that_is_not_volatile() {
+        let mut d = db();
+        d.set_policy(Policy::VolatileLru);
+        for i in 0..50_000u32 {
+            d.set_plain(format!("k{i}").as_bytes(), b"v").expect("room");
+        }
+        let deadline = d.clock().now_ms() + 100_000;
+        for k in [b"k7".as_slice(), b"k30000", b"k49999"] {
+            assert!(d.set_expiry(k, Some(deadline)));
+        }
+        assert_eq!(d.expires(), 3);
+
+        for round in 0..3 {
+            assert!(d.evict_one(), "round {round} found nothing to take");
+        }
+        assert_eq!(d.expires(), 0, "all three went");
+        assert_eq!(d.len(), 50_000 - 3, "and nothing else did");
+        assert!(!d.evict_one(), "and now there is nothing eligible left");
+        assert_eq!(d.len(), 50_000 - 3);
     }
 
     /// The direction of the score, which is the thing worth pinning. A test that

@@ -15,19 +15,29 @@
 //! was dead. The rule adapts: a database full of dead keys gets swept hard and a
 //! database with a few gets one cheap look.
 //!
-//! There is no second dictionary here yet, so the sample comes off the main index
-//! and most of what it looks at may have no deadline at all. That changes the
-//! ratio the rule is computed over, not the rule. The quarter is a quarter of the
-//! keys sampled that could have expired, because a quarter of every key sampled
-//! is a bar that a database which is one percent volatile can never clear however
-//! much dead memory is sitting in it.
+//! The sample comes off a second index of just the keys that carry a deadline,
+//! the way Redis's comes off `db->expires`. That index lives in the map, because
+//! the map is the only thing that knows where a record is and the only thing
+//! that moves one, and it is described where it is kept. What it buys here is
+//! that every key this looks at is a key that could have expired, so the quarter
+//! rule is Redis's quarter over Redis's denominator and a database where one key
+//! in a million is volatile costs the same per round as one where all of them
+//! are.
 //!
-//! It changes the cost, though, and that is what the budget is for. The budget is
-//! in keys looked at rather than keys expired, so a sweep of a database where
-//! nothing is volatile costs exactly the budget and not a byte more, whatever the
-//! density is. And the density can be nothing at all, which is the common case:
-//! a count of the keys carrying a deadline sits in the keyspace, and a zero there
-//! ends this before it draws anything.
+//! This used to sample the main index and skip most of what it found, and the
+//! shape of that is worth remembering, because it is what the budget still
+//! protects against. A sweep over a mostly non volatile database spent its whole
+//! budget walking past keys with nothing wrong with them, and the ratio it then
+//! judged had to be taken over the volatile keys alone rather than over
+//! everything looked at, because a quarter of every key sampled is a bar that a
+//! database which is one percent volatile can never clear however much dead
+//! memory is sitting in it. Both denominators are the same now, and the code
+//! still counts them separately because the difference between them is exactly
+//! the thing a test should be able to see going wrong.
+//!
+//! The common case is still the one that costs nothing: a count of the keys
+//! carrying a deadline sits in the keyspace, and a zero there ends this before it
+//! draws anything.
 
 use crate::keyspace::Keyspace;
 use crate::value;
@@ -77,7 +87,7 @@ impl Keyspace {
         // common one, and this is where it finds that out, for one comparison
         // rather than for a walk of a segment that was never going to hold
         // anything worth taking.
-        if budget == 0 || self.expires == 0 {
+        if budget == 0 || self.expires() == 0 {
             return c;
         }
         let now = self.clock.now_ms();
@@ -107,8 +117,14 @@ impl Keyspace {
         let mut n = 0usize;
         let mut round = Cycle::default();
         let r = self.rng.next_u64();
-        self.map.sample(r, |_key, rec, addr| {
+        self.map.sample_tagged(r, |_key, rec, addr| {
             round.examined += 1;
+            // Every key the marked index holds carries a deadline, so this is
+            // not a filter any more and the two counts move together. It stays
+            // because it is cheap, it is read off a record that is already in
+            // cache, and a divergence between them is the marked index having
+            // gone wrong, which is the one bug this whole arrangement can have.
+            debug_assert!(value::has_expiry(rec), "a marked key with no deadline");
             if value::has_expiry(rec) {
                 round.volatile += 1;
                 if value::is_expired(rec, now) {
@@ -192,6 +208,51 @@ mod tests {
         for i in 0..2_000u32 {
             assert!(d.exists(format!("k{i}").as_bytes()));
         }
+    }
+
+    /// The reason the second index exists, as a number a test can hold.
+    ///
+    /// Ten thousand keys, a hundred of them with a deadline that has passed. The
+    /// sweep has to reclaim all hundred, and the thing to watch is what it spent
+    /// getting there: every key it looks at comes off the marked index, so it
+    /// looks at about a hundred keys and not about ten thousand. Off the main
+    /// index it would have had to walk a hundred keys for every one it wanted.
+    ///
+    /// It comes out at exactly a hundred, because a round starts at a random
+    /// slot of the marked index and then walks forward, so one round covers all
+    /// of them. The bound is twice that rather than exactly that, because the
+    /// number a test should hold is the shape and not the arithmetic.
+    #[test]
+    fn a_sweep_only_looks_at_keys_that_could_have_expired() {
+        let mut d = db();
+        for i in 0..10_000u32 {
+            d.set_plain(format!("k{i}").as_bytes(), b"v").expect("room");
+        }
+        for i in 0..100u32 {
+            d.psetex(format!("d{i}").as_bytes(), 100, b"v")
+                .expect("room");
+        }
+        assert_eq!(d.expires(), 100);
+        d.clock_mut().advance(200);
+
+        let mut spent = 0;
+        for _ in 0..100 {
+            let c = d.expire_cycle(4096);
+            spent += c.examined;
+            assert_eq!(
+                c.examined, c.volatile,
+                "it looked at a key with no deadline"
+            );
+            if d.expires() == 0 {
+                break;
+            }
+        }
+        assert_eq!(d.expires(), 0);
+        assert_eq!(d.len(), 10_000, "and it took none of the others");
+        assert!(
+            spent <= 200,
+            "spent {spent} looks to reclaim a hundred keys"
+        );
     }
 
     #[test]
