@@ -20,6 +20,12 @@
 //! calls into the system allocator. It is not measurable next to `malloc`.
 //! Non shard threads never set the flag and pay the same single branch.
 //!
+//! The claims are cheaper still. [`allow`] and the three named forms of it come
+//! down to a relaxed load of a static, false in any process that has never armed
+//! a thread, which is every shipped binary. That is what lets a claim sit inside
+//! a loop where the growth actually happens rather than being hoisted to the top
+//! of a function it does not describe.
+//!
 //! # Three modes, and why an abort is not the only one
 //!
 //! An abort tells you about one violation per run, which is the wrong tool for
@@ -52,16 +58,20 @@
 //! interesting frames into each other and the report comes back naming
 //! `serve_command` for everything.
 //!
-//! Run it before touching anything here. The first list it produced contained
-//! sites that a narrower workload had not reached, and it contradicted what had
-//! already been written down about what was left. A report mode exists so that
-//! the list is measured rather than argued about, and that only works if it is
-//! the list you actually look at.
+//! Run it before touching anything here, and believe it over anything written
+//! down. Twice during this work the list contradicted what was already recorded
+//! about what was left, and both times the list was right. A report mode exists
+//! so that this is measured rather than argued about, and that only works if it
+//! is the list somebody actually looks at.
 //!
-//! # What it found, and the two piles it sorts into
+//! It is also the gate. An empty list exits 0 and anything else exits 1, and
+//! `ci.yml` runs it on every push, so a new allocation on a command path fails
+//! the pull request that added it rather than being found a release later.
 //!
-//! The first arming reported 31 distinct sites, and they were never one
-//! problem.
+//! # What it found, and the four piles it sorted into
+//!
+//! The first arming reported 31 distinct sites, and they were never one problem.
+//! The list is empty now, and it got there four different ways.
 //!
 //! Most of them were the first touch of a key. Creating a set, hash, list or
 //! zset allocates the body, and the slab that holds bodies of that type doubles
@@ -69,25 +79,36 @@
 //! only sensible place for it, so those sites wanted a claim written down and a
 //! [`first_touch`] around them rather than a fix. They have one now.
 //!
-//! The rest were the ones worth having: a `to_vec` of the value in `APPEND`,
-//! `SETRANGE` and `EXPIRE`, a `Vec` built per call to hold the operands of a
-//! set operation, a `Vec` of indices in `LREM`, a permutation buffer in
-//! `ZRANDMEMBER`, an owned key out of `RANDOMKEY`, the record copy in `RENAME`
-//! and the engine's own list of free decoder slots. Every one of those was per
-//! command and in steady state, which is exactly what Y7 is about, and every one
-//! of them is gone.
+//! Then the ones worth having, which were per command and in steady state, which
+//! is exactly what Y7 is about. A `to_vec` of the value in `APPEND`, `SETRANGE`,
+//! `EXPIRE`, `GETEX`, `INCRBYFLOAT` and the string arm of `COPY`. A `Vec` built
+//! per call to hold the operands of a set operation. A `Vec` of indices in
+//! `LREM`. An owned key out of `RANDOMKEY`. The record copy in `RENAME`. The
+//! engine's own list of free decoder slots. The hash table a `SUNION` walked
+//! everything into, which was the largest of them and is now a table the
+//! database keeps. And the old value out of `SET ... GET`, `GETSET` and
+//! `GETDEL`, which looked like a signature question and was not: the owning
+//! method stayed for the embedded caller and the wire took a `_with` form that
+//! hands the value over where it lies, because the wire writes it into the reply
+//! and never looks at it again. Every one of those is gone.
 //!
-//! What is left is nine sites in three groups. Four are a collection growing
-//! because somebody put more in it, which is proportional to the data rather
-//! than per command and is arguably the same claim [`first_touch`] makes. One is
-//! the `ZRANDMEMBER` buffer reaching the size of the largest set it has been
-//! asked about. Three are a `to_vec` of a previous value, which is a signature
-//! question rather than a code question, because the embedded API says
-//! `Option<Vec<u8>>` and an owning API has to own something.
+//! Third, memory that is proportional to what is stored rather than to what is
+//! served. An intset run gets longer as members go into it and there is no
+//! arrangement of that code which stores ten thousand integers in the room it
+//! had for eight. That is [`for_the_data`], and the test of the claim is that a
+//! workload which stops adding data stops allocating.
+//!
+//! Fourth, scratch buffers the database keeps and refills: the `ZRANDMEMBER`
+//! permutation and the set algebra tables. Those allocate when a call is bigger
+//! than every call before it and never otherwise. That is [`high_water`], and
+//! the test of the claim is a unit test making the same call twice and counting
+//! zero the second time. Every site wrapped in it has one.
 //!
 //! So the order is: report first, sort the list into the piles, fix the ones
-//! that are per command and annotate the ones that are not, and only then turn
-//! [`Mode::Abort`] on for a build that has to stay clean.
+//! that are per command and put the right claim on the ones that are not. The
+//! three claims are all [`allow`] underneath and differ only in what they say,
+//! which is the entire point of having three of them: `git grep first_touch` is
+//! a list of the places a key is created, and it stays one.
 //!
 //! # Using it
 //!
@@ -134,6 +155,14 @@ pub enum Mode {
 
 /// The mode, as a number, because a static has to be something an atomic holds.
 static MODE: AtomicU8 = AtomicU8::new(0);
+
+/// Whether any thread in this process has ever been marked.
+///
+/// Not the mode. [`enter_no_alloc`] is public and a test calls it without going
+/// near [`set_mode`], so the mode being off does not mean no thread is marked.
+/// This is the question [`allow`] actually needs answered, and it is one
+/// relaxed load of a static rather than a thread local.
+static ARMED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// How many violations have been seen in [`Mode::Report`].
 static SEEN_TOTAL: AtomicU64 = AtomicU64::new(0);
@@ -251,6 +280,12 @@ pub fn seen() -> (usize, u64) {
 /// is not a shard's, and so does want the mark to end, wants [`guard`].
 #[inline]
 pub fn enter_no_alloc() {
+    // Latched here so that [`allow`] can be free in a process where nothing is
+    // ever marked, which is every shipped binary and every benchmark. It is
+    // never cleared: a process that has armed one thread once pays the full
+    // path for the rest of its life, which is the right way round because that
+    // process is the one being measured for violations rather than for speed.
+    ARMED.store(true, Ordering::Relaxed);
     FORBID.with(|f| f.set(f.get().saturating_add(1)));
 }
 
@@ -275,8 +310,27 @@ pub fn is_forbidden() -> bool {
 /// Every call to this is a claim that the work inside is off the command path.
 /// Wrapping a command path in it to silence an abort is the one way to misuse
 /// this module, so the calls are meant to be few and easy to find.
+///
+/// # Cost
+///
+/// One relaxed load of a static when no thread in the process has ever been
+/// marked, and a thread local read and two writes when one has.
+///
+/// The load is in front of the rest because these calls are not all at the top
+/// of a function any more. The set algebra makes its claim around the insert
+/// that grows its table, which is once per member, because the alternative is
+/// one guard around the whole walk and that hides whatever the caller's closure
+/// does. A thread local read and two writes per member of a union is not
+/// obviously free, and a laptop with other work on it could not resolve the
+/// difference either way: two runs of `setops_small` with the same code in place
+/// disagreed by more than the effect being looked for. So this stopped being an
+/// argument about how cheap a thread local is and became a load of a static that
+/// is false in every shipped binary and in every benchmark.
 #[inline]
 pub fn allow<T>(f: impl FnOnce() -> T) -> T {
+    if !ARMED.load(Ordering::Relaxed) {
+        return f();
+    }
     let saved = FORBID.with(|c| c.replace(0));
     let guard = Restore(saved);
     let out = f();
@@ -303,6 +357,42 @@ pub fn allow<T>(f: impl FnOnce() -> T) -> T {
 /// worse than not having the check.
 #[inline]
 pub fn first_touch<T>(f: impl FnOnce() -> T) -> T {
+    allow(f)
+}
+
+/// Run `f`, which is a collection getting bigger because more was put in it.
+///
+/// [`allow`] with a name on it, and the name is the claim. The rule is that
+/// nothing is proportional to the number of commands served, not that nothing
+/// ever calls the allocator: an intset that has taken its ten thousandth member
+/// has to have grown nine times along the way, and there is no arrangement of
+/// that code which stores ten thousand integers in the room it had for eight.
+///
+/// The test is whether a workload that stops adding data stops allocating.
+/// [`first_touch`] is the same argument for a key that was not there at all,
+/// and this is the argument for the key that was.
+#[inline]
+pub fn for_the_data<T>(f: impl FnOnce() -> T) -> T {
+    allow(f)
+}
+
+/// Run `f`, which is a buffer the database keeps reaching a size it has never
+/// been asked for before.
+///
+/// [`allow`] with a name on it, and the name is the claim. A `ZRANDMEMBER` needs
+/// somewhere to shuffle and a `SUNION` needs somewhere to check for duplicates,
+/// and both of those are cleared and refilled rather than built and dropped. So
+/// the allocation is not per command, it is per high water mark: a database that
+/// has answered a union over a million members holds a million member table, and
+/// every union after it that is no larger pays the allocator nothing.
+///
+/// The test is whether the same call made twice allocates the second time. That
+/// is a unit test rather than an argument, and every site wrapped in this has
+/// one. [`for_the_data`] is the neighbouring claim, and the difference is that
+/// this memory is not holding anything between commands: it is scratch that has
+/// grown to fit the largest question asked so far.
+#[inline]
+pub fn high_water<T>(f: impl FnOnce() -> T) -> T {
     allow(f)
 }
 

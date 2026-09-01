@@ -447,11 +447,17 @@ where
 
     let mut digits = [0u8; DIGITS_MAX];
     seen.clear();
-    seen.reserve(sets[first].len());
-    for m in sets[first].iter() {
-        seen.insert(text(m, &mut digits), 1)
-            .expect("no larger than its source");
-    }
+    // One `yo_alloc::high_water` over the whole fill, which the union cannot
+    // have because it calls the caller back inside its walk and this does not.
+    // Same claim either way: the table is the database's and it grows when this
+    // intersection is bigger than every one before it.
+    yo_alloc::high_water(|| {
+        seen.reserve(sets[first].len());
+        for m in sets[first].iter() {
+            seen.insert(text(m, &mut digits), 1)
+                .expect("no larger than its source");
+        }
+    });
     for &i in rest {
         for m in sets[i].iter() {
             if let Some(count) = seen.get_mut(text(m, &mut digits)) {
@@ -567,7 +573,27 @@ where
     let biggest = sets.iter().map(|s| s.len()).max().unwrap_or(0);
     let mut digits = [0u8; DIGITS_MAX];
     seen.clear();
-    seen.reserve(biggest);
+    // `yo_alloc::high_water` on both of these, and on the insert below, because
+    // the table belongs to the database and is cleared rather than dropped. It
+    // grows when this union is bigger than every union before it and not
+    // otherwise, which is what
+    // `sets::tests::a_union_over_text_sets_does_not_allocate_once_its_table_is_warm`
+    // measures.
+    //
+    // The insert is the one that is per member rather than per call: the slot
+    // array and the rows are covered by the reserve, but the name blob is not,
+    // and it grows as the names go in. A guard around the whole walk instead
+    // would be one call rather than one per member, and it would hide whatever
+    // `f` does, which is the reply buffer for `SUNION` and the destination set
+    // for `SUNIONSTORE`. The report is worth more than that.
+    //
+    // A claim per member was worth being careful about, and `setops_small` on a
+    // laptop with other work on it could not tell the two versions apart: the
+    // spread between two runs of the same code was larger than the thing being
+    // looked for. So `yo_alloc::allow` grew a relaxed load of a static in front
+    // of its thread local work instead, and this is free in any process that has
+    // not armed a thread, which is every shipped binary.
+    yo_alloc::high_water(|| seen.reserve(biggest));
     let mut found = 0usize;
     for s in sets {
         for m in s.iter() {
@@ -576,7 +602,8 @@ where
             // and a table's `42` key the same, and `042` keys as itself,
             // because that is the same rule that decided how each was stored.
             let name = text(m, &mut digits);
-            if seen.insert(name, ()).is_ok_and(|was| was.is_none()) {
+            let fresh = yo_alloc::high_water(|| seen.insert(name, ()));
+            if fresh.is_ok_and(|was| was.is_none()) {
                 f(name);
                 found += 1;
             }

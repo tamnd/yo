@@ -259,13 +259,52 @@ impl Keyspace {
     /// [`Moved::Ok`] without `replace` on a key that has technically expired and
     /// not yet been collected. That is Redis's behaviour and it is the only one
     /// that is consistent with `EXISTS` saying zero for the same key.
+    /// A key copied onto itself answers [`Moved::Ok`] and does nothing, and
+    /// without `replace` it answers [`Moved::Taken`], which is the same pair of
+    /// answers [`Keyspace::rename`] gives. The wire never asks: Redis refuses
+    /// `COPY k k` with an error and so does the dispatch. This is for the
+    /// embedded caller, who can ask, and for whom freeing the body and then
+    /// writing a record that points at it would be the worst of the answers
+    /// available.
     pub fn copy(&mut self, src: &[u8], dst: &[u8], replace: bool) -> Moved {
-        let Some(rec) = self.export(src) else {
+        if self.live_rec(src).is_none() {
             return Moved::Missing;
-        };
-        if !replace && self.live_rec(dst).is_some() {
+        }
+        let same = src == dst;
+        if !replace && (same || self.live_rec(dst).is_some()) {
             return Moved::Taken;
         }
+        if same {
+            return Moved::Ok;
+        }
+        // The destination is settled before anything is copied, which is the
+        // difference between a refused copy of a million member set costing
+        // nothing and costing the set.
+        //
+        // Both keys have been reaped by now, so the address below stays good
+        // for as long as it is held. It is read after the reaping and not
+        // before, because a reap can move records around.
+        let addr = self.map.find(src).expect("it was live a line ago");
+        if value::kind(self.map.value_at(addr)) == Kind::String {
+            // A string record is the value, deadline and all, so copying the
+            // record is copying the key. That is [`Keyspace::rename`]'s trick,
+            // except the source stays where it is, and it goes through the
+            // database's scratch buffer for the same reason: the borrow of the
+            // map has to end before the write can begin, and a short string is
+            // not worth a malloc and a free.
+            let mut bytes = std::mem::take(&mut self.scratch);
+            bytes.clear();
+            bytes.extend_from_slice(self.map.value_at(addr));
+            self.free_body(dst);
+            self.map.set_with(dst, bytes.len(), |out| {
+                out.copy_from_slice(&bytes);
+            });
+            self.scratch = bytes;
+            return Moved::Ok;
+        }
+        // A collection is a clone and there is no way around that: the
+        // destination has to end up owning a set of its own.
+        let rec = self.export(src).expect("it was live a line ago");
         self.import(dst, rec);
         Moved::Ok
     }
@@ -489,6 +528,42 @@ mod tests {
         assert_eq!(read(&mut d, b"b"), b"v2");
         assert_eq!(d.copy(b"a", b"b", true), Moved::Ok);
         assert_eq!(read(&mut d, b"b"), b"v1");
+    }
+
+    /// `COPY` of a string used to go through `export`, which builds a `Vec` of
+    /// the value so that `import` can copy it into the map and drop it.
+    #[test]
+    fn a_copy_of_a_string_does_not_allocate() {
+        let mut d = db();
+        put(&mut d, b"a", b"a-value-of-some-length");
+        // Warmed up, so the map has already made room for both names and the
+        // loop below is copies and nothing else.
+        for _ in 0..4 {
+            assert_eq!(d.copy(b"a", b"b", true), Moved::Ok);
+        }
+        let (_, allocs) = crate::tally::counted(|| {
+            for _ in 0..50 {
+                assert_eq!(d.copy(b"a", b"b", true), Moved::Ok);
+            }
+        });
+        assert_eq!(allocs, 0, "copy allocated {allocs} times in fifty");
+        assert_eq!(read(&mut d, b"b"), b"a-value-of-some-length");
+    }
+
+    /// The embedded caller can ask for this and the wire cannot, because the
+    /// dispatch turns it into an error before it gets here. Freeing the body
+    /// and then writing a record that still points at it would be the way to
+    /// get this wrong.
+    #[test]
+    fn a_copy_onto_itself_leaves_the_key_alone() {
+        let mut d = db();
+        d.sadd(b"s", [b"m1".as_ref(), b"m2".as_ref()].into_iter())
+            .expect("a set");
+
+        assert_eq!(d.copy(b"s", b"s", false), Moved::Taken);
+        assert_eq!(d.copy(b"s", b"s", true), Moved::Ok);
+        assert_eq!(members(&mut d, b"s"), ["m1", "m2"]);
+        assert_eq!(d.sets.len(), 1, "no second body was made or lost");
     }
 
     #[test]
