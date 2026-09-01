@@ -103,6 +103,7 @@ pub mod counter;
 pub mod elem;
 pub mod evict;
 pub mod expiry;
+pub mod group;
 pub mod grow;
 pub mod hash;
 pub mod hashes;
