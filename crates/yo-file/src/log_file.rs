@@ -783,13 +783,41 @@ mod tests {
     /// to pick the fsync completion up. A test that polls once is a test that
     /// only passes off Linux, which is how this one first went out.
     fn poll_until_durable(sink: &mut LogFile, upto: u64) {
-        for _ in 0..100_000 {
+        spin_until(|| {
             sink.poll().unwrap();
-            if sink.durable_upto() >= upto {
+            sink.durable_upto() >= upto
+        });
+    }
+
+    /// How long a test waits for a completion before it calls it a failure.
+    ///
+    /// Thirty seconds, and the number is not about how long an fsync takes. It
+    /// is about the difference between a machine that is not going to answer and
+    /// one that is busy, and thirty seconds is far past anything the second kind
+    /// needs while still being a test that ends.
+    const SPIN_LIMIT: std::time::Duration = std::time::Duration::from_secs(30);
+
+    /// Turn `f` until it says yes, and fail rather than hang if it never does.
+    ///
+    /// Bounded by the clock and not by a count of turns, which is what these
+    /// tests used to do and is what made two of them flaky on a CI runner. A
+    /// hundred thousand non blocking polls is a few milliseconds of spinning on
+    /// a quiet machine, and an fsync against network attached storage on a
+    /// loaded shared runner does not come back inside that. The count was a
+    /// timeout in disguise, and a timeout measured in the wrong unit.
+    ///
+    /// The yield is what makes the wait cheap. Spinning at full speed on a
+    /// single core runner takes the core away from whatever has to make the
+    /// progress being waited for, which turns a slow answer into no answer.
+    fn spin_until(mut f: impl FnMut() -> bool) {
+        let start = std::time::Instant::now();
+        while start.elapsed() < SPIN_LIMIT {
+            if f() {
                 return;
             }
+            std::thread::yield_now();
         }
-        panic!("polled to the cap and {upto} is still not durable");
+        panic!("waited {SPIN_LIMIT:?} and it never happened");
     }
 
     /// A sync in ring mode is a request, not an answer. Nothing is durable
@@ -876,12 +904,10 @@ mod tests {
             log.advance_epoch();
             log.commit_pending().unwrap();
             let last = parked.iter().copied().max().unwrap();
-            for _ in 0..100_000 {
+            spin_until(|| {
                 log.poll().unwrap();
-                if log.durable_upto() >= last {
-                    break;
-                }
-            }
+                log.durable_upto() >= last
+            });
             assert!(
                 parked.iter().all(|&at| at <= log.durable_upto()),
                 "somebody is still parked after the commit landed"
