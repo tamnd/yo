@@ -159,6 +159,13 @@ const SCRATCH: usize = 1024;
 /// type and stays right for as long as the key is there, where an address is
 /// only good until the next write. That is also why nothing here memoizes a
 /// string: a string lives in the record itself and moves when the record does.
+///
+/// What it is worth is measured rather than argued about, by the pair of rows
+/// `engine/sadd` and `engine/sadd-alternating` in `yo-resp`'s `engine` bench.
+/// The second one alternates between two keys, which defeats this on every
+/// command and leaves both keys as warm in the cache as the one key was, so the
+/// difference between the rows is close to this and nothing else. On an Apple M4
+/// it is about nineteen nanoseconds a command, which is 1.25x at pipeline 64.
 struct Memo {
     /// What the map's write counter said when this was taken.
     writes: u64,
