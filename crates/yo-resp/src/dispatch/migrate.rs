@@ -430,7 +430,8 @@ fn finish(
 /// non blocking connect and only notices on the first write, so that is the
 /// message clients have always got for it, and the same goes for a connection
 /// that is refused outright. What is left for the connect message is the case
-/// where there is something at the address and it never completes the handshake.
+/// where the handshake never completes, which is what a host sees when nothing
+/// answers and no reset comes back either.
 fn connect(plan: &Plan<'_>) -> std::result::Result<TcpStream, Broke> {
     let host = std::str::from_utf8(plan.host).map_err(|_| Broke {
         failed: WRITE_FAILED,
@@ -1197,8 +1198,21 @@ mod tests {
         assert_eq!(sent[4][0], "SELECT", "and the fourth one had to");
     }
 
+    /// A peer that is not there is an `IOERR`, and the key stays put.
+    ///
+    /// Which of the two `IOERR` lines comes back is not this code's decision and
+    /// the test does not pin it. A machine that answers a connection to a closed
+    /// port with a reset gets the write line, because that is what [`connect`]
+    /// says a refusal is. A machine whose firewall drops the packet instead
+    /// never gets an answer at all and times out, which is the connect line. The
+    /// Windows runners do the second one and every other machine we build on
+    /// does the first, so asserting either line would be asserting a property of
+    /// the host and not of `MIGRATE`.
+    ///
+    /// What is worth pinning is what the client can act on: it is an `IOERR` and
+    /// not some other error, and the key is still here to try again with.
     #[test]
-    fn a_peer_that_is_not_listening_is_a_write_error() {
+    fn a_peer_that_is_not_listening_is_an_io_error() {
         // Bound and then dropped, so the port is one nothing answers on.
         let port = TcpListener::bind("127.0.0.1:0")
             .expect("a free port")
@@ -1208,17 +1222,17 @@ mod tests {
             .to_string();
         let mut at = At::new();
         at.run(&[b"set", b"k", b"v"]);
-        assert_eq!(
-            at.run(&[
-                b"migrate",
-                b"127.0.0.1",
-                port.as_bytes(),
-                b"k",
-                b"0",
-                b"200"
-            ]),
-            format!("-{}\r\n", String::from_utf8_lossy(WRITE_FAILED))
-        );
+        let reply = at.run(&[
+            b"migrate",
+            b"127.0.0.1",
+            port.as_bytes(),
+            b"k",
+            b"0",
+            b"200",
+        ]);
+        let either = [CONNECT_FAILED, WRITE_FAILED]
+            .map(|line| format!("-{}\r\n", String::from_utf8_lossy(line)));
+        assert!(either.contains(&reply), "got {reply:?}");
         assert_eq!(at.run(&[b"exists", b"k"]), ":1\r\n", "and the key stays");
     }
 
