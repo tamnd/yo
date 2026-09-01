@@ -2816,7 +2816,7 @@ const fn keys() -> [u16; COMMANDS.len()] {
 
 /// The command called `name`, whatever case the client spelled it in.
 ///
-/// The scan is over [`KEYS`] and not over [`COMMANDS`], so a candidate costs one
+/// The scan is over a key array and not over [`COMMANDS`], so a candidate costs one
 /// `u16` compare and the full name is only read when the length and the first
 /// letter already matched. There are 89 distinct keys over the table, so that
 /// happens about twice for a name that is a command and almost never for one
