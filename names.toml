@@ -112,6 +112,16 @@ note      = "v0.3.9 owner=tamnd"
 
 [[name]]
 registry  = "crates.io"
+name      = "yo-derive"
+namespace = ""
+state     = "free"
+probed    = "2026-09-02"
+owner     = ""
+fallback  = ""
+note      = "new workspace member, the release workflow claims it"
+
+[[name]]
+registry  = "crates.io"
 name      = "yo-doc"
 namespace = ""
 state     = "free"

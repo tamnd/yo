@@ -853,6 +853,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "yo-derive"
+version = "0.3.12"
+
+[[package]]
 name = "yo-doc"
 version = "0.3.12"
 dependencies = [
@@ -977,6 +981,8 @@ version = "0.3.12"
 dependencies = [
  "criterion",
  "yo-common",
+ "yo-derive",
+ "yo-doc",
  "yo-index",
  "yo-kv",
  "yo-shape",

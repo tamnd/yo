@@ -20,6 +20,8 @@ path = "src/lib.rs"
 
 [dependencies]
 yo-common.workspace = true
+yo-derive.workspace = true
+yo-doc.workspace = true
 yo-index.workspace = true
 yo-kv.workspace = true
 yo-shape.workspace = true

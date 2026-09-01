@@ -47,6 +47,36 @@
 //! # Ok::<(), yo::Error>(())
 //! ```
 //!
+//! # Your own struct is the document
+//!
+//! [`Db::docs`] holds a collection of whatever type you already have, stored as
+//! that type. The fields worth looking documents up by say so with an attribute,
+//! and the derive writes a constant for each one, so a query is a name the
+//! compiler knows rather than a string it does not. The [`doc`] module is the
+//! whole of it.
+//!
+//! ```
+//! use yo::Yo;
+//!
+//! #[derive(Yo)]
+//! struct Order {
+//!     #[yo(id)]
+//!     id: u64,
+//!     #[yo(index)]
+//!     status: String,
+//!     #[yo(ordered)]
+//!     total: f64,
+//! }
+//!
+//! let db = yo::open(yo::MEMORY)?;
+//! let orders = db.docs::<Order>("orders")?;
+//!
+//! orders.put(&Order { id: 1, status: "open".to_owned(), total: 12.5 })?;
+//! assert_eq!(orders.find(Order::STATUS, "open")?.len(), 1);
+//! assert_eq!(orders.range(Order::TOTAL, 0.0..50.0)?.len(), 1);
+//! # Ok::<(), yo::Error>(())
+//! ```
+//!
 //! # The same store the wire talks to
 //!
 //! [`Db::strings`] is the Redis string keyspace and [`Db::sets`] is the set
@@ -99,13 +129,19 @@
 //! message. The owned and served modes put this same API over `yo-shard`'s
 //! runtime and arrive with it.
 //!
-//! `#[derive(Yo)]`. Until it lands a collection holds the primitives, strings
-//! and byte strings, which is enough to measure and enough to use.
+//! Vectors and graphs. [`Db::docs`] and `#[derive(Yo)]` are here, so a
+//! collection of your own structs is indexed and queried today, and the vector
+//! search and the graph walks over the same documents are the rest of M6 and M7.
 
 #![deny(missing_docs)]
 
+// The derive writes `::yo::` paths, and this crate is `yo` everywhere except
+// inside itself, where the name would otherwise not resolve at all.
+extern crate self as yo;
+
 pub mod counter;
 pub mod db;
+pub mod doc;
 pub mod keys;
 pub mod keyspace;
 pub mod map;
@@ -114,12 +150,17 @@ pub mod store;
 
 pub use counter::Counter;
 pub use db::{Db, MEMORY, open};
+pub use doc::{Docs, Document, Ordered, Path};
 pub use keys::{Keys, Ttl, When};
 pub use keyspace::Strings;
 pub use map::Map;
 pub use sets::{Set, Sets};
 pub use store::{Decode, Encode};
 pub use yo_common::{Code, Error, Result};
+/// Write a type's shape, its document encoding and the indexes it declares.
+///
+/// See the [`doc`] module for the attributes and what they mean.
+pub use yo_derive::Yo;
 pub use yo_shape::{Desc, Shape, Tag};
 // The two views a borrowing read hands to its closure. They were reachable
 // before this and not nameable, so a caller could take one and could not write

@@ -109,7 +109,7 @@ impl<K: Decode, V: Decode> Map<K, V> {
         K: Borrow<Q>,
         Q: Encode + ?Sized,
     {
-        self.read(|c| match key.encode(|k| c.data.get(k)) {
+        self.read(|c| match key.encode(|k| c.data.map().get(k)) {
             // Decoded straight out of the arena rather than copied out and then
             // decoded, so a fixed width value costs no allocation at all and a
             // string costs exactly the one the caller asked for.
@@ -149,7 +149,7 @@ impl<K: Decode, V: Decode> Map<K, V> {
         K: Borrow<Q>,
         Q: Encode + ?Sized,
     {
-        self.read(|c| match key.encode(|k| c.data.get(k)) {
+        self.read(|c| match key.encode(|k| c.data.map().get(k)) {
             Some(bytes) => V::view(bytes).map(|view| Some(f(view))),
             None => Ok(None),
         })
@@ -179,7 +179,7 @@ impl<K: Decode, V: Decode> Map<K, V> {
                     if total > RawMap::max_record() {
                         return Err(too_big(total));
                     }
-                    c.data.set(k, v);
+                    c.data.map_mut().set(k, v);
                     Ok(())
                 })
             })
@@ -197,7 +197,7 @@ impl<K: Decode, V: Decode> Map<K, V> {
         K: Borrow<Q>,
         Q: Encode + ?Sized,
     {
-        self.write(|c| Ok(key.encode(|k| c.data.del(k))))
+        self.write(|c| Ok(key.encode(|k| c.data.map_mut().del(k))))
     }
 
     /// Whether a key is present, without reading its value.
@@ -211,7 +211,7 @@ impl<K: Decode, V: Decode> Map<K, V> {
         K: Borrow<Q>,
         Q: Encode + ?Sized,
     {
-        self.read(|c| Ok(key.encode(|k| c.data.contains(k))))
+        self.read(|c| Ok(key.encode(|k| c.data.map().contains(k))))
     }
 
     /// How many keys are stored.
@@ -221,7 +221,7 @@ impl<K: Decode, V: Decode> Map<K, V> {
     /// [`Code::Invalid`] if called from inside a callback that is already
     /// holding this database.
     pub fn len(&self) -> Result<usize> {
-        self.read(|c| Ok(c.data.len()))
+        self.read(|c| Ok(c.data.map().len()))
     }
 
     /// Whether the collection is empty.
@@ -231,7 +231,7 @@ impl<K: Decode, V: Decode> Map<K, V> {
     /// [`Code::Invalid`] if called from inside a callback that is already
     /// holding this database.
     pub fn is_empty(&self) -> Result<bool> {
-        self.read(|c| Ok(c.data.is_empty()))
+        self.read(|c| Ok(c.data.map().is_empty()))
     }
 
     /// The largest key and value this collection takes, the two together.

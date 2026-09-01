@@ -1,0 +1,25 @@
+[package]
+name = "yo-derive"
+description = "The derive that writes a type's shape, its document encoding and its indexes"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[lib]
+proc-macro = true
+
+# There are none, and that is deliberate. A derive is the one place a library
+# gets to add three crates to everybody's build graph without being asked, and
+# the grammar this reads is a struct with named fields, which the token stream
+# the compiler already hands over answers directly. See the module docs.
+[dependencies]
+
+[lints]
+workspace = true
