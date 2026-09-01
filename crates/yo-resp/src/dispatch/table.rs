@@ -2889,9 +2889,10 @@ pub fn lookup(name: &[u8]) -> Option<&'static Spec> {
 /// engine resolves a command's name once when it frames it and hands the number
 /// on to both the key hash and the dispatcher.
 ///
-/// [`FREE`] is the answer for a name that is not a command, which is not a
-/// special case anybody has to write down: it is `u16::MAX`, the table is 191
-/// entries, and [`at`] hands back `None` for anything past the end.
+/// `u16::MAX` is the answer for a name that is not a command, which is not a
+/// special case anybody has to write down: the table is 191 entries, so [`at`]
+/// hands back `None` for it the same way it would for any other number past the
+/// end.
 #[must_use]
 pub fn lookup_index(name: &[u8]) -> u16 {
     let Some(key) = key_of(name) else {
