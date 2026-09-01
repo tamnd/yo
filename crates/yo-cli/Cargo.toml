@@ -35,11 +35,15 @@ yo-resp = { workspace = true }
 [target.'cfg(unix)'.dependencies]
 libc = { workspace = true }
 
-# The same question on Windows, which answers it with `WSAPoll`. One feature and
-# not the whole of windows-sys, because the crate is generated from the entire
-# Windows API and the default is nothing at all.
+# The same question on Windows, which answers it with `WSAPoll`, plus the console
+# handler that Ctrl-C arrives through. Two features and not the whole of
+# windows-sys, because the crate is generated from the entire Windows API and the
+# default is nothing at all.
 [target.'cfg(windows)'.dependencies]
-windows-sys = { workspace = true, features = ["Win32_Networking_WinSock"] }
+windows-sys = { workspace = true, features = [
+    "Win32_Networking_WinSock",
+    "Win32_System_Console",
+] }
 
 # The tests are the one place both sides are allowed in the same binary. They
 # build real files with the engine and then check them with the tool, which is

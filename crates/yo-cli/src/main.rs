@@ -15,11 +15,11 @@
 mod check;
 mod poll;
 mod serve;
+mod signal;
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::process::ExitCode;
-use std::sync::atomic::AtomicBool;
 
 use check::Severity;
 
@@ -288,17 +288,26 @@ fn serve_command(args: &[&str]) -> ExitCode {
         (false, None) => unreachable!("refused above"),
     }
 
-    // Nothing sets this yet. Ctrl-C ends the process, and there is no state to
-    // flush until the file arrives in M5, which is when a shutdown that waits
-    // for something starts to mean anything.
-    static STOP: AtomicBool = AtomicBool::new(false);
-    match server.run(&STOP) {
+    // After the listening line and not before it, so a Ctrl-C that arrives in
+    // the moment between the two is a process that was never told to serve
+    // rather than one that says it is serving and then stops.
+    signal::listen();
+    let outcome = match server.run(signal::stop()) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("yodb serve: {e}");
             ExitCode::FAILURE
         }
+    };
+    // Explicitly, and before the line that says so, because dropping the server
+    // is what unlinks the socket file and closes the doors. Leaving it to the
+    // end of the function would print that it had shut down while the path it
+    // was listening on was still there for somebody to connect to.
+    drop(server);
+    if signal::stopped() {
+        println!("yodb {version} shutting down");
     }
+    outcome
 }
 
 fn plural(n: usize) -> &'static str {
