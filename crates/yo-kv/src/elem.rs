@@ -51,6 +51,37 @@
 //! remove from an ordered structure, and here there is no ordered structure to
 //! remove from.
 //!
+//! # How large the slot array is
+//!
+//! Exactly as large as the table needs, rounded up to a whole group and nothing
+//! further, which is at most seven slots of waste. It used to be the next power
+//! of two, which is up to twice the array, and the gate's own `SADD` row landed
+//! on nearly the worst point of that: eight hundred and ten thousand members
+//! want just over nine hundred thousand slots and a masked array gave them two
+//! million and ninety seven thousand.
+//!
+//! What makes any size available is `group_at`, a multiply and a shift over the
+//! hash bits a row already carries rather than an and against a mask. The three
+//! cycles it costs go in front of a load that misses cache. It also makes the
+//! twenty four bits in a row enough at every size, where masking them down only
+//! worked while the mask was narrower than they were and needed a rehash out of
+//! the name blob above that.
+//!
+//! The array grows by doubling while it is small and by a quarter once it is
+//! past sixty four kilobytes, which is [`crate::grow`]'s policy with a bigger
+//! step, because a slot array's growth places every entry again where a row
+//! array's is a memcpy. So the load runs between seven tenths and seven eighths
+//! rather than between three eighths and three quarters, and the array is rebuilt
+//! more often for a smaller step each time. A rebuild reads two flat arrays and
+//! hashes nothing, so it is the cheap half of a growth.
+//!
+//! The two halves of this are one change and neither is worth having alone. A
+//! higher load makes a slot at a time probe fall apart, and a group probe on its
+//! own only pays for itself once the load is somewhere a slot at a time could
+//! not go. Together, on sixteen byte members, a set went from 34.83 bytes a
+//! member to 31.45 at a million and from 37.03 to 31.18 at a hundred thousand,
+//! and the slot array itself from 8.39 bytes a member to 5.00.
+//!
 //! # Removal
 //!
 //! Keeping the row array dense means a removal moves the last row into the hole
@@ -69,26 +100,29 @@
 //! collect after itself.
 //!
 //! What that leaves behind is the groups that were completely full, because a
-//! probe really did go past one of those and a marker in it is holding the path
-//! open. At three quarters full that is about one group in ten, so a drained set
-//! ends with a few percent of its slots marked rather than none of them. It used
-//! to be none, when a removal shifted the run behind it back one slot at a time,
-//! and a few percent is the price of the group probe. It is a small one: almost
-//! every group still has an empty in it, so a miss against a drained set is
-//! still one group.
+//! probe really did go past one of those, a marker in it is holding the path
+//! open, and a group with no empty in it never gains one. It is not a small
+//! number at the load this runs at. A set of two thousand, which is still in the
+//! band that doubles, ends a full drain with 232 of 4096 slots marked. A set of a
+//! hundred thousand, which is in the band that grows by a quarter and so sits
+//! near seven eighths, ends one with about half its slots marked. It used to be
+//! none of them, when a removal shifted the run behind it back one slot at a
+//! time, and this is the price of the group probe.
 //!
-//! What is left over is counted and it counts against the load exactly as a live
-//! member does, so a table churned in place rebuilds on the same schedule as one
-//! that only grows and can never fill up with markers. That count is also what
-//! bounds a probe, and the bound is easier than it looks: a removal turns a full
-//! slot into a marker or into an empty one, so the two together never go up, so
-//! a probe is never longer than it was at the moment the table was fullest.
+//! What makes that price bounded rather than unbounded is the marker count. A
+//! marker counts against the load exactly as a live member does, so a table
+//! cannot fill up with them: the first insert that would push live plus dead past
+//! the load rebuilds the array and clears every one. A table churned in place
+//! rebuilds on the same schedule as one that only grows, and a drained table that
+//! is refilled rebuilds once on the way back up. That count is also what bounds a
+//! probe, and the bound is easier than it looks: a removal turns a full slot into
+//! a marker or into an empty one, so the two together never go up, so a probe is
+//! never longer than it was at the moment the table was fullest.
 //!
-//! It is not free, and the case where it is not is a table drained and then read
-//! from. Shifting the run back really did give the slot up, so a set emptied
-//! from a million down to ten used to answer a miss like a table holding ten,
-//! and now it answers like a table that once held a million, which is under
-//! three slots looked at either way and is the whole of the trade.
+//! The case where the trade is felt is a table drained and then read from without
+//! being written to, because nothing then triggers the rebuild. A miss there
+//! walks to the first group that has an empty rather than stopping at the first
+//! empty slot, which is a couple of groups instead of one.
 //!
 //! This used to shift the run behind the hole back instead, which leaves no
 //! marker and costs a walk over that run with a home slot computed for every
@@ -98,10 +132,10 @@
 //! is the gate that says a command path allocates nothing.
 //!
 //! Neither the removal nor the marker reads a name, because every row carries
-//! the slot it wanted. Three bytes a row for that, packed in beside the name
-//! length, and it took a pop at a hundred thousand members from 123 ns to
-//! 25.7 ns, which is the difference between a random trip into the name blob per
-//! slot examined and no trip at all.
+//! the bits of its own hash that say which group it wanted. Three bytes a row for
+//! that, packed in beside the name length, and it took a pop at a hundred
+//! thousand members from 123 ns to 25.7 ns, which is the difference between a
+//! random trip into the name blob per slot examined and no trip at all.
 //!
 //! # Names
 //!
@@ -1456,22 +1490,24 @@ mod tests {
         }
     }
 
-    /// A drain collects most of what it leaves behind.
+    /// A drain leaves only markers, and never more than the load allows.
     ///
     /// A removal from a group that has an empty slot in it clears every marker
-    /// in that group, so as a set empties the markers go with it. What is left
-    /// at the end is the groups that were completely full when the drain
+    /// in that group, so as a set empties most of the markers go with it. What
+    /// is left at the end is the groups that were completely full when the drain
     /// started, because a probe does go past one of those and a marker there is
-    /// still holding the path open. At three quarters full that is about one
-    /// group in ten, which is what the bound below is, and it is loose because
-    /// it is checking an order of magnitude rather than a formula.
+    /// still holding the path open, and a group that has no empty in it never
+    /// gains one. On this shape that is 232 slots in 4096.
     ///
     /// It used to be none at all, when a removal shifted the run behind it back
-    /// instead. That is the price of the group probe and it is a small one: a
-    /// few percent of slots holding a marker means almost every group still has
-    /// an empty in it, so a miss against the drained set is still one group.
+    /// instead. What the marker count is really doing is bounding it: markers
+    /// count against the load exactly as live rows do, so the array cannot fill
+    /// with them and the first insert that would push it over rebuilds and
+    /// clears the lot. The check below is that bound and not a smaller number,
+    /// because a smaller number is a property of the size this test happens to
+    /// use rather than of the rule.
     #[test]
-    fn emptying_a_set_a_member_at_a_time_leaves_almost_nothing_behind() {
+    fn emptying_a_set_a_member_at_a_time_leaves_only_markers() {
         let names: Vec<Vec<u8>> = (0..2000u32).map(|i| format!("m{i}").into_bytes()).collect();
         let mut s = Set::new();
         for name in &names {
@@ -1483,7 +1519,7 @@ mod tests {
         }
         assert!(s.is_empty());
         assert!(
-            s.dead * 5 < slots,
+            s.dead * LOAD_DEN <= slots * LOAD_NUM,
             "the drain left {} markers in {slots} slots",
             s.dead
         );
