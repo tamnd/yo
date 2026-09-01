@@ -126,6 +126,11 @@ pub struct Keyspace {
     /// `maxmemory-samples`, carried per database for the same reason the policy
     /// is. See [`evict::SAMPLES`] for why the default is five.
     pub(crate) samples: usize,
+    /// The good candidates from earlier rounds of eviction sampling.
+    ///
+    /// See [`evict::Pool`]. Empty and costing nothing until the first eviction,
+    /// which on most databases is never.
+    pub(crate) pool: evict::Pool,
     /// Where `SPOP` and `SRANDMEMBER` draw from.
     pub(crate) rng: Rng,
     /// The last collection key that was resolved, for the command behind it.
@@ -355,6 +360,7 @@ impl Keyspace {
             policy: Policy::default(),
             lfu: Lfu::DEFAULT,
             samples: evict::SAMPLES,
+            pool: evict::Pool::new(),
             rng: Rng::new(clock.now_ms() ^ made.wrapping_mul(0x9e37_79b9_7f4a_7c15)),
             memo: Memo::empty(),
             scratch: Vec::with_capacity(SCRATCH),
@@ -395,8 +401,15 @@ impl Keyspace {
     /// nobody has touched since the switch reads as freshly used rather than as
     /// stale, which is the safe direction: the other one evicts the working set
     /// on the first pass after an operator changes a setting.
+    ///
+    /// The candidate pool does go, because a score only means anything against
+    /// another score under the same rule and every number in there was worked
+    /// out under the old one.
     #[inline]
-    pub const fn set_policy(&mut self, policy: Policy) {
+    pub fn set_policy(&mut self, policy: Policy) {
+        if policy != self.policy {
+            self.pool.clear();
+        }
         self.policy = policy;
     }
 
@@ -1140,6 +1153,7 @@ impl Keyspace {
         self.lists.clear();
         self.zsets.clear();
         self.arrays.clear();
+        self.pool.clear();
         self.bodies = 0;
         self.expires = 0;
     }
@@ -1247,8 +1261,16 @@ impl Keyspace {
     /// eviction when it is an expiry, and those two numbers are watched
     /// separately for a reason. Lazy expiry takes it the next time anything asks
     /// for it, and the active cycle takes it before that.
+    ///
+    /// What comes back is not only the worst of this round. Everything sampled
+    /// goes into [`evict::Pool`], which holds the sixteen best across rounds, so
+    /// the answer is the worst key seen since the pool was last emptied. The
+    /// price is that a candidate is a key rather than an address and so has to
+    /// be looked up and rechecked here, because it can have been deleted or have
+    /// expired or have lost its deadline since the round that spotted it.
     fn victim(&mut self) -> Option<Addr> {
         if matches!(self.policy, Policy::NoEviction) || self.map.is_empty() {
+            self.pool.clear();
             return None;
         }
         // The classic eviction surprise, answered before it costs anything. A
@@ -1258,10 +1280,52 @@ impl Keyspace {
         // on a path where a client is waiting for the write this is making room
         // for. The count knows.
         if self.policy.volatile_only() && self.expires == 0 {
+            self.pool.clear();
             return None;
         }
         let now = self.clock.now_ms();
         let (policy, lfu, want) = (self.policy, self.lfu, self.samples);
+        if policy.is_random() {
+            return self.draw(now, want);
+        }
+        let mut seen = 0usize;
+        for _ in 0..ROUNDS {
+            let r = self.rng.next_u64();
+            let pool = &mut self.pool;
+            self.map.sample(r, |key, rec, _addr| {
+                if !value::is_expired(rec, now) && evict::eligible(rec, policy) {
+                    seen += 1;
+                    pool.offer(key, evict::score(rec, policy, now, lfu));
+                }
+                seen < want
+            });
+            if seen >= want {
+                break;
+            }
+        }
+        while let Some(key) = self.pool.take() {
+            let Some(addr) = self.map.find(key) else {
+                continue;
+            };
+            let rec = self.map.value_at(addr);
+            if value::is_expired(rec, now) || !evict::eligible(rec, policy) {
+                continue;
+            }
+            return Some(addr);
+        }
+        None
+    }
+
+    /// A fair draw among the eligible keys, which is what the random pair want.
+    ///
+    /// No pool, because there is no ordering for one to approximate: under
+    /// `allkeys-random` and `volatile-random` every eligible key is as good a
+    /// victim as every other, and remembering sixteen of them across rounds
+    /// would only mean the same sixteen going first. The sampling is what does
+    /// the choosing, so the address it lands on is used straight away and the
+    /// key never has to be copied at all.
+    fn draw(&mut self, now: u64, want: usize) -> Option<Addr> {
+        let policy = self.policy;
         let mut best = evict::Best::EMPTY;
         let mut seen = 0usize;
         for _ in 0..ROUNDS {
@@ -1269,7 +1333,7 @@ impl Keyspace {
             self.map.sample(r, |_key, rec, addr| {
                 if !value::is_expired(rec, now) && evict::eligible(rec, policy) {
                     seen += 1;
-                    best.offer(addr, evict::score(rec, policy, now, lfu));
+                    best.offer(addr, evict::ANY);
                 }
                 seen < want
             });
@@ -1757,5 +1821,118 @@ mod tests {
 
         assert!(!d.evict_one(), "it evicted a key that was already dead");
         assert_eq!(d.evicted_keys(), 0);
+    }
+
+    /// The point of the pool. A round looks at five keys, takes one, and used to
+    /// throw the other four away, so the second worst key in the database had to
+    /// be found again from scratch every time.
+    #[test]
+    fn a_candidate_that_was_not_taken_is_still_in_the_running() {
+        let mut d = db();
+        d.set_policy(Policy::AllKeysLru);
+        for i in 0..40u32 {
+            d.set_plain(format!("k{i}").as_bytes(), b"v").expect("room");
+            d.clock_mut().advance(1000);
+        }
+        assert!(d.pool.is_empty(), "nothing has sampled anything yet");
+
+        assert!(d.evict_one());
+        assert!(
+            !d.pool.is_empty(),
+            "every key it looked at and did not take was thrown away"
+        );
+    }
+
+    /// A candidate is a key and not an address, so it can stop being a key
+    /// between the round that spotted it and the round that wants it. Every one
+    /// of them going at once is the worst case, and the answer has to be the
+    /// live key rather than a shrug.
+    #[test]
+    fn a_candidate_that_went_away_is_stepped_over() {
+        let mut d = db();
+        d.set_policy(Policy::AllKeysLru);
+        for i in 0..40u32 {
+            d.set_plain(format!("k{i}").as_bytes(), b"v").expect("room");
+            d.clock_mut().advance(1000);
+        }
+        assert!(d.evict_one());
+        assert!(!d.pool.is_empty());
+
+        // By hand, so every candidate still held names a key that is not there.
+        for i in 0..40u32 {
+            d.drop_key(format!("k{i}").as_bytes());
+        }
+        assert_eq!(d.len(), 0);
+        d.set_plain(b"fresh", b"v").expect("room");
+
+        assert!(d.evict_one(), "it gave up on a database with a key in it");
+        assert!(!d.exists(b"fresh"));
+        assert!(d.pool.is_empty(), "and the stale ones went with it");
+    }
+
+    /// A score only means something against another score under the same rule,
+    /// so a pool full of them is worth nothing the moment the rule changes.
+    #[test]
+    fn changing_the_policy_throws_the_candidates_away() {
+        let mut d = db();
+        d.set_policy(Policy::AllKeysLru);
+        let now = d.clock().now_ms();
+        for i in 0..40u32 {
+            d.set_plain(format!("k{i}").as_bytes(), b"v").expect("room");
+            d.set_expiry(
+                format!("k{i}").as_bytes(),
+                Some(now + 100_000 + u64::from(i)),
+            );
+            d.clock_mut().advance(1000);
+        }
+        assert!(d.evict_one());
+        assert!(!d.pool.is_empty());
+
+        d.set_policy(Policy::VolatileTtl);
+        assert!(d.pool.is_empty(), "idle seconds against a countdown");
+
+        // And the same policy set again is not a change and costs nothing.
+        d.set_policy(Policy::VolatileTtl);
+        assert!(d.evict_one());
+        assert!(!d.pool.is_empty());
+        d.set_policy(Policy::VolatileTtl);
+        assert!(!d.pool.is_empty());
+    }
+
+    /// A fair draw has no ordering for a pool to get closer to, so the random
+    /// pair never copy a key at all.
+    #[test]
+    fn a_random_policy_keeps_no_candidates() {
+        let mut d = db();
+        d.set_policy(Policy::AllKeysRandom);
+        for i in 0..40u32 {
+            d.set_plain(format!("k{i}").as_bytes(), b"v").expect("room");
+        }
+
+        assert!(d.evict_one());
+        assert_eq!(d.len(), 39);
+        assert!(d.pool.is_empty());
+        assert_eq!(
+            d.pool.memory_bytes(),
+            0,
+            "and it allocated nothing to do it"
+        );
+    }
+
+    /// A flush leaves the pool naming keys that are all gone, which the recheck
+    /// would survive and would pay sixteen lookups for.
+    #[test]
+    fn a_flush_takes_the_candidates_with_it() {
+        let mut d = db();
+        d.set_policy(Policy::AllKeysLru);
+        for i in 0..40u32 {
+            d.set_plain(format!("k{i}").as_bytes(), b"v").expect("room");
+            d.clock_mut().advance(1000);
+        }
+        assert!(d.evict_one());
+        assert!(!d.pool.is_empty());
+
+        d.clear();
+        assert!(d.pool.is_empty());
     }
 }
