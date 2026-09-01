@@ -181,20 +181,16 @@ impl Docs {
             let Some(at) = value.path_bytes(index.path())? else {
                 continue;
             };
-            let Some(key) = Key::of(at) else {
-                continue;
-            };
-            if key.is_too_long() {
+            if index.keys_at(at, slot).is_err() {
                 return Err(Error::fmt(
                     Code::Full,
                     format_args!(
-                        "the value at {} is longer than {} bytes and cannot be indexed",
+                        "a value at {} is longer than {} bytes and cannot be indexed",
                         String::from_utf8_lossy(index.path()),
                         index::KEY_MAX
                     ),
                 ));
             }
-            slot.extend_from_slice(key.as_bytes());
         }
 
         unindex(rows, keys, indexes, id);
@@ -213,9 +209,13 @@ impl Docs {
         };
 
         for (slot, index) in taken.iter().zip(indexes.iter_mut()) {
-            if !slot.is_empty() {
-                index.add(slot, id)?;
-            }
+            let mut filed = Ok(());
+            index::each_key(slot, |key| {
+                if filed.is_ok() {
+                    filed = index.add(key, id);
+                }
+            });
+            filed?;
         }
         Ok(fresh)
     }
@@ -251,6 +251,36 @@ impl Docs {
         self.create_index_bytes(path.as_bytes(), IndexKind::Ordered)
     }
 
+    /// Start indexing every element of the array at `path`.
+    ///
+    /// A document with `["red", "blue"]` there is filed under both, so a search
+    /// for either finds it. A scalar at the path is an array of one, so a
+    /// collection where some documents have a list of tags and some have a
+    /// single tag works without the caller having to normalise it first.
+    ///
+    /// The lookup is [`Docs::find`] with the element as the key, unchanged. An
+    /// array index costs what the document has at the path, so a document with
+    /// ten elements costs ten postings and a document with none costs nothing.
+    pub fn create_array_index(&mut self, path: &str) -> Result<()> {
+        self.create_index_bytes(path.as_bytes(), IndexKind::Array)
+    }
+
+    /// Start indexing every word of the string at `path`.
+    ///
+    /// A document with `"A red bicycle"` there is filed under `a`, `red` and
+    /// `bicycle`, and the lookup is [`Docs::find`] with [`Key::word`] as the
+    /// key. Case is folded on both sides, so a search does not have to know how
+    /// the document was written.
+    ///
+    /// This is a word index and not a search engine. There is no ranking, no
+    /// stemming and no phrase matching, and a path that holds something other
+    /// than a string files nothing. What it answers is which documents contain
+    /// a word, which is a filter, and the ranking that belongs on top of it is
+    /// `10`.
+    pub fn create_text_index(&mut self, path: &str) -> Result<()> {
+        self.create_index_bytes(path.as_bytes(), IndexKind::Text)
+    }
+
     /// [`Docs::create_index`] and [`Docs::create_ordered_index`] for a path that
     /// is already bytes.
     pub fn create_index_bytes(&mut self, path: &[u8], kind: IndexKind) -> Result<()> {
@@ -258,10 +288,15 @@ impl Docs {
             step?;
         }
         match self.indexes.iter().position(|i| i.path() == path) {
-            // Equality on top of ordered is already answered, and equality on
-            // top of equality is nothing at all.
-            Some(_) if kind == IndexKind::Equality => return Ok(()),
-            Some(at) if self.indexes[at].kind() == IndexKind::Ordered => return Ok(()),
+            // The same kind again is nothing at all, and equality on top of
+            // ordered is already answered. Every other pair means the path is
+            // being asked a different question, so it gets rebuilt.
+            Some(at) if self.indexes[at].kind() == kind => return Ok(()),
+            Some(at)
+                if kind == IndexKind::Equality && self.indexes[at].kind() == IndexKind::Ordered =>
+            {
+                return Ok(());
+            }
             Some(at) => {
                 self.indexes.remove(at);
                 self.taken.truncate(self.indexes.len());
@@ -269,6 +304,7 @@ impl Docs {
             None => {}
         }
         let mut index = PathIndex::new(path, kind);
+        let mut list = Vec::new();
         for (id, bytes) in self.rows.pairs() {
             let Some(value) = Value::new(bytes) else {
                 continue;
@@ -280,21 +316,25 @@ impl Docs {
             let Some(at) = doc.path_bytes(path)? else {
                 continue;
             };
-            let Some(key) = Key::of(at.value()) else {
-                continue;
-            };
-            if key.is_too_long() {
+            list.clear();
+            if index.keys_at(at.value(), &mut list).is_err() {
                 return Err(Error::fmt(
                     Code::Full,
                     format_args!(
-                        "the value at {} in {} is longer than {} bytes and cannot be indexed",
+                        "a value at {} in {} is longer than {} bytes and cannot be indexed",
                         String::from_utf8_lossy(path),
                         String::from_utf8_lossy(id),
                         index::KEY_MAX
                     ),
                 ));
             }
-            index.add(key.as_bytes(), id)?;
+            let mut filed = Ok(());
+            index::each_key(&list, |key| {
+                if filed.is_ok() {
+                    filed = index.add(key, id);
+                }
+            });
+            filed?;
         }
         self.indexes.push(index);
         self.taken.push(Vec::new());
@@ -583,14 +623,16 @@ fn unindex(rows: &Elements<()>, keys: &Keys, indexes: &mut [PathIndex], id: &[u8
         return;
     };
     let doc = Doc { value, keys };
+    let mut list = Vec::new();
     for index in indexes {
         let Ok(Some(at)) = doc.path_bytes(index.path()) else {
             continue;
         };
-        let Some(key) = Key::of(at.value()) else {
-            continue;
-        };
-        index.take(key.as_bytes(), id);
+        list.clear();
+        // The keys came out of this same code on the way in, so a key that was
+        // refused then is not filed now and there is nothing to take out.
+        let _ = index.keys_at(at.value(), &mut list);
+        index::each_key(&list, |key| index.take(key, id));
     }
 }
 
@@ -1143,7 +1185,7 @@ mod tests {
         let mut out = Vec::new();
         let n = docs
             .find(path, key, |id, d| {
-                assert!(d.get(b"id").is_some(), "the document came back whole");
+                assert!(!d.is_empty(), "the document came back whole");
                 out.push(String::from_utf8_lossy(id).into_owned());
             })
             .expect("indexed");
@@ -1499,6 +1541,174 @@ mod tests {
             IndexKind::Ordered
         );
         assert_eq!(docs.indexes().len(), 1);
+    }
+
+    /// A document with a list of tags at `$.tags` and a title at `$.title`.
+    fn tagged(title: &str, tags: &[&str]) -> Vec<u8> {
+        let mut b = Builder::new();
+        b.begin_object().expect("open");
+        b.key(b"title").expect("key");
+        b.text(title).expect("value");
+        b.key(b"tags").expect("key");
+        b.begin_array().expect("open");
+        for tag in tags {
+            b.text(tag).expect("value");
+        }
+        b.end_array().expect("close");
+        b.end_object().expect("close");
+        b.finish().expect("finished").to_vec()
+    }
+
+    #[test]
+    fn an_array_index_files_a_document_under_every_element() {
+        let mut docs = Docs::new();
+        docs.create_array_index("$.tags").expect("indexed");
+        docs.put_bytes(b"a", &tagged("one", &["red", "blue"]))
+            .expect("put");
+        docs.put_bytes(b"b", &tagged("two", &["blue", "green"]))
+            .expect("put");
+        docs.put_bytes(b"c", &tagged("three", &[])).expect("put");
+
+        assert_eq!(found(&docs, "$.tags", &Key::text("red")), ["a"]);
+        assert_eq!(found(&docs, "$.tags", &Key::text("blue")), ["a", "b"]);
+        assert_eq!(found(&docs, "$.tags", &Key::text("green")), ["b"]);
+        assert!(found(&docs, "$.tags", &Key::text("puce")).is_empty());
+        assert_eq!(
+            docs.index("$.tags").expect("there").len(),
+            3,
+            "three distinct tags over two documents"
+        );
+    }
+
+    #[test]
+    fn an_array_index_takes_every_element_back_out_again() {
+        let mut docs = Docs::new();
+        docs.create_array_index("$.tags").expect("indexed");
+        docs.put_bytes(b"a", &tagged("one", &["red", "blue"]))
+            .expect("put");
+        docs.put_bytes(b"b", &tagged("two", &["blue"]))
+            .expect("put");
+
+        // An overwrite drops one tag and gains another.
+        docs.put_bytes(b"a", &tagged("one", &["blue", "green"]))
+            .expect("put");
+        assert!(found(&docs, "$.tags", &Key::text("red")).is_empty());
+        assert_eq!(found(&docs, "$.tags", &Key::text("blue")), ["a", "b"]);
+        assert_eq!(found(&docs, "$.tags", &Key::text("green")), ["a"]);
+
+        assert!(docs.remove(b"a"));
+        assert_eq!(found(&docs, "$.tags", &Key::text("blue")), ["b"]);
+        assert!(found(&docs, "$.tags", &Key::text("green")).is_empty());
+        assert_eq!(
+            docs.index("$.tags").expect("there").len(),
+            1,
+            "a tag nobody has left is not a key any more"
+        );
+    }
+
+    #[test]
+    fn an_array_index_treats_one_value_as_a_list_of_one() {
+        let mut docs = Docs::new();
+        docs.create_array_index("$.status").expect("indexed");
+        docs.put_bytes(b"order:1", &order(1, "open", 1))
+            .expect("put");
+        assert_eq!(found(&docs, "$.status", &Key::text("open")), ["order:1"]);
+    }
+
+    #[test]
+    fn the_same_element_twice_is_one_posting() {
+        let mut docs = Docs::new();
+        docs.create_array_index("$.tags").expect("indexed");
+        docs.put_bytes(b"a", &tagged("one", &["red", "red", "red"]))
+            .expect("put");
+        assert_eq!(found(&docs, "$.tags", &Key::text("red")), ["a"]);
+        assert_eq!(docs.index("$.tags").expect("there").postings(), 1);
+
+        // And taking it out once takes it out, rather than three times over.
+        assert!(docs.remove(b"a"));
+        assert_eq!(docs.index("$.tags").expect("there").postings(), 0);
+        assert!(docs.index("$.tags").expect("there").is_empty());
+    }
+
+    #[test]
+    fn a_text_index_files_a_document_under_every_word() {
+        let mut docs = Docs::new();
+        docs.create_text_index("$.title").expect("indexed");
+        docs.put_bytes(b"a", &tagged("A red bicycle", &[]))
+            .expect("put");
+        docs.put_bytes(b"b", &tagged("The red car, and a bicycle!", &[]))
+            .expect("put");
+
+        assert_eq!(found(&docs, "$.title", &word("bicycle")), ["a", "b"]);
+        assert_eq!(found(&docs, "$.title", &word("car")), ["b"]);
+        assert_eq!(
+            found(&docs, "$.title", &word("RED")),
+            ["a", "b"],
+            "a search folds case the same way the write did"
+        );
+        assert!(found(&docs, "$.title", &word("lorry")).is_empty());
+    }
+
+    #[test]
+    fn a_text_index_follows_the_words_through_a_rewrite() {
+        let mut docs = Docs::new();
+        docs.create_text_index("$.title").expect("indexed");
+        docs.put_bytes(b"a", &tagged("a red bicycle", &[]))
+            .expect("put");
+        docs.put_bytes(b"a", &tagged("a blue bicycle", &[]))
+            .expect("put");
+        assert!(found(&docs, "$.title", &word("red")).is_empty());
+        assert_eq!(found(&docs, "$.title", &word("blue")), ["a"]);
+        assert_eq!(found(&docs, "$.title", &word("bicycle")), ["a"]);
+
+        assert!(docs.remove(b"a"));
+        assert!(docs.index("$.title").expect("there").is_empty());
+    }
+
+    #[test]
+    fn a_text_index_declared_after_the_documents_finds_them() {
+        let mut docs = Docs::new();
+        for i in 0..16i64 {
+            let title = if i % 2 == 0 {
+                "a red one"
+            } else {
+                "a blue one"
+            };
+            docs.put_bytes(format!("t:{i}").as_bytes(), &tagged(title, &[]))
+                .expect("put");
+        }
+        docs.create_text_index("$.title").expect("indexed");
+        assert_eq!(docs.count("$.title", &word("red")).expect("i"), 8);
+        assert_eq!(docs.count("$.title", &word("one")).expect("i"), 16);
+        assert_eq!(
+            docs.index("$.title").expect("there").len(),
+            4,
+            "a, red, blue and one"
+        );
+    }
+
+    #[test]
+    fn changing_what_an_index_is_asked_rebuilds_it() {
+        let mut docs = Docs::new();
+        docs.create_index("$.tags").expect("indexed");
+        docs.put_bytes(b"a", &tagged("one", &["red", "blue"]))
+            .expect("put");
+        assert!(
+            found(&docs, "$.tags", &Key::text("red")).is_empty(),
+            "an equality index over an array files nothing"
+        );
+
+        docs.create_array_index("$.tags").expect("rebuilt");
+        assert_eq!(docs.indexes().len(), 1, "it replaced rather than added");
+        assert_eq!(found(&docs, "$.tags", &Key::text("red")), ["a"]);
+
+        docs.create_array_index("$.tags").expect("already there");
+        assert_eq!(docs.indexes().len(), 1);
+    }
+
+    /// The key a text index files one word under.
+    fn word(w: &str) -> Key {
+        Key::word(w).expect("one word")
     }
 
     #[test]

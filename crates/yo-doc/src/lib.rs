@@ -7,7 +7,8 @@
 //! that matter for an embedded engine written down below. [`Docs`] is the
 //! collection: documents by id, with the [`Keys`] table that turns every object
 //! key into two bytes and a [`PathIndex`] per path that is worth looking
-//! documents up by, for equality or for ranges.
+//! documents up by, for equality, for ranges, for the elements of an array or
+//! for the words of a string.
 //!
 //! ```
 //! use yo_doc::{Builder, Kind, Value};
@@ -65,11 +66,6 @@
 //! Parsing JSON text. It arrives with the RESP surface, where it belongs: the
 //! typed API never parses JSON, it serializes a struct straight into this
 //! encoding, and text parsing is for `JSON.SET` and for bulk import.
-//!
-//! Array and text indexes, which file a document under every element of an array
-//! or every token of a string rather than under one key. The posting lists are
-//! the same sets and the write path is the same one, so what is missing is the
-//! part that decides how many keys a document has at a path.
 //!
 //! The vector index, which is `10`, and the typed `Docs<T>` surface with its
 //! derive, which is `15`.
