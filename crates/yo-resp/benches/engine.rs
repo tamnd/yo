@@ -113,18 +113,29 @@ fn bench_over(
 /// listpack it passed through on the way there.
 const HOT: usize = 100_000;
 
-/// Fill `set:hot` with [`HOT`] members, a batch at a time.
-fn fill_hot(r: &mut Reactor<Wire<Null>>, conn: ConnId) {
+/// Fill one set with [`HOT`] members, a batch at a time.
+fn fill_named(r: &mut Reactor<Wire<Null>>, conn: ConnId, key: &[u8]) {
     let mut batch = Vec::new();
     for chunk in 0..HOT / 64 {
         let mut stream = Vec::new();
         for i in 0..64 {
             let m = format!("member:{:012}", chunk * 64 + i);
-            stream.extend_from_slice(&wire(&[b"SADD", b"set:hot", m.as_bytes()]));
+            stream.extend_from_slice(&wire(&[b"SADD", key, m.as_bytes()]));
         }
         r.engine_mut().feed(conn, &stream);
         pump(r, &mut batch);
     }
+}
+
+/// Fill `set:hot` with [`HOT`] members.
+fn fill_hot(r: &mut Reactor<Wire<Null>>, conn: ConnId) {
+    fill_named(r, conn, b"set:hot");
+}
+
+/// Fill `set:hot` and `set:alt`, both to [`HOT`] members.
+fn fill_both(r: &mut Reactor<Wire<Null>>, conn: ConnId) {
+    fill_named(r, conn, b"set:hot");
+    fill_named(r, conn, b"set:alt");
 }
 
 fn bench_set(c: &mut Criterion) {
@@ -156,6 +167,53 @@ fn bench_sadd(c: &mut Criterion) {
         &[b"SADD", b"set:hot", b"member:000000000001"],
         fill_hot,
     );
+}
+
+/// The same batch, alternating between two sets instead of hammering one.
+///
+/// This is the A/B for Y13. `engine/sadd` is the escalated shape: every command
+/// in the batch names the key the command in front of it named, so the memo in
+/// the keyspace answers where the body is and nothing hashes or probes. This row
+/// alternates between two keys, which defeats the memo on every single command
+/// while leaving both sets, both records and both slabs exactly as warm in the
+/// cache as the one set was. So the difference between the two rows is the memo
+/// and close to nothing else, which is not true of the obvious alternative of
+/// spreading over sixty four keys: that one would be measuring cache misses as
+/// well and would flatter the claim.
+///
+/// What it says, on an Apple M4 in release, as a development measurement and not
+/// a gate number: 73.5 ns a command escalated against 92.0 alternating at P64,
+/// 77.2 against 93.1 at P16, and 128.6 against 138.5 at P1. So the memo is worth
+/// about nineteen nanoseconds a command, which is 1.25x at P64 and 1.20x at P16.
+/// The P1 rows are the pair this bench can say least about. A batch of one has
+/// no command in front of it inside the same batch, so the only hit available is
+/// against the batch before, and the maintenance slice runs in between. Ten
+/// nanoseconds is what the two rows differ by there and this row cannot tell you
+/// how much of it is the memo.
+///
+/// The member is one that is already there, for the reason [`bench_sadd`] gives.
+fn bench_sadd_alternating(c: &mut Criterion) {
+    let hot = wire(&[b"SADD", b"set:hot", b"member:000000000001"]);
+    let alt = wire(&[b"SADD", b"set:alt", b"member:000000000001"]);
+    let mut g = c.benchmark_group("engine/sadd-alternating");
+
+    for depth in [1usize, 16, 64] {
+        let mut stream = Vec::new();
+        for i in 0..depth {
+            stream.extend_from_slice(if i % 2 == 0 { &hot } else { &alt });
+        }
+        g.throughput(Throughput::Elements(depth as u64));
+        g.bench_function(format!("p{depth}"), |b| {
+            let (mut r, conn, mut batch) = ready(Null::default());
+            fill_both(&mut r, conn);
+            b.iter(|| {
+                r.engine_mut().feed(conn, black_box(&stream));
+                black_box(pump(&mut r, &mut batch))
+            });
+        });
+    }
+
+    g.finish();
 }
 
 /// The draw, which is the read half of the same shape.
@@ -215,6 +273,7 @@ criterion_group!(
     bench_get,
     bench_incr,
     bench_sadd,
+    bench_sadd_alternating,
     bench_srandmember,
     bench_fanout
 );
