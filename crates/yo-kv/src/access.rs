@@ -268,6 +268,17 @@ impl Policy {
         matches!(self, Policy::AllKeysLrm | Policy::VolatileLrm)
     }
 
+    /// Whether a victim is picked by a fair draw and nothing else.
+    ///
+    /// The pair that has no ordering to approximate, which is why the eviction
+    /// pool skips them: keeping candidates between rounds is how a sampled
+    /// policy gets closer to the true worst key, and under these two every
+    /// eligible key already is the answer.
+    #[must_use]
+    pub const fn is_random(self) -> bool {
+        matches!(self, Policy::AllKeysRandom | Policy::VolatileRandom)
+    }
+
     /// Whether the access field holds a clock, which is the question `OBJECT
     /// IDLETIME` asks before it answers.
     ///
