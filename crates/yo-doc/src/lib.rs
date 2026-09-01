@@ -1,9 +1,12 @@
-//! YOJB: the binary JSON encoding documents are stored in (`09` section 2).
+//! The document model: YOJB, the encoding, and the collection it is stored in
+//! (`09` sections 2 and 4).
 //!
 //! A document database is a binary JSON encoding plus secondary indexes over
-//! paths into it. This crate is the first half. It is JSONB in spirit, which is
-//! Postgres and CockroachDB in spirit, with the differences that matter for an
-//! embedded engine written down below.
+//! paths into it. [`Value`] and [`Builder`] are the encoding, which is JSONB in
+//! spirit, which is Postgres and CockroachDB in spirit, with the differences
+//! that matter for an embedded engine written down below. [`Docs`] is the
+//! collection: documents by id, with the [`Keys`] table that turns every object
+//! key into two bytes. The indexes over paths come next.
 //!
 //! ```
 //! use yo_doc::{Builder, Kind, Value};
@@ -43,8 +46,8 @@
 //! rather than bytes. Document collections repeat the same twenty field names
 //! on every document, so this is worth roughly forty percent of a collection's
 //! size, and it turns a member lookup from a comparison of bytes into a
-//! comparison of integers. [`Builder::begin_object_interned`] writes one; the
-//! table that hands out the ids belongs to the collection and not here.
+//! comparison of integers. [`Keys`] is the table that hands out the ids and
+//! [`Docs::put`] is what applies it.
 //!
 //! **A container is capped at 16.7 M elements**, because the count shares a
 //! word with the kind and the flags. That is one word of overhead per value
@@ -62,18 +65,27 @@
 //! typed API never parses JSON, it serializes a struct straight into this
 //! encoding, and text parsing is for `JSON.SET` and for bulk import.
 //!
-//! Collections, indexes and the intern table. Those are the second half of the
-//! document model and they sit on top of this.
+//! Path indexes. A collection stores documents and reads one back by id; a
+//! query that finds documents by what is in them needs an index per indexed
+//! path, and those are element tables too.
+//!
+//! The vector index, which is `10`, and the typed `Docs<T>` surface with its
+//! derive, which is `15`.
 
 #![deny(missing_docs)]
 
 mod build;
+mod docs;
 mod head;
+mod keys;
 pub mod layout;
 mod path;
 mod read;
 
 pub use build::Builder;
+pub use docs::{Doc, DocElems, DocMembers, Docs};
 pub use head::{COUNT_MAX, DEPTH_MAX, Kind};
+pub use keys::{KEYS_MAX, Keys};
 pub use path::{Step, Steps};
 pub use read::{Elems, Members, Value, key_order};
+pub use yo_kv::Cursor;
