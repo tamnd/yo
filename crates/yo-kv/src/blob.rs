@@ -21,10 +21,11 @@
 //!
 //! [`Blob::push`] hands back an offset and nothing else, and [`Blob::read`] takes
 //! an offset and a length. The reference is the caller's to shape, which is not
-//! ceremony: [`crate::Elements`] keeps a name's length in sixteen bits so a row
-//! stays twelve bytes, and a hash value cannot be capped at sixty four kilobytes
-//! because Redis lets one be half a gigabyte. One blob, two reference layouts,
-//! and neither of them is a compromise with the other.
+//! ceremony: [`crate::Elements`] keeps a name's length in one byte so a row stays
+//! eight, and a hash value cannot be capped at two hundred and fifty five bytes
+//! or at sixty four kilobytes either, because Redis lets one be half a gigabyte.
+//! One blob, two reference layouts, and neither of them is a compromise with the
+//! other.
 //!
 //! [`Span`] is here for the callers that have no reason to pack it tighter.
 //!
@@ -248,6 +249,23 @@ impl Keep<'_> {
     pub fn moved_span(&mut self, span: &mut Span) {
         let len = span.len as usize;
         self.moved(&mut span.at, len);
+    }
+
+    /// The `len` bytes at `at`, as they were before the rebuild started.
+    ///
+    /// A reference whose length is written into the bytes rather than held
+    /// beside them has to read those bytes to know how many to carry over, and
+    /// the blob it would normally read from is half moved by the time it is
+    /// asked. This is the old copy, which is still whole.
+    ///
+    /// # Panics
+    ///
+    /// If they are not inside the old blob.
+    #[inline]
+    #[must_use]
+    pub fn peek(&self, at: u32, len: usize) -> &[u8] {
+        let at = at as usize;
+        &self.old[at..at + len]
     }
 }
 

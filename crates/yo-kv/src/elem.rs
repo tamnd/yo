@@ -55,9 +55,10 @@
 //! structure it replaced.
 //!
 //! Neither the removal nor the shift reads a name, because every row carries the
-//! slot it wanted. Four bytes a row for that, and it took a pop at a hundred
-//! thousand members from 123 ns to 25.7 ns, which is the difference between a
-//! random trip into the name blob per slot examined and no trip at all.
+//! slot it wanted. Three bytes a row for that, packed in beside the name length,
+//! and it took a pop at a hundred thousand members from 123 ns to 25.7 ns, which
+//! is the difference between a random trip into the name blob per slot examined
+//! and no trip at all.
 //!
 //! # Names
 //!
@@ -91,8 +92,8 @@ pub const MAX_ROWS: usize = 0x00FF_FFFE;
 ///
 /// Redis has no limit on a field name below the 512 MiB it puts on everything.
 /// A name that long is a value that has been put in the wrong place, and holding
-/// the ceiling at what fits in sixteen bits is what keeps a row at twelve bytes
-/// plus its payload.
+/// the ceiling at what fits in sixteen bits is what lets a long name carry its
+/// own length in two bytes rather than four.
 pub const NAME_MAX: usize = u16::MAX as usize;
 
 /// An empty slot. No live slot can hold this, because a live row index is at
@@ -110,27 +111,75 @@ const LOAD_DEN: usize = 4;
 /// The smallest slot array, which is one cache line of slots.
 const MIN_SLOTS: usize = 16;
 
-/// Where a name sits in the blob.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct NameRef {
-    at: u32,
-    len: u16,
-}
+/// The shortest name that keeps its length in the blob instead of in its row.
+///
+/// A row holds the length in one byte, so a name this long or longer writes its
+/// real length into the two bytes ahead of it and puts this sentinel in the
+/// byte. Nothing on the probe path pays much for that: the prefix sits in the
+/// cache line the name comparison was about to read anyway, and the branch is a
+/// comparison against a constant that goes the same way on every element of
+/// every collection anyone has ever measured.
+const LONG_NAME: usize = 255;
+
+/// How many bytes a long name's length prefix takes.
+const PREFIX: usize = 2;
+
+/// How many bits of the home slot a row keeps.
+const HOME_BITS: u32 = 24;
 
 /// One element: where its name is and where it wanted to sit.
 ///
-/// `home` is the low 32 bits of the name's hash, which is where the slot for
-/// this row would sit in an empty table. Four bytes to hold it, and what they
-/// buy is that a removal and a growth never read a name and never hash one. Both
-/// of those walk slots and ask each one where it wanted to be, and asking the
-/// blob instead means a random cache miss per slot examined, on the two
-/// operations where there is no reply to send that would have paid for it.
+/// Eight bytes, and the packing is what makes it eight rather than twelve. The
+/// blob offset needs a whole `u32` because a large collection's names run to
+/// megabytes. The other four hold the name's length in the low byte and the home
+/// slot in the twenty four above it.
+///
+/// The home slot is where this row would sit in an empty table, and what it buys
+/// is that a removal and a growth never read a name and never hash one. Both of
+/// those walk slots and ask each one where it wanted to be, and asking the blob
+/// instead means a random cache miss per slot examined, on the two operations
+/// where there is no reply to send that would have paid for it.
+///
+/// Twenty four bits of it is every bit that matters until the slot array passes
+/// sixteen million, which is a table holding twelve million elements. Past there
+/// [`Elements::home_of`] hashes the name instead, and that is the right place for
+/// the cost to land: the partitioned band splits a collection at a quarter of a
+/// million, so a table that large is one partition of a set with two hundred
+/// million members in it.
 ///
 /// The payload is deliberately not in here. See [`Elements::vals`].
 #[derive(Debug, Clone, Copy)]
 struct Row {
-    name: NameRef,
-    home: u32,
+    /// Where the name starts in the blob, or where its length prefix does.
+    at: u32,
+    /// The name's length in the low eight bits, its home slot in the top
+    /// twenty four.
+    packed: u32,
+}
+
+impl Row {
+    /// The row for a name of `len` bytes that has just been pushed at `at`.
+    #[inline]
+    fn new(at: u32, len: usize, h: u64) -> Row {
+        let len = u32::try_from(len.min(LONG_NAME)).expect("LONG_NAME is one byte");
+        Row {
+            at,
+            packed: ((h as u32 & ((1 << HOME_BITS) - 1)) << 8) | len,
+        }
+    }
+
+    /// The length byte, which is [`LONG_NAME`] when the real length is in the
+    /// blob.
+    #[inline]
+    const fn len_byte(self) -> usize {
+        (self.packed & 0xFF) as usize
+    }
+
+    /// The low [`HOME_BITS`] of the name's hash.
+    #[inline]
+    const fn home(self) -> usize {
+        (self.packed >> 8) as usize
+    }
 }
 
 /// An open addressed table of elements, keyed by name, dense in insertion order.
@@ -158,10 +207,10 @@ pub struct Elements<V> {
     vals: Vec<V>,
     /// Every live name, back to back, and some dead ones.
     ///
-    /// The length stays in [`NameRef`] rather than in a [`crate::blob::Span`],
-    /// because sixteen bits of it is what keeps a row at twelve bytes and a name
-    /// that needs more than sixteen bits is a value someone put in the wrong
-    /// place.
+    /// The length stays in the row rather than in a [`crate::blob::Span`],
+    /// because one byte of it is what keeps a row at eight bytes, and the names
+    /// that do not fit in one byte carry their own length in the blob instead of
+    /// widening every row that does.
     names: Blob,
 }
 
@@ -348,11 +397,8 @@ impl<V: Copy> Elements<V> {
         }
         self.reserve_one();
         let at = u32::try_from(self.rows.len()).expect("MAX_ROWS is under u32::MAX");
-        let name_ref = self.push_name(name);
-        self.rows.push(Row {
-            name: name_ref,
-            home: h as u32,
-        });
+        let name_at = self.push_name(name);
+        self.rows.push(Row::new(name_at, name.len(), h));
         self.vals.push(value);
         self.put_slot(h, at);
         Ok(None)
@@ -590,14 +636,14 @@ impl<V: Copy> Elements<V> {
             // The last row moves into the hole, so the slot that pointed at the
             // end now has to point here. One extra probe, which is what a draw
             // being a single index costs.
-            let moved = self.rows[last].home;
-            self.repoint(moved, last, at);
+            self.repoint(last, at);
             self.rows.swap(at, last);
             self.vals.swap(at, last);
         }
         let row = self.rows.pop().expect("the table was not empty");
         let value = self.vals.pop().expect("a payload per row");
-        self.names.release(row.name.len as usize);
+        let gone = self.footprint(&row);
+        self.names.release(gone);
         self.maybe_compact_names();
         value
     }
@@ -610,7 +656,7 @@ impl<V: Copy> Elements<V> {
     /// because `SPOP` in a loop deletes every element a set ever had.
     fn clear_slot(&mut self, row: usize) {
         let mask = self.slots.len() - 1;
-        let mut at = (self.rows[row].home as usize) & mask;
+        let mut at = self.home_of(row, mask);
         loop {
             let slot = self.slots[at];
             debug_assert!(slot != EMPTY, "the row being removed has a slot");
@@ -628,7 +674,7 @@ impl<V: Copy> Elements<V> {
         while self.slots[scan] != EMPTY {
             let slot = self.slots[scan];
             let idx = (slot & 0x00FF_FFFF) as usize;
-            let home = (self.rows[idx].home as usize) & mask;
+            let home = self.home_of(idx, mask);
             // True when the slot's home is at or behind the hole, meaning it
             // probed over the hole to get here and would not be found now.
             if (scan.wrapping_sub(home) & mask) >= (scan.wrapping_sub(hole) & mask) {
@@ -641,9 +687,9 @@ impl<V: Copy> Elements<V> {
     }
 
     /// Point the slot holding `from` at `to` instead.
-    fn repoint(&mut self, home: u32, from: usize, to: usize) {
+    fn repoint(&mut self, from: usize, to: usize) {
         let mask = self.slots.len() - 1;
-        let mut at = (home as usize) & mask;
+        let mut at = self.home_of(from, mask);
         loop {
             let slot = self.slots[at];
             debug_assert!(slot != EMPTY, "the row being moved has a slot");
@@ -687,7 +733,7 @@ impl<V: Copy> Elements<V> {
                 continue;
             }
             let row = (slot & 0x00FF_FFFF) as usize;
-            let mut at = (self.rows[row].home as usize) & mask;
+            let mut at = self.home_of(row, mask);
             while self.slots[at] != EMPTY {
                 at = (at + 1) & mask;
             }
@@ -695,18 +741,83 @@ impl<V: Copy> Elements<V> {
         }
     }
 
-    /// Append a name to the blob.
-    fn push_name(&mut self, name: &[u8]) -> NameRef {
-        NameRef {
-            at: self.names.push(name),
-            len: u16::try_from(name.len()).expect("the caller checked NAME_MAX"),
+    /// Where the row at `idx` wanted to sit, in a table with this `mask`.
+    ///
+    /// One comparison against a number the caller already had in a register, and
+    /// then a field of a row it was going to read anyway. The other arm is for a
+    /// table with more slots than a row has bits to name one, which costs a hash
+    /// and a trip into the blob and is the reason the row is eight bytes rather
+    /// than twelve for everybody else.
+    ///
+    /// The arms are split and the cold one is kept out of line because this is
+    /// called once per slot of the run behind a removal. Left as one function it
+    /// has a hash call in it, the call stops it being inlined into that loop, and
+    /// a pop of a thousand members measured 52 percent slower.
+    #[inline(always)]
+    fn home_of(&self, idx: usize, mask: usize) -> usize {
+        let row = self.rows[idx];
+        if mask < 1 << HOME_BITS {
+            row.home() & mask
+        } else {
+            self.home_by_hash(&row, mask)
         }
     }
 
+    /// Where a row wanted to sit in a table too large for the packed bits.
+    #[cold]
+    #[inline(never)]
+    fn home_by_hash(&self, row: &Row, mask: usize) -> usize {
+        hash(self.name_of(row)) as usize & mask
+    }
+
+    /// Append a name to the blob and say where it went.
+    ///
+    /// A long one goes in behind its own length, because a row has one byte to
+    /// say how long a name is and that is not enough for this one.
+    fn push_name(&mut self, name: &[u8]) -> u32 {
+        if name.len() < LONG_NAME {
+            return self.names.push(name);
+        }
+        let len = u16::try_from(name.len()).expect("the caller checked NAME_MAX");
+        let at = self.names.push(&len.to_le_bytes());
+        self.names.push(name);
+        at
+    }
+
     /// The bytes of one row's name.
-    #[inline]
+    #[inline(always)]
     fn name_of(&self, row: &Row) -> &[u8] {
-        self.names.read(row.name.at, row.name.len as usize)
+        let len = row.len_byte();
+        if len < LONG_NAME {
+            self.names.read(row.at, len)
+        } else {
+            self.long_name(row.at)
+        }
+    }
+
+    /// The bytes of a name too long to measure in a row.
+    #[cold]
+    #[inline(never)]
+    fn long_name(&self, at: u32) -> &[u8] {
+        self.names.read(at + PREFIX as u32, self.long_len(at))
+    }
+
+    /// The real length of a long name, from the bytes written ahead of it.
+    #[inline]
+    fn long_len(&self, at: u32) -> usize {
+        let head = self.names.read(at, PREFIX);
+        usize::from(u16::from_le_bytes([head[0], head[1]]))
+    }
+
+    /// How many blob bytes one row's name occupies, its prefix included.
+    #[inline(always)]
+    fn footprint(&self, row: &Row) -> usize {
+        let len = row.len_byte();
+        if len < LONG_NAME {
+            len
+        } else {
+            PREFIX + self.long_len(row.at)
+        }
     }
 
     /// Give the dead name bytes back once there are more of them than live ones.
@@ -720,7 +831,17 @@ impl<V: Copy> Elements<V> {
         let rows = &mut self.rows;
         self.names.compact(|keep| {
             for row in rows.iter_mut() {
-                keep.moved(&mut row.name.at, row.name.len as usize);
+                let len = row.len_byte();
+                let take = if len < LONG_NAME {
+                    len
+                } else {
+                    // The length is in the bytes rather than in the row, and the
+                    // blob this would normally read it from is half rebuilt, so
+                    // it comes off the old copy the rebuild is reading from.
+                    let head = keep.peek(row.at, PREFIX);
+                    PREFIX + usize::from(u16::from_le_bytes([head[0], head[1]]))
+                };
+                keep.moved(&mut row.at, take);
             }
         });
     }
@@ -932,6 +1053,85 @@ mod tests {
         assert_eq!(s.insert(&ok, ()), Ok(None));
     }
 
+    /// A row says how long a name is in one byte, and a name that does not fit
+    /// in one byte keeps its length in the blob instead. Everything either side
+    /// of that line has to read back as what went in, and the line itself is
+    /// where an off by one lives, so this walks across it.
+    #[test]
+    fn a_name_too_long_to_measure_in_a_row_reads_back_whole() {
+        let lens = [0, 1, 2, 253, 254, 255, 256, 257, 1000, NAME_MAX];
+        // Distinct bytes per name as well as distinct lengths, so a read that
+        // lands on the wrong name is not hidden by every name being x's.
+        let names: Vec<Vec<u8>> = lens
+            .iter()
+            .enumerate()
+            .map(|(i, &n)| vec![b'a' + u8::try_from(i).expect("under 26"); n])
+            .collect();
+
+        let mut s = Set::new();
+        for name in &names {
+            assert_eq!(s.insert(name, ()), Ok(None), "length {}", name.len());
+        }
+        assert_eq!(s.len(), names.len(), "two of them collided into one row");
+        for name in &names {
+            assert!(s.contains(name), "length {} went missing", name.len());
+        }
+        let mut back: Vec<Vec<u8>> = s.iter().map(|(n, ())| n.to_vec()).collect();
+        back.sort();
+        let mut want = names.clone();
+        want.sort();
+        assert_eq!(back, want, "a walk gave back different bytes");
+
+        // And out again, one at a time, because a removal reads the length to
+        // give the blob its bytes back and moves the last row into the hole.
+        for (i, name) in names.iter().enumerate() {
+            assert_eq!(s.remove(name), Some(()), "length {}", name.len());
+            for later in &names[i + 1..] {
+                assert!(s.contains(later), "length {} lost", later.len());
+            }
+        }
+        assert!(s.is_empty());
+    }
+
+    /// The same names through a blob rebuild, which is the one place that has to
+    /// read a length out of bytes that are being moved underneath it.
+    #[test]
+    fn long_names_survive_the_blob_giving_its_dead_bytes_back() {
+        let mut s = Set::new();
+        let names: Vec<Vec<u8>> = (0..200u32)
+            .map(|i| format!("{i:0>500}").into_bytes())
+            .collect();
+        for name in &names {
+            s.insert(name, ()).expect("room");
+        }
+        let keep: Vec<Vec<u8>> = (0..100u32)
+            .map(|i| format!("keep-{i:0>500}").into_bytes())
+            .collect();
+        for name in &keep {
+            s.insert(name, ()).expect("room");
+        }
+        let before = s.name_bytes();
+        // A hundred kilobytes of dead names against fifty of live ones, which is
+        // over the floor and past the ratio, so the removals rebuild.
+        for name in &names {
+            assert_eq!(s.remove(name), Some(()));
+        }
+        assert!(
+            s.name_bytes() * 2 < before,
+            "the rebuild never ran, the blob went from {before} to {}",
+            s.name_bytes()
+        );
+        assert_eq!(s.len(), keep.len());
+        for name in &keep {
+            assert!(s.contains(name), "a long name moved wrongly");
+        }
+        let mut back: Vec<Vec<u8>> = s.iter().map(|(n, ())| n.to_vec()).collect();
+        back.sort();
+        let mut want = keep.clone();
+        want.sort();
+        assert_eq!(back, want);
+    }
+
     /// Dead name bytes are given back once there are more of them than live
     /// ones, and everything still reads correctly on the other side of it.
     #[test]
@@ -1105,21 +1305,20 @@ mod tests {
     }
 
     /// The row is the thing there are a million of, so its size is a decision
-    /// and not an accident. Six bytes of name reference and four of home slot,
-    /// with two of padding that the name offset's alignment forces and nothing
-    /// can be done about.
+    /// and not an accident. Four bytes of blob offset, one of name length and
+    /// three of home slot, with no padding anywhere in it.
     ///
     /// The payload is in an array of its own, so a score costs its eight bytes
     /// and not twelve. That is the whole reason for the split and it is worth a
     /// test, because putting the score back in the row would compile.
     #[test]
-    fn a_row_is_twelve_bytes_whatever_the_collection_stores() {
-        assert_eq!(size_of::<Row>(), 12);
-        assert_eq!(size_of::<Row>() + size_of::<()>(), 12, "a set member");
-        assert_eq!(size_of::<Row>() + size_of::<f64>(), 20, "a sorted set");
+    fn a_row_is_eight_bytes_whatever_the_collection_stores() {
+        assert_eq!(size_of::<Row>(), 8);
+        assert_eq!(size_of::<Row>() + size_of::<()>(), 8, "a set member");
+        assert_eq!(size_of::<Row>() + size_of::<f64>(), 16, "a sorted set");
         assert_eq!(
             size_of::<Row>() + size_of::<crate::blob::Span>(),
-            20,
+            16,
             "a hash field"
         );
     }
