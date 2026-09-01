@@ -5,7 +5,10 @@
 //! it: one element table per indexed path, keyed by the value at that path,
 //! holding the ids of the documents that have it.
 //!
-//! An index answers equality, and an ordered one answers ranges as well.
+//! An index answers equality, and an ordered one answers ranges as well. The
+//! array and text kinds file a document under more than one key at a time,
+//! every element of an array or every word of a string, and are asked the same
+//! question an equality index is.
 //!
 //! ```
 //! use std::ops::Bound;
@@ -14,13 +17,20 @@
 //! let mut docs = Docs::new();
 //! docs.create_index("$.status")?;
 //! docs.create_ordered_index("$.price")?;
-//! for (id, status, price) in [("a", "open", 30), ("b", "shut", 10), ("c", "open", 20)] {
+//! docs.create_text_index("$.name")?;
+//! for (id, status, price, name) in [
+//!     ("a", "open", 30, "A red bicycle"),
+//!     ("b", "shut", 10, "a blue kite"),
+//!     ("c", "open", 20, "A red kite"),
+//! ] {
 //!     let mut b = Builder::new();
 //!     b.begin_object()?;
 //!     b.key(b"status")?;
 //!     b.text(status)?;
 //!     b.key(b"price")?;
 //!     b.int(price)?;
+//!     b.key(b"name")?;
+//!     b.text(name)?;
 //!     b.end_object()?;
 //!     let bytes = b.finish()?.to_vec();
 //!     docs.put_bytes(id.as_bytes(), &bytes)?;
@@ -37,6 +47,13 @@
 //!     upto.push(id.to_vec())
 //! })?;
 //! assert_eq!(upto, [b"b".to_vec(), b"c".to_vec()]);
+//!
+//! // One word out of the name, with the case folded on both sides.
+//! let red = Key::word("RED").expect("one word");
+//! let mut kites = Vec::new();
+//! docs.find("$.name", &red, |id, _| kites.push(id.to_vec()))?;
+//! kites.sort();
+//! assert_eq!(kites, [b"a".to_vec(), b"c".to_vec()]);
 //! # Ok::<(), yo_common::Error>(())
 //! ```
 //!
@@ -96,13 +113,37 @@
 //! type, and a total order across types has to pick an arbitrary answer to
 //! whether a string is above or below a number.
 //!
+//! # More than one key at a time
+//!
+//! An array index files a document under every element of the array at the
+//! path, and a text index under every word of the string. Both answer the same
+//! question an equality index does, so [`PathIndex::find`] and
+//! [`PathIndex::count`] do not know which kind they are on, and the only thing
+//! that changes is how many keys a document has.
+//!
+//! A scalar at the path of an array index is an array of one. A collection
+//! where some documents carry a list of tags and some carry a single tag is a
+//! real collection, and an index that filed one and not the other would miss
+//! documents for a reason nobody can see.
+//!
+//! A text index folds case, so a search has to fold it too, and [`Key::word`]
+//! is what does that on the query side. Everything that is not a letter or a
+//! digit is a separator. That is a word index and not a search engine: there is
+//! no ranking, no stemming and no phrase matching, and the ranking that belongs
+//! on top of it is `10`. Splitting on bytes is also wrong for a language that
+//! does not put spaces between words, and the answer there is a real tokeniser
+//! rather than a rule here that is subtly wrong in another way.
+//!
 //! # What is not indexed
 //!
 //! A path that lands on an object or an array puts nothing in an equality
-//! index, and a document that has no value at the path puts nothing in either.
-//! Both are absences rather than errors: an equality index answers which
-//! documents have a given scalar there, and neither of those documents does.
-//! Indexing each element of an array is the separate `array` kind.
+//! index, and a document that has no value at the path puts nothing in any
+//! kind. Both are absences rather than errors: an index answers which documents
+//! have a given value there, and neither of those documents does.
+//!
+//! A path that lands on something other than a string puts nothing in a text
+//! index. A number has no words in it, and filing `7` under the key `7` in a
+//! text index would make one kind quietly behave like another.
 
 use core::cmp::Ordering;
 use core::ops::Bound;
@@ -201,6 +242,25 @@ impl Key {
             k.push(b);
         }
         Key(k)
+    }
+
+    /// The key one word is filed under in a text index, or `None` if this is
+    /// not one word.
+    ///
+    /// A search against a text index goes through this rather than
+    /// [`Key::text`], because a text index folds case when it files a document
+    /// and a search that does not fold it finds nothing and says nothing about
+    /// why. Anything that is not letters and digits is a separator, so a phrase
+    /// is two words and answers `None`: matching one is a search this index
+    /// cannot answer on its own, rather than a search for the first word.
+    #[must_use]
+    pub fn word(v: &str) -> Option<Key> {
+        let mut rest = v.as_bytes();
+        let word = next_word(&mut rest)?;
+        if next_word(&mut rest).is_some() {
+            return None;
+        }
+        Some(fold(word))
     }
 
     /// The key for a value found in a document, or `None` if it is a container
@@ -302,7 +362,7 @@ fn whole(v: f64) -> Option<i64> {
     if n as f64 == v { Some(n) } else { None }
 }
 
-/// What an index can be asked.
+/// What an index can be asked, and how many keys a document gets at its path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IndexKind {
     /// One value at a time. A table from key to posting list and nothing else.
@@ -310,6 +370,137 @@ pub enum IndexKind {
     /// One value at a time, or every value between two of them. The same table
     /// with a counted B+ tree over its rows.
     Ordered,
+    /// One element of an array at a time. A document with `["red", "blue"]` at
+    /// the path is filed under both, so a search for either finds it.
+    Array,
+    /// One word of a string at a time, folded to lower case. A document with
+    /// `"A red bicycle"` at the path is filed under `a`, `red` and `bicycle`.
+    Text,
+}
+
+impl IndexKind {
+    /// Whether this kind can be asked for a range as well as for a value.
+    #[must_use]
+    pub fn is_ordered(self) -> bool {
+        self == IndexKind::Ordered
+    }
+
+    /// Whether a document can be filed under more than one key at a time.
+    #[must_use]
+    pub fn is_multi(self) -> bool {
+        matches!(self, IndexKind::Array | IndexKind::Text)
+    }
+}
+
+/// A value at an indexed path that cannot be a key, because it is longer than
+/// [`KEY_MAX`].
+///
+/// Carried back rather than turned into an error here, so the layer that knows
+/// which path and which document it was can say so.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct TooLong;
+
+/// Append every key `at` files under, as a list of one length byte pair and
+/// then that many bytes.
+///
+/// Length prefixed rather than one buffer per key, because an array index files
+/// a document under as many keys as the array is long and a write is not
+/// allowed to allocate per element.
+///
+/// A path that lands on nothing this kind can use puts nothing in the list.
+/// That is an absence and not an error: an index answers which documents have a
+/// given value at the path, and a document with an object there does not have
+/// one.
+pub(crate) fn keys_at(
+    kind: IndexKind,
+    at: Value<'_>,
+    out: &mut Vec<u8>,
+) -> core::result::Result<(), TooLong> {
+    match kind {
+        IndexKind::Equality | IndexKind::Ordered => {
+            if let Some(key) = Key::of(at) {
+                push_key(&key, out)?;
+            }
+        }
+        IndexKind::Array => match at.kind() {
+            // A scalar at the path is an array of one. A caller that files
+            // `["red"]` on one document and `"red"` on the next means the same
+            // thing by both, and an index that disagreed would be a query that
+            // misses documents for a reason nobody can see.
+            Kind::Array => {
+                for elem in at.iter() {
+                    if let Some(key) = Key::of(elem) {
+                        push_key(&key, out)?;
+                    }
+                }
+            }
+            Kind::Object => {}
+            _ => {
+                if let Some(key) = Key::of(at) {
+                    push_key(&key, out)?;
+                }
+            }
+        },
+        IndexKind::Text => {
+            if let Some(text) = at.text_bytes() {
+                let mut rest = text;
+                while let Some(word) = next_word(&mut rest) {
+                    push_key(&fold(word), out)?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Put one key on the end of a key list.
+fn push_key(key: &Key, out: &mut Vec<u8>) -> core::result::Result<(), TooLong> {
+    let bytes = key.as_bytes();
+    if key.is_too_long() {
+        return Err(TooLong);
+    }
+    // The length fits two bytes because KEY_MAX does, and the check above ran.
+    let n = bytes.len() as u16;
+    out.extend_from_slice(&n.to_le_bytes());
+    out.extend_from_slice(bytes);
+    Ok(())
+}
+
+/// Walk a key list back out again.
+pub(crate) fn each_key(mut list: &[u8], mut f: impl FnMut(&[u8])) {
+    while list.len() >= 2 {
+        let n = usize::from(u16::from_le_bytes([list[0], list[1]]));
+        let Some(key) = list.get(2..2 + n) else {
+            return;
+        };
+        f(key);
+        list = &list[2 + n..];
+    }
+}
+
+/// The next run of letters and digits in `rest`, with `rest` left after it.
+///
+/// Everything else is a separator, so punctuation, spaces and the bytes of a
+/// multi byte character all split. Splitting inside a word of a language that
+/// does not use spaces is wrong, and a real tokeniser is the answer rather than
+/// a rule here that is subtly wrong in a different way, so `10` will bring one.
+/// For the ASCII text that gets a text index today this is what a caller means.
+/// One word as the key a text index files it under, folded to lower case.
+fn fold(word: &[u8]) -> Key {
+    Key(Small::collect(
+        core::iter::once(TAG_TEXT).chain(word.iter().map(u8::to_ascii_lowercase)),
+    ))
+}
+
+fn next_word<'a>(rest: &mut &'a [u8]) -> Option<&'a [u8]> {
+    let start = rest.iter().position(|b| b.is_ascii_alphanumeric())?;
+    let after = rest[start..]
+        .iter()
+        .position(|b| !b.is_ascii_alphanumeric())
+        .map_or(rest.len(), |n| start + n);
+    let word = &rest[start..after];
+    *rest = &rest[after..];
+    Some(word)
 }
 
 /// One index, over one path.
@@ -319,6 +510,8 @@ pub struct PathIndex {
     /// lookup. Parsing is a scan of a dozen bytes and it saves an owned step
     /// type that would have to be kept in step with [`crate::Steps`].
     path: Box<[u8]>,
+    /// What this index can be asked and how many keys a document gets.
+    kind: IndexKind,
     /// The key to the slab slot its posting list sits in.
     keys: Elements<u32>,
     /// The rows of `keys` in key order, for an ordered index, and nothing at all
@@ -342,11 +535,9 @@ impl PathIndex {
     pub(crate) fn new(path: &[u8], kind: IndexKind) -> PathIndex {
         PathIndex {
             path: path.into(),
+            kind,
             keys: Elements::new(),
-            order: match kind {
-                IndexKind::Equality => None,
-                IndexKind::Ordered => Some(Rank::new()),
-            },
+            order: kind.is_ordered().then(Rank::new),
             posts: Slab::new(),
             postings: 0,
         }
@@ -361,11 +552,16 @@ impl PathIndex {
     /// What this index can be asked.
     #[must_use]
     pub fn kind(&self) -> IndexKind {
-        if self.order.is_some() {
-            IndexKind::Ordered
-        } else {
-            IndexKind::Equality
-        }
+        self.kind
+    }
+
+    /// Every key `at` files under in this index.
+    pub(crate) fn keys_at(
+        &self,
+        at: Value<'_>,
+        out: &mut Vec<u8>,
+    ) -> core::result::Result<(), TooLong> {
+        keys_at(self.kind, at, out)
     }
 
     /// How many distinct values are filed.
@@ -689,6 +885,100 @@ pub(crate) fn each_id(set: &Set, mut f: impl FnMut(&[u8])) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The keys a kind takes from one value, as printable strings.
+    fn taken(kind: IndexKind, build: impl FnOnce(&mut crate::Builder)) -> Vec<String> {
+        let mut b = crate::Builder::new();
+        build(&mut b);
+        let bytes = b.finish().expect("built").to_vec();
+        let value = Value::new(&bytes).expect("readable");
+        let mut list = Vec::new();
+        keys_at(kind, value, &mut list).expect("short enough");
+        let mut out = Vec::new();
+        each_key(&list, |key| {
+            out.push(format!("{:?}", Key(Small::collect(key.iter().copied()))))
+        });
+        out
+    }
+
+    #[test]
+    fn an_array_index_takes_one_key_per_element() {
+        let keys = taken(IndexKind::Array, |b| {
+            b.begin_array().expect("open");
+            b.text("red").expect("value");
+            b.int(7).expect("value");
+            b.begin_object().expect("open");
+            b.end_object().expect("close");
+            b.end_array().expect("close");
+        });
+        assert_eq!(keys.len(), 2, "the object inside is not a key: {keys:?}");
+        assert_eq!(keys[0], "\"red\"");
+
+        // A scalar is a list of one, and an object is a list of none.
+        assert_eq!(
+            taken(IndexKind::Array, |b| b.text("red").expect("v")).len(),
+            1
+        );
+        assert_eq!(
+            taken(IndexKind::Array, |b| {
+                b.begin_object().expect("open");
+                b.end_object().expect("close");
+            })
+            .len(),
+            0
+        );
+    }
+
+    #[test]
+    fn a_text_index_splits_on_everything_that_is_not_a_letter_or_a_digit() {
+        let keys = taken(IndexKind::Text, |b| {
+            b.text("  The RED car, model 3! ").expect("value")
+        });
+        assert_eq!(
+            keys,
+            ["\"the\"", "\"red\"", "\"car\"", "\"model\"", "\"3\""]
+        );
+
+        assert!(taken(IndexKind::Text, |b| b.text("!!! ...").expect("v")).is_empty());
+        assert!(taken(IndexKind::Text, |b| b.int(7).expect("v")).is_empty());
+    }
+
+    #[test]
+    fn a_word_key_is_what_a_text_index_filed_and_a_phrase_is_not_one() {
+        assert_eq!(Key::word("RED"), Key::word("red"));
+        assert_eq!(Key::word("red!"), Key::word("red"));
+        assert!(Key::word("red car").is_none(), "a phrase is two words");
+        assert!(Key::word("").is_none());
+        assert!(Key::word("!!!").is_none());
+        assert_eq!(
+            Key::word("red").expect("a word"),
+            Key::text("red"),
+            "a word that needs no folding is the string key, and there is no \
+             second text tag to keep them apart"
+        );
+        assert_ne!(Key::word("RED").expect("a word"), Key::text("RED"));
+    }
+
+    #[test]
+    fn a_key_list_reads_back_exactly_what_went_into_it() {
+        let mut list = Vec::new();
+        push_key(&Key::text("red"), &mut list).expect("short");
+        push_key(&Key::int(7), &mut list).expect("short");
+        push_key(&Key::null(), &mut list).expect("short");
+        let mut out = Vec::new();
+        each_key(&list, |key| out.push(key.to_vec()));
+        assert_eq!(
+            out,
+            [
+                Key::text("red").as_bytes().to_vec(),
+                Key::int(7).as_bytes().to_vec(),
+                Key::null().as_bytes().to_vec(),
+            ]
+        );
+
+        let long = "x".repeat(KEY_MAX);
+        assert!(push_key(&Key::text(&long), &mut list).is_err());
+    }
 
     #[test]
     fn a_number_and_the_string_of_it_are_different_keys() {
