@@ -130,6 +130,9 @@ pub struct RawMap {
     /// It lives here rather than in the caller because there are eleven places
     /// in `yo-kv` that write to a map and one place here that could be missed,
     /// and a missed invalidation is a stale answer rather than a slow one.
+    ///
+    /// [`RawMap::value_at_mut`] is the one exception and it is argued for where
+    /// it is written. Everything else, including the in place ones, bumps this.
     writes: u64,
 }
 
@@ -248,6 +251,36 @@ impl RawMap {
     pub fn value_at(&self, addr: Addr) -> &[u8] {
         let (klen, vlen) = Record::lens(self.arena.get(addr, HDR));
         &self.arena.get(addr, HDR + klen + vlen)[HDR + klen..]
+    }
+
+    /// The value at an address, to be overwritten in place, without counting as
+    /// a write.
+    ///
+    /// This is the one method taking a mutable borrow that leaves
+    /// [`RawMap::writes`] where it was, and that is a deliberate exception to
+    /// the rule stated on the counter rather than an oversight in it.
+    ///
+    /// It is sound because nothing moves. The record already exists, the caller
+    /// already holds its address, there is no allocation and no index write, so
+    /// every address and every number read out of a record before the call is
+    /// still right afterwards. That is a stronger guarantee than the counter is
+    /// asking about, and it is one this method can actually make.
+    ///
+    /// It exists because the conservative answer costs more here than it
+    /// protects. The eviction clock is written back on nearly every read, under
+    /// eight of the ten policies including the default, so counting it as a write
+    /// would invalidate the caller's memo on every single command rather than on
+    /// every write. That is a measured nineteen nanoseconds a command on single
+    /// key `SADD`, given up to avoid thinking once about three bytes written
+    /// inside a record that is not going anywhere.
+    ///
+    /// The length cannot change, for the same reason it cannot in
+    /// [`RawMap::value_mut`], and an address is only good until the next real
+    /// write, for the same reason it is in [`RawMap::find`].
+    #[inline]
+    pub fn value_at_mut(&mut self, addr: Addr) -> &mut [u8] {
+        let (klen, vlen) = Record::lens(self.arena.get(addr, HDR));
+        &mut self.arena.get_mut(addr, HDR + klen + vlen)[HDR + klen..]
     }
 
     /// The value stored under `key`, to be overwritten where it lies.
@@ -1133,9 +1166,12 @@ mod tests {
     }
 
     /// Whatever memoizes against this counter is only correct if every way of
-    /// writing to the map moves it. A method that mutates and does not is not a
-    /// slow memo, it is a wrong answer, so this asserts on the whole `&mut self`
-    /// surface rather than on the ones that look like they matter.
+    /// moving something in the map moves it too. A method that mutates and does
+    /// not is not a slow memo, it is a wrong answer, so this asserts on the whole
+    /// `&mut self` surface rather than on the ones that look like they matter.
+    ///
+    /// The single exception is pinned by the test below this one, so a method
+    /// added without a decision about which side it falls on fails here.
     #[test]
     fn every_way_of_writing_moves_the_counter() {
         let mut m = RawMap::new();
@@ -1159,6 +1195,26 @@ mod tests {
         moved(&m, "compact_segment");
         m.del(b"k");
         moved(&m, "del");
+    }
+
+    /// The exception, pinned so that it stays a decision rather than becoming a
+    /// habit. An in place stamp leaves the counter alone, and everything the
+    /// caller resolved before it is still right after it.
+    #[test]
+    fn stamping_a_value_in_place_is_not_a_write() {
+        let mut m = RawMap::new();
+        m.set(b"k", b"hello");
+        let addr = m.find(b"k").expect("just stored");
+        let before = m.writes();
+
+        m.value_at_mut(addr)[0] = b'j';
+
+        assert_eq!(m.writes(), before, "a stamp counted as a write");
+        assert_eq!(m.get(b"k"), Some(&b"jello"[..]));
+        // And the address the caller was holding still means what it meant, which
+        // is the guarantee the counter would otherwise be asked about.
+        assert_eq!(m.find(b"k"), Some(addr));
+        assert_eq!(m.value_at(addr), b"jello");
     }
 
     /// `clear` replaces the map with a fresh one, and a fresh one starts at

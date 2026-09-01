@@ -773,7 +773,7 @@ impl Keyspace {
         let len = z.len();
         let at = self.zsets.insert(z);
         let record = value::slot_record_len(false);
-        self.map.set_with(key, record, |out| {
+        self.write_rec(key, record, |out| {
             value::write_slot_record(out, Kind::Zset, at, None);
         });
         self.bodies += 1;
@@ -806,7 +806,7 @@ impl Keyspace {
         // is allowed to make.
         let at = yo_alloc::first_touch(|| self.zsets.insert(Zset::new()));
         let len = value::slot_record_len(false);
-        self.map.set_with(key, len, |out| {
+        self.write_rec(key, len, |out| {
             value::write_slot_record(out, Kind::Zset, at, None);
         });
         self.bodies += 1;
