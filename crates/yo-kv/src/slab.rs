@@ -270,6 +270,17 @@ impl<T: Bytes> Slab<T> {
         self.slots.capacity() * mem::size_of::<Slot<T>>()
     }
 
+    /// The old name for [`Slab::slot_bytes`], which answered the same number.
+    ///
+    /// Kept because a patch release does not take a public item away, and there
+    /// are now three ways to ask a slab what it costs rather than one, so the
+    /// name that does not say which of the three it means had to go. It goes at
+    /// the next minor.
+    #[deprecated(since = "0.3.8", note = "renamed to slot_bytes")]
+    pub fn memory_bytes(&self) -> usize {
+        self.slot_bytes()
+    }
+
     /// What the values are holding, asked of every one of them.
     ///
     /// The honest walk, for the places that want the number exactly and do not
