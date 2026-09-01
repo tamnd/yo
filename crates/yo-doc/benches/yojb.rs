@@ -26,7 +26,7 @@
 
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use std::hint::black_box;
-use yo_doc::{Builder, Value};
+use yo_doc::{Builder, Docs, Value};
 
 /// An object of `n` members, each holding a string of `pad` bytes.
 fn object(n: usize, pad: usize) -> (Vec<u8>, Vec<String>) {
@@ -153,12 +153,65 @@ fn bench_validate(c: &mut Criterion) {
     g.finish();
 }
 
+/// Storing a document and reading one back, which is the collection rather
+/// than the encoding.
+///
+/// `put` carries the interning walk and the copy into the primary table, so it
+/// is strictly more than `build` at the same field count and the gap is what
+/// interning costs on the write side. `get` is a probe of the primary table and
+/// then a field lookup, which is the whole of `HGET`'s shape with a document in
+/// the middle of it, and `field` is that lookup on its own against the same
+/// lookup on a document whose keys are bytes.
+fn bench_docs(c: &mut Criterion) {
+    let mut g = c.benchmark_group("yojb/docs");
+    for n in [4usize, 16, 64] {
+        let (bytes, names) = object(n, 16);
+        let ids: Vec<String> = (0..1024).map(|i| format!("doc:{i:06}")).collect();
+
+        g.bench_with_input(BenchmarkId::new("put", n), &n, |b, _| {
+            let mut docs = Docs::with_capacity(ids.len(), bytes.len());
+            let mut i = 0usize;
+            b.iter(|| {
+                i = (i + 1) % ids.len();
+                black_box(
+                    docs.put_bytes(black_box(ids[i].as_bytes()), black_box(&bytes))
+                        .expect("put"),
+                )
+            });
+        });
+
+        let mut docs = Docs::with_capacity(ids.len(), bytes.len());
+        for id in &ids {
+            docs.put_bytes(id.as_bytes(), &bytes).expect("put");
+        }
+        g.bench_with_input(BenchmarkId::new("get", n), &n, |b, _| {
+            let mut i = 0usize;
+            b.iter(|| {
+                i = (i + 1) % ids.len();
+                let d = docs.get(black_box(ids[i].as_bytes())).expect("stored");
+                black_box(d.get(black_box(names[i % n].as_bytes())))
+            });
+        });
+
+        let doc = docs.get(ids[0].as_bytes()).expect("stored");
+        g.bench_with_input(BenchmarkId::new("field", n), &n, |b, _| {
+            let mut i = 0usize;
+            b.iter(|| {
+                i = (i + 1) % n;
+                black_box(doc.get(black_box(names[i].as_bytes())))
+            });
+        });
+    }
+    g.finish();
+}
+
 criterion_group!(
     benches,
     bench_get,
     bench_get_over_payload,
     bench_path,
     bench_build,
-    bench_validate
+    bench_validate,
+    bench_docs
 );
 criterion_main!(benches);

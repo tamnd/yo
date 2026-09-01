@@ -14,6 +14,9 @@ categories.workspace = true
 
 [dependencies]
 yo-common.workspace = true
+# A collection's tables are the element table a hash's fields live in, which is
+# `09` section 4's R25 taken literally rather than as a resemblance.
+yo-kv.workspace = true
 
 [dev-dependencies]
 criterion = { workspace = true }
