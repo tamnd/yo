@@ -257,6 +257,34 @@ impl Access {
         Access(bits & MAX)
     }
 
+    /// Whether this key has never been stamped.
+    ///
+    /// All zeroes, which is what a record carries from the moment it is written
+    /// until something reads it under a policy that cares. It is a sentinel and
+    /// not a reading, and both readings answer for it as though the key had just
+    /// been used: zero seconds idle, and the starting frequency. That is the
+    /// safe direction. The other one would make every key in the database the
+    /// most attractive victim available for as long as it went unread, which
+    /// would evict the working set the moment a policy was switched on.
+    ///
+    /// It is a sentinel rather than a flag bit because it costs nothing and
+    /// because it means a record can be created without anybody deciding what to
+    /// put here. The writers do not know the clock or the policy, and having
+    /// them ask would have put both through every call site that makes a record.
+    ///
+    /// Zero is very nearly unreachable as a real reading. An LRU stamp is zero
+    /// only in the first second of 1970. An LFU stamp is zero only for a key
+    /// already decayed to nothing that is touched during the one minute in every
+    /// forty five days when the LFU clock wraps, and the cost of the collision
+    /// is that the key looks freshly used for a moment instead of unused. That
+    /// is a rounding error in a heuristic, and it is worth it to keep the write
+    /// path from having to care.
+    #[inline]
+    #[must_use]
+    pub const fn is_unset(self) -> bool {
+        self.bits() == 0
+    }
+
     /// The reading for a key touched at `now_ms` under an LRU policy.
     #[inline]
     #[must_use]
@@ -295,6 +323,9 @@ impl Access {
     #[inline]
     #[must_use]
     pub const fn idle_secs(self, now_ms: u64) -> u64 {
+        if self.is_unset() {
+            return 0;
+        }
         let now = clock_at(now_ms);
         let then = self.bits();
         let ticks = if now >= then {
@@ -315,6 +346,9 @@ impl Access {
     #[inline]
     #[must_use]
     pub const fn freq(self, now_ms: u64, lfu: Lfu) -> u8 {
+        if self.is_unset() {
+            return LFU_INIT;
+        }
         let counter = self.counter();
         if lfu.decay_minutes == 0 {
             return counter;
@@ -618,6 +652,27 @@ mod tests {
         assert_eq!(Policy::parse(b"allkeys"), None);
         assert_eq!(Policy::parse(b""), None);
         assert_eq!(Policy::parse(b"allkeys-lru "), None, "no trimming here");
+    }
+
+    /// A key nothing has stamped reads as freshly used under both policies.
+    ///
+    /// This is the one that matters on the day somebody turns a policy on. Every
+    /// key already in the database is unstamped at that moment, and the wrong
+    /// answer here makes all of them the most attractive victims available, so
+    /// enabling `allkeys-lru` on a full database would throw the working set
+    /// away before it read any of it back.
+    #[test]
+    fn a_key_that_was_never_stamped_reads_as_freshly_used() {
+        let unset = Access::default();
+        assert!(unset.is_unset());
+        assert_eq!(unset.idle_secs(at(86_400 * 365)), 0, "not idle for a year");
+        assert_eq!(unset.freq(at(86_400 * 365), Lfu::DEFAULT), LFU_INIT);
+
+        // And it leaves the sentinel behind as soon as it is touched.
+        let mut rng = Rng::new(2);
+        let stamped = unset.touched(at(1_000), Lfu::DEFAULT, &mut rng);
+        assert!(!stamped.is_unset());
+        assert!(stamped.freq(at(1_000), Lfu::DEFAULT) >= LFU_INIT);
     }
 
     #[test]

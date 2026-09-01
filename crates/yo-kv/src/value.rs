@@ -5,15 +5,34 @@
 //! carried in a one byte header in front of them:
 //!
 //! ```text
-//! +--------+-------------------------+-----------+
-//! | meta   | expire at, u64 LE       | payload   |
-//! | u8     | 8 bytes, only if tagged | see below |
-//! +--------+-------------------------+-----------+
+//! +--------+-------------------------+-------------------+-----------+
+//! | meta   | expire at, u64 LE       | access, 24 bits   | payload   |
+//! | u8     | 8 bytes, only if tagged | 3 bytes, tagged   | see below |
+//! +--------+-------------------------+-------------------+-----------+
 //! ```
 //!
 //! One byte, and eight more only for a key that has a deadline, which most keys
 //! do not. The alternative is a second lookup into a side table for the TTL, and
 //! a second lookup is a second cache miss on a path whose whole budget is one.
+//!
+//! # The access field
+//!
+//! Three bytes saying when the key was last read, or how often, depending on
+//! which eviction policy is in force. It is [`crate::access::Access`] and the
+//! reasoning about what goes in it lives there.
+//!
+//! It is behind a tag bit the same way the deadline is, but unlike the deadline
+//! every record written now has one. The bit is there so that a record written
+//! before the field existed still reads back correctly rather than to make the
+//! field optional, and it sits after the deadline for the same reason: the
+//! deadline stays at offset one and everything that reads one goes on working.
+//!
+//! Three bytes on every key is a real cost and it is worth being straight about
+//! why it is paid unconditionally rather than only under a policy that reads it.
+//! A key written under `noeviction` and then read under `allkeys-lru` has to be
+//! rankable, and it cannot become rankable later without the record growing,
+//! which means moving it, on what is usually a read. Paying three bytes always
+//! is the version where switching policy at runtime does the obvious thing.
 //!
 //! The payload depends on the encoding. An `int` holds the eight bytes of the
 //! integer and not its digits, which is what makes `INCR` a probe, an add and a
@@ -33,6 +52,7 @@
 //! rather than out of a second structure. A string is zero, so nothing written
 //! before the tag existed reads back as anything else.
 
+use crate::access::Access;
 use yo_common::num::{parse_i64, push_i64};
 
 /// The longest value Redis calls `embstr` rather than `raw`.
@@ -152,7 +172,20 @@ const ENC_EMBSTR: u8 = 1;
 const ENC_RAW: u8 = 2;
 /// Bit 2: whether eight bytes of deadline follow the meta byte.
 const HAS_EXPIRY: u8 = 0b0000_0100;
-/// Bits 3, 4 and 5: which type the key holds. Bits 6 and 7 are still spare.
+/// Bit 6: whether three bytes of access data follow the deadline.
+///
+/// Everything this crate writes now sets it, and the bit exists so that a file
+/// written before it did still opens. A record with the bit clear has no access
+/// field and its payload starts where it always did, which is what makes reading
+/// an older file a matter of asking rather than of knowing which version wrote
+/// it.
+///
+/// It does not work in the other direction. A binary from before this bit reads
+/// a record that sets it, ignores the bit it does not know about, and takes the
+/// three access bytes for the front of the payload. There is no format version
+/// in the file to refuse on, which is worth fixing and is not this change.
+const HAS_ACCESS: u8 = 0b0100_0000;
+/// Bits 3, 4 and 5: which type the key holds. Bit 7 is still spare.
 ///
 /// String is zero, so every record written before the tag existed reads back as
 /// a string, which is what it was.
@@ -167,6 +200,9 @@ const KIND_ARRAY: u8 = 6;
 
 /// Bytes of integer payload, which is a whole `i64` and never its digits.
 const INT_LEN: usize = 8;
+
+/// Bytes of access data, which is [`Access`] and is twenty four bits.
+const ACCESS_LEN: usize = 3;
 
 /// The meta byte in front of every stored string.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -242,10 +278,36 @@ impl Meta {
         self.0 & HAS_EXPIRY != 0
     }
 
+    /// Whether an access field follows the deadline.
+    ///
+    /// False only for a record written before the field existed, which is what
+    /// lets an older file open rather than be misread. Everything this crate
+    /// writes now sets it.
+    #[inline]
+    pub const fn has_access(self) -> bool {
+        self.0 & HAS_ACCESS != 0
+    }
+
+    /// The same byte with the access field declared.
+    #[inline]
+    const fn with_access(self) -> Meta {
+        Meta(self.0 | HAS_ACCESS)
+    }
+
+    /// Where the access field starts, counting from the meta byte.
+    ///
+    /// After the deadline rather than before it, which is what keeps a record
+    /// written before this field existed readable: the deadline is still at
+    /// offset one and everything that reads one can go on doing so.
+    #[inline]
+    const fn access_at(self) -> usize {
+        if self.has_expiry() { 1 + 8 } else { 1 }
+    }
+
     /// Where the payload starts, counting from the meta byte.
     #[inline]
     pub const fn payload_at(self) -> usize {
-        if self.has_expiry() { 1 + 8 } else { 1 }
+        self.access_at() + if self.has_access() { ACCESS_LEN } else { 0 }
     }
 }
 
@@ -345,9 +407,14 @@ impl Str<'_> {
 }
 
 /// How many bytes a record holding this value will occupy.
+///
+/// The access field is counted unconditionally, because every record this crate
+/// writes now carries one. It is not a parameter for that reason: making it one
+/// would put a flag through twenty six call sites to describe something none of
+/// them gets to decide.
 #[inline]
 pub fn record_len(enc: Encoding, payload: usize, has_expiry: bool) -> usize {
-    let head = if has_expiry { 1 + 8 } else { 1 };
+    let head = (if has_expiry { 1 + 8 } else { 1 }) + ACCESS_LEN;
     head + if enc == Encoding::Int {
         INT_LEN
     } else {
@@ -362,12 +429,13 @@ pub fn record_len(enc: Encoding, payload: usize, has_expiry: bool) -> usize {
 /// already established that they parse by choosing that encoding.
 #[inline]
 pub fn write_record(out: &mut [u8], enc: Encoding, bytes: &[u8], expire_at: Option<u64>) {
-    out[0] = Meta::string(enc, expire_at.is_some()).byte();
+    out[0] = Meta::string(enc, expire_at.is_some()).with_access().byte();
     let mut at = 1;
     if let Some(ms) = expire_at {
         out[at..at + 8].copy_from_slice(&ms.to_le_bytes());
         at += 8;
     }
+    at += write_blank_access(&mut out[at..]);
     match enc {
         Encoding::Int => {
             let n =
@@ -381,13 +449,32 @@ pub fn write_record(out: &mut [u8], enc: Encoding, bytes: &[u8], expire_at: Opti
 /// Write a record whose value is an integer the caller already has.
 #[inline]
 pub fn write_int_record(out: &mut [u8], n: i64, expire_at: Option<u64>) {
-    out[0] = Meta::string(Encoding::Int, expire_at.is_some()).byte();
+    out[0] = Meta::string(Encoding::Int, expire_at.is_some())
+        .with_access()
+        .byte();
     let mut at = 1;
     if let Some(ms) = expire_at {
         out[at..at + 8].copy_from_slice(&ms.to_le_bytes());
         at += 8;
     }
+    at += write_blank_access(&mut out[at..]);
     out[at..at + INT_LEN].copy_from_slice(&n.to_le_bytes());
+}
+
+/// Leave room for the access field and put nothing in it.
+///
+/// The writers here do not know the clock or which policy is in force, and a
+/// record layout is the wrong place to learn either. The keyspace stamps the
+/// field through [`set_access`] once the record is in, which is also where the
+/// decision about whether to stamp at all belongs.
+///
+/// Zero is the most evictable value a key can hold under either reading, which
+/// is the right way round for a default: a key that somehow never got stamped
+/// goes first rather than never.
+#[inline]
+fn write_blank_access(out: &mut [u8]) -> usize {
+    out[..ACCESS_LEN].fill(0);
+    ACCESS_LEN
 }
 
 /// Bytes of slab number, which is how a record points at a body.
@@ -396,7 +483,7 @@ const SLOT_LEN: usize = 4;
 /// How many bytes a record pointing at a slab slot occupies.
 #[inline]
 pub fn slot_record_len(has_expiry: bool) -> usize {
-    (if has_expiry { 1 + 8 } else { 1 }) + SLOT_LEN
+    (if has_expiry { 1 + 8 } else { 1 }) + ACCESS_LEN + SLOT_LEN
 }
 
 /// Write a record that points at `slot` in the slab for `kind`.
@@ -404,13 +491,53 @@ pub fn slot_record_len(has_expiry: bool) -> usize {
 /// `out` must be exactly [`slot_record_len`] long.
 #[inline]
 pub fn write_slot_record(out: &mut [u8], kind: Kind, slot: u32, expire_at: Option<u64>) {
-    out[0] = Meta::slot(kind, expire_at.is_some()).byte();
+    out[0] = Meta::slot(kind, expire_at.is_some()).with_access().byte();
     let mut at = 1;
     if let Some(ms) = expire_at {
         out[at..at + 8].copy_from_slice(&ms.to_le_bytes());
         at += 8;
     }
+    at += write_blank_access(&mut out[at..]);
     out[at..at + SLOT_LEN].copy_from_slice(&slot.to_le_bytes());
+}
+
+/// What the access field in a record says, or `None` if it has no room for one.
+///
+/// `None` means the record predates the field, which is a key that was written
+/// by an older build and read back out of a file. It is not an error and the
+/// caller should treat it as a key it knows nothing about rather than as a key
+/// that has never been touched.
+#[inline]
+#[must_use]
+pub fn access(rec: &[u8]) -> Option<Access> {
+    let m = Meta::from_byte(rec[0]);
+    if !m.has_access() {
+        return None;
+    }
+    let at = m.access_at();
+    Some(Access::from_bits(u32::from_le_bytes([
+        rec[at],
+        rec[at + 1],
+        rec[at + 2],
+        0,
+    ])))
+}
+
+/// Stamp the access field, in place, over whatever was there.
+///
+/// Returns false for a record with no room, which is the same older record
+/// [`access`] answers `None` for. It is not worth growing one to make room: the
+/// record would have to move, on a path that is usually a read, and the next
+/// write to that key rewrites it with a field anyway.
+#[inline]
+pub fn set_access(rec: &mut [u8], a: Access) -> bool {
+    let m = Meta::from_byte(rec[0]);
+    if !m.has_access() {
+        return false;
+    }
+    let at = m.access_at();
+    rec[at..at + ACCESS_LEN].copy_from_slice(&a.bits().to_le_bytes()[..ACCESS_LEN]);
+    true
 }
 
 /// The slab number in a record that has one.
@@ -694,10 +821,119 @@ mod tests {
     }
 
     #[test]
-    fn the_top_two_bits_are_still_free() {
-        // Whatever lands in them next must not disturb the tag, so this is the
-        // check that the tag is three bits and not five.
+    fn the_bits_above_the_tag_do_not_disturb_it() {
+        // Bit 6 is now the access flag and bit 7 is still free, and neither of
+        // them may move the tag, so this is the check that the tag is three
+        // bits and not five.
         assert_eq!(Meta::from_byte(0b1100_0000).kind(), Kind::String);
         assert_eq!(Meta::from_byte(0b1101_0000).kind(), Kind::Set);
+        // And the flag itself reads off the byte rather than off the tag.
+        assert!(Meta::from_byte(0b0100_0000).has_access());
+        assert!(!Meta::from_byte(0b1011_1111).has_access());
+    }
+
+    /// Every record this crate writes has room for an access field, and the
+    /// field starts empty.
+    #[test]
+    fn a_fresh_record_has_an_unstamped_access_field() {
+        for expire in [None, Some(1_700_000_000_000)] {
+            for (enc, bytes) in [
+                (Encoding::Int, &b"42"[..]),
+                (Encoding::Embstr, b"hello"),
+                (Encoding::Raw, &[b'x'; 64][..]),
+            ] {
+                let mut rec = vec![0u8; record_len(enc, bytes.len(), expire.is_some())];
+                write_record(&mut rec, enc, bytes, expire);
+                let a = access(&rec).expect("a record we just wrote has the field");
+                assert!(a.is_unset(), "{enc:?} came out stamped");
+                assert_eq!(expire_at(&rec), expire, "{enc:?} lost its deadline");
+                match enc {
+                    Encoding::Int => assert_eq!(read(&rec), Str::Int(42)),
+                    _ => assert_eq!(read(&rec), Str::Bytes(bytes)),
+                }
+            }
+        }
+    }
+
+    /// The same for the other two writers, which is every record shape there is.
+    #[test]
+    fn slot_and_int_records_have_the_field_too() {
+        for expire in [None, Some(9_000)] {
+            let mut rec = vec![0u8; slot_record_len(expire.is_some())];
+            write_slot_record(&mut rec, Kind::Set, 77, expire);
+            assert!(access(&rec).expect("the field").is_unset());
+            assert_eq!(slot(&rec), 77);
+            assert_eq!(kind(&rec), Kind::Set);
+            assert_eq!(expire_at(&rec), expire);
+
+            let mut rec = vec![0u8; record_len(Encoding::Int, 0, expire.is_some())];
+            write_int_record(&mut rec, -5, expire);
+            assert!(access(&rec).expect("the field").is_unset());
+            assert_eq!(read(&rec), Str::Int(-5));
+            assert_eq!(expire_at(&rec), expire);
+        }
+    }
+
+    /// Stamping the field does not disturb anything either side of it.
+    ///
+    /// It sits between the deadline and the payload and it is written in place
+    /// on a path that is usually a read, so an off by one here would corrupt a
+    /// value quietly rather than fail.
+    #[test]
+    fn stamping_the_field_leaves_the_deadline_and_the_payload_alone() {
+        let deadline = 1_700_000_000_123u64;
+        let body = b"the payload nobody should touch";
+        let mut rec = vec![0u8; record_len(Encoding::Raw, body.len(), true)];
+        write_record(&mut rec, Encoding::Raw, body, Some(deadline));
+
+        for bits in [1u32, 0xff, 0x00ff_ffff, 0x0012_3456] {
+            let a = Access::from_bits(bits);
+            assert!(set_access(&mut rec, a));
+            assert_eq!(access(&rec), Some(a), "{bits:#x} did not survive");
+            assert_eq!(
+                expire_at(&rec),
+                Some(deadline),
+                "{bits:#x} hit the deadline"
+            );
+            assert_eq!(read(&rec), Str::Bytes(body), "{bits:#x} hit the payload");
+        }
+    }
+
+    /// A record written before the field existed still reads correctly, and
+    /// refuses to be stamped rather than being stamped over its payload.
+    ///
+    /// This is the whole reason the field is behind a tag bit instead of just
+    /// always being there. A file written by an older build has records with the
+    /// bit clear, and their payload starts three bytes earlier.
+    #[test]
+    fn a_record_from_before_the_field_still_reads() {
+        // Built by hand, the way the old writer did it: meta, deadline, payload,
+        // and no access field.
+        let body = b"older";
+        let mut old = vec![Meta::string(Encoding::Raw, true).byte()];
+        old.extend_from_slice(&7_000u64.to_le_bytes());
+        old.extend_from_slice(body);
+
+        assert!(!Meta::from_byte(old[0]).has_access());
+        assert_eq!(access(&old), None, "there is no field to read");
+        assert_eq!(expire_at(&old), Some(7_000));
+        assert_eq!(read(&old), Str::Bytes(body));
+
+        let before = old.clone();
+        assert!(
+            !set_access(&mut old, Access::from_bits(0xabcdef)),
+            "it should refuse rather than write over the payload"
+        );
+        assert_eq!(old, before, "it wrote something anyway");
+    }
+
+    /// The field costs three bytes on every record and no more.
+    #[test]
+    fn the_field_costs_three_bytes() {
+        assert_eq!(record_len(Encoding::Raw, 10, false), 1 + 3 + 10);
+        assert_eq!(record_len(Encoding::Raw, 10, true), 1 + 8 + 3 + 10);
+        assert_eq!(record_len(Encoding::Int, 10, false), 1 + 3 + 8);
+        assert_eq!(slot_record_len(false), 1 + 3 + 4);
+        assert_eq!(slot_record_len(true), 1 + 8 + 3 + 4);
     }
 }
