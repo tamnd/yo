@@ -1080,7 +1080,17 @@ fn hash(name: &[u8]) -> u64 {
 /// no further. A caller that says how large its result will be gets an array
 /// sized for it rather than one sized for the next power of two above it.
 fn slots_for(n: usize) -> usize {
-    ((n * LOAD_DEN) / LOAD_NUM + 1).max(MIN_SLOTS)
+    // Rounded up to a power of two on this branch, which is what main does and
+    // which is deliberately the wasteful thing, because this branch exists to
+    // answer one question and that question is not about memory. Sizing exactly
+    // at three quarters and sizing to a power of two are two changes, and
+    // measuring them together measured neither. A million members want just over
+    // 1.33 million slots and this hands back 2.09 million, so the array actually
+    // runs at 0.48 and not at 0.75. That is main's load and main's memory, which
+    // leaves the group probe as the only thing left that differs.
+    ((n * LOAD_DEN) / LOAD_NUM + 1)
+        .max(MIN_SLOTS)
+        .next_power_of_two()
 }
 
 /// The next size up for a slot array that has just run out of room.
