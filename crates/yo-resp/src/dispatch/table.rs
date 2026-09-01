@@ -2878,19 +2878,49 @@ const fn index() -> [u16; SLOTS] {
 /// the whole walk.
 #[must_use]
 pub fn lookup(name: &[u8]) -> Option<&'static Spec> {
-    let key = key_of(name)?;
+    at(lookup_index(name))
+}
+
+/// The same, answering with a position in the table rather than a reference.
+///
+/// This is where the lookup actually ends, because the index is what the slots
+/// hold. It is here as its own function because a position fits in a `u16` and a
+/// reference does not fit anywhere a framed command can carry it cheaply, so the
+/// engine resolves a command's name once when it frames it and hands the number
+/// on to both the key hash and the dispatcher.
+///
+/// [`FREE`] is the answer for a name that is not a command, which is not a
+/// special case anybody has to write down: it is `u16::MAX`, the table is 191
+/// entries, and [`at`] hands back `None` for anything past the end.
+#[must_use]
+pub fn lookup_index(name: &[u8]) -> u16 {
+    let Some(key) = key_of(name) else {
+        return FREE;
+    };
     let mut at = slot_of(key);
     loop {
         let i = INDEX[at];
         if i == FREE {
-            return None;
+            return FREE;
         }
-        let spec = &COMMANDS[i as usize];
-        if spec.name.as_bytes().eq_ignore_ascii_case(name) {
-            return Some(spec);
+        if COMMANDS[i as usize]
+            .name
+            .as_bytes()
+            .eq_ignore_ascii_case(name)
+        {
+            return i;
         }
         at = (at + 1) & (SLOTS - 1);
     }
+}
+
+/// The command at `i`, or `None` if there is none there.
+///
+/// The other half of [`lookup_index`], and the only thing that should ever be
+/// handed one of its answers.
+#[must_use]
+pub fn at(i: u16) -> Option<&'static Spec> {
+    COMMANDS.get(i as usize)
 }
 
 /// How many commands there are.

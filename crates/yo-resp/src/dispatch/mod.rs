@@ -773,9 +773,33 @@ pub fn execute(server: &mut Server, session: &mut Session, args: Args<'_>, out: 
     if args.is_empty() {
         return Flow::Continue;
     }
+    resolved(server, session, lookup(args.name()), args, out)
+}
+
+/// The same, for a caller that has already found the command.
+///
+/// The engine frames a command before it runs it, and between those two it also
+/// asks which key the command touches so the record can be prefetched. That is
+/// two more chances to look the name up, and looking it up three times to run it
+/// once is three times the cost of the cheapest thing in the path. So the engine
+/// resolves the name where it frames the command, carries the answer on the
+/// framed command, and both the other two take it from there.
+///
+/// `spec` is `None` for a name that is not a command, which is the same thing
+/// [`lookup`] says and lands in the same reply.
+pub fn resolved(
+    server: &mut Server,
+    session: &mut Session,
+    spec: Option<&'static Spec>,
+    args: Args<'_>,
+    out: &mut Out,
+) -> Flow {
+    if args.is_empty() {
+        return Flow::Continue;
+    }
     server.stats.commands += 1;
 
-    let Some(spec) = lookup(args.name()) else {
+    let Some(spec) = spec else {
         write_error(out, &args::unknown_command(args));
         return Flow::Continue;
     };
