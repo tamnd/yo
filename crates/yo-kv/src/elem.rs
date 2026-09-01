@@ -207,10 +207,10 @@ pub struct Elements<V> {
     vals: Vec<V>,
     /// Every live name, back to back, and some dead ones.
     ///
-    /// The length stays in the row rather than in a [`crate::blob::Span`],
-    /// because one byte of it is what keeps a row at eight bytes, and the names
-    /// that do not fit in one byte carry their own length in the blob instead of
-    /// widening every row that does.
+    /// The length stays in the row rather than beside the offset, because one
+    /// byte of it is what keeps a row at eight bytes, and the names that do not
+    /// fit in one byte carry their own length in the blob instead of widening
+    /// every row that does.
     names: Blob,
 }
 
@@ -1316,11 +1316,7 @@ mod tests {
         assert_eq!(size_of::<Row>(), 8);
         assert_eq!(size_of::<Row>() + size_of::<()>(), 8, "a set member");
         assert_eq!(size_of::<Row>() + size_of::<f64>(), 16, "a sorted set");
-        assert_eq!(
-            size_of::<Row>() + size_of::<crate::blob::Span>(),
-            16,
-            "a hash field"
-        );
+        assert_eq!(size_of::<Row>() + size_of::<u32>(), 12, "a hash field");
     }
 
     #[test]
