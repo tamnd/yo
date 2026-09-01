@@ -2767,48 +2767,90 @@ pub static COMMANDS: &[Spec] = &[
     },
 ];
 
-/// The length and the lower cased first byte of a name, packed into a `u16`.
+/// The shortest and the longest command name.
 ///
-/// `None` for a name nothing in [`COMMANDS`] could be spelled as, which here is
-/// only the empty one and one longer than a byte can count. Both of those are
-/// answered before anything is read.
+/// Both are facts about [`COMMANDS`], pinned by a test, and both are checked
+/// before anything is read, so a name that could not be a command is rejected on
+/// its length alone.
+const MIN_LEN: usize = 3;
+const MAX_LEN: usize = 16;
+
+/// How many slots the index has, which is a power of two and about two and a
+/// half times the number of commands.
+///
+/// One kibibyte of `u16`, eight cache lines, and loose enough that a probe for a
+/// name that is not a command stops at an empty slot almost immediately. Tight
+/// enough that the whole thing stays resident next to the table it indexes.
+const SLOTS: usize = 512;
+
+/// A slot nothing was put in.
+///
+/// `u16::MAX` and not zero, because zero is `set` and `set` is the command this
+/// most wants to be able to find.
+const FREE: u16 = u16::MAX;
+
+/// The multiplier, found by searching for one that spreads these 191 names well.
+///
+/// Not a magic constant in the bad sense: it is checked. Every command is looked
+/// up by its own name in a test, and another test holds the worst probe length
+/// at what it is now, so a command added later that made this multiplier bad
+/// would fail rather than quietly cost every lookup an extra slot.
+const MIX: u64 = 0xbedf_bd94_c335_37f9;
+
+/// The four bytes the index is computed from: the length, the first two bytes
+/// and the last, lower cased.
+///
+/// `None` for a name no command could be spelled as, which is decided on the
+/// length before a byte is read.
+///
+/// Four bytes and not the whole name because the whole name has to be compared
+/// at the end anyway, so the hash only has to be good enough to get to the right
+/// slot, and reading less of the name is a shorter dependency chain in front of
+/// the multiply. These four leave 180 distinct values over the 191 commands,
+/// which is eleven pairs that share a slot and probe once more, and the probe is
+/// the same compare the lookup was always going to do.
 ///
 /// `| 0x20` lower cases a letter and does not have to be told which bytes are
-/// letters, because the only thing that matters is that it maps the two cases of
-/// a name to the same number and every command name is letters.
-const fn key_of(name: &[u8]) -> Option<u16> {
-    if name.is_empty() || name.len() > u8::MAX as usize {
+/// letters. It maps the two cases of a name to the same number, which is all
+/// this needs, and every command name is letters.
+const fn key_of(name: &[u8]) -> Option<u32> {
+    if name.len() < MIN_LEN || name.len() > MAX_LEN {
         return None;
     }
-    Some(((name.len() as u16) << 8) | (name[0] | 0x20) as u16)
+    let last = name.len() - 1;
+    Some(
+        name.len() as u32
+            | ((name[0] | 0x20) as u32) << 8
+            | ((name[1] | 0x20) as u32) << 16
+            | ((name[last] | 0x20) as u32) << 24,
+    )
 }
 
-/// [`key_of`] every command name, in table order.
-///
-/// This is the whole of the change that made [`lookup`] cheap, and it is not a
-/// hash or an index, it is the same linear scan over two bytes a command instead
-/// of over a hundred. A `Spec` is about ninety six bytes, so walking to `del` at
-/// a hundred and forty seventh used to read fourteen kilobytes to look at two
-/// bytes out of each, which is two hundred and twenty cache lines. The same walk
-/// over this reads two hundred and ninety four bytes, five lines, sequentially.
-///
-/// A bucket index keyed on the same two bytes was tried first and was worse. It
-/// found `srandmember` six percent faster and cost `get` and `set` twenty
-/// percent, because a bucket lookup is three dependent loads into three
-/// different arrays and a scan is one stride a prefetcher can see coming. The
-/// table is written in rough order of how often a command is sent, and against
-/// a scan that ordering is worth something, which is a thing an index throws
-/// away.
-const KEYS: [u16; COMMANDS.len()] = keys();
+/// Where a key wants to sit.
+const fn slot_of(key: u32) -> usize {
+    ((key as u64).wrapping_mul(MIX) >> 55) as usize & (SLOTS - 1)
+}
 
-const fn keys() -> [u16; COMMANDS.len()] {
-    let mut out = [0u16; COMMANDS.len()];
+/// The index, built at compile time by inserting every command in table order.
+///
+/// Table order is rough order of how often a command is sent, and inserting in
+/// that order means the hotter of two commands that want the same slot gets it
+/// and the colder one probes, which is the right way round.
+const INDEX: [u16; SLOTS] = index();
+
+const fn index() -> [u16; SLOTS] {
+    let mut out = [FREE; SLOTS];
     let mut i = 0;
     while i < COMMANDS.len() {
-        out[i] = match key_of(COMMANDS[i].name.as_bytes()) {
+        let key = match key_of(COMMANDS[i].name.as_bytes()) {
             Some(key) => key,
-            None => panic!("a command has no name"),
+            None => panic!("a command name is outside MIN_LEN..=MAX_LEN"),
         };
+        let mut at = slot_of(key);
+        while out[at] != FREE {
+            at = (at + 1) & (SLOTS - 1);
+        }
+        out[at] = i as u16;
         i += 1;
     }
     out
@@ -2816,20 +2858,39 @@ const fn keys() -> [u16; COMMANDS.len()] {
 
 /// The command called `name`, whatever case the client spelled it in.
 ///
-/// The scan is over a key array and not over [`COMMANDS`], so a candidate costs one
-/// `u16` compare and the full name is only read when the length and the first
-/// letter already matched. There are 89 distinct keys over the table, so that
-/// happens about twice for a name that is a command and almost never for one
-/// that is not.
+/// This used to walk the whole table comparing lengths, and the cost of that was
+/// not what it looked like. The table is written in rough order of how often a
+/// command is sent, so `set` and `get` were the first two entries and cost one
+/// compare, but `exists` is the hundred and forty ninth and `del` the hundred and
+/// forty seventh, and every one of those compares was paid twice per command,
+/// once to work out the key hash and once to dispatch.
+///
+/// Measured, that walk was 104 nanoseconds a command, which is more than a whole
+/// `GET` costs end to end. `EXISTS` on a missing key ran at three and a half
+/// times `GET` and almost none of the difference was the command: short
+/// circuiting the lookup alone took it from 8.7 microseconds a batch of sixty
+/// four to 2.0, and left it faster than `GET`, which it should be, because it
+/// does less.
+///
+/// So this is one multiply and one load into a kibibyte, and then the same name
+/// compare it always ended with. What it costs the hot commands is a multiply
+/// they did not use to pay and a load that hits, and what it saves the rest is
+/// the whole walk.
 #[must_use]
 pub fn lookup(name: &[u8]) -> Option<&'static Spec> {
-    let want = key_of(name)?;
-    for (at, &key) in KEYS.iter().enumerate() {
-        if key == want && COMMANDS[at].name.as_bytes().eq_ignore_ascii_case(name) {
-            return Some(&COMMANDS[at]);
+    let key = key_of(name)?;
+    let mut at = slot_of(key);
+    loop {
+        let i = INDEX[at];
+        if i == FREE {
+            return None;
         }
+        let spec = &COMMANDS[i as usize];
+        if spec.name.as_bytes().eq_ignore_ascii_case(name) {
+            return Some(spec);
+        }
+        at = (at + 1) & (SLOTS - 1);
     }
-    None
 }
 
 /// How many commands there are.
@@ -2927,9 +2988,10 @@ mod tests {
 
     /// Every command is findable under its own name, in either case.
     ///
-    /// The key array is built at compile time from the table it sits beside, so
-    /// what a test can still catch is the two of them being read differently:
-    /// `keys` packing the length one way and `lookup` packing it another.
+    /// The index is built at compile time from the table it sits beside, so what
+    /// a test can still catch is a command that the build put somewhere the
+    /// lookup does not walk past, which is what a probe that stopped early would
+    /// look like.
     #[test]
     fn every_command_is_findable_by_its_own_name() {
         for spec in COMMANDS {
@@ -2959,13 +3021,63 @@ mod tests {
         assert!(lookup(b"9et").is_none());
     }
 
-    /// The two cases of a name pack to the same key and different names do not.
+    /// The two cases of a name give the same key and different names do not.
     #[test]
-    fn a_key_is_the_length_and_the_letter_and_nothing_else() {
+    fn a_key_folds_the_case_and_nothing_else() {
         assert_eq!(key_of(b"get"), key_of(b"GET"));
-        assert_eq!(key_of(b"get"), key_of(b"gzz"), "same length, same letter");
-        assert_ne!(key_of(b"get"), key_of(b"set"), "same length, other letter");
+        assert_eq!(key_of(b"get"), key_of(b"gEt"));
+        assert_ne!(key_of(b"get"), key_of(b"set"), "other first byte");
+        assert_ne!(key_of(b"get"), key_of(b"gxt"), "other second byte");
+        assert_ne!(key_of(b"get"), key_of(b"gex"), "other last byte");
         assert_ne!(key_of(b"get"), key_of(b"gett"), "other length");
+    }
+
+    /// The index is still worth having, which is a thing that can rot.
+    ///
+    /// The multiplier was searched for against the 191 commands that were in the
+    /// table when it was written. Adding commands cannot make a lookup wrong,
+    /// because a probe walks to an empty slot and every candidate has its name
+    /// compared, but it can make one slow, and a slow lookup is exactly the thing
+    /// this replaced. So the worst probe is written down here: if a command
+    /// added later pushes it up, somebody searches for a new multiplier or a
+    /// bigger table rather than finding out from a benchmark six months later.
+    #[test]
+    fn no_command_is_more_than_two_slots_from_where_it_wants_to_be() {
+        let mut worst = 0;
+        let mut total = 0;
+        for spec in COMMANDS {
+            let key = key_of(spec.name.as_bytes()).expect(spec.name);
+            let home = slot_of(key);
+            let mut at = home;
+            let mut steps = 0;
+            while INDEX[at] as usize != index_of(spec) {
+                at = (at + 1) & (SLOTS - 1);
+                steps += 1;
+                assert!(steps < SLOTS, "{} is not in the index at all", spec.name);
+            }
+            worst = worst.max(steps);
+            total += steps;
+        }
+        assert!(worst <= 2, "worst probe is {worst} slots");
+        assert!(
+            total <= 40,
+            "{total} extra slots walked over the whole table"
+        );
+    }
+
+    /// The table has room to probe in, which is what stops the loop.
+    #[test]
+    fn the_index_is_not_full() {
+        assert!(
+            COMMANDS.len() < SLOTS,
+            "the probe would never find an empty"
+        );
+        assert!(
+            COMMANDS.len() < FREE as usize,
+            "an index would collide with FREE"
+        );
+        let free = INDEX.iter().filter(|&&i| i == FREE).count();
+        assert_eq!(free, SLOTS - COMMANDS.len());
     }
 
     #[test]

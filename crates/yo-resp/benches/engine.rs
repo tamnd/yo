@@ -154,6 +154,21 @@ fn bench_incr(c: &mut Criterion) {
     bench_command(c, "incr", &[b"INCR", b"hits"]);
 }
 
+/// A command from the back of the table, on a key that is not there.
+///
+/// `set` and `get` are the first two entries in the command table and `exists`
+/// is the hundred and forty ninth, so the pair of them together says whether
+/// finding a command costs anything, separately from what the command then does.
+/// Deliberately a miss: `EXISTS` on a key nobody wrote does almost nothing after
+/// the lookup, which is what leaves the lookup visible.
+///
+/// It is `EXISTS` and not `DEL` because a `DEL` that finds something is a
+/// different command the second time round, and a row that changes shape between
+/// the first iteration and the rest is not measuring one thing.
+fn bench_exists(c: &mut Criterion) {
+    bench_command(c, "exists", &[b"EXISTS", b"key:nothing"]);
+}
+
 /// The hot key shape: every command in the batch on the same set.
 ///
 /// The member is one that is already there, which is the steady state of the
@@ -272,6 +287,7 @@ criterion_group!(
     bench_set,
     bench_get,
     bench_incr,
+    bench_exists,
     bench_sadd,
     bench_sadd_alternating,
     bench_srandmember,
