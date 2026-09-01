@@ -57,3 +57,7 @@ harness = false
 [[bench]]
 name = "setops"
 harness = false
+
+[[bench]]
+name = "rdb"
+harness = false
