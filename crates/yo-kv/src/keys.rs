@@ -23,9 +23,16 @@
 //! wire layer holds every database and this one holds none of them, so the two
 //! halves are separate calls and the caller is what joins them up.
 //!
-//! It also makes the pair the answer for `MOVE`, `DUMP` and `RESTORE` when they
-//! land, which want exactly this: a value lifted out of a database, standing on
-//! its own with its deadline attached.
+//! It also makes the pair the answer for `MOVE`, `DUMP` and `RESTORE`, which
+//! want exactly this: a value lifted out of a database, standing on its own with
+//! its deadline attached.
+//!
+//! There are two ways to lift one out. [`Keyspace::export`] clones the body and
+//! leaves the key where it is, which is what `COPY` needs, and
+//! [`Keyspace::take`] pulls the body out of the slab and deletes the key, which
+//! is what `MOVE` needs. `MOVE` through `export` would clone a set of a million
+//! members and then throw the original away a line later, so the two are
+//! separate calls rather than one call with a flag.
 
 use yo_common::Result;
 
@@ -151,6 +158,54 @@ impl Keyspace {
             // there yet, so this arm is the only one left and it names it.
             Kind::Stream => unreachable!("nothing can store a stream yet"),
         };
+        Some(Record { body, expire_at })
+    }
+
+    /// Lift everything under `key` out and leave the key gone.
+    ///
+    /// The same answer [`Keyspace::export`] gives, without the clone. A body in
+    /// the slab is already a value standing on its own, so a caller that is
+    /// about to delete the source can have that body itself rather than a copy
+    /// of it, and taking a set of a million members costs a slot number.
+    ///
+    /// This is what `MOVE` wants and what `COPY` cannot have. The difference is
+    /// that a move leaves nothing behind, so there is never a moment where two
+    /// records point at one slot.
+    ///
+    /// The record is removed here rather than by the caller, because the body is
+    /// out of the slab by then and a record still pointing at a slot that has
+    /// been freed is the one state this file exists to prevent. A `del` on top
+    /// of this would free the body a second time and underflow the count of keys
+    /// that hold one.
+    pub fn take(&mut self, key: &[u8]) -> Option<Record> {
+        let addr = self.live_rec(key)?;
+        let rec = self.map.value_at(addr);
+        let expire_at = value::expire_at(rec);
+        let kind = value::kind(rec);
+        // A string record is the value, so there is nothing in the slab to take
+        // and the bytes have to be copied out before the record goes. It leaves
+        // early because the slot below is not there to read on this one.
+        if kind == Kind::String {
+            let bytes = value::read(rec).to_vec();
+            self.del_rec(key);
+            return Some(Record {
+                body: Body::String(bytes),
+                expire_at,
+            });
+        }
+        let slot = value::slot(rec);
+        let gone = "the record points at its body";
+        let body = match kind {
+            Kind::Set => Body::Set(self.sets.remove(slot).expect(gone)),
+            Kind::Hash => Body::Hash(self.hashes.remove(slot).expect(gone)),
+            Kind::List => Body::List(self.lists.remove(slot).expect(gone)),
+            Kind::Zset => Body::Zset(self.zsets.remove(slot).expect(gone)),
+            Kind::Array => Body::Array(self.arrays.remove(slot).expect(gone)),
+            // Handled above, and named rather than caught, as in `export`.
+            Kind::String | Kind::Stream => unreachable!("handled above or cannot be stored"),
+        };
+        self.bodies -= 1;
+        self.del_rec(key);
         Some(Record { body, expire_at })
     }
 
@@ -368,6 +423,7 @@ mod tests {
     use crate::Clock;
     use crate::End;
     use crate::zsets::ZAdd;
+    use crate::{Applied, Cond};
 
     fn db() -> Keyspace {
         Keyspace::with_clock(Clock::fixed(1_000_000))
@@ -699,6 +755,63 @@ mod tests {
         assert_eq!(d.copy(b"a", b"l", true), Moved::Ok);
         assert_eq!(d.kind_of(b"l"), Some(Kind::String));
         assert_eq!(read(&mut d, b"l"), b"v1");
+    }
+
+    /// The whole reason `take` exists: the body arrives without being cloned and
+    /// the slab it came out of is empty afterwards.
+    #[test]
+    fn taking_a_set_empties_the_slab_and_the_key() {
+        let mut d = db();
+        d.sadd(b"s", [b"m1".as_ref(), b"m2".as_ref()].into_iter())
+            .expect("a set");
+        assert_eq!(d.sets.len(), 1);
+
+        let rec = d.take(b"s").expect("a record");
+        assert_eq!(rec.kind(), Kind::Set);
+        assert_eq!(d.sets.len(), 0, "the body left with the record");
+        assert!(!d.exists(b"s"), "and so did the key");
+
+        let mut into = db();
+        into.import(b"s", rec);
+        assert_eq!(members(&mut into, b"s"), ["m1", "m2"]);
+    }
+
+    /// A string has no slab slot, so the bytes are copied and the count is left
+    /// alone. Taking one and then taking it again answers nothing the second
+    /// time, which is the check that the record went too.
+    #[test]
+    fn taking_a_string_takes_the_record_with_it() {
+        let mut d = db();
+        put(&mut d, b"a", b"v1");
+
+        let rec = d.take(b"a").expect("a record");
+        assert_eq!(rec.kind(), Kind::String);
+        assert!(d.take(b"a").is_none());
+        assert_eq!(d.len(), 0);
+    }
+
+    /// The deadline travels, the same as it does through `export`.
+    #[test]
+    fn a_taken_key_keeps_the_time_it_had_left() {
+        let mut d = db();
+        put(&mut d, b"a", b"v1");
+        assert_eq!(d.expire(b"a", 2_000_000, Cond::Always), Applied::Ok);
+
+        let rec = d.take(b"a").expect("a record");
+        assert_eq!(rec.expire_at(), Some(2_000_000));
+    }
+
+    /// A key past its deadline is not there to take, which is the reaping every
+    /// other read does and not a special case here.
+    #[test]
+    fn a_dead_key_cannot_be_taken() {
+        let mut d = db();
+        d.sadd(b"s", [b"m1".as_ref()].into_iter()).expect("a set");
+        assert_eq!(d.expire(b"s", 1_000_001, Cond::Always), Applied::Ok);
+        d.clock_mut().advance(10);
+
+        assert!(d.take(b"s").is_none());
+        assert_eq!(d.sets.len(), 0, "and the body did not stay behind");
     }
 
     #[test]

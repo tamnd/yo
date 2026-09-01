@@ -137,8 +137,11 @@ doc = "14"
 # deadline lives in the key's record and EXPIRE is dispatched down the same path
 # DEL is. There was an expiry group in this file that listed none of them and
 # claimed nine, which was two names for one group and a count nobody could check.
-# What is left after the twenty one below is DUMP, RESTORE, MIGRATE, MOVE, SORT,
-# SORT_RO, WAIT and WAITAOF, and the first two of those want the file format.
+# What is left is DUMP, RESTORE and MIGRATE, and all three of them want the file
+# format, which is why they are the last three in the group rather than the
+# hardest three. MOVE, SORT, SORT_RO, WAIT and WAITAOF were the rest of it and
+# they landed together because none of them needs anything the store did not
+# already have.
 # DEL, UNLINK, EXISTS and TYPE landed in M2 and the rest are in M3. The four were
 # not a random quarter of the group, they are what Redis's own test suite needs
 # before it will run one file. OBJECT is here now because the size ladder is not
@@ -698,6 +701,41 @@ bounded = "risk"
 status = "shipped"
 wire = "verified"
 notes = "SORT without STORE, which is the whole difference. It exists so that a replica can answer a sort and so that a client with readonly permissions can ask for one, since SORT itself has to be a write command for the sake of an option most callers never use. STORE is not a word this parser knows, so SORT_RO k STORE d is a syntax error and not a permission error, which is what Redis answers too."
+
+[[command]]
+name = "MOVE"
+group = "keyspace"
+since = "1.0.0"
+arity = 3
+plan = "metadata"
+bounded = "inherent"
+status = "shipped"
+wire = "verified"
+notes = "COPY with the source deleted, and the one command here that is cheap for a reason COPY cannot borrow. A body in the slab is already a value standing on its own, so a move can take that body rather than clone it, and moving a set of a million members writes a slot number into another database and deletes a record. The store gained a take next to the existing export for this, and take is the one that deletes the record itself rather than leaving it to the caller, because between the body leaving the slab and the record going there is a record pointing at a slot that has been freed, which is the one state the whole file exists to prevent. A del on top of a take would go through free_body a second time and underflow the count of keys holding a body. The destination is asked about before the source is touched, which is the opposite of Redis's order and answers the same thing, and here it is not about cost: a take that has to be put back is not something this can do. Both misses answer zero, a database index that is not one is an error, and moving a key into the database it is already in is the same object error, which is checked before either key is looked at."
+
+[[command]]
+name = "WAIT"
+group = "keyspace"
+since = "3.0.0"
+arity = 3
+divergent = "D-25"
+plan = "none"
+bounded = "inherent"
+status = "shipped"
+wire = "verified"
+notes = "There is no replication, so the number of replicas that acknowledged this connection's writes is zero and always will be. Redis with no replicas attached gives the same zero, it just takes the whole timeout to do it, and answering at once instead is D-25. It carries the blocking flag because Redis gives it that flag and because that is what a client reads to decide whether it can send this on a pipelined connection, and the flag is what routes it to the file that holds the parking machinery even though it never parks. What is not a formality is the argument checking, since that is the only part of this a client can see today: numreplicas is any integer at all and a negative one is satisfied on the spot, and the timeout is whole milliseconds rather than the seconds BLPOP takes, so it has its own two complaints."
+
+[[command]]
+name = "WAITAOF"
+group = "keyspace"
+since = "7.2.0"
+arity = 4
+divergent = "D-25"
+plan = "none"
+bounded = "inherent"
+status = "shipped"
+wire = "verified"
+notes = "WAIT for the append only file rather than for replicas, and both of its numbers are zero here for the same reason: appendonly is fixed at no, so there is no local file to be behind, and there is no replication, so there are no remote ones either. The reply is a flat array of two integers on both protocols. Redis reads the three arguments with three different helpers and each has its own complaint, which is worth copying exactly because it is the whole of what a client can see: numlocal is a range and says it must be between 0 and 1, numreplicas must be positive, and the timeout is milliseconds and is refused separately for not being an integer and for being negative. The one error a client can provoke that is about the server rather than the arguments is WAITAOF with numlocal set, which cannot be used when appendonly is disabled, and it is disabled and immutable here."
 
 [[command]]
 name = "SCAN"
@@ -2236,6 +2274,17 @@ bounded = "inherent"
 status = "shipped"
 wire = "verified"
 notes = "FLUSHALL on the one database this connection is on."
+
+[[command]]
+name = "SWAPDB"
+group = "server"
+since = "4.0.0"
+arity = 3
+plan = "none"
+bounded = "inherent"
+status = "shipped"
+wire = "verified"
+notes = "In the server group and not the keyspace one, which is Redis's answer and is the right one: it names no key and what it changes is what every connected client is looking at. A database here is a value in a slice, so the swap is the slice's own swap and costs two pointer sized writes whatever is in either database, which is what makes this fast and dangerous at the same time. Nobody is told. A client on database zero is still on database zero and is now looking at what used to be database one, and a client parked in BLPOP remembers the index it blocked on rather than the database, so it wakes against the swapped in one. That is Redis's behaviour and here it falls out of the index being the thing that is stored rather than being a rule anybody wrote. The two arguments have two different complaints, and the split is Redis's: a word that is not a number says which of the two arguments was wrong, and a number that is not one of ours gets the same out of range message SELECT gives, because the first check happens while reading the argument and the second happens inside the swap."
 
 [[command]]
 name = "TIME"
