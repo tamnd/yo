@@ -45,7 +45,7 @@ permissions:
 
 # Two tags pushed close together would otherwise race each other through the
 # same publish, and the loser would be the one that finds the version already
-# uploaded. Not cancelled, because cancelling a run halfway through eighteen
+# uploaded. Not cancelled, because cancelling a run halfway through nineteen
 # uploads is the worst of both.
 concurrency:
   group: release-${{ inputs.tag || github.ref }}
@@ -113,7 +113,7 @@ jobs:
   # is not there yet is a broken instruction for however long the gap lasts.
   #
   # Everything in the workspace goes up, not just `yodb`. crates.io has no way
-  # to publish a crate without publishing what it depends on, so the seventeen
+  # to publish a crate without publishing what it depends on, so the eighteen
   # members are part of the release whether or not anyone is meant to depend on
   # them directly. `dx/12` §2 has the row saying so. `xtask` is `publish = false`
   # and stays out on its own.
@@ -138,7 +138,7 @@ jobs:
           save-if: false
 
       # What is already up there at this version. A publish is not a transaction
-      # across eighteen crates: if the ninth upload fails on a network blip the
+      # across nineteen crates: if the ninth upload fails on a network blip the
       # first eight are permanent, and re-running the job would then die on
       # "crate version already uploaded" without saying which one it meant. So
       # ask first and exclude what is done, which makes re-running the job the
@@ -239,7 +239,7 @@ jobs:
           done
 
       # `names.toml` says `free` for a name until something is published under
-      # it, and after this job seventeen of those rows are wrong. Nothing here
+      # it, and after this job eighteen of those rows are wrong. Nothing here
       # can fix them, because the file lives in the commit the tag points at and
       # a release does not push. So say it, in the summary, where whoever cut the
       # release will read it.

@@ -1,0 +1,26 @@
+[package]
+name = "yo-doc"
+description = "YOJB, the binary JSON encoding that yo stores documents in"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+yo-common.workspace = true
+
+[dev-dependencies]
+criterion = { workspace = true }
+
+[[bench]]
+name = "yojb"
+harness = false
+
+[lints]
+workspace = true

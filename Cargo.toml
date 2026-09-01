@@ -8,6 +8,7 @@ members = [
     "crates/yo-cli",
     "crates/yo-common",
     "crates/yo-crash",
+    "crates/yo-doc",
     "crates/yo-file",
     "crates/yo-format",
     "crates/yo-index",
@@ -53,6 +54,7 @@ yo-capi = { path = "crates/yo-capi", version = "0.3.12" }
 yo-cli = { path = "crates/yo-cli", version = "0.3.12" }
 yo-common = { path = "crates/yo-common", version = "0.3.12" }
 yo-crash = { path = "crates/yo-crash", version = "0.3.12" }
+yo-doc = { path = "crates/yo-doc", version = "0.3.12" }
 yo-file = { path = "crates/yo-file", version = "0.3.12" }
 yo-format = { path = "crates/yo-format", version = "0.3.12" }
 yo-index = { path = "crates/yo-index", version = "0.3.12" }
