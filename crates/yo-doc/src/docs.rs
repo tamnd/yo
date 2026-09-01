@@ -65,11 +65,13 @@
 //! through the table: `get(b"status")` resolves the name to an id once and then
 //! searches the document by id, which is a binary search over integers.
 
+use core::ops::Bound;
+
 use yo_common::{Code, Error, Result};
 use yo_kv::{Cursor, Elements, Full};
 
 use crate::head::{DEPTH_MAX, Kind};
-use crate::index::{self, Key, PathIndex};
+use crate::index::{self, IndexKind, Key, PathIndex};
 use crate::path::{Step, Steps};
 use crate::{Builder, Keys, Value};
 
@@ -218,28 +220,55 @@ impl Docs {
         Ok(fresh)
     }
 
-    /// Start indexing `path`, and file every document already here under it.
+    /// Start indexing `path` for equality, and file every document already here
+    /// under it.
     ///
     /// Declaring the same path twice is not an error and does not rebuild
     /// anything, because a caller that opens a collection and declares its
     /// indexes on the way in should be able to do that every time it opens it.
+    /// An ordered index that is already there stays ordered, since it answers
+    /// equality as well.
     ///
     /// The backfill is a path lookup per document, so it costs the collection
     /// once. There is no background indexer and no window in which the index is
     /// declared and not yet true, which is Y3.
     pub fn create_index(&mut self, path: &str) -> Result<()> {
-        self.create_index_bytes(path.as_bytes())
+        self.create_index_bytes(path.as_bytes(), IndexKind::Equality)
     }
 
-    /// [`Docs::create_index`] for a path that is already bytes.
-    pub fn create_index_bytes(&mut self, path: &[u8]) -> Result<()> {
+    /// Start indexing `path` for equality and for ranges.
+    ///
+    /// An ordered index is an equality index with a counted B+ tree over the
+    /// rows of its key table, which is the same tree a sorted set ranks with.
+    /// It costs about three bytes per distinct value on top of the equality
+    /// index and a logarithmic search per new value, and it is what
+    /// [`Docs::range`] needs.
+    ///
+    /// A path that is already indexed for equality is upgraded and rebuilt. The
+    /// alternative is answering `Ok` and then having every range on it come back
+    /// empty, which is a query that lies.
+    pub fn create_ordered_index(&mut self, path: &str) -> Result<()> {
+        self.create_index_bytes(path.as_bytes(), IndexKind::Ordered)
+    }
+
+    /// [`Docs::create_index`] and [`Docs::create_ordered_index`] for a path that
+    /// is already bytes.
+    pub fn create_index_bytes(&mut self, path: &[u8], kind: IndexKind) -> Result<()> {
         for step in Steps::new(path) {
             step?;
         }
-        if self.indexes.iter().any(|i| i.path() == path) {
-            return Ok(());
+        match self.indexes.iter().position(|i| i.path() == path) {
+            // Equality on top of ordered is already answered, and equality on
+            // top of equality is nothing at all.
+            Some(_) if kind == IndexKind::Equality => return Ok(()),
+            Some(at) if self.indexes[at].kind() == IndexKind::Ordered => return Ok(()),
+            Some(at) => {
+                self.indexes.remove(at);
+                self.taken.truncate(self.indexes.len());
+            }
+            None => {}
         }
-        let mut index = PathIndex::new(path);
+        let mut index = PathIndex::new(path, kind);
         for (id, bytes) in self.rows.pairs() {
             let Some(value) = Value::new(bytes) else {
                 continue;
@@ -339,6 +368,83 @@ impl Docs {
             )
         })?;
         Ok(index.count(key))
+    }
+
+    /// Hand every document whose value at `path` falls between `lo` and `hi` to
+    /// `f`, smallest first, and say how many there were.
+    ///
+    /// One search of the tree and then a walk, so the cost is the size of the
+    /// answer and not the size of the collection. The bounds are the ordinary
+    /// [`Bound`], so a half open range, a range open at one end and a range open
+    /// at both are all the same call.
+    ///
+    /// The path has to carry an ordered index. An equality index has no order to
+    /// walk, and answering nothing would be a query that lies rather than a
+    /// query that says no.
+    pub fn range(
+        &self,
+        path: &str,
+        lo: Bound<&Key>,
+        hi: Bound<&Key>,
+        mut f: impl FnMut(&[u8], Doc<'_>),
+    ) -> Result<usize> {
+        let index = self.ordered(path)?;
+        let mut n = 0usize;
+        for (_, set) in index.range(lo, hi) {
+            index::each_id(set, |id| {
+                if let Some(doc) = self.get(id) {
+                    f(id, doc);
+                    n += 1;
+                }
+            });
+        }
+        Ok(n)
+    }
+
+    /// [`Docs::range`] backwards, largest value first.
+    pub fn range_rev(
+        &self,
+        path: &str,
+        lo: Bound<&Key>,
+        hi: Bound<&Key>,
+        mut f: impl FnMut(&[u8], Doc<'_>),
+    ) -> Result<usize> {
+        let index = self.ordered(path)?;
+        let mut n = 0usize;
+        for (_, set) in index.range_rev(lo, hi) {
+            index::each_id(set, |id| {
+                if let Some(doc) = self.get(id) {
+                    f(id, doc);
+                    n += 1;
+                }
+            });
+        }
+        Ok(n)
+    }
+
+    /// How many documents fall between `lo` and `hi` at `path`, without reading
+    /// any of them.
+    ///
+    /// This reads the distinct values in the range rather than the documents, so
+    /// a range covering a million documents under a hundred values costs a
+    /// hundred.
+    pub fn count_range(&self, path: &str, lo: Bound<&Key>, hi: Bound<&Key>) -> Result<usize> {
+        Ok(self.ordered(path)?.count_in(lo, hi))
+    }
+
+    /// The ordered index on `path`, or the error that says why there is not one.
+    fn ordered(&self, path: &str) -> Result<&PathIndex> {
+        match self.index(path) {
+            Some(index) if index.kind() == IndexKind::Ordered => Ok(index),
+            Some(_) => Err(Error::fmt(
+                Code::Invalid,
+                format_args!("the index on {path} answers equality and not ranges"),
+            )),
+            None => Err(Error::fmt(
+                Code::Invalid,
+                format_args!("there is no index on {path}, so this would be a scan"),
+            )),
+        }
     }
 
     /// The document stored under `id`.
@@ -1248,6 +1354,151 @@ mod tests {
                 "order:6"
             ]
         );
+    }
+
+    /// The customer numbers a range answers, in the order it answered them.
+    fn ranged(docs: &Docs, lo: Bound<&Key>, hi: Bound<&Key>) -> Vec<i64> {
+        let mut out = Vec::new();
+        let n = docs
+            .range("$.customer", lo, hi, |_, d| {
+                out.push(d.get(b"customer").and_then(|v| v.as_int()).expect("there"));
+            })
+            .expect("ordered");
+        assert_eq!(n, out.len());
+
+        let mut back = Vec::new();
+        docs.range_rev("$.customer", lo, hi, |_, d| {
+            back.push(d.get(b"customer").and_then(|v| v.as_int()).expect("there"));
+        })
+        .expect("ordered");
+        back.reverse();
+        assert_eq!(out, back, "backwards is forwards read the other way");
+        assert_eq!(
+            docs.count_range("$.customer", lo, hi).expect("ordered"),
+            out.len()
+        );
+        out
+    }
+
+    #[test]
+    fn an_ordered_index_answers_a_range_in_order() {
+        let mut docs = Docs::new();
+        docs.create_ordered_index("$.customer").expect("ordered");
+        // Customer is seven times the id, so the values are 0, 7, 14 and on.
+        for i in 0..64i64 {
+            docs.put_bytes(format!("order:{i}").as_bytes(), &order(i, "open", 1))
+                .expect("put");
+        }
+
+        assert_eq!(
+            ranged(&docs, Bound::Unbounded, Bound::Unbounded),
+            (0..64i64).map(|i| i * 7).collect::<Vec<i64>>()
+        );
+        let (lo, hi) = (Key::int(70), Key::int(105));
+        assert_eq!(
+            ranged(&docs, Bound::Included(&lo), Bound::Included(&hi)),
+            [70, 77, 84, 91, 98, 105]
+        );
+        assert_eq!(
+            ranged(&docs, Bound::Excluded(&lo), Bound::Excluded(&hi)),
+            [77, 84, 91, 98]
+        );
+        // Bounds that fall between two values, which is the ordinary case.
+        assert_eq!(
+            ranged(
+                &docs,
+                Bound::Included(&Key::int(71)),
+                Bound::Excluded(&Key::int(90))
+            ),
+            [77, 84]
+        );
+        assert!(ranged(&docs, Bound::Included(&Key::int(442)), Bound::Unbounded).is_empty());
+
+        // Equality still works on the same index.
+        assert_eq!(docs.count("$.customer", &Key::int(70)).expect("i"), 1);
+        assert_eq!(
+            docs.index("$.customer").expect("there").kind(),
+            IndexKind::Ordered
+        );
+    }
+
+    #[test]
+    fn a_range_stays_right_through_writes_and_removals() {
+        let mut docs = Docs::new();
+        for i in 0..128i64 {
+            docs.put_bytes(format!("order:{i}").as_bytes(), &order(i, "open", 1))
+                .expect("put");
+        }
+        // Declared after the fact, so this is the backfill and not the write
+        // path putting the tree together.
+        docs.create_ordered_index("$.customer").expect("ordered");
+        assert_eq!(ranged(&docs, Bound::Unbounded, Bound::Unbounded).len(), 128);
+
+        // Every removal moves the key table's last row into the hole, so this is
+        // the renumbering going through the whole collection.
+        for i in (0..128i64).step_by(2) {
+            assert!(docs.remove(format!("order:{i}").as_bytes()));
+        }
+        assert_eq!(
+            ranged(&docs, Bound::Unbounded, Bound::Unbounded),
+            (0..128i64)
+                .filter(|i| i % 2 == 1)
+                .map(|i| i * 7)
+                .collect::<Vec<i64>>()
+        );
+
+        // And an overwrite that moves a document from one key to another.
+        docs.put_bytes(b"order:1", &order(200, "open", 1))
+            .expect("put");
+        let after = ranged(&docs, Bound::Unbounded, Bound::Unbounded);
+        assert_eq!(after.first(), Some(&21), "seven is gone");
+        assert_eq!(after.last(), Some(&1400), "and it came back at the top");
+    }
+
+    #[test]
+    fn an_equality_index_refuses_a_range_rather_than_answering_nothing() {
+        let mut docs = Docs::new();
+        docs.create_index("$.customer").expect("indexed");
+        docs.put_bytes(b"order:1", &order(1, "open", 1))
+            .expect("put");
+        let err = docs
+            .range("$.customer", Bound::Unbounded, Bound::Unbounded, |_, _| ())
+            .expect_err("refused");
+        assert_eq!(err.code(), Code::Invalid);
+        assert!(err.to_string().contains("equality"), "{err}");
+        assert_eq!(
+            docs.range("$.status", Bound::Unbounded, Bound::Unbounded, |_, _| ())
+                .expect_err("refused")
+                .code(),
+            Code::Invalid
+        );
+    }
+
+    #[test]
+    fn asking_for_an_order_on_an_equality_index_upgrades_it() {
+        let mut docs = Docs::new();
+        docs.create_index("$.customer").expect("indexed");
+        for i in 0..8i64 {
+            docs.put_bytes(format!("order:{i}").as_bytes(), &order(i, "open", 1))
+                .expect("put");
+        }
+        assert_eq!(
+            docs.index("$.customer").expect("there").kind(),
+            IndexKind::Equality
+        );
+
+        docs.create_ordered_index("$.customer").expect("upgraded");
+        assert_eq!(docs.indexes().len(), 1, "it replaced rather than added");
+        assert_eq!(ranged(&docs, Bound::Unbounded, Bound::Unbounded).len(), 8);
+
+        // And going the other way leaves the order alone, because an ordered
+        // index answers equality too.
+        docs.create_index("$.customer").expect("already there");
+        assert_eq!(
+            docs.index("$.customer").expect("there").kind(),
+            IndexKind::Ordered
+        );
+        assert_eq!(docs.indexes().len(), 1);
     }
 
     #[test]
