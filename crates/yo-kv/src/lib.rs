@@ -92,6 +92,7 @@
 
 #![deny(missing_docs)]
 
+pub mod access;
 pub mod array;
 pub mod arrays;
 pub mod blob;
