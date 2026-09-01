@@ -196,3 +196,11 @@ reason = "Both commands ask whether this connection's writes have got somewhere 
 status = "until"
 resolved_by = "M8"
 spec = "12 section 8"
+
+[[divergence]]
+id = "D-26"
+title = "RESTORE checks IDLETIME and FREQ and then drops them"
+reason = "Both options set eviction metadata on a real server, so a key restored with IDLETIME 3600 arrives already an hour stale and one restored with FREQ 200 arrives hot. There is no eviction here yet, and the store has readers for that metadata and no writer, so a restored key starts with the idle time and the counter any new key gets. Both numbers are still parsed and range checked rather than skipped, because the four error messages are the whole of what a client can see about these two options today, and a client that sends FREQ 300 should be told it is out of range whether or not anybody is going to act on 200. What a client can observe is OBJECT IDLETIME and OBJECT FREQ answering the same thing for a restored key as for a freshly written one, and that stops being a divergence when the eviction milestone gives the metadata a writer."
+status = "until"
+resolved_by = "M5"
+spec = "14 section 5"
