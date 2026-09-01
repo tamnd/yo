@@ -192,15 +192,15 @@ const TOMB: u32 = 0x00FF_FFFF;
 
 /// How full the slot array is allowed to get before it grows.
 ///
-/// Seven eighths, which is one free slot per group and is the load a group probe
-/// is built for. A slot at a time this would be a bad number, because an
-/// unsuccessful linear probe costs half of one plus one over the square of one
-/// minus the load and that is twenty three slots here against two and a half at
-/// three quarters. Eight slots at a time it is a little over one group either
-/// way, so the load can go where the memory wants it. Markers count towards it,
-/// because a marker is a slot a probe has to look at and step over.
-const LOAD_NUM: usize = 7;
-const LOAD_DEN: usize = 8;
+/// Three quarters, which is where a group of eight still nearly always has an
+/// empty slot in it. That is the number a probe actually cares about, because it
+/// stops at the first group with an empty and not at the first empty slot: at
+/// three quarters nine groups in ten hold one and a miss is 1.1 groups, and at
+/// seven eighths only six in ten do and a miss is over one and a half. Markers
+/// count towards it, because a marker is a slot a probe has to look at and step
+/// over.
+const LOAD_NUM: usize = 3;
+const LOAD_DEN: usize = 4;
 
 /// The smallest slot array, which is one cache line of slots.
 const MIN_SLOTS: usize = 16;
@@ -760,7 +760,7 @@ impl<V: Copy> Elements<V> {
         let mut at = group_at(bits_of(h), self.groups());
         loop {
             let slots = &self.slots[at..at + group::WIDTH];
-            let mut hits = group::tags(slots, tag);
+            let (mut hits, gaps) = group::scan(slots, tag, EMPTY);
             while hits != 0 {
                 let i = hits.trailing_zeros() as usize;
                 hits &= hits - 1;
@@ -773,7 +773,7 @@ impl<V: Copy> Elements<V> {
                     return Some(row as usize);
                 }
             }
-            if group::empty(slots, EMPTY) != 0 {
+            if gaps != 0 {
                 return None;
             }
             at = self.next_group(at);

@@ -20,8 +20,17 @@
 //!
 //! The stop condition falls out of the same work. A probe stops at the first
 //! group with an empty slot in it, so the empty mask is both the answer to "is
-//! it here" and the answer to "is there anywhere left to look", and neither
-//! costs a separate pass.
+//! it here" and the answer to "is there anywhere left to look". [`scan`] hands
+//! back both off one pass, because the slots are already in registers by the
+//! time the first one has been worked out and going round again for the second
+//! is thirty two bytes read twice for nothing.
+//!
+//! How full the array is allowed to get is [`crate::elem`]'s decision and not
+//! this module's, but the number a group probe cares about is not the load, it
+//! is the chance that a group has an empty slot in it. Eight wide, three
+//! quarters full, that is nine in ten and a miss is 1.1 groups. Seven eighths
+//! full it is six in ten and a miss is over one and a half, which is why the
+//! load this ships with is the first number and not the second.
 //!
 //! # Why eight and why aligned
 //!
@@ -45,8 +54,9 @@
 
 /// How many slots one group covers.
 ///
-/// A power of two, and the slot array is a power of two and never smaller than
-/// this, so every group is aligned and there is no partial group at the end.
+/// A power of two, and the slot array is a whole number of these and never
+/// fewer than one, so every group is aligned and there is no partial group at
+/// the end.
 pub const WIDTH: usize = 8;
 
 /// The slots of one group, always [`WIDTH`] of them.
@@ -63,6 +73,22 @@ pub type Slots<'a> = &'a [u32];
 pub fn tags(slots: Slots<'_>, tag: u8) -> u8 {
     debug_assert_eq!(slots.len(), WIDTH);
     imp::eq_top(slots, tag)
+}
+
+/// The tag mask and the empty mask together, off one pass over the group.
+///
+/// A probe wants both of them every time round: which slots might be the name it
+/// is looking for, and whether it is allowed to stop here. Asked for one at a
+/// time they are two passes over the same thirty two bytes, and the second one
+/// is pure waste because the first already had the slots in registers.
+///
+/// Answered in that order, tags first and empties second, which is the order the
+/// caller uses them in.
+#[inline(always)]
+#[must_use]
+pub fn scan(slots: Slots<'_>, tag: u8, empty: u32) -> (u8, u8) {
+    debug_assert_eq!(slots.len(), WIDTH);
+    imp::scan(slots, tag, empty)
 }
 
 /// Which slots have never been written to.
@@ -135,6 +161,40 @@ mod imp {
         }
     }
 
+    /// Both masks off one load of each half.
+    #[inline(always)]
+    unsafe fn pair(
+        slots: &[u32],
+        at: usize,
+        top: __m128i,
+        want: __m128i,
+        none: __m128i,
+    ) -> (u8, u8) {
+        // SAFETY: as `half`, and the two compares read the same loaded lanes.
+        unsafe {
+            let v = _mm_loadu_si128(slots.as_ptr().add(at).cast::<__m128i>());
+            let t = _mm_cmpeq_epi32(_mm_and_si128(v, top), want);
+            let e = _mm_cmpeq_epi32(v, none);
+            (
+                _mm_movemask_ps(_mm_castsi128_ps(t)) as u8,
+                _mm_movemask_ps(_mm_castsi128_ps(e)) as u8,
+            )
+        }
+    }
+
+    #[inline(always)]
+    pub fn scan(slots: &[u32], tag: u8, empty: u32) -> (u8, u8) {
+        // SAFETY: SSE2 is part of the x86-64 baseline.
+        unsafe {
+            let top = _mm_set1_epi32(0xFF00_0000u32 as i32);
+            let want = _mm_set1_epi32((u32::from(tag) << 24) as i32);
+            let none = _mm_set1_epi32(empty as i32);
+            let (t0, e0) = pair(slots, 0, top, want, none);
+            let (t1, e1) = pair(slots, 4, top, want, none);
+            (t0 | (t1 << 4), e0 | (e1 << 4))
+        }
+    }
+
     #[inline(always)]
     pub fn eq_top(slots: &[u32], tag: u8) -> u8 {
         both(slots, 0xFF00_0000, u32::from(tag) << 24)
@@ -185,6 +245,42 @@ mod imp {
         }
     }
 
+    /// Both masks off one load of each half.
+    #[inline(always)]
+    unsafe fn pair(
+        slots: &[u32],
+        at: usize,
+        top: uint32x4_t,
+        want: uint32x4_t,
+        none: uint32x4_t,
+    ) -> (u8, u8) {
+        const BITS: [u32; 4] = [1, 2, 4, 8];
+        // SAFETY: as `half`, and the two compares read the same loaded lanes.
+        unsafe {
+            let bits = vld1q_u32(BITS.as_ptr());
+            let v = vld1q_u32(slots.as_ptr().add(at));
+            let t = vceqq_u32(vandq_u32(v, top), want);
+            let e = vceqq_u32(v, none);
+            (
+                vaddvq_u32(vandq_u32(t, bits)) as u8,
+                vaddvq_u32(vandq_u32(e, bits)) as u8,
+            )
+        }
+    }
+
+    #[inline(always)]
+    pub fn scan(slots: &[u32], tag: u8, empty: u32) -> (u8, u8) {
+        // SAFETY: NEON is part of the aarch64 baseline.
+        unsafe {
+            let top = vdupq_n_u32(0xFF00_0000);
+            let want = vdupq_n_u32(u32::from(tag) << 24);
+            let none = vdupq_n_u32(empty);
+            let (t0, e0) = pair(slots, 0, top, want, none);
+            let (t1, e1) = pair(slots, 4, top, want, none);
+            (t0 | (t1 << 4), e0 | (e1 << 4))
+        }
+    }
+
     #[inline(always)]
     pub fn eq_top(slots: &[u32], tag: u8) -> u8 {
         both(slots, 0xFF00_0000, u32::from(tag) << 24)
@@ -215,6 +311,11 @@ mod imp {
             bits |= u8::from(slot & and == want) << i;
         }
         bits
+    }
+
+    #[inline(always)]
+    pub fn scan(slots: &[u32], tag: u8, empty: u32) -> (u8, u8) {
+        (eq_top(slots, tag), eq_all(slots, empty))
     }
 
     #[inline(always)]
@@ -291,6 +392,13 @@ mod tests {
                 scalar(&group, u32::MAX, 0xFFFF_FFFF),
                 "empty over {group:08x?}"
             );
+            for tag in [1u8, 0x3F, 0xFF] {
+                assert_eq!(
+                    scan(&group, tag, 0xFFFF_FFFF),
+                    (tags(&group, tag), empty(&group, 0xFFFF_FFFF)),
+                    "one pass and two have to agree, tag {tag:#04x} over {group:08x?}"
+                );
+            }
             assert_eq!(
                 free(&group, 0x00FF_FFFF),
                 scalar(&group, 0x00FF_FFFF, 0x00FF_FFFF),
