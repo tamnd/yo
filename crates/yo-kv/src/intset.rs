@@ -1019,7 +1019,11 @@ impl Run {
     fn grow_by(&mut self, w: usize) {
         let want = self.bytes.len() + w;
         if want > self.bytes.capacity() {
-            self.bytes.reserve_exact(STEP * w);
+            // `yo_alloc::for_the_data` and not a fix. A run that has taken its
+            // ten thousandth member has grown along the way, and this is the
+            // only place in the intset that ever asks the allocator for
+            // anything.
+            yo_alloc::for_the_data(|| self.bytes.reserve_exact(STEP * w));
         }
         self.bytes.resize(want, 0);
     }

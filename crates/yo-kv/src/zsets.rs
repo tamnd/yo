@@ -594,9 +594,12 @@ impl Keyspace {
         // the allocator on every `ZRANDMEMBER` is a malloc and a free on a
         // command a sampler sends in a loop. Taken out and put back, so an early
         // return leaves it as it was found.
+        // `yo_alloc::high_water` because this is the buffer reaching a size it
+        // has not been asked for before, which happens once per largest sorted
+        // set the database has been sampled from and never again.
         let mut rows = std::mem::take(&mut self.rows);
         rows.clear();
-        rows.extend(0..len);
+        yo_alloc::high_water(|| rows.extend(0..len));
         for i in 0..want {
             let pick = i + self.rng.below(len - i);
             rows.swap(i, pick);

@@ -56,14 +56,30 @@ pub(super) fn execute(db: &mut Keyspace, spec: &Spec, args: Args<'_>, out: &mut 
             None => out.nil(),
         },
         "set" => set(db, args, out)?,
-        "getset" => match db.getset(args.get(1), args.get(2))? {
-            Some(v) => out.bulk(&v),
-            None => out.nil(),
-        },
-        "getdel" => match db.getdel(args.get(1))? {
-            Some(v) => out.bulk(&v),
-            None => out.nil(),
-        },
+        // Both of these have an owning form the embedded caller wants and a
+        // `_with` form that hands the old value over where it lies. On the wire
+        // the value is written into the reply and never looked at again, so the
+        // owning form would be a malloc and a free per command.
+        "getset" => {
+            let mut had = false;
+            db.set_with(
+                args.get(1),
+                args.get(2),
+                SetOptions::PLAIN.returning(),
+                |v| {
+                    had = true;
+                    write_str(out, v);
+                },
+            )?;
+            if !had {
+                out.nil();
+            }
+        }
+        "getdel" => {
+            if !db.getdel_with(args.get(1), |v| write_str(out, v))? {
+                out.nil();
+            }
+        }
         "getex" => getex(db, args, out)?,
         "setnx" => out.int(i64::from(db.setnx(args.get(1), args.get(2))?)),
         "setex" => {
@@ -336,11 +352,18 @@ fn set(db: &mut Keyspace, args: Args<'_>, out: &mut Out) -> Result<()> {
         opts.compare = Some(condition(keyword, args.get(at))?);
     }
 
-    let done = db.set(key, val, opts)?;
+    // `set_with` and not `set`, so the old value goes straight into the reply
+    // out of the record it is still sitting in. `set` would hand it back as a
+    // `Vec` that this writes once and drops, which is a malloc and a free per
+    // `SET ... GET`.
+    let mut had = false;
+    let done = db.set_with(key, val, opts, |v| {
+        had = true;
+        write_str(out, v);
+    })?;
     if opts.get {
-        match done.previous {
-            Some(v) => out.bulk(&v),
-            None => out.nil(),
+        if !had {
+            out.nil();
         }
     } else if done.stored {
         out.ok();

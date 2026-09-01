@@ -195,6 +195,26 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo xtask check
 
+  # Y7 says a command path does not allocate, which is a claim that decays the
+  # moment nothing checks it. This builds a debug yodb with the allocation check
+  # in report mode, sends about nine thousand commands covering every type and
+  # fails if anything asked the allocator for memory. Debug on purpose: release
+  # inlines the frames into each other and the report comes back naming
+  # `serve_command` for everything, which tells nobody anything.
+  #
+  # It is here and not in `deep.yml` because the fix is nearly always one line
+  # and the person who wants to know is the one who just wrote it.
+  alloc:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2.9.2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - run: cargo xtask alloc
+
   # The C header is the surface every binding sits on, so it gets compiled the
   # way a caller would compile it: two compilers, every dialect they support,
   # warnings as errors. Then the example is linked and run, because a header

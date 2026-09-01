@@ -6,9 +6,15 @@ tool for finding out how many there are. Report mode captures a backtrace for
 each distinct site instead, and this is the thing that produces the workload
 those backtraces come from.
 
-It builds yodb, starts it on a free port with the check armed, sends about four
-and a half thousand commands covering every type, stops the server and prints
-one line per distinct site with the innermost frame that is in this repository.
+It builds yodb, starts it on a free port with the check armed, sends about nine
+thousand commands covering every type, stops the server and prints one line per
+distinct site with the innermost frame that is in this repository.
+
+It is a gate and not just a report. An empty list exits 0 and anything else
+exits 1, so CI runs this and a new allocation on a command path fails the pull
+request that added it, with the file and the line in the log. Report mode rather
+than abort mode because a report names every site in one run and an abort names
+the first one, and the list is the thing worth reading.
 
 Two passes over the same commands. The first one creates every key it touches,
 so it sees a key coming into existence, which is the one allocation a command is
@@ -67,6 +73,11 @@ def workload(tag):
         a(("DECR", k("n%d" % i)))
         a(("SETEX", k("e%d" % i), "100", "v"))
         a(("GETSET", k("s%d" % i), "reset"))
+        a(("SET", k("s%d" % i), "v", "GET"))
+        a(("SET", k("d%d" % i), "gone"))
+        a(("GETDEL", k("d%d" % i)))
+        a(("GETEX", k("s%d" % i), "EX", "1000"))
+        a(("DIGEST", k("s%d" % i)))
         a(("SETNX", k("s%d" % i), "no"))
         a(("EXISTS", k("s%d" % i)))
         a(("TYPE", k("s%d" % i)))
@@ -289,7 +300,11 @@ def main():
     if KEEP:
         print("")
         print("raw log at %s" % log.name)
-    return 0
+    print("")
+    print("Y7 says a command path does not allocate. Every site above either")
+    print("needs fixing or needs one of the claims in yo_alloc around it:")
+    print("first_touch, for_the_data or high_water. Pick the one that is true.")
+    return 1
 
 
 if __name__ == "__main__":

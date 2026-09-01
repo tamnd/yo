@@ -368,7 +368,11 @@ fn bench_small(c: &mut Criterion) {
             let text_refs: Vec<&Set> = text.iter().collect();
 
             for (what, refs) in [("ints", &int_refs), ("text", &text_refs)] {
-                let id = format!("{what}/k{k}");
+                // The size is in the identifier because the loop above runs two
+                // of them. Without it both sizes claim the same row name and
+                // criterion panics on the duplicate, which it did, and the
+                // sixty four member rows were never measured at all.
+                let id = format!("{what}/n{n}/k{k}");
                 g.bench_with_input(BenchmarkId::new("inter", &id), &n, |b, _| {
                     let mut sc = setops::Scratch::new();
                     b.iter(|| {

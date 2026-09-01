@@ -169,9 +169,10 @@ pub struct SetOutcome {
     pub stored: bool,
     /// The previous value, when `GET` was asked for and there was one.
     ///
-    /// Owned, because the record it lived in has been freed by the time this is
-    /// handed back. `SET ... GET` is the one string command that cannot avoid a
-    /// copy, and it is not on the gate list.
+    /// Owned, because the record it lived in has been written over by the time
+    /// this is handed back, and only ever filled in by [`Keyspace::set`]. A
+    /// caller that does not want the copy calls [`Keyspace::set_with`] and gets
+    /// the old value where it still lives, which is what the wire does.
     pub previous: Option<Vec<u8>>,
 }
 
@@ -300,7 +301,39 @@ impl Keyspace {
     /// once, `NX`, `XX` and the four `IF` forms all decide against that one
     /// look, and `GET` reports what was there whether or not the write went
     /// ahead.
+    ///
+    /// The old value comes back owned, which costs a copy of it. On the wire
+    /// that copy is pure waste, because the reply is written and the bytes are
+    /// never looked at again, so the wire calls [`Keyspace::set_with`] instead
+    /// and this is that with a `to_vec` on the end.
     pub fn set(&mut self, key: &[u8], val: &[u8], opts: SetOptions<'_>) -> Result<SetOutcome> {
+        let mut previous = None;
+        let mut out = self.set_with(key, val, opts, |v| previous = Some(v.to_vec()))?;
+        out.previous = previous;
+        Ok(out)
+    }
+
+    /// `SET`, handing the old value to `previous` rather than copying it out.
+    ///
+    /// [`Keyspace::set`] with the allocation taken off it. `previous` is called
+    /// with the value as it lies in the record, before the write goes over it,
+    /// and only when `GET` was asked for and there was something there. Nothing
+    /// after that point can fail, so a caller that writes the value straight
+    /// into a reply is not going to have to take it back out again.
+    ///
+    /// [`SetOutcome::previous`] is always `None` here. The value went to the
+    /// closure, and putting it in both places would be the copy this exists to
+    /// avoid.
+    pub fn set_with<F>(
+        &mut self,
+        key: &[u8],
+        val: &[u8],
+        opts: SetOptions<'_>,
+        previous: F,
+    ) -> Result<SetOutcome>
+    where
+        F: FnOnce(Str<'_>),
+    {
         check_len(key, val.len())?;
         self.reap(key);
         if opts.get || opts.compare.is_some() {
@@ -315,7 +348,7 @@ impl Keyspace {
         if opts.get
             && let Some(rec) = present
         {
-            out.previous = Some(value::read(rec).to_vec());
+            previous(value::read(rec));
         }
         let allowed = match opts.exists {
             Exists::Always => true,
@@ -392,13 +425,29 @@ impl Keyspace {
 
     /// `GETDEL key`.
     pub fn getdel(&mut self, key: &[u8]) -> Result<Option<Vec<u8>>> {
+        let mut had = None;
+        self.getdel_with(key, |v| had = Some(v.to_vec()))?;
+        Ok(had)
+    }
+
+    /// `GETDEL`, handing the value to `f` rather than copying it out.
+    ///
+    /// [`Keyspace::getdel`] with the allocation taken off it, the same pair
+    /// [`Keyspace::set`] and [`Keyspace::set_with`] are. `f` is called with the
+    /// value where it still lies, before the key goes, and the answer says
+    /// whether there was one.
+    pub fn getdel_with<F>(&mut self, key: &[u8], f: F) -> Result<bool>
+    where
+        F: FnOnce(Str<'_>),
+    {
         self.reap(key);
         self.string_only(key)?;
-        let had = self.peek(key).map(|v| v.to_vec());
-        if had.is_some() {
-            self.drop_key(key);
-        }
-        Ok(had)
+        let Some(v) = self.peek(key) else {
+            return Ok(false);
+        };
+        f(v);
+        self.drop_key(key);
+        Ok(true)
     }
 
     /// `GETEX key [EX s|PX ms|EXAT s|PXAT ms|PERSIST]`.
@@ -419,9 +468,17 @@ impl Keyspace {
                 // this reads the value out and writes the whole record back. A
                 // deadline that is added or removed changes the record's length,
                 // so there is nothing to overwrite in place.
+                //
+                // Through the database's scratch buffer rather than a fresh
+                // `Vec`, for the reason `RENAME` does the same thing: the
+                // borrow of the map has to end before the write can begin, and
+                // a value carried three lines is not worth a malloc and a free.
                 let rec = self.map.get(key).expect("checked just above");
-                let bytes = value::read(rec).to_vec();
+                let mut bytes = std::mem::take(&mut self.scratch);
+                bytes.clear();
+                value::read(rec).write_to(&mut bytes);
                 self.store(key, &bytes, wanted);
+                self.scratch = bytes;
             }
         }
         Ok(self.peek(key))
@@ -659,8 +716,17 @@ impl Keyspace {
         self.string_only(key)?;
         let (current, deadline) = match self.map.get(key) {
             Some(rec) => {
-                let text = value::read(rec).to_vec();
-                let n = parse_f64(&text).ok_or_else(|| Error::new(Code::Invalid, NOT_A_FLOAT))?;
+                // Read out of the record rather than copied out of it. An int
+                // encoded value has no digits anywhere to borrow, so that arm
+                // converts instead of formatting and parsing, which is the same
+                // double either way: the decimal form of an `i64` rounds to the
+                // nearest double and so does the cast.
+                let n = match value::read(rec) {
+                    Str::Int(n) => n as f64,
+                    Str::Bytes(b) => {
+                        parse_f64(b).ok_or_else(|| Error::new(Code::Invalid, NOT_A_FLOAT))?
+                    }
+                };
                 (n, value::expire_at(rec))
             }
             None => (0.0, None),
@@ -1542,6 +1608,72 @@ mod tests {
         );
         // And the key it could not increment is left as it was.
         assert_eq!(got(&mut s, b"k").as_deref(), Some(&b"10.6"[..]));
+    }
+
+    /// An int encoded value takes the other arm of the read in `incrbyfloat`,
+    /// which converts rather than formatting the digits and parsing them back.
+    /// Both arms have to reach the same double or the same command answers two
+    /// different things depending on how the value happened to be stored.
+    #[test]
+    fn incrbyfloat_reads_an_int_encoded_value_the_same_as_its_digits() {
+        for n in [0i64, 6, -6, 1 << 40, -(1 << 40), i64::MAX, i64::MIN] {
+            let mut s = store();
+            s.set_plain(b"i", n.to_string().as_bytes()).unwrap();
+            // `APPEND` of nothing leaves the same bytes in a record that is no
+            // longer int encoded, which is the only way to get the two arms
+            // looking at one value.
+            s.set_plain(b"t", n.to_string().as_bytes()).unwrap();
+            s.append(b"t", b"").unwrap();
+            assert_eq!(s.encoding(b"i"), Some(Encoding::Int));
+            assert_ne!(s.encoding(b"t"), Some(Encoding::Int));
+            assert_eq!(
+                s.incrbyfloat(b"i", 0.5).unwrap(),
+                s.incrbyfloat(b"t", 0.5).unwrap(),
+                "the two encodings of {n} do not increment alike"
+            );
+        }
+    }
+
+    /// `INCRBYFLOAT` used to copy the value out of the record so it could parse
+    /// it, and then throw the copy away.
+    #[test]
+    fn incrbyfloat_does_not_allocate() {
+        let mut s = store();
+        for _ in 0..4 {
+            s.incrbyfloat(b"f", 1.5).unwrap();
+        }
+        let (_, allocs) = crate::tally::counted(|| {
+            for _ in 0..50 {
+                s.incrbyfloat(b"f", 1.5).unwrap();
+            }
+        });
+        assert_eq!(allocs, 0, "incrbyfloat allocated {allocs} times in fifty");
+    }
+
+    /// `SET ... GET` used to hand the old value back as a `Vec` that the wire
+    /// writes once and drops.
+    #[test]
+    fn set_with_does_not_allocate_to_report_the_old_value() {
+        let mut s = store();
+        let opts = SetOptions::PLAIN.returning();
+        let mut seen = Vec::with_capacity(64);
+        for _ in 0..4 {
+            s.set_with(b"k", b"a-value", opts, |v| v.write_to(&mut seen))
+                .unwrap();
+        }
+        let (_, allocs) = crate::tally::counted(|| {
+            for _ in 0..50 {
+                seen.clear();
+                s.set_with(b"k", b"a-value", opts, |v| v.write_to(&mut seen))
+                    .unwrap();
+            }
+        });
+        assert_eq!(allocs, 0, "set with GET allocated {allocs} times in fifty");
+        assert_eq!(seen, b"a-value");
+        // And the owning version still answers what it always did.
+        let done = s.set(b"k", b"next", opts).unwrap();
+        assert_eq!(done.previous.as_deref(), Some(&b"a-value"[..]));
+        assert!(done.stored);
     }
 
     #[test]
