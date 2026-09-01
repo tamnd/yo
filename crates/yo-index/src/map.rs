@@ -20,6 +20,7 @@
 
 use crate::index::{Index, Keys};
 use crate::scan::Cursor;
+use crate::tagged::Tagged;
 use yo_arena::Arena;
 use yo_common::{Addr, Space, bytes_eq, wyhash};
 
@@ -134,6 +135,22 @@ pub struct RawMap {
     /// [`RawMap::value_at_mut`] is the one exception and it is argued for where
     /// it is written. Everything else, including the in place ones, bumps this.
     writes: u64,
+    /// The records the caller marked when it wrote them.
+    ///
+    /// A second index of a subset of the keys, which exists so that a caller
+    /// looking for one of them does not have to walk past the ones it is not
+    /// looking for. The only thing that uses it is expiry: a key with a deadline
+    /// is rare in most databases, and both the active expire cycle and the
+    /// `volatile-*` eviction policies were sampling the whole map to find one.
+    ///
+    /// It is here and not in `yo-kv` because this is the only thing that knows
+    /// where a record is. An overwrite can move one, a delete takes one away,
+    /// and compaction moves them between segments, and all three are in this
+    /// file. A set of addresses kept anywhere else would go stale on the third.
+    ///
+    /// What "marked" means is entirely the caller's business. This holds
+    /// addresses and has never heard of a deadline.
+    tagged: Tagged,
 }
 
 impl RawMap {
@@ -144,6 +161,7 @@ impl RawMap {
             arena: Arena::new(),
             evac: None,
             writes: 0,
+            tagged: Tagged::new(),
         }
     }
 
@@ -313,7 +331,15 @@ impl RawMap {
 
     /// Store `val` under `key`, returning the length of the value it replaced.
     pub fn set(&mut self, key: &[u8], val: &[u8]) -> Option<usize> {
-        self.set_with(key, val.len(), |_| {}, |buf| buf.copy_from_slice(val))
+        self.set_with(
+            key,
+            val.len(),
+            |_| {},
+            |buf| {
+                buf.copy_from_slice(val);
+                false
+            },
+        )
     }
 
     /// The largest record this map can store, key and value and header together.
@@ -344,7 +370,10 @@ impl RawMap {
     ///
     /// `fill` is handed exactly `vlen` bytes of uninitialised-looking storage.
     /// It is arena memory that has been handed out before and freed, so its
-    /// contents are arbitrary and every byte of it must be written.
+    /// contents are arbitrary and every byte of it must be written. What it
+    /// answers is whether this record should be marked, which is what
+    /// [`RawMap::sample_tagged`] later draws from. A caller with no use for that
+    /// answers `false` and pays a branch.
     ///
     /// `peek` is handed the value that was already under `key`, if there was
     /// one, before anything is written over it. It exists because the caller
@@ -360,7 +389,7 @@ impl RawMap {
     pub fn set_with<P, F>(&mut self, key: &[u8], vlen: usize, peek: P, fill: F) -> Option<usize>
     where
         P: FnOnce(&[u8]),
-        F: FnOnce(&mut [u8]),
+        F: FnOnce(&mut [u8]) -> bool,
     {
         self.writes += 1;
         assert!(key.len() <= u32::MAX as usize, "key too long");
@@ -403,7 +432,11 @@ impl RawMap {
             peek(&self.arena.get(addr, HDR + klen + old_vlen)[HDR + klen..]);
             if old_vlen == vlen {
                 let rec = self.arena.get_mut(addr, total);
-                fill(&mut rec[HDR + klen..]);
+                let tag = fill(&mut rec[HDR + klen..]);
+                // The record did not move, so this is the only thing that can
+                // have changed about where it stands: `PERSIST` on a key whose
+                // value is the same length is exactly this branch.
+                self.retag(addr, tag);
                 return Some(vlen);
             }
         }
@@ -417,12 +450,35 @@ impl RawMap {
         // The arena hands back a run padded up to its alignment, so index to
         // `total` rather than to the end of the slice.
         buf[HDR..HDR + key.len()].copy_from_slice(key);
-        fill(&mut buf[HDR + key.len()..total]);
+        let tag = fill(&mut buf[HDR + key.len()..total]);
 
         let old = {
             let recs = Records { arena: &self.arena };
             self.index.insert(h, key, addr, &recs)
         };
+        // After the insert and not before, because the address the old record
+        // was at is only known once the index has handed it back, and tagging
+        // the new one first would put both in the set for the width of the call
+        // if they happened to be the same address, which they cannot be, but the
+        // order that does not depend on that is the one to write.
+        if let Some(prev) = old {
+            self.tagged.remove(prev);
+        }
+        if tag {
+            self.tagged.insert(addr);
+        } else {
+            // Nothing to take out. `addr` is a run the arena has just handed
+            // back, and nothing is ever freed while it is still marked: a delete
+            // unmarks before it frees, an overwrite unmarks the record it
+            // replaces on the line above, and compaction moves the mark before
+            // it frees the copy it moved from. So a fresh address is never in
+            // the set, and this is the common path, which is every `SET` on a
+            // database that has any deadline in it at all.
+            debug_assert!(
+                !self.tagged.contains(addr),
+                "the arena handed out an address that is still marked"
+            );
+        }
         match old {
             Some(prev) => {
                 let (pk, pv) = Record::lens(self.arena.get(prev, HDR));
@@ -430,6 +486,26 @@ impl RawMap {
                 Some(pv)
             }
             None => None,
+        }
+    }
+
+    /// Put `addr` in the marked set, or take it out, to match `tag`.
+    ///
+    /// For the in place path, which is the one where the record was already
+    /// there and could already have been marked. It cannot tell whether the mark
+    /// changed without asking, because a deadline is eight bytes in the record
+    /// and a value eight bytes shorter with a deadline is the same length as a
+    /// value without one, so a write that lands in place is not proof that the
+    /// mark stayed put.
+    ///
+    /// On a database where nothing is marked the ask is one comparison against a
+    /// zero length, which is what the overwhelming majority of servers pay.
+    #[inline]
+    fn retag(&mut self, addr: Addr, tag: bool) {
+        if tag {
+            self.tagged.insert(addr);
+        } else {
+            self.tagged.remove(addr);
         }
     }
 
@@ -460,6 +536,7 @@ impl RawMap {
             Some(a) => {
                 let (k, v) = Record::lens(self.arena.get(a, HDR));
                 peek(&self.arena.get(a, HDR + k + v)[HDR + k..]);
+                self.tagged.remove(a);
                 self.arena.free(a, HDR + k + v);
                 true
             }
@@ -552,7 +629,47 @@ impl RawMap {
 
     /// Bytes held by index structure plus arena segments.
     pub fn memory_bytes(&self) -> usize {
-        self.index.memory_bytes() + self.arena.reserved_bytes() as usize
+        self.index.memory_bytes()
+            + self.arena.reserved_bytes() as usize
+            + self.tagged.memory_bytes()
+    }
+
+    /// How many records are marked.
+    ///
+    /// Exact, and kept exact by every write path, so a caller can branch on a
+    /// zero here rather than starting a sweep that was never going to find
+    /// anything.
+    #[inline]
+    #[must_use]
+    pub fn tagged_len(&self) -> usize {
+        self.tagged.len()
+    }
+
+    /// Whether the record at `addr` is marked.
+    ///
+    /// For a test and for a debug assertion. Nothing on a hot path asks this:
+    /// the mark is written from the record's own bytes, so anything holding the
+    /// record already knows.
+    #[must_use]
+    pub fn is_tagged(&self, addr: Addr) -> bool {
+        self.tagged.contains(addr)
+    }
+
+    /// Walk marked records from wherever `r` lands, until `out` says stop.
+    ///
+    /// [`RawMap::sample`] for the marked subset, and the reason the subset
+    /// exists. A database of ten million keys where a thousand carry a deadline
+    /// gives the expire cycle a thousand candidates to draw from instead of ten
+    /// million, and the cycle stops costing anything at all in the case that
+    /// matters most, which is the one where the answer is that there is nothing
+    /// to do.
+    pub fn sample_tagged(&self, r: u64, mut out: impl FnMut(&[u8], &[u8], Addr) -> bool) {
+        let arena = &self.arena;
+        self.tagged.sample(r, |addr| {
+            let (klen, vlen) = Record::lens(arena.get(addr, HDR));
+            let bytes = arena.get(addr, HDR + klen + vlen);
+            out(&bytes[HDR..HDR + klen], &bytes[HDR + klen..], addr)
+        });
     }
 
     /// Move every live record out of `seg` and into the current segment, then
@@ -636,6 +753,12 @@ impl RawMap {
             let recs = Records { arena: &self.arena };
             let ok = self.index.relocate(hash, key, new, &recs);
             debug_assert!(ok, "compaction lost an entry the index just handed us");
+            // The one place a record moves without anybody writing to it, and
+            // therefore the one place the tagged set would go stale if this line
+            // were not here.
+            if self.tagged.remove(old) {
+                self.tagged.insert(new);
+            }
             self.arena.free(old, total);
             moved += 1;
         }
@@ -995,6 +1118,92 @@ mod tests {
         }
     }
 
+    /// A mark follows its record wherever the record goes.
+    ///
+    /// The whole reason the marked set lives in this file. Compaction moves a
+    /// record to a new address without anybody writing to it, so a set of
+    /// addresses kept by a caller would be pointing at freed space afterwards,
+    /// and the sample would read whatever the arena handed out next.
+    #[test]
+    fn compaction_carries_the_marks_with_it() {
+        let mut m = RawMap::new();
+        let val = vec![b'z'; COMPACT_VAL];
+        const N: usize = COMPACT_N;
+        for i in 0..N {
+            m.set_with(
+                &key(i),
+                val.len(),
+                |_| {},
+                |b| {
+                    b.copy_from_slice(&val);
+                    i % 3 == 0
+                },
+            );
+        }
+        let want = (0..N).filter(|i| i % 3 == 0).count();
+        assert_eq!(m.tagged_len(), want);
+
+        for i in (0..N).step_by(2) {
+            m.del(&key(i));
+        }
+        let want = (0..N).filter(|i| i % 3 == 0 && i % 2 == 1).count();
+        assert_eq!(m.tagged_len(), want, "a delete takes the mark with it");
+
+        for seg in m.arena().compaction_candidates() {
+            m.compact_segment(seg);
+        }
+        assert_eq!(
+            m.tagged_len(),
+            want,
+            "and compaction moves it rather than losing it"
+        );
+
+        // Every mark points at a record that is still there and is one of the
+        // ones that was marked, which is what a stale address would fail.
+        let mut seen = 0;
+        m.sample_tagged(0, |k, _, addr| {
+            assert!(m.get(k).is_some(), "a mark on a key that is gone");
+            let i: usize = std::str::from_utf8(&k[4..]).unwrap().parse().unwrap();
+            assert!(
+                i.is_multiple_of(3) && !i.is_multiple_of(2),
+                "key {i} was never marked"
+            );
+            assert!(m.is_tagged(addr));
+            seen += 1;
+            true
+        });
+        assert_eq!(seen, want);
+    }
+
+    /// A mark goes on and comes off with the record's own bytes, which is how
+    /// PERSIST works: the value is the same length, so the record does not move
+    /// and only the mark changes.
+    #[test]
+    fn a_mark_goes_on_and_comes_off_in_place() {
+        let mut m = RawMap::new();
+        let mark = |m: &mut RawMap, on: bool| {
+            m.set_with(
+                b"k",
+                1,
+                |_| {},
+                |b| {
+                    b[0] = b'v';
+                    on
+                },
+            )
+        };
+        mark(&mut m, true);
+        assert_eq!(m.tagged_len(), 1);
+        mark(&mut m, true);
+        assert_eq!(m.tagged_len(), 1, "marking twice is marking once");
+        mark(&mut m, false);
+        assert_eq!(m.tagged_len(), 0);
+        mark(&mut m, true);
+        assert_eq!(m.tagged_len(), 1);
+        assert!(m.del(b"k"));
+        assert_eq!(m.tagged_len(), 0);
+    }
+
     /// The bug this exists for: overwriting a key writes a new record and only
     /// counts the old one dead, so without compaction a server that rewrites
     /// the same keys holds every version of every one of them forever. Measured
@@ -1297,7 +1506,15 @@ mod tests {
 
         m.set(b"k", b"v");
         moved(&m, "set");
-        m.set_with(b"k", 1, |_| {}, |b| b[0] = b'w');
+        m.set_with(
+            b"k",
+            1,
+            |_| {},
+            |b| {
+                b[0] = b'w';
+                false
+            },
+        );
         moved(&m, "set_with");
         m.value_mut(b"k");
         moved(&m, "value_mut");

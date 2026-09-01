@@ -42,6 +42,7 @@ mod bucket;
 mod index;
 mod map;
 mod scan;
+mod tagged;
 
 pub use bucket::{Bucket, EMPTY, SLOTS, SlotMask};
 pub use index::{Index, Keys, MAX_CHAIN, SEGMENT_BUCKETS};
