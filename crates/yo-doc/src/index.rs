@@ -87,25 +87,34 @@
 //!
 //! [`Key`] is the value at the path with a tag byte in front of it, so a
 //! document with the string `"7"` at a path and one with the number seven do
-//! not land on the same key. Numbers are stored big endian with the sign bit
-//! flipped, and floats with the sign bit set for positives and every bit flipped
-//! for negatives, both of which order correctly read as bytes. Equality does not
+//! not land on the same key. Every key is written so that comparing two of them
+//! as bytes gives the same answer comparing the values would. Equality does not
 //! need that, but it means the tree can compare keys with `memcmp` and never
 //! decode one.
 //!
-//! An integer and a float that names the same integer, `7` and `7.0`, get the
-//! same key. A caller asking for seven means seven, and JSON has one number
-//! type, so the alternative is a query that misses documents for a reason
-//! nobody can see.
+//! There is one tag for numbers rather than one for integers and one for
+//! floats, because a range over a path holding both has to put them in one
+//! order, and two tags cannot. Every finite number is a mantissa times a power
+//! of two, so a numeric key is written as where its leading bit sits, which is
+//! `floor(log2(|v|)) + 1` and is called the place here, followed by the mantissa
+//! shifted up to the top of eight bytes. Two numbers with different places are
+//! ordered by the place alone, and two with the same place are ordered by the
+//! mantissa read from the leading bit down, which is what the shift lines up.
+//! The place is biased by 32768 so that the whole range a f64 can reach sorts as
+//! an unsigned number, and everything after the class byte is flipped for a
+//! negative, because a bigger magnitude there is a smaller number.
 //!
-//! Where this encoding is not enough is ordering across the two number tags: a
-//! float that is not a whole number sorts after every integer rather than among
-//! them, so a range over a path holding a mix of the two is ordered within each
-//! tag and not across them. A path in a real collection holds one type, so this
-//! has not bitten yet, but it is a real limitation and not a rounding error, and
-//! the way out is a single numeric tag with a lossless order preserving encoding
-//! rather than the two exact ones here. That is a format change, so it has to be
-//! settled before the freeze at the end of M6 rather than after it.
+//! The byte in front of the place is the class, which is one of negative
+//! infinity, negative, zero, positive, positive infinity and NaN. Those five
+//! that are not an ordinary finite value have no size worth writing, so they
+//! carry a place and a mantissa of zero and are ordered by the class alone. NaN
+//! sorts above everything rather than being refused, so a range never has to
+//! think about it.
+//!
+//! An integer and a float that names the same integer, `7` and `7.0`, get the
+//! same key, because both normalise to a leading `111` and a place of three. A
+//! caller asking for seven means seven, and JSON has one number type, so the
+//! alternative is a query that misses documents for a reason nobody can see.
 //!
 //! Types do not interleave either: everything with a smaller tag sorts before
 //! everything with a larger one, so nulls, then booleans, then numbers, then
@@ -167,17 +176,16 @@ pub const KEY_MAX: usize = yo_kv::NAME_MAX - 1;
 
 /// How much of a key sits in the caller's frame before it needs the allocator.
 ///
-/// A tag and eight bytes covers every number, every boolean and null, and a tag
-/// and thirty one bytes covers the short strings that get indexed in practice:
-/// a status, a country, an identifier.
+/// Twelve bytes covers every number, one byte covers a boolean or a null, and a
+/// tag and thirty one bytes covers the short strings that get indexed in
+/// practice: a status, a country, an identifier.
 const KEY_INLINE: usize = 32;
 
 const TAG_NULL: u8 = 0;
 const TAG_FALSE: u8 = 1;
 const TAG_TRUE: u8 = 2;
-const TAG_INT: u8 = 3;
-const TAG_FLOAT: u8 = 4;
-const TAG_TEXT: u8 = 5;
+const TAG_NUM: u8 = 3;
+const TAG_TEXT: u8 = 4;
 
 /// A value as an index looks it up.
 ///
@@ -205,27 +213,50 @@ impl Key {
     /// The key for an integer.
     #[must_use]
     pub fn int(v: i64) -> Key {
-        let mut k = Small::collect([TAG_INT]);
-        for b in order_int(v) {
-            k.push(b);
-        }
-        Key(k)
+        let (neg, mant) = if v < 0 {
+            (true, v.unsigned_abs())
+        } else {
+            (false, v as u64)
+        };
+        number(Class::of(neg, mant == 0), mant, i32::from(bits(mant)))
     }
 
     /// The key for a float.
     ///
-    /// A float that names a whole number gets the same key as that integer, so
+    /// A float and an integer that name the same number get the same key, so
     /// `7.0` and `7` are one key and a search for either finds both.
     #[must_use]
     pub fn float(v: f64) -> Key {
-        if let Some(n) = whole(v) {
-            return Key::int(n);
+        if v.is_nan() {
+            return number(Class::Nan, 0, 0);
         }
-        let mut k = Small::collect([TAG_FLOAT]);
-        for b in order_float(v) {
-            k.push(b);
+        if v.is_infinite() {
+            return number(
+                if v.is_sign_negative() {
+                    Class::NegInf
+                } else {
+                    Class::PosInf
+                },
+                0,
+                0,
+            );
         }
-        Key(k)
+        let raw = v.to_bits();
+        let neg = raw >> 63 == 1;
+        let exponent = ((raw >> 52) & 0x7ff) as i32;
+        let fraction = raw & ((1 << 52) - 1);
+        // A subnormal has no implied leading one and a fixed exponent, and
+        // everything else has both.
+        let (mant, scale) = if exponent == 0 {
+            (fraction, -1074)
+        } else {
+            (fraction | (1 << 52), exponent - 1075)
+        };
+        number(
+            Class::of(neg, mant == 0),
+            mant,
+            scale + i32::from(bits(mant)),
+        )
     }
 
     /// The key for a string.
@@ -306,7 +337,7 @@ impl core::fmt::Debug for Key {
             Some(&TAG_FALSE) => f.write_str("false"),
             Some(&TAG_TRUE) => f.write_str("true"),
             Some(&TAG_TEXT) => write!(f, "{:?}", String::from_utf8_lossy(&b[1..])),
-            Some(&TAG_INT) | Some(&TAG_FLOAT) => write!(f, "{}", Hex(&b[1..])),
+            Some(&TAG_NUM) => write!(f, "{}", Hex(&b[1..])),
             _ => f.write_str("<no key>"),
         }
     }
@@ -325,43 +356,72 @@ impl core::fmt::Display for Hex<'_> {
     }
 }
 
-/// An integer as bytes that sort the way the integer does.
+/// Where a number sits in the order, before its size is looked at.
 ///
-/// Big endian puts the most significant byte first, and flipping the sign bit
-/// moves the negatives below the positives, which is what two's complement gets
-/// wrong when it is read as unsigned.
-fn order_int(v: i64) -> [u8; 8] {
-    ((v as u64) ^ (1 << 63)).to_be_bytes()
+/// The class is the first byte of a numeric key, so the five kinds of number
+/// that are not an ordinary finite value each land somewhere fixed rather than
+/// being encoded into the same bytes the finite ones use.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Class {
+    NegInf = 0,
+    Negative = 1,
+    Zero = 2,
+    Positive = 3,
+    PosInf = 4,
+    /// Not a number, which JSON has no way to write and a document can only get
+    /// from a program that put one there. It sorts above everything rather than
+    /// being refused, so a range never has to think about it.
+    Nan = 5,
+}
+
+impl Class {
+    fn of(neg: bool, zero: bool) -> Class {
+        match (zero, neg) {
+            (true, _) => Class::Zero,
+            (false, true) => Class::Negative,
+            (false, false) => Class::Positive,
+        }
+    }
+}
+
+/// How many bits a magnitude takes.
+fn bits(mant: u64) -> u16 {
+    (64 - mant.leading_zeros()) as u16
+}
+
+/// A number as bytes that sort the way the number does, whether it arrived as
+/// an integer or as a float.
+///
+/// Every finite number is `mantissa * 2^k` for some odd mantissa, so `place` is
+/// where its leading bit sits, which is `floor(log2(|v|)) + 1`. Two numbers with
+/// different `place` are ordered by it alone, and two with the same `place` are
+/// ordered by their mantissas read from the leading bit down. Lining the
+/// mantissa up to the top of eight bytes is what makes that a byte comparison,
+/// and it is also what makes `7` and `7.0` the same bytes: both normalise to a
+/// leading `111` and a `place` of three, whatever they looked like on the way
+/// in.
+///
+/// Negatives get the ten bytes after the class flipped, because a bigger
+/// magnitude is a smaller number.
+fn number(class: Class, mant: u64, place: i32) -> Key {
+    let mut k = Small::collect([TAG_NUM, class as u8]);
+    let (place, mant) = match class {
+        // The size of an infinity, a zero or a NaN is not a question, and
+        // writing it as zero keeps every numeric key the same width.
+        Class::Negative | Class::Positive => (place, mant << mant.leading_zeros()),
+        _ => (0, 0),
+    };
+    // Biased so that the whole range a f64 can reach, which is roughly -1074 to
+    // 1025, is an unsigned number that sorts the way the signed one does.
+    let place = ((place + 32768) as u16).to_be_bytes();
+    let flip = if class == Class::Negative { 0xff } else { 0 };
+    for b in place.into_iter().chain(mant.to_be_bytes()) {
+        k.push(b ^ flip);
+    }
+    Key(k)
 }
 
 /// A float as bytes that sort the way the float does.
-///
-/// IEEE 754 is already ordered correctly for the positives once the sign bit is
-/// set, and the negatives are ordered backwards, so they get every bit flipped
-/// instead. This is the standard trick and it is exact: no value maps onto
-/// another one.
-fn order_float(v: f64) -> [u8; 8] {
-    let bits = v.to_bits();
-    let flipped = if bits & (1 << 63) != 0 {
-        !bits
-    } else {
-        bits | (1 << 63)
-    };
-    flipped.to_be_bytes()
-}
-
-/// The integer a float names exactly, if it names one.
-///
-/// `as` saturates rather than wrapping, so the check on the way back catches
-/// anything out of range as well as anything with a fraction.
-fn whole(v: f64) -> Option<i64> {
-    if !v.is_finite() {
-        return None;
-    }
-    let n = v as i64;
-    if n as f64 == v { Some(n) } else { None }
-}
-
 /// What an index can be asked, and how many keys a document gets at its path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IndexKind {
@@ -1015,6 +1075,89 @@ mod tests {
     }
 
     #[test]
+    fn an_integer_and_a_float_sort_among_each_other() {
+        // The order this has to produce is the numeric one, and the two ways of
+        // writing a number are mixed on purpose so that nothing can pass by
+        // keeping the integers on one side and the floats on the other.
+        let mut mixed: Vec<Key> = [
+            Key::float(12.5),
+            Key::int(99),
+            Key::int(-3),
+            Key::float(-2.5),
+            Key::int(0),
+            Key::float(0.25),
+            Key::int(13),
+        ]
+        .to_vec();
+        mixed.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+        let want = [
+            Key::int(-3),
+            Key::float(-2.5),
+            Key::int(0),
+            Key::float(0.25),
+            Key::float(12.5),
+            Key::int(13),
+            Key::int(99),
+        ];
+        assert_eq!(mixed, want);
+    }
+
+    #[test]
+    fn seven_and_seven_point_zero_are_one_key() {
+        assert_eq!(Key::int(7), Key::float(7.0));
+        assert_eq!(Key::int(-7), Key::float(-7.0));
+        assert_eq!(Key::int(0), Key::float(0.0));
+        // A negative zero is a zero. Nothing else would let a caller who asks
+        // for zero find a document that has one.
+        assert_eq!(Key::int(0), Key::float(-0.0));
+        assert_eq!(Key::int(1 << 53), Key::float((1u64 << 53) as f64));
+        // And two numbers that are close are still two numbers. `i64::MAX` is
+        // one below a power of two and the nearest f64 to it is that power of
+        // two, so these are not the same value and do not get the same key.
+        assert_ne!(Key::int(i64::MAX), Key::float(i64::MAX as f64));
+    }
+
+    #[test]
+    fn the_ends_of_the_number_line_sort_where_they_belong() {
+        let mut ends = [
+            Key::float(f64::NAN),
+            Key::float(f64::INFINITY),
+            Key::int(1),
+            Key::float(f64::NEG_INFINITY),
+            Key::int(-1),
+            Key::float(f64::MIN),
+            Key::float(f64::MAX),
+        ]
+        .to_vec();
+        ends.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+        let want = [
+            Key::float(f64::NEG_INFINITY),
+            Key::float(f64::MIN),
+            Key::int(-1),
+            Key::int(1),
+            Key::float(f64::MAX),
+            Key::float(f64::INFINITY),
+            // Above everything, so a range never has to think about it.
+            Key::float(f64::NAN),
+        ];
+        assert_eq!(ends, want);
+    }
+
+    #[test]
+    fn every_number_is_the_same_width() {
+        for k in [
+            Key::int(0),
+            Key::int(i64::MIN),
+            Key::float(1e300),
+            Key::float(f64::MIN_POSITIVE),
+            Key::float(f64::NAN),
+            Key::float(f64::NEG_INFINITY),
+        ] {
+            assert_eq!(k.as_bytes().len(), 12, "{k:?}");
+        }
+    }
+
+    #[test]
     fn a_short_key_stays_off_the_heap() {
         assert!(Key::int(i64::MIN).0.is_inline());
         assert!(Key::text("a-fairly-ordinary-status").0.is_inline());
@@ -1026,7 +1169,9 @@ mod tests {
         assert_eq!(format!("{:?}", Key::null()), "null");
         assert_eq!(format!("{:?}", Key::bool(true)), "true");
         assert_eq!(format!("{:?}", Key::text("open")), "\"open\"");
-        assert_eq!(format!("{:?}", Key::int(0)), "8000000000000000");
+        // The class byte for a zero, then a place and a mantissa that are both
+        // written as zero because the size of a zero is not a question.
+        assert_eq!(format!("{:?}", Key::int(0)), "0280000000000000000000");
     }
 
     /// An ordered index over `$.n` holding the integers given, one document per
@@ -1053,11 +1198,28 @@ mod tests {
         out
     }
 
-    /// The integer an INT key was made from.
+    /// The number a numeric key was made from, for the whole numbers these
+    /// tests file.
     fn unorder_int(key: &[u8]) -> i64 {
-        assert_eq!(key[0], TAG_INT, "these tests only file integers");
-        let bytes: [u8; 8] = key[1..9].try_into().expect("eight bytes");
-        (u64::from_be_bytes(bytes) ^ (1 << 63)) as i64
+        assert_eq!(key[0], TAG_NUM, "these tests only file numbers");
+        let class = key[1];
+        if class == Class::Zero as u8 {
+            return 0;
+        }
+        let flip = if class == Class::Negative as u8 {
+            0xffu8
+        } else {
+            0
+        };
+        let place = u16::from_be_bytes([key[2] ^ flip, key[3] ^ flip]) as i32 - 32768;
+        let mut mant = [0u8; 8];
+        for (out, b) in mant.iter_mut().zip(&key[4..12]) {
+            *out = b ^ flip;
+        }
+        // The mantissa sits at the top of the eight bytes, so shifting it back
+        // down by however far its leading bit is from `place` gives the integer.
+        let n = (u64::from_be_bytes(mant) >> (64 - place)) as i64;
+        if flip == 0 { n } else { -n }
     }
 
     #[test]
