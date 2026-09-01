@@ -4,6 +4,39 @@ What each release changed, why, and what it costs you. The versioning rules and 
 
 While the major is 0, a minor release may break anything, including the on-disk format. The format is frozen at `M6`, not before.
 
+## 0.3.10 — 2026-09-01
+
+Five pull requests, no milestone, so this is a patch. It is the keyspace group getting to within one command of finished, plus one number changed in the growth policy that takes two and a half bytes a member off every large collection.
+
+The `.yo` layout is untouched. A file written by any 0.3.x opens unchanged.
+
+The keyspace commands are the ones Redis's own test suite and every piece of tooling assume are there. SORT and SORT_RO, MOVE, SWAPDB, WAIT, WAITAOF, and now DUMP and RESTORE. What is left is MIGRATE, which is RESTORE with an outbound client connection in front of it, so it is waiting on a client rather than on anything in the store.
+
+### Added
+
+- **DUMP and RESTORE, over Redis's own file format.** A payload is a value standing on its own outside the process, the same way a record is one inside it, so this is the export and import that COPY and MOVE already use with the RDB serialisation and its CRC64 footer wrapped around them. The bytes have to be Redis's bytes or the commands are pointless, so the codec follows rdb.c rather than a description of it. CRC64 is where that mattered: the header comment in crc64.c and every published table for crc-64-jones say the initial value is all ones, and the function Redis actually calls starts from whatever the caller passes and every caller passes zero, so the check value for `123456789` is `e9c6d914c4b8d9ca` and not the published `caa717168609f281`. Reading and writing are deliberately not mirrors. The reader takes every encoding a modern Redis emits, which is the quicklist, the three listpack forms, the intset, both sorted set forms and both hash forms carrying field deadlines, with LZF decompression underneath all of them because `rdbcompression` is on by default. The writer picks the plainest legal type per kind, because one shape per kind is one shape to get right and every Redis since 2.6 loads it.
+- **SORT and SORT_RO.** The one command in the keyspace group that reads keys nobody named: `BY` and `GET` are templates rather than globs, so a sort of ten thousand elements with both can read twenty thousand other keys. That is why it carries `movablekeys` and why it is the one read path in the engine that copies the elements out before it starts, since reading another key needs the database the elements are borrowed from and the borrow has to end first.
+- **MOVE, SWAPDB, WAIT and WAITAOF.** MOVE is the cheap one for a reason COPY cannot borrow. A body in the slab is already a value standing on its own, so a move can take that body rather than clone it, and moving a set of a million members writes a slot number into another database and deletes a record. SWAPDB is two pointer sized writes and nobody is told, so a client on database zero is still on database zero and is now looking at what used to be database one. WAIT and WAITAOF answer the numbers Redis answers on a server with no replicas and no append only file, without the sleep, which is registered as D-25.
+
+### Changed
+
+- **`names.toml` records what 0.3.9 actually published.** The reserve audit cannot run in the release it describes, because the file it would fix is the one the release was cut from, so it runs on `main` afterwards and the result is committed. Housekeeping, and it is here because a name that says free while something is published under it is exactly the kind of stale claim that file exists to prevent.
+- **A large element array grows by an eighth instead of a quarter.** One word, and it takes 2.40 bytes a member off a set of a million and 1.69 off one of a hundred thousand, measured on sixteen byte members. The policy was a quarter because of an argument about copies that nobody had measured: an element is copied about five times over the life of an array that grows by a quarter and about nine for one that grows by an eighth, which reads as buying memory with throughput. That count is wrong for the arrays this applies to, because a growing array is grown with `realloc` and past the allocator's mmap threshold the block is its own mapping, so growing it is a page table edit rather than a walk over the bytes.
+
+### Performance
+
+Development measurements unless the machine is named. None of these are gate numbers.
+
+- **Slack under ten percent at every size, on gamingpc.** 2.40 percent at four thousand rows, 9.31 at a hundred thousand and 5.27 at four million, against an average of thirty three percent for doubling and a worst case of a hundred. That is 8.19, 8.74 and 8.42 bytes per element for a row that is eight bytes wide.
+- **Nothing on the read path moved and a fill costs thirteen percent, on gamingpc.** Eight cores pinned, criterion at one second of warm up and three of measurement, median of two interleaved passes. `probe_hit` at a million went 24.6 to 25.1 ns, `probe_miss` 7.57 to 7.64, `draw` flat at 5.47, `write_over` 27.9 to 27.3 and `pop` 6.21 to 6.00 ms. `fill` at a million went 50.4 to 56.9 ms, which is the whole price: more rehashes on the way up, paid once by a table that then lives with its size forever.
+- **The first run of that A/B was thrown away.** A single pass had main's own `walk/1000000` at 807 microseconds on one pass and 931 on the next, and three of the rows that looked like regressions were exactly that. Everything is now run interleaved, main then branch then main then branch, and only rows where both passes agree are quoted. Criterion's own percentage lines are contaminated across checkouts and are ignored in favour of absolute times.
+
+### Known
+
+- **The DUMP writer does not use the memcpy it could.** A set already sitting in a listpack could go out as `SET_LISTPACK` with one copy, since our listpack is byte compatible with Redis's on purpose, and instead it goes out member by member. That is the next optimisation on the file and it wants its own measurement rather than being asserted.
+- **RESTORE checks IDLETIME and FREQ and then drops them, which is D-26.** Both set eviction metadata on a real server, and the store has readers for that metadata and no writer, so a restored key starts with the idle time and the counter any new key gets. The numbers are still parsed and range checked, because those four error messages are the whole of what a client can see about the two options today. It resolves at M5.
+- **MIGRATE is the last command in the keyspace group and it is not here.** It needs an outbound client connection, which nothing else in the server has yet.
+
 ## 0.3.9 — 2026-09-01
 
 Five pull requests, no milestone, so this is a patch. It is two things at once. The first is the rest of what a cache has to do about time and space that 0.3.8 started: keys that expire now come back on their own rather than waiting for somebody to read them, and picking what to evict stopped forgetting everything it learned between one eviction and the next. The second is the beginning of the memory campaign, which is where the gate says the work is.
