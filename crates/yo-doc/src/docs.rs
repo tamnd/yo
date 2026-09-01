@@ -32,15 +32,31 @@
 //! [`Docs::put`] does not store the value it is given. It walks it once and
 //! writes it again with every object key replaced by its id from the
 //! collection's [`Keys`], which is where the forty percent that interning is
-//! worth actually gets saved. The walk is the same pass that will extract the
-//! indexed paths when the path indexes land, so a document is read once on the
-//! way in and not once per index.
+//! worth actually gets saved.
 //!
 //! If the key table fills part way through, the document is stored as it
 //! arrived with its keys as bytes. Nothing about that is a fallback mode: the
 //! interned flag sits in each container's header, so a collection holds both
 //! kinds at once, a reader tells them apart per container, and documents
 //! written before the table filled stay exactly as they were.
+//!
+//! # What a write does about the indexes
+//!
+//! A write takes one path lookup per declared index, not a comparison against
+//! every index path at every node of the document. I had it the other way round
+//! at first, on the argument that the interning walk is already touching every
+//! node so the extraction may as well ride along on it. That is worse: with N
+//! indexes it costs N comparisons at every node, where a lookup per index costs
+//! N times the two or three binary searches a shallow path takes, and index
+//! paths are shallow. It is also much simpler, and it is the same code the
+//! backfill in [`Docs::create_index`] runs.
+//!
+//! The keys are worked out before anything is stored, so a value that is too
+//! long to be an index key fails the write rather than leaving behind a document
+//! that is in the collection and in none of its indexes. Then the old document
+//! under that id is taken out of the indexes, then the new one is stored, then
+//! it is filed. An overwrite and a removal both un-index through the same code,
+//! because both make the old entries wrong.
 //!
 //! # Reading one back
 //!
@@ -53,6 +69,7 @@ use yo_common::{Code, Error, Result};
 use yo_kv::{Cursor, Elements, Full};
 
 use crate::head::{DEPTH_MAX, Kind};
+use crate::index::{self, Key, PathIndex};
 use crate::path::{Step, Steps};
 use crate::{Builder, Keys, Value};
 
@@ -65,6 +82,15 @@ pub struct Docs {
     keys: Keys,
     /// The buffer a write is re-encoded into, kept so a write does not allocate.
     build: Builder,
+    /// One per indexed path, in the order they were declared.
+    indexes: Vec<PathIndex>,
+    /// The key each index takes from the document being written, one slot per
+    /// index and empty where the document has nothing to file.
+    ///
+    /// Worked out before anything is stored, so a value that cannot be indexed
+    /// fails the write rather than leaving a document behind that no query will
+    /// ever find. Kept on the collection so a write allocates nothing.
+    taken: Vec<Vec<u8>>,
 }
 
 impl Default for Docs {
@@ -83,6 +109,8 @@ impl Docs {
             rows: Elements::tailed(0, 0),
             keys: Keys::new(),
             build: Builder::new(),
+            indexes: Vec::new(),
+            taken: Vec::new(),
         }
     }
 
@@ -96,6 +124,8 @@ impl Docs {
             rows: Elements::tailed(n, n.saturating_mul(each)),
             keys: Keys::new(),
             build: Builder::with_capacity(each),
+            indexes: Vec::new(),
+            taken: Vec::new(),
         }
     }
 
@@ -107,17 +137,7 @@ impl Docs {
     /// another one without the names is how a collection ends up reading the
     /// wrong field.
     pub fn put(&mut self, id: &[u8], value: Value<'_>) -> Result<bool> {
-        self.build.clear();
-        if intern_into(&mut self.keys, &mut self.build, value, 0)? {
-            let bytes = self.build.finish()?;
-            return store(&mut self.rows, id, bytes);
-        }
-        // The key table filled part way through. Store what arrived, keys and
-        // all, which is a memcpy and needs no second walk.
-        self.build.clear();
-        self.build.embed(&value)?;
-        let bytes = self.build.finish()?;
-        store(&mut self.rows, id, bytes)
+        self.write(id, value, None)
     }
 
     /// Store the document `doc` encodes under `id`, and say whether the id is
@@ -129,12 +149,196 @@ impl Docs {
     pub fn put_bytes(&mut self, id: &[u8], doc: &[u8]) -> Result<bool> {
         let value = Value::new(doc)
             .ok_or_else(|| Error::new(Code::Corrupt, "the document is not a readable value"))?;
-        self.build.clear();
-        if intern_into(&mut self.keys, &mut self.build, value, 0)? {
-            let bytes = self.build.finish()?;
-            return store(&mut self.rows, id, bytes);
+        self.write(id, value, Some(doc))
+    }
+
+    /// The write both forms of put go through.
+    ///
+    /// `raw` is the caller's bytes when it had some, so that the path where the
+    /// key table is full stores them directly instead of copying them through
+    /// the builder to get back what it was already holding.
+    ///
+    /// The order is: work out the index keys, un-index whatever was under this
+    /// id, store, index. Working the keys out first is what makes a write that
+    /// cannot be indexed leave the collection exactly as it was, rather than
+    /// storing a document that no query will find.
+    fn write(&mut self, id: &[u8], value: Value<'_>, raw: Option<&[u8]>) -> Result<bool> {
+        let Docs {
+            rows,
+            keys,
+            build,
+            indexes,
+            taken,
+        } = self;
+
+        taken.resize(indexes.len(), Vec::new());
+        for (slot, index) in taken.iter_mut().zip(indexes.iter()) {
+            slot.clear();
+            // The incoming value has its keys as bytes, since put refuses one
+            // that does not, so its paths resolve without the key table.
+            let Some(at) = value.path_bytes(index.path())? else {
+                continue;
+            };
+            let Some(key) = Key::of(at) else {
+                continue;
+            };
+            if key.is_too_long() {
+                return Err(Error::fmt(
+                    Code::Full,
+                    format_args!(
+                        "the value at {} is longer than {} bytes and cannot be indexed",
+                        String::from_utf8_lossy(index.path()),
+                        index::KEY_MAX
+                    ),
+                ));
+            }
+            slot.extend_from_slice(key.as_bytes());
         }
-        store(&mut self.rows, id, doc)
+
+        unindex(rows, keys, indexes, id);
+
+        build.clear();
+        let fresh = if intern_into(keys, build, value, 0)? {
+            store(rows, id, build.finish()?)?
+        } else if let Some(raw) = raw {
+            // The key table filled part way through, and the caller is holding
+            // exactly what should be stored.
+            store(rows, id, raw)?
+        } else {
+            build.clear();
+            build.embed(&value)?;
+            store(rows, id, build.finish()?)?
+        };
+
+        for (slot, index) in taken.iter().zip(indexes.iter_mut()) {
+            if !slot.is_empty() {
+                index.add(slot, id)?;
+            }
+        }
+        Ok(fresh)
+    }
+
+    /// Start indexing `path`, and file every document already here under it.
+    ///
+    /// Declaring the same path twice is not an error and does not rebuild
+    /// anything, because a caller that opens a collection and declares its
+    /// indexes on the way in should be able to do that every time it opens it.
+    ///
+    /// The backfill is a path lookup per document, so it costs the collection
+    /// once. There is no background indexer and no window in which the index is
+    /// declared and not yet true, which is Y3.
+    pub fn create_index(&mut self, path: &str) -> Result<()> {
+        self.create_index_bytes(path.as_bytes())
+    }
+
+    /// [`Docs::create_index`] for a path that is already bytes.
+    pub fn create_index_bytes(&mut self, path: &[u8]) -> Result<()> {
+        for step in Steps::new(path) {
+            step?;
+        }
+        if self.indexes.iter().any(|i| i.path() == path) {
+            return Ok(());
+        }
+        let mut index = PathIndex::new(path);
+        for (id, bytes) in self.rows.pairs() {
+            let Some(value) = Value::new(bytes) else {
+                continue;
+            };
+            let doc = Doc {
+                value,
+                keys: &self.keys,
+            };
+            let Some(at) = doc.path_bytes(path)? else {
+                continue;
+            };
+            let Some(key) = Key::of(at.value()) else {
+                continue;
+            };
+            if key.is_too_long() {
+                return Err(Error::fmt(
+                    Code::Full,
+                    format_args!(
+                        "the value at {} in {} is longer than {} bytes and cannot be indexed",
+                        String::from_utf8_lossy(path),
+                        String::from_utf8_lossy(id),
+                        index::KEY_MAX
+                    ),
+                ));
+            }
+            index.add(key.as_bytes(), id)?;
+        }
+        self.indexes.push(index);
+        self.taken.push(Vec::new());
+        Ok(())
+    }
+
+    /// Stop indexing `path`, and say whether it was indexed.
+    pub fn drop_index(&mut self, path: &str) -> bool {
+        self.drop_index_bytes(path.as_bytes())
+    }
+
+    /// [`Docs::drop_index`] for a path that is already bytes.
+    pub fn drop_index_bytes(&mut self, path: &[u8]) -> bool {
+        let Some(at) = self.indexes.iter().position(|i| i.path() == path) else {
+            return false;
+        };
+        self.indexes.remove(at);
+        self.taken.truncate(self.indexes.len());
+        true
+    }
+
+    /// The indexes this collection keeps, in the order they were declared.
+    #[must_use]
+    pub fn indexes(&self) -> &[PathIndex] {
+        &self.indexes
+    }
+
+    /// The index on `path`, if there is one.
+    #[must_use]
+    pub fn index(&self, path: &str) -> Option<&PathIndex> {
+        self.indexes.iter().find(|i| i.path() == path.as_bytes())
+    }
+
+    /// Hand every document whose value at `path` is `key` to `f`, and say how
+    /// many there were.
+    ///
+    /// One probe of the index and one probe of the primary table per document,
+    /// which is the cost model `09` section 5 states rather than hides. A path
+    /// with no index on it is an error and not a scan: a query that silently
+    /// turns into a walk of the collection is the thing this API exists not to
+    /// do.
+    pub fn find(&self, path: &str, key: &Key, mut f: impl FnMut(&[u8], Doc<'_>)) -> Result<usize> {
+        let index = self.index(path).ok_or_else(|| {
+            Error::fmt(
+                Code::Invalid,
+                format_args!("there is no index on {path}, so this would be a scan"),
+            )
+        })?;
+        let Some(set) = index.get(key) else {
+            return Ok(0);
+        };
+        let mut n = 0usize;
+        index::each_id(set, |id| {
+            if let Some(doc) = self.get(id) {
+                f(id, doc);
+                n += 1;
+            }
+        });
+        Ok(n)
+    }
+
+    /// How many documents have `key` at `path`, without reading any of them.
+    ///
+    /// The number a caller sorts its filters by before it intersects them, and
+    /// it is a probe rather than a walk.
+    pub fn count(&self, path: &str, key: &Key) -> Result<usize> {
+        let index = self.index(path).ok_or_else(|| {
+            Error::fmt(
+                Code::Invalid,
+                format_args!("there is no index on {path}, so this would be a scan"),
+            )
+        })?;
+        Ok(index.count(key))
     }
 
     /// The document stored under `id`.
@@ -164,11 +368,21 @@ impl Docs {
 
     /// Take the document under `id` out, and say whether there was one.
     ///
+    /// Every index the document was filed in loses it first, so a removal costs
+    /// a path lookup per index on the way out.
+    ///
     /// The key table is left alone. A name it interned stays interned even if
     /// this was the last document using it, which is [`Keys`]'s rule and the
     /// reason an id is a row index.
     pub fn remove(&mut self, id: &[u8]) -> bool {
-        self.rows.remove(id).is_some()
+        let Docs {
+            rows,
+            keys,
+            indexes,
+            ..
+        } = self;
+        unindex(rows, keys, indexes, id);
+        rows.remove(id).is_some()
     }
 
     /// How many documents there are.
@@ -214,18 +428,63 @@ impl Docs {
 
     /// Throw every document away and keep the key table and the allocations.
     ///
+    /// The indexes stay declared and go empty, for the same reason the key table
+    /// stays: a caller that empties a collection is refilling it, and an index
+    /// that quietly disappeared when the last document did would turn the next
+    /// query into an error.
+    ///
     /// The key table stays because a collection that is emptied is usually a
     /// collection that is about to be refilled with the same shape of document,
     /// and relearning twenty names is work with nothing to show for it.
     pub fn clear(&mut self) {
         self.rows.clear();
         self.build.clear();
+        for index in &mut self.indexes {
+            index.clear();
+        }
     }
 
-    /// What the collection costs, the key table included.
+    /// What the collection costs, the key table and the indexes included.
     #[must_use]
     pub fn memory_bytes(&self) -> usize {
-        self.rows.memory_bytes() + self.keys.memory_bytes()
+        self.rows.memory_bytes()
+            + self.keys.memory_bytes()
+            + self
+                .indexes
+                .iter()
+                .map(PathIndex::memory_bytes)
+                .sum::<usize>()
+    }
+}
+
+/// Take whatever is stored under `id` out of every index, leaving the primary
+/// table alone.
+///
+/// Both an overwrite and a removal go through here, because both of them make
+/// the old document's index entries wrong and neither of them can work out what
+/// those entries were once the bytes are gone. Nothing here can fail: a document
+/// that is no longer readable, or a path that no longer resolves, simply has
+/// nothing filed under it, and refusing a removal because the thing being
+/// removed is damaged is the wrong answer.
+fn unindex(rows: &Elements<()>, keys: &Keys, indexes: &mut [PathIndex], id: &[u8]) {
+    if indexes.is_empty() {
+        return;
+    }
+    let Some(bytes) = rows.tail(id) else {
+        return;
+    };
+    let Some(value) = Value::new(bytes) else {
+        return;
+    };
+    let doc = Doc { value, keys };
+    for index in indexes {
+        let Ok(Some(at)) = doc.path_bytes(index.path()) else {
+            continue;
+        };
+        let Some(key) = Key::of(at.value()) else {
+            continue;
+        };
+        index.take(key.as_bytes(), id);
     }
 }
 
@@ -771,6 +1030,224 @@ mod tests {
         let text = format!("{:?}", docs.get(b"order:1").expect("stored"));
         assert!(text.contains("\"status\": \"open\""), "{text}");
         assert!(text.contains("\"sku\": \"sku-0\""), "{text}");
+    }
+
+    /// The ids `find` answers for one key, sorted so a test can compare them.
+    fn found(docs: &Docs, path: &str, key: &Key) -> Vec<String> {
+        let mut out = Vec::new();
+        let n = docs
+            .find(path, key, |id, d| {
+                assert!(d.get(b"id").is_some(), "the document came back whole");
+                out.push(String::from_utf8_lossy(id).into_owned());
+            })
+            .expect("indexed");
+        assert_eq!(n, out.len(), "the count is what the callback saw");
+        out.sort();
+        out
+    }
+
+    #[test]
+    fn an_index_declared_after_the_documents_finds_them() {
+        let mut docs = Docs::new();
+        for i in 0..64i64 {
+            let status = if i % 4 == 0 { "shut" } else { "open" };
+            docs.put_bytes(format!("order:{i}").as_bytes(), &order(i, status, 1))
+                .expect("put");
+        }
+        docs.create_index("$.status").expect("indexed");
+        assert_eq!(docs.index("$.status").expect("there").len(), 2);
+        assert_eq!(docs.count("$.status", &Key::text("shut")).expect("i"), 16);
+        assert_eq!(docs.count("$.status", &Key::text("open")).expect("i"), 48);
+        assert_eq!(found(&docs, "$.status", &Key::text("shut")).len(), 16);
+        assert!(found(&docs, "$.status", &Key::text("gone")).is_empty());
+
+        // A document written after the index exists is filed by the write.
+        docs.put_bytes(b"order:64", &order(64, "shut", 1))
+            .expect("put");
+        assert_eq!(docs.count("$.status", &Key::text("shut")).expect("i"), 17);
+    }
+
+    #[test]
+    fn an_overwrite_moves_a_document_from_one_key_to_the_other() {
+        let mut docs = Docs::new();
+        docs.create_index("$.status").expect("indexed");
+        docs.put_bytes(b"order:1", &order(1, "open", 1))
+            .expect("put");
+        assert_eq!(found(&docs, "$.status", &Key::text("open")), ["order:1"]);
+
+        docs.put_bytes(b"order:1", &order(1, "shut", 1))
+            .expect("put");
+        assert!(
+            found(&docs, "$.status", &Key::text("open")).is_empty(),
+            "the old key kept it"
+        );
+        assert_eq!(found(&docs, "$.status", &Key::text("shut")), ["order:1"]);
+        assert_eq!(docs.index("$.status").expect("there").postings(), 1);
+    }
+
+    #[test]
+    fn a_removal_takes_a_document_out_of_every_index() {
+        let mut docs = Docs::new();
+        docs.create_index("$.status").expect("indexed");
+        docs.create_index("$.customer").expect("indexed");
+        for i in 0..8i64 {
+            docs.put_bytes(format!("order:{i}").as_bytes(), &order(i, "open", 1))
+                .expect("put");
+        }
+        assert!(docs.remove(b"order:3"));
+        assert_eq!(found(&docs, "$.status", &Key::text("open")).len(), 7);
+        assert_eq!(docs.count("$.customer", &Key::int(21)).expect("i"), 0);
+        assert_eq!(docs.count("$.customer", &Key::int(28)).expect("i"), 1);
+        for index in docs.indexes() {
+            assert_eq!(index.postings(), 7);
+        }
+
+        assert!(!docs.remove(b"order:3"), "it is already gone");
+        assert_eq!(docs.index("$.status").expect("there").postings(), 7);
+    }
+
+    #[test]
+    fn a_path_that_names_a_container_or_nothing_is_simply_not_filed() {
+        let mut docs = Docs::new();
+        docs.create_index("$.lines").expect("indexed");
+        docs.create_index("$.shipped").expect("indexed");
+        docs.create_index("$.lines[0].qty").expect("indexed");
+        for i in 0..4i64 {
+            docs.put_bytes(format!("order:{i}").as_bytes(), &order(i, "open", 2))
+                .expect("put");
+        }
+        assert_eq!(docs.len(), 4);
+        assert!(
+            docs.index("$.lines").expect("there").is_empty(),
+            "an array has no equality key"
+        );
+        assert!(
+            docs.index("$.shipped").expect("there").is_empty(),
+            "no document has that path"
+        );
+        assert_eq!(
+            docs.count("$.lines[0].qty", &Key::int(1)).expect("i"),
+            4,
+            "a path through an array reaches a scalar"
+        );
+    }
+
+    #[test]
+    fn a_value_too_long_to_index_fails_the_write_and_stores_nothing() {
+        let mut b = Builder::new();
+        b.begin_object().expect("open");
+        b.key(b"status").expect("key");
+        b.text(&"x".repeat(crate::KEY_MAX)).expect("value");
+        b.end_object().expect("close");
+        let huge = b.finish().expect("finished").to_vec();
+
+        let mut docs = Docs::new();
+        docs.create_index("$.status").expect("indexed");
+        let err = docs.put_bytes(b"order:1", &huge).expect_err("refused");
+        assert_eq!(err.code(), Code::Full);
+        assert!(
+            docs.is_empty(),
+            "a write that cannot be indexed leaves nothing behind"
+        );
+
+        // Without the index it is an ordinary document and goes in fine.
+        assert!(docs.drop_index("$.status"));
+        docs.put_bytes(b"order:1", &huge).expect("put");
+        assert_eq!(docs.len(), 1);
+    }
+
+    #[test]
+    fn a_query_on_a_path_with_no_index_says_so_rather_than_scanning() {
+        let mut docs = Docs::new();
+        docs.put_bytes(b"order:1", &order(1, "open", 1))
+            .expect("put");
+        let err = docs
+            .find("$.status", &Key::text("open"), |_, _| ())
+            .expect_err("refused");
+        assert_eq!(err.code(), Code::Invalid);
+        assert_eq!(
+            docs.count("$.status", &Key::text("open"))
+                .expect_err("refused")
+                .code(),
+            Code::Invalid
+        );
+        assert!(docs.index("$.status").is_none());
+        assert!(!docs.drop_index("$.status"));
+    }
+
+    #[test]
+    fn declaring_the_same_index_twice_leaves_the_first_one_alone() {
+        let mut docs = Docs::new();
+        docs.create_index("$.status").expect("indexed");
+        docs.put_bytes(b"order:1", &order(1, "open", 1))
+            .expect("put");
+        docs.create_index("$.status").expect("indexed again");
+        assert_eq!(docs.indexes().len(), 1);
+        assert_eq!(
+            docs.index("$.status").expect("there").postings(),
+            1,
+            "a redeclaration did not double file anything"
+        );
+        assert!(docs.create_index("$.[").is_err(), "the path has to parse");
+    }
+
+    #[test]
+    fn clearing_a_collection_empties_its_indexes_and_keeps_them() {
+        let mut docs = Docs::new();
+        docs.create_index("$.status").expect("indexed");
+        for i in 0..8i64 {
+            docs.put_bytes(format!("order:{i}").as_bytes(), &order(i, "open", 1))
+                .expect("put");
+        }
+        docs.clear();
+        assert!(docs.is_empty());
+        assert!(docs.index("$.status").expect("still declared").is_empty());
+        assert_eq!(docs.count("$.status", &Key::text("open")).expect("i"), 0);
+
+        docs.put_bytes(b"order:9", &order(9, "open", 1))
+            .expect("put");
+        assert_eq!(found(&docs, "$.status", &Key::text("open")), ["order:9"]);
+    }
+
+    #[test]
+    fn two_indexes_intersect_as_the_sets_they_are() {
+        let mut docs = Docs::new();
+        docs.create_index("$.status").expect("indexed");
+        docs.create_index("$.customer").expect("indexed");
+        for i in 0..32i64 {
+            let status = if i % 2 == 0 { "open" } else { "shut" };
+            docs.put_bytes(format!("order:{i}").as_bytes(), &order(i % 4, status, 1))
+                .expect("put");
+        }
+
+        // What a planner does: probe both, walk the smaller, ask the larger.
+        // That is `SINTER` and there is no code here that is not already the
+        // set's.
+        let open = Key::text("open");
+        let customer = Key::int(14);
+        let small = docs.count("$.customer", &customer).expect("indexed");
+        let large = docs.count("$.status", &open).expect("indexed");
+        assert_eq!((small, large), (8, 16));
+
+        let small = docs.index("$.customer").expect("there").get(&customer);
+        let large = docs.index("$.status").expect("there").get(&open);
+        let (Some(small), Some(large)) = (small, large) else {
+            panic!("both keys are filed");
+        };
+        let mut both = Vec::new();
+        index::each_id(small, |id| {
+            if large.contains(id) {
+                both.push(String::from_utf8_lossy(id).into_owned());
+            }
+        });
+        both.sort();
+        assert_eq!(
+            both,
+            [
+                "order:10", "order:14", "order:18", "order:2", "order:22", "order:26", "order:30",
+                "order:6"
+            ]
+        );
     }
 
     #[test]

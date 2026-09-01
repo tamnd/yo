@@ -6,7 +6,8 @@
 //! spirit, which is Postgres and CockroachDB in spirit, with the differences
 //! that matter for an embedded engine written down below. [`Docs`] is the
 //! collection: documents by id, with the [`Keys`] table that turns every object
-//! key into two bytes. The indexes over paths come next.
+//! key into two bytes and a [`PathIndex`] per path that is worth looking
+//! documents up by.
 //!
 //! ```
 //! use yo_doc::{Builder, Kind, Value};
@@ -65,9 +66,15 @@
 //! typed API never parses JSON, it serializes a struct straight into this
 //! encoding, and text parsing is for `JSON.SET` and for bulk import.
 //!
-//! Path indexes. A collection stores documents and reads one back by id; a
-//! query that finds documents by what is in them needs an index per indexed
-//! path, and those are element tables too.
+//! Ordered path indexes. [`PathIndex`] answers equality, which is the one the
+//! exit gate names, and a range needs the counted B+ tree from `08` section 5
+//! rather than an element table. The index key encoding here is already order
+//! preserving so that the tree can take it as it is.
+//!
+//! Array and text indexes, which file a document under every element of an array
+//! or every token of a string rather than under one key. The posting lists are
+//! the same sets and the write path is the same one, so what is missing is the
+//! part that decides how many keys a document has at a path.
 //!
 //! The vector index, which is `10`, and the typed `Docs<T>` surface with its
 //! derive, which is `15`.
@@ -77,6 +84,7 @@
 mod build;
 mod docs;
 mod head;
+mod index;
 mod keys;
 pub mod layout;
 mod path;
@@ -85,6 +93,7 @@ mod read;
 pub use build::Builder;
 pub use docs::{Doc, DocElems, DocMembers, Docs};
 pub use head::{COUNT_MAX, DEPTH_MAX, Kind};
+pub use index::{KEY_MAX, Key, PathIndex};
 pub use keys::{KEYS_MAX, Keys};
 pub use path::{Step, Steps};
 pub use read::{Elems, Members, Value, key_order};
