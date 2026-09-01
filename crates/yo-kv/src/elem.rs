@@ -156,17 +156,37 @@ const EMPTY: u32 = 0xFFFF_FFFF;
 /// is about to reject, and the probe is the hottest path in the engine.
 const TOMB: u32 = 0x00FF_FFFF;
 
-/// How full the slot array is allowed to get before it doubles.
+/// How full the slot array is allowed to get before it grows.
 ///
-/// Three quarters is where linear probing is still short and the array is not
-/// mostly air. The run length at this load is under three on average, which is
-/// inside one cache line of slots. Markers count towards it, because a marker is
-/// a slot a probe has to look at and step over.
-const LOAD_NUM: usize = 3;
-const LOAD_DEN: usize = 4;
+/// Seven eighths, which is one free slot per group and is the load a group probe
+/// is built for. A slot at a time this would be a bad number, because an
+/// unsuccessful linear probe costs half of one plus one over the square of one
+/// minus the load and that is twenty three slots here against two and a half at
+/// three quarters. Eight slots at a time it is a little over one group either
+/// way, so the load can go where the memory wants it. Markers count towards it,
+/// because a marker is a slot a probe has to look at and step over.
+const LOAD_NUM: usize = 7;
+const LOAD_DEN: usize = 8;
 
 /// The smallest slot array, which is one cache line of slots.
 const MIN_SLOTS: usize = 16;
+
+/// Where doubling the slot array stops paying for itself, in bytes.
+///
+/// The same number [`crate::grow`] uses on the flat arrays and for the same
+/// reason: under this the worst slack is sixty four kilobytes, which is not
+/// worth an extra rebuild to avoid.
+const DOUBLE_UNDER: usize = 64 * 1024;
+
+/// One over the slot array's growth factor once it is past [`DOUBLE_UNDER`].
+///
+/// A quarter, where [`crate::grow`] takes an eighth on the rows and the names.
+/// Those grow with a memcpy and this grows by placing every entry again, so a
+/// rebuild here costs more per byte and is worth doing less often. A quarter
+/// puts the load between seven tenths and seven eighths across a growth, and an
+/// eighth would put it between eight tenths and seven eighths for twice as many
+/// rebuilds, which is not a trade worth taking on the insert path.
+const OVER_BY: usize = 4;
 
 /// The shortest name that keeps its length in the blob instead of in its row.
 ///
@@ -181,27 +201,31 @@ const LONG_NAME: usize = 255;
 /// How many bytes a long name's length prefix takes.
 const PREFIX: usize = 2;
 
-/// How many bits of the home slot a row keeps.
+/// How many bits of its hash a row keeps.
 const HOME_BITS: u32 = 24;
 
 /// One element: where its name is and where it wanted to sit.
 ///
 /// Eight bytes, and the packing is what makes it eight rather than twelve. The
 /// blob offset needs a whole `u32` because a large collection's names run to
-/// megabytes. The other four hold the name's length in the low byte and the home
-/// slot in the twenty four above it.
+/// megabytes. The other four hold the name's length in the low byte and twenty
+/// four bits of the name's hash above it.
 ///
-/// The home slot is where this row would sit in an empty table, and what it buys
-/// is that a removal and a growth never read a name and never hash one. Both of
-/// those walk slots and ask each one where it wanted to be, and asking the blob
-/// instead means a random cache miss per slot examined, on the two operations
-/// where there is no reply to send that would have paid for it.
+/// Those bits are what pick the group this row wanted to sit in, and what they
+/// buy is that a removal and a growth never read a name and never hash one. Both
+/// of those walk slots and ask each one where it wanted to be, and asking the
+/// blob instead means a random cache miss per slot examined, on the two
+/// operations where there is no reply to send that would have paid for it.
 ///
-/// Twenty four bits of it is every bit that matters until the slot array passes
-/// sixteen million, which is a table holding twelve million elements. Past there
-/// [`Elements::home_of`] hashes the name instead, and that is the right place for
-/// the cost to land: the partitioned band splits a collection at a quarter of a
-/// million, so a table that large is one partition of a set with two hundred
+/// Twenty four is enough at every size, which it was not when a slot array was a
+/// power of two and these bits were masked down to it. [`group_at`] scales them
+/// across however many groups there are rather than cutting them down, so the
+/// answer is the one the insert gave whatever the table has grown to since. Past
+/// two million groups they stop being able to name every group apart and a few
+/// groups get one more name's worth of hash space than their neighbours, which
+/// is a table holding twelve million elements and is a little clustering rather
+/// than a wrong answer. The partitioned band splits a collection at a quarter of
+/// a million, so a table that large is one partition of a set with two hundred
 /// million members in it.
 ///
 /// The payload is deliberately not in here. See [`Elements::vals`].
@@ -221,7 +245,7 @@ impl Row {
         let len = u32::try_from(len.min(LONG_NAME)).expect("LONG_NAME is one byte");
         Row {
             at,
-            packed: ((h as u32 & ((1 << HOME_BITS) - 1)) << 8) | len,
+            packed: (bits_of(h) << 8) | len,
         }
     }
 
@@ -234,9 +258,36 @@ impl Row {
 
     /// The low [`HOME_BITS`] of the name's hash.
     #[inline]
-    const fn home(self) -> usize {
-        (self.packed >> 8) as usize
+    const fn bits(self) -> u32 {
+        self.packed >> 8
     }
+}
+
+/// The bits of a hash that pick a group.
+///
+/// The low [`HOME_BITS`], deliberately not the high ones, because the tag comes
+/// off the top byte. If the two overlapped then every row in a group would carry
+/// nearly the same tag and the tag would stop throwing anything out.
+#[inline(always)]
+const fn bits_of(h: u64) -> u32 {
+    h as u32 & ((1 << HOME_BITS) - 1)
+}
+
+/// Where the group a name with these hash bits belongs to starts.
+///
+/// A multiply and a shift rather than an and, which is the standard way to put a
+/// hash into a range that is not a power of two, and it is what lets the array be
+/// exactly as large as the table needs instead of the next power of two up. On
+/// the gate's own shape that rounding was the difference between a load of 0.39
+/// and the load the array was sized for.
+///
+/// The three cycles it costs over an and sit in front of a load that misses
+/// cache, which is the only reason the trade is there to take. It answers with a
+/// slot index and not a group number so that the caller can index straight into
+/// the array.
+#[inline(always)]
+const fn group_at(bits: u32, groups: usize) -> usize {
+    (((bits as u64 * groups as u64) >> HOME_BITS) as usize) * group::WIDTH
 }
 
 /// An open addressed table of elements, keyed by name, dense in insertion order.
@@ -671,9 +722,8 @@ impl<V: Copy> Elements<V> {
         if self.rows.is_empty() {
             return None;
         }
-        let mask = self.slots.len() - 1;
         let tag = tag_of(h);
-        let mut at = self.group_of(h as usize & mask);
+        let mut at = group_at(bits_of(h), self.groups());
         loop {
             let slots = &self.slots[at..at + group::WIDTH];
             let mut hits = group::tags(slots, tag);
@@ -692,7 +742,7 @@ impl<V: Copy> Elements<V> {
             if group::empty(slots, EMPTY) != 0 {
                 return None;
             }
-            at = (at + group::WIDTH) & mask;
+            at = self.next_group(at);
         }
     }
 
@@ -704,14 +754,13 @@ impl<V: Copy> Elements<V> {
     /// these slots in this order and stops only at an [`EMPTY`], which is at or
     /// after wherever this lands.
     fn put_slot(&mut self, h: u64, row: u32) {
-        let mask = self.slots.len() - 1;
-        let mut at = self.group_of(h as usize & mask);
+        let mut at = group_at(bits_of(h), self.groups());
         let at = loop {
             let free = group::free(&self.slots[at..at + group::WIDTH], ROW);
             if free != 0 {
                 break at + free.trailing_zeros() as usize;
             }
-            at = (at + group::WIDTH) & mask;
+            at = self.next_group(at);
         };
         if self.slots[at] == TOMB {
             self.dead -= 1;
@@ -751,7 +800,7 @@ impl<V: Copy> Elements<V> {
     /// against the load until the next rebuild.
     fn clear_slot(&mut self, row: usize) {
         let at = self.slot_of(row);
-        let group = at & !(group::WIDTH - 1);
+        let group = self.group_of(at);
         let slots = &self.slots[group..group + group::WIDTH];
         if group::empty(slots, EMPTY) == 0 {
             self.slots[at] = TOMB;
@@ -786,9 +835,8 @@ impl<V: Copy> Elements<V> {
     /// row does not keep. A marker cannot match, because its row bits are all
     /// ones and no row index is.
     fn slot_of(&self, row: usize) -> usize {
-        let mask = self.slots.len() - 1;
         let want = u32::try_from(row).expect("a row index fits in 24 bits");
-        let mut at = self.group_of(self.home_of(row, mask));
+        let mut at = group_at(self.rows[row].bits(), self.groups());
         loop {
             let slots = &self.slots[at..at + group::WIDTH];
             let hit = group::rows(slots, ROW, want);
@@ -799,18 +847,36 @@ impl<V: Copy> Elements<V> {
                 group::empty(slots, EMPTY) == 0,
                 "the row being looked for has a slot at or before the first gap"
             );
-            at = (at + group::WIDTH) & mask;
+            at = self.next_group(at);
         }
     }
 
     /// Where the group holding slot `at` starts.
     ///
-    /// The slot array is a power of two and never shorter than [`group::WIDTH`],
-    /// so every group is aligned, there is no partial one at the end, and this
-    /// is one and rather than a division.
+    /// The array is a whole number of groups and never fewer than one, so every
+    /// group is aligned, there is no partial one at the end, and this is one and
+    /// rather than a division.
     #[inline(always)]
     const fn group_of(&self, at: usize) -> usize {
         at & !(group::WIDTH - 1)
+    }
+
+    /// How many groups the slot array holds.
+    #[inline(always)]
+    const fn groups(&self) -> usize {
+        self.slots.len() / group::WIDTH
+    }
+
+    /// The group after the one starting at `at`, wrapping at the end.
+    ///
+    /// A comparison rather than a mask, because the array is no longer a power of
+    /// two. It is the same branch a masked probe was already paying for in the
+    /// loop condition and it predicts perfectly until the one iteration that
+    /// wraps.
+    #[inline(always)]
+    fn next_group(&self, at: usize) -> usize {
+        let next = at + group::WIDTH;
+        if next == self.slots.len() { 0 } else { next }
     }
 
     /// Make sure there is room for one more before it is inserted.
@@ -818,18 +884,28 @@ impl<V: Copy> Elements<V> {
     /// The row array grows by [`crate::grow`]'s policy rather than by `Vec`'s,
     /// because a doubling row array on a large collection is the single largest
     /// piece of memory nobody asked for in the whole structure. The slot array
-    /// keeps its power of two, which is not a policy, it is what makes the
-    /// probe a mask instead of a division.
+    /// now follows a policy of its own too, in [`next_slots`], rather than the
+    /// power of two it used to have no choice about.
     fn reserve_one(&mut self) {
         let want = self.rows.len() + 1;
         crate::grow::reserve(&mut self.rows, 1);
         crate::grow::reserve(&mut self.vals, 1);
         // The markers are in here because they are what a probe has to walk
         // past, so a table churned in place rebuilds on the same schedule as one
-        // that only grows. A rebuild the markers alone triggered comes back the
-        // same size or smaller and clears every one of them.
+        // that only grows.
         if (want + self.dead) * LOAD_DEN > self.slots.len() * LOAD_NUM {
-            self.grow_to(slots_for(want));
+            let need = slots_for(want);
+            // A rebuild the markers alone triggered comes back the size it
+            // already is and clears every one of them. Sizing it down to what
+            // the live rows need would be right on memory and wrong on work: the
+            // array would land exactly at the load limit and the next churn cycle
+            // would rebuild it again.
+            let to = if need <= self.slots.len() {
+                self.slots.len()
+            } else {
+                need.max(next_slots(self.slots.len()))
+            };
+            self.grow_to(to);
         }
     }
 
@@ -837,11 +913,15 @@ impl<V: Copy> Elements<V> {
     ///
     /// The rows do not move and the names do not move. Only the slots are, and
     /// they are rebuilt from the old slot array rather than from the names: the
-    /// tag is already in the old slot and the home is already in the row, so a
-    /// growth reads two flat arrays and hashes nothing.
+    /// tag is already in the old slot and the hash bits are already in the row,
+    /// so a growth reads two flat arrays and hashes nothing.
+    ///
+    /// The size asked for is rounded up to a whole number of groups and nothing
+    /// else. That rounding is at most seven slots, where the power of two this
+    /// used to do was up to twice the array.
     fn grow_to(&mut self, slots: usize) {
-        let slots = slots.max(MIN_SLOTS).next_power_of_two();
-        let mask = slots - 1;
+        let groups = slots.max(MIN_SLOTS).div_ceil(group::WIDTH);
+        let slots = groups * group::WIDTH;
         let old = std::mem::replace(&mut self.slots, vec![EMPTY; slots].into_boxed_slice());
         self.dead = 0;
         for &slot in &old {
@@ -849,45 +929,16 @@ impl<V: Copy> Elements<V> {
                 continue;
             }
             let row = (slot & ROW) as usize;
-            let mut at = self.group_of(self.home_of(row, mask));
+            let mut at = group_at(self.rows[row].bits(), groups);
             let at = loop {
                 let free = group::empty(&self.slots[at..at + group::WIDTH], EMPTY);
                 if free != 0 {
                     break at + free.trailing_zeros() as usize;
                 }
-                at = (at + group::WIDTH) & mask;
+                at = self.next_group(at);
             };
             self.slots[at] = slot;
         }
-    }
-
-    /// Where the row at `idx` wanted to sit, in a table with this `mask`.
-    ///
-    /// One comparison against a number the caller already had in a register, and
-    /// then a field of a row it was going to read anyway. The other arm is for a
-    /// table with more slots than a row has bits to name one, which costs a hash
-    /// and a trip into the blob and is the reason the row is eight bytes rather
-    /// than twelve for everybody else.
-    ///
-    /// The arms are split and the cold one is kept out of line because this is
-    /// called once per slot of the run behind a removal. Left as one function it
-    /// has a hash call in it, the call stops it being inlined into that loop, and
-    /// a pop of a thousand members measured 52 percent slower.
-    #[inline(always)]
-    fn home_of(&self, idx: usize, mask: usize) -> usize {
-        let row = self.rows[idx];
-        if mask < 1 << HOME_BITS {
-            row.home() & mask
-        } else {
-            self.home_by_hash(&row, mask)
-        }
-    }
-
-    /// Where a row wanted to sit in a table too large for the packed bits.
-    #[cold]
-    #[inline(never)]
-    fn home_by_hash(&self, row: &Row, mask: usize) -> usize {
-        hash(self.name_of(row)) as usize & mask
     }
 
     /// Append a name to the blob and say where it went.
@@ -990,10 +1041,25 @@ fn hash(name: &[u8]) -> u64 {
 }
 
 /// How many slots `n` elements need at the load factor.
+///
+/// Exactly that many, rounded up to a whole group by [`Elements::grow_to`] and
+/// no further. A caller that says how large its result will be gets an array
+/// sized for it rather than one sized for the next power of two above it.
 fn slots_for(n: usize) -> usize {
-    ((n * LOAD_DEN) / LOAD_NUM + 1)
-        .max(MIN_SLOTS)
-        .next_power_of_two()
+    ((n * LOAD_DEN) / LOAD_NUM + 1).max(MIN_SLOTS)
+}
+
+/// The next size up for a slot array that has just run out of room.
+///
+/// A growth has to be geometric or an insert is not amortised constant, and
+/// [`slots_for`] on its own is not: it answers with an array exactly at the load
+/// limit, so the very next insert would grow again. This is the floor under it.
+fn next_slots(now: usize) -> usize {
+    if now * size_of::<u32>() < DOUBLE_UNDER {
+        now.saturating_mul(2).max(MIN_SLOTS)
+    } else {
+        now + now / OVER_BY
+    }
 }
 
 #[cfg(test)]
