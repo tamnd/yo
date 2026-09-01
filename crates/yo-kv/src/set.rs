@@ -478,6 +478,42 @@ impl Set {
         }
     }
 
+    /// What the slot array costs on its own, or nothing if there is not one.
+    ///
+    /// The three of these split [`Set::memory_bytes`] into the arrays it is made
+    /// of, which is what turns an argument about where the memory went into a
+    /// number. An intset and a listpack are one allocation with no index over
+    /// it, so they answer all of it under names and nothing under the other two.
+    #[must_use]
+    pub fn slot_bytes(&self) -> usize {
+        match &self.body {
+            Body::Ints(_) | Body::Packed(_) => 0,
+            Body::Table(t) => t.slot_bytes(),
+            Body::Split(p) => p.slot_bytes(),
+        }
+    }
+
+    /// What the row array costs on its own, capacity and not length.
+    #[must_use]
+    pub fn row_bytes(&self) -> usize {
+        match &self.body {
+            Body::Ints(_) | Body::Packed(_) => 0,
+            Body::Table(t) => t.row_bytes(),
+            Body::Split(p) => p.row_bytes(),
+        }
+    }
+
+    /// What the member bytes cost, live ones and dead ones together.
+    #[must_use]
+    pub fn name_bytes(&self) -> usize {
+        match &self.body {
+            Body::Ints(s) => s.memory_bytes(),
+            Body::Packed(lp) => lp.byte_len(),
+            Body::Table(t) => t.name_bytes(),
+            Body::Split(p) => p.name_bytes(),
+        }
+    }
+
     /// Add `member`, promoting if it no longer fits. Answers whether it was new.
     ///
     /// This is `setTypeAdd`, arm for arm.
@@ -797,11 +833,16 @@ mod tests {
                 s.add(m.as_bytes(), &limits);
             }
             let total = s.memory_bytes();
+            let per = |b: usize| b as f64 / n as f64;
             println!(
-                "bytes n={n:<9} band={:<10} total={total:<10} payload={payload:<9} per_member={:.2} over_per_member={:.2}",
+                "bytes n={n:<9} band={:<10} total={total:<10} payload={payload:<9} per_member={:.2} over_per_member={:.2} slots={:.2} rows={:.2} names={:.2} name_slack={:.2}",
                 band(&s),
-                total as f64 / n as f64,
-                (total as f64 - payload as f64) / n as f64
+                per(total),
+                per(total - payload),
+                per(s.slot_bytes()),
+                per(s.row_bytes()),
+                per(s.name_bytes()),
+                per(s.name_bytes() - payload)
             );
         }
     }
