@@ -867,16 +867,23 @@ fn config(server: &mut Server, args: Args<'_>, out: &mut Out) -> Result<()> {
 /// processor time against wall clock to decide whether a server is busy or
 /// waiting, so an absent field there is a real hole and not a tidy omission.
 fn info(server: &Server, args: Args<'_>, out: &mut Out) {
-    let want = |section: &str| {
-        args.len() == 1
-            || (1..args.len()).any(|i| {
-                let a = args.get(i);
-                is(a, section.as_bytes())
-                    || is(a, b"all")
-                    || is(a, b"everything")
-                    || is(a, b"default")
-            })
-    };
+    // Redis keeps two lists: the sections a bare `INFO` hands back, and the ones
+    // that have to be asked for by name or by `all`. `commandstats` is in the
+    // second, along with `latencystats` and `errorstats`, because they grow with
+    // the number of distinct commands a server has seen and a monitoring tool
+    // polling `INFO` every second does not want them.
+    //
+    // `unit/info-command` is exactly this distinction written down: it asks for
+    // `INFO default` and insists `rejected_calls` is not in the answer, then
+    // asks for `INFO all` and insists that it is.
+    let named = |section: &str| (1..args.len()).any(|i| is(args.get(i), section.as_bytes()));
+    let everything = (1..args.len()).any(|i| {
+        let a = args.get(i);
+        is(a, b"all") || is(a, b"everything")
+    });
+    let by_default = args.len() == 1 || (1..args.len()).any(|i| is(args.get(i), b"default"));
+    let want = |section: &str| by_default || everything || named(section);
+    let extra = |section: &str| everything || named(section);
     // One string, built once and written once. It allocates, which is allowed
     // here and nowhere near the commands that count: `INFO` is a monitoring
     // call and it is not on the path M2 is measured on.
@@ -950,7 +957,28 @@ fn info(server: &Server, args: Args<'_>, out: &mut Out) {
             }
         }
         if want("replication") {
-            s.push_str("# Replication\r\nrole:master\r\nconnected_slaves:0\r\n\r\n");
+            // Four fields out of Redis's dozen, and the eight that are missing
+            // all describe the replication backlog, which is a thing that does
+            // not exist here rather than a thing that is empty. The four that
+            // are here are true of a server with no replica attached: it is the
+            // master, nobody is following it, no failover is in progress and
+            // nothing has been written to a stream that does not exist, which is
+            // an offset of zero.
+            s.push_str(
+                "# Replication\r\nrole:master\r\nconnected_slaves:0\r\n\
+                 master_failover_state:no-failover\r\nmaster_repl_offset:0\r\n\r\n",
+            );
+        }
+        if extra("commandstats") {
+            s.push_str("# Commandstats\r\n");
+            for (name, row) in server.command_stats() {
+                let _ = write!(
+                    s,
+                    "cmdstat_{name}:calls={},rejected_calls={},failed_calls={}\r\n",
+                    row.calls, row.rejected, row.failed,
+                );
+            }
+            s.push_str("\r\n");
         }
         if want("keyspace") {
             s.push_str("# Keyspace\r\n");

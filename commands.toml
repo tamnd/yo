@@ -2273,7 +2273,7 @@ bounded = "inherent"
 status = "shipped"
 wire = "verified"
 divergent = "D-12"
-notes = "Only the fields this layer can stand behind. There is no rdb_last_save_time because there is no save, and a field that is not there is a client falling back rather than a client believing a zero. The CPU section was absent for the same reason and is there now, from one getrusage call, because Redis's own unit/info-command asks for used_cpu_user by name and because a monitoring tool graphs it against wall clock to tell a busy server from a waiting one."
+notes = "Only the fields this layer can stand behind. There is no rdb_last_save_time because there is no save, and a field that is not there is a client falling back rather than a client believing a zero. The CPU section was absent for the same reason and is there now, from one getrusage call, because Redis's own unit/info-command asks for used_cpu_user by name and because a monitoring tool graphs it against wall clock to tell a busy server from a waiting one. Commandstats is here under the same rule and is three of Redis's five fields: calls, rejected_calls and failed_calls are counted, and usec and usec_per_call are not, because timing a command means two clock reads around a call that takes tens of nanoseconds and a zero under a name that says microseconds is worse than nothing at all. Replication reports role, connected_slaves, master_failover_state and master_repl_offset, and the eight backlog fields are missing because the backlog is a thing that does not exist here rather than a thing that is empty."
 
 [[command]]
 name = "DBSIZE"

@@ -2782,6 +2782,45 @@ pub fn lookup(name: &[u8]) -> Option<&'static Spec> {
         .find(|c| c.name.len() == name.len() && c.name.as_bytes().eq_ignore_ascii_case(name))
 }
 
+/// How many commands there are.
+///
+/// The length of a counter array that has a row per command, which is the only
+/// thing that wants this number.
+#[must_use]
+pub const fn count() -> usize {
+    COMMANDS.len()
+}
+
+/// Where in [`COMMANDS`] this spec is.
+///
+/// Every `&'static Spec` a caller can hold came out of [`lookup`] and therefore
+/// points into that array, so its position is the distance from the front
+/// measured in whole `Spec`s. That is arithmetic on two addresses and not a
+/// search, which is the point: a per command counter has to be reachable from
+/// the spec the dispatcher is already holding without walking the table a second
+/// time.
+///
+/// A spec from somewhere else would answer nonsense, which is why this takes a
+/// `&'static Spec` rather than a `&Spec`: the only `'static` ones are in the
+/// table.
+#[must_use]
+pub fn index_of(spec: &'static Spec) -> usize {
+    let front = COMMANDS.as_ptr().addr();
+    let here = std::ptr::from_ref(spec).addr();
+    (here - front) / size_of::<Spec>()
+}
+
+/// The name of the command at `at`, which is [`index_of`] the other way round.
+///
+/// # Panics
+///
+/// If `at` is past the end of the table, which only a caller that made the index
+/// up rather than getting it from [`index_of`] can manage.
+#[must_use]
+pub fn name_at(at: usize) -> &'static str {
+    COMMANDS[at].name
+}
+
 /// Whether `n` arguments, counting the name, satisfy this command's arity.
 #[must_use]
 pub fn arity_ok(spec: &Spec, n: usize) -> bool {
@@ -2809,6 +2848,23 @@ mod tests {
             );
             assert!(seen.insert(c.name), "{} is in the table twice", c.name);
         }
+    }
+
+    /// Every command's index is where the table actually holds it.
+    ///
+    /// Checked against the position a search finds, over the whole table rather
+    /// than a sample, because the arithmetic is the thing being tested and an
+    /// off by one in it would put every counter on the wrong command.
+    #[test]
+    fn a_spec_knows_where_it_is_in_the_table() {
+        assert_eq!(count(), COMMANDS.len());
+        for (want, spec) in COMMANDS.iter().enumerate() {
+            assert_eq!(index_of(spec), want, "{} is at the wrong index", spec.name);
+        }
+        assert_eq!(
+            index_of(lookup(b"get").unwrap()),
+            index_of(lookup(b"GET").unwrap())
+        );
     }
 
     #[test]
