@@ -94,8 +94,12 @@
 //! back when the dead share crosses a half and there are at least a few thousand
 //! of them, which is a rewrite of the blob and a walk over the rows to move
 //! their offsets, and until then they are counted and reported rather than
-//! pretended away. That accounting lives in [`crate::blob`], because a hash's
-//! values want exactly the same thing and there should be one copy of it.
+//! pretended away. That accounting lives in [`crate::blob`], which is also what
+//! a key's bytes are kept in, so there is one copy of it.
+//!
+//! A hash writes its value into the same blob directly behind the field name,
+//! which is what [`Elements::tailed`] is. The pair is one span, so the row's
+//! offset finds both and a hash field carries no value offset at all.
 
 use yo_common::{bytes_eq, hash_key, tag_of};
 
@@ -158,6 +162,16 @@ const LONG_NAME: usize = 255;
 
 /// How many bytes a long name's length prefix takes.
 const PREFIX: usize = 2;
+
+/// The shortest tail that keeps its length in four bytes rather than one.
+///
+/// A tail carries its own length, because unlike a name there is nowhere in the
+/// row left to put it. One byte covers every value anyone actually stores in a
+/// hash field and the escape covers the rest.
+const LONG_TAIL: usize = 255;
+
+/// How many bytes a long tail's length prefix takes, the marker included.
+const TAIL_PREFIX: usize = 5;
 
 /// How many bits of the home slot a row keeps.
 const HOME_BITS: u32 = 24;
@@ -230,7 +244,30 @@ pub struct Elements<V> {
     /// These count against the load exactly as live rows do, which is what stops
     /// a table written and removed from in place filling up with them, and it is
     /// also what a drained table watches to know when to rebuild.
-    dead: usize,
+    ///
+    /// Four bytes and not eight, because a marker sits in a slot and the slot
+    /// array is indexed by a `u32`. It is next to [`Elements::tailed`] so that
+    /// the two of them share the eight bytes this used to take on its own.
+    dead: u32,
+    /// Whether a name in the blob is followed by a tail.
+    ///
+    /// A hash is the only collection that has a second variable length thing to
+    /// keep per element, and the obvious place for it is a blob of its own with
+    /// a four byte offset beside every row saying where in it to look. That is
+    /// what this used to be, and the four bytes were the single largest piece of
+    /// overhead in a hash: more than the row, more than the slot.
+    ///
+    /// Behind the name instead, the offset is not needed at all, because the row
+    /// already says where the name starts and the name says how long it is. It
+    /// costs one byte for the tail's own length, against four for the offset and
+    /// one for the length the separate blob was writing anyway.
+    ///
+    /// It is a flag rather than a type parameter because the alternative is
+    /// threading a constant through [`crate::parts::Parts`] and every scratch
+    /// table in `setops`, to save nothing per element. Nothing on the probe path
+    /// reads it: a name is found exactly as it was, and only the accounting and
+    /// the compaction care that there is anything behind it.
+    tailed: bool,
     /// The rows, in insertion order, with no holes.
     rows: Vec<Row>,
     /// The payloads, one per row and at the same index.
@@ -252,6 +289,9 @@ pub struct Elements<V> {
     /// byte of it is what keeps a row at eight bytes, and the names that do not
     /// fit in one byte carry their own length in the blob instead of widening
     /// every row that does.
+    ///
+    /// When [`Elements::tailed`] is set, each name has its element's bytes
+    /// written directly behind it and the pair is one span.
     names: Blob,
 }
 
@@ -274,7 +314,20 @@ impl<V: Copy> Elements<V> {
             rows: Vec::new(),
             vals: Vec::new(),
             names: Blob::new(),
+            tailed: false,
         }
+    }
+
+    /// An empty table that keeps each element's bytes behind its name.
+    ///
+    /// Room for `n` elements and `blob` bytes of names and tails together. See
+    /// [`Elements::tailed`] for what a tail is and why it is not a second blob.
+    #[must_use]
+    pub fn tailed(n: usize, blob: usize) -> Elements<V> {
+        let mut e = Elements::with_capacity(n);
+        e.names = Blob::with_capacity(blob);
+        e.tailed = true;
+        e
     }
 
     /// An empty table with room for `n` elements already taken.
@@ -307,7 +360,7 @@ impl<V: Copy> Elements<V> {
         }
         self.rows.reserve(n.saturating_sub(self.rows.len()));
         self.vals.reserve(n.saturating_sub(self.vals.len()));
-        if (n + self.dead) * LOAD_DEN > self.slots.len() * LOAD_NUM {
+        if (n + self.dead as usize) * LOAD_DEN > self.slots.len() * LOAD_NUM {
             self.grow_to(slots_for(n));
         }
     }
@@ -446,6 +499,84 @@ impl<V: Copy> Elements<V> {
         Ok(None)
     }
 
+    /// Store `tail` against `name`, and say which row it is in and whether the
+    /// name is new.
+    ///
+    /// `HSET`. Only for a table built by [`Elements::tailed`].
+    ///
+    /// A name that is already here keeps its row and its slot and gets a fresh
+    /// span in the blob, because the new tail need not be the length of the old
+    /// one. That copies the name again, which is the one thing this arrangement
+    /// costs that a separate value blob did not, and it is a few bytes against
+    /// the four an offset would have cost every field in the hash forever.
+    pub fn set_tailed(
+        &mut self,
+        name: &[u8],
+        tail: &[u8],
+        value: V,
+    ) -> Result<(usize, bool), Full> {
+        debug_assert!(self.tailed, "this table does not keep tails");
+        if name.len() > NAME_MAX {
+            return Err(Full::Name);
+        }
+        let h = hash(name);
+        if let Some(at) = self.find_hashed(h, name) {
+            self.rewrite_tail(at, name, tail);
+            self.vals[at] = value;
+            return Ok((at, false));
+        }
+        if self.rows.len() >= MAX_ROWS {
+            return Err(Full::Rows);
+        }
+        self.reserve_one();
+        let at = self.rows.len();
+        let name_at = self.push_name(name);
+        self.push_tail(tail);
+        self.rows.push(Row::new(name_at, name.len(), h));
+        self.vals.push(value);
+        self.put_slot(h, u32::try_from(at).expect("MAX_ROWS is under u32::MAX"));
+        Ok((at, true))
+    }
+
+    /// Put a fresh copy of a row's name and a new tail at the end of the blob.
+    fn rewrite_tail(&mut self, at: usize, name: &[u8], tail: &[u8]) {
+        let gone = self.footprint(&self.rows[at]);
+        let name_at = self.push_name(name);
+        self.push_tail(tail);
+        self.rows[at].at = name_at;
+        self.names.release(gone);
+        self.maybe_compact_names();
+    }
+
+    /// The tail stored against `name`.
+    #[inline]
+    #[must_use]
+    pub fn tail(&self, name: &[u8]) -> Option<&[u8]> {
+        let at = self.find(name)?;
+        Some(self.tail_of(&self.rows[at]))
+    }
+
+    /// How long the tail stored against `name` is. `HSTRLEN`.
+    #[inline]
+    #[must_use]
+    pub fn tail_len(&self, name: &[u8]) -> Option<usize> {
+        let at = self.find(name)?;
+        Some(self.tail_len_of(&self.rows[at]))
+    }
+
+    /// The name and tail of one row, by position.
+    #[inline]
+    #[must_use]
+    pub fn pair_at(&self, idx: usize) -> Option<(&[u8], &[u8])> {
+        let row = self.rows.get(idx)?;
+        Some((self.name_of(row), self.tail_of(row)))
+    }
+
+    /// Every name and tail, in insertion order. `HGETALL`.
+    pub fn pairs(&self) -> impl Iterator<Item = (&[u8], &[u8])> {
+        self.rows.iter().map(|r| (self.name_of(r), self.tail_of(r)))
+    }
+
     /// Take an element out and hand back what it held.
     ///
     /// `SREM`, `HDEL` and the removing half of `SPOP`.
@@ -524,11 +655,11 @@ impl<V: Copy> Elements<V> {
 
     /// Every payload, to be changed in place, with no names in the way.
     ///
-    /// A hash keeps its values in a blob of its own and the payload is where
-    /// they are, so when that blob compacts every one of those references has to
-    /// move. The names are deliberately not offered here: this borrows the rows
-    /// mutably, and handing out a name at the same time would borrow the name
-    /// blob as well for no caller that wants it.
+    /// For a payload that is a reference into somewhere else, which has to be
+    /// fixed up when that somewhere else moves. The names are deliberately not
+    /// offered here: this borrows the rows mutably, and handing out a name at
+    /// the same time would borrow the name blob as well for no caller that
+    /// wants it.
     pub fn payloads_mut(&mut self) -> impl Iterator<Item = &mut V> {
         self.vals.iter_mut()
     }
@@ -552,6 +683,27 @@ impl<V: Copy> Elements<V> {
     where
         F: FnMut(&[u8], &V),
     {
+        self.scan_rows(cursor, count, |e, at| {
+            f(e.name_of(&e.rows[at]), &e.vals[at]);
+        })
+    }
+
+    /// [`Elements::scan`] handing back names and tails. This is `HSCAN`.
+    pub fn scan_pairs<F>(&self, cursor: Cursor, count: usize, mut f: F) -> Cursor
+    where
+        F: FnMut(&[u8], &[u8]),
+    {
+        self.scan_rows(cursor, count, |e, at| {
+            let row = &e.rows[at];
+            f(e.name_of(row), e.tail_of(row));
+        })
+    }
+
+    /// The walk itself, which does not care what is read out of each row.
+    fn scan_rows<F>(&self, cursor: Cursor, count: usize, mut f: F) -> Cursor
+    where
+        F: FnMut(&Elements<V>, usize),
+    {
         if self.rows.is_empty() {
             return Cursor::END;
         }
@@ -565,8 +717,7 @@ impl<V: Copy> Elements<V> {
             None => top,
         };
         for _ in 0..count.max(1) {
-            let row = &self.rows[at];
-            f(self.name_of(row), &self.vals[at]);
+            f(self, at);
             if at == 0 {
                 return Cursor::END;
             }
@@ -777,7 +928,7 @@ impl<V: Copy> Elements<V> {
         // past, so a table churned in place rebuilds on the same schedule as one
         // that only grows. A rebuild the markers alone triggered comes back the
         // same size or smaller and clears every one of them.
-        if (want + self.dead) * LOAD_DEN > self.slots.len() * LOAD_NUM {
+        if (want + self.dead as usize) * LOAD_DEN > self.slots.len() * LOAD_NUM {
             self.grow_to(slots_for(want));
         }
     }
@@ -876,13 +1027,74 @@ impl<V: Copy> Elements<V> {
 
     /// How many blob bytes one row's name occupies, its prefix included.
     #[inline(always)]
-    fn footprint(&self, row: &Row) -> usize {
+    fn name_span(&self, row: &Row) -> usize {
         let len = row.len_byte();
         if len < LONG_NAME {
             len
         } else {
             PREFIX + self.long_len(row.at)
         }
+    }
+
+    /// How many blob bytes one row occupies, name and tail together.
+    #[inline(always)]
+    fn footprint(&self, row: &Row) -> usize {
+        let name = self.name_span(row);
+        if !self.tailed {
+            return name;
+        }
+        name + self.tail_span(row.at + name as u32)
+    }
+
+    /// Write a tail behind whatever was just pushed.
+    ///
+    /// A short one is a length byte and the bytes. A long one puts [`LONG_TAIL`]
+    /// in the byte and the real length in the four behind it, which is the same
+    /// shape [`Row`] uses for a long name and for the same reason: the common
+    /// case pays one byte and the rare case pays for itself.
+    fn push_tail(&mut self, tail: &[u8]) {
+        if tail.len() < LONG_TAIL {
+            self.names.push(&[tail.len() as u8]);
+        } else {
+            let len = u32::try_from(tail.len()).expect("a value is under four gigabytes");
+            self.names.push(&[LONG_TAIL as u8]);
+            self.names.push(&len.to_le_bytes());
+        }
+        self.names.push(tail);
+    }
+
+    /// How long the tail at `at` is, and how many bytes its length took.
+    #[inline]
+    fn tail_head(&self, at: u32) -> (usize, usize) {
+        let len = usize::from(self.names.read(at, 1)[0]);
+        if len < LONG_TAIL {
+            return (len, 1);
+        }
+        let head = self.names.read(at + 1, 4);
+        let long = u32::from_le_bytes(head.try_into().expect("four bytes"));
+        (long as usize, TAIL_PREFIX)
+    }
+
+    /// How many blob bytes the tail at `at` occupies, its prefix included.
+    #[inline]
+    fn tail_span(&self, at: u32) -> usize {
+        let (len, prefix) = self.tail_head(at);
+        prefix + len
+    }
+
+    /// The bytes of one row's tail.
+    #[inline]
+    fn tail_of(&self, row: &Row) -> &[u8] {
+        let at = row.at + self.name_span(row) as u32;
+        let (len, prefix) = self.tail_head(at);
+        self.names.read(at + prefix as u32, len)
+    }
+
+    /// How long one row's tail is, without reading it.
+    #[inline]
+    fn tail_len_of(&self, row: &Row) -> usize {
+        let at = row.at + self.name_span(row) as u32;
+        self.tail_head(at).0
     }
 
     /// Give the dead name bytes back once there are more of them than live ones.
@@ -894,10 +1106,11 @@ impl<V: Copy> Elements<V> {
             return;
         }
         let rows = &mut self.rows;
+        let tailed = self.tailed;
         self.names.compact(|keep| {
             for row in rows.iter_mut() {
                 let len = row.len_byte();
-                let take = if len < LONG_NAME {
+                let mut take = if len < LONG_NAME {
                     len
                 } else {
                     // The length is in the bytes rather than in the row, and the
@@ -906,6 +1119,19 @@ impl<V: Copy> Elements<V> {
                     let head = keep.peek(row.at, PREFIX);
                     PREFIX + usize::from(u16::from_le_bytes([head[0], head[1]]))
                 };
+                if tailed {
+                    // Same again for the tail, off the old copy for the same
+                    // reason, and it moves with the name because the two of them
+                    // are one span.
+                    let at = row.at + take as u32;
+                    let head = keep.peek(at, 1)[0];
+                    take += if usize::from(head) < LONG_TAIL {
+                        1 + usize::from(head)
+                    } else {
+                        let long = keep.peek(at + 1, 4);
+                        TAIL_PREFIX + u32::from_le_bytes(long.try_into().expect("four")) as usize
+                    };
+                }
                 keep.moved(&mut row.at, take);
             }
         });
@@ -1274,9 +1500,12 @@ mod tests {
             }
         }
         assert_eq!(live, s.len(), "one live slot per row and no more");
-        assert_eq!(dead, s.dead, "the dead count is what is in the array");
+        assert_eq!(
+            dead, s.dead as usize,
+            "the dead count is what is in the array"
+        );
         assert!(
-            s.len() + s.dead <= s.slots.len() * LOAD_NUM / LOAD_DEN,
+            s.len() + s.dead as usize <= s.slots.len() * LOAD_NUM / LOAD_DEN,
             "there is always an empty slot left for a probe to stop at"
         );
         for (i, name) in names.iter().enumerate() {
@@ -1373,11 +1602,11 @@ mod tests {
         for name in &names {
             s.insert(name, ()).expect("room");
         }
-        let mut was = s.len() + s.dead;
+        let mut was = s.len() + s.dead as usize;
         // Out of order, so the runs are broken up rather than eaten from one end.
         for i in (0..names.len()).rev().step_by(7) {
             s.remove(&names[i]).expect("was there");
-            let now = s.len() + s.dead;
+            let now = s.len() + s.dead as usize;
             assert!(
                 now <= was,
                 "{now} occupied against {was} before the removal"
@@ -1532,6 +1761,78 @@ mod tests {
         assert_eq!(size_of::<Row>() + size_of::<()>(), 8, "a set member");
         assert_eq!(size_of::<Row>() + size_of::<f64>(), 16, "a sorted set");
         assert_eq!(size_of::<Row>() + size_of::<u32>(), 12, "a hash field");
+    }
+
+    /// A tailed table for tests, since every one of them wants the same shape.
+    fn tailed() -> Elements<()> {
+        Elements::tailed(8, 64)
+    }
+
+    #[test]
+    fn a_tail_comes_back_whatever_length_it_is() {
+        let mut t = tailed();
+        let long = vec![b'z'; 4000];
+        for (name, tail) in [
+            (&b"empty"[..], &b""[..]),
+            (b"one", b"1"),
+            (b"short", b"a value"),
+            (b"at254", &vec![b'y'; 254][..]),
+            (b"at255", &vec![b'x'; 255][..]),
+            (b"long", &long[..]),
+        ] {
+            t.set_tailed(name, tail, ()).expect("room");
+        }
+        assert_eq!(t.tail(b"empty"), Some(&b""[..]));
+        assert_eq!(t.tail(b"one"), Some(&b"1"[..]));
+        assert_eq!(t.tail(b"short"), Some(&b"a value"[..]));
+        assert_eq!(t.tail_len(b"at254"), Some(254));
+        assert_eq!(t.tail_len(b"at255"), Some(255), "past the one byte length");
+        assert_eq!(t.tail(b"long"), Some(&long[..]));
+        assert_eq!(t.tail(b"absent"), None);
+        assert_eq!(t.len(), 6);
+    }
+
+    #[test]
+    fn rewriting_a_tail_leaves_every_other_row_alone() {
+        let mut t = tailed();
+        for i in 0..200 {
+            t.set_tailed(format!("f{i:04}").as_bytes(), b"v", ())
+                .expect("room");
+        }
+        // Longer, then shorter, then long enough to need the four byte length,
+        // because each of those moves the row's span somewhere different.
+        for tail in [&b"a much longer value than before"[..], b"x", &[b'q'; 900]] {
+            let (row, fresh) = t.set_tailed(b"f0100", tail, ()).expect("room");
+            assert!(!fresh, "the field was already there");
+            assert_eq!(t.tail(b"f0100"), Some(tail));
+            assert_eq!(t.pair_at(row).map(|(n, _)| n), Some(&b"f0100"[..]));
+        }
+        for i in 0..200 {
+            let name = format!("f{i:04}");
+            let want: &[u8] = if i == 100 { &[b'q'; 900] } else { b"v" };
+            assert_eq!(t.tail(name.as_bytes()), Some(want), "field {i}");
+        }
+    }
+
+    #[test]
+    fn a_compaction_keeps_names_and_tails_together() {
+        let mut t = tailed();
+        for i in 0..500 {
+            t.set_tailed(format!("f{i:04}").as_bytes(), b"a value here", ())
+                .expect("room");
+        }
+        for i in 0..400 {
+            t.remove(format!("f{i:04}").as_bytes()).expect("there");
+        }
+        // Enough dead bytes to have crossed the compaction line by now, and the
+        // rows that are left have to have moved with both halves of their span.
+        for i in 400..500 {
+            let name = format!("f{i:04}");
+            assert_eq!(t.tail(name.as_bytes()), Some(&b"a value here"[..]), "{i}");
+        }
+        let pairs: Vec<_> = t.pairs().map(|(n, v)| (n.to_vec(), v.to_vec())).collect();
+        assert_eq!(pairs.len(), 100);
+        assert!(pairs.iter().all(|(_, v)| v == b"a value here"));
     }
 
     #[test]

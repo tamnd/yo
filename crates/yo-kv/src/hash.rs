@@ -1,7 +1,8 @@
 //! A hash, in whichever of the two representations currently fits it.
 //!
 //! A hash is a listpack of alternating fields and values, or an element table
-//! with the values in a blob beside it. Which one is not a free choice: `OBJECT
+//! that keeps each value behind its field name. Which one is not a free choice:
+//! `OBJECT
 //! ENCODING` has to answer `listpack` or `hashtable` at exactly the sizes a real
 //! server answers them, so the rule here is `hash_max_listpack_entries` and
 //! `hash_max_listpack_value` read off `t_hash.c` in the 8.10.1 tarball.
@@ -9,8 +10,8 @@
 //! ```text
 //!   small, any bytes                    everything else
 //! +---------------------------+   +---------------------------------+
-//! | f | v | f | v | f | v ... |-->| element table + a value blob    |
-//! | ~2 B a side, walked        |   | one probe, no cap               |
+//! | f | v | f | v | f | v ... |-->| element table, value behind the |
+//! | ~2 B a side, walked        |   | name; one probe, no cap         |
 //! +---------------------------+   +---------------------------------+
 //!   to 512 fields, 64 B a side
 //! ```
@@ -28,22 +29,34 @@
 //! accident. `HSET h a b` followed by `HGET h b` finds nothing, which is right,
 //! and a search with a step of one would have found the `b` that is a value.
 //!
-//! In the table band a row's payload is an offset into a [`Blob`] the hash owns,
-//! and the value's length is written into the blob in front of the bytes rather
-//! than carried next to the offset. That is `05` section 4.2's element per row: a
-//! value is bytes in a shared stretch, not an allocation of its own, and
-//! rewriting one appends and abandons rather than moving everything after it. The
-//! abandoned bytes are counted and come back when they outnumber the live ones.
+//! In the table band the value goes into the element table's own blob directly
+//! behind the field name, with its length in front of the bytes. That is `05`
+//! section 4.2's element per row: a value is bytes in a shared stretch, not an
+//! allocation of its own, and rewriting one appends and abandons rather than
+//! moving everything after it. The abandoned bytes are counted and come back
+//! when they outnumber the live ones.
 //!
-//! Field names are interned by the element table, which is the point of the
-//! split. `HSET h field v1` and then `HSET h field v2` writes four bytes of
-//! offset and the new value, and touches the field's name not at all.
+//! Behind the name and not in a blob of its own, because a second blob needs a
+//! four byte offset beside every row saying where in it to look, and that offset
+//! was the largest single piece of overhead a field carried, bigger than the row
+//! and bigger than the slot. The row already says where the name starts and the
+//! name says how long it is, so the value that follows it needs nothing but its
+//! own length, which the separate blob was writing anyway.
 //!
-//! What a field costs, then, is eight bytes of row, four of offset, one of value
-//! length, about five of slot array, and the field name and the value themselves.
-//! Twelve of those eighteen are the two arrays and the only way past them is to
-//! stop interning field names, which would put the name back in front of every
-//! value and pay for it again on every rewrite.
+//! What it costs is that a rewrite copies the field name again, since the new
+//! value need not be the length of the old one. That is the one thing the split
+//! blobs did better, it measured at nineteen percent on a write to a field that
+//! was already there, and a write to a field that is new got twenty seven
+//! percent quicker for the same reason.
+//!
+//! Field names are still interned, so a hash holding a thousand copies of the
+//! same field name across a thousand rewrites holds one of them.
+//!
+//! What a field costs, then, is eight bytes of row, one of value length, about
+//! eight of slot array, and the field name and the value themselves. The two
+//! arrays are the rest and the only way past them is to stop interning field
+//! names, which would put the name back in front of every value and pay for it
+//! again on every rewrite.
 //!
 //! # Field TTL
 //!
@@ -103,7 +116,6 @@
 
 use yo_common::num::{self, parse_i64};
 
-use crate::blob::Blob;
 use crate::elem::Elements;
 use crate::listpack::{self, Listpack};
 use crate::scan::Cursor;
@@ -177,7 +189,7 @@ pub enum Encoding {
     /// step, and a hash arrives here by being given a field deadline rather than
     /// by growing.
     ListpackEx,
-    /// The element table, with the values in a blob beside it.
+    /// The element table, each value behind its field name.
     Hashtable,
 }
 
@@ -358,7 +370,9 @@ fn bytes_of<'a>(t: Text<'a>, digits: &'a mut [u8; num::DIGITS_MAX]) -> &'a [u8] 
     }
 }
 
-/// How many bytes of value blob a hash of `n` fields promoted from `p` wants.
+/// How many blob bytes a hash of `n` fields promoted from `p` wants.
+///
+/// The blob holds a field name and its value back to back, so this counts both.
 ///
 /// The old answer was sixteen a field whatever the values were, and at a
 /// thousand eight byte values that guess stayed visible in the measurement: the
@@ -367,26 +381,33 @@ fn bytes_of<'a>(t: Text<'a>, digits: &'a mut [u8; num::DIGITS_MAX]) -> &'a [u8] 
 /// overshoot at the start is still an overshoot four doublings later.
 ///
 /// There is no reason to guess here, because the listpack in hand has real
-/// values in it and the fields coming after them are almost always the same
-/// shape. The average includes the one byte of length `Blob::push_sized` writes
-/// in front of anything short, so it is the blob cost and not the value length.
-/// It costs one walk of at most `max_listpack_entries` entries on a promotion
-/// that is about to copy every one of them anyway.
-fn value_bytes_for(p: &Packed, n: usize) -> usize {
+/// fields and values in it and the ones coming after them are almost always the
+/// same shape. The average includes the length byte written in front of each
+/// value, so it is the blob cost and not the payload length. It costs one walk
+/// of at most `max_listpack_entries` entries on a promotion that is about to
+/// copy every one of them anyway.
+fn blob_bytes_for(p: &Packed, n: usize) -> usize {
     if p.len() == 0 {
         return 0;
     }
     let mut seen = 0usize;
+    let mut digits = [0u8; num::DIGITS_MAX];
     for i in 0..p.len() {
-        let Some(v) = p.lp.get(i * p.step() + 1) else {
+        let at = i * p.step();
+        let (Some(f), Some(v)) = (p.lp.get(at), p.lp.get(at + 1)) else {
             break;
         };
-        seen += match v {
-            Text::Str(s) => s.len(),
-            Text::Int(x) => num::i64_digits(&mut [0u8; num::DIGITS_MAX], x).len(),
-        } + 1;
+        seen += text_len(&mut digits, f) + text_len(&mut digits, v) + 1;
     }
     seen.saturating_mul(n) / p.len()
+}
+
+/// How many bytes one listpack entry is once it is written out as bytes.
+fn text_len(digits: &mut [u8; num::DIGITS_MAX], t: Text<'_>) -> usize {
+    match t {
+        Text::Str(s) => s.len(),
+        Text::Int(x) => num::i64_digits(digits, x).len(),
+    }
 }
 
 fn push_text(lp: &mut Listpack, t: Text<'_>) {
@@ -399,11 +420,17 @@ fn push_text(lp: &mut Listpack, t: Text<'_>) {
     }
 }
 
-/// The native band: interned field names, values in a blob of their own.
+/// The native band: interned field names, each with its value behind it.
+///
+/// The value used to live in a blob of its own with a four byte offset beside
+/// every row saying where in it to look. Behind the name instead, the offset is
+/// not needed, because the row already says where the name starts and the name
+/// says how long it is. That was the largest single piece of overhead a field
+/// carried, bigger than the row and bigger than the slot, and `Elements::tailed`
+/// is where the rest of the argument lives.
 #[derive(Debug, Clone)]
 struct Table {
-    fields: Elements<u32>,
-    values: Blob,
+    fields: Elements<()>,
     /// One slot per row once any field has a deadline, and nothing before then.
     ///
     /// It has to be told about every row this table gains or loses, in the same
@@ -423,42 +450,31 @@ impl Table {
     /// in the hash is charged for it.
     fn new(hint: usize, value_bytes: usize) -> Table {
         Table {
-            fields: Elements::with_capacity(hint),
-            values: Blob::with_capacity(value_bytes),
+            fields: Elements::tailed(hint, value_bytes),
             ttl: Deadlines::new(),
         }
     }
 
     #[inline]
     fn get(&self, field: &[u8]) -> Option<&[u8]> {
-        self.fields.get(field).map(|&at| self.values.sized(at))
+        self.fields.tail(field)
     }
 
     /// Store `value` against `field` and say whether the field is new.
     fn set(&mut self, field: &[u8], value: &[u8]) -> bool {
-        let at = self.values.push_sized(value);
-        if let Some(row) = self.fields.index_of(field) {
-            let slot = self.fields.at_mut(row).expect("the probe found it");
-            let old = std::mem::replace(slot, at);
-            self.values.release_sized(old);
-            // A write clears the deadline, the same as in the packed band.
-            self.ttl.clear(row);
-            self.settle();
-            return false;
-        }
-        match self.fields.insert(field, at) {
-            Ok(_) => {
+        match self.fields.set_tailed(field, value, ()) {
+            Ok((_, true)) => {
                 self.ttl.inserted();
                 true
             }
-            Err(_) => {
-                // A field name over NAME_MAX or a table at MAX_ROWS. The value
-                // bytes are already in the blob, so they are given back rather
-                // than left as a leak nothing accounts for.
-                self.values.release_sized(at);
-                self.settle();
+            Ok((row, false)) => {
+                // A write clears the deadline, the same as in the packed band.
+                self.ttl.clear(row);
                 false
             }
+            // A field name over NAME_MAX or a table at MAX_ROWS. Nothing was
+            // written, so there is nothing to give back.
+            Err(_) => false,
         }
     }
 
@@ -477,26 +493,10 @@ impl Table {
     /// The one place a row leaves this table, so that the swap remove and the
     /// deadline that has to follow it cannot drift apart in a later edit.
     fn remove_at(&mut self, row: usize) {
-        let at = self
-            .fields
+        self.fields
             .remove_at(row)
             .expect("the caller found the row");
-        self.values.release_sized(at);
         self.ttl.removed(row);
-        self.settle();
-    }
-
-    /// Give the dead value bytes back once there are more of them than live.
-    fn settle(&mut self) {
-        if !self.values.worth_compacting() {
-            return;
-        }
-        let fields = &mut self.fields;
-        self.values.compact(|keep| {
-            for at in fields.payloads_mut() {
-                keep.moved_sized(at);
-            }
-        });
     }
 }
 
@@ -539,8 +539,10 @@ impl Hash {
             Hash::new()
         } else {
             Hash {
-                // Sixteen bytes a value, because a caller who names a field
-                // count and nothing else has told us everything it knows.
+                // Sixteen bytes a field for the names and values together,
+                // because a caller who names a field count and nothing else has
+                // told us everything it knows. Undershooting costs a realloc and
+                // overshooting is charged to every field, so this leans low.
                 body: Body::Table(Table::new(hint, hint.saturating_mul(16))),
             }
         }
@@ -704,7 +706,7 @@ impl Hash {
     pub fn value_len(&self, field: &[u8]) -> Option<usize> {
         match &self.body {
             Body::Packed(_) => self.get(field).map(|v| v.byte_len()),
-            Body::Table(t) => t.fields.get(field).map(|&at| t.values.sized_len(at)),
+            Body::Table(t) => t.fields.tail_len(field),
         }
     }
 
@@ -723,8 +725,8 @@ impl Hash {
                 Some((field, value))
             }
             Body::Table(t) => {
-                let (name, at) = t.fields.at(index)?;
-                Some((Text::Str(name), Text::Str(t.values.sized(*at))))
+                let (name, value) = t.fields.pair_at(index)?;
+                Some((Text::Str(name), Text::Str(value)))
             }
         }
     }
@@ -761,12 +763,9 @@ impl Hash {
         F: FnMut(Text<'_>, Text<'_>),
     {
         match &self.body {
-            Body::Table(t) => {
-                let values = &t.values;
-                t.fields.scan(cursor, count, |name, at| {
-                    f(Text::Str(name), Text::Str(values.sized(*at)));
-                })
-            }
+            Body::Table(t) => t.fields.scan_pairs(cursor, count, |name, value| {
+                f(Text::Str(name), Text::Str(value));
+            }),
             Body::Packed(_) => {
                 for (field, value) in self.iter() {
                     f(field, value);
@@ -984,9 +983,7 @@ impl Hash {
     pub fn memory_bytes(&self) -> usize {
         match &self.body {
             Body::Packed(p) => p.lp.byte_len(),
-            Body::Table(t) => {
-                t.fields.memory_bytes() + t.values.memory_bytes() + t.ttl.memory_bytes()
-            }
+            Body::Table(t) => t.fields.memory_bytes() + t.ttl.memory_bytes(),
         }
     }
 
@@ -999,7 +996,7 @@ impl Hash {
     pub fn dead_value_bytes(&self) -> usize {
         match &self.body {
             Body::Packed(_) => 0,
-            Body::Table(t) => t.values.dead(),
+            Body::Table(t) => t.fields.dead_name_bytes(),
         }
     }
 
@@ -1009,7 +1006,7 @@ impl Hash {
             return;
         };
         let n = p.len() + extra;
-        let mut t = Table::new(n, value_bytes_for(p, n));
+        let mut t = Table::new(n, blob_bytes_for(p, n));
         for i in 0..p.len() {
             let at = i * p.step();
             let (Some(field), Some(value)) = (p.lp.get(at), p.lp.get(at + 1)) else {
@@ -1061,36 +1058,33 @@ mod tests {
     ///
     /// The `gate` row at the bottom is the shape spec `14` section 5 actually
     /// names, a million fields over a thousand hashes rather than a million in
-    /// one. It prints 21.93 of overhead, and it used to print 29.11: the value
-    /// blob opened at sixteen bytes a value whatever the values were, and a
-    /// blob doubles rather than shrinks, so that overshoot was still there four
-    /// doublings later and held 16.42 bytes a field to store nine. A promotion
-    /// has the real values in front of it, so it sizes the blob from them now.
+    /// one. It has come down twice. It printed 29.11 of overhead when the value
+    /// blob opened at sixteen bytes a value whatever the values were, because a
+    /// blob doubles rather than shrinks and that overshoot was still there four
+    /// doublings later, holding 16.42 bytes a field to store nine. Sizing a
+    /// promoted hash's blob from the values it can already see took it to 21.93.
     ///
-    /// At a million fields in one hash it prints 38.09 total against a payload
-    /// of 16, so 22.09 of overhead, and the columns say where it is. Slots 8.39,
-    /// rows 12.26, names 8.20, values 9.24. Two of those four are nearly all
-    /// payload: names is the eight byte field name plus 0.20 of blob slack and
-    /// values is the eight byte value plus 1.24. The overhead is the other two
-    /// plus that slack, and it breaks down as a four byte slot at 2.1 slots a
-    /// field, an eight byte row, and the four byte offset into the value
-    /// blob that the table carries beside its rows.
+    /// The columns are where the rest went. At 21.93 they read slots 8.19, rows
+    /// 12.31, names 8.19 and values 9.23, and two of those four are nearly all
+    /// payload: names is the eight byte field name plus blob slack and values is
+    /// the eight byte value plus a length byte and slack. The overhead was a
+    /// four byte slot at 2.1 slots a field, an eight byte row, and a four byte
+    /// offset into the value blob beside every row.
     ///
-    /// Slots is 8.39 rather than 5.33 only because the slot array rounds up to a
-    /// power of two, and a million fields wants 1.33 million slots and gets
-    /// 2.09 million, so the table sits at 0.48 load. Sizing it exactly would
-    /// save 3.06 bytes a field, and #178's control run already priced that at
+    /// Slots is 8.19 rather than 5.33 only because the slot array rounds up to a
+    /// power of two, and a thousand fields wants 1334 slots and gets 2048, so
+    /// the table sits at under half load. Sizing it exactly would save about
+    /// three bytes a field, and #178's control run already priced that at
     /// roughly nothing on a hit and eighteen to twenty percent on a miss.
     ///
-    /// That is worth knowing because it says the gate cannot be reached by
-    /// tuning. Even with the slot array sized exactly and no blob slack at all
-    /// the three arrays come to 5.33 plus 8 plus 4, which is 17.33, and the bar
-    /// is 16. One of the three has to go rather than shrink. The one that looks
-    /// removable is the value offset: a field's name and its value could sit
-    /// back to back in one blob, and then the row's `at` finds both and the
-    /// four byte column disappears. What that costs is a length for the value,
-    /// which is a byte in the blob for anything under 128 rather than four
-    /// beside every row.
+    /// That said the gate could not be reached by tuning. Even with the slot
+    /// array sized exactly and no blob slack at all the three arrays came to
+    /// 5.33 plus 8 plus 4, which is 17.33, and the bar is 16. One of the three
+    /// had to go rather than shrink, and the one that went is the value offset:
+    /// a field's name and its value sit back to back in one blob now, so the
+    /// row's `at` finds both and the four byte column is gone. What it costs is
+    /// a length byte for the value in the blob, which the separate blob was
+    /// writing anyway, so it is four bytes a field back.
     #[test]
     #[ignore = "a measurement, run it by name"]
     fn measure_bytes_per_field() {
@@ -1108,13 +1102,12 @@ mod tests {
             let per = |b: usize| b as f64 / n as f64;
             match &h.body {
                 Body::Table(t) => println!(
-                    "table    n={n:<9} total={total:<10} payload={payload:<9} per_field={:.2} over_per_field={:.2} slots={:.2} rows={:.2} names={:.2} values={:.2}",
+                    "table    n={n:<9} total={total:<10} payload={payload:<9} per_field={:.2} over_per_field={:.2} slots={:.2} rows={:.2} blob={:.2}",
                     per(total),
                     per(total - payload),
                     per(t.fields.slot_bytes()),
                     per(t.fields.row_bytes()),
                     per(t.fields.name_bytes()),
-                    per(t.values.memory_bytes()),
                 ),
                 Body::Packed(_) => println!(
                     "listpack n={n:<9} total={total:<10} payload={payload:<9} per_field={:.2} over_per_field={:.2}",
@@ -1154,22 +1147,90 @@ mod tests {
         };
         let total: usize = all.iter().map(Hash::memory_bytes).sum();
         println!(
-            "gate     n={n:<9} total={total:<10} payload={payload:<9} per_field={:.2} over_per_field={:.2} slots={:.2} rows={:.2} names={:.2} values={:.2}",
+            "gate     n={n:<9} total={total:<10} payload={payload:<9} per_field={:.2} over_per_field={:.2} slots={:.2} rows={:.2} blob={:.2}",
             per(total),
             per(total - payload),
             per(sum(|t| t.fields.slot_bytes())),
             per(sum(|t| t.fields.row_bytes())),
             per(sum(|t| t.fields.name_bytes())),
-            per(sum(|t| t.values.memory_bytes())),
         );
     }
 
-    /// The value blob of a promoted hash is sized from the values, not a guess.
+    /// What a field read and a field write cost, in nanoseconds.
     ///
-    /// A thousand eight byte values are nine thousand bytes of blob, and the
-    /// blob used to open at sixteen a value and double from there to sixteen
-    /// thousand. A quarter of slack is the most a doubling blob can be carrying
-    /// when it opened at the right size.
+    /// Run it with `cargo test -p yo-kv --release measure_field_access --
+    /// --ignored --nocapture`. The memory measurement next to it is the one that
+    /// matters for the gate, and this is here so that a change made for memory
+    /// has to say what it did to the time as well.
+    ///
+    /// Four cases, because the value living behind the name rather than in a
+    /// blob of its own moves them in different directions. What it did, on a
+    /// hundred thousand field hash, against the same test run with a separate
+    /// value blob:
+    ///
+    /// ```text
+    ///              blob      behind     change
+    ///   get hit    10.2 ns   10.1 ns    flat
+    ///   get miss   13.2 ns   13.0 ns    flat
+    ///   set old    20.2 ns   24.1 ns    +19%
+    ///   set new    27.3 ns   20.0 ns    -27%
+    /// ```
+    ///
+    /// The reads were expected to get quicker, since they follow one chain
+    /// instead of two, and they did not: the value blob was being read straight
+    /// after the name blob and the prefetcher was already covering it.
+    ///
+    /// The writes are the real trade and they go both ways. A write to a field
+    /// that is already there copies the name again, because the new value need
+    /// not be the length of the old one, and that is the 19 percent. A write to
+    /// a field that is not there pushes one span instead of two and touches one
+    /// array fewer, and that is the 27. A fill is all new fields and a counter
+    /// being bumped is all old ones, so which way this lands depends on the
+    /// workload, and the memory it buys does not.
+    #[test]
+    #[ignore = "a measurement, run it by name"]
+    fn measure_field_access() {
+        use std::time::Instant;
+        let limits = Limits::DEFAULT;
+        let n = 100_000usize;
+        let fields: Vec<String> = (0..n).map(|i| format!("f{i:07}")).collect();
+        let mut h = Hash::with_hint(n, &limits);
+        for f in &fields {
+            h.set(f.as_bytes(), b"v0000000", &limits);
+        }
+        let time = |label: &str, reps: usize, f: &mut dyn FnMut(usize)| {
+            let start = Instant::now();
+            for i in 0..reps {
+                f(i);
+            }
+            let ns = start.elapsed().as_nanos() as f64 / reps as f64;
+            println!("{label:<12} {ns:.2} ns");
+        };
+        let mut sink = 0usize;
+        time("get hit", n, &mut |i| {
+            sink += h.get(fields[i % n].as_bytes()).map_or(0, |v| v.byte_len());
+        });
+        let absent: Vec<String> = (0..n).map(|i| format!("g{i:07}")).collect();
+        time("get miss", n, &mut |i| {
+            sink += usize::from(h.get(absent[i].as_bytes()).is_none());
+        });
+        assert!(sink > 0, "the reads are not optimised away");
+        let mut w = h.clone();
+        time("set old", n, &mut |i| {
+            w.set(fields[i % n].as_bytes(), b"v1111111", &limits);
+        });
+        let mut fresh = Hash::with_hint(n, &limits);
+        time("set new", n, &mut |i| {
+            fresh.set(fields[i].as_bytes(), b"v0000000", &limits);
+        });
+    }
+
+    /// The blob of a promoted hash is sized from the values, not a guess.
+    ///
+    /// A thousand eight byte names and values are seventeen thousand bytes of
+    /// blob, and the blob used to open at sixteen a value and double from there.
+    /// A quarter of slack is the most a doubling blob can be carrying when it
+    /// opened at the right size.
     #[test]
     fn a_promoted_hash_does_not_size_its_values_by_guesswork() {
         let mut h = Hash::new();
@@ -1183,11 +1244,11 @@ mod tests {
         let Body::Table(t) = &h.body else {
             panic!("a thousand fields is the table band");
         };
-        let held = 1000 * 9;
+        let held = 1000 * 17;
         assert!(
-            t.values.memory_bytes() < held + held / 4,
-            "the value blob is {} bytes to hold {held}",
-            t.values.memory_bytes()
+            t.fields.name_bytes() < held + held / 4,
+            "the blob is {} bytes to hold {held}",
+            t.fields.name_bytes()
         );
     }
 
