@@ -358,6 +358,37 @@ fn bytes_of<'a>(t: Text<'a>, digits: &'a mut [u8; num::DIGITS_MAX]) -> &'a [u8] 
     }
 }
 
+/// How many bytes of value blob a hash of `n` fields promoted from `p` wants.
+///
+/// The old answer was sixteen a field whatever the values were, and at a
+/// thousand eight byte values that guess stayed visible in the measurement: the
+/// blob opened at nearly twice what it needed and doubled from there, so it held
+/// 16.42 bytes a field to store nine. A blob never shrinks on its own, so an
+/// overshoot at the start is still an overshoot four doublings later.
+///
+/// There is no reason to guess here, because the listpack in hand has real
+/// values in it and the fields coming after them are almost always the same
+/// shape. The average includes the one byte of length `Blob::push_sized` writes
+/// in front of anything short, so it is the blob cost and not the value length.
+/// It costs one walk of at most `max_listpack_entries` entries on a promotion
+/// that is about to copy every one of them anyway.
+fn value_bytes_for(p: &Packed, n: usize) -> usize {
+    if p.len() == 0 {
+        return 0;
+    }
+    let mut seen = 0usize;
+    for i in 0..p.len() {
+        let Some(v) = p.lp.get(i * p.step() + 1) else {
+            break;
+        };
+        seen += match v {
+            Text::Str(s) => s.len(),
+            Text::Int(x) => num::i64_digits(&mut [0u8; num::DIGITS_MAX], x).len(),
+        } + 1;
+    }
+    seen.saturating_mul(n) / p.len()
+}
+
 fn push_text(lp: &mut Listpack, t: Text<'_>) {
     match t {
         Text::Str(s) => lp.push(s),
@@ -383,12 +414,17 @@ struct Table {
 }
 
 impl Table {
-    fn new(hint: usize) -> Table {
+    /// A table with room for `hint` fields and `value_bytes` of values.
+    ///
+    /// Both are hints and being wrong about either costs a realloc, which is
+    /// what a hint is allowed to cost. The value one is worth passing properly
+    /// where the caller knows it, because a blob doubles, so an overshoot at
+    /// the start is still an overshoot several doublings later and every field
+    /// in the hash is charged for it.
+    fn new(hint: usize, value_bytes: usize) -> Table {
         Table {
             fields: Elements::with_capacity(hint),
-            // Sixteen bytes a value is a guess and being wrong about it costs a
-            // realloc, which is what a guess is allowed to cost.
-            values: Blob::with_capacity(hint.saturating_mul(16)),
+            values: Blob::with_capacity(value_bytes),
             ttl: Deadlines::new(),
         }
     }
@@ -503,7 +539,9 @@ impl Hash {
             Hash::new()
         } else {
             Hash {
-                body: Body::Table(Table::new(hint)),
+                // Sixteen bytes a value, because a caller who names a field
+                // count and nothing else has told us everything it knows.
+                body: Body::Table(Table::new(hint, hint.saturating_mul(16))),
             }
         }
     }
@@ -970,7 +1008,8 @@ impl Hash {
         let Body::Packed(p) = &self.body else {
             return;
         };
-        let mut t = Table::new(p.len() + extra);
+        let n = p.len() + extra;
+        let mut t = Table::new(n, value_bytes_for(p, n));
         for i in 0..p.len() {
             let at = i * p.step();
             let (Some(field), Some(value)) = (p.lp.get(at), p.lp.get(at + 1)) else {
@@ -1020,8 +1059,16 @@ mod tests {
     /// stores and nothing else, which nothing can reach, so the number to read
     /// is the overhead column and the gate is really thirty two total.
     ///
-    /// At a million fields it prints 38.09 total against a payload of 16, so
-    /// 22.09 of overhead, and the columns say where all of it is. Slots 8.39,
+    /// The `gate` row at the bottom is the shape spec `14` section 5 actually
+    /// names, a million fields over a thousand hashes rather than a million in
+    /// one. It prints 21.93 of overhead, and it used to print 29.11: the value
+    /// blob opened at sixteen bytes a value whatever the values were, and a
+    /// blob doubles rather than shrinks, so that overshoot was still there four
+    /// doublings later and held 16.42 bytes a field to store nine. A promotion
+    /// has the real values in front of it, so it sizes the blob from them now.
+    ///
+    /// At a million fields in one hash it prints 38.09 total against a payload
+    /// of 16, so 22.09 of overhead, and the columns say where it is. Slots 8.39,
     /// rows 12.26, names 8.20, values 9.24. Two of those four are nearly all
     /// payload: names is the eight byte field name plus 0.20 of blob slack and
     /// values is the eight byte value plus 1.24. The overhead is the other two
@@ -1076,6 +1123,72 @@ mod tests {
                 ),
             }
         }
+        // The shape the gate actually names, which is a million fields spread
+        // over a thousand hashes rather than a million in one. It matters
+        // because every fixed cost in a table is charged a thousand times here,
+        // and because a thousand field table rounds its slot array up
+        // differently from a million field one.
+        let hashes = 1_000;
+        let each = 1_000;
+        let mut all = Vec::with_capacity(hashes);
+        let mut payload = 0usize;
+        for h in 0..hashes {
+            let mut one = Hash::new();
+            for i in 0..each {
+                let f = format!("f{i:07}");
+                let v = format!("v{h:03}{i:04}");
+                payload += f.len() + v.len();
+                one.set(f.as_bytes(), v.as_bytes(), &limits);
+            }
+            all.push(one);
+        }
+        let n = hashes * each;
+        let per = |b: usize| b as f64 / n as f64;
+        let sum = |f: fn(&Table) -> usize| -> usize {
+            all.iter()
+                .map(|h| match &h.body {
+                    Body::Table(t) => f(t),
+                    Body::Packed(_) => 0,
+                })
+                .sum()
+        };
+        let total: usize = all.iter().map(Hash::memory_bytes).sum();
+        println!(
+            "gate     n={n:<9} total={total:<10} payload={payload:<9} per_field={:.2} over_per_field={:.2} slots={:.2} rows={:.2} names={:.2} values={:.2}",
+            per(total),
+            per(total - payload),
+            per(sum(|t| t.fields.slot_bytes())),
+            per(sum(|t| t.fields.row_bytes())),
+            per(sum(|t| t.fields.name_bytes())),
+            per(sum(|t| t.values.memory_bytes())),
+        );
+    }
+
+    /// The value blob of a promoted hash is sized from the values, not a guess.
+    ///
+    /// A thousand eight byte values are nine thousand bytes of blob, and the
+    /// blob used to open at sixteen a value and double from there to sixteen
+    /// thousand. A quarter of slack is the most a doubling blob can be carrying
+    /// when it opened at the right size.
+    #[test]
+    fn a_promoted_hash_does_not_size_its_values_by_guesswork() {
+        let mut h = Hash::new();
+        for i in 0..1000 {
+            h.set(
+                format!("f{i:07}").as_bytes(),
+                format!("v{i:07}").as_bytes(),
+                &Limits::DEFAULT,
+            );
+        }
+        let Body::Table(t) = &h.body else {
+            panic!("a thousand fields is the table band");
+        };
+        let held = 1000 * 9;
+        assert!(
+            t.values.memory_bytes() < held + held / 4,
+            "the value blob is {} bytes to hold {held}",
+            t.values.memory_bytes()
+        );
     }
 
     /// A hash that never leaves the listpack band.
