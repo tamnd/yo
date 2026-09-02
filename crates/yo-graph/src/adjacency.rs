@@ -320,6 +320,31 @@ impl Adjacency {
         }
     }
 
+    /// Every non empty run under `label` in `dir`, as the node and its two
+    /// slices, in whatever order the table happens to hold them.
+    ///
+    /// This is the read side of promotion. The cold form is built by walking
+    /// the hot plane once and handing every run to an encoder, and there is no
+    /// other way to get at a run whose node you have not already been told
+    /// about, because the table is keyed by the node rather than ordered by it.
+    /// The order is deliberately not promised: a caller that needs the runs in
+    /// node order is building something sorted anyway and can sort what it
+    /// collects.
+    pub fn for_each_run(&self, label: u32, dir: Dir, mut f: impl FnMut(u64, &[u64], &[u32])) {
+        let want = incoming(dir);
+        for s in &self.slots {
+            if s.flags & LIVE == 0 || s.len == 0 || s.label != label || s.flags & INCOMING != want {
+                continue;
+            }
+            let (at, len) = (s.at as usize, s.len as usize);
+            f(
+                s.node,
+                &self.neighbour[at..at + len],
+                &self.edge[at..at + len],
+            );
+        }
+    }
+
     /// Ask the cache for the slot a run's header will be found in.
     ///
     /// A multi hop walk knows its whole next frontier before it reads any of

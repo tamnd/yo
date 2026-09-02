@@ -24,5 +24,9 @@ criterion = { workspace = true }
 name = "adjacency"
 harness = false
 
+[[bench]]
+name = "cold"
+harness = false
+
 [lints]
 workspace = true

@@ -40,9 +40,26 @@
 //!
 //! Twelve bytes an edge is the payload, and the run headers and the capacity
 //! slack take a graph shaped like LiveJournal to around 15 once it has settled.
-//! That is the price of a structure where every operation is O(1). The cold
-//! form, zu's node group CSR, is where 8 bits an edge comes from, and it is the
-//! next thing here.
+//! That is the price of a structure where every operation is O(1).
+//!
+//! [`Csr`], the cold form, which is the same adjacency once nothing is changing
+//! it: node grouped, gap coded and bit packed, read only, and about an order of
+//! magnitude smaller. On an R-MAT graph it is 12.63 bits an edge as the ids
+//! come, and 9.89 after [`csr::order_by_degree`] gives the hubs the small ids.
+//! On a uniformly random graph it is 15.98 against a floor of 13.44, and the
+//! ordering pass moves that by nothing, which is what says the difference
+//! between the two graphs is the graph rather than the encoder.
+//!
+//! ```
+//! use yo_graph::{Csr, csr};
+//!
+//! let mut edges = vec![(0u32, 3u32), (0, 1), (2, 0), (0, 9)];
+//! let to = csr::order_by_degree(10, &edges);
+//! csr::renumber(&mut edges, &to);
+//!
+//! let cold = Csr::build(10, &mut edges);
+//! assert_eq!(cold.degree(to[0]), 3);
+//! ```
 //!
 //! The node table, the edge records, the typed `Graph<N, E>` surface, the ten
 //! command `G.*` family and the algorithms are the rest of M7.
@@ -50,5 +67,7 @@
 #![deny(missing_docs)]
 
 pub mod adjacency;
+pub mod csr;
 
 pub use adjacency::{Adjacency, Dir};
+pub use csr::Csr;
