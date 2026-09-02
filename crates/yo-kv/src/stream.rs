@@ -113,7 +113,7 @@ use crate::listpack::{self, Entry, Listpack};
 
 pub mod groups;
 
-pub use groups::{Consumer, Filter, Group, Nack};
+pub use groups::{Consumer, Filter, Group, Nack, Retry};
 
 /// How many bytes a node holds before the next entry starts a new one.
 ///
@@ -318,6 +318,52 @@ impl Default for Limits {
         Limits {
             max_node_bytes: NODE_BYTES,
             max_node_entries: NODE_ENTRIES,
+        }
+    }
+}
+
+/// What a delete does about the consumer groups still pointing at the entry.
+///
+/// `XDEL` takes an entry out from under whoever was handed it and leaves the
+/// pending list holding an ID that can never be read, which is a state `XCLAIM`
+/// then has to clean up. The 8.2 commands let a caller say what it wants
+/// instead, and the three answers are the three words here.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Refs {
+    /// `KEEPREF`: take the entry and leave every pending list alone, which is
+    /// what `XDEL` has always done and is still the default.
+    #[default]
+    Keep,
+    /// `DELREF`: take the entry and take it out of every pending list with it.
+    Drop,
+    /// `ACKED`: only take the entry when no group could still be handed it.
+    Acked,
+}
+
+/// What one ID a delete was asked about came to.
+///
+/// The numbers are Redis's and they are not a success flag: a caller sending a
+/// list of IDs gets one of these each and has to be able to tell an entry that
+/// was never there from one that is still there on purpose.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Fate {
+    /// There was nothing here to do.
+    Missing,
+    /// It went.
+    Gone,
+    /// Somebody could still be handed it, so it stayed.
+    Held,
+}
+
+impl Fate {
+    /// The integer this is on the wire.
+    #[must_use]
+    #[inline]
+    pub fn code(self) -> i64 {
+        match self {
+            Fate::Missing => -1,
+            Fate::Gone => 1,
+            Fate::Held => 2,
         }
     }
 }
@@ -648,6 +694,83 @@ impl Stream {
         }
         self.max_deleted = self.max_deleted.max(id);
         true
+    }
+
+    /// Delete an entry, saying what to do about the groups, which is `XDELEX`.
+    ///
+    /// [`Refs::Acked`] is the interesting one and it asks a wider question than
+    /// its name does. An entry is safe to take when no group is holding it in a
+    /// pending list and no group's bookmark is still behind it, because a group
+    /// that has not reached the entry yet has not had its chance at it. So a
+    /// stream with one group sitting at `0-0` refuses every `ACKED` delete, and
+    /// that is a real server's answer and not an over careful reading of it.
+    pub fn delete_ref(&mut self, id: Id, refs: Refs) -> Fate {
+        if refs == Refs::Acked && self.still_wanted(id) {
+            return Fate::Held;
+        }
+        if !self.delete(id) {
+            return Fate::Missing;
+        }
+        if refs == Refs::Drop {
+            self.drop_refs(id);
+        }
+        Fate::Gone
+    }
+
+    /// Acknowledge an entry for one group and then delete it, which is `XACKDEL`.
+    ///
+    /// The acknowledgement is the part that decides the answer. An ID this group
+    /// was not holding is [`Fate::Missing`] whether or not the entry is in the
+    /// stream, and an ID it was holding is never `Missing`, so a caller reading
+    /// the reply is being told about its own pending list and not about the log.
+    pub fn ack_delete(&mut self, group: &[u8], id: Id, refs: Refs) -> Fate {
+        let Some(g) = self.group_mut(group) else {
+            return Fate::Missing;
+        };
+        if !g.ack(id) {
+            return Fate::Missing;
+        }
+        if refs == Refs::Acked && self.still_wanted(id) {
+            return Fate::Held;
+        }
+        self.delete(id);
+        if refs == Refs::Drop {
+            self.drop_refs(id);
+        }
+        Fate::Gone
+    }
+
+    /// Hand an entry back to a group without acknowledging it, which is `XNACK`.
+    ///
+    /// `force` makes a pending entry out of one that was not pending, and like
+    /// [`Stream::claim`]'s `FORCE` it only works on an entry that is really in
+    /// the stream. Answers whether anything happened, and `None` when there is
+    /// no such group.
+    pub fn nack(&mut self, group: &[u8], id: Id, retry: Retry, force: bool) -> Option<bool> {
+        let here = self.contains(id);
+        let g = self.group_mut(group)?;
+        if g.release(id, retry) {
+            return Some(true);
+        }
+        if force && here {
+            g.force_release(id, retry);
+            return Some(true);
+        }
+        Some(false)
+    }
+
+    /// Whether any group could still be handed `id`, which is what `ACKED` asks.
+    fn still_wanted(&self, id: Id) -> bool {
+        self.groups
+            .iter()
+            .any(|(_, g)| g.nack(id).is_some() || id > g.last_id())
+    }
+
+    /// Take an ID out of every group's pending list, which is what `DELREF` does.
+    fn drop_refs(&mut self, id: Id) {
+        for (_, g) in &mut self.groups {
+            g.forget(id);
+        }
     }
 
     /// The same without recording it.

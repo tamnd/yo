@@ -39,7 +39,7 @@
 
 use yo_common::num::{DIGITS_MAX, u64_digits};
 use yo_common::{Code, Error, Result, num};
-use yo_kv::stream::{Consumer, Fields, Filter, Group, Id, Stream};
+use yo_kv::stream::{Consumer, Fate, Fields, Filter, Group, Id, Refs, Retry, Stream};
 use yo_kv::streams::{self as kv, Add, Claim, Read, Start, Trim};
 use yo_kv::{Entry, Keyspace};
 
@@ -93,6 +93,18 @@ const DOLLAR_MEANINGLESS: &str = "The $ ID is meaningless in the context of XREA
 const PLUS_MEANINGLESS: &str = "The + ID is meaningless in the context of XREADGROUP: you want to read the history of this consumer by specifying a proper ID, or use the + ID to get new messages. The + ID would just return an empty result set.";
 /// What `XREADGROUP` says when the `GROUP` it needs is not there.
 const MISSING_GROUP: &str = "Missing GROUP option for XREADGROUP";
+/// What `XDELEX` and `XACKDEL` say about a `numids` that is not a count.
+const IDS_NOT_POSITIVE: &str = "Number of IDs must be a positive integer";
+/// And about one that does not match how many IDs came after it.
+const IDS_MISMATCH: &str = "The `numids` parameter must match the number of arguments";
+/// `XNACK` asks both of those questions in its own words, which are not those.
+const NACK_IDS_NOT_POSITIVE: &str = "numids must be a positive integer";
+const NACK_IDS_MISMATCH: &str = "number of IDs doesn't match numids";
+/// And it reads the word in front of `IDS` as a position rather than an option,
+/// so a wrong one gets this rather than a syntax error.
+const NACK_MODE: &str = "mode must be SILENT, FAIL, or FATAL";
+/// What it says about a `RETRYCOUNT` below zero.
+const NACK_RETRY_NEGATIVE: &str = "Invalid RETRYCOUNT value, must be >= 0";
 /// And what `XREAD` says about the two options that are not its.
 const GROUP_IS_NOT_XREAD: &str =
     "The GROUP option is only supported by XREADGROUP. You called XREAD instead.";
@@ -133,6 +145,9 @@ pub(super) fn execute(
             let key = args.get(1);
             out.uint(db.xdel(key, ids(args, 2)?)?);
         }
+        "xdelex" => delex(db, args, out)?,
+        "xackdel" => ackdel(db, args, out)?,
+        "xnack" => nack(db, args, out)?,
         "xtrim" => xtrim(db, args, out)?,
         "xrange" => range(db, args, false, out)?,
         "xrevrange" => range(db, args, true, out)?,
@@ -439,8 +454,19 @@ fn pending(db: &mut Keyspace, args: Args<'_>, now: u64, out: &mut Out) -> Result
     let seen = db.xpending_into(key, name, want, now, |id, nack, c| {
         out.array(4);
         id_out(out, id);
-        out.bulk(c.name());
-        out.uint(nack.idle(now));
+        // An entry `XNACK` released has no owner and no idle time. Redis writes
+        // an empty name and a minus one for it rather than leaving it out, so a
+        // sweeper can see there is work here that nobody has picked up.
+        match c {
+            Some(c) => {
+                out.bulk(c.name());
+                out.uint(nack.idle(now));
+            }
+            None => {
+                out.bulk(b"");
+                out.int(-1);
+            }
+        }
         out.uint(nack.count());
         true
     })?;
@@ -498,6 +524,184 @@ fn summary(db: &mut Keyspace, key: &[u8], name: &[u8], out: &mut Out) -> Result<
     Ok(())
 }
 
+// ------------------------------------------------- the pending list, in 8.x
+
+/// `XDELEX key [KEEPREF|DELREF|ACKED] IDS numids id [id ...]`.
+///
+/// `XDEL` with a say in what happens to the consumer groups that were handed the
+/// entry, and one integer back per ID instead of a count, because a caller that
+/// asked for `ACKED` needs to know which of its IDs stayed.
+fn delex(db: &mut Keyspace, args: Args<'_>, out: &mut Out) -> Result<()> {
+    let key = args.get(1);
+    // The key is looked up before any of the syntax is read, which is visible
+    // from a client: `XDELEX somestring BOGUS IDS 1 1-1` is a wrong type and not
+    // a syntax error, and so is the same command with a `numids` of zero.
+    let here = db.stream(key)?.is_some();
+    let (refs, at) = refs_and_ids(args, 2)?;
+    let n = args.len() - at;
+    // A key that is not there answers before the IDs are read, so
+    // `XDELEX missing IDS 2 bad bad` is two minus ones and not a complaint about
+    // the IDs. Redis only parses them once it has something to look them up in.
+    if !here {
+        missing(out, n);
+        return Ok(());
+    }
+    let ids = ids_in(args, at, args.len())?;
+    out.array(n);
+    db.xdelex(key, refs, ids, |fate| out.int(fate.code()))
+}
+
+/// `XACKDEL key group [KEEPREF|DELREF|ACKED] IDS numids id [id ...]`.
+///
+/// The same reply, about a different question. Here minus one means the group
+/// was not holding the ID rather than that the stream does not have it, so an
+/// entry that is sitting in the stream unread answers minus one and stays.
+fn ackdel(db: &mut Keyspace, args: Args<'_>, out: &mut Out) -> Result<()> {
+    let (key, name) = (args.get(1), args.get(2));
+    let here = db.stream(key)?.is_some();
+    let (refs, at) = refs_and_ids(args, 3)?;
+    let n = args.len() - at;
+    if !here {
+        missing(out, n);
+        return Ok(());
+    }
+    let ids = ids_in(args, at, args.len())?;
+    out.array(n);
+    db.xackdel(key, name, refs, ids, |fate| out.int(fate.code()))
+}
+
+/// `XNACK key group <SILENT|FAIL|FATAL> IDS numids id [id ...] [RETRYCOUNT n] [FORCE]`.
+///
+/// The other half of `XACK`: a consumer saying it could not do the work, so the
+/// entry goes back to the group rather than out of it. It comes back with no
+/// owner and reading as idle for longer than any `min-idle-time` a claim can
+/// name, which is what puts it at the front of the next `XAUTOCLAIM`.
+///
+/// The bookmark does not move, so a `>` read will not hand it out again. That is
+/// the whole design: a released entry is offered to a claim and not to the
+/// group's next reader, which is the only way it cannot be delivered twice over.
+fn nack(db: &mut Keyspace, args: Args<'_>, out: &mut Out) -> Result<()> {
+    let (key, name) = (args.get(1), args.get(2));
+    // Before the mode word, which is visible: `XNACK k nosuchgroup BOGUS ...` is
+    // told about the group and not about the mode.
+    if !db.stream(key)?.is_some_and(|s| s.group(name).is_some()) {
+        nogroup(out, &kv::no_key_or_group(key, name));
+        return Ok(());
+    }
+    // The three words differ in one thing only, the delivery count, and `SILENT`
+    // takes one off it rather than putting it back to zero. That is only visible
+    // on an entry that has been handed out more than once, so it is easy to
+    // measure the wrong rule off a message that has only been delivered once.
+    let mode = match args.get(3) {
+        w if args::is(w, b"silent") => Retry::Down,
+        w if args::is(w, b"fail") => Retry::Keep,
+        w if args::is(w, b"fatal") => Retry::Max,
+        _ => return Err(bad(NACK_MODE)),
+    };
+    if !args::is(args.get(4), b"ids") {
+        return Err(args::syntax());
+    }
+    let want = count(args, 5, NACK_IDS_NOT_POSITIVE)?;
+    let (at, left) = (6, args.len().saturating_sub(6));
+    if left < want {
+        return Err(bad(NACK_IDS_MISMATCH));
+    }
+    let end = at + want;
+    let ids = ids_in(args, at, end)?;
+
+    // Everything past the IDs is an option, which is why one ID too many is
+    // reported as an option nobody recognises rather than as a count that does
+    // not add up. `XDELEX` refuses the same shape as a syntax error.
+    let mut retry = None;
+    let mut force = false;
+    let mut i = end;
+    while i < args.len() {
+        let opt = args.get(i);
+        let more = args.len() - i - 1;
+        if args::is(opt, b"force") {
+            force = true;
+            i += 1;
+        } else if args::is(opt, b"retrycount") && more > 0 {
+            retry = Some(Retry::At(non_negative(
+                args.int(i + 1)?,
+                NACK_RETRY_NEGATIVE,
+            )?));
+            i += 2;
+        } else {
+            return Err(unrecognised("XNACK", opt));
+        }
+    }
+    // `RETRYCOUNT` wins over the word, so `FATAL ... RETRYCOUNT 3` leaves the
+    // count at three and not at the ceiling `FATAL` on its own would set.
+    let done = db.xnack(key, name, retry.unwrap_or(mode), force, ids)?;
+    out.uint(done.expect("the group was there a moment ago"));
+    Ok(())
+}
+
+/// The `[KEEPREF|DELREF|ACKED] IDS numids id [id ...]` tail two of the three
+/// share, read from `at`. Answers what the word said and where the IDs start.
+///
+/// The condition is one word and not a set of flags, so `KEEPREF DELREF` is a
+/// syntax error rather than the second one winning. `XNACK`'s `FORCE` is a flag
+/// and repeating that is fine, which is a difference between two commands that
+/// went in at the same time and is worth copying rather than smoothing over.
+fn refs_and_ids(args: Args<'_>, at: usize) -> Result<(Refs, usize)> {
+    let word = args.get(at);
+    let (refs, at) = if args::is(word, b"keepref") {
+        (Refs::Keep, at + 1)
+    } else if args::is(word, b"delref") {
+        (Refs::Drop, at + 1)
+    } else if args::is(word, b"acked") {
+        (Refs::Acked, at + 1)
+    } else {
+        (Refs::Keep, at)
+    };
+    if !args::is(args.get(at), b"ids") {
+        return Err(args::syntax());
+    }
+    let want = count(args, at + 1, IDS_NOT_POSITIVE)?;
+    let start = at + 2;
+    let left = args.len().saturating_sub(start);
+    if left < want {
+        return Err(bad(IDS_MISMATCH));
+    }
+    if left > want {
+        return Err(args::syntax());
+    }
+    Ok((refs, start))
+}
+
+/// A `numids`, which has to be a number above zero and carries its own sentence.
+fn count(args: Args<'_>, at: usize, msg: &'static str) -> Result<usize> {
+    match num::parse_i64(args.get(at)) {
+        Some(n) if n > 0 => Ok(usize::try_from(n).unwrap_or(usize::MAX)),
+        _ => Err(bad(msg)),
+    }
+}
+
+/// An array of `n` minus ones, which is what the two delete commands answer for
+/// a key that is not there.
+fn missing(out: &mut Out, n: usize) {
+    out.array(n);
+    for _ in 0..n {
+        out.int(Fate::Missing.code());
+    }
+}
+
+/// `ERR Unrecognized <COMMAND> option '<opt>'`, which two of these commands use
+/// for anything they did not expect after the arguments they count.
+fn unrecognised(name: &str, opt: &[u8]) -> Error {
+    yo_alloc::allow(|| {
+        Error::fmt(
+            Code::Invalid,
+            format_args!(
+                "Unrecognized {name} option '{}'",
+                String::from_utf8_lossy(opt)
+            ),
+        )
+    })
+}
+
 // ---------------------------------------------------------------- claiming
 
 /// `XCLAIM key group consumer min-idle-time id [id ...] [options]`.
@@ -550,15 +754,7 @@ fn claim(db: &mut Keyspace, args: Args<'_>, now: u64, out: &mut Out) -> Result<(
             last = Some(strict_id(args.get(i + 1))?);
             i += 2;
         } else {
-            return Err(yo_alloc::allow(|| {
-                Error::fmt(
-                    Code::Invalid,
-                    format_args!(
-                        "Unrecognized XCLAIM option '{}'",
-                        String::from_utf8_lossy(opt)
-                    ),
-                )
-            }));
+            return Err(unrecognised("XCLAIM", opt));
         }
     }
     // `JUSTID` is not only a reply shape. Redis reads it as "I am not really
@@ -940,9 +1136,9 @@ fn full_info(s: &Stream, count: usize, out: &mut Out) {
         maybe_uint(out, s.lag(g));
         out.bulk(b"pel-count");
         out.uint(g.pending_len() as u64);
-        // Redis 8.8's `XNACK` counter, which nothing here can move off zero.
+        // How many of those nobody is holding, which is what `XNACK` makes.
         out.bulk(b"nacked-count");
-        out.uint(0);
+        out.uint(g.nacked_len() as u64);
         out.bulk(b"pending");
         let at = out.len();
         let want = Filter {
@@ -954,7 +1150,9 @@ fn full_info(s: &Stream, count: usize, out: &mut Out) {
         let seen = g.pending_range(want, 0, |id, nack, c| {
             out.array(4);
             id_out(out, id);
-            out.bulk(c.name());
+            // The delivery time of a released entry is the zero it was put back
+            // at, and its consumer is the empty name, the same as `XPENDING`.
+            out.bulk(c.map_or(&b""[..], Consumer::name));
             out.uint(nack.time());
             out.uint(nack.count());
             true
@@ -1532,12 +1730,18 @@ fn bound(arg: &[u8], low: bool) -> Result<Id> {
 /// then complaining. Checking and then walking again is two passes over a short
 /// argument list and no allocation, which is the trade this whole layer makes.
 fn ids<'a>(args: Args<'a>, at: usize) -> Result<impl Iterator<Item = Id> + 'a> {
-    for i in at..args.len() {
+    ids_in(args, at, args.len())
+}
+
+/// The same over a run that stops short of the end, which is what the three 8.x
+/// commands need: they count their IDs and take options after them.
+fn ids_in<'a>(args: Args<'a>, at: usize, end: usize) -> Result<impl Iterator<Item = Id> + 'a> {
+    for i in at..end {
         strict_id(args.get(i))?;
     }
     // Every one of these parsed a moment ago, so the second pass cannot fail and
     // the `filter_map` drops nothing.
-    Ok((at..args.len()).filter_map(move |i| Id::parse(args.get(i), 0)))
+    Ok((at..end).filter_map(move |i| Id::parse(args.get(i), 0)))
 }
 
 /// One entry as the client sees it, which is its ID and its fields laid flat.

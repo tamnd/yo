@@ -567,7 +567,7 @@ mod tests {
         // A row that claims a verified argument order for a command nothing
         // runs, which is the claim that reads as done and is not.
         let tables = toml::parse(
-            "[[command]]\nname = \"XACKDEL\"\ngroup = \"stream\"\nsince = \"8.2.0\"\narity = -5\n\
+            "[[command]]\nname = \"XCFGSET\"\ngroup = \"stream\"\nsince = \"8.8.0\"\narity = -4\n\
              plan = \"point\"\nbounded = \"inherent\"\nstatus = \"shipped\"\nwire = \"verified\"\n",
         )
         .unwrap();

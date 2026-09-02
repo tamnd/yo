@@ -34,7 +34,7 @@ use yo_common::{Code, Error, Result};
 
 use crate::keyspace::Keyspace;
 use crate::stream::groups::Filter;
-use crate::stream::{Fields, Group, Id, Refused, Stream};
+use crate::stream::{Fate, Fields, Group, Id, Refs, Refused, Retry, Stream};
 use crate::value::{self, Kind};
 
 /// What every stream command says about an ID it cannot read.
@@ -345,6 +345,95 @@ impl Keyspace {
         Ok(ids.filter(|&id| s.delete(id)).count() as u64)
     }
 
+    /// `XDELEX key [KEEPREF|DELREF|ACKED] IDS numids id [id ...]`.
+    ///
+    /// The callback gets what became of each ID, in the order they were given. A
+    /// key that is not there is not an error and not a short reply either: every
+    /// ID gets [`Fate::Missing`], which is what a real server answers and is why
+    /// the ID list is walked even when there is nothing to walk it against.
+    ///
+    /// # Errors
+    ///
+    /// [`Code::WrongType`] for a key holding something else.
+    pub fn xdelex<F>(
+        &mut self,
+        key: &[u8],
+        refs: Refs,
+        ids: impl Iterator<Item = Id>,
+        mut f: F,
+    ) -> Result<()>
+    where
+        F: FnMut(Fate),
+    {
+        let Some(at) = self.live_slot(key, Kind::Stream)? else {
+            ids.for_each(|_| f(Fate::Missing));
+            return Ok(());
+        };
+        let s = self.stream_at(at);
+        ids.for_each(|id| f(s.delete_ref(id, refs)));
+        Ok(())
+    }
+
+    /// `XACKDEL key group [KEEPREF|DELREF|ACKED] IDS numids id [id ...]`.
+    ///
+    /// The same shape, and a group that is not there behaves like a key that is
+    /// not there rather than raising `NOGROUP`, because the answer this command
+    /// gives per ID is about the pending list and an absent group is holding
+    /// nothing.
+    ///
+    /// # Errors
+    ///
+    /// [`Code::WrongType`] for a key holding something else.
+    pub fn xackdel<F>(
+        &mut self,
+        key: &[u8],
+        group: &[u8],
+        refs: Refs,
+        ids: impl Iterator<Item = Id>,
+        mut f: F,
+    ) -> Result<()>
+    where
+        F: FnMut(Fate),
+    {
+        let Some(at) = self.live_slot(key, Kind::Stream)? else {
+            ids.for_each(|_| f(Fate::Missing));
+            return Ok(());
+        };
+        let s = self.stream_at(at);
+        ids.for_each(|id| f(s.ack_delete(group, id, refs)));
+        Ok(())
+    }
+
+    /// `XNACK key group <SILENT|FAIL|FATAL> IDS numids id [id ...] [RETRYCOUNT n] [FORCE]`.
+    ///
+    /// Answers how many entries were released, and `None` when there is no such
+    /// key or group, which this command does raise `NOGROUP` for.
+    ///
+    /// # Errors
+    ///
+    /// [`Code::WrongType`] for a key holding something else.
+    pub fn xnack(
+        &mut self,
+        key: &[u8],
+        group: &[u8],
+        retry: Retry,
+        force: bool,
+        ids: impl Iterator<Item = Id>,
+    ) -> Result<Option<u64>> {
+        let Some(at) = self.live_slot(key, Kind::Stream)? else {
+            return Ok(None);
+        };
+        let s = self.stream_at(at);
+        if s.group(group).is_none() {
+            return Ok(None);
+        }
+        let mut done = 0;
+        for id in ids {
+            done += u64::from(s.nack(group, id, retry, force).unwrap_or(false));
+        }
+        Ok(Some(done))
+    }
+
     /// `XTRIM key strategy`. Answers how many entries went.
     ///
     /// # Errors
@@ -643,7 +732,7 @@ impl Keyspace {
         f: F,
     ) -> Result<Option<usize>>
     where
-        F: FnMut(Id, &crate::stream::Nack, &crate::stream::Consumer) -> bool,
+        F: FnMut(Id, &crate::stream::Nack, Option<&crate::stream::Consumer>) -> bool,
     {
         let Some(s) = self.stream(key)? else {
             return Ok(None);
@@ -1357,7 +1446,12 @@ mod tests {
         let mut out = Vec::new();
         let seen = d
             .xpending_into(b"s", b"workers", Filter::default(), 600, |id, nack, c| {
-                out.push((id, nack.count(), nack.idle(600), c.name().to_vec()));
+                out.push((
+                    id,
+                    nack.count(),
+                    nack.idle(600),
+                    c.expect("an owner").name().to_vec(),
+                ));
                 true
             })
             .expect("a stream")

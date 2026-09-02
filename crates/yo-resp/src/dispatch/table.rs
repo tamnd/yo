@@ -2313,6 +2313,45 @@ pub static COMMANDS: &[Spec] = &[
         group: "stream",
     },
     Spec {
+        name: "xdelex",
+        arity: -5,
+        flags: WRITE_FAST,
+        first_key: 1,
+        last_key: 1,
+        step: 1,
+        acl: AC_STREAM_WRITE_FAST,
+        since: "8.2.0",
+        complexity: "O(1) per ID.",
+        summary: "Remove entries by ID, saying what to do about the groups.",
+        group: "stream",
+    },
+    Spec {
+        name: "xackdel",
+        arity: -6,
+        flags: WRITE_FAST,
+        first_key: 1,
+        last_key: 1,
+        step: 1,
+        acl: AC_STREAM_WRITE_FAST,
+        since: "8.2.0",
+        complexity: "O(1) per ID.",
+        summary: "Acknowledge entries for a group and remove them.",
+        group: "stream",
+    },
+    Spec {
+        name: "xnack",
+        arity: -7,
+        flags: WRITE_FAST,
+        first_key: 1,
+        last_key: 1,
+        step: 1,
+        acl: AC_STREAM_WRITE_FAST,
+        since: "8.8.0",
+        complexity: "O(1) per ID.",
+        summary: "Give entries back to the group for somebody else to claim.",
+        group: "stream",
+    },
+    Spec {
         name: "xtrim",
         arity: -4,
         flags: WRITE_SLOW,
@@ -3144,22 +3183,23 @@ const SLOTS: usize = 512;
 /// most wants to be able to find.
 const FREE: u16 = u16::MAX;
 
-/// The multiplier, found by searching for one that spreads these 216 names well.
+/// The multiplier, found by searching for one that spreads these 219 names well.
 ///
 /// Not a magic constant in the bad sense: it is checked. Every command is looked
 /// up by its own name in a test, and another test holds the worst probe length
 /// at what it is now, so a command added later that made this multiplier bad
 /// would fail rather than quietly cost every lookup an extra slot.
 ///
-/// It has been searched for three times, and each time because the test went red
+/// It has been searched for four times, and each time because the test went red
 /// rather than because somebody went looking. The first was against the 191 names
 /// in the table then, the ten graph commands pushed its worst probe to three
 /// slots, and the second search was run over all 201. The fifteen stream commands
-/// pushed that one to four slots and fifty one extra probes, and this is the same
-/// search run again over all 216: worst two and thirty nine extra slots over the
-/// whole table. Fourteen of those thirty nine are forced by the key and no
-/// multiplier can remove them.
-const MIX: u64 = 0x54ba_a2d7_89b5_2acd;
+/// pushed that one to four slots and fifty one extra probes, so the third was run
+/// over all 216, and the three 8.x pending list commands cost that one two more
+/// probes than the test allows. This is the same search run again over all 219:
+/// worst two and thirty nine extra slots over the whole table. Thirteen of those
+/// thirty nine are forced by the key and no multiplier can remove them.
+const MIX: u64 = 0xecfd_0b34_d0a1_0159;
 
 /// The four bytes the index is computed from: the length, the first two bytes
 /// and the last, lower cased.
@@ -3170,11 +3210,11 @@ const MIX: u64 = 0x54ba_a2d7_89b5_2acd;
 /// Four bytes and not the whole name because the whole name has to be compared
 /// at the end anyway, so the hash only has to be good enough to get to the right
 /// slot, and reading less of the name is a shorter dependency chain in front of
-/// the multiply. These four leave 203 distinct values over the 216 commands, so
+/// the multiply. These four leave 206 distinct values over the 219 commands, so
 /// twelve groups of names collide whatever the multiplier is and probe once more,
 /// and the probe is the same compare the lookup was always going to do. `setnx`
 /// and `setex` are one of those groups and `g.nadd` and `g.eadd` are another. The
-/// fifteen stream commands are in none of them, since a name is keyed on its
+/// eighteen stream commands are in none of them, since a name is keyed on its
 /// first two bytes and its last and no two of them agree on all three.
 ///
 /// `| 0x20` lower cases a letter and does not have to be told which bytes are
