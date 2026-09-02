@@ -47,6 +47,7 @@ use yo_kv::{End, Entry, Keyspace, Member, ZEnd};
 
 use super::args::{self, Args, NOT_AN_INT};
 use super::lists::{BAD_MPOP_COUNT, BAD_NUMKEYS, end_of};
+use super::streams;
 use super::table::Spec;
 use super::zsets;
 use super::{Flow, Server, Session};
@@ -96,6 +97,29 @@ pub(super) fn execute(
         return replication(spec.name, args, out).map(|()| Flow::Continue);
     }
     let now = server.now_ms();
+    // The two stream reads, which are here for the same reason the list five
+    // are and leave through a different door. `BLOCK` is optional on both, so
+    // where `BLPOP` always has a timeout to read, `XREAD` may have been told to
+    // answer now and take nothing for an answer. That is the difference between
+    // parking and writing the null, and it cannot be said with a deadline of
+    // `None`, which already means wait for as long as it takes.
+    if spec.name == "xread" || spec.name == "xreadgroup" {
+        let db = session.db();
+        let want = streams::parse_read(spec.name, args, server.db(db), now)?;
+        let block = Block::xread(want.keys, want.reads);
+        if block.now(server.db(db), now, out)? {
+            return Ok(Flow::Continue);
+        }
+        let Some(deadline) = want.wait else {
+            // No `BLOCK` at all, so nothing arriving is the answer and not a
+            // reason to wait for it. A null array on both protocols, which is
+            // also what a `BLOCK` that runs out sends.
+            out.nil_array();
+            return Ok(Flow::Continue);
+        };
+        server.park(session.id(), db, deadline, block);
+        return Ok(Flow::Block);
+    }
     let last = args.len() - 1;
     let (deadline, block) = match spec.name {
         // The keys are everything between the name and the timeout, so `BLPOP a
@@ -150,7 +174,7 @@ pub(super) fn execute(
     };
 
     let db = session.db();
-    if block.now(server.db(db), out)? {
+    if block.now(server.db(db), now, out)? {
         return Ok(Flow::Continue);
     }
     server.park(session.id(), db, deadline, block);
@@ -305,6 +329,14 @@ enum Want {
     ZPop { end: ZEnd },
     /// `BZMPOP`: up to `count` members off the first sorted set that has any.
     ZMpop { end: ZEnd, count: usize },
+    /// `XREAD BLOCK` and `XREADGROUP BLOCK`: whatever has arrived on any of the
+    /// streams since the ID this asked from.
+    ///
+    /// Unlike the other five this takes nothing away, so several clients parked
+    /// on one stream all get the same entry rather than one of them getting it.
+    /// That is the whole point of a stream over a list, and it costs nothing
+    /// here because the attempt is a read.
+    XRead(streams::Reads),
 }
 
 impl Want {
@@ -329,10 +361,15 @@ impl Want {
         &self,
         keys: &[Vec<u8>],
         db: &mut Keyspace,
+        now: u64,
         out: &mut Out,
         strict: bool,
     ) -> Result<bool> {
         match self {
+            // The one arm that needs to know what time it is, because a group
+            // read records when each entry was handed out. The other five take
+            // an element off a collection and the clock does not come into it.
+            Want::XRead(r) => streams::read(db, keys, r, now, strict, out),
             Want::Pop { end } => {
                 for key in keys {
                     if !ready(db, key, strict)? {
@@ -524,8 +561,17 @@ impl Block {
     /// # Errors
     ///
     /// A key of another type, which is an error rather than a wait.
-    fn now(&self, db: &mut Keyspace, out: &mut Out) -> Result<bool> {
-        self.want.attempt(&self.keys, db, out, true)
+    fn now(&self, db: &mut Keyspace, now: u64, out: &mut Out) -> Result<bool> {
+        self.want.attempt(&self.keys, db, now, out, true)
+    }
+
+    /// `XREAD BLOCK` and `XREADGROUP BLOCK`, whose keys and IDs were read
+    /// together by [`streams::parse_read`] because neither makes sense alone.
+    fn xread(keys: Vec<Vec<u8>>, reads: streams::Reads) -> Block {
+        Block {
+            keys,
+            want: Want::XRead(reads),
+        }
     }
 }
 
@@ -674,7 +720,7 @@ impl Waiters {
     fn try_serve(&self, at: usize, dbs: &mut [Keyspace], now: u64, out: &mut Out) -> bool {
         let w = &self.list[at];
         let mark = out.len();
-        match w.want.attempt(&w.keys, &mut dbs[w.db], out, false) {
+        match w.want.attempt(&w.keys, &mut dbs[w.db], now, out, false) {
             Ok(true) => return true,
             Ok(false) => {}
             // `strict` is off, so nothing in there returns an error today.

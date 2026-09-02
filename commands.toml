@@ -115,7 +115,7 @@ doc = "11 section 7"
 [[group]]
 name = "stream"
 expected = 20
-status = "planned"
+status = "partial"
 doc = "08 section 7"
 
 [[group]]
@@ -2264,6 +2264,175 @@ status = "shipped"
 wire = "verified"
 divergent = "D-20"
 notes = "Seven fields about the key, or twelve with FULL. It is the one array command where a missing key is an error rather than an empty answer, which is deliberate on Redis's part: this is a question about a key that exists. The seven short fields are all struct reads, so the short form is constant time, and only FULL walks the directory to average the slices."
+
+
+# --------------------------------------------------------------------- stream
+
+[[command]]
+name = "XADD"
+group = "stream"
+since = "5.0.0"
+arity = -5
+plan = "point"
+bounded = "inherent"
+status = "shipped"
+wire = "verified"
+notes = "One append into the tail node, which is a listpack that grows until it hits either the byte or the entry limit and then a new one is started. The field names of an entry that matches the node's master entry are not stored again, so a producer writing the same shape over and over pays for the values and a flag byte. The ID is either the clock, a millisecond the client named with the sequence worked out here, or an ID given whole, and all three have to be greater than the last one."
+
+[[command]]
+name = "XLEN"
+group = "stream"
+since = "5.0.0"
+arity = 2
+plan = "metadata"
+bounded = "inherent"
+status = "shipped"
+wire = "verified"
+notes = "A counter on the stream record and not a walk, which is why it stays constant time on a stream that has had entries deleted out of the middle of it."
+
+[[command]]
+name = "XDEL"
+group = "stream"
+since = "5.0.0"
+arity = -3
+plan = "point"
+bounded = "inherent"
+status = "shipped"
+wire = "verified"
+notes = "The entry is marked deleted in its node rather than moved out of it, so the cost is the lookup and not a rewrite of everything behind it. Every ID in the argument list is parsed before any of them is deleted, which is Redis's order and is visible: XDEL key 1-1 nonsense deletes nothing."
+
+[[command]]
+name = "XTRIM"
+group = "stream"
+since = "5.0.0"
+arity = -4
+plan = "cursor"
+bounded = "yes"
+status = "shipped"
+wire = "verified"
+notes = "Whole nodes are dropped at the front while the node behind is still past the threshold, which is what makes the approximate form cheap: it stops at a node boundary rather than rewriting a listpack to remove part of one. An approximate trim with no LIMIT gets an implicit one of a hundred times stream-node-max-entries, so a single XTRIM MAXLEN ~ 0 on a large stream removes a bounded amount and leaves the rest for the next one."
+
+[[command]]
+name = "XRANGE"
+group = "stream"
+since = "5.0.0"
+arity = -4
+plan = "cursor"
+bounded = "risk"
+status = "shipped"
+wire = "verified"
+notes = "The walk starts at the node holding the low bound rather than at the front, and entries go into the reply buffer as they are read with the array header written behind them, so nothing is collected. XRANGE key - + with no COUNT is the whole stream on the wire, which is the risk the bound field names and is Redis's behaviour."
+
+[[command]]
+name = "XREVRANGE"
+group = "stream"
+since = "5.0.0"
+arity = -4
+plan = "cursor"
+bounded = "risk"
+status = "shipped"
+wire = "verified"
+notes = "XRANGE with the bounds swapped by the caller, since the storage takes the low one first either way. The backward walk inside a node is the slower direction today, because a listpack is stepped back over by reading the length that trails each entry, and PR 1 left a note about doing that without buffering the node."
+
+[[command]]
+name = "XREAD"
+group = "stream"
+since = "5.0.0"
+arity = -4
+plan = "cursor"
+bounded = "risk"
+status = "shipped"
+wire = "verified"
+notes = "Several streams in one command, each from an ID the client is holding, and BLOCK parks the client on the waiter list rather than polling. Nothing is taken away, so a hundred readers parked on one stream all get the same entry when it lands, which is the difference between this and BLPOP. The $ and + forms are resolved once when the command arrives and never again on a retry, because resolving them per attempt would mean the client waits for what comes after the last thing that happened and never wakes."
+
+[[command]]
+name = "XREADGROUP"
+group = "stream"
+since = "5.0.0"
+arity = -7
+plan = "cursor"
+bounded = "risk"
+status = "shipped"
+wire = "verified"
+notes = "The same read with a group bookmark in front of it, so > hands out what nobody has had and an ID reads back this consumer's own pending list. It is a write because delivery is recorded: each entry handed out goes on the group's pending list against the consumer that took it, unless NOACK says not to. A history read of an entry that has since been deleted answers the ID with a null beside it so the consumer can still acknowledge it."
+
+[[command]]
+name = "XACK"
+group = "stream"
+since = "5.0.0"
+arity = -4
+plan = "point"
+bounded = "inherent"
+status = "shipped"
+wire = "verified"
+notes = "One removal from the group's pending list and one from the consumer's per ID, both by lookup rather than by scan. Like XDEL it parses every ID before it acknowledges any of them."
+
+[[command]]
+name = "XSETID"
+group = "stream"
+since = "5.0.0"
+arity = -3
+plan = "metadata"
+bounded = "inherent"
+status = "shipped"
+wire = "verified"
+notes = "Three counters on the stream record and nothing else, which is what makes it the command a replica load uses to put a stream back exactly as it was. The new last ID has to be at least the top entry's and at least the max deleted ID, and both refusals have their own sentence."
+
+[[command]]
+name = "XGROUP"
+group = "stream"
+since = "5.0.0"
+arity = -2
+plan = "metadata"
+bounded = "inherent"
+status = "shipped"
+wire = "verified"
+notes = "Six subcommands over the group records on the stream. Each has its own arity in Redis's table, so too few arguments names the pair as xgroup|create and enough arguments in a shape the handler will not take gets the longer sentence pointing at XGROUP HELP. CREATE on a group that is already there answers BUSYGROUP, which is its own prefix because a client racing another one to create a group treats it as somebody else got there first."
+
+[[command]]
+name = "XINFO"
+group = "stream"
+since = "5.0.0"
+arity = -2
+plan = "metadata"
+bounded = "risk"
+status = "shipped"
+wire = "verified"
+divergent = "D-27, D-28"
+notes = "Four subcommands, three of which are struct reads. XINFO STREAM FULL is the risk the bound field names, since it walks entries and every group's pending list, and its COUNT defaults to ten with zero meaning all of them. Groups and consumers come back in name order, which is free for Redis because it holds them in a rax and is found here by a selection walk, on the grounds that this is a diagnostic command over a handful of names and the alternative is a second index to keep in step."
+
+[[command]]
+name = "XPENDING"
+group = "stream"
+since = "5.0.0"
+arity = -3
+plan = "cursor"
+bounded = "risk"
+status = "shipped"
+wire = "verified"
+notes = "Two commands under one name. The short form is four numbers off the group record and the long form walks the pending list between two IDs. Redis reads the optional consumer only when the argument count comes out exactly right, so a stray trailing argument is ignored rather than refused, and that is copied here rather than tidied up."
+
+[[command]]
+name = "XCLAIM"
+group = "stream"
+since = "5.0.0"
+arity = -6
+plan = "point"
+bounded = "inherent"
+status = "shipped"
+wire = "verified"
+notes = "One pending list entry moved between consumers per ID, by lookup. IDs are read until one will not parse and everything after that is an option, which is Redis's rule and is visible: XCLAIM k g c 0 - complains about an unrecognised option and not about a bad ID. An ID that is pending but whose entry has since been deleted is dropped from the pending list on the way past and left out of the reply."
+
+[[command]]
+name = "XAUTOCLAIM"
+group = "stream"
+since = "6.2.0"
+arity = -6
+plan = "cursor"
+bounded = "yes"
+status = "shipped"
+wire = "verified"
+notes = "A sweep of the pending list from a cursor, taking what has been idle long enough and stopping after COUNT of them, with the cursor to carry on from as the first value of the reply. The third value is the IDs it dropped for no longer being in the stream, which is what makes a sweep converge instead of handing the same dead entry round forever."
 
 
 # ------------------------------------------------------------------ scripting

@@ -488,6 +488,19 @@ impl Out {
         self.close(if self.proto.is_resp3() { b'~' } else { b'*' }, start, n);
     }
 
+    /// And for a map whose size is only known once it has been written, which
+    /// is `XREAD`.
+    ///
+    /// `XREAD` names several streams and leaves out the ones that had nothing
+    /// new, so the number of pairs is whatever survived the walk. The count is
+    /// `n` on either protocol and only the tag changes, because the two shapes
+    /// do not agree on what a pair is: RESP3 sends a map of stream name to
+    /// entries and RESP2 sends an array of two element arrays. The caller writes
+    /// one or the other and this closes it.
+    pub fn close_map(&mut self, start: usize, n: usize) {
+        self.close(if self.proto.is_resp3() { b'%' } else { b'*' }, start, n);
+    }
+
     /// Write a header of `tag` for `n` elements behind the elements, then move
     /// it in front of them.
     fn close(&mut self, tag: u8, start: usize, n: usize) {

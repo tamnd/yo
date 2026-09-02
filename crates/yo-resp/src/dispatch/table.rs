@@ -121,6 +121,28 @@ const AC_ARRAY_WRITE_FAST: &[&str] = &["@write", "@array", "@fast"];
 /// The array write side for `ARDELRANGE`, the one array command Redis does not
 /// mark fast.
 const AC_ARRAY_WRITE_SLOW: &[&str] = &["@write", "@array", "@slow"];
+/// The stream read side, for the ones that answer without walking entries.
+const AC_STREAM_READ_FAST: &[&str] = &["@read", "@stream", "@fast"];
+/// The stream read side for the ranges, whose cost is what they return.
+const AC_STREAM_READ_SLOW: &[&str] = &["@read", "@stream", "@slow"];
+/// The stream write side, which is everything that appends, deletes or moves an
+/// entry between pending lists.
+const AC_STREAM_WRITE_FAST: &[&str] = &["@write", "@stream", "@fast"];
+/// The stream write side for `XTRIM`, whose cost is what it removes.
+const AC_STREAM_WRITE_SLOW: &[&str] = &["@write", "@stream", "@slow"];
+/// `XREAD`, which waits and does not write.
+const AC_STREAM_BLOCKING_READ: &[&str] = &["@read", "@stream", "@slow", "@blocking"];
+/// `XREADGROUP`, which waits and does write, since handing an entry to a
+/// consumer puts it on that consumer's pending list.
+const AC_STREAM_BLOCKING_WRITE: &[&str] = &["@write", "@stream", "@slow", "@blocking"];
+/// `XGROUP` and `XINFO`, whose keys are on the subcommand and whose categories
+/// are therefore only the container's.
+const AC_STREAM_CONTAINER: &[&str] = &["@slow"];
+/// The two stream reads, whose keys come after `STREAMS` and are half of what
+/// follows it, so nothing positional can find them.
+const READ_BLOCKING_MOVABLE: &[&str] = &["readonly", "blocking", "movablekeys"];
+/// The same for `XREADGROUP`, which is a write.
+const WRITE_BLOCKING_MOVABLE: &[&str] = &["write", "blocking", "movablekeys"];
 /// Read only and not counted as fast, for a command whose keys are counted
 /// rather than positioned, so a client has to read the key specs to route it.
 const READ_MOVABLE: &[&str] = &["readonly", "movablekeys"];
@@ -2250,6 +2272,202 @@ pub static COMMANDS: &[Spec] = &[
         summary: "The shape of the array, and what its slices look like.",
         group: "array",
     },
+    // ------------------------------------------------------------- streams
+    Spec {
+        name: "xadd",
+        arity: -5,
+        flags: WRITE_FAST_OOM,
+        first_key: 1,
+        last_key: 1,
+        step: 1,
+        acl: AC_STREAM_WRITE_FAST,
+        since: "5.0.0",
+        complexity: "O(1) for the append, plus what a trim removes.",
+        summary: "Append an entry and answer with the ID it got.",
+        group: "stream",
+    },
+    Spec {
+        name: "xlen",
+        arity: 2,
+        flags: READ_FAST,
+        first_key: 1,
+        last_key: 1,
+        step: 1,
+        acl: AC_STREAM_READ_FAST,
+        since: "5.0.0",
+        complexity: "O(1)",
+        summary: "How many entries the stream holds.",
+        group: "stream",
+    },
+    Spec {
+        name: "xdel",
+        arity: -3,
+        flags: WRITE_FAST,
+        first_key: 1,
+        last_key: 1,
+        step: 1,
+        acl: AC_STREAM_WRITE_FAST,
+        since: "5.0.0",
+        complexity: "O(1) per ID.",
+        summary: "Remove entries by ID and say how many were there.",
+        group: "stream",
+    },
+    Spec {
+        name: "xtrim",
+        arity: -4,
+        flags: WRITE_SLOW,
+        first_key: 1,
+        last_key: 1,
+        step: 1,
+        acl: AC_STREAM_WRITE_SLOW,
+        since: "5.0.0",
+        complexity: "O(N) in the entries removed.",
+        summary: "Cut the stream down to a length or a minimum ID.",
+        group: "stream",
+    },
+    Spec {
+        name: "xrange",
+        arity: -4,
+        flags: READ_SLOW,
+        first_key: 1,
+        last_key: 1,
+        step: 1,
+        acl: AC_STREAM_READ_SLOW,
+        since: "5.0.0",
+        complexity: "O(N) in the entries returned.",
+        summary: "The entries between two IDs, oldest first.",
+        group: "stream",
+    },
+    Spec {
+        name: "xrevrange",
+        arity: -4,
+        flags: READ_SLOW,
+        first_key: 1,
+        last_key: 1,
+        step: 1,
+        acl: AC_STREAM_READ_SLOW,
+        since: "5.0.0",
+        complexity: "O(N) in the entries returned.",
+        summary: "The entries between two IDs, newest first.",
+        group: "stream",
+    },
+    Spec {
+        name: "xread",
+        arity: -4,
+        flags: READ_BLOCKING_MOVABLE,
+        first_key: 0,
+        last_key: 0,
+        step: 0,
+        acl: AC_STREAM_BLOCKING_READ,
+        since: "5.0.0",
+        complexity: "O(N) in the entries returned.",
+        summary: "Read from one or more streams, waiting if asked to.",
+        group: "stream",
+    },
+    Spec {
+        name: "xreadgroup",
+        arity: -7,
+        flags: WRITE_BLOCKING_MOVABLE,
+        first_key: 0,
+        last_key: 0,
+        step: 0,
+        acl: AC_STREAM_BLOCKING_WRITE,
+        since: "5.0.0",
+        complexity: "O(N) in the entries returned.",
+        summary: "Read as part of a consumer group, waiting if asked to.",
+        group: "stream",
+    },
+    Spec {
+        name: "xack",
+        arity: -4,
+        flags: WRITE_FAST,
+        first_key: 1,
+        last_key: 1,
+        step: 1,
+        acl: AC_STREAM_WRITE_FAST,
+        since: "5.0.0",
+        complexity: "O(1) per ID.",
+        summary: "Drop entries from a group's pending list.",
+        group: "stream",
+    },
+    Spec {
+        name: "xsetid",
+        arity: -3,
+        flags: WRITE_FAST_OOM,
+        first_key: 1,
+        last_key: 1,
+        step: 1,
+        acl: AC_STREAM_WRITE_FAST,
+        since: "5.0.0",
+        complexity: "O(1)",
+        summary: "Set the last ID, the entries added and the max deleted ID.",
+        group: "stream",
+    },
+    Spec {
+        name: "xgroup",
+        arity: -2,
+        flags: &[],
+        first_key: 0,
+        last_key: 0,
+        step: 0,
+        acl: AC_STREAM_CONTAINER,
+        since: "5.0.0",
+        complexity: "O(1) for all subcommands except DESTROY, which frees the group's pending list.",
+        summary: "Make, move and unmake consumer groups.",
+        group: "stream",
+    },
+    Spec {
+        name: "xinfo",
+        arity: -2,
+        flags: &[],
+        first_key: 0,
+        last_key: 0,
+        step: 0,
+        acl: AC_STREAM_CONTAINER,
+        since: "5.0.0",
+        complexity: "O(1), or O(N) with N the entries and pending entries shown when FULL is given.",
+        summary: "What a stream, its groups and its consumers look like.",
+        group: "stream",
+    },
+    Spec {
+        name: "xpending",
+        arity: -3,
+        flags: READ_SLOW,
+        first_key: 1,
+        last_key: 1,
+        step: 1,
+        acl: AC_STREAM_READ_SLOW,
+        since: "5.0.0",
+        complexity: "O(1) for the summary, O(N) in the entries returned for the list.",
+        summary: "What a group has handed out and not had acknowledged.",
+        group: "stream",
+    },
+    Spec {
+        name: "xclaim",
+        arity: -6,
+        flags: WRITE_FAST,
+        first_key: 1,
+        last_key: 1,
+        step: 1,
+        acl: AC_STREAM_WRITE_FAST,
+        since: "5.0.0",
+        complexity: "O(1) per ID.",
+        summary: "Move named pending entries to another consumer.",
+        group: "stream",
+    },
+    Spec {
+        name: "xautoclaim",
+        arity: -6,
+        flags: WRITE_FAST,
+        first_key: 1,
+        last_key: 1,
+        step: 1,
+        acl: AC_STREAM_WRITE_FAST,
+        since: "6.2.0",
+        complexity: "O(1) per entry claimed, plus what it skips getting there.",
+        summary: "Sweep a group's pending list and take what has gone idle.",
+        group: "stream",
+    },
     // ------------------------------------------------------------ keyspace
     Spec {
         name: "del",
@@ -2926,20 +3144,22 @@ const SLOTS: usize = 512;
 /// most wants to be able to find.
 const FREE: u16 = u16::MAX;
 
-/// The multiplier, found by searching for one that spreads these 201 names well.
+/// The multiplier, found by searching for one that spreads these 216 names well.
 ///
 /// Not a magic constant in the bad sense: it is checked. Every command is looked
 /// up by its own name in a test, and another test holds the worst probe length
 /// at what it is now, so a command added later that made this multiplier bad
 /// would fail rather than quietly cost every lookup an extra slot.
 ///
-/// It has been searched for twice. The first one was found against the 191 names
-/// that were in the table then, and the ten graph commands pushed its worst probe
-/// to three slots and the test that watches it went red, which is what that test
-/// is for. This one is the same search run again over all 201, and it is better
-/// than the old one was even before the graph commands arrived: worst two and
-/// thirty extra slots over the whole table, against three and forty three.
-const MIX: u64 = 0xf6ef_8bb8_48a2_2acd;
+/// It has been searched for three times, and each time because the test went red
+/// rather than because somebody went looking. The first was against the 191 names
+/// in the table then, the ten graph commands pushed its worst probe to three
+/// slots, and the second search was run over all 201. The fifteen stream commands
+/// pushed that one to four slots and fifty one extra probes, and this is the same
+/// search run again over all 216: worst two and thirty nine extra slots over the
+/// whole table. Fourteen of those thirty nine are forced by the key and no
+/// multiplier can remove them.
+const MIX: u64 = 0x54ba_a2d7_89b5_2acd;
 
 /// The four bytes the index is computed from: the length, the first two bytes
 /// and the last, lower cased.
@@ -2950,10 +3170,12 @@ const MIX: u64 = 0xf6ef_8bb8_48a2_2acd;
 /// Four bytes and not the whole name because the whole name has to be compared
 /// at the end anyway, so the hash only has to be good enough to get to the right
 /// slot, and reading less of the name is a shorter dependency chain in front of
-/// the multiply. These four leave 188 distinct values over the 201 commands, so
+/// the multiply. These four leave 203 distinct values over the 216 commands, so
 /// twelve groups of names collide whatever the multiplier is and probe once more,
 /// and the probe is the same compare the lookup was always going to do. `setnx`
-/// and `setex` are one of those groups and `g.nadd` and `g.eadd` are another.
+/// and `setex` are one of those groups and `g.nadd` and `g.eadd` are another. The
+/// fifteen stream commands are in none of them, since a name is keyed on its
+/// first two bytes and its last and no two of them agree on all three.
 ///
 /// `| 0x20` lower cases a letter and does not have to be told which bytes are
 /// letters. It maps the two cases of a name to the same number, which is all

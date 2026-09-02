@@ -68,6 +68,15 @@ pub const GROUP_EXISTS: &str = "Consumer Group name already exists";
 pub const SETID_TOO_SMALL: &str =
     "The ID specified in XSETID is smaller than the target stream top item";
 
+/// And what it says about an ID below the `MAXDELETEDID` it was handed.
+///
+/// A separate sentence because it is a separate mistake. The one above is about
+/// an entry the stream still holds and this is about one it says it deleted, and
+/// a stream whose last ID sat below its own high water mark for deletions would
+/// hand that ID out again.
+pub const SETID_BELOW_MAX_DELETED: &str =
+    "The ID specified in XSETID is smaller than the provided max_deleted_entry_id";
+
 /// What a command that needs the key says when it is not there.
 pub const NO_SUCH_KEY: &str = "no such key";
 
@@ -365,6 +374,12 @@ impl Keyspace {
         let Some(at) = self.live_slot(key, Kind::Stream)? else {
             return Err(Error::new(Code::NotFound, NO_SUCH_KEY));
         };
+        // Checked here rather than in `Stream::set_id`, because it is a rule
+        // about the two arguments and not about the stream: the pair is
+        // contradictory whatever the stream currently holds.
+        if max_deleted.is_some_and(|id| last < id) {
+            return Err(Error::new(Code::Invalid, SETID_BELOW_MAX_DELETED));
+        }
         self.stream_at(at)
             .set_id(last, added, max_deleted)
             .map_err(|_| Error::new(Code::Invalid, SETID_TOO_SMALL))
@@ -455,17 +470,25 @@ impl Keyspace {
         // a claim rather than a default: `XINFO GROUPS` reports the counter as
         // null on a real server until something sets it, and the lag is worked
         // out from where the bookmark sits instead.
+        let read = capped(read, s);
         Ok(s.create_group(group, last, read))
     }
 
     /// `XGROUP DESTROY key group`. Answers whether there was one.
     ///
+    /// A group that is not there is a zero and a key that is not there is an
+    /// error, which is Redis's rule for every `XGROUP` subcommand and is worth
+    /// stating because the two look like the same kind of nothing from a client.
+    /// They are not: destroying a group nobody made is a no op, and destroying a
+    /// group on a key nobody made is a mistake about which key.
+    ///
     /// # Errors
     ///
-    /// [`Code::WrongType`] for a key holding something else.
+    /// [`Code::WrongType`] for a key holding something else, and
+    /// [`Code::NotFound`] for a key that is not there.
     pub fn xgroup_destroy(&mut self, key: &[u8], group: &[u8]) -> Result<bool> {
         let Some(at) = self.live_slot(key, Kind::Stream)? else {
-            return Ok(false);
+            return Err(Error::new(Code::NotFound, NO_KEY_FOR_GROUP));
         };
         Ok(self.stream_at(at).destroy_group(group))
     }
@@ -490,9 +513,16 @@ impl Keyspace {
         };
         let s = self.stream_at(slot);
         let last = position(s, at);
+        let read = capped(read, s);
         let Some(g) = s.group_mut(group) else {
             return Ok(None);
         };
+        // `read` and not the group's old counter when nothing was named, so
+        // `XGROUP SETID key group 0` gives the counter up rather than leaving
+        // one that was true of somewhere else. That is what a real server does
+        // and it is visible immediately: `XINFO GROUPS` reports both the counter
+        // and the lag as null afterwards, until a read or an `ENTRIESREAD` puts
+        // a number back.
         g.set_id(last, read);
         Ok(Some(()))
     }
@@ -729,6 +759,18 @@ fn position(s: &Stream, at: Start) -> Id {
         Start::Last => s.last_id(),
         Start::At(id) => id,
     }
+}
+
+/// An `ENTRIESREAD` held down to what the stream has ever added.
+///
+/// A group cannot have read more entries than were ever written, so a client
+/// that says it has is corrected rather than believed. Redis does the same and
+/// it is visible: `XGROUP CREATE key g 0 ENTRIESREAD 99` on a stream of three
+/// reports three afterwards, not ninety nine. It matters because the number is
+/// subtracted from the entry count to get the lag, and an inflated one would
+/// make the lag come out at zero on a group that has read nothing.
+fn capped(read: Option<u64>, s: &Stream) -> Option<u64> {
+    read.map(|n| n.min(s.added()))
 }
 
 /// Run a trim, whichever kind it is. Answers how many entries went.
@@ -987,6 +1029,112 @@ mod tests {
         let late = s.group(b"late").expect("the late group");
         assert_eq!(late.entries_read(), None);
         assert_eq!(s.lag(late), Some(0), "and nothing is in front of this one");
+    }
+
+    /// A read counter a client hands in is held down to what was ever written,
+    /// and giving none at all on a `SETID` gives the counter up.
+    ///
+    /// Both are Redis 8.10.1's. The first matters because the number is
+    /// subtracted from the entry count to work the lag out, so believing a
+    /// client that says ninety nine would report a lag of zero on a group that
+    /// has read nothing.
+    #[test]
+    fn a_read_counter_that_is_too_big_is_brought_back_down() {
+        let mut d = db();
+        for ms in 1..=3 {
+            add(&mut d, b"s", Add::At(Id::new(ms, 0)));
+        }
+
+        d.xgroup_create(b"s", b"g", Start::At(Id::MIN), false, Some(99))
+            .expect("a stream");
+        assert_eq!(
+            counter(&mut d, b"g"),
+            Some(3),
+            "held down to what was added"
+        );
+
+        d.xgroup_setid(b"s", b"g", Start::At(Id::MIN), Some(2))
+            .expect("a stream")
+            .expect("the group");
+        assert_eq!(counter(&mut d, b"g"), Some(2), "and left alone below that");
+
+        d.xgroup_setid(b"s", b"g", Start::At(Id::MIN), None)
+            .expect("a stream")
+            .expect("the group");
+        assert_eq!(
+            counter(&mut d, b"g"),
+            None,
+            "and given up when none is named"
+        );
+    }
+
+    /// The one group's read counter, which the test above reads three times.
+    fn counter(d: &mut Keyspace, group: &[u8]) -> Option<u64> {
+        d.stream(b"s")
+            .expect("a stream")
+            .expect("the key")
+            .group(group)
+            .expect("the group")
+            .entries_read()
+    }
+
+    /// `XSETID` refuses a last ID below the deletion mark it was handed.
+    ///
+    /// Its own sentence and not the one about the top item, because it is its
+    /// own mistake: the pair contradicts itself whatever the stream holds, and a
+    /// stream whose last ID sat below its own deletion mark would hand an ID out
+    /// twice.
+    #[test]
+    fn setid_refuses_a_last_id_under_its_own_deletion_mark() {
+        let mut d = db();
+        add(&mut d, b"s", Add::At(Id::new(5, 0)));
+
+        let e = d
+            .xsetid(b"s", Id::new(9, 9), None, Some(Id::new(99, 99)))
+            .expect_err("the pair contradicts itself");
+        assert_eq!(e.message(), SETID_BELOW_MAX_DELETED);
+
+        d.xsetid(b"s", Id::new(99, 99), None, Some(Id::new(9, 9)))
+            .expect("the other way round is fine");
+        let s = d.stream(b"s").expect("a stream").expect("the key");
+        assert_eq!(s.last_id(), Id::new(99, 99));
+        assert_eq!(s.max_deleted_id(), Id::new(9, 9));
+    }
+
+    /// A history read makes the consumer it was sent as, and answers nothing.
+    ///
+    /// The case is a worker that restarts under a new name and asks for its own
+    /// backlog before it asks for new work. There is no backlog because the name
+    /// is new, and that is an empty list rather than a missing group, which is
+    /// the answer the wire has to be able to tell apart from `NOGROUP`.
+    #[test]
+    fn a_history_read_by_a_name_nobody_has_used_makes_the_consumer() {
+        let mut d = db();
+        add(&mut d, b"s", Add::At(Id::new(1, 0)));
+        d.xgroup_create(b"s", b"g", Start::At(Id::MIN), false, None)
+            .expect("a stream");
+
+        let want = Read {
+            group: b"g",
+            consumer: b"newbie",
+            from: From::Pending(Id::MIN),
+            count: None,
+            noack: false,
+        };
+        let seen = d
+            .xreadgroup_into(b"s", want, 500, |_, _| true)
+            .expect("a stream")
+            .expect("the group is there");
+        assert_eq!(seen, 0, "nothing was ever handed to this name");
+
+        let s = d.stream(b"s").expect("a stream").expect("the key");
+        let c = s
+            .group(b"g")
+            .expect("the group")
+            .consumer_named(b"newbie")
+            .expect("the read made it");
+        assert_eq!(c.seen(), 500, "it was heard from");
+        assert_eq!(c.active(), None, "and it has never had anything");
     }
 
     #[test]
