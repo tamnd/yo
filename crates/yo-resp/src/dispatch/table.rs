@@ -106,6 +106,12 @@ const AC_ZSET_BLOCKING_FAST: &[&str] = &["@write", "@sortedset", "@fast", "@bloc
 const AC_ZSET_BLOCKING_SLOW: &[&str] = &["@write", "@sortedset", "@slow", "@blocking"];
 /// The array read side, for the ones whose cost is the number of indices named
 /// and not the size of the array.
+/// The graph read side, for the ones that answer without walking the plane.
+const AC_GRAPH_READ_FAST: &[&str] = &["@read", "@graph", "@fast"];
+/// The graph read side for the ones that walk it.
+const AC_GRAPH_READ_SLOW: &[&str] = &["@read", "@graph", "@slow"];
+/// The graph write side, all of which are a probe and a run.
+const AC_GRAPH_WRITE_FAST: &[&str] = &["@write", "@graph", "@fast"];
 const AC_ARRAY_READ_FAST: &[&str] = &["@read", "@array", "@fast"];
 /// The array read side for `ARGETRANGE`, which answers once per position in the
 /// range and so costs the range rather than the population.
@@ -1878,6 +1884,137 @@ pub static COMMANDS: &[Spec] = &[
         summary: "Pop from the first of several sorted sets that has anything, waiting if none does.",
         group: "zset",
     },
+    // --------------------------------------------------------------- graph
+    Spec {
+        name: "g.nadd",
+        arity: -3,
+        flags: WRITE_FAST_OOM,
+        first_key: 1,
+        last_key: 1,
+        step: 1,
+        acl: AC_GRAPH_WRITE_FAST,
+        since: "8.8.0",
+        complexity: "O(N) with N the fields written",
+        summary: "Write a node and its properties, creating it if it is new.",
+        group: "graph",
+    },
+    Spec {
+        name: "g.nget",
+        arity: 3,
+        flags: READ_FAST,
+        first_key: 1,
+        last_key: 1,
+        step: 1,
+        acl: AC_GRAPH_READ_FAST,
+        since: "8.8.0",
+        complexity: "O(N) with N the fields on the node",
+        summary: "Every property on a node.",
+        group: "graph",
+    },
+    Spec {
+        name: "g.ndel",
+        arity: 3,
+        flags: WRITE_FAST,
+        first_key: 1,
+        last_key: 1,
+        step: 1,
+        acl: AC_GRAPH_WRITE_FAST,
+        since: "8.8.0",
+        complexity: "O(E) with E the edges on the node",
+        summary: "Delete a node and every edge that touches it.",
+        group: "graph",
+    },
+    Spec {
+        name: "g.eadd",
+        arity: -5,
+        flags: WRITE_FAST_OOM,
+        first_key: 1,
+        last_key: 1,
+        step: 1,
+        acl: AC_GRAPH_WRITE_FAST,
+        since: "8.8.0",
+        complexity: "O(D) with D the outgoing degree under the label",
+        summary: "Write an edge and its properties, creating either end if it is new.",
+        group: "graph",
+    },
+    Spec {
+        name: "g.edel",
+        arity: 5,
+        flags: WRITE_FAST,
+        first_key: 1,
+        last_key: 1,
+        step: 1,
+        acl: AC_GRAPH_WRITE_FAST,
+        since: "8.8.0",
+        complexity: "O(D) with D the outgoing degree under the label",
+        summary: "Delete one edge between two nodes under a label.",
+        group: "graph",
+    },
+    Spec {
+        name: "g.out",
+        arity: -4,
+        flags: READ_FAST,
+        first_key: 1,
+        last_key: 1,
+        step: 1,
+        acl: AC_GRAPH_READ_FAST,
+        since: "8.8.0",
+        complexity: "O(N) with N the page asked for",
+        summary: "Outgoing neighbours under a label, a page at a time.",
+        group: "graph",
+    },
+    Spec {
+        name: "g.in",
+        arity: -4,
+        flags: READ_FAST,
+        first_key: 1,
+        last_key: 1,
+        step: 1,
+        acl: AC_GRAPH_READ_FAST,
+        since: "8.8.0",
+        complexity: "O(N) with N the page asked for",
+        summary: "Incoming neighbours under a label, a page at a time.",
+        group: "graph",
+    },
+    Spec {
+        name: "g.deg",
+        arity: -4,
+        flags: READ_FAST,
+        first_key: 1,
+        last_key: 1,
+        step: 1,
+        acl: AC_GRAPH_READ_FAST,
+        since: "8.8.0",
+        complexity: "O(1)",
+        summary: "How many edges a node has under a label.",
+        group: "graph",
+    },
+    Spec {
+        name: "g.neigh",
+        arity: -4,
+        flags: READ_SLOW,
+        first_key: 1,
+        last_key: 1,
+        step: 1,
+        acl: AC_GRAPH_READ_SLOW,
+        since: "8.8.0",
+        complexity: "O(V + E) over the ball the depth reaches",
+        summary: "Everything reachable within a depth, each node once.",
+        group: "graph",
+    },
+    Spec {
+        name: "g.path",
+        arity: -4,
+        flags: READ_SLOW,
+        first_key: 1,
+        last_key: 1,
+        step: 1,
+        acl: AC_GRAPH_READ_SLOW,
+        since: "8.8.0",
+        complexity: "O(b^(d/2)) with b the branching factor and d the distance",
+        summary: "A shortest path between two nodes, searched from both ends.",
+        group: "graph",
+    },
     // --------------------------------------------------------------- array
     Spec {
         name: "arset",
@@ -2789,13 +2926,20 @@ const SLOTS: usize = 512;
 /// most wants to be able to find.
 const FREE: u16 = u16::MAX;
 
-/// The multiplier, found by searching for one that spreads these 191 names well.
+/// The multiplier, found by searching for one that spreads these 201 names well.
 ///
 /// Not a magic constant in the bad sense: it is checked. Every command is looked
 /// up by its own name in a test, and another test holds the worst probe length
 /// at what it is now, so a command added later that made this multiplier bad
 /// would fail rather than quietly cost every lookup an extra slot.
-const MIX: u64 = 0xbedf_bd94_c335_37f9;
+///
+/// It has been searched for twice. The first one was found against the 191 names
+/// that were in the table then, and the ten graph commands pushed its worst probe
+/// to three slots and the test that watches it went red, which is what that test
+/// is for. This one is the same search run again over all 201, and it is better
+/// than the old one was even before the graph commands arrived: worst two and
+/// thirty extra slots over the whole table, against three and forty three.
+const MIX: u64 = 0xf6ef_8bb8_48a2_2acd;
 
 /// The four bytes the index is computed from: the length, the first two bytes
 /// and the last, lower cased.
@@ -2806,9 +2950,10 @@ const MIX: u64 = 0xbedf_bd94_c335_37f9;
 /// Four bytes and not the whole name because the whole name has to be compared
 /// at the end anyway, so the hash only has to be good enough to get to the right
 /// slot, and reading less of the name is a shorter dependency chain in front of
-/// the multiply. These four leave 180 distinct values over the 191 commands,
-/// which is eleven pairs that share a slot and probe once more, and the probe is
-/// the same compare the lookup was always going to do.
+/// the multiply. These four leave 188 distinct values over the 201 commands, so
+/// twelve groups of names collide whatever the multiplier is and probe once more,
+/// and the probe is the same compare the lookup was always going to do. `setnx`
+/// and `setex` are one of those groups and `g.nadd` and `g.eadd` are another.
 ///
 /// `| 0x20` lower cases a letter and does not have to be told which bytes are
 /// letters. It maps the two cases of a name to the same number, which is all

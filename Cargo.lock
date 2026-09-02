@@ -954,6 +954,8 @@ dependencies = [
  "windows-sys",
  "yo-alloc",
  "yo-common",
+ "yo-doc",
+ "yo-graph",
  "yo-kv",
  "yo-reactor",
 ]

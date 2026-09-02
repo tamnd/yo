@@ -103,6 +103,16 @@ status = "shipped"
 doc = "08 section 1"
 
 [[group]]
+name = "graph"
+expected = 10
+status = "shipped"
+doc = "11 section 7"
+# Ten and no query language, which is the design and not a gap. There is no
+# G.QUERY and there is not going to be one: a traversal on the wire says which
+# way it is going, and anything that needs a plan is written as typed methods
+# against the embedded API where the compiler checks it before it runs.
+
+[[group]]
 name = "stream"
 expected = 20
 status = "planned"
@@ -1935,6 +1945,119 @@ bounded = "inherent"
 status = "shipped"
 wire = "verified"
 notes = "ZMPOP with a wait, and the same parse shifted along by one. The timeout is read before the key count, so BZMPOP abc 1 k MIN complains about the timeout and not about the count. A key count that leaves no room for the direction is a plain syntax error, because the word that should have been MIN or MAX is swallowed as a key and there is nothing left to read."
+
+
+# ---------------------------------------------------------------------- graph
+
+[[command]]
+name = "G.NADD"
+group = "graph"
+since = "8.8.0"
+arity = -3
+plan = "point"
+bounded = "inherent"
+status = "shipped"
+wire = "verified"
+notes = "One node id lookup, one label free write and one document into the node store, which is the same write a document collection takes because it is the same store. The reply is 1 for a node that was not there and 0 for one whose properties were replaced, so an ingest can count what it created without reading anything back. An isolated node is an empty object of four bytes, which is what lets the property store double as the node table and answer whether a node exists at all."
+
+[[command]]
+name = "G.NGET"
+group = "graph"
+since = "8.8.0"
+arity = 3
+plan = "point"
+bounded = "inherent"
+status = "shipped"
+wire = "verified"
+notes = "A hash lookup for the dense id and then one document read. Every value comes back as a bulk string because every value went in as one, and a node written by the embedded API that holds an integer comes back as its digits. There is nothing on the wire that says whether a client meant 5 or the text 5, so guessing would hand back something it did not write."
+
+[[command]]
+name = "G.NDEL"
+group = "graph"
+since = "8.8.0"
+arity = 3
+plan = "point"
+bounded = "inherent"
+status = "shipped"
+wire = "verified"
+notes = "The edges go first and the document second, at both ends and under every label, because a slot handed back while its properties were still there would be given out again with the old fields on it. Each run is copied before it is walked, since unlinking moves the last entry of a run into the hole it made and a walk over a live run would skip whatever moved. The key goes when the last node does."
+
+[[command]]
+name = "G.EADD"
+group = "graph"
+since = "8.8.0"
+arity = -5
+plan = "point"
+bounded = "inherent"
+status = "shipped"
+wire = "verified"
+notes = "A scan of the outgoing run for the pair, so an upsert is the degree under that label and not the whole graph. Either end that is not there is created as a node with no properties, which the typed surface refuses and the wire does not: there an id is a handle a caller can only have got from add, and here it is the client's own bytes and creating the node is well defined. Bulk edge ingest is most of what a graph does and two commands an edge would be the wrong trade."
+
+[[command]]
+name = "G.EDEL"
+group = "graph"
+since = "8.8.0"
+arity = 5
+plan = "point"
+bounded = "inherent"
+status = "shipped"
+wire = "verified"
+notes = "One edge and not every edge between the pair, because the plane allows parallel edges and the wire has no way to name one of them. The properties go before the slot is handed back, in that order, for the same reason G.NDEL uses. A pair with two edges under one label loses the older of them and the other is still readable with G.OUT."
+
+[[command]]
+name = "G.OUT"
+group = "graph"
+since = "8.8.0"
+arity = -4
+plan = "cursor"
+bounded = "yes"
+status = "shipped"
+wire = "verified"
+notes = "A probe and then a sequential read, which is 22 ns at degree 4 and 33 ns at degree 20 on a 13900K. The cursor is a position in the run rather than a snapshot, so an edit between two pages can skip an entry or repeat one, which is the guarantee SCAN gives and for the same reason: the alternative is holding a copy per client. A cursor of zero coming back is the end."
+
+[[command]]
+name = "G.IN"
+group = "graph"
+since = "8.8.0"
+arity = -4
+plan = "cursor"
+bounded = "yes"
+status = "shipped"
+wire = "verified"
+notes = "G.OUT down the other plane and the same code. The in run costs the same as the out run to read, which is the whole reason there are two planes rather than one plane and a scan, and it is why an incoming traversal is not the thing you avoid writing."
+
+[[command]]
+name = "G.DEG"
+group = "graph"
+since = "8.8.0"
+arity = -4
+plan = "metadata"
+bounded = "inherent"
+status = "shipped"
+wire = "verified"
+notes = "The length of a run, read off its header without touching the run itself. BOTH is the two lengths added, which counts a self loop twice because it is two entries in the plane, and saying otherwise would mean walking the run to find them."
+
+[[command]]
+name = "G.NEIGH"
+group = "graph"
+since = "8.8.0"
+arity = -4
+plan = "cursor"
+bounded = "yes"
+status = "shipped"
+wire = "verified"
+notes = "Every header in the frontier is asked for before any of them is read, which is 37 percent off a two hop walk on the bench. The frontier is deduplicated between hops and not at the end, because a frontier that keeps every path to a node grows as the product of the degrees, and the question is which nodes can be reached and not by how many routes. Depth is 2 when nobody says, since an unbounded depth on a social graph is the whole graph by hop four."
+
+[[command]]
+name = "G.PATH"
+group = "graph"
+since = "8.8.0"
+arity = -4
+plan = "cursor"
+bounded = "yes"
+status = "shipped"
+wire = "verified"
+notes = "A search from both ends at once, expanding whichever side is smaller. A one sided search over a graph of branching factor b touches b to the d and two half searches touch twice b to the d over 2, so at a branching factor of 30 and a distance of 6 that is 729 million against 54 thousand. Each side keeps who it came from, one integer per node touched, and the path is read back by walking the two parents from where they met rather than by carrying whole paths in the frontier. Every label at once, because a shortest path question asked of a graph with two kinds of edge means either one."
 
 
 # ---------------------------------------------------------------------- array
