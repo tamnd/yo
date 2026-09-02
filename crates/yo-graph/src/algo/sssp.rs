@@ -36,9 +36,13 @@
 //!
 //! Too small and it is Dijkstra with extra bookkeeping, one node a bucket. Too
 //! large and it is Bellman-Ford, one bucket for the whole graph and every edge
-//! relaxed over and over. The paper's guidance works out, for integer weights,
-//! as the largest weight over the average degree, which is what [`sssp`] uses
-//! when it is not told otherwise.
+//! relaxed over and over.
+//!
+//! The paper's guidance is the largest weight over the average degree, and it is
+//! written for a machine that relaxes a whole band at once. On one core the
+//! trade is different, because the work a wide band saves in bucket steps comes
+//! straight back as nodes relaxed twice, and the measured answer is a much
+//! narrower band than the guidance gives. [`DELTA`] has the numbers.
 //!
 //! ```
 //! use yo_graph::{Graph, NO_PROPS, Snapshot, algo};
@@ -61,7 +65,26 @@ use crate::Snapshot;
 pub const UNREACHABLE: u64 = u64::MAX;
 
 /// The band width [`sssp`] uses.
-pub const DELTA: u32 = 16;
+///
+/// Measured rather than guessed. Sweeping the width over an R-MAT graph of four
+/// million edges with GAP's weights on a 13900K, the time climbs the whole way
+/// as the band gets wider: 17.6 ms at one, 21.3 at four, 34.5 at sixteen and
+/// 134.5 at a hundred and twenty eight, against 46.1 for a heap Dijkstra over
+/// the same graph. A narrow band on one core is nearly free, because the bucket
+/// steps a wide band saves come straight back as nodes relaxed twice, and the
+/// paper's guidance is written for a machine that relaxes a whole band at once
+/// rather than one that walks it.
+///
+/// Four rather than one because that graph is not every graph. Stepping the
+/// bands is a step per band whether anything is in it or not, so a long chain of
+/// heavy edges pays for the width it is not using, and there is a quarter as
+/// much of that at four as at one. Thirteen percent on the graphs where the
+/// narrowest band wins is a fair price for that.
+pub const DELTA: u32 = 4;
+
+/// The most buckets the ring is allowed, so that a heavy edge cannot ask for a
+/// bucket per band across the whole weight range.
+const BUCKETS: u64 = 1 << 16;
 
 /// How far every node is from `src`, or [`UNREACHABLE`].
 ///
@@ -81,10 +104,11 @@ pub fn sssp(g: &Snapshot, weights: &[u32], src: u32) -> Vec<u64> {
 
 /// The same, with the band width spelled out.
 ///
-/// Rounded down to a power of two, and a `delta` of zero read as one. Very large
-/// weights against a very small `delta` means a lot of empty buckets to step
-/// over, which costs time and no memory, since the buckets are a ring however
-/// far apart the distances are.
+/// Rounded down to a power of two, and a `delta` of zero read as one. It is a
+/// request rather than an instruction: a band narrow enough that the heaviest
+/// edge spans more than sixty five thousand of them is widened until it does
+/// not, since the buckets are a ring and the ring has to be able to hold that
+/// span. Nothing else about the answer depends on the width.
 ///
 /// # Panics
 ///
@@ -98,19 +122,27 @@ pub fn sssp_with(g: &Snapshot, weights: &[u32], src: u32, delta: u32) -> Vec<u64
         return far;
     }
 
-    // The band width as a shift rather than a number. Every relaxation has to
-    // work out which bucket a distance falls in, which is a division by the
-    // width and then one by the ring size, and a division is thirty cycles that
-    // the rest of the loop does not have to spare. Rounding the width down to a
-    // power of two and the ring up to one turns both into a shift and a mask.
-    // The width is a heuristic to begin with, so rounding it costs nothing real.
-    let shift = delta.max(1).ilog2();
-    let width = 1u64 << shift;
+    // The band width as a shift rather than a number, so that working out which
+    // bucket a distance falls in is a shift and a mask rather than a division by
+    // the width and then one by the ring size. Measuring it says this is worth
+    // nothing at all, since the loop is waiting on memory and there was room for
+    // two divides inside that wait, but the width is a heuristic to begin with
+    // and rounding it to a power of two costs nothing either.
+    let mut shift = delta.max(1).ilog2();
     let heaviest = u64::from(weights.iter().copied().max().unwrap_or(0));
 
-    // Wide enough that an edge relaxed out of the bucket being emptied cannot
-    // reach round to one that has already been done. The heaviest edge moves a
-    // node at most that many bands forward.
+    // The ring has to be wide enough that an edge relaxed out of the bucket
+    // being emptied cannot reach round to one that has already been done, and
+    // the heaviest edge moves a node that many bands forward. A caller weighing
+    // edges in bytes or in microseconds rather than in hops has a heaviest edge
+    // in the billions, and asking for a narrow band on top of that is asking for
+    // a bucket per band across the whole range. Widen the band until the ring
+    // fits instead, which costs the caller some repeated relaxations and not
+    // twenty five gigabytes.
+    while (heaviest >> shift) + 2 > BUCKETS {
+        shift += 1;
+    }
+    let width = 1u64 << shift;
     let ring = ((heaviest >> shift) + 2).next_power_of_two();
     let mask = ring - 1;
     let mut bucket: Vec<Vec<u32>> = vec![Vec::new(); ring as usize];
@@ -258,6 +290,27 @@ mod tests {
         let (s, w) = weighted(&[(1, 2, 1)]);
         let far = sssp(&s, &w, s.dense(2).expect("2"));
         assert_eq!(far[s.dense(1).expect("1") as usize], UNREACHABLE);
+    }
+
+    /// Weights in the billions, which is what a caller counting bytes or
+    /// microseconds has, against the narrowest band anybody can ask for. A ring
+    /// of one bucket per band over that range would be twenty five gigabytes,
+    /// so the band has to widen on its own and the answer has to stay right.
+    #[test]
+    fn a_huge_weight_does_not_ask_for_a_huge_ring() {
+        let heaviest = i64::from(u32::MAX);
+        let (s, w) = weighted(&[
+            (1, 4, heaviest),
+            (1, 2, heaviest / 3),
+            (2, 3, heaviest / 3),
+            (3, 4, heaviest / 3),
+        ]);
+        let far = sssp_with(&s, &w, s.dense(1).expect("1"), 1);
+        assert_eq!(
+            far[s.dense(4).expect("4") as usize],
+            heaviest as u64 / 3 * 3
+        );
+        assert_eq!(far, reference(&s, &w, s.dense(1).expect("1")));
     }
 
     #[test]

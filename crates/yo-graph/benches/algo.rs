@@ -24,6 +24,15 @@
 //!   - `algo/scc` is Tarjan on its own, because there is no slower obvious form
 //!     worth timing against it. The row is there to say what strong components
 //!     cost next to the weak ones two rows above.
+//!   - `algo/community` puts Leiden, Louvain and label propagation next to each
+//!     other on the same graph. These are three answers to one question rather
+//!     than one answer written three ways, so the run also prints what each of
+//!     them found and what it is worth by modularity, and the time is only half
+//!     the comparison.
+//!   - `algo/betweenness` is Brandes over sixty four sampled sources. There is no
+//!     row for the exact form because the exact form is a search per node, which
+//!     on this graph is four hours, and the sampling is the reason anybody can
+//!     ask this question about a graph this size at all.
 //!
 //! # The graph
 //!
@@ -94,7 +103,7 @@ use yo_common::Rng;
 use yo_graph::algo::pagerank::DAMPING;
 use yo_graph::algo::{
     UNREACHABLE, UNREACHED, betweenness_with, bfs, label_propagation, leiden, louvain, modularity,
-    pagerank_with, scc, sssp, sssp_with, triangle_count, wcc,
+    pagerank_with, scc, sssp, triangle_count, wcc,
 };
 use yo_graph::{Graph, NO_PROPS, Snapshot};
 
@@ -385,11 +394,6 @@ fn bench_algo(c: &mut Criterion) {
     group.bench_function("pagerank/push 10 rounds", |b| {
         b.iter(|| black_box(push(black_box(&s), ROUNDS)));
     });
-    for delta in [1u32, 2, 4, 8, 16, 32, 64, 128] {
-        group.bench_function(format!("sweep/delta {delta}"), |b| {
-            b.iter(|| black_box(sssp_with(black_box(&s), black_box(&weights), src, delta)));
-        });
-    }
     group.bench_function("betweenness/64 pivots", |b| {
         b.iter(|| black_box(betweenness_with(black_box(&s), 64)));
     });
