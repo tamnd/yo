@@ -44,6 +44,49 @@
 //! per hop. That is the same tax on both sides and it is well under the lane
 //! crossing, but it is the first thing to fix if this ever becomes a hot path
 //! rather than a measurement.
+//!
+//! # The answer
+//!
+//! Measured on gamingpc, a 13900K running Windows 11, which is the quietest box
+//! in the set and the only one where these numbers hold still. Each cell is
+//! barriered over wavefront, so above one means dropping the barrier won.
+//!
+//! ```text
+//!   hops      1      2      3      4      5      6
+//!   1 shard  4.64   1.78   1.86   1.51   1.15   1.11
+//!   4 shards 1.12   1.71   2.53   1.77   1.09   1.16
+//!   8 shards 1.08   1.38   2.58   1.72   0.81   0.62
+//! ```
+//!
+//! P-8 said dropping the barrier would not help below four hops. That is wrong,
+//! and wrong by a lot at the short end: one hop on a single shard is 4.64x and
+//! three hops on eight shards is 2.58x. The barrier costs a full round trip per
+//! hop whether or not there is anything to synchronise, and on a walk that only
+//! has one or two hops in it that round trip is most of the walk.
+//!
+//! What P-8 got right is that the barrier pays for something, and the bottom
+//! right of that table is where the bill arrives. At eight shards the wavefront
+//! loses at five hops and loses badly at six, 2.31 ms against 1.43 ms. The
+//! reason is the repeated work described above. The frontier at six hops is the
+//! whole graph, so the chance that a node is claimed by a deeper wave first and
+//! has to be expanded again is at its highest exactly when there is the most of
+//! it to expand, and more shards means more waves in flight to be out of order
+//! with each other. At one and four shards there are not enough waves for that
+//! to overtake the barrier cost within six hops.
+//!
+//! So the honest reading is that neither strategy is the right one everywhere,
+//! and the crossover is a function of shard count and hop count rather than of
+//! hop count alone. Short walks, which is what a query actually issues most of,
+//! want the wavefront. A walk deep enough to saturate the graph on a machine
+//! with many shards wants the barrier. Picking between them at plan time off
+//! the requested hop count and the shard count is cheap, and it is what `11`
+//! section 4 should say instead of stating one cost model for both.
+//!
+//! The laptop disagrees with all of this and says the wavefront wins at every
+//! hop count, which is what it would say: its load average sits near sixty, so
+//! a barrier that waits for the slowest shard is waiting on the scheduler and
+//! not on the work. That is a real effect on a loaded machine and it is worth
+//! knowing, but it is not the number that goes in the spec.
 
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use std::hint::black_box;
