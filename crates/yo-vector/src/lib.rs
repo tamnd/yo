@@ -69,11 +69,20 @@
 //! Chamfer, so it costs an encode at write time, the index that is already
 //! here, and [`muvera::chamfer`] as the rerank. There is no second index.
 //!
-//! The HNSW compatibility view and writing any of this to a `.yo` file are the
-//! rest of M6.
+//! [`hnsw`] is the compatibility view. Clients pass `M`, `EF_CONSTRUCTION` and
+//! `EF_RUNTIME` and expect them to do something, because against Redis and
+//! valkey they do, and there is no graph here to point them at. So each one is
+//! mapped onto whatever it was actually for: build effort becomes the posting
+//! size, search beam becomes the probe and the rerank width, and `M` is the out
+//! degree of a graph that does not exist, so it is echoed back and changes
+//! nothing. A client that asked for HNSW and meant it can say so and be
+//! refused rather than quietly served something else.
+//!
+//! Writing any of this to a `.yo` file is the rest of M6.
 
 #![deny(missing_docs)]
 
+pub mod hnsw;
 pub mod muvera;
 pub mod partition;
 pub mod rabitq;

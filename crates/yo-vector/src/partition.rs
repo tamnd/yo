@@ -94,7 +94,7 @@ pub trait Vectors {
 
 /// The knobs, all of which have a defensible default and none of which anybody
 /// should have to touch.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Tuning {
     /// How many members a partition wants. It splits past twice this and merges
     /// under a quarter of it.
