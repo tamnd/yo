@@ -35,14 +35,14 @@
 //!
 //! ```text
 //!   probe     scanned  candidates      search      rerank
-//!       1         376         58us         88us         30us
-//!       8        3005         81us        114us         33us
-//!      32       12021        168us        195us         26us
-//!      64       24042        256us        290us         33us
-//!     128       48084        463us        518us         54us
+//!       1         376         64us         94us         29us
+//!       8        3005         93us        124us         31us
+//!      32       12021        153us        185us         32us
+//!      64       24042        226us        257us         31us
+//!     128       48084        376us        402us         26us
 //!
-//! ranking 1331 centroids: 57 us
-//! scanning one partition of 376: 3.2 us
+//! ranking 1331 centroids: 70 us
+//! scanning one partition of 376: 2.4 us
 //! ```
 //!
 //! Rerank is flat, which is what it should be, because the number of candidates
@@ -58,12 +58,24 @@
 //! on the hot path costs more than some of the things it measures, and the
 //! numbers are written down here instead.
 //!
-//! Where it stands now, at probe 64: 60 microseconds ranking, 33 preparing, 127
-//! scanning and 32 selecting. The scan is still half of it at 5.3 nanoseconds a
-//! member, and the next two are worth having. Preparing a query is a residual
-//! and a quantisation per partition and it allocates twice, and selecting is a
-//! sort of everything the scan found when only the best `want` of it can
-//! possibly matter.
+//! Selecting was the other one. The scan used to push every member it looked at
+//! into one vector and then pick the best `k` times `rerank` out of it, which at
+//! probe 64 is 24 thousand entries written and read back to keep 160, and a
+//! bounded heap does the same job with one comparison for a member that is not
+//! going to win. That took probe 64 from 290 microseconds to 257 and probe 128
+//! from 518 to 402.
+//!
+//! Where it stands now, at probe 64: 70 microseconds ranking centroids, about 26
+//! preparing, 127 scanning and what little is left of selecting. The scan is
+//! still more than half of it at 5.3 nanoseconds a member.
+//!
+//! Ranking is the next one worth having. It is 53 nanoseconds a centroid for a
+//! 128 dimensional distance, plus two allocations the size of the centroid count
+//! and a selection over all of them, and none of that has been looked at yet.
+//! Preparing a query is a residual and a quantisation per partition and it
+//! allocates twice, and it is 413 nanoseconds a partition at this dimension
+//! against 936 for the rotation the whole search shares once, so the rotation is
+//! not the thing to chase there.
 
 use std::time::{Duration, Instant};
 use yo_common::Rng;

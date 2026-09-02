@@ -251,8 +251,9 @@ impl Quantizer {
         let mut x = self.residual(v, centroid);
         let norm = length(&x);
         if norm > 0.0 {
+            let by = 1.0 / norm;
             for c in &mut x {
-                *c /= norm;
+                *c *= by;
             }
         }
         self.rot.apply(&mut x);
@@ -269,8 +270,9 @@ impl Quantizer {
         let mut r = self.residual(x, centroid);
         let norm = length(&r);
         if norm > 0.0 {
+            let by = 1.0 / norm;
             for c in &mut r {
-                *c /= norm;
+                *c *= by;
             }
         }
         self.write(&r, norm, code)
@@ -318,8 +320,9 @@ impl Quantizer {
         let mut x = self.residual(q, centroid);
         let norm = length(&x);
         if norm > 0.0 {
+            let by = 1.0 / norm;
             for c in &mut x {
-                *c /= norm;
+                *c *= by;
             }
         }
         self.rot.apply(&mut x);
@@ -340,8 +343,9 @@ impl Quantizer {
         let mut x = self.residual(q, centroid);
         let norm = length(&x);
         if norm > 0.0 {
+            let by = 1.0 / norm;
             for c in &mut x {
-                *c /= norm;
+                *c *= by;
             }
         }
         self.prepare(x, norm)
@@ -359,9 +363,10 @@ impl Quantizer {
         let top = (1u64 << wide) - 1;
         let (lo, hi) = span(&x);
         let delta = step(lo, hi, top);
+        let by = 1.0 / delta;
         let mut planes = vec![0u64; wide * words];
         for (i, &c) in x.iter().enumerate() {
-            let level = level_of(c, lo, delta, top);
+            let level = level_of(c, lo, by, top);
             for (b, plane) in planes.chunks_exact_mut(words).enumerate() {
                 plane[i / 64] |= ((level >> b) & 1) << (i % 64);
             }
@@ -597,8 +602,12 @@ fn step(lo: f32, hi: f32, top: u64) -> f32 {
 }
 
 /// Which level a coordinate rounds to.
-fn level_of(c: f32, lo: f32, delta: f32, top: u64) -> u64 {
-    (((c - lo) / delta).round() as i64).clamp(0, top as i64) as u64
+///
+/// `by` is one over the step rather than the step, because this runs once per
+/// coordinate on both the encode path and the query path and a float division
+/// per coordinate is not worth paying twice for one number.
+fn level_of(c: f32, lo: f32, by: f32, top: u64) -> u64 {
+    (((c - lo) * by).round() as i64).clamp(0, top as i64) as u64
 }
 
 /// Write one word of one plane.
@@ -642,12 +651,13 @@ fn level_code(x: &[f32], code: &mut [u8]) -> Coded {
     let top = Bits::Four.top();
     let (lo, hi) = span(x);
     let delta = step(lo, hi, top);
+    let by = 1.0 / delta;
     let mut recon = 0.0f32;
     let mut dot = 0.0f32;
     for (w, chunk) in x.chunks(64).enumerate() {
         let mut planes = [0u64; 4];
         for (k, &c) in chunk.iter().enumerate() {
-            let level = level_of(c, lo, delta, top);
+            let level = level_of(c, lo, by, top);
             for (b, plane) in planes.iter_mut().enumerate() {
                 *plane |= ((level >> b) & 1) << k;
             }

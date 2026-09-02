@@ -55,13 +55,17 @@
 //! so.
 //!
 //! The row that is now worth watching is `query` against `scan`. Preparing a
-//! query is 9.8 microseconds at 768 dimensions and scanning a partition of a
+//! query is 9.4 microseconds at 768 dimensions and scanning a partition of a
 //! thousand codes is 12.4, so the preparation is no longer lost in the noise,
-//! and it got worse rather than better when the scan got faster. It happens
-//! once per partition probed, because the residual is taken against that
-//! partition's centroid, and a search probes tens of them. `examples/search.rs`
-//! puts it at a tenth of a search at 128 dimensions and it will be more than
-//! that at 768.
+//! and it got worse rather than better when the scan got faster.
+//!
+//! What this row measures is not quite what a search pays, though, and the
+//! difference matters. `query` is a rotation and then a residual and a
+//! quantisation, and the rotation is 7.2 of those 9.4 microseconds. A search
+//! rotates once and then takes a residual against each partition it probes, so
+//! the per partition cost is the other 2.2, and the rotation is amortised over
+//! tens of partitions rather than paid by each of them, which is what the
+//! `rotated` rows are here to keep honest.
 //!
 //! # Reading these on a machine someone else is using
 //!
@@ -197,6 +201,14 @@ fn bench_query(c: &mut Criterion) {
         let q = Quantizer::new(dim, Bits::One, 7);
         g.bench_with_input(BenchmarkId::from_parameter(dim), &dim, |b, _| {
             b.iter(|| black_box(q.query(black_box(&query), &centroid)));
+        });
+        // The same without the rotation, which is what a search pays per
+        // partition it probes. The rotation happens once for the whole search
+        // and the residual and the quantisation happen once per partition, so
+        // this is the row that scales with `probe` and the one above is not.
+        let rotated = q.rotate(&query);
+        g.bench_with_input(BenchmarkId::new("rotated", dim), &dim, |b, _| {
+            b.iter(|| black_box(q.query_rotated(black_box(&rotated), &centroid)));
         });
     }
     g.finish();
