@@ -21,6 +21,14 @@
 //! finds the giant component out of a two neighbour sample and then only looks
 //! at the edges of the nodes that are not in it.
 //!
+//! [`pagerank()`] is the pull form, which is the one the GAP suite measures, with
+//! the mass that lands on a dead end handed back out rather than dropped, which
+//! is what the 1999 paper describes and what GAP leaves out.
+//!
+//! [`triangle_count()`] is the ordered count from Schank and Wagner at WEA 2005
+//! under the degree ordering Ortmann and Brandes recommend at ALENEX 2014, so a
+//! hub is intersected against almost nothing rather than against everybody.
+//!
 //! # Why they are deterministic
 //!
 //! Two of them sample, and both sample from [`yo_common::Rng`] with a fixed
@@ -32,9 +40,13 @@
 //! crate.
 
 pub mod bfs;
+pub mod pagerank;
+pub mod triangle;
 pub mod wcc;
 
 pub use bfs::{UNREACHED, bfs};
+pub use pagerank::{Rank, pagerank, pagerank_with};
+pub use triangle::triangle_count;
 pub use wcc::{Components, wcc};
 
 /// A bit per node, which is how a frontier is held when it is big.

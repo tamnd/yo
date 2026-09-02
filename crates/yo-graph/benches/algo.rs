@@ -12,34 +12,54 @@
 //!     gap is the whole reason the switch is in there.
 //!   - `algo/wcc` compares Afforest against plain union find over every edge.
 //!     Same answer again, and the gap is what the two neighbour sample buys.
+//!   - `algo/pagerank` compares ten rounds pulled against ten rounds pushed.
+//!     Identical arithmetic in a different order, so the gap is entirely about
+//!     which array gets written to at a random offset.
+//!   - `algo/triangle count` compares the degree ordering against numbering the
+//!     nodes in the order they already had. Same count, and the gap is the
+//!     Ortmann and Brandes point about the ordering being the algorithm.
 //!
 //! # The graph
 //!
-//! R-MAT at the Graph500 probabilities, scale 18 and degree 16, which is 262
-//! thousand nodes and 4.2 million edges. That is the standard synthetic social
-//! graph and it is the shape both of these algorithms are written for: a heavy
-//! tail, a giant component, and a search whose middle levels hold nearly all of
-//! the edges. A uniform random graph would flatter neither algorithm and would
-//! not be what anybody runs them on.
+//! R-MAT at the Graph500 probabilities, scale 18 and degree 16, which is 262144
+//! nodes and 4194304 edges. That is the standard synthetic social graph and it
+//! is the shape these algorithms are written for: a heavy tail, a giant
+//! component, and a search whose middle levels hold nearly all of the edges. A
+//! uniform random graph would flatter none of them and would not be what anybody
+//! runs them on.
+//!
+//! Counting triangles is superlinear in the edge count, so it gets its own
+//! smaller graph, scale 15 at the same degree, which is 32768 nodes, 524288
+//! edges and 6665423 triangles. On the big one a single count is seven seconds,
+//! which is a real number and not one worth paying twenty times on every run.
 //!
 //! # Where it stands
 //!
-//! One core of an Apple M4, over the graph above, which comes out as 262144
-//! nodes and 4194304 edges once it is built. Minimum per iteration.
+//! One core each, minimum per iteration, on an Apple M4 and on an i9-13900K.
 //!
-//! | Row | Time | Rate |
-//! |---|---|---|
-//! | `snapshot` | 29.59 ms | 7.1 ns an edge |
-//! | `bfs/direction optimizing` | 1.89 ms | 2.21 billion edges a second |
-//! | `bfs/top down` | 6.30 ms | 0.67 billion edges a second |
-//! | `wcc/afforest` | 3.37 ms | 1.25 billion edges a second |
-//! | `wcc/union find` | 11.28 ms | 0.37 billion edges a second |
+//! | Row | M4 | 13900K | Rate on the M4 |
+//! |---|---|---|---|
+//! | `snapshot` | 29.58 ms | 41.01 ms | 7.1 ns an edge |
+//! | `bfs/direction optimizing` | 1.89 ms | 2.02 ms | 2.21 billion edges a second |
+//! | `bfs/top down` | 6.30 ms | 5.87 ms | 0.67 billion edges a second |
+//! | `wcc/afforest` | 3.37 ms | 3.55 ms | 1.25 billion edges a second |
+//! | `wcc/union find` | 11.28 ms | 21.29 ms | 0.37 billion edges a second |
+//! | `pagerank/pull 10 rounds` | 35.42 ms | not run yet | 1.18 billion edges a second a round |
+//! | `pagerank/push 10 rounds` | 37.11 ms | not run yet | 1.13 billion edges a second a round |
+//! | `triangle count/degree ordered` | 106.9 ms | not run yet | 62.4 million triangles a second |
+//! | `triangle count/unordered` | 277.6 ms | not run yet | 24.0 million triangles a second |
 //!
-//! So the direction switch is worth 3.33x and the two neighbour sample is worth
-//! 3.35x, both on a single core with no threads anywhere in either of them. The
-//! rates count every edge in the graph rather than only the ones the algorithm
-//! looked at, which is the honest way round: an algorithm that skips edges is
-//! supposed to get the credit for skipping them.
+//! The direction switch is worth 3.33x, the two neighbour sample is worth 3.35x
+//! and the degree ordering is worth 2.60x, all on a single core with no threads
+//! anywhere in any of them. The rates count every edge in the graph rather than
+//! only the ones the algorithm looked at, which is the honest way round: an
+//! algorithm that skips edges is supposed to get the credit for skipping them.
+//!
+//! Pulling beats pushing by 5 percent here and that is smaller than it looks,
+//! because at 262 thousand nodes the score array is a megabyte and stays in
+//! cache, so a random write into it costs about what a random read does. The
+//! gap is the reason to prefer the pull form rather than the size of the prize,
+//! and it grows with the graph.
 //!
 //! Taking the snapshot costs about as much as five breadth first searches, and
 //! it is worth saying plainly that a caller who wants one search over a graph
@@ -56,12 +76,15 @@
 use criterion::{Criterion, criterion_group, criterion_main};
 use std::hint::black_box;
 use yo_common::Rng;
-use yo_graph::algo::{UNREACHED, bfs, wcc};
+use yo_graph::algo::pagerank::DAMPING;
+use yo_graph::algo::{UNREACHED, bfs, pagerank_with, triangle_count, wcc};
 use yo_graph::{Graph, NO_PROPS, Snapshot};
 
 const LABEL: u32 = 1;
 const SCALE: u32 = 18;
 const DEGREE: u32 = 16;
+const SMALL: u32 = 15;
+const ROUNDS: u32 = 10;
 
 /// R-MAT with the Graph500 probabilities.
 fn rmat(scale: u32, degree: u32, seed: u64) -> Vec<(u64, u64)> {
@@ -89,12 +112,35 @@ fn rmat(scale: u32, degree: u32, seed: u64) -> Vec<(u64, u64)> {
 }
 
 fn build(scale: u32, degree: u32) -> Graph {
+    build_with(scale, degree, false)
+}
+
+/// The graph, optionally with the node ids shuffled first.
+///
+/// R-MAT hands out its highest degree nodes at its lowest ids, because that is
+/// what the recursion does, so a graph left in that numbering arrives at any
+/// algorithm already sorted by degree. That is not what a real graph looks like
+/// and it quietly hands the win to whichever variant was going to benefit from
+/// a degree order. Shuffling costs nothing, changes no answer, since none of
+/// these is a question about node ids, and makes the comparison the one that
+/// matters.
+fn build_with(scale: u32, degree: u32, shuffle: bool) -> Graph {
+    let n = 1u64 << scale;
+    let mut name: Vec<u64> = (0..n).collect();
+    if shuffle {
+        let mut rng = Rng::new(0x5eed);
+        for at in (1..n as usize).rev() {
+            name.swap(at, (rng.next_u64() % (at as u64 + 1)) as usize);
+        }
+    }
+
     let mut g = Graph::new();
-    for id in 0..1u64 << scale {
-        g.add_node(id).expect("a node");
+    for id in &name {
+        g.add_node(*id).expect("a node");
     }
     for (src, dst) in rmat(scale, degree, 0x9e37) {
-        g.link(src, dst, LABEL, NO_PROPS).expect("an edge");
+        g.link(name[src as usize], name[dst as usize], LABEL, NO_PROPS)
+            .expect("an edge");
     }
     g
 }
@@ -145,6 +191,74 @@ fn union_find(g: &Snapshot) -> Vec<u32> {
     of
 }
 
+/// The same rounds of PageRank written the other way round, walking outgoing
+/// edges and adding into the neighbour, as the thing pulling has to beat.
+fn push(g: &Snapshot, rounds: u32) -> Vec<f32> {
+    let n = g.nodes() as usize;
+    let d = DAMPING;
+    let mut score = vec![1.0 / n as f32; n];
+    let mut next = vec![0f32; n];
+    for _ in 0..rounds {
+        next.fill(0.0);
+        let mut stuck = 0f64;
+        for (node, score) in score.iter().enumerate() {
+            let out = g.out_degree(node as u32);
+            if out == 0 {
+                stuck += f64::from(*score);
+                continue;
+            }
+            let share = score / out as f32;
+            for to in g.out(node as u32) {
+                next[*to as usize] += share;
+            }
+        }
+        let base = ((1.0 - f64::from(d)) + f64::from(d) * stuck) / n as f64;
+        for node in 0..n {
+            score[node] = (base + f64::from(d) * f64::from(next[node])) as f32;
+        }
+    }
+    score
+}
+
+/// The same triangle count with the nodes left in the order they came in,
+/// which is the ordering the degree ordering has to beat.
+fn triangles_unordered(g: &Snapshot) -> u64 {
+    let n = g.nodes() as usize;
+    let mut up: Vec<Vec<u32>> = vec![Vec::new(); n];
+    for node in 0..n as u32 {
+        for other in g.out(node).iter().chain(g.into_(node)) {
+            if *other > node {
+                up[node as usize].push(*other);
+            } else if *other < node {
+                up[*other as usize].push(node);
+            }
+        }
+    }
+    for mine in &mut up {
+        mine.sort_unstable();
+        mine.dedup();
+    }
+    let mut found = 0u64;
+    for node in 0..n {
+        for other in &up[node] {
+            let (a, b) = (&up[node], &up[*other as usize]);
+            let (mut i, mut j) = (0, 0);
+            while i < a.len() && j < b.len() {
+                match a[i].cmp(&b[j]) {
+                    std::cmp::Ordering::Less => i += 1,
+                    std::cmp::Ordering::Greater => j += 1,
+                    std::cmp::Ordering::Equal => {
+                        found += 1;
+                        i += 1;
+                        j += 1;
+                    }
+                }
+            }
+        }
+    }
+    found
+}
+
 fn bench_algo(c: &mut Criterion) {
     let g = build(SCALE, DEGREE);
     let s = Snapshot::of(&g);
@@ -155,6 +269,30 @@ fn bench_algo(c: &mut Criterion) {
         .expect("a node");
     assert_eq!(bfs(&s, src), top_down(&s, src), "the same search");
     assert_eq!(wcc(&s).labels(), union_find(&s), "the same components");
+    let pulled = pagerank_with(&s, DAMPING, 0.0, ROUNDS);
+    let pushed = push(&s, ROUNDS);
+    let apart = pulled
+        .scores()
+        .iter()
+        .zip(&pushed)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0f32, f32::max);
+    assert!(apart < 1e-5, "the same rounds, {apart} apart");
+    // Counting triangles is superlinear in the edge count, so it gets its own
+    // smaller graph. On the big one a single count is seven seconds, which is a
+    // real number and not one worth paying twenty times over on every run.
+    let small = Snapshot::of(&build_with(SMALL, DEGREE, true));
+    assert_eq!(
+        triangle_count(&small),
+        triangles_unordered(&small),
+        "the same triangles"
+    );
+    eprintln!(
+        "the small graph has {} nodes, {} edges and {} triangles",
+        small.nodes(),
+        small.edges(),
+        triangle_count(&small)
+    );
 
     let mut group = c.benchmark_group("algo");
     group.sample_size(20);
@@ -172,6 +310,21 @@ fn bench_algo(c: &mut Criterion) {
     });
     group.bench_function("wcc/union find", |b| {
         b.iter(|| black_box(union_find(black_box(&s))));
+    });
+    // A fixed count of rounds rather than a run to convergence, so the number
+    // is a round and not a property of how quickly this particular graph
+    // settles.
+    group.bench_function("pagerank/pull 10 rounds", |b| {
+        b.iter(|| black_box(pagerank_with(black_box(&s), DAMPING, 0.0, ROUNDS)));
+    });
+    group.bench_function("pagerank/push 10 rounds", |b| {
+        b.iter(|| black_box(push(black_box(&s), ROUNDS)));
+    });
+    group.bench_function("triangle count/degree ordered", |b| {
+        b.iter(|| black_box(triangle_count(black_box(&small))));
+    });
+    group.bench_function("triangle count/unordered", |b| {
+        b.iter(|| black_box(triangles_unordered(black_box(&small))));
     });
     group.finish();
 }
