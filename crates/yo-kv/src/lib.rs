@@ -164,6 +164,7 @@ pub mod streams;
 pub mod strings;
 #[cfg(test)]
 mod tally;
+pub mod tier;
 pub mod ttl;
 pub mod value;
 pub mod walk;
