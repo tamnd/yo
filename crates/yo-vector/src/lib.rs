@@ -38,16 +38,28 @@
 //! estimator costs with the query left in floats. `benches/rabitq.rs` runs both
 //! so the ratio is measured rather than remembered.
 //!
-//! The partitions themselves, the LIRE update protocol, filtered search, MUVERA
-//! and the HNSW compatibility view are the rest of M6 and are not here yet.
-//! Preparing a query is 10 microseconds and it happens once per partition
-//! probed, which the partition store fixes by rotating its centroids once when
-//! it builds them rather than rotating the query again for each of them.
+//! [`Partitions`] is the index over those codes. A vector belongs to the
+//! partition whose centroid it is nearest, a partition's members are a flat run
+//! of codes, an insert is an append and a delete moves the last member into the
+//! hole. A search ranks the centroids, scans the nearest few postings, and then
+//! measures the best handful properly against the full precision vectors. It
+//! splits, merges and reassigns in bounded steps as it goes, which is SPFresh's
+//! LIRE, and it is why there is never a rebuild.
+//!
+//! The centroids are kept already rotated, which matters more than it sounds
+//! like it should. Preparing a query is mostly the rotation and it happens once
+//! per partition probed, so rotating the centroids once when they are built
+//! turns tens of rotations a search into one.
+//!
+//! Filtered search, MUVERA, the HNSW compatibility view and writing any of this
+//! to a `.yo` file are the rest of M6.
 
 #![deny(missing_docs)]
 
+pub mod partition;
 pub mod rabitq;
 pub mod rotate;
 
+pub use partition::{Hit, Partitions, Tuning, Vectors};
 pub use rabitq::{Bits, Coded, Quantizer, Query};
 pub use rotate::Rotation;
