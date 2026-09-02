@@ -55,7 +55,7 @@ pub const EXHAUSTED: &str =
 ///
 /// Redis's wording, run on sentence and all, because it goes on the wire
 /// verbatim and a client's test suite compares it.
-pub const NO_KEY_FOR_GROUP: &str = "The XGROUP subcommand requires the key to exist. Note that for CONSUMERGROUP CREATE you may want to use the MKSTREAM option to create an empty stream automatically.";
+pub const NO_KEY_FOR_GROUP: &str = "The XGROUP subcommand requires the key to exist. Note that for CREATE you may want to use the MKSTREAM option to create an empty stream automatically.";
 
 /// What `XGROUP CREATE` says about a group that is already there.
 ///
@@ -71,17 +71,51 @@ pub const SETID_TOO_SMALL: &str =
 /// What a command that needs the key says when it is not there.
 pub const NO_SUCH_KEY: &str = "no such key";
 
-/// The message a missing group gets, which carries both names.
+/// What `XGROUP` and `XINFO CONSUMERS` say about a group that is not there.
 ///
 /// A function rather than a constant because Redis puts the group and the key
 /// in it, and a client watching for a particular group in its logs is reading
 /// exactly that. It goes out under a `NOGROUP` prefix.
+///
+/// There are three of these and they are not interchangeable. This is the one
+/// the commands that only ever name one key use. Every wording here was read
+/// off Redis 8.10.1, since the difference between them is not something the
+/// documentation mentions and a client library matching on the text would break
+/// on a paraphrase.
 #[must_use]
 pub fn no_group(group: &[u8], key: &[u8]) -> String {
     format!(
         "No such consumer group '{}' for key name '{}'",
         String::from_utf8_lossy(group),
         String::from_utf8_lossy(key)
+    )
+}
+
+/// What `XPENDING`, `XCLAIM` and `XAUTOCLAIM` say instead.
+///
+/// The key comes first here and the sentence allows for either half being the
+/// missing one, because these commands cannot tell a stream with no such group
+/// from a key that is not a stream at all without looking twice.
+#[must_use]
+pub fn no_key_or_group(key: &[u8], group: &[u8]) -> String {
+    format!(
+        "No such key '{}' or consumer group '{}'",
+        String::from_utf8_lossy(key),
+        String::from_utf8_lossy(group)
+    )
+}
+
+/// And what `XREADGROUP` says, which is the one above with its own tail.
+///
+/// The tail is there because `XREADGROUP` is the command people send by
+/// accident against a stream they never made a group on, so Redis spells out
+/// which option is at fault.
+#[must_use]
+pub fn no_group_for_read(key: &[u8], group: &[u8]) -> String {
+    format!(
+        "No such key '{}' or consumer group '{}' in XREADGROUP with GROUP option",
+        String::from_utf8_lossy(key),
+        String::from_utf8_lossy(group)
     )
 }
 
@@ -416,7 +450,12 @@ impl Keyspace {
         };
         let s = self.stream_at(slot);
         let last = position(s, at);
-        Ok(s.create_group(group, last, read.or(Some(0))))
+        // `read` and not a zero for a group with no `ENTRIESREAD`. A fresh group
+        // does not know how many entries are behind it, and saying zero would be
+        // a claim rather than a default: `XINFO GROUPS` reports the counter as
+        // null on a real server until something sets it, and the lag is worked
+        // out from where the bookmark sits instead.
+        Ok(s.create_group(group, last, read))
     }
 
     /// `XGROUP DESTROY key group`. Answers whether there was one.
@@ -920,6 +959,36 @@ mod tests {
         }
     }
 
+    /// A new group has no read counter and still has a lag, because the two are
+    /// worked out separately.
+    ///
+    /// Both lines are Redis 8.10.1's: `XINFO GROUPS` on a group made with no
+    /// `ENTRIESREAD` reports the counter as null whichever position it was made
+    /// at, and reports a lag of the whole stream at `0` and of zero at `$`.
+    #[test]
+    fn a_new_group_has_no_read_counter() {
+        let mut d = db();
+        for ms in 1..=5 {
+            add(&mut d, b"s", Add::At(Id::new(ms, 0)));
+        }
+
+        assert!(
+            d.xgroup_create(b"s", b"early", Start::At(Id::MIN), false, None)
+                .expect("a stream")
+        );
+        assert!(
+            d.xgroup_create(b"s", b"late", Start::Last, false, None)
+                .expect("a stream")
+        );
+        let s = d.stream(b"s").expect("a stream").expect("the key");
+        let early = s.group(b"early").expect("the early group");
+        assert_eq!(early.entries_read(), None);
+        assert_eq!(s.lag(early), Some(5), "everything is still in front of it");
+        let late = s.group(b"late").expect("the late group");
+        assert_eq!(late.entries_read(), None);
+        assert_eq!(s.lag(late), Some(0), "and nothing is in front of this one");
+    }
+
     #[test]
     fn a_group_reads_what_arrives_after_it_was_made() {
         let mut d = db();
@@ -990,7 +1059,7 @@ mod tests {
         let g = s.group(b"workers").expect("the group");
         assert_eq!(g.pending_len(), 0, "nothing was written down");
         assert_eq!(g.last_id(), Id::new(1, 0), "the bookmark still moved");
-        assert_eq!(g.lag(s.added()), Some(0), "and the group has caught up");
+        assert_eq!(s.lag(g), Some(0), "and the group has caught up");
     }
 
     #[test]

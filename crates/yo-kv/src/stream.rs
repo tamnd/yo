@@ -104,6 +104,7 @@
 //! delete from in bulk. The node's master entry counts how many of its entries
 //! are dead, and a node whose last live entry goes is dropped whole.
 
+use std::cmp::Ordering;
 use std::collections::VecDeque;
 
 use yo_common::num::{DIGITS_MAX, i64_digits, push_u64, u64_digits};
@@ -330,6 +331,97 @@ struct Node {
     /// is deleted, because the differences behind it are relative to it.
     master: Id,
     lp: Listpack,
+}
+
+/// What a stream looks like from the outside, for working out a group's
+/// counters.
+///
+/// Five numbers taken together at one moment. The reason they travel as a
+/// bundle is that both rules below read several of them and the answers have to
+/// come from the same instant, and the reason it is a private type is that
+/// nobody outside wants five loose numbers, they want [`Stream::lag`].
+#[derive(Debug, Clone, Copy)]
+struct Edges {
+    added: u64,
+    length: u64,
+    first: Option<Id>,
+    last: Id,
+    max_deleted: Id,
+}
+
+impl Edges {
+    /// How many entries a reader sitting at `id` must have passed, when that is
+    /// exactly knowable, which is the three positions where it is.
+    ///
+    /// At or past the last ID ever handed out, everything that was ever added
+    /// has gone by. Below the oldest entry left, with nothing deleted inside
+    /// what is left, everything that has gone is behind and the length is what
+    /// is in front. Exactly on the oldest entry left, the same plus one.
+    ///
+    /// Anywhere else the answer is genuinely unknown rather than approximate,
+    /// because working it out would mean counting the entries between here and
+    /// there, and that is the walk the whole counter exists to avoid.
+    fn estimate(&self, id: Id) -> Option<u64> {
+        if self.added == 0 {
+            return Some(0);
+        }
+        if id >= self.last {
+            return Some(self.added);
+        }
+        let first = self.first?;
+        // A hole below the oldest entry left is not a hole in what is left, so
+        // the subtraction below still holds. That is the case a trim makes, and
+        // it is why a trim does not cost a group its lag.
+        if self.max_deleted != Id::MIN && self.max_deleted >= first {
+            return None;
+        }
+        let behind = self.added - self.length;
+        match id.cmp(&first) {
+            Ordering::Less => Some(behind),
+            Ordering::Equal => Some(behind + 1),
+            Ordering::Greater => None,
+        }
+    }
+
+    /// Whether anything has been deleted at or above `id`.
+    ///
+    /// Only [`Stream::delete`] moves `max_deleted`, so a trim does not count,
+    /// and a stream with nothing left in it does not either, since there is no
+    /// gap in an empty stream for a reader to fall into.
+    fn holed_from(&self, id: Id) -> bool {
+        if self.length == 0 || self.max_deleted == Id::MIN {
+            return false;
+        }
+        if self.first.is_some_and(|first| first > self.max_deleted) {
+            return false;
+        }
+        id <= self.max_deleted
+    }
+
+    /// A group's lag, the good way first and the subtraction second.
+    fn lag(&self, group: &Group) -> Option<u64> {
+        if let Some(read) = self.estimate(group.last_id()) {
+            return Some(self.added.saturating_sub(read));
+        }
+        let read = group.entries_read()?;
+        if self.holed_from(group.last_id()) {
+            return None;
+        }
+        Some(self.added.saturating_sub(read))
+    }
+
+    /// What a group's read counter becomes once `id` has been handed out.
+    ///
+    /// One more than it was, while it is known and nothing has been deleted
+    /// ahead of the entry just delivered. Otherwise the estimate above gets a
+    /// go, which is what lets a group that has read all the way to the end come
+    /// back from not knowing.
+    fn on_deliver(&self, group: &Group, id: Id) -> Option<u64> {
+        match group.entries_read() {
+            Some(read) if !self.holed_from(id) => Some(read + 1),
+            _ => self.estimate(id),
+        }
+    }
 }
 
 /// A log of entries in ID order.
@@ -585,31 +677,42 @@ impl Stream {
             bump(&mut node.lp, -1, 1);
         }
         self.length -= 1;
-        self.lose_counts_above(id);
         true
     }
 
-    /// Tell any group that had not reached `id` that it has lost count.
+    /// The five facts every counter a group keeps is worked out from.
     ///
-    /// A group works out its lag by subtracting what it has read from what the
-    /// stream has ever added, and that only holds while every entry between the
-    /// two is still there. Taking an entry the group had not read yet breaks it,
-    /// because the group will now read one fewer than the subtraction says.
-    ///
-    /// Taking an entry the group is already past does not, which is why this
-    /// compares against the bookmark rather than clearing every group. That is
-    /// Redis's rule and it is the one that matters in practice, since trimming
-    /// the old end of a stream is normal and a group that is keeping up should
-    /// not lose its lag because of it.
-    ///
-    /// It never comes back. Redis does not recover the count when the group
-    /// later reads to the end, and neither does this.
-    fn lose_counts_above(&mut self, id: Id) {
-        for (_, g) in &mut self.groups {
-            if id > g.last_id() {
-                g.lose_count();
-            }
+    /// Read once and carried, rather than asked for again per entry, because
+    /// [`Stream::first_id`] walks a node and a delivery cannot change any of the
+    /// five: handing an entry to a consumer neither adds one nor removes one.
+    fn edges(&self) -> Edges {
+        Edges {
+            added: self.added,
+            length: self.length,
+            first: self.first_id(),
+            last: self.last,
+            max_deleted: self.max_deleted,
         }
+    }
+
+    /// How far behind a group is, or `None` when that cannot be worked out.
+    ///
+    /// Two ways of answering and the good one is tried first. If the group's
+    /// bookmark is somewhere the distance from the start of time is exactly
+    /// known, which is the last ID, past it, or before the first entry left,
+    /// that distance is the answer. Otherwise the group's own counter will do,
+    /// but only while nothing has been deleted at or above the bookmark, since
+    /// a hole ahead of the group means it will read fewer entries than the
+    /// subtraction is expecting.
+    ///
+    /// Both paths and their order were read off Redis 8.10.1 rather than worked
+    /// out, because reasoning gives the wrong answer on the case that matters:
+    /// a group sitting at `0-0` on a stream trimmed from five entries to two
+    /// reports a lag of two and not five, which is the estimate winning over a
+    /// subtraction that is valid and is further from the truth.
+    #[must_use]
+    pub fn lag(&self, group: &Group) -> Option<u64> {
+        self.edges().lag(group)
     }
 
     /// Cut the stream down to `len` entries, dropping the oldest, which is
@@ -632,11 +735,9 @@ impl Stream {
             };
             let (count, _) = counts(&node.lp);
             if self.length - count >= len {
-                let top = last_of(node);
                 self.length -= count;
                 gone += count;
                 self.nodes.pop_front();
-                self.lose_counts_above(top);
                 continue;
             }
             if !exact {
@@ -661,11 +762,9 @@ impl Stream {
             }
             let (count, _) = counts(&node.lp);
             if last_of(node) < id {
-                let top = last_of(node);
                 self.length -= count;
                 gone += count;
                 self.nodes.pop_front();
-                self.lose_counts_above(top);
                 continue;
             }
             if !exact {
@@ -825,6 +924,9 @@ impl Stream {
     where
         F: FnMut(Id, Fields<'_>) -> bool,
     {
+        // Before the split borrow, because it walks a node and the walk below
+        // holds the nodes. Nothing a delivery does can change any of it.
+        let edges = self.edges();
         // Field by field, so that walking the nodes and writing the pending list
         // are two borrows the compiler can see are disjoint.
         let Stream { nodes, groups, .. } = self;
@@ -838,11 +940,15 @@ impl Stream {
         };
         let mut seen = 0;
         walk_nodes(nodes, from, Id::MAX, count, &mut |id, fields| {
+            // Worked out before the bookmark moves, because the rule asks where
+            // the group was when the entry was handed over.
+            let read = edges.on_deliver(g, id);
             if noack {
                 g.skip(id);
             } else {
                 g.deliver(slot, id, now);
             }
+            g.set_read(read);
             seen += 1;
             f(id, fields)
         });
@@ -2137,7 +2243,7 @@ mod tests {
         assert_eq!(g.pending_len(), 3);
         assert_eq!(g.last_id(), Id::new(3, 0));
         assert_eq!(g.entries_read(), Some(3));
-        assert_eq!(g.lag(s.added()), Some(0));
+        assert_eq!(s.lag(g), Some(0));
         let c = g.consumer_named(b"alice").expect("alice");
         assert_eq!(c.len(), 3);
         assert_eq!(c.active(), 500);
@@ -2236,43 +2342,64 @@ mod tests {
         assert_eq!(g.pending_len(), 2);
     }
 
-    /// Lag is a subtraction and it only holds while nothing has gone missing in
-    /// front of the group.
+    /// The lag and the read counter, which are two answers and not one.
     ///
-    /// All four cases checked against Redis 8.10.1.
+    /// Every line here was run against Redis 8.10.1 first and the numbers are
+    /// its numbers. The one worth pointing at is the last pair: the counter goes
+    /// away and the group's bookmark keeps moving, because a delete ahead of a
+    /// group makes the counter unknowable rather than merely stale.
     #[test]
-    fn losing_an_unread_entry_loses_the_lag() {
-        // Deleting something the group has already read leaves the lag alone.
+    fn a_hole_in_front_of_a_group_takes_its_lag() {
         let mut s = logged(5);
         s.create_group(b"workers", Id::MIN, Some(0));
         read(&mut s, "workers", "alice", Some(3), 1);
-        assert_eq!(s.group(b"workers").expect("g").lag(s.added()), Some(2));
-        assert!(s.delete(Id::new(1, 0)));
-        assert_eq!(s.group(b"workers").expect("g").lag(s.added()), Some(2));
+        assert_eq!(counters(&s), (Some(3), Some(2)));
 
-        // Deleting something it has not reached takes the lag away for good,
-        // and reading to the end does not bring it back.
+        // Deleting something the group has already read leaves both alone,
+        // since the hole is behind the bookmark and the entries in front of it
+        // are all still there.
+        assert!(s.delete(Id::new(1, 0)));
+        assert_eq!(counters(&s), (Some(3), Some(2)));
+
+        // Deleting something it has not reached takes the lag, and leaves the
+        // counter exactly where it was. Redis does not clear it here.
         assert!(s.delete(Id::new(5, 0)));
-        assert_eq!(s.group(b"workers").expect("g").lag(s.added()), None);
-        assert_eq!(s.group(b"workers").expect("g").entries_read(), None);
+        assert_eq!(counters(&s), (Some(3), None));
+
+        // Reading what is left moves the bookmark to 4-0, which is not the last
+        // ID the stream ever handed out, so there is still no way to say how far
+        // along that is and the counter goes too.
         read(&mut s, "workers", "alice", None, 1);
-        assert_eq!(s.group(b"workers").expect("g").lag(s.added()), None);
+        assert_eq!(s.group(b"workers").expect("g").last_id(), Id::new(4, 0));
+        assert_eq!(counters(&s), (None, None));
     }
 
+    /// A trim is not a hole, so it costs a group nothing, and once it has cut
+    /// past the bookmark the lag becomes what is left rather than nothing.
+    ///
+    /// Checked against Redis 8.10.1 at twenty entries, where the three lines
+    /// below read 5, 5 and 2.
     #[test]
-    fn trimming_behind_a_group_leaves_its_lag_alone() {
+    fn trimming_past_a_group_leaves_it_the_length() {
         let mut s = logged(500);
         s.create_group(b"workers", Id::MIN, Some(0));
         read(&mut s, "workers", "alice", Some(400), 1);
-        assert_eq!(s.group(b"workers").expect("g").lag(s.added()), Some(100));
+        assert_eq!(counters(&s), (Some(400), Some(100)));
 
         // Whole nodes off the front, all of them well behind the bookmark.
         assert_eq!(s.trim_maxlen(200, true, None), 300);
-        assert_eq!(s.group(b"workers").expect("g").lag(s.added()), Some(100));
+        assert_eq!(counters(&s), (Some(400), Some(100)));
 
-        // And now past it, which it cannot survive.
-        assert!(s.trim_maxlen(10, true, None) > 0);
-        assert_eq!(s.group(b"workers").expect("g").lag(s.added()), None);
+        // And now past it. The bookmark is below every entry left, so the lag is
+        // the length: those are exactly the entries the group has still to read.
+        assert_eq!(s.trim_maxlen(10, true, None), 190);
+        assert_eq!(counters(&s), (Some(400), Some(10)));
+    }
+
+    /// The counter and the lag of the one group, which every lag test reads.
+    fn counters(s: &Stream) -> (Option<u64>, Option<u64>) {
+        let g = s.group(b"workers").expect("the group");
+        (g.entries_read(), s.lag(g))
     }
 
     #[test]
