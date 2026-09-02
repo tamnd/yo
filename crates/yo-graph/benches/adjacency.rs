@@ -15,6 +15,47 @@
 //!   - `graph/link` and `graph/unlink`, the write path. An unlink scans the run
 //!     at each end, so it is priced against a degree rather than as one number.
 //!
+//! # Where it stands
+//!
+//! On a 13th Gen Intel Core i9-13900K with nothing else running, criterion's
+//! middle estimate:
+//!
+//! ```text
+//! degree                     4        20       200
+//! one hop              23.7 ns   36.2 ns  219.5 ns
+//! link                 60.0 ns   32.1 ns         -
+//! unlink              148.3 ns  161.2 ns  171.7 ns
+//! ```
+//!
+//! ```text
+//! two hops over ten million edges     serial  2.06 us
+//!                                 prefetched  1.60 us
+//! ```
+//!
+//! The one hop row is a straight line: fit it and the intercept is 19.7
+//! nanoseconds and the slope is 1.0 nanoseconds an edge. That is the probe and
+//! the sequential read, and it is the cost model in `11` section 4 measured
+//! rather than asserted. G14 asks for a one hop under 500 nanoseconds, so the
+//! degree it holds out to is about 480, which is past the degree of all but a
+//! handful of nodes in any real graph.
+//!
+//! The two hop is 2.06 microseconds against a 50 microsecond gate, over a graph
+//! of ten million edges at an average degree of twenty, which is exactly the
+//! shape G14 names. Asking for the frontier's headers before reading any of
+//! them takes it to 1.60, so the hint is worth 22 per cent and it earns the
+//! call. It is worth being clear about why the gate is not close: the walk
+//! reads 400 neighbours through 20 runs, the runs are contiguous, and the only
+//! serial thing left is the 20 probes, which is what the prefetch attacks.
+//!
+//! Link is faster at degree 20 than at degree 4 and that is not a mistake. Both
+//! rows link into 2000 nodes, so the degree 4 row is 2000 new run headers
+//! against 8000 links and the degree 20 row is the same 2000 against 40000. The
+//! per link cost falls because the fixed cost per node is being spread.
+//!
+//! Unlink is flatter against the degree than the scan in it suggests, because
+//! at degree 200 the hundred comparisons that scan costs are a sequential read
+//! of a run already in L1, which is about 25 nanoseconds of the 172.
+//!
 //! # Reading these on a machine someone else is using
 //!
 //! Criterion's mean picks up whatever else the box is doing, so the comparable
