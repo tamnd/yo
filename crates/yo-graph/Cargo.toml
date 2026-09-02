@@ -32,5 +32,9 @@ harness = false
 name = "cold"
 harness = false
 
+[[bench]]
+name = "property"
+harness = false
+
 [lints]
 workspace = true

@@ -350,6 +350,24 @@ impl Graph {
         self.nodes.find(path, key, f)
     }
 
+    /// How many nodes have `key` under `path`, without reading any of them.
+    ///
+    /// # Errors
+    ///
+    /// The same as [`Graph::find_nodes`].
+    pub fn count_nodes(&self, path: &str, key: &Key) -> Result<usize> {
+        self.nodes.count(path, key)
+    }
+
+    /// How many edges have `key` under `path`, without reading any of them.
+    ///
+    /// # Errors
+    ///
+    /// The same as [`Graph::find_edges`].
+    pub fn count_edges(&self, path: &str, key: &Key) -> Result<usize> {
+        self.edges.count(path, key)
+    }
+
     /// Calls `f` for every edge slot whose properties have `key` under `path`.
     ///
     /// # Errors
