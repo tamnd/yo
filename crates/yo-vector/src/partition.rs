@@ -117,6 +117,15 @@ pub struct Tuning {
     /// would make recall fall off over a long write stream, which is the thing
     /// this index exists to not do.
     pub sweep: usize,
+    /// How much further than `probe` a filtered search will go looking when the
+    /// filter is selective enough that the nearest partitions do not hold `k`
+    /// members that pass, as a multiple of `probe`.
+    ///
+    /// This is the only knob here with a genuinely hard trade behind it. Too
+    /// small and a filter matching one document in a thousand returns nothing
+    /// while the answer sat two partitions further out. Too large and the same
+    /// filter reads the whole collection to prove there is nothing there.
+    pub widen: usize,
 }
 
 impl Default for Tuning {
@@ -126,6 +135,7 @@ impl Default for Tuning {
             probe: 8,
             rerank: 4,
             sweep: 4,
+            widen: 8,
         }
     }
 }
@@ -139,6 +149,121 @@ impl Default for Tuning {
 /// not what the estimator is for. Reranking a few dozen costs a few dozen
 /// squared distances, which is nothing next to the scan that produced them.
 const FLOOR: usize = 32;
+
+/// What decides whether the scan bothers with a member.
+///
+/// A filtered vector search is a recall lottery when the filter runs after the
+/// search: ask for ten English passages, get the best forty by vector, find
+/// three of them are English, and the other seven English passages that were
+/// nearer never had a chance. The fix is to filter inside the scan, so that
+/// only members that can be answers are ranked at all, and that means the thing
+/// the filter reads has to sit next to the codes rather than behind a lookup
+/// into somebody else's table.
+///
+/// So every member carries a `u64` tag, given at insert, and a filter is a
+/// predicate on that tag. What the tag means is the caller's business. A
+/// handful of low cardinality attributes pack into it exactly, one field each,
+/// and the filter is then exact. Anything wider goes through [`Signature`],
+/// which is exact in the direction that matters: it never rejects a member that
+/// should have matched, so the caller's real predicate over the answers still
+/// decides.
+pub trait Filter {
+    /// Whether a member with this tag is worth ranking.
+    fn allows(&self, tag: u64) -> bool;
+}
+
+/// The filter that lets everything through, which is what an unfiltered search
+/// runs.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Any;
+
+impl Filter for Any {
+    fn allows(&self, _tag: u64) -> bool {
+        true
+    }
+}
+
+impl<F: Fn(u64) -> bool> Filter for F {
+    fn allows(&self, tag: u64) -> bool {
+        self(tag)
+    }
+}
+
+/// A tag built by setting one bit per attribute value, so that a conjunction of
+/// required values is a subset test.
+///
+/// Superimposed coding, which is old and still the right answer when the test
+/// has to be one instruction on a value that is already in a register. Each
+/// attribute and value pair hashes to one of 64 bits. A member's tag is the
+/// bits for the values it has. A query's tag is the bits for the values it
+/// requires. The member is worth ranking when it has all of the query's bits.
+///
+/// Two different values can land on the same bit, so a member can pass a filter
+/// it does not really match. It can never fail one it does match, which is the
+/// direction that matters: the answers are a superset of the truth and the
+/// caller's own predicate cuts them down, where the other way round would lose
+/// answers silently.
+///
+/// ```
+/// use yo_vector::Signature;
+///
+/// // What a document is tagged with, and what a query asks for.
+/// let doc = Signature::of(&[("lang", "en".as_bytes()), ("topic", "finance".as_bytes())]);
+/// let english = Signature::of(&[("lang", "en".as_bytes())]);
+///
+/// assert!(doc.covers(english));
+/// // The other way round only holds if the two bits happened to collide.
+/// assert!(!english.covers(doc) || english.bits() == doc.bits());
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Signature(u64);
+
+impl Signature {
+    /// The signature of a set of attribute and value pairs.
+    #[must_use]
+    pub fn of(values: &[(&str, &[u8])]) -> Signature {
+        let mut bits = 0u64;
+        for (attribute, value) in values {
+            bits |= 1u64 << (hash(attribute.as_bytes(), value) % 64);
+        }
+        Signature(bits)
+    }
+
+    /// The signature as the tag to hand to [`Partitions::insert_tagged`].
+    #[must_use]
+    pub fn bits(self) -> u64 {
+        self.0
+    }
+
+    /// The signature of a tag that came back out of the index.
+    #[must_use]
+    pub fn from_bits(bits: u64) -> Signature {
+        Signature(bits)
+    }
+
+    /// Whether this has every bit `want` has, which is the test the scan runs.
+    #[must_use]
+    pub fn covers(self, want: Signature) -> bool {
+        self.0 & want.0 == want.0
+    }
+}
+
+impl Filter for Signature {
+    fn allows(&self, tag: u64) -> bool {
+        Signature(tag).covers(*self)
+    }
+}
+
+/// FNV over the attribute and then the value, which is small, has no state and
+/// spreads a short value over the whole word well enough to pick a bit.
+fn hash(attribute: &[u8], value: &[u8]) -> u64 {
+    let mut h = 0xcbf2_9ce4_8422_2325u64;
+    for byte in attribute.iter().chain(b":").chain(value) {
+        h ^= u64::from(*byte);
+        h = h.wrapping_mul(0x1000_0000_01b3);
+    }
+    h
+}
 
 /// An answer: a document id and how far it really is, not how far it was
 /// estimated to be.
@@ -162,6 +287,12 @@ struct Slot {
 #[derive(Default)]
 struct Posting {
     ids: Vec<u64>,
+    /// One tag per member, in the same order, which is what a filter meets.
+    ///
+    /// Beside the ids rather than behind a pointer, because the whole point is
+    /// that the scan can skip a member without touching anything that is not
+    /// already in cache.
+    tags: Vec<u64>,
     codes: Vec<u8>,
     meta: Vec<Coded>,
     /// The size at which a split was tried and found there was no cut, which
@@ -263,6 +394,18 @@ impl Partitions {
     ///
     /// If `v` is not [`Partitions::dim`] long.
     pub fn insert(&mut self, id: u64, v: &[f32]) {
+        self.insert_tagged(id, v, 0);
+    }
+
+    /// The same, with the tag a filter will meet in the scan.
+    ///
+    /// See [`Filter`] for what a tag is and [`Signature`] for the encoding to
+    /// reach for when the attributes do not fit in one exactly.
+    ///
+    /// # Panics
+    ///
+    /// If `v` is not [`Partitions::dim`] long.
+    pub fn insert_tagged(&mut self, id: u64, v: &[f32], tag: u64) {
         assert_eq!(
             v.len(),
             self.dim(),
@@ -280,7 +423,14 @@ impl Partitions {
         } else {
             self.nearest(&x)
         };
-        self.place(p, id, &x);
+        self.place(p, id, tag, &x);
+    }
+
+    /// The tag `id` was inserted with, if it is still here.
+    #[must_use]
+    pub fn tag(&self, id: u64) -> Option<u64> {
+        let at = self.at.get(&id)?;
+        Some(self.postings[at.partition as usize].tags[at.slot as usize])
     }
 
     /// Take a vector out, saying whether it was there.
@@ -315,10 +465,39 @@ impl Partitions {
     /// If `q` is not [`Partitions::dim`] long.
     #[must_use]
     pub fn search(&self, q: &[f32], k: usize, vectors: &impl Vectors) -> Vec<Hit> {
+        self.search_where(q, k, &Any, vectors)
+    }
+
+    /// The `k` nearest vectors to `q` that a filter allows.
+    ///
+    /// The filter runs inside the scan, on the tag that sits next to the code,
+    /// so a member the filter rejects is never ranked and never takes a place
+    /// that an answer should have had. Filtering afterwards instead is what
+    /// makes a filtered vector search a lottery, and the more selective the
+    /// filter the worse a lottery it is.
+    ///
+    /// A selective filter also means the nearest few partitions may not hold `k`
+    /// members that pass, so the scan keeps going into further partitions until
+    /// it has enough or until it has spent [`Tuning::widen`]. A filter that
+    /// matches almost nothing returns fewer answers rather than reading the
+    /// whole collection, which is the trade every engine makes here and is worth
+    /// saying out loud.
+    ///
+    /// # Panics
+    ///
+    /// If `q` is not [`Partitions::dim`] long.
+    #[must_use]
+    pub fn search_where(
+        &self,
+        q: &[f32],
+        k: usize,
+        filter: &impl Filter,
+        vectors: &impl Vectors,
+    ) -> Vec<Hit> {
         if k == 0 {
             return Vec::new();
         }
-        let candidates = self.candidates(q, (k * self.tuning.rerank).max(FLOOR));
+        let candidates = self.candidates_where(q, (k * self.tuning.rerank).max(FLOOR), filter);
         let mut buf = vec![0.0f32; self.dim()];
         let mut hits = Vec::with_capacity(candidates.len());
         for (id, _) in candidates {
@@ -344,6 +523,21 @@ impl Partitions {
     /// If `q` is not [`Partitions::dim`] long.
     #[must_use]
     pub fn candidates(&self, q: &[f32], want: usize) -> Vec<(u64, f32)> {
+        self.candidates_where(q, want, &Any)
+    }
+
+    /// The same, with the filter run inside the scan.
+    ///
+    /// # Panics
+    ///
+    /// If `q` is not [`Partitions::dim`] long.
+    #[must_use]
+    pub fn candidates_where(
+        &self,
+        q: &[f32],
+        want: usize,
+        filter: &impl Filter,
+    ) -> Vec<(u64, f32)> {
         assert_eq!(
             q.len(),
             self.dim(),
@@ -359,10 +553,21 @@ impl Partitions {
         let u = self.quant.rotate(q);
         let width = self.quant.code_bytes();
         let mut found = Vec::new();
-        for p in self.probe(&u) {
+        let reach = self.tuning.probe.saturating_mul(self.tuning.widen.max(1));
+        for (n, p) in self.near_partitions(&u, reach).into_iter().enumerate() {
+            // Past the partitions an unfiltered search would have read, keep
+            // going only while there is still not enough to answer with. An
+            // unfiltered search never gets here, because the first `probe`
+            // partitions of a collection worth probing hold more than `want`.
+            if n >= self.tuning.probe && found.len() >= want {
+                break;
+            }
             let prepared = self.quant.query_rotated(&u, self.centroid(p));
             let posting = &self.postings[p];
             for (i, &id) in posting.ids.iter().enumerate() {
+                if !filter.allows(posting.tags[i]) {
+                    continue;
+                }
                 let code = &posting.codes[i * width..(i + 1) * width];
                 found.push((id, prepared.distance(code, &posting.meta[i])));
             }
@@ -422,16 +627,16 @@ impl Partitions {
     /// Cut a partition in two by two means over its own members, then sweep the
     /// neighbours for anything that should have come along.
     fn split(&mut self, p: usize, vectors: &impl Vectors) -> usize {
-        let (ids, xs) = self.take(p, vectors);
+        let (members, xs) = self.take(p, vectors);
         let dim = self.dim();
-        if ids.len() < 2 {
-            for (i, id) in ids.iter().enumerate() {
-                self.place(p, *id, &xs[i * dim..(i + 1) * dim]);
+        if members.len() < 2 {
+            for (i, m) in members.iter().enumerate() {
+                self.place(p, m.id, m.tag, &xs[i * dim..(i + 1) * dim]);
             }
-            return ids.len();
+            return members.len();
         }
         let (a, b) = two_means(&xs, dim);
-        let sides: Vec<bool> = (0..ids.len())
+        let sides: Vec<bool> = (0..members.len())
             .map(|i| {
                 sqdist(&xs[i * dim..(i + 1) * dim], &a) <= sqdist(&xs[i * dim..(i + 1) * dim], &b)
             })
@@ -442,32 +647,32 @@ impl Partitions {
         // that really is all one vector costs a re-encode of it a logarithmic
         // number of times rather than once per insert.
         if sides.iter().all(|&s| s) || sides.iter().all(|&s| !s) {
-            for (i, id) in ids.iter().enumerate() {
-                self.place(p, *id, &xs[i * dim..(i + 1) * dim]);
+            for (i, m) in members.iter().enumerate() {
+                self.place(p, m.id, m.tag, &xs[i * dim..(i + 1) * dim]);
             }
-            self.postings[p].stuck = ids.len() * 2;
-            return ids.len();
+            self.postings[p].stuck = members.len() * 2;
+            return members.len();
         }
         self.centroids[p * dim..(p + 1) * dim].copy_from_slice(&a);
         let q = self.add_partition(&b);
-        for (i, id) in ids.iter().enumerate() {
+        for (i, m) in members.iter().enumerate() {
             let to = if sides[i] { p } else { q };
-            self.place(to, *id, &xs[i * dim..(i + 1) * dim]);
+            self.place(to, m.id, m.tag, &xs[i * dim..(i + 1) * dim]);
         }
-        ids.len() + self.sweep(&[p, q], vectors)
+        members.len() + self.sweep(&[p, q], vectors)
     }
 
     /// Hand a partition's members to whoever is nearest now, and drop it.
     fn merge(&mut self, p: usize, vectors: &impl Vectors) -> usize {
-        let (ids, xs) = self.take(p, vectors);
+        let (members, xs) = self.take(p, vectors);
         let dim = self.dim();
         self.drop_partition(p);
-        for (i, id) in ids.iter().enumerate() {
+        for (i, m) in members.iter().enumerate() {
             let x = &xs[i * dim..(i + 1) * dim];
             let to = self.nearest(x);
-            self.place(to, *id, x);
+            self.place(to, m.id, m.tag, x);
         }
-        ids.len()
+        members.len()
     }
 
     /// LIRE: after the centroids move, anything nearby that is now filed under
@@ -496,6 +701,7 @@ impl Partitions {
             for i in (0..self.postings[p].len()).rev() {
                 seen += 1;
                 let id = self.postings[p].ids[i];
+                let tag = self.postings[p].tags[i];
                 if !vectors.get(id, &mut buf) {
                     self.pull_and_forget(p, i);
                     continue;
@@ -504,7 +710,7 @@ impl Partitions {
                 let to = self.nearest(&x);
                 if to != p {
                     self.pull_and_forget(p, i);
-                    self.place(to, id, &x);
+                    self.place(to, id, tag, &x);
                 }
             }
         }
@@ -513,27 +719,23 @@ impl Partitions {
 
     /// Empty a partition out, handing back its members and their rotated
     /// vectors. Ids the source has forgotten are dropped.
-    fn take(&mut self, p: usize, vectors: &impl Vectors) -> (Vec<u64>, Vec<f32>) {
+    fn take(&mut self, p: usize, vectors: &impl Vectors) -> (Vec<Member>, Vec<f32>) {
         let dim = self.dim();
         let ids = std::mem::take(&mut self.postings[p].ids);
+        let tags = std::mem::take(&mut self.postings[p].tags);
         self.postings[p].codes.clear();
         self.postings[p].meta.clear();
         let mut kept = Vec::with_capacity(ids.len());
         let mut xs = Vec::with_capacity(ids.len() * dim);
         let mut buf = vec![0.0f32; dim];
-        for id in ids {
+        for (id, tag) in ids.into_iter().zip(tags) {
             self.at.remove(&id);
             if vectors.get(id, &mut buf) {
                 xs.extend_from_slice(&self.quant.rotate(&buf));
-                kept.push(id);
+                kept.push(Member { id, tag });
             }
         }
         (kept, xs)
-    }
-
-    /// The partitions a query should scan, nearest first.
-    fn probe(&self, x: &[f32]) -> Vec<usize> {
-        self.near_partitions(x, self.tuning.probe)
     }
 
     /// The `n` partitions whose centroids are nearest `x`, nearest first.
@@ -590,7 +792,7 @@ impl Partitions {
     }
 
     /// Append a member to a partition. `x` is rotated.
-    fn place(&mut self, p: usize, id: u64, x: &[f32]) {
+    fn place(&mut self, p: usize, id: u64, tag: u64, x: &[f32]) {
         let dim = self.dim();
         let width = self.quant.code_bytes();
         let slot = self.postings[p].len();
@@ -602,6 +804,7 @@ impl Partitions {
             &mut self.postings[p].codes[slot * width..(slot + 1) * width],
         );
         self.postings[p].ids.push(id);
+        self.postings[p].tags.push(tag);
         self.postings[p].meta.push(coded);
         self.at.insert(
             id,
@@ -618,6 +821,7 @@ impl Partitions {
         let posting = &mut self.postings[p];
         let last = posting.len() - 1;
         posting.ids.swap_remove(s);
+        posting.tags.swap_remove(s);
         posting.meta.swap_remove(s);
         if s != last {
             let (head, tail) = posting.codes.split_at_mut(last * width);
@@ -642,6 +846,14 @@ impl Partitions {
             );
         }
     }
+}
+
+/// A member on its way from one partition to another, which is the only time
+/// its id and its tag travel together without a posting around them.
+#[derive(Clone, Copy)]
+struct Member {
+    id: u64,
+    tag: u64,
 }
 
 enum Job {
@@ -885,6 +1097,7 @@ mod tests {
         for (p, posting) in ix.postings.iter().enumerate() {
             assert_eq!(posting.codes.len(), posting.len() * width, "partition {p}");
             assert_eq!(posting.meta.len(), posting.len(), "partition {p}");
+            assert_eq!(posting.tags.len(), posting.len(), "partition {p}");
             for (s, id) in posting.ids.iter().enumerate() {
                 let at = ix.at.get(id).expect("every member is in the map");
                 assert_eq!(at.partition as usize, p, "id {id}");
@@ -893,6 +1106,172 @@ mod tests {
             }
         }
         assert_eq!(seen, ix.at.len(), "the map has entries with no member");
+    }
+
+    /// Build an index where every vector carries a tag, so the filter has
+    /// something to meet.
+    fn build_tagged(
+        store: &Store,
+        dim: usize,
+        tuning: Tuning,
+        tag: impl Fn(u64) -> u64,
+    ) -> Partitions {
+        let mut ix = Partitions::new(dim, Bits::One, 7, tuning);
+        for (i, v) in store.0.iter().enumerate() {
+            ix.insert_tagged(i as u64, v, tag(i as u64));
+            if i % 64 == 0 {
+                ix.maintain(store, 4096);
+            }
+        }
+        ix.maintain(store, 1 << 20);
+        ix
+    }
+
+    /// The whole point of pushing a filter into the scan, measured against the
+    /// thing it replaces.
+    ///
+    /// One document in fifty carries the tag. Filtering inside the scan finds
+    /// the true ten of those. Taking the best forty by vector and then throwing
+    /// away the ones that do not match, which is what a search that cannot push
+    /// a filter down has to do, finds almost none of them, and the ones it
+    /// misses were nearer than the ones it kept.
+    #[test]
+    fn a_filter_in_the_scan_finds_what_a_filter_after_it_cannot() {
+        let dim = 96;
+        let store = corpus(dim, 3000, 12, 47);
+        let tuning = Tuning {
+            posting: 64,
+            ..Tuning::default()
+        };
+        let wanted = |id: u64| id.is_multiple_of(50);
+        let ix = build_tagged(&store, dim, tuning, |id| u64::from(wanted(id)));
+
+        let (mut pushed, mut after) = (0usize, 0usize);
+        let k = 10;
+        for i in 0..40 {
+            let q = &store.0[i * 71 % store.0.len()];
+
+            // What the answer is: brute force over the members that match.
+            let mut all: Vec<(u64, f32)> = store
+                .0
+                .iter()
+                .enumerate()
+                .filter(|(id, _)| wanted(*id as u64))
+                .map(|(id, v)| (id as u64, sqdist(q, v)))
+                .collect();
+            all.sort_by(|a, b| a.1.total_cmp(&b.1));
+            let want: Vec<u64> = all[..k].iter().map(|(id, _)| *id).collect();
+
+            let got: Vec<u64> = ix
+                .search_where(q, k, &|tag: u64| tag == 1, &store)
+                .into_iter()
+                .map(|h| h.id)
+                .collect();
+            pushed += want.iter().filter(|id| got.contains(id)).count();
+
+            let late: Vec<u64> = ix
+                .search(q, k * tuning.rerank, &store)
+                .into_iter()
+                .map(|h| h.id)
+                .filter(|id| wanted(*id))
+                .take(k)
+                .collect();
+            after += want.iter().filter(|id| late.contains(id)).count();
+        }
+        let (pushed, after) = (pushed as f32 / 400.0, after as f32 / 400.0);
+        assert!(pushed >= 0.95, "pushing the filter down gave {pushed}");
+        assert!(
+            after < pushed / 2.0,
+            "filtering afterwards gave {after} against {pushed}, which is not the point being made"
+        );
+    }
+
+    #[test]
+    fn a_filter_that_matches_nothing_answers_nothing() {
+        let dim = 64;
+        let store = corpus(dim, 500, 4, 53);
+        let ix = build_tagged(&store, dim, Tuning::default(), |_| 1);
+        assert!(
+            ix.search_where(&store.0[0], 10, &|tag: u64| tag == 2, &store)
+                .is_empty()
+        );
+        // And the same filter matching everything is the unfiltered answer.
+        let all = ix.search_where(&store.0[0], 10, &Any, &store);
+        assert_eq!(all, ix.search(&store.0[0], 10, &store));
+    }
+
+    #[test]
+    fn a_tag_survives_a_split_and_a_merge() {
+        let dim = 64;
+        let store = corpus(dim, 800, 6, 59);
+        let tuning = Tuning {
+            posting: 24,
+            ..Tuning::default()
+        };
+        let mut ix = build_tagged(&store, dim, tuning, |id| id * 7 + 1);
+        assert!(ix.partitions() > 4, "it never split");
+        for id in 0..800u64 {
+            assert_eq!(ix.tag(id), Some(id * 7 + 1), "id {id} after the splits");
+        }
+
+        // Now shrink it until partitions merge, and the survivors keep theirs.
+        for id in 0..760u64 {
+            ix.remove(id);
+        }
+        ix.maintain(&store, 1 << 20);
+        consistent(&ix);
+        for id in 760..800u64 {
+            assert_eq!(ix.tag(id), Some(id * 7 + 1), "id {id} after the merges");
+        }
+        assert_eq!(ix.tag(0), None);
+    }
+
+    /// A selective filter means the answers are not in the nearest partitions,
+    /// and a search that will not look further returns fewer than it should.
+    #[test]
+    fn a_selective_filter_makes_the_search_look_further() {
+        let dim = 64;
+        let store = corpus(dim, 2000, 10, 61);
+        let tuning = Tuning {
+            posting: 32,
+            ..Tuning::default()
+        };
+        let tag = |id: u64| u64::from(id.is_multiple_of(100));
+        let ix = build_tagged(&store, dim, tuning, tag);
+        let narrow = build_tagged(&store, dim, Tuning { widen: 1, ..tuning }, tag);
+
+        let mut wide_found = 0usize;
+        let mut narrow_found = 0usize;
+        for i in 0..20 {
+            let q = &store.0[i * 91 % store.0.len()];
+            wide_found += ix.search_where(q, 10, &|t: u64| t == 1, &store).len();
+            narrow_found += narrow.search_where(q, 10, &|t: u64| t == 1, &store).len();
+        }
+        assert_eq!(
+            wide_found, 200,
+            "one in a hundred of two thousand is twenty"
+        );
+        assert!(
+            narrow_found < wide_found,
+            "not widening found {narrow_found} of {wide_found}"
+        );
+    }
+
+    #[test]
+    fn a_signature_never_rejects_something_it_should_have_matched() {
+        let english = Signature::of(&[("lang", b"en")]);
+        let doc = Signature::of(&[("lang", b"en"), ("topic", b"finance"), ("year", b"2026")]);
+        assert!(doc.covers(english));
+        assert!(english.allows(doc.bits()));
+        assert_eq!(Signature::from_bits(doc.bits()), doc);
+
+        // And over a lot of values, nothing that matches is ever turned away.
+        for i in 0..500u32 {
+            let value = i.to_string();
+            let one = Signature::of(&[("id", value.as_bytes())]);
+            let with = Signature::of(&[("id", value.as_bytes()), ("kind", b"page")]);
+            assert!(with.covers(one), "value {value}");
+        }
     }
 
     #[test]
