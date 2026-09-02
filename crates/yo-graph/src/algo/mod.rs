@@ -43,6 +43,10 @@
 //! [`label_propagation()`] is the one to reach for when even Louvain is too much
 //! work for the size of the graph.
 //!
+//! [`betweenness()`] is Brandes from 2001, sampled over random sources the way
+//! Brandes and Pich describe in 2007, which is the only centrality here that
+//! finds the node whose removal would cut the graph in half.
+//!
 //! # Why they are deterministic
 //!
 //! Several of these sample or shuffle, and all of them draw from
@@ -53,6 +57,7 @@
 //! answer moves between runs cannot be tested against a reference
 //! implementation and cannot be diffed between two versions of this crate.
 
+pub mod betweenness;
 pub mod bfs;
 pub mod community;
 pub mod label_propagation;
@@ -62,6 +67,7 @@ pub mod sssp;
 pub mod triangle;
 pub mod wcc;
 
+pub use betweenness::{Between, betweenness, betweenness_exact, betweenness_with};
 pub use bfs::{UNREACHED, bfs};
 pub use community::{leiden, leiden_with, louvain, louvain_with, modularity, modularity_with};
 pub use label_propagation::{label_propagation, label_propagation_with};

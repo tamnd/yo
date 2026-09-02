@@ -93,8 +93,8 @@ use std::hint::black_box;
 use yo_common::Rng;
 use yo_graph::algo::pagerank::DAMPING;
 use yo_graph::algo::{
-    UNREACHABLE, UNREACHED, bfs, label_propagation, leiden, louvain, modularity, pagerank_with,
-    scc, sssp, sssp_with, triangle_count, wcc,
+    UNREACHABLE, UNREACHED, betweenness_with, bfs, label_propagation, leiden, louvain, modularity,
+    pagerank_with, scc, sssp, sssp_with, triangle_count, wcc,
 };
 use yo_graph::{Graph, NO_PROPS, Snapshot};
 
@@ -390,6 +390,9 @@ fn bench_algo(c: &mut Criterion) {
             b.iter(|| black_box(sssp_with(black_box(&s), black_box(&weights), src, delta)));
         });
     }
+    group.bench_function("betweenness/64 pivots", |b| {
+        b.iter(|| black_box(betweenness_with(black_box(&s), 64)));
+    });
     group.bench_function("community/leiden", |b| {
         b.iter(|| black_box(leiden(black_box(&small))));
     });
