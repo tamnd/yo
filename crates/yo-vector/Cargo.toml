@@ -30,3 +30,7 @@ harness = false
 
 [lints]
 workspace = true
+
+[[bench]]
+name = "tmp_widen"
+harness = false
