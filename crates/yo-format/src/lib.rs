@@ -24,12 +24,16 @@
 #![deny(missing_docs)]
 
 pub mod catalog;
+pub mod document;
 pub mod page;
 pub mod record;
 pub mod superblock;
 pub mod vector;
 
 pub use catalog::{Band, CatalogEntry, Model, ValueType};
+pub use document::{
+    DOC_COUNT_MAX, DOC_COUNT_SHIFT, DOC_HEADER_LEN, DocumentBody, ValueTag, doc_flags,
+};
 pub use page::{PAGE_HEADER_LEN, PageHeader};
 pub use record::{RecordHeader, RecordKind, RecordRef, record_flags};
 pub use superblock::{CheckpointEntry, Superblock, superblock_flags};

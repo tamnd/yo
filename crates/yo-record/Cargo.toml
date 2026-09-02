@@ -20,6 +20,9 @@ yo-format = { workspace = true }
 
 [dev-dependencies]
 criterion = { workspace = true }
+# Only so that a test can put a real document through the log rather than a
+# blob shaped like one.
+yo-doc = { workspace = true }
 
 [[bench]]
 name = "append"

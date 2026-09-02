@@ -20,6 +20,9 @@ yo-kv.workspace = true
 
 [dev-dependencies]
 criterion = { workspace = true }
+# Only so that a test can hold the wire tags and flags on the same numbering as
+# the record format, which is what `yo-kv` does for `Kind` and `ValueType`.
+yo-format = { workspace = true }
 
 [[bench]]
 name = "yojb"

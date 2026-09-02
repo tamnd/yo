@@ -94,9 +94,10 @@ pub enum RecordKind {
     String = 0,
     /// One chunk of a collection, or of a value too large for a page.
     CollectionChunk = 1,
-    /// A document.
+    /// A document, whose value is the YOJB value byte for byte. See
+    /// [`crate::document`].
     Document = 2,
-    /// A vector.
+    /// A vector. See [`crate::vector`].
     Vector = 3,
     /// A graph node.
     GraphNode = 4,

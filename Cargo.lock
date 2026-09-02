@@ -862,6 +862,7 @@ version = "0.3.12"
 dependencies = [
  "criterion",
  "yo-common",
+ "yo-format",
  "yo-kv",
 ]
 
@@ -939,6 +940,7 @@ version = "0.3.12"
 dependencies = [
  "criterion",
  "yo-common",
+ "yo-doc",
  "yo-format",
 ]
 
