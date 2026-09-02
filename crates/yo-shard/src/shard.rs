@@ -106,13 +106,40 @@ type Job<T> = Box<dyn FnOnce(&mut ShardCtx<T>) + Send + 'static>;
 const RUNNING: u32 = 0;
 const PARKED: u32 = 1;
 
+/// The handshake between a sender and a shard on its way to sleep.
+///
+/// Both sides do a store and then a load. The sender puts the job in the lane
+/// and then reads this state to decide whether anyone needs waking. The shard
+/// writes PARKED and then reads the lanes to decide whether it is safe to
+/// sleep. Release and acquire are not enough for that shape, because neither of
+/// them stops a load being answered while the store in front of it is still in
+/// a buffer, so both loads can read the old value: the sender decides the shard
+/// is awake, the shard decides the lane is empty, and the job sits there until
+/// something unrelated happens to wake the shard up. On an idle shard nothing
+/// unrelated ever does.
+///
+/// The fix is a sequentially consistent fence on each side, between the store
+/// and the load. Two of them together give the guarantee that one side must see
+/// the other, which is exactly what is needed and is checked by the loom model
+/// at the bottom of this file. One fence is not enough and the model says so.
+///
+/// The load after the fence is plain, and the read modify write only happens
+/// when the shard really is parked. Waking a running shard is the common case
+/// by a long way, and doing it with a load leaves this cache line shared
+/// between all the submitters instead of bouncing it exclusive on every send.
 struct Signal {
     state: AtomicU32,
     thread: OnceLock<Thread>,
 }
 
 impl Signal {
+    /// Wake shard `self` if it is asleep. Call this after the job is in the
+    /// lane, never before, because the fence orders those two and nothing else.
     fn wake(&self) {
+        core::sync::atomic::fence(Ordering::SeqCst);
+        if self.state.load(Ordering::Relaxed) != PARKED {
+            return;
+        }
         if self.state.swap(RUNNING, Ordering::AcqRel) == PARKED
             && let Some(t) = self.thread.get()
         {
@@ -409,6 +436,11 @@ fn run<T>(ctx: &mut ShardCtx<T>, rxs: &[Receiver<Job<T>>], signal: &Signal, stop
         }
 
         signal.state.store(PARKED, Ordering::Release);
+        // The partner of the fence in `Signal::wake`, and the reason is written
+        // out there. It has to sit between announcing the park and reading the
+        // lanes, or the read can happen while the announcement is still in a
+        // buffer and a sender is free to miss it.
+        core::sync::atomic::fence(Ordering::SeqCst);
         // Check once more after announcing the park. A sender that pushed
         // before our store will find PARKED and unpark us; one that pushed
         // after it is visible here. Either way we do not sleep on work.
@@ -540,6 +572,11 @@ mod tests {
     const QUEUED: u32 = 100;
     #[cfg(not(miri))]
     const QUEUED: u32 = 1000;
+
+    #[cfg(miri)]
+    const ROUNDS: usize = 64;
+    #[cfg(not(miri))]
+    const ROUNDS: usize = 4_000;
 
     #[cfg(miri)]
     const SPREAD: u64 = 4_000;
@@ -694,6 +731,35 @@ mod tests {
     }
 
     #[test]
+    fn a_job_that_arrives_while_the_shard_is_falling_asleep_is_not_lost() {
+        // The window this is aiming at is a handful of instructions wide: the
+        // shard has written PARKED and is reading the lanes, the sender has
+        // written the lane and is reading the state. Landing in it takes luck,
+        // so the test buys luck with repetition and with a delay that walks
+        // across the spin limit rather than sitting on one side of it. The
+        // recv_timeout is what turns a lost wakeup into a failure instead of a
+        // test run that never comes back.
+        let rt: Runtime<usize> = Builder::new().shards(1).pin(false).build(|_| 0usize);
+        let sub = rt.submitter();
+        let (tx, rx) = std::sync::mpsc::channel();
+        for round in 0..ROUNDS {
+            // Sweeps up to and well past the point where the shard gives up
+            // spinning, so some rounds catch it awake, some asleep, and some
+            // in between.
+            std::thread::sleep(std::time::Duration::from_nanos(200 * (round % 64) as u64));
+            let tx = tx.clone();
+            sub.send(0, move |ctx| {
+                *ctx.state += 1;
+                let _ = tx.send(*ctx.state);
+            });
+            let seen = rx
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .unwrap_or_else(|_| panic!("round {round} was pushed to a shard that never woke"));
+            assert_eq!(seen, round + 1);
+        }
+    }
+
+    #[test]
     fn shard_of_spreads_hashes() {
         let rt: Runtime<()> = Builder::new().shards(8).pin(false).build(|_| ());
         let mut counts = [0usize; 8];
@@ -707,5 +773,57 @@ mod tests {
                 "shard {s} got {c}, which is not an even spread"
             );
         }
+    }
+}
+
+/// The park handshake, checked by loom rather than argued about.
+///
+/// Run with `RUSTFLAGS="--cfg loom" cargo test -p yo-shard --release shard::loom`.
+/// The model copies the two halves rather than calling into them, because the
+/// real ones are wrapped in a thread, a lane and a runtime that loom has no
+/// business enumerating. What it copies exactly is the shape and the orderings,
+/// which is where the bug was: a job going into a lane and a shard deciding to
+/// sleep, each side reading something the other wrote a moment earlier. Take
+/// away either fence, or swap the pair for a sequentially consistent store and
+/// a sequentially consistent read modify write, and loom finds the bad
+/// interleaving straight away.
+#[cfg(all(test, loom))]
+mod loom_tests {
+    use loom::sync::Arc;
+    use loom::sync::atomic::{AtomicUsize, Ordering, fence};
+
+    const RUNNING: usize = super::RUNNING as usize;
+    const PARKED: usize = super::PARKED as usize;
+
+    #[test]
+    fn a_shard_never_sleeps_on_a_job_nobody_is_going_to_wake_it_for() {
+        loom::model(|| {
+            let state = Arc::new(AtomicUsize::new(RUNNING));
+            let lane = Arc::new(AtomicUsize::new(0));
+
+            // The sender, which is `Submitter::push` followed by `Signal::wake`.
+            let sender = {
+                let (state, lane) = (Arc::clone(&state), Arc::clone(&lane));
+                loom::thread::spawn(move || {
+                    lane.store(1, Ordering::Release);
+                    fence(Ordering::SeqCst);
+                    if state.load(Ordering::Relaxed) != PARKED {
+                        return false;
+                    }
+                    state.swap(RUNNING, Ordering::AcqRel) == PARKED
+                })
+            };
+
+            // The shard, which is the tail of `run`.
+            state.store(PARKED, Ordering::Release);
+            fence(Ordering::SeqCst);
+            let pending = lane.load(Ordering::Acquire) == 1;
+
+            let woken = sender.join().unwrap();
+            assert!(
+                pending || woken,
+                "the shard saw an empty lane and the sender saw a running shard, so the job sits there"
+            );
+        });
     }
 }
