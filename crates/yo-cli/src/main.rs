@@ -288,6 +288,20 @@ fn serve_command(args: &[&str]) -> ExitCode {
         (false, None) => unreachable!("refused above"),
     }
 
+    // Both numbers, on purpose. A server that only printed the quarter would
+    // leave the next person to wonder a quarter of what, and the answer to that
+    // is the thing they need when the pool comes out the wrong size. See
+    // `yo_resp::cap` for why it is a quarter at all.
+    let cap = yo_resp::cap::cap();
+    match cap.limit() {
+        Some(limit) => println!(
+            "yodb {version} may use {} and will size pools from {}",
+            bytes(limit),
+            bytes(cap.budget())
+        ),
+        None => println!("yodb {version} found no memory limit to size pools from"),
+    }
+
     // After the listening line and not before it, so a Ctrl-C that arrives in
     // the moment between the two is a process that was never told to serve
     // rather than one that says it is serving and then stops.
@@ -312,4 +326,42 @@ fn serve_command(args: &[&str]) -> ExitCode {
 
 fn plural(n: usize) -> &'static str {
     if n == 1 { "" } else { "s" }
+}
+
+/// A byte count a person can read, for the startup lines only.
+///
+/// Powers of two with the short names, because that is what `maxmemory` takes
+/// and a server that prints one unit and accepts another is a server that gets
+/// misconfigured.
+fn bytes(n: u64) -> String {
+    const UNITS: [(u64, &str); 3] = [(1 << 30, "gb"), (1 << 20, "mb"), (1 << 10, "kb")];
+    for (size, name) in UNITS {
+        if n >= size {
+            let whole = n / size;
+            let tenths = (n % size) * 10 / size;
+            return if tenths == 0 {
+                format!("{whole}{name}")
+            } else {
+                format!("{whole}.{tenths}{name}")
+            };
+        }
+    }
+    format!("{n} bytes")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::bytes;
+
+    #[test]
+    fn a_byte_count_prints_in_the_units_maxmemory_takes() {
+        assert_eq!(bytes(0), "0 bytes");
+        assert_eq!(bytes(512), "512 bytes");
+        assert_eq!(bytes(1024), "1kb");
+        assert_eq!(bytes(2 * 1024 * 1024 * 1024), "2gb");
+        // One tenth is enough to tell 7.5gb from 7gb and not so much that the
+        // line stops being readable.
+        assert_eq!(bytes(7 * (1 << 30) + (1 << 29)), "7.5gb");
+        assert_eq!(bytes(1536), "1.5kb");
+    }
 }
