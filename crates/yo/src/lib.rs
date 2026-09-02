@@ -142,6 +142,7 @@ extern crate self as yo;
 pub mod counter;
 pub mod db;
 pub mod doc;
+pub mod graph;
 pub mod keys;
 pub mod keyspace;
 pub mod map;
@@ -150,7 +151,8 @@ pub mod store;
 
 pub use counter::Counter;
 pub use db::{Db, MEMORY, open};
-pub use doc::{Docs, Document, Ordered, Path};
+pub use doc::{Docs, Document, Indexed, Ordered, Path};
+pub use graph::{Edge, Graph, Hop, Id, Node, Walk};
 pub use keys::{Keys, Ttl, When};
 pub use keyspace::Strings;
 pub use map::Map;

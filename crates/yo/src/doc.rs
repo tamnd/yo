@@ -196,15 +196,23 @@ impl Asked for String {
     label = "this type has no id",
     note = "add `#[derive(Yo)]` to it and mark one field `#[yo(id)]`, which is what a document is stored under"
 )]
-pub trait Document: Field {
+pub trait Document: Field + Indexed {
     /// The type of the field marked `#[yo(id)]`.
     type Id: Field + Asked;
 
-    /// The indexes this type declares, which the collection is created with.
-    const INDEXES: &'static [(&'static str, IndexKind)];
-
     /// This document's id.
     fn id(&self) -> &Self::Id;
+}
+
+/// The indexes a type declares.
+///
+/// Written by `#[derive(Yo)]` for every type it is put on, whether or not the
+/// type has an id, because an edge type declares indexes and has no id. That is
+/// the whole reason this is a trait of its own rather than a constant on
+/// [`Document`].
+pub trait Indexed {
+    /// The paths this type asks to be indexed, and how.
+    const INDEXES: &'static [(&'static str, IndexKind)];
 }
 
 /// A path into a document, what its index can be asked, and the type of the
@@ -635,7 +643,7 @@ impl Documents {
 }
 
 /// The key a value is filed under, or the sentence saying why it has none.
-fn key_of<Q: Query + ?Sized>(value: &Q, kind: IndexKind, what: &str) -> Result<Key> {
+pub(crate) fn key_of<Q: Query + ?Sized>(value: &Q, kind: IndexKind, what: &str) -> Result<Key> {
     // The kind matters because a text index files words rather than whole
     // strings, so a query against one has to be folded the same way the write
     // was. Everything else asks its value for the key it always gives.

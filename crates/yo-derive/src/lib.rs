@@ -80,6 +80,7 @@ fn emit(s: Struct) -> Result<TokenStream, String> {
 
     out.push_str(&shape(&s));
     out.push_str(&field(&s));
+    out.push_str(&indexed(&s));
     if let Some(id) = the_id(&s)? {
         out.push_str(&document(&s, id));
     }
@@ -152,7 +153,10 @@ impl ::yo::doc::Field for {name} {{
     )
 }
 
-fn document(s: &Struct, id: &Field) -> String {
+/// The indexes a type declares, which every derived type has whether or not it
+/// has an id. An edge type has no id and still declares indexes, so this is a
+/// trait of its own rather than a constant on `Document`.
+fn indexed(s: &Struct) -> String {
     let mut indexes = String::new();
     for f in &s.fields {
         if let Some(kind) = f.kind {
@@ -160,13 +164,22 @@ fn document(s: &Struct, id: &Field) -> String {
             indexes.push_str(&format!("({path:?}, ::yo::doc::IndexKind::{kind}),"));
         }
     }
+    let name = &s.name;
+    format!(
+        "#[automatically_derived]
+impl ::yo::doc::Indexed for {name} {{
+    const INDEXES: &'static [(&'static str, ::yo::doc::IndexKind)] = &[{indexes}];
+}}
+"
+    )
+}
+
+fn document(s: &Struct, id: &Field) -> String {
     let (name, ty, at) = (&s.name, &id.ty, &id.name);
     format!(
         "#[automatically_derived]
 impl ::yo::doc::Document for {name} {{
     type Id = {ty};
-
-    const INDEXES: &'static [(&'static str, ::yo::doc::IndexKind)] = &[{indexes}];
 
     fn id(&self) -> &{ty} {{
         &self.{at}
