@@ -51,8 +51,25 @@
 //! of those want the answer to come out of the byte the lookup already fetched
 //! rather than out of a second structure. A string is zero, so nothing written
 //! before the tag existed reads back as anything else.
+//!
+//! # The tier tag
+//!
+//! The last bit says whether the payload is the value or a place on the file
+//! where the value is. That is `14` section 4.1's tier tag, and the reason it is
+//! a bit here rather than a lookup somewhere else is the number it exists to
+//! make possible: at most 1.05 device reads for every point read. A point read
+//! that has to consult a second structure to find out whether the value is
+//! resident has already spent the miss it was trying to avoid.
+//!
+//! A demoted record keeps its deadline, its access field, its type and its
+//! encoding, and adds a length. So `TTL`, `TYPE`, `OBJECT ENCODING`, `STRLEN`,
+//! `EXISTS` and the whole of eviction go on answering at memory speed on a key
+//! whose value is on the device, and only the commands that actually want the
+//! bytes pay for them. [`write_cold_record`] writes one and [`cold`] is the
+//! branch that reads it.
 
 use crate::access::Access;
+use yo_common::Addr;
 use yo_common::num::{parse_i64, push_i64};
 
 /// The longest value Redis calls `embstr` rather than `raw`.
@@ -215,7 +232,21 @@ const HAS_EXPIRY: u8 = 0b0000_0100;
 /// three access bytes for the front of the payload. There is no format version
 /// in the file to refuse on, which is worth fixing and is not this change.
 const HAS_ACCESS: u8 = 0b0100_0000;
-/// Bits 3, 4 and 5: which type the key holds. Bit 7 is still spare.
+/// Bit 7: whether the payload is a place on the file rather than a value.
+///
+/// This is the tier tag `14` section 4.1 needs, and the reason it is a bit in
+/// the meta byte rather than a side table is the whole point of it. A point read
+/// has already paid for the cache line the record starts in by the time it looks
+/// at anything, so asking whether the value is resident is free, and asking any
+/// other way is a second miss on a path whose budget is one. That is what makes
+/// `1.05` device reads per point read a reachable number rather than `2.05`.
+///
+/// A cold record keeps its deadline and its access field in memory. Expiry has
+/// to work on a key whose value is on the device without reading the device, and
+/// so does eviction, or the policy would have to fault in the very keys it is
+/// deciding to get rid of.
+const COLD: u8 = 0b1000_0000;
+/// Bits 3, 4 and 5: which type the key holds.
 ///
 /// String is zero, so every record written before the tag existed reads back as
 /// a string, which is what it was.
@@ -329,6 +360,22 @@ impl Meta {
     #[inline]
     const fn with_access(self) -> Meta {
         Meta(self.0 | HAS_ACCESS)
+    }
+
+    /// Whether the payload is a place on the file rather than the value.
+    ///
+    /// The one question a point read asks before it decides whether it is going
+    /// to touch a device, and the answer comes out of the byte the lookup has
+    /// already fetched.
+    #[inline]
+    pub const fn is_cold(self) -> bool {
+        self.0 & COLD != 0
+    }
+
+    /// The same byte with the value declared to be on the file.
+    #[inline]
+    pub const fn with_cold(self) -> Meta {
+        Meta(self.0 | COLD)
     }
 
     /// Where the access field starts, counting from the meta byte.
@@ -538,6 +585,105 @@ pub fn write_slot_record(out: &mut [u8], kind: Kind, slot: u32, expire_at: Optio
     out[at..at + SLOT_LEN].copy_from_slice(&slot.to_le_bytes());
 }
 
+/// Bytes of file address and value length in a demoted record.
+///
+/// The length is here rather than only on the device because `STRLEN`, `TYPE`,
+/// `OBJECT ENCODING`, `TTL` and `MEMORY USAGE` all have answers that do not need
+/// the bytes, and a tiering layer that faults a value in to answer `STRLEN` is a
+/// tiering layer that has given the game away. Four bytes caps a demoted value
+/// at four gigabytes, which is above the proto-max-bulk-len a server will accept
+/// in the first place.
+const COLD_LEN: usize = 8 + 4;
+
+/// How many bytes a record pointing at a demoted value occupies.
+///
+/// Twelve bytes of payload against however many the value was, which is the
+/// whole reason demotion buys anything. A key with an eight byte value is not
+/// worth demoting and a caller that demotes one will find its memory going up.
+#[inline]
+pub fn cold_record_len(has_expiry: bool) -> usize {
+    (if has_expiry { 1 + 8 } else { 1 }) + ACCESS_LEN + COLD_LEN
+}
+
+/// Write a record saying the value is at `at` on the file and is `len` bytes.
+///
+/// `out` must be exactly [`cold_record_len`] long. `kind` and `enc` are carried
+/// across from the record being replaced so that the questions which can be
+/// answered without the device still can be.
+#[inline]
+pub fn write_cold_record(
+    out: &mut [u8],
+    kind: Kind,
+    enc: Encoding,
+    at: Addr,
+    len: u32,
+    expire_at: Option<u64>,
+) {
+    out[0] = Meta::new(kind, enc, expire_at.is_some())
+        .with_access()
+        .with_cold()
+        .byte();
+    let mut i = 1;
+    if let Some(ms) = expire_at {
+        out[i..i + 8].copy_from_slice(&ms.to_le_bytes());
+        i += 8;
+    }
+    i += write_blank_access(&mut out[i..]);
+    out[i..i + 8].copy_from_slice(&at.to_bits().to_le_bytes());
+    out[i + 8..i + 12].copy_from_slice(&len.to_le_bytes());
+}
+
+/// Where a demoted value is and how big it is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Cold {
+    /// Where on the file the value lives.
+    pub at: Addr,
+    /// How many bytes it is, so the reader can size its buffer in one go and
+    /// the commands that only want the length never go and look.
+    pub len: u32,
+}
+
+/// Where the value of a demoted record is, or `None` if the record is resident.
+///
+/// This is the branch every point read makes. `None` is the common answer and
+/// it costs one test of a bit in a byte that has already been fetched.
+#[inline]
+#[must_use]
+pub fn cold(rec: &[u8]) -> Option<Cold> {
+    let m = Meta::from_byte(rec[0]);
+    if !m.is_cold() {
+        return None;
+    }
+    let i = m.payload_at();
+    let mut a = [0u8; 8];
+    a.copy_from_slice(&rec[i..i + 8]);
+    let mut l = [0u8; 4];
+    l.copy_from_slice(&rec[i + 8..i + 12]);
+    Some(Cold {
+        at: Addr::from_bits(u64::from_le_bytes(a)),
+        len: u32::from_le_bytes(l),
+    })
+}
+
+/// How long the value in a record is, without reading it.
+///
+/// The point of the tier tag seen from the command side: `STRLEN` on a demoted
+/// key is the same cost as `STRLEN` on a resident one. `None` means the record
+/// holds something whose length is not a string length, which is every
+/// collection, and those keep their length in their body.
+#[inline]
+#[must_use]
+pub fn str_len(rec: &[u8]) -> Option<usize> {
+    let m = Meta::from_byte(rec[0]);
+    if m.kind() != Kind::String {
+        return None;
+    }
+    match cold(rec) {
+        Some(c) => Some(c.len as usize),
+        None => Some(read(rec).len()),
+    }
+}
+
 /// What the access field in a record says, or `None` if it has no room for one.
 ///
 /// `None` means the record predates the field, which is a key that was written
@@ -633,9 +779,18 @@ pub fn is_expired(rec: &[u8], now_ms: u64) -> bool {
 }
 
 /// The value in a record.
+///
+/// # Panics
+///
+/// In a debug build, if the record is demoted. A demoted record's payload is a
+/// file address and reading it as a value would hand back twelve bytes of
+/// address as though they were the string, which is the kind of wrong that
+/// looks like data corruption three layers away. Callers check [`cold`] first,
+/// and that check is the branch they were going to make anyway.
 #[inline]
 pub fn read(rec: &[u8]) -> Str<'_> {
     let m = Meta::from_byte(rec[0]);
+    debug_assert!(!m.is_cold(), "read on a record whose value is on the file");
     let at = m.payload_at();
     match m.encoding() {
         Encoding::Int => {
@@ -654,7 +809,7 @@ pub fn read(rec: &[u8]) -> Str<'_> {
 #[inline]
 pub fn read_int_in_place(rec: &[u8]) -> Option<(i64, usize)> {
     let m = Meta::from_byte(rec[0]);
-    if m.encoding() != Encoding::Int {
+    if m.is_cold() || m.encoding() != Encoding::Int {
         return None;
     }
     let at = m.payload_at();
@@ -673,7 +828,7 @@ pub fn read_int_in_place(rec: &[u8]) -> Option<(i64, usize)> {
 #[inline]
 pub fn raw_in_place(rec: &mut [u8]) -> Option<&mut [u8]> {
     let m = Meta::from_byte(rec[0]);
-    if m.encoding() != Encoding::Raw {
+    if m.is_cold() || m.encoding() != Encoding::Raw {
         return None;
     }
     let at = m.payload_at();
@@ -1020,5 +1175,108 @@ mod tests {
         assert_eq!(record_len(Encoding::Int, 10, false), 1 + 3 + 8);
         assert_eq!(slot_record_len(false), 1 + 3 + 4);
         assert_eq!(slot_record_len(true), 1 + 8 + 3 + 4);
+    }
+
+    /// A place on the file to demote a value to.
+    fn somewhere() -> Addr {
+        Addr::new(yo_common::Space::Log, 4096)
+    }
+
+    #[test]
+    fn a_demoted_record_says_so_in_the_byte_the_lookup_already_read() {
+        let mut rec = vec![0u8; cold_record_len(false)];
+        write_cold_record(
+            &mut rec,
+            Kind::String,
+            Encoding::Raw,
+            somewhere(),
+            900,
+            None,
+        );
+        // The one branch a point read makes, and it is a bit in rec[0].
+        let c = cold(&rec).expect("the record is demoted");
+        assert_eq!(c.at, somewhere());
+        assert_eq!(c.len, 900);
+    }
+
+    #[test]
+    fn a_resident_record_is_not_demoted() {
+        let mut rec = vec![0u8; record_len(Encoding::Raw, 3, false)];
+        write_record(&mut rec, Encoding::Raw, b"abc", None);
+        assert_eq!(cold(&rec), None);
+    }
+
+    #[test]
+    fn a_demoted_record_answers_everything_that_is_not_the_bytes() {
+        let deadline = 1_700_000_000_000u64;
+        let mut rec = vec![0u8; cold_record_len(true)];
+        write_cold_record(
+            &mut rec,
+            Kind::String,
+            Encoding::Raw,
+            somewhere(),
+            77,
+            Some(deadline),
+        );
+        // None of these is allowed to want the device.
+        assert_eq!(kind(&rec), Kind::String);
+        assert_eq!(expire_at(&rec), Some(deadline));
+        assert_eq!(str_len(&rec), Some(77));
+        assert_eq!(Meta::from_byte(rec[0]).encoding(), Encoding::Raw);
+        assert!(access(&rec).is_some());
+    }
+
+    #[test]
+    fn a_demoted_record_can_still_be_stamped_and_ranked() {
+        // Eviction has to be able to score a key whose value is on the file,
+        // or the policy would fault in the keys it is trying to get rid of.
+        let mut rec = vec![0u8; cold_record_len(false)];
+        write_cold_record(
+            &mut rec,
+            Kind::String,
+            Encoding::Embstr,
+            somewhere(),
+            5,
+            None,
+        );
+        let a = Access::from_bits(12345);
+        assert!(set_access(&mut rec, a));
+        assert_eq!(access(&rec), Some(a));
+        // And the address survived being written around.
+        assert_eq!(cold(&rec).map(|c| c.at), Some(somewhere()));
+    }
+
+    #[test]
+    fn the_in_place_writers_refuse_a_demoted_record() {
+        let mut rec = vec![0u8; cold_record_len(false)];
+        write_cold_record(&mut rec, Kind::String, Encoding::Int, somewhere(), 2, None);
+        // The payload of this record parses as an int if you do not look at the
+        // tier tag first, which is exactly the bug the check is here to stop.
+        assert_eq!(read_int_in_place(&rec), None);
+        assert_eq!(raw_in_place(&mut rec), None);
+    }
+
+    #[test]
+    fn demoting_a_long_value_is_what_buys_the_memory() {
+        // Twelve bytes of payload whatever the value was. A short value is not
+        // worth demoting and the arithmetic says so rather than a comment.
+        let long = record_len(Encoding::Raw, 4096, false);
+        assert!(
+            cold_record_len(false) < long / 100,
+            "{} against {long}",
+            cold_record_len(false)
+        );
+        assert!(cold_record_len(false) > record_len(Encoding::Raw, 8, false));
+    }
+
+    #[test]
+    fn str_len_on_a_resident_string_is_the_value_length() {
+        let mut rec = vec![0u8; record_len(Encoding::Raw, 3, false)];
+        write_record(&mut rec, Encoding::Raw, b"abc", None);
+        assert_eq!(str_len(&rec), Some(3));
+
+        let mut n = vec![0u8; record_len(Encoding::Int, 0, false)];
+        write_int_record(&mut n, -1234, None);
+        assert_eq!(str_len(&n), Some(5));
     }
 }
