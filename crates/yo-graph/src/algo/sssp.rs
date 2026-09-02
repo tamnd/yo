@@ -60,70 +60,99 @@ use crate::Snapshot;
 /// How far away a node the search never reached is.
 pub const UNREACHABLE: u64 = u64::MAX;
 
+/// The band width [`sssp`] uses.
+pub const DELTA: u32 = 16;
+
 /// How far every node is from `src`, or [`UNREACHABLE`].
 ///
 /// `weights` is what [`Snapshot::weighted`] handed back, in the same order as
-/// the outgoing runs. A shorter one is treated as a graph whose remaining edges
-/// weigh nothing, because a read should not panic on a caller's arithmetic, and
-/// that is a mistake the caller will see in the answer immediately.
+/// the outgoing runs.
+///
+/// # Panics
+///
+/// If `weights` is not one weight per edge of the snapshot. A weight that does
+/// not line up with the edge it belongs to is a wrong answer rather than a slow
+/// one, and there is no reading of a short list that is more likely to be what
+/// the caller meant than a mistake.
 #[must_use]
 pub fn sssp(g: &Snapshot, weights: &[u32], src: u32) -> Vec<u64> {
-    sssp_with(g, weights, src, pick(g, weights))
+    sssp_with(g, weights, src, DELTA)
 }
 
 /// The same, with the band width spelled out.
 ///
-/// A `delta` of zero is read as one, since a band has to have some width. Very
-/// large weights against a very small `delta` means a lot of empty buckets to
-/// step over, which costs time and no memory, since the buckets are a ring
-/// however far apart the distances are.
+/// Rounded down to a power of two, and a `delta` of zero read as one. Very large
+/// weights against a very small `delta` means a lot of empty buckets to step
+/// over, which costs time and no memory, since the buckets are a ring however
+/// far apart the distances are.
+///
+/// # Panics
+///
+/// If `weights` is not one weight per edge of the snapshot.
 #[must_use]
 pub fn sssp_with(g: &Snapshot, weights: &[u32], src: u32, delta: u32) -> Vec<u64> {
+    assert_eq!(weights.len() as u64, g.edges(), "one weight an edge");
     let n = g.nodes();
     let mut far = vec![UNREACHABLE; n as usize];
     if src >= n {
         return far;
     }
-    let delta = u64::from(delta.max(1));
 
-    // A ring of buckets, wide enough that an edge relaxed out of the bucket
-    // being emptied cannot reach round to a bucket that has already been done.
-    // The heaviest edge moves a node at most that many bands forward.
+    // The band width as a shift rather than a number. Every relaxation has to
+    // work out which bucket a distance falls in, which is a division by the
+    // width and then one by the ring size, and a division is thirty cycles that
+    // the rest of the loop does not have to spare. Rounding the width down to a
+    // power of two and the ring up to one turns both into a shift and a mask.
+    // The width is a heuristic to begin with, so rounding it costs nothing real.
+    let shift = delta.max(1).ilog2();
+    let width = 1u64 << shift;
     let heaviest = u64::from(weights.iter().copied().max().unwrap_or(0));
-    let ring = (heaviest / delta + 2) as usize;
-    let mut bucket: Vec<Vec<u32>> = vec![Vec::new(); ring];
+
+    // Wide enough that an edge relaxed out of the bucket being emptied cannot
+    // reach round to one that has already been done. The heaviest edge moves a
+    // node at most that many bands forward.
+    let ring = ((heaviest >> shift) + 2).next_power_of_two();
+    let mask = ring - 1;
+    let mut bucket: Vec<Vec<u32>> = vec![Vec::new(); ring as usize];
 
     far[src as usize] = 0;
     bucket[0].push(src);
     let mut waiting = 1usize;
 
     let mut band = 0u64;
+    let mut here: Vec<u32> = Vec::new();
     let mut done: Vec<u32> = Vec::new();
     while waiting > 0 {
-        let at = (band % ring as u64) as usize;
+        let at = (band & mask) as usize;
         done.clear();
 
         // The light edges, over and over, because relaxing one can put a node
-        // back into the bucket that is being emptied.
+        // back into the bucket that is being emptied. The swap is so that the
+        // room the last pass allocated is the room this one fills.
         while !bucket[at].is_empty() {
-            let here = std::mem::take(&mut bucket[at]);
+            std::mem::swap(&mut here, &mut bucket[at]);
             waiting -= here.len();
-            for node in here {
+            for node in here.drain(..) {
                 // Somebody found a shorter way to this node after it went into
                 // the bucket, so it belongs to an earlier band and has already
                 // been dealt with there.
-                if far[node as usize] / delta != band {
+                let from = far[node as usize];
+                if from >> shift != band {
                     continue;
                 }
                 done.push(node);
-                // Nothing relaxed below can make this node itself any closer,
-                // since no edge weighs less than nothing, so the distance it is
-                // working from is fixed for the whole of this loop.
-                let at = far[node as usize];
-                for (to, weight) in near(g, weights, node) {
-                    if u64::from(weight) <= delta {
-                        let now = at + u64::from(weight);
-                        relax(&mut far, &mut bucket, &mut waiting, delta, ring, to, now);
+                let near = g.out(node);
+                let cost = &weights[g.out_at(node)..][..near.len()];
+                for (to, weight) in near.iter().zip(cost) {
+                    let weight = u64::from(*weight);
+                    if weight > width {
+                        continue;
+                    }
+                    let now = from + weight;
+                    if now < far[*to as usize] {
+                        far[*to as usize] = now;
+                        bucket[((now >> shift) & mask) as usize].push(*to);
+                        waiting += 1;
                     }
                 }
             }
@@ -131,61 +160,25 @@ pub fn sssp_with(g: &Snapshot, weights: &[u32], src: u32, delta: u32) -> Vec<u64
 
         // Then the heavy ones, once, for everything that came out of the band.
         for node in &done {
-            let at = far[*node as usize];
-            for (to, weight) in near(g, weights, *node) {
-                if u64::from(weight) > delta {
-                    let now = at + u64::from(weight);
-                    relax(&mut far, &mut bucket, &mut waiting, delta, ring, to, now);
+            let from = far[*node as usize];
+            let near = g.out(*node);
+            let cost = &weights[g.out_at(*node)..][..near.len()];
+            for (to, weight) in near.iter().zip(cost) {
+                let weight = u64::from(*weight);
+                if weight <= width {
+                    continue;
+                }
+                let now = from + weight;
+                if now < far[*to as usize] {
+                    far[*to as usize] = now;
+                    bucket[((now >> shift) & mask) as usize].push(*to);
+                    waiting += 1;
                 }
             }
         }
         band += 1;
     }
     far
-}
-
-/// One node's edges, as a neighbour and what it costs to take it.
-fn near<'a>(
-    g: &'a Snapshot,
-    weights: &'a [u32],
-    node: u32,
-) -> impl Iterator<Item = (u32, u32)> + 'a {
-    let from = g.out_at(node);
-    g.out(node)
-        .iter()
-        .enumerate()
-        .map(move |(i, to)| (*to, weights.get(from + i).copied().unwrap_or(0)))
-}
-
-/// Take a shorter way to a node, if this is one.
-fn relax(
-    far: &mut [u64],
-    bucket: &mut [Vec<u32>],
-    waiting: &mut usize,
-    delta: u64,
-    ring: usize,
-    node: u32,
-    now: u64,
-) {
-    if now >= far[node as usize] {
-        return;
-    }
-    far[node as usize] = now;
-    bucket[(now / delta % ring as u64) as usize].push(node);
-    *waiting += 1;
-}
-
-/// The band width to use when the caller has no opinion.
-///
-/// The heaviest edge over the average degree, which is the integer reading of
-/// the paper's guidance. The point of it is that a band should hold about one
-/// step's worth of the graph: with an average degree of sixteen and weights up
-/// to a hundred, a band a hundred wide would take in most of the frontier at
-/// once and a band one wide would take in almost none of it.
-fn pick(g: &Snapshot, weights: &[u32]) -> u32 {
-    let heaviest = weights.iter().copied().max().unwrap_or(1);
-    let degree = (g.edges() / u64::from(g.nodes().max(1))).max(1);
-    (u64::from(heaviest) / degree).max(1) as u32
 }
 
 #[cfg(test)]

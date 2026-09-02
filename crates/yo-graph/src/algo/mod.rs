@@ -37,17 +37,25 @@
 //! for strong components, written with its frames in a `Vec` so a long chain
 //! does not take the process down with it.
 //!
+//! [`leiden()`] is Traag, Waltman and van Eck from 2019, which is Louvain with
+//! the step that stops it handing back a community in two disconnected halves.
+//! [`louvain()`] itself is here to be measured against it, and
+//! [`label_propagation()`] is the one to reach for when even Louvain is too much
+//! work for the size of the graph.
+//!
 //! # Why they are deterministic
 //!
-//! Two of them sample, and both sample from [`yo_common::Rng`] with a fixed
-//! seed. A caller who runs the same algorithm over the same snapshot twice gets
-//! the same answer, including the same representative for a component and the
-//! same nodes chosen for a sample. That is worth more than the entropy is: an
-//! algorithm whose answer moves between runs cannot be tested against a
-//! reference implementation and cannot be diffed between two versions of this
-//! crate.
+//! Several of these sample or shuffle, and all of them draw from
+//! [`yo_common::Rng`] with a fixed seed. A caller who runs the same algorithm
+//! over the same snapshot twice gets the same answer, including the same
+//! representative for a component, the same nodes chosen for a sample and the
+//! same communities. That is worth more than the entropy is: an algorithm whose
+//! answer moves between runs cannot be tested against a reference
+//! implementation and cannot be diffed between two versions of this crate.
 
 pub mod bfs;
+pub mod community;
+pub mod label_propagation;
 pub mod pagerank;
 pub mod scc;
 pub mod sssp;
@@ -55,6 +63,8 @@ pub mod triangle;
 pub mod wcc;
 
 pub use bfs::{UNREACHED, bfs};
+pub use community::{leiden, leiden_with, louvain, louvain_with, modularity, modularity_with};
+pub use label_propagation::{label_propagation, label_propagation_with};
 pub use pagerank::{Rank, pagerank, pagerank_with};
 pub use scc::scc;
 pub use sssp::{UNREACHABLE, sssp, sssp_with};
@@ -133,6 +143,29 @@ impl Components {
     pub fn labels(&self) -> &[u32] {
         &self.of
     }
+}
+
+/// Rename every group after the lowest numbered node in it.
+///
+/// [`wcc()`] and [`scc()`] arrive at that naming on their own, out of how they
+/// are written. The community algorithms do not: they end up with whatever
+/// label happened to win, which is a node id but an arbitrary one, and two runs
+/// that found the same communities would then disagree on paper. This is the
+/// pass that makes the answer depend only on the grouping.
+///
+/// Every label has to be a dense id, which is true of every algorithm here
+/// because a community is named after one of its members.
+pub(crate) fn tidy(mut of: Vec<u32>) -> Components {
+    let mut low = vec![u32::MAX; of.len()];
+    for (node, at) in of.iter().enumerate() {
+        let low = &mut low[*at as usize];
+        *low = (*low).min(node as u32);
+    }
+    let count = low.iter().filter(|low| **low != u32::MAX).count() as u32;
+    for at in &mut of {
+        *at = low[*at as usize];
+    }
+    Components { of, count }
 }
 
 /// A bit per node, which is how a frontier is held when it is big.

@@ -92,7 +92,10 @@ use std::collections::BinaryHeap;
 use std::hint::black_box;
 use yo_common::Rng;
 use yo_graph::algo::pagerank::DAMPING;
-use yo_graph::algo::{UNREACHABLE, UNREACHED, bfs, pagerank_with, scc, sssp, triangle_count, wcc};
+use yo_graph::algo::{
+    UNREACHABLE, UNREACHED, bfs, label_propagation, leiden, louvain, modularity, pagerank_with,
+    scc, sssp, sssp_with, triangle_count, wcc,
+};
 use yo_graph::{Graph, NO_PROPS, Snapshot};
 
 const LABEL: u32 = 1;
@@ -344,6 +347,17 @@ fn bench_algo(c: &mut Criterion) {
         small.edges(),
         triangle_count(&small)
     );
+    for (name, c) in [
+        ("leiden", leiden(&small)),
+        ("louvain", louvain(&small)),
+        ("label propagation", label_propagation(&small)),
+    ] {
+        eprintln!(
+            "{name} found {} communities at modularity {:.4}",
+            c.count(),
+            modularity(&small, c.labels())
+        );
+    }
 
     let mut group = c.benchmark_group("algo");
     group.sample_size(20);
@@ -370,6 +384,20 @@ fn bench_algo(c: &mut Criterion) {
     });
     group.bench_function("pagerank/push 10 rounds", |b| {
         b.iter(|| black_box(push(black_box(&s), ROUNDS)));
+    });
+    for delta in [1u32, 2, 4, 8, 16, 32, 64, 128] {
+        group.bench_function(format!("sweep/delta {delta}"), |b| {
+            b.iter(|| black_box(sssp_with(black_box(&s), black_box(&weights), src, delta)));
+        });
+    }
+    group.bench_function("community/leiden", |b| {
+        b.iter(|| black_box(leiden(black_box(&small))));
+    });
+    group.bench_function("community/louvain", |b| {
+        b.iter(|| black_box(louvain(black_box(&small))));
+    });
+    group.bench_function("community/label propagation", |b| {
+        b.iter(|| black_box(label_propagation(black_box(&small))));
     });
     group.bench_function("sssp/delta stepping", |b| {
         b.iter(|| black_box(sssp(black_box(&s), black_box(&weights), src)));
