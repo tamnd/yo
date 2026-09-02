@@ -29,6 +29,10 @@ name = "adjacency"
 harness = false
 
 [[bench]]
+name = "algo"
+harness = false
+
+[[bench]]
 name = "cold"
 harness = false
 

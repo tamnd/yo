@@ -81,6 +81,14 @@ const EMPTY_OBJECT: [u8; 4] = EMPTY_OBJECT_HEAD.to_le_bytes();
 /// bytes. `yo_format::doc_flags` names the same bits.
 const EMPTY_OBJECT_HEAD: u32 = 7 | (1 << 4) | (1 << 5);
 
+/// What to pass as the properties of a node or an edge that has none.
+///
+/// An edge still needs a document, because the property store is keyed by the
+/// edge slot and a slot with nothing under it would be a slot that later reads
+/// have to guard against. This is the four bytes that document is, so a caller
+/// with nothing to say does not have to run a `Builder` to say it.
+pub const NO_PROPS: &[u8] = &EMPTY_OBJECT;
+
 /// A property graph.
 #[derive(Debug, Default)]
 pub struct Graph {
