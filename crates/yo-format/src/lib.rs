@@ -27,11 +27,13 @@ pub mod catalog;
 pub mod page;
 pub mod record;
 pub mod superblock;
+pub mod vector;
 
 pub use catalog::{Band, CatalogEntry, Model, ValueType};
 pub use page::{PAGE_HEADER_LEN, PageHeader};
 pub use record::{RecordHeader, RecordKind, RecordRef, record_flags};
 pub use superblock::{CheckpointEntry, Superblock, superblock_flags};
+pub use vector::{Element, VECTOR_HEADER_LEN, VectorBody};
 
 /// The sixteen bytes at offset zero of every `.yo` file.
 ///
