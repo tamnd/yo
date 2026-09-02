@@ -26,20 +26,26 @@
 //!
 //! # Where it stands
 //!
-//! On an M4 Max, minimum per iteration, one run:
+//! On an M4 Max, a thousand and twenty four codes an iteration, one run:
 //!
 //! ```text
-//! dim   scan/one   scan/exact_one   scan/four   scan/exact_four
-//! 128      9.1 us         110.5 us     45.2 us          325.4 us
-//! 256     10.3 us         233.8 us     65.1 us          748.4 us
-//! 768     20.6 us         721.5 us    169.9 us         2738.1 us
+//! dim   scan/one   apiece/one   scan/four   apiece/four   exact/one   exact/four
+//! 128      3.8 us       6.7 us     20.1 us       20.9 us     89.9 us     280.4 us
+//! 256      5.4 us       8.0 us     36.4 us       38.1 us    174.0 us     530.7 us
+//! 768     12.4 us      15.6 us     76.7 us       93.2 us    531.6 us    1576.1 us
 //! ```
 //!
-//! So a thousand codes at 768 dimensions is 20 microseconds against a whole
-//! search budget of a millisecond, and the popcount scan is 35 times the float
-//! one at one bit and 16 times at four. Encode at the same dimension is about 8
+//! So a thousand codes at 768 dimensions is 12 microseconds against a whole
+//! search budget of a millisecond, and the popcount scan is 43 times the float
+//! one at one bit and 21 times at four. Encode at the same dimension is about 8
 //! microseconds, which is 120 thousand vectors a second on one core against a
 //! target of fifty thousand, so ingest has room too.
+//!
+//! The `scan` rows against the `apiece` rows are the same arithmetic over the
+//! same bytes, differing only in whether the estimator was handed the posting
+//! or one code at a time. At 128 dimensions that is 3.8 against 6.7, which is
+//! most of what a search does and it comes from nothing more than the compiler
+//! being able to see how wide a code is.
 //!
 //! The `exact` rows get worse faster than the real ones do, and that is the
 //! layout talking rather than the estimator. Reading a coordinate's level out of
@@ -49,13 +55,17 @@
 //! so.
 //!
 //! The row that is now worth watching is `query` against `scan`. Preparing a
-//! query is 9.8 microseconds at 768 dimensions and scanning a partition of a
-//! thousand codes is 20.6, so the preparation is no longer lost in the noise. It
-//! happens once per partition probed, because the residual is taken against that
-//! partition's centroid, and a search probes tens of them. The fix is that the
-//! rotation is linear, so rotating the centroids once when they are built turns
-//! the per partition work into a subtraction, and it lands with the partition
-//! store.
+//! query is 9.4 microseconds at 768 dimensions and scanning a partition of a
+//! thousand codes is 12.4, so the preparation is no longer lost in the noise,
+//! and it got worse rather than better when the scan got faster.
+//!
+//! What this row measures is not quite what a search pays, though, and the
+//! difference matters. `query` is a rotation and then a residual and a
+//! quantisation, and the rotation is 7.2 of those 9.4 microseconds. A search
+//! rotates once and then takes a residual against each partition it probes, so
+//! the per partition cost is the other 2.2, and the rotation is amortised over
+//! tens of partitions rather than paid by each of them, which is what the
+//! `rotated` rows are here to keep honest.
 //!
 //! # Reading these on a machine someone else is using
 //!
@@ -133,16 +143,31 @@ fn bench_scan(c: &mut Criterion) {
             let (codes, meta) = partition(&q, &vs, &centroid);
             let width = q.code_bytes();
             let prepared = q.query(&query, &centroid);
+            let mut out = vec![0.0f32; n];
             g.bench_with_input(BenchmarkId::new(name, dim), &dim, |b, _| {
                 b.iter(|| {
-                    let mut best = f32::INFINITY;
-                    for i in 0..n {
-                        let d = prepared.distance(&codes[i * width..(i + 1) * width], &meta[i]);
-                        best = best.min(d);
-                    }
-                    black_box(best)
+                    prepared.scan(&codes, &meta, &mut out);
+                    black_box(out.iter().copied().fold(f32::INFINITY, f32::min))
                 });
             });
+            // The same posting one code at a time, through the convenient
+            // entry point. The gap between the two rows is what handing the
+            // estimator a whole posting buys, which is the width decided once
+            // instead of per member and the query's own terms hoisted out.
+            g.bench_with_input(
+                BenchmarkId::new(format!("apiece/{name}"), dim),
+                &dim,
+                |b, _| {
+                    b.iter(|| {
+                        let mut best = f32::INFINITY;
+                        for i in 0..n {
+                            let d = prepared.distance(&codes[i * width..(i + 1) * width], &meta[i]);
+                            best = best.min(d);
+                        }
+                        black_box(best)
+                    });
+                },
+            );
             // The same scan against a query that was never quantised, which is
             // a float multiply per dimension per code and is what the popcount
             // scan replaced. It is here so the claim about the speedup is a
@@ -176,6 +201,14 @@ fn bench_query(c: &mut Criterion) {
         let q = Quantizer::new(dim, Bits::One, 7);
         g.bench_with_input(BenchmarkId::from_parameter(dim), &dim, |b, _| {
             b.iter(|| black_box(q.query(black_box(&query), &centroid)));
+        });
+        // The same without the rotation, which is what a search pays per
+        // partition it probes. The rotation happens once for the whole search
+        // and the residual and the quantisation happen once per partition, so
+        // this is the row that scales with `probe` and the one above is not.
+        let rotated = q.rotate(&query);
+        g.bench_with_input(BenchmarkId::new("rotated", dim), &dim, |b, _| {
+            b.iter(|| black_box(q.query_rotated(black_box(&rotated), &centroid)));
         });
     }
     g.finish();

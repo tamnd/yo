@@ -609,33 +609,42 @@ impl Partitions {
         // Rotated once here and never again, which is what lets a search probe
         // tens of partitions without paying for tens of rotations.
         let u = self.quant.rotate(q);
-        let width = self.quant.code_bytes();
-        let mut found = Vec::new();
+        let mut best = Bounded::new(want);
+        // One buffer for the whole search rather than one per partition, and
+        // grown rather than cleared, because every partition after the first
+        // wants the same room the one before it did.
+        let mut scores: Vec<f32> = Vec::new();
         let reach = self.tuning.probe.saturating_mul(self.tuning.widen.max(1));
         for (n, p) in self.near_partitions(&u, reach).into_iter().enumerate() {
             // Past the partitions an unfiltered search would have read, keep
             // going only while there is still not enough to answer with. An
             // unfiltered search never gets here, because the first `probe`
             // partitions of a collection worth probing hold more than `want`.
-            if n >= self.tuning.probe && found.len() >= want {
+            if n >= self.tuning.probe && best.full() {
                 break;
             }
             let prepared = self.quant.query_rotated(&u, self.centroid(p));
             let posting = &self.postings[p];
-            for (i, &id) in posting.ids.iter().enumerate() {
+            let held = posting.ids.len();
+            if scores.len() < held {
+                scores.resize(held, 0.0);
+            }
+            // The whole posting at once, so the estimator's inner loops know
+            // how wide a code is. Then a second pass, which for most members is
+            // one comparison against the worst answer so far and no more, and
+            // which does not read the id or the tag of a member that lost.
+            prepared.scan(&posting.codes, &posting.meta, &mut scores[..held]);
+            for (i, &at) in scores[..held].iter().enumerate() {
+                if !best.wants(at) {
+                    continue;
+                }
                 if !filter.allows(posting.tags[i]) {
                     continue;
                 }
-                let code = &posting.codes[i * width..(i + 1) * width];
-                found.push((id, prepared.distance(code, &posting.meta[i])));
+                best.put(posting.ids[i], at);
             }
         }
-        if found.len() > want {
-            found.select_nth_unstable_by(want, |a, b| a.1.total_cmp(&b.1));
-            found.truncate(want);
-        }
-        found.sort_by(|a, b| a.1.total_cmp(&b.1));
-        found
+        best.sorted()
     }
 
     /// Whether there is a split or a merge waiting.
@@ -1080,6 +1089,89 @@ fn sqdist(a: &[f32], b: &[f32]) -> f32 {
         i += 1;
     }
     sum
+}
+
+/// One candidate, ordered by its estimated distance.
+///
+/// The tie break on the id is not decoration. Two members of the same partition
+/// can get the same estimate out of codes that are 16 bytes wide, and without a
+/// tie break which of them survives depends on the order the heap happened to
+/// be in, which makes a search answer depend on the insertion history of the
+/// collection rather than on the collection.
+#[derive(PartialEq)]
+struct Ranked {
+    at: f32,
+    id: u64,
+}
+
+impl Eq for Ranked {}
+
+impl Ord for Ranked {
+    fn cmp(&self, other: &Ranked) -> std::cmp::Ordering {
+        self.at.total_cmp(&other.at).then(self.id.cmp(&other.id))
+    }
+}
+
+impl PartialOrd for Ranked {
+    fn partial_cmp(&self, other: &Ranked) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+/// The best `want` candidates seen so far, and nothing else.
+///
+/// The scan used to push every member of every partition it read into one
+/// vector and then select from it, which at probe 64 is 24 thousand entries
+/// pushed and 24 thousand selected over to keep 160. That is 384 kilobytes of
+/// writes per search and it was a tenth of the search's time.
+///
+/// A bounded heap makes the common case one comparison. Once `want` candidates
+/// are in, a member is only touched further if it beats the worst of them,
+/// which after the first partition or two is a small fraction of them, and a
+/// member that loses never has its id or its tag read at all.
+struct Bounded {
+    want: usize,
+    heap: std::collections::BinaryHeap<Ranked>,
+}
+
+impl Bounded {
+    fn new(want: usize) -> Bounded {
+        Bounded {
+            want,
+            heap: std::collections::BinaryHeap::with_capacity(want + 1),
+        }
+    }
+
+    /// Whether there are already `want` answers, which is what says a search
+    /// that was widening for a filter can stop widening.
+    fn full(&self) -> bool {
+        self.heap.len() >= self.want
+    }
+
+    /// Whether `at` could still be one of the answers.
+    #[inline]
+    fn wants(&self, at: f32) -> bool {
+        match self.heap.peek() {
+            Some(worst) if self.heap.len() >= self.want => at < worst.at,
+            _ => true,
+        }
+    }
+
+    fn put(&mut self, id: u64, at: f32) {
+        if self.heap.len() >= self.want {
+            self.heap.pop();
+        }
+        self.heap.push(Ranked { at, id });
+    }
+
+    /// The answers, nearest first.
+    fn sorted(self) -> Vec<(u64, f32)> {
+        self.heap
+            .into_sorted_vec()
+            .into_iter()
+            .map(|r| (r.id, r.at))
+            .collect()
+    }
 }
 
 #[cfg(test)]
@@ -1659,7 +1751,7 @@ mod tests {
 
         assert_eq!(a, b, "the two ways round should write the same code");
         assert!((one.norm - two.norm).abs() < 1e-4);
-        assert!((one.correction - two.correction).abs() < 1e-4);
+        assert!((one.scale - two.scale).abs() < 1e-4);
     }
 
     #[test]
