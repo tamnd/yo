@@ -32,6 +32,7 @@ use crate::hash::{self, Hash};
 use crate::list::{self, List};
 use crate::set::{self, Set};
 use crate::slab::{Bytes, Slab};
+use crate::stream::{self, Stream};
 use crate::ttl::{self, Applied, Ask, Cond};
 use crate::value::{self, Kind};
 use crate::zset::{self, Zset};
@@ -50,7 +51,7 @@ macro_rules! bytes {
         }
     })* };
 }
-bytes!(Set, Hash, List, Zset, Array);
+bytes!(Set, Hash, List, Zset, Array, Stream);
 
 /// A foreign body counts what it says it counts, plus the box around it.
 ///
@@ -94,6 +95,8 @@ pub struct Keyspace {
     pub(crate) zsets: Slab<Zset>,
     /// Every sparse array in this database, addressed the same way.
     pub(crate) arrays: Slab<Array>,
+    /// Every stream in this database, addressed the same way.
+    pub(crate) streams: Slab<Stream>,
     /// Every foreign body in this database, addressed the same way.
     ///
     /// A box per slot rather than a value, because the thing in it is not sized
@@ -120,6 +123,8 @@ pub struct Keyspace {
     pub(crate) list_limits: list::Limits,
     /// Where a sorted set changes representation.
     pub(crate) zset_limits: zset::Limits,
+    /// Where a stream starts a new node, which is two `CONFIG` values.
+    pub(crate) stream_limits: stream::Limits,
     /// What this database would evict, and therefore what a read writes back.
     ///
     /// One server wide setting in Redis, carried per database here for the same
@@ -360,12 +365,14 @@ impl Keyspace {
             lists: Slab::new(),
             zsets: Slab::new(),
             arrays: Slab::new(),
+            streams: Slab::new(),
             foreign: Slab::new(),
             bodies: 0,
             limits: set::Limits::DEFAULT,
             hash_limits: hash::Limits::DEFAULT,
             list_limits: list::Limits::default(),
             zset_limits: zset::Limits::DEFAULT,
+            stream_limits: stream::Limits::default(),
             policy: Policy::default(),
             lfu: Lfu::DEFAULT,
             samples: evict::SAMPLES,
@@ -620,6 +627,22 @@ impl Keyspace {
         self.list_limits = limits;
     }
 
+    /// Where a stream starts a new node, which is two `CONFIG` values.
+    #[inline]
+    pub const fn stream_limits(&self) -> &stream::Limits {
+        &self.stream_limits
+    }
+
+    /// Change where a stream starts a new node.
+    ///
+    /// Same rule as the other four: this decides what the next `XADD` builds
+    /// and leaves every node that is already full exactly as it is, which is
+    /// also what Redis does, since a node is never resized after it is written.
+    #[inline]
+    pub const fn set_stream_limits(&mut self, limits: stream::Limits) {
+        self.stream_limits = limits;
+    }
+
     /// Where a sorted set changes representation, which is two `CONFIG` values.
     #[inline]
     pub const fn zset_limits(&self) -> &zset::Limits {
@@ -862,13 +885,11 @@ impl Keyspace {
             Kind::Zset => self.zset_encoding(key).map(zset::Encoding::name),
             // The one type with one encoding, so there is nothing to ask.
             Kind::Array => Some("sliced-array"),
+            // The same, and Redis's word for it rather than a description of
+            // the node layout.
+            Kind::Stream => Some("stream"),
             // The body knows and this does not, which is the whole point of it.
             Kind::Foreign => self.foreign_at(key).map(Foreign::encoding),
-            // Named rather than caught, so that the next type to land is a
-            // build error here and not a panic on a live server. That is not
-            // hypothetical: `COPY` of a list took the shard down for exactly as
-            // long as its own match had a catch all at the bottom.
-            Kind::Stream => unreachable!("nothing can store a stream yet"),
         }
     }
 
@@ -911,6 +932,7 @@ impl Keyspace {
             | Kind::List
             | Kind::Zset
             | Kind::Array
+            | Kind::Stream
             | Kind::Foreign) => {
                 let slot = value::slot(rec);
                 let len = value::slot_record_len(at.is_some());
@@ -918,8 +940,6 @@ impl Keyspace {
                     value::write_slot_record(out, kind, slot, at);
                 });
             }
-            // Named rather than caught, as above.
-            Kind::Stream => unreachable!("nothing can store a stream yet"),
         }
         true
     }
@@ -1042,13 +1062,16 @@ impl Keyspace {
                 self.arrays.remove(at);
                 self.bodies -= 1;
             }
+            Kind::Stream => {
+                let at = value::slot(rec);
+                self.streams.remove(at);
+                self.bodies -= 1;
+            }
             Kind::Foreign => {
                 let at = value::slot(rec);
                 self.foreign.remove(at);
                 self.bodies -= 1;
             }
-            // Named rather than caught, as above.
-            Kind::Stream => unreachable!("nothing can store a stream yet"),
         }
     }
 
@@ -1257,6 +1280,7 @@ impl Keyspace {
         self.lists.clear();
         self.zsets.clear();
         self.arrays.clear();
+        self.streams.clear();
         self.foreign.clear();
         self.pool.clear();
         self.bodies = 0;
@@ -1489,6 +1513,7 @@ impl Keyspace {
             + self.lists.value_bytes()
             + self.zsets.value_bytes()
             + self.arrays.value_bytes()
+            + self.streams.value_bytes()
             + self.foreign.value_bytes()
     }
 
@@ -1507,12 +1532,13 @@ impl Keyspace {
             + self.lists.settled_bytes()
             + self.zsets.settled_bytes()
             + self.arrays.settled_bytes()
+            + self.streams.settled_bytes()
             + self.foreign.settled_bytes()
     }
 
     /// Start or stop keeping the running total in every slab.
     ///
-    /// One call for all six, because a limit is a property of the server and
+    /// One call for all seven, because a limit is a property of the server and
     /// not of a type, and a database tracking its sets but not its hashes would
     /// answer a number that is neither of the two things it could mean.
     pub fn track_memory(&mut self, on: bool) {
@@ -1521,6 +1547,7 @@ impl Keyspace {
         self.lists.track_bytes(on);
         self.zsets.track_bytes(on);
         self.arrays.track_bytes(on);
+        self.streams.track_bytes(on);
         self.foreign.track_bytes(on);
     }
 
@@ -1533,6 +1560,7 @@ impl Keyspace {
             + self.lists.slot_bytes()
             + self.zsets.slot_bytes()
             + self.arrays.slot_bytes()
+            + self.streams.slot_bytes()
             + self.foreign.slot_bytes()
     }
 

@@ -125,6 +125,7 @@ pub mod sets;
 pub mod slab;
 pub mod sort;
 pub mod stream;
+pub mod streams;
 pub mod strings;
 #[cfg(test)]
 mod tally;

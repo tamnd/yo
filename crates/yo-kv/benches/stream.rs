@@ -161,7 +161,7 @@ fn bench_write(c: &mut Criterion) {
         g.bench_with_input(BenchmarkId::new("trim", n), &n, |b, _| {
             b.iter_batched_ref(
                 || filled(n),
-                |s| black_box(s.trim_maxlen((n / 10) as u64, true)),
+                |s| black_box(s.trim_maxlen((n / 10) as u64, true, None)),
                 criterion::BatchSize::LargeInput,
             )
         });
@@ -254,7 +254,7 @@ fn bench_read(c: &mut Criterion) {
 fn behind(n: usize) -> Stream {
     let mut s = filled(n);
     s.create_group(b"workers", Id::MIN, Some(0));
-    s.read_group(b"workers", b"alice", None, 1, |_, _| true)
+    s.read_group(b"workers", b"alice", None, false, 1, |_, _| true)
         .expect("the group");
     s
 }
@@ -277,7 +277,7 @@ fn bench_groups(c: &mut Criterion) {
                 },
                 |s| {
                     let mut got = 0usize;
-                    s.read_group(b"workers", b"alice", None, 1, |_, fields| {
+                    s.read_group(b"workers", b"alice", None, false, 1, |_, fields| {
                         got += fields.len();
                         true
                     });

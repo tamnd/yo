@@ -403,6 +403,20 @@ impl Group {
         true
     }
 
+    /// Move the bookmark past an entry without writing it into the ledger.
+    ///
+    /// This is `XREADGROUP ... NOACK`, which is a consumer saying it does not
+    /// want the work tracked. The group still counts the entry as read, because
+    /// the lag is about how far behind the group is and not about how much of
+    /// it is outstanding, so a NOACK reader that has caught up reports a lag of
+    /// zero the same as any other.
+    pub fn skip(&mut self, id: Id) {
+        if id > self.last {
+            self.last = id;
+        }
+        self.read = self.read.map(|n| n + 1);
+    }
+
     /// Hand an entry to whoever already holds it, which is a history read.
     ///
     /// `XREADGROUP` with an ID rather than `>` is a consumer asking for what it
@@ -576,6 +590,32 @@ impl Group {
             }
         }
         None
+    }
+
+    /// How many bytes this group takes, not counting the struct itself.
+    ///
+    /// The pending map is counted per entry at the size of a key and a value
+    /// plus a share of the node around them, rather than exactly, because a
+    /// [`BTreeMap`] does not say how many nodes it has and the answer is only
+    /// ever read by `MEMORY USAGE` and the eviction total. A B-tree node here
+    /// holds eleven entries and some overhead, and a sixteenth of an entry is
+    /// close enough for both.
+    #[must_use]
+    pub fn memory_bytes(&self) -> usize {
+        let each = std::mem::size_of::<(Id, Nack)>();
+        let pending = self.pending.len() * (each + each / 16);
+        let consumers: usize = self
+            .consumers
+            .iter()
+            .map(|slot| {
+                std::mem::size_of::<Option<Consumer>>()
+                    + slot.as_ref().map_or(0, |c| {
+                        let each = std::mem::size_of::<Id>();
+                        c.name.capacity() + c.pending.len() * (each + each / 16)
+                    })
+            })
+            .sum();
+        pending + consumers
     }
 }
 
