@@ -44,17 +44,23 @@
 //!
 //! [`Csr`], the cold form, which is the same adjacency once nothing is changing
 //! it: node grouped, gap coded and bit packed, read only, and about an order of
-//! magnitude smaller. On an R-MAT graph it is 12.63 bits an edge as the ids
-//! come, and 9.89 after [`csr::order_by_degree`] gives the hubs the small ids.
-//! On a uniformly random graph it is 15.98 against a floor of 13.44, and the
+//! magnitude smaller. On an R-MAT graph it is 11.98 bits an edge as the ids
+//! come, and 9.38 after [`csr::order_by_degree`] gives the hubs the small ids.
+//! On a uniformly random graph it is 15.96 against a floor of 13.44, and the
 //! ordering pass moves that by nothing, which is what says the difference
 //! between the two graphs is the graph rather than the encoder.
 //!
-//! On soc-LiveJournal1, which is a real graph and the one the target should be
-//! judged on, it is 19.62 degree ordered, and the gap code is within 1.18 bits
-//! of the entropy of the gaps it is coding. The bits that are left are in the
-//! numbering rather than in the code, so the next thing this needs is layered
-//! label propagation. [`csr`] has the full breakdown.
+//! [`bisect`], the numbering that matters on a real graph. It reads the graph as
+//! a bipartite one, splits the nodes in half, swaps nodes across the middle for
+//! as long as an estimate of the compressed size goes down, and recurses, which
+//! is Facebook's recursive graph bisection from 2016. On soc-LiveJournal1 it
+//! takes the cold form to 15.00 bits an edge where degree ordering leaves it at
+//! 19.00, and on web-Google to 15.04 against 20.21. It costs twelve minutes on
+//! eight cores for a graph of seventy million edges, which is the trade the cold
+//! form is for.
+//!
+//! Neither number is the 8 bits an edge the spec asks for, and [`csr`] has the
+//! full breakdown of where the rest of it is.
 //!
 //! ```
 //! use yo_graph::{Csr, csr};
@@ -75,6 +81,7 @@
 
 pub mod adjacency;
 pub mod algo;
+pub mod bisect;
 pub mod csr;
 pub mod graph;
 pub mod props;
