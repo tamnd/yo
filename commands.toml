@@ -126,8 +126,9 @@ doc = "08 section 7"
 [[group]]
 name = "hyperloglog"
 expected = 5
-status = "planned"
+status = "shipped"
 doc = "08 section 8"
+notes = "A sketch is an ordinary string with a documented layout, so these are string commands that refuse a string that is not a sketch. Byte for byte compatible with Redis, which is the only thing worth aiming at here: the format is what a client sees, so a sketch GET out of a real server and SET into us counts the same, and one built here counts the same over there. MurmurHash64A with the seed 0xadc83b19, the three sparse opcodes, the 3000 byte promotion threshold and Ertl's estimator are all copied rather than improved on."
 
 [[group]]
 name = "geo"
@@ -564,6 +565,63 @@ bounded = "inherent"
 status = "shipped"
 wire = "verified"
 notes = "The same parser with the writes refused, so a replica can answer it. An OVERFLOW word is still accepted even though nothing it can run will overflow, which is what a real server does."
+
+# -------------------------------------------------------------- hyperloglogs
+
+[[command]]
+name = "PFADD"
+group = "hyperloglog"
+since = "2.8.9"
+arity = -2
+plan = "whole-value"
+bounded = "inherent"
+status = "shipped"
+wire = "verified"
+notes = "One hash and one register write an element. The value is only rewritten when a register actually changed, so adding an element the sketch already has costs a hash and a walk and no store. Creating the key counts as a change, which is why PFADD k with nothing to add answers 1 the first time and 0 after."
+
+[[command]]
+name = "PFCOUNT"
+group = "hyperloglog"
+since = "2.8.9"
+arity = -2
+plan = "merge"
+bounded = "inherent"
+status = "shipped"
+wire = "verified"
+notes = "A readonly command that writes. One key answers out of the eight cached header bytes when they are good and fills them in when they are not, so the first count after an add walks 16384 registers and every one after it reads eight bytes. Several keys are merged through a register array on the stack and that answer is never cached, because the union of two sketches is not a key."
+
+[[command]]
+name = "PFMERGE"
+group = "hyperloglog"
+since = "2.8.9"
+arity = -2
+plan = "merge"
+bounded = "inherent"
+status = "shipped"
+wire = "verified"
+notes = "The destination is one of the sources, so a merge never loses what was there. The result stays sparse when every input was sparse and it still fits, which is what a real server leaves behind, and one dense input makes it dense whatever the destination was."
+
+[[command]]
+name = "PFDEBUG"
+group = "hyperloglog"
+since = "2.8.9"
+arity = 3
+plan = "whole-value"
+bounded = "inherent"
+status = "shipped"
+wire = "verified"
+notes = "Four subcommands, GETREG, DECODE, ENCODING and TODENSE, and two of them change what they are looking at: GETREG converts a sparse sketch to dense and leaves it converted, and that is a real server's behaviour and not ours. Its complaint about an unknown subcommand is its own sentence rather than the one every other container command uses."
+
+[[command]]
+name = "PFSELFTEST"
+group = "hyperloglog"
+since = "2.8.9"
+arity = 1
+plan = "none"
+bounded = "inherent"
+status = "shipped"
+wire = "verified"
+notes = "Answers OK. Redis runs a few thousand additions and checks the estimate is inside its bounds; ours are checked in cargo test, where a failure stops a release rather than a client."
 
 # ------------------------------------------------------------------- keyspace
 #

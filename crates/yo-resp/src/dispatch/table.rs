@@ -48,6 +48,8 @@ const READ_FAST: &[&str] = &["readonly", "fast"];
 const WRITE_FAST_OOM: &[&str] = &["write", "denyoom", "fast"];
 /// A write that allocates and is not counted as fast.
 const WRITE_OOM: &[&str] = &["write", "denyoom"];
+/// A write that allocates and is not for ordinary clients, which is `PFDEBUG`.
+const WRITE_OOM_ADMIN: &[&str] = &["write", "denyoom", "admin"];
 /// The read side categories.
 const AC_READ_FAST: &[&str] = &["@read", "@string", "@fast"];
 /// The bitmap read side, for the two that answer without walking the value.
@@ -56,6 +58,15 @@ const AC_BIT_READ_FAST: &[&str] = &["@read", "@bitmap", "@fast"];
 const AC_BIT_READ: &[&str] = &["@read", "@bitmap", "@slow"];
 /// The bitmap write side. Redis counts none of these as fast, `SETBIT` included.
 const AC_BIT_WRITE: &[&str] = &["@write", "@bitmap", "@slow"];
+
+/// The sketch write side, which Redis counts as fast for `PFADD` alone.
+const AC_HLL_WRITE_FAST: &[&str] = &["@write", "@hyperloglog", "@fast"];
+/// The sketch write side for the ones that walk every register.
+const AC_HLL_WRITE: &[&str] = &["@write", "@hyperloglog", "@slow"];
+/// The sketch read side, which is `PFCOUNT` and only `PFCOUNT`.
+const AC_HLL_READ: &[&str] = &["@read", "@hyperloglog", "@slow"];
+/// The two that are not for clients, and are tagged so an ACL can say so.
+const AC_HLL_ADMIN: &[&str] = &["@hyperloglog", "@admin", "@slow", "@dangerous"];
 /// The read side categories for the ones that walk the value.
 const AC_READ_SLOW: &[&str] = &["@read", "@string", "@slow"];
 /// The write side categories.
@@ -646,6 +657,72 @@ pub static COMMANDS: &[Spec] = &[
         complexity: "O(1) per subcommand",
         summary: "The read only half of BITFIELD, for a replica to answer.",
         group: "bitmap",
+    },
+    // --------------------------------------------------------- hyperloglogs
+    Spec {
+        name: "pfadd",
+        arity: -2,
+        flags: WRITE_OOM,
+        first_key: 1,
+        last_key: 1,
+        step: 1,
+        acl: AC_HLL_WRITE_FAST,
+        since: "2.8.9",
+        complexity: "O(1) an element",
+        summary: "Add elements to a sketch, answering whether it changed.",
+        group: "hyperloglog",
+    },
+    Spec {
+        name: "pfcount",
+        arity: -2,
+        flags: &["readonly"],
+        first_key: 1,
+        last_key: -1,
+        step: 1,
+        acl: AC_HLL_READ,
+        since: "2.8.9",
+        complexity: "O(1) for one key, O(N) for N of them",
+        summary: "Estimate how many distinct elements the sketches hold.",
+        group: "hyperloglog",
+    },
+    Spec {
+        name: "pfmerge",
+        arity: -2,
+        flags: WRITE_OOM,
+        first_key: 1,
+        last_key: -1,
+        step: 1,
+        acl: AC_HLL_WRITE,
+        since: "2.8.9",
+        complexity: "O(N) in the number of sketches",
+        summary: "Merge sketches into the first one, which is a union.",
+        group: "hyperloglog",
+    },
+    Spec {
+        name: "pfdebug",
+        arity: 3,
+        flags: WRITE_OOM_ADMIN,
+        first_key: 2,
+        last_key: 2,
+        step: 1,
+        acl: AC_HLL_ADMIN,
+        since: "2.8.9",
+        complexity: "O(N)",
+        summary: "Look inside a sketch, and in one case convert it.",
+        group: "hyperloglog",
+    },
+    Spec {
+        name: "pfselftest",
+        arity: 1,
+        flags: &["admin"],
+        first_key: 0,
+        last_key: 0,
+        step: 0,
+        acl: AC_HLL_ADMIN,
+        since: "2.8.9",
+        complexity: "O(1)",
+        summary: "Check the sketch code, which our tests do at build time.",
+        group: "hyperloglog",
     },
     // ----------------------------------------------------------------- sets
     Spec {
@@ -3295,9 +3372,13 @@ const FREE: u16 = u16::MAX;
 /// pushed that one to four slots and fifty one extra probes, so the third was run
 /// over all 216, and the three 8.x pending list commands cost that one two more
 /// probes than the test allows. The fourth was over 219 and the seven bitmap
-/// commands took it to three slots. This is the same search run again over all
-/// 226: worst two and forty nine extra slots over the whole table. Fifteen of
-/// those forty nine are forced by the key and no multiplier can remove them.
+/// commands took it to three slots, and the fifth was over all 226. The five
+/// HyperLogLog commands kept its worst probe at two and took it from forty nine
+/// extra slots to fifty five, and this time the search found nothing better: two
+/// and a half million multipliers over the 231 names produced one other at fifty
+/// five and none below it, so fifty five is where this key function bottoms out
+/// and the multiplier is unchanged. Twenty nine of those names collide on the
+/// key itself and no multiplier can separate them.
 const MIX: u64 = 0xc97a_a994_53b3_7fdb;
 
 /// The four bytes the index is computed from: the length, the first two bytes
@@ -3309,13 +3390,14 @@ const MIX: u64 = 0xc97a_a994_53b3_7fdb;
 /// Four bytes and not the whole name because the whole name has to be compared
 /// at the end anyway, so the hash only has to be good enough to get to the right
 /// slot, and reading less of the name is a shorter dependency chain in front of
-/// the multiply. These four leave 211 distinct values over the 226 commands, so
-/// fifteen names collide whatever the multiplier is and probe once more, and the
-/// probe is the same compare the lookup was always going to do. `setnx` and
+/// the multiply. These four leave 216 distinct values over the 231 commands, so
+/// twenty nine names collide whatever the multiplier is and probe once more, and
+/// the probe is the same compare the lookup was always going to do. `setnx` and
 /// `setex` are one of those groups and `g.nadd` and `g.eadd` are another, and the
 /// bitmaps added two more, `getset` with `getbit` and `setbit` with `select`. The
-/// eighteen stream commands are in none of them, since a name is keyed on its
-/// first two bytes and its last and no two of them agree on all three.
+/// eighteen stream commands are in none of them, and neither are the five
+/// HyperLogLog ones, since a name is keyed on its first two bytes and its last
+/// and no two of either agree on all three.
 ///
 /// `| 0x20` lower cases a letter and does not have to be told which bytes are
 /// letters. It maps the two cases of a name to the same number, which is all
@@ -3573,7 +3655,7 @@ mod tests {
     /// The index is still worth having, which is a thing that can rot.
     ///
     /// The multiplier was searched for against the 191 commands that were in the
-    /// table when it was written. Adding commands cannot make a lookup wrong,
+    /// table when it was written, and five times since. Adding commands cannot make a lookup wrong,
     /// because a probe walks to an empty slot and every candidate has its name
     /// compared, but it can make one slow, and a slow lookup is exactly the thing
     /// this replaced. So the worst probe is written down here: if a command
@@ -3598,7 +3680,7 @@ mod tests {
         }
         assert!(worst <= 2, "worst probe is {worst} slots");
         assert!(
-            total <= 49,
+            total <= 55,
             "{total} extra slots walked over the whole table"
         );
     }
