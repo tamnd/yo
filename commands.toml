@@ -133,8 +133,9 @@ notes = "A sketch is an ordinary string with a documented layout, so these are s
 [[group]]
 name = "geo"
 expected = 10
-status = "planned"
+status = "shipped"
 doc = "08 section 8"
+notes = "A geo key is a sorted set with a 52 bit interleave of longitude and latitude for a score, so the whole group is arithmetic on the way in and on the way out and the sorted set commands keep working on it. Six of the ten are one search written six ways and share one parser, because six parsers is six chances to accept an option in one spelling and refuse it in another."
 
 [[group]]
 name = "pubsub"
@@ -2087,6 +2088,126 @@ bounded = "inherent"
 status = "shipped"
 wire = "verified"
 notes = "ZMPOP with a wait, and the same parse shifted along by one. The timeout is read before the key count, so BZMPOP abc 1 k MIN complains about the timeout and not about the count. A key count that leaves no room for the direction is a plain syntax error, because the word that should have been MIN or MAX is swallowed as a key and there is nothing left to read."
+
+
+# ------------------------------------------------------------------------- geo
+#
+# Ten commands over the sorted set the four above it write, which is why they
+# are here rather than in a group of their own: a place is a member scored with
+# the 52 bit interleave of its longitude and its latitude, so ZREM removes a
+# place, ZCARD counts them and ZSCORE answers the hash. Six of the ten are one
+# search written six ways, three of which Redis deprecated and none of which it
+# has removed.
+
+[[command]]
+name = "GEOADD"
+group = "geo"
+since = "3.2.0"
+arity = -5
+plan = "point"
+bounded = "inherent"
+status = "shipped"
+wire = "verified"
+notes = "ZADD with the coordinates turned into a score on the way in, and it takes NX, XX and CH for that reason. Every triple is parsed before any of them is stored, so a call with one bad pair in it leaves the key exactly as it was rather than half updated. A count of arguments that is not three of them after the options is a syntax error and not an arity one, which is where GEOADD k CH CH CH CH lands: Redis hands zero triples to the ZADD path and that is what the path says about zero."
+
+[[command]]
+name = "GEOPOS"
+group = "geo"
+since = "3.2.0"
+arity = -2
+plan = "point"
+bounded = "inherent"
+status = "shipped"
+wire = "verified"
+notes = "One entry for each member asked about, so the reply is as long as the command and nothing else. A member that is not there is a null array and not a null string, which a RESP2 client sees as *-1, and a key that is not there answers the same thing once for each member rather than an empty array. The coordinates come back out of the score and are not the ones that went in, because a 52 bit hash is about 0.6 metres of resolution and the decoded pair is the centre of the box the original point fell in."
+
+[[command]]
+name = "GEOHASH"
+group = "geo"
+since = "3.2.0"
+arity = -2
+plan = "point"
+bounded = "inherent"
+status = "shipped"
+wire = "verified"
+notes = "The same shape as GEOPOS with the standard eleven character geohash string in place of the pair, and a null string rather than a null array for a member that is not there. The eleven characters are not the score in base 32: Redis re-encodes the decoded point over the real world range of minus 90 to 90 rather than the minus 85.05 the score uses, so a geohash from here pastes into any site that takes one."
+
+[[command]]
+name = "GEODIST"
+group = "geo"
+since = "3.2.0"
+arity = -4
+plan = "point"
+bounded = "inherent"
+status = "shipped"
+wire = "verified"
+notes = "Two lookups and a haversine over a sphere of 6372797.560856 metres. The unit is read before the members are looked up, so a bad unit beats a missing key, and a missing member on either side is a null string rather than an error. The answer is a bulk string of exactly four decimal places on both protocols and not a RESP3 double, which is the one place in the geo group where a number is deliberately not written the way the rest of the server writes numbers."
+
+[[command]]
+name = "GEOSEARCH"
+group = "geo"
+since = "6.2.0"
+arity = -7
+plan = "cursor"
+bounded = "risk"
+status = "shipped"
+wire = "verified"
+notes = "The spelling of the search that is not deprecated, and the only one that can take a box. The centre is FROMMEMBER or FROMLONLAT and the shape is BYRADIUS or BYBOX, exactly one of each, and leaving either out has its own sentence that quotes the command back the way the client spelled it. Nine geohash boxes at a precision chosen to cover the shape are walked as nine score ranges over the sorted set, and each candidate is then measured properly, so the neighbour boxes cost a range lookup each and no false positive survives to the reply."
+
+[[command]]
+name = "GEOSEARCHSTORE"
+group = "geo"
+since = "6.2.0"
+arity = -8
+plan = "whole-value"
+bounded = "inherent"
+status = "shipped"
+wire = "verified"
+notes = "GEOSEARCH with the results written to a key instead of to the client, which is why it takes no WITH option and says so in a sentence of its own if one is given. By default it stores the geohash score, so the destination is a geo key that can be searched again, and STOREDIST stores the distance in the search unit instead, which makes it an ordinary sorted set ordered by how far away things are. A search that finds nothing deletes the destination rather than leaving what was there."
+
+[[command]]
+name = "GEORADIUS"
+group = "geo"
+since = "3.2.0"
+arity = -6
+plan = "cursor"
+bounded = "risk"
+status = "shipped"
+wire = "verified"
+notes = "Deprecated in 6.2 and still here, because deprecated in Redis means documented as old rather than removed. It is GEOSEARCH with the centre and the radius as fixed arguments, plus STORE and STOREDIST, and those two are what make it a write command with movable keys. The source key is looked up and type checked before a single argument is read, so a wrong type beats a radius that will not parse, and that order is part of what a client sees."
+
+[[command]]
+name = "GEORADIUS_RO"
+group = "geo"
+since = "3.2.10"
+arity = -6
+plan = "cursor"
+bounded = "risk"
+status = "shipped"
+wire = "verified"
+notes = "GEORADIUS with the two store options taken away, which is the whole difference and is enough to make it a readonly command that a replica will run. Naming a store here is a plain syntax error rather than the sentence about incompatible options, because the words are not in its table at all."
+
+[[command]]
+name = "GEORADIUSBYMEMBER"
+group = "geo"
+since = "3.2.0"
+arity = -5
+plan = "cursor"
+bounded = "risk"
+status = "shipped"
+wire = "verified"
+notes = "GEORADIUS centred on a member of the same key rather than on a pair of numbers. A key that is not there answers the empty array without ever looking the member up, and a member that is not there in a key that is answers that it could not decode the member, which is Redis's sentence for it and reads oddly because the failure is the lookup and not the decode."
+
+[[command]]
+name = "GEORADIUSBYMEMBER_RO"
+group = "geo"
+since = "3.2.10"
+arity = -5
+plan = "cursor"
+bounded = "risk"
+status = "shipped"
+wire = "verified"
+notes = "The readonly half of the pair above, and at twenty characters the longest command name a real server answers to, which is why the dispatch table's name length bound is what it is."
 
 
 # ---------------------------------------------------------------------- graph

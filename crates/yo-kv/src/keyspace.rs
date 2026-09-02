@@ -206,6 +206,15 @@ pub struct Keyspace {
     /// round: the same database had to build that table anyway, and the version
     /// that threw it away afterwards built it again on the next call.
     pub(crate) setops: crate::setops::Scratch,
+
+    /// What the last geo search found, kept for the same reason.
+    ///
+    /// A search cannot answer in the order it walks: the nine hash boxes come
+    /// out in hash order and the reply is in distance order, so every candidate
+    /// has to be in hand before the first one can be written. See
+    /// [`crate::geos::Scratch`], which is the two buffers and the argument for
+    /// keeping them here.
+    pub(crate) geo: crate::geos::Scratch,
 }
 
 /// How big [`Keyspace::scratch`] starts.
@@ -382,6 +391,7 @@ impl Keyspace {
             scratch: Vec::with_capacity(SCRATCH),
             rows: Vec::new(),
             setops: crate::setops::Scratch::new(),
+            geo: crate::geos::Scratch::default(),
         }
     }
 

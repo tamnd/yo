@@ -123,6 +123,11 @@ const AC_ZSET_BLOCKING_FAST: &[&str] = &["@write", "@sortedset", "@fast", "@bloc
 const AC_ZSET_BLOCKING_SLOW: &[&str] = &["@write", "@sortedset", "@slow", "@blocking"];
 /// The array read side, for the ones whose cost is the number of indices named
 /// and not the size of the array.
+/// The geo read side. Redis counts none of these as fast, not even GEODIST,
+/// which is two probes and some arithmetic.
+const AC_GEO_READ: &[&str] = &["@read", "@geo", "@slow"];
+/// The geo write side, which is GEOADD and the four forms that can store.
+const AC_GEO_WRITE: &[&str] = &["@write", "@geo", "@slow"];
 /// The graph read side, for the ones that answer without walking the plane.
 const AC_GRAPH_READ_FAST: &[&str] = &["@read", "@graph", "@fast"];
 /// The graph read side for the ones that walk it.
@@ -2081,6 +2086,137 @@ pub static COMMANDS: &[Spec] = &[
         summary: "Pop from the first of several sorted sets that has anything, waiting if none does.",
         group: "zset",
     },
+    // ----------------------------------------------------------------- geo
+    Spec {
+        name: "geoadd",
+        arity: -5,
+        flags: WRITE_OOM,
+        first_key: 1,
+        last_key: 1,
+        step: 1,
+        acl: AC_GEO_WRITE,
+        since: "3.2.0",
+        complexity: "O(log(N)) per point added",
+        summary: "Add places to a geo key, which is a sorted set of position hashes.",
+        group: "geo",
+    },
+    Spec {
+        name: "geopos",
+        arity: -2,
+        flags: READ_SLOW,
+        first_key: 1,
+        last_key: 1,
+        step: 1,
+        acl: AC_GEO_READ,
+        since: "3.2.0",
+        complexity: "O(1) per member asked about",
+        summary: "Answer where each member is, as a longitude and a latitude.",
+        group: "geo",
+    },
+    Spec {
+        name: "geodist",
+        arity: -4,
+        flags: READ_SLOW,
+        first_key: 1,
+        last_key: 1,
+        step: 1,
+        acl: AC_GEO_READ,
+        since: "3.2.0",
+        complexity: "O(1)",
+        summary: "Answer how far apart two members are, in the unit asked for.",
+        group: "geo",
+    },
+    Spec {
+        name: "geohash",
+        arity: -2,
+        flags: READ_SLOW,
+        first_key: 1,
+        last_key: 1,
+        step: 1,
+        acl: AC_GEO_READ,
+        since: "3.2.0",
+        complexity: "O(1) per member asked about",
+        summary: "Answer each member's position as a standard eleven character geohash.",
+        group: "geo",
+    },
+    Spec {
+        name: "geosearch",
+        arity: -7,
+        flags: READ_SLOW,
+        first_key: 1,
+        last_key: 1,
+        step: 1,
+        acl: AC_GEO_READ,
+        since: "6.2.0",
+        complexity: "O(N+log(M)) with N the members in the boxes searched",
+        summary: "Find the members inside a circle or a rectangle around a point.",
+        group: "geo",
+    },
+    Spec {
+        name: "geosearchstore",
+        arity: -8,
+        flags: WRITE_OOM,
+        first_key: 1,
+        last_key: 2,
+        step: 1,
+        acl: AC_GEO_WRITE,
+        since: "6.2.0",
+        complexity: "O(N+log(M)) with N the members in the boxes searched",
+        summary: "Run a search and write what it found into another key.",
+        group: "geo",
+    },
+    Spec {
+        name: "georadius",
+        arity: -6,
+        flags: WRITE_MOVABLE,
+        first_key: 1,
+        last_key: 1,
+        step: 1,
+        acl: AC_GEO_WRITE,
+        since: "3.2.0",
+        complexity: "O(N+log(M)) with N the members in the boxes searched",
+        summary: "The older spelling of a circular search, which can also store.",
+        group: "geo",
+    },
+    Spec {
+        name: "georadius_ro",
+        arity: -6,
+        flags: READ_SLOW,
+        first_key: 1,
+        last_key: 1,
+        step: 1,
+        acl: AC_GEO_READ,
+        since: "3.2.10",
+        complexity: "O(N+log(M)) with N the members in the boxes searched",
+        summary: "GEORADIUS without the store options, so a replica can serve it.",
+        group: "geo",
+    },
+    Spec {
+        name: "georadiusbymember",
+        arity: -5,
+        flags: WRITE_MOVABLE,
+        first_key: 1,
+        last_key: 1,
+        step: 1,
+        acl: AC_GEO_WRITE,
+        since: "3.2.0",
+        complexity: "O(N+log(M)) with N the members in the boxes searched",
+        summary: "The same search centred on a member rather than on a point.",
+        group: "geo",
+    },
+    Spec {
+        name: "georadiusbymember_ro",
+        arity: -5,
+        flags: READ_SLOW,
+        first_key: 1,
+        last_key: 1,
+        step: 1,
+        acl: AC_GEO_READ,
+        since: "3.2.10",
+        complexity: "O(N+log(M)) with N the members in the boxes searched",
+        summary: "GEORADIUSBYMEMBER without the store options.",
+        group: "geo",
+    },
     // --------------------------------------------------------------- graph
     Spec {
         name: "g.nadd",
@@ -3342,10 +3478,10 @@ pub static COMMANDS: &[Spec] = &[
 /// before anything is read, so a name that could not be a command is rejected on
 /// its length alone.
 const MIN_LEN: usize = 3;
-const MAX_LEN: usize = 16;
+const MAX_LEN: usize = 20;
 
-/// How many slots the index has, which is a power of two and about two and a
-/// half times the number of commands.
+/// How many slots the index has, which is a power of two and a bit over twice
+/// the number of commands.
 ///
 /// One kibibyte of `u16`, eight cache lines, and loose enough that a probe for a
 /// name that is not a command stops at an empty slot almost immediately. Tight
@@ -3358,14 +3494,14 @@ const SLOTS: usize = 512;
 /// most wants to be able to find.
 const FREE: u16 = u16::MAX;
 
-/// The multiplier, found by searching for one that spreads these 226 names well.
+/// The multiplier, found by searching for one that spreads these 241 names well.
 ///
 /// Not a magic constant in the bad sense: it is checked. Every command is looked
 /// up by its own name in a test, and another test holds the worst probe length
 /// at what it is now, so a command added later that made this multiplier bad
 /// would fail rather than quietly cost every lookup an extra slot.
 ///
-/// It has been searched for five times, and each time because the test went red
+/// It has been searched for six times, and each time because the test went red
 /// rather than because somebody went looking. The first was against the 191 names
 /// in the table then, the ten graph commands pushed its worst probe to three
 /// slots, and the second search was run over all 201. The fifteen stream commands
@@ -3374,12 +3510,13 @@ const FREE: u16 = u16::MAX;
 /// probes than the test allows. The fourth was over 219 and the seven bitmap
 /// commands took it to three slots, and the fifth was over all 226. The five
 /// HyperLogLog commands kept its worst probe at two and took it from forty nine
-/// extra slots to fifty five, and this time the search found nothing better: two
-/// and a half million multipliers over the 231 names produced one other at fifty
-/// five and none below it, so fifty five is where this key function bottoms out
-/// and the multiplier is unchanged. Twenty nine of those names collide on the
-/// key itself and no multiplier can separate them.
-const MIX: u64 = 0xc97a_a994_53b3_7fdb;
+/// extra slots to fifty five, and the search over the 231 names found nothing
+/// better, so that one stood. The ten geo commands took it to sixty, and the
+/// sixth search, over eight million multipliers and all 241 names, found this
+/// one at fifty six. Twenty nine of the names collide on the key itself and no
+/// multiplier can separate them, which is the floor everything here is measured
+/// against.
+const MIX: u64 = 0xf9e1_1b95_048d_6851;
 
 /// The four bytes the index is computed from: the length, the first two bytes
 /// and the last, lower cased.
@@ -3390,14 +3527,14 @@ const MIX: u64 = 0xc97a_a994_53b3_7fdb;
 /// Four bytes and not the whole name because the whole name has to be compared
 /// at the end anyway, so the hash only has to be good enough to get to the right
 /// slot, and reading less of the name is a shorter dependency chain in front of
-/// the multiply. These four leave 216 distinct values over the 231 commands, so
+/// the multiply. These four leave 226 distinct values over the 241 commands, so
 /// twenty nine names collide whatever the multiplier is and probe once more, and
 /// the probe is the same compare the lookup was always going to do. `setnx` and
 /// `setex` are one of those groups and `g.nadd` and `g.eadd` are another, and the
 /// bitmaps added two more, `getset` with `getbit` and `setbit` with `select`. The
-/// eighteen stream commands are in none of them, and neither are the five
-/// HyperLogLog ones, since a name is keyed on its first two bytes and its last
-/// and no two of either agree on all three.
+/// eighteen stream commands are in none of them, neither are the five
+/// HyperLogLog ones, and neither are the ten geo ones, since a name is keyed on
+/// its first two bytes and its last and no two of either agree on all three.
 ///
 /// `| 0x20` lower cases a letter and does not have to be told which bytes are
 /// letters. It maps the two cases of a name to the same number, which is all
@@ -3680,7 +3817,7 @@ mod tests {
         }
         assert!(worst <= 2, "worst probe is {worst} slots");
         assert!(
-            total <= 55,
+            total <= 56,
             "{total} extra slots walked over the whole table"
         );
     }
