@@ -77,7 +77,16 @@ fn bench_hops(c: &mut Criterion) {
         group.bench_with_input(BenchmarkId::from_parameter(degree), &degree, |b, _| {
             b.iter(|| {
                 let node = rng.next_u64() % 50_000;
-                black_box(black_box(&h).neighbours(node, FOLLOWS, Dir::Out).len())
+                // Summed rather than counted. The length is in the run header
+                // and reading it never touches the run, so a version that
+                // stopped at `len()` would time the probe alone and be flat
+                // across the degree, which is not what this row is for.
+                black_box(
+                    black_box(&h)
+                        .neighbours(node, FOLLOWS, Dir::Out)
+                        .iter()
+                        .sum::<u64>(),
+                )
             });
         });
     }
