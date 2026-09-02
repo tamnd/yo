@@ -82,6 +82,7 @@
 
 #![deny(missing_docs)]
 
+pub(crate) mod coarse;
 pub mod hnsw;
 pub mod muvera;
 pub mod partition;
