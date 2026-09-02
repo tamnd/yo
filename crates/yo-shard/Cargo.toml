@@ -19,12 +19,20 @@ libc = { workspace = true }
 [dev-dependencies]
 criterion = { workspace = true }
 yo-index = { workspace = true }
+# The adjacency plane, for the cross shard traversal experiment in
+# `benches/traverse.rs`. O-G1 is a question about the runtime, so the benchmark
+# lives with the runtime and borrows the graph rather than the other way round.
+yo-graph = { workspace = true }
 
 [lints]
 workspace = true
 
 [[bench]]
 name = "shard"
+harness = false
+
+[[bench]]
+name = "traverse"
 harness = false
 
 [target.'cfg(loom)'.dev-dependencies]
