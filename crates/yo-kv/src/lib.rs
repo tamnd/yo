@@ -129,6 +129,7 @@ pub mod chunk;
 pub mod clock;
 pub mod cond;
 pub mod counter;
+pub mod demote;
 pub mod elem;
 pub mod evict;
 pub mod expiry;
