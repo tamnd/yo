@@ -948,6 +948,7 @@ version = "0.3.12"
 dependencies = [
  "criterion",
  "libc",
+ "windows-sys",
  "yo-alloc",
  "yo-common",
  "yo-kv",

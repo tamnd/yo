@@ -11,9 +11,14 @@
 //! a name that says main thread would be right on a single threaded server and
 //! wrong on the one this becomes, so they are left out.
 //!
-//! On a platform with no `getrusage` there is no `# CPU` section at all, and a
-//! client that does not find the field falls back, where a client that finds a
-//! zero believes it.
+//! Windows has no `getrusage` and it does have `GetProcessTimes`, which is the
+//! same two numbers for this process. What it has no equivalent of is the child
+//! totals, so those two are zero there and that is true rather than made up:
+//! this server starts no children.
+//!
+//! On a platform with neither there is no `# CPU` section at all, and a client
+//! that does not find the field falls back, where a client that finds a zero
+//! believes it.
 
 /// Processor time used since this process started, in seconds.
 ///
@@ -64,7 +69,58 @@ fn read(who: libc::c_int) -> (f64, f64) {
 }
 
 /// Read the counters, or `None` where the platform has no way to.
-#[cfg(not(unix))]
+///
+/// `GetProcessTimes` is the Windows equivalent of `getrusage` for this process
+/// and it is exact rather than sampled. There is no equivalent for children:
+/// Windows does not keep a running total for processes this one has waited for,
+/// because it has no `wait` in that sense and no parent child accounting to hang
+/// one off. This server starts no children, so the honest total for them is
+/// zero, and that is what those two fields say.
+#[cfg(windows)]
+pub fn usage() -> Option<Usage> {
+    use windows_sys::Win32::Foundation::FILETIME;
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, GetProcessTimes};
+
+    let mut created = FILETIME::default();
+    let mut exited = FILETIME::default();
+    let mut sys = FILETIME::default();
+    let mut user = FILETIME::default();
+    // SAFETY: all four are locals that live across the call, the handle from
+    // `GetCurrentProcess` is a pseudo handle that is always valid and never
+    // needs closing, and the call only writes into what it is given.
+    let ok = unsafe {
+        GetProcessTimes(
+            GetCurrentProcess(),
+            &raw mut created,
+            &raw mut exited,
+            &raw mut sys,
+            &raw mut user,
+        )
+    };
+    if ok == 0 {
+        return None;
+    }
+    Some(Usage {
+        sys: secs(sys),
+        user: secs(user),
+        sys_children: 0.0,
+        user_children: 0.0,
+    })
+}
+
+/// A `FILETIME` as seconds.
+///
+/// It is a count of hundred nanosecond ticks split across two 32 bit halves,
+/// and it is not aligned well enough to be read as a `u64` in place, which is
+/// why Windows hands it over in halves in the first place.
+#[cfg(windows)]
+fn secs(t: windows_sys::Win32::Foundation::FILETIME) -> f64 {
+    let ticks = (u64::from(t.dwHighDateTime) << 32) | u64::from(t.dwLowDateTime);
+    ticks as f64 / 1e7
+}
+
+/// Read the counters, or `None` where the platform has no way to.
+#[cfg(not(any(unix, windows)))]
 pub fn usage() -> Option<Usage> {
     None
 }

@@ -127,7 +127,11 @@ mod imp {
     pub fn listen() {}
 }
 
-#[cfg(test)]
+// Everything in here raises a signal and looks at what the handler did, so it
+// is unix only, and the cfg goes on the module rather than on the test. On the
+// test it leaves `use super::*` behind with nothing using it, which is a warning
+// on Windows and a warning is an error in CI.
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
 
@@ -137,7 +141,6 @@ mod tests {
     /// read one process wide static and two tests reading it in an order nobody
     /// chose is a flake waiting to happen.
     #[test]
-    #[cfg(unix)]
     fn a_term_sets_the_flag_and_nothing_else_does() {
         assert!(!stopped(), "nothing has been signalled yet");
         listen();
