@@ -334,11 +334,7 @@ impl Encoder {
         let mut code = 0usize;
         for b in 0..self.shape.ksim {
             let plane = &planes[b * self.dim..(b + 1) * self.dim];
-            let mut dot = 0.0f32;
-            for (p, c) in plane.iter().zip(x) {
-                dot += p * c;
-            }
-            code |= usize::from(dot > 0.0) << b;
+            code |= usize::from(dot(plane, x) > 0.0) << b;
         }
         code
     }
@@ -348,12 +344,7 @@ impl Encoder {
     fn project(&self, rep: usize, x: &[f32], scale: f32, at: usize, out: &mut [f32]) {
         let m = &self.proj[rep * self.shape.dproj * self.dim..];
         for j in 0..self.shape.dproj {
-            let row = &m[j * self.dim..(j + 1) * self.dim];
-            let mut sum = 0.0f32;
-            for (a, b) in row.iter().zip(x) {
-                sum += a * b;
-            }
-            out[at + j] = sum * scale;
+            out[at + j] = dot(&m[j * self.dim..(j + 1) * self.dim], x) * scale;
         }
     }
 }
@@ -417,17 +408,48 @@ pub fn chamfer(query: &[f32], doc: &[f32], dim: usize) -> f32 {
     for q in query.chunks_exact(dim) {
         let mut best = f32::NEG_INFINITY;
         for p in doc.chunks_exact(dim) {
-            let mut dot = 0.0f32;
-            for (a, b) in q.iter().zip(p) {
-                dot += a * b;
-            }
-            if dot > best {
-                best = dot;
+            let d = dot(q, p);
+            if d > best {
+                best = d;
             }
         }
         total += best;
     }
     total / (query.len() / dim) as f32
+}
+
+/// A dot product, with eight running totals rather than one.
+///
+/// The same reason as [`crate::partition`]'s squared distance, and it is worth
+/// repeating because it is not obvious: adding floats is not associative, so a
+/// compiler is not allowed to turn one accumulator into a vector of them, and
+/// the one line version is a chain of dependent adds four cycles apart. This is
+/// the whole of an encode. Projecting one bucket is a row of the matrix against
+/// it, there are buckets times repetitions of those, and at the default shape
+/// and 128 dimensional tokens that is a quarter of a million multiply adds for
+/// one document, all of them here.
+///
+/// The totals are summed in a fixed order at the end, so the answer is
+/// deterministic, and it is a different answer from the one line version by the
+/// last bit or so in the way any two orderings of a float sum are.
+fn dot(a: &[f32], b: &[f32]) -> f32 {
+    let mut totals = [0.0f32; 8];
+    let mut i = 0;
+    while i + 8 <= a.len() {
+        for (k, total) in totals.iter_mut().enumerate() {
+            *total += a[i + k] * b[i + k];
+        }
+        i += 8;
+    }
+    let mut sum = 0.0f32;
+    for total in totals {
+        sum += total;
+    }
+    while i < a.len() {
+        sum += a[i] * b[i];
+        i += 1;
+    }
+    sum
 }
 
 /// A standard normal, by Box Muller. Only ever called while an encoder is being
