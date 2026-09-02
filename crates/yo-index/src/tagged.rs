@@ -196,10 +196,19 @@ impl Tagged {
     }
 
     /// Grow or shrink to `slots`, which must be a power of two.
+    ///
+    /// `yo_alloc::for_the_data` and not a fix. A database that has taken its ten
+    /// millionth key with a deadline has to have doubled this table along the
+    /// way, and there is no arrangement of it that holds ten million addresses
+    /// in the room it had for sixty four. The shrink is the same claim from the
+    /// other side, and the reason it is not a per command cost is the hysteresis
+    /// above it: growth is at three quarters and shrink is at one quarter, so a
+    /// set sitting on a boundary does not resize on alternate writes.
     fn resize(&mut self, slots: usize) {
         debug_assert!(slots.is_power_of_two());
         debug_assert!(self.len * LOAD_DEN <= slots * LOAD_NUM);
-        let old = core::mem::replace(&mut self.slots, vec![Addr::NONE; slots]);
+        let fresh = yo_alloc::for_the_data(|| vec![Addr::NONE; slots]);
+        let old = core::mem::replace(&mut self.slots, fresh);
         let mask = slots - 1;
         for a in old {
             if a == Addr::NONE {
