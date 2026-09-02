@@ -22,6 +22,11 @@ yo-index.workspace = true
 criterion = { workspace = true }
 # Only so that a test can hold `Kind` and `ValueType` on the same numbering.
 yo-format = { workspace = true }
+# Only so that a test can run a chunk chain against the real log rather than
+# against a vector shaped like one. Which crate owns the wiring between the
+# memory engine and the record plane is not settled, and a dev dependency does
+# not settle it.
+yo-record = { workspace = true }
 
 [lints]
 workspace = true

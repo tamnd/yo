@@ -913,6 +913,7 @@ dependencies = [
  "yo-common",
  "yo-format",
  "yo-index",
+ "yo-record",
 ]
 
 [[package]]

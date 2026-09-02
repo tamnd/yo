@@ -127,6 +127,7 @@ pub mod bits;
 pub mod blob;
 pub mod chunk;
 pub mod clock;
+pub mod cold;
 pub mod cond;
 pub mod counter;
 pub mod demote;
