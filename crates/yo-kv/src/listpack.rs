@@ -547,7 +547,12 @@ impl Listpack {
 }
 
 /// A forward walk.
-#[derive(Debug)]
+///
+/// Cloneable because a stream node holds several logical records inside one
+/// blob and a reader has to be able to keep a mark on where a record's fields
+/// started while it walks on to find where the record ends. Cloning one is
+/// copying a slice and an offset.
+#[derive(Debug, Clone)]
 pub struct Iter<'a> {
     bytes: &'a [u8],
     at: usize,
@@ -568,7 +573,7 @@ impl<'a> Iterator for Iter<'a> {
 }
 
 /// A backward walk.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct RevIter<'a> {
     bytes: &'a [u8],
     at: usize,
