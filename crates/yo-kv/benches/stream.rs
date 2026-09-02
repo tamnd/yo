@@ -24,6 +24,25 @@
 //! one are separated, which is what has to happen before anyone argues for a
 //! radix tree here.
 //!
+//! The `group/` rows are the consumer group and its pending list. `group/read`
+//! is the same walk as `range/all` with a pending entry written per delivery,
+//! so the gap between the two is what keeping the ledger costs and nothing
+//! else. The two ack rows differ only in the order the acks arrive, in order
+//! against scattered, because the pending list is a B-tree partly on the bet
+//! that the sorted case is the common one and the gap is what that bet is
+//! worth.
+//!
+//! The numbers worth quoting are from gamingpc, a quiet 13900K, because this
+//! laptop's load average sits above sixty and an absolute time taken on it is
+//! not comparable with the next one. At a million entries a locate is 596
+//! nanoseconds, a hundred entry window forwards is 1.44 microseconds and the
+//! same window backwards is 4.92. The locate hardly moves between a thousand
+//! entries and a million, 468 nanoseconds against 596, which is the binary
+//! search doing the thing it was picked for. Reading the whole stream is 9.01
+//! milliseconds at a million, so 111 million entries a second sequential, and
+//! appending a million is 368 milliseconds, so 2.7 million appends a second on
+//! one core.
+//!
 //! The memory side does not need a timer. These entries, `sensor` and `reading`
 //! a millisecond apart, cost 20.95 bytes each at a thousand, 22.94 at a hundred
 //! thousand and 23.94 at a million. The same entries with a field name that
@@ -34,7 +53,7 @@
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use std::hint::black_box;
-use yo_kv::stream::{Id, Limits, Stream};
+use yo_kv::stream::{Filter, Id, Limits, Stream};
 
 /// Redis's defaults, so the nodes are the size a real server's are.
 fn limits() -> Limits {
@@ -227,5 +246,131 @@ fn bench_read(c: &mut Criterion) {
     g.finish();
 }
 
-criterion_group!(benches, bench_write, bench_read);
+/// A stream with one group that has read everything into one consumer.
+///
+/// The pending list is then the whole stream, which is the shape a group takes
+/// when its consumers have stopped acknowledging, and it is the shape every
+/// interesting question about the PEL is asked in.
+fn behind(n: usize) -> Stream {
+    let mut s = filled(n);
+    s.create_group(b"workers", Id::MIN, Some(0));
+    s.read_group(b"workers", b"alice", None, 1, |_, _| true)
+        .expect("the group");
+    s
+}
+
+fn bench_groups(c: &mut Criterion) {
+    let mut g = c.benchmark_group("stream");
+
+    for &n in sizes() {
+        g.throughput(Throughput::Elements(n as u64));
+
+        // `XREADGROUP >` over the whole stream, which is the log walk plus a
+        // pending entry written per delivery. Read against `range/all`, the gap
+        // is what the ledger costs.
+        g.bench_with_input(BenchmarkId::new("group/read", n), &n, |b, _| {
+            b.iter_batched_ref(
+                || {
+                    let mut s = filled(n);
+                    s.create_group(b"workers", Id::MIN, Some(0));
+                    s
+                },
+                |s| {
+                    let mut got = 0usize;
+                    s.read_group(b"workers", b"alice", None, 1, |_, fields| {
+                        got += fields.len();
+                        true
+                    });
+                    black_box(got)
+                },
+                criterion::BatchSize::LargeInput,
+            )
+        });
+
+        // `XACK` over the whole pending list, oldest first, which is what a
+        // consumer that is keeping up does. Every ack takes the first key of
+        // the map and the first of the consumer's set.
+        g.bench_with_input(BenchmarkId::new("group/ack in order", n), &n, |b, _| {
+            b.iter_batched_ref(
+                || behind(n),
+                |s| {
+                    let group = s.group_mut(b"workers").expect("the group");
+                    let mut gone = 0usize;
+                    for i in 0..n {
+                        gone += usize::from(group.ack(black_box(id(i))));
+                    }
+                    gone
+                },
+                criterion::BatchSize::LargeInput,
+            )
+        });
+
+        // The same acks in a scattered order, which is what a pool of workers
+        // finishing at different speeds actually produces. The gap between this
+        // row and the one above it is what the B-tree costs when the access is
+        // not the sorted one it was chosen partly for.
+        g.bench_with_input(BenchmarkId::new("group/ack scattered", n), &n, |b, _| {
+            b.iter_batched_ref(
+                || behind(n),
+                |s| {
+                    let group = s.group_mut(b"workers").expect("the group");
+                    let mut gone = 0usize;
+                    let mut at = 0usize;
+                    for _ in 0..n {
+                        at = (at + 7919) % n;
+                        gone += usize::from(group.ack(black_box(id(at))));
+                    }
+                    gone
+                },
+                criterion::BatchSize::LargeInput,
+            )
+        });
+    }
+
+    for &n in sizes() {
+        let s = behind(n);
+        let group = s.group(b"workers").expect("the group");
+
+        // `XPENDING` over a hundred entry window from a moving point, which is
+        // the paging shape again and the row that says whether the ordered walk
+        // is worth what the map costs.
+        g.throughput(Throughput::Elements(100));
+        g.bench_with_input(BenchmarkId::new("group/pending window", n), &n, |b, _| {
+            let half = (n / 2).max(1);
+            let mut i = 0usize;
+            b.iter(|| {
+                i = (i + 7919) % half;
+                let mut got = 0usize;
+                let want = Filter {
+                    start: black_box(id(n / 4 + i)),
+                    count: Some(100),
+                    ..Filter::default()
+                };
+                group.pending_range(want, 1_000, |_, _, _| {
+                    got += 1;
+                    true
+                });
+                black_box(got)
+            })
+        });
+
+        // The `XAUTOCLAIM` scan, a hundred entries deep from a moving point.
+        // Nothing is claimed, so this is the cost of finding the stale ones and
+        // not of moving them.
+        g.bench_with_input(BenchmarkId::new("group/claimable", n), &n, |b, _| {
+            let half = (n / 2).max(1);
+            let mut i = 0usize;
+            let mut out = Vec::new();
+            b.iter(|| {
+                i = (i + 7919) % half;
+                out.clear();
+                black_box(group.claimable(black_box(id(n / 4 + i)), 0, 1_000, 100, &mut out))
+            })
+        });
+    }
+
+    g.finish();
+}
+
+criterion_group!(benches, bench_write, bench_read, bench_groups);
 criterion_main!(benches);
