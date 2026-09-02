@@ -977,6 +977,7 @@ dependencies = [
  "loom",
  "yo-alloc",
  "yo-common",
+ "yo-graph",
  "yo-index",
 ]
 
