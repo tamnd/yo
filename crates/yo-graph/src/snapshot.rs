@@ -99,50 +99,31 @@ impl Snapshot {
     /// it. An isolated node is an empty run and costs two offsets.
     #[must_use]
     pub fn labelled(g: &Graph, labels: &[u32]) -> Snapshot {
-        let mut ids: Vec<u64> = g.node_props().iter().map(|(id, _)| id).collect();
-        ids.sort_unstable();
-        let n = ids.len();
-        let map = Map::of(&ids);
+        project(g, labels, None).0
+    }
 
-        // One pass to count and one to fill, which is the standard CSR build.
-        // The counts are accumulated one to the right so that the prefix sum
-        // leaves the starts in place and the fill can use the same array as its
-        // cursor.
-        let mut out_at = vec![0u64; n + 1];
-        for label in labels {
-            g.adjacency().for_each_run(*label, Dir::Out, |node, ns, _| {
-                let Some(at) = map.dense(node) else { return };
-                out_at[at as usize + 1] += ns.len() as u64;
-            });
-        }
-        for i in 0..n {
-            out_at[i + 1] += out_at[i];
-        }
-        let mut out_to = vec![0u32; out_at[n] as usize];
-        let mut cursor = out_at.clone();
-        for label in labels {
-            g.adjacency().for_each_run(*label, Dir::Out, |node, ns, _| {
-                let Some(at) = map.dense(node) else { return };
-                for to in ns {
-                    // A neighbour the map does not know cannot happen: the
-                    // plane's ends are nodes and every node is in the map. It
-                    // is skipped rather than asserted because a snapshot is a
-                    // read and a read should not be able to panic.
-                    let Some(to) = map.dense(*to) else { continue };
-                    out_to[cursor[at as usize] as usize] = to;
-                    cursor[at as usize] += 1;
-                }
-            });
-        }
-
-        let (in_at, in_to) = transpose(n, &out_at, &out_to);
-        Snapshot {
-            ids,
-            out_at,
-            out_to,
-            in_at,
-            in_to,
-        }
+    /// The same projection, and a weight for every outgoing edge in it.
+    ///
+    /// The weight is read off the edge's own document, out of the field named,
+    /// which is where a weight lives in this engine: an edge is a document and a
+    /// weight is one of its fields. The weights come back in the order the
+    /// outgoing runs are in, so the weight of the edge `out(node)[i]` is
+    /// `weights[out_at(node) + i]`, and a shortest path only has to index the
+    /// two arrays together.
+    ///
+    /// An edge whose document has no such field, or has one that is not a
+    /// number, or has a negative one, gets `missing`. A negative weight is
+    /// refused rather than clamped because every shortest path algorithm worth
+    /// having needs weights that do not go backwards, and quietly turning a
+    /// minus five into a zero is a worse answer than using the default the
+    /// caller chose.
+    ///
+    /// A float is rounded to the nearest whole number, and anything above four
+    /// billion is held at four billion, because a weight is `u32` so that an
+    /// edge costs four bytes rather than eight.
+    #[must_use]
+    pub fn weighted(g: &Graph, labels: &[u32], field: &[u8], missing: u32) -> (Snapshot, Vec<u32>) {
+        project(g, labels, Some((field, missing)))
     }
 
     /// How many nodes there are, which is the length of every answer.
@@ -184,6 +165,16 @@ impl Snapshot {
     #[must_use]
     pub fn out(&self, node: u32) -> &[u32] {
         run(&self.out_at, &self.out_to, node)
+    }
+
+    /// Where node `node`'s outgoing run starts in the flat array.
+    ///
+    /// Only useful next to something that was built alongside that array, which
+    /// in practice means the weights out of [`Snapshot::weighted`]: the weight
+    /// of `out(node)[i]` is `weights[out_at(node) + i]`.
+    #[must_use]
+    pub fn out_at(&self, node: u32) -> usize {
+        self.out_at[node as usize] as usize
     }
 
     /// Node `node`'s incoming neighbours.
@@ -235,6 +226,91 @@ impl Snapshot {
             + (self.out_at.capacity() + self.in_at.capacity()) * size_of::<u64>()
             + (self.out_to.capacity() + self.in_to.capacity()) * size_of::<u32>()
     }
+}
+
+/// The projection itself, with or without weights.
+///
+/// One function rather than two, because the weights have to come out in the
+/// same order the neighbours do and the only way to be sure of that is for the
+/// same loop to write both.
+fn project(g: &Graph, labels: &[u32], weight: Option<(&[u8], u32)>) -> (Snapshot, Vec<u32>) {
+    let mut ids: Vec<u64> = g.node_props().iter().map(|(id, _)| id).collect();
+    ids.sort_unstable();
+    let n = ids.len();
+    let map = Map::of(&ids);
+
+    // One pass to count and one to fill, which is the standard CSR build. The
+    // counts are accumulated one to the right so that the prefix sum leaves the
+    // starts in place and the fill can use the same array as its cursor.
+    let mut out_at = vec![0u64; n + 1];
+    for label in labels {
+        g.adjacency().for_each_run(*label, Dir::Out, |node, ns, _| {
+            let Some(at) = map.dense(node) else { return };
+            out_at[at as usize + 1] += ns.len() as u64;
+        });
+    }
+    for i in 0..n {
+        out_at[i + 1] += out_at[i];
+    }
+
+    let mut out_to = vec![0u32; out_at[n] as usize];
+    let mut weights = match weight {
+        Some(_) => vec![0u32; out_at[n] as usize],
+        None => Vec::new(),
+    };
+    let mut cursor = out_at.clone();
+    for label in labels {
+        g.adjacency()
+            .for_each_run(*label, Dir::Out, |node, ns, es| {
+                let Some(at) = map.dense(node) else { return };
+                for (i, to) in ns.iter().enumerate() {
+                    // A neighbour the map does not know cannot happen: the plane's
+                    // ends are nodes and every node is in the map. It is skipped
+                    // rather than asserted because a snapshot is a read and a read
+                    // should not be able to panic.
+                    let Some(to) = map.dense(*to) else { continue };
+                    let put = cursor[at as usize] as usize;
+                    out_to[put] = to;
+                    if let Some((field, missing)) = weight {
+                        weights[put] = weigh(g, es[i], field, missing);
+                    }
+                    cursor[at as usize] += 1;
+                }
+            });
+    }
+
+    let (in_at, in_to) = transpose(n, &out_at, &out_to);
+    let s = Snapshot {
+        ids,
+        out_at,
+        out_to,
+        in_at,
+        in_to,
+    };
+    (s, weights)
+}
+
+/// One edge's weight, out of its own document.
+fn weigh(g: &Graph, slot: u32, field: &[u8], missing: u32) -> u32 {
+    let Some(value) = g.edge(slot).and_then(|doc| doc.get(field)) else {
+        return missing;
+    };
+    if let Some(n) = value.as_int() {
+        return u32::try_from(n).unwrap_or(if n < 0 { missing } else { u32::MAX });
+    }
+    if let Some(n) = value.as_float() {
+        if n.is_nan() || n < 0.0 {
+            return missing;
+        }
+        // Rounded rather than truncated, so an edge that weighs 0.6 does not
+        // turn into a free one.
+        return if n >= f64::from(u32::MAX) {
+            u32::MAX
+        } else {
+            n.round() as u32
+        };
+    }
+    missing
 }
 
 /// One node's slice out of a CSR.
