@@ -149,6 +149,46 @@ pub struct Csr {
     edges: u64,
     groups: Vec<Group>,
     words: Vec<u64>,
+    cost: Cost,
+}
+
+/// Where the bits went, in bits.
+///
+/// A compressed structure that cannot say which part of itself is expensive is
+/// very hard to improve, and the answer moves a lot between graphs: on a graph
+/// with an average degree of sixteen the per node fields are a fifth of the
+/// total, and on one with an average degree of three they are most of it.
+/// [`Csr::cost`] returns this and the `compress` example prints it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Cost {
+    /// The per node bit offset tables.
+    pub offsets: u64,
+    /// One degree per node, including the nodes that have no edges.
+    pub degrees: u64,
+    /// One first neighbour per node that has any.
+    pub firsts: u64,
+    /// The six bit width in front of every block of gaps.
+    pub widths: u64,
+    /// The gaps, which is the only part that is really the graph.
+    pub gaps: u64,
+    /// The fixed group records, which are not in the bit stream at all.
+    pub groups: u64,
+    /// Whatever rounding the stream up to whole words left over.
+    pub slack: u64,
+}
+
+impl Cost {
+    /// Everything, which is [`Csr::bytes`] in bits and to the bit.
+    #[must_use]
+    pub fn total(&self) -> u64 {
+        self.offsets
+            + self.degrees
+            + self.firsts
+            + self.widths
+            + self.gaps
+            + self.groups
+            + self.slack
+    }
 }
 
 impl Csr {
@@ -288,6 +328,12 @@ impl Csr {
         self.words.capacity() * size_of::<u64>() + self.groups.capacity() * size_of::<Group>()
     }
 
+    /// Where the bits went. See [`Cost`].
+    #[must_use]
+    pub fn cost(&self) -> Cost {
+        self.cost
+    }
+
     /// [`bytes`](Csr::bytes) said the way the target in `11` is written, and
     /// zero for a graph with no edges.
     #[must_use]
@@ -330,6 +376,7 @@ impl Csr {
         let mut offs: Vec<u64> = Vec::with_capacity(GROUP as usize);
         let mut gaps: Vec<u32> = Vec::new();
         let mut e = 0usize;
+        let mut cost = Cost::default();
 
         for lo in (0..nodes).step_by(GROUP as usize) {
             let hi = (lo + GROUP).min(nodes);
@@ -368,18 +415,23 @@ impl Csr {
 
             let at = w.bits();
             w.skip(count as u64 * u64::from(ow));
+            cost.offsets += count as u64 * u64::from(ow);
             for (i, (s, t)) in runs.iter().enumerate() {
                 w.put_at(at + i as u64 * u64::from(ow), offs[i], ow);
                 let run = &edges[*s..*t];
                 w.put(run.len() as u64, dw);
+                cost.degrees += u64::from(dw);
                 if run.is_empty() {
                     continue;
                 }
                 w.put(u64::from(run[0].1 - base), nw);
+                cost.firsts += u64::from(nw);
                 gaps_of(run, &mut gaps);
                 for block in gaps.chunks(BLOCK) {
                     let bw = width(u64::from(block.iter().copied().max().unwrap_or(0)));
                     w.put(u64::from(bw), 6);
+                    cost.widths += 6;
+                    cost.gaps += block.len() as u64 * u64::from(bw);
                     for gap in block {
                         w.put(u64::from(*gap), bw);
                     }
@@ -399,11 +451,17 @@ impl Csr {
         w.words.push(0);
         w.words.shrink_to_fit();
         groups.shrink_to_fit();
+        // The spare word and the rounding, so the total is the resident size to
+        // the bit rather than to the field. Taken before the group records go
+        // in, because those are not in the stream.
+        cost.slack = w.words.capacity() as u64 * 64 - cost.total();
+        cost.groups = groups.capacity() as u64 * size_of::<Group>() as u64 * 8;
         Csr {
             nodes,
             edges: edges.len() as u64,
             groups,
             words: w.words,
+            cost,
         }
     }
 }
@@ -656,6 +714,18 @@ mod tests {
         w.words.push(0);
         assert_eq!(read(&w.words, at, 40), 0x9f_ffff_ffff);
         assert_eq!(read(&w.words, at + 40, 32), 0xabcd);
+    }
+
+    #[test]
+    fn the_bits_add_up_to_the_bytes() {
+        let mut edges = rmat(12, 8, 0xadd);
+        let cold = Csr::build(1 << 12, &mut edges);
+        let c = cold.cost();
+        assert_eq!(c.total(), cold.bytes() as u64 * 8, "{c:?}");
+        assert!(
+            c.gaps > c.offsets,
+            "the gaps should be the biggest part here"
+        );
     }
 
     #[test]

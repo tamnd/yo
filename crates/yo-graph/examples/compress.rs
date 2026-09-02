@@ -75,23 +75,36 @@ fn main() {
         );
     }
 
+    println!(
+        "{:19}{:>7}{:>9}{:>9}{:>9}{:>8}{:>8}{:>8}{:>8}",
+        "", "total", "offsets", "degrees", "firsts", "widths", "gaps", "groups", "slack"
+    );
+
     let t = Instant::now();
     let cold = Csr::build(nodes, &mut edges.clone());
-    println!(
-        "cold               {:6.2} bits an edge, {:>6.1} MB, built in {:?}",
-        cold.bits_per_edge(),
-        cold.bytes() as f64 / (1 << 20) as f64,
-        t.elapsed()
-    );
+    report("cold", &cold, m, t.elapsed());
 
     let t = Instant::now();
     let to = csr::order_by_degree(nodes, &edges);
     csr::renumber(&mut edges, &to);
     let ordered = t.elapsed();
     let cold = Csr::build(nodes, &mut edges);
+    report("cold, deg ordered", &cold, m, ordered);
+}
+
+fn report(name: &str, cold: &Csr, m: f64, took: std::time::Duration) {
+    let c = cold.cost();
+    let per = |bits: u64| bits as f64 / m;
     println!(
-        "cold, deg ordered  {:6.2} bits an edge, {:>6.1} MB, ordered in {ordered:?}",
+        "{name:19}{:>7.2}{:>9.2}{:>9.2}{:>9.2}{:>9.2}{:>8.2}{:>8.2}{:>8.2}   {:>6.1} MB in {took:?}",
         cold.bits_per_edge(),
+        per(c.offsets),
+        per(c.degrees),
+        per(c.firsts),
+        per(c.widths),
+        per(c.gaps),
+        per(c.groups),
+        per(c.slack),
         cold.bytes() as f64 / (1 << 20) as f64,
     );
 }
