@@ -30,15 +30,19 @@
 //! assert_eq!(q.code_bytes(), 16);
 //! ```
 //!
-//! The estimator here is the reference one: a float multiply per dimension per
-//! code. It is right and it is not fast, at 900 nanoseconds a vector against a
-//! search budget of a millisecond, and the packed scan that RaBitQ's paper
-//! actually specifies, where the query is quantised and a code is measured with
-//! four ANDs and four popcounts, is the next change. `benches/rabitq.rs` holds
-//! the numbers it will be measured against.
+//! A code is stored as bit planes rather than with each coordinate's bits next
+//! to each other, and the query is quantised and transposed the same way, so
+//! measuring one against the other is ANDs and popcounts rather than a float
+//! multiply per dimension. That is 20 nanoseconds a vector at 768 dimensions
+//! against a whole search budget of a millisecond, and 35 times what the same
+//! estimator costs with the query left in floats. `benches/rabitq.rs` runs both
+//! so the ratio is measured rather than remembered.
 //!
 //! The partitions themselves, the LIRE update protocol, filtered search, MUVERA
 //! and the HNSW compatibility view are the rest of M6 and are not here yet.
+//! Preparing a query is 10 microseconds and it happens once per partition
+//! probed, which the partition store fixes by rotating its centroids once when
+//! it builds them rather than rotating the query again for each of them.
 
 #![deny(missing_docs)]
 
