@@ -609,8 +609,11 @@ impl Partitions {
         // Rotated once here and never again, which is what lets a search probe
         // tens of partitions without paying for tens of rotations.
         let u = self.quant.rotate(q);
-        let width = self.quant.code_bytes();
         let mut found = Vec::new();
+        // One buffer for the whole search rather than one per partition, and
+        // grown rather than cleared, because every partition after the first
+        // wants the same room the one before it did.
+        let mut scores: Vec<f32> = Vec::new();
         let reach = self.tuning.probe.saturating_mul(self.tuning.widen.max(1));
         for (n, p) in self.near_partitions(&u, reach).into_iter().enumerate() {
             // Past the partitions an unfiltered search would have read, keep
@@ -622,12 +625,19 @@ impl Partitions {
             }
             let prepared = self.quant.query_rotated(&u, self.centroid(p));
             let posting = &self.postings[p];
+            let held = posting.ids.len();
+            if scores.len() < held {
+                scores.resize(held, 0.0);
+            }
+            // The whole posting at once, so the estimator's inner loops know
+            // how wide a code is. Then a second pass for the filter and the
+            // ids, which reads two arrays this one never touched.
+            prepared.scan(&posting.codes, &posting.meta, &mut scores[..held]);
             for (i, &id) in posting.ids.iter().enumerate() {
                 if !filter.allows(posting.tags[i]) {
                     continue;
                 }
-                let code = &posting.codes[i * width..(i + 1) * width];
-                found.push((id, prepared.distance(code, &posting.meta[i])));
+                found.push((id, scores[i]));
             }
         }
         if found.len() > want {
@@ -1659,7 +1669,7 @@ mod tests {
 
         assert_eq!(a, b, "the two ways round should write the same code");
         assert!((one.norm - two.norm).abs() < 1e-4);
-        assert!((one.correction - two.correction).abs() < 1e-4);
+        assert!((one.scale - two.scale).abs() < 1e-4);
     }
 
     #[test]

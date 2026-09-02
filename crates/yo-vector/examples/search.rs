@@ -35,14 +35,14 @@
 //!
 //! ```text
 //!   probe     scanned  candidates      search      rerank
-//!       1         376         68us        100us         32us
-//!       8        3005        103us        134us         31us
-//!      32       12021        223us        260us         36us
-//!      64       24042        385us        421us         36us
-//!     128       48084        703us        799us         95us
+//!       1         376         58us         88us         30us
+//!       8        3005         81us        114us         33us
+//!      32       12021        168us        195us         26us
+//!      64       24042        256us        290us         33us
+//!     128       48084        463us        518us         54us
 //!
-//! ranking 1331 centroids: 63 us
-//! scanning one partition of 376: 5.0 us
+//! ranking 1331 centroids: 57 us
+//! scanning one partition of 376: 3.2 us
 //! ```
 //!
 //! Rerank is flat, which is what it should be, because the number of candidates
@@ -50,19 +50,20 @@
 //! rerank is not the problem and reading the full vectors back is not the
 //! problem, which was worth ruling out before anything else.
 //!
-//! The scan is. A one off timer inside `candidates_where` split the probe 64
+//! The scan was. A one off timer inside `candidates_where` split the probe 64
 //! row into 67 microseconds ranking centroids, 39 preparing one query per
 //! partition, 240 scanning postings and 37 picking the best of what the scan
-//! found. That timer is not in the library, because a timer on the hot path
-//! costs more than some of the things it measures, and the numbers are written
-//! down here instead.
+//! found, and the scan came down to 127 when the estimator started taking a
+//! whole posting at a time. That timer is not in the library, because a timer
+//! on the hot path costs more than some of the things it measures, and the
+//! numbers are written down here instead.
 //!
-//! Two thirds of a search is the estimator, at 9.9 nanoseconds a member. The
-//! bench in `benches/rabitq.rs` says the same thing from the other direction: a
-//! thousand one bit codes at 128 dimensions is 9.1 microseconds. So the way to
-//! the millisecond is to make the scan meet more than one code at a time, and
-//! the preparation and the selection are each a tenth and worth having after
-//! that rather than before it.
+//! Where it stands now, at probe 64: 60 microseconds ranking, 33 preparing, 127
+//! scanning and 32 selecting. The scan is still half of it at 5.3 nanoseconds a
+//! member, and the next two are worth having. Preparing a query is a residual
+//! and a quantisation per partition and it allocates twice, and selecting is a
+//! sort of everything the scan found when only the best `want` of it can
+//! possibly matter.
 
 use std::time::{Duration, Instant};
 use yo_common::Rng;
