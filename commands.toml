@@ -57,8 +57,13 @@ doc = "08 section 2"
 [[group]]
 name = "bitmap"
 expected = 7
-status = "planned"
+status = "shipped"
 doc = "08 section 8"
+# All seven, over the same string values the string group writes, which is why
+# STRLEN on a bitmap answers and SETBIT on something SET left behind works. The
+# kernels are in yo-kv's bits module and they are plain loops over u64 words
+# rather than intrinsics, because the loop is what the compiler already turns
+# into the vector instructions the machine has.
 
 [[group]]
 name = "list"
@@ -480,6 +485,85 @@ status = "shipped"
 wire = "verified"
 divergent = "D-11"
 notes = "INCREX key [BYINT n|BYFLOAT f] [SATURATE] [LBOUND l] [UBOUND u] [EX|PX|EXAT|PXAT|PERSIST] [ENX], checked against a real 8.8. A counter with a bound, a saturation policy and four things it can do to the deadline. The reply is the value and the amount applied, and a refused increment reports zero applied and does not create the key."
+
+# --------------------------------------------------------------------- bitmaps
+
+[[command]]
+name = "SETBIT"
+group = "bitmap"
+since = "2.2.0"
+arity = 4
+plan = "point"
+bounded = "risk"
+status = "shipped"
+wire = "verified"
+notes = "Writes the bit where it lies when the value is already raw, which is the common case and costs one probe and one byte written. An int or an embstr has to move to become raw first, and it does move, because a real server reports raw encoding after a SETBIT whether or not the bit changed. Bounded is a risk rather than inherent because the offset decides how far the value grows and four gigabits is the cap."
+
+[[command]]
+name = "GETBIT"
+group = "bitmap"
+since = "2.2.0"
+arity = 3
+plan = "point"
+bounded = "inherent"
+status = "shipped"
+wire = "verified"
+notes = "One probe and one byte read, and no re-encoding: an int key is still an int afterwards and the bits it answers with are the bits of its digits."
+
+[[command]]
+name = "BITCOUNT"
+group = "bitmap"
+since = "2.6.0"
+arity = -2
+plan = "whole-value"
+bounded = "inherent"
+status = "shipped"
+wire = "verified"
+notes = "Four running totals over thirty two bytes at a time. The BIT unit masks the two partial bytes at the ends and counts the whole ones in between. Redis clamps the two ends differently, a negative index up to zero and the end down to the last item but never the start, which is what makes a range that starts past the end count nothing."
+
+[[command]]
+name = "BITPOS"
+group = "bitmap"
+since = "2.8.7"
+arity = -3
+plan = "whole-value"
+bounded = "inherent"
+status = "shipped"
+wire = "verified"
+notes = "Skips eight bytes at a time and finds the bit with a leading zero count. A search for a nought with no end given answers the length in bits rather than minus one, because the string is treated as if it had noughts after it forever, and that is the only place a miss is not minus one."
+
+[[command]]
+name = "BITOP"
+group = "bitmap"
+since = "2.6.0"
+arity = -4
+plan = "merge"
+bounded = "risk"
+status = "shipped"
+wire = "verified"
+notes = "All eight operations, AND OR XOR NOT and 8.2's DIFF DIFF1 ANDOR ONE. The sources and the result go end to end in the one scratch buffer so that nothing allocates, and they are combined a kilobyte at a time so the working set stays in L1 however long the strings are. An empty result deletes the destination."
+
+[[command]]
+name = "BITFIELD"
+group = "bitmap"
+since = "3.2.0"
+arity = -2
+plan = "point"
+bounded = "risk"
+status = "shipped"
+wire = "verified"
+notes = "Packed fields up to sixty four bits wide, with WRAP, SAT and FAIL overflow. The arguments are walked twice, once to check every subcommand and work out how far the value has to grow and once to run them, which is both how nothing allocates and how a bad field type in the last subcommand leaves the key untouched and uncreated the way a real server does."
+
+[[command]]
+name = "BITFIELD_RO"
+group = "bitmap"
+since = "6.0.0"
+arity = -2
+plan = "point"
+bounded = "inherent"
+status = "shipped"
+wire = "verified"
+notes = "The same parser with the writes refused, so a replica can answer it. An OVERFLOW word is still accepted even though nothing it can run will overflow, which is what a real server does."
 
 # ------------------------------------------------------------------- keyspace
 #

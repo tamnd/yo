@@ -53,6 +53,7 @@
 
 mod args;
 mod arrays;
+mod bits;
 mod blocking;
 mod cpu;
 mod graph;
@@ -833,7 +834,9 @@ pub fn resolved(
     // `COPY`, `SWAPDB` and `FLUSHALL` reach a database nobody selected, so the
     // two groups that hold them mark all of them rather than the session's.
     server.dirty |= match spec.group {
-        "string" | "set" | "hash" | "list" | "zset" | "array" | "stream" => 1u64 << session.db,
+        "string" | "bitmap" | "set" | "hash" | "list" | "zset" | "array" | "stream" => {
+            1u64 << session.db
+        }
         _ => ALL_DATABASES,
     };
 
@@ -851,6 +854,13 @@ pub fn resolved(
             "string" => {
                 let db = session.db;
                 strings::execute(&mut server.dbs[db], spec, args, out).map(|()| Flow::Continue)
+            }
+            // Its own group and its own file, and the same values underneath:
+            // a bitmap is a string, so `STRLEN` on one answers and `SETBIT` on
+            // something a `SET` left behind works.
+            "bitmap" => {
+                let db = session.db;
+                bits::execute(&mut server.dbs[db], spec, args, out).map(|()| Flow::Continue)
             }
             "set" => {
                 let db = session.db;
@@ -4872,6 +4882,414 @@ mod tests {
             "held {} after two hundred passes against {after_first} after one",
             f.server.memory_bytes()
         );
+    }
+
+    // --------------------------------------------------------------- bitmaps
+
+    /// The two single bit commands, and the encoding rule underneath them.
+    ///
+    /// A write always leaves the value `raw` and a read never re-encodes, which
+    /// is why the `int` key here is still `int` after a `GETBIT` and is `raw`
+    /// with its first digit changed after a `SETBIT`.
+    #[test]
+    fn a_bit_is_written_and_read_back_and_a_write_unpacks_an_int() {
+        let mut f = Fixture::new();
+        assert_eq!(f.run(&[b"SETBIT", b"k", b"7", b"1"]), ":0\r\n");
+        assert_eq!(f.run(&[b"GET", b"k"]), "$1\r\n\u{1}\r\n");
+        assert_eq!(f.run(&[b"GETBIT", b"k", b"7"]), ":1\r\n");
+        assert_eq!(f.run(&[b"GETBIT", b"k", b"6"]), ":0\r\n");
+        assert_eq!(f.run(&[b"GETBIT", b"k", b"100"]), ":0\r\n");
+        assert_eq!(f.run(&[b"SETBIT", b"k", b"7", b"0"]), ":1\r\n");
+
+        // Writing a nought past the end still creates the key and still pads.
+        assert_eq!(f.run(&[b"SETBIT", b"nk", b"0", b"0"]), ":0\r\n");
+        assert_eq!(f.run(&[b"STRLEN", b"nk"]), ":1\r\n");
+        assert_eq!(f.run(&[b"OBJECT", b"ENCODING", b"nk"]), "$3\r\nraw\r\n");
+
+        f.run(&[b"SET", b"num", b"12345"]);
+        assert_eq!(f.run(&[b"GETBIT", b"num", b"1"]), ":0\r\n");
+        assert_eq!(f.run(&[b"OBJECT", b"ENCODING", b"num"]), "$3\r\nint\r\n");
+        assert_eq!(f.run(&[b"SETBIT", b"num", b"1", b"1"]), ":0\r\n");
+        assert_eq!(f.run(&[b"OBJECT", b"ENCODING", b"num"]), "$3\r\nraw\r\n");
+        assert_eq!(f.run(&[b"GET", b"num"]), "$5\r\nq2345\r\n");
+    }
+
+    /// Counting, in bytes and in bits.
+    ///
+    /// The `0 -5 BIT` row is 25 on a real 8.10.1 and Redis's own documentation
+    /// says 22 for it. The server is the thing being copied here.
+    #[test]
+    fn bits_are_counted_over_a_range_of_bytes_or_of_bits() {
+        let mut f = Fixture::new();
+        f.run(&[b"SET", b"mykey", b"foobar"]);
+        assert_eq!(f.run(&[b"BITCOUNT", b"mykey"]), ":26\r\n");
+        assert_eq!(f.run(&[b"BITCOUNT", b"mykey", b"0", b"0"]), ":4\r\n");
+        assert_eq!(f.run(&[b"BITCOUNT", b"mykey", b"1", b"1"]), ":6\r\n");
+        assert_eq!(
+            f.run(&[b"BITCOUNT", b"mykey", b"1", b"1", b"BYTE"]),
+            ":6\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"BITCOUNT", b"mykey", b"0", b"-5", b"BIT"]),
+            ":25\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"BITCOUNT", b"mykey", b"5", b"30", b"BIT"]),
+            ":17\r\n"
+        );
+        assert_eq!(f.run(&[b"BITCOUNT", b"nokey"]), ":0\r\n");
+
+        // A start past the end is left where it is and the end is pulled back,
+        // so the range comes out backwards and counts nothing.
+        assert_eq!(f.run(&[b"BITCOUNT", b"mykey", b"10", b"20"]), ":0\r\n");
+
+        // A lone start is a syntax error here, where BITPOS allows it.
+        assert_eq!(
+            f.run(&[b"BITCOUNT", b"mykey", b"0"]),
+            "-ERR syntax error\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"BITCOUNT", b"mykey", b"0", b"1", b"NIB"]),
+            "-ERR syntax error\r\n"
+        );
+    }
+
+    /// Searching, and the one place a miss is not minus one.
+    ///
+    /// A search for a nought that runs to the end of the string answers the
+    /// length in bits, because the string is treated as if it had noughts after
+    /// it forever. Give it an explicit end and it answers minus one instead.
+    #[test]
+    fn a_search_for_a_nought_past_the_end_answers_the_length_in_bits() {
+        let mut f = Fixture::new();
+        f.run(&[b"SET", b"ones", b"\xff\xff\xff"]);
+        assert_eq!(f.run(&[b"BITPOS", b"ones", b"0"]), ":24\r\n");
+        assert_eq!(f.run(&[b"BITPOS", b"ones", b"0", b"0"]), ":24\r\n");
+        assert_eq!(f.run(&[b"BITPOS", b"ones", b"0", b"0", b"-1"]), ":-1\r\n");
+        assert_eq!(f.run(&[b"BITPOS", b"ones", b"0", b"0", b"3"]), ":-1\r\n");
+        assert_eq!(f.run(&[b"BITPOS", b"ones", b"1"]), ":0\r\n");
+
+        f.run(&[b"SET", b"mid", b"\x00\xff\xf0"]);
+        assert_eq!(f.run(&[b"BITPOS", b"mid", b"1", b"0"]), ":8\r\n");
+        assert_eq!(f.run(&[b"BITPOS", b"mid", b"1", b"2"]), ":16\r\n");
+        assert_eq!(
+            f.run(&[b"BITPOS", b"mid", b"1", b"0", b"-1", b"BIT"]),
+            ":8\r\n"
+        );
+
+        // A missing key is all noughts, so a one is never found and a nought is
+        // at position zero.
+        assert_eq!(f.run(&[b"BITPOS", b"gone", b"1"]), ":-1\r\n");
+        assert_eq!(f.run(&[b"BITPOS", b"gone", b"0"]), ":0\r\n");
+    }
+
+    /// The eight operations, with the answers a real server gives for them.
+    #[test]
+    fn the_eight_combinations_write_what_a_real_server_writes() {
+        let mut f = Fixture::new();
+        f.run(&[b"SET", b"a", b"abc"]);
+        f.run(&[b"SET", b"b", b"abd"]);
+        let cases: &[(&[u8], &str)] = &[
+            (b"AND", "ab`"),
+            (b"OR", "abg"),
+            (b"XOR", "\u{0}\u{0}\u{7}"),
+            (b"DIFF", "\u{0}\u{0}\u{3}"),
+            (b"DIFF1", "\u{0}\u{0}\u{4}"),
+            (b"ANDOR", "ab`"),
+            (b"ONE", "\u{0}\u{0}\u{7}"),
+        ];
+        for (op, want) in cases {
+            assert_eq!(f.run(&[b"BITOP", op, b"d", b"a", b"b"]), ":3\r\n", "{op:?}");
+            assert_eq!(
+                f.run(&[b"GET", b"d"]),
+                format!("$3\r\n{want}\r\n"),
+                "{op:?}"
+            );
+        }
+        // The one whose answer is not text, so it is compared as bytes.
+        assert_eq!(f.run(&[b"BITOP", b"NOT", b"d", b"a"]), ":3\r\n");
+        assert_eq!(f.raw(&[b"GET", b"d"]), b"$3\r\n\x9e\x9d\x9c\r\n".to_vec());
+
+        // A missing source is a string of noughts as long as it needs to be, so
+        // an AND against one writes three zero bytes rather than nothing.
+        assert_eq!(f.run(&[b"BITOP", b"AND", b"d", b"a", b"gone"]), ":3\r\n");
+        assert_eq!(f.run(&[b"GET", b"d"]), "$3\r\n\u{0}\u{0}\u{0}\r\n");
+
+        // Every source missing is an empty result, and an empty result takes
+        // the destination with it.
+        f.run(&[b"SET", b"dest", b"x"]);
+        assert_eq!(f.run(&[b"BITOP", b"AND", b"dest", b"g1", b"g2"]), ":0\r\n");
+        assert_eq!(f.run(&[b"EXISTS", b"dest"]), ":0\r\n");
+    }
+
+    /// What `BITOP` says when it is asked for something it cannot do.
+    #[test]
+    fn bitop_names_the_operation_in_its_own_complaints() {
+        let mut f = Fixture::new();
+        f.run(&[b"SET", b"a", b"abc"]);
+        assert_eq!(
+            f.run(&[b"BITOP", b"nope", b"d", b"a"]),
+            "-ERR syntax error\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"BITOP", b"NOT", b"d", b"a", b"a"]),
+            "-ERR BITOP NOT must be called with a single source key.\r\n"
+        );
+        for op in [&b"DIFF"[..], b"DIFF1", b"ANDOR"] {
+            assert_eq!(
+                f.run(&[b"BITOP", op, b"d", b"a"]),
+                format!(
+                    "-ERR BITOP {} must be called with at least two source keys.\r\n",
+                    String::from_utf8_lossy(op)
+                )
+            );
+        }
+        f.run(&[b"LPUSH", b"l", b"x"]);
+        assert_eq!(
+            f.run(&[b"BITOP", b"AND", b"d", b"a", b"l"]),
+            "-WRONGTYPE Operation against a key holding the wrong kind of value\r\n"
+        );
+    }
+
+    /// Packed fields, the three overflow policies and the `#` offset.
+    #[test]
+    fn bitfield_reads_and_writes_packed_fields() {
+        let mut f = Fixture::new();
+        assert_eq!(f.run(&[b"BITFIELD", b"bf"]), "*0\r\n");
+        assert_eq!(f.run(&[b"EXISTS", b"bf"]), ":0\r\n");
+
+        assert_eq!(
+            f.run(&[
+                b"BITFIELD",
+                b"bf",
+                b"INCRBY",
+                b"u2",
+                b"100",
+                b"1",
+                b"GET",
+                b"u4",
+                b"0"
+            ]),
+            "*2\r\n:1\r\n:0\r\n"
+        );
+        // The field at bit 100 is two bits wide, so it ends in the thirteenth
+        // byte and the value grew to thirteen bytes to hold it.
+        assert_eq!(f.run(&[b"STRLEN", b"bf"]), ":13\r\n");
+
+        // A `#` offset counts in fields rather than in bits.
+        assert_eq!(
+            f.run(&[
+                b"BITFIELD",
+                b"bf",
+                b"SET",
+                b"u8",
+                b"#0",
+                b"255",
+                b"GET",
+                b"u8",
+                b"#0"
+            ]),
+            "*2\r\n:0\r\n:255\r\n"
+        );
+
+        assert_eq!(
+            f.run(&[
+                b"BITFIELD",
+                b"bf",
+                b"OVERFLOW",
+                b"SAT",
+                b"INCRBY",
+                b"i8",
+                b"0",
+                b"120",
+                b"INCRBY",
+                b"i8",
+                b"0",
+                b"120"
+            ]),
+            "*2\r\n:119\r\n:127\r\n"
+        );
+        assert_eq!(
+            f.run(&[
+                b"BITFIELD",
+                b"bf2",
+                b"OVERFLOW",
+                b"FAIL",
+                b"INCRBY",
+                b"u2",
+                b"0",
+                b"5"
+            ]),
+            "*1\r\n$-1\r\n"
+        );
+        assert_eq!(
+            f.run(&[
+                b"BITFIELD",
+                b"bf3",
+                b"OVERFLOW",
+                b"WRAP",
+                b"INCRBY",
+                b"u2",
+                b"0",
+                b"5"
+            ]),
+            "*1\r\n:1\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"BITFIELD", b"bf3", b"GET", b"i64", b"0"]),
+            "*1\r\n:4611686018427387904\r\n"
+        );
+    }
+
+    /// A bad subcommand anywhere in the line stops all of it.
+    ///
+    /// Redis checks the whole argument list before it runs any of it, so the
+    /// `SET` in front of the bad type here never happens and the key it would
+    /// have created is not there afterwards.
+    #[test]
+    fn a_bad_bitfield_subcommand_leaves_the_key_alone() {
+        let mut f = Fixture::new();
+        let bad_type = "-ERR Invalid bitfield type. Use something like i16 u8. Note that u64 is not supported but i64 is.\r\n";
+        assert_eq!(
+            f.run(&[
+                b"BITFIELD",
+                b"bad",
+                b"SET",
+                b"u8",
+                b"0",
+                b"1",
+                b"GET",
+                b"u99",
+                b"0"
+            ]),
+            bad_type
+        );
+        assert_eq!(f.run(&[b"EXISTS", b"bad"]), ":0\r\n");
+        assert_eq!(
+            f.run(&[b"BITFIELD", b"bad", b"GET", b"u64", b"0"]),
+            bad_type
+        );
+        assert_eq!(
+            f.run(&[b"BITFIELD", b"bad", b"GET"]),
+            "-ERR syntax error\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"BITFIELD", b"bad", b"NOPE", b"u8", b"0"]),
+            "-ERR syntax error\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"BITFIELD", b"bad", b"OVERFLOW"]),
+            "-ERR syntax error\r\n"
+        );
+        assert_eq!(
+            f.run(&[
+                b"BITFIELD",
+                b"bad",
+                b"OVERFLOW",
+                b"NOPE",
+                b"GET",
+                b"u8",
+                b"0"
+            ]),
+            "-ERR Invalid OVERFLOW type specified\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"BITFIELD", b"bad", b"SET", b"u8", b"0", b"notanum"]),
+            "-ERR value is not an integer or out of range\r\n"
+        );
+        for at in [&b"#-1"[..], b"abc"] {
+            assert_eq!(
+                f.run(&[b"BITFIELD", b"bad", b"GET", b"u8", at]),
+                "-ERR bit offset is not an integer or out of range\r\n"
+            );
+        }
+    }
+
+    /// The read only twin reads, refuses to write, and creates nothing.
+    #[test]
+    fn bitfield_ro_answers_gets_and_refuses_the_rest() {
+        let mut f = Fixture::new();
+        f.run(&[b"SET", b"n", b"123"]);
+        assert_eq!(
+            f.run(&[b"BITFIELD_RO", b"n", b"GET", b"u8", b"0"]),
+            "*1\r\n:49\r\n"
+        );
+        // A read does not unpack an int the way a write does.
+        assert_eq!(f.run(&[b"OBJECT", b"ENCODING", b"n"]), "$3\r\nint\r\n");
+
+        // An OVERFLOW word is allowed even though nothing here can overflow.
+        assert_eq!(
+            f.run(&[
+                b"BITFIELD_RO",
+                b"n",
+                b"OVERFLOW",
+                b"SAT",
+                b"GET",
+                b"u8",
+                b"0"
+            ]),
+            "*1\r\n:49\r\n"
+        );
+        for sub in [&b"SET"[..], b"INCRBY"] {
+            assert_eq!(
+                f.run(&[b"BITFIELD_RO", b"n", sub, b"u8", b"0", b"1"]),
+                "-ERR BITFIELD_RO only supports the GET subcommand\r\n"
+            );
+        }
+
+        assert_eq!(
+            f.run(&[b"BITFIELD_RO", b"gone", b"GET", b"u8", b"100"]),
+            "*1\r\n:0\r\n"
+        );
+        assert_eq!(f.run(&[b"EXISTS", b"gone"]), ":0\r\n");
+    }
+
+    /// The offsets a bitmap command will not take.
+    #[test]
+    fn an_offset_off_the_end_of_the_world_is_refused() {
+        let mut f = Fixture::new();
+        let bad = "-ERR bit offset is not an integer or out of range\r\n";
+        for arg in [&b"abc"[..], b"-1", b"4294967296"] {
+            assert_eq!(f.run(&[b"SETBIT", b"k", arg, b"1"]), bad);
+            assert_eq!(f.run(&[b"GETBIT", b"k", arg]), bad);
+        }
+        for arg in [&b"2"[..], b"-1"] {
+            assert_eq!(
+                f.run(&[b"BITPOS", b"k", arg]),
+                "-ERR The bit argument must be 1 or 0.\r\n"
+            );
+        }
+        assert_eq!(
+            f.run(&[b"BITPOS", b"k", b"abc"]),
+            "-ERR value is not an integer or out of range\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"BITPOS", b"k", b"0", b"5", b"BIT"]),
+            "-ERR value is not an integer or out of range\r\n"
+        );
+        let bad_bit = "-ERR bit is not an integer or out of range\r\n";
+        assert_eq!(f.run(&[b"SETBIT", b"k", b"0", b"2"]), bad_bit);
+        assert_eq!(f.run(&[b"SETBIT", b"k", b"0", b"abc"]), bad_bit);
+    }
+
+    /// Every one of the seven refuses a key that is not a string.
+    #[test]
+    fn every_bitmap_command_says_wrongtype() {
+        let mut f = Fixture::new();
+        f.run(&[b"LPUSH", b"l", b"x"]);
+        let wrong = "-WRONGTYPE Operation against a key holding the wrong kind of value\r\n";
+        let cases: &[&[&[u8]]] = &[
+            &[b"SETBIT", b"l", b"0", b"1"],
+            &[b"GETBIT", b"l", b"0"],
+            &[b"BITCOUNT", b"l"],
+            &[b"BITPOS", b"l", b"1"],
+            &[b"BITOP", b"AND", b"d", b"l"],
+            &[b"BITFIELD", b"l", b"GET", b"u8", b"0"],
+            &[b"BITFIELD_RO", b"l", b"GET", b"u8", b"0"],
+        ];
+        for case in cases {
+            assert_eq!(f.run(case), wrong, "{:?}", case[0]);
+        }
     }
 
     /// A RESP2 array of bulk strings, which is what most of the list replies

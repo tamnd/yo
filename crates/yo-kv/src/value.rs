@@ -663,6 +663,23 @@ pub fn read_int_in_place(rec: &[u8]) -> Option<(i64, usize)> {
     Some((i64::from_le_bytes(b), at))
 }
 
+/// The bytes of a raw record, to be written over where they lie.
+///
+/// `None` for the other two encodings, and that is not a missing case: a bitmap
+/// write turns an int or an embstr into a raw string, which means moving it, so
+/// there is nothing here for those two to write into. `OBJECT ENCODING` says
+/// `raw` after a `SETBIT` on a value that was `int` a moment before, which is
+/// the same rule seen from the outside.
+#[inline]
+pub fn raw_in_place(rec: &mut [u8]) -> Option<&mut [u8]> {
+    let m = Meta::from_byte(rec[0]);
+    if m.encoding() != Encoding::Raw {
+        return None;
+    }
+    let at = m.payload_at();
+    Some(&mut rec[at..])
+}
+
 /// Store `n` back over an int payload that starts at `at`.
 #[inline]
 pub fn write_int_in_place(rec: &mut [u8], at: usize, n: i64) {

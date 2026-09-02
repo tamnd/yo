@@ -50,6 +50,12 @@ const WRITE_FAST_OOM: &[&str] = &["write", "denyoom", "fast"];
 const WRITE_OOM: &[&str] = &["write", "denyoom"];
 /// The read side categories.
 const AC_READ_FAST: &[&str] = &["@read", "@string", "@fast"];
+/// The bitmap read side, for the two that answer without walking the value.
+const AC_BIT_READ_FAST: &[&str] = &["@read", "@bitmap", "@fast"];
+/// The bitmap read side for the ones that walk it.
+const AC_BIT_READ: &[&str] = &["@read", "@bitmap", "@slow"];
+/// The bitmap write side. Redis counts none of these as fast, `SETBIT` included.
+const AC_BIT_WRITE: &[&str] = &["@write", "@bitmap", "@slow"];
 /// The read side categories for the ones that walk the value.
 const AC_READ_SLOW: &[&str] = &["@read", "@string", "@slow"];
 /// The write side categories.
@@ -548,6 +554,98 @@ pub static COMMANDS: &[Spec] = &[
         complexity: "O(1)",
         summary: "Count, with a bound, a saturation policy and a deadline.",
         group: "string",
+    },
+    // -------------------------------------------------------------- bitmaps
+    Spec {
+        name: "setbit",
+        arity: 4,
+        flags: WRITE_OOM,
+        first_key: 1,
+        last_key: 1,
+        step: 1,
+        acl: AC_BIT_WRITE,
+        since: "2.2.0",
+        complexity: "O(1)",
+        summary: "Set one bit of a string, growing it to reach the offset.",
+        group: "bitmap",
+    },
+    Spec {
+        name: "getbit",
+        arity: 3,
+        flags: READ_FAST,
+        first_key: 1,
+        last_key: 1,
+        step: 1,
+        acl: AC_BIT_READ_FAST,
+        since: "2.2.0",
+        complexity: "O(1)",
+        summary: "Read one bit of a string, or nought past its end.",
+        group: "bitmap",
+    },
+    Spec {
+        name: "bitcount",
+        arity: -2,
+        flags: &["readonly"],
+        first_key: 1,
+        last_key: 1,
+        step: 1,
+        acl: AC_BIT_READ,
+        since: "2.6.0",
+        complexity: "O(N)",
+        summary: "Count the set bits of a string, or of a range of it.",
+        group: "bitmap",
+    },
+    Spec {
+        name: "bitpos",
+        arity: -3,
+        flags: &["readonly"],
+        first_key: 1,
+        last_key: 1,
+        step: 1,
+        acl: AC_BIT_READ,
+        since: "2.8.7",
+        complexity: "O(N)",
+        summary: "Find the first bit set to one or nought in a string.",
+        group: "bitmap",
+    },
+    Spec {
+        name: "bitop",
+        arity: -4,
+        flags: WRITE_OOM,
+        first_key: 2,
+        last_key: -1,
+        step: 1,
+        acl: AC_BIT_WRITE,
+        since: "2.6.0",
+        complexity: "O(N) with N the length of the longest source",
+        summary: "Combine strings bit by bit and store the result.",
+        group: "bitmap",
+    },
+    Spec {
+        name: "bitfield",
+        arity: -2,
+        flags: WRITE_OOM,
+        first_key: 1,
+        last_key: 1,
+        step: 1,
+        acl: AC_BIT_WRITE,
+        since: "3.2.0",
+        complexity: "O(1) per subcommand",
+        summary: "Read and write packed integer fields inside a string.",
+        group: "bitmap",
+    },
+    Spec {
+        name: "bitfield_ro",
+        arity: -2,
+        flags: READ_FAST,
+        first_key: 1,
+        last_key: 1,
+        step: 1,
+        acl: AC_BIT_READ_FAST,
+        since: "6.0.0",
+        complexity: "O(1) per subcommand",
+        summary: "The read only half of BITFIELD, for a replica to answer.",
+        group: "bitmap",
     },
     // ----------------------------------------------------------------- sets
     Spec {
@@ -3183,23 +3281,24 @@ const SLOTS: usize = 512;
 /// most wants to be able to find.
 const FREE: u16 = u16::MAX;
 
-/// The multiplier, found by searching for one that spreads these 219 names well.
+/// The multiplier, found by searching for one that spreads these 226 names well.
 ///
 /// Not a magic constant in the bad sense: it is checked. Every command is looked
 /// up by its own name in a test, and another test holds the worst probe length
 /// at what it is now, so a command added later that made this multiplier bad
 /// would fail rather than quietly cost every lookup an extra slot.
 ///
-/// It has been searched for four times, and each time because the test went red
+/// It has been searched for five times, and each time because the test went red
 /// rather than because somebody went looking. The first was against the 191 names
 /// in the table then, the ten graph commands pushed its worst probe to three
 /// slots, and the second search was run over all 201. The fifteen stream commands
 /// pushed that one to four slots and fifty one extra probes, so the third was run
 /// over all 216, and the three 8.x pending list commands cost that one two more
-/// probes than the test allows. This is the same search run again over all 219:
-/// worst two and thirty nine extra slots over the whole table. Thirteen of those
-/// thirty nine are forced by the key and no multiplier can remove them.
-const MIX: u64 = 0xecfd_0b34_d0a1_0159;
+/// probes than the test allows. The fourth was over 219 and the seven bitmap
+/// commands took it to three slots. This is the same search run again over all
+/// 226: worst two and forty nine extra slots over the whole table. Fifteen of
+/// those forty nine are forced by the key and no multiplier can remove them.
+const MIX: u64 = 0xc97a_a994_53b3_7fdb;
 
 /// The four bytes the index is computed from: the length, the first two bytes
 /// and the last, lower cased.
@@ -3210,10 +3309,11 @@ const MIX: u64 = 0xecfd_0b34_d0a1_0159;
 /// Four bytes and not the whole name because the whole name has to be compared
 /// at the end anyway, so the hash only has to be good enough to get to the right
 /// slot, and reading less of the name is a shorter dependency chain in front of
-/// the multiply. These four leave 206 distinct values over the 219 commands, so
-/// twelve groups of names collide whatever the multiplier is and probe once more,
-/// and the probe is the same compare the lookup was always going to do. `setnx`
-/// and `setex` are one of those groups and `g.nadd` and `g.eadd` are another. The
+/// the multiply. These four leave 211 distinct values over the 226 commands, so
+/// fifteen names collide whatever the multiplier is and probe once more, and the
+/// probe is the same compare the lookup was always going to do. `setnx` and
+/// `setex` are one of those groups and `g.nadd` and `g.eadd` are another, and the
+/// bitmaps added two more, `getset` with `getbit` and `setbit` with `select`. The
 /// eighteen stream commands are in none of them, since a name is keyed on its
 /// first two bytes and its last and no two of them agree on all three.
 ///
@@ -3498,7 +3598,7 @@ mod tests {
         }
         assert!(worst <= 2, "worst probe is {worst} slots");
         assert!(
-            total <= 40,
+            total <= 49,
             "{total} extra slots walked over the whole table"
         );
     }
