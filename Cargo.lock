@@ -1003,6 +1003,7 @@ dependencies = [
  "yo-common",
  "yo-derive",
  "yo-doc",
+ "yo-graph",
  "yo-index",
  "yo-kv",
  "yo-shape",

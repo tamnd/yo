@@ -22,6 +22,7 @@ path = "src/lib.rs"
 yo-common.workspace = true
 yo-derive.workspace = true
 yo-doc.workspace = true
+yo-graph.workspace = true
 yo-index.workspace = true
 yo-kv.workspace = true
 yo-shape.workspace = true

@@ -6,10 +6,11 @@ use std::rc::Rc;
 
 use yo_common::{Code, Error, Result};
 use yo_index::RawMap;
-use yo_shape::{Desc, Tag};
+use yo_shape::{Desc, Shape, Tag};
 
 use crate::counter::Counter;
 use crate::doc::{Docs, Document, Documents};
+use crate::graph::Graph;
 use crate::keys::Keys;
 use crate::keyspace::Strings;
 use crate::map::Map;
@@ -107,6 +108,9 @@ pub(crate) enum Data {
     /// Boxed because a document collection carries its indexes and its build
     /// buffer, and a map should not pay for the size of one.
     Docs(Box<Documents>),
+    /// Boxed for the same reason, harder: a graph carries a plane, two document
+    /// stores and the table that turns an id into a dense one.
+    Graph(Box<crate::graph::Store>),
 }
 
 impl Data {
@@ -114,6 +118,7 @@ impl Data {
         match self {
             Data::Map(m) => m.memory_bytes(),
             Data::Docs(d) => d.docs.memory_bytes(),
+            Data::Graph(g) => g.memory_bytes(),
         }
     }
 
@@ -127,7 +132,7 @@ impl Data {
     pub(crate) fn map(&self) -> &RawMap {
         match self {
             Data::Map(m) => m,
-            Data::Docs(_) => wrong_kind(),
+            _ => wrong_kind(),
         }
     }
 
@@ -140,7 +145,7 @@ impl Data {
     pub(crate) fn map_mut(&mut self) -> &mut RawMap {
         match self {
             Data::Map(m) => m,
-            Data::Docs(_) => wrong_kind(),
+            _ => wrong_kind(),
         }
     }
 
@@ -153,7 +158,7 @@ impl Data {
     pub(crate) fn docs(&self) -> &yo_doc::Docs {
         match self {
             Data::Docs(d) => &d.docs,
-            Data::Map(_) => wrong_kind(),
+            _ => wrong_kind(),
         }
     }
 
@@ -166,7 +171,33 @@ impl Data {
     pub(crate) fn docs_mut(&mut self) -> &mut Documents {
         match self {
             Data::Docs(d) => d,
-            Data::Map(_) => wrong_kind(),
+            _ => wrong_kind(),
+        }
+    }
+
+    /// The graph inside, for a handle that was handed out against one.
+    ///
+    /// # Panics
+    ///
+    /// The same as [`Data::map`].
+    #[track_caller]
+    pub(crate) fn graph(&self) -> &crate::graph::Store {
+        match self {
+            Data::Graph(g) => g,
+            _ => wrong_kind(),
+        }
+    }
+
+    /// The same, for a write.
+    ///
+    /// # Panics
+    ///
+    /// The same as [`Data::map`].
+    #[track_caller]
+    pub(crate) fn graph_mut(&mut self) -> &mut crate::graph::Store {
+        match self {
+            Data::Graph(g) => g,
+            _ => wrong_kind(),
         }
     }
 }
@@ -233,6 +264,21 @@ fn declare<T: Document>(data: &mut Documents) -> Result<()> {
         data.docs.create_index_bytes(path.as_bytes(), *kind)?;
     }
     Ok(())
+}
+
+/// The shape every graph collection has.
+///
+/// A graph's node and edge types register themselves under their labels as they
+/// are used, so what the catalogue holds is only that this name is a graph and
+/// not a map or a document collection. The per label shape check is in
+/// `graph::Store`, and it is stricter than one tuple named at open time because
+/// it catches a type that changed under a label it already used.
+struct AGraph;
+
+impl Shape for AGraph {
+    fn describe(d: &mut Desc) {
+        d.strukt("graph", &[]);
+    }
 }
 
 /// The error a call made from inside another call's callback gets.
@@ -344,6 +390,72 @@ impl Db {
                 },
             )?;
         Ok(Docs::new(self.db.clone(), at, tag))
+    }
+
+    /// Open a graph, creating it if this is the first time.
+    ///
+    /// The name has one shape like every other collection, and it is the same
+    /// shape for every graph, because a graph's types are not fixed when it is
+    /// opened. A node type or an edge type registers itself under its label the
+    /// first time it is used, and the shape it registered is checked on every
+    /// later use, so the check is per label rather than one tuple named up
+    /// front. That way adding a node type to a program is not a schema change
+    /// for the types already in the graph.
+    ///
+    /// ```
+    /// use yo::{Edge, Node, Yo};
+    ///
+    /// #[derive(Yo)]
+    /// struct Person { #[yo(id)] id: u64, name: String }
+    ///
+    /// #[derive(Yo)]
+    /// struct Follows { since: i64 }
+    ///
+    /// impl Node for Person { const LABEL: &'static str = "Person"; }
+    /// impl Edge for Follows {
+    ///     type From = Person;
+    ///     type To = Person;
+    ///     const LABEL: &'static str = "FOLLOWS";
+    /// }
+    ///
+    /// let db = yo::open(yo::MEMORY)?;
+    /// let g = db.graph("social")?;
+    ///
+    /// let ada = g.add(&Person { id: 1, name: "ada".to_owned() })?;
+    /// let grace = g.add(&Person { id: 2, name: "grace".to_owned() })?;
+    /// g.link(ada, grace, &Follows { since: 2026 })?;
+    ///
+    /// assert_eq!(g.out::<Follows>(ada)?, vec![grace]);
+    /// # Ok::<(), yo::Error>(())
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// [`Code::ShapeMismatch`] when the name is already a collection of another
+    /// shape, which includes a name that is already a map or a document
+    /// collection.
+    pub fn graph(&self, name: &str) -> Result<Graph> {
+        let mut desc = Desc::new();
+        AGraph::describe(&mut desc);
+
+        let at =
+            self.db.write(
+                |inner| match inner.collections.iter().position(|c| c.name == name) {
+                    Some(at) => {
+                        yo_shape::check(name, &inner.collections[at].desc, &desc, None)?;
+                        Ok(at)
+                    }
+                    None => {
+                        inner.collections.push(Collection {
+                            name: name.to_owned(),
+                            desc,
+                            data: Data::Graph(Box::new(crate::graph::Store::new())),
+                        });
+                        Ok(inner.collections.len() - 1)
+                    }
+                },
+            )?;
+        Ok(Graph::new(self.db.clone(), at))
     }
 
     /// The Redis string keyspace.
