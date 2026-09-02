@@ -23,17 +23,27 @@
 //! width per run. That is the one idea from BtrBlocks and FastLanes that is
 //! worth taking here: a run of ten thousand where one gap is enormous and the
 //! rest are small would otherwise pay the enormous one ten thousand times, and
-//! a block only ever pays it thirty two times. It costs six bits a block, which
-//! is under a fifth of a bit an edge, and no extra offsets at all, because a
-//! run is decoded from its start and the blocks come in order.
+//! a block only ever pays it thirty two times. It costs seven bits a block,
+//! which is under a quarter of a bit an edge, and no extra offsets at all,
+//! because a run is decoded from its start and the blocks come in order.
 //!
-//! Two better sounding codes were measured against that and neither is here.
-//! Leaving the outliers of a block behind as patched exceptions, which is what
-//! PFOR does and is the obvious next move for a heavy tail, was worth 0.08 bits
-//! an edge on R-MAT and cost 0.29 on a uniform graph, because the gaps inside
-//! one block of a sorted list are not actually heavy tailed. Elias gamma, which
-//! needs no width at all, was 1.7 bits an edge worse on R-MAT and 7.7 worse on
-//! a uniform graph. A width a block is already close to what these gaps are.
+//! A block whose width does not fit everything in it leaves the ones that did
+//! not fit behind as patches, written again at the end of the block with their
+//! positions, which is what PFOR does. The encoder tries every width and keeps
+//! the cheapest, so a block only patches when patching is cheaper than widening.
+//! This was measured before and rejected, and what changed is the numbering
+//! rather than the code: under a degree ordering the gaps in one block are all
+//! about the same size and there is nothing to patch, and under the community
+//! numbering in [`bisect`](crate::bisect) a block is mostly ones with a jump to
+//! another community in it, which is exactly the shape patching is for. It is
+//! worth 0.65 bits an edge on R-MAT, 2.36 on soc-LiveJournal1 as its ids arrive,
+//! and 5.41 on a bisected web-Google. On a uniform graph it is a wash, 15.98
+//! before and 15.96 after, because there the widths in a block already agree and
+//! the few blocks that do patch save about what the headers cost. It is worth
+//! about a tenth of the decode, which is the trade being made.
+//!
+//! Elias gamma, which needs no width at all, was 1.7 bits an edge worse on R-MAT
+//! and 7.7 worse on a uniform graph, and is not here.
 //!
 //! # What it costs
 //!
@@ -55,67 +65,71 @@
 //!
 //! ```text
 //!                          total    table     head     gaps
-//! uniform                  15.98     1.06     1.31    13.59
-//! R-MAT                    12.63     1.00     0.97    10.48
-//! R-MAT, degree ordered     9.89     0.69     0.77     8.41
+//! uniform                  15.96     1.06     1.31    13.58
+//! R-MAT                    11.98     1.00     1.14     9.83
+//! R-MAT, degree ordered     9.38     0.69     0.78     7.90
 //! ```
 //!
-//! The uniform row is 15.98 against a floor of 13.44, so the encoder is within
+//! The uniform row is 15.96 against a floor of 13.44, so the encoder is within
 //! a fifth of what is provably possible on the case where nothing can help. The
-//! whole of the rest is the graph: R-MAT is 3.35 bits an edge cheaper for no
+//! whole of the rest is the graph: R-MAT is 3.98 bits an edge cheaper for no
 //! other reason than that it has hubs, and [`order_by_degree`] takes another
-//! 2.74 off by giving those hubs the small ids. The same ordering pass moves a
+//! 2.60 off by giving those hubs the small ids. The same ordering pass moves a
 //! uniform graph by nothing at all, which is the control that says it is the
 //! structure being exploited rather than the measurement.
 //!
 //! # What it costs on a graph nobody here generated
 //!
 //! R-MAT is a stand in and it is known to cluster less than the social graphs it
-//! stands in for, so I expected a real one to come out under 9.89. It does not.
-//! soc-LiveJournal1 from SNAP, 4847571 nodes and 68993773 edges, on an idle
-//! i9-13900K, through `examples/compress.rs`:
+//! stands in for, so a real one should come out under 9.38. It does not.
+//! soc-LiveJournal1 from SNAP, 4847571 nodes and 68993773 edges, on server3,
+//! through `examples/compress.rs`:
 //!
 //! ```text
-//!                          total  offsets  degrees   firsts  widths     gaps
-//! cold                     20.35     1.19     0.49     1.43    0.38     16.83
-//! cold, degree ordered     19.62     1.13     0.27     1.43    0.38     16.38
+//!                       total  offsets  degrees   firsts  widths   gaps  patches
+//! cold                  17.99     1.18     0.49     1.43    0.82  10.58     3.47
+//! cold, degree ordered  19.00     1.13     0.27     1.43    0.74  14.57     0.84
+//! cold, bisected        15.00     1.14     0.42     1.44    0.91   7.53     3.55
 //! ```
 //!
-//! That is roughly twice R-MAT and it is close to the 19.8 floor for a random
-//! graph of that shape, so on this graph the encoder is capturing almost none of
-//! the structure, and degree ordering is worth 0.73 bits here against 2.74 on
-//! R-MAT. The per node overhead is not the problem: it is about 3.5 bits of the
-//! 19.62 and the gaps are 16.38.
+//! Three things in that table are worth saying out loud.
 //!
-//! `--codes` on the same run says why, and it rules out most of what I would
-//! otherwise have tried next:
+//! The best number is 15.00 and it takes the numbering to get there. Before the
+//! patches and [`bisect`](crate::bisect) the same three rows were 20.35, 19.62
+//! and nothing, so this graph is a quarter smaller than it was and the whole of
+//! the difference is community structure that was there all along.
+//!
+//! Degree ordering now makes this graph bigger, 19.00 against 17.99. SNAP's ids
+//! are roughly the order the crawl found the accounts in, which already puts
+//! friends near each other, and sorting by degree throws that away. It was still
+//! the right call when the code could not exploit locality, and it stopped being
+//! the right call the moment the code could.
+//!
+//! The gaps are no longer most of the file. Under bisection the per node fields
+//! are 3.00 of the 15.00 and the payload is 11.99, against a floor, quoted by
+//! `--codes`, of 10.46 bits a gap or about 9.81 an edge. So the code is now 2.2
+//! bits over what any code that prices each gap on its own could do, where under
+//! degree ordering it was 1.18 over a floor that was itself six bits worse.
 //!
 //! ```text
-//! gaps 64685321, 3.3% of them 1, 0.9% of neighbours in a run of 4 or more
-//! by length floor       16.71 bits a gap
-//! block of 32           17.89   (this is the format)
-//! block of 16           17.37
-//! block of 8            17.15
-//! block of 32, patched  17.97
-//! elias delta           20.24
+//! gaps 64685321, 24.9% of them 1, 16.6% of neighbours in a run of 4 or more
+//! by length floor       10.46 bits a gap
+//! block of 32           17.06   (unpatched, which is what this used to be)
+//! block of 8            13.99
+//! block of 32, patched  14.06   (the model, and the real one does better)
+//! elias delta           12.14
+//! intervals, block 8    13.78
 //! ```
 //!
-//! The floor there is the entropy of the gap lengths, which is what any code
-//! that prices each gap on its own has to pay. The format is 1.18 bits over it,
-//! so there is almost nothing left in the code itself. Interval encoding, which
-//! is the first thing WebGraph does, is dead on arrival: it needs consecutive
-//! neighbours and this graph has 0.9 percent of them. PFOR is worse than what is
-//! shipped, Elias delta is 2.35 worse, and shrinking the block to 8 buys 0.74 at
-//! the cost of a width read every eighth edge, which is a real but small win and
-//! not the difference between 19.62 and 8.
-//!
-//! So the remaining bits are not in the code, they are in the numbering. Degree
-//! ordering puts the hubs together and then gives up; what closes the gap is
-//! layered label propagation, which numbers by community rather than by degree,
-//! and which is iterative and costs minutes rather than one sort. That is the
-//! next piece of work on this file and it is the one the 8 bits gate turns on.
-//! Until it exists the gate stays open, because 9.89 on a graph I generated is
-//! not an answer when the public one says 19.62.
+//! The 8 bits an edge in `11` is still not met and this is 15.00. What would
+//! close it is not another block code: the three that are left are all within a
+//! bit or two of each other and of the floor. It is a better numbering, and the
+//! measurement that says so is that bisection's own objective, a plain log gap
+//! code, prices this ordering at 9.29 bits a gap where it prices the degree
+//! ordering at 14.87. The numbering has found structure the encoder is only half
+//! spending. Interval encoding, which was dead on arrival under a degree
+//! ordering because only 0.9 percent of neighbours were consecutive, is now
+//! looking at 16.6 percent and is the first thing to try.
 //!
 //! # What this does not do
 //!
@@ -157,14 +171,20 @@ pub const BLOCK: usize = 32;
 struct Group {
     /// Bit offset of this group's node offset table in the word array.
     at: u64,
-    /// The smallest neighbour id anything in this group points at. Every first
-    /// neighbour is written against this, which is most of what makes a
-    /// clustered graph cheaper than a random one.
-    base: u32,
     /// Width of one entry in the node offset table.
     ow: u8,
     /// Width of a degree.
     dw: u8,
+    /// The smallest neighbour id anything in this group points at. Every first
+    /// neighbour is written against this, which is most of what makes a
+    /// clustered graph cheaper than a random one.
+    ///
+    /// Writing it against the node's own id instead, which under a community
+    /// numbering is the better guess, was measured and is worse: the width is a
+    /// group wide maximum, one node in five hundred and twelve points a long
+    /// way off, and the sign bit is paid by all of them. It cost 0.11 bits an
+    /// edge on web-Google under every ordering.
+    base: u32,
     /// Width of a first neighbour, once `base` is taken off it.
     nw: u8,
 }
@@ -209,10 +229,14 @@ pub struct Cost {
     pub degrees: u64,
     /// One first neighbour per node that has any.
     pub firsts: u64,
-    /// The six bit width in front of every block of gaps.
+    /// The header in front of every block of gaps: the width, whether anything
+    /// did not fit it, and how much of it did not.
     pub widths: u64,
     /// The gaps, which is the only part that is really the graph.
     pub gaps: u64,
+    /// The gaps that did not fit their block's width, written again at the end
+    /// of the block with the position they belong at.
+    pub patches: u64,
     /// The fixed group records, which are not in the bit stream at all.
     pub groups: u64,
     /// Whatever rounding the stream up to whole words left over.
@@ -228,6 +252,7 @@ impl Cost {
             + self.firsts
             + self.widths
             + self.gaps
+            + self.patches
             + self.groups
             + self.slack
     }
@@ -327,15 +352,39 @@ impl Csr {
         at += u64::from(s.nw);
         out.push(cur);
         let mut left = deg - 1;
+        // The block is read into here first, because a gap that was patched is
+        // only whole once its patch has been put back and the running sum cannot
+        // start until it is.
+        let mut block = [0u32; BLOCK];
         while left > 0 {
+            let n = left.min(BLOCK);
             let w = read(&self.words, at, 6) as u32;
             at += 6;
-            for _ in 0..left.min(BLOCK) {
-                cur += read(&self.words, at, w) as u32;
+            let patched = read(&self.words, at, 1) == 1;
+            at += 1;
+            let (mut x, mut ew) = (0u64, 0u32);
+            if patched {
+                x = read(&self.words, at, POS) + 1;
+                at += u64::from(POS);
+                ew = read(&self.words, at, 6) as u32;
+                at += 6;
+            }
+            for slot in &mut block[..n] {
+                *slot = read(&self.words, at, w) as u32;
                 at += u64::from(w);
+            }
+            for _ in 0..x {
+                let pos = read(&self.words, at, POS) as usize;
+                at += u64::from(POS);
+                let high = read(&self.words, at, ew);
+                at += u64::from(ew);
+                block[pos] |= (high << w) as u32;
+            }
+            for gap in &block[..n] {
+                cur += gap;
                 out.push(cur);
             }
-            left -= left.min(BLOCK);
+            left -= n;
         }
     }
 
@@ -470,12 +519,27 @@ impl Csr {
                 cost.firsts += u64::from(nw);
                 gaps_of(run, &mut gaps);
                 for block in gaps.chunks(BLOCK) {
-                    let bw = width(u64::from(block.iter().copied().max().unwrap_or(0)));
-                    w.put(u64::from(bw), 6);
-                    cost.widths += 6;
-                    cost.gaps += block.len() as u64 * u64::from(bw);
+                    let p = Plan::best(block);
+                    w.put(u64::from(p.w), 6);
+                    w.put(u64::from(p.x != 0), 1);
+                    cost.widths += 7;
+                    if p.x != 0 {
+                        w.put(u64::from(p.x - 1), POS);
+                        w.put(u64::from(p.ew), 6);
+                        cost.widths += 11;
+                    }
+                    cost.gaps += block.len() as u64 * u64::from(p.w);
                     for gap in block {
-                        w.put(u64::from(*gap), bw);
+                        w.put(u64::from(*gap) & mask(p.w), p.w);
+                    }
+                    // The part of a gap that did not fit, at its position in the
+                    // block, which the reader puts back on top of what it read.
+                    for (at, gap) in block.iter().enumerate() {
+                        if u64::from(*gap) >> p.w != 0 {
+                            w.put(at as u64, POS);
+                            w.put(u64::from(*gap) >> p.w, p.ew);
+                            cost.patches += u64::from(POS + p.ew);
+                        }
                     }
                 }
             }
@@ -525,18 +589,21 @@ fn gaps_of(run: &[(u32, u32)], into: &mut Vec<u32>) {
 /// that in a graph with hubs, almost every neighbour list contains some of the
 /// hubs, and giving the hubs the smallest ids puts that shared part of every
 /// list at the front where the gaps between its members are single digits. On
-/// the R-MAT graph in the test below it takes 12.63 bits an edge to 9.89.
+/// the R-MAT graph in the test below it takes 11.98 bits an edge to 9.38.
 ///
 /// The control matters as much as the result. On a uniformly random graph the
-/// same pass changes nothing at all, 15.98 bits an edge before and after, which
+/// same pass changes nothing at all, 15.96 bits an edge before and after, which
 /// is what says it is exploiting structure rather than being an artefact of the
 /// encoder. Breadth first from the busiest node, taking each frontier in degree
 /// order, was measured against this and came out slightly worse at 10.15, so it
 /// is not here.
 ///
-/// The orderings that go further, layered label propagation and the recursive
-/// bisections after it, are iterative and cost minutes on a large graph rather
-/// than one sort. They are the next lever and they are not this one.
+/// This is the cheap ordering and it is not the good one. On a real graph the
+/// numbering that pays is [`bisect::order`](crate::bisect::order), which finds
+/// communities rather than hubs and is minutes rather than one sort. It beats
+/// this by 5.2 bits an edge on web-Google. On R-MAT it does not beat this at
+/// all, because R-MAT's structure is its hubs and this pass is already the right
+/// answer for those.
 #[must_use]
 pub fn order_by_degree(nodes: u32, edges: &[(u32, u32)]) -> Vec<u32> {
     let mut deg = vec![0u32; nodes as usize];
@@ -561,6 +628,75 @@ pub fn renumber(edges: &mut [(u32, u32)], to: &[u32]) {
     }
 }
 
+/// How one block of gaps goes out: a width every gap in it is written at, and
+/// the ones that did not fit written again at the end.
+///
+/// A block of thirty two gaps under a community numbering is mostly ones with
+/// the occasional jump to another community in it, and a width that has to hold
+/// the jump charges all thirty two of them for it. Leaving the jump behind as a
+/// patch is what stops that, and it is only worth doing because the numbering
+/// makes the distribution that shape. Under a degree ordering the same thing
+/// costs 0.08 bits an edge, which is why it was not here before.
+#[derive(Debug, Clone, Copy, Default)]
+struct Plan {
+    /// The width every gap in the block is written at.
+    w: u32,
+    /// How many of them did not fit.
+    x: u32,
+    /// The width the part that did not fit is written at, which is the widest
+    /// gap in the block less `w`.
+    ew: u32,
+}
+
+/// Bits of position in a patch, which is what indexes a block.
+const POS: u32 = 5;
+
+impl Plan {
+    /// The cheapest way to write one block.
+    ///
+    /// Walking the candidate width down from the widest gap, `over` is how many
+    /// gaps do not fit it. The widest gap is an exception at every width below
+    /// its own, so the width the patches need is always the widest less the
+    /// candidate, and the whole search is a walk over a histogram rather than a
+    /// pass over the block per candidate.
+    fn best(block: &[u32]) -> Plan {
+        let mut hist = [0u32; 33];
+        let mut top = 0u32;
+        for g in block {
+            let b = width(u64::from(*g));
+            hist[b as usize] += 1;
+            top = top.max(b);
+        }
+        let n = block.len() as u64;
+        let mut best = Plan {
+            w: top,
+            x: 0,
+            ew: 0,
+        };
+        let mut cost = 7 + n * u64::from(top);
+        let mut over = 0u32;
+        for w in (0..top).rev() {
+            over += hist[w as usize + 1];
+            let plan = Plan {
+                w,
+                x: over,
+                ew: top - w,
+            };
+            let bits = plan.bits(n);
+            if bits < cost {
+                (best, cost) = (plan, bits);
+            }
+        }
+        best
+    }
+
+    /// What this block costs, header and payload and patches.
+    fn bits(&self, n: u64) -> u64 {
+        let head = if self.x == 0 { 7 } else { 7 + 11 };
+        head + n * u64::from(self.w) + u64::from(self.x) * u64::from(POS + self.ew)
+    }
+}
+
 /// How many bits one run takes, which has to agree exactly with what the
 /// encoder then writes.
 fn run_bits(gaps: &[u32], any: bool, dw: u32, nw: u32) -> u64 {
@@ -569,8 +705,7 @@ fn run_bits(gaps: &[u32], any: bool, dw: u32, nw: u32) -> u64 {
     }
     let mut bits = u64::from(dw) + u64::from(nw);
     for block in gaps.chunks(BLOCK) {
-        let bw = width(u64::from(block.iter().copied().max().unwrap_or(0)));
-        bits += 6 + block.len() as u64 * u64::from(bw);
+        bits += Plan::best(block).bits(block.len() as u64);
     }
     bits
 }
