@@ -58,6 +58,7 @@ mod blocking;
 mod cpu;
 mod graph;
 mod hashes;
+mod hll;
 mod keyspace;
 mod lists;
 mod migrate;
@@ -834,9 +835,8 @@ pub fn resolved(
     // `COPY`, `SWAPDB` and `FLUSHALL` reach a database nobody selected, so the
     // two groups that hold them mark all of them rather than the session's.
     server.dirty |= match spec.group {
-        "string" | "bitmap" | "set" | "hash" | "list" | "zset" | "array" | "stream" => {
-            1u64 << session.db
-        }
+        "string" | "bitmap" | "hyperloglog" | "set" | "hash" | "list" | "zset" | "array"
+        | "stream" => 1u64 << session.db,
         _ => ALL_DATABASES,
     };
 
@@ -861,6 +861,12 @@ pub fn resolved(
             "bitmap" => {
                 let db = session.db;
                 bits::execute(&mut server.dbs[db], spec, args, out).map(|()| Flow::Continue)
+            }
+            // The same again: a sketch is a string with a documented layout, so
+            // `GET` hands one to a client and `SET` takes it back.
+            "hyperloglog" => {
+                let db = session.db;
+                hll::execute(&mut server.dbs[db], spec, args, out).map(|()| Flow::Continue)
             }
             "set" => {
                 let db = session.db;
@@ -938,9 +944,9 @@ pub fn resolved(
 
 /// The error line for an error value.
 ///
-/// The prefix is what a client branches on, and there are only two of them in
-/// this milestone: `WRONGTYPE` for a command sent at the wrong kind of value,
-/// and `ERR` for everything else. The three errors that need a different one,
+/// The prefix is what a client branches on, and there are three of them:
+/// `WRONGTYPE` for a command sent at the wrong kind of value, `INVALIDOBJ` for a
+/// HyperLogLog whose opcodes do not add up, and `ERR` for everything else. The three errors that need a different one,
 /// `NOPROTO`, `WRONGPASS` and `OOM`, are written where they are decided rather
 /// than routed through here. `OOM` is not a [`Code`] of its own because
 /// [`Code::Full`] already covers the string that is too long for
@@ -948,6 +954,10 @@ pub fn resolved(
 fn write_error(out: &mut Out, e: &Error) {
     let prefix: &[u8] = match e.code() {
         Code::WrongType => b"WRONGTYPE ",
+        // Only the HyperLogLog commands answer this one, and the prefix is the
+        // sentence a client branches on to tell a sketch it cannot read from a
+        // sketch it sent wrong.
+        Code::Corrupt => b"INVALIDOBJ ",
         _ => b"ERR ",
     };
     out.error_line(prefix, e.message().as_bytes());
@@ -5290,6 +5300,161 @@ mod tests {
         for case in cases {
             assert_eq!(f.run(case), wrong, "{:?}", case[0]);
         }
+    }
+
+    // --------------------------------------------------------- hyperloglogs
+
+    #[test]
+    fn a_sketch_is_added_to_and_counted() {
+        let mut f = Fixture::new();
+        // Creating the key counts as a change, even with nothing to add.
+        assert_eq!(f.run(&[b"PFADD", b"h"]), ":1\r\n");
+        assert_eq!(f.run(&[b"PFADD", b"h"]), ":0\r\n");
+        assert_eq!(f.run(&[b"PFCOUNT", b"h"]), ":0\r\n");
+        assert_eq!(f.run(&[b"STRLEN", b"h"]), ":18\r\n");
+        // And it is a string, which is not an implementation detail: a client
+        // can `GET` a sketch out of one server and `SET` it into another.
+        assert_eq!(f.run(&[b"TYPE", b"h"]), "+string\r\n");
+        assert_eq!(f.run(&[b"OBJECT", b"ENCODING", b"h"]), "$3\r\nraw\r\n");
+
+        assert_eq!(f.run(&[b"PFADD", b"h", b"a", b"b", b"c"]), ":1\r\n");
+        assert_eq!(f.run(&[b"PFADD", b"h", b"a"]), ":0\r\n");
+        assert_eq!(f.run(&[b"PFCOUNT", b"h"]), ":3\r\n");
+    }
+
+    #[test]
+    fn the_bytes_of_a_sketch_are_the_ones_a_real_server_writes() {
+        let mut f = Fixture::new();
+        f.run(&[b"PFADD", b"h", b"a", b"b", b"c"]);
+        // Not text, so it is compared as bytes.
+        let want = b"HYLL\x01\0\0\0\0\0\0\0\0\0\0\x80\x60\xf3\x80\x50\xb1\x84\x4b\xfb\x80\x42\x5a";
+        let mut reply = b"$27\r\n".to_vec();
+        reply.extend_from_slice(want);
+        reply.extend_from_slice(b"\r\n");
+        assert_eq!(f.raw(&[b"GET", b"h"]), reply);
+    }
+
+    #[test]
+    fn counting_several_keys_counts_their_union() {
+        let mut f = Fixture::new();
+        f.run(&[b"PFADD", b"a", b"x", b"y"]);
+        f.run(&[b"PFADD", b"b", b"y", b"z"]);
+        assert_eq!(f.run(&[b"PFCOUNT", b"a"]), ":2\r\n");
+        assert_eq!(f.run(&[b"PFCOUNT", b"a", b"b"]), ":3\r\n");
+        // A key that is not there is an empty sketch, not an error and not
+        // something that gets created by being counted.
+        assert_eq!(f.run(&[b"PFCOUNT", b"gone"]), ":0\r\n");
+        assert_eq!(f.run(&[b"PFCOUNT", b"a", b"gone"]), ":2\r\n");
+        assert_eq!(f.run(&[b"EXISTS", b"gone"]), ":0\r\n");
+    }
+
+    #[test]
+    fn a_merge_keeps_what_the_destination_had() {
+        let mut f = Fixture::new();
+        f.run(&[b"PFADD", b"a", b"x", b"y"]);
+        f.run(&[b"PFADD", b"b", b"z"]);
+        assert_eq!(f.run(&[b"PFMERGE", b"d", b"a", b"b"]), "+OK\r\n");
+        assert_eq!(f.run(&[b"PFCOUNT", b"d"]), ":3\r\n");
+        // The destination is one of the sources, so a second merge adds to it.
+        f.run(&[b"PFADD", b"c", b"w"]);
+        assert_eq!(f.run(&[b"PFMERGE", b"d", b"c"]), "+OK\r\n");
+        assert_eq!(f.run(&[b"PFCOUNT", b"d"]), ":4\r\n");
+        // And with no sources it is a no-op that still answers OK and still
+        // creates a destination that was not there.
+        assert_eq!(f.run(&[b"PFMERGE", b"fresh"]), "+OK\r\n");
+        assert_eq!(f.run(&[b"PFCOUNT", b"fresh"]), ":0\r\n");
+    }
+
+    #[test]
+    fn the_debug_forms_answer_four_different_shapes() {
+        let mut f = Fixture::new();
+        f.run(&[b"PFADD", b"h", b"a", b"b", b"c"]);
+        assert_eq!(f.run(&[b"PFDEBUG", b"ENCODING", b"h"]), "+sparse\r\n");
+        assert_eq!(
+            f.run(&[b"PFDEBUG", b"DECODE", b"h"]),
+            "$44\r\nZ:8436 v:1,1 Z:4274 v:2,1 Z:3068 v:1,1 Z:603\r\n"
+        );
+        assert_eq!(f.run(&[b"PFDEBUG", b"TODENSE", b"h"]), ":1\r\n");
+        assert_eq!(f.run(&[b"PFDEBUG", b"TODENSE", b"h"]), ":0\r\n");
+        assert_eq!(f.run(&[b"PFDEBUG", b"ENCODING", b"h"]), "+dense\r\n");
+        assert_eq!(f.run(&[b"STRLEN", b"h"]), ":12304\r\n");
+        assert_eq!(f.run(&[b"PFCOUNT", b"h"]), ":3\r\n");
+        // A dense sketch has no opcodes left to print.
+        assert_eq!(
+            f.run(&[b"PFDEBUG", b"DECODE", b"h"]),
+            "-ERR HLL encoding is not sparse\r\n"
+        );
+
+        // All 16384 registers, of which three are not nought.
+        let reply = f.run(&[b"PFDEBUG", b"GETREG", b"h"]);
+        assert!(reply.starts_with("*16384\r\n"), "{}", &reply[..16]);
+        assert_eq!(reply.matches(":0\r\n").count(), 16381);
+        assert_eq!(reply.matches(":1\r\n").count(), 2);
+        assert_eq!(reply.matches(":2\r\n").count(), 1);
+
+        assert_eq!(f.run(&[b"PFSELFTEST"]), "+OK\r\n");
+    }
+
+    #[test]
+    fn a_string_that_is_not_a_sketch_is_refused_with_its_own_sentence() {
+        let mut f = Fixture::new();
+        f.run(&[b"SET", b"plain", b"not a sketch"]);
+        let not_hll = "-WRONGTYPE Key is not a valid HyperLogLog string value.\r\n";
+        assert_eq!(f.run(&[b"PFADD", b"plain", b"a"]), not_hll);
+        assert_eq!(f.run(&[b"PFCOUNT", b"plain"]), not_hll);
+        assert_eq!(f.run(&[b"PFMERGE", b"plain"]), not_hll);
+        assert_eq!(f.run(&[b"PFDEBUG", b"ENCODING", b"plain"]), not_hll);
+
+        // A key that is not a string at all gets the ordinary sentence, and a
+        // destination that would have been written is not created.
+        f.run(&[b"RPUSH", b"l", b"x"]);
+        let wrong = "-WRONGTYPE Operation against a key holding the wrong kind of value\r\n";
+        assert_eq!(f.run(&[b"PFADD", b"l", b"a"]), wrong);
+        assert_eq!(f.run(&[b"PFCOUNT", b"l"]), wrong);
+        assert_eq!(f.run(&[b"PFMERGE", b"dest", b"l"]), wrong);
+        assert_eq!(f.run(&[b"EXISTS", b"dest"]), ":0\r\n");
+        assert_eq!(f.run(&[b"PFDEBUG", b"GETREG", b"l"]), wrong);
+    }
+
+    #[test]
+    fn pfdebug_has_its_own_complaints() {
+        let mut f = Fixture::new();
+        f.run(&[b"PFADD", b"h", b"a"]);
+        // The word is quoted exactly as the client spelled it, and this is not
+        // the "Try X HELP." sentence every other container command uses.
+        assert_eq!(
+            f.run(&[b"PFDEBUG", b"NOPE", b"h"]),
+            "-ERR Unknown PFDEBUG subcommand 'NOPE'\r\n"
+        );
+        // Where all three of the real commands take a missing key as empty.
+        let gone = "-ERR The specified key does not exist\r\n";
+        assert_eq!(f.run(&[b"PFDEBUG", b"GETREG", b"missing"]), gone);
+        assert_eq!(f.run(&[b"PFDEBUG", b"DECODE", b"missing"]), gone);
+        assert_eq!(f.run(&[b"PFDEBUG", b"ENCODING", b"missing"]), gone);
+        assert_eq!(f.run(&[b"PFDEBUG", b"TODENSE", b"missing"]), gone);
+        assert_eq!(
+            f.run(&[b"PFDEBUG"]),
+            "-ERR wrong number of arguments for 'pfdebug' command\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"PFSELFTEST", b"x"]),
+            "-ERR wrong number of arguments for 'pfselftest' command\r\n"
+        );
+    }
+
+    #[test]
+    fn a_sketch_whose_opcodes_do_not_add_up_says_so() {
+        let mut f = Fixture::new();
+        f.run(&[b"PFADD", b"h", b"a", b"b", b"c"]);
+        // The sketch with its last byte cut off, which is still a header and a
+        // magic and is a run length encoding that stops short of register 16384.
+        let reply = f.raw(&[b"GET", b"h"]);
+        let short = reply[5..reply.len() - 3].to_vec();
+        f.run(&[b"SET", b"h", &short]);
+        assert_eq!(
+            f.run(&[b"PFCOUNT", b"h"]),
+            "-INVALIDOBJ Corrupted HLL object detected\r\n"
+        );
     }
 
     /// A RESP2 array of bulk strings, which is what most of the list replies

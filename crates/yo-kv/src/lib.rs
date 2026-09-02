@@ -29,6 +29,14 @@
 //! because in Redis there is not one either: `SET k A` then `GETBIT k 1`
 //! answers one.
 //!
+//! The HyperLogLogs, which are those same string values again with a documented
+//! layout inside them. [`hll`] is the sketch, the hash and the two
+//! representations and Ertl's estimator, and [`hlls`] is where a key turns into
+//! one. It is byte for byte Redis's format, on purpose: a client can `GET` a
+//! sketch out of a real server and `SET` it into us, and it has to count the
+//! same, so the hash function and the opcodes and the promotion threshold are
+//! copied rather than improved on.
+//!
 //! The set, which is the first row of M3, in all seventeen of its commands:
 //! `SADD`, `SREM`, `SCARD`, `SISMEMBER`, `SMISMEMBER`, `SMEMBERS`, `SPOP`,
 //! `SRANDMEMBER`, `SSCAN`, `SMOVE`, `SINTER`, `SINTERCARD`, `SUNION`, `SDIFF`
@@ -116,6 +124,8 @@ pub mod foreign;
 pub mod grow;
 pub mod hash;
 pub mod hashes;
+pub mod hll;
+pub mod hlls;
 pub mod intset;
 pub mod keys;
 pub mod keyspace;

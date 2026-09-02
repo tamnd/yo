@@ -48,7 +48,11 @@ const PLANLESS_GROUPS: &[&str] = &["connection", "scripting", "server"];
 /// value, and Redis puts them in the `@connection` ACL category for exactly that
 /// reason. Their group is where it is so that the count in `commands.toml`
 /// matches what a real server answers, and the honest plan for them is `none`.
-const PLANLESS_COMMANDS: &[&str] = &["WAIT", "WAITAOF"];
+/// `PFSELFTEST` is in the HyperLogLog group because that is the group a real
+/// server puts it in, and it names no key and reads none. It asks whether the
+/// sketch code works, which is a fact about the build rather than about a value,
+/// and the honest plan for it is `none` as well.
+const PLANLESS_COMMANDS: &[&str] = &["WAIT", "WAITAOF", "PFSELFTEST"];
 /// The bound or materialise verdicts.
 const BOUNDED: &[&str] = &["inherent", "yes", "risk"];
 /// Whether a command is implemented, and how far up it reaches.
