@@ -52,6 +52,7 @@ use crate::keyspace::Keyspace;
 use crate::list::List;
 use crate::rdb;
 use crate::set::Set;
+use crate::stream::Stream;
 use crate::value::{self, Kind};
 use crate::zset::Zset;
 
@@ -93,6 +94,7 @@ impl Record {
             Body::List(_) => Kind::List,
             Body::Zset(_) => Kind::Zset,
             Body::Array(_) => Kind::Array,
+            Body::Stream(_) => Kind::Stream,
             Body::Foreign(_) => Kind::Foreign,
         }
     }
@@ -104,7 +106,7 @@ impl Record {
     }
 }
 
-/// The seven things a record can be, owned rather than borrowed.
+/// The eight things a record can be, owned rather than borrowed.
 ///
 /// One variant per type that a key can hold, and that is the point: the day an
 /// eighth type lands, the compiler names this file. It did not before, because
@@ -119,6 +121,7 @@ pub(crate) enum Body {
     List(List),
     Zset(Zset),
     Array(Array),
+    Stream(Stream),
     Foreign(Box<dyn Foreign>),
 }
 
@@ -138,6 +141,7 @@ impl Clone for Body {
             Body::List(v) => Body::List(v.clone()),
             Body::Zset(v) => Body::Zset(v.clone()),
             Body::Array(v) => Body::Array(v.clone()),
+            Body::Stream(v) => Body::Stream(v.clone()),
             Body::Foreign(_) => unreachable!("a foreign body never reaches a clone"),
         }
     }
@@ -210,15 +214,18 @@ impl Keyspace {
                     .expect("the record points at its body")
                     .clone(),
             ),
+            Kind::Stream => Body::Stream(
+                self.streams
+                    .get(value::slot(rec))
+                    .expect("the record points at its body")
+                    .clone(),
+            ),
             // A copy is the one thing a foreign body cannot be asked for. See
             // [`Moved::Unsupported`]. `None` here reads the same as a missing
             // key to a caller that only wanted the record, which is why `COPY`
             // and `DUMP` both check the kind themselves before they get here
             // rather than reporting a graph as absent.
             Kind::Foreign => return None,
-            // A stream is the one type a key can hold that nothing can put
-            // there yet, so this arm is the only one left and it names it.
-            Kind::Stream => unreachable!("nothing can store a stream yet"),
         };
         Some(Record { body, expire_at })
     }
@@ -263,11 +270,12 @@ impl Keyspace {
             Kind::List => Body::List(self.lists.remove(slot).expect(gone)),
             Kind::Zset => Body::Zset(self.zsets.remove(slot).expect(gone)),
             Kind::Array => Body::Array(self.arrays.remove(slot).expect(gone)),
+            Kind::Stream => Body::Stream(self.streams.remove(slot).expect(gone)),
             // A move is the one of the two that a foreign body can do, because
             // it hands the box over rather than asking for a second one.
             Kind::Foreign => Body::Foreign(self.foreign.remove(slot).expect(gone)),
             // Handled above, and named rather than caught, as in `export`.
-            Kind::String | Kind::Stream => unreachable!("handled above or cannot be stored"),
+            Kind::String => unreachable!("handled above"),
         };
         self.bodies -= 1;
         self.del_rec(key);
@@ -314,6 +322,12 @@ impl Keyspace {
                 let slot = self.arrays.insert(array);
                 self.bodies += 1;
                 self.write_slot(key, Kind::Array, slot, at);
+            }
+            Body::Stream(stream) => {
+                self.free_body(key);
+                let slot = self.streams.insert(stream);
+                self.bodies += 1;
+                self.write_slot(key, Kind::Stream, slot, at);
             }
             Body::Foreign(body) => {
                 self.free_body(key);

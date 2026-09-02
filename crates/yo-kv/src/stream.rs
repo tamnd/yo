@@ -416,6 +416,55 @@ impl Stream {
         found
     }
 
+    /// The highest live ID, or `None` when there are none.
+    ///
+    /// Not the same as [`Stream::last_id`], which is the last ID handed out and
+    /// stays where it is when that entry is deleted. This is the greatest ID a
+    /// reader can still find, and `XSETID` is the one caller that needs the
+    /// difference, because it refuses to move the bookmark below an entry that
+    /// is still there.
+    #[must_use]
+    pub fn top_id(&self) -> Option<Id> {
+        let mut found = None;
+        self.rev_range(Id::MIN, Id::MAX, Some(1), |id, _| {
+            found = Some(id);
+            false
+        });
+        found
+    }
+
+    /// `XSETID`, which moves the bookmark and the two counters behind it.
+    ///
+    /// The bookmark decides what the next `XADD *` hands out and what a group
+    /// created at `$` starts from, so moving it is how a replica is made to
+    /// agree with a primary and how a stream is rebuilt from a log. The two
+    /// counters are optional because Redis added them later and a caller that
+    /// does not name them leaves them alone.
+    ///
+    /// # Errors
+    ///
+    /// [`Refused::NotGreater`] when `last` is below an entry that is still in
+    /// the stream, since a reader holding that entry's ID would then be reading
+    /// past the end of a stream that has not ended.
+    pub fn set_id(
+        &mut self,
+        last: Id,
+        added: Option<u64>,
+        max_deleted: Option<Id>,
+    ) -> Result<(), Refused> {
+        if self.top_id().is_some_and(|top| last < top) {
+            return Err(Refused::NotGreater);
+        }
+        self.last = last;
+        if let Some(added) = added {
+            self.added = added;
+        }
+        if let Some(id) = max_deleted {
+            self.max_deleted = id;
+        }
+        Ok(())
+    }
+
     /// What the ID would be if `XADD key *` ran now with clock reading `now`.
     ///
     /// The clock unless the clock has not moved, or has gone backwards, in which
@@ -569,9 +618,15 @@ impl Stream {
     /// `exact` is Redis's `=` against `~`. Without it only whole nodes are
     /// dropped, so the stream is left at `len` or a little over and no node is
     /// ever rewritten. That is the form to use, and it is why `~` exists.
-    pub fn trim_maxlen(&mut self, len: u64, exact: bool) -> u64 {
+    ///
+    /// `limit` is Redis's `LIMIT`, which stops the trim once that many entries
+    /// have gone rather than once the stream is short enough. It exists because
+    /// a capped stream that has fallen a long way behind would otherwise spend
+    /// one command dropping millions of entries with the shard doing nothing
+    /// else, and the next write will carry on where this one stopped.
+    pub fn trim_maxlen(&mut self, len: u64, exact: bool, limit: Option<u64>) -> u64 {
         let mut gone = 0;
-        while self.length > len {
+        while self.length > len && !limit.is_some_and(|cap| gone >= cap) {
             let Some(node) = self.nodes.front() else {
                 break;
             };
@@ -597,10 +652,13 @@ impl Stream {
     /// Drop every entry below `id`, which is `XTRIM key MINID id`. Answers how
     /// many went.
     ///
-    /// `exact` means the same as it does for [`Stream::trim_maxlen`].
-    pub fn trim_minid(&mut self, id: Id, exact: bool) -> u64 {
+    /// `exact` and `limit` mean what they do for [`Stream::trim_maxlen`].
+    pub fn trim_minid(&mut self, id: Id, exact: bool, limit: Option<u64>) -> u64 {
         let mut gone = 0;
         while let Some(node) = self.nodes.front() {
+            if limit.is_some_and(|cap| gone >= cap) {
+                break;
+            }
             let (count, _) = counts(&node.lp);
             if last_of(node) < id {
                 let top = last_of(node);
@@ -748,6 +806,11 @@ impl Stream {
     /// `consumer` and written into the pending list as it goes. The consumer is
     /// created if it is not there, because a consumer exists by turning up.
     ///
+    /// `noack` is Redis's `NOACK`, which hands the entries over without writing
+    /// them into the pending list at all. The group still counts them as read,
+    /// so the lag is the same either way, and the consumer is on its own if it
+    /// dies holding one.
+    ///
     /// Answers how many entries the callback saw, or `None` when there is no
     /// such group.
     pub fn read_group<F>(
@@ -755,6 +818,7 @@ impl Stream {
         group: &[u8],
         consumer: &[u8],
         count: Option<usize>,
+        noack: bool,
         now: u64,
         mut f: F,
     ) -> Option<usize>
@@ -774,7 +838,11 @@ impl Stream {
         };
         let mut seen = 0;
         walk_nodes(nodes, from, Id::MAX, count, &mut |id, fields| {
-            g.deliver(slot, id, now);
+            if noack {
+                g.skip(id);
+            } else {
+                g.deliver(slot, id, now);
+            }
             seen += 1;
             f(id, fields)
         });
@@ -930,13 +998,26 @@ impl Stream {
         Some((cursor, took))
     }
 
-    /// How many bytes the nodes take, not counting this struct.
+    /// How many bytes the entries and the groups take, not counting this struct.
+    ///
+    /// The name is the one every other body in this crate uses, because the
+    /// keyspace asks all of them the same question through one trait and a
+    /// stream that answered it under a different name would need its own arm.
     #[must_use]
-    pub fn memory(&self) -> usize {
-        self.nodes
+    pub fn memory_bytes(&self) -> usize {
+        let nodes: usize = self
+            .nodes
             .iter()
             .map(|node| node.lp.byte_len() + std::mem::size_of::<Node>())
-            .sum()
+            .sum();
+        let groups: usize = self
+            .groups
+            .iter()
+            .map(|(name, g)| {
+                name.capacity() + std::mem::size_of::<(Vec<u8>, Group)>() + g.memory_bytes()
+            })
+            .sum();
+        nodes + groups
     }
 
     /// How many nodes there are, which only a test and `XINFO STREAM FULL` care
@@ -1372,10 +1453,10 @@ mod tests {
                 .expect("an append");
         }
         assert!(
-            shared.memory() * 3 < apart.memory(),
+            shared.memory_bytes() * 3 < apart.memory_bytes(),
             "{} against {}",
-            shared.memory(),
-            apart.memory()
+            shared.memory_bytes(),
+            apart.memory_bytes()
         );
     }
 
@@ -1400,7 +1481,7 @@ mod tests {
             )
             .expect("an append");
         }
-        let each = s.memory() as f64 / 10_000.0;
+        let each = s.memory_bytes() as f64 / 10_000.0;
         assert!(each < 32.0, "{each:.2} bytes an entry");
     }
 
@@ -1625,7 +1706,7 @@ mod tests {
         for ms in 1..=1000u64 {
             add(&mut s, ms, 0, &[("n", "x")]);
         }
-        assert_eq!(s.trim_maxlen(150, true), 850);
+        assert_eq!(s.trim_maxlen(150, true, None), 850);
         assert_eq!(s.len(), 150);
         assert_eq!(s.first_id(), Some(Id::new(851, 0)));
         assert_eq!(s.last_id(), Id::new(1000, 0));
@@ -1638,7 +1719,7 @@ mod tests {
         for ms in 1..=1000u64 {
             add(&mut s, ms, 0, &[("n", "x")]);
         }
-        assert_eq!(s.trim_maxlen(150, false), 800);
+        assert_eq!(s.trim_maxlen(150, false, None), 800);
         assert_eq!(s.len(), 200, "left at the node boundary above 150");
         assert_eq!(s.nodes(), 2);
     }
@@ -1649,7 +1730,7 @@ mod tests {
         for ms in 1..=10u64 {
             add(&mut s, ms, 0, &[("n", "x")]);
         }
-        assert_eq!(s.trim_maxlen(50, true), 0);
+        assert_eq!(s.trim_maxlen(50, true, None), 0);
         assert_eq!(s.len(), 10);
     }
 
@@ -1659,7 +1740,7 @@ mod tests {
         for ms in 1..=250u64 {
             add(&mut s, ms, 0, &[("n", "x")]);
         }
-        assert_eq!(s.trim_maxlen(0, true), 250);
+        assert_eq!(s.trim_maxlen(0, true, None), 250);
         assert!(s.is_empty());
         assert_eq!(s.nodes(), 0);
         assert_eq!(s.last_id(), Id::new(250, 0));
@@ -1671,7 +1752,7 @@ mod tests {
         for ms in 1..=1000u64 {
             add(&mut s, ms, 0, &[("n", "x")]);
         }
-        assert_eq!(s.trim_minid(Id::new(400, 0), true), 399);
+        assert_eq!(s.trim_minid(Id::new(400, 0), true, None), 399);
         assert_eq!(s.first_id(), Some(Id::new(400, 0)));
         assert_eq!(s.len(), 601);
     }
@@ -1682,7 +1763,7 @@ mod tests {
         for ms in 1..=1000u64 {
             add(&mut s, ms, 0, &[("n", "x")]);
         }
-        assert_eq!(s.trim_minid(Id::new(450, 0), false), 400);
+        assert_eq!(s.trim_minid(Id::new(450, 0), false, None), 400);
         assert_eq!(s.first_id(), Some(Id::new(401, 0)));
     }
 
@@ -1999,10 +2080,17 @@ mod tests {
     /// What a group read hands back, with the fields flattened.
     fn read(s: &mut Stream, group: &str, who: &str, count: Option<usize>, now: u64) -> Vec<Id> {
         let mut out = Vec::new();
-        s.read_group(group.as_bytes(), who.as_bytes(), count, now, |id, _| {
-            out.push(id);
-            true
-        })
+        s.read_group(
+            group.as_bytes(),
+            who.as_bytes(),
+            count,
+            false,
+            now,
+            |id, _| {
+                out.push(id);
+                true
+            },
+        )
         .expect("the group");
         out
     }
@@ -2086,7 +2174,7 @@ mod tests {
     fn reading_a_group_that_is_not_there_says_so() {
         let mut s = logged(1);
         assert!(
-            s.read_group(b"nope", b"alice", None, 1, |_, _| true)
+            s.read_group(b"nope", b"alice", None, false, 1, |_, _| true)
                 .is_none()
         );
     }
@@ -2179,11 +2267,11 @@ mod tests {
         assert_eq!(s.group(b"workers").expect("g").lag(s.added()), Some(100));
 
         // Whole nodes off the front, all of them well behind the bookmark.
-        assert_eq!(s.trim_maxlen(200, true), 300);
+        assert_eq!(s.trim_maxlen(200, true, None), 300);
         assert_eq!(s.group(b"workers").expect("g").lag(s.added()), Some(100));
 
         // And now past it, which it cannot survive.
-        assert!(s.trim_maxlen(10, true) > 0);
+        assert!(s.trim_maxlen(10, true, None) > 0);
         assert_eq!(s.group(b"workers").expect("g").lag(s.added()), None);
     }
 
@@ -2400,7 +2488,7 @@ mod tests {
         s.create_group(b"workers", Id::MIN, Some(0));
         read(&mut s, "workers", "alice", Some(5), 100);
         // Trimming takes entries alice is still holding.
-        assert_eq!(s.trim_maxlen(3, true), 7);
+        assert_eq!(s.trim_maxlen(3, true, None), 7);
 
         assert_eq!(s.group(b"workers").expect("the group").pending_len(), 5);
         let mut gone = Vec::new();
@@ -2430,8 +2518,8 @@ mod tests {
         assert_eq!(s.len(), 0);
         assert_eq!(s.first_id(), None);
         assert_eq!(s.last_id(), Id::MIN);
-        assert_eq!(s.trim_maxlen(0, true), 0);
-        assert_eq!(s.trim_minid(Id::MAX, true), 0);
+        assert_eq!(s.trim_maxlen(0, true, None), 0);
+        assert_eq!(s.trim_minid(Id::MAX, true, None), 0);
         assert_eq!(dump(&s), vec![]);
     }
 }

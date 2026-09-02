@@ -357,7 +357,14 @@ pub(crate) fn dump(rec: &Record) -> Option<Vec<u8>> {
             }
         },
         Body::Hash(hash) => put_hash(&mut out, hash),
-        Body::Array(_) => return None,
+        // Neither of these has an RDB shape here yet. The sparse array is ours
+        // and has no Redis number to write under, and the stream does have one
+        // and is the next thing to land: the node layout is already byte for
+        // byte Redis's and there is a test holding it against a real `DUMP`, so
+        // what is missing is the envelope around it and the `RESTORE` side.
+        // Until then `DUMP` of a stream answers the same null a missing key
+        // does, which is a divergence and is registered as one.
+        Body::Array(_) | Body::Stream(_) => return None,
     }
     Some(seal(out))
 }
