@@ -13,29 +13,49 @@
 //!   - `encode` against the dimension. It is a rotation plus a pass, both linear
 //!     in the dimension times `log2` of it, so it should climb a little faster
 //!     than the dimension does and nothing worse.
-//!   - `scan/one` against `scan/four` at the same dimension. Four bits is four
-//!     times the bytes, so the gap is what reading four times the memory costs
-//!     and it should be well under four times, because a one bit scan is not
-//!     memory bound at this size.
+//!   - `scan/one` against `scan/exact_one` at the same dimension. That is the
+//!     popcount scan against the same estimator with the query left in floats,
+//!     which is a multiply per dimension per code, and it is the whole reason a
+//!     code is stored as bit planes.
+//!   - `scan/one` against `scan/four`. Four bits is four times the bytes and it
+//!     also meets an eight bit query rather than a four bit one, so it is eight
+//!     times the popcounts and the gap should be nearer eight than four.
 //!   - `query` against `scan`. The query is prepared once per partition and the
 //!     scan runs once per vector in it, so the preparation should be lost in the
-//!     noise at any partition size worth having.
+//!     noise at any partition size worth having. It is not, yet.
 //!
 //! # Where it stands
 //!
-//! On an M4 Max, encode at 768 dimensions is 7.6 microseconds, which is 132
-//! thousand vectors a second on one core against a target of fifty thousand, so
-//! ingest has room. The scan is the problem: 923 microseconds for a thousand one
-//! bit codes at 768 dimensions, which is 900 nanoseconds a vector when the whole
-//! search has a millisecond. That is the reference estimator doing one float
-//! multiply per dimension per code, and it is why RaBitQ's paper quantises the
-//! query and scans with popcounts instead. That is the next change, and these
-//! rows are what it will be measured against.
+//! On an M4 Max, minimum per iteration, one run:
 //!
-//! The four bit scan being faster than the one bit scan is the same story from
-//! the other end. Both do a float multiply per dimension, and the one bit path
-//! adds a shift and a test per dimension to pull the bit out, so it pays more to
-//! read less. Neither number is what the shape of the data can do.
+//! ```text
+//! dim   scan/one   scan/exact_one   scan/four   scan/exact_four
+//! 128      9.1 us         110.5 us     45.2 us          325.4 us
+//! 256     10.3 us         233.8 us     65.1 us          748.4 us
+//! 768     20.6 us         721.5 us    169.9 us         2738.1 us
+//! ```
+//!
+//! So a thousand codes at 768 dimensions is 20 microseconds against a whole
+//! search budget of a millisecond, and the popcount scan is 35 times the float
+//! one at one bit and 16 times at four. Encode at the same dimension is about 8
+//! microseconds, which is 120 thousand vectors a second on one core against a
+//! target of fifty thousand, so ingest has room too.
+//!
+//! The `exact` rows get worse faster than the real ones do, and that is the
+//! layout talking rather than the estimator. Reading a coordinate's level out of
+//! bit planes means touching one plane per bit, so the float path pays four
+//! loads a coordinate at four bits where it used to pay half of one. Bit planes
+//! are only worth having if the scan is popcounts, and these rows are what says
+//! so.
+//!
+//! The row that is now worth watching is `query` against `scan`. Preparing a
+//! query is 9.8 microseconds at 768 dimensions and scanning a partition of a
+//! thousand codes is 20.6, so the preparation is no longer lost in the noise. It
+//! happens once per partition probed, because the residual is taken against that
+//! partition's centroid, and a search probes tens of them. The fix is that the
+//! rotation is linear, so rotating the centroids once when they are built turns
+//! the per partition work into a subtraction, and it lands with the partition
+//! store.
 //!
 //! # Reading these on a machine someone else is using
 //!
@@ -123,6 +143,26 @@ fn bench_scan(c: &mut Criterion) {
                     black_box(best)
                 });
             });
+            // The same scan against a query that was never quantised, which is
+            // a float multiply per dimension per code and is what the popcount
+            // scan replaced. It is here so the claim about the speedup is a
+            // ratio inside one run rather than a number remembered from an
+            // older one.
+            g.bench_with_input(
+                BenchmarkId::new(format!("exact/{name}"), dim),
+                &dim,
+                |b, _| {
+                    b.iter(|| {
+                        let mut best = f32::INFINITY;
+                        for i in 0..n {
+                            let c =
+                                prepared.cosine_exact(&codes[i * width..(i + 1) * width], &meta[i]);
+                            best = best.min(c);
+                        }
+                        black_box(best)
+                    });
+                },
+            );
         }
     }
     g.finish();
