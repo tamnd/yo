@@ -191,6 +191,17 @@ impl<B: Blocks> Tier<B> {
         self.stats
     }
 
+    /// How many bytes the store holds, which is what `maxstore` is compared
+    /// against.
+    ///
+    /// Asked of the store rather than added up here. [`Stats::bytes_out`] counts
+    /// payload that was written and never goes down, and a limit on the file has
+    /// to be a limit on the file.
+    #[must_use]
+    pub fn store_bytes(&self) -> u64 {
+        self.blocks.bytes()
+    }
+
     /// The store, for a caller that has to flush or close it.
     pub const fn blocks(&self) -> &B {
         &self.blocks
@@ -480,6 +491,10 @@ mod tests {
                 .get(at.offset() as usize)
                 .map(Vec::as_slice)
                 .ok_or_else(|| Error::new(Code::NotFound, "no such block"))
+        }
+
+        fn bytes(&self) -> u64 {
+            self.blobs.iter().map(|b| b.len() as u64).sum()
         }
     }
 

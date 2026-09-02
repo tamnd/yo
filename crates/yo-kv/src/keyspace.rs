@@ -1221,11 +1221,30 @@ impl Keyspace {
         tier.demote(&mut self.map, key)
     }
 
-    /// Move values out to the file until this database fits in `budget` bytes.
+    /// How many bytes the attached store is holding, or `None` if there is not
+    /// one.
     ///
-    /// Answers how many went. This is `maxmemory` under the inversion `14`
+    /// `None` and `Some(0)` are different answers and the difference is the one
+    /// `maxstore` turns on. A database with nothing attached cannot migrate and
+    /// has to evict, and a database with an empty file attached can migrate the
+    /// moment it needs to.
+    #[must_use]
+    pub fn store_bytes(&self) -> Option<u64> {
+        self.tier.as_ref().map(Tier::store_bytes)
+    }
+
+    /// Move values out to the file until at least `shed` bytes of memory have
+    /// gone.
+    ///
+    /// Answers how many keys went. This is `maxmemory` under the inversion `14`
     /// describes: the limit that used to throw keys away now moves them, and
     /// what a client stored is still there afterwards.
+    ///
+    /// Bytes to shed rather than a target to reach, because the caller with the
+    /// limit is a server holding sixteen databases against one number and what
+    /// it knows is how far over it is, not what any one database should be
+    /// holding. `usize::MAX` means everything that can go, which is what a sweep
+    /// wants.
     ///
     /// Victims are chosen by the same policy `maxmemory-policy` names, so a
     /// database set to `allkeys-lru` demotes the coldest keys and one set to
@@ -1235,12 +1254,13 @@ impl Keyspace {
     /// # Errors
     ///
     /// Whatever the store says when it will not take the bytes.
-    pub fn relieve(&mut self, budget: usize) -> Result<usize> {
+    pub fn relieve(&mut self, shed: usize) -> Result<usize> {
         if self.tier.is_none() {
             return Ok(0);
         }
         let now = self.clock.now_ms();
         let (policy, lfu) = (self.policy, self.lfu);
+        let budget = self.map.memory_bytes().saturating_sub(shed);
         let tier = self.tier.as_mut().expect("checked just above");
         let moved = tier.relieve(&mut self.map, budget, policy, now, lfu);
         // A sweep compacts the arena, which moves records, and the memo holds a
@@ -1787,10 +1807,17 @@ impl Keyspace {
         self.foreign.track_bytes(on);
     }
 
-    /// The index, the arena and the slot arrays, none of which need asking twice.
+    /// The index, the arena and the slot arrays, none of which need asking
+    /// twice, plus the tier when there is one.
+    ///
+    /// The tier is in here because a doorkeeper and a directory buffer are real
+    /// memory and a limit that did not count them would be a limit on part of
+    /// the server. It is also the honest way round: the thing that gives memory
+    /// back costs some to keep, and both numbers belong in the same total.
     #[inline]
     fn slab_bytes(&self) -> usize {
-        self.map.memory_bytes()
+        self.tier.as_ref().map_or(0, Tier::memory_bytes)
+            + self.map.memory_bytes()
             + self.sets.slot_bytes()
             + self.hashes.slot_bytes()
             + self.lists.slot_bytes()
