@@ -15,6 +15,9 @@ categories.workspace = true
 [dependencies]
 yo-alloc = { workspace = true }
 yo-common = { workspace = true }
+# The graph the `G.*` family works on, held under a key through `yo_kv::Foreign`.
+yo-doc = { workspace = true }
+yo-graph = { workspace = true }
 yo-kv = { workspace = true }
 yo-reactor = { workspace = true }
 

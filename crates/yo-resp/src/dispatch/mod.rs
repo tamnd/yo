@@ -55,6 +55,7 @@ mod args;
 mod arrays;
 mod blocking;
 mod cpu;
+mod graph;
 mod hashes;
 mod keyspace;
 mod lists;
@@ -869,6 +870,10 @@ pub fn resolved(
             "array" => {
                 let db = session.db;
                 arrays::execute(&mut server.dbs[db], spec, args, out).map(|()| Flow::Continue)
+            }
+            "graph" => {
+                let db = session.db;
+                graph::execute(&mut server.dbs[db], spec, args, out).map(|()| Flow::Continue)
             }
             // The one keyspace command that needs more than the databases,
             // because the socket it talks down is held on the server between
@@ -7113,6 +7118,434 @@ mod tests {
         assert_eq!(
             g.run(&[b"HINCRBYFLOAT", b"h", b"f", b"1e19"]),
             "$20\r\n10000000000000000000\r\n"
+        );
+    }
+
+    // ----------------------------------------------------------------- graph
+
+    #[test]
+    fn a_node_comes_back_with_the_fields_it_went_in_with() {
+        let mut f = Fixture::new();
+        assert_eq!(
+            f.run(&[
+                b"G.NADD", b"social", b"ada", b"name", b"Ada", b"born", b"1815"
+            ]),
+            ":1\r\n"
+        );
+        // The year comes back as the four bytes that were sent and not as a
+        // number, because every property is text and there is nothing on the
+        // wire that says which of `1815` and `"1815"` the client meant. The
+        // fields are in the document's order, which is sorted by name, because
+        // that is what makes a field lookup a binary search.
+        assert_eq!(
+            f.run(&[b"G.NGET", b"social", b"ada"]),
+            "*4\r\n$4\r\nborn\r\n$4\r\n1815\r\n$4\r\nname\r\n$3\r\nAda\r\n"
+        );
+        // A second write to the same id replaces the document and says so with
+        // a zero, so an ingest can count what it created.
+        assert_eq!(
+            f.run(&[b"G.NADD", b"social", b"ada", b"name", b"Ada Lovelace"]),
+            ":0\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"G.NGET", b"social", b"ada"]),
+            "*2\r\n$4\r\nname\r\n$12\r\nAda Lovelace\r\n"
+        );
+        // A node with no properties is an empty map and not a null, which is
+        // how a client tells an isolated node from one that is not there.
+        assert_eq!(f.run(&[b"G.NADD", b"social", b"grace"]), ":1\r\n");
+        assert_eq!(f.run(&[b"G.NGET", b"social", b"grace"]), "*0\r\n");
+        assert_eq!(f.run(&[b"G.NGET", b"social", b"nobody"]), "$-1\r\n");
+        assert_eq!(f.run(&[b"G.NGET", b"nokey", b"ada"]), "$-1\r\n");
+
+        // A field with no value creates nothing, because the pairs are checked
+        // before the key is touched.
+        assert_eq!(
+            f.run(&[b"G.NADD", b"fresh", b"n", b"lonely"]),
+            "-ERR syntax error\r\n"
+        );
+        assert_eq!(f.run(&[b"EXISTS", b"fresh"]), ":0\r\n");
+
+        // On RESP3 the same reply is a map.
+        let mut g = Fixture::new();
+        g.run(&[b"HELLO", b"3"]);
+        g.run(&[b"G.NADD", b"social", b"ada", b"name", b"Ada"]);
+        assert_eq!(
+            g.run(&[b"G.NGET", b"social", b"ada"]),
+            "%1\r\n$4\r\nname\r\n$3\r\nAda\r\n"
+        );
+    }
+
+    #[test]
+    fn an_edge_creates_the_ends_it_needs() {
+        let mut f = Fixture::new();
+        assert_eq!(
+            f.run(&[
+                b"G.EADD", b"social", b"ada", b"grace", b"FOLLOWS", b"since", b"1843"
+            ]),
+            ":1\r\n"
+        );
+        // Neither end was written first and both are there, as empty nodes.
+        assert_eq!(f.run(&[b"G.NGET", b"social", b"ada"]), "*0\r\n");
+        assert_eq!(f.run(&[b"G.NGET", b"social", b"grace"]), "*0\r\n");
+        assert_eq!(
+            f.run(&[b"G.OUT", b"social", b"ada", b"FOLLOWS"]),
+            "*2\r\n$1\r\n0\r\n*1\r\n$5\r\ngrace\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"G.IN", b"social", b"grace", b"FOLLOWS"]),
+            "*2\r\n$1\r\n0\r\n*1\r\n$3\r\nada\r\n"
+        );
+        // The same pair under the same label again updates the edge rather than
+        // making a second one.
+        assert_eq!(
+            f.run(&[
+                b"G.EADD", b"social", b"ada", b"grace", b"FOLLOWS", b"since", b"1844"
+            ]),
+            ":0\r\n"
+        );
+        assert_eq!(f.run(&[b"G.DEG", b"social", b"ada", b"FOLLOWS"]), ":1\r\n");
+        // A different label between the same pair is a different edge.
+        assert_eq!(
+            f.run(&[b"G.EADD", b"social", b"ada", b"grace", b"WORKS_WITH"]),
+            ":1\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"G.DEG", b"social", b"ada", b"WORKS_WITH"]),
+            ":1\r\n"
+        );
+
+        assert_eq!(
+            f.run(&[b"G.EDEL", b"social", b"ada", b"grace", b"FOLLOWS"]),
+            ":1\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"G.EDEL", b"social", b"ada", b"grace", b"FOLLOWS"]),
+            ":0\r\n"
+        );
+        // A label nothing has used, an end that is not there, and a key that is
+        // not there are all a zero rather than an error.
+        assert_eq!(
+            f.run(&[b"G.EDEL", b"social", b"ada", b"grace", b"NEVER"]),
+            ":0\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"G.EDEL", b"social", b"ada", b"nobody", b"FOLLOWS"]),
+            ":0\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"G.EDEL", b"nokey", b"ada", b"grace", b"FOLLOWS"]),
+            ":0\r\n"
+        );
+    }
+
+    /// A run is paged the way `SCAN` is paged, so a client that can walk one
+    /// can walk the other.
+    #[test]
+    fn a_hop_answers_a_cursor_and_a_page() {
+        let mut f = Fixture::new();
+        for i in 0..25u32 {
+            let dst = format!("n{i}");
+            f.run(&[b"G.EADD", b"social", b"hub", dst.as_bytes(), b"FOLLOWS"]);
+        }
+        // Ten without being asked, and the cursor is where to carry on from.
+        let first = f.run(&[b"G.OUT", b"social", b"hub", b"FOLLOWS"]);
+        assert!(first.starts_with("*2\r\n$2\r\n10\r\n*10\r\n"), "{first}");
+
+        let mut seen = 0;
+        let mut cursor = String::from("0");
+        loop {
+            let page = f.run(&[
+                b"G.OUT",
+                b"social",
+                b"hub",
+                b"FOLLOWS",
+                b"COUNT",
+                b"7",
+                b"CURSOR",
+                cursor.as_bytes(),
+            ]);
+            let (head, rest) = page.split_once("\r\n*").expect("a cursor and a page");
+            cursor = head
+                .rsplit("\r\n")
+                .next()
+                .expect("the cursor line")
+                .to_string();
+            seen += rest
+                .split_once("\r\n")
+                .expect("the page length")
+                .0
+                .parse::<usize>()
+                .expect("a length");
+            if cursor == "0" {
+                break;
+            }
+        }
+        assert_eq!(seen, 25, "every neighbour once across the pages");
+
+        // A cursor past the end is an empty page and not an error, and so is a
+        // key or a label that is not there.
+        assert_eq!(
+            f.run(&[b"G.OUT", b"social", b"hub", b"FOLLOWS", b"CURSOR", b"900"]),
+            "*2\r\n$1\r\n0\r\n*0\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"G.OUT", b"social", b"hub", b"NEVER"]),
+            "*2\r\n$1\r\n0\r\n*0\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"G.OUT", b"nokey", b"hub", b"FOLLOWS"]),
+            "*2\r\n$1\r\n0\r\n*0\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"G.OUT", b"social", b"hub", b"FOLLOWS", b"COUNT", b"0"]),
+            "-ERR COUNT must be a positive integer\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"G.OUT", b"social", b"hub", b"FOLLOWS", b"NOPE", b"1"]),
+            "-ERR syntax error\r\n"
+        );
+    }
+
+    #[test]
+    fn a_degree_counts_one_way_or_both() {
+        let mut f = Fixture::new();
+        f.run(&[b"G.EADD", b"social", b"a", b"b", b"F"]);
+        f.run(&[b"G.EADD", b"social", b"a", b"c", b"F"]);
+        f.run(&[b"G.EADD", b"social", b"d", b"a", b"F"]);
+        assert_eq!(f.run(&[b"G.DEG", b"social", b"a", b"F"]), ":2\r\n");
+        assert_eq!(f.run(&[b"G.DEG", b"social", b"a", b"F", b"OUT"]), ":2\r\n");
+        assert_eq!(f.run(&[b"G.DEG", b"social", b"a", b"F", b"IN"]), ":1\r\n");
+        assert_eq!(f.run(&[b"G.DEG", b"social", b"a", b"F", b"BOTH"]), ":3\r\n");
+        assert_eq!(f.run(&[b"G.DEG", b"social", b"nobody", b"F"]), ":0\r\n");
+        assert_eq!(f.run(&[b"G.DEG", b"social", b"a", b"NEVER"]), ":0\r\n");
+        assert_eq!(f.run(&[b"G.DEG", b"nokey", b"a", b"F"]), ":0\r\n");
+        assert_eq!(
+            f.run(&[b"G.DEG", b"social", b"a", b"F", b"SIDEWAYS"]),
+            "-ERR syntax error\r\n"
+        );
+    }
+
+    /// A walk answers which nodes it can reach and not by how many routes, so a
+    /// node two ways out is in the frontier once.
+    #[test]
+    fn a_walk_reaches_each_node_once_however_many_ways_there_are() {
+        let mut f = Fixture::new();
+        for (src, dst) in [
+            ("ada", "grace"),
+            ("ada", "alan"),
+            ("grace", "edsger"),
+            ("alan", "edsger"),
+            ("edsger", "barbara"),
+        ] {
+            f.run(&[b"G.EADD", b"social", src.as_bytes(), dst.as_bytes(), b"F"]);
+        }
+        // Two hops without being asked, the start left out, and edsger once
+        // even though both of the first hop's nodes point at it.
+        assert_eq!(
+            f.run(&[b"G.NEIGH", b"social", b"ada", b"F"]),
+            "*3\r\n$5\r\ngrace\r\n$4\r\nalan\r\n$6\r\nedsger\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"G.NEIGH", b"social", b"ada", b"F", b"DEPTH", b"1"]),
+            "*2\r\n$5\r\ngrace\r\n$4\r\nalan\r\n"
+        );
+        let deep = f.run(&[b"G.NEIGH", b"social", b"ada", b"F", b"DEPTH", b"9"]);
+        assert!(deep.starts_with("*4\r\n"), "the whole component: {deep}");
+        assert!(deep.contains("$7\r\nbarbara\r\n"), "{deep}");
+        // COUNT stops the walk rather than trimming what it found.
+        assert_eq!(
+            f.run(&[b"G.NEIGH", b"social", b"ada", b"F", b"COUNT", b"1"]),
+            "*1\r\n$5\r\ngrace\r\n"
+        );
+        // A node nothing leaves is an empty array and not an error.
+        assert_eq!(f.run(&[b"G.NEIGH", b"social", b"barbara", b"F"]), "*0\r\n");
+        assert_eq!(f.run(&[b"G.NEIGH", b"social", b"ada", b"NEVER"]), "*0\r\n");
+        assert_eq!(f.run(&[b"G.NEIGH", b"nokey", b"ada", b"F"]), "*0\r\n");
+        assert_eq!(
+            f.run(&[b"G.NEIGH", b"social", b"ada", b"F", b"DEPTH", b"0"]),
+            "-ERR DEPTH must be a positive integer\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"G.NEIGH", b"social", b"ada", b"F", b"NOPE", b"1"]),
+            "-ERR syntax error\r\n"
+        );
+    }
+
+    /// The two sided search, which is the whole reason `G.PATH` is a command
+    /// and not something a client builds out of `G.OUT`.
+    #[test]
+    fn a_path_is_the_shortest_one_and_goes_over_any_label() {
+        let mut f = Fixture::new();
+        // A chain of six, and a shortcut that makes a shorter way round under a
+        // second label so the search has to take either kind of hop.
+        for i in 0..6u32 {
+            let src = format!("n{i}");
+            let dst = format!("n{}", i + 1);
+            f.run(&[b"G.EADD", b"road", src.as_bytes(), dst.as_bytes(), b"STEP"]);
+        }
+        assert_eq!(
+            f.run(&[b"G.PATH", b"road", b"n0", b"n6"]),
+            "*7\r\n$2\r\nn0\r\n$2\r\nn1\r\n$2\r\nn2\r\n$2\r\nn3\r\n$2\r\nn4\r\n$2\r\nn5\r\n$2\r\nn6\r\n"
+        );
+        f.run(&[b"G.EADD", b"road", b"n0", b"n5", b"JUMP"]);
+        assert_eq!(
+            f.run(&[b"G.PATH", b"road", b"n0", b"n6"]),
+            "*3\r\n$2\r\nn0\r\n$2\r\nn5\r\n$2\r\nn6\r\n"
+        );
+        // A node to itself is a path of one, and a depth too short to reach is
+        // no path at all.
+        assert_eq!(
+            f.run(&[b"G.PATH", b"road", b"n2", b"n2"]),
+            "*1\r\n$2\r\nn2\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"G.PATH", b"road", b"n0", b"n6", b"MAXDEPTH", b"1"]),
+            "*0\r\n"
+        );
+        // Direction counts: the chain only goes one way.
+        assert_eq!(f.run(&[b"G.PATH", b"road", b"n6", b"n0"]), "*0\r\n");
+        // An unreachable node, a node that is not there, and a key that is not
+        // there are the same empty answer.
+        f.run(&[b"G.NADD", b"road", b"island"]);
+        assert_eq!(f.run(&[b"G.PATH", b"road", b"n0", b"island"]), "*0\r\n");
+        assert_eq!(f.run(&[b"G.PATH", b"road", b"n0", b"nobody"]), "*0\r\n");
+        assert_eq!(f.run(&[b"G.PATH", b"nokey", b"n0", b"n6"]), "*0\r\n");
+        assert_eq!(
+            f.run(&[b"G.PATH", b"road", b"n0", b"n6", b"NOPE", b"3"]),
+            "-ERR syntax error\r\n"
+        );
+    }
+
+    /// The point of the escape in the record tag: the keyspace owns a graph key
+    /// the way it owns every other key, and none of these commands know a graph
+    /// exists.
+    #[test]
+    fn the_keyspace_sees_a_graph_key_like_any_other() {
+        let mut f = Fixture::new();
+        f.run(&[b"G.EADD", b"social", b"ada", b"grace", b"F"]);
+        assert_eq!(f.run(&[b"TYPE", b"social"]), "+graph\r\n");
+        assert_eq!(
+            f.run(&[b"OBJECT", b"ENCODING", b"social"]),
+            "$9\r\nadjacency\r\n"
+        );
+        assert_eq!(f.run(&[b"EXISTS", b"social"]), ":1\r\n");
+        assert_eq!(f.run(&[b"DBSIZE"]), ":1\r\n");
+        assert_eq!(f.run(&[b"KEYS", b"*"]), "*1\r\n$6\r\nsocial\r\n");
+        // A graph is counted against the server the way every other body is,
+        // which is what `maxmemory` will read when this key is a million nodes.
+        // There is no `MEMORY USAGE` command yet, so this asks the server.
+        let held = f.server.memory_bytes();
+        for i in 0..200u32 {
+            let dst = format!("n{i}");
+            f.run(&[b"G.EADD", b"big", b"hub", dst.as_bytes(), b"F"]);
+        }
+        assert!(
+            f.server.memory_bytes() > held,
+            "two hundred edges cost something: {held} then {}",
+            f.server.memory_bytes()
+        );
+        f.run(&[b"DEL", b"big"]);
+
+        // An expiry, then a rename, then a move to another database, all of
+        // which are the keyspace moving a record it cannot look inside.
+        assert_eq!(f.run(&[b"EXPIRE", b"social", b"100"]), ":1\r\n");
+        assert_eq!(f.run(&[b"PERSIST", b"social"]), ":1\r\n");
+        assert_eq!(f.run(&[b"RENAME", b"social", b"net"]), "+OK\r\n");
+        assert_eq!(f.run(&[b"MOVE", b"net", b"1"]), ":1\r\n");
+        assert_eq!(f.run(&[b"EXISTS", b"net"]), ":0\r\n");
+        f.run(&[b"SELECT", b"1"]);
+        assert_eq!(f.run(&[b"G.DEG", b"net", b"ada", b"F"]), ":1\r\n");
+
+        assert_eq!(f.run(&[b"DEL", b"net"]), ":1\r\n");
+        assert_eq!(f.run(&[b"DBSIZE"]), ":0\r\n");
+        f.run(&[b"G.NADD", b"g", b"n"]);
+        assert_eq!(f.run(&[b"FLUSHDB"]), "+OK\r\n");
+        assert_eq!(f.run(&[b"DBSIZE"]), ":0\r\n");
+    }
+
+    /// Neither `COPY` nor `DUMP` has a byte shape for a graph, so both say so
+    /// rather than answering the way they answer for a key that is not there.
+    #[test]
+    fn a_graph_cannot_be_copied_or_dumped() {
+        let mut f = Fixture::new();
+        f.run(&[b"G.NADD", b"social", b"ada"]);
+        assert_eq!(
+            f.run(&[b"COPY", b"social", b"other"]),
+            "-ERR COPY is not supported for a graph\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"COPY", b"social", b"other", b"DB", b"1"]),
+            "-ERR COPY is not supported for a graph\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"DUMP", b"social"]),
+            "-ERR DUMP is not supported for a graph\r\n"
+        );
+        // A refused copy leaves both keys exactly as they were.
+        assert_eq!(f.run(&[b"EXISTS", b"social", b"other"]), ":1\r\n");
+    }
+
+    /// A graph key is a key, so the commands for the other types refuse it and
+    /// the graph commands refuse theirs.
+    #[test]
+    fn a_graph_and_a_string_are_the_wrong_type_for_each_other() {
+        let wrong = "-WRONGTYPE Operation against a key holding the wrong kind of value\r\n";
+        let mut f = Fixture::new();
+        f.run(&[b"G.NADD", b"social", b"ada"]);
+        assert_eq!(f.run(&[b"GET", b"social"]), wrong);
+        assert_eq!(f.run(&[b"LPUSH", b"social", b"x"]), wrong);
+        assert_eq!(f.run(&[b"SADD", b"social", b"x"]), wrong);
+
+        f.run(&[b"SET", b"str", b"v"]);
+        for cmd in [
+            vec![b"G.NADD".as_ref(), b"str", b"n"],
+            vec![b"G.NGET".as_ref(), b"str", b"n"],
+            vec![b"G.NDEL".as_ref(), b"str", b"n"],
+            vec![b"G.EADD".as_ref(), b"str", b"a", b"b", b"F"],
+            vec![b"G.EDEL".as_ref(), b"str", b"a", b"b", b"F"],
+            vec![b"G.OUT".as_ref(), b"str", b"a", b"F"],
+            vec![b"G.IN".as_ref(), b"str", b"a", b"F"],
+            vec![b"G.DEG".as_ref(), b"str", b"a", b"F"],
+            vec![b"G.NEIGH".as_ref(), b"str", b"a", b"F"],
+            vec![b"G.PATH".as_ref(), b"str", b"a", b"b"],
+        ] {
+            assert_eq!(f.run(&cmd), wrong, "{:?}", cmd[0]);
+        }
+    }
+
+    /// Every other collection here takes its key with it when its last member
+    /// goes, and a graph is no different.
+    #[test]
+    fn a_graph_goes_when_its_last_node_does() {
+        let mut f = Fixture::new();
+        f.run(&[
+            b"G.EADD", b"social", b"ada", b"grace", b"F", b"since", b"1843",
+        ]);
+        assert_eq!(f.run(&[b"G.NDEL", b"social", b"ada"]), ":1\r\n");
+        // The node and the edges that hung off it are both gone.
+        assert_eq!(f.run(&[b"G.NGET", b"social", b"ada"]), "$-1\r\n");
+        assert_eq!(
+            f.run(&[b"G.DEG", b"social", b"grace", b"F", b"IN"]),
+            ":0\r\n"
+        );
+        assert_eq!(f.run(&[b"G.NDEL", b"social", b"ada"]), ":0\r\n");
+        assert_eq!(f.run(&[b"EXISTS", b"social"]), ":1\r\n");
+
+        assert_eq!(f.run(&[b"G.NDEL", b"social", b"grace"]), ":1\r\n");
+        assert_eq!(f.run(&[b"EXISTS", b"social"]), ":0\r\n");
+        assert_eq!(f.run(&[b"DBSIZE"]), ":0\r\n");
+        assert_eq!(f.run(&[b"G.NDEL", b"nokey", b"ada"]), ":0\r\n");
+
+        // The id the removed node had is not handed out again, so a client
+        // holding an id from an earlier reply cannot have it mean another node.
+        f.run(&[b"G.NADD", b"social", b"first"]);
+        f.run(&[b"G.NADD", b"social", b"second"]);
+        f.run(&[b"G.NDEL", b"social", b"first"]);
+        f.run(&[b"G.EADD", b"social", b"third", b"second", b"F"]);
+        assert_eq!(
+            f.run(&[b"G.OUT", b"social", b"third", b"F"]),
+            "*2\r\n$1\r\n0\r\n*1\r\n$6\r\nsecond\r\n"
         );
     }
 }

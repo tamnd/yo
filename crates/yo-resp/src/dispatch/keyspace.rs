@@ -17,6 +17,7 @@
 //! too without a line here changing.
 
 use super::args::{self, Args};
+use super::graph;
 use super::scan;
 use super::table::Spec;
 use crate::reply::Out;
@@ -149,8 +150,11 @@ pub(super) fn execute(
             out.int(found);
         }
         "type" => {
-            let name = match db.kind_of(args.get(1)) {
-                Some(k) => k.name().as_bytes(),
+            // Through `type_name` and not `kind_of`, because a foreign body
+            // knows its own word and the tag it rides on does not. A client
+            // asking about a graph is told `graph`.
+            let name = match db.type_name(args.get(1)) {
+                Some(name) => name.as_bytes(),
                 None => &b"none"[..],
             };
             // A simple string on both protocols, which is unusual enough to be
@@ -171,6 +175,10 @@ pub(super) fn execute(
         "scan" => scan(db, args, out)?,
         "keys" => keys(db, args.get(1), out),
         "sort" | "sort_ro" => sort(db, spec.name, args, out)?,
+        // A graph is refused rather than answered with the null bulk a missing
+        // key gets, because there is no byte shape for one and a client that
+        // could not tell the two apart would think its key had gone.
+        "dump" if graph::is_graph(db, args.get(1)) => return Err(no_dump()),
         "dump" => match db.dump(args.get(1)) {
             Some(payload) => out.bulk(&payload),
             None => out.nil(),
@@ -287,6 +295,21 @@ fn kind_named(arg: &[u8]) -> Option<Kind> {
 ///
 /// Unsigned, because ours uses the top bits and Redis parses a cursor with
 /// `strtoull` too.
+/// What `COPY` says about a source there is no way to duplicate.
+///
+/// A graph is an engine that lives above the keyspace and there is no generic
+/// way to ask one for a copy of itself, which is a decision rather than an
+/// oversight: a deep copy of ten million edges is not something a client should
+/// get from a command that looks like `SET`.
+fn no_copy() -> Error {
+    Error::new(Code::Unsupported, "COPY is not supported for a graph")
+}
+
+/// What `DUMP` says about the same key.
+fn no_dump() -> Error {
+    Error::new(Code::Unsupported, "DUMP is not supported for a graph")
+}
+
 /// `RENAME src dst` and `RENAMENX src dst`.
 ///
 /// Both answer an error for a source that is not there, which is unusual: every
@@ -344,7 +367,13 @@ fn copy(dbs: &mut [Keyspace], at: usize, args: Args<'_>, out: &mut Out) -> Resul
         return Err(Error::new(Code::Invalid, SAME_OBJECT));
     }
     let done = if into == at {
-        dbs[at].copy(src, dst, replace)
+        match dbs[at].copy(src, dst, replace) {
+            // The one `Moved` a caller cannot answer with a number, because
+            // zero would mean the destination was taken and this is a source
+            // there is no way to duplicate. See `Moved::Unsupported`.
+            Moved::Unsupported => return Err(no_copy()),
+            done => done,
+        }
     } else {
         // Two databases, so the value comes out of one standing on its own
         // before the other is touched. The borrow of the first ends with the
@@ -357,6 +386,9 @@ fn copy(dbs: &mut [Keyspace], at: usize, args: Args<'_>, out: &mut Out) -> Resul
         if !replace && dbs[into].exists(dst) {
             out.int(0);
             return Ok(());
+        }
+        if graph::is_graph(&mut dbs[at], src) {
+            return Err(no_copy());
         }
         let Some(rec) = dbs[at].export(src) else {
             out.int(0);

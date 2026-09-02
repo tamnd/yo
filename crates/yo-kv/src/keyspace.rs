@@ -27,6 +27,7 @@ use crate::Clock;
 use crate::access::{Access, Lfu, Policy};
 use crate::array::Array;
 use crate::evict;
+use crate::foreign::Foreign;
 use crate::hash::{self, Hash};
 use crate::list::{self, List};
 use crate::set::{self, Set};
@@ -50,6 +51,19 @@ macro_rules! bytes {
     })* };
 }
 bytes!(Set, Hash, List, Zset, Array);
+
+/// A foreign body counts what it says it counts, plus the box around it.
+///
+/// Not through the macro, because the macro calls an inherent method of the
+/// same name and this one is a trait method reached through a vtable. The
+/// pointer itself is two words on top of whatever the engine reports, which is
+/// the price of the escape and is worth naming rather than losing.
+impl Bytes for Box<dyn Foreign> {
+    #[inline]
+    fn memory_bytes(&self) -> usize {
+        self.as_ref().memory_bytes() + std::mem::size_of::<Box<dyn Foreign>>()
+    }
+}
 
 /// One database: every key, whatever type it holds.
 pub struct Keyspace {
@@ -80,6 +94,17 @@ pub struct Keyspace {
     pub(crate) zsets: Slab<Zset>,
     /// Every sparse array in this database, addressed the same way.
     pub(crate) arrays: Slab<Array>,
+    /// Every foreign body in this database, addressed the same way.
+    ///
+    /// A box per slot rather than a value, because the thing in it is not sized
+    /// here and could not be. That is one indirection more than the other
+    /// slabs pay, and it buys the graph, document and vector engines a place in
+    /// the keyspace without this crate depending on any of them. See
+    /// [`crate::foreign`].
+    ///
+    /// Empty on a server that has never held one, which is every server today,
+    /// and an empty slab is three words.
+    pub(crate) foreign: Slab<Box<dyn Foreign>>,
     /// How many keys hold something that is not a string.
     ///
     /// This exists so that a database of nothing but strings, which is every
@@ -335,6 +360,7 @@ impl Keyspace {
             lists: Slab::new(),
             zsets: Slab::new(),
             arrays: Slab::new(),
+            foreign: Slab::new(),
             bodies: 0,
             limits: set::Limits::DEFAULT,
             hash_limits: hash::Limits::DEFAULT,
@@ -727,6 +753,101 @@ impl Keyspace {
         Some(self.zsets.get(at)?.encoding())
     }
 
+    /// Put a foreign body under `key`, over whatever was there.
+    ///
+    /// The keyspace takes the box and frees it when the key goes, which is the
+    /// whole reason a graph lives in here rather than in a table beside it. See
+    /// [`crate::foreign`] for why that mattered enough to spend the last tag
+    /// pattern on.
+    ///
+    /// Overwriting is allowed and is what a caller that has just decided to
+    /// replace a key wants. A caller that did not mean to overwrite asks
+    /// [`Keyspace::kind_of`] first, which is what the commands above do so they
+    /// can answer WRONGTYPE rather than quietly throw a hash away.
+    pub fn put_foreign(&mut self, key: &[u8], body: Box<dyn Foreign>) -> u32 {
+        self.free_body(key);
+        let at = self.foreign.insert(body);
+        let len = value::slot_record_len(false);
+        self.write_rec(key, len, |out| {
+            value::write_slot_record(out, Kind::Foreign, at, None);
+        });
+        self.bodies += 1;
+        at
+    }
+
+    /// The foreign body under `key`.
+    ///
+    /// `None` for a key that is not there or has expired, an error for a key
+    /// holding something this crate does understand, which is the same three
+    /// way answer every other type's entry point gives.
+    ///
+    /// The caller turns the `&dyn Foreign` back into its own type with
+    /// [`downcast_ref`], and a `None` from that is a key holding a different
+    /// foreign body, which is also WRONGTYPE and is the caller's to report
+    /// because only it knows which one it wanted.
+    ///
+    /// [`downcast_ref`]: crate::Foreign
+    pub fn foreign(&mut self, key: &[u8]) -> Result<Option<&dyn Foreign>> {
+        let Some(at) = self.live_slot(key, Kind::Foreign)? else {
+            return Ok(None);
+        };
+        Ok(Some(
+            self.foreign
+                .get(at)
+                .expect("the record points at its body")
+                .as_ref(),
+        ))
+    }
+
+    /// The same, with a mutable borrow.
+    pub fn foreign_mut(&mut self, key: &[u8]) -> Result<Option<&mut dyn Foreign>> {
+        let Some(at) = self.live_slot(key, Kind::Foreign)? else {
+            return Ok(None);
+        };
+        Ok(Some(
+            self.foreign
+                .get_mut(at)
+                .expect("the record points at its body")
+                .as_mut(),
+        ))
+    }
+
+    /// Drop `key` if the foreign body under it has gone empty.
+    ///
+    /// Redis deletes a key when its collection empties, and a client can see
+    /// the difference, so every command that removes something calls this
+    /// afterwards rather than each of them deciding what empty means.
+    pub fn reap_foreign(&mut self, key: &[u8]) {
+        let gone = matches!(self.foreign(key), Ok(Some(b)) if b.is_empty());
+        if gone {
+            self.drop_key(key);
+        }
+    }
+
+    /// The foreign body under `key`, without the reap or the type check.
+    ///
+    /// For the arms that already have a live record in hand and only want the
+    /// body, where going through [`Keyspace::foreign`] would mean reaping a key
+    /// that was read a line ago.
+    fn foreign_at(&mut self, key: &[u8]) -> Option<&dyn Foreign> {
+        let rec = self.map.get(key)?;
+        let at = value::slot(rec);
+        Some(self.foreign.get(at)?.as_ref())
+    }
+
+    /// What `TYPE` should say about `key`.
+    ///
+    /// [`Kind::name`] for everything this crate knows, and the body's own word
+    /// for a foreign one, because a client asking about a graph is told `graph`
+    /// and not `foreign`. `None` for a key that is not there, which is the
+    /// `none` Redis answers with.
+    pub fn type_name(&mut self, key: &[u8]) -> Option<&'static str> {
+        match self.kind_of(key)? {
+            Kind::Foreign => self.foreign_at(key).map(Foreign::type_name),
+            kind => Some(kind.name()),
+        }
+    }
+
     /// `OBJECT ENCODING key`, as the word Redis puts on the wire.
     ///
     /// One place that knows every type's answer, so that adding the hash means
@@ -741,6 +862,8 @@ impl Keyspace {
             Kind::Zset => self.zset_encoding(key).map(zset::Encoding::name),
             // The one type with one encoding, so there is nothing to ask.
             Kind::Array => Some("sliced-array"),
+            // The body knows and this does not, which is the whole point of it.
+            Kind::Foreign => self.foreign_at(key).map(Foreign::encoding),
             // Named rather than caught, so that the next type to land is a
             // build error here and not a panic on a live server. That is not
             // hypothetical: `COPY` of a list took the shard down for exactly as
@@ -783,7 +906,12 @@ impl Keyspace {
             // Every body type writes the same record: a tag and a slot number.
             // The body is not touched and does not need to be, which is the
             // whole point of keeping it out of the record.
-            kind @ (Kind::Set | Kind::Hash | Kind::List | Kind::Zset | Kind::Array) => {
+            kind @ (Kind::Set
+            | Kind::Hash
+            | Kind::List
+            | Kind::Zset
+            | Kind::Array
+            | Kind::Foreign) => {
                 let slot = value::slot(rec);
                 let len = value::slot_record_len(at.is_some());
                 self.write_rec(key, len, |out| {
@@ -912,6 +1040,11 @@ impl Keyspace {
             Kind::Array => {
                 let at = value::slot(rec);
                 self.arrays.remove(at);
+                self.bodies -= 1;
+            }
+            Kind::Foreign => {
+                let at = value::slot(rec);
+                self.foreign.remove(at);
                 self.bodies -= 1;
             }
             // Named rather than caught, as above.
@@ -1124,6 +1257,7 @@ impl Keyspace {
         self.lists.clear();
         self.zsets.clear();
         self.arrays.clear();
+        self.foreign.clear();
         self.pool.clear();
         self.bodies = 0;
     }
@@ -1355,6 +1489,7 @@ impl Keyspace {
             + self.lists.value_bytes()
             + self.zsets.value_bytes()
             + self.arrays.value_bytes()
+            + self.foreign.value_bytes()
     }
 
     /// The same number, asked only of the collections that could have moved.
@@ -1372,11 +1507,12 @@ impl Keyspace {
             + self.lists.settled_bytes()
             + self.zsets.settled_bytes()
             + self.arrays.settled_bytes()
+            + self.foreign.settled_bytes()
     }
 
     /// Start or stop keeping the running total in every slab.
     ///
-    /// One call for all five, because a limit is a property of the server and
+    /// One call for all six, because a limit is a property of the server and
     /// not of a type, and a database tracking its sets but not its hashes would
     /// answer a number that is neither of the two things it could mean.
     pub fn track_memory(&mut self, on: bool) {
@@ -1385,6 +1521,7 @@ impl Keyspace {
         self.lists.track_bytes(on);
         self.zsets.track_bytes(on);
         self.arrays.track_bytes(on);
+        self.foreign.track_bytes(on);
     }
 
     /// The index, the arena and the slot arrays, none of which need asking twice.
@@ -1396,6 +1533,7 @@ impl Keyspace {
             + self.lists.slot_bytes()
             + self.zsets.slot_bytes()
             + self.arrays.slot_bytes()
+            + self.foreign.slot_bytes()
     }
 
     /// Give back one segment's worth of space if one has gone mostly dead.

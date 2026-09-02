@@ -128,10 +128,30 @@ pub enum Kind {
     Stream = 5,
     /// A sparse array.
     Array = 6,
+    /// A body this crate does not know the type of.
+    ///
+    /// The last of the eight patterns the tag can hold, and it is spent on an
+    /// escape rather than on one more type. Everything below this crate is a
+    /// primitive that the document, vector and graph engines are built out of,
+    /// so those engines sit above it and cannot be named here without a cycle,
+    /// and there are three of them and one pattern. An escape holds all three,
+    /// and the body says what it is when asked.
+    ///
+    /// It is the one kind with no `yo_format::catalog::ValueType` beside it,
+    /// because this version's writer does not save a foreign body and there is
+    /// nothing on disk for the catalog to name. When one of them becomes
+    /// saveable it gets its own number there, which does not have to be this
+    /// one, since nothing in a file has to agree with a tag that only ever
+    /// exists in memory.
+    Foreign = 7,
 }
 
 impl Kind {
     /// The word `TYPE` replies with.
+    ///
+    /// A foreign body knows its own word and this does not, so the answer here
+    /// is the one a caller sees when it has a kind and no body. Go through
+    /// [`crate::Keyspace::type_name`] to get what the client should be told.
     #[inline]
     pub const fn name(self) -> &'static str {
         match self {
@@ -142,15 +162,24 @@ impl Kind {
             Kind::List => "list",
             Kind::Stream => "stream",
             Kind::Array => "array",
+            Kind::Foreign => "foreign",
         }
+    }
+
+    /// Whether the body lives in a slab rather than in the record.
+    ///
+    /// Everything but a string, which is its own record. The arms that walk a
+    /// slot ask this rather than listing six kinds, so a new body kind is one
+    /// arm here and not six lists to find.
+    #[inline]
+    pub const fn is_body(self) -> bool {
+        !matches!(self, Kind::String)
     }
 
     /// The kind for a three bit tag.
     ///
-    /// Seven of the eight patterns are spoken for. The last one cannot come out
-    /// of our own writer, and it falls to `String` for the same reason an
-    /// unknown encoding falls to `raw`: it is the reading that hands the bytes
-    /// back rather than the one that reinterprets them.
+    /// All eight patterns are spoken for now, and zero is `String`, so this is
+    /// total and no longer has a fallback to explain.
     #[inline]
     const fn from_bits(bits: u8) -> Kind {
         match bits {
@@ -160,6 +189,7 @@ impl Kind {
             KIND_LIST => Kind::List,
             KIND_STREAM => Kind::Stream,
             KIND_ARRAY => Kind::Array,
+            KIND_FOREIGN => Kind::Foreign,
             _ => Kind::String,
         }
     }
@@ -197,6 +227,7 @@ const KIND_ZSET: u8 = 3;
 const KIND_LIST: u8 = 4;
 const KIND_STREAM: u8 = 5;
 const KIND_ARRAY: u8 = 6;
+const KIND_FOREIGN: u8 = 7;
 
 /// Bytes of integer payload, which is a whole `i64` and never its digits.
 const INT_LEN: usize = 8;
@@ -658,7 +689,20 @@ mod tests {
         assert_eq!(Encoding::of(&[b'x'; EMBSTR_MAX + 1]), Encoding::Raw);
     }
 
-    const KINDS: [Kind; 7] = [
+    const KINDS: [Kind; 8] = [
+        Kind::String,
+        Kind::Hash,
+        Kind::Set,
+        Kind::Zset,
+        Kind::List,
+        Kind::Stream,
+        Kind::Array,
+        Kind::Foreign,
+    ];
+
+    /// The seven that a saved file has a number for, which is every kind but
+    /// the escape.
+    const SAVED: [Kind; 7] = [
         Kind::String,
         Kind::Hash,
         Kind::Set,
@@ -728,8 +772,13 @@ mod tests {
         assert_eq!(Kind::List as u8, ValueType::List as u8);
         assert_eq!(Kind::Stream as u8, ValueType::Stream as u8);
         assert_eq!(Kind::Array as u8, ValueType::Array as u8);
+        // `Kind::Foreign` is deliberately not in this list. It is the escape
+        // for a body that lives above this crate, nothing saves one yet, and so
+        // there is no number on disk for it to have to match. Its tag is 7 and
+        // the catalog's 7 is a bitmap, which is a string in memory and never
+        // becomes a `Kind`, so the two cannot meet.
         // And the words agree, because both of them end up on a wire.
-        for k in KINDS {
+        for k in SAVED {
             let v = ValueType::from_u8(k as u8).expect("the catalog knows this one");
             assert_eq!(k.name(), v.redis_name(), "{k:?}");
         }
@@ -830,11 +879,13 @@ mod tests {
     }
 
     #[test]
-    fn an_unknown_type_tag_reads_as_a_string() {
-        // Six of eight patterns are used, and the other two answer String for
-        // the same reason: handing the bytes back is the harmless reading.
+    fn every_tag_pattern_is_spoken_for() {
+        // All eight of them now, the last one being the escape a body this
+        // crate cannot name is held under. There is no pattern left over to
+        // read as a string, so the day a ninth kind is wanted the tag has to
+        // grow a bit rather than borrow one.
         assert_eq!(Meta::from_byte(6 << 3).kind(), Kind::Array);
-        assert_eq!(Meta::from_byte(7 << 3).kind(), Kind::String);
+        assert_eq!(Meta::from_byte(7 << 3).kind(), Kind::Foreign);
     }
 
     #[test]

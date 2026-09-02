@@ -308,6 +308,12 @@ fn unseal(payload: &[u8]) -> Result<&[u8], Bad> {
 pub(crate) fn dump(rec: &Record) -> Option<Vec<u8>> {
     let mut out = Vec::new();
     match rec.body() {
+        // The same `None` a sparse array gets, and for a stronger reason: a
+        // foreign body is an engine that lives above this crate and there is no
+        // byte shape for it here to write even in principle. `DUMP` on a graph
+        // is refused by the dispatch before it reaches this, so nothing sees
+        // the null bulk this would otherwise produce.
+        Body::Foreign(_) => return None,
         Body::String(bytes) => {
             out.push(T_STRING);
             put_str(&mut out, bytes);
