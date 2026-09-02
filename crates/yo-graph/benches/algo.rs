@@ -18,6 +18,12 @@
 //!   - `algo/triangle count` compares the degree ordering against numbering the
 //!     nodes in the order they already had. Same count, and the gap is the
 //!     Ortmann and Brandes point about the ordering being the algorithm.
+//!   - `algo/sssp` compares delta stepping against Dijkstra with a binary heap
+//!     over the same weights from the same source. Same distances, and the gap
+//!     is what settling a band at a time buys over settling one node at a time.
+//!   - `algo/scc` is Tarjan on its own, because there is no slower obvious form
+//!     worth timing against it. The row is there to say what strong components
+//!     cost next to the weak ones two rows above.
 //!
 //! # The graph
 //!
@@ -33,33 +39,41 @@
 //! edges and 6665423 triangles. On the big one a single count is seven seconds,
 //! which is a real number and not one worth paying twenty times on every run.
 //!
+//! The shortest path rows want weights, and they get the GAP suite's: uniform
+//! integers from 1 to 255, drawn from a fixed seed so both rows see the same
+//! graph. Weights that all match would make delta stepping into breadth first
+//! search and would prove nothing about either row.
+//!
 //! # Where it stands
 //!
 //! One core each, minimum per iteration, on an Apple M4 and on an i9-13900K.
 //!
 //! | Row | M4 | 13900K | Rate on the M4 |
 //! |---|---|---|---|
-//! | `snapshot` | 29.58 ms | 41.01 ms | 7.1 ns an edge |
-//! | `bfs/direction optimizing` | 1.89 ms | 2.02 ms | 2.21 billion edges a second |
-//! | `bfs/top down` | 6.30 ms | 5.87 ms | 0.67 billion edges a second |
-//! | `wcc/afforest` | 3.37 ms | 3.55 ms | 1.25 billion edges a second |
-//! | `wcc/union find` | 11.28 ms | 21.29 ms | 0.37 billion edges a second |
-//! | `pagerank/pull 10 rounds` | 35.42 ms | not run yet | 1.18 billion edges a second a round |
-//! | `pagerank/push 10 rounds` | 37.11 ms | not run yet | 1.13 billion edges a second a round |
-//! | `triangle count/degree ordered` | 106.9 ms | not run yet | 62.4 million triangles a second |
-//! | `triangle count/unordered` | 277.6 ms | not run yet | 24.0 million triangles a second |
+//! | `snapshot` | 29.58 ms | 33.55 ms | 7.1 ns an edge |
+//! | `bfs/direction optimizing` | 1.89 ms | 2.14 ms | 2.21 billion edges a second |
+//! | `bfs/top down` | 6.30 ms | 6.45 ms | 0.67 billion edges a second |
+//! | `wcc/afforest` | 3.37 ms | 3.79 ms | 1.25 billion edges a second |
+//! | `wcc/union find` | 11.28 ms | 22.16 ms | 0.37 billion edges a second |
+//! | `pagerank/pull 10 rounds` | 35.42 ms | 33.65 ms | 1.18 billion edges a second a round |
+//! | `pagerank/push 10 rounds` | 37.11 ms | 46.13 ms | 1.13 billion edges a second a round |
+//! | `triangle count/degree ordered` | 106.9 ms | 114.9 ms | 62.4 million triangles a second |
+//! | `triangle count/unordered` | 277.6 ms | 288.8 ms | 24.0 million triangles a second |
 //!
 //! The direction switch is worth 3.33x, the two neighbour sample is worth 3.35x
-//! and the degree ordering is worth 2.60x, all on a single core with no threads
-//! anywhere in any of them. The rates count every edge in the graph rather than
-//! only the ones the algorithm looked at, which is the honest way round: an
-//! algorithm that skips edges is supposed to get the credit for skipping them.
+//! and the degree ordering is worth 2.60x on the M4, and 3.01x, 5.85x and 2.51x
+//! on the 13900K, all on a single core with no threads anywhere in any of them.
+//! The rates count every edge in the graph rather than only the ones the
+//! algorithm looked at, which is the honest way round: an algorithm that skips
+//! edges is supposed to get the credit for skipping them.
 //!
-//! Pulling beats pushing by 5 percent here and that is smaller than it looks,
-//! because at 262 thousand nodes the score array is a megabyte and stays in
-//! cache, so a random write into it costs about what a random read does. The
-//! gap is the reason to prefer the pull form rather than the size of the prize,
-//! and it grows with the graph.
+//! Pulling beats pushing by 5 percent on the M4 and by 37 percent on the
+//! 13900K, which is worth a sentence because it is the same code. At 262
+//! thousand nodes the score array is a megabyte, so on a machine where a random
+//! write into it is about as cheap as a random read there is almost nothing in
+//! it, and on a machine where the store queue is what runs out there is a lot.
+//! Pull is the form to write either way, since it is never the slower one and it
+//! is the one that stays correct when somebody adds threads.
 //!
 //! Taking the snapshot costs about as much as five breadth first searches, and
 //! it is worth saying plainly that a caller who wants one search over a graph
@@ -74,10 +88,11 @@
 //! `target/criterion/<group>/<id>/new/sample.json`.
 
 use criterion::{Criterion, criterion_group, criterion_main};
+use std::collections::BinaryHeap;
 use std::hint::black_box;
 use yo_common::Rng;
 use yo_graph::algo::pagerank::DAMPING;
-use yo_graph::algo::{UNREACHED, bfs, pagerank_with, triangle_count, wcc};
+use yo_graph::algo::{UNREACHABLE, UNREACHED, bfs, pagerank_with, scc, sssp, triangle_count, wcc};
 use yo_graph::{Graph, NO_PROPS, Snapshot};
 
 const LABEL: u32 = 1;
@@ -85,6 +100,9 @@ const SCALE: u32 = 18;
 const DEGREE: u32 = 16;
 const SMALL: u32 = 15;
 const ROUNDS: u32 = 10;
+
+/// The heaviest edge, which is what the GAP suite uses.
+const HEAVIEST: u32 = 255;
 
 /// R-MAT with the Graph500 probabilities.
 fn rmat(scale: u32, degree: u32, seed: u64) -> Vec<(u64, u64)> {
@@ -259,6 +277,28 @@ fn triangles_unordered(g: &Snapshot) -> u64 {
     found
 }
 
+/// Dijkstra with a binary heap, as the thing delta stepping has to beat.
+fn dijkstra(g: &Snapshot, weights: &[u32], src: u32) -> Vec<u64> {
+    let mut far = vec![UNREACHABLE; g.nodes() as usize];
+    let mut todo = BinaryHeap::new();
+    far[src as usize] = 0;
+    todo.push((std::cmp::Reverse(0u64), src));
+    while let Some((std::cmp::Reverse(at), node)) = todo.pop() {
+        if at > far[node as usize] {
+            continue;
+        }
+        let from = g.out_at(node);
+        for (i, to) in g.out(node).iter().enumerate() {
+            let now = at + u64::from(weights[from + i]);
+            if now < far[*to as usize] {
+                far[*to as usize] = now;
+                todo.push((std::cmp::Reverse(now), *to));
+            }
+        }
+    }
+    far
+}
+
 fn bench_algo(c: &mut Criterion) {
     let g = build(SCALE, DEGREE);
     let s = Snapshot::of(&g);
@@ -278,6 +318,17 @@ fn bench_algo(c: &mut Criterion) {
         .map(|(a, b)| (a - b).abs())
         .fold(0f32, f32::max);
     assert!(apart < 1e-5, "the same rounds, {apart} apart");
+    // GAP's weights: uniform from 1 to 255, off a fixed seed so both shortest
+    // path rows walk the same graph.
+    let mut rng = Rng::new(0x5a17);
+    let weights: Vec<u32> = (0..s.edges())
+        .map(|_| 1 + (rng.next_u64() % u64::from(HEAVIEST)) as u32)
+        .collect();
+    assert_eq!(
+        sssp(&s, &weights, src),
+        dijkstra(&s, &weights, src),
+        "the same distances"
+    );
     // Counting triangles is superlinear in the edge count, so it gets its own
     // smaller graph. On the big one a single count is seven seconds, which is a
     // real number and not one worth paying twenty times over on every run.
@@ -319,6 +370,15 @@ fn bench_algo(c: &mut Criterion) {
     });
     group.bench_function("pagerank/push 10 rounds", |b| {
         b.iter(|| black_box(push(black_box(&s), ROUNDS)));
+    });
+    group.bench_function("sssp/delta stepping", |b| {
+        b.iter(|| black_box(sssp(black_box(&s), black_box(&weights), src)));
+    });
+    group.bench_function("sssp/dijkstra", |b| {
+        b.iter(|| black_box(dijkstra(black_box(&s), black_box(&weights), src)));
+    });
+    group.bench_function("scc/tarjan", |b| {
+        b.iter(|| black_box(scc(black_box(&s))));
     });
     group.bench_function("triangle count/degree ordered", |b| {
         b.iter(|| black_box(triangle_count(black_box(&small))));

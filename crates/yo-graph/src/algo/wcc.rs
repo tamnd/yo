@@ -53,6 +53,7 @@
 use yo_common::Rng;
 
 use crate::Snapshot;
+use crate::algo::Components;
 
 /// How many neighbours of each node the sampling pass links.
 ///
@@ -72,74 +73,6 @@ const SAMPLE: usize = 1024;
 /// Fixed, so that two runs over the same snapshot do the same work and give the
 /// same representative for every component. See the module docs on [`super`].
 const SEED: u64 = 0x00c0_ffee;
-
-/// Which component each node is in.
-#[derive(Debug, Clone)]
-pub struct Components {
-    /// The representative of each node's component, which is the smallest dense
-    /// id in it.
-    of: Vec<u32>,
-    count: u32,
-}
-
-impl Components {
-    /// The component `node` is in, named by the lowest numbered node in it.
-    ///
-    /// # Panics
-    ///
-    /// If `node` is not a node of the snapshot this was computed from.
-    #[must_use]
-    pub fn of(&self, node: u32) -> u32 {
-        self.of[node as usize]
-    }
-
-    /// Whether two nodes are in the same component.
-    #[must_use]
-    pub fn same(&self, a: u32, b: u32) -> bool {
-        self.of(a) == self.of(b)
-    }
-
-    /// How many components there are, counting an isolated node as its own.
-    #[must_use]
-    pub fn count(&self) -> u32 {
-        self.count
-    }
-
-    /// How many nodes were labelled.
-    #[must_use]
-    pub fn len(&self) -> u32 {
-        self.of.len() as u32
-    }
-
-    /// Whether there were no nodes at all.
-    #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.of.is_empty()
-    }
-
-    /// The component with the most nodes in it, and how many that is.
-    ///
-    /// `None` for a graph with no nodes. The lowest numbered of them when two
-    /// are the same size, so the answer does not depend on iteration order.
-    #[must_use]
-    pub fn largest(&self) -> Option<(u32, u32)> {
-        let mut size = vec![0u32; self.of.len()];
-        for c in &self.of {
-            size[*c as usize] += 1;
-        }
-        size.iter()
-            .enumerate()
-            .filter(|(_, n)| **n > 0)
-            .max_by_key(|(at, n)| (**n, std::cmp::Reverse(*at)))
-            .map(|(at, n)| (at as u32, *n))
-    }
-
-    /// The label of every node, in dense id order.
-    #[must_use]
-    pub fn labels(&self) -> &[u32] {
-        &self.of
-    }
-}
 
 /// The weakly connected components of `g`.
 #[must_use]
