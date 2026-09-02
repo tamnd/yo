@@ -24,5 +24,9 @@ criterion = { workspace = true }
 name = "rabitq"
 harness = false
 
+[[bench]]
+name = "partition"
+harness = false
+
 [lints]
 workspace = true

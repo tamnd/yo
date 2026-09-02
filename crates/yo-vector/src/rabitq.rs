@@ -215,6 +215,24 @@ impl Quantizer {
         words_of(self.dim()) * 8 * self.bits.count()
     }
 
+    /// A vector in the frame everything else here works in.
+    ///
+    /// The rotation is linear, so `rotate(v - c)` is `rotate(v) - rotate(c)`,
+    /// and an index that keeps its centroids already rotated never has to
+    /// rotate one again. That is what [`Quantizer::encode_rotated`] and
+    /// [`Quantizer::query_rotated`] are for, and the rotation is the expensive
+    /// half of both of the two calls above them.
+    ///
+    /// # Panics
+    ///
+    /// If `v` is not [`Quantizer::dim`] long.
+    #[must_use]
+    pub fn rotate(&self, v: &[f32]) -> Vec<f32> {
+        let mut x = v.to_vec();
+        self.rot.apply(&mut x);
+        x
+    }
+
     /// Write `v`'s code against the centroid of the partition it is going into.
     ///
     /// # Panics
@@ -222,6 +240,36 @@ impl Quantizer {
     /// If `v` or `centroid` is not [`Quantizer::dim`] long, or `code` is not
     /// [`Quantizer::code_bytes`] long.
     pub fn encode(&self, v: &[f32], centroid: &[f32], code: &mut [u8]) -> Coded {
+        let mut x = self.residual(v, centroid);
+        let norm = length(&x);
+        if norm > 0.0 {
+            for c in &mut x {
+                *c /= norm;
+            }
+        }
+        self.rot.apply(&mut x);
+        self.write(&x, norm, code)
+    }
+
+    /// The same as [`Quantizer::encode`] with both sides already rotated.
+    ///
+    /// # Panics
+    ///
+    /// If `x` or `centroid` is not [`Quantizer::dim`] long, or `code` is not
+    /// [`Quantizer::code_bytes`] long.
+    pub fn encode_rotated(&self, x: &[f32], centroid: &[f32], code: &mut [u8]) -> Coded {
+        let mut r = self.residual(x, centroid);
+        let norm = length(&r);
+        if norm > 0.0 {
+            for c in &mut r {
+                *c /= norm;
+            }
+        }
+        self.write(&r, norm, code)
+    }
+
+    /// The code of a rotated unit residual whose original length was `norm`.
+    fn write(&self, x: &[f32], norm: f32, code: &mut [u8]) -> Coded {
         assert_eq!(
             code.len(),
             self.code_bytes(),
@@ -229,8 +277,6 @@ impl Quantizer {
             self.code_bytes(),
             code.len()
         );
-        let mut x = self.residual(v, centroid);
-        let norm = length(&x);
         code.fill(0);
         if norm == 0.0 {
             // The vector is the centroid. There is no direction to write down,
@@ -243,13 +289,9 @@ impl Quantizer {
                 delta: 0.0,
             };
         }
-        for c in &mut x {
-            *c /= norm;
-        }
-        self.rot.apply(&mut x);
         let mut coded = match self.bits {
-            Bits::One => sign_code(&x, code),
-            Bits::Four => level_code(&x, code),
+            Bits::One => sign_code(x, code),
+            Bits::Four => level_code(x, code),
         };
         coded.norm = norm;
         coded
@@ -273,6 +315,33 @@ impl Quantizer {
             }
         }
         self.rot.apply(&mut x);
+        self.prepare(x, norm)
+    }
+
+    /// The same as [`Quantizer::query`] with both sides already rotated.
+    ///
+    /// A search rotates its query once and then meets every partition it probes
+    /// through this, so the rotation is paid for once rather than once per
+    /// partition.
+    ///
+    /// # Panics
+    ///
+    /// If `q` or `centroid` is not [`Quantizer::dim`] long.
+    #[must_use]
+    pub fn query_rotated(&self, q: &[f32], centroid: &[f32]) -> Query {
+        let mut x = self.residual(q, centroid);
+        let norm = length(&x);
+        if norm > 0.0 {
+            for c in &mut x {
+                *c /= norm;
+            }
+        }
+        self.prepare(x, norm)
+    }
+
+    /// Quantise and transpose a rotated unit residual into the form the scan
+    /// meets a code with.
+    fn prepare(&self, x: Vec<f32>, norm: f32) -> Query {
         // The sum is taken from the unquantised coordinates because it is one
         // number computed once, so there is nothing to gain by approximating
         // it and it is half of what the estimator adds up.
