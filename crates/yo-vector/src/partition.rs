@@ -95,9 +95,11 @@
 //! A `.yo` file. None of this is written down yet, and the format freezes at the
 //! end of M6, so that is the next thing.
 //!
-//! Recall on SIFT1M with the coarse layer in place, against the same run without
-//! it. The layer only places new vectors, so a miss costs recall rather than
-//! stability, and how much recall is a measurement rather than an argument.
+//! A search that fits in a millisecond. SIFT1M on a 13900K gets recall 0.9598 at
+//! probe 64 rerank 16, which clears the gate, with p50 at 1.1 ms and p99 at 1.5
+//! ms, which does not. `examples/search.rs` is the breakdown of where that time
+//! goes and the answer is that two thirds of it is the estimator meeting one
+//! code at a time.
 //!
 //! The commands that put all of this on the wire are the rest of M6.
 
