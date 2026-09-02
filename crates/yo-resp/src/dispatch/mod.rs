@@ -5457,6 +5457,37 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_sketch_survives_a_dump_and_a_restore_in_both_encodings() {
+        let mut f = Fixture::new();
+        // One that stays sparse and one that has gone dense, since the payload
+        // carries the bytes and the two encodings are different lengths.
+        f.run(&[b"PFADD", b"small", b"a", b"b", b"c"]);
+        for i in 0..10_000u32 {
+            let ele = format!("e{i}");
+            f.run(&[b"PFADD", b"big", ele.as_bytes()]);
+        }
+        assert_eq!(f.run(&[b"PFDEBUG", b"ENCODING", b"small"]), "+sparse\r\n");
+        assert_eq!(f.run(&[b"PFDEBUG", b"ENCODING", b"big"]), "+dense\r\n");
+
+        for key in [&b"small"[..], b"big"] {
+            let mut copy = key.to_vec();
+            copy.push(b'2');
+            let bytes = payload(&f.raw(&[b"DUMP", key]));
+            assert_eq!(f.run(&[b"RESTORE", &copy, b"0", &bytes]), "+OK\r\n");
+            // The bytes, the encoding and the estimate all come back, which is
+            // the whole of what byte compatibility across a round trip means.
+            assert_eq!(f.raw(&[b"GET", &copy]), f.raw(&[b"GET", key]));
+            assert_eq!(
+                f.run(&[b"PFDEBUG", b"ENCODING", &copy]),
+                f.run(&[b"PFDEBUG", b"ENCODING", key])
+            );
+            assert_eq!(f.run(&[b"PFCOUNT", &copy]), f.run(&[b"PFCOUNT", key]));
+        }
+        assert_eq!(f.run(&[b"PFCOUNT", b"small2"]), ":3\r\n");
+        assert_eq!(f.run(&[b"STRLEN", b"big2"]), ":12304\r\n");
+    }
+
     /// A RESP2 array of bulk strings, which is what most of the list replies
     /// are and what writing them out by hand in every assertion looks like.
     fn bulks(parts: &[&str]) -> String {
