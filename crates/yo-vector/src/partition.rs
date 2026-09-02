@@ -370,6 +370,22 @@ impl Partitions {
         self.tuning
     }
 
+    /// Change the knobs on a collection that already has vectors in it.
+    ///
+    /// [`Tuning::probe`], [`Tuning::rerank`] and [`Tuning::widen`] are read by
+    /// each search, so they take effect on the next one. That is what makes a
+    /// recall against latency curve measurable on one built index rather than on
+    /// one built per row, and it is what `EF_RUNTIME` means to a client that
+    /// thinks it is talking to a graph.
+    ///
+    /// [`Tuning::posting`] and [`Tuning::sweep`] are what maintenance aims at,
+    /// so lowering `posting` does not split anything by itself. The partitions
+    /// move towards the new size as [`Partitions::maintain`] gets called, which
+    /// is the same way they got to the old one.
+    pub fn retune(&mut self, tuning: Tuning) {
+        self.tuning = tuning;
+    }
+
     /// The quantiser, whose seed and width a catalogue entry has to record.
     #[must_use]
     pub fn quantizer(&self) -> &Quantizer {
