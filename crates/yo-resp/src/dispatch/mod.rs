@@ -56,6 +56,7 @@ mod arrays;
 mod bits;
 mod blocking;
 mod cpu;
+mod geo;
 mod graph;
 mod hashes;
 mod hll;
@@ -835,8 +836,8 @@ pub fn resolved(
     // `COPY`, `SWAPDB` and `FLUSHALL` reach a database nobody selected, so the
     // two groups that hold them mark all of them rather than the session's.
     server.dirty |= match spec.group {
-        "string" | "bitmap" | "hyperloglog" | "set" | "hash" | "list" | "zset" | "array"
-        | "stream" => 1u64 << session.db,
+        "string" | "bitmap" | "hyperloglog" | "geo" | "set" | "hash" | "list" | "zset"
+        | "array" | "stream" => 1u64 << session.db,
         _ => ALL_DATABASES,
     };
 
@@ -883,6 +884,13 @@ pub fn resolved(
             "zset" => {
                 let db = session.db;
                 zsets::execute(&mut server.dbs[db], spec, args, out).map(|()| Flow::Continue)
+            }
+            // A geo key is a sorted set and these are sorted set commands with
+            // arithmetic on the way in and on the way out, so a client can ZREM
+            // a place out of one and ZCARD it to count them.
+            "geo" => {
+                let db = session.db;
+                geo::execute(&mut server.dbs[db], spec, args, out).map(|()| Flow::Continue)
             }
             "array" => {
                 let db = session.db;
@@ -7095,6 +7103,742 @@ mod tests {
             f.server.memory_bytes() <= after_first * 2,
             "held {} after two hundred passes against {after_first} after one",
             f.server.memory_bytes()
+        );
+    }
+
+    // ------------------------------------------------------------------- geo
+
+    /// The three places every Redis geo example uses, and one more.
+    ///
+    /// Every reply this section asserts on came off a running 8.10.1 with these
+    /// three loaded, byte for byte, including the number of digits in a
+    /// coordinate and the four places on a distance.
+    fn sicily(f: &mut Fixture) {
+        f.run(&[
+            b"GEOADD",
+            b"Sicily",
+            b"13.361389",
+            b"38.115556",
+            b"Palermo",
+            b"15.087269",
+            b"37.502669",
+            b"Catania",
+        ]);
+        f.run(&[
+            b"GEOADD",
+            b"Sicily",
+            b"13.583333",
+            b"37.316667",
+            b"Agrigento",
+        ]);
+    }
+
+    #[test]
+    fn places_go_in_as_scores_and_come_back_as_positions() {
+        let mut f = Fixture::new();
+        assert_eq!(
+            f.run(&[
+                b"GEOADD",
+                b"Sicily",
+                b"13.361389",
+                b"38.115556",
+                b"Palermo",
+                b"15.087269",
+                b"37.502669",
+                b"Catania"
+            ]),
+            ":2\r\n"
+        );
+        // A geo key is a sorted set and says so, which is not an implementation
+        // detail either: a client removes a place with ZREM and counts them
+        // with ZCARD, and the score is the number a real server stores.
+        assert_eq!(f.run(&[b"TYPE", b"Sicily"]), "+zset\r\n");
+        assert_eq!(
+            f.run(&[b"ZSCORE", b"Sicily", b"Palermo"]),
+            "$16\r\n3479099956230698\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"GEOPOS", b"Sicily", b"Palermo", b"NonExisting"]),
+            "*2\r\n*2\r\n$18\r\n13.361389338970184\r\n$16\r\n38.1155563954963\r\n*-1\r\n"
+        );
+        assert_eq!(
+            f.run(&[
+                b"GEOHASH",
+                b"Sicily",
+                b"Palermo",
+                b"Catania",
+                b"NonExisting"
+            ]),
+            "*3\r\n$11\r\nsqc8b49rny0\r\n$11\r\nsqdtr74hyu0\r\n$-1\r\n"
+        );
+        // A key that is not there is an empty one, and the two nulls are not
+        // the same null: GEOPOS answers the array one and GEOHASH the string
+        // one, which a RESP2 client can tell apart.
+        assert_eq!(f.run(&[b"GEOPOS", b"nokey", b"a"]), "*1\r\n*-1\r\n");
+        assert_eq!(f.run(&[b"GEOHASH", b"nokey", b"a"]), "*1\r\n$-1\r\n");
+    }
+
+    #[test]
+    fn a_distance_comes_back_with_four_places_in_whatever_unit_was_asked_for() {
+        let mut f = Fixture::new();
+        sicily(&mut f);
+        assert_eq!(
+            f.run(&[b"GEODIST", b"Sicily", b"Palermo", b"Catania"]),
+            "$11\r\n166274.1516\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"GEODIST", b"Sicily", b"Palermo", b"Catania", b"km"]),
+            "$8\r\n166.2742\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"GEODIST", b"Sicily", b"Palermo", b"Catania", b"mi"]),
+            "$8\r\n103.3182\r\n"
+        );
+        // A member that is not there and a key that is not there are the same
+        // nil, and the unit is read before the key is looked up, so a bad unit
+        // on a missing key is still an error.
+        assert_eq!(
+            f.run(&[b"GEODIST", b"Sicily", b"Palermo", b"Foo"]),
+            "$-1\r\n"
+        );
+        assert_eq!(f.run(&[b"GEODIST", b"nokey", b"a", b"b"]), "$-1\r\n");
+        assert_eq!(
+            f.run(&[b"GEODIST", b"nokey", b"a", b"b", b"parsecs"]),
+            "-ERR unsupported unit provided. please use M, KM, FT, MI\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"GEODIST", b"Sicily", b"a", b"b", b"km", b"extra"]),
+            "-ERR syntax error\r\n"
+        );
+    }
+
+    #[test]
+    fn a_search_finds_what_is_inside_it_nearest_first() {
+        let mut f = Fixture::new();
+        sicily(&mut f);
+        let all = "*3\r\n$7\r\nCatania\r\n$9\r\nAgrigento\r\n$7\r\nPalermo\r\n";
+        assert_eq!(
+            f.run(&[
+                b"GEOSEARCH",
+                b"Sicily",
+                b"FROMLONLAT",
+                b"15",
+                b"37",
+                b"BYRADIUS",
+                b"200",
+                b"km",
+                b"ASC"
+            ]),
+            all
+        );
+        // The older spelling of the same search, which is the same nine boxes
+        // and the same order.
+        assert_eq!(
+            f.run(&[b"GEORADIUS", b"Sicily", b"15", b"37", b"200", b"km", b"ASC"]),
+            all
+        );
+        assert_eq!(
+            f.run(&[
+                b"GEORADIUS_RO",
+                b"Sicily",
+                b"15",
+                b"37",
+                b"200",
+                b"km",
+                b"ASC"
+            ]),
+            all
+        );
+        // A count with no ordering means the nearest ones, so DESC has to be
+        // asked for to get the far end.
+        assert_eq!(
+            f.run(&[
+                b"GEORADIUS",
+                b"Sicily",
+                b"15",
+                b"37",
+                b"200",
+                b"km",
+                b"DESC",
+                b"COUNT",
+                b"1"
+            ]),
+            "*1\r\n$7\r\nPalermo\r\n"
+        );
+        assert_eq!(
+            f.run(&[
+                b"GEORADIUS",
+                b"Sicily",
+                b"15",
+                b"37",
+                b"200",
+                b"km",
+                b"COUNT",
+                b"1"
+            ]),
+            "*1\r\n$7\r\nCatania\r\n"
+        );
+        // Nothing inside a kilometre of that point, and nothing in a key that
+        // is not there, and both are the empty array rather than an error.
+        let empty = "*0\r\n";
+        assert_eq!(
+            f.run(&[
+                b"GEOSEARCH",
+                b"Sicily",
+                b"FROMLONLAT",
+                b"15",
+                b"37",
+                b"BYRADIUS",
+                b"1",
+                b"km"
+            ]),
+            empty
+        );
+        assert_eq!(
+            f.run(&[
+                b"GEOSEARCH",
+                b"nokey",
+                b"FROMLONLAT",
+                b"15",
+                b"37",
+                b"BYRADIUS",
+                b"1",
+                b"km"
+            ]),
+            empty
+        );
+        assert_eq!(
+            f.run(&[b"GEORADIUSBYMEMBER", b"nokey", b"m", b"1", b"km"]),
+            empty
+        );
+    }
+
+    #[test]
+    fn a_search_centred_on_a_member_starts_from_where_that_member_is() {
+        let mut f = Fixture::new();
+        sicily(&mut f);
+        assert_eq!(
+            f.run(&[b"GEORADIUSBYMEMBER", b"Sicily", b"Agrigento", b"100", b"km"]),
+            "*2\r\n$9\r\nAgrigento\r\n$7\r\nPalermo\r\n"
+        );
+        // The member itself is nothing away from itself, which is where the
+        // fixed point writer's zero shows up on the wire.
+        let with_dist = "*2\r\n*2\r\n$9\r\nAgrigento\r\n$6\r\n0.0000\r\n*2\r\n$7\r\nPalermo\r\n$7\r\n90.9778\r\n";
+        assert_eq!(
+            f.run(&[
+                b"GEORADIUSBYMEMBER_RO",
+                b"Sicily",
+                b"Agrigento",
+                b"100",
+                b"km",
+                b"WITHDIST"
+            ]),
+            with_dist
+        );
+        assert_eq!(
+            f.run(&[
+                b"GEOSEARCH",
+                b"Sicily",
+                b"FROMMEMBER",
+                b"Agrigento",
+                b"BYRADIUS",
+                b"100",
+                b"km",
+                b"ASC",
+                b"WITHDIST"
+            ]),
+            with_dist
+        );
+        assert_eq!(
+            f.run(&[b"GEORADIUSBYMEMBER", b"Sicily", b"Nowhere", b"100", b"km"]),
+            "-ERR could not decode requested zset member\r\n"
+        );
+    }
+
+    #[test]
+    fn a_box_search_reports_the_distance_the_hash_and_the_coordinates() {
+        let mut f = Fixture::new();
+        sicily(&mut f);
+        // Three options asked for, so each result is a four element array of
+        // the member, the distance, the hash and a pair. The order of the three
+        // is Redis's and not the order they were written in the command.
+        assert_eq!(
+            f.run(&[
+                b"GEOSEARCH",
+                b"Sicily",
+                b"FROMLONLAT",
+                b"15",
+                b"37",
+                b"BYBOX",
+                b"400",
+                b"400",
+                b"km",
+                b"ASC",
+                b"WITHCOORD",
+                b"WITHDIST",
+                b"WITHHASH"
+            ]),
+            "*3\r\n*4\r\n$7\r\nCatania\r\n$7\r\n56.4413\r\n:3479447370796909\r\n*2\r\n\
+             $18\r\n15.087267458438873\r\n$17\r\n37.50266842333162\r\n\
+             *4\r\n$9\r\nAgrigento\r\n$8\r\n130.4235\r\n:3479030013248308\r\n*2\r\n\
+             $18\r\n13.583331406116486\r\n$18\r\n37.316668049938166\r\n\
+             *4\r\n$7\r\nPalermo\r\n$8\r\n190.4424\r\n:3479099956230698\r\n*2\r\n\
+             $18\r\n13.361389338970184\r\n$16\r\n38.1155563954963\r\n"
+        );
+    }
+
+    #[test]
+    fn a_store_writes_the_hashes_and_a_storedist_writes_the_distances() {
+        let mut f = Fixture::new();
+        sicily(&mut f);
+        let hashes = "*6\r\n$9\r\nAgrigento\r\n$16\r\n3479030013248308\r\n\
+                      $7\r\nPalermo\r\n$16\r\n3479099956230698\r\n\
+                      $7\r\nCatania\r\n$16\r\n3479447370796909\r\n";
+        assert_eq!(
+            f.run(&[
+                b"GEOSEARCHSTORE",
+                b"dst",
+                b"Sicily",
+                b"FROMLONLAT",
+                b"15",
+                b"37",
+                b"BYRADIUS",
+                b"200",
+                b"km",
+                b"ASC"
+            ]),
+            ":3\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"ZRANGE", b"dst", b"0", b"-1", b"WITHSCORES"]),
+            hashes
+        );
+        // The same again through the older spelling, which stores the same
+        // scores, so a key written by either is a geo key.
+        assert_eq!(
+            f.run(&[
+                b"GEORADIUS",
+                b"Sicily",
+                b"15",
+                b"37",
+                b"200",
+                b"km",
+                b"STORE",
+                b"dst3"
+            ]),
+            ":3\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"ZRANGE", b"dst3", b"0", b"-1", b"WITHSCORES"]),
+            hashes
+        );
+        // STOREDIST stores the distance in the search unit instead, and those
+        // are full doubles rather than the four places WITHDIST writes. The
+        // numbers on the right are what 8.10.1 stored for this search, and they
+        // are compared with a tolerance rather than byte for byte because the
+        // last bit of a haversine is the platform's sin, cos and asin: this
+        // machine and that one disagree in the sixteenth digit, and so do two
+        // Redis builds. Everything a client actually reads back is four places
+        // and is asserted exactly above.
+        assert_eq!(
+            f.run(&[
+                b"GEOSEARCHSTORE",
+                b"dst2",
+                b"Sicily",
+                b"FROMLONLAT",
+                b"15",
+                b"37",
+                b"BYRADIUS",
+                b"200",
+                b"km",
+                b"ASC",
+                b"STOREDIST"
+            ]),
+            ":3\r\n"
+        );
+        for (member, want) in [
+            ("Catania", 56.441_257_870_158_19),
+            ("Agrigento", 130.423_487_067_147_14),
+            ("Palermo", 190.442_429_847_757_92),
+        ] {
+            let reply = f.run(&[b"ZSCORE", b"dst2", member.as_bytes()]);
+            let got: f64 = reply
+                .trim_start_matches(|c: char| c != '\n')
+                .trim()
+                .parse()
+                .unwrap_or_else(|_| panic!("{member} scored {reply:?}"));
+            assert!(
+                (got - want).abs() < 1e-9,
+                "{member} scored {got} not {want}"
+            );
+        }
+        // The order they went in is the order the scores put them in, which is
+        // the point of storing the distance rather than the hash.
+        assert_eq!(
+            f.run(&[b"ZRANGE", b"dst2", b"0", b"-1"]),
+            "*3\r\n$7\r\nCatania\r\n$9\r\nAgrigento\r\n$7\r\nPalermo\r\n"
+        );
+        // A search that finds nothing takes the destination with it rather than
+        // leaving what was there, and a source key that is not there is a
+        // search that finds nothing.
+        assert_eq!(
+            f.run(&[
+                b"GEOSEARCHSTORE",
+                b"dst",
+                b"nokey",
+                b"FROMLONLAT",
+                b"15",
+                b"37",
+                b"BYRADIUS",
+                b"200",
+                b"km"
+            ]),
+            ":0\r\n"
+        );
+        assert_eq!(f.run(&[b"EXISTS", b"dst"]), ":0\r\n");
+    }
+
+    #[test]
+    fn the_gates_on_geoadd_are_the_ones_zadd_has() {
+        let mut f = Fixture::new();
+        sicily(&mut f);
+        // XX on a member that is already where it is changes nothing, and NX on
+        // one that is there refuses to move it.
+        assert_eq!(
+            f.run(&[
+                b"GEOADD",
+                b"Sicily",
+                b"XX",
+                b"CH",
+                b"13.361389",
+                b"38.115556",
+                b"Palermo"
+            ]),
+            ":0\r\n"
+        );
+        assert_eq!(
+            f.run(&[
+                b"GEOADD",
+                b"Sicily",
+                b"NX",
+                b"13.361389",
+                b"38.9",
+                b"Palermo"
+            ]),
+            ":0\r\n"
+        );
+        assert_eq!(
+            f.run(&[
+                b"GEOADD",
+                b"Sicily",
+                b"CH",
+                b"13.361389",
+                b"38.9",
+                b"Palermo"
+            ]),
+            ":1\r\n"
+        );
+        // Out of range, and nothing is stored: the whole call is refused rather
+        // than the good pairs going in and the bad one stopping it.
+        assert_eq!(
+            f.run(&[
+                b"GEOADD",
+                b"new",
+                b"13.361389",
+                b"38.115556",
+                b"here",
+                b"181",
+                b"38",
+                b"there"
+            ]),
+            "-ERR invalid longitude,latitude pair 181.000000,38.000000\r\n"
+        );
+        assert_eq!(f.run(&[b"EXISTS", b"new"]), ":0\r\n");
+        assert_eq!(
+            f.run(&[b"GEOADD", b"new", b"x", b"38", b"here"]),
+            "-ERR value is not a valid float\r\n"
+        );
+        // The count of triples is checked before the two gates are, and a call
+        // with no triples at all reaches the same sentence.
+        assert_eq!(
+            f.run(&[b"GEOADD", b"new", b"13", b"38", b"here", b"and"]),
+            "-ERR syntax error\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"GEOADD", b"new", b"NX", b"XX", b"CH"]),
+            "-ERR syntax error\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"GEOADD", b"new", b"CH", b"CH", b"CH", b"CH"]),
+            "-ERR syntax error\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"GEOADD", b"new", b"NX", b"CH"]),
+            "-ERR wrong number of arguments for 'geoadd' command\r\n"
+        );
+    }
+
+    /// The sentences a search answers, which are its contract as much as the
+    /// results are.
+    #[test]
+    fn every_way_a_search_can_be_written_wrong_has_its_own_sentence() {
+        let mut f = Fixture::new();
+        sicily(&mut f);
+        let cases: &[(&[&[u8]], &str)] = &[
+            (
+                &[b"GEORADIUS", b"Sicily", b"15", b"37", b"x", b"km"],
+                "-ERR need numeric radius\r\n",
+            ),
+            (
+                &[b"GEORADIUS", b"Sicily", b"15", b"37", b"-1", b"km"],
+                "-ERR radius cannot be negative\r\n",
+            ),
+            (
+                &[b"GEORADIUS", b"Sicily", b"15", b"37", b"1", b"parsecs"],
+                "-ERR unsupported unit provided. please use M, KM, FT, MI\r\n",
+            ),
+            (
+                &[b"GEORADIUS", b"Sicily", b"181", b"37", b"1", b"km"],
+                "-ERR invalid longitude,latitude pair 181.000000,37.000000\r\n",
+            ),
+            (
+                &[
+                    b"GEOSEARCH",
+                    b"Sicily",
+                    b"FROMLONLAT",
+                    b"15",
+                    b"37",
+                    b"BYBOX",
+                    b"x",
+                    b"1",
+                    b"km",
+                ],
+                "-ERR need numeric width\r\n",
+            ),
+            (
+                &[
+                    b"GEOSEARCH",
+                    b"Sicily",
+                    b"FROMLONLAT",
+                    b"15",
+                    b"37",
+                    b"BYBOX",
+                    b"1",
+                    b"y",
+                    b"km",
+                ],
+                "-ERR need numeric height\r\n",
+            ),
+            (
+                &[
+                    b"GEOSEARCH",
+                    b"Sicily",
+                    b"FROMLONLAT",
+                    b"15",
+                    b"37",
+                    b"BYBOX",
+                    b"-1",
+                    b"1",
+                    b"km",
+                ],
+                "-ERR height or width cannot be negative\r\n",
+            ),
+            (
+                &[
+                    b"GEOSEARCH",
+                    b"Sicily",
+                    b"FROMLONLAT",
+                    b"15",
+                    b"37",
+                    b"BYRADIUS",
+                    b"1",
+                    b"km",
+                    b"ANY",
+                ],
+                "-ERR the ANY argument requires COUNT argument\r\n",
+            ),
+            (
+                &[
+                    b"GEOSEARCH",
+                    b"Sicily",
+                    b"FROMLONLAT",
+                    b"15",
+                    b"37",
+                    b"BYRADIUS",
+                    b"1",
+                    b"km",
+                    b"COUNT",
+                    b"0",
+                ],
+                "-ERR COUNT must be > 0\r\n",
+            ),
+            (
+                &[
+                    b"GEOSEARCH",
+                    b"Sicily",
+                    b"BYRADIUS",
+                    b"1",
+                    b"km",
+                    b"BYBOX",
+                    b"1",
+                    b"1",
+                    b"km",
+                ],
+                "-ERR syntax error\r\n",
+            ),
+            (
+                &[
+                    b"GEOSEARCH",
+                    b"Sicily",
+                    b"FROMMEMBER",
+                    b"Palermo",
+                    b"FROMLONLAT",
+                    b"1",
+                    b"2",
+                    b"BYRADIUS",
+                    b"1",
+                    b"km",
+                ],
+                "-ERR syntax error\r\n",
+            ),
+            // The two options a GEOSEARCH cannot leave out, each with its own
+            // sentence, and the command quoted the way the client spelled it.
+            (
+                &[
+                    b"geosearch",
+                    b"Sicily",
+                    b"BYRADIUS",
+                    b"1",
+                    b"km",
+                    b"ASC",
+                    b"WITHDIST",
+                ],
+                "-ERR exactly one of FROMMEMBER or FROMLONLAT can be specified for geosearch\r\n",
+            ),
+            (
+                &[
+                    b"GEOSEARCH",
+                    b"Sicily",
+                    b"FROMLONLAT",
+                    b"15",
+                    b"37",
+                    b"ASC",
+                    b"WITHDIST",
+                ],
+                "-ERR exactly one of BYRADIUS and BYBOX can be specified for GEOSEARCH\r\n",
+            ),
+            // A store cannot also be asked for the distance, and the two
+            // families name themselves differently in the same sentence.
+            (
+                &[
+                    b"GEOSEARCHSTORE",
+                    b"d",
+                    b"Sicily",
+                    b"FROMLONLAT",
+                    b"15",
+                    b"37",
+                    b"BYRADIUS",
+                    b"1",
+                    b"km",
+                    b"WITHCOORD",
+                ],
+                "-ERR GEOSEARCHSTORE is not compatible with WITHDIST, WITHHASH and WITHCOORD options\r\n",
+            ),
+            (
+                &[
+                    b"GEORADIUS",
+                    b"Sicily",
+                    b"15",
+                    b"37",
+                    b"1",
+                    b"km",
+                    b"WITHDIST",
+                    b"STORE",
+                    b"d",
+                ],
+                "-ERR STORE option in GEORADIUS is not compatible with WITHDIST, WITHHASH and WITHCOORD options\r\n",
+            ),
+            // The read only forms have no store at all, so the word is a stray
+            // one, and GEOSEARCH's STOREDIST is only a GEOSEARCHSTORE option.
+            (
+                &[
+                    b"GEORADIUS_RO",
+                    b"Sicily",
+                    b"15",
+                    b"37",
+                    b"1",
+                    b"km",
+                    b"STORE",
+                    b"d",
+                ],
+                "-ERR syntax error\r\n",
+            ),
+            (
+                &[
+                    b"GEOSEARCH",
+                    b"Sicily",
+                    b"FROMLONLAT",
+                    b"15",
+                    b"37",
+                    b"BYRADIUS",
+                    b"1",
+                    b"km",
+                    b"STOREDIST",
+                ],
+                "-ERR syntax error\r\n",
+            ),
+        ];
+        for (parts, want) in cases {
+            assert_eq!(&f.run(parts), want, "{:?}", parts[0]);
+        }
+    }
+
+    /// A wrong type wins over a bad argument, because the key is looked up
+    /// first, and every one of the ten says the same thing about it.
+    #[test]
+    fn every_geo_command_says_wrongtype() {
+        let mut f = Fixture::new();
+        f.run(&[b"SET", b"s", b"v"]);
+        let wrong = "-WRONGTYPE Operation against a key holding the wrong kind of value\r\n";
+        let cases: &[&[&[u8]]] = &[
+            &[b"GEOADD", b"s", b"13", b"38", b"m"],
+            &[b"GEOPOS", b"s", b"m"],
+            &[b"GEOHASH", b"s", b"m"],
+            &[b"GEODIST", b"s", b"a", b"b"],
+            &[
+                b"GEOSEARCH",
+                b"s",
+                b"FROMLONLAT",
+                b"15",
+                b"37",
+                b"BYRADIUS",
+                b"1",
+                b"km",
+            ],
+            &[
+                b"GEOSEARCHSTORE",
+                b"d",
+                b"s",
+                b"FROMLONLAT",
+                b"15",
+                b"37",
+                b"BYRADIUS",
+                b"1",
+                b"km",
+            ],
+            &[b"GEORADIUS", b"s", b"15", b"37", b"1", b"km"],
+            &[b"GEORADIUS_RO", b"s", b"15", b"37", b"1", b"km"],
+            &[b"GEORADIUSBYMEMBER", b"s", b"m", b"1", b"km"],
+            &[b"GEORADIUSBYMEMBER_RO", b"s", b"m", b"1", b"km"],
+        ];
+        for case in cases {
+            assert_eq!(f.run(case), wrong, "{:?}", case[0]);
+        }
+        // And it wins over an argument that will not parse, which is the whole
+        // reason the lookup comes first.
+        assert_eq!(
+            f.run(&[b"GEORADIUS", b"s", b"15", b"37", b"x", b"km"]),
+            wrong
         );
     }
 

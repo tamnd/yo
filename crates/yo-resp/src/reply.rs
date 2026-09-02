@@ -23,7 +23,8 @@
 
 use crate::proto::Proto;
 use yo_common::num::{
-    DIGITS_MAX, i64_len, push_double, push_human, push_i64, push_u64, u64_digits, u64_len,
+    DIGITS_MAX, i64_len, push_double, push_fixed4, push_human, push_i64, push_u64, u64_digits,
+    u64_len,
 };
 
 /// A reply buffer for one connection.
@@ -319,6 +320,16 @@ impl Out {
     /// alike, so unlike [`Out::double`] there is no protocol branch here.
     pub fn human_double(&mut self, d: f64) {
         self.bulk_written(|buf| push_human(buf, d));
+    }
+
+    /// A bulk string holding a distance, which is four places and no exponent.
+    ///
+    /// The geo commands are the only ones that write a number this way, and
+    /// they write it as a bulk string on both protocols rather than as RESP3's
+    /// double, so there is no protocol branch here either. See
+    /// [`yo_common::num::push_fixed4`] for why four.
+    pub fn distance(&mut self, d: f64) {
+        self.bulk_written(|buf| push_fixed4(buf, d));
     }
 
     /// A bulk string whose contents are written by `f` and measured after.

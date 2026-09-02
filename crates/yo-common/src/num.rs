@@ -418,6 +418,54 @@ pub fn push_human(out: &mut Vec<u8>, d: f64) {
     let _ = write!(sink, "{d}");
 }
 
+/// Appends a distance the way the geo commands write one, which is four digits
+/// after the point and no exponent ever.
+///
+/// `GEODIST` and the `WITHDIST` half of a search go through Redis's
+/// `fixedpoint_d2string` rather than through `d2string`, because "166.2742 km
+/// away" reads better than "166.27415156960033 km away" and four places is
+/// still a tenth of a metre when the unit is the kilometre. The trailing zeros
+/// stay, so a whole number of metres comes back as `5.0000` and a distance of
+/// nothing comes back as `0.0000`.
+///
+/// The scaled value is rounded to the nearest, ties to even, which is what
+/// `llrint` does in the default rounding mode and therefore what a real server
+/// answers. Ties are not reachable in practice, since the value being rounded
+/// came out of a square root, but rounding the other way would still be a
+/// divergence that only showed up in somebody's test suite.
+///
+/// A distance too large to scale into an integer writes nothing, which is what
+/// Redis does too: its formatter fails and hands the reply an empty string.
+/// Nothing reaches that from a real search, because the far side of the world
+/// is twenty thousand kilometres away and the scaled form of that is twelve
+/// digits.
+pub fn push_fixed4(out: &mut Vec<u8>, d: f64) {
+    let scaled = (d * 10_000.0).round_ties_even();
+    if !scaled.is_finite() || scaled.abs() >= DOUBLE_INT_LIMIT {
+        return;
+    }
+    let mut whole = scaled as i64;
+    if whole < 0 {
+        out.push(b'-');
+        whole = -whole;
+    }
+    let mut buf = [0u8; DIGITS_MAX];
+    let digits = u64_digits(&mut buf, whole as u64);
+    // Four digits or fewer means there is no integer part, and Redis writes a
+    // zero in front rather than leaving a reply that starts with a point. The
+    // padding is what is left of the four places once the digits are in.
+    if let Some(padding) = 4usize.checked_sub(digits.len()) {
+        out.extend_from_slice(b"0.");
+        out.extend_from_slice(&b"0000"[..padding]);
+        out.extend_from_slice(digits);
+    } else {
+        let (front, back) = digits.split_at(digits.len() - 4);
+        out.extend_from_slice(front);
+        out.push(b'.');
+        out.extend_from_slice(back);
+    }
+}
+
 /// Writes a double into a fixed buffer, byte for byte what [`push_double`]
 /// would append.
 ///
@@ -807,6 +855,45 @@ mod tests {
         push_human(&mut v, 5e-324);
         assert_eq!(v.len(), 326);
         assert!(v.starts_with(b"0.0") && v.ends_with(b"5"));
+    }
+
+    #[test]
+    fn a_distance_always_has_four_places_after_the_point() {
+        let cases: &[(f64, &str)] = &[
+            // Every one of these came off a running 8.10.1, through GEODIST and
+            // through WITHDIST, in all four units.
+            (0.0, "0.0000"),
+            (-0.0, "0.0000"),
+            (166_274.151_561_39, "166274.1516"),
+            (166.274_151_561_39, "166.2742"),
+            (103.318_154_263_49, "103.3182"),
+            (545_518.869_950_1, "545518.8700"),
+            (5.0, "5.0000"),
+            // Under one, where the integer part is a zero that is written rather
+            // than counted, and under a ten thousandth, where every digit of the
+            // answer is a leading zero.
+            (0.5, "0.5000"),
+            (0.05, "0.0500"),
+            (0.005, "0.0050"),
+            (0.0005, "0.0005"),
+            (0.000_04, "0.0000"),
+            // The tie goes to the even digit, which is what llrint does.
+            (0.000_25, "0.0002"),
+            (0.000_35, "0.0004"),
+            (-1.5, "-1.5000"),
+        ];
+        for &(d, want) in cases {
+            let mut v = Vec::new();
+            push_fixed4(&mut v, d);
+            assert_eq!(String::from_utf8(v).unwrap(), want, "writing {d}");
+        }
+        // Nothing at all for the values a real server's formatter refuses,
+        // which no search can produce and a client can still ask for.
+        for d in [f64::INFINITY, f64::NAN, 1e30] {
+            let mut v = Vec::new();
+            push_fixed4(&mut v, d);
+            assert!(v.is_empty(), "writing {d}");
+        }
     }
 
     /// The two double writers have to agree, because one is used to predict the

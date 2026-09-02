@@ -37,6 +37,18 @@
 //! same, so the hash function and the opcodes and the promotion threshold are
 //! copied rather than improved on.
 //!
+//! The places, which are sorted sets seen as a map. [`geo`] is the arithmetic,
+//! the 52 bit interleave of longitude and latitude that a score is, the
+//! haversine, the eleven character geohash string and the boxes a search covers,
+//! and [`geos`] is where a key turns into a search. There is no geo type either,
+//! for the same reason there is no bitmap one: `GEOADD` writes a member with a
+//! score and `ZSCORE` reads that score straight back out, so a place is a sorted
+//! set entry that somebody has agreed to read as a coordinate. What the search
+//! costs is nine score ranges, one for the box the centre falls in and one for
+//! each neighbour, at a precision picked so the nine cover the shape, and every
+//! candidate is measured properly afterwards so nothing outside the circle or
+//! the rectangle reaches the caller.
+//!
 //! The set, which is the first row of M3, in all seventeen of its commands:
 //! `SADD`, `SREM`, `SCARD`, `SISMEMBER`, `SMISMEMBER`, `SMEMBERS`, `SPOP`,
 //! `SRANDMEMBER`, `SSCAN`, `SMOVE`, `SINTER`, `SINTERCARD`, `SUNION`, `SDIFF`
@@ -121,6 +133,8 @@ pub mod elem;
 pub mod evict;
 pub mod expiry;
 pub mod foreign;
+pub mod geo;
+pub mod geos;
 pub mod grow;
 pub mod hash;
 pub mod hashes;

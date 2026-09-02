@@ -764,7 +764,7 @@ impl Keyspace {
     /// Whatever the key held is freed first, through the one funnel, and any
     /// deadline it had goes with it, because the value under the key is not the
     /// value the expiry was set on.
-    fn put_zset(&mut self, key: &[u8], z: Option<Zset>) -> usize {
+    pub(crate) fn put_zset(&mut self, key: &[u8], z: Option<Zset>) -> usize {
         let Some(z) = z else {
             self.drop_key(key);
             return 0;
@@ -782,7 +782,7 @@ impl Keyspace {
 
     /// The slot `key`'s sorted set is in, or `None` if there is no such key.
     #[inline]
-    fn zset_slot(&mut self, key: &[u8]) -> Result<Option<u32>> {
+    pub(crate) fn zset_slot(&mut self, key: &[u8]) -> Result<Option<u32>> {
         self.live_slot(key, Kind::Zset)
     }
 
@@ -791,7 +791,7 @@ impl Keyspace {
     /// Panicking here means a record outlived its body, which is the bug the
     /// two invariants in [`crate::sets`] are there to make impossible.
     #[inline]
-    fn zset_at(&self, at: u32) -> &Zset {
+    pub(crate) fn zset_at(&self, at: u32) -> &Zset {
         self.zsets.get(at).expect("the record points at its body")
     }
 
@@ -955,7 +955,10 @@ fn rank_span(start: i64, stop: i64, len: usize) -> (usize, usize) {
 
 /// The bytes of a member, which for one the listpack stored as an integer are
 /// the caller's buffer.
-fn member_bytes<'a>(m: Member<'a>, digits: &'a mut [u8; yo_common::num::DIGITS_MAX]) -> &'a [u8] {
+pub(crate) fn member_bytes<'a>(
+    m: Member<'a>,
+    digits: &'a mut [u8; yo_common::num::DIGITS_MAX],
+) -> &'a [u8] {
     match m {
         Member::Str(s) => s,
         Member::Int(n) => yo_common::num::i64_digits(digits, n),
