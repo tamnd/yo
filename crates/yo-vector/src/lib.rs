@@ -61,11 +61,20 @@
 //! should have said no but never the other way round, so the caller's own
 //! predicate stays the authority.
 //!
-//! MUVERA, the HNSW compatibility view and writing any of this to a `.yo` file
-//! are the rest of M6.
+//! [`muvera`] is late interaction retrieval on that same index. A ColBERT style
+//! model gives a document one vector per token and scores a query against it
+//! with Chamfer similarity, which normally means a second index over every
+//! token of every document and a scoring pass on top of it. MUVERA maps a set
+//! of token vectors to one fixed length vector whose dot product approximates
+//! Chamfer, so it costs an encode at write time, the index that is already
+//! here, and [`muvera::chamfer`] as the rerank. There is no second index.
+//!
+//! The HNSW compatibility view and writing any of this to a `.yo` file are the
+//! rest of M6.
 
 #![deny(missing_docs)]
 
+pub mod muvera;
 pub mod partition;
 pub mod rabitq;
 pub mod rotate;

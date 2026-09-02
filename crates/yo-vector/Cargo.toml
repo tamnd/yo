@@ -28,5 +28,9 @@ harness = false
 name = "partition"
 harness = false
 
+[[bench]]
+name = "muvera"
+harness = false
+
 [lints]
 workspace = true
