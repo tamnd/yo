@@ -71,40 +71,39 @@
 //!
 //! ```text
 //!         at  partitions    a second      insert    maintain   touched
-//!      12500          36       99845       19.8%       80.2%       5.3
-//!      50000         132       63393       36.4%       63.6%       6.9
-//!     200000         595       34091       66.1%       33.9%       5.5
-//!     800000        2141       13563       86.3%       13.7%       4.4
+//!      12500          36      115952       20.4%       79.6%       5.3
+//!      50000         132       72013       39.4%       60.6%       6.9
+//!     200000         595       46917       58.7%       41.3%       5.5
+//!     800000        2141       42459       60.9%       39.1%       4.4
 //! ```
 //!
 //! `touched` is how many vectors maintenance moved or looked at per vector
-//! inserted, and it is flat, which is the number that says the update protocol
-//! itself is not the problem. What is left is the insert, and it is 86 percent
-//! of the time by 800 thousand and it halves every time the collection doubles,
-//! because finding the partition a vector belongs to is a pass over every
-//! centroid and there is one centroid per `posting` vectors.
+//! inserted. It is flat, and that is the number which says the update protocol
+//! is doing bounded work rather than quietly turning into a rebuild.
 //!
-//! That is the whole remaining gap to the 50 thousand a second gate and it is
-//! one problem, not two.
+//! Both halves of that took a fix to get there and they were different fixes.
+//! Maintenance was 80 percent of the time and most of it was `sweep` measuring
+//! every member it looked at against every centroid in the collection, which is
+//! not what LIRE says and is several full scans per vector inserted. The insert
+//! was the other half and it was a scan over every centroid by definition, which
+//! is why the coarse layer in `src/coarse.rs` is there, and that file is where
+//! the reasoning about it lives. Before either fix, the rate halved on every
+//! doubling and was 13563 a second by 800 thousand.
 //!
 //! # What is not here yet
 //!
-//! An index over the centroids, so that finding the nearest one is not a walk
-//! over all of them. The first attempt at one is written up in the milestone and
-//! is not in the tree: a flat layer of anchors over a sample of the centroids
-//! cut the work by eight and got the nearest centroid wrong 11 percent of the
-//! time, which is fine on the insert path and is ruinous inside the sweep, where
-//! it drained partitions into each other and turned 199 splits into 9715. So the
-//! layer has to be close to exact, and at 128 dimensions a flat one only gets
-//! there by looking at nearly half the centroids. The next attempt is SPANN's
-//! closure assignment, and the accuracy gets measured before anything is wired
-//! in.
+//! A `.yo` file. None of this is written down yet, and the format freezes at the
+//! end of M6, so that is the next thing.
 //!
-//! Filters pushed into the scan, MUVERA, and writing any of this to a `.yo`
-//! file are the rest of M6.
+//! Recall on SIFT1M with the coarse layer in place, against the same run without
+//! it. The layer only places new vectors, so a miss costs recall rather than
+//! stability, and how much recall is a measurement rather than an argument.
+//!
+//! The commands that put all of this on the wire are the rest of M6.
 
 use std::collections::HashMap;
 
+use crate::coarse::Coarse;
 use crate::rabitq::{Bits, Coded, Quantizer};
 
 /// Where the full precision vectors live.
@@ -348,6 +347,11 @@ pub struct Partitions {
     /// Which partition and which slot every id is in, which is what makes a
     /// delete a constant time operation rather than a search.
     at: HashMap<u64, Slot>,
+    /// The index over the centroids. See [`crate::coarse`].
+    coarse: Coarse,
+    /// The shortlist a placement fills in, kept here so that placing a vector
+    /// does not allocate.
+    scratch: Vec<u32>,
 }
 
 impl Partitions {
@@ -368,6 +372,8 @@ impl Partitions {
             centroids: Vec::new(),
             postings: Vec::new(),
             at: HashMap::new(),
+            coarse: Coarse::default(),
+            scratch: Vec::new(),
         }
     }
 
@@ -468,7 +474,10 @@ impl Partitions {
             // centroids being means rather than members.
             self.add_partition(&x)
         } else {
-            self.nearest(&x)
+            let mut short = core::mem::take(&mut self.scratch);
+            let p = self.roughly_nearest(&x, &mut short);
+            self.scratch = short;
+            p
         };
         self.place(p, id, tag, &x);
     }
@@ -701,6 +710,7 @@ impl Partitions {
             return members.len();
         }
         self.centroids[p * dim..(p + 1) * dim].copy_from_slice(&a);
+        self.coarse.moved(p, &a, dim);
         let q = self.add_partition(&b);
         for (i, m) in members.iter().enumerate() {
             let to = if sides[i] { p } else { q };
@@ -830,6 +840,19 @@ impl Partitions {
         by.into_iter().map(|(p, _)| p).collect()
     }
 
+    /// The partition `x` belongs to, as far as the coarse layer can tell.
+    fn roughly_nearest(&self, x: &[f32], short: &mut Vec<u32>) -> usize {
+        if !self.coarse.ready() {
+            return self.nearest(x);
+        }
+        self.coarse.shortlist(x, self.dim(), short);
+        short
+            .iter()
+            .map(|&p| (p as usize, sqdist(x, self.centroid(p as usize))))
+            .min_by(|a, b| a.1.total_cmp(&b.1))
+            .map_or(0, |(p, _)| p)
+    }
+
     /// The partition `x` belongs to.
     fn nearest(&self, x: &[f32]) -> usize {
         (0..self.postings.len())
@@ -845,9 +868,23 @@ impl Partitions {
 
     /// A new empty partition around `centroid`, which is already rotated.
     fn add_partition(&mut self, centroid: &[f32]) -> usize {
+        let dim = self.quant.dim();
         self.centroids.extend_from_slice(centroid);
         self.postings.push(Posting::default());
-        self.postings.len() - 1
+        let p = self.postings.len() - 1;
+        self.coarse.added(p, centroid, dim);
+        self.refresh_coarse();
+        p
+    }
+
+    /// Rebuild the coarse layer if the partition count has moved far enough
+    /// since the anchors were last chosen.
+    fn refresh_coarse(&mut self) {
+        let n = self.postings.len();
+        if self.coarse.stale(n) {
+            let dim = self.quant.dim();
+            self.coarse.rebuild(&self.centroids, dim, n);
+        }
     }
 
     /// Drop an empty partition, moving the last one into its place.
@@ -855,6 +892,7 @@ impl Partitions {
         debug_assert_eq!(self.postings[p].len(), 0, "a partition is emptied first");
         let dim = self.dim();
         let last = self.postings.len() - 1;
+        self.coarse.dropped(p);
         self.postings.swap_remove(p);
         for i in 0..dim {
             self.centroids[p * dim + i] = self.centroids[last * dim + i];
@@ -869,6 +907,7 @@ impl Partitions {
                 }
             }
         }
+        self.refresh_coarse();
     }
 
     /// Append a member to a partition. `x` is rotated.
