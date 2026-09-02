@@ -176,14 +176,25 @@ impl Keyspace {
     /// of a million members. [`Keyspace::rename`] exists so that the one case
     /// which does not need a copy does not pay for one.
     pub fn export(&mut self, key: &[u8]) -> Option<Record> {
-        let addr = self.live_rec(key)?;
+        let mut addr = self.live_rec(key)?;
+        // A value on the file is read back but not put back. `DUMP` over a
+        // whole database is the scan the doorkeeper is there for: a backup
+        // should not be able to pull everything into memory on its way past. A
+        // chain that will not read back answers as a key that is not there,
+        // which is the only answer this signature has room for.
+        if value::cold(self.map.value_at(addr)).is_some() {
+            if self.warm(key).is_err() {
+                return None;
+            }
+            addr = self.map.find(key)?;
+        }
         let rec = self.map.value_at(addr);
         let expire_at = value::expire_at(rec);
         // The slot is read inside the arms and not before them. A string record
         // holds the string and not a slot, so reading four bytes where the slot
         // would be reads off the end of a short one.
         let body = match value::kind(rec) {
-            Kind::String => Body::String(value::read(rec).to_vec()),
+            Kind::String => Body::String(self.value_of(key, rec).to_vec()),
             Kind::Set => Body::Set(
                 self.sets
                     .get(value::slot(rec))
@@ -247,7 +258,18 @@ impl Keyspace {
     /// of this would free the body a second time and underflow the count of keys
     /// that hold one.
     pub fn take(&mut self, key: &[u8]) -> Option<Record> {
-        let addr = self.live_rec(key)?;
+        let mut addr = self.live_rec(key)?;
+        // The same read as [`Keyspace::export`] does, for the same reason,
+        // except that here the record is about to go anyway. What the caller
+        // does with the bytes decides where they end up, and on a `RENAME` that
+        // is a resident record under the new name with the old chunks left for
+        // the log's compaction to collect.
+        if value::cold(self.map.value_at(addr)).is_some() {
+            if self.warm(key).is_err() {
+                return None;
+            }
+            addr = self.map.find(key)?;
+        }
         let rec = self.map.value_at(addr);
         let expire_at = value::expire_at(rec);
         let kind = value::kind(rec);
@@ -255,7 +277,7 @@ impl Keyspace {
         // and the bytes have to be copied out before the record goes. It leaves
         // early because the slot below is not there to read on this one.
         if kind == Kind::String {
-            let bytes = value::read(rec).to_vec();
+            let bytes = self.value_of(key, rec).to_vec();
             self.del_rec(key);
             return Some(Record {
                 body: Body::String(bytes),

@@ -109,6 +109,11 @@ impl Keyspace {
         }
         self.reap(key);
         self.string_only(key)?;
+        // A bitmap is a string, so it can have been demoted like any other, and
+        // the bit being asked about is somewhere in it. Warmed rather than
+        // thawed: reading a bit out of a cold bitmap is a read like any other
+        // and the doorkeeper decides whether it earns its way back.
+        self.warm(key)?;
         let mut digits = [0u8; DIGITS_MAX];
         let bytes = self.bitmap(key, &mut digits);
         let byte = (offset / 8) as usize;
@@ -126,6 +131,7 @@ impl Keyspace {
         }
         let byte = (offset / 8) as usize;
         check_len(key, byte + 1)?;
+        self.thaw(key)?;
         let now = self.clock.now_ms();
         let hash = RawMap::hash_of(key);
 
@@ -192,6 +198,7 @@ impl Keyspace {
     pub fn bitcount(&mut self, key: &[u8], range: Option<(i64, i64, Unit)>) -> Result<u64> {
         self.reap(key);
         self.string_only(key)?;
+        self.warm(key)?;
         let mut digits = [0u8; DIGITS_MAX];
         let bytes = self.bitmap(key, &mut digits);
         let Some((start, end, unit)) = range else {
@@ -221,6 +228,7 @@ impl Keyspace {
     ) -> Result<i64> {
         self.reap(key);
         self.string_only(key)?;
+        self.warm(key)?;
         let here = self.map.get(key).is_some();
         let mut digits = [0u8; DIGITS_MAX];
         let bytes = self.bitmap(key, &mut digits);
@@ -268,6 +276,11 @@ impl Keyspace {
         for src in srcs.clone() {
             self.reap(src);
             self.string_only(src)?;
+            // Every source at once, so every one of them has to be in memory
+            // rather than in the one buffer a fault serves out of. `BITOP` over
+            // demoted sources brings them back, which is also what a client
+            // running it in a loop wants.
+            self.thaw(src)?;
         }
         // The sources have to be copied out before the destination can be
         // written, since they are borrowed from the map and the write wants the
@@ -360,6 +373,10 @@ impl Keyspace {
     ) -> Result<T> {
         self.reap(key);
         self.string_only(key)?;
+        // Every path here materialises the value and most of them write it
+        // back, so this thaws rather than asking the doorkeeper about a value
+        // that is going to be resident when the command ends anyway.
+        self.thaw(key)?;
         let need = grow.unwrap_or(0);
         check_len(key, need)?;
 

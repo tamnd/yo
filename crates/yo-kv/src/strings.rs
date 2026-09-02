@@ -200,7 +200,13 @@ impl Keyspace {
         if value::kind(rec) != Kind::String {
             return Err(wrong_type());
         }
-        Ok(Some(value::read(rec)))
+        // One more bit of the byte the kind came out of, and on a database with
+        // no file behind it no record ever has it set. See
+        // [`Keyspace::warmed`].
+        if value::cold(rec).is_some() {
+            return self.warmed(key);
+        }
+        Ok(Some(value::read(self.map.value_at(addr))))
     }
 
     /// `MGET key [key ...]`.
@@ -210,6 +216,15 @@ impl Keyspace {
     /// values borrow from it at once instead of being copied out one at a time.
     pub fn mget<'a>(&'a mut self, keys: &[&[u8]]) -> Vec<Option<Str<'a>>> {
         for k in keys {
+            // A demoted value is brought back into memory here rather than
+            // served from the buffer, because this form hands back every value
+            // at once and there is one buffer. The wire does not come through
+            // here, it calls [`Keyspace::mget_one`] per key, and that one asks
+            // the doorkeeper properly. An error is dropped: this returns a
+            // `Vec` with no room in it to say that one key would not read back,
+            // and the key then reads as nil, which is what a key holding the
+            // wrong type does two lines below.
+            let _ = self.thaw(k);
             // `live_rec` rather than `reap`, which does the same reap and also
             // stamps the eviction clock. The reading pass below cannot, because
             // it holds a shared borrow of the whole database so that every value
@@ -236,12 +251,37 @@ impl Keyspace {
     pub fn mget_one(&mut self, key: &[u8]) -> Option<Str<'_>> {
         let addr = self.live_rec(key)?;
         let rec = self.map.value_at(addr);
-        (value::kind(rec) == Kind::String).then(|| value::read(rec))
+        if value::kind(rec) != Kind::String {
+            return None;
+        }
+        if value::cold(rec).is_some() {
+            // A key whose value will not read back is nil here rather than an
+            // error, the same as a key holding a set is. `MGET` has no way to
+            // report one bad key out of a hundred and Redis does not try.
+            return self.warmed(key).ok().flatten();
+        }
+        Some(value::read(self.map.value_at(addr)))
     }
 
     /// `STRLEN key`, which is zero for a key that is not there.
+    ///
+    /// Answered out of the record even when the value is on the file, because a
+    /// demoted record carries the length next to the address. Going to the
+    /// device for a number that is already in memory would be a device read
+    /// spent on nothing, and it would be one that a client could use to pull a
+    /// whole database back into memory a key at a time.
     pub fn strlen(&mut self, key: &[u8]) -> Result<usize> {
-        Ok(self.get(key)?.map_or(0, |v| v.len()))
+        let Some(addr) = self.live_rec(key) else {
+            return Ok(0);
+        };
+        let rec = self.map.value_at(addr);
+        if value::kind(rec) != Kind::String {
+            return Err(wrong_type());
+        }
+        if let Some(c) = value::cold(rec) {
+            return Ok(c.len as usize);
+        }
+        Ok(value::read(rec).len())
     }
 
     /// `EXISTS key`, for one key.
@@ -291,6 +331,11 @@ impl Keyspace {
     /// Borrowed for a string, owned for an integer, because an integer's digits
     /// do not exist anywhere until somebody asks for them.
     pub fn getrange(&mut self, key: &[u8], start: i64, end: i64) -> Result<Cow<'_, [u8]>> {
+        // A range of a demoted value still reads the whole value back, because
+        // a chunk is 64 KiB and the range is usually smaller than one. The
+        // chunked band can serve a range out of the chunks it covers, and
+        // wiring that in here is worth doing once there is a workload asking
+        // for windows into large cold values. See [`cold::Reader::range`].
         let Some(v) = self.get(key)? else {
             return Ok(Cow::Borrowed(&[]));
         };
@@ -358,6 +403,10 @@ impl Keyspace {
             // the old value first cannot: there is nothing to hand back and
             // nothing to compare against. Redis answers WRONGTYPE for both.
             self.string_only(key)?;
+            // And a value on the file has to come back before it can be handed
+            // over or compared against. Plain `SET` does not do this, and that
+            // is the point: overwriting a demoted key costs no device read.
+            self.thaw(key)?;
         }
 
         let present = self.map.get(key);
@@ -459,6 +508,10 @@ impl Keyspace {
     {
         self.reap(key);
         self.string_only(key)?;
+        // Warmed and not thawed. The key is about to be deleted, so putting its
+        // value back in memory on the way past would be work done for a record
+        // that is not going to exist a line later.
+        self.warm(key)?;
         let Some(v) = self.peek(key) else {
             return Ok(false);
         };
@@ -474,6 +527,16 @@ impl Keyspace {
     pub fn getex(&mut self, key: &[u8], expire: Expire) -> Result<Option<Str<'_>>> {
         self.reap(key);
         self.string_only(key)?;
+        // Thawed rather than warmed, because a deadline that changes rewrites
+        // the whole record: the value does not move but the header in front of
+        // it changes length, so the bytes have to be in hand either way. Plain
+        // `GETEX` with no expiry argument is the read that the doorkeeper
+        // should get a vote on, and it takes the branch below instead.
+        if expire == Expire::Keep {
+            self.warm(key)?;
+        } else {
+            self.thaw(key)?;
+        }
         if expire != Expire::Keep {
             let current = self.map.get(key).and_then(value::expire_at);
             let wanted = match expire {
@@ -566,6 +629,7 @@ impl Keyspace {
     pub fn append(&mut self, key: &[u8], tail: &[u8]) -> Result<usize> {
         self.reap(key);
         self.string_only(key)?;
+        self.thaw(key)?;
         let Some(rec) = self.map.get(key) else {
             check_len(key, tail.len())?;
             self.store(key, tail, None);
@@ -600,9 +664,13 @@ impl Keyspace {
     pub fn setrange(&mut self, key: &[u8], offset: usize, val: &[u8]) -> Result<usize> {
         self.reap(key);
         self.string_only(key)?;
+        // `SETRANGE key n ""` writes nothing and answers the length, which the
+        // record already knows, so that form does not touch the device. See
+        // [`Keyspace::strlen`], which is the same argument.
         if val.is_empty() {
-            return Ok(self.peek(key).map_or(0, |v| v.len()));
+            return Ok(self.strlen(key).unwrap_or(0));
         }
+        self.thaw(key)?;
         let end = offset
             .checked_add(val.len())
             .ok_or_else(|| Error::new(Code::Invalid, BAD_OFFSET))?;
@@ -667,6 +735,12 @@ impl Keyspace {
 
     fn count(&mut self, key: &[u8], by: i64, subtract: bool) -> Result<i64> {
         check_len(key, 0)?;
+        // A demoted value is never int encoded, so a counter that is being
+        // counted on is never on the file and this costs one branch on a null
+        // field. It is here for the key that was a long string, got demoted,
+        // and is now being incremented, which answers an error rather than
+        // reading twelve bytes of address as a number.
+        self.thaw(key)?;
         let hash = RawMap::hash_of(key);
         let now = self.clock.now_ms();
 
@@ -731,6 +805,7 @@ impl Keyspace {
         // it.
         self.reap(key);
         self.string_only(key)?;
+        self.thaw(key)?;
         let (current, deadline) = match self.map.get(key) {
             Some(rec) => {
                 // Read out of the record rather than copied out of it. An int
@@ -819,8 +894,17 @@ impl Keyspace {
     /// satisfies, because there is still nothing to delete.
     pub fn delex(&mut self, key: &[u8], compare: Option<Compare<'_>>) -> bool {
         self.reap(key);
+        // Only the comparing form reads the value, and only that form pays for
+        // a demoted one. `DELEX` with no compare deletes a cold key without
+        // touching the file at all. An error faulting is a comparison that
+        // cannot be made, which is a comparison that does not hold.
         let matches = match compare {
-            Some(c) => c.holds(self.peek(key)),
+            Some(c) => {
+                if self.warm(key).is_err() {
+                    return false;
+                }
+                c.holds(self.peek(key))
+            }
             None => true,
         };
         matches && self.drop_key(key)
@@ -834,6 +918,10 @@ impl Keyspace {
     pub fn digest(&mut self, key: &[u8]) -> Result<Option<u64>> {
         self.reap(key);
         self.string_only(key)?;
+        // The digest is over the value, so a demoted one has to be read back.
+        // Warmed and not thawed: a client polling a digest to see whether a
+        // large value has changed is exactly the read the doorkeeper is for.
+        self.warm(key)?;
         Ok(self.peek(key).map(|v| v.digest()))
     }
 
@@ -858,6 +946,7 @@ impl Keyspace {
         check_len(key, 0)?;
         self.reap(key);
         self.string_only(key)?;
+        self.thaw(key)?;
 
         let (current, had_deadline) = match self.map.get(key) {
             Some(rec) => {
@@ -947,7 +1036,13 @@ impl Keyspace {
         self.reap(b);
         self.string_only(a)?;
         self.string_only(b)?;
+        // One key at a time, because there is one buffer and this needs two
+        // values. Each is copied out before the next is faulted, which is the
+        // one place in this file that copies a value it did not have to and it
+        // was already copying before any of this.
+        self.warm(a)?;
         let x = self.peek(a).map(|v| v.to_vec()).unwrap_or_default();
+        self.warm(b)?;
         let y = self.peek(b).map(|v| v.to_vec()).unwrap_or_default();
         Ok((x, y))
     }
@@ -965,13 +1060,20 @@ impl Keyspace {
     /// than failing the whole command, and it is not the right answer for `GET`,
     /// which is why the readers that owe a `WRONGTYPE` ask
     /// [`Keyspace::string_only`] first.
+    ///
+    /// A key whose value is on the file has to have been through
+    /// [`Keyspace::warm`] or [`Keyspace::thaw`] before this is called, because
+    /// this reads a served value out of the database's one buffer and nothing
+    /// in the buffer says whose value it is. A debug build asserts it. On a
+    /// database with no file behind it there are no cold records and this is
+    /// exactly what it always was.
     #[inline]
     pub(crate) fn peek(&self, key: &[u8]) -> Option<Str<'_>> {
         let rec = self.map.get(key)?;
         if value::kind(rec) != Kind::String {
             return None;
         }
-        Some(value::read(rec))
+        Some(self.value_of(key, rec))
     }
 
     /// Fail with `WRONGTYPE` if `key` holds something that is not a string.

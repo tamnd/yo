@@ -83,6 +83,24 @@ pub trait Blocks {
     fn get(&self, at: Addr) -> Result<&[u8]>;
 }
 
+/// So that a store can be chosen at run time rather than at compile time.
+///
+/// [`Keyspace`](crate::Keyspace) holds its tier behind this box, and the reason
+/// is that the alternative is a type parameter on `Keyspace`, which would spread
+/// to `yo-resp` and to every caller of either, all to name a type that only the
+/// code opening the file knows. The dispatch it costs is one indirect call on a
+/// path that is about to read a device, and nothing at all on a warm read, which
+/// never reaches this trait.
+impl Blocks for Box<dyn Blocks> {
+    fn put(&mut self, bytes: &[u8]) -> Result<Addr> {
+        (**self).put(bytes)
+    }
+
+    fn get(&self, at: Addr) -> Result<&[u8]> {
+        (**self).get(at)
+    }
+}
+
 /// Where a value went, and how much of it there is.
 ///
 /// Twelve bytes, which is what [`value::write_cold_record`](crate::value) puts
