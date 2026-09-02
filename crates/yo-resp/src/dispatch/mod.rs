@@ -8055,6 +8055,285 @@ mod tests {
         );
     }
 
+    /// `XDELEX`, which is `XDEL` with a say in what the groups keep.
+    #[test]
+    fn xdelex_answers_one_integer_an_id() {
+        let mut f = Fixture::new();
+        for i in 1..=4 {
+            f.run(&[b"XADD", b"s", format!("{i}-1").as_bytes(), b"a", b"1"]);
+        }
+        f.run(&[b"XGROUP", b"CREATE", b"s", b"g", b"0"]);
+        f.run(&[
+            b"XREADGROUP",
+            b"GROUP",
+            b"g",
+            b"c",
+            b"COUNT",
+            b"2",
+            b"STREAMS",
+            b"s",
+            b">",
+        ]);
+
+        // One means gone and minus one means it was not there to start with.
+        assert_eq!(
+            f.run(&[b"XDELEX", b"s", b"IDS", b"2", b"1-1", b"9-9"]),
+            "*2\r\n:1\r\n:-1\r\n"
+        );
+        // `KEEPREF` leaves the pending entry behind, so the group still counts
+        // the one it was handed even though the entry has gone.
+        assert!(
+            f.run(&[b"XPENDING", b"s", b"g"])
+                .starts_with("*4\r\n:2\r\n")
+        );
+        // `DELREF` takes it out of every pending list on the way past.
+        assert_eq!(
+            f.run(&[b"XDELEX", b"s", b"DELREF", b"IDS", b"1", b"2-1"]),
+            "*1\r\n:1\r\n"
+        );
+        // `1-1` is still in the list, because the delete before it said KEEPREF.
+        assert_eq!(
+            f.run(&[b"XPENDING", b"s", b"g"]),
+            "*4\r\n:1\r\n$3\r\n1-1\r\n$3\r\n1-1\r\n*1\r\n*2\r\n$1\r\nc\r\n$1\r\n1\r\n"
+        );
+
+        // Two means somebody still wants it, and the question is wider than the
+        // name: the group's bookmark is at `2-1`, so `4-1` is above it and is
+        // refused even though no consumer has ever been handed it.
+        assert_eq!(
+            f.run(&[b"XDELEX", b"s", b"ACKED", b"IDS", b"2", b"3-1", b"4-1"]),
+            "*2\r\n:2\r\n:2\r\n"
+        );
+
+        // A key that is not there answers minus ones without reading the IDs.
+        assert_eq!(
+            f.run(&[b"XDELEX", b"nope", b"IDS", b"2", b"bad", b"worse"]),
+            "*2\r\n:-1\r\n:-1\r\n"
+        );
+        // A key that is there validates every ID before deleting any of them.
+        assert!(
+            f.run(&[b"XDELEX", b"s", b"IDS", b"2", b"3-1", b"bad"])
+                .starts_with("-ERR Invalid stream ID")
+        );
+        assert_eq!(f.run(&[b"XLEN", b"s"]), ":2\r\n");
+
+        assert!(
+            f.run(&[b"XDELEX", b"s", b"IDS", b"0", b"1-1"])
+                .contains("Number of IDs must be a positive integer")
+        );
+        assert!(
+            f.run(&[b"XDELEX", b"s", b"IDS", b"2", b"1-1"])
+                .contains("The `numids` parameter must match the number of arguments")
+        );
+        // The condition is one word, so a second one is a syntax error, and so
+        // is one ID more than the count promised.
+        assert!(
+            f.run(&[b"XDELEX", b"s", b"KEEPREF", b"DELREF", b"IDS", b"1", b"1-1"])
+                .starts_with("-ERR syntax error")
+        );
+        assert!(
+            f.run(&[b"XDELEX", b"s", b"IDS", b"1", b"1-1", b"2-1"])
+                .starts_with("-ERR syntax error")
+        );
+        // The key is looked up first, so the wrong type beats the syntax.
+        f.run(&[b"SET", b"str", b"v"]);
+        assert!(
+            f.run(&[b"XDELEX", b"str", b"BOGUS", b"IDS", b"0", b"1-1"])
+                .starts_with("-WRONGTYPE")
+        );
+    }
+
+    /// `XACKDEL`, whose reply is about the pending list and not about the log.
+    #[test]
+    fn xackdel_reports_what_the_group_was_holding() {
+        let mut f = Fixture::new();
+        for i in 1..=3 {
+            f.run(&[b"XADD", b"s", format!("{i}-1").as_bytes(), b"a", b"1"]);
+        }
+        f.run(&[b"XGROUP", b"CREATE", b"s", b"g", b"0"]);
+        f.run(&[
+            b"XREADGROUP",
+            b"GROUP",
+            b"g",
+            b"c",
+            b"COUNT",
+            b"1",
+            b"STREAMS",
+            b"s",
+            b">",
+        ]);
+
+        // Minus one is not about the stream: `2-1` is sitting there unread and
+        // still answers minus one, because the group was not holding it. It also
+        // stays, since only an ID that was acknowledged is deleted.
+        assert_eq!(
+            f.run(&[b"XACKDEL", b"s", b"g", b"IDS", b"2", b"1-1", b"2-1"]),
+            "*2\r\n:1\r\n:-1\r\n"
+        );
+        assert_eq!(f.run(&[b"XLEN", b"s"]), ":2\r\n");
+
+        // A missing group is minus one an ID and not a NOGROUP.
+        assert_eq!(
+            f.run(&[b"XACKDEL", b"s", b"nope", b"IDS", b"1", b"2-1"]),
+            "*1\r\n:-1\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"XACKDEL", b"nope", b"g", b"IDS", b"1", b"2-1"]),
+            "*1\r\n:-1\r\n"
+        );
+
+        // The acknowledgement happens whatever the condition says, so an ACKED
+        // that answers two has still emptied the pending list.
+        f.run(&[b"XREADGROUP", b"GROUP", b"g", b"c", b"STREAMS", b"s", b">"]);
+        f.run(&[b"XGROUP", b"CREATE", b"s", b"g2", b"0"]);
+        assert_eq!(
+            f.run(&[b"XACKDEL", b"s", b"g", b"ACKED", b"IDS", b"1", b"2-1"]),
+            "*1\r\n:2\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"XPENDING", b"s", b"g"]),
+            "*4\r\n:1\r\n$3\r\n3-1\r\n$3\r\n3-1\r\n*1\r\n*2\r\n$1\r\nc\r\n$1\r\n1\r\n"
+        );
+        assert_eq!(f.run(&[b"XLEN", b"s"]), ":2\r\n");
+    }
+
+    /// `XNACK`, which hands an entry back to nobody.
+    #[test]
+    fn xnack_releases_an_entry_for_the_next_claim() {
+        let mut f = Fixture::new();
+        f.run(&[b"XADD", b"s", b"1-1", b"a", b"1"]);
+        f.run(&[b"XADD", b"s", b"2-1", b"a", b"2"]);
+        f.run(&[b"XGROUP", b"CREATE", b"s", b"g", b"0"]);
+        f.run(&[b"XREADGROUP", b"GROUP", b"g", b"c1", b"STREAMS", b"s", b">"]);
+        // Twice, so the delivery count is two and the words have something to
+        // do with it.
+        f.run(&[b"XCLAIM", b"s", b"g", b"c1", b"0", b"1-1", b"2-1"]);
+
+        assert_eq!(
+            f.run(&[b"XNACK", b"s", b"g", b"FAIL", b"IDS", b"1", b"1-1"]),
+            ":1\r\n"
+        );
+        // No owner, no idle time, and the count left where it was. A released
+        // entry reads as idle for longer than any min-idle-time, which is what
+        // puts it at the front of the next claim.
+        assert_eq!(
+            f.run(&[b"XPENDING", b"s", b"g", b"-", b"+", b"10"]),
+            "*2\r\n*4\r\n$3\r\n1-1\r\n$0\r\n\r\n:-1\r\n:2\r\n*4\r\n$3\r\n2-1\r\n$2\r\nc1\r\n:0\r\n:2\r\n"
+        );
+        // The consumer no longer holds it, so a filtered XPENDING skips it.
+        assert_eq!(
+            f.run(&[b"XPENDING", b"s", b"g", b"-", b"+", b"10", b"c1"]),
+            "*1\r\n*4\r\n$3\r\n2-1\r\n$2\r\nc1\r\n:0\r\n:2\r\n"
+        );
+        // The bookmark did not move, so a `>` read will not hand it out again.
+        assert_eq!(
+            f.run(&[b"XREADGROUP", b"GROUP", b"g", b"c2", b"STREAMS", b"s", b">"]),
+            "*-1\r\n"
+        );
+        // A claim at any min-idle-time takes it.
+        assert_eq!(
+            f.run(&[
+                b"XAUTOCLAIM",
+                b"s",
+                b"g",
+                b"c2",
+                b"99999999",
+                b"-",
+                b"JUSTID"
+            ]),
+            "*3\r\n$3\r\n0-0\r\n*1\r\n$3\r\n1-1\r\n*0\r\n"
+        );
+
+        // `SILENT` takes one off the count rather than putting it back to zero,
+        // which only shows on an entry that has been handed out more than once.
+        // It was delivered and then claimed, so it is on two and goes to one.
+        f.run(&[b"XNACK", b"s", b"g", b"SILENT", b"IDS", b"1", b"1-1"]);
+        assert!(
+            f.run(&[b"XPENDING", b"s", b"g", b"-", b"+", b"10"])
+                .contains(":-1\r\n:1\r\n")
+        );
+        // And it stops at zero rather than wrapping.
+        f.run(&[b"XNACK", b"s", b"g", b"SILENT", b"IDS", b"1", b"1-1"]);
+        f.run(&[b"XNACK", b"s", b"g", b"SILENT", b"IDS", b"1", b"1-1"]);
+        assert!(
+            f.run(&[b"XPENDING", b"s", b"g", b"-", b"+", b"10"])
+                .contains(":-1\r\n:0\r\n")
+        );
+        // `FATAL` puts it at the ceiling, and `RETRYCOUNT` wins over the word.
+        f.run(&[b"XNACK", b"s", b"g", b"FATAL", b"IDS", b"1", b"1-1"]);
+        assert!(
+            f.run(&[b"XPENDING", b"s", b"g", b"-", b"+", b"10"])
+                .contains(":9223372036854775807\r\n")
+        );
+        f.run(&[
+            b"XNACK",
+            b"s",
+            b"g",
+            b"FATAL",
+            b"IDS",
+            b"1",
+            b"1-1",
+            b"RETRYCOUNT",
+            b"3",
+        ]);
+        assert!(
+            f.run(&[b"XPENDING", b"s", b"g", b"-", b"+", b"10"])
+                .contains(":-1\r\n:3\r\n")
+        );
+
+        // Releasing something the group is not holding is zero, and `FORCE`
+        // makes the pending entry rather than answering zero. A forced entry
+        // starts at zero, since there was no earlier count to keep.
+        f.run(&[b"XACK", b"s", b"g", b"2-1"]);
+        assert_eq!(
+            f.run(&[b"XNACK", b"s", b"g", b"FAIL", b"IDS", b"1", b"2-1"]),
+            ":0\r\n"
+        );
+        assert_eq!(
+            f.run(&[
+                b"XNACK", b"s", b"g", b"FAIL", b"IDS", b"1", b"2-1", b"FORCE"
+            ]),
+            ":1\r\n"
+        );
+        assert!(
+            f.run(&[b"XPENDING", b"s", b"g", b"-", b"+", b"10"])
+                .contains(":-1\r\n:0\r\n")
+        );
+        // `FORCE` on an ID the stream does not have is still zero.
+        assert_eq!(
+            f.run(&[
+                b"XNACK", b"s", b"g", b"FAIL", b"IDS", b"1", b"9-9", b"FORCE"
+            ]),
+            ":0\r\n"
+        );
+
+        // The group is looked up before the mode word, and it raises rather
+        // than answering per ID the way the two delete commands do.
+        assert_eq!(
+            f.run(&[b"XNACK", b"s", b"nope", b"BOGUS", b"IDS", b"1", b"1-1"]),
+            "-NOGROUP No such key 's' or consumer group 'nope'\r\n"
+        );
+        assert!(
+            f.run(&[b"XNACK", b"s", b"g", b"BOGUS", b"IDS", b"1", b"1-1"])
+                .starts_with("-ERR")
+        );
+        // Its own sentences, which are not the ones XDELEX uses.
+        assert!(
+            f.run(&[b"XNACK", b"s", b"g", b"FAIL", b"IDS", b"0", b"1-1"])
+                .contains("numids must be a positive integer")
+        );
+        assert!(
+            f.run(&[b"XNACK", b"s", b"g", b"FAIL", b"IDS", b"2", b"1-1"])
+                .contains("number of IDs doesn't match numids")
+        );
+        // Everything past the counted IDs is an option, so one too many is an
+        // option nobody recognises and not a count that does not add up.
+        assert!(
+            f.run(&[b"XNACK", b"s", b"g", b"FAIL", b"IDS", b"1", b"1-1", b"2-1"])
+                .contains("Unrecognized XNACK option '2-1'")
+        );
+    }
+
     /// `XINFO`, which is where the shape of the storage shows through.
     #[test]
     fn xinfo_reports_the_stream_the_groups_and_the_consumers() {

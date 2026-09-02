@@ -112,11 +112,20 @@ pub struct Nack {
     /// `XCLAIM RETRYCOUNT` sets it and `XPENDING` reports it, so a consumer can
     /// give up on a message that has killed several workers already.
     count: u64,
-    /// Which consumer slot holds it.
+    /// Which consumer slot holds it, or [`Nack::NOBODY`].
     owner: u32,
 }
 
 impl Nack {
+    /// The slot of an entry that is pending and that nobody holds.
+    ///
+    /// `XNACK` hands work back to the group without giving it to anybody, so the
+    /// pending list has to be able to hold an entry with no consumer against it.
+    /// Redis reports one as an empty consumer name and an idle time of minus
+    /// one, and treats it as idle for longer than any `min-idle-time` a claim can
+    /// name, which is what makes it the next thing `XAUTOCLAIM` picks up.
+    const NOBODY: u32 = u32::MAX;
+
     /// When it was last handed out.
     #[must_use]
     #[inline]
@@ -131,14 +140,70 @@ impl Nack {
         self.count
     }
 
+    /// Which consumer holds it, or `None` for one that has been released.
+    #[must_use]
+    #[inline]
+    pub fn owner(&self) -> Option<u32> {
+        (self.owner != Nack::NOBODY).then_some(self.owner)
+    }
+
     /// How long it has been sitting, which is what `min-idle-time` is compared to.
     ///
     /// Saturating, because a NACK whose time was set forward by `XCLAIM TIME` is
-    /// something a caller is allowed to ask for and is not idle at all.
+    /// something a caller is allowed to ask for and is not idle at all. An entry
+    /// nobody holds has been idle for as long as there is, so that every claim
+    /// and every `XPENDING IDLE` filter picks it up whatever they asked for.
     #[must_use]
     #[inline]
     pub fn idle(&self, now: u64) -> u64 {
+        if self.owner == Nack::NOBODY {
+            return u64::MAX;
+        }
         now.saturating_sub(self.time)
+    }
+}
+
+/// What releasing an entry does to its delivery count.
+///
+/// `XNACK` takes one of three words for this and they only differ here. A worker
+/// that could not do the job because the machine it was on went away wants the
+/// attempt not to count, one that failed the way work sometimes fails wants the
+/// count left alone, and one that has decided the message itself is the problem
+/// wants nobody to try it again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Retry {
+    /// `SILENT`: take one off the count, as if the delivery had not happened.
+    Down,
+    /// `FAIL`: leave the count where it is, and start a new entry at zero.
+    Keep,
+    /// `FATAL`: put the count as high as it goes.
+    Max,
+    /// `RETRYCOUNT n`: put the count at exactly this, whatever the word said.
+    At(u64),
+}
+
+impl Retry {
+    /// The count an entry that was on `had` ends up with.
+    ///
+    /// [`Retry::Down`] takes one off rather than putting the count back to zero,
+    /// which is worth saying because the two look the same on an entry that has
+    /// only been handed out once and that is the entry most people try it on. A
+    /// message that has killed four workers and is then released by a fifth for
+    /// a reason that was nothing to do with the message reads as three, not as
+    /// new. It saturates, so a released entry that is released again stays at
+    /// zero rather than wrapping.
+    ///
+    /// [`Retry::Max`] is [`i64::MAX`] and not [`u64::MAX`] because that is the
+    /// number Redis reports, and a client that reads the count into a signed
+    /// integer, which is what the protocol hands it, has to be able to hold it.
+    #[must_use]
+    pub fn applied(self, had: u64) -> u64 {
+        match self {
+            Retry::Down => had.saturating_sub(1),
+            Retry::Keep => had,
+            Retry::Max => i64::MAX as u64,
+            Retry::At(n) => n,
+        }
     }
 }
 
@@ -222,6 +287,14 @@ pub struct Group {
     pending: BTreeMap<Id, Nack>,
     /// The consumers. A slot is emptied on deletion and never reused.
     consumers: Vec<Option<Consumer>>,
+    /// How many of the pending entries nobody holds.
+    ///
+    /// Kept rather than counted because `XINFO STREAM FULL` reports it and that
+    /// command takes a `COUNT` precisely so that it never walks a long pending
+    /// list. Every line that moves a NACK on or off [`Nack::NOBODY`] is in this
+    /// file and adjusts this, and a test at the bottom checks the number against
+    /// a full scan after a run of mixed operations.
+    nacked: usize,
 }
 
 impl Group {
@@ -233,6 +306,7 @@ impl Group {
             read,
             pending: BTreeMap::new(),
             consumers: Vec::new(),
+            nacked: 0,
         }
     }
 
@@ -264,6 +338,13 @@ impl Group {
     #[inline]
     pub fn pending_len(&self) -> usize {
         self.pending.len()
+    }
+
+    /// How many of those nobody is holding, which `XNACK` is what makes nonzero.
+    #[must_use]
+    #[inline]
+    pub fn nacked_len(&self) -> usize {
+        self.nacked
     }
 
     /// The lowest and highest pending IDs, which is the `XPENDING` summary.
@@ -450,10 +531,68 @@ impl Group {
         let Some(nack) = self.pending.remove(&id) else {
             return false;
         };
-        if let Some(Some(c)) = self.consumers.get_mut(nack.owner as usize) {
+        match self.consumers.get_mut(nack.owner as usize) {
+            Some(Some(c)) => {
+                c.pending.remove(&id);
+            }
+            // Either the slot was emptied under it, which cannot happen because
+            // deleting a consumer takes its entries with it, or nobody held it.
+            _ => self.nacked -= usize::from(nack.owner == Nack::NOBODY),
+        }
+        true
+    }
+
+    /// Hand an entry back to the group without acknowledging it, which is `XNACK`.
+    ///
+    /// The entry stays pending and stops belonging to anybody, so it reads as
+    /// idle for longer than any claim can ask for and the next `XAUTOCLAIM`
+    /// takes it. `retry` is what the delivery count becomes, which is the whole
+    /// difference between the three words `XNACK` takes.
+    ///
+    /// Answers whether it was pending. The bookmark does not move, so a `>` read
+    /// will not hand it out again: releasing an entry offers it to a claim and
+    /// not to the group's next reader, which is Redis's behaviour and the only
+    /// one that keeps a released entry from being delivered twice over.
+    pub fn release(&mut self, id: Id, retry: Retry) -> bool {
+        let Some(nack) = self.pending.get_mut(&id) else {
+            return false;
+        };
+        let was = std::mem::replace(&mut nack.owner, Nack::NOBODY);
+        nack.count = retry.applied(nack.count);
+        // Zero rather than now, because the delivery time of an entry nobody
+        // holds is never read as a time: `XPENDING` reports minus one for it and
+        // `XINFO STREAM FULL` reports the zero.
+        nack.time = 0;
+        if was == Nack::NOBODY {
+            return true;
+        }
+        self.nacked += 1;
+        if let Some(Some(c)) = self.consumers.get_mut(was as usize) {
             c.pending.remove(&id);
         }
         true
+    }
+
+    /// Make a released entry out of one that was not pending, which is
+    /// `XNACK ... FORCE`.
+    ///
+    /// The caller has to have checked that the entry is really in the stream,
+    /// for the same reason [`Group::force`] does. A count of zero is where a
+    /// released entry that has never been delivered starts, whatever word was
+    /// used, because there is no earlier count for `FAIL` to keep.
+    pub fn force_release(&mut self, id: Id, retry: Retry) {
+        if self.release(id, retry) {
+            return;
+        }
+        self.pending.insert(
+            id,
+            Nack {
+                time: 0,
+                count: retry.applied(0),
+                owner: Nack::NOBODY,
+            },
+        );
+        self.nacked += 1;
     }
 
     /// Drop a pending entry without it having been acknowledged.
@@ -490,7 +629,11 @@ impl Group {
             nack.count += 1;
         }
         if was != slot {
-            if let Some(Some(c)) = self.consumers.get_mut(was as usize) {
+            if was == Nack::NOBODY {
+                // A claim is how a released entry gets an owner again, and it is
+                // the only way, since a `>` read never looks below the bookmark.
+                self.nacked -= 1;
+            } else if let Some(Some(c)) = self.consumers.get_mut(was as usize) {
                 c.pending.remove(&id);
             }
             if let Some(Some(c)) = self.consumers.get_mut(slot as usize) {
@@ -523,27 +666,36 @@ impl Group {
 
     /// Pending entries in `want`, oldest first.
     ///
-    /// The callback answers whether to carry on.
+    /// The callback answers whether to carry on, and gets `None` for the owner
+    /// of an entry that has been released, which `XPENDING` writes as an empty
+    /// name. A consumer filter never matches one of those, since asking what a
+    /// named consumer is holding is asking about entries that have an owner.
     pub fn pending_range<F>(&self, want: Filter, now: u64, mut f: F) -> usize
     where
-        F: FnMut(Id, &Nack, &Consumer) -> bool,
+        F: FnMut(Id, &Nack, Option<&Consumer>) -> bool,
     {
         let mut seen = 0;
         for (&id, nack) in self.pending.range(want.start..=want.end) {
             if want.count.is_some_and(|n| seen >= n) {
                 break;
             }
-            if want.owner.is_some_and(|c| c != nack.owner) {
+            if want.owner.is_some_and(|c| Some(c) != nack.owner()) {
                 continue;
             }
             if nack.idle(now) < want.min_idle {
                 continue;
             }
-            let Some(Some(c)) = self.consumers.get(nack.owner as usize) else {
-                continue;
+            let who = match nack.owner() {
+                Some(slot) => match self.consumers.get(slot as usize) {
+                    Some(Some(c)) => Some(c),
+                    // A slot that has been emptied under a NACK, which deleting
+                    // a consumer cannot leave behind and nothing else can make.
+                    _ => continue,
+                },
+                None => None,
             };
             seen += 1;
-            if !f(id, nack, c) {
+            if !f(id, nack, who) {
                 break;
             }
         }
@@ -821,7 +973,10 @@ mod tests {
                 ..Filter::default()
             };
             g.pending_range(want, 1_000, |id, _, c| {
-                out.push((id, String::from_utf8_lossy(c.name()).into_owned()));
+                out.push((
+                    id,
+                    String::from_utf8_lossy(c.expect("an owner").name()).into_owned(),
+                ));
                 true
             });
             out
@@ -921,5 +1076,152 @@ mod tests {
         g.set_id(Id::MIN, Some(0));
         assert_eq!(g.last_id(), Id::MIN);
         assert_eq!(g.pending_len(), 1, "somebody is still holding it");
+    }
+
+    /// A released entry is pending, owned by nobody, and idle for ever.
+    #[test]
+    fn releasing_takes_the_entry_out_of_the_consumers_hands() {
+        let mut g = group();
+        let a = g.consumer_or_create(b"alice", 1);
+        g.deliver(a, Id::new(5, 0), 100);
+
+        assert!(g.release(Id::new(5, 0), Retry::Keep));
+        assert_eq!(g.pending_len(), 1, "it is still the group's problem");
+        assert_eq!(
+            g.consumer(a).expect("alice").pending().count(),
+            0,
+            "and no longer alice's"
+        );
+        let nack = g.nack(Id::new(5, 0)).expect("a nack");
+        assert_eq!(nack.owner(), None);
+        assert_eq!(nack.count(), 1, "Keep left the count where it was");
+        // Idle for longer than any min-idle-time a claim can name, which is what
+        // puts it at the front of the next sweep.
+        assert_eq!(nack.idle(100), u64::MAX);
+        let mut out = Vec::new();
+        assert_eq!(g.claimable(Id::MIN, u64::MAX, 100, 10, &mut out), None);
+        assert_eq!(out, vec![Id::new(5, 0)]);
+
+        // Releasing it again is still true and does not count it twice.
+        assert!(g.release(Id::new(5, 0), Retry::Keep));
+        assert_eq!(g.nacked_len(), 1);
+        // And nothing pending is false, however it is asked.
+        assert!(!g.release(Id::new(9, 0), Retry::Keep));
+    }
+
+    #[test]
+    fn the_three_words_differ_only_in_the_delivery_count() {
+        let count = |retry| {
+            let mut g = group();
+            let a = g.consumer_or_create(b"alice", 1);
+            g.deliver(a, Id::new(5, 0), 1);
+            g.claim(Id::new(5, 0), a, 2, None, true);
+            g.release(Id::new(5, 0), retry);
+            g.nack(Id::new(5, 0)).expect("a nack").count()
+        };
+        assert_eq!(count(Retry::Down), 1, "one off, not back to nothing");
+        assert_eq!(count(Retry::Keep), 2);
+        assert_eq!(count(Retry::Max), i64::MAX as u64);
+        assert_eq!(count(Retry::At(7)), 7);
+    }
+
+    /// Forcing makes the pending entry when there is not one, and does not make
+    /// a second one when there is.
+    #[test]
+    fn forcing_a_release_is_the_same_call_twice() {
+        let mut g = group();
+        g.force_release(Id::new(5, 0), Retry::Keep);
+        assert_eq!(g.pending_len(), 1);
+        assert_eq!(
+            g.nack(Id::new(5, 0)).expect("a nack").count(),
+            0,
+            "there was no earlier count to keep"
+        );
+
+        g.force_release(Id::new(5, 0), Retry::At(4));
+        assert_eq!(g.pending_len(), 1);
+        assert_eq!(g.nacked_len(), 1);
+        assert_eq!(g.nack(Id::new(5, 0)).expect("a nack").count(), 4);
+    }
+
+    /// The counter behind `XINFO STREAM FULL`'s `nacked-count`, which is a field
+    /// and not a walk, so every line that moves an entry on or off `NOBODY` has
+    /// to keep it right. This is the walk, run against the field.
+    #[test]
+    fn the_nacked_count_matches_a_full_scan() {
+        let mut g = group();
+        let a = g.consumer_or_create(b"alice", 1);
+        let b = g.consumer_or_create(b"bob", 1);
+        for ms in 1..=6u64 {
+            g.deliver(a, Id::new(ms, 0), 100);
+        }
+
+        let scan = |g: &Group| {
+            (1..=9u64)
+                .filter(|&ms| g.nack(Id::new(ms, 0)).is_some_and(|n| n.owner().is_none()))
+                .count()
+        };
+        let agrees = |g: &Group| assert_eq!(g.nacked_len(), scan(g), "the field drifted");
+
+        agrees(&g);
+        g.release(Id::new(1, 0), Retry::Keep);
+        g.release(Id::new(2, 0), Retry::Keep);
+        agrees(&g);
+
+        // A claim takes one back into somebody's hands.
+        g.claim(Id::new(1, 0), b, 200, None, true);
+        agrees(&g);
+        // An ack takes one out of the list altogether, released or not.
+        assert!(g.ack(Id::new(2, 0)));
+        assert!(g.ack(Id::new(3, 0)));
+        agrees(&g);
+        // And a forced release on an entry nobody was ever handed.
+        g.force_release(Id::new(9, 0), Retry::Down);
+        agrees(&g);
+        assert_eq!(g.nacked_len(), 1);
+    }
+
+    /// A consumer filter skips released entries, because a released entry has no
+    /// consumer to match and `XPENDING key group - + n consumer` is a question
+    /// about one consumer's work.
+    #[test]
+    fn a_released_entry_is_not_anybodys_pending_work() {
+        let mut g = group();
+        let a = g.consumer_or_create(b"alice", 1);
+        g.deliver(a, Id::new(3, 0), 100);
+        g.deliver(a, Id::new(5, 0), 100);
+        g.release(Id::new(3, 0), Retry::Keep);
+
+        let seen = |g: &Group, owner| {
+            let mut out = Vec::new();
+            let want = Filter {
+                owner,
+                ..Filter::default()
+            };
+            g.pending_range(want, 1_000, |id, _, c| {
+                out.push((id, c.map(|c| c.name().to_vec())));
+                true
+            });
+            out
+        };
+
+        assert_eq!(
+            seen(&g, None),
+            vec![
+                (Id::new(3, 0), None),
+                (Id::new(5, 0), Some(b"alice".to_vec()))
+            ]
+        );
+        assert_eq!(
+            seen(&g, Some(a)),
+            vec![(Id::new(5, 0), Some(b"alice".to_vec()))]
+        );
+        // The summary counts it against nobody, so alice is down to one.
+        assert_eq!(
+            g.pending_counts()
+                .map(|(name, n)| (name.to_vec(), n))
+                .collect::<Vec<_>>(),
+            vec![(b"alice".to_vec(), 1)]
+        );
     }
 }

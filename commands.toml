@@ -2302,6 +2302,39 @@ wire = "verified"
 notes = "The entry is marked deleted in its node rather than moved out of it, so the cost is the lookup and not a rewrite of everything behind it. Every ID in the argument list is parsed before any of them is deleted, which is Redis's order and is visible: XDEL key 1-1 nonsense deletes nothing."
 
 [[command]]
+name = "XDELEX"
+group = "stream"
+since = "8.2.0"
+arity = -5
+plan = "point"
+bounded = "inherent"
+status = "shipped"
+wire = "verified"
+notes = "XDEL with a say in what happens to the groups that were handed the entry, and one integer per ID back instead of a count. ACKED asks a wider question than its name does: an entry is only safe to take when no group holds it and no group's bookmark is still behind it, so a stream with one group sitting at 0-0 refuses every ACKED delete."
+
+[[command]]
+name = "XACKDEL"
+group = "stream"
+since = "8.2.0"
+arity = -6
+plan = "point"
+bounded = "inherent"
+status = "shipped"
+wire = "verified"
+notes = "The reply is about the group's pending list and not about the log, so an ID the group was not holding is minus one even when the entry is sitting in the stream, and an ID it was holding is never minus one even when the entry has already been deleted."
+
+[[command]]
+name = "XNACK"
+group = "stream"
+since = "8.8.0"
+arity = -7
+plan = "point"
+bounded = "inherent"
+status = "shipped"
+wire = "verified"
+notes = "The other half of XACK. The entry goes back to the group with no owner and reads as idle for longer than any min-idle-time a claim can name, which puts it at the front of the next XAUTOCLAIM. The bookmark does not move, so a > read will not hand it out a second time. The three words only differ in the delivery count: SILENT takes one off it, FAIL leaves it alone and FATAL puts it at the signed ceiling."
+
+[[command]]
 name = "XTRIM"
 group = "stream"
 since = "5.0.0"
