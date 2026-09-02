@@ -911,13 +911,19 @@ fn info(server: &Server, args: Args<'_>, out: &mut Out) {
             );
         }
         if want("memory") {
+            // Both the cap and the quarter of it, because the quarter is an
+            // empirical number and somebody surprised by it should be able to
+            // see what it was a quarter of without reading the source. The
+            // reasoning is written out in `cap`.
+            let cap = crate::cap::cap();
             let _ = write!(
                 s,
                 "# Memory\r\nused_memory:{}\r\nused_memory_dataset:{}\r\n\
                  used_memory_overhead:{}\r\nmem_arena_bytes:{}\r\n\
                  mem_arena_segments:{}\r\nmem_index_bytes:{}\r\n\
-                 mem_client_buffers:{}\r\nmaxmemory:{}\r\n\
-                 maxmemory_policy:{}\r\n\r\n",
+                 mem_client_buffers:{}\r\ntotal_system_memory:{}\r\n\
+                 mem_cgroup_limit:{}\r\nmem_limit:{}\r\nmem_budget:{}\r\n\
+                 maxmemory:{}\r\nmaxmemory_policy:{}\r\n\r\n",
                 server.memory_bytes(),
                 server.dataset_bytes(),
                 server.memory_bytes() - server.dataset_bytes(),
@@ -925,6 +931,10 @@ fn info(server: &Server, args: Args<'_>, out: &mut Out) {
                 server.segment_count(),
                 server.index_bytes(),
                 server.conn_bytes(),
+                cap.host.unwrap_or(0),
+                cap.cgroup.unwrap_or(0),
+                cap.limit().unwrap_or(0),
+                cap.budget(),
                 server.maxmemory(),
                 server.db_ref(0).policy().name(),
             );

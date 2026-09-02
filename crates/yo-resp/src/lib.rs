@@ -108,6 +108,7 @@
 
 #![deny(missing_docs)]
 
+pub mod cap;
 pub mod dispatch;
 pub mod engine;
 pub mod error;
@@ -116,6 +117,7 @@ pub mod proto;
 pub mod reply;
 pub mod request;
 
+pub use cap::Cap;
 pub use engine::{Cmd, ConnId, Sink, Wire};
 pub use error::ProtocolError;
 pub use frame::Frame;

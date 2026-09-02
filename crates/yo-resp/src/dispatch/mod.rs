@@ -3286,6 +3286,49 @@ mod tests {
         );
     }
 
+    /// The memory section says what this process may use, not what the machine
+    /// has.
+    ///
+    /// The distinction is the whole point of it. A server inside a container
+    /// that reports the host's memory is a server whose operator sizes it for
+    /// memory it will be killed for touching, so all three numbers are there:
+    /// what the machine has, what the cgroup allows, and the quarter of the
+    /// tighter one that pools are sized from.
+    #[test]
+    fn info_memory_reports_the_cap_and_the_quarter_of_it_that_gets_used() {
+        let mut f = Fixture::new();
+        let info = f.run(&[b"INFO", b"memory"]);
+        for field in [
+            "total_system_memory:",
+            "mem_cgroup_limit:",
+            "mem_limit:",
+            "mem_budget:",
+        ] {
+            assert!(info.contains(field), "no {field} in {info}");
+        }
+
+        let field = |name: &str| -> u64 {
+            info.lines()
+                .find_map(|l| l.strip_prefix(name))
+                .unwrap_or_else(|| panic!("no {name} in {info}"))
+                .trim()
+                .parse()
+                .unwrap_or_else(|_| panic!("{name} is not a number in {info}"))
+        };
+        let limit = field("mem_limit:");
+        assert_eq!(field("mem_budget:"), limit / 4, "{info}");
+        // Zero means there is no limit to report, which is a real answer on a
+        // machine with no cgroups and no way to ask how big it is.
+        if limit != 0 {
+            let host = field("total_system_memory:");
+            let cgroup = field("mem_cgroup_limit:");
+            assert!(
+                limit == host || limit == cgroup,
+                "the limit came from neither number: {info}"
+            );
+        }
+    }
+
     /// The three counters, each on the path that raises it.
     ///
     /// `calls` on a command that worked, `failed_calls` on one that ran and
