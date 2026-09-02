@@ -51,8 +51,18 @@
 //! per partition probed, so rotating the centroids once when they are built
 //! turns tens of rotations a search into one.
 //!
-//! Filtered search, MUVERA, the HNSW compatibility view and writing any of this
-//! to a `.yo` file are the rest of M6.
+//! A filter runs inside the posting scan rather than after it. Every member
+//! carries a tag word beside its code, and a scan that can reject a member
+//! before it measures one can keep going into further partitions until it has
+//! enough that pass. That widening is the whole point: a selective filter means
+//! the nearest partitions may hold nothing the caller asked for, and a search
+//! that does not go looking is a recall lottery. [`Signature`] packs arbitrary
+//! attribute values into that one word, and it is allowed to say yes when it
+//! should have said no but never the other way round, so the caller's own
+//! predicate stays the authority.
+//!
+//! MUVERA, the HNSW compatibility view and writing any of this to a `.yo` file
+//! are the rest of M6.
 
 #![deny(missing_docs)]
 
@@ -60,6 +70,6 @@ pub mod partition;
 pub mod rabitq;
 pub mod rotate;
 
-pub use partition::{Hit, Partitions, Tuning, Vectors};
+pub use partition::{Any, Filter, Hit, Partitions, Signature, Tuning, Vectors};
 pub use rabitq::{Bits, Coded, Quantizer, Query};
 pub use rotate::Rotation;

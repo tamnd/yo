@@ -19,16 +19,30 @@
 //!
 //! # Where it stands
 //!
-//! Filled in from a real run. Until then the shape to expect is the scan row
-//! from `benches/rabitq.rs` times `probe`, plus a float distance against every
-//! centroid, plus a squared distance for each of the forty candidates reranked.
+//! On a 13th Gen Intel Core i9-13900K with nothing else running, criterion's
+//! middle estimate:
 //!
-//! The number to watch as collections grow is that centroid ranking, because it
-//! is linear in the number of partitions where everything else here is not. At
-//! 100k vectors and a posting of 256 that is under four hundred centroids and it
-//! is a small part of a query. At ten million it would be the whole query, and
-//! the fix is to quantise the centroids and scan them the same way everything
-//! else here is scanned.
+//! ```text
+//! shape                 search    candidates    insert
+//! 128 dims, 100k      139.8 us      112.4 us   22.9 us
+//! 768 dims, 20k       309.5 us      284.6 us   50.5 us
+//! ```
+//!
+//! So G12's millisecond has room: a query at 768 dimensions is under a third of
+//! it, and rerank is 25 microseconds of that and buys the difference between an
+//! estimate and an answer.
+//!
+//! G13's fifty thousand vectors a second per core is not there yet. An insert at
+//! 128 dimensions is 22.9 microseconds, which is 44 thousand a second, and at
+//! 768 it is 50.5, which is 20 thousand. Encode is 8 microseconds of that, so
+//! most of it is the centroid ranking, which is a float distance against every
+//! centroid and is linear in the number of partitions where everything else here
+//! is not. At 20k vectors and a posting of 256 that is 78 centroids, and at ten
+//! million it would be three thousand.
+//!
+//! That is one problem with one answer, and it is the same answer as everywhere
+//! else in this crate: quantise the centroids and scan them with popcounts too.
+//! Until then this is the row that says how far off the gate is.
 //!
 //! # Reading these on a machine someone else is using
 //!
