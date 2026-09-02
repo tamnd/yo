@@ -252,17 +252,6 @@ impl Group {
         self.read = read;
     }
 
-    /// How far behind the group is, when that can be worked out.
-    ///
-    /// `added` is the stream's total ever appended. The subtraction is only
-    /// honest when nothing has been deleted, which the caller knows and this
-    /// does not, so a caller that has tombstones passes `None` for `read` at
-    /// the point it loses count and gets a null lag here forever after.
-    #[must_use]
-    pub fn lag(&self, added: u64) -> Option<u64> {
-        self.read.map(|read| added.saturating_sub(read))
-    }
-
     /// How many entries are pending across the whole group.
     #[must_use]
     #[inline]
@@ -399,7 +388,6 @@ impl Group {
         if id > self.last {
             self.last = id;
         }
-        self.read = self.read.map(|n| n + 1);
         true
     }
 
@@ -414,7 +402,6 @@ impl Group {
         if id > self.last {
             self.last = id;
         }
-        self.read = self.read.map(|n| n + 1);
     }
 
     /// Hand an entry to whoever already holds it, which is a history read.
@@ -437,12 +424,14 @@ impl Group {
         true
     }
 
-    /// Give up on knowing how many entries the group has read.
+    /// Put the read counter where the stream has worked out it belongs.
     ///
-    /// Called when an entry the group had not reached is taken out from under
-    /// it, which makes the lag subtraction wrong and unrecoverable.
-    pub fn lose_count(&mut self) {
-        self.read = None;
+    /// The counter is a fact about the stream and not about the group, since
+    /// what a delivery does to it depends on whether anything has been deleted
+    /// ahead of the group. [`crate::stream::Stream::read_group`] is the one
+    /// caller, and it is the one that can see both.
+    pub fn set_read(&mut self, read: Option<u64>) {
+        self.read = read;
     }
 
     /// Finish with an entry, which is `XACK`.
@@ -653,7 +642,6 @@ mod tests {
         assert!(g.deliver(a, Id::new(7, 0), 12));
 
         assert_eq!(g.last_id(), Id::new(7, 0));
-        assert_eq!(g.entries_read(), Some(2));
         assert_eq!(g.pending_len(), 2);
         assert_eq!(
             g.consumer(a).expect("alice").pending().collect::<Vec<_>>(),
@@ -898,16 +886,24 @@ mod tests {
         assert_eq!(cursor, Some(Id::new(4, 0)));
     }
 
+    /// The read counter is set from outside and a delivery does not touch it.
+    ///
+    /// It looks like something the group should keep for itself, and it is not:
+    /// what a delivery does to it depends on whether anything has been deleted
+    /// ahead of the entry being handed over, which is a fact about the stream.
+    /// The rule lives in [`crate::stream::Stream::read_group`] and this only
+    /// holds the number.
     #[test]
-    fn the_lag_is_what_has_not_been_read() {
+    fn a_delivery_leaves_the_read_counter_to_the_stream() {
         let mut g = group();
         let a = g.consumer_or_create(b"alice", 1);
         g.deliver(a, Id::new(1, 0), 1);
-        assert_eq!(g.lag(10), Some(9));
+        assert_eq!(g.entries_read(), Some(0), "the group did not count it");
 
-        // A group that lost count says so rather than guessing.
-        g.set_id(Id::new(1, 0), None);
-        assert_eq!(g.lag(10), None);
+        g.set_read(Some(1));
+        assert_eq!(g.entries_read(), Some(1));
+        g.set_read(None);
+        assert_eq!(g.entries_read(), None, "and it can be given up on");
     }
 
     #[test]
