@@ -18,7 +18,62 @@
 //!
 //! # Where it stands
 //!
-//! Filled in from a run on the i9-13900K.
+//! On a 13th Gen Intel Core i9-13900K with nothing else running, criterion's
+//! middle estimate:
+//!
+//! ```text
+//! degree                     4        20       200
+//! cold one hop         36.6 ns   65.7 ns  414.6 ns
+//! cold degree          13.6 ns         -   17.0 ns
+//! ```
+//!
+//! The one hop row is a straight line again: fit it and the intercept is 28.6
+//! nanoseconds and the slope is 1.93 nanoseconds an edge. Against the hot
+//! plane's 19.7 and 1.0, the probe costs 9 nanoseconds more because it is two
+//! dependent loads rather than one, and the decode is a little under twice a
+//! sequential read of a `u64` array. Two shifts, a mask and an add an edge, for
+//! a tenth of the memory, is the whole trade and it is a good one.
+//!
+//! The degree row is flat, 13.6 at degree 4 and 17.0 at degree 200, because it
+//! reads the offset and the degree and stops. It is faster than the hop's own
+//! intercept for the same reason: it never touches the gaps.
+//!
+//! ```text
+//! over ten million edges                 hot       cold
+//! one hop                            79.3 ns   103.3 ns
+//! two hops, serial                    2.06 us   1.90 us
+//! two hops, prefetched                1.60 us   1.71 us
+//! ```
+//!
+//! This is the comparison the promotion decision in `11` section 2 turns on and
+//! it does not say what I expected it to. A single cold hop is 1.30 times a hot
+//! one, so the cold form is a tier rather than an archive and there is no size
+//! of graph where reading it is out of the question.
+//!
+//! The two hop rows are more interesting than that. Serial, the cold form is
+//! quicker than the hot one, 1.90 microseconds against 2.06, because the graph
+//! is a tenth of the size and the walk is waiting on memory rather than on
+//! arithmetic. Prefetched, it is slower, 1.71 against 1.60, because once the
+//! misses are hidden there is nothing left for the decode to hide behind. So
+//! the answer to when a graph wants promoting is not about the walk being hot,
+//! it is about whether the walk is issuing its probes ahead of itself, and a
+//! walk that is not should arguably stay cold. That is worth writing into O-G2
+//! rather than guessing at.
+//!
+//! Both are far under the 50 microsecond gate in G14 either way.
+//!
+//! The one hop rows here are twice the ones in the degree table above because
+//! this graph is ten million edges rather than one million and does not fit in
+//! cache. That difference, 36.6 against 79.3 for the hot plane at the same
+//! degree, is the cache miss and nothing else.
+//!
+//! ```text
+//! order_by_degree over ten million edges   35.7 ms
+//! build over ten million edges            355.6 ms
+//! ```
+//!
+//! Both run on a sweep rather than on the write path. The encoder is 28 million
+//! edges a second, most of which is the sort.
 //!
 //! # Reading these on a machine someone else is using
 //!

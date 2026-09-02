@@ -1,6 +1,6 @@
 //! The cold form: the same adjacency at bits an edge rather than bytes.
 //!
-//! [`Adjacency`](crate::Adjacency) is what a graph being written looks like,
+//! [`Adjacency`] is what a graph being written looks like,
 //! twelve bytes an edge and every operation O(1). [`Csr`] is what the settled
 //! part of it looks like once nothing is changing it: read only, node grouped,
 //! and about an order of magnitude smaller. Spec `11` section 2 calls these the
