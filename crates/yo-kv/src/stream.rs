@@ -985,18 +985,25 @@ impl Stream {
         // Which IDs, decided before anything is touched, so that the redelivery
         // and the walk are two passes over a small list rather than one pass
         // holding the group and the nodes at the same time.
-        let g = self.group(group)?;
-        let c = g.consumer_named(consumer)?;
-        let ids: Vec<Id> = c
+        //
+        // The consumer is created rather than looked up, because a history read
+        // by a name nobody has used is an empty list and not a missing group. A
+        // worker that restarts under a new name and asks for its own backlog
+        // first is exactly that case, and Redis answers it with an empty list
+        // and the consumer left behind.
+        let g = self.group_mut(group)?;
+        let slot = g.consumer_or_create(consumer, now);
+        let ids: Vec<Id> = g
+            .consumer(slot)
+            .expect("the slot that was just made")
             .pending()
             .filter(|&id| id > after)
             .take(count.unwrap_or(usize::MAX))
             .collect();
-
-        let g = self.group_mut(group).expect("the group found a moment ago");
         for &id in &ids {
             g.redeliver(id, now);
         }
+        g.touch(slot, now, !ids.is_empty());
 
         let mut seen = 0;
         for &id in &ids {
@@ -1044,6 +1051,12 @@ impl Stream {
         now: u64,
         gone: &mut Vec<Id>,
     ) -> Option<Vec<Id>> {
+        // Before the loop, so that a claim which takes nothing still leaves the
+        // consumer behind. Redis creates it either way, and an `XAUTOCLAIM`
+        // against an empty pending list is the ordinary way that happens: the
+        // consumer turns up in `XINFO CONSUMERS` straight after, holding
+        // nothing.
+        self.group_mut(group)?.consumer_or_create(consumer, now);
         let mut took = Vec::new();
         for &id in ids {
             let here = self.contains(id);
@@ -1071,6 +1084,14 @@ impl Stream {
                     }
                 }
             }
+        }
+        // Active only when something moved, which is the same rule a read
+        // follows. A claim that found nothing idle enough leaves the consumer
+        // reading as never active.
+        if !took.is_empty() {
+            let g = self.group_mut(group).expect("the group found a moment ago");
+            let slot = g.consumer_or_create(consumer, now);
+            g.touch(slot, now, true);
         }
         Some(took)
     }
@@ -2246,7 +2267,7 @@ mod tests {
         assert_eq!(s.lag(g), Some(0));
         let c = g.consumer_named(b"alice").expect("alice");
         assert_eq!(c.len(), 3);
-        assert_eq!(c.active(), 500);
+        assert_eq!(c.active(), Some(500));
     }
 
     #[test]
@@ -2261,7 +2282,7 @@ mod tests {
             .expect("the group")
             .consumer_named(b"alice")
             .expect("alice");
-        assert_eq!((c.seen(), c.active()), (900, 100));
+        assert_eq!((c.seen(), c.active()), (900, Some(100)));
     }
 
     #[test]

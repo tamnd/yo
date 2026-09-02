@@ -204,3 +204,18 @@ reason = "Both options set eviction metadata on a real server, so a key restored
 status = "until"
 resolved_by = "M5"
 spec = "14 section 5"
+
+[[divergence]]
+id = "D-27"
+title = "XINFO STREAM leaves out the six idempotency fields"
+reason = "Redis 8.10 answers sixteen pairs and six of them are about the idempotency tracking it grew in 8.6: idmp-duration, idmp-maxsize, pids-tracked, iids-tracked, iids-added and iids-duplicates. That feature is a window in which a producer's own entry id is remembered so a retried XADD is recognised as the same write rather than appended twice, and there is none of it here, so there is nothing behind those numbers. Sending them as zeros would be worse than leaving them out, because zero is a real reading for four of them and a client that sees iids-duplicates 0 has been told the deduplication ran and found nothing rather than that it never ran. Ten pairs come back instead, in the same order Redis sends them in, so a client reading fields by name gets the same answer for every field it can find and finds nothing where a feature does not exist. This closes when XCFGSET and XIDMPRECORD land with the tracking behind them."
+status = "until"
+resolved_by = "M8"
+spec = "08 section 7"
+
+[[divergence]]
+id = "D-28"
+title = "radix-tree-keys and radix-tree-nodes count listpack nodes"
+reason = "Both fields describe the rax Redis keeps its stream nodes in, where the keys are the first id of each node and the nodes are the internal tree nodes holding them, so a stream of three listpacks under one branch reports three keys and two nodes and the second number moves with the shape of the tree and not only with the data. The storage here is a node list and not a rax, so there is no tree to count and the honest reading of both is the number of listpack nodes, with a floor of one on the second because a real server reports a root node for an empty stream. What a client can do with these fields is watch them to see how the stream is laid out underneath, and they still do that: keys is exact, and nodes moves the same way for the same reason. Nothing in the reply shape changes and no client that reads the two as a health signal reads them differently. This is what the structure is and it is not going to grow a rax to make two diagnostic numbers match, so it is permanent."
+status = "permanent"
+spec = "08 section 7"

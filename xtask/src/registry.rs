@@ -292,13 +292,22 @@ fn check_commands(tables: &[Table], ids: &BTreeSet<String>, bad: &mut Vec<String
         }
 
         // `12` section 10, the other half of the register.
+        // One id, or several separated by commas. A command can diverge twice
+        // for two unrelated reasons with two different lifetimes, which XINFO
+        // does: one of its two goes away when a feature lands and the other is
+        // permanent, so they cannot be written as one row.
         if let Some(v) = t.get("divergent") {
             match v.as_str() {
-                Some(id) if ids.contains(id) => {}
-                Some(id) => bad.push(format!(
-                    "commands.toml line {}: {name} names divergence {id}, which is not in divergences.toml",
-                    t.line
-                )),
+                Some(list) => {
+                    for id in list.split(',').map(str::trim) {
+                        if !ids.contains(id) {
+                            bad.push(format!(
+                                "commands.toml line {}: {name} names divergence {id}, which is not in divergences.toml",
+                                t.line
+                            ));
+                        }
+                    }
+                }
                 None => bad.push(format!(
                     "commands.toml line {}: {name} has divergent = {v}, which should be a divergence id",
                     t.line
@@ -558,7 +567,7 @@ mod tests {
         // A row that claims a verified argument order for a command nothing
         // runs, which is the claim that reads as done and is not.
         let tables = toml::parse(
-            "[[command]]\nname = \"XADD\"\ngroup = \"stream\"\nsince = \"5.0.0\"\narity = -5\n\
+            "[[command]]\nname = \"XACKDEL\"\ngroup = \"stream\"\nsince = \"8.2.0\"\narity = -5\n\
              plan = \"point\"\nbounded = \"inherent\"\nstatus = \"shipped\"\nwire = \"verified\"\n",
         )
         .unwrap();

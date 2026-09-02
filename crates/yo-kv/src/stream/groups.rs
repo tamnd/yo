@@ -153,7 +153,14 @@ pub struct Consumer {
     /// Redis separates the two because a consumer polling an empty stream is
     /// alive but idle, and telling those apart is the difference between a
     /// worker that is stuck and one that has nothing to do.
-    active: u64,
+    ///
+    /// `None` for a consumer that has never had anything, which is what
+    /// `XGROUP CREATECONSUMER` makes and what an `XREADGROUP` that found nothing
+    /// leaves behind. Redis reports that as an active time of minus one rather
+    /// than as the moment the consumer turned up, and `XINFO CONSUMERS` passes
+    /// it through to `inactive`, so a fresh consumer reads as never active and
+    /// not as active a moment ago.
+    active: Option<u64>,
     /// What it holds, in ID order.
     pending: BTreeSet<Id>,
 }
@@ -173,10 +180,10 @@ impl Consumer {
         self.seen
     }
 
-    /// When it last actually read something.
+    /// When it last actually read something, or `None` if it never has.
     #[must_use]
     #[inline]
-    pub fn active(&self) -> u64 {
+    pub fn active(&self) -> Option<u64> {
         self.active
     }
 
@@ -319,7 +326,7 @@ impl Group {
         self.consumers.push(Some(Consumer {
             name: name.to_vec(),
             seen: now,
-            active: now,
+            active: None,
             pending: BTreeSet::new(),
         }));
         (self.consumers.len() - 1) as u32
@@ -362,7 +369,7 @@ impl Group {
         if let Some(Some(c)) = self.consumers.get_mut(slot as usize) {
             c.seen = now;
             if read {
-                c.active = now;
+                c.active = Some(now);
             }
         }
     }

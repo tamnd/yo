@@ -64,6 +64,7 @@ mod scan;
 mod scripting;
 mod server;
 mod sets;
+mod streams;
 mod strings;
 pub mod table;
 mod zsets;
@@ -832,7 +833,7 @@ pub fn resolved(
     // `COPY`, `SWAPDB` and `FLUSHALL` reach a database nobody selected, so the
     // two groups that hold them mark all of them rather than the session's.
     server.dirty |= match spec.group {
-        "string" | "set" | "hash" | "list" | "zset" | "array" => 1u64 << session.db,
+        "string" | "set" | "hash" | "list" | "zset" | "array" | "stream" => 1u64 << session.db,
         _ => ALL_DATABASES,
     };
 
@@ -874,6 +875,15 @@ pub fn resolved(
             "graph" => {
                 let db = session.db;
                 graph::execute(&mut server.dbs[db], spec, args, out).map(|()| Flow::Continue)
+            }
+            // The clock is read before the database is borrowed, because every
+            // stream command needs the time and it lives on the server. An
+            // `XADD` with no ID, an `XCLAIM` working out what is idle and an
+            // `XINFO` reporting it all have to agree about what moment this is.
+            "stream" => {
+                let db = session.db;
+                let now = server.now_ms();
+                streams::execute(&mut server.dbs[db], spec, args, now, out).map(|()| Flow::Continue)
             }
             // The one keyspace command that needs more than the databases,
             // because the socket it talks down is held on the server between
@@ -7547,5 +7557,680 @@ mod tests {
             f.run(&[b"G.OUT", b"social", b"third", b"F"]),
             "*2\r\n$1\r\n0\r\n*1\r\n$6\r\nsecond\r\n"
         );
+    }
+
+    /// The three shapes an `XADD` id can take, and the one rule behind all of
+    /// them.
+    #[test]
+    fn xadd_ids_only_ever_go_up() {
+        let mut f = Fixture::new();
+        // A bare millisecond is that millisecond and sequence zero.
+        assert_eq!(f.run(&[b"XADD", b"s", b"5", b"a", b"1"]), "$3\r\n5-0\r\n");
+        // And `5-*` is the next free sequence inside it.
+        assert_eq!(f.run(&[b"XADD", b"s", b"5-*", b"a", b"2"]), "$3\r\n5-1\r\n");
+        assert_eq!(f.run(&[b"XADD", b"s", b"5-*", b"a", b"3"]), "$3\r\n5-2\r\n");
+        assert_eq!(f.run(&[b"XADD", b"s", b"6-9", b"a", b"4"]), "$3\r\n6-9\r\n");
+        assert_eq!(f.run(&[b"XLEN", b"s"]), ":4\r\n");
+
+        assert!(
+            f.run(&[b"XADD", b"s", b"6-9", b"a", b"5"])
+                .contains("equal or smaller")
+        );
+        assert!(
+            f.run(&[b"XADD", b"s", b"0-0", b"a", b"5"])
+                .contains("must be greater than 0-0")
+        );
+        assert!(
+            f.run(&[b"XADD", b"s", b"nonsense", b"a", b"5"])
+                .contains("Invalid stream ID")
+        );
+        // The pairs have to be pairs, and Redis calls an odd one an arity error
+        // rather than a syntax error even though the table has already passed.
+        assert!(
+            f.run(&[b"XADD", b"s", b"*", b"a"])
+                .contains("wrong number of arguments")
+        );
+
+        // `NOMKSTREAM` on a key that is not there is a null and not a zero, so a
+        // producer can tell nobody is consuming this yet from the write landed.
+        assert_eq!(
+            f.run(&[b"XADD", b"gone", b"NOMKSTREAM", b"*", b"a", b"1"]),
+            "$-1\r\n"
+        );
+        assert_eq!(f.run(&[b"EXISTS", b"gone"]), ":0\r\n");
+        assert_eq!(f.run(&[b"TYPE", b"s"]), "+stream\r\n");
+        assert_eq!(f.run(&[b"OBJECT", b"ENCODING", b"s"]), "$6\r\nstream\r\n");
+    }
+
+    /// The trim options, which are three keywords that disagree about how many
+    /// arguments they take.
+    #[test]
+    fn trimming_reads_its_options_the_way_redis_does() {
+        let mut f = Fixture::new();
+        for i in 1..=10u32 {
+            f.run(&[b"XADD", b"s", format!("{i}-1").as_bytes(), b"a", b"1"]);
+        }
+        assert_eq!(f.run(&[b"XTRIM", b"s", b"MAXLEN", b"4"]), ":6\r\n");
+        assert_eq!(f.run(&[b"XLEN", b"s"]), ":4\r\n");
+        assert_eq!(f.run(&[b"XTRIM", b"s", b"MINID", b"9"]), ":2\r\n");
+        assert_eq!(f.run(&[b"XLEN", b"s"]), ":2\r\n");
+
+        // One argument after the keyword and the `~` is read as the threshold,
+        // which is what a real server does and is the reason this is a number
+        // complaint and not a syntax one.
+        assert!(
+            f.run(&[b"XTRIM", b"s", b"MAXLEN", b"~"])
+                .contains("not an integer")
+        );
+        assert!(
+            f.run(&[b"XTRIM", b"s", b"MAXLEN", b"-1"])
+                .contains("MAXLEN argument must be >= 0")
+        );
+        // The strategy check runs before the approximation check, so a LIMIT
+        // with neither is told about the missing strategy.
+        assert!(
+            f.run(&[b"XTRIM", b"s", b"LIMIT", b"5"])
+                .contains("without specifying a trimming strategy")
+        );
+        assert!(
+            f.run(&[b"XTRIM", b"s", b"MAXLEN", b"5", b"LIMIT", b"5"])
+                .contains("without the special ~ option")
+        );
+        assert!(
+            f.run(&[b"XTRIM", b"s", b"MAXLEN", b"5", b"MINID", b"5"])
+                .contains("at the same time are not compatible")
+        );
+        // NOMKSTREAM is XADD's and XTRIM does not take it.
+        assert!(
+            f.run(&[b"XTRIM", b"s", b"NOMKSTREAM", b"MAXLEN", b"5"])
+                .contains("syntax error")
+        );
+        assert_eq!(f.run(&[b"XTRIM", b"missing", b"MAXLEN", b"5"]), ":0\r\n");
+    }
+
+    /// `XRANGE`, whose two kinds of nothing are the thing worth pinning.
+    #[test]
+    fn xrange_looks_the_key_up_before_it_reads_the_count() {
+        let mut f = Fixture::new();
+        f.run(&[b"XADD", b"s", b"5-1", b"a", b"1"]);
+        f.run(&[b"XADD", b"s", b"6-1", b"b", b"2"]);
+
+        assert_eq!(
+            f.run(&[b"XRANGE", b"s", b"-", b"+"]),
+            "*2\r\n*2\r\n$3\r\n5-1\r\n*2\r\n$1\r\na\r\n$1\r\n1\r\n\
+             *2\r\n$3\r\n6-1\r\n*2\r\n$1\r\nb\r\n$1\r\n2\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"XREVRANGE", b"s", b"+", b"-", b"COUNT", b"1"]),
+            "*1\r\n*2\r\n$3\r\n6-1\r\n*2\r\n$1\r\nb\r\n$1\r\n2\r\n"
+        );
+        // The exclusive bound is stepped after the missing sequence is filled
+        // in, so `(6` is `6-` and the largest sequence there is, minus one, and
+        // `6-1` is still in the range.
+        assert_eq!(
+            f.run(&[b"XRANGE", b"s", b"-", b"(6"]),
+            "*2\r\n*2\r\n$3\r\n5-1\r\n*2\r\n$1\r\na\r\n$1\r\n1\r\n\
+             *2\r\n$3\r\n6-1\r\n*2\r\n$1\r\nb\r\n$1\r\n2\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"XRANGE", b"s", b"(5-1", b"+"]),
+            "*1\r\n*2\r\n$3\r\n6-1\r\n*2\r\n$1\r\nb\r\n$1\r\n2\r\n"
+        );
+        assert!(
+            f.run(&[b"XRANGE", b"s", b"(-", b"+"])
+                .contains("Invalid stream ID")
+        );
+
+        // The two kinds of nothing. A key that is not there is an empty array
+        // and a key that is there with a count of zero is a null array, because
+        // the lookup happens first.
+        assert_eq!(
+            f.run(&[b"XRANGE", b"missing", b"-", b"+", b"COUNT", b"0"]),
+            "*0\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"XRANGE", b"s", b"-", b"+", b"COUNT", b"0"]),
+            "*-1\r\n"
+        );
+        f.run(&[b"SET", b"str", b"v"]);
+        assert!(
+            f.run(&[b"XRANGE", b"str", b"-", b"+", b"COUNT", b"0"])
+                .starts_with("-WRONGTYPE")
+        );
+        // The count is read in a loop, so the last one wins.
+        assert_eq!(
+            f.run(&[b"XRANGE", b"s", b"-", b"+", b"COUNT", b"2", b"COUNT", b"1"]),
+            "*1\r\n*2\r\n$3\r\n5-1\r\n*2\r\n$1\r\na\r\n$1\r\n1\r\n"
+        );
+    }
+
+    /// `XDEL` and `XACK` check every id before they touch any of them.
+    #[test]
+    fn a_bad_id_late_in_the_list_stops_the_whole_command() {
+        let mut f = Fixture::new();
+        f.run(&[b"XADD", b"s", b"1-1", b"a", b"1"]);
+        f.run(&[b"XADD", b"s", b"2-1", b"a", b"2"]);
+        assert!(
+            f.run(&[b"XDEL", b"s", b"1-1", b"nonsense"])
+                .contains("Invalid stream ID")
+        );
+        assert_eq!(f.run(&[b"XLEN", b"s"]), ":2\r\n");
+        assert_eq!(f.run(&[b"XDEL", b"s", b"1-1", b"9-9"]), ":1\r\n");
+        assert_eq!(f.run(&[b"XLEN", b"s"]), ":1\r\n");
+        assert_eq!(f.run(&[b"XDEL", b"missing", b"1-1"]), ":0\r\n");
+        assert_eq!(f.run(&[b"XACK", b"missing", b"g", b"1-1"]), ":0\r\n");
+    }
+
+    /// `XGROUP`, and the two different complaints it makes about arguments.
+    #[test]
+    fn xgroup_has_an_arity_per_subcommand() {
+        let mut f = Fixture::new();
+        assert!(
+            f.run(&[b"XGROUP", b"CREATE", b"s", b"g", b"$"])
+                .contains("requires the key")
+        );
+        assert_eq!(
+            f.run(&[b"XGROUP", b"CREATE", b"s", b"g", b"$", b"MKSTREAM"]),
+            "+OK\r\n"
+        );
+        // A second CREATE is BUSYGROUP and not an ordinary error, because a
+        // client racing another one to make a group branches on the prefix.
+        assert!(
+            f.run(&[b"XGROUP", b"CREATE", b"s", b"g", b"$"])
+                .starts_with("-BUSYGROUP")
+        );
+        assert_eq!(
+            f.run(&[b"XGROUP", b"CREATECONSUMER", b"s", b"g", b"c"]),
+            ":1\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"XGROUP", b"CREATECONSUMER", b"s", b"g", b"c"]),
+            ":0\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"XGROUP", b"DELCONSUMER", b"s", b"g", b"c"]),
+            ":0\r\n"
+        );
+
+        // Below the subcommand's own arity is an arity error naming the pair.
+        let short = f.run(&[b"XGROUP", b"DESTROY", b"s"]);
+        assert!(
+            short.contains("wrong number of arguments for 'xgroup|destroy' command"),
+            "{short}"
+        );
+        // At or above it in a shape the handler will not take is the other one.
+        let odd = f.run(&[b"XGROUP", b"SETID", b"s", b"g", b"0", b"ENTRIESREAD"]);
+        assert!(
+            odd.contains("unknown subcommand or wrong number of arguments for 'SETID'"),
+            "{odd}"
+        );
+        assert!(
+            f.run(&[b"XGROUP", b"NOSUCH", b"s"])
+                .contains("Try XGROUP HELP")
+        );
+
+        assert_eq!(f.run(&[b"XGROUP", b"SETID", b"s", b"g", b"0"]), "+OK\r\n");
+        assert!(
+            f.run(&[b"XGROUP", b"SETID", b"s", b"nogroup", b"0"])
+                .starts_with("-NOGROUP")
+        );
+        assert_eq!(f.run(&[b"XGROUP", b"DESTROY", b"s", b"g"]), ":1\r\n");
+        assert_eq!(f.run(&[b"XGROUP", b"DESTROY", b"s", b"g"]), ":0\r\n");
+        assert!(
+            f.run(&[b"XGROUP", b"DESTROY", b"missing", b"g"])
+                .contains("requires the key")
+        );
+    }
+
+    /// A group read, an acknowledgement, and what is left in between.
+    #[test]
+    fn xreadgroup_hands_out_and_xack_takes_back() {
+        let mut f = Fixture::new();
+        f.run(&[b"XADD", b"s", b"1-1", b"a", b"1"]);
+        f.run(&[b"XADD", b"s", b"2-1", b"a", b"2"]);
+        f.run(&[b"XGROUP", b"CREATE", b"s", b"g", b"0"]);
+
+        let first = f.run(&[
+            b"XREADGROUP",
+            b"GROUP",
+            b"g",
+            b"c1",
+            b"COUNT",
+            b"1",
+            b"STREAMS",
+            b"s",
+            b">",
+        ]);
+        assert_eq!(
+            first,
+            "*1\r\n*2\r\n$1\r\ns\r\n*1\r\n*2\r\n$3\r\n1-1\r\n*2\r\n$1\r\na\r\n$1\r\n1\r\n"
+        );
+        // A history read names its stream even with nothing to show, which is
+        // the difference between it and a `>` read that found nothing.
+        assert_eq!(
+            f.run(&[b"XREADGROUP", b"GROUP", b"g", b"c2", b"STREAMS", b"s", b"0"]),
+            "*1\r\n*2\r\n$1\r\ns\r\n*0\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"XREADGROUP", b"GROUP", b"g", b"c1", b"STREAMS", b"s", b"0"]),
+            "*1\r\n*2\r\n$1\r\ns\r\n*1\r\n*2\r\n$3\r\n1-1\r\n*2\r\n$1\r\na\r\n$1\r\n1\r\n"
+        );
+
+        assert_eq!(
+            f.run(&[b"XPENDING", b"s", b"g"]),
+            "*4\r\n:1\r\n$3\r\n1-1\r\n$3\r\n1-1\r\n*1\r\n*2\r\n$2\r\nc1\r\n$1\r\n1\r\n"
+        );
+        assert_eq!(f.run(&[b"XACK", b"s", b"g", b"1-1"]), ":1\r\n");
+        assert_eq!(f.run(&[b"XACK", b"s", b"g", b"1-1"]), ":0\r\n");
+        // Empty is four nulls and not a zero with three empty things.
+        assert_eq!(
+            f.run(&[b"XPENDING", b"s", b"g"]),
+            "*4\r\n:0\r\n$-1\r\n$-1\r\n*-1\r\n"
+        );
+
+        // A history read of an entry that has since been deleted is the id with
+        // a null beside it, so the consumer can still acknowledge it.
+        f.run(&[b"XREADGROUP", b"GROUP", b"g", b"c1", b"STREAMS", b"s", b">"]);
+        f.run(&[b"XDEL", b"s", b"2-1"]);
+        assert_eq!(
+            f.run(&[b"XREADGROUP", b"GROUP", b"g", b"c1", b"STREAMS", b"s", b"0"]),
+            "*1\r\n*2\r\n$1\r\ns\r\n*1\r\n*2\r\n$3\r\n2-1\r\n$-1\r\n"
+        );
+
+        // The group lookup runs before the id parse, so a `+` at a stream with
+        // no such group is told about the group and not about the id.
+        assert!(
+            f.run(&[
+                b"XREADGROUP",
+                b"GROUP",
+                b"nope",
+                b"c",
+                b"STREAMS",
+                b"s",
+                b"+"
+            ])
+            .starts_with("-NOGROUP")
+        );
+        assert!(
+            f.run(&[b"XREADGROUP", b"GROUP", b"g", b"c", b"STREAMS", b"s", b"$"])
+                .contains("meaningless in the context of XREADGROUP")
+        );
+        assert!(
+            f.run(&[b"XREAD", b"GROUP", b"g", b"c", b"STREAMS", b"s", b"0"])
+                .contains("only supported by XREADGROUP")
+        );
+        assert!(
+            f.run(&[
+                b"XREADGROUP",
+                b"GROUP",
+                b"g",
+                b"c",
+                b"STREAMS",
+                b"s",
+                b"a",
+                b"b"
+            ])
+            .contains("Unbalanced 'xreadgroup' list of streams")
+        );
+    }
+
+    /// `XREAD` without `BLOCK`, which answers now and takes nothing for an
+    /// answer.
+    #[test]
+    fn xread_with_no_block_writes_the_null_itself() {
+        let mut f = Fixture::new();
+        f.run(&[b"XADD", b"s", b"1-1", b"a", b"1"]);
+        assert_eq!(
+            f.run(&[b"XREAD", b"STREAMS", b"s", b"0"]),
+            "*1\r\n*2\r\n$1\r\ns\r\n*1\r\n*2\r\n$3\r\n1-1\r\n*2\r\n$1\r\na\r\n$1\r\n1\r\n"
+        );
+        // Nothing new is a null array and not an empty one, and a stream with
+        // nothing new is left out rather than sent with an empty list.
+        assert_eq!(f.run(&[b"XREAD", b"STREAMS", b"s", b"1-1"]), "*-1\r\n");
+        assert_eq!(f.run(&[b"XREAD", b"STREAMS", b"missing", b"0"]), "*-1\r\n");
+        f.run(&[b"XADD", b"other", b"1-1", b"b", b"2"]);
+        assert_eq!(
+            f.run(&[b"XREAD", b"STREAMS", b"s", b"other", b"1-1", b"0"]),
+            "*1\r\n*2\r\n$5\r\nother\r\n*1\r\n*2\r\n$3\r\n1-1\r\n*2\r\n$1\r\nb\r\n$1\r\n2\r\n"
+        );
+        // `$` is the last id, so nothing that is already there comes back.
+        assert_eq!(f.run(&[b"XREAD", b"STREAMS", b"s", b"$"]), "*-1\r\n");
+        // And `+` is the last entry, whatever COUNT says.
+        assert_eq!(
+            f.run(&[b"XREAD", b"COUNT", b"5", b"STREAMS", b"s", b"+"]),
+            "*1\r\n*2\r\n$1\r\ns\r\n*1\r\n*2\r\n$3\r\n1-1\r\n*2\r\n$1\r\na\r\n$1\r\n1\r\n"
+        );
+        // A count of zero means unlimited here, which is the opposite of what it
+        // means to XRANGE.
+        assert_eq!(
+            f.run(&[b"XREAD", b"COUNT", b"0", b"STREAMS", b"s", b"0"]),
+            "*1\r\n*2\r\n$1\r\ns\r\n*1\r\n*2\r\n$3\r\n1-1\r\n*2\r\n$1\r\na\r\n$1\r\n1\r\n"
+        );
+        // Milliseconds as a whole number, where BLPOP takes seconds as a float.
+        assert!(
+            f.run(&[b"XREAD", b"BLOCK", b"0.5", b"STREAMS", b"s", b"$"])
+                .contains("not an integer")
+        );
+        assert!(
+            f.run(&[b"XREAD", b"BLOCK", b"-1", b"STREAMS", b"s", b"$"])
+                .contains("timeout is negative")
+        );
+        assert!(
+            f.run(&[b"XREAD", b"STREAMS", b"s", b"other", b"0"])
+                .contains("Unbalanced 'xread' list of streams")
+        );
+    }
+
+    /// A blocked reader, and the two ways it stops being blocked.
+    #[test]
+    fn a_blocked_xread_wakes_on_the_next_entry() {
+        let mut f = Fixture::new();
+        f.run(&[b"XADD", b"s", b"1-1", b"a", b"1"]);
+        let (flow, reply) = f.flow(&[b"XREAD", b"BLOCK", b"0", b"STREAMS", b"s", b"$"]);
+        assert_eq!(flow, Flow::Block);
+        assert!(reply.is_empty());
+
+        // Everybody parked on the stream gets the entry, because a read takes
+        // nothing away. That is the difference between this and BLPOP.
+        let (flow, _) = f.flow(&[b"XREAD", b"BLOCK", b"0", b"STREAMS", b"s", b"$"]);
+        assert_eq!(flow, Flow::Block);
+        assert_eq!(f.server.waiters().len(), 2);
+
+        f.run(&[b"XADD", b"s", b"2-1", b"a", b"2"]);
+        let want = "*1\r\n*2\r\n$1\r\ns\r\n*1\r\n*2\r\n$3\r\n2-1\r\n*2\r\n$1\r\na\r\n$1\r\n2\r\n";
+        for at in 0..2 {
+            let mut out = Out::new(Proto::Resp2);
+            assert!(f.server.serve_waiter(at, 0, &mut out));
+            assert_eq!(core::str::from_utf8(out.as_slice()).expect("ascii"), want);
+        }
+
+        // And a deadline that runs out is a null array, the same as a plain
+        // XREAD that found nothing.
+        f.server.waiters_mut().forget(7);
+        let (flow, _) = f.flow(&[b"XREAD", b"BLOCK", b"50", b"STREAMS", b"s", b"$"]);
+        assert_eq!(flow, Flow::Block);
+        let mut out = Out::new(Proto::Resp2);
+        assert!(!f.server.serve_waiter(0, 0, &mut out));
+        assert!(out.as_slice().is_empty());
+        assert!(f.server.serve_waiter(0, u64::MAX, &mut out));
+        assert_eq!(
+            core::str::from_utf8(out.as_slice()).expect("ascii"),
+            "*-1\r\n"
+        );
+    }
+
+    /// A blocked group reader whose group is destroyed under it.
+    #[test]
+    fn losing_a_group_while_blocked_is_the_ordinary_sentence() {
+        let mut f = Fixture::new();
+        f.run(&[b"XADD", b"s", b"1-1", b"a", b"1"]);
+        f.run(&[b"XGROUP", b"CREATE", b"s", b"g", b"$"]);
+        let (flow, _) = f.flow(&[
+            b"XREADGROUP",
+            b"GROUP",
+            b"g",
+            b"c",
+            b"BLOCK",
+            b"0",
+            b"STREAMS",
+            b"s",
+            b">",
+        ]);
+        assert_eq!(flow, Flow::Block);
+
+        f.run(&[b"XGROUP", b"DESTROY", b"s", b"g"]);
+        let mut out = Out::new(Proto::Resp2);
+        assert!(f.server.serve_waiter(0, 0, &mut out));
+        // The ordinary sentence and not a special one about having been parked,
+        // which is what a running 8.10 sends.
+        assert_eq!(
+            core::str::from_utf8(out.as_slice()).expect("ascii"),
+            "-NOGROUP No such key 's' or consumer group 'g' in XREADGROUP with GROUP option\r\n"
+        );
+    }
+
+    /// `XCLAIM`, whose argument shape is the odd one in the group.
+    #[test]
+    fn xclaim_reads_ids_until_one_will_not_parse() {
+        let mut f = Fixture::new();
+        f.run(&[b"XADD", b"s", b"1-1", b"a", b"1"]);
+        f.run(&[b"XADD", b"s", b"2-1", b"a", b"2"]);
+        f.run(&[b"XGROUP", b"CREATE", b"s", b"g", b"0"]);
+        f.run(&[b"XREADGROUP", b"GROUP", b"g", b"c1", b"STREAMS", b"s", b">"]);
+
+        // Everything after the first argument that is not an id is an option, so
+        // a `-` is an unrecognised option and not a bad id.
+        assert!(
+            f.run(&[b"XCLAIM", b"s", b"g", b"c2", b"0", b"-"])
+                .contains("Unrecognized XCLAIM option '-'")
+        );
+        assert_eq!(
+            f.run(&[b"XCLAIM", b"s", b"g", b"c2", b"0", b"1-1", b"JUSTID"]),
+            "*1\r\n$3\r\n1-1\r\n"
+        );
+        // An id that is pending but whose entry has gone is an empty answer, and
+        // it leaves the pending list on the way past.
+        f.run(&[b"XDEL", b"s", b"2-1"]);
+        assert_eq!(
+            f.run(&[b"XCLAIM", b"s", b"g", b"c2", b"0", b"2-1"]),
+            "*0\r\n"
+        );
+        assert!(
+            f.run(&[b"XPENDING", b"s", b"g"])
+                .starts_with("*4\r\n:1\r\n")
+        );
+        assert!(
+            f.run(&[b"XCLAIM", b"s", b"nope", b"c", b"0", b"1-1"])
+                .starts_with("-NOGROUP")
+        );
+        assert!(
+            f.run(&[b"XCLAIM", b"s", b"g", b"c", b"nan", b"1-1"])
+                .contains("Invalid min-idle-time argument for XCLAIM")
+        );
+    }
+
+    /// `XAUTOCLAIM`, and the third value nobody expects.
+    #[test]
+    fn xautoclaim_reports_what_it_dropped() {
+        let mut f = Fixture::new();
+        f.run(&[b"XADD", b"s", b"1-1", b"a", b"1"]);
+        f.run(&[b"XADD", b"s", b"2-1", b"a", b"2"]);
+        f.run(&[b"XGROUP", b"CREATE", b"s", b"g", b"0"]);
+        f.run(&[b"XREADGROUP", b"GROUP", b"g", b"c1", b"STREAMS", b"s", b">"]);
+        f.run(&[b"XDEL", b"s", b"1-1"]);
+
+        // The cursor, what was claimed, and what was dropped for no longer being
+        // in the stream. The third one is what makes a sweep converge.
+        assert_eq!(
+            f.run(&[b"XAUTOCLAIM", b"s", b"g", b"c2", b"0", b"-", b"JUSTID"]),
+            "*3\r\n$3\r\n0-0\r\n*1\r\n$3\r\n2-1\r\n*1\r\n$3\r\n1-1\r\n"
+        );
+        assert!(
+            f.run(&[b"XAUTOCLAIM", b"s", b"g", b"c2", b"0", b"-", b"COUNT", b"0"])
+                .contains("COUNT must be > 0")
+        );
+        assert!(
+            f.run(&[b"XAUTOCLAIM", b"s", b"nope", b"c", b"0", b"-"])
+                .starts_with("-NOGROUP")
+        );
+    }
+
+    /// `XINFO`, which is where the shape of the storage shows through.
+    #[test]
+    fn xinfo_reports_the_stream_the_groups_and_the_consumers() {
+        let mut f = Fixture::new();
+        f.run(&[b"XADD", b"s", b"1-1", b"a", b"1"]);
+        f.run(&[b"XADD", b"s", b"2-1", b"a", b"2"]);
+        f.run(&[b"XGROUP", b"CREATE", b"s", b"g", b"0"]);
+        f.run(&[
+            b"XREADGROUP",
+            b"GROUP",
+            b"g",
+            b"c1",
+            b"COUNT",
+            b"1",
+            b"STREAMS",
+            b"s",
+            b">",
+        ]);
+
+        let info = f.run(&[b"XINFO", b"STREAM", b"s"]);
+        // Ten pairs, since the six idempotency fields have nothing behind them
+        // here and a zero would claim they had. That is D-27.
+        assert!(info.starts_with("*20\r\n"), "{info}");
+        assert!(info.contains("$6\r\nlength\r\n:2\r\n"), "{info}");
+        assert!(
+            info.contains("$17\r\nlast-generated-id\r\n$3\r\n2-1\r\n"),
+            "{info}"
+        );
+        assert!(info.contains("$13\r\nentries-added\r\n:2\r\n"), "{info}");
+        assert!(info.contains("$6\r\ngroups\r\n:1\r\n"), "{info}");
+
+        let groups = f.run(&[b"XINFO", b"GROUPS", b"s"]);
+        assert!(groups.starts_with("*1\r\n*12\r\n"), "{groups}");
+        assert!(groups.contains("$9\r\nconsumers\r\n:1\r\n"), "{groups}");
+        assert!(groups.contains("$7\r\npending\r\n:1\r\n"), "{groups}");
+        assert!(groups.contains("$3\r\nlag\r\n:1\r\n"), "{groups}");
+
+        // A consumer that has never been given anything reports minus one for
+        // inactive rather than the moment it turned up, which is what tells a
+        // worker that is stuck from one that has nothing to do.
+        f.run(&[b"XGROUP", b"CREATECONSUMER", b"s", b"g", b"c2"]);
+        let consumers = f.run(&[b"XINFO", b"CONSUMERS", b"s", b"g"]);
+        assert!(consumers.starts_with("*2\r\n"), "{consumers}");
+        assert!(
+            consumers.contains("$8\r\ninactive\r\n:-1\r\n"),
+            "{consumers}"
+        );
+        // And in name order, which the storage does not hold them in.
+        let c1 = consumers.find("c1").unwrap();
+        let c2 = consumers.find("c2").unwrap();
+        assert!(c1 < c2, "{consumers}");
+
+        let full = f.run(&[b"XINFO", b"STREAM", b"s", b"FULL"]);
+        assert!(full.starts_with("*18\r\n"), "{full}");
+        assert!(full.contains("$12\r\nnacked-count\r\n:0\r\n"), "{full}");
+        assert!(full.contains("$11\r\nactive-time\r\n"), "{full}");
+
+        assert!(
+            f.run(&[b"XINFO", b"STREAM", b"missing"])
+                .contains("no such key")
+        );
+        assert!(
+            f.run(&[b"XINFO", b"GROUPS", b"missing"])
+                .contains("no such key")
+        );
+        assert!(
+            f.run(&[b"XINFO", b"CONSUMERS", b"s", b"nope"])
+                .starts_with("-NOGROUP")
+        );
+        assert!(
+            f.run(&[b"XINFO", b"NOSUCH", b"s"])
+                .contains("Try XINFO HELP")
+        );
+        assert!(f.run(&[b"XINFO", b"HELP"]).contains("XINFO <subcommand>"));
+        assert!(f.run(&[b"XGROUP", b"HELP"]).contains("XGROUP <subcommand>"));
+    }
+
+    /// `XPENDING`'s long form, which reads its arguments by counting them.
+    #[test]
+    fn xpending_takes_the_consumer_only_when_the_count_comes_out_right() {
+        let mut f = Fixture::new();
+        f.run(&[b"XADD", b"s", b"1-1", b"a", b"1"]);
+        f.run(&[b"XGROUP", b"CREATE", b"s", b"g", b"0"]);
+        f.run(&[b"XREADGROUP", b"GROUP", b"g", b"c1", b"STREAMS", b"s", b">"]);
+
+        let list = f.run(&[b"XPENDING", b"s", b"g", b"-", b"+", b"10"]);
+        assert_eq!(list, "*1\r\n*4\r\n$3\r\n1-1\r\n$2\r\nc1\r\n:0\r\n:1\r\n");
+        assert_eq!(
+            f.run(&[b"XPENDING", b"s", b"g", b"-", b"+", b"10", b"c1"]),
+            "*1\r\n*4\r\n$3\r\n1-1\r\n$2\r\nc1\r\n:0\r\n:1\r\n"
+        );
+        // A consumer nobody has heard of holds nothing rather than erroring.
+        assert_eq!(
+            f.run(&[b"XPENDING", b"s", b"g", b"-", b"+", b"10", b"nope"]),
+            "*0\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"XPENDING", b"s", b"g", b"IDLE", b"0", b"-", b"+", b"10"]),
+            list
+        );
+        // IDLE is only read at position three.
+        assert!(
+            f.run(&[b"XPENDING", b"s", b"g", b"IDLE", b"0"])
+                .contains("syntax error")
+        );
+        assert!(
+            f.run(&[b"XPENDING", b"s", b"g", b"-", b"+"])
+                .contains("syntax error")
+        );
+        assert_eq!(
+            f.run(&[b"XPENDING", b"s", b"g", b"-", b"+", b"-1"]),
+            "*0\r\n"
+        );
+        assert!(
+            f.run(&[b"XPENDING", b"missing", b"g"])
+                .starts_with("-NOGROUP")
+        );
+    }
+
+    /// `XSETID`, which is three counters and two refusals.
+    #[test]
+    fn xsetid_will_not_go_below_what_is_there() {
+        let mut f = Fixture::new();
+        f.run(&[b"XADD", b"s", b"5-5", b"a", b"1"]);
+        assert_eq!(f.run(&[b"XSETID", b"s", b"9-9"]), "+OK\r\n");
+        assert_eq!(
+            f.run(&[
+                b"XSETID",
+                b"s",
+                b"10-1",
+                b"ENTRIESADDED",
+                b"7",
+                b"MAXDELETEDID",
+                b"9-1"
+            ]),
+            "+OK\r\n"
+        );
+        let info = f.run(&[b"XINFO", b"STREAM", b"s"]);
+        assert!(info.contains("$13\r\nentries-added\r\n:7\r\n"), "{info}");
+        assert!(
+            info.contains("$20\r\nmax-deleted-entry-id\r\n$3\r\n9-1\r\n"),
+            "{info}"
+        );
+
+        assert!(
+            f.run(&[b"XSETID", b"s", b"1-1"])
+                .contains("smaller than the target stream top item")
+        );
+        assert!(
+            f.run(&[b"XSETID", b"s", b"10-1", b"ENTRIESADDED", b"-1"])
+                .contains("entries_added must be positive")
+        );
+        assert!(
+            f.run(&[b"XSETID", b"missing", b"1-1"])
+                .contains("no such key")
+        );
+    }
+
+    /// RESP3, where the two reads answer a map and the entries stay an array.
+    #[test]
+    fn xread_answers_a_map_on_resp3_and_the_fields_stay_flat() {
+        let mut f = Fixture::new();
+        f.run(&[b"HELLO", b"3"]);
+        f.run(&[b"XADD", b"s", b"1-1", b"a", b"1"]);
+        // A map header and then the key and the entries side by side, with no
+        // two element array wrapping the pair.
+        assert_eq!(
+            f.run(&[b"XREAD", b"STREAMS", b"s", b"0"]),
+            "%1\r\n$1\r\ns\r\n*1\r\n*2\r\n$3\r\n1-1\r\n*2\r\n$1\r\na\r\n$1\r\n1\r\n"
+        );
+        // The fields are still one flat array and not a map, which is Redis's
+        // shape and is what every consumer written before RESP3 expects.
+        assert_eq!(
+            f.run(&[b"XRANGE", b"s", b"-", b"+"]),
+            "*1\r\n*2\r\n$3\r\n1-1\r\n*2\r\n$1\r\na\r\n$1\r\n1\r\n"
+        );
+        assert_eq!(f.run(&[b"XREAD", b"STREAMS", b"s", b"1-1"]), "_\r\n");
     }
 }
