@@ -110,6 +110,10 @@ use yo_common::num::{DIGITS_MAX, i64_digits, push_u64, u64_digits};
 
 use crate::listpack::{self, Entry, Listpack};
 
+pub mod groups;
+
+pub use groups::{Consumer, Filter, Group, Nack};
+
 /// How many bytes a node holds before the next entry starts a new one.
 ///
 /// `stream-node-max-bytes`, which is 4096 in Redis and is here for the same
@@ -343,6 +347,12 @@ pub struct Stream {
     /// Not the length. It only goes up, and it is what a consumer group uses to
     /// work out how far behind it is without walking anything.
     added: u64,
+    /// The consumer groups, by name.
+    ///
+    /// A vector because a stream has a handful of groups and the name is looked
+    /// up once a command, so a linear scan beats hashing and brings nothing
+    /// with it. The same argument the group makes about its consumers.
+    groups: Vec<(Vec<u8>, Group)>,
 }
 
 impl Stream {
@@ -526,7 +536,31 @@ impl Stream {
             bump(&mut node.lp, -1, 1);
         }
         self.length -= 1;
+        self.lose_counts_above(id);
         true
+    }
+
+    /// Tell any group that had not reached `id` that it has lost count.
+    ///
+    /// A group works out its lag by subtracting what it has read from what the
+    /// stream has ever added, and that only holds while every entry between the
+    /// two is still there. Taking an entry the group had not read yet breaks it,
+    /// because the group will now read one fewer than the subtraction says.
+    ///
+    /// Taking an entry the group is already past does not, which is why this
+    /// compares against the bookmark rather than clearing every group. That is
+    /// Redis's rule and it is the one that matters in practice, since trimming
+    /// the old end of a stream is normal and a group that is keeping up should
+    /// not lose its lag because of it.
+    ///
+    /// It never comes back. Redis does not recover the count when the group
+    /// later reads to the end, and neither does this.
+    fn lose_counts_above(&mut self, id: Id) {
+        for (_, g) in &mut self.groups {
+            if id > g.last_id() {
+                g.lose_count();
+            }
+        }
     }
 
     /// Cut the stream down to `len` entries, dropping the oldest, which is
@@ -543,9 +577,11 @@ impl Stream {
             };
             let (count, _) = counts(&node.lp);
             if self.length - count >= len {
+                let top = last_of(node);
                 self.length -= count;
                 gone += count;
                 self.nodes.pop_front();
+                self.lose_counts_above(top);
                 continue;
             }
             if !exact {
@@ -567,9 +603,11 @@ impl Stream {
         while let Some(node) = self.nodes.front() {
             let (count, _) = counts(&node.lp);
             if last_of(node) < id {
+                let top = last_of(node);
                 self.length -= count;
                 gone += count;
                 self.nodes.pop_front();
+                self.lose_counts_above(top);
                 continue;
             }
             if !exact {
@@ -648,6 +686,250 @@ impl Stream {
         seen
     }
 
+    /// Whether an entry with this ID is there and live.
+    ///
+    /// What `XCLAIM` asks before it hands a pending entry to somebody, since an
+    /// entry that has been deleted or trimmed away is work nobody can do.
+    #[must_use]
+    pub fn contains(&self, id: Id) -> bool {
+        let Some(at) = self.node_of(id) else {
+            return false;
+        };
+        let node = &self.nodes[at];
+        find(&node.lp, node.master, id).is_some_and(|(_, flags)| flags & DELETED == 0)
+    }
+
+    /// Make a consumer group, and say whether it was not already there.
+    ///
+    /// `XGROUP CREATE`. `last` is where it starts reading after, which is
+    /// [`Stream::last_id`] for `$` and [`Id::MIN`] for `0`.
+    pub fn create_group(&mut self, name: &[u8], last: Id, read: Option<u64>) -> bool {
+        if self.group(name).is_some() {
+            return false;
+        }
+        self.groups.push((name.to_vec(), Group::new(last, read)));
+        true
+    }
+
+    /// Take a group out, and say whether it was there.
+    pub fn destroy_group(&mut self, name: &[u8]) -> bool {
+        let Some(at) = self.groups.iter().position(|(n, _)| n == name) else {
+            return false;
+        };
+        self.groups.remove(at);
+        true
+    }
+
+    /// One group by name.
+    #[must_use]
+    pub fn group(&self, name: &[u8]) -> Option<&Group> {
+        self.groups
+            .iter()
+            .find(|(n, _)| n.as_slice() == name)
+            .map(|(_, g)| g)
+    }
+
+    /// One group by name, to change.
+    pub fn group_mut(&mut self, name: &[u8]) -> Option<&mut Group> {
+        self.groups
+            .iter_mut()
+            .find(|(n, _)| n.as_slice() == name)
+            .map(|(_, g)| g)
+    }
+
+    /// Every group, with its name.
+    pub fn groups(&self) -> impl Iterator<Item = (&[u8], &Group)> + '_ {
+        self.groups.iter().map(|(n, g)| (n.as_slice(), g))
+    }
+
+    /// Hand new entries to a consumer, which is `XREADGROUP ... >`.
+    ///
+    /// Every entry after the group's bookmark, up to `count`, delivered to
+    /// `consumer` and written into the pending list as it goes. The consumer is
+    /// created if it is not there, because a consumer exists by turning up.
+    ///
+    /// Answers how many entries the callback saw, or `None` when there is no
+    /// such group.
+    pub fn read_group<F>(
+        &mut self,
+        group: &[u8],
+        consumer: &[u8],
+        count: Option<usize>,
+        now: u64,
+        mut f: F,
+    ) -> Option<usize>
+    where
+        F: FnMut(Id, Fields<'_>) -> bool,
+    {
+        // Field by field, so that walking the nodes and writing the pending list
+        // are two borrows the compiler can see are disjoint.
+        let Stream { nodes, groups, .. } = self;
+        let (_, g) = groups.iter_mut().find(|(n, _)| n.as_slice() == group)?;
+        let slot = g.consumer_or_create(consumer, now);
+        let Some(from) = g.last_id().next() else {
+            // The bookmark is at the very last ID there is, so there is nothing
+            // after it and never will be.
+            g.touch(slot, now, false);
+            return Some(0);
+        };
+        let mut seen = 0;
+        walk_nodes(nodes, from, Id::MAX, count, &mut |id, fields| {
+            g.deliver(slot, id, now);
+            seen += 1;
+            f(id, fields)
+        });
+        g.touch(slot, now, seen > 0);
+        Some(seen)
+    }
+
+    /// Re-read what a consumer is already holding, which is `XREADGROUP` with an
+    /// ID rather than `>`.
+    ///
+    /// Every pending entry of that consumer after `after`, oldest first. Each
+    /// one counts as handed out again, so its delivery time is reset and its
+    /// count goes up. That is Redis's behaviour, checked rather than assumed,
+    /// and it is the right one: the count is how many times a consumer has been
+    /// told to do this work, and a consumer re-reading its backlog after a
+    /// restart has been told again.
+    ///
+    /// An entry that has since been deleted or trimmed is still in the pending
+    /// list and is handed to the callback with no fields, which is the null
+    /// Redis puts in the reply. Clearing those out is [`Stream::claim`]'s job
+    /// and not this one.
+    pub fn read_group_pending<F>(
+        &mut self,
+        group: &[u8],
+        consumer: &[u8],
+        after: Id,
+        count: Option<usize>,
+        now: u64,
+        mut f: F,
+    ) -> Option<usize>
+    where
+        F: FnMut(Id, Option<Fields<'_>>) -> bool,
+    {
+        // Which IDs, decided before anything is touched, so that the redelivery
+        // and the walk are two passes over a small list rather than one pass
+        // holding the group and the nodes at the same time.
+        let g = self.group(group)?;
+        let c = g.consumer_named(consumer)?;
+        let ids: Vec<Id> = c
+            .pending()
+            .filter(|&id| id > after)
+            .take(count.unwrap_or(usize::MAX))
+            .collect();
+
+        let g = self.group_mut(group).expect("the group found a moment ago");
+        for &id in &ids {
+            g.redeliver(id, now);
+        }
+
+        let mut seen = 0;
+        for &id in &ids {
+            seen += 1;
+            let mut go = true;
+            let mut found = false;
+            self.walk(id, id, Some(1), &mut |got, fields| {
+                found = true;
+                go = f(got, Some(fields));
+                false
+            });
+            if !found {
+                go = f(id, None);
+            }
+            if !go {
+                break;
+            }
+        }
+        Some(seen)
+    }
+
+    /// Move pending entries to a consumer, which is `XCLAIM`.
+    ///
+    /// Only entries idle at least `min_idle` move. `time` is what the delivery
+    /// time becomes, `retry` replaces the delivery count when it is given, and
+    /// `bump` says whether to add one to it, which `JUSTID` turns off. `force`
+    /// makes a pending entry for an ID that is in the stream but was not
+    /// pending.
+    ///
+    /// An ID that is pending but no longer in the stream is dropped from the
+    /// pending list rather than claimed, and reported through `gone`, which is
+    /// what Redis does and what stops a deleted entry being handed round
+    /// forever. Answers the IDs that moved.
+    #[allow(clippy::too_many_arguments)]
+    pub fn claim(
+        &mut self,
+        group: &[u8],
+        consumer: &[u8],
+        ids: &[Id],
+        min_idle: u64,
+        time: u64,
+        retry: Option<u64>,
+        bump: bool,
+        force: bool,
+        now: u64,
+        gone: &mut Vec<Id>,
+    ) -> Option<Vec<Id>> {
+        let mut took = Vec::new();
+        for &id in ids {
+            let here = self.contains(id);
+            let g = self.group_mut(group)?;
+            let slot = g.consumer_or_create(consumer, now);
+            match g.nack(id) {
+                Some(nack) => {
+                    if !here {
+                        g.forget(id);
+                        gone.push(id);
+                        continue;
+                    }
+                    if nack.idle(now) < min_idle {
+                        continue;
+                    }
+                    if g.claim(id, slot, time, retry, bump) {
+                        took.push(id);
+                    }
+                }
+                None => {
+                    // FORCE makes one out of nothing, but only for an entry that
+                    // is really there. Redis ignores the rest in silence.
+                    if force && here && g.force(id, slot, time, retry.unwrap_or(1)) {
+                        took.push(id);
+                    }
+                }
+            }
+        }
+        Some(took)
+    }
+
+    /// Sweep the pending list for stale entries and claim them, which is
+    /// `XAUTOCLAIM`.
+    ///
+    /// Starts at `start` and takes up to `count` entries that have been idle at
+    /// least `min_idle`. Answers where a following call should carry on from,
+    /// which is `None` at the end of the list, along with what was claimed and
+    /// what was dropped for no longer being in the stream.
+    #[allow(clippy::too_many_arguments)]
+    pub fn autoclaim(
+        &mut self,
+        group: &[u8],
+        consumer: &[u8],
+        start: Id,
+        min_idle: u64,
+        count: usize,
+        bump: bool,
+        now: u64,
+        gone: &mut Vec<Id>,
+    ) -> Option<(Option<Id>, Vec<Id>)> {
+        let mut ids = Vec::new();
+        let cursor = self
+            .group(group)?
+            .claimable(start, min_idle, now, count, &mut ids);
+        let took = self.claim(
+            group, consumer, &ids, min_idle, now, None, bump, false, now, gone,
+        )?;
+        Some((cursor, took))
+    }
+
     /// How many bytes the nodes take, not counting this struct.
     #[must_use]
     pub fn memory(&self) -> usize {
@@ -669,48 +951,12 @@ impl Stream {
     where
         F: FnMut(Id, Fields<'_>) -> bool,
     {
-        let mut seen = 0;
-        let mut stop = false;
-        for at in self.node_from(start)..self.nodes.len() {
-            let node = &self.nodes[at];
-            if node.master > end {
-                break;
-            }
-            each(&node.lp, node.master, &mut |id, fields| {
-                if id > end {
-                    stop = true;
-                    return false;
-                }
-                if id < start {
-                    return true;
-                }
-                if count.is_some_and(|want| seen >= want) {
-                    stop = true;
-                    return false;
-                }
-                seen += 1;
-                if !f(id, fields) {
-                    stop = true;
-                    return false;
-                }
-                true
-            });
-            if stop {
-                break;
-            }
-        }
-        seen
+        walk_nodes(&self.nodes, start, end, count, f)
     }
 
     /// The first node that can hold an entry at or after `id`.
-    ///
-    /// The binary search the module docs are about. `partition_point` answers
-    /// how many nodes start strictly before `id`, and the one before that is the
-    /// one `id` would be in, since a node holds everything from its master ID up
-    /// to the next node's.
     fn node_from(&self, id: Id) -> usize {
-        let after = self.nodes.partition_point(|node| node.master <= id);
-        after.saturating_sub(1)
+        node_from(&self.nodes, id)
     }
 
     /// The node that would hold `id`, or `None` when no node covers it.
@@ -719,6 +965,66 @@ impl Stream {
         let node = self.nodes.get(at)?;
         (node.master <= id && id <= last_of(node)).then_some(at)
     }
+}
+
+/// The first node that can hold an entry at or after `id`.
+///
+/// The binary search the module docs are about. `partition_point` answers how
+/// many nodes start strictly before `id`, and the one before that is the one
+/// `id` would be in, since a node holds everything from its master ID up to the
+/// next node's.
+///
+/// Free rather than a method so that a group read can hold the nodes and the
+/// groups at the same time, which it has to because it walks the one to write
+/// into the other.
+fn node_from(nodes: &VecDeque<Node>, id: Id) -> usize {
+    let after = nodes.partition_point(|node| node.master <= id);
+    after.saturating_sub(1)
+}
+
+/// Every live entry from `start` to `end`, both included, oldest first.
+///
+/// Free for the same reason [`node_from`] is.
+fn walk_nodes<F>(
+    nodes: &VecDeque<Node>,
+    start: Id,
+    end: Id,
+    count: Option<usize>,
+    f: &mut F,
+) -> usize
+where
+    F: FnMut(Id, Fields<'_>) -> bool,
+{
+    let mut seen = 0;
+    let mut stop = false;
+    for node in nodes.iter().skip(node_from(nodes, start)) {
+        if node.master > end {
+            break;
+        }
+        each(&node.lp, node.master, &mut |id, fields| {
+            if id > end {
+                stop = true;
+                return false;
+            }
+            if id < start {
+                return true;
+            }
+            if count.is_some_and(|want| seen >= want) {
+                stop = true;
+                return false;
+            }
+            seen += 1;
+            if !f(id, fields) {
+                stop = true;
+                return false;
+            }
+            true
+        });
+        if stop {
+            break;
+        }
+    }
+    seen
 }
 
 /// The field names and values of one entry.
@@ -1651,6 +1957,7 @@ mod tests {
             last: Id::new(u64::from(rest[1]), u64::from(rest[2])),
             max_deleted: Id::new(u64::from(rest[5]), u64::from(rest[6])),
             added: u64::from(rest[7]),
+            groups: Vec::new(),
         };
 
         assert_eq!(s.len(), 3);
@@ -1678,6 +1985,442 @@ mod tests {
                 (Id::new(3, 1), vec![(b"sensor".to_vec(), b"a".to_vec())]),
             ]
         );
+    }
+
+    /// A stream of `n` entries at 1-0 up to n-0, one field each.
+    fn logged(n: u64) -> Stream {
+        let mut s = Stream::new();
+        for ms in 1..=n {
+            add(&mut s, ms, 0, &[("job", "x")]);
+        }
+        s
+    }
+
+    /// What a group read hands back, with the fields flattened.
+    fn read(s: &mut Stream, group: &str, who: &str, count: Option<usize>, now: u64) -> Vec<Id> {
+        let mut out = Vec::new();
+        s.read_group(group.as_bytes(), who.as_bytes(), count, now, |id, _| {
+            out.push(id);
+            true
+        })
+        .expect("the group");
+        out
+    }
+
+    #[test]
+    fn a_group_is_made_once() {
+        let mut s = logged(3);
+        assert!(s.create_group(b"workers", Id::MIN, Some(0)));
+        assert!(!s.create_group(b"workers", Id::MIN, Some(0)));
+        assert!(s.group(b"workers").is_some());
+        assert!(s.destroy_group(b"workers"));
+        assert!(!s.destroy_group(b"workers"));
+        assert!(s.group(b"workers").is_none());
+    }
+
+    #[test]
+    fn a_group_read_hands_out_what_comes_after_the_bookmark() {
+        let mut s = logged(5);
+        s.create_group(b"workers", Id::MIN, Some(0));
+
+        assert_eq!(
+            read(&mut s, "workers", "alice", Some(2), 100),
+            vec![Id::new(1, 0), Id::new(2, 0)]
+        );
+        // The bookmark moved, so bob gets what alice did not.
+        assert_eq!(
+            read(&mut s, "workers", "bob", Some(2), 100),
+            vec![Id::new(3, 0), Id::new(4, 0)]
+        );
+        assert_eq!(
+            read(&mut s, "workers", "alice", None, 100),
+            vec![Id::new(5, 0)]
+        );
+        assert_eq!(read(&mut s, "workers", "alice", None, 100), vec![]);
+    }
+
+    #[test]
+    fn a_group_read_fills_the_pending_list() {
+        let mut s = logged(3);
+        s.create_group(b"workers", Id::MIN, Some(0));
+        read(&mut s, "workers", "alice", None, 500);
+
+        let g = s.group(b"workers").expect("the group");
+        assert_eq!(g.pending_len(), 3);
+        assert_eq!(g.last_id(), Id::new(3, 0));
+        assert_eq!(g.entries_read(), Some(3));
+        assert_eq!(g.lag(s.added()), Some(0));
+        let c = g.consumer_named(b"alice").expect("alice");
+        assert_eq!(c.len(), 3);
+        assert_eq!(c.active(), 500);
+    }
+
+    #[test]
+    fn a_read_that_finds_nothing_is_seen_but_not_active() {
+        let mut s = logged(1);
+        s.create_group(b"workers", Id::MIN, Some(0));
+        read(&mut s, "workers", "alice", None, 100);
+        read(&mut s, "workers", "alice", None, 900);
+
+        let c = s
+            .group(b"workers")
+            .expect("the group")
+            .consumer_named(b"alice")
+            .expect("alice");
+        assert_eq!((c.seen(), c.active()), (900, 100));
+    }
+
+    #[test]
+    fn a_group_starting_at_the_end_reads_only_what_comes_next() {
+        let mut s = logged(3);
+        s.create_group(b"workers", s.last_id(), Some(s.added()));
+        assert_eq!(read(&mut s, "workers", "alice", None, 1), vec![]);
+        add(&mut s, 4, 0, &[("job", "x")]);
+        assert_eq!(
+            read(&mut s, "workers", "alice", None, 1),
+            vec![Id::new(4, 0)]
+        );
+    }
+
+    #[test]
+    fn reading_a_group_that_is_not_there_says_so() {
+        let mut s = logged(1);
+        assert!(
+            s.read_group(b"nope", b"alice", None, 1, |_, _| true)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn a_consumer_can_re_read_what_it_is_holding() {
+        let mut s = logged(4);
+        s.create_group(b"workers", Id::MIN, Some(0));
+        read(&mut s, "workers", "alice", Some(2), 1);
+        read(&mut s, "workers", "bob", Some(2), 1);
+
+        let mut out = Vec::new();
+        s.read_group_pending(b"workers", b"alice", Id::MIN, None, 2, |id, fields| {
+            out.push((id, fields.map(|f| f.len())));
+            true
+        })
+        .expect("the group");
+        assert_eq!(
+            out,
+            vec![(Id::new(1, 0), Some(1)), (Id::new(2, 0), Some(1))]
+        );
+
+        // From an ID, which is how a consumer pages through its own backlog.
+        let mut after = Vec::new();
+        s.read_group_pending(b"workers", b"alice", Id::new(1, 0), None, 2, |id, _| {
+            after.push(id);
+            true
+        });
+        assert_eq!(after, vec![Id::new(2, 0)]);
+    }
+
+    /// A history read counts as a delivery, which is Redis's behaviour and not
+    /// the one I would have guessed.
+    ///
+    /// Checked against Redis 8.10.1: an entry left idle for 2006 milliseconds
+    /// and then read back through `XREADGROUP ... 0` came out idle for 2 with
+    /// its delivery count up by one. The count is how many times a consumer has
+    /// been told to do the work, and a consumer re-reading its backlog after a
+    /// restart has been told again.
+    #[test]
+    fn re_reading_counts_as_being_handed_it_again() {
+        let mut s = logged(2);
+        s.create_group(b"workers", Id::MIN, Some(0));
+        read(&mut s, "workers", "alice", None, 100);
+        s.read_group_pending(
+            b"workers",
+            b"alice",
+            Id::MIN,
+            None,
+            700,
+            |_: Id, _: Option<Fields<'_>>| true,
+        );
+
+        let g = s.group(b"workers").expect("the group");
+        let nack = g.nack(Id::new(1, 0)).expect("a nack");
+        assert_eq!((nack.count(), nack.time()), (2, 700));
+        // The bookmark does not move, because nothing new was handed out.
+        assert_eq!(g.last_id(), Id::new(2, 0));
+        assert_eq!(g.pending_len(), 2);
+    }
+
+    /// Lag is a subtraction and it only holds while nothing has gone missing in
+    /// front of the group.
+    ///
+    /// All four cases checked against Redis 8.10.1.
+    #[test]
+    fn losing_an_unread_entry_loses_the_lag() {
+        // Deleting something the group has already read leaves the lag alone.
+        let mut s = logged(5);
+        s.create_group(b"workers", Id::MIN, Some(0));
+        read(&mut s, "workers", "alice", Some(3), 1);
+        assert_eq!(s.group(b"workers").expect("g").lag(s.added()), Some(2));
+        assert!(s.delete(Id::new(1, 0)));
+        assert_eq!(s.group(b"workers").expect("g").lag(s.added()), Some(2));
+
+        // Deleting something it has not reached takes the lag away for good,
+        // and reading to the end does not bring it back.
+        assert!(s.delete(Id::new(5, 0)));
+        assert_eq!(s.group(b"workers").expect("g").lag(s.added()), None);
+        assert_eq!(s.group(b"workers").expect("g").entries_read(), None);
+        read(&mut s, "workers", "alice", None, 1);
+        assert_eq!(s.group(b"workers").expect("g").lag(s.added()), None);
+    }
+
+    #[test]
+    fn trimming_behind_a_group_leaves_its_lag_alone() {
+        let mut s = logged(500);
+        s.create_group(b"workers", Id::MIN, Some(0));
+        read(&mut s, "workers", "alice", Some(400), 1);
+        assert_eq!(s.group(b"workers").expect("g").lag(s.added()), Some(100));
+
+        // Whole nodes off the front, all of them well behind the bookmark.
+        assert_eq!(s.trim_maxlen(200, true), 300);
+        assert_eq!(s.group(b"workers").expect("g").lag(s.added()), Some(100));
+
+        // And now past it, which it cannot survive.
+        assert!(s.trim_maxlen(10, true) > 0);
+        assert_eq!(s.group(b"workers").expect("g").lag(s.added()), None);
+    }
+
+    #[test]
+    fn an_entry_that_went_away_still_comes_back_as_a_hole() {
+        let mut s = logged(3);
+        s.create_group(b"workers", Id::MIN, Some(0));
+        read(&mut s, "workers", "alice", None, 1);
+        assert!(s.delete(Id::new(2, 0)));
+
+        let mut out = Vec::new();
+        s.read_group_pending(b"workers", b"alice", Id::MIN, None, 2, |id, fields| {
+            out.push((id, fields.is_some()));
+            true
+        });
+        assert_eq!(
+            out,
+            vec![
+                (Id::new(1, 0), true),
+                (Id::new(2, 0), false),
+                (Id::new(3, 0), true)
+            ]
+        );
+    }
+
+    #[test]
+    fn acking_clears_the_pending_list() {
+        let mut s = logged(3);
+        s.create_group(b"workers", Id::MIN, Some(0));
+        read(&mut s, "workers", "alice", None, 1);
+        let g = s.group_mut(b"workers").expect("the group");
+        assert!(g.ack(Id::new(2, 0)));
+        assert_eq!(g.pending_len(), 2);
+    }
+
+    #[test]
+    fn a_claim_moves_work_off_a_consumer_that_stopped() {
+        let mut s = logged(2);
+        s.create_group(b"workers", Id::MIN, Some(0));
+        read(&mut s, "workers", "alice", None, 100);
+
+        let mut gone = Vec::new();
+        let took = s
+            .claim(
+                b"workers",
+                b"bob",
+                &[Id::new(1, 0), Id::new(2, 0)],
+                500,
+                5_000,
+                None,
+                true,
+                false,
+                5_000,
+                &mut gone,
+            )
+            .expect("the group");
+        assert_eq!(took, vec![Id::new(1, 0), Id::new(2, 0)]);
+        assert!(gone.is_empty());
+
+        let g = s.group(b"workers").expect("the group");
+        assert!(g.consumer_named(b"alice").expect("alice").is_empty());
+        assert_eq!(g.consumer_named(b"bob").expect("bob").len(), 2);
+        assert_eq!(g.nack(Id::new(1, 0)).expect("a nack").count(), 2);
+    }
+
+    #[test]
+    fn a_claim_leaves_work_that_is_not_idle_enough_alone() {
+        let mut s = logged(1);
+        s.create_group(b"workers", Id::MIN, Some(0));
+        read(&mut s, "workers", "alice", None, 100);
+
+        let mut gone = Vec::new();
+        let took = s
+            .claim(
+                b"workers",
+                b"bob",
+                &[Id::new(1, 0)],
+                5_000,
+                200,
+                None,
+                true,
+                false,
+                200,
+                &mut gone,
+            )
+            .expect("the group");
+        assert!(took.is_empty());
+        assert_eq!(
+            s.group(b"workers")
+                .expect("the group")
+                .consumer_named(b"alice")
+                .expect("alice")
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn claiming_an_entry_that_went_away_drops_it_instead() {
+        let mut s = logged(2);
+        s.create_group(b"workers", Id::MIN, Some(0));
+        read(&mut s, "workers", "alice", None, 100);
+        assert!(s.delete(Id::new(1, 0)));
+
+        let mut gone = Vec::new();
+        let took = s
+            .claim(
+                b"workers",
+                b"bob",
+                &[Id::new(1, 0), Id::new(2, 0)],
+                0,
+                5_000,
+                None,
+                true,
+                false,
+                5_000,
+                &mut gone,
+            )
+            .expect("the group");
+        assert_eq!(took, vec![Id::new(2, 0)]);
+        assert_eq!(gone, vec![Id::new(1, 0)]);
+        assert_eq!(s.group(b"workers").expect("the group").pending_len(), 1);
+    }
+
+    #[test]
+    fn force_only_works_on_an_entry_that_is_really_there() {
+        let mut s = logged(2);
+        s.create_group(b"workers", s.last_id(), Some(2));
+
+        let mut gone = Vec::new();
+        let took = s
+            .claim(
+                b"workers",
+                b"bob",
+                &[Id::new(1, 0), Id::new(99, 0)],
+                0,
+                100,
+                None,
+                true,
+                true,
+                100,
+                &mut gone,
+            )
+            .expect("the group");
+        assert_eq!(took, vec![Id::new(1, 0)], "99-0 is not in the stream");
+        assert_eq!(s.group(b"workers").expect("the group").pending_len(), 1);
+    }
+
+    #[test]
+    fn autoclaim_sweeps_the_stale_ones_and_says_where_it_stopped() {
+        let mut s = logged(6);
+        s.create_group(b"workers", Id::MIN, Some(0));
+        read(&mut s, "workers", "alice", Some(3), 100);
+        read(&mut s, "workers", "alice", None, 900);
+
+        let mut gone = Vec::new();
+        let (cursor, took) = s
+            .autoclaim(
+                b"workers",
+                b"bob",
+                Id::MIN,
+                500,
+                100,
+                true,
+                1_000,
+                &mut gone,
+            )
+            .expect("the group");
+        assert_eq!(cursor, None, "the sweep reached the end");
+        assert_eq!(took, vec![Id::new(1, 0), Id::new(2, 0), Id::new(3, 0)]);
+        assert_eq!(
+            s.group(b"workers")
+                .expect("the group")
+                .consumer_named(b"bob")
+                .expect("bob")
+                .len(),
+            3
+        );
+    }
+
+    #[test]
+    fn autoclaim_hands_back_a_cursor_when_it_hits_the_count() {
+        let mut s = logged(10);
+        s.create_group(b"workers", Id::MIN, Some(0));
+        read(&mut s, "workers", "alice", None, 100);
+
+        let mut gone = Vec::new();
+        let (cursor, took) = s
+            .autoclaim(b"workers", b"bob", Id::MIN, 0, 4, true, 1_000, &mut gone)
+            .expect("the group");
+        assert_eq!(took.len(), 4);
+        assert_eq!(cursor, Some(Id::new(5, 0)));
+
+        // And carrying on from the cursor takes the rest.
+        let (cursor, took) = s
+            .autoclaim(
+                b"workers",
+                b"bob",
+                cursor.expect("a cursor"),
+                0,
+                100,
+                true,
+                1_000,
+                &mut gone,
+            )
+            .expect("the group");
+        assert_eq!(took.len(), 6);
+        assert_eq!(cursor, None);
+    }
+
+    #[test]
+    fn a_group_survives_the_stream_being_trimmed_under_it() {
+        let mut s = logged(10);
+        s.create_group(b"workers", Id::MIN, Some(0));
+        read(&mut s, "workers", "alice", Some(5), 100);
+        // Trimming takes entries alice is still holding.
+        assert_eq!(s.trim_maxlen(3, true), 7);
+
+        assert_eq!(s.group(b"workers").expect("the group").pending_len(), 5);
+        let mut gone = Vec::new();
+        let took = s
+            .claim(
+                b"workers",
+                b"bob",
+                &(1..=5).map(|ms| Id::new(ms, 0)).collect::<Vec<_>>(),
+                0,
+                1_000,
+                None,
+                true,
+                false,
+                1_000,
+                &mut gone,
+            )
+            .expect("the group");
+        assert!(took.is_empty(), "none of them are there any more");
+        assert_eq!(gone.len(), 5);
+        assert_eq!(s.group(b"workers").expect("the group").pending_len(), 0);
     }
 
     #[test]
