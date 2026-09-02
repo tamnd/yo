@@ -47,6 +47,9 @@
 //! smaller graph, scale 15 at the same degree, which is 32768 nodes, 524288
 //! edges and 6665423 triangles. On the big one a single count is seven seconds,
 //! which is a real number and not one worth paying twenty times on every run.
+//! The community rows run on the same smaller graph for the same reason: Leiden
+//! is several passes over several levels, and half a second a run is already the
+//! slowest thing here.
 //!
 //! The shortest path rows want weights, and they get the GAP suite's: uniform
 //! integers from 1 to 255, drawn from a fixed seed so both rows see the same
@@ -57,6 +60,8 @@
 //!
 //! One core each, minimum per iteration, on an Apple M4 and on an i9-13900K.
 //!
+//! Over the big graph, 262144 nodes and 4194304 edges:
+//!
 //! | Row | M4 | 13900K | Rate on the M4 |
 //! |---|---|---|---|
 //! | `snapshot` | 29.58 ms | 33.55 ms | 7.1 ns an edge |
@@ -66,8 +71,20 @@
 //! | `wcc/union find` | 11.28 ms | 22.16 ms | 0.37 billion edges a second |
 //! | `pagerank/pull 10 rounds` | 35.42 ms | 33.65 ms | 1.18 billion edges a second a round |
 //! | `pagerank/push 10 rounds` | 37.11 ms | 46.13 ms | 1.13 billion edges a second a round |
+//! | `sssp/delta stepping` | 24.07 ms | 21.73 ms | 0.17 billion edges a second |
+//! | `sssp/dijkstra` | 44.65 ms | 44.13 ms | 0.09 billion edges a second |
+//! | `scc/tarjan` | 26.98 ms | 15.54 ms | 0.16 billion edges a second |
+//! | `betweenness/64 pivots` | 805.1 ms | 903.4 ms | 12.6 ms a source |
+//!
+//! Over the small graph, 32768 nodes and 524288 edges:
+//!
+//! | Row | M4 | 13900K | What it found |
+//! |---|---|---|---|
 //! | `triangle count/degree ordered` | 106.9 ms | 114.9 ms | 62.4 million triangles a second |
 //! | `triangle count/unordered` | 277.6 ms | 288.8 ms | 24.0 million triangles a second |
+//! | `community/leiden` | 526.3 ms | 489.9 ms | 8516 communities, modularity 0.0922 |
+//! | `community/louvain` | 133.5 ms | 112.9 ms | 8516 communities, modularity 0.0894 |
+//! | `community/label propagation` | 13.84 ms | 12.96 ms | 8518 communities, modularity 0.0001 |
 //!
 //! The direction switch is worth 3.33x, the two neighbour sample is worth 3.35x
 //! and the degree ordering is worth 2.60x on the M4, and 3.01x, 5.85x and 2.51x
@@ -75,6 +92,29 @@
 //! The rates count every edge in the graph rather than only the ones the
 //! algorithm looked at, which is the honest way round: an algorithm that skips
 //! edges is supposed to get the credit for skipping them.
+//!
+//! Delta stepping is worth 1.85x over the heap on the M4 and 2.03x on the
+//! 13900K, both at a band width of four, which is a quarter of what the paper's
+//! guidance gives for these weights. That is not the paper being wrong, it is
+//! the paper being about a different machine: a wide band is a way of finding
+//! independent work for several cores, and on one core the redundant relaxations
+//! it creates are just cost. Strong components come out at about the price of
+//! seven breadth first searches, which is the honest way to think about Tarjan:
+//! it is a single pass, and the pass is expensive because it is not a pass the
+//! prefetcher can help with.
+//!
+//! # What the community rows say and do not say
+//!
+//! Leiden is four times the cost of Louvain here and buys 3 percent of
+//! modularity for it, which is the trade the 2019 paper describes rather than an
+//! argument for either one. The number worth looking at is label propagation's
+//! 0.0001. It runs in a fortieth of Louvain's time and finds nothing at all, and
+//! that is a fact about the graph rather than about the algorithm: R-MAT has no
+//! communities planted in it, so the giant component has no seam for a label to
+//! stop at and one label runs through the whole of it. On a graph with real
+//! groups in it label propagation gets most of the way there for that price.
+//! Modularity of 0.09 from any of the three is a low number and it should be
+//! read as one.
 //!
 //! Pulling beats pushing by 5 percent on the M4 and by 37 percent on the
 //! 13900K, which is worth a sentence because it is the same code. At 262
