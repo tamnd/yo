@@ -61,13 +61,44 @@
 //! expensive half of preparing a query, so on a search that probes tens of
 //! partitions this is most of what preparation costs.
 //!
+//! # What it costs to build
+//!
+//! `examples/ingest.rs` measures the rate at every doubling and splits it
+//! between the insert and the maintenance, because a rate that falls as the
+//! collection grows and a rate that is just low need different work and a single
+//! number cannot tell them apart. On 128 dimensional vectors on one core of an
+//! M-series Mac:
+//!
+//! ```text
+//!         at  partitions    a second      insert    maintain   touched
+//!      12500          36       99845       19.8%       80.2%       5.3
+//!      50000         132       63393       36.4%       63.6%       6.9
+//!     200000         595       34091       66.1%       33.9%       5.5
+//!     800000        2141       13563       86.3%       13.7%       4.4
+//! ```
+//!
+//! `touched` is how many vectors maintenance moved or looked at per vector
+//! inserted, and it is flat, which is the number that says the update protocol
+//! itself is not the problem. What is left is the insert, and it is 86 percent
+//! of the time by 800 thousand and it halves every time the collection doubles,
+//! because finding the partition a vector belongs to is a pass over every
+//! centroid and there is one centroid per `posting` vectors.
+//!
+//! That is the whole remaining gap to the 50 thousand a second gate and it is
+//! one problem, not two.
+//!
 //! # What is not here yet
 //!
-//! Ranking the centroids is a linear pass over all of them, which is fine while
-//! there are hundreds and is not fine at the ten thousand a ten million vector
-//! collection wants. The fix is the same one as everywhere else in this crate,
-//! which is to quantise the centroids and scan them with popcounts too, and the
-//! bench has the row that says when it starts to matter.
+//! An index over the centroids, so that finding the nearest one is not a walk
+//! over all of them. The first attempt at one is written up in the milestone and
+//! is not in the tree: a flat layer of anchors over a sample of the centroids
+//! cut the work by eight and got the nearest centroid wrong 11 percent of the
+//! time, which is fine on the insert path and is ruinous inside the sweep, where
+//! it drained partitions into each other and turned 199 splits into 9715. So the
+//! layer has to be close to exact, and at 128 dimensions a flat one only gets
+//! there by looking at nearly half the centroids. The next attempt is SPANN's
+//! closure assignment, and the accuracy gets measured before anything is wired
+//! in.
 //!
 //! Filters pushed into the scan, MUVERA, and writing any of this to a `.yo`
 //! file are the rest of M6.
@@ -698,6 +729,25 @@ impl Partitions {
     /// because those are the only ones whose members can have a new nearest
     /// centroid, and looking at all of them would be the rebuild this index
     /// exists to avoid.
+    ///
+    /// # Why a member is only measured against what changed
+    ///
+    /// Every member is already filed under the centroid it was nearest to, and a
+    /// split moves one centroid and adds one. Nothing else moved, so for a member
+    /// of some other partition the nearest of all the centroids that did not
+    /// change is still the one it is already under, and the only way it can have
+    /// a new answer is if one of the two new centroids beats that. That is a
+    /// comparison against two, not a search over all of them.
+    ///
+    /// This is not a shortcut, it is what LIRE says, and getting it wrong is
+    /// expensive in a way that is easy to miss. A sweep after a split walks about
+    /// four partitions' worth of members, and a split happens every posting's
+    /// worth of inserts, so a full centroid scan per member works out at several
+    /// scans of every centroid in the collection per vector inserted. That is the
+    /// whole ingest cost at any size worth talking about: measured on 128
+    /// dimensional vectors it was 74 thousand a second at twelve thousand vectors
+    /// and 13 thousand at two hundred thousand, with maintenance three quarters
+    /// of it, and `examples/ingest.rs` is the harness that says so.
     fn sweep(&mut self, changed: &[usize], vectors: &impl Vectors) -> usize {
         let dim = self.dim();
         let mut look: Vec<usize> = Vec::new();
@@ -709,9 +759,17 @@ impl Partitions {
                 }
             }
         }
+        // Copied out because placing a member borrows the index, and safe to
+        // copy because nothing below here moves a centroid: `place` appends a
+        // code to a posting and leaves the centroids alone.
+        let fresh: Vec<(usize, Vec<f32>)> = changed
+            .iter()
+            .map(|&p| (p, self.centroid(p).to_vec()))
+            .collect();
         let mut seen = 0;
         let mut buf = vec![0.0f32; dim];
         for p in look {
+            let here = self.centroid(p).to_vec();
             // Backwards, because taking a member out moves the last one into
             // its slot and a backwards walk never steps over the one that moved.
             for i in (0..self.postings[p].len()).rev() {
@@ -723,10 +781,16 @@ impl Partitions {
                     continue;
                 }
                 let x = self.quant.rotate(&buf);
-                let to = self.nearest(&x);
-                if to != p {
+                let mut best = (p, sqdist(&x, &here));
+                for (q, centre) in &fresh {
+                    let d = sqdist(&x, centre);
+                    if d < best.1 {
+                        best = (*q, d);
+                    }
+                }
+                if best.0 != p {
                     self.pull_and_forget(p, i);
-                    self.place(to, id, tag, &x);
+                    self.place(best.0, id, tag, &x);
                 }
             }
         }
