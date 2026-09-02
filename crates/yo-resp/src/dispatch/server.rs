@@ -129,6 +129,21 @@ const MAXMEMORY_POLICY: &str = "maxmemory-policy";
 /// what the `maxmemory-policy` decides between.
 const MAXMEMORY: &str = "maxmemory";
 
+/// How much the server is allowed to keep on the file before it starts evicting.
+///
+/// The other half of the eviction inversion `14` section 4.1 describes, and the
+/// only setting here that has no counterpart in Redis. `maxmemory` is a limit on
+/// memory, and the right answer to a memory limit on a system with a file under
+/// it is to move data to the file. Throwing data away is the right answer to a
+/// limit on the file, and this is that limit.
+///
+/// Minus one is no limit and is the default, so a server that never sets this
+/// grows until the disk is full and then refuses writes, which is what a
+/// database does. Zero is a real setting and it means the file may hold nothing,
+/// so migration cannot make room and eviction is all that is left, which is
+/// Redis exactly and is the documented setting for a drop in cache.
+const MAXSTORE: &str = "maxstore";
+
 /// Read a byte count the way `CONFIG SET maxmemory` reads one.
 ///
 /// This is Redis's `memtoull`. Digits, then an optional unit that is not case
@@ -703,11 +718,13 @@ fn config(server: &mut Server, args: Args<'_>, out: &mut Out) -> Result<()> {
         let ladder = LADDER.iter().filter(|(k, _)| wanted(k));
         let policy = wanted(MAXMEMORY_POLICY);
         let limit = wanted(MAXMEMORY);
+        let store = wanted(MAXSTORE);
         out.map(
             fixed.clone().count()
                 + ladder.clone().count()
                 + usize::from(policy)
-                + usize::from(limit),
+                + usize::from(limit)
+                + usize::from(store),
         );
         for (k, v) in fixed {
             out.bulk(k.as_bytes());
@@ -727,6 +744,13 @@ fn config(server: &mut Server, args: Args<'_>, out: &mut Out) -> Result<()> {
             // reads back as 1073741824.
             out.bulk(MAXMEMORY.as_bytes());
             out.bulk_int(server.maxmemory() as i64);
+        }
+        if store {
+            // Minus one for no limit, and a plain number of bytes otherwise.
+            // Zero cannot mean no limit here the way it does for `maxmemory`,
+            // because zero is the setting that says the file holds nothing.
+            out.bulk(MAXSTORE.as_bytes());
+            out.bulk_int(server.maxstore().map_or(-1, |n| n as i64));
         }
     } else if is(sub, b"SET") {
         // Too few is a wrong number of arguments and an odd number is a syntax
@@ -748,6 +772,7 @@ fn config(server: &mut Server, args: Args<'_>, out: &mut Out) -> Result<()> {
         let mut count = 0;
         let mut policy = None;
         let mut limit = None;
+        let mut store = None;
         let mut i = 2;
         while i < args.len() {
             let (name, value) = (args.get(i), args.get(i + 1));
@@ -762,6 +787,26 @@ fn config(server: &mut Server, args: Args<'_>, out: &mut Out) -> Result<()> {
                     ));
                 };
                 limit = Some(bytes);
+                continue;
+            }
+            if is(name, MAXSTORE.as_bytes()) {
+                // `-1` before the memory parser sees it, because that parser
+                // refuses a sign and should keep refusing one: `maxmemory -1`
+                // is not a very large number and never was.
+                let parsed = if value == b"-1" {
+                    Some(None)
+                } else {
+                    parse_memory(value).map(Some)
+                };
+                let Some(bytes) = parsed else {
+                    return Err(Error::fmt(
+                        Code::Invalid,
+                        format_args!(
+                            "CONFIG SET failed (possibly related to argument '{MAXSTORE}') - argument must be a memory value or -1"
+                        ),
+                    ));
+                };
+                store = Some(bytes);
                 continue;
             }
             if is(name, MAXMEMORY_POLICY.as_bytes()) {
@@ -831,6 +876,9 @@ fn config(server: &mut Server, args: Args<'_>, out: &mut Out) -> Result<()> {
         // in the other order would run the first eviction under whatever the
         // policy used to be, which for a fresh server is `noeviction` and would
         // refuse the next write instead of making room for it.
+        if let Some(bytes) = store {
+            server.set_maxstore(bytes);
+        }
         if let Some(bytes) = limit {
             server.set_maxmemory(bytes);
         }
@@ -923,7 +971,8 @@ fn info(server: &Server, args: Args<'_>, out: &mut Out) {
                  mem_arena_segments:{}\r\nmem_index_bytes:{}\r\n\
                  mem_client_buffers:{}\r\ntotal_system_memory:{}\r\n\
                  mem_cgroup_limit:{}\r\nmem_limit:{}\r\nmem_budget:{}\r\n\
-                 maxmemory:{}\r\nmaxmemory_policy:{}\r\n\r\n",
+                 maxmemory:{}\r\nmaxmemory_policy:{}\r\n\
+                 maxstore:{}\r\nyo_store_bytes:{}\r\nyo_memory_regime:{}\r\n\r\n",
                 server.memory_bytes(),
                 server.dataset_bytes(),
                 server.memory_bytes() - server.dataset_bytes(),
@@ -937,6 +986,9 @@ fn info(server: &Server, args: Args<'_>, out: &mut Out) {
                 cap.budget(),
                 server.maxmemory(),
                 server.db_ref(0).policy().name(),
+                server.maxstore().map_or(-1, |n| n as i64),
+                server.store_bytes(),
+                server.regime(),
             );
         }
         if want("stats") {

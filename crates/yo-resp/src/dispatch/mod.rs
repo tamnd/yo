@@ -232,6 +232,22 @@ pub struct Server {
     /// Zero is the default and it is the whole reason the check in front of
     /// every write is one comparison against a field that is already warm.
     maxmemory: u64,
+    /// The `maxstore` limit in bytes, `None` when there is not one.
+    ///
+    /// The storage limit, and the other half of the inversion `14` section 4.1
+    /// describes. `maxmemory` is a limit on memory and the right answer to a
+    /// memory limit on a system with a file under it is to move data to the
+    /// file, not to delete it. Deleting is the right answer to a limit on the
+    /// file, and this is that limit.
+    ///
+    /// Zero is not "no limit" here, which is the one place this reads
+    /// differently from `maxmemory` and is the difference that makes a drop in
+    /// cache possible. A storage budget of zero bytes means nothing may live on
+    /// the file, so migration cannot make room and eviction is the only thing
+    /// left, which is Redis exactly. `None` is no limit and is the default,
+    /// which with `noeviction` means the database grows until the disk is full
+    /// and then writes fail, which is what a database does.
+    maxstore: Option<u64>,
     /// What [`Server::memory_bytes`] said at the last maintenance turn.
     ///
     /// The reading is a walk over every collection in every database and cannot
@@ -288,6 +304,7 @@ impl Server {
             dirty: ALL_DATABASES,
             conn_bytes: 0,
             maxmemory: 0,
+            maxstore: None,
             used: 0,
             evict_db: 0,
             expire_db: 0,
@@ -312,6 +329,7 @@ impl Server {
             dirty: ALL_DATABASES,
             conn_bytes: 0,
             maxmemory: 0,
+            maxstore: None,
             used: 0,
             evict_db: 0,
             expire_db: 0,
@@ -507,6 +525,63 @@ impl Server {
         self.used = self.settled_memory();
     }
 
+    /// The `maxstore` limit in bytes, `None` when there is not one.
+    #[must_use]
+    pub const fn maxstore(&self) -> Option<u64> {
+        self.maxstore
+    }
+
+    /// Set the storage limit, or clear it with `None`.
+    ///
+    /// Nothing is read here the way [`Server::set_maxmemory`] reads the memory
+    /// total, because this limit is compared against a number the store keeps
+    /// and answers on demand, not against a walk.
+    pub const fn set_maxstore(&mut self, bytes: Option<u64>) {
+        self.maxstore = bytes;
+    }
+
+    /// What every attached store is holding, for `INFO memory`.
+    ///
+    /// Zero on a server with nothing attached, which is not the same as a server
+    /// whose file is empty, and [`Server::regime`] is the field that tells those
+    /// two apart.
+    #[must_use]
+    pub fn store_bytes(&self) -> u64 {
+        self.dbs.iter().filter_map(Keyspace::store_bytes).sum()
+    }
+
+    /// Which way this server answers a memory limit, in one word for `INFO`.
+    ///
+    /// `evict` is Redis: a memory limit throws keys away. `migrate` is the
+    /// inversion: a memory limit moves values to the file and nothing stored is
+    /// lost. A server reports one word rather than leaving an operator to work
+    /// it out from a limit, a setting and whether a file happens to be open.
+    #[must_use]
+    pub fn regime(&self) -> &'static str {
+        if (0..self.dbs.len()).any(|at| self.migrates(at)) {
+            "migrate"
+        } else {
+            "evict"
+        }
+    }
+
+    /// Whether database `at` answers a memory limit by moving values to the
+    /// file rather than by throwing keys away.
+    ///
+    /// Three things have to hold. There has to be somewhere to move them, which
+    /// is a store attached to that database, and until the file work attaches
+    /// one this is false everywhere and every server behaves exactly as it did.
+    /// The storage budget has to be more than nothing, which is what
+    /// `maxstore 0` says it is not. And the file has to be under that budget,
+    /// because a full file is a storage limit reached and eviction is the right
+    /// answer to a storage limit.
+    fn migrates(&self, at: usize) -> bool {
+        let Some(held) = self.dbs[at].store_bytes() else {
+            return false;
+        };
+        self.maxstore.is_none_or(|cap| held < cap)
+    }
+
     /// Take a fresh memory reading, which the maintenance turn does once a batch.
     ///
     /// Nothing at all when there is no limit, which is the default and is every
@@ -575,7 +650,8 @@ impl Server {
         self.used = self.settled_memory();
         let mut budget = EVICT_BUDGET;
         while self.used as u64 > self.maxmemory {
-            if !self.evict_step() {
+            let over = self.used - self.maxmemory as usize;
+            if !self.relieve_step(over) {
                 return false;
             }
             self.compact_hard_step();
@@ -588,16 +664,31 @@ impl Server {
         true
     }
 
-    /// Throw one key away, from whichever database has one to give.
+    /// Give back `over` bytes from whichever database can, by moving values to
+    /// the file where there is one and by throwing keys away where there is not.
+    ///
+    /// The two answers are the eviction inversion and which one a database gets
+    /// is [`Server::migrates`]. Answers whether anything was given back at all,
+    /// and `false` is what refuses the client's write.
+    ///
+    /// A store that will not take the bytes counts as nothing given back, so the
+    /// write is refused rather than turned into a deletion. A disk that is
+    /// misbehaving is a reason to stop accepting writes and it is not a reason
+    /// to start losing data that was accepted already.
     ///
     /// Round robin from a cursor rather than always starting at database zero,
     /// so a server using more than one of them does not empty the first before
     /// touching the second. Almost every server is on database zero only, where
     /// this is one call that answers and fifteen that say the map is empty.
-    fn evict_step(&mut self) -> bool {
+    fn relieve_step(&mut self, over: usize) -> bool {
         for turn in 0..self.dbs.len() {
             let i = (self.evict_db + turn) % self.dbs.len();
-            if self.dbs[i].evict_one() {
+            let gave = if self.migrates(i) {
+                self.dbs[i].relieve(over).unwrap_or(0) > 0
+            } else {
+                self.dbs[i].evict_one()
+            };
+            if gave {
                 self.evict_db = (i + 1) % self.dbs.len();
                 self.dirty |= 1u64 << i;
                 return true;
@@ -9912,5 +10003,223 @@ mod tests {
             "*1\r\n*2\r\n$3\r\n1-1\r\n*2\r\n$1\r\na\r\n$1\r\n1\r\n"
         );
         assert_eq!(f.run(&[b"XREAD", b"STREAMS", b"s", b"1-1"]), "_\r\n");
+    }
+
+    /// A store to migrate values into, so a test can watch the inversion.
+    ///
+    /// A vector rather than a file for the same reason the tier's own tests use
+    /// one: the file work has not attached a real store yet, and what this is
+    /// checking is the policy above the store rather than the store.
+    struct Mem {
+        blobs: Vec<Vec<u8>>,
+    }
+
+    impl yo_kv::cold::Blocks for Mem {
+        fn put(&mut self, bytes: &[u8]) -> yo_common::Result<yo_common::Addr> {
+            self.blobs.push(bytes.to_vec());
+            Ok(yo_common::Addr::new(
+                yo_common::Space::Log,
+                (self.blobs.len() - 1) as u64,
+            ))
+        }
+
+        fn get(&self, at: yo_common::Addr) -> yo_common::Result<&[u8]> {
+            self.blobs
+                .get(at.offset() as usize)
+                .map(Vec::as_slice)
+                .ok_or_else(|| {
+                    yo_common::Error::new(yo_common::Code::Corrupt, "no chunk at that address")
+                })
+        }
+
+        fn bytes(&self) -> u64 {
+            self.blobs.iter().map(|b| b.len() as u64).sum()
+        }
+    }
+
+    /// A server holding several segments of strings, with somewhere to put them.
+    ///
+    /// Answers the fixture and what it was holding when it stopped filling.
+    fn filled(attach: bool) -> (Fixture, usize) {
+        let mut f = Fixture::new();
+        if attach {
+            f.server.db(0).attach(Box::new(Mem { blobs: Vec::new() }));
+        }
+        let val = vec![b'v'; 256];
+        for i in 0..24000u32 {
+            let k = format!("key:{i:08}");
+            f.run(&[b"SET", k.as_bytes(), &val]);
+        }
+        let full = f.server.memory_bytes();
+        assert!(full > 3 * 1024 * 1024, "the arena is several segments");
+        (f, full)
+    }
+
+    /// Write until the server is under `limit` or the writes run out.
+    ///
+    /// The same shape the eviction test uses. A memory limit is enforced in
+    /// front of a command, so nothing happens until something is written, and
+    /// the budget means one command does not do the whole job.
+    fn press(f: &mut Fixture, limit: usize) {
+        let val = vec![b'v'; 256];
+        for i in 0..3000u32 {
+            let k = format!("new:{i:08}");
+            assert_eq!(
+                f.run(&[b"SET", k.as_bytes(), &val]),
+                "+OK\r\n",
+                "write {i} was refused"
+            );
+            f.server.refresh_memory();
+            if f.server.memory_bytes() <= limit {
+                return;
+            }
+        }
+        panic!(
+            "it never got under: {} against {limit}",
+            f.server.memory_bytes()
+        );
+    }
+
+    #[test]
+    fn the_storage_limit_reads_back_and_minus_one_is_no_limit() {
+        let mut f = Fixture::new();
+        assert_eq!(
+            f.run(&[b"CONFIG", b"GET", b"maxstore"]),
+            "*2\r\n$8\r\nmaxstore\r\n$2\r\n-1\r\n",
+            "no limit is the default"
+        );
+        // The same memory value parser `maxmemory` uses, and the same trap in
+        // it, plus the one spelling that means no limit at all.
+        for (typed, bytes) in [
+            (&b"0"[..], "0"),
+            (b"1024", "1024"),
+            (b"1k", "1000"),
+            (b"1gb", "1073741824"),
+            (b"-1", "-1"),
+        ] {
+            assert_eq!(f.run(&[b"CONFIG", b"SET", b"maxstore", typed]), "+OK\r\n");
+            assert_eq!(
+                f.run(&[b"CONFIG", b"GET", b"maxstore"]),
+                format!("*2\r\n$8\r\nmaxstore\r\n${}\r\n{bytes}\r\n", bytes.len()),
+                "set {}",
+                String::from_utf8_lossy(typed)
+            );
+        }
+        for bad in [&b"1tb"[..], b"-2", b"", b"lots"] {
+            assert_eq!(
+                f.run(&[b"CONFIG", b"SET", b"maxstore", bad]),
+                "-ERR CONFIG SET failed (possibly related to argument 'maxstore') - argument must be a memory value or -1\r\n",
+                "refused {}",
+                String::from_utf8_lossy(bad)
+            );
+        }
+        // Nothing is attached, so the answer to a memory limit is still Redis's.
+        let info = f.run(&[b"INFO", b"memory"]);
+        assert!(info.contains("maxstore:-1"), "{info}");
+        assert!(info.contains("yo_memory_regime:evict"), "{info}");
+        assert!(info.contains("yo_store_bytes:0"), "{info}");
+    }
+
+    #[test]
+    fn a_memory_limit_moves_values_to_the_file_instead_of_dropping_keys() {
+        // The inversion. The same pressure that makes a Redis server throw keys
+        // away makes this one move values to the file, and afterwards every key
+        // is still there and still answers with what was stored in it.
+        let (mut f, full) = filled(true);
+        let keys = f.run(&[b"DBSIZE"]);
+        assert!(
+            f.run(&[b"INFO", b"memory"])
+                .contains("yo_memory_regime:migrate"),
+            "a database with somewhere to put values migrates"
+        );
+
+        let limit = full - 2 * 1024 * 1024;
+        f.run(&[b"CONFIG", b"SET", b"maxmemory-policy", b"allkeys-lru"]);
+        f.run(&[
+            b"CONFIG",
+            b"SET",
+            b"maxmemory",
+            limit.to_string().as_bytes(),
+        ]);
+        press(&mut f, limit);
+
+        assert!(
+            f.run(&[b"INFO", b"stats"]).contains("evicted_keys:0"),
+            "nothing was thrown away"
+        );
+        let after: usize = f.run(&[b"DBSIZE"])[1..]
+            .trim_end()
+            .parse()
+            .expect("a count");
+        let before: usize = keys[1..].trim_end().parse().expect("a count");
+        assert!(after > before, "the keys that came in are all still here");
+        assert!(
+            f.server.store_bytes() > 0,
+            "and what came out of memory went to the file"
+        );
+        // And the values read back, which is the part that makes it a migration
+        // rather than a loss.
+        let val = format!("$256\r\n{}\r\n", "v".repeat(256));
+        assert_eq!(f.run(&[b"GET", b"key:00000000"]), val);
+        assert_eq!(f.run(&[b"GET", b"key:00023999"]), val);
+    }
+
+    #[test]
+    fn a_storage_limit_of_zero_restores_redis_behaviour_exactly() {
+        // The documented setting for a drop in cache. A file that may hold
+        // nothing cannot be migrated to, so eviction is all that is left, and
+        // the server behaves exactly as it did before any of this existed.
+        let (mut f, full) = filled(true);
+        f.run(&[b"CONFIG", b"SET", b"maxstore", b"0"]);
+        assert!(
+            f.run(&[b"INFO", b"memory"])
+                .contains("yo_memory_regime:evict"),
+            "nothing may go to the file"
+        );
+
+        let limit = full - 2 * 1024 * 1024;
+        f.run(&[b"CONFIG", b"SET", b"maxmemory-policy", b"allkeys-lru"]);
+        f.run(&[
+            b"CONFIG",
+            b"SET",
+            b"maxmemory",
+            limit.to_string().as_bytes(),
+        ]);
+        press(&mut f, limit);
+
+        assert!(
+            !f.run(&[b"INFO", b"stats"]).contains("evicted_keys:0"),
+            "keys were thrown away, which is what was asked for"
+        );
+        assert_eq!(f.server.store_bytes(), 0, "and the file was never written");
+    }
+
+    #[test]
+    fn a_full_file_goes_back_to_evicting() {
+        // A storage limit reached is a storage limit, and eviction is the right
+        // answer to one. The budget here is a few kilobytes, so the first round
+        // of migration fills it and everything after that is evicted.
+        let (mut f, full) = filled(true);
+        f.run(&[b"CONFIG", b"SET", b"maxstore", b"64kb"]);
+        let limit = full - 2 * 1024 * 1024;
+        f.run(&[b"CONFIG", b"SET", b"maxmemory-policy", b"allkeys-lru"]);
+        f.run(&[
+            b"CONFIG",
+            b"SET",
+            b"maxmemory",
+            limit.to_string().as_bytes(),
+        ]);
+        press(&mut f, limit);
+
+        assert!(f.server.store_bytes() >= 64 * 1024, "the file filled up");
+        assert!(
+            !f.run(&[b"INFO", b"stats"]).contains("evicted_keys:0"),
+            "and then it started evicting"
+        );
+        assert!(
+            f.run(&[b"INFO", b"memory"])
+                .contains("yo_memory_regime:evict"),
+            "and it says so"
+        );
     }
 }

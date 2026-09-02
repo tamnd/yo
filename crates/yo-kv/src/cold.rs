@@ -81,6 +81,14 @@ pub trait Blocks {
     /// carries its own length, and a caller that had to remember it would be
     /// keeping a second copy of something that is already written down.
     fn get(&self, at: Addr) -> Result<&[u8]>;
+
+    /// How many bytes the store is holding, for the storage limit.
+    ///
+    /// The store's own size and not the sum of what was put in it. A log that
+    /// has been written to and compacted knows what it occupies and nothing
+    /// above it does, and `maxstore` is a limit on the file rather than on the
+    /// payload that went into it.
+    fn bytes(&self) -> u64;
 }
 
 /// So that a store can be chosen at run time rather than at compile time.
@@ -98,6 +106,10 @@ impl Blocks for Box<dyn Blocks> {
 
     fn get(&self, at: Addr) -> Result<&[u8]> {
         (**self).get(at)
+    }
+
+    fn bytes(&self) -> u64 {
+        (**self).bytes()
     }
 }
 
@@ -369,6 +381,10 @@ mod tests {
                 .get(at.offset() as usize)
                 .map(Vec::as_slice)
                 .ok_or_else(|| Error::new(Code::NotFound, "no such block"))
+        }
+
+        fn bytes(&self) -> u64 {
+            self.blobs.iter().map(|b| b.len() as u64).sum()
         }
     }
 

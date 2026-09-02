@@ -38,6 +38,13 @@ impl Blocks for LogBlocks {
         }
         Ok(self.log.read(at.offset())?.value)
     }
+
+    fn bytes(&self) -> u64 {
+        // How far the log has got, which is what it occupies. The tail can be a
+        // little ahead of this between a write and its flush, and a storage
+        // limit that is a page out is a storage limit that is close enough.
+        self.log.durable_upto()
+    }
 }
 
 fn log() -> LogBlocks {
