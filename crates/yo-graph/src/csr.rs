@@ -68,12 +68,54 @@
 //! uniform graph by nothing at all, which is the control that says it is the
 //! structure being exploited rather than the measurement.
 //!
-//! 9.89 is not 8, and the honest reading is that the remaining bits need either
-//! a real graph or a better ordering. R-MAT is known to have weaker clustering
-//! than the social graphs it stands in for, so a run on LiveJournal belongs in
-//! yo-bench and is the number the gate should be judged on. The ordering that
-//! would close the rest is layered label propagation, which is iterative and
-//! costs minutes rather than one sort.
+//! # What it costs on a graph nobody here generated
+//!
+//! R-MAT is a stand in and it is known to cluster less than the social graphs it
+//! stands in for, so I expected a real one to come out under 9.89. It does not.
+//! soc-LiveJournal1 from SNAP, 4847571 nodes and 68993773 edges, on an idle
+//! i9-13900K, through `examples/compress.rs`:
+//!
+//! ```text
+//!                          total  offsets  degrees   firsts  widths     gaps
+//! cold                     20.35     1.19     0.49     1.43    0.38     16.83
+//! cold, degree ordered     19.62     1.13     0.27     1.43    0.38     16.38
+//! ```
+//!
+//! That is roughly twice R-MAT and it is close to the 19.8 floor for a random
+//! graph of that shape, so on this graph the encoder is capturing almost none of
+//! the structure, and degree ordering is worth 0.73 bits here against 2.74 on
+//! R-MAT. The per node overhead is not the problem: it is about 3.5 bits of the
+//! 19.62 and the gaps are 16.38.
+//!
+//! `--codes` on the same run says why, and it rules out most of what I would
+//! otherwise have tried next:
+//!
+//! ```text
+//! gaps 64685321, 3.3% of them 1, 0.9% of neighbours in a run of 4 or more
+//! by length floor       16.71 bits a gap
+//! block of 32           17.89   (this is the format)
+//! block of 16           17.37
+//! block of 8            17.15
+//! block of 32, patched  17.97
+//! elias delta           20.24
+//! ```
+//!
+//! The floor there is the entropy of the gap lengths, which is what any code
+//! that prices each gap on its own has to pay. The format is 1.18 bits over it,
+//! so there is almost nothing left in the code itself. Interval encoding, which
+//! is the first thing WebGraph does, is dead on arrival: it needs consecutive
+//! neighbours and this graph has 0.9 percent of them. PFOR is worse than what is
+//! shipped, Elias delta is 2.35 worse, and shrinking the block to 8 buys 0.74 at
+//! the cost of a width read every eighth edge, which is a real but small win and
+//! not the difference between 19.62 and 8.
+//!
+//! So the remaining bits are not in the code, they are in the numbering. Degree
+//! ordering puts the hubs together and then gives up; what closes the gap is
+//! layered label propagation, which numbers by community rather than by degree,
+//! and which is iterative and costs minutes rather than one sort. That is the
+//! next piece of work on this file and it is the one the 8 bits gate turns on.
+//! Until it exists the gate stays open, because 9.89 on a graph I generated is
+//! not an answer when the public one says 19.62.
 //!
 //! # What this does not do
 //!
@@ -149,6 +191,46 @@ pub struct Csr {
     edges: u64,
     groups: Vec<Group>,
     words: Vec<u64>,
+    cost: Cost,
+}
+
+/// Where the bits went, in bits.
+///
+/// A compressed structure that cannot say which part of itself is expensive is
+/// very hard to improve, and the answer moves a lot between graphs: on a graph
+/// with an average degree of sixteen the per node fields are a fifth of the
+/// total, and on one with an average degree of three they are most of it.
+/// [`Csr::cost`] returns this and the `compress` example prints it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Cost {
+    /// The per node bit offset tables.
+    pub offsets: u64,
+    /// One degree per node, including the nodes that have no edges.
+    pub degrees: u64,
+    /// One first neighbour per node that has any.
+    pub firsts: u64,
+    /// The six bit width in front of every block of gaps.
+    pub widths: u64,
+    /// The gaps, which is the only part that is really the graph.
+    pub gaps: u64,
+    /// The fixed group records, which are not in the bit stream at all.
+    pub groups: u64,
+    /// Whatever rounding the stream up to whole words left over.
+    pub slack: u64,
+}
+
+impl Cost {
+    /// Everything, which is [`Csr::bytes`] in bits and to the bit.
+    #[must_use]
+    pub fn total(&self) -> u64 {
+        self.offsets
+            + self.degrees
+            + self.firsts
+            + self.widths
+            + self.gaps
+            + self.groups
+            + self.slack
+    }
 }
 
 impl Csr {
@@ -288,6 +370,12 @@ impl Csr {
         self.words.capacity() * size_of::<u64>() + self.groups.capacity() * size_of::<Group>()
     }
 
+    /// Where the bits went. See [`Cost`].
+    #[must_use]
+    pub fn cost(&self) -> Cost {
+        self.cost
+    }
+
     /// [`bytes`](Csr::bytes) said the way the target in `11` is written, and
     /// zero for a graph with no edges.
     #[must_use]
@@ -330,6 +418,7 @@ impl Csr {
         let mut offs: Vec<u64> = Vec::with_capacity(GROUP as usize);
         let mut gaps: Vec<u32> = Vec::new();
         let mut e = 0usize;
+        let mut cost = Cost::default();
 
         for lo in (0..nodes).step_by(GROUP as usize) {
             let hi = (lo + GROUP).min(nodes);
@@ -368,18 +457,23 @@ impl Csr {
 
             let at = w.bits();
             w.skip(count as u64 * u64::from(ow));
+            cost.offsets += count as u64 * u64::from(ow);
             for (i, (s, t)) in runs.iter().enumerate() {
                 w.put_at(at + i as u64 * u64::from(ow), offs[i], ow);
                 let run = &edges[*s..*t];
                 w.put(run.len() as u64, dw);
+                cost.degrees += u64::from(dw);
                 if run.is_empty() {
                     continue;
                 }
                 w.put(u64::from(run[0].1 - base), nw);
+                cost.firsts += u64::from(nw);
                 gaps_of(run, &mut gaps);
                 for block in gaps.chunks(BLOCK) {
                     let bw = width(u64::from(block.iter().copied().max().unwrap_or(0)));
                     w.put(u64::from(bw), 6);
+                    cost.widths += 6;
+                    cost.gaps += block.len() as u64 * u64::from(bw);
                     for gap in block {
                         w.put(u64::from(*gap), bw);
                     }
@@ -399,11 +493,17 @@ impl Csr {
         w.words.push(0);
         w.words.shrink_to_fit();
         groups.shrink_to_fit();
+        // The spare word and the rounding, so the total is the resident size to
+        // the bit rather than to the field. Taken before the group records go
+        // in, because those are not in the stream.
+        cost.slack = w.words.capacity() as u64 * 64 - cost.total();
+        cost.groups = groups.capacity() as u64 * size_of::<Group>() as u64 * 8;
         Csr {
             nodes,
             edges: edges.len() as u64,
             groups,
             words: w.words,
+            cost,
         }
     }
 }
@@ -656,6 +756,18 @@ mod tests {
         w.words.push(0);
         assert_eq!(read(&w.words, at, 40), 0x9f_ffff_ffff);
         assert_eq!(read(&w.words, at + 40, 32), 0xabcd);
+    }
+
+    #[test]
+    fn the_bits_add_up_to_the_bytes() {
+        let mut edges = rmat(12, 8, 0xadd);
+        let cold = Csr::build(1 << 12, &mut edges);
+        let c = cold.cost();
+        assert_eq!(c.total(), cold.bytes() as u64 * 8, "{c:?}");
+        assert!(
+            c.gaps > c.offsets,
+            "the gaps should be the biggest part here"
+        );
     }
 
     #[test]
