@@ -22,6 +22,13 @@
 //! The hash, in both of its representations and with field TTL, which is the
 //! `HEXPIRE` family and the third answer `OBJECT ENCODING` can give.
 //!
+//! The bitmaps, which are the same string values seen a bit at a time. [`bits`]
+//! is the kernels, popcount and scan and the eight ways of combining two
+//! bitmaps and the packed integer fields, and [`bitmaps`] is where a key turns
+//! into bytes and where Redis's edges are kept. There is no bitmap type,
+//! because in Redis there is not one either: `SET k A` then `GETBIT k 1`
+//! answers one.
+//!
 //! The set, which is the first row of M3, in all seventeen of its commands:
 //! `SADD`, `SREM`, `SCARD`, `SISMEMBER`, `SMISMEMBER`, `SMEMBERS`, `SPOP`,
 //! `SRANDMEMBER`, `SSCAN`, `SMOVE`, `SINTER`, `SINTERCARD`, `SUNION`, `SDIFF`
@@ -95,6 +102,8 @@
 pub mod access;
 pub mod array;
 pub mod arrays;
+pub mod bitmaps;
+pub mod bits;
 pub mod blob;
 pub mod chunk;
 pub mod clock;

@@ -966,7 +966,7 @@ impl Keyspace {
     /// which is why the readers that owe a `WRONGTYPE` ask
     /// [`Keyspace::string_only`] first.
     #[inline]
-    fn peek(&self, key: &[u8]) -> Option<Str<'_>> {
+    pub(crate) fn peek(&self, key: &[u8]) -> Option<Str<'_>> {
         let rec = self.map.get(key)?;
         if value::kind(rec) != Kind::String {
             return None;
@@ -993,7 +993,7 @@ impl Keyspace {
     /// Every other writer is long enough that it does not show, so they take the
     /// version that reads as one line.
     #[inline]
-    fn string_only(&self, key: &[u8]) -> Result<()> {
+    pub(crate) fn string_only(&self, key: &[u8]) -> Result<()> {
         if self.bodies == 0 {
             return Ok(());
         }
@@ -1039,7 +1039,7 @@ impl Keyspace {
     /// byte result, because they build the value with `sdscatlen` and the
     /// object never goes back through the encoder. `OBJECT ENCODING` is tested
     /// on exactly that.
-    fn store_raw(&mut self, key: &[u8], val: &[u8], deadline: Option<u64>) {
+    pub(crate) fn store_raw(&mut self, key: &[u8], val: &[u8], deadline: Option<u64>) {
         let len = value::record_len(Encoding::Raw, val.len(), deadline.is_some());
         self.free_body(key);
         self.write_rec(key, len, |out| {
