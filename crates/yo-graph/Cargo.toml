@@ -16,6 +16,10 @@ categories.workspace = true
 # The prefetch hint, which is the whole of what a batched multi hop walk needs
 # from anything outside this crate.
 yo-common.workspace = true
+# A node's properties and an edge's properties are documents, which is `11`
+# section 3 taken at its word rather than a second key value store built to hold
+# what the document model already holds.
+yo-doc.workspace = true
 
 [dev-dependencies]
 criterion = { workspace = true }
