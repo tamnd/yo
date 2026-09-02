@@ -1,0 +1,28 @@
+[package]
+name = "yo-graph"
+description = "The adjacency plane yo traverses graphs with"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+# The prefetch hint, which is the whole of what a batched multi hop walk needs
+# from anything outside this crate.
+yo-common.workspace = true
+
+[dev-dependencies]
+criterion = { workspace = true }
+
+[[bench]]
+name = "adjacency"
+harness = false
+
+[lints]
+workspace = true
