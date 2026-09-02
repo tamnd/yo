@@ -68,12 +68,54 @@
 //! uniform graph by nothing at all, which is the control that says it is the
 //! structure being exploited rather than the measurement.
 //!
-//! 9.89 is not 8, and the honest reading is that the remaining bits need either
-//! a real graph or a better ordering. R-MAT is known to have weaker clustering
-//! than the social graphs it stands in for, so a run on LiveJournal belongs in
-//! yo-bench and is the number the gate should be judged on. The ordering that
-//! would close the rest is layered label propagation, which is iterative and
-//! costs minutes rather than one sort.
+//! # What it costs on a graph nobody here generated
+//!
+//! R-MAT is a stand in and it is known to cluster less than the social graphs it
+//! stands in for, so I expected a real one to come out under 9.89. It does not.
+//! soc-LiveJournal1 from SNAP, 4847571 nodes and 68993773 edges, on an idle
+//! i9-13900K, through `examples/compress.rs`:
+//!
+//! ```text
+//!                          total  offsets  degrees   firsts  widths     gaps
+//! cold                     20.35     1.19     0.49     1.43    0.38     16.83
+//! cold, degree ordered     19.62     1.13     0.27     1.43    0.38     16.38
+//! ```
+//!
+//! That is roughly twice R-MAT and it is close to the 19.8 floor for a random
+//! graph of that shape, so on this graph the encoder is capturing almost none of
+//! the structure, and degree ordering is worth 0.73 bits here against 2.74 on
+//! R-MAT. The per node overhead is not the problem: it is about 3.5 bits of the
+//! 19.62 and the gaps are 16.38.
+//!
+//! `--codes` on the same run says why, and it rules out most of what I would
+//! otherwise have tried next:
+//!
+//! ```text
+//! gaps 64685321, 3.3% of them 1, 0.9% of neighbours in a run of 4 or more
+//! by length floor       16.71 bits a gap
+//! block of 32           17.89   (this is the format)
+//! block of 16           17.37
+//! block of 8            17.15
+//! block of 32, patched  17.97
+//! elias delta           20.24
+//! ```
+//!
+//! The floor there is the entropy of the gap lengths, which is what any code
+//! that prices each gap on its own has to pay. The format is 1.18 bits over it,
+//! so there is almost nothing left in the code itself. Interval encoding, which
+//! is the first thing WebGraph does, is dead on arrival: it needs consecutive
+//! neighbours and this graph has 0.9 percent of them. PFOR is worse than what is
+//! shipped, Elias delta is 2.35 worse, and shrinking the block to 8 buys 0.74 at
+//! the cost of a width read every eighth edge, which is a real but small win and
+//! not the difference between 19.62 and 8.
+//!
+//! So the remaining bits are not in the code, they are in the numbering. Degree
+//! ordering puts the hubs together and then gives up; what closes the gap is
+//! layered label propagation, which numbers by community rather than by degree,
+//! and which is iterative and costs minutes rather than one sort. That is the
+//! next piece of work on this file and it is the one the 8 bits gate turns on.
+//! Until it exists the gate stays open, because 9.89 on a graph I generated is
+//! not an answer when the public one says 19.62.
 //!
 //! # What this does not do
 //!

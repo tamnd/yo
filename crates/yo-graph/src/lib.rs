@@ -50,6 +50,12 @@
 //! ordering pass moves that by nothing, which is what says the difference
 //! between the two graphs is the graph rather than the encoder.
 //!
+//! On soc-LiveJournal1, which is a real graph and the one the target should be
+//! judged on, it is 19.62 degree ordered, and the gap code is within 1.18 bits
+//! of the entropy of the gaps it is coding. The bits that are left are in the
+//! numbering rather than in the code, so the next thing this needs is layered
+//! label propagation. [`csr`] has the full breakdown.
+//!
 //! ```
 //! use yo_graph::{Csr, csr};
 //!
