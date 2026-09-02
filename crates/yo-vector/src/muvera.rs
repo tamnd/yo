@@ -306,7 +306,7 @@ impl Encoder {
                     // difference whether the scaling happens before the
                     // projection or after.
                     let scale = if document {
-                        1.0 / f64::from(counts[k]) as f32
+                        1.0 / counts[k] as f32
                     } else {
                         1.0
                     };
