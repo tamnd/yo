@@ -67,13 +67,18 @@
 //! assert_eq!(cold.degree(to[0]), 3);
 //! ```
 //!
-//! The node table, the edge records, the typed `Graph<N, E>` surface, the ten
-//! command `G.*` family and the algorithms are the rest of M7.
+//! [`Graph`] is the two of them together with a document behind every node and
+//! every edge. The typed `Graph<N, E>` surface, the ten command `G.*` family and
+//! the algorithms are the rest of M7.
 
 #![deny(missing_docs)]
 
 pub mod adjacency;
 pub mod csr;
+pub mod graph;
+pub mod props;
 
 pub use adjacency::{Adjacency, Dir};
 pub use csr::Csr;
+pub use graph::Graph;
+pub use props::{Props, id_key};
