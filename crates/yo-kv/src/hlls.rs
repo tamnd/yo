@@ -52,6 +52,7 @@ impl Keyspace {
     {
         self.reap(key);
         self.string_only(key)?;
+        self.thaw(key)?;
         check_len(key, hll::DENSE)?;
 
         let mut buf = std::mem::take(&mut self.scratch);
@@ -111,6 +112,12 @@ impl Keyspace {
         for key in keys.clone() {
             self.reap(key);
             self.string_only(key)?;
+            // Every sketch is read in one pass below, borrowed out of the map
+            // at the same time, so they all have to be in memory rather than in
+            // the one buffer a served fault uses. A sketch is at most twelve
+            // kibibytes and a client counting them is going to count them
+            // again, so bringing them back is what it wanted anyway.
+            self.thaw(key)?;
         }
         let mut one = keys.clone();
         if let (Some(key), None) = (one.next(), one.next()) {
@@ -153,10 +160,12 @@ impl Keyspace {
     {
         self.reap(dest);
         self.string_only(dest)?;
+        self.thaw(dest)?;
         check_len(dest, hll::DENSE)?;
         for src in srcs.clone() {
             self.reap(src);
             self.string_only(src)?;
+            self.thaw(src)?;
         }
 
         // Every input is read before anything is written, the destination
@@ -232,6 +241,7 @@ impl Keyspace {
     pub fn pftodense(&mut self, key: &[u8]) -> Result<bool> {
         self.reap(key);
         self.string_only(key)?;
+        self.thaw(key)?;
         let bytes = self.sketch(key)?.ok_or_else(no_such_key)?;
         if hll::check(bytes)? == Encoding::Dense {
             return Ok(false);
@@ -260,6 +270,7 @@ impl Keyspace {
     pub fn pfencoding(&mut self, key: &[u8]) -> Result<Encoding> {
         self.reap(key);
         self.string_only(key)?;
+        self.warm(key)?;
         let bytes = self.sketch(key)?.ok_or_else(no_such_key)?;
         hll::check(bytes)
     }
@@ -272,6 +283,7 @@ impl Keyspace {
     pub fn pfdecode<T>(&mut self, key: &[u8], run: impl FnOnce(&[u8]) -> T) -> Result<T> {
         self.reap(key);
         self.string_only(key)?;
+        self.warm(key)?;
 
         // The buffer comes out of `self` before the sketch is read out of it, so
         // that the text is being written into something the map does not own and

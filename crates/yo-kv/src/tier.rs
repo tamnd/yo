@@ -273,6 +273,37 @@ impl<B: Blocks> Tier<B> {
     ///
     /// Whatever the store says when the chain will not read back.
     pub fn fault(&mut self, map: &mut RawMap, key: &[u8], out: &mut Vec<u8>) -> Result<Faulted> {
+        self.read(map, key, out, true)
+    }
+
+    /// Read `key`'s value and put it back in memory whatever the doorkeeper
+    /// thinks.
+    ///
+    /// This is for a command that is about to write the key. `APPEND` on a
+    /// demoted value reads it, adds to it and stores the result, and the result
+    /// is a resident record no matter which way the doorkeeper would have gone,
+    /// so asking it would be asking a question whose answer cannot be used. The
+    /// same goes for `INCR`, `SETRANGE`, `SETBIT`, `GETSET` and the rest of the
+    /// read modify write family.
+    ///
+    /// A promotion here still costs one device read and no more, and the value
+    /// it read is the one the caller was going to ask for anyway.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the store says when the chain will not read back.
+    pub fn thaw(&mut self, map: &mut RawMap, key: &[u8], out: &mut Vec<u8>) -> Result<Faulted> {
+        self.read(map, key, out, false)
+    }
+
+    /// The body of both, with `ask` saying whether the doorkeeper gets a vote.
+    fn read(
+        &mut self,
+        map: &mut RawMap,
+        key: &[u8],
+        out: &mut Vec<u8>,
+        ask: bool,
+    ) -> Result<Faulted> {
         let Some(addr) = map.find(key) else {
             return Ok(Faulted::Missing);
         };
@@ -302,7 +333,7 @@ impl<B: Blocks> Tier<B> {
 
         // One read is not enough. The bits go down now and the key comes back
         // on the next read, if there is one.
-        if !self.door.admit(RawMap::hash_of(key)) {
+        if ask && !self.door.admit(RawMap::hash_of(key)) {
             self.stats.served += 1;
             return Ok(Faulted::Served);
         }

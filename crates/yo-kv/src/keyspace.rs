@@ -26,6 +26,7 @@ use yo_index::RawMap;
 use crate::Clock;
 use crate::access::{Access, Lfu, Policy};
 use crate::array::Array;
+use crate::cold::Blocks;
 use crate::evict;
 use crate::foreign::Foreign;
 use crate::hash::{self, Hash};
@@ -33,8 +34,9 @@ use crate::list::{self, List};
 use crate::set::{self, Set};
 use crate::slab::{Bytes, Slab};
 use crate::stream::{self, Stream};
+use crate::tier::{Faulted, Tier};
 use crate::ttl::{self, Applied, Ask, Cond};
-use crate::value::{self, Kind};
+use crate::value::{self, Kind, Str};
 use crate::zset::{self, Zset};
 
 /// Every collection already answered this question, and this is the answer said
@@ -146,6 +148,42 @@ pub struct Keyspace {
     pub(crate) pool: evict::Pool,
     /// Where `SPOP` and `SRANDMEMBER` draw from.
     pub(crate) rng: Rng,
+    /// Where a demoted value goes and comes back from, if this database has one.
+    ///
+    /// `None` on a database with no file behind it, which is every embedded
+    /// caller that never opened one and every test that does not care, and on
+    /// such a database no record is ever cold and every check against this is a
+    /// null test on a field in the same cache line as the map.
+    ///
+    /// Boxed rather than a type parameter on `Keyspace`. The parameter would
+    /// have to be named by `yo-resp`, by the typed API and by every caller of
+    /// either, all to spell a type that only the code opening the file knows,
+    /// and it would be a parameter on the hot path to describe the cold one. See
+    /// [`Blocks`].
+    pub(crate) tier: Option<Tier<Box<dyn Blocks>>>,
+    /// The last value read off the file, for the read that is being answered.
+    ///
+    /// A demoted value that is served rather than promoted has to live
+    /// somewhere for the length of one command, because the record it came from
+    /// holds an address and the caller was promised bytes. One buffer, cleared
+    /// and refilled, on the same argument as [`Keyspace::scratch`]: a fault is
+    /// already a device read and a malloc on top of it is free by comparison,
+    /// but it is also unnecessary.
+    ///
+    /// It holds the value of the last key that was faulted and nothing says
+    /// which key that was, which is why nothing reads it without having faulted
+    /// in the same call. Everything that does goes through
+    /// [`Keyspace::warm`].
+    pub(crate) cold: Vec<u8>,
+    /// Whose value is in [`Keyspace::cold`].
+    ///
+    /// Only ever read by a debug assertion, and it is there because the failure
+    /// it catches is silent: a read that forgets to warm and then finds a cold
+    /// record would hand back whatever the last fault put in the buffer, which
+    /// is a real value belonging to a different key. A test would see plausible
+    /// bytes and pass. The copy costs a key's worth of memcpy on a path that
+    /// has just read a device, which is nothing next to what it is guarding.
+    pub(crate) cold_key: Vec<u8>,
     /// The last collection key that was resolved, for the command behind it.
     memo: Memo,
     /// One buffer for the commands that have to hold an element while the
@@ -387,6 +425,9 @@ impl Keyspace {
             samples: evict::SAMPLES,
             pool: evict::Pool::new(),
             rng: Rng::new(clock.now_ms() ^ made.wrapping_mul(0x9e37_79b9_7f4a_7c15)),
+            tier: None,
+            cold: Vec::new(),
+            cold_key: Vec::new(),
             memo: Memo::empty(),
             scratch: Vec::with_capacity(SCRATCH),
             rows: Vec::new(),
@@ -925,6 +966,28 @@ impl Keyspace {
         // Read what has to survive out of the record before writing over it.
         match value::kind(rec) {
             Kind::String => {
+                if let Some(c) = value::cold(rec) {
+                    // A deadline does not move a value that is on the file, it
+                    // changes the eight bytes in front of the address. So this
+                    // writes a new pointer rather than reading the value back
+                    // to write it out again, and `EXPIRE` on a demoted key
+                    // costs no device read at all. That is the same promise
+                    // `TTL` and `STRLEN` keep and it is why the header stayed
+                    // in memory.
+                    let enc = value::Meta::from_byte(rec[0]).encoding();
+                    let was = value::access(rec).unwrap_or_default();
+                    self.map.set_with(
+                        key,
+                        value::cold_record_len(at.is_some()),
+                        |_| {},
+                        |out| {
+                            value::write_cold_record(out, Kind::String, enc, c.at, c.len, at);
+                            value::set_access(out, was);
+                            value::has_expiry(out)
+                        },
+                    );
+                    return true;
+                }
                 // Through the scratch buffer rather than a fresh `Vec`, since
                 // `EXPIRE` on a string is a command a cache sends as often as
                 // the `SET` before it.
@@ -1109,6 +1172,169 @@ impl Keyspace {
             self.drop_key(key);
             self.expired += 1;
         }
+    }
+
+    /// Give this database somewhere to keep values that are not in memory.
+    ///
+    /// Until this is called nothing is ever demoted, no record is ever cold and
+    /// every command takes exactly the path it took before, which is why a
+    /// database that never opens a file pays nothing for this existing.
+    ///
+    /// The store is whatever the caller wants it to be. In a server it is the
+    /// shard's log. In a test it is a vector. This crate does not depend on
+    /// either and does not want to: [`Blocks`] is an append that hands
+    /// back an address and a read that takes one, and that is the whole of the
+    /// contract between the memory engine and whatever is under it.
+    pub fn attach(&mut self, blocks: Box<dyn Blocks>) {
+        self.tier = Some(Tier::new(blocks));
+    }
+
+    /// The tier, if one was attached, for its counters.
+    #[must_use]
+    pub const fn tier(&self) -> Option<&Tier<Box<dyn Blocks>>> {
+        self.tier.as_ref()
+    }
+
+    /// The tier, mutably, for a caller driving a sweep.
+    pub const fn tier_mut(&mut self) -> Option<&mut Tier<Box<dyn Blocks>>> {
+        self.tier.as_mut()
+    }
+
+    /// Move one key's value out to the file.
+    ///
+    /// Answers whether it went. A key that is not there, one holding something
+    /// other than a string, one that is int encoded and one whose value is
+    /// shorter than the pointer that would replace it all answer false, and so
+    /// does every key on a database with nothing attached.
+    ///
+    /// This is the single key form, which is what a test and a `DEBUG`
+    /// subcommand want. What a server under memory pressure wants is
+    /// [`Keyspace::relieve`].
+    ///
+    /// # Errors
+    ///
+    /// Whatever the store says when it will not take the bytes.
+    pub fn demote(&mut self, key: &[u8]) -> Result<bool> {
+        let Some(tier) = self.tier.as_mut() else {
+            return Ok(false);
+        };
+        tier.demote(&mut self.map, key)
+    }
+
+    /// Move values out to the file until this database fits in `budget` bytes.
+    ///
+    /// Answers how many went. This is `maxmemory` under the inversion `14`
+    /// describes: the limit that used to throw keys away now moves them, and
+    /// what a client stored is still there afterwards.
+    ///
+    /// Victims are chosen by the same policy `maxmemory-policy` names, so a
+    /// database set to `allkeys-lru` demotes the coldest keys and one set to
+    /// `volatile-ttl` demotes the ones closest to expiring. See
+    /// [`Tier::relieve`] for what a sweep does and where it stops.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the store says when it will not take the bytes.
+    pub fn relieve(&mut self, budget: usize) -> Result<usize> {
+        if self.tier.is_none() {
+            return Ok(0);
+        }
+        let now = self.clock.now_ms();
+        let (policy, lfu) = (self.policy, self.lfu);
+        let tier = self.tier.as_mut().expect("checked just above");
+        let moved = tier.relieve(&mut self.map, budget, policy, now, lfu);
+        // A sweep compacts the arena, which moves records, and the memo holds a
+        // record's address. It is normally thrown away by the map's write
+        // counter moving, and a sweep that demoted nothing and compacted anyway
+        // is the one case where that counter does not move.
+        self.memo = Memo::empty();
+        moved
+    }
+
+    /// Read `key`'s value off the file into [`Keyspace::cold`], if that is where
+    /// it is.
+    ///
+    /// The doorkeeper decides whether the value also goes back into memory, so
+    /// after this the record under `key` is either resident or still cold with
+    /// its bytes in the buffer, and [`Keyspace::value_of`] is what tells the two
+    /// apart. The address the caller was holding is not valid afterwards on the
+    /// promoting path, because promotion rewrites the record.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the store says when the chain will not read back.
+    pub(crate) fn warm(&mut self, key: &[u8]) -> Result<Faulted> {
+        let Some(tier) = self.tier.as_mut() else {
+            return Ok(Faulted::Warm);
+        };
+        let mut buf = core::mem::take(&mut self.cold);
+        let r = tier.fault(&mut self.map, key, &mut buf);
+        self.cold = buf;
+        if r == Ok(Faulted::Served) {
+            self.cold_key.clear();
+            self.cold_key.extend_from_slice(key);
+        }
+        r
+    }
+
+    /// Put `key`'s value back in memory if it was not there, for a command that
+    /// is about to write it.
+    ///
+    /// See [`Tier::thaw`] for why the doorkeeper does not get a vote here. The
+    /// short of it is that a read modify write leaves a resident record either
+    /// way, so there is nothing for an answer to change.
+    ///
+    /// A caller can carry on exactly as it did before after this returns, with
+    /// no cold case left to handle, which is why it is one line at the top of
+    /// `APPEND` and `INCR` rather than a second path through them.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the store says when the chain will not read back.
+    pub(crate) fn thaw(&mut self, key: &[u8]) -> Result<()> {
+        let Some(tier) = self.tier.as_mut() else {
+            return Ok(());
+        };
+        let mut buf = core::mem::take(&mut self.cold);
+        let r = tier.thaw(&mut self.map, key, &mut buf);
+        self.cold = buf;
+        r.map(|_| ())
+    }
+
+    /// The value in a record that may have been left on the file.
+    ///
+    /// Only correct straight after a [`Keyspace::warm`] of the same key, since
+    /// the buffer holds one value at a time. A debug build says so rather than
+    /// handing back a value that belongs to somebody else.
+    pub(crate) fn value_of<'a>(&'a self, key: &[u8], rec: &'a [u8]) -> Str<'a> {
+        if value::cold(rec).is_some() {
+            debug_assert!(
+                bytes_eq(&self.cold_key, key),
+                "a read found a value on the file without faulting it in first"
+            );
+            Str::Bytes(&self.cold)
+        } else {
+            value::read(rec)
+        }
+    }
+
+    /// [`Keyspace::warm`] and then the value, for the readers that do nothing
+    /// else with the record.
+    ///
+    /// `None` when the key went away, which it cannot do here but which the
+    /// second lookup has to allow for anyway: the first lookup's address does
+    /// not survive a promotion, so this has to find the key again rather than
+    /// trust a number from before.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the store says when the chain will not read back.
+    pub(crate) fn warmed(&mut self, key: &[u8]) -> Result<Option<Str<'_>>> {
+        self.warm(key)?;
+        let Some(addr) = self.map.find(key) else {
+            return Ok(None);
+        };
+        Ok(Some(self.value_of(key, self.map.value_at(addr))))
     }
 
     /// Where `key`'s record is, having thrown the key away first if it is dead.
