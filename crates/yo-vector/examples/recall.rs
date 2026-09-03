@@ -46,6 +46,17 @@
 //! and identical at every `rerank`, which is the same fact from the other side:
 //! once the ranking is nearly exact, widening the rerank only adds candidates
 //! that were never going to place.
+//!
+//! The probe sweep stops at 128 unless a third argument says otherwise, and that
+//! argument exists because of MS-MARCO. On SIFT the curve has flattened by 128
+//! and the top of the loop is past the answer, so nothing was ever lost by
+//! ending there. On a million MS-MARCO passage embeddings at 1024 dimensions
+//! recall is still climbing at 128, and a table that stops there reports where
+//! the loop ended and calls it a ceiling. So:
+//!
+//! ```text
+//! cargo run --release -p yo-vector --example recall -- msmarco 500 1024
+//! ```
 
 use std::time::Instant;
 use yo_vector::{Bits, Partitions, Tuning, Vectors};
@@ -71,7 +82,7 @@ impl Vectors for Base {
 fn main() {
     let mut args = std::env::args().skip(1);
     let Some(dir) = args.next() else {
-        eprintln!("usage: recall <dataset directory> [queries]");
+        eprintln!("usage: recall <dataset directory> [queries] [highest probe]");
         std::process::exit(2);
     };
     // Ten thousand queries at a millisecond each is ten seconds a row and there
@@ -80,6 +91,15 @@ fn main() {
     let queries: usize = args.next().map_or(1_000, |a| {
         a.parse()
             .expect("the second argument is a number of queries")
+    });
+    // Where the sweep stops. A dataset the index finds easy is finished well
+    // before 128 probes and one it does not is only getting interesting there,
+    // so the top is an argument rather than a number in the loop. MS-MARCO is
+    // what made it one: recall on it is still climbing at 128, and reporting the
+    // end of the sweep as the ceiling would have been reporting the loop.
+    let top: usize = args.next().map_or(128, |a| {
+        a.parse()
+            .expect("the third argument is the highest probe count")
     });
     let set = prefix(&dir);
 
@@ -133,7 +153,8 @@ fn main() {
             "probe", "rerank", "recall@10", "p50", "p99"
         );
 
-        for probe in [8usize, 16, 32, 64, 128] {
+        let mut probe = 8;
+        while probe <= top {
             for rerank in [4usize, 8, 16, 32] {
                 let mut t = ix.tuning();
                 t.probe = probe;
@@ -141,6 +162,7 @@ fn main() {
                 ix.retune(t);
                 measure(&ix, &bench, probe, rerank);
             }
+            probe *= 2;
         }
     }
 }
