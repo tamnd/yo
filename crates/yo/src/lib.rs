@@ -109,6 +109,30 @@
 //! # Ok::<(), yo::Error>(())
 //! ```
 //!
+//! # Vectors are a collection, not a second database
+//!
+//! [`Db::vectors`] holds embeddings under keys and answers the nearest ones to
+//! a query. There is no index to build first, no probe list to tune and no
+//! rebuild after a write: the index splits and merges its own partitions as the
+//! collection is written to, which is what `10` section 5 is about.
+//!
+//! ```
+//! let db = yo::open(yo::MEMORY)?;
+//! let passages = db.vectors_with("passages", 3, yo::Metric::Cosine)?;
+//!
+//! passages.put("a", &[1.0, 0.0, 0.0])?;
+//! passages.put("b", &[0.0, 1.0, 0.0])?;
+//!
+//! let hits = passages.search(&[0.9, 0.1, 0.0], 1)?;
+//! assert_eq!(hits[0].key, b"a".to_vec());
+//! # Ok::<(), yo::Error>(())
+//! ```
+//!
+//! The searchable form of a vector is a RaBitQ code, a bit per dimension, so a
+//! collection of 768 dimensional embeddings is 96 bytes a vector to scan rather
+//! than 3072. The candidates it picks are then measured against the full
+//! precision vectors, so a hit's distance is the real distance.
+//!
 //! # Zero copy is available, never mandatory
 //!
 //! [`Map::get`] hands back an owned value because that is what most code
@@ -129,9 +153,10 @@
 //! message. The owned and served modes put this same API over `yo-shard`'s
 //! runtime and arrive with it.
 //!
-//! Vectors and graphs. [`Db::docs`] and `#[derive(Yo)]` are here, so a
-//! collection of your own structs is indexed and queried today, and the vector
-//! search and the graph walks over the same documents are the rest of M6 and M7.
+//! One collection that is two. A document and its embedding are stored in
+//! [`Db::docs`] and in [`Db::vectors`] separately today, under the same key if
+//! that is how you write them, and the filtered search that reads a document's
+//! indexed fields inside the vector scan is the rest of M6.
 
 #![deny(missing_docs)]
 
@@ -148,6 +173,7 @@ pub mod keyspace;
 pub mod map;
 pub mod sets;
 pub mod store;
+pub mod vector;
 
 pub use counter::Counter;
 pub use db::{Db, MEMORY, open};
@@ -158,12 +184,13 @@ pub use keyspace::Strings;
 pub use map::Map;
 pub use sets::{Set, Sets};
 pub use store::{Decode, Encode};
+pub use vector::{Match, Vectors};
 pub use yo_common::{Code, Error, Result};
 /// Write a type's shape, its document encoding and the indexes it declares.
 ///
 /// See the [`doc`] module for the attributes and what they mean.
 pub use yo_derive::Yo;
-pub use yo_shape::{Desc, Shape, Tag};
+pub use yo_shape::{Desc, Metric, Shape, Tag};
 // The two views a borrowing read hands to its closure. They were reachable
 // before this and not nameable, so a caller could take one and could not write
 // down the type of what they had taken.

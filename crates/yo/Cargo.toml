@@ -22,10 +22,12 @@ path = "src/lib.rs"
 yo-common.workspace = true
 yo-derive.workspace = true
 yo-doc.workspace = true
+yo-format.workspace = true
 yo-graph.workspace = true
 yo-index.workspace = true
 yo-kv.workspace = true
 yo-shape.workspace = true
+yo-vector.workspace = true
 
 [dev-dependencies]
 criterion = { workspace = true }

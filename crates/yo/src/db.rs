@@ -16,6 +16,7 @@ use crate::keyspace::Strings;
 use crate::map::Map;
 use crate::sets::{Set, Sets};
 use crate::store::Decode;
+use crate::vector::Vectors;
 
 /// The path that means "no file at all", which is a real path and not a flag
 /// (`07` section 7).
@@ -111,6 +112,9 @@ pub(crate) enum Data {
     /// Boxed for the same reason, harder: a graph carries a plane, two document
     /// stores and the table that turns an id into a dense one.
     Graph(Box<crate::graph::Store>),
+    /// Boxed for the same reason again: a vector collection carries the
+    /// partitions, the codes under them and every full precision vector.
+    Vectors(Box<crate::vector::Store>),
 }
 
 impl Data {
@@ -119,6 +123,7 @@ impl Data {
             Data::Map(m) => m.memory_bytes(),
             Data::Docs(d) => d.docs.memory_bytes(),
             Data::Graph(g) => g.memory_bytes(),
+            Data::Vectors(v) => v.memory_bytes(),
         }
     }
 
@@ -197,6 +202,32 @@ impl Data {
     pub(crate) fn graph_mut(&mut self) -> &mut crate::graph::Store {
         match self {
             Data::Graph(g) => g,
+            _ => wrong_kind(),
+        }
+    }
+
+    /// The vectors inside, for a handle that was handed out against them.
+    ///
+    /// # Panics
+    ///
+    /// The same as [`Data::map`].
+    #[track_caller]
+    pub(crate) fn vectors(&self) -> &crate::vector::Store {
+        match self {
+            Data::Vectors(v) => v,
+            _ => wrong_kind(),
+        }
+    }
+
+    /// The same, for a write.
+    ///
+    /// # Panics
+    ///
+    /// The same as [`Data::map`].
+    #[track_caller]
+    pub(crate) fn vectors_mut(&mut self) -> &mut crate::vector::Store {
+        match self {
+            Data::Vectors(v) => v,
             _ => wrong_kind(),
         }
     }
@@ -456,6 +487,83 @@ impl Db {
                 },
             )?;
         Ok(Graph::new(self.db.clone(), at))
+    }
+
+    /// Open a collection of vectors, creating it if this is the first time.
+    ///
+    /// Nearness is euclidean distance. [`Db::vectors_with`] is the same call
+    /// with the metric spelled out, and cosine is the other one worth having.
+    ///
+    /// The dimension is part of the collection's shape exactly as a map's value
+    /// type is, so a collection opened at 768 dimensions cannot later be opened
+    /// at 1536 and quietly read the old vectors as half of a new one.
+    ///
+    /// ```
+    /// let db = yo::open(yo::MEMORY)?;
+    /// let v = db.vectors("passages", 3)?;
+    ///
+    /// v.put("a", &[1.0, 0.0, 0.0])?;
+    /// v.put("b", &[0.0, 1.0, 0.0])?;
+    ///
+    /// assert_eq!(v.search(&[0.9, 0.1, 0.0], 1)?[0].key, b"a".to_vec());
+    /// # Ok::<(), yo::Error>(())
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// [`Code::ShapeMismatch`] when the name is already a collection of another
+    /// shape, which includes the same name at another dimension or metric, and
+    /// [`Code::Invalid`] for a dimension no collection can hold.
+    pub fn vectors(&self, name: &str, dim: usize) -> Result<Vectors> {
+        self.vectors_with(name, dim, yo_shape::Metric::L2)
+    }
+
+    /// The same, saying what nearness means.
+    ///
+    /// [`Metric::Cosine`](yo_shape::Metric::Cosine) stores the unit vector and
+    /// reports one minus the cosine similarity, which is what a collection of
+    /// text embeddings wants. See the [`vector`](crate::vector) module for what
+    /// each metric does and why two of the four are refused.
+    ///
+    /// # Errors
+    ///
+    /// As [`Db::vectors`], and [`Code::Unsupported`] for a metric this build
+    /// does not measure.
+    pub fn vectors_with(
+        &self,
+        name: &str,
+        dim: usize,
+        metric: yo_shape::Metric,
+    ) -> Result<Vectors> {
+        let width = crate::vector::dimension(dim)?;
+        crate::vector::metric(metric)?;
+
+        let mut desc = Desc::new();
+        desc.vector(width, metric);
+
+        let at =
+            self.db.write(
+                |inner| match inner.collections.iter().position(|c| c.name == name) {
+                    Some(at) => {
+                        yo_shape::check(name, &inner.collections[at].desc, &desc, None)?;
+                        Ok(at)
+                    }
+                    None => {
+                        inner.collections.push(Collection {
+                            name: name.to_owned(),
+                            desc,
+                            data: Data::Vectors(Box::new(crate::vector::Store::new(dim, metric))),
+                        });
+                        Ok(inner.collections.len() - 1)
+                    }
+                },
+            )?;
+        Ok(Vectors {
+            db: self.db.clone(),
+            at,
+            dim,
+            metric,
+        })
     }
 
     /// The Redis string keyspace.

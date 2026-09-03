@@ -1009,10 +1009,12 @@ dependencies = [
  "yo-common",
  "yo-derive",
  "yo-doc",
+ "yo-format",
  "yo-graph",
  "yo-index",
  "yo-kv",
  "yo-shape",
+ "yo-vector",
 ]
 
 [[package]]
