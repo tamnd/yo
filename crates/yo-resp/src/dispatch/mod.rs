@@ -9436,10 +9436,12 @@ mod tests {
             f.run(&[b"JSON.GET", b"doc"]),
             bulk(r#"{"o":{"made":1},"s":"x","arr":[1,9]}"#)
         );
-        // Text that is not JSON is refused before the key is touched.
+        // Text that is not JSON is refused before the key is touched. The
+        // line has no `ERR` in front of it, which is this command's and not
+        // every command's, and is in D-37.
         assert!(
             f.run(&[b"JSON.SET", b"doc", b"$.s", b"nope"])
-                .starts_with("-ERR")
+                .starts_with("-this is not the start of a value")
         );
         assert_eq!(f.run(&[b"JSON.GET", b"doc", b".s"]), bulk("\"x\""));
     }
@@ -9765,9 +9767,11 @@ mod tests {
 
         // The values are parsed before the key is touched, so text that is not
         // JSON leaves the document alone.
+        // Text that is not JSON is refused before the key is touched, and
+        // the line has no `ERR` in front of it, which is D-37.
         assert!(
             f.run(&[b"JSON.ARRAPPEND", b"doc", b".a", b"nope"])
-                .starts_with("-ERR")
+                .starts_with("-this is not the start of a value")
         );
         assert_eq!(f.run(&[b"JSON.GET", b"doc", b".a"]), bulk("[]"));
     }
@@ -10225,6 +10229,335 @@ mod tests {
         assert_eq!(
             f.run(&[b"JSON.STRAPPEND", b"nope", b"$.a", b"1"]),
             "-ERR could not perform this operation on a key that doesn't exist\r\n"
+        );
+    }
+
+    /// RFC 7386 in one test: a null deletes, everything else merges, and a
+    /// patch that is not an object replaces what it lands on.
+    #[test]
+    fn a_merge_patch_adds_replaces_and_deletes_in_one_write() {
+        let mut f = Fixture::new();
+
+        // A key that is not there is created at the root, nulls and all,
+        // because a deletion with nothing to delete is still what the client
+        // sent.
+        assert_eq!(
+            f.run(&[b"JSON.MERGE", b"doc", b"$", br#"{"x":null,"y":1}"#]),
+            "+OK\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"JSON.GET", b"doc", b"$"]),
+            bulk(r#"[{"x":null,"y":1}]"#).as_str()
+        );
+
+        // Onto something that is there, a null deletes the member of that name
+        // and the rest is merged one level at a time.
+        f.run(&[b"JSON.SET", b"doc", b"$", br#"{"a":{"b":1,"c":2},"d":3}"#]);
+        assert_eq!(
+            f.run(&[b"JSON.MERGE", b"doc", b"$", br#"{"a":{"b":null,"e":4}}"#]),
+            "+OK\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"JSON.GET", b"doc", b"$"]),
+            bulk(r#"[{"a":{"c":2,"e":4},"d":3}]"#).as_str()
+        );
+
+        // A patch that is not an object replaces what it is merged onto.
+        assert_eq!(f.run(&[b"JSON.MERGE", b"doc", b"$.a", b"[1,2]"]), "+OK\r\n");
+        assert_eq!(
+            f.run(&[b"JSON.GET", b"doc", b"$"]),
+            bulk(r#"[{"a":[1,2],"d":3}]"#).as_str()
+        );
+
+        // A patch object onto a value that is not an object starts from an
+        // empty object, so this time the null has nothing to delete and is
+        // dropped rather than stored.
+        assert_eq!(
+            f.run(&[b"JSON.MERGE", b"doc", b"$.d", br#"{"p":null,"q":9}"#]),
+            "+OK\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"JSON.GET", b"doc", b"$"]),
+            bulk(r#"[{"a":[1,2],"d":{"q":9}}]"#).as_str()
+        );
+
+        // A member one level past the end of the document is created and keeps
+        // its nulls, two levels past it is a write that did not happen, and a
+        // path that would have to invent where it goes is the unprefixed line.
+        assert_eq!(
+            f.run(&[b"JSON.MERGE", b"doc", b"$.new", br#"{"z":null}"#]),
+            "+OK\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"JSON.GET", b"doc", b"$.new"]),
+            bulk(r#"[{"z":null}]"#).as_str()
+        );
+        assert_eq!(
+            f.run(&[b"JSON.MERGE", b"doc", b"$.no.deep", b"1"]),
+            "$-1\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"JSON.MERGE", b"doc", b"$.no.*", b"1"]),
+            "-Err wrong static path\r\n"
+        );
+
+        // A wildcard merges every match.
+        f.run(&[b"JSON.SET", b"doc", b"$", br#"{"a":{"n":1},"b":{"n":2}}"#]);
+        assert_eq!(
+            f.run(&[b"JSON.MERGE", b"doc", b"$.*", br#"{"m":0}"#]),
+            "+OK\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"JSON.GET", b"doc", b"$"]),
+            bulk(r#"[{"a":{"m":0,"n":1},"b":{"m":0,"n":2}}]"#).as_str()
+        );
+
+        // The three ways to get it wrong.
+        assert_eq!(
+            f.run(&[b"JSON.MERGE", b"doc", b"$", b"{}", b"more"]),
+            "-ERR syntax error\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"JSON.MERGE", b"gone", b"$.a", b"1"]),
+            "-ERR new objects must be created at the root\r\n"
+        );
+        f.run(&[b"SET", b"str", b"x"]);
+        assert_eq!(
+            f.run(&[b"JSON.MERGE", b"str", b"$", b"1"]),
+            "-Existing key has wrong Redis type\r\n"
+        );
+    }
+
+    /// A descent is the one path that matches a value and something inside that
+    /// same value, and the inner merge has to survive the outer one.
+    #[test]
+    fn a_merge_down_a_descent_keeps_what_the_inner_match_did() {
+        let mut f = Fixture::new();
+        f.run(&[b"JSON.SET", b"doc", b"$", br#"{"a":{"b":1},"c":[2]}"#]);
+        assert_eq!(
+            f.run(&[b"JSON.MERGE", b"doc", b"$..*", br#"{"m":1}"#]),
+            "+OK\r\n"
+        );
+        // `a`, `a.b`, `c` and `c[0]` all match. `a.b` is merged first and `a` is
+        // merged onto the result, so the `{"m":1}` written into `a.b` is still
+        // there. Doing it the other way round would leave `{"a":{"b":1,"m":1}}`.
+        assert_eq!(
+            f.run(&[b"JSON.GET", b"doc", b"$"]),
+            bulk(r#"[{"a":{"b":{"m":1},"m":1},"c":{"m":1}}]"#).as_str()
+        );
+
+        // A deletion down the same path, which is the case where the inner
+        // merge empties the object the outer one then copies.
+        f.run(&[b"JSON.SET", b"doc", b"$", br#"{"a":{"b":1},"c":[2]}"#]);
+        assert_eq!(
+            f.run(&[b"JSON.MERGE", b"doc", b"$..*", br#"{"a":null}"#]),
+            "+OK\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"JSON.GET", b"doc", b"$"]),
+            bulk(r#"[{"a":{"b":{}},"c":{}}]"#).as_str()
+        );
+    }
+
+    /// D-41. RedisJSON refuses this one, and which document it refuses is
+    /// decided by how it happens to hold an array of numbers.
+    #[test]
+    fn a_merge_onto_a_number_inside_an_array_is_a_merge_and_not_an_error() {
+        let mut f = Fixture::new();
+        f.run(&[b"JSON.SET", b"doc", b"$", br#"{"a":[1,2]}"#]);
+        assert_eq!(
+            f.run(&[b"JSON.MERGE", b"doc", b"$.a[0]", br#"{"x":1}"#]),
+            "+OK\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"JSON.GET", b"doc", b"$"]),
+            bulk(r#"[{"a":[{"x":1},2]}]"#).as_str()
+        );
+        // The same document with one element that is not an integer is the one
+        // RedisJSON is happy with, and it goes the same way here.
+        f.run(&[b"JSON.SET", b"doc", b"$", br#"{"a":[1,"s"]}"#]);
+        assert_eq!(
+            f.run(&[b"JSON.MERGE", b"doc", b"$.a[0]", br#"{"x":1}"#]),
+            "+OK\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"JSON.GET", b"doc", b"$"]),
+            bulk(r#"[{"a":[{"x":1},"s"]}]"#).as_str()
+        );
+    }
+
+    /// `JSON.MSET` checks what it can before it writes anything and skips the
+    /// one thing it cannot, which is a path with nowhere to put its value.
+    #[test]
+    fn an_mset_writes_every_triple_it_can_and_checks_the_rest_up_front() {
+        let mut f = Fixture::new();
+        assert_eq!(
+            f.run(&[b"JSON.MSET", b"a", b"$", b"1", b"b", b"$", b"2"]),
+            "+OK\r\n"
+        );
+        assert_eq!(f.run(&[b"JSON.GET", b"a", b"$"]), bulk("[1]").as_str());
+        assert_eq!(f.run(&[b"JSON.GET", b"b", b"$"]), bulk("[2]").as_str());
+
+        // A repeated key takes the last write.
+        assert_eq!(
+            f.run(&[b"JSON.MSET", b"a", b"$", b"3", b"a", b"$", b"4"]),
+            "+OK\r\n"
+        );
+        assert_eq!(f.run(&[b"JSON.GET", b"a", b"$"]), bulk("[4]").as_str());
+
+        // A triple whose path names nowhere is skipped, the others are still
+        // written and the reply turns into a nil. Both ways round, because a
+        // loop that gave up at the first skip would agree with this on one
+        // order and not on the other.
+        f.run(&[b"JSON.SET", b"a", b"$", br#"{"n":1}"#]);
+        assert_eq!(
+            f.run(&[b"JSON.MSET", b"a", b"$.no.deep", b"9", b"b", b"$", b"5"]),
+            "$-1\r\n"
+        );
+        assert_eq!(f.run(&[b"JSON.GET", b"b", b"$"]), bulk("[5]").as_str());
+        assert_eq!(
+            f.run(&[b"JSON.MSET", b"b", b"$", b"6", b"a", b"$.no.deep", b"9"]),
+            "$-1\r\n"
+        );
+        assert_eq!(f.run(&[b"JSON.GET", b"b", b"$"]), bulk("[6]").as_str());
+
+        // A value that is not JSON, a key holding something else and a path
+        // that would have to create a document below its own root are all
+        // checked before anything is written, so the good triple next to them
+        // does not happen either.
+        f.run(&[b"SET", b"str", b"x"]);
+        assert_eq!(
+            f.run(&[b"JSON.MSET", b"a", b"$.n", b"7", b"b", b"$", b"notjson"]),
+            "-this is not the start of a value, at byte 0 of the JSON text\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"JSON.MSET", b"a", b"$.n", b"7", b"str", b"$", b"1"]),
+            "-Existing key has wrong Redis type\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"JSON.MSET", b"a", b"$.n", b"7", b"gone", b"$.x", b"1"]),
+            "-ERR new objects must be created at the root\r\n"
+        );
+        assert_eq!(f.run(&[b"JSON.GET", b"a", b"$.n"]), bulk("[1]").as_str());
+
+        // The two errors a path can be are checked up front as well, so the
+        // triple before them is not written either. A wildcard that matched
+        // nothing has nowhere to invent, and an index that is not in the array
+        // is out of range, and both of them stop the whole command.
+        assert_eq!(
+            f.run(&[b"JSON.MSET", b"b", b"$", b"8", b"a", b"$.no.*", b"9"]),
+            "-Err wrong static path\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"JSON.MSET", b"b", b"$", b"8", b"a", b"$[0]", b"9"]),
+            "-ERR array index out of range\r\n"
+        );
+        assert_eq!(f.run(&[b"JSON.GET", b"b", b"$"]), bulk("[6]").as_str());
+
+        // Every triple is worked out against the keyspace as the command found
+        // it, so a second triple on the same key does not see the first one and
+        // the last write is the one that stays.
+        f.run(&[b"JSON.SET", b"c", b"$", br#"{"n":1}"#]);
+        assert_eq!(
+            f.run(&[b"JSON.MSET", b"c", b"$", br#"{"n":2}"#, b"c", b"$.n", b"3"]),
+            "+OK\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"JSON.GET", b"c", b"$"]),
+            bulk(r#"[{"n":3}]"#).as_str()
+        );
+
+        // An argument count that is not a run of key, path and value is the
+        // arity error rather than a syntax one.
+        assert_eq!(
+            f.run(&[b"JSON.MSET", b"a", b"$", b"1", b"b"]),
+            "-ERR wrong number of arguments for 'json.mset' command\r\n"
+        );
+    }
+
+    /// `JSON.RESP` hands back RESP types, and the marker element is what tells
+    /// an empty array and an empty object apart.
+    #[test]
+    fn json_resp_answers_the_document_as_resp_types() {
+        let mut f = Fixture::new();
+        f.run(&[b"JSON.SET", b"doc", b"$", br#"{"a":1,"b":[2,"c"]}"#]);
+        assert_eq!(
+            f.run(&[b"JSON.RESP", b"doc"]),
+            "*5\r\n+{\r\n$1\r\na\r\n:1\r\n$1\r\nb\r\n*3\r\n+[\r\n:2\r\n$1\r\nc\r\n"
+        );
+        // A JSONPath wraps the same answer in one more array.
+        assert_eq!(
+            f.run(&[b"JSON.RESP", b"doc", b"$.b"]),
+            "*1\r\n*3\r\n+[\r\n:2\r\n$1\r\nc\r\n"
+        );
+
+        f.run(&[
+            b"JSON.SET",
+            b"doc",
+            b"$",
+            br#"{"f":2.5,"t":true,"z":null,"e":[],"o":{}}"#,
+        ]);
+        assert_eq!(f.run(&[b"JSON.RESP", b"doc", b".e"]), "*1\r\n+[\r\n");
+        assert_eq!(f.run(&[b"JSON.RESP", b"doc", b".o"]), "*1\r\n+{\r\n");
+        // A double goes out as its text, so a client reads the same digits
+        // `JSON.GET` would have given it.
+        assert_eq!(f.run(&[b"JSON.RESP", b"doc", b".f"]), bulk("2.5").as_str());
+        assert_eq!(f.run(&[b"JSON.RESP", b"doc", b".t"]), "+true\r\n");
+        assert_eq!(f.run(&[b"JSON.RESP", b"doc", b".z"]), "$-1\r\n");
+
+        // A missing legacy path is an error, a missing JSONPath is an empty
+        // array, and a key that is not there is a nil on either.
+        assert_eq!(
+            f.run(&[b"JSON.RESP", b"doc", b".nope"]),
+            "-ERR Path does not exist\r\n"
+        );
+        assert_eq!(f.run(&[b"JSON.RESP", b"doc", b"$.nope"]), "*0\r\n");
+        assert_eq!(f.run(&[b"JSON.RESP", b"gone"]), "$-1\r\n");
+        assert_eq!(f.run(&[b"JSON.RESP", b"gone", b"$"]), "$-1\r\n");
+    }
+
+    /// `JSON.DEBUG` answers a byte count that is this encoding's, so the test
+    /// pins the shapes and that the two syntaxes agree rather than a number
+    /// read off another server. That is D-42.
+    #[test]
+    fn json_debug_answers_a_byte_count_and_its_own_help() {
+        let mut f = Fixture::new();
+        f.run(&[b"JSON.SET", b"doc", b"$", br#"{"a":[1,2],"s":"hello"}"#]);
+        let one = f.run(&[b"JSON.DEBUG", b"MEMORY", b"doc", b".s"]);
+        assert!(one.starts_with(':'), "{one}");
+        assert_eq!(
+            f.run(&[b"JSON.DEBUG", b"memory", b"doc", b"$.s"]),
+            format!("*1\r\n{one}")
+        );
+        let whole = f.run(&[b"JSON.DEBUG", b"MEMORY", b"doc"]);
+        assert!(whole.starts_with(':') && whole.len() > one.len(), "{whole}");
+
+        // A key that is not there is a zero on a legacy path and an empty set
+        // on a JSONPath, which is the one reader here that does not answer nil
+        // for it.
+        assert_eq!(f.run(&[b"JSON.DEBUG", b"MEMORY", b"gone"]), ":0\r\n");
+        assert_eq!(f.run(&[b"JSON.DEBUG", b"MEMORY", b"gone", b"$"]), "*0\r\n");
+        assert_eq!(
+            f.run(&[b"JSON.DEBUG", b"MEMORY", b"doc", b".nope"]),
+            "-ERR Path does not exist\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"JSON.DEBUG", b"MEMORY", b"doc", b"$.nope"]),
+            "*0\r\n"
+        );
+
+        assert_eq!(
+            f.run(&[b"JSON.DEBUG", b"HELP"]),
+            "*2\r\n$42\r\nMEMORY <key> [path] - reports memory usage\r\n\
+             $34\r\nHELP                - this message\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"JSON.DEBUG", b"NOPE"]),
+            "-ERR unknown subcommand - try `JSON.DEBUG HELP`\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"JSON.DEBUG", b"MEMORY"]),
+            "-ERR wrong number of arguments for 'json.debug' command\r\n"
         );
     }
 

@@ -120,12 +120,12 @@ doc = "11 section 7"
 [[group]]
 name = "json"
 expected = 25
-status = "partial"
+status = "shipped"
 doc = "09 section 2"
-# Twenty one of the twenty five, which are the ones that read and write a value
-# at a path plus the whole array family, the four that ask how big something is,
-# the three that do arithmetic and the one that appends to a string. The other
-# four are MERGE, MSET, RESP and DEBUG, and they are the next change. The count
+# All twenty five, which are the ones that read and write a value at a path, the
+# whole array family, the four that ask how big something is, the three that do
+# arithmetic, the one that appends to a string, the merge patch, the multi key
+# write and the two odd ones that answer RESP types and byte counts. The count
 # is RedisJSON 2.8 as it ships inside Redis 8, read off COMMAND LIST FILTERBY
 # ACLCAT json on a running one rather than off the documentation, which lists
 # NUMMULTBY and NUMPOWBY as deprecated and still registers them.
@@ -2365,6 +2365,30 @@ divergent = "D-34"
 notes = "The text is parsed into the encoding before the key is touched, so a value that is not JSON changes nothing and costs one parse. A path that matched is a rebuild with the new value spliced in at every offset it matched, and everything the path did not name is a memcpy, so the cost follows the size of the document rather than the number of places written. A path that matched nothing can still be a write, but only if it names exactly one place and the container that would hold it is there, which is why a wildcard that matched nothing is an error rather than a fan out of new fields. The risk is the honest verdict: a JSON.SET on a ten megabyte document rewrites ten megabytes whatever the path was, and the fix for that is a document small enough to be one value or a collection instead of one key."
 
 [[command]]
+name = "JSON.MSET"
+group = "json"
+since = "2.6.0"
+arity = -4
+plan = "whole-value"
+bounded = "risk"
+status = "shipped"
+wire = "verified"
+divergent = "D-34,D-37,D-40"
+notes = "Three arguments a key and any number of keys, which is why the key spec is a step of three rather than a range. Every triple is worked out against the keyspace as the command found it and nothing is written until all of them are known to work, so a client that saw an error knows nothing happened. The one thing that is not an error is a path that names nowhere to put its value: that triple is skipped, the others are still written and the reply turns into a nil. That was read off a running module both ways round, with the failing triple first and last, because a naive loop and this agree on one order and not on the other. Two triples on one key do not see each other and the last one written is the one that stays."
+
+[[command]]
+name = "JSON.MERGE"
+group = "json"
+since = "2.6.0"
+arity = -4
+plan = "whole-value"
+bounded = "risk"
+status = "shipped"
+wire = "verified"
+divergent = "D-34,D-37,D-40,D-41"
+notes = "RFC 7386, which is a small rule with a lot of edges. A patch that is not an object replaces what it is merged onto, an object patch is applied member by member, and a null in the patch deletes the member of that name rather than storing a null. A patch object merged onto anything that is not an object starts from an empty object, so the nulls have nothing to delete and are dropped, which is how a patch onto a number comes out holding only the members that were not deletions. Where there is nothing at all the patch is stored as it stands, nulls and all, which is a key that is not there and a member the path is about to create. A wildcard merges every match, and a path that matched nothing follows the same rule JSON.SET follows."
+
+[[command]]
 name = "JSON.GET"
 group = "json"
 since = "1.0.0"
@@ -2602,6 +2626,30 @@ status = "shipped"
 wire = "verified"
 divergent = "D-34,D-36,D-37"
 notes = "The path is optional and sits in the middle, which no other command in this group does, so three arguments means the value is the last one and the path is the root. The value is JSON and has to be a JSON string, so a client appends a quoted string and not bare text, and a value that is a number is a WRONGTYPE about a path value even though it was the value that was wrong. The answer is the new length in bytes and not in characters."
+
+[[command]]
+name = "JSON.RESP"
+group = "json"
+since = "1.0.0"
+arity = -2
+plan = "whole-value"
+bounded = "risk"
+status = "shipped"
+wire = "verified"
+divergent = "D-34,D-40"
+notes = "The document as RESP types rather than as JSON text, so a client can walk it without a JSON parser. An object is an array whose first element is the simple string open brace followed by key, value, key, value, and an array is one whose first element is the simple string open bracket, which is what tells an empty object and an empty array apart. A double goes out as a bulk string holding its JSON text rather than as a RESP double, so the reply is the same on both protocols. The whole answer is built in one pass over the value and costs what the value is worth."
+
+[[command]]
+name = "JSON.DEBUG"
+group = "json"
+since = "1.0.0"
+arity = -2
+plan = "metadata"
+bounded = "inherent"
+status = "shipped"
+wire = "verified"
+divergent = "D-40,D-42"
+notes = "MEMORY and HELP, and the key sits after the subcommand, which is why the command carries movablekeys and a key spec that searches for the keyword. MEMORY answers how many bytes the value at a path takes, which here is the length of its encoded form and is a walk of the value rather than a count kept anywhere. The numbers are not RedisJSON's and cannot be, since the two servers do not store a document the same way. HELP answers the same two lines the module answers, spacing included."
 
 # --------------------------------------------------------------------- vector
 

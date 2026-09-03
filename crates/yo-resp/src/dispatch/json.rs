@@ -109,7 +109,11 @@ impl Foreign for JsonBody {
 pub(super) fn execute(db: &mut Keyspace, spec: &Spec, args: Args<'_>, out: &mut Out) -> Result<()> {
     match spec.name {
         "json.set" => set(db, args, out),
+        "json.mset" => mset(db, args, out),
+        "json.merge" => merge(db, args, out),
         "json.get" => get(db, args, out),
+        "json.resp" => resp(db, args, out),
+        "json.debug" => debug(db, args, out),
         "json.mget" => mget(db, args, out),
         "json.del" | "json.forget" => del(db, args, out),
         "json.type" => kind(db, args, out),
@@ -152,10 +156,53 @@ fn set(db: &mut Keyspace, args: Args<'_>, out: &mut Out) -> Result<()> {
     let path = Path::parse(raw)?;
     // The document is parsed before the key is touched, so a client that sent
     // text that is not JSON changes nothing.
-    let value = yo_doc::from_json(text)?;
+    let value = match yo_doc::from_json(text) {
+        Ok(value) => value,
+        Err(e) => {
+            unprefixed(&e, out);
+            return Ok(());
+        }
+    };
+    match plan_one(db, key, &path, &value, only, out)? {
+        Plan::Store(doc) => {
+            store(db, key, doc);
+            out.ok();
+        }
+        Plan::Nothing => out.nil(),
+        Plan::Refused => {}
+    }
+    Ok(())
+}
 
-    let body = match doc_mut(db, key, out)? {
-        Doc::Wrong => return Ok(()),
+/// What one `key path value` write would do, worked out without doing it.
+///
+/// Three answers and not two, because the line a path that cannot say where a
+/// value goes gets has no prefix and so is written where it happens rather than
+/// returned, and the caller has to know the reply is already out.
+enum Plan {
+    /// Put this document under the key.
+    Store(Vec<u8>),
+    /// The path named nowhere the value could go.
+    Nothing,
+    /// Nothing is to be written and the reply is already out.
+    Refused,
+}
+
+/// One `key path value` write, which is all of `JSON.SET` and one of
+/// `JSON.MSET`'s triples.
+///
+/// It answers the document rather than storing it because `JSON.MSET` has to
+/// know that every triple works before the first one is written.
+fn plan_one<'v>(
+    db: &mut Keyspace,
+    key: &[u8],
+    path: &Path<'v>,
+    value: &'v [u8],
+    only: Only,
+    out: &mut Out,
+) -> Result<Plan> {
+    let body = match doc(db, key, out)? {
+        Doc::Wrong => return Ok(Plan::Refused),
         Doc::Gone => {
             // Nothing is there. The only path that says where a whole document
             // goes is the root, and this is checked before `NX` and `XX`
@@ -164,55 +211,59 @@ fn set(db: &mut Keyspace, args: Args<'_>, out: &mut Out) -> Result<()> {
                 return Err(Error::new(Code::Invalid, NOT_AT_ROOT));
             }
             if only == Only::Present {
-                out.nil();
-                return Ok(());
+                return Ok(Plan::Nothing);
             }
-            db.put_foreign(key, Box::new(JsonBody { doc: value }));
-            out.ok();
-            return Ok(());
+            return Ok(Plan::Store(value.to_vec()));
         }
         Doc::Here(body) => body,
     };
 
-    let after = {
-        let root = readable(&body.doc)?;
-        let mut hits = Vec::new();
-        path.select(&root, &mut hits);
-        if hits.is_empty() {
-            if only == Only::Present {
-                out.nil();
-                return Ok(());
-            }
-            // A path that matched nothing can still say where a value goes, but
-            // only if it says exactly one place. A wildcard or a descent would
-            // have to invent one, and that is the unprefixed error.
-            if !path.is_definite() {
-                out.error(STATIC_PATH);
-                return Ok(());
-            }
-            let Some(at) = grow(&root, &path, &value)? else {
-                // The container that would hold it is not there, or is not an
-                // object. Not an error on either syntax, just a write that did
-                // not happen.
-                out.nil();
-                return Ok(());
-            };
-            edit(&root, &at)?
-        } else {
-            if only == Only::Missing {
-                out.nil();
-                return Ok(());
-            }
-            let at: Vec<_> = offsets(&root, &hits)?
-                .into_iter()
-                .map(|off| (off, Edit::Set(&value)))
-                .collect();
-            edit(&root, &at)?
+    let root = readable(&body.doc)?;
+    let mut hits = Vec::new();
+    path.select(&root, &mut hits);
+    if hits.is_empty() {
+        if only == Only::Present {
+            return Ok(Plan::Nothing);
         }
-    };
-    body.doc = after;
-    out.ok();
-    Ok(())
+        // A path that matched nothing can still say where a value goes, but
+        // only if it says exactly one place. A wildcard or a descent would
+        // have to invent one, and that is the unprefixed error.
+        if !path.is_definite() {
+            out.error(STATIC_PATH);
+            return Ok(Plan::Refused);
+        }
+        let Some(at) = grow(&root, path, value)? else {
+            // The container that would hold it is not there, or is not an
+            // object. Not an error on either syntax, just a write that did
+            // not happen.
+            return Ok(Plan::Nothing);
+        };
+        Ok(Plan::Store(edit(&root, &at)?))
+    } else {
+        if only == Only::Missing {
+            return Ok(Plan::Nothing);
+        }
+        let at: Vec<_> = offsets(&root, &hits)?
+            .into_iter()
+            .map(|off| (off, Edit::Set(value)))
+            .collect();
+        Ok(Plan::Store(edit(&root, &at)?))
+    }
+}
+
+/// Put a document under a key, whether or not one is there already.
+///
+/// Only ever called for a key a [`Plan`] was worked out against, so the key
+/// either holds a document or holds nothing, and the wrong type is somebody
+/// else's error to write.
+fn store(db: &mut Keyspace, key: &[u8], doc: Vec<u8>) {
+    if let Ok(Some(body)) = db.foreign_mut(key)
+        && let Some(body) = body.downcast_mut::<JsonBody>()
+    {
+        body.doc = doc;
+        return;
+    }
+    db.put_foreign(key, Box::new(JsonBody { doc }));
 }
 
 /// Whether a `NX` or an `XX` was given.
@@ -250,6 +301,219 @@ fn grow<'v>(
         return Ok(None);
     }
     Ok(Some(vec![(offset(root, &holder)?, Edit::Put(name, value))]))
+}
+
+/// `JSON.MSET key path value [key path value ...]`.
+///
+/// Every triple is worked out against the keyspace as it was before the command
+/// and nothing is written until all of them are known to work, so a client that
+/// saw an error knows that nothing happened. What is not an error is a path that
+/// names nowhere to put its value: that triple is skipped, the others are still
+/// written, and the reply is a nil instead of `OK`. Read off 8.10.1 both ways
+/// round, with the failing triple first and last, because a naive loop and this
+/// are the same for one order and not for the other.
+///
+/// Working every triple out against the state the command started in is also
+/// what the reference does, so two triples on one key do not see each other and
+/// the last one written is the one that stays.
+fn mset(db: &mut Keyspace, args: Args<'_>, out: &mut Out) -> Result<()> {
+    if args.len() < 4 || !(args.len() - 1).is_multiple_of(3) {
+        return Err(args::wrong_arity("json.mset"));
+    }
+    let mut jobs = Vec::with_capacity((args.len() - 1) / 3);
+    for i in (1..args.len()).step_by(3) {
+        let path = Path::parse(args.get(i + 1))?;
+        let value = match yo_doc::from_json(args.get(i + 2)) {
+            Ok(value) => value,
+            Err(e) => {
+                unprefixed(&e, out);
+                return Ok(());
+            }
+        };
+        jobs.push((args.get(i), path, value));
+    }
+    let mut plans = Vec::with_capacity(jobs.len());
+    for (key, path, value) in &jobs {
+        match plan_one(db, key, path, value, Only::Either, out)? {
+            Plan::Refused => return Ok(()),
+            plan => plans.push(plan),
+        }
+    }
+    let mut all = true;
+    for ((key, _, _), plan) in jobs.iter().zip(plans) {
+        match plan {
+            Plan::Store(doc) => store(db, key, doc),
+            Plan::Nothing => all = false,
+            // Every one of these was turned into an early return above.
+            Plan::Refused => unreachable!("a refused triple is answered before any is written"),
+        }
+    }
+    if all {
+        out.ok();
+    } else {
+        out.nil();
+    }
+    Ok(())
+}
+
+/// `JSON.MERGE key path value`.
+///
+/// The value is a merge patch, RFC 7386: a patch that is not an object replaces
+/// what it is merged onto, and an object patch is applied member by member with
+/// a `null` deleting the member of that name. It is the one write here whose
+/// argument is not the value being stored.
+fn merge(db: &mut Keyspace, args: Args<'_>, out: &mut Out) -> Result<()> {
+    if args.len() != 4 {
+        return Err(args::syntax());
+    }
+    let (key, raw, text) = (args.get(1), args.get(2), args.get(3));
+    let path = Path::parse(raw)?;
+    let patch = match yo_doc::from_json(text) {
+        Ok(patch) => patch,
+        Err(e) => {
+            unprefixed(&e, out);
+            return Ok(());
+        }
+    };
+    let body = match doc_mut(db, key, out)? {
+        Doc::Wrong => return Ok(()),
+        Doc::Gone => {
+            if !path.is_root() {
+                return Err(Error::new(Code::Invalid, NOT_AT_ROOT));
+            }
+            // Stored as it stands, nulls and all. A merge patch says a null
+            // deletes the member of that name, and RFC 7386 goes on to say that
+            // a patch applied to nothing has its nulls dropped, but RedisJSON
+            // only does that where there is something to merge onto: a key that
+            // is not there and a member the path is about to create both keep
+            // the null. Read off 8.10.1 with `{"x":null,"y":1}` on both.
+            db.put_foreign(key, Box::new(JsonBody { doc: patch }));
+            out.ok();
+            return Ok(());
+        }
+        Doc::Here(body) => body,
+    };
+
+    // The merged values, held out here because the edits below borrow them.
+    let made: Vec<Vec<u8>>;
+    let after = {
+        let root = readable(&body.doc)?;
+        let patched = readable(&patch)?;
+        let mut hits = Vec::new();
+        path.select(&root, &mut hits);
+        if hits.is_empty() {
+            // The same rule `JSON.SET` follows for a path that matched nothing,
+            // down to the unprefixed line for a path that would have to invent
+            // the place it names.
+            if !path.is_definite() {
+                out.error(STATIC_PATH);
+                return Ok(());
+            }
+            let Some(at) = grow(&root, &path, &patch)? else {
+                out.nil();
+                return Ok(());
+            };
+            edit(&root, &at)?
+        } else {
+            made = folded(&root, &hits, &patched)?;
+            let at: Vec<_> = offsets(&root, &hits)?
+                .into_iter()
+                .zip(&made)
+                .map(|(off, bytes)| (off, Edit::Set(bytes)))
+                .collect();
+            edit(&root, &at)?
+        }
+    };
+    body.doc = after;
+    out.ok();
+    Ok(())
+}
+
+/// The patch merged onto every match, innermost match first.
+///
+/// A `$..` path is the only one that matches a value and something inside that
+/// same value, and the two are not independent: the reference merges the inner
+/// match first and then merges the outer one onto the result, so the inner
+/// change is still there at the end. `$..*` with `{"m":1}` on `{"a":{"b":1}}`
+/// comes out as `{"a":{"b":{"m":1},"m":1}}` and not as `{"a":{"b":1,"m":1}}`.
+/// Working outermost first would throw the inner one away, which is what
+/// [`edit`] does with an edit inside an edit and is right for `JSON.SET`.
+///
+/// The answers line up with `hits`. Sorting by offset the other way round is
+/// what puts an inner match before the outer one, since a match is always
+/// further into the document than anything that holds it.
+fn folded(root: &Value<'_>, hits: &[Value<'_>], patch: &Value<'_>) -> Result<Vec<Vec<u8>>> {
+    let spans = hits
+        .iter()
+        .map(|v| {
+            let at = offset(root, v)?;
+            Ok((at, at + v.encoded_len().ok_or_else(damaged)?))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let mut order: Vec<usize> = (0..hits.len()).collect();
+    order.sort_by_key(|&i| core::cmp::Reverse(spans[i].0));
+
+    let mut made: Vec<Vec<u8>> = vec![Vec::new(); hits.len()];
+    for &i in &order {
+        let (at, end) = spans[i];
+        // Everything already merged that sits inside this match. The ones
+        // nested inside another of these are dropped by `edit`, which is right,
+        // because the one that holds them already has them folded in.
+        let inside: Vec<_> = (0..hits.len())
+            .filter(|&j| j != i && spans[j].0 > at && spans[j].0 < end)
+            .map(|j| Ok((offset(&hits[i], &hits[j])?, Edit::Set(made[j].as_slice()))))
+            .collect::<Result<Vec<_>>>()?;
+        let with = if inside.is_empty() {
+            None
+        } else {
+            Some(edit(&hits[i], &inside)?)
+        };
+        let target = match &with {
+            Some(bytes) => readable(bytes)?,
+            None => hits[i],
+        };
+        let mut b = Builder::new();
+        merged(Some(&target), patch, &mut b)?;
+        made[i] = b.finish()?.to_vec();
+    }
+    Ok(made)
+}
+
+/// `patch` merged onto `target`, which is RFC 7386 and nothing more.
+///
+/// A patch that is not an object replaces the target outright, whatever the
+/// target was. An object patch merged onto anything that is not an object
+/// starts from an empty object, which is what makes `{"x":null,"y":1}` onto a
+/// `7` come out as `{"y":1}`: the deletion has nothing to delete and is dropped
+/// rather than kept as a null.
+fn merged(target: Option<&Value<'_>>, patch: &Value<'_>, b: &mut Builder) -> Result<()> {
+    if patch.kind() != Kind::Object {
+        return b.embed(patch);
+    }
+    let was = target.filter(|t| t.kind() == Kind::Object);
+    b.begin_object()?;
+    if let Some(t) = was {
+        for i in 0..t.len() {
+            // A member the patch names is written by the loop below, or is a
+            // deletion and is written by nobody.
+            let key = t.key_at(i).ok_or_else(damaged)?;
+            if patch.get(key).is_some() {
+                continue;
+            }
+            b.key(key)?;
+            b.embed(&t.at(i).ok_or_else(damaged)?)?;
+        }
+    }
+    for i in 0..patch.len() {
+        let key = patch.key_at(i).ok_or_else(damaged)?;
+        let v = patch.at(i).ok_or_else(damaged)?;
+        if v.is_null() {
+            continue;
+        }
+        b.key(key)?;
+        merged(was.and_then(|t| t.get(key)).as_ref(), &v, b)?;
+    }
+    b.end_object()
 }
 
 /// `JSON.DEL key [path]` and `JSON.FORGET`, which is the same command.
@@ -836,7 +1100,13 @@ fn arrappend(db: &mut Keyspace, args: Args<'_>, out: &mut Out) -> Result<()> {
         return Err(args::wrong_arity("json.arrappend"));
     }
     let path = Path::parse(raw)?;
-    let added = values(args, 3)?;
+    let added = match values(args, 3) {
+        Ok(added) => added,
+        Err(e) => {
+            unprefixed(&e, out);
+            return Ok(());
+        }
+    };
     let body = match doc_mut(db, key, out)? {
         Doc::Wrong => return Ok(()),
         Doc::Gone => return Err(no_key()),
@@ -882,7 +1152,13 @@ fn arrinsert(db: &mut Keyspace, args: Args<'_>, out: &mut Out) -> Result<()> {
     }
     let path = Path::parse(raw)?;
     let want = args.int(3)?;
-    let added = values(args, 4)?;
+    let added = match values(args, 4) {
+        Ok(added) => added,
+        Err(e) => {
+            unprefixed(&e, out);
+            return Ok(());
+        }
+    };
     let body = match doc_mut(db, key, out)? {
         Doc::Wrong => return Ok(()),
         Doc::Gone => return Err(no_key()),
@@ -1492,6 +1768,142 @@ fn strappend(db: &mut Keyspace, args: Args<'_>, out: &mut Out) -> Result<()> {
     Ok(())
 }
 
+// ------------------------------------------------------- the two odd commands
+
+/// `JSON.RESP key [path]`, the document as RESP types rather than as JSON text.
+///
+/// An object is an array whose first element is the simple string `{` followed
+/// by its members flattened into key, value, key, value. An array is an array
+/// whose first element is the simple string `[`. An integer is an integer, a
+/// double is a bulk string holding its JSON text, a string is a bulk string, a
+/// boolean is the simple string `true` or `false` and a null is a nil. The
+/// reason it exists is that a client can walk the answer without a JSON parser,
+/// and the reason the two containers carry a marker element is that an empty
+/// array and an empty object would otherwise both be an empty array.
+fn resp(db: &mut Keyspace, args: Args<'_>, out: &mut Out) -> Result<()> {
+    let key = args.get(1);
+    // Anything past the path is ignored, the same as `JSON.DEL`.
+    let raw = args.opt(2).unwrap_or(ROOT);
+    let path = Path::parse(raw)?;
+    let body = match doc(db, key, out)? {
+        Doc::Wrong => return Ok(()),
+        Doc::Gone => {
+            out.nil();
+            return Ok(());
+        }
+        Doc::Here(body) => body,
+    };
+    let root = readable(&body.doc)?;
+    let mut hits = Vec::new();
+    path.select(&root, &mut hits);
+    if path.legacy() {
+        let Some(v) = hits.first() else {
+            return Err(missing());
+        };
+        return shape(v, out);
+    }
+    out.array(hits.len());
+    for v in &hits {
+        shape(v, out)?;
+    }
+    Ok(())
+}
+
+/// One value, as the RESP `JSON.RESP` answers with.
+fn shape(v: &Value<'_>, out: &mut Out) -> Result<()> {
+    match v.kind() {
+        Kind::Null => out.nil(),
+        Kind::Bool => out.simple(if v.as_bool() == Some(true) {
+            b"true"
+        } else {
+            b"false"
+        }),
+        Kind::Int => out.int(v.as_int().ok_or_else(damaged)?),
+        Kind::Float => {
+            // A double goes out as its JSON text and not as a RESP double, so
+            // the reply is the same on both protocols and a client that reads
+            // it gets the same digits `JSON.GET` would have given it.
+            let mut text = Vec::new();
+            v.write_json(&mut text)?;
+            out.bulk(&text);
+        }
+        Kind::Text => out.bulk(v.text_bytes().ok_or_else(damaged)?),
+        Kind::Array => {
+            out.array(v.len() + 1);
+            out.simple(b"[");
+            for e in v.iter() {
+                shape(&e, out)?;
+            }
+        }
+        Kind::Object => {
+            out.array(v.len() * 2 + 1);
+            out.simple(b"{");
+            for i in 0..v.len() {
+                out.bulk(v.key_at(i).ok_or_else(damaged)?);
+                shape(&v.at(i).ok_or_else(damaged)?, out)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// `JSON.DEBUG MEMORY key [path]` and `JSON.DEBUG HELP`.
+///
+/// The byte counts are this encoding's and not RedisJSON's, which is D-42: the
+/// two servers do not store a document the same way, so there is no arrangement
+/// under which the same document would answer the same number twice.
+fn debug(db: &mut Keyspace, args: Args<'_>, out: &mut Out) -> Result<()> {
+    if args::is(args.get(1), b"help") {
+        // Two lines, spaced the way the module spaces them.
+        out.array(2);
+        out.bulk(b"MEMORY <key> [path] - reports memory usage");
+        out.bulk(b"HELP                - this message");
+        return Ok(());
+    }
+    if !args::is(args.get(1), b"memory") {
+        return Err(Error::new(
+            Code::Invalid,
+            "unknown subcommand - try `JSON.DEBUG HELP`",
+        ));
+    }
+    if args.len() < 3 {
+        return Err(args::wrong_arity("json.debug"));
+    }
+    let key = args.get(2);
+    let raw = args.opt(3).unwrap_or(ROOT);
+    let path = Path::parse(raw)?;
+    let body = match doc(db, key, out)? {
+        Doc::Wrong => return Ok(()),
+        Doc::Gone => {
+            // A key that is not there is a zero on a legacy path and an empty
+            // set on a JSONPath, which is the one reader here that does not
+            // answer a nil for it.
+            if path.legacy() {
+                out.int(0);
+            } else {
+                out.array(0);
+            }
+            return Ok(());
+        }
+        Doc::Here(body) => body,
+    };
+    let root = readable(&body.doc)?;
+    let mut hits = Vec::new();
+    path.select(&root, &mut hits);
+    if path.legacy() {
+        let Some(v) = hits.first() else {
+            return Err(missing());
+        };
+        out.int(i64::try_from(v.encoded_len().ok_or_else(damaged)?).unwrap_or(i64::MAX));
+        return Ok(());
+    }
+    out.array(hits.len());
+    for v in &hits {
+        out.int(i64::try_from(v.encoded_len().ok_or_else(damaged)?).unwrap_or(i64::MAX));
+    }
+    Ok(())
+}
+
 // ----------------------------------------------------------------- the plumbing
 
 /// What a lookup of a document key found.
@@ -1603,7 +2015,28 @@ fn offset(root: &Value<'_>, v: &Value<'_>) -> Result<usize> {
 
 /// The document under a key, as a value.
 fn readable(doc: &[u8]) -> Result<Value<'_>> {
-    Value::new(doc).ok_or_else(|| Error::new(Code::Invalid, "the document stored here is damaged"))
+    Value::new(doc).ok_or_else(damaged)
+}
+
+/// What a walk that ran into bytes it could not read gets.
+///
+/// Only reachable if a stored document is damaged, since every document here is
+/// built by this server. It is an error rather than a panic because a client
+/// asking for a key it has no way of knowing is broken should get a line back
+/// and not a dropped connection.
+fn damaged() -> Error {
+    Error::new(Code::Invalid, "the document stored here is damaged")
+}
+
+/// Send an error with no `ERR` in front of it, which is how RedisJSON answers a
+/// value that is not JSON on `JSON.SET`, `JSON.ARRAPPEND`, `JSON.ARRINSERT`,
+/// `JSON.MERGE` and `JSON.MSET`.
+///
+/// It does prefix the same error on `JSON.ARRINDEX`, `JSON.STRAPPEND` and the
+/// number family, so this is not a rule about parse errors, it is a rule about
+/// which command the client sent. The wording is ours either way and is D-37.
+fn unprefixed(e: &Error, out: &mut Out) {
+    out.error_line(b"", e.message().as_bytes());
 }
 
 /// What a legacy path that named nothing gets.
