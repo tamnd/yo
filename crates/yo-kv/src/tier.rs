@@ -530,15 +530,23 @@ impl<B: Blocks> Tier<B> {
         let mut barren = 0;
         while map.memory_bytes() > budget {
             let round = self.round(map, policy, now_ms, lfu)?;
+            // After every round and not only the productive ones, because the
+            // state a long load spends most of its time in is a keyspace that is
+            // already cold, holding segments earlier rounds emptied out and
+            // nothing has handed back yet. Those rounds move nothing and free
+            // two megabytes, and stopping on the count would refuse a client's
+            // write on a server whose memory just went down.
+            //
+            // What stops this being the expensive loop it used to be is the
+            // floor on `compact_hard`. This runs on databases whose memory is
+            // somewhere else entirely: the budget is the arena's share of the
+            // limit, a keyspace full of collections keeps its bodies in slabs
+            // the arena has never heard of, and a round looking for strings to
+            // demote finds none of them. Without a floor the loop answered that
+            // by walking the whole arena on every write and handing back
+            // segments that were almost entirely live.
             while map.memory_bytes() > budget && map.compact_hard().is_some() {}
             if round == 0 {
-                // Nothing left worth moving out of memory, so the floor on what
-                // is worth copying is the only thing between this and refusing
-                // the write, and it comes off. While there is still something to
-                // demote the sweep is better off demoting it: that frees a
-                // record for about a byte written per byte freed, and emptying a
-                // segment that is barely dead costs hundreds.
-                while map.memory_bytes() > budget && map.compact_any().is_some() {}
                 barren += 1;
                 if barren == BARREN {
                     break;

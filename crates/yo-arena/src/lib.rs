@@ -695,24 +695,6 @@ impl Arena {
             .map(|(_, i)| i)
     }
 
-    /// The same pick with both ratios ignored: any segment holding anything dead
-    /// will do, and the one holding the most goes first.
-    ///
-    /// The trade here is as bad as it gets, which is the point of having it
-    /// separate. A segment a fifth of a percent dead costs two megabytes of
-    /// copying to give four kilobytes back, and the only reason to make that
-    /// trade is that the caller has already tried everything cheaper and the
-    /// next thing after this is refusing a client's write.
-    #[must_use]
-    pub fn dirty_candidate(&self) -> Option<usize> {
-        (0..self.segs.len())
-            .filter(|&i| i != self.cur && !self.segs[i].free)
-            .map(|i| (self.segs[i].header().dead_bytes, i))
-            .filter(|&(dead, _)| dead > 0)
-            .max()
-            .map(|(_, i)| i)
-    }
-
     /// Dead bytes in one segment.
     pub fn dead_bytes(&self, seg: usize) -> u64 {
         self.segs[seg].header().dead_bytes

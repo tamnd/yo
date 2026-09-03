@@ -69,8 +69,6 @@ enum Sweep {
     /// However clean the store is overall, as long as this segment is worth
     /// emptying on its own.
     Hard,
-    /// Anything holding anything dead, however little comes back.
-    LastResort,
 }
 
 /// A segment that is partway through being evacuated, and how far it got.
@@ -900,23 +898,6 @@ impl RawMap {
         self.compact(Sweep::Hard)
     }
 
-    /// One slice of compaction with nothing held back, for a caller that has run
-    /// out of anything else to try.
-    ///
-    /// This takes a segment holding a single dead record and copies the rest of
-    /// it somewhere else to get that record's bytes back, which is a bad enough
-    /// trade that [`RawMap::compact_hard`] refuses it: the caller under a memory
-    /// limit has a cheaper way to free the same bytes, which is to move another
-    /// value out of memory, and it should do that instead.
-    ///
-    /// It is here for when there is no other way. A caller that has nothing left
-    /// worth moving out and is still over its limit is choosing between this and
-    /// telling a client no, and at that point a hundred kilobytes bought with
-    /// two megabytes of copying is a hundred kilobytes the server did not have.
-    pub fn compact_any(&mut self) -> Option<usize> {
-        self.compact(Sweep::LastResort)
-    }
-
     fn compact(&mut self, sweep: Sweep) -> Option<usize> {
         self.writes += 1;
         let (seg, from) = match self.evac {
@@ -925,7 +906,6 @@ impl RawMap {
                 let pick = match sweep {
                     Sweep::Ordinary => self.arena.worst_candidate()?,
                     Sweep::Hard => self.arena.any_candidate()?,
-                    Sweep::LastResort => self.arena.dirty_candidate()?,
                 };
                 (pick, yo_arena::HEADER_SIZE)
             }
@@ -1432,15 +1412,15 @@ mod tests {
         }
     }
 
-    /// A store with a little dead spread thinly through it collects only as a
-    /// last resort.
+    /// A store with a little dead spread thinly through it collects nothing,
+    /// however hard it is asked.
     ///
-    /// One key in fifty, so no segment is anywhere near worth emptying and the
-    /// hard sweep leaves it alone. That is the right answer for a caller with
-    /// something better to do and the wrong one for a caller with nothing left
-    /// to try, which is why there are two of them and not one.
+    /// One key in fifty, so no segment is anywhere near worth emptying. There is
+    /// no pressure high enough to make copying forty nine bytes to get one back
+    /// the right move, because a caller under pressure has something cheaper it
+    /// could be doing with the same effort.
     #[test]
-    fn a_barely_dead_store_only_collects_as_a_last_resort() {
+    fn a_barely_dead_store_collects_nothing_however_hard_it_is_asked() {
         let mut m = RawMap::new();
         let val = vec![b'z'; COMPACT_VAL];
         const N: usize = COMPACT_N;
@@ -1453,20 +1433,6 @@ mod tests {
 
         assert_eq!(m.compact_step(), None, "not worth collecting");
         assert_eq!(m.compact_hard(), None, "fifty bytes moved for one back");
-        let free = m.arena().free_segments();
-        let mut calls = 0;
-        while m.arena().free_segments() == free {
-            assert!(
-                m.compact_any().is_some(),
-                "there is a segment holding something dead"
-            );
-            calls += 1;
-            assert!(calls < 1000, "the walk is not getting any further along");
-        }
-        for i in 0..N {
-            let want = if i % 50 == 0 { None } else { Some(val.clone()) };
-            assert_eq!(m.get(&key(i)).map(<[u8]>::to_vec), want, "key {i}");
-        }
     }
 
     /// Compaction says what it walked past and what it had to copy.
