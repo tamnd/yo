@@ -132,23 +132,36 @@
 //!
 //! ```text
 //!                        1024 docs    16384 docs
-//!   HGET                      16.6          21.8
-//!   probe                     33.3          38.8
-//!     of which the key        11.7          11.6
-//!   find                      73.4          91.5
+//!   HGET                      23.5          28.1
+//!   HGET, 12 byte field       27.2          29.3
+//!   probe                     38.9          41.0
+//!     of which the key        10.2          12.1
+//!     so the lookup           28.7          28.8
+//!   find                      65.5          93.0
 //! ```
 //!
+//! The two `HGET` rows are the same call against a different field width, and
+//! the second one is there because the first is not a fair comparison. An index
+//! key for an integer is twelve bytes, and the hash fields in this bench are the
+//! decimal of the loop counter, so at most five. Measuring the index against the
+//! short one charges it for the longer key and calls the difference index
+//! overhead, which it is not, because a hash asked for a twelve byte field pays
+//! exactly the same thing.
+//!
 //! `probe` is [`PathIndex::count`] with the path already resolved, which is the
-//! index lookup on its own. Take the key encoding off it and it is 21.6 and
-//! 27.2 against `HGET`'s 16.6 and 21.8, so the table probe itself is within a
-//! quarter of the one it is made of, and what is left of that is the key being
-//! twelve bytes where the hash field in this bench is at most five.
+//! index lookup plus the key encoding, and `key` is the encoding on its own.
+//! Take one off the other and the lookup is 28.7 and 28.8 against 27.2 and 29.3
+//! for the hash at the same key width. That is the gate: the probe is one probe
+//! and it costs what a probe costs. It is also flat where `HGET` is not, which
+//! is the table growing from 1024 to 16384 entries showing up on one side and
+//! not the other, and at the larger size the index is the faster of the two.
 //!
 //! `find` is the whole call a caller makes and it is more than one probe by
 //! construction: it looks the path up by name, encodes the key, probes the
 //! index, and then probes the primary table with the id it got back. The second
-//! probe is a document read and is the same thing `HGET` is doing, so the honest
-//! statement of the gate is that an indexed equality is two of them and not one.
+//! probe is a document read, and `HGET` does not need one because the value it
+//! returns is in the slot it just found. So an indexed equality that hands back
+//! the document is two probes, and only the first of them is the index.
 //!
 //! The key encoding used to be the largest single piece of this, at 15.6 ns on
 //! an M-series laptop where the whole probe was 28.2, because it pushed twelve
