@@ -165,6 +165,8 @@ impl Collection {
             rerank: as_u32(tuning.rerank)?,
             sweep: as_u32(tuning.sweep)?,
             widen: as_u32(tuning.widen)?,
+            spill: as_u32(tuning.spill)?,
+            slack: tuning.slack,
             centroids,
             keys,
         };
@@ -209,6 +211,8 @@ impl Collection {
                 rerank: head.rerank as usize,
                 sweep: head.sweep as usize,
                 widen: head.widen as usize,
+                spill: head.spill as usize,
+                slack: head.slack,
             },
         );
         let width = index.quantizer().code_bytes();

@@ -31,7 +31,7 @@
 //! ```text
 //!   root                        one per partition
 //! +------------------+        +---------------------------+
-//! | header, 88 bytes |        | count | code_bytes | stuck |
+//! | header, 96 bytes |        | count | code_bytes | stuck |
 //! +------------------+        +---------------------------+
 //! | centroid chain   |        | ids      count * 8        |
 //! | key chain        |        | tags     count * 8        |
@@ -76,7 +76,7 @@
 //! reader that does not like an image can throw it away and rebuild from the
 //! records, slowly and correctly.
 
-use crate::{get_u8, get_u16, get_u32, get_u64, put_u8, put_u16, put_u32, put_u64};
+use crate::{get_f32, get_u8, get_u16, get_u32, get_u64, put_f32, put_u8, put_u16, put_u32, put_u64};
 use yo_common::{Code, Error, Result};
 
 /// The four bytes an image starts with, so that a stray chunk is not read as
@@ -84,7 +84,7 @@ use yo_common::{Code, Error, Result};
 pub const IMAGE_TAG: u32 = u32::from_le_bytes(*b"YOIX");
 
 /// The fixed part at the front of an image root.
-pub const IMAGE_HEADER_LEN: usize = 88;
+pub const IMAGE_HEADER_LEN: usize = 96;
 
 /// One line of the partition table that follows the root header.
 pub const PARTITION_ENTRY_LEN: usize = 16;
@@ -135,7 +135,7 @@ pub mod metric {
 /// The two chains here and the partition table after it are addresses into the
 /// log, so this is small whatever the collection's size: a few dozen bytes plus
 /// sixteen per partition.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct ImageHeader {
     /// Which index this is an image of. See [`image_kind`].
     pub kind: u8,
@@ -169,6 +169,17 @@ pub struct ImageHeader {
     pub sweep: u32,
     /// How much further a filtered search looks.
     pub widen: u32,
+    /// How many partitions one vector may be written into.
+    ///
+    /// Part of the image rather than left to whatever the loader happens to be
+    /// tuned to, because it says how the collection was built. A collection
+    /// built with boundary copies and reopened without them keeps the copies it
+    /// has and stops making new ones, which is a recall curve that changes under
+    /// the caller for a reason nothing reports.
+    pub spill: u32,
+    /// How much further than the nearest centroid a copy is still made, as a
+    /// fraction.
+    pub slack: f32,
     /// Where the centroids are, and how many bytes of them there are.
     pub centroids: Chain,
     /// Where the key table is, and how long it is.
@@ -240,6 +251,8 @@ impl ImageHeader {
         put_u64(into, 64, self.centroids.len);
         put_u64(into, 72, self.keys.at);
         put_u64(into, 80, self.keys.len);
+        put_u32(into, 88, self.spill);
+        put_f32(into, 92, self.slack);
         Ok(need)
     }
 
@@ -284,6 +297,8 @@ impl ImageHeader {
             sweep: get_u32(bytes, 44),
             widen: get_u32(bytes, 48),
             slots: get_u32(bytes, 52),
+            spill: get_u32(bytes, 88),
+            slack: get_f32(bytes, 92),
             centroids: Chain {
                 at: get_u64(bytes, 56),
                 len: get_u64(bytes, 64),
@@ -647,6 +662,8 @@ mod tests {
             rerank: 4,
             sweep: 4,
             widen: 8,
+            spill: 4,
+            slack: 0.10,
             centroids: Chain {
                 at: 4096,
                 len: u64::from(partitions) * u64::from(dim) * 4,
@@ -861,7 +878,7 @@ mod tests {
     fn the_layout_is_the_one_written_down() {
         // The numbers in the module diagram, so that a change to any of them is
         // a change to a test rather than a silent change to the format.
-        assert_eq!(IMAGE_HEADER_LEN, 88);
+        assert_eq!(IMAGE_HEADER_LEN, 96);
         assert_eq!(PARTITION_ENTRY_LEN, 16);
         assert_eq!(POSTING_HEADER_LEN, 16);
         assert_eq!(META_LEN, 16);

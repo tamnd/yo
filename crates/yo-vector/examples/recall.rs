@@ -82,7 +82,7 @@ impl Vectors for Base {
 fn main() {
     let mut args = std::env::args().skip(1);
     let Some(dir) = args.next() else {
-        eprintln!("usage: recall <dataset directory> [queries] [highest probe]");
+        eprintln!("usage: recall <dataset directory> [queries] [highest probe] [spill] [slack]");
         std::process::exit(2);
     };
     // Ten thousand queries at a millisecond each is ten seconds a row and there
@@ -101,6 +101,17 @@ fn main() {
         a.parse()
             .expect("the third argument is the highest probe count")
     });
+    // The two replication knobs, because whether a boundary copy pays is a
+    // question about the data rather than about the index, and the answer on
+    // generated vectors is not evidence. `src/miss.rs` is why they are here:
+    // on MS-MARCO the whole of the recall gap is neighbours in partitions the
+    // search never reads, which is what a copy in a second partition is for.
+    let spill: usize = args
+        .next()
+        .map_or(Tuning::default().spill, |a| a.parse().expect("spill is a count"));
+    let slack: f32 = args
+        .next()
+        .map_or(Tuning::default().slack, |a| a.parse().expect("slack is a fraction"));
     let set = prefix(&dir);
 
     let t = Instant::now();
@@ -128,7 +139,10 @@ fn main() {
 
     for bits in [Bits::One, Bits::Four] {
         let t = Instant::now();
-        let mut ix = Partitions::new(dim, bits, 0x51f7, Tuning::default());
+        let mut tuning = Tuning::default();
+        tuning.spill = spill;
+        tuning.slack = slack;
+        let mut ix = Partitions::new(dim, bits, 0x51f7, tuning);
         let mut buf = vec![0f32; dim];
         for id in 0..n as u64 {
             base.get(id, &mut buf);
@@ -144,8 +158,9 @@ fn main() {
         let rate = n as f64 / built.as_secs_f64();
         println!();
         println!(
-            "{bits:?} bit, {} partitions, built in {built:?}, {:.0} vectors a second on one core",
+            "{bits:?} bit, spill {spill} slack {slack}, {} partitions, {:.3} copies a vector, built in {built:?}, {:.0} vectors a second on one core",
             ix.partitions(),
+            ix.entries() as f64 / ix.len() as f64,
             rate
         );
         println!(

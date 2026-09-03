@@ -140,7 +140,7 @@
 //!
 //! The commands that put all of this on the wire are the rest of M6.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use yo_common::{Code, Error, Result};
 
@@ -166,7 +166,7 @@ pub trait Vectors {
 
 /// The knobs, all of which have a defensible default and none of which anybody
 /// should have to touch.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Tuning {
     /// How many members a partition wants. It splits past twice this and merges
     /// under a quarter of it.
@@ -198,6 +198,37 @@ pub struct Tuning {
     /// while the answer sat two partitions further out. Too large and the same
     /// filter reads the whole collection to prove there is nothing there.
     pub widen: usize,
+    /// How many partitions one vector may be written into, at most.
+    ///
+    /// One is no replication and is what the index did before this existed. It
+    /// is not the default, and `src/miss.rs` is why.
+    ///
+    /// A vector belongs to the partition whose centroid it is nearest, and on
+    /// some data that is a much weaker statement than it sounds. Measured on a
+    /// million MS-MARCO passage embeddings, only 0.8952 of the true nearest
+    /// neighbours of a query sat in one of the 128 partitions the search reads,
+    /// and the recall the search actually returned was 0.8942, so the whole of
+    /// the miss was neighbours nobody looked at rather than anything the
+    /// estimator did. A vector near the boundary between two partitions is one
+    /// query away from being in the wrong one, and no amount of scanning fixes
+    /// that because the scan never gets there.
+    ///
+    /// So a vector near a boundary goes in both, which is SPANN's answer.
+    /// Raising this raises recall and costs memory and scan time in proportion
+    /// to how many vectors actually qualify, which is what [`Tuning::slack`]
+    /// controls.
+    pub spill: usize,
+    /// How much further than the nearest centroid a vector will still be copied
+    /// into, as a fraction.
+    ///
+    /// A vector goes into every one of its [`Tuning::spill`] nearest partitions
+    /// whose centroid is within `1 + slack` of the nearest one, so zero is no
+    /// replication whatever `spill` says and a large value replicates
+    /// everything into everything. It is a distance ratio rather than a count
+    /// because the thing being asked is whether a vector is genuinely near a
+    /// boundary, and a vector sitting squarely inside its partition should cost
+    /// one copy however large `spill` is.
+    pub slack: f32,
 }
 
 impl Default for Tuning {
@@ -208,6 +239,8 @@ impl Default for Tuning {
             rerank: 4,
             sweep: 4,
             widen: 8,
+            spill: 4,
+            slack: 0.10,
         }
     }
 }
@@ -379,12 +412,23 @@ pub struct Hit {
     pub distance: f32,
 }
 
-/// Where a member sits.
+/// Where one copy of a member sits, and where the next copy of it is.
+///
+/// A vector is in one posting most of the time and in several when it sits near
+/// the boundary between them, which is what [`Tuning::spill`] is for. So an id
+/// does not map to a place, it maps to a chain of them, threaded through an
+/// arena so that a chain of one costs what the single slot used to cost and a
+/// replicated id costs twelve more bytes per copy rather than an allocation.
 #[derive(Debug, Clone, Copy)]
-struct Slot {
+struct Place {
     partition: u32,
     slot: u32,
+    /// The next copy of the same vector, or [`END`]. Also the free list.
+    next: u32,
 }
+
+/// The end of a chain, and the empty free list.
+const END: u32 = u32::MAX;
 
 /// One partition's members: the ids, their codes end to end, and what each code
 /// needs beside it.
@@ -419,14 +463,25 @@ pub struct Partitions {
     /// The centroids, already rotated, `dim` floats each end to end.
     centroids: Vec<f32>,
     postings: Vec<Posting>,
-    /// Which partition and which slot every id is in, which is what makes a
-    /// delete a constant time operation rather than a search.
-    at: HashMap<u64, Slot>,
+    /// The head of every id's chain of placements, which is what makes a delete
+    /// a constant time operation rather than a search.
+    at: HashMap<u64, u32>,
+    /// The placements themselves, and the free list through their `next`.
+    ///
+    /// One arena rather than a list per id, because most ids have exactly one
+    /// placement and a `Vec` each would be a million allocations on a million
+    /// vectors to hold one entry apiece.
+    places: Vec<Place>,
+    free: u32,
     /// The index over the centroids. See [`crate::coarse`].
     coarse: Coarse,
     /// The shortlist a placement fills in, kept here so that placing a vector
     /// does not allocate.
     scratch: Vec<u32>,
+    /// One member's copies, and the partitions an insert is about to spill
+    /// into, kept for the same reason `scratch` is.
+    spare: Vec<Place>,
+    spill: Vec<(usize, f32)>,
     /// Partitions that may be over the split threshold, and partitions that may
     /// be under the merge threshold.
     ///
@@ -468,8 +523,12 @@ impl Partitions {
             centroids: Vec::new(),
             postings: Vec::new(),
             at: HashMap::new(),
+            places: Vec::new(),
+            free: END,
             coarse: Coarse::default(),
             scratch: Vec::new(),
+            spare: Vec::new(),
+            spill: Vec::new(),
             big: Vec::new(),
             small: Vec::new(),
         }
@@ -497,6 +556,16 @@ impl Partitions {
     #[must_use]
     pub fn partitions(&self) -> usize {
         self.postings.len()
+    }
+
+    /// How many coded members the postings hold between them.
+    ///
+    /// The same as [`Partitions::len`] until [`Tuning::spill`] puts a vector
+    /// near a boundary into more than one partition, and the ratio of the two
+    /// is what replication is costing in memory and in scan time.
+    #[must_use]
+    pub fn entries(&self) -> usize {
+        self.postings.iter().map(Posting::len).sum()
     }
 
     /// The knobs.
@@ -566,24 +635,94 @@ impl Partitions {
         );
         self.remove(id);
         let x = self.quant.rotate(v);
-        let p = if self.postings.is_empty() {
+        if self.postings.is_empty() {
             // The first vector is the first centroid. There is nothing to
             // average it with yet, and the first split is what starts the
             // centroids being means rather than members.
-            self.add_partition(&x)
-        } else {
-            let mut short = core::mem::take(&mut self.scratch);
-            let p = self.roughly_nearest(&x, &mut short);
+            let p = self.add_partition(&x);
+            self.place(p, id, tag, &x);
+            return;
+        }
+        let mut into = core::mem::take(&mut self.spill);
+        self.spill_into(&x, &mut into);
+        for i in 0..into.len() {
+            self.place(into[i].0, id, tag, &x);
+        }
+        self.spill = into;
+    }
+
+    /// The partitions a vector goes into, nearest first.
+    ///
+    /// The first is the one it belongs to and there is always exactly one of
+    /// those. The rest are the boundary copies [`Tuning::spill`] is about, and
+    /// they are picked the way SPANN picks them, with the rule that keeps the
+    /// replication factor down doing most of the work.
+    ///
+    /// A candidate is dropped if some partition already chosen is nearer to it
+    /// than the vector is. That reads oddly and it is the whole trick: a
+    /// candidate on the far side of one already taken adds a copy in a direction
+    /// that is already covered, and a query that would reach the candidate would
+    /// have reached the one already taken first. Without it, `slack` alone puts
+    /// a vector into every partition in a dense neighbourhood and the index
+    /// doubles in size for recall it already had.
+    fn spill_into(&mut self, x: &[f32], into: &mut Vec<(usize, f32)>) {
+        into.clear();
+        let dim = self.dim();
+        let want = self.tuning.spill.max(1);
+        // The coarse layer's shortlist rather than every centroid, which is what
+        // keeps an insert from costing what a search costs. It is at least 256
+        // partitions wide, so the nearest handful of them are in there.
+        let mut short = core::mem::take(&mut self.scratch);
+        if want == 1 || self.tuning.slack <= 0.0 {
+            let p = self.roughly_nearest(x, &mut short);
             self.scratch = short;
-            p
+            into.push((p, 0.0));
+            return;
+        }
+        self.coarse.shortlist(x, dim, &mut short);
+        let mut near: Vec<(usize, f32)> = if short.is_empty() {
+            (0..self.postings.len())
+                .map(|p| (p, sqdist(x, self.centroid(p))))
+                .collect()
+        } else {
+            short
+                .iter()
+                .map(|&p| (p as usize, sqdist(x, self.centroid(p as usize))))
+                .collect()
         };
-        self.place(p, id, tag, &x);
+        self.scratch = short;
+        near.sort_unstable_by(|a, b| a.1.total_cmp(&b.1));
+        let Some(&(first, best)) = near.first() else {
+            return;
+        };
+        into.push((first, best));
+        // Squared distances throughout, so the ratio on distances is the square
+        // of it here. Comparing the squares directly and skipping two square
+        // roots per candidate is worth it on a path that runs once per insert.
+        let ceiling = best * (1.0 + self.tuning.slack) * (1.0 + self.tuning.slack);
+        for &(q, d) in near.iter().skip(1) {
+            if into.len() >= want {
+                break;
+            }
+            if d > ceiling {
+                break;
+            }
+            let centre = &self.centroids[q * dim..(q + 1) * dim];
+            let covered = into
+                .iter()
+                .any(|&(taken, _)| sqdist(&self.centroids[taken * dim..(taken + 1) * dim], centre) < d);
+            if !covered {
+                into.push((q, d));
+            }
+        }
     }
 
     /// The tag `id` was inserted with, if it is still here.
     #[must_use]
     pub fn tag(&self, id: u64) -> Option<u64> {
-        let at = self.at.get(&id)?;
+        // Any copy will do. Every copy of a member carries the same tag, which
+        // is what [`Partitions::retag`] is for.
+        let at = self.any_place(id)?;
         Some(self.postings[at.partition as usize].tags[at.slot as usize])
     }
 
@@ -595,11 +734,15 @@ impl Partitions {
     /// summarises changes, which for a document index is a field being indexed
     /// or stopping being indexed.
     pub fn retag(&mut self, id: u64, tag: u64) -> bool {
-        let Some(at) = self.at.get(&id) else {
-            return false;
-        };
-        self.postings[at.partition as usize].tags[at.slot as usize] = tag;
-        true
+        let mut walk = self.at.get(&id).copied().unwrap_or(END);
+        let mut found = false;
+        while walk != END {
+            let place = self.places[walk as usize];
+            self.postings[place.partition as usize].tags[place.slot as usize] = tag;
+            found = true;
+            walk = place.next;
+        }
+        found
     }
 
     /// Take a vector out, saying whether it was there.
@@ -607,13 +750,28 @@ impl Partitions {
     /// The last member of the posting moves into the hole. There is no
     /// tombstone, so there is nothing to accumulate and nothing to compact.
     pub fn remove(&mut self, id: u64) -> bool {
-        let Some(Slot { partition, slot }) = self.at.remove(&id) else {
+        let mut copies = core::mem::take(&mut self.spare);
+        self.every_place(id, &mut copies);
+        if copies.is_empty() {
+            self.spare = copies;
             return false;
-        };
-        let moved = self.pull(partition as usize, slot as usize);
-        if let Some(other) = moved {
-            self.at.insert(other, Slot { partition, slot });
         }
+        self.detach_all(id);
+        // Highest slot first inside a partition, because pulling a member moves
+        // the last one into its slot, and a copy of this same id sitting at a
+        // higher slot in the same posting would have its recorded slot go stale.
+        // There is at most one copy per partition so this only matters across
+        // them, but the order costs nothing and the alternative is a rule that
+        // has to stay true.
+        copies.sort_unstable_by(|a, b| b.slot.cmp(&a.slot));
+        for copy in &copies {
+            let p = copy.partition as usize;
+            let s = copy.slot as usize;
+            if let Some(moved) = self.pull(p, s) {
+                self.reslot(moved, p, s);
+            }
+        }
+        self.spare = copies;
         true
     }
 
@@ -691,17 +849,14 @@ impl Partitions {
         }
         let p = self.postings.len();
         for (slot, &id) in ids.iter().enumerate() {
-            let was = self.at.insert(
-                id,
-                Slot {
-                    partition: p as u32,
-                    slot: slot as u32,
-                },
-            );
-            if was.is_some() {
+            // An id in two partitions is a replicated member and is what an
+            // image of a spilled collection looks like. An id twice in one
+            // partition is not, and `attach` is where that is caught, because
+            // it is the shape a delete cannot undo.
+            if !self.attach(id, p, slot) {
                 return Err(
-                    Error::new(Code::Corrupt, "an id is in two partitions of one image")
-                        .with_detail(format!("id={id}")),
+                    Error::new(Code::Corrupt, "an id is twice in one partition of an image")
+                        .with_detail(format!("id={id} partition={p}")),
                 );
             }
         }
@@ -874,7 +1029,21 @@ impl Partitions {
                 best.put(posting.ids[i], at);
             }
         }
-        best.sorted()
+        let mut out = best.sorted();
+        // A replicated member is in more than one posting and a search can read
+        // more than one of them, so the same id can be ranked twice, with two
+        // different estimates because each copy is coded against its own
+        // centroid. The near duplicates are not adjacent for that reason, so
+        // this is a pass with a set rather than a `dedup`.
+        //
+        // Only when there is replication to undo. With `spill` at one there can
+        // be no duplicate, and a search that pays for proving it every time is
+        // charging every collection for a feature some of them do not use.
+        if self.tuning.spill > 1 {
+            let mut seen = HashSet::with_capacity(out.len());
+            out.retain(|&(id, _)| seen.insert(id));
+        }
+        out
     }
 
     /// Whether there is a split or a merge waiting.
@@ -1119,7 +1288,9 @@ impl Partitions {
         let mut xs = Vec::with_capacity(ids.len() * dim);
         let mut buf = vec![0.0f32; dim];
         for (id, tag) in ids.into_iter().zip(tags) {
-            self.at.remove(&id);
+            // Only this partition's copy. A member replicated into a partition
+            // that is not the one being emptied keeps the copy it has there.
+            self.detach(id, p);
             if vectors.get(id, &mut buf) {
                 xs.extend_from_slice(&self.quant.rotate(&buf));
                 kept.push(Member { id, tag });
@@ -1157,7 +1328,7 @@ impl Partitions {
     /// Which partition holds `id`, if any.
     #[cfg(test)]
     pub(crate) fn holder(&self, id: u64) -> Option<usize> {
-        self.at.get(&id).map(|s| s.partition as usize)
+        self.any_place(id).map(|s| s.partition as usize)
     }
 
     /// The partition `x` belongs to, as far as the coarse layer can tell.
@@ -1221,10 +1392,13 @@ impl Partitions {
         self.centroids.truncate(last * dim);
         if p != last {
             // The partition that used to be last is at `p` now, so everything
-            // filed under it has to be told.
-            for &id in &self.postings[p].ids {
-                if let Some(slot) = self.at.get_mut(&id) {
-                    slot.partition = p as u32;
+            // filed under it has to be told. It is the copy in `last` that
+            // moves, not the member, so a replicated id keeps its other copies
+            // pointing where they already point.
+            for i in 0..self.postings[p].len() {
+                let id = self.postings[p].ids[i];
+                if let Some(at) = self.placed_at(id, last) {
+                    self.places[at as usize].partition = p as u32;
                 }
             }
             self.note(p);
@@ -1233,10 +1407,19 @@ impl Partitions {
     }
 
     /// Append a member to a partition. `x` is rotated.
+    ///
+    /// A partition that already holds a copy of `id` keeps the one it has, so
+    /// that the two maintenance paths that can hand the same member to the same
+    /// partition twice, a merge into a partition the member was replicated into
+    /// and a sweep that moves it there, cannot produce a posting with the same
+    /// id in it twice.
     fn place(&mut self, p: usize, id: u64, tag: u64, x: &[f32]) {
         let dim = self.dim();
         let width = self.quant.code_bytes();
         let slot = self.postings[p].len();
+        if !self.attach(id, p, slot) {
+            return;
+        }
         self.postings[p].codes.resize((slot + 1) * width, 0);
         let centroid = &self.centroids[p * dim..(p + 1) * dim];
         let coded = self.quant.encode_rotated(
@@ -1247,14 +1430,144 @@ impl Partitions {
         self.postings[p].ids.push(id);
         self.postings[p].tags.push(tag);
         self.postings[p].meta.push(coded);
-        self.at.insert(
-            id,
-            Slot {
-                partition: p as u32,
-                slot: slot as u32,
-            },
-        );
         self.note(p);
+    }
+
+    // -- the placement chain -------------------------------------------------
+    //
+    // Every site that used to write `self.at` goes through one of these, because
+    // with replication the question is almost never about an id. It is about one
+    // copy of an id, the one in a particular partition, and the difference only
+    // shows up as a corrupt index a long way from where it was caused.
+
+    /// Record that `id` has a copy at `(p, slot)`, saying whether it is new.
+    ///
+    /// A partition already holding a copy is left alone rather than given a
+    /// second one. Nothing on the insert path asks for that, but the maintenance
+    /// paths can: a member replicated into two partitions that are then merged
+    /// into each other would otherwise arrive twice, and a duplicate inside one
+    /// posting is the one shape the rest of this cannot cope with, because a
+    /// delete would take out one copy and leave the other.
+    fn attach(&mut self, id: u64, p: usize, slot: usize) -> bool {
+        let head = self.at.get(&id).copied().unwrap_or(END);
+        let mut walk = head;
+        while walk != END {
+            if self.places[walk as usize].partition as usize == p {
+                return false;
+            }
+            walk = self.places[walk as usize].next;
+        }
+        let place = Place {
+            partition: p as u32,
+            slot: slot as u32,
+            next: head,
+        };
+        let at = if self.free == END {
+            self.places.push(place);
+            (self.places.len() - 1) as u32
+        } else {
+            let at = self.free;
+            self.free = self.places[at as usize].next;
+            self.places[at as usize] = place;
+            at
+        };
+        self.at.insert(id, at);
+        true
+    }
+
+    /// Forget the copy of `id` in partition `p`, saying whether there was one.
+    fn detach(&mut self, id: u64, p: usize) -> bool {
+        let Some(&head) = self.at.get(&id) else {
+            return false;
+        };
+        let mut prev = END;
+        let mut walk = head;
+        while walk != END {
+            let this = self.places[walk as usize];
+            if this.partition as usize == p {
+                if prev == END {
+                    if this.next == END {
+                        self.at.remove(&id);
+                    } else {
+                        self.at.insert(id, this.next);
+                    }
+                } else {
+                    self.places[prev as usize].next = this.next;
+                }
+                self.places[walk as usize].next = self.free;
+                self.free = walk;
+                return true;
+            }
+            prev = walk;
+            walk = this.next;
+        }
+        false
+    }
+
+    /// Forget every copy of `id`, saying whether there were any.
+    fn detach_all(&mut self, id: u64) -> bool {
+        let Some(head) = self.at.remove(&id) else {
+            return false;
+        };
+        let mut walk = head;
+        while walk != END {
+            let next = self.places[walk as usize].next;
+            self.places[walk as usize].next = self.free;
+            self.free = walk;
+            walk = next;
+        }
+        true
+    }
+
+    /// Where the copy of `id` in partition `p` is, if there is one.
+    fn placed_at(&self, id: u64, p: usize) -> Option<u32> {
+        let mut walk = self.at.get(&id).copied().unwrap_or(END);
+        while walk != END {
+            if self.places[walk as usize].partition as usize == p {
+                return Some(walk);
+            }
+            walk = self.places[walk as usize].next;
+        }
+        None
+    }
+
+    /// Say that the copy of `id` in partition `p` is at slot `s` now, which is
+    /// what a pull leaves behind when it moves the last member into a hole.
+    fn reslot(&mut self, id: u64, p: usize, s: usize) {
+        if let Some(at) = self.placed_at(id, p) {
+            self.places[at as usize].slot = s as u32;
+        } else {
+            debug_assert!(false, "id {id} is in partition {p} and the map does not say so");
+        }
+    }
+
+    /// How many partitions hold a copy of `id`.
+    #[cfg(test)]
+    fn placements_of(&self, id: u64) -> usize {
+        let mut walk = self.at.get(&id).copied().unwrap_or(END);
+        let mut n = 0;
+        while walk != END {
+            n += 1;
+            walk = self.places[walk as usize].next;
+        }
+        n
+    }
+
+    /// Any one copy of `id`, for the questions that do not care which.
+    fn any_place(&self, id: u64) -> Option<Place> {
+        self.at.get(&id).map(|&at| self.places[at as usize])
+    }
+
+    /// Every copy of `id`, collected because the callers that want them all are
+    /// about to borrow the index mutably.
+    fn every_place(&self, id: u64, into: &mut Vec<Place>) {
+        into.clear();
+        let mut walk = self.at.get(&id).copied().unwrap_or(END);
+        while walk != END {
+            let place = self.places[walk as usize];
+            into.push(place);
+            walk = place.next;
+        }
     }
 
     /// Take slot `s` out of partition `p`, returning the id that moved into it.
@@ -1279,15 +1592,9 @@ impl Partitions {
     /// the member somewhere else.
     fn pull_and_forget(&mut self, p: usize, s: usize) {
         let id = self.postings[p].ids[s];
-        self.at.remove(&id);
+        self.detach(id, p);
         if let Some(moved) = self.pull(p, s) {
-            self.at.insert(
-                moved,
-                Slot {
-                    partition: p as u32,
-                    slot: s as u32,
-                },
-            );
+            self.reslot(moved, p, s);
         }
     }
 }
@@ -1649,14 +1956,47 @@ mod tests {
             assert_eq!(posting.codes.len(), posting.len() * width, "partition {p}");
             assert_eq!(posting.meta.len(), posting.len(), "partition {p}");
             assert_eq!(posting.tags.len(), posting.len(), "partition {p}");
+            let mut here = HashSet::new();
             for (s, id) in posting.ids.iter().enumerate() {
-                let at = ix.at.get(id).expect("every member is in the map");
-                assert_eq!(at.partition as usize, p, "id {id}");
-                assert_eq!(at.slot as usize, s, "id {id}");
+                assert!(here.insert(*id), "id {id} is twice in partition {p}");
+                let at = ix
+                    .placed_at(*id, p)
+                    .expect("every member is in the map, under the partition holding it");
+                assert_eq!(ix.places[at as usize].slot as usize, s, "id {id}");
                 seen += 1;
             }
         }
-        assert_eq!(seen, ix.at.len(), "the map has entries with no member");
+        // Every placement points at a member, as many placements as there are
+        // members, and the free list accounts for the rest of the arena. A
+        // replicated id makes the first of those the interesting one: a chain
+        // that kept an entry for a copy that was pulled would still look right
+        // from the posting's side, and the count is what catches it.
+        let mut held = 0usize;
+        for (&id, &head) in &ix.at {
+            let mut walk = head;
+            let mut mine = HashSet::new();
+            while walk != END {
+                let place = ix.places[walk as usize];
+                let p = place.partition as usize;
+                assert!(mine.insert(p), "id {id} is filed twice under partition {p}");
+                assert!(p < ix.postings.len(), "id {id} is filed under partition {p}");
+                assert_eq!(
+                    ix.postings[p].ids[place.slot as usize], id,
+                    "id {id} is filed at a slot holding something else"
+                );
+                held += 1;
+                walk = place.next;
+            }
+        }
+        assert_eq!(seen, held, "the map and the postings disagree on the count");
+        let mut spare = 0usize;
+        let mut walk = ix.free;
+        while walk != END {
+            spare += 1;
+            assert!(spare <= ix.places.len(), "the free list has a cycle in it");
+            walk = ix.places[walk as usize].next;
+        }
+        assert_eq!(held + spare, ix.places.len(), "the arena has leaked");
     }
 
     /// Build an index where every vector carries a tag, so the filter has
@@ -1988,6 +2328,133 @@ mod tests {
         assert_eq!(ix.len(), 399);
         consistent(&ix);
         assert!(ix.search(&q, 5, &store).iter().all(|h| h.id != 7));
+    }
+
+    /// How many copies of its members a collection is holding, which is what
+    /// replication costs and what it has to be paid for in recall.
+    fn copies(ix: &Partitions) -> f32 {
+        let held: usize = ix.postings.iter().map(Posting::len).sum();
+        held as f32 / ix.len() as f32
+    }
+
+    /// The knob does what it says: off means one copy of everything, and on
+    /// means more than one copy of some things and not of everything.
+    #[test]
+    fn spilling_puts_boundary_vectors_in_more_than_one_partition() {
+        let dim = 32;
+        let store = corpus(dim, 3000, 12, 5);
+        let mut off = Tuning::default();
+        off.spill = 1;
+        let none = build(&store, dim, off);
+        consistent(&none);
+        assert_eq!(copies(&none), 1.0, "spill of one is one copy of everything");
+
+        let on = build(&store, dim, Tuning::default());
+        consistent(&on);
+        let rate = copies(&on);
+        assert!(rate > 1.0, "spilling should make copies, made {rate}");
+        assert!(
+            rate < Tuning::default().spill as f32,
+            "slack should stop short of copying everything into everything, made {rate}"
+        );
+        assert_eq!(on.len(), store.0.len(), "a copy is not a member");
+    }
+
+    /// The whole point of it, which is the only thing here worth breaking a
+    /// build over. A member reachable from more partitions is found from more
+    /// queries, so recall at a probe count too small for the collection goes up.
+    #[test]
+    fn spilling_buys_recall_at_a_narrow_probe() {
+        let dim = 32;
+        let store = corpus(dim, 4000, 16, 23);
+        let narrow = |spill: usize| {
+            let mut t = Tuning::default();
+            t.spill = spill;
+            t.probe = 2;
+            t
+        };
+        let none = recall(&build(&store, dim, narrow(1)), &store, 10, 200);
+        let some = recall(&build(&store, dim, narrow(4)), &store, 10, 200);
+        assert!(
+            some > none,
+            "spilling should raise recall at probe 2, went from {none} to {some}"
+        );
+    }
+
+    /// A replicated member is scanned twice by a search that reads both of its
+    /// partitions, and an answer list with the same id in it twice is a bug the
+    /// caller sees.
+    #[test]
+    fn a_replicated_member_comes_back_once() {
+        let dim = 32;
+        let store = corpus(dim, 2000, 8, 31);
+        let mut t = Tuning::default();
+        // Every partition, so that every copy of every member is read and the
+        // duplicates are certain rather than likely.
+        t.probe = 1 << 20;
+        let ix = build(&store, dim, t);
+        for i in 0..50 {
+            let q = &store.0[i * 37 % store.0.len()];
+            let got: Vec<u64> = ix.search(q, 20, &store).into_iter().map(|h| h.id).collect();
+            let mut once = got.clone();
+            once.sort_unstable();
+            once.dedup();
+            assert_eq!(got.len(), once.len(), "a duplicate answer for query {i}");
+        }
+    }
+
+    /// Every copy has to go, and the arena has to come back. Removing under
+    /// replication is the path where a leak or a stale placement would show up,
+    /// and `consistent` is what says it did not.
+    #[test]
+    fn removing_a_replicated_member_takes_every_copy() {
+        let dim = 32;
+        let store = corpus(dim, 1500, 6, 41);
+        let mut ix = build(&store, dim, Tuning::default());
+        let before: usize = ix.postings.iter().map(Posting::len).sum();
+        let mut gone = 0usize;
+        for id in (0..1500u64).step_by(3) {
+            gone += ix.placements_of(id);
+            assert!(ix.remove(id));
+            assert!(!ix.contains(id));
+        }
+        consistent(&ix);
+        let after: usize = ix.postings.iter().map(Posting::len).sum();
+        assert_eq!(before - after, gone, "a copy was left behind");
+        assert_eq!(ix.len(), 1000);
+        for id in (0..1500u64).step_by(3) {
+            let q = &store.0[id as usize];
+            assert!(ix.search(q, 5, &store).iter().all(|h| h.id != id));
+        }
+    }
+
+    /// A retag has to reach every copy, because a scan meets whichever one it
+    /// reads first and a filter that sees a stale tag in one partition and a
+    /// fresh one in another is the worst kind of wrong.
+    #[test]
+    fn retagging_a_replicated_member_reaches_every_copy() {
+        let dim = 32;
+        let store = corpus(dim, 1200, 6, 47);
+        let mut ix = Partitions::new(dim, Bits::One, 7, Tuning::default());
+        for (i, v) in store.0.iter().enumerate() {
+            ix.insert_tagged(i as u64, v, 1);
+            if i % 64 == 0 {
+                ix.maintain(&store, 4096);
+            }
+        }
+        ix.maintain(&store, 1 << 20);
+        let spread = (0..1200u64).find(|&id| ix.placements_of(id) > 1);
+        let id = spread.expect("some member is in more than one partition");
+        assert!(ix.retag(id, 9));
+        let mut copies = Vec::new();
+        ix.every_place(id, &mut copies);
+        for place in &copies {
+            assert_eq!(
+                ix.postings[place.partition as usize].tags[place.slot as usize], 9,
+                "a copy kept the old tag"
+            );
+        }
+        consistent(&ix);
     }
 
     #[test]
