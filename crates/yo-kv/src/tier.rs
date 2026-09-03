@@ -361,6 +361,12 @@ impl<B: Blocks> Tier<B> {
             at: c.at,
             len: u64::from(c.len),
         };
+        // Before the borrows start, not after they end, because after they end
+        // is inside a scope that owns them. One value's chunks and its
+        // directory are alive together here on purpose, so this is the point
+        // where a store that has to stage bytes to lend them out is allowed to
+        // drop the last value's.
+        self.blocks.release();
         {
             let reader = cold::Reader::open(&self.blocks, chain)?;
             for piece in reader.range(0, reader.len()) {
