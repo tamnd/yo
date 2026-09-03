@@ -105,6 +105,7 @@ pub mod image;
 pub mod muvera;
 pub mod partition;
 pub mod rabitq;
+pub(crate) mod rank;
 pub mod rotate;
 
 pub use collection::{Collection, Match};
