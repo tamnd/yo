@@ -34,7 +34,7 @@ use crate::list::{self, List};
 use crate::set::{self, Set};
 use crate::slab::{Bytes, Slab};
 use crate::stream::{self, Stream};
-use crate::tier::{Faulted, Tier};
+use crate::tier::{Faulted, Relief, Tier};
 use crate::ttl::{self, Applied, Ask, Cond};
 use crate::value::{self, Kind, Str};
 use crate::zset::{self, Zset};
@@ -1236,7 +1236,8 @@ impl Keyspace {
     /// Move values out to the file until at least `shed` bytes of memory have
     /// gone.
     ///
-    /// Answers how many keys went. This is `maxmemory` under the inversion `14`
+    /// Answers with a [`Relief`], which is how many keys went and how much
+    /// memory that gave back. This is `maxmemory` under the inversion `14`
     /// describes: the limit that used to throw keys away now moves them, and
     /// what a client stored is still there afterwards.
     ///
@@ -1267,9 +1268,9 @@ impl Keyspace {
     /// # Errors
     ///
     /// Whatever the store says when it will not take the bytes.
-    pub fn relieve(&mut self, shed: usize) -> Result<usize> {
+    pub fn relieve(&mut self, shed: usize) -> Result<Relief> {
         if self.tier.is_none() {
-            return Ok(0);
+            return Ok(Relief::default());
         }
         let now = self.clock.now_ms();
         let policy = match self.policy {

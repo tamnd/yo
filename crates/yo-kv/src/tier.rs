@@ -139,6 +139,34 @@ pub struct Stats {
     pub bytes_in: u64,
 }
 
+/// What a sweep did, which is two numbers because it does two things.
+///
+/// Kept apart rather than added up because they answer different questions.
+/// `moved` is how much colder the keyspace got and it is what a test about
+/// demotion is written against. `freed` is how much memory came back, and that
+/// is what a server holding itself to a limit has to read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Relief {
+    /// Values that went out to the file.
+    pub moved: usize,
+    /// Bytes of memory the map gave back while that was happening, which is
+    /// segments the arena handed over and not records that got shorter.
+    pub freed: usize,
+}
+
+impl Relief {
+    /// Whether the sweep is worth calling again, which is the question the
+    /// caller with the limit is really asking.
+    ///
+    /// Either number being non zero is progress. Both being zero is a keyspace
+    /// with nothing left to move and no dead space to reclaim, and a write that
+    /// cannot be fitted in that is a write that has to be refused.
+    #[must_use]
+    pub const fn made_room(self) -> bool {
+        self.moved > 0 || self.freed > 0
+    }
+}
+
 /// Whether moving this record's value to the file would save memory.
 ///
 /// Straight comparison of the two record lengths. A record whose value is short
@@ -366,11 +394,11 @@ impl<B: Blocks> Tier<B> {
 
     /// Move values out until the map fits in `budget` bytes.
     ///
-    /// Returns how many were moved. Stops early when [`BARREN`] rounds in a row
-    /// find nothing worth demoting, which is the case where every value left is
-    /// shorter than the pointer that would replace it, and the honest answer
-    /// there is that memory cannot be given back rather than that the loop
-    /// should keep spinning.
+    /// Answers with a [`Relief`], which is what moved and what that was worth.
+    /// Stops early when [`BARREN`] rounds in a row find nothing worth demoting,
+    /// which is the case where every value left is shorter than the pointer
+    /// that would replace it, and the honest answer there is that memory cannot
+    /// be given back rather than that the loop should keep spinning.
     ///
     /// Two things had to be right before that stop rule meant what it says, and
     /// both of them are about a sweep that runs long enough to make most of the
@@ -396,6 +424,21 @@ impl<B: Blocks> Tier<B> {
     /// key too many costs one device read later, and stopping one key short
     /// costs a memory limit that was not respected.
     ///
+    /// # Why the count of values moved is not the answer on its own
+    ///
+    /// Because the two halves of this loop run at different rates. Demotion
+    /// happens key by key and compaction happens two megabytes at a time, so a
+    /// sweep that has been running for a while is full of rounds that move
+    /// values and free nothing, and rounds that move nothing and free a whole
+    /// segment that earlier rounds had emptied out. The second kind is not
+    /// rare: sampling draws one index segment, and in a keyspace that is mostly
+    /// cold it draws a segment with nothing resident in it often.
+    ///
+    /// A caller asking for room and reading only the count refuses its client's
+    /// write on one of those rounds, on a server whose memory just went down by
+    /// two megabytes. That is what [`Relief::made_room`] is for and it is why
+    /// this counts both.
+    ///
     /// # Errors
     ///
     /// Whatever the store says when it cannot take the bytes.
@@ -406,7 +449,8 @@ impl<B: Blocks> Tier<B> {
         policy: Policy,
         now_ms: u64,
         lfu: Lfu,
-    ) -> Result<usize> {
+    ) -> Result<Relief> {
+        let start = map.memory_bytes();
         let mut moved = 0;
         let mut barren = 0;
         while map.memory_bytes() > budget {
@@ -422,7 +466,10 @@ impl<B: Blocks> Tier<B> {
             barren = 0;
             moved += round;
         }
-        Ok(moved)
+        Ok(Relief {
+            moved,
+            freed: start.saturating_sub(map.memory_bytes()),
+        })
     }
 
     /// One sample and demote pass, which is the body of [`Tier::relieve`] and is
@@ -730,7 +777,7 @@ mod tests {
                 Lfu::default(),
             )
             .expect("relieved");
-        assert!(moved > 0, "nothing was moved");
+        assert!(moved.moved > 0, "nothing was moved");
         assert!(
             m.memory_bytes() <= budget,
             "still {} bytes against a budget of {budget}",
@@ -815,7 +862,52 @@ mod tests {
         let moved = t
             .relieve(&mut m, 1, Policy::AllKeysLru, 2_000_000, Lfu::default())
             .expect("asked");
-        assert_eq!(moved, 0);
+        assert_eq!(moved, Relief::default());
+    }
+
+    #[test]
+    fn a_sweep_that_moves_nothing_and_frees_a_segment_still_says_it_made_room() {
+        // The state a server spends most of a long load in: a keyspace that is
+        // already cold, holding segments that earlier rounds emptied out and
+        // that nothing has handed back yet. Every round here is barren because
+        // there is genuinely nothing left worth moving, and the memory still
+        // comes back. A caller reading only the count sees a zero and refuses
+        // its client's write, which is the bug this is here about.
+        let mut m = RawMap::new();
+        let val = vec![b'v'; 4096];
+        for i in 0..2_000u32 {
+            put(&mut m, &i.to_le_bytes(), &val, None);
+        }
+        let mut t = tier();
+        for i in 0..2_000u32 {
+            assert!(
+                t.demote(&mut m, &i.to_le_bytes()).expect("demoted"),
+                "key {i} did not go out"
+            );
+        }
+
+        let before = m.memory_bytes();
+        let r = t
+            .relieve(
+                &mut m,
+                before - 1,
+                Policy::AllKeysLru,
+                2_000_000,
+                Lfu::default(),
+            )
+            .expect("swept");
+
+        assert_eq!(r.moved, 0, "there was nothing left in memory to move");
+        assert!(
+            r.freed > 0,
+            "compaction gave nothing back, so this checked nothing"
+        );
+        assert!(
+            r.made_room(),
+            "a sweep that freed {} said it did not",
+            r.freed
+        );
+        assert_eq!(m.len(), 2_000, "a sweep that lost keys");
     }
 
     #[test]
@@ -838,7 +930,10 @@ mod tests {
                 Lfu::default(),
             )
             .expect("relieved");
-        assert!(moved > 0, "nothing was moved, so this checked nothing");
+        assert!(
+            moved.moved > 0,
+            "nothing was moved, so this checked nothing"
+        );
 
         let mut out = Vec::new();
         for (i, val) in want.iter().enumerate() {

@@ -8,6 +8,7 @@
 //! cargo xtask reserve    the registry name audit, in xtask/reserve.py
 //! cargo xtask cross      clippy for the two targets this laptop is not
 //! cargo xtask alloc      what allocates on a command path, in xtask/alloc.py
+//! cargo xtask ltm        the larger than memory gate, in xtask/src/ltm.rs
 //! ```
 //!
 //! `check` is what CI runs. Generated files are checked in so that a binding
@@ -34,11 +35,17 @@
 //! and a socket, and it lives in the repository rather than in somebody's `tmp`
 //! because a list of violations is worth nothing if the next person cannot
 //! produce the same one.
+//!
+//! `ltm` is the same idea for M5. It starts a server with a store file and a
+//! memory limit, loads ten times that limit, reads at random and reports what
+//! each point read cost in reads from the file. The gate rows in `06` are
+//! ratios, and a ratio nobody can reproduce is a claim.
 
 mod emit_header;
 mod emit_model;
 mod errors;
 mod json;
+mod ltm;
 mod model;
 mod registry;
 mod toml;
@@ -80,13 +87,14 @@ fn main() {
         Some("reserve") => python("reserve.py"),
         Some("cross") => cross(),
         Some("alloc") => python("alloc.py"),
+        Some("ltm") => ltm::ltm(),
         Some(other) => {
             eprintln!("unknown command: {other}");
-            eprintln!("usage: cargo xtask [generate|check|reserve|cross|alloc]");
+            eprintln!("usage: cargo xtask [generate|check|reserve|cross|alloc|ltm]");
             process::exit(2);
         }
         None => {
-            eprintln!("usage: cargo xtask [generate|check|reserve|cross|alloc]");
+            eprintln!("usage: cargo xtask [generate|check|reserve|cross|alloc|ltm]");
             process::exit(2);
         }
     }

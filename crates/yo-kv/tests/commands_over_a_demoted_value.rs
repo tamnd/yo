@@ -309,8 +309,8 @@ fn a_sweep_moves_the_whole_database_and_every_key_still_answers() {
     for i in 0..200u32 {
         k.set_plain(&i.to_le_bytes(), &val).expect("stored");
     }
-    let moved = k.relieve(usize::MAX).expect("swept");
-    assert!(moved > 0, "nothing was moved");
+    let swept = k.relieve(usize::MAX).expect("swept");
+    assert!(swept.moved > 0, "nothing was moved");
 
     for i in 0..200u32 {
         assert_eq!(
@@ -331,6 +331,6 @@ fn a_database_with_nothing_attached_never_goes_cold() {
         !k.demote(b"k").expect("asked"),
         "there is nowhere to put it"
     );
-    assert_eq!(k.relieve(usize::MAX).expect("swept"), 0);
+    assert_eq!(k.relieve(usize::MAX).expect("swept").moved, 0);
     assert_eq!(k.get(b"k").expect("read"), Some(Str::Bytes(&val)));
 }
