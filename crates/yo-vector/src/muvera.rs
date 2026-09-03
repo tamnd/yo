@@ -420,7 +420,7 @@ pub fn chamfer(query: &[f32], doc: &[f32], dim: usize) -> f32 {
 
 /// A dot product, with eight running totals rather than one.
 ///
-/// The same reason as [`crate::partition`]'s squared distance, and it is worth
+/// The same reason as [`crate::dist`]'s squared distance, and it is worth
 /// repeating because it is not obvious: adding floats is not associative, so a
 /// compiler is not allowed to turn one accumulator into a vector of them, and
 /// the one line version is a chain of dependent adds four cycles apart. This is
@@ -429,25 +429,34 @@ pub fn chamfer(query: &[f32], doc: &[f32], dim: usize) -> f32 {
 /// and 128 dimensional tokens that is a quarter of a million multiply adds for
 /// one document, all of them here.
 ///
+/// Eight totals on their own are not enough. Walking two slices by a counter
+/// bounded by one of the two lengths leaves the compiler unable to prove the
+/// other index is in range, so it emits a bounds check per element, and a
+/// branch in the middle of a loop body is one the vectoriser will not cross.
+/// [`slice::as_chunks`] hands back fixed size arrays instead, and indexing an
+/// eight element array by a constant needs no check at all.
+///
 /// The totals are summed in a fixed order at the end, so the answer is
 /// deterministic, and it is a different answer from the one line version by the
 /// last bit or so in the way any two orderings of a float sum are.
 fn dot(a: &[f32], b: &[f32]) -> f32 {
+    let n = a.len().min(b.len());
+    let (xs, x_tail) = a[..n].as_chunks::<8>();
+    let (ys, _) = b[..n].as_chunks::<8>();
+
     let mut totals = [0.0f32; 8];
-    let mut i = 0;
-    while i + 8 <= a.len() {
-        for (k, total) in totals.iter_mut().enumerate() {
-            *total += a[i + k] * b[i + k];
+    for (x, y) in xs.iter().zip(ys) {
+        for k in 0..8 {
+            totals[k] += x[k] * y[k];
         }
-        i += 8;
     }
+
     let mut sum = 0.0f32;
     for total in totals {
         sum += total;
     }
-    while i < a.len() {
-        sum += a[i] * b[i];
-        i += 1;
+    for (x, y) in x_tail.iter().zip(&b[n - x_tail.len()..]) {
+        sum += x * y;
     }
     sum
 }

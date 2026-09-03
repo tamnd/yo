@@ -76,6 +76,8 @@
 //! ones where it is not used. That also means every existing test, all of which
 //! are well under the floor, measures the same code path it always did.
 
+use crate::dist::sqdist;
+
 /// How many partitions there have to be before a layer is worth having.
 ///
 /// A lookup through the layer costs `sqrt(P)` anchors plus [`KEEP`] centroids,
@@ -358,34 +360,6 @@ impl Coarse {
         }
         best
     }
-}
-
-/// Squared euclidean distance, unrolled by eight so the compiler has something
-/// obvious to vectorise.
-///
-/// The same shape as the one in `partition.rs`, kept here rather than shared
-/// because this module is otherwise standalone and one small function is a
-/// cheaper dependency than an export.
-fn sqdist(a: &[f32], b: &[f32]) -> f32 {
-    let mut totals = [0.0f32; 8];
-    let mut i = 0;
-    while i + 8 <= a.len() {
-        for (k, total) in totals.iter_mut().enumerate() {
-            let d = a[i + k] - b[i + k];
-            *total += d * d;
-        }
-        i += 8;
-    }
-    let mut sum = 0.0f32;
-    for total in totals {
-        sum += total;
-    }
-    while i < a.len() {
-        let d = a[i] - b[i];
-        sum += d * d;
-        i += 1;
-    }
-    sum
 }
 
 #[cfg(test)]

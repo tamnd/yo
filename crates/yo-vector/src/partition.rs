@@ -66,22 +66,23 @@
 //! `examples/ingest.rs` measures the rate at every doubling and splits it
 //! between the insert and the maintenance, because a rate that falls as the
 //! collection grows and a rate that is just low need different work and a single
-//! number cannot tell them apart. On 128 dimensional vectors on one core of an
-//! M-series Mac:
+//! number cannot tell them apart. On 128 dimensional vectors on one core of a
+//! 13th Gen Intel Core i9-13900K with nothing else running:
 //!
 //! ```text
 //!         at  partitions    a second      insert    maintain   touched
-//!      12500          36      115952       20.4%       79.6%       5.3
-//!      50000         132       72013       39.4%       60.6%       6.9
-//!     200000         595       46917       58.7%       41.3%       5.5
-//!     800000        2141       42459       60.9%       39.1%       4.4
+//!      12500          36       65814       18.6%       81.4%       5.3
+//!      50000         132       49501       22.4%       77.6%       6.9
+//!     200000         595       42379       37.1%       62.9%       5.5
+//!     800000        2141       42076       40.3%       59.7%       4.4
+//!    1600000        4337       35760       37.3%       62.7%       4.4
 //! ```
 //!
 //! `touched` is how many vectors maintenance moved or looked at per vector
 //! inserted. It is flat, and that is the number which says the update protocol
 //! is doing bounded work rather than quietly turning into a rebuild.
 //!
-//! Both halves of that took a fix to get there and they were different fixes.
+//! Three fixes got it there and they were three different problems.
 //! Maintenance was 80 percent of the time and most of it was `sweep` measuring
 //! every member it looked at against every centroid in the collection, which is
 //! not what LIRE says and is several full scans per vector inserted. The insert
@@ -90,22 +91,43 @@
 //! the reasoning about it lives. Before either fix, the rate halved on every
 //! doubling and was 13563 a second by 800 thousand.
 //!
+//! The third was the squared distance itself, which by then was half of an
+//! entire ingest across the two copies of it that existed, and it was slow for
+//! a reason that had nothing to do with the index: a bounds check the compiler
+//! could not remove was stopping the loop vectorising. There is now one copy in
+//! `src/dist.rs` and that file is where the reasoning lives. It doubled the
+//! rate on its own, 21183 a second to 40318 over the whole 1.6 million on the
+//! same machine, and it cut the insert half by three times, 45.9 seconds to
+//! 15.3, which is why insert and maintenance have swapped places in that table.
+//!
+//! So G13's fifty thousand a second per core is close but not met. The work
+//! left is maintenance, which is now roughly five ninths of an ingest and is
+//! mostly `sweep` measuring drifted members after a split. An M-series Mac runs
+//! the same build at 63363 a second, which is above the gate, but that machine
+//! is not quiet enough here to be the one a gate is called on.
+//!
 //! # What is not here yet
 //!
 //! A `.yo` file. None of this is written down yet, and the format freezes at the
 //! end of M6, so that is the next thing.
 //!
-//! A search that fits in a millisecond. SIFT1M on a 13900K gets recall 0.9598 at
-//! probe 64 rerank 16, which clears the gate, with p50 at 1.1 ms and p99 at 1.5
-//! ms, which does not. `examples/search.rs` is the breakdown of where that time
-//! goes and the answer is that two thirds of it is the estimator meeting one
-//! code at a time.
+//! MS-MARCO-v2. SIFT1M on a 13900K now gets recall 0.9597 at probe 64 rerank
+//! 16 with p50 at 638 us and p99 at 776 us, so both halves of G12 are met on
+//! that dataset, and the same run before the `src/dist.rs` change was 808 us
+//! and 996 us for the same recall, which was inside the millisecond by so
+//! little that nobody should have called it. The other dataset the gate names
+//! has not been run.
+//!
+//! `examples/search.rs` is the breakdown of where the remaining time goes and
+//! the answer is that two thirds of it is the estimator meeting one code at a
+//! time.
 //!
 //! The commands that put all of this on the wire are the rest of M6.
 
 use std::collections::HashMap;
 
 use crate::coarse::Coarse;
+use crate::dist::sqdist;
 use crate::rabitq::{Bits, Coded, Quantizer};
 
 /// Where the full precision vectors live.
@@ -1053,42 +1075,6 @@ fn two_means(xs: &[f32], dim: usize) -> (Vec<f32>, Vec<f32>) {
         }
     }
     (a, b)
-}
-
-/// The squared distance, because the square root is monotone and nothing here
-/// needs it.
-///
-/// Written with eight running totals rather than one, and that is not a
-/// flourish. Adding floats is not associative, so a compiler is not allowed to
-/// turn a single accumulator into a vector of them, and the obvious one line
-/// version is a chain of dependent adds four cycles apart. It is the hottest
-/// loop in the file, because every insert measures a query against every
-/// centroid and every search does it twice over, and writing it this way was
-/// worth two thirds of what an insert cost at 768 dimensions.
-///
-/// The eight totals are summed in a fixed order at the end, so the answer is
-/// deterministic. It is a different answer from the one line version, by the
-/// last bit or so, in the same way that any two orderings of a float sum are.
-fn sqdist(a: &[f32], b: &[f32]) -> f32 {
-    let mut totals = [0.0f32; 8];
-    let mut i = 0;
-    while i + 8 <= a.len() {
-        for (k, total) in totals.iter_mut().enumerate() {
-            let d = a[i + k] - b[i + k];
-            *total += d * d;
-        }
-        i += 8;
-    }
-    let mut sum = 0.0f32;
-    for total in totals {
-        sum += total;
-    }
-    while i < a.len() {
-        let d = a[i] - b[i];
-        sum += d * d;
-        i += 1;
-    }
-    sum
 }
 
 /// One candidate, ordered by its estimated distance.
