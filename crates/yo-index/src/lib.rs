@@ -46,5 +46,5 @@ mod tagged;
 
 pub use bucket::{Bucket, EMPTY, SLOTS, SlotMask};
 pub use index::{Index, Keys, MAX_CHAIN, SEGMENT_BUCKETS};
-pub use map::RawMap;
+pub use map::{Compaction, RawMap};
 pub use scan::Cursor;

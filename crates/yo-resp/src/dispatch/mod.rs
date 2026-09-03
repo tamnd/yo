@@ -468,6 +468,24 @@ impl Server {
             .sum()
     }
 
+    /// What arena compaction has cost, across every database.
+    ///
+    /// The write amplification of value separation, which is invisible from the
+    /// outside otherwise: a client that writes a megabyte can leave the store
+    /// copying several more, and the only sign of it without these is that the
+    /// writes got slower.
+    #[must_use]
+    pub fn compaction(&self) -> yo_kv::Compaction {
+        self.dbs.iter().map(|db| db.map().compaction()).fold(
+            yo_kv::Compaction::default(),
+            |a, b| yo_kv::Compaction {
+                walked: a.walked + b.walked,
+                moved: a.moved + b.moved,
+                bytes: a.bytes + b.bytes,
+            },
+        )
+    }
+
     /// Arena segments whose pages are real, across every database.
     #[must_use]
     pub fn segment_count(&self) -> usize {
