@@ -19,6 +19,12 @@
 //! hundred nearest neighbours of each query by exact L2, which is what recall is
 //! measured against.
 //!
+//! The three names come from the directory, so anything else published this way
+//! runs without a change. GIST1M is the same tarball one directory along, a
+//! million vectors at 960 dimensions, and it is the harder one: a quantiser
+//! that holds at 128 dimensions of SIFT descriptors is not thereby known to
+//! hold at 960.
+//!
 //! `fvecs` and `ivecs` are the same layout with a different element type: for
 //! each vector, a little endian `i32` dimension followed by that many `f32` or
 //! `i32`. There is no header and no count, so the file length divided by the
@@ -65,18 +71,22 @@ impl Vectors for Base {
 fn main() {
     let mut args = std::env::args().skip(1);
     let Some(dir) = args.next() else {
-        eprintln!("usage: recall <sift directory> [queries]");
+        eprintln!("usage: recall <dataset directory> [queries]");
         std::process::exit(2);
     };
     // Ten thousand queries at a millisecond each is ten seconds a row and there
     // are a lot of rows, so the default is a slice of them. Recall over a
     // thousand SIFT queries is stable to about half a percent.
-    let queries: usize = args.next().map_or(1_000, |a| a.parse().unwrap());
+    let queries: usize = args.next().map_or(1_000, |a| {
+        a.parse()
+            .expect("the second argument is a number of queries")
+    });
+    let set = prefix(&dir);
 
     let t = Instant::now();
-    let (dim, base) = read_vecs::<f32>(&format!("{dir}/sift_base.fvecs"));
-    let (qdim, query) = read_vecs::<f32>(&format!("{dir}/sift_query.fvecs"));
-    let (gdim, truth) = read_vecs::<i32>(&format!("{dir}/sift_groundtruth.ivecs"));
+    let (dim, base) = read_vecs::<f32>(&format!("{dir}/{set}_base.fvecs"));
+    let (qdim, query) = read_vecs::<f32>(&format!("{dir}/{set}_query.fvecs"));
+    let (gdim, truth) = read_vecs::<i32>(&format!("{dir}/{set}_groundtruth.ivecs"));
     assert_eq!(dim, qdim, "base and query dimensions differ");
     let n = base.len() / dim;
     let queries = queries.min(query.len() / dim);
@@ -170,6 +180,20 @@ fn measure(ix: &Partitions, b: &Bench, probe: usize, rerank: usize) {
         at(0.50),
         at(0.99)
     );
+}
+
+/// What the three files in a directory are called, which every dataset
+/// published in this format names after itself.
+///
+/// `sift/` holds `sift_base.fvecs` and `gist/` holds `gist_base.fvecs`, so the
+/// last component of the path is the prefix and there is nothing to pass. A
+/// trailing slash is dropped rather than turned into an empty prefix, because
+/// tab completion puts one there.
+fn prefix(dir: &str) -> &str {
+    dir.trim_end_matches('/')
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(dir)
 }
 
 /// One `fvecs` or `ivecs` file, as the dimension and every vector end to end.
