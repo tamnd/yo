@@ -561,6 +561,61 @@ impl Stream {
         Stream::default()
     }
 
+    /// The nodes as they stand, each one its master ID and its blob.
+    ///
+    /// This is what an RDB payload for a stream is made of, and it is why the
+    /// node layout was copied from Redis in the first place. The master ID is
+    /// the sixteen byte rax key a real server writes and the blob is the
+    /// listpack it writes after it, so [`crate::rdb`] puts both on the wire with
+    /// nothing converted on the way.
+    pub(crate) fn raw_nodes(&self) -> impl Iterator<Item = (Id, &[u8])> + '_ {
+        self.nodes.iter().map(|n| (n.master, n.lp.as_bytes()))
+    }
+
+    /// Put a node on the end of a stream that is being built from a payload.
+    ///
+    /// Refuses a master that does not beat the one before it, for the reason
+    /// [`Stream::thaw`] gives: the nodes are searched by binary search over
+    /// their masters, so a run that is not in order would leave a lookup unable
+    /// to say which node an ID belongs in.
+    pub(crate) fn push_raw_node(&mut self, master: Id, lp: Listpack) -> bool {
+        if self.nodes.back().is_some_and(|n| n.master >= master) {
+            return false;
+        }
+        self.nodes.push_back(Node { master, lp });
+        true
+    }
+
+    /// Put the counters on a stream that is being built from a payload.
+    ///
+    /// The same three checks [`Stream::thaw`] makes, because a payload from a
+    /// client has even less claim to be believed than bytes off our own disk.
+    pub(crate) fn set_counters(
+        &mut self,
+        length: u64,
+        last: Id,
+        max_deleted: Id,
+        added: u64,
+    ) -> bool {
+        if length > added || max_deleted > last || (self.nodes.is_empty() && length != 0) {
+            return false;
+        }
+        self.length = length;
+        self.last = last;
+        self.max_deleted = max_deleted;
+        self.added = added;
+        true
+    }
+
+    /// Put a group on a stream that is being built from a payload.
+    pub(crate) fn push_group(&mut self, name: &[u8], group: Group) -> bool {
+        if self.groups.iter().any(|(had, _)| had == name) {
+            return false;
+        }
+        self.groups.push((name.to_vec(), group));
+        true
+    }
+
     /// Write the stream out as the bytes a tier can hold, for
     /// [`crate::keyspace::Keyspace`] to hand back to [`Stream::thaw`].
     ///

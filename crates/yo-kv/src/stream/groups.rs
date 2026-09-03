@@ -391,6 +391,88 @@ impl Group {
         self.nacked
     }
 
+    /// Every pending entry with what is known about it, oldest first.
+    ///
+    /// The whole ledger and no filter, which is what an RDB payload carries and
+    /// what nothing on the wire ever asks for, since `XPENDING` always has a
+    /// range and usually a count.
+    pub fn pending_all(&self) -> impl Iterator<Item = (Id, &Nack)> + '_ {
+        self.pending.iter().map(|(&id, nack)| (id, nack))
+    }
+
+    /// Put a pending entry on a group being built from a payload, unowned.
+    ///
+    /// An RDB writes the group's whole pending list first and its consumers
+    /// after it, so there is nobody to hand the entry to at the point it
+    /// arrives. [`Group::restore_owner`] gives it an owner when the consumer
+    /// holding it turns up, and an entry no consumer claims stays unowned. That
+    /// is not a hole in the format: Redis loads the same payload into a NACK
+    /// with a null consumer and leaves it there, so both servers end up with the
+    /// same released entry.
+    pub(crate) fn restore_nack(&mut self, id: Id, time: u64, count: u64) -> bool {
+        if self
+            .pending
+            .keys()
+            .next_back()
+            .is_some_and(|&had| had >= id)
+        {
+            return false;
+        }
+        self.pending.insert(
+            id,
+            Nack {
+                time,
+                count,
+                owner: Nack::NOBODY,
+            },
+        );
+        self.nacked += 1;
+        true
+    }
+
+    /// Make a consumer on a group being built from a payload, times and all.
+    ///
+    /// Not [`Group::create_consumer`], because that one sets both times to now
+    /// and a restored consumer has times of its own that a client can see.
+    pub(crate) fn restore_consumer(
+        &mut self,
+        name: &[u8],
+        seen: u64,
+        active: Option<u64>,
+    ) -> Option<u32> {
+        if self.slot(name).is_some() {
+            return None;
+        }
+        self.consumers.push(Some(Consumer {
+            name: name.to_vec(),
+            seen,
+            active,
+            pending: BTreeSet::new(),
+        }));
+        Some((self.consumers.len() - 1) as u32)
+    }
+
+    /// Hand a restored pending entry to the consumer that was holding it.
+    ///
+    /// Refuses an entry that is not pending or that somebody already holds,
+    /// since a payload naming the same entry under two consumers would leave the
+    /// second consumer holding one the ledger says belongs to the first.
+    pub(crate) fn restore_owner(&mut self, id: Id, slot: u32) -> bool {
+        if !matches!(self.pending.get(&id), Some(nack) if nack.owner == Nack::NOBODY) {
+            return false;
+        }
+        let Some(Some(c)) = self.consumers.get_mut(slot as usize) else {
+            return false;
+        };
+        c.pending.insert(id);
+        self.pending
+            .get_mut(&id)
+            .expect("the entry the check above just found")
+            .owner = slot;
+        self.nacked -= 1;
+        true
+    }
+
     /// The lowest and highest pending IDs, which is the `XPENDING` summary.
     #[must_use]
     pub fn pending_bounds(&self) -> Option<(Id, Id)> {
