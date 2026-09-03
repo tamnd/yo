@@ -10359,6 +10359,70 @@ mod tests {
         );
     }
 
+    /// A filter is a selector like any other, so every command that takes a path
+    /// takes one, reads and writes alike.
+    #[test]
+    fn a_filter_path_reads_and_writes_the_members_it_keeps() {
+        let mut f = Fixture::new();
+        let doc = br#"{"book":[{"t":"a","p":8},{"t":"b","p":13},{"t":"c","p":9}],"cap":10}"#;
+        f.run(&[b"JSON.SET", b"doc", b"$", doc]);
+
+        assert_eq!(
+            f.run(&[b"JSON.GET", b"doc", b"$.book[?(@.p < 10)].t"]),
+            bulk(r#"["a","c"]"#).as_str()
+        );
+        // `$` inside the expression is the document, so a member can be measured
+        // against something that is not inside it.
+        assert_eq!(
+            f.run(&[b"JSON.GET", b"doc", b"$.book[?(@.p < $.cap)].t"]),
+            bulk(r#"["a","c"]"#).as_str()
+        );
+        // The legacy syntax takes one too, and answers the first match.
+        assert_eq!(
+            f.run(&[b"JSON.GET", b"doc", b"book[?(@.p < 10)].t"]),
+            bulk(r#""a""#).as_str()
+        );
+        assert_eq!(
+            f.run(&[b"JSON.TYPE", b"doc", b"$.book[?(@.p > 10)]"]),
+            "*1\r\n$6\r\nobject\r\n"
+        );
+
+        // A write goes through it as far as a value that is already there. A
+        // field that is not there yet has nowhere definite to go, which is the
+        // same refusal a wildcard gets.
+        assert_eq!(
+            f.run(&[b"JSON.NUMINCRBY", b"doc", b"$.book[?(@.p < 10)].p", b"1"]),
+            bulk("[9,10]").as_str()
+        );
+        assert_eq!(
+            f.run(&[b"JSON.SET", b"doc", b"$.book[?(@.p == 13)].t", br#""B""#]),
+            "+OK\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"JSON.SET", b"doc", b"$.book[?(@.p == 13)].n", b"1"]),
+            "-Err wrong static path\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"JSON.DEL", b"doc", b"$.book[?(@.p > 9)]"]),
+            ":2\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"JSON.GET", b"doc", b"$"]),
+            bulk(r#"[{"cap":10,"book":[{"p":9,"t":"a"}]}]"#).as_str()
+        );
+
+        // A path that does not parse is refused before the document is read, so
+        // a key that is not there answers the same way.
+        assert!(
+            f.run(&[b"JSON.GET", b"doc", b"$.book[?(@.p <)]"])
+                .starts_with("-ERR")
+        );
+        assert!(
+            f.run(&[b"JSON.GET", b"nokey", b"$.book[?(@.p <)]"])
+                .starts_with("-ERR")
+        );
+    }
+
     /// D-41. RedisJSON refuses this one, and which document it refuses is
     /// decided by how it happens to hold an array of numbers.
     #[test]
