@@ -50,6 +50,13 @@
 //! has nothing left to change and is quietly skipped. The alternative is
 //! refusing a path that a real Redis accepts.
 //!
+//! Going away is the important word. A [`Edit::Set`] replaces everything below
+//! it and a [`Edit::Splice`] replaces only the run it names, so an edit inside
+//! an element the splice keeps still happens, and so does an edit inside a
+//! member an [`Edit::Put`] leaves alone. `$..*` on `{"a": [[7], [7, 7]]}`
+//! matches the outer array and both inner ones, and `JSON.ARRAPPEND` with that
+//! path has to reach all three.
+//!
 //! An offset that no value in the document begins at is a different thing and
 //! is refused, because the only way to hold one is a bug in whatever worked it
 //! out, and a write that silently does nothing is the worst way to find out.
@@ -154,12 +161,12 @@ fn write(
         // asking for it to be written. Reaching it here means it is the root,
         // and that is refused above.
         Edit::Remove => Err(no_root()),
-        Edit::Put(key, value) => put(v, key, value, b),
+        Edit::Put(key, value) => put(root, v, key, value, at, done, b),
         Edit::Splice {
             at: from,
             take,
             put,
-        } => splice(v, from, take, put, b),
+        } => splice(root, v, Run { from, take, put }, at, done, b),
     }
 }
 
@@ -212,7 +219,19 @@ fn array(
 }
 
 /// Rebuild an object with one more member in it.
-fn put(v: &Value<'_>, key: &[u8], value: &[u8], b: &mut Builder) -> Result<()> {
+///
+/// The members already there are written through [`write`] rather than embedded,
+/// because none of them is going away and an edit inside one of them still has
+/// to happen.
+fn put(
+    root: &Value<'_>,
+    v: &Value<'_>,
+    key: &[u8],
+    value: &[u8],
+    at: &[(usize, Edit<'_>)],
+    done: &mut [bool],
+    b: &mut Builder,
+) -> Result<()> {
     if v.kind() != Kind::Object {
         return Err(Error::new(
             Code::Invalid,
@@ -229,8 +248,12 @@ fn put(v: &Value<'_>, key: &[u8], value: &[u8], b: &mut Builder) -> Result<()> {
         .ok_or_else(|| Error::new(Code::Invalid, "the value put is not readable"))?;
     b.begin_object()?;
     for i in 0..v.len() {
+        let child = v.at(i).ok_or_else(unreadable)?;
+        if skipped(root, &child, at, done)? {
+            continue;
+        }
         b.key(v.key_at(i).ok_or_else(unreadable)?)?;
-        b.embed(&v.at(i).ok_or_else(unreadable)?)?;
+        write(root, &child, at, done, b)?;
     }
     // Last, so that a key already in the object is the one that loses. The
     // builder keeps the last of a repeated key, which is what every JSON parser
@@ -240,8 +263,29 @@ fn put(v: &Value<'_>, key: &[u8], value: &[u8], b: &mut Builder) -> Result<()> {
     b.end_object()
 }
 
+/// A run of an array being replaced, which is one [`Edit::Splice`] unpacked.
+struct Run<'a> {
+    /// Where the replaced run starts.
+    from: usize,
+    /// How many elements it covers.
+    take: usize,
+    /// What goes in their place.
+    put: &'a [&'a [u8]],
+}
+
 /// Rebuild an array with a run of it replaced.
-fn splice(v: &Value<'_>, from: usize, take: usize, put: &[&[u8]], b: &mut Builder) -> Result<()> {
+///
+/// The elements outside the run are written through [`write`], for the reason
+/// [`put`] gives. The ones inside it are the ones going away, so an edit in
+/// there is dropped, which the `mark` in [`write`] already accounted for.
+fn splice(
+    root: &Value<'_>,
+    v: &Value<'_>,
+    run: Run<'_>,
+    at: &[(usize, Edit<'_>)],
+    done: &mut [bool],
+    b: &mut Builder,
+) -> Result<()> {
     if v.kind() != Kind::Array {
         return Err(Error::new(
             Code::Invalid,
@@ -249,19 +293,26 @@ fn splice(v: &Value<'_>, from: usize, take: usize, put: &[&[u8]], b: &mut Builde
         ));
     }
     let n = v.len();
-    let from = from.min(n);
-    let end = from.saturating_add(take).min(n);
+    let from = run.from.min(n);
+    let end = from.saturating_add(run.take).min(n);
     b.begin_array()?;
+    let kept = |i: usize, b: &mut Builder, done: &mut [bool]| -> Result<()> {
+        let child = v.at(i).ok_or_else(unreadable)?;
+        if skipped(root, &child, at, done)? {
+            return Ok(());
+        }
+        write(root, &child, at, done, b)
+    };
     for i in 0..from {
-        b.embed(&v.at(i).ok_or_else(unreadable)?)?;
+        kept(i, b, done)?;
     }
-    for bytes in put {
+    for bytes in run.put {
         let new = Value::new(bytes)
             .ok_or_else(|| Error::new(Code::Invalid, "an element written is not readable"))?;
         b.embed(&new)?;
     }
     for i in end..n {
-        b.embed(&v.at(i).ok_or_else(unreadable)?)?;
+        kept(i, b, done)?;
     }
     b.end_array()
 }
@@ -534,6 +585,49 @@ mod tests {
         );
         assert!(out.get(b"go").is_none());
         assert_eq!(out.len(), 2);
+    }
+
+    #[test]
+    fn a_splice_or_a_put_still_carries_the_edits_inside_what_it_keeps() {
+        let one = from_json(b"1").expect("parses");
+        let put: &[&[u8]] = &[&one];
+        // `$..a` names the outer array and the inner one it holds, and an
+        // append with that path has to reach both.
+        assert_eq!(
+            changed(
+                r#"{"a":[{"a":[7]}]}"#,
+                b"$..a",
+                Edit::Splice {
+                    at: usize::MAX,
+                    take: 0,
+                    put,
+                }
+            ),
+            r#"{"a":[{"a":[7,1]},1]}"#
+        );
+        // The same for a member going into an object that also holds one.
+        assert_eq!(
+            changed(
+                r#"{"o":{"o":{}}}"#,
+                b"$..o",
+                Edit::Put(b"n", one.as_slice())
+            ),
+            r#"{"o":{"n":1,"o":{"n":1}}}"#
+        );
+        // What the splice takes out is going away, so an edit in there is
+        // dropped the way one inside a removed value is.
+        assert_eq!(
+            changed(
+                r#"{"a":[{"a":[7]}]}"#,
+                b"$..a",
+                Edit::Splice {
+                    at: 0,
+                    take: usize::MAX,
+                    put: &[],
+                }
+            ),
+            r#"{"a":[]}"#
+        );
     }
 
     #[test]

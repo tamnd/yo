@@ -2593,6 +2593,58 @@ pub static COMMANDS: &[Spec] = &[
         summary: "Where a value first sits in the arrays a path matched.",
         group: "json",
     },
+    Spec {
+        name: "json.numincrby",
+        arity: 4,
+        flags: JSON_WRITE,
+        first_key: 1,
+        last_key: 1,
+        step: 1,
+        acl: AC_JSON_WRITE,
+        since: "1.0.0",
+        complexity: "O(N) with N the size of the document",
+        summary: "Add to every number a path matched.",
+        group: "json",
+    },
+    Spec {
+        name: "json.nummultby",
+        arity: 4,
+        flags: JSON_WRITE,
+        first_key: 1,
+        last_key: 1,
+        step: 1,
+        acl: AC_JSON_WRITE,
+        since: "1.0.0",
+        complexity: "O(N) with N the size of the document",
+        summary: "Multiply every number a path matched.",
+        group: "json",
+    },
+    Spec {
+        name: "json.numpowby",
+        arity: 4,
+        flags: JSON_WRITE,
+        first_key: 1,
+        last_key: 1,
+        step: 1,
+        acl: AC_JSON_WRITE,
+        since: "1.0.0",
+        complexity: "O(N) with N the size of the document",
+        summary: "Raise every number a path matched to a power.",
+        group: "json",
+    },
+    Spec {
+        name: "json.strappend",
+        arity: -3,
+        flags: JSON_WRITE_OOM,
+        first_key: 1,
+        last_key: 1,
+        step: 1,
+        acl: AC_JSON_WRITE,
+        since: "1.0.0",
+        complexity: "O(N) with N the size of the document",
+        summary: "Add to the end of every string a path matched.",
+        group: "json",
+    },
     // -------------------------------------------------------------- vector
     Spec {
         name: "vadd",
@@ -3958,12 +4010,21 @@ const FREE: u16 = u16::MAX;
 /// slots was the whole budget spent in one place. The fix was the key rather
 /// than the multiplier, which is what [`key_of`] now folds the middle byte in
 /// for, and the ninth search was run over the 271 names with the new key across
-/// six shards. It found this one at two slots and fifty seven, which is a
-/// shade over a fifth of a probe a command, the same as the multiplier it
-/// replaces managed over nine fewer names. Twelve of the names still collide on
-/// the key and no multiplier can separate them, so twelve extra probes is the
-/// floor now rather than seventeen.
-const MIX: u64 = 0x98c7_3dc0_1fe8_9281;
+/// six shards. It found one at two slots and fifty seven, which is a shade over
+/// a fifth of a probe a command, the same as the multiplier it replaced managed
+/// over nine fewer names.
+///
+/// The number family and `json.strappend` took that one to three slots, and the
+/// tenth search over the 275 names found this one at two slots and sixty seven.
+/// Three of the six shards converged on sixty seven from different seeds without
+/// any of them bettering it, which is the sign that the key rather than the
+/// multiplier is what is left: fourteen of the names collide on the key itself
+/// and no multiplier can separate them, so fourteen extra probes is the floor
+/// and this is within a quarter of it per name. The two new pairs are
+/// `json.arrappend` with `json.strappend` and `json.numincrby` with
+/// `json.nummultby`, and both are the same shape as the pairs already there,
+/// which is a group whose names agree everywhere the key looks.
+const MIX: u64 = 0x2cdd_af88_9f9f_65cf;
 
 /// The four bytes the index is computed from: the length, the first two bytes,
 /// and the last byte with the middle byte folded into it, all lower cased.
@@ -3976,8 +4037,8 @@ const MIX: u64 = 0x98c7_3dc0_1fe8_9281;
 /// slot, and reading less of the name is a shorter dependency chain in front of
 /// the multiply. Names that agree on all four collide whatever the multiplier is
 /// and probe once more, and the probe is the same compare the lookup was always
-/// going to do. Over the 271 commands there are twelve such pairs and no group
-/// larger than a pair, so twelve extra probes is the floor.
+/// going to do. Over the 275 commands there are fourteen such pairs and no group
+/// larger than a pair, so fourteen extra probes is the floor.
 ///
 /// The middle byte is the part that was added last and it is worth saying why,
 /// because for a long time the key was the length and the first two bytes and
@@ -4281,7 +4342,7 @@ mod tests {
         }
         assert!(worst <= 2, "worst probe is {worst} slots");
         assert!(
-            total <= 57,
+            total <= 67,
             "{total} extra slots walked over the whole table"
         );
     }

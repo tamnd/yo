@@ -9895,6 +9895,339 @@ mod tests {
         );
     }
 
+    /// The number family answers text and keeps an integer an integer until
+    /// something in the sum is not one.
+    #[test]
+    fn the_json_number_family_answers_json_text_and_keeps_its_integers() {
+        let mut f = Fixture::new();
+        let doc = br#"{"i":7,"f":1.5,"neg":-2,"s":"ab"}"#;
+        f.run(&[b"JSON.SET", b"doc", b"$", doc]);
+
+        // A legacy path answers the new value as JSON text in a bulk string,
+        // not as a number, which is the shape all three of them use.
+        assert_eq!(
+            f.run(&[b"JSON.NUMINCRBY", b"doc", b".i", b"2"]),
+            bulk("9").as_str()
+        );
+        // A JSONPath answers a bulk string holding a JSON array.
+        assert_eq!(
+            f.run(&[b"JSON.NUMINCRBY", b"doc", b"$.i", b"2"]),
+            bulk("[11]").as_str()
+        );
+        // Two integers stay an integer and a double anywhere in it makes the
+        // answer a double, which the document then holds.
+        assert_eq!(
+            f.run(&[b"JSON.NUMINCRBY", b"doc", b".i", b"2.0"]),
+            bulk("13.0").as_str()
+        );
+        assert_eq!(
+            f.run(&[b"JSON.TYPE", b"doc", b".i"]),
+            bulk("number").as_str()
+        );
+        assert_eq!(
+            f.run(&[b"JSON.NUMMULTBY", b"doc", b".f", b"2"]),
+            bulk("3.0").as_str()
+        );
+        assert_eq!(
+            f.run(&[b"JSON.NUMPOWBY", b"doc", b".neg", b"3"]),
+            bulk("-8").as_str()
+        );
+        // A power of a half is a square root, and the square root of a negative
+        // number is the error that says the answer is not a number.
+        f.run(&[b"JSON.SET", b"doc", b"$.f", b"1.5"]);
+        assert_eq!(
+            f.run(&[b"JSON.NUMPOWBY", b"doc", b".f", b"0.5"]),
+            bulk("1.224744871391589").as_str()
+        );
+        assert_eq!(
+            f.run(&[b"JSON.NUMPOWBY", b"doc", b".neg", b"0.5"]),
+            "-ERR result is not a number\r\n"
+        );
+        // An integer answer that does not fit is refused rather than promoted,
+        // and a negative exponent lands in the same error because there is no
+        // integer answer to two to the minus one.
+        f.run(&[b"JSON.SET", b"doc", b"$.big", b"9223372036854775807"]);
+        assert_eq!(
+            f.run(&[b"JSON.NUMINCRBY", b"doc", b".big", b"1"]),
+            "-ERR numeric overflow\r\n"
+        );
+        f.run(&[b"JSON.SET", b"doc", b"$.p", b"2"]);
+        assert_eq!(
+            f.run(&[b"JSON.NUMPOWBY", b"doc", b".p", b"-1"]),
+            "-ERR numeric overflow\r\n"
+        );
+        // A double that leaves the finite numbers is the other error.
+        f.run(&[b"JSON.SET", b"doc", b"$.huge", b"1e308"]);
+        assert_eq!(
+            f.run(&[b"JSON.NUMMULTBY", b"doc", b".huge", b"1e10"]),
+            "-ERR result is not a number\r\n"
+        );
+
+        // A match that is not a number is a null inside the array on a
+        // JSONPath, and a legacy path that found no number at all is the error
+        // with the module's own typo in it.
+        assert_eq!(
+            f.run(&[b"JSON.NUMINCRBY", b"doc", b"$.s", b"1"]),
+            bulk("[null]").as_str()
+        );
+        assert_eq!(
+            f.run(&[b"JSON.NUMINCRBY", b"doc", b"$.nope", b"1"]),
+            bulk("[]").as_str()
+        );
+        assert_eq!(
+            f.run(&[b"JSON.NUMINCRBY", b"doc", b".s", b"1"]),
+            "-ERR Path does not exist or does not contains a number\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"JSON.NUMINCRBY", b"doc", b".nope", b"1"]),
+            "-ERR Path does not exist or does not contains a number\r\n"
+        );
+        // The operand is JSON and has to be a number. Valid JSON that is not
+        // one is a line of its own, and it goes out without a prefix.
+        assert_eq!(
+            f.run(&[b"JSON.NUMINCRBY", b"doc", b".i", b"true"]),
+            "-bad input number\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"JSON.NUMINCRBY", b"nokey", b".i", b"1"]),
+            "-ERR could not perform this operation on a key that doesn't exist\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"JSON.NUMINCRBY", b"nokey", b"$.i", b"1"]),
+            "-ERR could not perform this operation on a key that doesn't exist\r\n"
+        );
+    }
+
+    /// `JSON.STRAPPEND` puts its path in the middle and makes it optional,
+    /// which nothing else in the group does.
+    #[test]
+    fn json_strappend_reads_its_shape_off_the_argument_count() {
+        let mut f = Fixture::new();
+        f.run(&[b"JSON.SET", b"doc", b"$", br#"{"s":"ab","n":1}"#]);
+
+        assert_eq!(
+            f.run(&[b"JSON.STRAPPEND", b"doc", b".s", br#""c""#]),
+            ":3\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"JSON.STRAPPEND", b"doc", b"$.s", br#""d""#]),
+            "*1\r\n:4\r\n"
+        );
+        // The length is in bytes and not in characters, so one two byte letter
+        // takes it up by two.
+        assert_eq!(
+            f.run(&[b"JSON.STRAPPEND", b"doc", b".s", br#""\u00e9""#]),
+            ":6\r\n"
+        );
+        // Three arguments means the value is the last one and the path is the
+        // root, so this appends to a document that is a string on its own.
+        f.run(&[b"JSON.SET", b"str", b"$", br#""ab""#]);
+        assert_eq!(f.run(&[b"JSON.STRAPPEND", b"str", br#""c""#]), ":3\r\n");
+        assert_eq!(f.run(&[b"JSON.GET", b"str"]), bulk("\"abc\"").as_str());
+
+        // The value is JSON and has to be a JSON string. A number is a
+        // WRONGTYPE about a path value even though it was the value that was
+        // wrong, which is the module's wording and not a slip here.
+        assert_eq!(
+            f.run(&[b"JSON.STRAPPEND", b"doc", b".s", b"5"]),
+            "-WRONGTYPE wrong type of path value - expected string\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"JSON.STRAPPEND", b"doc", b"$.n", br#""c""#]),
+            "*1\r\n$-1\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"JSON.STRAPPEND", b"doc", b".n", br#""c""#]),
+            "-ERR Path does not exist or not a string\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"JSON.STRAPPEND", b"doc", b"$.nope", br#""c""#]),
+            "*0\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"JSON.STRAPPEND", b"nokey", br#""c""#]),
+            "-ERR could not perform this operation on a key that doesn't exist\r\n"
+        );
+    }
+
+    /// A legacy path can match more than one value, and which of them the one
+    /// answer comes from is not the same choice twice.
+    #[test]
+    fn a_legacy_wildcard_write_touches_every_match_and_answers_only_one() {
+        let mut f = Fixture::new();
+        // Three arrays of one, two and three elements, which tells the first
+        // match and the last match apart in a single command.
+        let three = br#"{"a":[[7],[7,7],[7,7,7]]}"#;
+
+        f.run(&[b"JSON.SET", b"doc", b"$", three]);
+        assert_eq!(
+            f.run(&[b"JSON.ARRAPPEND", b"doc", b".a[*]", b"9"]),
+            ":4\r\n"
+        );
+        f.run(&[b"JSON.SET", b"doc", b"$", three]);
+        assert_eq!(
+            f.run(&[b"JSON.ARRINSERT", b"doc", b".a[*]", b"0", b"9"]),
+            ":2\r\n"
+        );
+        f.run(&[b"JSON.SET", b"doc", b"$", three]);
+        assert_eq!(
+            f.run(&[b"JSON.ARRTRIM", b"doc", b".a[*]", b"0", b"1"]),
+            ":1\r\n"
+        );
+        f.run(&[b"JSON.SET", b"doc", b"$", br#"{"a":[[1,2,3],[4,5,6]]}"#]);
+        assert_eq!(
+            f.run(&[b"JSON.ARRPOP", b"doc", b".a[*]", b"0"]),
+            bulk("1").as_str()
+        );
+        f.run(&[b"JSON.SET", b"doc", b"$", br#"{"a":[1,2,3]}"#]);
+        assert_eq!(
+            f.run(&[b"JSON.NUMINCRBY", b"doc", b".a[*]", b"10"]),
+            bulk("13").as_str()
+        );
+        f.run(&[b"JSON.SET", b"doc", b"$", br#"{"a":["p","qq","rrr"]}"#]);
+        assert_eq!(
+            f.run(&[b"JSON.STRAPPEND", b"doc", b".a[*]", br#""z""#]),
+            ":4\r\n"
+        );
+        f.run(&[b"JSON.SET", b"doc", b"$", br#"{"a":[true,false,true]}"#]);
+        assert_eq!(
+            f.run(&[b"JSON.TOGGLE", b"doc", b".a[*]"]),
+            bulk("false").as_str()
+        );
+        // Every one of them wrote to all three matches, whichever one it chose
+        // to answer about.
+        assert_eq!(
+            f.run(&[b"JSON.GET", b"doc", b".a"]),
+            bulk("[false,true,false]").as_str()
+        );
+
+        // A match of the wrong kind is skipped rather than being the answer, so
+        // a path that found a string and then two arrays still answers.
+        f.run(&[b"JSON.SET", b"doc", b"$", br#"{"a":["x",[1],[1,2]]}"#]);
+        assert_eq!(
+            f.run(&[b"JSON.ARRAPPEND", b"doc", b".a[*]", b"9"]),
+            ":3\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"JSON.GET", b"doc", b".a"]),
+            bulk(r#"["x",[1,9],[1,2,9]]"#).as_str()
+        );
+        // Nothing of the right kind anywhere is the error, and that is the only
+        // case that is.
+        f.run(&[b"JSON.SET", b"doc", b"$", br#"{"a":["x","y"]}"#]);
+        assert_eq!(
+            f.run(&[b"JSON.ARRAPPEND", b"doc", b".a[*]", b"9"]),
+            "-ERR Path does not exist or not an array\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"JSON.TOGGLE", b"doc", b".a[*]"]),
+            "-ERR Path does not exist or not a bool\r\n"
+        );
+        // The one array that was there and had nothing in it is an answer and
+        // not a skip, so the pop answers about it rather than about the array
+        // after it.
+        f.run(&[b"JSON.SET", b"doc", b"$", br#"{"a":[[],[2,3]]}"#]);
+        assert_eq!(f.run(&[b"JSON.ARRPOP", b"doc", b".a[*]"]), "$-1\r\n");
+        assert_eq!(
+            f.run(&[b"JSON.GET", b"doc", b".a"]),
+            bulk("[[],[2]]").as_str()
+        );
+    }
+
+    /// A path that matched a value and something inside that value writes to
+    /// both, which is what `$..` and a nested wildcard are for.
+    #[test]
+    fn a_write_reaches_a_match_that_sits_inside_another_match() {
+        let mut f = Fixture::new();
+        let nested = br#"{"a":[{"a":[7]},{"a":[7,7]}]}"#;
+
+        f.run(&[b"JSON.SET", b"doc", b"$", nested]);
+        assert_eq!(
+            f.run(&[b"JSON.ARRAPPEND", b"doc", b"$..a", b"9"]),
+            "*3\r\n:3\r\n:2\r\n:3\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"JSON.GET", b"doc", b"$"]),
+            bulk(r#"[{"a":[{"a":[7,9]},{"a":[7,7,9]},9]}]"#).as_str()
+        );
+
+        // The same for a trim, where the outer array keeps the two elements the
+        // inner writes landed in.
+        f.run(&[b"JSON.SET", b"doc", b"$", nested]);
+        assert_eq!(
+            f.run(&[b"JSON.ARRTRIM", b"doc", b"$..a", b"0", b"0"]),
+            "*3\r\n:1\r\n:1\r\n:1\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"JSON.GET", b"doc", b"$"]),
+            bulk(r#"[{"a":[{"a":[7]}]}]"#).as_str()
+        );
+
+        // And for a number, where the first match is the object the outer array
+        // holds and only the two inside it are numbers.
+        f.run(&[b"JSON.SET", b"doc", b"$", nested]);
+        assert_eq!(
+            f.run(&[b"JSON.NUMINCRBY", b"doc", b"$..a[0]", b"1"]),
+            bulk("[null,8,8]").as_str()
+        );
+    }
+
+    /// The value a write is given is looked at only once the path has found
+    /// something of the right kind to use it on.
+    #[test]
+    fn a_bad_operand_is_not_the_answer_when_the_path_found_nothing_to_use_it_on() {
+        let mut f = Fixture::new();
+        f.run(&[b"JSON.SET", b"doc", b"$", br#"{"n":7,"s":"t"}"#]);
+
+        // A string is not a number, so the path answers first and the `"x"` is
+        // never looked at. Same for the value that is not JSON at all.
+        assert_eq!(
+            f.run(&[b"JSON.NUMINCRBY", b"doc", b"$.s", br#""x""#]),
+            bulk("[null]").as_str()
+        );
+        assert_eq!(
+            f.run(&[b"JSON.NUMINCRBY", b"doc", b"$.s", b"notjson"]),
+            bulk("[null]").as_str()
+        );
+        assert_eq!(
+            f.run(&[b"JSON.NUMINCRBY", b"doc", b"$.missing", b"notjson"]),
+            bulk("[]").as_str()
+        );
+        assert_eq!(
+            f.run(&[b"JSON.NUMINCRBY", b"doc", b".s", br#""x""#]),
+            "-ERR Path does not exist or does not contains a number\r\n"
+        );
+        // A number match anywhere and the value is looked at after all.
+        assert_eq!(
+            f.run(&[b"JSON.NUMINCRBY", b"doc", b"$.n", br#""x""#]),
+            "-bad input number\r\n"
+        );
+
+        // JSON.STRAPPEND follows the same order with its own two answers.
+        assert_eq!(
+            f.run(&[b"JSON.STRAPPEND", b"doc", b"$.n", b"1"]),
+            "*1\r\n$-1\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"JSON.STRAPPEND", b"doc", b".n", b"1"]),
+            "-ERR Path does not exist or not a string\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"JSON.STRAPPEND", b"doc", b"$.s", b"1"]),
+            "-WRONGTYPE wrong type of path value - expected string\r\n"
+        );
+
+        // A key that is not there still comes before either of them.
+        assert_eq!(
+            f.run(&[b"JSON.NUMINCRBY", b"nope", b"$.a", br#""x""#]),
+            "-ERR could not perform this operation on a key that doesn't exist\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"JSON.STRAPPEND", b"nope", b"$.a", b"1"]),
+            "-ERR could not perform this operation on a key that doesn't exist\r\n"
+        );
+    }
+
     // ---------------------------------------------------------------- vector
 
     /// The first `VADD` fixes the dimension and every one after it has to

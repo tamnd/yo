@@ -35,7 +35,8 @@
 //! an integer and everything else is stored as a float, which is the same split
 //! RedisJSON makes and the reason `1` comes back as `1` rather than as `1.0`.
 //! An integer literal too big for an `i64` becomes a float, and loses precision
-//! the way it would anywhere else.
+//! the way it would anywhere else. So does `-0`, which is a number an integer
+//! cannot hold and a double can.
 //!
 //! # Two things the writer does that are worth knowing
 //!
@@ -455,7 +456,14 @@ impl<'a> Reader<'a> {
             .expect("a number is the ASCII this function just walked over");
         // An integer that does not fit falls through to the float, which is the
         // only thing that can be done with it and is what everyone else does.
-        if whole && let Ok(i) = text.parse::<i64>() {
+        // So does a negative zero, which is a number an integer cannot hold and
+        // a double can, and which every other JSON parser reads as a double for
+        // that reason. It matters because a document that went through here
+        // would otherwise come back out with the sign gone.
+        if whole
+            && text != "-0"
+            && let Ok(i) = text.parse::<i64>()
+        {
             return b.int(i);
         }
         let f: f64 = text
@@ -723,6 +731,12 @@ mod tests {
         let bytes = from_json(b"1").expect("parses");
         assert_eq!(Value::new(&bytes).expect("readable").kind(), Kind::Int);
         let bytes = from_json(b"1.0").expect("parses");
+        assert_eq!(Value::new(&bytes).expect("readable").kind(), Kind::Float);
+        // A negative zero is the one whole number that is a double, because an
+        // integer cannot hold the sign and losing it would change the document.
+        assert_eq!(round("-0"), "-0.0");
+        assert_eq!(round("0"), "0");
+        let bytes = from_json(b"-0").expect("parses");
         assert_eq!(Value::new(&bytes).expect("readable").kind(), Kind::Float);
     }
 

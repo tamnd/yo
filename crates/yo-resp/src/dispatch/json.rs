@@ -124,6 +124,10 @@ pub(super) fn execute(db: &mut Keyspace, spec: &Spec, args: Args<'_>, out: &mut 
         "json.arrtrim" => arrtrim(db, args, out),
         "json.arrpop" => arrpop(db, args, out),
         "json.arrindex" => arrindex(db, args, out),
+        "json.numincrby" => arith(db, args, out, Arith::Add),
+        "json.nummultby" => arith(db, args, out, Arith::Mul),
+        "json.numpowby" => arith(db, args, out, Arith::Pow),
+        "json.strappend" => strappend(db, args, out),
         other => unreachable!("{other} is not a JSON command"),
     }
 }
@@ -329,22 +333,23 @@ fn toggle(db: &mut Keyspace, args: Args<'_>, out: &mut Out) -> Result<()> {
                     flipped.push(Some(!was));
                 }
                 // A path that matched something that is not a boolean is a hole
-                // in the array for a JSONPath. A legacy path cannot say that,
-                // so it says the same thing it says for a path that matched
-                // nothing at all, in one sentence that covers both.
-                None if path.legacy() => return Err(not_a_bool()),
+                // in the array for a JSONPath, and for a legacy path it is a
+                // match this skips over on the way to the next one.
                 None => flipped.push(None),
             }
         }
-        if hits.is_empty() && path.legacy() {
+        // Nothing to flip anywhere is the error, and it is one sentence for a
+        // path that matched nothing and a path that matched no boolean, because
+        // a legacy reply has no room to say which.
+        if path.legacy() && !flipped.iter().any(Option::is_some) {
             return Err(not_a_bool());
         }
         (edit(&root, &at)?, flipped)
     };
     body.doc = after;
     if path.legacy() {
-        match flipped.first().and_then(|f| *f) {
-            Some(now) => out.bulk(if now { b"true" } else { b"false" }),
+        match Pick::Last.of(&flipped) {
+            Some(now) => out.bulk(if *now { b"true" } else { b"false" }),
             None => out.nil(),
         }
         return Ok(());
@@ -746,20 +751,61 @@ fn arrays<'r>(root: &Value<'r>, path: &Path<'_>) -> Result<Vec<Option<(usize, Va
     Ok(out)
 }
 
-/// The one array a legacy path named, or the error that says it did not.
-fn only_array<'r>(found: &[Option<(usize, Value<'r>)>]) -> Result<(usize, Value<'r>)> {
-    match found.first() {
-        Some(Some((off, v))) => Ok((*off, *v)),
-        _ => Err(not_an_array()),
+/// That a legacy path named at least one array, or the error that says it did
+/// not.
+///
+/// A legacy path can match more than one value, `.a[*]` being the short way to
+/// get there, and a write applies to every match it can rather than to the
+/// first one. So this refuses only when there was nothing it could do at all: a
+/// path that matched a string and then two arrays appends to the two arrays and
+/// answers, and a path that matched two strings is the error. Checked on 8.10.1
+/// on `{"a":["x",[1],[1,2]]}`, which answers three.
+fn any_array(found: &[Option<(usize, Value<'_>)>]) -> Result<()> {
+    if found.iter().any(Option::is_some) {
+        return Ok(());
+    }
+    Err(not_an_array())
+}
+
+/// Which of the matches a legacy path answers with.
+///
+/// A legacy path answers one value and a write touches every match, so there is
+/// a choice here, and RedisJSON does not make the same one twice. The readers
+/// answer the first match. The writes answer whichever match they wrote last,
+/// and they do not all walk the matches the same way round: `JSON.ARRAPPEND`,
+/// the number family, `JSON.STRAPPEND` and `JSON.TOGGLE` walk forwards and so
+/// answer the last, while `JSON.ARRINSERT`, `JSON.ARRTRIM` and `JSON.ARRPOP`
+/// walk backwards and so answer the first. It reads like an accident of how
+/// each one was written, and it is what a client sees, so it is copied rather
+/// than tidied up. Read off 8.10.1 with three arrays of one, two and three
+/// elements, which tells the two apart in one command.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Pick {
+    First,
+    Last,
+}
+
+impl Pick {
+    /// The answer a legacy path gets, out of one answer per match.
+    ///
+    /// A `None` is a match this command did not touch because it was the wrong
+    /// kind of value, and those are skipped rather than counted, which is why a
+    /// path that matched a string and then an array answers about the array.
+    fn of<T>(self, all: &[Option<T>]) -> Option<&T> {
+        let mut kept = all.iter().flatten();
+        match self {
+            Pick::First => kept.next(),
+            Pick::Last => kept.next_back(),
+        }
     }
 }
 
 /// Answer with the new length of every array the command touched, in whichever
 /// of the two shapes the path asked for.
-fn lengths(path: &Path<'_>, lens: &[Option<usize>], out: &mut Out) {
+fn lengths(path: &Path<'_>, lens: &[Option<usize>], pick: Pick, out: &mut Out) {
     if path.legacy() {
-        match lens.first().and_then(|n| *n) {
-            Some(n) => out.int(n as i64),
+        match pick.of(lens) {
+            Some(n) => out.int(*n as i64),
             None => out.nil(),
         }
         return;
@@ -801,7 +847,7 @@ fn arrappend(db: &mut Keyspace, args: Args<'_>, out: &mut Out) -> Result<()> {
         let root = readable(&body.doc)?;
         let found = arrays(&root, &path)?;
         if path.legacy() {
-            only_array(&found)?;
+            any_array(&found)?;
         }
         let mut at = Vec::new();
         let mut lens = Vec::with_capacity(found.len());
@@ -824,7 +870,7 @@ fn arrappend(db: &mut Keyspace, args: Args<'_>, out: &mut Out) -> Result<()> {
         (edit(&root, &at)?, lens)
     };
     body.doc = after;
-    lengths(&path, &lens, out);
+    lengths(&path, &lens, Pick::Last, out);
     Ok(())
 }
 
@@ -847,7 +893,7 @@ fn arrinsert(db: &mut Keyspace, args: Args<'_>, out: &mut Out) -> Result<()> {
         let root = readable(&body.doc)?;
         let found = arrays(&root, &path)?;
         if path.legacy() {
-            only_array(&found)?;
+            any_array(&found)?;
         }
         let mut at = Vec::new();
         let mut lens = Vec::with_capacity(found.len());
@@ -877,7 +923,7 @@ fn arrinsert(db: &mut Keyspace, args: Args<'_>, out: &mut Out) -> Result<()> {
         (edit(&root, &at)?, lens)
     };
     body.doc = after;
-    lengths(&path, &lens, out);
+    lengths(&path, &lens, Pick::First, out);
     Ok(())
 }
 
@@ -911,7 +957,7 @@ fn arrtrim(db: &mut Keyspace, args: Args<'_>, out: &mut Out) -> Result<()> {
         let root = readable(&body.doc)?;
         let found = arrays(&root, &path)?;
         if path.legacy() {
-            only_array(&found)?;
+            any_array(&found)?;
         }
         // The kept elements are the bytes already in the document, spliced back
         // over the whole array. Held out here because the edits below borrow
@@ -950,7 +996,7 @@ fn arrtrim(db: &mut Keyspace, args: Args<'_>, out: &mut Out) -> Result<()> {
         (edit(&root, &at)?, lens)
     };
     body.doc = after;
-    lengths(&path, &lens, out);
+    lengths(&path, &lens, Pick::First, out);
     Ok(())
 }
 
@@ -995,16 +1041,21 @@ fn arrpop(db: &mut Keyspace, args: Args<'_>, out: &mut Out) -> Result<()> {
         let root = readable(&body.doc)?;
         let found = arrays(&root, &path)?;
         if path.legacy() {
-            only_array(&found)?;
+            any_array(&found)?;
         }
         let mut at = Vec::new();
-        let mut gone: Vec<Option<Vec<u8>>> = Vec::with_capacity(found.len());
+        // Two levels of nothing, and they are not the same nothing. The outer
+        // one is a match this command did not touch at all because it was not
+        // an array, which [`Pick`] skips over. The inner one is an array it did
+        // look at and found nothing in, which is an answer and is the answer a
+        // legacy path gets if that array came first.
+        let mut gone: Vec<Option<Option<Vec<u8>>>> = Vec::with_capacity(found.len());
         for f in &found {
             match f {
                 // An empty array pops nothing and is not an error, on either
                 // syntax, which is the one case where a legacy path that named
                 // a real array still answers nil.
-                Some((_, v)) if v.is_empty() => gone.push(None),
+                Some((_, v)) if v.is_empty() => gone.push(Some(None)),
                 Some((off, v)) => {
                     let i = reach(want, v.len());
                     let mut text = Vec::new();
@@ -1020,7 +1071,7 @@ fn arrpop(db: &mut Keyspace, args: Args<'_>, out: &mut Out) -> Result<()> {
                             put: &[],
                         },
                     ));
-                    gone.push(Some(text));
+                    gone.push(Some(Some(text)));
                 }
                 None => gone.push(None),
             }
@@ -1029,17 +1080,17 @@ fn arrpop(db: &mut Keyspace, args: Args<'_>, out: &mut Out) -> Result<()> {
     };
     body.doc = after;
     if path.legacy() {
-        match gone.first().and_then(|g| g.as_ref()) {
-            Some(text) => out.bulk(text),
-            None => out.nil(),
+        match Pick::First.of(&gone) {
+            Some(Some(text)) => out.bulk(text),
+            _ => out.nil(),
         }
         return Ok(());
     }
     out.array(gone.len());
     for g in &gone {
         match g {
-            Some(text) => out.bulk(text),
-            None => out.nil(),
+            Some(Some(text)) => out.bulk(text),
+            _ => out.nil(),
         }
     }
     Ok(())
@@ -1177,6 +1228,270 @@ fn same(a: &Value<'_>, b: &Value<'_>) -> bool {
     }
 }
 
+// ------------------------------------------------- the numbers and the strings
+
+/// Which of `JSON.NUMINCRBY`, `JSON.NUMMULTBY` and `JSON.NUMPOWBY` is being
+/// run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Arith {
+    Add,
+    Mul,
+    Pow,
+}
+
+/// A JSON number, which is an integer until something makes it a double.
+///
+/// This is the whole reason the number family is not one line. JSON has one
+/// number type and every implementation that cares about round tripping keeps
+/// two, so `7 + 2` has to answer `9` and `7 + 2.0` has to answer `9.0`, and the
+/// document has to hold what the reply said.
+#[derive(Debug, Clone, Copy)]
+enum Num {
+    Int(i64),
+    Float(f64),
+}
+
+impl Num {
+    /// The number a value holds, if it holds one.
+    fn of(v: &Value<'_>) -> Option<Num> {
+        match v.kind() {
+            Kind::Int => v.as_int().map(Num::Int),
+            Kind::Float => v.as_float().map(Num::Float),
+            _ => None,
+        }
+    }
+
+    /// The same number as a double, which is what mixed arithmetic works in.
+    fn as_f64(self) -> f64 {
+        match self {
+            Num::Int(i) => i as f64,
+            Num::Float(f) => f,
+        }
+    }
+
+    /// The number as a document value.
+    fn encode(self) -> Result<Vec<u8>> {
+        let mut b = Builder::new();
+        match self {
+            Num::Int(i) => b.int(i)?,
+            Num::Float(f) => b.float(f)?,
+        }
+        Ok(b.finish()?.to_vec())
+    }
+}
+
+impl Arith {
+    /// `a` combined with `b`, in integers when both of them are integers.
+    ///
+    /// Two integers are checked and overflow is refused rather than promoted to
+    /// a double, so `JSON.NUMINCRBY` on the largest integer there is answers an
+    /// error and leaves the document alone. A power with a negative exponent
+    /// falls into the same error even though nothing overflowed, because the
+    /// exponent has to be a count and there is no integer answer to two to the
+    /// minus one. Both of those are RedisJSON's, read off 8.10.1.
+    ///
+    /// Anything with a double in it is done in doubles, and a result that is not
+    /// finite is refused, which covers a product that overflowed and the square
+    /// root of a negative number in one test.
+    fn apply(self, a: Num, b: Num) -> Result<Num> {
+        if let (Num::Int(x), Num::Int(y)) = (a, b) {
+            let done = match self {
+                Arith::Add => x.checked_add(y),
+                Arith::Mul => x.checked_mul(y),
+                Arith::Pow => u32::try_from(y).ok().and_then(|y| x.checked_pow(y)),
+            };
+            return done.map(Num::Int).ok_or_else(overflowed);
+        }
+        let (x, y) = (a.as_f64(), b.as_f64());
+        let done = match self {
+            Arith::Add => x + y,
+            Arith::Mul => x * y,
+            Arith::Pow => x.powf(y),
+        };
+        if !done.is_finite() {
+            return Err(not_a_number());
+        }
+        Ok(Num::Float(done))
+    }
+}
+
+/// `JSON.NUMINCRBY`, `JSON.NUMMULTBY` and `JSON.NUMPOWBY`, which are one
+/// command with three operators.
+///
+/// The reply is a bulk string holding JSON text rather than a number, on both
+/// syntaxes: a legacy path answers the new value as text and a JSONPath answers
+/// a JSON array of the new values with a `null` for every match that was not a
+/// number. A client that wants the number back has to parse it, which is odd
+/// and is what every RedisJSON client already does.
+fn arith(db: &mut Keyspace, args: Args<'_>, out: &mut Out, how: Arith) -> Result<()> {
+    let (key, raw, operand) = (args.get(1), args.get(2), args.get(3));
+    let path = Path::parse(raw)?;
+    let body = match doc_mut(db, key, out)? {
+        Doc::Wrong => return Ok(()),
+        Doc::Gone => return Err(no_key()),
+        Doc::Here(body) => body,
+    };
+    // The new values, encoded, held out here because the edits below borrow
+    // them. One entry per match, `None` for a match that was not a number.
+    let mut made: Vec<Option<Vec<u8>>> = Vec::new();
+    let after = {
+        let root = readable(&body.doc)?;
+        let mut hits = Vec::new();
+        path.select(&root, &mut hits);
+        let was: Vec<Option<Num>> = hits.iter().map(Num::of).collect();
+        // The operand is looked at only once a match turns out to be a number.
+        // `JSON.NUMINCRBY key $.a_string "x"` answers `[null]` on the path and
+        // never says anything about the `"x"`, which is RedisJSON's order and
+        // matters because the two answers are nothing alike.
+        let holder;
+        let by = if was.iter().any(Option::is_some) {
+            // Parsed as JSON rather than as a number, so ` 3 ` is a three and
+            // `1 2` is a parse error rather than a one.
+            holder = yo_doc::from_json(operand)?;
+            match Num::of(&readable(&holder)?) {
+                Some(by) => Some(by),
+                None => {
+                    // Valid JSON that is not a number, which is `true` or `"3"`
+                    // or a whole object. Unprefixed, like the other two lines
+                    // this file writes itself.
+                    out.error(b"bad input number");
+                    return Ok(());
+                }
+            }
+        } else if path.legacy() {
+            return Err(no_number());
+        } else {
+            None
+        };
+        for w in &was {
+            match (w, by) {
+                (Some(w), Some(by)) => made.push(Some(how.apply(*w, by)?.encode()?)),
+                _ => made.push(None),
+            }
+        }
+        let mut at = Vec::new();
+        for (v, m) in hits.iter().zip(&made) {
+            if let Some(bytes) = m {
+                at.push((offset(&root, v)?, Edit::Set(bytes)));
+            }
+        }
+        edit(&root, &at)?
+    };
+    body.doc = after;
+
+    // The text is written off the encoded value rather than off the number, so
+    // what the client reads back is the same bytes `JSON.GET` will answer with.
+    let mut text = Vec::new();
+    if path.legacy() {
+        if let Some(bytes) = Pick::Last.of(&made) {
+            readable(bytes)?.write_json(&mut text)?;
+        }
+        out.bulk(&text);
+        return Ok(());
+    }
+    text.push(b'[');
+    for (i, m) in made.iter().enumerate() {
+        if i > 0 {
+            text.push(b',');
+        }
+        match m {
+            Some(bytes) => readable(bytes)?.write_json(&mut text)?,
+            None => text.extend_from_slice(b"null"),
+        }
+    }
+    text.push(b']');
+    out.bulk(&text);
+    Ok(())
+}
+
+/// `JSON.STRAPPEND key [path] value`.
+///
+/// The path is optional and sits in the middle, which no other command here
+/// does, so the shape has to be read off the count: three arguments means the
+/// value is the last one and the path is the root. Anything past the value is
+/// ignored rather than refused, which is RedisJSON's and is why the arity is
+/// open ended.
+fn strappend(db: &mut Keyspace, args: Args<'_>, out: &mut Out) -> Result<()> {
+    let key = args.get(1);
+    let (raw, text) = if args.len() == 3 {
+        (ROOT, args.get(2))
+    } else {
+        (args.get(2), args.get(3))
+    };
+    let path = Path::parse(raw)?;
+    let body = match doc_mut(db, key, out)? {
+        Doc::Wrong => return Ok(()),
+        Doc::Gone => return Err(no_key()),
+        Doc::Here(body) => body,
+    };
+    let mut made: Vec<Option<Vec<u8>>> = Vec::new();
+    let after = {
+        let root = readable(&body.doc)?;
+        let mut hits = Vec::new();
+        path.select(&root, &mut hits);
+        let was: Vec<Option<&[u8]>> = hits.iter().map(Value::text_bytes).collect();
+        // The value is looked at only once a match turns out to be a string,
+        // the same order the number family follows.
+        let holder;
+        let more = if was.iter().any(Option::is_some) {
+            holder = yo_doc::from_json(text)?;
+            // The value is JSON and has to be a JSON string, so a client
+            // appends `"a"` and not `a`. A value that is a number is a
+            // `WRONGTYPE` about a path value even though it was the value and
+            // not the path that was wrong, which reads like the check was
+            // written in the wrong place and is what the module answers.
+            match readable(&holder)?.text_bytes() {
+                Some(more) => Some(more),
+                None => {
+                    return Err(Error::new(
+                        Code::WrongType,
+                        "wrong type of path value - expected string",
+                    ));
+                }
+            }
+        } else if path.legacy() {
+            return Err(not_a_string());
+        } else {
+            None
+        };
+        for w in &was {
+            match (w, more) {
+                (Some(was), Some(more)) => {
+                    let mut joined = Vec::with_capacity(was.len() + more.len());
+                    joined.extend_from_slice(was);
+                    joined.extend_from_slice(more);
+                    let mut b = Builder::new();
+                    b.text_bytes(&joined)?;
+                    made.push(Some(b.finish()?.to_vec()));
+                }
+                _ => made.push(None),
+            }
+        }
+        let mut at = Vec::new();
+        for (v, m) in hits.iter().zip(&made) {
+            if let Some(bytes) = m {
+                at.push((offset(&root, v)?, Edit::Set(bytes)));
+            }
+        }
+        edit(&root, &at)?
+    };
+    body.doc = after;
+
+    // The length is in bytes and not in characters, so appending one `é` to a
+    // two byte string answers four.
+    let lens: Vec<Option<usize>> = made
+        .iter()
+        .map(|m| {
+            m.as_ref()
+                .and_then(|b| Value::new(b))
+                .and_then(|v| v.text_bytes())
+                .map(<[u8]>::len)
+        })
+        .collect();
+    lengths(&path, &lens, Pick::Last, out);
+    Ok(())
+}
+
 // ----------------------------------------------------------------- the plumbing
 
 /// What a lookup of a document key found.
@@ -1303,6 +1618,32 @@ fn missing() -> Error {
 /// path that matched something that is not a boolean, which is one message.
 fn not_a_bool() -> Error {
     Error::new(Code::Invalid, "Path does not exist or not a bool")
+}
+
+/// What a legacy number command gets when no match was a number.
+///
+/// The wording is RedisJSON's, typo and all, and it is one line for a path that
+/// matched nothing and for one that matched a string.
+fn no_number() -> Error {
+    Error::new(
+        Code::Invalid,
+        "Path does not exist or does not contains a number",
+    )
+}
+
+/// What a legacy `JSON.STRAPPEND` gets when no match was a string.
+fn not_a_string() -> Error {
+    Error::new(Code::Invalid, "Path does not exist or not a string")
+}
+
+/// What arithmetic that ran off the end of an integer gets.
+fn overflowed() -> Error {
+    Error::new(Code::Invalid, "numeric overflow")
+}
+
+/// What arithmetic that left the real numbers gets.
+fn not_a_number() -> Error {
+    Error::new(Code::Invalid, "result is not a number")
 }
 
 /// What the commands that need a document get when there is not one.
