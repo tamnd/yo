@@ -1404,7 +1404,7 @@ impl Partitions {
         let mut look: Vec<usize> = Vec::new();
         for &p in changed {
             let centre = self.centroid(p).to_vec();
-            for q in self.near_partitions(&centre, self.tuning.sweep) {
+            for q in self.roughly_near_partitions(&centre, self.tuning.sweep) {
                 if !changed.contains(&q) && !look.contains(&q) {
                     look.push(q);
                 }
@@ -1478,6 +1478,33 @@ impl Partitions {
     /// way. Putting it through [`crate::coarse`] was tried and the recall it
     /// costs is not worth the time it saves, which the module doc there sets out
     /// with the numbers.
+    /// The `n` partitions near `x`, as far as the coarse layer can tell.
+    ///
+    /// This is only for the sweep, and the reason it is allowed there and not on
+    /// the search path is that it picks which partitions to look in rather than
+    /// what the answer is. Every member the sweep then looks at is compared
+    /// exactly against the centroids that just changed, so a neighbour the layer
+    /// missed costs a few members not moving yet rather than a member moving to
+    /// the wrong place, and the next split in that neighbourhood picks them up.
+    /// The distinction matters because an approximate decision inside the sweep
+    /// is the one thing [`crate::coarse`] says out loud must not happen.
+    fn roughly_near_partitions(&self, x: &[f32], n: usize) -> Vec<usize> {
+        if !self.coarse.ready() {
+            return self.near_partitions(x, n);
+        }
+        let mut short = Vec::new();
+        self.coarse.shortlist(x, self.dim(), &mut short);
+        let mut by: Vec<(usize, f32)> = short
+            .iter()
+            .map(|&p| (p as usize, sqdist(x, self.centroid(p as usize))))
+            .collect();
+        let n = n.min(by.len());
+        by.select_nth_unstable_by(n.saturating_sub(1), |a, b| a.1.total_cmp(&b.1));
+        by.truncate(n);
+        by.sort_by(|a, b| a.1.total_cmp(&b.1));
+        by.into_iter().map(|(p, _)| p).collect()
+    }
+
     fn near_partitions(&self, x: &[f32], n: usize) -> Vec<usize> {
         let mut by: Vec<(usize, f32)> = (0..self.postings.len())
             .map(|p| (p, sqdist(x, self.centroid(p))))
