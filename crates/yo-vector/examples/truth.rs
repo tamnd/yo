@@ -122,7 +122,7 @@ fn main() {
 struct Nearest {
     k: usize,
     /// Distance and id, ordered by distance, nearest first.
-    have: Vec<(f32, i32)>,
+    have: Vec<(f64, i32)>,
 }
 
 impl Nearest {
@@ -137,7 +137,7 @@ impl Nearest {
         self.have.clear();
     }
 
-    fn offer(&mut self, id: i32, d: f32) {
+    fn offer(&mut self, id: i32, d: f64) {
         if self.have.len() == self.k && d >= self.have[self.k - 1].0 {
             return;
         }
@@ -153,32 +153,42 @@ impl Nearest {
     }
 }
 
-/// The squared distance between two vectors of the same length.
+/// The squared distance between two vectors of the same length, in double.
+///
+/// The index measures in single precision and that is the right call there,
+/// because a distance is only ever compared with another one and the answer
+/// almost never turns on the last bit. A ground truth is the one place it does.
+/// Run in single precision against SIFT this got 9919 of the ten thousand top
+/// ten lists exactly right and the eighty one it did not were all a swap at the
+/// boundary between two neighbours whose distances agree to seven digits. The
+/// difference of two `f32` and its square are both exact in `f64`, so widening
+/// the accumulator is the whole fix, and paying twice the arithmetic once per
+/// dataset is not a trade worth thinking about.
 ///
 /// Chunked rather than indexed for the reason `src/dist.rs` sets out at length:
 /// indexing two slices by one counter leaves a bounds check in the loop body,
 /// and a branch in there stops the whole thing vectorising. This is the only
 /// arithmetic in the program and it runs a trillion times, so it is worth the
 /// four extra lines here rather than a use of an internal module.
-fn sqdist(a: &[f32], b: &[f32]) -> f32 {
+fn sqdist(a: &[f32], b: &[f32]) -> f64 {
     const LANES: usize = 8;
     let (xs, x_tail) = a.as_chunks::<LANES>();
     let (ys, y_tail) = b.as_chunks::<LANES>();
 
-    let mut totals = [0.0f32; LANES];
+    let mut totals = [0.0f64; LANES];
     for (x, y) in xs.iter().zip(ys) {
         for k in 0..LANES {
-            let d = x[k] - y[k];
+            let d = f64::from(x[k]) - f64::from(y[k]);
             totals[k] += d * d;
         }
     }
 
-    let mut sum = 0.0f32;
+    let mut sum = 0.0f64;
     for total in totals {
         sum += total;
     }
     for (x, y) in x_tail.iter().zip(y_tail) {
-        let d = x - y;
+        let d = f64::from(*x) - f64::from(*y);
         sum += d * d;
     }
     sum
