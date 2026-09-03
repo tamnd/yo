@@ -68,6 +68,23 @@
 //! comparison against three centroids and cheap, and the layer is used for the
 //! one thing that is left: [`Partitions::insert`](crate::Partitions::insert).
 //!
+//! A search does not use it either, and that one was measured rather than
+//! argued. Ranking every centroid is the fixed cost of every search, it is a
+//! cost in the dimension rather than in the probe count, and on a thousand
+//! dimensional embedding it is most of a short query: the MS-MARCO probe sweep
+//! is a straight line of about 48 microseconds a partition with a 700
+//! microsecond intercept, and the intercept is 2963 centroids at 1024
+//! dimensions, which is twelve megabytes read per query. Picking the probe head
+//! through the layer does take that intercept off, and the saving is real, 6891
+//! microseconds down to 6289 at probe 128 on a 13900K. It also takes recall at
+//! 10 from 0.8950 to 0.8312 there, and from 0.8516 to 0.7440 at probe 64,
+//! because a shortlist that holds the nearest centroid nine times in ten is not
+//! thereby a shortlist that holds the nearest hundred in the right order.
+//! Widening the shortlist to fix that is paying the ranking back a piece at a
+//! time. Ten percent of the latency for six to ten points of recall is the
+//! wrong trade in the only direction anybody runs a vector index for, so a
+//! search ranks the centroids itself and the intercept stays.
+//!
 //! # When it is not there
 //!
 //! Below [`FLOOR`] partitions there is no layer and the caller scans. A few
