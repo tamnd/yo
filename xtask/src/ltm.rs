@@ -64,6 +64,12 @@ struct Options {
     maxmemory: u64,
     times: u64,
     kind: Kind,
+    /// The command the read phase issues.
+    ///
+    /// Resolved after the whole command line has been read, because `--read`
+    /// has to be checked against `--type` and the two can arrive in either
+    /// order.
+    read: Point,
     value: usize,
     elements: usize,
     reads: u64,
@@ -82,6 +88,7 @@ impl Default for Options {
             maxmemory: 256 * 1024 * 1024,
             times: 10,
             kind: Kind::String,
+            read: Point::Get,
             value: 4096,
             elements: 16,
             reads: 100_000,
@@ -108,6 +115,10 @@ usage: cargo xtask ltm [options]
                     it is split across its elements
   --elements N      elements a collection key holds, 16 by default, and
                     ignored for a string
+  --read NAME       the command the read phase issues. One choice for
+                    every type but the sorted set, which takes ZSCORE by
+                    default and also takes ZRANK, which is the command
+                    prediction P-4 is about
   --reads N         how many point reads to issue, 100000 by default
   --seed N          the seed for the read order, 1 by default
   --yodb PATH       use this binary instead of building one
@@ -144,6 +155,7 @@ pub fn ltm() {
 
 fn parse(args: &[String]) -> Result<Option<Options>, String> {
     let mut opts = Options::default();
+    let mut read: Option<String> = None;
     let mut at = 0;
     while at < args.len() {
         let arg = args[at].as_str();
@@ -175,6 +187,7 @@ fn parse(args: &[String]) -> Result<Option<Options>, String> {
                         opts.elements = usize::try_from(number(arg, value)?)
                             .map_err(|_| format!("{value} is not an element count"))?;
                     }
+                    "--read" => read = Some(value.to_uppercase()),
                     "--reads" => opts.reads = number(arg, value)?,
                     "--seed" => opts.seed = number(arg, value)?,
                     "--value" => {
@@ -206,6 +219,24 @@ fn parse(args: &[String]) -> Result<Option<Options>, String> {
     if opts.times == 0 || opts.reads == 0 {
         return Err("--times and --reads both have to be at least one".into());
     }
+    // After the loop and not inside it, because this is the one option that
+    // depends on another one and the two can be given in either order.
+    opts.read = match &read {
+        None => opts.kind.reads()[0],
+        Some(name) => *opts
+            .kind
+            .reads()
+            .iter()
+            .find(|p| p.name() == name)
+            .ok_or_else(|| {
+                let names: Vec<&str> = opts.kind.reads().iter().map(|p| p.name()).collect();
+                format!(
+                    "a {} is not read with {name}, only with {}",
+                    opts.kind.name(),
+                    names.join(" or ")
+                )
+            })?,
+    };
     Ok(Some(opts))
 }
 
@@ -348,7 +379,7 @@ fn present(opts: &Options, r: &Report) -> bool {
         human(r.keys * opts.value as u64),
         r.keys,
         opts.kind.name(),
-        opts.kind.point_read()
+        opts.read.name()
     );
     println!(
         "memory        {} used against a {} limit, regime {}",
@@ -719,15 +750,16 @@ impl Fixtures {
     }
 
     /// Append the one command that reads element `at` of one key.
-    fn read(&self, out: &mut Vec<u8>, kind: Kind, key: &[u8], at: usize) {
-        match kind {
-            Kind::String => cmd(out, &[b"GET", key]),
-            Kind::Set => cmd(out, &[b"SISMEMBER", key, &self.parts[at]]),
-            Kind::Hash => cmd(out, &[b"HGET", key, &self.fields[at]]),
-            Kind::List => cmd(out, &[b"LINDEX", key, &self.indexes[at]]),
-            Kind::Zset => cmd(out, &[b"ZSCORE", key, &self.parts[at]]),
-            Kind::Array => cmd(out, &[b"ARGET", key, &self.indexes[at]]),
-            Kind::Stream => cmd(out, &[b"XRANGE", key, &self.ids[at], &self.ids[at]]),
+    fn read(&self, out: &mut Vec<u8>, read: Point, key: &[u8], at: usize) {
+        match read {
+            Point::Get => cmd(out, &[b"GET", key]),
+            Point::Sismember => cmd(out, &[b"SISMEMBER", key, &self.parts[at]]),
+            Point::Hget => cmd(out, &[b"HGET", key, &self.fields[at]]),
+            Point::Lindex => cmd(out, &[b"LINDEX", key, &self.indexes[at]]),
+            Point::Zscore => cmd(out, &[b"ZSCORE", key, &self.parts[at]]),
+            Point::Zrank => cmd(out, &[b"ZRANK", key, &self.parts[at]]),
+            Point::Arget => cmd(out, &[b"ARGET", key, &self.indexes[at]]),
+            Point::Xrange => cmd(out, &[b"XRANGE", key, &self.ids[at], &self.ids[at]]),
         }
     }
 }
@@ -792,7 +824,7 @@ fn reads(conn: &mut Conn, keys: u64, opts: &Options, fix: &Fixtures) -> Result<V
         // body learns to come back in pieces.
         let at = rng.below(elements) as usize;
         out.clear();
-        fix.read(&mut out, opts.kind, key.as_bytes(), at);
+        fix.read(&mut out, opts.read, key.as_bytes(), at);
         let start = Instant::now();
         conn.send(&out)?;
         let reply = conn.reply()?;
@@ -802,21 +834,16 @@ fn reads(conn: &mut Conn, keys: u64, opts: &Options, fix: &Fixtures) -> Result<V
             conn.drain(n)?;
         }
         latency.push(start.elapsed().as_micros() as u64);
-        let found = match reply {
+        match &reply {
             // The string row checks the length as well, because it is the one
             // kind whose whole value comes back and a short one would mean the
             // file handed back the wrong bytes.
-            Reply::Bulk(Some(len)) if opts.kind == Kind::String && len != opts.value => {
+            Reply::Bulk(Some(len)) if opts.kind == Kind::String && *len != opts.value => {
                 return Err(format!(
                     "{key} came back {len} bytes long instead of {}",
                     opts.value
                 ));
             }
-            Reply::Bulk(Some(_)) => true,
-            Reply::Bulk(None) => false,
-            Reply::Int(n) => n != 0,
-            Reply::Array(Some(n)) => n != 0,
-            Reply::Array(None) => false,
             Reply::Error(e) => {
                 return Err(format!(
                     "the server answered a read of {key} with an error: {e}"
@@ -825,8 +852,9 @@ fn reads(conn: &mut Conn, keys: u64, opts: &Options, fix: &Fixtures) -> Result<V
             Reply::Status => {
                 return Err(format!("the read of {key} was answered with a status"));
             }
-        };
-        if !found {
+            _ => {}
+        }
+        if !opts.read.found(&reply) {
             misses += 1;
         }
     }
@@ -927,20 +955,78 @@ impl Kind {
         }
     }
 
-    /// The command the read phase issues, for the report.
+    /// The point reads this type can be measured with, the default first.
     ///
     /// One element out of one key in every case, because the gate counts store
     /// reads a point read and a command that walks a whole collection would be
     /// answering a different question with the same arithmetic.
-    fn point_read(self) -> &'static str {
+    ///
+    /// Only the sorted set has two, and it has two because the gate names both:
+    /// the row across every type is a lookup, which is ZSCORE, and prediction
+    /// P-4 is about ZRANK, which finds the same element and then has to know
+    /// where it sits.
+    fn reads(self) -> &'static [Point] {
         match self {
-            Kind::String => "GET",
-            Kind::Set => "SISMEMBER",
-            Kind::Hash => "HGET",
-            Kind::List => "LINDEX",
-            Kind::Zset => "ZSCORE",
-            Kind::Array => "ARGET",
-            Kind::Stream => "XRANGE",
+            Kind::String => &[Point::Get],
+            Kind::Set => &[Point::Sismember],
+            Kind::Hash => &[Point::Hget],
+            Kind::List => &[Point::Lindex],
+            Kind::Zset => &[Point::Zscore, Point::Zrank],
+            Kind::Array => &[Point::Arget],
+            Kind::Stream => &[Point::Xrange],
+        }
+    }
+}
+
+/// The command one point read is issued with.
+///
+/// A command and not just a name, because the reply decides what counts as a
+/// hit and the two are not the same rule. SISMEMBER answers one for a hit and
+/// zero for a miss, so a zero there is a key that is not holding what the
+/// harness put in it. ZRANK answers the position, and a zero there is the first
+/// element and the most ordinary hit there is. Reading one rule onto the other
+/// would turn every ZRANK row into a run of misses or hide a broken one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Point {
+    Get,
+    Sismember,
+    Hget,
+    Lindex,
+    Zscore,
+    Zrank,
+    Arget,
+    Xrange,
+}
+
+impl Point {
+    /// The command name, which is what the report prints and what `--read`
+    /// takes.
+    fn name(self) -> &'static str {
+        match self {
+            Point::Get => "GET",
+            Point::Sismember => "SISMEMBER",
+            Point::Hget => "HGET",
+            Point::Lindex => "LINDEX",
+            Point::Zscore => "ZSCORE",
+            Point::Zrank => "ZRANK",
+            Point::Arget => "ARGET",
+            Point::Xrange => "XRANGE",
+        }
+    }
+
+    /// Whether this reply means the element was there.
+    fn found(self, reply: &Reply) -> bool {
+        match reply {
+            Reply::Bulk(Some(_)) => true,
+            Reply::Bulk(None) => false,
+            // The rank of the first element is zero and the answer to a
+            // membership test that missed is also zero, so which one this is
+            // depends on the command and not on the reply.
+            Reply::Int(_) if self == Point::Zrank => true,
+            Reply::Int(n) => *n != 0,
+            Reply::Array(Some(n)) => *n != 0,
+            Reply::Array(None) => false,
+            Reply::Error(_) | Reply::Status => false,
         }
     }
 }
@@ -1134,22 +1220,73 @@ mod tests {
             let o = opts(kind);
             let fix = Fixtures::new(&o);
             let at = if kind == Kind::String { 0 } else { 3 };
-            let mut out = Vec::new();
-            fix.read(&mut out, kind, b"key:0", at);
-            let text = String::from_utf8_lossy(&out).into_owned();
-            assert!(
-                text.contains(kind.point_read()),
-                "a {} read went out as {text:?} and the report calls it {}",
-                kind.name(),
-                kind.point_read()
-            );
-            assert_eq!(
-                out.iter().filter(|b| **b == b'*').count(),
-                1,
-                "a {} read is more than one command",
-                kind.name()
-            );
+            // Every read the type offers and not just the default one, so a
+            // second one added to a type cannot go out as the first one.
+            for read in kind.reads() {
+                let mut out = Vec::new();
+                fix.read(&mut out, *read, b"key:0", at);
+                let text = String::from_utf8_lossy(&out).into_owned();
+                assert!(
+                    text.contains(read.name()),
+                    "a {} read went out as {text:?} and the report calls it {}",
+                    kind.name(),
+                    read.name()
+                );
+                assert_eq!(
+                    out.iter().filter(|b| **b == b'*').count(),
+                    1,
+                    "a {} read is more than one command",
+                    kind.name()
+                );
+            }
         }
+    }
+
+    /// The trap the second read on a type walks into. SISMEMBER answers one for
+    /// a hit and zero for a miss, so a zero there is a key that is not holding
+    /// what the harness put in it. ZRANK answers the position, so a zero there
+    /// is the first element and the most ordinary hit there is. One rule read
+    /// onto the other turns every ZRANK row into a run of misses and stops the
+    /// run before it reports anything.
+    #[test]
+    fn a_rank_of_zero_is_the_first_element_and_not_a_miss() {
+        assert!(Point::Zrank.found(&Reply::Int(0)));
+        assert!(Point::Zrank.found(&Reply::Int(41)));
+        assert!(!Point::Sismember.found(&Reply::Int(0)));
+        assert!(Point::Sismember.found(&Reply::Int(1)));
+        // And a key that is not there is a miss for both of them.
+        assert!(!Point::Zrank.found(&Reply::Bulk(None)));
+        assert!(!Point::Zscore.found(&Reply::Bulk(None)));
+    }
+
+    /// `--read` names a command, and a command that does not read the type
+    /// under test is a mistake worth stopping for rather than one to fall back
+    /// from. Falling back would run the whole load, minutes of it, and then
+    /// report a row the caller did not ask for.
+    #[test]
+    fn a_read_that_does_not_fit_the_type_is_refused() {
+        let args = |kind: &str, read: &str| {
+            ["--type", kind, "--read", read]
+                .iter()
+                .map(|s| s.to_string())
+                .collect::<Vec<_>>()
+        };
+        let opts = parse(&args("zset", "zrank"))
+            .expect("zrank reads a zset")
+            .expect("not the help");
+        assert_eq!(opts.read, Point::Zrank);
+        // The default is the first one the type lists, whichever order the
+        // options arrived in.
+        let opts = parse(&args("zset", "zscore")).unwrap().unwrap();
+        assert_eq!(opts.read, Point::Zscore);
+        let mut swapped = vec!["--read".to_string(), "zrank".to_string()];
+        swapped.extend(["--type".to_string(), "zset".to_string()]);
+        assert_eq!(parse(&swapped).unwrap().unwrap().read, Point::Zrank);
+
+        let err = parse(&args("set", "zrank"))
+            .err()
+            .expect("a set is not read with ZRANK");
+        assert!(err.contains("SISMEMBER"), "{err}");
     }
 
     #[test]
