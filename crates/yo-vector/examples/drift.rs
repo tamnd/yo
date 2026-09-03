@@ -65,7 +65,7 @@ const K: usize = 10;
 fn main() {
     let mut args = std::env::args().skip(1);
     let Some(dir) = args.next() else {
-        eprintln!("usage: drift <sift directory> [hours] [queries]");
+        eprintln!("usage: drift <dataset directory> [hours] [queries]");
         std::process::exit(2);
     };
     let hours: f64 = args.next().map_or(24.0, |a| {
@@ -79,10 +79,12 @@ fn main() {
             .expect("the third argument is a number of queries")
     });
 
+    let set = prefix(&dir);
+
     let t = Instant::now();
-    let (dim, data) = read_vecs::<f32>(&format!("{dir}/sift_base.fvecs"));
-    let (qdim, query) = read_vecs::<f32>(&format!("{dir}/sift_query.fvecs"));
-    let (gdim, truth) = read_vecs::<i32>(&format!("{dir}/sift_groundtruth.ivecs"));
+    let (dim, data) = read_vecs::<f32>(&format!("{dir}/{set}_base.fvecs"));
+    let (qdim, query) = read_vecs::<f32>(&format!("{dir}/{set}_query.fvecs"));
+    let (gdim, truth) = read_vecs::<i32>(&format!("{dir}/{set}_groundtruth.ivecs"));
     assert_eq!(dim, qdim, "base and query dimensions differ");
     let n = data.len() / dim;
     let queries = queries.min(query.len() / dim);
@@ -181,6 +183,16 @@ fn row(
         quantile(0.50),
         quantile(0.99)
     );
+}
+
+/// What the three files in a directory are called, which every dataset
+/// published in this format names after itself, so `sift/` holds
+/// `sift_base.fvecs` and `gist/` holds `gist_base.fvecs`.
+fn prefix(dir: &str) -> &str {
+    dir.trim_end_matches('/')
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(dir)
 }
 
 /// One `fvecs` or `ivecs` file, as the dimension and every vector end to end.
