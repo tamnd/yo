@@ -998,15 +998,29 @@ fn info(server: &Server, args: Args<'_>, out: &mut Out) {
             );
         }
         if want("stats") {
+            // The cold counters live here and not in the memory section,
+            // because they are totals since the server started and everything
+            // in that section is a level right now. `yo_cold_faults` over the
+            // point reads a run issued is the ratio G9 is a gate on, and it
+            // cannot be worked out from outside the server.
+            let cold = server.cold_stats();
             let _ = write!(
                 s,
                 "# Stats\r\ntotal_connections_received:{}\r\n\
                  total_commands_processed:{}\r\nexpired_keys:{}\r\n\
-                 evicted_keys:{}\r\n\r\n",
+                 evicted_keys:{}\r\nyo_cold_demoted:{}\r\nyo_cold_promoted:{}\r\n\
+                 yo_cold_faults:{}\r\nyo_cold_served:{}\r\nyo_cold_bytes_out:{}\r\n\
+                 yo_cold_bytes_in:{}\r\n\r\n",
                 server.stats.connections,
                 server.stats.commands,
                 server.expired_keys(),
                 server.evicted_keys(),
+                cold.demoted,
+                cold.promoted,
+                cold.faults,
+                cold.served,
+                cold.bytes_out,
+                cold.bytes_in,
             );
         }
         if want("cpu") {

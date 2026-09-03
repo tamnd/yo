@@ -867,6 +867,20 @@ mod tests {
             // key and this says none of the other ones were dropped on the way.
             let stats = info(&mut client, "stats");
             assert_eq!(field(&stats, "evicted_keys"), "0", "keys were thrown away");
+
+            // G9 in miniature. The working set here is four times memory rather
+            // than the ten the gate asks for, so this is not the gate, but the
+            // shape of the number is the same: a point read off the file should
+            // cost about one fault and not several. A read that faults twice is
+            // a chain being walked or a value being promoted and demoted again
+            // in the same pass, and both of those show up here first.
+            let count = |name| field(&stats, name).parse::<u64>().expect("a number");
+            let (demoted, faults) = (count("yo_cold_demoted"), count("yo_cold_faults"));
+            assert!(demoted > 0, "nothing was demoted\n{stats}");
+            assert!(
+                faults <= KEYS as u64 * 105 / 100,
+                "{faults} faults for {KEYS} reads\n{stats}"
+            );
             client.write_all(&cmd(&[b"DBSIZE"])).expect("sent");
             assert_eq!(
                 read_exact(&mut client, format!(":{KEYS}\r\n").len()),

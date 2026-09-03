@@ -612,6 +612,36 @@ impl Server {
         self.dbs.iter().filter_map(Keyspace::store_bytes).sum()
     }
 
+    /// What the file has been asked to do, added up over every database.
+    ///
+    /// Counters and not levels, so they only ever go up and a run is the
+    /// difference between two readings. G9 is a ratio over these: the faults a
+    /// run took, divided by the point reads it issued, has to come out at 1.05
+    /// or less with a working set ten times memory. There is no way to work that
+    /// out from outside the server, so it is reported rather than inferred.
+    ///
+    /// A fault is a read that went to the store. Whether it also went to the
+    /// device depends on the store: a log serves a read out of a resident page
+    /// without touching anything. At ten times memory almost every fault is a
+    /// real read, which is why the gate is written against this number, but the
+    /// two are not the same thing and a run tight against the bar should be
+    /// checked against what the operating system says.
+    #[must_use]
+    pub fn cold_stats(&self) -> yo_kv::tier::Stats {
+        let mut total = yo_kv::tier::Stats::default();
+        for db in &self.dbs {
+            let Some(tier) = db.tier() else { continue };
+            let s = tier.stats();
+            total.demoted += s.demoted;
+            total.promoted += s.promoted;
+            total.faults += s.faults;
+            total.served += s.served;
+            total.bytes_out += s.bytes_out;
+            total.bytes_in += s.bytes_in;
+        }
+        total
+    }
+
     /// Which way this server answers a memory limit, in one word for `INFO`.
     ///
     /// `evict` is Redis: a memory limit throws keys away. `migrate` is the
