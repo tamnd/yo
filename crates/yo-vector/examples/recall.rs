@@ -82,7 +82,9 @@ impl Vectors for Base {
 fn main() {
     let mut args = std::env::args().skip(1);
     let Some(dir) = args.next() else {
-        eprintln!("usage: recall <dataset directory> [queries] [highest probe] [spill] [slack]");
+        eprintln!(
+            "usage: recall <dataset directory> [queries] [highest probe] [spill] [slack] [posting]"
+        );
         std::process::exit(2);
     };
     // Ten thousand queries at a millisecond each is ten seconds a row and there
@@ -111,6 +113,14 @@ fn main() {
     });
     let slack: f32 = args.next().map_or(Tuning::default().slack, |a| {
         a.parse().expect("slack is a fraction")
+    });
+    // The posting size comes with them, because replication makes more entries
+    // and a posting is sized in entries, so a run that only turns `spill` up is
+    // also a run with three times the partitions and a probe that reads a third
+    // of the share of the index it used to. Raising this alongside it is how the
+    // two runs get compared at the same shape.
+    let posting: usize = args.next().map_or(Tuning::default().posting, |a| {
+        a.parse().expect("posting is a size")
     });
     let set = prefix(&dir);
 
@@ -142,6 +152,7 @@ fn main() {
         let mut tuning = Tuning::default();
         tuning.spill = spill;
         tuning.slack = slack;
+        tuning.posting = posting;
         let mut ix = Partitions::new(dim, bits, 0x51f7, tuning);
         let mut buf = vec![0f32; dim];
         for id in 0..n as u64 {
@@ -158,7 +169,7 @@ fn main() {
         let rate = n as f64 / built.as_secs_f64();
         println!();
         println!(
-            "{bits:?} bit, spill {spill} slack {slack}, {} partitions, {:.3} copies a vector, built in {built:?}, {:.0} vectors a second on one core",
+            "{bits:?} bit, spill {spill} slack {slack} posting {posting}, {} partitions, {:.3} copies a vector, built in {built:?}, {:.0} vectors a second on one core",
             ix.partitions(),
             ix.entries() as f64 / ix.len() as f64,
             rate

@@ -654,17 +654,40 @@ impl Partitions {
     /// The partitions a vector goes into, nearest first.
     ///
     /// The first is the one it belongs to and there is always exactly one of
-    /// those. The rest are the boundary copies [`Tuning::spill`] is about, and
-    /// they are picked the way SPANN picks them, with the rule that keeps the
-    /// replication factor down doing most of the work.
+    /// those. The rest are the boundary copies [`Tuning::spill`] is about: every
+    /// further partition whose centroid is within [`Tuning::slack`] of the
+    /// nearest one, up to `spill` of them in total.
     ///
-    /// A candidate is dropped if some partition already chosen is nearer to it
-    /// than the vector is. That reads oddly and it is the whole trick: a
-    /// candidate on the far side of one already taken adds a copy in a direction
-    /// that is already covered, and a query that would reach the candidate would
-    /// have reached the one already taken first. Without it, `slack` alone puts
-    /// a vector into every partition in a dense neighbourhood and the index
-    /// doubles in size for recall it already had.
+    /// # The rule that is not here
+    ///
+    /// SPANN has a third condition, and it was written, measured and taken out
+    /// again. It drops a candidate if some partition already chosen is nearer to
+    /// it than the vector is, on the grounds that a candidate on the far side of
+    /// one already taken adds a copy in a direction that is already covered.
+    /// That is the rule that keeps SPANN's replication factor down.
+    ///
+    /// It rejects every candidate there is at a thousand dimensions. On two
+    /// hundred thousand generated 1024 dimensional vectors in 528 partitions,
+    /// the copy rate with the rule in is 1.0000 at every setting of `spill` and
+    /// `slack` that was tried, and without it 2.85 at a `spill` of 4 and 5.08 at
+    /// 8. A million MS-MARCO passages say the same thing from the other end:
+    /// 1.000 copies a vector at `spill` 4 and 1.001 at `spill` 8 with `slack` at
+    /// 0.60, which is a feature that is switched on and doing nothing.
+    ///
+    /// The reason is the one [`coarse`](crate::coarse) already ran into.
+    /// Distances concentrate, and a centroid is the mean of a few hundred
+    /// members so it sits well inside a cloud whose radius is most of the
+    /// distance to the next centroid. Two neighbouring centroids are therefore
+    /// much closer to each other than any of their members is to either, the
+    /// condition holds for every pair, and nothing is ever copied. Keeping a
+    /// rule that fires on nothing would have left the whole feature switched on
+    /// and inert, which is worse than not having it.
+    ///
+    /// What is left holds the replication factor down instead: `spill` caps it
+    /// outright and `slack` cuts off candidates that are not really boundary
+    /// cases. On this data `spill` is what binds, because `slack` at 0.15 and at
+    /// 0.35 give copy rates of 2.8500 and 2.8452, which is the same
+    /// concentration seen from the other side.
     fn spill_into(&mut self, x: &[f32], into: &mut Vec<(usize, f32)>) {
         into.clear();
         let dim = self.dim();
@@ -707,13 +730,7 @@ impl Partitions {
             if d > ceiling {
                 break;
             }
-            let centre = &self.centroids[q * dim..(q + 1) * dim];
-            let covered = into.iter().any(|&(taken, _)| {
-                sqdist(&self.centroids[taken * dim..(taken + 1) * dim], centre) < d
-            });
-            if !covered {
-                into.push((q, d));
-            }
+            into.push((q, d));
         }
     }
 
@@ -2599,15 +2616,22 @@ mod tests {
 
     /// How many members are filed under something that is not their nearest
     /// centroid.
+    /// Asked once per member rather than once per posting entry, because a
+    /// boundary copy sits in a partition that is not the member's nearest on
+    /// purpose, and counting one as drift would read replication as the very
+    /// thing the sweep exists to undo. A member has drifted when none of the
+    /// partitions holding it is its nearest.
     fn misfiled(ix: &Partitions, store: &Store) -> usize {
         let mut buf = vec![0.0f32; ix.dim()];
         let mut wrong = 0;
-        for (p, posting) in ix.postings.iter().enumerate() {
-            for &id in &posting.ids {
-                assert!(store.get(id, &mut buf));
-                if ix.nearest(&ix.quant.rotate(&buf)) != p {
-                    wrong += 1;
-                }
+        for id in 0..store.0.len() as u64 {
+            if !ix.contains(id) {
+                continue;
+            }
+            assert!(store.get(id, &mut buf));
+            let near = ix.nearest(&ix.quant.rotate(&buf));
+            if ix.placed_at(id, near).is_none() {
+                wrong += 1;
             }
         }
         wrong
