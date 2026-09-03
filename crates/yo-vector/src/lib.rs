@@ -51,6 +51,13 @@
 //! per partition probed, so rotating the centroids once when they are built
 //! turns tens of rotations a search into one.
 //!
+//! [`Collection`] is the piece above that, and it is the one both doors reach.
+//! [`Partitions`] deals in ids and knows nothing about the key a client wrote a
+//! vector under, what metric the collection was opened with, or where the full
+//! precision vectors live, because none of those are the index's business.
+//! `db.vectors()` in a Rust program and `VADD` off a socket both need all three,
+//! so they are answered once here rather than twice above.
+//!
 //! A filter runs inside the posting scan rather than after it. Every member
 //! carries a tag word beside its code, and a scan that can reject a member
 //! before it measures one can keep going into further partitions until it has
@@ -83,6 +90,7 @@
 #![deny(missing_docs)]
 
 pub(crate) mod coarse;
+pub mod collection;
 pub(crate) mod dist;
 pub mod hnsw;
 pub mod muvera;
@@ -90,6 +98,7 @@ pub mod partition;
 pub mod rabitq;
 pub mod rotate;
 
+pub use collection::{Collection, Match};
 pub use partition::{Any, Filter, Hit, Partitions, Signature, Tuning, Vectors};
 pub use rabitq::{Bits, Coded, Quantizer, Query};
 pub use rotate::Rotation;

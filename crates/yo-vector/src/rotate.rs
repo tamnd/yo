@@ -71,6 +71,7 @@ const INV_ROOT2: f32 = core::f32::consts::FRAC_1_SQRT_2;
 /// The pairs are stored rather than the permutation they came from, because
 /// rotating in place off a pair list is one pass over the vector and no scratch
 /// buffer, where a permutation would want somewhere to write the shuffled copy.
+#[derive(Debug)]
 struct Round {
     /// The sign mask for every coordinate, either nothing or the top bit, ready
     /// to be exclusive ored straight into the float.
@@ -87,6 +88,7 @@ struct Round {
 }
 
 /// A random orthogonal transform, rebuilt from its seed rather than stored.
+#[derive(Debug)]
 pub struct Rotation {
     dim: usize,
     seed: u64,

@@ -114,7 +114,7 @@ pub(crate) enum Data {
     Graph(Box<crate::graph::Store>),
     /// Boxed for the same reason again: a vector collection carries the
     /// partitions, the codes under them and every full precision vector.
-    Vectors(Box<crate::vector::Store>),
+    Vectors(Box<yo_vector::Collection>),
 }
 
 impl Data {
@@ -212,7 +212,7 @@ impl Data {
     ///
     /// The same as [`Data::map`].
     #[track_caller]
-    pub(crate) fn vectors(&self) -> &crate::vector::Store {
+    pub(crate) fn vectors(&self) -> &yo_vector::Collection {
         match self {
             Data::Vectors(v) => v,
             _ => wrong_kind(),
@@ -225,7 +225,7 @@ impl Data {
     ///
     /// The same as [`Data::map`].
     #[track_caller]
-    pub(crate) fn vectors_mut(&mut self) -> &mut crate::vector::Store {
+    pub(crate) fn vectors_mut(&mut self) -> &mut yo_vector::Collection {
         match self {
             Data::Vectors(v) => v,
             _ => wrong_kind(),
@@ -535,8 +535,8 @@ impl Db {
         dim: usize,
         metric: yo_shape::Metric,
     ) -> Result<Vectors> {
-        let width = crate::vector::dimension(dim)?;
-        crate::vector::metric(metric)?;
+        let width = yo_vector::collection::width(dim)?;
+        yo_vector::collection::check_metric(metric)?;
 
         let mut desc = Desc::new();
         desc.vector(width, metric);
@@ -552,7 +552,7 @@ impl Db {
                         inner.collections.push(Collection {
                             name: name.to_owned(),
                             desc,
-                            data: Data::Vectors(Box::new(crate::vector::Store::new(dim, metric))),
+                            data: Data::Vectors(Box::new(yo_vector::Collection::new(dim, metric)?)),
                         });
                         Ok(inner.collections.len() - 1)
                     }

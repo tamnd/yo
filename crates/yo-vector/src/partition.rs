@@ -351,7 +351,7 @@ struct Slot {
 
 /// One partition's members: the ids, their codes end to end, and what each code
 /// needs beside it.
-#[derive(Default)]
+#[derive(Debug, Default)]
 struct Posting {
     ids: Vec<u64>,
     /// One tag per member, in the same order, which is what a filter meets.
@@ -375,6 +375,7 @@ impl Posting {
 }
 
 /// A collection of vectors, quantised, partitioned, and updated in place.
+#[derive(Debug)]
 pub struct Partitions {
     quant: Quantizer,
     tuning: Tuning,

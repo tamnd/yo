@@ -174,6 +174,7 @@ pub struct Coded {
 }
 
 /// The quantiser for one collection: its rotation and its width.
+#[derive(Debug)]
 pub struct Quantizer {
     rot: Rotation,
     bits: Bits,
@@ -405,6 +406,7 @@ impl Quantizer {
 
 /// A query, rotated and quantised once and then measured against every code in
 /// a partition.
+#[derive(Debug)]
 pub struct Query {
     /// The width of the codes this is measured against, so the scan knows how
     /// many planes each one has.
