@@ -1598,6 +1598,17 @@ impl Keyspace {
                     false
                 }
             },
+            Kind::Array => match self.arrays.get(slot) {
+                Some(body) if body.memory_bytes() > grows_by => {
+                    body.freeze(buf);
+                    true
+                }
+                Some(_) => false,
+                None => {
+                    debug_assert!(false, "an array record with no array behind it");
+                    false
+                }
+            },
             _ => {
                 debug_assert!(false, "a kind `moves` said yes to and this does not know");
                 false
@@ -1623,6 +1634,9 @@ impl Keyspace {
             }
             Kind::Zset => {
                 self.zsets.remove(slot);
+            }
+            Kind::Array => {
+                self.arrays.remove(slot);
             }
             _ => debug_assert!(false, "freeing a slot in a slab that was never found"),
         }
@@ -1721,6 +1735,13 @@ impl Keyspace {
                         .with_detail(e.to_string())
                 })?;
                 self.zsets.insert(zset)
+            }
+            Kind::Array => {
+                let array = Array::thaw(&self.frozen).map_err(|e| {
+                    Error::new(Code::Corrupt, "a demoted array did not read back")
+                        .with_detail(e.to_string())
+                })?;
+                self.arrays.insert(array)
             }
             // Nothing else is written cold with a body yet, so arriving here
             // means a record that says one thing and a demoter that did another.
@@ -2367,7 +2388,10 @@ impl Keyspace {
 /// the way back. A kind that is not in here stays in memory, which costs a
 /// demotion that did not happen and is never a wrong answer.
 const fn moves(kind: Kind) -> bool {
-    matches!(kind, Kind::Set | Kind::Hash | Kind::List | Kind::Zset)
+    matches!(
+        kind,
+        Kind::Set | Kind::Hash | Kind::List | Kind::Zset | Kind::Array
+    )
 }
 
 /// What Redis says when a command is sent at a key holding another type.

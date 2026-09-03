@@ -54,6 +54,8 @@ use std::cmp::Ordering;
 use yo_common::num;
 use yo_common::{Code, Error, Result};
 
+use crate::frozen::{self, Broken};
+
 /// How many indices one slice covers.
 ///
 /// Redis's `AR_SLICE_SIZE_DEFAULT`, and unlike Redis it is not configurable,
@@ -76,6 +78,15 @@ const SPARSE_MAX: usize = 10;
 /// equal to it so that a slice sitting on the line does not rebuild itself on
 /// every other write.
 const SPARSE_MIN: usize = 5;
+
+/// The directory and its slices, which is the only form an array is written in.
+const FORM_SLICES: u8 = 1;
+/// On the form byte, that the insert cursor has been set and follows it.
+const HAS_INSERT: u8 = 0x80;
+/// A slice held as offsets and words.
+const LAYOUT_SPARSE: u8 = 1;
+/// A slice held as a window.
+const LAYOUT_DENSE: u8 = 2;
 
 /// The largest index an array will accept.
 ///
@@ -326,6 +337,13 @@ impl Slice {
     /// compaction.
     fn words_mut(&mut self) -> &mut [Word] {
         match &mut self.layout {
+            Layout::Sparse { words, .. } | Layout::Dense { words, .. } => words,
+        }
+    }
+
+    /// The same walk, for the one that only reads: freezing the blob.
+    fn words(&self) -> &[Word] {
+        match &self.layout {
             Layout::Sparse { words, .. } | Layout::Dense { words, .. } => words,
         }
     }
@@ -1049,6 +1067,132 @@ impl Array {
             + self.blob.capacity()
     }
 
+    /// Write this array out in a form a device can hold.
+    ///
+    /// The directory goes out as it stands, slice by slice and word by word,
+    /// rather than as the index and value pairs a client would see. Rebuilding
+    /// from pairs would go through [`Array::set`], and the layout a slice ends up
+    /// in depends on the order it was written in as well as on what is in it, so
+    /// a slice that had been filled and partly emptied would come back sparse
+    /// where it went out dense. `ARINFO` reports that split, so an array whose
+    /// layout changed because it was quiet long enough to be demoted would be an
+    /// array whose answers depend on memory pressure.
+    ///
+    /// The blob is written live bytes only, in the order the words are walked in,
+    /// so a demotion is also a compaction and the dead space does not reach the
+    /// device. It goes in front of the directory because a word carries where its
+    /// value starts, and reading the blob first is what lets every one of those
+    /// be checked as it arrives rather than in a second pass.
+    pub fn freeze(&self, out: &mut Vec<u8>) {
+        out.push(match self.insert {
+            Some(_) => FORM_SLICES | HAS_INSERT,
+            None => FORM_SLICES,
+        });
+        if let Some(at) = self.insert {
+            frozen::put_uint(out, at);
+        }
+        frozen::put_uint(out, self.count);
+
+        // The live length is known without a walk, which is the same subtraction
+        // `compact` sizes its fresh blob with.
+        frozen::put_uint(out, (self.blob.len() - self.dead) as u64);
+        for (_, slice) in &self.slices {
+            for w in slice.words() {
+                if !w.is_empty() && w.tag() == TAG_BLOB {
+                    let (start, len) = w.blob_span();
+                    out.extend_from_slice(&self.blob[start..start + len]);
+                }
+            }
+        }
+
+        frozen::put_uint(out, self.slices.len() as u64);
+        // The same walk again, in the same order, so a value's new start is the
+        // running total of what went before it and no table has to be kept.
+        let mut at = 0usize;
+        for (id, slice) in &self.slices {
+            frozen::put_uint(out, *id);
+            match &slice.layout {
+                Layout::Sparse { offs, words } => {
+                    out.push(LAYOUT_SPARSE);
+                    frozen::put_uint(out, words.len() as u64);
+                    for (&off, &w) in offs.iter().zip(words) {
+                        frozen::put_uint(out, u64::from(off));
+                        frozen::put_uint(out, moved(w, &mut at));
+                    }
+                }
+                Layout::Dense { offset, words } => {
+                    out.push(LAYOUT_DENSE);
+                    frozen::put_uint(out, u64::from(*offset));
+                    frozen::put_uint(out, words.len() as u64);
+                    for &w in words {
+                        frozen::put_uint(out, moved(w, &mut at));
+                    }
+                }
+            }
+        }
+    }
+
+    /// Read back what [`Array::freeze`] wrote.
+    ///
+    /// Everything the rest of this file takes for granted is checked here, since
+    /// this is the one way a directory arrives without having been built by
+    /// [`Array::set`]: offsets inside a slice go up and stay under
+    /// [`SLICE_SIZE`], a sparse slice holds no holes, a dense window has a
+    /// populated word at each end, the slice ids go up, the counts add up to the
+    /// array's own, and every value in the blob is pointed at by exactly one
+    /// word. A body that fails any of them is an error, because the alternative
+    /// is an `ARGET` that reads off the end of the blob.
+    pub fn thaw(bytes: &[u8]) -> core::result::Result<Array, Broken> {
+        let mut cut = frozen::Cut::new(bytes);
+        let tag = cut.byte()?;
+        if tag & !HAS_INSERT != FORM_SLICES {
+            return Err(Broken::Form);
+        }
+        let insert = if tag & HAS_INSERT != 0 {
+            let at = cut.uint()?;
+            if at > INDEX_MAX {
+                return Err(Broken::Body);
+            }
+            Some(at)
+        } else {
+            None
+        };
+        let count = cut.uint()?;
+        let blob = cut.bytes()?.to_vec();
+
+        let n = usize::try_from(cut.uint()?).map_err(|_| Broken::Short)?;
+        // A slice costs an id, a layout byte and a length, so a count larger
+        // than what is left cannot be honest and is not worth an allocation.
+        if n > cut.rest().len() {
+            return Err(Broken::Body);
+        }
+        let mut slices: Vec<(u64, Slice)> = Vec::with_capacity(n);
+        let mut used = 0usize;
+        let mut seen = 0u64;
+        for _ in 0..n {
+            let id = cut.uint()?;
+            if id > INDEX_MAX >> SLICE_BITS {
+                return Err(Broken::Body);
+            }
+            if slices.last().is_some_and(|(last, _)| id <= *last) {
+                return Err(Broken::Body);
+            }
+            let slice = read_slice(&mut cut, blob.len(), &mut used)?;
+            seen += u64::from(slice.count);
+            slices.push((id, slice));
+        }
+        if seen != count || used != blob.len() {
+            return Err(Broken::Body);
+        }
+        Ok(Array {
+            slices,
+            blob,
+            dead: 0,
+            count,
+            insert,
+        })
+    }
+
     /// Which entry holds slice `id`, or where it would be inserted.
     fn find(&self, id: u64) -> core::result::Result<usize, usize> {
         self.slices.binary_search_by(|(have, _)| {
@@ -1240,6 +1384,115 @@ pub const VALUE_TOO_LONG: &str = "array value exceeds the one gigabyte limit";
 /// underlying problem, which is Redis's doing and worth keeping: one of them is
 /// about an index the client named and the other is about a cursor it did not.
 pub const INSERT_OVERFLOW: &str = "insert index overflow";
+
+/// A word as it should be written, with a blob value pointed at where it is
+/// about to land rather than where it used to be.
+///
+/// `at` is the running length of the frozen blob, so this is the compaction
+/// `Array::compact` does, run against a buffer that has already been written
+/// instead of against a fresh `Vec`.
+fn moved(w: Word, at: &mut usize) -> u64 {
+    if w.is_empty() || w.tag() != TAG_BLOB {
+        return w.0;
+    }
+    let (_, len) = w.blob_span();
+    let start = *at;
+    *at += len;
+    Word::from_blob(start, len).0
+}
+
+/// A word read back, checked against the blob it may be pointing into.
+///
+/// `used` counts the blob bytes claimed so far, which the caller compares with
+/// the blob's length at the end. Two words pointing at the same bytes, or a
+/// value nothing points at, both fail that comparison.
+fn read_word(
+    cut: &mut frozen::Cut<'_>,
+    blob: usize,
+    used: &mut usize,
+) -> core::result::Result<Word, Broken> {
+    let w = Word(cut.uint()?);
+    if !w.is_empty() && w.tag() == TAG_BLOB {
+        let (start, len) = w.blob_span();
+        // A blob word is only written for a value of `INLINE_MAX` and up, so a
+        // shorter one is a word that was not written by `freeze`.
+        if len <= INLINE_MAX || start + len > blob {
+            return Err(Broken::Body);
+        }
+        *used += len;
+    }
+    Ok(w)
+}
+
+/// One slice read back, in whichever layout it says it is in.
+fn read_slice(
+    cut: &mut frozen::Cut<'_>,
+    blob: usize,
+    used: &mut usize,
+) -> core::result::Result<Slice, Broken> {
+    match cut.byte()? {
+        LAYOUT_SPARSE => {
+            let n = usize::try_from(cut.uint()?).map_err(|_| Broken::Short)?;
+            // An offset and a word are a byte each at the very least, and a
+            // slice with nothing in it is dropped rather than kept.
+            if n == 0 || n > cut.rest().len() {
+                return Err(Broken::Body);
+            }
+            let mut offs: Vec<u16> = Vec::with_capacity(n);
+            let mut words = Vec::with_capacity(n);
+            for _ in 0..n {
+                let off = u16::try_from(cut.uint()?).map_err(|_| Broken::Body)?;
+                if u64::from(off) >= SLICE_SIZE {
+                    return Err(Broken::Body);
+                }
+                if offs.last().is_some_and(|last| off <= *last) {
+                    return Err(Broken::Body);
+                }
+                let w = read_word(cut, blob, used)?;
+                // Sparse holds what is there and nothing else, so an empty word
+                // in here would make `count` and the entries disagree.
+                if w.is_empty() {
+                    return Err(Broken::Body);
+                }
+                offs.push(off);
+                words.push(w);
+            }
+            Ok(Slice {
+                count: n as u16,
+                layout: Layout::Sparse { offs, words },
+            })
+        }
+        LAYOUT_DENSE => {
+            let offset = u16::try_from(cut.uint()?).map_err(|_| Broken::Body)?;
+            let n = usize::try_from(cut.uint()?).map_err(|_| Broken::Short)?;
+            if n == 0 || n > cut.rest().len() {
+                return Err(Broken::Body);
+            }
+            if u64::from(offset) + n as u64 > SLICE_SIZE {
+                return Err(Broken::Body);
+            }
+            let mut words = Vec::with_capacity(n);
+            let mut live = 0u16;
+            for _ in 0..n {
+                let w = read_word(cut, blob, used)?;
+                if !w.is_empty() {
+                    live += 1;
+                }
+                words.push(w);
+            }
+            // Trimmed at both ends, which is what makes `Slice::high` derivable
+            // rather than stored.
+            if words[0].is_empty() || words[n - 1].is_empty() {
+                return Err(Broken::Body);
+            }
+            Ok(Slice {
+                count: live,
+                layout: Layout::Dense { offset, words },
+            })
+        }
+        _ => Err(Broken::Form),
+    }
+}
 
 /// Splits an index into the slice that holds it and the offset inside.
 #[inline]
@@ -1925,5 +2178,165 @@ mod tests {
         assert_eq!(b.next_index(), Some(2));
         assert_eq!(append(&mut b, &[b"z"]).expect("room"), 2);
         assert_eq!(a.next_index(), Some(2), "and the two do not share it");
+    }
+
+    /// Freeze an array, read it back, and check that nothing about it moved.
+    fn round_trip(a: &Array) -> Array {
+        let mut buf = Vec::new();
+        a.freeze(&mut buf);
+        let back = Array::thaw(&buf).expect("what freeze wrote");
+        assert_eq!(back.count(), a.count(), "the population");
+        assert_eq!(back.len(), a.len(), "the high water mark");
+        assert_eq!(back.next_index(), a.next_index(), "the insert cursor");
+        assert_eq!(back.slices.len(), a.slices.len(), "the slice count");
+        for ((id, was), (back_id, now)) in a.slices.iter().zip(&back.slices) {
+            assert_eq!(id, back_id, "the slice ids");
+            assert_eq!(was.count, now.count, "slice {id} holds the same number");
+            assert_eq!(
+                matches!(was.layout, Layout::Dense { .. }),
+                matches!(now.layout, Layout::Dense { .. }),
+                "slice {id} came back in the layout it left in"
+            );
+        }
+        assert_eq!(
+            scan(&back, 0, u64::MAX, usize::MAX),
+            scan(a, 0, u64::MAX, usize::MAX)
+        );
+        back
+    }
+
+    #[test]
+    fn a_frozen_array_comes_back_with_every_value_it_held() {
+        let mut a = Array::new();
+        // One of each of the four things a word can be, and a long value that
+        // has to live in the blob.
+        set(&mut a, 0, b"12345");
+        set(&mut a, 1, b"1.5");
+        set(&mut a, 2, b"short");
+        set(
+            &mut a,
+            3,
+            b"a value well past the seven bytes a word can inline",
+        );
+        set(&mut a, 9_000_000_000_000, b"a long way up the index space");
+        let back = round_trip(&a);
+        assert_eq!(read(&back, 0).as_deref(), Some(&b"12345"[..]));
+        assert_eq!(read(&back, 1).as_deref(), Some(&b"1.5"[..]));
+        assert_eq!(read(&back, 2).as_deref(), Some(&b"short"[..]));
+        assert_eq!(
+            read(&back, 3).as_deref(),
+            Some(&b"a value well past the seven bytes a word can inline"[..])
+        );
+        assert_eq!(
+            read(&back, 9_000_000_000_000).as_deref(),
+            Some(&b"a long way up the index space"[..])
+        );
+        assert_eq!(read(&back, 4), None, "and a hole is still a hole");
+        assert_eq!(back.get(0), Some(Element::Int(12345)), "still an integer");
+        assert_eq!(back.get(1), Some(Element::Float(1.5)), "still a double");
+
+        round_trip(&Array::new());
+    }
+
+    #[test]
+    fn both_layouts_come_back_in_the_layout_they_left_in() {
+        // Dense, which is eleven consecutive positions.
+        let mut dense = Array::new();
+        for i in 0..=SPARSE_MAX as u64 {
+            set(&mut dense, i, b"x");
+        }
+        assert!(matches!(dense.slices[0].1.layout, Layout::Dense { .. }));
+        round_trip(&dense);
+
+        // Dense with holes punched in the middle, which is the case a rebuild
+        // through `set` would have brought back sparse.
+        let mut holed = dense.clone();
+        for i in 2..5 {
+            holed.del(i);
+        }
+        assert!(matches!(holed.slices[0].1.layout, Layout::Dense { .. }));
+        assert_eq!(holed.count(), 8);
+        let back = round_trip(&holed);
+        assert_eq!(read(&back, 1).as_deref(), Some(&b"x"[..]));
+        assert_eq!(read(&back, 4), None);
+
+        // Sparse, which is elements too far apart to be worth a window.
+        let mut sparse = Array::new();
+        for i in 0..40 {
+            set(&mut sparse, i * 100, b"x");
+        }
+        assert!(matches!(sparse.slices[0].1.layout, Layout::Sparse { .. }));
+        round_trip(&sparse);
+    }
+
+    #[test]
+    fn freezing_an_array_leaves_the_dead_blob_bytes_behind() {
+        let mut a = Array::new();
+        let long = vec![b'v'; 200];
+        // Written and overwritten enough times that most of the blob is dead,
+        // and under the floor that would have compacted it in place.
+        for _ in 0..8 {
+            set(&mut a, 0, &long);
+        }
+        assert!(a.dead > 0, "there is dead space to leave behind");
+        let mut buf = Vec::new();
+        a.freeze(&mut buf);
+        let back = Array::thaw(&buf).expect("what freeze wrote");
+        assert_eq!(back.dead, 0, "a demotion is a compaction");
+        assert_eq!(back.blob.len(), a.blob.len() - a.dead);
+        assert_eq!(read(&back, 0).as_deref(), Some(&long[..]));
+        assert!(
+            buf.len() < a.blob.len(),
+            "and the dead bytes never went out"
+        );
+    }
+
+    #[test]
+    fn a_frozen_array_keeps_the_insert_cursor() {
+        let mut a = Array::new();
+        append(&mut a, &[b"x", b"y", b"z"]).expect("room");
+        let mut back = round_trip(&a);
+        assert_eq!(back.next_index(), Some(3));
+        assert_eq!(append(&mut back, &[b"w"]).expect("room"), 3);
+
+        // And an array that nothing has appended to comes back without one, so
+        // its first append still lands at zero.
+        let mut untouched = Array::new();
+        set(&mut untouched, 99, b"x");
+        let mut back = round_trip(&untouched);
+        assert_eq!(back.next_index(), Some(0), "a cursor nothing has moved");
+        assert_eq!(append(&mut back, &[b"first"]).expect("room"), 0);
+    }
+
+    #[test]
+    fn a_frozen_array_that_arrives_damaged_is_an_error_and_not_a_panic() {
+        let mut a = Array::new();
+        for i in 0..200u64 {
+            set(
+                &mut a,
+                i * 7,
+                format!("value:{i:04} and enough bytes to reach the blob").as_bytes(),
+            );
+        }
+        let mut buf = Vec::new();
+        a.freeze(&mut buf);
+        assert!(Array::thaw(&buf).is_ok(), "the body it wrote reads back");
+
+        assert!(Array::thaw(&[]).is_err(), "nothing at all");
+        assert!(Array::thaw(&[99]).is_err(), "a form nobody wrote");
+        for cut in 1..buf.len().min(96) {
+            assert!(Array::thaw(&buf[..cut]).is_err(), "cut at {cut}");
+        }
+        // Every single byte flipped in the header and the first slice, which is
+        // where a length, a layout byte and a word all live.
+        for at in 0..buf.len().min(96) {
+            for bit in 0..8 {
+                let mut bad = buf.clone();
+                bad[at] ^= 1 << bit;
+                // Whatever it decides, it decides without reading off the end of
+                // the blob and without a subtraction going backwards.
+                let _ = Array::thaw(&bad);
+            }
+        }
     }
 }
