@@ -258,7 +258,7 @@ impl Ranker {
         // rather than a sort, because the order inside the shortlist is about to
         // be thrown away and replaced with the real one.
         let by_estimate = |a: &(usize, f32), b: &(usize, f32)| a.1.total_cmp(&b.1);
-        let wide = (want * WIDEN).max(LEAST).min(CEILING).min(n);
+        let wide = (want * WIDEN).clamp(LEAST, CEILING).min(n);
         let mut by: Vec<(usize, f32)> = scores.iter().copied().enumerate().collect();
         by.select_nth_unstable_by(wide - 1, by_estimate);
         // Past the shortlist the estimate is the answer, so that part needs
@@ -541,7 +541,9 @@ mod tests {
                         let u = &queries[i * dim..(i + 1) * dim];
                         let head = truth(u, &centroids, dim, n, want);
                         let mut scores = vec![0.0; n];
-                        coder.query_rotated(u, &mean).scan(&codes, &meta, &mut scores);
+                        coder
+                            .query_rotated(u, &mean)
+                            .scan(&codes, &meta, &mut scores);
                         let mut order: Vec<usize> = (0..n).collect();
                         order.sort_by(|&a, &b| scores[a].total_cmp(&scores[b]));
                         let mut place = vec![0usize; n];

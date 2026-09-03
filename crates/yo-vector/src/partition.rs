@@ -145,9 +145,9 @@ use std::collections::HashMap;
 use yo_common::{Code, Error, Result};
 
 use crate::coarse::Coarse;
-use crate::rank::Ranker;
 use crate::dist::sqdist;
 use crate::rabitq::{Bits, Coded, Quantizer};
+use crate::rank::Ranker;
 
 /// Where the full precision vectors live.
 ///
