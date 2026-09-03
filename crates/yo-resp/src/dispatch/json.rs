@@ -115,6 +115,15 @@ pub(super) fn execute(db: &mut Keyspace, spec: &Spec, args: Args<'_>, out: &mut 
         "json.type" => kind(db, args, out),
         "json.toggle" => toggle(db, args, out),
         "json.clear" => clear(db, args, out),
+        "json.arrlen" => sized(db, args, out, Asked::ArrayLen),
+        "json.objlen" => sized(db, args, out, Asked::ObjectLen),
+        "json.strlen" => sized(db, args, out, Asked::TextLen),
+        "json.objkeys" => sized(db, args, out, Asked::ObjectKeys),
+        "json.arrappend" => arrappend(db, args, out),
+        "json.arrinsert" => arrinsert(db, args, out),
+        "json.arrtrim" => arrtrim(db, args, out),
+        "json.arrpop" => arrpop(db, args, out),
+        "json.arrindex" => arrindex(db, args, out),
         other => unreachable!("{other} is not a JSON command"),
     }
 }
@@ -573,6 +582,598 @@ fn word(v: &Value<'_>) -> &'static [u8] {
         Kind::Text => b"string",
         Kind::Array => b"array",
         Kind::Object => b"object",
+    }
+}
+
+// ------------------------------------------------------------- the array family
+
+/// Which of `JSON.ARRLEN`, `JSON.OBJLEN`, `JSON.STRLEN` and `JSON.OBJKEYS` is
+/// being run.
+///
+/// The four are one command with four sets of answers, and the answers do not
+/// follow a pattern. A legacy path that matched nothing is an error for
+/// `JSON.ARRLEN` and `JSON.STRLEN` and a nil for the other two. A legacy path
+/// that matched the wrong kind of value is an `ERR` for `JSON.ARRLEN` and
+/// `JSON.OBJKEYS` and a `WRONGTYPE` for the other two. A JSONPath against a key
+/// that is not there is `could not perform this operation on a key that doesn't
+/// exist` for three of them and `Path does not exist or not an object` for
+/// `JSON.OBJLEN`, which is a line about a path being sent for a missing key.
+///
+/// None of that is a simplification of RedisJSON and none of it is a guess. It
+/// was read off a running module one command at a time, because a client that
+/// branches on the error text is the entire reason this file exists.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Asked {
+    ArrayLen,
+    ObjectLen,
+    TextLen,
+    ObjectKeys,
+}
+
+impl Asked {
+    /// The kind of value the path is supposed to name.
+    fn kind(self) -> Kind {
+        match self {
+            Asked::ArrayLen => Kind::Array,
+            Asked::ObjectLen | Asked::ObjectKeys => Kind::Object,
+            Asked::TextLen => Kind::Text,
+        }
+    }
+
+    /// Whether a legacy path that matched nothing answers nil rather than an
+    /// error.
+    fn quiet(self) -> bool {
+        matches!(self, Asked::ObjectLen | Asked::ObjectKeys)
+    }
+
+    /// What a legacy path that matched the wrong kind of value gets.
+    fn wrong(self) -> Error {
+        match self {
+            Asked::ArrayLen => Error::new(Code::Invalid, "Path does not exist or not an array"),
+            Asked::ObjectKeys => Error::new(Code::Invalid, "Path does not exist or not an object"),
+            Asked::ObjectLen => Error::new(
+                Code::WrongType,
+                "wrong type of path value - expected object",
+            ),
+            Asked::TextLen => Error::new(
+                Code::WrongType,
+                "wrong type of path value - expected string",
+            ),
+        }
+    }
+
+    /// What a JSONPath against a key that is not there gets.
+    fn no_key(self) -> Error {
+        match self {
+            Asked::ObjectLen => Error::new(Code::Invalid, "Path does not exist or not an object"),
+            _ => no_key(),
+        }
+    }
+
+    /// The answer for one match, which is a count for three of them and the
+    /// keys themselves for the fourth.
+    ///
+    /// A document written through this file never has its keys interned, since
+    /// interning is a collection's table and there is no collection here, so
+    /// [`Value::key_at`] always answers. The fallback is there because the type
+    /// allows the other case rather than because anything reaches it.
+    fn one(self, v: &Value<'_>, out: &mut Out) {
+        match self {
+            Asked::TextLen => out.int(v.text_bytes().unwrap_or_default().len() as i64),
+            Asked::ArrayLen | Asked::ObjectLen => out.int(v.len() as i64),
+            Asked::ObjectKeys => {
+                out.array(v.len());
+                for i in 0..v.len() {
+                    out.bulk(v.key_at(i).unwrap_or_default());
+                }
+            }
+        }
+    }
+}
+
+/// `JSON.ARRLEN`, `JSON.OBJLEN`, `JSON.STRLEN` and `JSON.OBJKEYS`.
+fn sized(db: &mut Keyspace, args: Args<'_>, out: &mut Out, asked: Asked) -> Result<()> {
+    let key = args.get(1);
+    let raw = args.opt(2).unwrap_or(ROOT);
+    let path = Path::parse(raw)?;
+    let body = match doc(db, key, out)? {
+        Doc::Wrong => return Ok(()),
+        // A legacy path against a missing key is a nil and a JSONPath against
+        // one is an error, which is the opposite way round from everywhere else
+        // in this file and is what the module does.
+        Doc::Gone if path.legacy() => {
+            out.nil();
+            return Ok(());
+        }
+        Doc::Gone => return Err(asked.no_key()),
+        Doc::Here(body) => body,
+    };
+    let root = readable(&body.doc)?;
+    let mut hits = Vec::new();
+    path.select(&root, &mut hits);
+    if path.legacy() {
+        let Some(v) = hits.first() else {
+            if asked.quiet() {
+                out.nil();
+                return Ok(());
+            }
+            return Err(missing());
+        };
+        if v.kind() != asked.kind() {
+            return Err(asked.wrong());
+        }
+        asked.one(v, out);
+        return Ok(());
+    }
+    out.array(hits.len());
+    for v in &hits {
+        if v.kind() == asked.kind() {
+            asked.one(v, out);
+        } else {
+            out.nil();
+        }
+    }
+    Ok(())
+}
+
+/// What every array command says when a legacy path did not name an array,
+/// whether because it matched nothing or because it matched something else.
+///
+/// One line for both, which is the same shape as `JSON.TOGGLE`'s and for the
+/// same reason: a legacy path answers at most one value, so there is nothing
+/// for the message to say about which of the two happened.
+fn not_an_array() -> Error {
+    Error::new(Code::Invalid, "Path does not exist or not an array")
+}
+
+/// The arrays a path matched, with their offsets, and nothing else.
+///
+/// Every array command needs the same three things and treats a match that is
+/// not an array the same way, so the walk is written once. The answer is one
+/// entry per match, `None` for a match that is not an array, which is the hole
+/// a JSONPath reply shows as a nil.
+fn arrays<'r>(root: &Value<'r>, path: &Path<'_>) -> Result<Vec<Option<(usize, Value<'r>)>>> {
+    let mut hits = Vec::new();
+    path.select(root, &mut hits);
+    let mut out = Vec::with_capacity(hits.len());
+    for v in hits {
+        if v.kind() == Kind::Array {
+            out.push(Some((offset(root, &v)?, v)));
+        } else {
+            out.push(None);
+        }
+    }
+    Ok(out)
+}
+
+/// The one array a legacy path named, or the error that says it did not.
+fn only_array<'r>(found: &[Option<(usize, Value<'r>)>]) -> Result<(usize, Value<'r>)> {
+    match found.first() {
+        Some(Some((off, v))) => Ok((*off, *v)),
+        _ => Err(not_an_array()),
+    }
+}
+
+/// Answer with the new length of every array the command touched, in whichever
+/// of the two shapes the path asked for.
+fn lengths(path: &Path<'_>, lens: &[Option<usize>], out: &mut Out) {
+    if path.legacy() {
+        match lens.first().and_then(|n| *n) {
+            Some(n) => out.int(n as i64),
+            None => out.nil(),
+        }
+        return;
+    }
+    out.array(lens.len());
+    for n in lens {
+        match n {
+            Some(n) => out.int(*n as i64),
+            None => out.nil(),
+        }
+    }
+}
+
+/// The values a command takes from `from` onwards, encoded.
+///
+/// Parsed before the key is touched, so a value that is not JSON changes
+/// nothing, which is the rule `JSON.SET` follows too.
+fn values(args: Args<'_>, from: usize) -> Result<Vec<Vec<u8>>> {
+    (from..args.len())
+        .map(|i| yo_doc::from_json(args.get(i)))
+        .collect()
+}
+
+/// `JSON.ARRAPPEND key path value [value ...]`.
+fn arrappend(db: &mut Keyspace, args: Args<'_>, out: &mut Out) -> Result<()> {
+    let (key, raw) = (args.get(1), args.get(2));
+    if args.len() < 4 {
+        return Err(args::wrong_arity("json.arrappend"));
+    }
+    let path = Path::parse(raw)?;
+    let added = values(args, 3)?;
+    let body = match doc_mut(db, key, out)? {
+        Doc::Wrong => return Ok(()),
+        Doc::Gone => return Err(no_key()),
+        Doc::Here(body) => body,
+    };
+    let put: Vec<&[u8]> = added.iter().map(Vec::as_slice).collect();
+    let (after, lens) = {
+        let root = readable(&body.doc)?;
+        let found = arrays(&root, &path)?;
+        if path.legacy() {
+            only_array(&found)?;
+        }
+        let mut at = Vec::new();
+        let mut lens = Vec::with_capacity(found.len());
+        for f in &found {
+            match f {
+                Some((off, v)) => {
+                    at.push((
+                        *off,
+                        Edit::Splice {
+                            at: v.len(),
+                            take: 0,
+                            put: &put,
+                        },
+                    ));
+                    lens.push(Some(v.len() + put.len()));
+                }
+                None => lens.push(None),
+            }
+        }
+        (edit(&root, &at)?, lens)
+    };
+    body.doc = after;
+    lengths(&path, &lens, out);
+    Ok(())
+}
+
+/// `JSON.ARRINSERT key path index value [value ...]`.
+fn arrinsert(db: &mut Keyspace, args: Args<'_>, out: &mut Out) -> Result<()> {
+    let (key, raw) = (args.get(1), args.get(2));
+    if args.len() < 5 {
+        return Err(args::wrong_arity("json.arrinsert"));
+    }
+    let path = Path::parse(raw)?;
+    let want = args.int(3)?;
+    let added = values(args, 4)?;
+    let body = match doc_mut(db, key, out)? {
+        Doc::Wrong => return Ok(()),
+        Doc::Gone => return Err(no_key()),
+        Doc::Here(body) => body,
+    };
+    let put: Vec<&[u8]> = added.iter().map(Vec::as_slice).collect();
+    let (after, lens) = {
+        let root = readable(&body.doc)?;
+        let found = arrays(&root, &path)?;
+        if path.legacy() {
+            only_array(&found)?;
+        }
+        let mut at = Vec::new();
+        let mut lens = Vec::with_capacity(found.len());
+        for f in &found {
+            match f {
+                Some((off, v)) => {
+                    // An index the array does not reach is refused rather than
+                    // clamped, which is what makes this different from every
+                    // other index here. The end itself is allowed, so an insert
+                    // at the length is an append.
+                    let Some(i) = place(want, v.len()) else {
+                        return Err(Error::new(Code::Invalid, "index out of bounds"));
+                    };
+                    at.push((
+                        *off,
+                        Edit::Splice {
+                            at: i,
+                            take: 0,
+                            put: &put,
+                        },
+                    ));
+                    lens.push(Some(v.len() + put.len()));
+                }
+                None => lens.push(None),
+            }
+        }
+        (edit(&root, &at)?, lens)
+    };
+    body.doc = after;
+    lengths(&path, &lens, out);
+    Ok(())
+}
+
+/// Where an insert index lands in an array of `len`, or nothing if it does not
+/// land in it at all.
+///
+/// Negative counts back from the end, so `-1` is before the last element and
+/// `-len` is the front. The end is a place and one past it is not.
+fn place(want: i64, len: usize) -> Option<usize> {
+    let at = if want < 0 { len as i64 + want } else { want };
+    if at < 0 || at > len as i64 {
+        return None;
+    }
+    Some(at as usize)
+}
+
+/// `JSON.ARRTRIM key path start stop`.
+fn arrtrim(db: &mut Keyspace, args: Args<'_>, out: &mut Out) -> Result<()> {
+    let (key, raw) = (args.get(1), args.get(2));
+    if args.len() != 5 {
+        return Err(args::wrong_arity("json.arrtrim"));
+    }
+    let path = Path::parse(raw)?;
+    let (from, to) = (args.int(3)?, args.int(4)?);
+    let body = match doc_mut(db, key, out)? {
+        Doc::Wrong => return Ok(()),
+        Doc::Gone => return Err(no_key()),
+        Doc::Here(body) => body,
+    };
+    let (after, lens) = {
+        let root = readable(&body.doc)?;
+        let found = arrays(&root, &path)?;
+        if path.legacy() {
+            only_array(&found)?;
+        }
+        // The kept elements are the bytes already in the document, spliced back
+        // over the whole array. Held out here because the edits below borrow
+        // them and the borrow has to outlive the loop that builds them.
+        let mut kept: Vec<Vec<&[u8]>> = Vec::with_capacity(found.len());
+        for f in &found {
+            let mut keep = Vec::new();
+            if let Some((_, v)) = f {
+                let (start, stop) = span(from, to, v.len());
+                for i in start..stop {
+                    if let Some(e) = v.at(i).and_then(|e| e.as_bytes()) {
+                        keep.push(e);
+                    }
+                }
+            }
+            kept.push(keep);
+        }
+        let mut at = Vec::new();
+        let mut lens = Vec::with_capacity(found.len());
+        for (f, keep) in found.iter().zip(&kept) {
+            match f {
+                Some((off, v)) => {
+                    at.push((
+                        *off,
+                        Edit::Splice {
+                            at: 0,
+                            take: v.len(),
+                            put: keep,
+                        },
+                    ));
+                    lens.push(Some(keep.len()));
+                }
+                None => lens.push(None),
+            }
+        }
+        (edit(&root, &at)?, lens)
+    };
+    body.doc = after;
+    lengths(&path, &lens, out);
+    Ok(())
+}
+
+/// The half open run `JSON.ARRTRIM` keeps out of an array of `len`.
+///
+/// Both ends are inclusive on the wire and both count back from the end when
+/// negative, and both clamp rather than refuse. A start past the end or a stop
+/// before the start leaves nothing, which is an empty array and not an error.
+fn span(from: i64, to: i64, len: usize) -> (usize, usize) {
+    let n = len as i64;
+    let start = if from < 0 {
+        (n + from).max(0)
+    } else {
+        from.min(n)
+    };
+    let stop = if to < 0 {
+        (n + to).max(0)
+    } else {
+        to.min(n - 1)
+    };
+    if start > stop || len == 0 {
+        return (0, 0);
+    }
+    (start as usize, stop as usize + 1)
+}
+
+/// `JSON.ARRPOP key [path [index]]`.
+fn arrpop(db: &mut Keyspace, args: Args<'_>, out: &mut Out) -> Result<()> {
+    let key = args.get(1);
+    let raw = args.opt(2).unwrap_or(ROOT);
+    if args.len() > 4 {
+        return Err(args::wrong_arity("json.arrpop"));
+    }
+    let path = Path::parse(raw)?;
+    let want = if args.len() == 4 { args.int(3)? } else { -1 };
+    let body = match doc_mut(db, key, out)? {
+        Doc::Wrong => return Ok(()),
+        Doc::Gone => return Err(no_key()),
+        Doc::Here(body) => body,
+    };
+    let (after, gone) = {
+        let root = readable(&body.doc)?;
+        let found = arrays(&root, &path)?;
+        if path.legacy() {
+            only_array(&found)?;
+        }
+        let mut at = Vec::new();
+        let mut gone: Vec<Option<Vec<u8>>> = Vec::with_capacity(found.len());
+        for f in &found {
+            match f {
+                // An empty array pops nothing and is not an error, on either
+                // syntax, which is the one case where a legacy path that named
+                // a real array still answers nil.
+                Some((_, v)) if v.is_empty() => gone.push(None),
+                Some((off, v)) => {
+                    let i = reach(want, v.len());
+                    let mut text = Vec::new();
+                    match v.at(i) {
+                        Some(e) => e.write_json(&mut text)?,
+                        None => return Err(missing()),
+                    }
+                    at.push((
+                        *off,
+                        Edit::Splice {
+                            at: i,
+                            take: 1,
+                            put: &[],
+                        },
+                    ));
+                    gone.push(Some(text));
+                }
+                None => gone.push(None),
+            }
+        }
+        (edit(&root, &at)?, gone)
+    };
+    body.doc = after;
+    if path.legacy() {
+        match gone.first().and_then(|g| g.as_ref()) {
+            Some(text) => out.bulk(text),
+            None => out.nil(),
+        }
+        return Ok(());
+    }
+    out.array(gone.len());
+    for g in &gone {
+        match g {
+            Some(text) => out.bulk(text),
+            None => out.nil(),
+        }
+    }
+    Ok(())
+}
+
+/// Which element of an array of `len` an index reaches, clamped to one that is
+/// there.
+///
+/// Unlike the insert index this never refuses. A pop past the end takes the
+/// last element and a pop before the front takes the first, and `len` is never
+/// zero here because an empty array is handled before this is called.
+fn reach(want: i64, len: usize) -> usize {
+    let n = len as i64;
+    let at = if want < 0 { n + want } else { want };
+    at.clamp(0, n - 1) as usize
+}
+
+/// `JSON.ARRINDEX key path value [start [stop]]`.
+///
+/// The one array command whose errors do not match the others. A legacy path
+/// that matched nothing is `Path does not exist` and one that matched something
+/// that is not an array is a `WRONGTYPE`, where every other command here says
+/// `Path does not exist or not an array` for both.
+fn arrindex(db: &mut Keyspace, args: Args<'_>, out: &mut Out) -> Result<()> {
+    let (key, raw, text) = (args.get(1), args.get(2), args.get(3));
+    if args.len() < 4 || args.len() > 6 {
+        return Err(args::wrong_arity("json.arrindex"));
+    }
+    let path = Path::parse(raw)?;
+    let looking = yo_doc::from_json(text)?;
+    let from = if args.len() > 4 { args.int(4)? } else { 0 };
+    // Zero is the end of the array rather than the front of it, so the default
+    // searches everything and a stop that was left off means the same thing as
+    // one that was given as zero.
+    let to = if args.len() > 5 { args.int(5)? } else { 0 };
+    let body = match doc(db, key, out)? {
+        Doc::Wrong => return Ok(()),
+        Doc::Gone => return Err(missing()),
+        Doc::Here(body) => body,
+    };
+    let root = readable(&body.doc)?;
+    let looking = readable(&looking)?;
+    let mut hits = Vec::new();
+    path.select(&root, &mut hits);
+    if path.legacy() {
+        let Some(v) = hits.first() else {
+            return Err(missing());
+        };
+        if v.kind() != Kind::Array {
+            return Err(Error::new(
+                Code::WrongType,
+                "wrong type of path value - expected array",
+            ));
+        }
+        out.int(seek(v, &looking, from, to));
+        return Ok(());
+    }
+    out.array(hits.len());
+    for v in &hits {
+        if v.kind() == Kind::Array {
+            out.int(seek(v, &looking, from, to));
+        } else {
+            out.nil();
+        }
+    }
+    Ok(())
+}
+
+/// Where `looking` first sits in `v` between `from` and `to`, or `-1`.
+///
+/// `to` is exclusive, which is not what the rest of Redis does with a stop and
+/// is what RedisJSON does here, and zero means the end rather than the front.
+///
+/// `from` counts back from the end when it is negative and is then clamped to
+/// the last element rather than to one past it, so a start of five into an array
+/// of four still looks at the fourth. That reads like a mistake and it is what
+/// RedisJSON does, checked on `[1,2,3,1]` where a start of four, five or minus
+/// one all answer three. An empty array answers minus one whatever the start is,
+/// which falls out of the stop being zero.
+fn seek(v: &Value<'_>, looking: &Value<'_>, from: i64, to: i64) -> i64 {
+    let n = v.len() as i64;
+    let start = if from < 0 { n + from } else { from }.clamp(0, (n - 1).max(0));
+    let stop = if to == 0 {
+        n
+    } else if to < 0 {
+        (n + to).max(0)
+    } else {
+        to.min(n)
+    };
+    let mut i = start;
+    while i < stop {
+        if let Some(e) = v.at(i as usize)
+            && same(&e, looking)
+        {
+            return i;
+        }
+        i += 1;
+    }
+    -1
+}
+
+/// Whether two values are the same value.
+///
+/// Structural rather than a comparison of the encoded bytes, because an object
+/// inside a stored document may hold its keys as intern table ids where the one
+/// parsed off the wire holds them as bytes, and those two encode differently
+/// while meaning the same thing.
+fn same(a: &Value<'_>, b: &Value<'_>) -> bool {
+    if a.kind() != b.kind() {
+        return false;
+    }
+    match a.kind() {
+        Kind::Null => true,
+        Kind::Bool => a.as_bool() == b.as_bool(),
+        Kind::Int => a.as_int() == b.as_int(),
+        Kind::Float => a.as_float() == b.as_float(),
+        Kind::Text => a.text_bytes() == b.text_bytes(),
+        Kind::Array => {
+            a.len() == b.len()
+                && (0..a.len()).all(|i| match (a.at(i), b.at(i)) {
+                    (Some(x), Some(y)) => same(&x, &y),
+                    _ => false,
+                })
+        }
+        Kind::Object => {
+            a.len() == b.len()
+                && (0..a.len()).all(|i| {
+                    let key = a.key_at(i);
+                    match (key, key.and_then(|k| b.get(k)), a.at(i)) {
+                        (Some(_), Some(y), Some(x)) => same(&x, &y),
+                        _ => false,
+                    }
+                })
+        }
     }
 }
 
