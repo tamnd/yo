@@ -24,25 +24,38 @@
 //!
 //! ```text
 //! shape                 search    candidates    insert
-//! 128 dims, 100k      139.8 us      112.4 us   22.9 us
-//! 768 dims, 20k       309.5 us      284.6 us   50.5 us
+//! 128 dims, 100k       83.1 us       79.0 us    8.0 us
+//! 768 dims, 20k       288.9 us      276.8 us   22.5 us
 //! ```
 //!
 //! So G12's millisecond has room: a query at 768 dimensions is under a third of
-//! it, and rerank is 25 microseconds of that and buys the difference between an
+//! it, and rerank is 12 microseconds of that and buys the difference between an
 //! estimate and an answer.
 //!
-//! G13's fifty thousand vectors a second per core is not there yet. An insert at
-//! 128 dimensions is 22.9 microseconds, which is 44 thousand a second, and at
-//! 768 it is 50.5, which is 20 thousand. Encode is 8 microseconds of that, so
-//! most of it is the centroid ranking, which is a float distance against every
-//! centroid and is linear in the number of partitions where everything else here
-//! is not. At 20k vectors and a posting of 256 that is 78 centroids, and at ten
-//! million it would be three thousand.
+//! The `insert` column is where the shared squared distance in `src/dist.rs`
+//! shows up, because an insert is a centroid ranking and a centroid ranking is
+//! almost nothing but that distance. On the same machine, immediately before
+//! and after that one change: 24.4 to 8.0 at 128 dimensions and 47.1 to 22.5 at
+//! 768. `search` moved much less, 102.6 to 83.1 and 324.7 to 288.9, because a
+//! search is mostly the estimator meeting codes and only the rerank at the end
+//! of it is float distances.
 //!
-//! That is one problem with one answer, and it is the same answer as everywhere
-//! else in this crate: quantise the centroids and scan them with popcounts too.
-//! Until then this is the row that says how far off the gate is.
+//! The `insert` row here is not the whole of G13 and never was. It is a
+//! centroid ranking plus an encode plus an append against a collection that is
+//! standing still, and the gate is about a collection being written to, where
+//! maintenance is the other half of the cost and criterion has no way to see
+//! it. `examples/ingest.rs` is what G13 is actually read off, and the module
+//! doc on `src/partition.rs` carries that table.
+//!
+//! What this row is good for is the insert half on its own. It was the larger
+//! half of an ingest and it is not any more, for two reasons. The centroid
+//! ranking used to be a float distance against every centroid in the
+//! collection, which is linear in the partition count where everything else
+//! here is not, and `src/coarse.rs` is the answer to that. Then the float
+//! distance itself turned out to be held back by a bounds check the compiler
+//! could not remove, and `src/dist.rs` is the answer to that. The second of
+//! those two on its own took the insert half of a 1.6 million vector ingest
+//! from 45.9 seconds to 15.3.
 //!
 //! # Reading these on a machine someone else is using
 //!
