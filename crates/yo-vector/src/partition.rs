@@ -645,8 +645,8 @@ impl Partitions {
         }
         let mut into = core::mem::take(&mut self.spill);
         self.spill_into(&x, &mut into);
-        for i in 0..into.len() {
-            self.place(into[i].0, id, tag, &x);
+        for &(p, _) in &into {
+            self.place(p, id, tag, &x);
         }
         self.spill = into;
     }
@@ -780,7 +780,7 @@ impl Partitions {
         // There is at most one copy per partition so this only matters across
         // them, but the order costs nothing and the alternative is a rule that
         // has to stay true.
-        copies.sort_unstable_by(|a, b| b.slot.cmp(&a.slot));
+        copies.sort_unstable_by_key(|c| core::cmp::Reverse(c.slot));
         for copy in &copies {
             let p = copy.partition as usize;
             let s = copy.slot as usize;
@@ -2367,8 +2367,10 @@ mod tests {
     fn spilling_puts_boundary_vectors_in_more_than_one_partition() {
         let dim = 32;
         let store = corpus(dim, 3000, 12, 5);
-        let mut off = Tuning::default();
-        off.spill = 1;
+        let off = Tuning {
+            spill: 1,
+            ..Tuning::default()
+        };
         let none = build(&store, dim, off);
         consistent(&none);
         assert_eq!(copies(&none), 1.0, "spill of one is one copy of everything");
@@ -2405,8 +2407,10 @@ mod tests {
     fn a_copy_is_found_from_the_partition_it_was_copied_into() {
         let dim = 32;
         let store = corpus(dim, 3000, 12, 5);
-        let mut t = Tuning::default();
-        t.slack = 0.25;
+        let t = Tuning {
+            slack: 0.25,
+            ..Tuning::default()
+        };
         let mut ix = build(&store, dim, t);
         let (id, copies) = (0..3000u64)
             .filter_map(|id| {
@@ -2446,10 +2450,12 @@ mod tests {
     fn a_replicated_member_comes_back_once() {
         let dim = 32;
         let store = corpus(dim, 2000, 8, 31);
-        let mut t = Tuning::default();
         // Every partition, so that every copy of every member is read and the
         // duplicates are certain rather than likely.
-        t.probe = 1 << 20;
+        let t = Tuning {
+            probe: 1 << 20,
+            ..Tuning::default()
+        };
         let ix = build(&store, dim, t);
         for i in 0..50 {
             let q = &store.0[i * 37 % store.0.len()];

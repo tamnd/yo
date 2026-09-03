@@ -149,10 +149,12 @@ fn main() {
 
     for bits in [Bits::One, Bits::Four] {
         let t = Instant::now();
-        let mut tuning = Tuning::default();
-        tuning.spill = spill;
-        tuning.slack = slack;
-        tuning.posting = posting;
+        let tuning = Tuning {
+            spill,
+            slack,
+            posting,
+            ..Tuning::default()
+        };
         let mut ix = Partitions::new(dim, bits, 0x51f7, tuning);
         let mut buf = vec![0f32; dim];
         for id in 0..n as u64 {
