@@ -2476,6 +2476,123 @@ pub static COMMANDS: &[Spec] = &[
         summary: "Empty the containers and zero the numbers a path matched.",
         group: "json",
     },
+    Spec {
+        name: "json.arrlen",
+        arity: -2,
+        flags: JSON_READ,
+        first_key: 1,
+        last_key: 1,
+        step: 1,
+        acl: AC_JSON_READ,
+        since: "1.0.0",
+        complexity: "O(1)",
+        summary: "How many elements are in the arrays a path matched.",
+        group: "json",
+    },
+    Spec {
+        name: "json.objlen",
+        arity: -2,
+        flags: JSON_READ,
+        first_key: 1,
+        last_key: 1,
+        step: 1,
+        acl: AC_JSON_READ,
+        since: "1.0.0",
+        complexity: "O(1)",
+        summary: "How many members are in the objects a path matched.",
+        group: "json",
+    },
+    Spec {
+        name: "json.strlen",
+        arity: -2,
+        flags: JSON_READ,
+        first_key: 1,
+        last_key: 1,
+        step: 1,
+        acl: AC_JSON_READ,
+        since: "1.0.0",
+        complexity: "O(1)",
+        summary: "How long the strings a path matched are, in bytes.",
+        group: "json",
+    },
+    Spec {
+        name: "json.objkeys",
+        arity: -2,
+        flags: JSON_READ,
+        first_key: 1,
+        last_key: 1,
+        step: 1,
+        acl: AC_JSON_READ,
+        since: "1.0.0",
+        complexity: "O(N) with N the number of members",
+        summary: "The keys of the objects a path matched.",
+        group: "json",
+    },
+    Spec {
+        name: "json.arrappend",
+        arity: -3,
+        flags: JSON_WRITE_OOM,
+        first_key: 1,
+        last_key: 1,
+        step: 1,
+        acl: AC_JSON_WRITE,
+        since: "1.0.0",
+        complexity: "O(N) with N the size of the document",
+        summary: "Add values to the end of the arrays a path matched.",
+        group: "json",
+    },
+    Spec {
+        name: "json.arrinsert",
+        arity: -5,
+        flags: JSON_WRITE_OOM,
+        first_key: 1,
+        last_key: 1,
+        step: 1,
+        acl: AC_JSON_WRITE,
+        since: "1.0.0",
+        complexity: "O(N) with N the size of the document",
+        summary: "Put values into the arrays a path matched, at an index.",
+        group: "json",
+    },
+    Spec {
+        name: "json.arrtrim",
+        arity: 5,
+        flags: JSON_WRITE,
+        first_key: 1,
+        last_key: 1,
+        step: 1,
+        acl: AC_JSON_WRITE,
+        since: "1.0.0",
+        complexity: "O(N) with N the size of the document",
+        summary: "Keep only a run of the arrays a path matched.",
+        group: "json",
+    },
+    Spec {
+        name: "json.arrpop",
+        arity: -2,
+        flags: JSON_WRITE,
+        first_key: 1,
+        last_key: 1,
+        step: 1,
+        acl: AC_JSON_WRITE,
+        since: "1.0.0",
+        complexity: "O(N) with N the size of the document",
+        summary: "Take one element out of the arrays a path matched.",
+        group: "json",
+    },
+    Spec {
+        name: "json.arrindex",
+        arity: -4,
+        flags: JSON_READ,
+        first_key: 1,
+        last_key: 1,
+        step: 1,
+        acl: AC_JSON_READ,
+        since: "1.0.0",
+        complexity: "O(N) with N the number of elements",
+        summary: "Where a value first sits in the arrays a path matched.",
+        group: "json",
+    },
     // -------------------------------------------------------------- vector
     Spec {
         name: "vadd",
@@ -3799,7 +3916,7 @@ const SLOTS: usize = 512;
 /// most wants to be able to find.
 const FREE: u16 = u16::MAX;
 
-/// The multiplier, found by searching for one that spreads these 254 names well.
+/// The multiplier, found by searching for one that spreads these 271 names well.
 ///
 /// Not a magic constant in the bad sense: it is checked. Every command is looked
 /// up by its own name in a test, and another test holds the worst probe length
@@ -3832,10 +3949,24 @@ const FREE: u16 = u16::MAX;
 /// `json.set` and `json.get` are one of those pairs, since every name in the
 /// group starts `js` and the only thing left to tell them apart is the length
 /// and the last byte.
-const MIX: u64 = 0x12ac_3c57_ec2d_bd8b;
+///
+/// The nine JSON array commands took that one to four slots, and this time the
+/// search over the 271 names found nothing at two whatever it was given. That
+/// was not the multiplier's fault. `json.arrlen`, `json.objlen` and
+/// `json.strlen` all key to the same four bytes, and three names in one slot run
+/// costs the third of them two probes before any other name has moved, so two
+/// slots was the whole budget spent in one place. The fix was the key rather
+/// than the multiplier, which is what [`key_of`] now folds the middle byte in
+/// for, and the ninth search was run over the 271 names with the new key across
+/// six shards. It found this one at two slots and fifty seven, which is a
+/// shade over a fifth of a probe a command, the same as the multiplier it
+/// replaces managed over nine fewer names. Twelve of the names still collide on
+/// the key and no multiplier can separate them, so twelve extra probes is the
+/// floor now rather than seventeen.
+const MIX: u64 = 0x98c7_3dc0_1fe8_9281;
 
-/// The four bytes the index is computed from: the length, the first two bytes
-/// and the last, lower cased.
+/// The four bytes the index is computed from: the length, the first two bytes,
+/// and the last byte with the middle byte folded into it, all lower cased.
 ///
 /// `None` for a name no command could be spelled as, which is decided on the
 /// length before a byte is read.
@@ -3843,32 +3974,43 @@ const MIX: u64 = 0x12ac_3c57_ec2d_bd8b;
 /// Four bytes and not the whole name because the whole name has to be compared
 /// at the end anyway, so the hash only has to be good enough to get to the right
 /// slot, and reading less of the name is a shorter dependency chain in front of
-/// the multiply. These four leave 246 distinct values over the 262 commands, so
-/// thirty one names collide whatever the multiplier is and probe once more, and
-/// the probe is the same compare the lookup was always going to do. `setnx` and
-/// `setex` are one of those groups and `g.nadd` and `g.eadd` are another, and the
-/// bitmaps added two more, `getset` with `getbit` and `setbit` with `select`. The
-/// eighteen stream commands are in none of them, neither are the five
-/// HyperLogLog ones, and neither are the ten geo ones or the twelve vector set
-/// ones, since a name is keyed on its first two bytes and its last and no two of
-/// any of them agree on all three. The JSON commands are the worst case this
-/// key has: all eight of them start `js`, so all eight are keyed on nothing but
-/// their length and their last byte, and `json.set` and `json.get` agree on
-/// both.
+/// the multiply. Names that agree on all four collide whatever the multiplier is
+/// and probe once more, and the probe is the same compare the lookup was always
+/// going to do. Over the 271 commands there are twelve such pairs and no group
+/// larger than a pair, so twelve extra probes is the floor.
+///
+/// The middle byte is the part that was added last and it is worth saying why,
+/// because for a long time the key was the length and the first two bytes and
+/// the last and nothing else. That was fine while the groups that agreed on a
+/// prefix were small: `setnx` with `setex`, `g.nadd` with `g.eadd`, `getset`
+/// with `getbit`, `setbit` with `select`. The JSON group broke it, because every
+/// name in it starts `js` and so every name in it was keyed on nothing but its
+/// length and its last byte, and `json.arrlen`, `json.objlen` and `json.strlen`
+/// agree on both. Three names in one slot run costs the third of them two probes
+/// on its own, which leaves a multiplier no room anywhere else, and the number
+/// families still to come are the same shape again. Folding in the middle byte
+/// separates all three, and it separates `json.set` from `json.get` as well.
+/// It costs one more load off a cache line the first two bytes already pulled
+/// in, and the xor is on the same dependency chain as the shifts rather than in
+/// front of them.
 ///
 /// `| 0x20` lower cases a letter and does not have to be told which bytes are
 /// letters. It maps the two cases of a name to the same number, which is all
-/// this needs, and every command name is letters.
+/// this needs, and every command name is letters. It has to be applied to the
+/// middle byte and the last byte separately, before the xor rather than after,
+/// because `.` and `n` differ in the bit `| 0x20` sets and an xor of the raw
+/// bytes would keep that difference alive.
 const fn key_of(name: &[u8]) -> Option<u32> {
     if name.len() < MIN_LEN || name.len() > MAX_LEN {
         return None;
     }
     let last = name.len() - 1;
+    let mid = name.len() / 2;
     Some(
         name.len() as u32
             | ((name[0] | 0x20) as u32) << 8
             | ((name[1] | 0x20) as u32) << 16
-            | ((name[last] | 0x20) as u32) << 24,
+            | (((name[last] | 0x20) ^ (name[mid] | 0x20)) as u32) << 24,
     )
 }
 
@@ -4107,12 +4249,14 @@ mod tests {
         assert_ne!(key_of(b"get"), key_of(b"gxt"), "other second byte");
         assert_ne!(key_of(b"get"), key_of(b"gex"), "other last byte");
         assert_ne!(key_of(b"get"), key_of(b"gett"), "other length");
+        assert_ne!(key_of(b"abcde"), key_of(b"abxde"), "other middle byte");
+        assert_eq!(key_of(b"abcde"), key_of(b"ABCDE"), "middle byte folds too");
     }
 
     /// The index is still worth having, which is a thing that can rot.
     ///
     /// The multiplier was searched for against the 191 commands that were in the
-    /// table when it was written, and five times since. Adding commands cannot make a lookup wrong,
+    /// table when it was written, and eight times since. Adding commands cannot make a lookup wrong,
     /// because a probe walks to an empty slot and every candidate has its name
     /// compared, but it can make one slow, and a slow lookup is exactly the thing
     /// this replaced. So the worst probe is written down here: if a command
@@ -4137,7 +4281,7 @@ mod tests {
         }
         assert!(worst <= 2, "worst probe is {worst} slots");
         assert!(
-            total <= 54,
+            total <= 57,
             "{total} extra slots walked over the whole table"
         );
     }

@@ -122,10 +122,10 @@ name = "json"
 expected = 25
 status = "partial"
 doc = "09 section 2"
-# Eight of the twenty five, which are the ones that read and write a value at a
-# path rather than the ones that work on a particular type of value. The other
-# seventeen are the array, the string and the number families plus MERGE, MSET,
-# RESP and DEBUG, and they are the next change. The count is RedisJSON 2.8 as it
+# Seventeen of the twenty five, which are the ones that read and write a value at
+# a path plus the whole array family and the four that ask how big something is.
+# The other eight are the string and the number families plus MERGE, MSET, RESP
+# and DEBUG, and they are the next change. The count is RedisJSON 2.8 as it
 # ships inside Redis 8, read off COMMAND LIST FILTERBY ACLCAT json on a running
 # one rather than off the documentation, which lists NUMMULTBY and NUMPOWBY as
 # deprecated and still registers them.
@@ -2446,6 +2446,114 @@ status = "shipped"
 wire = "verified"
 divergent = "D-34"
 notes = "Empties containers and zeroes numbers and leaves a string, a boolean and a null alone, which is RedisJSON's rule and not an obvious one since clearing a string to the empty string would be just as defensible. It counts only what it changed, so an object that was already empty and a number that was already zero are not counted and a second call on the same path answers zero."
+
+[[command]]
+name = "JSON.ARRLEN"
+group = "json"
+since = "1.0.0"
+arity = -2
+plan = "whole-value"
+bounded = "inherent"
+status = "shipped"
+wire = "verified"
+divergent = "D-34"
+notes = "The count is stored in the container's header, so this is a path walk and then a read of one field rather than a walk of the array. A legacy path that matched nothing is the error Path does not exist and one that matched something that is not an array is Path does not exist or not an array, which are two different lines for what a client sees as the same failure and are both RedisJSON's. A legacy path against a key that is not there is a nil and a JSONPath against the same key is an error, which is the opposite way round from the rest of this group."
+
+[[command]]
+name = "JSON.OBJLEN"
+group = "json"
+since = "1.0.0"
+arity = -2
+plan = "whole-value"
+bounded = "inherent"
+status = "shipped"
+wire = "verified"
+divergent = "D-34"
+notes = "The same read as JSON.ARRLEN over an object, and every one of its error lines is different. A legacy path that matched nothing is a nil rather than an error, a legacy path that matched something else is a WRONGTYPE rather than an ERR, and a JSONPath against a key that is not there is the line about the path rather than the line about the key. None of that is a pattern and all of it was read off a running module, because the error text is what a client library branches on."
+
+[[command]]
+name = "JSON.STRLEN"
+group = "json"
+since = "1.0.0"
+arity = -2
+plan = "whole-value"
+bounded = "inherent"
+status = "shipped"
+wire = "verified"
+divergent = "D-34"
+notes = "The length in bytes and not in characters, which matters the moment a document holds anything outside ASCII and is what RedisJSON answers because its strings are Rust strings underneath too. A legacy path that matched nothing is an error and one that matched something that is not a string is a WRONGTYPE, which is the third of the four combinations this family manages to use."
+
+[[command]]
+name = "JSON.OBJKEYS"
+group = "json"
+since = "1.0.0"
+arity = -2
+plan = "whole-value"
+bounded = "inherent"
+status = "shipped"
+wire = "verified"
+divergent = "D-34"
+notes = "The keys of every object the path matched, as an array per match. Ours come back sorted by length and then by bytes because that is the order the encoding stores them in to make a lookup a binary search, and RedisJSON keeps the order they were written in, which is D-34 and is the same divergence every reply that shows an object has."
+
+[[command]]
+name = "JSON.ARRAPPEND"
+group = "json"
+since = "1.0.0"
+arity = -3
+plan = "whole-value"
+bounded = "risk"
+status = "shipped"
+wire = "verified"
+divergent = "D-34"
+notes = "Adds to the end of every array the path matched and answers the new length of each. The arity in the table is the module's own, which allows a call with no values at all and then refuses it with a wrong number of arguments error from inside the command, so the table and the check disagree on purpose and both match what Redis does. The values are parsed before the key is touched, so a value that is not JSON changes nothing."
+
+[[command]]
+name = "JSON.ARRINSERT"
+group = "json"
+since = "1.0.0"
+arity = -5
+plan = "whole-value"
+bounded = "risk"
+status = "shipped"
+wire = "verified"
+divergent = "D-34,D-36"
+notes = "The one index in this group that is refused rather than clamped. An index the array does not reach is the error index out of bounds, where a pop past the end takes the last element and a trim past the end leaves an empty array. The end itself counts as a place, so an insert at the length is an append, and a negative index counts back from the end with minus the length meaning the front."
+
+[[command]]
+name = "JSON.ARRTRIM"
+group = "json"
+since = "1.0.0"
+arity = 5
+plan = "whole-value"
+bounded = "risk"
+status = "shipped"
+wire = "verified"
+divergent = "D-34"
+notes = "Keeps the run from start to stop, both ends included, and answers what is left. Both ends count back from the end when negative and both clamp rather than refuse, so a start past the end or a stop before the start leaves an empty array and not an error. It is one splice of the kept elements over the whole array rather than a splice at each end, because two edits at the same offset is a caller bug the editor resolves by taking the first."
+
+[[command]]
+name = "JSON.ARRPOP"
+group = "json"
+since = "1.0.0"
+arity = -2
+plan = "whole-value"
+bounded = "risk"
+status = "shipped"
+wire = "verified"
+divergent = "D-34"
+notes = "Takes one element out and answers it as JSON text. The default index is minus one, which is the last element, and an index past either end is clamped to one that is there. An empty array answers nil and is not an error, which is the only case where a legacy path that named a real array still answers nil."
+
+[[command]]
+name = "JSON.ARRINDEX"
+group = "json"
+since = "1.0.0"
+arity = -4
+plan = "whole-value"
+bounded = "inherent"
+status = "shipped"
+wire = "verified"
+divergent = "D-34"
+notes = "Where a value first sits in every array the path matched, or minus one. The stop is exclusive, which is not what the rest of Redis does with a stop, and zero means the end rather than the front so leaving it off and passing zero are the same thing. The comparison is structural rather than a comparison of the encoded bytes, because an object stored in a document can hold its keys as intern table ids where the one parsed off the wire holds them as bytes, and those two encode differently while meaning the same thing."
 
 # --------------------------------------------------------------------- vector
 

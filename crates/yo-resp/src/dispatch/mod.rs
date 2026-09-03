@@ -9578,6 +9578,323 @@ mod tests {
         assert_eq!(f.run(&[b"JSON.MGET", b"one", b".nope"]), "*1\r\n$-1\r\n");
     }
 
+    /// The four commands that ask how big something is, and the four different
+    /// sets of answers they give for the same three failures.
+    ///
+    /// There is no pattern in this and there is no reading it off the
+    /// documentation either. It was read off a running RedisJSON one line at a
+    /// time, and it is written down here because the error text is what a client
+    /// library branches on.
+    #[test]
+    fn the_json_commands_that_answer_a_size_disagree_about_every_failure() {
+        let mut f = Fixture::new();
+        let doc = br#"{"a":[1,2,3],"o":{"x":1,"y":2},"s":"hello","n":7}"#;
+        f.run(&[b"JSON.SET", b"doc", b"$", doc]);
+
+        assert_eq!(f.run(&[b"JSON.ARRLEN", b"doc", b".a"]), ":3\r\n");
+        assert_eq!(f.run(&[b"JSON.ARRLEN", b"doc", b"$.a"]), "*1\r\n:3\r\n");
+        assert_eq!(f.run(&[b"JSON.OBJLEN", b"doc", b".o"]), ":2\r\n");
+        assert_eq!(f.run(&[b"JSON.STRLEN", b"doc", b".s"]), ":5\r\n");
+        assert_eq!(
+            f.run(&[b"JSON.OBJKEYS", b"doc", b".o"]),
+            format!("*2\r\n{}{}", bulk("x"), bulk("y"))
+        );
+        // A JSONPath answers one entry per match and a hole for a match of the
+        // wrong kind, which is the one shape all four agree on.
+        assert_eq!(
+            f.run(&[b"JSON.ARRLEN", b"doc", b"$.*"]),
+            "*4\r\n:3\r\n$-1\r\n$-1\r\n$-1\r\n"
+        );
+
+        // A legacy path that matched nothing. Two of them are an error and two
+        // of them are a nil, and the two errors do not use the same sentence.
+        assert_eq!(
+            f.run(&[b"JSON.ARRLEN", b"doc", b".nope"]),
+            "-ERR Path does not exist\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"JSON.STRLEN", b"doc", b".nope"]),
+            "-ERR Path does not exist\r\n"
+        );
+        assert_eq!(f.run(&[b"JSON.OBJLEN", b"doc", b".nope"]), "$-1\r\n");
+        // A nil bulk and not an empty array, even though the answer would have
+        // been an array, which is what RedisJSON sends here too.
+        assert_eq!(f.run(&[b"JSON.OBJKEYS", b"doc", b".nope"]), "$-1\r\n");
+        // The JSONPath spelling of the same question is an empty array, since
+        // no match is not a failure on that syntax.
+        assert_eq!(f.run(&[b"JSON.OBJKEYS", b"doc", b"$.nope"]), "*0\r\n");
+
+        // A legacy path that matched the wrong kind of value. Now two of them
+        // are an ERR and two of them are a WRONGTYPE, and it is not the same
+        // two.
+        assert_eq!(
+            f.run(&[b"JSON.ARRLEN", b"doc", b".n"]),
+            "-ERR Path does not exist or not an array\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"JSON.OBJKEYS", b"doc", b".n"]),
+            "-ERR Path does not exist or not an object\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"JSON.OBJLEN", b"doc", b".n"]),
+            "-WRONGTYPE wrong type of path value - expected object\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"JSON.STRLEN", b"doc", b".n"]),
+            "-WRONGTYPE wrong type of path value - expected string\r\n"
+        );
+
+        // A key that is not there, where the two syntaxes swap over: the legacy
+        // path is the quiet answer and the JSONPath is the error.
+        assert_eq!(f.run(&[b"JSON.ARRLEN", b"nokey", b".a"]), "$-1\r\n");
+        assert_eq!(f.run(&[b"JSON.OBJLEN", b"nokey", b".a"]), "$-1\r\n");
+        assert_eq!(f.run(&[b"JSON.STRLEN", b"nokey", b".a"]), "$-1\r\n");
+        assert_eq!(f.run(&[b"JSON.OBJKEYS", b"nokey", b".a"]), "$-1\r\n");
+        assert_eq!(
+            f.run(&[b"JSON.ARRLEN", b"nokey", b"$.a"]),
+            "-ERR could not perform this operation on a key that doesn't exist\r\n"
+        );
+        // Except this one, which answers about the path instead.
+        assert_eq!(
+            f.run(&[b"JSON.OBJLEN", b"nokey", b"$.a"]),
+            "-ERR Path does not exist or not an object\r\n"
+        );
+    }
+
+    /// `JSON.ARRAPPEND`, `JSON.ARRINSERT`, `JSON.ARRTRIM` and `JSON.ARRPOP`.
+    ///
+    /// The four of them share one error line for a path that named something
+    /// that is not an array, and they disagree about what an index outside the
+    /// array means: insert refuses it and the other two clamp.
+    #[test]
+    fn the_json_array_writes_agree_on_the_errors_and_not_on_the_indexes() {
+        let mut f = Fixture::new();
+        f.run(&[b"JSON.SET", b"doc", b"$", br#"{"a":[1,2,3],"n":7}"#]);
+
+        assert_eq!(f.run(&[b"JSON.ARRAPPEND", b"doc", b".a", b"4"]), ":4\r\n");
+        assert_eq!(
+            f.run(&[b"JSON.ARRAPPEND", b"doc", b"$.a", b"5", b"6"]),
+            "*1\r\n:6\r\n"
+        );
+        assert_eq!(f.run(&[b"JSON.GET", b"doc", b".a"]), bulk("[1,2,3,4,5,6]"));
+
+        // A negative index counts back from the end, and the end itself is a
+        // place to insert at, so an insert at the length is an append.
+        assert_eq!(
+            f.run(&[b"JSON.ARRINSERT", b"doc", b".a", b"-1", b"0"]),
+            ":7\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"JSON.GET", b"doc", b".a"]),
+            bulk("[1,2,3,4,5,0,6]")
+        );
+        assert_eq!(
+            f.run(&[b"JSON.ARRINSERT", b"doc", b".a", b"7", b"9"]),
+            ":8\r\n"
+        );
+        // One past the end is not, and neither is one before the front.
+        assert_eq!(
+            f.run(&[b"JSON.ARRINSERT", b"doc", b".a", b"9", b"9"]),
+            "-ERR index out of bounds\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"JSON.ARRINSERT", b"doc", b".a", b"-9", b"9"]),
+            "-ERR index out of bounds\r\n"
+        );
+
+        // Trim takes both ends inclusive and clamps both of them, so a start
+        // past the end leaves an empty array rather than an error.
+        f.run(&[b"JSON.SET", b"doc", b"$.a", b"[1,2,3,4,5]"]);
+        assert_eq!(
+            f.run(&[b"JSON.ARRTRIM", b"doc", b".a", b"1", b"3"]),
+            ":3\r\n"
+        );
+        assert_eq!(f.run(&[b"JSON.GET", b"doc", b".a"]), bulk("[2,3,4]"));
+        assert_eq!(
+            f.run(&[b"JSON.ARRTRIM", b"doc", b".a", b"-2", b"99"]),
+            ":2\r\n"
+        );
+        assert_eq!(f.run(&[b"JSON.GET", b"doc", b".a"]), bulk("[3,4]"));
+        assert_eq!(
+            f.run(&[b"JSON.ARRTRIM", b"doc", b".a", b"9", b"9"]),
+            ":0\r\n"
+        );
+        assert_eq!(f.run(&[b"JSON.GET", b"doc", b".a"]), bulk("[]"));
+
+        // Pop clamps as well, its default is the last element, and an empty
+        // array pops a nil rather than failing.
+        f.run(&[b"JSON.SET", b"doc", b"$.a", b"[1,2,3]"]);
+        assert_eq!(f.run(&[b"JSON.ARRPOP", b"doc", b".a"]), bulk("3"));
+        assert_eq!(f.run(&[b"JSON.ARRPOP", b"doc", b".a", b"0"]), bulk("1"));
+        assert_eq!(f.run(&[b"JSON.ARRPOP", b"doc", b".a", b"99"]), bulk("2"));
+        assert_eq!(f.run(&[b"JSON.ARRPOP", b"doc", b".a"]), "$-1\r\n");
+
+        // One sentence covers a path that matched nothing and a path that
+        // matched the wrong kind of value, for all four of them.
+        for call in [
+            &[&b"JSON.ARRAPPEND"[..], b"doc", b"PATH", b"1"][..],
+            &[&b"JSON.ARRTRIM"[..], b"doc", b"PATH", b"1", b"1"][..],
+            &[&b"JSON.ARRPOP"[..], b"doc", b"PATH", b"1"][..],
+            &[&b"JSON.ARRINSERT"[..], b"doc", b"PATH", b"0", b"1"][..],
+        ] {
+            for path in [&b".n"[..], &b".nope"[..]] {
+                let args: Vec<&[u8]> = call
+                    .iter()
+                    .map(|a| if *a == b"PATH" { path } else { *a })
+                    .collect();
+                assert_eq!(
+                    f.run(&args),
+                    "-ERR Path does not exist or not an array\r\n",
+                    "{} {}",
+                    String::from_utf8_lossy(call[0]),
+                    String::from_utf8_lossy(path)
+                );
+            }
+        }
+
+        // A key that is not there is the same sentence for all four, on either
+        // syntax, and it is about the key and not about the path.
+        assert_eq!(
+            f.run(&[b"JSON.ARRAPPEND", b"nokey", b".a", b"1"]),
+            "-ERR could not perform this operation on a key that doesn't exist\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"JSON.ARRPOP", b"nokey", b"$.a"]),
+            "-ERR could not perform this operation on a key that doesn't exist\r\n"
+        );
+
+        // The values are parsed before the key is touched, so text that is not
+        // JSON leaves the document alone.
+        assert!(
+            f.run(&[b"JSON.ARRAPPEND", b"doc", b".a", b"nope"])
+                .starts_with("-ERR")
+        );
+        assert_eq!(f.run(&[b"JSON.GET", b"doc", b".a"]), bulk("[]"));
+    }
+
+    /// `JSON.ARRINSERT` refuses the whole command when any one of the arrays a
+    /// path matched cannot take the index, which is D-36.
+    ///
+    /// RedisJSON walks the matches, inserts into each one it can, and returns
+    /// the error on the first one it cannot, leaving the earlier inserts in the
+    /// document. A write here is one list of edits applied together, so either
+    /// all of them happen or none of them do.
+    #[test]
+    fn json_arrinsert_is_all_or_nothing_across_the_matches() {
+        let mut f = Fixture::new();
+        let doc = br#"{"a":[1,2,3],"n":{"a":[9,8],"in":{"a":[1]}}}"#;
+        f.run(&[b"JSON.SET", b"doc", b"$", doc]);
+        assert_eq!(
+            f.run(&[b"JSON.ARRINSERT", b"doc", b"$..a", b"-2", b"0"]),
+            "-ERR index out of bounds\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"JSON.GET", b"doc"]),
+            bulk(r#"{"a":[1,2,3],"n":{"a":[9,8],"in":{"a":[1]}}}"#)
+        );
+        // Every match can take the index, so every match gets it.
+        assert_eq!(
+            f.run(&[b"JSON.ARRINSERT", b"doc", b"$..a", b"0", b"0"]),
+            "*3\r\n:4\r\n:3\r\n:2\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"JSON.GET", b"doc"]),
+            bulk(r#"{"a":[0,1,2,3],"n":{"a":[0,9,8],"in":{"a":[0,1]}}}"#)
+        );
+    }
+
+    /// `JSON.ARRINDEX`, whose stop is exclusive and whose start clamps to the
+    /// last element rather than to one past it.
+    ///
+    /// Both of those read like mistakes and both are what RedisJSON does. The
+    /// start is the one that bites: a start of five into an array of four still
+    /// looks at the fourth, so a search that should have run out of array comes
+    /// back with an answer.
+    #[test]
+    fn json_arrindex_has_an_exclusive_stop_and_a_start_that_cannot_run_off_the_end() {
+        let mut f = Fixture::new();
+        f.run(&[b"JSON.SET", b"doc", b"$", br#"{"a":[1,2,3,1],"n":7}"#]);
+
+        assert_eq!(f.run(&[b"JSON.ARRINDEX", b"doc", b".a", b"2"]), ":1\r\n");
+        assert_eq!(f.run(&[b"JSON.ARRINDEX", b"doc", b".a", b"9"]), ":-1\r\n");
+        assert_eq!(
+            f.run(&[b"JSON.ARRINDEX", b"doc", b"$.a", b"2"]),
+            "*1\r\n:1\r\n"
+        );
+
+        // Zero as the stop means the end rather than the front, so leaving it
+        // off and passing it are the same thing.
+        assert_eq!(
+            f.run(&[b"JSON.ARRINDEX", b"doc", b".a", b"1", b"1", b"0"]),
+            ":3\r\n"
+        );
+        // The stop is exclusive, so a stop of three does not look at index
+        // three.
+        assert_eq!(
+            f.run(&[b"JSON.ARRINDEX", b"doc", b".a", b"1", b"1", b"3"]),
+            ":-1\r\n"
+        );
+
+        // The start clamps to the last element in both directions, which is why
+        // a start of four, five or minus one all find the 1 at index three.
+        for start in [&b"4"[..], &b"5"[..], &b"-1"[..]] {
+            assert_eq!(
+                f.run(&[b"JSON.ARRINDEX", b"doc", b".a", b"1", start]),
+                ":3\r\n",
+                "{}",
+                String::from_utf8_lossy(start)
+            );
+        }
+        assert_eq!(
+            f.run(&[b"JSON.ARRINDEX", b"doc", b".a", b"1", b"-100"]),
+            ":0\r\n"
+        );
+        // An empty array is the one case that comes back with nothing, since
+        // the stop is zero and the loop never starts.
+        f.run(&[b"JSON.SET", b"doc", b"$.a", b"[]"]);
+        assert_eq!(
+            f.run(&[b"JSON.ARRINDEX", b"doc", b".a", b"1", b"1"]),
+            ":-1\r\n"
+        );
+
+        // The comparison is structural rather than one of the encoded bytes,
+        // because an object in a stored document holds its keys as intern table
+        // ids where one parsed off the wire holds them as bytes.
+        f.run(&[b"JSON.SET", b"doc", b"$.a", br#"[{"k":1},[1,2],"s"]"#]);
+        assert_eq!(
+            f.run(&[b"JSON.ARRINDEX", b"doc", b".a", br#"{"k":1}"#]),
+            ":0\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"JSON.ARRINDEX", b"doc", b".a", b"[1,2]"]),
+            ":1\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"JSON.ARRINDEX", b"doc", b".a", b"[2,1]"]),
+            ":-1\r\n"
+        );
+
+        // Its errors are a third set again: a missing legacy path is the short
+        // sentence, the wrong kind of value is a WRONGTYPE, and a key that is
+        // not there is about the path on either syntax.
+        assert_eq!(
+            f.run(&[b"JSON.ARRINDEX", b"doc", b".nope", b"1"]),
+            "-ERR Path does not exist\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"JSON.ARRINDEX", b"doc", b".n", b"1"]),
+            "-WRONGTYPE wrong type of path value - expected array\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"JSON.ARRINDEX", b"nokey", b".a", b"1"]),
+            "-ERR Path does not exist\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"JSON.ARRINDEX", b"nokey", b"$.a", b"1"]),
+            "-ERR Path does not exist\r\n"
+        );
+    }
+
     // ---------------------------------------------------------------- vector
 
     /// The first `VADD` fixes the dimension and every one after it has to
