@@ -522,6 +522,25 @@ fn bench_hget(c: &mut Criterion) {
             });
         });
 
+        // The same probe against a field as wide as an index key, because an
+        // index key for an integer is twelve bytes and the fields above are at
+        // most five. Comparing the two directly charges the index for a longer
+        // key and calls the difference overhead, which it is not: a hash asked
+        // for a twelve byte field pays it too. This row is what makes the ratio
+        // below a statement about the table rather than about the key.
+        let wide: Vec<Vec<u8>> = (0..n).map(|i| format!("{i:012}").into_bytes()).collect();
+        let mut long = Hash::with_hint(n, &HashLimits::DEFAULT);
+        for (i, f) in wide.iter().enumerate() {
+            long.set(f, &record(i), &HashLimits::DEFAULT);
+        }
+        g.bench_with_input(BenchmarkId::new("hget12", n), &n, |b, _| {
+            let mut i = 0usize;
+            b.iter(|| {
+                i = (i + 1) % n;
+                black_box(long.get(black_box(&wide[i])))
+            });
+        });
+
         g.bench_with_input(BenchmarkId::new("find", n), &n, |b, _| {
             let mut i = 0usize;
             b.iter(|| {
