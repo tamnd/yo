@@ -128,6 +128,15 @@ const AC_ZSET_BLOCKING_SLOW: &[&str] = &["@write", "@sortedset", "@slow", "@bloc
 const AC_GEO_READ: &[&str] = &["@read", "@geo", "@slow"];
 /// The geo write side, which is GEOADD and the four forms that can store.
 const AC_GEO_WRITE: &[&str] = &["@write", "@geo", "@slow"];
+/// The vector set read side, for the ones that answer about one element.
+const AC_VECTOR_READ_FAST: &[&str] = &["@read", "@vectorset", "@fast"];
+/// The vector set read side for the ones that search or draw.
+const AC_VECTOR_READ_SLOW: &[&str] = &["@read", "@vectorset", "@slow"];
+/// The vector set write side for the ones that only touch what is beside the
+/// vector.
+const AC_VECTOR_WRITE_FAST: &[&str] = &["@write", "@vectorset", "@fast"];
+/// The vector set write side for `VADD`, which searches on the way in.
+const AC_VECTOR_WRITE_SLOW: &[&str] = &["@write", "@vectorset", "@slow"];
 /// The graph read side, for the ones that answer without walking the plane.
 const AC_GRAPH_READ_FAST: &[&str] = &["@read", "@graph", "@fast"];
 /// The graph read side for the ones that walk it.
@@ -2348,6 +2357,163 @@ pub static COMMANDS: &[Spec] = &[
         summary: "A shortest path between two nodes, searched from both ends.",
         group: "graph",
     },
+    // -------------------------------------------------------------- vector
+    Spec {
+        name: "vadd",
+        arity: -5,
+        flags: WRITE_OOM,
+        first_key: 1,
+        last_key: 1,
+        step: 1,
+        acl: AC_VECTOR_WRITE_SLOW,
+        since: "8.0.0",
+        complexity: "O(P*D) with P the partitions probed and D the dimension",
+        summary: "Add a vector to a vector set under an element name.",
+        group: "vector",
+    },
+    Spec {
+        name: "vsim",
+        arity: -4,
+        flags: READ_SLOW,
+        first_key: 1,
+        last_key: 1,
+        step: 1,
+        acl: AC_VECTOR_READ_SLOW,
+        since: "8.0.0",
+        complexity: "O(P*D) with P the partitions probed and D the dimension",
+        summary: "The elements nearest a vector or nearest another element.",
+        group: "vector",
+    },
+    Spec {
+        name: "vrem",
+        arity: 3,
+        flags: WRITE_FAST,
+        first_key: 1,
+        last_key: 1,
+        step: 1,
+        acl: AC_VECTOR_WRITE_FAST,
+        since: "8.0.0",
+        complexity: "O(1)",
+        summary: "Remove an element and its vector from a vector set.",
+        group: "vector",
+    },
+    Spec {
+        name: "vcard",
+        arity: 2,
+        flags: READ_FAST,
+        first_key: 1,
+        last_key: 1,
+        step: 1,
+        acl: AC_VECTOR_READ_FAST,
+        since: "8.0.0",
+        complexity: "O(1)",
+        summary: "How many elements a vector set holds.",
+        group: "vector",
+    },
+    Spec {
+        name: "vdim",
+        arity: 2,
+        flags: READ_FAST,
+        first_key: 1,
+        last_key: 1,
+        step: 1,
+        acl: AC_VECTOR_READ_FAST,
+        since: "8.0.0",
+        complexity: "O(1)",
+        summary: "How many dimensions the vectors in a vector set have.",
+        group: "vector",
+    },
+    Spec {
+        name: "vemb",
+        arity: -3,
+        flags: READ_FAST,
+        first_key: 1,
+        last_key: 1,
+        step: 1,
+        acl: AC_VECTOR_READ_FAST,
+        since: "8.0.0",
+        complexity: "O(D) with D the dimension",
+        summary: "The vector an element went in with.",
+        group: "vector",
+    },
+    Spec {
+        name: "vinfo",
+        arity: 2,
+        flags: READ_FAST,
+        first_key: 1,
+        last_key: 1,
+        step: 1,
+        acl: AC_VECTOR_READ_FAST,
+        since: "8.0.0",
+        complexity: "O(N) with N the elements, for the attribute count",
+        summary: "What a vector set is and how its index is tuned.",
+        group: "vector",
+    },
+    Spec {
+        name: "vismember",
+        arity: 3,
+        flags: READ_FAST,
+        first_key: 1,
+        last_key: 1,
+        step: 1,
+        acl: AC_VECTOR_READ_FAST,
+        since: "8.0.0",
+        complexity: "O(1)",
+        summary: "Whether an element is in a vector set.",
+        group: "vector",
+    },
+    Spec {
+        name: "vrandmember",
+        arity: -2,
+        flags: READ_SLOW,
+        first_key: 1,
+        last_key: 1,
+        step: 1,
+        acl: AC_VECTOR_READ_SLOW,
+        since: "8.0.0",
+        complexity: "O(1) for one, O(N) for a positive count",
+        summary: "Random elements of a vector set.",
+        group: "vector",
+    },
+    Spec {
+        name: "vlinks",
+        arity: -3,
+        flags: READ_SLOW,
+        first_key: 1,
+        last_key: 1,
+        step: 1,
+        acl: AC_VECTOR_READ_SLOW,
+        since: "8.0.0",
+        complexity: "O(P*D) with P the partitions probed and D the dimension",
+        summary: "The elements an element is stored next to.",
+        group: "vector",
+    },
+    Spec {
+        name: "vsetattr",
+        arity: 4,
+        flags: WRITE_FAST_OOM,
+        first_key: 1,
+        last_key: 1,
+        step: 1,
+        acl: AC_VECTOR_WRITE_FAST,
+        since: "8.0.0",
+        complexity: "O(1)",
+        summary: "Set the attribute string on an element, or clear it.",
+        group: "vector",
+    },
+    Spec {
+        name: "vgetattr",
+        arity: 3,
+        flags: READ_FAST,
+        first_key: 1,
+        last_key: 1,
+        step: 1,
+        acl: AC_VECTOR_READ_FAST,
+        since: "8.0.0",
+        complexity: "O(1)",
+        summary: "The attribute string on an element.",
+        group: "vector",
+    },
     // --------------------------------------------------------------- array
     Spec {
         name: "arset",
@@ -3514,7 +3680,7 @@ const SLOTS: usize = 512;
 /// most wants to be able to find.
 const FREE: u16 = u16::MAX;
 
-/// The multiplier, found by searching for one that spreads these 241 names well.
+/// The multiplier, found by searching for one that spreads these 254 names well.
 ///
 /// Not a magic constant in the bad sense: it is checked. Every command is looked
 /// up by its own name in a test, and another test holds the worst probe length
@@ -3532,11 +3698,14 @@ const FREE: u16 = u16::MAX;
 /// HyperLogLog commands kept its worst probe at two and took it from forty nine
 /// extra slots to fifty five, and the search over the 231 names found nothing
 /// better, so that one stood. The ten geo commands took it to sixty, and the
-/// sixth search, over eight million multipliers and all 241 names, found this
-/// one at fifty six. Twenty nine of the names collide on the key itself and no
-/// multiplier can separate them, which is the floor everything here is measured
-/// against.
-const MIX: u64 = 0xf9e1_1b95_048d_6851;
+/// sixth search, over eight million multipliers and all 241 names, found one at
+/// fifty six. The twelve vector set commands took that one to four slots and
+/// seventy extra probes, so the seventh search was run over all 254 names and
+/// found this one at two slots and seventy seven. Twenty nine of the names
+/// collide on the key itself and no multiplier can separate them, which is the
+/// floor everything here is measured against, and none of the twelve joined a
+/// group.
+const MIX: u64 = 0x0eab_5675_42cf_6351;
 
 /// The four bytes the index is computed from: the length, the first two bytes
 /// and the last, lower cased.
@@ -3547,14 +3716,15 @@ const MIX: u64 = 0xf9e1_1b95_048d_6851;
 /// Four bytes and not the whole name because the whole name has to be compared
 /// at the end anyway, so the hash only has to be good enough to get to the right
 /// slot, and reading less of the name is a shorter dependency chain in front of
-/// the multiply. These four leave 226 distinct values over the 241 commands, so
+/// the multiply. These four leave 239 distinct values over the 254 commands, so
 /// twenty nine names collide whatever the multiplier is and probe once more, and
 /// the probe is the same compare the lookup was always going to do. `setnx` and
 /// `setex` are one of those groups and `g.nadd` and `g.eadd` are another, and the
 /// bitmaps added two more, `getset` with `getbit` and `setbit` with `select`. The
 /// eighteen stream commands are in none of them, neither are the five
-/// HyperLogLog ones, and neither are the ten geo ones, since a name is keyed on
-/// its first two bytes and its last and no two of either agree on all three.
+/// HyperLogLog ones, and neither are the ten geo ones or the twelve vector set
+/// ones, since a name is keyed on its first two bytes and its last and no two of
+/// any of them agree on all three.
 ///
 /// `| 0x20` lower cases a letter and does not have to be told which bytes are
 /// letters. It maps the two cases of a name to the same number, which is all
@@ -3636,7 +3806,7 @@ pub fn lookup(name: &[u8]) -> Option<&'static Spec> {
 /// on to both the key hash and the dispatcher.
 ///
 /// `u16::MAX` is the answer for a name that is not a command, which is not a
-/// special case anybody has to write down: the table is 191 entries, so [`at`]
+/// special case anybody has to write down: the table is 254 entries, so [`at`]
 /// hands back `None` for it the same way it would for any other number past the
 /// end.
 #[must_use]
@@ -3837,7 +4007,7 @@ mod tests {
         }
         assert!(worst <= 2, "worst probe is {worst} slots");
         assert!(
-            total <= 56,
+            total <= 77,
             "{total} extra slots walked over the whole table"
         );
     }

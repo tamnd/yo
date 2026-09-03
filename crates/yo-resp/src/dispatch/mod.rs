@@ -70,6 +70,7 @@ mod sets;
 mod streams;
 mod strings;
 pub mod table;
+mod vectors;
 mod zsets;
 
 pub use args::Args;
@@ -1146,6 +1147,10 @@ pub fn resolved(
             "graph" => {
                 let db = session.db;
                 graph::execute(&mut server.dbs[db], spec, args, out).map(|()| Flow::Continue)
+            }
+            "vector" => {
+                let db = session.db;
+                vectors::execute(&mut server.dbs[db], spec, args, out).map(|()| Flow::Continue)
             }
             // The clock is read before the database is borrowed, because every
             // stream command needs the time and it lives on the server. An
@@ -9289,6 +9294,355 @@ mod tests {
             f.run(&[b"G.OUT", b"social", b"third", b"F"]),
             "*2\r\n$1\r\n0\r\n*1\r\n$6\r\nsecond\r\n"
         );
+    }
+
+    // ---------------------------------------------------------------- vector
+
+    /// The first `VADD` fixes the dimension and every one after it has to
+    /// agree, because there is no create command to say it earlier.
+    #[test]
+    fn the_first_vadd_decides_how_wide_the_set_is() {
+        let mut f = Fixture::new();
+        assert_eq!(
+            f.run(&[b"VADD", b"v", b"VALUES", b"2", b"1", b"0", b"east"]),
+            ":1\r\n"
+        );
+        assert_eq!(f.run(&[b"VDIM", b"v"]), ":2\r\n");
+        assert_eq!(f.run(&[b"VCARD", b"v"]), ":1\r\n");
+        // A second vector under the same name replaces it and says so with a
+        // zero, so an ingest can count what it created.
+        assert_eq!(
+            f.run(&[b"VADD", b"v", b"VALUES", b"2", b"0", b"1", b"east"]),
+            ":0\r\n"
+        );
+        assert_eq!(f.run(&[b"VCARD", b"v"]), ":1\r\n");
+        // Three dimensions into a two dimensional set names both numbers, since
+        // a client that gets this wrong needs to know which end is which.
+        assert_eq!(
+            f.run(&[b"VADD", b"v", b"VALUES", b"3", b"1", b"0", b"0", b"up"]),
+            "-ERR Vector dimension mismatch - got 3 but set has 2\r\n"
+        );
+        // A vector of zeros has no direction, so a cosine set has nowhere to
+        // put it.
+        assert_eq!(
+            f.run(&[b"VADD", b"v", b"VALUES", b"2", b"0", b"0", b"nowhere"]),
+            "-ERR a cosine collection compares directions and a vector of length zero has none\r\n"
+        );
+        // Nothing above created a key, and a set that never took a vector has
+        // no dimension to report.
+        assert_eq!(f.run(&[b"EXISTS", b"fresh"]), ":0\r\n");
+        assert_eq!(f.run(&[b"VDIM", b"fresh"]), "-ERR key does not exist\r\n");
+        assert_eq!(f.run(&[b"VCARD", b"fresh"]), ":0\r\n");
+    }
+
+    /// What a client sent comes back out, and what a client asked for is a
+    /// similarity and not the distance underneath it.
+    #[test]
+    fn vemb_gives_back_the_vector_and_vsim_gives_back_a_similarity() {
+        let mut f = Fixture::new();
+        f.run(&[b"VADD", b"v", b"VALUES", b"2", b"3", b"4", b"a"]);
+        // The set stored the unit vector and the length is multiplied back on
+        // the way out, so `3 4` and not `0.6 0.8`.
+        assert_eq!(
+            f.run(&[b"VEMB", b"v", b"a"]),
+            "*2\r\n$1\r\n3\r\n$1\r\n4\r\n"
+        );
+        assert_eq!(f.run(&[b"VEMB", b"v", b"nobody"]), "*-1\r\n");
+        assert_eq!(f.run(&[b"VEMB", b"nokey", b"a"]), "*-1\r\n");
+
+        // On the axes, where the unit vector is exact and so is the dot
+        // product, both ends of the scale come out exact: the same direction is
+        // 1 and the opposite one is 0, with a right angle at a half.
+        let mut f = Fixture::new();
+        f.run(&[b"VADD", b"v", b"VALUES", b"2", b"3", b"0", b"a"]);
+        f.run(&[b"VADD", b"v", b"VALUES", b"2", b"-1", b"0", b"opposite"]);
+        f.run(&[b"VADD", b"v", b"VALUES", b"2", b"0", b"7", b"across"]);
+        assert_eq!(
+            f.run(&[b"VSIM", b"v", b"VALUES", b"2", b"2", b"0", b"WITHSCORES"]),
+            "*6\r\n$1\r\na\r\n$1\r\n1\r\n$6\r\nacross\r\n$3\r\n0.5\r\n\
+             $8\r\nopposite\r\n$1\r\n0\r\n"
+        );
+        // A search from an element leaves that element out, since it is always
+        // its own nearest neighbour.
+        assert_eq!(
+            f.run(&[b"VSIM", b"v", b"ELE", b"a"]),
+            "*2\r\n$6\r\nacross\r\n$8\r\nopposite\r\n"
+        );
+        // An element that is not there is an empty answer and not an error,
+        // which is what a missing key gives too.
+        assert_eq!(f.run(&[b"VSIM", b"v", b"ELE", b"nobody"]), "*0\r\n");
+        assert_eq!(f.run(&[b"VSIM", b"nokey", b"ELE", b"a"]), "*0\r\n");
+        // COUNT bounds it and TRUTH reads every vector rather than the codes,
+        // which has to agree with the index on a set this small.
+        assert_eq!(
+            f.run(&[b"VSIM", b"v", b"ELE", b"a", b"COUNT", b"1"]),
+            "*1\r\n$6\r\nacross\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"VSIM", b"v", b"ELE", b"a", b"TRUTH"]),
+            "*2\r\n$6\r\nacross\r\n$8\r\nopposite\r\n"
+        );
+        // EF widens how much of the index is read and does not change how many
+        // answers come back, so a wide search still returns what COUNT asked
+        // for.
+        assert_eq!(
+            f.run(&[b"VSIM", b"v", b"ELE", b"a", b"COUNT", b"1", b"EF", b"500"]),
+            "*1\r\n$6\r\nacross\r\n"
+        );
+
+        // On RESP3 a scored search is a map, which is what the vector set
+        // module replies and is not what ZRANGE does here.
+        let mut g = Fixture::new();
+        g.run(&[b"HELLO", b"3"]);
+        g.run(&[b"VADD", b"v", b"VALUES", b"2", b"1", b"0", b"east"]);
+        assert_eq!(
+            g.run(&[b"VSIM", b"v", b"VALUES", b"2", b"1", b"0", b"WITHSCORES"]),
+            "%1\r\n$4\r\neast\r\n,1\r\n"
+        );
+    }
+
+    /// The attribute pair, and the one reply that means two things.
+    #[test]
+    fn an_attribute_is_bytes_and_an_empty_one_takes_it_off() {
+        let mut f = Fixture::new();
+        f.run(&[b"VADD", b"v", b"VALUES", b"2", b"1", b"0", b"east"]);
+        assert_eq!(f.run(&[b"VGETATTR", b"v", b"east"]), "$-1\r\n");
+        assert_eq!(f.run(&[b"VSETATTR", b"v", b"east", b"{\"k\":1}"]), ":1\r\n");
+        assert_eq!(f.run(&[b"VGETATTR", b"v", b"east"]), "$7\r\n{\"k\":1}\r\n");
+        // Not parsed as JSON, because nothing reads into it yet and refusing a
+        // write for a rule nothing enforces would be the wrong trade.
+        assert_eq!(f.run(&[b"VSETATTR", b"v", b"east", b"not json"]), ":1\r\n");
+        assert_eq!(f.run(&[b"VGETATTR", b"v", b"east"]), "$8\r\nnot json\r\n");
+        // An empty string clears it, which is Redis's spelling of the removal.
+        assert_eq!(f.run(&[b"VSETATTR", b"v", b"east", b""]), ":1\r\n");
+        assert_eq!(f.run(&[b"VGETATTR", b"v", b"east"]), "$-1\r\n");
+        // An element that is not there answers zero rather than being created,
+        // since an attribute with no vector under it is not a thing this holds.
+        assert_eq!(f.run(&[b"VSETATTR", b"v", b"nobody", b"{}"]), ":0\r\n");
+        assert_eq!(f.run(&[b"VSETATTR", b"nokey", b"east", b"{}"]), ":0\r\n");
+        assert_eq!(f.run(&[b"EXISTS", b"nokey"]), ":0\r\n");
+        // A null for an element with no attribute and a null for one that is
+        // not there. VISMEMBER is how a client tells the two apart.
+        assert_eq!(f.run(&[b"VGETATTR", b"v", b"nobody"]), "$-1\r\n");
+        assert_eq!(f.run(&[b"VISMEMBER", b"v", b"east"]), ":1\r\n");
+        assert_eq!(f.run(&[b"VISMEMBER", b"v", b"nobody"]), ":0\r\n");
+        assert_eq!(f.run(&[b"VISMEMBER", b"nokey", b"east"]), ":0\r\n");
+
+        // WITHATTRIBS carries it alongside the answers.
+        f.run(&[b"VSETATTR", b"v", b"east", b"{\"k\":1}"]);
+        f.run(&[b"VADD", b"v", b"VALUES", b"2", b"0", b"1", b"north"]);
+        assert_eq!(
+            f.run(&[b"VSIM", b"v", b"VALUES", b"2", b"1", b"0", b"WITHATTRIBS"]),
+            "*4\r\n$4\r\neast\r\n$7\r\n{\"k\":1}\r\n$5\r\nnorth\r\n$-1\r\n"
+        );
+    }
+
+    /// The slot a removed element had is reused, and nothing that was beside it
+    /// comes back with the next element to get it.
+    #[test]
+    fn vrem_takes_the_attribute_with_it() {
+        let mut f = Fixture::new();
+        f.run(&[b"VADD", b"v", b"VALUES", b"2", b"1", b"0", b"east"]);
+        f.run(&[b"VSETATTR", b"v", b"east", b"{\"k\":1}"]);
+        assert_eq!(f.run(&[b"VREM", b"v", b"east"]), ":1\r\n");
+        assert_eq!(f.run(&[b"VREM", b"v", b"east"]), ":0\r\n");
+        assert_eq!(f.run(&[b"VREM", b"nokey", b"east"]), ":0\r\n");
+        // The key went with the last element, the way every other collection
+        // here works.
+        assert_eq!(f.run(&[b"EXISTS", b"v"]), ":0\r\n");
+
+        // The next element is given the slot the removed one had, and it comes
+        // with no attribute on it.
+        f.run(&[b"VADD", b"v", b"VALUES", b"2", b"1", b"0", b"east"]);
+        f.run(&[b"VSETATTR", b"v", b"east", b"{\"k\":1}"]);
+        f.run(&[b"VADD", b"v", b"VALUES", b"2", b"0", b"1", b"north"]);
+        f.run(&[b"VREM", b"v", b"east"]);
+        f.run(&[b"VADD", b"v", b"VALUES", b"2", b"1", b"1", b"between"]);
+        assert_eq!(f.run(&[b"VGETATTR", b"v", b"between"]), "$-1\r\n");
+    }
+
+    /// `VINFO` says what the index is before it says anything a client could
+    /// mistake for a graph.
+    #[test]
+    fn vinfo_says_partition_first() {
+        let mut f = Fixture::new();
+        f.run(&[
+            b"VADD", b"v", b"VALUES", b"2", b"1", b"0", b"east", b"M", b"32",
+        ]);
+        f.run(&[b"VSETATTR", b"v", b"east", b"{}"]);
+        let info = f.run(&[b"VINFO", b"v"]);
+        assert!(info.starts_with("*24\r\n$10\r\nindex-type\r\n$9\r\npartition\r\n"));
+        // What the client asked for and not what happened to the tuning, which
+        // is `10` section 7: M is recorded and changes nothing.
+        assert!(info.contains("$6\r\nhnsw-m\r\n:32\r\n"), "{info}");
+        assert!(info.contains("$10\r\nvector-dim\r\n:2\r\n"), "{info}");
+        assert!(info.contains("$16\r\nattributes-count\r\n:1\r\n"), "{info}");
+        // The quantisation is recorded and not applied, which is D-32, so it
+        // reports back what was sent.
+        assert!(
+            info.contains("$10\r\nquant-type\r\n$3\r\nf32\r\n"),
+            "{info}"
+        );
+        f.run(&[b"VADD", b"v", b"VALUES", b"2", b"0", b"1", b"north", b"BIN"]);
+        assert!(
+            f.run(&[b"VINFO", b"v"])
+                .contains("$10\r\nquant-type\r\n$3\r\nbin\r\n")
+        );
+        assert_eq!(f.run(&[b"VINFO", b"nokey"]), "$-1\r\n");
+    }
+
+    /// The three options that ask for something this index does not have say so
+    /// rather than doing something else quietly.
+    #[test]
+    fn reduce_and_filter_are_refused_and_not_ignored() {
+        let mut f = Fixture::new();
+        let reduce = f.run(&[
+            b"VADD", b"v", b"REDUCE", b"1", b"VALUES", b"2", b"1", b"0", b"east",
+        ]);
+        assert!(
+            reduce.starts_with("-ERR REDUCE is not supported."),
+            "{reduce}"
+        );
+        assert_eq!(f.run(&[b"EXISTS", b"v"]), ":0\r\n");
+
+        f.run(&[b"VADD", b"v", b"VALUES", b"2", b"1", b"0", b"east"]);
+        let filter = f.run(&[b"VSIM", b"v", b"ELE", b"east", b"FILTER", b".k == 1"]);
+        assert!(
+            filter.starts_with("-ERR FILTER is not supported yet."),
+            "{filter}"
+        );
+        // The parse happens before the key is read, so a filtered search over a
+        // key that is not there is the same refusal and not an empty answer.
+        let missing = f.run(&[b"VSIM", b"nokey", b"ELE", b"e", b"FILTER", b".k == 1"]);
+        assert!(missing.starts_with("-ERR FILTER"), "{missing}");
+    }
+
+    /// A vector set key is a key, so the keyspace owns it the way it owns every
+    /// other one and none of those commands know what is inside it.
+    #[test]
+    fn the_keyspace_sees_a_vector_set_key_like_any_other() {
+        let mut f = Fixture::new();
+        f.run(&[b"VADD", b"v", b"VALUES", b"2", b"1", b"0", b"east"]);
+        assert_eq!(f.run(&[b"TYPE", b"v"]), "+vectorset\r\n");
+        assert_eq!(f.run(&[b"EXISTS", b"v"]), ":1\r\n");
+        assert_eq!(f.run(&[b"OBJECT", b"ENCODING", b"v"]), "$6\r\nrabitq\r\n");
+        assert_eq!(f.run(&[b"KEYS", b"*"]), "*1\r\n$1\r\nv\r\n");
+        assert_eq!(f.run(&[b"DBSIZE"]), ":1\r\n");
+        assert_eq!(f.run(&[b"EXPIRE", b"v", b"100"]), ":1\r\n");
+        assert_eq!(f.run(&[b"TTL", b"v"]), ":100\r\n");
+        assert_eq!(f.run(&[b"PERSIST", b"v"]), ":1\r\n");
+        assert_eq!(f.run(&[b"DEL", b"v"]), ":1\r\n");
+        assert_eq!(f.run(&[b"EXISTS", b"v"]), ":0\r\n");
+
+        // And the wrong type is the wrong type in both directions.
+        f.run(&[b"SET", b"s", b"1"]);
+        assert_eq!(
+            f.run(&[b"VADD", b"s", b"VALUES", b"2", b"1", b"0", b"east"]),
+            "-WRONGTYPE Operation against a key holding the wrong kind of value\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"VCARD", b"s"]),
+            "-WRONGTYPE Operation against a key holding the wrong kind of value\r\n"
+        );
+        f.run(&[b"VADD", b"v", b"VALUES", b"2", b"1", b"0", b"east"]);
+        assert_eq!(
+            f.run(&[b"GET", b"v"]),
+            "-WRONGTYPE Operation against a key holding the wrong kind of value\r\n"
+        );
+        // A graph and a vector set share the escape in the record tag and are
+        // still two different types, which is the case the tag alone cannot
+        // decide.
+        f.run(&[b"G.NADD", b"social", b"ada"]);
+        assert_eq!(
+            f.run(&[b"VCARD", b"social"]),
+            "-WRONGTYPE Operation against a key holding the wrong kind of value\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"G.NGET", b"v", b"ada"]),
+            "-WRONGTYPE Operation against a key holding the wrong kind of value\r\n"
+        );
+    }
+
+    /// `VRANDMEMBER` is `SRANDMEMBER` over the element names, in both of its
+    /// shapes, off the database's own generator.
+    #[test]
+    fn vrandmember_has_the_two_shapes_srandmember_has() {
+        let mut f = Fixture::new();
+        for (i, name) in [&b"a"[..], b"b", b"c"].iter().enumerate() {
+            let x = (i + 1).to_string();
+            f.run(&[b"VADD", b"v", b"VALUES", b"2", x.as_bytes(), b"1", name]);
+        }
+        // One element is a bulk string and not an array of one.
+        let one = f.run(&[b"VRANDMEMBER", b"v"]);
+        assert!(one.starts_with("$1\r\n"), "{one}");
+        // A positive count is distinct and stops at the size of the set.
+        let mut all = f.run(&[b"VRANDMEMBER", b"v", b"9"]);
+        assert!(all.starts_with("*3\r\n"), "{all}");
+        for name in ["a", "b", "c"] {
+            assert!(all.contains(name), "{all} is missing {name}");
+        }
+        all = f.run(&[b"VRANDMEMBER", b"v", b"2"]);
+        assert!(all.starts_with("*2\r\n"), "{all}");
+        // A negative one draws that many and allows repeats.
+        let many = f.run(&[b"VRANDMEMBER", b"v", b"-5"]);
+        assert!(many.starts_with("*5\r\n"), "{many}");
+        // A key that is not there answers the shape that was asked for.
+        assert_eq!(f.run(&[b"VRANDMEMBER", b"nokey"]), "$-1\r\n");
+        assert_eq!(f.run(&[b"VRANDMEMBER", b"nokey", b"3"]), "*0\r\n");
+    }
+
+    /// `VLINKS` answers about the index that is here rather than the graph that
+    /// is not, which is D-2.
+    #[test]
+    fn vlinks_reports_one_layer_of_partition_neighbours() {
+        let mut f = Fixture::new();
+        f.run(&[b"VADD", b"v", b"VALUES", b"2", b"1", b"0", b"east"]);
+        f.run(&[b"VADD", b"v", b"VALUES", b"2", b"0", b"1", b"north"]);
+        // One layer deep, because the index is one layer deep, so a client
+        // walking layers gets a short list and not a shape it cannot parse.
+        assert_eq!(
+            f.run(&[b"VLINKS", b"v", b"east"]),
+            "*1\r\n*1\r\n$5\r\nnorth\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"VLINKS", b"v", b"east", b"WITHSCORES"]),
+            "*1\r\n*2\r\n$5\r\nnorth\r\n$3\r\n0.5\r\n"
+        );
+        assert_eq!(f.run(&[b"VLINKS", b"v", b"nobody"]), "*-1\r\n");
+        assert_eq!(f.run(&[b"VLINKS", b"nokey", b"east"]), "*-1\r\n");
+    }
+
+    /// A vector arrives either as digits or as bytes, and the two have to mean
+    /// the same thing.
+    #[test]
+    fn fp32_and_values_are_the_same_vector() {
+        let mut f = Fixture::new();
+        let mut blob = Vec::new();
+        for x in [3.0f32, 4.0] {
+            blob.extend_from_slice(&x.to_le_bytes());
+        }
+        assert_eq!(f.run(&[b"VADD", b"v", b"FP32", &blob, b"a"]), ":1\r\n");
+        assert_eq!(f.run(&[b"VDIM", b"v"]), ":2\r\n");
+        assert_eq!(
+            f.run(&[b"VEMB", b"v", b"a"]),
+            "*2\r\n$1\r\n3\r\n$1\r\n4\r\n"
+        );
+        // RAW is the stored form and the number that turns it back into the
+        // client's, which is the unit vector and the length it arrived with.
+        let raw = f.run(&[b"VEMB", b"v", b"a", b"RAW"]);
+        assert!(raw.starts_with("*3\r\n$3\r\nf32\r\n$8\r\n"), "{raw}");
+        assert!(raw.ends_with("$1\r\n5\r\n"), "{raw}");
+        // A blob that is not a whole number of floats is not a vector.
+        assert_eq!(
+            f.run(&[b"VADD", b"w", b"FP32", b"abc", b"a"]),
+            "-ERR invalid vector specification\r\n"
+        );
+        // Neither is a count that promises more than arrived.
+        assert_eq!(
+            f.run(&[b"VADD", b"w", b"VALUES", b"4", b"1", b"0", b"a"]),
+            "-ERR syntax error\r\n"
+        );
+        assert_eq!(f.run(&[b"EXISTS", b"w"]), ":0\r\n");
     }
 
     /// The three shapes an `XADD` id can take, and the one rule behind all of

@@ -961,6 +961,8 @@ dependencies = [
  "yo-graph",
  "yo-kv",
  "yo-reactor",
+ "yo-shape",
+ "yo-vector",
 ]
 
 [[package]]

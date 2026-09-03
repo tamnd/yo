@@ -118,6 +118,20 @@ doc = "11 section 7"
 # against the embedded API where the compiler checks it before it runs.
 
 [[group]]
+name = "vector"
+expected = 12
+status = "shipped"
+doc = "10 section 9"
+# Redis's twelve, with Redis's names and Redis's argument order, over an index
+# that is not the one Redis has. That is the whole point of the group: the
+# reason to keep the command surface exactly is so a client can be pointed at
+# either server without a change, and the reason to keep a different index is
+# that a partition index answers the same question on a thirty second of the
+# memory. Where the difference reaches the wire it is D-2 for VLINKS and D-31
+# through D-33 for the three options that ask for something the index does not
+# have.
+
+[[group]]
 name = "stream"
 expected = 20
 status = "partial"
@@ -2321,6 +2335,145 @@ bounded = "yes"
 status = "shipped"
 wire = "verified"
 notes = "A search from both ends at once, expanding whichever side is smaller. A one sided search over a graph of branching factor b touches b to the d and two half searches touch twice b to the d over 2, so at a branching factor of 30 and a distance of 6 that is 729 million against 54 thousand. Each side keeps who it came from, one integer per node touched, and the path is read back by walking the two parents from where they met rather than by carrying whole paths in the frontier. Every label at once, because a shortest path question asked of a graph with two kinds of edge means either one."
+
+
+# --------------------------------------------------------------------- vector
+
+[[command]]
+name = "VADD"
+group = "vector"
+since = "8.0.0"
+arity = -5
+plan = "point"
+bounded = "yes"
+status = "shipped"
+wire = "verified"
+divergent = "D-31,D-32"
+notes = "The vector is parsed, checked and made a unit vector before the key is touched, so a VADD with a bad option or a vector full of zeros creates nothing rather than creating an empty set and then failing. The reply is 1 for an element that was not there and 0 for one whose vector was replaced, which is what lets an ingest count what it created without reading anything back. The first VADD fixes the dimension because there is no create command to fix it earlier, and every one after it that disagrees is an error naming both numbers. The length the vector arrived with is kept beside the element, since a cosine set stores the unit vector and VEMB is supposed to give back roughly what went in. Insertion probes the index the same way a search does, so the cost is the probe count times the dimension and not the size of the set."
+
+[[command]]
+name = "VSIM"
+group = "vector"
+since = "8.0.0"
+arity = -4
+plan = "point"
+bounded = "yes"
+status = "shipped"
+wire = "verified"
+divergent = "D-33"
+notes = "A search from a vector or from an element already in the set, and the element form leaves that element out because it is always its own nearest neighbour and nobody asked. The score is a similarity and not a distance: the collection measures one minus the cosine, from 0 for the same direction to 2 for the opposite one, and the reply is 1 minus half of that, so an identical vector scores exactly 1 and an opposite one exactly 0. WITHSCORES replies as a map under RESP3, which is what the vector set module does and is not what ZRANGE does here, and the difference is deliberate: a client that already parses one of these should not have to tell the two servers apart. EF widens the search by raising how many candidates are ranked, which is the knob this index has for the thing EF names. TRUTH reads every vector and no codes at all, which is what recall is measured against and is the only reply here with no approximation in it."
+
+[[command]]
+name = "VREM"
+group = "vector"
+since = "8.0.0"
+arity = 3
+plan = "point"
+bounded = "inherent"
+status = "shipped"
+wire = "verified"
+notes = "The element's id is read before the removal and not after, because afterwards the slot it named is free and the next VADD is given it, and the attribute string sitting in that slot would come back under a name that never wrote it. The vector's slot goes back to the free list and its code stays in the posting until maintenance walks past it, which is the same deferred cost every partition index pays and is why a set that is written and deleted in a loop does not grow. The key goes when the last element does, the way every other collection here works."
+
+[[command]]
+name = "VCARD"
+group = "vector"
+since = "8.0.0"
+arity = 2
+plan = "metadata"
+bounded = "inherent"
+status = "shipped"
+wire = "verified"
+notes = "A counter on the key table. Zero for a key that is not there rather than an error, since a vector set with nothing in it does not exist and a client counting one is asking a question that has an answer."
+
+[[command]]
+name = "VDIM"
+group = "vector"
+since = "8.0.0"
+arity = 2
+plan = "metadata"
+bounded = "inherent"
+status = "shipped"
+wire = "verified"
+notes = "One field off the collection. A key that is not there is an error and not zero, because zero is a number a client could pass to VADD and get a different error out of, and there is no dimension to report before the first vector arrives."
+
+[[command]]
+name = "VEMB"
+group = "vector"
+since = "8.0.0"
+arity = -3
+plan = "point"
+bounded = "inherent"
+status = "shipped"
+wire = "verified"
+notes = "The unit vector multiplied back by the length it arrived with, so a vector sent as 3 and 4 comes back as 3 and 4 and not as 0.6 and 0.8. It is roughly and not exactly, because the normalisation and the multiplication are both float32 and neither is reversible, which is the same thing Redis says about its own answer. RAW gives the stored form instead: the string f32, the unit vector as little endian float32, and the length as the number that turns one into the other. There is no quantisation range in that reply because the bytes are not quantised, which is one field fewer than a real vector set sends and is the honest count for what is stored."
+
+[[command]]
+name = "VINFO"
+group = "vector"
+since = "8.0.0"
+arity = 2
+plan = "metadata"
+bounded = "inherent"
+status = "shipped"
+wire = "verified"
+divergent = "D-32"
+notes = "index-type is the first field and says partition, because everything under it is describing an index that is not a graph and a client reading hnsw-m without reading that would draw the wrong conclusion from it. hnsw-m, ef-construction and ef-runtime are what the client asked for rather than what happened, which is 10 section 7: two of the three moved the tuning and M did not, and reporting the tuning under a name that says M would be answering a different question. partitions, probe, rerank and code-bytes are the index that actually ran, and they are the four numbers worth having when a search is slower or less accurate than expected. attributes-count walks the elements, which is the one field here that is not O(1)."
+
+[[command]]
+name = "VISMEMBER"
+group = "vector"
+since = "8.0.0"
+arity = 3
+plan = "point"
+bounded = "inherent"
+status = "shipped"
+wire = "verified"
+notes = "One lookup in the key table, which is the same open addressed table every other keyed shape in this build uses, so this costs what SISMEMBER costs and reads no vector at all."
+
+[[command]]
+name = "VRANDMEMBER"
+group = "vector"
+since = "8.0.0"
+arity = -2
+plan = "cursor"
+bounded = "yes"
+status = "shipped"
+wire = "verified"
+notes = "The two shapes SRANDMEMBER has, for the same reasons: a negative count draws that many with repeats allowed and a positive one draws distinct elements and stops at the size of the set. The distinct form shuffles the positions and takes the front rather than drawing and rejecting, because rejection gets slower the closer the count gets to the size and is unbounded at the end of it. The draws come off the database's own generator through Keyspace::random rather than off one held in the set, so a run under Keyspace::seed repeats exactly the way a run of SRANDMEMBER does."
+
+[[command]]
+name = "VLINKS"
+group = "vector"
+since = "8.0.0"
+arity = -3
+plan = "point"
+bounded = "yes"
+status = "shipped"
+wire = "verified"
+divergent = "D-2"
+notes = "There is no HNSW graph here, so there are no layer by layer links to report, and the question the command is asking still has an answer: which elements this one is stored next to. That is its own partition, nearest first, which is what a client drawing a neighbourhood out of this actually wants. The reply is one layer deep because the index is one layer deep, so a client walking layers gets a short list rather than a shape it cannot parse. D-2 has said this would be the answer since the register was written."
+
+[[command]]
+name = "VSETATTR"
+group = "vector"
+since = "8.0.0"
+arity = 4
+plan = "point"
+bounded = "inherent"
+status = "shipped"
+wire = "verified"
+notes = "The attribute is bytes here and not parsed as JSON, because the only thing that reads into it is the FILTER expression language and that is D-33, so validating it would be refusing writes for a rule nothing enforces yet. An empty string clears the attribute, which is Redis's spelling of the removal and is why this is one command and not two. It answers 0 for an element that is not there rather than creating one, since an attribute with no vector under it is not a thing a vector set can hold."
+
+[[command]]
+name = "VGETATTR"
+group = "vector"
+since = "8.0.0"
+arity = 3
+plan = "point"
+bounded = "inherent"
+status = "shipped"
+wire = "verified"
+notes = "A null for an element with no attribute and a null for an element that is not there, which is the same reply for two different facts and is what a real vector set answers. VISMEMBER is how a client tells them apart, and adding a third reply here to save that round trip would be a divergence bought for nothing."
 
 
 # ---------------------------------------------------------------------- array

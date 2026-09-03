@@ -234,3 +234,27 @@ reason = "A Redis 8.10 dumps a stream as type 27, which is the type 21 payload w
 status = "until"
 resolved_by = "M8"
 spec = "14 section 5"
+
+[[divergence]]
+id = "D-31"
+title = "VADD REDUCE is refused rather than ignored"
+reason = "REDUCE asks for the vector to be projected onto fewer dimensions on the way in, using a random projection built when the set is created. The projection itself is not the problem, since the rotation this index already applies is one, but what it changes is what the set is: a client that sends 300 dimensions under REDUCE 100 has a 100 dimensional set afterwards, and VDIM has to say 100, and VEMB gives back the projection and not the vector. Accepting the option and storing the full vector anyway would leave that client with a set three times the size it budgeted for, being told by VDIM that it is the size it asked for, which is worse than being told the option is not here. So it is an error, and a client that wants the reduction can do it on its own side where it can see the matrix it used."
+status = "until"
+resolved_by = "M6"
+spec = "10 section 9"
+
+[[divergence]]
+id = "D-32"
+title = "NOQUANT, BIN and Q8 are recorded and change nothing"
+reason = "The three of them pick how a vector set stores a vector: full precision floats, one bit a dimension, or one byte a dimension. This stores the full precision vector and a one bit RaBitQ code beside it whatever is asked for, and the search reads the codes to pick candidates and then the floats to rank them. That is at least as accurate as NOQUANT, which is the most accurate of the three, and it uses the memory of NOQUANT plus a thirty second, so a client asking for BIN to save memory does not get the saving. Refusing the options instead would break clients that pass BIN as a tuning hint and would gain them nothing, since the accuracy they would lose by being refused is accuracy they were trying to trade away in the first place. VINFO reports back what was asked for rather than what is stored, so quant-type says bin when BIN was sent, and that is the one field where this register is what a client has to read to know what happened. This closes when the format freeze decides whether a collection can be told to drop its floats."
+status = "until"
+resolved_by = "M6"
+spec = "10 section 9"
+
+[[divergence]]
+id = "D-33"
+title = "VSIM FILTER and FILTER-EF are refused"
+reason = "FILTER takes an expression over the JSON attributes on the elements and only returns the ones it matches, and FILTER-EF bounds how much of the index it is allowed to read before giving up. The scan they push into exists here, since the partition search already visits candidates one at a time and yo_vector::Filter is the hook for exactly this, and what is missing is the expression language over the attribute strings. The reason it is an error rather than a filter applied to the answers after the search is that those are not the same command. A filter that matches one element in a thousand, applied to the ten nearest, returns nothing at all almost every time, and a client would read that as no matches rather than as the search not having looked far enough. Refusing says which of the two it is. This closes when the filtered search lands with the document field index, which is the same piece of work: the filter reads indexed fields inside the posting scan whether they came from a document or from a SETATTR string."
+status = "until"
+resolved_by = "M6"
+spec = "10 section 9"
