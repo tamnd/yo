@@ -137,6 +137,20 @@ const AC_VECTOR_READ_SLOW: &[&str] = &["@read", "@vectorset", "@slow"];
 const AC_VECTOR_WRITE_FAST: &[&str] = &["@write", "@vectorset", "@fast"];
 /// The vector set write side for `VADD`, which searches on the way in.
 const AC_VECTOR_WRITE_SLOW: &[&str] = &["@write", "@vectorset", "@slow"];
+/// The JSON read side. Two categories and no speed one, which is RedisJSON's
+/// own answer to `COMMAND INFO` and not an omission: the module registers
+/// `@read @json` and leaves it there.
+const AC_JSON_READ: &[&str] = &["@read", "@json"];
+/// The JSON write side, the same way.
+const AC_JSON_WRITE: &[&str] = &["@write", "@json"];
+/// A JSON read, with the `module` flag every RedisJSON command carries. It is
+/// there because the command came from a module on a real server, and a client
+/// that reads the flags off `COMMAND INFO` should see the same list from both.
+const JSON_READ: &[&str] = &["readonly", "module"];
+/// A JSON write that does not grow the document.
+const JSON_WRITE: &[&str] = &["write", "module"];
+/// A JSON write that does, which is `JSON.SET` and nothing else here.
+const JSON_WRITE_OOM: &[&str] = &["write", "denyoom", "module"];
 /// The graph read side, for the ones that answer without walking the plane.
 const AC_GRAPH_READ_FAST: &[&str] = &["@read", "@graph", "@fast"];
 /// The graph read side for the ones that walk it.
@@ -2357,6 +2371,111 @@ pub static COMMANDS: &[Spec] = &[
         summary: "A shortest path between two nodes, searched from both ends.",
         group: "graph",
     },
+    // ---------------------------------------------------------------- json
+    Spec {
+        name: "json.set",
+        arity: -4,
+        flags: JSON_WRITE_OOM,
+        first_key: 1,
+        last_key: 1,
+        step: 1,
+        acl: AC_JSON_WRITE,
+        since: "1.0.0",
+        complexity: "O(N) with N the size of the document",
+        summary: "Set the value at a path, creating the document at the root.",
+        group: "json",
+    },
+    Spec {
+        name: "json.get",
+        arity: -2,
+        flags: JSON_READ,
+        first_key: 1,
+        last_key: 1,
+        step: 1,
+        acl: AC_JSON_READ,
+        since: "1.0.0",
+        complexity: "O(N) with N the size of what the paths matched",
+        summary: "The values one or more paths match, as JSON text.",
+        group: "json",
+    },
+    Spec {
+        name: "json.mget",
+        arity: -3,
+        flags: JSON_READ,
+        first_key: 1,
+        last_key: -2,
+        step: 1,
+        acl: AC_JSON_READ,
+        since: "1.0.0",
+        complexity: "O(K*N) with K the keys and N the size of each document",
+        summary: "One path against several documents, one answer per key.",
+        group: "json",
+    },
+    Spec {
+        name: "json.del",
+        arity: -2,
+        flags: JSON_WRITE,
+        first_key: 1,
+        last_key: 1,
+        step: 1,
+        acl: AC_JSON_WRITE,
+        since: "1.0.0",
+        complexity: "O(N) with N the size of the document",
+        summary: "Remove what a path matched, or the key when it is the root.",
+        group: "json",
+    },
+    Spec {
+        name: "json.forget",
+        arity: -2,
+        flags: JSON_WRITE,
+        first_key: 1,
+        last_key: 1,
+        step: 1,
+        acl: AC_JSON_WRITE,
+        since: "1.0.0",
+        complexity: "O(N) with N the size of the document",
+        summary: "The same command as JSON.DEL, under its other name.",
+        group: "json",
+    },
+    Spec {
+        name: "json.type",
+        arity: -2,
+        flags: JSON_READ,
+        first_key: 1,
+        last_key: 1,
+        step: 1,
+        acl: AC_JSON_READ,
+        since: "1.0.0",
+        complexity: "O(N) with N the size of the document",
+        summary: "The JSON type of what a path matched.",
+        group: "json",
+    },
+    Spec {
+        name: "json.toggle",
+        arity: 3,
+        flags: JSON_WRITE,
+        first_key: 1,
+        last_key: 1,
+        step: 1,
+        acl: AC_JSON_WRITE,
+        since: "2.0.0",
+        complexity: "O(N) with N the size of the document",
+        summary: "Flip every boolean a path matched.",
+        group: "json",
+    },
+    Spec {
+        name: "json.clear",
+        arity: -2,
+        flags: JSON_WRITE,
+        first_key: 1,
+        last_key: 1,
+        step: 1,
+        acl: AC_JSON_WRITE,
+        since: "2.0.0",
+        complexity: "O(N) with N the size of the document",
+        summary: "Empty the containers and zero the numbers a path matched.",
+        group: "json",
+    },
     // -------------------------------------------------------------- vector
     Spec {
         name: "vadd",
@@ -3687,7 +3806,7 @@ const FREE: u16 = u16::MAX;
 /// at what it is now, so a command added later that made this multiplier bad
 /// would fail rather than quietly cost every lookup an extra slot.
 ///
-/// It has been searched for six times, and each time because the test went red
+/// It has been searched for eight times, and each time because the test went red
 /// rather than because somebody went looking. The first was against the 191 names
 /// in the table then, the ten graph commands pushed its worst probe to three
 /// slots, and the second search was run over all 201. The fifteen stream commands
@@ -3701,11 +3820,19 @@ const FREE: u16 = u16::MAX;
 /// sixth search, over eight million multipliers and all 241 names, found one at
 /// fifty six. The twelve vector set commands took that one to four slots and
 /// seventy extra probes, so the seventh search was run over all 254 names and
-/// found this one at two slots and seventy seven. Twenty nine of the names
-/// collide on the key itself and no multiplier can separate them, which is the
-/// floor everything here is measured against, and none of the twelve joined a
-/// group.
-const MIX: u64 = 0x0eab_5675_42cf_6351;
+/// found one at two slots and seventy seven.
+///
+/// The eight JSON commands took that one to five slots, which is the worst any
+/// of them has been, and the eighth search was run over four hundred million
+/// multipliers and all 262 names. It found this one at two slots and fifty four,
+/// which is the best the table has ever been and a third fewer extra probes than
+/// the multiplier it replaced managed with eight fewer commands. Thirty one of
+/// the names collide on the key itself and no multiplier can separate them, so
+/// seventeen extra probes is the floor everything here is measured against.
+/// `json.set` and `json.get` are one of those pairs, since every name in the
+/// group starts `js` and the only thing left to tell them apart is the length
+/// and the last byte.
+const MIX: u64 = 0x12ac_3c57_ec2d_bd8b;
 
 /// The four bytes the index is computed from: the length, the first two bytes
 /// and the last, lower cased.
@@ -3716,15 +3843,18 @@ const MIX: u64 = 0x0eab_5675_42cf_6351;
 /// Four bytes and not the whole name because the whole name has to be compared
 /// at the end anyway, so the hash only has to be good enough to get to the right
 /// slot, and reading less of the name is a shorter dependency chain in front of
-/// the multiply. These four leave 239 distinct values over the 254 commands, so
-/// twenty nine names collide whatever the multiplier is and probe once more, and
+/// the multiply. These four leave 246 distinct values over the 262 commands, so
+/// thirty one names collide whatever the multiplier is and probe once more, and
 /// the probe is the same compare the lookup was always going to do. `setnx` and
 /// `setex` are one of those groups and `g.nadd` and `g.eadd` are another, and the
 /// bitmaps added two more, `getset` with `getbit` and `setbit` with `select`. The
 /// eighteen stream commands are in none of them, neither are the five
 /// HyperLogLog ones, and neither are the ten geo ones or the twelve vector set
 /// ones, since a name is keyed on its first two bytes and its last and no two of
-/// any of them agree on all three.
+/// any of them agree on all three. The JSON commands are the worst case this
+/// key has: all eight of them start `js`, so all eight are keyed on nothing but
+/// their length and their last byte, and `json.set` and `json.get` agree on
+/// both.
 ///
 /// `| 0x20` lower cases a letter and does not have to be told which bytes are
 /// letters. It maps the two cases of a name to the same number, which is all
@@ -4007,7 +4137,7 @@ mod tests {
         }
         assert!(worst <= 2, "worst probe is {worst} slots");
         assert!(
-            total <= 77,
+            total <= 54,
             "{total} extra slots walked over the whole table"
         );
     }
