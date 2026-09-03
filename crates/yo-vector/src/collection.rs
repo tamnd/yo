@@ -397,6 +397,26 @@ impl Collection {
     ///
     /// As [`Collection::search`].
     pub fn search_exact(&self, q: &[f32], k: usize, skip: Option<&[u8]>) -> Result<Vec<Match>> {
+        self.search_exact_where(q, k, skip, &crate::Any)
+    }
+
+    /// The same walk, over only the members the filter allows.
+    ///
+    /// There is no scan to push the filter into here, because there is no scan:
+    /// this measures everything. It exists so that a client asking for the exact
+    /// answer and asking for a filter gets the exact answer to the question it
+    /// asked, rather than being told the two options do not go together.
+    ///
+    /// # Errors
+    ///
+    /// As [`Collection::search`].
+    pub fn search_exact_where(
+        &self,
+        q: &[f32],
+        k: usize,
+        skip: Option<&[u8]>,
+        filter: &impl crate::Filter,
+    ) -> Result<Vec<Match>> {
         let ready = self.ready(q)?;
         if k == 0 {
             return Ok(Vec::new());
@@ -404,6 +424,9 @@ impl Collection {
         let mut hits: Vec<(f32, &[u8])> = Vec::with_capacity(self.ids.len());
         for (key, &id) in self.ids.iter() {
             if skip == Some(key) {
+                continue;
+            }
+            if !filter.allows(self.index.tag(id).unwrap_or(0)) || !filter.exact(id) {
                 continue;
             }
             hits.push((crate::dist::sqdist(&ready, self.raw.at(id)), key));

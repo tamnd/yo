@@ -71,6 +71,7 @@ mod streams;
 mod strings;
 pub mod table;
 mod vectors;
+mod vfilter;
 mod zsets;
 
 pub use args::Args;
@@ -9491,10 +9492,10 @@ mod tests {
         assert_eq!(f.run(&[b"VINFO", b"nokey"]), "$-1\r\n");
     }
 
-    /// The three options that ask for something this index does not have say so
+    /// The option that asks for something this index does not have says so
     /// rather than doing something else quietly.
     #[test]
-    fn reduce_and_filter_are_refused_and_not_ignored() {
+    fn reduce_is_refused_and_not_ignored() {
         let mut f = Fixture::new();
         let reduce = f.run(&[
             b"VADD", b"v", b"REDUCE", b"1", b"VALUES", b"2", b"1", b"0", b"east",
@@ -9504,17 +9505,198 @@ mod tests {
             "{reduce}"
         );
         assert_eq!(f.run(&[b"EXISTS", b"v"]), ":0\r\n");
+    }
 
-        f.run(&[b"VADD", b"v", b"VALUES", b"2", b"1", b"0", b"east"]);
-        let filter = f.run(&[b"VSIM", b"v", b"ELE", b"east", b"FILTER", b".k == 1"]);
-        assert!(
-            filter.starts_with("-ERR FILTER is not supported yet."),
-            "{filter}"
+    /// A filtered search answers with the nearest elements that match, and an
+    /// expression that is not one is an error before the key is looked at.
+    #[test]
+    fn vsim_filter_reads_the_attributes() {
+        let mut f = Fixture::new();
+        for (name, x, y, attr) in [
+            ("a", "1", "0", r#"{"lang":"en","year":1999}"#),
+            ("b", "9", "1", r#"{"lang":"fr","year":2005}"#),
+            ("c", "8", "2", r#"{"lang":"en","year":1970}"#),
+            ("d", "7", "3", r#"{"lang":"en","year":2020}"#),
+        ] {
+            f.run(&[
+                b"VADD",
+                b"v",
+                b"VALUES",
+                b"2",
+                x.as_bytes(),
+                y.as_bytes(),
+                name.as_bytes(),
+                b"SETATTR",
+                attr.as_bytes(),
+            ]);
+        }
+        // `b` is the nearest to the query and is the one the filter drops, so
+        // this is the answer a filter applied afterwards would have got wrong.
+        assert_eq!(
+            f.run(&[
+                b"VSIM",
+                b"v",
+                b"VALUES",
+                b"2",
+                b"9",
+                b"1",
+                b"COUNT",
+                b"2",
+                b"FILTER",
+                b".lang == \"en\"",
+            ]),
+            "*2\r\n$1\r\na\r\n$1\r\nc\r\n"
         );
-        // The parse happens before the key is read, so a filtered search over a
-        // key that is not there is the same refusal and not an empty answer.
-        let missing = f.run(&[b"VSIM", b"nokey", b"ELE", b"e", b"FILTER", b".k == 1"]);
-        assert!(missing.starts_with("-ERR FILTER"), "{missing}");
+        // A number is compared as a number, and the two halves of an `and` both
+        // have to hold.
+        assert_eq!(
+            f.run(&[
+                b"VSIM",
+                b"v",
+                b"VALUES",
+                b"2",
+                b"9",
+                b"1",
+                b"FILTER",
+                b".lang == 'en' and .year > 1980",
+            ]),
+            "*2\r\n$1\r\na\r\n$1\r\nd\r\n"
+        );
+        // A list, and a field an element does not have.
+        assert_eq!(
+            f.run(&[
+                b"VSIM",
+                b"v",
+                b"VALUES",
+                b"2",
+                b"9",
+                b"1",
+                b"FILTER",
+                b".lang in ['fr', 'de']",
+            ]),
+            "*1\r\n$1\r\nb\r\n"
+        );
+        assert_eq!(
+            f.run(&[
+                b"VSIM",
+                b"v",
+                b"VALUES",
+                b"2",
+                b"9",
+                b"1",
+                b"FILTER",
+                b".rating > 3"
+            ]),
+            "*0\r\n"
+        );
+        // TRUTH measures every vector, and the filter still decides which ones
+        // are measured.
+        assert_eq!(
+            f.run(&[
+                b"VSIM",
+                b"v",
+                b"VALUES",
+                b"2",
+                b"9",
+                b"1",
+                b"TRUTH",
+                b"FILTER",
+                b".year < 1980",
+            ]),
+            "*1\r\n$1\r\nc\r\n"
+        );
+        // VSETATTR moves an element in and out of a filter, which means the tag
+        // beside its code was rewritten and not just the string.
+        f.run(&[b"VSETATTR", b"v", b"b", r#"{"lang":"en"}"#.as_bytes()]);
+        assert_eq!(
+            f.run(&[
+                b"VSIM",
+                b"v",
+                b"VALUES",
+                b"2",
+                b"9",
+                b"1",
+                b"COUNT",
+                b"1",
+                b"FILTER",
+                b".lang == \"en\"",
+            ]),
+            "*1\r\n$1\r\nb\r\n"
+        );
+        // And a VADD that replaces the vector keeps the attribute and the tag,
+        // which is the same rewrite from the other end.
+        f.run(&[b"VADD", b"v", b"VALUES", b"2", b"9", b"2", b"b"]);
+        assert_eq!(
+            f.run(&[
+                b"VSIM",
+                b"v",
+                b"VALUES",
+                b"2",
+                b"9",
+                b"1",
+                b"COUNT",
+                b"1",
+                b"FILTER",
+                b".lang == \"en\"",
+            ]),
+            "*1\r\n$1\r\nb\r\n"
+        );
+
+        // The expression is parsed before the key is read, so a bad one is an
+        // error whether or not the key is there.
+        let bad = f.run(&[b"VSIM", b"nokey", b"ELE", b"e", b"FILTER", b".k =="]);
+        assert_eq!(bad, "-ERR invalid FILTER expression\r\n");
+        assert_eq!(
+            f.run(&[b"VSIM", b"v", b"ELE", b"a", b"FILTER", b"junk"]),
+            "-ERR invalid FILTER expression\r\n"
+        );
+        // FILTER-EF raises the effort rather than capping it, and zero is
+        // Redis's word for no limit, so neither is an error.
+        assert_eq!(
+            f.run(&[
+                b"VSIM",
+                b"v",
+                b"VALUES",
+                b"2",
+                b"9",
+                b"1",
+                b"COUNT",
+                b"1",
+                b"FILTER-EF",
+                b"500",
+                b"FILTER",
+                b".lang == 'en'",
+            ]),
+            "*1\r\n$1\r\nb\r\n"
+        );
+        assert_eq!(
+            f.run(&[
+                b"VSIM",
+                b"v",
+                b"VALUES",
+                b"2",
+                b"9",
+                b"1",
+                b"COUNT",
+                b"1",
+                b"FILTER-EF",
+                b"0"
+            ]),
+            "*1\r\n$1\r\nb\r\n"
+        );
+        assert_eq!(
+            f.run(&[
+                b"VSIM",
+                b"v",
+                b"VALUES",
+                b"2",
+                b"9",
+                b"1",
+                b"FILTER-EF",
+                b"lots"
+            ]),
+            "-ERR EF must be a positive integer\r\n"
+        );
     }
 
     /// A vector set key is a key, so the keyspace owns it the way it owns every

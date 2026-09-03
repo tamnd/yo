@@ -127,9 +127,9 @@ doc = "10 section 9"
 # reason to keep the command surface exactly is so a client can be pointed at
 # either server without a change, and the reason to keep a different index is
 # that a partition index answers the same question on a thirty second of the
-# memory. Where the difference reaches the wire it is D-2 for VLINKS and D-31
-# through D-33 for the three options that ask for something the index does not
-# have.
+# memory. Where the difference reaches the wire it is D-2 for VLINKS, D-31 and
+# D-32 for the two options that ask for something the index does not have, and
+# D-33 for the one number beside FILTER that means something else here.
 
 [[group]]
 name = "stream"
@@ -2361,7 +2361,7 @@ bounded = "yes"
 status = "shipped"
 wire = "verified"
 divergent = "D-33"
-notes = "A search from a vector or from an element already in the set, and the element form leaves that element out because it is always its own nearest neighbour and nobody asked. The score is a similarity and not a distance: the collection measures one minus the cosine, from 0 for the same direction to 2 for the opposite one, and the reply is 1 minus half of that, so an identical vector scores exactly 1 and an opposite one exactly 0. WITHSCORES replies as a map under RESP3, which is what the vector set module does and is not what ZRANGE does here, and the difference is deliberate: a client that already parses one of these should not have to tell the two servers apart. EF widens the search by raising how many candidates are ranked, which is the knob this index has for the thing EF names. TRUTH reads every vector and no codes at all, which is what recall is measured against and is the only reply here with no approximation in it."
+notes = "A search from a vector or from an element already in the set, and the element form leaves that element out because it is always its own nearest neighbour and nobody asked. The score is a similarity and not a distance: the collection measures one minus the cosine, from 0 for the same direction to 2 for the opposite one, and the reply is 1 minus half of that, so an identical vector scores exactly 1 and an opposite one exactly 0. WITHSCORES replies as a map under RESP3, which is what the vector set module does and is not what ZRANGE does here, and the difference is deliberate: a client that already parses one of these should not have to tell the two servers apart. EF widens the search by raising how many candidates are ranked, which is the knob this index has for the thing EF names. TRUTH reads every vector and no codes at all, which is what recall is measured against and is the only reply here with no approximation in it. FILTER is an expression over the elements' attribute strings and it is decided inside the scan rather than over the answers, so the reply is the nearest COUNT elements that match and not whichever of the nearest COUNT happened to match. The expression is parsed before the key is read, so a bad one is an error whether or not the key is there. What the scan tests first is a 64 bit summary of the element's attributes that sits beside its code, and the expression itself only runs on what survives that and is near enough to rank. FILTER-EF raises the effort and cannot lower it, which is D-33, and TRUTH FILTER is the way to ask for every match rather than the nearest few."
 
 [[command]]
 name = "VREM"
@@ -2462,7 +2462,7 @@ plan = "point"
 bounded = "inherent"
 status = "shipped"
 wire = "verified"
-notes = "The attribute is bytes here and not parsed as JSON, because the only thing that reads into it is the FILTER expression language and that is D-33, so validating it would be refusing writes for a rule nothing enforces yet. An empty string clears the attribute, which is Redis's spelling of the removal and is why this is one command and not two. It answers 0 for an element that is not there rather than creating one, since an attribute with no vector under it is not a thing a vector set can hold."
+notes = "The attribute is stored as the bytes the client sent and is not validated as JSON, because a string that is not JSON is a string whose every field is missing, which is an element that matches no filter, and that is the same answer refusing the write would give without refusing anybody's write. Setting it also rewrites the summary of the attributes that sits beside the element's code in the index, which is what makes VSETATTR move an element in and out of a filter rather than only changing what VGETATTR says. An empty string clears the attribute, which is Redis's spelling of the removal and is why this is one command and not two. It answers 0 for an element that is not there rather than creating one, since an attribute with no vector under it is not a thing a vector set can hold."
 
 [[command]]
 name = "VGETATTR"
