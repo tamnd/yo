@@ -443,6 +443,11 @@ impl Set {
             }
             FORM_MEMBERS => {
                 let n = usize::try_from(cut.uint()?).map_err(|_| Broken::Short)?;
+                // A member is at least one byte, so a count larger than what is
+                // left cannot be honest and is not worth an allocation.
+                if n > cut.rest().len() {
+                    return Err(Broken::Body);
+                }
                 // The same threshold the live set splits at, so a band that was
                 // demoted comes back a band. One that has shrunk under the
                 // threshold since comes back a table, which is the one place a

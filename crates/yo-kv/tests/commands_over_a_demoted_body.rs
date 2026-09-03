@@ -1,10 +1,11 @@
-//! Set commands against a key whose body is not in memory.
+//! Collection commands against a key whose body is not in memory.
 //!
 //! The same promise `commands_over_a_demoted_value.rs` makes about strings, for
-//! the type whose body lives in a slab rather than in the record. Nothing above
+//! the types whose body lives in a slab rather than in the record. Nothing above
 //! the keyspace can tell that a set was on the device a moment ago: it answers
 //! `SCARD`, `SISMEMBER`, `SADD`, `SMEMBERS` and the set algebra with the members
-//! it had, in the representation it had them in.
+//! it had, in the representation it had them in, and the hash answers `HGET`,
+//! `HLEN` and the `HEXPIRE` family the same way.
 //!
 //! The store is a vector that counts its reads, as in the string file and for
 //! the same reason: reads per command is what G9 is a gate on, and a set that
@@ -15,7 +16,8 @@ use std::rc::Rc;
 
 use yo_common::{Addr, Code, Error, Result, Space};
 use yo_kv::cold::Blocks;
-use yo_kv::{Keyspace, set};
+use yo_kv::ttl::{Ask, Cond};
+use yo_kv::{Keyspace, hash, set};
 
 /// A store that remembers how many times it was read.
 struct Mem {
@@ -67,6 +69,34 @@ fn cold(key: &[u8], of: &[Vec<u8>]) -> (Keyspace, Rc<Cell<usize>>) {
     assert!(k.demote(key).expect("demoted"), "the body should have gone");
     reads.set(0);
     (k, reads)
+}
+
+/// Field and value pairs, past the listpack band and into a table.
+fn fields(n: usize) -> Vec<(Vec<u8>, Vec<u8>)> {
+    (0..n)
+        .map(|i| {
+            (
+                format!("field:{i:05}").into_bytes(),
+                format!("value:{i:05}").into_bytes(),
+            )
+        })
+        .collect()
+}
+
+/// A database holding `key` as a hash with its body already on the file.
+fn cold_hash(key: &[u8], of: &[(Vec<u8>, Vec<u8>)]) -> (Keyspace, Rc<Cell<usize>>) {
+    let (mut k, reads) = db();
+    k.hset(key, of.iter().map(|(f, v)| (f.as_slice(), v.as_slice())))
+        .expect("set");
+    assert!(k.demote(key).expect("demoted"), "the body should have gone");
+    reads.set(0);
+    (k, reads)
+}
+
+/// What `HGET` answers, as bytes.
+fn hget(k: &mut Keyspace, key: &[u8], field: &[u8]) -> Option<Vec<u8>> {
+    k.hget(key, field, |v| v.map(|t| t.to_vec()))
+        .expect("asked")
 }
 
 #[test]
@@ -200,12 +230,159 @@ fn dumping_and_restoring_a_demoted_set_gives_the_same_set_back() {
 }
 
 #[test]
+fn a_demoted_hash_answers_hlen_and_hget_with_what_it_held() {
+    let all = fields(600);
+    let (mut k, _) = cold_hash(b"h", &all);
+    assert_eq!(k.hlen(b"h").expect("counted"), 600);
+    for (f, v) in &all {
+        assert_eq!(hget(&mut k, b"h", f).as_ref(), Some(v), "{f:?}");
+    }
+    assert_eq!(hget(&mut k, b"h", b"field:99999"), None);
+}
+
+#[test]
+fn bringing_a_hash_back_costs_one_pass_and_then_nothing() {
+    let all = fields(600);
+    let (mut k, reads) = cold_hash(b"h", &all);
+    assert_eq!(k.hlen(b"h").expect("counted"), 600);
+    let first = reads.get();
+    assert!(first > 0, "the body was on the file");
+    for _ in 0..50 {
+        k.hlen(b"h").expect("counted");
+        hget(&mut k, b"h", b"field:00007");
+    }
+    assert_eq!(reads.get(), first, "nothing went back to the device");
+}
+
+#[test]
+fn a_demoted_hash_can_be_written_to_and_the_new_field_stays() {
+    let all = fields(600);
+    let (mut k, _) = cold_hash(b"h", &all);
+    assert_eq!(
+        k.hset(b"h", [(b"fresh".as_slice(), b"one".as_slice())].into_iter())
+            .expect("set"),
+        1
+    );
+    assert_eq!(k.hlen(b"h").expect("counted"), 601);
+    assert_eq!(hget(&mut k, b"h", b"fresh"), Some(b"one".to_vec()));
+    assert_eq!(
+        hget(&mut k, b"h", b"field:00000"),
+        Some(b"value:00000".to_vec())
+    );
+}
+
+#[test]
+fn a_demoted_hash_keeps_the_word_object_encoding_answers() {
+    let (mut k, _) = cold_hash(b"table", &fields(600));
+    assert_eq!(k.hash_encoding(b"table"), Some(hash::Encoding::Hashtable));
+
+    // A hash small enough to still be a listpack, which has to be demotable and
+    // has to come back on the band it left.
+    let (mut k, _) = cold_hash(b"small", &fields(60));
+    assert_eq!(k.hash_encoding(b"small"), Some(hash::Encoding::Listpack));
+    assert_eq!(k.hlen(b"small").expect("counted"), 60);
+}
+
+#[test]
+fn a_field_deadline_survives_a_demoted_hash_coming_back() {
+    let all = fields(600);
+    let (mut k, _) = cold_hash(b"h", &all);
+    let mut got = Vec::new();
+    k.hexpire(
+        b"h",
+        9_000_000_000_000,
+        Cond::Always,
+        [b"field:00003".as_slice()].into_iter(),
+        |a| got.push(a),
+    )
+    .expect("set a deadline");
+    assert_eq!(got.len(), 1);
+
+    // Out again, so the deadline has to go through the frozen form and back.
+    assert!(k.demote(b"h").expect("demoted"));
+    let mut asked = Vec::new();
+    k.httl(
+        b"h",
+        [b"field:00003".as_slice(), b"field:00004".as_slice()].into_iter(),
+        |a| asked.push(a),
+    )
+    .expect("asked");
+    assert_eq!(asked, [Ask::At(9_000_000_000_000), Ask::NoDeadline]);
+    assert_eq!(k.hlen(b"h").expect("counted"), 600, "and nothing was lost");
+}
+
+#[test]
+fn a_listpack_hash_with_a_field_deadline_comes_back_widened() {
+    let (mut k, _) = cold_hash(b"h", &fields(60));
+    let mut got = Vec::new();
+    k.hexpire(
+        b"h",
+        9_000_000_000_000,
+        Cond::Always,
+        [b"field:00003".as_slice()].into_iter(),
+        |a| got.push(a),
+    )
+    .expect("set a deadline");
+    assert_eq!(k.hash_encoding(b"h"), Some(hash::Encoding::ListpackEx));
+
+    assert!(k.demote(b"h").expect("demoted"));
+    assert_eq!(
+        k.hash_encoding(b"h"),
+        Some(hash::Encoding::ListpackEx),
+        "widening is one way and a trip to the device is not a way back"
+    );
+    let mut asked = Vec::new();
+    k.httl(b"h", [b"field:00003".as_slice()].into_iter(), |a| {
+        asked.push(a);
+    })
+    .expect("asked");
+    assert_eq!(asked, [Ask::At(9_000_000_000_000)]);
+}
+
+#[test]
+fn deleting_a_demoted_hash_does_not_free_somebody_elses_slab_slot() {
+    let (mut k, _) = db();
+    let all = fields(600);
+    for name in [b"cold".as_slice(), b"warm".as_slice()] {
+        k.hset(name, all.iter().map(|(f, v)| (f.as_slice(), v.as_slice())))
+            .expect("set");
+    }
+    assert!(k.demote(b"cold").expect("demoted"));
+    k.del(b"cold");
+    assert_eq!(k.hlen(b"warm").expect("counted"), 600);
+    assert_eq!(
+        hget(&mut k, b"warm", b"field:00042"),
+        Some(b"value:00042".to_vec())
+    );
+    assert_eq!(k.hlen(b"cold").expect("counted"), 0);
+}
+
+#[test]
+fn dumping_and_restoring_a_demoted_hash_gives_the_same_hash_back() {
+    let all = fields(600);
+    let (mut k, _) = cold_hash(b"h", &all);
+    let blob = k.dump(b"h").expect("dumped");
+    assert!(k.restore(b"back", &blob, None, false).is_ok());
+    assert_eq!(k.hlen(b"back").expect("counted"), 600);
+    for (f, v) in &all {
+        assert_eq!(hget(&mut k, b"back", f).as_ref(), Some(v), "{f:?}");
+    }
+}
+
+#[test]
 fn a_sweep_moves_collection_bodies_and_the_memory_goes_down() {
     let (mut k, _) = db();
+    let pairs = fields(200);
     for i in 0..200 {
         let key = format!("set:{i}");
         k.sadd(key.as_bytes(), members(200).iter().map(Vec::as_slice))
             .expect("added");
+        let key = format!("hash:{i}");
+        k.hset(
+            key.as_bytes(),
+            pairs.iter().map(|(f, v)| (f.as_slice(), v.as_slice())),
+        )
+        .expect("set");
     }
     let before = k.memory_bytes();
     let relief = k.relieve(usize::MAX).expect("swept");
@@ -217,10 +394,12 @@ fn a_sweep_moves_collection_bodies_and_the_memory_goes_down() {
     // its loop is in the keyspace rather than in the tier.
     assert!(after < before, "{after} is not under {before}");
 
-    // And every set is still readable, in full, afterwards.
+    // And every body is still readable, in full, afterwards.
     for i in 0..200 {
         let key = format!("set:{i}");
         assert_eq!(k.scard(key.as_bytes()).expect("counted"), 200, "{key}");
+        let key = format!("hash:{i}");
+        assert_eq!(k.hlen(key.as_bytes()).expect("counted"), 200, "{key}");
     }
 }
 
