@@ -269,9 +269,7 @@ impl Key {
     #[must_use]
     pub fn text_bytes(v: &[u8]) -> Key {
         let mut k = Small::collect([TAG_TEXT]);
-        for &b in v {
-            k.push(b);
-        }
+        k.extend_from_slice(v);
         Key(k)
     }
 
@@ -404,7 +402,6 @@ fn bits(mant: u64) -> u16 {
 /// Negatives get the ten bytes after the class flipped, because a bigger
 /// magnitude is a smaller number.
 fn number(class: Class, mant: u64, place: i32) -> Key {
-    let mut k = Small::collect([TAG_NUM, class as u8]);
     let (place, mant) = match class {
         // The size of an infinity, a zero or a NaN is not a question, and
         // writing it as zero keeps every numeric key the same width.
@@ -415,10 +412,17 @@ fn number(class: Class, mant: u64, place: i32) -> Key {
     // 1025, is an unsigned number that sorts the way the signed one does.
     let place = ((place + 32768) as u16).to_be_bytes();
     let flip = if class == Class::Negative { 0xff } else { 0 };
-    for b in place.into_iter().chain(mant.to_be_bytes()) {
-        k.push(b ^ flip);
+    // Written into a local array and copied in one go rather than pushed a byte
+    // at a time. Every numeric key is these twelve bytes, the length is known
+    // before the first one is written, and a push has to re-read which variant
+    // the list is on each time round.
+    let mut k = [TAG_NUM, class as u8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+    k[2..4].copy_from_slice(&place);
+    k[4..].copy_from_slice(&mant.to_be_bytes());
+    for b in &mut k[2..] {
+        *b ^= flip;
     }
-    Key(k)
+    Key(Small::from_slice(&k))
 }
 
 /// A float as bytes that sort the way the float does.

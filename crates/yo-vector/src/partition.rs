@@ -71,18 +71,18 @@
 //!
 //! ```text
 //!         at  partitions    a second      insert    maintain   touched
-//!      12500          36       65814       18.6%       81.4%       5.3
-//!      50000         132       49501       22.4%       77.6%       6.9
-//!     200000         595       42379       37.1%       62.9%       5.5
-//!     800000        2141       42076       40.3%       59.7%       4.4
-//!    1600000        4337       35760       37.3%       62.7%       4.4
+//!      12500          36      132060       20.7%       79.3%       5.3
+//!      50000         132       94166       31.0%       69.0%       6.9
+//!     200000         595       67764       49.1%       50.9%       5.5
+//!     800000        2141       64107       52.8%       47.2%       4.4
+//!    1600000        4337       59040       53.7%       46.3%       4.4
 //! ```
 //!
 //! `touched` is how many vectors maintenance moved or looked at per vector
 //! inserted. It is flat, and that is the number which says the update protocol
 //! is doing bounded work rather than quietly turning into a rebuild.
 //!
-//! Three fixes got it there and they were three different problems.
+//! Five fixes got it there and they were five different problems.
 //! Maintenance was 80 percent of the time and most of it was `sweep` measuring
 //! every member it looked at against every centroid in the collection, which is
 //! not what LIRE says and is several full scans per vector inserted. The insert
@@ -100,11 +100,24 @@
 //! same machine, and it cut the insert half by three times, 45.9 seconds to
 //! 15.3, which is why insert and maintenance have swapped places in that table.
 //!
-//! So G13's fifty thousand a second per core is close but not met. The work
-//! left is maintenance, which is now roughly five ninths of an ingest and is
-//! mostly `sweep` measuring drifted members after a split. An M-series Mac runs
-//! the same build at 63363 a second, which is above the gate, but that machine
-//! is not quiet enough here to be the one a gate is called on.
+//! The fourth was [`Partitions::job`], which used to ask its two questions by
+//! walking every partition twice, once per vector inserted. That is the same
+//! quadratic the coarse layer exists to remove, hiding one level up, and by 1.6
+//! million vectors it was around a fifth of an ingest spent deciding there was
+//! nothing to do. It is the two candidate lists now.
+//!
+//! The fifth was the rotation, in `src/rotate.rs`, which unpacked a sign bit
+//! with a shift and a mask inside the loop and then branched on a random bit
+//! per pair. Turning a pair is the same as flipping the sign of its second
+//! coordinate, so the branch folds into the sign table at build time. Those two
+//! together took the whole 1.6 million from 40318 a second to 64647, and the
+//! maintenance half from 24.4 seconds to 11.6.
+//!
+//! So G13's fifty thousand a second per core is met on the machine it is called
+//! on, and it is met at every size in the table rather than only at the small
+//! end. The two halves are close to even now, 53.7 percent insert against 46.3
+//! percent maintenance at the far end, so neither one is the obvious next thing
+//! to go and look at.
 //!
 //! # What is not here yet
 //!
