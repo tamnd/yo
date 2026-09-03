@@ -118,6 +118,19 @@ doc = "11 section 7"
 # against the embedded API where the compiler checks it before it runs.
 
 [[group]]
+name = "json"
+expected = 25
+status = "partial"
+doc = "09 section 2"
+# Eight of the twenty five, which are the ones that read and write a value at a
+# path rather than the ones that work on a particular type of value. The other
+# seventeen are the array, the string and the number families plus MERGE, MSET,
+# RESP and DEBUG, and they are the next change. The count is RedisJSON 2.8 as it
+# ships inside Redis 8, read off COMMAND LIST FILTERBY ACLCAT json on a running
+# one rather than off the documentation, which lists NUMMULTBY and NUMPOWBY as
+# deprecated and still registers them.
+
+[[group]]
 name = "vector"
 expected = 12
 status = "shipped"
@@ -2336,6 +2349,103 @@ status = "shipped"
 wire = "verified"
 notes = "A search from both ends at once, expanding whichever side is smaller. A one sided search over a graph of branching factor b touches b to the d and two half searches touch twice b to the d over 2, so at a branching factor of 30 and a distance of 6 that is 729 million against 54 thousand. Each side keeps who it came from, one integer per node touched, and the path is read back by walking the two parents from where they met rather than by carrying whole paths in the frontier. Every label at once, because a shortest path question asked of a graph with two kinds of edge means either one."
 
+
+# ----------------------------------------------------------------------- json
+
+[[command]]
+name = "JSON.SET"
+group = "json"
+since = "1.0.0"
+arity = -4
+plan = "whole-value"
+bounded = "risk"
+status = "shipped"
+wire = "verified"
+divergent = "D-34"
+notes = "The text is parsed into the encoding before the key is touched, so a value that is not JSON changes nothing and costs one parse. A path that matched is a rebuild with the new value spliced in at every offset it matched, and everything the path did not name is a memcpy, so the cost follows the size of the document rather than the number of places written. A path that matched nothing can still be a write, but only if it names exactly one place and the container that would hold it is there, which is why a wildcard that matched nothing is an error rather than a fan out of new fields. The risk is the honest verdict: a JSON.SET on a ten megabyte document rewrites ten megabytes whatever the path was, and the fix for that is a document small enough to be one value or a collection instead of one key."
+
+[[command]]
+name = "JSON.GET"
+group = "json"
+since = "1.0.0"
+arity = -2
+plan = "whole-value"
+bounded = "risk"
+status = "shipped"
+wire = "verified"
+divergent = "D-34"
+notes = "Several paths in one call, each matched against the same document, and the reply is one bulk string of JSON text whatever was asked for. INDENT, NEWLINE and SPACE lay it out, and they lay out the wrapper the reply is built in as well as the values inside it, so what a JSONPath matched starts one level in and what one of several paths matched starts two. The default path is the legacy root and not the JSONPath root, which is the difference between the document coming back as itself and coming back inside an array, and it is the one thing here most likely to break a client that was written against a guess."
+
+[[command]]
+name = "JSON.MGET"
+group = "json"
+since = "1.0.0"
+arity = -3
+plan = "merge"
+bounded = "risk"
+status = "shipped"
+wire = "verified"
+divergent = "D-34,D-35"
+notes = "One path against many keys, one entry per key in the order they were given. A key that is not there, a key holding something that is not a document and a key whose document the path did not match are all a nil rather than an error, which is what lets a client read a hundred keys and use the ninety that answered."
+
+[[command]]
+name = "JSON.DEL"
+group = "json"
+since = "1.0.0"
+arity = -2
+plan = "whole-value"
+bounded = "risk"
+status = "shipped"
+wire = "verified"
+divergent = "D-34"
+notes = "Removing the root removes the key, which is the keyspace's business and not the editor's, so it is handled before the document is read. A delete that empties the root container removes the key too, the same rule that makes EXISTS answer zero for a list somebody popped the last element off, and it is a rule about deleting rather than about shape, so a document written as an empty object by JSON.SET stays. Everything else is a rebuild without the matched values in it, and the reply is how many places were removed. Anything after the path is ignored rather than refused, which is RedisJSON's behaviour: it registers the command as taking one path and never looks at the rest."
+
+[[command]]
+name = "JSON.FORGET"
+group = "json"
+since = "1.0.0"
+arity = -2
+plan = "whole-value"
+bounded = "risk"
+status = "shipped"
+wire = "verified"
+divergent = "D-34"
+notes = "The same command as JSON.DEL under its other name, which exists because DEL was taken by the keyspace and the module wanted a name that could not be confused with it. Both are in the table because both are in COMMAND LIST and a client library picks whichever one its author preferred."
+
+[[command]]
+name = "JSON.TYPE"
+group = "json"
+since = "1.0.0"
+arity = -2
+plan = "whole-value"
+bounded = "inherent"
+status = "shipped"
+wire = "verified"
+notes = "The one command here where a legacy path that matched nothing answers nil rather than an error, which lines up with a key that is not there answering nil too. The words are RedisJSON's and they split what the encoding also splits, an integer from a number, so no translation table is needed. The verdict is inherent because the answer is one word per match and a path answers at most as many matches as the document has values."
+
+[[command]]
+name = "JSON.TOGGLE"
+group = "json"
+since = "2.0.0"
+arity = 3
+plan = "whole-value"
+bounded = "risk"
+status = "shipped"
+wire = "verified"
+divergent = "D-34"
+notes = "Flips every boolean the path matched and answers the value each one now has, as an integer per match on a JSONPath and as the word true or false on a legacy path. A match that is not a boolean is a hole in the array on one syntax and the error Path does not exist or not a bool on the other, which is one sentence covering both the path that matched nothing and the path that matched the wrong thing, because a legacy path cannot tell a client which of the two happened."
+
+[[command]]
+name = "JSON.CLEAR"
+group = "json"
+since = "2.0.0"
+arity = -2
+plan = "whole-value"
+bounded = "risk"
+status = "shipped"
+wire = "verified"
+divergent = "D-34"
+notes = "Empties containers and zeroes numbers and leaves a string, a boolean and a null alone, which is RedisJSON's rule and not an obvious one since clearing a string to the empty string would be just as defensible. It counts only what it changed, so an object that was already empty and a number that was already zero are not counted and a second call on the same path answers zero."
 
 # --------------------------------------------------------------------- vector
 

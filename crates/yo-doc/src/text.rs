@@ -105,8 +105,37 @@ impl Builder {
     }
 }
 
+/// How a document is laid out when it is written as text.
+///
+/// All three are empty by default, which is one line and no spaces, and that is
+/// what `JSON.GET` answers when the client did not ask for anything else. The
+/// three are Redis's `INDENT`, `NEWLINE` and `SPACE`, and they are strings
+/// rather than counts there, so they are strings here.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Format<'a> {
+    /// Written once per level of nesting at the start of a line.
+    pub indent: &'a [u8],
+    /// Written at the end of a line.
+    pub newline: &'a [u8],
+    /// Written after the colon between a key and its value.
+    pub space: &'a [u8],
+}
+
+impl Format<'_> {
+    /// Whether this asks for anything at all.
+    ///
+    /// A container with nothing in it is written as `{}` either way, so the
+    /// laid out form only differs from the compact one where there is something
+    /// to lay out. `JSON.GET` builds its own wrapper around what a path matched
+    /// and has to make the same decision about it, which is why this is public.
+    #[must_use]
+    pub fn is_plain(&self) -> bool {
+        self.indent.is_empty() && self.newline.is_empty() && self.space.is_empty()
+    }
+}
+
 impl Value<'_> {
-    /// This value as JSON text.
+    /// This value as JSON text, on one line.
     pub fn to_json(&self) -> Result<Vec<u8>> {
         let mut out = Vec::new();
         self.write_json(&mut out)?;
@@ -118,7 +147,23 @@ impl Value<'_> {
     /// The reply path has one of those per connection, so a `JSON.GET` over a
     /// thousand keys is one buffer rather than a thousand.
     pub fn write_json(&self, out: &mut Vec<u8>) -> Result<()> {
-        write_value(self, out, 0)
+        write_value(self, &Format::default(), out, 0)
+    }
+
+    /// The same, laid out the way `f` asks for.
+    pub fn write_json_with(&self, f: &Format<'_>, out: &mut Vec<u8>) -> Result<()> {
+        write_value(self, f, out, 0)
+    }
+
+    /// The same again, as if this value were already `depth` levels down.
+    ///
+    /// `JSON.GET` wraps what a JSONPath matched in an array and wraps several
+    /// paths in an object keyed by the paths, and it lays those wrappers out
+    /// too, so the values inside them start one or two levels in rather than at
+    /// the margin. The wrapper is built by the caller, which is the only thing
+    /// that knows how deep it went.
+    pub fn write_json_at(&self, f: &Format<'_>, out: &mut Vec<u8>, depth: usize) -> Result<()> {
+        write_value(self, f, out, depth)
     }
 }
 
@@ -437,7 +482,7 @@ impl<'a> Reader<'a> {
 
 // ----------------------------------------------------------------- the writing
 
-fn write_value(v: &Value<'_>, out: &mut Vec<u8>, depth: usize) -> Result<()> {
+fn write_value(v: &Value<'_>, f: &Format<'_>, out: &mut Vec<u8>, depth: usize) -> Result<()> {
     match v.kind() {
         Kind::Null => out.extend_from_slice(b"null"),
         Kind::Bool => out.extend_from_slice(if v.as_bool() == Some(true) {
@@ -453,12 +498,19 @@ fn write_value(v: &Value<'_>, out: &mut Vec<u8>, depth: usize) -> Result<()> {
         Kind::Text => write_string(v.text_bytes().ok_or_else(unreadable)?, out),
         Kind::Array => {
             deeper(depth)?;
+            let laid_out = !f.is_plain() && !v.is_empty();
             out.push(b'[');
             for (i, e) in v.iter().enumerate() {
                 if i > 0 {
                     out.push(b',');
                 }
-                write_value(&e, out, depth + 1)?;
+                if laid_out {
+                    line(f, out, depth + 1);
+                }
+                write_value(&e, f, out, depth + 1)?;
+            }
+            if laid_out {
+                line(f, out, depth);
             }
             out.push(b']');
         }
@@ -470,19 +522,35 @@ fn write_value(v: &Value<'_>, out: &mut Vec<u8>, depth: usize) -> Result<()> {
                     "an object whose keys are interned needs the collection's key table to be written as text",
                 ));
             }
+            let laid_out = !f.is_plain() && !v.is_empty();
             out.push(b'{');
             for (i, (key, e)) in v.members().enumerate() {
                 if i > 0 {
                     out.push(b',');
                 }
+                if laid_out {
+                    line(f, out, depth + 1);
+                }
                 write_string(key, out);
                 out.push(b':');
-                write_value(&e, out, depth + 1)?;
+                out.extend_from_slice(f.space);
+                write_value(&e, f, out, depth + 1)?;
+            }
+            if laid_out {
+                line(f, out, depth);
             }
             out.push(b'}');
         }
     }
     Ok(())
+}
+
+/// End the line and indent the next one to `depth`.
+fn line(f: &Format<'_>, out: &mut Vec<u8>, depth: usize) {
+    out.extend_from_slice(f.newline);
+    for _ in 0..depth {
+        out.extend_from_slice(f.indent);
+    }
 }
 
 /// A document this crate wrote never nests past [`DEPTH_MAX`], so this only
@@ -577,6 +645,50 @@ mod tests {
             .expect_err("this should not parse")
             .message()
             .to_string()
+    }
+
+    /// The text, through the encoding, and back out laid out the way `f` asks.
+    fn laid_out(text: &str, f: &Format<'_>) -> String {
+        let bytes = from_json(text.as_bytes()).expect("the text parses");
+        let v = Value::new(&bytes).expect("readable");
+        let mut out = Vec::new();
+        v.write_json_with(f, &mut out).expect("writable");
+        String::from_utf8(out).expect("UTF-8")
+    }
+
+    #[test]
+    fn a_document_is_laid_out_the_way_json_get_asks_for() {
+        let f = Format {
+            indent: b"  ",
+            newline: b"\n",
+            space: b" ",
+        };
+        assert_eq!(
+            laid_out(r#"{"a":1,"bb":[2,3]}"#, &f),
+            "{\n  \"a\": 1,\n  \"bb\": [\n    2,\n    3\n  ]\n}"
+        );
+        // A container with nothing in it has nothing to lay out, so it stays on
+        // the one line either way.
+        assert_eq!(
+            laid_out(r#"{"a":{},"bb":[]}"#, &f),
+            "{\n  \"a\": {},\n  \"bb\": []\n}"
+        );
+        // A scalar is a scalar whatever was asked for.
+        assert_eq!(laid_out("1.5", &f), "1.5");
+        // Asking for nothing is the compact form, byte for byte.
+        assert_eq!(
+            laid_out(r#"{"a":1,"bb":[2,3]}"#, &Format::default()),
+            round(r#"{"a":1,"bb":[2,3]}"#)
+        );
+        // The three are separate, so a client that asked for one gets one.
+        let only_space = Format {
+            space: b" ",
+            ..Format::default()
+        };
+        assert_eq!(
+            laid_out(r#"{"a":1,"bb":2}"#, &only_space),
+            r#"{"a": 1,"bb": 2}"#
+        );
     }
 
     #[test]

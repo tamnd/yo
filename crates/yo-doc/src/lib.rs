@@ -118,6 +118,6 @@ pub use keys::{KEYS_MAX, Keys};
 pub use path::{Step, Steps};
 pub use query::Path;
 pub use read::{Elems, Members, Value, key_order};
-pub use text::from_json;
+pub use text::{Format, from_json};
 pub use vector::VectorIndex;
 pub use yo_kv::Cursor;

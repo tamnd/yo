@@ -51,6 +51,7 @@
 use yo_common::{Code, Error, Result};
 
 use crate::head::{DEPTH_MAX, Kind};
+use crate::path::Step;
 use crate::read::Value;
 
 /// A parsed path.
@@ -121,6 +122,17 @@ impl<'a> Path<'a> {
         self.legacy
     }
 
+    /// Whether this path is the root and nothing else.
+    ///
+    /// `$`, a bare `.` and the empty path are all it. `JSON.SET` needs to know,
+    /// because the root is the only place a whole document can be written to a
+    /// key that is not there yet, and `JSON.DEL` needs to know because deleting
+    /// the root is deleting the key.
+    #[must_use]
+    pub fn is_root(&self) -> bool {
+        self.sels.is_empty()
+    }
+
     /// Whether this path names at most one place, whatever document it is
     /// matched against.
     ///
@@ -156,6 +168,32 @@ impl<'a> Path<'a> {
             }
         }
         out.append(&mut cur);
+    }
+
+    /// This path without its last selector, and that selector, when the last
+    /// one names one place.
+    ///
+    /// `JSON.SET` is what needs it. A path that matched nothing can still be a
+    /// place to write, as long as what would hold the new value is there and the
+    /// last step says exactly where in it the value goes, so `$.a.b` against a
+    /// document with an `a` and no `b` splits into the parent `$.a` and the step
+    /// `b`.
+    ///
+    /// `None` for the root, which has no last selector, and for a last selector
+    /// that is a wildcard, a descent, a union or a slice, because none of those
+    /// names a place that is not already there.
+    #[must_use]
+    pub fn split_last(&self) -> Option<(Path<'a>, Step<'a>)> {
+        let step = match self.sels.last()? {
+            Sel::Key(k) => Step::Key(k),
+            Sel::Index(i) => Step::Index(*i),
+            _ => return None,
+        };
+        let parent = Path {
+            sels: self.sels[..self.sels.len() - 1].to_vec(),
+            legacy: self.legacy,
+        };
+        Some((parent, step))
     }
 
     /// The one value this path names, for a caller that has already checked
@@ -267,6 +305,12 @@ struct Parse<'a> {
 
 impl<'a> Parse<'a> {
     fn run(&mut self) -> Result<()> {
+        // A legacy path of one dot is the root. It is the spelling the `JSON.*`
+        // commands fall back to when the client gave no path at all, and it is
+        // the only place a `.` is allowed to have nothing after it.
+        if self.legacy && self.rest == b"." {
+            return Ok(());
+        }
         // A path with no `$` may start with a bare name, so that `a.b` means
         // what `$.a.b` means. Only at the front of one of those: anywhere else,
         // and in a path that did start with a `$`, a missing separator is a typo
@@ -469,6 +513,36 @@ mod tests {
             .expect_err("this should not parse")
             .message()
             .to_string()
+    }
+
+    /// The root has three spellings and one of them is a bare dot, which is
+    /// what the `JSON.*` commands use when the client gave no path at all.
+    #[test]
+    fn a_bare_dot_is_the_root_and_is_the_only_dot_with_nothing_after_it() {
+        for spelling in ["$", ".", ""] {
+            let p = Path::parse(spelling.as_bytes()).expect("the path parses");
+            assert!(p.is_root(), "{spelling} should be the root");
+            assert!(p.is_definite(), "{spelling} names one place");
+        }
+        assert!(!Path::parse(b"$").expect("parses").legacy());
+        assert!(Path::parse(b".").expect("parses").legacy());
+        let d = doc();
+        assert_eq!(
+            ask(&d, "."),
+            format!(
+                "[{}]",
+                String::from_utf8_lossy(
+                    &Value::new(&d)
+                        .expect("readable")
+                        .to_json()
+                        .expect("writable")
+                )
+            )
+        );
+        // Every other dot still has to be followed by something.
+        assert!(why("..").contains("`..` with nothing after it"));
+        assert!(why(".a.").contains("no name after it"));
+        assert!(why("$.").contains("no name after it"));
     }
 
     #[test]
