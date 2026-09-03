@@ -3470,6 +3470,26 @@ pub static COMMANDS: &[Spec] = &[
         summary: "The server's clock, as seconds and microseconds.",
         group: "server",
     },
+    Spec {
+        name: "shutdown",
+        arity: -1,
+        flags: &[
+            "admin",
+            "noscript",
+            "loading",
+            "stale",
+            "no_multi",
+            "allow_busy",
+        ],
+        first_key: 0,
+        last_key: 0,
+        step: 0,
+        acl: &["@admin", "@slow", "@dangerous"],
+        since: "1.0.0",
+        complexity: "O(1)",
+        summary: "Stop the server, without answering.",
+        group: "server",
+    },
 ];
 
 /// The shortest and the longest command name.

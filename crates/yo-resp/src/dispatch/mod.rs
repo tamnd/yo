@@ -307,6 +307,15 @@ pub struct Server {
     pub stats: Stats,
     /// A counter per command, for `INFO commandstats`.
     cmdstats: CommandStats,
+    /// Set by `SHUTDOWN`, and read by whatever is turning the loop.
+    ///
+    /// A flag rather than an exit, because the command layer is not what owns
+    /// the process. It runs inside a batch that has other commands behind it
+    /// and inside a driver that has a socket file to take away and a file to
+    /// close, and a server that calls `exit` from a command handler skips all
+    /// of that. So the command says stop and the driver stops, on the same turn
+    /// and through the same door a signal uses.
+    stopping: bool,
 }
 
 impl Server {
@@ -334,6 +343,7 @@ impl Server {
             peers: migrate::Peers::default(),
             stats: Stats::default(),
             cmdstats: CommandStats::default(),
+            stopping: false,
         }
     }
 
@@ -360,6 +370,7 @@ impl Server {
             peers: migrate::Peers::default(),
             stats: Stats::default(),
             cmdstats: CommandStats::default(),
+            stopping: false,
         }
     }
 
@@ -375,6 +386,25 @@ impl Server {
         // has [`Server::db_ref`] and does not come through here.
         self.dirty |= 1u64 << i;
         &mut self.dbs[i]
+    }
+
+    /// Ask for the server to stop, which is what `SHUTDOWN` does.
+    ///
+    /// It sets a flag and returns. Nothing here closes a socket, flushes a file
+    /// or ends the process, because none of those belong to this layer, and a
+    /// batch that is halfway through still has to finish and be written out.
+    pub fn stop(&mut self) {
+        self.stopping = true;
+    }
+
+    /// Whether somebody has asked the server to stop.
+    ///
+    /// Read once per turn by the loop, next to the flag a signal sets. The two
+    /// mean the same thing and are separate only because one arrives from the
+    /// operating system and the other from a client.
+    #[must_use]
+    pub fn stopping(&self) -> bool {
+        self.stopping
     }
 
     /// One database, by index, without taking it mutably.
@@ -3756,6 +3786,90 @@ mod tests {
         let (flow, reply) = f.flow(&[b"QUIT"]);
         assert_eq!(reply, "+OK\r\n");
         assert_eq!(flow, Flow::Close);
+    }
+
+    /// A server that has not been asked to stop is not stopping, and one that
+    /// has says so without writing anything back.
+    ///
+    /// The empty reply is the point. Redis answers nothing at all here and the
+    /// client sees the socket close, and an `OK` would be a promise from a
+    /// process that is about to not exist.
+    #[test]
+    fn shutdown_writes_nothing_and_sets_the_flag() {
+        let mut f = Fixture::new();
+        assert!(!f.server.stopping(), "nobody has asked yet");
+
+        let (flow, reply) = f.flow(&[b"SHUTDOWN"]);
+        assert_eq!(reply, "");
+        assert_eq!(flow, Flow::Close);
+        assert!(f.server.stopping());
+    }
+
+    /// Every flag combination 8.10.1 takes, and every one it refuses.
+    ///
+    /// The refusals are the half worth pinning down. `SAVE` and `NOSAVE`
+    /// contradict each other, `ABORT` says to do nothing so it cannot be
+    /// combined with a word about how to do it, and repeating any one of them
+    /// is fine. All of it was read off a running 8.10.1 rather than worked out
+    /// from the documentation, which does not say.
+    #[test]
+    fn shutdown_takes_the_flags_redis_takes() {
+        for flags in [
+            &[b"NOSAVE".as_slice()][..],
+            &[b"SAVE"],
+            &[b"NOW"],
+            &[b"FORCE"],
+            &[b"nosave"],
+            &[b"NOW", b"NOW"],
+            &[b"SAVE", b"SAVE"],
+            &[b"NOSAVE", b"NOW", b"FORCE"],
+        ] {
+            let mut f = Fixture::new();
+            let mut parts = vec![b"SHUTDOWN".as_slice()];
+            parts.extend_from_slice(flags);
+            let (flow, reply) = f.flow(&parts);
+            assert_eq!(reply, "", "SHUTDOWN {flags:?} answered something");
+            assert_eq!(flow, Flow::Close, "SHUTDOWN {flags:?} did not close");
+            assert!(f.server.stopping(), "SHUTDOWN {flags:?} did not stop");
+        }
+
+        for flags in [
+            &[b"BOGUS".as_slice()][..],
+            &[b"SAVE", b"NOSAVE"],
+            &[b"NOSAVE", b"SAVE"],
+            &[b"ABORT", b"NOW"],
+            &[b"NOSAVE", b"ABORT"],
+            &[b"NOW", b"FORCE", b"ABORT"],
+        ] {
+            let mut f = Fixture::new();
+            let mut parts = vec![b"SHUTDOWN".as_slice()];
+            parts.extend_from_slice(flags);
+            assert_eq!(
+                f.run(&parts),
+                "-ERR syntax error\r\n",
+                "SHUTDOWN {flags:?} was accepted"
+            );
+            assert!(!f.server.stopping(), "SHUTDOWN {flags:?} stopped anyway");
+        }
+    }
+
+    /// `ABORT` has nothing to call off, ever.
+    ///
+    /// A shutdown here is decided and done inside one turn of the loop, so
+    /// there is no window in which one is in progress. That makes Redis's
+    /// message for a cancel with nothing to cancel the right answer every time
+    /// rather than only when nothing happens to be pending. Two `ABORT`s is
+    /// still one `ABORT`, which is what 8.10.1 does.
+    #[test]
+    fn shutdown_abort_never_has_anything_to_abort() {
+        let mut f = Fixture::new();
+        for parts in [
+            &[b"SHUTDOWN".as_slice(), b"ABORT"][..],
+            &[b"SHUTDOWN", b"ABORT", b"ABORT"],
+        ] {
+            assert_eq!(f.run(parts), "-ERR No shutdown in progress.\r\n");
+            assert!(!f.server.stopping(), "an abort stopped the server");
+        }
     }
 
     #[test]

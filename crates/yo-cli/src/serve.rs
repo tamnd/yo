@@ -421,7 +421,18 @@ impl Server {
         }
     }
 
-    /// Turn the loop until `stop` is set.
+    /// Turn the loop until `stop` is set, or until a client says `SHUTDOWN`.
+    ///
+    /// Two doors out and they are the same door. `stop` is what a signal
+    /// handler sets and the engine's flag is what the command sets, and the
+    /// loop leaves on either, so everything that happens after this returns,
+    /// which is the socket file going away and the file being closed, happens
+    /// once and in one place regardless of which one asked.
+    ///
+    /// The engine is asked at the top of a turn rather than the moment the
+    /// command runs, so the batch that carried the `SHUTDOWN` finishes and its
+    /// replies go out first. There are none for the `SHUTDOWN` itself, and
+    /// there may well be some for the commands that shared its batch.
     ///
     /// # Errors
     ///
@@ -429,7 +440,7 @@ impl Server {
     /// connection failing is that connection's problem and closes it.
     pub fn run(&mut self, stop: &AtomicBool) -> io::Result<()> {
         let mut idle = 0u32;
-        while !stop.load(Ordering::Relaxed) {
+        while !stop.load(Ordering::Relaxed) && !self.reactor.engine().stopping() {
             let wait = if idle <= SPIN_TURNS {
                 Duration::ZERO
             } else if self.reactor.engine().owed() > 0 {

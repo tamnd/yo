@@ -2918,3 +2918,14 @@ bounded = "inherent"
 status = "shipped"
 wire = "verified"
 notes = "Two bulk strings and not one integer, seconds and then microseconds within that second, both as decimal text. It reads the wall clock and not the coarse cached millisecond the keyspace uses, because the coarse one is refreshed on a tick and a client that calls TIME twice and gets the same microsecond has been lied to. The ACL categories are @fast and nothing else, which reads like an omission and is not: the categories say what a command can reach and this one reaches nothing."
+
+[[command]]
+name = "SHUTDOWN"
+group = "server"
+since = "1.0.0"
+arity = -1
+plan = "none"
+bounded = "inherent"
+status = "shipped"
+wire = "verified"
+notes = "Nothing is written back on success and the connection closes under the client, which is what a stopped server looks like from the outside and is what the client libraries already expect. All five flags are taken and none of them changes what happens, because this server has no save points and no snapshot to write: what durability there is belongs to the file underneath and is already on disk before a command returns, so SAVE has nothing to do and NOSAVE has nothing to skip, and NOW and FORCE are about replicas and failed saves that do not exist here. The syntax errors were read off 8.10.1 rather than guessed. SAVE and NOSAVE together is an error, ABORT next to any other flag is an error, and ABORT next to a second ABORT is fine, as is any flag repeated. ABORT on its own answers No shutdown in progress, and here that is a state that cannot be reached at all rather than one that happens to be empty, because the decision and the stop land inside one turn of the loop. The command sets a flag and the driver leaves its loop on the next turn, so the batch this arrived in finishes and its other replies go out, and the socket file and the file get taken away by the same code a signal reaches."
