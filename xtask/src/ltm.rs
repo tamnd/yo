@@ -45,6 +45,13 @@ use crate::root;
 /// The bar the first M5 exit gate sets: store reads per point read.
 const BAR: f64 = 1.05;
 
+/// The fewest bytes an element can be and still be told apart from its neighbour.
+///
+/// An element carries its own index in the first ten bytes, so anything shorter
+/// than that loses the index and a key ends up holding sixteen copies of one
+/// element, which for a set is a set of one.
+const MIN_ELEMENT: usize = 16;
+
 /// How many commands go out before the replies are read, during the load.
 ///
 /// The load is not being measured, it just has to finish, and a round trip per
@@ -56,7 +63,9 @@ struct Options {
     store: PathBuf,
     maxmemory: u64,
     times: u64,
+    kind: Kind,
     value: usize,
+    elements: usize,
     reads: u64,
     seed: u64,
     yodb: Option<PathBuf>,
@@ -72,7 +81,9 @@ impl Default for Options {
             store: std::env::temp_dir().join(format!("ltm-{}.yo", process::id())),
             maxmemory: 256 * 1024 * 1024,
             times: 10,
+            kind: Kind::String,
             value: 4096,
+            elements: 16,
             reads: 100_000,
             seed: 1,
             yodb: None,
@@ -91,7 +102,12 @@ usage: cargo xtask ltm [options]
                     in the units CONFIG SET takes
   --times N         how many times the limit the working set should be,
                     10 by default, which is the multiple the gate names
-  --value LEN       value length in bytes, 4096 by default
+  --type NAME       what a key holds: string, set, hash, list, zset,
+                    array or stream. string by default
+  --value LEN       bytes a key holds, 4096 by default. For a collection
+                    it is split across its elements
+  --elements N      elements a collection key holds, 16 by default, and
+                    ignored for a string
   --reads N         how many point reads to issue, 100000 by default
   --seed N          the seed for the read order, 1 by default
   --yodb PATH       use this binary instead of building one
@@ -151,6 +167,14 @@ fn parse(args: &[String]) -> Result<Option<Options>, String> {
                             .ok_or_else(|| format!("{value} is not an amount of memory"))?;
                     }
                     "--times" => opts.times = number(arg, value)?,
+                    "--type" => {
+                        opts.kind = Kind::parse(value)
+                            .ok_or_else(|| format!("{value} is not a type this measures"))?;
+                    }
+                    "--elements" => {
+                        opts.elements = usize::try_from(number(arg, value)?)
+                            .map_err(|_| format!("{value} is not an element count"))?;
+                    }
                     "--reads" => opts.reads = number(arg, value)?,
                     "--seed" => opts.seed = number(arg, value)?,
                     "--value" => {
@@ -169,6 +193,15 @@ fn parse(args: &[String]) -> Result<Option<Options>, String> {
     }
     if opts.value == 0 {
         return Err("a value length of zero leaves nothing to demote".into());
+    }
+    if opts.elements == 0 {
+        return Err("a collection with no elements in it is not one".into());
+    }
+    if opts.kind != Kind::String && opts.value / opts.elements < MIN_ELEMENT {
+        return Err(format!(
+            "{} bytes across {} elements leaves under {MIN_ELEMENT} in each one, which is too few for one element to differ from the next",
+            opts.value, opts.elements
+        ));
     }
     if opts.times == 0 || opts.reads == 0 {
         return Err("--times and --reads both have to be at least one".into());
@@ -220,9 +253,10 @@ fn measure(opts: &Options) -> Result<bool, String> {
     };
 
     println!(
-        "yodb {}, {} of memory, {keys} keys of {} bytes, which is {} times the limit",
+        "yodb {}, {} of memory, {keys} {} keys of {} bytes, which is {} times the limit",
         binary.display(),
         human(opts.maxmemory),
+        opts.kind.name(),
         opts.value,
         opts.times
     );
@@ -241,8 +275,10 @@ fn measure(opts: &Options) -> Result<bool, String> {
 fn run_against(server: &mut Server, opts: &Options, keys: u64) -> Result<Report, String> {
     let mut conn = Conn::connect(&server.addr)?;
 
+    let fix = Fixtures::new(opts);
+
     let at = Instant::now();
-    load(&mut conn, keys, opts.value)?;
+    load(&mut conn, keys, opts, &fix)?;
     let loaded = at.elapsed();
     println!(
         "loaded  {keys} keys in {:.1}s, {:.0} writes a second",
@@ -254,7 +290,7 @@ fn run_against(server: &mut Server, opts: &Options, keys: u64) -> Result<Report,
     let device_before = server.device_bytes();
 
     let at = Instant::now();
-    let latency = reads(&mut conn, keys, opts)?;
+    let latency = reads(&mut conn, keys, opts, &fix)?;
     let read = at.elapsed();
 
     let after = stats(&mut conn)?;
@@ -308,9 +344,11 @@ fn present(opts: &Options, r: &Report) -> bool {
 
     println!();
     println!(
-        "working set   {} in {} keys",
+        "working set   {} in {} {} keys, read with {}",
         human(r.keys * opts.value as u64),
-        r.keys
+        r.keys,
+        opts.kind.name(),
+        opts.kind.point_read()
     );
     println!(
         "memory        {} used against a {} limit, regime {}",
@@ -493,6 +531,9 @@ enum Reply {
     Int(i64),
     /// A bulk string, as its length. The body goes in `Conn::body`.
     Bulk(Option<usize>),
+    /// An array, as how many replies follow it. Only the stream row asks for
+    /// one, and only to find out whether the entry it named came back.
+    Array(Option<usize>),
 }
 
 impl Conn {
@@ -547,8 +588,35 @@ impl Conn {
                 self.body.truncate(len);
                 Ok(Reply::Bulk(Some(len)))
             }
+            "*" => {
+                let len: i64 = rest
+                    .parse()
+                    .map_err(|_| format!("bad array length: {rest}"))?;
+                if len < 0 {
+                    return Ok(Reply::Array(None));
+                }
+                Ok(Reply::Array(Some(len as usize)))
+            }
             other => Err(format!("a reply this harness does not read: {other}{rest}")),
         }
+    }
+
+    /// Read the replies nested inside an array of `n`, and throw them away.
+    ///
+    /// An XRANGE row is an array of entries, each an id and an array of field
+    /// and value, and what this row is measuring is the fault that produced it
+    /// rather than anything in it. What matters is that the whole reply comes
+    /// off the socket, because a connection with half a reply left on it
+    /// answers the next command with the other half.
+    fn drain(&mut self, n: usize) -> Result<(), String> {
+        for _ in 0..n {
+            match self.reply()? {
+                Reply::Array(Some(inner)) => self.drain(inner)?,
+                Reply::Error(e) => return Err(e),
+                _ => {}
+            }
+        }
+        Ok(())
     }
 }
 
@@ -562,40 +630,140 @@ fn cmd(out: &mut Vec<u8>, parts: &[&[u8]]) {
     }
 }
 
-fn load(conn: &mut Conn, keys: u64, value: usize) -> Result<(), String> {
-    // One buffer for every value. What is being measured is what the server
-    // does with them, not whether the harness can make them up quickly.
-    let payload: Vec<u8> = (0..value).map(|i| b'a' + (i % 26) as u8).collect();
-    let mut out = Vec::with_capacity(BATCH * (value + 64));
+/// Everything a key of one kind is written from and read back with.
+///
+/// Built once for the whole run. What is being measured is the server, and a
+/// harness that formats sixteen member names per key spends the run in
+/// `format!` rather than in the thing under test.
+struct Fixtures {
+    /// One element's bytes, `elements` of them, all the same length.
+    parts: Vec<Vec<u8>>,
+    /// Hash field names, one an element.
+    fields: Vec<Vec<u8>>,
+    /// Element positions as decimal, for LINDEX and ARGET.
+    indexes: Vec<Vec<u8>>,
+    /// Zset scores, one an element.
+    scores: Vec<Vec<u8>>,
+    /// Stream ids, one an element. They start at one because `0-0` is not an id
+    /// a stream will take.
+    ids: Vec<Vec<u8>>,
+}
+
+impl Fixtures {
+    fn new(opts: &Options) -> Fixtures {
+        let (n, each) = match opts.kind {
+            Kind::String => (1, opts.value),
+            _ => (opts.elements, opts.value / opts.elements),
+        };
+        Fixtures {
+            parts: (0..n).map(|i| element(i as u64, each)).collect(),
+            fields: (0..n).map(|i| format!("f:{i}").into_bytes()).collect(),
+            indexes: (0..n).map(|i| format!("{i}").into_bytes()).collect(),
+            scores: (0..n).map(|i| format!("{i}").into_bytes()).collect(),
+            ids: (0..n)
+                .map(|i| format!("{}-0", i + 1).into_bytes())
+                .collect(),
+        }
+    }
+
+    /// Append the commands that write one key, and answer how many replies they
+    /// will produce.
+    ///
+    /// One command for every kind but the stream, which has no command that
+    /// appends more than one entry.
+    fn write(&self, out: &mut Vec<u8>, kind: Kind, key: &[u8]) -> usize {
+        let mut parts: Vec<&[u8]> = Vec::with_capacity(3 + self.parts.len() * 2);
+        match kind {
+            Kind::String => {
+                cmd(out, &[b"SET", key, &self.parts[0]]);
+                return 1;
+            }
+            Kind::Set | Kind::List => {
+                parts.push(if kind == Kind::Set { b"SADD" } else { b"RPUSH" });
+                parts.push(key);
+                parts.extend(self.parts.iter().map(Vec::as_slice));
+            }
+            Kind::Hash => {
+                parts.push(b"HSET");
+                parts.push(key);
+                for (field, part) in self.fields.iter().zip(&self.parts) {
+                    parts.push(field);
+                    parts.push(part);
+                }
+            }
+            Kind::Zset => {
+                parts.push(b"ZADD");
+                parts.push(key);
+                for (score, part) in self.scores.iter().zip(&self.parts) {
+                    parts.push(score);
+                    parts.push(part);
+                }
+            }
+            Kind::Array => {
+                // From index zero, so the array is dense and the whole of it is
+                // one body rather than a slice per element.
+                parts.push(b"ARSET");
+                parts.push(key);
+                parts.push(b"0");
+                parts.extend(self.parts.iter().map(Vec::as_slice));
+            }
+            Kind::Stream => {
+                for (id, part) in self.ids.iter().zip(&self.parts) {
+                    cmd(out, &[b"XADD", key, id, b"f", part]);
+                }
+                return self.parts.len();
+            }
+        }
+        cmd(out, &parts);
+        1
+    }
+
+    /// Append the one command that reads element `at` of one key.
+    fn read(&self, out: &mut Vec<u8>, kind: Kind, key: &[u8], at: usize) {
+        match kind {
+            Kind::String => cmd(out, &[b"GET", key]),
+            Kind::Set => cmd(out, &[b"SISMEMBER", key, &self.parts[at]]),
+            Kind::Hash => cmd(out, &[b"HGET", key, &self.fields[at]]),
+            Kind::List => cmd(out, &[b"LINDEX", key, &self.indexes[at]]),
+            Kind::Zset => cmd(out, &[b"ZSCORE", key, &self.parts[at]]),
+            Kind::Array => cmd(out, &[b"ARGET", key, &self.indexes[at]]),
+            Kind::Stream => cmd(out, &[b"XRANGE", key, &self.ids[at], &self.ids[at]]),
+        }
+    }
+}
+
+fn load(conn: &mut Conn, keys: u64, opts: &Options, fix: &Fixtures) -> Result<(), String> {
+    let mut out = Vec::with_capacity(BATCH * (opts.value + 64 * fix.parts.len()));
     let mut done = 0u64;
     let mut next_report = keys / 10;
 
     while done < keys {
         let batch = BATCH.min((keys - done) as usize);
         out.clear();
+        let mut replies = 0;
         for i in 0..batch {
             let key = format!("key:{}", done + i as u64);
-            cmd(&mut out, &[b"SET", key.as_bytes(), &payload]);
+            replies += fix.write(&mut out, opts.kind, key.as_bytes());
         }
         conn.send(&out)?;
-        let mut refused: Option<(u64, String)> = None;
-        for i in 0..batch {
+        let mut refused: Option<String> = None;
+        for _ in 0..replies {
             match conn.reply()? {
-                Reply::Status => {}
-                // Not returned here. There are up to 255 more replies still in
-                // flight, and a connection with those left on it cannot be
-                // asked anything, which is exactly when somebody wants to ask
+                // Not returned here. There are up to a few thousand more replies
+                // still in flight, and a connection with those left on it cannot
+                // be asked anything, which is exactly when somebody wants to ask
                 // it what its memory looks like.
-                Reply::Error(e) => refused = refused.or(Some((done + i as u64, e))),
-                _ => return Err("a SET answered with something that is not a status".into()),
+                Reply::Error(e) => refused = refused.or(Some(e)),
+                Reply::Array(Some(n)) => conn.drain(n)?,
+                _ => {}
             }
         }
-        if let Some((key, message)) = refused {
+        if let Some(message) = refused {
             let memory = section(conn, "memory").unwrap_or_default();
             let stats = section(conn, "stats").unwrap_or_default();
             let keys_now = dbsize(conn).unwrap_or(0);
             return Err(format!(
-                "the server refused the write at key {key}: {message}\nA server with a file should have made room rather than answering that. What it looked like when it did, at {keys_now} keys in:\n{}\n{}",
+                "the server refused a write in the batch at key {done}: {message}\nA server with a file should have made room rather than answering that. What it looked like when it did, at {keys_now} keys in:\n{}\n{}",
                 memory.trim(),
                 stats.trim()
             ));
@@ -609,39 +777,57 @@ fn load(conn: &mut Conn, keys: u64, value: usize) -> Result<(), String> {
     Ok(())
 }
 
-fn reads(conn: &mut Conn, keys: u64, opts: &Options) -> Result<Vec<u64>, String> {
+fn reads(conn: &mut Conn, keys: u64, opts: &Options, fix: &Fixtures) -> Result<Vec<u64>, String> {
     let mut rng = Rng::new(opts.seed);
     let mut latency = Vec::with_capacity(opts.reads as usize);
     let mut out = Vec::with_capacity(64);
     let mut misses = 0u64;
+    let elements = fix.parts.len() as u64;
 
     for _ in 0..opts.reads {
         let key = format!("key:{}", rng.below(keys));
+        // A random element as well as a random key. Reading element zero every
+        // time would be a fair measurement of the fault, since the whole body
+        // comes back at once either way, but it would stop being one the day a
+        // body learns to come back in pieces.
+        let at = rng.below(elements) as usize;
         out.clear();
-        cmd(&mut out, &[b"GET", key.as_bytes()]);
-        let at = Instant::now();
+        fix.read(&mut out, opts.kind, key.as_bytes(), at);
+        let start = Instant::now();
         conn.send(&out)?;
         let reply = conn.reply()?;
-        latency.push(at.elapsed().as_micros() as u64);
-        match reply {
-            Reply::Bulk(Some(len)) if len == opts.value => {}
-            Reply::Bulk(Some(len)) => {
+        // Nested replies before the clock stops, because the entry is not back
+        // until the last of it is off the socket.
+        if let Reply::Array(Some(n)) = reply {
+            conn.drain(n)?;
+        }
+        latency.push(start.elapsed().as_micros() as u64);
+        let found = match reply {
+            // The string row checks the length as well, because it is the one
+            // kind whose whole value comes back and a short one would mean the
+            // file handed back the wrong bytes.
+            Reply::Bulk(Some(len)) if opts.kind == Kind::String && len != opts.value => {
                 return Err(format!(
                     "{key} came back {len} bytes long instead of {}",
                     opts.value
                 ));
             }
-            Reply::Bulk(None) => misses += 1,
+            Reply::Bulk(Some(_)) => true,
+            Reply::Bulk(None) => false,
+            Reply::Int(n) => n != 0,
+            Reply::Array(Some(n)) => n != 0,
+            Reply::Array(None) => false,
             Reply::Error(e) => {
                 return Err(format!(
                     "the server answered a read of {key} with an error: {e}"
                 ));
             }
-            _ => {
-                return Err(format!(
-                    "the read of {key} was answered with something that is not a bulk string"
-                ));
+            Reply::Status => {
+                return Err(format!("the read of {key} was answered with a status"));
             }
+        };
+        if !found {
+            misses += 1;
         }
     }
     if misses > 0 {
@@ -694,6 +880,80 @@ fn field<'a>(text: &'a str, name: &str) -> Option<&'a str> {
         let (key, value) = line.split_once(':')?;
         (key.trim() == name).then(|| value.trim())
     })
+}
+
+/// What a key holds, which is the axis the first M5 gate is measured across.
+///
+/// The gate says 1.05 store reads a point read at ten times memory across every
+/// type, and a string was the only type that could be measured until every
+/// collection body could leave memory too. A collection is the harder case and
+/// not the easier one: a string demotes as the bytes it already is, and a
+/// collection has to be frozen to a form on the way out and rebuilt on the way
+/// back, so a row here is measuring the promote path as well as the read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Kind {
+    String,
+    Set,
+    Hash,
+    List,
+    Zset,
+    Array,
+    Stream,
+}
+
+impl Kind {
+    fn parse(name: &str) -> Option<Kind> {
+        Some(match name {
+            "string" => Kind::String,
+            "set" => Kind::Set,
+            "hash" => Kind::Hash,
+            "list" => Kind::List,
+            "zset" | "sortedset" => Kind::Zset,
+            "array" => Kind::Array,
+            "stream" => Kind::Stream,
+            _ => return None,
+        })
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Kind::String => "string",
+            Kind::Set => "set",
+            Kind::Hash => "hash",
+            Kind::List => "list",
+            Kind::Zset => "zset",
+            Kind::Array => "array",
+            Kind::Stream => "stream",
+        }
+    }
+
+    /// The command the read phase issues, for the report.
+    ///
+    /// One element out of one key in every case, because the gate counts store
+    /// reads a point read and a command that walks a whole collection would be
+    /// answering a different question with the same arithmetic.
+    fn point_read(self) -> &'static str {
+        match self {
+            Kind::String => "GET",
+            Kind::Set => "SISMEMBER",
+            Kind::Hash => "HGET",
+            Kind::List => "LINDEX",
+            Kind::Zset => "ZSCORE",
+            Kind::Array => "ARGET",
+            Kind::Stream => "XRANGE",
+        }
+    }
+}
+
+/// One element's bytes, `len` of them, with `at` written into the front.
+///
+/// The front has to differ between elements of the same key, because a set with
+/// the same member sixteen times is a set of one, and it has to be a fixed width
+/// so that every element is the length the reader checks for.
+fn element(at: u64, len: usize) -> Vec<u8> {
+    let mut v = format!("{at:09}:").into_bytes();
+    v.resize(len, b'e');
+    v
 }
 
 /// A byte count a person can read.
@@ -788,5 +1048,135 @@ mod tests {
         let o = Options::default();
         let keys = o.maxmemory * o.times / o.value as u64;
         assert_eq!(keys * o.value as u64, o.maxmemory * 10);
+    }
+
+    /// The options a row of a given kind runs with, without a server.
+    fn opts(kind: Kind) -> Options {
+        Options {
+            kind,
+            value: 4096,
+            elements: 16,
+            ..Options::default()
+        }
+    }
+
+    #[test]
+    fn every_type_the_gate_names_can_be_asked_for() {
+        for name in ["string", "set", "hash", "list", "zset", "array", "stream"] {
+            let kind = Kind::parse(name).unwrap_or_else(|| panic!("{name} is not a type"));
+            assert_eq!(kind.name(), name);
+        }
+        assert_eq!(Kind::parse("sortedset"), Some(Kind::Zset));
+        assert_eq!(Kind::parse("geo"), None);
+    }
+
+    #[test]
+    fn the_elements_of_one_key_all_differ_and_are_all_the_same_length() {
+        // A set of sixteen copies of one member is a set of one, and a run over
+        // it would be measuring a body a sixteenth of the size the report says.
+        let fix = Fixtures::new(&opts(Kind::Set));
+        assert_eq!(fix.parts.len(), 16);
+        for part in &fix.parts {
+            assert_eq!(part.len(), 4096 / 16);
+        }
+        let mut sorted = fix.parts.clone();
+        sorted.sort();
+        sorted.dedup();
+        assert_eq!(sorted.len(), 16, "two elements of one key are the same");
+    }
+
+    #[test]
+    fn a_string_key_holds_the_whole_value_in_one_element() {
+        let fix = Fixtures::new(&opts(Kind::String));
+        assert_eq!(fix.parts.len(), 1);
+        assert_eq!(fix.parts[0].len(), 4096);
+    }
+
+    #[test]
+    fn a_write_says_how_many_replies_it_is_going_to_get() {
+        // The load reads exactly this many replies before it sends the next
+        // batch, so a count that is one out leaves the connection holding a
+        // reply that the next command gets answered with.
+        for (kind, expected) in [
+            (Kind::String, 1),
+            (Kind::Set, 1),
+            (Kind::Hash, 1),
+            (Kind::List, 1),
+            (Kind::Zset, 1),
+            (Kind::Array, 1),
+            (Kind::Stream, 16),
+        ] {
+            let o = opts(kind);
+            let fix = Fixtures::new(&o);
+            let mut out = Vec::new();
+            let replies = fix.write(&mut out, kind, b"key:0");
+            assert_eq!(replies, expected, "{} said the wrong count", kind.name());
+            assert_eq!(
+                out.iter().filter(|b| **b == b'*').count(),
+                expected,
+                "{} sent a number of commands its count does not match",
+                kind.name()
+            );
+        }
+    }
+
+    #[test]
+    fn a_read_asks_for_one_element_with_the_command_the_report_names() {
+        for kind in [
+            Kind::String,
+            Kind::Set,
+            Kind::Hash,
+            Kind::List,
+            Kind::Zset,
+            Kind::Array,
+            Kind::Stream,
+        ] {
+            let o = opts(kind);
+            let fix = Fixtures::new(&o);
+            let at = if kind == Kind::String { 0 } else { 3 };
+            let mut out = Vec::new();
+            fix.read(&mut out, kind, b"key:0", at);
+            let text = String::from_utf8_lossy(&out).into_owned();
+            assert!(
+                text.contains(kind.point_read()),
+                "a {} read went out as {text:?} and the report calls it {}",
+                kind.name(),
+                kind.point_read()
+            );
+            assert_eq!(
+                out.iter().filter(|b| **b == b'*').count(),
+                1,
+                "a {} read is more than one command",
+                kind.name()
+            );
+        }
+    }
+
+    #[test]
+    fn a_stream_never_writes_the_id_a_stream_will_not_take() {
+        // `0-0` is not an id XADD accepts, so the ids are one ahead of the
+        // element positions and the read has to use the same ones.
+        let fix = Fixtures::new(&opts(Kind::Stream));
+        assert_eq!(fix.ids[0], b"1-0");
+        assert_eq!(fix.ids[15], b"16-0");
+    }
+
+    #[test]
+    fn elements_too_small_to_tell_apart_are_refused() {
+        let args = |kind: &str, elements: &str| {
+            vec![
+                "--type".to_string(),
+                kind.to_string(),
+                "--value".to_string(),
+                "512".to_string(),
+                "--elements".to_string(),
+                elements.to_string(),
+            ]
+        };
+        assert!(parse(&args("set", "16")).is_ok());
+        assert!(parse(&args("set", "64")).is_err());
+        assert!(parse(&args("set", "0")).is_err());
+        // A string is one element and the split does not apply to it.
+        assert!(parse(&args("string", "64")).is_ok());
     }
 }
