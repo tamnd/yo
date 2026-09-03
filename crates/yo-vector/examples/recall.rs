@@ -59,7 +59,7 @@
 //! ```
 
 use std::time::Instant;
-use yo_vector::{Bits, Partitions, Tuning, Vectors};
+use yo_vector::{Any, Bits, Partitions, Tuning, Vectors};
 
 /// The base vectors, kept in full precision, which is what the rerank reads and
 /// what a real collection would keep in its document log.
@@ -177,8 +177,8 @@ fn main() {
             rate
         );
         println!(
-            "{:>6}{:>8}{:>12}{:>11}{:>11}",
-            "probe", "rerank", "recall@10", "p50", "p99"
+            "{:>6}{:>8}{:>12}{:>11}{:>11}{:>9}",
+            "probe", "rerank", "recall@10", "p50", "p99", "read"
         );
 
         let mut probe = 8;
@@ -187,8 +187,32 @@ fn main() {
                 let mut t = ix.tuning();
                 t.probe = probe;
                 t.rerank = rerank;
+                t.patience = 0;
                 ix.retune(t);
                 measure(&ix, &bench, probe, rerank);
+            }
+            probe *= 2;
+        }
+
+        // The second table is the one that says whether a fixed probe was ever
+        // the right shape. Same index, same queries, rerank held at four so the
+        // only thing moving is how early a search is allowed to give up, and the
+        // `read` column is what it actually cost rather than what it was allowed
+        // to spend.
+        println!();
+        println!(
+            "{:>6}{:>8}{:>12}{:>11}{:>11}{:>9}",
+            "probe", "patience", "recall@10", "p50", "p99", "read"
+        );
+        let mut probe = 8;
+        while probe <= top {
+            for patience in [1usize, 2, 3, 4, 8] {
+                let mut t = ix.tuning();
+                t.probe = probe;
+                t.rerank = 4;
+                t.patience = patience;
+                ix.retune(t);
+                measure(&ix, &bench, probe, patience);
             }
             probe *= 2;
         }
@@ -208,15 +232,17 @@ struct Bench {
     queries: usize,
 }
 
-fn measure(ix: &Partitions, b: &Bench, probe: usize, rerank: usize) {
+fn measure(ix: &Partitions, b: &Bench, probe: usize, knob: usize) {
     const K: usize = 10;
     let mut hit = 0usize;
+    let mut read = 0usize;
     let mut took = Vec::with_capacity(b.queries);
     for q in 0..b.queries {
         let v = &b.query[q * b.dim..(q + 1) * b.dim];
         let t = Instant::now();
-        let got = ix.search(v, K, &b.base);
+        let (got, work) = ix.search_costed(v, K, &Any, &b.base);
         took.push(t.elapsed().as_secs_f64() * 1e6);
+        read += work.probed;
         // Recall at ten is how many of the true ten came back, and the true ten
         // are the first ten of the hundred the ground truth lists.
         let want = &b.truth[q * b.gdim..q * b.gdim + K];
@@ -225,10 +251,11 @@ fn measure(ix: &Partitions, b: &Bench, probe: usize, rerank: usize) {
     took.sort_by(f64::total_cmp);
     let at = |p: f64| took[((took.len() - 1) as f64 * p) as usize];
     println!(
-        "{probe:>6}{rerank:>8}{:>12.4}{:>9.0} us{:>9.0} us",
+        "{probe:>6}{knob:>8}{:>12.4}{:>9.0} us{:>9.0} us{:>9.1}",
         hit as f64 / (b.queries * K) as f64,
         at(0.50),
-        at(0.99)
+        at(0.99),
+        read as f64 / b.queries as f64
     );
 }
 

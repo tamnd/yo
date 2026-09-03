@@ -167,6 +167,7 @@ impl Collection {
             widen: as_u32(tuning.widen)?,
             spill: as_u32(tuning.spill)?,
             slack: tuning.slack,
+            patience: as_u32(tuning.patience)?,
             centroids,
             keys,
         };
@@ -213,6 +214,7 @@ impl Collection {
                 widen: head.widen as usize,
                 spill: head.spill as usize,
                 slack: head.slack,
+                patience: head.patience as usize,
             },
         );
         let width = index.quantizer().code_bytes();

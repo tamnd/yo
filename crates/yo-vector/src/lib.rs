@@ -123,6 +123,6 @@ pub mod rotate;
 
 pub use collection::{Collection, Match};
 pub use image::{Restored, Stored};
-pub use partition::{Any, Filter, Hit, Partitions, Signature, Tuning, Vectors};
+pub use partition::{Any, Filter, Hit, Partitions, Signature, Tuning, Vectors, Work};
 pub use rabitq::{Bits, Coded, Quantizer, Query};
 pub use rotate::Rotation;
