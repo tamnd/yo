@@ -737,13 +737,21 @@ impl Partitions {
         Ok(())
     }
 
+    /// Drop the centroid codes, so that a test can ask the same question of the
+    /// same index with and without them.
+    #[cfg(test)]
+    pub(crate) fn forget_centroid_codes(&mut self) {
+        self.rank = Ranker::default();
+    }
+
     /// Say that a load is over, so the derived parts can be built once.
     ///
-    /// The coarse layer and the two maintenance candidate lists are the whole of
-    /// what an image does not carry, because both are decided by the centroids
-    /// and the posting lengths that it does carry. Building them here is one
-    /// pass rather than the running updates the insert path makes, which is the
-    /// difference between a load being linear and being quadratic.
+    /// The coarse layer, the centroid codes and the two maintenance candidate
+    /// lists are the whole of what an image does not carry, because all three
+    /// are decided by the centroids and the posting lengths that it does carry.
+    /// Building them here is one pass rather than the running updates the insert
+    /// path makes, which is the difference between a load being linear and being
+    /// quadratic.
     pub(crate) fn finish_image(&mut self) {
         let dim = self.quant.dim();
         let n = self.postings.len();
@@ -2087,6 +2095,41 @@ mod tests {
 
         let r = recall(&ix, &store, 10, 60);
         assert!(r >= 0.95, "recall at 10 after the stream was {r}");
+    }
+
+    /// The centroid codes only come into play past a few hundred partitions, so
+    /// the collections the rest of these tests build never reach them. What they
+    /// promise is that the search does not change, and the way to find out is to
+    /// take every answer, throw the codes away, and take every answer again.
+    #[test]
+    fn ranking_centroids_through_codes_gives_the_same_search() {
+        // Small vectors and short postings, because what this test needs is a
+        // lot of partitions rather than a lot of vectors, and building them is
+        // the whole cost of it.
+        let dim = 12;
+        let store = corpus(dim, 12_000, 40, 91);
+        let tuning = Tuning {
+            posting: 32,
+            ..Tuning::default()
+        };
+        let mut ix = build(&store, dim, tuning);
+        assert!(
+            ix.postings.len() > crate::rank::FLOOR,
+            "only {} partitions, which is not enough to have codes at all",
+            ix.postings.len()
+        );
+
+        let ask = |ix: &Partitions| -> Vec<Vec<u64>> {
+            (0..200)
+                .map(|i| {
+                    let q = &store.0[i * 57 % store.0.len()];
+                    ix.search(q, 10, &store).into_iter().map(|h| h.id).collect()
+                })
+                .collect()
+        };
+        let coded = ask(&ix);
+        ix.forget_centroid_codes();
+        assert_eq!(coded, ask(&ix), "the codes changed an answer");
     }
 
     /// What the sweep is for, measured as the thing it actually fixes rather
