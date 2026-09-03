@@ -67,6 +67,13 @@
 //! a union, which is RFC 9535 without its filter selector. The `JSON.*` surface
 //! is written against sets rather than single values, so it needs both.
 //!
+//! [`edit`](mod@edit) is the write side. A path answers a set of places and an edit says
+//! what happens at each of them, which is a replacement, a removal, a key put
+//! into an object or a run of an array spliced. A document is rebuilt rather
+//! than patched, and everything the edit did not name is a memcpy through
+//! [`Builder::embed`], so the cost follows the size of the document and not the
+//! number of changes.
+//!
 //! [`text`] is JSON text in and out. The typed API never touches it, since a
 //! struct is serialized straight into this encoding and read straight back out
 //! of it, but `JSON.SET` arrives with text and `JSON.GET` has to hand text
@@ -91,6 +98,7 @@
 
 mod build;
 mod docs;
+pub mod edit;
 mod head;
 mod index;
 mod keys;
@@ -103,6 +111,7 @@ pub mod vector;
 
 pub use build::Builder;
 pub use docs::{Doc, DocElems, DocMembers, Docs};
+pub use edit::{Edit, edit};
 pub use head::{COUNT_MAX, DEPTH_MAX, Kind};
 pub use index::{IndexKind, KEY_MAX, Key, PathIndex, Ranged, RangedRev};
 pub use keys::{KEYS_MAX, Keys};
