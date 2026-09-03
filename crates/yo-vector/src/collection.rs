@@ -466,6 +466,96 @@ impl Collection {
         self.index.code_bytes()
     }
 
+    // -- what an image is made of -------------------------------------------
+    //
+    // [`crate::image`] is the other half of these: it writes a collection down
+    // and reads it back, and it needs at the parts that nothing else outside
+    // this file has any business touching. A load is not a sequence of writes,
+    // so it cannot go through [`Collection::put`]: putting a vector back would
+    // requantise it, and requantising every vector is the rebuild an image
+    // exists to avoid.
+
+    /// The index, for the half of an image that is codes and centroids.
+    pub(crate) fn index(&self) -> &Partitions {
+        &self.index
+    }
+
+    /// Key to id, which is the half of an image that is names.
+    pub(crate) fn id_table(&self) -> &Elements<u64> {
+        &self.ids
+    }
+
+    /// How far the ids go, which is not how many there are.
+    ///
+    /// An id is a slot, so a collection that has had members removed has holes
+    /// and the live count says nothing about the highest id in use. This is the
+    /// number an image writes so that a load can allocate the table once.
+    pub(crate) fn slots(&self) -> usize {
+        self.raw.owner.len()
+    }
+
+    /// Whether the index has a member under `id`.
+    pub(crate) fn holds(&self, id: u64) -> bool {
+        self.index.contains(id)
+    }
+
+    /// An empty collection around an index that is already built, with room for
+    /// `slots` vectors and not one of them written yet.
+    pub(crate) fn from_image(index: Partitions, metric: Metric, slots: usize) -> Collection {
+        let dim = index.dim();
+        Collection {
+            index,
+            raw: Raw {
+                dim,
+                data: vec![0.0; slots * dim],
+                owner: vec![None; slots],
+                free: Vec::new(),
+            },
+            ids: Elements::new(),
+            metric,
+        }
+    }
+
+    /// Put a vector back in the slot the image says it was in.
+    ///
+    /// The index already has the member, so this is the other two tables only:
+    /// the vector into its slot and the key into the id table. No maintenance
+    /// runs, because nothing moved.
+    ///
+    /// # Errors
+    ///
+    /// [`Code::Full`] for a key the id table will not take, which for an image
+    /// written by this build cannot happen and for a damaged one is the honest
+    /// answer.
+    pub(crate) fn restore(&mut self, key: &[u8], id: u64, v: &[f32]) -> Result<()> {
+        self.raw.owner[id as usize] = Some(key.into());
+        self.raw.write(id, v);
+        self.ids
+            .insert(key, id)
+            .map_err(|_| Error::new(Code::Full, "that key is too long for a vector collection"))?;
+        Ok(())
+    }
+
+    /// Drop a member the store could not produce a vector for.
+    pub(crate) fn forget(&mut self, id: u64) {
+        self.index.remove(id);
+    }
+
+    /// Say a load is over, so the free list can be built from what is left.
+    ///
+    /// In reverse, so that the lowest free slot is on top and the next write
+    /// takes it. That is what an insert path that has been running normally
+    /// leaves behind, and a collection that has just been loaded should not be
+    /// distinguishable from one that has not.
+    pub(crate) fn seal(&mut self) {
+        self.raw.free.clear();
+        for id in (0..self.raw.owner.len()).rev() {
+            if self.raw.owner[id].is_none() {
+                self.raw.free.push(id as u64);
+            }
+        }
+    }
+
     /// A vector this collection can take, in the form it stores.
     fn ready(&self, v: &[f32]) -> Result<Vec<f32>> {
         if v.len() != self.raw.dim {

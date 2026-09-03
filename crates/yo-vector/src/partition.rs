@@ -121,8 +121,11 @@
 //!
 //! # What is not here yet
 //!
-//! A `.yo` file. None of this is written down yet, and the format freezes at the
-//! end of M6, so that is the next thing.
+//! A checkpoint that writes the image out. [`crate::image`] is the layout and
+//! the two halves of the round trip, and the seam it comes back through is a
+//! pair of crate private calls further down this file, so an index survives a
+//! restart without requantising anything. What is still missing is the shard
+//! side: deciding when to write one, and pointing a checkpoint entry at it.
 //!
 //! MS-MARCO-v2. SIFT1M on a 13900K now gets recall 0.9597 at probe 64 rerank
 //! 16 with p50 at 638 us and p99 at 776 us, so both halves of G12 are met on
@@ -138,6 +141,8 @@
 //! The commands that put all of this on the wire are the rest of M6.
 
 use std::collections::HashMap;
+
+use yo_common::{Code, Error, Result};
 
 use crate::coarse::Coarse;
 use crate::dist::sqdist;
@@ -616,6 +621,122 @@ impl Partitions {
     #[must_use]
     pub fn contains(&self, id: u64) -> bool {
         self.at.contains_key(&id)
+    }
+
+    // -- what an image is made of -------------------------------------------
+    //
+    // [`crate::image`] writes an index down and reads it back, and it lives in
+    // its own file because the layout it writes is the format's business rather
+    // than the index's. These four are the seam between the two: everything
+    // above is private on purpose and none of it is worth making public just so
+    // that a sibling module can copy it into a buffer.
+
+    /// Every centroid, already rotated, `dim` floats each end to end.
+    pub(crate) fn all_centroids(&self) -> &[f32] {
+        &self.centroids
+    }
+
+    /// One partition's four parallel arrays, and the size at which its last
+    /// split gave up.
+    pub(crate) fn posting_parts(&self, p: usize) -> (&[u64], &[u64], &[u8], &[Coded], usize) {
+        let posting = &self.postings[p];
+        (
+            &posting.ids,
+            &posting.tags,
+            &posting.codes,
+            &posting.meta,
+            posting.stuck,
+        )
+    }
+
+    /// Put a whole partition back, centroid and members together.
+    ///
+    /// The centroid goes on the end of the run and the members go into a new
+    /// posting, so partitions come back in the order they were written and an
+    /// id keeps the partition number it had. Nothing is requantised and nothing
+    /// is measured: an image holds the codes, and recomputing them from the
+    /// vectors would be the rebuild this whole index exists to not do.
+    ///
+    /// # Errors
+    ///
+    /// [`Code::Corrupt`] if the four arrays do not describe the same members or
+    /// if an id is already in the index.
+    pub(crate) fn absorb(
+        &mut self,
+        centroid: &[f32],
+        ids: Vec<u64>,
+        tags: Vec<u64>,
+        codes: Vec<u8>,
+        meta: Vec<Coded>,
+        stuck: usize,
+    ) -> Result<()> {
+        let width = self.quant.code_bytes();
+        if centroid.len() != self.dim()
+            || tags.len() != ids.len()
+            || meta.len() != ids.len()
+            || codes.len() != ids.len() * width
+        {
+            return Err(Error::new(
+                Code::Corrupt,
+                "the parts of a partition do not describe the same members",
+            )
+            .with_detail(format!(
+                "centroid={} ids={} tags={} codes={} meta={}",
+                centroid.len(),
+                ids.len(),
+                tags.len(),
+                codes.len(),
+                meta.len()
+            )));
+        }
+        let p = self.postings.len();
+        for (slot, &id) in ids.iter().enumerate() {
+            let was = self.at.insert(
+                id,
+                Slot {
+                    partition: p as u32,
+                    slot: slot as u32,
+                },
+            );
+            if was.is_some() {
+                return Err(
+                    Error::new(Code::Corrupt, "an id is in two partitions of one image")
+                        .with_detail(format!("id={id}")),
+                );
+            }
+        }
+        self.centroids.extend_from_slice(centroid);
+        self.postings.push(Posting {
+            ids,
+            tags,
+            codes,
+            meta,
+            stuck,
+        });
+        Ok(())
+    }
+
+    /// Say that a load is over, so the derived parts can be built once.
+    ///
+    /// The coarse layer and the two maintenance candidate lists are the whole of
+    /// what an image does not carry, because both are decided by the centroids
+    /// and the posting lengths that it does carry. Building them here is one
+    /// pass rather than the running updates the insert path makes, which is the
+    /// difference between a load being linear and being quadratic.
+    pub(crate) fn finish_image(&mut self) {
+        let dim = self.quant.dim();
+        let n = self.postings.len();
+        self.coarse.rebuild(&self.centroids, dim, n);
+        self.big.clear();
+        self.small.clear();
+        for p in 0..n {
+            if self.over(p) {
+                self.big.push(p as u32);
+            }
+            if self.under(p) {
+                self.small.push(p as u32);
+            }
+        }
     }
 
     /// The `k` nearest vectors to `q`, measured exactly.

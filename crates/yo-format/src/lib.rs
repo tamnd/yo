@@ -25,6 +25,7 @@
 
 pub mod catalog;
 pub mod document;
+pub mod image;
 pub mod page;
 pub mod record;
 pub mod superblock;
@@ -33,6 +34,9 @@ pub mod vector;
 pub use catalog::{Band, CatalogEntry, Model, ValueType};
 pub use document::{
     DOC_COUNT_MAX, DOC_COUNT_SHIFT, DOC_HEADER_LEN, DocumentBody, ValueTag, doc_flags,
+};
+pub use image::{
+    Chain, IMAGE_HEADER_LEN, ImageHeader, POSTING_HEADER_LEN, PostingHeader, image_kind,
 };
 pub use page::{PAGE_HEADER_LEN, PageHeader};
 pub use record::{RecordHeader, RecordKind, RecordRef, record_flags};
@@ -153,6 +157,28 @@ pub fn get_u64(b: &[u8], off: usize) -> u64 {
     match b.get(off..off + 8) {
         Some(s) => u64::from_le_bytes([s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7]]),
         None => 0,
+    }
+}
+
+/// Reads a little endian `f32` at `off`, or 0 if the slice is too short.
+///
+/// Bit for bit, through [`f32::from_le_bytes`], which is not the same as reading
+/// a number and converting it: a vector that came back nearly right would
+/// reorder search results for no reason anybody could find.
+#[inline]
+#[must_use]
+pub fn get_f32(b: &[u8], off: usize) -> f32 {
+    match b.get(off..off + 4) {
+        Some(s) => f32::from_le_bytes([s[0], s[1], s[2], s[3]]),
+        None => 0.0,
+    }
+}
+
+/// Writes `v` little endian at `off`. Does nothing if the slice is too short.
+#[inline]
+pub fn put_f32(b: &mut [u8], off: usize, v: f32) {
+    if let Some(s) = b.get_mut(off..off + 4) {
+        s.copy_from_slice(&v.to_le_bytes());
     }
 }
 
@@ -278,6 +304,20 @@ mod tests {
         assert_eq!(b, [0, 0, 0], "no room, so nothing was written");
         put_u16(&mut b, 0, 0x1234);
         assert_eq!(b, [0x34, 0x12, 0]);
+    }
+
+    #[test]
+    fn a_float_goes_down_and_comes_back_bit_for_bit() {
+        let mut b = [0u8; 4];
+        for v in [0.0f32, -0.0, 1.0, -1.0, 1e-38, 3.4e38, 0.1] {
+            put_f32(&mut b, 0, v);
+            assert_eq!(
+                get_f32(&b, 0).to_bits(),
+                v.to_bits(),
+                "{v} came back changed"
+            );
+        }
+        assert_eq!(get_f32(&b, 2), 0.0, "two bytes are not a float");
     }
 
     #[test]

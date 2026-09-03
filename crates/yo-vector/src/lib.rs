@@ -88,7 +88,12 @@
 //! nothing. A client that asked for HNSW and meant it can say so and be
 //! refused rather than quietly served something else.
 //!
-//! Writing any of this to a `.yo` file is the rest of M6.
+//! [`image`] is how any of it survives a restart. A collection is written down
+//! as the format's `10` section 2 says, one chain per partition under a
+//! checkpoint, and read back without a single vector being requantised. The
+//! vectors themselves are not in there, because they are already records of kind
+//! 3 in the log, so a load takes the shape and the codes from the image and the
+//! vectors from whatever the caller points it at.
 
 #![deny(missing_docs)]
 
@@ -96,12 +101,14 @@ pub(crate) mod coarse;
 pub mod collection;
 pub(crate) mod dist;
 pub mod hnsw;
+pub mod image;
 pub mod muvera;
 pub mod partition;
 pub mod rabitq;
 pub mod rotate;
 
 pub use collection::{Collection, Match};
+pub use image::{Restored, Stored};
 pub use partition::{Any, Filter, Hit, Partitions, Signature, Tuning, Vectors};
 pub use rabitq::{Bits, Coded, Quantizer, Query};
 pub use rotate::Rotation;
