@@ -89,6 +89,21 @@ pub trait Blocks {
     /// above it does, and `maxstore` is a limit on the file rather than on the
     /// payload that went into it.
     fn bytes(&self) -> u64;
+
+    /// Says that every borrow handed out by [`Blocks::get`] is finished with.
+    ///
+    /// A store that borrows from something it already holds has nothing to do
+    /// here and takes the default. A store that has to copy the bytes somewhere
+    /// before it can lend them out needs a moment when that somewhere is known
+    /// to be unused, because `get` takes `&self` and cannot free anything, and
+    /// this is that moment: it takes `&mut self`, which is the proof that no
+    /// borrow is alive.
+    ///
+    /// A caller that never calls it is correct and grows. [`Reader`] holds
+    /// several chunks of one value at once by design, so the call belongs
+    /// before a read and not inside one, which is where
+    /// [`Tier`](crate::tier::Tier) puts it.
+    fn release(&mut self) {}
 }
 
 /// So that a store can be chosen at run time rather than at compile time.
@@ -110,6 +125,10 @@ impl Blocks for Box<dyn Blocks> {
 
     fn bytes(&self) -> u64 {
         (**self).bytes()
+    }
+
+    fn release(&mut self) {
+        (**self).release();
     }
 }
 

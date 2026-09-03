@@ -19,6 +19,13 @@
 //! pages and then clear, so this stays small in practice, and
 //! [`LogFile::cache_bytes`] is there for a caller that wants to check rather
 //! than assume.
+//!
+//! **A point read does not go through it.** [`LogFile::read_into`] copies the
+//! bytes the caller asked for and caches nothing, because the caller there is a
+//! client naming a key whose value was moved out of memory, and over a store
+//! larger than memory the page it lands in is a different one every time. Read
+//! those through the cache and a run of random reads pulls 32 MiB per key and
+//! ends up holding the whole file, which is the opposite of what a file is for.
 
 use crate::file::{Alloc, REGION_LEN, io_err};
 use crate::io as fio;
@@ -469,6 +476,35 @@ impl PageSource for LogFile {
         // cache. Nothing frees it without `&mut self`, which the returned borrow
         // rules out for as long as it is alive.
         Some(unsafe { &*p })
+    }
+
+    fn read_into(&self, page_addr: u64, offset: usize, into: &mut [u8]) -> Option<usize> {
+        // A page already in the cache is free to read out of, and a page in the
+        // cache is one compaction or recovery is working through right now, so
+        // going to the device for it would be a second copy of bytes that are
+        // already here.
+        //
+        // SAFETY: as in `page_bytes`. `LogFile` is not `Sync`, the `&mut Cache`
+        // dies at the end of the statement, and the borrow below is derived from
+        // a `Box::into_raw` allocation the `Vec` does not own.
+        let cached = unsafe { &mut *self.cache.get() }
+            .find(page_addr)
+            .map(|p| unsafe { &*p });
+        if let Some(bytes) = cached {
+            if offset >= bytes.len() {
+                return Some(0);
+            }
+            let n = into.len().min(bytes.len() - offset);
+            into[..n].copy_from_slice(&bytes[offset..offset + n]);
+            return Some(n);
+        }
+        // Same reason as `page_bytes`: a write still in the ring has not reached
+        // the file, and reading under it gives back whatever was there before.
+        self.with_ring(RingWriter::quiesce);
+        let off = *self.regions.get(&page_addr)?;
+        // Not cached. That is the point of this method, and it is why a store
+        // larger than memory can be read at all.
+        fio::read_at(&self.file, off + offset as u64, into).ok()
     }
 }
 
@@ -1029,5 +1065,53 @@ mod tests {
         log.commit_pending().unwrap();
         assert_eq!(log.read(more).unwrap().value, b"after the reopen");
         assert_eq!(log.read(addrs[0]).unwrap().value, b"value number 0");
+    }
+
+    /// The thing a store larger than memory is for. Most of these records are
+    /// in pages that left the resident window long ago, `read` says so, and
+    /// every one of them still comes back byte for byte off the file.
+    #[test]
+    fn a_record_whose_page_left_the_window_still_reads_off_the_file() {
+        let t = Tmp::new("faultin");
+        let mut db = Yo::create(&t.0, &CreateOptions::default()).unwrap();
+        let small = LogConfig {
+            page_len: 8192,
+            resident_pages: 2,
+            ..cfg(0)
+        };
+        let mut log = Log::open(small, db.log(0).unwrap(), 0).unwrap();
+
+        let h = RecordHeader::new(RecordKind::CollectionChunk);
+        let mut wrote = Vec::new();
+        for i in 0..400u32 {
+            let v = format!("value number {i}, ").repeat(6);
+            let addr = log.append(&h, b"", v.as_bytes()).unwrap().addr;
+            wrote.push((addr, v));
+        }
+        log.commit_pending().unwrap();
+
+        let mut gone = 0;
+        let mut out = Vec::new();
+        for (addr, want) in &wrote {
+            if log.read(*addr).is_err() {
+                gone += 1;
+            }
+            out.clear();
+            log.read_value_into(*addr, &mut out).unwrap();
+            assert_eq!(
+                out,
+                want.as_bytes(),
+                "the record at {addr} did not come back the same"
+            );
+        }
+        assert!(
+            gone > 300,
+            "only {gone} of the 400 were out of the window, so this mostly read memory"
+        );
+        assert_eq!(
+            log.sink().cache_bytes(),
+            0,
+            "point reads filled the page cache, which is what makes a store larger than memory unreadable"
+        );
     }
 }

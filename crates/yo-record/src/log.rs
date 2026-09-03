@@ -55,6 +55,14 @@ pub const DEFAULT_RESIDENT_PAGES: usize = 3;
 /// How much of the resident window updates in place. `06` section 2's 40%.
 pub const DEFAULT_MUTABLE_FRACTION: f64 = 0.40;
 
+/// How much a read of a record that is not resident asks for on its first try.
+///
+/// A device does not do better than a block, and most records are shorter than
+/// one, so this is the whole read for most of them. A longer record costs a
+/// second read of exactly what its own header says it needs, and there is no
+/// third.
+pub const FAULT_BLOCK: usize = 4096;
+
 /// The unit a write is aligned to, which is the torn write unit `07` section 1
 /// assumes and nothing stronger.
 pub const FLUSH_BLOCK: usize = 4096;
@@ -682,7 +690,14 @@ impl<S: PageSink> Log<S> {
     /// behind it.
     fn close_page(&mut self, slot: usize) -> Result<()> {
         match self.cfg.durability {
-            Durability::None => Ok(()),
+            // Not nothing. This mode's promise is that a commit is answered
+            // without waiting for the store, and a page that has filled up is
+            // not waiting for anything: the tail has left it and the next turn
+            // of the ring hands its buffer to another page. A page that goes
+            // out of memory without being written is a page that is gone, while
+            // the process is still running and with nothing having crashed, so
+            // the bytes go out here. What this mode skips is the sync.
+            Durability::None => self.flush_slot(slot),
             // The `poll` is what hands an asynchronous sink's submissions to
             // the kernel, and this mode's promise is that the kernel has them.
             // A page boundary is once per 32 MiB, so the call costs nothing
@@ -836,6 +851,11 @@ impl<S: PageSink> Log<S> {
     // -- reading ------------------------------------------------------------
 
     /// The record at `addr`, if it is resident.
+    ///
+    /// A borrow straight out of the page buffer, so this is the read that costs
+    /// nothing and it only answers for the window. A caller that has to have
+    /// the record either way wants `read_value_into`, which is on the logs that
+    /// have a store to read from and which serves both sides.
     ///
     /// # Errors
     ///
@@ -1014,6 +1034,111 @@ impl<S: PageSink + PageSource> Log<S> {
         log.recompute_boundaries();
         Ok(log)
     }
+
+    /// Appends the value of the record at `addr` to `out`, whether or not the
+    /// page it is in is still in memory.
+    ///
+    /// This is the fault in that [`Log::read`] describes and does not do.
+    /// `read` serves the resident window and says `NotFound` for everything
+    /// older, which is the right answer for a caller walking pages and the
+    /// wrong one for a client naming a key: a value that was moved out of
+    /// memory is in the file precisely because it is not in the window, so a
+    /// store that can only read the window is a store that can only hold what
+    /// already fits.
+    ///
+    /// The resident case is the same read and the same borrow, one copy on the
+    /// way out. The stable case is [`PageSource::read_into`] twice at worst,
+    /// once for [`FAULT_BLOCK`] bytes at the record and once more for the rest
+    /// if the record is longer than that. It is never a page.
+    ///
+    /// # Errors
+    ///
+    /// [`Code::NotFound`] if the address is below `begin`, where compaction has
+    /// already been, or if the store has no page for it. [`Code::Invalid`] for
+    /// an address at or past the tail, which is a caller asking about a record
+    /// that has not been written. [`Code::Corrupt`] if what comes back does not
+    /// parse or is shorter than its own header says.
+    pub fn read_value_into(&self, addr: u64, out: &mut Vec<u8>) -> Result<()> {
+        match self.region_of(addr) {
+            Region::ReadOnly | Region::Mutable => {
+                let r = self.read(addr)?;
+                out.extend_from_slice(r.value);
+                return Ok(());
+            }
+            Region::Reclaimed => {
+                return Err(
+                    Error::new(Code::NotFound, "that address has been reclaimed")
+                        .with_detail(format!("addr={addr} begin={}", self.begin)),
+                );
+            }
+            Region::Unallocated => {
+                return Err(Error::new(Code::Invalid, "that address is past the tail")
+                    .with_detail(format!("addr={addr} tail={}", self.tail)));
+            }
+            Region::Stable => {}
+        }
+
+        let page_addr = self.page_addr_of(addr);
+        let off = PAGE_HEADER_LEN + (addr - page_addr) as usize;
+        // Never more than what is left of the page, so that a record near the
+        // end of one does not turn into a read past the region.
+        let room = self.cfg.page_len - off;
+        let mut buf = vec![0u8; FAULT_BLOCK.min(room)];
+        let mut have = self.fill(page_addr, off, &mut buf)?;
+
+        // The first four bytes are the record's total length, which is how a
+        // block granular read knows whether it got the whole thing. Zero is the
+        // end of log sentinel, and finding one here means the index is pointing
+        // at a record that was never written.
+        if have < 4 {
+            return Err(
+                Error::new(Code::Corrupt, "the page ends before the record does")
+                    .with_detail(format!("addr={addr} page_addr={page_addr} read={have}")),
+            );
+        }
+        let len = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
+        if len == 0 {
+            return Err(
+                Error::new(Code::Corrupt, "there is no record at that address")
+                    .with_detail(format!("addr={addr}")),
+            );
+        }
+        if len > have {
+            if len > room {
+                return Err(
+                    Error::new(Code::Corrupt, "the record runs past the end of its page")
+                        .with_detail(format!("addr={addr} len={len} room={room}")),
+                );
+            }
+            buf.resize(len, 0);
+            have = self.fill(page_addr, off, &mut buf)?;
+            if have < len {
+                return Err(Error::new(Code::Corrupt, "the record is not all there")
+                    .with_detail(format!("addr={addr} len={len} read={have}")));
+            }
+        }
+        buf.truncate(have);
+
+        match RecordRef::parse(&buf)? {
+            Some(r) => {
+                out.extend_from_slice(r.value);
+                Ok(())
+            }
+            None => Err(
+                Error::new(Code::Corrupt, "there is no record at that address")
+                    .with_detail(format!("addr={addr}")),
+            ),
+        }
+    }
+
+    /// One read from the store, with a missing page turned into an error the
+    /// caller can report rather than a `None` it has to invent words for.
+    fn fill(&self, page_addr: u64, off: usize, into: &mut [u8]) -> Result<usize> {
+        self.sink.read_into(page_addr, off, into).ok_or_else(|| {
+            Error::new(Code::NotFound, "the store has no page for that address")
+                .with_detail(format!("page_addr={page_addr}"))
+        })
+    }
 }
 
 #[cfg(test)]
@@ -1105,6 +1230,119 @@ mod tests {
         };
         let err = Log::recover(cfg, MemorySink::new(), 64).unwrap_err();
         assert_eq!(err.code(), Code::Corrupt);
+    }
+
+    /// Durability `none` says a commit does not wait for the store. It does not
+    /// say the store never sees the page.
+    ///
+    /// A turned page loses its buffer to the next page that lands in the same
+    /// ring slot, so a page that is not written on its way out is a page that
+    /// is gone, with nothing having crashed and the process still running. This
+    /// used to be exactly what happened, and it is the reason a server with a
+    /// file could not read back a value it had moved into it.
+    #[test]
+    fn a_page_that_turns_reaches_the_store_even_with_no_durability() {
+        let mut log = small(Durability::None);
+        let payload = log.payload_len() as u64;
+        let mut wrote = Vec::new();
+        while log.tail() < payload * 4 {
+            let v = format!("value number {}", wrote.len());
+            wrote.push((put(&mut log, b"k", v.as_bytes()).addr, v));
+        }
+
+        let pages: Vec<u64> = log.sink().pages().iter().map(|(a, _)| *a).collect();
+        assert!(
+            pages.contains(&0) && pages.contains(&payload),
+            "the pages the tail has left are not in the store: {pages:?}"
+        );
+
+        let mut out = Vec::new();
+        for (addr, want) in &wrote {
+            out.clear();
+            log.read_value_into(*addr, &mut out).unwrap();
+            assert_eq!(out, want.as_bytes(), "the record at {addr}");
+        }
+    }
+
+    /// What `read` refuses, this answers. The two together are the whole
+    /// difference between a file that holds what already fits in memory and a
+    /// file that holds more than memory.
+    #[test]
+    fn a_record_below_the_window_reads_back_through_the_store() {
+        let mut log = small(Durability::Group);
+        let mut wrote = Vec::new();
+        for i in 0..1_500u32 {
+            let v = format!("value number {i}").repeat(3);
+            wrote.push((put(&mut log, b"k", v.as_bytes()).addr, v));
+        }
+        log.commit_pending().unwrap();
+
+        let mut gone = 0;
+        let mut out = Vec::new();
+        for (addr, want) in &wrote {
+            if log.read(*addr).is_err() {
+                gone += 1;
+            }
+            out.clear();
+            log.read_value_into(*addr, &mut out).unwrap();
+            assert_eq!(out, want.as_bytes(), "the record at {addr}");
+        }
+        assert!(
+            gone > 1_000,
+            "only {gone} of the 1500 were below the window"
+        );
+    }
+
+    /// A value longer than one read, which is the branch that goes back for the
+    /// rest of the record after the header says how much there is.
+    #[test]
+    fn a_record_longer_than_a_block_comes_back_whole() {
+        let cfg = LogConfig {
+            shard: 1,
+            page_len: 64 * 1024,
+            resident_pages: 2,
+            mutable_fraction: 0.40,
+            durability: Durability::Group,
+        };
+        let mut log = Log::new(cfg, MemorySink::new()).unwrap();
+        let long: Vec<u8> = (0..FAULT_BLOCK * 2 + 111)
+            .map(|i| (i % 251) as u8)
+            .collect();
+        let first = put(&mut log, b"long", &long).addr;
+        for i in 0..40u32 {
+            put(&mut log, b"filler", &vec![b'x'; 4000][..]);
+            let _ = i;
+        }
+        log.commit_pending().unwrap();
+
+        assert!(
+            log.read(first).is_err(),
+            "the long record is still resident"
+        );
+        let mut out = Vec::new();
+        log.read_value_into(first, &mut out).unwrap();
+        assert_eq!(out, long, "the second read did not bring back the rest");
+    }
+
+    /// The two addresses that are not a fault at all. Compaction has been past
+    /// one and nothing has been written at the other, and answering either with
+    /// a device read would be reading somebody else's bytes.
+    #[test]
+    fn an_address_outside_the_log_is_not_something_to_fault_in() {
+        let mut log = small(Durability::Group);
+        for i in 0..1_500u32 {
+            put(&mut log, b"k", &i.to_le_bytes());
+        }
+        log.commit_pending().unwrap();
+
+        let mut out = Vec::new();
+        let err = log.read_value_into(log.tail(), &mut out).unwrap_err();
+        assert_eq!(err.code(), Code::Invalid, "{err}");
+
+        let head = log.head();
+        log.set_begin(head);
+        let err = log.read_value_into(0, &mut out).unwrap_err();
+        assert_eq!(err.code(), Code::NotFound, "{err}");
     }
 
     #[test]

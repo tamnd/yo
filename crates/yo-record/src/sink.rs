@@ -97,11 +97,16 @@ pub trait PageSink {
 
 /// Where a page comes back from, once it has left memory.
 ///
-/// The read counterpart of [`PageSink`]. Two callers need it and they need it
-/// for the same reason: the pages they want are in the stable region, which is
-/// in the file and not in the log's resident window. Compaction reads the pages
-/// it is rewriting, and recovery reads the page a partially filled tail is
-/// sitting in so that it does not write zeroes over the records already there.
+/// The read counterpart of [`PageSink`]. Three callers need it and the first
+/// two need it for the same reason: the pages they want are in the stable
+/// region, which is in the file and not in the log's resident window.
+/// Compaction reads the pages it is rewriting, and recovery reads the page a
+/// partially filled tail is sitting in so that it does not write zeroes over
+/// the records already there.
+///
+/// The third caller is a point read of a value that was moved out of memory,
+/// and it is the reason there are two methods here rather than one. See
+/// [`PageSource::read_into`].
 ///
 /// This is the seam. The file layer implements it against a mapping, and the
 /// tests implement it against a `Vec`.
@@ -109,6 +114,36 @@ pub trait PageSource {
     /// The full physical bytes of the page whose payload starts at `page_addr`,
     /// header included, or `None` if this source does not have it.
     fn page_bytes(&self, page_addr: u64) -> Option<&[u8]>;
+
+    /// Copies at most `into.len()` bytes out of the page whose payload starts
+    /// at `page_addr`, beginning `offset` bytes into the physical page, and
+    /// answers how many landed. `None` means this source does not have that
+    /// page at all.
+    ///
+    /// # Why this is not [`PageSource::page_bytes`] with a slice on the end
+    ///
+    /// Because of who calls it. Compaction and recovery ask for a page they are
+    /// about to work through from one end to the other, and a source that keeps
+    /// the image around while they do is doing them a favour. A point read of a
+    /// demoted value asks for a few hundred bytes out of the middle of a page
+    /// chosen by whichever key a client happened to name, and over a store
+    /// larger than memory the next read is in a different page. Serving that
+    /// through `page_bytes` reads a whole 32 MiB page off the device to answer
+    /// a 4 KiB question and then holds it, and a run of random reads holds the
+    /// entire file. So this is the narrow one: it copies rather than borrows,
+    /// which is what lets an implementation read a block and forget it.
+    ///
+    /// The default is the honest answer for a source that already has the page
+    /// in memory, which is every source but the file.
+    fn read_into(&self, page_addr: u64, offset: usize, into: &mut [u8]) -> Option<usize> {
+        let bytes = self.page_bytes(page_addr)?;
+        if offset >= bytes.len() {
+            return Some(0);
+        }
+        let n = into.len().min(bytes.len() - offset);
+        into[..n].copy_from_slice(&bytes[offset..offset + n]);
+        Some(n)
+    }
 }
 
 /// A sink that keeps pages in memory and calls that durable.

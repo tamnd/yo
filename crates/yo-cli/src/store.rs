@@ -25,6 +25,16 @@
 //! engine only asks when that database is actually under memory pressure. A
 //! server that is given a file and never fills memory never writes to it.
 //!
+//! # Reading back what does not fit
+//!
+//! A log keeps a few pages in memory and everything older is in the file, and
+//! for a store holding ten times memory that is where nearly every read lands.
+//! So a read here tries the resident window first, because a value demoted a
+//! moment ago is still in it and costs nothing, and falls through to a block
+//! granular read off the file for everything else. The bytes that come back
+//! have to live somewhere for the length of the borrow, which is what `staged`
+//! is, and the tier says when it is done with them.
+//!
 //! # What durability means here
 //!
 //! Nothing that is only in memory survives a restart today, so a value that was
@@ -93,7 +103,10 @@ impl Store {
                 ..LogConfig::default()
             };
             let log = Log::new(cfg, sink).ok()?;
-            Some(Box::new(Chunks { log }))
+            Some(Box::new(Chunks {
+                log,
+                staged: std::cell::UnsafeCell::new(Vec::new()),
+            }))
         }
     }
 }
@@ -101,6 +114,16 @@ impl Store {
 /// One database's log, wearing the interface the tier asks for.
 struct Chunks {
     log: Log<LogFile>,
+    /// Chunks read back off the file, waiting for the reader that asked for
+    /// them to be done.
+    ///
+    /// [`Blocks::get`] takes `&self` and hands out a borrow, and bytes that
+    /// came off a device have to live somewhere for that borrow to point at.
+    /// Each entry owns its own allocation, so growing the vector moves the
+    /// boxes and not the bytes, and a borrow handed out earlier stays where it
+    /// was. [`Blocks::release`] empties it and takes `&mut self`, which is the
+    /// proof that no borrow is still alive.
+    staged: std::cell::UnsafeCell<Vec<Box<[u8]>>>,
 }
 
 impl Blocks for Chunks {
@@ -117,7 +140,32 @@ impl Blocks for Chunks {
         if at.space() != Some(Space::Log) {
             return Err(Error::new(Code::Invalid, "that address is not in the log"));
         }
-        Ok(self.log.read(at.offset())?.value)
+        let off = at.offset();
+        // A chunk still in the log's resident window is already in memory and
+        // the borrow can point straight at it. That is the common case for a
+        // value demoted a moment ago and it costs nothing.
+        match self.log.read(off) {
+            Ok(r) => return Ok(r.value),
+            // The page has aged out of the window, which is where most of a
+            // store larger than memory lives. Not a failure, and the log's own
+            // documentation calls it the signal to fault the page in.
+            Err(e) if e.code() == Code::NotFound => {}
+            Err(e) => return Err(e),
+        }
+
+        let mut buf = Vec::new();
+        self.log.read_value_into(off, &mut buf)?;
+        // SAFETY: `Chunks` is not `Sync` and the log inside it is not `Send`, so
+        // there is one thread in here. The `&mut Vec` dies at the end of this
+        // call, and the borrow that leaves it is derived from the box's own
+        // allocation, which the vector does not own the bytes of and does not
+        // move when it grows. Nothing frees it without `&mut self`.
+        let staged = unsafe { &mut *self.staged.get() };
+        staged.push(buf.into_boxed_slice());
+        let bytes: *const [u8] = &*staged[staged.len() - 1];
+        // SAFETY: the allocation is live and owned by the box just pushed, and
+        // `release` is the only thing that drops it.
+        Ok(unsafe { &*bytes })
     }
 
     fn bytes(&self) -> u64 {
@@ -127,6 +175,13 @@ impl Blocks for Chunks {
         // are 32 MiB, so a store holding thirty megabytes of demoted values
         // would report nothing at all and a storage limit would never fire.
         self.log.tail().saturating_sub(self.log.begin())
+    }
+
+    fn release(&mut self) {
+        // One value's worth at a time. The tier calls this before it reads, so
+        // what goes here is the chunks of the value read before this one, and
+        // the high water mark is a single value rather than a session.
+        self.staged.get_mut().clear();
     }
 }
 
@@ -205,6 +260,46 @@ mod tests {
             );
         }
         assert_eq!(k.len(), 200, "a sweep moves values and not keys");
+    }
+
+    /// The case the whole file exists for, at the level the file is written at.
+    ///
+    /// The log keeps three 32 MiB pages in memory, so this writes past that on
+    /// purpose. Everything below the window comes off the device, several
+    /// borrows are alive at once because that is what reading a chained value
+    /// looks like, and they all still say what was put in them.
+    #[test]
+    fn chunks_past_the_resident_window_read_back_off_the_device() {
+        let path = tmp("window");
+        let store = Store::create(&path.0).expect("a file");
+        let mut source = store.source();
+        let mut blocks = source(0).expect("database zero has a log");
+
+        // Four pages worth, so that the first ones are long gone by the end.
+        let piece = vec![b'q'; yo_kv::cold::CHUNK];
+        let mut addrs = Vec::new();
+        for i in 0..(4 * 32 * 1024 * 1024 / yo_kv::cold::CHUNK) {
+            let mut v = piece.clone();
+            v[..8].copy_from_slice(&(i as u64).to_le_bytes());
+            addrs.push((blocks.put(&v).expect("written"), i as u64));
+        }
+
+        // Held together rather than one at a time, which is the part a store
+        // that stages bytes has to get right.
+        let mut held = Vec::new();
+        for (at, i) in &addrs {
+            let got = blocks.get(*at).expect("read back");
+            assert_eq!(got.len(), yo_kv::cold::CHUNK, "chunk {i} came back short");
+            held.push((got, *i));
+        }
+        for (got, i) in held {
+            assert_eq!(
+                u64::from_le_bytes(got[..8].try_into().expect("eight bytes")),
+                i,
+                "chunk {i} came back as somebody else"
+            );
+        }
+        blocks.release();
     }
 
     #[test]
