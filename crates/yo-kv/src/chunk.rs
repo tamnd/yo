@@ -163,6 +163,19 @@ impl Chunk {
         self.tail - self.head
     }
 
+    /// The encoded entries, without the dead space at either end.
+    ///
+    /// The reverse of [`Chunk::adopt`], and the two are a pair: what comes out
+    /// of here goes back in there and gives a chunk holding the same elements.
+    /// That is what a demotion needs, because the ring is rebuilt on the way
+    /// back and rebuilding it by pushing every element one at a time would
+    /// re-encode a list that arrived already encoded.
+    #[must_use]
+    #[inline]
+    pub fn entries(&self) -> &[u8] {
+        &self.bytes[self.head..self.tail]
+    }
+
     /// Put `value` at the back, or say there was no room.
     ///
     /// The count cap is checked here rather than by the caller because a chunk

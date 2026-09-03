@@ -4,8 +4,10 @@
 //! the types whose body lives in a slab rather than in the record. Nothing above
 //! the keyspace can tell that a set was on the device a moment ago: it answers
 //! `SCARD`, `SISMEMBER`, `SADD`, `SMEMBERS` and the set algebra with the members
-//! it had, in the representation it had them in, and the hash answers `HGET`,
-//! `HLEN` and the `HEXPIRE` family the same way.
+//! it had, in the representation it had them in, the hash answers `HGET`, `HLEN`
+//! and the `HEXPIRE` family the same way, the list answers `LLEN`, `LINDEX` and
+//! a push at either end, and the sorted set answers `ZSCORE` and `ZRANK` with
+//! the order it went out in.
 //!
 //! The store is a vector that counts its reads, as in the string file and for
 //! the same reason: reads per command is what G9 is a gate on, and a set that
@@ -17,7 +19,8 @@ use std::rc::Rc;
 use yo_common::{Addr, Code, Error, Result, Space};
 use yo_kv::cold::Blocks;
 use yo_kv::ttl::{Ask, Cond};
-use yo_kv::{Keyspace, hash, set};
+use yo_kv::zsets::{Query, ZAdd};
+use yo_kv::{End, Keyspace, hash, list, set, zset};
 
 /// A store that remembers how many times it was read.
 struct Mem {
@@ -91,6 +94,63 @@ fn cold_hash(key: &[u8], of: &[(Vec<u8>, Vec<u8>)]) -> (Keyspace, Rc<Cell<usize>
     assert!(k.demote(key).expect("demoted"), "the body should have gone");
     reads.set(0);
     (k, reads)
+}
+
+/// Elements long enough that `n` of them are a ring of chunks and not one blob.
+fn elements(n: usize) -> Vec<Vec<u8>> {
+    (0..n)
+        .map(|i| format!("element:{i:05}:{}", "p".repeat(400)).into_bytes())
+        .collect()
+}
+
+/// A database holding `key` as a list with its body already on the file.
+fn cold_list(key: &[u8], of: &[Vec<u8>]) -> (Keyspace, Rc<Cell<usize>>) {
+    let (mut k, reads) = db();
+    k.push(key, End::Right, of.iter().map(Vec::as_slice))
+        .expect("pushed");
+    assert!(k.demote(key).expect("demoted"), "the body should have gone");
+    reads.set(0);
+    (k, reads)
+}
+
+/// What `LINDEX` answers, as bytes.
+fn lindex(k: &mut Keyspace, key: &[u8], at: i64) -> Option<Vec<u8>> {
+    k.lindex(key, at).expect("asked").map(|e| e.to_vec())
+}
+
+/// Members and the scores they go in with, one score a member so the order is
+/// the order the names are in.
+fn scored(n: usize) -> Vec<(f64, Vec<u8>)> {
+    (0..n)
+        .map(|i| (i as f64, format!("member:{i:05}").into_bytes()))
+        .collect()
+}
+
+/// A database holding `key` as a sorted set with its body already on the file.
+fn cold_zset(key: &[u8], of: &[(f64, Vec<u8>)]) -> (Keyspace, Rc<Cell<usize>>) {
+    let (mut k, reads) = db();
+    k.zadd(
+        key,
+        of.iter().map(|(s, m)| (*s, m.as_slice())),
+        ZAdd::default(),
+    )
+    .expect("added");
+    assert!(k.demote(key).expect("demoted"), "the body should have gone");
+    reads.set(0);
+    (k, reads)
+}
+
+/// Every member a query covers, in the order the walk gives them.
+fn zrange(k: &mut Keyspace, key: &[u8], q: &Query<'_>) -> Vec<Vec<u8>> {
+    let w = k.zwindow(key, q).expect("windowed");
+    let mut out = Vec::new();
+    k.zwalk(key, w, |m, _| {
+        let mut bytes = Vec::new();
+        m.write_to(&mut bytes);
+        out.push(bytes);
+    })
+    .expect("walked");
+    out
 }
 
 /// What `HGET` answers, as bytes.
@@ -370,9 +430,238 @@ fn dumping_and_restoring_a_demoted_hash_gives_the_same_hash_back() {
 }
 
 #[test]
+fn a_demoted_list_answers_llen_and_lindex_with_what_it_held() {
+    let all = elements(200);
+    let (mut k, _) = cold_list(b"l", &all);
+    assert_eq!(k.llen(b"l").expect("counted"), 200);
+    assert_eq!(lindex(&mut k, b"l", 0).as_ref(), Some(&all[0]));
+    assert_eq!(lindex(&mut k, b"l", 199).as_ref(), Some(&all[199]));
+    assert_eq!(lindex(&mut k, b"l", -1).as_ref(), Some(&all[199]));
+    assert_eq!(lindex(&mut k, b"l", 200), None);
+    let got: Vec<Vec<u8>> = k
+        .lrange(b"l", 0, -1)
+        .expect("ranged")
+        .map(|e| e.to_vec())
+        .collect();
+    assert_eq!(got, all, "and in the order they went in");
+}
+
+#[test]
+fn bringing_a_list_back_costs_one_pass_and_then_nothing() {
+    let all = elements(200);
+    let (mut k, reads) = cold_list(b"l", &all);
+    assert_eq!(k.llen(b"l").expect("counted"), 200);
+    let first = reads.get();
+    assert!(first > 0, "the body was on the file");
+    for _ in 0..50 {
+        k.llen(b"l").expect("counted");
+        lindex(&mut k, b"l", 7);
+    }
+    assert_eq!(reads.get(), first, "nothing went back to the device");
+}
+
+#[test]
+fn a_demoted_list_takes_elements_at_both_ends_again() {
+    let all = elements(200);
+    let (mut k, _) = cold_list(b"l", &all);
+    k.push(b"l", End::Left, [b"first".as_slice()].into_iter())
+        .expect("pushed");
+    k.push(b"l", End::Right, [b"last".as_slice()].into_iter())
+        .expect("pushed");
+    assert_eq!(k.llen(b"l").expect("counted"), 202);
+    assert_eq!(lindex(&mut k, b"l", 0), Some(b"first".to_vec()));
+    assert_eq!(lindex(&mut k, b"l", -1), Some(b"last".to_vec()));
+    assert_eq!(lindex(&mut k, b"l", 1).as_ref(), Some(&all[0]));
+
+    assert_eq!(
+        k.pop(b"l", End::Left).expect("popped"),
+        Some(b"first".to_vec())
+    );
+    assert_eq!(
+        k.pop(b"l", End::Right).expect("popped"),
+        Some(b"last".to_vec())
+    );
+    assert_eq!(k.llen(b"l").expect("counted"), 200);
+}
+
+#[test]
+fn a_demoted_list_keeps_the_word_object_encoding_answers() {
+    let (mut k, _) = cold_list(b"ring", &elements(200));
+    assert_eq!(k.list_encoding(b"ring"), Some(list::Encoding::Quicklist));
+
+    // A list small enough to still be one blob, which has to come back one.
+    let short: Vec<Vec<u8>> = (0..5).map(|i| format!("e{i}").into_bytes()).collect();
+    let (mut k, _) = cold_list(b"blob", &short);
+    assert_eq!(k.list_encoding(b"blob"), Some(list::Encoding::Listpack));
+    assert_eq!(k.llen(b"blob").expect("counted"), 5);
+}
+
+#[test]
+fn deleting_a_demoted_list_does_not_free_somebody_elses_slab_slot() {
+    let (mut k, _) = db();
+    let all = elements(200);
+    for name in [b"cold".as_slice(), b"warm".as_slice()] {
+        k.push(name, End::Right, all.iter().map(Vec::as_slice))
+            .expect("pushed");
+    }
+    assert!(k.demote(b"cold").expect("demoted"));
+    k.del(b"cold");
+    assert_eq!(k.llen(b"warm").expect("counted"), 200);
+    assert_eq!(lindex(&mut k, b"warm", 42).as_ref(), Some(&all[42]));
+    assert_eq!(k.llen(b"cold").expect("counted"), 0);
+}
+
+#[test]
+fn dumping_and_restoring_a_demoted_list_gives_the_same_list_back() {
+    let all = elements(200);
+    let (mut k, _) = cold_list(b"l", &all);
+    let blob = k.dump(b"l").expect("dumped");
+    assert!(k.restore(b"back", &blob, None, false).is_ok());
+    assert_eq!(k.llen(b"back").expect("counted"), 200);
+    let got: Vec<Vec<u8>> = k
+        .lrange(b"back", 0, -1)
+        .expect("ranged")
+        .map(|e| e.to_vec())
+        .collect();
+    assert_eq!(got, all);
+}
+
+#[test]
+fn a_demoted_sorted_set_answers_zcard_zscore_and_zrank_with_what_it_held() {
+    let all = scored(400);
+    let (mut k, _) = cold_zset(b"z", &all);
+    assert_eq!(k.zcard(b"z").expect("counted"), 400);
+    assert_eq!(k.zscore(b"z", b"member:00000").expect("asked"), Some(0.0));
+    assert_eq!(k.zscore(b"z", b"member:00399").expect("asked"), Some(399.0));
+    assert_eq!(k.zscore(b"z", b"nobody").expect("asked"), None);
+    assert_eq!(
+        k.zrank(b"z", b"member:00042", false).expect("ranked"),
+        Some((42, 42.0))
+    );
+    assert_eq!(
+        k.zrank(b"z", b"member:00042", true).expect("ranked"),
+        Some((357, 42.0))
+    );
+    let got = zrange(&mut k, b"z", &Query::rank(0, -1));
+    let want: Vec<Vec<u8>> = all.iter().map(|(_, m)| m.clone()).collect();
+    assert_eq!(got, want, "and in the order the scores put them in");
+}
+
+#[test]
+fn bringing_a_sorted_set_back_costs_one_pass_and_then_nothing() {
+    let all = scored(400);
+    let (mut k, reads) = cold_zset(b"z", &all);
+    assert_eq!(k.zcard(b"z").expect("counted"), 400);
+    let first = reads.get();
+    assert!(first > 0, "the body was on the file");
+    for _ in 0..50 {
+        k.zcard(b"z").expect("counted");
+        k.zscore(b"z", b"member:00007").expect("asked");
+        k.zrank(b"z", b"member:00007", false).expect("ranked");
+    }
+    assert_eq!(reads.get(), first, "nothing went back to the device");
+}
+
+#[test]
+fn a_demoted_sorted_set_can_be_added_to_and_the_ranks_still_come_out_right() {
+    let all = scored(400);
+    let (mut k, _) = cold_zset(b"z", &all);
+    assert_eq!(
+        k.zadd(
+            b"z",
+            [(-1.0, b"first".as_slice()), (1000.0, b"last".as_slice())].into_iter(),
+            ZAdd::default(),
+        )
+        .expect("added"),
+        2
+    );
+    assert_eq!(k.zcard(b"z").expect("counted"), 402);
+    assert_eq!(
+        k.zrank(b"z", b"first", false).expect("ranked"),
+        Some((0, -1.0))
+    );
+    assert_eq!(
+        k.zrank(b"z", b"last", false).expect("ranked"),
+        Some((401, 1000.0))
+    );
+    assert_eq!(
+        k.zrank(b"z", b"member:00000", false).expect("ranked"),
+        Some((1, 0.0))
+    );
+    // And the score of a member that was already in there still moves it.
+    k.zadd(
+        b"z",
+        [(500.0, b"member:00000".as_slice())].into_iter(),
+        ZAdd::default(),
+    )
+    .expect("moved");
+    assert_eq!(
+        k.zrank(b"z", b"member:00000", false).expect("ranked"),
+        Some((400, 500.0))
+    );
+}
+
+#[test]
+fn a_demoted_sorted_set_keeps_the_word_object_encoding_answers() {
+    // The table, which is what four hundred members make.
+    let (mut k, _) = cold_zset(b"table", &scored(400));
+    assert_eq!(k.zset_encoding(b"table"), Some(zset::Encoding::Skiplist));
+
+    // And one small enough to still be one packed blob, which has to come back
+    // one, because the word is a property of the body and not of the record.
+    let (mut k, _) = cold_zset(b"blob", &scored(40));
+    assert_eq!(k.zset_encoding(b"blob"), Some(zset::Encoding::Listpack));
+    assert_eq!(k.zcard(b"blob").expect("counted"), 40);
+    assert_eq!(
+        k.zscore(b"blob", b"member:00039").expect("asked"),
+        Some(39.0)
+    );
+}
+
+#[test]
+fn deleting_a_demoted_sorted_set_does_not_free_somebody_elses_slab_slot() {
+    let (mut k, _) = db();
+    let all = scored(400);
+    for name in [b"cold".as_slice(), b"warm".as_slice()] {
+        k.zadd(
+            name,
+            all.iter().map(|(s, m)| (*s, m.as_slice())),
+            ZAdd::default(),
+        )
+        .expect("added");
+    }
+    assert!(k.demote(b"cold").expect("demoted"));
+    k.del(b"cold");
+    assert_eq!(k.zcard(b"warm").expect("counted"), 400);
+    assert_eq!(
+        k.zrank(b"warm", b"member:00042", false).expect("ranked"),
+        Some((42, 42.0))
+    );
+    assert_eq!(k.zcard(b"cold").expect("counted"), 0);
+}
+
+#[test]
+fn dumping_and_restoring_a_demoted_sorted_set_gives_the_same_one_back() {
+    let all = scored(400);
+    let (mut k, _) = cold_zset(b"z", &all);
+    let blob = k.dump(b"z").expect("dumped");
+    assert!(k.restore(b"back", &blob, None, false).is_ok());
+    assert_eq!(k.zcard(b"back").expect("counted"), 400);
+    let got = zrange(&mut k, b"back", &Query::rank(0, -1));
+    let want: Vec<Vec<u8>> = all.iter().map(|(_, m)| m.clone()).collect();
+    assert_eq!(got, want);
+    assert_eq!(
+        k.zscore(b"back", b"member:00399").expect("asked"),
+        Some(399.0)
+    );
+}
+
+#[test]
 fn a_sweep_moves_collection_bodies_and_the_memory_goes_down() {
     let (mut k, _) = db();
     let pairs = fields(200);
+    let rows = elements(60);
+    let ranked = scored(200);
     for i in 0..200 {
         let key = format!("set:{i}");
         k.sadd(key.as_bytes(), members(200).iter().map(Vec::as_slice))
@@ -383,6 +672,16 @@ fn a_sweep_moves_collection_bodies_and_the_memory_goes_down() {
             pairs.iter().map(|(f, v)| (f.as_slice(), v.as_slice())),
         )
         .expect("set");
+        let key = format!("list:{i}");
+        k.push(key.as_bytes(), End::Right, rows.iter().map(Vec::as_slice))
+            .expect("pushed");
+        let key = format!("zset:{i}");
+        k.zadd(
+            key.as_bytes(),
+            ranked.iter().map(|(s, m)| (*s, m.as_slice())),
+            ZAdd::default(),
+        )
+        .expect("added");
     }
     let before = k.memory_bytes();
     let relief = k.relieve(usize::MAX).expect("swept");
@@ -400,6 +699,10 @@ fn a_sweep_moves_collection_bodies_and_the_memory_goes_down() {
         assert_eq!(k.scard(key.as_bytes()).expect("counted"), 200, "{key}");
         let key = format!("hash:{i}");
         assert_eq!(k.hlen(key.as_bytes()).expect("counted"), 200, "{key}");
+        let key = format!("list:{i}");
+        assert_eq!(k.llen(key.as_bytes()).expect("counted"), 60, "{key}");
+        let key = format!("zset:{i}");
+        assert_eq!(k.zcard(key.as_bytes()).expect("counted"), 200, "{key}");
     }
 }
 
