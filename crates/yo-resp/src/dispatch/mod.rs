@@ -786,7 +786,13 @@ impl Server {
             // would cost a resident page window to find that out.
             let gave = if !self.dbs[i].is_empty() && self.migrates(i) {
                 self.attach_store(i);
-                self.dbs[i].relieve(over).unwrap_or(0) > 0
+                // Whether it made room and not whether it moved a key. A round
+                // that demoted nothing and handed back a segment is a round
+                // that made room, and reading only the count refuses the write
+                // that provoked it.
+                self.dbs[i]
+                    .relieve(over)
+                    .is_ok_and(yo_kv::tier::Relief::made_room)
             } else {
                 self.dbs[i].evict_one()
             };

@@ -193,8 +193,8 @@ mod tests {
         for i in 0..200u32 {
             k.set_plain(&i.to_le_bytes(), &val).expect("stored");
         }
-        let moved = k.relieve(usize::MAX).expect("swept");
-        assert!(moved > 0, "nothing was moved");
+        let swept = k.relieve(usize::MAX).expect("swept");
+        assert!(swept.moved > 0, "nothing was moved");
         assert!(k.store_bytes().expect("attached") > 0, "the file is empty");
 
         for i in 0..200u32 {
