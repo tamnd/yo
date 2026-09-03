@@ -149,8 +149,11 @@ const AC_JSON_WRITE: &[&str] = &["@write", "@json"];
 const JSON_READ: &[&str] = &["readonly", "module"];
 /// A JSON write that does not grow the document.
 const JSON_WRITE: &[&str] = &["write", "module"];
-/// A JSON write that does, which is `JSON.SET` and nothing else here.
+/// A JSON write that does, which is the four that take a value off the wire.
 const JSON_WRITE_OOM: &[&str] = &["write", "denyoom", "module"];
+/// A JSON read whose key is not where the arity says it is, which is
+/// `JSON.DEBUG` and its subcommand.
+const JSON_READ_MOVABLE: &[&str] = &["readonly", "module", "movablekeys"];
 /// The graph read side, for the ones that answer without walking the plane.
 const AC_GRAPH_READ_FAST: &[&str] = &["@read", "@graph", "@fast"];
 /// The graph read side for the ones that walk it.
@@ -2386,6 +2389,32 @@ pub static COMMANDS: &[Spec] = &[
         group: "json",
     },
     Spec {
+        name: "json.mset",
+        arity: -4,
+        flags: JSON_WRITE_OOM,
+        first_key: 1,
+        last_key: -1,
+        step: 3,
+        acl: AC_JSON_WRITE,
+        since: "2.6.0",
+        complexity: "O(K*N) with K the keys and N the size of each document",
+        summary: "Set the value at a path in each of several documents.",
+        group: "json",
+    },
+    Spec {
+        name: "json.merge",
+        arity: -4,
+        flags: JSON_WRITE_OOM,
+        first_key: 1,
+        last_key: 1,
+        step: 1,
+        acl: AC_JSON_WRITE,
+        since: "2.6.0",
+        complexity: "O(N) with N the size of the document",
+        summary: "Apply an RFC 7386 merge patch at a path.",
+        group: "json",
+    },
+    Spec {
         name: "json.get",
         arity: -2,
         flags: JSON_READ,
@@ -2643,6 +2672,32 @@ pub static COMMANDS: &[Spec] = &[
         since: "1.0.0",
         complexity: "O(N) with N the size of the document",
         summary: "Add to the end of every string a path matched.",
+        group: "json",
+    },
+    Spec {
+        name: "json.resp",
+        arity: -2,
+        flags: JSON_READ,
+        first_key: 1,
+        last_key: 1,
+        step: 1,
+        acl: AC_JSON_READ,
+        since: "1.0.0",
+        complexity: "O(N) with N the size of what the path matched",
+        summary: "What a path matched, as RESP types rather than as JSON text.",
+        group: "json",
+    },
+    Spec {
+        name: "json.debug",
+        arity: -2,
+        flags: JSON_READ_MOVABLE,
+        first_key: 0,
+        last_key: 0,
+        step: 0,
+        acl: AC_JSON_READ,
+        since: "1.0.0",
+        complexity: "O(N) with N the size of what the path matched",
+        summary: "How much memory a document takes, and the help for that.",
         group: "json",
     },
     // -------------------------------------------------------------- vector
@@ -4015,16 +4070,24 @@ const FREE: u16 = u16::MAX;
 /// over nine fewer names.
 ///
 /// The number family and `json.strappend` took that one to three slots, and the
-/// tenth search over the 275 names found this one at two slots and sixty seven.
+/// tenth search over the 275 names found one at two slots and sixty seven.
 /// Three of the six shards converged on sixty seven from different seeds without
 /// any of them bettering it, which is the sign that the key rather than the
 /// multiplier is what is left: fourteen of the names collide on the key itself
 /// and no multiplier can separate them, so fourteen extra probes is the floor
-/// and this is within a quarter of it per name. The two new pairs are
+/// and that was within a quarter of it per name. The two new pairs were
 /// `json.arrappend` with `json.strappend` and `json.numincrby` with
 /// `json.nummultby`, and both are the same shape as the pairs already there,
 /// which is a group whose names agree everywhere the key looks.
-const MIX: u64 = 0x2cdd_af88_9f9f_65cf;
+///
+/// The last four JSON commands took it to three slots again, and the eleventh
+/// search over the 279 names found this one at two slots and sixty two, which is
+/// better than the table has ever been while carrying four more names. Only one
+/// of the four collides on the key, `json.mset` with `json.mget`, so the floor
+/// moved by one and the multiplier found five more probes than the floor moved.
+/// Nine shards were run from different seeds and the spread was sixty two to a
+/// hundred and three, which is worth knowing: one shard is not a search.
+const MIX: u64 = 0xccc7_1184_c47d_0a5f;
 
 /// The four bytes the index is computed from: the length, the first two bytes,
 /// and the last byte with the middle byte folded into it, all lower cased.
@@ -4342,7 +4405,7 @@ mod tests {
         }
         assert!(worst <= 2, "worst probe is {worst} slots");
         assert!(
-            total <= 67,
+            total <= 62,
             "{total} extra slots walked over the whole table"
         );
     }
