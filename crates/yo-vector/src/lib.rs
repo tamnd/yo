@@ -57,6 +57,11 @@
 //! times slower than reading them, because reading them is already going at
 //! memory speed and the estimator that would replace it is not.
 //!
+//! `src/probe.rs` is where that decision gets its context. It splits a query
+//! into ranking the centroids, preparing the query against each partition
+//! probed, and scanning the postings, and it is what says which of the three is
+//! worth working on at a given dimension and collection size.
+//!
 //! [`Collection`] is the piece above that, and it is the one both doors reach.
 //! [`Partitions`] deals in ids and knows nothing about the key a client wrote a
 //! vector under, what metric the collection was opened with, or where the full
@@ -111,6 +116,7 @@ pub mod image;
 mod miss;
 pub mod muvera;
 pub mod partition;
+mod probe;
 pub mod rabitq;
 mod rank;
 pub mod rotate;
