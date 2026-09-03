@@ -999,6 +999,9 @@ version = "0.3.13"
 dependencies = [
  "criterion",
  "yo-common",
+ "yo-format",
+ "yo-kv",
+ "yo-shape",
 ]
 
 [[package]]
@@ -1009,7 +1012,6 @@ dependencies = [
  "yo-common",
  "yo-derive",
  "yo-doc",
- "yo-format",
  "yo-graph",
  "yo-index",
  "yo-kv",

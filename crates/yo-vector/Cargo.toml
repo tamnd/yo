@@ -16,6 +16,15 @@ categories.workspace = true
 # The seeded generator, because a rotation that cannot be rebuilt from the seed
 # in the catalogue is a rotation that has to be written to the file.
 yo-common.workspace = true
+# The dimension limit, which is the record format's rather than a second one
+# picked here that would agree until it did not.
+yo-format.workspace = true
+# `Elements` for the key table a collection keeps, which is the same open
+# addressed table every other keyed shape in this build uses.
+yo-kv.workspace = true
+# `Metric`, so that what a collection measures is written in the same word the
+# catalogue writes it in rather than in a second enum that means the same thing.
+yo-shape.workspace = true
 
 [dev-dependencies]
 criterion = { workspace = true }
