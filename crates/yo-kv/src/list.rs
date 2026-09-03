@@ -46,6 +46,7 @@ use std::collections::VecDeque;
 use yo_common::Small;
 
 use crate::chunk::{CHUNK_BYTES, Chunk};
+use crate::frozen::{self, Broken};
 use crate::listpack::{Entry, Listpack};
 
 /// How many `LREM` hits fit without the allocator.
@@ -54,6 +55,11 @@ use crate::listpack::{Entry, Listpack};
 /// a count past a handful is somebody clearing every copy out of a long list,
 /// where one allocation is not what it is paying for.
 const HITS: usize = 8;
+
+/// One packed blob, which is Redis's `LIST_QUICKLIST` of a single listpack.
+const FORM_PACKED: u8 = 1;
+/// The ring, written chunk by chunk.
+const FORM_CHUNKS: u8 = 2;
 
 /// A list element: bytes as they lie, or an integer not yet formatted.
 pub type Element<'a> = Entry<'a>;
@@ -200,6 +206,81 @@ impl List {
     #[inline]
     pub fn is_empty(&self) -> bool {
         self.len() == 0
+    }
+
+    /// Write this list out as the bytes it comes back from.
+    ///
+    /// What a demotion turns the body into. The packed band goes out as the
+    /// listpack bytes it already is, and the ring goes out chunk by chunk, each
+    /// one its element count and its live bytes.
+    ///
+    /// Chunk by chunk and not element by element, because a chunk's bytes are
+    /// already in the encoding [`Chunk::adopt`] takes, so a list of a million
+    /// elements is a couple of thousand copies out and the same number back
+    /// rather than two million encodes. The ring also comes back with the same
+    /// chunk boundaries it left with, which keeps `MEMORY USAGE` and the walk
+    /// cost of an index the same on both sides of a trip to the device.
+    ///
+    /// The dead space at either end of a chunk is not written. A chunk that had
+    /// room to push into comes back full, and pushing into it again allocates a
+    /// new chunk where the old one would have grown in place. That is a list
+    /// which was quiet long enough to be demoted paying one allocation on the
+    /// write that wakes it, and it is worth the bytes it saves on the device.
+    pub fn freeze(&self, out: &mut Vec<u8>) {
+        match &self.body {
+            Body::Packed(lp) => {
+                out.push(FORM_PACKED);
+                out.extend_from_slice(lp.as_bytes());
+            }
+            Body::Chunks(d) => {
+                out.push(FORM_CHUNKS);
+                frozen::put_uint(out, d.chunks.len() as u64);
+                for c in &d.chunks {
+                    frozen::put_uint(out, c.len() as u64);
+                    frozen::put_bytes(out, c.entries());
+                }
+            }
+        }
+    }
+
+    /// Read a list back out of what [`List::freeze`] wrote.
+    ///
+    /// # Errors
+    ///
+    /// [`Broken`] for bytes that are not the shape freeze wrote, which is a read
+    /// that came back torn rather than anything a caller did.
+    pub fn thaw(bytes: &[u8]) -> Result<List, Broken> {
+        let mut cut = frozen::Cut::new(bytes);
+        match cut.byte()? {
+            FORM_PACKED => Ok(List {
+                body: Body::Packed(Listpack::from_bytes(cut.rest()).map_err(|_| Broken::Body)?),
+            }),
+            FORM_CHUNKS => {
+                let n = usize::try_from(cut.uint()?).map_err(|_| Broken::Short)?;
+                // A chunk is at least a count and a length, so two bytes, and a
+                // number larger than what is left is not worth an allocation.
+                if n > cut.rest().len() {
+                    return Err(Broken::Body);
+                }
+                let mut d = Deque::new();
+                d.chunks.reserve(n);
+                for _ in 0..n {
+                    let count = usize::try_from(cut.uint()?).map_err(|_| Broken::Short)?;
+                    let entries = cut.bytes()?;
+                    if count > entries.len() {
+                        // An entry is at least one byte, so this cannot be a
+                        // chunk anything wrote.
+                        return Err(Broken::Body);
+                    }
+                    d.len += count;
+                    d.chunks.push_back(Chunk::adopt(entries, count));
+                }
+                Ok(List {
+                    body: Body::Chunks(d),
+                })
+            }
+            _ => Err(Broken::Form),
+        }
     }
 
     /// What `OBJECT ENCODING` says about it.
@@ -2235,5 +2316,105 @@ mod tests {
         }
         assert_eq!(all(&l), want);
         (packed, chunked)
+    }
+
+    /// Freeze a list, read it back, and check nothing about it changed.
+    fn round_trip(l: &List) -> List {
+        let mut out = Vec::new();
+        l.freeze(&mut out);
+        let back = List::thaw(&out).expect("it came back");
+        assert_eq!(back.len(), l.len(), "the length");
+        assert_eq!(back.encoding(), l.encoding(), "the band");
+        assert_eq!(all(&back), all(l), "the elements");
+        let mut backward: Vec<Vec<u8>> = back.iter_back().map(|e| e.to_vec()).collect();
+        backward.reverse();
+        assert_eq!(backward, all(l), "and the walk the other way");
+        back
+    }
+
+    #[test]
+    fn a_frozen_list_comes_back_in_the_band_it_left() {
+        round_trip(&List::new());
+        for l in both_bands(40) {
+            round_trip(&l);
+        }
+        for l in both_bands(200) {
+            round_trip(&l);
+        }
+    }
+
+    /// The ring comes back with the chunks it left with, not one long one.
+    ///
+    /// Both because `MEMORY USAGE` should say the same thing on both sides of a
+    /// trip to the device, and because what an index costs is a walk over chunks
+    /// and then a walk inside one.
+    #[test]
+    fn a_ring_comes_back_with_the_same_chunk_boundaries() {
+        let l = chunked(2000);
+        let Body::Chunks(before) = &l.body else {
+            unreachable!("chunked built a ring");
+        };
+        let want: Vec<usize> = before.chunks.iter().map(Chunk::len).collect();
+        assert!(want.len() > 2, "{} chunks is not a ring", want.len());
+
+        let back = round_trip(&l);
+        let Body::Chunks(after) = &back.body else {
+            unreachable!("it came back a ring");
+        };
+        let got: Vec<usize> = after.chunks.iter().map(Chunk::len).collect();
+        assert_eq!(got, want);
+    }
+
+    #[test]
+    fn a_list_that_came_back_takes_more_elements_at_both_ends() {
+        let limits = Limits::default();
+        for l in both_bands(200) {
+            let mut back = round_trip(&l);
+            back.push_front(b"first", &limits);
+            back.push_back(b"last", &limits);
+            assert_eq!(back.len(), l.len() + 2);
+            assert_eq!(back.front().expect("a front").to_vec(), b"first".to_vec());
+            assert_eq!(back.back().expect("a back").to_vec(), b"last".to_vec());
+            assert_eq!(back.get(1).expect("the old front").to_vec(), all(&l)[0]);
+        }
+    }
+
+    #[test]
+    fn an_element_too_big_for_a_chunk_survives_the_trip() {
+        let limits = Limits::default();
+        let mut l = List::new();
+        l.push_back(b"before", &limits);
+        l.push_back(&vec![b'x'; CHUNK_BYTES * 2], &limits);
+        l.push_back(b"after", &limits);
+        assert_eq!(l.encoding(), Encoding::Quicklist);
+        let back = round_trip(&l);
+        assert_eq!(
+            back.get(1).expect("the big one").to_vec().len(),
+            CHUNK_BYTES * 2
+        );
+    }
+
+    #[test]
+    fn a_frozen_list_that_arrives_damaged_is_an_error_and_not_a_panic() {
+        for l in both_bands(40) {
+            let mut out = Vec::new();
+            l.freeze(&mut out);
+            for cut in 0..out.len() {
+                let _ = List::thaw(&out[..cut]);
+            }
+        }
+        assert_eq!(List::thaw(&[]).err(), Some(Broken::Short));
+        assert_eq!(List::thaw(&[9]).err(), Some(Broken::Form));
+        assert_eq!(List::thaw(&[FORM_PACKED, 1, 2]).err(), Some(Broken::Body));
+        // A chunk count no amount of what is left could fill, and then a chunk
+        // claiming more elements than it has bytes for.
+        assert_eq!(
+            List::thaw(&[FORM_CHUNKS, 0xff, 0xff, 0x7f, 0]).err(),
+            Some(Broken::Body)
+        );
+        assert_eq!(
+            List::thaw(&[FORM_CHUNKS, 1, 9, 2, b'a', b'b']).err(),
+            Some(Broken::Body)
+        );
     }
 }

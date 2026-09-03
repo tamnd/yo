@@ -841,14 +841,20 @@ impl Keyspace {
     /// How a list is represented, or `None` if `key` is not a list.
     ///
     /// The same shape as [`Keyspace::set_encoding`], and the same argument for
-    /// asking the body rather than reading a copy out of the record.
+    /// asking the body rather than reading a copy out of the record. A demoted
+    /// list is brought back to answer, as the set and the hash are.
     pub fn list_encoding(&mut self, key: &[u8]) -> Option<list::Encoding> {
         self.reap(key);
         let rec = self.map.get(key)?;
         if value::kind(rec) != Kind::List {
             return None;
         }
-        let at = value::slot(rec);
+        let cold = value::Meta::from_byte(rec[0]).is_cold();
+        let at = if cold {
+            self.promote_body(key).ok()??
+        } else {
+            value::slot(rec)
+        };
         Some(self.lists.get(at)?.encoding())
     }
 
@@ -859,7 +865,12 @@ impl Keyspace {
         if value::kind(rec) != Kind::Zset {
             return None;
         }
-        let at = value::slot(rec);
+        let cold = value::Meta::from_byte(rec[0]).is_cold();
+        let at = if cold {
+            self.promote_body(key).ok()??
+        } else {
+            value::slot(rec)
+        };
         Some(self.zsets.get(at)?.encoding())
     }
 
@@ -1565,6 +1576,28 @@ impl Keyspace {
                     false
                 }
             },
+            Kind::List => match self.lists.get(slot) {
+                Some(body) if body.memory_bytes() > grows_by => {
+                    body.freeze(buf);
+                    true
+                }
+                Some(_) => false,
+                None => {
+                    debug_assert!(false, "a list record with no list behind it");
+                    false
+                }
+            },
+            Kind::Zset => match self.zsets.get(slot) {
+                Some(body) if body.memory_bytes() > grows_by => {
+                    body.freeze(buf);
+                    true
+                }
+                Some(_) => false,
+                None => {
+                    debug_assert!(false, "a sorted set record with no sorted set behind it");
+                    false
+                }
+            },
             _ => {
                 debug_assert!(false, "a kind `moves` said yes to and this does not know");
                 false
@@ -1584,6 +1617,12 @@ impl Keyspace {
             }
             Kind::Hash => {
                 self.hashes.remove(slot);
+            }
+            Kind::List => {
+                self.lists.remove(slot);
+            }
+            Kind::Zset => {
+                self.zsets.remove(slot);
             }
             _ => debug_assert!(false, "freeing a slot in a slab that was never found"),
         }
@@ -1668,6 +1707,20 @@ impl Keyspace {
                         .with_detail(e.to_string())
                 })?;
                 self.hashes.insert(hash)
+            }
+            Kind::List => {
+                let list = List::thaw(&self.frozen).map_err(|e| {
+                    Error::new(Code::Corrupt, "a demoted list did not read back")
+                        .with_detail(e.to_string())
+                })?;
+                self.lists.insert(list)
+            }
+            Kind::Zset => {
+                let zset = Zset::thaw(&self.frozen).map_err(|e| {
+                    Error::new(Code::Corrupt, "a demoted sorted set did not read back")
+                        .with_detail(e.to_string())
+                })?;
+                self.zsets.insert(zset)
             }
             // Nothing else is written cold with a body yet, so arriving here
             // means a record that says one thing and a demoter that did another.
@@ -2314,7 +2367,7 @@ impl Keyspace {
 /// the way back. A kind that is not in here stays in memory, which costs a
 /// demotion that did not happen and is never a wrong answer.
 const fn moves(kind: Kind) -> bool {
-    matches!(kind, Kind::Set | Kind::Hash)
+    matches!(kind, Kind::Set | Kind::Hash | Kind::List | Kind::Zset)
 }
 
 /// What Redis says when a command is sent at a key holding another type.

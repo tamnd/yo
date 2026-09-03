@@ -58,12 +58,18 @@ use core::ops::Range;
 use yo_common::num::{DIGITS_MAX, DOUBLE_MAX, i64_digits, parse_f64, write_double};
 
 use crate::elem::Elements;
+use crate::frozen::{self, Broken};
 use crate::listpack::{self, Listpack};
 use crate::rank::Rank;
 use crate::scan::Cursor;
 
 /// A member: bytes as they lie, or an integer not yet formatted.
 pub type Member<'a> = listpack::Entry<'a>;
+
+/// The packed band, which is Redis's `ZSET_LISTPACK`.
+const FORM_PACKED: u8 = 1;
+/// The table and its tree, written out as members in rank order.
+const FORM_MEMBERS: u8 = 2;
 
 /// Where a sorted set stops being one packed blob.
 #[derive(Debug, Clone, Copy)]
@@ -333,6 +339,84 @@ impl Zset {
             })
         } else {
             Err(lp)
+        }
+    }
+
+    /// Write this sorted set out in a form a device can hold.
+    ///
+    /// The packed band goes out as its own bytes, and the table goes out as its
+    /// members in rank order, each one followed by its score. Rank order is the
+    /// point of writing it that way: the order is the expensive half of a sorted
+    /// set, and a body written in order comes back without a single comparison.
+    ///
+    /// A score is eight raw bytes rather than the text a listpack holds, because
+    /// the table has the double already and formatting it here only to parse it
+    /// on the way back would cost two conversions for no saving.
+    pub fn freeze(&self, out: &mut Vec<u8>) {
+        match &self.body {
+            Body::Packed(lp) => {
+                out.push(FORM_PACKED);
+                out.extend_from_slice(lp.as_bytes());
+            }
+            Body::Table(t) => {
+                out.push(FORM_MEMBERS);
+                frozen::put_uint(out, t.members.len() as u64);
+                // Through the tree's own walk and not through `Zset::at`, which
+                // would descend from the root for every rank and turn a pass
+                // into a count times a depth.
+                for row in t.order.iter_from(0) {
+                    let Some((name, score)) = t.members.at(row as usize) else {
+                        continue;
+                    };
+                    frozen::put_bytes(out, name);
+                    frozen::put_f64(out, *score);
+                }
+            }
+        }
+    }
+
+    /// Read back what [`Zset::freeze`] wrote.
+    ///
+    /// The band a sorted set left in is the band it comes back in, so a value
+    /// that was quiet long enough to be moved out answers `OBJECT ENCODING` with
+    /// the same word it answered before.
+    pub fn thaw(bytes: &[u8]) -> Result<Zset, Broken> {
+        let mut cut = frozen::Cut::new(bytes);
+        match cut.byte()? {
+            FORM_PACKED => Ok(Zset {
+                body: Body::Packed(Listpack::from_bytes(cut.rest()).map_err(|_| Broken::Body)?),
+            }),
+            FORM_MEMBERS => {
+                let n = usize::try_from(cut.uint()?).map_err(|_| Broken::Short)?;
+                // A member costs a length byte and a score costs eight, so a
+                // count larger than what is left cannot be honest and is not
+                // worth an allocation.
+                if n > cut.rest().len() {
+                    return Err(Broken::Body);
+                }
+                let mut table = Table {
+                    members: Elements::with_capacity(n),
+                    order: Rank::new(),
+                };
+                for _ in 0..n {
+                    let name = cut.bytes()?;
+                    let score = cut.f64()?;
+                    let row = table.members.len() as u32;
+                    // A member twice over would leave the table one row short of
+                    // the tree and every rank after it wrong, so a body that
+                    // repeats one is refused rather than half built.
+                    if !matches!(table.members.insert(name, score), Ok(None)) {
+                        return Err(Broken::Body);
+                    }
+                    // Written in rank order, so every member goes on the end and
+                    // the tree compares nothing.
+                    table.order.insert_at(row as usize, row);
+                }
+                Ok(Zset {
+                    body: Body::Table(table),
+                })
+            }
+            _ => Err(Broken::Form),
         }
     }
 
@@ -1441,5 +1525,125 @@ mod tests {
         assert!(per_order < 3.4, "{per_order} bytes an element in the tree");
         let per = z.memory_bytes() as f64 / f64::from(n);
         assert!(per < 70.0, "{per} bytes a member all in");
+    }
+
+    /// Freeze a sorted set, read it back, and check that nothing about it moved.
+    fn round_trip(z: &Zset) -> Zset {
+        let mut buf = Vec::new();
+        z.freeze(&mut buf);
+        let back = Zset::thaw(&buf).expect("what freeze wrote");
+        assert_eq!(back.len(), z.len(), "the member count");
+        assert_eq!(back.encoding(), z.encoding(), "the band");
+        assert_eq!(listed(&back), listed(z), "the members in rank order");
+        back
+    }
+
+    #[test]
+    fn a_frozen_sorted_set_comes_back_in_the_band_it_left() {
+        let pairs: Vec<(String, f64)> = (0..40)
+            .map(|i| (format!("member:{i:04}"), f64::from(i) * 1.5 - 12.0))
+            .collect();
+        let refs: Vec<(&str, f64)> = pairs.iter().map(|(m, s)| (m.as_str(), *s)).collect();
+
+        let packed = round_trip(&built(&refs, &PACKED));
+        assert_eq!(packed.encoding(), Encoding::Listpack);
+        let table = round_trip(&built(&refs, &TABLE));
+        assert_eq!(table.encoding(), Encoding::Skiplist);
+
+        // The two bands agree with each other and with the model, so a value
+        // that was frozen on one and read on the other would have been caught.
+        assert_eq!(listed(&packed), model(&refs));
+        assert_eq!(listed(&table), model(&refs));
+
+        round_trip(&Zset::new());
+    }
+
+    #[test]
+    fn a_score_survives_the_trip_exactly() {
+        // Scores that a text round trip through a listpack would be at risk of
+        // rounding, plus the two that a zigzagged integer encoding would get
+        // wrong. Every one of them has to come back bit for bit, because a
+        // score is what the whole order is built on.
+        let scores = [
+            0.0,
+            -0.0,
+            1.0 / 3.0,
+            -1.0 / 3.0,
+            f64::MIN_POSITIVE,
+            f64::MAX,
+            f64::MIN,
+            9_007_199_254_740_993.0,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+        ];
+        let mut z = Zset::new();
+        for (i, s) in scores.iter().enumerate() {
+            z.add(format!("member:{i:04}").as_bytes(), *s, &TABLE);
+        }
+        let back = round_trip(&z);
+        for (i, s) in scores.iter().enumerate() {
+            let member = format!("member:{i:04}");
+            assert_eq!(
+                back.score(member.as_bytes()).map(f64::to_bits),
+                Some(s.to_bits()),
+                "the score of {member}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_sorted_set_that_came_back_still_takes_members_and_ranks_them() {
+        let pairs: Vec<(String, f64)> = (0..200)
+            .map(|i| (format!("member:{i:04}"), f64::from(i)))
+            .collect();
+        let refs: Vec<(&str, f64)> = pairs.iter().map(|(m, s)| (m.as_str(), *s)).collect();
+        let mut back = round_trip(&built(&refs, &TABLE));
+
+        // One in the middle, one at each end, and one that is already in here
+        // and only moves.
+        assert_eq!(back.add(b"middle", 99.5, &TABLE), Added::New);
+        assert_eq!(back.add(b"first", -1.0, &TABLE), Added::New);
+        assert_eq!(back.add(b"last", 1000.0, &TABLE), Added::New);
+        assert_eq!(back.add(b"member:0000", 500.0, &TABLE), Added::Changed);
+
+        assert_eq!(back.len(), 203);
+        assert_eq!(back.rank(b"first"), Some(0));
+        assert_eq!(back.rank(b"last"), Some(202));
+        // `first`, then member:0001 through member:0099, because member:0000
+        // moved up to five hundred and left the front.
+        assert_eq!(back.rank(b"middle"), Some(100));
+        assert_eq!(back.score(b"member:0000"), Some(500.0));
+        assert!(back.remove(b"middle"));
+        assert_eq!(back.rank(b"last"), Some(201));
+    }
+
+    #[test]
+    fn a_frozen_sorted_set_that_arrives_damaged_is_an_error_and_not_a_panic() {
+        let pairs: Vec<(String, f64)> = (0..200)
+            .map(|i| (format!("member:{i:04}"), f64::from(i)))
+            .collect();
+        let refs: Vec<(&str, f64)> = pairs.iter().map(|(m, s)| (m.as_str(), *s)).collect();
+        let z = built(&refs, &TABLE);
+        let mut buf = Vec::new();
+        z.freeze(&mut buf);
+
+        assert!(Zset::thaw(&[]).is_err(), "nothing at all");
+        assert!(Zset::thaw(&[99]).is_err(), "a form nobody wrote");
+        for cut in 1..buf.len().min(64) {
+            assert!(Zset::thaw(&buf[..cut]).is_err(), "cut at {cut}");
+        }
+        // A count that claims far more members than there are bytes behind it.
+        let mut lying = vec![FORM_MEMBERS];
+        frozen::put_uint(&mut lying, u64::MAX);
+        assert!(Zset::thaw(&lying).is_err(), "a count nobody could hold");
+        // The same member twice, which would leave the tree longer than the
+        // table and every rank after it wrong.
+        let mut twice = vec![FORM_MEMBERS];
+        frozen::put_uint(&mut twice, 2);
+        for _ in 0..2 {
+            frozen::put_bytes(&mut twice, b"member");
+            frozen::put_f64(&mut twice, 1.0);
+        }
+        assert!(Zset::thaw(&twice).is_err(), "a member written twice");
     }
 }

@@ -82,6 +82,17 @@ pub fn put_int(out: &mut Vec<u8>, v: i64) {
     put_uint(out, ((v << 1) ^ (v >> 63)) as u64);
 }
 
+/// Append `v` as its eight raw bytes, little endian.
+///
+/// Not LEB128 and not zigzag, because a double's bit pattern carries its
+/// exponent in the high bits, so every ordinary score would take the full ten
+/// groups plus the sign work. Eight flat bytes are shorter and cost nothing to
+/// read back.
+#[inline]
+pub fn put_f64(out: &mut Vec<u8>, v: f64) {
+    out.extend_from_slice(&v.to_le_bytes());
+}
+
 /// Append `bytes` behind its length.
 #[inline]
 pub fn put_bytes(out: &mut Vec<u8>, bytes: &[u8]) {
@@ -141,6 +152,15 @@ impl<'a> Cut<'a> {
     pub fn int(&mut self) -> Result<i64, Broken> {
         let n = self.uint()?;
         Ok(((n >> 1) as i64) ^ -((n & 1) as i64))
+    }
+
+    /// The next double, from its eight raw bytes.
+    #[inline]
+    pub fn f64(&mut self) -> Result<f64, Broken> {
+        let s = self.take(8)?;
+        let mut b = [0u8; 8];
+        b.copy_from_slice(s);
+        Ok(f64::from_le_bytes(b))
     }
 
     /// The next `n` bytes.
