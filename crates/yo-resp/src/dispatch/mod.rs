@@ -10423,6 +10423,42 @@ mod tests {
         );
     }
 
+    /// The operators past the comparisons, over the wire rather than in the
+    /// parser's own tests, so that a client can reach all of them.
+    #[test]
+    fn a_filter_takes_the_membership_operators_and_the_methods_too() {
+        let mut f = Fixture::new();
+        let doc = br#"{"box":[{"t":"a","n":[1,2],"g":"x"},{"t":"b","n":[9],"g":"y"}]}"#;
+        f.run(&[b"JSON.SET", b"doc", b"$", doc]);
+
+        for (path, want) in [
+            (&b"$.box[?(@.g in [\"x\"])].t"[..], r#"["a"]"#),
+            (b"$.box[?(@.g nin [\"x\"])].t", r#"["b"]"#),
+            (b"$.box[?(@.n anyof [2,3])].t", r#"["a"]"#),
+            (b"$.box[?(@.n subsetof [1,2,3])].t", r#"["a"]"#),
+            (b"$.box[?(@.n size 2)].t", r#"["a"]"#),
+            (b"$.box[?(@.n empty false)].t", r#"["a","b"]"#),
+            (b"$.box[?(@.n.length() == 1)].t", r#"["b"]"#),
+            (b"$.box[?(@.n.sum() > 5)].t", r#"["b"]"#),
+            (b"$.box[?(@.n[0] + 1 == 2)].t", r#"["a"]"#),
+            (b"$.box[?(@~ size 3)].t", r#"["a","b"]"#),
+            (b"$.box[?(@.n~)].t", "[]"),
+        ] {
+            assert_eq!(f.run(&[b"JSON.GET", b"doc", path]), bulk(want).as_str());
+        }
+
+        // A write goes through one of these the same way it goes through a
+        // comparison.
+        assert_eq!(
+            f.run(&[b"JSON.SET", b"doc", b"$.box[?(@.n size 1)].g", br#""z""#]),
+            "+OK\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"JSON.GET", b"doc", b"$.box[?(@.g == \"z\")].t"]),
+            bulk(r#"["b"]"#).as_str()
+        );
+    }
+
     /// D-41. RedisJSON refuses this one, and which document it refuses is
     /// decided by how it happens to hold an array of numbers.
     #[test]
