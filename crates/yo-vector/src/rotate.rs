@@ -66,20 +66,24 @@ use yo_common::Rng;
 /// A quarter turn on a pair is a sum and a difference, both over this.
 const INV_ROOT2: f32 = core::f32::consts::FRAC_1_SQRT_2;
 
-/// One sweep: a sign for every coordinate, a pairing of all of them, and which
-/// way round each pair is turned.
+/// One sweep: a sign for every coordinate and a pairing of all of them.
 ///
 /// The pairs are stored rather than the permutation they came from, because
 /// rotating in place off a pair list is one pass over the vector and no scratch
 /// buffer, where a permutation would want somewhere to write the shuffled copy.
 struct Round {
-    /// One bit per coordinate, set when its sign is flipped before the pairing.
-    flip: Vec<u64>,
+    /// The sign mask for every coordinate, either nothing or the top bit, ready
+    /// to be exclusive ored straight into the float.
+    ///
+    /// This used to be one bit per coordinate, unpacked with a shift and a mask
+    /// inside the loop, which is four integer operations per float and stops
+    /// the loop being one wide exclusive or over a run of them. A word each is
+    /// `dim` times `rounds` times four bytes for the whole collection, a few
+    /// kilobytes, and no vector anywhere pays for it twice.
+    signs: Vec<u32>,
     /// `(i, j)` for each pair, which together cover every index once, or every
     /// index but one when the dimension is odd.
     pairs: Vec<(u32, u32)>,
-    /// One bit per pair, set when the difference goes first rather than second.
-    turn: Vec<u64>,
 }
 
 /// A random orthogonal transform, rebuilt from its seed rather than stored.
@@ -110,14 +114,30 @@ impl Rotation {
         for _ in 0..sweeps {
             shuffle(&mut order, &mut rng);
             let half = dim / 2;
-            let pairs = (0..half)
+            let pairs: Vec<(u32, u32)> = (0..half)
                 .map(|k| (order[2 * k], order[2 * k + 1]))
                 .collect();
-            rounds.push(Round {
-                flip: bits(dim, &mut rng),
-                pairs,
-                turn: bits(half, &mut rng),
-            });
+            // Drawn in this order because that is the order they were drawn in
+            // when they were two separate tables, and the rotation a seed gives
+            // has to stay the one it always gave.
+            let flip = bits(dim, &mut rng);
+            let turn = bits(half, &mut rng);
+            let mut signs: Vec<u32> = (0..dim)
+                .map(|i| u32::from((flip[i / 64] >> (i % 64)) & 1 == 1) << 31)
+                .collect();
+            // Turning a pair the other way round is the same thing as flipping
+            // the sign of its second coordinate first. With b negated the sum
+            // becomes the difference and the difference becomes the sum, and
+            // both of those are exact in floating point, so folding the turn
+            // into the sign here gives bit for bit what the branch inside the
+            // pair loop used to give and the loop no longer has a coin toss to
+            // mispredict in it.
+            for (k, &(_, j)) in pairs.iter().enumerate() {
+                if (turn[k / 64] >> (k % 64)) & 1 == 1 {
+                    signs[j as usize] ^= 1 << 31;
+                }
+            }
+            rounds.push(Round { signs, pairs });
         }
         Rotation { dim, seed, rounds }
     }
@@ -149,22 +169,18 @@ impl Rotation {
         );
         for round in &self.rounds {
             // A sign is the top bit of the float, so flipping one is an xor and
-            // there is no branch to mispredict on a coin toss.
-            for (i, c) in v.iter_mut().enumerate() {
-                let sign = ((round.flip[i / 64] >> (i % 64)) & 1) << 31;
-                *c = f32::from_bits(c.to_bits() ^ (sign as u32));
+            // there is no branch to mispredict on a coin toss. Zipping two
+            // slices of the same length rather than indexing one by a counter
+            // is what lets the compiler drop the bounds check and do a whole
+            // register of them at once.
+            for (c, &sign) in v.iter_mut().zip(&round.signs) {
+                *c = f32::from_bits(c.to_bits() ^ sign);
             }
-            for (k, &(i, j)) in round.pairs.iter().enumerate() {
+            for &(i, j) in &round.pairs {
                 let (i, j) = (i as usize, j as usize);
                 let (a, b) = (v[i], v[j]);
-                let (sum, difference) = ((a + b) * INV_ROOT2, (a - b) * INV_ROOT2);
-                if (round.turn[k / 64] >> (k % 64)) & 1 == 0 {
-                    v[i] = sum;
-                    v[j] = difference;
-                } else {
-                    v[i] = difference;
-                    v[j] = sum;
-                }
+                v[i] = (a + b) * INV_ROOT2;
+                v[j] = (a - b) * INV_ROOT2;
             }
         }
     }
@@ -236,6 +252,35 @@ mod tests {
                 let after = dot(&x, &y);
                 assert!((before - after).abs() < 1e-3, "{before} became {after}");
             }
+        }
+    }
+
+    /// The rotation is not written into the file, it is rebuilt from a seed, so
+    /// a build that computes a different one from the same seed cannot read a
+    /// collection an older build wrote. Nothing else in the crate would notice:
+    /// the codes would still be self consistent and recall would still look
+    /// fine, and only the vectors already on disk would be wrong. So the bits
+    /// are pinned here.
+    ///
+    /// If this fails and the change was deliberate, the file format version is
+    /// the thing that has to move, not this number.
+    #[test]
+    fn a_seed_gives_the_rotation_it_has_always_given() {
+        for (dim, want) in [
+            (8usize, 0xef2f_9c0c_1aad_5cdfu64),
+            (33, 0x97e7_79cf_5820_4a3f),
+            (128, 0xde6f_cf6b_69cf_490c),
+        ] {
+            let mut v: Vec<f32> = (0..dim).map(|i| (i as f32 + 1.0) / 8.0).collect();
+            Rotation::new(dim, 0xB0A7).apply(&mut v);
+            let mut got: u64 = 0xcbf2_9ce4_8422_2325;
+            for c in &v {
+                for byte in c.to_bits().to_le_bytes() {
+                    got ^= u64::from(byte);
+                    got = got.wrapping_mul(0x0100_0000_01b3);
+                }
+            }
+            assert_eq!(got, want, "the rotation at {dim} dimensions has moved");
         }
     }
 

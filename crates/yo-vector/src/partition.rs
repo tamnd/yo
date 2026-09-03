@@ -376,6 +376,27 @@ pub struct Partitions {
     /// The shortlist a placement fills in, kept here so that placing a vector
     /// does not allocate.
     scratch: Vec<u32>,
+    /// Partitions that may be over the split threshold, and partitions that may
+    /// be under the merge threshold.
+    ///
+    /// Deciding what to maintain next used to be two passes over every
+    /// partition, once for the largest and once for the smallest, and it ran
+    /// once per vector inserted. That is linear in the partition count and the
+    /// partition count grows with the collection, which is the same quadratic
+    /// the coarse layer was built to remove, just hiding somewhere else. By 1.6
+    /// million vectors it was a fifth of an ingest and it was doing nothing at
+    /// all almost every time it ran.
+    ///
+    /// A partition can only cross a threshold when its own length changes, and
+    /// there are five places a length changes, so the crossings can be recorded
+    /// as they happen instead of looked for afterwards. These two lists hold
+    /// every partition that qualifies and usually nothing else. They are
+    /// allowed to hold stale entries, because [`Partitions::job`] checks the
+    /// real length before it returns anything and drops what no longer
+    /// qualifies, and they are kept in partition order so that a tie is broken
+    /// the same way the two passes broke it.
+    big: Vec<u32>,
+    small: Vec<u32>,
 }
 
 impl Partitions {
@@ -398,6 +419,8 @@ impl Partitions {
             at: HashMap::new(),
             coarse: Coarse::default(),
             scratch: Vec::new(),
+            big: Vec::new(),
+            small: Vec::new(),
         }
     }
 
@@ -672,7 +695,27 @@ impl Partitions {
     /// Whether there is a split or a merge waiting.
     #[must_use]
     pub fn needs_maintenance(&self) -> bool {
-        self.job().is_some()
+        // The same two questions [`Partitions::job`] asks, without the pruning,
+        // so that asking does not need the collection mutably.
+        self.big.iter().any(|&p| {
+            let p = p as usize;
+            self.over(p) && self.postings[p].len() > self.postings[p].stuck
+        }) || (self.postings.len() > 1 && self.small.iter().any(|&p| self.under(p as usize)))
+    }
+
+    /// Whether partition `p` is big enough to split. False for an index that is
+    /// no longer there, which is what a stale candidate looks like.
+    fn over(&self, p: usize) -> bool {
+        self.postings
+            .get(p)
+            .is_some_and(|posting| posting.len() > self.tuning.posting * 2)
+    }
+
+    /// Whether partition `p` is small enough to merge away.
+    fn under(&self, p: usize) -> bool {
+        self.postings
+            .get(p)
+            .is_some_and(|posting| posting.len() * 4 < self.tuning.posting)
     }
 
     /// Do bounded maintenance, and say how many vectors it looked at.
@@ -694,20 +737,58 @@ impl Partitions {
         done
     }
 
+    /// Note that partition `p`'s length has changed, so it may have crossed a
+    /// threshold in either direction.
+    ///
+    /// Both lists are checked, rather than only the one the direction of the
+    /// change could have reached, because every caller would otherwise have to
+    /// know which way it moved the length and one of them moves it both ways.
+    /// They are short enough that looking is free.
+    fn note(&mut self, p: usize) {
+        let (over, under) = (self.over(p), self.under(p));
+        let p = p as u32;
+        if over && !self.big.contains(&p) {
+            self.big.push(p);
+        }
+        if under && !self.small.contains(&p) {
+            self.small.push(p);
+        }
+    }
+
     /// The next thing worth doing, biggest problem first.
-    fn job(&self) -> Option<Job> {
-        let big = (0..self.postings.len())
+    ///
+    /// This used to walk every partition twice. It now walks the two candidate
+    /// lists, which hold every partition that qualifies and are usually empty,
+    /// and drops the entries that have stopped qualifying on the way past. The
+    /// answer is the same one the walk gave, including which partition is
+    /// picked when two are the same size, because the lists are in partition
+    /// order and a maximum takes the last of equals where a minimum takes the
+    /// first.
+    fn job(&mut self) -> Option<Job> {
+        let mut big = std::mem::take(&mut self.big);
+        big.retain(|&p| self.over(p as usize));
+        big.sort_unstable();
+        let split = big
+            .iter()
+            .map(|&p| p as usize)
             .filter(|&p| self.postings[p].len() > self.postings[p].stuck)
             .max_by_key(|&p| self.postings[p].len());
-        if let Some(big) = big
-            && self.postings[big].len() > self.tuning.posting * 2
-        {
-            return Some(Job::Split(big));
+        self.big = big;
+        if let Some(split) = split {
+            return Some(Job::Split(split));
         }
+
         if self.postings.len() > 1 {
-            let small = (0..self.postings.len()).min_by_key(|&p| self.postings[p].len())?;
-            if self.postings[small].len() * 4 < self.tuning.posting {
-                return Some(Job::Merge(small));
+            let mut small = std::mem::take(&mut self.small);
+            small.retain(|&p| self.under(p as usize));
+            small.sort_unstable();
+            let merge = small
+                .iter()
+                .map(|&p| p as usize)
+                .min_by_key(|&p| self.postings[p].len());
+            self.small = small;
+            if let Some(merge) = merge {
+                return Some(Job::Merge(merge));
             }
         }
         None
@@ -848,6 +929,7 @@ impl Partitions {
         let tags = std::mem::take(&mut self.postings[p].tags);
         self.postings[p].codes.clear();
         self.postings[p].meta.clear();
+        self.note(p);
         let mut kept = Vec::with_capacity(ids.len());
         let mut xs = Vec::with_capacity(ids.len() * dim);
         let mut buf = vec![0.0f32; dim];
@@ -906,6 +988,7 @@ impl Partitions {
         self.postings.push(Posting::default());
         let p = self.postings.len() - 1;
         self.coarse.added(p, centroid, dim);
+        self.note(p);
         self.refresh_coarse();
         p
     }
@@ -939,6 +1022,7 @@ impl Partitions {
                     slot.partition = p as u32;
                 }
             }
+            self.note(p);
         }
         self.refresh_coarse();
     }
@@ -965,6 +1049,7 @@ impl Partitions {
                 slot: slot as u32,
             },
         );
+        self.note(p);
     }
 
     /// Take slot `s` out of partition `p`, returning the id that moved into it.
@@ -980,7 +1065,9 @@ impl Partitions {
             head[s * width..(s + 1) * width].copy_from_slice(&tail[..width]);
         }
         posting.codes.truncate(last * width);
-        (s != last).then(|| posting.ids[s])
+        let moved = (s != last).then(|| posting.ids[s]);
+        self.note(p);
+        moved
     }
 
     /// The same, keeping the map straight, for the paths that are about to put
@@ -1008,6 +1095,7 @@ struct Member {
     tag: u64,
 }
 
+#[derive(Debug, PartialEq, Eq)]
 enum Job {
     Split(usize),
     Merge(usize),
@@ -1164,6 +1252,65 @@ impl Bounded {
 mod tests {
     use super::*;
     use yo_common::Rng;
+
+    /// What `job` used to be: two passes over every partition. The candidate
+    /// lists are only worth having if they give the same answer, so the slow
+    /// version stays here as the thing the fast one is checked against.
+    fn slow_job(ix: &Partitions) -> Option<Job> {
+        let big = (0..ix.postings.len())
+            .filter(|&p| ix.postings[p].len() > ix.postings[p].stuck)
+            .max_by_key(|&p| ix.postings[p].len());
+        if let Some(big) = big
+            && ix.postings[big].len() > ix.tuning.posting * 2
+        {
+            return Some(Job::Split(big));
+        }
+        if ix.postings.len() > 1 {
+            let small = (0..ix.postings.len()).min_by_key(|&p| ix.postings[p].len())?;
+            if ix.postings[small].len() * 4 < ix.tuning.posting {
+                return Some(Job::Merge(small));
+            }
+        }
+        None
+    }
+
+    /// Every partition that qualifies has to be on a list, or maintenance stops
+    /// happening and the index quietly rots. Deletes are in here on purpose,
+    /// because a delete is the only thing that pushes a partition down through
+    /// the merge threshold and it is also what makes a partition disappear and
+    /// renumber the one that was last.
+    #[test]
+    fn the_candidate_lists_answer_what_the_two_passes_answered() {
+        let store = corpus(16, 3000, 12, 0x105E);
+        let mut ix = Partitions::new(16, Bits::One, 7, Tuning::default());
+        let mut rng = Rng::new(0x105F);
+        let mut live: Vec<u64> = Vec::new();
+        for id in 0..3000u64 {
+            ix.insert(id, &store.0[id as usize]);
+            live.push(id);
+            if id % 7 == 3 && !live.is_empty() {
+                let at = rng.below(live.len());
+                let gone = live.swap_remove(at);
+                ix.remove(gone);
+            }
+            // Once before maintenance runs and once after, because the lists
+            // are written by both and the state in between is the one a stale
+            // entry would survive in.
+            assert_eq!(
+                ix.job(),
+                slow_job(&ix),
+                "after {id} inserts, before maintaining"
+            );
+            ix.maintain(&store, 8);
+            assert_eq!(
+                ix.job(),
+                slow_job(&ix),
+                "after {id} inserts, after maintaining"
+            );
+            assert_eq!(ix.needs_maintenance(), slow_job(&ix).is_some());
+        }
+        assert!(ix.postings.len() > 5, "the test never split anything");
+    }
 
     /// The record log, for a test: every vector by id, where the id is where it
     /// sits.
