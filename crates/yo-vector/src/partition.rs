@@ -212,8 +212,9 @@ pub struct Tuning {
     /// It keys off the answer rather than off the geometry, which is deliberate.
     /// The obvious rule is to stop once the next centroid is more than some
     /// fraction further away than the nearest one, and that rule is useless
-    /// here: see [`Partitions::spill_into`] for the measurement, but the short
-    /// version is that distances concentrate, every centroid a query can see is
+    /// here: the measurement is on the private `spill_into`, which is where the
+    /// same rule was tried and dropped on the write path, and the short version
+    /// is that distances concentrate, every centroid a query can see is
     /// within a few percent of every other, and there is no setting of the
     /// fraction between pruning nothing and pruning everything.
     ///
@@ -227,6 +228,21 @@ pub struct Tuning {
     /// it is only allowed to fire once there are already enough. A filtered
     /// search that is widening because it does not have enough is never cut off
     /// by it.
+    ///
+    /// # Where the default comes from
+    ///
+    /// Eight, which is the same as the default `probe`, and that is not a
+    /// coincidence: a search that only reads eight partitions cannot have eight
+    /// quiet ones in a row before it runs out, so the default settings are the
+    /// settings this does nothing under. It starts to matter exactly when
+    /// somebody raises `probe`, which is when it should.
+    ///
+    /// On SIFT1M at `probe` 128 and `rerank` 16, where the fixed sweep recalls
+    /// 0.9757 reading all 128, eight reads 96.9 of them for 0.9750, four reads
+    /// 65.6 for 0.9704, and three reads 53.3 for 0.9641, against a fixed `probe`
+    /// of 64 which reads all 64 for 0.9665. So a quarter of the reads go away for
+    /// seven ten thousandths of recall, and the settings in between fill in a
+    /// ladder that `probe` can only climb by doubling.
     pub patience: usize,
     /// How many partitions one vector may be written into, at most.
     ///
@@ -271,7 +287,7 @@ impl Default for Tuning {
             widen: 8,
             spill: 4,
             slack: 0.10,
-            patience: 0,
+            patience: 8,
         }
     }
 }

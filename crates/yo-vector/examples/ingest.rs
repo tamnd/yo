@@ -47,23 +47,53 @@ impl Vectors for Store {
 }
 
 fn main() {
-    let n: usize = std::env::args()
-        .nth(1)
+    let mut args = std::env::args().skip(1);
+    let n: usize = args.next().and_then(|a| a.parse().ok()).unwrap_or(200_000);
+    // The dimension is an argument because the cost of an insert is linear in it
+    // and the partition count is not, so 128 and 1024 are not the same
+    // measurement twice. MS-MARCO is 1024 and is where a regression showed up
+    // that 128 dimensional data hid.
+    let dim: usize = args.next().and_then(|a| a.parse().ok()).unwrap_or(128);
+    // The two replication knobs, so that what a boundary copy costs on the write
+    // path can be read off against the same run with it switched off.
+    let spill: usize = args
+        .next()
         .and_then(|a| a.parse().ok())
-        .unwrap_or(200_000);
-    let dim = 128;
+        .unwrap_or(Tuning::default().spill);
+    let slack: f32 = args
+        .next()
+        .and_then(|a| a.parse().ok())
+        .unwrap_or(Tuning::default().slack);
+    // The posting size, which is really the partition count in disguise: a
+    // collection ends up with about one partition per two postings' worth of
+    // entries. It is here because the terms that hurt are the ones that touch
+    // every centroid, and the only way to reach a real collection's partition
+    // count without a real collection's memory is to make the postings smaller.
+    let posting: usize = args
+        .next()
+        .and_then(|a| a.parse().ok())
+        .unwrap_or(Tuning::default().posting);
     // Enough clusters that the index has real structure to find and few enough
     // that each one is far bigger than a partition, which is the shape of every
     // real embedding collection.
-    let store = corpus(dim, n, 200, 0x9e37);
+    let clusters: usize = args.next().and_then(|a| a.parse().ok()).unwrap_or(200);
+    let store = corpus(dim, n, clusters, 0x9e37);
 
-    println!("{n} vectors, {dim} dimensions, one core");
+    println!(
+        "{n} vectors, {dim} dimensions, spill {spill} slack {slack} posting {posting}, {clusters} clusters, one core"
+    );
     println!(
         "{:>10}{:>12}{:>12}{:>12}{:>12}{:>10}",
         "at", "partitions", "a second", "insert", "maintain", "touched"
     );
 
-    let mut ix = Partitions::new(dim, Bits::One, 0x51f7, Tuning::default());
+    let tuning = Tuning {
+        spill,
+        slack,
+        posting,
+        ..Tuning::default()
+    };
+    let mut ix = Partitions::new(dim, Bits::One, 0x51f7, tuning);
     let mut buf = vec![0f32; dim];
     // Report at every doubling, because a rate that halves each time the
     // collection doubles is exactly what a quadratic looks like and a table on a
