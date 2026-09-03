@@ -28,14 +28,60 @@
 //! in one bracket, and a slice with an optional step. That is RFC 9535 without
 //! its filter selector.
 //!
-//! # What is not here yet
+//! The filter, `[?(@.price < 10)]`, is here too. It is the only selector whose
+//! answer depends on the document rather than only on the path, and the only one
+//! that can look somewhere other than where it stands, because `$` inside an
+//! expression is the whole document.
 //!
-//! `?(@.price < 10)`. The grammar knows it exists and says so rather than
-//! reading it as a name with punctuation in it, which is what a path parser
-//! that has not thought about filters does, and it is worse than an error
-//! because the client gets an empty answer instead of a complaint. Filters need
-//! an expression language and a comparison order over mixed types, which is a
-//! piece of work with its own decisions in it, so it is its own change.
+//! ```
+//! use yo_doc::{Path, Value, from_json};
+//!
+//! let doc = from_json(br#"{"items":[{"sku":"a","price":3},{"sku":"b","price":15}]}"#)?;
+//! let v = Value::new(&doc).expect("readable");
+//!
+//! let mut hits = Vec::new();
+//! Path::parse(b"$.items[?(@.price < 10)].sku")?.select(&v, &mut hits);
+//! let cheap: Vec<&str> = hits.iter().filter_map(Value::as_text).collect();
+//! assert_eq!(cheap, ["a"]);
+//! # Ok::<(), yo_common::Error>(())
+//! ```
+//!
+//! # What a filter's operators mean
+//!
+//! An operand is a path from the current node, a path from the root, or a
+//! literal, and a path answers a set rather than one value. A comparison is true
+//! when some pair drawn from the two sides satisfies it, so `@.tags[*] == "x"`
+//! asks whether any tag is `x`. A side that answers nothing satisfies nothing,
+//! which is why `@.missing == 1` and `@.missing < 1` are both false, and `!=` is
+//! the negation of the whole comparison rather than a comparison of its own,
+//! which is why `@.missing != 1` is true.
+//!
+//! An ordering comparison only arises between two values of the same sort.
+//! Numbers order as numbers, strings order by their characters, `false` is below
+//! `true`, and two nulls are equal, so `null >= null` is true and `null < null`
+//! is not. Everything else is false: a string is not below a number, and an
+//! array or an object is not below anything at all, not even an equal one.
+//! Equality is the whole value, and it crosses the integer and float split so
+//! `1 == 1.0`, but it crosses nothing else, so `0 == false` and `1 == "1"` are
+//! both false. All of that was read off RedisJSON 8.10.1 rather than off the
+//! RFC, which leaves most of it open.
+//!
+//! An expression with no operator in it asks whether the operand is there.
+//! `[?(@.price)]` keeps the members that have a price, including the ones whose
+//! price is `null` or `false`, because it is a question about the document and
+//! not about the value. The one thing that is false on its own is the literal
+//! `false`, so `[?(false)]` keeps nothing while `[?(0)]` and `[?(null)]` keep
+//! everything.
+//!
+//! `=~` is a regular expression, and the flavour is the one in
+//! [`yo_common::re`], which is what `ARGREP` uses. RedisJSON's is the Rust
+//! `regex` crate's, so the two agree on everything anyone writes by hand and
+//! part company on the corners, which is a row in the divergence register.
+//!
+//! The parentheses everyone writes around a filter are not part of it, so
+//! `[?@.a == 1]` and `[? (@.a == 1)]` are the same filter. A filter iterates the
+//! children of an array and of an object alike, and it works under a write as
+//! well as a read: `JSON.SET`, `JSON.DEL` and `JSON.NUMINCRBY` all take one.
 //!
 //! # Two orderings that are not Redis's
 //!
@@ -50,6 +96,7 @@
 
 use yo_common::{Code, Error, Result};
 
+use crate::filter::{Expr, Op, Operand, Pattern};
 use crate::head::{DEPTH_MAX, Kind};
 use crate::path::Step;
 use crate::read::Value;
@@ -68,7 +115,7 @@ pub struct Path<'a> {
 
 /// One selector.
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum Sel<'a> {
+pub(crate) enum Sel<'a> {
     /// A member of an object, by name.
     Key(&'a [u8]),
     /// An element of an array, counting back from the end when negative.
@@ -87,6 +134,10 @@ enum Sel<'a> {
         to: Option<i64>,
         step: i64,
     },
+    /// The children this expression is true of. Boxed because it is the one
+    /// selector that is more than a few words and every other selector would
+    /// otherwise pay for it.
+    Filter(Box<Expr<'a>>),
 }
 
 impl<'a> Path<'a> {
@@ -155,19 +206,7 @@ impl<'a> Path<'a> {
     /// against many documents keeps one buffer. Nothing here allocates except
     /// that buffer and the frontier the walk carries.
     pub fn select<'d>(&self, root: &Value<'d>, out: &mut Vec<Value<'d>>) {
-        let mut cur = vec![*root];
-        let mut next = Vec::new();
-        for sel in &self.sels {
-            next.clear();
-            for v in &cur {
-                apply(sel, v, &mut next);
-            }
-            core::mem::swap(&mut cur, &mut next);
-            if cur.is_empty() {
-                return;
-            }
-        }
-        out.append(&mut cur);
+        select_from(&self.sels, root, root, out);
     }
 
     /// This path without its last selector, and that selector, when the last
@@ -209,8 +248,35 @@ impl<'a> Path<'a> {
     }
 }
 
+/// Walk `sels` from `start`, with everything they name appended to `out`.
+///
+/// `root` is carried the whole way down because a filter may say `$`, which is
+/// the document and not the value the filter stands on. It is the same value as
+/// `start` for a path a client sent and a different one for a path inside a
+/// filter.
+pub(crate) fn select_from<'d>(
+    sels: &[Sel<'_>],
+    start: &Value<'d>,
+    root: &Value<'d>,
+    out: &mut Vec<Value<'d>>,
+) {
+    let mut cur = vec![*start];
+    let mut next = Vec::new();
+    for sel in sels {
+        next.clear();
+        for v in &cur {
+            apply(sel, root, v, &mut next);
+        }
+        core::mem::swap(&mut cur, &mut next);
+        if cur.is_empty() {
+            return;
+        }
+    }
+    out.append(&mut cur);
+}
+
 /// One selector against one value, with everything it names pushed onto `out`.
-fn apply<'d>(sel: &Sel<'_>, v: &Value<'d>, out: &mut Vec<Value<'d>>) {
+fn apply<'d>(sel: &Sel<'_>, root: &Value<'d>, v: &Value<'d>, out: &mut Vec<Value<'d>>) {
     match sel {
         Sel::Key(k) => out.extend(v.get(k)),
         Sel::Index(i) => out.extend(index(v, *i)),
@@ -218,10 +284,14 @@ fn apply<'d>(sel: &Sel<'_>, v: &Value<'d>, out: &mut Vec<Value<'d>>) {
         Sel::Descend => descend(v, out, 0),
         Sel::Union(items) => {
             for item in items {
-                apply(item, v, out);
+                apply(item, root, v, out);
             }
         }
         Sel::Slice { from, to, step } => slice(v, *from, *to, *step, out),
+        // A filter is asked about the children and not about the value it
+        // stands on, so an array is filtered element by element and an object
+        // member by member, which is what `iter` walks for both.
+        Sel::Filter(e) => out.extend(v.iter().filter(|child| e.holds(root, child))),
     }
 }
 
@@ -374,15 +444,13 @@ impl<'a> Parse<'a> {
     /// Everything between one `[` and its `]`.
     fn bracket(&mut self) -> Result<Sel<'a>> {
         let body = &self.rest[self.at + 1..];
-        let Some(close) = body.iter().position(|&c| c == b']') else {
+        let Some(close) = closer(body, b']') else {
             return Err(self.bad("a `[` with no `]` after it"));
         };
         let inner = &body[..close];
         self.at += close + 2;
-        if inner.starts_with(b"?") {
-            return Err(self.bad(
-                "a filter, `[?(...)]`, is not read yet, so this path is refused rather than answering nothing",
-            ));
+        if let Some(rest) = inner.strip_prefix(b"?") {
+            return self.filter(rest);
         }
         if inner == b"*" {
             return Ok(Sel::Wild);
@@ -439,6 +507,25 @@ impl<'a> Parse<'a> {
             .ok_or_else(|| self.bad("an index that is not a number"))
     }
 
+    /// Everything between `[?` and its `]`.
+    ///
+    /// The parentheses everyone writes around a filter are not part of it. They
+    /// are a group like any other group, which is why `[?@.a == 1]` and
+    /// `[? (@.a == 1)]` are both this and read the same.
+    fn filter(&mut self, body: &'a [u8]) -> Result<Sel<'a>> {
+        let mut f = Filter {
+            body,
+            at: 0,
+            of: self.at,
+        };
+        let e = f.or()?;
+        f.spaces();
+        if f.at < f.body.len() {
+            return Err(f.bad("a filter with something left over at the end of it"));
+        }
+        Ok(Sel::Filter(Box::new(e)))
+    }
+
     /// An error that says where in the path it happened, since a path is short
     /// enough that the offset is the whole explanation.
     fn bad(&self, what: &str) -> Error {
@@ -447,6 +534,298 @@ impl<'a> Parse<'a> {
             format_args!("{what}, at byte {} of the path", self.at),
         )
     }
+}
+
+// ------------------------------------------------------------------ a filter
+
+/// The grammar inside `[?...]`.
+///
+/// Separate from [`Parse`] because it reads an expression rather than a run of
+/// selectors, and because it works over the one bracket rather than over the
+/// whole path. `of` is where that bracket started, so an error still says where
+/// in the path the client should look.
+struct Filter<'a> {
+    body: &'a [u8],
+    at: usize,
+    of: usize,
+}
+
+impl<'a> Filter<'a> {
+    /// `and` and then any number of `|| and`.
+    fn or(&mut self) -> Result<Expr<'a>> {
+        let mut e = self.and()?;
+        while self.word(b"||") {
+            e = Expr::Or(Box::new(e), Box::new(self.and()?));
+        }
+        Ok(e)
+    }
+
+    /// `unary` and then any number of `&& unary`, which is why `&&` binds
+    /// tighter than `||`.
+    fn and(&mut self) -> Result<Expr<'a>> {
+        let mut e = self.unary()?;
+        while self.word(b"&&") {
+            e = Expr::And(Box::new(e), Box::new(self.unary()?));
+        }
+        Ok(e)
+    }
+
+    /// A `!`, a group, or a comparison.
+    fn unary(&mut self) -> Result<Expr<'a>> {
+        self.spaces();
+        if self.word(b"!") {
+            return Ok(Expr::Not(Box::new(self.unary()?)));
+        }
+        if self.word(b"(") {
+            let e = self.or()?;
+            if !self.word(b")") {
+                return Err(self.bad("a `(` in a filter with no `)` after it"));
+            }
+            return Ok(e);
+        }
+        self.cmp()
+    }
+
+    /// One operand, and the other one when there is an operator between them.
+    fn cmp(&mut self) -> Result<Expr<'a>> {
+        let left = self.operand()?;
+        let Some(op) = self.op() else {
+            return Ok(Expr::Test(left));
+        };
+        let mut right = self.operand()?;
+        if op == Op::Re {
+            // A pattern is compiled here rather than once per value it is run
+            // against, which is the whole reason a path is parsed at all. One
+            // that will not compile is left as it was written, which makes it a
+            // right hand side that matches nothing, because that is what the
+            // reference does with `"["` rather than refusing the path.
+            if let Operand::Lit(bytes) = &right
+                && let Some(v) = Value::new(bytes)
+                && let Some(text) = v.text_bytes()
+                && let Ok(pat) = Pattern::new(text)
+            {
+                right = Operand::Re(pat);
+            }
+        }
+        Ok(Expr::Cmp(left, op, right))
+    }
+
+    /// The operator between two operands, if there is one.
+    ///
+    /// The two character ones are tried first, so that `<=` is not read as a
+    /// `<` with a stray `=` after it.
+    fn op(&mut self) -> Option<Op> {
+        self.spaces();
+        for (text, op) in [
+            (&b"=="[..], Op::Eq),
+            (b"!=", Op::Ne),
+            (b"<=", Op::Le),
+            (b">=", Op::Ge),
+            (b"=~", Op::Re),
+            (b"<", Op::Lt),
+            (b">", Op::Gt),
+        ] {
+            if self.word(text) {
+                return Some(op);
+            }
+        }
+        None
+    }
+
+    /// A path from `@` or from `$`, or a value written into the path.
+    fn operand(&mut self) -> Result<Operand<'a>> {
+        self.spaces();
+        let Some(&c) = self.body.get(self.at) else {
+            return Err(self.bad("a filter that stops where a value was expected"));
+        };
+        if c == b'@' || c == b'$' {
+            self.at += 1;
+            let to = self.at + path_end(&self.body[self.at..]);
+            let mut p = Parse {
+                rest: &self.body[self.at..to],
+                at: 0,
+                legacy: false,
+                sels: Vec::new(),
+            };
+            p.run()?;
+            self.at = to;
+            return Ok(Operand::Path {
+                at: c == b'@',
+                sels: p.sels,
+            });
+        }
+        self.literal()
+    }
+
+    /// A number, a string, `true`, `false`, `null`, or a whole array or object.
+    fn literal(&mut self) -> Result<Operand<'a>> {
+        let from = self.at;
+        let text = match self.body[self.at] {
+            b'"' | b'\'' => self.string()?,
+            open @ (b'[' | b'{') => {
+                let body = &self.body[self.at + 1..];
+                let close = if open == b'[' { b']' } else { b'}' };
+                let Some(close) = closer(body, close) else {
+                    return Err(self.bad("a value in a filter that is not closed"));
+                };
+                self.at += close + 2;
+                self.body[from..self.at].to_vec()
+            }
+            _ => {
+                while self.at < self.body.len() && !stops(self.body[self.at]) {
+                    self.at += 1;
+                }
+                if self.at == from {
+                    return Err(self.bad("a filter with an operator where a value goes"));
+                }
+                self.body[from..self.at].to_vec()
+            }
+        };
+        let bytes = crate::from_json(&text)
+            .map_err(|_| self.bad("a value in a filter that is not a value"))?;
+        Ok(Operand::Lit(bytes))
+    }
+
+    /// A quoted string, as the JSON text of the same string.
+    ///
+    /// A filter may quote with either mark and JSON only knows the one, so a
+    /// single quoted string is rewritten rather than parsed twice. What is
+    /// inside it is left alone, escapes included, so `'A'` means what it
+    /// means in JSON.
+    fn string(&mut self) -> Result<Vec<u8>> {
+        let quote = self.body[self.at];
+        let mut out = vec![b'"'];
+        let mut i = self.at + 1;
+        while i < self.body.len() {
+            let c = self.body[i];
+            if c == b'\\' && i + 1 < self.body.len() {
+                // A quote of the other kind was escaped to get past this
+                // parser, and JSON has no escape for it, so the backslash goes
+                // and the mark stays.
+                let next = self.body[i + 1];
+                if next == b'\'' {
+                    out.push(b'\'');
+                } else {
+                    out.push(c);
+                    out.push(next);
+                }
+                i += 2;
+                continue;
+            }
+            if c == quote {
+                out.push(b'"');
+                self.at = i + 1;
+                return Ok(out);
+            }
+            if c == b'"' {
+                out.push(b'\\');
+            }
+            out.push(c);
+            i += 1;
+        }
+        Err(self.bad("a string in a filter with no closing quote"))
+    }
+
+    /// Take `text` if it is next, after any spaces.
+    fn word(&mut self, text: &[u8]) -> bool {
+        self.spaces();
+        if self.body[self.at..].starts_with(text) {
+            self.at += text.len();
+            return true;
+        }
+        false
+    }
+
+    fn spaces(&mut self) {
+        while matches!(self.body.get(self.at), Some(b' ' | b'\t')) {
+            self.at += 1;
+        }
+    }
+
+    fn bad(&self, what: &str) -> Error {
+        Error::fmt(
+            Code::Invalid,
+            format_args!("{what}, at byte {} of the path", self.of + self.at),
+        )
+    }
+}
+
+/// Where a path inside a filter ends.
+///
+/// A path there runs up against the expression around it, so it stops at the
+/// first thing that cannot be part of one. Arithmetic is not read, so `+`, `-`
+/// and the rest are not in that set and a member really called `total-vat` is
+/// reachable, which matters more than an operator nobody can use.
+fn path_end(body: &[u8]) -> usize {
+    let mut depth = 0usize;
+    let mut quote = 0u8;
+    let mut i = 0;
+    while i < body.len() {
+        let c = body[i];
+        if quote != 0 {
+            if c == b'\\' {
+                i += 2;
+                continue;
+            }
+            if c == quote {
+                quote = 0;
+            }
+        } else if depth == 0 && stops(c) {
+            return i;
+        } else {
+            match c {
+                b'"' | b'\'' => quote = c,
+                b'[' => depth += 1,
+                b']' => depth = depth.saturating_sub(1),
+                _ => {}
+            }
+        }
+        i += 1;
+    }
+    body.len()
+}
+
+/// Whether this byte ends a path or a bare value inside a filter.
+fn stops(c: u8) -> bool {
+    matches!(
+        c,
+        b' ' | b'\t' | b'(' | b')' | b'!' | b'<' | b'>' | b'=' | b'&' | b'|' | b',' | b'~'
+    )
+}
+
+/// Where the `close` that matches an opener is, counting nesting and quotes.
+///
+/// The first `]` is the answer for `[0]` and for `['a']`, and it is the wrong
+/// answer for `[?(@.a[0] == 1)]` and for `[?(@.a == "]")]`, which is why this
+/// walks rather than searches. `close` is a parameter because a filter can hold
+/// a whole value written out, and `{"a":1}` ends at a brace.
+fn closer(body: &[u8], close: u8) -> Option<usize> {
+    let mut depth = 0usize;
+    let mut quote = 0u8;
+    let mut i = 0;
+    while i < body.len() {
+        let c = body[i];
+        if quote != 0 {
+            if c == b'\\' {
+                i += 2;
+                continue;
+            }
+            if c == quote {
+                quote = 0;
+            }
+        } else if c == close && depth == 0 {
+            return Some(i);
+        } else {
+            match c {
+                b'"' | b'\'' => quote = c,
+                b'[' | b'{' => depth += 1,
+                b']' | b'}' => depth = depth.saturating_sub(1),
+                _ => {}
+            }
+        }
+        i += 1;
+    }
+    None
 }
 
 /// The bytes inside `"..."` or `'...'`, if that is what this is.
@@ -671,8 +1050,12 @@ mod tests {
         assert!(why("$.a[::0]").contains("step of zero"));
         assert!(why("$.a[1:2:3:4]").contains("at most a start"));
         assert!(why("$a").contains("does not start with"));
-        assert!(why("$.a[?(@.b > 1)]").contains("is not read yet"));
         assert!(why("$.a[x]").contains("at byte "));
+        assert!(why("$.a[?(@.b > 1]").contains("no `)`"));
+        assert!(why("$.a[?(@.b >)]").contains("where a value goes"));
+        assert!(why("$.a[?(@.b > 1) 2]").contains("left over"));
+        assert!(why("$.a[?(@.b == nope)]").contains("not a value"));
+        assert!(why("$.a[?]").contains("where a value was expected"));
     }
 
     #[test]
@@ -698,5 +1081,201 @@ mod tests {
         p.select(&Value::new(&two).expect("readable"), &mut hits);
         let got: Vec<i64> = hits.iter().filter_map(Value::as_int).collect();
         assert_eq!(got, [1, 2]);
+    }
+
+    /// One member per type a `p` can be, each with a name that says which, so
+    /// that an answer reads as the list of types that survived rather than as a
+    /// list of values.
+    ///
+    /// The last one has no `p` at all, which is the case most of the operators
+    /// treat differently from the rest.
+    fn types() -> Vec<u8> {
+        from_json(
+            br#"[{"p":1,"id":"i"},{"p":2.5,"id":"f"},{"p":"s","id":"t"},
+                 {"p":null,"id":"n"},{"p":false,"id":"b"},{"p":[1],"id":"a"},
+                 {"p":{"x":1},"id":"o"},{"q":9,"id":"m"}]"#,
+        )
+        .expect("the text parses")
+    }
+
+    /// The ids of the members of [`types`] a filter keeps, as one string.
+    fn kept(filter: &str) -> String {
+        let d = types();
+        ask(&d, &format!("$[?{filter}].id"))
+            .replace(['[', ']', '"'], "")
+            .replace(',', "")
+    }
+
+    #[test]
+    fn a_filter_keeps_the_children_its_expression_is_true_of() {
+        let d = doc();
+        assert_eq!(ask(&d, "$.store.book[?(@.price < 10)].title"), r#"["a"]"#);
+        assert_eq!(ask(&d, "$.store.book[?(@.price > 10)].title"), r#"["b"]"#);
+        // `$` inside a filter is the whole document rather than the member, so a
+        // member can be compared against something somewhere else entirely.
+        assert_eq!(
+            ask(&d, "$.store.book[?(@.price < $.expensive)].title"),
+            r#"["a"]"#
+        );
+        // The parentheses are a group like any other, so leaving them out and
+        // padding them with spaces both read the same.
+        assert_eq!(ask(&d, "$.store.book[?@.price<10].title"), r#"["a"]"#);
+        assert_eq!(ask(&d, "$.store.book[? (@.price < 10) ].title"), r#"["a"]"#);
+    }
+
+    /// An ordering comparison only arises between two values of the same sort,
+    /// and where it does not arise the answer is no.
+    #[test]
+    fn ordering_is_within_a_type_and_not_across_one() {
+        assert_eq!(kept("(@.p < 2)"), "i");
+        assert_eq!(kept("(@.p > 2)"), "f");
+        assert_eq!(kept("(@.p >= 1)"), "if");
+        assert_eq!(kept("(@.p <= 2.5)"), "if");
+        // Strings order by their characters, and a string is not below a number
+        // however the two would sort if they were written out.
+        assert_eq!(kept(r#"(@.p > "")"#), "t");
+        assert_eq!(kept(r#"(@.p < "s")"#), "");
+        assert_eq!(kept(r#"(@.p <= "s")"#), "t");
+        assert_eq!(kept(r#"(@.p > "1")"#), "t");
+        assert_eq!(kept(r#"(@.p < "1")"#), "");
+        // `false` is below `true`, and two nulls are equal without either being
+        // below the other.
+        assert_eq!(kept("(@.p > false)"), "");
+        assert_eq!(kept("(@.p >= false)"), "b");
+        assert_eq!(kept("(@.p < true)"), "b");
+        assert_eq!(kept("(@.p > null)"), "");
+        assert_eq!(kept("(@.p >= null)"), "n");
+        // An array and an object have no order at all, so even an equal one is
+        // not below or above itself.
+        assert_eq!(kept("(@.p >= [1])"), "");
+        assert_eq!(kept("(@.p <= [1])"), "");
+        assert_eq!(kept(r#"(@.p >= {"x":1})"#), "");
+        assert_eq!(kept("(@.p > [])"), "");
+        assert_eq!(kept("(@.p > {})"), "");
+    }
+
+    /// Equality is the whole value, and the only line it crosses is the one
+    /// between the two ways a number is held.
+    #[test]
+    fn equality_crosses_the_number_split_and_no_other() {
+        assert_eq!(kept("(@.p == 1)"), "i");
+        assert_eq!(kept("(@.p == 1.0)"), "i");
+        assert_eq!(kept("(@.p == 2.5)"), "f");
+        assert_eq!(kept(r#"(@.p == "s")"#), "t");
+        assert_eq!(kept("(@.p == null)"), "n");
+        assert_eq!(kept("(@.p == false)"), "b");
+        assert_eq!(kept("(@.p == [1])"), "a");
+        assert_eq!(kept(r#"(@.p == {"x":1})"#), "o");
+        // A zero is not a false, a one is not a `"1"`, and an array of one is
+        // not the thing it holds.
+        assert_eq!(kept("(@.p == 0)"), "");
+        assert_eq!(kept(r#"(@.p == "1")"#), "");
+        assert_eq!(kept("(@.p == [2])"), "");
+        assert_eq!(kept(r#"(@.p == {"x":2})"#), "");
+    }
+
+    /// `!=` negates the comparison rather than being one, which is the whole
+    /// difference: a member with no `p` satisfies it and satisfies nothing else.
+    #[test]
+    fn not_equal_is_the_negation_of_the_whole_comparison() {
+        assert_eq!(kept("(@.p != 1)"), "ftnbaom");
+        assert_eq!(kept("(@.p != 9)"), "iftnbaom");
+        // Two sides that both answer nothing are equal to nothing, so this keeps
+        // every member and its opposite keeps none.
+        assert_eq!(kept("(@.zz == @.yy)"), "");
+        assert_eq!(kept("(@.zz != @.yy)"), "iftnbaom");
+    }
+
+    /// An operand on its own asks whether the document has it, so a `p` that is
+    /// there is true whatever it holds.
+    #[test]
+    fn a_bare_operand_asks_whether_it_is_there() {
+        assert_eq!(kept("(@.p)"), "iftnbao");
+        assert_eq!(kept("(!@.p)"), "m");
+        assert_eq!(kept("!@.p"), "m");
+        assert_eq!(kept("(@.q)"), "m");
+        // A literal is itself, and the only one that is false is the one that
+        // says so.
+        assert_eq!(kept("(false)"), "");
+        assert_eq!(kept("(0)"), "iftnbaom");
+        assert_eq!(kept(r#"("")"#), "iftnbaom");
+        assert_eq!(kept("(null)"), "iftnbaom");
+        assert_eq!(kept("(true)"), "iftnbaom");
+    }
+
+    #[test]
+    fn and_binds_tighter_than_or() {
+        // Read the other way round this would keep nothing, because no member is
+        // both an `i` and dearer than a hundred.
+        assert_eq!(kept(r#"(@.id == "i" || @.id == "f" && @.p > 100)"#), "i");
+        assert_eq!(kept(r#"(@.id == "i" && @.p == 1 || @.id == "t")"#), "it");
+        assert_eq!(kept(r#"((@.id == "i" || @.id == "f") && @.p > 2)"#), "f");
+        assert_eq!(kept(r#"(!(@.id == "i") && @.p == 2.5)"#), "f");
+    }
+
+    /// A path answers a set, so a comparison asks whether any pair out of the
+    /// two sets satisfies it.
+    #[test]
+    fn a_comparison_holds_when_any_pair_of_answers_does() {
+        let d = from_json(br#"[{"t":["x","y"]},{"t":["z"]},{"t":[]}]"#).expect("parses");
+        assert_eq!(ask(&d, r#"$[?(@.t[*] == "y")].t"#), r#"[["x","y"]]"#);
+        assert_eq!(ask(&d, r#"$[?(@.t[*] == "q")].t"#), "[]");
+        // An empty set satisfies nothing, and `!=` is the one operator that
+        // reads that as true.
+        assert_eq!(ask(&d, r#"$[?(@.t[*] != "z")].t"#), r#"[["x","y"],[]]"#);
+        // A path under `@` is a path like any other, `*` and `..` included.
+        assert_eq!(kept("(@..x == 1)"), "o");
+        // `[*]` is every child of a container and an object is a container, so
+        // the object whose only member is a one is kept alongside the array.
+        assert_eq!(kept("(@.p[*] == 1)"), "ao");
+    }
+
+    #[test]
+    fn a_pattern_is_unanchored_and_minds_its_case() {
+        assert_eq!(kept(r#"(@.p =~ "s")"#), "t");
+        assert_eq!(kept(r#"(@.p =~ "^s$")"#), "t");
+        assert_eq!(kept(r#"(@.p =~ "S")"#), "");
+        assert_eq!(kept(r#"(@.p =~ "^x")"#), "");
+        // A pattern that is not a string, and a pattern that is not a pattern,
+        // both answer no rather than refusing the path.
+        assert_eq!(kept("(@.p =~ 1)"), "");
+        assert_eq!(kept("(@.p =~ null)"), "");
+        assert_eq!(kept(r#"(@.p =~ "[")"#), "");
+    }
+
+    /// A filter walks the children of whatever it is applied to, and an object
+    /// has children too.
+    #[test]
+    fn a_filter_reads_an_object_the_same_way_it_reads_an_array() {
+        let d = from_json(br#"{"one":{"p":1},"two":{"p":9}}"#).expect("parses");
+        assert_eq!(ask(&d, "$[?(@.p < 5)]"), r#"[{"p":1}]"#);
+        assert_eq!(ask(&d, "$.*[?(@.p < 5)]"), "[]");
+        // Nothing that is not a container has children, so a filter over one
+        // answers nothing rather than answering it.
+        let flat = from_json(br#"[1,"a",null]"#).expect("parses");
+        assert_eq!(ask(&flat, "$[*][?(@.p)]"), "[]");
+    }
+
+    /// A filter is a selector, so it composes with the rest of them and a path
+    /// can go on after it or hold more than one.
+    #[test]
+    fn a_filter_is_a_selector_like_the_others() {
+        let d = from_json(
+            br#"{"runs":[{"ok":true,"steps":[{"ms":9},{"ms":31}]},
+                        {"ok":false,"steps":[{"ms":2}]}]}"#,
+        )
+        .expect("parses");
+        assert_eq!(
+            ask(&d, "$.runs[?(@.ok == true)].steps[?(@.ms > 10)].ms"),
+            "[31]"
+        );
+        assert_eq!(ask(&d, "$..steps[?(@.ms < 10)].ms"), "[9,2]");
+        // A filter is not one place, so it is not somewhere a value can be
+        // grown, which is what `JSON.SET` asks about.
+        assert!(
+            !Path::parse(b"$.runs[?(@.ok)]")
+                .expect("parses")
+                .is_definite()
+        );
     }
 }

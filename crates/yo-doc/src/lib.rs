@@ -99,6 +99,7 @@
 mod build;
 mod docs;
 pub mod edit;
+mod filter;
 mod head;
 mod index;
 mod keys;
