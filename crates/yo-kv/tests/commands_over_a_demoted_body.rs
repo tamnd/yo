@@ -6,8 +6,9 @@
 //! `SCARD`, `SISMEMBER`, `SADD`, `SMEMBERS` and the set algebra with the members
 //! it had, in the representation it had them in, the hash answers `HGET`, `HLEN`
 //! and the `HEXPIRE` family the same way, the list answers `LLEN`, `LINDEX` and
-//! a push at either end, and the sorted set answers `ZSCORE` and `ZRANK` with
-//! the order it went out in.
+//! a push at either end, the sorted set answers `ZSCORE` and `ZRANK` with the
+//! order it went out in, and the array answers `ARGET` and `ARINFO` with the
+//! values and the shape it had.
 //!
 //! The store is a vector that counts its reads, as in the string file and for
 //! the same reason: reads per command is what G9 is a gate on, and a set that
@@ -20,7 +21,7 @@ use yo_common::{Addr, Code, Error, Result, Space};
 use yo_kv::cold::Blocks;
 use yo_kv::ttl::{Ask, Cond};
 use yo_kv::zsets::{Query, ZAdd};
-use yo_kv::{End, Keyspace, hash, list, set, zset};
+use yo_kv::{End, Keyspace, array, hash, list, set, zset};
 
 /// A store that remembers how many times it was read.
 struct Mem {
@@ -151,6 +152,33 @@ fn zrange(k: &mut Keyspace, key: &[u8], q: &Query<'_>) -> Vec<Vec<u8>> {
     })
     .expect("walked");
     out
+}
+
+/// A database holding `key` as an array with `n` values in it, one every
+/// seventh index so the slices are sparse, already on the file.
+fn cold_array(key: &[u8], n: u64) -> (Keyspace, Rc<Cell<usize>>) {
+    let (mut k, reads) = db();
+    for i in 0..n {
+        let val = format!("value:{i:05} and long enough to reach the blob").into_bytes();
+        k.arset(key, i * 7, [val.as_slice()].into_iter())
+            .expect("set");
+    }
+    assert!(k.demote(key).expect("demoted"), "the body should have gone");
+    reads.set(0);
+    (k, reads)
+}
+
+/// What `ARGET` answers, as bytes.
+fn arget(k: &mut Keyspace, key: &[u8], at: u64) -> Option<Vec<u8>> {
+    let mut got = None;
+    k.arget_into(key, [at].into_iter(), |e| {
+        got = e.map(|v| {
+            let mut buf = [0u8; array::ELEMENT_MAX];
+            v.text(&mut buf).to_vec()
+        });
+    })
+    .expect("asked");
+    got
 }
 
 /// What `HGET` answers, as bytes.
@@ -657,6 +685,96 @@ fn dumping_and_restoring_a_demoted_sorted_set_gives_the_same_one_back() {
 }
 
 #[test]
+fn a_demoted_array_answers_arlen_arcount_and_arget_with_what_it_held() {
+    let (mut k, _) = cold_array(b"a", 300);
+    assert_eq!(k.arcount(b"a").expect("counted"), 300);
+    assert_eq!(k.arlen(b"a").expect("measured"), 299 * 7 + 1);
+    for i in [0u64, 1, 42, 299] {
+        assert_eq!(
+            arget(&mut k, b"a", i * 7),
+            Some(format!("value:{i:05} and long enough to reach the blob").into_bytes()),
+            "index {i}"
+        );
+    }
+    assert_eq!(arget(&mut k, b"a", 1), None, "and a hole is still a hole");
+}
+
+#[test]
+fn bringing_an_array_back_costs_one_pass_and_then_nothing() {
+    let (mut k, reads) = cold_array(b"a", 300);
+    assert_eq!(k.arcount(b"a").expect("counted"), 300);
+    let first = reads.get();
+    assert!(first > 0, "the body was on the file");
+    for _ in 0..50 {
+        k.arcount(b"a").expect("counted");
+        arget(&mut k, b"a", 49);
+    }
+    assert_eq!(reads.get(), first, "nothing went back to the device");
+}
+
+#[test]
+fn a_demoted_array_can_be_written_to_and_the_new_value_stays() {
+    let (mut k, _) = cold_array(b"a", 300);
+    assert_eq!(
+        k.arset(b"a", 1, [b"in a hole".as_slice()].into_iter())
+            .expect("set"),
+        1
+    );
+    assert_eq!(
+        k.arset(b"a", 0, [b"over the top".as_slice()].into_iter())
+            .expect("set"),
+        0,
+        "an overwrite does not fill a new position"
+    );
+    assert_eq!(k.arcount(b"a").expect("counted"), 301);
+    assert_eq!(arget(&mut k, b"a", 1), Some(b"in a hole".to_vec()));
+    assert_eq!(arget(&mut k, b"a", 0), Some(b"over the top".to_vec()));
+    assert_eq!(
+        arget(&mut k, b"a", 7),
+        Some(b"value:00001 and long enough to reach the blob".to_vec())
+    );
+}
+
+#[test]
+fn a_demoted_array_keeps_the_shape_arinfo_reports() {
+    let (mut k, _) = db();
+    // Consecutive indices, which is what makes a slice dense.
+    for i in 0..300u64 {
+        k.arset(b"a", i, [b"x".as_slice()].into_iter())
+            .expect("set");
+    }
+    let was = k.arinfo(b"a", true).expect("asked");
+    assert!(was.dense_slices > 0, "consecutive writes make a window");
+    assert!(k.demote(b"a").expect("demoted"));
+    let now = k.arinfo(b"a", true).expect("asked");
+    assert_eq!(now.count, was.count);
+    assert_eq!(now.len, was.len);
+    assert_eq!(now.slices, was.slices);
+    assert_eq!(
+        now.dense_slices, was.dense_slices,
+        "and it is still a window"
+    );
+    assert_eq!(now.sparse_slices, was.sparse_slices);
+}
+
+#[test]
+fn deleting_a_demoted_array_does_not_free_somebody_elses_slab_slot() {
+    let (mut k, _) = cold_array(b"cold", 300);
+    for i in 0..300u64 {
+        let val = format!("value:{i:05} and long enough to reach the blob").into_bytes();
+        k.arset(b"warm", i * 7, [val.as_slice()].into_iter())
+            .expect("set");
+    }
+    k.del(b"cold");
+    assert_eq!(k.arcount(b"warm").expect("counted"), 300);
+    assert_eq!(
+        arget(&mut k, b"warm", 294),
+        Some(b"value:00042 and long enough to reach the blob".to_vec())
+    );
+    assert_eq!(k.arcount(b"cold").expect("counted"), 0);
+}
+
+#[test]
 fn a_sweep_moves_collection_bodies_and_the_memory_goes_down() {
     let (mut k, _) = db();
     let pairs = fields(200);
@@ -682,6 +800,11 @@ fn a_sweep_moves_collection_bodies_and_the_memory_goes_down() {
             ZAdd::default(),
         )
         .expect("added");
+        let key = format!("array:{i}");
+        for (at, (_, m)) in ranked.iter().enumerate() {
+            k.arset(key.as_bytes(), at as u64 * 7, [m.as_slice()].into_iter())
+                .expect("set");
+        }
     }
     let before = k.memory_bytes();
     let relief = k.relieve(usize::MAX).expect("swept");
@@ -703,6 +826,8 @@ fn a_sweep_moves_collection_bodies_and_the_memory_goes_down() {
         assert_eq!(k.llen(key.as_bytes()).expect("counted"), 60, "{key}");
         let key = format!("zset:{i}");
         assert_eq!(k.zcard(key.as_bytes()).expect("counted"), 200, "{key}");
+        let key = format!("array:{i}");
+        assert_eq!(k.arcount(key.as_bytes()).expect("counted"), 200, "{key}");
     }
 }
 
