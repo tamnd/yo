@@ -40,10 +40,10 @@ impl Blocks for LogBlocks {
     }
 
     fn bytes(&self) -> u64 {
-        // How far the log has got, which is what it occupies. The tail can be a
-        // little ahead of this between a write and its flush, and a storage
-        // limit that is a page out is a storage limit that is close enough.
-        self.log.durable_upto()
+        // From the oldest address the log still holds to where the next append
+        // goes, which is what it occupies. Not how far the writes have got,
+        // which is a page behind for as long as the tail page is filling up.
+        self.log.tail().saturating_sub(self.log.begin())
     }
 }
 

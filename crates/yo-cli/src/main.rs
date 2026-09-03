@@ -16,6 +16,7 @@ mod check;
 mod poll;
 mod serve;
 mod signal;
+mod store;
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -29,6 +30,7 @@ yodb, an embedded knowledge engine
 usage:
   yodb check FILE [--quick] [--quiet]
   yodb serve [--bind ADDR] [--port PORT] [--unixsocket PATH] [--no-port]
+             [--store PATH --maxmemory BYTES]
 
   check    read a .yo file and report anything wrong with it. Never writes.
              --quick   skip the records and read only the headers
@@ -41,6 +43,16 @@ usage:
                            TCP stack and is the faster way in for a client
                            on the same machine
              --no-port     no TCP at all, socket file only
+             --maxmemory   how much memory to use before something has to
+                           go, in the units CONFIG SET takes, so 100mb is
+                           a hundred mebibytes and 100m is a hundred
+                           million. No limit by default
+             --store       a file to put cold values in when memory fills
+                           up, instead of throwing keys away. The path has
+                           to be a new one, because what a previous run
+                           left in a store is reachable only through an
+                           index that died with it. Needs --maxmemory,
+                           since a server with no limit never fills up
 
 environment:
   YO_ALLOC  what to do when a command path allocates. off by default, which
@@ -211,6 +223,8 @@ fn serve_command(args: &[&str]) -> ExitCode {
     let mut port = DEFAULT_PORT;
     let mut unixsocket: Option<std::path::PathBuf> = None;
     let mut tcp = true;
+    let mut store: Option<std::path::PathBuf> = None;
+    let mut maxmemory: Option<u64> = None;
 
     let mut at = 0;
     while at < args.len() {
@@ -222,7 +236,7 @@ fn serve_command(args: &[&str]) -> ExitCode {
                 return ExitCode::SUCCESS;
             }
             "--no-port" => tcp = false,
-            "--bind" | "--port" | "--unixsocket" => {
+            "--bind" | "--port" | "--unixsocket" | "--store" | "--maxmemory" => {
                 let Some(value) = args.get(at) else {
                     eprintln!("yodb serve: {arg} needs a value");
                     return ExitCode::from(2);
@@ -232,6 +246,18 @@ fn serve_command(args: &[&str]) -> ExitCode {
                     bind = (*value).to_string();
                 } else if arg == "--unixsocket" {
                     unixsocket = Some(std::path::PathBuf::from(*value));
+                } else if arg == "--store" {
+                    store = Some(std::path::PathBuf::from(*value));
+                } else if arg == "--maxmemory" {
+                    // The parser `CONFIG SET maxmemory` uses, so that the two
+                    // ways of setting the same limit read it the same way.
+                    match yo_resp::dispatch::parse_memory(value.as_bytes()) {
+                        Some(n) => maxmemory = Some(n),
+                        None => {
+                            eprintln!("yodb serve: {value} is not an amount of memory");
+                            return ExitCode::from(2);
+                        }
+                    }
                 } else {
                     match value.parse() {
                         Ok(p) => port = p,
@@ -257,6 +283,24 @@ fn serve_command(args: &[&str]) -> ExitCode {
         eprintln!("yodb serve: --no-port with no --unixsocket leaves nothing to connect to");
         return ExitCode::from(2);
     }
+    if store.is_some() && maxmemory.is_none() {
+        eprintln!("yodb serve: --store with no --maxmemory is a file nothing would ever be put in");
+        return ExitCode::from(2);
+    }
+
+    // Before the listener, because a file that cannot be made should not leave a
+    // port bound behind it, and because failing here is a mistyped path and the
+    // person who typed it is still watching.
+    let opened = match &store {
+        Some(path) => match store::Store::create(path) {
+            Ok(s) => Some(s),
+            Err(e) => {
+                eprintln!("yodb serve: {}: {e}", path.display());
+                return ExitCode::from(2);
+            }
+        },
+        None => None,
+    };
 
     let want = if tcp { Some(addr) } else { None };
     let mut server = match serve::Server::open(want, unixsocket.clone()) {
@@ -266,6 +310,12 @@ fn serve_command(args: &[&str]) -> ExitCode {
             return ExitCode::from(2);
         }
     };
+    if let Some(limit) = maxmemory {
+        server.set_maxmemory(limit);
+    }
+    if let Some(opened) = opened {
+        server.use_store(opened);
+    }
 
     // What it actually bound to, which is the only way to find out when the
     // port asked for was zero.
@@ -300,6 +350,18 @@ fn serve_command(args: &[&str]) -> ExitCode {
             bytes(cap.budget())
         ),
         None => println!("yodb {version} found no memory limit to size pools from"),
+    }
+
+    // Which of the two things a memory limit means here, said out loud at
+    // startup, because they are opposites and the difference is a file.
+    match (&store, maxmemory) {
+        (Some(path), Some(limit)) => println!(
+            "yodb {version} keeps {} in memory and moves the rest into {}",
+            bytes(limit),
+            path.display()
+        ),
+        (None, Some(limit)) => println!("yodb {version} evicts keys above {}", bytes(limit)),
+        (_, None) => {}
     }
 
     // After the listening line and not before it, so a Ctrl-C that arrives in

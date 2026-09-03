@@ -74,10 +74,12 @@ mod zsets;
 
 pub use args::Args;
 pub use blocking::{Parked, Waiters};
+pub use server::parse_memory;
 pub use table::{COMMANDS, Spec, arity_ok, lookup};
 
 use crate::reply::Out;
 use yo_common::{Code, Error};
+use yo_kv::cold::Blocks;
 use yo_kv::{Clock, Keyspace};
 
 /// How many databases a server has.
@@ -202,6 +204,13 @@ impl CommandStats {
     }
 }
 
+/// Where a database gets its store from, asked by database number.
+///
+/// `None` means that database cannot have one. The caller owns whatever the
+/// stores are cut out of, which for `yodb` is one `.yo` file with a log per
+/// database, and this crate never learns what any of that is.
+pub type StoreSource = dyn FnMut(usize) -> Option<Box<dyn Blocks>>;
+
 /// Everything a server holds.
 ///
 /// One of these per shard thread, not one per process: the databases inside are
@@ -232,6 +241,17 @@ pub struct Server {
     /// Zero is the default and it is the whole reason the check in front of
     /// every write is one comparison against a field that is already warm.
     maxmemory: u64,
+    /// Where a database gets a store from the first time it needs one.
+    ///
+    /// A closure and not a store, because there are sixteen databases and a
+    /// server that fills memory on database zero should not have opened
+    /// anything for the other fifteen. Nothing is asked of this until a memory
+    /// limit is actually reached, so a server that never fills memory never
+    /// opens a file, and a server that has no file never has one of these.
+    ///
+    /// `None` from the closure means that database cannot have one, which is
+    /// how the caller says the file it opened has no more room for logs.
+    store: Option<Box<StoreSource>>,
     /// The `maxstore` limit in bytes, `None` when there is not one.
     ///
     /// The storage limit, and the other half of the inversion `14` section 4.1
@@ -304,6 +324,7 @@ impl Server {
             dirty: ALL_DATABASES,
             conn_bytes: 0,
             maxmemory: 0,
+            store: None,
             maxstore: None,
             used: 0,
             evict_db: 0,
@@ -329,6 +350,7 @@ impl Server {
             dirty: ALL_DATABASES,
             conn_bytes: 0,
             maxmemory: 0,
+            store: None,
             maxstore: None,
             used: 0,
             evict_db: 0,
@@ -525,6 +547,46 @@ impl Server {
         self.used = self.settled_memory();
     }
 
+    /// Say where a database should get its store from when it needs one.
+    ///
+    /// This is what turns the eviction inversion on. Until it is called every
+    /// database answers a memory limit by evicting, which is Redis, and after it
+    /// is called a database under memory pressure moves values to whatever the
+    /// closure hands back instead of throwing keys away.
+    ///
+    /// Called at most once per database and only under pressure, so a server
+    /// that is given a file and never fills memory never touches it.
+    pub fn set_store_source(
+        &mut self,
+        source: impl FnMut(usize) -> Option<Box<dyn Blocks>> + 'static,
+    ) {
+        self.store = Some(Box::new(source));
+    }
+
+    /// Whether this server has been given somewhere to put cold values.
+    #[must_use]
+    pub const fn has_store_source(&self) -> bool {
+        self.store.is_some()
+    }
+
+    /// Open database `at`'s store, if it has not got one and there is one to be
+    /// had.
+    ///
+    /// A store that will not open leaves the database where it was, which is
+    /// evicting, because a memory limit that cannot be answered by moving data
+    /// still has to be answered.
+    fn attach_store(&mut self, at: usize) {
+        if self.dbs[at].store_bytes().is_some() {
+            return;
+        }
+        let Some(source) = self.store.as_mut() else {
+            return;
+        };
+        if let Some(blocks) = source(at) {
+            self.dbs[at].attach(blocks);
+        }
+    }
+
     /// The `maxstore` limit in bytes, `None` when there is not one.
     #[must_use]
     pub const fn maxstore(&self) -> Option<u64> {
@@ -569,17 +631,24 @@ impl Server {
     /// file rather than by throwing keys away.
     ///
     /// Three things have to hold. There has to be somewhere to move them, which
-    /// is a store attached to that database, and until the file work attaches
-    /// one this is false everywhere and every server behaves exactly as it did.
+    /// is a store attached to that database or a source that can open one, and
+    /// on a server that was never given a file this is false everywhere and
+    /// every database behaves exactly as it did.
     /// The storage budget has to be more than nothing, which is what
     /// `maxstore 0` says it is not. And the file has to be under that budget,
     /// because a full file is a storage limit reached and eviction is the right
     /// answer to a storage limit.
     fn migrates(&self, at: usize) -> bool {
-        let Some(held) = self.dbs[at].store_bytes() else {
+        if self.maxstore == Some(0) {
             return false;
-        };
-        self.maxstore.is_none_or(|cap| held < cap)
+        }
+        match self.dbs[at].store_bytes() {
+            Some(held) => self.maxstore.is_none_or(|cap| held < cap),
+            // Nothing attached, but somewhere to get one from the moment this
+            // database needs it, which is what makes the answer yes rather than
+            // no. Opening it here would mean `INFO` opened files.
+            None => self.store.is_some(),
+        }
     }
 
     /// Take a fresh memory reading, which the maintenance turn does once a batch.
@@ -683,7 +752,10 @@ impl Server {
     fn relieve_step(&mut self, over: usize) -> bool {
         for turn in 0..self.dbs.len() {
             let i = (self.evict_db + turn) % self.dbs.len();
-            let gave = if self.migrates(i) {
+            // An empty database has nothing to move and opening a log for one
+            // would cost a resident page window to find that out.
+            let gave = if !self.dbs[i].is_empty() && self.migrates(i) {
+                self.attach_store(i);
                 self.dbs[i].relieve(over).unwrap_or(0) > 0
             } else {
                 self.dbs[i].evict_one()

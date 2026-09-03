@@ -60,6 +60,7 @@ use yo_reactor::Reactor;
 use yo_resp::engine::{Cmd, ConnId, Sink, Wire, pump};
 
 use crate::poll::Poller;
+use crate::store::Store;
 
 /// How much is read off one connection at a time.
 ///
@@ -382,6 +383,28 @@ impl Server {
         })
     }
 
+    /// How much memory the server may use before something has to go.
+    pub fn set_maxmemory(&mut self, bytes: u64) {
+        self.reactor.engine_mut().server_mut().set_maxmemory(bytes);
+    }
+
+    /// Give the engine a file to move cold values into when it hits that limit.
+    ///
+    /// With a file under it a memory limit stops meaning "delete keys" and
+    /// starts meaning "keep the working set in memory", which is `14` section
+    /// 4.1 and is the whole point of the thing. Without one the same limit
+    /// evicts, which is Redis and is what every server did before this existed.
+    ///
+    /// A log is only opened for a database that actually comes under pressure,
+    /// so a server that is given a file and never fills memory writes nothing to
+    /// it and pays nothing for having been offered one.
+    pub fn use_store(&mut self, store: Store) {
+        self.reactor
+            .engine_mut()
+            .server_mut()
+            .set_store_source(store.source());
+    }
+
     /// Where it actually landed, which is the only way to find out when the
     /// port asked for was zero.
     ///
@@ -602,6 +625,49 @@ mod tests {
         }
     }
 
+    /// The same harness, for a server that was given a file and a limit.
+    ///
+    /// The path goes away with the test whichever way it ends, because a leftover
+    /// from a failed run is what makes the next run fail for a different reason.
+    fn served_with_store(name: &str, client: impl FnOnce(SocketAddr) + Send + 'static) {
+        struct Tmp(PathBuf);
+        impl Drop for Tmp {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_file(&self.0);
+            }
+        }
+        let mut path = std::env::temp_dir();
+        path.push(format!("yodb-test-{name}-{}.yo", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let path = Tmp(path);
+
+        let mut server = Server::open(
+            Some("127.0.0.1:0".parse().expect("a literal address")),
+            None,
+        )
+        .expect("a free port");
+        // Small enough that the test reaches it by writing rather than by
+        // waiting, and large enough to be a limit this store can hold to: space
+        // comes back a two megabyte segment at a time, so a limit of one or two
+        // is a limit nothing can get under.
+        server.set_maxmemory(8 * 1024 * 1024);
+        server.use_store(Store::create(&path.0).expect("a fresh file"));
+
+        let addr = server.local_addr().expect("bound");
+        let stop = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&stop);
+
+        let thread = std::thread::spawn(move || {
+            let _stopper = Stopper(flag);
+            client(addr);
+        });
+
+        server.run(&stop).expect("the listener stays up");
+        if let Err(panic) = thread.join() {
+            std::panic::resume_unwind(panic);
+        }
+    }
+
     /// A client with a timeout on it, so a reply that never comes fails the
     /// test instead of hanging it.
     fn connect(addr: SocketAddr) -> TcpStream {
@@ -721,6 +787,132 @@ mod tests {
                 .expect("sent");
             assert_eq!(read_exact(&mut client, 11), b"$5\r\nvalue\r\n");
         });
+    }
+
+    /// A server with a file under it, doing the thing the file is for.
+    ///
+    /// Thirty two megabytes of values into an eight megabyte server, over a real
+    /// socket. Redis answers that by deleting most of them and this answers it by
+    /// moving them into the file, so the test is that every key is still there
+    /// and that the file is not empty. It is the only end to end check of `14`
+    /// section 4.1 there is, because every layer under it can be tested with a
+    /// store made of a vector and none of that proves a `.yo` file was ever
+    /// opened.
+    ///
+    /// Four thousand keys of eight kilobytes and not forty thousand of one,
+    /// because what goes to the file is the value and what stays behind is the
+    /// key, its index entry and the record that says where the value went. That
+    /// floor is per key and it does not move, so a key count whose floor is
+    /// already over the limit is a server that cannot get under it however much
+    /// it demotes, and the honest answer to that is the OOM it gives.
+    #[test]
+    fn a_server_with_a_file_moves_values_into_it_rather_than_losing_them() {
+        const KEYS: usize = 4_000;
+        const LEN: usize = 8 * 1024;
+        const BATCH: usize = 100;
+
+        served_with_store("demote", |addr| {
+            let mut client = connect(addr);
+            let value = vec![b'v'; LEN];
+
+            // Pipelined in batches rather than one at a time, because four
+            // thousand round trips is four thousand times the socket latency
+            // and this test is not about the socket.
+            let mut at = 0;
+            while at < KEYS {
+                let upto = (at + BATCH).min(KEYS);
+                let mut sent = Vec::new();
+                for i in at..upto {
+                    sent.extend_from_slice(&cmd(&[b"SET", format!("k{i}").as_bytes(), &value]));
+                }
+                client.write_all(&sent).expect("sent");
+                assert_eq!(
+                    read_exact(&mut client, 5 * (upto - at)),
+                    b"+OK\r\n".repeat(upto - at),
+                    "a write was refused, so the file did not make room for it"
+                );
+                at = upto;
+            }
+
+            // Every one of them, not a sample, because the failure this is
+            // looking for is a handful of keys that quietly went away.
+            let one = {
+                let mut w = format!("${LEN}\r\n").into_bytes();
+                w.extend_from_slice(&value);
+                w.extend_from_slice(b"\r\n");
+                w
+            };
+            let mut at = 0;
+            while at < KEYS {
+                let upto = (at + BATCH).min(KEYS);
+                let mut sent = Vec::new();
+                for i in at..upto {
+                    sent.extend_from_slice(&cmd(&[b"GET", format!("k{i}").as_bytes()]));
+                }
+                client.write_all(&sent).expect("sent");
+                assert_eq!(
+                    read_exact(&mut client, one.len() * (upto - at)),
+                    one.repeat(upto - at),
+                    "a key between k{at} and k{upto} did not come back"
+                );
+                at = upto;
+            }
+
+            let memory = info(&mut client, "memory");
+            let held: u64 = field(&memory, "yo_store_bytes").parse().expect("a number");
+            assert!(held > 0, "nothing reached the file\n{memory}");
+            assert_eq!(field(&memory, "yo_memory_regime"), "migrate", "{memory}");
+
+            // The count as well as the reads, because a key that answers is one
+            // key and this says none of the other ones were dropped on the way.
+            let stats = info(&mut client, "stats");
+            assert_eq!(field(&stats, "evicted_keys"), "0", "keys were thrown away");
+            client.write_all(&cmd(&[b"DBSIZE"])).expect("sent");
+            assert_eq!(
+                read_exact(&mut client, format!(":{KEYS}\r\n").len()),
+                format!(":{KEYS}\r\n").into_bytes()
+            );
+        });
+    }
+
+    /// One command, encoded the way a client sends it.
+    fn cmd(parts: &[&[u8]]) -> Vec<u8> {
+        let mut out = format!("*{}\r\n", parts.len()).into_bytes();
+        for p in parts {
+            out.extend_from_slice(format!("${}\r\n", p.len()).as_bytes());
+            out.extend_from_slice(p);
+            out.extend_from_slice(b"\r\n");
+        }
+        out
+    }
+
+    /// `INFO section`, read back as the text of the bulk string.
+    fn info(stream: &mut TcpStream, section: &str) -> String {
+        stream
+            .write_all(&cmd(&[b"INFO", section.as_bytes()]))
+            .expect("sent");
+        let mut header = Vec::new();
+        loop {
+            let mut b = [0u8; 1];
+            stream.read_exact(&mut b).expect("the reply arrives");
+            if b[0] == b'\n' {
+                break;
+            }
+            header.push(b[0]);
+        }
+        let len: usize = String::from_utf8_lossy(&header[1..header.len() - 1])
+            .parse()
+            .expect("a bulk length");
+        let body = read_exact(stream, len + 2);
+        String::from_utf8_lossy(&body[..len]).into_owned()
+    }
+
+    /// One `name:value` line out of an `INFO` section.
+    fn field<'a>(info: &'a str, name: &str) -> &'a str {
+        info.lines()
+            .find_map(|l| l.strip_prefix(name)?.strip_prefix(':'))
+            .unwrap_or_else(|| panic!("no {name} in\n{info}"))
+            .trim_end()
     }
 
     /// A client that goes away without saying `QUIT`, which is what every
