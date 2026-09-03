@@ -866,6 +866,8 @@ dependencies = [
  "yo-common",
  "yo-format",
  "yo-kv",
+ "yo-shape",
+ "yo-vector",
 ]
 
 [[package]]

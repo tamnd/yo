@@ -24,6 +24,8 @@ pub struct Field {
     pub id: bool,
     /// The `IndexKind` variant this field asked for, if it asked for one.
     pub kind: Option<&'static str>,
+    /// How wide the embedding at this field is, if it asked for a vector index.
+    pub vector: Option<usize>,
 }
 
 /// A struct with named fields.
@@ -113,6 +115,7 @@ fn fields(body: TokenStream) -> Result<Vec<Field>, String> {
             elem,
             id: false,
             kind: None,
+            vector: None,
         };
         for mark in marks {
             apply(&mut field, &mark)?;
@@ -124,6 +127,28 @@ fn fields(body: TokenStream) -> Result<Vec<Field>, String> {
 }
 
 fn apply(field: &mut Field, mark: &str) -> Result<(), String> {
+    if let Some(width) = mark.strip_prefix("vector=") {
+        let dim = width.parse::<usize>().map_err(|_| {
+            format!(
+                "the field {} asks for a vector index {width} wide, and a width is a whole number",
+                field.label
+            )
+        })?;
+        if dim == 0 {
+            return Err(format!(
+                "the field {} asks for a vector index of no width, and there is nothing to compare",
+                field.label
+            ));
+        }
+        if let Some(already) = field.kind {
+            return Err(format!(
+                "the field {} asks for a vector index and a {already} one at once, and an embedding is not a key",
+                field.label
+            ));
+        }
+        field.vector = Some(dim);
+        return Ok(());
+    }
     let kind = match mark {
         "id" => {
             field.id = true;
@@ -133,9 +158,15 @@ fn apply(field: &mut Field, mark: &str) -> Result<(), String> {
         "ordered" => "Ordered",
         "array" => "Array",
         "text" => "Text",
+        "vector" => {
+            return Err(format!(
+                "the field {} asks for a vector index without saying how wide, as in #[yo(vector = 384)]",
+                field.label
+            ));
+        }
         other => {
             return Err(format!(
-                "{other} is not something yo understands on the field {}. It knows id, index, ordered, array and text",
+                "{other} is not something yo understands on the field {}. It knows id, index, ordered, array, text and vector",
                 field.label
             ));
         }
@@ -143,6 +174,12 @@ fn apply(field: &mut Field, mark: &str) -> Result<(), String> {
     if let Some(already) = field.kind {
         return Err(format!(
             "the field {} asks for two indexes at once, {already} and {kind}, and a path answers one question",
+            field.label
+        ));
+    }
+    if field.vector.is_some() {
+        return Err(format!(
+            "the field {} asks for a vector index and a {kind} one at once, and an embedding is not a key",
             field.label
         ));
     }
@@ -171,9 +208,29 @@ fn take_marks(c: &mut Cursor) -> Result<Vec<String>, String> {
             Some(TokenTree::Group(g)) if g.delimiter() == Delimiter::Parenthesis => g.stream(),
             _ => return Err("yo takes a list of words, as in #[yo(index)]".to_owned()),
         };
-        for tt in list {
+        // A word, or a word with a number after it, which is what a vector
+        // index needs and is the only place a value appears in one of these.
+        let mut items = Cursor::new(list);
+        while let Some(tt) = items.bump() {
             match tt {
-                TokenTree::Ident(word) => words.push(word.to_string()),
+                TokenTree::Ident(word) => {
+                    let mut mark = word.to_string();
+                    if matches!(items.peek(), Some(TokenTree::Punct(p)) if p.as_char() == '=') {
+                        items.bump();
+                        match items.bump() {
+                            Some(TokenTree::Literal(n)) => {
+                                mark.push('=');
+                                mark.push_str(&n.to_string());
+                            }
+                            _ => {
+                                return Err(format!(
+                                    "{mark} in a yo attribute is followed by an equals sign and nothing it can use, as in #[yo(vector = 384)]"
+                                ));
+                            }
+                        }
+                    }
+                    words.push(mark);
+                }
                 TokenTree::Punct(p) if p.as_char() == ',' => {}
                 other => return Err(format!("{other} is not a word yo can read in an attribute")),
             }

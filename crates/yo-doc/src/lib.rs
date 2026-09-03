@@ -67,8 +67,15 @@
 //! typed API never parses JSON, it serializes a struct straight into this
 //! encoding, and text parsing is for `JSON.SET` and for bulk import.
 //!
-//! The vector index, which is `10`, and the typed `Docs<T>` surface with its
-//! derive, which is `15`.
+//! The typed `Docs<T>` surface with its derive, which is `15`.
+//!
+//! # What is here now that was not
+//!
+//! [`VectorIndex`] puts an embedding under a path in the same collection the
+//! document is in, so a nearest neighbour search hands back documents and the
+//! filter over their other indexed fields runs inside the scan. See
+//! [`vector`] for why that is not a [`PathIndex`] and why the
+//! filter has to be inside.
 
 #![deny(missing_docs)]
 
@@ -80,6 +87,7 @@ mod keys;
 pub mod layout;
 mod path;
 mod read;
+pub mod vector;
 
 pub use build::Builder;
 pub use docs::{Doc, DocElems, DocMembers, Docs};
@@ -88,4 +96,5 @@ pub use index::{IndexKind, KEY_MAX, Key, PathIndex, Ranged, RangedRev};
 pub use keys::{KEYS_MAX, Keys};
 pub use path::{Step, Steps};
 pub use read::{Elems, Members, Value, key_order};
+pub use vector::VectorIndex;
 pub use yo_kv::Cursor;
