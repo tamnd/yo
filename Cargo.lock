@@ -791,7 +791,7 @@ dependencies = [
 
 [[package]]
 name = "xtask"
-version = "0.3.12"
+version = "0.3.13"
 dependencies = [
  "yo-common",
  "yo-resp",
@@ -799,11 +799,11 @@ dependencies = [
 
 [[package]]
 name = "yo-alloc"
-version = "0.3.12"
+version = "0.3.13"
 
 [[package]]
 name = "yo-arena"
-version = "0.3.12"
+version = "0.3.13"
 dependencies = [
  "criterion",
  "libc",
@@ -813,7 +813,7 @@ dependencies = [
 
 [[package]]
 name = "yo-capi"
-version = "0.3.12"
+version = "0.3.13"
 dependencies = [
  "yo-common",
  "yo-index",
@@ -821,7 +821,7 @@ dependencies = [
 
 [[package]]
 name = "yo-cli"
-version = "0.3.12"
+version = "0.3.13"
 dependencies = [
  "libc",
  "windows-sys",
@@ -838,7 +838,7 @@ dependencies = [
 
 [[package]]
 name = "yo-common"
-version = "0.3.12"
+version = "0.3.13"
 dependencies = [
  "criterion",
  "yo-alloc",
@@ -846,7 +846,7 @@ dependencies = [
 
 [[package]]
 name = "yo-crash"
-version = "0.3.12"
+version = "0.3.13"
 dependencies = [
  "yo-common",
  "yo-format",
@@ -856,11 +856,11 @@ dependencies = [
 
 [[package]]
 name = "yo-derive"
-version = "0.3.12"
+version = "0.3.13"
 
 [[package]]
 name = "yo-doc"
-version = "0.3.12"
+version = "0.3.13"
 dependencies = [
  "criterion",
  "yo-common",
@@ -870,7 +870,7 @@ dependencies = [
 
 [[package]]
 name = "yo-file"
-version = "0.3.12"
+version = "0.3.13"
 dependencies = [
  "criterion",
  "libc",
@@ -882,14 +882,14 @@ dependencies = [
 
 [[package]]
 name = "yo-format"
-version = "0.3.12"
+version = "0.3.13"
 dependencies = [
  "yo-common",
 ]
 
 [[package]]
 name = "yo-graph"
-version = "0.3.12"
+version = "0.3.13"
 dependencies = [
  "criterion",
  "yo-common",
@@ -898,7 +898,7 @@ dependencies = [
 
 [[package]]
 name = "yo-index"
-version = "0.3.12"
+version = "0.3.13"
 dependencies = [
  "criterion",
  "yo-alloc",
@@ -908,7 +908,7 @@ dependencies = [
 
 [[package]]
 name = "yo-kv"
-version = "0.3.12"
+version = "0.3.13"
 dependencies = [
  "criterion",
  "yo-alloc",
@@ -920,7 +920,7 @@ dependencies = [
 
 [[package]]
 name = "yo-reactor"
-version = "0.3.12"
+version = "0.3.13"
 dependencies = [
  "criterion",
  "yo-common",
@@ -930,7 +930,7 @@ dependencies = [
 
 [[package]]
 name = "yo-reader"
-version = "0.3.12"
+version = "0.3.13"
 dependencies = [
  "yo-common",
  "yo-file",
@@ -940,7 +940,7 @@ dependencies = [
 
 [[package]]
 name = "yo-record"
-version = "0.3.12"
+version = "0.3.13"
 dependencies = [
  "criterion",
  "yo-common",
@@ -950,7 +950,7 @@ dependencies = [
 
 [[package]]
 name = "yo-resp"
-version = "0.3.12"
+version = "0.3.13"
 dependencies = [
  "criterion",
  "libc",
@@ -965,14 +965,14 @@ dependencies = [
 
 [[package]]
 name = "yo-shape"
-version = "0.3.12"
+version = "0.3.13"
 dependencies = [
  "yo-common",
 ]
 
 [[package]]
 name = "yo-shard"
-version = "0.3.12"
+version = "0.3.13"
 dependencies = [
  "criterion",
  "libc",
@@ -985,7 +985,7 @@ dependencies = [
 
 [[package]]
 name = "yo-uring"
-version = "0.3.12"
+version = "0.3.13"
 dependencies = [
  "criterion",
  "io-uring",
@@ -995,7 +995,7 @@ dependencies = [
 
 [[package]]
 name = "yo-vector"
-version = "0.3.12"
+version = "0.3.13"
 dependencies = [
  "criterion",
  "yo-common",
@@ -1003,7 +1003,7 @@ dependencies = [
 
 [[package]]
 name = "yodb"
-version = "0.3.12"
+version = "0.3.13"
 dependencies = [
  "criterion",
  "yo-common",

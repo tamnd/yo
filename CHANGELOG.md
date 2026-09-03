@@ -4,6 +4,68 @@ What each release changed, why, and what it costs you. The versioning rules and 
 
 While the major is 0, a minor release may break anything, including the on-disk format. The format is frozen at `M6`, not before.
 
+## 0.3.13 — 2026-09-03
+
+Seventy pull requests, and no milestone has closed, so by the rule in [RELEASING.md](RELEASING.md) this is a patch. It is a great deal bigger than a patch is meant to be, and that is a process failure rather than a plan: the feature work for three milestones landed over two days and nothing was tagged in between. The rule itself stands, because a minor is what says a milestone is done and none of M5, M6 or M7 has met its exit gate yet.
+
+What is in here is the document model, the vector index, the graph model, streams, bitmaps, HyperLogLogs, geo, and tiering to a file that is larger than memory. That is most of what the engine was supposed to be.
+
+A file written by an earlier 0.3.x still opens. Nothing that existed moved or changed meaning. What did happen is that the `.yo` file gained record kinds it did not have before, so a file written by this version and opened by 0.3.12 will not be understood, and the format section below says which ones.
+
+### Added
+
+- **The document model, which is YOJB plus secondary indexes.** YOJB is an owned binary JSON encoding with per collection key interning, so a field name is stored once for the collection rather than once per document, and reading a path is an offset walk rather than a parse. On top of it are path indexes in five flavours: equality, ordered, array, text and vector. Every number in an index key goes in one representation, so an integer and a double that compare equal sort together and a range over a path does not have to know which one it will find. `#[derive(Yo)]` puts your own struct in a collection with `#[yo(index)]` on the fields that want one, and the typed `Docs<T>` surface is what you use it through.
+- **The vector index, built on RaBitQ and SPFresh rather than on HNSW.** Vectors are quantised with RaBitQ at 1 bit and at 4 bit, partitions are updated in place with the LIRE protocol so there is never a rebuild, and a partition is scanned with popcounts rather than multiplies. Filters are pushed into the posting scan instead of being applied to what comes out of it. MUVERA is in for multi vector retrieval, which turns a set of token vectors into one fixed dimensional vector the same index can hold. HNSW is present as a compatibility view only, with its parameters mapped onto the partition index, because it is what people's existing configuration is written in.
+- **The graph model, hot and cold.** The hot form is an adjacency plane at 12 bytes per edge. The cold form is the node group CSR ported from `zu`, with node numbering by recursive bisection and per block gap patching. Nodes and edges carry documents, reusing the document model rather than inventing a property store. The typed `Graph<N, E>` surface makes a wrong traversal a compile error: `out::<Follows>()` does not compile on a node type that `Follows` cannot start from. The algorithm set is breadth first search, weak and strong components, PageRank, triangle count, shortest paths, Leiden, Louvain, label propagation and sampled betweenness, each checked against a slow obvious reference over dozens of random graphs. The ten command `G.*` family is on the wire.
+- **Streams, with consumer groups and the pending entries list.** The log is a listpack per node holding about a hundred entries, with IDs stored as differences from the node master and field names stored once per node. Eighteen commands are on the wire and verified against a running Redis 8.10.1: the fifteen classic ones, and `XDELEX`, `XACKDEL` and `XNACK` from 8.2 and 8.8. The group lag rules are the fiddly part and they are right, including the cases where the lag is genuinely unknowable and Redis reports a null rather than a made up number.
+- **Bitmaps, HyperLogLogs and geo.** All seven bitmap commands, all five HyperLogLog commands in a format that is byte for byte what a real 8.10.1 writes, and the ten geo commands, which is the four member ones and the one search written six ways. All verified against a running 8.10.1.
+- **Tiering, so the data can be larger than memory.** Values move out to the file and back: strings first, then all six collection bodies. A string demotes by handing over the bytes it already is. A collection cannot, because its body is a table or a band or a listpack in a slab and the pointers in it mean nothing to anyone reading the file back, so it is frozen to a form that comes back in the exact representation it left in, including the flags that only affect what `OBJECT ENCODING` is called. A value that changed encoding because it was quiet long enough to be demoted would be a value whose behaviour depends on memory pressure, and that is not something a client can be asked to reason about.
+- **The demotion policies M5 asked for.** S3-FIFO and SIEVE, with a doorkeeper on admission so a value read once does not evict something read repeatedly. Which tier a value is in is a tag in the byte the lookup already read, so a point read knows before it goes to the device.
+- **The eviction inversion.** `maxmemory` migrates and `maxstore` evicts, and `maxstore` of 0 restores Redis behaviour exactly. All ten eviction policies are in, with the 24 bit LRU clock and the 8 bit log LFU counter.
+- **`INFO` says what the file is doing,** and `yodb serve` can be given a file at runtime rather than only at startup.
+- **`INFO commandstats` reports per command call counts,** and `INFO cpu` works on Windows.
+
+### Changed
+
+- **A command is found with one multiply instead of a walk, and looked up once instead of three times.** The dispatch table is a perfect hash over the command names, so finding `GET` is an arithmetic operation rather than a scan, and the lookup result is carried through the call rather than being redone for the arity check and again for the keyspace notification.
+- **Keys with a deadline are kept in a second index of their own.** The active expiry cycle used to sample the whole keyspace to find the small fraction of keys that can expire at all, which is the wrong shape when one key in a thousand has a TTL.
+- **A hash field's value goes behind its field name rather than in a blob of its own,** and an integer set stores its runs against a frame of reference. Together those are most of what M3's memory gate was short by.
+- **`yodb serve` stops on a signal instead of being killed.** It closes the file properly, which matters because the alternative is a recovery pass on the next start for no reason.
+
+### Fixed
+
+- **A shard could go to sleep on a job that was already in its own lane.** The check for more work and the decision to park were not one step, so a job queued in the window between them was not seen until something else woke the shard up. On an idle server that is a request that appears to hang.
+- **Restoring a hash took the blob whole where it could,** which is the same change the sorted set got in 0.3.11 and for the same reason. It was filed as a known gap there.
+- **The package check has been red on main since the document work landed,** which would have stopped this release. A test in `yo-record` uses a real document, and that dev dependency closes a cycle through `yo-kv`. Cargo builds a cycle made of dev dependencies without complaining, but `cargo package` has to put the crates in some order and there is not one, so it packaged `yo-record` first and then looked for `yo-doc` on a registry where nothing has been published under that name. A dev dependency with no version is left out of the manifest that goes up, so the edge stops existing as far as crates.io is concerned.
+
+### Format
+
+The `.yo` file gained record kinds. Document records, vector records, graph records, and the cold forms that tiering writes: chunked values, frozen collection bodies, and the directory record that addresses a chunk rather than walking to it. A cold band value is fixed 64 KiB chunks with a directory holding their addresses, so chunk `i` is one lookup, and a value of at most one chunk is one record with no directory at all. A directory is itself one chunk, which is 8192 addresses, which is 512 MiB, which is exactly the largest string Redis holds, so a chain is always either one read or two and there is no second level.
+
+A file written by 0.3.12 opens unchanged under this version. A file written by this version does not open under 0.3.12, because the older reader has no word for the new kinds. The format is not frozen until M6 is done, so this can still happen again, and it will be called out here each time.
+
+### Performance
+
+Development measurements unless the machine is named. None of these are gate numbers.
+
+- **Vector search on SIFT1M, on gamingpc, a 13900K.** Recall at 10 of 0.9597, p50 814 us, p99 1114 us. Ingest is 26239 vectors a second on one core, against the 50 thousand M6 asks for. Search itself is a little over half what it was when it was first measured, after the profile showed where the time went, and putting an index over the centroids means placing a vector is a lookup rather than a scan of every partition.
+- **A graph hop, on gamingpc.** 22.1 ns at degree 4 and 33.0 ns at degree 20, against M7's 500 ns. Two hops over 10M edges is 1.60 us prefetched against a 50 us gate, so the plane clears it by a factor of thirty. A walk that reads a document off everything it touches is a different number and an honest one: 397 ns for one hop with an edge and a node document per neighbour, and 92 us for the two hop case, which misses.
+- **The cold graph form is 9.38 bits per edge on R-MAT degree ordered, 15.00 on soc-LiveJournal1 and 15.04 on web-Google,** down from 19.62 and 21.02 before recursive bisection and per block patching. M7 asks for 8 and this does not reach it. Bisection now puts sixteen percent of neighbours consecutive, so interval encoding is the next thing to try.
+- **A point read under a working set ten times memory costs 0.917 device reads,** measured on this laptop and again on server3. That is the M5 gate's 1.05 for strings, and the harness does not yet have a row for the collection types.
+- **The stream commands against redis 8.10.1 on server3.** XADD 1.60x, XRANGE 1.57x, XREADGROUP 2.45x, XACK 1.56x, XLEN 0.90x. PING is 1.09x on the same box, which says the socket is the roofline and this comparison has to be read in process before it means anything about the structure.
+- **Dropping the hop barrier, on gamingpc, answers prediction P-8 and it is wrong at the short end and right at the deep end.** Pipelining wins by 4.64x at one hop on a single shard and by 2.58x at three hops on eight shards, and loses at eight shards past four hops, 0.81x at five and 0.62x at six, because by then the frontier is most of the graph and a node claimed by a deeper wave first has to be expanded again. The crossover is a function of shard count and hop count rather than hop count alone, so the planner should pick between the two rather than the spec stating one cost model for both.
+
+### Known gaps
+
+- **No milestone has met its exit gate, which is why this is a patch and not a minor.** M5 wants 1.05 device reads per point read across every type and has strings only, M6 wants recall at 10 of 0.95 with p99 under 1 ms on MS-MARCO-v2 as well as SIFT1M and has SIFT1M only, and M7 wants the stream commands at 10x and is socket bound at the numbers above.
+- **`DUMP` on a stream answers the null that a missing key answers,** because the RDB serialiser has no stream envelope yet. Every other type round trips through `DUMP` and `RESTORE`.
+- **`XCFGSET` and `XIDMPRECORD` are the two stream commands left in 8.x,** and both need the idempotency tracking that divergence D-27 is about.
+- **`RESTORE` still checks `IDLETIME` and `FREQ` and then drops them, which is D-26.** It was expected to resolve at M5 and has not.
+- **`GRAPH.QUERY` is not supported and will not be.** No Cypher, no GQL. It is in the divergence register with the reasoning so nobody has to relitigate it.
+- **Log page buffers are not counted against `maxmemory`.** A real log carries three 32 MiB page buffers, about 96 MiB per attached database, and none of it is visible to the memory total the eviction loop reads. The leaning is to report them in their own `INFO` field rather than charge them, but it is not decided.
+- **`keyspace_hits` and `keyspace_misses` are missing from `INFO stats`.**
+- **`GETRANGE` on a demoted value reads the whole value back** rather than only the chunks the window covers, which the cold reader already supports.
+
 ## 0.3.12 — 2026-09-01
 
 Two pull requests and both are fixes, so this is a patch. It exists because 0.3.10 and 0.3.11 were both tagged with a crash in them and a tag never moves, so neither of those two reached crates.io. Use this one.
