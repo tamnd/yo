@@ -117,6 +117,7 @@
 use yo_common::num::{self, parse_i64};
 
 use crate::elem::Elements;
+use crate::frozen::{self, Broken};
 use crate::listpack::{self, Listpack};
 use crate::scan::Cursor;
 use crate::ttl::{Applied, Ask, Cond, Deadlines, decide};
@@ -134,6 +135,19 @@ const NONE: u64 = u64::MAX;
 /// default. Four kilobytes of stack for the length of one `RESTORE` is a fair
 /// price for taking the square out of the common case.
 const CHECK_MAX: usize = Limits::DEFAULT.max_listpack_entries;
+
+/// The packed band with two elements a field, which is Redis's `HASH_LISTPACK`.
+const FORM_PACKED: u8 = 1;
+/// The packed band with three, a deadline behind every value.
+const FORM_PACKED_EX: u8 = 2;
+/// The element table, written out as its fields.
+const FORM_FIELDS: u8 = 3;
+/// On a table, that a deadline follows every pair.
+///
+/// The top bit of the form byte rather than a form of its own, so that a hash
+/// with no field TTL, which is nearly all of them, does not pay a byte a field
+/// for a column of zeroes.
+const HAS_TTL: u8 = 0x80;
 
 /// A field name or a value, as it is stored.
 ///
@@ -650,6 +664,125 @@ impl Hash {
         match &self.body {
             Body::Packed(p) if !p.ex => Some(p.lp.as_bytes()),
             _ => None,
+        }
+    }
+
+    /// Write this hash out as the bytes it comes back from.
+    ///
+    /// What a demotion turns the body into so the record can hold an address
+    /// instead of a slab slot. The form byte says which band left, because the
+    /// band is visible through `OBJECT ENCODING` and a hash that came back on a
+    /// different one would be a hash whose answer depends on memory pressure.
+    ///
+    /// Both packed bands go out as the listpack bytes they already are, so they
+    /// cost a byte of overhead and no walk. `listpackex` carries the earliest
+    /// deadline in front of them, because that bound is what stops the active
+    /// cycle from having to walk a hash to find out it has nothing to do, and
+    /// recomputing it on the way back in would be a walk on the fault path.
+    ///
+    /// The table goes out as its fields, with the deadline column written only
+    /// if a field actually has one.
+    pub fn freeze(&self, out: &mut Vec<u8>) {
+        match &self.body {
+            Body::Packed(p) if !p.ex => {
+                out.push(FORM_PACKED);
+                out.extend_from_slice(p.lp.as_bytes());
+            }
+            Body::Packed(p) => {
+                out.push(FORM_PACKED_EX);
+                frozen::put_uint(out, p.soonest);
+                out.extend_from_slice(p.lp.as_bytes());
+            }
+            Body::Table(t) => {
+                let with_ttl = !t.ttl.is_empty();
+                out.push(if with_ttl {
+                    FORM_FIELDS | HAS_TTL
+                } else {
+                    FORM_FIELDS
+                });
+                let n = t.fields.len();
+                frozen::put_uint(out, n as u64);
+                // The blob the table opens with on the way back. A blob never
+                // shrinks on its own, so a guess here is charged to every field
+                // for as long as the hash lives, and the exact number is one
+                // walk of a thing that is about to be walked anyway.
+                let mut tail = 0usize;
+                for i in 0..n {
+                    let (f, v) = t.fields.pair_at(i).expect("index is under the length");
+                    tail += f.len() + v.len() + 1;
+                }
+                frozen::put_uint(out, tail as u64);
+                for i in 0..n {
+                    let (f, v) = t.fields.pair_at(i).expect("index is under the length");
+                    frozen::put_bytes(out, f);
+                    frozen::put_bytes(out, v);
+                    if with_ttl {
+                        frozen::put_uint(out, t.ttl.get(i).unwrap_or(0));
+                    }
+                }
+            }
+        }
+    }
+
+    /// Read a hash back out of what [`Hash::freeze`] wrote.
+    ///
+    /// Answers an error rather than panicking on anything that is not the shape
+    /// it wrote, because the bytes have been to a device and back and a torn
+    /// chunk has to reach the caller as a failed read.
+    pub fn thaw(bytes: &[u8]) -> Result<Hash, Broken> {
+        let mut cut = frozen::Cut::new(bytes);
+        let tag = cut.byte()?;
+        match tag {
+            FORM_PACKED => Ok(Hash {
+                body: Body::Packed(Packed {
+                    lp: Listpack::from_bytes(cut.rest()).map_err(|_| Broken::Body)?,
+                    ex: false,
+                    soonest: NONE,
+                }),
+            }),
+            FORM_PACKED_EX => {
+                let soonest = cut.uint()?;
+                Ok(Hash {
+                    body: Body::Packed(Packed {
+                        lp: Listpack::from_bytes(cut.rest()).map_err(|_| Broken::Body)?,
+                        ex: true,
+                        soonest,
+                    }),
+                })
+            }
+            _ if tag & !HAS_TTL == FORM_FIELDS => {
+                let with_ttl = tag & HAS_TTL != 0;
+                let n = usize::try_from(cut.uint()?).map_err(|_| Broken::Short)?;
+                let tail = usize::try_from(cut.uint()?).map_err(|_| Broken::Short)?;
+                // A pair is at least two bytes, so a count larger than what is
+                // left cannot be honest and is not worth an allocation.
+                if n > cut.rest().len() || tail > cut.rest().len() {
+                    return Err(Broken::Body);
+                }
+                let mut t = Table::new(n, tail);
+                for _ in 0..n {
+                    let field = cut.bytes()?;
+                    let value = cut.bytes()?;
+                    let deadline = if with_ttl { cut.uint()? } else { 0 };
+                    if !t.set(field, value) {
+                        // A repeat field, a name over the limit or a table at
+                        // its row cap. None of those is something freeze wrote.
+                        return Err(Broken::Body);
+                    }
+                    if deadline != 0 {
+                        // Zero is not a deadline anything stores, so `now` of
+                        // zero rejects nothing that was really there. The row
+                        // is the one just appended.
+                        let row = t.fields.len() - 1;
+                        let applied = t.ttl.set(row, deadline, Cond::Always, 0);
+                        debug_assert_eq!(applied, Applied::Ok, "a deadline that was stored");
+                    }
+                }
+                Ok(Hash {
+                    body: Body::Table(t),
+                })
+            }
+            _ => Err(Broken::Form),
         }
     }
 
@@ -1919,5 +2052,94 @@ mod tests {
         assert_eq!(h.len(), 0);
         assert_eq!(h.get(b"a"), None);
         assert!(h.memory_bytes() < 64, "{} bytes", h.memory_bytes());
+    }
+
+    /// Freeze a hash, read it back, and check it is the same hash.
+    ///
+    /// The band and the length are checked as well as the pairs, because coming
+    /// back on a different band would change what `OBJECT ENCODING` says about a
+    /// value that nobody wrote to.
+    fn round_trip(h: &Hash) -> Hash {
+        let mut out = Vec::new();
+        h.freeze(&mut out);
+        let back = Hash::thaw(&out).expect("it came back");
+        assert_eq!(back.len(), h.len(), "the field count");
+        assert_eq!(back.encoding(), h.encoding(), "the band");
+        assert_eq!(pairs(&back), pairs(h), "the fields");
+        back
+    }
+
+    #[test]
+    fn a_frozen_hash_comes_back_in_the_band_it_left() {
+        round_trip(&Hash::new());
+        round_trip(&filled(3, &SMALL));
+        round_trip(&filled(300, &AT_128));
+        round_trip(&filled(3, &AS_TABLE));
+
+        // And a value too long for the packed band, which is the other way a
+        // hash becomes a table.
+        let mut h = Hash::new();
+        h.set(b"f", &[b'x'; 200], &SMALL);
+        assert_eq!(h.encoding(), Encoding::Hashtable);
+        let back = round_trip(&h);
+        assert_eq!(back.get(b"f").map(text), Some(vec![b'x'; 200]));
+    }
+
+    #[test]
+    fn every_field_deadline_survives_the_trip() {
+        for limits in [&SMALL, &AS_TABLE] {
+            let mut h = filled(4, limits);
+            h.expire(b"f1", 5000, Cond::Always, 0);
+            h.expire(b"f3", 9000, Cond::Always, 0);
+            let back = round_trip(&h);
+            assert_eq!(back.deadline(b"f1"), Ask::At(5000));
+            assert_eq!(back.deadline(b"f3"), Ask::At(9000));
+            assert_eq!(back.deadline(b"f0"), Ask::NoDeadline);
+            assert_eq!(back.deadline(b"f2"), Ask::NoDeadline);
+            assert_eq!(back.deadline_count(), 2);
+            // The bound the active cycle reads. It can be early and it cannot be
+            // late, and a hash that came back with no bound at all would be a
+            // hash the cycle sleeps through.
+            assert_eq!(back.soonest_deadline(), Some(5000));
+        }
+    }
+
+    /// A hash that has widened and then had every deadline taken off again.
+    ///
+    /// It stays `listpackex`, because widening is one way, and the third element
+    /// per field is still there holding a zero. Both facts have to survive or the
+    /// encoding changes under a client that only ever called `HPERSIST`.
+    #[test]
+    fn a_widened_hash_with_no_deadlines_left_still_comes_back_widened() {
+        let mut h = filled(3, &SMALL);
+        h.expire(b"f1", 5000, Cond::Always, 0);
+        assert_eq!(h.persist(b"f1"), Ask::At(5000));
+        assert_eq!(h.encoding(), Encoding::ListpackEx);
+        assert_eq!(h.deadline_count(), 0);
+        let back = round_trip(&h);
+        assert_eq!(back.deadline_count(), 0);
+        assert_eq!(back.soonest_deadline(), Some(5000), "the bound only falls");
+    }
+
+    #[test]
+    fn a_frozen_hash_that_arrives_damaged_is_an_error_and_not_a_panic() {
+        for h in [filled(3, &SMALL), filled(3, &AS_TABLE)] {
+            let mut out = Vec::new();
+            h.freeze(&mut out);
+            for cut in 0..out.len() {
+                // Every prefix. Some of them are a hash of fewer fields and that
+                // is fine, what matters is that none of them panics or hangs.
+                let _ = Hash::thaw(&out[..cut]);
+            }
+        }
+        assert_eq!(Hash::thaw(&[]).err(), Some(Broken::Short));
+        assert_eq!(Hash::thaw(&[9]).err(), Some(Broken::Form));
+        assert_eq!(Hash::thaw(&[FORM_PACKED, 1, 2]).err(), Some(Broken::Body));
+        // A field count that no amount of what is left could fill, which is the
+        // one an allocation would be sized from.
+        assert_eq!(
+            Hash::thaw(&[FORM_FIELDS, 0xff, 0xff, 0x7f, 0]).err(),
+            Some(Broken::Body)
+        );
     }
 }

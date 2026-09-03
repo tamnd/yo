@@ -821,14 +821,20 @@ impl Keyspace {
     ///
     /// The same shape as [`Keyspace::set_encoding`] and for the same reason: the
     /// record holds a slot number and the body is the thing that knows which of
-    /// the two it currently is.
+    /// the two it currently is. A demoted hash is brought back to answer, which
+    /// is the same trade the set makes.
     pub fn hash_encoding(&mut self, key: &[u8]) -> Option<hash::Encoding> {
         self.reap(key);
         let rec = self.map.get(key)?;
         if value::kind(rec) != Kind::Hash {
             return None;
         }
-        let at = value::slot(rec);
+        let cold = value::Meta::from_byte(rec[0]).is_cold();
+        let at = if cold {
+            self.promote_body(key).ok()??
+        } else {
+            value::slot(rec)
+        };
         Some(self.hashes.get(at)?.encoding())
     }
 
@@ -1406,7 +1412,7 @@ impl Keyspace {
             self.map.sample(r, |k, v, _| {
                 seen += 1;
                 let m = value::Meta::from_byte(v[0]);
-                if !m.is_cold() && m.kind() == Kind::Set {
+                if !m.is_cold() && moves(m.kind()) {
                     pool.offer(k, evict::score(v, policy, now_ms, lfu));
                     found += 1;
                 }
@@ -1472,41 +1478,39 @@ impl Keyspace {
         };
         let rec = self.map.value_at(addr);
         let m = value::Meta::from_byte(rec[0]);
-        // Sets only, for now. Every other collection wants the same three steps
-        // and a `freeze` of its own, and the shape of the third one is what this
-        // is establishing.
-        if m.is_cold() || m.kind() != Kind::Set {
+        if m.is_cold() || !moves(m.kind()) {
             return Ok(false);
         }
+        let kind = m.kind();
         let expire_at = value::expire_at(rec);
         // Carried across and not restamped, as in `Tier::demote`. A key that was
         // moved out was not used, and a demotion that looked like a use would
         // make the next sweep pick the wrong victim.
         let was = value::access(rec).unwrap_or_default();
         let slot = value::slot(rec);
-        let Some(set) = self.sets.get(slot) else {
-            debug_assert!(false, "a set record with no set behind it");
-            return Ok(false);
-        };
         // The same arithmetic the string side uses and not a tunable: a body
         // that costs less to keep than the pointer to it would is left where it
         // is. It is even more favourable here, because what a table costs in
         // memory is well above what its members weigh on a device.
         let grows_by = value::cold_record_len(expire_at.is_some())
             - value::slot_record_len(expire_at.is_some());
-        if set.memory_bytes() <= grows_by {
-            return Ok(false);
-        }
 
         let mut buf = core::mem::take(&mut self.frozen);
         buf.clear();
-        set.freeze(&mut buf);
-        let tier = self.tier.as_mut().expect("checked at the top");
-        let wrote = tier.stash(&buf);
+        let worth = self.freeze_body(kind, slot, grows_by, &mut buf);
+        let stashed = if worth {
+            let tier = self.tier.as_mut().expect("checked at the top");
+            Some(tier.stash(&buf))
+        } else {
+            None
+        };
         self.frozen = buf;
+        let Some(wrote) = stashed else {
+            return Ok(false);
+        };
         let chain = wrote?;
 
-        self.sets.remove(slot);
+        self.free_slot(kind, slot);
         self.bodies -= 1;
         let len = chain.len as u32;
         let wrote = self.map.set_with(
@@ -1516,17 +1520,10 @@ impl Keyspace {
             |out| {
                 // The encoding bits mean nothing on a collection record, which
                 // is what `Meta::slot` already writes and says. `OBJECT
-                // ENCODING` on a demoted set brings it back and asks the body,
+                // ENCODING` on a demoted body brings it back and asks the body,
                 // which is one device read for a command nobody sends in a
                 // loop, and is one place holding the fact rather than two.
-                value::write_cold_record(
-                    out,
-                    Kind::Set,
-                    value::Encoding::Int,
-                    chain.at,
-                    len,
-                    expire_at,
-                );
+                value::write_cold_record(out, kind, value::Encoding::Int, chain.at, len, expire_at);
                 value::set_access(out, was);
                 value::has_expiry(out)
             },
@@ -1536,6 +1533,60 @@ impl Keyspace {
         // and that is what the memo checks, so the slot number it is holding for
         // this key is already unreachable.
         Ok(true)
+    }
+
+    /// Turn the body in `slot` into bytes, or say it is not worth moving.
+    ///
+    /// The one place that knows which slab a kind indexes on the way out, and
+    /// the size check is in here because it needs the body in hand and the body
+    /// is the thing this is holding. `false` leaves `buf` in whatever state it
+    /// was, which the caller does not read.
+    fn freeze_body(&self, kind: Kind, slot: u32, grows_by: usize, buf: &mut Vec<u8>) -> bool {
+        match kind {
+            Kind::Set => match self.sets.get(slot) {
+                Some(body) if body.memory_bytes() > grows_by => {
+                    body.freeze(buf);
+                    true
+                }
+                Some(_) => false,
+                None => {
+                    debug_assert!(false, "a set record with no set behind it");
+                    false
+                }
+            },
+            Kind::Hash => match self.hashes.get(slot) {
+                Some(body) if body.memory_bytes() > grows_by => {
+                    body.freeze(buf);
+                    true
+                }
+                Some(_) => false,
+                None => {
+                    debug_assert!(false, "a hash record with no hash behind it");
+                    false
+                }
+            },
+            _ => {
+                debug_assert!(false, "a kind `moves` said yes to and this does not know");
+                false
+            }
+        }
+    }
+
+    /// Give a slab slot back once its body has been written out.
+    ///
+    /// The twin of [`Keyspace::freeze_body`], kept beside it so that adding a
+    /// type means touching two arms next to each other rather than hunting for
+    /// the second one.
+    fn free_slot(&mut self, kind: Kind, slot: u32) {
+        match kind {
+            Kind::Set => {
+                self.sets.remove(slot);
+            }
+            Kind::Hash => {
+                self.hashes.remove(slot);
+            }
+            _ => debug_assert!(false, "freeing a slot in a slab that was never found"),
+        }
     }
 
     /// Send a cold record that holds a body back to [`Keyspace::promote_body`],
@@ -1610,6 +1661,13 @@ impl Keyspace {
                         .with_detail(e.to_string())
                 })?;
                 self.sets.insert(set)
+            }
+            Kind::Hash => {
+                let hash = Hash::thaw(&self.frozen).map_err(|e| {
+                    Error::new(Code::Corrupt, "a demoted hash did not read back")
+                        .with_detail(e.to_string())
+                })?;
+                self.hashes.insert(hash)
             }
             // Nothing else is written cold with a body yet, so arriving here
             // means a record that says one thing and a demoter that did another.
@@ -2247,6 +2305,16 @@ impl Keyspace {
     pub fn hash_of(key: &[u8]) -> u64 {
         RawMap::hash_of(key)
     }
+}
+
+/// Whether a body of this kind can leave memory yet.
+///
+/// One list rather than a check in each of the three places that need it, so a
+/// type that gains a `freeze` cannot be demotable in the sweep and unreadable on
+/// the way back. A kind that is not in here stays in memory, which costs a
+/// demotion that did not happen and is never a wrong answer.
+const fn moves(kind: Kind) -> bool {
+    matches!(kind, Kind::Set | Kind::Hash)
 }
 
 /// What Redis says when a command is sent at a key holding another type.
