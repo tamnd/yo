@@ -109,6 +109,7 @@ use std::collections::VecDeque;
 
 use yo_common::num::{DIGITS_MAX, i64_digits, push_u64, u64_digits};
 
+use crate::frozen::{self, Broken};
 use crate::listpack::{self, Entry, Listpack};
 
 pub mod groups;
@@ -470,6 +471,13 @@ impl Edges {
     }
 }
 
+/// The only frozen form there is: the nodes as they stand, then the groups.
+///
+/// There is no packed form to sit beside it the way the other collections have
+/// one, because a stream is a listpack per node from the first entry and never
+/// changes shape.
+const FORM_NODES: u8 = 1;
+
 /// A log of entries in ID order.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Stream {
@@ -498,6 +506,111 @@ impl Stream {
     #[must_use]
     pub fn new() -> Stream {
         Stream::default()
+    }
+
+    /// Write the stream out as the bytes a tier can hold, for
+    /// [`crate::keyspace::Keyspace`] to hand back to [`Stream::thaw`].
+    ///
+    /// The nodes go out as the listpacks they already are, one master ID and one
+    /// blob each. That is the whole point of the node layout: a run of entries
+    /// is already a flat sequence of bytes with no pointers in it, so freezing
+    /// one is a copy and thawing it is a length check. Only the counters and the
+    /// consumer groups need a form of their own.
+    pub fn freeze(&self, out: &mut Vec<u8>) {
+        out.push(FORM_NODES);
+        frozen::put_uint(out, self.length);
+        frozen::put_uint(out, self.last.ms);
+        frozen::put_uint(out, self.last.seq);
+        frozen::put_uint(out, self.max_deleted.ms);
+        frozen::put_uint(out, self.max_deleted.seq);
+        frozen::put_uint(out, self.added);
+
+        frozen::put_uint(out, self.nodes.len() as u64);
+        for node in &self.nodes {
+            frozen::put_uint(out, node.master.ms);
+            frozen::put_uint(out, node.master.seq);
+            frozen::put_bytes(out, node.lp.as_bytes());
+        }
+
+        frozen::put_uint(out, self.groups.len() as u64);
+        for (name, group) in &self.groups {
+            frozen::put_bytes(out, name);
+            group.freeze(out);
+        }
+    }
+
+    /// Read back a stream [`Stream::freeze`] wrote.
+    ///
+    /// What is inside a node is checked as far as [`Listpack::from_bytes`]
+    /// checks it, which is that the header, the lengths and the terminator all
+    /// agree, and no further. Every walk over a node's contents already returns
+    /// early on anything it does not understand rather than trusting what it
+    /// finds, so a structurally sound listpack full of nonsense answers an empty
+    /// range instead of panicking. That is the same trust a node written by
+    /// Redis and loaded from an RDB file gets today.
+    pub fn thaw(bytes: &[u8]) -> Result<Stream, Broken> {
+        let mut cut = frozen::Cut::new(bytes);
+        if cut.byte()? != FORM_NODES {
+            return Err(Broken::Form);
+        }
+        let length = cut.uint()?;
+        let last = Id::new(cut.uint()?, cut.uint()?);
+        let max_deleted = Id::new(cut.uint()?, cut.uint()?);
+        let added = cut.uint()?;
+        // Deleting an entry needs an entry, and so does reading one, so a stream
+        // that has lost more than it ever took or is holding more than it was
+        // ever given did not come from `freeze`.
+        if length > added || max_deleted > last {
+            return Err(Broken::Body);
+        }
+
+        let n = usize::try_from(cut.uint()?).map_err(|_| Broken::Short)?;
+        // A node is a master ID and a listpack, so it cannot be under a byte and
+        // a count past what is left is short rather than a reservation to make.
+        if n > cut.rest().len() {
+            return Err(Broken::Short);
+        }
+        let mut nodes = VecDeque::with_capacity(n);
+        let mut prev: Option<Id> = None;
+        for _ in 0..n {
+            let master = Id::new(cut.uint()?, cut.uint()?);
+            // Nodes are consecutive runs in ID order, so a master that does not
+            // beat the one before it would leave a lookup unable to pick the
+            // node an ID belongs in.
+            if prev.is_some_and(|p| p >= master) {
+                return Err(Broken::Body);
+            }
+            prev = Some(master);
+            let lp = Listpack::from_bytes(cut.bytes()?).map_err(|_| Broken::Body)?;
+            nodes.push_back(Node { master, lp });
+        }
+        if nodes.is_empty() && length != 0 {
+            return Err(Broken::Body);
+        }
+
+        let n = usize::try_from(cut.uint()?).map_err(|_| Broken::Short)?;
+        if n > cut.rest().len() {
+            return Err(Broken::Short);
+        }
+        let mut groups: Vec<(Vec<u8>, Group)> = Vec::with_capacity(n);
+        for _ in 0..n {
+            let name = cut.bytes()?;
+            // Groups are found by a scan for the name, so a repeat would leave
+            // the second one holding entries that nothing could acknowledge.
+            if groups.iter().any(|(had, _)| had == name) {
+                return Err(Broken::Body);
+            }
+            groups.push((name.to_vec(), Group::thaw(&mut cut)?));
+        }
+
+        Ok(Stream {
+            nodes,
+            length,
+            last,
+            max_deleted,
+            added,
+            groups,
+        })
     }
 
     /// How many live entries there are, which is `XLEN`.
@@ -2780,6 +2893,153 @@ mod tests {
         assert!(took.is_empty(), "none of them are there any more");
         assert_eq!(gone.len(), 5);
         assert_eq!(s.group(b"workers").expect("the group").pending_len(), 0);
+    }
+
+    /// Out and back, checking everything a client can see on the way.
+    fn round_trip(s: &Stream) -> Stream {
+        let mut bytes = Vec::new();
+        s.freeze(&mut bytes);
+        let back = Stream::thaw(&bytes).expect("our own bytes");
+        assert_eq!(dump(&back), dump(s), "the entries");
+        assert_eq!(back.len(), s.len(), "the length");
+        assert_eq!(back.added(), s.added(), "the count added");
+        assert_eq!(back.last_id(), s.last_id(), "the last ID");
+        assert_eq!(back.max_deleted_id(), s.max_deleted_id(), "the max deleted");
+        assert_eq!(back.nodes(), s.nodes(), "the node count");
+        assert_eq!(back, *s, "the whole thing");
+        back
+    }
+
+    #[test]
+    fn a_frozen_stream_comes_back_with_every_entry_it_held() {
+        let mut s = Stream::new();
+        for ms in 1..=500u64 {
+            add(&mut s, ms, 0, &[("job", "x"), ("n", "1")]);
+        }
+        add(&mut s, 500, 1, &[("job", "y")]);
+        assert!(s.nodes() > 1, "more than one node, so the walk is tested");
+        round_trip(&s);
+    }
+
+    #[test]
+    fn a_frozen_stream_keeps_the_holes_and_the_counters() {
+        let mut s = logged(200);
+        for ms in [3u64, 4, 5, 100, 199] {
+            assert!(s.delete(Id::new(ms, 0)));
+        }
+        s.trim_minid(Id::new(20, 0), true, None);
+        let back = round_trip(&s);
+        assert_eq!(back.first_id(), Some(Id::new(20, 0)));
+        assert!(!back.contains(Id::new(100, 0)), "a hole is still a hole");
+        assert_eq!(back.max_deleted_id(), Id::new(199, 0));
+    }
+
+    #[test]
+    fn a_frozen_stream_keeps_its_groups_and_who_is_holding_what() {
+        let mut s = logged(20);
+        s.create_group(b"workers", Id::MIN, Some(0));
+        s.create_group(b"audit", Id::new(5, 0), None);
+        read(&mut s, "workers", "alice", Some(6), 1_000);
+        read(&mut s, "workers", "bob", Some(4), 2_000);
+        // One handed back to the group with nobody holding it, so the NACK count
+        // has something to come back as.
+        assert_eq!(
+            s.nack(b"workers", Id::new(2, 0), Retry::Keep, true),
+            Some(true)
+        );
+        // And one consumer deleted, so a slot in the middle is empty and the
+        // slot numbers behind it have to survive.
+        s.group_mut(b"workers")
+            .expect("the group")
+            .create_consumer(b"carol", 3_000);
+        read(&mut s, "workers", "dave", Some(2), 4_000);
+        s.group_mut(b"workers")
+            .expect("the group")
+            .delete_consumer(b"carol");
+
+        let back = round_trip(&s);
+        let g = back.group(b"workers").expect("the group");
+        assert_eq!(g.pending_len(), 12);
+        assert_eq!(g.nacked_len(), 1);
+        assert_eq!(g.entries_read(), Some(12));
+        // Six, less the one handed back to the group.
+        assert_eq!(g.consumer_named(b"alice").expect("alice").len(), 5);
+        assert_eq!(g.consumer_named(b"bob").expect("bob").len(), 4);
+        assert_eq!(g.consumer_named(b"dave").expect("dave").len(), 2);
+        assert_eq!(g.consumer_named(b"carol"), None);
+        // Dave came after carol, so his slot is the fourth one and reading the
+        // empties back as empties is what keeps his entries his.
+        assert_eq!(g.slot(b"dave"), Some(3));
+        assert_eq!(g.nack(Id::new(1, 0)).expect("a nack").owner(), Some(0));
+        assert_eq!(g.nack(Id::new(2, 0)).expect("a nack").owner(), None);
+        assert_eq!(
+            back.group(b"audit").expect("audit").last_id(),
+            Id::new(5, 0)
+        );
+        assert_eq!(back.group(b"audit").expect("audit").entries_read(), None);
+    }
+
+    #[test]
+    fn a_stream_that_came_back_still_takes_entries_and_reads_them() {
+        let mut s = logged(10);
+        s.create_group(b"workers", Id::MIN, Some(0));
+        read(&mut s, "workers", "alice", Some(4), 1_000);
+
+        let mut back = round_trip(&s);
+        add(&mut back, 11, 0, &[("job", "new")]);
+        assert_eq!(back.len(), 11);
+        assert_eq!(
+            read(&mut back, "workers", "alice", Some(3), 2_000),
+            vec![Id::new(5, 0), Id::new(6, 0), Id::new(7, 0)]
+        );
+        assert!(
+            back.group_mut(b"workers")
+                .expect("the group")
+                .ack(Id::new(1, 0))
+        );
+        assert_eq!(back.group(b"workers").expect("the group").pending_len(), 6);
+    }
+
+    #[test]
+    fn an_empty_stream_that_still_exists_comes_back() {
+        let mut s = logged(3);
+        for ms in 1..=3u64 {
+            assert!(s.delete(Id::new(ms, 0)));
+        }
+        assert_eq!(s.nodes(), 0, "the last node went with the last entry");
+        let back = round_trip(&s);
+        assert!(back.is_empty());
+        // The whole reason an empty stream is kept: a new entry still has to
+        // beat the ID of one that is gone.
+        assert_eq!(back.last_id(), Id::new(3, 0));
+        round_trip(&Stream::new());
+    }
+
+    #[test]
+    fn a_frozen_stream_that_arrives_damaged_is_an_error_and_not_a_panic() {
+        let mut s = logged(8);
+        s.create_group(b"workers", Id::MIN, Some(0));
+        read(&mut s, "workers", "alice", Some(3), 1_000);
+        let mut bytes = Vec::new();
+        s.freeze(&mut bytes);
+
+        for cut in 0..bytes.len() {
+            assert!(Stream::thaw(&bytes[..cut]).is_err(), "cut at {cut}");
+        }
+        // Every bit of the header and the front of the first node, which is
+        // where the counts and the lengths that a reader trusts all live.
+        for at in 0..bytes.len().min(40) {
+            for bit in 0..8 {
+                let mut bad = bytes.clone();
+                bad[at] ^= 1 << bit;
+                // It either parses into some other stream or it does not. Either
+                // way it comes back rather than going through a length that was
+                // never checked.
+                let _ = Stream::thaw(&bad);
+            }
+        }
+        assert_eq!(Stream::thaw(&[]), Err(Broken::Short));
+        assert_eq!(Stream::thaw(&[9]), Err(Broken::Form));
     }
 
     #[test]

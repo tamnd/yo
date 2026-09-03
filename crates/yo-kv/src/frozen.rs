@@ -1,9 +1,9 @@
 //! The bytes a collection body turns into on its way out of memory.
 //!
 //! A string demotes by handing the bytes it already is to the tier. A set, a
-//! hash, a list or a sorted set cannot do that, because its body is a table or a
-//! band or a listpack sitting in a [`Slab`](crate::slab), and the pointers in it
-//! mean nothing to anyone reading the file back. So it is written out as a form
+//! hash, a list, a sorted set, an array or a stream cannot do that, because its
+//! body is a table or a band or a listpack sitting in a [`Slab`](crate::slab),
+//! and the pointers in it mean nothing to anyone reading the file back. So it is written out as a form
 //! byte and whatever that form needs, and read back into the same representation
 //! it left in. This module is the plumbing both directions share.
 //!
