@@ -31,9 +31,15 @@
 //!
 //! The part of JSONPath that names exactly one place: a root, member access by
 //! name, and element access by index counting from either end. The parts that
-//! name a set of places, `[*]` and `..` and `?(@.x > 1)`, come with the
-//! RedisJSON surface, because they answer a list and everything here answers at
-//! most one value.
+//! name a set of places, `[*]` and `..` and a slice and a union, are in
+//! [`query`](crate::query), because they answer a list and everything here
+//! answers at most one value.
+//!
+//! Both grammars read the same path the same way where they overlap, so a
+//! caller that knows it wants one field uses this and pays no allocation, and
+//! one that has taken a path from a client parses it with
+//! [`Path`](crate::Path) and finds out from
+//! [`is_definite`](crate::Path::is_definite) whether it named one place.
 
 use yo_common::{Code, Error, Result};
 
@@ -89,7 +95,9 @@ impl<'a> Steps<'a> {
             b'.' => {
                 self.rest = &self.rest[1..];
                 if self.rest.first() == Some(&b'.') {
-                    return Err(bad("a descent, `..`, names more than one place"));
+                    return Err(bad(
+                        "a descent, `..`, names more than one place, so it is read by `Path` and not here",
+                    ));
                 }
                 let end = self
                     .rest
@@ -127,7 +135,9 @@ impl<'a> Steps<'a> {
         let inner = &body[..close];
         self.rest = &body[close + 1..];
         if inner == b"*" {
-            return Err(bad("a wildcard, `[*]`, names more than one place"));
+            return Err(bad(
+                "a wildcard, `[*]`, names more than one place, so it is read by `Path` and not here",
+            ));
         }
         if let Some(quoted) = quoted(inner) {
             return Ok(Step::Key(quoted));
