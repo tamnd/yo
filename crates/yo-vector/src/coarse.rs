@@ -44,7 +44,7 @@
 //! under an anchor further away than every anchor holding a few hundred near
 //! misses.
 //!
-//! # It is only used to give a vector a home, and that is the whole design
+//! # It never decides anything, and that is the whole design
 //!
 //! The first version of this was used everywhere a nearest centroid was wanted,
 //! and it made the index ten times slower rather than faster. That is worth
@@ -63,25 +63,40 @@
 //! Placing a new vector has no such loop. The vector has no partition yet, so a
 //! near miss costs one vector sitting in a partition next to the right one, and
 //! nothing about that makes the next placement worse. That is a recall cost and
-//! it is bounded and it is measurable, which the other one was not. So the sweep
-//! keeps its exact comparison, which after `sweep` was made local is a
-//! comparison against three centroids and cheap, and the layer is used for the
-//! two places where a vector has no home to compare against:
-//! [`Partitions::insert`](crate::Partitions::insert), and the rehoming a merge
-//! does when it dissolves a partition and has to find somewhere for every member
-//! that was in it.
+//! it is bounded and it is measurable, which the other one was not.
 //!
-//! The merge case is worth its own note, because it is the one that pays for the
-//! layer at a high dimension. A merge is per member and it used to be an exact
-//! scan per member, so a collection with small postings spent nearly all of its
-//! ingest there. Measured by `examples/ingest.rs` at 1024 dimensions with
-//! posting 24 and replication off, which builds 4849 partitions out of a hundred
-//! thousand vectors: 764 vectors a second overall with the exact scan and 2431
-//! with the shortlist, and 558 against 2298 over the last quarter of the run.
-//! The `touched` column does not move, so it is the same members being visited
-//! and only the lookup got cheaper. It is a rehoming and not a sweep, so the
-//! feedback loop above does not apply: the member has just had its partition
-//! taken away from it.
+//! So the line is not which call sites are allowed to use the layer, it is what
+//! the answer is used for. Deciding where a member that already has a partition
+//! should live has to be exact, and everything else can be approximate. That
+//! puts three call sites on the layer. Placing a new vector, which is
+//! [`Partitions::insert`](crate::Partitions::insert). Rehoming the members of a
+//! partition a merge has just dissolved, which is the same question because
+//! their partition has been taken away from them. And picking which partitions
+//! a sweep should look in after a split, which is not a decision at all: every
+//! member the sweep then visits is compared exactly against the centroids that
+//! changed, so a neighbour the layer missed costs a few members not moving yet
+//! and the next split in that neighbourhood picks them up. The sweep's own
+//! comparison, the one the feedback loop above was about, is still exact and is
+//! still against three centroids.
+//!
+//! The two maintenance sites are what pay for the layer at a high dimension, and
+//! they are worth measuring apart because they are not the same size. Measured
+//! by `examples/ingest.rs` at 1024 dimensions with posting 24 and replication
+//! off, which builds 4849 partitions out of a hundred thousand vectors: 764
+//! vectors a second overall with both exact, 1474 with only the merge on the
+//! layer, and 2431 with the sweep's neighbour pick on it as well. Over the last
+//! quarter of the run, which is the part that says what happens at a real size,
+//! that is 558 then 1189 then 2298. The `touched` column does not move at any of
+//! the three, so it is the same members being visited and only the lookup got
+//! cheaper.
+//!
+//! The recall that costs is nothing that can be measured. On SIFT1M with one bit
+//! codes at probe 128 and rerank 32, recall at 10 is 0.9898 with both exact and
+//! 0.9919 with both on the layer, and across the patience settings the two
+//! differ by two or three thousandths in each direction. The partition counts
+//! come out at 6914 and 6880, so the sweep is genuinely making different
+//! decisions and the answers are the same anyway, which is what the argument
+//! above predicted.
 //!
 //! A search does not use it either, and that one was measured rather than
 //! argued. Ranking every centroid is the fixed cost of every search, it is a
