@@ -332,6 +332,19 @@ impl Coarse {
     /// Unranked because the caller is going to measure them properly anyway, and
     /// the whole job of this is to hand over a short list rather than an answer.
     pub(crate) fn shortlist(&self, x: &[f32], dim: usize, out: &mut Vec<u32>) {
+        self.shortlist_of(x, dim, KEEP, out);
+    }
+
+    /// The same, collecting at least `want` candidates rather than [`KEEP`].
+    ///
+    /// A placement wants one partition and a shortlist of a few hundred is a
+    /// long way past what it takes to get that one right. A search wants the
+    /// nearest `probe` of them in order, and the hundredth nearest is a much
+    /// harder question than the first, so it has to ask for a wider list. `want`
+    /// is a floor and not a ceiling: the walk stops at the first anchor that
+    /// takes the count past it, so the list that comes back is usually longer.
+    pub(crate) fn shortlist_of(&self, x: &[f32], dim: usize, want: usize, out: &mut Vec<u32>) {
+        let want = want.max(KEEP);
         out.clear();
         // The nearest few anchors, by insertion into a fixed array rather than
         // by sorting all of them into a `Vec`. This runs on the insert path and
@@ -358,7 +371,7 @@ impl Coarse {
             // At least two anchors whatever the counts say, because the boundary
             // between the first two is exactly where a single anchor is most
             // likely to have the wrong side of the answer.
-            if out.len() >= KEEP && out.len() > list.len() {
+            if out.len() >= want && out.len() > list.len() {
                 break;
             }
         }

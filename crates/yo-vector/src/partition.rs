@@ -339,6 +339,20 @@ pub trait Filter {
     fn exact(&self, _id: u64) -> bool {
         true
     }
+
+    /// Whether this filter can turn members away.
+    ///
+    /// A search that can be turned away has to be ready to look further than
+    /// `probe` partitions, because the nearest ones may not hold `k` members
+    /// that pass, and getting ready to costs something before the first
+    /// partition is read: the probe order has to be built `widen` times longer
+    /// than the search will use if it never widens. Saying no here is how a
+    /// search that cannot be turned away avoids paying for the case that cannot
+    /// happen to it. The default is yes, because a filter that answers wrongly
+    /// here returns short answers rather than slow ones.
+    fn narrowing(&self) -> bool {
+        true
+    }
 }
 
 /// The filter that lets everything through, which is what an unfiltered search
@@ -349,6 +363,10 @@ pub struct Any;
 impl Filter for Any {
     fn allows(&self, _tag: u64) -> bool {
         true
+    }
+
+    fn narrowing(&self) -> bool {
+        false
     }
 }
 
@@ -1120,12 +1138,18 @@ impl Partitions {
         // grown rather than cleared, because every partition after the first
         // wants the same room the one before it did.
         let mut scores: Vec<f32> = Vec::new();
-        let reach = self.tuning.probe.saturating_mul(self.tuning.widen.max(1));
+        // A filter that turns nothing away can never widen, so it does not have
+        // to pay for a probe order it will not read.
+        let reach = if filter.narrowing() {
+            self.tuning.probe.saturating_mul(self.tuning.widen.max(1))
+        } else {
+            self.tuning.probe
+        };
         let mut work = Work::default();
         // How many partitions in a row have gone by without one of their members
         // being good enough to displace an answer. See [`Tuning::patience`].
         let mut quiet = 0;
-        for (n, p) in self.near_partitions(&u, reach).into_iter().enumerate() {
+        for (n, p) in self.probe_order_of(&u, reach).into_iter().enumerate() {
             // Two reasons to stop, and both of them need enough answers in hand
             // first. Past the partitions an unfiltered search would have read,
             // keep going only while there is still not enough to answer with; an
@@ -1334,11 +1358,18 @@ impl Partitions {
         let (members, xs) = self.take(p, vectors);
         let dim = self.dim();
         self.drop_partition(p);
+        // The same approximate lookup an insert uses, and for the same reason.
+        // An exact one is a distance to every centroid in the collection, once
+        // per member of the partition being emptied, and a merge is the one
+        // maintenance job whose whole cost is that lookup. Measured at 1024
+        // dimensions and 4849 partitions it is most of an ingest.
+        let mut short = core::mem::take(&mut self.scratch);
         for (i, m) in members.iter().enumerate() {
             let x = &xs[i * dim..(i + 1) * dim];
-            let to = self.nearest(x);
+            let to = self.roughly_nearest(x, &mut short);
             self.place(to, m.id, m.tag, x);
         }
+        self.scratch = short;
         members.len()
     }
 
@@ -1373,7 +1404,7 @@ impl Partitions {
         let mut look: Vec<usize> = Vec::new();
         for &p in changed {
             let centre = self.centroid(p).to_vec();
-            for q in self.near_partitions(&centre, self.tuning.sweep) {
+            for q in self.probe_order_of(&centre, self.tuning.sweep) {
                 if !changed.contains(&q) && !look.contains(&q) {
                     look.push(q);
                 }
@@ -1442,6 +1473,49 @@ impl Partitions {
     }
 
     /// The `n` partitions whose centroids are nearest `x`, nearest first.
+    /// The same, through the coarse layer, which is what a search uses.
+    ///
+    /// # Why the exact one was not good enough
+    ///
+    /// [`Partitions::near_partitions`] measures the query against every centroid
+    /// in the collection. That is fine at a few hundred partitions and it is the
+    /// whole cost of a query at several thousand: a million MS-MARCO passages
+    /// build 7707 partitions at 1024 dimensions, so an exact probe order is
+    /// nearly eight million multiply and adds before a single code has been
+    /// read, and the scan it is choosing for is a tenth of that. It is the same
+    /// quadratic [`crate::coarse`] was built to take off the insert path,
+    /// sitting on the search path where nobody had looked for it, and it was
+    /// invisible for as long as everything was measured on SIFT, which is 128
+    /// dimensions and cheap enough per centroid to hide it.
+    ///
+    /// So the search asks the layer for a shortlist and ranks that exactly. The
+    /// shortlist is asked to be four times as long as the search will read,
+    /// because the layer only has to get the neighbourhood right and a query's
+    /// nearest hundred partitions all sit in the nearest handful of anchors.
+    /// Below [`crate::coarse::FLOOR`] partitions there is no layer and this is
+    /// the exact walk, which is also what every test in this file runs.
+    fn probe_order_of(&self, x: &[f32], n: usize) -> Vec<usize> {
+        if !self.coarse.ready() {
+            return self.near_partitions(x, n);
+        }
+        let mut short = Vec::new();
+        self.coarse.shortlist_of(x, self.dim(), n * 4, &mut short);
+        if short.len() <= n {
+            // The layer had nothing to narrow, so ranking its answer is the same
+            // work as ranking everything and one of them is right.
+            return self.near_partitions(x, n);
+        }
+        let mut by: Vec<(usize, f32)> = short
+            .iter()
+            .map(|&p| (p as usize, sqdist(x, self.centroid(p as usize))))
+            .collect();
+        let n = n.min(by.len());
+        by.select_nth_unstable_by(n.saturating_sub(1), |a, b| a.1.total_cmp(&b.1));
+        by.truncate(n);
+        by.sort_by(|a, b| a.1.total_cmp(&b.1));
+        by.into_iter().map(|(p, _)| p).collect()
+    }
+
     fn near_partitions(&self, x: &[f32], n: usize) -> Vec<usize> {
         let mut by: Vec<(usize, f32)> = (0..self.postings.len())
             .map(|p| (p, sqdist(x, self.centroid(p))))
