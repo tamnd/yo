@@ -135,6 +135,7 @@ pub mod elem;
 pub mod evict;
 pub mod expiry;
 pub mod foreign;
+pub mod frozen;
 pub mod geo;
 pub mod geos;
 pub mod grow;

@@ -57,6 +57,7 @@
 //! arms.
 
 use crate::elem::Elements;
+use crate::frozen::{self, Broken};
 use crate::intset::Intset;
 use crate::listpack::{self, Listpack};
 use crate::parts::{PARTITION_AT, Parts, parts_for};
@@ -65,6 +66,21 @@ use yo_common::num::{DIGITS_MAX, i64_digits, i64_len, parse_i64};
 
 /// A set member: bytes as they lie, or an integer not yet formatted.
 pub type Member<'a> = listpack::Entry<'a>;
+
+/// A single run intset, written as the Redis layout it already is.
+const FORM_INTSET: u8 = 1;
+/// A listpack, written as the layout it already is.
+const FORM_PACKED: u8 = 2;
+/// An intset that has split into runs, written as ascending gaps.
+const FORM_RUNS: u8 = 3;
+/// A table or a band, written as its members.
+const FORM_MEMBERS: u8 = 4;
+/// The top bit of the form byte, which carries [`Set::ints_past_limit`].
+///
+/// In the form byte rather than a byte of its own because it only ever means
+/// anything for the two integer forms, and a set that has to be told what to call
+/// itself has already been told what it is.
+const PAST_LIMIT: u8 = 0x80;
 
 /// A member on its way to being asked about, in every form the three
 /// representations want it in.
@@ -328,6 +344,129 @@ impl Set {
             Body::Ints(s) if !self.ints_past_limit => s.as_bytes(),
             Body::Packed(lp) => Some(lp.as_bytes()),
             _ => None,
+        }
+    }
+
+    /// Write the set out as the bytes it becomes when it leaves memory.
+    ///
+    /// One form byte and then whatever that form needs. The two representations
+    /// that already have a flat layout, the single run intset and the listpack,
+    /// are written as themselves and cost one byte, because those bytes are
+    /// exactly what has to come back. The other two are written as their members.
+    ///
+    /// The form carries enough to land back in the same representation, which
+    /// [`crate::rdb`] deliberately does not: `ints_past_limit` rides in the top
+    /// bit of the form byte, and a set of integers that has split into runs is
+    /// its own form rather than a list of members, so that a million integers do
+    /// not come back as a hash table at thirty bytes a member. A value that
+    /// changed encoding because it was quiet long enough to be demoted would be a
+    /// value whose `OBJECT ENCODING` depends on memory pressure.
+    ///
+    /// See [`Set::thaw`], which is the other half and reads exactly this.
+    pub fn freeze(&self, out: &mut Vec<u8>) {
+        let past = if self.ints_past_limit { PAST_LIMIT } else { 0 };
+        match &self.body {
+            // `as_bytes` and not `packed_bytes`, because the ceiling only decides
+            // what the encoding is called and the flag above carries that. A set
+            // over the ceiling still has the Redis layout while it is one run,
+            // and writing the layout it has beats writing its members.
+            Body::Ints(s) => match s.as_bytes() {
+                Some(bytes) => {
+                    out.push(FORM_INTSET | past);
+                    out.extend_from_slice(bytes);
+                }
+                // Split into runs, so there is no one blob. Ascending, so the
+                // gaps are what gets written: a dense set of integers is a byte
+                // a member here where its members as digits would be several.
+                None => {
+                    out.push(FORM_RUNS | past);
+                    frozen::put_uint(out, s.len() as u64);
+                    let mut prev = 0u64;
+                    for i in 0..s.len() {
+                        let v = s.at(i) as u64;
+                        frozen::put_uint(out, v.wrapping_sub(prev));
+                        prev = v;
+                    }
+                }
+            },
+            Body::Packed(lp) => {
+                out.push(FORM_PACKED);
+                out.extend_from_slice(lp.as_bytes());
+            }
+            Body::Table(_) | Body::Split(_) => {
+                out.push(FORM_MEMBERS);
+                frozen::put_uint(out, self.len() as u64);
+                let mut digits = [0u8; DIGITS_MAX];
+                for m in self.iter() {
+                    match m {
+                        Member::Str(bytes) => frozen::put_bytes(out, bytes),
+                        // Neither of these two bodies stores an integer as one,
+                        // so this arm is for the type and not for a case that
+                        // arrives.
+                        Member::Int(n) => frozen::put_bytes(out, i64_digits(&mut digits, n)),
+                    }
+                }
+            }
+        }
+    }
+
+    /// Read back a set written by [`Set::freeze`].
+    ///
+    /// The count in the member form is a capacity and not a promise. It picks the
+    /// body and sizes it, and then the members decide the length, so a count that
+    /// disagrees with what follows costs a rehash and never a wrong set.
+    pub fn thaw(bytes: &[u8]) -> Result<Set, Broken> {
+        let mut cut = frozen::Cut::new(bytes);
+        let tag = cut.byte()?;
+        let ints_past_limit = tag & PAST_LIMIT != 0;
+        match tag & !PAST_LIMIT {
+            FORM_INTSET => Ok(Set {
+                body: Body::Ints(Intset::from_bytes(cut.rest()).map_err(|_| Broken::Body)?),
+                ints_past_limit,
+            }),
+            FORM_PACKED => Ok(Set {
+                body: Body::Packed(Listpack::from_bytes(cut.rest()).map_err(|_| Broken::Body)?),
+                ints_past_limit: false,
+            }),
+            FORM_RUNS => {
+                let n = usize::try_from(cut.uint()?).map_err(|_| Broken::Short)?;
+                let mut s = Intset::with_capacity(n);
+                let mut prev = 0u64;
+                for _ in 0..n {
+                    prev = prev.wrapping_add(cut.uint()?);
+                    s.add(prev as i64);
+                }
+                Ok(Set {
+                    body: Body::Ints(s),
+                    ints_past_limit,
+                })
+            }
+            FORM_MEMBERS => {
+                let n = usize::try_from(cut.uint()?).map_err(|_| Broken::Short)?;
+                // The same threshold the live set splits at, so a band that was
+                // demoted comes back a band. One that has shrunk under the
+                // threshold since comes back a table, which is the one place a
+                // round trip changes the body, and both of them answer
+                // `hashtable` so nothing outside can tell.
+                let mut set = Set {
+                    body: if n > PARTITION_AT {
+                        Body::Split(Parts::with_parts(parts_for(n)))
+                    } else {
+                        Body::Table(Elements::with_capacity(n))
+                    },
+                    ints_past_limit: false,
+                };
+                for _ in 0..n {
+                    let member = cut.bytes()?;
+                    match &mut set.body {
+                        Body::Table(t) => t.insert(member, ()).map_err(|_| Broken::Body)?,
+                        Body::Split(p) => p.insert(member, ()).map_err(|_| Broken::Body)?,
+                        _ => unreachable!("the body was just built as one of those two"),
+                    };
+                }
+                Ok(set)
+            }
+            _ => Err(Broken::Form),
         }
     }
 
@@ -813,6 +952,122 @@ mod tests {
             assert!(s.add(m.as_bytes(), &Limits::DEFAULT), "{m} was new");
         }
         s
+    }
+
+    /// Freeze a set, thaw it, and check that what came back is the same set in
+    /// the same representation.
+    ///
+    /// Members are compared as bytes and as a sorted list, because two of the
+    /// four bodies hold them in insertion order and a round trip through the
+    /// member form does not promise to preserve it. What it does promise is the
+    /// membership and the word `OBJECT ENCODING` answers, and those are what this
+    /// checks.
+    fn round_trip(set: &Set) -> Set {
+        let mut out = Vec::new();
+        set.freeze(&mut out);
+        let back = Set::thaw(&out).expect("what freeze wrote, thaw reads");
+        assert_eq!(back.len(), set.len(), "member count");
+        assert_eq!(back.encoding(), set.encoding(), "encoding");
+        let mut was: Vec<Vec<u8>> = set.iter().map(bytes_of).collect();
+        let mut now: Vec<Vec<u8>> = back.iter().map(bytes_of).collect();
+        was.sort_unstable();
+        now.sort_unstable();
+        assert_eq!(was, now, "members");
+        back
+    }
+
+    fn bytes_of(m: Member<'_>) -> Vec<u8> {
+        match m {
+            Member::Str(b) => b.to_vec(),
+            Member::Int(n) => n.to_string().into_bytes(),
+        }
+    }
+
+    #[test]
+    fn a_frozen_set_comes_back_in_the_body_it_left() {
+        // An intset, which is one run and goes out as the Redis layout.
+        let mut ints = Set::new();
+        for i in 0..100i64 {
+            ints.add(i.to_string().as_bytes(), &Limits::DEFAULT);
+        }
+        assert_eq!(ints.encoding(), Encoding::Intset);
+        round_trip(&ints);
+
+        // A listpack, same story with the other flat layout.
+        let packed = of(&["one", "two", "three"]);
+        assert_eq!(packed.encoding(), Encoding::Listpack);
+        round_trip(&packed);
+
+        // A table, which goes out as its members.
+        let mut table = Set::new();
+        for i in 0..500 {
+            table.add(format!("member:{i}").as_bytes(), &Limits::DEFAULT);
+        }
+        assert_eq!(table.encoding(), Encoding::Hashtable);
+        round_trip(&table);
+
+        // An empty set, which the keyspace never stores but which is one byte
+        // and should not need a special case anywhere.
+        round_trip(&Set::new());
+    }
+
+    #[test]
+    fn an_intset_past_its_ceiling_still_calls_itself_a_hashtable_after_a_round_trip() {
+        let mut s = Set::new();
+        for i in 0..2_000i64 {
+            s.add(i.to_string().as_bytes(), &Limits::DEFAULT);
+        }
+        // Past `set-max-intset-entries`, so it answers `hashtable` while its
+        // body is still an intset. That flag is the whole reason the form byte
+        // has a spare bit, and losing it would change what a client sees.
+        assert_eq!(s.encoding(), Encoding::Hashtable);
+        let back = round_trip(&s);
+        assert!(back.ints().is_some(), "still an intset underneath");
+    }
+
+    #[test]
+    fn a_large_set_of_integers_does_not_come_back_as_a_table() {
+        // Past the point where the runs split, which is the case the gap form
+        // exists for. Through a table it would be thirty bytes a member.
+        let mut s = Set::new();
+        for i in 0..200_000i64 {
+            s.add((i * 3).to_string().as_bytes(), &Limits::DEFAULT);
+        }
+        assert!(s.ints().is_some_and(|i| i.as_bytes().is_none()), "split");
+        let mut out = Vec::new();
+        s.freeze(&mut out);
+        let back = round_trip(&s);
+        assert!(back.ints().is_some(), "came back as integers");
+        // Gaps of three, so two bytes a member is the ceiling here and the
+        // digits would have been six. The check is against the loose bound
+        // because the point is the order of magnitude and not the byte.
+        assert!(out.len() < s.len() * 3, "{} bytes", out.len());
+    }
+
+    #[test]
+    fn a_partitioned_set_comes_back_partitioned() {
+        let mut s = Set::new();
+        for i in 0..=PARTITION_AT {
+            s.add(format!("member:{i}").as_bytes(), &Limits::DEFAULT);
+        }
+        assert!(matches!(s.body, Body::Split(_)), "split");
+        let back = round_trip(&s);
+        assert!(matches!(back.body, Body::Split(_)), "still split");
+    }
+
+    #[test]
+    fn a_frozen_set_that_arrives_damaged_is_an_error_and_not_a_panic() {
+        let s = of(&["one", "two", "three"]);
+        let mut out = Vec::new();
+        s.freeze(&mut out);
+        for cut in 1..out.len() {
+            // Every prefix, because a short read off the store can end anywhere
+            // and none of them may panic.
+            let _ = Set::thaw(&out[..cut]);
+        }
+        assert_eq!(Set::thaw(&[]).err(), Some(Broken::Short));
+        assert_eq!(Set::thaw(&[9]).err(), Some(Broken::Form));
+        assert_eq!(Set::thaw(&[FORM_INTSET, 1, 2]).err(), Some(Broken::Body));
     }
 
     /// What a set actually costs per member, which is half of M3's memory gate

@@ -34,7 +34,7 @@ use crate::list::{self, List};
 use crate::set::{self, Set};
 use crate::slab::{Bytes, Slab};
 use crate::stream::{self, Stream};
-use crate::tier::{Faulted, Relief, Tier};
+use crate::tier::{self, Faulted, Relief, Tier};
 use crate::ttl::{self, Applied, Ask, Cond};
 use crate::value::{self, Kind, Str};
 use crate::zset::{self, Zset};
@@ -110,8 +110,15 @@ pub struct Keyspace {
     /// Empty on a server that has never held one, which is every server today,
     /// and an empty slab is three words.
     pub(crate) foreign: Slab<Box<dyn Foreign>>,
-    /// How many keys hold something that is not a string.
+    /// How many keys hold a body that is in a slab right now.
     ///
+    /// Not how many hold something that is not a string, which is what it used to
+    /// be and what it still is on a database with no file behind it. A collection
+    /// that has been demoted has no slab slot, so it does not count here, and
+    /// that is what every reader of this number wants: [`Keyspace::free_body`]
+    /// has nothing to free for one, and a sweep has nothing to move.
+    ///
+
     /// This exists so that a database of nothing but strings, which is every
     /// benchmark today and most of what `SET` sees, can skip the body check in
     /// [`Keyspace::free_body`] on one predictable branch against a field that is
@@ -184,6 +191,16 @@ pub struct Keyspace {
     /// bytes and pass. The copy costs a key's worth of memcpy on a path that
     /// has just read a device, which is nothing next to what it is guarding.
     pub(crate) cold_key: Vec<u8>,
+    /// A collection body on its way to the file or on its way back.
+    ///
+    /// Not [`Keyspace::cold`], which holds the value of the last string that was
+    /// faulted and is read after the fact by [`Keyspace::value_of`]. This buffer
+    /// is written and consumed inside one call and nothing looks at it
+    /// afterwards, so sharing the other one would mean a `SADD` on a demoted set
+    /// quietly replacing the bytes a `GET` in the same pipeline was about to hand
+    /// back. One `Vec` each, cleared and refilled, is three words of a struct
+    /// that already has a hundred.
+    pub(crate) frozen: Vec<u8>,
     /// The last collection key that was resolved, for the command behind it.
     memo: Memo,
     /// One buffer for the commands that have to hold an element while the
@@ -428,6 +445,7 @@ impl Keyspace {
             tier: None,
             cold: Vec::new(),
             cold_key: Vec::new(),
+            frozen: Vec::new(),
             memo: Memo::empty(),
             scratch: Vec::with_capacity(SCRATCH),
             rows: Vec::new(),
@@ -777,13 +795,25 @@ impl Keyspace {
     /// rewriting the record every time a set was promoted, for the sake of a
     /// command nobody calls in a loop, and would leave two places able to
     /// disagree about the same fact.
+    /// A demoted set is brought back to answer, which is the one thing this
+    /// costs that the others do not. The word is a property of the body and the
+    /// body is on the device, so there is nothing else to read it off. It is one
+    /// device read for a command nobody sends in a loop, and the alternative is a
+    /// copy of the word in the record's two spare encoding bits with two places
+    /// then able to disagree about it.
     pub fn set_encoding(&mut self, key: &[u8]) -> Option<set::Encoding> {
         self.reap(key);
         let rec = self.map.get(key)?;
         if value::kind(rec) != Kind::Set {
             return None;
         }
-        let at = value::slot(rec);
+        let cold = value::Meta::from_byte(rec[0]).is_cold();
+        let at = if cold {
+            // The record is given up here, because promotion writes a new one.
+            self.promote_body(key).ok()??
+        } else {
+            value::slot(rec)
+        };
         Some(self.sets.get(at)?.encoding())
     }
 
@@ -963,31 +993,35 @@ impl Keyspace {
         if value::expire_at(rec) == at {
             return true;
         }
+        // A deadline does not move a value that is on the file, it changes the
+        // eight bytes in front of the address. So this writes a new pointer
+        // rather than reading the value back to write it out again, and `EXPIRE`
+        // on a demoted key costs no device read at all. That is the same promise
+        // `TTL` and `STRLEN` keep and it is why the header stayed in memory.
+        //
+        // Ahead of the type split rather than inside the string arm, because a
+        // demoted set is a pointer in exactly the same way and writing a slot
+        // record over one would leave a record pointing at a slab slot that
+        // belongs to something else.
+        if let Some(c) = value::cold(rec) {
+            let m = value::Meta::from_byte(rec[0]);
+            let (kind, enc) = (m.kind(), m.encoding());
+            let was = value::access(rec).unwrap_or_default();
+            self.map.set_with(
+                key,
+                value::cold_record_len(at.is_some()),
+                |_| {},
+                |out| {
+                    value::write_cold_record(out, kind, enc, c.at, c.len, at);
+                    value::set_access(out, was);
+                    value::has_expiry(out)
+                },
+            );
+            return true;
+        }
         // Read what has to survive out of the record before writing over it.
         match value::kind(rec) {
             Kind::String => {
-                if let Some(c) = value::cold(rec) {
-                    // A deadline does not move a value that is on the file, it
-                    // changes the eight bytes in front of the address. So this
-                    // writes a new pointer rather than reading the value back
-                    // to write it out again, and `EXPIRE` on a demoted key
-                    // costs no device read at all. That is the same promise
-                    // `TTL` and `STRLEN` keep and it is why the header stayed
-                    // in memory.
-                    let enc = value::Meta::from_byte(rec[0]).encoding();
-                    let was = value::access(rec).unwrap_or_default();
-                    self.map.set_with(
-                        key,
-                        value::cold_record_len(at.is_some()),
-                        |_| {},
-                        |out| {
-                            value::write_cold_record(out, Kind::String, enc, c.at, c.len, at);
-                            value::set_access(out, was);
-                            value::has_expiry(out)
-                        },
-                    );
-                    return true;
-                }
                 // Through the scratch buffer rather than a fresh `Vec`, since
                 // `EXPIRE` on a string is a command a cache sends as often as
                 // the `SET` before it.
@@ -1108,6 +1142,15 @@ impl Keyspace {
         let Some(rec) = self.map.get(key) else {
             return;
         };
+        // A body that has been moved to the file has no slab slot to give back,
+        // and the four bytes where the slot number would be are the front of an
+        // address. Reading them as a slot and freeing it would hand back a slot
+        // belonging to a different key. The chunks on the file are left where
+        // they are, which is what the log's compaction collects. See
+        // [`crate::tier`].
+        if value::Meta::from_byte(rec[0]).is_cold() {
+            return;
+        }
         match value::kind(rec) {
             Kind::String => {}
             Kind::Set => {
@@ -1202,8 +1245,8 @@ impl Keyspace {
 
     /// Move one key's value out to the file.
     ///
-    /// Answers whether it went. A key that is not there, one holding something
-    /// other than a string, one that is int encoded and one whose value is
+    /// Answers whether it went. A key that is not there, one that is int
+    /// encoded, one holding a type that does not move yet and one whose value is
     /// shorter than the pointer that would replace it all answer false, and so
     /// does every key on a database with nothing attached.
     ///
@@ -1211,13 +1254,26 @@ impl Keyspace {
     /// subcommand want. What a server under memory pressure wants is
     /// [`Keyspace::relieve`].
     ///
+    /// One entry point for both kinds of value, because a caller naming a key
+    /// should not have to know whether its body is in the record or in a slab.
+    /// The two paths underneath are different all the way down: a string goes
+    /// through the tier, and a collection goes through `demote_body` beside
+    /// this, which frees a slab slot and grows a record.
+    ///
     /// # Errors
     ///
     /// Whatever the store says when it will not take the bytes.
     pub fn demote(&mut self, key: &[u8]) -> Result<bool> {
-        let Some(tier) = self.tier.as_mut() else {
+        if self.tier.is_none() {
+            return Ok(false);
+        }
+        let Some(addr) = self.map.find(key) else {
             return Ok(false);
         };
+        if value::kind(self.map.value_at(addr)).is_body() {
+            return self.demote_body(key);
+        }
+        let tier = self.tier.as_mut().expect("checked at the top");
         tier.demote(&mut self.map, key)
     }
 
@@ -1265,6 +1321,22 @@ impl Keyspace {
     /// answers writes with OOM until somebody finds the third setting that turns
     /// the file on. That is a trap and not a default.
     ///
+    /// # Two passes, because the two kinds of value are counted in different
+    /// places
+    ///
+    /// Strings go first, through [`Tier::relieve`], which measures itself against
+    /// the arena because a string is its record and moving one makes the arena
+    /// smaller. Collections cannot be swept that way. A collection's body is in a
+    /// slab the arena knows nothing about, and moving one makes the arena
+    /// **bigger**, because a twenty byte pointer replaces an eight byte slot
+    /// number. A loop that watched the arena would demote every collection in the
+    /// database, watch its number go up the whole time, and never stop.
+    ///
+    /// So the second pass is here rather than in the tier, and it measures itself
+    /// against [`Keyspace::memory_bytes`], which is the arena and the slabs
+    /// together. That is the only number that goes down when a body moves, and it
+    /// is the number the server's limit is compared against anyway.
+    ///
     /// # Errors
     ///
     /// Whatever the store says when it will not take the bytes.
@@ -1278,15 +1350,290 @@ impl Keyspace {
             chosen => chosen,
         };
         let lfu = self.lfu;
+        let start = self.memory_bytes();
+        let target = start.saturating_sub(shed);
         let budget = self.map.memory_bytes().saturating_sub(shed);
         let tier = self.tier.as_mut().expect("checked just above");
-        let moved = tier.relieve(&mut self.map, budget, policy, now, lfu);
+        let mut relief = tier.relieve(&mut self.map, budget, policy, now, lfu)?;
         // A sweep compacts the arena, which moves records, and the memo holds a
         // record's address. It is normally thrown away by the map's write
         // counter moving, and a sweep that demoted nothing and compacted anyway
         // is the one case where that counter does not move.
         self.memo = Memo::empty();
-        moved
+        if self.bodies > 0 && self.memory_bytes() > target {
+            relief.moved += self.shed_bodies(target, policy, now, lfu)?;
+        }
+        relief.freed = start.saturating_sub(self.memory_bytes());
+        Ok(relief)
+    }
+
+    /// Sample the keyspace for collection bodies and move them out until
+    /// [`Keyspace::memory_bytes`] is under `target`.
+    ///
+    /// The same shape as [`Tier::relieve`]'s loop, with the same stop rule and
+    /// for the same reason: a round that finds nothing is a collision rather than
+    /// a conclusion, so it takes [`tier::BARREN`] of them in a row to give up.
+    /// What is different is the number being watched, which is explained on
+    /// [`Keyspace::relieve`], and that there is no compaction step in here. The
+    /// arena grows on this path rather than shrinking, so there is nothing for a
+    /// compaction to hand back that the string pass has not already taken.
+    fn shed_bodies(
+        &mut self,
+        target: usize,
+        policy: Policy,
+        now_ms: u64,
+        lfu: Lfu,
+    ) -> Result<usize> {
+        let mut moved = 0;
+        let mut barren = 0;
+        // The pool comes out of the keyspace for the length of the sweep, because
+        // it hands back a borrow of itself and demoting one victim needs the
+        // whole keyspace. `kb` is the same borrow copied somewhere it can live
+        // across that call, and it is one allocation for the sweep rather than
+        // one per victim.
+        let mut pool = core::mem::take(&mut self.pool);
+        let mut kb: Vec<u8> = Vec::new();
+        while self.memory_bytes() > target {
+            pool.clear();
+            let r = self.rng.next_u64();
+            let pool = &mut pool;
+            let mut seen = 0usize;
+            let mut found = 0usize;
+            // The body check is on the record and not on the slab, so the sample
+            // closure does not need a second borrow of the keyspace. A record
+            // that turns out to hold a body too small to be worth moving is
+            // refused by `demote_body`, which has the slab in hand by then.
+            self.map.sample(r, |k, v, _| {
+                seen += 1;
+                let m = value::Meta::from_byte(v[0]);
+                if !m.is_cold() && m.kind() == Kind::Set {
+                    pool.offer(k, evict::score(v, policy, now_ms, lfu));
+                    found += 1;
+                }
+                found < evict::CANDIDATES && seen < tier::WALK
+            });
+
+            let mut round = 0;
+            while let Some(k) = pool.take() {
+                kb.clear();
+                kb.extend_from_slice(k);
+                if self.demote_body(&kb)? {
+                    round += 1;
+                }
+            }
+            if round == 0 {
+                barren += 1;
+                if barren == tier::BARREN {
+                    break;
+                }
+                continue;
+            }
+            barren = 0;
+            moved += round;
+        }
+        self.pool = pool;
+        // Every demotion rewrote a record, so nothing the memo holds is worth
+        // keeping and one of the slot numbers in it is now a freed slab slot.
+        self.memo = Memo::empty();
+        Ok(moved)
+    }
+
+    /// Move `key`'s collection body out to the file.
+    ///
+    /// `Ok(false)` for a key that is not there, that holds a type this does not
+    /// move yet, that is already on the file, or whose body is smaller than the
+    /// pointer that would replace it. None of those is an error, for the same
+    /// reason none of them is in [`crate::tier::demote`](Tier::demote): a sweep
+    /// asks about a lot of keys and most of the answers are no.
+    ///
+    /// # What is different from a string
+    ///
+    /// A string's value is its record, so the tier can read it, write it out and
+    /// rewrite the record without anyone else being involved. A collection's body
+    /// is in a slab and its record holds a four byte number, so three things have
+    /// to happen here and only here: the body is turned into bytes that mean
+    /// something on a device, the slab slot is freed, and the record grows from
+    /// eight bytes to twenty because an address and a length are longer than a
+    /// slot number.
+    ///
+    /// That last part is why the memory a sweep frees does not show up in the
+    /// arena. Demoting a collection makes the arena bigger and the slab smaller,
+    /// and it is the sum that goes down. See [`Keyspace::relieve`].
+    ///
+    /// # Errors
+    ///
+    /// Whatever the store says when it cannot take the bytes.
+    pub(crate) fn demote_body(&mut self, key: &[u8]) -> Result<bool> {
+        if self.tier.is_none() {
+            return Ok(false);
+        }
+        let Some(addr) = self.map.find(key) else {
+            return Ok(false);
+        };
+        let rec = self.map.value_at(addr);
+        let m = value::Meta::from_byte(rec[0]);
+        // Sets only, for now. Every other collection wants the same three steps
+        // and a `freeze` of its own, and the shape of the third one is what this
+        // is establishing.
+        if m.is_cold() || m.kind() != Kind::Set {
+            return Ok(false);
+        }
+        let expire_at = value::expire_at(rec);
+        // Carried across and not restamped, as in `Tier::demote`. A key that was
+        // moved out was not used, and a demotion that looked like a use would
+        // make the next sweep pick the wrong victim.
+        let was = value::access(rec).unwrap_or_default();
+        let slot = value::slot(rec);
+        let Some(set) = self.sets.get(slot) else {
+            debug_assert!(false, "a set record with no set behind it");
+            return Ok(false);
+        };
+        // The same arithmetic the string side uses and not a tunable: a body
+        // that costs less to keep than the pointer to it would is left where it
+        // is. It is even more favourable here, because what a table costs in
+        // memory is well above what its members weigh on a device.
+        let grows_by = value::cold_record_len(expire_at.is_some())
+            - value::slot_record_len(expire_at.is_some());
+        if set.memory_bytes() <= grows_by {
+            return Ok(false);
+        }
+
+        let mut buf = core::mem::take(&mut self.frozen);
+        buf.clear();
+        set.freeze(&mut buf);
+        let tier = self.tier.as_mut().expect("checked at the top");
+        let wrote = tier.stash(&buf);
+        self.frozen = buf;
+        let chain = wrote?;
+
+        self.sets.remove(slot);
+        self.bodies -= 1;
+        let len = chain.len as u32;
+        let wrote = self.map.set_with(
+            key,
+            value::cold_record_len(expire_at.is_some()),
+            |_| {},
+            |out| {
+                // The encoding bits mean nothing on a collection record, which
+                // is what `Meta::slot` already writes and says. `OBJECT
+                // ENCODING` on a demoted set brings it back and asks the body,
+                // which is one device read for a command nobody sends in a
+                // loop, and is one place holding the fact rather than two.
+                value::write_cold_record(
+                    out,
+                    Kind::Set,
+                    value::Encoding::Int,
+                    chain.at,
+                    len,
+                    expire_at,
+                );
+                value::set_access(out, was);
+                value::has_expiry(out)
+            },
+        );
+        debug_assert!(wrote.is_some(), "the key was found a moment ago");
+        // Not cleared by hand. Writing the record moves the map's write counter
+        // and that is what the memo checks, so the slot number it is holding for
+        // this key is already unreachable.
+        Ok(true)
+    }
+
+    /// Send a cold record that holds a body back to [`Keyspace::promote_body`],
+    /// and say whether that is what happened.
+    ///
+    /// The guard in front of both fault entry points, and it is here rather than
+    /// in the tier because the tier cannot do this job. [`Tier::fault`] puts a
+    /// value back by writing a string record, so handing it a demoted set would
+    /// turn the set into a string holding the bytes a set freezes to. The kind is
+    /// in the record and only this side has a slab to put a body in.
+    ///
+    /// One probe of the map on a path that is about to read a device, on a
+    /// database that has a file at all. Every other database is refused by the
+    /// caller before it gets here.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the store says when the chain will not read back.
+    fn body_came_back(&mut self, key: &[u8]) -> Result<bool> {
+        let Some(addr) = self.map.find(key) else {
+            return Ok(false);
+        };
+        let m = value::Meta::from_byte(self.map.value_at(addr)[0]);
+        if !m.is_cold() || !m.kind().is_body() {
+            return Ok(false);
+        }
+        self.promote_body(key)?;
+        Ok(true)
+    }
+
+    /// Bring `key`'s collection body back into a slab and answer its new slot.
+    ///
+    /// The record has to be rewritten either way, because a resident collection
+    /// is a slot number and there is no way to hold one without being in the
+    /// slab, so the doorkeeper does not get a vote. See [`Tier::fetch`].
+    ///
+    /// # Errors
+    ///
+    /// Whatever the store says when the chain will not read back, and
+    /// [`Code::Corrupt`] when it reads back as something that is not a body.
+    fn promote_body(&mut self, key: &[u8]) -> Result<Option<u32>> {
+        let Some(addr) = self.map.find(key) else {
+            return Ok(None);
+        };
+        let rec = self.map.value_at(addr);
+        let Some(c) = value::cold(rec) else {
+            return Ok(None);
+        };
+        let kind = value::kind(rec);
+        let expire_at = value::expire_at(rec);
+        let was = value::access(rec).unwrap_or_default();
+        let Some(tier) = self.tier.as_mut() else {
+            debug_assert!(false, "a cold record on a database with no file");
+            return Ok(None);
+        };
+
+        let mut buf = core::mem::take(&mut self.frozen);
+        let read = tier.fetch(
+            crate::cold::Chain {
+                at: c.at,
+                len: u64::from(c.len),
+            },
+            &mut buf,
+        );
+        self.frozen = buf;
+        read?;
+
+        let slot = match kind {
+            Kind::Set => {
+                let set = Set::thaw(&self.frozen).map_err(|e| {
+                    Error::new(Code::Corrupt, "a demoted set did not read back")
+                        .with_detail(e.to_string())
+                })?;
+                self.sets.insert(set)
+            }
+            // Nothing else is written cold with a body yet, so arriving here
+            // means a record that says one thing and a demoter that did another.
+            _ => {
+                return Err(Error::new(
+                    Code::Corrupt,
+                    "a demoted body of a type that is not moved out",
+                )
+                .with_detail(kind.name().to_string()));
+            }
+        };
+        self.bodies += 1;
+        let wrote = self.map.set_with(
+            key,
+            value::slot_record_len(expire_at.is_some()),
+            |_| {},
+            |out| {
+                value::write_slot_record(out, kind, slot, expire_at);
+                value::set_access(out, was);
+                value::has_expiry(out)
+            },
+        );
+        debug_assert!(wrote.is_some(), "the key was found a moment ago");
+        Ok(Some(slot))
     }
 
     /// Read `key`'s value off the file into [`Keyspace::cold`], if that is where
@@ -1302,9 +1649,13 @@ impl Keyspace {
     ///
     /// Whatever the store says when the chain will not read back.
     pub(crate) fn warm(&mut self, key: &[u8]) -> Result<Faulted> {
-        let Some(tier) = self.tier.as_mut() else {
+        if self.tier.is_none() {
             return Ok(Faulted::Warm);
-        };
+        }
+        if self.body_came_back(key)? {
+            return Ok(Faulted::Promoted);
+        }
+        let tier = self.tier.as_mut().expect("checked at the top");
         let mut buf = core::mem::take(&mut self.cold);
         let r = tier.fault(&mut self.map, key, &mut buf);
         self.cold = buf;
@@ -1330,9 +1681,13 @@ impl Keyspace {
     ///
     /// Whatever the store says when the chain will not read back.
     pub(crate) fn thaw(&mut self, key: &[u8]) -> Result<()> {
-        let Some(tier) = self.tier.as_mut() else {
+        if self.tier.is_none() {
             return Ok(());
-        };
+        }
+        if self.body_came_back(key)? {
+            return Ok(());
+        }
+        let tier = self.tier.as_mut().expect("checked at the top");
         let mut buf = core::mem::take(&mut self.cold);
         let r = tier.thaw(&mut self.map, key, &mut buf);
         self.cold = buf;
@@ -1477,6 +1832,12 @@ impl Keyspace {
         if value::kind(rec) != want {
             return Err(wrong_type());
         }
+        // One test of a bit in a byte that is already in a register, on the
+        // funnel every collection command comes through. A database with no file
+        // behind it never sets it and pays that test and nothing else.
+        if value::Meta::from_byte(rec[0]).is_cold() {
+            return self.promote_body(key);
+        }
         let slot = value::slot(rec);
         // A key with a deadline is not memoized. The memo is invalidated by
         // writes and a deadline passes without one, so remembering a dated key
@@ -1527,6 +1888,11 @@ impl Keyspace {
         let kind = value::kind(rec);
         if kind != a && kind != b {
             return Err(wrong_type());
+        }
+        // As in `live_slot`, and the kind was read before the record was given
+        // up because promotion rewrites it.
+        if value::Meta::from_byte(rec[0]).is_cold() {
+            return Ok(self.promote_body(key)?.map(|slot| (kind, slot)));
         }
         let slot = value::slot(rec);
         let dated = value::expire_at(rec).is_some();
