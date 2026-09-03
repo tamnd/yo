@@ -17,6 +17,7 @@
 
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
 use std::hint::black_box;
+use std::time::{Duration, Instant};
 use yo_reactor::Reactor;
 use yo_resp::engine::{Cmd, ConnId, Sink, Wire, pump};
 
@@ -241,6 +242,232 @@ fn bench_srandmember(c: &mut Criterion) {
     bench_over(c, "srandmember", &[b"SRANDMEMBER", b"set:hot"], fill_hot);
 }
 
+/// How many entries the hot stream holds before the stream rows start.
+///
+/// Enough to be many listpack nodes rather than one, because a stream that fits
+/// in a single node has no node walk in it and the node walk is most of what a
+/// range costs.
+const ENTRIES: u64 = 100_000;
+
+/// The cap the stream rows keep the hot stream under.
+///
+/// A bench that appends for five seconds and never trims is a bench that ends up
+/// measuring an allocator against a stream nobody would run. The tilde makes the
+/// trim node at a time, which is what a real `MAXLEN ~` does and is why the trim
+/// is close to free most of the time it is asked for.
+const CAP: &[u8] = b"100000";
+
+/// Fill `stream:hot` with [`ENTRIES`] entries and give it a consumer group.
+///
+/// The ids are explicit and consecutive so that the rows which have to name an
+/// entry can work out what to name without asking.
+fn fill_stream(r: &mut Reactor<Wire<Null>>, conn: ConnId) {
+    fill_stream_of(r, conn, ENTRIES);
+}
+
+/// The same with the entry count named.
+///
+/// The group rows use a short stream. They read from the tail and they measure
+/// the group lookup, the delivery and the pending list, none of which knows how
+/// many nodes are sitting behind the entry being handed over. They also rebuild
+/// the fixture once a sample rather than once a row, so a hundred thousand
+/// entries there would be a minute of setup for a number that does not move.
+fn fill_stream_of(r: &mut Reactor<Wire<Null>>, conn: ConnId, entries: u64) {
+    let mut batch = Vec::new();
+    let mut stream = Vec::new();
+    for i in 1..=entries {
+        let id = format!("{i}-0");
+        stream.extend_from_slice(&wire(&[b"XADD", b"stream:hot", id.as_bytes(), b"f", b"v"]));
+        if i % 64 == 0 {
+            r.engine_mut().feed(conn, &stream);
+            pump(r, &mut batch);
+            stream.clear();
+        }
+    }
+    r.engine_mut().feed(conn, &stream);
+    pump(r, &mut batch);
+    // `$` and not `0`, so the group starts at the end and the rows that read
+    // with `>` see the entries they added themselves and nothing else.
+    r.engine_mut().feed(
+        conn,
+        &wire(&[b"XGROUP", b"CREATE", b"stream:hot", b"g", b"$"]),
+    );
+    pump(r, &mut batch);
+}
+
+/// The append, capped so the stream stays the size a running one would be.
+fn bench_xadd(c: &mut Criterion) {
+    bench_over(
+        c,
+        "xadd",
+        &[
+            b"XADD",
+            b"stream:hot",
+            b"MAXLEN",
+            b"~",
+            CAP,
+            b"*",
+            b"f",
+            b"v",
+        ],
+        fill_stream,
+    );
+}
+
+/// The length, which is a counter and no walk at all.
+///
+/// It is here for the same reason `exists` is: it is the row that says what a
+/// command costs when the command itself does nothing, so the other stream rows
+/// can be read as the walk plus this.
+fn bench_xlen(c: &mut Criterion) {
+    bench_over(c, "xlen", &[b"XLEN", b"stream:hot"], fill_stream);
+}
+
+/// Ten entries off the front, which is the shape a reader polling a log has.
+fn bench_xrange(c: &mut Criterion) {
+    bench_over(
+        c,
+        "xrange",
+        &[b"XRANGE", b"stream:hot", b"-", b"+", b"COUNT", b"10"],
+        fill_stream,
+    );
+}
+
+/// How many entries the hot stream holds before the group rows start.
+const GROUP_ENTRIES: u64 = 1024;
+
+/// Add entries to the hot stream, untimed, and answer the ids they got.
+fn add_entries(r: &mut Reactor<Wire<Null>>, conn: ConnId, next: &mut u64, n: usize) -> Vec<u64> {
+    let mut batch = Vec::new();
+    let mut stream = Vec::new();
+    let mut ids = Vec::with_capacity(n);
+    for _ in 0..n {
+        *next += 1;
+        ids.push(*next);
+        let id = format!("{next}-0");
+        stream.extend_from_slice(&wire(&[
+            b"XADD",
+            b"stream:hot",
+            b"MAXLEN",
+            b"~",
+            CAP,
+            id.as_bytes(),
+            b"f",
+            b"v",
+        ]));
+    }
+    r.engine_mut().feed(conn, &stream);
+    pump(r, &mut batch);
+    ids
+}
+
+/// The delivery, with the entries it delivers added outside the clock.
+///
+/// This row cannot be written the way the others are. `XREADGROUP` with `>`
+/// consumes what it reads, so a batch fed to a stream that has run out is
+/// measuring how fast we say there is nothing new, which is not the row anyone
+/// means. So the entries are added before each timed batch and the clock only
+/// covers the read, which is what `iter_custom` is for. Everything the setup
+/// costs stays out of the number.
+fn bench_xreadgroup(c: &mut Criterion) {
+    let mut g = c.benchmark_group("engine/xreadgroup");
+
+    for depth in [1usize, 16, 64] {
+        let stream = pipelined(
+            &[
+                b"XREADGROUP",
+                b"GROUP",
+                b"g",
+                b"c1",
+                b"COUNT",
+                b"1",
+                b"STREAMS",
+                b"stream:hot",
+                b">",
+            ],
+            depth,
+        );
+        g.throughput(Throughput::Elements(depth as u64));
+        g.bench_function(format!("p{depth}"), |b| {
+            b.iter_custom(|iters| {
+                let (mut r, conn, mut batch) = ready(Null::default());
+                fill_stream_of(&mut r, conn, GROUP_ENTRIES);
+                let mut next = GROUP_ENTRIES;
+                let mut total = Duration::ZERO;
+                for _ in 0..iters {
+                    // One entry a command, so every command in the batch has
+                    // something of its own to deliver.
+                    add_entries(&mut r, conn, &mut next, depth);
+                    let at = Instant::now();
+                    r.engine_mut().feed(conn, black_box(&stream));
+                    black_box(pump(&mut r, &mut batch));
+                    total += at.elapsed();
+                }
+                total
+            });
+        });
+    }
+
+    g.finish();
+}
+
+/// The acknowledgement, on entries that really are pending.
+///
+/// Same problem as [`bench_xreadgroup`] and the same answer. An `XACK` of an id
+/// nobody is holding is a lookup and a miss, and the row that matters is the one
+/// where the id comes out of the pending list.
+fn bench_xack(c: &mut Criterion) {
+    let mut g = c.benchmark_group("engine/xack");
+
+    for depth in [1usize, 16, 64] {
+        let read = pipelined(
+            &[
+                b"XREADGROUP",
+                b"GROUP",
+                b"g",
+                b"c1",
+                b"COUNT",
+                b"1",
+                b"STREAMS",
+                b"stream:hot",
+                b">",
+            ],
+            depth,
+        );
+        g.throughput(Throughput::Elements(depth as u64));
+        g.bench_function(format!("p{depth}"), |b| {
+            b.iter_custom(|iters| {
+                let (mut r, conn, mut batch) = ready(Null::default());
+                fill_stream_of(&mut r, conn, GROUP_ENTRIES);
+                let mut next = GROUP_ENTRIES;
+                let mut total = Duration::ZERO;
+                for _ in 0..iters {
+                    let ids = add_entries(&mut r, conn, &mut next, depth);
+                    r.engine_mut().feed(conn, &read);
+                    pump(&mut r, &mut batch);
+                    let mut acks = Vec::new();
+                    for id in &ids {
+                        let id = format!("{id}-0");
+                        acks.extend_from_slice(&wire(&[
+                            b"XACK",
+                            b"stream:hot",
+                            b"g",
+                            id.as_bytes(),
+                        ]));
+                    }
+                    let at = Instant::now();
+                    r.engine_mut().feed(conn, black_box(&acks));
+                    black_box(pump(&mut r, &mut batch));
+                    total += at.elapsed();
+                }
+                total
+            });
+        });
+    }
+
+    g.finish();
+}
+
 /// Sixteen connections with one command each against one connection with
 /// sixteen.
 ///
@@ -291,6 +518,11 @@ criterion_group!(
     bench_sadd,
     bench_sadd_alternating,
     bench_srandmember,
+    bench_xadd,
+    bench_xlen,
+    bench_xrange,
+    bench_xreadgroup,
+    bench_xack,
     bench_fanout
 );
 criterion_main!(benches);
