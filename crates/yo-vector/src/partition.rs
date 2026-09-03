@@ -100,7 +100,7 @@
 //! same machine, and it cut the insert half by three times, 45.9 seconds to
 //! 15.3, which is why insert and maintenance have swapped places in that table.
 //!
-//! The fourth was [`Partitions::job`], which used to ask its two questions by
+//! The fourth was `Partitions::job`, which used to ask its two questions by
 //! walking every partition twice, once per vector inserted. That is the same
 //! quadratic the coarse layer exists to remove, hiding one level up, and by 1.6
 //! million vectors it was around a fifth of an ingest spent deciding there was
