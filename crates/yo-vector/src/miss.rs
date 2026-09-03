@@ -110,9 +110,12 @@ fn read_vecs<T: Le>(path: &str) -> (usize, Vec<T>) {
 }
 
 /// The dataset directory names its own files, so `sift/` holds `sift_base.fvecs`.
+///
+/// Both separators, because this gets run on gamingpc as often as anywhere and
+/// `C:\Users\gopher\data\msmarco` has no forward slash in it to split on.
 fn prefix(dir: &str) -> &str {
-    let dir = dir.trim_end_matches('/');
-    dir.rsplit('/').next().unwrap_or(dir)
+    let dir = dir.trim_end_matches(['/', '\\']);
+    dir.rsplit(['/', '\\']).next().unwrap_or(dir)
 }
 
 /// Where every true neighbour sits in the probe order, over a slice of the
@@ -123,6 +126,10 @@ fn how_far_down_the_probe_order_the_answers_are() {
     let Ok(dir) = std::env::var("YO_DATASET") else {
         panic!("set YO_DATASET to a directory holding <name>_base.fvecs and the two beside it");
     };
+    // `set YO_DATASET=x && cargo test` on Windows puts the space before the
+    // ampersand inside the variable, and the error that causes names a path
+    // with a space in the middle of it and takes a while to read.
+    let dir = dir.trim().to_string();
     let queries: usize = std::env::var("YO_QUERIES")
         .ok()
         .and_then(|q| q.parse().ok())
