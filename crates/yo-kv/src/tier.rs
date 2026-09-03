@@ -32,12 +32,21 @@
 //! device read to prove it. That is the TinyLFU admission argument and it is the
 //! difference between a tier and a cache that thrashes.
 //!
-//! # What this does not do yet
+//! # Where the collections are
 //!
-//! Only strings, and only ones that are not int encoded. A collection keeps its
-//! body in a slab and its record holds a slab index, so demoting one means
-//! moving the body and not the record, which is the chunked band's other half
-//! and a separate piece of work.
+//! This file moves strings, and only ones that are not int encoded. A collection
+//! keeps its body in a slab and its record holds a slab index, so moving one
+//! means freeing a slab slot and growing a record, and neither of those is
+//! reachable from here. The two halves it does own are [`Tier::stash`] and
+//! [`Tier::fetch`], which are the store side with the record side left out, and
+//! the rest is in `Keyspace::demote_body` and `Keyspace::promote_body` beside
+//! it.
+//!
+//! A demoted body arriving at [`Tier::fault`] is refused rather than served,
+//! because putting a value back here means writing a string record and that
+//! would turn a set into a string. The caller routes them, and the refusal is
+//! there so that a caller which forgets gets an error instead of a corrupted
+//! key.
 //!
 //! Victims are chosen by sampling, through the same [`evict::Pool`] eviction
 //! uses, rather than by the S3-FIFO and SIEVE queues in [`demote`](crate::demote).
@@ -56,7 +65,7 @@
 //! true of the chunks a crash leaves behind between the last chunk write and the
 //! directory write.
 
-use yo_common::{Result, Rng};
+use yo_common::{Code, Error, Result, Rng};
 use yo_index::RawMap;
 
 use crate::access::{Lfu, Policy};
@@ -301,6 +310,54 @@ impl<B: Blocks> Tier<B> {
         Ok(true)
     }
 
+    /// Write `bytes` to the file and answer where they went.
+    ///
+    /// The store half of demotion with the record half left out, which is what a
+    /// collection needs. A string's value is its record, so [`Tier::demote`] can
+    /// do both ends and does. A collection's body is in a slab and its record
+    /// holds a number, so the caller is the only one that can free the slot and
+    /// rewrite the record, and all it wants from here is the chain.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the store says when it cannot take the bytes.
+    pub fn stash(&mut self, bytes: &[u8]) -> Result<cold::Chain> {
+        let chain = cold::write(&mut self.blocks, bytes, &mut self.scratch)?;
+        self.stats.demoted += 1;
+        self.stats.bytes_out += chain.len;
+        Ok(chain)
+    }
+
+    /// Read a chain back into `out`, which is cleared first.
+    ///
+    /// The other half of [`Tier::stash`], and the doorkeeper does not get a vote
+    /// here for the same reason it does not in [`Tier::thaw`]: a collection
+    /// command needs its body in a slab to answer at all, so there is no serving
+    /// it from the file and leaving it there. The read that costs one device read
+    /// is the read that promotes.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the store says when the chain will not read back.
+    pub fn fetch(&mut self, chain: cold::Chain, out: &mut Vec<u8>) -> Result<()> {
+        out.clear();
+        out.reserve(chain.len as usize);
+        // Same order as in `read`, and for the same reason: the release goes
+        // before the borrows and not after, because after is inside the scope
+        // that owns them.
+        self.blocks.release();
+        {
+            let reader = cold::Reader::open(&self.blocks, chain)?;
+            for piece in reader.range(0, reader.len()) {
+                out.extend_from_slice(piece?);
+            }
+        }
+        self.stats.faults += 1;
+        self.stats.bytes_in += chain.len;
+        self.stats.promoted += 1;
+        Ok(())
+    }
+
     /// Read `key`'s value, from the file if that is where it is.
     ///
     /// `out` is cleared and filled only when the answer is [`Faulted::Served`]
@@ -351,6 +408,18 @@ impl<B: Blocks> Tier<B> {
             return Ok(Faulted::Warm);
         };
         let m = value::Meta::from_byte(rec[0]);
+        if m.kind().is_body() {
+            // This puts a value back by writing a string record, so a demoted
+            // collection arriving here would come back as a string holding the
+            // bytes its body froze to. The caller routes those to
+            // `Keyspace::promote_body`, which has a slab to put a body in, and
+            // this says so rather than trusting that it always will.
+            return Err(Error::new(
+                Code::Invalid,
+                "a demoted body cannot be read back as a string",
+            )
+            .with_detail(m.kind().name().to_string()));
+        }
         let enc = m.encoding();
         let expire_at = value::expire_at(rec);
         let was = value::access(rec).unwrap_or_default();
