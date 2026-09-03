@@ -44,7 +44,7 @@
 //! under an anchor further away than every anchor holding a few hundred near
 //! misses.
 //!
-//! # It is only used to place a vector, and that is the whole design
+//! # It is only used to give a vector a home, and that is the whole design
 //!
 //! The first version of this was used everywhere a nearest centroid was wanted,
 //! and it made the index ten times slower rather than faster. That is worth
@@ -66,7 +66,22 @@
 //! it is bounded and it is measurable, which the other one was not. So the sweep
 //! keeps its exact comparison, which after `sweep` was made local is a
 //! comparison against three centroids and cheap, and the layer is used for the
-//! one thing that is left: [`Partitions::insert`](crate::Partitions::insert).
+//! two places where a vector has no home to compare against:
+//! [`Partitions::insert`](crate::Partitions::insert), and the rehoming a merge
+//! does when it dissolves a partition and has to find somewhere for every member
+//! that was in it.
+//!
+//! The merge case is worth its own note, because it is the one that pays for the
+//! layer at a high dimension. A merge is per member and it used to be an exact
+//! scan per member, so a collection with small postings spent nearly all of its
+//! ingest there. Measured by `examples/ingest.rs` at 1024 dimensions with
+//! posting 24 and replication off, which builds 4849 partitions out of a hundred
+//! thousand vectors: 764 vectors a second overall with the exact scan and 2431
+//! with the shortlist, and 558 against 2298 over the last quarter of the run.
+//! The `touched` column does not move, so it is the same members being visited
+//! and only the lookup got cheaper. It is a rehoming and not a sweep, so the
+//! feedback loop above does not apply: the member has just had its partition
+//! taken away from it.
 //!
 //! A search does not use it either, and that one was measured rather than
 //! argued. Ranking every centroid is the fixed cost of every search, it is a
@@ -84,6 +99,17 @@
 //! time. Ten percent of the latency for six to ten points of recall is the
 //! wrong trade in the only direction anybody runs a vector index for, so a
 //! search ranks the centroids itself and the intercept stays.
+//!
+//! That was measured again with a shortlist four times the probe count, which is
+//! as wide as it can be asked to be before ranking it costs what ranking
+//! everything costs, and it is still the wrong trade. On SIFT1M with 6880
+//! partitions, one bit codes at probe 128 and rerank 32, recall at 10 goes from
+//! 0.9898 to 0.9741, and with the probe pruning on top the three patience
+//! settings go from 0.9912, 0.9936 and 0.9941 to 0.9714, 0.9738 and 0.9741. A
+//! point and a half at 128 dimensions where MS-MARCO lost six at 1024, which is
+//! the same finding twice: a shortlist that holds the nearest centroid holds the
+//! nearest hundred in roughly the right order and roughly is not good enough
+//! when the probe head is the whole answer.
 //!
 //! # When it is not there
 //!
@@ -332,19 +358,6 @@ impl Coarse {
     /// Unranked because the caller is going to measure them properly anyway, and
     /// the whole job of this is to hand over a short list rather than an answer.
     pub(crate) fn shortlist(&self, x: &[f32], dim: usize, out: &mut Vec<u32>) {
-        self.shortlist_of(x, dim, KEEP, out);
-    }
-
-    /// The same, collecting at least `want` candidates rather than [`KEEP`].
-    ///
-    /// A placement wants one partition and a shortlist of a few hundred is a
-    /// long way past what it takes to get that one right. A search wants the
-    /// nearest `probe` of them in order, and the hundredth nearest is a much
-    /// harder question than the first, so it has to ask for a wider list. `want`
-    /// is a floor and not a ceiling: the walk stops at the first anchor that
-    /// takes the count past it, so the list that comes back is usually longer.
-    pub(crate) fn shortlist_of(&self, x: &[f32], dim: usize, want: usize, out: &mut Vec<u32>) {
-        let want = want.max(KEEP);
         out.clear();
         // The nearest few anchors, by insertion into a fixed array rather than
         // by sorting all of them into a `Vec`. This runs on the insert path and
@@ -371,7 +384,7 @@ impl Coarse {
             // At least two anchors whatever the counts say, because the boundary
             // between the first two is exactly where a single anchor is most
             // likely to have the wrong side of the answer.
-            if out.len() >= want && out.len() > list.len() {
+            if out.len() >= KEEP && out.len() > list.len() {
                 break;
             }
         }
