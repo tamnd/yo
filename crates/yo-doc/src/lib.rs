@@ -61,11 +61,15 @@
 //! calls the fields indexed is a document model that decompresses on every
 //! read.
 //!
-//! # What is not here
+//! [`text`] is JSON text in and out. The typed API never touches it, since a
+//! struct is serialized straight into this encoding and read straight back out
+//! of it, but `JSON.SET` arrives with text and `JSON.GET` has to hand text
+//! back, so the whole `JSON.*` surface stands on [`Builder::json`] and
+//! [`Value::to_json`]. The parser takes RFC 8259 and nothing else, for the
+//! reason spelled out there: every convenience a JSON parser adds is a document
+//! that loads here and is refused by a real Redis.
 //!
-//! Parsing JSON text. It arrives with the RESP surface, where it belongs: the
-//! typed API never parses JSON, it serializes a struct straight into this
-//! encoding, and text parsing is for `JSON.SET` and for bulk import.
+//! # What is not here
 //!
 //! The typed `Docs<T>` surface with its derive, which is `15`.
 //!
@@ -87,6 +91,7 @@ mod keys;
 pub mod layout;
 mod path;
 mod read;
+pub mod text;
 pub mod vector;
 
 pub use build::Builder;
@@ -96,5 +101,6 @@ pub use index::{IndexKind, KEY_MAX, Key, PathIndex, Ranged, RangedRev};
 pub use keys::{KEYS_MAX, Keys};
 pub use path::{Step, Steps};
 pub use read::{Elems, Members, Value, key_order};
+pub use text::from_json;
 pub use vector::VectorIndex;
 pub use yo_kv::Cursor;
