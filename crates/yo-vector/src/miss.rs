@@ -35,6 +35,54 @@
 //! already does, so the whole diagnostic is about as expensive as running the
 //! queries once.
 //!
+//! # The answer
+//!
+//! Over 500 queries and the true ten of each, the share of true neighbours the
+//! probe order reaches by each probe count, and the running total:
+//!
+//! ```text
+//!               MS-MARCO 1M            SIFT1M
+//!  found by   share   running   share   running
+//!   probe 8  0.6418    0.6418  0.6610    0.6610
+//!  probe 16  0.0700    0.7118  0.1356    0.7966
+//!  probe 32  0.0680    0.7798  0.1102    0.9068
+//!  probe 64  0.0718    0.8516  0.0616    0.9684
+//! probe 128  0.0436    0.8952  0.0220    0.9904
+//! probe 256  0.0354    0.9306  0.0084    0.9988
+//! probe 512  0.0352    0.9658  0.0012    1.0000
+//! probe 1024 0.0240    0.9898  0.0000    1.0000
+//!    beyond  0.0102    1.0000  0.0000    1.0000
+//! ```
+//!
+//! The running column at probe 128 is a ceiling. It is the best recall a search
+//! at that probe count could have, if the estimator were exact and the rerank
+//! were unlimited, because a neighbour in a partition nobody reads cannot come
+//! back however good the arithmetic is. Set it beside what the search actually
+//! measures at probe 128 and the two datasets say opposite things.
+//!
+//! ```text
+//!             ceiling   measured    gap
+//! MS-MARCO     0.8952     0.8942  0.0010
+//! SIFT1M       0.9904     0.9597  0.0307
+//! ```
+//!
+//! On MS-MARCO the gap is a thousandth. The estimator is not losing anything.
+//! Every miss is a neighbour in a partition the search never looked at, so more
+//! bits and a wider rerank are worth nothing here and only partition quality
+//! is, which is what the four bit run already said from the other side when it
+//! matched one bit to four decimal places and took four times as long.
+//!
+//! On SIFT it is the other way round. Nearly everything is reachable by probe
+//! 128 and the search brings back three points less than it could, so what is
+//! left there is the estimator. SIFT clears the gate at 0.9597 either way.
+//!
+//! The two tails are worth reading as well. The furthest a true neighbour sat
+//! down the order was 281 of 2663 on SIFT and 2610 of 2963 on MS-MARCO. A
+//! neighbour at rank 2610 is not a boundary case and replication will not reach
+//! it either, because its own nearest centroids are all far from the query.
+//! That one percent is the floor this partitioning has on this data, and the
+//! band replication is for is the one from 128 to 1024, which is 0.0946.
+//!
 //! # Running it
 //!
 //! It needs a real dataset, because the whole question is about the shape of
