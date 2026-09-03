@@ -532,6 +532,13 @@ impl<B: Blocks> Tier<B> {
             let round = self.round(map, policy, now_ms, lfu)?;
             while map.memory_bytes() > budget && map.compact_hard().is_some() {}
             if round == 0 {
+                // Nothing left worth moving out of memory, so the floor on what
+                // is worth copying is the only thing between this and refusing
+                // the write, and it comes off. While there is still something to
+                // demote the sweep is better off demoting it: that frees a
+                // record for about a byte written per byte freed, and emptying a
+                // segment that is barely dead costs hundreds.
+                while map.memory_bytes() > budget && map.compact_any().is_some() {}
                 barren += 1;
                 if barren == BARREN {
                     break;

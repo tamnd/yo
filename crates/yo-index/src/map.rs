@@ -56,11 +56,50 @@ const EVAC_FLOOR: usize = 64 * 1024;
 /// smaller problem.
 const EVAC_CEILING: usize = yo_arena::SEGMENT_SIZE;
 
+/// How much a caller is willing to pay for the memory a sweep gives back.
+///
+/// Not how hard to work but which trades to accept, which is the part that
+/// turned out to matter: the difference between the three is entirely in which
+/// segment gets picked, and picking badly costs a hundred times more than the
+/// work itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Sweep {
+    /// Only when the store as a whole is dirty enough to be worth a sweep.
+    Ordinary,
+    /// However clean the store is overall, as long as this segment is worth
+    /// emptying on its own.
+    Hard,
+    /// Anything holding anything dead, however little comes back.
+    LastResort,
+}
+
 /// A segment that is partway through being evacuated, and how far it got.
 #[derive(Clone, Copy)]
 struct Evac {
     seg: usize,
     off: usize,
+}
+
+/// What compaction has done to a map over its life.
+///
+/// The write amplification of value separation, in the two parts it is actually
+/// made of. Every record the walk steps over costs a liveness probe whether it
+/// is live or not, and every live one it finds costs a copy on top of that, so a
+/// segment full of dead records and a segment full of live ones are different
+/// amounts of work for the same number of bytes. One counter cannot tell those
+/// apart, which is why there are three.
+///
+/// Counted here rather than in the caller because this is the only place that
+/// knows a record moved, and the numbers are wanted per store rather than per
+/// command. They never reset, including across [`RawMap::clear`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Compaction {
+    /// Records the walk has stepped over, live and dead together.
+    pub walked: u64,
+    /// The ones that were still live and had to be copied somewhere else.
+    pub moved: u64,
+    /// What those copies came to, headers and keys included.
+    pub bytes: u64,
 }
 
 struct Record;
@@ -151,6 +190,8 @@ pub struct RawMap {
     /// What "marked" means is entirely the caller's business. This holds
     /// addresses and has never heard of a deadline.
     tagged: Tagged,
+    /// What compaction has cost so far.
+    compaction: Compaction,
 }
 
 impl RawMap {
@@ -162,7 +203,19 @@ impl RawMap {
             evac: None,
             writes: 0,
             tagged: Tagged::new(),
+            compaction: Compaction::default(),
         }
+    }
+
+    /// What compaction has done to this map since it was made.
+    ///
+    /// A running total and not a rate, so two reads either side of a load say
+    /// what that load cost. See [`Compaction`] for what the three numbers are
+    /// and why they are not one.
+    #[inline]
+    #[must_use]
+    pub const fn compaction(&self) -> Compaction {
+        self.compaction
     }
 
     /// How many times this map has been written to.
@@ -201,8 +254,12 @@ impl RawMap {
         // to zero here could land on a value a memo was already holding and
         // read as "nothing moved" on the one call where everything did.
         let writes = self.writes;
+        let compaction = self.compaction;
         *self = RawMap::new();
         self.writes = writes + 1;
+        // Carried for a plainer reason: it is what this store has spent, and a
+        // `FLUSHALL` does not give any of it back.
+        self.compaction = compaction;
     }
 
     /// The hash this map files `key` under.
@@ -732,6 +789,7 @@ impl RawMap {
             let (klen, vlen) = Record::lens(self.arena.get(old, HDR));
             let total = HDR + klen + vlen;
             off += total.next_multiple_of(yo_arena::ALIGN);
+            self.compaction.walked += 1;
 
             let hash = {
                 let bytes = self.arena.get(old, HDR + klen);
@@ -761,6 +819,8 @@ impl RawMap {
             }
             self.arena.free(old, total);
             moved += 1;
+            self.compaction.moved += 1;
+            self.compaction.bytes += total as u64;
         }
         (moved, off)
     }
@@ -822,7 +882,7 @@ impl RawMap {
     /// never picked up, and the arena would fill with segments that are nearly
     /// empty and never reclaimed.
     pub fn compact_step(&mut self) -> Option<usize> {
-        self.compact(false)
+        self.compact(Sweep::Ordinary)
     }
 
     /// One slice of compaction for a store that has run out of room.
@@ -830,26 +890,42 @@ impl RawMap {
     /// The same work, choosing between segments the way
     /// [`Arena::any_candidate`](yo_arena::Arena::any_candidate) chooses rather
     /// than the way [`Arena::worst_candidate`](yo_arena::Arena::worst_candidate)
-    /// does, so a segment holding a single dead record is still worth
-    /// evacuating. The reason is written on `any_candidate`: at a memory limit
-    /// the copying is cheaper than the alternative, which is telling a client no.
+    /// does, so a store that is clean overall still collects the parts of it
+    /// that are not. The reason is written on `any_candidate`.
     ///
     /// A segment already in flight is finished first either way, so switching
     /// between this and [`RawMap::compact_step`] cannot leave a segment half
     /// evacuated forever.
     pub fn compact_hard(&mut self) -> Option<usize> {
-        self.compact(true)
+        self.compact(Sweep::Hard)
     }
 
-    fn compact(&mut self, hard: bool) -> Option<usize> {
+    /// One slice of compaction with nothing held back, for a caller that has run
+    /// out of anything else to try.
+    ///
+    /// This takes a segment holding a single dead record and copies the rest of
+    /// it somewhere else to get that record's bytes back, which is a bad enough
+    /// trade that [`RawMap::compact_hard`] refuses it: the caller under a memory
+    /// limit has a cheaper way to free the same bytes, which is to move another
+    /// value out of memory, and it should do that instead.
+    ///
+    /// It is here for when there is no other way. A caller that has nothing left
+    /// worth moving out and is still over its limit is choosing between this and
+    /// telling a client no, and at that point a hundred kilobytes bought with
+    /// two megabytes of copying is a hundred kilobytes the server did not have.
+    pub fn compact_any(&mut self) -> Option<usize> {
+        self.compact(Sweep::LastResort)
+    }
+
+    fn compact(&mut self, sweep: Sweep) -> Option<usize> {
         self.writes += 1;
         let (seg, from) = match self.evac {
             Some(e) => (e.seg, e.off),
             None => {
-                let pick = if hard {
-                    self.arena.any_candidate()?
-                } else {
-                    self.arena.worst_candidate()?
+                let pick = match sweep {
+                    Sweep::Ordinary => self.arena.worst_candidate()?,
+                    Sweep::Hard => self.arena.any_candidate()?,
+                    Sweep::LastResort => self.arena.dirty_candidate()?,
                 };
                 (pick, yo_arena::HEADER_SIZE)
             }
@@ -1310,21 +1386,29 @@ mod tests {
 
     /// A store barely holding any garbage collects nothing until it is asked to.
     ///
-    /// The two ratios are the whole reason [`RawMap::compact_hard`] exists. A
-    /// server under a memory limit needs the pages back whatever the ratios
-    /// think of the trade, and a server that is not under one should not pay for
-    /// copying that buys it a few kilobytes.
+    /// The global ratio is the reason [`RawMap::compact_hard`] exists. A server
+    /// under a memory limit needs the pages back whether or not the store as a
+    /// whole is dirty enough to be worth a sweep, and a server that is not under
+    /// one should not pay for copying that buys it a few kilobytes.
+    ///
+    /// The per segment ratio is a different question and the hard path keeps it.
+    /// What is being asked for here is a store that is clean overall and has one
+    /// part of it that is not, which is why the deletes are a run and not a
+    /// stride: records land in the order they were written, so a run of them
+    /// empties out the segments it lands in rather than taking a tenth off every
+    /// segment and leaving none of them worth moving.
     #[test]
     fn a_store_with_little_dead_in_it_only_collects_when_pushed() {
         let mut m = RawMap::new();
         let val = vec![b'z'; COMPACT_VAL];
         const N: usize = COMPACT_N;
+        const DEAD: usize = N / 10;
         for i in 0..N {
             m.set(&key(i), &val);
         }
-        // One key in fifty, which is well under the eighth of everything held
-        // that compaction normally waits for.
-        for i in (0..N).step_by(50) {
+        // A tenth of the keys, which is under the eighth of everything held that
+        // compaction normally waits for.
+        for i in 0..DEAD {
             m.del(&key(i));
         }
 
@@ -1343,9 +1427,90 @@ mod tests {
         // records that were live in the segment that came back were moved and
         // their index entries were moved with them.
         for i in 0..N {
+            let want = if i < DEAD { None } else { Some(val.clone()) };
+            assert_eq!(m.get(&key(i)).map(<[u8]>::to_vec), want, "key {i}");
+        }
+    }
+
+    /// A store with a little dead spread thinly through it collects only as a
+    /// last resort.
+    ///
+    /// One key in fifty, so no segment is anywhere near worth emptying and the
+    /// hard sweep leaves it alone. That is the right answer for a caller with
+    /// something better to do and the wrong one for a caller with nothing left
+    /// to try, which is why there are two of them and not one.
+    #[test]
+    fn a_barely_dead_store_only_collects_as_a_last_resort() {
+        let mut m = RawMap::new();
+        let val = vec![b'z'; COMPACT_VAL];
+        const N: usize = COMPACT_N;
+        for i in 0..N {
+            m.set(&key(i), &val);
+        }
+        for i in (0..N).step_by(50) {
+            m.del(&key(i));
+        }
+
+        assert_eq!(m.compact_step(), None, "not worth collecting");
+        assert_eq!(m.compact_hard(), None, "fifty bytes moved for one back");
+        let free = m.arena().free_segments();
+        let mut calls = 0;
+        while m.arena().free_segments() == free {
+            assert!(
+                m.compact_any().is_some(),
+                "there is a segment holding something dead"
+            );
+            calls += 1;
+            assert!(calls < 1000, "the walk is not getting any further along");
+        }
+        for i in 0..N {
             let want = if i % 50 == 0 { None } else { Some(val.clone()) };
             assert_eq!(m.get(&key(i)).map(<[u8]>::to_vec), want, "key {i}");
         }
+    }
+
+    /// Compaction says what it walked past and what it had to copy.
+    ///
+    /// The two are separate because they cost different things and because the
+    /// gap between them is the useful part: a walk that steps over a thousand
+    /// records and copies two got its segment back cheaply, and one that copies
+    /// nine hundred of them paid nearly the price of the writes twice over.
+    #[test]
+    fn compaction_counts_what_it_walked_and_what_it_moved() {
+        let mut m = RawMap::new();
+        let val = vec![b'z'; COMPACT_VAL];
+        const N: usize = COMPACT_N;
+        for i in 0..N {
+            m.set(&key(i), &val);
+        }
+        assert_eq!(
+            m.compaction(),
+            Compaction::default(),
+            "a load with nothing dead in it has nothing to collect"
+        );
+
+        // Half of them dead, so a walk over a segment should find about half of
+        // what it steps over still live.
+        for i in (0..N).step_by(2) {
+            m.del(&key(i));
+        }
+        for _ in 0..200 {
+            m.compact_step();
+        }
+        let c = m.compaction();
+        assert!(c.walked > 0, "the walk did not step over anything");
+        assert!(c.moved > 0, "everything it stepped over was dead");
+        assert!(c.moved < c.walked, "nothing it stepped over was dead");
+        assert!(
+            c.bytes >= c.moved * COMPACT_VAL as u64,
+            "{} records moved and only {} bytes with them",
+            c.moved,
+            c.bytes
+        );
+
+        // What a store has spent is not something a flush gives back.
+        m.clear();
+        assert_eq!(m.compaction(), c, "the bill was thrown away with the data");
     }
 
     /// The budget grows with how far behind the collector is.

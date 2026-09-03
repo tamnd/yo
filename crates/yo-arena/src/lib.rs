@@ -650,17 +650,35 @@ impl Arena {
             .map(|(_, i)| i)
     }
 
-    /// The same pick with both ratios ignored: any segment holding anything
-    /// dead will do, and the one holding the most goes first.
+    /// The same pick with [`Arena::GARBAGE_RATIO`] ignored: it does not matter
+    /// how clean the store is as a whole, only whether this segment is dirty
+    /// enough to be worth emptying.
     ///
-    /// This is for a store that has run into a memory limit, where the two
-    /// ratios are answering the wrong question. They exist to stop a healthy
-    /// store paying for copying it does not need, and they are right about that:
-    /// evacuating a segment that is a twentieth dead copies nineteen twentieths
-    /// of two megabytes to get one twentieth back. At the limit that trade turns
-    /// over. The alternative to the copying is refusing the client's write, and
-    /// a hundred kilobytes bought with two megabytes of copying is a hundred
-    /// kilobytes the server did not have.
+    /// This is for a store that has run into a memory limit, where the question
+    /// the global ratio answers is the wrong one. That ratio exists to stop a
+    /// healthy store paying for copying it does not need, and a store at its
+    /// limit needs the copying: one dirty segment out of forty is not worth
+    /// collecting on an idle server and is worth collecting on one that is
+    /// about to start throwing keys away.
+    ///
+    /// The per segment ratio stays, and it took a measurement to work out that
+    /// it had to. Without it this took any segment holding a single dead byte,
+    /// and under the larger than memory gate that is what it kept finding: a
+    /// segment a fifth of a percent dead, whose two megabytes of live records
+    /// were copied somewhere else to get four kilobytes back. A full size string
+    /// row copied 213 GB to load 2.5 GB, 85 bytes moved for every byte the
+    /// client wrote, and a profile put three quarters of the server's time
+    /// inside the walk. The load ran at 19 thousand writes a second against 234
+    /// thousand for the same row with nothing to demote.
+    ///
+    /// What makes the floor the right shape rather than just a smaller number is
+    /// that compaction is not the only way to free memory here. The caller is a
+    /// demotion sweep, and demoting a value frees its record for about a byte
+    /// written per byte freed. Emptying a segment that is a fraction `d` dead
+    /// costs `(1 - d) / d` bytes copied per byte freed, which is three at a
+    /// quarter dead and five hundred at a fifth of a percent. So there is a
+    /// point below which the sweep should stop copying and go and demote
+    /// something instead, and the floor is where that is.
     ///
     /// There is no cheap first test here, on purpose. The walk over the headers
     /// costs a load per segment and this is only called when the server is over
@@ -668,6 +686,25 @@ impl Arena {
     /// where the cost of one load per segment is what matters.
     #[must_use]
     pub fn any_candidate(&self) -> Option<usize> {
+        let threshold = (SEGMENT_SIZE as f64 * Self::COMPACT_RATIO) as u64;
+        (0..self.segs.len())
+            .filter(|&i| i != self.cur && !self.segs[i].free)
+            .map(|i| (self.segs[i].header().dead_bytes, i))
+            .filter(|&(dead, _)| dead >= threshold)
+            .max()
+            .map(|(_, i)| i)
+    }
+
+    /// The same pick with both ratios ignored: any segment holding anything dead
+    /// will do, and the one holding the most goes first.
+    ///
+    /// The trade here is as bad as it gets, which is the point of having it
+    /// separate. A segment a fifth of a percent dead costs two megabytes of
+    /// copying to give four kilobytes back, and the only reason to make that
+    /// trade is that the caller has already tried everything cheaper and the
+    /// next thing after this is refusing a client's write.
+    #[must_use]
+    pub fn dirty_candidate(&self) -> Option<usize> {
         (0..self.segs.len())
             .filter(|&i| i != self.cur && !self.segs[i].free)
             .map(|i| (self.segs[i].header().dead_bytes, i))
@@ -905,8 +942,42 @@ mod tests {
         assert_eq!(a.compaction_candidates(), vec![0]);
     }
 
+    /// A dirty segment in a clean store is worth emptying under pressure.
+    ///
+    /// Three segments, one of them a quarter dead, which puts the store as a
+    /// whole under [`Arena::GARBAGE_RATIO`] and that one segment over
+    /// [`Arena::COMPACT_RATIO`]. An idle server leaves it alone because two
+    /// megabytes is not worth a command's time. One at its limit takes it.
     #[test]
-    fn a_barely_dead_segment_is_a_candidate_only_under_pressure() {
+    fn a_dirty_segment_in_a_clean_store_is_a_candidate_only_under_pressure() {
+        let mut a = Arena::new();
+        let chunk = vec![0u8; 128 * 1024];
+        let mut addrs = Vec::new();
+        while a.segment_count() < 3 {
+            addrs.push(a.put(&chunk).unwrap());
+        }
+        // Four chunks of sixteen, so a quarter of segment 0 and a twelfth of
+        // everything held.
+        for addr in addrs
+            .iter()
+            .filter(|x| x.offset() < SEGMENT_SIZE as u64)
+            .take(4)
+        {
+            a.free(*addr, chunk.len());
+        }
+        assert_eq!(a.worst_candidate(), None, "not worth collecting");
+        assert_eq!(a.any_candidate(), Some(0), "worth collecting at a limit");
+    }
+
+    /// A segment with a little dead in it is not worth emptying at any pressure.
+    ///
+    /// The trade is what makes this true and not the pause: copying fifteen
+    /// sixteenths of a segment to get the last sixteenth back frees the same
+    /// bytes the caller could have freed by demoting one more value, and costs
+    /// fifteen times as much to do it. Under the larger than memory gate this
+    /// was the whole cost of the write path, so the floor is not a nicety.
+    #[test]
+    fn a_barely_dead_segment_is_not_a_candidate_under_any_pressure() {
         let mut a = Arena::new();
         let chunk = vec![0u8; 128 * 1024];
         let mut addrs = Vec::new();
@@ -921,7 +992,7 @@ mod tests {
             .expect("segment 0 holds something");
         a.free(one, chunk.len());
         assert_eq!(a.worst_candidate(), None, "not worth collecting");
-        assert_eq!(a.any_candidate(), Some(0), "worth collecting at a limit");
+        assert_eq!(a.any_candidate(), None, "fifteen bytes moved for one back");
     }
 
     #[test]

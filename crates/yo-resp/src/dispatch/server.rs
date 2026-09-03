@@ -970,11 +970,14 @@ fn info(server: &Server, args: Args<'_>, out: &mut Out) {
             // see what it was a quarter of without reading the source. The
             // reasoning is written out in `cap`.
             let cap = crate::cap::cap();
+            let compact = server.compaction();
             let _ = write!(
                 s,
                 "# Memory\r\nused_memory:{}\r\nused_memory_dataset:{}\r\n\
                  used_memory_overhead:{}\r\nmem_arena_bytes:{}\r\n\
-                 mem_arena_segments:{}\r\nmem_index_bytes:{}\r\n\
+                 mem_arena_segments:{}\r\nmem_compact_walked:{}\r\n\
+                 mem_compact_moved:{}\r\nmem_compact_bytes:{}\r\n\
+                 mem_index_bytes:{}\r\n\
                  mem_client_buffers:{}\r\ntotal_system_memory:{}\r\n\
                  mem_cgroup_limit:{}\r\nmem_limit:{}\r\nmem_budget:{}\r\n\
                  maxmemory:{}\r\nmaxmemory_policy:{}\r\n\
@@ -984,6 +987,9 @@ fn info(server: &Server, args: Args<'_>, out: &mut Out) {
                 server.memory_bytes() - server.dataset_bytes(),
                 server.arena_bytes(),
                 server.segment_count(),
+                compact.walked,
+                compact.moved,
+                compact.bytes,
                 server.index_bytes(),
                 server.conn_bytes(),
                 cap.host.unwrap_or(0),

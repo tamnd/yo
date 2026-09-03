@@ -201,6 +201,9 @@ pub use value::{EMBSTR_MAX, Encoding, Kind, Str};
 // [`Cursor`] a collection walk hands back and is named apart from it so that a
 // caller holding both cannot pass one where the other was meant.
 pub use yo_index::Cursor as KeyCursor;
+// What arena compaction has cost, which `INFO` reports and nothing in here
+// reads, so it is only here to save the reporter a dependency on the index.
+pub use yo_index::Compaction;
 pub use zset::{Bound as ZBound, Lex, Limits as ZsetLimits, Zset};
 pub use zsetops::{Aggregate, Op as ZOp, Operand};
 pub use zsets::{By, Gate, Move, Query, Window, ZAdd};

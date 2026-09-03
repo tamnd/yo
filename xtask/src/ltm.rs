@@ -264,6 +264,12 @@ struct Report {
     regime: String,
     dbsize: u64,
     latency: Vec<u64>,
+    /// Arena records the load's compaction stepped over.
+    walked: u64,
+    /// The ones it found live and had to copy.
+    moved: u64,
+    /// What those copies came to.
+    copied: u64,
 }
 
 fn measure(opts: &Options) -> Result<bool, String> {
@@ -311,6 +317,9 @@ fn run_against(server: &mut Server, opts: &Options, keys: u64) -> Result<Report,
     let at = Instant::now();
     load(&mut conn, keys, opts, &fix)?;
     let loaded = at.elapsed();
+    // Read before the reads run, because a promote writes into the arena too
+    // and this line is about what the writes cost.
+    let after_load = section(&mut conn, "memory")?;
     println!(
         "loaded  {keys} keys in {:.1}s, {:.0} writes a second",
         loaded.as_secs_f64(),
@@ -356,6 +365,9 @@ fn run_against(server: &mut Server, opts: &Options, keys: u64) -> Result<Report,
             .to_string(),
         dbsize,
         latency,
+        walked: count(&after_load, "mem_compact_walked"),
+        moved: count(&after_load, "mem_compact_moved"),
+        copied: count(&after_load, "mem_compact_bytes"),
     })
 }
 
@@ -401,6 +413,18 @@ fn present(opts: &Options, r: &Report) -> bool {
         "load          {:.1}s, {:.0} writes a second",
         r.loaded.as_secs_f64(),
         r.keys as f64 / r.loaded.as_secs_f64()
+    );
+    // What the load paid on top of itself. The written figure is what the
+    // client asked for, so a ratio above one is bytes the store moved around
+    // for its own sake, and the gap between walked and moved says whether the
+    // walk was cheap probes over dead records or real copies.
+    let written = r.keys * opts.value as u64;
+    println!(
+        "compaction    {} moved of {} walked, {} copied, {:.2}x what was written",
+        r.moved,
+        r.walked,
+        human(r.copied),
+        r.copied as f64 / written.max(1) as f64
     );
     println!(
         "reads         {} in {:.1}s, {:.0} a second",
@@ -908,6 +932,14 @@ fn field<'a>(text: &'a str, name: &str) -> Option<&'a str> {
         let (key, value) = line.split_once(':')?;
         (key.trim() == name).then(|| value.trim())
     })
+}
+
+/// One `name:value` line read as a number, or zero when it is not there.
+///
+/// Zero and not an error because a run against an older binary is still worth
+/// having, and a row of zeroes says plainly which one it was.
+fn count(text: &str, name: &str) -> u64 {
+    field(text, name).and_then(|v| v.parse().ok()).unwrap_or(0)
 }
 
 /// What a key holds, which is the axis the first M5 gate is measured across.
