@@ -196,6 +196,29 @@ impl Collection {
         self.ids.iter().map(|(key, _)| key)
     }
 
+    /// The `n`th key, counting from zero, in that same order.
+    ///
+    /// For a caller that wants one member and not all of them, which is what
+    /// `VRANDMEMBER` is and what walking the whole table to throw it away would
+    /// be the wrong way to answer.
+    #[must_use]
+    pub fn key_at(&self, n: usize) -> Option<&[u8]> {
+        self.ids.at(n).map(|(key, _)| key)
+    }
+
+    /// The id the index knows `key` by.
+    ///
+    /// An id is the slot the vector sits in. It is stable while the key is
+    /// there, it changes if the key is removed and written again, and it is
+    /// handed out so that a caller keeping something else per vector can key it
+    /// by a small integer rather than by a second copy of the key. The attribute
+    /// a vector set holds is the first of those and a pushed down filter's tag
+    /// will be the next.
+    #[must_use]
+    pub fn id(&self, key: &[u8]) -> Option<u64> {
+        self.ids.get(key).copied()
+    }
+
     /// Put a vector in under `key`, and say whether the key is new.
     ///
     /// Replacing is the same call. The old code comes out of its partition and
@@ -289,6 +312,46 @@ impl Collection {
             }
         }
         Ok(out)
+    }
+
+    /// The same answer, arrived at by measuring every vector in the collection.
+    ///
+    /// This is what the index is an approximation of, so it is the thing recall
+    /// is measured against, and it is what `VSIM ... TRUTH` asks for. It reads
+    /// no codes at all: the estimator exists to avoid this walk and there is
+    /// nothing it can contribute to a walk that is happening anyway.
+    ///
+    /// Linear in the collection, which is the point. A client asking for it on a
+    /// million vectors is asking for a million distances and should get them
+    /// rather than a refusal, because the reason to ask is to find out what the
+    /// index missed.
+    ///
+    /// # Errors
+    ///
+    /// As [`Collection::search`].
+    pub fn search_exact(&self, q: &[f32], k: usize, skip: Option<&[u8]>) -> Result<Vec<Match>> {
+        let ready = self.ready(q)?;
+        if k == 0 {
+            return Ok(Vec::new());
+        }
+        let mut hits: Vec<(f32, &[u8])> = Vec::with_capacity(self.ids.len());
+        for (key, &id) in self.ids.iter() {
+            if skip == Some(key) {
+                continue;
+            }
+            hits.push((crate::dist::sqdist(&ready, self.raw.at(id)), key));
+        }
+        // By distance and then by key, so that vectors at the same distance come
+        // back in an order that does not depend on where the table put them.
+        hits.sort_by(|a, b| a.0.total_cmp(&b.0).then_with(|| a.1.cmp(b.1)));
+        hits.truncate(k);
+        Ok(hits
+            .into_iter()
+            .map(|(sq, key)| Match {
+                key: key.to_vec(),
+                distance: self.report(sq),
+            })
+            .collect())
     }
 
     /// Do bounded maintenance, and say how many vectors it looked at.

@@ -58,7 +58,7 @@ use super::table::Spec;
 use crate::reply::Out;
 
 /// What `SCAN` and `MEMORY USAGE` and the rest see under a graph key.
-const NOT_A_GRAPH: &str = "WRONGTYPE Operation against a key holding the wrong kind of value";
+const NOT_A_GRAPH: &str = "Operation against a key holding the wrong kind of value";
 /// What a depth or a count that is not a number gets.
 const BAD_DEPTH: &str = "DEPTH must be a positive integer";
 const BAD_COUNT: &str = "COUNT must be a positive integer";

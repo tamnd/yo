@@ -20,6 +20,11 @@ yo-doc = { workspace = true }
 yo-graph = { workspace = true }
 yo-kv = { workspace = true }
 yo-reactor = { workspace = true }
+# `Metric`, so that a vector set says cosine in the same word the catalogue does.
+yo-shape = { workspace = true }
+# The collection the `V*` family works on, which is the same one the embedded
+# API hands out so the two doors cannot answer a replace differently.
+yo-vector = { workspace = true }
 
 # Only INFO cpu needs it, through one getrusage call, and only on Unix.
 [target.'cfg(unix)'.dependencies]

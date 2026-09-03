@@ -470,6 +470,17 @@ impl Keyspace {
         self.rng = Rng::new(seed);
     }
 
+    /// The next number from that same stream.
+    ///
+    /// For a command whose value lives in a [`Foreign`] body and so cannot
+    /// reach the draw any other way. `VRANDMEMBER` is the one, and it should be
+    /// as repeatable under [`Keyspace::seed`] as `SRANDMEMBER` is, which it
+    /// would not be if it carried a generator of its own.
+    #[inline]
+    pub const fn random(&mut self) -> u64 {
+        self.rng.next_u64()
+    }
+
     /// What this database would evict, which is `CONFIG GET maxmemory-policy`.
     #[inline]
     #[must_use]
