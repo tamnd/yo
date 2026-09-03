@@ -42,10 +42,11 @@
 //! Redis does and for the same reason, and it is why `VEMB` of a vector that
 //! went in as `[3, 4]` says `[3, 4]` and not `[0.6, 0.8]`.
 //!
-//! An element's attribute string lives here too. It is arbitrary bytes to us:
-//! Redis documents it as JSON because its `FILTER` expressions read into it, and
-//! there is no `FILTER` here yet, so validating it would be refusing writes for
-//! a rule nothing enforces.
+//! An element's attribute string lives here too, as the bytes the client sent.
+//! `FILTER` reads JSON out of it, and a string that is not JSON is a string
+//! whose fields are all missing, which is an element no filter matches. That is
+//! the same answer refusing the write would eventually give and it is one a
+//! client can get to without having its writes refused.
 //!
 //! Both are held in a slice indexed by the id the collection gave the element,
 //! rather than in a second table keyed by the element name. An id is a small
@@ -53,7 +54,21 @@
 //! elements should not hold a million extra copies of their names to answer
 //! `VGETATTR`.
 //!
-//! # The three things a client asks for that are not here
+//! # Filtering happens inside the search
+//!
+//! `VSIM ... FILTER '.year > 1980'` is answered by deciding the filter while the
+//! search is still choosing what to rank, which is [`vfilter`](super::vfilter)
+//! and [`yo_vector::Filter`]. Filtering the ten nearest afterwards would answer a
+//! filter that matches one element in a thousand with nothing at all, almost
+//! every time, and the client could not tell that from a real no match.
+//!
+//! The element's attributes are summarised into the tag the collection stores
+//! beside its code, one bit per field and string value, so the scan's first test
+//! is a subset test on a word it has already loaded and the expression itself
+//! only ever runs on what survives that. The tag is rewritten whenever the
+//! attribute is, which is what `VSETATTR` costs beyond the store.
+//!
+//! # The two things a client asks for that are not here
 //!
 //! `REDUCE` projects a vector onto fewer dimensions on the way in. It is a
 //! refusal (D-31) and not silently ignored, because a client that asked for 100
@@ -65,21 +80,22 @@
 //! as accurate as the most accurate of the three, so they are recorded for
 //! `VINFO` and change nothing (D-32).
 //!
-//! `FILTER` reads an expression over the attribute strings. The scan it would
-//! push into is already here, in [`yo_vector::Filter`], and the expression
-//! language over the attributes is not, so `FILTER` is a refusal until it is
-//! (D-33). Answering it by filtering after the search instead would be the one
-//! thing worse than refusing, because a selective filter over the nearest ten
-//! answers is usually nothing at all.
+//! `FILTER-EF` bounds how much work Redis will do before giving up on a
+//! selective filter. The scan here widens on its own until it has enough answers
+//! or has spent its budget, so the number raises the effort rather than capping
+//! it, and a filter that matches almost nothing comes back with fewer answers
+//! than `COUNT` rather than reading the whole set. `TRUTH` is the way to ask for
+//! all of them (D-33).
 
 use yo_common::{Code, Error, Result, parse_i64};
 use yo_kv::{Foreign, Keyspace};
 use yo_shape::Metric;
 use yo_vector::hnsw::Requested;
-use yo_vector::{Collection, Match};
+use yo_vector::{Collection, Match, Signature};
 
 use super::args::{self, Args};
 use super::table::Spec;
+use super::vfilter;
 use crate::reply::Out;
 
 /// What a key holding anything else answers.
@@ -197,6 +213,17 @@ impl VectorBody {
         &mut self.side[id]
     }
 
+    /// Put the element's attributes back into the tag the scan reads.
+    ///
+    /// The tag is a summary of a string the client can rewrite at any time, so
+    /// this runs on every write that can have changed either the attribute or
+    /// the element's place in the index. It is one store into the posting, with
+    /// no requantising and no maintenance behind it.
+    fn retag(&mut self, key: &[u8]) {
+        let tag = self.attr(key).map_or(0, vfilter::tag);
+        self.c.retag(key, tag);
+    }
+
     /// How many elements carry an attribute, which is what `VINFO` reports.
     fn attributes(&self) -> usize {
         self.side.iter().filter(|s| s.attr.is_some()).count()
@@ -257,6 +284,10 @@ fn vadd(db: &mut Keyspace, args: Args<'_>, out: &mut Out) -> Result<()> {
     if let Some(attr) = opts.attr {
         side.attr = Some(attr.into());
     }
+    // Always, and not only when SETATTR was sent. A VADD over an element that is
+    // already there gives it a new vector and therefore a new place in the
+    // index, carrying whatever tag the insert put on it, which is none.
+    body.retag(element);
     out.int(i64::from(new));
     Ok(())
 }
@@ -286,9 +317,9 @@ fn vsim(db: &mut Keyspace, args: Args<'_>, out: &mut Out) -> Result<()> {
                 return Ok(());
             };
             let q = q.to_vec();
-            search(body, &q, opts.effort, Some(e), opts.truth)?
+            search(body, &q, opts.effort, Some(e), &opts)?
         }
-        Query::Vector(v) => search(body, &v, opts.effort, None, opts.truth)?,
+        Query::Vector(v) => search(body, &v, opts.effort, None, &opts)?,
     };
     // Whatever `EF` widened the search to, the client asked for `COUNT`.
     hits.truncate(opts.count);
@@ -505,6 +536,7 @@ fn vsetattr(db: &mut Keyspace, args: Args<'_>, out: &mut Out) -> Result<()> {
     } else {
         Some(value.into())
     };
+    body.retag(element);
     out.int(1);
     Ok(())
 }
@@ -585,6 +617,8 @@ struct Sim {
     withscores: bool,
     withattribs: bool,
     truth: bool,
+    /// The expression the elements have to match, if there is one.
+    filter: Option<vfilter::Filter>,
 }
 
 impl Sim {
@@ -595,6 +629,7 @@ impl Sim {
             withscores: false,
             withattribs: false,
             truth: false,
+            filter: None,
         };
         let mut ef = None;
         let mut i = from;
@@ -620,11 +655,22 @@ impl Sim {
             } else if args::is(arg, b"ef") && rest >= 2 {
                 ef = Some(positive(args.get(i + 1), BAD_EF)?);
                 i += 2;
-            } else if (args::is(arg, b"filter") || args::is(arg, b"filter-ef")) && rest >= 2 {
-                return Err(Error::new(
-                    Code::Unsupported,
-                    "FILTER is not supported yet. Filtering after the search instead would answer a selective filter with almost nothing, so it refuses rather than doing that quietly",
-                ));
+            } else if args::is(arg, b"filter") && rest >= 2 {
+                got.filter = Some(vfilter::Filter::parse(args.get(i + 1))?);
+                i += 2;
+            } else if args::is(arg, b"filter-ef") && rest >= 2 {
+                // Redis reads this as a ceiling on the work a selective filter
+                // may cost. The scan here widens until it has enough answers and
+                // then stops on its own, so what a client can usefully move is
+                // how much is asked for, which is the same knob EF turns (D-33).
+                // Zero is Redis's word for no limit and is the default here, so
+                // it changes nothing rather than being a syntax error.
+                let asked = match parse_i64(args.get(i + 1)) {
+                    Some(n) => usize::try_from(n).unwrap_or(0),
+                    None => return Err(Error::new(Code::Invalid, BAD_EF)),
+                };
+                ef = Some(ef.unwrap_or(0).max(asked));
+                i += 2;
             } else {
                 return Err(args::syntax());
             }
@@ -647,12 +693,48 @@ fn search(
     q: &[f32],
     k: usize,
     skip: Option<&[u8]>,
-    truth: bool,
+    opts: &Sim,
 ) -> Result<Vec<Match>> {
-    if truth {
-        body.c.search_exact(q, k, skip)
+    let Some(expr) = &opts.filter else {
+        return if opts.truth {
+            body.c.search_exact(q, k, skip)
+        } else {
+            body.c.search(q, k, skip)
+        };
+    };
+    let want = Filtered {
+        expr,
+        want: expr.signature(),
+        side: &body.side,
+    };
+    if opts.truth {
+        body.c.search_exact_where(q, k, skip, &want)
     } else {
-        body.c.search(q, k, skip)
+        body.c.search_where(q, k, skip, &want)
+    }
+}
+
+/// What a `FILTER` becomes inside the scan.
+///
+/// Two tests in the order they cost. The tag is a summary of the element's
+/// attributes that the scan can read in one instruction, and it can only ever
+/// let through an element the expression will reject, never keep out one it
+/// would have kept. The expression itself then runs on what is left, which is
+/// the elements that are near enough to be ranked and passed the summary.
+struct Filtered<'a> {
+    expr: &'a vfilter::Filter,
+    want: Signature,
+    side: &'a [Side],
+}
+
+impl yo_vector::Filter for Filtered<'_> {
+    fn allows(&self, tag: u64) -> bool {
+        Signature::from_bits(tag).covers(self.want)
+    }
+
+    fn exact(&self, id: u64) -> bool {
+        let attr = self.side.get(id as usize).and_then(|s| s.attr.as_deref());
+        self.expr.matches(attr)
     }
 }
 

@@ -234,9 +234,26 @@ const FLOOR: usize = 32;
 /// which is exact in the direction that matters: it never rejects a member that
 /// should have matched, so the caller's real predicate over the answers still
 /// decides.
+/// A tag that is only a summary needs a second test somewhere, and the place
+/// for it is [`Filter::exact`], which sees the member's id and can go and read
+/// whatever the caller keyed by it. That runs only for members the tag let
+/// through that are also near enough to be ranked, which is why it is allowed to
+/// be the expensive one: an expression over a JSON string is fine there and
+/// would not be fine in the scan.
 pub trait Filter {
     /// Whether a member with this tag is worth ranking.
     fn allows(&self, tag: u64) -> bool;
+
+    /// The second test, on the member's id rather than on its tag.
+    ///
+    /// Everything lets everything through by default, because for a filter whose
+    /// tag says the whole truth there is nothing left to ask. Override it when
+    /// the tag is a summary and the real predicate lives in a table of the
+    /// caller's, and keep the tag test as the cheap superset of it: a member the
+    /// tag rejects never reaches here.
+    fn exact(&self, _id: u64) -> bool {
+        true
+    }
 }
 
 /// The filter that lets everything through, which is what an unfiltered search
@@ -728,6 +745,9 @@ impl Partitions {
                     continue;
                 }
                 if !filter.allows(posting.tags[i]) {
+                    continue;
+                }
+                if !filter.exact(posting.ids[i]) {
                     continue;
                 }
                 best.put(posting.ids[i], at);
@@ -1574,6 +1594,67 @@ mod tests {
             after < pushed / 2.0,
             "filtering afterwards gave {after} against {pushed}, which is not the point being made"
         );
+    }
+
+    /// The second test decides, and the scan keeps widening until it has `k` of
+    /// what the second test wants rather than `k` of what the tag wants.
+    ///
+    /// This is what a filter whose tag is only a summary looks like: the tag
+    /// lets a superset through, so an answer that passes it and fails the exact
+    /// test must not have cost an answer that passes both.
+    #[test]
+    fn the_exact_test_decides_and_the_scan_widens_for_it() {
+        struct Summary;
+
+        impl Filter for Summary {
+            fn allows(&self, tag: u64) -> bool {
+                // One in ten, which is what a bit that several values landed on
+                // looks like from inside the scan.
+                tag == 1
+            }
+
+            fn exact(&self, id: u64) -> bool {
+                // One in fifty, and a subset of what the tag allowed, which is
+                // the direction a summary is allowed to be wrong in.
+                id.is_multiple_of(50)
+            }
+        }
+
+        let dim = 64;
+        let store = corpus(dim, 3000, 9, 71);
+        let tuning = Tuning {
+            posting: 64,
+            ..Tuning::default()
+        };
+        let ix = build_tagged(&store, dim, tuning, |id| u64::from(id.is_multiple_of(10)));
+
+        let k = 10;
+        let mut found = 0usize;
+        for i in 0..20 {
+            let q = &store.0[i * 131 % store.0.len()];
+            let mut all: Vec<(u64, f32)> = store
+                .0
+                .iter()
+                .enumerate()
+                .map(|(id, v)| (id as u64, sqdist(q, v)))
+                .filter(|(id, _)| id.is_multiple_of(50))
+                .collect();
+            all.sort_by(|a, b| a.1.total_cmp(&b.1));
+            let want: Vec<u64> = all[..k].iter().map(|(id, _)| *id).collect();
+
+            let got: Vec<u64> = ix
+                .search_where(q, k, &Summary, &store)
+                .into_iter()
+                .map(|h| h.id)
+                .collect();
+            assert!(
+                got.iter().all(|id| id.is_multiple_of(50)),
+                "the exact test did not decide: {got:?}"
+            );
+            found += want.iter().filter(|id| got.contains(id)).count();
+        }
+        let recall = found as f32 / (20.0 * k as f32);
+        assert!(recall >= 0.9, "two stage filtering gave {recall}");
     }
 
     #[test]

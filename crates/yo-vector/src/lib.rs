@@ -66,7 +66,10 @@
 //! that does not go looking is a recall lottery. [`Signature`] packs arbitrary
 //! attribute values into that one word, and it is allowed to say yes when it
 //! should have said no but never the other way round, so the caller's own
-//! predicate stays the authority.
+//! predicate stays the authority. That predicate has a place to live too:
+//! [`Filter::exact`] sees the member's id and runs only on members the tag let
+//! through that are near enough to be ranked, which is what lets an expression
+//! over a JSON string be the real answer without the scan ever reading one.
 //!
 //! [`muvera`] is late interaction retrieval on that same index. A ColBERT style
 //! model gives a document one vector per token and scores a query against it
