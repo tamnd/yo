@@ -147,7 +147,6 @@ use yo_common::{Code, Error, Result};
 use crate::coarse::Coarse;
 use crate::dist::sqdist;
 use crate::rabitq::{Bits, Coded, Quantizer};
-use crate::rank::Ranker;
 
 /// Where the full precision vectors live.
 ///
@@ -250,16 +249,6 @@ pub trait Filter {
     /// Whether a member with this tag is worth ranking.
     fn allows(&self, tag: u64) -> bool;
 
-    /// Whether this filter rejects nothing at all.
-    ///
-    /// A search that can be told the answer is yes knows it will stop at
-    /// [`Tuning::probe`] rather than widen, and can ask for a shorter ranking of
-    /// the centroids. Saying no when the truth is yes costs a little time and
-    /// nothing else, which is why that is the default.
-    fn total(&self) -> bool {
-        false
-    }
-
     /// The second test, on the member's id rather than on its tag.
     ///
     /// Everything lets everything through by default, because for a filter whose
@@ -279,10 +268,6 @@ pub struct Any;
 
 impl Filter for Any {
     fn allows(&self, _tag: u64) -> bool {
-        true
-    }
-
-    fn total(&self) -> bool {
         true
     }
 }
@@ -437,13 +422,8 @@ pub struct Partitions {
     /// Which partition and which slot every id is in, which is what makes a
     /// delete a constant time operation rather than a search.
     at: HashMap<u64, Slot>,
-    /// The index over the centroids, for placing a vector. See
-    /// [`crate::coarse`].
+    /// The index over the centroids. See [`crate::coarse`].
     coarse: Coarse,
-    /// The centroids in coded form, for ranking them on a search. See
-    /// [`crate::rank`], which is a different structure answering a different
-    /// question and says why it is not this one.
-    rank: Ranker,
     /// The shortlist a placement fills in, kept here so that placing a vector
     /// does not allocate.
     scratch: Vec<u32>,
@@ -489,7 +469,6 @@ impl Partitions {
             postings: Vec::new(),
             at: HashMap::new(),
             coarse: Coarse::default(),
-            rank: Ranker::default(),
             scratch: Vec::new(),
             big: Vec::new(),
             small: Vec::new(),
@@ -737,26 +716,17 @@ impl Partitions {
         Ok(())
     }
 
-    /// Drop the centroid codes, so that a test can ask the same question of the
-    /// same index with and without them.
-    #[cfg(test)]
-    pub(crate) fn forget_centroid_codes(&mut self) {
-        self.rank = Ranker::default();
-    }
-
     /// Say that a load is over, so the derived parts can be built once.
     ///
-    /// The coarse layer, the centroid codes and the two maintenance candidate
-    /// lists are the whole of what an image does not carry, because all three
-    /// are decided by the centroids and the posting lengths that it does carry.
-    /// Building them here is one pass rather than the running updates the insert
-    /// path makes, which is the difference between a load being linear and being
-    /// quadratic.
+    /// The coarse layer and the two maintenance candidate lists are the whole of
+    /// what an image does not carry, because both are decided by the centroids
+    /// and the posting lengths that it does carry. Building them here is one
+    /// pass rather than the running updates the insert path makes, which is the
+    /// difference between a load being linear and being quadratic.
     pub(crate) fn finish_image(&mut self) {
         let dim = self.quant.dim();
         let n = self.postings.len();
         self.coarse.rebuild(&self.centroids, dim, n);
-        self.rank.rebuild(&self.quant, &self.centroids, n);
         self.big.clear();
         self.small.clear();
         for p in 0..n {
@@ -871,15 +841,7 @@ impl Partitions {
         // grown rather than cleared, because every partition after the first
         // wants the same room the one before it did.
         let mut scores: Vec<f32> = Vec::new();
-        // A filtered search may have to keep going to find members that pass.
-        // An unfiltered one provably stops at `probe`, because the break below
-        // fires the moment it has enough, so asking for more than that is a
-        // longer centroid ranking bought for nothing.
-        let reach = if filter.total() {
-            self.tuning.probe
-        } else {
-            self.tuning.probe.saturating_mul(self.tuning.widen.max(1))
-        };
+        let reach = self.tuning.probe.saturating_mul(self.tuning.widen.max(1));
         for (n, p) in self.near_partitions(&u, reach).into_iter().enumerate() {
             // Past the partitions an unfiltered search would have read, keep
             // going only while there is still not enough to answer with. An
@@ -1048,7 +1010,6 @@ impl Partitions {
         }
         self.centroids[p * dim..(p + 1) * dim].copy_from_slice(&a);
         self.coarse.moved(p, &a, dim);
-        self.rank.moved(p, &a);
         let q = self.add_partition(&b);
         for (i, m) in members.iter().enumerate() {
             let to = if sides[i] { p } else { q };
@@ -1168,15 +1129,7 @@ impl Partitions {
     }
 
     /// The `n` partitions whose centroids are nearest `x`, nearest first.
-    ///
-    /// Through the centroid codes once there are enough centroids for reading
-    /// them all to be the expensive part of a query. See [`crate::rank`], which
-    /// also says why this is not the anchor layer.
     fn near_partitions(&self, x: &[f32], n: usize) -> Vec<usize> {
-        if self.rank.ready() {
-            let mut scores = Vec::new();
-            return self.rank.head(x, &self.centroids, n, &mut scores);
-        }
         let mut by: Vec<(usize, f32)> = (0..self.postings.len())
             .map(|p| (p, sqdist(x, self.centroid(p))))
             .collect();
@@ -1220,7 +1173,6 @@ impl Partitions {
         self.postings.push(Posting::default());
         let p = self.postings.len() - 1;
         self.coarse.added(p, centroid, dim);
-        self.rank.added(centroid);
         self.note(p);
         self.refresh_coarse();
         p
@@ -1234,9 +1186,6 @@ impl Partitions {
             let dim = self.quant.dim();
             self.coarse.rebuild(&self.centroids, dim, n);
         }
-        if self.rank.stale(n) {
-            self.rank.rebuild(&self.quant, &self.centroids, n);
-        }
     }
 
     /// Drop an empty partition, moving the last one into its place.
@@ -1245,7 +1194,6 @@ impl Partitions {
         let dim = self.dim();
         let last = self.postings.len() - 1;
         self.coarse.dropped(p);
-        self.rank.dropped(p);
         self.postings.swap_remove(p);
         for i in 0..dim {
             self.centroids[p * dim + i] = self.centroids[last * dim + i];
@@ -2095,41 +2043,6 @@ mod tests {
 
         let r = recall(&ix, &store, 10, 60);
         assert!(r >= 0.95, "recall at 10 after the stream was {r}");
-    }
-
-    /// The centroid codes only come into play past a few hundred partitions, so
-    /// the collections the rest of these tests build never reach them. What they
-    /// promise is that the search does not change, and the way to find out is to
-    /// take every answer, throw the codes away, and take every answer again.
-    #[test]
-    fn ranking_centroids_through_codes_gives_the_same_search() {
-        // Small vectors and short postings, because what this test needs is a
-        // lot of partitions rather than a lot of vectors, and building them is
-        // the whole cost of it.
-        let dim = 12;
-        let store = corpus(dim, 12_000, 40, 91);
-        let tuning = Tuning {
-            posting: 32,
-            ..Tuning::default()
-        };
-        let mut ix = build(&store, dim, tuning);
-        assert!(
-            ix.postings.len() > crate::rank::FLOOR,
-            "only {} partitions, which is not enough to have codes at all",
-            ix.postings.len()
-        );
-
-        let ask = |ix: &Partitions| -> Vec<Vec<u64>> {
-            (0..200)
-                .map(|i| {
-                    let q = &store.0[i * 57 % store.0.len()];
-                    ix.search(q, 10, &store).into_iter().map(|h| h.id).collect()
-                })
-                .collect()
-        };
-        let coded = ask(&ix);
-        ix.forget_centroid_codes();
-        assert_eq!(coded, ask(&ix), "the codes changed an answer");
     }
 
     /// What the sweep is for, measured as the thing it actually fixes rather

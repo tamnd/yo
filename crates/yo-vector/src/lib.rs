@@ -51,13 +51,11 @@
 //! per partition probed, so rotating the centroids once when they are built
 //! turns tens of rotations a search into one.
 //!
-//! Ranking those centroids is its own problem once there are thousands of them,
-//! because reading every one of them is twelve megabytes on a large collection
-//! and it is spent before a query has touched a single posting. So the centroids
-//! are coded too, against their own mean, and the scan picks a shortlist that is
-//! then measured exactly. Every centroid is still looked at on every query, which
-//! is the difference between that and a tree over them, and `src/rank.rs` is
-//! where the reasoning and the measurements live.
+//! They are read in full on every search, which sounds like the obvious thing to
+//! fix on a collection with thousands of them and is not. `src/rank.rs` is the
+//! measurement: coding them the way their members are coded is three to nine
+//! times slower than reading them, because reading them is already going at
+//! memory speed and the estimator that would replace it is not.
 //!
 //! [`Collection`] is the piece above that, and it is the one both doors reach.
 //! [`Partitions`] deals in ids and knows nothing about the key a client wrote a
@@ -113,7 +111,7 @@ pub mod image;
 pub mod muvera;
 pub mod partition;
 pub mod rabitq;
-pub(crate) mod rank;
+mod rank;
 pub mod rotate;
 
 pub use collection::{Collection, Match};
