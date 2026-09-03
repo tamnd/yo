@@ -123,7 +123,7 @@ pub enum Compat {
 }
 
 /// What to do with an HNSW request.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Plan {
     /// Serve it here, tuned like this, with this many postings ready.
     Partitions {
