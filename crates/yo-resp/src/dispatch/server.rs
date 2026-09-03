@@ -296,6 +296,7 @@ pub(super) fn execute(
             out.ok();
         }
         "time" => time(out),
+        "shutdown" => return shutdown(server, args),
         _ => return Err(args::unknown_command(args)),
     }
     Ok(Flow::Continue)
@@ -319,6 +320,59 @@ fn time(out: &mut Out) {
     out.array(2);
     out.bulk(now.as_secs().to_string().as_bytes());
     out.bulk(now.subsec_micros().to_string().as_bytes());
+}
+
+// ---------------------------------------------------------------- SHUTDOWN
+
+/// `SHUTDOWN [NOSAVE | SAVE] [NOW] [FORCE] [ABORT]`.
+///
+/// On success this writes nothing at all and the connection closes under the
+/// client, which is what a server that has stopped looks like from the outside
+/// and is what every client library already expects. There is no `OK`, because
+/// an `OK` would be a promise made by a process that is about to not exist.
+///
+/// The flags are taken and none of them changes what happens, which is the same
+/// answer `SAVE` gets from `CONFIG GET`: this server has no save points and no
+/// snapshot to write, so saving and not saving are the same act. What durability
+/// there is belongs to the file underneath and is already on disk by the time a
+/// command returns, so there is nothing for `SAVE` to do and nothing for
+/// `NOSAVE` to skip. `NOW` and `FORCE` are about not waiting for replicas and
+/// about going anyway when a save failed, and neither has anything to wait for
+/// or to fail here.
+///
+/// # Errors
+///
+/// [`Code::Invalid`] for a word that is not one of the five, for `SAVE` and
+/// `NOSAVE` in the same call, and for `ABORT` alongside any other flag, all of
+/// which is what 8.10.1 says. `ABORT` on its own gets Redis's message for a
+/// cancel with nothing to cancel, and here that is not a state that can be
+/// reached rather than one that happens to be empty: a shutdown is decided and
+/// done inside one turn of the loop, so there is never a window in which one is
+/// in progress and a second client could call it off.
+fn shutdown(server: &mut Server, args: Args<'_>) -> Result<Flow> {
+    let (mut save, mut nosave, mut abort, mut other) = (false, false, false, false);
+    for at in 1..args.len() {
+        let arg = args.get(at);
+        match () {
+            () if is(arg, b"save") => save = true,
+            () if is(arg, b"nosave") => nosave = true,
+            () if is(arg, b"abort") => abort = true,
+            () if is(arg, b"now") || is(arg, b"force") => other = true,
+            () => return Err(args::syntax()),
+        }
+    }
+    // Repeating one is fine and contradicting yourself is not, and `ABORT` says
+    // to do nothing so it cannot be combined with a word about how to do it.
+    if (save && nosave) || (abort && (save || nosave || other)) {
+        return Err(args::syntax());
+    }
+    if abort {
+        return Err(Error::new(Code::Invalid, "No shutdown in progress."));
+    }
+    server.stop();
+    // Closing is what stops anything the client pipelined behind this from
+    // being answered by a server that is on its way out.
+    Ok(Flow::Close)
 }
 
 // ------------------------------------------------------------------- FLUSH

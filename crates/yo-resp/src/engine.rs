@@ -545,6 +545,17 @@ impl<S: Sink> Wire<S> {
         self.dirty.len()
     }
 
+    /// Whether a client has asked the server to stop.
+    ///
+    /// The driver reads this once a turn, next to the flag a signal sets, and
+    /// leaves its loop when either is set. Asked after the batch rather than
+    /// during it, so the `SHUTDOWN` and everything that shared its batch is
+    /// finished and written out before anything closes.
+    #[must_use]
+    pub fn stopping(&self) -> bool {
+        self.server.stopping()
+    }
+
     /// Decoders in the pool, which is the high water mark of one batch.
     #[must_use]
     pub fn decoders(&self) -> usize {
