@@ -708,9 +708,9 @@ impl Partitions {
                 break;
             }
             let centre = &self.centroids[q * dim..(q + 1) * dim];
-            let covered = into
-                .iter()
-                .any(|&(taken, _)| sqdist(&self.centroids[taken * dim..(taken + 1) * dim], centre) < d);
+            let covered = into.iter().any(|&(taken, _)| {
+                sqdist(&self.centroids[taken * dim..(taken + 1) * dim], centre) < d
+            });
             if !covered {
                 into.push((q, d));
             }
@@ -854,10 +854,11 @@ impl Partitions {
             // partition is not, and `attach` is where that is caught, because
             // it is the shape a delete cannot undo.
             if !self.attach(id, p, slot) {
-                return Err(
-                    Error::new(Code::Corrupt, "an id is twice in one partition of an image")
-                        .with_detail(format!("id={id} partition={p}")),
-                );
+                return Err(Error::new(
+                    Code::Corrupt,
+                    "an id is twice in one partition of an image",
+                )
+                .with_detail(format!("id={id} partition={p}")));
             }
         }
         self.centroids.extend_from_slice(centroid);
@@ -1537,7 +1538,10 @@ impl Partitions {
         if let Some(at) = self.placed_at(id, p) {
             self.places[at as usize].slot = s as u32;
         } else {
-            debug_assert!(false, "id {id} is in partition {p} and the map does not say so");
+            debug_assert!(
+                false,
+                "id {id} is in partition {p} and the map does not say so"
+            );
         }
     }
 
@@ -1979,7 +1983,10 @@ mod tests {
                 let place = ix.places[walk as usize];
                 let p = place.partition as usize;
                 assert!(mine.insert(p), "id {id} is filed twice under partition {p}");
-                assert!(p < ix.postings.len(), "id {id} is filed under partition {p}");
+                assert!(
+                    p < ix.postings.len(),
+                    "id {id} is filed under partition {p}"
+                );
                 assert_eq!(
                     ix.postings[p].ids[place.slot as usize], id,
                     "id {id} is filed at a slot holding something else"
@@ -2360,25 +2367,59 @@ mod tests {
         assert_eq!(on.len(), store.0.len(), "a copy is not a member");
     }
 
-    /// The whole point of it, which is the only thing here worth breaking a
-    /// build over. A member reachable from more partitions is found from more
-    /// queries, so recall at a probe count too small for the collection goes up.
+    /// The whole point of it, stated as the thing that is actually true rather
+    /// than as a recall number.
+    ///
+    /// A copy of a member in a second partition means a search that reads that
+    /// partition finds the member, without widening and without the member's own
+    /// partition being anywhere near the query. So take a member that got
+    /// copied, take a different member of the partition it was copied into, and
+    /// search from that one with a probe of exactly one. The scan reads one
+    /// posting, and the copy is why the answer is in it.
+    ///
+    /// Recall is deliberately not what this asserts. Whether copies pay for
+    /// themselves end to end is a question about the shape of the data, and on
+    /// generated vectors the answer is no by a hair, because a tight cluster has
+    /// no boundary members worth copying and the copies that do get made push
+    /// the partition count up and the share of the index a fixed probe reads
+    /// down. `examples/recall.rs` is where that gets answered, on data somebody
+    /// else made.
     #[test]
-    fn spilling_buys_recall_at_a_narrow_probe() {
+    fn a_copy_is_found_from_the_partition_it_was_copied_into() {
         let dim = 32;
-        let store = corpus(dim, 4000, 16, 23);
-        let narrow = |spill: usize| {
-            let mut t = Tuning::default();
-            t.spill = spill;
-            t.probe = 2;
-            t
-        };
-        let none = recall(&build(&store, dim, narrow(1)), &store, 10, 200);
-        let some = recall(&build(&store, dim, narrow(4)), &store, 10, 200);
-        assert!(
-            some > none,
-            "spilling should raise recall at probe 2, went from {none} to {some}"
-        );
+        let store = corpus(dim, 3000, 12, 5);
+        let mut t = Tuning::default();
+        t.slack = 0.25;
+        let mut ix = build(&store, dim, t);
+        let (id, copies) = (0..3000u64)
+            .filter_map(|id| {
+                let mut places = Vec::new();
+                ix.every_place(id, &mut places);
+                (places.len() > 1).then_some((id, places))
+            })
+            .next()
+            .expect("some member near a boundary got copied");
+
+        let mut narrow = t;
+        narrow.probe = 1;
+        narrow.widen = 1;
+        ix.retune(narrow);
+        for place in &copies {
+            let p = place.partition as usize;
+            // A different member of the same posting, so the query lands there
+            // rather than where the copied member belongs.
+            let neighbour = ix.postings[p]
+                .ids
+                .iter()
+                .copied()
+                .find(|&other| other != id)
+                .expect("the partition holds more than the copy");
+            let got = ix.candidates(&store.0[neighbour as usize], ix.postings[p].len());
+            assert!(
+                got.iter().any(|&(seen, _)| seen == id),
+                "member {id} has a copy in partition {p} and a search of it did not find it"
+            );
+        }
     }
 
     /// A replicated member is scanned twice by a search that reads both of its

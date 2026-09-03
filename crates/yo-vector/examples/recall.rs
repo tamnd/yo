@@ -106,12 +106,12 @@ fn main() {
     // generated vectors is not evidence. `src/miss.rs` is why they are here:
     // on MS-MARCO the whole of the recall gap is neighbours in partitions the
     // search never reads, which is what a copy in a second partition is for.
-    let spill: usize = args
-        .next()
-        .map_or(Tuning::default().spill, |a| a.parse().expect("spill is a count"));
-    let slack: f32 = args
-        .next()
-        .map_or(Tuning::default().slack, |a| a.parse().expect("slack is a fraction"));
+    let spill: usize = args.next().map_or(Tuning::default().spill, |a| {
+        a.parse().expect("spill is a count")
+    });
+    let slack: f32 = args.next().map_or(Tuning::default().slack, |a| {
+        a.parse().expect("slack is a fraction")
+    });
     let set = prefix(&dir);
 
     let t = Instant::now();

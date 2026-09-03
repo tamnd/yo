@@ -76,7 +76,9 @@
 //! reader that does not like an image can throw it away and rebuild from the
 //! records, slowly and correctly.
 
-use crate::{get_f32, get_u8, get_u16, get_u32, get_u64, put_f32, put_u8, put_u16, put_u32, put_u64};
+use crate::{
+    get_f32, get_u8, get_u16, get_u32, get_u64, put_f32, put_u8, put_u16, put_u32, put_u64,
+};
 use yo_common::{Code, Error, Result};
 
 /// The four bytes an image starts with, so that a stray chunk is not read as

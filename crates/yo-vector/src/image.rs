@@ -450,9 +450,37 @@ mod tests {
             .collect()
     }
 
+    /// The corpus above gathered into a handful of clusters, which is what a
+    /// boundary needs in order to exist at all. Uniform points in a cube put
+    /// every centroid near the middle of it, so any two centroids are closer to
+    /// each other than either is to a vector, and no vector is ever near enough
+    /// to a second partition to be copied into it.
+    fn clustered(dim: usize, n: usize, clusters: usize, seed: u64) -> Vec<(Vec<u8>, Vec<f32>)> {
+        let centres = corpus(dim, clusters, seed);
+        corpus(dim, n, seed ^ 0x9e37)
+            .into_iter()
+            .enumerate()
+            .map(|(i, (key, off))| {
+                let centre = &centres[i % clusters].1;
+                let v = centre.iter().zip(&off).map(|(c, o)| c + o * 0.6).collect();
+                (key, v)
+            })
+            .collect()
+    }
+
     fn built(dim: usize, n: usize, metric: Metric) -> Collection {
+        built_from(dim, metric, Tuning::default(), corpus(dim, n, 42))
+    }
+
+    fn built_from(
+        dim: usize,
+        metric: Metric,
+        tuning: Tuning,
+        vectors: Vec<(Vec<u8>, Vec<f32>)>,
+    ) -> Collection {
         let mut c = Collection::new(dim, metric).expect("a collection");
-        for (i, (key, v)) in corpus(dim, n, 42).into_iter().enumerate() {
+        c.retune(tuning);
+        for (i, (key, v)) in vectors.into_iter().enumerate() {
             c.put_tagged(&key, &v, 1 << (i % 8)).expect("put");
         }
         c
@@ -502,6 +530,31 @@ mod tests {
                 "a filtered query came back differently, so a tag moved"
             );
         }
+    }
+
+    /// A collection with boundary copies in it is the one shape the loader used
+    /// to refuse outright, because an id in two partitions was the definition of
+    /// a corrupt image. The copies have to come back, and they have to come back
+    /// as copies rather than as two members.
+    ///
+    /// Clustered and slacker than the rest of the tests here on purpose, for the
+    /// reason [`clustered`] gives: the plain corpus makes no copies at all, so
+    /// the test would pass without ever exercising what it is named after.
+    #[test]
+    fn the_boundary_copies_survive_a_round_trip() {
+        let tuning = Tuning {
+            slack: 0.25,
+            ..Tuning::default()
+        };
+        let c = built_from(32, Metric::L2, tuning, clustered(32, 3000, 12, 42));
+        assert!(
+            c.entries() > c.len(),
+            "a collection with no copies in it proves nothing here"
+        );
+        let back = round_trip(&c, &Table::of(&c)).collection;
+        assert_eq!(back.entries(), c.entries(), "a copy was lost");
+        assert_eq!(back.len(), c.len(), "a copy came back as a member");
+        assert_eq!(back.partitions(), c.partitions());
     }
 
     #[test]

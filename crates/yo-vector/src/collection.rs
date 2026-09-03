@@ -167,6 +167,14 @@ impl Collection {
         self.index.partitions()
     }
 
+    /// How many coded members the partitions hold between them, which is more
+    /// than [`Collection::len`] by however many boundary copies
+    /// [`Tuning::spill`] has made.
+    #[must_use]
+    pub fn entries(&self) -> usize {
+        self.index.entries()
+    }
+
     /// The knobs the index is searched with.
     #[must_use]
     pub fn tuning(&self) -> Tuning {
