@@ -63,7 +63,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 
-use super::Id;
+use super::{Cursor, Id};
 use crate::frozen::{self, Broken};
 
 /// Which pending entries a caller wants, which is every filter `XPENDING` takes.
@@ -274,7 +274,7 @@ impl Consumer {
 }
 
 /// A consumer group over one stream.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default)]
 pub struct Group {
     /// The last ID handed out, which `XREADGROUP >` reads after.
     last: Id,
@@ -296,7 +296,30 @@ pub struct Group {
     /// file and adjusts this, and a test at the bottom checks the number against
     /// a full scan after a run of mixed operations.
     nacked: usize,
+    /// Where the last read of this group stopped inside a node's blob.
+    ///
+    /// A note about the shape of the stream and not about the group, dropped by
+    /// anything that moves the bytes it counted past and rebuilt by the next
+    /// read. See [`Cursor`].
+    resume: Option<Cursor>,
 }
+
+/// Two groups are the same when they hold the same entries for the same
+/// consumers at the same place. The resume cursor is not part of that. It is a
+/// note about where a walk got to in a blob, a freeze and thaw drops it, and a
+/// group that has read something is not a different group from the same group
+/// before it did.
+impl PartialEq for Group {
+    fn eq(&self, other: &Group) -> bool {
+        self.last == other.last
+            && self.read == other.read
+            && self.pending == other.pending
+            && self.consumers == other.consumers
+            && self.nacked == other.nacked
+    }
+}
+
+impl Eq for Group {}
 
 impl Group {
     /// A group reading after `last`, having read `read` entries.
@@ -308,7 +331,27 @@ impl Group {
             pending: BTreeMap::new(),
             consumers: Vec::new(),
             nacked: 0,
+            resume: None,
         }
+    }
+
+    /// The node and byte offset the last read stopped at, when it is still good.
+    ///
+    /// Good means two things. The stream has not moved any bytes since, which is
+    /// what the epoch says, and this read is asking for exactly the ID the read
+    /// that left the mark would be asked for next. The second is what makes an
+    /// `XGROUP SETID` back to an older ID safe without the group having to know
+    /// about it: the bookmark is somewhere else, so the mark does not match and
+    /// the walk starts from the front.
+    #[must_use]
+    pub(crate) fn resume(&self, epoch: u64, from: Id) -> Option<(Id, usize)> {
+        let c = self.resume?;
+        (c.epoch == epoch && c.next == from).then_some((c.master, c.byte))
+    }
+
+    /// Keep where the read that just ran stopped, or forget the old mark.
+    pub(crate) fn set_resume(&mut self, at: Option<Cursor>) {
+        self.resume = at;
     }
 
     /// The last ID handed out.
@@ -827,6 +870,7 @@ impl Group {
             pending: BTreeMap::new(),
             consumers,
             nacked: 0,
+            resume: None,
         };
         let mut prev = None;
         for _ in 0..n {

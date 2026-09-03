@@ -478,8 +478,35 @@ impl Edges {
 /// changes shape.
 const FORM_NODES: u8 = 1;
 
+/// Where a group read stopped, so the next one does not start from the front.
+///
+/// `XREADGROUP GROUP g c COUNT 1 STREAMS key >` hands over one entry and moves
+/// the group's bookmark one along. Without a mark the read after it walks the
+/// node's blob from the first entry to find the one after the bookmark, and at
+/// the default hundred entries a node that is fifty entries of decoding to hand
+/// back one of them, which makes a consumer draining a stream quadratic in the
+/// node rather than linear.
+///
+/// The mark is only believed when the stream has not moved any bytes since it
+/// was taken and the read is asking for exactly the ID the walk that left it
+/// would be asked for next. Anything else, an `XGROUP SETID` most of all, walks
+/// from the front the way it always did.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Cursor {
+    /// The stream's mutation count when this was taken.
+    epoch: u64,
+    /// The ID the walk that left this mark would be asked for next, which is
+    /// one past the last entry it handed over. A read starting anywhere else
+    /// cannot use it, because the mark says nothing about what is behind it.
+    next: Id,
+    /// Which node, by its master ID, which is unique and never reused.
+    master: Id,
+    /// Where in that node's blob to pick up.
+    byte: usize,
+}
+
 /// A log of entries in ID order.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default)]
 pub struct Stream {
     nodes: VecDeque<Node>,
     /// Live entries, which is what `XLEN` answers.
@@ -499,7 +526,33 @@ pub struct Stream {
     /// up once a command, so a linear scan beats hashing and brings nothing
     /// with it. The same argument the group makes about its consumers.
     groups: Vec<(Vec<u8>, Group)>,
+    /// How many times something has moved bytes inside a node.
+    ///
+    /// A [`Cursor`] is a byte offset into a node's blob and it is only good for
+    /// as long as the bytes it counted past are where they were. An append is
+    /// not one of these events, because it writes at the end and the header
+    /// fields it rewrites are the same width either side of it almost always,
+    /// and the almost is what this counts.
+    epoch: u64,
 }
+
+/// Two streams are the same when they hold the same entries and the same
+/// groups. The mutation count is not part of that. It is a number the resume
+/// cursors compare themselves against, nothing outside this file can see it,
+/// and a stream frozen and thawed is the same stream even though its count
+/// starts again at zero.
+impl PartialEq for Stream {
+    fn eq(&self, other: &Stream) -> bool {
+        self.nodes == other.nodes
+            && self.length == other.length
+            && self.last == other.last
+            && self.max_deleted == other.max_deleted
+            && self.added == other.added
+            && self.groups == other.groups
+    }
+}
+
+impl Eq for Stream {}
 
 impl Stream {
     /// An empty stream.
@@ -610,6 +663,7 @@ impl Stream {
             max_deleted,
             added,
             groups,
+            epoch: 0,
         })
     }
 
@@ -789,7 +843,13 @@ impl Stream {
         let node = self.nodes.back_mut().expect("a node was just made sure of");
         let same = same_fields(&node.lp, fields);
         write_entry(&mut node.lp, node.master, id, fields, same);
-        bump(&mut node.lp, 1, 0);
+        // The entry itself goes on the end and moves nothing, so a group's mark
+        // into this node survives an append and lands on what was just written,
+        // which is the whole point. The counts in front of it are the one part
+        // that can move, and this is where that gets noticed.
+        if bump(&mut node.lp, 1, 0) {
+            self.epoch = self.epoch.wrapping_add(1);
+        }
 
         self.length += 1;
         self.added += 1;
@@ -912,6 +972,11 @@ impl Stream {
             set_int(&mut node.lp, offset, flags | DELETED);
             bump(&mut node.lp, -1, 1);
         }
+        // Marking an entry dead writes into the middle of the node, so anything
+        // behind it has moved and every group's mark is now a byte offset to
+        // nowhere. Deletes are rare next to appends and reads, so this throws
+        // all of them away rather than working out which ones survived.
+        self.epoch = self.epoch.wrapping_add(1);
         self.length -= 1;
         true
     }
@@ -1060,7 +1125,7 @@ impl Stream {
                 break;
             }
             buf.clear();
-            each(&node.lp, node.master, &mut |id, fields| {
+            each(&node.lp, node.master, None, &mut |id, _, fields| {
                 if id >= start && id <= end {
                     buf.push((id, fields));
                 }
@@ -1165,7 +1230,13 @@ impl Stream {
         let edges = self.edges();
         // Field by field, so that walking the nodes and writing the pending list
         // are two borrows the compiler can see are disjoint.
-        let Stream { nodes, groups, .. } = self;
+        let Stream {
+            nodes,
+            groups,
+            epoch,
+            ..
+        } = self;
+        let epoch = *epoch;
         let (_, g) = groups.iter_mut().find(|(n, _)| n.as_slice() == group)?;
         let slot = g.consumer_or_create(consumer, now);
         let Some(from) = g.last_id().next() else {
@@ -1174,8 +1245,12 @@ impl Stream {
             g.touch(slot, now, false);
             return Some(0);
         };
-        let mut seen = 0;
-        walk_nodes(nodes, from, Id::MAX, count, &mut |id, fields| {
+        // Where the last read of this group stopped, when it is still good for
+        // this one. A consumer draining a stream one entry at a time asks for
+        // the entry right after the one it just got, and this is what saves it
+        // decoding the node from the front to find it.
+        let resume = g.resume(epoch, from);
+        let (seen, mark) = walk_nodes(nodes, from, Id::MAX, count, resume, &mut |id, fields| {
             // Worked out before the bookmark moves, because the rule asks where
             // the group was when the entry was handed over.
             let read = edges.on_deliver(g, id);
@@ -1185,8 +1260,17 @@ impl Stream {
                 g.deliver(slot, id, now);
             }
             g.set_read(read);
-            seen += 1;
             f(id, fields)
+        });
+        let next = g.last_id().next();
+        g.set_resume(match (mark, next) {
+            (Some((master, byte)), Some(next)) => Some(Cursor {
+                epoch,
+                next,
+                master,
+                byte,
+            }),
+            _ => None,
         });
         g.touch(slot, now, seen > 0);
         Some(seen)
@@ -1395,7 +1479,7 @@ impl Stream {
     where
         F: FnMut(Id, Fields<'_>) -> bool,
     {
-        walk_nodes(&self.nodes, start, end, count, f)
+        walk_nodes(&self.nodes, start, end, count, None, f).0
     }
 
     /// The first node that can hold an entry at or after `id`.
@@ -1429,23 +1513,35 @@ fn node_from(nodes: &VecDeque<Node>, id: Id) -> usize {
 /// Every live entry from `start` to `end`, both included, oldest first.
 ///
 /// Free for the same reason [`node_from`] is.
+/// `resume` is a node's master ID and a byte offset inside it from an earlier
+/// walk, and the answer carries the same pair back for where this one stopped.
+/// Only a group read has one, and it is the caller's job to have checked that
+/// nothing has moved the bytes since.
 fn walk_nodes<F>(
     nodes: &VecDeque<Node>,
     start: Id,
     end: Id,
     count: Option<usize>,
+    resume: Option<(Id, usize)>,
     f: &mut F,
-) -> usize
+) -> (usize, Option<(Id, usize)>)
 where
     F: FnMut(Id, Fields<'_>) -> bool,
 {
     let mut seen = 0;
     let mut stop = false;
-    for node in nodes.iter().skip(node_from(nodes, start)) {
+    let first = node_from(nodes, start);
+    // Only when the mark is about the node this walk is starting in. Node master
+    // IDs are unique and never reused, so a node that has since been trimmed
+    // away cannot be mistaken for the one that took its place.
+    let mut from =
+        resume.and_then(|(master, byte)| (nodes.get(first)?.master == master).then_some(byte));
+    let mut mark = None;
+    for node in nodes.iter().skip(first) {
         if node.master > end {
             break;
         }
-        each(&node.lp, node.master, &mut |id, fields| {
+        let at = each(&node.lp, node.master, from.take(), &mut |id, _, fields| {
             if id > end {
                 stop = true;
                 return false;
@@ -1464,11 +1560,12 @@ where
             }
             true
         });
+        mark = Some((node.master, at));
         if stop {
             break;
         }
     }
-    seen
+    (seen, mark)
 }
 
 /// The field names and values of one entry.
@@ -1557,14 +1654,24 @@ fn counts(lp: &Listpack) -> (u64, u64) {
     (count.max(0) as u64, deleted.max(0) as u64)
 }
 
-/// Add to the master entry's two counts.
-fn bump(lp: &mut Listpack, live: i64, dead: i64) {
+/// Add to the master entry's two counts, answering whether that moved any bytes.
+///
+/// Both counts sit in front of every entry in the node, so a write that encodes
+/// to a different width than what was there shifts the whole rest of the blob
+/// along and every [`Cursor`] into it is a byte offset to nowhere. It usually
+/// does not: a node holds a hundred entries by default and a listpack keeps
+/// anything under a hundred and twenty eight in one byte, so an append writes
+/// the same width it read almost every time. Almost, because the node limits are
+/// the caller's to set.
+fn bump(lp: &mut Listpack, live: i64, dead: i64) -> bool {
+    let was = lp.byte_len();
     let (count, deleted) = counts(lp);
     let mut buf = [0u8; DIGITS_MAX];
     let at = count as i64 + live;
     lp.replace(0, u64_digits(&mut buf, at.max(0) as u64));
     let at = deleted as i64 + dead;
     lp.replace(1, u64_digits(&mut buf, at.max(0) as u64));
+    lp.byte_len() != was
 }
 
 /// An entry as an integer, or zero for anything else.
@@ -1615,7 +1722,7 @@ fn write_entry(lp: &mut Listpack, master: Id, id: Id, fields: &[(&[u8], &[u8])],
 /// The greatest ID in a node, live or not.
 fn last_of(node: &Node) -> Id {
     let mut last = node.master;
-    each(&node.lp, node.master, &mut |id, _| {
+    each(&node.lp, node.master, None, &mut |id, _, _| {
         last = id;
         true
     });
@@ -1628,27 +1735,33 @@ fn last_of(node: &Node) -> Id {
 /// that is what `replace` takes.
 fn find(lp: &Listpack, master: Id, id: Id) -> Option<(usize, i64)> {
     let mut at = None;
-    walk_node(lp, master, &mut |found, index, flags, _| {
-        if found == id {
-            at = Some((index, flags));
+    walk_node(lp, master, None, &mut |mark, flags, _| {
+        if mark.id == id {
+            // Always a `Some`, because this walk starts at the front, and the
+            // `if let` rather than an unwrap keeps that a fact about this call
+            // rather than something the mark has to promise everybody.
+            if let Some(index) = mark.index {
+                at = Some((index, flags));
+            }
             return false;
         }
-        found < id
+        mark.id < id
     });
     at
 }
 
 /// Every entry in a node, live ones only, oldest first.
-fn each<'a, F>(lp: &'a Listpack, master: Id, f: &mut F)
+/// `from` and the answer are the resume mark [`walk_node`] takes and gives back.
+fn each<'a, F>(lp: &'a Listpack, master: Id, from: Option<usize>, f: &mut F) -> usize
 where
-    F: FnMut(Id, Fields<'a>) -> bool,
+    F: FnMut(Id, usize, Fields<'a>) -> bool,
 {
-    walk_node(lp, master, &mut |id, _, flags, fields| {
+    walk_node(lp, master, from, &mut |mark, flags, fields| {
         if flags & DELETED != 0 {
             return true;
         }
-        f(id, fields)
-    });
+        f(mark.id, mark.byte, fields)
+    })
 }
 
 /// Every entry in a node, deleted ones included, with its element index.
@@ -1656,13 +1769,13 @@ where
 /// One forward walk of the whole blob. Nothing here reaches into the middle by
 /// index, because a listpack index is a walk from the front and doing that per
 /// entry would turn a node scan into a quadratic one.
-fn walk_node<'a, F>(lp: &'a Listpack, master: Id, f: &mut F)
+fn walk_node<'a, F>(lp: &'a Listpack, master: Id, from: Option<usize>, f: &mut F) -> usize
 where
-    F: FnMut(Id, usize, i64, Fields<'a>) -> bool,
+    F: FnMut(Mark, i64, Fields<'a>) -> bool,
 {
     let mut it = lp.iter();
     let (Some(_), Some(_), Some(Entry::Int(masters))) = (it.next(), it.next(), it.next()) else {
-        return;
+        return it.offset();
     };
     let masters = masters.max(0) as usize;
     // The master field names, kept as a mark to hand to the entries that share
@@ -1671,17 +1784,26 @@ where
     let mut index = MASTER_FIELDS;
     for _ in 0..=masters {
         if it.next().is_none() {
-            return;
+            return it.offset();
         }
         index += 1;
     }
+    // A resume skips straight to where a previous walk stopped. The header above
+    // still has to be read whichever way this is called, because the field names
+    // a shared entry hands back live in it, but that is a handful of elements
+    // rather than every entry in the node.
+    let counting = from.is_none();
+    if let Some(byte) = from.filter(|byte| *byte > it.offset()) {
+        it = lp.iter_at(byte);
+    }
 
     loop {
-        let at = index;
+        let at = it.offset();
+        let element = index;
         let (Some(Entry::Int(flags)), Some(Entry::Int(ms)), Some(Entry::Int(seq))) =
             (it.next(), it.next(), it.next())
         else {
-            return;
+            return at;
         };
         index += 3;
         let id = Id {
@@ -1699,7 +1821,7 @@ where
             (fields, masters + 1)
         } else {
             let Some(Entry::Int(n)) = it.next() else {
-                return;
+                return at;
             };
             index += 1;
             let fields = Fields {
@@ -1710,16 +1832,37 @@ where
             (fields, n.max(0) as usize * 2 + 1)
         };
 
-        if !f(id, at, flags, fields) {
-            return;
+        let mark = Mark {
+            id,
+            index: counting.then_some(element),
+            byte: at,
+        };
+        if !f(mark, flags, fields) {
+            return at;
         }
         for _ in 0..skip {
             if it.next().is_none() {
-                return;
+                return it.offset();
             }
             index += 1;
         }
     }
+}
+
+/// Where one entry sits inside its node.
+#[derive(Debug, Clone, Copy)]
+struct Mark {
+    /// The entry's ID, worked out from the node's master and the two
+    /// differences the entry stores.
+    id: Id,
+    /// Which listpack element the entry's flags are, for the writes that reach
+    /// back in by index. Only filled in on a walk that started at the front,
+    /// because counting elements from a resume point would give a number
+    /// [`Listpack::replace`] cannot use.
+    index: Option<usize>,
+    /// Where in the blob the entry's flags element starts, which is what
+    /// [`Listpack::iter_at`] takes to come back here.
+    byte: usize,
 }
 
 #[cfg(test)]
@@ -2402,6 +2545,7 @@ mod tests {
             max_deleted: Id::new(u64::from(rest[5]), u64::from(rest[6])),
             added: u64::from(rest[7]),
             groups: Vec::new(),
+            epoch: 0,
         };
 
         assert_eq!(s.len(), 3);
@@ -2456,6 +2600,100 @@ mod tests {
         )
         .expect("the group");
         out
+    }
+
+    /// The read the resume cursor exists for.
+    ///
+    /// Five hundred entries is five nodes, so this also covers the mark being
+    /// carried over a node boundary and the walk picking up in the next one.
+    #[test]
+    fn a_group_draining_one_at_a_time_gets_every_entry_once() {
+        let mut s = logged(500);
+        s.create_group(b"workers", Id::MIN, Some(0));
+        let mut got = Vec::new();
+        for _ in 0..500 {
+            got.extend(read(&mut s, "workers", "alice", Some(1), 100));
+        }
+        assert_eq!(got, (1..=500).map(|ms| Id::new(ms, 0)).collect::<Vec<_>>());
+        assert!(read(&mut s, "workers", "alice", Some(1), 100).is_empty());
+    }
+
+    /// The state a consumer keeping up with a producer sits in, where the mark
+    /// points past the last entry there was and an append lands right on it.
+    #[test]
+    fn a_group_that_has_caught_up_is_handed_the_next_append() {
+        let mut s = logged(3);
+        s.create_group(b"workers", Id::MIN, Some(0));
+        assert_eq!(read(&mut s, "workers", "alice", None, 100).len(), 3);
+        for ms in 4..=200u64 {
+            add(&mut s, ms, 0, &[("job", "x")]);
+            assert_eq!(
+                read(&mut s, "workers", "alice", Some(1), 100),
+                vec![Id::new(ms, 0)],
+                "the entry appended a moment ago"
+            );
+        }
+    }
+
+    /// A delete moves every byte behind it, so the mark has to be thrown away
+    /// rather than followed into the middle of an entry.
+    #[test]
+    fn a_delete_between_two_group_reads_does_not_lose_the_rest() {
+        let mut s = logged(300);
+        s.create_group(b"workers", Id::MIN, Some(0));
+        let mut got = read(&mut s, "workers", "alice", Some(10), 100);
+        assert!(s.delete(Id::new(150, 0)));
+        while got.len() < 299 {
+            let more = read(&mut s, "workers", "alice", Some(1), 100);
+            assert_eq!(more.len(), 1, "at {}", got.len());
+            got.extend(more);
+        }
+        let want: Vec<Id> = (1..=300)
+            .filter(|ms| *ms != 150)
+            .map(|ms| Id::new(ms, 0))
+            .collect();
+        assert_eq!(got, want);
+    }
+
+    /// `XGROUP SETID` back to the start puts the bookmark somewhere the mark
+    /// says nothing about, and the read after it has to walk from the front.
+    #[test]
+    fn moving_the_bookmark_back_reads_it_all_again() {
+        let mut s = logged(250);
+        s.create_group(b"workers", Id::MIN, Some(0));
+        for _ in 0..120 {
+            read(&mut s, "workers", "alice", Some(1), 100);
+        }
+        s.group_mut(b"workers")
+            .expect("the group")
+            .set_id(Id::MIN, Some(0));
+        let mut got = Vec::new();
+        for _ in 0..250 {
+            got.extend(read(&mut s, "workers", "alice", Some(1), 100));
+        }
+        assert_eq!(got, (1..=250).map(|ms| Id::new(ms, 0)).collect::<Vec<_>>());
+    }
+
+    /// A trim drops whole nodes from the front, one of which may be the one a
+    /// group's mark is about. Node master IDs are never reused, so the mark
+    /// cannot be mistaken for one about the node that took its place.
+    #[test]
+    fn a_trim_under_a_group_does_not_hand_out_the_wrong_entries() {
+        let mut s = logged(500);
+        s.create_group(b"workers", Id::MIN, Some(0));
+        for _ in 0..50 {
+            read(&mut s, "workers", "alice", Some(1), 100);
+        }
+        assert_eq!(s.trim_maxlen(200, false, None), 300);
+        let mut got = Vec::new();
+        for _ in 0..250 {
+            got.extend(read(&mut s, "workers", "alice", Some(1), 100));
+        }
+        assert_eq!(
+            got,
+            (301..=500).map(|ms| Id::new(ms, 0)).collect::<Vec<_>>(),
+            "everything the trim left that the group had not read"
+        );
     }
 
     #[test]

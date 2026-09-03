@@ -288,6 +288,23 @@ impl Listpack {
         decode(&self.bytes[at..self.bytes.len() - 1]).map(|(e, _)| e)
     }
 
+    /// A forward walk that starts at a byte offset a previous walk reported.
+    ///
+    /// The offset has to come from [`Iter::offset`] on a walk of this same blob,
+    /// taken while nothing has moved the bytes since. A stream node uses it to
+    /// resume a group read where the last one stopped instead of decoding the
+    /// whole node again, and it checks the entry it lands on before believing
+    /// it. An offset that is past the end gives an empty walk rather than
+    /// nonsense, and one that lands in the middle of an entry gives whatever
+    /// those bytes decode as, which is why the caller checks.
+    #[must_use]
+    pub fn iter_at(&self, byte: usize) -> Iter<'_> {
+        Iter {
+            bytes: &self.bytes,
+            at: byte.clamp(HDR, self.bytes.len().saturating_sub(1)),
+        }
+    }
+
     /// A forward walk that starts at `index` rather than at the front.
     ///
     /// `LRANGE key 300 320` on a packed list would otherwise decode three
@@ -556,6 +573,17 @@ impl Listpack {
 pub struct Iter<'a> {
     bytes: &'a [u8],
     at: usize,
+}
+
+impl Iter<'_> {
+    /// Where in the blob the next element starts.
+    ///
+    /// Hand it back to [`Listpack::iter_at`] to carry on from here later.
+    #[inline]
+    #[must_use]
+    pub const fn offset(&self) -> usize {
+        self.at
+    }
 }
 
 impl<'a> Iterator for Iter<'a> {
@@ -1593,6 +1621,27 @@ mod tests {
             };
             assert_eq!(lp.find(m, 2), want, "member {at} under a step of two");
         }
+    }
+
+    /// A walk stopped anywhere and started again from the offset it reported
+    /// has to give the rest of the blob, whatever the elements are encoded as.
+    /// This is what a stream group read leans on to pick up where the last one
+    /// stopped instead of decoding the node from the front every time.
+    #[test]
+    fn a_walk_started_again_at_an_offset_gives_the_rest() {
+        let members = every_encoding();
+        let lp = of(&members.iter().map(Vec::as_slice).collect::<Vec<_>>());
+        for stop in 0..members.len() {
+            let mut it = lp.iter();
+            for _ in 0..stop {
+                it.next().expect("an element");
+            }
+            let at = it.offset();
+            let rest: Vec<Vec<u8>> = lp.iter_at(at).map(|e| e.to_vec()).collect();
+            assert_eq!(rest, members[stop..], "picking up at element {stop}");
+        }
+        assert_eq!(lp.iter_at(usize::MAX).count(), 0, "past the end is empty");
+        assert_eq!(lp.iter_at(0).count(), members.len(), "before the first");
     }
 
     /// The backward walk finds its way from one entry to the one in front of it
