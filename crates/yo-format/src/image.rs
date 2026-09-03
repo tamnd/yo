@@ -31,7 +31,7 @@
 //! ```text
 //!   root                        one per partition
 //! +------------------+        +---------------------------+
-//! | header, 96 bytes |        | count | code_bytes | stuck |
+//! | header, 100 bytes |        | count | code_bytes | stuck |
 //! +------------------+        +---------------------------+
 //! | centroid chain   |        | ids      count * 8        |
 //! | key chain        |        | tags     count * 8        |
@@ -86,7 +86,7 @@ use yo_common::{Code, Error, Result};
 pub const IMAGE_TAG: u32 = u32::from_le_bytes(*b"YOIX");
 
 /// The fixed part at the front of an image root.
-pub const IMAGE_HEADER_LEN: usize = 96;
+pub const IMAGE_HEADER_LEN: usize = 100;
 
 /// One line of the partition table that follows the root header.
 pub const PARTITION_ENTRY_LEN: usize = 16;
@@ -182,6 +182,8 @@ pub struct ImageHeader {
     /// How much further than the nearest centroid a copy is still made, as a
     /// fraction.
     pub slack: f32,
+    /// How many partitions in a row may add nothing before a search stops.
+    pub patience: u32,
     /// Where the centroids are, and how many bytes of them there are.
     pub centroids: Chain,
     /// Where the key table is, and how long it is.
@@ -255,6 +257,7 @@ impl ImageHeader {
         put_u64(into, 80, self.keys.len);
         put_u32(into, 88, self.spill);
         put_f32(into, 92, self.slack);
+        put_u32(into, 96, self.patience);
         Ok(need)
     }
 
@@ -301,6 +304,7 @@ impl ImageHeader {
             slots: get_u32(bytes, 52),
             spill: get_u32(bytes, 88),
             slack: get_f32(bytes, 92),
+            patience: get_u32(bytes, 96),
             centroids: Chain {
                 at: get_u64(bytes, 56),
                 len: get_u64(bytes, 64),
@@ -666,6 +670,7 @@ mod tests {
             widen: 8,
             spill: 4,
             slack: 0.10,
+            patience: 3,
             centroids: Chain {
                 at: 4096,
                 len: u64::from(partitions) * u64::from(dim) * 4,
@@ -880,7 +885,7 @@ mod tests {
     fn the_layout_is_the_one_written_down() {
         // The numbers in the module diagram, so that a change to any of them is
         // a change to a test rather than a silent change to the format.
-        assert_eq!(IMAGE_HEADER_LEN, 96);
+        assert_eq!(IMAGE_HEADER_LEN, 100);
         assert_eq!(PARTITION_ENTRY_LEN, 16);
         assert_eq!(POSTING_HEADER_LEN, 16);
         assert_eq!(META_LEN, 16);

@@ -198,6 +198,52 @@ pub struct Tuning {
     /// while the answer sat two partitions further out. Too large and the same
     /// filter reads the whole collection to prove there is nothing there.
     pub widen: usize,
+    /// How many partitions in a row may add nothing to the answer before the
+    /// search stops reading, once it has enough candidates to answer with.
+    ///
+    /// [`Tuning::probe`] is a budget every query spends whether it needs to or
+    /// not, and queries do not need the same amount. A query sitting deep inside
+    /// one partition has found everything it is going to find after two or three
+    /// of them, and a query on a boundary is still turning up better answers
+    /// forty partitions in. This is what lets one search cost what it needs
+    /// rather than what the slowest query needs, and it is the whole of the
+    /// difference between a mean probe depth and a fixed one.
+    ///
+    /// It keys off the answer rather than off the geometry, which is deliberate.
+    /// The obvious rule is to stop once the next centroid is more than some
+    /// fraction further away than the nearest one, and that rule is useless
+    /// here: the measurement is on the private `spill_into`, which is where the
+    /// same rule was tried and dropped on the write path, and the short version
+    /// is that distances concentrate, every centroid a query can see is
+    /// within a few percent of every other, and there is no setting of the
+    /// fraction between pruning nothing and pruning everything.
+    ///
+    /// A partition counts as adding nothing when not one of its members was good
+    /// enough to displace an answer already held. The count resets the moment one
+    /// is, so a run of empty partitions followed by a good one buys the search
+    /// its patience back. Zero switches this off and every search reads `probe`
+    /// partitions.
+    ///
+    /// It cannot change how many candidates come back, only which ones, because
+    /// it is only allowed to fire once there are already enough. A filtered
+    /// search that is widening because it does not have enough is never cut off
+    /// by it.
+    ///
+    /// # Where the default comes from
+    ///
+    /// Eight, which is the same as the default `probe`, and that is not a
+    /// coincidence: a search that only reads eight partitions cannot have eight
+    /// quiet ones in a row before it runs out, so the default settings are the
+    /// settings this does nothing under. It starts to matter exactly when
+    /// somebody raises `probe`, which is when it should.
+    ///
+    /// On SIFT1M at `probe` 128 and `rerank` 16, where the fixed sweep recalls
+    /// 0.9757 reading all 128, eight reads 96.9 of them for 0.9750, four reads
+    /// 65.6 for 0.9704, and three reads 53.3 for 0.9641, against a fixed `probe`
+    /// of 64 which reads all 64 for 0.9665. So a quarter of the reads go away for
+    /// seven ten thousandths of recall, and the settings in between fill in a
+    /// ladder that `probe` can only climb by doubling.
+    pub patience: usize,
     /// How many partitions one vector may be written into, at most.
     ///
     /// One is no replication and is what the index did before this existed. It
@@ -241,6 +287,7 @@ impl Default for Tuning {
             widen: 8,
             spill: 4,
             slack: 0.10,
+            patience: 8,
         }
     }
 }
@@ -410,6 +457,21 @@ pub struct Hit {
     pub id: u64,
     /// The exact squared distance, measured against the full precision vector.
     pub distance: f32,
+}
+
+/// What one search actually read.
+///
+/// [`Tuning::probe`] is a budget rather than a bill, and with
+/// [`Tuning::patience`] set the two are different for most queries. This is the
+/// bill.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Work {
+    /// Partitions read.
+    pub probed: usize,
+    /// Coded members the estimator was run over, which is the number that
+    /// actually tracks the time a search took. Partitions are not the same size
+    /// as each other and a count of them hides that.
+    pub scanned: usize,
 }
 
 /// Where one copy of a member sits, and where the next copy of it is.
@@ -952,10 +1014,32 @@ impl Partitions {
         filter: &impl Filter,
         vectors: &impl Vectors,
     ) -> Vec<Hit> {
+        self.search_costed(q, k, filter, vectors).0
+    }
+
+    /// The same again, and what the scan behind it cost.
+    ///
+    /// See [`Work`]. Worth having in front of a caller rather than behind a
+    /// feature flag, because with [`Tuning::patience`] set the cost of a search
+    /// is a property of the query and not of the settings, and a tuner that
+    /// cannot see it is guessing.
+    ///
+    /// # Panics
+    ///
+    /// If `q` is not [`Partitions::dim`] long.
+    #[must_use]
+    pub fn search_costed(
+        &self,
+        q: &[f32],
+        k: usize,
+        filter: &impl Filter,
+        vectors: &impl Vectors,
+    ) -> (Vec<Hit>, Work) {
         if k == 0 {
-            return Vec::new();
+            return (Vec::new(), Work::default());
         }
-        let candidates = self.candidates_where(q, (k * self.tuning.rerank).max(FLOOR), filter);
+        let (candidates, work) =
+            self.candidates_costed(q, (k * self.tuning.rerank).max(FLOOR), filter);
         let mut buf = vec![0.0f32; self.dim()];
         let mut hits = Vec::with_capacity(candidates.len());
         for (id, _) in candidates {
@@ -968,7 +1052,7 @@ impl Partitions {
         }
         hits.sort_by(|a, b| a.distance.total_cmp(&b.distance));
         hits.truncate(k);
-        hits
+        (hits, work)
     }
 
     /// The `want` best candidates by the estimator, without rerank.
@@ -996,6 +1080,28 @@ impl Partitions {
         want: usize,
         filter: &impl Filter,
     ) -> Vec<(u64, f32)> {
+        self.candidates_costed(q, want, filter).0
+    }
+
+    /// The same again, and what reading them cost.
+    ///
+    /// The cost is here because [`Tuning::patience`] makes it vary from one
+    /// query to the next, and a knob whose whole point is that different queries
+    /// pay different amounts is not one anybody can set without being able to see
+    /// what it did. It is also the honest way to compare two settings: recall
+    /// against partitions actually read, rather than recall against the budget
+    /// neither of them spent.
+    ///
+    /// # Panics
+    ///
+    /// If `q` is not [`Partitions::dim`] long.
+    #[must_use]
+    pub fn candidates_costed(
+        &self,
+        q: &[f32],
+        want: usize,
+        filter: &impl Filter,
+    ) -> (Vec<(u64, f32)>, Work) {
         assert_eq!(
             q.len(),
             self.dim(),
@@ -1004,7 +1110,7 @@ impl Partitions {
             q.len()
         );
         if want == 0 || self.postings.is_empty() {
-            return Vec::new();
+            return (Vec::new(), Work::default());
         }
         // Rotated once here and never again, which is what lets a search probe
         // tens of partitions without paying for tens of rotations.
@@ -1015,12 +1121,21 @@ impl Partitions {
         // wants the same room the one before it did.
         let mut scores: Vec<f32> = Vec::new();
         let reach = self.tuning.probe.saturating_mul(self.tuning.widen.max(1));
+        let mut work = Work::default();
+        // How many partitions in a row have gone by without one of their members
+        // being good enough to displace an answer. See [`Tuning::patience`].
+        let mut quiet = 0;
         for (n, p) in self.near_partitions(&u, reach).into_iter().enumerate() {
-            // Past the partitions an unfiltered search would have read, keep
-            // going only while there is still not enough to answer with. An
+            // Two reasons to stop, and both of them need enough answers in hand
+            // first. Past the partitions an unfiltered search would have read,
+            // keep going only while there is still not enough to answer with; an
             // unfiltered search never gets here, because the first `probe`
             // partitions of a collection worth probing hold more than `want`.
-            if n >= self.tuning.probe && best.full() {
+            // Inside them, stop once the last few have added nothing.
+            if best.full()
+                && (n >= self.tuning.probe
+                    || (self.tuning.patience > 0 && quiet >= self.tuning.patience))
+            {
                 break;
             }
             let prepared = self.quant.query_rotated(&u, self.centroid(p));
@@ -1034,6 +1149,9 @@ impl Partitions {
             // one comparison against the worst answer so far and no more, and
             // which does not read the id or the tag of a member that lost.
             prepared.scan(&posting.codes, &posting.meta, &mut scores[..held]);
+            work.probed += 1;
+            work.scanned += held;
+            let mut took = 0;
             for (i, &at) in scores[..held].iter().enumerate() {
                 if !best.wants(at) {
                     continue;
@@ -1045,7 +1163,13 @@ impl Partitions {
                     continue;
                 }
                 best.put(posting.ids[i], at);
+                took += 1;
             }
+            // A partition that displaced something buys the search its patience
+            // back, because a run of empty ones followed by a good one is the
+            // shape of a query whose neighbourhood is spread out rather than a
+            // query that has finished.
+            quiet = if took == 0 { quiet + 1 } else { 0 };
         }
         let mut out = best.sorted();
         // A replicated member is in more than one posting and a search can read
@@ -1061,7 +1185,7 @@ impl Partitions {
             let mut seen = HashSet::with_capacity(out.len());
             out.retain(|&(id, _)| seen.insert(id));
         }
-        out
+        (out, work)
     }
 
     /// Whether there is a split or a merge waiting.
@@ -2440,6 +2564,83 @@ mod tests {
                 got.iter().any(|&(seen, _)| seen == id),
                 "member {id} has a copy in partition {p} and a search of it did not find it"
             );
+        }
+    }
+
+    /// The knob is only worth having if the searches it cuts short were reading
+    /// partitions that had stopped paying, so the two things to show are that it
+    /// reads fewer of them and that the answers survive it.
+    #[test]
+    fn patience_reads_fewer_partitions_and_keeps_the_answers() {
+        let dim = 32;
+        let store = corpus(dim, 4000, 16, 77);
+        let wide = Tuning {
+            probe: 64,
+            ..Tuning::default()
+        };
+        let mut ix = build(&store, dim, wide);
+        let queries = 100;
+        let full = recall(&ix, &store, 10, queries);
+        let cost = |ix: &Partitions| -> f64 {
+            (0..queries)
+                .map(|i| {
+                    let q = &store.0[i * 7 % store.0.len()];
+                    ix.search_costed(q, 10, &Any, &store).1.probed
+                })
+                .sum::<usize>() as f64
+                / queries as f64
+        };
+        let spent = cost(&ix);
+
+        ix.retune(Tuning {
+            probe: 64,
+            patience: 2,
+            ..Tuning::default()
+        });
+        let cut = cost(&ix);
+        assert!(
+            cut < spent * 0.75,
+            "patience of two read {cut:.1} partitions a query against {spent:.1}, which is not a saving worth the knob"
+        );
+        let after = recall(&ix, &store, 10, queries);
+        assert!(
+            after >= full - 0.02,
+            "recall went from {full} to {after}, which is more than giving up early is allowed to cost"
+        );
+    }
+
+    /// The rule is written as "once there is enough to answer with", and the
+    /// case that proves it is the one where there is not. A filter that almost
+    /// nothing passes is why `widen` exists, and a search that gave up on it
+    /// after two quiet partitions would return nothing at all.
+    #[test]
+    fn patience_does_not_cut_off_a_filter_that_is_still_short() {
+        let dim = 32;
+        let store = corpus(dim, 4000, 16, 91);
+        let mut ix = build(
+            &store,
+            dim,
+            Tuning {
+                patience: 1,
+                ..Tuning::default()
+            },
+        );
+        // One member in fifty, spread over every partition, so the answers are
+        // certainly not all in the first few.
+        for id in 0..4000u64 {
+            ix.retag(id, u64::from(id % 50 == 0));
+        }
+        struct Rare;
+        impl Filter for Rare {
+            fn allows(&self, tag: u64) -> bool {
+                tag == 1
+            }
+        }
+        let q = &store.0[3];
+        let got = ix.search_where(q, 10, &Rare, &store);
+        assert_eq!(got.len(), 10, "the filtered search came back short");
+        for hit in &got {
+            assert!(hit.id.is_multiple_of(50), "{} is not a match", hit.id);
         }
     }
 

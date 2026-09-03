@@ -57,9 +57,19 @@
 //! ```text
 //! cargo run --release -p yo-vector --example recall -- msmarco 500 1024
 //! ```
+//!
+//! There is a second table under the first one and it is the more interesting of
+//! the two. The first sweeps `probe`, which every query spends whether it needs
+//! to or not. The second holds `rerank` at four and sweeps `patience`, which lets
+//! a query stop once the partitions it is reading have stopped improving the
+//! answer, and it reports a `read` column: the mean number of partitions a query
+//! actually read. Two rows with the same recall and different `read` are the
+//! whole point, because the row with the smaller number is the same answer for
+//! less work. Comparing a `patience` row against a `probe` row means comparing
+//! them at equal `read` rather than at equal `probe`.
 
 use std::time::Instant;
-use yo_vector::{Bits, Partitions, Tuning, Vectors};
+use yo_vector::{Any, Bits, Partitions, Tuning, Vectors};
 
 /// The base vectors, kept in full precision, which is what the rerank reads and
 /// what a real collection would keep in its document log.
@@ -177,8 +187,8 @@ fn main() {
             rate
         );
         println!(
-            "{:>6}{:>8}{:>12}{:>11}{:>11}",
-            "probe", "rerank", "recall@10", "p50", "p99"
+            "{:>6}{:>8}{:>10}{:>12}{:>11}{:>11}{:>9}",
+            "probe", "rerank", "patience", "recall@10", "p50", "p99", "read"
         );
 
         let mut probe = 8;
@@ -187,10 +197,38 @@ fn main() {
                 let mut t = ix.tuning();
                 t.probe = probe;
                 t.rerank = rerank;
+                t.patience = 0;
                 ix.retune(t);
-                measure(&ix, &bench, probe, rerank);
+                measure(&ix, &bench, probe, rerank, 0);
             }
             probe *= 2;
+        }
+
+        // The second table is the one that says whether a fixed probe was ever
+        // the right shape. It sits at the top of the probe sweep, because that
+        // is the only place where giving up early has anything to give up, and
+        // it moves `rerank` with `patience` because the two interact: a wider
+        // rerank asks for more candidates, so the answer set takes longer to
+        // fill and longer to settle, and a patience that prunes hard at rerank 4
+        // may prune nothing at rerank 32. The row with `patience` at zero is the
+        // matching row of the first table and is what the rest are read against.
+        //
+        // The column to compare on is `read` and not `probe`. Two rows with the
+        // same recall and different `read` are the whole point.
+        println!();
+        println!(
+            "{:>6}{:>8}{:>10}{:>12}{:>11}{:>11}{:>9}",
+            "probe", "rerank", "patience", "recall@10", "p50", "p99", "read"
+        );
+        for rerank in [4usize, 8, 16, 32] {
+            for patience in [0usize, 1, 2, 3, 4, 8, 16] {
+                let mut t = ix.tuning();
+                t.probe = top;
+                t.rerank = rerank;
+                t.patience = patience;
+                ix.retune(t);
+                measure(&ix, &bench, top, rerank, patience);
+            }
         }
     }
 }
@@ -208,15 +246,17 @@ struct Bench {
     queries: usize,
 }
 
-fn measure(ix: &Partitions, b: &Bench, probe: usize, rerank: usize) {
+fn measure(ix: &Partitions, b: &Bench, probe: usize, rerank: usize, patience: usize) {
     const K: usize = 10;
     let mut hit = 0usize;
+    let mut read = 0usize;
     let mut took = Vec::with_capacity(b.queries);
     for q in 0..b.queries {
         let v = &b.query[q * b.dim..(q + 1) * b.dim];
         let t = Instant::now();
-        let got = ix.search(v, K, &b.base);
+        let (got, work) = ix.search_costed(v, K, &Any, &b.base);
         took.push(t.elapsed().as_secs_f64() * 1e6);
+        read += work.probed;
         // Recall at ten is how many of the true ten came back, and the true ten
         // are the first ten of the hundred the ground truth lists.
         let want = &b.truth[q * b.gdim..q * b.gdim + K];
@@ -225,10 +265,11 @@ fn measure(ix: &Partitions, b: &Bench, probe: usize, rerank: usize) {
     took.sort_by(f64::total_cmp);
     let at = |p: f64| took[((took.len() - 1) as f64 * p) as usize];
     println!(
-        "{probe:>6}{rerank:>8}{:>12.4}{:>9.0} us{:>9.0} us",
+        "{probe:>6}{rerank:>8}{patience:>10}{:>12.4}{:>9.0} us{:>9.0} us{:>9.1}",
         hit as f64 / (b.queries * K) as f64,
         at(0.50),
-        at(0.99)
+        at(0.99),
+        read as f64 / b.queries as f64
     );
 }
 
