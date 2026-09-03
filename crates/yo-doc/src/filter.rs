@@ -13,14 +13,22 @@
 //!
 //! Everything here works over a set on either side, since a path operand answers
 //! a set, and the empty set is the ordinary case rather than an error: a member
-//! that has no `price` at all is a member `@.price < 10` is false for. The one
-//! operator that reads it the other way round is `!=`, which negates the whole
-//! comparison, so it is answered before the pairs are walked rather than inside
-//! the walk.
+//! that has no `price` at all is a member `@.price < 10` is false for. The
+//! operators that read it the other way round are `!=`, `nin` and `noneof`,
+//! which negate the whole comparison, so they are answered before the pairs are
+//! walked rather than inside the walk.
 //!
-//! Nothing here allocates per value except the two answer buffers, and a pattern
-//! is compiled once while the path is parsed rather than once per value it is
-//! run against.
+//! An operand is not always something in the document. `@.p + 1`, `@.p.sum()`
+//! and `@.p~` all answer values that are nowhere in it, which is what [`Item`]
+//! is for: a hit is either a value the document holds, a number that was worked
+//! out, or a key name. A comparison between two document values is the whole
+//! value, and one where either side was worked out is a number against a number
+//! or a string against a string, because those are the only two kinds anything
+//! here can make.
+//!
+//! Nothing here allocates per value except the answer buffers, and a pattern is
+//! compiled once while the path is parsed rather than once per value it is run
+//! against.
 
 use core::cmp::Ordering;
 use std::sync::Arc;
@@ -64,6 +72,56 @@ pub(crate) enum Operand<'a> {
     /// A compiled regular expression, which is the right hand side of `=~` and
     /// is nothing anywhere else.
     Re(Pattern),
+    /// The key names of whatever is under it, which is the postfix `~`.
+    Keys(Box<Operand<'a>>),
+    /// A postfix method, `@.tags.length()`.
+    Call(Box<Operand<'a>>, Fun),
+    /// Arithmetic, which is only ever a number and only ever over numbers.
+    Math(Box<Operand<'a>>, Arith, Box<Operand<'a>>),
+}
+
+/// A postfix method.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Fun {
+    /// How long a string, an array or an object is. Nothing else has a length.
+    Length,
+    /// How many values the operand answered, which is a number even when that
+    /// number is zero, so `@.nope.count() == 0` is true.
+    Count,
+    /// The smallest, largest, total and mean of an array of numbers. An array
+    /// with anything else in it, and an empty one, answer nothing.
+    Min,
+    Max,
+    Sum,
+    Avg,
+    /// A name that is not one of the above. It answers nothing, which is what
+    /// the reference does with `@.p.size()` rather than refusing the path.
+    Unknown,
+}
+
+impl Fun {
+    /// The method `name` spells, or [`Fun::Unknown`] when it spells none.
+    pub(crate) fn named(name: &[u8]) -> Fun {
+        match name {
+            b"length" => Fun::Length,
+            b"count" => Fun::Count,
+            b"min" => Fun::Min,
+            b"max" => Fun::Max,
+            b"sum" => Fun::Sum,
+            b"avg" => Fun::Avg,
+            _ => Fun::Unknown,
+        }
+    }
+}
+
+/// An arithmetic operator.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Arith {
+    Add,
+    Sub,
+    Mul,
+    Div,
+    Rem,
 }
 
 /// A compiled pattern and the text it came from.
@@ -119,6 +177,79 @@ pub(crate) enum Op {
     Ge,
     /// `=~`, a regular expression against a string.
     Re,
+    /// `in`, whether the left value is one of the elements on the right.
+    In,
+    /// `nin`, the negation of `in` over both whole sides.
+    Nin,
+    /// `anyof`, whether two arrays share an element.
+    AnyOf,
+    /// `noneof`, the negation of `anyof` over both whole sides.
+    NoneOf,
+    /// `subsetof`, whether every element on the left is on the right.
+    SubsetOf,
+    /// `size`, whether the left is a string, an array or an object of this
+    /// length.
+    Size,
+    /// `empty`, whether the left is a string, an array or an object and whether
+    /// it is empty, against the `true` or `false` on the right.
+    Empty,
+}
+
+/// One thing an operand answered.
+///
+/// A path answers values the document holds and a literal answers its own
+/// bytes, which are both a [`Value`]. Arithmetic and the aggregates answer a
+/// number that is nowhere in the document, and `~` answers a key name, which is
+/// bytes in the document but not a value in it.
+#[derive(Debug, Clone, Copy)]
+enum Item<'v> {
+    Ref(Value<'v>),
+    Num(f64),
+    Key(&'v [u8]),
+}
+
+impl<'v> Item<'v> {
+    /// This as a number, whichever way it is held.
+    fn number(&self) -> Option<f64> {
+        match self {
+            Item::Ref(v) => number(v),
+            Item::Num(n) => Some(*n),
+            Item::Key(_) => None,
+        }
+    }
+
+    /// This as a string.
+    fn text(&self) -> Option<&'v [u8]> {
+        match self {
+            Item::Ref(v) => v.text_bytes(),
+            Item::Num(_) => None,
+            Item::Key(k) => Some(k),
+        }
+    }
+
+    /// How long this is, for the things that have a length.
+    ///
+    /// A number that was worked out has none, and neither has a key name, since
+    /// neither is something a client could have asked the length of.
+    fn size(&self) -> Option<usize> {
+        match self {
+            Item::Ref(v) => match v.kind() {
+                Kind::Text => Some(v.text_bytes().unwrap_or_default().len()),
+                Kind::Array | Kind::Object => Some(v.len()),
+                _ => None,
+            },
+            Item::Num(_) | Item::Key(_) => None,
+        }
+    }
+
+    /// The elements of this, when it is an array.
+    fn elements(&self) -> impl Iterator<Item = Item<'v>> {
+        let v = match self {
+            Item::Ref(v) if v.kind() == Kind::Array => Some(*v),
+            _ => None,
+        };
+        v.into_iter().flat_map(|v| v.iter().map(Item::Ref))
+    }
 }
 
 impl Expr<'_> {
@@ -132,33 +263,116 @@ impl Expr<'_> {
             // there is true whatever it holds. A literal is itself, and the one
             // value that is false is the one that says so.
             Expr::Test(o) => match o {
-                Operand::Path { .. } => !values(o, root, cur).is_empty(),
                 Operand::Lit(_) => values(o, root, cur)
                     .first()
                     .is_none_or(|v| v.as_bool() != Some(false)),
-                // Never built: a pattern is only ever the right hand side of a
-                // `=~`, and the parser will not put one anywhere else.
-                Operand::Re(_) => false,
+                _ => !values(o, root, cur).is_empty(),
             },
             Expr::Cmp(l, op, r) => cmp(l, *op, r, root, cur),
         }
     }
 }
 
+impl Item<'_> {
+    /// This as a boolean, for the literal that a bare operand tests.
+    fn as_bool(&self) -> Option<bool> {
+        match self {
+            Item::Ref(v) => v.as_bool(),
+            _ => None,
+        }
+    }
+}
+
 /// Everything one operand answers.
-fn values<'v>(o: &'v Operand<'_>, root: &Value<'v>, cur: &Value<'v>) -> Vec<Value<'v>> {
+fn values<'v>(o: &'v Operand<'_>, root: &Value<'v>, cur: &Value<'v>) -> Vec<Item<'v>> {
     let mut out = Vec::new();
     match o {
         Operand::Path { at, sels } => {
-            select_from(sels, if *at { cur } else { root }, root, &mut out);
+            let mut hits = Vec::new();
+            select_from(sels, if *at { cur } else { root }, root, &mut hits);
+            out.extend(hits.into_iter().map(Item::Ref));
         }
         // The bytes belong to the path rather than to the document, which is
         // fine: the path outlives the walk, and that is what the lifetime here
         // says.
-        Operand::Lit(bytes) => out.extend(Value::new(bytes)),
+        Operand::Lit(bytes) => out.extend(Value::new(bytes).map(Item::Ref)),
         Operand::Re(_) => {}
+        Operand::Keys(inner) => {
+            for it in values(inner, root, cur) {
+                let Item::Ref(v) = it else { continue };
+                if v.kind() != Kind::Object {
+                    continue;
+                }
+                out.extend((0..v.len()).filter_map(|i| v.key_at(i)).map(Item::Key));
+            }
+        }
+        Operand::Call(inner, fun) => {
+            let got = values(inner, root, cur);
+            call(&got, *fun, &mut out);
+        }
+        Operand::Math(l, op, r) => {
+            let (left, right) = (values(l, root, cur), values(r, root, cur));
+            for a in left.iter().filter_map(Item::number) {
+                for b in right.iter().filter_map(Item::number) {
+                    out.push(Item::Num(match op {
+                        Arith::Add => a + b,
+                        Arith::Sub => a - b,
+                        Arith::Mul => a * b,
+                        Arith::Div => a / b,
+                        Arith::Rem => a % b,
+                    }));
+                }
+            }
+        }
     }
     out
+}
+
+/// One postfix method over what the operand under it answered.
+fn call<'v>(got: &[Item<'v>], fun: Fun, out: &mut Vec<Item<'v>>) {
+    if fun == Fun::Count {
+        // The one method that answers a number whatever it was given, which is
+        // why an operand that matched nothing still compares against zero.
+        #[expect(
+            clippy::cast_precision_loss,
+            reason = "a count that reaches the precision of a double is not a document"
+        )]
+        out.push(Item::Num(got.len() as f64));
+        return;
+    }
+    for it in got {
+        match fun {
+            Fun::Length => {
+                #[expect(
+                    clippy::cast_precision_loss,
+                    reason = "a length that reaches the precision of a double is not a document"
+                )]
+                out.extend(it.size().map(|n| Item::Num(n as f64)));
+            }
+            // An array with anything but numbers in it, and an empty one, answer
+            // nothing rather than answering over what is left, because a mean
+            // over the numeric half of a mixed array is not a number anybody
+            // asked for.
+            Fun::Min | Fun::Max | Fun::Sum | Fun::Avg => {
+                let ns: Option<Vec<f64>> = it.elements().map(|e| e.number()).collect();
+                let Some(ns) = ns.filter(|ns| !ns.is_empty()) else {
+                    continue;
+                };
+                #[expect(
+                    clippy::cast_precision_loss,
+                    reason = "a count that reaches the precision of a double is not a document"
+                )]
+                let n = match fun {
+                    Fun::Min => ns.iter().copied().fold(f64::INFINITY, f64::min),
+                    Fun::Max => ns.iter().copied().fold(f64::NEG_INFINITY, f64::max),
+                    Fun::Sum => ns.iter().sum(),
+                    _ => ns.iter().sum::<f64>() / ns.len() as f64,
+                };
+                out.push(Item::Num(n));
+            }
+            Fun::Count | Fun::Unknown => {}
+        }
+    }
 }
 
 /// One comparison, which is true when some pair out of the two sides satisfies
@@ -170,26 +384,84 @@ fn cmp<'v>(
     root: &Value<'v>,
     cur: &Value<'v>,
 ) -> bool {
+    // `~` answers a set of key names, and the reference treats that set as the
+    // collection the collection operators work over rather than looking inside
+    // whatever the keys name. It also refuses to read a key name as a string
+    // for `=~` and for `in`, which is the one place the two sides of that are
+    // not the same, so both are answered here.
+    let keys = matches!(l, Operand::Keys(_));
     if op == Op::Re {
         // A pattern that is not a string literal is not a pattern, and the
         // reference answers nothing rather than complaining.
         let Operand::Re(pat) = r else {
             return false;
         };
+        if keys {
+            return false;
+        }
         let mut m = Matcher::new();
         m.reserve(&pat.re);
         return values(l, root, cur)
             .iter()
-            .filter_map(Value::text_bytes)
+            .filter_map(Item::text)
             .any(|s| m.is_match(&pat.re, s));
     }
     let left = values(l, root, cur);
     let right = values(r, root, cur);
-    // `!=` is the negation of `==` over the whole of both sides and not a
-    // comparison in its own right, so a side that answers nothing makes it true
-    // where it makes every other operator false.
-    if op == Op::Ne {
-        return !left.iter().any(|a| right.iter().any(|b| same(a, b)));
+    // These three are the negation of a comparison over the whole of both sides
+    // and not comparisons in their own right, so a side that answers nothing
+    // makes them true where it makes every other operator false.
+    match op {
+        Op::Ne => return !left.iter().any(|a| right.iter().any(|b| same(a, b))),
+        Op::Nin => return keys || !within(&left, &right),
+        Op::NoneOf => return !shares(&left, &right, keys),
+        _ => {}
+    }
+    // What is left are the operators a side that answers nothing cannot satisfy,
+    // and `~` over anything but an object answers nothing.
+    if keys && left.is_empty() {
+        return false;
+    }
+    match op {
+        Op::In => return !keys && within(&left, &right),
+        Op::AnyOf => return shares(&left, &right, keys),
+        Op::SubsetOf => {
+            let inside = |a: &Item<'v>| right.iter().any(|b| b.elements().any(|x| same(a, &x)));
+            if keys {
+                return left.iter().all(inside);
+            }
+            return left.iter().any(|a| {
+                matches!(a, Item::Ref(v) if v.kind() == Kind::Array)
+                    && a.elements().all(|e| inside(&e))
+            });
+        }
+        Op::Size => {
+            let Some(want) = right.iter().find_map(|b| b.number()) else {
+                return false;
+            };
+            #[expect(
+                clippy::cast_precision_loss,
+                reason = "a length that reaches the precision of a double is not a document"
+            )]
+            return if keys {
+                left.len() as f64 == want
+            } else {
+                left.iter()
+                    .any(|a| a.size().is_some_and(|n| n as f64 == want))
+            };
+        }
+        Op::Empty => {
+            let Some(want) = right.iter().find_map(|b| b.as_bool()) else {
+                return false;
+            };
+            return if keys {
+                !want
+            } else {
+                left.iter()
+                    .any(|a| a.size().is_some_and(|n| (n == 0) == want))
+            };
+        }
+        _ => {}
     }
     left.iter().any(|a| {
         right.iter().any(|b| match op {
@@ -198,12 +470,38 @@ fn cmp<'v>(
             Op::Le => matches!(order(a, b), Some(Ordering::Less | Ordering::Equal)),
             Op::Gt => order(a, b) == Some(Ordering::Greater),
             Op::Ge => matches!(order(a, b), Some(Ordering::Greater | Ordering::Equal)),
-            Op::Ne | Op::Re => unreachable!("both are answered above"),
+            Op::Ne
+            | Op::Re
+            | Op::In
+            | Op::Nin
+            | Op::AnyOf
+            | Op::NoneOf
+            | Op::SubsetOf
+            | Op::Size
+            | Op::Empty => unreachable!("all of these are answered above"),
         })
     })
 }
 
-/// Where two values stand relative to each other, or `None` when the question
+/// Whether anything on the left is an element of anything on the right, which
+/// is `in`.
+fn within(left: &[Item<'_>], right: &[Item<'_>]) -> bool {
+    left.iter()
+        .any(|a| right.iter().any(|b| b.elements().any(|e| same(a, &e))))
+}
+
+/// Whether an array on the left and an array on the right share an element,
+/// which is `anyof`. `keys` says the left answers are themselves the collection,
+/// which is what a `~` gives.
+fn shares(left: &[Item<'_>], right: &[Item<'_>], keys: bool) -> bool {
+    let hit = |e: &Item<'_>| right.iter().any(|b| b.elements().any(|x| same(e, &x)));
+    if keys {
+        return left.iter().any(hit);
+    }
+    left.iter().any(|a| a.elements().any(|e| hit(&e)))
+}
+
+/// Where two answers stand relative to each other, or `None` when the question
 /// does not arise.
 ///
 /// Numbers order as numbers whichever of the two ways each is held, strings
@@ -215,7 +513,22 @@ fn cmp<'v>(
 /// A string is not below a number, and an array or an object is not below
 /// anything at all, not even an equal one: `[] >= []` is false in the reference
 /// and false here.
-fn order(a: &Value<'_>, b: &Value<'_>) -> Option<Ordering> {
+fn order(a: &Item<'_>, b: &Item<'_>) -> Option<Ordering> {
+    if let (Item::Ref(x), Item::Ref(y)) = (a, b) {
+        return order_value(x, y);
+    }
+    if let (Some(x), Some(y)) = (a.number(), b.number()) {
+        return x.partial_cmp(&y);
+    }
+    match (a.text(), b.text()) {
+        (Some(x), Some(y)) => Some(x.cmp(y)),
+        _ => None,
+    }
+}
+
+/// [`order`] for two values the document holds, which is the only case where a
+/// boolean or a null can turn up.
+fn order_value(a: &Value<'_>, b: &Value<'_>) -> Option<Ordering> {
     if let (Some(x), Some(y)) = (number(a), number(b)) {
         return x.partial_cmp(&y);
     }
@@ -239,13 +552,27 @@ fn number(v: &Value<'_>) -> Option<f64> {
     v.as_int().map(|i| i as f64).or_else(|| v.as_float())
 }
 
+/// Whether two answers are the same.
+fn same(a: &Item<'_>, b: &Item<'_>) -> bool {
+    if let (Item::Ref(x), Item::Ref(y)) = (a, b) {
+        return same_value(x, y);
+    }
+    if let (Some(x), Some(y)) = (a.number(), b.number()) {
+        return x == y;
+    }
+    match (a.text(), b.text()) {
+        (Some(x), Some(y)) => x == y,
+        _ => false,
+    }
+}
+
 /// Whether two values are the same value.
 ///
 /// Numbers are compared as numbers, so `1` and `1.0` are the same, and nothing
 /// else crosses a type: a `0` is not a `false` and a `1` is not a `"1"`. An
 /// array is its elements in order, and an object is its members looked up by
 /// name so that two objects written in different orders still come out equal.
-fn same(a: &Value<'_>, b: &Value<'_>) -> bool {
+fn same_value(a: &Value<'_>, b: &Value<'_>) -> bool {
     if let (Some(x), Some(y)) = (number(a), number(b)) {
         return x == y;
     }
@@ -259,7 +586,7 @@ fn same(a: &Value<'_>, b: &Value<'_>) -> bool {
         Kind::Array => {
             a.len() == b.len()
                 && (0..a.len()).all(|i| match (a.at(i), b.at(i)) {
-                    (Some(x), Some(y)) => same(&x, &y),
+                    (Some(x), Some(y)) => same_value(&x, &y),
                     _ => false,
                 })
         }
@@ -285,7 +612,7 @@ fn object(a: &Value<'_>, b: &Value<'_>) -> bool {
         let Some(y) = b.get(key) else {
             return false;
         };
-        if !same(&x, &y) {
+        if !same_value(&x, &y) {
             return false;
         }
         seen += 1;

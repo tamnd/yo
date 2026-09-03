@@ -83,6 +83,39 @@
 //! children of an array and of an object alike, and it works under a write as
 //! well as a read: `JSON.SET`, `JSON.DEL` and `JSON.NUMINCRBY` all take one.
 //!
+//! # The operators past the comparisons
+//!
+//! `in` asks whether the left value is one of the elements of the array on the
+//! right, and `nin` is its negation over both whole sides. `anyof` and `noneof`
+//! ask whether two arrays share an element, and `subsetof` asks whether every
+//! element of the left array is on the right, which makes `[]` a subset of
+//! anything. `size` takes a bare number and is the length of a string, an array
+//! or an object, and `empty` takes `true` or `false` over the same three, so a
+//! number has neither and satisfies neither.
+//!
+//! The postfix methods are `.length()`, `.count()`, `.min()`, `.max()`, `.sum()`
+//! and `.avg()`. `count()` is how many values the operand answered and is a
+//! number even when that number is zero, so `@.nope.count() == 0` is true, and
+//! it is the only one of the six that answers for an operand that answered
+//! nothing. The four aggregates want an array of numbers and answer nothing for
+//! an empty one or for an array with anything else in it. A name that is not one
+//! of the six answers nothing rather than refusing the path, which is what
+//! `@.p.size()` does.
+//!
+//! Arithmetic is `+ - * / %` over numbers, `*` and `/` and `%` bind tighter than
+//! `+` and `-`, and parentheses group. Subtraction needs its spaces, because
+//! `@.total-vat` is a key called `total-vat` and `@.total - vat` is not. The
+//! other four do not, so `@.p*2 == 6` reads the way it looks.
+//!
+//! The postfix `~` answers the key names of an object, one string each, and
+//! nothing at all for an array or a scalar. It is a set rather than an array
+//! value, so `@.p~ == "x"` is true of any object with an `x` in it, and the
+//! operators that want a collection read the whole set as one: `@.p~ size 2` is
+//! an object with two keys, and `@.p~ subsetof ["x","y"]` is an object with no
+//! other key. `in` and `=~` do not take it and are false whatever is on the
+//! other side, which is the reference's behaviour rather than a rule with a
+//! reason behind it.
+//!
 //! # Two orderings that are not Redis's
 //!
 //! Matches come back in document order, and for an object that is key order,
@@ -96,7 +129,7 @@
 
 use yo_common::{Code, Error, Result};
 
-use crate::filter::{Expr, Op, Operand, Pattern};
+use crate::filter::{Arith, Expr, Fun, Op, Operand, Pattern};
 use crate::head::{DEPTH_MAX, Kind};
 use crate::path::Step;
 use crate::read::Value;
@@ -571,19 +604,44 @@ impl<'a> Filter<'a> {
     }
 
     /// A `!`, a group, or a comparison.
+    ///
+    /// A `(` is ambiguous, because `(@.a || @.b)` groups an expression and
+    /// `(1 + 2) * 3` groups arithmetic and the two are told apart only by what
+    /// comes after the `)`. This reads it as an expression, and if what follows
+    /// is an operator rather than the end of one, winds back and reads the whole
+    /// thing as a comparison instead.
     fn unary(&mut self) -> Result<Expr<'a>> {
         self.spaces();
         if self.word(b"!") {
             return Ok(Expr::Not(Box::new(self.unary()?)));
         }
+        let from = self.at;
         if self.word(b"(") {
             let e = self.or()?;
             if !self.word(b")") {
                 return Err(self.bad("a `(` in a filter with no `)` after it"));
             }
-            return Ok(e);
+            if !self.operator_next() {
+                return Ok(e);
+            }
+            self.at = from;
         }
         self.cmp()
+    }
+
+    /// Whether what comes next is an operator, which is what says a `(...)` just
+    /// read was arithmetic and not a group.
+    fn operator_next(&mut self) -> bool {
+        self.spaces();
+        let rest = &self.body[self.at..];
+        if rest.first().is_some_and(|c| {
+            matches!(c, b'+' | b'-' | b'*' | b'/' | b'%' | b'<' | b'>' | b'=') || *c == b'!'
+        }) {
+            // A `!` is only an operator when it is a `!=`, since a `!` on its
+            // own after a group is not something a filter can mean.
+            return rest[0] != b'!' || rest.starts_with(b"!=");
+        }
+        WORD_OPS.iter().any(|(text, _)| word_at(rest, text))
     }
 
     /// One operand, and the other one when there is an operator between them.
@@ -613,7 +671,8 @@ impl<'a> Filter<'a> {
     /// The operator between two operands, if there is one.
     ///
     /// The two character ones are tried first, so that `<=` is not read as a
-    /// `<` with a stray `=` after it.
+    /// `<` with a stray `=` after it, and the ones written as words need a
+    /// boundary after them so that a `size` in `sizes` is not one.
     fn op(&mut self) -> Option<Op> {
         self.spaces();
         for (text, op) in [
@@ -629,18 +688,83 @@ impl<'a> Filter<'a> {
                 return Some(op);
             }
         }
+        for (text, op) in WORD_OPS {
+            if word_at(&self.body[self.at..], text) {
+                self.at += text.len();
+                return Some(*op);
+            }
+        }
         None
     }
 
-    /// A path from `@` or from `$`, or a value written into the path.
+    /// One side of a comparison, which is a sum of products of atoms.
+    ///
+    /// Arithmetic binds tighter than a comparison and `*` binds tighter than
+    /// `+`, which is the ordering everybody expects and is the one the reference
+    /// has.
     fn operand(&mut self) -> Result<Operand<'a>> {
+        let mut e = self.product()?;
+        loop {
+            self.spaces();
+            let op = match self.body.get(self.at) {
+                Some(b'+') => Arith::Add,
+                // A `-` is only ever subtraction when it is spaced, because a
+                // key really called `total-vat` is reachable and an operator
+                // nobody can write around is not worth it.
+                Some(b'-') => Arith::Sub,
+                _ => break,
+            };
+            self.at += 1;
+            e = Operand::Math(Box::new(e), op, Box::new(self.product()?));
+        }
+        Ok(e)
+    }
+
+    /// An atom and then any number of `* / %` and another atom.
+    fn product(&mut self) -> Result<Operand<'a>> {
+        let mut e = self.atom()?;
+        loop {
+            self.spaces();
+            let op = match self.body.get(self.at) {
+                Some(b'*') => Arith::Mul,
+                Some(b'/') => Arith::Div,
+                Some(b'%') => Arith::Rem,
+                _ => break,
+            };
+            self.at += 1;
+            e = Operand::Math(Box::new(e), op, Box::new(self.atom()?));
+        }
+        Ok(e)
+    }
+
+    /// A path from `@` or from `$`, a value written into the path, or either of
+    /// those in parentheses, and then any postfix on it.
+    fn atom(&mut self) -> Result<Operand<'a>> {
         self.spaces();
         let Some(&c) = self.body.get(self.at) else {
             return Err(self.bad("a filter that stops where a value was expected"));
         };
-        if c == b'@' || c == b'$' {
+        let mut e = if c == b'(' {
             self.at += 1;
-            let to = self.at + path_end(&self.body[self.at..]);
+            let inner = self.operand()?;
+            if !self.word(b")") {
+                return Err(self.bad("a `(` in a filter with no `)` after it"));
+            }
+            inner
+        } else if c == b'@' || c == b'$' {
+            self.at += 1;
+            let end = self.at + path_end(&self.body[self.at..]);
+            // A postfix method looks like the last name of the path, because the
+            // path stops at the `(` rather than at the `.` before it, so the
+            // name comes back off the end here.
+            let mut to = end;
+            let mut fun = None;
+            if self.body[end..].starts_with(b"()")
+                && let Some(dot) = self.body[self.at..end].iter().rposition(|&b| b == b'.')
+            {
+                fun = Some(Fun::named(&self.body[self.at + dot + 1..end]));
+                to = self.at + dot;
+            }
             let mut p = Parse {
                 rest: &self.body[self.at..to],
                 at: 0,
@@ -648,13 +772,25 @@ impl<'a> Filter<'a> {
                 sels: Vec::new(),
             };
             p.run()?;
-            self.at = to;
-            return Ok(Operand::Path {
+            self.at = if fun.is_some() { end + 2 } else { end };
+            let path = Operand::Path {
                 at: c == b'@',
                 sels: p.sels,
-            });
+            };
+            match fun {
+                Some(f) => Operand::Call(Box::new(path), f),
+                None => path,
+            }
+        } else {
+            self.literal()?
+        };
+        // One `~` and no more. Key names have no keys of their own, so `@.p~~`
+        // is a path that means nothing and the reference refuses it.
+        if self.body.get(self.at) == Some(&b'~') {
+            self.at += 1;
+            e = Operand::Keys(Box::new(e));
         }
-        self.literal()
+        Ok(e)
     }
 
     /// A number, a string, `true`, `false`, `null`, or a whole array or object.
@@ -786,11 +922,53 @@ fn path_end(body: &[u8]) -> usize {
 }
 
 /// Whether this byte ends a path or a bare value inside a filter.
+///
+/// A `-` is not one of these, which is what makes a member really called
+/// `total-vat` reachable and what makes `@.p - 1` need its spaces. Every other
+/// arithmetic operator is, because no key anybody writes has a `*` in it and a
+/// client who has one can quote it.
 fn stops(c: u8) -> bool {
     matches!(
         c,
-        b' ' | b'\t' | b'(' | b')' | b'!' | b'<' | b'>' | b'=' | b'&' | b'|' | b',' | b'~'
+        b' ' | b'\t'
+            | b'('
+            | b')'
+            | b'!'
+            | b'<'
+            | b'>'
+            | b'='
+            | b'&'
+            | b'|'
+            | b','
+            | b'~'
+            | b'+'
+            | b'*'
+            | b'/'
+            | b'%'
     )
+}
+
+/// The operators that are written as words rather than as symbols.
+///
+/// `nin` comes before `in` and `noneof` before `nin`, so that the longer one is
+/// the one that matches.
+const WORD_OPS: &[(&[u8], Op)] = &[
+    (b"subsetof", Op::SubsetOf),
+    (b"anyof", Op::AnyOf),
+    (b"noneof", Op::NoneOf),
+    (b"nin", Op::Nin),
+    (b"in", Op::In),
+    (b"size", Op::Size),
+    (b"empty", Op::Empty),
+];
+
+/// Whether `body` starts with `text` and then something that is not more of a
+/// word, so that the `in` in `into` is not the operator.
+fn word_at(body: &[u8], text: &[u8]) -> bool {
+    body.starts_with(text)
+        && !body[text.len()..]
+            .first()
+            .is_some_and(|c| c.is_ascii_alphanumeric() || *c == b'_')
 }
 
 /// Where the `close` that matches an opener is, counting nesting and quotes.
@@ -1056,6 +1234,12 @@ mod tests {
         assert!(why("$.a[?(@.b > 1) 2]").contains("left over"));
         assert!(why("$.a[?(@.b == nope)]").contains("not a value"));
         assert!(why("$.a[?]").contains("where a value was expected"));
+        // An operator with nothing after it, and a `~` on something that has no
+        // keys to answer, which the reference refuses as well.
+        assert!(why("$.a[?(@.b in)]").contains("where a value goes"));
+        assert!(why("$.a[?(@.b size)]").contains("where a value goes"));
+        assert!(why("$.a[?(@.b + )]").contains("where a value goes"));
+        assert!(why("$.a[?(@.b~~)]").contains("no `)`"));
     }
 
     #[test]
@@ -1277,5 +1461,110 @@ mod tests {
                 .expect("parses")
                 .is_definite()
         );
+    }
+
+    /// `in` is membership in the elements of the right side, and `anyof`,
+    /// `noneof` and `subsetof` are all about two arrays rather than about a
+    /// value and an array.
+    #[test]
+    fn the_membership_operators_read_an_array_on_the_right() {
+        assert_eq!(kept("(@.p in [1,2])"), "i");
+        assert_eq!(kept("(@.p nin [1,2])"), "ftnbaom");
+        // Membership is the same equality as `==`, so it reaches every type.
+        assert_eq!(kept(r#"(@.p in [[1],{"x":1},null,false,"s"])"#), "tnbao");
+        // These three want an array on the left as well, which only `a` has.
+        assert_eq!(kept("(@.p anyof [1,9])"), "a");
+        assert_eq!(kept("(@.p noneof [1,9])"), "iftnbom");
+        assert_eq!(kept("(@.p subsetof [1,2,3])"), "a");
+        // `nin` and `noneof` negate the whole comparison, so the member with no
+        // `p` at all satisfies them and satisfies nothing else here.
+        assert_eq!(kept("(@.p subsetof [])"), "");
+    }
+
+    /// `size` and `empty` are the one length a string, an array and an object
+    /// each have, and nothing else has one.
+    #[test]
+    fn size_and_empty_are_about_the_three_types_with_a_length() {
+        assert_eq!(kept("(@.p size 1)"), "tao");
+        assert_eq!(kept("(@.p size 0)"), "");
+        assert_eq!(kept("(@.p empty false)"), "tao");
+        assert_eq!(kept("(@.p empty true)"), "");
+        let d = from_json(br#"[{"p":"","id":"s"},{"p":[],"id":"a"},{"p":{},"id":"o"}]"#)
+            .expect("parses");
+        assert_eq!(ask(&d, "$[?(@.p empty true)].id"), r#"["s","a","o"]"#);
+        assert_eq!(ask(&d, "$[?(@.p size 0)].id"), r#"["s","a","o"]"#);
+    }
+
+    /// The six postfix methods, and the one thing that separates `count()` from
+    /// the rest of them.
+    #[test]
+    fn a_method_answers_something_the_document_does_not_hold() {
+        assert_eq!(kept("(@.p.length() == 1)"), "tao");
+        // `count()` is how many values the operand answered, so it answers a
+        // number for an operand that answered nothing, which none of the others
+        // do.
+        assert_eq!(kept("(@.p.count() == 1)"), "iftnbao");
+        assert_eq!(kept("(@.p.count() == 0)"), "m");
+        // The aggregates want an array of numbers, and `[1]` is the only one.
+        assert_eq!(kept("(@.p.min() == 1)"), "a");
+        assert_eq!(kept("(@.p.max() == 1)"), "a");
+        assert_eq!(kept("(@.p.sum() == 1)"), "a");
+        assert_eq!(kept("(@.p.avg() == 1)"), "a");
+        // A name that is not one of the six answers nothing rather than being a
+        // path that will not parse.
+        assert_eq!(kept("(@.p.size() == 1)"), "");
+        assert_eq!(kept("(@.p.nope() == 1)"), "");
+    }
+
+    /// Arithmetic is over numbers, it binds the way it does everywhere else,
+    /// and it composes with a method on either side.
+    #[test]
+    fn arithmetic_is_numbers_and_the_usual_precedence() {
+        assert_eq!(kept("(@.p + 1 == 2)"), "i");
+        assert_eq!(kept("(@.p - 1 == 0)"), "i");
+        assert_eq!(kept("(@.p * 2 == 5)"), "f");
+        assert_eq!(kept("(@.p / 2 == 0.5)"), "i");
+        assert_eq!(kept("(@.p % 2 == 1)"), "i");
+        assert_eq!(kept("(@.p + @.p == 2)"), "i");
+        assert_eq!(kept("(@.p.length() + 1 == 2)"), "tao");
+        // Everything is kept when the expression has no operand in it at all,
+        // which is what makes these two about precedence and nothing else.
+        assert_eq!(kept("(1 + 2 * 3 == 7)"), "iftnbaom");
+        assert_eq!(kept("((1 + 2) * 3 == 9)"), "iftnbaom");
+        assert_eq!(kept("(1 + 2 * 3 == 9)"), "");
+        // The four that are not `-` do not need their spaces, because `-` is
+        // the one that is also a character a key name can hold.
+        assert_eq!(kept("(@.p*2==2)"), "i");
+        let d = from_json(br#"[{"a-b":1,"id":"k"}]"#).expect("parses");
+        assert_eq!(ask(&d, r#"$[?(@.a-b == 1)].id"#), r#"["k"]"#);
+    }
+
+    /// `~` answers the key names of an object, as a set of strings rather than
+    /// as an array value.
+    #[test]
+    fn the_keys_operator_answers_a_name_at_a_time() {
+        assert_eq!(kept("(@.p~)"), "o");
+        assert_eq!(kept(r#"(@.p~ == "x")"#), "o");
+        assert_eq!(kept(r#"(@.p~ != "x")"#), "iftnbam");
+        // The operators that want a collection read the whole set as one, so
+        // `size` is how many keys there are and not how long a key is.
+        assert_eq!(kept("(@.p~ size 1)"), "o");
+        assert_eq!(kept(r#"(@.p~ subsetof ["x"])"#), "o");
+        assert_eq!(kept(r#"(@.p~ anyof ["x"])"#), "o");
+        assert_eq!(kept(r#"(@.p~ noneof ["x"])"#), "iftnbam");
+        assert_eq!(kept("(@.p~ empty false)"), "o");
+        assert_eq!(kept("(@.p~ empty true)"), "");
+        // `in` and `=~` do not take a key name, which is the reference's
+        // behaviour and not a rule with a reason behind it.
+        assert_eq!(kept(r#"(@.p~ in ["x"])"#), "");
+        assert_eq!(kept(r#"(@.p~ =~ "x")"#), "");
+        assert_eq!(kept(r#"(@.p~ nin ["x"])"#), "iftnbaom");
+        // A two key object counts as two, and nothing that is not an object
+        // answers at all.
+        let d = from_json(br#"[{"p":{"abc":1},"id":"one"},{"p":{"a":1,"b":2},"id":"two"}]"#)
+            .expect("parses");
+        assert_eq!(ask(&d, "$[?(@.p~ size 1)].id"), r#"["one"]"#);
+        assert_eq!(ask(&d, "$[?(@.p~ size 2)].id"), r#"["two"]"#);
+        assert_eq!(ask(&d, "$[?(@.p~ size 3)].id"), "[]");
     }
 }
