@@ -140,6 +140,55 @@ impl<T: Copy, const N: usize> Small<T, N> {
         Small::Inline { buf, len }
     }
 
+    /// Everything in a slice, on the stack if it fits.
+    ///
+    /// [`Small::collect`] has to ask whether it has run out of room on every
+    /// element, because an iterator is not obliged to say how many it has. A
+    /// slice does say, so this asks once and then copies, which is a `memcpy`
+    /// and not a loop. That is worth having wherever the elements are already
+    /// laid out, and a fixed size key built in a local array is the case it was
+    /// written for.
+    #[must_use]
+    pub fn from_slice(s: &[T]) -> Small<T, N> {
+        const { assert!(N > 0, "a Small with no inline room is just a Vec") };
+        let Some(&first) = s.first() else {
+            return Small::Empty;
+        };
+        if s.len() > N {
+            return Small::Spilled(s.to_vec());
+        }
+        let mut buf = [first; N];
+        buf[..s.len()].copy_from_slice(s);
+        Small::Inline { buf, len: s.len() }
+    }
+
+    /// Add a slice on the end, in one go.
+    ///
+    /// Pushing one at a time re-reads which variant this is on every element,
+    /// and the compiler cannot keep the length in a register across it. This
+    /// works out where everything is going first, so the common case is a
+    /// `memcpy` into the inline buffer and the spill happens at most once.
+    pub fn extend_from_slice(&mut self, s: &[T]) {
+        const { assert!(N > 0, "a Small with no inline room is just a Vec") };
+        if s.is_empty() {
+            return;
+        }
+        match self {
+            Small::Empty => *self = Small::from_slice(s),
+            Small::Inline { buf, len } if *len + s.len() <= N => {
+                buf[*len..*len + s.len()].copy_from_slice(s);
+                *len += s.len();
+            }
+            Small::Inline { buf, len } => {
+                let mut spill = Vec::with_capacity((*len + s.len()).max(N * 2));
+                spill.extend_from_slice(&buf[..*len]);
+                spill.extend_from_slice(s);
+                *self = Small::Spilled(spill);
+            }
+            Small::Spilled(v) => v.extend_from_slice(s),
+        }
+    }
+
     /// The elements, in order.
     #[must_use]
     pub fn as_slice(&self) -> &[T] {
@@ -251,6 +300,42 @@ mod tests {
         assert!(!s.is_inline());
         assert_eq!(s.len(), 1_000);
         assert!(s.iter().copied().eq(0..1_000));
+    }
+
+    /// The two slice forms have to agree with the iterator form at every
+    /// length, either side of the spill, because they are the same list built a
+    /// faster way and not a second type.
+    #[test]
+    fn the_slice_forms_agree_with_collecting() {
+        for n in 0..12usize {
+            let want: Vec<u32> = (0..n as u32).collect();
+
+            let s: Small<u32, 4> = Small::from_slice(&want);
+            assert_eq!(&*s, &want[..], "from_slice at {n}");
+            assert_eq!(s.is_inline(), n <= 4, "from_slice spilled wrongly at {n}");
+
+            for split in 0..=n {
+                let mut s: Small<u32, 4> = Small::from_slice(&want[..split]);
+                s.extend_from_slice(&want[split..]);
+                assert_eq!(&*s, &want[..], "extend at {n} split at {split}");
+            }
+        }
+    }
+
+    /// Extending a list that has already spilled goes to the `Vec` and stays
+    /// there, and extending by nothing at all leaves an empty one empty rather
+    /// than making it inline with no elements.
+    #[test]
+    fn extending_past_the_spill_keeps_everything() {
+        let mut s: Small<u32, 4> = Small::collect(0..6);
+        s.extend_from_slice(&[6, 7, 8]);
+        assert!(!s.is_inline());
+        assert!(s.iter().copied().eq(0..9));
+
+        let mut empty: Small<u32, 4> = Small::new();
+        empty.extend_from_slice(&[]);
+        assert!(empty.is_empty());
+        assert!(matches!(empty, Small::Empty));
     }
 
     #[test]

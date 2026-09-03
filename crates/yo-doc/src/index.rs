@@ -122,6 +122,40 @@
 //! type, and a total order across types has to pick an arbitrary answer to
 //! whether a string is above or below a number.
 //!
+//! # What a probe costs
+//!
+//! G15 is that finding a document by a value at an indexed path costs what
+//! `HGET` costs, and the reason to expect that is the section above: the index
+//! is a hash's field table and a probe of it is a probe of one. `benches/yojb`
+//! runs both against the same records so the claim is a ratio. On a 13900K with
+//! nothing else running, nanoseconds:
+//!
+//! ```text
+//!                        1024 docs    16384 docs
+//!   HGET                      16.6          21.8
+//!   probe                     33.3          38.8
+//!     of which the key        11.7          11.6
+//!   find                      73.4          91.5
+//! ```
+//!
+//! `probe` is [`PathIndex::count`] with the path already resolved, which is the
+//! index lookup on its own. Take the key encoding off it and it is 21.6 and
+//! 27.2 against `HGET`'s 16.6 and 21.8, so the table probe itself is within a
+//! quarter of the one it is made of, and what is left of that is the key being
+//! twelve bytes where the hash field in this bench is at most five.
+//!
+//! `find` is the whole call a caller makes and it is more than one probe by
+//! construction: it looks the path up by name, encodes the key, probes the
+//! index, and then probes the primary table with the id it got back. The second
+//! probe is a document read and is the same thing `HGET` is doing, so the honest
+//! statement of the gate is that an indexed equality is two of them and not one.
+//!
+//! The key encoding used to be the largest single piece of this, at 15.6 ns on
+//! an M-series laptop where the whole probe was 28.2, because it pushed twelve
+//! bytes into a [`Small`] one at a time and every push re-reads which variant
+//! the list is on. It is built in a local array and copied in one go now, which
+//! took that to 3.1 ns and the probe to 10.6.
+//!
 //! # More than one key at a time
 //!
 //! An array index files a document under every element of the array at the
@@ -269,9 +303,7 @@ impl Key {
     #[must_use]
     pub fn text_bytes(v: &[u8]) -> Key {
         let mut k = Small::collect([TAG_TEXT]);
-        for &b in v {
-            k.push(b);
-        }
+        k.extend_from_slice(v);
         Key(k)
     }
 
@@ -404,7 +436,6 @@ fn bits(mant: u64) -> u16 {
 /// Negatives get the ten bytes after the class flipped, because a bigger
 /// magnitude is a smaller number.
 fn number(class: Class, mant: u64, place: i32) -> Key {
-    let mut k = Small::collect([TAG_NUM, class as u8]);
     let (place, mant) = match class {
         // The size of an infinity, a zero or a NaN is not a question, and
         // writing it as zero keeps every numeric key the same width.
@@ -415,10 +446,17 @@ fn number(class: Class, mant: u64, place: i32) -> Key {
     // 1025, is an unsigned number that sorts the way the signed one does.
     let place = ((place + 32768) as u16).to_be_bytes();
     let flip = if class == Class::Negative { 0xff } else { 0 };
-    for b in place.into_iter().chain(mant.to_be_bytes()) {
-        k.push(b ^ flip);
+    // Written into a local array and copied in one go rather than pushed a byte
+    // at a time. Every numeric key is these twelve bytes, the length is known
+    // before the first one is written, and a push has to re-read which variant
+    // the list is on each time round.
+    let mut k = [TAG_NUM, class as u8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+    k[2..4].copy_from_slice(&place);
+    k[4..].copy_from_slice(&mant.to_be_bytes());
+    for b in &mut k[2..] {
+        *b ^= flip;
     }
-    Key(k)
+    Key(Small::from_slice(&k))
 }
 
 /// A float as bytes that sort the way the float does.

@@ -31,6 +31,10 @@
 //!   - `index/put_equality` against `index/put_array` and `index/put_text`. The
 //!     gap there is what filing eight keys costs over filing one, so it should
 //!     be about eight set writes and not more.
+//!   - `hget/find` against `hget/hget`, which is the gate itself. Both are the
+//!     same records at the same size and the ratio between them is the answer.
+//!     `hget/count` is the same probe without reading the document, so the two
+//!     halves of `find` can be told apart.
 //!
 //! # Reading these on a machine someone else is using
 //!
@@ -42,6 +46,7 @@ use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use std::hint::black_box;
 use std::ops::Bound;
 use yo_doc::{Builder, Docs, IndexKind, Key, Value};
+use yo_kv::{Hash, HashLimits};
 
 /// An object of `n` members, each holding a string of `pad` bytes.
 fn object(n: usize, pad: usize) -> (Vec<u8>, Vec<String>) {
@@ -468,6 +473,104 @@ fn bench_index(c: &mut Criterion) {
     g.finish();
 }
 
+/// The same `n` records twice, once as a collection with a unique valued index
+/// and once as a hash keyed by the same value.
+///
+/// `$.seq` is the path because it is the one no two documents share, so a probe
+/// answers exactly one document and the row is a probe rather than a probe plus
+/// a walk of a posting list. The hash holds the whole record as its value, so
+/// both sides hand back the same bytes for the same lookup and the comparison
+/// is not one side doing less work.
+fn parity(n: usize) -> (Docs, Hash) {
+    let mut docs = Docs::with_capacity(n, 160);
+    docs.create_index("$.seq").expect("indexed");
+    let mut hash = Hash::with_hint(n, &HashLimits::DEFAULT);
+    for i in 0..n {
+        let bytes = record(i);
+        docs.put_bytes(format!("d:{i:08}").as_bytes(), &bytes)
+            .expect("put");
+        hash.set(format!("{i}").as_bytes(), &bytes, &HashLimits::DEFAULT);
+    }
+    (docs, hash)
+}
+
+/// G15 stated as a ratio: an indexed path equality against `HGET`.
+///
+/// The gate is that finding a document by a value at an indexed path costs what
+/// getting a field out of a hash costs, because underneath it is the same
+/// element table being probed once. So this runs both against the same records
+/// at the same collection sizes and the number to read is `find` over `hget`.
+///
+/// The `find` side is doing three things the `hget` side is not, and all three
+/// are on purpose because all three are what a caller actually pays. It looks
+/// the path up by name, it encodes the value into an index key, and it takes
+/// the id it gets back and reads the document out of the primary table. That
+/// last one is the second probe, and it is the reason the honest claim here is
+/// the same cost class rather than the same number.
+fn bench_hget(c: &mut Criterion) {
+    let mut g = c.benchmark_group("yojb/hget");
+    for n in [1024usize, 16_384] {
+        let (docs, hash) = parity(n);
+        assert_eq!(docs.count("$.seq", &Key::int(7)).expect("indexed"), 1);
+        let fields: Vec<Vec<u8>> = (0..n).map(|i| format!("{i}").into_bytes()).collect();
+
+        g.bench_with_input(BenchmarkId::new("hget", n), &n, |b, _| {
+            let mut i = 0usize;
+            b.iter(|| {
+                i = (i + 1) % n;
+                black_box(hash.get(black_box(&fields[i])))
+            });
+        });
+
+        g.bench_with_input(BenchmarkId::new("find", n), &n, |b, _| {
+            let mut i = 0usize;
+            b.iter(|| {
+                i = (i + 1) % n;
+                let mut len = 0usize;
+                docs.find("$.seq", black_box(&Key::int(i as i64)), |_, d| {
+                    len = d.len()
+                })
+                .expect("indexed");
+                black_box(len)
+            });
+        });
+
+        // The probe on its own, without reading the document it points at, so
+        // the two probes in `find` can be told apart when the ratio moves.
+        g.bench_with_input(BenchmarkId::new("count", n), &n, |b, _| {
+            let mut i = 0usize;
+            b.iter(|| {
+                i = (i + 1) % n;
+                black_box(
+                    docs.count("$.seq", black_box(&Key::int(i as i64)))
+                        .expect("indexed"),
+                )
+            });
+        });
+
+        // The probe again with the path already resolved, which is what a
+        // prepared query would pay, and the key encoding on its own. Between
+        // them and `count` there is nowhere for a nanosecond to hide.
+        let index = docs.index("$.seq").expect("indexed");
+        g.bench_with_input(BenchmarkId::new("probe", n), &n, |b, _| {
+            let mut i = 0usize;
+            b.iter(|| {
+                i = (i + 1) % n;
+                black_box(index.count(black_box(&Key::int(i as i64))))
+            });
+        });
+
+        g.bench_with_input(BenchmarkId::new("key", n), &n, |b, _| {
+            let mut i = 0usize;
+            b.iter(|| {
+                i = (i + 1) % n;
+                black_box(Key::int(black_box(i as i64)))
+            });
+        });
+    }
+    g.finish();
+}
+
 criterion_group!(
     benches,
     bench_get,
@@ -476,6 +579,7 @@ criterion_group!(
     bench_build,
     bench_validate,
     bench_docs,
-    bench_index
+    bench_index,
+    bench_hget
 );
 criterion_main!(benches);

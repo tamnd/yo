@@ -24,13 +24,13 @@
 //!
 //! ```text
 //! shape                 search    candidates    insert
-//! 128 dims, 100k       83.1 us       79.0 us    8.0 us
-//! 768 dims, 20k       288.9 us      276.8 us   22.5 us
+//! 128 dims, 100k       77.9 us       77.7 us    6.9 us
+//! 768 dims, 20k       281.7 us      277.1 us   13.3 us
 //! ```
 //!
 //! So G12's millisecond has room: a query at 768 dimensions is under a third of
-//! it, and rerank is 12 microseconds of that and buys the difference between an
-//! estimate and an answer.
+//! it, and rerank buys the difference between an estimate and an answer for a
+//! few microseconds.
 //!
 //! The `insert` column is where the shared squared distance in `src/dist.rs`
 //! shows up, because an insert is a centroid ranking and a centroid ranking is
@@ -39,6 +39,11 @@
 //! 768. `search` moved much less, 102.6 to 83.1 and 324.7 to 288.9, because a
 //! search is mostly the estimator meeting codes and only the rerank at the end
 //! of it is float distances.
+//!
+//! The rotation in `src/rotate.rs` is what moved the column after that, 8.0 to
+//! 6.9 and 22.5 to 13.3, and the 768 row moves further because a rotation is
+//! the one thing here that grows with the dimension while a hundred thousand
+//! codes do not.
 //!
 //! The `insert` row here is not the whole of G13 and never was. It is a
 //! centroid ranking plus an encode plus an append against a collection that is
