@@ -17,6 +17,13 @@ yo-common.workspace = true
 # A collection's tables are the element table a hash's fields live in, which is
 # `09` section 4's R25 taken literally rather than as a resemblance.
 yo-kv.workspace = true
+# `Metric`, so that a vector index says cosine in the same word the catalogue
+# and the wire say it in.
+yo-shape.workspace = true
+# The vector index on a path is the same `Collection` a vector set is, so a
+# document and its embedding are one write rather than two collections joined on
+# the id by whoever is calling.
+yo-vector.workspace = true
 
 [dev-dependencies]
 criterion = { workspace = true }

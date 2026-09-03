@@ -97,6 +97,55 @@
 //! An integer is stored as an `i64`, which is the one number type JSON has, so
 //! a `u64` above `i64::MAX` is refused on the way in rather than silently
 //! rounded through a float.
+//!
+//! # An embedding is a field
+//!
+//! `#[yo(vector = 384)]` on a `Vec<f32>` gives that path a vector index, and the
+//! field is still an ordinary field: it is written with the document, it comes
+//! back with the document, and there is no second collection to keep in step.
+//! The constant the derive writes is a [`Vector`], so [`Docs::near`] takes it
+//! and [`Docs::find`] does not.
+//!
+//! ```
+//! use yo::Yo;
+//!
+//! #[derive(Yo, Debug)]
+//! struct Note {
+//!     #[yo(id)]
+//!     id: u64,
+//!     #[yo(index)]
+//!     lang: String,
+//!     #[yo(vector = 3)]
+//!     embedding: Vec<f32>,
+//! }
+//!
+//! let db = yo::open(yo::MEMORY)?;
+//! let notes = db.docs::<Note>("notes")?;
+//! for (id, lang, v) in [
+//!     (1u64, "en", [1.0, 0.0, 0.0]),
+//!     (2, "fr", [0.9, 0.1, 0.0]),
+//!     (3, "en", [0.0, 0.0, 1.0]),
+//! ] {
+//!     notes.put(&Note { id, lang: lang.to_owned(), embedding: v.to_vec() })?;
+//! }
+//!
+//! let close = notes.nearest(Note::EMBEDDING, &[1.0, 0.05, 0.0], 2)?;
+//! assert_eq!(close.iter().map(|n| n.id).collect::<Vec<_>>(), [1, 2]);
+//!
+//! // The same search, narrowed by another indexed field.
+//! let english = notes
+//!     .near(Note::EMBEDDING, &[1.0, 0.05, 0.0])
+//!     .filter(Note::LANG, "en")
+//!     .take(2)?;
+//! assert_eq!(english.iter().map(|n| n.id).collect::<Vec<_>>(), [1, 3]);
+//! # Ok::<(), yo::Error>(())
+//! ```
+//!
+//! The filter is decided inside the scan and not over the answers, so asking for
+//! two English notes gives the two nearest English notes rather than whichever
+//! of the nearest few happened to be English. That distinction is the whole
+//! reason the two live in one collection, and [`yo_doc::vector`] has the rest of
+//! it.
 
 use core::marker::PhantomData;
 use core::ops::{Bound, RangeBounds};
@@ -213,6 +262,13 @@ pub trait Document: Field + Indexed {
 pub trait Indexed {
     /// The paths this type asks to be indexed, and how.
     const INDEXES: &'static [(&'static str, IndexKind)];
+
+    /// The paths that hold an embedding, and how wide it is.
+    ///
+    /// Defaulted to nothing, so a type written before vector indexes existed
+    /// and a type that has no embedding both say the same thing without saying
+    /// anything.
+    const VECTORS: &'static [(&'static str, usize)] = &[];
 }
 
 /// A path into a document, what its index can be asked, and the type of the
@@ -327,6 +383,62 @@ impl<T, V> Ordered<T, V> {
 impl<T, V> From<Ordered<T, V>> for Path<T, V> {
     fn from(o: Ordered<T, V>) -> Path<T, V> {
         o.path
+    }
+}
+
+/// A path that holds an embedding, and how wide it is.
+///
+/// A third type rather than another kind on [`Path`], for the same reason
+/// [`Ordered`] is a second one: what a path can be asked is decided when the
+/// type is written. [`Docs::near`] takes one of these and nothing else, so
+/// asking an equality index for the nearest anything is a type error at the call
+/// site, and so is handing a vector path to [`Docs::find`].
+pub struct Vector<T> {
+    path: &'static str,
+    dim: usize,
+    marker: PhantomData<fn() -> T>,
+}
+
+impl<T> Clone for Vector<T> {
+    fn clone(&self) -> Vector<T> {
+        *self
+    }
+}
+
+impl<T> Copy for Vector<T> {}
+
+impl<T> core::fmt::Debug for Vector<T> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("Vector")
+            .field("path", &self.path)
+            .field("dim", &self.dim)
+            .finish()
+    }
+}
+
+impl<T> Vector<T> {
+    /// A path holding a `dim` wide embedding.
+    ///
+    /// The derive calls this.
+    #[must_use]
+    pub const fn new(path: &'static str, dim: usize) -> Vector<T> {
+        Vector {
+            path,
+            dim,
+            marker: PhantomData,
+        }
+    }
+
+    /// The path, as `$.embedding`.
+    #[must_use]
+    pub const fn path(&self) -> &'static str {
+        self.path
+    }
+
+    /// How many coordinates the embedding there has.
+    #[must_use]
+    pub const fn dim(&self) -> usize {
+        self.dim
     }
 }
 
@@ -603,6 +715,92 @@ impl<T: Document> Docs<T> {
         self.read(|docs| docs.count_range(path, as_ref(&lo), as_ref(&hi)))
     }
 
+    /// The `k` documents whose embedding at `path` is nearest to `q`, nearest
+    /// first.
+    ///
+    /// # Errors
+    ///
+    /// [`Code::Invalid`] if `q` is not as wide as the path says, and
+    /// [`Code::Corrupt`] if a stored document is not a `T`.
+    pub fn nearest(&self, path: Vector<T>, q: &[f32], k: usize) -> Result<Vec<T>> {
+        self.near(path, q).take(k)
+    }
+
+    /// The `k` documents most like the one under `id`, that one left out.
+    ///
+    /// More like this, which is the question a collection with embeddings in it
+    /// is really for, and it does not make the caller read the document back
+    /// out to get its vector first. A document with no embedding has nothing to
+    /// be like, so this answers nothing rather than an error.
+    ///
+    /// # Errors
+    ///
+    /// [`Code::Invalid`] for an id that cannot be a key, and [`Code::Corrupt`]
+    /// if a stored document is not a `T`.
+    pub fn nearest_to(
+        &self,
+        path: Vector<T>,
+        id: &<T::Id as Asked>::Ask,
+        k: usize,
+    ) -> Result<Vec<T>> {
+        let id = key_of(id, IndexKind::Equality, "the id")?;
+        self.read(|docs| {
+            let mut out = Vec::new();
+            let mut bad = Ok(());
+            docs.nearest_to(path.path(), id.as_bytes(), k, |_, doc, _| {
+                collect::<T>(&mut out, &mut bad, doc);
+            })?;
+            bad?;
+            Ok(out)
+        })
+    }
+
+    /// A nearest neighbour search that other indexed fields can narrow.
+    ///
+    /// ```
+    /// # use yo::Yo;
+    /// #[derive(Yo, Debug)]
+    /// struct Note {
+    ///     #[yo(id)]
+    ///     id: u64,
+    ///     #[yo(index)]
+    ///     lang: String,
+    ///     #[yo(vector = 3)]
+    ///     embedding: Vec<f32>,
+    /// }
+    ///
+    /// # let db = yo::open(yo::MEMORY)?;
+    /// # let notes = db.docs::<Note>("notes")?;
+    /// # for (id, lang, v) in [
+    /// #     (1u64, "en", [1.0, 0.0, 0.0]),
+    /// #     (2, "fr", [0.9, 0.1, 0.0]),
+    /// #     (3, "en", [0.0, 0.0, 1.0]),
+    /// # ] {
+    /// #     notes.put(&Note { id, lang: lang.to_owned(), embedding: v.to_vec() })?;
+    /// # }
+    /// let close = notes
+    ///     .near(Note::EMBEDDING, &[1.0, 0.05, 0.0])
+    ///     .filter(Note::LANG, "en")
+    ///     .take(2)?;
+    /// assert_eq!(close.iter().map(|n| n.id).collect::<Vec<_>>(), [1, 3]);
+    /// # Ok::<(), yo::Error>(())
+    /// ```
+    ///
+    /// Every filter is decided inside the scan rather than over the answers, so
+    /// asking for two English notes gives the two nearest English notes and not
+    /// whichever of the nearest few happened to be English. See
+    /// [`yo_doc::vector`] for the encoding and for the one direction it is not
+    /// exact in.
+    pub fn near<'a>(&'a self, path: Vector<T>, q: &'a [f32]) -> Near<'a, T> {
+        Near {
+            docs: self,
+            path,
+            q,
+            want: Vec::new(),
+            bad: None,
+        }
+    }
+
     /// What this collection is holding, documents and indexes together.
     ///
     /// # Errors
@@ -621,6 +819,99 @@ impl<T: Document> Docs<T> {
     fn write<R>(&self, f: impl FnOnce(&mut Documents) -> Result<R>) -> Result<R> {
         self.db
             .write(|inner| f(inner.collections[self.at].data.docs_mut()))
+    }
+}
+
+/// A nearest neighbour search being put together, from [`Docs::near`].
+///
+/// A builder rather than a method with a list of filters, because the filters
+/// are over different fields with different types and a slice of them would
+/// have to give that up. Turning a value into an index key can fail, so a
+/// filter that cannot be one is kept here and handed over at the end rather
+/// than making every step return a `Result`.
+pub struct Near<'a, T> {
+    docs: &'a Docs<T>,
+    path: Vector<T>,
+    q: &'a [f32],
+    want: Vec<(&'static str, Key)>,
+    bad: Option<Error>,
+}
+
+impl<T> core::fmt::Debug for Near<'_, T> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("Near")
+            .field("path", &self.path.path())
+            .field("filters", &self.want.len())
+            .finish()
+    }
+}
+
+impl<'a, T: Document> Near<'a, T> {
+    /// Only documents whose value at `path` is `value`.
+    ///
+    /// Two of these means both, so it is a conjunction and not a choice. The
+    /// path has to carry an ordinary index, because what the scan tests is the
+    /// keys that index filed the document under.
+    #[must_use]
+    pub fn filter<V: Asked>(mut self, path: impl Into<Path<T, V>>, value: &V::Ask) -> Near<'a, T> {
+        let path = path.into();
+        match key_of(value, path.kind, path.path) {
+            Ok(key) => self.want.push((path.path, key)),
+            Err(e) => self.bad = self.bad.or(Some(e)),
+        }
+        self
+    }
+
+    /// The `k` nearest that pass every filter, nearest first.
+    ///
+    /// # Errors
+    ///
+    /// [`Code::Invalid`] if a filter names a path with no index on it, if a
+    /// filter value cannot be an index key, or if the query vector is not as
+    /// wide as the path says. [`Code::Corrupt`] if a stored document is not a
+    /// `T`.
+    pub fn take(self, k: usize) -> Result<Vec<T>> {
+        Ok(self.scored(k)?.into_iter().map(|(doc, _)| doc).collect())
+    }
+
+    /// The same, each document with how far it is.
+    ///
+    /// The distance is what the collection measures, so for the cosine default
+    /// it is one minus the cosine and nearer is smaller. It is measured against
+    /// the full precision vector rather than against the code.
+    ///
+    /// # Errors
+    ///
+    /// The same as [`Near::take`].
+    pub fn scored(self, k: usize) -> Result<Vec<(T, f32)>> {
+        if let Some(e) = self.bad {
+            return Err(e);
+        }
+        let (path, q, want) = (self.path.path(), self.q, self.want);
+        self.docs.read(|docs| {
+            let mut out = Vec::new();
+            let mut bad = Ok(());
+            docs.nearest_where(path, q, k, &want, |_, doc, at| {
+                if bad.is_ok() {
+                    match T::read(doc) {
+                        Ok(v) => out.push((v, at)),
+                        Err(e) => bad = Err(e),
+                    }
+                }
+            })?;
+            bad?;
+            Ok(out)
+        })
+    }
+}
+
+/// Read one answer into `out`, keeping the first failure rather than the last.
+fn collect<T: Document>(out: &mut Vec<T>, bad: &mut Result<()>, doc: Doc<'_>) {
+    if bad.is_ok() {
+        match T::read(doc) {
+            Ok(v) => out.push(v),
+            Err(e) => *bad = Err(e),
+        }
     }
 }
 
@@ -1204,5 +1495,148 @@ mod tests {
             .put(&order(u64::MAX, "open", 1.0))
             .expect_err("too big");
         assert_eq!(e.code(), crate::Code::Invalid);
+    }
+
+    // ---- the vector index
+
+    #[derive(Yo, Debug, Clone, PartialEq)]
+    struct Note {
+        #[yo(id)]
+        id: u64,
+        #[yo(index)]
+        lang: String,
+        #[yo(vector = 4)]
+        embedding: Vec<f32>,
+    }
+
+    fn note(id: u64, lang: &str, embedding: [f32; 4]) -> Note {
+        Note {
+            id,
+            lang: lang.to_owned(),
+            embedding: embedding.to_vec(),
+        }
+    }
+
+    /// A collection holding four notes, two of them in each language.
+    fn notes() -> (crate::Db, Docs<Note>) {
+        let db = open(crate::MEMORY).expect("a database in memory");
+        let notes = db.docs::<Note>("notes").expect("a new collection");
+        for n in [
+            note(1, "en", [1.0, 0.0, 0.0, 0.0]),
+            note(2, "fr", [0.0, 1.0, 0.0, 0.0]),
+            note(3, "en", [0.0, 0.0, 1.0, 0.0]),
+            note(4, "fr", [0.0, 0.0, 0.0, 1.0]),
+        ] {
+            notes.put(&n).expect("a document that fits");
+        }
+        (db, notes)
+    }
+
+    #[test]
+    fn a_derived_vector_field_is_indexed_and_comes_back_whole() {
+        let (_db, notes) = notes();
+        assert_eq!(
+            Note::VECTORS,
+            [("$.embedding", 4usize)],
+            "the derive declares the path and the width"
+        );
+        assert_eq!(Note::EMBEDDING.path(), "$.embedding");
+        assert_eq!(Note::EMBEDDING.dim(), 4);
+
+        // The embedding is a field of the document like any other, so the
+        // struct that comes out is the struct that went in.
+        assert_eq!(
+            notes.get(&2).expect("a read"),
+            Some(note(2, "fr", [0.0, 1.0, 0.0, 0.0]))
+        );
+
+        let near = notes
+            .nearest(Note::EMBEDDING, &[0.9, 0.1, 0.0, 0.0], 2)
+            .expect("a search");
+        assert_eq!(near.iter().map(|n| n.id).collect::<Vec<_>>(), [1, 2]);
+    }
+
+    #[test]
+    fn a_filter_narrows_the_search_and_not_the_answers() {
+        let (_db, notes) = notes();
+        let french = notes
+            .near(Note::EMBEDDING, &[0.9, 0.1, 0.0, 0.0])
+            .filter(Note::LANG, "fr")
+            .take(2)
+            .expect("a search");
+        assert_eq!(french.iter().map(|n| n.id).collect::<Vec<_>>(), [2, 4]);
+
+        // The scores come back in the same order, nearer first.
+        let scored = notes
+            .near(Note::EMBEDDING, &[0.9, 0.1, 0.0, 0.0])
+            .filter(Note::LANG, "fr")
+            .scored(2)
+            .expect("a search");
+        assert_eq!(scored[0].0.id, 2);
+        assert!(scored[0].1 <= scored[1].1);
+
+        // A filter on a path with no index says so rather than answering
+        // nothing, and it says so when the search runs.
+        let e = notes
+            .near(Note::EMBEDDING, &[1.0, 0.0, 0.0, 0.0])
+            .filter(
+                Path::<Note, String>::new("$.author", IndexKind::Equality),
+                "me",
+            )
+            .take(1)
+            .expect_err("no index there");
+        assert_eq!(e.code(), crate::Code::Invalid);
+    }
+
+    #[test]
+    fn more_like_this_leaves_the_document_itself_out() {
+        let (_db, notes) = notes();
+        let like = notes.nearest_to(Note::EMBEDDING, &1, 2).expect("a search");
+        assert_eq!(like.len(), 2);
+        assert!(!like.iter().any(|n| n.id == 1));
+
+        // An id that is not in the collection has nothing to be like.
+        assert!(
+            notes
+                .nearest_to(Note::EMBEDDING, &99, 2)
+                .expect("a search")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn an_embedding_of_the_wrong_width_is_refused() {
+        let db = open(crate::MEMORY).expect("a database in memory");
+        let notes = db.docs::<Note>("notes").expect("a new collection");
+        let e = notes
+            .put(&Note {
+                id: 1,
+                lang: "en".to_owned(),
+                embedding: vec![1.0, 0.0],
+            })
+            .expect_err("two coordinates where four were declared");
+        assert_eq!(e.code(), crate::Code::Invalid);
+        assert_eq!(notes.len().expect("a count"), 0);
+
+        // And so is a query vector of the wrong width.
+        let e = notes
+            .nearest(Note::EMBEDDING, &[1.0, 0.0], 1)
+            .expect_err("two coordinates");
+        assert_eq!(e.code(), crate::Code::Invalid);
+    }
+
+    #[test]
+    fn reopening_a_collection_keeps_the_vector_index() {
+        let (db, notes) = notes();
+        let again = db.docs::<Note>("notes").expect("the same collection");
+        assert_eq!(
+            again
+                .nearest(Note::EMBEDDING, &[0.0, 0.0, 0.9, 0.1], 1)
+                .expect("a search")
+                .first()
+                .map(|n| n.id),
+            Some(3)
+        );
+        drop(notes);
     }
 }

@@ -289,11 +289,26 @@ impl Signature {
     /// The signature of a set of attribute and value pairs.
     #[must_use]
     pub fn of(values: &[(&str, &[u8])]) -> Signature {
-        let mut bits = 0u64;
+        let mut got = Signature(0);
         for (attribute, value) in values {
-            bits |= 1u64 << (hash(attribute.as_bytes(), value) % 64);
+            got.insert(attribute, value);
         }
-        Signature(bits)
+        got
+    }
+
+    /// Add one attribute and value pair to what this signature covers.
+    ///
+    /// For a caller that meets the pairs one at a time rather than holding them
+    /// all in a slice, which is what building a tag out of a document's indexed
+    /// fields looks like.
+    pub fn insert(&mut self, attribute: &str, value: &[u8]) {
+        self.insert_bytes(attribute.as_bytes(), value);
+    }
+
+    /// The same for an attribute that is already bytes, which is what a document
+    /// path is.
+    pub fn insert_bytes(&mut self, attribute: &[u8], value: &[u8]) {
+        self.0 |= 1u64 << (hash(attribute, value) % 64);
     }
 
     /// The signature as the tag to hand to [`Partitions::insert_tagged`].
@@ -548,6 +563,21 @@ impl Partitions {
     pub fn tag(&self, id: u64) -> Option<u64> {
         let at = self.at.get(&id)?;
         Some(self.postings[at.partition as usize].tags[at.slot as usize])
+    }
+
+    /// Change the tag `id` carries, saying whether it was there.
+    ///
+    /// The tag sits beside the code and nothing about the placement depends on
+    /// it, so this is one write and no maintenance. That is what makes it
+    /// affordable to recompute every tag in a collection when the thing the tag
+    /// summarises changes, which for a document index is a field being indexed
+    /// or stopping being indexed.
+    pub fn retag(&mut self, id: u64, tag: u64) -> bool {
+        let Some(at) = self.at.get(&id) else {
+            return false;
+        };
+        self.postings[at.partition as usize].tags[at.slot as usize] = tag;
+        true
     }
 
     /// Take a vector out, saying whether it was there.

@@ -14,6 +14,8 @@
 //!     tags: Vec<String>,
 //!     #[yo(text)]
 //!     note: String,
+//!     #[yo(vector = 3)]
+//!     embedding: Vec<f32>,
 //! }
 //! ```
 //!
@@ -31,6 +33,13 @@
 //! equality and ranges, `#[yo(array)]` files the document under every element
 //! of a list, and `#[yo(text)]` files it under every word of a string. They are
 //! the four kinds a path index comes in and nothing is invented here.
+//!
+//! `#[yo(vector = 384)]` on a `Vec<f32>` asks for a vector index over the
+//! embedding that field holds, which is the one mark that takes a number,
+//! because how wide a collection's vectors are is decided when the type is
+//! written and there is no reason to find it out from the first document
+//! instead. It gives the type a `Vector` constant, so a nearest neighbour
+//! search names the field the same way an equality lookup does.
 //!
 //! # Why there are no dependencies
 //!
@@ -164,11 +173,19 @@ fn indexed(s: &Struct) -> String {
             indexes.push_str(&format!("({path:?}, ::yo::doc::IndexKind::{kind}),"));
         }
     }
+    let mut vectors = String::new();
+    for f in &s.fields {
+        if let Some(dim) = f.vector {
+            let path = format!("$.{}", f.label);
+            vectors.push_str(&format!("({path:?}, {dim}),"));
+        }
+    }
     let name = &s.name;
     format!(
         "#[automatically_derived]
 impl ::yo::doc::Indexed for {name} {{
     const INDEXES: &'static [(&'static str, ::yo::doc::IndexKind)] = &[{indexes}];
+    const VECTORS: &'static [(&'static str, usize)] = &[{vectors}];
 }}
 "
     )
@@ -220,6 +237,17 @@ fn paths(s: &Struct) -> String {
             "    /// The `{path}` path, which is indexed for {kind} and named
     /// `{label}` on this type.
     pub const {upper}: {held} = {built};
+"
+        ));
+    }
+    for f in &s.fields {
+        let Some(dim) = f.vector else { continue };
+        let (upper, label, path) = (f.label.to_uppercase(), &f.label, format!("$.{}", f.label));
+        let name = &s.name;
+        consts.push_str(&format!(
+            "    /// The `{path}` path, which holds a {dim} wide embedding and is
+    /// named `{label}` on this type.
+    pub const {upper}: ::yo::doc::Vector<{name}> = ::yo::doc::Vector::new({path:?}, {dim});
 "
         ));
     }

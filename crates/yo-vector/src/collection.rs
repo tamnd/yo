@@ -232,12 +232,32 @@ impl Collection {
     /// vector of length zero, which has no direction to store. [`Code::Full`]
     /// for a key past the length limit.
     pub fn put(&mut self, key: &[u8], v: &[f32]) -> Result<bool> {
+        self.put_tagged(key, v, 0)
+    }
+
+    /// The same, with the tag a filtered search will meet in the posting scan.
+    ///
+    /// A tag is 64 bits and it travels beside the code rather than beside the
+    /// vector, which is the whole reason a filter here costs nothing: the scan
+    /// is already reading that cache line to get at the code, so testing the
+    /// tag is one instruction on a word that has arrived anyway. See
+    /// [`Signature`](crate::Signature) for how a set of field and value pairs
+    /// becomes one, and [`Collection::search_where`] for the other end of it.
+    ///
+    /// A tag of zero passes no filter except [`Any`](crate::Any), which is
+    /// what an untagged collection wants: [`Collection::put`] is this with a
+    /// zero and every search over it is unfiltered.
+    ///
+    /// # Errors
+    ///
+    /// As [`Collection::put`].
+    pub fn put_tagged(&mut self, key: &[u8], v: &[f32], tag: u64) -> Result<bool> {
         let ready = self.ready(v)?;
 
         let new = match self.ids.get(key) {
             Some(&id) => {
                 self.raw.write(id, &ready);
-                self.index.insert(id, &ready);
+                self.index.insert_tagged(id, &ready, tag);
                 false
             }
             None => {
@@ -249,13 +269,33 @@ impl Collection {
                         "that key is too long for a vector collection",
                     ));
                 }
-                self.index.insert(id, &ready);
+                self.index.insert_tagged(id, &ready, tag);
                 true
             }
         };
 
         self.catch_up();
         Ok(new)
+    }
+
+    /// The tag `key` was stored with, if it is here.
+    #[must_use]
+    pub fn tag(&self, key: &[u8]) -> Option<u64> {
+        self.index.tag(*self.ids.get(key)?)
+    }
+
+    /// Change the tag under `key` without touching the vector, and say whether
+    /// there was one.
+    ///
+    /// The tag summarises something outside the vector, so it can go stale while
+    /// the vector is still right. Rewriting it is one store into the posting,
+    /// with no requantisation and no maintenance, which is what makes it cheap
+    /// enough to redo every tag in a collection when the summary changes.
+    pub fn retag(&mut self, key: &[u8], tag: u64) -> bool {
+        let Some(&id) = self.ids.get(key) else {
+            return false;
+        };
+        self.index.retag(id, tag)
     }
 
     /// Take a vector out, saying whether it was there.
@@ -283,6 +323,33 @@ impl Collection {
     /// [`Code::Invalid`] when `q` is not [`Collection::dim`] long or holds a
     /// coordinate that is not a number.
     pub fn search(&self, q: &[f32], k: usize, skip: Option<&[u8]>) -> Result<Vec<Match>> {
+        self.search_where(q, k, skip, &crate::Any)
+    }
+
+    /// The same, over only the members whose tag `filter` allows.
+    ///
+    /// The filter runs inside the posting scan and not on the answers, which is
+    /// the difference between a filtered search and a search followed by a
+    /// filter. A filter matching one member in a thousand, applied to the
+    /// nearest ten, returns nothing almost every time; applied in the scan it
+    /// keeps reading further partitions until it has `k` or until it has spent
+    /// [`Tuning::widen`], so it returns the nearest ten that pass.
+    ///
+    /// It can still come back with fewer than `k`. That is the trade every
+    /// engine makes here and it is the right one, because the alternative to
+    /// giving up after a bounded widen is reading the whole collection for a
+    /// query that was going to find nothing anyway.
+    ///
+    /// # Errors
+    ///
+    /// As [`Collection::search`].
+    pub fn search_where(
+        &self,
+        q: &[f32],
+        k: usize,
+        skip: Option<&[u8]>,
+        filter: &impl crate::Filter,
+    ) -> Result<Vec<Match>> {
         // The query is checked before the collection is looked at, so that a
         // query of the wrong length says so rather than answering nothing at
         // all while the collection happens to be empty.
@@ -295,7 +362,7 @@ impl Collection {
         // it out does not cost an answer. It is the nearest one and it is
         // therefore always in the shortlist.
         let want = if skip.is_some() { k + 1 } else { k };
-        let hits = self.index.search(&ready, want, &self.raw);
+        let hits = self.index.search_where(&ready, want, filter, &self.raw);
 
         let mut out = Vec::with_capacity(hits.len().min(k));
         for hit in hits {

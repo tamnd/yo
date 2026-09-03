@@ -294,6 +294,9 @@ fn declare<T: Document>(data: &mut Documents) -> Result<()> {
     for (path, kind) in T::INDEXES {
         data.docs.create_index_bytes(path.as_bytes(), *kind)?;
     }
+    for (path, dim) in T::VECTORS {
+        data.docs.create_vector_index(path, *dim)?;
+    }
     Ok(())
 }
 

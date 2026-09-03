@@ -58,6 +58,13 @@
 //! it is filed. An overwrite and a removal both un-index through the same code,
 //! because both make the old entries wrong.
 //!
+//! A vector index at a path is read in the same pass and for the same reason: a
+//! document whose embedding is the wrong shape fails the write rather than
+//! landing in the collection with no vector in it. It is filed after the
+//! document is stored, along with the tag that a filtered search tests, which is
+//! the keys the other indexes just filed this document under. See
+//! [`vector`](crate::vector).
+//!
 //! # Reading one back
 //!
 //! [`Docs::get`] answers a [`Doc`], which is a [`Value`] with the collection's
@@ -69,10 +76,13 @@ use core::ops::Bound;
 
 use yo_common::{Code, Error, Result};
 use yo_kv::{Cursor, Elements, Full};
+use yo_shape::Metric;
+use yo_vector::{Match, Signature};
 
 use crate::head::{DEPTH_MAX, Kind};
 use crate::index::{self, IndexKind, Key, PathIndex};
 use crate::path::{Step, Steps};
+use crate::vector::{self, VectorIndex};
 use crate::{Builder, Keys, Value};
 
 /// Documents by id, with the key table their keys are interned against.
@@ -93,6 +103,18 @@ pub struct Docs {
     /// fails the write rather than leaving a document behind that no query will
     /// ever find. Kept on the collection so a write allocates nothing.
     taken: Vec<Vec<u8>>,
+    /// One per path holding an embedding, in the order they were declared.
+    ///
+    /// Beside the path indexes rather than among them, because nearness has no
+    /// key to file under. See [`vector`](crate::vector).
+    vectors: Vec<VectorIndex>,
+    /// The vector each of those takes from the document being written, one slot
+    /// per index and empty where the document has nothing at the path.
+    ///
+    /// Read before anything is stored, for the same reason the index keys are:
+    /// a document whose embedding is the wrong shape fails the write rather than
+    /// landing in the collection and in none of its vector indexes.
+    drawn: Vec<Vec<f32>>,
 }
 
 impl Default for Docs {
@@ -113,6 +135,8 @@ impl Docs {
             build: Builder::new(),
             indexes: Vec::new(),
             taken: Vec::new(),
+            vectors: Vec::new(),
+            drawn: Vec::new(),
         }
     }
 
@@ -128,6 +152,8 @@ impl Docs {
             build: Builder::with_capacity(each),
             indexes: Vec::new(),
             taken: Vec::new(),
+            vectors: Vec::new(),
+            drawn: Vec::new(),
         }
     }
 
@@ -171,6 +197,8 @@ impl Docs {
             build,
             indexes,
             taken,
+            vectors,
+            drawn,
         } = self;
 
         taken.resize(indexes.len(), Vec::new());
@@ -192,6 +220,28 @@ impl Docs {
                 ));
             }
         }
+
+        drawn.resize(vectors.len(), Vec::new());
+        for (slot, index) in drawn.iter_mut().zip(vectors.iter()) {
+            slot.clear();
+            let Some(at) = value.path_bytes(index.path())? else {
+                continue;
+            };
+            vector::coordinates(at, index.dim(), index.path(), slot)?;
+        }
+        // What a filtered search will meet in the posting scan: one bit per key
+        // the other indexes file this document under, worked out here because
+        // `taken` already holds exactly those keys.
+        let tag = if vectors.is_empty() {
+            0
+        } else {
+            vector::tag_of(
+                indexes
+                    .iter()
+                    .map(PathIndex::path)
+                    .zip(taken.iter().map(Vec::as_slice)),
+            )
+        };
 
         unindex(rows, keys, indexes, id);
 
@@ -216,6 +266,15 @@ impl Docs {
                 }
             });
             filed?;
+        }
+        // A document that no longer has anything at the path leaves the vector
+        // index, rather than keeping the vector the last version of it had.
+        for (slot, index) in drawn.iter().zip(vectors.iter_mut()) {
+            if slot.is_empty() {
+                index.collection_mut().remove(id);
+            } else {
+                index.collection_mut().put_tagged(id, slot, tag)?;
+            }
         }
         Ok(fresh)
     }
@@ -287,22 +346,20 @@ impl Docs {
         for step in Steps::new(path) {
             step?;
         }
-        match self.indexes.iter().position(|i| i.path() == path) {
-            // The same kind again is nothing at all, and equality on top of
-            // ordered is already answered. Every other pair means the path is
-            // being asked a different question, so it gets rebuilt.
+        // The same kind again is nothing at all, and equality on top of ordered
+        // is already answered. Every other pair means the path is being asked a
+        // different question, so it gets rebuilt. The old one stays in place
+        // until the new one is filled, so a backfill that fails leaves the
+        // collection with the index it already had rather than with none.
+        let old = match self.indexes.iter().position(|i| i.path() == path) {
             Some(at) if self.indexes[at].kind() == kind => return Ok(()),
             Some(at)
                 if kind == IndexKind::Equality && self.indexes[at].kind() == IndexKind::Ordered =>
             {
                 return Ok(());
             }
-            Some(at) => {
-                self.indexes.remove(at);
-                self.taken.truncate(self.indexes.len());
-            }
-            None => {}
-        }
+            found => found,
+        };
         let mut index = PathIndex::new(path, kind);
         let mut list = Vec::new();
         for (id, bytes) in self.rows.pairs() {
@@ -336,8 +393,14 @@ impl Docs {
             });
             filed?;
         }
-        self.indexes.push(index);
-        self.taken.push(Vec::new());
+        match old {
+            Some(at) => self.indexes[at] = index,
+            None => {
+                self.indexes.push(index);
+                self.taken.push(Vec::new());
+            }
+        }
+        self.retag();
         Ok(())
     }
 
@@ -353,6 +416,7 @@ impl Docs {
         };
         self.indexes.remove(at);
         self.taken.truncate(self.indexes.len());
+        self.retag();
         true
     }
 
@@ -366,6 +430,265 @@ impl Docs {
     #[must_use]
     pub fn index(&self, path: &str) -> Option<&PathIndex> {
         self.indexes.iter().find(|i| i.path() == path.as_bytes())
+    }
+
+    /// Start indexing the `dim` wide embedding at `path` for nearness, by
+    /// cosine, and file every document already here.
+    ///
+    /// Cosine because that is what a text or image embedding is compared by, and
+    /// a collection built for one measure and searched as if it were another
+    /// gives wrong answers quietly. [`Docs::create_vector_index_with`] takes the
+    /// other one.
+    ///
+    /// Declaring the same path at the same width and measure twice is not an
+    /// error and rebuilds nothing, the same as [`Docs::create_index`], so a
+    /// caller that declares its indexes every time it opens a collection can.
+    /// Changing the width or the measure rebuilds, because there is nothing in
+    /// the old collection that answers the new question.
+    pub fn create_vector_index(&mut self, path: &str, dim: usize) -> Result<()> {
+        self.create_vector_index_bytes(path.as_bytes(), dim, Metric::Cosine)
+    }
+
+    /// The same, saying what nearness means.
+    pub fn create_vector_index_with(
+        &mut self,
+        path: &str,
+        dim: usize,
+        metric: Metric,
+    ) -> Result<()> {
+        self.create_vector_index_bytes(path.as_bytes(), dim, metric)
+    }
+
+    /// [`Docs::create_vector_index_with`] for a path that is already bytes.
+    ///
+    /// # Errors
+    ///
+    /// [`Code::Invalid`] for a path that does not parse, a width of zero or past
+    /// the format's limit, and for a document already here whose value at the
+    /// path is not an array of `dim` numbers. [`Code::Unsupported`] for a
+    /// measure this build does not do.
+    pub fn create_vector_index_bytes(
+        &mut self,
+        path: &[u8],
+        dim: usize,
+        metric: Metric,
+    ) -> Result<()> {
+        for step in Steps::new(path) {
+            step?;
+        }
+        // As with a path index, the one that is already here stays until the new
+        // one is filled, so a document whose embedding is not the new width
+        // leaves the collection with the index it had rather than with none.
+        let old = match self.vectors.iter().position(|v| v.path() == path) {
+            Some(at) if self.vectors[at].dim() == dim && self.vectors[at].metric() == metric => {
+                return Ok(());
+            }
+            found => found,
+        };
+        let mut index = VectorIndex::new(path, dim, metric)?;
+        let mut list = Vec::new();
+        let mut v = Vec::new();
+        for (id, bytes) in self.rows.pairs() {
+            let Some(value) = Value::new(bytes) else {
+                continue;
+            };
+            let doc = Doc {
+                value,
+                keys: &self.keys,
+            };
+            let Some(at) = doc.path_bytes(path)? else {
+                continue;
+            };
+            vector::coordinates(at.value(), dim, path, &mut v)?;
+            let tag = tag_for(&doc, &self.indexes, &mut list);
+            index.collection_mut().put_tagged(id, &v, tag)?;
+        }
+        match old {
+            Some(at) => self.vectors[at] = index,
+            None => {
+                self.vectors.push(index);
+                self.drawn.push(Vec::new());
+            }
+        }
+        Ok(())
+    }
+
+    /// Stop indexing the embedding at `path`, and say whether it was indexed.
+    pub fn drop_vector_index(&mut self, path: &str) -> bool {
+        self.drop_vector_index_bytes(path.as_bytes())
+    }
+
+    /// [`Docs::drop_vector_index`] for a path that is already bytes.
+    pub fn drop_vector_index_bytes(&mut self, path: &[u8]) -> bool {
+        let Some(at) = self.vectors.iter().position(|v| v.path() == path) else {
+            return false;
+        };
+        self.vectors.remove(at);
+        self.drawn.truncate(self.vectors.len());
+        true
+    }
+
+    /// The vector indexes this collection keeps, in the order they were
+    /// declared.
+    #[must_use]
+    pub fn vector_indexes(&self) -> &[VectorIndex] {
+        &self.vectors
+    }
+
+    /// The vector index on `path`, if there is one.
+    #[must_use]
+    pub fn vector_index(&self, path: &str) -> Option<&VectorIndex> {
+        self.vectors.iter().find(|v| v.path() == path.as_bytes())
+    }
+
+    /// The vector stored for `id` at `path`, as the index holds it.
+    ///
+    /// For a cosine index that is the normalised vector and not the one the
+    /// document carries, because normalising once at write time is what makes
+    /// every later comparison a dot product. The document itself still has what
+    /// was written.
+    #[must_use]
+    pub fn embedding(&self, path: &str, id: &[u8]) -> Option<&[f32]> {
+        self.vector_index(path)?.collection().get(id)
+    }
+
+    /// Hand the `k` documents nearest to `q` at `path` to `f`, nearest first,
+    /// and say how many there were.
+    ///
+    /// The third argument to `f` is the distance, which for a cosine index is
+    /// one minus the cosine so that nearer is smaller, and it is measured
+    /// against the full precision vector rather than against the code.
+    ///
+    /// A path with no vector index on it is an error and not a scan, the same
+    /// rule [`Docs::find`] follows.
+    pub fn nearest(
+        &self,
+        path: &str,
+        q: &[f32],
+        k: usize,
+        f: impl FnMut(&[u8], Doc<'_>, f32),
+    ) -> Result<usize> {
+        let hits = self.vector(path)?.collection().search(q, k, None)?;
+        Ok(self.answer(&hits, f))
+    }
+
+    /// The same, over only the documents whose indexed fields hold every value
+    /// in `want`.
+    ///
+    /// The filter runs inside the posting scan rather than over the answers, so
+    /// a selective filter returns the nearest documents that match instead of
+    /// whichever of the nearest happened to match. See
+    /// [`vector`](crate::vector) for the encoding and for the one direction it
+    /// is not exact in: a document can pass a filter it does not really match,
+    /// never fail one it does, so a caller with a predicate of its own still
+    /// gets every answer to check.
+    ///
+    /// Every path in `want` has to carry an ordinary index, because the bits the
+    /// filter tests are the keys those indexes filed the document under. A path
+    /// with no index is an error rather than a filter that matches nothing.
+    pub fn nearest_where(
+        &self,
+        path: &str,
+        q: &[f32],
+        k: usize,
+        want: &[(&str, Key)],
+        f: impl FnMut(&[u8], Doc<'_>, f32),
+    ) -> Result<usize> {
+        let filter = self.wanted(want)?;
+        let hits = self
+            .vector(path)?
+            .collection()
+            .search_where(q, k, None, &filter)?;
+        Ok(self.answer(&hits, f))
+    }
+
+    /// Hand the `k` documents most like the one under `id` to `f`, `id` itself
+    /// left out.
+    ///
+    /// More like this, which is the query a document collection with embeddings
+    /// in it is really for. A document with nothing at the path has nothing to
+    /// be like, so it answers zero rather than an error.
+    pub fn nearest_to(
+        &self,
+        path: &str,
+        id: &[u8],
+        k: usize,
+        f: impl FnMut(&[u8], Doc<'_>, f32),
+    ) -> Result<usize> {
+        let index = self.vector(path)?;
+        let Some(q) = index.collection().get(id) else {
+            return Ok(0);
+        };
+        let hits = index.collection().search(q, k, Some(id))?;
+        Ok(self.answer(&hits, f))
+    }
+
+    /// The vector index on `path`, or the error that says why there is not one.
+    fn vector(&self, path: &str) -> Result<&VectorIndex> {
+        self.vector_index(path).ok_or_else(|| {
+            Error::fmt(
+                Code::Invalid,
+                format_args!("there is no vector index on {path}, so this would be a scan"),
+            )
+        })
+    }
+
+    /// Turn what a query requires into the signature the scan tests.
+    fn wanted(&self, want: &[(&str, Key)]) -> Result<Signature> {
+        let mut sig = Signature::default();
+        for (path, key) in want {
+            if self.index(path).is_none() {
+                return Err(Error::fmt(
+                    Code::Invalid,
+                    format_args!("there is no index on {path}, so a search cannot filter on it"),
+                ));
+            }
+            sig.insert(path, key.as_bytes());
+        }
+        Ok(sig)
+    }
+
+    /// Read the documents a search answered with, skipping any that have gone.
+    fn answer(&self, hits: &[Match], mut f: impl FnMut(&[u8], Doc<'_>, f32)) -> usize {
+        let mut n = 0usize;
+        for hit in hits {
+            if let Some(doc) = self.get(&hit.key) {
+                f(&hit.key, doc, hit.distance);
+                n += 1;
+            }
+        }
+        n
+    }
+
+    /// Work out every document's tag again and write it back.
+    ///
+    /// A tag summarises the keys the other indexes filed the document under, so
+    /// declaring or dropping one makes every tag wrong. This is one store per
+    /// document per vector index, with no requantising and no maintenance, which
+    /// is cheap enough to do on the spot and is the only alternative to a filter
+    /// that used to work quietly answering nothing.
+    fn retag(&mut self) {
+        let Docs {
+            rows,
+            keys,
+            indexes,
+            vectors,
+            ..
+        } = self;
+        if vectors.is_empty() {
+            return;
+        }
+        let mut list = Vec::new();
+        for (id, bytes) in rows.pairs() {
+            let Some(value) = Value::new(bytes) else {
+                continue;
+            };
+            let doc = Doc { value, keys };
+            let tag = tag_for(&doc, indexes, &mut list);
+            for index in vectors.iter_mut() {
+                index.collection_mut().retag(id, tag);
+            }
+        }
     }
 
     /// Hand every document whose value at `path` is `key` to `f`, and say how
@@ -525,9 +848,13 @@ impl Docs {
             rows,
             keys,
             indexes,
+            vectors,
             ..
         } = self;
         unindex(rows, keys, indexes, id);
+        for index in vectors.iter_mut() {
+            index.collection_mut().remove(id);
+        }
         rows.remove(id).is_some()
     }
 
@@ -588,6 +915,9 @@ impl Docs {
         for index in &mut self.indexes {
             index.clear();
         }
+        for index in &mut self.vectors {
+            index.clear();
+        }
     }
 
     /// What the collection costs, the key table and the indexes included.
@@ -600,7 +930,31 @@ impl Docs {
                 .iter()
                 .map(PathIndex::memory_bytes)
                 .sum::<usize>()
+            + self
+                .vectors
+                .iter()
+                .map(VectorIndex::memory_bytes)
+                .sum::<usize>()
     }
+}
+
+/// The tag a stored document carries, worked out from the indexes it is filed
+/// in.
+///
+/// Nothing here can fail. A path that no longer resolves or a value that is too
+/// long to be an index key contributes no bit, which is the same absence the
+/// document has in that index.
+fn tag_for(doc: &Doc<'_>, indexes: &[PathIndex], list: &mut Vec<u8>) -> u64 {
+    let mut sig = Signature::default();
+    for index in indexes {
+        let Ok(Some(at)) = doc.path_bytes(index.path()) else {
+            continue;
+        };
+        list.clear();
+        let _ = index.keys_at(at.value(), list);
+        vector::add_keys(&mut sig, index.path(), list);
+    }
+    sig.bits()
 }
 
 /// Take whatever is stored under `id` out of every index, leaving the primary
@@ -1733,5 +2087,311 @@ mod tests {
                 .and_then(|v| v.as_text()),
             Some("sku-0")
         );
+    }
+
+    // ---- the vector index
+
+    /// A document with a language and an embedding, which is the shape `10`
+    /// section 3 uses as its example.
+    fn item(lang: &str, v: &[f32]) -> Vec<u8> {
+        let mut b = Builder::new();
+        b.begin_object().expect("open");
+        b.key(b"lang").expect("key");
+        b.text(lang).expect("value");
+        b.key(b"embedding").expect("key");
+        b.begin_array().expect("open");
+        for x in v {
+            b.float(f64::from(*x)).expect("value");
+        }
+        b.end_array().expect("close");
+        b.end_object().expect("close");
+        b.finish().expect("finished").to_vec()
+    }
+
+    /// The same document with no embedding in it at all.
+    fn bare(lang: &str) -> Vec<u8> {
+        let mut b = Builder::new();
+        b.begin_object().expect("open");
+        b.key(b"lang").expect("key");
+        b.text(lang).expect("value");
+        b.end_object().expect("close");
+        b.finish().expect("finished").to_vec()
+    }
+
+    /// Eight coordinates that depend only on `n`, so a test that fails fails
+    /// the same way twice.
+    fn spread(n: u64) -> [f32; 8] {
+        let mut s = n.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1;
+        let mut v = [0.0f32; 8];
+        for x in &mut v {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            *x = (s >> 40) as f32 / 4096.0 - 1.0;
+        }
+        v
+    }
+
+    #[test]
+    fn a_document_and_its_embedding_are_one_write() {
+        let mut docs = Docs::new();
+        docs.create_vector_index("$.embedding", 3).expect("index");
+        for (id, v) in [
+            ("a", [1.0, 0.0, 0.0]),
+            ("b", [0.0, 1.0, 0.0]),
+            ("c", [0.0, 0.0, 1.0]),
+        ] {
+            docs.put_bytes(id.as_bytes(), &item("en", &v)).expect("put");
+        }
+        assert_eq!(docs.vector_index("$.embedding").expect("declared").len(), 3);
+
+        // The answer is documents and not ids to go and look up somewhere else,
+        // and it comes back nearest first.
+        let mut got = Vec::new();
+        let n = docs
+            .nearest("$.embedding", &[0.9, 0.1, 0.0], 3, |id, doc, d| {
+                let lang = doc
+                    .get(b"lang")
+                    .and_then(|v| v.as_text())
+                    .map(str::to_owned);
+                got.push((id.to_vec(), lang, d));
+            })
+            .expect("nearest");
+        assert_eq!(n, 3);
+        assert_eq!(got[0].0, b"a".to_vec());
+        assert_eq!(got[0].1.as_deref(), Some("en"));
+        assert!(got[0].2 <= got[1].2 && got[1].2 <= got[2].2);
+
+        // A path with no vector index on it says so rather than scanning.
+        assert!(
+            docs.nearest("$.lang", &[1.0, 0.0, 0.0], 1, |_, _, _| {})
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn an_embedding_of_the_wrong_shape_fails_the_write_and_stores_nothing() {
+        let mut docs = Docs::new();
+        docs.create_vector_index("$.embedding", 3).expect("index");
+        docs.put_bytes(b"a", &item("en", &[1.0, 0.0, 0.0]))
+            .expect("put");
+
+        for wrong in [vec![1.0, 0.0], vec![1.0, 0.0, 0.0, 0.0]] {
+            assert!(docs.put_bytes(b"b", &item("en", &wrong)).is_err());
+        }
+        assert!(docs.get(b"b").is_none(), "the write left nothing behind");
+        assert_eq!(docs.len(), 1);
+        assert_eq!(docs.vector_index("$.embedding").expect("declared").len(), 1);
+    }
+
+    #[test]
+    fn a_document_with_nothing_at_the_path_is_not_in_the_index() {
+        let mut docs = Docs::new();
+        docs.create_vector_index("$.embedding", 3).expect("index");
+        docs.put_bytes(b"a", &item("en", &[1.0, 0.0, 0.0]))
+            .expect("put");
+        docs.put_bytes(b"b", &bare("en")).expect("put");
+        assert_eq!(docs.len(), 2);
+        assert_eq!(docs.vector_index("$.embedding").expect("declared").len(), 1);
+
+        // Rewriting a document without its embedding takes the old vector out
+        // rather than leaving the one the last version had.
+        docs.put_bytes(b"a", &bare("en")).expect("put");
+        assert!(
+            docs.vector_index("$.embedding")
+                .expect("declared")
+                .is_empty()
+        );
+        assert!(docs.get(b"a").is_some());
+
+        // And a removal takes it with it.
+        docs.put_bytes(b"a", &item("en", &[1.0, 0.0, 0.0]))
+            .expect("put");
+        assert!(docs.remove(b"a"));
+        assert!(
+            docs.vector_index("$.embedding")
+                .expect("declared")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn a_filter_finds_the_nearest_match_and_not_the_nearest_that_matches() {
+        let mut docs = Docs::new();
+        docs.create_index("$.lang").expect("index");
+        docs.create_vector_index("$.embedding", 8).expect("index");
+
+        // Four hundred English documents spread about, and one French one that
+        // sits nowhere near the query.
+        for n in 0..400u64 {
+            let id = format!("en:{n}");
+            docs.put_bytes(id.as_bytes(), &item("en", &spread(n)))
+                .expect("put");
+        }
+        docs.put_bytes(b"fr", &item("fr", &spread(9_999)))
+            .expect("put");
+
+        let q = spread(3);
+        let mut top = Vec::new();
+        docs.nearest("$.embedding", &q, 20, |id, _, _| top.push(id.to_vec()))
+            .expect("nearest");
+        assert_eq!(top[0], b"en:3".to_vec());
+        assert!(
+            !top.iter().any(|id| id == b"fr"),
+            "searching and then filtering would have answered nothing"
+        );
+
+        // Filtering inside the scan finds it anyway.
+        let french = [("$.lang", Key::text("fr"))];
+        let mut found = Vec::new();
+        docs.nearest_where("$.embedding", &q, 5, &french, |id, _, _| {
+            found.push(id.to_vec())
+        })
+        .expect("nearest");
+        assert_eq!(found, [b"fr".to_vec()]);
+
+        // A path with no index on it cannot be filtered on, and says so.
+        let nothing = [("$.topic", Key::text("finance"))];
+        assert!(
+            docs.nearest_where("$.embedding", &q, 5, &nothing, |_, _, _| {})
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn declaring_either_index_last_gives_the_same_answers() {
+        let q = spread(11);
+        let french = [("$.lang", Key::text("fr"))];
+
+        // Vectors first, then the field the filter reads, so every tag was
+        // written before there was anything to put in it.
+        let mut late = Docs::new();
+        late.create_vector_index("$.embedding", 8).expect("index");
+        for n in 0..200u64 {
+            let lang = if n % 50 == 0 { "fr" } else { "en" };
+            let id = format!("{n}");
+            late.put_bytes(id.as_bytes(), &item(lang, &spread(n)))
+                .expect("put");
+        }
+        late.create_index("$.lang").expect("index");
+
+        // The other way round, where every write already knew.
+        let mut early = Docs::new();
+        early.create_index("$.lang").expect("index");
+        for n in 0..200u64 {
+            let lang = if n % 50 == 0 { "fr" } else { "en" };
+            let id = format!("{n}");
+            early
+                .put_bytes(id.as_bytes(), &item(lang, &spread(n)))
+                .expect("put");
+        }
+        early.create_vector_index("$.embedding", 8).expect("index");
+
+        let mut a = Vec::new();
+        late.nearest_where("$.embedding", &q, 4, &french, |id, _, _| {
+            a.push(id.to_vec())
+        })
+        .expect("nearest");
+        let mut b = Vec::new();
+        early
+            .nearest_where("$.embedding", &q, 4, &french, |id, _, _| {
+                b.push(id.to_vec())
+            })
+            .expect("nearest");
+        assert_eq!(a.len(), 4, "there are four French documents to find");
+        assert_eq!(a, b);
+
+        // Dropping the field index and declaring it again leaves the tags right.
+        assert!(late.drop_index("$.lang"));
+        late.create_index("$.lang").expect("index");
+        let mut again = Vec::new();
+        late.nearest_where("$.embedding", &q, 4, &french, |id, _, _| {
+            again.push(id.to_vec());
+        })
+        .expect("nearest");
+        assert_eq!(again, a);
+    }
+
+    #[test]
+    fn nearest_to_leaves_the_document_itself_out() {
+        let mut docs = Docs::new();
+        docs.create_vector_index("$.embedding", 3).expect("index");
+        for (id, v) in [
+            ("a", [1.0, 0.0, 0.0]),
+            ("b", [0.9, 0.1, 0.0]),
+            ("c", [0.0, 0.0, 1.0]),
+        ] {
+            docs.put_bytes(id.as_bytes(), &item("en", &v)).expect("put");
+        }
+
+        let mut like = Vec::new();
+        docs.nearest_to("$.embedding", b"a", 2, |id, _, _| like.push(id.to_vec()))
+            .expect("nearest");
+        assert_eq!(like, [b"b".to_vec(), b"c".to_vec()]);
+
+        // A document with no embedding has nothing to be like.
+        docs.put_bytes(b"d", &bare("en")).expect("put");
+        let mut none = 0;
+        assert_eq!(
+            docs.nearest_to("$.embedding", b"d", 2, |_, _, _| none += 1)
+                .expect("nearest"),
+            0
+        );
+    }
+
+    #[test]
+    fn declaring_the_same_vector_index_again_rebuilds_nothing() {
+        let mut docs = Docs::new();
+        for n in 0..8u64 {
+            let id = format!("{n}");
+            docs.put_bytes(id.as_bytes(), &item("en", &spread(n)))
+                .expect("put");
+        }
+        docs.create_vector_index("$.embedding", 8).expect("index");
+        assert_eq!(docs.vector_index("$.embedding").expect("declared").len(), 8);
+
+        // The same declaration is nothing at all.
+        docs.create_vector_index("$.embedding", 8).expect("again");
+        assert_eq!(docs.vector_indexes().len(), 1);
+
+        // A different width is a different question, so it is rebuilt, and
+        // documents whose embedding is not that wide fail the declaration. The
+        // index that was already there is the one that is still there.
+        assert!(docs.create_vector_index("$.embedding", 4).is_err());
+        let still = docs.vector_index("$.embedding").expect("still declared");
+        assert_eq!(still.dim(), 8);
+        assert_eq!(still.len(), 8);
+
+        assert!(docs.drop_vector_index("$.embedding"));
+        assert!(!docs.drop_vector_index("$.embedding"));
+        assert!(docs.vector_indexes().is_empty());
+        assert_eq!(docs.len(), 8, "the documents are untouched");
+    }
+
+    #[test]
+    fn clearing_a_collection_empties_the_vector_index_and_keeps_it_declared() {
+        let mut docs = Docs::new();
+        docs.create_vector_index("$.embedding", 3).expect("index");
+        docs.put_bytes(b"a", &item("en", &[1.0, 0.0, 0.0]))
+            .expect("put");
+        let full = docs.memory_bytes();
+
+        docs.clear();
+        assert!(docs.is_empty());
+        assert!(
+            docs.vector_index("$.embedding")
+                .expect("declared")
+                .is_empty()
+        );
+        assert!(docs.memory_bytes() < full);
+
+        docs.put_bytes(b"b", &item("en", &[0.0, 1.0, 0.0]))
+            .expect("put");
+        let mut got = Vec::new();
+        docs.nearest("$.embedding", &[0.0, 1.0, 0.0], 1, |id, _, _| {
+            got.push(id.to_vec())
+        })
+        .expect("nearest");
+        assert_eq!(got, [b"b".to_vec()]);
     }
 }
