@@ -51,6 +51,12 @@
 //! per partition probed, so rotating the centroids once when they are built
 //! turns tens of rotations a search into one.
 //!
+//! They are read in full on every search, which sounds like the obvious thing to
+//! fix on a collection with thousands of them and is not. `src/rank.rs` is the
+//! measurement: coding them the way their members are coded is three to nine
+//! times slower than reading them, because reading them is already going at
+//! memory speed and the estimator that would replace it is not.
+//!
 //! [`Collection`] is the piece above that, and it is the one both doors reach.
 //! [`Partitions`] deals in ids and knows nothing about the key a client wrote a
 //! vector under, what metric the collection was opened with, or where the full
@@ -105,6 +111,7 @@ pub mod image;
 pub mod muvera;
 pub mod partition;
 pub mod rabitq;
+mod rank;
 pub mod rotate;
 
 pub use collection::{Collection, Match};
