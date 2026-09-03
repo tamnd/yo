@@ -502,6 +502,65 @@ mod tests {
         assert_eq!(got[0], 0, "a centroid is nearest to itself");
     }
 
+    /// What the two ways of ranking centroids actually cost, at the shape a
+    /// million MS-MARCO passages make. This is the measurement the module doc's
+    /// first section is about, and it is here rather than in `example recall`
+    /// because there it is a tenth of a query and the machine's own noise is
+    /// wider than the difference.
+    ///
+    /// Worth running under `--release`, since the exact scan is a vectorised
+    /// loop and a debug build is measuring the wrong thing entirely.
+    #[test]
+    #[ignore = "prints a table rather than asserting anything"]
+    fn what_ranking_the_centroids_costs() {
+        for &(n, dim) in &[(2963usize, 1024usize), (2963, 128), (10_000, 768)] {
+            let q = Quantizer::new(dim, Bits::One, 0x51de_0001);
+            let centroids = clumped(n, dim, 2);
+            let mut r = Ranker::default();
+            r.rebuild(&q, &centroids, n);
+            let queries = clumped(200, dim, 3);
+            let want = 128;
+
+            let exact = |u: &[f32]| -> Vec<usize> {
+                let mut by: Vec<(usize, f32)> = (0..n)
+                    .map(|p| (p, sqdist(u, &centroids[p * dim..(p + 1) * dim])))
+                    .collect();
+                by.select_nth_unstable_by(want - 1, |a, b| a.1.total_cmp(&b.1));
+                by.truncate(want);
+                by.sort_unstable_by(|a, b| a.1.total_cmp(&b.1));
+                by.into_iter().map(|(p, _)| p).collect()
+            };
+
+            let mut scores = Vec::new();
+            let mut sink = 0usize;
+            // A warm pass each, because the first one pays for the pages.
+            for i in 0..200 {
+                let u = &queries[i * dim..(i + 1) * dim];
+                sink += exact(u).len() + r.head(u, &centroids, want, &mut scores).len();
+            }
+            let at = std::time::Instant::now();
+            for i in 0..200 {
+                sink += exact(&queries[i * dim..(i + 1) * dim]).len();
+            }
+            let full = at.elapsed().as_nanos() as f64 / 200.0 / 1000.0;
+            let at = std::time::Instant::now();
+            for i in 0..200 {
+                sink += r
+                    .head(
+                        &queries[i * dim..(i + 1) * dim],
+                        &centroids,
+                        want,
+                        &mut scores,
+                    )
+                    .len();
+            }
+            let coded = at.elapsed().as_nanos() as f64 / 200.0 / 1000.0;
+            println!(
+                "{n:6} centroids at {dim:5}  in full {full:8.1} us  coded {coded:8.1} us  ({sink})"
+            );
+        }
+    }
+
     /// For a head of `want`, how far down the estimate's order the true head
     /// reaches. That distance is the slack [`WIDEN`] has to carry, and the table
     /// this prints is the one quoted in the module doc.
