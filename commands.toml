@@ -122,13 +122,13 @@ name = "json"
 expected = 25
 status = "partial"
 doc = "09 section 2"
-# Seventeen of the twenty five, which are the ones that read and write a value at
-# a path plus the whole array family and the four that ask how big something is.
-# The other eight are the string and the number families plus MERGE, MSET, RESP
-# and DEBUG, and they are the next change. The count is RedisJSON 2.8 as it
-# ships inside Redis 8, read off COMMAND LIST FILTERBY ACLCAT json on a running
-# one rather than off the documentation, which lists NUMMULTBY and NUMPOWBY as
-# deprecated and still registers them.
+# Twenty one of the twenty five, which are the ones that read and write a value
+# at a path plus the whole array family, the four that ask how big something is,
+# the three that do arithmetic and the one that appends to a string. The other
+# four are MERGE, MSET, RESP and DEBUG, and they are the next change. The count
+# is RedisJSON 2.8 as it ships inside Redis 8, read off COMMAND LIST FILTERBY
+# ACLCAT json on a running one rather than off the documentation, which lists
+# NUMMULTBY and NUMPOWBY as deprecated and still registers them.
 
 [[group]]
 name = "vector"
@@ -2554,6 +2554,54 @@ status = "shipped"
 wire = "verified"
 divergent = "D-34"
 notes = "Where a value first sits in every array the path matched, or minus one. The stop is exclusive, which is not what the rest of Redis does with a stop, and zero means the end rather than the front so leaving it off and passing zero are the same thing. The comparison is structural rather than a comparison of the encoded bytes, because an object stored in a document can hold its keys as intern table ids where the one parsed off the wire holds them as bytes, and those two encode differently while meaning the same thing."
+
+[[command]]
+name = "JSON.NUMINCRBY"
+group = "json"
+since = "1.0.0"
+arity = 4
+plan = "whole-value"
+bounded = "risk"
+status = "shipped"
+wire = "verified"
+divergent = "D-34,D-36,D-37,D-38,D-39"
+notes = "Adds to every number the path matched and answers the new values as JSON text rather than as numbers, which is a bulk string on a legacy path and a bulk string holding a JSON array on a JSONPath. Two integers stay an integer and anything with a double in it is a double, so adding two to seven answers nine and adding two point zero answers nine point zero, and the document holds whichever one the reply said. An integer result that does not fit is refused rather than promoted to a double."
+
+[[command]]
+name = "JSON.NUMMULTBY"
+group = "json"
+since = "1.0.0"
+arity = 4
+plan = "whole-value"
+bounded = "risk"
+status = "shipped"
+wire = "verified"
+divergent = "D-34,D-36,D-37,D-38,D-39"
+notes = "The same command as JSON.NUMINCRBY with a different operator. Redis marked it deprecated in RedisJSON 2.0 and still registers it, so it is here for the clients that still send it."
+
+[[command]]
+name = "JSON.NUMPOWBY"
+group = "json"
+since = "1.0.0"
+arity = 4
+plan = "whole-value"
+bounded = "risk"
+status = "shipped"
+wire = "verified"
+divergent = "D-34,D-36,D-37,D-38,D-39"
+notes = "The same again, raising rather than multiplying. A negative exponent against an integer is the numeric overflow error even though nothing overflowed, because there is no integer answer to two to the minus one and the module reports it that way. A double exponent is done in doubles, so a power of nought point five is a square root, and the square root of a negative number is the error that says the result is not a number."
+
+[[command]]
+name = "JSON.STRAPPEND"
+group = "json"
+since = "1.0.0"
+arity = -3
+plan = "whole-value"
+bounded = "risk"
+status = "shipped"
+wire = "verified"
+divergent = "D-34,D-36,D-37"
+notes = "The path is optional and sits in the middle, which no other command in this group does, so three arguments means the value is the last one and the path is the root. The value is JSON and has to be a JSON string, so a client appends a quoted string and not bare text, and a value that is a number is a WRONGTYPE about a path value even though it was the value that was wrong. The answer is the new length in bytes and not in characters."
 
 # --------------------------------------------------------------------- vector
 
