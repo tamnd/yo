@@ -61,6 +61,12 @@
 //! calls the fields indexed is a document model that decompresses on every
 //! read.
 //!
+//! [`query`] is the other half of the path grammar. [`Value::path`] answers one
+//! value and refuses `[*]` and `..` because it has nowhere to put a second
+//! answer, and [`Path`] is what reads those: a descent, a wildcard, a slice and
+//! a union, which is RFC 9535 without its filter selector. The `JSON.*` surface
+//! is written against sets rather than single values, so it needs both.
+//!
 //! [`text`] is JSON text in and out. The typed API never touches it, since a
 //! struct is serialized straight into this encoding and read straight back out
 //! of it, but `JSON.SET` arrives with text and `JSON.GET` has to hand text
@@ -90,6 +96,7 @@ mod index;
 mod keys;
 pub mod layout;
 mod path;
+pub mod query;
 mod read;
 pub mod text;
 pub mod vector;
@@ -100,6 +107,7 @@ pub use head::{COUNT_MAX, DEPTH_MAX, Kind};
 pub use index::{IndexKind, KEY_MAX, Key, PathIndex, Ranged, RangedRev};
 pub use keys::{KEYS_MAX, Keys};
 pub use path::{Step, Steps};
+pub use query::Path;
 pub use read::{Elems, Members, Value, key_order};
 pub use text::from_json;
 pub use vector::VectorIndex;
