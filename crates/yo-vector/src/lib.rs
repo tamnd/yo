@@ -108,6 +108,7 @@ pub mod collection;
 pub(crate) mod dist;
 pub mod hnsw;
 pub mod image;
+mod miss;
 pub mod muvera;
 pub mod partition;
 pub mod rabitq;

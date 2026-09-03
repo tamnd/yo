@@ -1140,6 +1140,26 @@ impl Partitions {
         by.into_iter().map(|(p, _)| p).collect()
     }
 
+    /// The partitions in the order a search would probe them, nearest centroid
+    /// first, all of them.
+    ///
+    /// Test only, and it exists for [`miss`](crate::miss), which asks how far
+    /// down this order a query's true neighbours sit. That is the measurement
+    /// that says whether the recall gate wants better partitions or a better
+    /// estimator, and it cannot be taken from outside the crate because the
+    /// probe order is not something a caller has any business seeing.
+    #[cfg(test)]
+    pub(crate) fn probe_order(&self, q: &[f32], into: &mut Vec<usize>) {
+        let u = self.quant.rotate(q);
+        *into = self.near_partitions(&u, self.postings.len());
+    }
+
+    /// Which partition holds `id`, if any.
+    #[cfg(test)]
+    pub(crate) fn holder(&self, id: u64) -> Option<usize> {
+        self.at.get(&id).map(|s| s.partition as usize)
+    }
+
     /// The partition `x` belongs to, as far as the coarse layer can tell.
     fn roughly_nearest(&self, x: &[f32], short: &mut Vec<u32>) -> usize {
         if !self.coarse.ready() {
