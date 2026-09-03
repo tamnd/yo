@@ -155,6 +155,7 @@ use crate::keys::{Body, Record};
 use crate::list::{self, List};
 use crate::listpack::{Entry, Listpack};
 use crate::set::{self, Set};
+use crate::stream::{Group, Id, Stream};
 use crate::zset::{self, Zset};
 
 /// The RDB version this server writes into the footer.
@@ -197,12 +198,16 @@ const T_ZSET: u8 = 3;
 const T_HASH: u8 = 4;
 const T_ZSET_2: u8 = 5;
 const T_SET_INTSET: u8 = 11;
+const T_STREAM_LISTPACKS: u8 = 15;
 const T_HASH_LISTPACK: u8 = 16;
 const T_ZSET_LISTPACK: u8 = 17;
 const T_LIST_QUICKLIST_2: u8 = 18;
+const T_STREAM_LISTPACKS_2: u8 = 19;
 const T_SET_LISTPACK: u8 = 20;
+const T_STREAM_LISTPACKS_3: u8 = 21;
 const T_HASH_METADATA: u8 = 24;
 const T_HASH_LISTPACK_EX: u8 = 25;
+const T_STREAM_LISTPACKS_4: u8 = 27;
 
 // The length encoding, `00` and `01` in the top two bits for six and fourteen
 // bit lengths, then two whole byte forms, and `11` for the special encodings.
@@ -357,14 +362,10 @@ pub(crate) fn dump(rec: &Record) -> Option<Vec<u8>> {
             }
         },
         Body::Hash(hash) => put_hash(&mut out, hash),
-        // Neither of these has an RDB shape here yet. The sparse array is ours
-        // and has no Redis number to write under, and the stream does have one
-        // and is the next thing to land: the node layout is already byte for
-        // byte Redis's and there is a test holding it against a real `DUMP`, so
-        // what is missing is the envelope around it and the `RESTORE` side.
-        // Until then `DUMP` of a stream answers the same null a missing key
-        // does, which is a divergence and is registered as one.
-        Body::Array(_) | Body::Stream(_) => return None,
+        Body::Stream(stream) => put_stream(&mut out, stream),
+        // The sparse array is ours and has no Redis number to write under, so
+        // there is nothing for it to go out as.
+        Body::Array(_) => return None,
     }
     Some(seal(out))
 }
@@ -408,6 +409,87 @@ fn put_hash(out: &mut Vec<u8>, hash: &Hash) {
         put_entry(out, field);
         put_entry(out, value);
     }
+}
+
+/// A stream: the node blobs, then everything the nodes do not say.
+///
+/// This is where the node layout pays for itself. A node is already the rax key
+/// and the listpack a real server writes, so the whole of the entry data goes
+/// out as a length and a memcpy each and nothing is decoded on the way. What
+/// follows is the counters, and then the consumer groups, which are the part
+/// that is genuinely a structure rather than bytes.
+///
+/// `LISTPACKS_3` and not the newest type. A Redis 8.10 writes 27, which is this
+/// with a per group field and an idempotency block on the end, and both are
+/// empty for every stream this server can hold because it does not track
+/// producer IDs. Writing the older type is the same data in a shape more servers
+/// accept, which is the rule the rest of this file already follows.
+fn put_stream(out: &mut Vec<u8>, s: &Stream) {
+    out.push(T_STREAM_LISTPACKS_3);
+    put_len(out, s.nodes() as u64);
+    for (master, blob) in s.raw_nodes() {
+        // The sixteen big endian bytes, which is the rax key Redis writes here
+        // and is the only place in a payload where an ID is not a length.
+        put_str(out, &master.to_bytes());
+        put_str(out, blob);
+    }
+    put_len(out, s.len());
+    put_id(out, s.last_id());
+    // A stream with nothing left in it has no first entry, and Redis writes 0-0
+    // for that rather than leaving the field out.
+    put_id(out, s.first_id().unwrap_or(Id::MIN));
+    put_id(out, s.max_deleted_id());
+    put_len(out, s.added());
+
+    put_len(out, s.groups().count() as u64);
+    for (name, group) in s.groups() {
+        put_str(out, name);
+        put_id(out, group.last_id());
+        // Minus one for a count that cannot be worked out, which is what Redis
+        // writes for the same thing and reads back as unknown. Checked on
+        // 8.10.1: a group over a stream something has been deleted from dumps
+        // with eight bytes of ones here and reports a null `entries-read`.
+        put_len(out, group.entries_read().unwrap_or(u64::MAX));
+
+        // The whole ledger first and the consumers after it, so a reader meets
+        // an entry before it meets whoever is holding it. That is not an
+        // accident of the format: it is what lets an entry nobody holds be
+        // written at all.
+        put_len(out, group.pending_len() as u64);
+        for (id, nack) in group.pending_all() {
+            out.extend_from_slice(&id.to_bytes());
+            put_millis(out, nack.time() as i64);
+            put_len(out, nack.count());
+        }
+
+        put_len(out, group.consumers().count() as u64);
+        for c in group.consumers() {
+            put_str(out, c.name());
+            put_millis(out, c.seen() as i64);
+            // Minus one for a consumer that has never had anything, which is
+            // what `XINFO CONSUMERS` on a real server reports for one made by
+            // `XGROUP CREATECONSUMER` and never read from.
+            put_millis(out, c.active().map_or(-1, |at| at as i64));
+            put_len(out, c.len() as u64);
+            for id in c.pending() {
+                out.extend_from_slice(&id.to_bytes());
+            }
+        }
+    }
+}
+
+/// An entry ID, as the two lengths a stream writes everywhere but a rax key.
+fn put_id(out: &mut Vec<u8>, id: Id) {
+    put_len(out, id.ms);
+    put_len(out, id.seq);
+}
+
+/// A time, which a stream writes as eight signed little endian bytes.
+///
+/// Signed because minus one is a value the format uses, for a consumer that has
+/// never read anything.
+fn put_millis(out: &mut Vec<u8>, at: i64) {
+    out.extend_from_slice(&at.to_le_bytes());
 }
 
 /// A length, in the smallest of the four forms that holds it.
@@ -536,7 +618,19 @@ impl<'a> Reader<'a> {
     ///
     /// Zero is refused with it, for the reason [`non_empty`] gives.
     fn count(&mut self) -> Result<usize, Bad> {
-        let n = non_empty(self.len()?)?;
+        non_empty(self.bounded()?)
+    }
+
+    /// The same bound without the empty rule.
+    ///
+    /// A stream has four counts that are allowed to be zero and every one of
+    /// them is an ordinary state rather than a payload nobody could have
+    /// produced. It holds no nodes at all once everything in it has been
+    /// deleted, and a real server dumps that and restores it as a live stream of
+    /// length zero. It can have no consumer groups, a group can have nothing
+    /// pending, and a consumer can be holding nothing.
+    fn bounded(&mut self) -> Result<usize, Bad> {
+        let n = self.len()?;
         if n > self.buf.len() - self.at {
             return Err(Bad::Format);
         }
@@ -545,10 +639,38 @@ impl<'a> Reader<'a> {
 
     /// A length, refusing the `11` forms that are not lengths at all.
     fn len(&mut self) -> Result<usize, Bad> {
+        usize::try_from(self.num()?).map_err(|_| Bad::Format)
+    }
+
+    /// A number written in the length encoding, which is how a stream writes
+    /// every counter it has and both halves of almost every ID.
+    ///
+    /// Separate from [`Reader::len`] because a stream's numbers are not lengths
+    /// and are routinely past what a `usize` has to hold: a millisecond
+    /// timestamp is one, and an unknown `entries-read` is written as the whole
+    /// sixty four bits set.
+    fn num(&mut self) -> Result<u64, Bad> {
         match self.len_or_encoding()? {
-            (n, false) => usize::try_from(n).map_err(|_| Bad::Format),
+            (n, false) => Ok(n),
             (_, true) => Err(Bad::Format),
         }
+    }
+
+    /// An entry ID, as the two lengths a stream writes almost everywhere.
+    fn id(&mut self) -> Result<Id, Bad> {
+        Ok(Id::new(self.num()?, self.num()?))
+    }
+
+    /// An entry ID as the sixteen big endian bytes a pending list writes.
+    fn raw_id(&mut self) -> Result<Id, Bad> {
+        let b = self.take(16)?;
+        Ok(Id::from_bytes(b.try_into().expect("sixteen bytes")))
+    }
+
+    /// A time, which a stream writes as eight signed little endian bytes.
+    fn millis(&mut self) -> Result<i64, Bad> {
+        let b = self.take(8)?;
+        Ok(i64::from_le_bytes(b.try_into().expect("eight bytes")))
     }
 
     /// A length, and whether it was one of the special encodings instead.
@@ -712,6 +834,9 @@ pub(crate) fn load(payload: &[u8], limits: Limits<'_>, now: u64) -> Result<Body,
         T_HASH_METADATA => read_hash_metadata(&mut r, limits.hash, now)?,
         T_HASH_LISTPACK => read_hash_listpack(&mut r, limits.hash, false, now)?,
         T_HASH_LISTPACK_EX => read_hash_listpack(&mut r, limits.hash, true, now)?,
+        T_STREAM_LISTPACKS | T_STREAM_LISTPACKS_2 | T_STREAM_LISTPACKS_3 | T_STREAM_LISTPACKS_4 => {
+            read_stream(&mut r, kind)?
+        }
         _ => return Err(Bad::Format),
     };
     // Trailing bytes mean the payload was not what it said it was, even though
@@ -957,6 +1082,162 @@ fn read_hash_listpack(
     Ok(Body::Hash(hash))
 }
 
+/// A stream, in whichever of the four types it arrived as.
+///
+/// The nodes go straight in, since a payload's listpack is the blob this holds
+/// anyway, and the rest of the payload is read into the counters and the groups
+/// around them. Everything is checked on the way rather than trusted, because a
+/// `RESTORE` takes these bytes from a client.
+///
+/// The four types are the same format with pieces added on the end of it, so
+/// what varies is which fields are there and not where anything is:
+///
+/// ```text
+/// 15  the nodes, the length and the last ID
+/// 19  and the first ID, the deleted high water mark, the two read counters
+/// 21  and a consumer's active time as well as its seen time
+/// 27  and a per group field and a stream wide idempotency block
+/// ```
+///
+/// The three fields 15 does not carry are worked out rather than left empty,
+/// which is what Redis does with the same payload. There is nothing above the
+/// oldest entry that has been deleted, since a type 15 payload has no way to say
+/// there was, and everything that is there was added, since a stream that has
+/// been trimmed cannot say so either. Both are the honest reading of a format
+/// that predates the question.
+fn read_stream(r: &mut Reader<'_>, kind: u8) -> Result<Body, Bad> {
+    let edges = kind != T_STREAM_LISTPACKS;
+    let active = kind == T_STREAM_LISTPACKS_3 || kind == T_STREAM_LISTPACKS_4;
+    let mut s = Stream::new();
+
+    let nodes = r.bounded()?;
+    for _ in 0..nodes {
+        let key = r.str()?;
+        let key: [u8; 16] = key.as_ref().try_into().map_err(|_| Bad::Format)?;
+        let blob = r.str()?;
+        let lp = Listpack::from_bytes(&blob).map_err(|_| Bad::Format)?;
+        // A node with nothing in it has no master entry, so every walk over it
+        // would stop on the first read and the stream would be holding bytes
+        // that answer nothing. Redis refuses the same node for the same reason.
+        if lp.is_empty() || !s.push_raw_node(Id::from_bytes(key), lp) {
+            return Err(Bad::Format);
+        }
+    }
+
+    let length = r.num()?;
+    let last = r.id()?;
+    let (max_deleted, added) = if edges {
+        // The first ID is read and dropped. It is the oldest entry that is still
+        // there, which the nodes already say, and taking the payload's word for
+        // it would let a wrong one disagree with what a range walk finds.
+        let _first = r.id()?;
+        (r.id()?, r.num()?)
+    } else {
+        (Id::MIN, length)
+    };
+    if !s.set_counters(length, last, max_deleted, added) {
+        return Err(Bad::Format);
+    }
+
+    let groups = r.bounded()?;
+    for _ in 0..groups {
+        let name = r.str()?.into_owned();
+        let last = r.id()?;
+        // Minus one is how the format says the count is not known, and it is not
+        // a count that happens to be enormous.
+        let read = match edges {
+            true => match r.num()? {
+                u64::MAX => None,
+                n => Some(n),
+            },
+            false => None,
+        };
+        let mut group = Group::new(last, read);
+
+        let pending = r.bounded()?;
+        for _ in 0..pending {
+            let id = r.raw_id()?;
+            let time = r.millis()?.max(0) as u64;
+            let count = r.num()?;
+            if !group.restore_nack(id, time, count) {
+                return Err(Bad::Format);
+            }
+        }
+
+        let consumers = r.bounded()?;
+        for _ in 0..consumers {
+            let name = r.str()?.into_owned();
+            let seen = r.millis()?.max(0) as u64;
+            // Before type 21 there was one time and it stood for both, which is
+            // what Redis fills in when it reads an older payload.
+            let at = if active { r.millis()? } else { seen as i64 };
+            let Some(slot) = group.restore_consumer(&name, seen, (at >= 0).then_some(at as u64))
+            else {
+                return Err(Bad::Format);
+            };
+            let held = r.bounded()?;
+            for _ in 0..held {
+                let id = r.raw_id()?;
+                if !group.restore_owner(id, slot) {
+                    return Err(Bad::Format);
+                }
+            }
+        }
+        if kind == T_STREAM_LISTPACKS_4 {
+            skip_group_idmp(r)?;
+        }
+        if !s.push_group(&name, group) {
+            return Err(Bad::Format);
+        }
+    }
+    if kind == T_STREAM_LISTPACKS_4 {
+        skip_idmp(r)?;
+    }
+    Ok(Body::Stream(s))
+}
+
+/// The group's half of the idempotency block a Redis 8.10 writes.
+///
+/// One count, and it is zero in every payload a real server has been seen to
+/// produce. Read and dropped, for the reason [`skip_idmp`] gives.
+fn skip_group_idmp(r: &mut Reader<'_>) -> Result<(), Bad> {
+    if r.num()? != 0 {
+        return Err(Bad::Format);
+    }
+    Ok(())
+}
+
+/// The idempotency block a Redis 8.10 puts on the end of a stream.
+///
+/// Producer IDs are a thing this server does not track at all, so what is here
+/// is read to find the end of the payload and then dropped. Dropping it is a
+/// divergence and is registered as one, and it is a smaller one than it sounds:
+/// a payload only ever carries the producer names and never any of the IDs
+/// recorded against them, so a real Redis loading its own `DUMP` comes back with
+/// `pids-tracked` and `iids-tracked` both at zero as well. Checked on 8.10.1 by
+/// recording two IDs under one producer, dumping, restoring the payload under
+/// another key and asking.
+///
+/// The two counts that must be zero are refused rather than skipped when they
+/// are not. Nothing has been seen to write one, so what follows a nonzero count
+/// is not something that can be read off a server, and guessing it would be
+/// inventing a format instead of reading one. Refusing says so out loud, where a
+/// skip would quietly turn the rest of the payload into nonsense.
+fn skip_idmp(r: &mut Reader<'_>) -> Result<(), Bad> {
+    let _duration = r.num()?;
+    let _maxsize = r.num()?;
+    let producers = r.bounded()?;
+    for _ in 0..producers {
+        let _name = r.str()?;
+        if r.num()? != 0 {
+            return Err(Bad::Format);
+        }
+    }
+    let _added = r.num()?;
+    let _duplicates = r.num()?;
+    Ok(())
+}
+
 /// A field's absolute deadline from the header and its stored distance.
 const fn deadline(soonest: u64, ttl: u64) -> Option<u64> {
     if ttl == 0 {
@@ -997,6 +1278,7 @@ fn text<'a>(entry: Entry<'a>, buf: &'a mut [u8; DIGITS_MAX]) -> &'a [u8] {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::stream::Retry;
     use crate::ttl::{Ask, Cond};
 
     fn limits() -> (set::Limits, hash::Limits, list::Limits, zset::Limits) {
@@ -1519,5 +1801,271 @@ mod tests {
             assert_eq!(r.len_or_encoding(), Ok((n, false)), "{n} did not survive");
             assert!(r.done(), "{n} left bytes behind");
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Streams.
+    // -----------------------------------------------------------------------
+
+    /// The stream `sample()` builds, dumped by a Redis 8.10.1 over a socket.
+    ///
+    /// Type 27, which is what a current server writes: `LISTPACKS_3` with a
+    /// count on the end of every group and an idempotency block on the end of
+    /// the stream. Both are zero here and are zero on anything this server can
+    /// hold, since it does not track producer IDs.
+    ///
+    /// The times in it are real times from the machine it was taken on, which is
+    /// the point of hard coding the payload rather than building one: nothing in
+    /// this file gets to pick what a delivery time looks like.
+    const FROM_REDIS: &[u8] = &[
+        0x1b, 0x01, 0x10, 0, 0, 0, 0, 0, 0, 0, 5, 0, 0, 0, 0, 0, 0, 0, 1, 0x40, 0x5f, 0x5f, 0, 0,
+        0, 0x1f, 0, 3, 1, 1, 1, 2, 1, 0x86, b's', b'e', b'n', b's', b'o', b'r', 7, 0x87, b'r',
+        b'e', b'a', b'd', b'i', b'n', b'g', 8, 0, 1, 2, 1, 0, 1, 0, 1, 0x81, b'a', 2, 1, 1, 5, 1,
+        3, 1, 0, 1, 1, 1, 0x81, b'b', 2, 2, 1, 5, 1, 2, 1, 0xc2, 0xb7, 2, 0xdf, 0xff, 2, 0x81,
+        b'c', 2, 3, 1, 5, 1, 0, 1, 0xc3, 0x7f, 2, 0xdf, 0xff, 2, 1, 1, 0x85, b'o', b't', b'h',
+        b'e', b'r', 6, 0x81, b'x', 2, 6, 1, 0xff, 3, 0x43, 0x84, 0, 5, 1, 5, 2, 4, 2, 2, b'g',
+        b'1', 0x42, 0xbc, 0, 0x81, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 2, 0, 0, 0, 0,
+        0, 0, 0, 5, 0, 0, 0, 0, 0, 0, 0, 1, 0x50, 0xe1, 0x0a, 0x66, 0xa0, 1, 0, 0, 1, 0, 0, 0, 0,
+        0, 0, 2, 0xbc, 0, 0, 0, 0, 0, 0, 0, 0, 0x50, 0xe1, 0x0a, 0x66, 0xa0, 1, 0, 0, 1, 2, 5,
+        b'a', b'l', b'i', b'c', b'e', 0x50, 0xe1, 0x0a, 0x66, 0xa0, 1, 0, 0, 0x50, 0xe1, 0x0a,
+        0x66, 0xa0, 1, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 5, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0,
+        2, 0xbc, 0, 0, 0, 0, 0, 0, 0, 0, 3, b'b', b'o', b'b', 0x70, 0xe1, 0x0a, 0x66, 0xa0, 1, 0,
+        0, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0, 0, 2, b'g', b'2', 0x43, 0x84, 0,
+        0x81, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0, 0, 0, 0x40, 0x64, 0x40, 0x64, 0,
+        0, 0, 0x0f, 0, 0x5c, 0x1f, 0xdc, 0xf0, 0xb9, 0x7e, 0x8b, 0x75,
+    ];
+
+    /// When the two deliveries in [`FROM_REDIS`] happened, and when `bob` was
+    /// made a few milliseconds later.
+    const DELIVERED: u64 = 1_788_418_384_208;
+    const MADE: u64 = 1_788_418_384_240;
+
+    /// The stream [`FROM_REDIS`] is a dump of, built here instead.
+    ///
+    /// Four entries with one deleted, two groups, and one of them with two
+    /// consumers where only one has anything. Built by the same commands in the
+    /// same order, so that the two can be compared as values rather than as
+    /// bytes.
+    fn sample() -> Stream {
+        let l = crate::stream::Limits::default();
+        let mut s = Stream::new();
+        s.append(Id::new(5, 1), &[(b"sensor", b"a"), (b"reading", b"1")], l)
+            .expect("the first entry");
+        s.append(Id::new(5, 2), &[(b"sensor", b"b"), (b"reading", b"2")], l)
+            .expect("the second entry");
+        s.append(Id::new(700, 0), &[(b"sensor", b"c"), (b"reading", b"3")], l)
+            .expect("the third entry");
+        s.append(Id::new(900, 0), &[(b"other", b"x")], l)
+            .expect("the fourth entry");
+        assert!(s.delete(Id::new(5, 2)), "the second entry was there");
+
+        s.create_group(b"g1", Id::MIN, None);
+        let g = s.group_mut(b"g1").expect("the group just made");
+        let alice = g.consumer_or_create(b"alice", DELIVERED);
+        g.deliver(alice, Id::new(5, 1), DELIVERED);
+        g.deliver(alice, Id::new(700, 0), DELIVERED);
+        // What the read path does once it knows the read handed something over,
+        // and the reason alice has an active time in the payload while bob,
+        // which was only ever declared, does not.
+        g.touch(alice, DELIVERED, true);
+        // A group over a stream something has been deleted from cannot work out
+        // how far it has read, which is what a real server reports too.
+        g.set_read(None);
+        g.create_consumer(b"bob", MADE);
+
+        s.create_group(b"g2", Id::new(900, 0), None);
+        s.group_mut(b"g2")
+            .expect("the group just made")
+            .set_read(None);
+        s
+    }
+
+    fn loaded(payload: &[u8]) -> Body {
+        let (s, h, l, z) = limits();
+        let all = Limits {
+            set: &s,
+            hash: &h,
+            list: &l,
+            zset: &z,
+        };
+        load(payload, all, 0).expect("a payload that should have loaded")
+    }
+
+    /// The one that matters, because it is the only test here that did not get
+    /// to choose both sides of the comparison.
+    #[test]
+    fn a_stream_a_real_redis_dumped_loads_the_same_stream() {
+        let Body::Stream(back) = loaded(FROM_REDIS) else {
+            panic!("a stream came back as something else");
+        };
+        assert_eq!(back, sample());
+    }
+
+    /// The other direction, and the thing `MIGRATE` needs: what this writes has
+    /// to be what that reads.
+    ///
+    /// Not byte for byte against `FROM_REDIS`, because that is type 27 and this
+    /// writes type 21 on purpose. What is compared is the payload this writes
+    /// against the same payload read back by the reader that already agrees with
+    /// a real server.
+    #[test]
+    fn a_stream_this_wrote_reads_back_as_itself() {
+        let s = sample();
+        let rec = Record::new(Body::Stream(s.clone()), None);
+        let payload = dump(&rec).expect("a stream has an RDB shape");
+        assert_eq!(payload[0], T_STREAM_LISTPACKS_3);
+        let Body::Stream(back) = loaded(&payload) else {
+            panic!("a stream came back as something else");
+        };
+        assert_eq!(back, s);
+    }
+
+    /// A stream everything has been deleted from is still a stream, and a real
+    /// server dumps one and restores it rather than treating it as a deleted
+    /// key the way it does an empty set.
+    #[test]
+    fn an_empty_stream_survives_the_round_trip() {
+        let l = crate::stream::Limits::default();
+        let mut s = Stream::new();
+        s.append(Id::new(1, 1), &[(b"a", b"1")], l)
+            .expect("the only entry");
+        assert!(s.delete(Id::new(1, 1)), "the only entry was there");
+
+        let rec = Record::new(Body::Stream(s.clone()), None);
+        let payload = dump(&rec).expect("a stream has an RDB shape");
+        let Body::Stream(back) = loaded(&payload) else {
+            panic!("a stream came back as something else");
+        };
+        assert_eq!(back, s);
+        assert_eq!(back.len(), 0);
+        assert_eq!(back.last_id(), Id::new(1, 1));
+        assert_eq!(back.max_deleted_id(), Id::new(1, 1));
+        assert_eq!(back.added(), 1);
+    }
+
+    /// The same payload a real server writes for one, checked against the bytes
+    /// rather than against our own writer, since an empty stream is the one
+    /// shape where a count being allowed to be zero could quietly be wrong.
+    #[test]
+    fn an_empty_stream_from_a_real_redis_loads() {
+        let payload: &[u8] = &[
+            0x1b, 0, 0, 1, 1, 0, 0, 1, 1, 1, 0, 0x40, 0x64, 0x40, 0x64, 0, 0, 0, 0x0f, 0, 0x30,
+            0xd1, 0x23, 0xc3, 0x38, 0xd9, 0xd6, 0x40,
+        ];
+        let Body::Stream(back) = loaded(payload) else {
+            panic!("a stream came back as something else");
+        };
+        assert_eq!(back.len(), 0);
+        assert_eq!(back.nodes(), 0);
+        assert_eq!(back.last_id(), Id::new(1, 1));
+        assert_eq!(back.added(), 1);
+    }
+
+    /// An entry `XNACK` handed back sits in the ledger with nobody against it,
+    /// and the format has room for that: the group's pending list is written
+    /// before its consumers, so an entry no consumer claims is simply never
+    /// claimed.
+    #[test]
+    fn a_pending_entry_nobody_holds_survives() {
+        let l = crate::stream::Limits::default();
+        let mut s = Stream::new();
+        s.append(Id::new(1, 1), &[(b"a", b"1")], l)
+            .expect("the only entry");
+        s.create_group(b"g", Id::MIN, Some(0));
+        let g = s.group_mut(b"g").expect("the group just made");
+        let who = g.consumer_or_create(b"c", 100);
+        g.deliver(who, Id::new(1, 1), 100);
+        assert!(g.release(Id::new(1, 1), Retry::Keep), "it was delivered");
+        assert_eq!(g.nacked_len(), 1);
+
+        let rec = Record::new(Body::Stream(s.clone()), None);
+        let payload = dump(&rec).expect("a stream has an RDB shape");
+        let Body::Stream(back) = loaded(&payload) else {
+            panic!("a stream came back as something else");
+        };
+        assert_eq!(back, s);
+        let g = back.group(b"g").expect("the group came back");
+        assert_eq!(g.nacked_len(), 1);
+        assert!(
+            g.nack(Id::new(1, 1))
+                .expect("still pending")
+                .owner()
+                .is_none()
+        );
+    }
+
+    /// Every way a stream payload can be wrong that the reader is meant to
+    /// notice, each one made by breaking a payload that was fine.
+    #[test]
+    fn a_stream_payload_that_does_not_add_up_is_refused() {
+        let rec = Record::new(Body::Stream(sample()), None);
+        let good = dump(&rec).expect("a stream has an RDB shape");
+        let body = &good[..good.len() - FOOTER];
+        let (s, h, l, z) = limits();
+        let all = Limits {
+            set: &s,
+            hash: &h,
+            list: &l,
+            zset: &z,
+        };
+
+        // The type byte, changed to one nothing writes.
+        let mut bent = body.to_vec();
+        bent[0] = 26;
+        assert_eq!(load(&seal(bent), all, 0).unwrap_err(), Bad::Format);
+
+        // A node key that is not sixteen bytes.
+        let mut bent = body.to_vec();
+        bent[2] = 15;
+        assert_eq!(load(&seal(bent), all, 0).unwrap_err(), Bad::Format);
+
+        // Cut short anywhere is short everywhere.
+        for cut in [1, 3, 20, 60, 120, 180] {
+            let bent = body[..cut.min(body.len())].to_vec();
+            assert_eq!(
+                load(&seal(bent), all, 0).unwrap_err(),
+                Bad::Format,
+                "a payload cut at {cut} was accepted"
+            );
+        }
+
+        // Anything extra on the end, which is what a type 27 payload read as a
+        // 21 would look like.
+        let mut bent = body.to_vec();
+        bent.push(0);
+        assert_eq!(load(&seal(bent), all, 0).unwrap_err(), Bad::Format);
+    }
+
+    /// The idempotency block is dropped rather than read, and the payload it is
+    /// on still has to end exactly where it says it does.
+    #[test]
+    fn the_idempotency_block_is_read_past_and_not_kept() {
+        let Body::Stream(back) = loaded(FROM_REDIS) else {
+            panic!("a stream came back as something else");
+        };
+        // Nothing here holds a producer ID, so there is nothing to check on the
+        // value. What the test is for is that the payload was consumed to the
+        // last byte, which `load` only accepts when it was.
+        assert_eq!(back.len(), 3);
+
+        // A producer with an ID recorded against it is a shape no `DUMP` has
+        // been seen to write, and reading past it would be guessing.
+        let body = &FROM_REDIS[..FROM_REDIS.len() - FOOTER];
+        let at = body.len() - 3;
+        assert_eq!(
+            &body[at..],
+            &[0, 0, 0],
+            "the producer count and the two totals"
+        );
+        let mut bent = body.to_vec();
+        bent[at] = 1;
+        let (s, h, l, z) = limits();
+        let all = Limits {
+            set: &s,
+            hash: &h,
+            list: &l,
+            zset: &z,
+        };
+        assert_eq!(load(&seal(bent), all, 0).unwrap_err(), Bad::Format);
     }
 }
