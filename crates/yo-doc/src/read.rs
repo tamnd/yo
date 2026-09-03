@@ -296,6 +296,24 @@ impl<'a> Value<'a> {
         off.checked_add(last.encoded_len_at(depth + 1)?)
     }
 
+    /// Where this value begins inside `root`, in bytes.
+    ///
+    /// A child is its parent's slice from the child's offset, so the offset is
+    /// still there to be read back off the slice itself and nothing has to be
+    /// carried alongside it. This is how a write identifies the places a path
+    /// matched: [`Path::select`](crate::Path::select) answers values, and a
+    /// value plus the document it came out of is an offset, which is what
+    /// [`edit`](crate::edit()) takes.
+    ///
+    /// `None` if this value did not come out of `root`.
+    #[must_use]
+    pub fn offset_in(&self, root: &Value<'_>) -> Option<usize> {
+        let here = self.b.as_ptr() as usize;
+        let base = root.b.as_ptr() as usize;
+        let off = here.checked_sub(base)?;
+        (off < root.b.len()).then_some(off)
+    }
+
     /// This value's bytes and nothing after them.
     #[must_use]
     pub fn as_bytes(&self) -> Option<&'a [u8]> {
