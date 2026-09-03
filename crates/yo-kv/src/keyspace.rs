@@ -1609,6 +1609,17 @@ impl Keyspace {
                     false
                 }
             },
+            Kind::Stream => match self.streams.get(slot) {
+                Some(body) if body.memory_bytes() > grows_by => {
+                    body.freeze(buf);
+                    true
+                }
+                Some(_) => false,
+                None => {
+                    debug_assert!(false, "a stream record with no stream behind it");
+                    false
+                }
+            },
             _ => {
                 debug_assert!(false, "a kind `moves` said yes to and this does not know");
                 false
@@ -1637,6 +1648,9 @@ impl Keyspace {
             }
             Kind::Array => {
                 self.arrays.remove(slot);
+            }
+            Kind::Stream => {
+                self.streams.remove(slot);
             }
             _ => debug_assert!(false, "freeing a slot in a slab that was never found"),
         }
@@ -1742,6 +1756,13 @@ impl Keyspace {
                         .with_detail(e.to_string())
                 })?;
                 self.arrays.insert(array)
+            }
+            Kind::Stream => {
+                let stream = Stream::thaw(&self.frozen).map_err(|e| {
+                    Error::new(Code::Corrupt, "a demoted stream did not read back")
+                        .with_detail(e.to_string())
+                })?;
+                self.streams.insert(stream)
             }
             // Nothing else is written cold with a body yet, so arriving here
             // means a record that says one thing and a demoter that did another.
@@ -2390,7 +2411,7 @@ impl Keyspace {
 const fn moves(kind: Kind) -> bool {
     matches!(
         kind,
-        Kind::Set | Kind::Hash | Kind::List | Kind::Zset | Kind::Array
+        Kind::Set | Kind::Hash | Kind::List | Kind::Zset | Kind::Array | Kind::Stream
     )
 }
 

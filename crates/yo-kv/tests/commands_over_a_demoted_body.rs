@@ -7,8 +7,10 @@
 //! it had, in the representation it had them in, the hash answers `HGET`, `HLEN`
 //! and the `HEXPIRE` family the same way, the list answers `LLEN`, `LINDEX` and
 //! a push at either end, the sorted set answers `ZSCORE` and `ZRANK` with the
-//! order it went out in, and the array answers `ARGET` and `ARINFO` with the
-//! values and the shape it had.
+//! order it went out in, the array answers `ARGET` and `ARINFO` with the values
+//! and the shape it had, and the stream answers `XLEN`, `XRANGE` and
+//! `XREADGROUP` with its entries and with every group still holding what it was
+//! holding.
 //!
 //! The store is a vector that counts its reads, as in the string file and for
 //! the same reason: reads per command is what G9 is a gate on, and a set that
@@ -19,6 +21,8 @@ use std::rc::Rc;
 
 use yo_common::{Addr, Code, Error, Result, Space};
 use yo_kv::cold::Blocks;
+use yo_kv::stream::Id;
+use yo_kv::streams::{Add, From, Read, Start, Trim};
 use yo_kv::ttl::{Ask, Cond};
 use yo_kv::zsets::{Query, ZAdd};
 use yo_kv::{End, Keyspace, array, hash, list, set, zset};
@@ -179,6 +183,50 @@ fn arget(k: &mut Keyspace, key: &[u8], at: u64) -> Option<Vec<u8>> {
     })
     .expect("asked");
     got
+}
+
+/// A database holding `key` as a stream of `n` entries with a group that has
+/// read half of them, already on the file.
+fn cold_stream(key: &[u8], n: u64) -> (Keyspace, Rc<Cell<usize>>) {
+    let (mut k, reads) = db();
+    for ms in 1..=n {
+        let job = format!("job:{ms:05}").into_bytes();
+        let fields: [(&[u8], &[u8]); 2] = [(b"job", job.as_slice()), (b"where", b"a queue")];
+        k.xadd(
+            key,
+            Add::At(Id::new(ms, 0)),
+            &fields,
+            Trim::None,
+            true,
+            1_000,
+        )
+        .expect("added");
+    }
+    k.xgroup_create(key, b"workers", Start::At(Id::MIN), false, Some(0))
+        .expect("made");
+    let want = Read {
+        group: b"workers",
+        consumer: b"alice",
+        from: From::New,
+        count: Some((n / 2) as usize),
+        noack: false,
+    };
+    k.xreadgroup_into(key, want, 2_000, |_, _| true)
+        .expect("read");
+    assert!(k.demote(key).expect("demoted"), "the body should have gone");
+    reads.set(0);
+    (k, reads)
+}
+
+/// The IDs a range over the whole stream hands back.
+fn xrange(k: &mut Keyspace, key: &[u8]) -> Vec<Id> {
+    let mut out = Vec::new();
+    k.xrange_into(key, Id::MIN, Id::MAX, None, false, |id, _| {
+        out.push(id);
+        true
+    })
+    .expect("walked");
+    out
 }
 
 /// What `HGET` answers, as bytes.
@@ -775,6 +823,131 @@ fn deleting_a_demoted_array_does_not_free_somebody_elses_slab_slot() {
 }
 
 #[test]
+fn a_demoted_stream_answers_xlen_and_xrange_with_what_it_held() {
+    let (mut k, _) = cold_stream(b"x", 400);
+    assert_eq!(k.stream(b"x").expect("asked").expect("there").len(), 400);
+    let ids = xrange(&mut k, b"x");
+    assert_eq!(ids.len(), 400);
+    assert_eq!(ids[0], Id::new(1, 0));
+    assert_eq!(ids[399], Id::new(400, 0));
+
+    let mut seen = Vec::new();
+    k.xrange_into(b"x", Id::new(42, 0), Id::new(42, 0), None, false, |_, f| {
+        seen = f.map(|(name, v)| (name.to_vec(), v.to_vec())).collect();
+        true
+    })
+    .expect("walked");
+    assert_eq!(
+        seen,
+        vec![
+            (b"job".to_vec(), b"job:00042".to_vec()),
+            (b"where".to_vec(), b"a queue".to_vec())
+        ]
+    );
+}
+
+#[test]
+fn bringing_a_stream_back_costs_one_pass_and_then_nothing() {
+    let (mut k, reads) = cold_stream(b"x", 400);
+    assert_eq!(k.stream(b"x").expect("asked").expect("there").len(), 400);
+    let first = reads.get();
+    assert!(first > 0, "the body was on the file");
+    for _ in 0..50 {
+        k.stream(b"x").expect("asked");
+        xrange(&mut k, b"x");
+    }
+    assert_eq!(reads.get(), first, "nothing went back to the device");
+}
+
+#[test]
+fn a_demoted_stream_can_be_appended_to_and_the_entry_stays() {
+    let (mut k, _) = cold_stream(b"x", 100);
+    let fields: [(&[u8], &[u8]); 1] = [(b"job", b"the new one")];
+    assert_eq!(
+        k.xadd(b"x", Add::Auto, &fields, Trim::None, false, 900_000)
+            .expect("added"),
+        Some(Id::new(900_000, 0))
+    );
+    assert_eq!(k.stream(b"x").expect("asked").expect("there").len(), 101);
+    assert_eq!(
+        k.stream(b"x").expect("asked").expect("there").last_id(),
+        Id::new(900_000, 0)
+    );
+    assert_eq!(
+        k.xdel(b"x", [Id::new(1, 0)].into_iter()).expect("deleted"),
+        1
+    );
+    assert_eq!(k.stream(b"x").expect("asked").expect("there").len(), 100);
+}
+
+#[test]
+fn a_demoted_stream_keeps_its_group_and_who_is_holding_what() {
+    let (mut k, _) = cold_stream(b"x", 100);
+    {
+        let s = k.stream(b"x").expect("asked").expect("there");
+        let g = s.group(b"workers").expect("the group");
+        assert_eq!(g.pending_len(), 50);
+        assert_eq!(g.last_id(), Id::new(50, 0));
+        assert_eq!(g.entries_read(), Some(50));
+        assert_eq!(g.consumer_named(b"alice").expect("alice").len(), 50);
+    }
+    // And the group carries on from where it was, rather than from the start.
+    let want = Read {
+        group: b"workers",
+        consumer: b"bob",
+        from: From::New,
+        count: Some(3),
+        noack: false,
+    };
+    let mut got = Vec::new();
+    k.xreadgroup_into(b"x", want, 3_000, |id, _| {
+        got.push(id);
+        true
+    })
+    .expect("read")
+    .expect("the group");
+    assert_eq!(got, vec![Id::new(51, 0), Id::new(52, 0), Id::new(53, 0)]);
+    assert_eq!(
+        k.xack(
+            b"x",
+            b"workers",
+            [Id::new(1, 0), Id::new(51, 0)].into_iter()
+        )
+        .expect("acked"),
+        2
+    );
+}
+
+#[test]
+fn a_demoted_stream_keeps_the_word_object_encoding_answers() {
+    let (mut k, _) = cold_stream(b"x", 100);
+    assert_eq!(k.encoding_name(b"x"), Some("stream"));
+    assert_eq!(k.stream(b"x").expect("asked").expect("there").len(), 100);
+}
+
+#[test]
+fn deleting_a_demoted_stream_does_not_free_somebody_elses_slab_slot() {
+    let (mut k, _) = cold_stream(b"cold", 100);
+    for ms in 1..=100u64 {
+        let job = format!("job:{ms:05}").into_bytes();
+        let fields: [(&[u8], &[u8]); 1] = [(b"job", job.as_slice())];
+        k.xadd(
+            b"warm",
+            Add::At(Id::new(ms, 0)),
+            &fields,
+            Trim::None,
+            true,
+            1_000,
+        )
+        .expect("added");
+    }
+    k.del(b"cold");
+    assert_eq!(k.stream(b"warm").expect("asked").expect("there").len(), 100);
+    assert_eq!(xrange(&mut k, b"warm").len(), 100);
+    assert!(k.stream(b"cold").expect("asked").is_none());
+}
+
+#[test]
 fn a_sweep_moves_collection_bodies_and_the_memory_goes_down() {
     let (mut k, _) = db();
     let pairs = fields(200);
@@ -805,6 +978,19 @@ fn a_sweep_moves_collection_bodies_and_the_memory_goes_down() {
             k.arset(key.as_bytes(), at as u64 * 7, [m.as_slice()].into_iter())
                 .expect("set");
         }
+        let key = format!("stream:{i}");
+        for (at, (_, m)) in ranked.iter().enumerate() {
+            let fields: [(&[u8], &[u8]); 1] = [(b"job", m.as_slice())];
+            k.xadd(
+                key.as_bytes(),
+                Add::At(Id::new(at as u64 + 1, 0)),
+                &fields,
+                Trim::None,
+                true,
+                1_000,
+            )
+            .expect("added");
+        }
     }
     let before = k.memory_bytes();
     let relief = k.relieve(usize::MAX).expect("swept");
@@ -828,6 +1014,15 @@ fn a_sweep_moves_collection_bodies_and_the_memory_goes_down() {
         assert_eq!(k.zcard(key.as_bytes()).expect("counted"), 200, "{key}");
         let key = format!("array:{i}");
         assert_eq!(k.arcount(key.as_bytes()).expect("counted"), 200, "{key}");
+        let key = format!("stream:{i}");
+        assert_eq!(
+            k.stream(key.as_bytes())
+                .expect("asked")
+                .expect("there")
+                .len(),
+            200,
+            "{key}"
+        );
     }
 }
 

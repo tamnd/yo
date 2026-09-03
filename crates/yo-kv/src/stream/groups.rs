@@ -61,9 +61,10 @@
 //! no hashing with it. A slot is never reused while the group lives, so the
 //! index a NACK holds stays valid.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 use super::Id;
+use crate::frozen::{self, Broken};
 
 /// Which pending entries a caller wants, which is every filter `XPENDING` takes.
 ///
@@ -740,6 +741,126 @@ impl Group {
         None
     }
 
+    /// Write the group out as bytes, for [`super::Stream::freeze`].
+    ///
+    /// The consumer slots go out including the empty ones, because a slot is
+    /// emptied on deletion and never reused and a NACK names its owner by slot
+    /// number. Renumbering them on the way through would hand every pending
+    /// entry to the wrong consumer.
+    ///
+    /// What each consumer is holding is not written. It is a partition of the
+    /// pending list by owner, so it is rebuilt from the pending list on the way
+    /// back in and the two cannot come back disagreeing.
+    pub(super) fn freeze(&self, out: &mut Vec<u8>) {
+        frozen::put_uint(out, self.last.ms);
+        frozen::put_uint(out, self.last.seq);
+        put_opt(out, self.read);
+
+        frozen::put_uint(out, self.consumers.len() as u64);
+        for slot in &self.consumers {
+            match slot {
+                None => out.push(0),
+                Some(c) => {
+                    out.push(1);
+                    frozen::put_bytes(out, &c.name);
+                    frozen::put_uint(out, c.seen);
+                    put_opt(out, c.active);
+                }
+            }
+        }
+
+        frozen::put_uint(out, self.pending.len() as u64);
+        for (id, nack) in &self.pending {
+            frozen::put_uint(out, id.ms);
+            frozen::put_uint(out, id.seq);
+            frozen::put_uint(out, nack.time);
+            frozen::put_uint(out, nack.count);
+            // The owner goes out as itself rather than as an index with a spare
+            // value for nobody, because [`Nack::NOBODY`] already is one.
+            frozen::put_uint(out, u64::from(nack.owner));
+        }
+    }
+
+    /// Read back a group [`Group::freeze`] wrote.
+    pub(super) fn thaw(cut: &mut frozen::Cut<'_>) -> Result<Group, Broken> {
+        let last = Id::new(cut.uint()?, cut.uint()?);
+        let read = take_opt(cut)?;
+
+        let n = usize::try_from(cut.uint()?).map_err(|_| Broken::Short)?;
+        // A slot is a byte at the very least, so a count past what is left is a
+        // short body and not a reason to reserve that many.
+        if n > cut.rest().len() {
+            return Err(Broken::Short);
+        }
+        let mut consumers: Vec<Option<Consumer>> = Vec::with_capacity(n);
+        let mut names = HashSet::with_capacity(n);
+        for _ in 0..n {
+            match cut.byte()? {
+                0 => consumers.push(None),
+                1 => {
+                    let name = cut.bytes()?;
+                    // Two consumers under one name would make every lookup find
+                    // the first and leave the second unreachable, holding
+                    // entries nothing can claim back.
+                    if !names.insert(name) {
+                        return Err(Broken::Body);
+                    }
+                    consumers.push(Some(Consumer {
+                        name: name.to_vec(),
+                        seen: cut.uint()?,
+                        active: take_opt(cut)?,
+                        pending: BTreeSet::new(),
+                    }));
+                }
+                _ => return Err(Broken::Body),
+            }
+        }
+
+        let n = usize::try_from(cut.uint()?).map_err(|_| Broken::Short)?;
+        // Five numbers each, so one byte apiece is already generous.
+        if n > cut.rest().len() {
+            return Err(Broken::Short);
+        }
+        let mut group = Group {
+            last,
+            read,
+            pending: BTreeMap::new(),
+            consumers,
+            nacked: 0,
+        };
+        let mut prev = None;
+        for _ in 0..n {
+            let id = Id::new(cut.uint()?, cut.uint()?);
+            // Written in ID order out of a map, so anything else is bytes that
+            // did not come from `freeze`, and a repeat would silently drop an
+            // entry somebody is holding.
+            if prev.is_some_and(|p| p >= id) {
+                return Err(Broken::Body);
+            }
+            prev = Some(id);
+            let nack = Nack {
+                time: cut.uint()?,
+                count: cut.uint()?,
+                owner: u32::try_from(cut.uint()?).map_err(|_| Broken::Body)?,
+            };
+            if nack.owner == Nack::NOBODY {
+                group.nacked += 1;
+            } else {
+                match group.consumers.get_mut(nack.owner as usize) {
+                    Some(Some(c)) => {
+                        c.pending.insert(id);
+                    }
+                    // An owner that is off the end or an emptied slot would be
+                    // an entry held by a consumer that cannot be named, so
+                    // neither `XPENDING` nor a claim would ever reach it.
+                    _ => return Err(Broken::Body),
+                }
+            }
+            group.pending.insert(id, nack);
+        }
+        Ok(group)
+    }
+
     /// How many bytes this group takes, not counting the struct itself.
     ///
     /// The pending map is counted per entry at the size of a key and a value
@@ -764,6 +885,31 @@ impl Group {
             })
             .sum();
         pending + consumers
+    }
+}
+
+/// Append a count that may not be known, as a flag byte and then the number.
+///
+/// A byte rather than the usual trick of writing one more than the number and
+/// keeping zero for nothing, because both of the counts this is used for are a
+/// `u64` and adding one to the top of the range wraps. The flag costs a byte
+/// and is right everywhere.
+fn put_opt(out: &mut Vec<u8>, v: Option<u64>) {
+    match v {
+        None => out.push(0),
+        Some(n) => {
+            out.push(1);
+            frozen::put_uint(out, n);
+        }
+    }
+}
+
+/// Read back what [`put_opt`] wrote.
+fn take_opt(cut: &mut frozen::Cut<'_>) -> Result<Option<u64>, Broken> {
+    match cut.byte()? {
+        0 => Ok(None),
+        1 => Ok(Some(cut.uint()?)),
+        _ => Err(Broken::Body),
     }
 }
 
@@ -1222,6 +1368,49 @@ mod tests {
                 .map(|(name, n)| (name.to_vec(), n))
                 .collect::<Vec<_>>(),
             vec![(b"alice".to_vec(), 1)]
+        );
+    }
+
+    #[test]
+    fn a_frozen_group_with_a_pending_entry_nobody_could_hold_is_refused() {
+        let mut g = group();
+        let slot = g.consumer_or_create(b"alice", 1_000);
+        g.deliver(slot, Id::new(1, 0), 1_000);
+        let mut bytes = Vec::new();
+        g.freeze(&mut bytes);
+        assert_eq!(Group::thaw(&mut frozen::Cut::new(&bytes)), Ok(g));
+
+        // The owner is the last number in the body, and a slot past the end
+        // would be an entry no consumer could ever be told to finish.
+        let mut bad = bytes.clone();
+        *bad.last_mut().expect("a body") = 7;
+        assert_eq!(Group::thaw(&mut frozen::Cut::new(&bad)), Err(Broken::Body));
+
+        for cut in 0..bytes.len() {
+            assert!(
+                Group::thaw(&mut frozen::Cut::new(&bytes[..cut])).is_err(),
+                "cut at {cut}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_frozen_group_that_names_one_consumer_twice_is_refused() {
+        let mut g = group();
+        g.consumer_or_create(b"alice", 1_000);
+        g.consumer_or_create(b"carol", 1_000);
+        let mut bytes = Vec::new();
+        g.freeze(&mut bytes);
+        // Both names are five letters, so one name becomes the other without
+        // the length in front of it moving.
+        let at = bytes
+            .windows(5)
+            .position(|w| w == b"carol")
+            .expect("the second name");
+        bytes[at..at + 5].copy_from_slice(b"alice");
+        assert_eq!(
+            Group::thaw(&mut frozen::Cut::new(&bytes)),
+            Err(Broken::Body)
         );
     }
 }
