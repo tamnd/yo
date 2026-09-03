@@ -21,8 +21,15 @@ yo-format = { workspace = true }
 [dev-dependencies]
 criterion = { workspace = true }
 # Only so that a test can put a real document through the log rather than a
-# blob shaped like one.
-yo-doc = { workspace = true }
+# blob shaped like one. A path and no version, unlike every other dependency
+# here, because this edge closes a cycle: a document holds a key table that
+# comes from `yo-kv`, and `yo-kv`'s own tests reach back into the log. Cargo
+# builds a cycle made of dev dependencies happily enough, but `cargo package`
+# has to put the crates in some order and there is not one, so it packages this
+# crate first and then cannot find `yo-doc` anywhere but crates.io. A dev
+# dependency with no version is left out of the manifest that goes up, which
+# breaks the cycle for the registry and changes nothing here.
+yo-doc = { path = "../yo-doc" }
 
 [[bench]]
 name = "append"
