@@ -1251,6 +1251,19 @@ impl Keyspace {
     /// `volatile-ttl` demotes the ones closest to expiring. See
     /// [`Tier::relieve`] for what a sweep does and where it stops.
     ///
+    /// # Why `noeviction` still moves values
+    ///
+    /// Because it says do not lose data, and moving a value to the file does not
+    /// lose any. The policy is two things at once in Redis, whether to give
+    /// memory back at all and which keys to take it from, and only the second of
+    /// those means anything here. So the default policy picks victims the way
+    /// `allkeys-lru` does and the promise it was set for is kept: every key a
+    /// client stored is still readable afterwards.
+    ///
+    /// The alternative is a server that was given a file, was given a limit, and
+    /// answers writes with OOM until somebody finds the third setting that turns
+    /// the file on. That is a trap and not a default.
+    ///
     /// # Errors
     ///
     /// Whatever the store says when it will not take the bytes.
@@ -1259,7 +1272,11 @@ impl Keyspace {
             return Ok(0);
         }
         let now = self.clock.now_ms();
-        let (policy, lfu) = (self.policy, self.lfu);
+        let policy = match self.policy {
+            Policy::NoEviction => Policy::AllKeysLru,
+            chosen => chosen,
+        };
+        let lfu = self.lfu;
         let budget = self.map.memory_bytes().saturating_sub(shed);
         let tier = self.tier.as_mut().expect("checked just above");
         let moved = tier.relieve(&mut self.map, budget, policy, now, lfu);

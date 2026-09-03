@@ -30,6 +30,15 @@ yo-reader = { workspace = true }
 yo-reactor = { workspace = true }
 yo-resp = { workspace = true }
 
+# `yodb serve --store` is where the memory engine and the file meet. Neither one
+# depends on the other on purpose, so that each can be tested without the other,
+# and a program is what decides to put the two together. This is the program.
+yo-common = { workspace = true }
+yo-file = { workspace = true }
+yo-format = { workspace = true }
+yo-kv = { workspace = true }
+yo-record = { workspace = true }
+
 # `yodb serve` asks the kernel which connections are ready rather than trying
 # every one of them, which is `epoll` on Linux and `kqueue` on macOS.
 [target.'cfg(unix)'.dependencies]
@@ -44,14 +53,6 @@ windows-sys = { workspace = true, features = [
     "Win32_Networking_WinSock",
     "Win32_System_Console",
 ] }
-
-# The tests are the one place both sides are allowed in the same binary. They
-# build real files with the engine and then check them with the tool, which is
-# the only way to find out whether the tool would notice anything.
-[dev-dependencies]
-yo-file = { workspace = true }
-yo-format = { workspace = true }
-yo-record = { workspace = true }
 
 # The executable is `yodb`, not `yo`. `yo` on PATH is Yeoman's, and is Yeoman's
 # on Homebrew core, Chocolatey and the AUR, so shipping `yo` means shipping a

@@ -155,7 +155,13 @@ const MAXSTORE: &str = "maxstore";
 /// A unit that overflows clamps rather than failing, which is upstream's
 /// `ULLONG_MAX` arm. There is no sign: a leading minus is refused before the
 /// digits are read, so `maxmemory -1` is not a very large number.
-fn parse_memory(value: &[u8]) -> Option<u64> {
+///
+/// Public because `yodb serve` takes the same limits on the command line that
+/// `CONFIG SET` takes at runtime, and a server that accepts `100mb` from one and
+/// not the other, or reads it as a different number, is a server that gets
+/// misconfigured. One parser, one answer.
+#[must_use]
+pub fn parse_memory(value: &[u8]) -> Option<u64> {
     let split = value
         .iter()
         .position(|b| !b.is_ascii_digit())
