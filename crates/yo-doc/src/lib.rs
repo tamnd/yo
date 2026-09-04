@@ -117,7 +117,7 @@ pub use head::{COUNT_MAX, DEPTH_MAX, Kind};
 pub use index::{IndexKind, KEY_MAX, Key, PathIndex, Ranged, RangedRev};
 pub use keys::{KEYS_MAX, Keys};
 pub use path::{Step, Steps};
-pub use query::Path;
+pub use query::{Computed, Path};
 pub use read::{Elems, Members, Value, key_order};
 pub use text::{Format, from_json};
 pub use vector::VectorIndex;
