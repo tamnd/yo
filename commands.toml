@@ -79,16 +79,15 @@ doc = "08 section 6"
 [[group]]
 name = "hash"
 expected = 29
-status = "partial"
+status = "shipped"
 doc = "08 section 3"
-# Twenty eight are here and HIMPORT is not. It came with Redis 8.10 along with
-# compact hashes, which is a new encoding that stores the field names once for a
-# family of keys that share a schema rather than once per key. That one is the
-# expensive item out of the whole 8.10 delta, because it is a change to how a
-# hash is stored rather than another command over the same storage, and the
-# saving it goes after is one this project already has a different answer to in
-# the size ladder. Whether it is worth having both is a question for M8 and not
-# one to answer by adding an encoding first.
+# All twenty nine, HIMPORT and its four subcommands included. That one came with
+# Redis 8.10 along with a pair of template encodings that store the field names
+# once for a family of keys sharing a schema rather than once per key. The
+# command is here in full and the encoding is not, because a hash in this engine
+# already interns its field names per collection and the saving is one the size
+# ladder answers a different way. Everything a client can read off a key built
+# this way matches, and the encoding string does not, which is D-45.
 
 [[group]]
 name = "set"
@@ -1522,12 +1521,13 @@ notes = "One answer for the whole list, because FNX and FXX are asked over every
 name = "HIMPORT"
 group = "hash"
 since = "8.10.0"
-arity = -4
+arity = -2
 plan = "whole-value"
 bounded = "risk"
-status = "planned"
-wire = "none"
-notes = "New in 8.10 and not written yet. It builds a whole hash in one call, which is the write side of the compact hash encoding that shipped with it: a server that can store the field names once for a family of keys wants a way to be handed the whole family shape at once rather than a field at a time. The plan is whole-value because it replaces the key rather than editing it, and it is a risk because the size of the write is the size of the argument list."
+status = "shipped"
+wire = "verified"
+divergent = "D-45"
+notes = "A container of four subcommands over one idea. A client about to write a million hashes with the same shape declares the shape once with PREPARE and then sends only the values for each key, so the field names cross the wire once instead of a million times. The fieldsets are connection state and not keyspace state, which is the reference's design and the surprising part of it: a fieldset is invisible to every other connection, RESET throws them all away and SELECT does not, and a key built from one outlives both the fieldset and the connection. Two orders are in play and they are not the same order, because the values on a SET line arrive in the order the fields were declared in and the hash is built in sorted order, and the sort is by length before bytes, so a fieldset of b and aa builds a hash whose first field is b. SET replaces the key rather than editing it, which is what takes the old fields and the old deadline with it, and the lengths are checked before anything is deleted so a call that cannot go through leaves the key alone. WRONGTYPE beats both of the other complaints, so SET against a string is a type error even when the fieldset is missing too. The plan is whole-value because it replaces the key, and it is a risk because the size of the write is the size of the argument list. The storage saving the encoding went after is not here and is D-45."
 
 
 # ---------------------------------------------------------------------- lists
