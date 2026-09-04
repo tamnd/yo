@@ -363,3 +363,24 @@ reason = "A bloom filter, a cuckoo filter, a count min sketch, a vector set, a J
 status = "until"
 resolved_by = "M8"
 spec = "12 section 10"
+
+[[divergence]]
+id = "D-49"
+title = "The decay a top k sketch draws is deterministic here and random on the reference"
+reason = "The structure behind TOPK is heavy keeper, where a bucket already counting something else only gives way at random, and the chance of it giving way is the decay to the power of the count, so a bucket holding a big number is nearly impossible to shift. RedisBloom draws that chance with rand(), from the process wide sequence nobody seeded, which has two consequences a client can see. The same commands sent to the same server twice give different counts: twenty adds of one item and two hundred of another into a single bucket answered 133, 115 and 146 on three runs of one server here. And a replica replaying the same writes ends up with a different sketch from its primary, because it makes its own draws, so TOPK.LIST can name different items on the two of them. This draws from a generator that belongs to the sketch and is advanced by the sketch, seeded from its own shape, so the same writes in the same order always give the same sketch on any machine that replays them, which is what replication and a durable log both need. The distribution is the same one and the structure's guarantee is the same one, and no client can tell which of the two servers produced a given count anyway, since the reference cannot reproduce its own. Everything around the draw is copied exactly, because all of it is deterministic and all of it is observable: MurmurHash2 over thirty two bits, the fingerprint seed of 1919, the bucket taken modulo the width, the rule TOPK.COUNT reads the buckets by, the heap sift and the order TOPK.LIST answers in when counts are equal."
+status = "permanent"
+spec = "11 section 8"
+
+[[divergence]]
+id = "D-50"
+title = "A top k bucket counter stops at the ceiling where the reference wraps"
+reason = "A bucket in the table holds a fingerprint and a thirty two bit count, and a count of zero is what marks the bucket free. The module adds an increment to the count without checking, so a bucket that has been fed about forty three thousand increments of the maximum size wraps through zero and reads as free, and the item it had been counting for is dropped in favour of the next one to hash there, having been the heaviest thing in the sketch a moment earlier. This saturates instead, so the count stops at four billion and stays there. Nothing a client can reasonably do reaches either behaviour, since it takes four billion counted occurrences of one item in one sketch to get near it, and a client that did get there is far better served by a count that is stuck too low than by one that has silently reset. The count min sketch saturates on the reference in the same place for the same reason, which is what CMS: INCRBY overflow is about, so this is the module disagreeing with itself rather than a rule we are breaking."
+status = "permanent"
+spec = "11 section 8"
+
+[[divergence]]
+id = "D-51"
+title = "A top k reply cut short is a shorter array here and a broken one on the reference"
+reason = "TOPK.INCRBY writes its array header from the number of pairs the client sent, then reads and applies one pair at a time, and a bad increment makes it write an error into the array and stop. The header still promises the rest, so a real server sends *3 followed by two elements and the client reads the next command's reply as the third, which is a connection out of step rather than a bad answer, and it is why TOPK.INCRBY k a 1 b -1 c 1 leaves a redis-cli hanging until the next command comes back to fill the hole. The elements written here are the same ones in the same order and the header counts them, so the reply is short and well formed and the client stays in step. The same applies to a NUL in an item's bytes, which is the other half of this row: the module keeps items as C strings and replies with them through a call that stops at the first NUL, so an item added as a NUL b comes back from TOPK.LIST and from an expulsion as a, while the sketch is still counting all three bytes and TOPK.QUERY on all three answers yes. Items are bytes here from end to end and the whole item comes back. A client that sends binary items gets an answer it can match against what it sent instead of one it cannot."
+status = "permanent"
+spec = "11 section 8"

@@ -198,6 +198,20 @@ doc = "11 section 8"
 # its depth in a float.
 
 [[group]]
+name = "topk"
+expected = 7
+status = "shipped"
+doc = "11 section 8"
+# Seven commands and no undocumented eighth. This is the one sketch family that
+# keeps the items rather than only counting them, so it is the one that can
+# answer what the commonest things were rather than how often a named thing
+# happened. The structure is heavy keeper, and the hash, the fingerprint seed,
+# the bucket arithmetic, the heap sift and the order TOPK.LIST comes out in are
+# all copied from the module. The decay draw is not, because the module draws it
+# from rand() and so does not agree with itself between two runs of the same
+# commands, which is D-49.
+
+[[group]]
 name = "stream"
 expected = 20
 status = "partial"
@@ -3251,6 +3265,89 @@ bounded = "inherent"
 status = "shipped"
 wire = "verified"
 notes = "Three fields, and they are three separate keys and not a nested one, so the reply is six elements on RESP2 and a map of three on RESP3. No field argument: asking for one is an arity error. The count is the running total the increments added up to and it is signed, so a sketch that has been fed enough reports a negative one."
+
+
+# ------------------------------------------------------------------------ topk
+
+[[command]]
+name = "TOPK.RESERVE"
+group = "topk"
+since = "2.0.0"
+arity = -3
+plan = "whole-value"
+bounded = "risk"
+status = "shipped"
+wire = "verified"
+divergent = "D-47"
+notes = "Three arguments or six and nothing in between, so a reserve with a width and a depth but no decay is a wrong arity rather than a defaulted decay. The defaults are a width of eight and a depth of seven, which is fifty six buckets and is small enough that anything past a handful of distinct items collides, and the risk on the row is that the whole table is allocated here before a single item has been counted. The key is looked at before the arguments are, so a k of zero at a key that is already there is key already exists and not invalid k. A sketch past a gibibyte is refused with the module's own out of memory sentence, which is the D-47 cap the count min sketch is on, and that sentence is the one error in the family that carries an ERR prefix because the module wrote the prefix into the string."
+
+[[command]]
+name = "TOPK.ADD"
+group = "topk"
+since = "2.0.0"
+arity = -3
+plan = "point"
+bounded = "inherent"
+status = "shipped"
+wire = "verified"
+divergent = "D-49"
+notes = "One occurrence of each item, and one reply an item: a null when the kept set did not change and the name of the item that lost its place when it did. Depth buckets are touched and a bucket held by something else only gives way at random, which is what stops a run of rare items from pushing a common one out, and the draw behind that is deterministic here and random on the reference, which is D-49. An item whose bytes contain a NUL comes back whole here and truncated there, which is D-51."
+
+[[command]]
+name = "TOPK.INCRBY"
+group = "topk"
+since = "2.0.0"
+arity = -4
+plan = "point"
+bounded = "inherent"
+status = "shipped"
+wire = "verified"
+divergent = "D-51"
+notes = "Item and increment pairs, read and applied one at a time, so a bad increment in the middle leaves every pair before it counted. That is the opposite of CMS.INCRBY, which parses the whole command before it applies any of it, and the difference is the module's rather than ours. An increment is a whole number from zero to a hundred thousand and zero is legal, which puts an item in the kept set with a count of nothing, where TOPK.QUERY answers one and TOPK.LIST does not show it. The reference writes an array header counting every pair and then stops at the bad one, which leaves the connection reading the next reply as the rest of this one, and this counts what it actually wrote, which is D-51."
+
+[[command]]
+name = "TOPK.QUERY"
+group = "topk"
+since = "2.0.0"
+arity = -3
+plan = "point"
+bounded = "inherent"
+status = "shipped"
+wire = "verified"
+notes = "Whether each item is one of the ones being kept, which is a walk of the k slots and not a look at the buckets, so an item the sketch has counted plenty of times answers no if something heavier took its slot. A bool an item on RESP3 and an integer an item on RESP2, and a missing key is an error rather than a row of zeros."
+
+[[command]]
+name = "TOPK.COUNT"
+group = "topk"
+since = "2.0.0"
+arity = -3
+plan = "point"
+bounded = "inherent"
+status = "shipped"
+wire = "verified"
+notes = "The largest count across the rows whose fingerprint matches, which is the other way round from a count min sketch and is right for this structure: a bucket shared with a heavier item has been decayed rather than added to, so the small readings are the wrong ones. A bucket reading below the smallest kept count is left out for an item the heap is keeping. The module's own documentation calls this reply approximate and warns it can be well under the truth, which it can, and an integer an item on both protocols."
+
+[[command]]
+name = "TOPK.LIST"
+group = "topk"
+since = "2.0.0"
+arity = -2
+plan = "whole-value"
+bounded = "inherent"
+status = "shipped"
+wire = "verified"
+notes = "The kept items heaviest first, with counts beside them if WITHCOUNT is there. The keyword is compared against as many characters as the client sent, so every prefix of it turns the counts on including the empty string, and only a longer word or a different one is refused, which is a strncasecmp with the wrong length in the module and is copied because it is observable. The keyword is checked before the key exists, so a list of a missing key with a bad keyword complains about the keyword. Items with equal counts come out in the order the heap holds them rather than the order they arrived, and that order is a fact about the sift the module wrote, so the sift is copied quirk for quirk."
+
+[[command]]
+name = "TOPK.INFO"
+group = "topk"
+since = "2.0.0"
+arity = 2
+plan = "metadata"
+bounded = "inherent"
+status = "shipped"
+wire = "verified"
+notes = "Four fields, so eight elements on RESP2 and a map of four on RESP3. The decay goes out through the double reply, which is a comma line on RESP3 and a bulk string of the shortest digits that read back as the same double on RESP2, so a decay of one is 1 and a decay of a billionth is 1e-9. No field argument: asking for one is an arity error."
 
 
 # ---------------------------------------------------------------------- array
