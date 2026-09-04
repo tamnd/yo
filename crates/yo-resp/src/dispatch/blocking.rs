@@ -43,7 +43,7 @@
 //! rule about when to look.
 
 use yo_common::{Code, Error, Result, num};
-use yo_kv::{Db, End, Entry, Keyspace, Member, Movem, ZEnd};
+use yo_kv::{Db, End, Entry, Member, Movem, ZEnd};
 
 use super::args::{self, Args, NOT_AN_INT};
 use super::lists::{BAD_MPOP_COUNT, BAD_NUMKEYS, end_of, movem_options};
@@ -107,7 +107,7 @@ pub(super) fn execute(
         let db = session.db();
         let want = streams::parse_read(spec.name, args, server.db(db), now)?;
         let block = Block::xread(want.keys, want.reads);
-        if block.now(server.db(db), now, out)? {
+        if block.now(server.striped(db), now, out)? {
             return Ok(Flow::Continue);
         }
         let Some(deadline) = want.wait else {
@@ -185,7 +185,7 @@ pub(super) fn execute(
     };
 
     let db = session.db();
-    if block.now(server.db(db), now, out)? {
+    if block.now(server.striped(db), now, out)? {
         return Ok(Flow::Continue);
     }
     server.park(session.id(), db, deadline, block);
@@ -378,7 +378,7 @@ impl Want {
     fn attempt(
         &self,
         keys: &[Vec<u8>],
-        db: &mut Keyspace,
+        db: &mut Db,
         now: u64,
         out: &mut Out,
         strict: bool,
@@ -387,7 +387,10 @@ impl Want {
             // The one arm that needs to know what time it is, because a group
             // read records when each entry was handed out. The other six take
             // an element off a collection and the clock does not come into it.
-            Want::XRead(r) => streams::read(db, keys, r, now, strict, out),
+            // The one arm still on the bridge, because the stream group has
+            // not been taught about stripes yet and a stream read names its
+            // keys the way every other blocking command does.
+            Want::XRead(r) => streams::read(db.only_mut(), keys, r, now, strict, out),
             Want::Pop { end } => {
                 for key in keys {
                     if !ready(db, key, strict)? {
@@ -395,7 +398,7 @@ impl Want {
                     }
                     out.array(2);
                     out.bulk(key);
-                    db.pop_into(key, *end, 1, |e| element(out, e))?;
+                    db.at(key).pop_into(key, *end, 1, |e| element(out, e))?;
                     return Ok(true);
                 }
                 Ok(false)
@@ -408,7 +411,9 @@ impl Want {
                     out.array(2);
                     out.bulk(key);
                     let mark = out.len();
-                    let n = db.pop_into(key, *end, *count, |e| element(out, e))?;
+                    let n = db
+                        .at(key)
+                        .pop_into(key, *end, *count, |e| element(out, e))?;
                     out.close_array(mark, n);
                     return Ok(true);
                 }
@@ -424,7 +429,7 @@ impl Want {
                     }
                     out.array(3);
                     out.bulk(key);
-                    db.zpop(key, *end, 1, |m, sc| {
+                    db.at(key).zpop(key, *end, 1, |m, sc| {
                         member(out, m);
                         out.double(sc);
                     })?;
@@ -440,7 +445,7 @@ impl Want {
                     out.array(2);
                     out.bulk(key);
                     let mark = out.len();
-                    let n = db.zpop(key, *end, *count, |m, sc| {
+                    let n = db.at(key).zpop(key, *end, *count, |m, sc| {
                         out.array(2);
                         member(out, m);
                         out.double(sc);
@@ -482,7 +487,7 @@ impl Want {
             // nothing and answer nothing while looking like it had tried.
             Want::MoveM { dst, mv } => {
                 let src = &keys[0];
-                let have = match db.llen(src) {
+                let have = match db.at(src).llen(src) {
                     Ok(n) => n,
                     Err(e) if strict => return Err(e),
                     Err(_) => return Ok(false),
@@ -521,8 +526,8 @@ impl Want {
 ///
 /// A key of the wrong type is an error to the command handler and not one to the
 /// retry, which is the whole of what `strict` decides.
-fn ready(db: &mut Keyspace, key: &[u8], strict: bool) -> Result<bool> {
-    match db.llen(key) {
+fn ready(db: &mut Db, key: &[u8], strict: bool) -> Result<bool> {
+    match db.at(key).llen(key) {
         Ok(n) => Ok(n > 0),
         Err(e) if strict => Err(e),
         Err(_) => Ok(false),
@@ -530,8 +535,8 @@ fn ready(db: &mut Keyspace, key: &[u8], strict: bool) -> Result<bool> {
 }
 
 /// The same for a sorted set, which has its own emptiness to ask about.
-fn zready(db: &mut Keyspace, key: &[u8], strict: bool) -> Result<bool> {
-    match db.zcard(key) {
+fn zready(db: &mut Db, key: &[u8], strict: bool) -> Result<bool> {
+    match db.at(key).zcard(key) {
         Ok(n) => Ok(n > 0),
         Err(e) if strict => Err(e),
         Err(_) => Ok(false),
@@ -628,7 +633,7 @@ impl Block {
     /// # Errors
     ///
     /// A key of another type, which is an error rather than a wait.
-    fn now(&self, db: &mut Keyspace, now: u64, out: &mut Out) -> Result<bool> {
+    fn now(&self, db: &mut Db, now: u64, out: &mut Out) -> Result<bool> {
         self.want.attempt(&self.keys, db, now, out, true)
     }
 
@@ -787,10 +792,7 @@ impl Waiters {
     fn try_serve(&self, at: usize, dbs: &mut [Db], now: u64, out: &mut Out) -> bool {
         let w = &self.list[at];
         let mark = out.len();
-        match w
-            .want
-            .attempt(&w.keys, dbs[w.db].only_mut(), now, out, false)
-        {
+        match w.want.attempt(&w.keys, &mut dbs[w.db], now, out, false) {
             Ok(true) => return true,
             Ok(false) => {}
             // `strict` is off, so nothing in there returns an error today.
