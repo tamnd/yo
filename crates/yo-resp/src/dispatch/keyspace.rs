@@ -23,7 +23,7 @@ use crate::reply::Out;
 use yo_common::{Code, Error, Result, glob_matches};
 use yo_kv::rdb::Bad;
 use yo_kv::sort::Sort;
-use yo_kv::{Applied, Ask, Cond, Keyspace, Kind, MAX_AT, Moved};
+use yo_kv::{Applied, Ask, Cond, Db, Keyspace, Kind, MAX_AT, Moved};
 
 /// Milliseconds in a second, which is the whole of what the p in `PTTL` means.
 const SECOND: i64 = 1000;
@@ -108,7 +108,7 @@ const OBJECT_HELP: &[&str] = &[
 /// database the connection is not on. Everything else here takes `at` and looks
 /// no further, and the borrow of the slice ends at the top of each arm.
 pub(super) fn execute(
-    dbs: &mut [Keyspace],
+    dbs: &mut [Db],
     at: usize,
     spec: &Spec,
     args: Args<'_>,
@@ -121,7 +121,7 @@ pub(super) fn execute(
         "move" => return move_key(dbs, at, args, out),
         _ => {}
     }
-    let db = &mut dbs[at];
+    let db = dbs[at].only_mut();
     match spec.name {
         // `UNLINK` is `DEL` with the freeing moved to a background thread on a
         // real server. Ours frees on the spot, which is what `UNLINK` promises
@@ -368,7 +368,7 @@ fn rename(db: &mut Keyspace, name: &str, args: Args<'_>, out: &mut Out) -> Resul
 /// `COPY a a DB 1` is a real copy and `COPY a a DB 0` from database zero is
 /// the error. That is why the check is down here and not next to the argument
 /// parsing: it needs to know which database was asked for.
-fn copy(dbs: &mut [Keyspace], at: usize, args: Args<'_>, out: &mut Out) -> Result<()> {
+fn copy(dbs: &mut [Db], at: usize, args: Args<'_>, out: &mut Out) -> Result<()> {
     let (src, dst) = (args.get(1), args.get(2));
     let mut into = at;
     let mut replace = false;
@@ -396,11 +396,11 @@ fn copy(dbs: &mut [Keyspace], at: usize, args: Args<'_>, out: &mut Out) -> Resul
         return Err(Error::new(Code::Invalid, SAME_OBJECT));
     }
     let done = if into == at {
-        match dbs[at].copy(src, dst, replace) {
+        match dbs[at].only_mut().copy(src, dst, replace) {
             // The one `Moved` a caller cannot answer with a number, because
             // zero would mean the destination was taken and this is a source
             // there is no way to duplicate. See `Moved::Unsupported`.
-            Moved::Unsupported => return Err(no_copy(&mut dbs[at], src)),
+            Moved::Unsupported => return Err(no_copy(dbs[at].only_mut(), src)),
             done => done,
         }
     } else {
@@ -412,18 +412,18 @@ fn copy(dbs: &mut [Keyspace], at: usize, args: Args<'_>, out: &mut Out) -> Resul
         // the single database path above and answers the same thing. Export
         // clones the body, so asking first is the difference between a refused
         // copy of a million member set costing nothing and costing the set.
-        if !replace && dbs[into].exists(dst) {
+        if !replace && dbs[into].only_mut().exists(dst) {
             out.int(0);
             return Ok(());
         }
-        if is_foreign(&mut dbs[at], src) {
-            return Err(no_copy(&mut dbs[at], src));
+        if is_foreign(dbs[at].only_mut(), src) {
+            return Err(no_copy(dbs[at].only_mut(), src));
         }
-        let Some(rec) = dbs[at].export(src) else {
+        let Some(rec) = dbs[at].only_mut().export(src) else {
             out.int(0);
             return Ok(());
         };
-        dbs[into].import(dst, rec);
+        dbs[into].only_mut().import(dst, rec);
         Moved::Ok
     };
     out.int(i64::from(done == Moved::Ok));
@@ -530,7 +530,7 @@ fn restore(db: &mut Keyspace, args: Args<'_>, out: &mut Out) -> Result<()> {
 /// Redis checks in and answers the same thing both ways round. Here it is not
 /// about cost, it is that a take that has to be put back is not something this
 /// can do: the body is out of the slab by then and the key is gone.
-fn move_key(dbs: &mut [Keyspace], at: usize, args: Args<'_>, out: &mut Out) -> Result<()> {
+fn move_key(dbs: &mut [Db], at: usize, args: Args<'_>, out: &mut Out) -> Result<()> {
     let key = args.get(1);
     let n = args.int(2)?;
     let into = usize::try_from(n)
@@ -540,15 +540,15 @@ fn move_key(dbs: &mut [Keyspace], at: usize, args: Args<'_>, out: &mut Out) -> R
     if into == at {
         return Err(Error::new(Code::Invalid, SAME_OBJECT));
     }
-    if dbs[into].exists(key) {
+    if dbs[into].only_mut().exists(key) {
         out.int(0);
         return Ok(());
     }
-    let Some(rec) = dbs[at].take(key) else {
+    let Some(rec) = dbs[at].only_mut().take(key) else {
         out.int(0);
         return Ok(());
     };
-    dbs[into].import(key, rec);
+    dbs[into].only_mut().import(key, rec);
     out.int(1);
     Ok(())
 }
