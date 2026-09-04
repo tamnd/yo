@@ -151,9 +151,10 @@ doc = "10 section 9"
 # reason to keep the command surface exactly is so a client can be pointed at
 # either server without a change, and the reason to keep a different index is
 # that a partition index answers the same question on a thirty second of the
-# memory. Where the difference reaches the wire it is D-2 for VLINKS, D-31 and
-# D-32 for the two options that ask for something the index does not have, and
-# D-33 for the one number beside FILTER that means something else here.
+# memory. Where the difference reaches the wire it is D-2 for VLINKS, D-31 for
+# the one option that asks for something the index does not have, D-32 for what
+# a quantisation saves rather than what it stores, and D-33 for the one number
+# beside FILTER that means something else here.
 #
 # Two things about the group are the module's own doing rather than anybody's
 # design and are copied because a client can see both. The names are registered
@@ -2829,7 +2830,7 @@ bounded = "yes"
 status = "shipped"
 wire = "verified"
 divergent = "D-31,D-32"
-notes = "The vector is parsed, checked and made a unit vector before the key is touched, so a VADD with a bad option or a vector full of zeros creates nothing rather than creating an empty set and then failing. The reply is 1 for an element that was not there and 0 for one whose vector was replaced, which is what lets an ingest count what it created without reading anything back. The first VADD fixes the dimension because there is no create command to fix it earlier, and every one after it that disagrees is an error naming both numbers. The length the vector arrived with is kept beside the element, since a cosine set stores the unit vector and VEMB is supposed to give back roughly what went in. Insertion probes the index the same way a search does, so the cost is the probe count times the dimension and not the size of the set."
+notes = "The vector is parsed and checked before the key is touched, so a VADD with a bad option creates nothing rather than creating an empty set and then failing. The reply is 1 for an element that was not there and 0 for one whose vector was replaced, which is what lets an ingest count what it created without reading anything back. The first VADD fixes both the dimension and the quantisation because there is no create command to fix them earlier, and every one after it that disagrees about either is an error, the quantisation first. Naming no quantisation names Q8, so a plain VADD onto a set that was made NOQUANT is refused rather than taken. The vector is split into the direction it pointed and the length it had, the direction is squeezed and stored and the length is kept beside the element, which is what lets VEMB give back what went in. A vector of zeros has no direction and is stored as the origin rather than refused, which is what a real server does with it. Insertion probes the index the same way a search does, so the cost is the probe count times the dimension and not the size of the set."
 
 [[command]]
 name = "VSIM"
@@ -2885,7 +2886,7 @@ plan = "point"
 bounded = "inherent"
 status = "shipped"
 wire = "verified"
-notes = "The unit vector multiplied back by the length it arrived with, so a vector sent as 3 and 4 comes back as 3 and 4 and not as 0.6 and 0.8. It is roughly and not exactly, because the normalisation and the multiplication are both float32 and neither is reversible, which is the same thing Redis says about its own answer. RAW gives the stored form instead: the string f32, the unit vector as little endian float32, and the length as the number that turns one into the other. There is no quantisation range in that reply because the bytes are not quantised, which is one field fewer than a real vector set sends and is the honest count for what is stored."
+notes = "The stored direction multiplied back by the length it arrived with, so a vector sent as 3 and 4 comes back as 3 and 4 and not as 0.6 and 0.8. How near it comes back is what the quantisation decides: NOQUANT gives 3 and 4, Q8 gives 2.992125988006592 and 4, and BIN gives 1 and 1 with no length multiplied back on at all, since a sign has no length in it to scale. All three are a real server's answers for the same input, to the last digit. RAW gives the stored bytes instead, with the name of the form as a simple string rather than a bulk one: f32 and the little endian floats, int8 and one code a coordinate, or bin and one bit a coordinate in whole 64 bit words. Then the length, and then for int8 the scale the codes are measured against, which is four elements where the other two are three."
 
 [[command]]
 name = "VINFO"
@@ -2908,7 +2909,7 @@ plan = "point"
 bounded = "inherent"
 status = "shipped"
 wire = "verified"
-notes = "One lookup in the key table, which is the same open addressed table every other keyed shape in this build uses, so this costs what SISMEMBER costs and reads no vector at all."
+notes = "One lookup in the key table, which is the same open addressed table every other keyed shape in this build uses, so this costs what SISMEMBER costs and reads no vector at all. The answer is a boolean and not a number, which is only visible on RESP3 where it goes out as #t or #f, and the same is true of VADD, VREM and VSETATTR."
 
 [[command]]
 name = "VRANDMEMBER"
@@ -2942,7 +2943,7 @@ plan = "point"
 bounded = "inherent"
 status = "shipped"
 wire = "verified"
-notes = "The attribute is stored as the bytes the client sent and is not validated as JSON, because a string that is not JSON is a string whose every field is missing, which is an element that matches no filter, and that is the same answer refusing the write would give without refusing anybody's write. Setting it also rewrites the summary of the attributes that sits beside the element's code in the index, which is what makes VSETATTR move an element in and out of a filter rather than only changing what VGETATTR says. An empty string clears the attribute, which is Redis's spelling of the removal and is why this is one command and not two. It answers 0 for an element that is not there rather than creating one, since an attribute with no vector under it is not a thing a vector set can hold."
+notes = "The attribute is stored as the bytes the client sent and is not validated as JSON, because a string that is not JSON is a string whose every field is missing, which is an element that matches no filter, and that is the same answer refusing the write would give without refusing anybody's write. Setting it also rewrites the summary of the attributes that sits beside the element's code in the index, which is what makes VSETATTR move an element in and out of a filter rather than only changing what VGETATTR says. An empty string clears the attribute, which is Redis's spelling of the removal and is why this is one command and not two. It answers false for an element that is not there rather than creating one, since an attribute with no vector under it is not a thing a vector set can hold."
 
 [[command]]
 name = "VGETATTR"

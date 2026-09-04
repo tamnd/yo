@@ -44,18 +44,24 @@
 //! since there is no create command the dimension is whatever the first vector
 //! is and every one after it has to match.
 //!
-//! A similarity is not a distance. The collection measures one minus the cosine,
-//! which is 0 for the same direction and 2 for the opposite one, and the wire
-//! wants 1 for the same direction and 0 for the opposite one, so the reply is
-//! `1 - distance / 2` and both ends of that are exact.
+//! A similarity is not a distance. Everything stored here is a direction of
+//! length one, and between two of those the euclidean distance and the cosine
+//! are the same fact written twice, so the collection measures the first and
+//! [`similarity`] reports the second on the scale the wire wants. An identical
+//! vector is exactly 1 and an opposite one is exactly 0.
 //!
 //! # What a client sent and what is stored
 //!
-//! The unit vector, because that is what a cosine collection stores. `VEMB` is
-//! supposed to hand back roughly what went in, so the length of the original is
-//! kept beside the element and multiplied back on the way out. That is what
-//! Redis does and for the same reason, and it is why `VEMB` of a vector that
-//! went in as `[3, 4]` says `[3, 4]` and not `[0.6, 0.8]`.
+//! The direction it pointed and the length it had, separately, and the length is
+//! multiplied back on in `VEMB`. That is what Redis does and for the same
+//! reason, and it is why `VEMB` of a vector that went in as `[3, 4]` says
+//! `[3, 4]` and not `[0.6, 0.8]`.
+//!
+//! The direction is stored in whichever of the three forms the set was made
+//! with, which is [`yo_vector::quant`], so `VEMB` hands back the squeezed vector
+//! and not the original. A query is squeezed the same way before it is
+//! searched, so it is compared with what is stored on the same terms, and a
+//! search for a vector that is already in the set comes back at exactly 1.
 //!
 //! An element's attribute string lives here too, as the bytes the client sent.
 //! `FILTER` reads JSON out of it, and a string that is not JSON is a string
@@ -83,18 +89,14 @@
 //! only ever runs on what survives that. The tag is rewritten whenever the
 //! attribute is, which is what `VSETATTR` costs beyond the store.
 //!
-//! # The two things a client asks for that are not here
+//! # The one thing a client asks for that is not here
 //!
 //! `REDUCE` projects a vector onto fewer dimensions on the way in. It is a
 //! refusal (D-31) and not silently ignored, because a client that asked for 100
 //! dimensions and got 300 would be told the wrong thing by `VDIM` and would pay
 //! three times the memory it budgeted for.
 //!
-//! `NOQUANT`, `BIN` and `Q8` choose how a vector is stored. This stores the full
-//! precision vector and a one bit code beside it either way, which is at least
-//! as accurate as the most accurate of the three, so they are recorded for
-//! `VINFO` and change nothing (D-32).
-//!
+
 //! `FILTER-EF` bounds how much work Redis will do before giving up on a
 //! selective filter. The scan here widens on its own until it has enough answers
 //! or has spent its budget, so the number raises the effort rather than capping
@@ -106,7 +108,7 @@ use yo_common::{Code, Error, Result, parse_i64};
 use yo_kv::{Foreign, Keyspace};
 use yo_shape::Metric;
 use yo_vector::hnsw::Requested;
-use yo_vector::{Collection, Match, Signature};
+use yo_vector::{Collection, Match, Quant, Signature, quant};
 
 use super::args::{self, Args};
 use super::table::Spec;
@@ -123,6 +125,10 @@ const BAD_COUNT: &str = "COUNT must be a positive integer";
 const BAD_EF: &str = "EF must be a positive integer";
 /// What `M` gets.
 const BAD_M: &str = "M must be a positive integer";
+/// What a `VADD` that asks for a different quantisation than the set was made
+/// with gets, which it gets whether it named one or not because naming none
+/// means naming `Q8`.
+const WRONG_QUANT: &str = "asked quantization mismatch with existing vector set";
 /// What a `VRANGE` low end that is not a range gets.
 const BAD_START: &str = "invalid start range format";
 /// What its high end gets.
@@ -146,11 +152,12 @@ pub(super) struct VectorBody {
     /// `VINFO` to answer with. Two of the three changed the tuning on the way
     /// through and `M` did not, which is `10` section 7.
     asked: Requested,
-    /// Which of `NOQUANT`, `BIN` and `Q8` the client asked for, recorded and
-    /// not applied.
-    quant: &'static str,
-    /// The length of the vector each element went in as, and its attribute
-    /// string, indexed by the collection's id for that element.
+    /// Which of `NOQUANT`, `BIN` and `Q8` this set was made with, which is
+    /// what every element in it is stored as.
+    quant: Quant,
+    /// The length of the vector each element went in as, its quantisation
+    /// scale and its attribute string, indexed by the collection's id for that
+    /// element.
     side: Vec<Side>,
 }
 
@@ -163,6 +170,9 @@ struct Side {
     /// multiplying by it is the identity and an element with no recorded length
     /// comes back as the unit vector rather than as the origin.
     norm: f32,
+    /// The widest coordinate of the stored direction, which is what a `Q8` code
+    /// is measured against and is 0 for the two forms that have no scale.
+    range: f32,
     /// The attribute string, which is bytes here and JSON to a client.
     attr: Option<Box<[u8]>>,
 }
@@ -195,22 +205,21 @@ impl Foreign for VectorBody {
 
 impl VectorBody {
     /// An empty vector set of `dim` dimensions.
-    fn new(dim: usize, asked: Requested) -> Result<VectorBody> {
-        let mut c = Collection::new(dim, Metric::Cosine)?;
+    fn new(dim: usize, quant: Quant, asked: Requested) -> Result<VectorBody> {
+        let mut c = Collection::new(dim, Metric::L2)?;
         c.retune(asked.tuning());
         Ok(VectorBody {
             c,
             asked,
-            quant: "f32",
+            quant,
             side: Vec::new(),
         })
     }
 
-    /// What an element went in as, which is the unit vector scaled back up.
+    /// What an element went in as, as near as the quantisation kept it.
     fn embedding(&self, key: &[u8]) -> Option<Vec<f32>> {
-        let unit = self.c.get(key)?;
-        let norm = self.norm(key);
-        Some(unit.iter().map(|x| x * norm).collect())
+        let dir = self.c.get(key)?;
+        Some(quant::restore(self.quant, dir, self.norm(key)))
     }
 
     /// The length the element's vector had when it arrived.
@@ -219,6 +228,14 @@ impl VectorBody {
             Some(s) if s.norm > 0.0 => s.norm,
             _ => 1.0,
         }
+    }
+
+    /// The scale the element's `Q8` codes were measured against.
+    fn range(&self, key: &[u8]) -> f32 {
+        self.c
+            .id(key)
+            .and_then(|id| self.side.get(id as usize))
+            .map_or(0.0, |s| s.range)
     }
 
     /// The element's attribute string, if it has one.
@@ -254,14 +271,32 @@ impl VectorBody {
     }
 }
 
-/// The similarity a client expects, from the distance the collection measured.
+/// The similarity a client expects, between the query and one of the answers.
 ///
-/// The collection reports one minus the cosine, in 0 for the same direction to 2
-/// for the opposite one. A vector set reports the other way round and on a scale
-/// of one, so this is `1 - d / 2`, which puts an identical vector at exactly 1
-/// and an opposite one at exactly 0.
-fn similarity(distance: f32) -> f64 {
-    f64::from(1.0 - distance / 2.0).clamp(0.0, 1.0)
+/// The cosine of the two, moved onto a scale where the same direction is 1 and
+/// the opposite one is 0. It is worked out from the two vectors rather than from
+/// the distance the search reported, because the search reports a euclidean
+/// distance and squaring a square root back costs the exactness of the two cases
+/// a client is most likely to look at: two vectors at right angles come out at
+/// 0.5000000171 rather than at 0.5.
+///
+/// In `f32` and not in `f64`, because a real server computes it in `f32` and the
+/// wire carries every digit of whichever one it was. The clamp is what makes the
+/// ends exact, since a vector's own length divided back out of itself is 1 give
+/// or take the last bit and the answer would otherwise print as 0.99999997.
+fn similarity(q: &[f32], s: &[f32]) -> f64 {
+    let mut dot = 0.0f32;
+    for (a, b) in q.iter().zip(s) {
+        dot = a.mul_add(*b, dot);
+    }
+    let cos = dot / (quant::norm(q) * quant::norm(s));
+    f64::from(((1.0 + cos) / 2.0).clamp(0.0, 1.0))
+}
+
+/// The similarity between the query and the element `hit` names, or 0 for an
+/// element that has gone between the search and the reply.
+fn score(body: &VectorBody, q: &[f32], hit: &Match) -> f64 {
+    body.c.get(&hit.key).map_or(0.0, |s| similarity(q, s))
 }
 
 pub(super) fn execute(db: &mut Keyspace, spec: &Spec, args: Args<'_>, out: &mut Out) -> Result<()> {
@@ -300,12 +335,15 @@ fn vadd(db: &mut Keyspace, args: Args<'_>, out: &mut Out) -> Result<()> {
 
     // Everything is parsed before the key is touched, so a VADD with a bad
     // option creates nothing rather than creating the set and then failing.
-    let body = open(db, args.get(1), v.len(), opts.asked)?;
-    let new = body.c.put(element, &v)?;
-    body.quant = opts.quant;
-    let norm = norm(&v);
+    let body = open(db, args.get(1), v.len(), opts.quant, opts.asked)?;
+    // Squeezed before it is stored, because what a vector set holds is the
+    // squeezed form and `VEMB` is supposed to hand that back rather than hand
+    // back the original and pretend the quantisation was free.
+    let squeezed = quant::squeeze(body.quant, &v);
+    let new = body.c.put(element, &squeezed.dir)?;
     let side = body.side_mut(element);
-    side.norm = norm;
+    side.norm = squeezed.norm;
+    side.range = squeezed.range;
     if let Some(attr) = opts.attr {
         side.attr = Some(attr.into());
     }
@@ -313,7 +351,10 @@ fn vadd(db: &mut Keyspace, args: Args<'_>, out: &mut Out) -> Result<()> {
     // already there gives it a new vector and therefore a new place in the
     // index, carrying whatever tag the insert put on it, which is none.
     body.retag(element);
-    out.int(i64::from(new));
+    // A boolean and not a number, which is what a real server answers here and
+    // is only visible on RESP3, where it is `#t` and `#f` rather than `:1` and
+    // `:0`. The same is true of VREM, VISMEMBER and VSETATTR.
+    out.bool(new);
     Ok(())
 }
 
@@ -333,29 +374,38 @@ fn vsim(db: &mut Keyspace, args: Args<'_>, out: &mut Out) -> Result<()> {
         out.array(0);
         return Ok(());
     };
-    let mut hits = match query {
+    let (q, mut hits) = match query {
         // A search from an element leaves that element out, because it is
         // always the nearest and nobody asked what a thing is most like itself.
         Query::Element(e) => {
-            let Some(q) = body.c.get(e) else {
+            let Some(stored) = body.c.get(e) else {
                 out.array(0);
                 return Ok(());
             };
-            let q = q.to_vec();
-            search(body, &q, opts.effort, Some(e), &opts)?
+            let q = stored.to_vec();
+            let hits = search(body, &q, opts.effort, Some(e), &opts)?;
+            (q, hits)
         }
-        Query::Vector(v) => search(body, &v, opts.effort, None, &opts)?,
+        // The query is squeezed the same way the set was, so it is compared
+        // against the stored vectors on their own terms. It is also what makes
+        // a search for a vector that is in the set score exactly 1 rather than
+        // slightly under it.
+        Query::Vector(v) => {
+            let q = quant::squeeze(body.quant, &v).dir;
+            let hits = search(body, &q, opts.effort, None, &opts)?;
+            (q, hits)
+        }
     };
     // Whatever `EF` widened the search to, the client asked for `COUNT`.
     hits.truncate(opts.count);
-    answer(body, &hits, &opts, out);
+    answer(body, &q, &hits, &opts, out);
     Ok(())
 }
 
 /// `VREM key element`, which answers 1 if the element was there.
 fn vrem(db: &mut Keyspace, args: Args<'_>, out: &mut Out) -> Result<()> {
     let Some(body) = write(db, args.get(1))? else {
-        out.int(0);
+        out.bool(false);
         return Ok(());
     };
     let element = args.get(2);
@@ -368,7 +418,7 @@ fn vrem(db: &mut Keyspace, args: Args<'_>, out: &mut Out) -> Result<()> {
     {
         *side = Side::default();
     }
-    out.int(i64::from(gone));
+    out.bool(gone);
     // A vector set whose last element has gone takes its key with it, which is
     // what every other collection here does.
     db.reap_foreign(args.get(1));
@@ -410,19 +460,20 @@ fn vemb(db: &mut Keyspace, args: Args<'_>, out: &mut Out) -> Result<()> {
         return Ok(());
     };
     if raw {
-        // The stored form and the number that turns it back into the client's,
-        // which is what RAW is for. Ours is the unit vector as float32 in the
-        // machine's own order, and there is no quantisation range to report
-        // because the bytes are not quantised.
-        let unit = body.c.get(element).expect("the element is there");
-        let mut bytes = Vec::with_capacity(unit.len() * 4);
-        for x in unit {
-            bytes.extend_from_slice(&x.to_le_bytes());
-        }
-        out.array(3);
-        out.bulk(b"f32");
+        // The stored bytes and the numbers that turn them back into the
+        // client's vector, which is what RAW is for. The name of the form comes
+        // back as a simple string rather than a bulk one, which is a real
+        // server's shape and is the sort of thing a client parses positionally.
+        let dir = body.c.get(element).expect("the element is there");
+        let range = body.range(element);
+        let bytes = quant::raw(body.quant, dir, range);
+        out.array(if body.quant == Quant::Int8 { 4 } else { 3 });
+        out.simple(body.quant.token().as_bytes());
         out.bulk(&bytes);
         out.double(f64::from(body.norm(element)));
+        if body.quant == Quant::Int8 {
+            out.double(f64::from(range));
+        }
         return Ok(());
     }
     out.array(v.len());
@@ -455,7 +506,7 @@ fn vinfo(db: &mut Keyspace, args: Args<'_>, out: &mut Out) -> Result<()> {
     out.bulk(b"index-type");
     out.bulk(b"partition");
     out.bulk(b"quant-type");
-    out.bulk(body.quant.as_bytes());
+    out.bulk(body.quant.token().as_bytes());
     for (name, value) in fields {
         out.bulk(name);
         out.uint(value);
@@ -470,7 +521,7 @@ fn vinfo(db: &mut Keyspace, args: Args<'_>, out: &mut Out) -> Result<()> {
 /// `VISMEMBER key element`.
 fn vismember(db: &mut Keyspace, args: Args<'_>, out: &mut Out) -> Result<()> {
     let there = read(db, args.get(1))?.is_some_and(|b| b.c.contains(args.get(2)));
-    out.int(i64::from(there));
+    out.bool(there);
     Ok(())
 }
 
@@ -536,7 +587,7 @@ fn vlinks(db: &mut Keyspace, args: Args<'_>, out: &mut Out) -> Result<()> {
     // One layer, because there is one. A client walking layer by layer sees a
     // graph one deep rather than a reply it cannot parse.
     out.array(1);
-    write_hits(&near, withscores, out);
+    write_hits(body, &q, &near, withscores, out);
     Ok(())
 }
 
@@ -546,12 +597,12 @@ fn vlinks(db: &mut Keyspace, args: Args<'_>, out: &mut Out) -> Result<()> {
 /// removal and the reason this is not two commands.
 fn vsetattr(db: &mut Keyspace, args: Args<'_>, out: &mut Out) -> Result<()> {
     let Some(body) = write(db, args.get(1))? else {
-        out.int(0);
+        out.bool(false);
         return Ok(());
     };
     let element = args.get(2);
     if !body.c.contains(element) {
-        out.int(0);
+        out.bool(false);
         return Ok(());
     }
     let value = args.get(3);
@@ -562,7 +613,7 @@ fn vsetattr(db: &mut Keyspace, args: Args<'_>, out: &mut Out) -> Result<()> {
         Some(value.into())
     };
     body.retag(element);
-    out.int(1);
+    out.bool(true);
     Ok(())
 }
 
@@ -694,15 +745,18 @@ enum Query<'a> {
 /// The options on a `VADD`.
 struct Add<'a> {
     asked: Requested,
-    quant: &'static str,
+    quant: Quant,
     attr: Option<&'a [u8]>,
 }
 
 impl<'a> Add<'a> {
     fn parse(args: Args<'a>, from: usize) -> Result<Add<'a>> {
+        // `Q8` and not `NOQUANT` when nobody said, which is Redis's default and
+        // is why a plain `VADD` onto a set that was made `NOQUANT` is refused
+        // rather than taken.
         let mut got = Add {
             asked: Requested::default(),
-            quant: "f32",
+            quant: Quant::Int8,
             attr: None,
         };
         let mut i = from;
@@ -716,13 +770,13 @@ impl<'a> Add<'a> {
                 // redo.
                 i += 1;
             } else if args::is(arg, b"noquant") {
-                got.quant = "f32";
+                got.quant = Quant::None;
                 i += 1;
             } else if args::is(arg, b"bin") {
-                got.quant = "bin";
+                got.quant = Quant::Bin;
                 i += 1;
             } else if args::is(arg, b"q8") {
-                got.quant = "int8";
+                got.quant = Quant::Int8;
                 i += 1;
             } else if args::is(arg, b"ef") && rest >= 2 {
                 got.asked.ef_construction = positive(args.get(i + 1), BAD_EF)?;
@@ -872,7 +926,7 @@ impl yo_vector::Filter for Filtered<'_> {
 }
 
 /// Write what `VSIM` found, in whichever of the four shapes was asked for.
-fn answer(body: &VectorBody, hits: &[Match], opts: &Sim, out: &mut Out) {
+fn answer(body: &VectorBody, q: &[f32], hits: &[Match], opts: &Sim, out: &mut Out) {
     // A plain VSIM is a flat array of names, and the option shapes are Redis's
     // rather than this codebase's ZRANGE shape, because a client that already
     // parses one of these should not have to tell the two servers apart.
@@ -892,7 +946,7 @@ fn answer(body: &VectorBody, hits: &[Match], opts: &Sim, out: &mut Out) {
                 out.array(extras);
             }
             if opts.withscores {
-                out.double(similarity(hit.distance));
+                out.double(score(body, q, hit));
             }
             if opts.withattribs {
                 attribute(body, &hit.key, out);
@@ -904,7 +958,7 @@ fn answer(body: &VectorBody, hits: &[Match], opts: &Sim, out: &mut Out) {
     for hit in hits {
         out.bulk(&hit.key);
         if opts.withscores {
-            out.double(similarity(hit.distance));
+            out.double(score(body, q, hit));
         }
         if opts.withattribs {
             attribute(body, &hit.key, out);
@@ -921,12 +975,12 @@ fn attribute(body: &VectorBody, key: &[u8], out: &mut Out) {
 }
 
 /// A flat list of elements, with their similarities beside them if asked.
-fn write_hits(hits: &[Match], withscores: bool, out: &mut Out) {
+fn write_hits(body: &VectorBody, q: &[f32], hits: &[Match], withscores: bool, out: &mut Out) {
     out.array(hits.len() * (1 + usize::from(withscores)));
     for hit in hits {
         out.bulk(&hit.key);
         if withscores {
-            out.double(similarity(hit.distance));
+            out.double(score(body, q, hit));
         }
     }
 }
@@ -965,14 +1019,6 @@ fn vector(args: Args<'_>, at: usize) -> Result<(Vec<f32>, usize)> {
     Err(Error::new(Code::Invalid, BAD_VECTOR))
 }
 
-/// The euclidean length of a vector, which is what `VEMB` multiplies back.
-fn norm(v: &[f32]) -> f32 {
-    let sum = v.iter().map(|x| f64::from(*x) * f64::from(*x)).sum::<f64>();
-    #[allow(clippy::cast_possible_truncation)]
-    let norm = sum.sqrt() as f32;
-    norm
-}
-
 /// The positions `VRANDMEMBER count` draws, in the two shapes it has.
 fn draws(db: &mut Keyspace, count: i64, len: usize) -> Vec<usize> {
     let Ok(want) = usize::try_from(count) else {
@@ -1003,13 +1049,23 @@ fn open<'d>(
     db: &'d mut Keyspace,
     key: &[u8],
     dim: usize,
+    quant: Quant,
     asked: Requested,
 ) -> Result<&'d mut VectorBody> {
+    // The quantisation is settled when the set is made and every element after
+    // that is stored the same way, because a set holding two forms at once could
+    // not answer VINFO and its elements could not be compared with each other.
     if db.kind_of(key).is_none() {
-        db.put_foreign(key, Box::new(VectorBody::new(dim, asked)?));
+        db.put_foreign(key, Box::new(VectorBody::new(dim, quant, asked)?));
     }
     match write(db, key)? {
         Some(body) => {
+            // Before the dimension, because that is the order a real server
+            // reads them in and a `VADD` that has both wrong is told about the
+            // quantisation.
+            if body.quant != quant {
+                return Err(Error::new(Code::Invalid, WRONG_QUANT));
+            }
             if body.c.dim() != dim {
                 return Err(Error::fmt(
                     Code::Invalid,

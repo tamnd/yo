@@ -11703,11 +11703,22 @@ mod tests {
             f.run(&[b"VADD", b"v", b"VALUES", b"3", b"1", b"0", b"0", b"up"]),
             "-ERR Vector dimension mismatch - got 3 but set has 2\r\n"
         );
-        // A vector of zeros has no direction, so a cosine set has nowhere to
-        // put it.
+        // A vector of zeros has no direction, and it is taken anyway and comes
+        // back as the origin, because that is what a real server does with it.
         assert_eq!(
             f.run(&[b"VADD", b"v", b"VALUES", b"2", b"0", b"0", b"nowhere"]),
-            "-ERR a cosine collection compares directions and a vector of length zero has none\r\n"
+            ":1\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"VEMB", b"v", b"nowhere"]),
+            "*2\r\n$1\r\n0\r\n$1\r\n0\r\n"
+        );
+        // A set is made with one quantisation and keeps it, and a `VADD` that
+        // names another is refused. Naming none names `Q8`, which is why this
+        // set is a `Q8` one.
+        assert_eq!(
+            f.run(&[b"VADD", b"v", b"VALUES", b"2", b"1", b"1", b"other", b"BIN"]),
+            "-ERR asked quantization mismatch with existing vector set\r\n"
         );
         // Nothing above created a key, and a set that never took a vector has
         // no dimension to report.
@@ -11722,11 +11733,27 @@ mod tests {
     fn vemb_gives_back_the_vector_and_vsim_gives_back_a_similarity() {
         let mut f = Fixture::new();
         f.run(&[b"VADD", b"v", b"VALUES", b"2", b"3", b"4", b"a"]);
-        // The set stored the unit vector and the length is multiplied back on
-        // the way out, so `3 4` and not `0.6 0.8`.
+        // The set stored the direction and the length is multiplied back on the
+        // way out, so this is `3 4` and not `0.6 0.8`. It is not quite `3 4`
+        // either, because nobody named a quantisation and that means `Q8`: the
+        // wider coordinate lands on a code exactly and the other one does not.
+        // Both numbers are a real server's answers for the same input.
         assert_eq!(
             f.run(&[b"VEMB", b"v", b"a"]),
+            "*2\r\n$17\r\n2.992125988006592\r\n$1\r\n4\r\n"
+        );
+        // NOQUANT is the way to ask for what went in to come back out.
+        f.run(&[b"VADD", b"n", b"VALUES", b"2", b"3", b"4", b"a", b"NOQUANT"]);
+        assert_eq!(
+            f.run(&[b"VEMB", b"n", b"a"]),
             "*2\r\n$1\r\n3\r\n$1\r\n4\r\n"
+        );
+        // BIN keeps the signs and nothing else, and does not multiply the
+        // length back on, since a sign has no length in it to scale.
+        f.run(&[b"VADD", b"b", b"VALUES", b"2", b"3", b"-4", b"a", b"BIN"]);
+        assert_eq!(
+            f.run(&[b"VEMB", b"b", b"a"]),
+            "*2\r\n$1\r\n1\r\n$2\r\n-1\r\n"
         );
         assert_eq!(f.run(&[b"VEMB", b"v", b"nobody"]), "*-1\r\n");
         assert_eq!(f.run(&[b"VEMB", b"nokey", b"a"]), "*-1\r\n");
@@ -11858,12 +11885,13 @@ mod tests {
         assert!(info.contains("$6\r\nhnsw-m\r\n:32\r\n"), "{info}");
         assert!(info.contains("$10\r\nvector-dim\r\n:2\r\n"), "{info}");
         assert!(info.contains("$16\r\nattributes-count\r\n:1\r\n"), "{info}");
-        // The quantisation is recorded and not applied, which is D-32, so it
-        // reports back what was sent.
+        // Nobody named a quantisation, so this set is a `Q8` one and every
+        // element in it is stored that way.
         assert!(
-            info.contains("$10\r\nquant-type\r\n$3\r\nf32\r\n"),
+            info.contains("$10\r\nquant-type\r\n$4\r\nint8\r\n"),
             "{info}"
         );
+        let mut f = Fixture::new();
         f.run(&[b"VADD", b"v", b"VALUES", b"2", b"0", b"1", b"north", b"BIN"]);
         assert!(
             f.run(&[b"VINFO", b"v"])
@@ -12298,13 +12326,17 @@ mod tests {
         assert_eq!(f.run(&[b"VDIM", b"v"]), ":2\r\n");
         assert_eq!(
             f.run(&[b"VEMB", b"v", b"a"]),
-            "*2\r\n$1\r\n3\r\n$1\r\n4\r\n"
+            "*2\r\n$17\r\n2.992125988006592\r\n$1\r\n4\r\n"
         );
-        // RAW is the stored form and the number that turns it back into the
-        // client's, which is the unit vector and the length it arrived with.
-        let raw = f.run(&[b"VEMB", b"v", b"a", b"RAW"]);
-        assert!(raw.starts_with("*3\r\n$3\r\nf32\r\n$8\r\n"), "{raw}");
-        assert!(raw.ends_with("$1\r\n5\r\n"), "{raw}");
+        // RAW is the stored bytes and the numbers that turn them back into the
+        // client's vector, which for `Q8` is a code a coordinate, the length the
+        // vector arrived with and the scale the codes are measured against. The
+        // name of the form is a simple string, which is a real server's shape,
+        // and all four of these are a real server's answers.
+        assert_eq!(
+            f.run(&[b"VEMB", b"v", b"a", b"RAW"]),
+            "*4\r\n+int8\r\n$2\r\n_\x7f\r\n$1\r\n5\r\n$17\r\n0.800000011920929\r\n"
+        );
         // A blob that is not a whole number of floats is not a vector.
         assert_eq!(
             f.run(&[b"VADD", b"w", b"FP32", b"abc", b"a"]),
