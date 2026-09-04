@@ -156,6 +156,29 @@ const VECTOR_WRITE: &[&str] = &["write", "module"];
 /// `VSETATTR`, which the module marks fast and, though it takes a string off
 /// the wire, does not mark denyoom.
 const VECTOR_WRITE_FAST: &[&str] = &["write", "module", "fast"];
+/// The one category nearly every search command is in. The module registers
+/// `@search` on its own for most of them rather than pairing it with `@read` or
+/// `@write` the way RedisJSON does, which is the module's own answer to
+/// `COMMAND INFO` and is copied rather than tidied up.
+const AC_SEARCH: &[&str] = &["@search"];
+/// `FT.DROPINDEX` and the two spellings of it, which the module puts in the
+/// dangerous category because dropping an index with `DD` deletes the documents
+/// it followed.
+const AC_SEARCH_DROP: &[&str] = &["@write", "@slow", "@dangerous", "@search"];
+/// `FT._DROPIFX`, which is the same command with a shorter list. The module
+/// leaves the slow and dangerous categories off this one and there is no
+/// reading of it that makes it less dangerous than the others.
+const AC_SEARCH_WRITE: &[&str] = &["@write", "@search"];
+/// `FT._LIST`, which the module puts in `@admin` because listing every index is
+/// a question about the server rather than about anything in it.
+const AC_SEARCH_LIST: &[&str] = &["@admin", "@slow", "@search"];
+/// A search read, with the `module` flag every search command carries for the
+/// same reason the JSON and vector set ones do.
+const SEARCH_READ: &[&str] = &["readonly", "module"];
+/// A search write that takes a schema or an alias off the wire.
+const SEARCH_WRITE_OOM: &[&str] = &["write", "denyoom", "module"];
+/// A search write that only ever frees, which is dropping an index or an alias.
+const SEARCH_WRITE: &[&str] = &["write", "module"];
 /// The JSON read side. Two categories and no speed one, which is RedisJSON's
 /// own answer to `COMMAND INFO` and not an omission: the module registers
 /// `@read @json` and leaves it there.
@@ -3071,6 +3094,222 @@ pub static COMMANDS: &[Spec] = &[
         summary: "The elements of a vector set whose names fall in a range.",
         group: "vector",
     },
+    // -------------------------------------------------------------- search
+    //
+    // None of these carries a key spec, and the three zeros are the module's
+    // own answer rather than a gap here. An index name is not a key: it is not
+    // in the keyspace, `TYPE` has nothing to say about it, and a cluster client
+    // has nothing to route on. `FT.SUGADD` and the four deprecated document
+    // commands do carry real keys, and they arrive with the rest of the search
+    // surface rather than here.
+    Spec {
+        name: "FT.CREATE",
+        arity: -5,
+        flags: SEARCH_WRITE_OOM,
+        first_key: 0,
+        last_key: 0,
+        step: 0,
+        acl: AC_SEARCH,
+        since: "1.0.0",
+        complexity: "O(K) with K the fields declared, plus O(N) over the keyspace when the initial scan runs",
+        summary: "Create an index over the keys with a prefix, with the given schema.",
+        group: "search",
+    },
+    Spec {
+        name: "FT._CREATEIFNX",
+        arity: -5,
+        flags: SEARCH_WRITE_OOM,
+        first_key: 0,
+        last_key: 0,
+        step: 0,
+        acl: AC_SEARCH,
+        since: "1.0.0",
+        complexity: "O(K) with K the fields declared, plus O(N) over the keyspace when the initial scan runs",
+        summary: "Create an index, and say nothing if one of that name is already there.",
+        group: "search",
+    },
+    Spec {
+        name: "FT.ALTER",
+        arity: -6,
+        flags: SEARCH_WRITE_OOM,
+        first_key: 0,
+        last_key: 0,
+        step: 0,
+        acl: AC_SEARCH,
+        since: "1.0.0",
+        complexity: "O(N) over the keys the index follows, when the fields are backfilled",
+        summary: "Add fields to an index's schema.",
+        group: "search",
+    },
+    Spec {
+        name: "FT._ALTERIFNX",
+        arity: -6,
+        flags: SEARCH_WRITE_OOM,
+        first_key: 0,
+        last_key: 0,
+        step: 0,
+        acl: AC_SEARCH,
+        since: "1.0.0",
+        complexity: "O(N) over the keys the index follows, when the fields are backfilled",
+        summary: "Add fields to a schema, and say nothing about the ones already there.",
+        group: "search",
+    },
+    Spec {
+        name: "FT.DROPINDEX",
+        arity: -2,
+        flags: SEARCH_WRITE,
+        first_key: 0,
+        last_key: 0,
+        step: 0,
+        acl: AC_SEARCH_DROP,
+        since: "2.0.0",
+        complexity: "O(1), or O(N) over the documents when DD is given",
+        summary: "Take an index away, and its documents with it when DD is given.",
+        group: "search",
+    },
+    Spec {
+        name: "FT._DROPINDEXIFX",
+        arity: -2,
+        flags: SEARCH_WRITE,
+        first_key: 0,
+        last_key: 0,
+        step: 0,
+        acl: AC_SEARCH_DROP,
+        since: "2.0.0",
+        complexity: "O(1), or O(N) over the documents when DD is given",
+        summary: "Take an index away, and say nothing when there is none of that name.",
+        group: "search",
+    },
+    Spec {
+        name: "FT.DROP",
+        arity: -1,
+        flags: SEARCH_WRITE,
+        first_key: 0,
+        last_key: 0,
+        step: 0,
+        acl: AC_SEARCH_DROP,
+        since: "1.0.0",
+        complexity: "O(1)",
+        summary: "Take an index away. Deprecated, and FT.DROPINDEX is the name to use.",
+        group: "search",
+    },
+    Spec {
+        name: "FT._DROPIFX",
+        arity: -1,
+        flags: SEARCH_WRITE,
+        first_key: 0,
+        last_key: 0,
+        step: 0,
+        acl: AC_SEARCH_WRITE,
+        since: "1.0.0",
+        complexity: "O(1)",
+        summary: "Take an index away and say nothing when there is none. Deprecated.",
+        group: "search",
+    },
+    Spec {
+        name: "FT.INFO",
+        arity: 2,
+        flags: SEARCH_READ,
+        first_key: 0,
+        last_key: 0,
+        step: 0,
+        acl: AC_SEARCH,
+        since: "1.0.0",
+        complexity: "O(1)",
+        summary: "Everything the server knows about one index.",
+        group: "search",
+    },
+    Spec {
+        name: "FT._LIST",
+        arity: -1,
+        flags: SEARCH_READ,
+        first_key: 0,
+        last_key: 0,
+        step: 0,
+        acl: AC_SEARCH_LIST,
+        since: "2.0.0",
+        complexity: "O(N) with N the indexes on the server",
+        summary: "Every index on the server, by name.",
+        group: "search",
+    },
+    Spec {
+        name: "FT.ALIASADD",
+        arity: 3,
+        flags: SEARCH_WRITE_OOM,
+        first_key: 0,
+        last_key: 0,
+        step: 0,
+        acl: AC_SEARCH,
+        since: "1.0.0",
+        complexity: "O(1)",
+        summary: "Point another name at an index.",
+        group: "search",
+    },
+    Spec {
+        name: "FT._ALIASADDIFNX",
+        arity: 3,
+        flags: SEARCH_WRITE_OOM,
+        first_key: 0,
+        last_key: 0,
+        step: 0,
+        acl: AC_SEARCH,
+        since: "1.0.0",
+        complexity: "O(1)",
+        summary: "Point another name at an index, and say nothing if it is taken.",
+        group: "search",
+    },
+    Spec {
+        name: "FT.ALIASDEL",
+        arity: 2,
+        flags: SEARCH_WRITE,
+        first_key: 0,
+        last_key: 0,
+        step: 0,
+        acl: AC_SEARCH,
+        since: "1.0.0",
+        complexity: "O(1)",
+        summary: "Take an alias away.",
+        group: "search",
+    },
+    Spec {
+        name: "FT._ALIASDELIFX",
+        arity: 2,
+        flags: SEARCH_WRITE,
+        first_key: 0,
+        last_key: 0,
+        step: 0,
+        acl: AC_SEARCH,
+        since: "1.0.0",
+        complexity: "O(1)",
+        summary: "Take an alias away, and say nothing when there is none.",
+        group: "search",
+    },
+    Spec {
+        name: "FT.ALIASUPDATE",
+        arity: 3,
+        flags: SEARCH_WRITE_OOM,
+        first_key: 0,
+        last_key: 0,
+        step: 0,
+        acl: AC_SEARCH,
+        since: "1.0.0",
+        complexity: "O(1)",
+        summary: "Move an alias to another index, adding it when it was not there.",
+        group: "search",
+    },
+    Spec {
+        name: "FT.ALIASLIST",
+        arity: 2,
+        flags: SEARCH_READ,
+        first_key: 0,
+        last_key: 0,
+        step: 0,
+        acl: AC_SEARCH,
+        since: "8.10.0",
+        complexity: "O(N) with N the aliases pointing at the index",
+        summary: "The aliases pointing at one index.",
+        group: "search",
+    },
     // --------------------------------------------------------------- bloom
     Spec {
         name: "bf.reserve",
@@ -5634,16 +5873,17 @@ mod tests {
     /// The name here is the name a client reads back, so it is spelled the way
     /// the server that registered it spelled it.
     ///
-    /// That is lower case for everything except the vector set group, which the
-    /// module registers in upper case, so `COMMAND INFO vadd` answers `VADD` and
-    /// the arity error quotes `VADD`. Nothing else in the table cares, because
-    /// a lookup compares without regard to case and the index key folds the case
-    /// out before it hashes.
+    /// That is lower case for everything the server itself registers and upper
+    /// case for the two groups that come out of a module, so `COMMAND INFO vadd`
+    /// answers `VADD` and `COMMAND INFO ft.create` answers `FT.CREATE`, and the
+    /// arity errors quote them the same way. Nothing else in the table cares,
+    /// because a lookup compares without regard to case and the index key folds
+    /// the case out before it hashes.
     #[test]
     fn every_name_is_spelled_the_way_it_was_registered_and_appears_once() {
         let mut seen = std::collections::BTreeSet::new();
         for c in COMMANDS {
-            let want = if c.group == "vector" {
+            let want = if c.group == "vector" || c.group == "search" {
                 c.name.to_uppercase()
             } else {
                 c.name.to_lowercase()
@@ -5760,8 +6000,9 @@ mod tests {
             total += steps;
         }
         assert!(worst <= 2, "worst probe is {worst} slots");
+        assert_eq!(worst, 1, "the multiplier stopped keeping every command close");
         assert!(
-            total <= 18,
+            total <= 21,
             "{total} extra slots walked over the whole table"
         );
     }

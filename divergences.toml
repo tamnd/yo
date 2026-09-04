@@ -426,3 +426,25 @@ title = "The weighted mean adds in a double where the module adds in a long doub
 reason = "TWA is the area under the line joining the readings in a bucket, and the module accumulates that area in a C long double, which is eighty bit extended on x86-64, IEEE binary128 on aarch64 Linux and a plain sixty four bit double on Apple silicon, so the module's own answer to the same read already depends on which machine it was built on. This adds in an f64 everywhere, which is the Apple silicon answer and the same trade D-21 makes for AROP. The difference is the last digit of a bucket whose trapezoids do not add exactly, roughly one read in a hundred over a sweep of twelve thousand, and it never shows up on a bucket whose area lands on a number a double holds exactly. Every other part of the reduction agrees, including which readings a bucket reaches for on each side, where it cuts the bucket off against the ends of the read, and the whole bucket a compaction rule writes."
 status = "permanent"
 spec = "11 section 9"
+
+[[divergence]]
+id = "D-58"
+title = "FT.INFO answers zero for every counter that describes documents"
+reason = "The sixteen commands that define an index ship before the commands that put documents into one, so every field FT.INFO reports about content is the honest answer for an index with nothing in it: num_docs, max_doc_id, num_terms, num_records and the inverted index block count are zero, the sizes in megabytes are zero, the averages that are a ratio of two zeros are nan the same way they are on the reference, and percent_indexed is one because an index with no documents is fully indexed. The reference answers exactly these numbers for an index that has just been created over no matching keys, so a client reading FT.INFO on a fresh index cannot tell the two apart, and the difference only appears once documents exist. The memory figures are the other half: what an index costs here is arena bytes rather than the module's allocator arithmetic over the module's own block layout, so those fields will report this server's number rather than the reference's for the same reason D-53 gives for TS.INFO. Everything about the definition is exact today, which is the part a client branches on: the name, the options, the prefixes, the filter, the language, the score, every attribute with its options in the reference's own order, and the shape of the reply on both protocols."
+status = "until"
+resolved_by = "M8"
+spec = "09 section 5"
+
+[[divergence]]
+id = "D-59"
+title = "FT._LIST answers in creation order where the reference answers in hash order"
+reason = "The reference keeps its indexes in a dictionary and FT._LIST walks it, so the order the names come back in is the order they hash into a table whose size depends on how many there are, which changes when the table resizes and has nothing to do with when the indexes were made. This keeps them in a vector and walks that, so the order is the order they were created in. Neither order is documented and the module's own tests sort the reply before comparing it, so a client that depends on either is reading an accident. Creation order is the more useful accident: it is stable across a restart, it does not change when an unrelated index is dropped, and it is what a human reading a list of indexes expects. The set of names is identical on both, and so is the type on the wire, which is a set on RESP3 and an array on RESP2."
+status = "permanent"
+spec = "09 section 5"
+
+[[divergence]]
+id = "D-60"
+title = "A compressed Vamana field reports the scheme the client asked for"
+reason = "SVS-VAMANA takes a COMPRESSION word out of a list of six, and what FT.INFO reports back for it depends on how the reference was built rather than on what the client sent. The LVQ and LeanVec schemes come from a library that is only compiled in on x86-64 with the right instruction set, and a build without them quietly falls back to a scalar quantiser and reports GlobalSQ8 for all six words, which is what the arm64 build used for this comparison does. Reporting the same thing here would mean copying one build's missing dependency into a server that has no such dependency, and it would make FT.INFO answer a word the client never sent and cannot ask for. The word the client asked for is echoed instead, in the spelling the module knows the scheme by, so LVQ8 comes back as LVQ8 and leanvec4x8 comes back as LeanVec4x8. Everything else about the field agrees, including which words each algorithm takes, the training threshold that goes with a compression and its default of 10240, and the order the whole attribute is reported in."
+status = "permanent"
+spec = "09 section 5"

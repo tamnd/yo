@@ -167,6 +167,23 @@ doc = "10 section 9"
 # grants access rather than the one that refuses it.
 
 [[group]]
+name = "search"
+expected = 46
+status = "partial"
+doc = "09 section 5"
+# Forty six is what COMMAND LIST FILTERBY ACLCAT search answers on a running
+# Redis 8.10, and it is the forty one FT names plus five that are not FT names
+# at all: _FT.CONFIG, _FT.DEBUG, search.CLUSTERINFO, search.CLUSTERREFRESH and
+# search.CLUSTERSET. Those five belong to the coordinator rather than to the
+# index and arrive with the cluster work, so the group cannot reach shipped
+# before that lands however many FT commands are done.
+# The sixteen listed here are the ones about the index itself: making one,
+# altering one, dropping one, reading one back and the alias family. None of
+# them names a key, and the four with an underscore in front are the forms the
+# coordinator calls, which differ from the plain ones only in what they do when
+# the index is already there or already gone.
+
+[[group]]
 name = "bloom"
 expected = 11
 status = "shipped"
@@ -2967,6 +2984,186 @@ status = "shipped"
 wire = "verified"
 notes = "The only command in the group that never looks at a vector. It reads the element names as names, in the order bytes come in, with the same four spellings a lex range has anywhere else, so a client can page over a set that is being written to without holding a cursor and without the repeats and misses a random draw gives it. One spelling is not the same as elsewhere: a bracket with nothing after it is an error here rather than the empty name, which matters because an element really can be called the empty string and so the two answers are about a real element. The count is read before either end, so a request that has a bad range and a bad count is told about the count. Both ends are read before either is placed, so a range written backwards is told about its spelling first and about its direction second. Zero is not the same as leaving the count out, since a client that asked for no elements is given none, and a negative count is no limit at all. The range is decided first and only what it covers is sorted, which is what keeps reading ten names off a large set from sorting the whole of it."
 
+
+# ---------------------------------------------------------------------- search
+
+[[command]]
+name = "FT.CREATE"
+group = "search"
+since = "1.0.0"
+arity = -5
+plan = "none"
+bounded = "inherent"
+status = "shipped"
+wire = "verified"
+notes = "The index is looked up before a single argument is parsed, so creating one that is already there answers Index already exists whatever nonsense follows the name, and a client that retries a create does not get told about a typo it has had in the script all along. The options in front of SCHEMA are read in a loop that takes them in any order and any number of times, with the last one winning, because that is what the module does. The counted ones are greedy over words and not over options, so PREFIX 2 a: SCHEMA t TEXT reads SCHEMA as the second prefix and then complains about t, which is a message that looks wrong and is exactly right. The schema itself is two loops, one that reads a name and an optional AS and a type, and one that reads flag words until it sees something that is not one, which is why TEXT SORTABLE WITHSUFFIXTRIE is an error and TEXT WITHSUFFIXTRIE SORTABLE is not: the suffix trie belongs to the type and the sortable flag ends the type. Nothing is written until the whole schema parses, so a create that fails halfway leaves no index behind. The keyspace backfill a real server starts here arrives with the document work and the plan becomes a walk over the prefixes then."
+
+[[command]]
+name = "FT._CREATEIFNX"
+group = "search"
+since = "1.0.0"
+arity = -5
+plan = "none"
+bounded = "inherent"
+status = "shipped"
+wire = "verified"
+notes = "FT.CREATE with the one difference the name promises: an index that is already there is left alone and answers OK rather than an error. The existence check still comes before the parse, so a create with a schema that would never parse answers OK when the index exists, and the same command answers an error the moment somebody drops it. This is the form the coordinator sends when it is making an index on every shard and does not know which of them already has one."
+
+[[command]]
+name = "FT.ALTER"
+group = "search"
+since = "1.0.0"
+arity = -6
+plan = "none"
+bounded = "inherent"
+status = "shipped"
+wire = "verified"
+notes = "Only one action exists, and it is SCHEMA ADD followed by field definitions read with the same two loops FT.CREATE uses. The word after the index name has to be SCHEMA and the word after that has to be ADD, and the two get different sentences: a missing SCHEMA is ALTER must be followed by SCHEMA and anything other than ADD is Unknown action passed to ALTER SCHEMA. A field whose name is already in the schema is a duplicate and the whole command fails, so an alter is all or nothing the same way a create is. SKIPINITIALSCAN is taken and ignored, because the initial scan it turns off is the one that is not there yet."
+
+[[command]]
+name = "FT._ALTERIFNX"
+group = "search"
+since = "1.0.0"
+arity = -6
+plan = "none"
+bounded = "inherent"
+status = "shipped"
+wire = "verified"
+notes = "FT.ALTER with the duplicate field turned from an error into a no change. The fields that are new are added and the ones already there are left as they are, which is what makes an alter safe to send twice, and the reply is OK either way. The coordinator uses it for the same reason it uses the create form with the suffix."
+
+[[command]]
+name = "FT.DROPINDEX"
+group = "search"
+since = "2.0.0"
+arity = -2
+plan = "none"
+bounded = "inherent"
+status = "shipped"
+wire = "verified"
+notes = "The index and every alias pointing at it go, and DD is taken and does nothing because there are no indexed documents to delete yet. It counts its own arguments rather than leaving it to the arity in the table, and the sentence it writes when the count is wrong names the command with an underscore in front of it, so a client sending three arguments and a word that is not DD is told about '_FT.DROPINDEX' with a leading underscore that is not in the name it sent. That is the module quoting its own internal registration and it is copied because a client can see it."
+
+[[command]]
+name = "FT._DROPINDEXIFX"
+group = "search"
+since = "2.0.0"
+arity = -2
+plan = "none"
+bounded = "inherent"
+status = "shipped"
+wire = "verified"
+notes = "FT.DROPINDEX with a missing index answered OK instead of Index not found. The arity sentence gets the same underscore stuck on the front, so this one reads '_FT._DROPINDEXIFX' with two underscores in it, which is the module quoting a name no client ever sends."
+
+[[command]]
+name = "FT.DROP"
+group = "search"
+since = "1.0.0"
+arity = -1
+plan = "none"
+bounded = "inherent"
+status = "shipped"
+wire = "verified"
+notes = "The old name for dropping an index, still registered and still working, and not the same command underneath. It does not take DD, it looks the index up before it complains about anything extra after the name, and the complaint is a bare Unknown argument with no word quoted after it. It also carries no since in COMMAND DOCS because the module never documented it, so the version here is the one the module first shipped it in rather than one read off a running server."
+
+[[command]]
+name = "FT._DROPIFX"
+group = "search"
+since = "1.0.0"
+arity = -1
+plan = "none"
+bounded = "inherent"
+status = "shipped"
+wire = "verified"
+notes = "FT.DROP with a missing index answered OK. Its ACL categories are the short pair rather than the four the plain form carries, which is a difference in what a rule can refuse rather than in what the command does, and it is copied because an ACL written against a real server has to mean the same thing here."
+
+[[command]]
+name = "FT.INFO"
+group = "search"
+since = "1.0.0"
+arity = 2
+plan = "none"
+bounded = "yes"
+status = "shipped"
+wire = "verified"
+divergent = "D-58"
+notes = "Everything the server knows about one index, and the reply shape is the fussiest in the group: on RESP2 it is a flat array where some values are simple strings, some are integers and some are bulk strings holding a number, and which is which was read off the wire rather than guessed. The counters that describe documents are all zero until the document work lands and the memory figures are zero or nan, which is D-51. number_of_uses counts opens and this command is one, so it increments before it reports and the first FT.INFO after a create answers one. indexes_all is a constant false, because a real server answers false with no prefix, with an empty prefix, on JSON and after a key has been indexed, so there is nothing it is the answer to yet. An attribute echoes its options in a fixed order that is not the order they were sent in, and a sortable numeric field reports UNF whether or not the client asked for it."
+
+[[command]]
+name = "FT._LIST"
+group = "search"
+since = "2.0.0"
+arity = -1
+plan = "none"
+bounded = "yes"
+status = "shipped"
+wire = "verified"
+divergent = "D-59"
+notes = "Every index name, as simple strings, and a set rather than an array on RESP3. The order is creation order here and hash order there, which is D-52: a real server walks its own dictionary and the order it gives back is stable for a given set of names and means nothing, so a client that sorts is right on both and a client that does not is reading an accident either way."
+
+[[command]]
+name = "FT.ALIASADD"
+group = "search"
+since = "1.0.0"
+arity = 3
+plan = "none"
+bounded = "inherent"
+status = "shipped"
+wire = "verified"
+notes = "A second name for an index, refused if the alias is already an alias and refused if it is the name of an index, with two different sentences for the two. The second check is the one that matters: an alias that shadowed an index name would make every later command ambiguous, so the module refuses it up front with Alias conflicts with an existing index name and so does this."
+
+[[command]]
+name = "FT._ALIASADDIFNX"
+group = "search"
+since = "1.0.0"
+arity = 3
+plan = "none"
+bounded = "inherent"
+status = "shipped"
+wire = "verified"
+notes = "FT.ALIASADD with an alias that already points at the same index answered OK. An alias pointing at a different index is still Alias already exists, because that is a move rather than a repeat and the command that moves one is FT.ALIASUPDATE."
+
+[[command]]
+name = "FT.ALIASDEL"
+group = "search"
+since = "1.0.0"
+arity = 2
+plan = "none"
+bounded = "inherent"
+status = "shipped"
+wire = "verified"
+notes = "Takes an alias away and leaves the index alone. A name that is nothing at all is a bare Alias does not exist with no code in front of it, which is one of the several search errors that have no prefix, and the name of an index is a different answer again: Alias does not belong to provided spec, because the name exists and is simply not an alias."
+
+[[command]]
+name = "FT._ALIASDELIFX"
+group = "search"
+since = "1.0.0"
+arity = 2
+plan = "none"
+bounded = "inherent"
+status = "shipped"
+wire = "verified"
+notes = "FT.ALIASDEL with an alias that is not there answered OK. The suffix does not forgive the name of an index, which is still Alias does not belong to provided spec, because that name is not missing and the command was still asked to do something it cannot."
+
+[[command]]
+name = "FT.ALIASUPDATE"
+group = "search"
+since = "1.0.0"
+arity = 3
+plan = "none"
+bounded = "inherent"
+status = "shipped"
+wire = "verified"
+notes = "Points an alias at an index whether or not it pointed somewhere already, which is the only way to move one without a window where it points at nothing. Pointing it at a name that is an index rather than an alias is Alias does not belong to provided spec, which reads like a sentence about ownership and is really the module noticing that the name it was asked to move is not an alias at all."
+
+[[command]]
+name = "FT.ALIASLIST"
+group = "search"
+since = "8.10.0"
+arity = 2
+plan = "none"
+bounded = "yes"
+status = "shipped"
+wire = "verified"
+notes = "The aliases of one index, which is the only command in the alias family that reads rather than writes and the newest command in the group. The name is misleading in the same way it is on a real server: it does not list every alias on the server, it takes an index and lists that index's own, and calling it with no argument is an arity error rather than a listing. The names come back as bulk strings where FT._LIST writes simple ones, and as a set on RESP3."
 
 # ----------------------------------------------------------------------- bloom
 
