@@ -113,6 +113,7 @@ pub mod dispatch;
 pub mod engine;
 pub mod error;
 pub mod frame;
+mod front;
 pub mod proto;
 pub mod reply;
 pub mod request;
