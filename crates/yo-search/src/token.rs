@@ -81,7 +81,123 @@ pub fn bare(src: &[u8]) -> Vec<u8> {
     }
 }
 
-/// A word folded to lower case, the way the whole family folds it.
+/// How many bytes a character that starts with this byte is read as.
+///
+/// This is not quite the UTF-8 rule. It is a range check on the first byte and
+/// nothing else, so everything from `0x80` to `0xdf` starts a two byte
+/// character, including the continuation bytes that cannot start anything at
+/// all. A stray `0x80` in the middle of a word therefore eats the byte after it
+/// rather than being refused, and the word that comes out is not the word that
+/// went in. That is what a real server does and there is no way to be
+/// compatible with it and sensible at the same time.
+#[must_use]
+pub const fn width(lead: u8) -> usize {
+    match lead {
+        0x00..=0x7f => 1,
+        0x80..=0xdf => 2,
+        0xe0..=0xef => 3,
+        _ => 4,
+    }
+}
+
+/// The character starting at `at` and how many bytes it took.
+///
+/// Every byte after the first is taken for its low six bits whatever it is, and
+/// a byte off the end of `src` counts as zero, which is what reading a C string
+/// one character at a time does when the string runs out in the middle of one.
+/// So the answer can be far outside the range of a character, and the caller
+/// has to be ready for that rather than assuming it decoded anything real.
+fn rune(src: &[u8], at: usize) -> (u32, usize) {
+    let lead = src[at];
+    let took = width(lead);
+    if took == 1 {
+        return (u32::from(lead), 1);
+    }
+    let mask = match took {
+        2 => 0x1f,
+        3 => 0x0f,
+        _ => 0x07,
+    };
+    let mut cp = u32::from(lead) & mask;
+    for step in 1..took {
+        let b = src.get(at + step).copied().unwrap_or(0);
+        cp = (cp << 6) | (u32::from(b) & 0x3f);
+    }
+    (cp, took)
+}
+
+/// One character written back out, in as few bytes as it fits in.
+///
+/// A character that is not a character at all, which is what reading a broken
+/// one gives, is written in the same shape as one of its size. Nothing reads
+/// these back as text, they are index keys and they only have to be the same
+/// key every time.
+fn push_rune(out: &mut Vec<u8>, cp: u32) {
+    match cp {
+        0x0000..=0x007f => out.push(cp as u8),
+        0x0080..=0x07ff => {
+            out.extend_from_slice(&[0xc0 | (cp >> 6) as u8, 0x80 | (cp & 0x3f) as u8])
+        }
+        0x0800..=0xffff => out.extend_from_slice(&[
+            0xe0 | (cp >> 12) as u8,
+            0x80 | ((cp >> 6) & 0x3f) as u8,
+            0x80 | (cp & 0x3f) as u8,
+        ]),
+        _ => out.extend_from_slice(&[
+            0xf0 | ((cp >> 18) & 0x07) as u8,
+            0x80 | ((cp >> 12) & 0x3f) as u8,
+            0x80 | ((cp >> 6) & 0x3f) as u8,
+            0x80 | (cp & 0x3f) as u8,
+        ]),
+    }
+}
+
+/// The folding both sides share, over the first `head` bytes of `src`.
+///
+/// A character whose first byte is inside the head is folded even where the
+/// rest of it is not, so the fold reads past the head and stops as soon as a
+/// character starts outside it. A character that comes out as zero ends the
+/// word there, because what holds it is a C string and there is nothing after a
+/// zero in one of those. That is checked after the cutting and not before it,
+/// so a character that is only zero once it has been cut down ends the word
+/// too, which is why a value of one `0xf0` and a space indexes nothing.
+fn folded(src: &[u8], head: usize, cut: bool) -> Vec<u8> {
+    let head = head.min(src.len());
+    let mut out = Vec::with_capacity(head);
+    let mut at = 0;
+    'word: while at < head {
+        let (cp, took) = rune(src, at);
+        at += took;
+        match char::from_u32(cp) {
+            Some(c) => {
+                for c in c.to_lowercase() {
+                    let c = narrow(u32::from(c), cut);
+                    if c == 0 {
+                        break 'word;
+                    }
+                    push_rune(&mut out, c);
+                }
+            }
+            // Nothing to fold it to, because it is not a character. Whatever
+            // came out of the decoding is what goes in.
+            None => {
+                let cp = narrow(cp, cut);
+                if cp == 0 {
+                    break 'word;
+                }
+                push_rune(&mut out, cp);
+            }
+        }
+    }
+    out
+}
+
+/// A character cut down to sixteen bits, where that is what the caller stores.
+const fn narrow(cp: u32, cut: bool) -> u32 {
+    if cut { cp & 0xffff } else { cp }
+}
+
+/// A word folded to lower case, the way a query folds it.
 ///
 /// This is the full Unicode lowercase mapping and not the ASCII one, so `ÉTÉ`
 /// is `été`, `ЖУК` is `жук` and `İ` is the two characters `i` and a combining
@@ -90,49 +206,38 @@ pub fn bare(src: &[u8]) -> Vec<u8> {
 /// to `οδος`: the final sigma rule is a conditional mapping and a real server
 /// does not apply it.
 ///
-/// Bytes that are not valid UTF-8 are handed back as they arrived. There is
-/// nothing sensible to fold them to, and a value that reaches here is whatever
-/// the client wrote rather than something that has been validated.
+/// Bytes that are not valid UTF-8 are read anyway, under [`width`], and what
+/// comes out of that is what the word becomes. There is nothing sensible to do
+/// with them and this is what a real server does with them.
 #[must_use]
 pub fn fold(src: &[u8]) -> Vec<u8> {
     // The common case is a word that is already lower case and all ASCII, and
     // walking it once to find that out is cheaper than building a second copy
     // of it every time.
-    if src.iter().all(|b| b.is_ascii() && !b.is_ascii_uppercase()) {
+    if src
+        .iter()
+        .all(|b| b.is_ascii() && !b.is_ascii_uppercase() && *b != 0)
+    {
         return src.to_vec();
     }
-    let mut out = Vec::with_capacity(src.len());
-    let mut rest = src;
-    loop {
-        match std::str::from_utf8(rest) {
-            Ok(s) => {
-                push_folded(&mut out, s);
-                return out;
-            }
-            Err(e) => {
-                let (good, bad) = rest.split_at(e.valid_up_to());
-                // Safe because `valid_up_to` is where the decoder stopped.
-                push_folded(&mut out, std::str::from_utf8(good).unwrap_or_default());
-                let skip = e.error_len().unwrap_or(bad.len()).max(1);
-                out.extend_from_slice(&bad[..skip.min(bad.len())]);
-                rest = &bad[skip.min(bad.len())..];
-            }
-        }
-    }
+    folded(src, src.len(), false)
 }
 
-/// The folded form of a run that is known to decode.
-fn push_folded(out: &mut Vec<u8>, s: &str) {
-    for c in s.chars() {
-        if c.is_ascii() {
-            out.push(c.to_ascii_lowercase() as u8);
-        } else {
-            for c in c.to_lowercase() {
-                let mut buf = [0u8; 4];
-                out.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
-            }
-        }
-    }
+/// A word folded the way a document folds it, which is not quite the same.
+///
+/// Every character is cut down to sixteen bits on the way into an index. A
+/// document holding an emoji stores something else, and the query looking for
+/// that emoji keeps it whole and therefore never finds the document. That is a
+/// real server's behaviour and not ours, and copying it is the only way a
+/// document written through one and read through the other says the same thing.
+///
+/// `src` is the word followed by whatever came after it in the value, and
+/// `head` is how long the word is. The tail is there because folding a word
+/// whose last character is broken reads past the end of it, into bytes that
+/// were never part of the word.
+#[must_use]
+pub fn fold_stored(src: &[u8], head: usize) -> Vec<u8> {
+    folded(src, head, true)
 }
 
 #[cfg(test)]
@@ -171,11 +276,54 @@ mod tests {
         assert_eq!(fold("ΟΔΟΣ".as_bytes()), "οδοσ".as_bytes());
     }
 
+    /// Bytes that are not a word at all are read as though they were, because
+    /// that is what a real server does with them.
     #[test]
-    fn bytes_that_are_not_a_word_at_all_come_back_as_they_went_in() {
-        assert_eq!(fold(b"aa\xffbb"), b"aa\xffbb");
-        assert_eq!(fold(b"\xc3"), b"\xc3");
-        assert_eq!(fold(b"A\xffB"), b"a\xffb");
+    fn a_broken_character_is_read_rather_than_refused() {
+        assert_eq!(fold(b"zz\x80yy"), b"zz9y");
+        assert_eq!(fold(b"aa\xffbb"), b"aa\xf7\xa2\xa2\x80");
+        // The byte after the end of the word counts as a zero, and a character
+        // that comes out as zero ends the word.
+        assert_eq!(fold(b"zz\x80"), b"zz");
+        // A byte on its own that reads as a character with nothing in it is a
+        // character all the same, and this one is `À`.
+        assert_eq!(fold(b"\xc3"), "à".as_bytes());
+    }
+
+    /// The head is how much of the buffer is the word, and the rest of it is
+    /// only there to be read by a character that started inside the head and
+    /// did not finish there.
+    #[test]
+    fn folding_a_word_reads_past_it_and_does_not_go_past_it() {
+        assert_eq!(fold_stored(b"zz\x80 yy", 3), b"zz ");
+        assert_eq!(fold_stored(b"zz\x80-yy", 3), b"zz-");
+        assert_eq!(fold_stored(b"zzyy", 2), b"zz");
+    }
+
+    /// Every character an index stores is cut down to sixteen bits, so the ones
+    /// above that come out as something else entirely.
+    #[test]
+    fn what_goes_into_an_index_is_cut_to_sixteen_bits() {
+        let emoji = "😀".as_bytes();
+        assert_eq!(fold_stored(emoji, emoji.len()), "\u{f600}".as_bytes());
+        assert_eq!(fold(emoji), emoji);
+        // Lowercased first and cut afterwards, which is why this Osage capital
+        // comes out as the small letter and not as the capital.
+        let osage = "𐒰".as_bytes();
+        assert_eq!(fold_stored(osage, osage.len()), "\u{4d8}".as_bytes());
+        assert_eq!(fold(osage), "𐓘".as_bytes());
+    }
+
+    #[test]
+    fn a_first_byte_says_how_many_bytes_a_character_has() {
+        assert_eq!(width(b'a'), 1);
+        assert_eq!(width(0x80), 2);
+        assert_eq!(width(0xc3), 2);
+        assert_eq!(width(0xdf), 2);
+        assert_eq!(width(0xe0), 3);
+        assert_eq!(width(0xef), 3);
+        assert_eq!(width(0xf0), 4);
+        assert_eq!(width(0xff), 4);
     }
 
     /// A backslash that protects a backslash does not survive being read, which
