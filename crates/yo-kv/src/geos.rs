@@ -428,7 +428,7 @@ impl Db {
     /// `WRONGTYPE` from the source, which is checked before the destination is
     /// touched.
     pub fn geosearchstore(
-        &mut self,
+        &self,
         dest: &[u8],
         src: &[u8],
         shape: &Shape,
@@ -438,10 +438,10 @@ impl Db {
         let (home, onto) = (self.stripe_of(src), self.stripe_of(dest));
         if home == onto {
             return self
-                .stripe_mut(home)
+                .hold_stripe(home)
                 .geosearchstore(dest, src, shape, limit, dist);
         }
-        let n = self.stripe_mut(home).geosearch(src, shape, limit)?;
+        let n = self.hold_stripe(home).geosearch(src, shape, limit)?;
         let mut got = Elements::with_capacity(n.max(16));
         // Both at once and in stripe order, since the hits are read out of the
         // source's stripe and the destination's limits decide what is built
@@ -458,7 +458,7 @@ impl Db {
         let limits = held.stripe(onto).zset_limits;
         let built = Zset::from_elements(got, &limits);
         drop(held);
-        Ok(self.stripe_mut(onto).put_zset(dest, built))
+        Ok(self.hold_stripe(onto).put_zset(dest, built))
     }
 }
 

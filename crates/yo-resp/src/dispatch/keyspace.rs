@@ -219,10 +219,11 @@ pub(super) fn execute(
         // Every stripe and not one, and the stripe is drawn first so that the
         // key is still drawn from the database rather than from whichever
         // stripe happened to be asked. See [`Db::random_key`].
-        "randomkey" => match db.random_key() {
-            Some(key) => out.bulk(key),
-            None => out.nil(),
-        },
+        "randomkey" => {
+            if !db.random_key(|key| out.bulk(key)) {
+                out.nil();
+            }
+        }
         other => unreachable!("keyspace command with no body: {other}"),
     }
     Ok(())

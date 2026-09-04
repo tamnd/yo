@@ -290,9 +290,11 @@ fn mpop(db: &mut Db, args: Args<'_>, out: &mut Out) -> Result<()> {
 
 /// `LMOVE` and `RPOPLPUSH`, which are the same command.
 fn moved(db: &mut Db, src: &[u8], dst: &[u8], from: End, to: End, out: &mut Out) -> Result<()> {
-    match db.lmove(src, dst, from, to)? {
-        Some(v) => out.bulk(v),
-        None => out.nil(),
+    // The element is written from inside the move rather than answered by it,
+    // because what it is borrowed from is a stripe that is still held while the
+    // reply is being written and is let go of straight after.
+    if !db.lmove(src, dst, from, to, |v| out.bulk(v))? {
+        out.nil();
     }
     Ok(())
 }

@@ -828,7 +828,7 @@ impl Db {
     /// one, so only keys that are genuinely spread out pay for the two passes
     /// below.
     pub fn zsetop<'k, F>(
-        &mut self,
+        &self,
         op: Op,
         keys: impl Iterator<Item = &'k [u8]> + Clone,
         weights: &[f64],
@@ -839,7 +839,7 @@ impl Db {
         F: FnMut(Member<'_>, f64),
     {
         if let Some(home) = self.one_stripe(keys.clone()) {
-            return self.stripe_mut(home).zsetop(op, keys, weights, agg, f);
+            return self.hold_stripe(home).zsetop(op, keys, weights, agg, f);
         }
         let slots = self.operand_slots(keys)?;
         let held = self.hold_operands(&slots);
@@ -861,7 +861,7 @@ impl Db {
     /// so no body is written over while it is still being read, whichever stripe
     /// it is on.
     pub fn zsetop_store<'k>(
-        &mut self,
+        &self,
         op: Op,
         destination: &'k [u8],
         keys: impl Iterator<Item = &'k [u8]> + Clone,
@@ -870,7 +870,7 @@ impl Db {
     ) -> Result<usize> {
         if let Some(home) = self.one_stripe(std::iter::once(destination).chain(keys.clone())) {
             return self
-                .stripe_mut(home)
+                .hold_stripe(home)
                 .zsetop_store(op, destination, keys, weights, agg);
         }
         let slots = self.operand_slots(keys)?;
@@ -881,17 +881,17 @@ impl Db {
         // going to live.
         let limits = self.hold(destination).zset_limits;
         let built = Zset::from_elements(got, &limits);
-        Ok(self.at(destination).put_zset(destination, built))
+        Ok(self.hold(destination).put_zset(destination, built))
     }
 
     /// `ZINTERCARD numkeys key [key ...] [LIMIT limit]`.
     pub fn zintercard<'k>(
-        &mut self,
+        &self,
         keys: impl Iterator<Item = &'k [u8]> + Clone,
         limit: usize,
     ) -> Result<usize> {
         if let Some(home) = self.one_stripe(keys.clone()) {
-            return self.stripe_mut(home).zintercard(keys, limit);
+            return self.hold_stripe(home).zintercard(keys, limit);
         }
         let slots = self.operand_slots(keys)?;
         let held = self.hold_operands(&slots);
@@ -905,17 +905,16 @@ impl Db {
     /// sorted set that comes of it is put on the destination's. The source keeps
     /// its members either way, which is what makes the copy the right shape even
     /// when the two keys are the same key.
-    pub fn zrangestore(
-        &mut self,
-        destination: &[u8],
-        source: &[u8],
-        q: &Query<'_>,
-    ) -> Result<usize> {
+    pub fn zrangestore(&self, destination: &[u8], source: &[u8], q: &Query<'_>) -> Result<usize> {
         let (onto, home) = (self.stripe_of(destination), self.stripe_of(source));
         if onto == home {
-            return self.stripe_mut(onto).zrangestore(destination, source, q);
+            return self.hold_stripe(onto).zrangestore(destination, source, q);
         }
-        let built = match self.stripe_mut(home).zset_slot(source)? {
+        // Out of the stripe and then let go of, because a match keeps whatever
+        // it is looking at alive for the whole of itself and the arm below
+        // wants this same stripe again.
+        let slot = self.hold_stripe(home).zset_slot(source)?;
+        let built = match slot {
             None => None,
             Some(at) => {
                 // Both at once and in stripe order rather than one and then the
@@ -934,7 +933,7 @@ impl Db {
                 Zset::from_elements(got, &limits)
             }
         };
-        Ok(self.stripe_mut(onto).put_zset(destination, built))
+        Ok(self.hold_stripe(onto).put_zset(destination, built))
     }
 
     /// Reap and resolve every input key, in order, to the stripe and slot its
@@ -944,15 +943,12 @@ impl Db {
     /// place rather than dropping it, because `WEIGHTS` is positional. Each key
     /// is resolved on its own stripe, which is the only difference, and it has to
     /// happen before any body is read because the reap wants the stripe mutably.
-    fn operand_slots<'k>(
-        &mut self,
-        keys: impl Iterator<Item = &'k [u8]>,
-    ) -> Result<Vec<Option<Home>>> {
+    fn operand_slots<'k>(&self, keys: impl Iterator<Item = &'k [u8]>) -> Result<Vec<Option<Home>>> {
         let mut out = Vec::with_capacity(keys.size_hint().0);
         for key in keys {
             let stripe = self.stripe_of(key);
             let got = self
-                .stripe_mut(stripe)
+                .hold_stripe(stripe)
                 .live_slot_either(key, Kind::Zset, Kind::Set)?;
             out.push(got.map(|(kind, at)| (stripe, kind, at)));
         }

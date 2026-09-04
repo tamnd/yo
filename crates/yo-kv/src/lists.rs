@@ -658,36 +658,38 @@ impl Db {
     /// has to be copied for the reason the one stripe version gives, that it has
     /// no structure to borrow from once it has moved, and the copy costs no
     /// allocation after the first call for the same reason too.
-    pub fn lmove(&mut self, src: &[u8], dst: &[u8], from: End, to: End) -> Result<Option<&[u8]>> {
+    pub fn lmove<F>(&self, src: &[u8], dst: &[u8], from: End, to: End, f: F) -> Result<bool>
+    where
+        F: FnOnce(&[u8]),
+    {
         let (home, onto) = (self.stripe_of(src), self.stripe_of(dst));
         if home == onto {
-            return self.stripe_mut(home).lmove(src, dst, from, to);
+            return match self.hold_stripe(home).lmove(src, dst, from, to)? {
+                Some(moved) => {
+                    f(moved);
+                    Ok(true)
+                }
+                None => Ok(false),
+            };
         }
         // The destination's type before anything is taken, which is the order
         // that makes `LMOVE list string LEFT LEFT` leave the source alone.
-        self.stripe_mut(onto).list_slot(dst)?;
-        let (mut buf, rows) = self.take_scratch();
+        self.hold_stripe(onto).list_slot(dst)?;
+        // The buffers before the stripes, which is the order every command that
+        // wants both takes them in.
+        let mut spare = self.spare();
+        let buf = &mut spare.bytes;
         buf.clear();
-        let took = self
-            .stripe_mut(home)
-            .pop_into(src, from, 1, |e| e.write_to(&mut buf));
-        let moved = match took {
-            Ok(n) => n,
-            Err(e) => {
-                self.put_scratch(buf, rows);
-                return Err(e);
-            }
-        };
+        let moved = self
+            .hold_stripe(home)
+            .pop_into(src, from, 1, |e| e.write_to(buf))?;
         if moved == 0 {
-            self.put_scratch(buf, rows);
-            return Ok(None);
+            return Ok(false);
         }
-        let pushed = self
-            .stripe_mut(onto)
-            .push(dst, to, std::iter::once(buf.as_slice()));
-        self.put_scratch(buf, rows);
-        pushed?;
-        Ok(Some(self.scratch_bytes()))
+        self.hold_stripe(onto)
+            .push(dst, to, std::iter::once(buf.as_slice()))?;
+        f(buf);
+        Ok(true)
     }
 
     /// `LMOVEM src dst LEFT|RIGHT LEFT|RIGHT [COUNT|EXACTLY n OBO|BULK]`.
@@ -702,40 +704,34 @@ impl Db {
     /// hands the block to that method on the destination's stripe. The source
     /// stripe has already given the elements up by then, so what is left is a
     /// push into one stripe, which is a move whose source is not there.
-    pub fn lmovem<F>(&mut self, src: &[u8], dst: &[u8], b: Movem, f: F) -> Result<usize>
+    pub fn lmovem<F>(&self, src: &[u8], dst: &[u8], b: Movem, f: F) -> Result<usize>
     where
         F: FnMut(&[u8]),
     {
         let (home, onto) = (self.stripe_of(src), self.stripe_of(dst));
         if home == onto {
-            return self.stripe_mut(home).lmovem(src, dst, b, f);
+            return self.hold_stripe(home).lmovem(src, dst, b, f);
         }
         // Both types settled before a single element moves, and the length of
         // the source is wanted for `EXACTLY` anyway.
-        self.stripe_mut(onto).list_slot(dst)?;
-        let have = self.stripe_mut(home).llen(src)?;
+        self.hold_stripe(onto).list_slot(dst)?;
+        let have = self.hold_stripe(home).llen(src)?;
         if have == 0 || (b.exactly && have < b.count) {
             return Ok(0);
         }
-        let (mut buf, mut ends) = self.take_scratch();
+        // The buffers before the stripes, which is the order every command that
+        // wants both takes them in.
+        let mut spare = self.spare();
+        let spare = &mut *spare;
+        let (buf, ends) = (&mut spare.bytes, &mut spare.rows);
         buf.clear();
         ends.clear();
-        let took = self.stripe_mut(home).pop_into(src, b.from, b.count, |e| {
-            e.write_to(&mut buf);
+        let moved = self.hold_stripe(home).pop_into(src, b.from, b.count, |e| {
+            e.write_to(buf);
             ends.push(buf.len());
-        });
-        let moved = match took {
-            Ok(n) => n,
-            Err(e) => {
-                self.put_scratch(buf, ends);
-                return Err(e);
-            }
-        };
-        let pushed = self
-            .stripe_mut(onto)
-            .push_block(dst, b, moved, &buf, &ends, f);
-        self.put_scratch(buf, ends);
-        pushed?;
+        })?;
+        self.hold_stripe(onto)
+            .push_block(dst, b, moved, buf, ends, f)?;
         Ok(moved)
     }
 }

@@ -462,14 +462,11 @@ impl Want {
                 if !ready(db, src, strict)? {
                     return Ok(false);
                 }
-                match db.lmove(src, dst, *from, *to) {
-                    Ok(Some(v)) => {
-                        out.bulk(v);
-                        Ok(true)
-                    }
+                match db.lmove(src, dst, *from, *to, |v| out.bulk(v)) {
+                    Ok(true) => Ok(true),
                     // The source had something in it a line ago and this is the
                     // only thread that could have taken it.
-                    Ok(None) => Ok(false),
+                    Ok(false) => Ok(false),
                     Err(e) if strict => Err(e),
                     // The destination is not a list any more. Nothing was taken,
                     // because `lmove` checks the destination before it pops, so

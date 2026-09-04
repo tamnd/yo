@@ -157,7 +157,7 @@ impl Db {
     /// is the same copy with the copy moved to whoever wrote the value. The copy
     /// is also what lets a `BY` or a `GET` reach a stripe other than the one the
     /// elements came from.
-    pub fn sort(&mut self, key: &[u8], opts: &Sort<'_>) -> Result<Vec<Option<Vec<u8>>>> {
+    pub fn sort(&self, key: &[u8], opts: &Sort<'_>) -> Result<Vec<Option<Vec<u8>>>> {
         let mut opts = *opts;
         opts.store = false;
         self.sorted(key, &opts)
@@ -177,21 +177,21 @@ impl Db {
     /// The destination is on its own stripe, which is not generally the stripe
     /// the elements came from, so it is found here after the sort rather than
     /// anywhere near the read.
-    pub fn sort_store(&mut self, key: &[u8], dest: &[u8], opts: &Sort<'_>) -> Result<usize> {
+    pub fn sort_store(&self, key: &[u8], dest: &[u8], opts: &Sort<'_>) -> Result<usize> {
         let mut opts = *opts;
         opts.store = true;
         let rows = self.sorted(key, &opts)?;
         if rows.is_empty() {
-            self.at(dest).del(dest);
+            self.hold(dest).del(dest);
             return Ok(0);
         }
         // Written into a fresh key rather than appended to whatever was there,
         // and the delete comes first so that `SORT k STORE k` reads k, then
         // throws it away, then writes the answer. Redis is the same, and it is
         // the reason the elements had to be copied out before any of this.
-        self.at(dest).del(dest);
+        self.hold(dest).del(dest);
         let owned: Vec<Vec<u8>> = rows.into_iter().map(Option::unwrap_or_default).collect();
-        self.at(dest).push(
+        self.hold(dest).push(
             dest,
             crate::lists::End::Right,
             owned.iter().map(Vec::as_slice),
@@ -199,8 +199,8 @@ impl Db {
     }
 
     /// The body both of them share.
-    fn sorted(&mut self, key: &[u8], opts: &Sort<'_>) -> Result<Vec<Option<Vec<u8>>>> {
-        let kind = self.at(key).kind_of(key);
+    fn sorted(&self, key: &[u8], opts: &Sort<'_>) -> Result<Vec<Option<Vec<u8>>>> {
+        let kind = self.hold(key).kind_of(key);
         let elems = self.elements(key, kind)?;
 
         // A `BY` with no `*` cannot name a key per element, so it is an order to
@@ -236,10 +236,10 @@ impl Db {
     ///
     /// Owned, for the reason [`Db::sort`] gives. A missing key is an empty
     /// list and not an error, so `SORT nosuchkey` answers nothing.
-    fn elements(&mut self, key: &[u8], kind: Option<Kind>) -> Result<Vec<Vec<u8>>> {
+    fn elements(&self, key: &[u8], kind: Option<Kind>) -> Result<Vec<Vec<u8>>> {
         let mut out = Vec::new();
         // One stripe for the whole of this, since it is all the same key.
-        let db = self.at(key);
+        let mut db = self.hold(key);
         match kind {
             None => {}
             Some(Kind::List) => {
@@ -279,7 +279,7 @@ impl Db {
 
     /// Weigh every element and put them in order.
     fn order(
-        &mut self,
+        &self,
         elems: Vec<Vec<u8>>,
         by: Option<&[u8]>,
         alpha: bool,
@@ -349,7 +349,7 @@ impl Db {
     }
 
     /// Build the answer, which is the elements themselves or a `GET` per element.
-    fn emit(&mut self, elems: &[Vec<u8>], get: &[&[u8]]) -> Result<Vec<Option<Vec<u8>>>> {
+    fn emit(&self, elems: &[Vec<u8>], get: &[&[u8]]) -> Result<Vec<Option<Vec<u8>>>> {
         if get.is_empty() {
             return Ok(elems.iter().map(|e| Some(e.clone())).collect());
         }
@@ -377,7 +377,7 @@ impl Db {
     /// The name is built out of the element, so the stripe it lands on is not
     /// known until here and two elements of the same key are read from two
     /// different stripes as often as not.
-    fn by_pattern(&mut self, pattern: &[u8], elem: &[u8]) -> Option<Vec<u8>> {
+    fn by_pattern(&self, pattern: &[u8], elem: &[u8]) -> Option<Vec<u8>> {
         let star = pattern.iter().position(|&c| c == b'*')?;
         // The field split is looked for after the `*`, so a `->` in the prefix
         // is part of the key name. And there has to be something after it, so a
@@ -398,7 +398,7 @@ impl Db {
         key.extend_from_slice(elem);
         key.extend_from_slice(&key_part[star + 1..]);
 
-        let stripe = self.at(&key);
+        let mut stripe = self.hold(&key);
         match field {
             Some(f) => stripe
                 .hget(&key, f, |t| {
