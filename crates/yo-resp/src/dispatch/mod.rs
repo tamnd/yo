@@ -1380,7 +1380,7 @@ pub fn resolved(
             }
             "ts" => {
                 let db = session.db;
-                ts::execute(&mut server.dbs[db], spec, args, out).map(|()| Flow::Continue)
+                ts::execute(&server.dbs[db], spec, args, out).map(|()| Flow::Continue)
             }
             // The clock is read before the database is borrowed, because every
             // stream command needs the time and it lives on the server. An

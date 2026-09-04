@@ -285,7 +285,7 @@
 
 use yo_common::num::{DOUBLE_MAX, parse_f64, parse_i64, write_dragonbox};
 use yo_common::{Code, Error, Result};
-use yo_kv::{Db, Foreign, KeyCursor, Kind};
+use yo_kv::{Db, Foreign, KeyCursor, Keyspace, Kind};
 use yo_series::{
     Agg, Buckets, Encoding, Policy, Query, Refused, Rows, Sample, Series, Stamp, Unread,
     bucket_start,
@@ -539,7 +539,7 @@ impl Foreign for TsBody {
 /// stripe its key is on and reads that one, so a command naming several series
 /// touches a stripe per series and a rule linking two keys works whether or not
 /// they landed on the same one.
-pub(super) fn execute(db: &mut Db, spec: &Spec, args: Args<'_>, out: &mut Out) -> Result<()> {
+pub(super) fn execute(db: &Db, spec: &Spec, args: Args<'_>, out: &mut Out) -> Result<()> {
     match spec.name {
         "ts.create" => create(db, &args, out),
         "ts.alter" => alter(db, &args, out),
@@ -568,18 +568,18 @@ pub(super) fn execute(db: &mut Db, spec: &Spec, args: Args<'_>, out: &mut Out) -
 
 /// `TS.CREATE key [RETENTION n] [ENCODING e] [CHUNK_SIZE n] [DUPLICATE_POLICY p]
 /// [IGNORE t v] [LABELS name value ...]`.
-fn create(db: &mut Db, args: &Args<'_>, out: &mut Out) -> Result<()> {
+fn create(db: &Db, args: &Args<'_>, out: &mut Out) -> Result<()> {
     let opts = match options(args) {
         Ok(opts) => opts,
         Err(bad) => return said(bad, "ts.create", out),
     };
     let key = args.get(1);
-    if db.at(key).kind_of(key).is_some() {
+    if db.hold(key).kind_of(key).is_some() {
         return say(out, EXISTS);
     }
     let mut s = Series::new();
     apply(&mut s, opts);
-    db.at(key).put_foreign(key, Box::new(TsBody { s }));
+    db.hold(key).put_foreign(key, Box::new(TsBody { s }));
     out.ok();
     Ok(())
 }
@@ -590,13 +590,15 @@ fn create(db: &mut Db, args: &Args<'_>, out: &mut Out) -> Result<()> {
 /// An encoding is read and then thrown away, because a series that already holds
 /// samples cannot be told to store them a different way and the module does not
 /// try. Everything that was not named is left as it was.
-fn alter(db: &mut Db, args: &Args<'_>, out: &mut Out) -> Result<()> {
+fn alter(db: &Db, args: &Args<'_>, out: &mut Out) -> Result<()> {
     let mut opts = match options(args) {
         Ok(opts) => opts,
         Err(bad) => return said(bad, "ts.alter", out),
     };
     opts.encoding = None;
-    let Some(body) = write(db, args.get(1))? else {
+    let key = args.get(1);
+    let mut stripe = db.hold(key);
+    let Some(body) = write(&mut stripe, key)? else {
         return say(out, MISSING);
     };
     apply(&mut body.s, opts);
@@ -610,7 +612,7 @@ fn alter(db: &mut Db, args: &Args<'_>, out: &mut Out) -> Result<()> {
 /// On a series that is already there the only option that means anything is
 /// `ON_DUPLICATE`, and the rest are read past. That is why a `DUPLICATE_POLICY`
 /// on a `TS.ADD` against a key that exists does nothing at all.
-fn add(db: &mut Db, args: &Args<'_>, out: &mut Out) -> Result<()> {
+fn add(db: &Db, args: &Args<'_>, out: &mut Out) -> Result<()> {
     let key = args.get(1);
     let Some(value) = number(args.get(3)) else {
         return say(out, BAD_VALUE);
@@ -619,17 +621,17 @@ fn add(db: &mut Db, args: &Args<'_>, out: &mut Out) -> Result<()> {
         Ok(at) => at,
         Err(msg) => return say(out, msg),
     };
-    let over = if db.at(key).kind_of(key).is_none() {
+    let over = if db.hold(key).kind_of(key).is_none() {
         let opts = match options(args) {
             Ok(opts) => opts,
             Err(bad) => return said(bad, "ts.add", out),
         };
         let mut s = Series::new();
         apply(&mut s, opts);
-        db.at(key).put_foreign(key, Box::new(TsBody { s }));
+        db.hold(key).put_foreign(key, Box::new(TsBody { s }));
         None
     } else {
-        if write(db, key).is_err() {
+        if write(&mut db.hold(key), key).is_err() {
             return say(out, NOT_A_SERIES);
         }
         match find(args, b"ON_DUPLICATE") {
@@ -640,9 +642,15 @@ fn add(db: &mut Db, args: &Args<'_>, out: &mut Out) -> Result<()> {
             },
         }
     };
-    let body = write(db, key)?.expect("the series is there by now");
-    let before = body.s.last();
-    if store(body, at, value, over, out) {
+    // The stripe goes back before the rules run, because a rule writes into
+    // another key and that key can be on this same stripe.
+    let stored = {
+        let mut stripe = db.hold(key);
+        let body = write(&mut stripe, key)?.expect("the series is there by now");
+        let before = body.s.last();
+        store(body, at, value, over, out).then_some(before)
+    };
+    if let Some(before) = stored {
         feed(db, key, at, before)?;
     }
     Ok(())
@@ -654,7 +662,7 @@ fn add(db: &mut Db, args: &Args<'_>, out: &mut Out) -> Result<()> {
 /// after it, so this is the only command in the family whose reply can hold both
 /// timestamps and errors. It creates nothing: a key that is not already a series
 /// is an error in its slot.
-fn madd(db: &mut Db, args: &Args<'_>, out: &mut Out) -> Result<()> {
+fn madd(db: &Db, args: &Args<'_>, out: &mut Out) -> Result<()> {
     if args.len() < 4 || !(args.len() - 1).is_multiple_of(3) {
         return Err(args::wrong_arity("ts.madd"));
     }
@@ -671,18 +679,22 @@ fn madd(db: &mut Db, args: &Args<'_>, out: &mut Out) -> Result<()> {
                 continue;
             }
         };
-        let stored = match write(db, args.get(i)) {
-            Ok(Some(body)) => {
-                let before = body.s.last();
-                store(body, at, value, None, out).then_some(before)
-            }
-            Ok(None) | Err(_) => {
-                out.error_line(b"ERR ", NOT_A_SERIES);
-                None
+        let key = args.get(i);
+        let stored = {
+            let mut stripe = db.hold(key);
+            match write(&mut stripe, key) {
+                Ok(Some(body)) => {
+                    let before = body.s.last();
+                    store(body, at, value, None, out).then_some(before)
+                }
+                Ok(None) | Err(_) => {
+                    out.error_line(b"ERR ", NOT_A_SERIES);
+                    None
+                }
             }
         };
         if let Some(before) = stored {
-            feed(db, args.get(i), at, before)?;
+            feed(db, key, at, before)?;
         }
     }
     Ok(())
@@ -696,15 +708,15 @@ fn madd(db: &mut Db, args: &Args<'_>, out: &mut Out) -> Result<()> {
 /// behind that is an error rather than a backfill. The sample goes in under the
 /// last policy whatever the series says, which is what makes two of these on one
 /// timestamp add up rather than collide.
-fn incr(db: &mut Db, args: &Args<'_>, out: &mut Out, up: bool) -> Result<()> {
+fn incr(db: &Db, args: &Args<'_>, out: &mut Out, up: bool) -> Result<()> {
     let key = args.get(1);
     let name = if up { "ts.incrby" } else { "ts.decrby" };
-    let exists = db.at(key).kind_of(key).is_some();
+    let exists = db.hold(key).kind_of(key).is_some();
     if exists {
         // A key holding something else is `WRONGTYPE` here rather than the
         // sentence `TS.ADD` gives, and it is answered before the number is even
         // looked at.
-        write(db, key)?;
+        write(&mut db.hold(key), key)?;
     }
     let Some(by) = parse_f64(args.get(2)).filter(|n| !n.is_nan()) else {
         return say(out, BAD_INCREMENT);
@@ -735,21 +747,26 @@ fn incr(db: &mut Db, args: &Args<'_>, out: &mut Out, up: bool) -> Result<()> {
         };
         let mut s = Series::new();
         apply(&mut s, opts);
-        db.at(key).put_foreign(key, Box::new(TsBody { s }));
+        db.hold(key).put_foreign(key, Box::new(TsBody { s }));
     }
-    let body = write(db, key)?.expect("the series is there by now");
-    let last = body.s.last_sample();
-    if last.is_some_and(|s| at < s.at) {
-        out.error(BARE_BACKWARDS);
-        return Ok(());
-    }
-    let base = last.map_or(0.0, |s| s.value);
-    if base.is_nan() {
-        return say(out, NAN_INCREMENT);
-    }
-    let value = if up { base + by } else { base - by };
-    let before = body.s.last();
-    if store(body, at, value, Some(Policy::Last), out) {
+    // As `TS.ADD`, the stripe goes back before the rules run.
+    let stored = {
+        let mut stripe = db.hold(key);
+        let body = write(&mut stripe, key)?.expect("the series is there by now");
+        let last = body.s.last_sample();
+        if last.is_some_and(|s| at < s.at) {
+            out.error(BARE_BACKWARDS);
+            return Ok(());
+        }
+        let base = last.map_or(0.0, |s| s.value);
+        if base.is_nan() {
+            return say(out, NAN_INCREMENT);
+        }
+        let value = if up { base + by } else { base - by };
+        let before = body.s.last();
+        store(body, at, value, Some(Policy::Last), out).then_some(before)
+    };
+    if let Some(before) = stored {
         feed(db, key, at, before)?;
     }
     Ok(())
@@ -757,21 +774,27 @@ fn incr(db: &mut Db, args: &Args<'_>, out: &mut Out, up: bool) -> Result<()> {
 
 /// `TS.DEL key from to`, both ends included, which answers how many samples
 /// went.
-fn del(db: &mut Db, args: &Args<'_>, out: &mut Out) -> Result<()> {
+fn del(db: &Db, args: &Args<'_>, out: &mut Out) -> Result<()> {
     let Some(from) = span(args.get(2), b"-", 0) else {
         return say(out, BAD_FROM);
     };
     let Some(to) = span(args.get(3), b"+", i64::MAX) else {
         return say(out, BAD_TO);
     };
-    let Some(body) = write(db, args.get(1))? else {
-        return say(out, MISSING);
+    let key = args.get(1);
+    // The count comes out of the block and the stripe goes back with it,
+    // because putting the rules back in step writes into other keys.
+    let gone = {
+        let mut stripe = db.hold(key);
+        let Some(body) = write(&mut stripe, key)? else {
+            return say(out, MISSING);
+        };
+        body.s.delete(from, to)
     };
-    let gone = body.s.delete(from, to);
     // The rules are put back in step even when the delete took nothing, because
     // the reference starts the open bucket again either way and a fold that had
     // been counting part of a bucket goes back to counting all of it.
-    undo(db, args.get(1), from, to)?;
+    undo(db, key, from, to)?;
     out.uint(gone as u64);
     Ok(())
 }
@@ -782,7 +805,7 @@ fn del(db: &mut Db, args: &Args<'_>, out: &mut Out) -> Result<()> {
 /// The three checks run in an order of their own: a fourth word is an arity
 /// error before the key is looked at, the key is resolved before the third word
 /// is read, and only then is a third word that is not `LATEST` complained about.
-fn get(db: &mut Db, args: &Args<'_>, out: &mut Out) -> Result<()> {
+fn get(db: &Db, args: &Args<'_>, out: &mut Out) -> Result<()> {
     if args.len() > 3 {
         return Err(args::wrong_arity("ts.get"));
     }
@@ -792,7 +815,9 @@ fn get(db: &mut Db, args: &Args<'_>, out: &mut Out) -> Result<()> {
     } else {
         None
     };
-    let Some(body) = read(db, args.get(1))? else {
+    let key = args.get(1);
+    let mut stripe = db.hold(key);
+    let Some(body) = read(&mut stripe, key)? else {
         return say(out, MISSING);
     };
     if args.len() == 3 && !latest {
@@ -817,9 +842,10 @@ fn get(db: &mut Db, args: &Args<'_>, out: &mut Out) -> Result<()> {
 /// key that is not there says so whatever else is wrong with the command. After
 /// that the two ends of the span are read, and only then the options, in the
 /// order their errors come out in.
-fn range(db: &mut Db, args: &Args<'_>, out: &mut Out, reverse: bool) -> Result<()> {
+fn range(db: &Db, args: &Args<'_>, out: &mut Out, reverse: bool) -> Result<()> {
     let name = if reverse { "ts.revrange" } else { "ts.range" };
-    if read(db, args.get(1))?.is_none() {
+    let key = args.get(1);
+    if read(&mut db.hold(key), key)?.is_none() {
         return say(out, MISSING);
     }
     let mut query = match reading(args, reverse, SPAN_AT) {
@@ -827,9 +853,10 @@ fn range(db: &mut Db, args: &Args<'_>, out: &mut Out, reverse: bool) -> Result<(
         Err(bad) => return said(bad, name, out),
     };
     if find_from(args, SPAN_AT + 1, b"LATEST").is_some() {
-        query.latest = open_bucket(db, args.get(1))?;
+        query.latest = open_bucket(db, key)?;
     }
-    let body = read(db, args.get(1))?.expect("the series was there a moment ago");
+    let mut stripe = db.hold(key);
+    let body = read(&mut stripe, key)?.expect("the series was there a moment ago");
     let rows = match body.s.read(&query) {
         Ok(rows) => rows,
         Err(Unread::TooWide) => return say(out, TOO_WIDE),
@@ -853,7 +880,7 @@ fn range(db: &mut Db, args: &Args<'_>, out: &mut Out, reverse: bool) -> Result<(
 /// span, then the rest of the options, then the keys. Only the names come out in
 /// front of the span, which is why they are read here and then read again below
 /// with everything else.
-fn nrange(db: &mut Db, args: &Args<'_>, out: &mut Out, reverse: bool) -> Result<()> {
+fn nrange(db: &Db, args: &Args<'_>, out: &mut Out, reverse: bool) -> Result<()> {
     let name = if reverse { "ts.nrevrange" } else { "ts.nrange" };
     let Some(keys) = parse_i64(args.get(1))
         .filter(|&n| n > 0)
@@ -878,7 +905,8 @@ fn nrange(db: &mut Db, args: &Args<'_>, out: &mut Out, reverse: bool) -> Result<
         Err(bad) => return said(bad, name, out),
     };
     for i in 0..keys {
-        if read(db, args.get(2 + i))?.is_none() {
+        let key = args.get(2 + i);
+        if read(&mut db.hold(key), key)?.is_none() {
             return say(out, MISSING);
         }
     }
@@ -899,7 +927,8 @@ fn nrange(db: &mut Db, args: &Args<'_>, out: &mut Out, reverse: bool) -> Result<
         if let Some(buckets) = one.buckets.as_mut() {
             buckets.aggs.clone_from(list);
         }
-        let body = read(db, &key)?.expect("the series was there a moment ago");
+        let mut stripe = db.hold(&key);
+        let body = read(&mut stripe, &key)?.expect("the series was there a moment ago");
         match body.s.read(&one) {
             Ok(rows) => taken.push(rows),
             Err(Unread::TooWide) => return say(out, TOO_WIDE),
@@ -959,7 +988,7 @@ fn join(taken: &[Rows]) -> Rows {
 /// else answers the server's own bare `WRONGTYPE` rather than the module's
 /// prefixed one, because this command lets the server report the type where the
 /// others write their own sentence about it.
-fn tail(db: &mut Db, args: &Args<'_>, out: &mut Out) -> Result<()> {
+fn tail(db: &Db, args: &Args<'_>, out: &mut Out) -> Result<()> {
     if args.len() != 3 {
         return Err(args::wrong_arity("ts.read"));
     }
@@ -973,7 +1002,9 @@ fn tail(db: &mut Db, args: &Args<'_>, out: &mut Out) -> Result<()> {
             None => return said(Bad::Bare(BAD_READ_AT), "ts.read", out),
         }
     };
-    let Some(body) = bare_read(db, args.get(1))? else {
+    let key = args.get(1);
+    let mut stripe = db.hold(key);
+    let Some(body) = bare_read(&mut stripe, key)? else {
         out.array(0);
         return Ok(());
     };
@@ -1469,13 +1500,13 @@ fn rules_in(args: &Args<'_>, from: usize, to: usize) -> core::result::Result<Vec
 /// The walk covers every stripe, because a filter takes the series it names
 /// wherever they landed, and the names come back sorted so a database that is
 /// one stripe wide and one that is many answer in the same order.
-fn chosen(db: &mut Db, rules: &[Rule]) -> Vec<Vec<u8>> {
+fn chosen(db: &Db, rules: &[Rule]) -> Vec<Vec<u8>> {
     let mut names = Vec::new();
     db.scan(KeyCursor::START, usize::MAX, Some(Kind::Foreign), |key| {
         names.push(key.to_vec());
     });
     names.retain(|name| {
-        db.at(name)
+        db.hold(name)
             .foreign(name)
             .ok()
             .flatten()
@@ -1487,7 +1518,7 @@ fn chosen(db: &mut Db, rules: &[Rule]) -> Vec<Vec<u8>> {
 }
 
 /// `TS.QUERYINDEX filter [filter ...]`, the key names a filter list takes.
-fn queryindex(db: &mut Db, args: &Args<'_>, out: &mut Out) -> Result<()> {
+fn queryindex(db: &Db, args: &Args<'_>, out: &mut Out) -> Result<()> {
     let rules = match rules(args, 1) {
         Ok(rules) => rules,
         Err(bad) => return said(bad, "ts.queryindex", out),
@@ -1507,7 +1538,7 @@ fn queryindex(db: &mut Db, args: &Args<'_>, out: &mut Out) -> Result<()> {
 /// This is the one command in the family where a filter list is optional, and a
 /// missing one means every series rather than none, so the rule about naming at
 /// least one thing to take does not apply until a `FILTER` is written down.
-fn querylabels(db: &mut Db, args: &Args<'_>, out: &mut Out) -> Result<()> {
+fn querylabels(db: &Db, args: &Args<'_>, out: &mut Out) -> Result<()> {
     let values = if args::is(args.get(1), b"LABELS") {
         false
     } else if args::is(args.get(1), b"VALUES") {
@@ -1541,7 +1572,8 @@ fn querylabels(db: &mut Db, args: &Args<'_>, out: &mut Out) -> Result<()> {
     };
     let mut found: Vec<Vec<u8>> = Vec::new();
     for name in chosen(db, &rules) {
-        let Some(body) = read(db, &name)? else {
+        let mut stripe = db.hold(&name);
+        let Some(body) = read(&mut stripe, &name)? else {
             continue;
         };
         if values {
@@ -1593,7 +1625,7 @@ enum Wearing {
 /// `FILTER` is not optional and its absence is an arity error rather than a
 /// syntax one, however many words the command has, because the module counts the
 /// arguments it needed after it has found the keyword rather than before.
-fn mget(db: &mut Db, args: &Args<'_>, out: &mut Out) -> Result<()> {
+fn mget(db: &Db, args: &Args<'_>, out: &mut Out) -> Result<()> {
     let Some(filter) = find(args, b"FILTER") else {
         return Err(args::wrong_arity("ts.mget"));
     };
@@ -1614,7 +1646,8 @@ fn mget(db: &mut Db, args: &Args<'_>, out: &mut Out) -> Result<()> {
     }
     for name in &names {
         let open = if latest { open_bucket(db, name)? } else { None };
-        let Some(body) = read(db, name)? else {
+        let mut stripe = db.hold(name);
+        let Some(body) = read(&mut stripe, name)? else {
             continue;
         };
         let last = open.or_else(|| body.s.last_sample());
@@ -1771,7 +1804,7 @@ const REDUCERS: &[Agg] = &[
 /// everything about buckets, alignment and the two sample filters is already
 /// settled by the time this starts. What is new is the filter list in front of
 /// it and the group behind it.
-fn mrange(db: &mut Db, args: &Args<'_>, out: &mut Out, reverse: bool) -> Result<()> {
+fn mrange(db: &Db, args: &Args<'_>, out: &mut Out, reverse: bool) -> Result<()> {
     let name = if reverse { "ts.mrevrange" } else { "ts.mrange" };
     // The order the checks happen in, which is the order their errors come out
     // in and is not the order the words are written in.
@@ -1834,7 +1867,8 @@ fn mrange(db: &mut Db, args: &Args<'_>, out: &mut Out, reverse: bool) -> Result<
     let mut taken: Vec<Took> = Vec::with_capacity(names.len());
     for key in names {
         query.latest = if latest { open_bucket(db, &key)? } else { None };
-        let Some(body) = read(db, &key)? else {
+        let mut stripe = db.hold(&key);
+        let Some(body) = read(&mut stripe, &key)? else {
             continue;
         };
         let labels = body.s.labels().to_vec();
@@ -2046,7 +2080,7 @@ fn columns(out: &mut Out, rows: &Rows) {
 /// are written in. The bucket width is read before the reduction name, the
 /// reduction name before the width is compared against zero, and all of that
 /// before either key is looked up.
-fn createrule(db: &mut Db, args: &Args<'_>, out: &mut Out) -> Result<()> {
+fn createrule(db: &Db, args: &Args<'_>, out: &mut Out) -> Result<()> {
     if !matches!(args.len(), 6 | 7) || !args::is(args.get(3), b"AGGREGATION") {
         return Err(args::wrong_arity("ts.createrule"));
     }
@@ -2076,23 +2110,33 @@ fn createrule(db: &mut Db, args: &Args<'_>, out: &mut Out) -> Result<()> {
     // been deleted is out of the way by the time this asks whether there is one.
     prune(db, &source)?;
     prune(db, &dest)?;
-    let Some(body) = read(db, &source)? else {
-        return say(out, MISSING);
-    };
-    if body.s.source().is_some() {
-        return say(out, SOURCE_IS_DEST);
+    // The two ends are two keys and can be one stripe, so each end is looked at
+    // inside a block of its own and the stripe goes back before the other end is
+    // reached for. The order the checks come out in is what it was.
+    {
+        let mut stripe = db.hold(&source);
+        let Some(body) = read(&mut stripe, &source)? else {
+            return say(out, MISSING);
+        };
+        if body.s.source().is_some() {
+            return say(out, SOURCE_IS_DEST);
+        }
     }
-    let Some(body) = write(db, &dest)? else {
-        return say(out, MISSING);
-    };
-    if !body.s.rules().is_empty() {
-        return say(out, DEST_IS_SOURCE);
+    {
+        let mut stripe = db.hold(&dest);
+        let Some(body) = write(&mut stripe, &dest)? else {
+            return say(out, MISSING);
+        };
+        if !body.s.rules().is_empty() {
+            return say(out, DEST_IS_SOURCE);
+        }
+        if body.s.source().is_some() {
+            return say(out, RULE_EXISTS);
+        }
+        body.s.set_source(Some(source.clone()));
     }
-    if body.s.source().is_some() {
-        return say(out, RULE_EXISTS);
-    }
-    body.s.set_source(Some(source.clone()));
-    let body = write(db, &source)?.expect("the source was there a moment ago");
+    let mut stripe = db.hold(&source);
+    let body = write(&mut stripe, &source)?.expect("the source was there a moment ago");
     // A new rule starts with no bucket open, which is what keeps it off the
     // samples the source already held. Those buckets are never written and the
     // destination only starts filling from the next sample the source is given.
@@ -2109,20 +2153,24 @@ fn createrule(db: &mut Db, args: &Args<'_>, out: &mut Out) -> Result<()> {
 }
 
 /// `TS.DELETERULE source dest`, which takes the link apart from both ends.
-fn deleterule(db: &mut Db, args: &Args<'_>, out: &mut Out) -> Result<()> {
+fn deleterule(db: &Db, args: &Args<'_>, out: &mut Out) -> Result<()> {
     if args.len() != 3 {
         return Err(args::wrong_arity("ts.deleterule"));
     }
     let source = args.get(1).to_vec();
     let dest = args.get(2).to_vec();
     prune(db, &source)?;
-    let Some(body) = write(db, &source)? else {
-        return say(out, MISSING);
-    };
-    if !body.s.drop_rule(&dest) {
-        return say(out, NO_RULE);
+    {
+        let mut stripe = db.hold(&source);
+        let Some(body) = write(&mut stripe, &source)? else {
+            return say(out, MISSING);
+        };
+        if !body.s.drop_rule(&dest) {
+            return say(out, NO_RULE);
+        }
     }
-    if let Some(body) = write(db, &dest)? {
+    let mut stripe = db.hold(&dest);
+    if let Some(body) = write(&mut stripe, &dest)? {
         body.s.set_source(None);
     }
     out.ok();
@@ -2135,20 +2183,26 @@ fn deleterule(db: &mut Db, args: &Args<'_>, out: &mut Out) -> Result<()> {
 /// lost one of its ends is found rather than reported. Every command that reads
 /// a link or writes one asks for this first, which is enough for a client to
 /// never see a rule that has stopped meaning anything.
-fn prune(db: &mut Db, key: &[u8]) -> Result<()> {
+fn prune(db: &Db, key: &[u8]) -> Result<()> {
     // A key holding something else has no rules to lose and is not this
     // function's business to complain about, since the command that asked has
     // its own order to complain in.
-    let Ok(Some(body)) = read(db, key) else {
-        return Ok(());
+    // What the rules say is copied out and the stripe goes back, because
+    // reading the other end of a rule can want this same stripe again.
+    let (source, dests) = {
+        let mut stripe = db.hold(key);
+        let Ok(Some(body)) = read(&mut stripe, key) else {
+            return Ok(());
+        };
+        let source = body.s.source().map(<[u8]>::to_vec);
+        let dests: Vec<Vec<u8>> = body
+            .s
+            .rules()
+            .iter()
+            .map(|rule| rule.dest.clone())
+            .collect();
+        (source, dests)
     };
-    let source = body.s.source().map(<[u8]>::to_vec);
-    let dests: Vec<Vec<u8>> = body
-        .s
-        .rules()
-        .iter()
-        .map(|rule| rule.dest.clone())
-        .collect();
     let mut kept = Vec::with_capacity(dests.len());
     for dest in dests {
         if points_at(db, &dest, key)? {
@@ -2159,7 +2213,8 @@ fn prune(db: &mut Db, key: &[u8]) -> Result<()> {
         None => false,
         Some(source) => !feeds(db, source, key)?,
     };
-    let Some(body) = write(db, key)? else {
+    let mut stripe = db.hold(key);
+    let Some(body) = write(&mut stripe, key)? else {
         return Ok(());
     };
     body.s.keep_rules(&kept);
@@ -2170,8 +2225,9 @@ fn prune(db: &mut Db, key: &[u8]) -> Result<()> {
 }
 
 /// Whether the series under `key` is a destination fed by `source`.
-fn points_at(db: &mut Db, key: &[u8], source: &[u8]) -> Result<bool> {
-    let body = match read(db, key) {
+fn points_at(db: &Db, key: &[u8], source: &[u8]) -> Result<bool> {
+    let mut stripe = db.hold(key);
+    let body = match read(&mut stripe, key) {
         Ok(body) => body,
         // A key that has been replaced by something else is not a destination
         // any more, and saying so here is what takes the rule off the source.
@@ -2181,8 +2237,9 @@ fn points_at(db: &mut Db, key: &[u8], source: &[u8]) -> Result<bool> {
 }
 
 /// Whether the series under `key` holds a rule writing into `dest`.
-fn feeds(db: &mut Db, key: &[u8], dest: &[u8]) -> Result<bool> {
-    let body = match read(db, key) {
+fn feeds(db: &Db, key: &[u8], dest: &[u8]) -> Result<bool> {
+    let mut stripe = db.hold(key);
+    let body = match read(&mut stripe, key) {
         Ok(body) => body,
         Err(_) => return Ok(false),
     };
@@ -2237,38 +2294,46 @@ fn fold(s: &Series, rule: &Compaction, at: i64, from: i64) -> Option<f64> {
 /// sample landing behind the newest one is the other half of this: the bucket it
 /// falls in is closed already, so it is worked out again from everything the
 /// source holds there and written over whatever the destination had.
-fn feed(db: &mut Db, key: &[u8], at: i64, before: Option<i64>) -> Result<()> {
+fn feed(db: &Db, key: &[u8], at: i64, before: Option<i64>) -> Result<()> {
     for rule in rules_of(db, key)? {
-        let Some(body) = read(db, key)? else {
-            return Ok(());
-        };
-        let landed = bucket_start(at, rule.delta, rule.align);
-        let mut written = None;
-        let mut moved = None;
-        if before.is_none_or(|last| at >= last) {
-            match rule.open {
-                // The bucket that was open is finished, so it is written down
-                // and the new one takes its place.
-                Some(open) if landed > open => {
-                    written = fold(&body.s, &rule, open, rule.start).map(|value| (open, value));
-                    moved = Some((Some(landed), at));
+        // What the source says is worked out first and the stripe goes back
+        // with the answer, because the destination can be on this same stripe.
+        let (written, moved) = {
+            let mut stripe = db.hold(key);
+            let Some(body) = read(&mut stripe, key)? else {
+                return Ok(());
+            };
+            let landed = bucket_start(at, rule.delta, rule.align);
+            let mut written = None;
+            let mut moved = None;
+            if before.is_none_or(|last| at >= last) {
+                match rule.open {
+                    // The bucket that was open is finished, so it is written
+                    // down and the new one takes its place.
+                    Some(open) if landed > open => {
+                        written = fold(&body.s, &rule, open, rule.start).map(|value| (open, value));
+                        moved = Some((Some(landed), at));
+                    }
+                    Some(_) => {}
+                    None => moved = Some((Some(landed), at)),
                 }
-                Some(_) => {}
-                None => moved = Some((Some(landed), at)),
+            } else {
+                let newest = bucket_start(before.unwrap_or(at), rule.delta, rule.align);
+                if landed < newest {
+                    written = fold(&body.s, &rule, landed, landed).map(|value| (landed, value));
+                } else if rule.open == Some(landed) {
+                    // The open bucket counts this one too, and the module works
+                    // the whole bucket out again rather than folding one more
+                    // reading into what it had, so from here on the fold counts
+                    // the lot.
+                    moved = Some((Some(landed), landed));
+                }
             }
-        } else {
-            let newest = bucket_start(before.unwrap_or(at), rule.delta, rule.align);
-            if landed < newest {
-                written = fold(&body.s, &rule, landed, landed).map(|value| (landed, value));
-            } else if rule.open == Some(landed) {
-                // The open bucket counts this one too, and the module works the
-                // whole bucket out again rather than folding one more reading
-                // into what it had, so from here on the fold counts the lot.
-                moved = Some((Some(landed), landed));
-            }
-        }
+            (written, moved)
+        };
+        let mut stripe = db.hold(&rule.dest);
         if let Some((at, value)) = written
-            && let Some(dest) = write(db, &rule.dest)?
+            && let Some(dest) = write(&mut stripe, &rule.dest)?
         {
             // An alignment can put the first bucket edge before zero, and the
             // module writes that bucket at zero rather than at a timestamp no
@@ -2279,8 +2344,10 @@ fn feed(db: &mut Db, key: &[u8], at: i64, before: Option<i64>) -> Result<()> {
             // that policy is.
             let _ = dest.s.add(Sample::new(at, value), Some(Policy::Last));
         }
+        drop(stripe);
+        let mut stripe = db.hold(key);
         if let Some((open, start)) = moved
-            && let Some(body) = write(db, key)?
+            && let Some(body) = write(&mut stripe, key)?
             && let Some(mine) = body.s.rule_mut(&rule.dest)
         {
             mine.open = open;
@@ -2302,52 +2369,67 @@ fn feed(db: &mut Db, key: &[u8], at: i64, before: Option<i64>) -> Result<()> {
 /// and started again over everything the source has left there, so a fold that
 /// had been counting only the samples the rule was given goes back to counting
 /// the lot.
-fn undo(db: &mut Db, key: &[u8], from: i64, to: i64) -> Result<()> {
+fn undo(db: &Db, key: &[u8], from: i64, to: i64) -> Result<()> {
     for rule in rules_of(db, key)? {
-        let Some(body) = read(db, key)? else {
-            return Ok(());
+        // Source and destination are two keys and can be one stripe, so each
+        // step takes the one it needs and gives it back before the next.
+        let open = {
+            let mut stripe = db.hold(key);
+            let Some(body) = read(&mut stripe, key)? else {
+                return Ok(());
+            };
+            body.s
+                .last()
+                .map(|last| bucket_start(last, rule.delta, rule.align))
         };
-        let open = body
-            .s
-            .last()
-            .map(|last| bucket_start(last, rule.delta, rule.align));
         let head = bucket_start(from.max(0), rule.delta, rule.align);
         let tail = to.saturating_add(rule.delta);
-        let Some(dest) = read(db, &rule.dest)? else {
-            continue;
-        };
-        let stamps: Vec<i64> = dest.s.range(head, tail).map(|sample| sample.at).collect();
-        let body = read(db, key)?.expect("the source was there a moment ago");
-        let mut rows = Vec::with_capacity(stamps.len());
-        for at in stamps {
-            let value = match open {
-                Some(open) if at < open => fold(&body.s, &rule, at, at),
-                _ => None,
+        let stamps: Vec<i64> = {
+            let mut stripe = db.hold(&rule.dest);
+            let Some(dest) = read(&mut stripe, &rule.dest)? else {
+                continue;
             };
-            rows.push((at, value));
-        }
-        for (at, value) in rows {
-            if let Some(dest) = write(db, &rule.dest)? {
-                match value {
-                    Some(value) => {
-                        let _ = dest.s.add(Sample::new(at, value), Some(Policy::Last));
-                    }
-                    None => {
-                        dest.s.delete(at, at);
+            dest.s.range(head, tail).map(|sample| sample.at).collect()
+        };
+        let rows = {
+            let mut stripe = db.hold(key);
+            let body = read(&mut stripe, key)?.expect("the source was there a moment ago");
+            let mut rows = Vec::with_capacity(stamps.len());
+            for at in stamps {
+                let value = match open {
+                    Some(open) if at < open => fold(&body.s, &rule, at, at),
+                    _ => None,
+                };
+                rows.push((at, value));
+            }
+            rows
+        };
+        {
+            let mut stripe = db.hold(&rule.dest);
+            for (at, value) in rows {
+                if let Some(dest) = write(&mut stripe, &rule.dest)? {
+                    match value {
+                        Some(value) => {
+                            let _ = dest.s.add(Sample::new(at, value), Some(Policy::Last));
+                        }
+                        None => {
+                            dest.s.delete(at, at);
+                        }
                     }
                 }
             }
+            if let Some(dest) = write(&mut stripe, &rule.dest)? {
+                // Whatever the span was, a destination never holds the bucket
+                // its source is still filling, and a delete can make an older
+                // bucket that one.
+                match open {
+                    Some(open) => dest.s.delete(open, i64::MAX),
+                    None => dest.s.delete(0, i64::MAX),
+                };
+            }
         }
-        if let Some(dest) = write(db, &rule.dest)? {
-            // Whatever the span was, a destination never holds the bucket its
-            // source is still filling, and a delete can make an older bucket
-            // that one.
-            match open {
-                Some(open) => dest.s.delete(open, i64::MAX),
-                None => dest.s.delete(0, i64::MAX),
-            };
-        }
-        if let Some(body) = write(db, key)?
+        let mut stripe = db.hold(key);
+        if let Some(body) = write(&mut stripe, key)?
             && let Some(mine) = body.s.rule_mut(&rule.dest)
         {
             mine.open = open;
@@ -2358,9 +2440,9 @@ fn undo(db: &mut Db, key: &[u8], from: i64, to: i64) -> Result<()> {
 }
 
 /// The rules on `key`, with the ones whose destination is gone already dropped.
-fn rules_of(db: &mut Db, key: &[u8]) -> Result<Vec<Compaction>> {
+fn rules_of(db: &Db, key: &[u8]) -> Result<Vec<Compaction>> {
     prune(db, key)?;
-    Ok(read(db, key)?.map_or_else(Vec::new, |body| body.s.rules().to_vec()))
+    Ok(read(&mut db.hold(key), key)?.map_or_else(Vec::new, |body| body.s.rules().to_vec()))
 }
 
 /// The bucket a destination's source is still filling, which is what `LATEST`
@@ -2369,15 +2451,20 @@ fn rules_of(db: &mut Db, key: &[u8]) -> Result<Vec<Compaction>> {
 /// It is only there on a series that is the destination of a rule whose source
 /// has given it a sample since the rule was made. Everywhere else `LATEST` means
 /// nothing at all and the read answers what it would have answered without it.
-fn open_bucket(db: &mut Db, key: &[u8]) -> Result<Option<Sample>> {
+fn open_bucket(db: &Db, key: &[u8]) -> Result<Option<Sample>> {
     prune(db, key)?;
-    let Some(body) = read(db, key)? else {
-        return Ok(None);
+    let source = {
+        let mut stripe = db.hold(key);
+        let Some(body) = read(&mut stripe, key)? else {
+            return Ok(None);
+        };
+        let Some(source) = body.s.source().map(<[u8]>::to_vec) else {
+            return Ok(None);
+        };
+        source
     };
-    let Some(source) = body.s.source().map(<[u8]>::to_vec) else {
-        return Ok(None);
-    };
-    let Some(body) = read(db, &source)? else {
+    let mut stripe = db.hold(&source);
+    let Some(body) = read(&mut stripe, &source)? else {
         return Ok(None);
     };
     let Some(rule) = body.s.rules().iter().find(|rule| rule.dest == key).cloned() else {
@@ -2391,10 +2478,12 @@ fn open_bucket(db: &mut Db, key: &[u8]) -> Result<Option<Sample>> {
 
 /// `TS.INFO key`, which is fourteen fields about the series and takes no field
 /// name.
-fn info(db: &mut Db, args: &Args<'_>, out: &mut Out) -> Result<()> {
+fn info(db: &Db, args: &Args<'_>, out: &mut Out) -> Result<()> {
     let resp3 = out.proto().is_resp3();
-    prune(db, args.get(1))?;
-    let Some(body) = read(db, args.get(1))? else {
+    let key = args.get(1);
+    prune(db, key)?;
+    let mut stripe = db.hold(key);
+    let Some(body) = read(&mut stripe, key)? else {
         return say(out, MISSING);
     };
     let s = &body.s;
@@ -2784,11 +2873,13 @@ fn wrong_kind() -> Error {
 
 /// The series under `key` for writing, or `None` if the key is not there.
 ///
-/// The stripe is worked out from the key every time rather than passed in,
-/// which costs a hash and is what lets the rest of the module go on naming keys
-/// without knowing there are stripes at all.
-fn write<'d>(db: &'d mut Db, key: &[u8]) -> Result<Option<&'d mut TsBody>> {
-    match db.at(key).foreign_mut(key) {
+/// The stripe comes in rather than being worked out here, because the answer
+/// borrows out of it and a borrow cannot outlive the guard it came from. The
+/// caller decides how long it holds, which is what a command that writes
+/// through a rule into another key needs: it lets go of the source before it
+/// reaches for the destination.
+fn write<'k>(stripe: &'k mut Keyspace, key: &[u8]) -> Result<Option<&'k mut TsBody>> {
+    match stripe.foreign_mut(key) {
         Ok(Some(body)) => match body.downcast_mut::<TsBody>() {
             Some(body) => Ok(Some(body)),
             None => Err(wrong_kind()),
@@ -2802,8 +2893,8 @@ fn write<'d>(db: &'d mut Db, key: &[u8]) -> Result<Option<&'d mut TsBody>> {
 /// The same again, with the server's own bare `WRONGTYPE` for a key holding
 /// something else rather than the module's prefixed sentence, which is what
 /// `TS.READ` answers and the only place in the family that does.
-fn bare_read<'d>(db: &'d mut Db, key: &[u8]) -> Result<Option<&'d TsBody>> {
-    match db.at(key).foreign(key)? {
+fn bare_read<'k>(stripe: &'k mut Keyspace, key: &[u8]) -> Result<Option<&'k TsBody>> {
+    match stripe.foreign(key)? {
         Some(body) => match body.downcast_ref::<TsBody>() {
             Some(body) => Ok(Some(body)),
             None => Err(yo_kv::keyspace::wrong_type()),
@@ -2813,8 +2904,8 @@ fn bare_read<'d>(db: &'d mut Db, key: &[u8]) -> Result<Option<&'d TsBody>> {
 }
 
 /// The same, for reading.
-fn read<'d>(db: &'d mut Db, key: &[u8]) -> Result<Option<&'d TsBody>> {
-    match db.at(key).foreign(key) {
+fn read<'k>(stripe: &'k mut Keyspace, key: &[u8]) -> Result<Option<&'k TsBody>> {
+    match stripe.foreign(key) {
         Ok(Some(body)) => match body.downcast_ref::<TsBody>() {
             Some(body) => Ok(Some(body)),
             None => Err(wrong_kind()),
