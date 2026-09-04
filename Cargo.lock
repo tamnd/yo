@@ -841,6 +841,7 @@ name = "yo-common"
 version = "0.3.15"
 dependencies = [
  "criterion",
+ "loom",
  "yo-alloc",
 ]
 

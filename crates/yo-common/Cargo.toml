@@ -20,6 +20,9 @@ workspace = true
 [dev-dependencies]
 criterion = { workspace = true }
 
+[target.'cfg(loom)'.dev-dependencies]
+loom = { workspace = true }
+
 [[bench]]
 name = "hash"
 harness = false

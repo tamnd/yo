@@ -14,11 +14,13 @@ pub mod dtoa;
 pub mod eq;
 pub mod error;
 pub mod glob;
+pub mod lock;
 pub mod num;
 pub mod prefetch;
 pub mod re;
 pub mod rng;
 pub mod small;
+pub(crate) mod sync;
 pub mod wyhash;
 pub mod xxh3;
 
@@ -27,6 +29,7 @@ pub use crc::{SLOT_COUNT, crc16, crc32c, hash_tag, slot_of};
 pub use eq::bytes_eq;
 pub use error::{Code, Error, Result};
 pub use glob::matches as glob_matches;
+pub use lock::{Held, Lock};
 pub use num::{
     DIGITS_MAX, i64_digits, i64_len, parse_i64, push_double, push_i64, push_u64, u64_digits,
 };

@@ -119,9 +119,10 @@ jobs:
       - run: rm rust-toolchain.toml
       - run: cargo test --workspace --locked
 
-  # The SPSC lane is the only lock free thing in the tree. Loom enumerates the
-  # interleavings a weak memory model allows rather than hoping the test machine
-  # produces the interesting one. Cheap enough to stay on the fast path.
+  # The SPSC lane and the stripe lock are the two places where two threads touch
+  # the same bytes. Loom enumerates the interleavings a weak memory model allows
+  # rather than hoping the test machine produces the interesting one. Cheap
+  # enough to stay on the fast path.
   loom:
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -132,6 +133,10 @@ jobs:
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo test -p yo-shard --release --locked --lib spsc::loom
+        env:
+          RUSTFLAGS: --cfg loom
+          LOOM_MAX_PREEMPTIONS: "3"
+      - run: cargo test -p yo-common --release --locked --lib lock::loom
         env:
           RUSTFLAGS: --cfg loom
           LOOM_MAX_PREEMPTIONS: "3"
