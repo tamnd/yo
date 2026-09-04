@@ -492,10 +492,15 @@ fn msetex(db: &Db, args: Args<'_>, out: &mut Out) -> Result<()> {
     for (k, v) in pairs(args, 2, n) {
         check_len(k, v.len())?;
     }
+    // Every stripe the command names, held from before the condition is decided
+    // until after the last pair is written, so that a key cannot appear or go
+    // between being asked about and being written.
+    let mut held = db.hold_keys(pairs(args, 2, n).map(|(k, _)| k));
+    let mut asked = |k: &[u8]| held.stripe_mut(db.stripe_of(k)).exists(k);
     let allowed = match exists {
         Exists::Always => true,
-        Exists::IfMissing => pairs(args, 2, n).all(|(k, _)| !db.hold(k).exists(k)),
-        Exists::IfPresent => pairs(args, 2, n).all(|(k, _)| db.hold(k).exists(k)),
+        Exists::IfMissing => pairs(args, 2, n).all(|(k, _)| !asked(k)),
+        Exists::IfPresent => pairs(args, 2, n).all(|(k, _)| asked(k)),
     };
     if !allowed {
         out.int(0);
@@ -506,8 +511,11 @@ fn msetex(db: &Db, args: Args<'_>, out: &mut Out) -> Result<()> {
     // of all of them. `Expire::Keep` still has to go through, since what it
     // keeps is that key's own deadline and only its stripe knows it.
     for (k, v) in pairs(args, 2, n) {
-        db.hold(k)
-            .msetex(core::iter::once((k, v)), Exists::Always, expire)?;
+        held.stripe_mut(db.stripe_of(k)).msetex(
+            core::iter::once((k, v)),
+            Exists::Always,
+            expire,
+        )?;
     }
     out.int(1);
     Ok(())
@@ -523,14 +531,17 @@ fn msetex(db: &Db, args: Args<'_>, out: &mut Out) -> Result<()> {
 /// kept by handing each stripe its own pairs: the first stripe would write
 /// before the second found the bad pair. So the check is a pass of its own out
 /// here and the write is one pair at a time through the stripe that pair
-/// belongs on.
+/// belongs on, with every stripe the command names held for the whole of it so
+/// that nobody sees half of an `MSET`.
 fn mset(db: &Db, args: Args<'_>, out: &mut Out) -> Result<()> {
     let n = pair_count(args, "mset")?;
     for (k, v) in pairs(args, 1, n) {
         check_len(k, v.len())?;
     }
+    let mut held = db.hold_keys(pairs(args, 1, n).map(|(k, _)| k));
     for (k, v) in pairs(args, 1, n) {
-        db.hold(k).mset(core::iter::once((k, v)))?;
+        held.stripe_mut(db.stripe_of(k))
+            .mset(core::iter::once((k, v)))?;
     }
     out.ok();
     Ok(())
@@ -547,12 +558,14 @@ fn msetnx(db: &Db, args: Args<'_>, out: &mut Out) -> Result<()> {
     for (k, v) in pairs(args, 1, n) {
         check_len(k, v.len())?;
     }
-    if pairs(args, 1, n).any(|(k, _)| db.hold(k).exists(k)) {
+    let mut held = db.hold_keys(pairs(args, 1, n).map(|(k, _)| k));
+    if pairs(args, 1, n).any(|(k, _)| held.stripe_mut(db.stripe_of(k)).exists(k)) {
         out.int(0);
         return Ok(());
     }
     for (k, v) in pairs(args, 1, n) {
-        db.hold(k).mset(core::iter::once((k, v)))?;
+        held.stripe_mut(db.stripe_of(k))
+            .mset(core::iter::once((k, v)))?;
     }
     out.int(1);
     Ok(())
@@ -565,10 +578,13 @@ fn msetnx(db: &Db, args: Args<'_>, out: &mut Out) -> Result<()> {
 /// one at a time and in order, and a `Vec` here would be an allocation per call
 /// on a thread that must not.
 fn mget(db: &Db, args: Args<'_>, out: &mut Out) -> Result<()> {
+    // Every stripe at once, so the answer is these keys as they were at one
+    // moment rather than each key as it was when the walk reached it.
+    let mut held = db.hold_keys((1..args.len()).map(|i| args.get(i)));
     out.array(args.len() - 1);
     for i in 1..args.len() {
         let key = args.get(i);
-        match db.hold(key).mget_one(key) {
+        match held.stripe_mut(db.stripe_of(key)).mget_one(key) {
             Some(v) => write_str(out, v),
             None => out.nil(),
         }

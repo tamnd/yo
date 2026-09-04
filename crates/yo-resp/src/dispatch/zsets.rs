@@ -842,6 +842,10 @@ fn pop(db: &Db, end: ZEnd, args: Args<'_>, out: &mut Out) -> Result<()> {
 /// flatten into.
 fn mpop(db: &Db, args: Args<'_>, out: &mut Out) -> Result<()> {
     let (end, from, to, want) = parse_mpop(args, 1)?;
+    // Every key at once, as [`super::lists::mpop`] takes them, and for the same
+    // reason: the key that answers is the first that had anything in it at one
+    // moment rather than when the walk reached it.
+    let mut held = db.hold_keys((from..to).map(|i| args.get(i)));
     for i in from..to {
         let key = args.get(i);
         // `ZCARD` and not a pop that reports nothing, because the name of the
@@ -850,7 +854,7 @@ fn mpop(db: &Db, args: Args<'_>, out: &mut Out) -> Result<()> {
         // as it would be if it were the only key named.
         // Each key on its own stripe, found once and used for both calls, since
         // the pop that follows is against the same key as the count.
-        let mut stripe = db.hold(key);
+        let stripe = held.stripe_mut(db.stripe_of(key));
         if stripe.zcard(key)? == 0 {
             continue;
         }

@@ -826,13 +826,16 @@ fn mget(db: &Db, args: Args<'_>, out: &mut Out) -> Result<()> {
     let f = Format::default();
     out.array(last - 1);
     let mut text = Vec::new();
+    // Every stripe at once, so the answer is these documents as they were at
+    // one moment rather than each as it was when the walk reached it.
+    let mut held = db.hold_keys((1..last).map(|i| args.get(i)));
     for i in 1..last {
         let key = args.get(i);
         // A key that is not there and a key holding something that is not a
         // document are both a hole in the array. `MGET` does the same with a
         // key holding a hash, and for the same reason: one bad key in a hundred
         // should not lose the other ninety nine answers.
-        let mut stripe = db.hold(key);
+        let stripe = held.stripe_mut(db.stripe_of(key));
         let Ok(Some(body)) = stripe.foreign(key) else {
             out.nil();
             continue;

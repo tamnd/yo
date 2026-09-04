@@ -135,10 +135,11 @@ pub(super) fn execute(
         // The promise is about visibility and not about which thread did the
         // work, so this is the same body rather than a divergence.
         "del" | "unlink" => {
+            let mut held = db.hold_keys((1..args.len()).map(|i| args.get(i)));
             let mut gone = 0i64;
             for i in 1..args.len() {
                 let key = args.get(i);
-                if db.hold(key).del(key) {
+                if held.stripe_mut(db.stripe_of(key)).del(key) {
                     gone += 1;
                 }
             }
@@ -147,10 +148,11 @@ pub(super) fn execute(
         // A key named twice counts twice, which looks like a bug and is what
         // Redis does. `EXISTS k k` on one key answers two.
         "exists" => {
+            let mut held = db.hold_keys((1..args.len()).map(|i| args.get(i)));
             let mut found = 0i64;
             for i in 1..args.len() {
                 let key = args.get(i);
-                if db.hold(key).exists(key) {
+                if held.stripe_mut(db.stripe_of(key)).exists(key) {
                     found += 1;
                 }
             }
@@ -178,10 +180,13 @@ pub(super) fn execute(
         // be on two stripes. The count is the same either way: a key named
         // twice counts twice here as well.
         "touch" => {
+            let mut held = db.hold_keys((1..args.len()).map(|i| args.get(i)));
             let mut hit = 0i64;
             for i in 1..args.len() {
                 let key = args.get(i);
-                hit += db.hold(key).touch(core::iter::once(key)) as i64;
+                hit += held
+                    .stripe_mut(db.stripe_of(key))
+                    .touch(core::iter::once(key)) as i64;
             }
             out.int(hit);
         }

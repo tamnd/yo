@@ -317,6 +317,17 @@ impl Db {
         out
     }
 
+    /// The same, for a command that has keys rather than stripe numbers.
+    ///
+    /// Which is most of them: a multi key command is handed the names off the
+    /// wire and works out where they live here. Two keys on one stripe hold it
+    /// once, so `MGET a a` and `MGET a b` where both land in the same place are
+    /// one hold and not two.
+    #[must_use]
+    pub fn hold_keys<'k>(&self, keys: impl Iterator<Item = &'k [u8]>) -> Holds<'_> {
+        self.hold_many(keys.map(|key| self.stripe_of(key)))
+    }
+
     /// Every stripe, in order, mutably.
     ///
     /// Free, because an exclusive reference to the database is already an

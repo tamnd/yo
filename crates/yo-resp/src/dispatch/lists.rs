@@ -266,6 +266,10 @@ fn mpop(db: &Db, args: Args<'_>, out: &mut Out) -> Result<()> {
         };
     }
 
+    // Every key at once, so the one that answers is the first that had anything
+    // in it at one moment rather than the first that had anything in it when
+    // the walk reached it.
+    let mut held = db.hold_keys((2..at).map(|i| args.get(i)));
     for i in 2..at {
         let key = args.get(i);
         // `LLEN` and not a pop that reports nothing, because the reply carries
@@ -273,7 +277,7 @@ fn mpop(db: &Db, args: Args<'_>, out: &mut Out) -> Result<()> {
         // elements are. A key of another type is an error here, the same as it
         // would be if it were the only key named.
         // Each key on its own stripe, found once and used for both calls.
-        let mut stripe = db.hold(key);
+        let stripe = held.stripe_mut(db.stripe_of(key));
         if stripe.llen(key)? == 0 {
             continue;
         }
