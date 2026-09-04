@@ -18,6 +18,11 @@
 //! which negate the whole comparison, so they are answered before the pairs are
 //! walked rather than inside the walk.
 //!
+//! Arithmetic and the methods are the exception to the set rule. They want one
+//! node and answer nothing for two, so `@.list[*] + 1` is nothing on a list of
+//! two rather than two sums. `count()` is outside that because counting is what
+//! it is for.
+//!
 //! An operand is not always something in the document. `@.p + 1`, `@.p.sum()`
 //! and `@.p~` all answer values that are nowhere in it, which is what [`Item`]
 //! is for: a hit is either a value the document holds, a number that was worked
@@ -198,6 +203,33 @@ pub(crate) enum Op {
     Empty,
 }
 
+/// A number an operand worked out.
+///
+/// Which of the two it is only matters when it is written back to a client,
+/// which is what a projection does: the reference answers `$.a + $.b` as `7`
+/// and `$.list.sum()` as `7.0`, and a client reading the reply as JSON sees the
+/// difference. Every comparison here goes through [`Item::number`] and reads
+/// both the same way.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum Num {
+    Int(i64),
+    Float(f64),
+}
+
+impl Num {
+    /// This as a double, which is what a comparison wants.
+    fn as_f64(self) -> f64 {
+        #[expect(
+            clippy::cast_precision_loss,
+            reason = "a comparison and not a round trip"
+        )]
+        match self {
+            Num::Int(i) => i as f64,
+            Num::Float(f) => f,
+        }
+    }
+}
+
 /// One thing an operand answered.
 ///
 /// A path answers values the document holds and a literal answers its own
@@ -205,9 +237,9 @@ pub(crate) enum Op {
 /// number that is nowhere in the document, and `~` answers a key name, which is
 /// bytes in the document but not a value in it.
 #[derive(Debug, Clone, Copy)]
-enum Item<'v> {
+pub(crate) enum Item<'v> {
     Ref(Value<'v>),
-    Num(f64),
+    Num(Num),
     Key(&'v [u8]),
 }
 
@@ -216,6 +248,21 @@ impl<'v> Item<'v> {
     fn number(&self) -> Option<f64> {
         match self {
             Item::Ref(v) => number(v),
+            Item::Num(n) => Some(n.as_f64()),
+            Item::Key(_) => None,
+        }
+    }
+
+    /// This as a number that still knows whether it is whole.
+    ///
+    /// The document's own kinds decide, so a `3` stays whole through the
+    /// arithmetic that reads it and a `3.0` does not.
+    fn num(&self) -> Option<Num> {
+        match self {
+            Item::Ref(v) => v
+                .as_int()
+                .map(Num::Int)
+                .or_else(|| v.as_float().map(Num::Float)),
             Item::Num(n) => Some(*n),
             Item::Key(_) => None,
         }
@@ -306,27 +353,86 @@ fn values<'v>(o: &'v Operand<'_>, root: &Value<'v>, cur: &Value<'v>) -> Vec<Item
             call(&got, *fun, &mut out);
         }
         Operand::Math(l, op, r) => {
-            let (left, right) = (values(l, root, cur), values(r, root, cur));
-            for a in left.iter().filter_map(Item::number) {
-                for b in right.iter().filter_map(Item::number) {
-                    out.push(Item::Num(match op {
-                        Arith::Add => a + b,
-                        Arith::Sub => a - b,
-                        Arith::Mul => a * b,
-                        Arith::Div => a / b,
-                        Arith::Rem => a % b,
-                    }));
-                }
+            if let (Some(a), Some(b)) = (only(l, root, cur), only(r, root, cur))
+                && let Some(n) = arith(a, *op, b)
+            {
+                out.push(Item::Num(n));
             }
         }
-        Operand::Sign(inner, neg) => out.extend(
-            values(inner, root, cur)
-                .iter()
-                .filter_map(Item::number)
-                .map(|n| Item::Num(if *neg { -n } else { n })),
-        ),
+        Operand::Sign(inner, neg) => {
+            if let Some(n) = only(inner, root, cur) {
+                out.push(Item::Num(if *neg { negate(n) } else { n }));
+            }
+        }
     }
     out
+}
+
+/// The one number an operand answered, and nothing when it answered none or
+/// more than one.
+///
+/// Arithmetic, a sign and every method but `count()` all want exactly one, so
+/// `@.list[*] + 1` answers nothing on a list of two rather than answering twice.
+/// That is the reference's rule and it is worth keeping, because a client that
+/// wrote it meant one number and two answers would be two guesses.
+fn only<'v>(o: &'v Operand<'_>, root: &Value<'v>, cur: &Value<'v>) -> Option<Num> {
+    match values(o, root, cur).as_slice() {
+        [one] => one.num(),
+        _ => None,
+    }
+}
+
+/// Two numbers and the operator between them.
+///
+/// Whole numbers stay whole, because a projection writes what it worked out
+/// back to the client. A division is always a fraction even when it comes out
+/// even, an overflow falls back to doubles rather than wrapping, and a division
+/// or a remainder by zero answers nothing rather than an infinity JSON has no
+/// way to write.
+fn arith(a: Num, op: Arith, b: Num) -> Option<Num> {
+    if matches!(op, Arith::Div | Arith::Rem) && b.as_f64() == 0.0 {
+        return None;
+    }
+    if op == Arith::Div {
+        return Some(Num::Float(a.as_f64() / b.as_f64()));
+    }
+    if let (Num::Int(x), Num::Int(y)) = (a, b) {
+        let whole = match op {
+            Arith::Add => x.checked_add(y),
+            Arith::Sub => x.checked_sub(y),
+            Arith::Mul => x.checked_mul(y),
+            Arith::Rem => x.checked_rem(y),
+            Arith::Div => unreachable!("answered above"),
+        };
+        if let Some(n) = whole {
+            return Some(Num::Int(n));
+        }
+    }
+    let (x, y) = (a.as_f64(), b.as_f64());
+    Some(Num::Float(match op {
+        Arith::Add => x + y,
+        Arith::Sub => x - y,
+        Arith::Mul => x * y,
+        Arith::Rem => x % y,
+        Arith::Div => unreachable!("answered above"),
+    }))
+}
+
+/// A number with its sign turned round, which for the one whole number that has
+/// no positive twin means it stops being whole.
+fn negate(n: Num) -> Num {
+    match n {
+        Num::Int(i) => i
+            .checked_neg()
+            .map_or(Num::Float(-Num::Int(i).as_f64()), Num::Int),
+        Num::Float(f) => Num::Float(-f),
+    }
+}
+
+/// What a projection answers, which is an operand read against the document
+/// with nothing but the document to stand on.
+pub(crate) fn project<'v>(o: &'v Operand<'_>, root: &Value<'v>) -> Vec<Item<'v>> {
+    values(o, root, root)
 }
 
 /// The key names an operand answers, and `None` when nothing under it was an
@@ -353,46 +459,47 @@ fn keyset<'v>(of: &'v Operand<'_>, root: &Value<'v>, cur: &Value<'v>) -> Option<
 fn call<'v>(got: &[Item<'v>], fun: Fun, out: &mut Vec<Item<'v>>) {
     if fun == Fun::Count {
         // The one method that answers a number whatever it was given, which is
-        // why an operand that matched nothing still compares against zero.
-        #[expect(
-            clippy::cast_precision_loss,
-            reason = "a count that reaches the precision of a double is not a document"
-        )]
-        out.push(Item::Num(got.len() as f64));
+        // why an operand that matched nothing still compares against zero, and
+        // the one that is not held to the single node rule below.
+        out.push(Item::Num(Num::Int(
+            i64::try_from(got.len()).unwrap_or(i64::MAX),
+        )));
         return;
     }
-    for it in got {
-        match fun {
-            Fun::Length => {
-                #[expect(
-                    clippy::cast_precision_loss,
-                    reason = "a length that reaches the precision of a double is not a document"
-                )]
-                out.extend(it.size().map(|n| Item::Num(n as f64)));
-            }
-            // An array with anything but numbers in it, and an empty one, answer
-            // nothing rather than answering over what is left, because a mean
-            // over the numeric half of a mixed array is not a number anybody
-            // asked for.
-            Fun::Min | Fun::Max | Fun::Sum | Fun::Avg => {
-                let ns: Option<Vec<f64>> = it.elements().map(|e| e.number()).collect();
-                let Some(ns) = ns.filter(|ns| !ns.is_empty()) else {
-                    continue;
-                };
-                #[expect(
-                    clippy::cast_precision_loss,
-                    reason = "a count that reaches the precision of a double is not a document"
-                )]
-                let n = match fun {
-                    Fun::Min => ns.iter().copied().fold(f64::INFINITY, f64::min),
-                    Fun::Max => ns.iter().copied().fold(f64::NEG_INFINITY, f64::max),
-                    Fun::Sum => ns.iter().sum(),
-                    _ => ns.iter().sum::<f64>() / ns.len() as f64,
-                };
-                out.push(Item::Num(n));
-            }
-            Fun::Count | Fun::Unknown => {}
+    // Everything else wants one node, the same rule arithmetic has, so
+    // `@.list[*].length()` on a list of two answers nothing.
+    let [it] = got else {
+        return;
+    };
+    match fun {
+        Fun::Length => {
+            out.extend(
+                it.size()
+                    .and_then(|n| i64::try_from(n).ok())
+                    .map(|n| Item::Num(Num::Int(n))),
+            );
         }
+        // An array with anything but numbers in it, and an empty one, answer
+        // nothing rather than answering over what is left, because a mean over
+        // the numeric half of a mixed array is not a number anybody asked for.
+        Fun::Min | Fun::Max | Fun::Sum | Fun::Avg => {
+            let ns: Option<Vec<f64>> = it.elements().map(|e| e.number()).collect();
+            let Some(ns) = ns.filter(|ns| !ns.is_empty()) else {
+                return;
+            };
+            #[expect(
+                clippy::cast_precision_loss,
+                reason = "a count that reaches the precision of a double is not a document"
+            )]
+            let n = match fun {
+                Fun::Min => ns.iter().copied().fold(f64::INFINITY, f64::min),
+                Fun::Max => ns.iter().copied().fold(f64::NEG_INFINITY, f64::max),
+                Fun::Sum => ns.iter().sum(),
+                _ => ns.iter().sum::<f64>() / ns.len() as f64,
+            };
+            out.push(Item::Num(Num::Float(n)));
+        }
+        Fun::Count | Fun::Unknown => {}
     }
 }
 

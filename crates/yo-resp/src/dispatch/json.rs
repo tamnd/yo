@@ -52,7 +52,9 @@
 //! object out shows it, and it is D-34 in the register.
 
 use yo_common::{Code, Error, Result};
-use yo_doc::{Builder, Edit, Format, Kind, Path, Step, Value, edit};
+use yo_doc::{
+    Builder, Computed, Edit, Format, Kind, Path, Step, Value, edit, text::write_resp_float,
+};
 use yo_kv::{Foreign, Keyspace};
 
 use super::args::{self, Args};
@@ -153,7 +155,7 @@ fn set(db: &mut Keyspace, args: Args<'_>, out: &mut Out) -> Result<()> {
     } else if args.len() != 4 {
         return Err(args::wrong_arity("json.set"));
     }
-    let path = Path::parse(raw)?;
+    let path = path_of(raw)?;
     // The document is parsed before the key is touched, so a client that sent
     // text that is not JSON changes nothing.
     let value = match yo_doc::from_json(text) {
@@ -322,7 +324,7 @@ fn mset(db: &mut Keyspace, args: Args<'_>, out: &mut Out) -> Result<()> {
     }
     let mut jobs = Vec::with_capacity((args.len() - 1) / 3);
     for i in (1..args.len()).step_by(3) {
-        let path = Path::parse(args.get(i + 1))?;
+        let path = path_of(args.get(i + 1))?;
         let value = match yo_doc::from_json(args.get(i + 2)) {
             Ok(value) => value,
             Err(e) => {
@@ -367,7 +369,7 @@ fn merge(db: &mut Keyspace, args: Args<'_>, out: &mut Out) -> Result<()> {
         return Err(args::syntax());
     }
     let (key, raw, text) = (args.get(1), args.get(2), args.get(3));
-    let path = Path::parse(raw)?;
+    let path = path_of(raw)?;
     let patch = match yo_doc::from_json(text) {
         Ok(patch) => patch,
         Err(e) => {
@@ -523,7 +525,7 @@ fn del(db: &mut Keyspace, args: Args<'_>, out: &mut Out) -> Result<()> {
     // RedisJSON's behaviour and not an accident of the arity: it registers the
     // command as taking one path and never looks at the rest.
     let raw = args.opt(2).unwrap_or(ROOT);
-    let path = Path::parse(raw)?;
+    let path = path_of(raw)?;
     let body = match doc_mut(db, key, out)? {
         Doc::Wrong => return Ok(()),
         Doc::Gone => {
@@ -575,7 +577,7 @@ fn del(db: &mut Keyspace, args: Args<'_>, out: &mut Out) -> Result<()> {
 /// `JSON.TOGGLE key path`, which flips every boolean the path names.
 fn toggle(db: &mut Keyspace, args: Args<'_>, out: &mut Out) -> Result<()> {
     let (key, raw) = (args.get(1), args.get(2));
-    let path = Path::parse(raw)?;
+    let path = path_of(raw)?;
     let body = match doc_mut(db, key, out)? {
         Doc::Wrong => return Ok(()),
         Doc::Gone => return Err(no_key()),
@@ -635,7 +637,7 @@ fn toggle(db: &mut Keyspace, args: Args<'_>, out: &mut Out) -> Result<()> {
 fn clear(db: &mut Keyspace, args: Args<'_>, out: &mut Out) -> Result<()> {
     let key = args.get(1);
     let raw = args.opt(2).unwrap_or(ROOT);
-    let path = Path::parse(raw)?;
+    let path = path_of(raw)?;
     let body = match doc_mut(db, key, out)? {
         Doc::Wrong => return Ok(()),
         Doc::Gone => return Err(no_key()),
@@ -724,15 +726,54 @@ fn get(db: &mut Keyspace, args: Args<'_>, out: &mut Out) -> Result<()> {
     Ok(())
 }
 
+/// A path for a command that cannot take a projection, which is every one of
+/// them but `JSON.GET`, `JSON.MGET` and `JSON.RESP`.
+///
+/// A projection answers numbers and key names that are nowhere in the document,
+/// so there is nothing for a write to write to and nothing for `JSON.TYPE` to
+/// describe. The reference refuses it in the same words.
+fn path_of(raw: &[u8]) -> Result<Path<'_>> {
+    let path = Path::parse(raw)?;
+    if path.is_projection() {
+        return Err(Error::new(
+            Code::Invalid,
+            "computed/projection expressions are only supported by JSON.GET/JSON.MGET/JSON.RESP",
+        ));
+    }
+    Ok(path)
+}
+
 /// One path's answer, as the text it contributes, written as if it sat `depth`
 /// levels inside whatever wrapper the caller has already opened.
-fn one(
-    root: &Value<'_>,
-    path: &Path<'_>,
+fn one<'d>(
+    root: &Value<'d>,
+    path: &'d Path<'d>,
     f: &Format<'_>,
     text: &mut Vec<u8>,
     depth: usize,
 ) -> Result<()> {
+    if path.is_projection() {
+        // A projection always answers an array, however the path was written,
+        // and a projection that worked nothing out answers an empty one rather
+        // than the error a legacy path that matched nothing would.
+        let got = path.project(root);
+        let laid_out = !f.is_plain() && !got.is_empty();
+        text.push(b'[');
+        for (i, v) in got.iter().enumerate() {
+            if i > 0 {
+                text.push(b',');
+            }
+            if laid_out {
+                line(f, text, depth + 1);
+            }
+            v.write_json_at(f, text, depth + 1)?;
+        }
+        if laid_out {
+            line(f, text, depth);
+        }
+        text.push(b']');
+        return Ok(());
+    }
     let mut hits = Vec::new();
     path.select(root, &mut hits);
     if path.legacy() {
@@ -808,7 +849,7 @@ fn mget(db: &mut Keyspace, args: Args<'_>, out: &mut Out) -> Result<()> {
 fn kind(db: &mut Keyspace, args: Args<'_>, out: &mut Out) -> Result<()> {
     let key = args.get(1);
     let raw = args.opt(2).unwrap_or(ROOT);
-    let path = Path::parse(raw)?;
+    let path = path_of(raw)?;
     let body = match doc(db, key, out)? {
         Doc::Wrong => return Ok(()),
         Doc::Gone => {
@@ -944,7 +985,7 @@ impl Asked {
 fn sized(db: &mut Keyspace, args: Args<'_>, out: &mut Out, asked: Asked) -> Result<()> {
     let key = args.get(1);
     let raw = args.opt(2).unwrap_or(ROOT);
-    let path = Path::parse(raw)?;
+    let path = path_of(raw)?;
     let body = match doc(db, key, out)? {
         Doc::Wrong => return Ok(()),
         // A legacy path against a missing key is a nil and a JSONPath against
@@ -1099,7 +1140,7 @@ fn arrappend(db: &mut Keyspace, args: Args<'_>, out: &mut Out) -> Result<()> {
     if args.len() < 4 {
         return Err(args::wrong_arity("json.arrappend"));
     }
-    let path = Path::parse(raw)?;
+    let path = path_of(raw)?;
     let added = match values(args, 3) {
         Ok(added) => added,
         Err(e) => {
@@ -1150,7 +1191,7 @@ fn arrinsert(db: &mut Keyspace, args: Args<'_>, out: &mut Out) -> Result<()> {
     if args.len() < 5 {
         return Err(args::wrong_arity("json.arrinsert"));
     }
-    let path = Path::parse(raw)?;
+    let path = path_of(raw)?;
     let want = args.int(3)?;
     let added = match values(args, 4) {
         Ok(added) => added,
@@ -1222,7 +1263,7 @@ fn arrtrim(db: &mut Keyspace, args: Args<'_>, out: &mut Out) -> Result<()> {
     if args.len() != 5 {
         return Err(args::wrong_arity("json.arrtrim"));
     }
-    let path = Path::parse(raw)?;
+    let path = path_of(raw)?;
     let (from, to) = (args.int(3)?, args.int(4)?);
     let body = match doc_mut(db, key, out)? {
         Doc::Wrong => return Ok(()),
@@ -1306,7 +1347,7 @@ fn arrpop(db: &mut Keyspace, args: Args<'_>, out: &mut Out) -> Result<()> {
     if args.len() > 4 {
         return Err(args::wrong_arity("json.arrpop"));
     }
-    let path = Path::parse(raw)?;
+    let path = path_of(raw)?;
     let want = if args.len() == 4 { args.int(3)? } else { -1 };
     let body = match doc_mut(db, key, out)? {
         Doc::Wrong => return Ok(()),
@@ -1395,7 +1436,7 @@ fn arrindex(db: &mut Keyspace, args: Args<'_>, out: &mut Out) -> Result<()> {
     if args.len() < 4 || args.len() > 6 {
         return Err(args::wrong_arity("json.arrindex"));
     }
-    let path = Path::parse(raw)?;
+    let path = path_of(raw)?;
     let looking = yo_doc::from_json(text)?;
     let from = if args.len() > 4 { args.int(4)? } else { 0 };
     // Zero is the end of the array rather than the front of it, so the default
@@ -1601,7 +1642,7 @@ impl Arith {
 /// and is what every RedisJSON client already does.
 fn arith(db: &mut Keyspace, args: Args<'_>, out: &mut Out, how: Arith) -> Result<()> {
     let (key, raw, operand) = (args.get(1), args.get(2), args.get(3));
-    let path = Path::parse(raw)?;
+    let path = path_of(raw)?;
     let body = match doc_mut(db, key, out)? {
         Doc::Wrong => return Ok(()),
         Doc::Gone => return Err(no_key()),
@@ -1694,7 +1735,7 @@ fn strappend(db: &mut Keyspace, args: Args<'_>, out: &mut Out) -> Result<()> {
     } else {
         (args.get(2), args.get(3))
     };
-    let path = Path::parse(raw)?;
+    let path = path_of(raw)?;
     let body = match doc_mut(db, key, out)? {
         Doc::Wrong => return Ok(()),
         Doc::Gone => return Err(no_key()),
@@ -1794,6 +1835,17 @@ fn resp(db: &mut Keyspace, args: Args<'_>, out: &mut Out) -> Result<()> {
         Doc::Here(body) => body,
     };
     let root = readable(&body.doc)?;
+    if path.is_projection() {
+        // A projection answers a flat array of what it worked out, and it does
+        // that for a legacy path too, since there is no place in the document
+        // for the legacy shape to be about.
+        let got = path.project(&root);
+        out.array(got.len());
+        for v in &got {
+            computed(v, out)?;
+        }
+        return Ok(());
+    }
     let mut hits = Vec::new();
     path.select(&root, &mut hits);
     if path.legacy() {
@@ -1809,6 +1861,28 @@ fn resp(db: &mut Keyspace, args: Args<'_>, out: &mut Out) -> Result<()> {
     Ok(())
 }
 
+/// One value a projection worked out, in the shapes `JSON.RESP` uses for the
+/// same kinds: a whole number is an integer and anything else is a string.
+fn computed(v: &Computed<'_>, out: &mut Out) -> Result<()> {
+    match v {
+        Computed::Value(v) => shape(v, out),
+        Computed::Name(k) => {
+            out.bulk(k);
+            Ok(())
+        }
+        Computed::Int(i) => {
+            out.int(*i);
+            Ok(())
+        }
+        Computed::Float(x) => {
+            let mut text = Vec::new();
+            write_resp_float(*x, &mut text);
+            out.bulk(&text);
+            Ok(())
+        }
+    }
+}
+
 /// One value, as the RESP `JSON.RESP` answers with.
 fn shape(v: &Value<'_>, out: &mut Out) -> Result<()> {
     match v.kind() {
@@ -1820,11 +1894,12 @@ fn shape(v: &Value<'_>, out: &mut Out) -> Result<()> {
         }),
         Kind::Int => out.int(v.as_int().ok_or_else(damaged)?),
         Kind::Float => {
-            // A double goes out as its JSON text and not as a RESP double, so
-            // the reply is the same on both protocols and a client that reads
-            // it gets the same digits `JSON.GET` would have given it.
+            // A double goes out as text and not as a RESP double, so the reply
+            // is the same on both protocols. The text is not the JSON writer's,
+            // because Redis has its own number to text routine outside JSON and
+            // this reply goes through that one.
             let mut text = Vec::new();
-            v.write_json(&mut text)?;
+            write_resp_float(v.as_float().ok_or_else(damaged)?, &mut text);
             out.bulk(&text);
         }
         Kind::Text => out.bulk(v.text_bytes().ok_or_else(damaged)?),
@@ -1871,7 +1946,7 @@ fn debug(db: &mut Keyspace, args: Args<'_>, out: &mut Out) -> Result<()> {
     }
     let key = args.get(2);
     let raw = args.opt(3).unwrap_or(ROOT);
-    let path = Path::parse(raw)?;
+    let path = path_of(raw)?;
     let body = match doc(db, key, out)? {
         Doc::Wrong => return Ok(()),
         Doc::Gone => {

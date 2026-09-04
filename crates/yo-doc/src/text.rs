@@ -574,12 +574,21 @@ fn deeper(depth: usize) -> Result<()> {
     Ok(())
 }
 
-fn write_float(f: f64, out: &mut Vec<u8>) -> Result<()> {
+pub(crate) fn write_float(f: f64, out: &mut Vec<u8>) -> Result<()> {
     if !f.is_finite() {
         return Err(Error::new(
             Code::Invalid,
             "JSON has no way to write an infinity or a NaN",
         ));
+    }
+    // A number far from one is written the way every JSON writer worth using
+    // writes it, which is `1e16` rather than sixteen zeroes and `1e-7` rather
+    // than six. The switch is at `1e-5` below and `1e16` above, which is where
+    // RedisJSON's writer puts it and where JavaScript's does.
+    let mag = f.abs();
+    if mag != 0.0 && !(1e-5..1e16).contains(&mag) {
+        write!(Sink(out), "{f:e}").expect("a Vec never fails a write");
+        return Ok(());
     }
     let from = out.len();
     write!(Sink(out), "{f}").expect("a Vec never fails a write");
@@ -592,6 +601,124 @@ fn write_float(f: f64, out: &mut Vec<u8>) -> Result<()> {
     Ok(())
 }
 
+/// A whole number, as JSON text.
+pub(crate) fn write_int(i: i64, out: &mut Vec<u8>) {
+    write!(Sink(out), "{i}").expect("a Vec never fails a write");
+}
+
+/// A double, the way `JSON.RESP` writes one, which is not the way JSON does.
+///
+/// Redis has one routine for turning a double into text outside of JSON and
+/// `JSON.RESP` goes through it rather than through the JSON writer, so the
+/// digits are not the digits `JSON.GET` hands back for the same number. Three
+/// things differ. A whole number a long long can hold comes back as that long
+/// long, so `1.0` is `1` and `1e16` is `10000000000000000`. The switch to
+/// exponent form is at `1e-7` below and depends on the digit count above rather
+/// than sitting at `1e16`. And a positive exponent carries a `+`, so `1e19` is
+/// `1e+19` while `1e-7` stays `1e-7`.
+///
+/// The shape rules below are grisu2's as Redis links it. Redis will not always
+/// answer the shortest digits there and Rust always will, which is a difference
+/// of one digit on roughly one number in a thousand and is not worth carrying a
+/// second digit generator for.
+pub fn write_resp_float(f: f64, out: &mut Vec<u8>) {
+    if f.is_nan() {
+        out.extend_from_slice(b"nan");
+        return;
+    }
+    if f.is_infinite() {
+        out.extend_from_slice(if f < 0.0 { b"-inf" } else { b"inf" });
+        return;
+    }
+    if f == 0.0 {
+        if f.is_sign_negative() {
+            out.push(b'-');
+        }
+        out.push(b'0');
+        return;
+    }
+    // A whole number a long long can hold goes out as that long long. The half
+    // is not a typo: Redis will not trust the cast any nearer the edge than
+    // that, so the switch is at 4.6e18 and not at 9.2e18.
+    #[expect(clippy::cast_precision_loss, reason = "a bound and not a round trip")]
+    let half = (i64::MAX / 2) as f64;
+    if f.abs() <= half {
+        #[expect(clippy::cast_possible_truncation, reason = "bounded on the line above")]
+        let whole = f as i64;
+        #[expect(clippy::cast_precision_loss, reason = "the test is that it was exact")]
+        let exact = whole as f64 == f;
+        if exact {
+            write_int(whole, out);
+            return;
+        }
+    }
+    // The shortest digits and where the point sits, read back out of the form
+    // Rust writes them in. A double is at most seventeen digits, so the parse
+    // below cannot overrun.
+    let from = out.len();
+    write!(Sink(out), "{f:e}").expect("a Vec never fails a write");
+    let mut digits = [0u8; 17];
+    let mut count = 0;
+    let mut at = from;
+    let neg = out[at] == b'-';
+    if neg {
+        at += 1;
+    }
+    while at < out.len() && out[at] != b'e' {
+        if out[at] != b'.' {
+            digits[count] = out[at];
+            count += 1;
+        }
+        at += 1;
+    }
+    let exp: i32 = core::str::from_utf8(&out[at + 1..])
+        .expect("digits are UTF-8")
+        .parse()
+        .expect("Rust wrote the exponent");
+    out.truncate(from);
+    let digits = &digits[..count];
+    let len = i32::try_from(count).expect("at most seventeen");
+    // Where the point sits relative to the last digit. The value is the digits
+    // times ten to this.
+    let k = exp - (len - 1);
+    if neg {
+        out.push(b'-');
+    }
+    if k >= 0 && exp.abs() < len + 7 {
+        // A whole number that is short enough to write out in full.
+        out.extend_from_slice(digits);
+        out.resize(
+            out.len() + usize::try_from(k).expect("checked to be positive"),
+            b'0',
+        );
+    } else if k < 0 && (k > -7 || exp.abs() < 4) {
+        // A fraction near enough to one to write with a point in it.
+        let point = len + k;
+        if point <= 0 {
+            out.extend_from_slice(b"0.");
+            out.resize(
+                out.len() + usize::try_from(-point).expect("checked to be negative"),
+                b'0',
+            );
+            out.extend_from_slice(digits);
+        } else {
+            let point = usize::try_from(point).expect("checked to be positive");
+            out.extend_from_slice(&digits[..point]);
+            out.push(b'.');
+            out.extend_from_slice(&digits[point..]);
+        }
+    } else {
+        out.push(digits[0]);
+        if count > 1 {
+            out.push(b'.');
+            out.extend_from_slice(&digits[1..]);
+        }
+        out.push(b'e');
+        out.push(if exp < 0 { b'-' } else { b'+' });
+        write_int(i64::from(exp.abs()), out);
+    }
+}
+
 /// A string, quoted and escaped.
 ///
 /// The bytes above `0x7f` are copied as they are, which keeps UTF-8 as UTF-8
@@ -599,7 +726,7 @@ fn write_float(f: f64, out: &mut Vec<u8>) -> Result<()> {
 /// going in, which only [`Builder::text_bytes`] can produce, comes out the same
 /// way it went in and the result is not valid JSON. That is the caller's doing
 /// and re-encoding it would be inventing bytes.
-fn write_string(s: &[u8], out: &mut Vec<u8>) {
+pub(crate) fn write_string(s: &[u8], out: &mut Vec<u8>) {
     out.push(b'"');
     for &c in s {
         match c {
@@ -726,8 +853,16 @@ mod tests {
         assert_eq!(round("1e2"), "100.0");
         assert_eq!(round("-0.5"), "-0.5");
         assert_eq!(round("9223372036854775807"), "9223372036854775807");
-        // One past an i64, which is the point the split has to happen at.
-        assert_eq!(round("9223372036854775808"), "9223372036854776000.0");
+        // One past an i64, which is the point the split has to happen at. It
+        // comes back in exponent form because a double that big is written the
+        // way doubles that big are written.
+        assert_eq!(round("9223372036854775808"), "9.223372036854776e18");
+        assert_eq!(round("1e15"), "1000000000000000.0");
+        assert_eq!(round("1e16"), "1e16");
+        assert_eq!(round("1e-5"), "0.00001");
+        assert_eq!(round("1e-6"), "1e-6");
+        assert_eq!(round("-1e17"), "-1e17");
+        assert_eq!(round("5e-324"), "5e-324");
         let bytes = from_json(b"1").expect("parses");
         assert_eq!(Value::new(&bytes).expect("readable").kind(), Kind::Int);
         let bytes = from_json(b"1.0").expect("parses");
@@ -738,6 +873,44 @@ mod tests {
         assert_eq!(round("0"), "0");
         let bytes = from_json(b"-0").expect("parses");
         assert_eq!(Value::new(&bytes).expect("readable").kind(), Kind::Float);
+    }
+
+    #[test]
+    fn json_resp_writes_a_double_the_way_redis_writes_one_and_not_the_way_json_does() {
+        fn resp(f: f64) -> String {
+            let mut out = Vec::new();
+            write_resp_float(f, &mut out);
+            String::from_utf8(out).expect("digits are UTF-8")
+        }
+
+        // A whole number a long long can hold loses the `.0` the JSON writer
+        // puts on it, and the edge is at half a long long rather than at the
+        // whole of one.
+        assert_eq!(resp(1.0), "1");
+        assert_eq!(resp(1e16), "10000000000000000");
+        assert_eq!(resp(4e18), "4000000000000000000");
+        assert_eq!(resp(-4e18), "-4000000000000000000");
+        assert_eq!(resp(5e18), "5e+18");
+        // A whole number too big for that is still written out in full while it
+        // is short enough, which is what the digit count rule below is for.
+        assert_eq!(resp(1.2345678901234567e19), "12345678901234567000");
+        assert_eq!(resp(1e19), "1e+19");
+        assert_eq!(resp(1.5e19), "1.5e+19");
+        assert_eq!(resp(1e300), "1e+300");
+        assert_eq!(resp(f64::MAX), "1.7976931348623157e+308");
+        // A fraction keeps the point down to `1e-6` and goes to exponent form
+        // at `1e-7`, which is not where the JSON writer switches.
+        assert_eq!(resp(2.5), "2.5");
+        assert_eq!(resp(0.1), "0.1");
+        assert_eq!(resp(123.456), "123.456");
+        assert_eq!(resp(1e-6), "0.000001");
+        assert_eq!(resp(1e-7), "1e-7");
+        assert_eq!(resp(5e-324), "5e-324");
+        assert_eq!(resp(-1.5), "-1.5");
+        // A zero keeps its sign, since that is the one thing about a zero worth
+        // keeping.
+        assert_eq!(resp(0.0), "0");
+        assert_eq!(resp(-0.0), "-0");
     }
 
     #[test]

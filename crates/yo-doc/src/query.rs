@@ -106,12 +106,23 @@
 //! `@.p.size()` does.
 //!
 //! Arithmetic is `+ - * / %` over numbers, `*` and `/` and `%` bind tighter than
-//! `+` and `-`, and parentheses group. Subtraction needs its spaces, because
-//! `@.total-vat` is a key called `total-vat` and `@.total - vat` is not. The
-//! other four do not, so `@.p*2 == 6` reads the way it looks. A leading `-` or
+//! `+` and `-`, and parentheses group. Only `*` is an operator wherever it
+//! stands, so `@.p*2 == 6` reads the way it looks. The other four are name
+//! characters and need their spaces: `@.total-vat` is a key called `total-vat`,
+//! `@.a+1` is a key called `a+1`, and `@.total - vat` is the subtraction. The
+//! exception is straight after a `]`, where no name can be running, so
+//! `@.list[0]-1` is a subtraction with no spaces in it at all. A leading `-` or
 //! `+` is a sign, it answers a number or nothing so `-@.name` on a string
 //! answers nothing, and one is as many as go in a row: `--@.p` is refused and
 //! `-(-@.p)` is how a second one is written.
+//!
+//! Arithmetic and the methods want one node, which is the one place the set rule
+//! above does not hold. An operand that answered two answers nothing rather than
+//! a pair of sums, so `@.list[*] + 1` on a list of two is nothing and
+//! `@.list[*].length()` is nothing as well. `count()` is outside that because
+//! counting is what it is for. This is worth knowing before writing a wildcard
+//! into an arithmetic operand, because what comes back is nothing rather than
+//! what it looks like it asks for.
 //!
 //! The postfix `~` answers the key names of an object, one string each, and
 //! nothing at all for an array or a scalar. It is a set rather than an array
@@ -129,6 +140,37 @@
 //! `@.p~ empty true` and `@.p~ size 0` are all true, and on a number or a
 //! missing key none of the three is.
 //!
+//! # A path that is an expression
+//!
+//! `JSON.GET`, `JSON.MGET` and `JSON.RESP` take a path that is not a way through
+//! a document at all but a sum over one. `$.a + $.b`, `$.list.length()` and
+//! `$.o~` are all projections, and what comes back is what the expression worked
+//! out rather than where it was found. Nothing else about them is different from
+//! the same expression inside a filter: the same operators, the same methods,
+//! the same one node rule. [`Path::is_projection`] tells the two apart and
+//! [`Path::project`] runs one.
+//!
+//! A projection never fails the way a path does. `$.nope + 1` answers `[]`
+//! rather than raising the "path does not exist" a legacy path would, and it
+//! answers an array even when it was written in the legacy syntax, so `.a + 1`
+//! is `[4]` and not `4`.
+//!
+//! The first thing at the top level is a path however it is written, which is
+//! how `.a + 1` and `2 + 3` both parse. The second is a member really called
+//! `2`, plus three, and answers `[]`. Inside parentheses the ordinary rules are
+//! back, so `(2)` is the number two. `@` is refused up here, since there is no
+//! current node outside a filter.
+//!
+//! The kind of number that comes out follows the reference and is not always the
+//! kind the arithmetic suggests. A whole number stays whole through `+`, `-`,
+//! `*` and `%`, `/` is always a fraction even when it divides evenly, `length()`
+//! and `count()` are whole, and `min()`, `max()`, `sum()` and `avg()` are
+//! fractions. Dividing or taking a remainder by zero answers nothing.
+//!
+//! Every other `JSON.*` command refuses a projection rather than reading it as a
+//! path, so `JSON.NUMINCRBY key "$.a + 1" 1` is an error and not a write
+//! somewhere nobody asked for.
+//!
 //! # Two orderings that are not Redis's
 //!
 //! Matches come back in document order, and for an object that is key order,
@@ -142,7 +184,7 @@
 
 use yo_common::{Code, Error, Result};
 
-use crate::filter::{Arith, Expr, Fun, Op, Operand, Pattern};
+use crate::filter::{Arith, Expr, Fun, Item, Num, Op, Operand, Pattern};
 use crate::head::{DEPTH_MAX, Kind};
 use crate::path::Step;
 use crate::read::Value;
@@ -157,6 +199,56 @@ use crate::read::Value;
 pub struct Path<'a> {
     sels: Vec<Sel<'a>>,
     legacy: bool,
+    /// The expression this path is, when it is one rather than a way through
+    /// the document. A path with one has no selectors and names nothing.
+    proj: Option<Operand<'a>>,
+}
+
+/// One value a projection worked out.
+///
+/// A projection answers numbers and key names rather than places in a document,
+/// which is why it is not a [`Value`]. The two number kinds are apart because
+/// the reference writes `$.a + $.b` as `7` and `$.list.sum()` as `7.0`, and a
+/// client reading the reply back as JSON sees the difference.
+#[derive(Debug, Clone, Copy)]
+pub enum Computed<'d> {
+    /// A value the document holds.
+    Value(Value<'d>),
+    /// A key name, which is what `~` answers.
+    Name(&'d [u8]),
+    /// A whole number.
+    Int(i64),
+    /// A number that is not whole.
+    Float(f64),
+}
+
+impl Computed<'_> {
+    /// This as JSON text, appended to `out`, as if it sat `depth` levels inside
+    /// whatever the caller has already opened.
+    ///
+    /// # Errors
+    ///
+    /// A document that arrived damaged, and a number that is not finite, which
+    /// JSON has no way to write.
+    pub fn write_json_at(
+        &self,
+        f: &crate::Format<'_>,
+        out: &mut Vec<u8>,
+        depth: usize,
+    ) -> Result<()> {
+        match self {
+            Computed::Value(v) => v.write_json_at(f, out, depth),
+            Computed::Name(k) => {
+                crate::text::write_string(k, out);
+                Ok(())
+            }
+            Computed::Int(i) => {
+                crate::text::write_int(*i, out);
+                Ok(())
+            }
+            Computed::Float(x) => crate::text::write_float(*x, out),
+        }
+    }
 }
 
 /// One selector.
@@ -195,6 +287,16 @@ impl<'a> Path<'a> {
     /// in [`Path::legacy`], because what it changes is the shape of the reply
     /// and that is the dispatch layer's business rather than this one's.
     pub fn parse(path: &'a [u8]) -> Result<Path<'a>> {
+        // A projection is tried first and falls through quietly when the path is
+        // an ordinary one, so nothing about an ordinary path goes through the
+        // expression grammar.
+        if let Some(proj) = projection(path) {
+            return Ok(Path {
+                sels: Vec::new(),
+                legacy: false,
+                proj: Some(proj),
+            });
+        }
         let (rest, legacy) = match path.strip_prefix(b"$") {
             Some(rest) => (rest, false),
             None => (path, true),
@@ -209,7 +311,38 @@ impl<'a> Path<'a> {
         Ok(Path {
             sels: p.sels,
             legacy,
+            proj: None,
         })
+    }
+
+    /// Whether this path is an expression rather than a way through the
+    /// document.
+    ///
+    /// A projection answers values that are nowhere in the document, so there
+    /// is nothing for a write to write to and nothing for `JSON.TYPE` to
+    /// describe. Only `JSON.GET`, `JSON.MGET` and `JSON.RESP` take one and the
+    /// rest refuse it, which is what this is for.
+    #[must_use]
+    pub fn is_projection(&self) -> bool {
+        self.proj.is_some()
+    }
+
+    /// What this projection works out against `root`, and nothing at all when
+    /// the path is not one.
+    #[must_use]
+    pub fn project<'d>(&'d self, root: &Value<'d>) -> Vec<Computed<'d>> {
+        let Some(o) = &self.proj else {
+            return Vec::new();
+        };
+        crate::filter::project(o, root)
+            .into_iter()
+            .map(|it| match it {
+                Item::Ref(v) => Computed::Value(v),
+                Item::Key(k) => Computed::Name(k),
+                Item::Num(Num::Int(i)) => Computed::Int(i),
+                Item::Num(Num::Float(x)) => Computed::Float(x),
+            })
+            .collect()
     }
 
     /// Whether this path was written in the older syntax, without a leading
@@ -277,6 +410,7 @@ impl<'a> Path<'a> {
         let parent = Path {
             sels: self.sels[..self.sels.len() - 1].to_vec(),
             legacy: self.legacy,
+            proj: None,
         };
         Some((parent, step))
     }
@@ -476,9 +610,19 @@ impl<'a> Parse<'a> {
     }
 
     /// A bare name, which runs to the next separator.
+    ///
+    /// A name written without quotes may not have a space, a `~`, a `*` or a
+    /// comparison character in it, because the top level of a path is an
+    /// expression now and those are what it is made of. A member really called
+    /// `my key` is reached by `$["my key"]`, which is what the reference wants
+    /// too. The four arithmetic characters that are also name characters are
+    /// still name characters, so `$.total-vat` and `$.a+1` are members.
     fn name(&mut self) -> Result<&'a [u8]> {
         let from = self.at;
-        while self.at < self.rest.len() && !matches!(self.rest[self.at], b'.' | b'[') {
+        while self.at < self.rest.len()
+            && !matches!(self.rest[self.at], b'.' | b'[')
+            && !ends_name(self.rest[self.at])
+        {
             self.at += 1;
         }
         if self.at == from {
@@ -563,6 +707,7 @@ impl<'a> Parse<'a> {
             body,
             at: 0,
             of: self.at,
+            top: false,
         };
         let e = f.or()?;
         f.spaces();
@@ -594,6 +739,10 @@ struct Filter<'a> {
     body: &'a [u8],
     at: usize,
     of: usize,
+    /// Whether the next atom read is the first one of a projection, where a
+    /// bare name is a path rather than a value. It is cleared by the atom that
+    /// reads it, so it only ever applies to one.
+    top: bool,
 }
 
 impl<'a> Filter<'a> {
@@ -774,6 +923,10 @@ impl<'a> Filter<'a> {
             return Err(self.bad("a filter that stops where a value was expected"));
         };
         let mut e = if c == b'(' {
+            // Only the first thing at the very top of a projection is a path
+            // however it is written. Inside parentheses the ordinary rules are
+            // back, so `(2)` is the number and `2 + 3` is a member called `2`.
+            self.top = false;
             self.at += 1;
             let inner = self.operand()?;
             if !self.word(b")") {
@@ -781,35 +934,14 @@ impl<'a> Filter<'a> {
             }
             inner
         } else if c == b'@' || c == b'$' {
+            self.top = false;
             self.at += 1;
-            let end = self.at + path_end(&self.body[self.at..]);
-            // A postfix method looks like the last name of the path, because the
-            // path stops at the `(` rather than at the `.` before it, so the
-            // name comes back off the end here.
-            let mut to = end;
-            let mut fun = None;
-            if self.body[end..].starts_with(b"()")
-                && let Some(dot) = self.body[self.at..end].iter().rposition(|&b| b == b'.')
-            {
-                fun = Some(Fun::named(&self.body[self.at + dot + 1..end]));
-                to = self.at + dot;
-            }
-            let mut p = Parse {
-                rest: &self.body[self.at..to],
-                at: 0,
-                legacy: false,
-                sels: Vec::new(),
-            };
-            p.run()?;
-            self.at = if fun.is_some() { end + 2 } else { end };
-            let path = Operand::Path {
-                at: c == b'@',
-                sels: p.sels,
-            };
-            match fun {
-                Some(f) => Operand::Call(Box::new(path), f),
-                None => path,
-            }
+            self.path(c == b'@', false)?
+        } else if core::mem::take(&mut self.top) {
+            // The first thing in a projection is a path however it is written,
+            // which is what makes `.a + 1` read and what makes `2 + 3` a member
+            // really called `2` rather than five.
+            self.path(false, true)?
         } else {
             self.literal()?
         };
@@ -820,6 +952,39 @@ impl<'a> Filter<'a> {
             e = Operand::Keys(Box::new(e));
         }
         Ok(e)
+    }
+
+    /// The path that starts here, and the postfix method on the end of it when
+    /// there is one.
+    ///
+    /// `at` says the path started at `@` rather than at `$`, and `legacy` says
+    /// it started at neither, which only happens at the top of a projection.
+    fn path(&mut self, at: bool, legacy: bool) -> Result<Operand<'a>> {
+        let end = self.at + path_end(&self.body[self.at..]);
+        // A postfix method looks like the last name of the path, because the
+        // path stops at the `(` rather than at the `.` before it, so the name
+        // comes back off the end here.
+        let mut to = end;
+        let mut fun = None;
+        if self.body[end..].starts_with(b"()")
+            && let Some(dot) = self.body[self.at..end].iter().rposition(|&b| b == b'.')
+        {
+            fun = Some(Fun::named(&self.body[self.at + dot + 1..end]));
+            to = self.at + dot;
+        }
+        let mut p = Parse {
+            rest: &self.body[self.at..to],
+            at: 0,
+            legacy,
+            sels: Vec::new(),
+        };
+        p.run()?;
+        self.at = if fun.is_some() { end + 2 } else { end };
+        let path = Operand::Path { at, sels: p.sels };
+        Ok(match fun {
+            Some(f) => Operand::Call(Box::new(path), f),
+            None => path,
+        })
     }
 
     /// A number, a string, `true`, `false`, `null`, or a whole array or object.
@@ -915,6 +1080,56 @@ impl<'a> Filter<'a> {
     }
 }
 
+/// The expression a path is, when it is one rather than a way through the
+/// document.
+///
+/// Redis 8.10 lets the top level of a path be arithmetic, a postfix method or a
+/// `~`, so `$.a + $.b` answers a number that is nowhere in the document and
+/// `$.o~` answers key names. It is told from an ordinary path by what it parses
+/// into: a path on its own stays a path, and anything else is an expression. A
+/// path in parentheses is an expression too, which is what the leading `(` here
+/// is about.
+///
+/// Nothing here is an error. A body that does not read as an expression is left
+/// to the ordinary parser, which is what says whether it is a path or a mistake.
+fn projection(body: &[u8]) -> Option<Operand<'_>> {
+    // The reference's top level starts at the first byte, so a leading space is
+    // part of the first name rather than something to skip past, and nothing
+    // that starts with one is an expression.
+    if body.first().is_none_or(|c| matches!(c, b' ' | b'\t')) {
+        return None;
+    }
+    let mut f = Filter {
+        body,
+        at: 0,
+        of: 0,
+        top: true,
+    };
+    let e = f.operand().ok()?;
+    f.spaces();
+    if f.at != body.len() || (body[0] != b'(' && matches!(e, Operand::Path { .. })) {
+        return None;
+    }
+    // `@` is the node a filter stands on and there is no such node up here, so
+    // a path that mentions one is not an expression. The reference refuses it
+    // and this leaves it to the ordinary parser, which reads it as a member
+    // really called `@` and answers nothing, which is the same thing to a
+    // client.
+    (!mentions_at(&e)).then_some(e)
+}
+
+/// Whether an operand reads `@` anywhere inside it.
+fn mentions_at(o: &Operand<'_>) -> bool {
+    match o {
+        Operand::Path { at, .. } => *at,
+        Operand::Lit(_) | Operand::Re(_) => false,
+        Operand::Keys(inner) | Operand::Call(inner, _) | Operand::Sign(inner, _) => {
+            mentions_at(inner)
+        }
+        Operand::Math(l, _, r) => mentions_at(l) || mentions_at(r),
+    }
+}
+
 /// Where a path inside a filter ends.
 ///
 /// A path there runs up against the expression around it, so it stops at the
@@ -935,7 +1150,7 @@ fn path_end(body: &[u8]) -> usize {
             if c == quote {
                 quote = 0;
             }
-        } else if depth == 0 && stops(c) {
+        } else if depth == 0 && ends_path(body, i) {
             return i;
         } else {
             match c {
@@ -950,12 +1165,10 @@ fn path_end(body: &[u8]) -> usize {
     body.len()
 }
 
-/// Whether this byte ends a path or a bare value inside a filter.
+/// Whether this byte ends a bare value inside a filter.
 ///
-/// A `-` is not one of these, which is what makes a member really called
-/// `total-vat` reachable and what makes `@.p - 1` need its spaces. Every other
-/// arithmetic operator is, because no key anybody writes has a `*` in it and a
-/// client who has one can quote it.
+/// A `-` is not one of these, because a number's sign is read before this runs
+/// and a `1-2` with no spaces is not a value anybody meant.
 fn stops(c: u8) -> bool {
     matches!(
         c,
@@ -975,6 +1188,29 @@ fn stops(c: u8) -> bool {
             | b'/'
             | b'%'
     )
+}
+
+/// Whether the byte at `i` ends the path being read.
+///
+/// `+`, `-`, `/` and `%` are all characters a member name may have in it, so
+/// `@.total-vat` and `@.p+1` are members and not arithmetic. They only end a
+/// path where no name can be running, which is straight after a `]`, so
+/// `@.list[0]-1` is a subtraction. A `*` is never a name character, because it
+/// is the wildcard, so `@.p*2` is a product and a member really called `p*2` has
+/// to be written `@["p*2"]`. All of that was read off RedisJSON 8.10.1.
+fn ends_path(body: &[u8], i: usize) -> bool {
+    if matches!(body[i], b'+' | b'-' | b'/' | b'%') {
+        return i > 0 && body[i - 1] == b']';
+    }
+    ends_name(body[i])
+}
+
+/// Whether this byte ends a bare member name.
+///
+/// The same set that ends a path, less the four arithmetic characters that are
+/// also name characters, since a name is exactly where those are allowed.
+fn ends_name(c: u8) -> bool {
+    stops(c) && !matches!(c, b'+' | b'/' | b'%')
 }
 
 /// The operators that are written as words rather than as symbols.
@@ -1141,9 +1377,11 @@ mod tests {
         assert_eq!(ask(&d, "$.store.book[-1].title"), r#"["b"]"#);
         assert_eq!(ask(&d, "$['store']['bike']['price']"), "[19]");
         assert_eq!(ask(&d, "store.bike.price"), "[19]", "the older syntax");
-        // A name runs to the next separator and a space is not one, which is
-        // the only way to reach a key with a space in it without quoting.
-        assert_eq!(ask(&d, "$.store.no such key"), "[]");
+        // A bare name stops at a space, because the top level of a path is an
+        // expression and a space is where one operand ends. A key with a space
+        // in it is reached by quoting it.
+        assert!(why("$.store.no such key").contains("does not start with"));
+        assert_eq!(ask(&d, r#"$.store["no such key"]"#), "[]");
         assert_eq!(ask(&d, "$"), ask(&d, ""), "the root, both ways of asking");
     }
 
@@ -1562,11 +1800,37 @@ mod tests {
         assert_eq!(kept("(1 + 2 * 3 == 7)"), "iftnbaom");
         assert_eq!(kept("((1 + 2) * 3 == 9)"), "iftnbaom");
         assert_eq!(kept("(1 + 2 * 3 == 9)"), "");
-        // The four that are not `-` do not need their spaces, because `-` is
-        // the one that is also a character a key name can hold.
+        // `*` is the one that does not need its spaces. The other four are
+        // characters a key name can hold, so without spaces they are part of the
+        // name and the member they name is not there.
         assert_eq!(kept("(@.p*2==2)"), "i");
-        let d = from_json(br#"[{"a-b":1,"id":"k"}]"#).expect("parses");
+        assert_eq!(kept("(@.p+1==2)"), "");
+        assert_eq!(kept("(@.p/2==0.5)"), "");
+        assert_eq!(kept("(@.p%2==1)"), "");
+        let d = from_json(br#"[{"a-b":1,"a+b":2,"a/b":3,"id":"k"}]"#).expect("parses");
         assert_eq!(ask(&d, r#"$[?(@.a-b == 1)].id"#), r#"["k"]"#);
+        assert_eq!(ask(&d, r#"$[?(@.a+b == 2)].id"#), r#"["k"]"#);
+        assert_eq!(ask(&d, r#"$[?(@.a/b == 3)].id"#), r#"["k"]"#);
+        // Straight after a `]` no name can be running, so there the four are
+        // operators with no spaces around them.
+        let d = from_json(br#"[{"l":[4],"id":"k"}]"#).expect("parses");
+        assert_eq!(ask(&d, r#"$[?(@.l[0]-1 == 3)].id"#), r#"["k"]"#);
+        assert_eq!(ask(&d, r#"$[?(@.l[0]+1 == 5)].id"#), r#"["k"]"#);
+    }
+
+    /// Arithmetic and the methods want one node and answer nothing for two,
+    /// which is the one place a filter is not written against sets. `count()`
+    /// is outside the rule.
+    #[test]
+    fn arithmetic_and_the_methods_want_one_node() {
+        let d = from_json(
+            br#"[{"l":[1,2],"s":["ab","cd"],"id":"two"},{"l":[1],"s":["a"],"id":"one"}]"#,
+        )
+        .expect("parses");
+        assert_eq!(ask(&d, "$[?(@.l[*] + 1 == 2)].id"), r#"["one"]"#);
+        assert_eq!(ask(&d, "$[?(@.s[*].length() == 1)].id"), r#"["one"]"#);
+        assert_eq!(ask(&d, "$[?(-@.l[*] == -1)].id"), r#"["one"]"#);
+        assert_eq!(ask(&d, "$[?(@.l[*].count() == 2)].id"), r#"["two"]"#);
     }
 
     /// `~` answers the key names of an object, as a set of strings rather than
@@ -1654,5 +1918,62 @@ mod tests {
         // One sign and no more, and a group is how a second one is written.
         assert_eq!(kept("(-(-@.p) == 1)"), "i");
         assert!(why("$[?(--@.p == 1)]").contains("not a value"));
+    }
+
+    /// What a projection answers over [`doc`], as JSON text, the same way
+    /// [`ask`] reads a path.
+    fn sum(bytes: &[u8], path: &str) -> String {
+        let v = Value::new(bytes).expect("readable");
+        let p = Path::parse(path.as_bytes()).expect("the path parses");
+        assert!(p.is_projection(), "{path} should be a projection");
+        let mut out = Vec::new();
+        out.push(b'[');
+        for (i, got) in p.project(&v).iter().enumerate() {
+            if i > 0 {
+                out.push(b',');
+            }
+            got.write_json_at(&crate::Format::default(), &mut out, 0)
+                .expect("writable");
+        }
+        out.push(b']');
+        String::from_utf8(out).expect("UTF-8")
+    }
+
+    /// A path that is an expression rather than a way through the document.
+    #[test]
+    fn a_projection_works_something_out_rather_than_naming_a_place() {
+        let d = doc();
+        assert_eq!(sum(&d, "$.expensive + 1"), "[11]");
+        assert_eq!(sum(&d, "$.expensive * 2"), "[20]");
+        assert_eq!(sum(&d, "-$.expensive"), "[-10]");
+        assert_eq!(sum(&d, "$.store.book.length()"), "[2]");
+        assert_eq!(sum(&d, "$.store.book[*].count()"), "[2]");
+        assert_eq!(sum(&d, "$.store.bike~"), r#"["price"]"#);
+        // A division is a fraction however evenly it divides, and the four
+        // aggregates are fractions too, which is the reference's doing rather
+        // than anything the arithmetic asks for.
+        assert_eq!(sum(&d, "$.expensive / 1"), "[10.0]");
+        assert_eq!(sum(&d, "$.store.book[*].price.sum()"), "[]");
+        // Nothing at all rather than the error a path would raise, and an array
+        // even when the path was written the legacy way.
+        assert_eq!(sum(&d, "$.nope + 1"), "[]");
+        assert_eq!(sum(&d, "$.nope.count()"), "[0]");
+        assert_eq!(sum(&d, "$.expensive / 0"), "[]");
+        assert_eq!(sum(&d, ".expensive + 1"), "[11]");
+        assert_eq!(sum(&d, ".store.book.length()"), "[2]");
+        // The first thing up here is a path however it is written, so this is a
+        // member really called `2` and not the number. Inside a group the
+        // ordinary rules are back.
+        assert_eq!(sum(&d, "2 + 3"), "[]");
+        assert_eq!(sum(&d, "(2) + 3"), "[5]");
+        // A path is a path and not a projection, which is what keeps every
+        // other `JSON.*` command working.
+        for path in ["$.expensive", "$..price", "$.store.book[?(@.price < 10)]"] {
+            let p = Path::parse(path.as_bytes()).expect("parses");
+            assert!(!p.is_projection(), "{path} is a path");
+        }
+        // `@` has no meaning outside a filter, so a projection that mentions one
+        // is not a projection and does not parse as a path either.
+        assert!(why("@.expensive + 1").contains("does not start with"));
     }
 }
