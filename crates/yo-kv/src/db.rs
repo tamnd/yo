@@ -200,6 +200,17 @@ impl Db {
         self.rows = rows;
     }
 
+    /// What is in the byte buffer, for a caller that put something there and
+    /// wants to hand it back out borrowed.
+    ///
+    /// `LMOVE` across two stripes is the one that does that: the element it
+    /// moved has no structure left to borrow from once it has been pushed, so
+    /// the answer borrows this instead, exactly as it borrows a stripe's own
+    /// buffer when both keys are on one stripe.
+    pub(crate) fn scratch_bytes(&self) -> &[u8] {
+        &self.scratch
+    }
+
     /// The set operation tables, taken out for the same reason as the buffers.
     pub(crate) fn take_setops(&mut self) -> crate::setops::Scratch {
         std::mem::take(&mut self.setops)

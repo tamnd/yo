@@ -23,6 +23,7 @@
 
 use yo_common::{Code, Error, Result};
 
+use crate::db::Db;
 use crate::keyspace::Keyspace;
 use crate::list::{Element, List};
 use crate::strings;
@@ -516,7 +517,7 @@ impl Keyspace {
     /// than a `Vec` per element. Both are taken out of the database for the
     /// duration, because the bytes have to be in hand while `push` has
     /// `&mut self`.
-    pub fn lmovem<F>(&mut self, src: &[u8], dst: &[u8], b: Movem, mut f: F) -> Result<usize>
+    pub fn lmovem<F>(&mut self, src: &[u8], dst: &[u8], b: Movem, f: F) -> Result<usize>
     where
         F: FnMut(&[u8]),
     {
@@ -551,15 +552,44 @@ impl Keyspace {
             return Ok(0);
         }
 
-        // Where the destination order comes from. `pop_into` hands them over in
-        // the order it took them, which is source order from the left and
-        // reversed source order from the right. Bulk wants source order, so it
-        // turns them back over when they came off the right. One by one wants
-        // whatever repeated pushes at that end would have left, and a push at
-        // the head puts each in front of the last, so it turns them over when
-        // the destination end is the head. Those two conditions agree exactly
-        // when the two ends differ, which is why the spelling only matters when
-        // they are the same.
+        let pushed = self.push_block(dst, b, moved, &buf, &ends, f);
+        self.scratch = buf;
+        self.rows = ends;
+        pushed?;
+        Ok(moved)
+    }
+
+    /// The elements a move took, pushed onto the destination in the order the
+    /// destination wants them, and then handed to `f` in the order the reply
+    /// wants them.
+    ///
+    /// `buf` holds them end to end in the order they came off the source and
+    /// `ends` says where each one stops. Its own method because a move across
+    /// two stripes takes the elements out of one stripe and puts them into
+    /// another, and this half is the part that belongs to the destination.
+    ///
+    /// # Where the destination order comes from
+    ///
+    /// `pop_into` hands them over in the order it took them, which is source
+    /// order from the left and reversed source order from the right. Bulk wants
+    /// source order, so it turns them back over when they came off the right.
+    /// One by one wants whatever repeated pushes at that end would have left,
+    /// and a push at the head puts each in front of the last, so it turns them
+    /// over when the destination end is the head. Those two conditions agree
+    /// exactly when the two ends differ, which is why the spelling only matters
+    /// when they are the same.
+    pub(crate) fn push_block<F>(
+        &mut self,
+        dst: &[u8],
+        b: Movem,
+        moved: usize,
+        buf: &[u8],
+        ends: &[usize],
+        mut f: F,
+    ) -> Result<()>
+    where
+        F: FnMut(&[u8]),
+    {
         let flip = match b.order {
             Order::Bulk => !b.from.is_left(),
             Order::OneByOne => b.to.is_left(),
@@ -575,16 +605,11 @@ impl Keyspace {
         // front.
         let sent = |i: usize| placed(if b.to.is_left() { moved - 1 - i } else { i });
 
-        let pushed = self.push(dst, b.to, (0..moved).map(|i| at(sent(i))));
-        if pushed.is_ok() {
-            for i in 0..moved {
-                f(at(placed(i)));
-            }
+        self.push(dst, b.to, (0..moved).map(|i| at(sent(i))))?;
+        for i in 0..moved {
+            f(at(placed(i)));
         }
-        self.scratch = buf;
-        self.rows = ends;
-        pushed?;
-        Ok(moved)
+        Ok(())
     }
 
     /// The slot `key`'s list is in, or `None` if there is no such key.
@@ -618,6 +643,100 @@ impl Keyspace {
         });
         self.bodies += 1;
         at
+    }
+}
+
+impl Db {
+    /// `LMOVE`, and `RPOPLPUSH` with it, over a database of any width.
+    ///
+    /// Two keys on one stripe is the whole command handed to that stripe, which
+    /// is what a width one database always does and what makes `LMOVE k k LEFT
+    /// RIGHT` a rotation here as much as it is there.
+    ///
+    /// Two keys on two stripes is the same three steps with the element passing
+    /// through this database's own buffer rather than a stripe's. The element
+    /// has to be copied for the reason the one stripe version gives, that it has
+    /// no structure to borrow from once it has moved, and the copy costs no
+    /// allocation after the first call for the same reason too.
+    pub fn lmove(&mut self, src: &[u8], dst: &[u8], from: End, to: End) -> Result<Option<&[u8]>> {
+        let (home, onto) = (self.stripe_of(src), self.stripe_of(dst));
+        if home == onto {
+            return self.stripe_mut(home).lmove(src, dst, from, to);
+        }
+        // The destination's type before anything is taken, which is the order
+        // that makes `LMOVE list string LEFT LEFT` leave the source alone.
+        self.stripe_mut(onto).list_slot(dst)?;
+        let (mut buf, rows) = self.take_scratch();
+        buf.clear();
+        let took = self
+            .stripe_mut(home)
+            .pop_into(src, from, 1, |e| e.write_to(&mut buf));
+        let moved = match took {
+            Ok(n) => n,
+            Err(e) => {
+                self.put_scratch(buf, rows);
+                return Err(e);
+            }
+        };
+        if moved == 0 {
+            self.put_scratch(buf, rows);
+            return Ok(None);
+        }
+        let pushed = self
+            .stripe_mut(onto)
+            .push(dst, to, std::iter::once(buf.as_slice()));
+        self.put_scratch(buf, rows);
+        pushed?;
+        Ok(Some(self.scratch_bytes()))
+    }
+
+    /// `LMOVEM src dst LEFT|RIGHT LEFT|RIGHT [COUNT|EXACTLY n OBO|BULK]`.
+    ///
+    /// [`Db::lmove`] for a block of elements, and everything is taken out of the
+    /// source before anything is put in the destination, which is what the one
+    /// stripe version does and for the same reason: the destination is allowed
+    /// to be the source.
+    ///
+    /// The ordering the elements end up in is worked out by
+    /// [`Keyspace::lmovem`], and rather than write it out a second time this
+    /// hands the block to that method on the destination's stripe. The source
+    /// stripe has already given the elements up by then, so what is left is a
+    /// push into one stripe, which is a move whose source is not there.
+    pub fn lmovem<F>(&mut self, src: &[u8], dst: &[u8], b: Movem, f: F) -> Result<usize>
+    where
+        F: FnMut(&[u8]),
+    {
+        let (home, onto) = (self.stripe_of(src), self.stripe_of(dst));
+        if home == onto {
+            return self.stripe_mut(home).lmovem(src, dst, b, f);
+        }
+        // Both types settled before a single element moves, and the length of
+        // the source is wanted for `EXACTLY` anyway.
+        self.stripe_mut(onto).list_slot(dst)?;
+        let have = self.stripe_mut(home).llen(src)?;
+        if have == 0 || (b.exactly && have < b.count) {
+            return Ok(0);
+        }
+        let (mut buf, mut ends) = self.take_scratch();
+        buf.clear();
+        ends.clear();
+        let took = self.stripe_mut(home).pop_into(src, b.from, b.count, |e| {
+            e.write_to(&mut buf);
+            ends.push(buf.len());
+        });
+        let moved = match took {
+            Ok(n) => n,
+            Err(e) => {
+                self.put_scratch(buf, ends);
+                return Err(e);
+            }
+        };
+        let pushed = self
+            .stripe_mut(onto)
+            .push_block(dst, b, moved, &buf, &ends, f);
+        self.put_scratch(buf, ends);
+        pushed?;
+        Ok(moved)
     }
 }
 

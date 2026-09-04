@@ -1,7 +1,7 @@
 //! The list commands, on the wire.
 //!
 //! The same shape as [`super::sets`]: the name has been looked up and the arity
-//! has been checked, so this turns arguments into a call on [`Keyspace`] and the
+//! has been checked, so this turns arguments into a call on [`Db`] and the
 //! answer into a reply. No decisions about lists are made here and none about
 //! representations, because the wire and the embedded API have to reach the same
 //! code or there are two implementations of `LPUSH` and one of them is wrong
@@ -25,7 +25,7 @@
 //! never a `Vec` of ten thousand anything on this thread (Y18).
 
 use yo_common::{Code, Error, Result, parse_i64};
-use yo_kv::{End, Entry, Keyspace, Movem, Order};
+use yo_kv::{Db, End, Entry, Movem, Order};
 
 use super::args::{self, Args};
 use super::table::Spec;
@@ -48,31 +48,51 @@ const BAD_COUNT: &str = "COUNT can't be negative";
 const BAD_MAXLEN: &str = "MAXLEN can't be negative";
 
 /// Run one list command.
-pub(super) fn execute(db: &mut Keyspace, spec: &Spec, args: Args<'_>, out: &mut Out) -> Result<()> {
+pub(super) fn execute(db: &mut Db, spec: &Spec, args: Args<'_>, out: &mut Out) -> Result<()> {
     match spec.name {
-        "lpush" => out.int(count(db.push(args.get(1), End::Left, rest(args))?)),
-        "rpush" => out.int(count(db.push(args.get(1), End::Right, rest(args))?)),
-        "lpushx" => out.int(count(db.pushx(args.get(1), End::Left, rest(args))?)),
-        "rpushx" => out.int(count(db.pushx(args.get(1), End::Right, rest(args))?)),
+        "lpush" => {
+            let key = args.get(1);
+            out.int(count(db.at(key).push(key, End::Left, rest(args))?));
+        }
+        "rpush" => {
+            let key = args.get(1);
+            out.int(count(db.at(key).push(key, End::Right, rest(args))?));
+        }
+        "lpushx" => {
+            let key = args.get(1);
+            out.int(count(db.at(key).pushx(key, End::Left, rest(args))?));
+        }
+        "rpushx" => {
+            let key = args.get(1);
+            out.int(count(db.at(key).pushx(key, End::Right, rest(args))?));
+        }
         "lpop" => pop(db, spec, args, End::Left, out)?,
         "rpop" => pop(db, spec, args, End::Right, out)?,
-        "llen" => out.int(count(db.llen(args.get(1))?)),
+        "llen" => {
+            let key = args.get(1);
+            out.int(count(db.at(key).llen(key)?));
+        }
         "lrange" => {
             let (start, stop) = (args.int(2)?, args.int(3)?);
+            let key = args.get(1);
             let mark = out.len();
             let mut n = 0;
-            for e in db.lrange(args.get(1), start, stop)? {
+            for e in db.at(key).lrange(key, start, stop)? {
                 element(out, e);
                 n += 1;
             }
             out.close_array(mark, n);
         }
-        "lindex" => match db.lindex(args.get(1), args.int(2)?)? {
-            Some(e) => element(out, e),
-            None => out.nil(),
-        },
+        "lindex" => {
+            let key = args.get(1);
+            match db.at(key).lindex(key, args.int(2)?)? {
+                Some(e) => element(out, e),
+                None => out.nil(),
+            }
+        }
         "lset" => {
-            db.lset(args.get(1), args.int(2)?, args.get(3))?;
+            let key = args.get(1);
+            db.at(key).lset(key, args.int(2)?, args.get(3))?;
             out.ok();
         }
         "linsert" => {
@@ -83,11 +103,16 @@ pub(super) fn execute(db: &mut Keyspace, spec: &Spec, args: Args<'_>, out: &mut 
             } else {
                 return Err(args::syntax());
             };
-            out.int(db.linsert(args.get(1), before, args.get(3), args.get(4))?);
+            let key = args.get(1);
+            out.int(db.at(key).linsert(key, before, args.get(3), args.get(4))?);
         }
-        "lrem" => out.int(count(db.lrem(args.get(1), args.int(2)?, args.get(3))?)),
+        "lrem" => {
+            let key = args.get(1);
+            out.int(count(db.at(key).lrem(key, args.int(2)?, args.get(3))?));
+        }
         "ltrim" => {
-            db.ltrim(args.get(1), args.int(2)?, args.int(3)?)?;
+            let key = args.get(1);
+            db.at(key).ltrim(key, args.int(2)?, args.int(3)?)?;
             out.ok();
         }
         "lpos" => lpos(db, args, out)?,
@@ -113,11 +138,11 @@ pub(super) fn execute(db: &mut Keyspace, spec: &Spec, args: Args<'_>, out: &mut 
 /// is why the count is looked at before anything is popped: without it the
 /// answer is one element or a null, and with it an array or a null array, even
 /// when the count is one.
-fn pop(db: &mut Keyspace, spec: &Spec, args: Args<'_>, end: End, out: &mut Out) -> Result<()> {
+fn pop(db: &mut Db, spec: &Spec, args: Args<'_>, end: End, out: &mut Out) -> Result<()> {
     let key = args.get(1);
     if args.len() == 2 {
         let mut got = false;
-        db.pop_into(key, end, 1, |e| {
+        db.at(key).pop_into(key, end, 1, |e| {
             element(out, e);
             got = true;
         })?;
@@ -143,12 +168,14 @@ fn pop(db: &mut Keyspace, spec: &Spec, args: Args<'_>, end: End, out: &mut Out) 
     // that is there with a count of zero is an empty array. Telling those apart
     // needs the length before the pop, because a pop of zero cannot report the
     // difference.
-    if db.llen(key)? == 0 {
+    // The stripe once, since the length and the pop are the same key.
+    let stripe = db.at(key);
+    if stripe.llen(key)? == 0 {
         out.nil_array();
         return Ok(());
     }
     let mark = out.len();
-    let n = db.pop_into(key, end, want, |e| element(out, e))?;
+    let n = stripe.pop_into(key, end, want, |e| element(out, e))?;
     out.close_array(mark, n);
     Ok(())
 }
@@ -159,7 +186,7 @@ fn pop(db: &mut Keyspace, spec: &Spec, args: Args<'_>, end: End, out: &mut Out) 
 /// which is empty rather than null when nothing matched and when the key is not
 /// there. Those are three different replies for what a client might reasonably
 /// call the same outcome, and all three are Redis's.
-fn lpos(db: &mut Keyspace, args: Args<'_>, out: &mut Out) -> Result<()> {
+fn lpos(db: &mut Db, args: Args<'_>, out: &mut Out) -> Result<()> {
     let mut rank = 1i64;
     let mut wanted: Option<usize> = None;
     let mut maxlen = 0usize;
@@ -187,12 +214,15 @@ fn lpos(db: &mut Keyspace, args: Args<'_>, out: &mut Out) -> Result<()> {
     match wanted {
         Some(n) => {
             let mark = out.len();
-            let found = db.lpos_into(key, want, rank, n, maxlen, |at| out.int(count(at)))?;
+            let found = db
+                .at(key)
+                .lpos_into(key, want, rank, n, maxlen, |at| out.int(count(at)))?;
             out.close_array(mark, found);
         }
         None => {
             let mut found = None;
-            db.lpos_into(key, want, rank, 1, maxlen, |at| found = Some(at))?;
+            db.at(key)
+                .lpos_into(key, want, rank, 1, maxlen, |at| found = Some(at))?;
             match found {
                 Some(at) => out.int(count(at)),
                 None => out.nil(),
@@ -208,7 +238,7 @@ fn lpos(db: &mut Keyspace, args: Args<'_>, out: &mut Out) -> Result<()> {
 /// The keys are tried in the order they were sent and the first one holding
 /// anything is the one that is popped, which is the whole point of the command:
 /// one round trip instead of a `LLEN` per key followed by an `LPOP`.
-fn mpop(db: &mut Keyspace, args: Args<'_>, out: &mut Out) -> Result<()> {
+fn mpop(db: &mut Db, args: Args<'_>, out: &mut Out) -> Result<()> {
     let numkeys = match args.int(1) {
         Ok(n) if n > 0 => usize::try_from(n).unwrap_or(usize::MAX),
         _ => return Err(Error::new(Code::Invalid, BAD_NUMKEYS)),
@@ -239,13 +269,15 @@ fn mpop(db: &mut Keyspace, args: Args<'_>, out: &mut Out) -> Result<()> {
         // the name of the key that answered and has to be written before the
         // elements are. A key of another type is an error here, the same as it
         // would be if it were the only key named.
-        if db.llen(key)? == 0 {
+        // Each key on its own stripe, found once and used for both calls.
+        let stripe = db.at(key);
+        if stripe.llen(key)? == 0 {
             continue;
         }
         out.array(2);
         out.bulk(key);
         let mark = out.len();
-        let n = db.pop_into(key, end, want, |e| element(out, e))?;
+        let n = stripe.pop_into(key, end, want, |e| element(out, e))?;
         out.close_array(mark, n);
         return Ok(());
     }
@@ -257,14 +289,7 @@ fn mpop(db: &mut Keyspace, args: Args<'_>, out: &mut Out) -> Result<()> {
 }
 
 /// `LMOVE` and `RPOPLPUSH`, which are the same command.
-fn moved(
-    db: &mut Keyspace,
-    src: &[u8],
-    dst: &[u8],
-    from: End,
-    to: End,
-    out: &mut Out,
-) -> Result<()> {
+fn moved(db: &mut Db, src: &[u8], dst: &[u8], from: End, to: End, out: &mut Out) -> Result<()> {
     match db.lmove(src, dst, from, to)? {
         Some(v) => out.bulk(v),
         None => out.nil(),
@@ -290,7 +315,7 @@ fn moved(
 /// have sent is one element, and `LMOVEM` answers `*-1` because what it would
 /// have sent is an array, which is the same rule that makes `LPOP k` a `$-1` and
 /// `LPOP k 2` a `*-1`. Read off the wire rather than off a client.
-fn movem(db: &mut Keyspace, args: Args<'_>, out: &mut Out) -> Result<()> {
+fn movem(db: &mut Db, args: Args<'_>, out: &mut Out) -> Result<()> {
     let from = end_of(args.get(3))?;
     let to = end_of(args.get(4))?;
     let block = movem_options(args, 5, from, to)?;

@@ -1318,7 +1318,7 @@ pub fn resolved(
             }
             "list" => {
                 let db = session.db;
-                lists::execute(server.dbs[db].only_mut(), spec, args, out).map(|()| Flow::Continue)
+                lists::execute(&mut server.dbs[db], spec, args, out).map(|()| Flow::Continue)
             }
             "zset" => {
                 let db = session.db;
@@ -18938,5 +18938,220 @@ mod tests {
             ":3\r\n",
             "and left the destination"
         );
+    }
+
+    /// Every list command, on one stripe and on eight.
+    ///
+    /// The blocking six are in here too, both when they can be answered on the
+    /// spot and when they cannot, since a command that parks its client writes
+    /// nothing at all and two servers have to agree about that as much as they
+    /// agree about a reply.
+    #[test]
+    fn the_list_group_answers_the_same_however_many_stripes_there_are() {
+        let script: &[&[&[u8]]] = &[
+            &[b"RPUSH", b"l1", b"a", b"b", b"c"],
+            &[b"LPUSH", b"l1", b"z"],
+            &[b"RPUSHX", b"l1", b"d"],
+            &[b"LPUSHX", b"gone", b"x"],
+            &[b"RPUSHX", b"gone", b"x"],
+            &[b"LLEN", b"l1"],
+            &[b"LLEN", b"gone"],
+            &[b"LRANGE", b"l1", b"0", b"-1"],
+            &[b"LRANGE", b"l1", b"1", b"2"],
+            &[b"LRANGE", b"l1", b"5", b"9"],
+            &[b"LINDEX", b"l1", b"0"],
+            &[b"LINDEX", b"l1", b"-1"],
+            &[b"LINDEX", b"l1", b"99"],
+            &[b"LSET", b"l1", b"0", b"y"],
+            &[b"LINSERT", b"l1", b"BEFORE", b"b", b"aa"],
+            &[b"LINSERT", b"l1", b"AFTER", b"nothere", b"x"],
+            &[b"LPOS", b"l1", b"b"],
+            &[b"LPOS", b"l1", b"b", b"COUNT", b"0"],
+            &[b"LPOS", b"l1", b"nothere"],
+            &[b"LPOS", b"l1", b"b", b"RANK", b"-1", b"MAXLEN", b"2"],
+            &[b"LREM", b"l1", b"1", b"aa"],
+            &[b"LTRIM", b"l1", b"0", b"3"],
+            &[b"LRANGE", b"l1", b"0", b"-1"],
+            &[b"LPOP", b"l1"],
+            &[b"RPOP", b"l1"],
+            &[b"LPOP", b"l1", b"2"],
+            &[b"LPOP", b"gone"],
+            &[b"LPOP", b"gone", b"2"],
+            &[b"EXISTS", b"l1"],
+            // The ones that name two keys, and the one that takes a block of
+            // elements rather than the one on the end.
+            &[b"RPUSH", b"src", b"a", b"b", b"c", b"d"],
+            &[b"LMOVE", b"src", b"dst", b"LEFT", b"RIGHT"],
+            &[b"RPOPLPUSH", b"src", b"dst"],
+            &[b"LRANGE", b"dst", b"0", b"-1"],
+            &[b"LMOVE", b"gone", b"dst", b"LEFT", b"RIGHT"],
+            &[b"LMOVEM", b"src", b"dst", b"LEFT", b"RIGHT"],
+            &[
+                b"LMOVEM", b"src", b"dst", b"LEFT", b"RIGHT", b"COUNT", b"2", b"BULK",
+            ],
+            &[
+                b"LMOVEM", b"dst", b"dst", b"LEFT", b"RIGHT", b"COUNT", b"2", b"OBO",
+            ],
+            &[b"LRANGE", b"dst", b"0", b"-1"],
+            &[
+                b"LMOVEM", b"src", b"dst", b"LEFT", b"RIGHT", b"EXACTLY", b"9", b"BULK",
+            ],
+            &[b"LMPOP", b"2", b"gone", b"dst", b"LEFT"],
+            &[b"LMPOP", b"2", b"gone", b"dst", b"RIGHT", b"COUNT", b"2"],
+            &[b"LMPOP", b"1", b"gone", b"LEFT"],
+            // The blocking ones, first with something there to answer them and
+            // then with nothing, which parks the client and writes nothing.
+            &[b"RPUSH", b"q", b"a", b"b", b"c"],
+            &[b"BLPOP", b"gone", b"q", b"0"],
+            &[b"BRPOP", b"q", b"0"],
+            &[b"BLMPOP", b"0", b"2", b"gone", b"q", b"LEFT"],
+            &[b"RPUSH", b"q", b"x", b"y", b"z"],
+            &[b"BLMOVE", b"q", b"dst", b"LEFT", b"RIGHT", b"0"],
+            &[b"BRPOPLPUSH", b"q", b"dst", b"0"],
+            &[b"BLMOVEM", b"q", b"dst", b"LEFT", b"RIGHT", b"0"],
+            &[b"BLPOP", b"q", b"0"],
+            &[b"BLMOVE", b"q", b"dst", b"LEFT", b"RIGHT", b"0"],
+            // The errors, which have to be the same errors.
+            &[b"SET", b"plain", b"v"],
+            &[b"LPUSH", b"plain", b"a"],
+            &[b"LLEN", b"plain"],
+            &[b"LMOVE", b"dst", b"plain", b"LEFT", b"RIGHT"],
+            &[b"LRANGE", b"dst", b"0", b"-1"],
+            &[b"LMOVEM", b"dst", b"plain", b"LEFT", b"RIGHT"],
+            &[b"LSET", b"gone", b"0", b"v"],
+            &[b"LSET", b"dst", b"99", b"v"],
+            &[b"LPOP", b"dst", b"-1"],
+            &[b"LMPOP", b"0", b"dst", b"LEFT"],
+            &[b"LPOS", b"dst", b"a", b"RANK", b"0"],
+        ];
+
+        let mut one = Fixture::new();
+        let mut many = Fixture::striped(8);
+        for parts in script {
+            let a = one.run(parts);
+            let b = many.run(parts);
+            assert_eq!(a, b, "{}", String::from_utf8_lossy(parts[0]));
+        }
+    }
+
+    /// An `LMOVE` and an `LMOVEM` whose two keys are on two stripes.
+    #[test]
+    fn a_list_move_across_stripes_takes_the_elements_with_it() {
+        let mut f = Fixture::striped(8);
+        let other = apart(&mut f, "src");
+        let third = apart(&mut f, &other);
+        let (src, dst, plain) = (b"src".as_slice(), other.as_bytes(), third.as_bytes());
+
+        f.run(&[b"RPUSH", src, b"a", b"b", b"c", b"d"]);
+        assert_eq!(
+            f.run(&[b"LMOVE", src, dst, b"LEFT", b"RIGHT"]),
+            "$1\r\na\r\n"
+        );
+        assert_eq!(f.run(&[b"RPOPLPUSH", src, dst]), "$1\r\nd\r\n");
+        assert_eq!(
+            f.run(&[b"LRANGE", dst, b"0", b"-1"]),
+            "*2\r\n$1\r\nd\r\n$1\r\na\r\n",
+            "one went on each end of the destination"
+        );
+        assert_eq!(
+            f.run(&[b"LRANGE", src, b"0", b"-1"]),
+            "*2\r\n$1\r\nb\r\n$1\r\nc\r\n"
+        );
+
+        // A block of them, which under BULK arrives in the order it left.
+        assert_eq!(
+            f.run(&[
+                b"LMOVEM", src, dst, b"LEFT", b"RIGHT", b"COUNT", b"2", b"BULK"
+            ]),
+            "*2\r\n$1\r\nb\r\n$1\r\nc\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"LRANGE", dst, b"0", b"-1"]),
+            "*4\r\n$1\r\nd\r\n$1\r\na\r\n$1\r\nb\r\n$1\r\nc\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"EXISTS", src]),
+            ":0\r\n",
+            "and the source is gone with its last element"
+        );
+
+        // An `EXACTLY` the source cannot fill moves nothing, and a source that
+        // is not there at all is the two kinds of nothing the two commands have.
+        f.run(&[b"RPUSH", src, b"e", b"f"]);
+        assert_eq!(
+            f.run(&[
+                b"LMOVEM", src, dst, b"LEFT", b"RIGHT", b"EXACTLY", b"3", b"BULK"
+            ]),
+            "*-1\r\n"
+        );
+        assert_eq!(f.run(&[b"LLEN", src]), ":2\r\n", "and took none of them");
+        assert_eq!(
+            f.run(&[b"LMOVE", b"gone", dst, b"LEFT", b"RIGHT"]),
+            "$-1\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"LMOVEM", b"gone", dst, b"LEFT", b"RIGHT"]),
+            "*-1\r\n"
+        );
+
+        // A destination of the wrong type is refused before anything is taken,
+        // which is the order that matters most here, since an element already
+        // out of the source would have nowhere to go back to.
+        f.run(&[b"SET", plain, b"v"]);
+        assert_eq!(
+            f.run(&[b"LMOVE", src, plain, b"LEFT", b"RIGHT"]),
+            "-WRONGTYPE Operation against a key holding the wrong kind of value\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"LLEN", src]),
+            ":2\r\n",
+            "and left the source alone"
+        );
+        assert_eq!(
+            f.run(&[b"LMOVEM", src, plain, b"LEFT", b"RIGHT"]),
+            "-WRONGTYPE Operation against a key holding the wrong kind of value\r\n"
+        );
+        assert_eq!(f.run(&[b"LLEN", src]), ":2\r\n");
+    }
+
+    /// A parked client served by a push that landed on another stripe.
+    ///
+    /// A waiter remembers the database and not the stripe, which is the point:
+    /// serving it runs the same attempt the command ran, and the attempt finds
+    /// the stripe each of its keys is on for itself.
+    #[test]
+    fn a_parked_client_is_served_from_the_stripe_its_key_is_on() {
+        let mut f = Fixture::striped(8);
+        let other = apart(&mut f, "q");
+        let (q, far) = (b"q".as_slice(), other.as_bytes());
+
+        assert_eq!(f.flow(&[b"BLPOP", q, far, b"0"]).0, Flow::Block);
+        assert_eq!(f.server.waiters().len(), 1);
+        f.run(&[b"RPUSH", far, b"v"]);
+        let mut out = Out::new(Proto::Resp2);
+        assert!(f.server.serve_waiter(0, 0, &mut out));
+        let want = format!("*2\r\n${}\r\n{other}\r\n$1\r\nv\r\n", other.len());
+        assert_eq!(core::str::from_utf8(out.as_slice()).expect("ascii"), want);
+        assert_eq!(
+            f.run(&[b"EXISTS", far]),
+            ":0\r\n",
+            "and it took the element with it"
+        );
+
+        // And a move across two stripes is served the same way, by the push
+        // that fills its source.
+        f.server.waiters_mut().forget(7);
+        assert_eq!(
+            f.flow(&[b"BLMOVE", q, far, b"LEFT", b"RIGHT", b"0"]).0,
+            Flow::Block
+        );
+        f.run(&[b"RPUSH", q, b"w"]);
+        let mut out = Out::new(Proto::Resp2);
+        assert!(f.server.serve_waiter(0, 0, &mut out));
+        assert_eq!(
+            core::str::from_utf8(out.as_slice()).expect("ascii"),
+            "$1\r\nw\r\n"
+        );
+        assert_eq!(f.run(&[b"LRANGE", far, b"0", b"-1"]), "*1\r\n$1\r\nw\r\n");
     }
 }
