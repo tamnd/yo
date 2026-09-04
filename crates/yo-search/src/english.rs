@@ -35,6 +35,51 @@ const fn vowel(b: u8) -> bool {
     matches!(b, b'a' | b'e' | b'i' | b'o' | b'u' | b'y')
 }
 
+/// Where the character starting at `at` ends.
+///
+/// The rules count letters and a letter is not always a byte. `suûely` has six
+/// letters and seven bytes, and a step that counts the bytes finds a consonant
+/// where there is half of a `û`, so the syllable at the end reads short when it
+/// is not and the final `e` comes off a word that should have kept it. Every
+/// step that moves by one letter goes through here.
+///
+/// A byte that is not part of any character is a character of its own, which is
+/// the only thing left to do with it and is what keeps this from looping.
+const fn ahead(w: &[u8], at: usize) -> usize {
+    let mut i = at + 1;
+    while i < w.len() && w[i] & 0xc0 == 0x80 {
+        i += 1;
+    }
+    i
+}
+
+/// Where the character in front of `at` starts, or nothing at the front of the
+/// word.
+const fn back(w: &[u8], at: usize) -> Option<usize> {
+    if at == 0 {
+        return None;
+    }
+    let mut i = at - 1;
+    while i > 0 && w[i] & 0xc0 == 0x80 {
+        i -= 1;
+    }
+    Some(i)
+}
+
+/// Whether a word has at least `n` letters in it.
+const fn holds(w: &[u8], n: usize) -> bool {
+    let mut at = 0;
+    let mut left = n;
+    while left > 0 {
+        if at >= w.len() {
+            return false;
+        }
+        at = ahead(w, at);
+        left -= 1;
+    }
+    true
+}
+
 /// The consonants a word may end in for `li` to be a suffix worth removing.
 const LI_ENDING: &[u8] = b"cdeghkmnrt";
 
@@ -129,8 +174,10 @@ impl English {
         self.w.clear();
         self.w.extend_from_slice(word);
         // Two letters is not enough for any rule here to have room to work in,
-        // and three is where the algorithm starts looking.
-        if self.w.len() < 3 {
+        // and three is where the algorithm starts looking. Letters and not
+        // bytes, so a two letter word does not get taken apart because one of
+        // its letters is written in three bytes.
+        if !holds(&self.w, 3) {
             return &self.w;
         }
         self.prelude();
@@ -188,13 +235,13 @@ impl English {
     fn region(&self, from: usize) -> usize {
         let mut i = from;
         while i < self.w.len() && !vowel(self.w[i]) {
-            i += 1;
+            i = ahead(&self.w, i);
         }
         while i < self.w.len() && vowel(self.w[i]) {
-            i += 1;
+            i = ahead(&self.w, i);
         }
         if i < self.w.len() {
-            i + 1
+            ahead(&self.w, i)
         } else {
             self.w.len()
         }
@@ -205,14 +252,20 @@ impl English {
     /// something that rhymes with `top`.
     fn short_syllable(&self, len: usize) -> bool {
         let w = &self.w[..len];
-        if w.len() == 2 {
-            return vowel(w[0]) && !vowel(w[1]);
-        }
-        if w.len() < 3 {
+        let Some(c) = back(w, w.len()) else {
             return false;
+        };
+        let Some(b) = back(w, c) else {
+            return false;
+        };
+        match back(w, b) {
+            // A word of exactly two letters is short when it reads vowel then
+            // consonant, which is the whole of it rather than the end of it.
+            None => vowel(w[b]) && !vowel(w[c]),
+            Some(a) => {
+                !vowel(w[a]) && vowel(w[b]) && !vowel(w[c]) && !matches!(w[c], b'w' | b'x' | b'Y')
+            }
         }
-        let (a, b, c) = (w[w.len() - 3], w[w.len() - 2], w[w.len() - 1]);
-        !vowel(a) && vowel(b) && !vowel(c) && !matches!(c, b'w' | b'x' | b'Y')
     }
 
     /// Whether the whole word is short, which is a short syllable at the end and
@@ -264,7 +317,12 @@ impl English {
             // `cries` has two letters in front of the ending and becomes `cri`,
             // `ties` has one and becomes `tie`, which keeps it a word rather
             // than turning it into the letter it starts with.
-            let with: &[u8] = if self.w.len() > 4 { b"i" } else { b"ie" };
+            let front = self.w.len() - 3;
+            let with: &[u8] = if holds(&self.w[..front], 2) {
+                b"i"
+            } else {
+                b"ie"
+            };
             self.replace(3, with);
             return;
         }
@@ -313,9 +371,17 @@ impl English {
     /// Only when there is a consonant in front of it and that consonant is not
     /// the first letter, which is what keeps `by` and `say` as they are.
     fn terminal_y(&mut self) {
-        let n = self.w.len();
-        if n >= 3 && matches!(self.w[n - 1], b'y' | b'Y') && !vowel(self.w[n - 2]) {
-            self.w[n - 1] = b'i';
+        let Some(last) = back(&self.w, self.w.len()) else {
+            return;
+        };
+        if !matches!(self.w[last], b'y' | b'Y') {
+            return;
+        }
+        let Some(before) = back(&self.w, last) else {
+            return;
+        };
+        if before > 0 && !vowel(self.w[before]) {
+            self.w[last] = b'i';
         }
     }
 
@@ -490,6 +556,22 @@ mod tests {
         assert_eq!(stem("say"), "say");
         assert_eq!(stem("cry"), "cri");
         assert_eq!(stem("enjoyment"), "enjoy");
+    }
+
+    /// A letter written in more than one byte counts as one letter.
+    ///
+    /// These four came off a real server. `ruãe` keeps its `e` because `uã` is
+    /// a short syllable and the rule that spots one has to see the `ã` as a
+    /// single consonant, and `suûely` loses its `ly` and keeps the `e` for the
+    /// same reason. Counting bytes gets both of them wrong in the direction
+    /// that quietly cuts a letter off the stem, which puts every word in the
+    /// language that carries an accent into the wrong bucket of the index.
+    #[test]
+    fn a_letter_of_more_than_one_byte_is_still_one_letter() {
+        assert_eq!(stem("ruãe"), "ruãe");
+        assert_eq!(stem("suûely"), "suûe");
+        assert_eq!(stem("ãy"), "ãy");
+        assert_eq!(stem("ñies"), "ñie");
     }
 
     /// Four hundred words and the stem a real server gives for each.

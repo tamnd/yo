@@ -59,6 +59,7 @@ pub mod index;
 pub mod query;
 pub mod registry;
 pub mod text;
+pub mod token;
 
 pub use english::English;
 pub use field::{Algo, Coords, Field, Kind, Tag, Text, Vector, Width};

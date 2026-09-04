@@ -30,6 +30,7 @@ use crate::index::Index;
 use crate::query::explain::bit;
 use crate::query::{Circle, EVERY, Mask, Node, Pair, Range, Vector, What, Word, expansion};
 use crate::text;
+use crate::token::{bare, control, escapes, fold, wordy};
 
 /// Why a query was refused.
 ///
@@ -202,6 +203,12 @@ impl Default for Ask<'_> {
 ///
 /// A `Bad` naming what went wrong and where.
 pub fn parse(query: &[u8], index: &Index, ask: &Ask) -> Result<Node, Bad> {
+    // A real server reads the query as a C string, so a zero byte in it ends the
+    // query rather than sitting inside it: `aa\0bb` is the one word `aa`.
+    let query = match query.iter().position(|b| *b == 0) {
+        Some(end) => &query[..end],
+        None => query,
+    };
     let mut p = Parse {
         src: query,
         at: 0,
@@ -404,16 +411,6 @@ fn number_len(src: &[u8], from: usize) -> Option<usize> {
     Some(at)
 }
 
-/// Whether a byte can be part of a bare word.
-///
-/// The underscore is in and every other punctuation mark is out, which is what
-/// makes `ab_cd` one word and `ab-cd` two. Anything above the ASCII range is in,
-/// so a word in any other language stays whole without this having to know
-/// which language it is.
-const fn wordy(b: u8) -> bool {
-    b.is_ascii_alphanumeric() || b == b'_' || b >= 0x80
-}
-
 /// Whether a byte ends a word without meaning anything itself.
 ///
 /// These are the marks that split a word where they fall between two of them:
@@ -422,7 +419,7 @@ const fn wordy(b: u8) -> bool {
 const fn splitter(b: u8) -> bool {
     matches!(
         b,
-        b'.' | b',' | b'/' | b'+' | b'=' | b'!' | b'?' | b'#' | b'&' | b'^' | b'<' | b'>'
+        b'.' | b',' | b'/' | b'+' | b'=' | b'!' | b'?' | b'#' | b'&' | b'^' | b'<' | b'>' | b'`'
     )
 }
 
@@ -447,7 +444,16 @@ impl Parse<'_> {
     fn spaces(&mut self) {
         loop {
             match self.peek() {
-                Some(b' ' | b'\t' | b'\n' | b'\r') => self.at += 1,
+                Some(b' ') => self.at += 1,
+                // Every control byte ends a word here the way a space does, so
+                // `a\nb` is two words. A document is tokenised by other rules
+                // that drop them instead, which is a difference between the two
+                // halves of a real server rather than one this invented.
+                Some(b) if control(b) => self.at += 1,
+                // A backslash that escapes nothing is not part of the word it
+                // was written against and is not a token of its own either, so
+                // `aa\yy` is the two words `aa` and `yy`.
+                Some(b'\\') if !self.escaped(self.at) => self.at += 1,
                 Some(b'\'') if self.ask.dialect == 1 => self.at += 1,
                 _ => return,
             }
@@ -468,14 +474,26 @@ impl Parse<'_> {
     }
 
     fn at_word(&self) -> bool {
-        matches!(self.peek(), Some(b) if wordy(b) || b == b'\\')
+        matches!(self.peek(), Some(b) if wordy(b)) || self.escaped(self.at)
+    }
+
+    /// Whether a backslash at this offset takes the byte after it as a letter,
+    /// which is the only way a backslash is part of a word at all.
+    fn escaped(&self, at: usize) -> bool {
+        self.src.get(at) == Some(&b'\\') && matches!(self.src.get(at + 1), Some(b) if escapes(*b))
     }
 
     /// Where the word starting at a position ends.
     fn word_end(&self, from: usize) -> usize {
         let mut at = from;
-        while at < self.src.len() && (wordy(self.src[at]) || self.src[at] == b'\\') {
-            at += if self.src[at] == b'\\' { 2 } else { 1 };
+        while at < self.src.len() {
+            if self.escaped(at) {
+                at += 2;
+            } else if wordy(self.src[at]) {
+                at += 1;
+            } else {
+                break;
+            }
         }
         at.min(self.src.len())
     }
@@ -624,7 +642,8 @@ impl Parse<'_> {
             }
             Some(b'@' | b'$') => at + 1,
             Some(b'*') if matches!(self.src.get(at + 1), Some(b) if wordy(*b)) => at + 1,
-            Some(b) if wordy(*b) || *b == b'\\' => at,
+            Some(b) if wordy(*b) => at,
+            Some(b'\\') if self.escaped(at) => at,
             _ => return Box::default(),
         };
         self.src[from..self.word_end(from)].into()
@@ -665,7 +684,14 @@ impl Parse<'_> {
     /// of its own, a bracket or a bar, quotes the last word read.
     fn stuck(&mut self, start: usize) -> Bad {
         if self.peek() == Some(b'*') {
-            self.at += 1;
+            // The star is part of the word it is glued to, so there is nothing
+            // else in the query to point at even when the query goes on:
+            // `%hello* world` is refused back at `hello` the same way `%hello*`
+            // on its own is.
+            return Bad::Syntax {
+                at: start,
+                near: self.word.clone(),
+            };
         }
         self.spaces();
         if self.done() {
@@ -695,6 +721,22 @@ impl Parse<'_> {
             at,
             near: self.word.clone(),
         }
+    }
+
+    /// The same, quoting what is in front of the parser rather than the word it
+    /// read last.
+    ///
+    /// A star that is standing where a word belongs is refused at the star and
+    /// names the word after it, so `aa%*BB` is refused at the star near `BB`
+    /// and not near the `aa` that came before. Where what follows has no text
+    /// of its own there is nothing to name and the last word read is quoted
+    /// after all.
+    fn syntax_near(&self) -> Bad {
+        let near = self.near_at(self.at);
+        if near.is_empty() {
+            return self.syntax();
+        }
+        Bad::Syntax { at: self.at, near }
     }
 
     /// Whether a field is there and can do what the query asked of it.
@@ -1250,7 +1292,7 @@ impl Parse<'_> {
             // a pattern does the same. A word with a fuzzy or a phrase written
             // after it is only a word, and it is what the fuzzy binds to rather
             // than something that binds to whatever is on its own left.
-            Some(b) if wordy(b) || b == b'\\' => {
+            Some(b) if wordy(b) || self.escaped(self.at) => {
                 self.src.get(self.word_end(self.at)) == Some(&b'*')
                     || self.patternish(self.at).is_some()
             }
@@ -1337,7 +1379,8 @@ impl Parse<'_> {
             Some(b'*') => self.star()?,
             Some(b'-' | b'+' | b'.') if self.at_number() => self.plain()?,
             Some(b'-' | b'~') => self.factor()?,
-            Some(b) if wordy(b) || b == b'\\' => self.plain()?,
+            Some(b) if wordy(b) => self.plain()?,
+            Some(b'\\') if self.escaped(self.at) => self.plain()?,
             _ => return Err(self.syntax()),
         };
         if holding {
@@ -1362,7 +1405,7 @@ impl Parse<'_> {
             return Err(Bad::Syntax { at, near: name });
         }
         self.word = name.clone();
-        let value: Box<[u8]> = self.param(&name).to_ascii_lowercase().into();
+        let value: Box<[u8]> = fold(&self.param(&name)).into();
         // A star after the reference makes a prefix of whatever it held, and
         // the value goes in whole, spaces and digits and all.
         if self.eat(b'*') {
@@ -1438,7 +1481,9 @@ impl Parse<'_> {
             // error later in the query to quote, where a pattern and a
             // parameter leave nothing, so it undoes what those two did.
             self.hush = false;
-            self.word()
+            let word = self.word();
+            let end = self.at;
+            self.bodied(&word, end)
         };
         if self.eat(b'*') {
             return Ok(Node::new(What::Infix(word)));
@@ -1467,7 +1512,7 @@ impl Parse<'_> {
         if let Some(body) = self.glued() {
             // The match is on the words in lower case and the error quotes the
             // phrase as it was written, so `%"A B"` is refused near `A B`.
-            let word: Box<[u8]> = body.to_ascii_lowercase().into();
+            let word: Box<[u8]> = fold(&body).into();
             self.word = body;
             for _ in 0..wide {
                 let spot = self.at;
@@ -1491,12 +1536,12 @@ impl Parse<'_> {
             if self.ask.dialect == 1 {
                 return Err(self.syntax_at(spot));
             }
-            self.param(&name).to_ascii_lowercase().into()
+            fold(&self.param(&name)).into()
         } else {
             if !self.at_word() {
-                return Err(self.syntax());
+                return Err(self.syntax_near());
             }
-            self.token().to_ascii_lowercase().into()
+            fold(&self.token()).into()
         };
         for _ in 0..wide {
             let spot = self.at;
@@ -1542,6 +1587,7 @@ impl Parse<'_> {
             return Ok(Node::new(What::Pattern(pattern)));
         }
         let spot = self.mark;
+        let end = self.at;
         if self.eat(b'*') {
             // Two stars in a row are a prefix and then a suffix, and are that
             // only when there is a word after the second one: `hel**llo` is two
@@ -1559,7 +1605,7 @@ impl Parse<'_> {
             // began rather than at the star.
             self.mark = spot;
             self.hush = false;
-            return Ok(Node::new(What::Prefix(word)));
+            return Ok(Node::new(What::Prefix(self.bodied(&word, end))));
         }
         // Under the later dialects a number is matched as it stands. Nothing
         // stems it and no stopword list holds it, so it is done here. The first
@@ -1579,7 +1625,7 @@ impl Parse<'_> {
             return Ok(self.expand(bare));
         }
         self.skip_splitters();
-        let word: Box<[u8]> = word.to_ascii_lowercase().into();
+        let word: Box<[u8]> = fold(&word).into();
         if self.drops(&word) {
             return Ok(Node::empty());
         }
@@ -1662,27 +1708,45 @@ impl Parse<'_> {
     /// It is one inside a phrase under the later dialects, where `"a$b"` is one
     /// word rather than a word and a parameter, and it is one nowhere else.
     fn worded(&mut self, dollar: bool) -> Box<[u8]> {
-        let mut out = Vec::new();
+        let start = self.at;
         while let Some(b) = self.peek() {
-            if b == b'\\' {
-                self.at += 1;
-                if let Some(b) = self.peek() {
-                    out.push(b);
-                    self.at += 1;
-                }
+            if self.escaped(self.at) {
+                self.at += 2;
                 continue;
             }
             if !wordy(b) && !(dollar && b == b'$') {
                 break;
             }
-            out.push(b);
             self.at += 1;
         }
-        let out: Box<[u8]> = out.into();
-        if !out.is_empty() {
-            self.word = out.clone();
+        if self.at > start {
+            // What a syntax error further along the query quotes is the word as
+            // it was written, backslashes and capitals and all, rather than the
+            // word the parser made of it. So `aa\-bb )` is refused near
+            // `aa\-bb` and `"BB\A Cc"` near `A`.
+            self.word = self.src[start..self.at].into();
         }
-        out
+        bare(&self.src[start..self.at]).into()
+    }
+
+    /// The body of a prefix, a suffix or an infix, which is not quite the word
+    /// it was made from.
+    ///
+    /// A backslash left on the end of it comes off, so `{*x\\}` looks for
+    /// anything ending in `x` where the tag value `{x\\}` is a backslash on the
+    /// end of an `x`. The one place it stays is a query that ends inside the
+    /// word itself, where `*x\\` is the suffix `x\`, and there is no reason for
+    /// the difference other than that a real server reads the end of its input
+    /// through a different door than it reads the rest.
+    fn bodied(&self, body: &[u8], end: usize) -> Box<[u8]> {
+        if end >= self.src.len() {
+            return body.into();
+        }
+        let mut cut = body.len();
+        while cut > 0 && body[cut - 1] == b'\\' {
+            cut -= 1;
+        }
+        body[..cut].into()
     }
 
     /// One word that is a token in its own right, which an error can point at.
@@ -1770,18 +1834,20 @@ impl Parse<'_> {
                         near: name,
                     });
                 }
-                Some(b) if wordy(b) || b == b'\\' || b == b'$' => {
+                Some(b) if wordy(b) || b == b'$' || self.escaped(self.at) => {
                     let at = self.at;
                     self.mark = self.at;
-                    let word: Box<[u8]> = self
-                        .worded(self.ask.dialect >= 2)
-                        .to_ascii_lowercase()
-                        .into();
+                    let word: Box<[u8]> = fold(&self.worded(self.ask.dialect >= 2)).into();
                     // A star glued to the end of a word makes a prefix, and a
                     // prefix in a phrase is refused under the first dialect
                     // where the word started rather than where the star is.
+                    // What it quotes is the word as it was typed, capitals and
+                    // all, and not the word the phrase was going to look for.
                     if self.ask.dialect == 1 && self.peek() == Some(b'*') {
-                        return Err(Bad::Syntax { at, near: word });
+                        return Err(Bad::Syntax {
+                            at,
+                            near: self.word.clone(),
+                        });
                     }
                     self.skip_splitters();
                     // The one place the dialects disagree about stopwords. The
@@ -1789,7 +1855,19 @@ impl Parse<'_> {
                     // a phrase the client did not ask for, which is defensible
                     // and is also what it does.
                     if self.ask.dialect == 1 && self.drops(&word) {
-                        return Err(Bad::Syntax { at, near: word });
+                        // A phrase is a list of terms, and the grammar the
+                        // first dialect is written in only knows how to drop a
+                        // stopword out of a list that has two terms in it
+                        // already. So `"x y be"` is the two words with the
+                        // stopword gone and `"x be y"` is refused at the
+                        // stopword, which is the same rule a tag list follows.
+                        if list.len() < 2 {
+                            return Err(Bad::Syntax {
+                                at,
+                                near: self.word.clone(),
+                            });
+                        }
+                        continue;
                     }
                     list.push(Node::term(&word));
                 }
@@ -1800,7 +1878,7 @@ impl Parse<'_> {
                     self.at += 1;
                     continue;
                 }
-                _ => return Err(self.syntax()),
+                _ => return Err(self.syntax_near()),
             }
         }
         // What the client wrote between the quotes, which is the word an error
@@ -2382,6 +2460,9 @@ impl Parse<'_> {
         let mut list: Vec<Node> = Vec::new();
         let mut run: Vec<Node> = Vec::new();
         let mut odd = false;
+        // Whether the one value the list has so far is a stopword, which is a
+        // value nothing else may sit beside in the first dialect.
+        let mut stopped = false;
         let mut refused = false;
         let mut more = false;
         // Whether the list ended at a modifier rather than at its brace, which
@@ -2439,6 +2520,14 @@ impl Parse<'_> {
                 shut = self.mark;
                 break;
             }
+            // A list whose only value is a stopword takes nothing beside it,
+            // so `@g:{be x}` is the tag `be` with text after it and the brace
+            // on the end belongs to nobody.
+            if stopped && !matches!(self.peek(), Some(b'|' | b'}') | None) {
+                shut = self.at;
+                cut = true;
+                break;
+            }
             let mut spot = self.at;
             let node = match self.peek() {
                 // The first dialect takes a tag that was never closed and
@@ -2480,6 +2569,7 @@ impl Parse<'_> {
                     self.mark = bar;
                     more = true;
                     odd = false;
+                    stopped = false;
                     close_run(&mut list, &mut run);
                     continue;
                 }
@@ -2536,6 +2626,19 @@ impl Parse<'_> {
                         Node::term(&value)
                     }
                 }
+                // The first dialect ends the list where something begins that
+                // is a term but cannot be a value, and reads it as ordinary
+                // text after the tag the same way it does a modifier. So
+                // `@g:{aa-bb}` is a tag beside a NOT, and the brace on the end
+                // belongs to nobody by then, which is where it is refused. The
+                // five are every mark the grammar lets a term start with.
+                Some(b'"' | b'%' | b'(' | b'-' | b'~')
+                    if self.ask.dialect == 1 && !run.is_empty() =>
+                {
+                    shut = self.at;
+                    cut = true;
+                    break;
+                }
                 Some(b'|') => {
                     // An alternative with nothing in it is refused at the bar,
                     // which is the one place in a tag that points forwards
@@ -2550,14 +2653,29 @@ impl Parse<'_> {
                     self.at += 1;
                     refused |= odd && run.len() > 1;
                     odd = false;
+                    stopped = false;
                     close_run(&mut list, &mut run);
                     continue;
                 }
                 Some(b'"') if self.ask.dialect >= 2 => {
                     self.at += 1;
-                    let word = self.until(b'"')?;
+                    // A phrase that never closes is refused at the quote it
+                    // opened with, where one written outside a tag is refused
+                    // at the word after the quote.
+                    let Ok(word) = self.until(b'"') else {
+                        return Err(self.syntax_at(spot));
+                    };
                     self.word = word.clone();
-                    Node::term(&word)
+                    // A phrase with a star after it is a prefix on the whole
+                    // phrase, spaces and all, so `{"a b"*}` looks for a tag
+                    // that starts `a b`.
+                    if self.eat(b'*') {
+                        odd = true;
+                        self.hush = false;
+                        Node::new(What::Prefix(self.bodied(&bare(&word), self.at)))
+                    } else {
+                        Node::term(&word)
+                    }
                 }
                 // A single quote holds a value the same way a double one does,
                 // and one that never closes is passed over rather than read,
@@ -2570,7 +2688,13 @@ impl Parse<'_> {
                     self.at += 1;
                     let word = self.until(b'\'')?;
                     self.word = word.clone();
-                    Node::term(&word)
+                    if self.eat(b'*') {
+                        odd = true;
+                        self.hush = false;
+                        Node::new(What::Prefix(self.bodied(&bare(&word), self.at)))
+                    } else {
+                        Node::term(&word)
+                    }
                 }
                 Some(b'*') => {
                     self.mark = self.at;
@@ -2601,15 +2725,20 @@ impl Parse<'_> {
                         self.tag_word()
                     };
                     self.word = word.clone();
+                    // A value that is matched against the front or the back of
+                    // a tag loses its escapes where a whole value keeps them,
+                    // so `{a\-b}` looks for `a\-b` and `{*a\-b}` looks for
+                    // anything ending `a-b`.
+                    let body = self.bodied(&bare(&word), self.at);
                     // A star on both ends of the value matches anywhere inside
                     // it, the same way it does outside a tag.
                     if self.eat(b'*') {
-                        Node::new(What::Infix(word))
+                        Node::new(What::Infix(body))
                     } else {
-                        Node::new(What::Suffix(word))
+                        Node::new(What::Suffix(body))
                     }
                 }
-                Some(b) if wordy(b) || b == b'\\' || self.at_number() => {
+                Some(b) if wordy(b) || self.at_number() || self.escaped(self.at) => {
                     let word = self.tag_value();
                     if word.is_empty() {
                         return Err(self.syntax_at(spot));
@@ -2619,7 +2748,7 @@ impl Parse<'_> {
                     if self.eat(b'*') {
                         odd = true;
                         self.hush = false;
-                        Node::new(What::Prefix(word))
+                        Node::new(What::Prefix(self.bodied(&bare(&word), self.at)))
                     } else if self.ask.dialect >= 2
                         && &*word == b"w"
                         && self.src.get(self.at + 1) != Some(&b'\'')
@@ -2635,8 +2764,26 @@ impl Parse<'_> {
                         self.mark = spot;
                         self.word = pattern.clone();
                         Node::new(What::Pattern(self.patterned(pattern)))
+                    } else if self.ask.dialect == 1 && self.drops(&fold(&word)) {
+                        // A run of values is a phrase, and the first dialect
+                        // drops a stopword out of a phrase that has two words
+                        // in it already. One that arrives before that ends the
+                        // list instead, so `@g:{x be y}` is the tag `x` with
+                        // text after it and `@g:{x y be z}` is the three words
+                        // that are not stopwords.
+                        if run.len() >= 2 {
+                            continue;
+                        }
+                        if run.is_empty() {
+                            stopped = true;
+                            Node::term(&word)
+                        } else {
+                            self.at = spot;
+                            shut = spot;
+                            cut = true;
+                            break;
+                        }
                     } else {
-                        odd |= self.ask.dialect == 1 && self.drops(&word.to_ascii_lowercase());
                         Node::term(&word)
                     }
                 }
@@ -2728,6 +2875,14 @@ impl Parse<'_> {
             return self.tag_word();
         }
         let end = self.number_end().unwrap_or(self.at);
+        // A number and a word both start here and the longer one wins, which is
+        // why `{1\-a}` is the one word it looks like while `{5.5\-a}` is the
+        // number `5.5` beside the word `-a`: the escape is part of a word and
+        // is not part of a number, so it only carries the value on when the
+        // word it makes reaches further than the number does.
+        if self.word_end(self.at) > end {
+            return self.tag_word();
+        }
         let word = &self.src[self.at..end];
         self.at = end;
         if self.ask.dialect == 1 {
@@ -2738,21 +2893,14 @@ impl Parse<'_> {
 
     /// A tag value, which keeps its case and the escapes that were written in
     /// it, because both of those are matched rather than folded away.
+    ///
+    /// The escape reaches the same bytes it reaches anywhere else, so `{aa\-bb}`
+    /// is one value and `{aa\xbb}` is two: the backslash in front of a letter
+    /// escapes nothing, ends the value where it stands and is thrown away, and
+    /// the letters after it are a value of their own.
     fn tag_word(&mut self) -> Box<[u8]> {
         let start = self.at;
-        while let Some(b) = self.peek() {
-            if b == b'\\' {
-                self.at += 1;
-                if self.peek().is_some() {
-                    self.at += 1;
-                }
-                continue;
-            }
-            if !wordy(b) {
-                break;
-            }
-            self.at += 1;
-        }
+        self.at = self.word_end(self.at);
         self.src[start..self.at].into()
     }
 
@@ -2996,7 +3144,9 @@ impl Parse<'_> {
             self.word = name.clone();
             return Bad::Syntax { at, near: name };
         }
-        self.syntax()
+        // A star with a word after it is the word's, so `@a *x` is refused at
+        // the star and names the `x` rather than the field.
+        self.syntax_near()
     }
 
     /// Hangs one attribute off the node it was written after.
@@ -3264,7 +3414,18 @@ impl Parse<'_> {
                 // The rest of the query still has to parse, so the reference
                 // stands in as a number, which is the one shape that reads
                 // sensibly everywhere a parameter can appear.
-                self.gone.push(name.into());
+                //
+                // The name the client is told about is the one they wrote, so
+                // `$p\{a` is missing under that name and not under the `p{a`
+                // the escape made of it. The word last read is that name when
+                // nothing has been read since, which is the case everywhere a
+                // parameter is looked up.
+                let told = if bare(&self.word) == name {
+                    self.word.clone()
+                } else {
+                    name.into()
+                };
+                self.gone.push(told);
                 b"0".to_vec().into()
             }
         }
@@ -3373,7 +3534,21 @@ fn close_run(list: &mut Vec<Node>, run: &mut Vec<Node>) {
     match run.len() {
         0 => {}
         1 => list.push(run.pop().unwrap_or_else(Node::empty)),
-        _ => list.push(Node::new(What::Intersect(std::mem::take(run)))),
+        _ => {
+            // A value of one word is matched exactly as it was written, and a
+            // value of several is not a value at all: it is a phrase, and a
+            // phrase is folded and unescaped the way every other phrase in the
+            // language is. So `{AA}` looks for `AA` and `{AA BB}` looks for
+            // `aa` next to `bb`, which reads like a mistake until you see that
+            // the second one was never going to match a tag with a space in it
+            // either way.
+            for node in run.iter_mut() {
+                if let What::Term(w) = &mut node.what {
+                    w.word = fold(&bare(&w.word)).into();
+                }
+            }
+            list.push(Node::new(What::Intersect(std::mem::take(run))));
+        }
     }
     run.clear();
 }
@@ -3570,6 +3745,146 @@ mod tests {
     #[test]
     fn a_tag_lists_its_values_without_a_union_around_them() {
         assert_eq!(shown("@g:{x|y}", 1), "TAG:@g {\n  x\n  y\n}\n");
+    }
+
+    /// A tag value of one word is matched byte for byte and a value of several
+    /// is not a value at all, it is a phrase, and every phrase in the language
+    /// is folded and unescaped the same way.
+    #[test]
+    fn a_tag_value_of_one_word_keeps_what_a_value_of_several_loses() {
+        assert_eq!(shown("@g:{AA}", 2), "TAG:@g {\n  AA\n}\n");
+        assert_eq!(shown(r"@g:{aa\-bb}", 2), "TAG:@g {\n  aa\\-bb\n}\n");
+        assert_eq!(
+            shown("@g:{AA BB}", 2),
+            "TAG:@g {\n  INTERSECT {\n    aa\n    bb\n  }\n}\n"
+        );
+        assert_eq!(
+            shown(r"@g:{aa\-BB cc}", 2),
+            "TAG:@g {\n  INTERSECT {\n    aa-bb\n    cc\n  }\n}\n"
+        );
+    }
+
+    /// A backslash in front of a letter escapes nothing and ends the value, so
+    /// these are two values where the one in front of a mark is one.
+    #[test]
+    fn an_escape_that_reaches_nothing_splits_a_tag_value_in_two() {
+        assert_eq!(
+            shown(r"@g:{aa\xbb}", 2),
+            "TAG:@g {\n  INTERSECT {\n    aa\n    xbb\n  }\n}\n"
+        );
+    }
+
+    /// A value matched against the front or the back of a tag loses its escapes
+    /// where a whole value keeps them, and keeps its capitals either way.
+    #[test]
+    fn a_tag_value_with_a_star_on_it_is_unescaped_and_not_folded() {
+        assert_eq!(shown(r"@g:{a\-b*}", 2), "TAG:@g {\n  PREFIX{a-b*}\n}\n");
+        assert_eq!(shown(r"@g:{*a\-b}", 2), "TAG:@g {\n  SUFFIX{*a-b}\n}\n");
+        assert_eq!(shown(r"@g:{*a\-b*}", 2), "TAG:@g {\n  INFIX{*a-b*}\n}\n");
+        assert_eq!(shown("@g:{AA*}", 2), "TAG:@g {\n  PREFIX{AA*}\n}\n");
+        assert_eq!(
+            shown(r#"@g:{"aa bb"*}"#, 2),
+            "TAG:@g {\n  PREFIX{aa bb*}\n}\n"
+        );
+    }
+
+    /// A backslash left on the end of a pattern comes off, and the one place it
+    /// stays is a query that ends inside the word.
+    #[test]
+    fn a_trailing_escape_comes_off_a_pattern_and_not_off_a_value() {
+        assert_eq!(shown(r"@g:{*x\\}", 2), "TAG:@g {\n  SUFFIX{*x}\n}\n");
+        assert_eq!(shown(r"@g:{x\\*}", 2), "TAG:@g {\n  PREFIX{x*}\n}\n");
+        assert_eq!(shown(r"@g:{*x\\y\\}", 2), "TAG:@g {\n  SUFFIX{*x\\y}\n}\n");
+        assert_eq!(shown(r"@g:{x\\}", 2), "TAG:@g {\n  x\\\\\n}\n");
+        assert_eq!(shown(r"*x\\", 2), "SUFFIX{*x\\}\n");
+    }
+
+    /// A tag value is the longer of the number and the word that both start
+    /// where it does, which is the only thing that tells these three apart.
+    #[test]
+    fn a_tag_value_is_the_longer_of_a_number_and_a_word() {
+        assert_eq!(shown(r"@g:{1\-a}", 2), "TAG:@g {\n  1\\-a\n}\n");
+        assert_eq!(
+            shown(r"@g:{5.5\-a}", 2),
+            "TAG:@g {\n  INTERSECT {\n    5.5\n    -a\n  }\n}\n"
+        );
+        assert_eq!(
+            shown("@g:{1.5.5}", 2),
+            "TAG:@g {\n  INTERSECT {\n    1.5\n    .5\n  }\n}\n"
+        );
+    }
+
+    /// The first dialect has no reading for a tag value that starts with one of
+    /// these five, so the list ends there and the rest is ordinary text, which
+    /// leaves the closing brace belonging to nobody.
+    #[test]
+    fn the_first_dialect_ends_a_tag_list_at_a_mark_a_value_cannot_start_with() {
+        assert_eq!(
+            refused("@g:{aa-bb}", 1),
+            Bad::Syntax {
+                at: 9,
+                near: b"bb".to_vec().into()
+            }
+        );
+    }
+
+    /// A tag list and a phrase are both term lists, and the grammar the first
+    /// dialect is written in only drops a stopword out of one that has two
+    /// terms in it already.
+    #[test]
+    fn a_stopword_needs_two_terms_in_front_of_it_before_it_is_dropped() {
+        assert_eq!(shown("@g:{be}", 1), "TAG:@g {\n  be\n}\n");
+        assert!(matches!(refused("@g:{x be}", 1), Bad::Syntax { at: 8, .. }));
+        assert!(matches!(
+            refused("@g:{x be y}", 1),
+            Bad::Syntax { at: 10, .. }
+        ));
+        assert_eq!(
+            shown("@g:{x y be z}", 1),
+            "TAG:@g {\n  INTERSECT {\n    x\n    y\n    z\n  }\n}\n"
+        );
+        assert!(matches!(
+            refused(r#""x be y""#, 1),
+            Bad::Syntax { at: 3, .. }
+        ));
+        assert_eq!(shown(r#""x y be""#, 1), "EXACT {\n  x\n  y\n}\n");
+    }
+
+    /// What an error quotes is the word the client wrote and not the word the
+    /// parser made of it.
+    #[test]
+    fn an_error_quotes_the_word_as_it_was_typed() {
+        assert_eq!(
+            refused(r"aa\-bb )", 1),
+            Bad::Syntax {
+                at: 7,
+                near: br"aa\-bb".to_vec().into()
+            }
+        );
+        assert_eq!(
+            refused(r#"@g:{aa  "BB\A Cc"} @a:x"#, 1),
+            Bad::Syntax {
+                at: 12,
+                near: b"A".to_vec().into()
+            }
+        );
+    }
+
+    /// A star is part of the word it is glued to, so there is nothing else to
+    /// point at even when the query goes on.
+    #[test]
+    fn a_fuzzy_word_with_a_star_on_it_is_refused_back_at_the_word() {
+        assert!(matches!(
+            refused("%hello* world", 1),
+            Bad::Syntax { at: 1, .. }
+        ));
+        assert_eq!(
+            refused("aa%*BB", 1),
+            Bad::Syntax {
+                at: 3,
+                near: b"BB".to_vec().into()
+            }
+        );
     }
 
     /// Two modifiers with no field in common leave a node that cannot match, and
