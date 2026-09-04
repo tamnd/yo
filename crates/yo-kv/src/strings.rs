@@ -999,6 +999,24 @@ impl Keyspace {
         Ok(out)
     }
 
+    /// One string value, copied out, or an empty one for a key that is not
+    /// there.
+    ///
+    /// What `LCS` needs, and the only read here that hands back an owned value.
+    /// It is its own method rather than a step inside [`Keyspace::lcs`] because
+    /// the two keys `LCS` names can be on two stripes of the same database, and
+    /// then there is no single keyspace that can be asked for both.
+    ///
+    /// # Errors
+    ///
+    /// `WRONGTYPE` if the key holds something that is not a string.
+    pub fn string_copy(&mut self, key: &[u8]) -> Result<Vec<u8>> {
+        self.reap(key);
+        self.string_only(key)?;
+        self.warm(key)?;
+        Ok(self.peek(key).map(|v| v.to_vec()).unwrap_or_default())
+    }
+
     /// `LCS key1 key2`, the longest common subsequence itself.
     ///
     /// A key that is not there is the empty string, which is Redis's reading and
@@ -1032,19 +1050,11 @@ impl Keyspace {
     /// expensive, and borrowing both at once through a `&mut self` reap is a
     /// fight with the borrow checker for no measurable gain.
     fn both(&mut self, a: &[u8], b: &[u8]) -> Result<(Vec<u8>, Vec<u8>)> {
-        self.reap(a);
-        self.reap(b);
-        self.string_only(a)?;
-        self.string_only(b)?;
         // One key at a time, because there is one buffer and this needs two
         // values. Each is copied out before the next is faulted, which is the
         // one place in this file that copies a value it did not have to and it
         // was already copying before any of this.
-        self.warm(a)?;
-        let x = self.peek(a).map(|v| v.to_vec()).unwrap_or_default();
-        self.warm(b)?;
-        let y = self.peek(b).map(|v| v.to_vec()).unwrap_or_default();
-        Ok((x, y))
+        Ok((self.string_copy(a)?, self.string_copy(b)?))
     }
 
     // ---------------------------------------------------------------- private
@@ -1183,8 +1193,18 @@ fn step(n: i64, by: i64, subtract: bool) -> Result<i64> {
 /// Not string only. The key limit is the keyspace's and applies to every type,
 /// and a set member is held the same way a string is, so [`crate::sets`] checks
 /// against this rather than growing a second copy of the same two numbers.
+///
+/// Public because the commands that write several keys at once check every pair
+/// before they write any, and once those keys are spread over several stripes
+/// the check cannot be inside the write: it would pass on the first stripe,
+/// write there, and then fail on the second, leaving half of an `MSET` done.
+///
+/// # Errors
+///
+/// If the key is longer than [`KEY_MAX`] or the value longer than
+/// [`STRING_MAX`].
 #[inline]
-pub(crate) fn check_len(key: &[u8], len: usize) -> Result<()> {
+pub fn check_len(key: &[u8], len: usize) -> Result<()> {
     if key.len() > KEY_MAX {
         return Err(Error::new(Code::Full, KEY_TOO_LONG));
     }

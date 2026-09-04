@@ -389,6 +389,29 @@ impl Server {
         }
     }
 
+    /// A server whose databases are cut into `width` stripes each.
+    ///
+    /// Not reachable from the command line and not meant to be yet. Only the
+    /// groups that have been taught about stripes can run on a server wider
+    /// than one, and every other group answers through [`Db::only_mut`], which
+    /// says so by failing rather than by giving a wrong answer.
+    ///
+    /// That is what this is for. Each group that is taught gets its own tests
+    /// run at a width greater than one alongside the tests it already has, and
+    /// a group that has not been taught cannot be run that way by accident. It
+    /// stops being scaffolding and starts being the thing `--threads` sets when
+    /// the last group is done.
+    #[must_use]
+    pub fn with_width(width: usize) -> Server {
+        let clock = Clock::system();
+        let mut server = Server::new();
+        server.dbs = (0..DATABASES)
+            .map(|_| Db::with_clock(clock, width))
+            .collect();
+        server.width = server.dbs[0].width();
+        server
+    }
+
     /// A server on a clock the caller moves by hand, for tests.
     #[must_use]
     pub fn with_clock(clock: Clock) -> Server {
@@ -555,6 +578,16 @@ impl Server {
         for db in &mut self.dbs {
             db.set_clock_ms(now);
         }
+    }
+
+    /// Move every clock here on by `ms`, for tests about expiry.
+    ///
+    /// The same thing [`Server::set_clock_ms`] does and by the same argument,
+    /// except that it moves from wherever the clock is rather than to a stated
+    /// moment, which is what a test that wants a key to have expired asks for.
+    pub fn advance_clock_ms(&mut self, ms: u64) {
+        let now = self.clock.now_ms() + ms;
+        self.set_clock_ms(now);
     }
 
     /// Move every clock here to `ms` by hand, for tests about expiry.
@@ -1237,8 +1270,7 @@ pub fn resolved(
         match spec.group {
             "string" => {
                 let db = session.db;
-                strings::execute(server.dbs[db].only_mut(), spec, args, out)
-                    .map(|()| Flow::Continue)
+                strings::execute(&mut server.dbs[db], spec, args, out).map(|()| Flow::Continue)
             }
             // Its own group and its own file, and the same values underneath:
             // a bitmap is a string, so `STRLEN` on one answers and `SETBIT` on
@@ -1432,8 +1464,17 @@ mod tests {
 
     impl Fixture {
         fn new() -> Fixture {
+            Fixture::on(Server::new())
+        }
+
+        /// The same, on a server whose databases are cut into `width` stripes.
+        fn striped(width: usize) -> Fixture {
+            Fixture::on(Server::with_width(width))
+        }
+
+        fn on(server: Server) -> Fixture {
             Fixture {
-                server: Server::new(),
+                server,
                 session: Session::new(7),
                 argv: Argv::new(),
                 out: Out::new(Proto::Resp2),
@@ -1465,9 +1506,7 @@ mod tests {
 
         /// Move every clock in the server on by `ms`.
         fn advance(&mut self, ms: u64) {
-            for db in 0..DATABASES {
-                self.server.db(db).clock_mut().advance(ms);
-            }
+            self.server.advance_clock_ms(ms);
         }
 
         /// The same, with what the connection should do next.
@@ -17843,6 +17882,119 @@ mod tests {
             f.run(&[b"INFO", b"memory"])
                 .contains("yo_memory_regime:evict"),
             "and it says so"
+        );
+    }
+    // ------------------------------------------------------------- stripes
+
+    /// Every string command, run twice: once on a database that is one keyspace
+    /// and once on a database that is eight, with the same commands in the same
+    /// order and the replies compared byte for byte.
+    ///
+    /// This is the whole claim the striping rests on. A key belongs to one
+    /// stripe and to no other, so the answer to a command cannot depend on how
+    /// many stripes there are, and the way to check that is to ask the same
+    /// question of two servers that differ in nothing else.
+    ///
+    /// The keys are chosen to land on different stripes rather than to look
+    /// tidy. `MSET a 1 b 2 c 3` over eight stripes is only a test of anything if
+    /// those three keys are not all on the same one, and at eight stripes three
+    /// keys land together about one time in fifty.
+    #[test]
+    fn the_string_group_answers_the_same_however_many_stripes_there_are() {
+        let script: &[&[&[u8]]] = &[
+            // The single key commands, which are the ones that get handed one
+            // stripe at the dispatch site.
+            &[b"SET", b"k1", b"v1"],
+            &[b"SET", b"k2", b"v2"],
+            &[b"GET", b"k1"],
+            &[b"GET", b"nothing"],
+            &[b"GETSET", b"k1", b"v1b"],
+            &[b"SETNX", b"k1", b"no"],
+            &[b"SETNX", b"k3", b"yes"],
+            &[b"APPEND", b"k3", b"!"],
+            &[b"STRLEN", b"k3"],
+            &[b"SETRANGE", b"k3", b"1", b"XY"],
+            &[b"GETRANGE", b"k3", b"0", b"-1"],
+            &[b"INCR", b"n1"],
+            &[b"INCRBY", b"n1", b"41"],
+            &[b"DECRBY", b"n1", b"2"],
+            &[b"INCRBYFLOAT", b"f1", b"1.5"],
+            &[b"SETEX", b"e1", b"100", b"v"],
+            &[b"PSETEX", b"e2", b"100000", b"v"],
+            &[b"GETEX", b"e1", b"PERSIST"],
+            &[b"GETDEL", b"k2"],
+            &[b"GET", b"k2"],
+            &[b"DIGEST", b"k1"],
+            &[b"DELEX", b"k3"],
+            // The five that name more than one key, which are the ones that
+            // cannot be handed one stripe at all.
+            &[b"MSET", b"a", b"1", b"b", b"2", b"c", b"3"],
+            &[b"MGET", b"a", b"b", b"c", b"missing"],
+            &[b"MSETNX", b"d", b"4", b"e", b"5"],
+            &[b"MSETNX", b"e", b"6", b"f", b"7"],
+            &[b"MGET", b"d", b"e", b"f"],
+            &[b"MSETEX", b"2", b"g", b"7", b"h", b"8", b"NX"],
+            &[b"MSETEX", b"2", b"g", b"9", b"h", b"9", b"NX"],
+            &[b"MSETEX", b"2", b"g", b"9", b"h", b"9", b"XX"],
+            &[b"MGET", b"g", b"h"],
+            &[b"SET", b"s1", b"ohmytext"],
+            &[b"SET", b"s2", b"mynewtext"],
+            &[b"LCS", b"s1", b"s2"],
+            &[b"LCS", b"s1", b"s2", b"LEN"],
+            &[b"LCS", b"s1", b"s2", b"IDX", b"MINMATCHLEN", b"4"],
+            &[b"LCS", b"s1", b"s2", b"IDX", b"WITHMATCHLEN"],
+            &[b"LCS", b"s1", b"gone"],
+            // And the errors, which have to be the same errors.
+            &[b"MSET", b"odd"],
+            &[b"LCS", b"s1", b"s2", b"LEN", b"IDX"],
+            &[b"MGET"],
+        ];
+
+        let mut one = Fixture::new();
+        let mut many = Fixture::striped(8);
+        for parts in script {
+            let a = one.run(parts);
+            let b = many.run(parts);
+            assert_eq!(a, b, "{}", String::from_utf8_lossy(parts[0]));
+        }
+    }
+
+    /// The keys of an `MSET` really do end up on different stripes.
+    ///
+    /// Without this the test above could pass on a server whose stripe number
+    /// happened to be a constant, which is a striped database in name only.
+    #[test]
+    fn a_striped_database_spreads_the_keys_it_is_given() {
+        let mut f = Fixture::striped(8);
+        for i in 0..256 {
+            let key = format!("key:{i}");
+            f.run(&[b"SET", key.as_bytes(), b"v"]);
+        }
+        assert_eq!(f.run(&[b"DBSIZE"]), ":256\r\n");
+    }
+
+    /// A wrong type stops an `MGET` no more than it does on one stripe: the key
+    /// that is not a string comes back nil and the rest of the reply is intact.
+    #[test]
+    fn a_wrong_type_in_the_middle_of_an_mget_is_still_one_nil() {
+        let mut one = Fixture::new();
+        let mut many = Fixture::striped(8);
+        for f in [&mut one, &mut many] {
+            f.run(&[b"SET", b"str", b"v"]);
+            // Planted rather than pushed. `RPUSH` belongs to the list group,
+            // which has not been taught about stripes yet and would refuse the
+            // wide server. What is under test is what `MGET` does when it walks
+            // onto a key that is not a string, and that does not care how the
+            // key got there.
+            f.server
+                .striped(0)
+                .at(b"list")
+                .push(b"list", yo_kv::End::Right, core::iter::once(&b"v"[..]))
+                .expect("a new list");
+        }
+        assert_eq!(
+            one.run(&[b"MGET", b"str", b"list", b"gone"]),
+            many.run(&[b"MGET", b"str", b"list", b"gone"])
         );
     }
 }

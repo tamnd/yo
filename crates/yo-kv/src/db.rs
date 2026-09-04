@@ -220,6 +220,17 @@ impl Db {
         &mut self.stripes
     }
 
+    /// What time every stripe here thinks it is.
+    ///
+    /// One reading and not one per stripe. The clock is set on all of them
+    /// together at the top of a turn of the loop, so a command that asks two
+    /// stripes what the time is has to get the same answer from both or two
+    /// keys written by the same command would expire at different moments.
+    #[must_use]
+    pub fn now_ms(&self) -> u64 {
+        self.stripes[0].clock().now_ms()
+    }
+
     /// How many keys are in the database.
     #[must_use]
     pub fn len(&self) -> usize {
