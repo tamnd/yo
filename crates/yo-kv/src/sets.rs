@@ -736,17 +736,17 @@ impl Db {
     /// they should be in. A source that is not there answers zero without ever
     /// looking at the destination, so a destination holding a string is not a
     /// `WRONGTYPE` until the source turns out to be a set.
-    pub fn smove(&mut self, source: &[u8], destination: &[u8], member: &[u8]) -> Result<bool> {
+    pub fn smove(&self, source: &[u8], destination: &[u8], member: &[u8]) -> Result<bool> {
         let (from, onto) = (self.stripe_of(source), self.stripe_of(destination));
         if from == onto {
-            return self.stripe_mut(from).smove(source, destination, member);
+            return self.hold_stripe(from).smove(source, destination, member);
         }
-        let Some(at) = self.stripe_mut(from).set_slot(source)? else {
+        let Some(at) = self.hold_stripe(from).set_slot(source)? else {
             return Ok(false);
         };
-        let there = self.stripe_mut(onto).set_slot(destination)?;
+        let there = self.hold_stripe(onto).set_slot(destination)?;
         if !self
-            .stripe_mut(from)
+            .hold_stripe(from)
             .sets
             .get_mut(at)
             .expect("the record points at its body")
@@ -755,7 +755,7 @@ impl Db {
             return Ok(false);
         }
 
-        let dest = self.stripe_mut(onto);
+        let mut dest = self.hold_stripe(onto);
         let limits = dest.limits;
         let into = match there {
             Some(into) => into,
@@ -766,7 +766,7 @@ impl Db {
             .expect("the record points at its body")
             .add(member, &limits);
 
-        let src = self.stripe_mut(from);
+        let mut src = self.hold_stripe(from);
         if src.set_at(at).is_empty() {
             src.drop_key(source);
         }
@@ -775,7 +775,7 @@ impl Db {
 
     /// `SINTER key [key ...]`, and `SINTERCARD`'s limit.
     pub fn sinter<'k, F>(
-        &mut self,
+        &self,
         keys: impl Iterator<Item = &'k [u8]> + Clone,
         limit: usize,
         f: F,
@@ -784,24 +784,26 @@ impl Db {
         F: FnMut(&[u8]),
     {
         if let Some(home) = self.one_stripe(keys.clone()) {
-            return self.stripe_mut(home).sinter(keys, limit, f);
+            return self.hold_stripe(home).sinter(keys, limit, f);
         }
         let slots = self.set_slots(keys)?;
         if slots.is_empty() || slots.iter().any(Option::is_none) {
             return Ok(0);
         }
-        let mut scratch = self.take_setops();
+        // The buffers before the stripes, which is the order every command
+        // that wants both takes them in.
+        let mut spare = self.spare();
+        let scratch = &mut spare.setops;
         let held = self.hold_slots(&slots);
         let sets = bodies_of(&held, &slots);
-        let n = setops::inter(&mut scratch, &sets, limit, f);
+        let n = setops::inter(scratch, &sets, limit, f);
         drop(held);
-        self.put_setops(scratch);
         Ok(n)
     }
 
     /// `SINTERCARD numkeys key [key ...] [LIMIT limit]`.
     pub fn sintercard<'k>(
-        &mut self,
+        &self,
         keys: impl Iterator<Item = &'k [u8]> + Clone,
         limit: usize,
     ) -> Result<usize> {
@@ -810,7 +812,7 @@ impl Db {
 
     /// `SUNION key [key ...]`, and `SUNIONCARD`'s limit.
     pub fn sunion<'k, F>(
-        &mut self,
+        &self,
         keys: impl Iterator<Item = &'k [u8]> + Clone,
         limit: usize,
         f: F,
@@ -819,21 +821,23 @@ impl Db {
         F: FnMut(&[u8]),
     {
         if let Some(home) = self.one_stripe(keys.clone()) {
-            return self.stripe_mut(home).sunion(keys, limit, f);
+            return self.hold_stripe(home).sunion(keys, limit, f);
         }
         let slots = self.set_slots(keys)?;
-        let mut scratch = self.take_setops();
+        // The buffers before the stripes, which is the order every command
+        // that wants both takes them in.
+        let mut spare = self.spare();
+        let scratch = &mut spare.setops;
         let held = self.hold_slots(&slots);
         let sets = bodies_of(&held, &slots);
-        let n = setops::union(&mut scratch, &sets, limit, f);
+        let n = setops::union(scratch, &sets, limit, f);
         drop(held);
-        self.put_setops(scratch);
         Ok(n)
     }
 
     /// `SUNIONCARD numkeys key [key ...] [LIMIT limit]`.
     pub fn sunioncard<'k>(
-        &mut self,
+        &self,
         keys: impl Iterator<Item = &'k [u8]> + Clone,
         limit: usize,
     ) -> Result<usize> {
@@ -842,7 +846,7 @@ impl Db {
 
     /// `SDIFF key [key ...]`, and `SDIFFCARD`'s limit.
     pub fn sdiff<'k, F>(
-        &mut self,
+        &self,
         keys: impl Iterator<Item = &'k [u8]> + Clone,
         limit: usize,
         f: F,
@@ -851,7 +855,7 @@ impl Db {
         F: FnMut(&[u8]),
     {
         if let Some(home) = self.one_stripe(keys.clone()) {
-            return self.stripe_mut(home).sdiff(keys, limit, f);
+            return self.hold_stripe(home).sdiff(keys, limit, f);
         }
         let slots = self.set_slots(keys)?;
         let Some(Some(_)) = slots.first() else {
@@ -864,7 +868,7 @@ impl Db {
 
     /// `SDIFFCARD numkeys key [key ...] [LIMIT limit]`.
     pub fn sdiffcard<'k>(
-        &mut self,
+        &self,
         keys: impl Iterator<Item = &'k [u8]> + Clone,
         limit: usize,
     ) -> Result<usize> {
@@ -878,15 +882,18 @@ impl Db {
     /// source work. The limits and the slab the answer goes into are the
     /// destination's stripe's, since that is where the set is going to live.
     pub fn sinterstore<'k>(
-        &mut self,
+        &self,
         destination: &'k [u8],
         keys: impl Iterator<Item = &'k [u8]> + Clone,
     ) -> Result<usize> {
         if let Some(home) = self.one_stripe(std::iter::once(destination).chain(keys.clone())) {
-            return self.stripe_mut(home).sinterstore(destination, keys);
+            return self.hold_stripe(home).sinterstore(destination, keys);
         }
         let slots = self.set_slots(keys)?;
-        let mut scratch = self.take_setops();
+        // The buffers before the stripes, which is the order every command
+        // that wants both takes them in.
+        let mut spare = self.spare();
+        let scratch = &mut spare.setops;
         let built = if slots.is_empty() || slots.iter().any(Option::is_none) {
             None
         } else {
@@ -895,45 +902,46 @@ impl Db {
             let sets = bodies_of(&held, &slots);
             let upper = sets.iter().map(|s| s.len()).min().unwrap_or(0);
             setops::collect(upper, &limits, |f| {
-                setops::inter(&mut scratch, &sets, 0, f);
+                setops::inter(scratch, &sets, 0, f);
             })
         };
-        self.put_setops(scratch);
-        Ok(self.at(destination).put_set(destination, built))
+        Ok(self.hold(destination).put_set(destination, built))
     }
 
     /// `SUNIONSTORE destination key [key ...]`.
     pub fn sunionstore<'k>(
-        &mut self,
+        &self,
         destination: &'k [u8],
         keys: impl Iterator<Item = &'k [u8]> + Clone,
     ) -> Result<usize> {
         if let Some(home) = self.one_stripe(std::iter::once(destination).chain(keys.clone())) {
-            return self.stripe_mut(home).sunionstore(destination, keys);
+            return self.hold_stripe(home).sunionstore(destination, keys);
         }
         let slots = self.set_slots(keys)?;
-        let mut scratch = self.take_setops();
+        // The buffers before the stripes, which is the order every command
+        // that wants both takes them in.
+        let mut spare = self.spare();
+        let scratch = &mut spare.setops;
         let built = {
             let limits = self.hold(destination).limits;
             let held = self.hold_slots(&slots);
             let sets = bodies_of(&held, &slots);
             let upper = sets.iter().map(|s| s.len()).sum();
             setops::collect(upper, &limits, |f| {
-                setops::union(&mut scratch, &sets, 0, f);
+                setops::union(scratch, &sets, 0, f);
             })
         };
-        self.put_setops(scratch);
-        Ok(self.at(destination).put_set(destination, built))
+        Ok(self.hold(destination).put_set(destination, built))
     }
 
     /// `SDIFFSTORE destination key [key ...]`.
     pub fn sdiffstore<'k>(
-        &mut self,
+        &self,
         destination: &'k [u8],
         keys: impl Iterator<Item = &'k [u8]> + Clone,
     ) -> Result<usize> {
         if let Some(home) = self.one_stripe(std::iter::once(destination).chain(keys.clone())) {
-            return self.stripe_mut(home).sdiffstore(destination, keys);
+            return self.hold_stripe(home).sdiffstore(destination, keys);
         }
         let slots = self.set_slots(keys)?;
         let built = match slots.first() {
@@ -948,7 +956,7 @@ impl Db {
             }
             _ => None,
         };
-        Ok(self.at(destination).put_set(destination, built))
+        Ok(self.hold(destination).put_set(destination, built))
     }
 
     /// Reap and resolve every key, in order, to the stripe and slot its set is
@@ -958,14 +966,11 @@ impl Db {
     /// first key holding something that is not a set stops the whole command
     /// before anything has been written. Each key is resolved on its own stripe,
     /// which is the only difference.
-    fn set_slots<'k>(
-        &mut self,
-        keys: impl Iterator<Item = &'k [u8]>,
-    ) -> Result<PerSet<Option<Home>>> {
+    fn set_slots<'k>(&self, keys: impl Iterator<Item = &'k [u8]>) -> Result<PerSet<Option<Home>>> {
         let mut out = PerSet::new();
         for key in keys {
             let stripe = self.stripe_of(key);
-            let at = self.stripe_mut(stripe).set_slot(key)?;
+            let at = self.hold_stripe(stripe).set_slot(key)?;
             out.push(at.map(|at| (stripe, at)));
         }
         Ok(out)

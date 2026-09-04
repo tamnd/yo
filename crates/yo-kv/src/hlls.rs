@@ -375,15 +375,15 @@ impl Db {
     /// into one set of registers a stripe at a time. Sixteen kibibytes of
     /// registers is the only state the merge needs, so nothing is held across
     /// the stripes but that.
-    pub fn pfcount<'k, I>(&mut self, keys: I) -> Result<u64>
+    pub fn pfcount<'k, I>(&self, keys: I) -> Result<u64>
     where
         I: Iterator<Item = &'k [u8]> + Clone,
     {
         if let Some(home) = self.one_stripe(keys.clone()) {
-            return self.stripe_mut(home).pfcount(keys);
+            return self.hold_stripe(home).pfcount(keys);
         }
         for key in keys.clone() {
-            self.at(key).hll_ready(key)?;
+            self.hold(key).hll_ready(key)?;
         }
         let mut max = [0u8; hll::REGISTERS];
         for key in keys {
@@ -398,17 +398,17 @@ impl Db {
     /// single keyspace runs them, the destination first and then the sources,
     /// so the sentence a client gets for a bad key is the sentence it would have
     /// got, and then every input is read before the destination is written.
-    pub fn pfmerge<'k, I>(&mut self, dest: &'k [u8], srcs: I) -> Result<()>
+    pub fn pfmerge<'k, I>(&self, dest: &'k [u8], srcs: I) -> Result<()>
     where
         I: Iterator<Item = &'k [u8]> + Clone,
     {
         if let Some(home) = self.one_stripe(std::iter::once(dest).chain(srcs.clone())) {
-            return self.stripe_mut(home).pfmerge(dest, srcs);
+            return self.hold_stripe(home).pfmerge(dest, srcs);
         }
-        self.at(dest).hll_ready(dest)?;
+        self.hold(dest).hll_ready(dest)?;
         check_len(dest, hll::DENSE)?;
         for src in srcs.clone() {
-            self.at(src).hll_ready(src)?;
+            self.hold(src).hll_ready(src)?;
         }
 
         let mut max = [0u8; hll::REGISTERS];
@@ -416,7 +416,7 @@ impl Db {
         for key in std::iter::once(dest).chain(srcs) {
             dense |= self.hold(key).merge_sketch(key, &mut max)?;
         }
-        self.at(dest).pfmerge_into(dest, &max, dense)
+        self.hold(dest).pfmerge_into(dest, &max, dense)
     }
 }
 

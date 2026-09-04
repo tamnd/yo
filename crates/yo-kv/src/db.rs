@@ -76,14 +76,25 @@ pub struct Db {
     /// mean taking a stripe. Every stripe carries the same reading and they are
     /// all moved together, so this is that reading and not a fourth opinion.
     clock: Clock,
-    /// Somewhere to put bytes that came out of one stripe and are wanted while
-    /// another stripe is being held. A key for [`Db::random_key`], the sources
-    /// of a `BITOP` for `Db::bitop`. Every stripe has a buffer of its own for
-    /// its own work, and this is the one for work that is nobody's.
-    scratch: Vec<u8>,
-    /// Where each of the things in `scratch` ends, for the callers that put
-    /// more than one thing in it.
-    rows: Vec<usize>,
+    /// The buffers for work that is not any one stripe's, behind a lock of
+    /// their own. [`Db::spare`] has the order they are taken in and why there
+    /// is one set of them rather than one per thread.
+    spare: Lock<Spare>,
+}
+
+/// Somewhere to put bytes and rows that came out of one stripe and are wanted
+/// while another stripe is being held.
+///
+/// The sources of a `BITOP`, the element a cross stripe `LMOVE` is carrying,
+/// the tables a set operation fills in. Every stripe has buffers of its own for
+/// its own work, and these are the ones for work that is nobody's.
+#[derive(Default)]
+pub(crate) struct Spare {
+    /// The bytes.
+    pub(crate) bytes: Vec<u8>,
+    /// Where each of the things in `bytes` ends, for the callers that put more
+    /// than one thing in it.
+    pub(crate) rows: Vec<usize>,
     /// The tables a set operation across stripes fills in.
     ///
     /// A keyspace keeps a pair of these for the set operations that happen
@@ -91,7 +102,7 @@ pub struct Db {
     /// table per call was most of what a `SUNION` over text sets did. An
     /// operation whose keys are on several stripes is not any one stripe's, so
     /// it gets its own.
-    setops: crate::setops::Scratch,
+    pub(crate) setops: crate::setops::Scratch,
 }
 
 impl Db {
@@ -111,9 +122,11 @@ impl Db {
                 .collect(),
             mask: (n - 1) as u64,
             clock,
-            scratch: Vec::new(),
-            rows: Vec::new(),
-            setops: crate::setops::Scratch::new(),
+            spare: Lock::new(Spare {
+                bytes: Vec::new(),
+                rows: Vec::new(),
+                setops: crate::setops::Scratch::new(),
+            }),
         }
     }
 
@@ -235,44 +248,22 @@ impl Db {
             .then_some(first)
     }
 
-    /// The two buffers a command that spans stripes builds its answer in.
+    /// The buffers a command that spans stripes builds its answer in.
     ///
-    /// Taken out rather than lent, because everything the caller does with them
-    /// is done while holding a stripe, and a stripe is part of this database.
-    /// Whoever takes them puts them back with [`Db::put_scratch`], and that is
-    /// what makes the second run of the same command cost no allocation.
-    pub(crate) fn take_scratch(&mut self) -> (Vec<u8>, Vec<usize>) {
-        (
-            std::mem::take(&mut self.scratch),
-            std::mem::take(&mut self.rows),
-        )
-    }
-
-    /// The buffers back, ready for the next command.
-    pub(crate) fn put_scratch(&mut self, scratch: Vec<u8>, rows: Vec<usize>) {
-        self.scratch = scratch;
-        self.rows = rows;
-    }
-
-    /// What is in the byte buffer, for a caller that put something there and
-    /// wants to hand it back out borrowed.
+    /// Held for the length of the command and taken before any stripe is. That
+    /// order is the rule and it is the only lock order this database has: every
+    /// caller that wants both wants the spare first and the stripes after, in
+    /// stripe order, so no two of them can be waiting for each other.
     ///
-    /// `LMOVE` across two stripes is the one that does that: the element it
-    /// moved has no structure left to borrow from once it has been pushed, so
-    /// the answer borrows this instead, exactly as it borrows a stripe's own
-    /// buffer when both keys are on one stripe.
-    pub(crate) fn scratch_bytes(&self) -> &[u8] {
-        &self.scratch
-    }
-
-    /// The set operation tables, taken out for the same reason as the buffers.
-    pub(crate) fn take_setops(&mut self) -> crate::setops::Scratch {
-        std::mem::take(&mut self.setops)
-    }
-
-    /// The tables back.
-    pub(crate) fn put_setops(&mut self, setops: crate::setops::Scratch) {
-        self.setops = setops;
+    /// One set of buffers per database and not per thread, so two threads
+    /// running a command that spans stripes on the same database take turns.
+    /// That is a real serialisation and it is deliberate: the commands that
+    /// come through here are the set algebra and the two key moves, which are
+    /// a rounding error in any cache workload, and the alternative is either
+    /// buffers per thread that nothing frees or an allocation on a command
+    /// path, and Y7 does not allow the second one.
+    pub(crate) fn spare(&self) -> Held<'_, Spare> {
+        self.spare.lock()
     }
 
     /// Stripe `i`.
@@ -375,13 +366,23 @@ impl Db {
     }
 
     /// Throw the whole database away, which is what `FLUSHDB` does.
-    pub fn clear(&mut self) {
-        for stripe in self.stripes_mut() {
-            stripe.clear();
+    ///
+    /// One stripe at a time, the same as every other walk here. A reader on
+    /// another thread can see a database that is half thrown away, which is the
+    /// same thing it can see of a `FLUSHDB` on any server that does not stop
+    /// the world for one.
+    pub fn clear(&self) {
+        for i in 0..self.stripes.len() {
+            self.hold_stripe(i).clear();
         }
     }
 
     /// Move every clock in the database to `ms`.
+    ///
+    /// Exclusive, and it stays exclusive. A clock is read on every command and
+    /// moved by whatever is turning the loop, so this is the one thing here
+    /// that a thread must not be doing while another thread is serving, and the
+    /// borrow checker saying so is the cheapest way to keep it that way.
     pub fn set_clock_ms(&mut self, ms: u64) {
         self.clock.set(ms);
         for stripe in self.stripes_mut() {
@@ -418,7 +419,7 @@ impl Db {
     /// stopping to hand the client a cursor for it would be the more expensive
     /// of the two.
     pub fn scan(
-        &mut self,
+        &self,
         from: KeyCursor,
         budget: usize,
         ty: Option<Kind>,
@@ -435,7 +436,7 @@ impl Db {
         let mut cursor = from.without_stripe();
         let mut seen = 0usize;
         while at < self.stripes.len() {
-            let next = self.stripes[at].get_mut().scan(cursor, budget, ty, |key| {
+            let next = self.hold_stripe(at).scan(cursor, budget, ty, |key| {
                 seen += 1;
                 out(key);
             });
@@ -457,9 +458,9 @@ impl Db {
     /// order the stripes are in and then whatever order each one walks in,
     /// which is no order at all as far as a client is concerned, the same as it
     /// was with one stripe.
-    pub fn keys(&mut self, mut out: impl FnMut(&[u8])) {
-        for stripe in self.stripes_mut() {
-            stripe.keys(&mut out);
+    pub fn keys(&self, mut out: impl FnMut(&[u8])) {
+        for i in 0..self.stripes.len() {
+            self.hold_stripe(i).keys(&mut out);
         }
     }
 
@@ -475,46 +476,42 @@ impl Db {
     /// it are asked in turn when that happens, so an answer of `None` here
     /// means every stripe was asked and none of them had a live key.
     ///
-    /// The answer is copied into this database's own buffer rather than
-    /// borrowed from the stripe's, which is what lets the loop above go round
-    /// again while holding an answer. The buffer is kept between draws, so the
-    /// copy is a few bytes and the allocator only hears about a key name longer
-    /// than any this database has answered with before.
-    pub fn random_key(&mut self) -> Option<&[u8]> {
-        let live: usize = self.stripes_mut().map(|s| s.len()).sum();
+    /// The key is handed to `f` while its stripe is still held rather than
+    /// answered, because the stripe it came out of is what it is borrowed from
+    /// and letting go of that stripe is the end of the borrow. The caller
+    /// writes it into a reply, which is not part of this database and is
+    /// therefore still there afterwards. `false` means no stripe had one.
+    pub fn random_key(&self, f: impl FnOnce(&[u8])) -> bool {
+        let live: usize = (0..self.stripes.len())
+            .map(|i| self.hold_stripe(i).len())
+            .sum();
         if live == 0 {
-            return None;
+            return false;
         }
-        let draw = (self.stripes[0].get_mut().random() % live as u64) as usize;
+        let draw = (self.hold_stripe(0).random() % live as u64) as usize;
         let mut running = 0;
         let mut first = 0;
-        for (i, stripe) in self.stripes.iter_mut().enumerate() {
-            running += stripe.get_mut().len();
+        for i in 0..self.stripes.len() {
+            running += self.hold_stripe(i).len();
             if draw < running {
                 first = i;
                 break;
             }
         }
-        // Taken out and put back, because the closest thing to a stripe's
-        // answer this can hold is a copy of it and the stripe is borrowed while
-        // the copy is being made.
-        let mut buf = std::mem::take(&mut self.scratch);
-        buf.clear();
-        let mut found = false;
+        let mut f = Some(f);
         for step in 0..self.stripes.len() {
             let i = (first as u64 + step as u64) & self.mask;
-            if let Some(key) = self.stripes[i as usize].get_mut().random_key() {
-                // `yo_alloc::high_water` because this is the buffer reaching a
-                // length it has not been asked for before, which is the longest
-                // key name this database has ever answered with. The draw after
-                // it pays nothing, and that is the test below.
-                yo_alloc::high_water(|| buf.extend_from_slice(key));
-                found = true;
-                break;
+            let mut stripe = self.hold_stripe(i as usize);
+            if let Some(key) = stripe.random_key() {
+                // The closure is taken out of the option rather than called in
+                // place, because it is `FnOnce` and the loop it is inside can
+                // go round again. It never does after this point, which the
+                // return says.
+                f.take().expect("the loop stops the first time it fires")(key);
+                return true;
             }
         }
-        self.scratch = buf;
-        found.then_some(self.scratch.as_slice())
+        false
     }
 }
 
@@ -710,7 +707,7 @@ mod tests {
 
     #[test]
     fn a_scan_walks_every_stripe_and_answers_every_key_once() {
-        let mut db = filled(8, 2_000);
+        let db = filled(8, 2_000);
         let mut seen: Vec<Vec<u8>> = Vec::new();
         let mut at = KeyCursor::START;
         let mut calls = 0;
@@ -739,7 +736,7 @@ mod tests {
     // that says the walk is over rather than a panic.
     #[test]
     fn a_scan_carries_the_stripe_in_the_cursor() {
-        let mut db = filled(8, 2_000);
+        let db = filled(8, 2_000);
         let first = db.scan(KeyCursor::START, 10, None, |_| {});
         assert!(!first.is_end());
 
@@ -769,7 +766,11 @@ mod tests {
         });
         let mut picked = HashSet::new();
         for _ in 0..200 {
-            let key = db.random_key().expect("the database is not empty").to_vec();
+            let mut key = Vec::new();
+            assert!(
+                db.random_key(|k| key.extend_from_slice(k)),
+                "the database is not empty"
+            );
             assert!(all.contains(&key), "a key that is not there");
             picked.insert(key);
         }
@@ -785,22 +786,23 @@ mod tests {
             }
         }
         for _ in 0..20 {
-            assert_eq!(db.random_key(), Some(&b"k4242"[..]));
+            let mut key = Vec::new();
+            assert!(db.random_key(|k| key.extend_from_slice(k)));
+            assert_eq!(key, b"k4242");
         }
         db.at(b"k4242").del(b"k4242");
-        assert_eq!(db.random_key(), None);
+        assert!(!db.random_key(|_| unreachable!("there are no keys left")));
     }
 
-    /// The buffer the answer is copied into is kept, so the draw after the
-    /// first one of that length pays the allocator nothing. That is the claim
-    /// the `yo_alloc::high_water` in `random_key` is making.
+    /// The key is handed out of the stripe it is on rather than copied, so a
+    /// draw asks the allocator for nothing at all.
     #[test]
-    fn a_second_random_key_does_not_allocate() {
-        let mut db = filled(8, 500);
-        assert!(db.random_key().is_some(), "the database is not empty");
+    fn a_random_key_does_not_allocate() {
+        let db = filled(8, 500);
+        assert!(db.random_key(|_| {}), "the database is not empty");
         let (_, allocs) = crate::tally::counted(|| {
             for _ in 0..200 {
-                assert!(db.random_key().is_some(), "the database is not empty");
+                assert!(db.random_key(|_| {}), "the database is not empty");
             }
         });
         assert_eq!(

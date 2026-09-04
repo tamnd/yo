@@ -435,21 +435,25 @@ impl Db {
     /// # Panics
     ///
     /// As [`Keyspace::bitop`].
-    pub fn bitop<'k, I>(&mut self, op: Op, dest: &'k [u8], srcs: I) -> Result<usize>
+    pub fn bitop<'k, I>(&self, op: Op, dest: &'k [u8], srcs: I) -> Result<usize>
     where
         I: Iterator<Item = &'k [u8]> + Clone,
     {
         if let Some(home) = self.one_stripe(std::iter::once(dest).chain(srcs.clone())) {
-            return self.stripe_mut(home).bitop(op, dest, srcs);
+            return self.hold_stripe(home).bitop(op, dest, srcs);
         }
         for src in srcs.clone() {
-            let stripe = self.at(src);
+            let mut stripe = self.hold(src);
             stripe.reap(src);
             stripe.string_only(src)?;
             stripe.thaw(src)?;
         }
 
-        let (mut flat, mut ends) = self.take_scratch();
+        // The buffers before the stripes, which is the order every command that
+        // wants both takes them in.
+        let mut spare = self.spare();
+        let spare = &mut *spare;
+        let (flat, ends) = (&mut spare.bytes, &mut spare.rows);
         flat.clear();
         ends.clear();
         let mut digits = [0u8; DIGITS_MAX];
@@ -462,33 +466,25 @@ impl Db {
             flat.extend_from_slice(bytes);
             ends.push(flat.len());
         }
-        let len = bits::width(parts(&flat, &ends));
+        let len = bits::width(parts(flat, ends));
         if len > STRING_MAX {
-            self.put_scratch(flat, ends);
             return Err(Error::new(Code::Invalid, TOO_LONG));
         }
 
         let split = flat.len();
         flat.resize(split + len, 0);
         let (read, write) = flat.split_at_mut(split);
-        bits::combine(op, parts(read, &ends), write);
+        bits::combine(op, parts(read, ends), write);
 
-        let outcome = if len == 0 {
-            self.at(dest).del(dest);
-            Ok(0)
-        } else {
-            let stripe = self.at(dest);
-            stripe.reap(dest);
-            match stripe.string_only(dest) {
-                Ok(()) => {
-                    stripe.store_raw(dest, &flat[split..], None);
-                    Ok(len)
-                }
-                Err(e) => Err(e),
-            }
-        };
-        self.put_scratch(flat, ends);
-        outcome
+        if len == 0 {
+            self.hold(dest).del(dest);
+            return Ok(0);
+        }
+        let mut stripe = self.hold(dest);
+        stripe.reap(dest);
+        stripe.string_only(dest)?;
+        stripe.store_raw(dest, &flat[split..], None);
+        Ok(len)
     }
 }
 
