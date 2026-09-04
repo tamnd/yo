@@ -572,13 +572,20 @@ impl Server {
     /// before any of them executes, so it cannot hold the mutable borrow `run`
     /// is about to want, and it does not need one: warming a cache line reads
     /// nothing and changes nothing.
-    ///
-    /// # Panics
-    ///
-    /// As [`Server::db`].
     #[must_use]
-    pub fn db_ref(&self, i: usize) -> &Keyspace {
-        self.dbs[i].only()
+    pub fn striped_ref(&self, i: usize) -> &Db {
+        &self.dbs[i]
+    }
+
+    /// The stripe that answers for a database when a setting is read back.
+    ///
+    /// A ladder setting and an eviction policy are one number on a real server,
+    /// and the fact that every stripe of every database carries a copy of it is
+    /// ours rather than the client's problem. A write puts the same value on
+    /// every one of them, so any stripe answers for all of them and this is the
+    /// first one.
+    fn settings(&self) -> &Keyspace {
+        self.dbs[0].stripe(0)
     }
 
     /// Take a new clock reading and give it to every database.
@@ -20360,6 +20367,58 @@ mod tests {
             f.run(&[b"LRANGE", dest, b"0", b"-1"]),
             "*4\r\n$1\r\nd\r\n$1\r\nc\r\n$1\r\nb\r\n$1\r\na\r\n",
             "the destination is on a stripe of its own and got the whole answer"
+        );
+    }
+
+    /// A `CONFIG SET` reaches every stripe, so where a key landed does not
+    /// decide what shape it is stored in.
+    ///
+    /// This is the setting that would go wrong quietly. A stripe that kept the
+    /// old ladder would hold the same hash in a different encoding from the
+    /// stripe next to it, and the only thing that would ever say so is
+    /// `OBJECT ENCODING`, which is why the check is on that.
+    #[test]
+    fn a_setting_reaches_every_stripe_and_reads_back_from_any_of_them() {
+        let mut f = Fixture::striped(8);
+        let other = apart(&mut f, "h");
+        let (first, second) = (b"h".as_slice(), other.as_bytes());
+
+        assert_eq!(
+            f.run(&[b"CONFIG", b"SET", b"hash-max-listpack-entries", b"2"]),
+            "+OK\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"CONFIG", b"GET", b"hash-max-listpack-entries"]),
+            "*2\r\n$25\r\nhash-max-listpack-entries\r\n$1\r\n2\r\n",
+            "the read comes off one stripe and has to answer for all of them"
+        );
+        for key in [first, second] {
+            f.run(&[b"HSET", key, b"a", b"1", b"b", b"2"]);
+            assert_eq!(
+                f.run(&[b"OBJECT", b"ENCODING", key]),
+                "$8\r\nlistpack\r\n",
+                "two fields is still under the ladder"
+            );
+            f.run(&[b"HSET", key, b"c", b"3"]);
+            assert_eq!(
+                f.run(&[b"OBJECT", b"ENCODING", key]),
+                "$9\r\nhashtable\r\n",
+                "three fields is over it, on whichever stripe the key is on"
+            );
+        }
+
+        // And the policy, which every stripe has to agree about for the same
+        // reason: an eviction draws from one stripe at a time.
+        assert_eq!(
+            f.run(&[b"CONFIG", b"SET", b"maxmemory-policy", b"allkeys-lru"]),
+            "+OK\r\n"
+        );
+        let db = f.server.striped(0);
+        assert!(
+            db.stripes()
+                .iter()
+                .all(|s| s.policy().name() == "allkeys-lru"),
+            "a stripe kept the old policy"
         );
     }
 }

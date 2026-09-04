@@ -166,6 +166,18 @@ impl Db {
         &mut self.stripes[i]
     }
 
+    /// The same, without taking it mutably.
+    ///
+    /// What the prefetch stage uses. It warms a cache line for a key it has the
+    /// hash of and it runs before anything is executed, so it can neither take
+    /// the database mutably nor be handed the key.
+    #[inline]
+    #[must_use]
+    pub fn at_ref_hashed(&self, hash: u64) -> &Keyspace {
+        let i = self.stripe_of_hash(hash);
+        &self.stripes[i]
+    }
+
     /// The one stripe every one of `keys` is on, or `None` when they are spread
     /// over more than one.
     ///

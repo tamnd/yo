@@ -881,7 +881,14 @@ impl<S: Sink> Engine for Wire<S> {
 
     fn prefetch(&self, cmd: &Cmd, hash: u64) {
         let db = self.conns[cmd.conn as usize].session.db();
-        self.server.db_ref(db).prefetch(hash);
+        // The hash picks the stripe as well as the record, so this warms the
+        // line the command is going to read and not a line on some other
+        // stripe. It is the same hash the command itself will route on, which
+        // is why the stripe is worked out from a hash rather than from a key.
+        self.server
+            .striped_ref(db)
+            .at_ref_hashed(hash)
+            .prefetch(hash);
     }
 
     fn run(&mut self, cmd: Cmd, _hash: Option<u64>) -> yo_reactor::Flow {
