@@ -1374,7 +1374,7 @@ pub fn resolved(
             }
             "ts" => {
                 let db = session.db;
-                ts::execute(server.dbs[db].only_mut(), spec, args, out).map(|()| Flow::Continue)
+                ts::execute(&mut server.dbs[db], spec, args, out).map(|()| Flow::Continue)
             }
             // The clock is read before the database is borrowed, because every
             // stream command needs the time and it lives on the server. An
@@ -19698,6 +19698,236 @@ mod tests {
             f.run(&[b"ZCARD", dst]),
             ":2\r\n",
             "and left the destination"
+        );
+    }
+
+    /// Every time series command, on one stripe and on eight.
+    ///
+    /// Every timestamp is written out rather than left to the clock, so the two
+    /// servers are compared on the samples they hold and not on how long the
+    /// test took to get from one of them to the other.
+    #[test]
+    fn the_time_series_group_answers_the_same_however_many_stripes_there_are() {
+        let script: &[&[&[u8]]] = &[
+            &[
+                b"TS.CREATE",
+                b"ts:a",
+                b"LABELS",
+                b"sensor",
+                b"a",
+                b"room",
+                b"1",
+            ],
+            &[b"TS.CREATE", b"ts:a"],
+            &[b"TS.ALTER", b"ts:a", b"RETENTION", b"0"],
+            &[b"TS.ADD", b"ts:a", b"1000", b"1.5"],
+            &[
+                b"TS.ADD", b"ts:b", b"1000", b"2", b"LABELS", b"sensor", b"b", b"room", b"1",
+            ],
+            &[
+                b"TS.MADD", b"ts:a", b"2000", b"2.5", b"ts:b", b"2000", b"3", b"gone", b"1", b"1",
+            ],
+            &[b"TS.INCRBY", b"ts:a", b"1", b"TIMESTAMP", b"3000"],
+            &[b"TS.DECRBY", b"ts:a", b"0.5", b"TIMESTAMP", b"4000"],
+            &[b"TS.GET", b"ts:a"],
+            &[b"TS.GET", b"gone"],
+            &[b"TS.RANGE", b"ts:a", b"-", b"+"],
+            &[b"TS.RANGE", b"ts:a", b"1000", b"3000", b"COUNT", b"2"],
+            &[
+                b"TS.RANGE",
+                b"ts:a",
+                b"-",
+                b"+",
+                b"AGGREGATION",
+                b"avg",
+                b"2000",
+            ],
+            &[b"TS.REVRANGE", b"ts:a", b"-", b"+"],
+            &[b"TS.NRANGE", b"2", b"ts:a", b"ts:b", b"-", b"+"],
+            &[b"TS.NREVRANGE", b"2", b"ts:a", b"ts:b", b"-", b"+"],
+            &[b"TS.NRANGE", b"2", b"ts:a", b"gone", b"-", b"+"],
+            &[b"TS.READ", b"ts:a", b"0"],
+            &[b"TS.READ", b"ts:a", b"+"],
+            // The filters, which are the ones that have to walk every stripe.
+            &[b"TS.QUERYINDEX", b"sensor=a"],
+            &[b"TS.QUERYINDEX", b"room=1"],
+            &[b"TS.QUERYINDEX", b"room=9"],
+            &[b"TS.QUERYLABELS", b"LABELS", b"FILTER", b"room=1"],
+            &[
+                b"TS.QUERYLABELS",
+                b"VALUES",
+                b"sensor",
+                b"FILTER",
+                b"room=1",
+            ],
+            &[b"TS.MGET", b"WITHLABELS", b"FILTER", b"room=1"],
+            &[
+                b"TS.MGET",
+                b"SELECTED_LABELS",
+                b"sensor",
+                b"FILTER",
+                b"sensor=a",
+            ],
+            &[b"TS.MRANGE", b"-", b"+", b"FILTER", b"room=1"],
+            &[
+                b"TS.MREVRANGE",
+                b"-",
+                b"+",
+                b"WITHLABELS",
+                b"FILTER",
+                b"sensor=a",
+            ],
+            &[
+                b"TS.MRANGE",
+                b"-",
+                b"+",
+                b"FILTER",
+                b"room=1",
+                b"GROUPBY",
+                b"room",
+                b"REDUCE",
+                b"max",
+            ],
+            &[b"TS.INFO", b"ts:a"],
+            // And a rule, which is the one thing here that names two keys.
+            &[
+                b"TS.CREATERULE",
+                b"ts:a",
+                b"ts:down",
+                b"AGGREGATION",
+                b"avg",
+                b"1000",
+            ],
+            &[b"TS.CREATE", b"ts:down"],
+            &[
+                b"TS.CREATERULE",
+                b"ts:a",
+                b"ts:down",
+                b"AGGREGATION",
+                b"avg",
+                b"1000",
+            ],
+            &[b"TS.ADD", b"ts:a", b"5000", b"4"],
+            &[b"TS.ADD", b"ts:a", b"6000", b"5"],
+            &[b"TS.RANGE", b"ts:down", b"-", b"+"],
+            &[b"TS.GET", b"ts:down", b"LATEST"],
+            &[b"TS.INFO", b"ts:down"],
+            &[b"TS.DEL", b"ts:a", b"5000", b"6000"],
+            &[b"TS.RANGE", b"ts:down", b"-", b"+"],
+            &[b"TS.DELETERULE", b"ts:a", b"ts:down"],
+            &[b"TS.DELETERULE", b"ts:a", b"ts:down"],
+            &[b"TS.DEL", b"ts:a", b"0", b"1000"],
+            // And the errors.
+            &[b"SET", b"plain", b"v"],
+            &[b"TS.ADD", b"plain", b"1", b"1"],
+            &[b"TS.GET", b"plain"],
+            &[b"TS.READ", b"plain", b"0"],
+            &[b"TS.ALTER", b"gone", b"RETENTION", b"0"],
+            &[b"TS.RANGE", b"gone", b"-", b"+"],
+            &[b"TS.INFO", b"gone"],
+        ];
+
+        let mut one = Fixture::new();
+        let mut many = Fixture::striped(8);
+        for parts in script {
+            let a = one.run(parts);
+            let b = many.run(parts);
+            assert_eq!(a, b, "{}", String::from_utf8_lossy(parts[0]));
+        }
+    }
+
+    /// A compaction rule whose two ends are on two stripes.
+    ///
+    /// This is the one thing in the family that walks from a key to another key,
+    /// and it walks it in both directions: a sample on the source closes a
+    /// bucket on the destination, a `LATEST` read on the destination folds the
+    /// bucket the source is still filling, and a delete on the source rewrites
+    /// what the destination already held. The same script is run against a
+    /// server one stripe wide, where the two keys share a store, and against one
+    /// eight stripes wide, where they do not.
+    #[test]
+    fn a_compaction_rule_across_stripes_reaches_both_ends() {
+        let mut many = Fixture::striped(8);
+        let other = apart(&mut many, "src");
+        let (src, dst) = (b"src".as_slice(), other.as_bytes());
+        let mut one = Fixture::new();
+        let mut both = |parts: &[&[u8]]| {
+            let a = one.run(parts);
+            let b = many.run(parts);
+            assert_eq!(a, b, "{}", String::from_utf8_lossy(parts[0]));
+            a
+        };
+
+        both(&[b"TS.CREATE", src]);
+        both(&[b"TS.CREATE", dst]);
+        assert_eq!(
+            both(&[b"TS.CREATERULE", src, dst, b"AGGREGATION", b"avg", b"1000"]),
+            "+OK\r\n"
+        );
+        both(&[b"TS.ADD", src, b"1000", b"1"]);
+        both(&[b"TS.ADD", src, b"1500", b"3"]);
+        // The bucket the source is filling is not written down yet, and asking
+        // for it works it out off the source.
+        assert_eq!(both(&[b"TS.RANGE", dst, b"-", b"+"]), "*0\r\n");
+        let open = both(&[b"TS.GET", dst, b"LATEST"]);
+        assert!(open.contains(":1000"), "the open bucket is folded: {open}");
+
+        // A sample past the bucket closes it, which is the write that has to
+        // land on the other stripe.
+        both(&[b"TS.ADD", src, b"2000", b"5"]);
+        let got = both(&[b"TS.RANGE", dst, b"-", b"+"]);
+        assert!(got.starts_with("*1\r\n"), "the bucket was written: {got}");
+        assert!(got.contains(":1000"), "{got}");
+
+        // And a delete on the source takes it away again.
+        both(&[b"TS.DEL", src, b"1000", b"1999"]);
+        assert_eq!(both(&[b"TS.RANGE", dst, b"-", b"+"]), "*0\r\n");
+
+        // Both ends still know about each other, and the link comes apart from
+        // the source.
+        assert!(
+            both(&[b"TS.INFO", dst]).contains("src"),
+            "the source is named"
+        );
+        assert_eq!(both(&[b"TS.DELETERULE", src, dst]), "+OK\r\n");
+        assert_eq!(
+            both(&[b"TS.DELETERULE", src, dst]),
+            "-ERR TSDB: compaction rule does not exist\r\n"
+        );
+    }
+
+    /// A label filter takes the series it names wherever they landed.
+    #[test]
+    fn a_label_query_across_stripes_finds_every_series() {
+        let names: [&[u8]; 6] = [b"q:1", b"q:2", b"q:3", b"q:4", b"q:5", b"q:6"];
+        let mut many = Fixture::striped(8);
+        let mut homes: Vec<usize> = names
+            .iter()
+            .map(|name| many.server.striped(0).stripe_of(name))
+            .collect();
+        homes.sort_unstable();
+        homes.dedup();
+        assert!(homes.len() > 1, "the six keys are not all on one stripe");
+
+        let mut one = Fixture::new();
+        let mut both = |parts: &[&[u8]]| {
+            let a = one.run(parts);
+            let b = many.run(parts);
+            assert_eq!(a, b, "{}", String::from_utf8_lossy(parts[0]));
+            a
+        };
+        for name in &names {
+            both(&[b"TS.CREATE", name, b"LABELS", b"room", b"1"]);
+            both(&[b"TS.ADD", name, b"1000", b"1"]);
+        }
+
+        let got = both(&[b"TS.QUERYINDEX", b"room=1"]);
+        assert!(got.starts_with("*6\r\n"), "every series answered: {got}");
+        assert!(both(&[b"TS.MGET", b"FILTER", b"room=1"]).starts_with("*6\r\n"));
+        assert!(both(&[b"TS.MRANGE", b"-", b"+", b"FILTER", b"room=1"]).starts_with("*6\r\n"));
+        assert_eq!(
+            both(&[b"TS.QUERYLABELS", b"LABELS", b"FILTER", b"room=1"]),
+            "*1\r\n$4\r\nroom\r\n"
         );
     }
 }

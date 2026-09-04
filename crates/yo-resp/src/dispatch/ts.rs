@@ -285,7 +285,7 @@
 
 use yo_common::num::{DOUBLE_MAX, parse_f64, parse_i64, write_dragonbox};
 use yo_common::{Code, Error, Result};
-use yo_kv::{Foreign, KeyCursor, Keyspace, Kind};
+use yo_kv::{Db, Foreign, KeyCursor, Kind};
 use yo_series::{
     Agg, Buckets, Encoding, Policy, Query, Refused, Rows, Sample, Series, Stamp, Unread,
     bucket_start,
@@ -532,7 +532,14 @@ impl Foreign for TsBody {
     }
 }
 
-pub(super) fn execute(db: &mut Keyspace, spec: &Spec, args: Args<'_>, out: &mut Out) -> Result<()> {
+/// Every command in the family, given the whole database.
+///
+/// Nothing below reaches a key on its own. The three helpers at the bottom of
+/// the file are the only way into the keyspace, and each of them finds the
+/// stripe its key is on and reads that one, so a command naming several series
+/// touches a stripe per series and a rule linking two keys works whether or not
+/// they landed on the same one.
+pub(super) fn execute(db: &mut Db, spec: &Spec, args: Args<'_>, out: &mut Out) -> Result<()> {
     match spec.name {
         "ts.create" => create(db, &args, out),
         "ts.alter" => alter(db, &args, out),
@@ -561,18 +568,18 @@ pub(super) fn execute(db: &mut Keyspace, spec: &Spec, args: Args<'_>, out: &mut 
 
 /// `TS.CREATE key [RETENTION n] [ENCODING e] [CHUNK_SIZE n] [DUPLICATE_POLICY p]
 /// [IGNORE t v] [LABELS name value ...]`.
-fn create(db: &mut Keyspace, args: &Args<'_>, out: &mut Out) -> Result<()> {
+fn create(db: &mut Db, args: &Args<'_>, out: &mut Out) -> Result<()> {
     let opts = match options(args) {
         Ok(opts) => opts,
         Err(bad) => return said(bad, "ts.create", out),
     };
     let key = args.get(1);
-    if db.kind_of(key).is_some() {
+    if db.at(key).kind_of(key).is_some() {
         return say(out, EXISTS);
     }
     let mut s = Series::new();
     apply(&mut s, opts);
-    db.put_foreign(key, Box::new(TsBody { s }));
+    db.at(key).put_foreign(key, Box::new(TsBody { s }));
     out.ok();
     Ok(())
 }
@@ -583,7 +590,7 @@ fn create(db: &mut Keyspace, args: &Args<'_>, out: &mut Out) -> Result<()> {
 /// An encoding is read and then thrown away, because a series that already holds
 /// samples cannot be told to store them a different way and the module does not
 /// try. Everything that was not named is left as it was.
-fn alter(db: &mut Keyspace, args: &Args<'_>, out: &mut Out) -> Result<()> {
+fn alter(db: &mut Db, args: &Args<'_>, out: &mut Out) -> Result<()> {
     let mut opts = match options(args) {
         Ok(opts) => opts,
         Err(bad) => return said(bad, "ts.alter", out),
@@ -603,7 +610,7 @@ fn alter(db: &mut Keyspace, args: &Args<'_>, out: &mut Out) -> Result<()> {
 /// On a series that is already there the only option that means anything is
 /// `ON_DUPLICATE`, and the rest are read past. That is why a `DUPLICATE_POLICY`
 /// on a `TS.ADD` against a key that exists does nothing at all.
-fn add(db: &mut Keyspace, args: &Args<'_>, out: &mut Out) -> Result<()> {
+fn add(db: &mut Db, args: &Args<'_>, out: &mut Out) -> Result<()> {
     let key = args.get(1);
     let Some(value) = number(args.get(3)) else {
         return say(out, BAD_VALUE);
@@ -612,14 +619,14 @@ fn add(db: &mut Keyspace, args: &Args<'_>, out: &mut Out) -> Result<()> {
         Ok(at) => at,
         Err(msg) => return say(out, msg),
     };
-    let over = if db.kind_of(key).is_none() {
+    let over = if db.at(key).kind_of(key).is_none() {
         let opts = match options(args) {
             Ok(opts) => opts,
             Err(bad) => return said(bad, "ts.add", out),
         };
         let mut s = Series::new();
         apply(&mut s, opts);
-        db.put_foreign(key, Box::new(TsBody { s }));
+        db.at(key).put_foreign(key, Box::new(TsBody { s }));
         None
     } else {
         if write(db, key).is_err() {
@@ -647,7 +654,7 @@ fn add(db: &mut Keyspace, args: &Args<'_>, out: &mut Out) -> Result<()> {
 /// after it, so this is the only command in the family whose reply can hold both
 /// timestamps and errors. It creates nothing: a key that is not already a series
 /// is an error in its slot.
-fn madd(db: &mut Keyspace, args: &Args<'_>, out: &mut Out) -> Result<()> {
+fn madd(db: &mut Db, args: &Args<'_>, out: &mut Out) -> Result<()> {
     if args.len() < 4 || !(args.len() - 1).is_multiple_of(3) {
         return Err(args::wrong_arity("ts.madd"));
     }
@@ -689,10 +696,10 @@ fn madd(db: &mut Keyspace, args: &Args<'_>, out: &mut Out) -> Result<()> {
 /// behind that is an error rather than a backfill. The sample goes in under the
 /// last policy whatever the series says, which is what makes two of these on one
 /// timestamp add up rather than collide.
-fn incr(db: &mut Keyspace, args: &Args<'_>, out: &mut Out, up: bool) -> Result<()> {
+fn incr(db: &mut Db, args: &Args<'_>, out: &mut Out, up: bool) -> Result<()> {
     let key = args.get(1);
     let name = if up { "ts.incrby" } else { "ts.decrby" };
-    let exists = db.kind_of(key).is_some();
+    let exists = db.at(key).kind_of(key).is_some();
     if exists {
         // A key holding something else is `WRONGTYPE` here rather than the
         // sentence `TS.ADD` gives, and it is answered before the number is even
@@ -728,7 +735,7 @@ fn incr(db: &mut Keyspace, args: &Args<'_>, out: &mut Out, up: bool) -> Result<(
         };
         let mut s = Series::new();
         apply(&mut s, opts);
-        db.put_foreign(key, Box::new(TsBody { s }));
+        db.at(key).put_foreign(key, Box::new(TsBody { s }));
     }
     let body = write(db, key)?.expect("the series is there by now");
     let last = body.s.last_sample();
@@ -750,7 +757,7 @@ fn incr(db: &mut Keyspace, args: &Args<'_>, out: &mut Out, up: bool) -> Result<(
 
 /// `TS.DEL key from to`, both ends included, which answers how many samples
 /// went.
-fn del(db: &mut Keyspace, args: &Args<'_>, out: &mut Out) -> Result<()> {
+fn del(db: &mut Db, args: &Args<'_>, out: &mut Out) -> Result<()> {
     let Some(from) = span(args.get(2), b"-", 0) else {
         return say(out, BAD_FROM);
     };
@@ -775,7 +782,7 @@ fn del(db: &mut Keyspace, args: &Args<'_>, out: &mut Out) -> Result<()> {
 /// The three checks run in an order of their own: a fourth word is an arity
 /// error before the key is looked at, the key is resolved before the third word
 /// is read, and only then is a third word that is not `LATEST` complained about.
-fn get(db: &mut Keyspace, args: &Args<'_>, out: &mut Out) -> Result<()> {
+fn get(db: &mut Db, args: &Args<'_>, out: &mut Out) -> Result<()> {
     if args.len() > 3 {
         return Err(args::wrong_arity("ts.get"));
     }
@@ -810,7 +817,7 @@ fn get(db: &mut Keyspace, args: &Args<'_>, out: &mut Out) -> Result<()> {
 /// key that is not there says so whatever else is wrong with the command. After
 /// that the two ends of the span are read, and only then the options, in the
 /// order their errors come out in.
-fn range(db: &mut Keyspace, args: &Args<'_>, out: &mut Out, reverse: bool) -> Result<()> {
+fn range(db: &mut Db, args: &Args<'_>, out: &mut Out, reverse: bool) -> Result<()> {
     let name = if reverse { "ts.revrange" } else { "ts.range" };
     if read(db, args.get(1))?.is_none() {
         return say(out, MISSING);
@@ -846,7 +853,7 @@ fn range(db: &mut Keyspace, args: &Args<'_>, out: &mut Out, reverse: bool) -> Re
 /// span, then the rest of the options, then the keys. Only the names come out in
 /// front of the span, which is why they are read here and then read again below
 /// with everything else.
-fn nrange(db: &mut Keyspace, args: &Args<'_>, out: &mut Out, reverse: bool) -> Result<()> {
+fn nrange(db: &mut Db, args: &Args<'_>, out: &mut Out, reverse: bool) -> Result<()> {
     let name = if reverse { "ts.nrevrange" } else { "ts.nrange" };
     let Some(keys) = parse_i64(args.get(1))
         .filter(|&n| n > 0)
@@ -952,7 +959,7 @@ fn join(taken: &[Rows]) -> Rows {
 /// else answers the server's own bare `WRONGTYPE` rather than the module's
 /// prefixed one, because this command lets the server report the type where the
 /// others write their own sentence about it.
-fn tail(db: &mut Keyspace, args: &Args<'_>, out: &mut Out) -> Result<()> {
+fn tail(db: &mut Db, args: &Args<'_>, out: &mut Out) -> Result<()> {
     if args.len() != 3 {
         return Err(args::wrong_arity("ts.read"));
     }
@@ -1458,13 +1465,18 @@ fn rules_in(args: &Args<'_>, from: usize, to: usize) -> core::result::Result<Vec
 /// is not there any more. The walk cannot drift because there is nothing for it
 /// to drift from, and it only ever touches the keys holding a foreign body,
 /// which on a keyspace that is mostly strings and hashes is a small part of it.
-fn chosen(db: &mut Keyspace, rules: &[Rule]) -> Vec<Vec<u8>> {
+///
+/// The walk covers every stripe, because a filter takes the series it names
+/// wherever they landed, and the names come back sorted so a database that is
+/// one stripe wide and one that is many answer in the same order.
+fn chosen(db: &mut Db, rules: &[Rule]) -> Vec<Vec<u8>> {
     let mut names = Vec::new();
     db.scan(KeyCursor::START, usize::MAX, Some(Kind::Foreign), |key| {
         names.push(key.to_vec());
     });
     names.retain(|name| {
-        db.foreign(name)
+        db.at(name)
+            .foreign(name)
             .ok()
             .flatten()
             .and_then(<dyn Foreign>::downcast_ref::<TsBody>)
@@ -1475,7 +1487,7 @@ fn chosen(db: &mut Keyspace, rules: &[Rule]) -> Vec<Vec<u8>> {
 }
 
 /// `TS.QUERYINDEX filter [filter ...]`, the key names a filter list takes.
-fn queryindex(db: &mut Keyspace, args: &Args<'_>, out: &mut Out) -> Result<()> {
+fn queryindex(db: &mut Db, args: &Args<'_>, out: &mut Out) -> Result<()> {
     let rules = match rules(args, 1) {
         Ok(rules) => rules,
         Err(bad) => return said(bad, "ts.queryindex", out),
@@ -1495,7 +1507,7 @@ fn queryindex(db: &mut Keyspace, args: &Args<'_>, out: &mut Out) -> Result<()> {
 /// This is the one command in the family where a filter list is optional, and a
 /// missing one means every series rather than none, so the rule about naming at
 /// least one thing to take does not apply until a `FILTER` is written down.
-fn querylabels(db: &mut Keyspace, args: &Args<'_>, out: &mut Out) -> Result<()> {
+fn querylabels(db: &mut Db, args: &Args<'_>, out: &mut Out) -> Result<()> {
     let values = if args::is(args.get(1), b"LABELS") {
         false
     } else if args::is(args.get(1), b"VALUES") {
@@ -1581,7 +1593,7 @@ enum Wearing {
 /// `FILTER` is not optional and its absence is an arity error rather than a
 /// syntax one, however many words the command has, because the module counts the
 /// arguments it needed after it has found the keyword rather than before.
-fn mget(db: &mut Keyspace, args: &Args<'_>, out: &mut Out) -> Result<()> {
+fn mget(db: &mut Db, args: &Args<'_>, out: &mut Out) -> Result<()> {
     let Some(filter) = find(args, b"FILTER") else {
         return Err(args::wrong_arity("ts.mget"));
     };
@@ -1759,7 +1771,7 @@ const REDUCERS: &[Agg] = &[
 /// everything about buckets, alignment and the two sample filters is already
 /// settled by the time this starts. What is new is the filter list in front of
 /// it and the group behind it.
-fn mrange(db: &mut Keyspace, args: &Args<'_>, out: &mut Out, reverse: bool) -> Result<()> {
+fn mrange(db: &mut Db, args: &Args<'_>, out: &mut Out, reverse: bool) -> Result<()> {
     let name = if reverse { "ts.mrevrange" } else { "ts.mrange" };
     // The order the checks happen in, which is the order their errors come out
     // in and is not the order the words are written in.
@@ -2034,7 +2046,7 @@ fn columns(out: &mut Out, rows: &Rows) {
 /// are written in. The bucket width is read before the reduction name, the
 /// reduction name before the width is compared against zero, and all of that
 /// before either key is looked up.
-fn createrule(db: &mut Keyspace, args: &Args<'_>, out: &mut Out) -> Result<()> {
+fn createrule(db: &mut Db, args: &Args<'_>, out: &mut Out) -> Result<()> {
     if !matches!(args.len(), 6 | 7) || !args::is(args.get(3), b"AGGREGATION") {
         return Err(args::wrong_arity("ts.createrule"));
     }
@@ -2097,7 +2109,7 @@ fn createrule(db: &mut Keyspace, args: &Args<'_>, out: &mut Out) -> Result<()> {
 }
 
 /// `TS.DELETERULE source dest`, which takes the link apart from both ends.
-fn deleterule(db: &mut Keyspace, args: &Args<'_>, out: &mut Out) -> Result<()> {
+fn deleterule(db: &mut Db, args: &Args<'_>, out: &mut Out) -> Result<()> {
     if args.len() != 3 {
         return Err(args::wrong_arity("ts.deleterule"));
     }
@@ -2123,7 +2135,7 @@ fn deleterule(db: &mut Keyspace, args: &Args<'_>, out: &mut Out) -> Result<()> {
 /// lost one of its ends is found rather than reported. Every command that reads
 /// a link or writes one asks for this first, which is enough for a client to
 /// never see a rule that has stopped meaning anything.
-fn prune(db: &mut Keyspace, key: &[u8]) -> Result<()> {
+fn prune(db: &mut Db, key: &[u8]) -> Result<()> {
     // A key holding something else has no rules to lose and is not this
     // function's business to complain about, since the command that asked has
     // its own order to complain in.
@@ -2158,7 +2170,7 @@ fn prune(db: &mut Keyspace, key: &[u8]) -> Result<()> {
 }
 
 /// Whether the series under `key` is a destination fed by `source`.
-fn points_at(db: &mut Keyspace, key: &[u8], source: &[u8]) -> Result<bool> {
+fn points_at(db: &mut Db, key: &[u8], source: &[u8]) -> Result<bool> {
     let body = match read(db, key) {
         Ok(body) => body,
         // A key that has been replaced by something else is not a destination
@@ -2169,7 +2181,7 @@ fn points_at(db: &mut Keyspace, key: &[u8], source: &[u8]) -> Result<bool> {
 }
 
 /// Whether the series under `key` holds a rule writing into `dest`.
-fn feeds(db: &mut Keyspace, key: &[u8], dest: &[u8]) -> Result<bool> {
+fn feeds(db: &mut Db, key: &[u8], dest: &[u8]) -> Result<bool> {
     let body = match read(db, key) {
         Ok(body) => body,
         Err(_) => return Ok(false),
@@ -2225,7 +2237,7 @@ fn fold(s: &Series, rule: &Compaction, at: i64, from: i64) -> Option<f64> {
 /// sample landing behind the newest one is the other half of this: the bucket it
 /// falls in is closed already, so it is worked out again from everything the
 /// source holds there and written over whatever the destination had.
-fn feed(db: &mut Keyspace, key: &[u8], at: i64, before: Option<i64>) -> Result<()> {
+fn feed(db: &mut Db, key: &[u8], at: i64, before: Option<i64>) -> Result<()> {
     for rule in rules_of(db, key)? {
         let Some(body) = read(db, key)? else {
             return Ok(());
@@ -2290,7 +2302,7 @@ fn feed(db: &mut Keyspace, key: &[u8], at: i64, before: Option<i64>) -> Result<(
 /// and started again over everything the source has left there, so a fold that
 /// had been counting only the samples the rule was given goes back to counting
 /// the lot.
-fn undo(db: &mut Keyspace, key: &[u8], from: i64, to: i64) -> Result<()> {
+fn undo(db: &mut Db, key: &[u8], from: i64, to: i64) -> Result<()> {
     for rule in rules_of(db, key)? {
         let Some(body) = read(db, key)? else {
             return Ok(());
@@ -2346,7 +2358,7 @@ fn undo(db: &mut Keyspace, key: &[u8], from: i64, to: i64) -> Result<()> {
 }
 
 /// The rules on `key`, with the ones whose destination is gone already dropped.
-fn rules_of(db: &mut Keyspace, key: &[u8]) -> Result<Vec<Compaction>> {
+fn rules_of(db: &mut Db, key: &[u8]) -> Result<Vec<Compaction>> {
     prune(db, key)?;
     Ok(read(db, key)?.map_or_else(Vec::new, |body| body.s.rules().to_vec()))
 }
@@ -2357,7 +2369,7 @@ fn rules_of(db: &mut Keyspace, key: &[u8]) -> Result<Vec<Compaction>> {
 /// It is only there on a series that is the destination of a rule whose source
 /// has given it a sample since the rule was made. Everywhere else `LATEST` means
 /// nothing at all and the read answers what it would have answered without it.
-fn open_bucket(db: &mut Keyspace, key: &[u8]) -> Result<Option<Sample>> {
+fn open_bucket(db: &mut Db, key: &[u8]) -> Result<Option<Sample>> {
     prune(db, key)?;
     let Some(body) = read(db, key)? else {
         return Ok(None);
@@ -2379,7 +2391,7 @@ fn open_bucket(db: &mut Keyspace, key: &[u8]) -> Result<Option<Sample>> {
 
 /// `TS.INFO key`, which is fourteen fields about the series and takes no field
 /// name.
-fn info(db: &mut Keyspace, args: &Args<'_>, out: &mut Out) -> Result<()> {
+fn info(db: &mut Db, args: &Args<'_>, out: &mut Out) -> Result<()> {
     let resp3 = out.proto().is_resp3();
     prune(db, args.get(1))?;
     let Some(body) = read(db, args.get(1))? else {
@@ -2675,7 +2687,7 @@ fn span(arg: &[u8], open: &[u8], edge: i64) -> Option<i64> {
 
 /// A timestamp argument, which is a whole number of milliseconds or a star for
 /// whenever the server thinks it is now.
-fn moment(db: &Keyspace, arg: &[u8]) -> core::result::Result<i64, &'static [u8]> {
+fn moment(db: &Db, arg: &[u8]) -> core::result::Result<i64, &'static [u8]> {
     if arg == b"*" {
         return Ok(now(db));
     }
@@ -2689,8 +2701,8 @@ fn moment(db: &Keyspace, arg: &[u8]) -> core::result::Result<i64, &'static [u8]>
 }
 
 /// The server's clock, as a timestamp.
-fn now(db: &Keyspace) -> i64 {
-    db.clock().now_ms() as i64
+fn now(db: &Db) -> i64 {
+    db.now_ms() as i64
 }
 
 /// A sample value, in the grammar the module's own reader accepts.
@@ -2771,8 +2783,12 @@ fn wrong_kind() -> Error {
 }
 
 /// The series under `key` for writing, or `None` if the key is not there.
-fn write<'d>(db: &'d mut Keyspace, key: &[u8]) -> Result<Option<&'d mut TsBody>> {
-    match db.foreign_mut(key) {
+///
+/// The stripe is worked out from the key every time rather than passed in,
+/// which costs a hash and is what lets the rest of the module go on naming keys
+/// without knowing there are stripes at all.
+fn write<'d>(db: &'d mut Db, key: &[u8]) -> Result<Option<&'d mut TsBody>> {
+    match db.at(key).foreign_mut(key) {
         Ok(Some(body)) => match body.downcast_mut::<TsBody>() {
             Some(body) => Ok(Some(body)),
             None => Err(wrong_kind()),
@@ -2786,8 +2802,8 @@ fn write<'d>(db: &'d mut Keyspace, key: &[u8]) -> Result<Option<&'d mut TsBody>>
 /// The same again, with the server's own bare `WRONGTYPE` for a key holding
 /// something else rather than the module's prefixed sentence, which is what
 /// `TS.READ` answers and the only place in the family that does.
-fn bare_read<'d>(db: &'d mut Keyspace, key: &[u8]) -> Result<Option<&'d TsBody>> {
-    match db.foreign(key)? {
+fn bare_read<'d>(db: &'d mut Db, key: &[u8]) -> Result<Option<&'d TsBody>> {
+    match db.at(key).foreign(key)? {
         Some(body) => match body.downcast_ref::<TsBody>() {
             Some(body) => Ok(Some(body)),
             None => Err(yo_kv::keyspace::wrong_type()),
@@ -2797,8 +2813,8 @@ fn bare_read<'d>(db: &'d mut Keyspace, key: &[u8]) -> Result<Option<&'d TsBody>>
 }
 
 /// The same, for reading.
-fn read<'d>(db: &'d mut Keyspace, key: &[u8]) -> Result<Option<&'d TsBody>> {
-    match db.foreign(key) {
+fn read<'d>(db: &'d mut Db, key: &[u8]) -> Result<Option<&'d TsBody>> {
+    match db.at(key).foreign(key) {
         Ok(Some(body)) => match body.downcast_ref::<TsBody>() {
             Some(body) => Ok(Some(body)),
             None => Err(wrong_kind()),
