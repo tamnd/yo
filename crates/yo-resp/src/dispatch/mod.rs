@@ -15181,6 +15181,437 @@ mod tests {
         );
     }
 
+    /// Two series with an overlap and a gap each, plus a third holding nothing,
+    /// which is what the joined reads are measured against.
+    fn joined() -> Fixture {
+        let mut f = Fixture::new();
+        f.run(&[b"TS.CREATE", b"z"]);
+        for (at, v) in [
+            (b"10".as_slice(), b"1".as_slice()),
+            (b"20", b"2"),
+            (b"40", b"4"),
+            (b"50", b"5"),
+        ] {
+            f.run(&[b"TS.ADD", b"x", at, v]);
+        }
+        for (at, v) in [
+            (b"20".as_slice(), b"20".as_slice()),
+            (b"30", b"30"),
+            (b"50", b"50"),
+            (b"60", b"60"),
+        ] {
+            f.run(&[b"TS.ADD", b"y", at, v]);
+        }
+        f
+    }
+
+    /// The joined read lines its keys up on the timestamp and writes a row as
+    /// the timestamp and then a nested array of the columns, which is the one
+    /// shape in the family that is not the flat pair.
+    #[test]
+    fn an_nrange_joins_its_keys_on_the_timestamp() {
+        let mut f = joined();
+        // One key still nests, so the shape does not depend on the count.
+        assert_eq!(
+            f.run(&[b"TS.NRANGE", b"1", b"x", b"-", b"+"]),
+            "*4\r\n*2\r\n:10\r\n*1\r\n+1\r\n*2\r\n:20\r\n*1\r\n+2\r\n\
+             *2\r\n:40\r\n*1\r\n+4\r\n*2\r\n:50\r\n*1\r\n+5\r\n"
+        );
+        // A key with no reading where another key has one writes NaN there.
+        assert_eq!(
+            f.run(&[b"TS.NRANGE", b"2", b"x", b"y", b"-", b"+"]),
+            "*6\r\n*2\r\n:10\r\n*2\r\n+1\r\n+NaN\r\n\
+             *2\r\n:20\r\n*2\r\n+2\r\n+20\r\n\
+             *2\r\n:30\r\n*2\r\n+NaN\r\n+30\r\n\
+             *2\r\n:40\r\n*2\r\n+4\r\n+NaN\r\n\
+             *2\r\n:50\r\n*2\r\n+5\r\n+50\r\n\
+             *2\r\n:60\r\n*2\r\n+NaN\r\n+60\r\n"
+        );
+        // A series holding nothing is a column of NaN and never a row of its
+        // own, and the same key twice answers twice.
+        assert_eq!(
+            f.run(&[b"TS.NRANGE", b"2", b"x", b"z", b"20", b"40"]),
+            "*2\r\n*2\r\n:20\r\n*2\r\n+2\r\n+NaN\r\n*2\r\n:40\r\n*2\r\n+4\r\n+NaN\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"TS.NRANGE", b"2", b"x", b"x", b"40", b"50"]),
+            "*2\r\n*2\r\n:40\r\n*2\r\n+4\r\n+4\r\n*2\r\n:50\r\n*2\r\n+5\r\n+5\r\n"
+        );
+        // COUNT is applied to the joined rows and not to each key, so backwards
+        // it gives the newest joined row rather than the newest of each.
+        assert_eq!(
+            f.run(&[
+                b"TS.NREVRANGE",
+                b"2",
+                b"x",
+                b"y",
+                b"-",
+                b"+",
+                b"COUNT",
+                b"1"
+            ]),
+            "*1\r\n*2\r\n:60\r\n*2\r\n+NaN\r\n+60\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"TS.NRANGE", b"2", b"x", b"y", b"-", b"+", b"COUNT", b"1"]),
+            "*1\r\n*2\r\n:10\r\n*2\r\n+1\r\n+NaN\r\n"
+        );
+        // The two sample filters are settled a key at a time, before the join.
+        assert_eq!(
+            f.run(&[
+                b"TS.NRANGE",
+                b"2",
+                b"x",
+                b"y",
+                b"-",
+                b"+",
+                b"FILTER_BY_VALUE",
+                b"2",
+                b"30"
+            ]),
+            "*4\r\n*2\r\n:20\r\n*2\r\n+2\r\n+20\r\n\
+             *2\r\n:30\r\n*2\r\n+NaN\r\n+30\r\n\
+             *2\r\n:40\r\n*2\r\n+4\r\n+NaN\r\n\
+             *2\r\n:50\r\n*2\r\n+5\r\n+NaN\r\n"
+        );
+    }
+
+    /// The aggregation on a joined read names one reduction a key and then the
+    /// one bucket width, and each name may be a comma list, so a row can be
+    /// wider than the key count.
+    #[test]
+    fn an_nrange_aggregation_names_one_reduction_a_key() {
+        let mut f = joined();
+        assert_eq!(
+            f.run(&[
+                b"TS.NRANGE",
+                b"2",
+                b"x",
+                b"y",
+                b"-",
+                b"+",
+                b"AGGREGATION",
+                b"sum",
+                b"sum",
+                b"20"
+            ]),
+            "*4\r\n*2\r\n:0\r\n*2\r\n+1\r\n+NaN\r\n\
+             *2\r\n:20\r\n*2\r\n+2\r\n+50\r\n\
+             *2\r\n:40\r\n*2\r\n+9\r\n+50\r\n\
+             *2\r\n:60\r\n*2\r\n+NaN\r\n+60\r\n"
+        );
+        // A comma list on the first key widens the row to three columns.
+        assert_eq!(
+            f.run(&[
+                b"TS.NRANGE",
+                b"2",
+                b"x",
+                b"y",
+                b"-",
+                b"+",
+                b"AGGREGATION",
+                b"sum,count",
+                b"avg",
+                b"20"
+            ]),
+            "*4\r\n*2\r\n:0\r\n*3\r\n+1\r\n+1\r\n+NaN\r\n\
+             *2\r\n:20\r\n*3\r\n+2\r\n+1\r\n+25\r\n\
+             *2\r\n:40\r\n*3\r\n+9\r\n+2\r\n+50\r\n\
+             *2\r\n:60\r\n*3\r\n+NaN\r\n+NaN\r\n+60\r\n"
+        );
+        // Everything behind the width moves along with it, so BUCKETTIMESTAMP
+        // sits one or two past the width whatever the key count is.
+        assert_eq!(
+            f.run(&[
+                b"TS.NRANGE",
+                b"2",
+                b"x",
+                b"y",
+                b"-",
+                b"+",
+                b"AGGREGATION",
+                b"avg",
+                b"sum",
+                b"100",
+                b"EMPTY",
+                b"BUCKETTIMESTAMP",
+                b"end"
+            ]),
+            "*1\r\n*2\r\n:100\r\n*2\r\n+3\r\n+160\r\n"
+        );
+        // A COUNT landing in one of the name slots is a reduction name and not
+        // the keyword, and the read then has no count at all.
+        assert_eq!(
+            f.run(&[
+                b"TS.NRANGE",
+                b"2",
+                b"x",
+                b"y",
+                b"-",
+                b"+",
+                b"AGGREGATION",
+                b"avg",
+                b"COUNT",
+                b"100"
+            ]),
+            "*1\r\n*2\r\n:0\r\n*2\r\n+3\r\n+4\r\n"
+        );
+    }
+
+    /// The sentences a joined read answers when it does not add up, which are
+    /// the module's own and come out in the module's own order.
+    #[test]
+    fn an_nrange_says_what_the_module_says_when_it_does_not_add_up() {
+        let mut f = joined();
+        f.run(&[b"SET", b"str", b"hi"]);
+        let bad_keys = "-ERR TSDB: numkeys must be a positive integer\r\n";
+        let numkeys = "-ERR TSDB: the number of AGGREGATION arguments \
+                       must be equal to numkeys\r\n";
+        let cases: &[(&[&[u8]], &str)] = &[
+            (&[b"TS.NRANGE", b"0", b"x", b"-", b"+"], bad_keys),
+            (&[b"TS.NRANGE", b"-1", b"x", b"-", b"+"], bad_keys),
+            (&[b"TS.NRANGE", b"abc", b"x", b"-", b"+"], bad_keys),
+            // Not enough words behind the count for the keys and both ends of
+            // the span, which is an arity error however many keys were named.
+            (
+                &[b"TS.NRANGE", b"2", b"x", b"-", b"+"],
+                "-ERR wrong number of arguments for 'ts.nrange' command\r\n",
+            ),
+            (
+                &[b"TS.NRANGE", b"99", b"x", b"-", b"+"],
+                "-ERR wrong number of arguments for 'ts.nrange' command\r\n",
+            ),
+            // The reduction names are read before the two ends of the span,
+            // which no other option is.
+            (
+                &[
+                    b"TS.NRANGE",
+                    b"2",
+                    b"x",
+                    b"y",
+                    b"abc",
+                    b"+",
+                    b"AGGREGATION",
+                    b"nope",
+                    b"sum",
+                    b"100",
+                ],
+                "-ERR TSDB: Unknown aggregation type\r\n",
+            ),
+            (
+                &[b"TS.NRANGE", b"2", b"x", b"y", b"abc", b"+"],
+                "-ERR TSDB: wrong fromTimestamp\r\n",
+            ),
+            (
+                &[b"TS.NRANGE", b"2", b"x", b"y", b"-", b"abc"],
+                "-ERR TSDB: wrong toTimestamp\r\n",
+            ),
+            // A name slot that is missing or holds a number is the count
+            // sentence, and a width slot that is itself a reduction name is
+            // that sentence as well.
+            (
+                &[
+                    b"TS.NRANGE",
+                    b"2",
+                    b"x",
+                    b"y",
+                    b"-",
+                    b"+",
+                    b"AGGREGATION",
+                    b"avg",
+                ],
+                numkeys,
+            ),
+            (
+                &[
+                    b"TS.NRANGE",
+                    b"2",
+                    b"x",
+                    b"y",
+                    b"-",
+                    b"+",
+                    b"AGGREGATION",
+                    b"100",
+                    b"sum",
+                    b"100",
+                ],
+                numkeys,
+            ),
+            (
+                &[
+                    b"TS.NRANGE",
+                    b"2",
+                    b"x",
+                    b"y",
+                    b"-",
+                    b"+",
+                    b"AGGREGATION",
+                    b"avg",
+                    b"sum",
+                    b"sum",
+                    b"100",
+                ],
+                numkeys,
+            ),
+            (
+                &[
+                    b"TS.NRANGE",
+                    b"2",
+                    b"x",
+                    b"y",
+                    b"-",
+                    b"+",
+                    b"AGGREGATION",
+                    b"avg",
+                    b"sum",
+                    b"abc",
+                ],
+                "-ERR TSDB: Couldn't parse AGGREGATION\r\n",
+            ),
+            (
+                &[
+                    b"TS.NRANGE",
+                    b"2",
+                    b"x",
+                    b"y",
+                    b"-",
+                    b"+",
+                    b"AGGREGATION",
+                    b"avg",
+                    b"sum",
+                    b"0",
+                ],
+                "-ERR TSDB: bucketDuration must be greater than zero\r\n",
+            ),
+            // With one key none of that applies and the plain parser runs, so a
+            // lone width is a missing width rather than a count mismatch.
+            (
+                &[b"TS.NRANGE", b"1", b"x", b"-", b"+", b"AGGREGATION", b"100"],
+                "-ERR TSDB: Couldn't parse AGGREGATION\r\n",
+            ),
+            (
+                &[
+                    b"TS.NRANGE",
+                    b"1",
+                    b"x",
+                    b"-",
+                    b"+",
+                    b"AGGREGATION",
+                    b"100",
+                    b"200",
+                ],
+                "-ERR TSDB: Unknown aggregation type\r\n",
+            ),
+            // The keys come last and in the order they were named.
+            (
+                &[b"TS.NRANGE", b"2", b"x", b"nope", b"-", b"+"],
+                "-ERR TSDB: the key does not exist\r\n",
+            ),
+            (
+                &[b"TS.NRANGE", b"2", b"str", b"nope", b"-", b"+"],
+                "-ERR WRONGTYPE Operation against a key \
+                 holding the wrong kind of value\r\n",
+            ),
+        ];
+        for (argv, want) in cases {
+            let got = f.run(argv);
+            assert_eq!(&got, want, "{argv:?}");
+        }
+    }
+
+    /// `TS.READ`, which is a key, one timestamp and everything from there on.
+    #[test]
+    fn a_read_walks_from_a_timestamp_to_the_end_of_the_series() {
+        let mut f = joined();
+        assert_eq!(
+            f.run(&[b"TS.READ", b"x", b"-"]),
+            "*4\r\n*2\r\n:10\r\n+1\r\n*2\r\n:20\r\n+2\r\n\
+             *2\r\n:40\r\n+4\r\n*2\r\n:50\r\n+5\r\n"
+        );
+        // A plus is the last sample on its own, and a timestamp between two
+        // samples starts at the one behind it.
+        assert_eq!(
+            f.run(&[b"TS.READ", b"x", b"+"]),
+            "*1\r\n*2\r\n:50\r\n+5\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"TS.READ", b"x", b"25"]),
+            "*2\r\n*2\r\n:40\r\n+4\r\n*2\r\n:50\r\n+5\r\n"
+        );
+        // Past the end, a series holding nothing and a key that is not there
+        // are all the empty array rather than an error.
+        assert_eq!(f.run(&[b"TS.READ", b"x", b"99"]), "*0\r\n");
+        assert_eq!(f.run(&[b"TS.READ", b"z", b"-"]), "*0\r\n");
+        assert_eq!(f.run(&[b"TS.READ", b"z", b"+"]), "*0\r\n");
+        assert_eq!(f.run(&[b"TS.READ", b"nope", b"-"]), "*0\r\n");
+        // The timestamp refusal goes out with nothing in front of it, and a key
+        // holding something else answers the bare WRONGTYPE rather than the
+        // module's prefixed one, both unlike the rest of the family.
+        assert_eq!(
+            f.run(&[b"TS.READ", b"x", b"abc"]),
+            "-TSDB: invalid timestamp\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"TS.READ", b"x", b"-1"]),
+            "-TSDB: invalid timestamp\r\n"
+        );
+        f.run(&[b"SET", b"str", b"hi"]);
+        assert_eq!(
+            f.run(&[b"TS.READ", b"str", b"-"]),
+            "-WRONGTYPE Operation against a key holding the wrong kind of value\r\n"
+        );
+        // Anything other than exactly three words is an arity error, so there
+        // is nowhere to put an option even though the table says minus three.
+        assert_eq!(
+            f.run(&[b"TS.READ", b"x"]),
+            "-ERR wrong number of arguments for 'ts.read' command\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"TS.READ", b"x", b"-", b"COUNT", b"1"]),
+            "-ERR wrong number of arguments for 'ts.read' command\r\n"
+        );
+    }
+
+    /// The keys of a joined read sit behind a count, so `COMMAND GETKEYS` has
+    /// to read the count to find them.
+    #[test]
+    fn getkeys_reads_the_count_of_a_joined_read() {
+        let mut f = Fixture::new();
+        assert_eq!(
+            f.run(&[
+                b"COMMAND",
+                b"GETKEYS",
+                b"TS.NRANGE",
+                b"2",
+                b"a",
+                b"b",
+                b"-",
+                b"+"
+            ]),
+            "*2\r\n$1\r\na\r\n$1\r\nb\r\n"
+        );
+        assert_eq!(
+            f.run(&[
+                b"COMMAND",
+                b"GETKEYS",
+                b"TS.NREVRANGE",
+                b"1",
+                b"a",
+                b"-",
+                b"+"
+            ]),
+            "*1\r\n$1\r\na\r\n"
+        );
+        // A count of zero, or one too large for the words that follow it, is
+        // the server's own refusal and not the module's.
+        for n in [b"0".as_slice(), b"9", b"abc"] {
+            assert_eq!(
+                f.run(&[b"COMMAND", b"GETKEYS", b"TS.NRANGE", n, b"a", b"-", b"+"]),
+                "-ERR Invalid arguments specified for command\r\n"
+            );
+        }
+    }
+
     /// The five series every test of the label surface works against.
     fn labelled() -> Fixture {
         let mut f = Fixture::new();

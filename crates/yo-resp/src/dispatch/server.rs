@@ -657,18 +657,24 @@ fn getkeys(args: Args<'_>, out: &mut Out) -> Result<()> {
             "Invalid number of arguments specified for command",
         ));
     }
-    // `MSETEX` is the one command here whose keys are not where the triple
-    // says. It carries its own count, which is why a real server marks it
-    // `movablekeys` and why a client has to ask this question about it at all.
-    if spec.name == "msetex" {
+    // Three commands here keep their keys somewhere the triple cannot describe,
+    // behind a count of how many there are. That is why a real server marks them
+    // `movablekeys` and why a client has to ask this question about them at all.
+    // `MSETEX` counts pairs and the two joined time series reads count single
+    // keys, so the step is the only thing that differs between them.
+    if let Some(step) = match spec.name {
+        "msetex" => Some(2),
+        "ts.nrange" | "ts.nrevrange" => Some(1),
+        _ => None,
+    } {
         let n = parse_i64(args.get(3))
             .filter(|&n| n > 0)
             .and_then(|n| usize::try_from(n).ok())
-            .filter(|&n| 4 + 2 * n <= args.len())
+            .filter(|&n| 4 + step * n <= args.len())
             .ok_or_else(|| Error::new(Code::Invalid, "Invalid arguments specified for command"))?;
         out.array(n);
         for i in 0..n {
-            out.bulk(args.get(4 + 2 * i));
+            out.bulk(args.get(4 + step * i));
         }
         return Ok(());
     }
@@ -701,7 +707,8 @@ fn getkeys(args: Args<'_>, out: &mut Out) -> Result<()> {
 ///
 /// The tips, the key specs and the subcommands are all empty. The triple above
 /// them says where the keys are for everything in this table except `MSETEX`,
-/// which is what `COMMAND GETKEYS` is for, and divergence D-13 says so.
+/// `TS.NRANGE` and `TS.NREVRANGE`, which is what `COMMAND GETKEYS` is for, and
+/// divergence D-13 says so.
 fn write_spec(out: &mut Out, spec: &Spec) {
     out.array(10);
     out.bulk(spec.name.as_bytes());

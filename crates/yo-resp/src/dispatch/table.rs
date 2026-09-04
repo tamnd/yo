@@ -257,6 +257,9 @@ const AC_TS_WRITE_FAST: &[&str] = &["@write", "@fast", "@timeseries"];
 /// category says. That disagreement is RedisTimeSeries's own and is copied as it
 /// stands, the same way the count min sketch one is.
 const TS_READ: &[&str] = &["readonly", "module"];
+/// The two joined reads, which carry their keys behind a count and so cannot be
+/// described by the first, last and step triple.
+const TS_READ_MOVABLE: &[&str] = &["readonly", "module", "movablekeys"];
 /// A time series write, all of which can ask for another chunk.
 const TS_WRITE: &[&str] = &["write", "denyoom", "module"];
 /// `TS.DEL`, the one write that only ever frees samples and so does not deny out
@@ -3866,6 +3869,45 @@ pub static COMMANDS: &[Spec] = &[
         group: "ts",
     },
     Spec {
+        name: "ts.nrange",
+        arity: -5,
+        flags: TS_READ_MOVABLE,
+        first_key: 0,
+        last_key: 0,
+        step: 0,
+        acl: AC_TS_READ,
+        since: "8.10.0",
+        complexity: "O(n/m+k) with n the samples, m the chunk size and k the samples in the span",
+        summary: "The same span out of several series, lined up on the timestamps.",
+        group: "ts",
+    },
+    Spec {
+        name: "ts.nrevrange",
+        arity: -5,
+        flags: TS_READ_MOVABLE,
+        first_key: 0,
+        last_key: 0,
+        step: 0,
+        acl: AC_TS_READ,
+        since: "8.10.0",
+        complexity: "O(n/m+k) with n the samples, m the chunk size and k the samples in the span",
+        summary: "The same rows, newest first.",
+        group: "ts",
+    },
+    Spec {
+        name: "ts.read",
+        arity: -3,
+        flags: TS_READ,
+        first_key: 1,
+        last_key: 1,
+        step: 1,
+        acl: AC_TS_READ,
+        since: "8.10.0",
+        complexity: "O(n/m+k) with n the samples, m the chunk size and k the samples answered",
+        summary: "Every sample from a timestamp to the end of the series.",
+        group: "ts",
+    },
+    Spec {
         name: "ts.queryindex",
         arity: -2,
         flags: TS_READ,
@@ -5150,7 +5192,7 @@ const SLOTS: usize = 2048;
 /// most wants to be able to find.
 const FREE: u16 = u16::MAX;
 
-/// The multiplier, found by searching for one that spreads these 337 names well.
+/// The multiplier, found by searching for one that spreads these 358 names well.
 ///
 /// Not a magic constant in the bad sense: it is checked. Every command is looked
 /// up by its own name in a test, and another test holds the worst probe length
@@ -5316,10 +5358,32 @@ const FREE: u16 = u16::MAX;
 /// The room this buys is the same room as last time and it is worth writing down
 /// again: `FT.*` and `TS.*` are still to come and both are large, and at a sixth
 /// full there is somewhere for them to go.
-const MIX: u64 = 0x2f0c_c21a_638a_e49d;
+///
+/// `TS.*` then arrived and the last three of it, the two joined reads and
+/// `TS.READ`, broke the bound in a way no multiplier could fix. `TS.NRANGE` made
+/// `ts.create`, `ts.incrby`, `ts.mrange` and `ts.nrange` four names sharing one
+/// key: all nine bytes long, all starting `ts`, and all with the same fold of
+/// the last byte against the middle one. Four names in a slot run costs the
+/// fourth of them three probes wherever the run starts, so the worst probe went
+/// to three and doubling the table again would not have moved it, because the
+/// cost is in the key and not in how much room the key has to land in.
+///
+/// So the sixteenth search was a search for a key rather than for a multiplier.
+/// Folding the second to last byte in as well separates all four of them, and it
+/// separates enough else besides to take the floor from twenty colliding names
+/// down to twelve, which is the fewest of the handful of folds tried. It is the
+/// cheapest byte to add, too, because it sits next to the last byte that is
+/// already being read. Then the multiplier search ran over the new key, three
+/// hundred and twenty million of them across eight shards, and the best keeps
+/// every command within one slot at eighteen extra probes over the whole table,
+/// against a floor of twelve. That is the best either number has ever been here
+/// while carrying the most names it has ever carried. The old multiplier was
+/// `0x2f0cc21a638ae49d` and it served for one search.
+const MIX: u64 = 0x5525_1c10_f29d_4c29;
 
 /// The four bytes the index is computed from: the length, the first two bytes,
-/// and the last byte with the middle byte folded into it, all lower cased.
+/// and the last byte with the second to last and the middle folded into it, all
+/// lower cased.
 ///
 /// `None` for a name no command could be spelled as, which is decided on the
 /// length before a byte is read.
@@ -5329,8 +5393,8 @@ const MIX: u64 = 0x2f0c_c21a_638a_e49d;
 /// slot, and reading less of the name is a shorter dependency chain in front of
 /// the multiply. Names that agree on all four collide whatever the multiplier is
 /// and probe once more, and the probe is the same compare the lookup was always
-/// going to do. Over the 275 commands there are fourteen such pairs and no group
-/// larger than a pair, so fourteen extra probes is the floor.
+/// going to do. Over the 358 commands there are twelve such pairs and no group
+/// larger than a pair, so twelve extra probes is the floor.
 ///
 /// The middle byte is the part that was added last and it is worth saying why,
 /// because for a long time the key was the length and the first two bytes and
@@ -5347,12 +5411,27 @@ const MIX: u64 = 0x2f0c_c21a_638a_e49d;
 /// in, and the xor is on the same dependency chain as the shifts rather than in
 /// front of them.
 ///
+/// The second to last byte went in for the same reason a family later. `TS.*`
+/// is the JSON shape again and worse: every name starts `ts`, so a nine byte
+/// name is keyed on nothing but its length and the fold of its last byte against
+/// its middle one, and `ts.create`, `ts.incrby`, `ts.mrange` and `ts.nrange` all
+/// land on the same fold. Four in a run is three probes for the last of them
+/// whatever the multiplier does, so the key had to carry more. The byte before
+/// the last one is the cheapest one left, being on the cache line the last byte
+/// already pulled in, and it separates all four of those and takes the floor
+/// from twenty down to twelve besides.
+///
 /// `| 0x20` lower cases a letter and does not have to be told which bytes are
 /// letters. It maps the two cases of a name to the same number, which is all
-/// this needs, and every command name is letters. It has to be applied to the
-/// middle byte and the last byte separately, before the xor rather than after,
+/// this needs, and every command name is letters. It has to be applied to each
+/// of the three folded bytes separately, before the xor rather than after,
 /// because `.` and `n` differ in the bit `| 0x20` sets and an xor of the raw
 /// bytes would keep that difference alive.
+///
+/// On a three or four byte name the middle byte and the second to last byte are
+/// the same byte and cancel each other out, which leaves the fold as the last
+/// byte alone. That is not a loss, because on a name that short every byte the
+/// fold could carry is already in the key somewhere else.
 const fn key_of(name: &[u8]) -> Option<u32> {
     if name.len() < MIN_LEN || name.len() > MAX_LEN {
         return None;
@@ -5363,7 +5442,7 @@ const fn key_of(name: &[u8]) -> Option<u32> {
         name.len() as u32
             | ((name[0] | 0x20) as u32) << 8
             | ((name[1] | 0x20) as u32) << 16
-            | (((name[last] | 0x20) ^ (name[mid] | 0x20)) as u32) << 24,
+            | (((name[last] | 0x20) ^ (name[last - 1] | 0x20) ^ (name[mid] | 0x20)) as u32) << 24,
     )
 }
 
@@ -5614,7 +5693,7 @@ mod tests {
     /// The index is still worth having, which is a thing that can rot.
     ///
     /// The multiplier was searched for against the 191 commands that were in the
-    /// table when it was written, and fourteen times since. Adding commands cannot
+    /// table when it was written, and fifteen times since. Adding commands cannot
     /// make a lookup wrong, because a probe walks to an empty slot and every
     /// candidate has its name compared, but it can make one slow, and a slow
     /// lookup is exactly the thing this replaced. So the worst probe is written
@@ -5646,7 +5725,7 @@ mod tests {
         }
         assert!(worst <= 2, "worst probe is {worst} slots");
         assert!(
-            total <= 28,
+            total <= 18,
             "{total} extra slots walked over the whole table"
         );
     }
