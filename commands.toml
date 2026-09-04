@@ -67,8 +67,9 @@ doc = "08 section 8"
 
 [[group]]
 name = "list"
-expected = 22
-status = "shipped"
+expected = 24
+status = "partial"
+# Twenty two are here and LMOVEM and BLMOVEM, which Redis 8.10 added, are not.
 doc = "08 section 6"
 # All twenty two, the five blocking ones included. What a parked client costs is
 # a copy of the keys it named and a walk over the waiter list per command, and
@@ -78,18 +79,27 @@ doc = "08 section 6"
 
 [[group]]
 name = "hash"
-expected = 28
-status = "shipped"
+expected = 29
+status = "partial"
 doc = "08 section 3"
+# Twenty eight are here and HIMPORT is not. It came with Redis 8.10 along with
+# compact hashes, which is a new encoding that stores the field names once for a
+# family of keys that share a schema rather than once per key. That one is the
+# expensive item out of the whole 8.10 delta, because it is a change to how a
+# hash is stored rather than another command over the same storage, and the
+# saving it goes after is one this project already has a different answer to in
+# the size ladder. Whether it is worth having both is a question for M8 and not
+# one to answer by adding an encoding first.
 
 [[group]]
 name = "set"
-expected = 17
-status = "shipped"
+expected = 19
+status = "partial"
 doc = "08 section 4"
-# All seventeen are here. What is left on the set is not commands, it is the
-# inline and native bands of the size ladder and the escalation of a hot key,
-# and neither of those changes an answer.
+# Seventeen are here and the two counting commands Redis 8.10 added are not.
+# What else is left on the set is not commands, it is the inline and native
+# bands of the size ladder and the escalation of a hot key, and neither of those
+# changes an answer.
 
 [[group]]
 name = "zset"
@@ -219,7 +229,7 @@ doc = "12 section 9"
 
 [[group]]
 name = "server"
-expected = 31
+expected = 32
 status = "partial"
 doc = "12 section 9"
 
@@ -1174,6 +1184,28 @@ status = "shipped"
 wire = "verified"
 notes = "Presized from the first set, which is an upper bound on what a difference can keep."
 
+[[command]]
+name = "SUNIONCARD"
+group = "set"
+since = "8.10.0"
+arity = -3
+plan = "whole-value"
+bounded = "inherent"
+status = "planned"
+wire = "none"
+notes = "New in 8.10 and not written yet. What SINTERCARD is to SINTER, this is to SUNION: the same walk with the members thrown away so only the count is built, and a LIMIT that stops it as soon as it has enough. The keys go behind a count for the same reason SINTERCARD's do, which is that LIMIT comes after them."
+
+[[command]]
+name = "SDIFFCARD"
+group = "set"
+since = "8.10.0"
+arity = -3
+plan = "whole-value"
+bounded = "inherent"
+status = "planned"
+wire = "none"
+notes = "New in 8.10 and not written yet, and the same shape as SUNIONCARD over a difference rather than a union."
+
 # ---------------------------------------------------------------------- hashes
 
 [[command]]
@@ -1484,6 +1516,17 @@ status = "shipped"
 wire = "verified"
 notes = "One answer for the whole list, because FNX and FXX are asked over every field named and not one at a time. KEEPTTL is needed because the write clears the deadline first, so the deadline is read before the value is stored and put back after."
 
+[[command]]
+name = "HIMPORT"
+group = "hash"
+since = "8.10.0"
+arity = -4
+plan = "whole-value"
+bounded = "risk"
+status = "planned"
+wire = "none"
+notes = "New in 8.10 and not written yet. It builds a whole hash in one call, which is the write side of the compact hash encoding that shipped with it: a server that can store the field names once for a family of keys wants a way to be handed the whole family shape at once rather than a field at a time. The plan is whole-value because it replaces the key rather than editing it, and it is a risk because the size of the write is the size of the argument list."
+
 
 # ---------------------------------------------------------------------- lists
 
@@ -1728,6 +1771,28 @@ bounded = "inherent"
 status = "shipped"
 wire = "verified"
 notes = "LMPOP with a wait, and the same parse shifted along by one. The timeout is read before the key count, so BLMPOP abc 0 k LEFT complains about the timeout and not about the count. A COUNT that is not a number at all gets the same sentence a zero or a negative one gets, which is count should be greater than 0 rather than the usual message about integers."
+
+[[command]]
+name = "LMOVEM"
+group = "list"
+since = "8.10.0"
+arity = -5
+plan = "point"
+bounded = "yes"
+status = "planned"
+wire = "none"
+notes = "New in 8.10 and not written yet. LMOVE with a count, so a batch of elements crosses between two lists in one call instead of one round trip each. It is bounded rather than inherent because the count is the client's, which is the difference between this and LMOVE."
+
+[[command]]
+name = "BLMOVEM"
+group = "list"
+since = "8.10.0"
+arity = -6
+plan = "point"
+bounded = "yes"
+status = "planned"
+wire = "none"
+notes = "New in 8.10 and not written yet. LMOVEM with a wait, and it goes in the same waiter machinery the other five blocking list commands use."
 
 # ------------------------------------------------------------------ sorted set
 
@@ -3106,7 +3171,7 @@ plan = "cursor"
 bounded = "risk"
 status = "shipped"
 wire = "verified"
-notes = "Several streams in one command, each from an ID the client is holding, and BLOCK parks the client on the waiter list rather than polling. Nothing is taken away, so a hundred readers parked on one stream all get the same entry when it lands, which is the difference between this and BLPOP. The $ and + forms are resolved once when the command arrives and never again on a retry, because resolving them per attempt would mean the client waits for what comes after the last thing that happened and never wakes."
+notes = "Several streams in one command, each from an ID the client is holding, and BLOCK parks the client on the waiter list rather than polling. Nothing is taken away, so a hundred readers parked on one stream all get the same entry when it lands, which is the difference between this and BLPOP. The $ and + forms are resolved once when the command arrives and never again on a retry, because resolving them per attempt would mean the client waits for what comes after the last thing that happened and never wakes. Redis 8.10 added MAXCOUNT and MAXSIZE, which cap how much one call answers across all the streams named rather than per stream the way COUNT does, and neither is taken here yet."
 
 [[command]]
 name = "XREADGROUP"
@@ -3117,7 +3182,7 @@ plan = "cursor"
 bounded = "risk"
 status = "shipped"
 wire = "verified"
-notes = "The same read with a group bookmark in front of it, so > hands out what nobody has had and an ID reads back this consumer's own pending list. It is a write because delivery is recorded: each entry handed out goes on the group's pending list against the consumer that took it, unless NOACK says not to. A history read of an entry that has since been deleted answers the ID with a null beside it so the consumer can still acknowledge it."
+notes = "The same read with a group bookmark in front of it, so > hands out what nobody has had and an ID reads back this consumer's own pending list. It is a write because delivery is recorded: each entry handed out goes on the group's pending list against the consumer that took it, unless NOACK says not to. A history read of an entry that has since been deleted answers the ID with a null beside it so the consumer can still acknowledge it. Redis 8.10 added MAXCOUNT and MAXSIZE, which cap how much one call answers across all the streams named rather than per stream the way COUNT does, and neither is taken here yet."
 
 [[command]]
 name = "XACK"
@@ -3396,3 +3461,14 @@ bounded = "inherent"
 status = "shipped"
 wire = "verified"
 notes = "Nothing is written back on success and the connection closes under the client, which is what a stopped server looks like from the outside and is what the client libraries already expect. All five flags are taken and none of them changes what happens, because this server has no save points and no snapshot to write: what durability there is belongs to the file underneath and is already on disk before a command returns, so SAVE has nothing to do and NOSAVE has nothing to skip, and NOW and FORCE are about replicas and failed saves that do not exist here. The syntax errors were read off 8.10.1 rather than guessed. SAVE and NOSAVE together is an error, ABORT next to any other flag is an error, and ABORT next to a second ABORT is fine, as is any flag repeated. ABORT on its own answers No shutdown in progress, and here that is a state that cannot be reached at all rather than one that happens to be empty, because the decision and the stop land inside one turn of the loop. The command sets a flag and the driver leaves its loop on the next turn, so the batch this arrived in finishes and its other replies go out, and the socket file and the file get taken away by the same code a signal reaches."
+
+[[command]]
+name = "BACKUP"
+group = "server"
+since = "8.10.0"
+arity = -1
+plan = "none"
+bounded = "risk"
+status = "planned"
+wire = "none"
+notes = "New in 8.10 and not written yet. It writes a consistent copy of the dataset out of the multi part append only file, so it is Redis's answer to taking a backup without stopping writes or paying for a fork. The shape it takes here is not the same problem, because durability belongs to the one file underneath and a copy of it at a checkpoint is already a consistent dataset, so this is a matter of naming a checkpoint and copying the file up to it rather than of writing out a snapshot. Risk rather than inherent because what it costs is the size of the dataset."
