@@ -254,33 +254,49 @@ thread_local! {
     static SLOT: Cell<usize> = const { Cell::new(usize::MAX) };
 }
 
-/// The counters one thread keeps.
+/// What one thread keeps to itself.
 ///
-/// One of these per thread and not one per server, because a counter every
-/// thread adds to is a cache line every thread has to own to add to it, and at a
-/// few million commands a second that one line is the server. So each thread
-/// counts into its own set and `INFO` adds the sets up when somebody asks, which
-/// is a walk over a few hundred rows on a command nobody sends in a loop.
+/// One of these per thread and not one per server, because a number every
+/// thread writes to is a cache line every thread has to own to write to it, and
+/// at a few million commands a second that one line is the server. So each
+/// thread writes into its own and whoever needs the whole picture, which is
+/// `INFO` and the maintenance turn, puts the pieces together when it asks.
 ///
-/// A cache line apart for the same reason, so that two threads counting at once
+/// A cache line apart for the same reason, so that two threads writing at once
 /// are not two threads passing one line back and forth.
 #[derive(Debug, Default)]
 #[repr(align(64))]
-struct Counters {
+struct Local {
     /// What the reactor counts.
     stats: Stats,
     /// A counter per command, for `INFO commandstats`.
     cmdstats: CommandStats,
+    /// Which databases this thread has run a command against since the
+    /// maintenance turn last took the mask.
+    ///
+    /// One bit per database. The thread ors into it and the turn takes the whole
+    /// of it with a swap, which is what keeps a mark that lands during the swap
+    /// from being lost: the worst that can happen is a bit the turn has already
+    /// taken being set again, and that costs one more look at a database with
+    /// nothing to collect.
+    dirty: AtomicU64,
 }
 
-/// Room for one thread to count in, which is what a server starts with.
-fn one_thread() -> Box<[Counters]> {
+impl Local {
+    /// Note that a command has run against these databases.
+    fn mark(&self, dbs: u64) {
+        self.dirty.store(self.dirty.load(Relaxed) | dbs, Relaxed);
+    }
+}
+
+/// Room for one thread, which is what a server starts with.
+fn one_thread() -> Box<[Local]> {
     slots(1)
 }
 
 /// Room for `threads` of them.
-fn slots(threads: usize) -> Box<[Counters]> {
-    (0..threads.max(1)).map(|_| Counters::default()).collect()
+fn slots(threads: usize) -> Box<[Local]> {
+    (0..threads.max(1)).map(|_| Local::default()).collect()
 }
 
 /// Where the process was started, which is what `dir` defaults to.
@@ -394,6 +410,11 @@ pub struct Server {
     /// answer is no every time. This is the cheap half of the question: a
     /// database nobody has touched since it last said no cannot have started
     /// saying yes.
+    ///
+    /// The maintenance turn's own mask and not a shared one. Threads mark what
+    /// they have touched in [`Local::dirty`] and the turn takes those with
+    /// [`Server::collect_marks`] before it reads this, so nothing on a command
+    /// path writes here.
     dirty: u64,
     /// What the connections are holding, kept by the engine.
     conn_bytes: usize,
@@ -473,13 +494,13 @@ pub struct Server {
     /// Empty on a server nobody has migrated a key out of, which is nearly all
     /// of them, and it costs a vector's three words to be empty.
     peers: migrate::Peers,
-    /// One set of counters per thread that runs commands here.
+    /// What each thread that runs commands here keeps to itself.
     ///
-    /// A fixed list, because a thread reading its own set must not have the list
-    /// move under it, and how many threads there will be is known before any of
-    /// them starts. A server nobody told otherwise has one.
-    counters: Box<[Counters]>,
-    /// How many sets have been handed out.
+    /// A fixed list, because a thread reading its own entry must not have the
+    /// list move under it, and how many threads there will be is known before
+    /// any of them starts. A server nobody told otherwise has one.
+    locals: Box<[Local]>,
+    /// How many entries have been handed out.
     claimed: AtomicUsize,
     /// Where `BACKUP` puts its files, and where `CONFIG GET dir` points.
     ///
@@ -537,7 +558,7 @@ impl Server {
             expire_ms: 0,
             waiters: Waiters::default(),
             peers: migrate::Peers::default(),
-            counters: one_thread(),
+            locals: one_thread(),
             claimed: AtomicUsize::new(0),
             dir: working_dir(),
             backup: backup::State::default(),
@@ -587,7 +608,7 @@ impl Server {
             expire_ms: 0,
             waiters: Waiters::default(),
             peers: migrate::Peers::default(),
-            counters: one_thread(),
+            locals: one_thread(),
             claimed: AtomicUsize::new(0),
             dir: working_dir(),
             backup: backup::State::default(),
@@ -879,7 +900,7 @@ impl Server {
     /// One command's counters, added up over every thread.
     fn command_stat(&self, at: usize) -> CommandStat {
         let mut sum = CommandStat::default();
-        for thread in &self.counters {
+        for thread in &self.locals {
             let row = &thread.cmdstats.0[at];
             sum.calls += row.calls.get();
             sum.rejected += row.rejected.get();
@@ -900,21 +921,21 @@ impl Server {
         &self.mine().stats
     }
 
-    /// The whole set, which is the counters and the command rows.
-    fn mine(&self) -> &Counters {
+    /// Everything the calling thread keeps to itself.
+    fn mine(&self) -> &Local {
         let mut slot = SLOT.get();
         if slot == usize::MAX {
             slot = self.claimed.fetch_add(1, Relaxed);
             SLOT.set(slot);
         }
-        &self.counters[slot % self.counters.len()]
+        &self.locals[slot % self.locals.len()]
     }
 
     /// Every thread's numbers added together, which is what `INFO` reports.
     #[must_use]
     pub fn totals(&self) -> Totals {
         let mut sum = Totals::default();
-        for thread in &self.counters {
+        for thread in &self.locals {
             sum.clients += thread.stats.clients.get();
             sum.connections += thread.stats.connections.get();
             sum.commands += thread.stats.commands.get();
@@ -929,7 +950,7 @@ impl Server {
     /// are left alone because that is a gauge and not a total: the connections
     /// are still open.
     pub fn reset_stats(&self) {
-        for thread in &self.counters {
+        for thread in &self.locals {
             thread.stats.connections.zero();
             thread.stats.commands.zero();
         }
@@ -942,7 +963,7 @@ impl Server {
     /// running server throws away what has been counted so far, which is why it
     /// wants the server to itself.
     pub fn set_threads(&mut self, threads: usize) {
-        self.counters = slots(threads);
+        self.locals = slots(threads);
         self.claimed = AtomicUsize::new(0);
     }
 
@@ -1311,6 +1332,22 @@ impl Server {
         None
     }
 
+    /// Take what every thread has marked and add it to the turn's own mask.
+    ///
+    /// The mask the turn works from is its own and not a shared one, because a
+    /// mask it read in place and then cleared a bit of would be a mask that lost
+    /// whatever another thread marked in between. A swap cannot lose a mark: a
+    /// thread that ors while the swap happens either gets its bit in before the
+    /// swap or leaves it there afterwards, and the second one costs one look at
+    /// a database the turn has already been through.
+    fn collect_marks(&mut self) {
+        let mut marked = 0;
+        for thread in &self.locals {
+            marked |= thread.dirty.swap(0, Relaxed);
+        }
+        self.dirty |= marked;
+    }
+
     /// Give one database's dead space back, if any database has enough of it to
     /// be worth the move. `None` when no database had a candidate.
     ///
@@ -1324,6 +1361,7 @@ impl Server {
     /// further along each time, so the cost of asking is a comparison per
     /// database and the cost of acting is bounded by a segment.
     pub fn compact_step(&mut self) -> Option<usize> {
+        self.collect_marks();
         for turn in 0..self.slots() {
             let i = (self.next_db + turn) % self.slots();
             // Nothing has run against this database since it last said it had
@@ -1486,13 +1524,13 @@ pub fn resolved(
     // record it dropped is exactly the kind of thing the collector is for.
     // `COPY`, `SWAPDB` and `FLUSHALL` reach a database nobody selected, so the
     // two groups that hold them mark all of them rather than the session's.
-    server.dirty |= match spec.group {
+    server.mine().mark(match spec.group {
         "string" | "bitmap" | "hyperloglog" | "geo" | "set" | "hash" | "list" | "zset"
         | "array" | "stream" | "bloom" | "cuckoo" | "cms" | "topk" | "tdigest" | "ts" => {
             1u64 << session.db
         }
         _ => ALL_DATABASES,
-    };
+    });
 
     let mark = out.len();
     // Before the group, because the five that block are list commands and would
@@ -4700,6 +4738,20 @@ mod tests {
     }
 
     #[test]
+    fn what_a_thread_marked_is_taken_by_the_maintenance_turn() {
+        let mut server = Server::new();
+        server.set_threads(2);
+        // A fresh server has every database marked, so start from nothing to
+        // see the one mark arrive.
+        server.dirty = 0;
+        server.locals[1].mark(1 << 9);
+        server.collect_marks();
+        assert_ne!(server.dirty & (1 << 9), 0);
+        // And taken once rather than left to be taken again next turn.
+        assert_eq!(server.locals[1].dirty.load(Relaxed), 0);
+    }
+
+    #[test]
     fn what_two_threads_counted_is_added_up_when_info_asks() {
         let mut server = Server::new();
         server.set_threads(2);
@@ -4708,7 +4760,7 @@ mod tests {
         // claim one set.
         let ping = lookup(b"PING").expect("PING is a command");
         for (at, calls) in [(0, 2), (1, 3)] {
-            let counters = &server.counters[at];
+            let counters = &server.locals[at];
             for _ in 0..calls {
                 counters.stats.commands.bump();
                 counters.cmdstats.at(ping).calls.bump();
