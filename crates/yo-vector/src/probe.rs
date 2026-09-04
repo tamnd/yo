@@ -88,8 +88,29 @@ use crate::rabitq::Bits;
 use std::time::Instant;
 use yo_common::Rng;
 
-/// How many partitions a query reads here.
-const PROBE: usize = 32;
+/// A number that can be set from the environment, so that the same run can be
+/// pointed at whatever configuration is under question without the table in the
+/// module doc moving underneath it.
+fn from_env(name: &str, default: usize) -> usize {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(default)
+}
+
+/// How many partitions a query reads here. `YO_PROBE` overrides it.
+fn probe() -> usize {
+    from_env("YO_PROBE", 32)
+}
+
+/// How many members a partition wants. `YO_POSTING` overrides it.
+///
+/// Worth overriding, because the split between these rows moves a long way with
+/// it: it is what decides how many centroids there are to rank and how many
+/// members there are behind each one.
+fn posting() -> usize {
+    from_env("YO_POSTING", Tuning::default().posting)
+}
 
 /// How many queries each number is the mean of.
 const QUERIES: usize = 200;
@@ -141,7 +162,8 @@ fn generated(dim: usize, n: usize, clusters: usize, seed: u64) -> Base {
 fn build(base: &Base) -> Partitions {
     let n = base.data.len() / base.dim;
     let tuning = Tuning {
-        probe: PROBE,
+        probe: probe(),
+        posting: posting(),
         ..Tuning::default()
     };
     let mut ix = Partitions::new(base.dim, Bits::One, 0x51f7, tuning);
@@ -204,7 +226,7 @@ fn where_a_query_spends_its_time() {
         for q in &queries {
             ix.probe_order(q, &mut order);
             let u = ix.quantizer().rotate(q);
-            for &p in order.iter().take(PROBE) {
+            for &p in order.iter().take(probe()) {
                 let prepared = ix
                     .quantizer()
                     .query_rotated(&u, &centroids[p * dim..(p + 1) * dim]);
@@ -219,7 +241,7 @@ fn where_a_query_spends_its_time() {
         for q in &queries {
             ix.probe_order(q, &mut order);
             let u = ix.quantizer().rotate(q);
-            for &p in order.iter().take(PROBE) {
+            for &p in order.iter().take(probe()) {
                 let prepared = ix
                     .quantizer()
                     .query_rotated(&u, &centroids[p * dim..(p + 1) * dim]);
@@ -233,12 +255,12 @@ fn where_a_query_spends_its_time() {
         }
         let scan = each(at.elapsed());
 
-        let members = PROBE * held / parts;
+        let members = probe() * held / parts;
         println!("  ranking centroids   {rank:8.1} us");
         println!(
             "  preparing the query {:8.1} us  ({:.1} us a partition)",
             prep - rank,
-            (prep - rank) / PROBE as f64
+            (prep - rank) / probe() as f64
         );
         println!(
             "  scanning the postings {:6.1} us  ({:.1} ns a member over {members})",

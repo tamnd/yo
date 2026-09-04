@@ -115,6 +115,7 @@ pub mod hnsw;
 pub mod image;
 mod miss;
 pub mod muvera;
+mod narrow;
 pub mod partition;
 mod probe;
 pub mod rabitq;
