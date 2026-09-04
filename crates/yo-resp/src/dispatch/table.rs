@@ -223,6 +223,24 @@ const TOPK_READ: &[&str] = &["readonly", "module"];
 /// can allocate is the constructor, and all three deny out of memory because the
 /// module marks all three.
 const TOPK_WRITE: &[&str] = &["write", "denyoom", "module"];
+/// The t digest read side for the ones that answer off the header or off one
+/// sweep of the centroids, which the module calls fast and which is all of them
+/// bar the trimmed mean.
+const AC_TDIGEST_READ_FAST: &[&str] = &["@read", "@fast", "@tdigest"];
+/// `TDIGEST.TRIMMED_MEAN`, the one read the module does not call fast.
+const AC_TDIGEST_READ: &[&str] = &["@read", "@tdigest"];
+/// The t digest write side for the two that only shape a digest.
+const AC_TDIGEST_WRITE_FAST: &[&str] = &["@write", "@fast", "@tdigest"];
+/// The two that move weight around.
+const AC_TDIGEST_WRITE: &[&str] = &["@write", "@tdigest"];
+/// A t digest read, which carries `module` and not `fast`.
+const TDIGEST_READ: &[&str] = &["readonly", "module"];
+/// A t digest write. All four deny out of memory because all four can end up
+/// asking for a set of centroids.
+const TDIGEST_WRITE: &[&str] = &["write", "denyoom", "module"];
+/// `TDIGEST.MERGE`, whose keys are behind a count and so cannot be found by the
+/// first, last and step the rest of the table uses.
+const TDIGEST_MERGE: &[&str] = &["write", "denyoom", "module", "movablekeys"];
 /// The graph read side, for the ones that answer without walking the plane.
 const AC_GRAPH_READ_FAST: &[&str] = &["@read", "@graph", "@fast"];
 /// The graph read side for the ones that walk it.
@@ -3495,6 +3513,189 @@ pub static COMMANDS: &[Spec] = &[
         summary: "The four numbers the sketch was made with.",
         group: "topk",
     },
+    // ------------------------------------------------------------- tdigest
+    Spec {
+        name: "tdigest.create",
+        arity: -2,
+        flags: TDIGEST_WRITE,
+        first_key: 1,
+        last_key: 1,
+        step: 1,
+        acl: AC_TDIGEST_WRITE_FAST,
+        since: "2.4.0",
+        complexity: "O(1)",
+        summary: "Make an empty digest of a stated compression.",
+        group: "tdigest",
+    },
+    Spec {
+        name: "tdigest.reset",
+        arity: 2,
+        flags: TDIGEST_WRITE,
+        first_key: 1,
+        last_key: 1,
+        step: 1,
+        acl: AC_TDIGEST_WRITE_FAST,
+        since: "2.4.0",
+        complexity: "O(1)",
+        summary: "Throw away every sample and keep the shape.",
+        group: "tdigest",
+    },
+    Spec {
+        name: "tdigest.add",
+        arity: -3,
+        flags: TDIGEST_WRITE,
+        first_key: 1,
+        last_key: 1,
+        step: 1,
+        acl: AC_TDIGEST_WRITE,
+        since: "2.4.0",
+        complexity: "O(N) with N the number of samples",
+        summary: "Add samples of weight one each.",
+        group: "tdigest",
+    },
+    Spec {
+        name: "tdigest.merge",
+        arity: -4,
+        flags: TDIGEST_MERGE,
+        first_key: 1,
+        last_key: 1,
+        step: 1,
+        acl: AC_TDIGEST_WRITE,
+        since: "2.4.0",
+        complexity: "O(N) with N the number of centroids in the inputs",
+        summary: "Fold digests together into one.",
+        group: "tdigest",
+    },
+    Spec {
+        name: "tdigest.min",
+        arity: 2,
+        flags: TDIGEST_READ,
+        first_key: 1,
+        last_key: 1,
+        step: 1,
+        acl: AC_TDIGEST_READ_FAST,
+        since: "2.4.0",
+        complexity: "O(1)",
+        summary: "The smallest sample ever added.",
+        group: "tdigest",
+    },
+    Spec {
+        name: "tdigest.max",
+        arity: 2,
+        flags: TDIGEST_READ,
+        first_key: 1,
+        last_key: 1,
+        step: 1,
+        acl: AC_TDIGEST_READ_FAST,
+        since: "2.4.0",
+        complexity: "O(1)",
+        summary: "The largest sample ever added.",
+        group: "tdigest",
+    },
+    Spec {
+        name: "tdigest.quantile",
+        arity: -3,
+        flags: TDIGEST_READ,
+        first_key: 1,
+        last_key: 1,
+        step: 1,
+        acl: AC_TDIGEST_READ_FAST,
+        since: "2.4.0",
+        complexity: "O(N) with N the number of centroids",
+        summary: "The value each fraction of the samples falls under.",
+        group: "tdigest",
+    },
+    Spec {
+        name: "tdigest.cdf",
+        arity: -3,
+        flags: TDIGEST_READ,
+        first_key: 1,
+        last_key: 1,
+        step: 1,
+        acl: AC_TDIGEST_READ_FAST,
+        since: "2.4.0",
+        complexity: "O(N) with N the number of centroids",
+        summary: "The fraction of the samples at or below each value.",
+        group: "tdigest",
+    },
+    Spec {
+        name: "tdigest.trimmed_mean",
+        arity: 4,
+        flags: TDIGEST_READ,
+        first_key: 1,
+        last_key: 1,
+        step: 1,
+        acl: AC_TDIGEST_READ,
+        since: "2.4.0",
+        complexity: "O(N) with N the number of centroids",
+        summary: "The mean of what is left once both tails are cut.",
+        group: "tdigest",
+    },
+    Spec {
+        name: "tdigest.rank",
+        arity: -3,
+        flags: TDIGEST_READ,
+        first_key: 1,
+        last_key: 1,
+        step: 1,
+        acl: AC_TDIGEST_READ_FAST,
+        since: "2.4.0",
+        complexity: "O(N) with N the number of centroids",
+        summary: "How many samples each value is above.",
+        group: "tdigest",
+    },
+    Spec {
+        name: "tdigest.revrank",
+        arity: -3,
+        flags: TDIGEST_READ,
+        first_key: 1,
+        last_key: 1,
+        step: 1,
+        acl: AC_TDIGEST_READ_FAST,
+        since: "2.4.0",
+        complexity: "O(N) with N the number of centroids",
+        summary: "How many samples each value is below.",
+        group: "tdigest",
+    },
+    Spec {
+        name: "tdigest.byrank",
+        arity: -3,
+        flags: TDIGEST_READ,
+        first_key: 1,
+        last_key: 1,
+        step: 1,
+        acl: AC_TDIGEST_READ_FAST,
+        since: "2.4.0",
+        complexity: "O(N) with N the number of centroids",
+        summary: "The value at each rank counting up from the smallest.",
+        group: "tdigest",
+    },
+    Spec {
+        name: "tdigest.byrevrank",
+        arity: -3,
+        flags: TDIGEST_READ,
+        first_key: 1,
+        last_key: 1,
+        step: 1,
+        acl: AC_TDIGEST_READ_FAST,
+        since: "2.4.0",
+        complexity: "O(N) with N the number of centroids",
+        summary: "The value at each rank counting down from the largest.",
+        group: "tdigest",
+    },
+    Spec {
+        name: "tdigest.info",
+        arity: 2,
+        flags: TDIGEST_READ,
+        first_key: 1,
+        last_key: 1,
+        step: 1,
+        acl: AC_TDIGEST_READ_FAST,
+        since: "2.4.0",
+        complexity: "O(1)",
+        summary: "The nine numbers the digest keeps about itself.",
+        group: "tdigest",
+    },
     // --------------------------------------------------------------- array
     Spec {
         name: "arset",
@@ -4668,18 +4869,20 @@ const MAX_LEN: usize = 20;
 /// How many slots the index has, which is a power of two and a bit over three
 /// times the number of commands.
 ///
-/// Two kibibytes of `u16`, thirty two cache lines, and loose enough that a probe
+/// Four kibibytes of `u16`, sixty four cache lines, and loose enough that a probe
 /// for a name that is not a command stops at an empty slot almost immediately.
 /// Tight enough that the whole thing stays resident next to the table it
 /// indexes.
 ///
 /// This was 512 for a long time, which was a bit over twice the number of
-/// commands, and it stopped being enough at 282 of them. The note on [`MIX`]
-/// has the whole story, and the short version is that at 55 percent full there
-/// was no multiplier left that kept every command within two slots of home,
-/// and at 27 percent full the multiplier that was already there does it without
-/// being changed. A kibibyte is what that cost.
-const SLOTS: usize = 1024;
+/// commands, and it stopped being enough at 282 of them. Then it was 1024, and
+/// that stopped being enough at 337. The note on [`MIX`] has the whole story
+/// both times, and the short version is the same one twice: at about half full
+/// there is no multiplier left that keeps every command within two slots of
+/// home, and at about a sixth full the multiplier that is already there keeps
+/// every one of them within a single slot without being touched. Two kibibytes
+/// is what it cost this time.
+const SLOTS: usize = 2048;
 
 /// A slot nothing was put in.
 ///
@@ -4687,14 +4890,14 @@ const SLOTS: usize = 1024;
 /// most wants to be able to find.
 const FREE: u16 = u16::MAX;
 
-/// The multiplier, found by searching for one that spreads these 282 names well.
+/// The multiplier, found by searching for one that spreads these 337 names well.
 ///
 /// Not a magic constant in the bad sense: it is checked. Every command is looked
 /// up by its own name in a test, and another test holds the worst probe length
 /// at what it is now, so a command added later that made this multiplier bad
 /// would fail rather than quietly cost every lookup an extra slot.
 ///
-/// It has been searched for eight times, and each time because the test went red
+/// It has been searched for fifteen times, and each time because the test went red
 /// rather than because somebody went looking. The first was against the 191 names
 /// in the table then, the ten graph commands pushed its worst probe to three
 /// slots, and the second search was run over all 201. The fifteen stream commands
@@ -4821,7 +5024,39 @@ const FREE: u16 = u16::MAX;
 /// worse on both counts, which is what the two big searches before it already
 /// said, so this multiplier stayed and the bound went up by five. None of the
 /// seven new names collides on the key, so the floor is still sixteen.
-const MIX: u64 = 0x3e86_68c9_760e_09c9;
+///
+/// The `TDIGEST.*` family took it to 337 names and broke the bound properly: the
+/// worst probe went to three slots, which is the first time since the table was
+/// doubled that a command was further from home than a lookup is allowed to be.
+/// Fourteen names is a lot to add to a family of sketch commands that all start
+/// with the same two bytes, and the key is built out of the first two bytes, so
+/// the whole family lands in a handful of key values before the multiply ever
+/// sees them.
+///
+/// So the fifteenth search ran, and it said the same thing the tenth one did at
+/// 282 names. Three and a half million multipliers against the 1024 slot table
+/// found nothing better than two slots and fifty two extra probes, against the
+/// fifty two this one already spends at three slots. That is the shape of a
+/// table that is too full rather than a multiplier that is bad, and at 337
+/// names in 1024 slots it is a third full, which is where the 512 slot table
+/// was when it ran out as well. Doubling the table to 2048 and touching nothing
+/// else takes this same multiplier to **one** slot and thirty four, so the
+/// answer was a bigger table again and not a new constant.
+///
+/// The search then ran over the doubled table anyway, because that is what
+/// happened last time and it found something worth having. Four and a half
+/// million multipliers turned up this one at one slot and twenty two, twelve
+/// fewer probes than the old multiplier spends in the same table, against a
+/// floor of sixteen from the names that collide on the key itself. Twelve
+/// probes over three hundred and thirty seven lookups is not much, but it is
+/// free, it moves both numbers the right way, and it is exactly the trade the
+/// doubling from 512 made, so it was taken. The old multiplier was
+/// `0x3e8668c9760e09c9` and it served for thirteen searches.
+///
+/// The room this buys is the same room as last time and it is worth writing down
+/// again: `FT.*` and `TS.*` are still to come and both are large, and at a sixth
+/// full there is somewhere for them to go.
+const MIX: u64 = 0x2f0c_c21a_638a_e49d;
 
 /// The four bytes the index is computed from: the length, the first two bytes,
 /// and the last byte with the middle byte folded into it, all lower cased.
@@ -4874,12 +5109,12 @@ const fn key_of(name: &[u8]) -> Option<u32> {
 
 /// Where a key wants to sit.
 ///
-/// The shift leaves the top ten bits of the product, which are the ones the
-/// multiply mixed the most, and the mask is what makes that a slot number. Ten
-/// because the table has 1024 slots, so both numbers have to move together if
-/// [`SLOTS`] ever does.
+/// The shift leaves the top eleven bits of the product, which are the ones the
+/// multiply mixed the most, and the mask is what makes that a slot number. Eleven
+/// because the table has 2048 slots, so both numbers have to move together if
+/// [`SLOTS`] ever does. It was ten while the table was half this size.
 const fn slot_of(key: u32) -> usize {
-    ((key as u64).wrapping_mul(MIX) >> 54) as usize & (SLOTS - 1)
+    ((key as u64).wrapping_mul(MIX) >> 53) as usize & (SLOTS - 1)
 }
 
 /// The index, built at compile time by inserting every command in table order.
@@ -5119,7 +5354,7 @@ mod tests {
     /// The index is still worth having, which is a thing that can rot.
     ///
     /// The multiplier was searched for against the 191 commands that were in the
-    /// table when it was written, and twelve times since. Adding commands cannot
+    /// table when it was written, and fourteen times since. Adding commands cannot
     /// make a lookup wrong, because a probe walks to an empty slot and every
     /// candidate has its name compared, but it can make one slow, and a slow
     /// lookup is exactly the thing this replaced. So the worst probe is written
@@ -5151,7 +5386,7 @@ mod tests {
         }
         assert!(worst <= 2, "worst probe is {worst} slots");
         assert!(
-            total <= 42,
+            total <= 22,
             "{total} extra slots walked over the whole table"
         );
     }
