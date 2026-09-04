@@ -362,8 +362,9 @@ impl Db {
     ///
     /// The answer is copied into this database's own buffer rather than
     /// borrowed from the stripe's, which is what lets the loop above go round
-    /// again while holding an answer. It is a key name and the buffer is kept,
-    /// so it costs a copy of a few bytes and no allocation.
+    /// again while holding an answer. The buffer is kept between draws, so the
+    /// copy is a few bytes and the allocator only hears about a key name longer
+    /// than any this database has answered with before.
     pub fn random_key(&mut self) -> Option<&[u8]> {
         let live = self.len();
         if live == 0 {
@@ -388,7 +389,11 @@ impl Db {
         for step in 0..self.stripes.len() {
             let i = (first as u64 + step as u64) & self.mask;
             if let Some(key) = self.stripes[i as usize].random_key() {
-                buf.extend_from_slice(key);
+                // `yo_alloc::high_water` because this is the buffer reaching a
+                // length it has not been asked for before, which is the longest
+                // key name this database has ever answered with. The draw after
+                // it pays nothing, and that is the test below.
+                yo_alloc::high_water(|| buf.extend_from_slice(key));
                 found = true;
                 break;
             }
@@ -567,5 +572,23 @@ mod tests {
         }
         db.at(b"k4242").del(b"k4242");
         assert_eq!(db.random_key(), None);
+    }
+
+    /// The buffer the answer is copied into is kept, so the draw after the
+    /// first one of that length pays the allocator nothing. That is the claim
+    /// the `yo_alloc::high_water` in `random_key` is making.
+    #[test]
+    fn a_second_random_key_does_not_allocate() {
+        let mut db = filled(8, 500);
+        assert!(db.random_key().is_some(), "the database is not empty");
+        let (_, allocs) = crate::tally::counted(|| {
+            for _ in 0..200 {
+                assert!(db.random_key().is_some(), "the database is not empty");
+            }
+        });
+        assert_eq!(
+            allocs, 0,
+            "randomkey allocated {allocs} times in two hundred"
+        );
     }
 }
