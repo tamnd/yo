@@ -64,7 +64,7 @@ use crate::keyspace::Keyspace;
 use crate::scan::Cursor;
 use crate::strings;
 use crate::value::{self, Kind};
-use crate::zset::{Added, Bound, Lex, Limits, Member, Zset};
+use crate::zset::{Added, Bound, Lex, Member, Zset};
 use crate::zsetops::{self, Aggregate, Op, Operand};
 
 /// Which members a `ZADD` is allowed to touch.
@@ -841,11 +841,12 @@ impl Db {
         if let Some(home) = self.one_stripe(keys.clone()) {
             return self.hold_stripe(home).zsetop(op, keys, weights, agg, f);
         }
-        let slots = self.operand_slots(keys)?;
-        let held = self.hold_operands(&slots);
+        // Stripe zero comes along for the limits the result is built under,
+        // which belong to no key here. See [`Db::zset_limits`].
+        let mut held = self.hold_operands(keys.clone(), Some(0));
+        let slots = self.operand_slots(&mut held, keys)?;
         let got = zsetops::gather(op, &operands_of(&held, &slots), weights, agg);
-        drop(held);
-        let limits = self.zset_limits();
+        let limits = held.stripe(0).zset_limits;
         let Some(z) = Zset::from_elements(got, &limits) else {
             return Ok(0);
         };
@@ -873,15 +874,15 @@ impl Db {
                 .hold_stripe(home)
                 .zsetop_store(op, destination, keys, weights, agg);
         }
-        let slots = self.operand_slots(keys)?;
-        let held = self.hold_operands(&slots);
+        let onto = self.stripe_of(destination);
+        let mut held = self.hold_operands(keys.clone(), Some(onto));
+        let slots = self.operand_slots(&mut held, keys)?;
         let got = zsetops::gather(op, &operands_of(&held, &slots), weights, agg);
-        drop(held);
         // The destination's stripe's limits, since that is where the result is
         // going to live.
-        let limits = self.hold(destination).zset_limits;
+        let limits = held.stripe(onto).zset_limits;
         let built = Zset::from_elements(got, &limits);
-        Ok(self.hold(destination).put_zset(destination, built))
+        Ok(held.stripe_mut(onto).put_zset(destination, built))
     }
 
     /// `ZINTERCARD numkeys key [key ...] [LIMIT limit]`.
@@ -893,8 +894,8 @@ impl Db {
         if let Some(home) = self.one_stripe(keys.clone()) {
             return self.hold_stripe(home).zintercard(keys, limit);
         }
-        let slots = self.operand_slots(keys)?;
-        let held = self.hold_operands(&slots);
+        let mut held = self.hold_operands(keys.clone(), None);
+        let slots = self.operand_slots(&mut held, keys)?;
         Ok(zsetops::intercard(&operands_of(&held, &slots), limit))
     }
 
@@ -910,17 +911,19 @@ impl Db {
         if onto == home {
             return self.hold_stripe(onto).zrangestore(destination, source, q);
         }
+        // Both at once and in stripe order rather than one and then the other,
+        // because the source is read into the table, the destination's limits
+        // decide how the table is built, and the destination is written from
+        // it. Held for the whole of that, so the source cannot be added to
+        // after it was read.
+        let mut held = self.hold_many([home, onto].into_iter());
         // Out of the stripe and then let go of, because a match keeps whatever
         // it is looking at alive for the whole of itself and the arm below
         // wants this same stripe again.
-        let slot = self.hold_stripe(home).zset_slot(source)?;
+        let slot = held.stripe_mut(home).zset_slot(source)?;
         let built = match slot {
             None => None,
             Some(at) => {
-                // Both at once and in stripe order rather than one and then the
-                // other, because the source is read into the table and the
-                // destination's limits decide how the table is built.
-                let held = self.hold_many([home, onto].into_iter());
                 let z = held.stripe(home).zset_at(at);
                 let w = window(z, q);
                 let mut got = Elements::with_capacity(w.count.max(16));
@@ -933,7 +936,23 @@ impl Db {
                 Zset::from_elements(got, &limits)
             }
         };
-        Ok(self.hold_stripe(onto).put_zset(destination, built))
+        Ok(held.stripe_mut(onto).put_zset(destination, built))
+    }
+
+    /// Every stripe the algebra names, held at once, in stripe order, with one
+    /// more for wherever the answer is going.
+    ///
+    /// Before anything is resolved rather than after, because a slot number is
+    /// only good while the stripe it came from is held: let go of it and the key
+    /// can be deleted and the slot handed to something else, and what was read
+    /// back would be a different body under the same number.
+    fn hold_operands<'k>(
+        &self,
+        keys: impl Iterator<Item = &'k [u8]>,
+        onto: Option<usize>,
+    ) -> Holds<'_> {
+        let named = keys.map(|key| self.stripe_of(key));
+        self.hold_many(named.chain(onto))
     }
 
     /// Reap and resolve every input key, in order, to the stripe and slot its
@@ -941,36 +960,23 @@ impl Db {
     ///
     /// As [`Keyspace::operand_slots`], down to keeping a key that is not there in
     /// place rather than dropping it, because `WEIGHTS` is positional. Each key
-    /// is resolved on its own stripe, which is the only difference, and it has to
-    /// happen before any body is read because the reap wants the stripe mutably.
-    fn operand_slots<'k>(&self, keys: impl Iterator<Item = &'k [u8]>) -> Result<Vec<Option<Home>>> {
+    /// is resolved on the stripe it is on, out of the ones already held, which
+    /// is the only difference, and it is a pass of its own because reaping a key
+    /// wants its stripe mutably and reading a body wants it shared.
+    fn operand_slots<'k>(
+        &self,
+        held: &mut Holds<'_>,
+        keys: impl Iterator<Item = &'k [u8]>,
+    ) -> Result<Vec<Option<Home>>> {
         let mut out = Vec::with_capacity(keys.size_hint().0);
         for key in keys {
             let stripe = self.stripe_of(key);
-            let got = self
-                .hold_stripe(stripe)
+            let got = held
+                .stripe_mut(stripe)
                 .live_slot_either(key, Kind::Zset, Kind::Set)?;
             out.push(got.map(|(kind, at)| (stripe, kind, at)));
         }
         Ok(out)
-    }
-
-    /// Every stripe those slots name, held at once, in stripe order.
-    ///
-    /// This is why the resolving above is a pass of its own: reaping a key wants
-    /// its stripe mutably and reading a body wants it held, and an operation
-    /// over four keys on four stripes wants all four bodies at the same time.
-    fn hold_operands(&self, slots: &[Option<Home>]) -> Holds<'_> {
-        self.hold_many(slots.iter().flatten().map(|&(stripe, _, _)| stripe))
-    }
-
-    /// The limits a result that belongs to no key is built under.
-    ///
-    /// Stripe zero's, because the two thresholds a sorted set is promoted at are
-    /// a setting of the database rather than of one stripe and every stripe
-    /// carries the same pair.
-    fn zset_limits(&self) -> Limits {
-        self.hold_stripe(0).zset_limits
     }
 }
 

@@ -441,12 +441,14 @@ impl Db {
                 .hold_stripe(home)
                 .geosearchstore(dest, src, shape, limit, dist);
         }
-        let n = self.hold_stripe(home).geosearch(src, shape, limit)?;
+        // Both at once and in stripe order, since the search leaves its hits in
+        // the source stripe's scratch, the destination's limits decide what is
+        // built from them, and the destination is written from that. The search
+        // runs with both already held, because a scratch that was filled and
+        // then let go of is a scratch the next search on that stripe overwrites.
+        let mut held = self.hold_many([home, onto].into_iter());
+        let n = held.stripe_mut(home).geosearch(src, shape, limit)?;
         let mut got = Elements::with_capacity(n.max(16));
-        // Both at once and in stripe order, since the hits are read out of the
-        // source's stripe and the destination's limits decide what is built
-        // from them.
-        let held = self.hold_many([home, onto].into_iter());
         for (name, hit) in held.stripe(home).geohits().iter() {
             let score = if dist {
                 hit.metres / shape.unit.metres()
@@ -457,8 +459,7 @@ impl Db {
         }
         let limits = held.stripe(onto).zset_limits;
         let built = Zset::from_elements(got, &limits);
-        drop(held);
-        Ok(self.hold_stripe(onto).put_zset(dest, built))
+        Ok(held.stripe_mut(onto).put_zset(dest, built))
     }
 }
 

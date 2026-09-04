@@ -69,10 +69,12 @@
 //! built out of the elements, so there is nothing here to route once at the top
 //! the way every other command is routed.
 //!
-//! So every key access below finds its own stripe. Nothing is held across one,
-//! which is what the copying already forced: the elements were being copied out
-//! before any lookup happened anyway, for the reason [`Db::sort`] gives, and
-//! that copy is what lets the next lookup take a different stripe.
+//! So the stripes are taken before the command starts rather than one at a
+//! time as the names appear. A sort with a pattern in it takes every stripe of
+//! the database, because the names are built out of the elements and the
+//! stripes those land on are, between them, all of them. A sort without one
+//! takes the one stripe its key is on, and the two stripes its key and its
+//! destination are on when there is a `STORE`.
 //!
 //! # Divergence
 //!
@@ -89,7 +91,7 @@
 //! with a zero byte in it sorts on all of its bytes, where `strcoll` stops at
 //! the zero. Registered in `divergences.toml`.
 
-use crate::db::Db;
+use crate::db::{Db, Holds};
 use crate::keyspace::wrong_type;
 use crate::value::Kind;
 use crate::zsets::Window;
@@ -160,7 +162,8 @@ impl Db {
     pub fn sort(&self, key: &[u8], opts: &Sort<'_>) -> Result<Vec<Option<Vec<u8>>>> {
         let mut opts = *opts;
         opts.store = false;
-        self.sorted(key, &opts)
+        let mut held = self.reach(key, None, &opts);
+        self.sorted(&mut held, key, &opts)
     }
 
     /// `SORT key ... STORE destination`, which answers the length of the list it
@@ -175,33 +178,58 @@ impl Db {
     /// thing it could be, and it is what Redis stores.
     ///
     /// The destination is on its own stripe, which is not generally the stripe
-    /// the elements came from, so it is found here after the sort rather than
-    /// anywhere near the read.
+    /// the elements came from, and it is held from the start alongside the rest
+    /// rather than reached for once the sort is done, so that nothing can write
+    /// into it between the read and the store.
     pub fn sort_store(&self, key: &[u8], dest: &[u8], opts: &Sort<'_>) -> Result<usize> {
         let mut opts = *opts;
         opts.store = true;
-        let rows = self.sorted(key, &opts)?;
+        let mut held = self.reach(key, Some(dest), &opts);
+        let rows = self.sorted(&mut held, key, &opts)?;
+        let onto = self.stripe_of(dest);
         if rows.is_empty() {
-            self.hold(dest).del(dest);
+            held.stripe_mut(onto).del(dest);
             return Ok(0);
         }
         // Written into a fresh key rather than appended to whatever was there,
         // and the delete comes first so that `SORT k STORE k` reads k, then
         // throws it away, then writes the answer. Redis is the same, and it is
         // the reason the elements had to be copied out before any of this.
-        self.hold(dest).del(dest);
+        held.stripe_mut(onto).del(dest);
         let owned: Vec<Vec<u8>> = rows.into_iter().map(Option::unwrap_or_default).collect();
-        self.hold(dest).push(
+        held.stripe_mut(onto).push(
             dest,
             crate::lists::End::Right,
             owned.iter().map(Vec::as_slice),
         )
     }
 
+    /// Every stripe this sort can touch, held, in stripe order.
+    ///
+    /// A `BY` or a `GET` with a `*` in it builds a key name out of each element,
+    /// and which stripes those names land on cannot be known before the elements
+    /// have been read. So a sort with a pattern in it takes the whole database
+    /// and a sort without one takes the one or two stripes it does name. The
+    /// wide form is the price of a command whose keys it cannot know in advance,
+    /// and it is no wider than what a client already gets from Redis, where a
+    /// sort holds the whole server for its whole run.
+    fn reach(&self, key: &[u8], dest: Option<&[u8]>, opts: &Sort<'_>) -> Holds<'_> {
+        if patterned(opts) {
+            return self.hold_many(0..self.width());
+        }
+        let named = std::iter::once(self.stripe_of(key));
+        self.hold_many(named.chain(dest.map(|d| self.stripe_of(d))))
+    }
+
     /// The body both of them share.
-    fn sorted(&self, key: &[u8], opts: &Sort<'_>) -> Result<Vec<Option<Vec<u8>>>> {
-        let kind = self.hold(key).kind_of(key);
-        let elems = self.elements(key, kind)?;
+    fn sorted(
+        &self,
+        held: &mut Holds<'_>,
+        key: &[u8],
+        opts: &Sort<'_>,
+    ) -> Result<Vec<Option<Vec<u8>>>> {
+        let kind = held.stripe_mut(self.stripe_of(key)).kind_of(key);
+        let elems = self.elements(held, key, kind)?;
 
         // A `BY` with no `*` cannot name a key per element, so it is an order to
         // leave things alone. The exception is the one the module doc explains.
@@ -225,21 +253,26 @@ impl Db {
             }
             e
         } else {
-            self.order(elems, by, alpha, opts.desc)?
+            self.order(held, elems, by, alpha, opts.desc)?
         };
 
         let window = limit(ordered.len(), opts.limit);
-        self.emit(&ordered[window], opts.get)
+        self.emit(held, &ordered[window], opts.get)
     }
 
     /// Copy the elements out of whatever holds them.
     ///
     /// Owned, for the reason [`Db::sort`] gives. A missing key is an empty
     /// list and not an error, so `SORT nosuchkey` answers nothing.
-    fn elements(&self, key: &[u8], kind: Option<Kind>) -> Result<Vec<Vec<u8>>> {
+    fn elements(
+        &self,
+        held: &mut Holds<'_>,
+        key: &[u8],
+        kind: Option<Kind>,
+    ) -> Result<Vec<Vec<u8>>> {
         let mut out = Vec::new();
         // One stripe for the whole of this, since it is all the same key.
-        let mut db = self.hold(key);
+        let db = held.stripe_mut(self.stripe_of(key));
         match kind {
             None => {}
             Some(Kind::List) => {
@@ -280,6 +313,7 @@ impl Db {
     /// Weigh every element and put them in order.
     fn order(
         &self,
+        held: &mut Holds<'_>,
         elems: Vec<Vec<u8>>,
         by: Option<&[u8]>,
         alpha: bool,
@@ -288,7 +322,7 @@ impl Db {
         let mut weighed = Vec::with_capacity(elems.len());
         for elem in elems {
             let looked = match by {
-                Some(pattern) => self.by_pattern(pattern, &elem),
+                Some(pattern) => self.by_pattern(held, pattern, &elem),
                 None => None,
             };
             let (score, text) = if alpha {
@@ -349,7 +383,12 @@ impl Db {
     }
 
     /// Build the answer, which is the elements themselves or a `GET` per element.
-    fn emit(&self, elems: &[Vec<u8>], get: &[&[u8]]) -> Result<Vec<Option<Vec<u8>>>> {
+    fn emit(
+        &self,
+        held: &mut Holds<'_>,
+        elems: &[Vec<u8>],
+        get: &[&[u8]],
+    ) -> Result<Vec<Option<Vec<u8>>>> {
         if get.is_empty() {
             return Ok(elems.iter().map(|e| Some(e.clone())).collect());
         }
@@ -359,7 +398,7 @@ impl Db {
                 if *pattern == b"#" {
                     out.push(Some(elem.clone()));
                 } else {
-                    out.push(self.by_pattern(pattern, elem));
+                    out.push(self.by_pattern(held, pattern, elem));
                 }
             }
         }
@@ -376,8 +415,9 @@ impl Db {
     ///
     /// The name is built out of the element, so the stripe it lands on is not
     /// known until here and two elements of the same key are read from two
-    /// different stripes as often as not.
-    fn by_pattern(&self, pattern: &[u8], elem: &[u8]) -> Option<Vec<u8>> {
+    /// different stripes as often as not. Every stripe is already held by then,
+    /// which is what [`Db::reach`] is for.
+    fn by_pattern(&self, held: &mut Holds<'_>, pattern: &[u8], elem: &[u8]) -> Option<Vec<u8>> {
         let star = pattern.iter().position(|&c| c == b'*')?;
         // The field split is looked for after the `*`, so a `->` in the prefix
         // is part of the key name. And there has to be something after it, so a
@@ -398,7 +438,7 @@ impl Db {
         key.extend_from_slice(elem);
         key.extend_from_slice(&key_part[star + 1..]);
 
-        let mut stripe = self.hold(&key);
+        let stripe = held.stripe_mut(self.stripe_of(&key));
         match field {
             Some(f) => stripe
                 .hget(&key, f, |t| {
@@ -412,6 +452,14 @@ impl Db {
             None => stripe.get(&key).ok().flatten().map(|s| s.to_vec()),
         }
     }
+}
+
+/// Whether this sort can name a key that was not given on the wire.
+///
+/// A `BY` with no `*` names nothing, and neither does a `GET #`, which is the
+/// element itself. Anything else with a `*` in it is a key per element.
+fn patterned(opts: &Sort<'_>) -> bool {
+    opts.by.is_some_and(|p| p.contains(&b'*')) || opts.get.iter().any(|&p| p != b"#")
 }
 
 /// Which slice of the sorted elements the `LIMIT` asked for.
