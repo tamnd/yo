@@ -4,6 +4,31 @@ What each release changed, why, and what it costs you. The versioning rules and 
 
 While the major is 0, a minor release may break anything, including the on-disk format. The format is frozen at `M6`, not before.
 
+## 0.3.16 — 2026-09-05
+
+Eight pull requests and no milestone has closed, so this is a patch.
+
+Two things are in it. The engine was split into a connection side and a server side and the stripes went behind a lock, which is the groundwork for running a database on more than one thread and changes nothing you can see from the outside yet. And the search query language landed, with `FT.EXPLAIN` and `FT.EXPLAINCLI` on top of it.
+
+A file written by 0.3.15 opens unchanged under this version and a file written by this version opens under 0.3.15. No record kind was added.
+
+### Added
+
+- **The search query language, and `FT.EXPLAIN` and `FT.EXPLAINCLI` on top of it.** These two commands print the tree a real server builds for a query, so there is no way to ship them without the parser being right first. What is parsed is words, prefixes and suffixes and infixes, fuzzy terms, phrases, field modifiers with and without a colon, numeric and geo and geoshape and tag and vector clauses, attribute clauses, parameters, unions and intersections, negation and optional, and wildcard. All three dialects behave the way the reference does, and they do not agree with each other: dialect 1 reads a bare star differently, ends a field modifier's reach at a different place, nests 97 brackets deep where the later two take 253, and words the refusal as an ordinary syntax error where the later two say the parser stack overflowed. The errors were treated as part of the contract rather than as an afterthought, because a client sees a refusal far more often than an explain tree, so every one carries the offset a real server reports and the word it quotes, including the cases where it quotes nothing at all. Checking was differential against a running 8.10.1 over a raw socket: forty seven batch files for the shapes that were hard, three fixed corpora of 320, 2880 and 672 queries, and a fuzzer over 1400 seeds at 400 queries each, all at zero differences across the three dialects, which is 560000 generated queries on top of the fixed ones. One difference is registered rather than copied, D-61, because the offset a real server gives when a dialect 1 query nests too deep does not point at anything a caller can act on.
+
+### Changed
+
+- **The engine is split into a connection side and a server side, and the stripes are behind a lock.** `serve` is still one thread and nothing about its behaviour changed, so there is nothing here to use yet. What it buys is that the thing a command holds while it runs is now a guard over one stripe rather than the whole engine, which is the shape the threaded server needs and is much easier to get right while there is still only one thread to get it wrong on. Every command group takes the database shared rather than owned, including the ones that span stripes and had to be reworked to do it.
+
+### Format
+
+No change. A file written by either of 0.3.15 and 0.3.16 opens under the other.
+
+### Known gaps
+
+- **`FT.SEARCH` and everything that reads documents are still not here.** What has landed so far is the index registry, the analysis pipeline and now the query language, which is all of the parts a search sits on top of and none of the search itself. `FT.SEARCH` with BM25 scoring is next, then `FT.AGGREGATE` and `FT.CURSOR`, then `FT.HYBRID`.
+- **`serve` is still one thread.** The stripes and the lock and the engine split are the routing and ownership half of M8. `serve --threads N` and the three number gates that milestone closes on are the other half.
+
 ## 0.3.15 — 2026-09-05
 
 Twenty four pull requests and no milestone has closed, so this is a patch. The reason is the same one as last time and it has not moved: M5, M6 and M7 all have their scope done and all three are held open by exit gates that are measurements rather than features, so the feature work for M8 keeps landing on top of them.
