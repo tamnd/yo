@@ -1,11 +1,11 @@
 //! `TS.*`, the time series family RedisTimeSeries put on the wire.
 //!
 //! The series itself is in `yo-series` and this is the wire in front of it, the
-//! same split as `super::cms` and the other module families. Eleven commands
+//! same split as `super::cms` and the other module families. Fourteen commands
 //! here: the key type, the two that shape a series, the four that write samples
 //! into it, the one that takes the newest sample back out, the one that reports
-//! on it and the two that read a span back either way round. The label index and
-//! compaction rules come next.
+//! on it, the two that read a span back either way round and the three that
+//! search on labels. The two multi key reads and the compaction rules come next.
 //!
 //! # Errors
 //!
@@ -68,6 +68,61 @@
 //! gap is filled end to end, a run before the first reading the series ever held
 //! is dropped, and a run after the last one is dropped as well.
 //!
+//! # The filter grammar
+//!
+//! Every command that searches on labels takes the same word and takes it apart
+//! the same way, and the way is not a grammar either. It is four steps. An
+//! argument holding `!=` anywhere is a negative one and splits on the two bytes
+//! `!` and `=`, one holding `=` but not `!=` is a positive one and splits on
+//! `=`, and one holding neither is `failed parsing labels`. Then, if there is a
+//! `(` that is not the first byte and the byte before it is `=`, the argument is
+//! the list form: it has to end in `)`, the label is the first field of the text
+//! before the bracket split on the separator bytes, and the text between the
+//! first `(` and the last `)` splits on commas with an empty field an error and
+//! an empty whole an empty list. Otherwise the whole argument splits on the
+//! separator bytes, the first field is the label and the second is the value,
+//! and no second field means present for a negative and absent for a positive.
+//!
+//! Splitting is `strtok`, so a run of separators counts as one and everything
+//! past the second field is dropped: `g==1`, `g===1` and `g=1=2` all ask the
+//! same question as `g=1`, and `g!!=1` is a negative on `g`. The bracket test
+//! reads the raw argument rather than a field, so `=(1)` is a list form with no
+//! label and is an error while `()=1` is an ordinary positive on the label `()`,
+//! and `g =(1)` asks about a label whose name ends in a space because nothing is
+//! trimmed anywhere. A bracket that is not straight behind a separator is an
+//! ordinary byte in an ordinary value, so `g=a(b` and `g=x()` are plain. Label
+//! names and values are both compared byte for byte, so case matters on both.
+//!
+//! A search needs at least one predicate that says which series to take, and
+//! only equals and the list form count, an empty list included. Anything else
+//! is `please provide at least one matcher`. `TS.QUERYLABELS` is the exception
+//! because its filter is optional, and with no filter at all it takes every
+//! series and never asks that question.
+//!
+//! # The label surface walks the keyspace
+//!
+//! There is no index from a label to the series wearing it. The three commands
+//! here walk every key in the keyspace, keep the ones that are series and ask
+//! each one whether the rules hold, which is why they carry `bounded = "risk"`
+//! in the registry. The reason is the one already written down in
+//! `yo_kv::foreign`: a second table means `DEL`, `TYPE`, `EXISTS`, `KEYS`,
+//! `SCAN`, `RANDOMKEY`, `EXPIRE`, `DBSIZE` and `FLUSHDB` each have to know about
+//! it and stay in step with it, and nine places that have to agree will not. An
+//! index can come later behind a measurement that says it is needed.
+//!
+//! # A label name written down twice
+//!
+//! A series is allowed to hold the same label name more than once and the two
+//! ways of reading one back disagree about which value that is. `TS.MGET` with
+//! `SELECTED_LABELS` gives the first in the order the labels were written.
+//! `TS.QUERYLABELS VALUES` gives the smallest by byte order, so a series holding
+//! `r=bb` and then `r=b` answers `b` on one and `bb` on the other. `TS.MGET`
+//! with `WITHLABELS` sidesteps the question and writes every pair. Matching
+//! looks at all of them, so such a series is found by either value.
+//!
+//! Two of the sentences the module raises about the keyword `SELECTED_LABELS`
+//! spell it `SELECT_LABELS`, without the `ED`. That is copied as it stands.
+//!
 //! # Where the two protocols disagree
 //!
 //! A sample value is a simple string of the shortest digits that read back as
@@ -113,7 +168,7 @@
 
 use yo_common::num::{DOUBLE_MAX, parse_f64, parse_i64, write_dragonbox};
 use yo_common::{Code, Error, Result};
-use yo_kv::{Foreign, Keyspace};
+use yo_kv::{Foreign, KeyCursor, Keyspace, Kind};
 use yo_series::{Agg, Buckets, Encoding, Policy, Query, Refused, Sample, Series, Stamp, Unread};
 
 use super::args::{self, Args};
@@ -218,6 +273,21 @@ const FILTER_TS_MISSING: &[u8] = b"TSDB: FILTER_BY_TS one or more arguments are 
 /// A read that would have built more rows than yo will build, which is D-54 and
 /// is the one sentence here the module has no counterpart for.
 const TOO_WIDE: &[u8] = b"TSDB: the requested range holds too many empty buckets";
+/// A filter word that is not a predicate at all.
+const BAD_FILTER: &[u8] = b"TSDB: failed parsing labels";
+/// A filter list with nothing in it that says which series to take.
+const NO_MATCHER: &[u8] = b"TSDB: please provide at least one matcher";
+/// A `FILTER` on `TS.QUERYLABELS` with nothing behind it.
+const NO_EXPRESSIONS: &[u8] = b"TSDB: FILTER given with no filter expressions";
+/// A `TS.QUERYLABELS` whose first word is neither of the two it takes.
+const BAD_SUBTYPE: &[u8] = b"TSDB: unknown subtype, must be one of LABELS|VALUES";
+/// A word where `TS.QUERYLABELS` expects the one keyword it takes.
+const EXPECTED_FILTER: &[u8] = b"TSDB: unknown argument, expected FILTER";
+/// Both ways of asking for labels back at once. The module drops the `ED` from
+/// one of the two keywords in its own sentence and this copies that.
+const BOTH_LABELS: &[u8] = b"TSDB: cannot accept WITHLABELS and SELECT_LABELS together";
+/// A `SELECTED_LABELS` with no label named behind it, spelled the same way.
+const NO_SELECTED: &[u8] = b"TSDB: SELECT_LABELS should have at least 1 parameter";
 /// A retention below zero, which the module writes with no prefix at all where
 /// a retention that is not a number gets one.
 const BARE_RETENTION: &[u8] = b"TSDB: Couldn't parse RETENTION";
@@ -296,6 +366,9 @@ pub(super) fn execute(db: &mut Keyspace, spec: &Spec, args: Args<'_>, out: &mut 
         "ts.get" => get(db, &args, out),
         "ts.range" => range(db, &args, out, false),
         "ts.revrange" => range(db, &args, out, true),
+        "ts.queryindex" => queryindex(db, &args, out),
+        "ts.querylabels" => querylabels(db, &args, out),
+        "ts.mget" => mget(db, &args, out),
         "ts.info" => info(db, &args, out),
         other => unreachable!("{other} is not a time series command"),
     }
@@ -773,6 +846,382 @@ fn by_ts(args: &Args<'_>) -> core::result::Result<Option<Vec<i64>>, Bad> {
     list.sort_unstable();
     list.dedup();
     Ok(Some(list))
+}
+
+/// One predicate off one filter word.
+///
+/// Six of them, and the split that matters is not equal against not equal: it is
+/// whether the predicate says which series to take or only which ones to leave
+/// out. A filter list made only of the second kind is refused, because it would
+/// otherwise mean the whole keyspace.
+#[derive(Debug)]
+enum Rule {
+    /// `label=value`.
+    Is(Vec<u8>, Vec<u8>),
+    /// `label!=value`.
+    IsNot(Vec<u8>, Vec<u8>),
+    /// `label=(a,b,c)`, and an empty list is allowed and matches nothing.
+    In(Vec<u8>, Vec<Vec<u8>>),
+    /// `label!=(a,b,c)`.
+    NotIn(Vec<u8>, Vec<Vec<u8>>),
+    /// `label!=`, which is the series that have the label at all.
+    Present(Vec<u8>),
+    /// `label=`, which is the series that do not.
+    Absent(Vec<u8>),
+}
+
+impl Rule {
+    /// Whether this predicate says which series to take rather than which to
+    /// leave out.
+    fn positive(&self) -> bool {
+        matches!(self, Rule::Is(..) | Rule::In(..))
+    }
+
+    /// Whether a series wearing `labels` passes.
+    ///
+    /// A label name can be written down twice on one series and both stay, so
+    /// every one of these looks at all the values under the name rather than the
+    /// first, and the two negatives are the positives turned round rather than
+    /// their own walk.
+    fn holds(&self, labels: &[(Vec<u8>, Vec<u8>)]) -> bool {
+        let any = |name: &Vec<u8>, take: &dyn Fn(&Vec<u8>) -> bool| {
+            labels.iter().any(|(n, v)| n == name && take(v))
+        };
+        match self {
+            Rule::Is(name, want) => any(name, &|v| v == want),
+            Rule::IsNot(name, want) => !any(name, &|v| v == want),
+            Rule::In(name, list) => any(name, &|v| list.contains(v)),
+            Rule::NotIn(name, list) => !any(name, &|v| list.contains(v)),
+            Rule::Present(name) => any(name, &|_| true),
+            Rule::Absent(name) => !any(name, &|_| true),
+        }
+    }
+}
+
+/// One filter word turned into a predicate.
+///
+/// The module reads these with `strtok`, which skips a run of separators rather
+/// than seeing an empty field between two of them, so `room==kitchen` is
+/// `room=kitchen` and `room=kitchen=x` is too. The list form is the one place
+/// that is not true: there the label is whatever comes before the bracket, taken
+/// apart the same way, and the value is the raw text between the brackets. A
+/// bracket that is not straight after the separator is an ordinary character in
+/// an ordinary value, which is why `room=a(b` is a filter for the value `a(b`
+/// and `room=(a,b` is a malformed list.
+fn rule(arg: &[u8]) -> core::result::Result<Rule, Bad> {
+    let negated = arg.windows(2).any(|w| w == b"!=");
+    let separator: &[u8] = if negated {
+        b"!="
+    } else if arg.contains(&b'=') {
+        b"="
+    } else {
+        return Err(Bad::Said(BAD_FILTER));
+    };
+    if let Some(open) = arg.iter().position(|&b| b == b'(')
+        && open > 0
+        && arg[open - 1] == b'='
+    {
+        if arg.last() != Some(&b')') {
+            return Err(Bad::Said(BAD_FILTER));
+        }
+        let mut at = 0;
+        let Some(name) = word(&arg[..open], separator, &mut at) else {
+            return Err(Bad::Said(BAD_FILTER));
+        };
+        let inside = &arg[open + 1..arg.len() - 1];
+        let mut list = Vec::new();
+        if !inside.is_empty() {
+            for part in inside.split(|&b| b == b',') {
+                if part.is_empty() {
+                    return Err(Bad::Said(BAD_FILTER));
+                }
+                list.push(part.to_vec());
+            }
+        }
+        let name = name.to_vec();
+        return Ok(if negated {
+            Rule::NotIn(name, list)
+        } else {
+            Rule::In(name, list)
+        });
+    }
+    let mut at = 0;
+    let Some(name) = word(arg, separator, &mut at) else {
+        return Err(Bad::Said(BAD_FILTER));
+    };
+    let name = name.to_vec();
+    match word(arg, separator, &mut at) {
+        Some(value) => {
+            let value = value.to_vec();
+            Ok(if negated {
+                Rule::IsNot(name, value)
+            } else {
+                Rule::Is(name, value)
+            })
+        }
+        None if negated => Ok(Rule::Present(name)),
+        None => Ok(Rule::Absent(name)),
+    }
+}
+
+/// The next run of `arg` that is not made of separators, starting at `at` and
+/// leaving `at` past it. This is `strtok` and nothing more.
+fn word<'a>(arg: &'a [u8], separator: &[u8], at: &mut usize) -> Option<&'a [u8]> {
+    while *at < arg.len() && separator.contains(&arg[*at]) {
+        *at += 1;
+    }
+    let start = *at;
+    while *at < arg.len() && !separator.contains(&arg[*at]) {
+        *at += 1;
+    }
+    (start < *at).then(|| &arg[start..*at])
+}
+
+/// A whole filter list, which has to name at least one thing to take.
+fn rules(args: &Args<'_>, from: usize) -> core::result::Result<Vec<Rule>, Bad> {
+    let mut list = Vec::with_capacity(args.len().saturating_sub(from));
+    for i in from..args.len() {
+        list.push(rule(args.get(i))?);
+    }
+    if !list.iter().any(Rule::positive) {
+        return Err(Bad::Said(NO_MATCHER));
+    }
+    Ok(list)
+}
+
+/// Every series the filter list takes, by key name, in order.
+///
+/// This walks the keyspace rather than reading a label index, and that is on
+/// purpose. An index beside the keyspace is a second table that `DEL`, `EXPIRE`,
+/// `RENAME`, `COPY`, `RESTORE`, `FLUSHDB` and eviction all have to remember to
+/// keep in step, and the one that forgets leaves a filter answering a key that
+/// is not there any more. The walk cannot drift because there is nothing for it
+/// to drift from, and it only ever touches the keys holding a foreign body,
+/// which on a keyspace that is mostly strings and hashes is a small part of it.
+fn chosen(db: &mut Keyspace, rules: &[Rule]) -> Vec<Vec<u8>> {
+    let mut names = Vec::new();
+    db.scan(KeyCursor::START, usize::MAX, Some(Kind::Foreign), |key| {
+        names.push(key.to_vec());
+    });
+    names.retain(|name| {
+        db.foreign(name)
+            .ok()
+            .flatten()
+            .and_then(<dyn Foreign>::downcast_ref::<TsBody>)
+            .is_some_and(|body| rules.iter().all(|r| r.holds(body.s.labels())))
+    });
+    names.sort_unstable();
+    names
+}
+
+/// `TS.QUERYINDEX filter [filter ...]`, the key names a filter list takes.
+fn queryindex(db: &mut Keyspace, args: &Args<'_>, out: &mut Out) -> Result<()> {
+    let rules = match rules(args, 1) {
+        Ok(rules) => rules,
+        Err(bad) => return said(bad, "ts.queryindex", out),
+    };
+    let names = chosen(db, &rules);
+    out.set(names.len());
+    for name in &names {
+        out.bulk(name);
+    }
+    Ok(())
+}
+
+/// `TS.QUERYLABELS LABELS [FILTER filter ...]` for the label names in use, and
+/// `TS.QUERYLABELS VALUES label [FILTER filter ...]` for the values one of them
+/// takes.
+///
+/// This is the one command in the family where a filter list is optional, and a
+/// missing one means every series rather than none, so the rule about naming at
+/// least one thing to take does not apply until a `FILTER` is written down.
+fn querylabels(db: &mut Keyspace, args: &Args<'_>, out: &mut Out) -> Result<()> {
+    let values = if args::is(args.get(1), b"LABELS") {
+        false
+    } else if args::is(args.get(1), b"VALUES") {
+        true
+    } else {
+        return say(out, BAD_SUBTYPE);
+    };
+    // `VALUES` needs the label it is asking about, and the module counts that
+    // itself rather than leaving it to the arity in the table.
+    let at = if values { 3 } else { 2 };
+    if args.len() < at {
+        return Err(args::wrong_arity("ts.querylabels"));
+    }
+    let mut rules = Vec::new();
+    if args.len() > at {
+        if !args::is(args.get(at), b"FILTER") {
+            return say(out, EXPECTED_FILTER);
+        }
+        if args.len() == at + 1 {
+            return say(out, NO_EXPRESSIONS);
+        }
+        rules = match self::rules(args, at + 1) {
+            Ok(rules) => rules,
+            Err(bad) => return said(bad, "ts.querylabels", out),
+        };
+    }
+    let wanted = if values {
+        args.get(2).to_vec()
+    } else {
+        Vec::new()
+    };
+    let mut found: Vec<Vec<u8>> = Vec::new();
+    for name in chosen(db, &rules) {
+        let Some(body) = read(db, &name)? else {
+            continue;
+        };
+        if values {
+            // A series that writes the same label name down twice contributes
+            // one value here and it is the smallest of them, which is not the
+            // first the way `SELECTED_LABELS` is. The module reads this side
+            // off a form sorted by name and then by value and stops at the
+            // first row that matches, so a later duplicate never shows up.
+            let smallest = body
+                .s
+                .labels()
+                .iter()
+                .filter(|(label, _)| *label == wanted)
+                .map(|(_, value)| value)
+                .min();
+            if let Some(value) = smallest {
+                found.push(value.clone());
+            }
+        } else {
+            for (label, _) in body.s.labels() {
+                found.push(label.clone());
+            }
+        }
+    }
+    found.sort_unstable();
+    found.dedup();
+    out.set(found.len());
+    for word in &found {
+        out.bulk(word);
+    }
+    Ok(())
+}
+
+/// Which labels a multi key read writes back beside each series.
+#[derive(Default)]
+enum Wearing {
+    /// None, which is what a read that asked for nothing gets.
+    #[default]
+    None,
+    /// All of them.
+    All,
+    /// These, in this order, with a nil where the series has no such label.
+    These(Vec<Vec<u8>>),
+}
+
+/// `TS.MGET [LATEST] [WITHLABELS | SELECTED_LABELS label ...] FILTER filter ...`,
+/// the newest sample of every series a filter list takes.
+///
+/// `FILTER` is not optional and its absence is an arity error rather than a
+/// syntax one, however many words the command has, because the module counts the
+/// arguments it needed after it has found the keyword rather than before.
+fn mget(db: &mut Keyspace, args: &Args<'_>, out: &mut Out) -> Result<()> {
+    let Some(filter) = find(args, b"FILTER") else {
+        return Err(args::wrong_arity("ts.mget"));
+    };
+    let wearing = match wearing(args, filter) {
+        Ok(wearing) => wearing,
+        Err(bad) => return said(bad, "ts.mget", out),
+    };
+    let rules = match rules(args, filter + 1) {
+        Ok(rules) => rules,
+        Err(bad) => return said(bad, "ts.mget", out),
+    };
+    let names = chosen(db, &rules);
+    if out.proto().is_resp3() {
+        out.map(names.len());
+    } else {
+        out.array(names.len());
+    }
+    for name in &names {
+        let Some(body) = read(db, name)? else {
+            continue;
+        };
+        let last = body.s.last_sample();
+        let labels = body.s.labels().to_vec();
+        // RESP3 has the key as the map key and the rest as a pair behind it.
+        // RESP2 has no map, so the key goes inside a triple with the other two.
+        if out.proto().is_resp3() {
+            out.bulk(name);
+            out.array(2);
+        } else {
+            out.array(3);
+            out.bulk(name);
+        }
+        wearing.write(out, &labels);
+        match last {
+            None => out.array(0),
+            Some(sample) => {
+                out.array(2);
+                out.int(sample.at);
+                value(out, sample.value);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Which labels a multi key read asked for, off the words in front of `FILTER`.
+fn wearing(args: &Args<'_>, filter: usize) -> core::result::Result<Wearing, Bad> {
+    let all = find(args, b"WITHLABELS").is_some_and(|at| at < filter);
+    let some = find(args, b"SELECTED_LABELS").filter(|&at| at < filter);
+    if all && some.is_some() {
+        return Err(Bad::Said(BOTH_LABELS));
+    }
+    if let Some(at) = some {
+        let list: Vec<Vec<u8>> = (at + 1..filter).map(|i| args.get(i).to_vec()).collect();
+        if list.is_empty() {
+            return Err(Bad::Said(NO_SELECTED));
+        }
+        return Ok(Wearing::These(list));
+    }
+    Ok(if all { Wearing::All } else { Wearing::None })
+}
+
+impl Wearing {
+    /// The labels half of one series in a multi key reply.
+    ///
+    /// A map on RESP3 and a list of pairs on RESP2, which is the same split
+    /// `TS.INFO` makes one level down and not the flat array a map downgrades
+    /// to on its own.
+    fn write(&self, out: &mut Out, labels: &[(Vec<u8>, Vec<u8>)]) {
+        let pairs: Vec<(&[u8], Option<&[u8]>)> = match self {
+            Wearing::None => Vec::new(),
+            Wearing::All => labels
+                .iter()
+                .map(|(n, v)| (n.as_slice(), Some(v.as_slice())))
+                .collect(),
+            Wearing::These(wanted) => wanted
+                .iter()
+                .map(|name| {
+                    let found = labels.iter().find(|(n, _)| n == name);
+                    (name.as_slice(), found.map(|(_, v)| v.as_slice()))
+                })
+                .collect(),
+        };
+        let resp3 = out.proto().is_resp3();
+        if resp3 {
+            out.map(pairs.len());
+        } else {
+            out.array(pairs.len());
+        }
+        for (name, value) in pairs {
+            if !resp3 {
+                out.array(2);
+            }
+            out.bulk(name);
+            match value {
+                Some(value) => out.bulk(value),
+                None => out.nil(),
+            }
+        }
+    }
 }
 
 /// `TS.INFO key`, which is fourteen fields about the series and takes no field

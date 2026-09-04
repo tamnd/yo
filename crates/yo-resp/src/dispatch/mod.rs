@@ -15181,6 +15181,321 @@ mod tests {
         );
     }
 
+    /// The five series every test of the label surface works against.
+    fn labelled() -> Fixture {
+        let mut f = Fixture::new();
+        f.run(&[
+            b"TS.CREATE",
+            b"a",
+            b"LABELS",
+            b"room",
+            b"kitchen",
+            b"x",
+            b"1",
+        ]);
+        f.run(&[
+            b"TS.CREATE",
+            b"b",
+            b"LABELS",
+            b"room",
+            b"bedroom",
+            b"x",
+            b"2",
+        ]);
+        f.run(&[b"TS.CREATE", b"c", b"LABELS", b"room", b"kitchen"]);
+        f.run(&[b"TS.CREATE", b"d"]);
+        f.run(&[b"TS.CREATE", b"e", b"LABELS", b"r", b"bb", b"r", b"b"]);
+        f.run(&[b"TS.ADD", b"a", b"100", b"1.5"]);
+        f.run(&[b"TS.ADD", b"b", b"200", b"2"]);
+        f
+    }
+
+    /// The filter grammar, which is four steps and a `strtok` rather than a
+    /// grammar, and which every command that searches on labels shares.
+    #[test]
+    fn a_filter_is_taken_apart_the_way_the_module_takes_one_apart() {
+        let mut f = labelled();
+        let cases: &[(&[&[u8]], &str)] = &[
+            // The plain forms, and the order the answer comes back in, which is
+            // by key name and not by anything the series remembers.
+            (
+                &[b"TS.QUERYINDEX", b"room=kitchen"],
+                "*2\r\n$1\r\na\r\n$1\r\nc\r\n",
+            ),
+            (
+                &[b"TS.QUERYINDEX", b"room=kitchen", b"x=1"],
+                "*1\r\n$1\r\na\r\n",
+            ),
+            (
+                &[b"TS.QUERYINDEX", b"room=(kitchen,bedroom)"],
+                "*3\r\n$1\r\na\r\n$1\r\nb\r\n$1\r\nc\r\n",
+            ),
+            // An empty list still counts as something that says which series to
+            // take, it just never takes any.
+            (&[b"TS.QUERYINDEX", b"room=()"], "*0\r\n"),
+            // Absent and present, neither of which stands on its own.
+            (
+                &[b"TS.QUERYINDEX", b"x=", b"room=kitchen"],
+                "*1\r\n$1\r\nc\r\n",
+            ),
+            (
+                &[b"TS.QUERYINDEX", b"room=kitchen", b"x!="],
+                "*1\r\n$1\r\na\r\n",
+            ),
+            (
+                &[b"TS.QUERYINDEX", b"room!=kitchen", b"x!="],
+                "-ERR TSDB: please provide at least one matcher\r\n",
+            ),
+            // A run of separators is one separator and everything past the
+            // second field is dropped, so all three of these ask one question.
+            (
+                &[b"TS.QUERYINDEX", b"room==kitchen"],
+                "*2\r\n$1\r\na\r\n$1\r\nc\r\n",
+            ),
+            (
+                &[b"TS.QUERYINDEX", b"room=kitchen=zz"],
+                "*2\r\n$1\r\na\r\n$1\r\nc\r\n",
+            ),
+            (&[b"TS.QUERYINDEX", b"room!!=kitchen", b"x=1"], "*0\r\n"),
+            // A bracket is only a list when it sits straight behind the
+            // separator, and then the label in front of it has to be there.
+            (&[b"TS.QUERYINDEX", b"()=1"], "*0\r\n"),
+            (
+                &[b"TS.QUERYINDEX", b"=(1)"],
+                "-ERR TSDB: failed parsing labels\r\n",
+            ),
+            (
+                &[b"TS.QUERYINDEX", b"room=(kitchen,)"],
+                "-ERR TSDB: failed parsing labels\r\n",
+            ),
+            (
+                &[b"TS.QUERYINDEX", b"room=(kitchen"],
+                "-ERR TSDB: failed parsing labels\r\n",
+            ),
+            (&[b"TS.QUERYINDEX", b"room=x()"], "*0\r\n"),
+            (
+                &[b"TS.QUERYINDEX", b"nonsense"],
+                "-ERR TSDB: failed parsing labels\r\n",
+            ),
+            // Nothing here says which series to take.
+            (
+                &[b"TS.QUERYINDEX", b"room!=kitchen"],
+                "-ERR TSDB: please provide at least one matcher\r\n",
+            ),
+            // Names and values are both compared byte for byte.
+            (&[b"TS.QUERYINDEX", b"ROOM=kitchen"], "*0\r\n"),
+            (&[b"TS.QUERYINDEX", b"room=KITCHEN"], "*0\r\n"),
+            (
+                &[b"TS.QUERYINDEX"],
+                "-ERR wrong number of arguments for 'ts.queryindex' command\r\n",
+            ),
+        ];
+        for (argv, want) in cases {
+            let got = f.run(argv);
+            assert_eq!(&got, want, "{:?}", argv.last());
+        }
+    }
+
+    /// `TS.QUERYLABELS`, whose filter is the one that is allowed to be missing.
+    #[test]
+    fn querylabels_says_which_names_are_worn_and_what_they_are_set_to() {
+        let mut f = labelled();
+        let cases: &[(&[&[u8]], &str)] = &[
+            (
+                &[b"TS.QUERYLABELS", b"LABELS"],
+                "*3\r\n$1\r\nr\r\n$4\r\nroom\r\n$1\r\nx\r\n",
+            ),
+            (
+                &[b"TS.QUERYLABELS", b"LABELS", b"FILTER", b"room=kitchen"],
+                "*2\r\n$4\r\nroom\r\n$1\r\nx\r\n",
+            ),
+            (
+                &[b"TS.QUERYLABELS", b"VALUES", b"room"],
+                "*2\r\n$7\r\nbedroom\r\n$7\r\nkitchen\r\n",
+            ),
+            // The series wearing `r` twice contributes the smaller of the two
+            // here, which is not the one it was written down as first.
+            (&[b"TS.QUERYLABELS", b"VALUES", b"r"], "*1\r\n$1\r\nb\r\n"),
+            (&[b"TS.QUERYLABELS", b"VALUES", b"nolabel"], "*0\r\n"),
+            (
+                &[b"TS.QUERYLABELS", b"VALUES"],
+                "-ERR wrong number of arguments for 'ts.querylabels' command\r\n",
+            ),
+            (
+                &[b"TS.QUERYLABELS", b"ZZZ"],
+                "-ERR TSDB: unknown subtype, must be one of LABELS|VALUES\r\n",
+            ),
+            (
+                &[b"TS.QUERYLABELS", b"LABELS", b"ZZZ"],
+                "-ERR TSDB: unknown argument, expected FILTER\r\n",
+            ),
+            (
+                &[b"TS.QUERYLABELS", b"LABELS", b"FILTER"],
+                "-ERR TSDB: FILTER given with no filter expressions\r\n",
+            ),
+            // With no filter at all every series is taken, which is why the
+            // first case here answers about `r` as well. A filter that is there
+            // still has to say which series to take.
+            (
+                &[b"TS.QUERYLABELS", b"LABELS", b"FILTER", b"room!=kitchen"],
+                "-ERR TSDB: please provide at least one matcher\r\n",
+            ),
+            (
+                &[
+                    b"TS.QUERYLABELS",
+                    b"LABELS",
+                    b"FILTER",
+                    b"room=kitchen",
+                    b"x=",
+                ],
+                "*1\r\n$4\r\nroom\r\n",
+            ),
+        ];
+        for (argv, want) in cases {
+            let got = f.run(argv);
+            assert_eq!(&got, want, "{:?}", argv.last());
+        }
+    }
+
+    /// `TS.MGET`, the newest sample of every series a filter takes, and the two
+    /// ways of asking for the labels back alongside it.
+    #[test]
+    fn mget_writes_the_newest_sample_and_the_labels_that_were_asked_for() {
+        let mut f = labelled();
+        let cases: &[(&[&[u8]], &str)] = &[
+            // A series with no samples writes an empty array where the sample
+            // goes rather than dropping out of the reply.
+            (
+                &[b"TS.MGET", b"FILTER", b"room=kitchen"],
+                "*2\r\n*3\r\n$1\r\na\r\n*0\r\n*2\r\n:100\r\n+1.5\r\n\
+                 *3\r\n$1\r\nc\r\n*0\r\n*0\r\n",
+            ),
+            (
+                &[b"TS.MGET", b"WITHLABELS", b"FILTER", b"room=kitchen"],
+                "*2\r\n*3\r\n$1\r\na\r\n*2\r\n*2\r\n$4\r\nroom\r\n$7\r\nkitchen\r\n\
+                 *2\r\n$1\r\nx\r\n$1\r\n1\r\n*2\r\n:100\r\n+1.5\r\n\
+                 *3\r\n$1\r\nc\r\n*1\r\n*2\r\n$4\r\nroom\r\n$7\r\nkitchen\r\n*0\r\n",
+            ),
+            // A selected label the series does not wear is a nil, not a gap.
+            (
+                &[
+                    b"TS.MGET",
+                    b"SELECTED_LABELS",
+                    b"x",
+                    b"FILTER",
+                    b"room=kitchen",
+                ],
+                "*2\r\n*3\r\n$1\r\na\r\n*1\r\n*2\r\n$1\r\nx\r\n$1\r\n1\r\n\
+                 *2\r\n:100\r\n+1.5\r\n\
+                 *3\r\n$1\r\nc\r\n*1\r\n*2\r\n$1\r\nx\r\n$-1\r\n*0\r\n",
+            ),
+            // The other half of the duplicated name rule. This one takes the
+            // first written down where `TS.QUERYLABELS` takes the smallest.
+            (
+                &[b"TS.MGET", b"SELECTED_LABELS", b"r", b"FILTER", b"r=b"],
+                "*1\r\n*3\r\n$1\r\ne\r\n*1\r\n*2\r\n$1\r\nr\r\n$2\r\nbb\r\n*0\r\n",
+            ),
+            (
+                &[b"TS.MGET", b"WITHLABELS", b"FILTER", b"r=b"],
+                "*1\r\n*3\r\n$1\r\ne\r\n*2\r\n*2\r\n$1\r\nr\r\n$2\r\nbb\r\n\
+                 *2\r\n$1\r\nr\r\n$1\r\nb\r\n*0\r\n",
+            ),
+            // A word that is not an option is ignored, but a missing `FILTER`
+            // is an arity error whatever else was written.
+            (
+                &[b"TS.MGET", b"ZZZ", b"FILTER", b"room=bedroom"],
+                "*1\r\n*3\r\n$1\r\nb\r\n*0\r\n*2\r\n:200\r\n+2\r\n",
+            ),
+            (
+                &[b"TS.MGET", b"a", b"b", b"c"],
+                "-ERR wrong number of arguments for 'ts.mget' command\r\n",
+            ),
+            (
+                &[b"TS.MGET", b"FILTER"],
+                "-ERR wrong number of arguments for 'ts.mget' command\r\n",
+            ),
+            // Both keyword checks happen before the filter is read, and the two
+            // sentences spell the second keyword without its `ED`.
+            (
+                &[
+                    b"TS.MGET",
+                    b"WITHLABELS",
+                    b"SELECTED_LABELS",
+                    b"x",
+                    b"FILTER",
+                    b"bad",
+                ],
+                "-ERR TSDB: cannot accept WITHLABELS and SELECT_LABELS together\r\n",
+            ),
+            (
+                &[b"TS.MGET", b"SELECTED_LABELS", b"FILTER", b"bad"],
+                "-ERR TSDB: SELECT_LABELS should have at least 1 parameter\r\n",
+            ),
+        ];
+        for (argv, want) in cases {
+            let got = f.run(argv);
+            assert_eq!(&got, want, "{:?}", argv.last());
+        }
+    }
+
+    /// What RESP3 changes across the label surface, which is a set where there
+    /// was an array and a map where there was a pair of them.
+    #[test]
+    fn resp3_writes_the_label_surface_as_sets_and_maps() {
+        let mut f = labelled();
+        f.out = Out::new(Proto::Resp3);
+        let cases: &[(&[&[u8]], &str)] = &[
+            (
+                &[b"TS.QUERYINDEX", b"room=kitchen"],
+                "~2\r\n$1\r\na\r\n$1\r\nc\r\n",
+            ),
+            (
+                &[b"TS.QUERYLABELS", b"LABELS"],
+                "~3\r\n$1\r\nr\r\n$4\r\nroom\r\n$1\r\nx\r\n",
+            ),
+            (
+                &[b"TS.QUERYLABELS", b"VALUES", b"room"],
+                "~2\r\n$7\r\nbedroom\r\n$7\r\nkitchen\r\n",
+            ),
+            // The key stops being the first of three and becomes the map key,
+            // and the labels stop being pairs and become a map of their own.
+            (
+                &[b"TS.MGET", b"FILTER", b"room=kitchen"],
+                "%2\r\n$1\r\na\r\n*2\r\n%0\r\n*2\r\n:100\r\n,1.5\r\n\
+                 $1\r\nc\r\n*2\r\n%0\r\n*0\r\n",
+            ),
+            (
+                &[b"TS.MGET", b"WITHLABELS", b"FILTER", b"room=kitchen"],
+                "%2\r\n$1\r\na\r\n*2\r\n%2\r\n$4\r\nroom\r\n$7\r\nkitchen\r\n\
+                 $1\r\nx\r\n$1\r\n1\r\n*2\r\n:100\r\n,1.5\r\n\
+                 $1\r\nc\r\n*2\r\n%1\r\n$4\r\nroom\r\n$7\r\nkitchen\r\n*0\r\n",
+            ),
+            (
+                &[
+                    b"TS.MGET",
+                    b"SELECTED_LABELS",
+                    b"x",
+                    b"FILTER",
+                    b"room=kitchen",
+                ],
+                "%2\r\n$1\r\na\r\n*2\r\n%1\r\n$1\r\nx\r\n$1\r\n1\r\n\
+                 *2\r\n:100\r\n,1.5\r\n\
+                 $1\r\nc\r\n*2\r\n%1\r\n$1\r\nx\r\n_\r\n*0\r\n",
+            ),
+            // A map with a name in it twice, which is what a series wearing one
+            // label name twice turns into.
+            (
+                &[b"TS.MGET", b"WITHLABELS", b"FILTER", b"r=b"],
+                "%1\r\n$1\r\ne\r\n*2\r\n%2\r\n$1\r\nr\r\n$2\r\nbb\r\n\
+                 $1\r\nr\r\n$1\r\nb\r\n*0\r\n",
+            ),
+        ];
+        for (argv, want) in cases {
+            let got = f.run(argv);
+            assert_eq!(&got, want, "{:?}", argv.last());
+        }
+    }
+
     /// The three shapes an `XADD` id can take, and the one rule behind all of
     /// them.
     #[test]
