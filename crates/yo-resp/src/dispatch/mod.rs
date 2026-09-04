@@ -404,16 +404,14 @@ impl Server {
 
     /// A server whose databases are cut into `width` stripes each.
     ///
-    /// Not reachable from the command line and not meant to be yet. Only the
-    /// groups that have been taught about stripes can run on a server wider
-    /// than one, and every other group answers through [`Db::only_mut`], which
-    /// says so by failing rather than by giving a wrong answer.
+    /// Not reachable from the command line yet. Every command group answers on
+    /// a server of any width now and so does everything that walks a whole
+    /// database, and the tests run each group at a width of one and a width of
+    /// eight and check the two agree.
     ///
-    /// That is what this is for. Each group that is taught gets its own tests
-    /// run at a width greater than one alongside the tests it already has, and
-    /// a group that has not been taught cannot be run that way by accident. It
-    /// stops being scaffolding and starts being the thing `--threads` sets when
-    /// the last group is done.
+    /// What is left before this is what `--threads` sets is the engine. A
+    /// database being several objects is what makes more than one thread
+    /// possible, and it is not what makes more than one thread happen.
     #[must_use]
     pub fn with_width(width: usize) -> Server {
         let clock = Clock::system();
@@ -456,26 +454,21 @@ impl Server {
 
     /// One database, by index.
     ///
+    /// A caller that knows which key it wants names the one stripe the key is
+    /// on rather than working over the whole thing, which is what `at` and its
+    /// neighbours on [`Db`] are for. A caller that is about a database rather
+    /// than about a key, which is the snapshot walk and a setting, works over
+    /// all of them.
+    ///
+    /// The borrow is mutable, so the database is marked as having had something
+    /// run against it. Anything that only reads has [`Server::striped_ref`] and
+    /// does not come through here.
+    ///
     /// # Panics
     ///
     /// If `i` is not a database. `SELECT` is the only way a client changes the
     /// index and it checks, so an index that is out of range here is a bug in
     /// the caller and not something a client can ask for.
-    pub fn db(&mut self, i: usize) -> &mut Keyspace {
-        // The borrow is mutable, so assume it is used. Anything that only reads
-        // has [`Server::db_ref`] and does not come through here.
-        self.dirty |= 1u64 << i;
-        self.dbs[i].only_mut()
-    }
-
-    /// One database, by index, as the striped thing it is.
-    ///
-    /// What a caller that knows which key it wants uses, since that caller can
-    /// name the one stripe the key is on rather than taking the whole database.
-    ///
-    /// # Panics
-    ///
-    /// As [`Server::db`].
     pub fn striped(&mut self, i: usize) -> &mut Db {
         self.dirty |= 1u64 << i;
         &mut self.dbs[i]
@@ -2457,7 +2450,7 @@ mod tests {
         let mut f = Fixture::new();
         f.run(&[b"SET", b"alive", b"v"]);
         f.run(&[b"SET", b"dead", b"v", b"PX", b"1"]);
-        f.server.db(0).clock_mut().advance(2);
+        f.server.advance_clock_ms(2);
         assert_eq!(
             f.run(&[b"DBSIZE"]),
             ":2\r\n",
@@ -3467,7 +3460,7 @@ mod tests {
         // Nothing has been evicted and nothing can be under the default policy,
         // so this stays at zero while the other one moves.
         f.run(&[b"SET", b"gone", b"v", b"PX", b"1"]);
-        f.server.db(0).clock_mut().advance(20);
+        f.server.advance_clock_ms(20);
         f.run(&[b"GET", b"gone"]);
         let info = f.run(&[b"INFO", b"stats"]);
         assert!(info.contains("expired_keys:1"), "{info}");
@@ -3923,7 +3916,7 @@ mod tests {
             f.run(&[b"SET", format!("d{i}").as_bytes(), b"v", b"PX", b"50"]);
         }
         f.advance(100);
-        let at = f.server.db(0).clock().now_ms();
+        let at = f.server.striped(0).now_ms();
         f.server.set_clock_ms(at);
         // A small budget, so that one slice cannot finish the job and a second
         // one having nothing to do would mean the gate and not an empty
@@ -3937,7 +3930,7 @@ mod tests {
             );
         }
         assert!(
-            f.server.db(0).expires() > 400,
+            f.server.striped(0).expires() > 400,
             "there is plenty left to take"
         );
         f.server.set_clock_ms(at + 1);
@@ -5128,7 +5121,7 @@ mod tests {
         // Time moves once per turn of the event loop and nowhere else, so a
         // test moves it by hand rather than by sleeping. There is nothing to
         // sleep for: the deadline is a number and so is the clock.
-        f.server.db(0).clock_mut().advance(60);
+        f.server.advance_clock_ms(60);
         assert_eq!(f.run(&[b"HLEN", b"h"]), ":1\r\n");
         assert_eq!(f.run(&[b"HGET", b"h", b"a"]), "$-1\r\n");
         assert_eq!(
@@ -17728,7 +17721,10 @@ mod tests {
     fn filled(attach: bool) -> (Fixture, usize) {
         let mut f = Fixture::new();
         if attach {
-            f.server.db(0).attach(Box::new(Mem { blobs: Vec::new() }));
+            f.server
+                .striped(0)
+                .stripe_mut(0)
+                .attach(Box::new(Mem { blobs: Vec::new() }));
         }
         let val = vec![b'v'; 256];
         for i in 0..24000u32 {

@@ -36,7 +36,8 @@
 //! # What it costs
 //!
 //! One key at a time, and the value is copied twice on the way: once because
-//! [`Keyspace::export`] hands back an owned record, and once as it is written.
+//! [`crate::Keyspace::export`] hands back an owned record, and once as it is
+//! written.
 //! The peak extra memory is therefore the largest single value and not the
 //! dataset, which is the number that matters, and the copy is worth calling out
 //! because the honest fix is a borrowing walk and that is a bigger change to the
@@ -46,8 +47,8 @@
 
 use yo_common::crc::crc64;
 
+use crate::db::Db;
 use crate::keys::Record;
-use crate::keyspace::Keyspace;
 use crate::rdb;
 use crate::value::Kind;
 use yo_index::Cursor as KeyCursor;
@@ -159,7 +160,16 @@ impl Snapshot {
     /// Keys past their deadline are dropped on the way through by the walk, the
     /// same as they are for `SCAN`, so a snapshot does not carry dead keys into
     /// the file and then into whatever loads it.
-    pub fn database(&mut self, index: usize, db: &mut Keyspace) {
+    ///
+    /// A database of several stripes is one selector and one run of keys, not
+    /// one per stripe, because a file says which database a key was in and has
+    /// nowhere to say which stripe. The walk is [`Db::scan`], which takes the
+    /// stripes one after another and carries the number it is on in the cursor,
+    /// so the keys come out in stripe order and a loader that knows nothing
+    /// about stripes reads them back and puts each one wherever its own hash
+    /// says. That is what makes a file written by a wide server loadable by a
+    /// narrow one and the other way round.
+    pub fn database(&mut self, index: usize, db: &mut Db) {
         if db.is_empty() {
             return;
         }
@@ -193,7 +203,7 @@ impl Snapshot {
                 // so the name is copied into the entry writer instead. It is a
                 // key name and it is a few bytes.
                 let key = self.names[from..to].to_vec();
-                let Some(rec) = db.export(&key) else {
+                let Some(rec) = db.at(&key).export(&key) else {
                     // Gone between the walk and here, which nothing can do while
                     // this holds the database, or read back off the store and
                     // failed. Either way there is no value to write.
@@ -361,8 +371,8 @@ mod tests {
         }
     }
 
-    fn db() -> Keyspace {
-        Keyspace::with_clock(Clock::fixed(1_000))
+    fn db() -> Db {
+        Db::with_clock(Clock::fixed(1_000), 1)
     }
 
     #[test]
@@ -379,29 +389,36 @@ mod tests {
     #[test]
     fn every_type_goes_out_as_the_payload_dump_would_have_written() {
         let mut d = db();
-        d.set_plain(b"str", b"hello").unwrap();
-        d.push(b"list", End::Right, [b"a".as_slice(), b"b"].into_iter())
+        d.at(b"str").set_plain(b"str", b"hello").unwrap();
+        d.at(b"list")
+            .push(b"list", End::Right, [b"a".as_slice(), b"b"].into_iter())
             .unwrap();
-        d.sadd(b"set", [b"x".as_slice(), b"y"].into_iter()).unwrap();
-        d.sadd(b"ints", [b"1".as_slice(), b"2"].into_iter())
+        d.at(b"set")
+            .sadd(b"set", [b"x".as_slice(), b"y"].into_iter())
             .unwrap();
-        d.zadd(
-            b"zset",
-            [(1.5, b"m".as_slice())].into_iter(),
-            ZAdd::default(),
-        )
-        .unwrap();
-        d.hset(b"hash", [(b"f".as_slice(), b"v".as_slice())].into_iter())
+        d.at(b"ints")
+            .sadd(b"ints", [b"1".as_slice(), b"2"].into_iter())
             .unwrap();
-        d.xadd(
-            b"stream",
-            Add::Auto,
-            &[(b"f".as_slice(), b"v".as_slice())],
-            Trim::None,
-            true,
-            1_000,
-        )
-        .unwrap();
+        d.at(b"zset")
+            .zadd(
+                b"zset",
+                [(1.5, b"m".as_slice())].into_iter(),
+                ZAdd::default(),
+            )
+            .unwrap();
+        d.at(b"hash")
+            .hset(b"hash", [(b"f".as_slice(), b"v".as_slice())].into_iter())
+            .unwrap();
+        d.at(b"stream")
+            .xadd(
+                b"stream",
+                Add::Auto,
+                &[(b"f".as_slice(), b"v".as_slice())],
+                Trim::None,
+                true,
+                1_000,
+            )
+            .unwrap();
 
         let mut snap = Snapshot::new();
         snap.database(0, &mut d);
@@ -416,7 +433,7 @@ mod tests {
             // whole claim: a file is the payloads with a frame around them.
             assert_eq!(
                 Some(payload.clone()),
-                d.dump(key).map(|p| p[..p.len() - FOOTER].to_vec()),
+                d.at(key).dump(key).map(|p| p[..p.len() - FOOTER].to_vec()),
                 "{}",
                 String::from_utf8_lossy(key)
             );
@@ -427,10 +444,10 @@ mod tests {
     fn a_deadline_travels_with_the_key_and_a_dead_key_does_not() {
         let mut d = db();
         for key in [&b"alive"[..], b"soon", b"gone"] {
-            d.set_plain(key, b"1").unwrap();
+            d.at(key).set_plain(key, b"1").unwrap();
         }
-        d.expire(b"soon", 9_000, Cond::Always);
-        d.expire(b"gone", 500, Cond::Always);
+        d.at(b"soon").expire(b"soon", 9_000, Cond::Always);
+        d.at(b"gone").expire(b"gone", 500, Cond::Always);
 
         let mut snap = Snapshot::new();
         snap.database(0, &mut d);
@@ -454,8 +471,8 @@ mod tests {
         let mut zero = db();
         let mut empty = db();
         let mut nine = db();
-        zero.set_plain(b"a", b"1").unwrap();
-        nine.set_plain(b"b", b"2").unwrap();
+        zero.at(b"a").set_plain(b"a", b"1").unwrap();
+        nine.at(b"b").set_plain(b"b", b"2").unwrap();
 
         let mut snap = Snapshot::new();
         snap.database(0, &mut zero);
@@ -471,7 +488,9 @@ mod tests {
         let mut d = db();
         let many = BATCH * 3 + 7;
         for i in 0..many {
-            d.set_plain(format!("k{i}").as_bytes(), b"v").unwrap();
+            d.at(format!("k{i}").as_bytes())
+                .set_plain(format!("k{i}").as_bytes(), b"v")
+                .unwrap();
         }
         let mut snap = Snapshot::new();
         snap.database(0, &mut d);
@@ -483,14 +502,64 @@ mod tests {
         assert_eq!(names.len(), many, "every key, and none of them twice");
     }
 
+    /// The same walk over a database cut into stripes.
+    ///
+    /// More keys than one batch again, so the cursor has to come back into the
+    /// middle of a stripe as well as move from one stripe to the next, and both
+    /// of those are places a key could be written twice or not at all. The file
+    /// says nothing about stripes, so what comes out is one selector and one run
+    /// of keys whatever the database was cut into.
+    #[test]
+    fn a_striped_database_writes_every_key_once_and_one_selector() {
+        let mut d = Db::with_clock(Clock::fixed(1_000), 8);
+        let many = BATCH * 3 + 7;
+        for i in 0..many {
+            let key = format!("k{i}");
+            d.at(key.as_bytes())
+                .set_plain(key.as_bytes(), b"v")
+                .unwrap();
+        }
+        // The keys really are spread out, which is the thing this test rests on.
+        assert!(
+            d.stripes().iter().all(|s| !s.is_empty()),
+            "a stripe got nothing, so this proves less than it looks"
+        );
+        // And one of them has a deadline, since a deadline is written before the
+        // key and getting the stripe wrong there attaches it to the wrong one.
+        d.at(b"k5").expire(b"k5", 9_000, Cond::Always);
+
+        let mut snap = Snapshot::new();
+        snap.database(3, &mut d);
+        let seen = walk(&snap.finish());
+
+        assert_eq!(seen.dbs, vec![3], "one selector for the whole database");
+        let mut names: Vec<&Vec<u8>> = seen.keys.iter().map(|(k, _, _)| k).collect();
+        names.sort();
+        names.dedup();
+        assert_eq!(names.len(), many, "every key, and none of them twice");
+        let dated: Vec<&Vec<u8>> = seen
+            .keys
+            .iter()
+            .filter(|(_, e, _)| e.is_some())
+            .map(|(k, _, _)| k)
+            .collect();
+        assert_eq!(
+            dated,
+            vec![&b"k5".to_vec()],
+            "the deadline went on that key"
+        );
+    }
+
     /// A sparse array has no Redis type byte, so it cannot go in a file and the
     /// snapshot has to say so rather than write something a loader would choke
     /// on halfway through the entry before it.
     #[test]
     fn a_type_with_no_rdb_shape_is_counted_and_left_out() {
         let mut d = db();
-        d.set_plain(b"ordinary", b"1").unwrap();
-        d.arset(b"sparse", 7, [&b"a"[..]].into_iter()).unwrap();
+        d.at(b"ordinary").set_plain(b"ordinary", b"1").unwrap();
+        d.at(b"sparse")
+            .arset(b"sparse", 7, [&b"a"[..]].into_iter())
+            .unwrap();
 
         let mut snap = Snapshot::new();
         snap.database(0, &mut d);

@@ -199,8 +199,8 @@ fn run(server: &mut Server, at: usize, args: Args<'_>, out: &mut Out) -> Result<
     // Everything that has to touch the store happens here, and the borrow ends
     // before the socket work starts. What comes out is owned, so the peer cache
     // and the databases are never borrowed at the same time.
-    let db = server.db(at);
-    let now = db.clock().now_ms();
+    let db = server.striped(at);
+    let now = db.now_ms();
     let mut going: Vec<Going<'_>> = Vec::new();
     for i in 0..plan.num_keys {
         let key = args.get(plan.first_key + i);
@@ -209,7 +209,7 @@ fn run(server: &mut Server, at: usize, args: Args<'_>, out: &mut Out) -> Result<
         // between. Here the clock is read once per batch and both readings would
         // be the same millisecond, so the second pass cannot find anything the
         // first one missed and there is only one pass.
-        let ttl = match db.deadline_of(key) {
+        let ttl = match db.at(key).deadline_of(key) {
             Ask::Missing => continue,
             Ask::NoDeadline => 0,
             Ask::At(when) if when <= now => continue,
@@ -217,7 +217,7 @@ fn run(server: &mut Server, at: usize, args: Args<'_>, out: &mut Out) -> Result<
             // at all and the key would arrive immortal.
             Ask::At(when) => (when - now).max(1) as i64,
         };
-        let Some(payload) = db.dump(key) else {
+        let Some(payload) = db.at(key).dump(key) else {
             continue;
         };
         going.push(Going { key, ttl, payload });
@@ -405,7 +405,7 @@ fn finish(
             // other nine from the reply and has to look.
             Some(line) => told = told.or(Some(line)),
             None if !plan.copy => {
-                server.db(at).del(g.key);
+                server.striped(at).at(g.key).del(g.key);
             }
             None => {}
         }
@@ -779,10 +779,43 @@ mod tests {
         out: Out,
     }
 
+    /// `n` key names, no two of them on the same stripe.
+    ///
+    /// Names rather than a fixed list, because which stripe a name lands on is
+    /// a property of the hash and writing three names that happen to differ
+    /// today would be a test that stops testing anything the day the hash
+    /// changes.
+    fn spread(at: &mut At, n: usize) -> Vec<String> {
+        let db = at.server.striped(0);
+        let mut seen: Vec<usize> = Vec::new();
+        let mut names: Vec<String> = Vec::new();
+        for i in 0..10_000 {
+            let name = format!("k:{i}");
+            let stripe = db.stripe_of(name.as_bytes());
+            if !seen.contains(&stripe) {
+                seen.push(stripe);
+                names.push(name);
+                if names.len() == n {
+                    return names;
+                }
+            }
+        }
+        panic!("ten thousand names and fewer than {n} stripes among them");
+    }
+
     impl At {
         fn new() -> At {
+            At::on(Server::new())
+        }
+
+        /// The same, on a server whose databases are cut into `width` stripes.
+        fn striped(width: usize) -> At {
+            At::on(Server::with_width(width))
+        }
+
+        fn on(server: Server) -> At {
             At {
-                server: Server::new(),
+                server,
                 // The client id, not the database. Every one of these runs on
                 // database zero, which is where a connection starts.
                 session: Session::new(3),
@@ -813,7 +846,7 @@ mod tests {
 
         /// Move the clock the session's database is on.
         fn advance(&mut self, ms: u64) {
-            self.server.db(0).clock_mut().advance(ms);
+            self.server.advance_clock_ms(ms);
         }
     }
 
@@ -954,6 +987,59 @@ mod tests {
         assert_eq!(sent[1][1], "a");
         assert_eq!(sent[2][1], "b");
         assert_eq!(at.run(&[b"exists", b"a", b"b"]), ":0\r\n");
+    }
+
+    /// The same, on a database cut into stripes, with the keys spread over
+    /// them.
+    ///
+    /// Every key here is looked up three times, for its deadline, for its
+    /// payload and to take it away afterwards, and each of those has to find the
+    /// stripe on its own. Holding one and using it for all of them would send
+    /// the first key and quietly find nothing for the rest.
+    #[test]
+    fn the_keys_form_reaches_across_stripes() {
+        let peer = fake(vec![vec!["+OK\r\n", "+OK\r\n", "+OK\r\n", "+OK\r\n"]]);
+        let mut at = At::striped(8);
+        let names = spread(&mut at, 3);
+        let (a, b, c) = (names[0].as_str(), names[1].as_str(), names[2].as_str());
+        at.run(&[
+            b"mset",
+            a.as_bytes(),
+            b"1",
+            b.as_bytes(),
+            b"2",
+            c.as_bytes(),
+            b"3",
+        ]);
+        at.run(&[b"expire", b.as_bytes(), b"100"]);
+
+        let reply = at.run(&[
+            b"migrate",
+            b"127.0.0.1",
+            peer.port.as_bytes(),
+            b"",
+            b"0",
+            b"1000",
+            b"KEYS",
+            a.as_bytes(),
+            b.as_bytes(),
+            c.as_bytes(),
+        ]);
+        assert_eq!(reply, "+OK\r\n");
+        let sent = peer.words();
+        assert_eq!(sent.len(), 4, "one SELECT and three RESTOREs");
+        assert_eq!(sent[1][1], a);
+        assert_eq!(sent[2][1], b);
+        assert_eq!(sent[3][1], c);
+        assert_ne!(
+            sent[2][2], "0",
+            "the deadline came off the stripe the key with one is on"
+        );
+        assert_eq!(
+            at.run(&[b"exists", a.as_bytes(), b.as_bytes(), c.as_bytes()]),
+            ":0\r\n",
+            "and all three were taken away afterwards"
+        );
     }
 
     #[test]
