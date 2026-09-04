@@ -299,11 +299,12 @@ fn score(body: &VectorBody, q: &[f32], hit: &Match) -> f64 {
     body.c.get(&hit.key).map_or(0.0, |s| similarity(q, s))
 }
 
-pub(super) fn execute(db: &mut Db, spec: &Spec, args: Args<'_>, out: &mut Out) -> Result<()> {
+pub(super) fn execute(db: &Db, spec: &Spec, args: Args<'_>, out: &mut Out) -> Result<()> {
     // A vector set is one value under one key and every command here names that
     // key first, so the stripe is found once and everything below goes on
     // taking a keyspace.
-    let db = db.at(args.get(1));
+    let mut held = db.hold(args.get(1));
+    let db = &mut *held;
     match spec.name {
         "VADD" => vadd(db, args, out),
         "VSIM" => vsim(db, args, out),

@@ -223,8 +223,9 @@ impl GraphBody {
 /// first, so the stripe is found once and everything below goes on taking a
 /// keyspace. The edges inside a graph name nodes and not keys, so nothing here
 /// reaches past the one it was given.
-pub(super) fn execute(db: &mut Db, spec: &Spec, args: Args<'_>, out: &mut Out) -> Result<()> {
-    let db = db.at(args.get(1));
+pub(super) fn execute(db: &Db, spec: &Spec, args: Args<'_>, out: &mut Out) -> Result<()> {
+    let mut held = db.hold(args.get(1));
+    let db = &mut *held;
     match spec.name {
         "g.nadd" => nadd(db, args, out),
         "g.nget" => nget(db, args, out),

@@ -409,7 +409,7 @@ impl Want {
                     out.bulk(key);
                     let mark = out.len();
                     let n = db
-                        .at(key)
+                        .hold(key)
                         .pop_into(key, *end, *count, |e| element(out, e))?;
                     out.close_array(mark, n);
                     return Ok(true);

@@ -134,12 +134,7 @@ impl Fieldsets {
 /// bare `HIMPORT`, and each subcommand checks its own count here. The name of
 /// the command an arity complaint carries is the container and the subcommand
 /// joined by a pipe, the same as `OBJECT` and `CONFIG`.
-pub(super) fn execute(
-    db: &mut Db,
-    sets: &mut Fieldsets,
-    args: Args<'_>,
-    out: &mut Out,
-) -> Result<()> {
+pub(super) fn execute(db: &Db, sets: &mut Fieldsets, args: Args<'_>, out: &mut Out) -> Result<()> {
     let sub = args.get(1);
     if args::is(sub, b"prepare") {
         // At least one field, so the shortest legal line is four words.
@@ -154,7 +149,7 @@ pub(super) fn execute(
         }
         // The only subcommand that touches the keyspace, and it names its key
         // third, so that key's stripe is what it is given.
-        set(db.at(args.get(2)), sets, args, out)?;
+        set(&mut db.hold(args.get(2)), sets, args, out)?;
     } else if args::is(sub, b"discard") {
         if args.len() != 3 {
             return Err(args::wrong_arity_sub("himport", "discard"));
