@@ -1301,7 +1301,7 @@ pub fn resolved(
             }
             "set" => {
                 let db = session.db;
-                sets::execute(server.dbs[db].only_mut(), spec, args, out).map(|()| Flow::Continue)
+                sets::execute(&mut server.dbs[db], spec, args, out).map(|()| Flow::Continue)
             }
             // The one hash command whose state is not in the keyspace. A
             // fieldset belongs to the connection, so this is handed the session
@@ -18468,6 +18468,174 @@ mod tests {
             let b = many.run(parts);
             assert_eq!(a, b, "{}", String::from_utf8_lossy(parts[0]));
         }
+    }
+
+    /// Every set command, on one stripe and on eight.
+    ///
+    /// The commands that answer members answer them in whatever order the set
+    /// or the table they were built in holds them, so those replies are
+    /// compared as sets. Everything else is compared byte for byte. Two servers
+    /// agreeing on the order would be a fact about the tables and not about the
+    /// answer, and asserting it would make this test fail for a reason nobody
+    /// cares about.
+    #[test]
+    fn the_set_group_answers_the_same_however_many_stripes_there_are() {
+        const UNORDERED: [&str; 4] = ["SMEMBERS", "SINTER", "SUNION", "SDIFF"];
+        let script: &[&[&[u8]]] = &[
+            &[b"SADD", b"s1", b"a", b"b", b"c"],
+            &[b"SADD", b"s1", b"a"],
+            &[b"SADD", b"s2", b"b", b"c", b"d"],
+            &[b"SADD", b"ints", b"1", b"2", b"3"],
+            &[b"SCARD", b"s1"],
+            &[b"SISMEMBER", b"s1", b"a"],
+            &[b"SISMEMBER", b"s1", b"z"],
+            &[b"SMISMEMBER", b"s1", b"a", b"z", b"c"],
+            &[b"SMEMBERS", b"s1"],
+            &[b"SREM", b"s1", b"c"],
+            &[b"SADD", b"s1", b"c"],
+            &[b"SSCAN", b"s1", b"0"],
+            &[b"SSCAN", b"s1", b"0", b"COUNT", b"100", b"MATCH", b"a*"],
+            // The two draws, on a set of one member, which is the only shape
+            // whose answer two servers have to agree on.
+            &[b"SADD", b"one", b"m"],
+            &[b"SRANDMEMBER", b"one"],
+            &[b"SRANDMEMBER", b"one", b"-3"],
+            &[b"SRANDMEMBER", b"gone"],
+            &[b"SPOP", b"one"],
+            &[b"SPOP", b"one"],
+            &[b"SPOP", b"gone", b"2"],
+            // The one that names two keys.
+            &[b"SMOVE", b"s1", b"s2", b"a"],
+            &[b"SMOVE", b"s1", b"s2", b"zzz"],
+            &[b"SMOVE", b"gone", b"s2", b"a"],
+            &[b"SMEMBERS", b"s1"],
+            &[b"SMEMBERS", b"s2"],
+            // The algebra.
+            &[b"SINTER", b"s1", b"s2"],
+            &[b"SUNION", b"s1", b"s2"],
+            &[b"SDIFF", b"s2", b"s1"],
+            &[b"SINTER", b"s1", b"gone"],
+            &[b"SUNION", b"s1", b"gone"],
+            &[b"SDIFF", b"gone", b"s1"],
+            &[b"SINTER", b"ints", b"s1"],
+            &[b"SINTERCARD", b"2", b"s1", b"s2"],
+            &[b"SINTERCARD", b"2", b"s1", b"s2", b"LIMIT", b"1"],
+            &[b"SUNIONCARD", b"2", b"s1", b"s2"],
+            &[b"SDIFFCARD", b"2", b"s2", b"s1"],
+            &[b"SINTERSTORE", b"d1", b"s1", b"s2"],
+            &[b"SMEMBERS", b"d1"],
+            &[b"SUNIONSTORE", b"d2", b"s1", b"s2"],
+            &[b"SCARD", b"d2"],
+            &[b"SDIFFSTORE", b"d3", b"s2", b"s1"],
+            &[b"SCARD", b"d3"],
+            // An empty result deletes the destination rather than storing a
+            // set with nothing in it.
+            &[b"SINTERSTORE", b"d4", b"s1", b"gone"],
+            &[b"EXISTS", b"d4"],
+            // And a destination that is also a source.
+            &[b"SUNIONSTORE", b"s2", b"s1", b"s2"],
+            &[b"SCARD", b"s2"],
+            // The errors, which have to be the same errors.
+            &[b"SET", b"str", b"v"],
+            &[b"SADD", b"str", b"a"],
+            &[b"SINTER", b"s1", b"str"],
+            &[b"SINTERSTORE", b"d5", b"s1", b"str"],
+            &[b"EXISTS", b"d5"],
+            &[b"SMOVE", b"str", b"s2", b"a"],
+            &[b"SMOVE", b"s1", b"str", b"b"],
+            &[b"SMOVE", b"gone", b"str", b"b"],
+            &[b"SINTERCARD", b"0", b"s1"],
+            &[b"SINTERCARD", b"3", b"s1", b"s2"],
+            &[b"SINTERCARD", b"2", b"s1", b"s2", b"LIMIT", b"-1"],
+            &[b"SPOP", b"s1", b"-1"],
+        ];
+
+        let mut one = Fixture::new();
+        let mut many = Fixture::striped(8);
+        for parts in script {
+            let a = one.run(parts);
+            let b = many.run(parts);
+            let name = String::from_utf8_lossy(parts[0]).to_uppercase();
+            if UNORDERED.contains(&name.as_str()) && a.starts_with(['*', '~']) {
+                assert_eq!(sorted(&a), sorted(&b), "{name}");
+            } else {
+                assert_eq!(a, b, "{name}");
+            }
+        }
+    }
+
+    /// The algebra over sets that are known to be on different stripes.
+    #[test]
+    fn a_set_operation_across_stripes_reads_every_set() {
+        let mut f = Fixture::striped(8);
+        let second = apart(&mut f, "s1");
+        let third = apart(&mut f, &second);
+        let (s1, s2, s3) = (b"s1".as_slice(), second.as_bytes(), third.as_bytes());
+
+        f.run(&[b"SADD", s1, b"a", b"b", b"c"]);
+        f.run(&[b"SADD", s2, b"b", b"c", b"d"]);
+        assert_eq!(sorted(&f.run(&[b"SINTER", s1, s2])), ["b", "c"]);
+        assert_eq!(
+            sorted(&f.run(&[b"SUNION", s1, s2])),
+            ["a", "b", "c", "d"],
+            "a union of two stripes is both of them"
+        );
+        assert_eq!(sorted(&f.run(&[b"SDIFF", s1, s2])), ["a"]);
+        assert_eq!(f.run(&[b"SINTERCARD", b"2", s1, s2]), ":2\r\n");
+        assert_eq!(f.run(&[b"SUNIONCARD", b"2", s1, s2]), ":4\r\n");
+        assert_eq!(f.run(&[b"SDIFFCARD", b"2", s1, s2]), ":1\r\n");
+
+        // A destination on a third stripe, and then one that is also a source.
+        assert_eq!(f.run(&[b"SINTERSTORE", s3, s1, s2]), ":2\r\n");
+        assert_eq!(sorted(&f.run(&[b"SMEMBERS", s3])), ["b", "c"]);
+        assert_eq!(f.run(&[b"SUNIONSTORE", s2, s1, s2]), ":4\r\n");
+        assert_eq!(sorted(&f.run(&[b"SMEMBERS", s2])), ["a", "b", "c", "d"]);
+        assert_eq!(f.run(&[b"SDIFFSTORE", s3, s2, s1]), ":1\r\n");
+        assert_eq!(sorted(&f.run(&[b"SMEMBERS", s3])), ["d"]);
+
+        // An empty result deletes a destination wherever it is, and a key of
+        // the wrong type stops the command before the destination is touched.
+        assert_eq!(f.run(&[b"SINTERSTORE", s3, s1, b"gone"]), ":0\r\n");
+        assert_eq!(f.run(&[b"EXISTS", s3]), ":0\r\n");
+        f.run(&[b"SET", s3, b"v"]);
+        assert_eq!(
+            f.run(&[b"SINTER", s1, s3]),
+            "-WRONGTYPE Operation against a key holding the wrong kind of value\r\n"
+        );
+        assert_eq!(f.run(&[b"GET", s3]), "$1\r\nv\r\n", "and left it alone");
+    }
+
+    /// An `SMOVE` whose two keys are on two stripes.
+    #[test]
+    fn a_move_across_stripes_takes_the_member_with_it() {
+        let mut f = Fixture::striped(8);
+        let other = apart(&mut f, "src");
+        let (src, dst) = (b"src".as_slice(), other.as_bytes());
+
+        f.run(&[b"SADD", src, b"a", b"b"]);
+        f.run(&[b"SADD", dst, b"c"]);
+        assert_eq!(f.run(&[b"SMOVE", src, dst, b"a"]), ":1\r\n");
+        assert_eq!(sorted(&f.run(&[b"SMEMBERS", src])), ["b"]);
+        assert_eq!(sorted(&f.run(&[b"SMEMBERS", dst])), ["a", "c"]);
+        assert_eq!(f.run(&[b"SMOVE", src, dst, b"a"]), ":0\r\n", "it has gone");
+
+        // A destination that is not there is created on its own stripe, and a
+        // source that loses its last member is deleted from its own.
+        f.run(&[b"DEL", dst]);
+        assert_eq!(f.run(&[b"SMOVE", src, dst, b"b"]), ":1\r\n");
+        assert_eq!(f.run(&[b"EXISTS", src]), ":0\r\n", "the source is empty");
+        assert_eq!(sorted(&f.run(&[b"SMEMBERS", dst])), ["b"]);
+
+        // And a source that is not there answers zero without ever asking what
+        // the destination holds, which is Redis's order and not the obvious
+        // one.
+        f.run(&[b"SET", dst, b"v"]);
+        assert_eq!(f.run(&[b"SMOVE", src, dst, b"b"]), ":0\r\n");
+        f.run(&[b"SADD", src, b"b"]);
+        assert_eq!(
+            f.run(&[b"SMOVE", src, dst, b"b"]),
+            "-WRONGTYPE Operation against a key holding the wrong kind of value\r\n"
+        );
     }
 
     /// A count and a merge over sketches that are known to be on two stripes.

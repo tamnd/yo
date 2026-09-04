@@ -2,7 +2,7 @@
 //!
 //! The same shape as [`super::strings`]: the name has been looked up and the
 //! arity has been checked, so this turns arguments into a call on
-//! [`Keyspace`] and the answer into a reply. No decisions about sets are made
+//! [`Db`] and the answer into a reply. No decisions about sets are made
 //! here, and none about representations, because the wire and the embedded API
 //! have to reach the same code or there are two implementations of `SADD` and
 //! one of them is wrong (Y23).
@@ -12,7 +12,7 @@
 //! Every command that takes a list of members hands the store an iterator over
 //! [`Args`] rather than collecting them into a `Vec` first. `SADD key a b c` on
 //! this thread allocates nothing at all, which is the point of Y1 and the
-//! reason [`Keyspace::sadd`] takes an iterator in the first place.
+//! reason [`yo_kv::Keyspace::sadd`] takes an iterator in the first place.
 //!
 //! # The set reply type
 //!
@@ -25,7 +25,7 @@
 
 use yo_common::num::{DIGITS_MAX, i64_digits};
 use yo_common::{Code, Error, Result, glob_matches, parse_i64};
-use yo_kv::{Keyspace, Member};
+use yo_kv::{Db, Member};
 
 use super::args::{self, Args};
 use super::scan;
@@ -44,12 +44,18 @@ const TOO_MANY_KEYS: &str = "Number of keys can't be greater than number of args
 const BAD_LIMIT: &str = "LIMIT can't be negative";
 
 /// Run one set command.
-pub(super) fn execute(db: &mut Keyspace, spec: &Spec, args: Args<'_>, out: &mut Out) -> Result<()> {
+pub(super) fn execute(db: &mut Db, spec: &Spec, args: Args<'_>, out: &mut Out) -> Result<()> {
+    // Every single key command finds the stripe its key is on and hands that
+    // one keyspace the work, so the key is read out of the arguments once and
+    // used twice. The commands that name several keys reach the database
+    // itself and ignore this, including the three whose first argument is a
+    // count rather than a key.
+    let key = args.get(1);
     match spec.name {
-        "sadd" => out.int(count(db.sadd(args.get(1), members(args))?)),
-        "srem" => out.int(count(db.srem(args.get(1), members(args))?)),
-        "scard" => out.int(count(db.scard(args.get(1))?)),
-        "sismember" => out.int(i64::from(db.sismember(args.get(1), args.get(2))?)),
+        "sadd" => out.int(count(db.at(key).sadd(key, members(args))?)),
+        "srem" => out.int(count(db.at(key).srem(key, members(args))?)),
+        "scard" => out.int(count(db.at(key).scard(key)?)),
+        "sismember" => out.int(i64::from(db.at(key).sismember(key, args.get(2))?)),
         // The two that want the body more than once go through `with_set`, not
         // through `Keyspace::smismember` and `Keyspace::smembers`. Those two
         // answer a `Vec` and an iterator, which is the right shape for an
@@ -60,13 +66,13 @@ pub(super) fn execute(db: &mut Keyspace, spec: &Spec, args: Args<'_>, out: &mut 
         // The header goes out inside the callback and not in front of the call,
         // because `with_set` is where WRONGTYPE is decided and a body checks its
         // arguments before it writes anything.
-        "smismember" => db.with_set(args.get(1), |set| {
+        "smismember" => db.at(key).with_set(key, |set| {
             out.array(args.len() - 2);
             for m in members(args) {
                 out.int(i64::from(set.is_some_and(|s| s.contains(m))));
             }
         })?,
-        "smembers" => db.with_set(args.get(1), |set| match set {
+        "smembers" => db.at(key).with_set(key, |set| match set {
             Some(s) => {
                 out.set(s.len());
                 for m in s.iter() {
@@ -97,7 +103,7 @@ pub(super) fn execute(db: &mut Keyspace, spec: &Spec, args: Args<'_>, out: &mut 
                 // is written after the fact from the count that came back.
                 let start = out.len();
                 let mut got = false;
-                db.spop_into(args.get(1), 1, |m| {
+                db.at(key).spop_into(key, 1, |m| {
                     write_member(out, m);
                     got = true;
                 })?;
@@ -110,7 +116,7 @@ pub(super) fn execute(db: &mut Keyspace, spec: &Spec, args: Args<'_>, out: &mut 
                 let want = pop_count(args.get(2))?;
                 let start = out.len();
                 let mut n = 0;
-                db.spop_into(args.get(1), want, |m| {
+                db.at(key).spop_into(key, want, |m| {
                     write_member(out, m);
                     n += 1;
                 })?;
@@ -119,7 +125,7 @@ pub(super) fn execute(db: &mut Keyspace, spec: &Spec, args: Args<'_>, out: &mut 
             _ => return Err(args::syntax()),
         },
         "srandmember" => match args.len() {
-            2 => db.srandmember(args.get(1), |m| match m {
+            2 => db.at(key).srandmember(key, |m| match m {
                 Some(m) => write_member(out, m),
                 None => out.nil(),
             })?,
@@ -127,7 +133,7 @@ pub(super) fn execute(db: &mut Keyspace, spec: &Spec, args: Args<'_>, out: &mut 
                 let count = args.int(2)?;
                 let start = out.len();
                 let mut n = 0;
-                db.srandmember_n(args.get(1), count, |m| {
+                db.at(key).srandmember_n(key, count, |m| {
                     write_member(out, m);
                     n += 1;
                 })?;
@@ -135,11 +141,7 @@ pub(super) fn execute(db: &mut Keyspace, spec: &Spec, args: Args<'_>, out: &mut 
             }
             _ => return Err(args::syntax()),
         },
-        "smove" => out.int(i64::from(db.smove(
-            args.get(1),
-            args.get(2),
-            args.get(3),
-        )?)),
+        "smove" => out.int(i64::from(db.smove(key, args.get(2), args.get(3))?)),
         "sscan" => scan(db, args, out)?,
         // The algebra. The three that answer members write them before their
         // own header, the same way SSCAN does and for the same reason: the
@@ -189,7 +191,7 @@ pub(super) fn execute(db: &mut Keyspace, spec: &Spec, args: Args<'_>, out: &mut 
 /// The cursor goes out as a bulk string of unsigned digits rather than through
 /// the integer path, because ours packs a partition count into the top bits and
 /// a large enough collection would make it wider than an `i64`.
-fn scan(db: &mut Keyspace, args: Args<'_>, out: &mut Out) -> Result<()> {
+fn scan(db: &mut Db, args: Args<'_>, out: &mut Out) -> Result<()> {
     let cursor = scan::parse_cursor(args.get(2))?;
     let mut pattern = None;
     let mut count = scan::COUNT;
@@ -217,7 +219,8 @@ fn scan(db: &mut Keyspace, args: Args<'_>, out: &mut Out) -> Result<()> {
     // around the walk is [`scan::reply`] and is shared with the other three.
     scan::reply(out, |out| {
         let mut n = 0;
-        let next = db.sscan(args.get(1), cursor, count, |m| {
+        let key = args.get(1);
+        let next = db.at(key).sscan(key, cursor, count, |m| {
             if matches(pattern, m) {
                 write_member(out, m);
                 n += 1;

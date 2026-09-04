@@ -65,6 +65,14 @@ pub struct Db {
     /// Where each of the things in `scratch` ends, for the callers that put
     /// more than one thing in it.
     rows: Vec<usize>,
+    /// The tables a set operation across stripes fills in.
+    ///
+    /// A keyspace keeps a pair of these for the set operations that happen
+    /// inside it, for the reason [`crate::setops::Scratch`] gives: building the
+    /// table per call was most of what a `SUNION` over text sets did. An
+    /// operation whose keys are on several stripes is not any one stripe's, so
+    /// it gets its own.
+    setops: crate::setops::Scratch,
 }
 
 impl Db {
@@ -83,6 +91,7 @@ impl Db {
             mask: (n - 1) as u64,
             scratch: Vec::new(),
             rows: Vec::new(),
+            setops: crate::setops::Scratch::new(),
         }
     }
 
@@ -189,6 +198,16 @@ impl Db {
     pub(crate) fn put_scratch(&mut self, scratch: Vec<u8>, rows: Vec<usize>) {
         self.scratch = scratch;
         self.rows = rows;
+    }
+
+    /// The set operation tables, taken out for the same reason as the buffers.
+    pub(crate) fn take_setops(&mut self) -> crate::setops::Scratch {
+        std::mem::take(&mut self.setops)
+    }
+
+    /// The tables back.
+    pub(crate) fn put_setops(&mut self, setops: crate::setops::Scratch) {
+        self.setops = setops;
     }
 
     /// Stripe `i`.
