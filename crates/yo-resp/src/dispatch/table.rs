@@ -3310,6 +3310,32 @@ pub static COMMANDS: &[Spec] = &[
         summary: "The aliases pointing at one index.",
         group: "search",
     },
+    Spec {
+        name: "FT.EXPLAIN",
+        arity: -3,
+        flags: SEARCH_READ,
+        first_key: 0,
+        last_key: 0,
+        step: 0,
+        acl: AC_SEARCH,
+        since: "1.0.0",
+        complexity: "O(1)",
+        summary: "The tree a query parses into, as text.",
+        group: "search",
+    },
+    Spec {
+        name: "FT.EXPLAINCLI",
+        arity: -3,
+        flags: SEARCH_READ,
+        first_key: 0,
+        last_key: 0,
+        step: 0,
+        acl: AC_SEARCH,
+        since: "1.0.0",
+        complexity: "O(1)",
+        summary: "The tree a query parses into, one line per reply element.",
+        group: "search",
+    },
     // --------------------------------------------------------------- bloom
     Spec {
         name: "bf.reserve",
@@ -6005,7 +6031,7 @@ mod tests {
             "the multiplier stopped keeping every command close"
         );
         assert!(
-            total <= 21,
+            total <= 22,
             "{total} extra slots walked over the whole table"
         );
     }

@@ -67,6 +67,7 @@ use yo_common::num::parse_f64;
 use yo_common::{Result, parse_i64};
 use yo_search::field::{self, Algo, Coords, Kind, Tag, Text, Vector, Width};
 use yo_search::index::{Definition, Source};
+use yo_search::query::{self, Ask, Bad, Pair};
 use yo_search::{Clash, Field, Index, Registry};
 use yo_shape::Metric;
 
@@ -258,6 +259,8 @@ pub(super) fn execute(
         "FT._ALIASDELIFX" => alias_del(reg, args, out, true),
         "FT.ALIASUPDATE" => alias_update(reg, args, out),
         "FT.ALIASLIST" => alias_list(reg, args, out),
+        "FT.EXPLAIN" => explain(reg, args, out, false),
+        "FT.EXPLAINCLI" => explain(reg, args, out, true),
         other => unreachable!("{other} is not a search command"),
     };
     if let Err(f) = done {
@@ -1404,4 +1407,253 @@ fn statistics(out: &mut Out, f: &Field) {
         tally(out, "direct_hnsw_insertions", 0);
         tally(out, "flat_buffer_size", 0);
     }
+}
+
+/// The most recent grammar a client may ask for.
+const NEWEST: u8 = 4;
+
+const BAD_DIALECT: &str = "SEARCH_PARSE_ARGS DIALECT requires a non negative integer >=1 and <= 4";
+const NEED_ARG: &str = "SEARCH_PARSE_ARGS Need an argument for ";
+const ODD_PARAMS: &str = "SEARCH_ADD_ARGS Parameters must be specified in PARAM VALUE pairs";
+const NOT_MAIN: &str = "` at position ";
+const NOT_MAIN_END: &str = " for <main>";
+
+/// What a client asked for beside the query, and where the reading of it stops.
+///
+/// `FT.EXPLAIN` shares its argument list with `FT.SEARCH`, so most of what can
+/// appear here is about a result set that this command never produces. The ones
+/// that change the tree are taken and the ones that change the rows are taken
+/// and dropped, which is what a real server does with them too when all it is
+/// being asked for is the tree.
+struct Asked {
+    dialect: u8,
+    params: Vec<Pair>,
+    verbatim: bool,
+    stopwords: bool,
+}
+
+impl Default for Asked {
+    fn default() -> Asked {
+        Asked {
+            dialect: 1,
+            params: Vec::new(),
+            verbatim: false,
+            stopwords: true,
+        }
+    }
+}
+
+/// The keywords that mean something to a result set and nothing to a tree,
+/// with how many words each one carries.
+const IGNORED: &[(&[u8], usize)] = &[
+    (b"NOCONTENT", 0),
+    (b"WITHSCORES", 0),
+    (b"WITHPAYLOADS", 0),
+    (b"WITHSORTKEYS", 0),
+    (b"EXPLAINSCORE", 0),
+    (b"LIMIT", 2),
+    (b"TIMEOUT", 1),
+    (b"SLOP", 1),
+    (b"INORDER", 0),
+    (b"LANGUAGE", 1),
+    (b"EXPANDER", 1),
+    (b"SCORER", 1),
+    (b"PAYLOAD", 1),
+];
+
+/// Reads the arguments after the query.
+///
+/// The error text carries a position, which is why this hands back bytes rather
+/// than a `Fail`: every other error line in this module is three static pieces
+/// around a word the client sent, and this one has a number in it.
+fn options(args: Args<'_>, from: usize) -> core::result::Result<Asked, Vec<u8>> {
+    let mut asked = Asked::default();
+    let mut at = from;
+    while at < args.len() {
+        let word = args.get(at);
+        if args::is(word, b"DIALECT") {
+            let Some(value) = args.opt(at + 1) else {
+                return Err(line(NEED_ARG, b"DIALECT", ""));
+            };
+            let Some(dialect) = parse_i64(value).filter(|d| (1..=i64::from(NEWEST)).contains(d))
+            else {
+                return Err(BAD_DIALECT.as_bytes().to_vec());
+            };
+            asked.dialect = u8::try_from(dialect).unwrap_or(1);
+            at += 2;
+            continue;
+        }
+        if args::is(word, b"PARAMS") {
+            at = params(args, at, &mut asked)?;
+            continue;
+        }
+        if args::is(word, b"VERBATIM") {
+            asked.verbatim = true;
+            at += 1;
+            continue;
+        }
+        if args::is(word, b"NOSTOPWORDS") {
+            asked.stopwords = false;
+            at += 1;
+            continue;
+        }
+        if let Some((_, takes)) = IGNORED.iter().find(|(k, _)| args::is(word, k)) {
+            if args.opt(at + takes).is_none() {
+                return Err(line(BAD_ARGS, word, NOT_THERE));
+            }
+            at += takes + 1;
+            continue;
+        }
+        return Err(unknown(word, at - from + 1));
+    }
+    Ok(asked)
+}
+
+/// `PARAMS n name value ...`, which is where a `$name` in a query comes from.
+fn params(args: Args<'_>, at: usize, asked: &mut Asked) -> core::result::Result<usize, Vec<u8>> {
+    let Some(count) = args.opt(at + 1) else {
+        return Err(line(BAD_ARGS, b"PARAMS", NOT_THERE));
+    };
+    let Some(count) = parse_i64(count) else {
+        return Err(line(BAD_ARGS, b"PARAMS", NOT_A_NUMBER));
+    };
+    let count = usize::try_from(count).unwrap_or(0);
+    if count == 0 || count % 2 != 0 {
+        return Err(ODD_PARAMS.as_bytes().to_vec());
+    }
+    for step in 0..count / 2 {
+        let name = args.opt(at + 2 + step * 2);
+        let value = args.opt(at + 3 + step * 2);
+        let (Some(name), Some(value)) = (name, value) else {
+            return Err(line(BAD_ARGS, b"PARAMS", NOT_THERE));
+        };
+        asked.params.push((name.into(), value.into()));
+    }
+    Ok(at + 2 + count)
+}
+
+/// An error line built from a head, a word the client sent and a tail.
+fn line(head: &str, word: &[u8], tail: &str) -> Vec<u8> {
+    let mut out = head.as_bytes().to_vec();
+    out.extend_from_slice(word);
+    out.extend_from_slice(tail.as_bytes());
+    out
+}
+
+/// The line for an argument nobody knows, which counts from the query.
+fn unknown(word: &[u8], position: usize) -> Vec<u8> {
+    let mut out = UNKNOWN.as_bytes().to_vec();
+    out.extend_from_slice(word);
+    out.extend_from_slice(NOT_MAIN.as_bytes());
+    out.extend_from_slice(position.to_string().as_bytes());
+    out.extend_from_slice(NOT_MAIN_END.as_bytes());
+    out
+}
+
+/// The line a refused query answers with.
+fn refused(bad: &Bad) -> Vec<u8> {
+    match bad {
+        Bad::Syntax { at, near } => spot("SEARCH_SYNTAX Syntax error at offset ", *at, near),
+        Bad::Unknown { at, near } => named(
+            "SEARCH_SYNTAX Unknown field at offset ",
+            *at,
+            near.as_deref(),
+        ),
+        Bad::Wrong { kind, at, near } => {
+            let head = format!("SEARCH_SYNTAX Expected a {kind} field at offset ");
+            named(&head, *at, near.as_deref())
+        }
+        Bad::Attribute(name) => line("SEARCH_OPTION_INVALID Invalid attribute ", name, ""),
+        Bad::Value { name, value } => {
+            let mut out = b"SEARCH_SYNTAX Invalid value (".to_vec();
+            out.extend_from_slice(value);
+            out.extend_from_slice(b") for `");
+            out.extend_from_slice(name);
+            out.push(b'`');
+            out
+        }
+        Bad::Missing(name) => {
+            let mut out = b"SEARCH_PARAM_NOT_FOUND Parameter not found `".to_vec();
+            out.extend_from_slice(name);
+            out.push(b'`');
+            out
+        }
+        Bad::Taken(name) => {
+            let mut out = b"SEARCH_INDEX_EXISTS Property `".to_vec();
+            out.extend_from_slice(name);
+            out.extend_from_slice(b"` already exists in schema");
+            out
+        }
+        Bad::Plain(text) => line("SEARCH_SYNTAX ", text.as_bytes(), ""),
+        Bad::Refused(text) => line("SEARCH_QUERY_BAD ", text.as_bytes(), ""),
+    }
+}
+
+/// The same for the two errors about a field, which leave the `near` off
+/// altogether when there is no word to put in it rather than trailing an empty
+/// one the way a syntax error does.
+fn named(head: &str, at: usize, near: Option<&[u8]>) -> Vec<u8> {
+    let Some(near) = near else {
+        let mut out = head.as_bytes().to_vec();
+        out.extend_from_slice(at.to_string().as_bytes());
+        return out;
+    };
+    spot(head, at, near)
+}
+
+/// `... at offset 7 near the`, which is how the parser points at a query.
+fn spot(head: &str, at: usize, near: &[u8]) -> Vec<u8> {
+    let mut out = head.as_bytes().to_vec();
+    out.extend_from_slice(at.to_string().as_bytes());
+    out.extend_from_slice(b" near ");
+    out.extend_from_slice(near);
+    out
+}
+
+/// `FT.EXPLAIN index query [options]` and `FT.EXPLAINCLI` beside it.
+///
+/// The same work with two shapes of reply. `FT.EXPLAIN` sends the printout as
+/// one bulk string and `FT.EXPLAINCLI` sends it split on newlines, including
+/// the empty piece after the last one, so a client that joins the array back
+/// with newlines gets exactly what the other command would have sent.
+fn explain<'a>(reg: &mut Registry, args: Args<'a>, out: &mut Out, cli: bool) -> Answer<'a> {
+    let name = args.get(1);
+    let query = args.get(2);
+    let asked = match options(args, 3) {
+        Ok(asked) => asked,
+        Err(text) => {
+            out.error(&text);
+            return Ok(());
+        }
+    };
+    // Counted, like every other command that resolves a name, and counted after
+    // the arguments rather than before: an unreadable argument list means the
+    // index was never opened.
+    let Some(index) = reg.open(name) else {
+        return Err(Fail::naming(MISSING, name));
+    };
+    let ask = Ask {
+        dialect: asked.dialect,
+        params: &asked.params,
+        verbatim: asked.verbatim,
+        stopwords: asked.stopwords,
+    };
+    let node = match query::parse(query, index, &ask) {
+        Ok(node) => node,
+        Err(bad) => {
+            out.error(&refused(&bad));
+            return Ok(());
+        }
+    };
+    let printed = query::explain(&node, index);
+    if !cli {
+        out.bulk(&printed);
+        return Ok(());
+    }
+    let lines = query::explain::lines(&printed);
+    out.array(lines.len());
+    for line in lines {
+        out.simple(line);
+    }
+    Ok(())
 }

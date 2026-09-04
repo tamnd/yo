@@ -30,12 +30,18 @@
 //! [`Index`] is a definition with a schema under a name. [`Registry`] is every
 //! index on the server plus the aliases pointing at them.
 //!
+//! [`query`] is the query language: the grammar a client writes, the tree it
+//! parses into and the printout `FT.EXPLAIN` answers with. Both dialects are
+//! there, because the one a client gets when it does not ask for one is still
+//! the first and they parse the same bytes into different trees.
+//!
 //! # What is not here yet
 //!
-//! The inverted index, the query grammar and the scoring. This is the shape an
-//! index has and the table it lives in, which is what `FT.CREATE`, `FT.ALTER`,
-//! `FT.INFO`, `FT.DROPINDEX` and the alias family need and all that they need.
-//! `FT.SEARCH` needs postings under it and that is the next piece.
+//! The inverted index and the scoring. This is the shape an index has, the
+//! table it lives in and the queries that can be asked of it, which is what
+//! `FT.CREATE`, `FT.ALTER`, `FT.INFO`, `FT.DROPINDEX`, `FT.EXPLAIN` and the
+//! alias family need and all that they need. `FT.SEARCH` needs postings under
+//! it and that is the next piece.
 //!
 //! # Why the registry is per server
 //!
@@ -50,10 +56,12 @@
 pub mod english;
 pub mod field;
 pub mod index;
+pub mod query;
 pub mod registry;
 pub mod text;
 
 pub use english::English;
 pub use field::{Algo, Coords, Field, Kind, Tag, Text, Vector, Width};
 pub use index::{Definition, Index, Options, Source};
+pub use query::{Node, What};
 pub use registry::{Clash, Registry};
