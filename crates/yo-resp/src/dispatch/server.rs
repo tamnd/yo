@@ -835,7 +835,7 @@ fn config(server: &mut Server, args: Args<'_>, out: &mut Out) -> Result<()> {
         }
         for (k, knob) in ladder {
             out.bulk(k.as_bytes());
-            out.bulk_int(read_knob(server.settings(), *knob) as i64);
+            out.bulk_int(read_knob(&server.settings(), *knob) as i64);
         }
         if policy {
             out.bulk(MAXMEMORY_POLICY.as_bytes());
@@ -1111,6 +1111,10 @@ fn info(server: &Server, args: Args<'_>, out: &mut Out) {
             // reasoning is written out in `cap`.
             let cap = crate::cap::cap();
             let compact = server.compaction();
+            // Read out of its stripe before the write, because an argument list
+            // keeps every temporary in it alive until the whole call is over
+            // and one of the other arguments walks that same stripe.
+            let policy = server.settings().policy().name();
             let _ = write!(
                 s,
                 "# Memory\r\nused_memory:{}\r\nused_memory_dataset:{}\r\n\
@@ -1137,7 +1141,7 @@ fn info(server: &Server, args: Args<'_>, out: &mut Out) {
                 cap.limit().unwrap_or(0),
                 cap.budget(),
                 server.maxmemory(),
-                server.settings().policy().name(),
+                policy,
                 server.maxstore().map_or(-1, |n| n as i64),
                 server.store_bytes(),
                 server.regime(),

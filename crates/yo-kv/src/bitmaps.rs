@@ -454,7 +454,11 @@ impl Db {
         ends.clear();
         let mut digits = [0u8; DIGITS_MAX];
         for src in srcs.clone() {
-            let bytes = self.at_ref(src).bitmap(src, &mut digits);
+            // The stripe is held for the copy and given back before the next
+            // source is looked at, so two sources on one stripe are two holds
+            // one after the other rather than a wait for ourselves.
+            let held = self.hold(src);
+            let bytes = held.bitmap(src, &mut digits);
             flat.extend_from_slice(bytes);
             ends.push(flat.len());
         }

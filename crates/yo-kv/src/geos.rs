@@ -443,7 +443,11 @@ impl Db {
         }
         let n = self.stripe_mut(home).geosearch(src, shape, limit)?;
         let mut got = Elements::with_capacity(n.max(16));
-        for (name, hit) in self.stripe(home).geohits().iter() {
+        // Both at once and in stripe order, since the hits are read out of the
+        // source's stripe and the destination's limits decide what is built
+        // from them.
+        let held = self.hold_many([home, onto].into_iter());
+        for (name, hit) in held.stripe(home).geohits().iter() {
             let score = if dist {
                 hit.metres / shape.unit.metres()
             } else {
@@ -451,8 +455,9 @@ impl Db {
             };
             let _ = got.insert(name, score);
         }
-        let limits = self.stripe(onto).zset_limits;
+        let limits = held.stripe(onto).zset_limits;
         let built = Zset::from_elements(got, &limits);
+        drop(held);
         Ok(self.stripe_mut(onto).put_zset(dest, built))
     }
 }

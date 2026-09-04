@@ -23,6 +23,8 @@
 //! is left before a database can be held by more than one thread is the engine
 //! itself, which is the other half of this milestone.
 
+use yo_common::Small;
+use yo_common::lock::{Held, Lock};
 use yo_index::Cursor as KeyCursor;
 
 use crate::value::Kind;
@@ -53,14 +55,27 @@ const STRIPE_SHIFT: u32 = 56;
 /// Holds the keys a client sees under one `SELECT`, spread over one or more
 /// keyspaces. A caller that knows which key it wants asks [`Db::at`] and gets
 /// the one keyspace that key can be in. A caller that wants the whole database
-/// walks [`Db::stripes`], and the answers it adds up are the same answers a
+/// walks [`Db::stripes_mut`], and the answers it adds up are the same answers a
 /// single keyspace would have given.
 pub struct Db {
     /// The stripes, always a power of two of them and always at least one.
-    stripes: Vec<Keyspace>,
+    ///
+    /// Each one behind a lock, because a database is going to be reached by
+    /// more than one thread and a stripe is the piece one command holds. A
+    /// caller that has this database by exclusive reference does not go near
+    /// the locks: the borrow checker has already proved that nobody else is
+    /// looking, so `at` and every whole database walk go through `get_mut` and
+    /// pay nothing. The locks are for the callers that have it shared.
+    stripes: Vec<Lock<Keyspace>>,
     /// `stripes.len() - 1`, kept here so the hot path is a shift and an and
     /// rather than a division.
     mask: u64,
+    /// What every stripe's clock was last set to.
+    ///
+    /// A copy rather than a lookup, so that asking what the time is does not
+    /// mean taking a stripe. Every stripe carries the same reading and they are
+    /// all moved together, so this is that reading and not a fourth opinion.
+    clock: Clock,
     /// Somewhere to put bytes that came out of one stripe and are wanted while
     /// another stripe is being held. A key for [`Db::random_key`], the sources
     /// of a `BITOP` for `Db::bitop`. Every stripe has a buffer of its own for
@@ -91,8 +106,11 @@ impl Db {
     pub fn with_clock(clock: Clock, stripes: usize) -> Db {
         let n = stripes.clamp(1, MAX_STRIPES).next_power_of_two();
         Db {
-            stripes: (0..n).map(|_| Keyspace::with_clock(clock)).collect(),
+            stripes: (0..n)
+                .map(|_| Lock::new(Keyspace::with_clock(clock)))
+                .collect(),
             mask: (n - 1) as u64,
+            clock,
             scratch: Vec::new(),
             rows: Vec::new(),
             setops: crate::setops::Scratch::new(),
@@ -149,15 +167,21 @@ impl Db {
     #[must_use]
     pub fn at(&mut self, key: &[u8]) -> &mut Keyspace {
         let i = self.stripe_of(key);
-        &mut self.stripes[i]
+        self.stripes[i].get_mut()
     }
 
-    /// The stripe `key` is on, without taking it mutably.
+    /// The stripe `key` is on, held.
+    ///
+    /// For a caller that has the database shared, which is every caller once
+    /// there is more than one thread. The stripe is released when the answer is
+    /// dropped, so a caller that wants it for the length of a command has to
+    /// keep the answer for the length of the command rather than write it into
+    /// the middle of a larger expression.
     #[inline]
     #[must_use]
-    pub fn at_ref(&self, key: &[u8]) -> &Keyspace {
+    pub fn hold(&self, key: &[u8]) -> Held<'_, Keyspace> {
         let i = self.stripe_of(key);
-        &self.stripes[i]
+        self.stripes[i].lock()
     }
 
     /// The stripe a key with this hash is on.
@@ -167,19 +191,33 @@ impl Db {
     #[must_use]
     pub fn at_hashed(&mut self, hash: u64) -> &mut Keyspace {
         let i = self.stripe_of_hash(hash);
-        &mut self.stripes[i]
+        self.stripes[i].get_mut()
     }
 
-    /// The same, without taking it mutably.
+    /// The stripe a key with this hash is on, held.
     ///
-    /// What the prefetch stage uses. It warms a cache line for a key it has the
-    /// hash of and it runs before anything is executed, so it can neither take
-    /// the database mutably nor be handed the key.
+    /// As [`Db::stripe_of_hash`] for what the hash has to be.
     #[inline]
     #[must_use]
-    pub fn at_ref_hashed(&self, hash: u64) -> &Keyspace {
+    pub fn hold_hashed(&self, hash: u64) -> Held<'_, Keyspace> {
         let i = self.stripe_of_hash(hash);
-        &self.stripes[i]
+        self.stripes[i].lock()
+    }
+
+    /// Warm the line a key with this hash is going to be read from, if the
+    /// stripe it is on is not busy.
+    ///
+    /// What the prefetch stage uses, and the one place a lock is not worth
+    /// waiting for. A prefetch is a hint about a command that has not started
+    /// yet, so a stripe that somebody else is holding is a stripe whose lines
+    /// are being pulled about anyway, and waiting for it would turn a hint into
+    /// a wait for another thread. It is skipped instead.
+    #[inline]
+    pub fn prefetch_hashed(&self, hash: u64) {
+        let i = self.stripe_of_hash(hash);
+        if let Some(stripe) = self.stripes[i].try_lock() {
+            stripe.prefetch(hash);
+        }
     }
 
     /// The one stripe every one of `keys` is on, or `None` when they are spread
@@ -247,29 +285,53 @@ impl Db {
     #[inline]
     #[must_use]
     pub fn stripe_mut(&mut self, i: usize) -> &mut Keyspace {
-        &mut self.stripes[i]
+        self.stripes[i].get_mut()
     }
 
-    /// Stripe `i`, without taking it mutably.
+    /// Stripe `i`, held.
     ///
     /// # Panics
     ///
-    /// As [`Db::stripe_mut`].
+    /// As [`Db::stripe_mut`], and also if the calling thread is already holding
+    /// this stripe, in a debug build. Holding one twice is a wait for yourself
+    /// and the lock says so rather than stopping.
     #[inline]
     #[must_use]
-    pub fn stripe(&self, i: usize) -> &Keyspace {
-        &self.stripes[i]
+    pub fn hold_stripe(&self, i: usize) -> Held<'_, Keyspace> {
+        self.stripes[i].lock()
     }
 
-    /// Every stripe, in order.
+    /// Every stripe named, each one once, held, in stripe order.
+    ///
+    /// The order is what makes this safe to call while another database is
+    /// being held elsewhere and what makes two commands that want the same pair
+    /// of stripes want them the same way round. The names are deduplicated
+    /// because two keys of a multi key command land on one stripe often enough,
+    /// and asking for a stripe twice is the mistake the lock panics about.
     #[must_use]
-    pub fn stripes(&self) -> &[Keyspace] {
-        &self.stripes
+    pub fn hold_many(&self, homes: impl Iterator<Item = usize>) -> Holds<'_> {
+        let mut want: Small<u16, INLINE_HOLDS> = homes.map(|i| i as u16).collect();
+        want.sort_unstable();
+        let mut out = Holds::new();
+        // A stripe number is eight bits, so this can never be one of them, which
+        // is what makes it the mark for nothing taken yet.
+        let mut last = u16::MAX;
+        for &i in want.iter() {
+            if i == last {
+                continue;
+            }
+            last = i;
+            out.push(i, self.stripes[usize::from(i)].lock());
+        }
+        out
     }
 
     /// Every stripe, in order, mutably.
-    pub fn stripes_mut(&mut self) -> &mut [Keyspace] {
-        &mut self.stripes
+    ///
+    /// Free, because an exclusive reference to the database is already an
+    /// exclusive reference to every stripe in it.
+    pub fn stripes_mut(&mut self) -> impl Iterator<Item = &mut Keyspace> {
+        self.stripes.iter_mut().map(Lock::get_mut)
     }
 
     /// What time every stripe here thinks it is.
@@ -277,47 +339,59 @@ impl Db {
     /// One reading and not one per stripe. The clock is set on all of them
     /// together at the top of a turn of the loop, so a command that asks two
     /// stripes what the time is has to get the same answer from both or two
-    /// keys written by the same command would expire at different moments.
+    /// keys written by the same command would expire at different moments. The
+    /// reading is kept here as well as in the stripes so that asking the time
+    /// does not mean taking one of them.
     #[must_use]
     pub fn now_ms(&self) -> u64 {
-        self.stripes[0].clock().now_ms()
+        self.clock.now_ms()
     }
 
     /// How many keys are in the database.
+    ///
+    /// One stripe at a time and never two at once, so this is a sum of counts
+    /// that were each true when it was read rather than a count of the database
+    /// at one moment. `DBSIZE` on a server that is being written to was already
+    /// that answer.
     #[must_use]
     pub fn len(&self) -> usize {
-        self.stripes.iter().map(Keyspace::len).sum()
+        (0..self.stripes.len())
+            .map(|i| self.stripes[i].lock().len())
+            .sum()
     }
 
     /// Whether there are none.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.stripes.iter().all(Keyspace::is_empty)
+        (0..self.stripes.len()).all(|i| self.stripes[i].lock().is_empty())
     }
 
     /// How many of the keys have a deadline on them.
     #[must_use]
     pub fn expires(&self) -> usize {
-        self.stripes.iter().map(Keyspace::expires).sum()
+        (0..self.stripes.len())
+            .map(|i| self.stripes[i].lock().expires())
+            .sum()
     }
 
     /// Throw the whole database away, which is what `FLUSHDB` does.
     pub fn clear(&mut self) {
-        for stripe in &mut self.stripes {
+        for stripe in self.stripes_mut() {
             stripe.clear();
         }
     }
 
     /// Move every clock in the database to `ms`.
     pub fn set_clock_ms(&mut self, ms: u64) {
-        for stripe in &mut self.stripes {
+        self.clock.set(ms);
+        for stripe in self.stripes_mut() {
             stripe.clock_mut().set(ms);
         }
     }
 
     /// Turn the running memory total on or off in every stripe.
     pub fn track_memory(&mut self, on: bool) {
-        for stripe in &mut self.stripes {
+        for stripe in self.stripes_mut() {
             stripe.track_memory(on);
         }
     }
@@ -361,7 +435,7 @@ impl Db {
         let mut cursor = from.without_stripe();
         let mut seen = 0usize;
         while at < self.stripes.len() {
-            let next = self.stripes[at].scan(cursor, budget, ty, |key| {
+            let next = self.stripes[at].get_mut().scan(cursor, budget, ty, |key| {
                 seen += 1;
                 out(key);
             });
@@ -384,7 +458,7 @@ impl Db {
     /// which is no order at all as far as a client is concerned, the same as it
     /// was with one stripe.
     pub fn keys(&mut self, mut out: impl FnMut(&[u8])) {
-        for stripe in &mut self.stripes {
+        for stripe in self.stripes_mut() {
             stripe.keys(&mut out);
         }
     }
@@ -407,15 +481,15 @@ impl Db {
     /// copy is a few bytes and the allocator only hears about a key name longer
     /// than any this database has answered with before.
     pub fn random_key(&mut self) -> Option<&[u8]> {
-        let live = self.len();
+        let live: usize = self.stripes_mut().map(|s| s.len()).sum();
         if live == 0 {
             return None;
         }
-        let draw = (self.stripes[0].random() % live as u64) as usize;
+        let draw = (self.stripes[0].get_mut().random() % live as u64) as usize;
         let mut running = 0;
         let mut first = 0;
-        for (i, stripe) in self.stripes.iter().enumerate() {
-            running += stripe.len();
+        for (i, stripe) in self.stripes.iter_mut().enumerate() {
+            running += stripe.get_mut().len();
             if draw < running {
                 first = i;
                 break;
@@ -429,7 +503,7 @@ impl Db {
         let mut found = false;
         for step in 0..self.stripes.len() {
             let i = (first as u64 + step as u64) & self.mask;
-            if let Some(key) = self.stripes[i as usize].random_key() {
+            if let Some(key) = self.stripes[i as usize].get_mut().random_key() {
                 // `yo_alloc::high_water` because this is the buffer reaching a
                 // length it has not been asked for before, which is the longest
                 // key name this database has ever answered with. The draw after
@@ -447,6 +521,91 @@ impl Db {
 impl Default for Db {
     fn default() -> Db {
         Db::new()
+    }
+}
+
+/// How many stripes one command can name before the list of them reaches the
+/// heap.
+///
+/// Eight, which is the same number the set operations use for the keys
+/// themselves and for the same reason: a command over more operands than that
+/// is rare enough that the cost of it is not what anyone is measuring, and a
+/// command path is not allowed to allocate. A stripe is named once however many
+/// of the keys are on it, so eight here covers more than eight keys.
+const INLINE_HOLDS: usize = 8;
+
+/// Several stripes of one database, held at once.
+///
+/// What a command whose keys are spread over the database gets from
+/// [`Db::hold_many`]. It is a list rather than a map because the number of
+/// stripes a command names is at most the number of keys it names, which is
+/// small, and walking a handful of pairs is cheaper than anything with a hash
+/// in it. The list is in stripe order, which is what [`Db::hold_many`] promises
+/// and what keeps two of these from waiting on each other.
+pub struct Holds<'a> {
+    /// The first few, where the answer nearly always fits.
+    room: [Option<(u16, Held<'a, Keyspace>)>; INLINE_HOLDS],
+    /// How many of `room` are in use.
+    n: usize,
+    /// The rest, for a command that named keys on more stripes than there is
+    /// room for above. This is the one path here that allocates and the reason
+    /// it is allowed to is that reaching it means a client sent a command over
+    /// nine or more stripes, which no benchmark and no real workload does.
+    spill: Vec<(u16, Held<'a, Keyspace>)>,
+}
+
+impl<'a> Holds<'a> {
+    /// Holding nothing.
+    fn new() -> Holds<'a> {
+        Holds {
+            room: [const { None }; INLINE_HOLDS],
+            n: 0,
+            spill: Vec::new(),
+        }
+    }
+
+    /// One more, which the caller has already taken and which comes after every
+    /// stripe added before it.
+    fn push(&mut self, home: u16, held: Held<'a, Keyspace>) {
+        if self.n < INLINE_HOLDS {
+            self.room[self.n] = Some((home, held));
+            self.n += 1;
+        } else {
+            self.spill.push((home, held));
+        }
+    }
+
+    /// Stripe `i`, which the caller asked for and is therefore holding.
+    ///
+    /// # Panics
+    ///
+    /// If `i` was not one of the stripes asked for, which is a caller that
+    /// worked out a stripe number twice and got two different answers.
+    #[must_use]
+    pub fn stripe(&self, i: usize) -> &Keyspace {
+        let home = i as u16;
+        for slot in self.room[..self.n].iter().flatten() {
+            if slot.0 == home {
+                return &slot.1;
+            }
+        }
+        let at = self
+            .spill
+            .binary_search_by_key(&home, |&(where_, _)| where_)
+            .expect("a stripe that was asked for");
+        &self.spill[at].1
+    }
+
+    /// How many stripes are being held.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.n + self.spill.len()
+    }
+
+    /// Whether none are, which is a command that named no keys.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
     }
 }
 
@@ -648,5 +807,59 @@ mod tests {
             allocs, 0,
             "randomkey allocated {allocs} times in two hundred"
         );
+    }
+
+    /// A command names its stripes in whatever order its keys arrived in and
+    /// names some of them twice. What comes back is each one once, and every
+    /// one of them is the stripe that was asked for.
+    #[test]
+    fn holding_several_stripes_takes_each_of_them_once() {
+        let mut db = filled(16, 400);
+        let counts: Vec<usize> = (0..db.width()).map(|i| db.stripe_mut(i).len()).collect();
+        let held = db.hold_many([9, 2, 9, 0, 2, 15].into_iter());
+        assert_eq!(held.len(), 4, "six names, four stripes");
+        assert!(!held.is_empty());
+        for i in [0, 2, 9, 15] {
+            assert_eq!(held.stripe(i).len(), counts[i], "stripe {i} came back");
+        }
+    }
+
+    /// Nothing named is nothing held, which is what a command with no keys
+    /// left after the missing ones were dropped hands back.
+    #[test]
+    fn holding_no_stripes_holds_nothing() {
+        let db = filled(4, 40);
+        let held = db.hold_many(std::iter::empty());
+        assert!(held.is_empty());
+        assert_eq!(held.len(), 0);
+    }
+
+    /// Y7 covers this the moment a database is wide, because a set operation
+    /// over keys on several stripes is a command path. Eight stripes fit
+    /// without the heap and the ninth is the one that is allowed to reach for
+    /// it.
+    #[test]
+    fn holding_up_to_eight_stripes_does_not_allocate() {
+        let db = filled(16, 400);
+        let (_, allocs) = crate::tally::counted(|| {
+            for _ in 0..50 {
+                let held = db.hold_many((0..8).rev());
+                assert_eq!(held.len(), 8);
+            }
+        });
+        assert_eq!(allocs, 0, "holding eight stripes allocated {allocs} times");
+    }
+
+    /// And more than eight still works, which is the part the spill is there
+    /// for.
+    #[test]
+    fn holding_more_stripes_than_there_is_room_for_still_holds_them_all() {
+        let mut db = filled(16, 400);
+        let counts: Vec<usize> = (0..db.width()).map(|i| db.stripe_mut(i).len()).collect();
+        let held = db.hold_many((0..16).rev());
+        assert_eq!(held.len(), 16);
+        for (i, &was) in counts.iter().enumerate() {
+            assert_eq!(held.stripe(i).len(), was, "stripe {i} came back");
+        }
     }
 }
