@@ -262,15 +262,16 @@ fn query(db: &Db, args: Args<'_>, out: &mut Out) -> Result<()> {
 /// different widths do not have the same counters.
 fn merge(db: &Db, args: Args<'_>, out: &mut Out) -> Result<()> {
     let dest = args.get(1);
-    let shape = {
+    // Read before the rest of the command is parsed, because a `CMS.MERGE`
+    // naming a destination that is not there answers that whatever else is
+    // wrong with it. The shape is read again below, once the stripes are held.
+    {
         let mut stripe = db.hold(dest);
-        let Some(body) = read(&mut stripe, dest)? else {
+        if read(&mut stripe, dest)?.is_none() {
             out.error(MISSING);
             return Ok(());
-        };
-        (body.c.width(), body.c.depth())
-    };
-    let (width, depth) = shape;
+        }
+    }
     let Some(count) = parse_i64(args.get(2)) else {
         out.error(BAD_NUMKEYS);
         return Ok(());
@@ -317,13 +318,23 @@ fn merge(db: &Db, args: Args<'_>, out: &mut Out) -> Result<()> {
         None => 1,
     };
 
+    // Every stripe the command names, held across both passes and the write, so
+    // that no source can be added to between being checked and being summed and
+    // the destination cannot be written by anyone else in between either.
+    let onto = db.stripe_of(dest);
+    let mut held = db.hold_keys(std::iter::once(dest).chain((0..count).map(|i| args.get(3 + i))));
+    let Some(body) = read(held.stripe_mut(onto), dest)? else {
+        out.error(MISSING);
+        return Ok(());
+    };
+    let (width, depth) = (body.c.width(), body.c.depth());
+
     // First pass: every source has to be there, be a sketch and be the right
     // shape, and they are checked in the order they were written, so the first
     // source that is wrong is the one reported.
     for i in 0..count {
         let key = args.get(3 + i);
-        let mut stripe = db.hold(key);
-        match read(&mut stripe, key)? {
+        match read(held.stripe_mut(db.stripe_of(key)), key)? {
             None => {
                 out.error(MISSING);
                 return Ok(());
@@ -340,24 +351,20 @@ fn merge(db: &Db, args: Args<'_>, out: &mut Out) -> Result<()> {
     // unless all of them fit. That is what makes an overflow leave the
     // destination alone, and it is also what lets the destination be one of its
     // own sources without reading half merged counters.
-    let mut acc = {
-        let mut stripe = db.hold(dest);
-        read(&mut stripe, dest)?
-            .expect("the destination is still there")
-            .c
-            .merge_start()
-    };
+    let mut acc = read(held.stripe_mut(onto), dest)?
+        .expect("the destination is still there")
+        .c
+        .merge_start();
     for i in 0..count {
         let key = args.get(3 + i);
-        let mut stripe = db.hold(key);
-        let src = read(&mut stripe, key)?.expect("checked in the first pass");
+        let src =
+            read(held.stripe_mut(db.stripe_of(key)), key)?.expect("checked in the first pass");
         if !src.c.merge_add(&mut acc, weight_at(i)) {
             out.error(MERGE_OVERFLOW);
             return Ok(());
         }
     }
-    let mut stripe = db.hold(dest);
-    let body = write(&mut stripe, dest)?.expect("the destination is still there");
+    let body = write(held.stripe_mut(onto), dest)?.expect("the destination is still there");
     body.c.merge_finish(acc);
     out.ok();
     Ok(())

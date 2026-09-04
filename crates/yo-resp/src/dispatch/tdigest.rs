@@ -245,7 +245,11 @@ fn add(db: &mut Keyspace, args: Args<'_>, out: &mut Out) -> Result<()> {
 /// there.
 fn merge(db: &Db, args: Args<'_>, out: &mut Out) -> Result<()> {
     let dest = args.get(1);
-    let dest_compression = read(&mut db.hold(dest), dest)?.map(|body| body.t.compression());
+    // Read before the rest of the command is parsed, because a destination
+    // holding something that is not a digest answers `WRONGTYPE` whatever else
+    // is wrong with the command. What it holds is read again below, once the
+    // stripes are held.
+    read(&mut db.hold(dest), dest)?;
     let Some(numkeys) = parse_i64(args.get(2)) else {
         return Err(Error::new(Code::Invalid, BAD_NUMKEYS));
     };
@@ -257,6 +261,11 @@ fn merge(db: &Db, args: Args<'_>, out: &mut Out) -> Result<()> {
         return Err(args::wrong_arity("tdigest.merge"));
     }
     let rest = sources + 3;
+    // Every stripe the command names, held from here to the write, so that no
+    // input can change between being measured and being folded in.
+    let onto = db.stripe_of(dest);
+    let mut held = db.hold_keys(std::iter::once(dest).chain((3..rest).map(|i| args.get(i))));
+    let dest_compression = read(held.stripe_mut(onto), dest)?.map(|body| body.t.compression());
     let mut compression = dest_compression;
     let mut override_dest = false;
     if rest < args.len() {
@@ -288,7 +297,7 @@ fn merge(db: &Db, args: Args<'_>, out: &mut Out) -> Result<()> {
         let found = if name == dest {
             dest_compression
         } else {
-            read(&mut db.hold(name), name)?.map(|body| body.t.compression())
+            read(held.stripe_mut(db.stripe_of(name)), name)?.map(|body| body.t.compression())
         };
         let Some(c) = found else {
             return Err(Error::new(Code::Invalid, MISSING));
@@ -299,15 +308,15 @@ fn merge(db: &Db, args: Args<'_>, out: &mut Out) -> Result<()> {
         return Err(Error::new(Code::Invalid, NO_MEMORY_DEST));
     };
     if !override_dest && dest_compression.is_some() {
-        let from = compressed(&mut db.hold(dest), dest)?;
+        let from = compressed(held.stripe_mut(onto), dest)?;
         fold(&mut into, &from)?;
     }
     for i in 3..rest {
         let key = args.get(i);
-        let from = compressed(&mut db.hold(key), key)?;
+        let from = compressed(held.stripe_mut(db.stripe_of(key)), key)?;
         fold(&mut into, &from)?;
     }
-    db.hold(dest)
+    held.stripe_mut(onto)
         .put_foreign(dest, Box::new(TDigestBody { t: into }));
     out.ok();
     Ok(())
