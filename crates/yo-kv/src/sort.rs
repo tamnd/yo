@@ -59,6 +59,21 @@
 //! `BY h_*` over keys holding lists gives every element a weight of nothing,
 //! which sorts them all equal and lets the tie break do the work.
 //!
+//! # Stripes
+//!
+//! This is the only thing in the store that takes a whole database rather than
+//! one keyspace, and it is why. The key it sorts is on one stripe, the key a
+//! `BY` names for an element is on whichever stripe that name lands on, the key
+//! a `GET` names is on another, and a `STORE` destination is on a fourth. None
+//! of those can be worked out before the command runs, because the names are
+//! built out of the elements, so there is nothing here to route once at the top
+//! the way every other command is routed.
+//!
+//! So every key access below finds its own stripe. Nothing is held across one,
+//! which is what the copying already forced: the elements were being copied out
+//! before any lookup happened anyway, for the reason [`Db::sort`] gives, and
+//! that copy is what lets the next lookup take a different stripe.
+//!
 //! # Divergence
 //!
 //! Redis compares strings with `strcoll` when there is no `STORE`, and with a
@@ -74,7 +89,8 @@
 //! with a zero byte in it sorts on all of its bytes, where `strcoll` stops at
 //! the zero. Registered in `divergences.toml`.
 
-use crate::keyspace::{Keyspace, wrong_type};
+use crate::db::Db;
+use crate::keyspace::wrong_type;
 use crate::value::Kind;
 use crate::zsets::Window;
 use std::cmp::Ordering;
@@ -106,7 +122,7 @@ pub struct Sort<'a> {
     pub alpha: bool,
     /// Whether the answer is going into a key rather than back to the caller.
     ///
-    /// Set by [`Keyspace::sort_store`] and not by the caller. It is in here
+    /// Set by [`Db::sort_store`] and not by the caller. It is in here
     /// rather than a separate argument because it changes the ordering and not
     /// just what happens to the result. See the module doc.
     pub store: bool,
@@ -126,7 +142,7 @@ struct Weighted {
     text: Option<Vec<u8>>,
 }
 
-impl Keyspace {
+impl Db {
     /// `SORT key [BY pattern] [LIMIT offset count] [GET pattern ...] [ASC|DESC]
     /// [ALPHA]`, and the whole of `SORT_RO`.
     ///
@@ -138,7 +154,9 @@ impl Keyspace {
     /// has to: the ordering is decided by reading other keys, and reading
     /// another key needs the database that the elements are borrowed from. Redis
     /// has the same problem and solves it by holding refcounted pointers, which
-    /// is the same copy with the copy moved to whoever wrote the value.
+    /// is the same copy with the copy moved to whoever wrote the value. The copy
+    /// is also what lets a `BY` or a `GET` reach a stripe other than the one the
+    /// elements came from.
     pub fn sort(&mut self, key: &[u8], opts: &Sort<'_>) -> Result<Vec<Option<Vec<u8>>>> {
         let mut opts = *opts;
         opts.store = false;
@@ -155,21 +173,25 @@ impl Keyspace {
     /// A `GET` pattern that missed stores an empty string, where the same miss
     /// sent to a client is a nil. There is no nil in a list, so this is the only
     /// thing it could be, and it is what Redis stores.
+    ///
+    /// The destination is on its own stripe, which is not generally the stripe
+    /// the elements came from, so it is found here after the sort rather than
+    /// anywhere near the read.
     pub fn sort_store(&mut self, key: &[u8], dest: &[u8], opts: &Sort<'_>) -> Result<usize> {
         let mut opts = *opts;
         opts.store = true;
         let rows = self.sorted(key, &opts)?;
         if rows.is_empty() {
-            self.del(dest);
+            self.at(dest).del(dest);
             return Ok(0);
         }
         // Written into a fresh key rather than appended to whatever was there,
         // and the delete comes first so that `SORT k STORE k` reads k, then
         // throws it away, then writes the answer. Redis is the same, and it is
         // the reason the elements had to be copied out before any of this.
-        self.del(dest);
+        self.at(dest).del(dest);
         let owned: Vec<Vec<u8>> = rows.into_iter().map(Option::unwrap_or_default).collect();
-        self.push(
+        self.at(dest).push(
             dest,
             crate::lists::End::Right,
             owned.iter().map(Vec::as_slice),
@@ -178,7 +200,7 @@ impl Keyspace {
 
     /// The body both of them share.
     fn sorted(&mut self, key: &[u8], opts: &Sort<'_>) -> Result<Vec<Option<Vec<u8>>>> {
-        let kind = self.kind_of(key);
+        let kind = self.at(key).kind_of(key);
         let elems = self.elements(key, kind)?;
 
         // A `BY` with no `*` cannot name a key per element, so it is an order to
@@ -212,21 +234,23 @@ impl Keyspace {
 
     /// Copy the elements out of whatever holds them.
     ///
-    /// Owned, for the reason [`Keyspace::sort`] gives. A missing key is an empty
+    /// Owned, for the reason [`Db::sort`] gives. A missing key is an empty
     /// list and not an error, so `SORT nosuchkey` answers nothing.
     fn elements(&mut self, key: &[u8], kind: Option<Kind>) -> Result<Vec<Vec<u8>>> {
         let mut out = Vec::new();
+        // One stripe for the whole of this, since it is all the same key.
+        let db = self.at(key);
         match kind {
             None => {}
             Some(Kind::List) => {
-                for e in self.lrange(key, 0, -1)? {
+                for e in db.lrange(key, 0, -1)? {
                     let mut v = Vec::new();
                     e.write_to(&mut v);
                     out.push(v);
                 }
             }
             Some(Kind::Set) => {
-                if let Some(members) = self.smembers(key)? {
+                if let Some(members) = db.smembers(key)? {
                     for m in members {
                         let mut v = Vec::new();
                         m.write_to(&mut v);
@@ -235,14 +259,14 @@ impl Keyspace {
                 }
             }
             Some(Kind::Zset) => {
-                let n = self.zcard(key)?;
+                let n = db.zcard(key)?;
                 let w = Window {
                     from: 0,
                     count: n,
                     rev: false,
                 };
                 out.reserve(n);
-                self.zwalk(key, w, |m, _| {
+                db.zwalk(key, w, |m, _| {
                     let mut v = Vec::new();
                     m.write_to(&mut v);
                     out.push(v);
@@ -349,6 +373,10 @@ impl Keyspace {
     /// than an error on purpose: a pattern is a guess about a naming convention
     /// and one key that does not fit the convention should not fail a command
     /// over ten thousand elements.
+    ///
+    /// The name is built out of the element, so the stripe it lands on is not
+    /// known until here and two elements of the same key are read from two
+    /// different stripes as often as not.
     fn by_pattern(&mut self, pattern: &[u8], elem: &[u8]) -> Option<Vec<u8>> {
         let star = pattern.iter().position(|&c| c == b'*')?;
         // The field split is looked for after the `*`, so a `->` in the prefix
@@ -370,8 +398,9 @@ impl Keyspace {
         key.extend_from_slice(elem);
         key.extend_from_slice(&key_part[star + 1..]);
 
+        let stripe = self.at(&key);
         match field {
-            Some(f) => self
+            Some(f) => stripe
                 .hget(&key, f, |t| {
                     t.map(|t| {
                         let mut v = Vec::new();
@@ -380,7 +409,7 @@ impl Keyspace {
                     })
                 })
                 .unwrap_or(None),
-            None => self.get(&key).ok().flatten().map(|s| s.to_vec()),
+            None => stripe.get(&key).ok().flatten().map(|s| s.to_vec()),
         }
     }
 }
@@ -430,14 +459,15 @@ mod tests {
         String::from_utf8_lossy(&v).into_owned()
     }
 
-    fn list(db: &mut Keyspace, key: &[u8], items: &[&str]) {
-        db.push(key, End::Right, items.iter().map(|s| s.as_bytes()))
+    fn list(db: &mut Db, key: &[u8], items: &[&str]) {
+        db.at(key)
+            .push(key, End::Right, items.iter().map(|s| s.as_bytes()))
             .expect("a fresh list takes elements");
     }
 
     #[test]
     fn numbers_sort_as_numbers_and_not_as_text() {
-        let mut db = Keyspace::new();
+        let mut db = Db::new();
         list(&mut db, b"l", &["10", "9", "100", "1"]);
         let opts = Sort::default();
         assert_eq!(flat(db.sort(b"l", &opts).unwrap()), ["1", "9", "10", "100"]);
@@ -453,7 +483,7 @@ mod tests {
 
     #[test]
     fn an_element_that_is_not_a_number_fails_the_whole_command() {
-        let mut db = Keyspace::new();
+        let mut db = Db::new();
         list(&mut db, b"l", &["1", "two", "3"]);
         let err = db.sort(b"l", &Sort::default()).unwrap_err();
         assert_eq!(err.message(), NOT_A_DOUBLE);
@@ -468,7 +498,7 @@ mod tests {
 
     #[test]
     fn desc_reverses_and_limit_takes_a_window_of_what_is_left() {
-        let mut db = Keyspace::new();
+        let mut db = Db::new();
         list(&mut db, b"l", &["3", "1", "5", "2", "4"]);
         let opts = Sort {
             desc: true,
@@ -497,11 +527,11 @@ mod tests {
 
     #[test]
     fn by_reads_a_key_for_every_element() {
-        let mut db = Keyspace::new();
+        let mut db = Db::new();
         list(&mut db, b"l", &["a", "b", "c"]);
-        db.set(b"w_a", b"3", SetOptions::PLAIN).unwrap();
-        db.set(b"w_b", b"1", SetOptions::PLAIN).unwrap();
-        db.set(b"w_c", b"2", SetOptions::PLAIN).unwrap();
+        db.at(b"w_a").set(b"w_a", b"3", SetOptions::PLAIN).unwrap();
+        db.at(b"w_b").set(b"w_b", b"1", SetOptions::PLAIN).unwrap();
+        db.at(b"w_c").set(b"w_c", b"2", SetOptions::PLAIN).unwrap();
         let opts = Sort {
             by: Some(b"w_*"),
             ..Sort::default()
@@ -511,9 +541,9 @@ mod tests {
 
     #[test]
     fn a_by_lookup_that_missed_weighs_nothing_and_the_element_breaks_the_tie() {
-        let mut db = Keyspace::new();
+        let mut db = Db::new();
         list(&mut db, b"l", &["c", "a", "b"]);
-        db.set(b"w_b", b"5", SetOptions::PLAIN).unwrap();
+        db.at(b"w_b").set(b"w_b", b"5", SetOptions::PLAIN).unwrap();
         let opts = Sort {
             by: Some(b"w_*"),
             ..Sort::default()
@@ -525,10 +555,14 @@ mod tests {
 
     #[test]
     fn under_alpha_a_missed_by_sorts_before_every_hit() {
-        let mut db = Keyspace::new();
+        let mut db = Db::new();
         list(&mut db, b"l", &["c", "a", "b"]);
-        db.set(b"w_b", b"zzz", SetOptions::PLAIN).unwrap();
-        db.set(b"w_c", b"aaa", SetOptions::PLAIN).unwrap();
+        db.at(b"w_b")
+            .set(b"w_b", b"zzz", SetOptions::PLAIN)
+            .unwrap();
+        db.at(b"w_c")
+            .set(b"w_c", b"aaa", SetOptions::PLAIN)
+            .unwrap();
         let opts = Sort {
             by: Some(b"w_*"),
             alpha: true,
@@ -539,11 +573,13 @@ mod tests {
 
     #[test]
     fn a_pattern_can_reach_into_a_hash() {
-        let mut db = Keyspace::new();
+        let mut db = Db::new();
         list(&mut db, b"l", &["a", "b"]);
-        db.hset(b"h_a", [(&b"w"[..], &b"2"[..])].into_iter())
+        db.at(b"h_a")
+            .hset(b"h_a", [(&b"w"[..], &b"2"[..])].into_iter())
             .unwrap();
-        db.hset(b"h_b", [(&b"w"[..], &b"1"[..])].into_iter())
+        db.at(b"h_b")
+            .hset(b"h_b", [(&b"w"[..], &b"1"[..])].into_iter())
             .unwrap();
         let opts = Sort {
             by: Some(b"h_*->w"),
@@ -552,7 +588,9 @@ mod tests {
         assert_eq!(flat(db.sort(b"l", &opts).unwrap()), ["b", "a"]);
         // And a pattern that ends in an arrow is a key name, not a hash lookup
         // with no field, so it reads a string key called `h_a->`.
-        db.set(b"h_a->", b"9", SetOptions::PLAIN).unwrap();
+        db.at(b"h_a->")
+            .set(b"h_a->", b"9", SetOptions::PLAIN)
+            .unwrap();
         let trailing = Sort {
             by: Some(b"h_*->"),
             ..Sort::default()
@@ -562,10 +600,14 @@ mod tests {
 
     #[test]
     fn get_answers_other_keys_and_a_hash_of_them() {
-        let mut db = Keyspace::new();
+        let mut db = Db::new();
         list(&mut db, b"l", &["2", "1"]);
-        db.set(b"d_1", b"one", SetOptions::PLAIN).unwrap();
-        db.set(b"d_2", b"two", SetOptions::PLAIN).unwrap();
+        db.at(b"d_1")
+            .set(b"d_1", b"one", SetOptions::PLAIN)
+            .unwrap();
+        db.at(b"d_2")
+            .set(b"d_2", b"two", SetOptions::PLAIN)
+            .unwrap();
         let get: [&[u8]; 2] = [b"#", b"d_*"];
         let opts = Sort {
             get: &get,
@@ -576,7 +618,7 @@ mod tests {
             ["1", "one", "2", "two"]
         );
         // A miss is a nil and not a skipped row, because the reply is positional.
-        db.del(b"d_2");
+        db.at(b"d_2").del(b"d_2");
         assert_eq!(
             flat(db.sort(b"l", &opts).unwrap()),
             ["1", "one", "2", "nil"]
@@ -585,7 +627,7 @@ mod tests {
 
     #[test]
     fn a_lookup_at_the_wrong_type_is_a_miss_and_not_an_error() {
-        let mut db = Keyspace::new();
+        let mut db = Db::new();
         list(&mut db, b"l", &["a"]);
         list(&mut db, b"d_a", &["x"]);
         let get: [&[u8]; 1] = [b"d_*"];
@@ -599,7 +641,7 @@ mod tests {
 
     #[test]
     fn by_without_a_star_leaves_the_order_alone() {
-        let mut db = Keyspace::new();
+        let mut db = Db::new();
         list(&mut db, b"l", &["3", "1", "2"]);
         let opts = Sort {
             by: Some(b"nosort"),
@@ -617,28 +659,34 @@ mod tests {
 
     #[test]
     fn a_set_stored_without_a_sort_is_sorted_anyway() {
-        let mut db = Keyspace::new();
+        let mut db = Db::new();
         for m in ["c", "a", "b"] {
-            db.sadd(b"s", [m.as_bytes()].into_iter()).unwrap();
+            db.at(b"s").sadd(b"s", [m.as_bytes()].into_iter()).unwrap();
         }
         let opts = Sort {
             by: Some(b"nosort"),
             ..Sort::default()
         };
         assert_eq!(db.sort_store(b"s", b"out", &opts).unwrap(), 3);
-        let got: Vec<String> = db.lrange(b"out", 0, -1).unwrap().map(text).collect();
+        let got: Vec<String> = db
+            .at(b"out")
+            .lrange(b"out", 0, -1)
+            .unwrap()
+            .map(text)
+            .collect();
         assert_eq!(got, ["a", "b", "c"]);
     }
 
     #[test]
     fn a_sorted_set_comes_out_in_score_order_when_nothing_says_otherwise() {
-        let mut db = Keyspace::new();
-        db.zadd(
-            b"z",
-            [(3.0, &b"c"[..]), (1.0, &b"a"[..]), (2.0, &b"b"[..])].into_iter(),
-            ZAdd::default(),
-        )
-        .unwrap();
+        let mut db = Db::new();
+        db.at(b"z")
+            .zadd(
+                b"z",
+                [(3.0, &b"c"[..]), (1.0, &b"a"[..]), (2.0, &b"b"[..])].into_iter(),
+                ZAdd::default(),
+            )
+            .unwrap();
         let opts = Sort {
             by: Some(b"nosort"),
             ..Sort::default()
@@ -648,18 +696,18 @@ mod tests {
 
     #[test]
     fn storing_an_empty_result_removes_the_destination() {
-        let mut db = Keyspace::new();
+        let mut db = Db::new();
         list(&mut db, b"out", &["stale"]);
         assert_eq!(
             db.sort_store(b"missing", b"out", &Sort::default()).unwrap(),
             0
         );
-        assert!(!db.exists(b"out"));
+        assert!(!db.at(b"out").exists(b"out"));
     }
 
     #[test]
     fn a_stored_get_that_missed_is_an_empty_string() {
-        let mut db = Keyspace::new();
+        let mut db = Db::new();
         list(&mut db, b"l", &["1"]);
         let get: [&[u8]; 1] = [b"d_*"];
         let opts = Sort {
@@ -667,14 +715,14 @@ mod tests {
             ..Sort::default()
         };
         assert_eq!(db.sort_store(b"l", b"out", &opts).unwrap(), 1);
-        assert_eq!(db.llen(b"out").unwrap(), 1);
+        assert_eq!(db.at(b"out").llen(b"out").unwrap(), 1);
     }
 
     #[test]
     fn a_missing_key_is_empty_and_a_wrong_type_is_an_error() {
-        let mut db = Keyspace::new();
+        let mut db = Db::new();
         assert!(db.sort(b"nosuchkey", &Sort::default()).unwrap().is_empty());
-        db.set(b"str", b"x", SetOptions::PLAIN).unwrap();
+        db.at(b"str").set(b"str", b"x", SetOptions::PLAIN).unwrap();
         assert_eq!(
             db.sort(b"str", &Sort::default()).unwrap_err().code(),
             Code::WrongType
@@ -683,10 +731,10 @@ mod tests {
 
     #[test]
     fn sorting_into_the_key_being_sorted_works() {
-        let mut db = Keyspace::new();
+        let mut db = Db::new();
         list(&mut db, b"l", &["3", "1", "2"]);
         assert_eq!(db.sort_store(b"l", b"l", &Sort::default()).unwrap(), 3);
-        let got: Vec<String> = db.lrange(b"l", 0, -1).unwrap().map(text).collect();
+        let got: Vec<String> = db.at(b"l").lrange(b"l", 0, -1).unwrap().map(text).collect();
         assert_eq!(got, ["1", "2", "3"]);
     }
 }

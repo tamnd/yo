@@ -259,6 +259,10 @@ impl Db {
     /// database wider than one stripe yet, and the check is what makes sure
     /// nothing can start asking before the last caller of this is gone.
     ///
+    /// Every command group has been taught about stripes now, so the last
+    /// caller left is the server's own handle on a database, and this goes when
+    /// that one does.
+    ///
     /// # Panics
     ///
     /// If the database has more than one stripe, which means a caller that

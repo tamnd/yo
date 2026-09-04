@@ -195,14 +195,12 @@ pub(super) fn execute(
         "object" => object(db, args, out)?,
         "scan" => scan(db, args, out)?,
         "keys" => keys(db, args.get(1), out),
-        // The one command in this file that has not been taught about stripes,
-        // and it is on its own because it is the only one that reads keys
-        // nobody named. `BY w_*` and `GET w_*` are resolved inside the store,
-        // one lookup per element, and every one of those lookups can land on a
-        // different stripe. Teaching it means moving that resolution up here,
-        // which is a change to `SORT` and not a change to routing, so it gets
-        // its own go rather than riding along with this one.
-        "sort" | "sort_ro" => sort(db.only_mut(), spec.name, args, out)?,
+        // The one command here that is handed the whole database rather than a
+        // stripe, because it is the only one that reads keys nobody named.
+        // `BY w_*` and `GET w_*` are resolved inside the store, one lookup per
+        // element, and every one of those lookups can land on a different
+        // stripe, so there is nothing to route once at this end.
+        "sort" | "sort_ro" => sort(db, spec.name, args, out)?,
         // A foreign body is refused rather than answered with the null bulk a
         // missing key gets, because there is no byte shape for one and a client
         // that could not tell the two apart would think its key had gone.
@@ -680,7 +678,7 @@ fn move_key(dbs: &mut [Db], at: usize, args: Args<'_>, out: &mut Out) -> Result<
 /// `GET # GET w_*` asks for two things per element and not for the second one
 /// twice. The patterns are collected into a small vector, which is the one
 /// allocation this parser makes and only when a `GET` was given at all.
-fn sort(db: &mut Keyspace, name: &str, args: Args<'_>, out: &mut Out) -> Result<()> {
+fn sort(db: &mut Db, name: &str, args: Args<'_>, out: &mut Out) -> Result<()> {
     let read_only = name == "sort_ro";
     let key = args.get(1);
     let mut opts = Sort::default();

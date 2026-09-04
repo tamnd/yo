@@ -20243,4 +20243,123 @@ mod tests {
         assert_eq!(both(&[b"TDIGEST.MIN", b"td"]), "$1\r\n1\r\n");
         assert_eq!(both(&[b"TDIGEST.MAX", b"td"]), "$2\r\n10\r\n");
     }
+
+    /// Every shape of `SORT`, on one stripe and on eight.
+    ///
+    /// The key it sorts, the keys a `BY` names, the keys a `GET` names and the
+    /// destination are four different names and nothing lines them up, so on
+    /// eight stripes this script is reading and writing all over the database
+    /// while on one it is doing what it always did.
+    #[test]
+    fn the_sort_command_answers_the_same_however_many_stripes_there_are() {
+        let script: &[&[&[u8]]] = &[
+            &[b"RPUSH", b"l", b"3", b"1", b"2", b"10"],
+            &[b"SORT", b"l"],
+            &[b"SORT", b"l", b"DESC"],
+            &[b"SORT", b"l", b"ALPHA"],
+            &[b"SORT", b"l", b"LIMIT", b"1", b"2"],
+            &[b"SORT_RO", b"l"],
+            // A weight per element, so the order comes off keys the command
+            // never named.
+            &[
+                b"MSET", b"w_1", b"4", b"w_2", b"3", b"w_3", b"2", b"w_10", b"1",
+            ],
+            &[b"SORT", b"l", b"BY", b"w_*"],
+            &[b"SORT", b"l", b"BY", b"w_*", b"DESC"],
+            &[b"DEL", b"w_2"],
+            &[b"SORT", b"l", b"BY", b"w_*"],
+            // And the answer off another set of keys again, with `#` mixed in
+            // so the rows are not all lookups.
+            &[b"MSET", b"d_1", b"one", b"d_3", b"three"],
+            &[b"SORT", b"l", b"BY", b"w_*", b"GET", b"#", b"GET", b"d_*"],
+            // A pattern that reaches into a hash, which is another key again.
+            &[b"HSET", b"h_1", b"f", b"9"],
+            &[b"HSET", b"h_2", b"f", b"8"],
+            &[b"HSET", b"h_3", b"f", b"7"],
+            &[b"HSET", b"h_10", b"f", b"6"],
+            &[b"SORT", b"l", b"BY", b"h_*->f"],
+            &[b"SORT", b"l", b"BY", b"nosort", b"GET", b"h_*->f"],
+            // The destination, which is a fourth place to land.
+            &[b"SORT", b"l", b"BY", b"w_*", b"STORE", b"out"],
+            &[b"LRANGE", b"out", b"0", b"-1"],
+            &[b"SORT", b"l", b"STORE", b"l"],
+            &[b"LRANGE", b"l", b"0", b"-1"],
+            // An empty result takes the destination away rather than leaving a
+            // list of nothing behind.
+            &[b"SORT", b"missing", b"STORE", b"out"],
+            &[b"EXISTS", b"out"],
+            // A set and a sorted set sort the same way a list does, and a set
+            // written to a destination is sorted even when nothing asked.
+            &[b"SADD", b"s", b"c", b"a", b"b"],
+            &[b"SORT", b"s", b"ALPHA"],
+            &[b"SORT", b"s", b"BY", b"nosort", b"STORE", b"out"],
+            &[b"LRANGE", b"out", b"0", b"-1"],
+            &[b"ZADD", b"z", b"3", b"c", b"1", b"a", b"2", b"b"],
+            &[b"SORT", b"z", b"BY", b"nosort"],
+            &[b"SORT", b"z", b"ALPHA", b"DESC"],
+            // And the two ways it refuses: a key of the wrong type, and an
+            // element that is not a number under a numeric sort.
+            &[b"SET", b"str", b"v"],
+            &[b"SORT", b"str"],
+            &[b"RPUSH", b"words", b"one", b"two"],
+            &[b"SORT", b"words"],
+            &[b"SORT_RO", b"l", b"STORE", b"out"],
+        ];
+
+        let mut one = Fixture::new();
+        let mut many = Fixture::striped(8);
+        for parts in script {
+            let a = one.run(parts);
+            let b = many.run(parts);
+            assert_eq!(a, b, "{}", String::from_utf8_lossy(parts[0]));
+        }
+    }
+
+    /// One `SORT` whose four kinds of key are on stripes of their own.
+    ///
+    /// The script above spreads keys around by writing enough of them, and this
+    /// one checks the spread rather than trusting it: the list, the weight key
+    /// for one of its elements and the destination are asserted to be in three
+    /// places before the command runs.
+    #[test]
+    fn a_sort_across_stripes_reads_every_pattern_key() {
+        let mut f = Fixture::striped(8);
+        let out = apart(&mut f, "l");
+        let (list, dest) = (b"l".as_slice(), out.as_bytes());
+
+        f.run(&[b"RPUSH", list, b"a", b"b", b"c", b"d"]);
+        f.run(&[
+            b"MSET", b"w_a", b"4", b"w_b", b"3", b"w_c", b"2", b"w_d", b"1",
+        ]);
+        f.run(&[
+            b"MSET", b"d_a", b"A", b"d_b", b"B", b"d_c", b"C", b"d_d", b"D",
+        ]);
+
+        // The weights are four keys and they are not all in one place, which is
+        // the thing that would go unnoticed if the command held a stripe.
+        let db = f.server.striped(0);
+        let weights: Vec<usize> = [b"w_a", b"w_b", b"w_c", b"w_d"]
+            .iter()
+            .map(|k| db.stripe_of(k.as_slice()))
+            .collect();
+        assert!(
+            weights.iter().any(|s| *s != weights[0]),
+            "the four weight keys all landed on one stripe, so this proves nothing"
+        );
+
+        assert_eq!(
+            f.run(&[b"SORT", list, b"BY", b"w_*", b"GET", b"d_*"]),
+            "*4\r\n$1\r\nD\r\n$1\r\nC\r\n$1\r\nB\r\n$1\r\nA\r\n",
+            "the order came off the weights and the answer off the data keys"
+        );
+        assert_eq!(
+            f.run(&[b"SORT", list, b"BY", b"w_*", b"STORE", dest]),
+            ":4\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"LRANGE", dest, b"0", b"-1"]),
+            "*4\r\n$1\r\nd\r\n$1\r\nc\r\n$1\r\nb\r\n$1\r\na\r\n",
+            "the destination is on a stripe of its own and got the whole answer"
+        );
+    }
 }
