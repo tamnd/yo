@@ -92,7 +92,7 @@ use crate::reply::Out;
 use std::path::{Path, PathBuf};
 use yo_common::{Code, Error};
 use yo_kv::cold::Blocks;
-use yo_kv::{Clock, Keyspace};
+use yo_kv::{Clock, Db, Keyspace};
 
 /// How many databases a server has.
 ///
@@ -240,7 +240,13 @@ pub type StoreSource = dyn FnMut(usize) -> Option<Box<dyn Blocks>>;
 /// this a server rather than a shard is that it is the whole of what a
 /// connection can address.
 pub struct Server {
-    dbs: Vec<Keyspace>,
+    dbs: Vec<Db>,
+    /// How many stripes each database is cut into, the same for all of them.
+    ///
+    /// Kept here as well as in each database so that the flat slot arithmetic
+    /// below is a multiply and a divide against a field on the server rather
+    /// than a walk asking each database how wide it is.
+    width: usize,
     clock: Clock,
     started_ms: u64,
     /// Where the next maintenance turn starts looking, so that a database
@@ -359,9 +365,8 @@ impl Server {
     pub fn new() -> Server {
         let clock = Clock::system();
         Server {
-            dbs: (0..DATABASES)
-                .map(|_| Keyspace::with_clock(clock))
-                .collect(),
+            dbs: (0..DATABASES).map(|_| Db::with_clock(clock, 1)).collect(),
+            width: 1,
             clock,
             started_ms: clock.now_ms(),
             next_db: 0,
@@ -388,9 +393,8 @@ impl Server {
     #[must_use]
     pub fn with_clock(clock: Clock) -> Server {
         Server {
-            dbs: (0..DATABASES)
-                .map(|_| Keyspace::with_clock(clock))
-                .collect(),
+            dbs: (0..DATABASES).map(|_| Db::with_clock(clock, 1)).collect(),
+            width: 1,
             clock,
             started_ms: clock.now_ms(),
             next_db: 0,
@@ -424,7 +428,61 @@ impl Server {
         // The borrow is mutable, so assume it is used. Anything that only reads
         // has [`Server::db_ref`] and does not come through here.
         self.dirty |= 1u64 << i;
+        self.dbs[i].only_mut()
+    }
+
+    /// One database, by index, as the striped thing it is.
+    ///
+    /// What a caller that knows which key it wants uses, since that caller can
+    /// name the one stripe the key is on rather than taking the whole database.
+    ///
+    /// # Panics
+    ///
+    /// As [`Server::db`].
+    pub fn striped(&mut self, i: usize) -> &mut Db {
+        self.dirty |= 1u64 << i;
         &mut self.dbs[i]
+    }
+
+    /// Every keyspace on the server, which is every stripe of every database.
+    ///
+    /// What the aggregates walk. A total over the whole server is a total over
+    /// all of these and the stripe boundaries do not appear in it, which is
+    /// what makes the numbers `INFO` reports the same numbers whatever the
+    /// server was cut into.
+    fn keyspaces(&self) -> impl Iterator<Item = &Keyspace> {
+        self.dbs.iter().flat_map(Db::stripes)
+    }
+
+    /// The same, mutably.
+    fn keyspaces_mut(&mut self) -> impl Iterator<Item = &mut Keyspace> {
+        self.dbs.iter_mut().flat_map(Db::stripes_mut)
+    }
+
+    /// How many keyspaces there are, counting every stripe of every database.
+    ///
+    /// The maintenance turns walk these rather than the databases, because a
+    /// stripe is the thing that holds an arena and a deadline heap and so it is
+    /// the thing that has anything to collect.
+    const fn slots(&self) -> usize {
+        DATABASES * self.width
+    }
+
+    /// Which database slot `i` belongs to.
+    const fn slot_db(&self, i: usize) -> usize {
+        i / self.width
+    }
+
+    /// Keyspace `i` of [`Server::slots`].
+    fn slot_mut(&mut self, i: usize) -> &mut Keyspace {
+        let (db, stripe) = (i / self.width, i % self.width);
+        self.dbs[db].stripe_mut(stripe)
+    }
+
+    /// The same, without taking it mutably.
+    fn slot(&self, i: usize) -> &Keyspace {
+        let (db, stripe) = (i / self.width, i % self.width);
+        self.dbs[db].stripe(stripe)
     }
 
     /// Where `BACKUP` writes and what `CONFIG GET dir` answers.
@@ -483,7 +541,7 @@ impl Server {
     /// As [`Server::db`].
     #[must_use]
     pub fn db_ref(&self, i: usize) -> &Keyspace {
-        &self.dbs[i]
+        self.dbs[i].only()
     }
 
     /// Take a new clock reading and give it to every database.
@@ -495,7 +553,7 @@ impl Server {
         self.clock.refresh();
         let now = self.clock.now_ms();
         for db in &mut self.dbs {
-            db.clock_mut().set(now);
+            db.set_clock_ms(now);
         }
     }
 
@@ -509,7 +567,7 @@ impl Server {
     pub fn set_clock_ms(&mut self, ms: u64) {
         self.clock.set(ms);
         for db in &mut self.dbs {
-            db.clock_mut().set(ms);
+            db.set_clock_ms(ms);
         }
     }
 
@@ -528,7 +586,7 @@ impl Server {
     /// keyspace can change them and the engine has to say when they move.
     #[must_use]
     pub fn memory_bytes(&self) -> usize {
-        self.dbs.iter().map(Keyspace::memory_bytes).sum::<usize>() + self.conn_bytes
+        self.keyspaces().map(Keyspace::memory_bytes).sum::<usize>() + self.conn_bytes
     }
 
     /// What the keyspace itself is holding, live records only.
@@ -538,8 +596,7 @@ impl Server {
     /// connections' buffers.
     #[must_use]
     pub fn dataset_bytes(&self) -> usize {
-        self.dbs
-            .iter()
+        self.keyspaces()
             .map(|db| db.map().arena().live_bytes() as usize)
             .sum()
     }
@@ -547,8 +604,7 @@ impl Server {
     /// Bytes the arenas are holding, live and dead together.
     #[must_use]
     pub fn arena_bytes(&self) -> usize {
-        self.dbs
-            .iter()
+        self.keyspaces()
             .map(|db| db.map().arena().reserved_bytes() as usize)
             .sum()
     }
@@ -556,8 +612,7 @@ impl Server {
     /// Bytes the indexes are holding.
     #[must_use]
     pub fn index_bytes(&self) -> usize {
-        self.dbs
-            .iter()
+        self.keyspaces()
             .map(|db| db.map().index().memory_bytes())
             .sum()
     }
@@ -570,7 +625,7 @@ impl Server {
     /// writes got slower.
     #[must_use]
     pub fn compaction(&self) -> yo_kv::Compaction {
-        self.dbs.iter().map(|db| db.map().compaction()).fold(
+        self.keyspaces().map(|db| db.map().compaction()).fold(
             yo_kv::Compaction::default(),
             |a, b| yo_kv::Compaction {
                 walked: a.walked + b.walked,
@@ -583,8 +638,7 @@ impl Server {
     /// Arena segments whose pages are real, across every database.
     #[must_use]
     pub fn segment_count(&self) -> usize {
-        self.dbs
-            .iter()
+        self.keyspaces()
             .map(|db| db.map().arena().resident_segments())
             .sum()
     }
@@ -609,13 +663,13 @@ impl Server {
     /// Keys reclaimed by running into them after their deadline.
     #[must_use]
     pub fn expired_keys(&self) -> u64 {
-        self.dbs.iter().map(Keyspace::expired_keys).sum()
+        self.keyspaces().map(Keyspace::expired_keys).sum()
     }
 
     /// Keys thrown away to make room, which is the other number entirely.
     #[must_use]
     pub fn evicted_keys(&self) -> u64 {
-        self.dbs.iter().map(Keyspace::evicted_keys).sum()
+        self.keyspaces().map(Keyspace::evicted_keys).sum()
     }
 
     /// Every command that has been seen, with its counters.
@@ -688,14 +742,14 @@ impl Server {
     /// evicting, because a memory limit that cannot be answered by moving data
     /// still has to be answered.
     fn attach_store(&mut self, at: usize) {
-        if self.dbs[at].store_bytes().is_some() {
+        if self.slot(at).store_bytes().is_some() {
             return;
         }
         let Some(source) = self.store.as_mut() else {
             return;
         };
         if let Some(blocks) = source(at) {
-            self.dbs[at].attach(blocks);
+            self.slot_mut(at).attach(blocks);
         }
     }
 
@@ -721,7 +775,7 @@ impl Server {
     /// two apart.
     #[must_use]
     pub fn store_bytes(&self) -> u64 {
-        self.dbs.iter().filter_map(Keyspace::store_bytes).sum()
+        self.keyspaces().filter_map(Keyspace::store_bytes).sum()
     }
 
     /// What the file has been asked to do, added up over every database.
@@ -741,7 +795,7 @@ impl Server {
     #[must_use]
     pub fn cold_stats(&self) -> yo_kv::tier::Stats {
         let mut total = yo_kv::tier::Stats::default();
-        for db in &self.dbs {
+        for db in self.keyspaces() {
             let Some(tier) = db.tier() else { continue };
             let s = tier.stats();
             total.demoted += s.demoted;
@@ -762,7 +816,7 @@ impl Server {
     /// it out from a limit, a setting and whether a file happens to be open.
     #[must_use]
     pub fn regime(&self) -> &'static str {
-        if (0..self.dbs.len()).any(|at| self.migrates(at)) {
+        if (0..self.slots()).any(|at| self.migrates(at)) {
             "migrate"
         } else {
             "evict"
@@ -784,7 +838,7 @@ impl Server {
         if self.maxstore == Some(0) {
             return false;
         }
-        match self.dbs[at].store_bytes() {
+        match self.slot(at).store_bytes() {
             Some(held) => self.maxstore.is_none_or(|cap| held < cap),
             // Nothing attached, but somewhere to get one from the moment this
             // database needs it, which is what makes the answer yes rather than
@@ -810,8 +864,7 @@ impl Server {
     /// what a batch touched rather than what the server holds, so it can be
     /// asked once a batch and again on every command that is over the limit.
     fn settled_memory(&mut self) -> usize {
-        self.dbs
-            .iter_mut()
+        self.keyspaces_mut()
             .map(Keyspace::settled_memory_bytes)
             .sum::<usize>()
             + self.conn_bytes
@@ -892,25 +945,25 @@ impl Server {
     /// touching the second. Almost every server is on database zero only, where
     /// this is one call that answers and fifteen that say the map is empty.
     fn relieve_step(&mut self, over: usize) -> bool {
-        for turn in 0..self.dbs.len() {
-            let i = (self.evict_db + turn) % self.dbs.len();
-            // An empty database has nothing to move and opening a log for one
+        for turn in 0..self.slots() {
+            let i = (self.evict_db + turn) % self.slots();
+            // An empty keyspace has nothing to move and opening a log for one
             // would cost a resident page window to find that out.
-            let gave = if !self.dbs[i].is_empty() && self.migrates(i) {
+            let gave = if !self.slot(i).is_empty() && self.migrates(i) {
                 self.attach_store(i);
                 // Whether it made room and not whether it moved a key. A round
                 // that demoted nothing and handed back a segment is a round
                 // that made room, and reading only the count refuses the write
                 // that provoked it.
-                self.dbs[i]
+                self.slot_mut(i)
                     .relieve(over)
                     .is_ok_and(yo_kv::tier::Relief::made_room)
             } else {
-                self.dbs[i].evict_one()
+                self.slot_mut(i).evict_one()
             };
             if gave {
-                self.evict_db = (i + 1) % self.dbs.len();
-                self.dirty |= 1u64 << i;
+                self.evict_db = (i + 1) % self.slots();
+                self.dirty |= 1u64 << self.slot_db(i);
                 return true;
             }
         }
@@ -957,16 +1010,16 @@ impl Server {
     /// other.
     pub fn expire_step(&mut self, budget: usize) -> usize {
         let mut spent = 0;
-        for turn in 0..self.dbs.len() {
+        for turn in 0..self.slots() {
             if spent >= budget {
                 break;
             }
-            let i = (self.expire_db + turn) % self.dbs.len();
-            let c = self.dbs[i].expire_cycle(budget - spent);
+            let i = (self.expire_db + turn) % self.slots();
+            let c = self.slot_mut(i).expire_cycle(budget - spent);
             spent += c.examined;
             if c.expired > 0 {
-                self.expire_db = (i + 1) % self.dbs.len();
-                self.dirty |= 1u64 << i;
+                self.expire_db = (i + 1) % self.slots();
+                self.dirty |= 1u64 << self.slot_db(i);
             }
         }
         spent
@@ -978,10 +1031,10 @@ impl Server {
     /// stops at the first one that had something to move, and it asks with the
     /// ratios off. See [`Keyspace::compact_hard`] for what that changes.
     fn compact_hard_step(&mut self) -> Option<usize> {
-        for turn in 0..self.dbs.len() {
-            let i = (self.next_db + turn) % self.dbs.len();
-            if let Some(moved) = self.dbs[i].compact_hard() {
-                self.next_db = (i + 1) % self.dbs.len();
+        for turn in 0..self.slots() {
+            let i = (self.next_db + turn) % self.slots();
+            if let Some(moved) = self.slot_mut(i).compact_hard() {
+                self.next_db = (i + 1) % self.slots();
                 return Some(moved);
             }
         }
@@ -1001,19 +1054,25 @@ impl Server {
     /// further along each time, so the cost of asking is a comparison per
     /// database and the cost of acting is bounded by a segment.
     pub fn compact_step(&mut self) -> Option<usize> {
-        for turn in 0..self.dbs.len() {
-            let i = (self.next_db + turn) % self.dbs.len();
+        for turn in 0..self.slots() {
+            let i = (self.next_db + turn) % self.slots();
             // Nothing has run against this database since it last said it had
             // nothing to collect, so it still has nothing to collect and the
             // line it lives on stays where it is.
-            if self.dirty & (1 << i) == 0 {
+            let at = self.slot_db(i);
+            if self.dirty & (1 << at) == 0 {
                 continue;
             }
-            if let Some(moved) = self.dbs[i].compact_step() {
-                self.next_db = (i + 1) % self.dbs.len();
+            if let Some(moved) = self.slot_mut(i).compact_step() {
+                self.next_db = (i + 1) % self.slots();
                 return Some(moved);
             }
-            self.dirty &= !(1u64 << i);
+            // Only once every stripe of the database has said it has nothing,
+            // since the bit is per database and one stripe answering for all of
+            // them would stop the others being asked at all.
+            if i % self.width == self.width - 1 {
+                self.dirty &= !(1u64 << at);
+            }
         }
         None
     }
@@ -1178,24 +1237,25 @@ pub fn resolved(
         match spec.group {
             "string" => {
                 let db = session.db;
-                strings::execute(&mut server.dbs[db], spec, args, out).map(|()| Flow::Continue)
+                strings::execute(server.dbs[db].only_mut(), spec, args, out)
+                    .map(|()| Flow::Continue)
             }
             // Its own group and its own file, and the same values underneath:
             // a bitmap is a string, so `STRLEN` on one answers and `SETBIT` on
             // something a `SET` left behind works.
             "bitmap" => {
                 let db = session.db;
-                bits::execute(&mut server.dbs[db], spec, args, out).map(|()| Flow::Continue)
+                bits::execute(server.dbs[db].only_mut(), spec, args, out).map(|()| Flow::Continue)
             }
             // The same again: a sketch is a string with a documented layout, so
             // `GET` hands one to a client and `SET` takes it back.
             "hyperloglog" => {
                 let db = session.db;
-                hll::execute(&mut server.dbs[db], spec, args, out).map(|()| Flow::Continue)
+                hll::execute(server.dbs[db].only_mut(), spec, args, out).map(|()| Flow::Continue)
             }
             "set" => {
                 let db = session.db;
-                sets::execute(&mut server.dbs[db], spec, args, out).map(|()| Flow::Continue)
+                sets::execute(server.dbs[db].only_mut(), spec, args, out).map(|()| Flow::Continue)
             }
             // The one hash command whose state is not in the keyspace. A
             // fieldset belongs to the connection, so this is handed the session
@@ -1203,70 +1263,72 @@ pub fn resolved(
             // keyspace group for the socket it keeps.
             "hash" if spec.name == "himport" => {
                 let db = session.db;
-                himport::execute(&mut server.dbs[db], &mut session.sets, args, out)
+                himport::execute(server.dbs[db].only_mut(), &mut session.sets, args, out)
                     .map(|()| Flow::Continue)
             }
             "hash" => {
                 let db = session.db;
-                hashes::execute(&mut server.dbs[db], spec, args, out).map(|()| Flow::Continue)
+                hashes::execute(server.dbs[db].only_mut(), spec, args, out).map(|()| Flow::Continue)
             }
             "list" => {
                 let db = session.db;
-                lists::execute(&mut server.dbs[db], spec, args, out).map(|()| Flow::Continue)
+                lists::execute(server.dbs[db].only_mut(), spec, args, out).map(|()| Flow::Continue)
             }
             "zset" => {
                 let db = session.db;
-                zsets::execute(&mut server.dbs[db], spec, args, out).map(|()| Flow::Continue)
+                zsets::execute(server.dbs[db].only_mut(), spec, args, out).map(|()| Flow::Continue)
             }
             // A geo key is a sorted set and these are sorted set commands with
             // arithmetic on the way in and on the way out, so a client can ZREM
             // a place out of one and ZCARD it to count them.
             "geo" => {
                 let db = session.db;
-                geo::execute(&mut server.dbs[db], spec, args, out).map(|()| Flow::Continue)
+                geo::execute(server.dbs[db].only_mut(), spec, args, out).map(|()| Flow::Continue)
             }
             "array" => {
                 let db = session.db;
-                arrays::execute(&mut server.dbs[db], spec, args, out).map(|()| Flow::Continue)
+                arrays::execute(server.dbs[db].only_mut(), spec, args, out).map(|()| Flow::Continue)
             }
             "graph" => {
                 let db = session.db;
-                graph::execute(&mut server.dbs[db], spec, args, out).map(|()| Flow::Continue)
+                graph::execute(server.dbs[db].only_mut(), spec, args, out).map(|()| Flow::Continue)
             }
             // A document under a key, reached by a path. The group is Redis's
             // module surface and the storage is ours, the same trade the vector
             // set group makes.
             "json" => {
                 let db = session.db;
-                json::execute(&mut server.dbs[db], spec, args, out).map(|()| Flow::Continue)
+                json::execute(server.dbs[db].only_mut(), spec, args, out).map(|()| Flow::Continue)
             }
             "vector" => {
                 let db = session.db;
-                vectors::execute(&mut server.dbs[db], spec, args, out).map(|()| Flow::Continue)
+                vectors::execute(server.dbs[db].only_mut(), spec, args, out)
+                    .map(|()| Flow::Continue)
             }
             "bloom" => {
                 let db = session.db;
-                bloom::execute(&mut server.dbs[db], spec, args, out).map(|()| Flow::Continue)
+                bloom::execute(server.dbs[db].only_mut(), spec, args, out).map(|()| Flow::Continue)
             }
             "cuckoo" => {
                 let db = session.db;
-                cuckoo::execute(&mut server.dbs[db], spec, args, out).map(|()| Flow::Continue)
+                cuckoo::execute(server.dbs[db].only_mut(), spec, args, out).map(|()| Flow::Continue)
             }
             "cms" => {
                 let db = session.db;
-                cms::execute(&mut server.dbs[db], spec, args, out).map(|()| Flow::Continue)
+                cms::execute(server.dbs[db].only_mut(), spec, args, out).map(|()| Flow::Continue)
             }
             "topk" => {
                 let db = session.db;
-                topk::execute(&mut server.dbs[db], spec, args, out).map(|()| Flow::Continue)
+                topk::execute(server.dbs[db].only_mut(), spec, args, out).map(|()| Flow::Continue)
             }
             "tdigest" => {
                 let db = session.db;
-                tdigest::execute(&mut server.dbs[db], spec, args, out).map(|()| Flow::Continue)
+                tdigest::execute(server.dbs[db].only_mut(), spec, args, out)
+                    .map(|()| Flow::Continue)
             }
             "ts" => {
                 let db = session.db;
-                ts::execute(&mut server.dbs[db], spec, args, out).map(|()| Flow::Continue)
+                ts::execute(server.dbs[db].only_mut(), spec, args, out).map(|()| Flow::Continue)
             }
             // The clock is read before the database is borrowed, because every
             // stream command needs the time and it lives on the server. An
@@ -1275,7 +1337,8 @@ pub fn resolved(
             "stream" => {
                 let db = session.db;
                 let now = server.now_ms();
-                streams::execute(&mut server.dbs[db], spec, args, now, out).map(|()| Flow::Continue)
+                streams::execute(server.dbs[db].only_mut(), spec, args, now, out)
+                    .map(|()| Flow::Continue)
             }
             // The one keyspace command that needs more than the databases,
             // because the socket it talks down is held on the server between

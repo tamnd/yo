@@ -43,7 +43,7 @@
 //! rule about when to look.
 
 use yo_common::{Code, Error, Result, num};
-use yo_kv::{End, Entry, Keyspace, Member, Movem, ZEnd};
+use yo_kv::{Db, End, Entry, Keyspace, Member, Movem, ZEnd};
 
 use super::args::{self, Args, NOT_AN_INT};
 use super::lists::{BAD_MPOP_COUNT, BAD_NUMKEYS, end_of, movem_options};
@@ -784,10 +784,13 @@ impl Waiters {
     /// # Panics
     ///
     /// As [`Waiters::at`].
-    fn try_serve(&self, at: usize, dbs: &mut [Keyspace], now: u64, out: &mut Out) -> bool {
+    fn try_serve(&self, at: usize, dbs: &mut [Db], now: u64, out: &mut Out) -> bool {
         let w = &self.list[at];
         let mark = out.len();
-        match w.want.attempt(&w.keys, &mut dbs[w.db], now, out, false) {
+        match w
+            .want
+            .attempt(&w.keys, dbs[w.db].only_mut(), now, out, false)
+        {
             Ok(true) => return true,
             Ok(false) => {}
             // `strict` is off, so nothing in there returns an error today.
