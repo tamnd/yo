@@ -15496,6 +15496,335 @@ mod tests {
         }
     }
 
+    /// The same five series with enough samples in them for a group to have
+    /// something to fold.
+    fn spanned() -> Fixture {
+        let mut f = labelled();
+        f.run(&[b"TS.ADD", b"a", b"200", b"2.5"]);
+        f.run(&[b"TS.ADD", b"c", b"100", b"10"]);
+        f.run(&[b"TS.ADD", b"c", b"300", b"30"]);
+        f
+    }
+
+    /// A span read out of every series a filter takes, with and without a group
+    /// over the top of it.
+    #[test]
+    fn mrange_reads_every_series_and_folds_the_groups_it_is_asked_for() {
+        let mut f = spanned();
+        let cases: &[(&[&[u8]], &str)] = &[
+            (
+                &[b"TS.MRANGE", b"-", b"+", b"FILTER", b"room=kitchen"],
+                "*2\r\n*3\r\n$1\r\na\r\n*0\r\n*2\r\n*2\r\n:100\r\n+1.5\r\n*2\r\n:200\r\n+2.5\r\n\
+                 *3\r\n$1\r\nc\r\n*0\r\n*2\r\n*2\r\n:100\r\n+10\r\n*2\r\n:300\r\n+30\r\n",
+            ),
+            // Newest first is applied to each series before anything else sees
+            // the rows.
+            (
+                &[
+                    b"TS.MREVRANGE",
+                    b"-",
+                    b"+",
+                    b"WITHLABELS",
+                    b"FILTER",
+                    b"room=kitchen",
+                ],
+                "*2\r\n*3\r\n$1\r\na\r\n*2\r\n*2\r\n$4\r\nroom\r\n$7\r\nkitchen\r\n\
+                 *2\r\n$1\r\nx\r\n$1\r\n1\r\n*2\r\n*2\r\n:200\r\n+2.5\r\n*2\r\n:100\r\n+1.5\r\n\
+                 *3\r\n$1\r\nc\r\n*1\r\n*2\r\n$4\r\nroom\r\n$7\r\nkitchen\r\n\
+                 *2\r\n*2\r\n:300\r\n+30\r\n*2\r\n:100\r\n+10\r\n",
+            ),
+            // A label a series does not wear comes back against a nil rather
+            // than being left out.
+            (
+                &[
+                    b"TS.MRANGE",
+                    b"-",
+                    b"+",
+                    b"SELECTED_LABELS",
+                    b"x",
+                    b"FILTER",
+                    b"room=kitchen",
+                ],
+                "*2\r\n*3\r\n$1\r\na\r\n*1\r\n*2\r\n$1\r\nx\r\n$1\r\n1\r\n\
+                 *2\r\n*2\r\n:100\r\n+1.5\r\n*2\r\n:200\r\n+2.5\r\n\
+                 *3\r\n$1\r\nc\r\n*1\r\n*2\r\n$1\r\nx\r\n$-1\r\n\
+                 *2\r\n*2\r\n:100\r\n+10\r\n*2\r\n:300\r\n+30\r\n",
+            ),
+            // The fold: 100 is in both series and adds up, the other two are in
+            // one each and are still rows.
+            (
+                &[
+                    b"TS.MRANGE",
+                    b"-",
+                    b"+",
+                    b"FILTER",
+                    b"room=kitchen",
+                    b"GROUPBY",
+                    b"room",
+                    b"REDUCE",
+                    b"sum",
+                ],
+                "*1\r\n*3\r\n$12\r\nroom=kitchen\r\n*0\r\n*3\r\n*2\r\n:100\r\n+11.5\r\n\
+                 *2\r\n:200\r\n+2.5\r\n*2\r\n:300\r\n+30\r\n",
+            ),
+            // RESP2 has nowhere to put the reducer and the member keys, so a
+            // group wearing labels writes them as two more labels.
+            (
+                &[
+                    b"TS.MRANGE",
+                    b"-",
+                    b"+",
+                    b"WITHLABELS",
+                    b"FILTER",
+                    b"room=kitchen",
+                    b"GROUPBY",
+                    b"room",
+                    b"REDUCE",
+                    b"max",
+                ],
+                "*1\r\n*3\r\n$12\r\nroom=kitchen\r\n*3\r\n*2\r\n$4\r\nroom\r\n$7\r\nkitchen\r\n\
+                 *2\r\n$11\r\n__reducer__\r\n$3\r\nmax\r\n\
+                 *2\r\n$10\r\n__source__\r\n$3\r\na,c\r\n\
+                 *3\r\n*2\r\n:100\r\n+10\r\n*2\r\n:200\r\n+2.5\r\n*2\r\n:300\r\n+30\r\n",
+            ),
+            // A count is applied to each member and then again to the fold.
+            (
+                &[
+                    b"TS.MREVRANGE",
+                    b"-",
+                    b"+",
+                    b"COUNT",
+                    b"1",
+                    b"FILTER",
+                    b"room=kitchen",
+                    b"GROUPBY",
+                    b"room",
+                    b"REDUCE",
+                    b"count",
+                ],
+                "*1\r\n*3\r\n$12\r\nroom=kitchen\r\n*0\r\n*1\r\n*2\r\n:300\r\n+1\r\n",
+            ),
+            // Nothing wears the label, so nothing is in any group.
+            (
+                &[
+                    b"TS.MRANGE",
+                    b"-",
+                    b"+",
+                    b"FILTER",
+                    b"room=kitchen",
+                    b"GROUPBY",
+                    b"nope",
+                    b"REDUCE",
+                    b"sum",
+                ],
+                "*0\r\n",
+            ),
+            (
+                &[
+                    b"TS.MRANGE",
+                    b"-",
+                    b"+",
+                    b"AGGREGATION",
+                    b"sum,avg",
+                    b"100",
+                    b"FILTER",
+                    b"room=bedroom",
+                ],
+                "*1\r\n*3\r\n$1\r\nb\r\n*0\r\n*1\r\n*3\r\n:200\r\n+2\r\n+2\r\n",
+            ),
+            // The errors, in the order they are looked for.
+            (
+                &[b"TS.MRANGE", b"-", b"+", b"room=kitchen"],
+                "-ERR TSDB: missing FILTER argument\r\n",
+            ),
+            (
+                &[b"TS.MRANGE", b"-", b"+", b"FILTER"],
+                "-ERR TSDB: missing labels for filter argument\r\n",
+            ),
+            (
+                &[
+                    b"TS.MRANGE",
+                    b"-",
+                    b"+",
+                    b"GROUPBY",
+                    b"room",
+                    b"REDUCE",
+                    b"sum",
+                    b"FILTER",
+                    b"room=kitchen",
+                ],
+                "-ERR TSDB: GROUPBY should always come after filter\r\n",
+            ),
+            // The group is four words from the end here, so the length is what
+            // is wrong with it.
+            (
+                &[
+                    b"TS.MRANGE",
+                    b"-",
+                    b"+",
+                    b"FILTER",
+                    b"room=kitchen",
+                    b"GROUPBY",
+                    b"room",
+                    b"REDUCE",
+                    b"sum",
+                    b"x",
+                ],
+                "-ERR wrong number of arguments for 'ts.mrange' command\r\n",
+            ),
+            // And here it is not, so its words are filters and answer first.
+            (
+                &[
+                    b"TS.MRANGE",
+                    b"-",
+                    b"+",
+                    b"FILTER",
+                    b"nope",
+                    b"GROUPBY",
+                    b"room",
+                    b"REDUCE",
+                    b"sum",
+                    b"x",
+                ],
+                "-ERR TSDB: failed parsing labels\r\n",
+            ),
+            (
+                &[
+                    b"TS.MRANGE",
+                    b"-",
+                    b"+",
+                    b"FILTER",
+                    b"room=kitchen",
+                    b"GROUPBY",
+                    b"room",
+                    b"REDUCE",
+                    b"twa",
+                ],
+                "-ERR TSDB: Invalid reducer type\r\n",
+            ),
+            (
+                &[
+                    b"TS.MRANGE",
+                    b"-",
+                    b"+",
+                    b"AGGREGATION",
+                    b"sum,avg",
+                    b"100",
+                    b"FILTER",
+                    b"room=kitchen",
+                    b"GROUPBY",
+                    b"room",
+                    b"REDUCE",
+                    b"sum",
+                ],
+                "-ERR TSDB: GROUPBY is not allowed when multiple aggregators are specified\r\n",
+            ),
+            // The label list ends at a keyword, so this is a `COUNT` with a
+            // `FILTER` where its number should be.
+            (
+                &[
+                    b"TS.MRANGE",
+                    b"-",
+                    b"+",
+                    b"SELECTED_LABELS",
+                    b"COUNT",
+                    b"FILTER",
+                    b"room=kitchen",
+                ],
+                "-ERR TSDB: Couldn't parse COUNT\r\n",
+            ),
+        ];
+        for (argv, want) in cases {
+            let got = f.run(argv);
+            assert_eq!(&got, want, "{argv:?}");
+        }
+    }
+
+    /// The multi key reads on RESP3, where the key becomes a map key and the
+    /// reducer and the member keys become fields of their own.
+    #[test]
+    fn resp3_writes_a_multi_key_read_as_a_map_of_four() {
+        let mut f = spanned();
+        f.out = Out::new(Proto::Resp3);
+        let cases: &[(&[&[u8]], &str)] = &[
+            (
+                &[b"TS.MRANGE", b"-", b"+", b"FILTER", b"room=bedroom"],
+                "%1\r\n$1\r\nb\r\n*3\r\n%0\r\n%1\r\n$11\r\naggregators\r\n*0\r\n\
+                 *1\r\n*2\r\n:200\r\n,2\r\n",
+            ),
+            // The reductions a read asked for, which RESP2 has no room for at
+            // all and which is empty on a read that asked for none.
+            (
+                &[
+                    b"TS.MRANGE",
+                    b"-",
+                    b"+",
+                    b"AGGREGATION",
+                    b"sum,avg",
+                    b"100",
+                    b"FILTER",
+                    b"room=bedroom",
+                ],
+                "%1\r\n$1\r\nb\r\n*3\r\n%0\r\n%1\r\n$11\r\naggregators\r\n*2\r\n$3\r\nsum\r\n\
+                 $3\r\navg\r\n*1\r\n*3\r\n:200\r\n,2\r\n,2\r\n",
+            ),
+            (
+                &[
+                    b"TS.MRANGE",
+                    b"-",
+                    b"+",
+                    b"FILTER",
+                    b"room=kitchen",
+                    b"GROUPBY",
+                    b"room",
+                    b"REDUCE",
+                    b"sum",
+                ],
+                "%1\r\n$12\r\nroom=kitchen\r\n*4\r\n%0\r\n%1\r\n$8\r\nreducers\r\n*1\r\n\
+                 $3\r\nsum\r\n%1\r\n$7\r\nsources\r\n*2\r\n$1\r\na\r\n$1\r\nc\r\n\
+                 *3\r\n*2\r\n:100\r\n,11.5\r\n*2\r\n:200\r\n,2.5\r\n*2\r\n:300\r\n,30\r\n",
+            ),
+            // The labels hold only the pair the group was made on, because the
+            // reducer and the sources have somewhere else to go.
+            (
+                &[
+                    b"TS.MRANGE",
+                    b"-",
+                    b"+",
+                    b"WITHLABELS",
+                    b"FILTER",
+                    b"room=kitchen",
+                    b"GROUPBY",
+                    b"room",
+                    b"REDUCE",
+                    b"max",
+                ],
+                "%1\r\n$12\r\nroom=kitchen\r\n*4\r\n%1\r\n$4\r\nroom\r\n$7\r\nkitchen\r\n\
+                 %1\r\n$8\r\nreducers\r\n*1\r\n$3\r\nmax\r\n\
+                 %1\r\n$7\r\nsources\r\n*2\r\n$1\r\na\r\n$1\r\nc\r\n\
+                 *3\r\n*2\r\n:100\r\n,10\r\n*2\r\n:200\r\n,2.5\r\n*2\r\n:300\r\n,30\r\n",
+            ),
+            (
+                &[
+                    b"TS.MRANGE",
+                    b"-",
+                    b"+",
+                    b"FILTER",
+                    b"room=kitchen",
+                    b"GROUPBY",
+                    b"nope",
+                    b"REDUCE",
+                    b"sum",
+                ],
+                "%0\r\n",
+            ),
+        ];
+        for (argv, want) in cases {
+            let got = f.run(argv);
+            assert_eq!(&got, want, "{argv:?}");
+        }
+    }
+
     /// The three shapes an `XADD` id can take, and the one rule behind all of
     /// them.
     #[test]

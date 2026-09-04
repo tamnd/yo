@@ -230,10 +230,11 @@ name = "ts"
 expected = 21
 status = "partial"
 doc = "11 section 9"
-# Twenty one commands, and the fourteen here are the key type, everything that
+# Twenty one commands, and the sixteen here are the key type, everything that
 # writes a sample into one or reports on it, the two that read a span back with
-# the aggregation grammar and the three that search on labels. The two multi key
-# reads, compaction rules and the three commands 8.10 added all come next.
+# the aggregation grammar, the three that search on labels and the two that read
+# a span out of every series at once. Compaction rules and the three commands
+# 8.10 added come next.
 # Samples are squeezed with
 # Gorilla, which is what the module does too, so a series read at a steady rate
 # costs a couple of bits a sample rather than sixteen bytes. Every error sentence
@@ -3696,6 +3697,28 @@ bounded = "risk"
 status = "shipped"
 wire = "verified"
 notes = "The newest sample of every series a filter list takes, with the labels beside it if the read asked for them. FILTER is not optional and its absence is an arity error rather than a syntax one however many words the command has, because the module counts what it needed after finding the keyword rather than before. WITHLABELS and SELECTED_LABELS together is an error, and the module drops the ED from the second keyword in the sentence it writes about it."
+
+[[command]]
+name = "TS.MRANGE"
+group = "ts"
+since = "1.0.0"
+arity = -4
+plan = "metadata"
+bounded = "risk"
+status = "shipped"
+wire = "verified"
+notes = "A span read out of every series a filter list takes, which is the TS.RANGE grammar with the filter list behind it and an optional group behind that. GROUPBY has to be the last four words of the command and REDUCE has to be the word two past it, or the command is an arity error rather than anything that names what went wrong. Ten of the fifteen reductions are allowed as a reducer and the weighted mean, the first and the last are not. A group folds the rows its members answered by timestamp, drops the readings that are not numbers and then reduces what is left."
+
+[[command]]
+name = "TS.MREVRANGE"
+group = "ts"
+since = "1.4.0"
+arity = -4
+plan = "metadata"
+bounded = "risk"
+status = "shipped"
+wire = "verified"
+notes = "The same read newest first. The direction is applied to each member series before the group folds them, and a COUNT is applied to each member and then again to the fold, so a group can answer fewer rows than the count and never more."
 
 
 # ---------------------------------------------------------------------- array
