@@ -214,8 +214,7 @@ impl<S: Sink> Wire<S> {
 
     /// Open a connection and give back its id.
     pub fn accept(&mut self) -> ConnId {
-        self.server.stats.clients += 1;
-        self.server.stats.connections += 1;
+        self.server.counted().opened();
         let at = self.front.open();
         self.note_buffers();
         at
@@ -363,7 +362,7 @@ impl<S: Sink> Wire<S> {
     /// pointing at somebody else's connection.
     fn forget(&mut self, client: u64) {
         self.server.waiters_mut().forget(client);
-        self.server.stats.clients = self.server.stats.clients.saturating_sub(1);
+        self.server.counted().closed();
     }
 
     /// Move up to `max` framed commands into `into`.

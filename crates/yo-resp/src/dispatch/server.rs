@@ -1030,8 +1030,7 @@ fn config(server: &mut Server, args: Args<'_>, out: &mut Out) -> Result<()> {
         }
         out.ok();
     } else if is(sub, b"RESETSTAT") {
-        server.stats.commands = 0;
-        server.stats.connections = 0;
+        server.reset_stats();
         out.ok();
     } else if is(sub, b"REWRITE") {
         return Err(Error::new(
@@ -1100,7 +1099,7 @@ fn info(server: &Server, args: Args<'_>, out: &mut Out) {
                 s,
                 "# Clients\r\nconnected_clients:{}\r\nblocked_clients:{}\r\n\
                  cluster_connections:0\r\n\r\n",
-                server.stats.clients,
+                server.totals().clients,
                 server.waiters().len(),
             );
         }
@@ -1154,6 +1153,7 @@ fn info(server: &Server, args: Args<'_>, out: &mut Out) {
             // point reads a run issued is the ratio G9 is a gate on, and it
             // cannot be worked out from outside the server.
             let cold = server.cold_stats();
+            let totals = server.totals();
             let _ = write!(
                 s,
                 "# Stats\r\ntotal_connections_received:{}\r\n\
@@ -1161,8 +1161,8 @@ fn info(server: &Server, args: Args<'_>, out: &mut Out) {
                  evicted_keys:{}\r\nyo_cold_demoted:{}\r\nyo_cold_promoted:{}\r\n\
                  yo_cold_faults:{}\r\nyo_cold_served:{}\r\nyo_cold_bytes_out:{}\r\n\
                  yo_cold_bytes_in:{}\r\n\r\n",
-                server.stats.connections,
-                server.stats.commands,
+                totals.connections,
+                totals.commands,
                 server.expired_keys(),
                 server.evicted_keys(),
                 cold.demoted,
