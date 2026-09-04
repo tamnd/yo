@@ -28,7 +28,8 @@ use super::table::Spec;
 use crate::reply::Out;
 use yo_common::num::{parse_f64, parse_i64};
 use yo_common::{Code, Error, Result, xxh3};
-use yo_kv::{Compare, Exists, Expire, IncrEx, IncrExpire, Keyspace, Num, SetOptions, Str};
+use yo_kv::strings::check_len;
+use yo_kv::{Compare, Db, Exists, Expire, IncrEx, IncrExpire, Keyspace, Num, SetOptions, Str};
 
 /// What Redis says when a digest is not sixteen hexadecimal characters.
 const BAD_DIGEST: &str = "must be exactly 16 hexadecimal characters";
@@ -49,7 +50,19 @@ const LEN_AND_IDX: &str = "If you want both the length and indexes, please just 
 /// to a switch on the length and then a compare; the table grows to about two
 /// hundred and fifty commands by M8 and this becomes a jump through an index
 /// stored in the [`Spec`], which does not change any of the bodies.
-pub(super) fn execute(db: &mut Keyspace, spec: &Spec, args: Args<'_>, out: &mut Out) -> Result<()> {
+pub(super) fn execute(db: &mut Db, spec: &Spec, args: Args<'_>, out: &mut Out) -> Result<()> {
+    // The five that name more than one key, taken before a stripe is chosen
+    // because there is no one stripe to choose. Everything below this names
+    // exactly one key and the table says it is at argument one.
+    match spec.name {
+        "mset" => return mset(db, args, out),
+        "msetnx" => return msetnx(db, args, out),
+        "mget" => return mget(db, args, out),
+        "msetex" => return msetex(db, args, out),
+        "lcs" => return lcs(db, args, out),
+        _ => {}
+    }
+    let db = db.at(args.get(1));
     match spec.name {
         "get" => match db.get(args.get(1))? {
             Some(v) => write_str(out, v),
@@ -90,28 +103,6 @@ pub(super) fn execute(db: &mut Keyspace, spec: &Spec, args: Args<'_>, out: &mut 
             db.psetex(args.get(1), args.int(2)?, args.get(3))?;
             out.ok();
         }
-        "mset" => {
-            let n = pair_count(args, "mset")?;
-            db.mset(pairs(args, 1, n))?;
-            out.ok();
-        }
-        "msetnx" => {
-            let n = pair_count(args, "msetnx")?;
-            out.int(i64::from(db.msetnx(pairs(args, 1, n))?));
-        }
-        "mget" => {
-            // One key at a time rather than `Keyspace::mget`, which collects the
-            // answers into a `Vec` for a caller that wants them all at once.
-            // The wire wants them one at a time and in order, and a `Vec` here
-            // would be an allocation per call on a thread that must not.
-            out.array(args.len() - 1);
-            for i in 1..args.len() {
-                match db.mget_one(args.get(i)) {
-                    Some(v) => write_str(out, v),
-                    None => out.nil(),
-                }
-            }
-        }
         "append" => out.int(count(db.append(args.get(1), args.get(2))?)),
         "strlen" => out.int(count(db.strlen(args.get(1))?)),
         "setrange" => {
@@ -132,8 +123,6 @@ pub(super) fn execute(db: &mut Keyspace, spec: &Spec, args: Args<'_>, out: &mut 
         // A bulk string on both protocols, not a RESP3 double. Redis has never
         // changed this one and a client that parses the digits would break.
         "incrbyfloat" => out.human_double(db.incrbyfloat(args.get(1), args.float(2)?)?),
-        "lcs" => lcs(db, args, out)?,
-        "msetex" => msetex(db, args, out)?,
         "delex" => delex(db, args, out)?,
         "digest" => match db.digest(args.get(1))? {
             Some(h) => out.bulk(&xxh3::hex(h)),
@@ -451,7 +440,7 @@ fn getex(db: &mut Keyspace, args: Args<'_>, out: &mut Out) -> Result<()> {
 
 /// `MSETEX numkeys key value [key value ...] [NX|XX]
 /// [EX s|PX ms|EXAT ts|PXAT ts|KEEPTTL]`.
-fn msetex(db: &mut Keyspace, args: Args<'_>, out: &mut Out) -> Result<()> {
+fn msetex(db: &mut Db, args: Args<'_>, out: &mut Out) -> Result<()> {
     let n = parse_i64(args.get(1))
         .filter(|&n| n > 0)
         .and_then(|n| usize::try_from(n).ok())
@@ -493,10 +482,96 @@ fn msetex(db: &mut Keyspace, args: Args<'_>, out: &mut Out) -> Result<()> {
         }
     }
     if let Some((u, pos)) = at {
-        expire = Expire::At(deadline(u, args.int(pos)?, db.clock().now_ms(), "msetex")?);
+        expire = Expire::At(deadline(u, args.int(pos)?, db.now_ms(), "msetex")?);
     }
 
-    out.int(i64::from(db.msetex(pairs(args, 2, n), exists, expire)?));
+    // The same three passes [`Keyspace::msetex`] makes, for the same reason
+    // [`mset`] makes them out here: the condition is over the whole set of keys
+    // and it has to be decided before anything is written.
+    for (k, v) in pairs(args, 2, n) {
+        check_len(k, v.len())?;
+    }
+    let allowed = match exists {
+        Exists::Always => true,
+        Exists::IfMissing => pairs(args, 2, n).all(|(k, _)| !db.at(k).exists(k)),
+        Exists::IfPresent => pairs(args, 2, n).all(|(k, _)| db.at(k).exists(k)),
+    };
+    if !allowed {
+        out.int(0);
+        return Ok(());
+    }
+    // `Exists::Always` on each pair, because the condition has been decided
+    // already and asking again per stripe would ask it of one key rather than
+    // of all of them. `Expire::Keep` still has to go through, since what it
+    // keeps is that key's own deadline and only its stripe knows it.
+    for (k, v) in pairs(args, 2, n) {
+        db.at(k)
+            .msetex(core::iter::once((k, v)), Exists::Always, expire)?;
+    }
+    out.int(1);
+    Ok(())
+}
+
+// -------------------------------------------------------- more than one key
+
+/// `MSET key value [key value ...]`.
+///
+/// [`Keyspace::mset`] checks every pair before it writes any, so that a value
+/// that is too long refuses the whole command rather than half of it. That
+/// order has to be kept when the keys are on several stripes, and it cannot be
+/// kept by handing each stripe its own pairs: the first stripe would write
+/// before the second found the bad pair. So the check is a pass of its own out
+/// here and the write is one pair at a time through the stripe that pair
+/// belongs on.
+fn mset(db: &mut Db, args: Args<'_>, out: &mut Out) -> Result<()> {
+    let n = pair_count(args, "mset")?;
+    for (k, v) in pairs(args, 1, n) {
+        check_len(k, v.len())?;
+    }
+    for (k, v) in pairs(args, 1, n) {
+        db.at(k).mset(core::iter::once((k, v)))?;
+    }
+    out.ok();
+    Ok(())
+}
+
+/// `MSETNX key value [key value ...]`, which stores all of them or none.
+///
+/// Three passes for the same reason [`Keyspace::msetnx`] takes three: the
+/// lengths, then whether any of the keys is already there, then the writes. The
+/// middle pass is what makes a key named twice inside one call not defeat
+/// itself, since nothing has been written when it runs.
+fn msetnx(db: &mut Db, args: Args<'_>, out: &mut Out) -> Result<()> {
+    let n = pair_count(args, "msetnx")?;
+    for (k, v) in pairs(args, 1, n) {
+        check_len(k, v.len())?;
+    }
+    if pairs(args, 1, n).any(|(k, _)| db.at(k).exists(k)) {
+        out.int(0);
+        return Ok(());
+    }
+    for (k, v) in pairs(args, 1, n) {
+        db.at(k).mset(core::iter::once((k, v)))?;
+    }
+    out.int(1);
+    Ok(())
+}
+
+/// `MGET key [key ...]`.
+///
+/// One key at a time rather than [`Keyspace::mget`], which collects the answers
+/// into a `Vec` for a caller that wants them all at once. The wire wants them
+/// one at a time and in order, and a `Vec` here would be an allocation per call
+/// on a thread that must not.
+fn mget(db: &mut Db, args: Args<'_>, out: &mut Out) -> Result<()> {
+    out.array(args.len() - 1);
+    for i in 1..args.len() {
+        let key = args.get(i);
+        match db.at(key).mget_one(key) {
+            Some(v) => write_str(out, v),
+            None => out.nil(),
+        }
+    }
     Ok(())
 }
 
@@ -660,7 +735,7 @@ fn write_num(out: &mut Out, n: Num) {
 ///
 /// `MINMATCHLEN` and `WITHMATCHLEN` without `IDX` are accepted and ignored,
 /// which is what a real server does.
-fn lcs(db: &mut Keyspace, args: Args<'_>, out: &mut Out) -> Result<()> {
+fn lcs(db: &mut Db, args: Args<'_>, out: &mut Out) -> Result<()> {
     let (a, b) = (args.get(1), args.get(2));
     let (mut want_len, mut want_idx, mut with_len) = (false, false, false);
     let mut minmatchlen = 0u32;
@@ -688,8 +763,15 @@ fn lcs(db: &mut Keyspace, args: Args<'_>, out: &mut Out) -> Result<()> {
         return Err(Error::new(Code::Invalid, LEN_AND_IDX));
     }
 
+    // Both values copied out before either is used, because the two keys can be
+    // on two stripes and no one keyspace holds them both. That is what
+    // [`Keyspace::lcs`] does inside itself anyway: it builds a table the size of
+    // the product of the two lengths, so a pair of copies is not what makes it
+    // expensive.
+    let (x, y) = (db.at(a).string_copy(a)?, db.at(b).string_copy(b)?);
+
     if want_idx {
-        let idx = db.lcs_idx(a, b, minmatchlen)?;
+        let idx = yo_kv::lcs::idx(&x, &y, minmatchlen)?;
         // A map on RESP3 and the same pairs flattened into an array on RESP2,
         // which is what `Out::map` writes and what a real server sends.
         out.map(2);
@@ -710,9 +792,9 @@ fn lcs(db: &mut Keyspace, args: Args<'_>, out: &mut Out) -> Result<()> {
         out.bulk(b"len");
         out.int(count(idx.len));
     } else if want_len {
-        out.int(count(db.lcs_len(a, b)?));
+        out.int(count(yo_kv::lcs::len(&x, &y)?));
     } else {
-        out.bulk(&db.lcs(a, b)?);
+        out.bulk(&yo_kv::lcs::string(&x, &y)?);
     }
     Ok(())
 }
