@@ -1309,12 +1309,12 @@ pub fn resolved(
             // keyspace group for the socket it keeps.
             "hash" if spec.name == "himport" => {
                 let db = session.db;
-                himport::execute(server.dbs[db].only_mut(), &mut session.sets, args, out)
+                himport::execute(&mut server.dbs[db], &mut session.sets, args, out)
                     .map(|()| Flow::Continue)
             }
             "hash" => {
                 let db = session.db;
-                hashes::execute(server.dbs[db].only_mut(), spec, args, out).map(|()| Flow::Continue)
+                hashes::execute(&mut server.dbs[db], spec, args, out).map(|()| Flow::Continue)
             }
             "list" => {
                 let db = session.db;
@@ -1333,11 +1333,11 @@ pub fn resolved(
             }
             "array" => {
                 let db = session.db;
-                arrays::execute(server.dbs[db].only_mut(), spec, args, out).map(|()| Flow::Continue)
+                arrays::execute(&mut server.dbs[db], spec, args, out).map(|()| Flow::Continue)
             }
             "graph" => {
                 let db = session.db;
-                graph::execute(server.dbs[db].only_mut(), spec, args, out).map(|()| Flow::Continue)
+                graph::execute(&mut server.dbs[db], spec, args, out).map(|()| Flow::Continue)
             }
             // A document under a key, reached by a path. The group is Redis's
             // module surface and the storage is ours, the same trade the vector
@@ -1348,29 +1348,27 @@ pub fn resolved(
             }
             "vector" => {
                 let db = session.db;
-                vectors::execute(server.dbs[db].only_mut(), spec, args, out)
-                    .map(|()| Flow::Continue)
+                vectors::execute(&mut server.dbs[db], spec, args, out).map(|()| Flow::Continue)
             }
             "bloom" => {
                 let db = session.db;
-                bloom::execute(server.dbs[db].only_mut(), spec, args, out).map(|()| Flow::Continue)
+                bloom::execute(&mut server.dbs[db], spec, args, out).map(|()| Flow::Continue)
             }
             "cuckoo" => {
                 let db = session.db;
-                cuckoo::execute(server.dbs[db].only_mut(), spec, args, out).map(|()| Flow::Continue)
+                cuckoo::execute(&mut server.dbs[db], spec, args, out).map(|()| Flow::Continue)
             }
             "cms" => {
                 let db = session.db;
-                cms::execute(server.dbs[db].only_mut(), spec, args, out).map(|()| Flow::Continue)
+                cms::execute(&mut server.dbs[db], spec, args, out).map(|()| Flow::Continue)
             }
             "topk" => {
                 let db = session.db;
-                topk::execute(server.dbs[db].only_mut(), spec, args, out).map(|()| Flow::Continue)
+                topk::execute(&mut server.dbs[db], spec, args, out).map(|()| Flow::Continue)
             }
             "tdigest" => {
                 let db = session.db;
-                tdigest::execute(server.dbs[db].only_mut(), spec, args, out)
-                    .map(|()| Flow::Continue)
+                tdigest::execute(&mut server.dbs[db], spec, args, out).map(|()| Flow::Continue)
             }
             "ts" => {
                 let db = session.db;
@@ -19929,5 +19927,320 @@ mod tests {
             both(&[b"TS.QUERYLABELS", b"LABELS", b"FILTER", b"room=1"]),
             "*1\r\n$4\r\nroom\r\n"
         );
+    }
+
+    /// Every hash command, and the field import beside it, on one stripe and on
+    /// eight.
+    ///
+    /// `HRANDFIELD` with a count draws from the stripe's own generator and two
+    /// stripes do not draw the same numbers, so the only draw here is off a hash
+    /// holding one field, where every generator gives the same answer.
+    #[test]
+    fn the_hash_group_answers_the_same_however_many_stripes_there_are() {
+        let script: &[&[&[u8]]] = &[
+            &[b"HSET", b"h", b"a", b"1", b"b", b"2"],
+            &[b"HMSET", b"h", b"c", b"3"],
+            &[b"HSETNX", b"h", b"a", b"9"],
+            &[b"HSETNX", b"h", b"d", b"4"],
+            &[b"HGET", b"h", b"a"],
+            &[b"HGET", b"h", b"nope"],
+            &[b"HMGET", b"h", b"a", b"nope"],
+            &[b"HLEN", b"h"],
+            &[b"HEXISTS", b"h", b"a"],
+            &[b"HSTRLEN", b"h", b"a"],
+            &[b"HGETALL", b"h"],
+            &[b"HKEYS", b"h"],
+            &[b"HVALS", b"h"],
+            &[b"HINCRBY", b"h", b"a", b"5"],
+            &[b"HINCRBYFLOAT", b"h", b"a", b"1.5"],
+            &[b"HSCAN", b"h", b"0"],
+            &[b"HSCAN", b"h", b"0", b"MATCH", b"a", b"COUNT", b"10"],
+            &[b"HSCAN", b"h", b"0", b"NOVALUES"],
+            &[b"HDEL", b"h", b"d"],
+            &[b"HSET", b"one", b"f", b"v"],
+            &[b"HRANDFIELD", b"one"],
+            &[b"HRANDFIELD", b"one", b"1", b"WITHVALUES"],
+            // The field deadlines.
+            &[b"HEXPIRE", b"h", b"100", b"FIELDS", b"1", b"a"],
+            &[b"HTTL", b"h", b"FIELDS", b"1", b"a"],
+            &[b"HPTTL", b"h", b"FIELDS", b"1", b"a"],
+            &[b"HEXPIRETIME", b"h", b"FIELDS", b"1", b"a"],
+            &[b"HPEXPIRETIME", b"h", b"FIELDS", b"1", b"a"],
+            &[b"HPERSIST", b"h", b"FIELDS", b"1", b"a"],
+            &[b"HPEXPIREAT", b"h", b"1", b"FIELDS", b"1", b"b"],
+            &[b"HGET", b"h", b"b"],
+            // The three that came later and word everything their own way.
+            &[b"HSETEX", b"h", b"EX", b"100", b"FIELDS", b"1", b"e", b"5"],
+            &[b"HGETEX", b"h", b"PERSIST", b"FIELDS", b"1", b"e"],
+            &[b"HGETDEL", b"h", b"FIELDS", b"1", b"e"],
+            &[b"HGET", b"h", b"e"],
+            // And the import, whose key is the third word.
+            &[b"HIMPORT", b"PREPARE", b"fs", b"x", b"y"],
+            &[b"HIMPORT", b"SET", b"imp", b"fs", b"1", b"2"],
+            &[b"HGETALL", b"imp"],
+            &[b"HIMPORT", b"SET", b"imp", b"nofs", b"1", b"2"],
+            &[b"HIMPORT", b"DISCARD", b"fs"],
+            // And the errors.
+            &[b"SET", b"plain", b"v"],
+            &[b"HSET", b"plain", b"a", b"1"],
+            &[b"HGETALL", b"plain"],
+            &[b"HGET", b"gone", b"a"],
+            &[b"HINCRBY", b"h", b"a", b"nan"],
+        ];
+
+        let mut one = Fixture::new();
+        let mut many = Fixture::striped(8);
+        // The field deadlines are absolute milliseconds worked out from the
+        // clock, so both servers are put on the same one rather than left to
+        // read the wall a moment apart.
+        one.server.set_clock_ms(1_700_000_000_000);
+        many.server.set_clock_ms(1_700_000_000_000);
+        for parts in script {
+            let a = one.run(parts);
+            let b = many.run(parts);
+            assert_eq!(a, b, "{}", String::from_utf8_lossy(parts[0]));
+        }
+    }
+
+    /// Every array command, on one stripe and on eight.
+    #[test]
+    fn the_array_group_answers_the_same_however_many_stripes_there_are() {
+        let script: &[&[&[u8]]] = &[
+            &[b"ARSET", b"a", b"0", b"x", b"y", b"z"],
+            &[b"ARMSET", b"a", b"5", b"p", b"7", b"q"],
+            &[b"ARGET", b"a", b"1"],
+            &[b"ARGET", b"a", b"99"],
+            &[b"ARMGET", b"a", b"0", b"5", b"99"],
+            &[b"ARGETRANGE", b"a", b"0", b"7"],
+            &[b"ARLEN", b"a"],
+            &[b"ARCOUNT", b"a"],
+            &[b"ARINSERT", b"a", b"m", b"n"],
+            &[b"ARSCAN", b"a", b"0", b"20"],
+            &[b"ARSCAN", b"a", b"0", b"20", b"LIMIT", b"2"],
+            &[b"ARGREP", b"a", b"0", b"20", b"EXACT", b"x"],
+            &[b"ARGREP", b"a", b"0", b"20", b"GLOB", b"*", b"WITHVALUES"],
+            &[b"ARLASTITEMS", b"a", b"2"],
+            &[b"ARLASTITEMS", b"a", b"2", b"REV"],
+            &[b"ARNEXT", b"a"],
+            &[b"ARSEEK", b"a", b"3"],
+            &[b"AROP", b"a", b"0", b"20", b"USED"],
+            &[b"AROP", b"a", b"0", b"20", b"MATCH", b"x"],
+            &[b"ARINFO", b"a"],
+            &[b"ARINFO", b"a", b"FULL"],
+            &[b"ARDEL", b"a", b"0"],
+            &[b"ARDELRANGE", b"a", b"1", b"2"],
+            &[b"ARCOUNT", b"a"],
+            &[b"ARRING", b"r", b"3", b"1", b"2", b"3", b"4"],
+            &[b"ARGETRANGE", b"r", b"0", b"9"],
+            // And the errors.
+            &[b"SET", b"plain", b"v"],
+            &[b"ARGET", b"plain", b"0"],
+            &[b"ARSET", b"plain", b"0", b"v"],
+            &[b"ARGET", b"gone", b"0"],
+            &[b"ARSET", b"a", b"bad", b"v"],
+        ];
+
+        let mut one = Fixture::new();
+        let mut many = Fixture::striped(8);
+        for parts in script {
+            let a = one.run(parts);
+            let b = many.run(parts);
+            assert_eq!(a, b, "{}", String::from_utf8_lossy(parts[0]));
+        }
+    }
+
+    /// Every graph and vector set command, on one stripe and on eight.
+    ///
+    /// `VRANDMEMBER` is not in here for the reason `HRANDFIELD` with a count is
+    /// not: it draws from the stripe's generator, and the stripes do not share
+    /// one.
+    #[test]
+    fn the_graph_and_vector_groups_answer_the_same_however_many_stripes_there_are() {
+        let script: &[&[&[u8]]] = &[
+            &[b"G.NADD", b"g", b"n1", b"name", b"one"],
+            &[b"G.NADD", b"g", b"n2", b"name", b"two"],
+            &[b"G.NADD", b"g", b"n3"],
+            &[b"G.NGET", b"g", b"n1"],
+            &[b"G.NGET", b"g", b"gone"],
+            &[b"G.EADD", b"g", b"n1", b"n2", b"knows"],
+            &[b"G.EADD", b"g", b"n2", b"n3", b"knows"],
+            &[b"G.OUT", b"g", b"n1", b"knows"],
+            &[b"G.IN", b"g", b"n2", b"knows"],
+            &[b"G.DEG", b"g", b"n1", b"knows"],
+            &[b"G.DEG", b"g", b"n2", b"knows", b"BOTH"],
+            &[b"G.NEIGH", b"g", b"n1", b"knows", b"DEPTH", b"2"],
+            &[b"G.PATH", b"g", b"n1", b"n3"],
+            &[b"G.EDEL", b"g", b"n1", b"n2", b"knows"],
+            &[b"G.NDEL", b"g", b"n3"],
+            &[b"G.NGET", b"g", b"n3"],
+            // The vector set, which is one index under one key.
+            &[b"VADD", b"v", b"VALUES", b"2", b"1", b"0", b"e1"],
+            &[b"VADD", b"v", b"VALUES", b"2", b"0", b"1", b"e2"],
+            &[b"VCARD", b"v"],
+            &[b"VDIM", b"v"],
+            &[b"VEMB", b"v", b"e1"],
+            &[b"VSIM", b"v", b"VALUES", b"2", b"1", b"0"],
+            &[b"VSIM", b"v", b"ELE", b"e1"],
+            &[b"VISMEMBER", b"v", b"e1"],
+            &[b"VISMEMBER", b"v", b"gone"],
+            &[b"VSETATTR", b"v", b"e1", b"{\"k\":1}"],
+            &[b"VGETATTR", b"v", b"e1"],
+            &[b"VRANGE", b"v", b"-", b"+"],
+            &[b"VLINKS", b"v", b"e1"],
+            &[b"VINFO", b"v"],
+            &[b"VREM", b"v", b"e2"],
+            &[b"VCARD", b"v"],
+            // And the errors.
+            &[b"SET", b"plain", b"v"],
+            &[b"G.NGET", b"plain", b"n1"],
+            &[b"VCARD", b"plain"],
+            &[b"G.NADD", b"gone2", b"n"],
+            &[b"VEMB", b"gone3", b"e"],
+        ];
+
+        let mut one = Fixture::new();
+        let mut many = Fixture::striped(8);
+        for parts in script {
+            let a = one.run(parts);
+            let b = many.run(parts);
+            assert_eq!(a, b, "{}", String::from_utf8_lossy(parts[0]));
+        }
+    }
+
+    /// Every bloom filter, cuckoo filter, count min sketch, top k and t digest
+    /// command, on one stripe and on eight.
+    #[test]
+    fn the_probabilistic_groups_answer_the_same_however_many_stripes_there_are() {
+        let script: &[&[&[u8]]] = &[
+            // The bloom filter.
+            &[b"BF.RESERVE", b"bf", b"0.01", b"100"],
+            &[b"BF.ADD", b"bf", b"a"],
+            &[b"BF.ADD", b"bf", b"a"],
+            &[b"BF.MADD", b"bf", b"b", b"c"],
+            &[b"BF.EXISTS", b"bf", b"a"],
+            &[b"BF.MEXISTS", b"bf", b"a", b"zz"],
+            &[b"BF.CARD", b"bf"],
+            &[b"BF.INFO", b"bf"],
+            &[b"BF.INFO", b"bf", b"CAPACITY"],
+            &[b"BF.DEBUG", b"bf"],
+            &[b"BF.INSERT", b"made", b"CAPACITY", b"50", b"ITEMS", b"x"],
+            &[b"BF.EXISTS", b"made", b"x"],
+            &[b"BF.SCANDUMP", b"bf", b"0"],
+            // The cuckoo filter.
+            &[b"CF.RESERVE", b"cf", b"100"],
+            &[b"CF.ADD", b"cf", b"a"],
+            &[b"CF.ADDNX", b"cf", b"a"],
+            &[b"CF.COUNT", b"cf", b"a"],
+            &[b"CF.EXISTS", b"cf", b"a"],
+            &[b"CF.MEXISTS", b"cf", b"a", b"zz"],
+            &[b"CF.INSERT", b"cf", b"ITEMS", b"b", b"c"],
+            &[b"CF.DEL", b"cf", b"a"],
+            &[b"CF.COMPACT", b"cf"],
+            &[b"CF.INFO", b"cf"],
+            &[b"CF.DEBUG", b"cf"],
+            &[b"CF.SCANDUMP", b"cf", b"0"],
+            // The count min sketch.
+            &[b"CMS.INITBYDIM", b"cms", b"100", b"5"],
+            &[b"CMS.INITBYPROB", b"cms2", b"0.01", b"0.01"],
+            &[b"CMS.INCRBY", b"cms", b"a", b"5", b"b", b"3"],
+            &[b"CMS.QUERY", b"cms", b"a", b"b", b"gone"],
+            &[b"CMS.INFO", b"cms"],
+            // The top k sketch.
+            &[b"TOPK.RESERVE", b"tk", b"3"],
+            &[b"TOPK.ADD", b"tk", b"a", b"b", b"a"],
+            &[b"TOPK.INCRBY", b"tk", b"c", b"4"],
+            &[b"TOPK.QUERY", b"tk", b"a", b"zz"],
+            &[b"TOPK.COUNT", b"tk", b"a", b"c"],
+            &[b"TOPK.LIST", b"tk"],
+            &[b"TOPK.LIST", b"tk", b"WITHCOUNT"],
+            &[b"TOPK.INFO", b"tk"],
+            // The t digest.
+            &[b"TDIGEST.CREATE", b"td"],
+            &[b"TDIGEST.ADD", b"td", b"1", b"2", b"3", b"4", b"5"],
+            &[b"TDIGEST.MIN", b"td"],
+            &[b"TDIGEST.MAX", b"td"],
+            &[b"TDIGEST.QUANTILE", b"td", b"0.5"],
+            &[b"TDIGEST.CDF", b"td", b"3"],
+            &[b"TDIGEST.RANK", b"td", b"3"],
+            &[b"TDIGEST.REVRANK", b"td", b"3"],
+            &[b"TDIGEST.BYRANK", b"td", b"0"],
+            &[b"TDIGEST.BYREVRANK", b"td", b"0"],
+            &[b"TDIGEST.TRIMMED_MEAN", b"td", b"0.1", b"0.9"],
+            &[b"TDIGEST.INFO", b"td"],
+            &[b"TDIGEST.RESET", b"td"],
+            &[b"TDIGEST.MIN", b"td"],
+            // And the errors.
+            &[b"SET", b"plain", b"v"],
+            &[b"BF.ADD", b"plain", b"a"],
+            &[b"CF.ADD", b"plain", b"a"],
+            &[b"CMS.QUERY", b"plain", b"a"],
+            &[b"TOPK.ADD", b"plain", b"a"],
+            &[b"TDIGEST.ADD", b"plain", b"1"],
+            &[b"CMS.INFO", b"gone"],
+            &[b"TOPK.INFO", b"gone"],
+            &[b"TDIGEST.INFO", b"gone"],
+        ];
+
+        let mut one = Fixture::new();
+        let mut many = Fixture::striped(8);
+        for parts in script {
+            let a = one.run(parts);
+            let b = many.run(parts);
+            assert_eq!(a, b, "{}", String::from_utf8_lossy(parts[0]));
+        }
+    }
+
+    /// The two sketch merges, with their sources on stripes of their own.
+    ///
+    /// These are the only two commands in the ten groups that name more than one
+    /// key, and both read a run of sources and write a destination, so both go
+    /// wrong in the same way if a merge holds one store and looks every source up
+    /// in it.
+    #[test]
+    fn a_sketch_merge_across_stripes_reads_every_source() {
+        let mut many = Fixture::striped(8);
+        let other = apart(&mut many, "s1");
+        let (s1, s2) = (b"s1".as_slice(), other.as_bytes());
+        let mut one = Fixture::new();
+        let mut both = |parts: &[&[u8]]| {
+            let a = one.run(parts);
+            let b = many.run(parts);
+            assert_eq!(a, b, "{}", String::from_utf8_lossy(parts[0]));
+            a
+        };
+
+        // The count min sketch. The destination has to be the sources' shape,
+        // and it is named first, so all three keys are read before anything is
+        // written.
+        for key in [b"cd".as_slice(), s1, s2] {
+            both(&[b"CMS.INITBYDIM", key, b"100", b"5"]);
+        }
+        both(&[b"CMS.INCRBY", s1, b"x", b"5"]);
+        both(&[b"CMS.INCRBY", s2, b"x", b"3"]);
+        assert_eq!(
+            both(&[b"CMS.MERGE", b"cd", b"2", s1, s2]),
+            "+OK\r\n",
+            "the merge took both sources"
+        );
+        assert_eq!(both(&[b"CMS.QUERY", b"cd", b"x"]), "*1\r\n:8\r\n");
+        // And with weights, which are read against the sources in order.
+        both(&[b"CMS.MERGE", b"cd", b"2", s1, s2, b"WEIGHTS", b"2", b"1"]);
+        assert_eq!(both(&[b"CMS.QUERY", b"cd", b"x"]), "*1\r\n:13\r\n");
+        // A source that is not a sketch is answered before anything is written.
+        both(&[b"SET", b"plain", b"v"]);
+        assert!(both(&[b"CMS.MERGE", b"cd", b"2", s1, b"plain"]).starts_with('-'));
+        assert_eq!(both(&[b"CMS.QUERY", b"cd", b"x"]), "*1\r\n:13\r\n");
+
+        // The t digest, which builds its destination and then puts it in place.
+        // The two source keys are used again here, so what they held goes first.
+        both(&[b"FLUSHALL"]);
+        both(&[b"TDIGEST.CREATE", b"td"]);
+        both(&[b"TDIGEST.CREATE", s1]);
+        both(&[b"TDIGEST.CREATE", s2]);
+        both(&[b"TDIGEST.ADD", s1, b"1", b"2"]);
+        both(&[b"TDIGEST.ADD", s2, b"9", b"10"]);
+        assert_eq!(both(&[b"TDIGEST.MERGE", b"td", b"2", s1, s2]), "+OK\r\n");
+        assert_eq!(both(&[b"TDIGEST.MIN", b"td"]), "$1\r\n1\r\n");
+        assert_eq!(both(&[b"TDIGEST.MAX", b"td"]), "$2\r\n10\r\n");
     }
 }

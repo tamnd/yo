@@ -28,7 +28,7 @@
 
 use yo_common::{Code, Error, Result, glob_matches, parse_i64};
 use yo_kv::hash::Text;
-use yo_kv::{Ask, Cond, Exists, Expire, Keyspace, MAX_AT};
+use yo_kv::{Ask, Cond, Db, Exists, Expire, Keyspace, MAX_AT};
 
 use super::args::{self, Args};
 use super::scan;
@@ -80,7 +80,13 @@ const SETEX_ONE_OF: &str = "Only one of EX, PX, EXAT, PXAT or KEEPTTL arguments 
 const SETEX_ONE_COND: &str = "Only one of FXX or FNX arguments can be specified";
 
 /// Run one hash command.
-pub(super) fn execute(db: &mut Keyspace, spec: &Spec, args: Args<'_>, out: &mut Out) -> Result<()> {
+///
+/// Every command in the group names one key and names it first, so the stripe
+/// is found once here and everything below goes on taking a keyspace. A hash
+/// lives on one stripe whatever is done to it, since nothing here reads a
+/// second key.
+pub(super) fn execute(db: &mut Db, spec: &Spec, args: Args<'_>, out: &mut Out) -> Result<()> {
+    let db = db.at(args.get(1));
     match spec.name {
         // HSET and HMSET are the same write and differ only in the reply, which
         // is why HMSET has been deprecated since 4.0 and still has to work.

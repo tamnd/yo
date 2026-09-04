@@ -36,7 +36,7 @@
 
 use yo_common::num::{parse_f64, parse_i64};
 use yo_common::{Code, Error, Result};
-use yo_kv::{Foreign, Keyspace};
+use yo_kv::{Db, Foreign, Keyspace};
 use yo_sketch::bloom::{Added, Bloom, Load, MAX_CAPACITY, MAX_EXPANSION, MIN_CAPACITY};
 
 use super::args::{self, Args};
@@ -135,7 +135,10 @@ impl Foreign for BloomBody {
     }
 }
 
-pub(super) fn execute(db: &mut Keyspace, spec: &Spec, args: Args<'_>, out: &mut Out) -> Result<()> {
+pub(super) fn execute(db: &mut Db, spec: &Spec, args: Args<'_>, out: &mut Out) -> Result<()> {
+    // Every command here names one filter and names it first, so the stripe is
+    // found once and everything below goes on taking a keyspace.
+    let db = db.at(args.get(1));
     match spec.name {
         "bf.reserve" => reserve(db, args, out),
         "bf.add" => add(db, args, out),

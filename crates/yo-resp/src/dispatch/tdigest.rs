@@ -48,7 +48,7 @@
 
 use yo_common::num::{parse_f64, parse_i64};
 use yo_common::{Code, Error, Result};
-use yo_kv::{Foreign, Keyspace};
+use yo_kv::{Db, Foreign};
 use yo_sketch::tdigest::TDigest;
 
 use super::args::{self, Args};
@@ -134,7 +134,13 @@ impl Foreign for TDigestBody {
     }
 }
 
-pub(super) fn execute(db: &mut Keyspace, spec: &Spec, args: Args<'_>, out: &mut Out) -> Result<()> {
+/// Run one t digest command.
+///
+/// Every command here reaches its key through the two helpers at the bottom of
+/// the file, and both of them find the stripe the key they were given is on.
+/// That is what `TDIGEST.MERGE` needs, since it reads a run of sources and
+/// writes a destination and the sources can be anywhere.
+pub(super) fn execute(db: &mut Db, spec: &Spec, args: Args<'_>, out: &mut Out) -> Result<()> {
     match spec.name {
         "tdigest.create" => create(db, args, out),
         "tdigest.reset" => reset(db, args, out),
@@ -160,7 +166,7 @@ pub(super) fn execute(db: &mut Keyspace, spec: &Spec, args: Args<'_>, out: &mut 
 /// centroids the digest is allowed, which is six times it plus ten, and a
 /// hundred of them is accurate to about a percent in the middle of the
 /// distribution and far better than that at the ends.
-fn create(db: &mut Keyspace, args: Args<'_>, out: &mut Out) -> Result<()> {
+fn create(db: &mut Db, args: Args<'_>, out: &mut Out) -> Result<()> {
     if args.len() != 2 && args.len() != 4 {
         return Err(args::wrong_arity("tdigest.create"));
     }
@@ -180,13 +186,13 @@ fn create(db: &mut Keyspace, args: Args<'_>, out: &mut Out) -> Result<()> {
     let Some(t) = TDigest::new(compression) else {
         return Err(Error::new(Code::Invalid, NO_MEMORY));
     };
-    db.put_foreign(key, Box::new(TDigestBody { t }));
+    db.at(key).put_foreign(key, Box::new(TDigestBody { t }));
     out.ok();
     Ok(())
 }
 
 /// `TDIGEST.RESET key`, which empties the digest and keeps its shape.
-fn reset(db: &mut Keyspace, args: Args<'_>, out: &mut Out) -> Result<()> {
+fn reset(db: &mut Db, args: Args<'_>, out: &mut Out) -> Result<()> {
     let body = digest(db, args.get(1))?;
     body.t.reset();
     out.ok();
@@ -197,7 +203,7 @@ fn reset(db: &mut Keyspace, args: Args<'_>, out: &mut Out) -> Result<()> {
 ///
 /// Every value is parsed before any of them is added, so a command that is going
 /// to fail changes nothing.
-fn add(db: &mut Keyspace, args: Args<'_>, out: &mut Out) -> Result<()> {
+fn add(db: &mut Db, args: Args<'_>, out: &mut Out) -> Result<()> {
     let body = digest(db, args.get(1))?;
     let mut values = Vec::with_capacity(args.len() - 2);
     for i in 2..args.len() {
@@ -229,7 +235,7 @@ fn add(db: &mut Keyspace, args: Args<'_>, out: &mut Out) -> Result<()> {
 /// The compression of the result is the destination's if it exists, the largest
 /// of the inputs' if it does not, and whatever `COMPRESSION` says if it is
 /// there.
-fn merge(db: &mut Keyspace, args: Args<'_>, out: &mut Out) -> Result<()> {
+fn merge(db: &mut Db, args: Args<'_>, out: &mut Out) -> Result<()> {
     let dest = args.get(1);
     let dest_compression = read(db, dest)?.map(|body| body.t.compression());
     let Some(numkeys) = parse_i64(args.get(2)) else {
@@ -292,7 +298,8 @@ fn merge(db: &mut Keyspace, args: Args<'_>, out: &mut Out) -> Result<()> {
         let from = compressed(db, args.get(i))?;
         fold(&mut into, &from)?;
     }
-    db.put_foreign(dest, Box::new(TDigestBody { t: into }));
+    db.at(dest)
+        .put_foreign(dest, Box::new(TDigestBody { t: into }));
     out.ok();
     Ok(())
 }
@@ -302,7 +309,7 @@ fn merge(db: &mut Keyspace, args: Args<'_>, out: &mut Out) -> Result<()> {
 /// The sweep is a write to a key the merge only reads from, which is what the
 /// reference does as well: merging out of a digest leaves that digest with its
 /// buffer folded in and its compression count one higher.
-fn compressed(db: &mut Keyspace, key: &[u8]) -> Result<Vec<(f64, i64)>> {
+fn compressed(db: &mut Db, key: &[u8]) -> Result<Vec<(f64, i64)>> {
     let body = digest(db, key)?;
     if body.t.compress().is_err() {
         return Err(Error::new(Code::Invalid, OVERFLOW));
@@ -331,7 +338,7 @@ fn fold(into: &mut TDigest, from: &[(f64, i64)]) -> Result<()> {
 }
 
 /// `TDIGEST.MIN key` and `TDIGEST.MAX key`, which are NaN on an empty digest.
-fn ends(db: &mut Keyspace, args: Args<'_>, out: &mut Out, top: bool) -> Result<()> {
+fn ends(db: &mut Db, args: Args<'_>, out: &mut Out, top: bool) -> Result<()> {
     let body = digest(db, args.get(1))?;
     let value = if body.t.size() > 0 {
         if top { body.t.max() } else { body.t.min() }
@@ -349,7 +356,7 @@ fn ends(db: &mut Keyspace, args: Args<'_>, out: &mut Out, top: bool) -> Result<(
 /// one pass. A client that sends its quantiles in order pays for one pass in
 /// total, and one that does not gets the same answers at more cost, which is why
 /// the split is here rather than a rule about the arguments.
-fn quantile(db: &mut Keyspace, args: Args<'_>, out: &mut Out) -> Result<()> {
+fn quantile(db: &mut Db, args: Args<'_>, out: &mut Out) -> Result<()> {
     let body = digest(db, args.get(1))?;
     let mut wanted = Vec::with_capacity(args.len() - 2);
     for i in 2..args.len() {
@@ -379,7 +386,7 @@ fn quantile(db: &mut Keyspace, args: Args<'_>, out: &mut Out) -> Result<()> {
 }
 
 /// `TDIGEST.CDF key value [value ...]`, the fraction at or below each value.
-fn cdf(db: &mut Keyspace, args: Args<'_>, out: &mut Out) -> Result<()> {
+fn cdf(db: &mut Db, args: Args<'_>, out: &mut Out) -> Result<()> {
     let body = digest(db, args.get(1))?;
     let mut wanted = Vec::with_capacity(args.len() - 2);
     for i in 2..args.len() {
@@ -398,7 +405,7 @@ fn cdf(db: &mut Keyspace, args: Args<'_>, out: &mut Out) -> Result<()> {
 
 /// `TDIGEST.TRIMMED_MEAN key low high`, the mean of what is left after both
 /// tails are cut.
-fn trimmed_mean(db: &mut Keyspace, args: Args<'_>, out: &mut Out) -> Result<()> {
+fn trimmed_mean(db: &mut Db, args: Args<'_>, out: &mut Out) -> Result<()> {
     let body = digest(db, args.get(1))?;
     let Some(low) = double(args.get(2)) else {
         return Err(Error::new(Code::Invalid, BAD_LOW));
@@ -424,7 +431,7 @@ fn trimmed_mean(db: &mut Keyspace, args: Args<'_>, out: &mut Out) -> Result<()> 
 /// sample the answer is minus one and over the largest it is the number of
 /// samples, and the two swap over for the reverse. An empty digest answers minus
 /// two to everything.
-fn rank(db: &mut Keyspace, args: Args<'_>, out: &mut Out, reverse: bool) -> Result<()> {
+fn rank(db: &mut Db, args: Args<'_>, out: &mut Out, reverse: bool) -> Result<()> {
     let body = digest(db, args.get(1))?;
     let mut wanted = Vec::with_capacity(args.len() - 2);
     for i in 2..args.len() {
@@ -465,7 +472,7 @@ fn rank(db: &mut Keyspace, args: Args<'_>, out: &mut Out, reverse: bool) -> Resu
 /// A rank at or past the number of samples answers an infinity, positive going
 /// forwards and negative going backwards, and every rank on an empty digest
 /// answers NaN.
-fn by_rank(db: &mut Keyspace, args: Args<'_>, out: &mut Out, reverse: bool) -> Result<()> {
+fn by_rank(db: &mut Db, args: Args<'_>, out: &mut Out, reverse: bool) -> Result<()> {
     let body = digest(db, args.get(1))?;
     let mut wanted = Vec::with_capacity(args.len() - 2);
     for i in 2..args.len() {
@@ -503,7 +510,7 @@ fn by_rank(db: &mut Keyspace, args: Args<'_>, out: &mut Out, reverse: bool) -> R
 }
 
 /// `TDIGEST.INFO key`, which is the nine numbers the digest keeps about itself.
-fn info(db: &mut Keyspace, args: Args<'_>, out: &mut Out) -> Result<()> {
+fn info(db: &mut Db, args: Args<'_>, out: &mut Out) -> Result<()> {
     let body = digest(db, args.get(1))?;
     let t = &body.t;
     out.map(9);
@@ -592,7 +599,7 @@ fn size(arg: &[u8]) -> Result<i64> {
 ///
 /// Every command takes it mutably, the reading ones included, because a question
 /// asked of a digest sweeps its buffer in before it answers.
-fn digest<'d>(db: &'d mut Keyspace, key: &[u8]) -> Result<&'d mut TDigestBody> {
+fn digest<'d>(db: &'d mut Db, key: &[u8]) -> Result<&'d mut TDigestBody> {
     match write(db, key)? {
         Some(body) => Ok(body),
         None => Err(Error::new(Code::Invalid, MISSING)),
@@ -600,8 +607,8 @@ fn digest<'d>(db: &'d mut Keyspace, key: &[u8]) -> Result<&'d mut TDigestBody> {
 }
 
 /// The digest under `key` for writing, or `None` if the key is not there.
-fn write<'d>(db: &'d mut Keyspace, key: &[u8]) -> Result<Option<&'d mut TDigestBody>> {
-    match db.foreign_mut(key)? {
+fn write<'d>(db: &'d mut Db, key: &[u8]) -> Result<Option<&'d mut TDigestBody>> {
+    match db.at(key).foreign_mut(key)? {
         Some(body) => match body.downcast_mut::<TDigestBody>() {
             Some(body) => Ok(Some(body)),
             None => Err(Error::new(Code::WrongType, WRONG_KIND)),
@@ -611,8 +618,8 @@ fn write<'d>(db: &'d mut Keyspace, key: &[u8]) -> Result<Option<&'d mut TDigestB
 }
 
 /// The same, for the two places that only want to know what is there.
-fn read<'d>(db: &'d mut Keyspace, key: &[u8]) -> Result<Option<&'d TDigestBody>> {
-    match db.foreign(key)? {
+fn read<'d>(db: &'d mut Db, key: &[u8]) -> Result<Option<&'d TDigestBody>> {
+    match db.at(key).foreign(key)? {
         Some(body) => match body.downcast_ref::<TDigestBody>() {
             Some(body) => Ok(Some(body)),
             None => Err(Error::new(Code::WrongType, WRONG_KIND)),

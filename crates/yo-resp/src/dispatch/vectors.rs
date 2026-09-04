@@ -105,7 +105,7 @@
 //! all of them (D-33).
 
 use yo_common::{Code, Error, Result, parse_i64};
-use yo_kv::{Foreign, Keyspace};
+use yo_kv::{Db, Foreign, Keyspace};
 use yo_shape::Metric;
 use yo_vector::hnsw::Requested;
 use yo_vector::{Collection, Match, Quant, Signature, quant};
@@ -299,7 +299,11 @@ fn score(body: &VectorBody, q: &[f32], hit: &Match) -> f64 {
     body.c.get(&hit.key).map_or(0.0, |s| similarity(q, s))
 }
 
-pub(super) fn execute(db: &mut Keyspace, spec: &Spec, args: Args<'_>, out: &mut Out) -> Result<()> {
+pub(super) fn execute(db: &mut Db, spec: &Spec, args: Args<'_>, out: &mut Out) -> Result<()> {
+    // A vector set is one value under one key and every command here names that
+    // key first, so the stripe is found once and everything below goes on
+    // taking a keyspace.
+    let db = db.at(args.get(1));
     match spec.name {
         "VADD" => vadd(db, args, out),
         "VSIM" => vsim(db, args, out),
