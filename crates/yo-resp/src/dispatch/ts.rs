@@ -164,6 +164,41 @@
 //! group was made on. A `SELECTED_LABELS` on a group is looked up against that
 //! one pair, so any other name comes back against a nil.
 //!
+//! # Compaction rules
+//!
+//! `TS.CREATERULE` points a source at a destination and every reading the source
+//! is given after that lands in a bucket of the destination. The rule has a
+//! width, a reduction and an alignment, and the destination is an ordinary
+//! series that a client can read, delete from and write to by hand, which is why
+//! the destination's own duplicate policy decides what happens when the rule
+//! writes over a bucket it already wrote.
+//!
+//! A rule never goes back over what the source held before it was made. It
+//! carries the bucket it is filling and the first reading it was given in that
+//! bucket, and it writes a bucket down when a reading arrives in a later one, so
+//! the buckets the source already had are never written and the destination
+//! starts from the next reading. A reading that arrives out of order into a
+//! bucket the rule has already closed makes that bucket alone worked out again
+//! from what the source now holds, and one that arrives into the bucket still
+//! open makes the whole of that bucket count rather than only the readings that
+//! came after the rule started it. `TS.DEL` on the source walks whatever the
+//! destination holds over the span that was deleted, works each of those buckets
+//! out again, drops the ones that ended up with nothing in them and drops
+//! everything at or past the bucket the rule has open, because a delete can
+//! reopen a bucket that had already been written.
+//!
+//! `LATEST` on any of the four reads shows the bucket a rule is still filling,
+//! worked out from the source, as one more reading on the end. It is added
+//! before any aggregation the read asked for, so a read that buckets its own
+//! answer buckets that reading with the rest, and it does nothing at all on a
+//! series no rule writes to. On the two multi key reads the word only counts in
+//! front of the `FILTER`, and a `LATEST` inside a `SELECTED_LABELS` list is both
+//! the flag and a label name that comes back against a nil.
+//!
+//! Two things a client can see differ from the module. A rebuilt bucket is not
+//! carried into the bucket the rule has open, which is D-56, and a rename does
+//! not follow the link, which is D-55.
+//!
 //! # Where the two protocols disagree
 //!
 //! A sample value is a simple string of the shortest digits that read back as
@@ -212,7 +247,11 @@ use yo_common::{Code, Error, Result};
 use yo_kv::{Foreign, KeyCursor, Keyspace, Kind};
 use yo_series::{
     Agg, Buckets, Encoding, Policy, Query, Refused, Rows, Sample, Series, Stamp, Unread,
+    bucket_start,
 };
+// The filter matchers below are called rules too, and both names come from the
+// module rather than from here, so the one that travels furthest is renamed.
+use yo_series::Rule as Compaction;
 
 use super::args::{self, Args};
 use super::table::Spec;
@@ -332,6 +371,30 @@ const BOTH_LABELS: &[u8] = b"TSDB: cannot accept WITHLABELS and SELECT_LABELS to
 /// A `SELECTED_LABELS` with no label named behind it, spelled the same way.
 const NO_SELECTED: &[u8] = b"TSDB: SELECT_LABELS should have at least 1 parameter";
 
+/// A rule written on to a series that is already the destination of one.
+const RULE_EXISTS: &[u8] = b"TSDB: the destination key already has a src rule";
+
+/// A rule written out of a series that is itself a destination, which is the
+/// module's way of saying a rule cannot be chained on to another.
+const SOURCE_IS_DEST: &[u8] = b"TSDB: the source key already has a source rule";
+
+/// A rule written into a series that is the source of one, which is the same
+/// refusal seen from the other end.
+const DEST_IS_SOURCE: &[u8] = b"TSDB: the destination key already has a dst rule";
+
+/// A rule from a key to itself.
+const SAME_KEY: &[u8] = b"TSDB: the source key and destination key should be different";
+
+/// A rule taken off a pair that does not have one.
+const NO_RULE: &[u8] = b"TSDB: compaction rule does not exist";
+
+/// An alignment on a rule that is missing or is not a whole number at or above
+/// zero.
+const BAD_ALIGN_STAMP: &[u8] = b"TSDB: Couldn't parse alignTimestamp";
+
+/// A third word on `TS.GET` that is not `LATEST`.
+const THIRD_WORD: &[u8] = b"TSDB: wrong 3rd argument";
+
 /// A multi key range read with no `FILTER` anywhere in it.
 const MISSING_FILTER: &[u8] = b"TSDB: missing FILTER argument";
 
@@ -430,6 +493,8 @@ pub(super) fn execute(db: &mut Keyspace, spec: &Spec, args: Args<'_>, out: &mut 
         "ts.queryindex" => queryindex(db, &args, out),
         "ts.querylabels" => querylabels(db, &args, out),
         "ts.mget" => mget(db, &args, out),
+        "ts.createrule" => createrule(db, &args, out),
+        "ts.deleterule" => deleterule(db, &args, out),
         "ts.mrange" => mrange(db, &args, out, false),
         "ts.mrevrange" => mrange(db, &args, out, true),
         "ts.info" => info(db, &args, out),
@@ -512,7 +577,10 @@ fn add(db: &mut Keyspace, args: &Args<'_>, out: &mut Out) -> Result<()> {
         }
     };
     let body = write(db, key)?.expect("the series is there by now");
-    store(body, at, value, over, out);
+    let before = body.s.last();
+    if store(body, at, value, over, out) {
+        feed(db, key, at, before)?;
+    }
     Ok(())
 }
 
@@ -539,9 +607,18 @@ fn madd(db: &mut Keyspace, args: &Args<'_>, out: &mut Out) -> Result<()> {
                 continue;
             }
         };
-        match write(db, args.get(i)) {
-            Ok(Some(body)) => store(body, at, value, None, out),
-            Ok(None) | Err(_) => out.error_line(b"ERR ", NOT_A_SERIES),
+        let stored = match write(db, args.get(i)) {
+            Ok(Some(body)) => {
+                let before = body.s.last();
+                store(body, at, value, None, out).then_some(before)
+            }
+            Ok(None) | Err(_) => {
+                out.error_line(b"ERR ", NOT_A_SERIES);
+                None
+            }
+        };
+        if let Some(before) = stored {
+            feed(db, args.get(i), at, before)?;
         }
     }
     Ok(())
@@ -607,7 +684,10 @@ fn incr(db: &mut Keyspace, args: &Args<'_>, out: &mut Out, up: bool) -> Result<(
         return say(out, NAN_INCREMENT);
     }
     let value = if up { base + by } else { base - by };
-    store(body, at, value, Some(Policy::Last), out);
+    let before = body.s.last();
+    if store(body, at, value, Some(Policy::Last), out) {
+        feed(db, key, at, before)?;
+    }
     Ok(())
 }
 
@@ -623,17 +703,38 @@ fn del(db: &mut Keyspace, args: &Args<'_>, out: &mut Out) -> Result<()> {
     let Some(body) = write(db, args.get(1))? else {
         return say(out, MISSING);
     };
-    out.uint(body.s.delete(from, to) as u64);
+    let gone = body.s.delete(from, to);
+    // The rules are put back in step even when the delete took nothing, because
+    // the reference starts the open bucket again either way and a fold that had
+    // been counting part of a bucket goes back to counting all of it.
+    undo(db, args.get(1), from, to)?;
+    out.uint(gone as u64);
     Ok(())
 }
 
-/// `TS.GET key`, which is the newest sample, or an empty array when there is not
-/// one.
+/// `TS.GET key [LATEST]`, which is the newest sample, or an empty array when
+/// there is not one.
+///
+/// The three checks run in an order of their own: a fourth word is an arity
+/// error before the key is looked at, the key is resolved before the third word
+/// is read, and only then is a third word that is not `LATEST` complained about.
 fn get(db: &mut Keyspace, args: &Args<'_>, out: &mut Out) -> Result<()> {
+    if args.len() > 3 {
+        return Err(args::wrong_arity("ts.get"));
+    }
+    let latest = args.opt(2).is_some_and(|word| args::is(word, b"LATEST"));
+    let open = if latest {
+        open_bucket(db, args.get(1))?
+    } else {
+        None
+    };
     let Some(body) = read(db, args.get(1))? else {
         return say(out, MISSING);
     };
-    match body.s.last_sample() {
+    if args.len() == 3 && !latest {
+        return say(out, THIRD_WORD);
+    }
+    match open.or_else(|| body.s.last_sample()) {
         None => out.array(0),
         Some(sample) => {
             out.array(2);
@@ -654,13 +755,17 @@ fn get(db: &mut Keyspace, args: &Args<'_>, out: &mut Out) -> Result<()> {
 /// order their errors come out in.
 fn range(db: &mut Keyspace, args: &Args<'_>, out: &mut Out, reverse: bool) -> Result<()> {
     let name = if reverse { "ts.revrange" } else { "ts.range" };
-    let Some(body) = read(db, args.get(1))? else {
+    if read(db, args.get(1))?.is_none() {
         return say(out, MISSING);
-    };
-    let query = match reading(args, reverse, SPAN_AT) {
+    }
+    let mut query = match reading(args, reverse, SPAN_AT) {
         Ok(query) => query,
         Err(bad) => return said(bad, name, out),
     };
+    if find_from(args, SPAN_AT + 1, b"LATEST").is_some() {
+        query.latest = open_bucket(db, args.get(1))?;
+    }
+    let body = read(db, args.get(1))?.expect("the series was there a moment ago");
     let rows = match body.s.read(&query) {
         Ok(rows) => rows,
         Err(Unread::TooWide) => return say(out, TOO_WIDE),
@@ -709,6 +814,7 @@ fn reading(args: &Args<'_>, reverse: bool, at: usize) -> core::result::Result<Qu
         by_ts: by_ts(args, opts)?,
         by_value: by_value(args, opts)?,
         buckets,
+        latest: None,
     })
 }
 
@@ -1204,16 +1310,18 @@ fn mget(db: &mut Keyspace, args: &Args<'_>, out: &mut Out) -> Result<()> {
         Err(bad) => return said(bad, "ts.mget", out),
     };
     let names = chosen(db, &rules);
+    let latest = latest(args);
     if out.proto().is_resp3() {
         out.map(names.len());
     } else {
         out.array(names.len());
     }
     for name in &names {
+        let open = if latest { open_bucket(db, name)? } else { None };
         let Some(body) = read(db, name)? else {
             continue;
         };
-        let last = body.s.last_sample();
+        let last = open.or_else(|| body.s.last_sample());
         let labels = body.s.labels().to_vec();
         // RESP3 has the key as the map key and the rest as a pair behind it.
         // RESP2 has no map, so the key goes inside a triple with the other two.
@@ -1255,6 +1363,17 @@ const ENDS_LABELS: &[&[u8]] = &[
     b"REDUCE",
     b"GROUPBY",
 ];
+
+/// Whether a multi key read asked for the bucket its sources are still filling.
+///
+/// The word only counts in front of the filters, because everything past those
+/// is read as a filter. A `SELECTED_LABELS` list does not stop it: a `LATEST`
+/// inside one is both the keyword and a label name, and comes back against a nil
+/// as well as turning the flag on.
+fn latest(args: &Args<'_>) -> bool {
+    let stop = find(args, b"FILTER").unwrap_or_else(|| args.len());
+    find(args, b"LATEST").is_some_and(|at| at < stop)
+}
 
 /// Which labels a multi key read asked for.
 ///
@@ -1414,8 +1533,11 @@ fn mrange(db: &mut Keyspace, args: &Args<'_>, out: &mut Out, reverse: bool) -> R
     }
 
     let names = chosen(db, &rules);
+    let latest = latest(args);
+    let mut query = query;
     let mut taken: Vec<Took> = Vec::with_capacity(names.len());
     for key in names {
+        query.latest = if latest { open_bucket(db, &key)? } else { None };
         let Some(body) = read(db, &key)? else {
             continue;
         };
@@ -1599,9 +1721,365 @@ fn spread(out: &mut Out, rows: &Rows) {
     }
 }
 
+/// `TS.CREATERULE source dest AGGREGATION reduction bucket [align]`, which sets
+/// a series to be folded into another one as it is written to.
+///
+/// Both ends of the link are stored, the source keeping a rule for each of its
+/// destinations and each destination keeping the name of its source, because
+/// `TS.INFO` reports both sides and neither can work the other out on its own.
+///
+/// The checks run in an order that has nothing to do with the order the words
+/// are written in. The bucket width is read before the reduction name, the
+/// reduction name before the width is compared against zero, and all of that
+/// before either key is looked up.
+fn createrule(db: &mut Keyspace, args: &Args<'_>, out: &mut Out) -> Result<()> {
+    if !matches!(args.len(), 6 | 7) || !args::is(args.get(3), b"AGGREGATION") {
+        return Err(args::wrong_arity("ts.createrule"));
+    }
+    let Some(delta) = parse_i64(args.get(5)) else {
+        return say(out, BAD_AGGREGATION);
+    };
+    let Some(agg) = Agg::parse(args.get(4)) else {
+        return say(out, UNKNOWN_AGG);
+    };
+    if delta <= 0 {
+        return say(out, BAD_BUCKET);
+    }
+    let align = match args.opt(6) {
+        None => 0,
+        Some(word) => match parse_i64(word).filter(|&n| n >= 0) {
+            Some(n) => n,
+            None => return say(out, BAD_ALIGN_STAMP),
+        },
+    };
+
+    let source = args.get(1).to_vec();
+    let dest = args.get(2).to_vec();
+    if source == dest {
+        return say(out, SAME_KEY);
+    }
+    // Both keys are pruned before either is read, so a rule whose other end has
+    // been deleted is out of the way by the time this asks whether there is one.
+    prune(db, &source)?;
+    prune(db, &dest)?;
+    let Some(body) = read(db, &source)? else {
+        return say(out, MISSING);
+    };
+    if body.s.source().is_some() {
+        return say(out, SOURCE_IS_DEST);
+    }
+    let Some(body) = write(db, &dest)? else {
+        return say(out, MISSING);
+    };
+    if !body.s.rules().is_empty() {
+        return say(out, DEST_IS_SOURCE);
+    }
+    if body.s.source().is_some() {
+        return say(out, RULE_EXISTS);
+    }
+    body.s.set_source(Some(source.clone()));
+    let body = write(db, &source)?.expect("the source was there a moment ago");
+    // A new rule starts with no bucket open, which is what keeps it off the
+    // samples the source already held. Those buckets are never written and the
+    // destination only starts filling from the next sample the source is given.
+    body.s.add_rule(Compaction {
+        dest,
+        delta,
+        agg,
+        align,
+        open: None,
+        start: 0,
+    });
+    out.ok();
+    Ok(())
+}
+
+/// `TS.DELETERULE source dest`, which takes the link apart from both ends.
+fn deleterule(db: &mut Keyspace, args: &Args<'_>, out: &mut Out) -> Result<()> {
+    if args.len() != 3 {
+        return Err(args::wrong_arity("ts.deleterule"));
+    }
+    let source = args.get(1).to_vec();
+    let dest = args.get(2).to_vec();
+    prune(db, &source)?;
+    let Some(body) = write(db, &source)? else {
+        return say(out, MISSING);
+    };
+    if !body.s.drop_rule(&dest) {
+        return say(out, NO_RULE);
+    }
+    if let Some(body) = write(db, &dest)? {
+        body.s.set_source(None);
+    }
+    out.ok();
+    Ok(())
+}
+
+/// Forgets the rules whose other end is gone.
+///
+/// Nothing tells this module that a key has been deleted, so a link that has
+/// lost one of its ends is found rather than reported. Every command that reads
+/// a link or writes one asks for this first, which is enough for a client to
+/// never see a rule that has stopped meaning anything.
+fn prune(db: &mut Keyspace, key: &[u8]) -> Result<()> {
+    // A key holding something else has no rules to lose and is not this
+    // function's business to complain about, since the command that asked has
+    // its own order to complain in.
+    let Ok(Some(body)) = read(db, key) else {
+        return Ok(());
+    };
+    let source = body.s.source().map(<[u8]>::to_vec);
+    let dests: Vec<Vec<u8>> = body
+        .s
+        .rules()
+        .iter()
+        .map(|rule| rule.dest.clone())
+        .collect();
+    let mut kept = Vec::with_capacity(dests.len());
+    for dest in dests {
+        if points_at(db, &dest, key)? {
+            kept.push(dest);
+        }
+    }
+    let orphan = match &source {
+        None => false,
+        Some(source) => !feeds(db, source, key)?,
+    };
+    let Some(body) = write(db, key)? else {
+        return Ok(());
+    };
+    body.s.keep_rules(&kept);
+    if orphan {
+        body.s.set_source(None);
+    }
+    Ok(())
+}
+
+/// Whether the series under `key` is a destination fed by `source`.
+fn points_at(db: &mut Keyspace, key: &[u8], source: &[u8]) -> Result<bool> {
+    let body = match read(db, key) {
+        Ok(body) => body,
+        // A key that has been replaced by something else is not a destination
+        // any more, and saying so here is what takes the rule off the source.
+        Err(_) => return Ok(false),
+    };
+    Ok(body.is_some_and(|body| body.s.source() == Some(source)))
+}
+
+/// Whether the series under `key` holds a rule writing into `dest`.
+fn feeds(db: &mut Keyspace, key: &[u8], dest: &[u8]) -> Result<bool> {
+    let body = match read(db, key) {
+        Ok(body) => body,
+        Err(_) => return Ok(false),
+    };
+    Ok(body.is_some_and(|body| body.s.rules().iter().any(|rule| rule.dest == dest)))
+}
+
+/// One folded bucket read off a source series, or `None` when nothing counted
+/// towards it.
+///
+/// The fold starts at `from` rather than at the bucket edge, because a rule only
+/// counts the samples it has been given and a sample written into a bucket
+/// before the rule existed is not one of them. With `from` on the edge this is
+/// the plain bucketed read `TS.RANGE` does, which is what makes a bucket worked
+/// out again agree with a read of the source down to the last digit.
+fn fold(s: &Series, rule: &Compaction, at: i64, from: i64) -> Option<f64> {
+    // The weighted mean weighs its last reading against whichever comes first,
+    // the end of the bucket or the end of the read, and a rule always gets the
+    // end of the bucket, so it is given a bucket of room on the far side and the
+    // first row is the answer. Nothing else looks past the bucket it is in.
+    // It also measures the bucket from its own edge rather than from the first
+    // reading a rule was given in it, so the whole bucket goes into the answer
+    // whatever the rule has seen of it.
+    let wide = rule.agg == Agg::Twa;
+    let room = if wide { 2 } else { 1 };
+    let query = Query {
+        from: if wide { at } else { from },
+        to: at.saturating_add(rule.delta * room) - 1,
+        buckets: Some(Buckets {
+            aggs: vec![rule.agg],
+            delta: rule.delta,
+            align: rule.align,
+            empty: false,
+            stamp: Stamp::Start,
+        }),
+        ..Query::default()
+    };
+    let rows = s.read(&query).ok()?;
+    // A bucket edge below the epoch is reported as sitting on it, and the room
+    // given to the weighted mean can put a second bucket in the answer, so the
+    // row is picked by its timestamp rather than by its place.
+    let want = at.max(0);
+    (0..rows.len())
+        .find(|&i| rows.stamps[i] == want)
+        .map(|i| rows.row(i)[0])
+}
+
+/// Moves every rule on `key` along after one sample landed on it.
+///
+/// A rule holds one bucket open and writes it down when a sample past it
+/// arrives, which is why a destination trails its source by a bucket and why the
+/// samples the source held before the rule was made never turn up in it. A
+/// sample landing behind the newest one is the other half of this: the bucket it
+/// falls in is closed already, so it is worked out again from everything the
+/// source holds there and written over whatever the destination had.
+fn feed(db: &mut Keyspace, key: &[u8], at: i64, before: Option<i64>) -> Result<()> {
+    for rule in rules_of(db, key)? {
+        let Some(body) = read(db, key)? else {
+            return Ok(());
+        };
+        let landed = bucket_start(at, rule.delta, rule.align);
+        let mut written = None;
+        let mut moved = None;
+        if before.is_none_or(|last| at >= last) {
+            match rule.open {
+                // The bucket that was open is finished, so it is written down
+                // and the new one takes its place.
+                Some(open) if landed > open => {
+                    written = fold(&body.s, &rule, open, rule.start).map(|value| (open, value));
+                    moved = Some((Some(landed), at));
+                }
+                Some(_) => {}
+                None => moved = Some((Some(landed), at)),
+            }
+        } else {
+            let newest = bucket_start(before.unwrap_or(at), rule.delta, rule.align);
+            if landed < newest {
+                written = fold(&body.s, &rule, landed, landed).map(|value| (landed, value));
+            } else if rule.open == Some(landed) {
+                // The open bucket counts this one too, and the module works the
+                // whole bucket out again rather than folding one more reading
+                // into what it had, so from here on the fold counts the lot.
+                moved = Some((Some(landed), landed));
+            }
+        }
+        if let Some((at, value)) = written
+            && let Some(dest) = write(db, &rule.dest)?
+        {
+            // An alignment can put the first bucket edge before zero, and the
+            // module writes that bucket at zero rather than at a timestamp no
+            // series is allowed to hold.
+            let at = at.max(0);
+            // The destination's own policy has no say here: a bucket that has
+            // been worked out again replaces the one written before it whatever
+            // that policy is.
+            let _ = dest.s.add(Sample::new(at, value), Some(Policy::Last));
+        }
+        if let Some((open, start)) = moved
+            && let Some(body) = write(db, key)?
+            && let Some(mine) = body.s.rule_mut(&rule.dest)
+        {
+            mine.open = open;
+            mine.start = start;
+        }
+    }
+    Ok(())
+}
+
+/// Puts every destination of `key` back in step after samples were taken out of
+/// it between `from` and `to`.
+///
+/// Deleting works the other way round from adding. Nothing new can appear in a
+/// destination, so this walks what the destination already holds over the span
+/// rather than the span itself, which is what keeps a delete of everything from
+/// costing a bucket per millisecond. A bucket the delete emptied goes, one it
+/// only thinned is worked out again, and one the delete reopened by taking the
+/// newest samples out from under it goes as well. The open bucket is thrown away
+/// and started again over everything the source has left there, so a fold that
+/// had been counting only the samples the rule was given goes back to counting
+/// the lot.
+fn undo(db: &mut Keyspace, key: &[u8], from: i64, to: i64) -> Result<()> {
+    for rule in rules_of(db, key)? {
+        let Some(body) = read(db, key)? else {
+            return Ok(());
+        };
+        let open = body
+            .s
+            .last()
+            .map(|last| bucket_start(last, rule.delta, rule.align));
+        let head = bucket_start(from.max(0), rule.delta, rule.align);
+        let tail = to.saturating_add(rule.delta);
+        let Some(dest) = read(db, &rule.dest)? else {
+            continue;
+        };
+        let stamps: Vec<i64> = dest.s.range(head, tail).map(|sample| sample.at).collect();
+        let body = read(db, key)?.expect("the source was there a moment ago");
+        let mut rows = Vec::with_capacity(stamps.len());
+        for at in stamps {
+            let value = match open {
+                Some(open) if at < open => fold(&body.s, &rule, at, at),
+                _ => None,
+            };
+            rows.push((at, value));
+        }
+        for (at, value) in rows {
+            if let Some(dest) = write(db, &rule.dest)? {
+                match value {
+                    Some(value) => {
+                        let _ = dest.s.add(Sample::new(at, value), Some(Policy::Last));
+                    }
+                    None => {
+                        dest.s.delete(at, at);
+                    }
+                }
+            }
+        }
+        if let Some(dest) = write(db, &rule.dest)? {
+            // Whatever the span was, a destination never holds the bucket its
+            // source is still filling, and a delete can make an older bucket
+            // that one.
+            match open {
+                Some(open) => dest.s.delete(open, i64::MAX),
+                None => dest.s.delete(0, i64::MAX),
+            };
+        }
+        if let Some(body) = write(db, key)?
+            && let Some(mine) = body.s.rule_mut(&rule.dest)
+        {
+            mine.open = open;
+            mine.start = open.unwrap_or(0);
+        }
+    }
+    Ok(())
+}
+
+/// The rules on `key`, with the ones whose destination is gone already dropped.
+fn rules_of(db: &mut Keyspace, key: &[u8]) -> Result<Vec<Compaction>> {
+    prune(db, key)?;
+    Ok(read(db, key)?.map_or_else(Vec::new, |body| body.s.rules().to_vec()))
+}
+
+/// The bucket a destination's source is still filling, which is what `LATEST`
+/// asks to see.
+///
+/// It is only there on a series that is the destination of a rule whose source
+/// has given it a sample since the rule was made. Everywhere else `LATEST` means
+/// nothing at all and the read answers what it would have answered without it.
+fn open_bucket(db: &mut Keyspace, key: &[u8]) -> Result<Option<Sample>> {
+    prune(db, key)?;
+    let Some(body) = read(db, key)? else {
+        return Ok(None);
+    };
+    let Some(source) = body.s.source().map(<[u8]>::to_vec) else {
+        return Ok(None);
+    };
+    let Some(body) = read(db, &source)? else {
+        return Ok(None);
+    };
+    let Some(rule) = body.s.rules().iter().find(|rule| rule.dest == key).cloned() else {
+        return Ok(None);
+    };
+    let Some(open) = rule.open else {
+        return Ok(None);
+    };
+    Ok(fold(&body.s, &rule, open, rule.start).map(|value| Sample::new(open.max(0), value)))
+}
+
 /// `TS.INFO key`, which is fourteen fields about the series and takes no field
 /// name.
 fn info(db: &mut Keyspace, args: &Args<'_>, out: &mut Out) -> Result<()> {
+    let resp3 = out.proto().is_resp3();
+    prune(db, args.get(1))?;
     let Some(body) = read(db, args.get(1))? else {
         return say(out, MISSING);
     };
@@ -1631,7 +2109,7 @@ fn info(db: &mut Keyspace, args: &Args<'_>, out: &mut Out) -> Result<()> {
     out.simple(b"duplicatePolicy");
     out.simple(s.policy().unwrap_or(Policy::Block).name().as_bytes());
     out.simple(b"labels");
-    if out.proto().is_resp3() {
+    if resp3 {
         out.map(s.labels().len());
         for (name, value) in s.labels() {
             out.bulk(name);
@@ -1645,12 +2123,34 @@ fn info(db: &mut Keyspace, args: &Args<'_>, out: &mut Out) -> Result<()> {
             out.bulk(value);
         }
     }
-    // Both of these wait on compaction rules, which are the next piece of the
-    // family to land.
     out.simple(b"sourceKey");
-    out.nil();
+    match s.source() {
+        Some(key) => out.bulk(key),
+        None => out.nil(),
+    }
+    // RESP2 writes a rule as four things with the destination first and RESP3
+    // makes the destination the key of a map, which is the same split the labels
+    // above go through one level up.
     out.simple(b"rules");
-    out.map(0);
+    if resp3 {
+        out.map(s.rules().len());
+        for rule in s.rules() {
+            out.bulk(&rule.dest);
+            out.array(3);
+            out.int(rule.delta);
+            out.simple(rule.agg.name().to_uppercase().as_bytes());
+            out.int(rule.align);
+        }
+    } else {
+        out.array(s.rules().len());
+        for rule in s.rules() {
+            out.array(4);
+            out.bulk(&rule.dest);
+            out.int(rule.delta);
+            out.simple(rule.agg.name().to_uppercase().as_bytes());
+            out.int(rule.align);
+        }
+    }
     out.simple(b"ignoreMaxTimeDiff");
     out.int(ignore_time);
     out.simple(b"ignoreMaxValDiff");
@@ -1667,11 +2167,22 @@ fn info(db: &mut Keyspace, args: &Args<'_>, out: &mut Out) -> Result<()> {
 /// The timestamp that comes back is not always the one that went in. A sample
 /// close enough to the newest one to be uninteresting is dropped and the newest
 /// timestamp is answered instead, which is how a client tells the two apart.
-fn store(body: &mut TsBody, at: i64, value: f64, over: Option<Policy>, out: &mut Out) {
+fn store(body: &mut TsBody, at: i64, value: f64, over: Option<Policy>, out: &mut Out) -> bool {
     match body.s.add(Sample::new(at, value), over) {
-        Ok(when) => out.int(when),
-        Err(Refused::Old) => out.error_line(b"ERR ", TOO_OLD),
-        Err(Refused::Duplicate) => out.error_line(b"ERR ", UPSERT),
+        Ok(when) => {
+            out.int(when);
+            // A sample too close to the newest one to be interesting was not
+            // stored, so there is nothing for a rule to be told about either.
+            when == at
+        }
+        Err(Refused::Old) => {
+            out.error_line(b"ERR ", TOO_OLD);
+            false
+        }
+        Err(Refused::Duplicate) => {
+            out.error_line(b"ERR ", UPSERT);
+            false
+        }
     }
 }
 

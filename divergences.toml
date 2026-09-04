@@ -405,3 +405,24 @@ title = "A TS.RANGE that asks for more than eight million rows is refused rather
 reason = "TS.RANGE with AGGREGATION and EMPTY fills every bucket in a gap between two readings, and the number of buckets in a gap is the gap divided by the bucket width. A series holding one reading at zero and one at the largest timestamp there is, read with a bucket width of one millisecond, asks for more buckets than there are bytes of memory on any machine. The module builds the reply anyway and the server dies when the allocation fails, which is a client with two samples and one command taking the process down. A read here stops at eight million rows and answers an error instead, which is roughly three hundred megabytes of reply and far more than any real client asks for. Every read that is bounded by the samples stored, which is every read that does not ask for the empty buckets, is unaffected, and so is every filled read whose gap is a sensible number of buckets wide. The error is the only sentence in the family that has no counterpart in the module, because the case it covers has no reply in the module either."
 status = "permanent"
 spec = "11 section 9"
+
+[[divergence]]
+id = "D-55"
+title = "A rename does not follow a compaction rule to the key that was renamed"
+reason = "A compaction rule names its two ends by key, and the module rewrites both ends when either key is renamed, so renaming a source leaves the destination pointing at the new name and renaming a destination leaves the rule on the source pointing at the new name. Nothing here tells the time series code that a rename happened, because a rename is a keyspace operation and the series is a value that knows nothing about the name it is filed under. The link is dropped instead: the rule and the source key both disappear from TS.INFO the next time either end is looked at, because every command that reads a link or writes one drops the rules whose other end is gone first. A DEL of either key does the same thing on both servers, so the only case that differs is a rename, and the client can put the link back with one TS.CREATERULE. Following a rename would mean either a reverse index from every key to the rules that name it, which is a cost on every rename in the keyspace for a feature almost nobody renames into, or a scan of every series on every rename, which is worse."
+status = "permanent"
+spec = "11 section 9"
+
+[[divergence]]
+id = "D-56"
+title = "A rebuilt bucket is not carried into the one a rule is filling"
+reason = "A compaction rule in the module keeps one bucket open and one running total, and a reading that arrives out of order and lands in that open bucket makes it work the whole bucket out again from the samples stored. The total it writes back is the total for the bucket it just rebuilt, but the bucket the rule thinks it has open is left as it was, so the next reading in a later bucket is added on top of a total that belongs to an older one. A source given 1 at 100, 2 at 200, 4 at 500, then 8 and 16 back in bucket 200, answers TS.GET on the destination with LATEST as 26 for bucket 500, which is 16 plus 8 plus 2 and cannot be read off any bucket of the source. A rule here starts the new bucket on the reading that opened it and answers 6, which is 4 plus 2 for the readings that are actually in bucket 500. Everything the destination has already written down is the same on both servers, because a bucket is only written when it closes and both work it out from the same samples, and so is every LATEST read that follows readings arriving in order. Reproducing the other number would mean carrying a running total per rule whose value depends on the order the readings arrived in rather than on what the series holds, which is a number no read of the source can check and no restart can rebuild."
+status = "permanent"
+spec = "11 section 9"
+
+[[divergence]]
+id = "D-57"
+title = "The weighted mean adds in a double where the module adds in a long double"
+reason = "TWA is the area under the line joining the readings in a bucket, and the module accumulates that area in a C long double, which is eighty bit extended on x86-64, IEEE binary128 on aarch64 Linux and a plain sixty four bit double on Apple silicon, so the module's own answer to the same read already depends on which machine it was built on. This adds in an f64 everywhere, which is the Apple silicon answer and the same trade D-21 makes for AROP. The difference is the last digit of a bucket whose trapezoids do not add exactly, roughly one read in a hundred over a sweep of twelve thousand, and it never shows up on a bucket whose area lands on a number a double holds exactly. Every other part of the reduction agrees, including which readings a bucket reaches for on each side, where it cuts the bucket off against the ends of the read, and the whole bucket a compaction rule writes."
+status = "permanent"
+spec = "11 section 9"
