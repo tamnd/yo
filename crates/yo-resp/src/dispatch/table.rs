@@ -1587,6 +1587,19 @@ pub static COMMANDS: &[Spec] = &[
         summary: "Move an element from either end of one list to either end of another.",
         group: "list",
     },
+    Spec {
+        name: "lmovem",
+        arity: -5,
+        flags: WRITE_OOM,
+        first_key: 1,
+        last_key: 2,
+        step: 1,
+        acl: AC_LIST_WRITE_SLOW,
+        since: "8.10.0",
+        complexity: "O(N) in the number of elements moved",
+        summary: "Move several elements from either end of one list to either end of another.",
+        group: "list",
+    },
     // The keys are behind a count, so `first_key` is zero and a cluster client
     // has to ask `COMMAND GETKEYS` rather than read a position out of this row.
     // That is what `movablekeys` means and it is why the three key fields are
@@ -4038,13 +4051,21 @@ pub static COMMANDS: &[Spec] = &[
 const MIN_LEN: usize = 3;
 const MAX_LEN: usize = 20;
 
-/// How many slots the index has, which is a power of two and a bit over twice
-/// the number of commands.
+/// How many slots the index has, which is a power of two and a bit over three
+/// times the number of commands.
 ///
-/// One kibibyte of `u16`, eight cache lines, and loose enough that a probe for a
-/// name that is not a command stops at an empty slot almost immediately. Tight
-/// enough that the whole thing stays resident next to the table it indexes.
-const SLOTS: usize = 512;
+/// Two kibibytes of `u16`, thirty two cache lines, and loose enough that a probe
+/// for a name that is not a command stops at an empty slot almost immediately.
+/// Tight enough that the whole thing stays resident next to the table it
+/// indexes.
+///
+/// This was 512 for a long time, which was a bit over twice the number of
+/// commands, and it stopped being enough at 282 of them. The note on [`MIX`]
+/// has the whole story, and the short version is that at 55 percent full there
+/// was no multiplier left that kept every command within two slots of home,
+/// and at 27 percent full the multiplier that was already there does it without
+/// being changed. A kibibyte is what that cost.
+const SLOTS: usize = 1024;
 
 /// A slot nothing was put in.
 ///
@@ -4052,7 +4073,7 @@ const SLOTS: usize = 512;
 /// most wants to be able to find.
 const FREE: u16 = u16::MAX;
 
-/// The multiplier, found by searching for one that spreads these 271 names well.
+/// The multiplier, found by searching for one that spreads these 282 names well.
 ///
 /// Not a magic constant in the bad sense: it is checked. Every command is looked
 /// up by its own name in a test, and another test holds the worst probe length
@@ -4121,12 +4142,33 @@ const FREE: u16 = u16::MAX;
 /// more than before, and the twelfth search is the first one that did not
 /// replace it. Eight shards over 960 million multipliers did not find a single
 /// one that kept the worst probe at two slots at all, let alone at two slots and
-/// sixty two, and the best of them was three slots and eighty one. So this one
-/// stays and the bound below goes up by one, which is the opposite of what the
-/// last eleven searches concluded and is the honest reading of the same
-/// procedure. There is a point where a table of this size stops having a better
-/// multiplier in it and this looks like it.
-const MIX: u64 = 0xccc7_1184_c47d_0a5f;
+/// sixty two, and the best of them was three slots and eighty one. So that one
+/// stayed and the bound went up by one, which is the opposite of what the first
+/// eleven searches concluded and was the honest reading of the same procedure.
+///
+/// `LMOVEM` took it to 282 names and three slots, and that is where the search
+/// stopped being the answer. Twelve searches had found a better multiplier
+/// eleven times and the twelfth had found that there was none, which is not a
+/// result about `LMOVEM`, it is a result about a 512 slot table holding 282
+/// names. Fifty five percent full is where linear probing starts to cost real
+/// runs, and no multiplier gets around that because the runs are the load
+/// factor and not the hash.
+///
+/// So the other half of the remedy this note has always named was taken and the
+/// table doubled. At 1024 slots the multiplier that was already here goes to two
+/// slots and forty two extra probes without being touched, which on its own
+/// would have been enough. A search over the doubled table across four shards
+/// and eighty million multipliers then found this one at **one** slot and twenty
+/// eight, so no command is more than a single slot from where it wants to be,
+/// which the table has never managed at any size. Fourteen names collide on the
+/// key itself and no multiplier can separate them, so fourteen is the floor and
+/// this is twice it, against a floor the 512 slot table never came within four
+/// times of.
+///
+/// The cost is a kibibyte, and the thing it buys beyond today is room. The
+/// `FT.*` and `TS.*` families are still to be written and both are large, and at
+/// 27 percent full there is somewhere for them to go.
+const MIX: u64 = 0x4950_0d48_92c9_0793;
 
 /// The four bytes the index is computed from: the length, the first two bytes,
 /// and the last byte with the middle byte folded into it, all lower cased.
@@ -4178,8 +4220,13 @@ const fn key_of(name: &[u8]) -> Option<u32> {
 }
 
 /// Where a key wants to sit.
+///
+/// The shift leaves the top ten bits of the product, which are the ones the
+/// multiply mixed the most, and the mask is what makes that a slot number. Ten
+/// because the table has 1024 slots, so both numbers have to move together if
+/// [`SLOTS`] ever does.
 const fn slot_of(key: u32) -> usize {
-    ((key as u64).wrapping_mul(MIX) >> 55) as usize & (SLOTS - 1)
+    ((key as u64).wrapping_mul(MIX) >> 54) as usize & (SLOTS - 1)
 }
 
 /// The index, built at compile time by inserting every command in table order.
@@ -4223,7 +4270,7 @@ const fn index() -> [u16; SLOTS] {
 /// four to 2.0, and left it faster than `GET`, which it should be, because it
 /// does less.
 ///
-/// So this is one multiply and one load into a kibibyte, and then the same name
+/// So this is one multiply and one load into two kibibytes, and then the same name
 /// compare it always ended with. What it costs the hot commands is a multiply
 /// they did not use to pay and a load that hits, and what it saves the rest is
 /// the whole walk.
@@ -4419,12 +4466,19 @@ mod tests {
     /// The index is still worth having, which is a thing that can rot.
     ///
     /// The multiplier was searched for against the 191 commands that were in the
-    /// table when it was written, and eight times since. Adding commands cannot make a lookup wrong,
-    /// because a probe walks to an empty slot and every candidate has its name
-    /// compared, but it can make one slow, and a slow lookup is exactly the thing
-    /// this replaced. So the worst probe is written down here: if a command
-    /// added later pushes it up, somebody searches for a new multiplier or a
-    /// bigger table rather than finding out from a benchmark six months later.
+    /// table when it was written, and twelve times since. Adding commands cannot
+    /// make a lookup wrong, because a probe walks to an empty slot and every
+    /// candidate has its name compared, but it can make one slow, and a slow
+    /// lookup is exactly the thing this replaced. So the worst probe is written
+    /// down here: if a command added later pushes it up, somebody searches for a
+    /// new multiplier or a bigger table rather than finding out from a benchmark
+    /// six months later. Both of those have now happened, and the note on
+    /// [`MIX`] says which one worked when.
+    ///
+    /// The bound is two slots because that is what a lookup is allowed to cost,
+    /// and the table is better than its bound: the multiplier in it keeps every
+    /// command within one slot. The total is held at exactly what it measures so
+    /// that a command which quietly spends the headroom shows up here.
     #[test]
     fn no_command_is_more_than_two_slots_from_where_it_wants_to_be() {
         let mut worst = 0;
@@ -4444,7 +4498,7 @@ mod tests {
         }
         assert!(worst <= 2, "worst probe is {worst} slots");
         assert!(
-            total <= 63,
+            total <= 28,
             "{total} extra slots walked over the whole table"
         );
     }

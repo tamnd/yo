@@ -66,6 +66,45 @@ impl End {
     }
 }
 
+/// Which order `LMOVEM` leaves the elements it moved in.
+///
+/// It only makes a difference when both ends are the same one, which is worth
+/// knowing before reading any further. Taking from the left and putting on the
+/// right hands the block over in the order it was in either way, and so does
+/// taking from the right and putting on the left. It is `LEFT LEFT` and `RIGHT
+/// RIGHT` where the two answers come apart, because those are the cases where
+/// each element lands in front of the one before it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Order {
+    /// `OBO`. Exactly as if `LMOVE` had been sent that many times, so a
+    /// destination end that puts each element in front of the last leaves the
+    /// block reversed.
+    OneByOne,
+    /// `BULK`. The block keeps the order it had in the source whatever the two
+    /// ends are.
+    Bulk,
+}
+
+/// Everything `LMOVEM` needs to know beyond the two keys.
+///
+/// The five of them travel together because they are all parsed out of one
+/// command and none of them means anything without the others. Keeping them in
+/// a struct is also what stops the call from being eight positional arguments
+/// where three of them are ends and flags that read the same at the call site.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Block {
+    /// The end of the source to take from.
+    pub from: End,
+    /// The end of the destination to put on.
+    pub to: End,
+    /// How many to move. The 5 argument form of the command means one.
+    pub count: usize,
+    /// `EXACTLY` rather than `COUNT`: all of them or none of them.
+    pub exactly: bool,
+    /// Which order they are left in.
+    pub order: Order,
+}
+
 impl Keyspace {
     /// `LPUSH key element [element ...]` and `RPUSH`. Answers the new length.
     ///
@@ -446,6 +485,104 @@ impl Keyspace {
         Ok(Some(&self.scratch))
     }
 
+    /// `LMOVEM src dst LEFT|RIGHT LEFT|RIGHT [COUNT|EXACTLY n OBO|BULK]`.
+    ///
+    /// [`Keyspace::lmove`] for more than one element at a time, which Redis
+    /// 8.10 added. `f` gets each element that moved, in the order it now sits in
+    /// the destination, which is the order the reply wants. The count that comes
+    /// back is how many that was, and zero means the reply is a nil rather than
+    /// an empty array.
+    ///
+    /// [`Block::exactly`] is the `EXACTLY` spelling against the `COUNT` one: all
+    /// of them or none of them, so a source shorter than the count moves nothing
+    /// and answers zero. That is the whole difference and it is checked before
+    /// anything is taken, which is the only way to make it true.
+    ///
+    /// # Why everything is taken before anything is put
+    ///
+    /// Because the destination is allowed to be the source. `LMOVEM k k LEFT
+    /// RIGHT COUNT 2 BULK` is a rotation by two and has to work, the same way
+    /// `LMOVE k k LEFT RIGHT` is a rotation by one. Popping the whole block
+    /// first and pushing it afterwards gets that for nothing, where anything
+    /// that interleaved the two would be reading a list it was writing.
+    ///
+    /// The block goes through the same scratch buffer [`Keyspace::lmove`] uses,
+    /// with the row buffer next to it holding where each element ends in it, so
+    /// moving a hundred elements is two buffers that were already there rather
+    /// than a `Vec` per element. Both are taken out of the database for the
+    /// duration, because the bytes have to be in hand while `push` has
+    /// `&mut self`.
+    pub fn lmovem<F>(&mut self, src: &[u8], dst: &[u8], b: Block, mut f: F) -> Result<usize>
+    where
+        F: FnMut(&[u8]),
+    {
+        // Both types settled before a single element moves, so a WRONGTYPE
+        // anywhere leaves both lists as they were. `llen` checks the source and
+        // is wanted for `EXACTLY` anyway.
+        self.list_slot(dst)?;
+        let have = self.llen(src)?;
+        if b.exactly && have < b.count {
+            return Ok(0);
+        }
+
+        let mut buf = std::mem::take(&mut self.scratch);
+        let mut ends = std::mem::take(&mut self.rows);
+        buf.clear();
+        ends.clear();
+        let took = self.pop_into(src, b.from, b.count, |e| {
+            e.write_to(&mut buf);
+            ends.push(buf.len());
+        });
+        let moved = match took {
+            Ok(n) => n,
+            Err(e) => {
+                self.scratch = buf;
+                self.rows = ends;
+                return Err(e);
+            }
+        };
+        if moved == 0 {
+            self.scratch = buf;
+            self.rows = ends;
+            return Ok(0);
+        }
+
+        // Where the destination order comes from. `pop_into` hands them over in
+        // the order it took them, which is source order from the left and
+        // reversed source order from the right. Bulk wants source order, so it
+        // turns them back over when they came off the right. One by one wants
+        // whatever repeated pushes at that end would have left, and a push at
+        // the head puts each in front of the last, so it turns them over when
+        // the destination end is the head. Those two conditions agree exactly
+        // when the two ends differ, which is why the spelling only matters when
+        // they are the same.
+        let flip = match b.order {
+            Order::Bulk => !b.from.is_left(),
+            Order::OneByOne => b.to.is_left(),
+        };
+        let at = |i: usize| {
+            let end = ends[i];
+            let start = if i == 0 { 0 } else { ends[i - 1] };
+            &buf[start..end]
+        };
+        let placed = |i: usize| if flip { moved - 1 - i } else { i };
+        // And pushing in that order needs the same turn again at the head, for
+        // the same reason: `push` is `LPUSH`, so the last one sent ends up in
+        // front.
+        let sent = |i: usize| placed(if b.to.is_left() { moved - 1 - i } else { i });
+
+        let pushed = self.push(dst, b.to, (0..moved).map(|i| at(sent(i))));
+        if pushed.is_ok() {
+            for i in 0..moved {
+                f(at(placed(i)));
+            }
+        }
+        self.scratch = buf;
+        self.rows = ends;
+        pushed?;
+        Ok(moved)
+    }
+
     /// The slot `key`'s list is in, or `None` if there is no such key.
     #[inline]
     fn list_slot(&mut self, key: &[u8]) -> Result<Option<u32>> {
@@ -724,6 +861,129 @@ mod tests {
             .lpos(b"l", b"a", 0, 0, 0, &mut Vec::new())
             .expect_err("zero");
         assert_eq!(e.message(), ZERO_RANK);
+    }
+
+    /// The whole of `LMOVEM`'s ordering, which is the part of it that is not
+    /// obvious. Every row was read off a live 8.10.1 before it was written here.
+    ///
+    /// The two spellings agree on the two rows where the ends differ and come
+    /// apart on the two where they are the same, and that is the entire content
+    /// of `OBO` against `BULK`.
+    #[test]
+    fn lmovem_orders_the_block_four_ways() {
+        use End::{Left, Right};
+        use Order::{Bulk, OneByOne};
+        for (from, to, order, want, left) in [
+            (Left, Right, OneByOne, ["a", "b"], ["c", "d", "e"]),
+            (Left, Right, Bulk, ["a", "b"], ["c", "d", "e"]),
+            (Left, Left, OneByOne, ["b", "a"], ["c", "d", "e"]),
+            (Left, Left, Bulk, ["a", "b"], ["c", "d", "e"]),
+            (Right, Left, OneByOne, ["d", "e"], ["a", "b", "c"]),
+            (Right, Left, Bulk, ["d", "e"], ["a", "b", "c"]),
+            (Right, Right, OneByOne, ["e", "d"], ["a", "b", "c"]),
+            (Right, Right, Bulk, ["d", "e"], ["a", "b", "c"]),
+        ] {
+            let mut d = db();
+            rpush(&mut d, b"s", &[b"a", b"b", b"c", b"d", b"e"]);
+            let mut got = Vec::new();
+            let b = Block {
+                from,
+                to,
+                count: 2,
+                exactly: false,
+                order,
+            };
+            let n = d
+                .lmovem(b"s", b"t", b, |v| {
+                    got.push(String::from_utf8(v.to_vec()).expect("utf8 in these tests"));
+                })
+                .expect("two lists");
+            let how = format!("{from:?} {to:?} {order:?}");
+            assert_eq!(n, 2, "{how}");
+            assert_eq!(got, want, "the reply for {how}");
+            assert_eq!(all(&mut d, b"t"), want, "the destination for {how}");
+            assert_eq!(all(&mut d, b"s"), left, "what is left for {how}");
+        }
+    }
+
+    /// A block for the tests that are not about ordering, which all want the
+    /// same one and only care about the ends and the count.
+    fn block(from: End, to: End, count: usize, exactly: bool) -> Block {
+        Block {
+            from,
+            to,
+            count,
+            exactly,
+            order: Order::Bulk,
+        }
+    }
+
+    /// `EXACTLY` is all of them or none, and the check happens before anything
+    /// is taken, which is the only place it can happen.
+    #[test]
+    fn lmovem_exactly_takes_all_of_them_or_none() {
+        let mut d = db();
+        rpush(&mut d, b"s", &[b"a", b"b", b"c"]);
+        let all_of_four = block(End::Left, End::Right, 4, true);
+        let n = d
+            .lmovem(b"s", b"t", all_of_four, |_| {
+                panic!("nothing should have moved")
+            })
+            .expect("two lists");
+        assert_eq!(n, 0);
+        assert_eq!(
+            all(&mut d, b"s"),
+            ["a", "b", "c"],
+            "the source is untouched"
+        );
+        assert_eq!(d.llen(b"t").expect("a list"), 0, "and nothing was made");
+
+        // The same count with `COUNT` takes what there is.
+        let mut got = Vec::new();
+        let up_to_four = block(End::Left, End::Right, 4, false);
+        let n = d
+            .lmovem(b"s", b"t", up_to_four, |v| got.push(v.to_vec()))
+            .expect("two lists");
+        assert_eq!(n, 3);
+        assert_eq!(got.len(), 3);
+        assert!(!d.exists(b"s"), "an emptied source goes");
+    }
+
+    /// The destination is allowed to be the source, the same way it is for
+    /// `LMOVE`, and there it is a rotation by more than one.
+    #[test]
+    fn lmovem_onto_itself_rotates_by_the_count() {
+        let mut d = db();
+        rpush(&mut d, b"l", &[b"a", b"b", b"c"]);
+        d.lmovem(b"l", b"l", block(End::Left, End::Right, 2, false), |_| {})
+            .expect("a list");
+        assert_eq!(all(&mut d, b"l"), ["c", "a", "b"]);
+
+        let mut d = db();
+        rpush(&mut d, b"l", &[b"a", b"b", b"c"]);
+        d.lmovem(b"l", b"l", block(End::Right, End::Left, 2, false), |_| {})
+            .expect("a list");
+        assert_eq!(all(&mut d, b"l"), ["b", "c", "a"]);
+    }
+
+    /// A source that is not there moves nothing and is not an error, and the
+    /// destination's type is settled before anything is taken.
+    #[test]
+    fn lmovem_checks_the_destination_before_taking_anything() {
+        let mut d = db();
+        rpush(&mut d, b"s", &[b"a", b"b"]);
+        d.set_plain(b"str", b"v").expect("room");
+        let two = block(End::Left, End::Right, 2, false);
+        let e = d
+            .lmovem(b"s", b"str", two, |_| {})
+            .expect_err("the destination is a string");
+        assert_eq!(e.code(), Code::WrongType);
+        assert_eq!(all(&mut d, b"s"), ["a", "b"], "the source is untouched");
+
+        let n = d
+            .lmovem(b"nope", b"t", two, |_| {})
+            .expect("a source that is not there is not an error");
+        assert_eq!(n, 0);
     }
 
     #[test]
