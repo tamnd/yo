@@ -4,6 +4,50 @@ What each release changed, why, and what it costs you. The versioning rules and 
 
 While the major is 0, a minor release may break anything, including the on-disk format. The format is frozen at `M6`, not before.
 
+## 0.3.15 — 2026-09-05
+
+Twenty four pull requests and no milestone has closed, so this is a patch. The reason is the same one as last time and it has not moved: M5, M6 and M7 all have their scope done and all three are held open by exit gates that are measurements rather than features, so the feature work for M8 keeps landing on top of them.
+
+What is in here is the time series command surface, the search index commands with a real stemmer under them, the vector set storage options doing what they have been claiming to do since they were parsed, and the first half of holding a database on more than one thread, which is that a database is now a set of stripes and every command reaches the one stripe its key lives on.
+
+A file written by 0.3.14 opens unchanged under this version and a file written by this version opens under 0.3.14. No record kind was added.
+
+### Added
+
+- **The time series command surface, in six parts.** The nine commands that write to a series under a key, `TS.RANGE` and `TS.REVRANGE` for reading a span back, `TS.QUERYINDEX`, `TS.QUERYLABELS` and `TS.MGET` for finding series by their labels, `TS.MRANGE` and `TS.MREVRANGE` for reading a span out of every series that matched at once, `TS.CREATERULE` and `TS.DELETERULE` for folding one series into another as it is written, and `TS.NRANGE`, `TS.NREVRANGE` and `TS.READ` for reading several named series in one call.
+- **Sixteen search index commands, all of them about an index rather than about what is in it.** `FT.CREATE` and `FT._CREATEIFNX`, `FT.ALTER` and `FT._ALTERIFNX`, the four spellings of drop, the alias family with its two suffixed forms, and `FT.INFO` and `FT._LIST`. The registry hangs off the server and not off a database, because that is where a real server keeps it, so `SELECT 1` followed by `FT._LIST` answers with the indexes made on database zero. The whole surface was read off a running 8.10.1 over a raw socket on both protocols at 136 calls with no difference, and most of what is in it came out of that rather than out of the documentation. Three differences are registered rather than copied: D-58 for the `FT.INFO` fields that are RediSearch's own internals, D-59 for the order of `FT._LIST`, and D-60 for the compression a Vamana field reports.
+- **The English stemmer and the stopword list.** Snowball's english, better known as Porter2, written out rule for rule, because a server that stems `flies` to `fly` where the reference stems it to `fli` answers a different set of documents for the same query and once an index is built the two cannot be reconciled. Twelve thousand words from a system dictionary were run through a real 8.10.1 with `FT.EXPLAIN` and the answers agree on all twelve thousand. The stopword list is thirty three words, found one at a time by asking the reference to explain a query of that word and seeing it come back empty.
+- **`VRANGE`, the thirteenth vector set command and the only one that never looks at a vector.** It reads element names as names, in the order bytes come in, with the same four spellings a lex range has anywhere else, which is what lets a client page over a set that is being written to without holding a cursor.
+
+### Changed
+
+- **A database is a set of stripes, and a command reaches the stripe its key lives on.** `Db` holds up to 256 keyspaces, the top byte of a key's hash picks one, and the default is still a single stripe so nothing about a one thread server changed. This is the half of the threading milestone that can be done while everything is still single threaded, and it is done: every command group routes each key it names rather than being handed the whole database, and everything that walks all of a database's keys walks all of its stripes, which is the expiry cycle, eviction, both compaction steps, `SCAN`, `KEYS`, `RANDOMKEY`, `DBSIZE`, `FLUSHDB`, `FLUSHALL`, `SWAPDB`, the settings, the snapshot and `MIGRATE`. Every group's tests run twice, once at one stripe and once at eight, and assert the same bytes come back.
+- **`SORT` resolves its own keys, because nobody else can.** The sorted key, each `BY` key, each `GET` key and the `STORE` destination are four different stripes and none of the last three is known before the command runs, since those names are built out of the elements. So the four store methods moved from the keyspace to the database and each lookup routes itself, one per element.
+- **The snapshot writes one selector and one run of keys per database rather than one per stripe,** so a file written by a wide server loads into a narrow one and the other way round. A file says which database a key was in and has nowhere to say which stripe, and that is on purpose.
+
+### Fixed
+
+- **`NOQUANT`, `BIN` and `Q8` are applied rather than only recorded.** A vector set has three ways to store a vector and until this all three were parsed and none was used, so `VEMB` gave back the full precision vector whatever the client asked for and `VEMB RAW` answered `f32` for a set made with `BIN`. A vector is now split into the direction it pointed and the length it had and the direction is squeezed the way the option asked for. The arithmetic is a real server's arithmetic rather than a reasonable version of it, which took reading it off a running one a few hundred vectors at a time. That is most of D-32.
+- **The vector set group was registered wrongly,** which the `VRANGE` work turned up.
+
+### Format
+
+No change. A file written by either of 0.3.14 and 0.3.15 opens under the other.
+
+### Known gaps
+
+- **Nothing here is multithreaded yet.** `yodb serve` is still one thread. The stripes are the routing half of M8 and the engine split and `serve --threads N` are the other half, along with the three number gates that milestone closes on, which are twice the throughput at pipeline depths 1, 10, 25 and 50, half the p99 latency, and half the resident memory and cycles per operation against the fastest rival on the same box.
+- **`FT.SEARCH` and everything that reads documents are not here.** What landed is the index registry and the analysis pipeline that a search will sit on top of.
+- **Three milestones have their scope done and are held open by exit gates,** unchanged from 0.3.14. M5 wants every larger than memory row at 10x, M6 wants recall at 10 of 0.95 with p99 under 1 ms on MS-MARCO-v2 as well as SIFT1M and 50 thousand vectors a second per core, and M7 wants the stream commands at 10x read in process rather than over a socket.
+- **There is no whole file RDB reader yet,** only the writer, so `PSYNC` is still ahead and divergence D-48 is still open.
+- **`MEMORY USAGE` is not implemented in this build** even though D-6 describes what it should answer.
+- **`XCFGSET` and `XIDMPRECORD` are the two stream commands left in 8.x,** and both need the idempotency tracking D-27 is about.
+- **`RESTORE` still checks `IDLETIME` and `FREQ` and then drops them, which is D-26.**
+- **`GRAPH.QUERY` is not supported and will not be.**
+- **Log page buffers are not counted against `maxmemory`,** about 96 MiB per attached database.
+- **`keyspace_hits` and `keyspace_misses` are missing from `INFO stats`.**
+- **`GETRANGE` on a demoted value reads the whole value back** rather than only the chunks the window covers.
+
 ## 0.3.14 — 2026-09-04
 
 Fifty four pull requests and no milestone has closed, so this is a patch again. The last release said that a patch this size is a process failure rather than a plan, and saying it twice is worse than saying it once, so here is the actual reason: M5, M6 and M7 all have their scope done and all three are held open by exit gates that are measurements rather than features. A gate that is not met cannot be waved through, and a milestone that cannot close cannot take a minor, so the feature work for M8 went in on top and the pile got bigger. The gates are in the known gaps below with the numbers they are currently at.
