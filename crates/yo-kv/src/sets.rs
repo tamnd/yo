@@ -458,13 +458,20 @@ impl Keyspace {
         self.sinter(keys, limit, |_| {})
     }
 
-    /// `SUNION key [key ...]`.
+    /// `SUNION key [key ...]`, and `SUNIONCARD`'s limit.
     ///
     /// A key that is not there contributes nothing and is dropped rather than
     /// emptying the answer, which is the opposite of what it does to an
     /// intersection and is right for the same reason: an empty set adds no
     /// members and removes none.
-    pub fn sunion<'k, F>(&mut self, keys: impl Iterator<Item = &'k [u8]>, f: F) -> Result<usize>
+    ///
+    /// Zero for a limit means no limit, as it does on [`Keyspace::sinter`].
+    pub fn sunion<'k, F>(
+        &mut self,
+        keys: impl Iterator<Item = &'k [u8]>,
+        limit: usize,
+        f: F,
+    ) -> Result<usize>
     where
         F: FnMut(&[u8]),
     {
@@ -474,17 +481,31 @@ impl Keyspace {
         // building that table was most of what a `SUNION` over text sets did.
         let mut scratch = std::mem::take(&mut self.setops);
         let sets = self.bodies_of(&slots);
-        let n = setops::union(&mut scratch, &sets, f);
+        let n = setops::union(&mut scratch, &sets, limit, f);
         self.setops = scratch;
         Ok(n)
     }
 
-    /// `SDIFF key [key ...]`.
+    /// `SUNIONCARD numkeys key [key ...] [LIMIT limit]`.
+    pub fn sunioncard<'k>(
+        &mut self,
+        keys: impl Iterator<Item = &'k [u8]>,
+        limit: usize,
+    ) -> Result<usize> {
+        self.sunion(keys, limit, |_| {})
+    }
+
+    /// `SDIFF key [key ...]`, and `SDIFFCARD`'s limit.
     ///
     /// The first key is the one being walked, so a first key that is not there
     /// is an empty answer whatever the rest hold. A later key that is not there
     /// takes nothing away and is dropped.
-    pub fn sdiff<'k, F>(&mut self, keys: impl Iterator<Item = &'k [u8]>, f: F) -> Result<usize>
+    pub fn sdiff<'k, F>(
+        &mut self,
+        keys: impl Iterator<Item = &'k [u8]>,
+        limit: usize,
+        f: F,
+    ) -> Result<usize>
     where
         F: FnMut(&[u8]),
     {
@@ -493,7 +514,16 @@ impl Keyspace {
             return Ok(0);
         };
         let sets = self.bodies_of(&slots);
-        Ok(setops::diff(&sets, f))
+        Ok(setops::diff(&sets, limit, f))
+    }
+
+    /// `SDIFFCARD numkeys key [key ...] [LIMIT limit]`.
+    pub fn sdiffcard<'k>(
+        &mut self,
+        keys: impl Iterator<Item = &'k [u8]>,
+        limit: usize,
+    ) -> Result<usize> {
+        self.sdiff(keys, limit, |_| {})
     }
 
     /// `SINTERSTORE destination key [key ...]`. Answers the size of the result.
@@ -533,7 +563,7 @@ impl Keyspace {
             // conversion rather than a wrong answer.
             let upper = sets.iter().map(|s| s.len()).sum();
             setops::collect(upper, &self.limits, |f| {
-                setops::union(&mut scratch, &sets, f);
+                setops::union(&mut scratch, &sets, 0, f);
             })
         };
         self.setops = scratch;
@@ -552,7 +582,7 @@ impl Keyspace {
                 let sets = self.bodies_of(&slots);
                 let upper = sets[0].len();
                 setops::collect(upper, &self.limits, |f| {
-                    setops::diff(&sets, f);
+                    setops::diff(&sets, 0, f);
                 })
             }
             _ => None,
@@ -720,10 +750,16 @@ mod tests {
         add(&mut d, b"b", &[b"gamma", b"delta", b"epsilon", b"zeta"]);
         // One call to grow the table to the size of this union. Everything
         // after it reuses what that one bought.
-        assert_eq!(d.sunion([b"a".as_slice(), b"b"].into_iter(), |_| {}), Ok(6));
+        assert_eq!(
+            d.sunion([b"a".as_slice(), b"b"].into_iter(), 0, |_| {}),
+            Ok(6)
+        );
         let (_, allocs) = crate::tally::counted(|| {
             for _ in 0..50 {
-                assert_eq!(d.sunion([b"a".as_slice(), b"b"].into_iter(), |_| {}), Ok(6));
+                assert_eq!(
+                    d.sunion([b"a".as_slice(), b"b"].into_iter(), 0, |_| {}),
+                    Ok(6)
+                );
             }
         });
         assert_eq!(allocs, 0, "sunion allocated {allocs} times in fifty");
@@ -736,14 +772,17 @@ mod tests {
         let mut d = db();
         add(&mut d, b"a", &[b"one", b"two"]);
         add(&mut d, b"b", &[b"two", b"three"]);
-        assert_eq!(d.sunion([b"a".as_slice(), b"b"].into_iter(), |_| {}), Ok(3));
+        assert_eq!(
+            d.sunion([b"a".as_slice(), b"b"].into_iter(), 0, |_| {}),
+            Ok(3)
+        );
 
         let many: Vec<Vec<u8>> = (0..500).map(|i| format!("m{i}").into_bytes()).collect();
         let refs: Vec<&[u8]> = many.iter().map(Vec::as_slice).collect();
         add(&mut d, b"c", &refs);
         let mut seen = Vec::new();
         assert_eq!(
-            d.sunion([b"a".as_slice(), b"c"].into_iter(), |m| seen
+            d.sunion([b"a".as_slice(), b"c"].into_iter(), 0, |m: &[u8]| seen
                 .push(m.to_vec())),
             Ok(502)
         );
@@ -753,7 +792,10 @@ mod tests {
 
         // And back down again, which is the direction that would break if the
         // table were only ever grown and not cleared.
-        assert_eq!(d.sunion([b"a".as_slice(), b"b"].into_iter(), |_| {}), Ok(3));
+        assert_eq!(
+            d.sunion([b"a".as_slice(), b"b"].into_iter(), 0, |_| {}),
+            Ok(3)
+        );
     }
 
     #[test]
@@ -1161,8 +1203,8 @@ mod tests {
             let (found, allocs) = crate::tally::counted(|| {
                 let mut n = 0;
                 d.sinter(keys.iter().copied(), 0, |_| n += 1).expect("sets");
-                d.sunion(keys.iter().copied(), |_| n += 1).expect("sets");
-                d.sdiff(keys.iter().copied(), |_| n += 1).expect("sets");
+                d.sunion(keys.iter().copied(), 0, |_| n += 1).expect("sets");
+                d.sdiff(keys.iter().copied(), 0, |_| n += 1).expect("sets");
                 n
             });
             assert!(found > 0, "ints {ints}: the operations found nothing");
@@ -1189,7 +1231,7 @@ mod tests {
         // Every set holds the same eight members, so they all survive.
         assert_eq!(inter, 8);
         let mut union = 0;
-        d.sunion(keys(), |_| union += 1).expect("sets");
+        d.sunion(keys(), 0, |_| union += 1).expect("sets");
         assert_eq!(union, 8);
     }
 
@@ -1461,8 +1503,8 @@ mod tests {
         let mut take = |m: &[u8]| got.push(String::from_utf8_lossy(m).into_owned());
         let n = match op {
             "inter" => d.sinter(keys.iter().copied(), 0, &mut take),
-            "union" => d.sunion(keys.iter().copied(), &mut take),
-            "diff" => d.sdiff(keys.iter().copied(), &mut take),
+            "union" => d.sunion(keys.iter().copied(), 0, &mut take),
+            "diff" => d.sdiff(keys.iter().copied(), 0, &mut take),
             other => unreachable!("{other}"),
         }
         .expect("sets");
@@ -1641,9 +1683,12 @@ mod tests {
             d.sinter([b"a".as_slice(), b"str"].into_iter(), 0, |_| ())
                 .is_err()
         );
-        assert!(d.sunion([b"str".as_slice()].into_iter(), |_| ()).is_err());
         assert!(
-            d.sdiff([b"a".as_slice(), b"str"].into_iter(), |_| ())
+            d.sunion([b"str".as_slice()].into_iter(), 0, |_| ())
+                .is_err()
+        );
+        assert!(
+            d.sdiff([b"a".as_slice(), b"str"].into_iter(), 0, |_| ())
                 .is_err()
         );
         assert!(

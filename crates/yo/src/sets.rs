@@ -339,6 +339,22 @@ impl Sets {
         self.collect(keys, Op::Union)
     }
 
+    /// How big the union is, without building it. `SUNIONCARD`.
+    ///
+    /// A `limit` of zero means no limit, and is [`Sets::intersect_len`]'s in
+    /// every respect.
+    ///
+    /// # Errors
+    ///
+    /// As [`Sets::add`], for any of the keys.
+    pub fn union_len<K: AsRef<[u8]>>(&self, keys: &[K], limit: usize) -> Result<usize> {
+        self.db.run(|inner| {
+            inner
+                .strings
+                .sunioncard(keys.iter().map(AsRef::as_ref), limit)
+        })
+    }
+
     /// Everything in the first set and in none of the others. `SDIFF`.
     ///
     /// # Errors
@@ -346,6 +362,22 @@ impl Sets {
     /// As [`Sets::add`], for any of the keys.
     pub fn difference<K: AsRef<[u8]>>(&self, keys: &[K]) -> Result<Vec<Vec<u8>>> {
         self.collect(keys, Op::Difference)
+    }
+
+    /// How big the difference is, without building it. `SDIFFCARD`.
+    ///
+    /// A `limit` of zero means no limit, and is [`Sets::intersect_len`]'s in
+    /// every respect.
+    ///
+    /// # Errors
+    ///
+    /// As [`Sets::add`], for any of the keys.
+    pub fn difference_len<K: AsRef<[u8]>>(&self, keys: &[K], limit: usize) -> Result<usize> {
+        self.db.run(|inner| {
+            inner
+                .strings
+                .sdiffcard(keys.iter().map(AsRef::as_ref), limit)
+        })
     }
 
     /// Store the intersection under `destination` and say how big it is.
@@ -417,8 +449,8 @@ impl Sets {
             let keys = keys.iter().map(AsRef::as_ref);
             match op {
                 Op::Intersect => inner.strings.sinter(keys, 0, push)?,
-                Op::Union => inner.strings.sunion(keys, push)?,
-                Op::Difference => inner.strings.sdiff(keys, push)?,
+                Op::Union => inner.strings.sunion(keys, 0, push)?,
+                Op::Difference => inner.strings.sdiff(keys, 0, push)?,
             };
             Ok(out)
         })
@@ -656,6 +688,17 @@ impl Set {
         self.sets.union(&self.keys_with(others)?)
     }
 
+    /// How many members this set and `others` have between them. `SUNIONCARD`.
+    ///
+    /// A `limit` of zero means no limit.
+    ///
+    /// # Errors
+    ///
+    /// As [`Set::move_to`].
+    pub fn union_len(&self, others: &[&Set], limit: usize) -> Result<usize> {
+        self.sets.union_len(&self.keys_with(others)?, limit)
+    }
+
     /// Everything in this set and in none of `others`. `SDIFF`.
     ///
     /// # Errors
@@ -663,6 +706,17 @@ impl Set {
     /// As [`Set::move_to`].
     pub fn difference(&self, others: &[&Set]) -> Result<Vec<Vec<u8>>> {
         self.sets.difference(&self.keys_with(others)?)
+    }
+
+    /// How many members this set has that no set in `others` has. `SDIFFCARD`.
+    ///
+    /// A `limit` of zero means no limit.
+    ///
+    /// # Errors
+    ///
+    /// As [`Set::move_to`].
+    pub fn difference_len(&self, others: &[&Set], limit: usize) -> Result<usize> {
+        self.sets.difference_len(&self.keys_with(others)?, limit)
     }
 
     /// Store the intersection in `destination` and say how big it is.
@@ -879,6 +933,10 @@ mod tests {
         );
         assert_eq!(sorted(a.difference(&[&b]).unwrap()), vec![b"x".to_vec()]);
         assert_eq!(a.intersect_len(&[&b], 0).unwrap(), 1);
+        assert_eq!(a.union_len(&[&b], 0).unwrap(), 3);
+        assert_eq!(a.union_len(&[&b], 2).unwrap(), 2, "the limit stops it");
+        assert_eq!(a.difference_len(&[&b], 0).unwrap(), 1);
+        assert_eq!(b.difference_len(&[&a], 0).unwrap(), 1);
 
         let out = db.set("out");
         assert_eq!(a.union_into(&out, &[&b]).unwrap(), 3);

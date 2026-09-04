@@ -982,6 +982,35 @@ pub static COMMANDS: &[Spec] = &[
         summary: "Store the members of the first set that no later set has.",
         group: "set",
     },
+    // The two 8.10 added, which are to SUNION and SDIFF what SINTERCARD is to
+    // SINTER, and which describe their keys the same way it does and for the
+    // same reason.
+    Spec {
+        name: "sunioncard",
+        arity: -3,
+        flags: READ_MOVABLE,
+        first_key: 0,
+        last_key: 0,
+        step: 0,
+        acl: AC_SET_READ_SLOW,
+        since: "8.10.0",
+        complexity: "O(N) in the total number of members",
+        summary: "How many members any of these sets has, up to a limit.",
+        group: "set",
+    },
+    Spec {
+        name: "sdiffcard",
+        arity: -3,
+        flags: READ_MOVABLE,
+        first_key: 0,
+        last_key: 0,
+        step: 0,
+        acl: AC_SET_READ_SLOW,
+        since: "8.10.0",
+        complexity: "O(N) in the total number of members",
+        summary: "How many members the first set has that no later set has, up to a limit.",
+        group: "set",
+    },
     // -------------------------------------------------------------- hashes
     Spec {
         name: "hset",
@@ -4087,6 +4116,16 @@ const FREE: u16 = u16::MAX;
 /// moved by one and the multiplier found five more probes than the floor moved.
 /// Nine shards were run from different seeds and the spread was sixty two to a
 /// hundred and three, which is worth knowing: one shard is not a search.
+///
+/// `SUNIONCARD` and `SDIFFCARD` took it to 281 names and sixty three probes, one
+/// more than before, and the twelfth search is the first one that did not
+/// replace it. Eight shards over 960 million multipliers did not find a single
+/// one that kept the worst probe at two slots at all, let alone at two slots and
+/// sixty two, and the best of them was three slots and eighty one. So this one
+/// stays and the bound below goes up by one, which is the opposite of what the
+/// last eleven searches concluded and is the honest reading of the same
+/// procedure. There is a point where a table of this size stops having a better
+/// multiplier in it and this looks like it.
 const MIX: u64 = 0xccc7_1184_c47d_0a5f;
 
 /// The four bytes the index is computed from: the length, the first two bytes,
@@ -4405,7 +4444,7 @@ mod tests {
         }
         assert!(worst <= 2, "worst probe is {worst} slots");
         assert!(
-            total <= 62,
+            total <= 63,
             "{total} extra slots walked over the whole table"
         );
     }
