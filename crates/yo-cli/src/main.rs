@@ -30,7 +30,7 @@ yodb, an embedded knowledge engine
 usage:
   yodb check FILE [--quick] [--quiet]
   yodb serve [--bind ADDR] [--port PORT] [--unixsocket PATH] [--no-port]
-             [--store PATH --maxmemory BYTES]
+             [--dir PATH] [--store PATH --maxmemory BYTES]
 
   check    read a .yo file and report anything wrong with it. Never writes.
              --quick   skip the records and read only the headers
@@ -43,6 +43,9 @@ usage:
                            TCP stack and is the faster way in for a client
                            on the same machine
              --no-port     no TCP at all, socket file only
+             --dir         where the server writes, which is where BACKUP
+                           puts its files and what CONFIG GET dir answers.
+                           The directory the command was run from by default
              --maxmemory   how much memory to use before something has to
                            go, in the units CONFIG SET takes, so 100mb is
                            a hundred mebibytes and 100m is a hundred
@@ -225,6 +228,7 @@ fn serve_command(args: &[&str]) -> ExitCode {
     let mut tcp = true;
     let mut store: Option<std::path::PathBuf> = None;
     let mut maxmemory: Option<u64> = None;
+    let mut dir: Option<std::path::PathBuf> = None;
 
     let mut at = 0;
     while at < args.len() {
@@ -236,7 +240,7 @@ fn serve_command(args: &[&str]) -> ExitCode {
                 return ExitCode::SUCCESS;
             }
             "--no-port" => tcp = false,
-            "--bind" | "--port" | "--unixsocket" | "--store" | "--maxmemory" => {
+            "--bind" | "--port" | "--unixsocket" | "--store" | "--maxmemory" | "--dir" => {
                 let Some(value) = args.get(at) else {
                     eprintln!("yodb serve: {arg} needs a value");
                     return ExitCode::from(2);
@@ -248,6 +252,8 @@ fn serve_command(args: &[&str]) -> ExitCode {
                     unixsocket = Some(std::path::PathBuf::from(*value));
                 } else if arg == "--store" {
                     store = Some(std::path::PathBuf::from(*value));
+                } else if arg == "--dir" {
+                    dir = Some(std::path::PathBuf::from(*value));
                 } else if arg == "--maxmemory" {
                     // The parser `CONFIG SET maxmemory` uses, so that the two
                     // ways of setting the same limit read it the same way.
@@ -287,6 +293,23 @@ fn serve_command(args: &[&str]) -> ExitCode {
         eprintln!("yodb serve: --store with no --maxmemory is a file nothing would ever be put in");
         return ExitCode::from(2);
     }
+    // Checked and made absolute here rather than when a backup is asked for,
+    // because the person who mistyped the path is still watching now and will
+    // not be then. Joined onto the working directory rather than canonicalised,
+    // since canonicalising on Windows produces a path with a prefix on it that
+    // nobody expects to read back out of `CONFIG GET dir`.
+    let dir = match dir {
+        Some(path) if !path.is_dir() => {
+            eprintln!(
+                "yodb serve: {}: not a directory to write in",
+                path.display()
+            );
+            return ExitCode::from(2);
+        }
+        Some(path) if path.is_absolute() => Some(path),
+        Some(path) => Some(std::env::current_dir().unwrap_or_default().join(path)),
+        None => None,
+    };
 
     // Before the listener, because a file that cannot be made should not leave a
     // port bound behind it, and because failing here is a mistyped path and the
@@ -312,6 +335,9 @@ fn serve_command(args: &[&str]) -> ExitCode {
     };
     if let Some(limit) = maxmemory {
         server.set_maxmemory(limit);
+    }
+    if let Some(dir) = dir {
+        server.set_dir(dir);
     }
     if let Some(opened) = opened {
         server.use_store(opened);
