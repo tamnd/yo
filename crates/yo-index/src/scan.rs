@@ -48,18 +48,25 @@
 //! # The shape of the number
 //!
 //! ```text
-//!  63                              16 15      6 5        0
-//! +----------------------------------+---------+----------+
-//! |         directory prefix         |    0    |  bucket  |
-//! +----------------------------------+---------+----------+
+//!  63                              16 15 14 13      6 5        0
+//! +----------------------------------+-----+---------+----------+
+//! |         directory prefix         |  0  | stripe  |  bucket  |
+//! +----------------------------------+-----+---------+----------+
 //! ```
 //!
 //! The bucket within a segment comes off the bottom of the hash and the prefix
 //! comes off the top, so the two never overlap and a split cannot move a key
-//! from one bucket to another. The ten bits in the middle are spare. They are
-//! not padding for its own sake: a segment is 64 buckets today and the day it is
-//! not, the field grows into them without the cursors clients are holding
-//! meaning something different.
+//! from one bucket to another. That leaves ten bits in the middle, and eight of
+//! them carry the stripe number.
+//!
+//! The stripe means nothing to the index. A database above this crate is
+//! several indexes and a walk of it is a walk of each one in turn, so the
+//! cursor a client holds has to say which one it had got to as well as where it
+//! had got to in it. This is where that number lives, because the bit budget is
+//! shared and a field handed out in two places is a field that collides. Two
+//! bits are left over and a segment is 64 buckets today, so the bucket field
+//! can double twice without any cursor a client is holding meaning something
+//! different.
 //!
 //! Zero is both the start and the end, which is Redis's convention and is not an
 //! ambiguity in practice: a walk that has finished says zero, and a client that
@@ -81,6 +88,15 @@ pub(crate) const PREFIX_SHIFT: u32 = 16;
 
 /// Bits of bucket index, which is `log2` of [`SEGMENT_BUCKETS`](super::SEGMENT_BUCKETS).
 pub(crate) const BUCKET_BITS: u32 = 6;
+
+/// Bits of stripe number, which is how many stripes a database can be cut into.
+pub const STRIPE_BITS: u32 = 8;
+
+/// Where the stripe number sits, which is directly above the bucket.
+const STRIPE_SHIFT: u32 = BUCKET_BITS;
+
+/// The stripe number on its own, in place.
+const STRIPE_MASK: u64 = ((1 << STRIPE_BITS) - 1) << STRIPE_SHIFT;
 
 impl Cursor {
     /// The start of a walk, and the same value as the end of one.
@@ -107,6 +123,37 @@ impl Cursor {
     #[must_use]
     pub const fn is_end(self) -> bool {
         self.0 == 0
+    }
+
+    /// Which index of several this cursor was walking.
+    ///
+    /// The index itself never reads this and never writes it. It is here
+    /// because the number a client holds has one bit budget and the layer above
+    /// needs a field in it, and a field handed out in two places is a field
+    /// that collides. See the module docs for the rest of the shape.
+    #[must_use]
+    pub const fn stripe(self) -> usize {
+        ((self.0 & STRIPE_MASK) >> STRIPE_SHIFT) as usize
+    }
+
+    /// The same cursor with a stripe number written into it.
+    ///
+    /// A number too big for the field is masked down rather than refused, and
+    /// nothing can hand one over: the field holds
+    /// [`STRIPE_BITS`] bits and that is what the width above it is capped at.
+    #[must_use]
+    pub const fn with_stripe(self, stripe: usize) -> Cursor {
+        Cursor((self.0 & !STRIPE_MASK) | (((stripe as u64) << STRIPE_SHIFT) & STRIPE_MASK))
+    }
+
+    /// The same cursor with the stripe number taken back out.
+    ///
+    /// What the index is handed, so that a walk of one stripe cannot tell it is
+    /// one of several. Which also means that a cursor holding nothing but a
+    /// stripe number is the start of that stripe.
+    #[must_use]
+    pub const fn without_stripe(self) -> Cursor {
+        Cursor(self.0 & !STRIPE_MASK)
     }
 
     /// The prefix half, which says which segment.
@@ -196,6 +243,20 @@ mod tests {
             let want = (hash >> (dir_bits - g)) & ((1 << g) - 1);
             assert_eq!(prefix >> (PREFIX_BITS - g), want, "depth {g}");
         }
+    }
+
+    #[test]
+    fn a_stripe_number_sits_beside_the_other_two_halves() {
+        let c = Cursor::at(0x1234, 42).with_stripe(200);
+        assert_eq!(c.prefix(), 0x1234);
+        assert_eq!(c.bucket(), 42);
+        assert_eq!(c.stripe(), 200);
+        assert_eq!(c.without_stripe(), Cursor::at(0x1234, 42));
+        // And a walk of one stripe is handed a cursor that has never heard of
+        // stripes, which for the first stripe is the ordinary start.
+        assert_eq!(Cursor::START.with_stripe(0), Cursor::START);
+        assert!(!Cursor::START.with_stripe(1).is_end());
+        assert!(Cursor::START.with_stripe(1).without_stripe().is_end());
     }
 
     #[test]

@@ -19,15 +19,20 @@
 //! keyspace, and everything that walks a whole database has to walk all of
 //! them.
 
+use yo_index::Cursor as KeyCursor;
+
+use crate::value::Kind;
 use crate::{Clock, Keyspace};
 
 /// The most stripes one database can be cut into.
 ///
-/// Eight bits of hash choose the stripe, so this is what those bits can count
-/// to. It is far more than a machine has cores and the point of the ceiling is
-/// not to be reached, it is to keep the choice inside a field nothing else is
-/// reading.
-pub const MAX_STRIPES: usize = 256;
+/// Two fields decide this and they agree. Eight bits of hash are free above the
+/// directory and they are what chooses the stripe, and eight bits of a `SCAN`
+/// cursor are free above the bucket and they are what remembers which stripe a
+/// walk had got to. It is far more than a machine has cores and the point of
+/// the ceiling is not to be reached, it is to keep both of those choices inside
+/// a field nothing else is reading.
+pub const MAX_STRIPES: usize = 1 << yo_index::STRIPE_BITS;
 
 /// Which end of the hash the stripe number is cut from.
 ///
@@ -52,6 +57,11 @@ pub struct Db {
     /// `stripes.len() - 1`, kept here so the hot path is a shift and an and
     /// rather than a division.
     mask: u64,
+    /// Somewhere to put a key that came from one stripe and is being handed to
+    /// a caller that is holding the whole database. [`Db::random_key`] is the
+    /// only one, and the buffer is what keeps it from allocating a key name
+    /// every time it is asked.
+    scratch: Vec<u8>,
 }
 
 impl Db {
@@ -68,6 +78,7 @@ impl Db {
         Db {
             stripes: (0..n).map(|_| Keyspace::with_clock(clock)).collect(),
             mask: (n - 1) as u64,
+            scratch: Vec::new(),
         }
     }
 
@@ -269,6 +280,122 @@ impl Db {
             stripe.track_memory(on);
         }
     }
+
+    /// A batch of keys and where the next batch starts, over the whole
+    /// database.
+    ///
+    /// This is `SCAN`, and it is one stripe at a time. The cursor carries the
+    /// stripe it had got to as well as the place in that stripe, which is what
+    /// the spare field in [`yo_index::Cursor`] is for.
+    ///
+    /// The promise a single keyspace makes survives being made one stripe at a
+    /// time, and it survives it for one reason: a key never changes stripe. So
+    /// a key that is there for the whole walk is on a stripe this walk has not
+    /// reached yet or on the one it is in the middle of, and either way it is
+    /// still coming. Nothing a writer does while the walk is going can move a
+    /// key from a stripe that is still to come to a stripe that is already
+    /// done.
+    ///
+    /// `budget` is spent per stripe rather than per call, so a call that
+    /// finishes a stripe exactly on the budget stops there rather than starting
+    /// the next one. What it will do is walk past any number of empty stripes,
+    /// because a stripe with nothing in it is a walk of one segment and
+    /// stopping to hand the client a cursor for it would be the more expensive
+    /// of the two.
+    pub fn scan(
+        &mut self,
+        from: KeyCursor,
+        budget: usize,
+        ty: Option<Kind>,
+        mut out: impl FnMut(&[u8]),
+    ) -> KeyCursor {
+        // A cursor naming a stripe this database does not have, which a client
+        // can produce by holding one across a server that came back narrower.
+        // It reads as a walk that is over, which is what Redis gives for any
+        // cursor it cannot make sense of, and the client starts again.
+        let mut at = from.stripe();
+        if at >= self.stripes.len() {
+            return KeyCursor::START;
+        }
+        let mut cursor = from.without_stripe();
+        let mut seen = 0usize;
+        while at < self.stripes.len() {
+            let next = self.stripes[at].scan(cursor, budget, ty, |key| {
+                seen += 1;
+                out(key);
+            });
+            if !next.is_end() {
+                return next.with_stripe(at);
+            }
+            at += 1;
+            cursor = KeyCursor::START;
+            if at < self.stripes.len() && seen >= budget {
+                return KeyCursor::START.with_stripe(at);
+            }
+        }
+        KeyCursor::START
+    }
+
+    /// Every key in the database, once each.
+    ///
+    /// This is `KEYS`, and it is every key of every stripe. The order is the
+    /// order the stripes are in and then whatever order each one walks in,
+    /// which is no order at all as far as a client is concerned, the same as it
+    /// was with one stripe.
+    pub fn keys(&mut self, mut out: impl FnMut(&[u8])) {
+        for stripe in &mut self.stripes {
+            stripe.keys(&mut out);
+        }
+    }
+
+    /// One key from anywhere in the database, or `None` if there are none.
+    ///
+    /// This is `RANDOMKEY`. The stripe is drawn first, weighted by how many
+    /// keys each one holds, so a database whose stripes came out uneven does
+    /// not answer the small ones as often as the big ones. Then that stripe
+    /// picks a key the way it always did.
+    ///
+    /// A stripe can still answer nothing, because its count includes keys whose
+    /// deadline has gone and which nothing has collected yet. The stripes after
+    /// it are asked in turn when that happens, so an answer of `None` here
+    /// means every stripe was asked and none of them had a live key.
+    ///
+    /// The answer is copied into this database's own buffer rather than
+    /// borrowed from the stripe's, which is what lets the loop above go round
+    /// again while holding an answer. It is a key name and the buffer is kept,
+    /// so it costs a copy of a few bytes and no allocation.
+    pub fn random_key(&mut self) -> Option<&[u8]> {
+        let live = self.len();
+        if live == 0 {
+            return None;
+        }
+        let draw = (self.stripes[0].random() % live as u64) as usize;
+        let mut running = 0;
+        let mut first = 0;
+        for (i, stripe) in self.stripes.iter().enumerate() {
+            running += stripe.len();
+            if draw < running {
+                first = i;
+                break;
+            }
+        }
+        // Taken out and put back, because the closest thing to a stripe's
+        // answer this can hold is a copy of it and the stripe is borrowed while
+        // the copy is being made.
+        let mut buf = std::mem::take(&mut self.scratch);
+        buf.clear();
+        let mut found = false;
+        for step in 0..self.stripes.len() {
+            let i = (first as u64 + step as u64) & self.mask;
+            if let Some(key) = self.stripes[i as usize].random_key() {
+                buf.extend_from_slice(key);
+                found = true;
+                break;
+            }
+        }
+        self.scratch = buf;
+        found.then_some(self.scratch.as_slice())
+    }
 }
 
 impl Default for Db {
@@ -279,8 +406,21 @@ impl Default for Db {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
+
+    use yo_index::Cursor as KeyCursor;
+
     use super::{Db, MAX_STRIPES};
     use crate::{Clock, Keyspace};
+
+    fn filled(stripes: usize, keys: u32) -> Db {
+        let mut db = Db::with_clock(Clock::fixed(1_000_000), stripes);
+        for i in 0..keys {
+            let key = format!("k{i}").into_bytes();
+            db.at(&key).setnx(&key, b"v").expect("room for a record");
+        }
+        db
+    }
 
     #[test]
     fn a_width_is_always_a_power_of_two_and_never_zero() {
@@ -344,5 +484,88 @@ mod tests {
         }
         db.clear();
         assert!(db.is_empty());
+    }
+
+    #[test]
+    fn a_scan_walks_every_stripe_and_answers_every_key_once() {
+        let mut db = filled(8, 2_000);
+        let mut seen: Vec<Vec<u8>> = Vec::new();
+        let mut at = KeyCursor::START;
+        let mut calls = 0;
+        loop {
+            at = db.scan(at, 10, None, |key| seen.push(key.to_vec()));
+            calls += 1;
+            if at.is_end() {
+                break;
+            }
+            assert!(calls < 10_000, "a scan that will not finish");
+        }
+        let unique: HashSet<Vec<u8>> = seen.iter().cloned().collect();
+        assert_eq!(unique.len(), 2_000);
+        assert_eq!(seen.len(), 2_000, "a quiet scan returned a key twice");
+
+        let mut walked = HashSet::new();
+        db.keys(|key| {
+            walked.insert(key.to_vec());
+        });
+        assert_eq!(unique, walked);
+    }
+
+    // Not about the keys, about the number in the middle of the cursor. Every
+    // batch after the first stripe has one in it, and a client that has held
+    // one from a database that had more stripes than this one gets an answer
+    // that says the walk is over rather than a panic.
+    #[test]
+    fn a_scan_carries_the_stripe_in_the_cursor() {
+        let mut db = filled(8, 2_000);
+        let first = db.scan(KeyCursor::START, 10, None, |_| {});
+        assert!(!first.is_end());
+
+        let mut stripes = HashSet::new();
+        let mut at = KeyCursor::START;
+        loop {
+            at = db.scan(at, 10, None, |_| {});
+            if at.is_end() {
+                break;
+            }
+            stripes.insert(at.stripe());
+        }
+        assert_eq!(stripes.len(), 8, "some stripe was never the one in hand");
+
+        let beyond = KeyCursor::START.with_stripe(9);
+        let mut any = false;
+        assert!(db.scan(beyond, 10, None, |_| any = true).is_end());
+        assert!(!any);
+    }
+
+    #[test]
+    fn a_random_key_comes_from_whichever_stripe_still_has_one() {
+        let mut db = filled(8, 5_000);
+        let mut all = HashSet::new();
+        db.keys(|key| {
+            all.insert(key.to_vec());
+        });
+        let mut picked = HashSet::new();
+        for _ in 0..200 {
+            let key = db.random_key().expect("the database is not empty").to_vec();
+            assert!(all.contains(&key), "a key that is not there");
+            picked.insert(key);
+        }
+        assert!(picked.len() > 10, "only {} distinct keys", picked.len());
+
+        // One key left in a database of eight stripes, so seven of the eight
+        // have nothing to answer with and the draw lands on one of those seven
+        // nearly every time.
+        for i in 0..5_000u32 {
+            if i != 4_242 {
+                let key = format!("k{i}").into_bytes();
+                db.at(&key).del(&key);
+            }
+        }
+        for _ in 0..20 {
+            assert_eq!(db.random_key(), Some(&b"k4242"[..]));
+        }
+        db.at(b"k4242").del(b"k4242");
+        assert_eq!(db.random_key(), None);
     }
 }
