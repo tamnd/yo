@@ -16,7 +16,7 @@
 
 use super::args::{self, Args, is};
 use super::table::{self, Spec};
-use super::{DATABASES, Flow, Server, Session, cpu};
+use super::{DATABASES, Flow, Server, Session, backup, cpu};
 use crate::proto::Proto;
 use crate::reply::Out;
 use core::fmt::Write;
@@ -35,7 +35,11 @@ use yo_kv::access::Policy;
 /// the `yo_version` field of `INFO` next to this one.
 const REPORTED_SERVER: &str = "redis";
 /// The Redis version we answer 100 percent of, which is what `HELLO` reports.
-const REPORTED_VERSION: &str = "8.8.0";
+///
+/// [`super::backup`] writes it into the `redis-ver` aux field of the base file
+/// it produces, so a server told to load one reads the same version out of the
+/// file that a client reads off the connection.
+pub(super) const REPORTED_VERSION: &str = "8.8.0";
 
 /// The settings that are fixed for the life of the process.
 ///
@@ -47,6 +51,9 @@ const REPORTED_VERSION: &str = "8.8.0";
 const SETTINGS: &[(&str, &str)] = &[
     ("appendonly", "no"),
     ("appendfsync", "everysec"),
+    // Where `BACKUP` writes, under `dir`. Fixed here where a real server takes
+    // it at startup, because nothing in this build reads it from a file.
+    ("backupdirname", backup::DIR_NAME),
     ("databases", "16"),
     ("io-threads", "1"),
     ("proto-max-bulk-len", "536870912"),
@@ -143,6 +150,23 @@ const MAXMEMORY: &str = "maxmemory";
 /// so migration cannot make room and eviction is all that is left, which is
 /// Redis exactly and is the documented setting for a drop in cache.
 const MAXSTORE: &str = "maxstore";
+
+/// Where the server writes, which `BACKUP LIST` answers paths under.
+///
+/// On its own for a fourth reason: it is readable and not writable, and it is
+/// not writable in a way of its own. Redis calls it a protected config, which
+/// means `CONFIG SET dir` is refused with a sentence about protection rather
+/// than about immutability unless the server was started with protected configs
+/// enabled. That distinction is copied, because the two messages are what an
+/// operator reads when a `CONFIG SET` does not take.
+const DIR: &str = "dir";
+
+/// How long a sealed backup is kept before it cleans itself up.
+///
+/// Seconds, and zero is the default and means it is kept until somebody says
+/// `BACKUP CLEANUP`. Writable, since a backup taken by a script that then died
+/// is exactly the thing this is for and setting it afterwards has to work.
+const SEALED_TTL: &str = "backup-sealed-ttl";
 
 /// Read a byte count the way `CONFIG SET maxmemory` reads one.
 ///
@@ -296,6 +320,7 @@ pub(super) fn execute(
             out.ok();
         }
         "time" => time(out),
+        "backup" => backup::execute(server, args, out)?,
         "shutdown" => return shutdown(server, args),
         _ => return Err(args::unknown_command(args)),
     }
@@ -779,12 +804,16 @@ fn config(server: &mut Server, args: Args<'_>, out: &mut Out) -> Result<()> {
         let policy = wanted(MAXMEMORY_POLICY);
         let limit = wanted(MAXMEMORY);
         let store = wanted(MAXSTORE);
+        let where_ = wanted(DIR);
+        let ttl = wanted(SEALED_TTL);
         out.map(
             fixed.clone().count()
                 + ladder.clone().count()
                 + usize::from(policy)
                 + usize::from(limit)
-                + usize::from(store),
+                + usize::from(store)
+                + usize::from(where_)
+                + usize::from(ttl),
         );
         for (k, v) in fixed {
             out.bulk(k.as_bytes());
@@ -812,6 +841,18 @@ fn config(server: &mut Server, args: Args<'_>, out: &mut Out) -> Result<()> {
             out.bulk(MAXSTORE.as_bytes());
             out.bulk_int(server.maxstore().map_or(-1, |n| n as i64));
         }
+        if where_ {
+            // Absolute, which is what a real server answers too: it resolves the
+            // directory at startup and reports the resolved one, so a client can
+            // tell where the files are without knowing where the process was
+            // launched from.
+            out.bulk(DIR.as_bytes());
+            yo_alloc::allow(|| out.bulk(server.dir().to_string_lossy().as_bytes()));
+        }
+        if ttl {
+            out.bulk(SEALED_TTL.as_bytes());
+            out.bulk_int(server.backup.ttl() as i64);
+        }
     } else if is(sub, b"SET") {
         // Too few is a wrong number of arguments and an odd number is a syntax
         // error, which is not the same sentence and is not the same rule. A
@@ -833,6 +874,7 @@ fn config(server: &mut Server, args: Args<'_>, out: &mut Out) -> Result<()> {
         let mut policy = None;
         let mut limit = None;
         let mut store = None;
+        let mut ttl = None;
         let mut i = 2;
         while i < args.len() {
             let (name, value) = (args.get(i), args.get(i + 1));
@@ -884,6 +926,26 @@ fn config(server: &mut Server, args: Args<'_>, out: &mut Out) -> Result<()> {
                 policy = Some(p);
                 continue;
             }
+            if is(name, DIR.as_bytes()) {
+                // Refused whatever the value is, including the one it is already
+                // set to, which is the one place a setting here does not take
+                // the write that changes nothing. That is the reference's
+                // answer: a protected config is refused before anybody looks at
+                // what was asked for.
+                return Err(Error::fmt(
+                    Code::Unsupported,
+                    format_args!(
+                        "CONFIG SET failed (possibly related to argument '{DIR}') - can't set protected config"
+                    ),
+                ));
+            }
+            if is(name, SEALED_TTL.as_bytes()) {
+                let Some(n) = parse_i64(value).filter(|&n| n >= 0) else {
+                    return Err(bad_setting(SEALED_TTL, parse_i64(value).is_some()));
+                };
+                ttl = Some(n as u64);
+                continue;
+            }
             if let Some((k, knob)) = LADDER.iter().find(|(k, _)| is(name, k.as_bytes())) {
                 let Some(n) = parse_i64(value).filter(|&n| n >= 0) else {
                     return Err(bad_setting(k, parse_i64(value).is_some()));
@@ -930,6 +992,9 @@ fn config(server: &mut Server, args: Args<'_>, out: &mut Out) -> Result<()> {
             for at in 0..DATABASES {
                 server.db(at).set_policy(p);
             }
+        }
+        if let Some(seconds) = ttl {
+            server.backup.set_ttl(seconds);
         }
         // Last, so that a `CONFIG SET maxmemory 1mb maxmemory-policy allkeys-lru`
         // has the policy in place before the limit that will act on it. The two

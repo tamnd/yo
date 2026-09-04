@@ -3970,6 +3970,24 @@ pub static COMMANDS: &[Spec] = &[
         summary: "Read and change the settings a running server exposes.",
         group: "server",
     },
+    // Exactly two, which is what a real 8.10.1 reports for the container even
+    // though every one of its subcommands carries its own arity underneath. All
+    // seven of them take two words, so nothing legal is refused by it, and the
+    // one thing that reads differently is the name inside the arity error for a
+    // subcommand with an argument after it. That is D-46.
+    Spec {
+        name: "backup",
+        arity: 2,
+        flags: &[],
+        first_key: 0,
+        last_key: 0,
+        step: 0,
+        acl: &["@slow"],
+        since: "8.10.0",
+        complexity: "Depends on subcommand.",
+        summary: "A container for backup management commands.",
+        group: "server",
+    },
     Spec {
         name: "info",
         arity: -1,

@@ -53,6 +53,7 @@
 
 mod args;
 mod arrays;
+mod backup;
 mod bits;
 mod blocking;
 mod cpu;
@@ -82,6 +83,7 @@ pub use server::parse_memory;
 pub use table::{COMMANDS, Spec, arity_ok, lookup};
 
 use crate::reply::Out;
+use std::path::{Path, PathBuf};
 use yo_common::{Code, Error};
 use yo_kv::cold::Blocks;
 use yo_kv::{Clock, Keyspace};
@@ -155,6 +157,16 @@ pub struct Stats {
     pub connections: u64,
     /// Commands run since the server started, which this layer counts itself.
     pub commands: u64,
+}
+
+/// Where the process was started, which is what `dir` defaults to.
+///
+/// A dot if the working directory cannot be read, which happens when it has
+/// been deleted out from under a running process. That is not a reason to
+/// refuse to start a server, and it leaves `BACKUP` to fail with the real error
+/// from the filesystem if anybody asks for one.
+fn working_dir() -> PathBuf {
+    std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
 }
 
 /// One command's counters, for `INFO commandstats`.
@@ -311,6 +323,19 @@ pub struct Server {
     pub stats: Stats,
     /// A counter per command, for `INFO commandstats`.
     cmdstats: CommandStats,
+    /// Where `BACKUP` puts its files, and where `CONFIG GET dir` points.
+    ///
+    /// Absolute, and resolved once when the server is built rather than every
+    /// time somebody asks. `BACKUP LIST` answers absolute paths and a client is
+    /// entitled to hand one of them to a copy tool, so a relative path that
+    /// meant something different after a `chdir` would be a path that stops
+    /// working for reasons nobody could see.
+    dir: PathBuf,
+    /// What backup is running, if one is.
+    ///
+    /// On the server and not on a session, because a backup outlives the
+    /// connection that asked for it and any other connection can seal it.
+    backup: backup::State,
     /// Set by `SHUTDOWN`, and read by whatever is turning the loop.
     ///
     /// A flag rather than an exit, because the command layer is not what owns
@@ -347,6 +372,8 @@ impl Server {
             peers: migrate::Peers::default(),
             stats: Stats::default(),
             cmdstats: CommandStats::default(),
+            dir: working_dir(),
+            backup: backup::State::default(),
             stopping: false,
         }
     }
@@ -374,6 +401,8 @@ impl Server {
             peers: migrate::Peers::default(),
             stats: Stats::default(),
             cmdstats: CommandStats::default(),
+            dir: working_dir(),
+            backup: backup::State::default(),
             stopping: false,
         }
     }
@@ -390,6 +419,31 @@ impl Server {
         // has [`Server::db_ref`] and does not come through here.
         self.dirty |= 1u64 << i;
         &mut self.dbs[i]
+    }
+
+    /// Where `BACKUP` writes and what `CONFIG GET dir` answers.
+    #[must_use]
+    pub fn dir(&self) -> &Path {
+        &self.dir
+    }
+
+    /// Point the server at a different directory, which `yodb serve --dir` does.
+    ///
+    /// Only before it is serving. There is no `CONFIG SET dir` here and there
+    /// is none on a real server either without turning protected configs on,
+    /// for the good reason that moving it out from under a running backup would
+    /// leave files nothing can find again.
+    pub fn set_dir(&mut self, dir: PathBuf) {
+        self.dir = dir;
+    }
+
+    /// Drop a sealed backup that has outlived `backup-sealed-ttl`.
+    ///
+    /// Once per batch, from the same maintenance turn that collects the arena.
+    /// It reads two fields and returns on a server that has never taken a
+    /// backup, which is nearly all of them.
+    pub fn backup_expire(&mut self) {
+        backup::expire(self);
     }
 
     /// Ask for the server to stop, which is what `SHUTDOWN` does.
@@ -3905,6 +3959,361 @@ mod tests {
             assert_eq!(f.run(parts), "-ERR No shutdown in progress.\r\n");
             assert!(!f.server.stopping(), "an abort stopped the server");
         }
+    }
+
+    /// A fixture whose server writes into a directory of its own.
+    ///
+    /// Every test here really writes files, because the whole point of the
+    /// command is the files and a backup that is only a state machine would
+    /// pass a test suite and fail the first person who tried to restore one.
+    /// The directory carries the test's name so that the suite can run its
+    /// tests in parallel the way it always does.
+    struct Backups {
+        f: Fixture,
+        dir: PathBuf,
+    }
+
+    impl Backups {
+        fn new(name: &str) -> Backups {
+            let dir = std::env::temp_dir().join(format!("yo-backup-{name}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).expect("could not make a temporary directory");
+            let mut f = Fixture::new();
+            f.server.set_dir(dir.clone());
+            Backups { f, dir }
+        }
+
+        fn run(&mut self, parts: &[&[u8]]) -> String {
+            self.f.run(parts)
+        }
+
+        /// The names in `backupdir`, sorted, so a test can say what is on disk.
+        fn files(&self) -> Vec<String> {
+            let mut names: Vec<String> = match std::fs::read_dir(self.dir.join("backupdir")) {
+                Ok(entries) => entries
+                    .filter_map(|e| e.ok())
+                    .map(|e| e.file_name().to_string_lossy().into_owned())
+                    .collect(),
+                Err(_) => Vec::new(),
+            };
+            names.sort();
+            names
+        }
+
+        fn read(&self, name: &str) -> Vec<u8> {
+            std::fs::read(self.dir.join("backupdir").join(name)).expect("could not read")
+        }
+    }
+
+    impl Drop for Backups {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    /// The four states and the moves between them, in the order a client walks
+    /// them, with the files checked at every step.
+    #[test]
+    fn backup_walks_the_states_the_reference_walks() {
+        let mut b = Backups::new("states");
+        let status = |b: &mut Backups| b.run(&[b"BACKUP", b"STATUS"]);
+
+        assert!(status(&mut b).contains("idle"));
+        assert!(b.files().is_empty(), "an idle server has written a backup");
+
+        assert_eq!(b.run(&[b"BACKUP", b"START"]), "+OK\r\n");
+        assert!(status(&mut b).contains("incrementing"));
+        assert_eq!(b.files(), ["appendonly.aof.1.base.rdb"]);
+
+        assert_eq!(b.run(&[b"BACKUP", b"SEAL"]), "+OK\r\n");
+        assert!(status(&mut b).contains("sealed"));
+        assert_eq!(
+            b.files(),
+            [
+                "appendonly.aof.1.base.rdb",
+                "appendonly.aof.1.incr.aof",
+                "appendonly.aof.manifest",
+            ]
+        );
+
+        assert_eq!(b.run(&[b"BACKUP", b"CLEANUP"]), "+OK\r\n");
+        assert!(status(&mut b).contains("idle"));
+        assert!(b.files().is_empty(), "cleanup left something behind");
+    }
+
+    /// Every move that is refused, in the reference's words.
+    #[test]
+    fn backup_refuses_the_moves_the_reference_refuses() {
+        let mut b = Backups::new("refusals");
+
+        assert_eq!(
+            b.run(&[b"BACKUP", b"SEAL"]),
+            "-ERR No backup ready to seal (must be in the incrementing state)\r\n"
+        );
+        assert_eq!(
+            b.run(&[b"BACKUP", b"ABORT"]),
+            "-ERR No backup in progress\r\n"
+        );
+        // Cleanup from idle is not an error, it is a way of saying there was
+        // nothing to clean up.
+        assert_eq!(b.run(&[b"BACKUP", b"CLEANUP"]), "+OK\r\n");
+
+        b.run(&[b"BACKUP", b"START"]);
+        assert_eq!(
+            b.run(&[b"BACKUP", b"START"]),
+            "-ERR A backup is already in progress, ABORT it first\r\n"
+        );
+        assert_eq!(
+            b.run(&[b"BACKUP", b"CLEANUP"]),
+            "-ERR Backup is in progress\r\n"
+        );
+
+        b.run(&[b"BACKUP", b"SEAL"]);
+        assert_eq!(
+            b.run(&[b"BACKUP", b"START"]),
+            "-ERR A sealed backup exists, CLEANUP it first\r\n"
+        );
+        assert_eq!(
+            b.run(&[b"BACKUP", b"SEAL"]),
+            "-ERR No backup ready to seal (must be in the incrementing state)\r\n"
+        );
+        assert_eq!(
+            b.run(&[b"BACKUP", b"ABORT"]),
+            "-ERR No backup in progress\r\n"
+        );
+    }
+
+    /// An abort takes the base file away and leaves a state saying who did it.
+    ///
+    /// The next backup takes the next sequence number rather than reusing the
+    /// one whose files were just thrown away, so a directory somebody copied a
+    /// half finished backup out of cannot end up with two different files under
+    /// one name.
+    #[test]
+    fn backup_abort_removes_the_file_and_says_who_did_it() {
+        let mut b = Backups::new("abort");
+        b.run(&[b"BACKUP", b"START"]);
+        assert_eq!(b.run(&[b"BACKUP", b"ABORT"]), "+OK\r\n");
+
+        let status = b.run(&[b"BACKUP", b"STATUS"]);
+        assert!(status.contains("failed"), "{status}");
+        assert!(status.contains("aborted by user"), "{status}");
+        assert!(b.files().is_empty(), "abort left the base file behind");
+        assert_eq!(b.run(&[b"BACKUP", b"LIST"]), "*0\r\n");
+
+        // A start from failed works, and is the second backup.
+        assert_eq!(b.run(&[b"BACKUP", b"START"]), "+OK\r\n");
+        assert_eq!(b.files(), ["appendonly.aof.2.base.rdb"]);
+        let status = b.run(&[b"BACKUP", b"STATUS"]);
+        assert!(status.contains("incrementing"), "{status}");
+        assert!(!status.contains("aborted"), "the old error was kept");
+    }
+
+    /// `LIST` names nothing, then one file, then three, and they are absolute.
+    #[test]
+    fn backup_list_names_the_files_that_are_pinned_so_far() {
+        let mut b = Backups::new("list");
+        assert_eq!(b.run(&[b"BACKUP", b"LIST"]), "*0\r\n");
+
+        b.run(&[b"BACKUP", b"START"]);
+        let base = b.dir.join("backupdir").join("appendonly.aof.1.base.rdb");
+        let base = base.to_string_lossy().into_owned();
+        assert_eq!(
+            b.run(&[b"BACKUP", b"LIST"]),
+            format!("*1\r\n${}\r\n{base}\r\n", base.len())
+        );
+
+        b.run(&[b"BACKUP", b"SEAL"]);
+        let listed = b.run(&[b"BACKUP", b"LIST"]);
+        assert!(listed.starts_with("*3\r\n"), "{listed}");
+        // The order is the manifest's order, base then incremental then the
+        // manifest itself, which is the order a restore needs them in.
+        let names: Vec<&str> = listed
+            .lines()
+            .filter(|l| l.starts_with('/') || l.contains(":\\"))
+            .collect();
+        assert_eq!(names.len(), 3, "{listed}");
+        assert!(names[0].ends_with("appendonly.aof.1.base.rdb"), "{listed}");
+        assert!(names[1].ends_with("appendonly.aof.1.incr.aof"), "{listed}");
+        assert!(names[2].ends_with("appendonly.aof.manifest"), "{listed}");
+    }
+
+    /// The base file is the dataset as it was at `START` and not at `SEAL`.
+    ///
+    /// That is D-46 and it is the one thing about this a client can notice, so
+    /// it is pinned here rather than left to be discovered by whoever restores
+    /// one. The incremental file is empty for the same reason: there is no
+    /// append only log underneath this server to copy the writes in between out
+    /// of.
+    #[test]
+    fn a_backup_holds_the_dataset_as_it_was_at_start() {
+        let mut b = Backups::new("contents");
+        b.run(&[b"SET", b"bk", b"v1"]);
+        b.run(&[b"BACKUP", b"START"]);
+        b.run(&[b"SET", b"bk", b"v2"]);
+        b.run(&[b"BACKUP", b"SEAL"]);
+
+        let base = b.read("appendonly.aof.1.base.rdb");
+        assert!(base.starts_with(b"REDIS"), "not an RDB file");
+        assert!(base.windows(2).any(|w| w == b"v1"), "the value is missing");
+        assert!(
+            !base.windows(2).any(|w| w == b"v2"),
+            "the base file moved on after START"
+        );
+        // The aux field a loader acts on, and the one that says this file is
+        // the base of an append only file rather than a standalone dump. Its
+        // value is the one byte string 1, which the encoder writes as an
+        // integer the way a real server writes it.
+        let at = base
+            .windows(8)
+            .position(|w| w == b"aof-base")
+            .expect("no aof-base aux field");
+        assert_eq!(&base[at + 8..at + 10], b"\xc0\x01", "{:?}", &base[at..]);
+
+        assert!(b.read("appendonly.aof.1.incr.aof").is_empty());
+        assert_eq!(
+            String::from_utf8(b.read("appendonly.aof.manifest")).expect("the manifest is text"),
+            "file appendonly.aof.1.base.rdb seq 1 type b\n\
+             file appendonly.aof.1.incr.aof seq 1 type i startoffset 0 endoffset 0\n"
+        );
+    }
+
+    /// `STATUS` is a map of four pairs on RESP3 and the same pairs flat on
+    /// RESP2, which is what every other map shaped reply in this server does.
+    #[test]
+    fn backup_status_is_a_map_on_resp3_and_a_flat_array_on_resp2() {
+        let mut b = Backups::new("status");
+        b.f.server.set_clock_ms(1_700_000_000_000);
+
+        assert_eq!(
+            b.run(&[b"BACKUP", b"STATUS"]),
+            "*8\r\n$5\r\nstate\r\n$4\r\nidle\r\n$5\r\nerror\r\n$0\r\n\r\n\
+             $10\r\nstart_time\r\n:0\r\n$8\r\nend_time\r\n:0\r\n"
+        );
+
+        b.f.out = Out::new(Proto::Resp3);
+        b.run(&[b"BACKUP", b"START"]);
+        assert_eq!(
+            b.run(&[b"BACKUP", b"STATUS"]),
+            "%4\r\n$5\r\nstate\r\n$12\r\nincrementing\r\n$5\r\nerror\r\n$0\r\n\r\n\
+             $10\r\nstart_time\r\n:1700000000\r\n$8\r\nend_time\r\n:0\r\n"
+        );
+
+        b.run(&[b"BACKUP", b"SEAL"]);
+        let sealed = b.run(&[b"BACKUP", b"STATUS"]);
+        assert!(sealed.contains("end_time\r\n:1700000000"), "{sealed}");
+    }
+
+    /// A sealed backup that nobody cleans up goes away on its own once
+    /// `backup-sealed-ttl` seconds have passed since the seal.
+    #[test]
+    fn a_sealed_backup_is_swept_away_after_the_timeout() {
+        let mut b = Backups::new("ttl");
+        b.f.server.set_clock_ms(1_000_000);
+        assert_eq!(
+            b.run(&[b"CONFIG", b"SET", b"backup-sealed-ttl", b"60"]),
+            "+OK\r\n"
+        );
+        b.run(&[b"BACKUP", b"START"]);
+        b.run(&[b"BACKUP", b"SEAL"]);
+
+        // A minute short of the deadline, nothing happens.
+        b.f.server.set_clock_ms(1_000_000 + 59_000);
+        b.f.server.backup_expire();
+        assert!(b.run(&[b"BACKUP", b"STATUS"]).contains("sealed"));
+        assert_eq!(b.files().len(), 3);
+
+        b.f.server.set_clock_ms(1_000_000 + 60_000);
+        b.f.server.backup_expire();
+        let status = b.run(&[b"BACKUP", b"STATUS"]);
+        assert!(status.contains("idle"), "{status}");
+        assert!(b.files().is_empty(), "the timeout left the files behind");
+
+        // Zero is the default and means a sealed backup is kept for ever.
+        b.run(&[b"CONFIG", b"SET", b"backup-sealed-ttl", b"0"]);
+        b.run(&[b"BACKUP", b"START"]);
+        b.run(&[b"BACKUP", b"SEAL"]);
+        b.f.server.set_clock_ms(9_000_000_000);
+        b.f.server.backup_expire();
+        assert!(b.run(&[b"BACKUP", b"STATUS"]).contains("sealed"));
+    }
+
+    /// The three settings around the command, read and written the way 8.10.1
+    /// reads and writes them.
+    #[test]
+    fn the_backup_settings_behave_the_way_the_reference_does() {
+        let mut b = Backups::new("config");
+        let dir = b.dir.to_string_lossy().into_owned();
+
+        assert_eq!(
+            b.run(&[b"CONFIG", b"GET", b"dir"]),
+            format!("*2\r\n$3\r\ndir\r\n${}\r\n{dir}\r\n", dir.len())
+        );
+        assert_eq!(
+            b.run(&[b"CONFIG", b"GET", b"backupdirname"]),
+            "*2\r\n$13\r\nbackupdirname\r\n$9\r\nbackupdir\r\n"
+        );
+        assert_eq!(
+            b.run(&[b"CONFIG", b"GET", b"backup-sealed-ttl"]),
+            "*2\r\n$17\r\nbackup-sealed-ttl\r\n$1\r\n0\r\n"
+        );
+
+        // `dir` is a protected config, so it is refused even for the value it
+        // already holds, and `backupdirname` is immutable.
+        assert_eq!(
+            b.run(&[b"CONFIG", b"SET", b"dir", dir.as_bytes()]),
+            "-ERR CONFIG SET failed (possibly related to argument 'dir') - can't set protected config\r\n"
+        );
+        assert_eq!(
+            b.run(&[b"CONFIG", b"SET", b"backupdirname", b"other"]),
+            "-ERR CONFIG SET failed (possibly related to argument 'backupdirname') - can't set immutable config\r\n"
+        );
+        assert!(
+            b.run(&[b"CONFIG", b"SET", b"backup-sealed-ttl", b"abc"])
+                .contains("argument couldn't be parsed into an integer")
+        );
+        assert!(
+            b.run(&[b"CONFIG", b"SET", b"backup-sealed-ttl", b"-1"])
+                .contains("argument must be between 0 and 9223372036854775807 inclusive")
+        );
+    }
+
+    /// The help text, which has `HELP` in it twice because the reference's does.
+    #[test]
+    fn backup_help_is_the_text_the_reference_sends() {
+        let mut f = Fixture::new();
+        let help = f.run(&[b"BACKUP", b"HELP"]);
+        assert!(help.starts_with("*17\r\n"), "{help}");
+        assert!(
+            help.contains("+BACKUP <subcommand> [<arg> [value] [opt] ...]. Subcommands are:\r\n")
+        );
+        assert!(help.contains("+    Start a new backup into the configured 'backupdirname'.\r\n"));
+        assert!(help.contains("+    Freeze the current backup (BASE + INCR + manifest).\r\n"));
+        assert!(help.contains("+    Return this help.\r\n+HELP\r\n+    Print this help.\r\n"));
+    }
+
+    /// What a mistyped `BACKUP` gets told.
+    ///
+    /// The arity error names `backup` where the reference names `backup|start`,
+    /// which is D-46: the table reports one arity for the container the way the
+    /// reference does, and the per subcommand table that would carry the better
+    /// name is not built yet. Every subcommand is exactly two words, so nothing
+    /// legal is refused by it.
+    #[test]
+    fn backup_refuses_what_it_cannot_read() {
+        let mut f = Fixture::new();
+        assert_eq!(
+            f.run(&[b"BACKUP"]),
+            "-ERR wrong number of arguments for 'backup' command\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"BACKUP", b"START", b"x"]),
+            "-ERR wrong number of arguments for 'backup' command\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"BACKUP", b"NOPE"]),
+            "-ERR unknown subcommand 'NOPE'. Try BACKUP HELP.\r\n"
+        );
     }
 
     #[test]

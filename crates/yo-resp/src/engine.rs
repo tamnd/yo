@@ -843,6 +843,10 @@ impl<S: Sink> Wire<S> {
         // Both are true, and the first is the one that is a batch old at worst.
         // Nothing at all on a server with no `maxmemory`, which is the default.
         self.server.refresh_memory();
+        // Two fields and a return on a server that has never taken a backup,
+        // which is nearly all of them. It is here rather than on a timer for the
+        // same reason the compaction is: one loop turns everything.
+        self.server.backup_expire();
         self.server.compact_step()
     }
 }

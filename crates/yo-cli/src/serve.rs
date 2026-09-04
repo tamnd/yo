@@ -383,6 +383,16 @@ impl Server {
         })
     }
 
+    /// Where the server writes, which today is where `BACKUP` puts its files.
+    ///
+    /// It is what `CONFIG GET dir` answers and what `BACKUP LIST` builds its
+    /// absolute paths out of, so it is taken here at startup and cannot be
+    /// changed afterwards, the same as on a real server without protected
+    /// configs turned on.
+    pub fn set_dir(&mut self, dir: PathBuf) {
+        self.reactor.engine_mut().server_mut().set_dir(dir);
+    }
+
     /// How much memory the server may use before something has to go.
     pub fn set_maxmemory(&mut self, bytes: u64) {
         self.reactor.engine_mut().server_mut().set_maxmemory(bytes);
