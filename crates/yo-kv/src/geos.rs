@@ -423,23 +423,32 @@ impl Db {
     /// under that stripe's promotion thresholds, the same way every other store
     /// form works.
     ///
+    /// `from` is the member the centre comes from, for the forms that take it
+    /// from one rather than from a pair of coordinates. It is read here, with
+    /// the stripes already held, so that the centre and the members it is
+    /// measured against are the same key at the same moment. A caller that read
+    /// it beforehand would be handing in a point the member may have moved away
+    /// from since.
+    ///
     /// # Errors
     ///
     /// `WRONGTYPE` from the source, which is checked before the destination is
-    /// touched.
+    /// touched, and the missing member complaint when `from` names a member the
+    /// source does not have.
     pub fn geosearchstore(
         &self,
         dest: &[u8],
         src: &[u8],
+        from: Option<&[u8]>,
         shape: &Shape,
         limit: Limit,
         dist: bool,
     ) -> Result<usize> {
         let (home, onto) = (self.stripe_of(src), self.stripe_of(dest));
         if home == onto {
-            return self
-                .hold_stripe(home)
-                .geosearchstore(dest, src, shape, limit, dist);
+            let mut stripe = self.hold_stripe(home);
+            let shape = recentre(&mut stripe, src, from, shape)?;
+            return stripe.geosearchstore(dest, src, &shape, limit, dist);
         }
         // Both at once and in stripe order, since the search leaves its hits in
         // the source stripe's scratch, the destination's limits decide what is
@@ -447,7 +456,8 @@ impl Db {
         // runs with both already held, because a scratch that was filled and
         // then let go of is a scratch the next search on that stripe overwrites.
         let mut held = self.hold_many([home, onto].into_iter());
-        let n = held.stripe_mut(home).geosearch(src, shape, limit)?;
+        let shape = recentre(held.stripe_mut(home), src, from, shape)?;
+        let n = held.stripe_mut(home).geosearch(src, &shape, limit)?;
         let mut got = Elements::with_capacity(n.max(16));
         for (name, hit) in held.stripe(home).geohits().iter() {
             let score = if dist {
@@ -461,6 +471,27 @@ impl Db {
         let built = Zset::from_elements(got, &limits);
         Ok(held.stripe_mut(onto).put_zset(dest, built))
     }
+}
+
+/// The shape with its centre read out of the source, for the search forms whose
+/// centre is a member rather than a pair of coordinates.
+///
+/// Called with the stripe held, which is the whole point of it. A source that is
+/// not there leaves the shape as it came in, since a search on a key that is not
+/// there finds nothing wherever it is pointed.
+fn recentre(
+    stripe: &mut Keyspace,
+    src: &[u8],
+    from: Option<&[u8]>,
+    shape: &Shape,
+) -> Result<Shape> {
+    let mut shape = *shape;
+    if let Some(member) = from
+        && let Some(centre) = stripe.geocentre(src, member)?
+    {
+        (shape.lon, shape.lat) = centre;
+    }
+    Ok(shape)
 }
 
 /// Walk the nine boxes and keep every member the shape covers.
@@ -520,6 +551,7 @@ pub fn circle(lon: f64, lat: f64, radius: f64, unit: Unit) -> Shape {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::Clock;
 
     /// The three places every Redis geo example uses, and one more far enough
     /// away to be outside every search here.
@@ -780,6 +812,48 @@ mod tests {
             0
         );
         assert_eq!(db.zcard(b"d").expect("no key"), 0);
+    }
+
+    #[test]
+    fn a_store_from_a_member_takes_its_centre_off_the_held_source() {
+        let db = Db::with_clock(Clock::fixed(1_000_000), 8);
+        db.hold(b"g")
+            .geoadd(b"g", PLACES.iter().copied(), ZAdd::default())
+            .expect("the places are all in range");
+        // A destination somewhere other than where the source is, so that the
+        // two stripe path is the one under test.
+        let dest = (0u32..)
+            .map(|i| format!("d{i}").into_bytes())
+            .find(|d| db.stripe_of(d) != db.stripe_of(b"g"))
+            .expect("some name lands on another stripe");
+        // The shape points at nowhere near Sicily, so a result with the two
+        // Sicilian places in it is a centre that came from the member.
+        let shape = circle(0.0, 0.0, 200.0, Unit::Km);
+        let limit = Limit::default();
+        assert_eq!(
+            db.geosearchstore(&dest, b"g", Some(b"Catania"), &shape, limit, false)
+                .expect("a zset"),
+            2
+        );
+        assert!(
+            db.hold(&dest)
+                .zscore(&dest, b"Palermo")
+                .expect("a zset")
+                .is_some()
+        );
+        // A member that is not there is the error, whatever the shape it came
+        // in with says.
+        assert!(
+            db.geosearchstore(&dest, b"g", Some(b"nope"), &shape, limit, false)
+                .is_err()
+        );
+        // And a source that is not there is not, because a search on a key that
+        // is not there finds nothing wherever it is pointed.
+        assert_eq!(
+            db.geosearchstore(&dest, b"gone", Some(b"nope"), &shape, limit, false)
+                .expect("no key"),
+            0
+        );
     }
 
     #[test]

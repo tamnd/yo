@@ -290,6 +290,10 @@ fn search(db: &Db, spec: &Spec, args: Args<'_>, out: &mut Out) -> Result<()> {
     let mut dest = (form.store == Store::Argument).then(|| args.get(1));
     let mut storedist = false;
     let (mut lon, mut lat) = (0.0, 0.0);
+    // The member the centre comes from, kept for the second reading of it below.
+    // The one during the parse settles which error a bad command answers, and
+    // the one under the hold settles where the search actually starts from.
+    let mut from = None;
     let mut kind = Kind::Circle { radius: 0.0 };
     let mut unit = Unit::M;
 
@@ -301,6 +305,7 @@ fn search(db: &Db, spec: &Spec, args: Args<'_>, out: &mut Out) -> Result<()> {
         Centre::Member => {
             // Only when the key is there. A key that is not there has its own
             // reply and it is not the error a member that is not there gets.
+            from = Some(args.get(2));
             if here {
                 (lon, lat) = centre(db, key, args.get(2))?;
             }
@@ -354,6 +359,7 @@ fn search(db: &Db, spec: &Spec, args: Args<'_>, out: &mut Out) -> Result<()> {
         } else if is(arg, b"storedist") && form.store == Store::Argument {
             storedist = true;
         } else if is(arg, b"frommember") && after >= 1 && options && !from_lonlat {
+            from = Some(args.get(at + 1));
             if here {
                 (lon, lat) = centre(db, key, args.get(at + 1))?;
             }
@@ -390,7 +396,7 @@ fn search(db: &Db, spec: &Spec, args: Args<'_>, out: &mut Out) -> Result<()> {
         return Err(plain(ANY_NEEDS_COUNT));
     }
 
-    let shape = Shape {
+    let mut shape = Shape {
         lon,
         lat,
         kind,
@@ -401,9 +407,19 @@ fn search(db: &Db, spec: &Spec, args: Args<'_>, out: &mut Out) -> Result<()> {
     // already the empty array in one form and the zero with the destination
     // deleted in the other, so there is no early return for it.
     match dest {
-        Some(into) => out.uint(db.geosearchstore(into, key, &shape, limit, storedist)? as u64),
+        Some(into) => {
+            out.uint(db.geosearchstore(into, key, from, &shape, limit, storedist)? as u64);
+        }
         None => {
             let mut stripe = db.hold(key);
+            // Where the member is, read again now that the stripe is held, so
+            // that the centre and the members it is measured against are the
+            // same key at the same moment rather than two of them.
+            if let Some(member) = from
+                && let Some(centre) = stripe.geocentre(key, member)?
+            {
+                (shape.lon, shape.lat) = centre;
+            }
             stripe.geosearch(key, &shape, limit)?;
             found(stripe.geohits(), unit, [withdist, withhash, withcoord], out);
         }
