@@ -230,14 +230,14 @@ name = "ts"
 expected = 21
 status = "partial"
 doc = "11 section 9"
-# Twenty one commands, and the sixteen here are the key type, everything that
+# Twenty one commands, and the eighteen here are the key type, everything that
 # writes a sample into one or reports on it, the two that read a span back with
-# the aggregation grammar, the three that search on labels and the two that read
-# a span out of every series at once. Compaction rules and the three commands
-# 8.10 added come next.
-# Samples are squeezed with
-# Gorilla, which is what the module does too, so a series read at a steady rate
-# costs a couple of bits a sample rather than sixteen bytes. Every error sentence
+# the aggregation grammar, the three that search on labels, the two that read a
+# span out of every series at once and the two that fold one series into another
+# as it is written to. The three commands 8.10 added come next.
+# Samples are squeezed with Gorilla, which is what the module does too, so a
+# series read at a steady rate costs a couple of bits a sample rather than
+# sixteen bytes. Every error sentence
 # and both of the two the module writes with no ERR in front of them are copied
 # word for word, and so is the option scan that lets a key called RETENTION be
 # the RETENTION keyword.
@@ -3719,6 +3719,28 @@ bounded = "risk"
 status = "shipped"
 wire = "verified"
 notes = "The same read newest first. The direction is applied to each member series before the group folds them, and a COUNT is applied to each member and then again to the fold, so a group can answer fewer rows than the count and never more."
+
+[[command]]
+name = "TS.CREATERULE"
+group = "ts"
+since = "1.0.0"
+arity = -5
+plan = "metadata"
+bounded = "risk"
+status = "shipped"
+wire = "verified"
+notes = "A standing instruction to fold one series into another as it is written to. Both ends of the link are stored, the source keeping a rule for each destination and each destination keeping the name of the one series allowed to feed it, because TS.INFO reports both sides and neither can work the other out on its own. A rule holds one bucket open and writes it down when a sample past it arrives, so a destination trails its source by a bucket and the samples the source held before the rule was made never turn up in it at all. A sample landing behind the newest one is the other half of that: the bucket it falls in is closed already, so it is worked out again over everything the source holds there and written over whatever the destination had, whatever the destination's own duplicate policy says. A delete on the source does the same in reverse and starts the open bucket again. The checks run in an order that has nothing to do with the order the words are written in, with the bucket width read before the reduction name and all of it before either key is looked up."
+
+[[command]]
+name = "TS.DELETERULE"
+group = "ts"
+since = "1.0.0"
+arity = 3
+plan = "metadata"
+bounded = "risk"
+status = "shipped"
+wire = "verified"
+notes = "Takes the link apart from both ends. Nothing tells the module that a key has been deleted, so a link that has lost one of its ends is found rather than reported: every command that reads a link or writes one drops the rules whose other end is gone first, which is enough for a client to never see a rule that has stopped meaning anything. The one place that leaves a difference from the reference is RENAME, which the module follows on both ends and which drops the link here."
 
 
 # ---------------------------------------------------------------------- array

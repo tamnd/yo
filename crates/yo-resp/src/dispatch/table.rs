@@ -262,6 +262,10 @@ const TS_WRITE: &[&str] = &["write", "denyoom", "module"];
 /// `TS.DEL`, the one write that only ever frees samples and so does not deny out
 /// of memory.
 const TS_DELETE: &[&str] = &["write", "module"];
+/// `TS.CREATERULE`, which is the one time series write that says `fast` in the
+/// flags rather than only in the ACL categories, and the one that never asks for
+/// room of its own.
+const TS_RULE: &[&str] = &["write", "module", "fast"];
 /// The graph read side, for the ones that answer without walking the plane.
 const AC_GRAPH_READ_FAST: &[&str] = &["@read", "@graph", "@fast"];
 /// The graph read side for the ones that walk it.
@@ -3924,6 +3928,32 @@ pub static COMMANDS: &[Spec] = &[
         since: "1.4.0",
         complexity: "O(n) with n the series in the keyspace",
         summary: "The same spans, newest first.",
+        group: "ts",
+    },
+    Spec {
+        name: "ts.createrule",
+        arity: -5,
+        flags: TS_RULE,
+        first_key: 1,
+        last_key: 2,
+        step: 1,
+        acl: AC_TS_WRITE,
+        since: "1.0.0",
+        complexity: "O(1)",
+        summary: "Fold one series into another as it is written to.",
+        group: "ts",
+    },
+    Spec {
+        name: "ts.deleterule",
+        arity: 3,
+        flags: TS_DELETE,
+        first_key: 1,
+        last_key: 2,
+        step: 1,
+        acl: AC_TS_WRITE_FAST,
+        since: "1.0.0",
+        complexity: "O(1)",
+        summary: "Stop folding one series into another.",
         group: "ts",
     },
     // --------------------------------------------------------------- array

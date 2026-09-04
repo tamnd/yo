@@ -25,6 +25,16 @@
 //! The gap has to have a reading on each side, and the readings that count are
 //! the ones in the whole series rather than the ones inside the span, so a gap
 //! that runs off the end of the span is still a gap.
+//!
+//! An alignment can put a bucket edge before the epoch, and that bucket is
+//! reported as starting on the epoch while still covering everything up to its
+//! real end. The middle and the end of such a bucket are counted from the
+//! timestamp it is reported under rather than from the edge it really has, and
+//! filling the empty buckets around it has two rules of its own: a forward read
+//! whose newest reading lands in it fills nothing after it, and a backward read
+//! whose far end lands in it answers nothing at all. All three are what the
+//! module does, and all three only show up on a read that asks for an alignment
+//! the buckets cannot line up against from the epoch.
 
 use crate::sample::Sample;
 use crate::series::Series;
@@ -189,6 +199,10 @@ pub struct Query {
     pub by_value: Option<(f64, f64)>,
     /// The bucketing, if the read asked for any.
     pub buckets: Option<Buckets>,
+    /// One reading to read as though it were stored, which is what `LATEST`
+    /// hands a compaction destination: the bucket its source is still filling
+    /// and has not written down yet.
+    pub latest: Option<Sample>,
 }
 
 impl Default for Query {
@@ -201,6 +215,7 @@ impl Default for Query {
             by_ts: None,
             by_value: None,
             buckets: None,
+            latest: None,
         }
     }
 }
@@ -270,14 +285,22 @@ pub enum Unread {
 
 /// Which bucket a timestamp falls in.
 fn bucket_of(at: i64, delta: i64, align: i64) -> i64 {
-    let start = at - (at - align).rem_euclid(delta);
-    // A bucket that starts before the epoch is reported as starting on it,
-    // because no reading can live in the part that hangs off the front.
-    start.max(0)
+    at - (at - align).rem_euclid(delta)
+}
+
+/// Where the bucket holding `at` starts, given how wide the buckets are and
+/// what they line up against.
+#[must_use]
+pub fn bucket_start(at: i64, delta: i64, align: i64) -> i64 {
+    bucket_of(at, delta, align)
 }
 
 /// The timestamp a bucket is reported under.
 fn stamp_of(stamp: Stamp, start: i64, delta: i64) -> i64 {
+    // A bucket whose edge falls before the epoch is reported as starting on it,
+    // because no reading can live in the part that hangs off the front, and the
+    // middle and the end are counted from there rather than from the real edge.
+    let start = start.max(0);
     match stamp {
         Stamp::Start => start,
         Stamp::Mid => start + delta / 2,
@@ -307,14 +330,40 @@ impl Series {
         {
             from = from.max(last - retention);
         }
-        let kept: Vec<Sample> = self
+        let mut kept: Vec<Sample> = self
             .range(from, query.to)
             .filter(|s| self.wanted(query, *s))
             .collect();
+        // The reading `LATEST` adds is newer than everything stored, so it goes
+        // on the end and the two filters look at it the same way they looked at
+        // the rest.
+        if let Some(open) = query.latest
+            && open.at >= from
+            && open.at <= query.to
+            && self.wanted(query, open)
+            && kept.last().is_none_or(|last| last.at < open.at)
+        {
+            kept.push(open);
+        }
 
+        // The weighted mean reaches over the edges of the bucket it is working
+        // on, and the readings it reaches for can sit outside the span the read
+        // asked for, so the two either side of that span are looked up on their
+        // own. No other reduction looks past a bucket, so no other read pays for
+        // the walk.
+        let edges = match &query.buckets {
+            Some(buckets) if buckets.aggs.contains(&Agg::Twa) => (
+                self.neighbours(query, from.max(0)).0.first().copied(),
+                self.neighbours(query, query.to.saturating_add(1))
+                    .1
+                    .first()
+                    .copied(),
+            ),
+            _ => (None, None),
+        };
         let mut rows = match &query.buckets {
             None => plain(&kept),
-            Some(buckets) => self.bucketed(query, buckets, &kept)?,
+            Some(buckets) => self.bucketed(query, buckets, &kept, edges)?,
         };
         if query.reverse {
             rows.flip();
@@ -369,12 +418,25 @@ impl Series {
     }
 
     /// The bucketed read.
-    fn bucketed(&self, query: &Query, buckets: &Buckets, kept: &[Sample]) -> Result<Rows, Unread> {
+    fn bucketed(
+        &self,
+        query: &Query,
+        buckets: &Buckets,
+        kept: &[Sample],
+        edges: (Option<Sample>, Option<Sample>),
+    ) -> Result<Rows, Unread> {
         let width = buckets.aggs.len();
         let mut rows = Rows {
             width,
             ..Rows::default()
         };
+        // A read running backwards over the empty buckets answers nothing at all
+        // when the bucket holding the far end of it hangs off the front of the
+        // epoch, which is what the module does. The same read forwards, or the
+        // same read without the empty buckets, answers normally.
+        if query.reverse && buckets.empty && bucket_of(query.to, buckets.delta, buckets.align) < 0 {
+            return Ok(rows);
+        }
         // One flag per number written, saying whether it is a `last` waiting on
         // the bucket before it in the reading direction. See [`carry`].
         let mut marks: Vec<bool> = Vec::new();
@@ -407,6 +469,7 @@ impl Series {
                 before,
                 kept,
                 after: hi,
+                edges,
             };
             self.emit(query, buckets, &group, &mut rows, &mut marks)?;
             if buckets.empty
@@ -424,8 +487,15 @@ impl Series {
             }
         }
 
+        // A forward read whose newest reading sits in a bucket that hangs off the
+        // front of the epoch fills nothing after that bucket, which is what the
+        // module does. Read backwards the same buckets are filled, because there
+        // they come first and are treated as the run in front of the readings
+        // rather than the run behind them. Every other gap is filled either way,
+        // including the one that follows that same bucket once a later reading
+        // closes it.
         if buckets.empty
-            && let Some(last) = last
+            && let Some(last) = last.filter(|start| *start >= 0 || query.reverse)
         {
             let end = bucket_of(query.to, buckets.delta, buckets.align);
             self.fill(
@@ -471,12 +541,18 @@ impl Series {
         let prev = group
             .before
             .and_then(|(_, lo, hi)| group.kept[lo..hi].iter().rev().find(|s| !s.value.is_nan()))
-            .copied();
+            .copied()
+            .or_else(|| group.before.is_none().then_some(group.edges.0).flatten());
         let next = group
             .kept
             .get(group.after)
             .copied()
-            .filter(|s| !s.value.is_nan());
+            .filter(|s| !s.value.is_nan())
+            .or_else(|| {
+                (group.after == group.kept.len())
+                    .then_some(group.edges.1)
+                    .flatten()
+            });
 
         rows.stamps
             .push(stamp_of(buckets.stamp, group.start, buckets.delta));
@@ -540,9 +616,19 @@ impl Series {
         if rows.len() + span > MAX_ROWS {
             return Err(Unread::TooWide);
         }
-        // The reading carried into a gap is the last one before it, and it is
-        // the same one for every bucket in the run.
-        let carried = left.first().map_or(f64::NAN, |s| s.value);
+        // The reading carried into a gap is the last one before the gap starts,
+        // and it is the same one for every bucket in the run. It is looked up
+        // from the edge of the first bucket rather than from the near end of the
+        // read, because the module carries a reading the read left out just as
+        // readily as one it kept, and nothing else in the run needs it.
+        let carried = if buckets.aggs.contains(&Agg::Last) {
+            self.neighbours(query, head)
+                .0
+                .first()
+                .map_or(f64::NAN, |s| s.value)
+        } else {
+            f64::NAN
+        };
         for i in 0..span {
             let start = head + buckets.delta * i64::try_from(i).unwrap_or(i64::MAX);
             rows.stamps
@@ -588,6 +674,9 @@ struct Group<'s> {
     kept: &'s [Sample],
     /// Where the samples after this bucket start.
     after: usize,
+    /// The readings either side of the whole read, for the buckets at its ends
+    /// to reach for once they run out of samples the read kept.
+    edges: (Option<Sample>, Option<Sample>),
 }
 
 /// Carry the last reading into the buckets that had none of their own.
@@ -725,7 +814,10 @@ fn weighted(
 
     let first_ts = match prev {
         Some(p) => {
-            let edge = start;
+            // The bucket is measured from its own edge or from the near end of
+            // the read, whichever comes later, the same way the far side is cut
+            // off by the far end of the read.
+            let edge = start.max(query.from);
             let at_edge = cross(p, opens, edge);
             area += (at_edge + opens.value) * (opens.at - edge) as f64 / 2.0;
             edge

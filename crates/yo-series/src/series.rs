@@ -1,6 +1,7 @@
 //! A whole series: the chunks, and everything the commands can set on it.
 
 use crate::chunk::{Chunk, Encoding};
+use crate::query::Agg;
 use crate::sample::Sample;
 
 /// How much room a chunk gets when nobody says otherwise.
@@ -64,6 +65,34 @@ pub enum Refused {
     Duplicate,
 }
 
+/// A standing instruction to fold one series into another.
+///
+/// The rule lives on the series being read from and names the one being written
+/// to. Both directions are stored, the source keeping a rule each and the
+/// destination keeping the name of the one series allowed to feed it, because
+/// `TS.INFO` reports both and neither side can work the other out on its own.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Rule {
+    /// The key the folded readings are written to.
+    pub dest: Vec<u8>,
+    /// How wide a bucket is, in whatever unit the timestamps are.
+    pub delta: i64,
+    /// The reduction each bucket is folded through.
+    pub agg: Agg,
+    /// The timestamp the bucket edges line up against.
+    pub align: i64,
+    /// Which bucket the rule is filling and has not written down yet, or `None`
+    /// when it has not been given a sample since it was made.
+    ///
+    /// A rule does not go back over what the source held before it existed, so
+    /// this is what tells the two apart: the buckets before this one were
+    /// written as they closed and this one is the only one still moving.
+    pub open: Option<i64>,
+    /// The oldest timestamp counted into the open bucket, which is the first
+    /// sample the rule was given after it started that bucket.
+    pub start: i64,
+}
+
 /// A run of samples with the settings the commands hang off it.
 #[derive(Clone, Debug)]
 pub struct Series {
@@ -84,6 +113,11 @@ pub struct Series {
     ignore_time: i64,
     /// How close in value.
     ignore_value: f64,
+    /// The one series allowed to write folded readings here, if this one is the
+    /// destination of a rule.
+    source: Option<Vec<u8>>,
+    /// The series this one is folded into, none or several.
+    rules: Vec<Rule>,
     /// The samples. There is always at least one chunk, empty or not.
     chunks: Vec<Chunk>,
     /// How many samples are in those chunks.
@@ -108,6 +142,8 @@ impl Series {
             labels: Vec::new(),
             ignore_time: 0,
             ignore_value: 0.0,
+            source: None,
+            rules: Vec::new(),
             chunks: vec![Chunk::new(Encoding::Compressed, DEFAULT_CHUNK_BYTES)],
             total: 0,
         }
@@ -199,6 +235,46 @@ impl Series {
         self.ignore_value = value;
     }
 
+    /// The series that folds readings into this one, if there is one.
+    #[must_use]
+    pub fn source(&self) -> Option<&[u8]> {
+        self.source.as_deref()
+    }
+
+    /// Names the series that folds readings into this one.
+    pub fn set_source(&mut self, key: Option<Vec<u8>>) {
+        self.source = key;
+    }
+
+    /// The series this one is folded into.
+    #[must_use]
+    pub fn rules(&self) -> &[Rule] {
+        &self.rules
+    }
+
+    /// Adds a rule, which the caller has already checked is allowed.
+    pub fn add_rule(&mut self, rule: Rule) {
+        self.rules.push(rule);
+    }
+
+    /// The rule writing to `dest`, to move its open bucket along.
+    pub fn rule_mut(&mut self, dest: &[u8]) -> Option<&mut Rule> {
+        self.rules.iter_mut().find(|rule| rule.dest == dest)
+    }
+
+    /// Drops the rule that writes to `dest`, and says whether there was one.
+    pub fn drop_rule(&mut self, dest: &[u8]) -> bool {
+        let before = self.rules.len();
+        self.rules.retain(|rule| rule.dest != dest);
+        self.rules.len() != before
+    }
+
+    /// Keeps only the rules writing to one of `dest`, which is how a rule whose
+    /// destination has been deleted stops being reported.
+    pub fn keep_rules(&mut self, dest: &[Vec<u8>]) {
+        self.rules.retain(|rule| dest.contains(&rule.dest));
+    }
+
     /// How many samples are stored.
     #[must_use]
     pub fn len(&self) -> usize {
@@ -248,7 +324,18 @@ impl Series {
             .iter()
             .map(|(key, value)| key.len() + value.len() + 2 * size_of::<Vec<u8>>())
             .sum();
-        size_of::<Self>() + self.chunks.len() * size_of::<Chunk>() + chunks + labels
+        let rules: usize = self
+            .rules
+            .iter()
+            .map(|rule| rule.dest.len() + size_of::<Rule>())
+            .sum();
+        let source = self.source.as_ref().map_or(0, Vec::len);
+        size_of::<Self>()
+            + self.chunks.len() * size_of::<Chunk>()
+            + chunks
+            + labels
+            + rules
+            + source
     }
 
     /// Stores `sample`, and answers the timestamp it went in on.

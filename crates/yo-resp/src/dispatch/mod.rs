@@ -15825,6 +15825,218 @@ mod tests {
         }
     }
 
+    /// `TS.CREATERULE`, whose refusals come in an order of their own.
+    #[test]
+    fn createrule_checks_the_two_keys_last_and_the_two_links_after_that() {
+        let mut f = Fixture::new();
+        f.run(&[b"TS.CREATE", b"src"]);
+        f.run(&[b"TS.CREATE", b"dst"]);
+        f.run(&[b"SET", b"plain", b"v"]);
+        let cases: &[(&[&[u8]], &str)] = &[
+            // The width is read before the reduction, the reduction before the
+            // width being above zero, and all three before either key is looked
+            // at, so a command that is wrong twice complains about the first.
+            (
+                &[
+                    b"TS.CREATERULE",
+                    b"src",
+                    b"dst",
+                    b"AGGREGATION",
+                    b"nope",
+                    b"x",
+                ],
+                "-ERR TSDB: Couldn't parse AGGREGATION\r\n",
+            ),
+            (
+                &[
+                    b"TS.CREATERULE",
+                    b"src",
+                    b"dst",
+                    b"AGGREGATION",
+                    b"nope",
+                    b"10",
+                ],
+                "-ERR TSDB: Unknown aggregation type\r\n",
+            ),
+            (
+                &[
+                    b"TS.CREATERULE",
+                    b"src",
+                    b"dst",
+                    b"AGGREGATION",
+                    b"avg",
+                    b"0",
+                ],
+                "-ERR TSDB: bucketDuration must be greater than zero\r\n",
+            ),
+            (
+                &[
+                    b"TS.CREATERULE",
+                    b"src",
+                    b"dst",
+                    b"AGGREGATION",
+                    b"avg",
+                    b"10",
+                    b"x",
+                ],
+                "-ERR TSDB: Couldn't parse alignTimestamp\r\n",
+            ),
+            (
+                &[
+                    b"TS.CREATERULE",
+                    b"src",
+                    b"src",
+                    b"AGGREGATION",
+                    b"avg",
+                    b"10",
+                ],
+                "-ERR TSDB: the source key and destination key should be different\r\n",
+            ),
+            // A key holding something else answers the same as a key that is not
+            // there at all, because the source is looked up first and neither of
+            // them is a series.
+            (
+                &[
+                    b"TS.CREATERULE",
+                    b"nope",
+                    b"plain",
+                    b"AGGREGATION",
+                    b"avg",
+                    b"10",
+                ],
+                "-ERR TSDB: the key does not exist\r\n",
+            ),
+            (
+                &[
+                    b"TS.CREATERULE",
+                    b"src",
+                    b"nope",
+                    b"AGGREGATION",
+                    b"avg",
+                    b"10",
+                ],
+                "-ERR TSDB: the key does not exist\r\n",
+            ),
+            // A keyword other than AGGREGATION is an arity error rather than a
+            // syntax one, because the arity is all that is checked.
+            (
+                &[b"TS.CREATERULE", b"src", b"dst", b"NOPE", b"avg", b"10"],
+                "-ERR wrong number of arguments for 'ts.createrule' command\r\n",
+            ),
+            (
+                &[
+                    b"TS.CREATERULE",
+                    b"src",
+                    b"dst",
+                    b"AGGREGATION",
+                    b"avg",
+                    b"10",
+                ],
+                "+OK\r\n",
+            ),
+            // The link is now in place, so the same rule again is refused from
+            // the destination's end.
+            (
+                &[
+                    b"TS.CREATERULE",
+                    b"src",
+                    b"dst",
+                    b"AGGREGATION",
+                    b"avg",
+                    b"10",
+                ],
+                "-ERR TSDB: the destination key already has a src rule\r\n",
+            ),
+            // A source that is already someone's destination, and a destination
+            // that is already someone's source, are two different sentences.
+            (
+                &[
+                    b"TS.CREATERULE",
+                    b"dst",
+                    b"src",
+                    b"AGGREGATION",
+                    b"avg",
+                    b"10",
+                ],
+                "-ERR TSDB: the source key already has a source rule\r\n",
+            ),
+            (&[b"TS.DELETERULE", b"src", b"dst"], "+OK\r\n"),
+            (
+                &[b"TS.DELETERULE", b"src", b"dst"],
+                "-ERR TSDB: compaction rule does not exist\r\n",
+            ),
+            // The source is looked up and the destination is not, so a missing
+            // destination is a missing rule and a missing source is a missing
+            // key, which is the other way round from `TS.CREATERULE`.
+            (
+                &[b"TS.DELETERULE", b"src", b"nope"],
+                "-ERR TSDB: compaction rule does not exist\r\n",
+            ),
+            (
+                &[b"TS.DELETERULE", b"nope", b"dst"],
+                "-ERR TSDB: the key does not exist\r\n",
+            ),
+        ];
+        for (argv, want) in cases {
+            let got = f.run(argv);
+            assert_eq!(&got, want, "{argv:?}");
+        }
+    }
+
+    /// What a rule writes, which is every bucket but the one it is filling.
+    #[test]
+    fn a_rule_writes_a_bucket_when_a_later_reading_closes_it() {
+        let mut f = Fixture::new();
+        f.run(&[b"TS.CREATE", b"src"]);
+        f.run(&[b"TS.CREATE", b"dst"]);
+        // The readings written before the rule was made are not folded, so the
+        // destination is still empty after the first two.
+        f.run(&[b"TS.ADD", b"src", b"10", b"1"]);
+        f.run(&[
+            b"TS.CREATERULE",
+            b"src",
+            b"dst",
+            b"AGGREGATION",
+            b"sum",
+            b"100",
+        ]);
+        f.run(&[b"TS.ADD", b"src", b"20", b"2"]);
+        assert_eq!(f.run(&[b"TS.RANGE", b"dst", b"-", b"+"]), "*0\r\n");
+        // The bucket the rule is filling holds only what it was given, so it is
+        // 2 rather than 3, and it is written when a reading lands past it.
+        assert_eq!(f.run(&[b"TS.GET", b"dst", b"LATEST"]), "*2\r\n:0\r\n+2\r\n");
+        f.run(&[b"TS.ADD", b"src", b"110", b"4"]);
+        assert_eq!(
+            f.run(&[b"TS.RANGE", b"dst", b"-", b"+"]),
+            "*1\r\n*2\r\n:0\r\n+2\r\n"
+        );
+        // A reading into a bucket that has already been written works that
+        // bucket out again over everything the source now holds.
+        f.run(&[b"TS.ADD", b"src", b"30", b"8"]);
+        assert_eq!(
+            f.run(&[b"TS.RANGE", b"dst", b"-", b"+"]),
+            "*1\r\n*2\r\n:0\r\n+11\r\n"
+        );
+        // Deleting from the source works the buckets it touched out again and
+        // reopens the newest one, so `LATEST` starts from the whole bucket.
+        assert_eq!(f.run(&[b"TS.DEL", b"src", b"0", b"25"]), ":2\r\n");
+        assert_eq!(
+            f.run(&[b"TS.RANGE", b"dst", b"-", b"+"]),
+            "*1\r\n*2\r\n:0\r\n+8\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"TS.GET", b"dst", b"LATEST"]),
+            "*2\r\n:100\r\n+4\r\n"
+        );
+        // The link shows on both ends, and dropping either key takes it down.
+        assert!(f.run(&[b"TS.INFO", b"dst"]).contains("sourceKey"));
+        f.run(&[b"DEL", b"dst"]);
+        assert_eq!(
+            f.run(&[b"TS.DELETERULE", b"src", b"dst"]),
+            "-ERR TSDB: compaction rule does not exist\r\n"
+        );
+    }
+
     /// The three shapes an `XADD` id can take, and the one rule behind all of
     /// them.
     #[test]
