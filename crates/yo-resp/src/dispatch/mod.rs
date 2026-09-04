@@ -92,8 +92,8 @@ pub use table::{COMMANDS, Spec, arity_ok, lookup};
 use crate::reply::Out;
 use std::cell::Cell;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::AtomicU64;
-use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
+use std::sync::atomic::Ordering::{Acquire, Relaxed, Release};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize};
 use yo_common::lock::Held;
 use yo_common::{Code, Error};
 use yo_kv::cold::Blocks;
@@ -133,6 +133,15 @@ const _: () = assert!(DATABASES <= 64);
 /// instead of a count and hands the rest to a timer; there is no timer here, so
 /// the rest goes to the next command that runs.
 const EVICT_BUDGET: usize = 64;
+
+/// The `maxstore` a server with no storage limit carries.
+///
+/// Sixteen exabytes, which is every disk there is and then some, so a server
+/// that set a limit this high and a server that set none behave the same way and
+/// the only difference is what `CONFIG GET maxstore` says. Zero cannot be the
+/// sentinel because zero is a limit with a meaning: nothing may live on the
+/// file.
+const NO_MAXSTORE: u64 = u64::MAX;
 
 /// What a server says to a command that would allocate when it has no room.
 ///
@@ -391,8 +400,11 @@ pub struct Server {
     /// The `maxmemory` limit in bytes, zero when there is not one.
     ///
     /// Zero is the default and it is the whole reason the check in front of
-    /// every write is one comparison against a field that is already warm.
-    maxmemory: u64,
+    /// every write is one comparison against a field that is already warm. It
+    /// is read by every command on every thread and written by a client that
+    /// sends `CONFIG SET`, so it is a number the threads can share rather than
+    /// a field one of them owns.
+    maxmemory: AtomicU64,
     /// Where a database gets a store from the first time it needs one.
     ///
     /// A closure and not a store, because there are sixteen databases and a
@@ -419,7 +431,13 @@ pub struct Server {
     /// left, which is Redis exactly. `None` is no limit and is the default,
     /// which with `noeviction` means the database grows until the disk is full
     /// and then writes fail, which is what a database does.
-    maxstore: Option<u64>,
+    ///
+    /// Shared between the threads the same way `maxmemory` is, and no limit is
+    /// [`NO_MAXSTORE`] rather than a second field saying whether the first one
+    /// counts. Two fields cannot be read as one, and a limit that was on when
+    /// the bytes were read and off by the time the number was is a limit that
+    /// answers from a server that never existed.
+    maxstore: AtomicU64,
     /// What [`Server::memory_bytes`] said at the last maintenance turn.
     ///
     /// The reading is a walk over every collection in every database and cannot
@@ -494,7 +512,7 @@ pub struct Server {
     /// close, and a server that calls `exit` from a command handler skips all
     /// of that. So the command says stop and the driver stops, on the same turn
     /// and through the same door a signal uses.
-    stopping: bool,
+    stopping: AtomicBool,
 }
 
 impl Server {
@@ -510,9 +528,9 @@ impl Server {
             next_db: 0,
             dirty: ALL_DATABASES,
             conn_bytes: 0,
-            maxmemory: 0,
+            maxmemory: AtomicU64::new(0),
             store: None,
-            maxstore: None,
+            maxstore: AtomicU64::new(NO_MAXSTORE),
             used: 0,
             evict_db: 0,
             expire_db: 0,
@@ -524,7 +542,7 @@ impl Server {
             dir: working_dir(),
             backup: backup::State::default(),
             search: Registry::new(),
-            stopping: false,
+            stopping: AtomicBool::new(false),
         }
     }
 
@@ -560,9 +578,9 @@ impl Server {
             next_db: 0,
             dirty: ALL_DATABASES,
             conn_bytes: 0,
-            maxmemory: 0,
+            maxmemory: AtomicU64::new(0),
             store: None,
-            maxstore: None,
+            maxstore: AtomicU64::new(NO_MAXSTORE),
             used: 0,
             evict_db: 0,
             expire_db: 0,
@@ -574,7 +592,7 @@ impl Server {
             dir: working_dir(),
             backup: backup::State::default(),
             search: Registry::new(),
-            stopping: false,
+            stopping: AtomicBool::new(false),
         }
     }
 
@@ -673,8 +691,8 @@ impl Server {
     /// It sets a flag and returns. Nothing here closes a socket, flushes a file
     /// or ends the process, because none of those belong to this layer, and a
     /// batch that is halfway through still has to finish and be written out.
-    pub fn stop(&mut self) {
-        self.stopping = true;
+    pub fn stop(&self) {
+        self.stopping.store(true, Release);
     }
 
     /// Whether somebody has asked the server to stop.
@@ -684,7 +702,7 @@ impl Server {
     /// operating system and the other from a client.
     #[must_use]
     pub fn stopping(&self) -> bool {
-        self.stopping
+        self.stopping.load(Acquire)
     }
 
     /// One database, by index, without taking it mutably.
@@ -930,8 +948,8 @@ impl Server {
 
     /// The `maxmemory` limit in bytes, zero when there is not one.
     #[must_use]
-    pub const fn maxmemory(&self) -> u64 {
-        self.maxmemory
+    pub fn maxmemory(&self) -> u64 {
+        self.maxmemory.load(Relaxed)
     }
 
     /// Set the limit, and take a reading straight away.
@@ -948,7 +966,7 @@ impl Server {
     /// first reading after switching it on is the walk that the total starts
     /// from, and it is the only walk.
     pub fn set_maxmemory(&mut self, bytes: u64) {
-        self.maxmemory = bytes;
+        self.maxmemory.store(bytes, Relaxed);
         for db in &mut self.dbs {
             db.track_memory(bytes != 0);
         }
@@ -997,8 +1015,11 @@ impl Server {
 
     /// The `maxstore` limit in bytes, `None` when there is not one.
     #[must_use]
-    pub const fn maxstore(&self) -> Option<u64> {
-        self.maxstore
+    pub fn maxstore(&self) -> Option<u64> {
+        match self.maxstore.load(Relaxed) {
+            NO_MAXSTORE => None,
+            bytes => Some(bytes),
+        }
     }
 
     /// Set the storage limit, or clear it with `None`.
@@ -1006,8 +1027,8 @@ impl Server {
     /// Nothing is read here the way [`Server::set_maxmemory`] reads the memory
     /// total, because this limit is compared against a number the store keeps
     /// and answers on demand, not against a walk.
-    pub const fn set_maxstore(&mut self, bytes: Option<u64>) {
-        self.maxstore = bytes;
+    pub fn set_maxstore(&self, bytes: Option<u64>) {
+        self.maxstore.store(bytes.unwrap_or(NO_MAXSTORE), Relaxed);
     }
 
     /// What every attached store is holding, for `INFO memory`.
@@ -1077,7 +1098,8 @@ impl Server {
     /// because a full file is a storage limit reached and eviction is the right
     /// answer to a storage limit.
     fn migrates(&self, at: usize) -> bool {
-        if self.maxstore == Some(0) {
+        let cap = self.maxstore();
+        if cap == Some(0) {
             return false;
         }
         // Out of the stripe first. A match keeps whatever it is looking at
@@ -1085,7 +1107,7 @@ impl Server {
         // across the arms for no reason.
         let bytes = self.slot(at).store_bytes();
         match bytes {
-            Some(held) => self.maxstore.is_none_or(|cap| held < cap),
+            Some(held) => cap.is_none_or(|cap| held < cap),
             // Nothing attached, but somewhere to get one from the moment this
             // database needs it, which is what makes the answer yes rather than
             // no. Opening it here would mean `INFO` opened files.
@@ -1098,7 +1120,7 @@ impl Server {
     /// Nothing at all when there is no limit, which is the default and is every
     /// server that has not asked for one.
     pub fn refresh_memory(&mut self) {
-        if self.maxmemory != 0 {
+        if self.maxmemory() != 0 {
             self.used = self.settled_memory();
         }
     }
@@ -1150,7 +1172,8 @@ impl Server {
     /// a few hundred megabytes gets what it asked for. A `maxmemory` of four
     /// megabytes is asking for a precision this store does not have.
     pub fn make_room(&mut self) -> bool {
-        if self.maxmemory == 0 || self.used as u64 <= self.maxmemory {
+        let limit = self.maxmemory();
+        if limit == 0 || self.used as u64 <= limit {
             return true;
         }
         // The cached reading is a batch old and the batch may have compacted
@@ -1159,8 +1182,8 @@ impl Server {
         // collections the last batch touched and not the whole database.
         self.used = self.settled_memory();
         let mut budget = EVICT_BUDGET;
-        while self.used as u64 > self.maxmemory {
-            let over = self.used - self.maxmemory as usize;
+        while self.used as u64 > limit {
+            let over = self.used - limit as usize;
             if !self.relieve_step(over) {
                 return false;
             }
@@ -1451,7 +1474,7 @@ pub fn resolved(
     // The flag is Redis's own `denyoom` and the list of commands carrying it is
     // Redis's list, so a command that only frees is let through with nothing
     // left, which is what lets a client dig itself out with `DEL`.
-    if server.maxmemory != 0 && !server.make_room() && spec.flags.contains(&"denyoom") {
+    if server.maxmemory() != 0 && !server.make_room() && spec.flags.contains(&"denyoom") {
         server.mine().cmdstats.at(spec).rejected.bump();
         out.error_line(b"OOM ", OOM);
         return Flow::Continue;
