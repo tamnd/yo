@@ -295,11 +295,18 @@ pub(super) fn execute(
             for db in &mut server.dbs {
                 db.clear();
             }
+            server.search.clear();
             out.ok();
         }
+        // The search indexes go too, and they go whichever database this is.
+        // An index that only ever followed keys on database zero is dropped by
+        // a `FLUSHDB` on database nine, which is measured against a real server
+        // rather than reasoned about: the module hangs its callback on the
+        // flush event without looking at which database flushed.
         "flushdb" => {
             flush_mode(args)?;
             server.dbs[session.db].clear();
+            server.search.clear();
             out.ok();
         }
         // Two databases change places and no key moves. A database here is a

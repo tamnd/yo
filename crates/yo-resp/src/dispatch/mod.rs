@@ -71,6 +71,7 @@ mod lists;
 mod migrate;
 mod scan;
 mod scripting;
+mod search;
 mod server;
 mod sets;
 mod streams;
@@ -93,6 +94,7 @@ use std::path::{Path, PathBuf};
 use yo_common::{Code, Error};
 use yo_kv::cold::Blocks;
 use yo_kv::{Clock, Db, Keyspace};
+use yo_search::Registry;
 
 /// How many databases a server has.
 ///
@@ -348,6 +350,16 @@ pub struct Server {
     /// On the server and not on a session, because a backup outlives the
     /// connection that asked for it and any other connection can seal it.
     backup: backup::State,
+    /// The search indexes and the names pointing at them.
+    ///
+    /// On the server and not on a database, which is the one collection in this
+    /// build that is. A real server keeps its indexes in the search module, the
+    /// module has one table, and `SELECT 1` followed by `FT._LIST` lists the
+    /// indexes made on database zero. `search.rs` has the rest of why.
+    ///
+    /// A server nobody has made an index on holds two empty vectors here, which
+    /// is six words and no allocation.
+    search: Registry,
     /// Set by `SHUTDOWN`, and read by whatever is turning the loop.
     ///
     /// A flag rather than an exit, because the command layer is not what owns
@@ -385,6 +397,7 @@ impl Server {
             cmdstats: CommandStats::default(),
             dir: working_dir(),
             backup: backup::State::default(),
+            search: Registry::new(),
             stopping: false,
         }
     }
@@ -436,6 +449,7 @@ impl Server {
             cmdstats: CommandStats::default(),
             dir: working_dir(),
             backup: backup::State::default(),
+            search: Registry::new(),
             stopping: false,
         }
     }
@@ -1382,6 +1396,11 @@ pub fn resolved(
             // a `DB n` and writes into a database nobody selected.
             "keyspace" => keyspace::execute(&mut server.dbs, session.db, spec, args, out)
                 .map(|()| Flow::Continue),
+            // No database at all, because an index is not a key. The registry
+            // is the whole of what these sixteen commands touch.
+            "search" => {
+                search::execute(&mut server.search, spec, args, out).map(|()| Flow::Continue)
+            }
             "scripting" => scripting::execute(spec, args, out).map(|()| Flow::Continue),
             _ => server::execute(server, session, spec, args, out),
         }

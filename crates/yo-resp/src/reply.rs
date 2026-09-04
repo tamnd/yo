@@ -219,6 +219,30 @@ impl Out {
         self.crlf();
     }
 
+    /// An error line with a word the client sent quoted in the middle of it.
+    ///
+    /// Several of the search errors read `Unknown argument \`x\`` and name the
+    /// word that was not understood, so the line is the server's own text, then
+    /// the client's bytes, then the server's text again. Only the middle piece
+    /// can carry a line ending and only the middle piece has them taken out,
+    /// for the reason [`Out::error_line`] gives.
+    pub fn error_about(&mut self, before: &[u8], word: &[u8], after: &[u8]) {
+        debug_assert!(
+            !before.contains(&b'\r') && !before.contains(&b'\n'),
+            "an error line cannot carry a line ending"
+        );
+        self.buf
+            .reserve(before.len() + word.len() + after.len() + 3);
+        self.buf.push(b'-');
+        self.buf.extend_from_slice(before);
+        for &b in word {
+            self.buf
+                .push(if b == b'\r' || b == b'\n' { b' ' } else { b });
+        }
+        self.buf.extend_from_slice(after);
+        self.crlf();
+    }
+
     /// A blob error, RESP3's `!`, which may carry anything including newlines.
     ///
     /// Degrades to a normal error line in RESP2, with line endings turned into

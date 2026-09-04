@@ -23,6 +23,9 @@ yo-reactor = { workspace = true }
 # The series the `TS.*` family works on, held under a key the same way the
 # sketches are.
 yo-series = { workspace = true }
+# The index definitions and the registry the `FT.*` family answers from, which
+# is the one collection here that is not under a key.
+yo-search = { workspace = true }
 # `Metric`, so that a vector set says cosine in the same word the catalogue does.
 yo-shape = { workspace = true }
 # The filter the `BF.*` family works on, whose bytes go out over BF.SCANDUMP.
