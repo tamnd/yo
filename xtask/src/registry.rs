@@ -79,6 +79,8 @@ const PLANLESS_COMMANDS: &[&str] = &[
     "FT._ALIASDELIFX",
     "FT.ALIASUPDATE",
     "FT.ALIASLIST",
+    "FT.EXPLAIN",
+    "FT.EXPLAINCLI",
 ];
 /// The bound or materialise verdicts.
 const BOUNDED: &[&str] = &["inherent", "yes", "risk"];

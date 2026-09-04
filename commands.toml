@@ -177,11 +177,12 @@ doc = "09 section 5"
 # search.CLUSTERSET. Those five belong to the coordinator rather than to the
 # index and arrive with the cluster work, so the group cannot reach shipped
 # before that lands however many FT commands are done.
-# The sixteen listed here are the ones about the index itself: making one,
-# altering one, dropping one, reading one back and the alias family. None of
-# them names a key, and the four with an underscore in front are the forms the
-# coordinator calls, which differ from the plain ones only in what they do when
-# the index is already there or already gone.
+# The eighteen listed here are the ones about the index itself: making one,
+# altering one, dropping one, reading one back, the alias family and the two
+# that print what a query parses into. None of them names a key, and the four
+# with an underscore in front are the forms the coordinator calls, which differ
+# from the plain ones only in what they do when the index is already there or
+# already gone.
 
 [[group]]
 name = "bloom"
@@ -3164,6 +3165,28 @@ bounded = "yes"
 status = "shipped"
 wire = "verified"
 notes = "The aliases of one index, which is the only command in the alias family that reads rather than writes and the newest command in the group. The name is misleading in the same way it is on a real server: it does not list every alias on the server, it takes an index and lists that index's own, and calling it with no argument is an arity error rather than a listing. The names come back as bulk strings where FT._LIST writes simple ones, and as a set on RESP3."
+
+[[command]]
+name = "FT.EXPLAIN"
+group = "search"
+since = "1.0.0"
+arity = -3
+plan = "none"
+bounded = "yes"
+status = "shipped"
+wire = "verified"
+notes = "The tree a query parses into, printed the way a real server prints it, which is the only way a client can see what its query actually asked for. The printout is part of the interface and not a debugging aid: the shape of it says what the engine will do, so a word expanding into a union of itself and its stem is printed as that union, and a field modifier that narrowed down to no field at all prints as @NULL rather than disappearing. It takes the same arguments FT.SEARCH does and ignores the ones that are only about a result set, so a client can paste a search in front of it and read back what it would have run."
+
+[[command]]
+name = "FT.EXPLAINCLI"
+group = "search"
+since = "1.0.0"
+arity = -3
+plan = "none"
+bounded = "yes"
+status = "shipped"
+wire = "verified"
+notes = "The same tree as FT.EXPLAIN with the lines split into an array of simple strings, for a client that would rather not split them itself. The split keeps the empty piece after the last newline, so joining the array back together with newlines gives exactly what FT.EXPLAIN would have sent, and a reply of one empty string is a query that came to nothing rather than a query that failed."
 
 # ----------------------------------------------------------------------- bloom
 
