@@ -40,7 +40,7 @@ use yo_common::num::parse_f64;
 use yo_common::{Code, Error, Result};
 use yo_kv::geo::{self, Kind, Shape, Unit};
 use yo_kv::geos::{self, Limit, Scratch, Sort};
-use yo_kv::{Gate, Keyspace, ZAdd};
+use yo_kv::{Db, Gate, Keyspace, ZAdd};
 
 use super::args::{self, Args, is};
 use super::table::Spec;
@@ -159,12 +159,16 @@ impl Form {
 }
 
 /// Run one geospatial command.
-pub(super) fn execute(db: &mut Keyspace, spec: &Spec, args: Args<'_>, out: &mut Out) -> Result<()> {
+pub(super) fn execute(db: &mut Db, spec: &Spec, args: Args<'_>, out: &mut Out) -> Result<()> {
+    // The four that read or write one key are handed the stripe that key is on.
+    // The search forms take the database, because a store form names a second
+    // key and the two of them can be anywhere.
+    let key = args.get(1);
     match spec.name {
-        "geoadd" => add(db, args, out),
-        "geopos" => pos(db, args, out),
-        "geohash" => hash(db, args, out),
-        "geodist" => dist(db, args, out),
+        "geoadd" => add(db.at(key), args, out),
+        "geopos" => pos(db.at(key), args, out),
+        "geohash" => hash(db.at(key), args, out),
+        "geodist" => dist(db.at(key), args, out),
         _ => search(db, spec, args, out),
     }
 }
@@ -275,13 +279,13 @@ fn dist(db: &mut Keyspace, args: Args<'_>, out: &mut Out) -> Result<()> {
 }
 
 /// The six search forms, which are one command with six front ends.
-fn search(db: &mut Keyspace, spec: &Spec, args: Args<'_>, out: &mut Out) -> Result<()> {
+fn search(db: &mut Db, spec: &Spec, args: Args<'_>, out: &mut Out) -> Result<()> {
     let form = Form::of(spec.name);
     let key = args.get(form.src);
     // Before any argument is read, because that is where Redis looks it up and
     // a wrong type has to win over a bad radius. It answers the existence
     // question at the same time, which two later decisions need.
-    let here = db.zcard(key)? != 0;
+    let here = db.at(key).zcard(key)? != 0;
 
     let mut dest = (form.store == Store::Argument).then(|| args.get(1));
     let mut storedist = false;
@@ -399,8 +403,9 @@ fn search(db: &mut Keyspace, spec: &Spec, args: Args<'_>, out: &mut Out) -> Resu
     match dest {
         Some(into) => out.uint(db.geosearchstore(into, key, &shape, limit, storedist)? as u64),
         None => {
-            db.geosearch(key, &shape, limit)?;
-            found(db.geohits(), unit, [withdist, withhash, withcoord], out);
+            let stripe = db.at(key);
+            stripe.geosearch(key, &shape, limit)?;
+            found(stripe.geohits(), unit, [withdist, withhash, withcoord], out);
         }
     }
     Ok(())
@@ -466,11 +471,13 @@ fn rectangle(args: Args<'_>, at: usize) -> Result<(Kind, Unit)> {
 }
 
 /// Where a member is, for the forms that take their centre from one.
-fn centre(db: &mut Keyspace, key: &[u8], member: &[u8]) -> Result<(f64, f64)> {
+fn centre(db: &mut Db, key: &[u8], member: &[u8]) -> Result<(f64, f64)> {
     // The key was there a moment ago and nothing has run since, so the `None`
     // is unreachable rather than being another way to say the member is
     // missing. Both answer the same sentence anyway.
-    db.geocentre(key, member)?.ok_or_else(geos::no_member)
+    db.at(key)
+        .geocentre(key, member)?
+        .ok_or_else(geos::no_member)
 }
 
 /// A unit word, or Redis's complaint about the ones it does not know.
