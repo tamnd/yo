@@ -1291,13 +1291,13 @@ pub fn resolved(
             // something a `SET` left behind works.
             "bitmap" => {
                 let db = session.db;
-                bits::execute(server.dbs[db].only_mut(), spec, args, out).map(|()| Flow::Continue)
+                bits::execute(&mut server.dbs[db], spec, args, out).map(|()| Flow::Continue)
             }
             // The same again: a sketch is a string with a documented layout, so
             // `GET` hands one to a client and `SET` takes it back.
             "hyperloglog" => {
                 let db = session.db;
-                hll::execute(server.dbs[db].only_mut(), spec, args, out).map(|()| Flow::Continue)
+                hll::execute(&mut server.dbs[db], spec, args, out).map(|()| Flow::Continue)
             }
             "set" => {
                 let db = session.db;
@@ -18265,5 +18265,239 @@ mod tests {
             .expect("a list that is there");
         assert_eq!(f.server.striped(0).at(src).llen(src).expect("a list"), 3);
         assert_eq!(f.server.striped(0).at(dst).llen(dst).expect("a list"), 2);
+    }
+
+    /// Every bitmap command, on one stripe and on eight, replies compared byte
+    /// for byte.
+    ///
+    /// `BITOP` is the one that names more than one key and it is where the work
+    /// went. The rest are single key commands that now find their own stripe,
+    /// and they are here because the cheapest way to be sure the routing is
+    /// right is to ask.
+    #[test]
+    fn the_bitmap_group_answers_the_same_however_many_stripes_there_are() {
+        let script: &[&[&[u8]]] = &[
+            &[b"SET", b"k1", b"foobar"],
+            &[b"SETBIT", b"b1", b"7", b"1"],
+            &[b"SETBIT", b"b1", b"7", b"0"],
+            &[b"GETBIT", b"k1", b"6"],
+            &[b"GETBIT", b"k1", b"100"],
+            &[b"BITCOUNT", b"k1"],
+            &[b"BITCOUNT", b"k1", b"0", b"0"],
+            &[b"BITCOUNT", b"k1", b"5", b"30", b"BIT"],
+            &[b"BITPOS", b"k1", b"1"],
+            &[b"BITPOS", b"k1", b"0", b"2"],
+            &[b"BITPOS", b"k1", b"1", b"2", b"-1", b"BIT"],
+            &[
+                b"BITFIELD",
+                b"bf",
+                b"SET",
+                b"u8",
+                b"0",
+                b"255",
+                b"GET",
+                b"u8",
+                b"0",
+            ],
+            &[
+                b"BITFIELD",
+                b"bf",
+                b"OVERFLOW",
+                b"SAT",
+                b"INCRBY",
+                b"u8",
+                b"0",
+                b"10",
+            ],
+            &[b"BITFIELD_RO", b"bf", b"GET", b"u8", b"0"],
+            // The multi key one, over sources that are not on one stripe unless
+            // eight stripes have folded into one.
+            &[b"SET", b"s1", b"abc"],
+            &[b"SET", b"s2", b"abd"],
+            &[b"SET", b"s3", b"a"],
+            &[b"BITOP", b"AND", b"d1", b"s1", b"s2"],
+            &[b"GET", b"d1"],
+            &[b"BITOP", b"OR", b"d2", b"s1", b"s2", b"s3"],
+            &[b"GET", b"d2"],
+            &[b"BITOP", b"XOR", b"d3", b"s1", b"s2"],
+            &[b"STRLEN", b"d3"],
+            &[b"BITOP", b"NOT", b"d4", b"s1"],
+            &[b"STRLEN", b"d4"],
+            &[b"BITOP", b"DIFF", b"d5", b"s1", b"s2"],
+            &[b"BITOP", b"DIFF1", b"d6", b"s1", b"s2"],
+            &[b"BITOP", b"ANDOR", b"d7", b"s1", b"s2"],
+            &[b"BITOP", b"ONE", b"d8", b"s1", b"s2"],
+            // A source that is not there reads as empty, and a result with
+            // nothing in it deletes the destination rather than writing one.
+            &[b"BITOP", b"AND", b"d1", b"gone", b"also-gone"],
+            &[b"EXISTS", b"d1"],
+            &[b"BITOP", b"OR", b"d9", b"s1", b"gone"],
+            &[b"GET", b"d9"],
+            // And the errors, which have to be the same errors. The key that
+            // is not a string is planted below rather than pushed here, since
+            // the list group has not been taught about stripes yet.
+            &[b"BITOP", b"AND", b"d1", b"s1", b"list"],
+            &[b"BITOP", b"AND", b"list", b"s1", b"s2"],
+            &[b"BITOP", b"NOT", b"d1", b"s1", b"s2"],
+            &[b"BITOP", b"DIFF", b"d1", b"s1"],
+            &[b"BITOP", b"NOPE", b"d1", b"s1"],
+            &[b"BITCOUNT", b"list"],
+            &[b"BITFIELD_RO", b"bf", b"SET", b"u8", b"0", b"1"],
+        ];
+
+        let mut one = Fixture::new();
+        let mut many = Fixture::striped(8);
+        for f in [&mut one, &mut many] {
+            plant_list(f, b"list");
+        }
+        for parts in script {
+            let a = one.run(parts);
+            let b = many.run(parts);
+            assert_eq!(a, b, "{}", String::from_utf8_lossy(parts[0]));
+        }
+    }
+
+    /// A list under `key`, put there through the store.
+    ///
+    /// What a test does when it wants a key of the wrong type on a striped
+    /// server, because the command that would make one is in a group that has
+    /// not been taught about stripes yet.
+    fn plant_list(f: &mut Fixture, key: &[u8]) {
+        f.server
+            .striped(0)
+            .at(key)
+            .push(key, yo_kv::End::Right, core::iter::once(&b"x"[..]))
+            .expect("a new list");
+    }
+
+    /// A `BITOP` whose keys are on two stripes reads both of them.
+    ///
+    /// The test above spreads its keys by hashing and would still pass if one
+    /// stripe were doing all the work, since the answers would be the same. This
+    /// one puts the destination and the two sources where they are known not to
+    /// share a stripe.
+    #[test]
+    fn a_bitop_across_stripes_reads_every_source() {
+        let mut f = Fixture::striped(8);
+        let other = apart(&mut f, "src");
+        let (src, far) = (b"src".as_slice(), other.as_bytes());
+        assert_ne!(
+            f.server.striped(0).stripe_of(src),
+            f.server.striped(0).stripe_of(far),
+            "the two keys are the point of the test"
+        );
+
+        f.run(&[b"SET", src, b"abc"]);
+        f.run(&[b"SET", far, b"abd"]);
+        assert_eq!(f.run(&[b"BITOP", b"AND", far, src, far]), ":3\r\n");
+        assert_eq!(
+            f.run(&[b"GET", far]),
+            "$3\r\nab`\r\n",
+            "a destination that is also a source"
+        );
+        f.run(&[b"SET", far, b"abd"]);
+        assert_eq!(f.run(&[b"BITOP", b"XOR", src, src, far]), ":3\r\n");
+        assert_eq!(
+            f.run(&[b"GET", src]),
+            "$3\r\n\0\0\x07\r\n",
+            "and the other way round"
+        );
+
+        // A result of nothing deletes a destination on whatever stripe it is
+        // on, and a source of the wrong type is refused before anything is
+        // written.
+        f.run(&[b"SET", src, b"abc"]);
+        f.run(&[b"DEL", far]);
+        assert_eq!(f.run(&[b"BITOP", b"AND", src, far, b"gone"]), ":0\r\n");
+        assert_eq!(f.run(&[b"EXISTS", src]), ":0\r\n");
+        f.run(&[b"SET", src, b"abc"]);
+        f.run(&[b"DEL", far]);
+        plant_list(&mut f, far);
+        assert_eq!(
+            f.run(&[b"BITOP", b"OR", b"out", src, far]),
+            "-WRONGTYPE Operation against a key holding the wrong kind of value\r\n"
+        );
+        assert_eq!(f.run(&[b"EXISTS", b"out"]), ":0\r\n");
+    }
+
+    /// Every HyperLogLog command, on one stripe and on eight.
+    #[test]
+    fn the_hyperloglog_group_answers_the_same_however_many_stripes_there_are() {
+        let script: &[&[&[u8]]] = &[
+            &[b"PFADD", b"h1", b"a", b"b", b"c"],
+            &[b"PFADD", b"h1", b"a"],
+            &[b"PFADD", b"h2"],
+            &[b"PFADD", b"h2", b"c", b"d", b"e"],
+            &[b"PFCOUNT", b"h1"],
+            &[b"PFCOUNT", b"h2"],
+            &[b"PFCOUNT", b"missing"],
+            // The two that name more than one key.
+            &[b"PFCOUNT", b"h1", b"h2"],
+            &[b"PFCOUNT", b"h1", b"missing"],
+            &[b"PFMERGE", b"m", b"h1", b"h2"],
+            &[b"PFCOUNT", b"m"],
+            &[b"STRLEN", b"m"],
+            &[b"PFMERGE", b"m"],
+            &[b"PFCOUNT", b"m"],
+            &[b"PFMERGE", b"m2", b"missing"],
+            &[b"PFCOUNT", b"m2"],
+            // The debugging ones, which are single key and change what they
+            // look at.
+            &[b"PFDEBUG", b"ENCODING", b"h1"],
+            &[b"PFDEBUG", b"DECODE", b"h1"],
+            &[b"PFDEBUG", b"TODENSE", b"h1"],
+            &[b"PFDEBUG", b"ENCODING", b"h1"],
+            &[b"PFDEBUG", b"TODENSE", b"h1"],
+            &[b"PFCOUNT", b"h1", b"h2"],
+            &[b"PFSELFTEST"],
+            // And the errors.
+            &[b"SET", b"plain", b"not a sketch at all"],
+            &[b"PFADD", b"plain", b"a"],
+            &[b"PFCOUNT", b"plain"],
+            &[b"PFCOUNT", b"h1", b"plain"],
+            &[b"PFMERGE", b"plain", b"h1"],
+            &[b"PFMERGE", b"m", b"plain"],
+            &[b"PFDEBUG", b"ENCODING", b"gone"],
+            &[b"PFDEBUG", b"NOPE", b"h1"],
+        ];
+
+        let mut one = Fixture::new();
+        let mut many = Fixture::striped(8);
+        for parts in script {
+            let a = one.run(parts);
+            let b = many.run(parts);
+            assert_eq!(a, b, "{}", String::from_utf8_lossy(parts[0]));
+        }
+    }
+
+    /// A count and a merge over sketches that are known to be on two stripes.
+    #[test]
+    fn a_pfcount_and_a_pfmerge_reach_across_stripes() {
+        let mut f = Fixture::striped(8);
+        let other = apart(&mut f, "src");
+        let (src, far) = (b"src".as_slice(), other.as_bytes());
+
+        for i in 0..150 {
+            let ele = format!("e:{i}");
+            f.run(&[b"PFADD", src, ele.as_bytes()]);
+        }
+        for i in 150..200 {
+            let ele = format!("e:{i}");
+            f.run(&[b"PFADD", far, ele.as_bytes()]);
+        }
+        // The three numbers a real server gives for these elements, which are
+        // the numbers the single stripe tests in the keyspace crate check too.
+        assert_eq!(f.run(&[b"PFCOUNT", src]), ":151\r\n");
+        assert_eq!(f.run(&[b"PFCOUNT", far]), ":49\r\n");
+        assert_eq!(f.run(&[b"PFCOUNT", src, far]), ":199\r\n");
+
+        // A merge whose destination is on a third stripe, and then one that
+        // writes into a source.
+        let dest = apart(&mut f, &other);
+        assert_eq!(f.run(&[b"PFMERGE", dest.as_bytes(), src, far]), "+OK\r\n");
+        assert_eq!(f.run(&[b"PFCOUNT", dest.as_bytes()]), ":199\r\n");
+        assert_eq!(f.run(&[b"PFMERGE", far, src]), "+OK\r\n");
+        assert_eq!(f.run(&[b"PFCOUNT", far]), ":199\r\n", "and kept its own");
+        assert_eq!(f.run(&[b"PFCOUNT", src]), ":151\r\n", "and left the source");
     }
 }

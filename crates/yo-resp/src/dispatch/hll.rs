@@ -22,18 +22,19 @@ use super::args::{self, Args, is};
 use super::table::Spec;
 use crate::reply::Out;
 use yo_common::{Code, Error, Result};
-use yo_kv::Keyspace;
+use yo_kv::Db;
 use yo_kv::hll;
 
 /// What Redis says about a `PFDEBUG` subcommand it does not know.
 const UNKNOWN_SUB: &str = "Unknown PFDEBUG subcommand";
 
 /// Run one HyperLogLog command.
-pub(super) fn execute(db: &mut Keyspace, spec: &Spec, args: Args<'_>, out: &mut Out) -> Result<()> {
+pub(super) fn execute(db: &mut Db, spec: &Spec, args: Args<'_>, out: &mut Out) -> Result<()> {
     match spec.name {
         "pfadd" => {
             let eles = (2..args.len()).map(|i| args.get(i));
-            out.int(i64::from(db.pfadd(args.get(1), eles)?));
+            let key = args.get(1);
+            out.int(i64::from(db.at(key).pfadd(key, eles)?));
         }
         "pfcount" => {
             let keys = (1..args.len()).map(|i| args.get(i));
@@ -56,24 +57,24 @@ pub(super) fn execute(db: &mut Keyspace, spec: &Spec, args: Args<'_>, out: &mut 
 }
 
 /// `PFDEBUG subcommand key`, which is four subcommands and no more.
-fn debug(db: &mut Keyspace, args: Args<'_>, out: &mut Out) -> Result<()> {
+fn debug(db: &mut Db, args: Args<'_>, out: &mut Out) -> Result<()> {
     let (sub, key) = (args.get(1), args.get(2));
     if is(sub, b"getreg") {
         // Sixteen kibibytes of registers, filled before a byte of the reply is
         // written, since the fill can still fail on a sketch that is corrupt.
         let mut regs = [0u8; hll::REGISTERS];
-        db.pfgetreg(key, &mut regs)?;
+        db.at(key).pfgetreg(key, &mut regs)?;
         out.array(regs.len());
         for &val in &regs {
             out.int(i64::from(val));
         }
     } else if is(sub, b"decode") {
-        db.pfdecode(key, |text| out.bulk(text))?;
+        db.at(key).pfdecode(key, |text| out.bulk(text))?;
     } else if is(sub, b"encoding") {
-        let enc = db.pfencoding(key)?;
+        let enc = db.at(key).pfencoding(key)?;
         out.simple(enc.name().as_bytes());
     } else if is(sub, b"todense") {
-        out.int(i64::from(db.pftodense(key)?));
+        out.int(i64::from(db.at(key).pftodense(key)?));
     } else {
         return Err(unknown(sub));
     }

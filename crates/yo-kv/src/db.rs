@@ -57,11 +57,14 @@ pub struct Db {
     /// `stripes.len() - 1`, kept here so the hot path is a shift and an and
     /// rather than a division.
     mask: u64,
-    /// Somewhere to put a key that came from one stripe and is being handed to
-    /// a caller that is holding the whole database. [`Db::random_key`] is the
-    /// only one, and the buffer is what keeps it from allocating a key name
-    /// every time it is asked.
+    /// Somewhere to put bytes that came out of one stripe and are wanted while
+    /// another stripe is being held. A key for [`Db::random_key`], the sources
+    /// of a `BITOP` for `Db::bitop`. Every stripe has a buffer of its own for
+    /// its own work, and this is the one for work that is nobody's.
     scratch: Vec<u8>,
+    /// Where each of the things in `scratch` ends, for the callers that put
+    /// more than one thing in it.
+    rows: Vec<usize>,
 }
 
 impl Db {
@@ -79,6 +82,7 @@ impl Db {
             stripes: (0..n).map(|_| Keyspace::with_clock(clock)).collect(),
             mask: (n - 1) as u64,
             scratch: Vec::new(),
+            rows: Vec::new(),
         }
     }
 
@@ -151,6 +155,40 @@ impl Db {
     pub fn at_hashed(&mut self, hash: u64) -> &mut Keyspace {
         let i = self.stripe_of_hash(hash);
         &mut self.stripes[i]
+    }
+
+    /// The one stripe every one of `keys` is on, or `None` when they are spread
+    /// over more than one.
+    ///
+    /// This is what a command that names several keys asks first. A database of
+    /// one stripe always answers `Some(0)`, so the old path stays the path, and
+    /// a wide database answers it often enough to be worth asking: a client that
+    /// hash tags its keys the way a cluster makes it does it so that its
+    /// multi key commands land in one place, and this is that place.
+    #[must_use]
+    pub fn one_stripe<'k>(&self, mut keys: impl Iterator<Item = &'k [u8]>) -> Option<usize> {
+        let first = self.stripe_of(keys.next()?);
+        keys.all(|key| self.stripe_of(key) == first)
+            .then_some(first)
+    }
+
+    /// The two buffers a command that spans stripes builds its answer in.
+    ///
+    /// Taken out rather than lent, because everything the caller does with them
+    /// is done while holding a stripe, and a stripe is part of this database.
+    /// Whoever takes them puts them back with [`Db::put_scratch`], and that is
+    /// what makes the second run of the same command cost no allocation.
+    pub(crate) fn take_scratch(&mut self) -> (Vec<u8>, Vec<usize>) {
+        (
+            std::mem::take(&mut self.scratch),
+            std::mem::take(&mut self.rows),
+        )
+    }
+
+    /// The buffers back, ready for the next command.
+    pub(crate) fn put_scratch(&mut self, scratch: Vec<u8>, rows: Vec<usize>) {
+        self.scratch = scratch;
+        self.rows = rows;
     }
 
     /// Stripe `i`.
@@ -443,6 +481,23 @@ mod tests {
         for i in 0..1000u32 {
             assert_eq!(db.stripe_of(&i.to_le_bytes()), 0);
         }
+    }
+
+    /// The question every multi key command asks before it does anything.
+    #[test]
+    fn a_list_of_keys_is_on_one_stripe_or_it_is_not() {
+        let names: [&[u8]; 3] = [b"a", b"b", b"c"];
+        let one = Db::with_clock(Clock::system(), 1);
+        assert_eq!(one.one_stripe(names.into_iter()), Some(0));
+        assert_eq!(one.one_stripe(std::iter::empty()), None);
+
+        // Sixteen stripes and three keys, which land together about one time in
+        // two hundred and fifty and are checked here to be sure they have not.
+        let many = Db::with_clock(Clock::system(), 16);
+        assert_eq!(many.one_stripe(names.into_iter()), None);
+        let home = many.stripe_of(b"a");
+        assert_eq!(many.one_stripe(std::iter::once(&b"a"[..])), Some(home));
+        assert_eq!(many.one_stripe([&b"a"[..], b"a"].into_iter()), Some(home));
     }
 
     #[test]

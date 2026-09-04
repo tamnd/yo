@@ -27,6 +27,7 @@
 //! a debugging command and it is allowed to, but it means a client cannot look
 //! at the registers of a sparse sketch without changing it.
 
+use crate::db::Db;
 use crate::hll::{self, Encoding};
 use crate::keyspace::Keyspace;
 use crate::strings::check_len;
@@ -110,14 +111,7 @@ impl Keyspace {
         I: Iterator<Item = &'k [u8]> + Clone,
     {
         for key in keys.clone() {
-            self.reap(key);
-            self.string_only(key)?;
-            // Every sketch is read in one pass below, borrowed out of the map
-            // at the same time, so they all have to be in memory rather than in
-            // the one buffer a served fault uses. A sketch is at most twelve
-            // kibibytes and a client counting them is going to count them
-            // again, so bringing them back is what it wanted anyway.
-            self.thaw(key)?;
+            self.hll_ready(key)?;
         }
         let mut one = keys.clone();
         if let (Some(key), None) = (one.next(), one.next()) {
@@ -130,19 +124,9 @@ impl Keyspace {
         // where a write would want to build its own copy.
         let mut max = [0u8; hll::REGISTERS];
         for key in keys {
-            let Some(bytes) = self.sketch(key)? else {
-                continue;
-            };
-            let enc = hll::check(bytes)?;
-            if !hll::merge(&mut max, bytes, enc) {
-                return Err(hll::corrupt());
-            }
+            self.merge_sketch(key, &mut max)?;
         }
-        let mut hist = [0u32; 64];
-        for &val in &max {
-            hist[val as usize] += 1;
-        }
-        Ok(hll::estimate(&hist))
+        Ok(estimate(&max))
     }
 
     /// `PFMERGE dest [source ...]`.
@@ -158,14 +142,10 @@ impl Keyspace {
     where
         I: Iterator<Item = &'k [u8]> + Clone,
     {
-        self.reap(dest);
-        self.string_only(dest)?;
-        self.thaw(dest)?;
+        self.hll_ready(dest)?;
         check_len(dest, hll::DENSE)?;
         for src in srcs.clone() {
-            self.reap(src);
-            self.string_only(src)?;
-            self.thaw(src)?;
+            self.hll_ready(src)?;
         }
 
         // Every input is read before anything is written, the destination
@@ -174,16 +154,52 @@ impl Keyspace {
         let mut max = [0u8; hll::REGISTERS];
         let mut dense = false;
         for key in std::iter::once(dest).chain(srcs) {
-            let Some(bytes) = self.sketch(key)? else {
-                continue;
-            };
-            let enc = hll::check(bytes)?;
-            dense |= enc == Encoding::Dense;
-            if !hll::merge(&mut max, bytes, enc) {
-                return Err(hll::corrupt());
-            }
+            dense |= self.merge_sketch(key, &mut max)?;
         }
+        self.pfmerge_into(dest, &max, dense)
+    }
 
+    /// The three checks every one of these makes before it reads a key.
+    ///
+    /// The thaw is the one worth a sentence. Every sketch a command names is
+    /// read in one pass, all of them borrowed out of the map at once, so they
+    /// all have to be in memory rather than in the one buffer a served fault
+    /// uses. A sketch is at most twelve kibibytes and a client counting them is
+    /// going to count them again, so bringing them back is what it wanted
+    /// anyway.
+    pub(crate) fn hll_ready(&mut self, key: &[u8]) -> Result<()> {
+        self.reap(key);
+        self.string_only(key)?;
+        self.thaw(key)?;
+        Ok(())
+    }
+
+    /// Fold the sketch under `key` into `max`, saying whether it was dense.
+    ///
+    /// A key that is not there is an empty sketch, which changes no register and
+    /// is not dense. The key is expected to have been through
+    /// [`Keyspace::hll_ready`] already.
+    pub(crate) fn merge_sketch(&self, key: &[u8], max: &mut [u8; hll::REGISTERS]) -> Result<bool> {
+        let Some(bytes) = self.sketch(key)? else {
+            return Ok(false);
+        };
+        let enc = hll::check(bytes)?;
+        if !hll::merge(max, bytes, enc) {
+            return Err(hll::corrupt());
+        }
+        Ok(enc == Encoding::Dense)
+    }
+
+    /// The write half of a merge: registers in, a sketch under `dest` out.
+    ///
+    /// `dense` is whether any input was dense, which is not the same question as
+    /// whether the registers need the room.
+    pub(crate) fn pfmerge_into(
+        &mut self,
+        dest: &[u8],
+        max: &[u8; hll::REGISTERS],
+        dense: bool,
+    ) -> Result<()> {
         let mut buf = std::mem::take(&mut self.scratch);
         buf.clear();
         let deadline = match self.map.get(dest) {
@@ -344,6 +360,73 @@ impl Keyspace {
             Some(Str::Int(_)) => Err(hll::not_hll()),
         }
     }
+}
+
+impl Db {
+    /// `PFCOUNT key [key ...]` over a database of any width.
+    ///
+    /// Every key on one stripe is that one stripe's `PFCOUNT`, which is every
+    /// `PFCOUNT` on a database of one stripe and every single key one wherever
+    /// that key is. That matters more here than it does for the other multi key
+    /// commands: one key is the form that answers out of the header cache
+    /// without touching a register, and it stays that form.
+    ///
+    /// Keys on several stripes are checked first, all of them, and then merged
+    /// into one set of registers a stripe at a time. Sixteen kibibytes of
+    /// registers is the only state the merge needs, so nothing is held across
+    /// the stripes but that.
+    pub fn pfcount<'k, I>(&mut self, keys: I) -> Result<u64>
+    where
+        I: Iterator<Item = &'k [u8]> + Clone,
+    {
+        if let Some(home) = self.one_stripe(keys.clone()) {
+            return self.stripe_mut(home).pfcount(keys);
+        }
+        for key in keys.clone() {
+            self.at(key).hll_ready(key)?;
+        }
+        let mut max = [0u8; hll::REGISTERS];
+        for key in keys {
+            self.at_ref(key).merge_sketch(key, &mut max)?;
+        }
+        Ok(estimate(&max))
+    }
+
+    /// `PFMERGE dest [source ...]` over a database of any width.
+    ///
+    /// One stripe is the old path. Otherwise the checks run in the order a
+    /// single keyspace runs them, the destination first and then the sources,
+    /// so the sentence a client gets for a bad key is the sentence it would have
+    /// got, and then every input is read before the destination is written.
+    pub fn pfmerge<'k, I>(&mut self, dest: &'k [u8], srcs: I) -> Result<()>
+    where
+        I: Iterator<Item = &'k [u8]> + Clone,
+    {
+        if let Some(home) = self.one_stripe(std::iter::once(dest).chain(srcs.clone())) {
+            return self.stripe_mut(home).pfmerge(dest, srcs);
+        }
+        self.at(dest).hll_ready(dest)?;
+        check_len(dest, hll::DENSE)?;
+        for src in srcs.clone() {
+            self.at(src).hll_ready(src)?;
+        }
+
+        let mut max = [0u8; hll::REGISTERS];
+        let mut dense = false;
+        for key in std::iter::once(dest).chain(srcs) {
+            dense |= self.at_ref(key).merge_sketch(key, &mut max)?;
+        }
+        self.at(dest).pfmerge_into(dest, &max, dense)
+    }
+}
+
+/// The estimate a merged set of registers gives.
+fn estimate(max: &[u8; hll::REGISTERS]) -> u64 {
+    let mut hist = [0u32; 64];
+    for &val in max {
+        hist[val as usize] += 1;
+    }
+    hll::estimate(&hist)
 }
 
 /// What `PFDEBUG` says about a key that is not there.
