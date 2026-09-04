@@ -741,12 +741,16 @@ impl Db {
         if from == onto {
             return self.hold_stripe(from).smove(source, destination, member);
         }
-        let Some(at) = self.hold_stripe(from).set_slot(source)? else {
+        // Both at once and in stripe order, so the member is never in neither
+        // set and never in both. It was in neither for as long as it took to
+        // let go of the source and reach for the destination before this.
+        let mut held = self.hold_many([from, onto].into_iter());
+        let Some(at) = held.stripe_mut(from).set_slot(source)? else {
             return Ok(false);
         };
-        let there = self.hold_stripe(onto).set_slot(destination)?;
-        if !self
-            .hold_stripe(from)
+        let there = held.stripe_mut(onto).set_slot(destination)?;
+        if !held
+            .stripe_mut(from)
             .sets
             .get_mut(at)
             .expect("the record points at its body")
@@ -755,7 +759,7 @@ impl Db {
             return Ok(false);
         }
 
-        let mut dest = self.hold_stripe(onto);
+        let dest = held.stripe_mut(onto);
         let limits = dest.limits;
         let into = match there {
             Some(into) => into,
@@ -766,7 +770,7 @@ impl Db {
             .expect("the record points at its body")
             .add(member, &limits);
 
-        let mut src = self.hold_stripe(from);
+        let src = held.stripe_mut(from);
         if src.set_at(at).is_empty() {
             src.drop_key(source);
         }
@@ -786,19 +790,17 @@ impl Db {
         if let Some(home) = self.one_stripe(keys.clone()) {
             return self.hold_stripe(home).sinter(keys, limit, f);
         }
-        let slots = self.set_slots(keys)?;
-        if slots.is_empty() || slots.iter().any(Option::is_none) {
-            return Ok(0);
-        }
         // The buffers before the stripes, which is the order every command
         // that wants both takes them in.
         let mut spare = self.spare();
         let scratch = &mut spare.setops;
-        let held = self.hold_slots(&slots);
+        let mut held = self.hold_sets(keys.clone(), None);
+        let slots = self.set_slots(&mut held, keys)?;
+        if slots.is_empty() || slots.iter().any(Option::is_none) {
+            return Ok(0);
+        }
         let sets = bodies_of(&held, &slots);
-        let n = setops::inter(scratch, &sets, limit, f);
-        drop(held);
-        Ok(n)
+        Ok(setops::inter(scratch, &sets, limit, f))
     }
 
     /// `SINTERCARD numkeys key [key ...] [LIMIT limit]`.
@@ -823,16 +825,14 @@ impl Db {
         if let Some(home) = self.one_stripe(keys.clone()) {
             return self.hold_stripe(home).sunion(keys, limit, f);
         }
-        let slots = self.set_slots(keys)?;
         // The buffers before the stripes, which is the order every command
         // that wants both takes them in.
         let mut spare = self.spare();
         let scratch = &mut spare.setops;
-        let held = self.hold_slots(&slots);
+        let mut held = self.hold_sets(keys.clone(), None);
+        let slots = self.set_slots(&mut held, keys)?;
         let sets = bodies_of(&held, &slots);
-        let n = setops::union(scratch, &sets, limit, f);
-        drop(held);
-        Ok(n)
+        Ok(setops::union(scratch, &sets, limit, f))
     }
 
     /// `SUNIONCARD numkeys key [key ...] [LIMIT limit]`.
@@ -857,11 +857,11 @@ impl Db {
         if let Some(home) = self.one_stripe(keys.clone()) {
             return self.hold_stripe(home).sdiff(keys, limit, f);
         }
-        let slots = self.set_slots(keys)?;
+        let mut held = self.hold_sets(keys.clone(), None);
+        let slots = self.set_slots(&mut held, keys)?;
         let Some(Some(_)) = slots.first() else {
             return Ok(0);
         };
-        let held = self.hold_slots(&slots);
         let sets = bodies_of(&held, &slots);
         Ok(setops::diff(&sets, limit, f))
     }
@@ -889,23 +889,24 @@ impl Db {
         if let Some(home) = self.one_stripe(std::iter::once(destination).chain(keys.clone())) {
             return self.hold_stripe(home).sinterstore(destination, keys);
         }
-        let slots = self.set_slots(keys)?;
         // The buffers before the stripes, which is the order every command
         // that wants both takes them in.
         let mut spare = self.spare();
         let scratch = &mut spare.setops;
+        let onto = self.stripe_of(destination);
+        let mut held = self.hold_sets(keys.clone(), Some(destination));
+        let slots = self.set_slots(&mut held, keys)?;
         let built = if slots.is_empty() || slots.iter().any(Option::is_none) {
             None
         } else {
-            let limits = self.hold(destination).limits;
-            let held = self.hold_slots(&slots);
+            let limits = held.stripe(onto).limits;
             let sets = bodies_of(&held, &slots);
             let upper = sets.iter().map(|s| s.len()).min().unwrap_or(0);
             setops::collect(upper, &limits, |f| {
                 setops::inter(scratch, &sets, 0, f);
             })
         };
-        Ok(self.hold(destination).put_set(destination, built))
+        Ok(held.stripe_mut(onto).put_set(destination, built))
     }
 
     /// `SUNIONSTORE destination key [key ...]`.
@@ -917,21 +918,22 @@ impl Db {
         if let Some(home) = self.one_stripe(std::iter::once(destination).chain(keys.clone())) {
             return self.hold_stripe(home).sunionstore(destination, keys);
         }
-        let slots = self.set_slots(keys)?;
         // The buffers before the stripes, which is the order every command
         // that wants both takes them in.
         let mut spare = self.spare();
         let scratch = &mut spare.setops;
+        let onto = self.stripe_of(destination);
+        let mut held = self.hold_sets(keys.clone(), Some(destination));
+        let slots = self.set_slots(&mut held, keys)?;
         let built = {
-            let limits = self.hold(destination).limits;
-            let held = self.hold_slots(&slots);
+            let limits = held.stripe(onto).limits;
             let sets = bodies_of(&held, &slots);
             let upper = sets.iter().map(|s| s.len()).sum();
             setops::collect(upper, &limits, |f| {
                 setops::union(scratch, &sets, 0, f);
             })
         };
-        Ok(self.hold(destination).put_set(destination, built))
+        Ok(held.stripe_mut(onto).put_set(destination, built))
     }
 
     /// `SDIFFSTORE destination key [key ...]`.
@@ -943,11 +945,12 @@ impl Db {
         if let Some(home) = self.one_stripe(std::iter::once(destination).chain(keys.clone())) {
             return self.hold_stripe(home).sdiffstore(destination, keys);
         }
-        let slots = self.set_slots(keys)?;
+        let onto = self.stripe_of(destination);
+        let mut held = self.hold_sets(keys.clone(), Some(destination));
+        let slots = self.set_slots(&mut held, keys)?;
         let built = match slots.first() {
             Some(Some(_)) => {
-                let limits = self.hold(destination).limits;
-                let held = self.hold_slots(&slots);
+                let limits = held.stripe(onto).limits;
                 let sets = bodies_of(&held, &slots);
                 let upper = sets[0].len();
                 setops::collect(upper, &limits, |f| {
@@ -956,7 +959,24 @@ impl Db {
             }
             _ => None,
         };
-        Ok(self.hold(destination).put_set(destination, built))
+        Ok(held.stripe_mut(onto).put_set(destination, built))
+    }
+
+    /// Every stripe a set operation names, held at once, in stripe order.
+    ///
+    /// Before anything is resolved rather than after, because a slot number is
+    /// only good while the stripe it came from is held: let go of it and the key
+    /// can be deleted and the slot handed to something else, and what was read
+    /// back would be a different set under the same number. Taken in stripe
+    /// order, which is what keeps two of these from waiting on each other.
+    #[inline]
+    fn hold_sets<'k>(
+        &self,
+        keys: impl Iterator<Item = &'k [u8]>,
+        destination: Option<&[u8]>,
+    ) -> Holds<'_> {
+        let named = keys.map(|key| self.stripe_of(key));
+        self.hold_many(named.chain(destination.map(|d| self.stripe_of(d))))
     }
 
     /// Reap and resolve every key, in order, to the stripe and slot its set is
@@ -964,29 +984,20 @@ impl Db {
     ///
     /// As [`Keyspace::set_slots`], including the part that matters most: the
     /// first key holding something that is not a set stops the whole command
-    /// before anything has been written. Each key is resolved on its own stripe,
-    /// which is the only difference.
-    fn set_slots<'k>(&self, keys: impl Iterator<Item = &'k [u8]>) -> Result<PerSet<Option<Home>>> {
+    /// before anything has been written. Each key is resolved on the stripe it
+    /// is on, out of the ones already held, which is the only difference.
+    fn set_slots<'k>(
+        &self,
+        held: &mut Holds<'_>,
+        keys: impl Iterator<Item = &'k [u8]>,
+    ) -> Result<PerSet<Option<Home>>> {
         let mut out = PerSet::new();
         for key in keys {
             let stripe = self.stripe_of(key);
-            let at = self.hold_stripe(stripe).set_slot(key)?;
+            let at = held.stripe_mut(stripe).set_slot(key)?;
             out.push(at.map(|at| (stripe, at)));
         }
         Ok(out)
-    }
-
-    /// Every stripe those slots name, held at once.
-    ///
-    /// This is the whole reason the resolving above happens first: reaping a
-    /// key needs its stripe mutably, reading a body needs it held, and an
-    /// operation over four keys on four stripes needs all four at the same
-    /// time. Nothing else of this database is held while these are, and they
-    /// are taken in stripe order, which is what keeps two of these from waiting
-    /// on each other.
-    #[inline]
-    fn hold_slots(&self, slots: &[Option<Home>]) -> Holds<'_> {
-        self.hold_many(slots.iter().flatten().map(|&(stripe, _)| stripe))
     }
 }
 

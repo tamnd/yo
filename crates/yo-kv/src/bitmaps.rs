@@ -426,11 +426,13 @@ impl Db {
     /// `BITOP` on a database of one stripe and every `BITOP` whose keys were
     /// hash tagged into the same place. That path is the old one, byte for byte.
     ///
-    /// The rest is the same work with the reads spread out. The sources are
-    /// copied out of the stripes they are on, one at a time, into a buffer this
-    /// database owns rather than one a stripe owns, since no stripe can be held
-    /// while the next one is being read. They are combined there and the result
-    /// is written to whichever stripe the destination is on.
+    /// The rest is the same work with the reads spread out. Every stripe the
+    /// command names is held for the whole of it, the sources are copied into a
+    /// buffer this database owns rather than one a stripe owns, and they are
+    /// combined there and written to whichever stripe the destination is on.
+    /// Held together rather than one after the other, because an operand that
+    /// was written to after it had been read would leave a result that no
+    /// arrangement of these keys ever had.
     ///
     /// # Panics
     ///
@@ -442,13 +444,6 @@ impl Db {
         if let Some(home) = self.one_stripe(std::iter::once(dest).chain(srcs.clone())) {
             return self.hold_stripe(home).bitop(op, dest, srcs);
         }
-        for src in srcs.clone() {
-            let mut stripe = self.hold(src);
-            stripe.reap(src);
-            stripe.string_only(src)?;
-            stripe.thaw(src)?;
-        }
-
         // The buffers before the stripes, which is the order every command that
         // wants both takes them in.
         let mut spare = self.spare();
@@ -456,13 +451,18 @@ impl Db {
         let (flat, ends) = (&mut spare.bytes, &mut spare.rows);
         flat.clear();
         ends.clear();
+        let onto = self.stripe_of(dest);
+        let mut held = self
+            .hold_many(std::iter::once(onto).chain(srcs.clone().map(|src| self.stripe_of(src))));
+        for src in srcs.clone() {
+            let stripe = held.stripe_mut(self.stripe_of(src));
+            stripe.reap(src);
+            stripe.string_only(src)?;
+            stripe.thaw(src)?;
+        }
         let mut digits = [0u8; DIGITS_MAX];
         for src in srcs.clone() {
-            // The stripe is held for the copy and given back before the next
-            // source is looked at, so two sources on one stripe are two holds
-            // one after the other rather than a wait for ourselves.
-            let held = self.hold(src);
-            let bytes = held.bitmap(src, &mut digits);
+            let bytes = held.stripe(self.stripe_of(src)).bitmap(src, &mut digits);
             flat.extend_from_slice(bytes);
             ends.push(flat.len());
         }
@@ -477,10 +477,10 @@ impl Db {
         bits::combine(op, parts(read, ends), write);
 
         if len == 0 {
-            self.hold(dest).del(dest);
+            held.stripe_mut(onto).del(dest);
             return Ok(0);
         }
-        let mut stripe = self.hold(dest);
+        let stripe = held.stripe_mut(onto);
         stripe.reap(dest);
         stripe.string_only(dest)?;
         stripe.store_raw(dest, &flat[split..], None);

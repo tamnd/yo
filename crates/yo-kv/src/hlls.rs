@@ -371,10 +371,11 @@ impl Db {
     /// commands: one key is the form that answers out of the header cache
     /// without touching a register, and it stays that form.
     ///
-    /// Keys on several stripes are checked first, all of them, and then merged
-    /// into one set of registers a stripe at a time. Sixteen kibibytes of
-    /// registers is the only state the merge needs, so nothing is held across
-    /// the stripes but that.
+    /// Keys on several stripes are taken together, checked, and then merged
+    /// into one set of registers. Together rather than one after the other,
+    /// because a count over four keys is one answer about four keys and a key
+    /// that was added to while the merge walked past it would make it an answer
+    /// about no moment at all.
     pub fn pfcount<'k, I>(&self, keys: I) -> Result<u64>
     where
         I: Iterator<Item = &'k [u8]> + Clone,
@@ -382,22 +383,26 @@ impl Db {
         if let Some(home) = self.one_stripe(keys.clone()) {
             return self.hold_stripe(home).pfcount(keys);
         }
+        let mut held = self.hold_many(keys.clone().map(|key| self.stripe_of(key)));
         for key in keys.clone() {
-            self.hold(key).hll_ready(key)?;
+            held.stripe_mut(self.stripe_of(key)).hll_ready(key)?;
         }
         let mut max = [0u8; hll::REGISTERS];
         for key in keys {
-            self.hold(key).merge_sketch(key, &mut max)?;
+            held.stripe(self.stripe_of(key))
+                .merge_sketch(key, &mut max)?;
         }
         Ok(estimate(&max))
     }
 
     /// `PFMERGE dest [source ...]` over a database of any width.
     ///
-    /// One stripe is the old path. Otherwise the checks run in the order a
-    /// single keyspace runs them, the destination first and then the sources,
-    /// so the sentence a client gets for a bad key is the sentence it would have
-    /// got, and then every input is read before the destination is written.
+    /// One stripe is the old path. Otherwise every stripe the command names is
+    /// held for the whole of it and the checks run in the order a single
+    /// keyspace runs them, the destination first and then the sources, so the
+    /// sentence a client gets for a bad key is the sentence it would have got.
+    /// Then every input is read and the destination is written, with no moment
+    /// in the middle where a source could be added to after it was read.
     pub fn pfmerge<'k, I>(&self, dest: &'k [u8], srcs: I) -> Result<()>
     where
         I: Iterator<Item = &'k [u8]> + Clone,
@@ -405,18 +410,23 @@ impl Db {
         if let Some(home) = self.one_stripe(std::iter::once(dest).chain(srcs.clone())) {
             return self.hold_stripe(home).pfmerge(dest, srcs);
         }
-        self.hold(dest).hll_ready(dest)?;
+        let onto = self.stripe_of(dest);
+        let mut held = self
+            .hold_many(std::iter::once(onto).chain(srcs.clone().map(|src| self.stripe_of(src))));
+        held.stripe_mut(onto).hll_ready(dest)?;
         check_len(dest, hll::DENSE)?;
         for src in srcs.clone() {
-            self.hold(src).hll_ready(src)?;
+            held.stripe_mut(self.stripe_of(src)).hll_ready(src)?;
         }
 
         let mut max = [0u8; hll::REGISTERS];
         let mut dense = false;
         for key in std::iter::once(dest).chain(srcs) {
-            dense |= self.hold(key).merge_sketch(key, &mut max)?;
+            dense |= held
+                .stripe(self.stripe_of(key))
+                .merge_sketch(key, &mut max)?;
         }
-        self.hold(dest).pfmerge_into(dest, &max, dense)
+        held.stripe_mut(onto).pfmerge_into(dest, &max, dense)
     }
 }
 
