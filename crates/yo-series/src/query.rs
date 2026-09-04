@@ -254,7 +254,7 @@ impl Rows {
     }
 
     /// Turn the rows around, which is all a read backwards is.
-    fn flip(&mut self) {
+    pub fn flip(&mut self) {
         self.stamps.reverse();
         if self.width == 1 {
             self.values.reverse();
@@ -268,7 +268,7 @@ impl Rows {
     }
 
     /// Drop everything past the first `n` rows.
-    fn keep(&mut self, n: usize) {
+    pub fn keep(&mut self, n: usize) {
         if n < self.stamps.len() {
             self.stamps.truncate(n);
             self.values.truncate(n * self.width);

@@ -1,12 +1,13 @@
 //! `TS.*`, the time series family RedisTimeSeries put on the wire.
 //!
 //! The series itself is in `yo-series` and this is the wire in front of it, the
-//! same split as `super::cms` and the other module families. Sixteen commands
-//! here: the key type, the two that shape a series, the four that write samples
-//! into it, the one that takes the newest sample back out, the one that reports
-//! on it, the two that read a span back either way round, the three that search
-//! on labels and the two that read a span out of every series at once. The
-//! compaction rules come next.
+//! same split as `super::cms` and the other module families. Twenty one
+//! commands here: the two that shape a series, the four that write samples into
+//! it, the one that cuts a span back out, the one that takes the newest sample,
+//! the one that reports on it, the two that read a span back either way round,
+//! the three the 8.10 release added for reading several series at once, the
+//! three that search on labels, the two that read a span out of every matching
+//! series and the two that set up and take down a compaction rule.
 //!
 //! # Errors
 //!
@@ -163,6 +164,46 @@
 //! `reducers` and `sources`, and leaves the labels holding only the pair the
 //! group was made on. A `SELECTED_LABELS` on a group is looked up against that
 //! one pair, so any other name comes back against a nil.
+//!
+//! # The joined reads
+//!
+//! `TS.NRANGE` and `TS.NREVRANGE` arrived in 8.10 and are the single key read
+//! again, this time over a list of keys written behind a count, with the rows
+//! lined up on the timestamp. A row is the timestamp and then one nested array
+//! holding a reading for every column, in the order the keys were named, and a
+//! key with no reading at a timestamp another key does have one at contributes a
+//! not a number there. That nesting is the only shape in the family that is not
+//! the flat pair, and it holds even when only one key was named. The same key
+//! twice is allowed and answers twice.
+//!
+//! Because the keys sit behind a count the two are `movablekeys` and `COMMAND
+//! GETKEYS` reads the count to find them, which is the same branch `MSETEX`
+//! uses.
+//!
+//! An `AGGREGATION` here names one reduction for every key and then the one
+//! bucket width, and each of those names may be a comma list, so a row can be
+//! wider than the key count. Everything behind the width, meaning `EMPTY` and
+//! `BUCKETTIMESTAMP`, is measured from the width slot rather than from the
+//! keyword, so the single key placement rules simply shift along as keys are
+//! added.
+//!
+//! Two orderings had to be measured rather than assumed. The reduction names are
+//! read before the two ends of the span, unlike every other option, so a command
+//! with both a bad timestamp and a bad reduction name answers about the name.
+//! And `COUNT` applies to the joined rows rather than to each key, so every
+//! series is read forward and in full, the join is built, and only then is it
+//! turned around and cut.
+//!
+//! With exactly one key none of the reduction name checking applies at all and
+//! the plain single key parser runs instead, which is why `AGGREGATION 100`
+//! reads as a missing width there and as a count mismatch as soon as there are
+//! two keys.
+//!
+//! `TS.READ` came with them and is the smallest read in the family: a key, one
+//! timestamp, and every sample from there to the end. A dash means from the
+//! beginning and a plus means the last sample only. It takes no options, has no
+//! cap on how many rows come back, and is the one command here that answers the
+//! server's own bare `WRONGTYPE` instead of the module's prefixed sentence.
 //!
 //! # Compaction rules
 //!
@@ -395,6 +436,19 @@ const BAD_ALIGN_STAMP: &[u8] = b"TSDB: Couldn't parse alignTimestamp";
 /// A third word on `TS.GET` that is not `LATEST`.
 const THIRD_WORD: &[u8] = b"TSDB: wrong 3rd argument";
 
+/// A joined read whose key count is missing, is not a whole number or is not
+/// above zero.
+const BAD_NUMKEYS: &[u8] = b"TSDB: numkeys must be a positive integer";
+
+/// An `AGGREGATION` on a joined read that does not name one reduction for every
+/// key it was given.
+const AGG_NUMKEYS: &[u8] = b"TSDB: the number of AGGREGATION arguments must be equal to numkeys";
+
+/// A `TS.READ` whose one timestamp is neither end of the series nor a timestamp
+/// at or above zero. It goes out with nothing in front of it, the way the two
+/// bare sentences above do.
+const BAD_READ_AT: &[u8] = b"TSDB: invalid timestamp";
+
 /// A multi key range read with no `FILTER` anywhere in it.
 const MISSING_FILTER: &[u8] = b"TSDB: missing FILTER argument";
 
@@ -490,6 +544,9 @@ pub(super) fn execute(db: &mut Keyspace, spec: &Spec, args: Args<'_>, out: &mut 
         "ts.get" => get(db, &args, out),
         "ts.range" => range(db, &args, out, false),
         "ts.revrange" => range(db, &args, out, true),
+        "ts.nrange" => nrange(db, &args, out, false),
+        "ts.nrevrange" => nrange(db, &args, out, true),
+        "ts.read" => tail(db, &args, out),
         "ts.queryindex" => queryindex(db, &args, out),
         "ts.querylabels" => querylabels(db, &args, out),
         "ts.mget" => mget(db, &args, out),
@@ -774,8 +831,182 @@ fn range(db: &mut Keyspace, args: &Args<'_>, out: &mut Out, reverse: bool) -> Re
     Ok(())
 }
 
+/// `TS.NRANGE numkeys key [key ...] from to [LATEST] [FILTER_BY_TS ts ...]
+/// [FILTER_BY_VALUE min max] [COUNT n] [[ALIGN a] AGGREGATION spec ... width
+/// [BUCKETTIMESTAMP b] [EMPTY]]` and `TS.NREVRANGE`, which read the same span
+/// out of several named series and line the answers up on their timestamps.
+///
+/// Every timestamp any of the series answered gets one row, with each series
+/// contributing the numbers it was asked for and a NaN for each of them when it
+/// answered nothing at that timestamp. `COUNT` is taken off the joined rows and
+/// not off each series, so a count of one is one row and not one row a key.
+///
+/// The checks run in an order of their own again: the key count, then the arity
+/// the key count implies, then the reduction names, then the two ends of the
+/// span, then the rest of the options, then the keys. Only the names come out in
+/// front of the span, which is why they are read here and then read again below
+/// with everything else.
+fn nrange(db: &mut Keyspace, args: &Args<'_>, out: &mut Out, reverse: bool) -> Result<()> {
+    let name = if reverse { "ts.nrevrange" } else { "ts.nrange" };
+    let Some(keys) = parse_i64(args.get(1))
+        .filter(|&n| n > 0)
+        .and_then(|n| usize::try_from(n).ok())
+    else {
+        return say(out, BAD_NUMKEYS);
+    };
+    // The span sits behind the keys, and a command with no room for both ends of
+    // it is an arity error however many keys it named.
+    let span = 2 + keys;
+    if span + 1 >= args.len() {
+        return Err(args::wrong_arity(name));
+    }
+    if keys > 1
+        && let Some(at) = find_from(args, span + 1, b"AGGREGATION")
+        && let Err(bad) = agg_lists(args, at, keys)
+    {
+        return said(bad, name, out);
+    }
+    let (query, lists) = match reading_keys(args, reverse, span, keys) {
+        Ok(read) => read,
+        Err(bad) => return said(bad, name, out),
+    };
+    for i in 0..keys {
+        if read(db, args.get(2 + i))?.is_none() {
+            return say(out, MISSING);
+        }
+    }
+
+    let latest = find_from(args, span + 1, b"LATEST").is_some();
+    let mut taken = Vec::with_capacity(keys);
+    for (i, list) in lists.iter().enumerate() {
+        let key = args.get(2 + i).to_vec();
+        let open = if latest { open_bucket(db, &key)? } else { None };
+        // Each series is read oldest first and without the count, because the
+        // rows are turned around and cut down after they have been lined up.
+        let mut one = Query {
+            reverse: false,
+            count: None,
+            latest: open,
+            ..query.clone()
+        };
+        if let Some(buckets) = one.buckets.as_mut() {
+            buckets.aggs.clone_from(list);
+        }
+        let body = read(db, &key)?.expect("the series was there a moment ago");
+        match body.s.read(&one) {
+            Ok(rows) => taken.push(rows),
+            Err(Unread::TooWide) => return say(out, TOO_WIDE),
+        }
+    }
+
+    let mut rows = join(&taken);
+    if reverse {
+        rows.flip();
+    }
+    if let Some(n) = query.count {
+        rows.keep(n);
+    }
+    columns(out, &rows);
+    Ok(())
+}
+
+/// Several reads lined up on their timestamps.
+///
+/// The reads are all oldest first here, so this is one cursor into each of them
+/// and one pass: the oldest timestamp any cursor is looking at is the next row,
+/// every read sitting on it hands over its numbers and steps forward, and every
+/// read that is not fills its share of the row with NaN.
+fn join(taken: &[Rows]) -> Rows {
+    let width = taken.iter().map(|rows| rows.width).sum();
+    let mut rows = Rows {
+        width,
+        ..Rows::default()
+    };
+    let mut at = vec![0usize; taken.len()];
+    while let Some(now) = taken
+        .iter()
+        .zip(&at)
+        .filter_map(|(one, &i)| one.stamps.get(i).copied())
+        .min()
+    {
+        rows.stamps.push(now);
+        for (k, one) in taken.iter().enumerate() {
+            if one.stamps.get(at[k]) == Some(&now) {
+                rows.values.extend_from_slice(one.row(at[k]));
+                at[k] += 1;
+            } else {
+                rows.values
+                    .extend(core::iter::repeat_n(f64::NAN, one.width));
+            }
+        }
+    }
+    rows
+}
+
+/// `TS.READ key from`, every sample from a timestamp to the end of the series.
+///
+/// The arity in the table is `-3` and the module answers a wrong arity to
+/// anything longer than three words, so the second half of that is checked here.
+/// Two of its answers are unlike the rest of the family: a key that is not there
+/// answers an empty array rather than a sentence, and a key holding something
+/// else answers the server's own bare `WRONGTYPE` rather than the module's
+/// prefixed one, because this command lets the server report the type where the
+/// others write their own sentence about it.
+fn tail(db: &mut Keyspace, args: &Args<'_>, out: &mut Out) -> Result<()> {
+    if args.len() != 3 {
+        return Err(args::wrong_arity("ts.read"));
+    }
+    let word = args.get(2);
+    let newest = word == b"+";
+    let from = if word == b"-" || newest {
+        0
+    } else {
+        match parse_i64(word).filter(|&n| n >= 0) {
+            Some(at) => at,
+            None => return said(Bad::Bare(BAD_READ_AT), "ts.read", out),
+        }
+    };
+    let Some(body) = bare_read(db, args.get(1))? else {
+        out.array(0);
+        return Ok(());
+    };
+    // The far end of the series is the last sample and not a timestamp, so it is
+    // looked up rather than parsed, and a series holding nothing has no far end
+    // to look up.
+    let from = match (newest, body.s.last_sample()) {
+        (true, None) => {
+            out.array(0);
+            return Ok(());
+        }
+        (true, Some(last)) => last.at,
+        (false, _) => from,
+    };
+    let query = Query {
+        from,
+        to: i64::MAX,
+        ..Query::default()
+    };
+    let rows = body
+        .s
+        .read(&query)
+        .expect("a read with no buckets fills no gaps");
+    spread(out, &rows);
+    Ok(())
+}
+
 /// Everything a read asked for, gathered off the command.
 fn reading(args: &Args<'_>, reverse: bool, at: usize) -> core::result::Result<Query, Bad> {
+    reading_keys(args, reverse, at, 1).map(|(query, _)| query)
+}
+
+/// The same for a read over `keys` series, which names one reduction list a key
+/// where a single key read names one.
+fn reading_keys(
+    args: &Args<'_>,
+    reverse: bool,
+    at: usize,
+    keys: usize,
+) -> core::result::Result<(Query, Vec<Vec<Agg>>), Bad> {
     let opts = at + 1;
     // Which end was written open matters later: an alignment against an end
     // that was never named is an error, and only the one character counts as
@@ -792,8 +1023,12 @@ fn reading(args: &Args<'_>, reverse: bool, at: usize) -> core::result::Result<Qu
     // LATEST comes first in the module and means read through to the compaction
     // rule that feeds this series. Nothing has rules yet, so it is read for the
     // order of the errors around it and then dropped.
-    let count = count_of(args, opts)?;
-    let mut buckets = buckets_of(args, opts)?;
+    let count = count_of(args, opts, keys)?;
+    let read = buckets_of(args, opts, keys)?;
+    let lists = read
+        .as_ref()
+        .map_or_else(|| vec![Vec::new(); keys], |(_, lists)| lists.clone());
+    let mut buckets = read.map(|(buckets, _)| buckets);
     if let Some(align) = align_of(
         args,
         opts,
@@ -806,33 +1041,37 @@ fn reading(args: &Args<'_>, reverse: bool, at: usize) -> core::result::Result<Qu
     {
         buckets.align = align;
     }
-    Ok(Query {
-        from,
-        to,
-        reverse,
-        count,
-        by_ts: by_ts(args, opts)?,
-        by_value: by_value(args, opts)?,
-        buckets,
-        latest: None,
-    })
+    Ok((
+        Query {
+            from,
+            to,
+            reverse,
+            count,
+            by_ts: by_ts(args, opts)?,
+            by_value: by_value(args, opts)?,
+            buckets,
+            latest: None,
+        },
+        lists,
+    ))
 }
 
 /// How many rows at most, if the read said.
 ///
 /// A `COUNT` sitting where a reduction name or a reducer name goes is that name
-/// and not the keyword, so the scan starts again past it. Two of those in a row
-/// is possible, which is why this is written twice.
-fn count_of(args: &Args<'_>, opts: usize) -> core::result::Result<Option<usize>, Bad> {
+/// and not the keyword, so the scan starts again past it. A joined read names
+/// one reduction a key, so there are that many slots behind `AGGREGATION` to
+/// step over rather than one, and a reducer is one more slot after that.
+fn count_of(args: &Args<'_>, opts: usize, keys: usize) -> core::result::Result<Option<usize>, Bad> {
     let Some(mut at) = find_from(args, opts, b"COUNT") else {
         return Ok(None);
     };
-    for word in [b"AGGREGATION".as_slice(), b"REDUCE".as_slice()] {
-        if find_from(args, opts, word) == Some(at - 1) {
-            match find_from(args, at + 1, b"COUNT") {
-                Some(next) => at = next,
-                None => return Ok(None),
-            }
+    while find_from(args, opts, b"AGGREGATION").is_some_and(|agg| at > agg && at <= agg + keys)
+        || find_from(args, opts, b"REDUCE") == Some(at - 1)
+    {
+        match find_from(args, at + 1, b"COUNT") {
+            Some(next) => at = next,
+            None => return Ok(None),
         }
     }
     if at + 1 == args.len() {
@@ -847,6 +1086,10 @@ fn count_of(args: &Args<'_>, opts: usize) -> core::result::Result<Option<usize>,
     Ok(Some(usize::try_from(n).unwrap_or(usize::MAX)))
 }
 
+/// How a read is cut into buckets, and the reduction list every key it names was
+/// given. A single key read has one list and a joined read has one a key.
+type Bucketing = (Buckets, Vec<Vec<Agg>>);
+
 /// How the read is cut into buckets, if it asked to be.
 ///
 /// `EMPTY` and `BUCKETTIMESTAMP` are only looked for when there is an
@@ -854,39 +1097,45 @@ fn count_of(args: &Args<'_>, opts: usize) -> core::result::Result<Option<usize>,
 /// behind it. That is not a grammar, it is a pair of arithmetic checks against
 /// where the keyword was found, and a command that puts the words in the
 /// documented order passes both.
-fn buckets_of(args: &Args<'_>, opts: usize) -> core::result::Result<Option<Buckets>, Bad> {
+fn buckets_of(
+    args: &Args<'_>,
+    opts: usize,
+    keys: usize,
+) -> core::result::Result<Option<Bucketing>, Bad> {
     let Some(at) = find_from(args, opts, b"AGGREGATION") else {
         return Ok(None);
     };
-    if at + 2 >= args.len() {
+    // One name a key and then the width, so the width moves along as the keys
+    // are added and the two flags behind it move with it.
+    let width = at + 1 + keys;
+    if width >= args.len() {
         return Err(Bad::Said(BAD_AGGREGATION));
     }
-    let spec = args.get(at + 1);
-    let Some(delta) = parse_i64(args.get(at + 2)) else {
+    let Some(delta) = parse_i64(args.get(width)) else {
         return Err(Bad::Said(BAD_AGGREGATION));
     };
-    // The list is read before the width is looked at, so a bad name on a zero
+    // The names are read before the width is looked at, so a bad name on a zero
     // width bucket answers about the name.
-    let aggs = reductions(spec)?;
+    let lists = agg_lists(args, at, keys)?;
     if delta <= 0 {
         return Err(Bad::Said(BAD_BUCKET));
     }
 
     let mut buckets = Buckets {
-        aggs,
+        aggs: lists[0].clone(),
         delta,
         align: 0,
         empty: false,
         stamp: Stamp::Start,
     };
     if let Some(flag) = find_from(args, opts, b"EMPTY") {
-        if flag != at + 3 && flag != at + 5 {
+        if flag != width + 1 && flag != width + 3 {
             return Err(Bad::Said(EMPTY_PLACE));
         }
         buckets.empty = true;
     }
     if let Some(flag) = find_from(args, opts, b"BUCKETTIMESTAMP") {
-        if flag != at + 3 && flag != at + 4 {
+        if flag != width + 1 && flag != width + 2 {
             return Err(Bad::Said(BUCKET_TS_PLACE));
         }
         if flag + 1 >= args.len() {
@@ -903,7 +1152,42 @@ fn buckets_of(args: &Args<'_>, opts: usize) -> core::result::Result<Option<Bucke
             return Err(Bad::Said(BAD_BUCKET_TS));
         };
     }
-    Ok(Some(buckets))
+    Ok(Some((buckets, lists)))
+}
+
+/// The reduction list every key of a joined read was given, which is one word a
+/// key in front of the bucket width.
+///
+/// A single key read is the plain grammar and none of the counting below applies
+/// to it: one word, whatever it holds, and then the width. Past one key the
+/// module counts what it was given, and it counts by what the words look like. A
+/// whole number where a name goes is the bucket width arriving early and means
+/// the command named fewer reductions than it has keys, a name where the width
+/// goes means it named more, and both of those are the one sentence about the
+/// count. A word in a name slot that is neither a number nor a reduction is
+/// about the name instead, which is why a name that is simply wrong answers
+/// differently from one that is missing.
+fn agg_lists(args: &Args<'_>, at: usize, keys: usize) -> core::result::Result<Vec<Vec<Agg>>, Bad> {
+    if keys == 1 {
+        return Ok(vec![reductions(args.get(at + 1))?]);
+    }
+    let mut lists = Vec::with_capacity(keys);
+    for i in 0..keys {
+        let Some(word) = args.opt(at + 1 + i) else {
+            return Err(Bad::Said(AGG_NUMKEYS));
+        };
+        if parse_i64(word).is_some() {
+            return Err(Bad::Said(AGG_NUMKEYS));
+        }
+        lists.push(reductions(word)?);
+    }
+    if args
+        .opt(at + 1 + keys)
+        .is_some_and(|word| reductions(word).is_ok())
+    {
+        return Err(Bad::Said(AGG_NUMKEYS));
+    }
+    Ok(lists)
 }
 
 /// The reduction list, which is one name or several separated by commas.
@@ -1721,6 +2005,24 @@ fn spread(out: &mut Out, rows: &Rows) {
     }
 }
 
+/// The same rows the way a joined read writes them, which is the timestamp and
+/// then one nested array holding a reading for every column.
+///
+/// A single sample read writes the timestamp and the one value side by side, so
+/// the two shapes are not the same even when a joined read was given one key.
+fn columns(out: &mut Out, rows: &Rows) {
+    out.array(rows.len());
+    for i in 0..rows.len() {
+        let row = rows.row(i);
+        out.array(2);
+        out.int(rows.stamps[i]);
+        out.array(row.len());
+        for &d in row {
+            value(out, d);
+        }
+    }
+}
+
 /// `TS.CREATERULE source dest AGGREGATION reduction bucket [align]`, which sets
 /// a series to be folded into another one as it is written to.
 ///
@@ -2478,6 +2780,19 @@ fn write<'d>(db: &'d mut Keyspace, key: &[u8]) -> Result<Option<&'d mut TsBody>>
         Ok(None) => Ok(None),
         Err(e) if e.code() == Code::WrongType => Err(wrong_kind()),
         Err(e) => Err(e),
+    }
+}
+
+/// The same again, with the server's own bare `WRONGTYPE` for a key holding
+/// something else rather than the module's prefixed sentence, which is what
+/// `TS.READ` answers and the only place in the family that does.
+fn bare_read<'d>(db: &'d mut Keyspace, key: &[u8]) -> Result<Option<&'d TsBody>> {
+    match db.foreign(key)? {
+        Some(body) => match body.downcast_ref::<TsBody>() {
+            Some(body) => Ok(Some(body)),
+            None => Err(yo_kv::keyspace::wrong_type()),
+        },
+        None => Ok(None),
     }
 }
 
