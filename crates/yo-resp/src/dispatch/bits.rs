@@ -26,7 +26,7 @@ use yo_common::num::parse_i64;
 use yo_common::{Code, Error, Result};
 use yo_kv::bitmaps::{Sub, SubOp, Unit};
 use yo_kv::bits::{Field, Op, Overflow};
-use yo_kv::{Keyspace, bitmaps};
+use yo_kv::{Db, bitmaps};
 
 /// What Redis says when a bit offset is not a number or is off the end.
 const BAD_OFFSET: &str = "bit offset is not an integer or out of range";
@@ -45,7 +45,7 @@ const BAD_OVERFLOW: &str = "Invalid OVERFLOW type specified";
 const RO_GET_ONLY: &str = "BITFIELD_RO only supports the GET subcommand";
 
 /// Run one bitmap command.
-pub(super) fn execute(db: &mut Keyspace, spec: &Spec, args: Args<'_>, out: &mut Out) -> Result<()> {
+pub(super) fn execute(db: &mut Db, spec: &Spec, args: Args<'_>, out: &mut Out) -> Result<()> {
     match spec.name {
         "setbit" => {
             let offset = offset(args.get(2))?;
@@ -54,15 +54,18 @@ pub(super) fn execute(db: &mut Keyspace, spec: &Spec, args: Args<'_>, out: &mut 
                 Some(1) => true,
                 _ => return Err(Error::new(Code::Invalid, BAD_BIT)),
             };
-            out.int(i64::from(db.setbit(args.get(1), offset, bit)?));
+            let key = args.get(1);
+            out.int(i64::from(db.at(key).setbit(key, offset, bit)?));
         }
         "getbit" => {
             let offset = offset(args.get(2))?;
-            out.int(i64::from(db.getbit(args.get(1), offset)?));
+            let key = args.get(1);
+            out.int(i64::from(db.at(key).getbit(key, offset)?));
         }
         "bitcount" => {
             let range = range(args, 2)?;
-            let set = db.bitcount(args.get(1), range)?;
+            let key = args.get(1);
+            let set = db.at(key).bitcount(key, range)?;
             out.int(i64::try_from(set).unwrap_or(i64::MAX));
         }
         "bitpos" => bitpos(db, args, out)?,
@@ -75,7 +78,7 @@ pub(super) fn execute(db: &mut Keyspace, spec: &Spec, args: Args<'_>, out: &mut 
 }
 
 /// `BITPOS key bit [start [end [BYTE | BIT]]]`.
-fn bitpos(db: &mut Keyspace, args: Args<'_>, out: &mut Out) -> Result<()> {
+fn bitpos(db: &mut Db, args: Args<'_>, out: &mut Out) -> Result<()> {
     // The bit comes before the indexes, so a client that sends a word here gets
     // the "not an integer" sentence and one that sends a 2 gets the other one.
     let bit = match args.int(2)? {
@@ -93,12 +96,13 @@ fn bitpos(db: &mut Keyspace, args: Args<'_>, out: &mut Out) -> Result<()> {
             (Some(start), Some(end), unit)
         }
     };
-    out.int(db.bitpos(args.get(1), bit, start, end, unit)?);
+    let key = args.get(1);
+    out.int(db.at(key).bitpos(key, bit, start, end, unit)?);
     Ok(())
 }
 
 /// `BITOP op dest src [src ...]`.
-fn bitop(db: &mut Keyspace, args: Args<'_>, out: &mut Out) -> Result<()> {
+fn bitop(db: &mut Db, args: Args<'_>, out: &mut Out) -> Result<()> {
     let op = Op::parse(args.get(1)).ok_or_else(args::syntax)?;
     let sources = args.len() - 3;
     if op == Op::Not && sources != 1 {
@@ -124,7 +128,7 @@ fn bad(op: Op, tail: &str) -> Error {
 /// the key alone, and it works out how far the value has to grow on the way
 /// past. The second one parses them again and runs them, writing each reply as
 /// it goes.
-fn bitfield(db: &mut Keyspace, args: Args<'_>, out: &mut Out, readonly: bool) -> Result<()> {
+fn bitfield(db: &mut Db, args: Args<'_>, out: &mut Out, readonly: bool) -> Result<()> {
     let mut grow: Option<usize> = None;
     let mut at = 2;
     let mut n = 0;
@@ -142,7 +146,8 @@ fn bitfield(db: &mut Keyspace, args: Args<'_>, out: &mut Out, readonly: bool) ->
     }
 
     out.array(n);
-    db.bitfield_with(args.get(1), grow, |bytes| {
+    let key = args.get(1);
+    db.at(key).bitfield_with(key, grow, |bytes| {
         let mut at = 2;
         let mut on = Overflow::Wrap;
         while at < args.len() {

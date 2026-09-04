@@ -28,6 +28,7 @@
 //! words to parse.
 
 use crate::bits::{self, Field, Op, Overflow};
+use crate::db::Db;
 use crate::keyspace::Keyspace;
 use crate::strings::{STRING_MAX, check_len};
 use crate::value::{self, Kind, Str};
@@ -415,6 +416,75 @@ impl Keyspace {
             Some(Str::Bytes(b)) => b,
             Some(Str::Int(n)) => num::i64_digits(digits, n),
         }
+    }
+}
+
+impl Db {
+    /// `BITOP op dest src [src ...]` over a database of any width.
+    ///
+    /// Every key on one stripe is that one stripe's `BITOP`, which is every
+    /// `BITOP` on a database of one stripe and every `BITOP` whose keys were
+    /// hash tagged into the same place. That path is the old one, byte for byte.
+    ///
+    /// The rest is the same work with the reads spread out. The sources are
+    /// copied out of the stripes they are on, one at a time, into a buffer this
+    /// database owns rather than one a stripe owns, since no stripe can be held
+    /// while the next one is being read. They are combined there and the result
+    /// is written to whichever stripe the destination is on.
+    ///
+    /// # Panics
+    ///
+    /// As [`Keyspace::bitop`].
+    pub fn bitop<'k, I>(&mut self, op: Op, dest: &'k [u8], srcs: I) -> Result<usize>
+    where
+        I: Iterator<Item = &'k [u8]> + Clone,
+    {
+        if let Some(home) = self.one_stripe(std::iter::once(dest).chain(srcs.clone())) {
+            return self.stripe_mut(home).bitop(op, dest, srcs);
+        }
+        for src in srcs.clone() {
+            let stripe = self.at(src);
+            stripe.reap(src);
+            stripe.string_only(src)?;
+            stripe.thaw(src)?;
+        }
+
+        let (mut flat, mut ends) = self.take_scratch();
+        flat.clear();
+        ends.clear();
+        let mut digits = [0u8; DIGITS_MAX];
+        for src in srcs.clone() {
+            let bytes = self.at_ref(src).bitmap(src, &mut digits);
+            flat.extend_from_slice(bytes);
+            ends.push(flat.len());
+        }
+        let len = bits::width(parts(&flat, &ends));
+        if len > STRING_MAX {
+            self.put_scratch(flat, ends);
+            return Err(Error::new(Code::Invalid, TOO_LONG));
+        }
+
+        let split = flat.len();
+        flat.resize(split + len, 0);
+        let (read, write) = flat.split_at_mut(split);
+        bits::combine(op, parts(read, &ends), write);
+
+        let outcome = if len == 0 {
+            self.at(dest).del(dest);
+            Ok(0)
+        } else {
+            let stripe = self.at(dest);
+            stripe.reap(dest);
+            match stripe.string_only(dest) {
+                Ok(()) => {
+                    stripe.store_raw(dest, &flat[split..], None);
+                    Ok(len)
+                }
+                Err(e) => Err(e),
+            }
+        };
+        self.put_scratch(flat, ends);
+        outcome
     }
 }
 
