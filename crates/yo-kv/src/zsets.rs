@@ -58,12 +58,13 @@
 use yo_common::num::DIGITS_MAX;
 use yo_common::{Code, Error, Result};
 
+use crate::db::Db;
 use crate::elem::Elements;
 use crate::keyspace::Keyspace;
 use crate::scan::Cursor;
 use crate::strings;
 use crate::value::{self, Kind};
-use crate::zset::{Added, Bound, Lex, Member, Zset};
+use crate::zset::{Added, Bound, Lex, Limits, Member, Zset};
 use crate::zsetops::{self, Aggregate, Op, Operand};
 
 /// Which members a `ZADD` is allowed to touch.
@@ -811,6 +812,172 @@ impl Keyspace {
         });
         self.bodies += 1;
         at
+    }
+}
+
+/// Where an input of the algebra lives on a striped database: which stripe it is
+/// on, what it is holding, and the slot the body is in.
+type Home = (usize, Kind, u32);
+
+impl Db {
+    /// `ZUNION`, `ZINTER` and `ZDIFF` over a database of any width.
+    ///
+    /// The keys are asked whether they share a stripe before anything else, and
+    /// when they do the whole command is handed to that stripe. A width one
+    /// database always takes that path and so does a hash tagged group on a wide
+    /// one, so only keys that are genuinely spread out pay for the two passes
+    /// below.
+    pub fn zsetop<'k, F>(
+        &mut self,
+        op: Op,
+        keys: impl Iterator<Item = &'k [u8]> + Clone,
+        weights: &[f64],
+        agg: Aggregate,
+        f: F,
+    ) -> Result<usize>
+    where
+        F: FnMut(Member<'_>, f64),
+    {
+        if let Some(home) = self.one_stripe(keys.clone()) {
+            return self.stripe_mut(home).zsetop(op, keys, weights, agg, f);
+        }
+        let slots = self.operand_slots(keys)?;
+        let got = zsetops::gather(op, &self.operands_of(&slots), weights, agg);
+        let limits = self.zset_limits();
+        let Some(z) = Zset::from_elements(got, &limits) else {
+            return Ok(0);
+        };
+        let len = z.len();
+        z.walk(0, len, false, f);
+        Ok(len)
+    }
+
+    /// `ZUNIONSTORE`, `ZINTERSTORE` and `ZDIFFSTORE`.
+    ///
+    /// The destination is allowed to be one of the sources here too, and for the
+    /// same reason: the whole result is built before the destination is touched,
+    /// so no body is written over while it is still being read, whichever stripe
+    /// it is on.
+    pub fn zsetop_store<'k>(
+        &mut self,
+        op: Op,
+        destination: &'k [u8],
+        keys: impl Iterator<Item = &'k [u8]> + Clone,
+        weights: &[f64],
+        agg: Aggregate,
+    ) -> Result<usize> {
+        if let Some(home) = self.one_stripe(std::iter::once(destination).chain(keys.clone())) {
+            return self
+                .stripe_mut(home)
+                .zsetop_store(op, destination, keys, weights, agg);
+        }
+        let slots = self.operand_slots(keys)?;
+        let got = zsetops::gather(op, &self.operands_of(&slots), weights, agg);
+        // The destination's stripe's limits, since that is where the result is
+        // going to live.
+        let limits = self.at_ref(destination).zset_limits;
+        let built = Zset::from_elements(got, &limits);
+        Ok(self.at(destination).put_zset(destination, built))
+    }
+
+    /// `ZINTERCARD numkeys key [key ...] [LIMIT limit]`.
+    pub fn zintercard<'k>(
+        &mut self,
+        keys: impl Iterator<Item = &'k [u8]> + Clone,
+        limit: usize,
+    ) -> Result<usize> {
+        if let Some(home) = self.one_stripe(keys.clone()) {
+            return self.stripe_mut(home).zintercard(keys, limit);
+        }
+        let slots = self.operand_slots(keys)?;
+        Ok(zsetops::intercard(&self.operands_of(&slots), limit))
+    }
+
+    /// `ZRANGESTORE destination source <the arguments of ZRANGE>`.
+    ///
+    /// Two keys and one window, so when they are on different stripes the window
+    /// is walked out of the source's stripe into a table of its own and the
+    /// sorted set that comes of it is put on the destination's. The source keeps
+    /// its members either way, which is what makes the copy the right shape even
+    /// when the two keys are the same key.
+    pub fn zrangestore(
+        &mut self,
+        destination: &[u8],
+        source: &[u8],
+        q: &Query<'_>,
+    ) -> Result<usize> {
+        let (onto, home) = (self.stripe_of(destination), self.stripe_of(source));
+        if onto == home {
+            return self.stripe_mut(onto).zrangestore(destination, source, q);
+        }
+        let built = match self.stripe_mut(home).zset_slot(source)? {
+            None => None,
+            Some(at) => {
+                let z = self.stripe(home).zset_at(at);
+                let w = window(z, q);
+                let mut got = Elements::with_capacity(w.count.max(16));
+                let mut digits = [0u8; DIGITS_MAX];
+                let from = if w.rev { w.from + 1 - w.count } else { w.from };
+                z.walk(from, w.count, false, |m, s| {
+                    let _ = got.insert(member_bytes(m, &mut digits), s);
+                });
+                let limits = self.stripe(onto).zset_limits;
+                Zset::from_elements(got, &limits)
+            }
+        };
+        Ok(self.stripe_mut(onto).put_zset(destination, built))
+    }
+
+    /// Reap and resolve every input key, in order, to the stripe and slot its
+    /// body is in.
+    ///
+    /// As [`Keyspace::operand_slots`], down to keeping a key that is not there in
+    /// place rather than dropping it, because `WEIGHTS` is positional. Each key
+    /// is resolved on its own stripe, which is the only difference, and it has to
+    /// happen before any body is read because the reap wants the stripe mutably.
+    fn operand_slots<'k>(
+        &mut self,
+        keys: impl Iterator<Item = &'k [u8]>,
+    ) -> Result<Vec<Option<Home>>> {
+        let mut out = Vec::with_capacity(keys.size_hint().0);
+        for key in keys {
+            let stripe = self.stripe_of(key);
+            let got = self
+                .stripe_mut(stripe)
+                .live_slot_either(key, Kind::Zset, Kind::Set)?;
+            out.push(got.map(|(kind, at)| (stripe, kind, at)));
+        }
+        Ok(out)
+    }
+
+    /// The bodies those slots point at, as things the algebra can ask questions
+    /// of.
+    ///
+    /// Every stripe an input is on is borrowed at once, which needs only a shared
+    /// borrow and is why the resolving above is a pass of its own.
+    fn operands_of(&self, slots: &[Option<Home>]) -> Vec<Operand<'_>> {
+        slots
+            .iter()
+            .map(|got| match got {
+                Some((stripe, Kind::Zset, at)) => Operand::Zset(self.stripe(*stripe).zset_at(*at)),
+                Some((stripe, Kind::Set, at)) => Operand::Set(
+                    self.stripe(*stripe)
+                        .sets
+                        .get(*at)
+                        .expect("the record points at its body"),
+                ),
+                _ => Operand::Missing,
+            })
+            .collect()
+    }
+
+    /// The limits a result that belongs to no key is built under.
+    ///
+    /// Stripe zero's, because the two thresholds a sorted set is promoted at are
+    /// a setting of the database rather than of one stripe and every stripe
+    /// carries the same pair.
+    fn zset_limits(&self) -> Limits {
+        self.stripe(0).zset_limits
     }
 }
 
