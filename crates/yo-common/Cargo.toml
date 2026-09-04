@@ -20,7 +20,11 @@ workspace = true
 [dev-dependencies]
 criterion = { workspace = true }
 
-[target.'cfg(loom)'.dev-dependencies]
+# A dependency of the library rather than of its tests, because `yo-shard`'s
+# own loom job builds this crate under `--cfg loom` as a dependency, and a
+# dependency does not get to see another crate's dev dependencies. Outside that
+# cfg the dependency does not exist at all.
+[target.'cfg(loom)'.dependencies]
 loom = { workspace = true }
 
 [[bench]]
