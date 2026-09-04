@@ -208,6 +208,21 @@ const CMS_READ: &[&str] = &["readonly", "module"];
 /// that can allocate are the constructors, and all four deny out of memory
 /// because the module marks all four.
 const CMS_WRITE: &[&str] = &["write", "denyoom", "module"];
+/// The top k read side, which the module does not call fast except for the one
+/// that reads four numbers off the header.
+const AC_TOPK_READ: &[&str] = &["@read", "@topk"];
+/// `TOPK.INFO`.
+const AC_TOPK_READ_FAST: &[&str] = &["@read", "@fast", "@topk"];
+/// The top k write side, which is the two that count things.
+const AC_TOPK_WRITE: &[&str] = &["@write", "@topk"];
+/// `TOPK.RESERVE`, the one write that only allocates.
+const AC_TOPK_WRITE_FAST: &[&str] = &["@write", "@fast", "@topk"];
+/// A top k read, which carries `module` and not `fast`.
+const TOPK_READ: &[&str] = &["readonly", "module"];
+/// A top k write. The table never grows after it is made, so the only one that
+/// can allocate is the constructor, and all three deny out of memory because the
+/// module marks all three.
+const TOPK_WRITE: &[&str] = &["write", "denyoom", "module"];
 /// The graph read side, for the ones that answer without walking the plane.
 const AC_GRAPH_READ_FAST: &[&str] = &["@read", "@graph", "@fast"];
 /// The graph read side for the ones that walk it.
@@ -3388,6 +3403,98 @@ pub static COMMANDS: &[Spec] = &[
         summary: "The width, the depth and everything ever added.",
         group: "cms",
     },
+    // ---------------------------------------------------------------- topk
+    Spec {
+        name: "topk.reserve",
+        arity: -3,
+        flags: TOPK_WRITE,
+        first_key: 1,
+        last_key: 1,
+        step: 1,
+        acl: AC_TOPK_WRITE_FAST,
+        since: "2.0.0",
+        complexity: "O(1)",
+        summary: "Make an empty sketch that keeps the k commonest items.",
+        group: "topk",
+    },
+    Spec {
+        name: "topk.add",
+        arity: -3,
+        flags: TOPK_WRITE,
+        first_key: 1,
+        last_key: 1,
+        step: 1,
+        acl: AC_TOPK_WRITE,
+        since: "2.0.0",
+        complexity: "O(N * K) with N the items and K the depth",
+        summary: "Count one occurrence of each item.",
+        group: "topk",
+    },
+    Spec {
+        name: "topk.incrby",
+        arity: -4,
+        flags: TOPK_WRITE,
+        first_key: 1,
+        last_key: 1,
+        step: 1,
+        acl: AC_TOPK_WRITE,
+        since: "2.0.0",
+        complexity: "O(N * K) with N the items and K the depth",
+        summary: "Count a stated number of occurrences of each item.",
+        group: "topk",
+    },
+    Spec {
+        name: "topk.query",
+        arity: -3,
+        flags: TOPK_READ,
+        first_key: 1,
+        last_key: 1,
+        step: 1,
+        acl: AC_TOPK_READ,
+        since: "2.0.0",
+        complexity: "O(N * K) with N the items and K the kept count",
+        summary: "Whether each item is one of the ones being kept.",
+        group: "topk",
+    },
+    Spec {
+        name: "topk.count",
+        arity: -3,
+        flags: TOPK_READ,
+        first_key: 1,
+        last_key: 1,
+        step: 1,
+        acl: AC_TOPK_READ,
+        since: "2.0.0",
+        complexity: "O(N * K) with N the items and K the depth",
+        summary: "How many times the sketch thinks it has seen each item.",
+        group: "topk",
+    },
+    Spec {
+        name: "topk.list",
+        arity: -2,
+        flags: TOPK_READ,
+        first_key: 1,
+        last_key: 1,
+        step: 1,
+        acl: AC_TOPK_READ,
+        since: "2.0.0",
+        complexity: "O(K log K) with K the kept count",
+        summary: "The kept items, heaviest first.",
+        group: "topk",
+    },
+    Spec {
+        name: "topk.info",
+        arity: 2,
+        flags: TOPK_READ,
+        first_key: 1,
+        last_key: 1,
+        step: 1,
+        acl: AC_TOPK_READ_FAST,
+        since: "2.0.0",
+        complexity: "O(1)",
+        summary: "The four numbers the sketch was made with.",
+        group: "topk",
+    },
     // --------------------------------------------------------------- array
     Spec {
         name: "arset",
@@ -4707,6 +4814,13 @@ const FREE: u16 = u16::MAX;
 /// bound went up by two again. Only one of the six new names collides on the
 /// key, which is `CMS.QUERY` against `CMS.MERGE`, so the floor is sixteen and
 /// the table is still a shade over twice it.
+///
+/// The `TOPK.*` family took it to 323 names and forty two extra probes, with the
+/// worst still one slot. A short search of four hundred thousand multipliers ran
+/// against the new table and the best it turned up was two slots and forty eight,
+/// worse on both counts, which is what the two big searches before it already
+/// said, so this multiplier stayed and the bound went up by five. None of the
+/// seven new names collides on the key, so the floor is still sixteen.
 const MIX: u64 = 0x3e86_68c9_760e_09c9;
 
 /// The four bytes the index is computed from: the length, the first two bytes,
@@ -5037,7 +5151,7 @@ mod tests {
         }
         assert!(worst <= 2, "worst probe is {worst} slots");
         assert!(
-            total <= 37,
+            total <= 42,
             "{total} extra slots walked over the whole table"
         );
     }

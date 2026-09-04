@@ -76,6 +76,7 @@ mod sets;
 mod streams;
 mod strings;
 pub mod table;
+mod topk;
 mod vectors;
 mod vfilter;
 mod zsets;
@@ -1156,7 +1157,7 @@ pub fn resolved(
     // two groups that hold them mark all of them rather than the session's.
     server.dirty |= match spec.group {
         "string" | "bitmap" | "hyperloglog" | "geo" | "set" | "hash" | "list" | "zset"
-        | "array" | "stream" | "bloom" | "cuckoo" | "cms" => 1u64 << session.db,
+        | "array" | "stream" | "bloom" | "cuckoo" | "cms" | "topk" => 1u64 << session.db,
         _ => ALL_DATABASES,
     };
 
@@ -1250,6 +1251,10 @@ pub fn resolved(
             "cms" => {
                 let db = session.db;
                 cms::execute(&mut server.dbs[db], spec, args, out).map(|()| Flow::Continue)
+            }
+            "topk" => {
+                let db = session.db;
+                topk::execute(&mut server.dbs[db], spec, args, out).map(|()| Flow::Continue)
             }
             // The clock is read before the database is borrowed, because every
             // stream command needs the time and it lives on the server. An
@@ -13398,6 +13403,237 @@ mod tests {
         assert_eq!(f.run(&[b"RENAME", b"c", b"c3"]), "+OK\r\n");
         assert_eq!(f.run(&[b"TYPE", b"c3"]), "+CMSk-TYPE\r\n");
         assert_eq!(f.run(&[b"DEL", b"c3"]), ":1\r\n");
+    }
+
+    // ------------------------------------------------------------------ topk
+
+    /// `TOPK.RESERVE` takes three arguments or six, and looks at the key before
+    /// it looks at any of them.
+    #[test]
+    fn a_reserve_takes_three_arguments_or_six() {
+        let mut f = Fixture::new();
+        assert_eq!(f.run(&[b"TOPK.RESERVE", b"t", b"5"]), "+OK\r\n");
+        assert_eq!(
+            f.run(&[b"TOPK.INFO", b"t"]),
+            "*8\r\n+k\r\n:5\r\n+width\r\n:8\r\n+depth\r\n:7\r\n+decay\r\n$3\r\n0.9\r\n"
+        );
+        // Four arguments and five are an arity error rather than a defaulted
+        // depth or decay.
+        for cmd in [
+            vec![&b"TOPK.RESERVE"[..], b"u", b"5", b"8"],
+            vec![&b"TOPK.RESERVE"[..], b"u", b"5", b"8", b"7"],
+        ] {
+            assert!(f.run(&cmd).contains("wrong number of arguments"));
+        }
+        assert_eq!(
+            f.run(&[b"TOPK.RESERVE", b"u", b"5", b"8", b"7", b"0.5"]),
+            "+OK\r\n"
+        );
+        // The key is checked first, so a reserve with nothing else right at a
+        // key that is taken still says the key is taken.
+        assert_eq!(
+            f.run(&[b"TOPK.RESERVE", b"u", b"0", b"0", b"0", b"9"]),
+            "-TopK: key already exists\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"TOPK.RESERVE", b"v", b"0"]),
+            "-TopK: invalid k\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"TOPK.RESERVE", b"v", b"1", b"0", b"7", b"0.9"]),
+            "-TopK: invalid width\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"TOPK.RESERVE", b"v", b"1", b"8", b"x", b"0.9"]),
+            "-TopK: invalid depth\r\n"
+        );
+        // Zero is out and one is in, which is the module's `> 0` and `<= 1`.
+        assert_eq!(
+            f.run(&[b"TOPK.RESERVE", b"v", b"1", b"8", b"7", b"0"]),
+            "-TopK: invalid decay value. must be '<= 1' & '> 0'\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"TOPK.RESERVE", b"v", b"1", b"8", b"7", b"1"]),
+            "+OK\r\n"
+        );
+        // Past the cap, with the one sentence in the family that has a prefix.
+        assert_eq!(
+            f.run(&[
+                b"TOPK.RESERVE",
+                b"w",
+                b"1",
+                b"4294967295",
+                b"4294967295",
+                b"0.9"
+            ]),
+            "-ERR Insufficient memory to create topk data structure\r\n"
+        );
+    }
+
+    /// What the sketch keeps, and the three ways of asking about it.
+    #[test]
+    fn the_kept_set_is_what_query_and_list_answer_from() {
+        let mut f = Fixture::new();
+        f.run(&[b"TOPK.RESERVE", b"t", b"2", b"1000", b"5", b"0.9"]);
+        // A null an item while there is room, then the name of whatever was
+        // pushed out.
+        assert_eq!(
+            f.run(&[b"TOPK.ADD", b"t", b"a", b"b"]),
+            "*2\r\n$-1\r\n$-1\r\n"
+        );
+        assert_eq!(f.run(&[b"TOPK.INCRBY", b"t", b"a", b"10"]), "*1\r\n$-1\r\n");
+        // Two slots are full and `c` arrives with a count of one, which is not
+        // under the smallest kept count, so it takes that slot straight away.
+        assert_eq!(f.run(&[b"TOPK.ADD", b"t", b"c"]), "*1\r\n$1\r\nb\r\n");
+        assert_eq!(f.run(&[b"TOPK.INCRBY", b"t", b"c", b"5"]), "*1\r\n$-1\r\n");
+        assert_eq!(
+            f.run(&[b"TOPK.QUERY", b"t", b"a", b"b", b"c"]),
+            "*3\r\n:1\r\n:0\r\n:1\r\n"
+        );
+        // The table still counts what the kept set let go of.
+        assert_eq!(
+            f.run(&[b"TOPK.COUNT", b"t", b"a", b"b", b"c"]),
+            "*3\r\n:11\r\n:1\r\n:6\r\n"
+        );
+        assert_eq!(f.run(&[b"TOPK.LIST", b"t"]), "*2\r\n$1\r\na\r\n$1\r\nc\r\n");
+        assert_eq!(
+            f.run(&[b"TOPK.LIST", b"t", b"WITHCOUNT"]),
+            "*4\r\n$1\r\na\r\n:11\r\n$1\r\nc\r\n:6\r\n"
+        );
+        // Any prefix of the keyword turns the counts on, the empty string
+        // included, and only a longer word or a different one is refused.
+        assert_eq!(
+            f.run(&[b"TOPK.LIST", b"t", b"w"]),
+            f.run(&[b"TOPK.LIST", b"t", b"WITHCOUNT"])
+        );
+        assert_eq!(
+            f.run(&[b"TOPK.LIST", b"t", b""]),
+            f.run(&[b"TOPK.LIST", b"t", b"WITHCOUNT"])
+        );
+        assert_eq!(
+            f.run(&[b"TOPK.LIST", b"t", b"WITHCOUNTS"]),
+            "-WITHCOUNT keyword expected\r\n"
+        );
+        // And the keyword is looked at before the key, so a missing key with a
+        // bad keyword complains about the keyword.
+        assert_eq!(
+            f.run(&[b"TOPK.LIST", b"missing", b"nope"]),
+            "-WITHCOUNT keyword expected\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"TOPK.LIST", b"missing"]),
+            "-TopK: key does not exist\r\n"
+        );
+        // An item counted zero times is kept and not listed.
+        f.run(&[b"TOPK.RESERVE", b"z", b"3"]);
+        assert_eq!(
+            f.run(&[b"TOPK.INCRBY", b"z", b"nothing", b"0"]),
+            "*1\r\n$-1\r\n"
+        );
+        assert_eq!(f.run(&[b"TOPK.QUERY", b"z", b"nothing"]), "*1\r\n:1\r\n");
+        assert_eq!(f.run(&[b"TOPK.LIST", b"z"]), "*0\r\n");
+    }
+
+    /// `TOPK.INCRBY` applies as it goes, so a bad increment leaves everything
+    /// before it counted, and the reply counts what it wrote.
+    #[test]
+    fn an_increment_is_applied_as_it_goes_and_stops_at_a_bad_one() {
+        let mut f = Fixture::new();
+        f.run(&[b"TOPK.RESERVE", b"t", b"5", b"1000", b"5", b"0.9"]);
+        // Three pairs, the middle one bad: two elements come back, one of them
+        // the error, and the array header says two rather than three. That last
+        // part is D-51 and it is why a client here stays in step.
+        assert_eq!(
+            f.run(&[b"TOPK.INCRBY", b"t", b"a", b"3", b"b", b"-1", b"c", b"4"]),
+            format!(
+                "*2\r\n$-1\r\n-{}\r\n",
+                "TopK: increment must be an integer greater or equal to 0                            and smaller or equal to 100,000"
+            )
+        );
+        assert_eq!(
+            f.run(&[b"TOPK.COUNT", b"t", b"a", b"b", b"c"]),
+            "*3\r\n:3\r\n:0\r\n:0\r\n"
+        );
+        // A hundred thousand is in and one more is out.
+        assert_eq!(
+            f.run(&[b"TOPK.INCRBY", b"t", b"a", b"100000"]),
+            "*1\r\n$-1\r\n"
+        );
+        assert!(
+            f.run(&[b"TOPK.INCRBY", b"t", b"a", b"100001"])
+                .contains("smaller or equal to 100,000")
+        );
+        // Pairs have to be pairs.
+        assert!(
+            f.run(&[b"TOPK.INCRBY", b"t", b"a", b"1", b"b"])
+                .contains("wrong number of arguments")
+        );
+        assert_eq!(f.run(&[b"TOPK.COUNT", b"t", b"a"]), "*1\r\n:100003\r\n");
+    }
+
+    /// The RESP3 shapes, which are the two the protocols disagree about.
+    #[test]
+    fn a_query_is_a_bool_and_info_is_a_map_on_resp3() {
+        let mut f = Fixture::new();
+        f.run(&[b"HELLO", b"3"]);
+        f.run(&[b"TOPK.RESERVE", b"t", b"2", b"8", b"7", b"0.5"]);
+        f.run(&[b"TOPK.ADD", b"t", b"a"]);
+        assert_eq!(
+            f.run(&[b"TOPK.QUERY", b"t", b"a", b"b"]),
+            "*2\r\n#t\r\n#f\r\n"
+        );
+        // The count stays an integer on both protocols.
+        assert_eq!(f.run(&[b"TOPK.COUNT", b"t", b"a"]), "*1\r\n:1\r\n");
+        assert_eq!(
+            f.run(&[b"TOPK.INFO", b"t"]),
+            "%4\r\n+k\r\n:2\r\n+width\r\n:8\r\n+depth\r\n:7\r\n+decay\r\n,0.5\r\n"
+        );
+        assert_eq!(f.run(&[b"TOPK.ADD", b"t", b"a"]), "*1\r\n_\r\n");
+    }
+
+    /// A top k key answers the module sentences the other sketch families
+    /// answer, and its own word for its type.
+    #[test]
+    fn a_top_k_sketch_is_a_module_key_to_the_rest_of_the_keyspace() {
+        let mut f = Fixture::new();
+        f.run(&[b"SET", b"s", b"text"]);
+        for cmd in [
+            vec![&b"TOPK.RESERVE"[..], b"s", b"5"],
+            vec![&b"TOPK.ADD"[..], b"s", b"a"],
+            vec![&b"TOPK.INCRBY"[..], b"s", b"a", b"1"],
+            vec![&b"TOPK.QUERY"[..], b"s", b"a"],
+            vec![&b"TOPK.COUNT"[..], b"s", b"a"],
+            vec![&b"TOPK.LIST"[..], b"s"],
+            vec![&b"TOPK.INFO"[..], b"s"],
+        ] {
+            let name = String::from_utf8_lossy(cmd[0]).into_owned();
+            let reply = f.run(&cmd);
+            assert!(
+                reply.starts_with("-WRONGTYPE") || reply == "-TopK: key already exists\r\n",
+                "{name}: {reply}"
+            );
+        }
+        f.run(&[b"TOPK.RESERVE", b"t", b"5"]);
+        assert_eq!(
+            f.run(&[b"COPY", b"t", b"t2"]),
+            "-ERR not supported for this module key\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"DUMP", b"t"]),
+            "-ERR DUMP is not supported for this module key\r\n"
+        );
+        assert_eq!(f.run(&[b"EXPIRE", b"t", b"100"]), ":1\r\n");
+        assert_eq!(f.run(&[b"PERSIST", b"t"]), ":1\r\n");
+        assert_eq!(f.run(&[b"RENAME", b"t", b"t3"]), "+OK\r\n");
+        assert_eq!(f.run(&[b"TYPE", b"t3"]), "+TopK-TYPE\r\n");
+        assert_eq!(f.run(&[b"OBJECT", b"ENCODING", b"t3"]), "$3\r\nraw\r\n");
+        assert_eq!(f.run(&[b"DEL", b"t3"]), ":1\r\n");
+        // Every one of the six that is not the constructor says the same thing
+        // about a key that is not there.
+        assert_eq!(
+            f.run(&[b"TOPK.INFO", b"t3"]),
+            "-TopK: key does not exist\r\n"
+        );
     }
 
     /// The three shapes an `XADD` id can take, and the one rule behind all of
