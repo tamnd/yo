@@ -1322,7 +1322,7 @@ pub fn resolved(
             }
             "zset" => {
                 let db = session.db;
-                zsets::execute(server.dbs[db].only_mut(), spec, args, out).map(|()| Flow::Continue)
+                zsets::execute(&mut server.dbs[db], spec, args, out).map(|()| Flow::Continue)
             }
             // A geo key is a sorted set and these are sorted set commands with
             // arithmetic on the way in and on the way out, so a client can ZREM
@@ -18667,5 +18667,276 @@ mod tests {
         assert_eq!(f.run(&[b"PFMERGE", far, src]), "+OK\r\n");
         assert_eq!(f.run(&[b"PFCOUNT", far]), ":199\r\n", "and kept its own");
         assert_eq!(f.run(&[b"PFCOUNT", src]), ":151\r\n", "and left the source");
+    }
+
+    /// Every sorted set command, on one stripe and on eight.
+    ///
+    /// Every reply here is compared byte for byte, unlike the set group, because
+    /// a sorted set answers in rank order and members sharing a score come out
+    /// in the order of their bytes. There is nothing left for the table the
+    /// answer was built in to decide.
+    #[test]
+    fn the_sorted_set_group_answers_the_same_however_many_stripes_there_are() {
+        let script: &[&[&[u8]]] = &[
+            &[b"ZADD", b"z1", b"1", b"a", b"2", b"b", b"3", b"c"],
+            &[b"ZADD", b"z1", b"NX", b"9", b"a"],
+            &[b"ZADD", b"z1", b"XX", b"CH", b"5", b"a"],
+            &[b"ZADD", b"z1", b"GT", b"CH", b"1", b"a"],
+            &[b"ZADD", b"z1", b"INCR", b"2", b"a"],
+            &[b"ZINCRBY", b"z1", b"1.5", b"b"],
+            &[b"ZADD", b"z2", b"1", b"b", b"2", b"c", b"3", b"d"],
+            &[b"ZADD", b"lex", b"0", b"a", b"0", b"b", b"0", b"c"],
+            &[b"ZADD", b"one", b"1", b"m"],
+            &[b"ZCARD", b"z1"],
+            &[b"ZCARD", b"gone"],
+            &[b"ZSCORE", b"z1", b"a"],
+            &[b"ZSCORE", b"z1", b"zz"],
+            &[b"ZMSCORE", b"z1", b"a", b"zz", b"c"],
+            &[b"ZRANK", b"z1", b"c"],
+            &[b"ZRANK", b"z1", b"c", b"WITHSCORE"],
+            &[b"ZREVRANK", b"z1", b"c"],
+            &[b"ZRANK", b"z1", b"gone"],
+            &[b"ZCOUNT", b"z1", b"-inf", b"+inf"],
+            &[b"ZCOUNT", b"z1", b"(1", b"3"],
+            &[b"ZLEXCOUNT", b"lex", b"-", b"+"],
+            // The range commands, which are one parse and one walk.
+            &[b"ZRANGE", b"z1", b"0", b"-1"],
+            &[b"ZRANGE", b"z1", b"0", b"-1", b"WITHSCORES"],
+            &[b"ZRANGE", b"z1", b"1", b"9", b"BYSCORE"],
+            &[b"ZRANGE", b"z1", b"9", b"1", b"BYSCORE", b"REV"],
+            &[b"ZRANGE", b"lex", b"[a", b"(c", b"BYLEX"],
+            &[b"ZREVRANGE", b"z1", b"0", b"-1"],
+            &[
+                b"ZRANGEBYSCORE",
+                b"z1",
+                b"-inf",
+                b"+inf",
+                b"LIMIT",
+                b"1",
+                b"1",
+            ],
+            &[b"ZREVRANGEBYLEX", b"lex", b"+", b"-"],
+            &[b"ZSCAN", b"z1", b"0"],
+            &[b"ZSCAN", b"z1", b"0", b"MATCH", b"a*", b"COUNT", b"100"],
+            // The draw, on a sorted set of one member, which is the only shape
+            // whose answer two servers have to agree on.
+            &[b"ZRANDMEMBER", b"one"],
+            &[b"ZRANDMEMBER", b"one", b"-3", b"WITHSCORES"],
+            &[b"ZRANDMEMBER", b"gone"],
+            // The one that copies a window into another key.
+            &[b"ZRANGESTORE", b"d0", b"z1", b"0", b"1"],
+            &[b"ZRANGE", b"d0", b"0", b"-1", b"WITHSCORES"],
+            &[b"ZRANGESTORE", b"d0", b"z1", b"5", b"1"],
+            &[b"EXISTS", b"d0"],
+            // The algebra, in both its shapes.
+            &[b"ZUNION", b"2", b"z1", b"z2"],
+            &[b"ZUNION", b"2", b"z1", b"z2", b"WITHSCORES"],
+            &[
+                b"ZUNION",
+                b"2",
+                b"z1",
+                b"z2",
+                b"WEIGHTS",
+                b"2",
+                b"3",
+                b"AGGREGATE",
+                b"MAX",
+                b"WITHSCORES",
+            ],
+            &[b"ZINTER", b"2", b"z1", b"z2", b"WITHSCORES"],
+            &[b"ZDIFF", b"2", b"z1", b"z2", b"WITHSCORES"],
+            &[b"ZDIFF", b"2", b"gone", b"z1"],
+            &[b"ZINTERCARD", b"2", b"z1", b"z2"],
+            &[b"ZINTERCARD", b"2", b"z1", b"z2", b"LIMIT", b"1"],
+            &[b"ZUNIONSTORE", b"d1", b"2", b"z1", b"z2"],
+            &[b"ZRANGE", b"d1", b"0", b"-1", b"WITHSCORES"],
+            &[
+                b"ZINTERSTORE",
+                b"d2",
+                b"2",
+                b"z1",
+                b"z2",
+                b"AGGREGATE",
+                b"MIN",
+            ],
+            &[b"ZRANGE", b"d2", b"0", b"-1", b"WITHSCORES"],
+            &[b"ZDIFFSTORE", b"d3", b"2", b"z1", b"z2"],
+            &[b"ZCARD", b"d3"],
+            // An empty result deletes the destination rather than storing a
+            // sorted set with nothing in it.
+            &[b"ZINTERSTORE", b"d4", b"2", b"z1", b"gone"],
+            &[b"EXISTS", b"d4"],
+            // A plain set is a sorted set where every score is one, so it is a
+            // legal input to all of these.
+            &[b"SADD", b"plain", b"a", b"x"],
+            &[b"ZUNIONSTORE", b"d5", b"2", b"z1", b"plain"],
+            &[b"ZRANGE", b"d5", b"0", b"-1", b"WITHSCORES"],
+            // And a destination that is also a source.
+            &[b"ZUNIONSTORE", b"z2", b"2", b"z1", b"z2"],
+            &[b"ZRANGE", b"z2", b"0", b"-1", b"WITHSCORES"],
+            // The three removals and the two pops.
+            &[b"ZREM", b"d5", b"x", b"nothere"],
+            &[b"ZREMRANGEBYRANK", b"d5", b"0", b"0"],
+            &[b"ZREMRANGEBYSCORE", b"d1", b"-inf", b"1"],
+            &[b"ZREMRANGEBYLEX", b"lex", b"[a", b"[a"],
+            &[b"ZPOPMIN", b"z1"],
+            &[b"ZPOPMAX", b"z1", b"2"],
+            &[b"ZPOPMIN", b"gone"],
+            &[b"ZMPOP", b"2", b"gone", b"z2", b"MIN"],
+            &[b"ZMPOP", b"2", b"gone", b"nothere", b"MAX", b"COUNT", b"2"],
+            // The errors, which have to be the same errors.
+            &[b"SET", b"str", b"v"],
+            &[b"ZADD", b"str", b"1", b"a"],
+            &[b"ZSCORE", b"str", b"a"],
+            &[b"ZADD", b"z1", b"nan", b"a"],
+            &[b"ZUNION", b"2", b"z1", b"str"],
+            &[b"ZUNIONSTORE", b"d6", b"2", b"z1", b"str"],
+            &[b"EXISTS", b"d6"],
+            &[b"ZINTERCARD", b"0", b"z1"],
+            &[b"ZINTERCARD", b"2", b"z1", b"z2", b"LIMIT", b"-1"],
+            &[b"ZRANGESTORE", b"d7", b"str", b"0", b"-1"],
+            &[b"ZMPOP", b"1", b"str", b"MIN"],
+            &[b"ZPOPMIN", b"z1", b"-1"],
+        ];
+
+        let mut one = Fixture::new();
+        let mut many = Fixture::striped(8);
+        for parts in script {
+            let a = one.run(parts);
+            let b = many.run(parts);
+            assert_eq!(a, b, "{}", String::from_utf8_lossy(parts[0]));
+        }
+    }
+
+    /// The algebra over sorted sets that are known to be on different stripes.
+    #[test]
+    fn a_sorted_set_operation_across_stripes_reads_every_input() {
+        let mut f = Fixture::striped(8);
+        let second = apart(&mut f, "z1");
+        let third = apart(&mut f, &second);
+        let (z1, z2, z3) = (b"z1".as_slice(), second.as_bytes(), third.as_bytes());
+
+        f.run(&[b"ZADD", z1, b"1", b"a", b"2", b"b"]);
+        f.run(&[b"ZADD", z2, b"3", b"b", b"4", b"c"]);
+        // a is 1, c is 4, b is 2 and 3 added together, which is the order they
+        // come out in and the answer that says both stripes were read.
+        assert_eq!(
+            f.run(&[b"ZUNION", b"2", z1, z2]),
+            "*3\r\n$1\r\na\r\n$1\r\nc\r\n$1\r\nb\r\n"
+        );
+        assert_eq!(f.run(&[b"ZINTER", b"2", z1, z2]), "*1\r\n$1\r\nb\r\n");
+        assert_eq!(f.run(&[b"ZDIFF", b"2", z1, z2]), "*1\r\n$1\r\na\r\n");
+        assert_eq!(f.run(&[b"ZINTERCARD", b"2", z1, z2]), ":1\r\n");
+        assert_eq!(
+            f.run(&[b"ZINTERCARD", b"2", z1, z2, b"LIMIT", b"1"]),
+            ":1\r\n"
+        );
+
+        // A destination on a third stripe, and the weights and the aggregate
+        // reaching every input.
+        assert_eq!(f.run(&[b"ZUNIONSTORE", z3, b"2", z1, z2]), ":3\r\n");
+        assert_eq!(f.run(&[b"ZSCORE", z3, b"b"]), "$1\r\n5\r\n");
+        assert_eq!(
+            f.run(&[
+                b"ZUNIONSTORE",
+                z3,
+                b"2",
+                z1,
+                z2,
+                b"WEIGHTS",
+                b"2",
+                b"3",
+                b"AGGREGATE",
+                b"MAX"
+            ]),
+            ":3\r\n"
+        );
+        assert_eq!(f.run(&[b"ZSCORE", z3, b"b"]), "$1\r\n9\r\n");
+        assert_eq!(f.run(&[b"ZINTERSTORE", z3, b"2", z1, z2]), ":1\r\n");
+        assert_eq!(f.run(&[b"ZCARD", z3]), ":1\r\n");
+        assert_eq!(f.run(&[b"ZDIFFSTORE", z3, b"2", z2, z1]), ":1\r\n");
+        assert_eq!(f.run(&[b"ZSCORE", z3, b"c"]), "$1\r\n4\r\n");
+
+        // A pop over keys on several stripes takes from the first one that has
+        // anything, which is what makes the order of the keys matter.
+        let popped = format!(
+            "*2\r\n${}\r\n{second}\r\n*1\r\n*2\r\n$1\r\nb\r\n$1\r\n3\r\n",
+            second.len()
+        );
+        assert_eq!(f.run(&[b"ZMPOP", b"3", b"gone", z2, z1, b"MIN"]), popped);
+        f.run(&[b"ZADD", z2, b"3", b"b"]);
+
+        // An empty result deletes a destination wherever it is, and an input of
+        // the wrong type stops the command before the destination is touched.
+        assert_eq!(f.run(&[b"ZINTERSTORE", z3, b"2", z1, b"gone"]), ":0\r\n");
+        assert_eq!(f.run(&[b"EXISTS", z3]), ":0\r\n");
+        f.run(&[b"SET", z3, b"v"]);
+        assert_eq!(
+            f.run(&[b"ZUNION", b"2", z1, z3]),
+            "-WRONGTYPE Operation against a key holding the wrong kind of value\r\n"
+        );
+        assert_eq!(f.run(&[b"GET", z3]), "$1\r\nv\r\n", "and left it alone");
+
+        // And a destination that is also a source works across stripes for the
+        // reason it works on one: the whole result is built before anything is
+        // written.
+        assert_eq!(f.run(&[b"ZUNIONSTORE", z2, b"2", z1, z2]), ":3\r\n");
+        assert_eq!(f.run(&[b"ZSCORE", z2, b"b"]), "$1\r\n5\r\n");
+        assert_eq!(f.run(&[b"ZCARD", z2]), ":3\r\n");
+    }
+
+    /// A `ZRANGESTORE` whose two keys are on two stripes.
+    #[test]
+    fn a_range_store_across_stripes_copies_the_window() {
+        let mut f = Fixture::striped(8);
+        let other = apart(&mut f, "src");
+        let third = apart(&mut f, &other);
+        let (src, dst, plain) = (b"src".as_slice(), other.as_bytes(), third.as_bytes());
+
+        f.run(&[b"ZADD", src, b"1", b"a", b"2", b"b", b"3", b"c"]);
+        assert_eq!(f.run(&[b"ZRANGESTORE", dst, src, b"0", b"1"]), ":2\r\n");
+        assert_eq!(
+            f.run(&[b"ZRANGE", dst, b"0", b"-1", b"WITHSCORES"]),
+            "*4\r\n$1\r\na\r\n$1\r\n1\r\n$1\r\nb\r\n$1\r\n2\r\n"
+        );
+        assert_eq!(f.run(&[b"ZCARD", src]), ":3\r\n", "the source kept its own");
+
+        // A window walked backwards takes the other end of the sorted set and
+        // still stores what it took in score order.
+        assert_eq!(
+            f.run(&[
+                b"ZRANGESTORE",
+                dst,
+                src,
+                b"+inf",
+                b"-inf",
+                b"BYSCORE",
+                b"REV",
+                b"LIMIT",
+                b"0",
+                b"2"
+            ]),
+            ":2\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"ZRANGE", dst, b"0", b"-1"]),
+            "*2\r\n$1\r\nb\r\n$1\r\nc\r\n"
+        );
+
+        // An empty window deletes the destination on its own stripe, and a
+        // source of the wrong type is refused before the destination is touched.
+        assert_eq!(f.run(&[b"ZRANGESTORE", dst, src, b"5", b"1"]), ":0\r\n");
+        assert_eq!(f.run(&[b"EXISTS", dst]), ":0\r\n");
+        f.run(&[b"ZRANGESTORE", dst, src, b"0", b"-1"]);
+        f.run(&[b"SET", plain, b"v"]);
+        assert_eq!(
+            f.run(&[b"ZRANGESTORE", dst, plain, b"0", b"-1"]),
+            "-WRONGTYPE Operation against a key holding the wrong kind of value\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"ZCARD", dst]),
+            ":3\r\n",
+            "and left the destination"
+        );
     }
 }
