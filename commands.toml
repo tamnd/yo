@@ -212,6 +212,20 @@ doc = "11 section 8"
 # commands, which is D-49.
 
 [[group]]
+name = "tdigest"
+expected = 14
+status = "shipped"
+doc = "11 section 8"
+# Fourteen commands and no undocumented fifteenth, the largest of the four sketch
+# families and the only one of them that is about an ordering rather than a
+# membership or a count. The digest is the merging variant of Dunning's, ported
+# from the module's own C at the commit its submodule pins, arithmetic and
+# rounding and unstable sort included. That last one reads like a bug to fix and
+# is not: two servers behind one load balancer have to answer the same p99 for
+# the same samples, and the tie order out of the sort is visible in the answer
+# when several centroids share a mean.
+
+[[group]]
 name = "stream"
 expected = 20
 status = "partial"
@@ -3348,6 +3362,164 @@ bounded = "inherent"
 status = "shipped"
 wire = "verified"
 notes = "Four fields, so eight elements on RESP2 and a map of four on RESP3. The decay goes out through the double reply, which is a comma line on RESP3 and a bulk string of the shortest digits that read back as the same double on RESP2, so a decay of one is 1 and a decay of a billionth is 1e-9. No field argument: asking for one is an arity error."
+
+
+# --------------------------------------------------------------------- tdigest
+
+[[command]]
+name = "TDIGEST.CREATE"
+group = "tdigest"
+since = "2.4.0"
+arity = -2
+plan = "whole-value"
+bounded = "risk"
+status = "shipped"
+wire = "verified"
+divergent = "D-52"
+notes = "Two arguments or four and nothing in between, so a stray word is an arity error rather than a syntax one. The keyword search looks for COMPRESSION across both trailing arguments and then reads the number out of the last one whatever it found, which is the module's RMUtil_ArgIndex and not a lookup, so TDIGEST.CREATE k 100 COMPRESSION tries to read a number out of the word COMPRESSION and says it cannot. The key is checked before the arguments, so a bad compression at a key that already holds a digest is key already exists. Capacity is six times the compression plus ten and every centroid is a mean and a weight, so the arrays are sized here before a sample has arrived, which is the risk on the row. A real server asks the allocator for them and ours refuses anything over a gibibyte, which is D-52."
+
+[[command]]
+name = "TDIGEST.RESET"
+group = "tdigest"
+since = "2.4.0"
+arity = 2
+plan = "whole-value"
+bounded = "inherent"
+status = "shipped"
+wire = "verified"
+notes = "Empties the digest and keeps its compression and its arrays, so the key stays and TDIGEST.INFO answers with the same capacity afterwards. The compression count goes back to zero along with everything else, and min and max go back to the largest and smallest doubles there are, which is what makes an empty digest answer NaN to TDIGEST.MIN rather than a number left over from before."
+
+[[command]]
+name = "TDIGEST.ADD"
+group = "tdigest"
+since = "2.4.0"
+arity = -3
+plan = "whole-value"
+bounded = "inherent"
+status = "shipped"
+wire = "verified"
+notes = "Every sample weighs one and every sample is parsed before any of them is added, so a bad number in the last position leaves the digest untouched. The double parser is Redis's string2d and not this engine's, which matters at the edges: 1e400 is a parse error where our own parser would have called it an infinity, 1e-400 is a parse error where ours would have called it zero, and the word inf in any case with any sign is a number that then fails the finite check with a different sentence. Adding into a full buffer sweeps it first, so the cost of a single add is amortised over the compression and one add in about every six hundred does the work."
+
+[[command]]
+name = "TDIGEST.MERGE"
+group = "tdigest"
+since = "2.4.0"
+arity = -4
+plan = "whole-value"
+bounded = "risk"
+status = "shipped"
+wire = "verified"
+notes = "The keys are behind a count rather than at fixed positions, so this is the only command in the table carrying movablekeys, and the key specs COMMAND INFO would need to describe that are D-46 along with every other one. The destination is built to one side and put in place at the end, so a merge that runs out of weight leaves the old destination alone. Without OVERRIDE the destination joins its own inputs, which means naming the destination as a source as well folds it in twice and the weights afterwards say so. Compression comes from the destination when it exists, from the largest of the inputs when it does not or when OVERRIDE was asked for, and from COMPRESSION when that is there. Reading a source sweeps its buffer in, so a merge writes to keys it only reads from and their compression counts go up, which is the module's behaviour and is visible in TDIGEST.INFO."
+
+[[command]]
+name = "TDIGEST.MIN"
+group = "tdigest"
+since = "2.4.0"
+arity = 2
+plan = "metadata"
+bounded = "inherent"
+status = "shipped"
+wire = "verified"
+notes = "The smallest sample ever added, kept as a field rather than found, so this does not touch the centroids at all. An empty digest answers NaN, which goes out as the bare word nan on RESP3 and as the three character bulk string nan on RESP2. A digest that has been reset is empty again for this purpose."
+
+[[command]]
+name = "TDIGEST.MAX"
+group = "tdigest"
+since = "2.4.0"
+arity = 2
+plan = "metadata"
+bounded = "inherent"
+status = "shipped"
+wire = "verified"
+notes = "The largest sample ever added, the same field lookup as TDIGEST.MIN and the same NaN on an empty digest."
+
+[[command]]
+name = "TDIGEST.QUANTILE"
+group = "tdigest"
+since = "2.4.0"
+arity = -3
+plan = "whole-value"
+bounded = "inherent"
+status = "shipped"
+wire = "verified"
+notes = "The walk over the centroids carries its position from one quantile to the next while they do not decrease, so the list is split into maximal non decreasing runs and each run costs one pass. That is not an optimisation on top of the module, it is the module, and it is visible: asking for 0.5 then 0.1 then 0.9 of the samples one, two, three, four gives three, one and four, where asking for them in order gives three, one and four as well but by a different route. A client that sends its quantiles sorted pays for one pass over the whole list."
+
+[[command]]
+name = "TDIGEST.CDF"
+group = "tdigest"
+since = "2.4.0"
+arity = -3
+plan = "whole-value"
+bounded = "inherent"
+status = "shipped"
+wire = "verified"
+notes = "The fraction of the samples at or below each value, one pass over the centroids for each of them with no run splitting, since the cdf walk has nothing to carry. A value under the smallest sample is zero and one over the largest is one, and an empty digest answers NaN to everything. The doubles go out through the double reply, so RESP3 gets comma lines and RESP2 gets bulk strings of the shortest digits that read back as the same double."
+
+[[command]]
+name = "TDIGEST.TRIMMED_MEAN"
+group = "tdigest"
+since = "2.4.0"
+arity = 4
+plan = "whole-value"
+bounded = "inherent"
+status = "shipped"
+wire = "verified"
+notes = "The mean of what is left once both tails are cut, with the two cuts named as fractions rather than as values. The two arguments have separate parse errors and a shared range error, and the cuts have to be strictly in order, so a low equal to a high is refused rather than answering NaN. The centroid the cut lands inside is counted for the part of its weight that is on the right side of the line, which is what makes this smoother than picking whole centroids. This is the one read in the family the module does not mark fast."
+
+[[command]]
+name = "TDIGEST.RANK"
+group = "tdigest"
+since = "2.4.0"
+arity = -3
+plan = "whole-value"
+bounded = "inherent"
+status = "shipped"
+wire = "verified"
+notes = "How many samples each value is above, which is the cdf read back as a count and rounded. The rounding is the module's own half round down written out of modf, because C rounds a half away from zero and there is no library call for the other direction, and the reverse command rounds the ordinary way instead, so the two are not mirror images and a value in the middle of a tie can be one apart between them. Below the smallest sample the answer is minus one, above the largest it is the number of samples, and an empty digest answers minus two to everything."
+
+[[command]]
+name = "TDIGEST.REVRANK"
+group = "tdigest"
+since = "2.4.0"
+arity = -3
+plan = "whole-value"
+bounded = "inherent"
+status = "shipped"
+wire = "verified"
+notes = "How many samples each value is below. The two ends swap over from TDIGEST.RANK, so below the smallest sample is the number of samples and above the largest is minus one, and an empty digest is still minus two. The arithmetic is the size less the rounded product, rounded again, which is where it parts company with the forward direction."
+
+[[command]]
+name = "TDIGEST.BYRANK"
+group = "tdigest"
+since = "2.4.0"
+arity = -3
+plan = "whole-value"
+bounded = "inherent"
+status = "shipped"
+wire = "verified"
+notes = "The other direction, a rank in and a value out. Ranks are whole numbers and a negative one is refused with its own sentence rather than treated as an end. Rank zero is the smallest sample exactly and a rank at or past the number of samples is positive infinity, which goes out as the bare word inf on RESP3, and every rank on an empty digest is NaN. Everything in between asks the digest for the quantile at the rank over the size."
+
+[[command]]
+name = "TDIGEST.BYREVRANK"
+group = "tdigest"
+since = "2.4.0"
+arity = -3
+plan = "whole-value"
+bounded = "inherent"
+status = "shipped"
+wire = "verified"
+notes = "The same counting down from the largest, so rank zero is the largest sample and a rank past the end is negative infinity. The quantile it asks for is the size less the rank less one, all over the size, which is not one minus the forward quantile and does not round to it either."
+
+[[command]]
+name = "TDIGEST.INFO"
+group = "tdigest"
+since = "2.4.0"
+arity = 2
+plan = "metadata"
+bounded = "inherent"
+status = "shipped"
+wire = "verified"
+notes = "Nine fields, so eighteen elements on RESP2 and a map of nine on RESP3: compression, capacity, merged nodes, unmerged nodes, merged weight, unmerged weight, observations, total compressions and memory usage. Memory usage is the reference's formula rather than what the digest costs here, eighty bytes for the header and sixteen for every slot in the capacity, because it is a number a client compares between servers. The two are within a few bytes of each other anyway. The command carries the dont_cache tip on a real server and there is nowhere in Spec to put a tip yet, which is the same gap as CMS.INFO and CF.INFO."
 
 
 # ---------------------------------------------------------------------- array

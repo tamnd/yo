@@ -28,11 +28,12 @@
 //!
 //! The scaling Bloom filter, which is [`bloom::Bloom`], the cuckoo filter, which
 //! is [`cuckoo::Cuckoo`], the count min sketch, which is [`cms::Cms`], and the
-//! heavy keeper behind the top k, which is [`topk::TopK`]. The t digest goes
-//! beside them and is not written yet.
+//! heavy keeper behind the top k, which is [`topk::TopK`], and the t digest,
+//! which is [`tdigest::TDigest`].
 
 pub mod bloom;
 pub mod cms;
 pub mod cuckoo;
 mod hash;
+pub mod tdigest;
 pub mod topk;

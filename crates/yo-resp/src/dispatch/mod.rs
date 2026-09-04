@@ -76,6 +76,7 @@ mod sets;
 mod streams;
 mod strings;
 pub mod table;
+mod tdigest;
 mod topk;
 mod vectors;
 mod vfilter;
@@ -1157,7 +1158,9 @@ pub fn resolved(
     // two groups that hold them mark all of them rather than the session's.
     server.dirty |= match spec.group {
         "string" | "bitmap" | "hyperloglog" | "geo" | "set" | "hash" | "list" | "zset"
-        | "array" | "stream" | "bloom" | "cuckoo" | "cms" | "topk" => 1u64 << session.db,
+        | "array" | "stream" | "bloom" | "cuckoo" | "cms" | "topk" | "tdigest" => {
+            1u64 << session.db
+        }
         _ => ALL_DATABASES,
     };
 
@@ -1255,6 +1258,10 @@ pub fn resolved(
             "topk" => {
                 let db = session.db;
                 topk::execute(&mut server.dbs[db], spec, args, out).map(|()| Flow::Continue)
+            }
+            "tdigest" => {
+                let db = session.db;
+                tdigest::execute(&mut server.dbs[db], spec, args, out).map(|()| Flow::Continue)
             }
             // The clock is read before the database is borrowed, because every
             // stream command needs the time and it lives on the server. An
@@ -13633,6 +13640,469 @@ mod tests {
         assert_eq!(
             f.run(&[b"TOPK.INFO", b"t3"]),
             "-TopK: key does not exist\r\n"
+        );
+    }
+
+    // --------------------------------------------------------------- tdigest
+
+    /// `TDIGEST.CREATE` takes two arguments or four, and the keyword search is a
+    /// search rather than a lookup.
+    #[test]
+    fn a_create_takes_two_arguments_or_four_and_reads_the_last_one() {
+        let mut f = Fixture::new();
+        assert_eq!(f.run(&[b"TDIGEST.CREATE", b"t"]), "+OK\r\n");
+        // A hundred is the default and the capacity is six times it plus ten.
+        assert_eq!(
+            f.run(&[b"TDIGEST.INFO", b"t"]),
+            "*18\r\n+Compression\r\n:100\r\n+Capacity\r\n:610\r\n+Merged nodes\r\n:0\r\n\
+             +Unmerged nodes\r\n:0\r\n+Merged weight\r\n:0\r\n+Unmerged weight\r\n:0\r\n\
+             +Observations\r\n:0\r\n+Total compressions\r\n:0\r\n+Memory usage\r\n:9840\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"TDIGEST.CREATE", b"t"]),
+            "-ERR T-Digest: key already exists\r\n"
+        );
+        // Three arguments is an arity error and not a missing keyword.
+        assert!(
+            f.run(&[b"TDIGEST.CREATE", b"u", b"COMPRESSION"])
+                .contains("wrong number of arguments")
+        );
+        assert_eq!(
+            f.run(&[b"TDIGEST.CREATE", b"u", b"COMPRESSION", b"1000"]),
+            "+OK\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"TDIGEST.CREATE", b"v", b"compression", b"1"]),
+            "+OK\r\n"
+        );
+        // The word is looked for across both trailing arguments and the number
+        // is then read out of the last one whatever was found, so this looks for
+        // a number inside the word `COMPRESSION` and does not find one.
+        assert_eq!(
+            f.run(&[b"TDIGEST.CREATE", b"w", b"100", b"COMPRESSION"]),
+            "-ERR T-Digest: error parsing compression parameter\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"TDIGEST.CREATE", b"w", b"NOPE", b"100"]),
+            "-ERR T-Digest: wrong keyword\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"TDIGEST.CREATE", b"w", b"COMPRESSION", b"1.5"]),
+            "-ERR T-Digest: error parsing compression parameter\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"TDIGEST.CREATE", b"w", b"COMPRESSION", b"0"]),
+            "-ERR T-Digest: compression parameter needs to be a positive integer\r\n"
+        );
+        // The reference's own ceiling, which is where the capacity stops fitting
+        // in an int, and one past it.
+        assert_eq!(
+            f.run(&[b"TDIGEST.CREATE", b"w", b"COMPRESSION", b"357913942"]),
+            "-ERR T-Digest: allocation failed\r\n"
+        );
+        // And ours, which is a gibibyte of centroids and is D-52.
+        assert_eq!(
+            f.run(&[b"TDIGEST.CREATE", b"w", b"COMPRESSION", b"100000000"]),
+            "-ERR T-Digest: allocation failed\r\n"
+        );
+        // The key is checked before the arguments, so a bad compression at a key
+        // that is already a digest still says the key is taken.
+        assert_eq!(
+            f.run(&[b"TDIGEST.CREATE", b"t", b"COMPRESSION", b"0"]),
+            "-ERR T-Digest: key already exists\r\n"
+        );
+    }
+
+    /// The four samples every note about this family is written against, and the
+    /// answers a real 8.10.1 gives for them.
+    #[test]
+    fn the_quantile_family_answers_what_the_module_answers() {
+        let mut f = Fixture::new();
+        f.run(&[b"TDIGEST.CREATE", b"s"]);
+        assert_eq!(
+            f.run(&[b"TDIGEST.ADD", b"s", b"1", b"2", b"3", b"4"]),
+            "+OK\r\n"
+        );
+        assert_eq!(f.run(&[b"TDIGEST.MIN", b"s"]), "$1\r\n1\r\n");
+        assert_eq!(f.run(&[b"TDIGEST.MAX", b"s"]), "$1\r\n4\r\n");
+        // The cdf of a sample is the weight below it plus half its own.
+        assert_eq!(
+            f.run(&[b"TDIGEST.CDF", b"s", b"1", b"2", b"3", b"4"]),
+            "*4\r\n$5\r\n0.125\r\n$5\r\n0.375\r\n$5\r\n0.625\r\n$5\r\n0.875\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"TDIGEST.QUANTILE", b"s", b"0", b"0.5", b"1"]),
+            "*3\r\n$1\r\n1\r\n$1\r\n3\r\n$1\r\n4\r\n"
+        );
+        // Out of order, the walk restarts, and 0.5 answers 3 either way while
+        // the two after it are read from the front again.
+        assert_eq!(
+            f.run(&[b"TDIGEST.QUANTILE", b"s", b"0.5", b"0.1", b"0.9"]),
+            "*3\r\n$1\r\n3\r\n$1\r\n1\r\n$1\r\n4\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"TDIGEST.RANK", b"s", b"0", b"1", b"3", b"4", b"5"]),
+            "*5\r\n:-1\r\n:0\r\n:2\r\n:3\r\n:4\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"TDIGEST.REVRANK", b"s", b"0", b"1", b"3", b"4", b"5"]),
+            "*5\r\n:4\r\n:3\r\n:1\r\n:0\r\n:-1\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"TDIGEST.BYRANK", b"s", b"0", b"1", b"3", b"4"]),
+            "*4\r\n$1\r\n1\r\n$1\r\n2\r\n$1\r\n4\r\n$3\r\ninf\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"TDIGEST.BYREVRANK", b"s", b"0", b"1", b"3", b"4"]),
+            "*4\r\n$1\r\n4\r\n$1\r\n3\r\n$1\r\n1\r\n$4\r\n-inf\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"TDIGEST.TRIMMED_MEAN", b"s", b"0", b"1"]),
+            "$3\r\n2.5\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"TDIGEST.TRIMMED_MEAN", b"s", b"0.25", b"0.75"]),
+            "$3\r\n2.5\r\n"
+        );
+        // The ranges, which are separate sentences from the parse failures.
+        assert_eq!(
+            f.run(&[b"TDIGEST.QUANTILE", b"s", b"1.1"]),
+            "-ERR T-Digest: quantile should be in [0,1]\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"TDIGEST.QUANTILE", b"s", b"zzz"]),
+            "-ERR T-Digest: error parsing quantile\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"TDIGEST.CDF", b"s", b"zzz"]),
+            "-ERR T-Digest: error parsing cdf\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"TDIGEST.RANK", b"s", b"zzz"]),
+            "-ERR T-Digest: error parsing value\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"TDIGEST.BYRANK", b"s", b"-1"]),
+            "-ERR T-Digest: rank needs to be non negative\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"TDIGEST.BYRANK", b"s", b"1.5"]),
+            "-ERR T-Digest: error parsing rank\r\n"
+        );
+        // Both cuts have their own parse sentence and share the range one, and
+        // equal cuts are refused rather than answering nothing.
+        assert_eq!(
+            f.run(&[b"TDIGEST.TRIMMED_MEAN", b"s", b"zzz", b"0.9"]),
+            "-ERR T-Digest: error parsing low_cut_percentile\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"TDIGEST.TRIMMED_MEAN", b"s", b"0.1", b"zzz"]),
+            "-ERR T-Digest: error parsing high_cut_percentile\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"TDIGEST.TRIMMED_MEAN", b"s", b"0.1", b"1.1"]),
+            "-ERR T-Digest: low_cut_percentile and high_cut_percentile should be in [0,1]\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"TDIGEST.TRIMMED_MEAN", b"s", b"0.5", b"0.5"]),
+            "-ERR T-Digest: low_cut_percentile should be lower than high_cut_percentile\r\n"
+        );
+    }
+
+    /// An empty digest answers every question, and answers most of them with
+    /// something that is not a number.
+    #[test]
+    fn an_empty_digest_has_an_answer_for_everything() {
+        let mut f = Fixture::new();
+        f.run(&[b"TDIGEST.CREATE", b"e"]);
+        assert_eq!(f.run(&[b"TDIGEST.MIN", b"e"]), "$3\r\nnan\r\n");
+        assert_eq!(f.run(&[b"TDIGEST.MAX", b"e"]), "$3\r\nnan\r\n");
+        assert_eq!(
+            f.run(&[b"TDIGEST.QUANTILE", b"e", b"0", b"1"]),
+            "*2\r\n$3\r\nnan\r\n$3\r\nnan\r\n"
+        );
+        assert_eq!(f.run(&[b"TDIGEST.CDF", b"e", b"0"]), "*1\r\n$3\r\nnan\r\n");
+        assert_eq!(
+            f.run(&[b"TDIGEST.TRIMMED_MEAN", b"e", b"0.1", b"0.9"]),
+            "$3\r\nnan\r\n"
+        );
+        // Minus two, which is a number no rank on a digest with samples in it
+        // can ever be.
+        assert_eq!(
+            f.run(&[b"TDIGEST.RANK", b"e", b"0", b"1"]),
+            "*2\r\n:-2\r\n:-2\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"TDIGEST.REVRANK", b"e", b"0", b"1"]),
+            "*2\r\n:-2\r\n:-2\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"TDIGEST.BYRANK", b"e", b"0", b"5"]),
+            "*2\r\n$3\r\nnan\r\n$3\r\nnan\r\n"
+        );
+        // A reset puts a digest with samples back into exactly this state.
+        f.run(&[b"TDIGEST.ADD", b"e", b"1", b"2", b"3"]);
+        assert_eq!(f.run(&[b"TDIGEST.RESET", b"e"]), "+OK\r\n");
+        assert_eq!(f.run(&[b"TDIGEST.MIN", b"e"]), "$3\r\nnan\r\n");
+        // Down to the compression count, so a reset digest and a fresh one of
+        // the same compression report the same nine numbers.
+        f.run(&[b"TDIGEST.CREATE", b"e2"]);
+        assert_eq!(
+            f.run(&[b"TDIGEST.INFO", b"e"]),
+            f.run(&[b"TDIGEST.INFO", b"e2"])
+        );
+    }
+
+    /// The double parser is Redis's and not this engine's, and the two disagree
+    /// at both ends of the range.
+    #[test]
+    fn a_sample_is_read_the_way_redis_reads_a_double() {
+        let mut f = Fixture::new();
+        f.run(&[b"TDIGEST.CREATE", b"a"]);
+        // Overflow and underflow are parse failures rather than an infinity and
+        // a zero, which is where this parts company with the rest of the engine.
+        for bad in [
+            &b"nan"[..],
+            b"1e400",
+            b"-1e400",
+            b"1e309",
+            b"1e-400",
+            b"",
+            b" 1",
+            b"1 ",
+            b"1e",
+            b"--1",
+        ] {
+            assert_eq!(
+                f.run(&[b"TDIGEST.ADD", b"a", bad]),
+                "-ERR T-Digest: error parsing val parameter\r\n",
+                "{}",
+                String::from_utf8_lossy(bad)
+            );
+        }
+        // An infinity spelled out parses and is then refused for being one, with
+        // a different sentence.
+        for word in [&b"inf"[..], b"-inf", b"+INF", b"Infinity"] {
+            assert_eq!(
+                f.run(&[b"TDIGEST.ADD", b"a", word]),
+                "-ERR T-Digest: val parameter needs to be a finite number\r\n",
+                "{}",
+                String::from_utf8_lossy(word)
+            );
+        }
+        // These all parse: hex, a bare point either side, and the smallest
+        // subnormal the reference will take.
+        for good in [&b"0x10"[..], b".5", b"1.", b"1e-320", b"-0", b"0"] {
+            assert_eq!(
+                f.run(&[b"TDIGEST.ADD", b"a", good]),
+                "+OK\r\n",
+                "{}",
+                String::from_utf8_lossy(good)
+            );
+        }
+        // Nothing landed from the failures, so six samples is what there is.
+        assert!(
+            f.run(&[b"TDIGEST.INFO", b"a"])
+                .contains("Observations\r\n:6\r\n")
+        );
+        // Every value is parsed before any is added, so this whole command is a
+        // no op.
+        assert_eq!(
+            f.run(&[b"TDIGEST.ADD", b"a", b"1", b"zzz"]),
+            "-ERR T-Digest: error parsing val parameter\r\n"
+        );
+        assert!(
+            f.run(&[b"TDIGEST.INFO", b"a"])
+                .contains("Observations\r\n:6\r\n")
+        );
+    }
+
+    /// What a merge does to its destination, to its inputs and to the buffer
+    /// split `TDIGEST.INFO` reports.
+    #[test]
+    fn a_merge_sweeps_the_destination_between_its_inputs() {
+        let mut f = Fixture::new();
+        f.run(&[b"TDIGEST.CREATE", b"m1", b"COMPRESSION", b"100"]);
+        f.run(&[b"TDIGEST.ADD", b"m1", b"1", b"2", b"3"]);
+        f.run(&[b"TDIGEST.CREATE", b"m2", b"COMPRESSION", b"200"]);
+        f.run(&[b"TDIGEST.ADD", b"m2", b"4", b"5", b"6"]);
+        assert_eq!(
+            f.run(&[b"TDIGEST.MERGE", b"d", b"2", b"m1", b"m2"]),
+            "+OK\r\n"
+        );
+        // The destination did not exist, so the compression is the largest of
+        // the inputs. The three from the first input were swept in before the
+        // three from the second arrived, which is the one visible effect of the
+        // reference folding one input at a time.
+        let info = f.run(&[b"TDIGEST.INFO", b"d"]);
+        assert!(info.contains("Compression\r\n:200\r\n"), "{info}");
+        assert!(info.contains("Merged nodes\r\n:3\r\n"), "{info}");
+        assert!(info.contains("Unmerged nodes\r\n:3\r\n"), "{info}");
+        assert!(info.contains("Total compressions\r\n:1\r\n"), "{info}");
+        assert_eq!(f.run(&[b"TDIGEST.MIN", b"d"]), "$1\r\n1\r\n");
+        assert_eq!(f.run(&[b"TDIGEST.MAX", b"d"]), "$1\r\n6\r\n");
+        // Reading a source sweeps it too, so a merge writes to keys it only
+        // reads from.
+        assert!(
+            f.run(&[b"TDIGEST.INFO", b"m1"])
+                .contains("Merged nodes\r\n:3\r\n")
+        );
+        // Without OVERRIDE the destination joins its own inputs, so this takes
+        // it to nine observations and keeps its own compression.
+        f.run(&[b"TDIGEST.MERGE", b"d", b"1", b"m1"]);
+        let info = f.run(&[b"TDIGEST.INFO", b"d"]);
+        assert!(info.contains("Observations\r\n:9\r\n"), "{info}");
+        assert!(info.contains("Compression\r\n:200\r\n"), "{info}");
+        // With OVERRIDE the old destination is dropped and the compression goes
+        // back to the largest of the inputs.
+        f.run(&[b"TDIGEST.MERGE", b"d", b"1", b"m1", b"OVERRIDE"]);
+        let info = f.run(&[b"TDIGEST.INFO", b"d"]);
+        assert!(info.contains("Observations\r\n:3\r\n"), "{info}");
+        assert!(info.contains("Compression\r\n:100\r\n"), "{info}");
+        // And COMPRESSION beats both.
+        f.run(&[b"TDIGEST.MERGE", b"d", b"1", b"m1", b"COMPRESSION", b"500"]);
+        assert!(
+            f.run(&[b"TDIGEST.INFO", b"d"])
+                .contains("Compression\r\n:500\r\n")
+        );
+        // Naming the destination as a source folds it in twice.
+        f.run(&[b"TDIGEST.MERGE", b"d", b"1", b"d"]);
+        assert!(
+            f.run(&[b"TDIGEST.INFO", b"d"])
+                .contains("Observations\r\n:12\r\n")
+        );
+        // The arguments, in the order the reference checks them.
+        assert_eq!(
+            f.run(&[b"TDIGEST.MERGE", b"d", b"zzz", b"m1"]),
+            "-ERR T-Digest: error parsing numkeys\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"TDIGEST.MERGE", b"d", b"0", b"m1"]),
+            "-ERR T-Digest: numkeys needs to be a positive integer\r\n"
+        );
+        assert!(
+            f.run(&[b"TDIGEST.MERGE", b"d", b"3", b"m1", b"m2"])
+                .contains("wrong number of arguments")
+        );
+        assert!(
+            f.run(&[b"TDIGEST.MERGE", b"d", b"1", b"m1", b"COMPRESSION"])
+                .contains("wrong number of arguments")
+        );
+        assert_eq!(
+            f.run(&[b"TDIGEST.MERGE", b"d", b"1", b"m1", b"NOPE"]),
+            "-ERR T-Digest: wrong keyword\r\n"
+        );
+        // A source that is not there stops the whole thing, and the destination
+        // is left as it was.
+        assert_eq!(
+            f.run(&[b"TDIGEST.MERGE", b"d", b"2", b"m1", b"gone"]),
+            "-ERR T-Digest: key does not exist\r\n"
+        );
+        assert!(
+            f.run(&[b"TDIGEST.INFO", b"d"])
+                .contains("Observations\r\n:12\r\n")
+        );
+        // A destination that is not there and is also named as a source is the
+        // same sentence rather than an empty merge.
+        assert_eq!(
+            f.run(&[b"TDIGEST.MERGE", b"gone", b"1", b"gone"]),
+            "-ERR T-Digest: key does not exist\r\n"
+        );
+    }
+
+    /// The RESP3 shapes, which are the two the protocols disagree about.
+    #[test]
+    fn a_digest_answers_doubles_and_a_map_on_resp3() {
+        let mut f = Fixture::new();
+        f.run(&[b"HELLO", b"3"]);
+        f.run(&[b"TDIGEST.CREATE", b"s"]);
+        f.run(&[b"TDIGEST.ADD", b"s", b"1", b"2", b"3", b"4"]);
+        assert_eq!(f.run(&[b"TDIGEST.MIN", b"s"]), ",1\r\n");
+        assert_eq!(
+            f.run(&[b"TDIGEST.QUANTILE", b"s", b"0", b"1"]),
+            "*2\r\n,1\r\n,4\r\n"
+        );
+        assert_eq!(f.run(&[b"TDIGEST.CDF", b"s", b"1"]), "*1\r\n,0.125\r\n");
+        // The two infinities and the NaN go out as the bare words.
+        assert_eq!(f.run(&[b"TDIGEST.BYRANK", b"s", b"4"]), "*1\r\n,inf\r\n");
+        assert_eq!(
+            f.run(&[b"TDIGEST.BYREVRANK", b"s", b"4"]),
+            "*1\r\n,-inf\r\n"
+        );
+        f.run(&[b"TDIGEST.CREATE", b"e"]);
+        assert_eq!(f.run(&[b"TDIGEST.MIN", b"e"]), ",nan\r\n");
+        // The ranks stay integers on both protocols.
+        assert_eq!(f.run(&[b"TDIGEST.RANK", b"s", b"1"]), "*1\r\n:0\r\n");
+        // Every question above swept the buffer in, so the four samples are all
+        // merged by now and the compression count says it happened once.
+        assert_eq!(
+            f.run(&[b"TDIGEST.INFO", b"s"]),
+            "%9\r\n+Compression\r\n:100\r\n+Capacity\r\n:610\r\n+Merged nodes\r\n:4\r\n\
+             +Unmerged nodes\r\n:0\r\n+Merged weight\r\n:4\r\n+Unmerged weight\r\n:0\r\n\
+             +Observations\r\n:4\r\n+Total compressions\r\n:1\r\n+Memory usage\r\n:9840\r\n"
+        );
+    }
+
+    /// A t digest key answers the module sentences the other sketch families
+    /// answer, and its own word for its type.
+    #[test]
+    fn a_t_digest_is_a_module_key_to_the_rest_of_the_keyspace() {
+        let mut f = Fixture::new();
+        f.run(&[b"SET", b"s", b"text"]);
+        for cmd in [
+            vec![&b"TDIGEST.CREATE"[..], b"s"],
+            vec![&b"TDIGEST.RESET"[..], b"s"],
+            vec![&b"TDIGEST.ADD"[..], b"s", b"1"],
+            vec![&b"TDIGEST.MIN"[..], b"s"],
+            vec![&b"TDIGEST.MAX"[..], b"s"],
+            vec![&b"TDIGEST.QUANTILE"[..], b"s", b"0.5"],
+            vec![&b"TDIGEST.CDF"[..], b"s", b"1"],
+            vec![&b"TDIGEST.TRIMMED_MEAN"[..], b"s", b"0.1", b"0.9"],
+            vec![&b"TDIGEST.RANK"[..], b"s", b"1"],
+            vec![&b"TDIGEST.REVRANK"[..], b"s", b"1"],
+            vec![&b"TDIGEST.BYRANK"[..], b"s", b"0"],
+            vec![&b"TDIGEST.BYREVRANK"[..], b"s", b"0"],
+            vec![&b"TDIGEST.INFO"[..], b"s"],
+        ] {
+            let name = String::from_utf8_lossy(cmd[0]).into_owned();
+            let reply = f.run(&cmd);
+            assert!(reply.starts_with("-WRONGTYPE"), "{name}: {reply}");
+        }
+        // The merge checks its destination the same way, and its sources too.
+        f.run(&[b"TDIGEST.CREATE", b"t"]);
+        assert!(
+            f.run(&[b"TDIGEST.MERGE", b"s", b"1", b"t"])
+                .starts_with("-WRONGTYPE")
+        );
+        assert!(
+            f.run(&[b"TDIGEST.MERGE", b"d", b"1", b"s"])
+                .starts_with("-WRONGTYPE")
+        );
+        assert_eq!(
+            f.run(&[b"COPY", b"t", b"t2"]),
+            "-ERR not supported for this module key\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"DUMP", b"t"]),
+            "-ERR DUMP is not supported for this module key\r\n"
+        );
+        assert_eq!(f.run(&[b"EXPIRE", b"t", b"100"]), ":1\r\n");
+        assert_eq!(f.run(&[b"PERSIST", b"t"]), ":1\r\n");
+        assert_eq!(f.run(&[b"RENAME", b"t", b"t3"]), "+OK\r\n");
+        assert_eq!(f.run(&[b"TYPE", b"t3"]), "+TDIS-TYPE\r\n");
+        assert_eq!(f.run(&[b"OBJECT", b"ENCODING", b"t3"]), "$3\r\nraw\r\n");
+        assert_eq!(f.run(&[b"DEL", b"t3"]), ":1\r\n");
+        // An empty digest is still a key, so the twelve that are not the
+        // constructor all say the same thing once it is gone.
+        assert_eq!(
+            f.run(&[b"TDIGEST.INFO", b"t3"]),
+            "-ERR T-Digest: key does not exist\r\n"
+        );
+        // The key is looked at before the arguments, so a bad argument at a key
+        // that is not there still says the key is not there.
+        assert_eq!(
+            f.run(&[b"TDIGEST.QUANTILE", b"t3", b"zzz"]),
+            "-ERR T-Digest: key does not exist\r\n"
         );
     }
 
