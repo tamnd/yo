@@ -6270,6 +6270,160 @@ mod tests {
     }
 
     #[test]
+    fn a_block_move_orders_the_block_by_the_ends_and_the_ordering_word() {
+        // OBO is what you get from sending LMOVE that many times, BULK keeps
+        // the source order. The two only differ when both ends are the same,
+        // which is the whole reason the word exists.
+        for (from, to, order, want) in [
+            ("LEFT", "RIGHT", "OBO", ["a", "b"]),
+            ("LEFT", "RIGHT", "BULK", ["a", "b"]),
+            ("LEFT", "LEFT", "OBO", ["b", "a"]),
+            ("LEFT", "LEFT", "BULK", ["a", "b"]),
+            ("RIGHT", "LEFT", "OBO", ["d", "e"]),
+            ("RIGHT", "LEFT", "BULK", ["d", "e"]),
+            ("RIGHT", "RIGHT", "OBO", ["e", "d"]),
+            ("RIGHT", "RIGHT", "BULK", ["d", "e"]),
+        ] {
+            let mut f = Fixture::new();
+            f.run(&[b"RPUSH", b"s", b"a", b"b", b"c", b"d", b"e"]);
+            let how = format!("{from} {to} {order}");
+            let reply = f.run(&[
+                b"LMOVEM",
+                b"s",
+                b"d",
+                from.as_bytes(),
+                to.as_bytes(),
+                b"COUNT",
+                b"2",
+                order.as_bytes(),
+            ]);
+            assert_eq!(reply, bulks(&want), "the reply for {how}");
+            assert_eq!(
+                f.run(&[b"LRANGE", b"d", b"0", b"-1"]),
+                bulks(&want),
+                "the destination for {how}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_block_move_of_one_needs_no_count_at_all() {
+        let mut f = Fixture::new();
+        f.run(&[b"RPUSH", b"s", b"a", b"b", b"c"]);
+        assert_eq!(
+            f.run(&[b"LMOVEM", b"s", b"d", b"LEFT", b"RIGHT"]),
+            bulks(&["a"])
+        );
+        assert_eq!(f.run(&[b"LRANGE", b"s", b"0", b"-1"]), bulks(&["b", "c"]));
+        // Six and seven arguments are neither of the two forms, so the
+        // reference calls both of them a syntax error rather than guessing.
+        assert_eq!(
+            f.run(&[b"LMOVEM", b"s", b"d", b"LEFT", b"RIGHT", b"COUNT"]),
+            "-ERR syntax error\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"LMOVEM", b"s", b"d", b"LEFT", b"RIGHT", b"COUNT", b"2"]),
+            "-ERR syntax error\r\n"
+        );
+    }
+
+    #[test]
+    fn a_block_move_with_exactly_takes_all_of_them_or_none() {
+        let mut f = Fixture::new();
+        f.run(&[b"RPUSH", b"s", b"a", b"b", b"c"]);
+        // A null array and not a null bulk string, which `redis-cli` prints as
+        // `(nil)` either way and only the raw wire tells apart. What it would
+        // have sent is an array, so its nothing is an array's nothing.
+        assert_eq!(
+            f.run(&[
+                b"LMOVEM", b"s", b"d", b"LEFT", b"RIGHT", b"EXACTLY", b"99", b"BULK"
+            ]),
+            "*-1\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"LRANGE", b"s", b"0", b"-1"]),
+            bulks(&["a", "b", "c"])
+        );
+        // COUNT takes what there is, and an emptied source goes away.
+        assert_eq!(
+            f.run(&[
+                b"LMOVEM", b"s", b"d", b"LEFT", b"RIGHT", b"COUNT", b"99", b"BULK"
+            ]),
+            bulks(&["a", "b", "c"])
+        );
+        assert_eq!(f.run(&[b"EXISTS", b"s"]), ":0\r\n");
+        assert_eq!(
+            f.run(&[
+                b"LMOVEM", b"s", b"d", b"LEFT", b"RIGHT", b"COUNT", b"1", b"BULK"
+            ]),
+            "*-1\r\n"
+        );
+    }
+
+    #[test]
+    fn a_block_move_onto_itself_rotates_by_the_count() {
+        let mut f = Fixture::new();
+        f.run(&[b"RPUSH", b"s", b"a", b"b", b"c"]);
+        assert_eq!(
+            f.run(&[
+                b"LMOVEM", b"s", b"s", b"LEFT", b"RIGHT", b"COUNT", b"2", b"BULK"
+            ]),
+            bulks(&["a", "b"])
+        );
+        assert_eq!(
+            f.run(&[b"LRANGE", b"s", b"0", b"-1"]),
+            bulks(&["c", "a", "b"])
+        );
+    }
+
+    #[test]
+    fn a_block_move_reads_the_count_before_the_ordering_word() {
+        let mut f = Fixture::new();
+        f.run(&[b"RPUSH", b"s", b"a", b"b"]);
+        f.run(&[b"SET", b"str", b"v"]);
+        let count = "-ERR count should be greater than 0\r\n";
+        assert_eq!(
+            f.run(&[
+                b"LMOVEM", b"s", b"d", b"LEFT", b"RIGHT", b"COUNT", b"abc", b"NOPE"
+            ]),
+            count
+        );
+        assert_eq!(
+            f.run(&[
+                b"LMOVEM", b"s", b"d", b"LEFT", b"RIGHT", b"COUNT", b"0", b"BULK"
+            ]),
+            count
+        );
+        assert_eq!(
+            f.run(&[
+                b"LMOVEM", b"s", b"d", b"LEFT", b"RIGHT", b"COUNT", b"1", b"NOPE"
+            ]),
+            "-ERR syntax error\r\n"
+        );
+        assert_eq!(
+            f.run(&[
+                b"LMOVEM", b"s", b"d", b"LEFT", b"RIGHT", b"NOPE", b"abc", b"BULK"
+            ]),
+            "-ERR syntax error\r\n"
+        );
+        // Every argument is read before the keys are looked at, so a bad count
+        // beats a wrong type even when the type is wrong on the source.
+        assert_eq!(
+            f.run(&[
+                b"LMOVEM", b"str", b"d", b"LEFT", b"RIGHT", b"COUNT", b"abc", b"BULK"
+            ]),
+            count
+        );
+        assert_eq!(
+            f.run(&[
+                b"LMOVEM", b"s", b"str", b"LEFT", b"RIGHT", b"COUNT", b"1", b"BULK"
+            ]),
+            "-WRONGTYPE Operation against a key holding the wrong kind of value\r\n"
+        );
+        assert_eq!(f.run(&[b"LRANGE", b"s", b"0", b"-1"]), bulks(&["a", "b"]));
+    }
+
+    #[test]
     fn lmpop_answers_from_the_first_key_that_has_anything() {
         let mut f = Fixture::new();
         f.run(&[b"RPUSH", b"b", b"1", b"2", b"3"]);

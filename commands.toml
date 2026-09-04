@@ -1782,9 +1782,9 @@ since = "8.10.0"
 arity = -5
 plan = "point"
 bounded = "yes"
-status = "planned"
-wire = "none"
-notes = "New in 8.10 and not written yet. LMOVE with a count, so a batch of elements crosses between two lists in one call instead of one round trip each. It is bounded rather than inherent because the count is the client's, which is the difference between this and LMOVE."
+status = "shipped"
+wire = "verified"
+notes = "LMOVE with a count, so a batch of elements crosses between two lists in one call instead of one round trip each. It is bounded rather than inherent because the count is the client's, which is the difference between this and LMOVE. COUNT takes what it can and EXACTLY takes all of them or none, which has to be decided before anything is taken. OBO and BULK only differ when both ends are the same, because that is when each element lands in front of the last, and the whole block goes through the scratch buffer before any of it is pushed so that the destination is allowed to be the source."
 
 [[command]]
 name = "BLMOVEM"

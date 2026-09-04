@@ -24,8 +24,8 @@
 //! afterwards through [`Out::close_array`]. A list of ten thousand elements is
 //! never a `Vec` of ten thousand anything on this thread (Y18).
 
-use yo_common::{Code, Error, Result};
-use yo_kv::{End, Entry, Keyspace};
+use yo_common::{Code, Error, Result, parse_i64};
+use yo_kv::{Block, End, Entry, Keyspace, Order};
 
 use super::args::{self, Args};
 use super::table::Spec;
@@ -39,6 +39,9 @@ use crate::reply::Out;
 const BAD_POP_COUNT: &str = "value is out of range, must be positive";
 /// `LMPOP`'s two, which are its own sentences and not the usual ones.
 pub(super) const BAD_NUMKEYS: &str = "numkeys should be greater than 0";
+/// `LMPOP`'s count, and `LMOVEM`'s, which turned out to be the same sentence.
+/// Both say it for zero, for a negative and for something that is not a number
+/// at all, the way `SPOP`'s message does.
 pub(super) const BAD_MPOP_COUNT: &str = "count should be greater than 0";
 /// What `LPOS` says about the two options that may not be negative.
 const BAD_COUNT: &str = "COUNT can't be negative";
@@ -97,6 +100,7 @@ pub(super) fn execute(db: &mut Keyspace, spec: &Spec, args: Args<'_>, out: &mut 
             let to = end_of(args.get(4))?;
             moved(db, args.get(1), args.get(2), from, to, out)?;
         }
+        "lmovem" => movem(db, args, out)?,
         "lmpop" => mpop(db, args, out)?,
         other => unreachable!("the table sent {other} to the list group"),
     }
@@ -264,6 +268,82 @@ fn moved(
     match db.lmove(src, dst, from, to)? {
         Some(v) => out.bulk(v),
         None => out.nil(),
+    }
+    Ok(())
+}
+
+/// `LMOVEM src dst LEFT|RIGHT LEFT|RIGHT [COUNT|EXACTLY n OBO|BULK]`.
+///
+/// The trailing block is all or nothing: with it, both the count and the
+/// ordering word have to be there, and `LMOVEM s d LEFT RIGHT COUNT 2` on its
+/// own is a syntax error. Without it the command moves one element, which is
+/// `LMOVE` with an array around the answer.
+///
+/// A count that is zero, negative or not a number at all gets the same sentence,
+/// which is 8.10.1's behaviour and reads the way `SPOP`'s does: whatever the
+/// client typed, what it needs told is which argument was wrong.
+///
+/// Nothing moved is a nil and not an empty array, so a caller can tell a source
+/// that was not there from one that was. It is a null *array* and not a null
+/// bulk string, which matters and is not visible through `redis-cli`, because
+/// that prints `(nil)` for both. `LMOVE` answers `$-1` because what it would
+/// have sent is one element, and `LMOVEM` answers `*-1` because what it would
+/// have sent is an array, which is the same rule that makes `LPOP k` a `$-1` and
+/// `LPOP k 2` a `*-1`. Read off the wire rather than off a client.
+fn movem(db: &mut Keyspace, args: Args<'_>, out: &mut Out) -> Result<()> {
+    let from = end_of(args.get(3))?;
+    let to = end_of(args.get(4))?;
+    let (count, exactly, order) = match args.len() {
+        5 => (1usize, false, Order::Bulk),
+        8 => {
+            let exactly = if args::is(args.get(5), b"exactly") {
+                true
+            } else if args::is(args.get(5), b"count") {
+                false
+            } else {
+                return Err(args::syntax());
+            };
+            // The count is read before the ordering word, which is only visible
+            // on a line that is wrong in both places: 8.10.1 answers about the
+            // count there. The order the two are looked at in is the sort of
+            // thing a client's own test suite pins, so it was measured rather
+            // than picked.
+            let count = match parse_i64(args.get(6)) {
+                Some(n) if n > 0 => usize::try_from(n).unwrap_or(usize::MAX),
+                _ => return Err(Error::new(Code::Invalid, BAD_MPOP_COUNT)),
+            };
+            let order = if args::is(args.get(7), b"obo") {
+                Order::OneByOne
+            } else if args::is(args.get(7), b"bulk") {
+                Order::Bulk
+            } else {
+                return Err(args::syntax());
+            };
+            (count, exactly, order)
+        }
+        _ => return Err(args::syntax()),
+    };
+
+    // Written before the header for the same reason the set algebra's are: how
+    // many moved is what the move produced, and an `EXACTLY` that came up short
+    // produces none of them.
+    let start = out.len();
+    let mut n = 0;
+    let block = Block {
+        from,
+        to,
+        count,
+        exactly,
+        order,
+    };
+    db.lmovem(args.get(1), args.get(2), block, |v| {
+        out.bulk(v);
+        n += 1;
+    })?;
+    if n == 0 {
+        out.nil_array();
+    } else {
+        out.close_array(start, n);
     }
     Ok(())
 }
