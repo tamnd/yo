@@ -6000,7 +6000,10 @@ mod tests {
             total += steps;
         }
         assert!(worst <= 2, "worst probe is {worst} slots");
-        assert_eq!(worst, 1, "the multiplier stopped keeping every command close");
+        assert_eq!(
+            worst, 1,
+            "the multiplier stopped keeping every command close"
+        );
         assert!(
             total <= 21,
             "{total} extra slots walked over the whole table"
