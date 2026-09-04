@@ -11872,6 +11872,117 @@ mod tests {
         assert_eq!(f.run(&[b"VINFO", b"nokey"]), "$-1\r\n");
     }
 
+    /// A set to read ranges of names out of.
+    fn named() -> Fixture {
+        let mut f = Fixture::new();
+        for (i, name) in ["alpha", "beta", "gamma", "delta", "epsilon"]
+            .iter()
+            .enumerate()
+        {
+            let x = (i + 1).to_string();
+            f.run(&[
+                b"VADD",
+                b"r",
+                b"VALUES",
+                b"2",
+                x.as_bytes(),
+                b"1",
+                name.as_bytes(),
+            ]);
+        }
+        f
+    }
+
+    /// `VRANGE` reads the names in the order bytes come in and pays no
+    /// attention to where the vectors point.
+    #[test]
+    fn vrange_walks_the_names_and_not_the_vectors() {
+        let mut f = named();
+        assert_eq!(
+            f.run(&[b"VRANGE", b"r", b"-", b"+"]),
+            "*5\r\n$5\r\nalpha\r\n$4\r\nbeta\r\n$5\r\ndelta\r\n$7\r\nepsilon\r\n$5\r\ngamma\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"VRANGE", b"r", b"[a", b"[d"]),
+            "*2\r\n$5\r\nalpha\r\n$4\r\nbeta\r\n",
+            "the high end is a name and not a prefix, so delta is past it"
+        );
+        assert_eq!(
+            f.run(&[b"VRANGE", b"r", b"(alpha", b"(gamma"]),
+            "*3\r\n$4\r\nbeta\r\n$5\r\ndelta\r\n$7\r\nepsilon\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"VRANGE", b"r", b"[beta", b"[beta"]),
+            "*1\r\n$4\r\nbeta\r\n"
+        );
+        assert_eq!(f.run(&[b"VRANGE", b"r", b"[z", b"+"]), "*0\r\n");
+        // Bytes and not letters, so an upper case name sorts before every lower
+        // case one rather than beside its own spelling.
+        f.run(&[b"VADD", b"r", b"VALUES", b"2", b"1", b"1", b"Beta"]);
+        assert_eq!(
+            f.run(&[b"VRANGE", b"r", b"-", b"[beta"]),
+            "*3\r\n$4\r\nBeta\r\n$5\r\nalpha\r\n$4\r\nbeta\r\n"
+        );
+        assert_eq!(f.run(&[b"VRANGE", b"nokey", b"-", b"+"]), "*0\r\n");
+    }
+
+    /// The count cuts the answer after the range is decided, and zero is not
+    /// the same as leaving it out.
+    #[test]
+    fn a_vrange_count_of_zero_asks_for_nothing() {
+        let mut f = named();
+        assert_eq!(
+            f.run(&[b"VRANGE", b"r", b"-", b"+", b"2"]),
+            "*2\r\n$5\r\nalpha\r\n$4\r\nbeta\r\n"
+        );
+        assert_eq!(f.run(&[b"VRANGE", b"r", b"-", b"+", b"0"]), "*0\r\n");
+        assert!(
+            f.run(&[b"VRANGE", b"r", b"-", b"+", b"-1"])
+                .starts_with("*5\r\n"),
+            "a negative count is no limit at all"
+        );
+    }
+
+    /// Both ends are read before either is placed, and the count is read before
+    /// either end.
+    #[test]
+    fn vrange_says_which_end_it_could_not_read() {
+        let mut f = named();
+        assert_eq!(
+            f.run(&[b"VRANGE", b"r", b"x", b"y"]),
+            "-ERR invalid start range format\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"VRANGE", b"r", b"+", b"x"]),
+            "-ERR invalid end range format\r\n",
+            "the high end is spelled wrong, which is worth saying before the \
+             low end being on the wrong side"
+        );
+        assert_eq!(
+            f.run(&[b"VRANGE", b"r", b"+", b"-"]),
+            "-ERR '-' can only be used as first argument, '+' only as second\r\n"
+        );
+        // A bracket with nothing after it is not the empty name here, though an
+        // element really can be called that.
+        assert_eq!(
+            f.run(&[b"VRANGE", b"r", b"[", b"+"]),
+            "-ERR invalid start range format\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"VRANGE", b"r", b"x", b"+", b"z"]),
+            "-ERR invalid COUNT value\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"VRANGE", b"r", b"-", b"+", b"2", b"extra"]),
+            "-ERR wrong number of arguments for 'VRANGE' command\r\n"
+        );
+        f.run(&[b"SET", b"s", b"x"]);
+        assert!(
+            f.run(&[b"VRANGE", b"s", b"-", b"+"])
+                .starts_with("-WRONGTYPE")
+        );
+    }
+
     /// The option that asks for something this index does not have says so
     /// rather than doing something else quietly.
     #[test]

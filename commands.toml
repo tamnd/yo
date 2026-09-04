@@ -143,10 +143,10 @@ doc = "09 section 2"
 
 [[group]]
 name = "vector"
-expected = 12
+expected = 13
 status = "shipped"
 doc = "10 section 9"
-# Redis's twelve, with Redis's names and Redis's argument order, over an index
+# Redis's thirteen, with Redis's names and Redis's argument order, over an index
 # that is not the one Redis has. That is the whole point of the group: the
 # reason to keep the command surface exactly is so a client can be pointed at
 # either server without a change, and the reason to keep a different index is
@@ -154,6 +154,16 @@ doc = "10 section 9"
 # memory. Where the difference reaches the wire it is D-2 for VLINKS, D-31 and
 # D-32 for the two options that ask for something the index does not have, and
 # D-33 for the one number beside FILTER that means something else here.
+#
+# Two things about the group are the module's own doing rather than anybody's
+# design and are copied because a client can see both. The names are registered
+# in upper case, so COMMAND INFO vadd answers VADD and an arity error quotes
+# VADD, which is the only group here that is not lower case. And none of the
+# thirteen is in any ACL category at all: there is no vectorset category on a
+# real server, ACL CAT vectorset is an unknown category there, and COMMAND LIST
+# FILTERBY ACLCAT read does not answer VSIM. Inventing a category would make a
+# rule written here mean something it does not mean there, in the direction that
+# grants access rather than the one that refuses it.
 
 [[group]]
 name = "bloom"
@@ -2944,6 +2954,17 @@ bounded = "inherent"
 status = "shipped"
 wire = "verified"
 notes = "A null for an element with no attribute and a null for an element that is not there, which is the same reply for two different facts and is what a real vector set answers. VISMEMBER is how a client tells them apart, and adding a third reply here to save that round trip would be a divergence bought for nothing."
+
+[[command]]
+name = "VRANGE"
+group = "vector"
+since = "8.4.0"
+arity = -4
+plan = "cursor"
+bounded = "risk"
+status = "shipped"
+wire = "verified"
+notes = "The only command in the group that never looks at a vector. It reads the element names as names, in the order bytes come in, with the same four spellings a lex range has anywhere else, so a client can page over a set that is being written to without holding a cursor and without the repeats and misses a random draw gives it. One spelling is not the same as elsewhere: a bracket with nothing after it is an error here rather than the empty name, which matters because an element really can be called the empty string and so the two answers are about a real element. The count is read before either end, so a request that has a bad range and a bad count is told about the count. Both ends are read before either is placed, so a range written backwards is told about its spelling first and about its direction second. Zero is not the same as leaving the count out, since a client that asked for no elements is given none, and a negative count is no limit at all. The range is decided first and only what it covers is sorted, which is what keeps reading ten names off a large set from sorting the whole of it."
 
 
 # ----------------------------------------------------------------------- bloom

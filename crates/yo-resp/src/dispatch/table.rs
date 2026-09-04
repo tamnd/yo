@@ -132,15 +132,30 @@ const AC_ZSET_BLOCKING_SLOW: &[&str] = &["@write", "@sortedset", "@slow", "@bloc
 const AC_GEO_READ: &[&str] = &["@read", "@geo", "@slow"];
 /// The geo write side, which is GEOADD and the four forms that can store.
 const AC_GEO_WRITE: &[&str] = &["@write", "@geo", "@slow"];
-/// The vector set read side, for the ones that answer about one element.
-const AC_VECTOR_READ_FAST: &[&str] = &["@read", "@vectorset", "@fast"];
-/// The vector set read side for the ones that search or draw.
-const AC_VECTOR_READ_SLOW: &[&str] = &["@read", "@vectorset", "@slow"];
-/// The vector set write side for the ones that only touch what is beside the
-/// vector.
-const AC_VECTOR_WRITE_FAST: &[&str] = &["@write", "@vectorset", "@fast"];
-/// The vector set write side for `VADD`, which searches on the way in.
-const AC_VECTOR_WRITE_SLOW: &[&str] = &["@write", "@vectorset", "@slow"];
+/// No ACL categories at all, which is what the vector set module registers.
+///
+/// It is the only group here with an empty list and it is not an omission. The
+/// module never calls the categories in, so a real server has no `vectorset`
+/// category to name, `ACL CAT vectorset` is an unknown category there, and
+/// `COMMAND LIST FILTERBY ACLCAT read` does not answer `VSIM`. Inventing a
+/// category would make a rule written against this server mean something it
+/// does not mean against a real one, which is the one thing a compatible ACL
+/// must not do, and it would do it in the direction that grants access rather
+/// than the direction that refuses it.
+const AC_NONE: &[&str] = &[];
+/// A vector set read, with the `module` flag every vector set command carries
+/// for the same reason the JSON and Bloom ones do.
+const VECTOR_READ: &[&str] = &["readonly", "module"];
+/// A vector set read the module also marks fast, which is the ones that answer
+/// about one element without searching.
+const VECTOR_READ_FAST: &[&str] = &["readonly", "module", "fast"];
+/// `VADD`, which is the one command here that can grow the set.
+const VECTOR_WRITE_OOM: &[&str] = &["write", "denyoom", "module"];
+/// `VREM`, which only ever frees, so the module does not mark it denyoom.
+const VECTOR_WRITE: &[&str] = &["write", "module"];
+/// `VSETATTR`, which the module marks fast and, though it takes a string off
+/// the wire, does not mark denyoom.
+const VECTOR_WRITE_FAST: &[&str] = &["write", "module", "fast"];
 /// The JSON read side. Two categories and no speed one, which is RedisJSON's
 /// own answer to `COMMAND INFO` and not an omission: the module registers
 /// `@read @json` and leaves it there.
@@ -2888,159 +2903,172 @@ pub static COMMANDS: &[Spec] = &[
     },
     // -------------------------------------------------------------- vector
     Spec {
-        name: "vadd",
+        name: "VADD",
         arity: -5,
-        flags: WRITE_OOM,
+        flags: VECTOR_WRITE_OOM,
         first_key: 1,
         last_key: 1,
         step: 1,
-        acl: AC_VECTOR_WRITE_SLOW,
+        acl: AC_NONE,
         since: "8.0.0",
         complexity: "O(P*D) with P the partitions probed and D the dimension",
         summary: "Add a vector to a vector set under an element name.",
         group: "vector",
     },
     Spec {
-        name: "vsim",
+        name: "VSIM",
         arity: -4,
-        flags: READ_SLOW,
+        flags: VECTOR_READ,
         first_key: 1,
         last_key: 1,
         step: 1,
-        acl: AC_VECTOR_READ_SLOW,
+        acl: AC_NONE,
         since: "8.0.0",
         complexity: "O(P*D) with P the partitions probed and D the dimension",
         summary: "The elements nearest a vector or nearest another element.",
         group: "vector",
     },
     Spec {
-        name: "vrem",
+        name: "VREM",
         arity: 3,
-        flags: WRITE_FAST,
+        flags: VECTOR_WRITE,
         first_key: 1,
         last_key: 1,
         step: 1,
-        acl: AC_VECTOR_WRITE_FAST,
+        acl: AC_NONE,
         since: "8.0.0",
         complexity: "O(1)",
         summary: "Remove an element and its vector from a vector set.",
         group: "vector",
     },
     Spec {
-        name: "vcard",
+        name: "VCARD",
         arity: 2,
-        flags: READ_FAST,
+        flags: VECTOR_READ_FAST,
         first_key: 1,
         last_key: 1,
         step: 1,
-        acl: AC_VECTOR_READ_FAST,
+        acl: AC_NONE,
         since: "8.0.0",
         complexity: "O(1)",
         summary: "How many elements a vector set holds.",
         group: "vector",
     },
     Spec {
-        name: "vdim",
+        name: "VDIM",
         arity: 2,
-        flags: READ_FAST,
+        flags: VECTOR_READ_FAST,
         first_key: 1,
         last_key: 1,
         step: 1,
-        acl: AC_VECTOR_READ_FAST,
+        acl: AC_NONE,
         since: "8.0.0",
         complexity: "O(1)",
         summary: "How many dimensions the vectors in a vector set have.",
         group: "vector",
     },
     Spec {
-        name: "vemb",
+        name: "VEMB",
         arity: -3,
-        flags: READ_FAST,
+        flags: VECTOR_READ_FAST,
         first_key: 1,
         last_key: 1,
         step: 1,
-        acl: AC_VECTOR_READ_FAST,
+        acl: AC_NONE,
         since: "8.0.0",
         complexity: "O(D) with D the dimension",
         summary: "The vector an element went in with.",
         group: "vector",
     },
     Spec {
-        name: "vinfo",
+        name: "VINFO",
         arity: 2,
-        flags: READ_FAST,
+        flags: VECTOR_READ_FAST,
         first_key: 1,
         last_key: 1,
         step: 1,
-        acl: AC_VECTOR_READ_FAST,
+        acl: AC_NONE,
         since: "8.0.0",
         complexity: "O(N) with N the elements, for the attribute count",
         summary: "What a vector set is and how its index is tuned.",
         group: "vector",
     },
     Spec {
-        name: "vismember",
+        name: "VISMEMBER",
         arity: 3,
-        flags: READ_FAST,
+        flags: VECTOR_READ,
         first_key: 1,
         last_key: 1,
         step: 1,
-        acl: AC_VECTOR_READ_FAST,
+        acl: AC_NONE,
         since: "8.0.0",
         complexity: "O(1)",
         summary: "Whether an element is in a vector set.",
         group: "vector",
     },
     Spec {
-        name: "vrandmember",
+        name: "VRANDMEMBER",
         arity: -2,
-        flags: READ_SLOW,
+        flags: VECTOR_READ,
         first_key: 1,
         last_key: 1,
         step: 1,
-        acl: AC_VECTOR_READ_SLOW,
+        acl: AC_NONE,
         since: "8.0.0",
         complexity: "O(1) for one, O(N) for a positive count",
         summary: "Random elements of a vector set.",
         group: "vector",
     },
     Spec {
-        name: "vlinks",
+        name: "VLINKS",
         arity: -3,
-        flags: READ_SLOW,
+        flags: VECTOR_READ_FAST,
         first_key: 1,
         last_key: 1,
         step: 1,
-        acl: AC_VECTOR_READ_SLOW,
+        acl: AC_NONE,
         since: "8.0.0",
         complexity: "O(P*D) with P the partitions probed and D the dimension",
         summary: "The elements an element is stored next to.",
         group: "vector",
     },
     Spec {
-        name: "vsetattr",
+        name: "VSETATTR",
         arity: 4,
-        flags: WRITE_FAST_OOM,
+        flags: VECTOR_WRITE_FAST,
         first_key: 1,
         last_key: 1,
         step: 1,
-        acl: AC_VECTOR_WRITE_FAST,
+        acl: AC_NONE,
         since: "8.0.0",
         complexity: "O(1)",
         summary: "Set the attribute string on an element, or clear it.",
         group: "vector",
     },
     Spec {
-        name: "vgetattr",
+        name: "VGETATTR",
         arity: 3,
-        flags: READ_FAST,
+        flags: VECTOR_READ_FAST,
         first_key: 1,
         last_key: 1,
         step: 1,
-        acl: AC_VECTOR_READ_FAST,
+        acl: AC_NONE,
         since: "8.0.0",
         complexity: "O(1)",
         summary: "The attribute string on an element.",
+        group: "vector",
+    },
+    Spec {
+        name: "VRANGE",
+        arity: -4,
+        flags: VECTOR_READ,
+        first_key: 1,
+        last_key: 1,
+        step: 1,
+        acl: AC_NONE,
+        since: "8.4.0",
+        complexity: "O(N log N) with N the elements the range covers",
+        summary: "The elements of a vector set whose names fall in a range.",
         group: "vector",
     },
     // --------------------------------------------------------------- bloom
@@ -5603,16 +5631,24 @@ pub fn arity_ok(spec: &Spec, n: usize) -> bool {
 mod tests {
     use super::*;
 
+    /// The name here is the name a client reads back, so it is spelled the way
+    /// the server that registered it spelled it.
+    ///
+    /// That is lower case for everything except the vector set group, which the
+    /// module registers in upper case, so `COMMAND INFO vadd` answers `VADD` and
+    /// the arity error quotes `VADD`. Nothing else in the table cares, because
+    /// a lookup compares without regard to case and the index key folds the case
+    /// out before it hashes.
     #[test]
-    fn every_name_is_lower_case_and_appears_once() {
+    fn every_name_is_spelled_the_way_it_was_registered_and_appears_once() {
         let mut seen = std::collections::BTreeSet::new();
         for c in COMMANDS {
-            assert_eq!(
-                c.name,
-                c.name.to_lowercase(),
-                "{} is not lower case",
-                c.name
-            );
+            let want = if c.group == "vector" {
+                c.name.to_uppercase()
+            } else {
+                c.name.to_lowercase()
+            };
+            assert_eq!(c.name, want, "{} is spelled wrong for its group", c.name);
             assert!(seen.insert(c.name), "{} is in the table twice", c.name);
         }
     }
