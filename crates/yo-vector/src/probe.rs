@@ -58,14 +58,53 @@
 //! `level_code` on the encode path had always done it that way and the query
 //! path had not.
 //!
+//! # At a million
+//!
+//! Those are 60k and 200k vectors and everything in them is resident. On
+//! gamingpc against a real million at 1024 dimensions, at a probe of 128, with
+//! the posting target the only thing that changes between the two columns:
+//!
+//! ```text
+//!                        posting 1024      posting 256
+//!  partitions                    1715             7249
+//!  ranking centroids          304.8 us        4257.4 us
+//!  preparing the query       1534.3 us         730.8 us
+//!  scanning the postings    32635.3 us        8124.7 us
+//!  the whole search          2703.6 us        4928.6 us
+//! ```
+//!
+//! Three things in there are worth more than the numbers.
+//!
+//! The scan is 182 nanoseconds a member at posting 1024 and 189 at posting 256,
+//! against the 18 the 200k run measured at the same dimension. Ten times, for
+//! the same code doing the same arithmetic on the same estimator. Two and a half
+//! million codes at 1024 dimensions is upwards of 300 megabytes and the scan is
+//! reading it out of DRAM in scattered runs, so what the 200k number was really
+//! measuring was a collection that fitted in cache. `benches/rabitq.rs` agreeing
+//! with it did not check that, because a bench that scans one buffer over and
+//! over never leaves cache either. The estimator is not the cost at this size.
+//! Getting the bytes to it is.
+//!
+//! Ranking goes up 14 times for 4.2 times the centroids, which is the same story
+//! one table earlier: 4 kilobytes a centroid, so 1715 of them fit in a last level
+//! cache and 7249 do not. `src/narrow.rs` is what that opens up and says when it
+//! would be worth wiring in.
+//!
+//! And the whole search is smaller than the scan row above it, by twelve times in
+//! the left column, which looks impossible and is not. Every row here probes 128
+//! partitions to the end because that is the worst case worth knowing. A real
+//! search stops when further partitions have gone a while without improving
+//! anything, so it reads a fraction of the 128 unless it is told not to. The
+//! bottom row is what a query costs and the three above it are what the parts of
+//! one cost, and the gap between them is the early stop earning its keep.
+//!
 //! # What is left
 //!
-//! The scan is two thirds of a query and it measures out at 12 nanoseconds a
-//! member at 768 dimensions and 18 at 1024, which is what `benches/rabitq.rs`
-//! says one code costs, so there is no overhead hiding in the loop around it.
 //! Making a query faster from here is a question of scanning fewer members
 //! rather than of scanning them faster, which is what the probe count and the
-//! posting size are, and what boundary replication is trying to buy.
+//! posting size are, and what boundary replication is trying to buy. That was
+//! true when the scan ran at the estimator's speed and it is more true now that
+//! it runs at DRAM's.
 //!
 //! # Running it
 //!
@@ -88,8 +127,29 @@ use crate::rabitq::Bits;
 use std::time::Instant;
 use yo_common::Rng;
 
-/// How many partitions a query reads here.
-const PROBE: usize = 32;
+/// A number that can be set from the environment, so that the same run can be
+/// pointed at whatever configuration is under question without the table in the
+/// module doc moving underneath it.
+fn from_env(name: &str, default: usize) -> usize {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(default)
+}
+
+/// How many partitions a query reads here. `YO_PROBE` overrides it.
+fn probe() -> usize {
+    from_env("YO_PROBE", 32)
+}
+
+/// How many members a partition wants. `YO_POSTING` overrides it.
+///
+/// Worth overriding, because the split between these rows moves a long way with
+/// it: it is what decides how many centroids there are to rank and how many
+/// members there are behind each one.
+fn posting() -> usize {
+    from_env("YO_POSTING", Tuning::default().posting)
+}
 
 /// How many queries each number is the mean of.
 const QUERIES: usize = 200;
@@ -141,7 +201,8 @@ fn generated(dim: usize, n: usize, clusters: usize, seed: u64) -> Base {
 fn build(base: &Base) -> Partitions {
     let n = base.data.len() / base.dim;
     let tuning = Tuning {
-        probe: PROBE,
+        probe: probe(),
+        posting: posting(),
         ..Tuning::default()
     };
     let mut ix = Partitions::new(base.dim, Bits::One, 0x51f7, tuning);
@@ -204,7 +265,7 @@ fn where_a_query_spends_its_time() {
         for q in &queries {
             ix.probe_order(q, &mut order);
             let u = ix.quantizer().rotate(q);
-            for &p in order.iter().take(PROBE) {
+            for &p in order.iter().take(probe()) {
                 let prepared = ix
                     .quantizer()
                     .query_rotated(&u, &centroids[p * dim..(p + 1) * dim]);
@@ -219,7 +280,7 @@ fn where_a_query_spends_its_time() {
         for q in &queries {
             ix.probe_order(q, &mut order);
             let u = ix.quantizer().rotate(q);
-            for &p in order.iter().take(PROBE) {
+            for &p in order.iter().take(probe()) {
                 let prepared = ix
                     .quantizer()
                     .query_rotated(&u, &centroids[p * dim..(p + 1) * dim]);
@@ -233,12 +294,12 @@ fn where_a_query_spends_its_time() {
         }
         let scan = each(at.elapsed());
 
-        let members = PROBE * held / parts;
+        let members = probe() * held / parts;
         println!("  ranking centroids   {rank:8.1} us");
         println!(
             "  preparing the query {:8.1} us  ({:.1} us a partition)",
             prep - rank,
-            (prep - rank) / PROBE as f64
+            (prep - rank) / probe() as f64
         );
         println!(
             "  scanning the postings {:6.1} us  ({:.1} ns a member over {members})",
