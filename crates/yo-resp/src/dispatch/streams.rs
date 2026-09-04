@@ -41,7 +41,7 @@ use yo_common::num::{DIGITS_MAX, u64_digits};
 use yo_common::{Code, Error, Result, num};
 use yo_kv::stream::{Consumer, Fate, Fields, Filter, Group, Id, Refs, Retry, Stream};
 use yo_kv::streams::{self as kv, Add, Claim, Read, Start, Trim};
-use yo_kv::{Db, Entry};
+use yo_kv::{Db, Entry, Holds};
 
 use super::args::{self, Args};
 use super::table::Spec;
@@ -1559,9 +1559,13 @@ pub(super) fn read(
     strict: bool,
     out: &mut Out,
 ) -> Result<bool> {
+    // Every stream at once, so that a read over four of them is one answer
+    // about four streams rather than four answers taken at four moments, and so
+    // that a group cannot be dropped between the check below and the read.
+    let mut held = db.hold_keys(keys.iter().map(Vec::as_slice));
     if let Some((name, _)) = &r.group {
         for key in keys {
-            let missing = match db.hold(key).stream(key) {
+            let missing = match held.stripe_mut(db.stripe_of(key)).stream(key) {
                 Ok(Some(s)) => s.group(name).is_none(),
                 Ok(None) => true,
                 Err(e) if strict => return Err(e),
@@ -1598,7 +1602,7 @@ pub(super) fn read(
         }
         out.bulk(key);
         let body = out.len();
-        let got = match one_stream(db, key, at, r, now, out) {
+        let got = match one_stream(db, &mut held, key, at, r, now, out) {
             Ok(n) => n,
             Err(e) if strict => return Err(e),
             Err(_) => {
@@ -1631,6 +1635,7 @@ pub(super) fn read(
 /// it.
 fn one_stream(
     db: &Db,
+    held: &mut Holds<'_>,
     key: &[u8],
     at: &At,
     r: &Reads,
@@ -1639,12 +1644,15 @@ fn one_stream(
 ) -> Result<Option<usize>> {
     match at {
         At::After(after) => {
-            let n = db
-                .hold(key)
-                .xread_into(key, *after, r.count, |id, fields| {
+            let n = held.stripe_mut(db.stripe_of(key)).xread_into(
+                key,
+                *after,
+                r.count,
+                |id, fields| {
                     entry(out, id, fields);
                     true
-                })?;
+                },
+            )?;
             Ok((n > 0).then_some(n))
         }
         At::Meaningless(_) => unreachable!("read refuses these before it walks"),
@@ -1661,7 +1669,8 @@ fn one_stream(
                 count: r.count,
                 noack: r.noack,
             };
-            let n = db.hold(key).xreadgroup_into(key, want, now, |id, fields| {
+            let stripe = held.stripe_mut(db.stripe_of(key));
+            let n = stripe.xreadgroup_into(key, want, now, |id, fields| {
                 match fields {
                     Some(fields) => entry(out, id, fields),
                     // A history read can name an entry that has since been
