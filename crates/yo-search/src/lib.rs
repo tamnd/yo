@@ -47,10 +47,13 @@
 
 #![deny(missing_docs)]
 
+pub mod english;
 pub mod field;
 pub mod index;
 pub mod registry;
+pub mod text;
 
+pub use english::English;
 pub use field::{Algo, Coords, Field, Kind, Tag, Text, Vector, Width};
 pub use index::{Definition, Index, Options, Source};
 pub use registry::{Clash, Registry};
