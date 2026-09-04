@@ -835,11 +835,11 @@ fn config(server: &mut Server, args: Args<'_>, out: &mut Out) -> Result<()> {
         }
         for (k, knob) in ladder {
             out.bulk(k.as_bytes());
-            out.bulk_int(read_knob(server.db_ref(0), *knob) as i64);
+            out.bulk_int(read_knob(server.settings(), *knob) as i64);
         }
         if policy {
             out.bulk(MAXMEMORY_POLICY.as_bytes());
-            out.bulk(server.db_ref(0).policy().name().as_bytes());
+            out.bulk(server.settings().policy().name().as_bytes());
         }
         if limit {
             // Back as a plain number of bytes whatever the client typed to set
@@ -994,17 +994,24 @@ fn config(server: &mut Server, args: Args<'_>, out: &mut Out) -> Result<()> {
                 ));
             }
         }
-        // Every database, because these are one server wide number in Redis and
-        // the fact that a `Keyspace` carries its own copy is ours and not the
-        // client's problem.
+        // Every stripe of every database, because these are one server wide
+        // number in Redis and the fact that a `Keyspace` carries its own copy is
+        // ours and not the client's problem. A stripe that missed one would put
+        // a key in a different shape from the same key on the stripe next to it,
+        // which `OBJECT ENCODING` would then answer differently for depending on
+        // where the key happened to land.
         for (knob, n) in writes.iter().flatten() {
             for at in 0..DATABASES {
-                write_knob(server.db(at), *knob, *n);
+                for stripe in server.striped(at).stripes_mut() {
+                    write_knob(stripe, *knob, *n);
+                }
             }
         }
         if let Some(p) = policy {
             for at in 0..DATABASES {
-                server.db(at).set_policy(p);
+                for stripe in server.striped(at).stripes_mut() {
+                    stripe.set_policy(p);
+                }
             }
         }
         if let Some(seconds) = ttl {
@@ -1130,7 +1137,7 @@ fn info(server: &Server, args: Args<'_>, out: &mut Out) {
                 cap.limit().unwrap_or(0),
                 cap.budget(),
                 server.maxmemory(),
-                server.db_ref(0).policy().name(),
+                server.settings().policy().name(),
                 server.maxstore().map_or(-1, |n| n as i64),
                 server.store_bytes(),
                 server.regime(),
