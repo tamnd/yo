@@ -226,6 +226,21 @@ doc = "11 section 8"
 # when several centroids share a mean.
 
 [[group]]
+name = "ts"
+expected = 21
+status = "partial"
+doc = "11 section 9"
+# Twenty one commands, and the nine here are the key type and everything that
+# writes a sample into one or reports on it. Reading a span with the aggregation
+# grammar, the label index the five multi key commands search, compaction rules
+# and the three commands 8.10 added all come next. Samples are squeezed with
+# Gorilla, which is what the module does too, so a series read at a steady rate
+# costs a couple of bits a sample rather than sixteen bytes. Every error sentence
+# and both of the two the module writes with no ERR in front of them are copied
+# word for word, and so is the option scan that lets a key called RETENTION be
+# the RETENTION keyword.
+
+[[group]]
 name = "stream"
 expected = 20
 status = "partial"
@@ -3520,6 +3535,109 @@ bounded = "inherent"
 status = "shipped"
 wire = "verified"
 notes = "Nine fields, so eighteen elements on RESP2 and a map of nine on RESP3: compression, capacity, merged nodes, unmerged nodes, merged weight, unmerged weight, observations, total compressions and memory usage. Memory usage is the reference's formula rather than what the digest costs here, eighty bytes for the header and sixteen for every slot in the capacity, because it is a number a client compares between servers. The two are within a few bytes of each other anyway. The command carries the dont_cache tip on a real server and there is nowhere in Spec to put a tip yet, which is the same gap as CMS.INFO and CF.INFO."
+
+
+# ------------------------------------------------------------------------- ts
+
+[[command]]
+name = "TS.CREATE"
+group = "ts"
+since = "1.0.0"
+arity = -2
+plan = "metadata"
+bounded = "inherent"
+status = "shipped"
+wire = "verified"
+notes = "An empty series with one chunk in it, so that TS.INFO answers a chunk count of one before anything has been written. The options are looked for one keyword at a time across the whole command rather than read in order, which is what the module does, so a word that is not an option is ignored, the key itself can match a keyword, and LABELS eats everything after it in pairs while the later scans still find keywords inside what it ate. All of that is visible from a client and all of it is copied. The arguments are read before the key is looked at, so a bad retention against a key that already exists answers about the retention rather than about the key."
+
+[[command]]
+name = "TS.ALTER"
+group = "ts"
+since = "1.0.0"
+arity = -2
+plan = "metadata"
+bounded = "inherent"
+status = "shipped"
+wire = "verified"
+notes = "The same scan, applied to a series that is already there, and only the keywords that appear change anything. ENCODING is read so that a bad value is still an error and then thrown away, because a series holding samples cannot be told to store them a different way. A retention set here trims what is already stored on the spot rather than waiting for the next sample."
+
+[[command]]
+name = "TS.ADD"
+group = "ts"
+since = "1.0.0"
+arity = -4
+plan = "point"
+bounded = "inherent"
+status = "shipped"
+wire = "verified"
+notes = "The value and the timestamp are read first and the key second, so a bad value against a key holding a string answers about the value. A star timestamp is whatever the server clock says. The series is made if it is not there, with the same options TS.CREATE takes, and ON_DUPLICATE is only read when the key was already there, which is why a policy word that is not a policy is an error on the second call and not on the first. A sample landing at or behind the newest one is an upsert under the duplicate policy, one landing past it is an append, and one so far behind that retention has already gone past it is refused."
+
+[[command]]
+name = "TS.MADD"
+group = "ts"
+since = "1.0.0"
+arity = -4
+plan = "point"
+bounded = "inherent"
+status = "shipped"
+wire = "verified"
+notes = "Each triple gets its own slot in the reply and a bad one does not stop the ones after it, so this is the only command in the family whose reply can hold both timestamps and errors. It reads no options and creates nothing, so a key that is not already a series is the key is not a TSDB key in its slot. A star timestamp is resolved once for the whole command rather than once per triple."
+
+[[command]]
+name = "TS.INCRBY"
+group = "ts"
+since = "1.0.0"
+arity = -3
+plan = "point"
+bounded = "inherent"
+status = "shipped"
+wire = "verified"
+notes = "The newest value plus the number given, stored under the last policy whatever the series says, so two of these on one timestamp add up rather than collide. A key holding something else is WRONGTYPE here where TS.ADD gives a sentence, and it is answered before the number is looked at. The increment goes through the ordinary number reader rather than the one a sample value uses, so it takes inf and a leading plus and a bare fraction and refuses nan, which is the module's own split and not a decision made here. A timestamp behind the newest sample is refused with one of the two errors the module writes with no ERR in front of it."
+
+[[command]]
+name = "TS.DECRBY"
+group = "ts"
+since = "1.0.0"
+arity = -3
+plan = "point"
+bounded = "inherent"
+status = "shipped"
+wire = "verified"
+notes = "The same command with the sign flipped, down to the errors and to which of the two number readers the argument goes through."
+
+[[command]]
+name = "TS.DEL"
+group = "ts"
+since = "1.6.0"
+arity = 4
+plan = "point"
+bounded = "inherent"
+status = "shipped"
+wire = "verified"
+notes = "Both ends are included and both take the one character standing for as far as that end goes. The count that comes back is how many samples went, so a span that covers nothing answers zero and so does a span whose ends are the wrong way round. A chunk the span covers entirely is dropped whole and one it covers partly is rewritten, and a series that ends up with nothing in it keeps its last chunk so the chunk count stays one."
+
+[[command]]
+name = "TS.GET"
+group = "ts"
+since = "1.0.0"
+arity = -2
+plan = "point"
+bounded = "inherent"
+status = "shipped"
+wire = "verified"
+notes = "The newest sample, or an empty array when the series has none. The value goes out as a simple string of the shortest digits that read back as the same number on RESP2 and as a double on RESP3, which are two renderings of one number. The command carries the dont_cache tip on a real server and there is nowhere in Spec to put a tip yet, which is the same gap as CMS.INFO and TDIGEST.INFO."
+
+[[command]]
+name = "TS.INFO"
+group = "ts"
+since = "1.0.0"
+arity = -2
+plan = "metadata"
+bounded = "inherent"
+status = "shipped"
+wire = "verified"
+divergent = "D-53"
+notes = "Fourteen fields, so twenty eight elements on RESP2 and a map of fourteen on RESP3. The chunk type and the duplicate policy are simple strings and never a nil, so a series that was never told what to do about a repeated timestamp reports block. The source key and the rules wait on compaction rules and are a nil and an empty map until those land. Memory usage is ours and not the reference's, which is D-53. The value half of the ignore window goes out as a bulk string on RESP2 where a sample value in TS.GET is a simple one, which is the module's inconsistency and is copied."
 
 
 # ---------------------------------------------------------------------- array

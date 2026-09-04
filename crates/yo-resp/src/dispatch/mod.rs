@@ -78,6 +78,7 @@ mod strings;
 pub mod table;
 mod tdigest;
 mod topk;
+mod ts;
 mod vectors;
 mod vfilter;
 mod zsets;
@@ -1158,7 +1159,7 @@ pub fn resolved(
     // two groups that hold them mark all of them rather than the session's.
     server.dirty |= match spec.group {
         "string" | "bitmap" | "hyperloglog" | "geo" | "set" | "hash" | "list" | "zset"
-        | "array" | "stream" | "bloom" | "cuckoo" | "cms" | "topk" | "tdigest" => {
+        | "array" | "stream" | "bloom" | "cuckoo" | "cms" | "topk" | "tdigest" | "ts" => {
             1u64 << session.db
         }
         _ => ALL_DATABASES,
@@ -1262,6 +1263,10 @@ pub fn resolved(
             "tdigest" => {
                 let db = session.db;
                 tdigest::execute(&mut server.dbs[db], spec, args, out).map(|()| Flow::Continue)
+            }
+            "ts" => {
+                let db = session.db;
+                ts::execute(&mut server.dbs[db], spec, args, out).map(|()| Flow::Continue)
             }
             // The clock is read before the database is borrowed, because every
             // stream command needs the time and it lives on the server. An
@@ -14103,6 +14108,549 @@ mod tests {
         assert_eq!(
             f.run(&[b"TDIGEST.QUANTILE", b"t3", b"zzz"]),
             "-ERR T-Digest: key does not exist\r\n"
+        );
+    }
+
+    // -------------------------------------------------------------------- ts
+
+    /// A `TS.INFO` reply with the memory usage taken out of it.
+    ///
+    /// That number is what a series costs here rather than what one costs in the
+    /// module, which is D-53, and it moves whenever the layout of a chunk does.
+    /// Everything either side of it is the wire contract and is worth pinning
+    /// down exactly, so the tests below check the whole reply with the one
+    /// number lifted out.
+    fn without_memory(reply: &str) -> String {
+        let head = "+memoryUsage\r\n:";
+        let at = reply.find(head).expect("every TS.INFO reports memory");
+        let rest = &reply[at + head.len()..];
+        let end = rest.find("\r\n").expect("and it is a whole number");
+        format!("{}{}", &reply[..at + head.len()], &rest[end..])
+    }
+
+    /// A series is made empty and still says it has a chunk, and the options are
+    /// read before the key is looked at.
+    #[test]
+    fn a_series_is_made_empty_and_reports_on_itself() {
+        let mut f = Fixture::new();
+        assert_eq!(f.run(&[b"TS.CREATE", b"t"]), "+OK\r\n");
+        assert_eq!(f.run(&[b"TYPE", b"t"]), "+TSDB-TYPE\r\n");
+        assert_eq!(f.run(&[b"OBJECT", b"ENCODING", b"t"]), "$3\r\nraw\r\n");
+        // Fourteen fields, so twenty eight elements. An empty series reports one
+        // chunk and zero at both ends, and neither the chunk type nor the
+        // duplicate policy is ever a nil.
+        assert_eq!(
+            without_memory(&f.run(&[b"TS.INFO", b"t"])),
+            "*28\r\n\
+             +totalSamples\r\n:0\r\n\
+             +memoryUsage\r\n:\r\n\
+             +firstTimestamp\r\n:0\r\n\
+             +lastTimestamp\r\n:0\r\n\
+             +retentionTime\r\n:0\r\n\
+             +chunkCount\r\n:1\r\n\
+             +chunkSize\r\n:4096\r\n\
+             +chunkType\r\n+compressed\r\n\
+             +duplicatePolicy\r\n+block\r\n\
+             +labels\r\n*0\r\n\
+             +sourceKey\r\n$-1\r\n\
+             +rules\r\n*0\r\n\
+             +ignoreMaxTimeDiff\r\n:0\r\n\
+             +ignoreMaxValDiff\r\n$1\r\n0\r\n"
+        );
+        // A key that is already there is about the key whatever it holds, and
+        // the existence is what is checked rather than the type.
+        assert_eq!(
+            f.run(&[b"TS.CREATE", b"t"]),
+            "-ERR TSDB: key already exists\r\n"
+        );
+        assert_eq!(f.run(&[b"SET", b"str", b"x"]), "+OK\r\n");
+        assert_eq!(
+            f.run(&[b"TS.CREATE", b"str"]),
+            "-ERR TSDB: key already exists\r\n"
+        );
+        // But the arguments are read first, so a bad one at a key that is there
+        // answers about the argument.
+        assert_eq!(
+            f.run(&[b"TS.CREATE", b"t", b"RETENTION", b"abc"]),
+            "-ERR TSDB: Couldn't parse RETENTION\r\n"
+        );
+        // The seven that will not make a series say WRONGTYPE about a key
+        // holding something else, where the two that would say a sentence.
+        // The word is inside the sentence and not in front of it, because the
+        // module writes its own error text and Redis puts ERR on the front of
+        // anything a module writes.
+        let wrong = "-ERR WRONGTYPE Operation against a key holding the wrong kind of value\r\n";
+        assert_eq!(f.run(&[b"TS.INFO", b"str"]), wrong);
+        assert_eq!(f.run(&[b"TS.GET", b"str"]), wrong);
+        assert_eq!(f.run(&[b"TS.ALTER", b"str"]), wrong);
+        assert_eq!(f.run(&[b"TS.DEL", b"str", b"0", b"1"]), wrong);
+        assert_eq!(f.run(&[b"TS.INCRBY", b"str", b"1"]), wrong);
+        assert_eq!(
+            f.run(&[b"TS.ADD", b"str", b"1", b"1"]),
+            "-ERR TSDB: the key is not a TSDB key\r\n"
+        );
+        // And the ones that will not make one say so about a key that is gone.
+        assert_eq!(
+            f.run(&[b"TS.INFO", b"nope"]),
+            "-ERR TSDB: the key does not exist\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"TS.GET", b"nope"]),
+            "-ERR TSDB: the key does not exist\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"TS.ALTER", b"nope"]),
+            "-ERR TSDB: the key does not exist\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"TS.DEL", b"nope", b"1", b"2"]),
+            "-ERR TSDB: the key does not exist\r\n"
+        );
+    }
+
+    /// Every option word, including the ones that are wrong, and the scan that
+    /// finds them.
+    #[test]
+    fn the_options_are_a_keyword_scan_and_not_a_grammar() {
+        let mut f = Fixture::new();
+        assert_eq!(
+            f.run(&[
+                b"TS.CREATE",
+                b"t",
+                b"RETENTION",
+                b"5000",
+                b"ENCODING",
+                b"UNCOMPRESSED",
+                b"CHUNK_SIZE",
+                b"128",
+                b"DUPLICATE_POLICY",
+                b"LAST",
+                b"IGNORE",
+                b"10",
+                b"0.5",
+                b"LABELS",
+                b"room",
+                b"kitchen"
+            ]),
+            "+OK\r\n"
+        );
+        let info = f.run(&[b"TS.INFO", b"t"]);
+        assert!(info.contains("+retentionTime\r\n:5000\r\n"), "{info}");
+        assert!(info.contains("+chunkSize\r\n:128\r\n"), "{info}");
+        assert!(info.contains("+chunkType\r\n+uncompressed\r\n"), "{info}");
+        assert!(info.contains("+duplicatePolicy\r\n+last\r\n"), "{info}");
+        assert!(info.contains("+ignoreMaxTimeDiff\r\n:10\r\n"), "{info}");
+        // A plain double here, where a sample value out of TS.GET is the
+        // shortest digits that read back as the same number.
+        assert!(
+            info.contains("+ignoreMaxValDiff\r\n$3\r\n0.5\r\n"),
+            "{info}"
+        );
+        assert!(
+            info.contains("+labels\r\n*1\r\n*2\r\n$4\r\nroom\r\n$7\r\nkitchen\r\n"),
+            "{info}"
+        );
+
+        // A word that is not an option is read past rather than refused.
+        assert_eq!(f.run(&[b"TS.CREATE", b"junk", b"FOO"]), "+OK\r\n");
+        // LABELS eats everything after it in pairs, and the later scans still
+        // look inside what it ate, so this sets a retention and stores a label
+        // called RETENTION at the same time.
+        assert_eq!(
+            f.run(&[
+                b"TS.CREATE",
+                b"g",
+                b"LABELS",
+                b"a",
+                b"b",
+                b"RETENTION",
+                b"5"
+            ]),
+            "+OK\r\n"
+        );
+        let greedy = f.run(&[b"TS.INFO", b"g"]);
+        assert!(greedy.contains("+retentionTime\r\n:5\r\n"), "{greedy}");
+        assert!(
+            greedy.contains("*2\r\n$1\r\na\r\n$1\r\nb\r\n*2\r\n$9\r\nRETENTION\r\n$1\r\n5\r\n"),
+            "{greedy}"
+        );
+
+        // Every way an option can be wrong, in the order the module reads them.
+        assert_eq!(
+            f.run(&[b"TS.CREATE", b"e", b"LABELS", b"a", b"b(c"]),
+            "-ERR TSDB: Couldn't parse LABELS\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"TS.CREATE", b"e", b"LABELS", b"", b"b"]),
+            "-ERR TSDB: Couldn't parse LABELS\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"TS.CREATE", b"e", b"RETENTION"]),
+            "-ERR TSDB: Couldn't parse RETENTION\r\n"
+        );
+        // A retention below zero is one of the two the module writes with no
+        // ERR in front of it, where one that is not a number gets one.
+        assert_eq!(
+            f.run(&[b"TS.CREATE", b"e", b"RETENTION", b"-1"]),
+            "-TSDB: Couldn't parse RETENTION\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"TS.CREATE", b"e", b"CHUNK_SIZE", b"abc"]),
+            "-ERR TSDB: Couldn't parse CHUNK_SIZE\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"TS.CREATE", b"e", b"CHUNK_SIZE", b"100"]),
+            "-ERR TSDB: CHUNK_SIZE value must be a multiple of 8 in the range [48 .. 1048576]\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"TS.CREATE", b"e", b"ENCODING", b"nope"]),
+            "-ERR TSDB: unknown ENCODING parameter\r\n"
+        );
+        // And an ENCODING with nothing behind it is an arity error where every
+        // other keyword in the same spot is a sentence.
+        assert!(
+            f.run(&[b"TS.CREATE", b"e", b"ENCODING"])
+                .contains("wrong number of arguments for 'ts.create' command")
+        );
+        assert_eq!(
+            f.run(&[b"TS.CREATE", b"e", b"DUPLICATE_POLICY"]),
+            "-ERR TSDB: Couldn't parse DUPLICATE_POLICY\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"TS.CREATE", b"e", b"DUPLICATE_POLICY", b"nope"]),
+            "-ERR TSDB: Unknown DUPLICATE_POLICY\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"TS.CREATE", b"e", b"IGNORE", b"10"]),
+            "-ERR TSDB: Couldn't parse IGNORE\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"TS.CREATE", b"e", b"IGNORE", b"-1", b"1"]),
+            "-ERR TSDB: IGNORE arguments cannot be negative\r\n"
+        );
+        assert_eq!(f.run(&[b"EXISTS", b"e"]), ":0\r\n");
+
+        // An alter changes what was named and leaves the rest alone, and reads
+        // an encoding only far enough to refuse a bad one.
+        assert_eq!(f.run(&[b"TS.ALTER", b"t", b"RETENTION", b"9"]), "+OK\r\n");
+        let after = f.run(&[b"TS.INFO", b"t"]);
+        assert!(after.contains("+retentionTime\r\n:9\r\n"), "{after}");
+        assert!(after.contains("+chunkSize\r\n:128\r\n"), "{after}");
+        assert!(after.contains("+duplicatePolicy\r\n+last\r\n"), "{after}");
+        assert_eq!(
+            f.run(&[b"TS.ALTER", b"t", b"ENCODING", b"nope"]),
+            "-ERR TSDB: unknown ENCODING parameter\r\n"
+        );
+        // An encoding it does take is still not applied.
+        assert_eq!(
+            f.run(&[b"TS.ALTER", b"t", b"ENCODING", b"COMPRESSED"]),
+            "+OK\r\n"
+        );
+        assert!(
+            f.run(&[b"TS.INFO", b"t"])
+                .contains("+chunkType\r\n+uncompressed\r\n")
+        );
+    }
+
+    /// Samples go in, come back out and are refused for the reasons the module
+    /// refuses them.
+    #[test]
+    fn samples_land_where_they_are_put_and_the_newest_comes_back() {
+        let mut f = Fixture::new();
+        assert_eq!(f.run(&[b"TS.ADD", b"t", b"100", b"1.5"]), ":100\r\n");
+        // The series was made on the way in.
+        assert_eq!(f.run(&[b"TYPE", b"t"]), "+TSDB-TYPE\r\n");
+        assert_eq!(f.run(&[b"TS.ADD", b"t", b"200", b"2"]), ":200\r\n");
+        // A sample value goes out as a simple string of the shortest digits
+        // that read back as the same number.
+        assert_eq!(f.run(&[b"TS.GET", b"t"]), "*2\r\n:200\r\n+2\r\n");
+        assert_eq!(f.run(&[b"TS.ADD", b"t", b"300", b"1e300"]), ":300\r\n");
+        assert_eq!(f.run(&[b"TS.GET", b"t"]), "*2\r\n:300\r\n+1E300\r\n");
+        // An empty series has no newest sample and answers an empty array
+        // rather than a nil.
+        assert_eq!(f.run(&[b"TS.CREATE", b"empty"]), "+OK\r\n");
+        assert_eq!(f.run(&[b"TS.GET", b"empty"]), "*0\r\n");
+
+        // The value is read before the key, so a bad one against a key holding
+        // a string is about the value.
+        assert_eq!(f.run(&[b"SET", b"str", b"x"]), "+OK\r\n");
+        assert_eq!(
+            f.run(&[b"TS.ADD", b"str", b"1", b".5"]),
+            "-ERR TSDB: invalid value\r\n"
+        );
+        // The grammar is tighter than the one a number argument usually gets:
+        // no leading plus, no bare fraction, no infinity and nothing that does
+        // not fit.
+        for bad in [
+            &b".5"[..],
+            b"1.",
+            b"+1",
+            b" 1",
+            b"0x10",
+            b"inf",
+            b"1e400",
+            b"--1",
+            b"1e",
+        ] {
+            assert_eq!(
+                f.run(&[b"TS.ADD", b"v", b"1", bad]),
+                "-ERR TSDB: invalid value\r\n",
+                "{}",
+                String::from_utf8_lossy(bad)
+            );
+        }
+        // And a reading that is not a number is one of three words.
+        assert_eq!(f.run(&[b"TS.ADD", b"v", b"1", b"NaN"]), ":1\r\n");
+
+        // A timestamp that is not a number, and one that is and is below zero,
+        // are two different sentences.
+        assert_eq!(
+            f.run(&[b"TS.ADD", b"t", b"abc", b"1"]),
+            "-ERR TSDB: invalid timestamp\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"TS.ADD", b"t", b"-1", b"1"]),
+            "-ERR TSDB: invalid timestamp, must be a nonnegative integer\r\n"
+        );
+
+        // A repeated timestamp is blocked by default, and ON_DUPLICATE on the
+        // command beats what the series was told.
+        assert_eq!(
+            f.run(&[b"TS.ADD", b"t", b"300", b"7"]),
+            "-ERR TSDB: Error at upsert, update is not supported when DUPLICATE_POLICY is set to BLOCK mode, or either current or new value is NaN and DUPLICATE_POLICY is MAX/MIN/SUM\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"TS.ADD", b"t", b"300", b"7", b"ON_DUPLICATE", b"LAST"]),
+            ":300\r\n"
+        );
+        assert_eq!(f.run(&[b"TS.GET", b"t"]), "*2\r\n:300\r\n+7\r\n");
+        // ON_DUPLICATE is only read when the key was already there, which is
+        // why a policy word that is not a policy passes on a fresh key.
+        assert_eq!(
+            f.run(&[b"TS.ADD", b"fresh", b"1", b"1", b"ON_DUPLICATE", b"nope"]),
+            ":1\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"TS.ADD", b"fresh", b"2", b"1", b"ON_DUPLICATE", b"nope"]),
+            "-ERR TSDB: Unknown DUPLICATE_POLICY\r\n"
+        );
+
+        // Retention is exact and it is checked before anything else happens, so
+        // a sample landing behind the window is refused rather than trimmed.
+        assert_eq!(f.run(&[b"TS.CREATE", b"r", b"RETENTION", b"50"]), "+OK\r\n");
+        assert_eq!(f.run(&[b"TS.ADD", b"r", b"1000", b"1"]), ":1000\r\n");
+        assert_eq!(f.run(&[b"TS.ADD", b"r", b"960", b"1"]), ":960\r\n");
+        assert_eq!(
+            f.run(&[b"TS.ADD", b"r", b"940", b"1"]),
+            "-ERR TSDB: Timestamp is older than retention\r\n"
+        );
+        // And the window trims as it moves.
+        assert_eq!(f.run(&[b"TS.ADD", b"r", b"1100", b"1"]), ":1100\r\n");
+        assert!(
+            f.run(&[b"TS.INFO", b"r"])
+                .contains("+totalSamples\r\n:1\r\n")
+        );
+
+        // An ignore window drops a sample close enough to the newest one to be
+        // uninteresting, and answers the newest timestamp so a client can tell.
+        assert_eq!(
+            f.run(&[
+                b"TS.CREATE",
+                b"i",
+                b"DUPLICATE_POLICY",
+                b"LAST",
+                b"IGNORE",
+                b"10",
+                b"0.5"
+            ]),
+            "+OK\r\n"
+        );
+        assert_eq!(f.run(&[b"TS.ADD", b"i", b"1000", b"1"]), ":1000\r\n");
+        assert_eq!(f.run(&[b"TS.ADD", b"i", b"1005", b"1.2"]), ":1000\r\n");
+        assert_eq!(f.run(&[b"TS.ADD", b"i", b"1005", b"9"]), ":1005\r\n");
+    }
+
+    /// Every triple in a `TS.MADD` is answered on its own, and none of them
+    /// makes a series.
+    #[test]
+    fn a_madd_answers_each_triple_and_creates_nothing() {
+        let mut f = Fixture::new();
+        assert_eq!(f.run(&[b"TS.CREATE", b"a"]), "+OK\r\n");
+        assert_eq!(f.run(&[b"TS.CREATE", b"b"]), "+OK\r\n");
+        assert_eq!(
+            f.run(&[
+                b"TS.MADD", b"a", b"100", b"1", b"b", b"100", b"2", b"a", b"200", b"3"
+            ]),
+            "*3\r\n:100\r\n:100\r\n:200\r\n"
+        );
+        // A key that is not a series is an error in its own slot and the ones
+        // after it still land.
+        assert_eq!(f.run(&[b"SET", b"str", b"x"]), "+OK\r\n");
+        assert_eq!(
+            f.run(&[
+                b"TS.MADD", b"gone", b"1", b"1", b"str", b"1", b"1", b"a", b"300", b"4"
+            ]),
+            "*3\r\n\
+             -ERR TSDB: the key is not a TSDB key\r\n\
+             -ERR TSDB: the key is not a TSDB key\r\n\
+             :300\r\n"
+        );
+        assert_eq!(f.run(&[b"EXISTS", b"gone"]), ":0\r\n");
+        // A bad value and a bad timestamp are answered in their slots too.
+        assert_eq!(
+            f.run(&[b"TS.MADD", b"a", b"400", b"zzz", b"a", b"abc", b"1"]),
+            "*2\r\n-ERR TSDB: invalid value\r\n-ERR TSDB: invalid timestamp\r\n"
+        );
+        // And a list that is not made of triples is an arity error.
+        assert!(
+            f.run(&[b"TS.MADD", b"a", b"1", b"1", b"a"])
+                .contains("wrong number of arguments for 'ts.madd' command")
+        );
+    }
+
+    /// The two increments, which only ever write forwards.
+    #[test]
+    fn an_increment_walks_the_newest_value_up_and_down() {
+        let mut f = Fixture::new();
+        assert_eq!(
+            f.run(&[b"TS.INCRBY", b"t", b"5", b"TIMESTAMP", b"100"]),
+            ":100\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"TS.INCRBY", b"t", b"5", b"TIMESTAMP", b"100"]),
+            ":100\r\n"
+        );
+        // Two on one timestamp add up rather than collide, because the sample
+        // goes in under the last policy whatever the series says.
+        assert_eq!(f.run(&[b"TS.GET", b"t"]), "*2\r\n:100\r\n+10\r\n");
+        assert_eq!(
+            f.run(&[b"TS.DECRBY", b"t", b"3", b"TIMESTAMP", b"200"]),
+            ":200\r\n"
+        );
+        assert_eq!(f.run(&[b"TS.GET", b"t"]), "*2\r\n:200\r\n+7\r\n");
+        // A timestamp behind the newest sample is the other of the two errors
+        // the module writes with no ERR in front of it.
+        assert_eq!(
+            f.run(&[b"TS.INCRBY", b"t", b"1", b"TIMESTAMP", b"150"]),
+            "-TSDB: timestamp must be equal to or higher than the maximum existing timestamp\r\n"
+        );
+        // The increment goes through the ordinary number reader, so it takes
+        // what a sample value will not and refuses a NaN that a sample value
+        // takes.
+        assert_eq!(
+            f.run(&[b"TS.INCRBY", b"p", b"+5", b"TIMESTAMP", b"1"]),
+            ":1\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"TS.INCRBY", b"q", b".5", b"TIMESTAMP", b"1"]),
+            ":1\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"TS.INCRBY", b"t", b"nan"]),
+            "-ERR TSDB: invalid increase/decrease value\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"TS.INCRBY", b"t", b"zzz"]),
+            "-ERR TSDB: invalid increase/decrease value\r\n"
+        );
+        // A key holding something else is WRONGTYPE and is answered before the
+        // number is looked at.
+        assert_eq!(f.run(&[b"SET", b"str", b"x"]), "+OK\r\n");
+        assert_eq!(
+            f.run(&[b"TS.INCRBY", b"str", b"zzz"]),
+            "-ERR WRONGTYPE Operation against a key holding the wrong kind of value\r\n"
+        );
+        // A TIMESTAMP keyword with nothing behind it is about the timestamp.
+        // The reference reads one past the end of its own arguments here and
+        // answers whatever was in that memory, so there is nothing to copy and
+        // this answers the same thing every time.
+        assert_eq!(
+            f.run(&[b"TS.INCRBY", b"t", b"1", b"TIMESTAMP"]),
+            "-ERR TSDB: invalid timestamp\r\n"
+        );
+        // And one behind a LABELS is a label name rather than the keyword, so
+        // this lands at the clock rather than at 5.
+        assert_eq!(
+            f.run(&[b"TS.INCRBY", b"lab", b"1", b"LABELS", b"TIMESTAMP", b"5"]),
+            format!(":{}\r\n", f.server.now_ms())
+        );
+        // Adding to a series whose newest value is not a number has no answer.
+        assert_eq!(f.run(&[b"TS.ADD", b"n", b"1", b"nan"]), ":1\r\n");
+        assert_eq!(
+            f.run(&[b"TS.INCRBY", b"n", b"1", b"TIMESTAMP", b"2"]),
+            "-ERR TSDB: cannot increment/decrement NaN value\r\n"
+        );
+    }
+
+    /// Deleting a span, both ends included.
+    #[test]
+    fn deleting_takes_out_a_span_and_answers_how_many_went() {
+        let mut f = Fixture::new();
+        for at in [b"100".as_slice(), b"200", b"300", b"400"] {
+            f.run(&[b"TS.ADD", b"t", at, b"1"]);
+        }
+        assert_eq!(f.run(&[b"TS.DEL", b"t", b"200", b"300"]), ":2\r\n");
+        assert!(
+            f.run(&[b"TS.INFO", b"t"])
+                .contains("+totalSamples\r\n:2\r\n")
+        );
+        // Ends the wrong way round take nothing out rather than being an error.
+        assert_eq!(f.run(&[b"TS.DEL", b"t", b"400", b"100"]), ":0\r\n");
+        // The two open ends.
+        assert_eq!(f.run(&[b"TS.DEL", b"t", b"-", b"+"]), ":2\r\n");
+        // A series everything has been deleted from keeps its chunk and reports
+        // zero at both ends again.
+        let empty = f.run(&[b"TS.INFO", b"t"]);
+        assert!(empty.contains("+totalSamples\r\n:0\r\n"), "{empty}");
+        assert!(empty.contains("+chunkCount\r\n:1\r\n"), "{empty}");
+        assert!(empty.contains("+firstTimestamp\r\n:0\r\n"), "{empty}");
+        assert!(empty.contains("+lastTimestamp\r\n:0\r\n"), "{empty}");
+        assert_eq!(f.run(&[b"TS.DEL", b"t", b"0", b"1000"]), ":0\r\n");
+        // The two ends have their own sentences.
+        assert_eq!(
+            f.run(&[b"TS.DEL", b"t", b"abc", b"5"]),
+            "-ERR TSDB: wrong fromTimestamp\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"TS.DEL", b"t", b"5", b"abc"]),
+            "-ERR TSDB: wrong toTimestamp\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"TS.DEL", b"t", b"-5", b"5"]),
+            "-ERR TSDB: wrong fromTimestamp\r\n"
+        );
+    }
+
+    /// What RESP3 changes, which is the two places a number is written and the
+    /// shape of `TS.INFO`.
+    #[test]
+    fn resp3_writes_a_sample_as_a_double_and_the_info_as_a_map() {
+        let mut f = Fixture::new();
+        f.out = Out::new(Proto::Resp3);
+        assert_eq!(
+            f.run(&[b"TS.CREATE", b"t", b"LABELS", b"room", b"kitchen"]),
+            "+OK\r\n"
+        );
+        assert_eq!(f.run(&[b"TS.ADD", b"t", b"100", b"1e300"]), ":100\r\n");
+        // A double rather than the simple string RESP2 gets.
+        assert_eq!(f.run(&[b"TS.GET", b"t"]), "*2\r\n:100\r\n,1e+300\r\n");
+        assert_eq!(
+            without_memory(&f.run(&[b"TS.INFO", b"t"])),
+            "%14\r\n\
+             +totalSamples\r\n:1\r\n\
+             +memoryUsage\r\n:\r\n\
+             +firstTimestamp\r\n:100\r\n\
+             +lastTimestamp\r\n:100\r\n\
+             +retentionTime\r\n:0\r\n\
+             +chunkCount\r\n:1\r\n\
+             +chunkSize\r\n:4096\r\n\
+             +chunkType\r\n+compressed\r\n\
+             +duplicatePolicy\r\n+block\r\n\
+             +labels\r\n%1\r\n$4\r\nroom\r\n$7\r\nkitchen\r\n\
+             +sourceKey\r\n_\r\n\
+             +rules\r\n%0\r\n\
+             +ignoreMaxTimeDiff\r\n:0\r\n\
+             +ignoreMaxValDiff\r\n,0\r\n"
         );
     }
 

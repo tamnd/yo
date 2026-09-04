@@ -20,6 +20,9 @@ yo-doc = { workspace = true }
 yo-graph = { workspace = true }
 yo-kv = { workspace = true }
 yo-reactor = { workspace = true }
+# The series the `TS.*` family works on, held under a key the same way the
+# sketches are.
+yo-series = { workspace = true }
 # `Metric`, so that a vector set says cosine in the same word the catalogue does.
 yo-shape = { workspace = true }
 # The filter the `BF.*` family works on, whose bytes go out over BF.SCANDUMP.
