@@ -192,6 +192,22 @@ const CUCKOO_WRITE: &[&str] = &["write", "denyoom", "module"];
 /// `CF.DEL`, the one write that only ever frees a slot and so does not deny out
 /// of memory.
 const CUCKOO_DELETE: &[&str] = &["write", "module", "fast"];
+/// The count min sketch read side. The module does not call either of these
+/// fast in the flags even though it puts `CMS.INFO` in the fast category, which
+/// is a disagreement in RedisBloom's own table and is copied as it stands.
+const AC_CMS_READ: &[&str] = &["@read", "@cms"];
+/// `CMS.INFO`, which is the one read in the fast category.
+const AC_CMS_READ_FAST: &[&str] = &["@read", "@fast", "@cms"];
+/// The count min sketch write side.
+const AC_CMS_WRITE: &[&str] = &["@write", "@cms"];
+/// The two constructors, which allocate and then do nothing.
+const AC_CMS_WRITE_FAST: &[&str] = &["@write", "@fast", "@cms"];
+/// A count min sketch read, which carries `module` and not `fast`.
+const CMS_READ: &[&str] = &["readonly", "module"];
+/// A count min sketch write. The table never grows after it is made, so the two
+/// that can allocate are the constructors, and all four deny out of memory
+/// because the module marks all four.
+const CMS_WRITE: &[&str] = &["write", "denyoom", "module"];
 /// The graph read side, for the ones that answer without walking the plane.
 const AC_GRAPH_READ_FAST: &[&str] = &["@read", "@graph", "@fast"];
 /// The graph read side for the ones that walk it.
@@ -3293,6 +3309,85 @@ pub static COMMANDS: &[Spec] = &[
         summary: "Pull the newer filters down into the older ones.",
         group: "cuckoo",
     },
+    // ----------------------------------------------------------------- cms
+    Spec {
+        name: "cms.initbydim",
+        arity: 4,
+        flags: CMS_WRITE,
+        first_key: 1,
+        last_key: 1,
+        step: 1,
+        acl: AC_CMS_WRITE_FAST,
+        since: "2.0.0",
+        complexity: "O(1)",
+        summary: "Make an empty sketch of a given width and depth.",
+        group: "cms",
+    },
+    Spec {
+        name: "cms.initbyprob",
+        arity: 4,
+        flags: CMS_WRITE,
+        first_key: 1,
+        last_key: 1,
+        step: 1,
+        acl: AC_CMS_WRITE_FAST,
+        since: "2.0.0",
+        complexity: "O(1)",
+        summary: "Make an empty sketch wide enough for a stated tolerance.",
+        group: "cms",
+    },
+    Spec {
+        name: "cms.incrby",
+        arity: -4,
+        flags: CMS_WRITE,
+        first_key: 1,
+        last_key: 1,
+        step: 1,
+        acl: AC_CMS_WRITE,
+        since: "2.0.0",
+        complexity: "O(N) with N the number of items",
+        summary: "Add to the count of one or more items.",
+        group: "cms",
+    },
+    Spec {
+        name: "cms.query",
+        arity: -3,
+        flags: CMS_READ,
+        first_key: 1,
+        last_key: 1,
+        step: 1,
+        acl: AC_CMS_READ,
+        since: "2.0.0",
+        complexity: "O(N) with N the number of items",
+        summary: "How many times the sketch has seen each item.",
+        group: "cms",
+    },
+    Spec {
+        name: "cms.merge",
+        arity: -4,
+        flags: CMS_WRITE,
+        first_key: 1,
+        last_key: 1,
+        step: 1,
+        acl: AC_CMS_WRITE,
+        since: "2.0.0",
+        complexity: "O(N * M) with N the sources and M the counters in one",
+        summary: "Replace a sketch with the weighted sum of others.",
+        group: "cms",
+    },
+    Spec {
+        name: "cms.info",
+        arity: 2,
+        flags: CMS_READ,
+        first_key: 1,
+        last_key: 1,
+        step: 1,
+        acl: AC_CMS_READ_FAST,
+        since: "2.0.0",
+        complexity: "O(1)",
+        summary: "The width, the depth and everything ever added.",
+        group: "cms",
+    },
     // --------------------------------------------------------------- array
     Spec {
         name: "arset",
@@ -4603,6 +4698,15 @@ const FREE: u16 = u16::MAX;
 /// None of the fourteen new names collides on the key, so the floor is still
 /// fifteen and the table is at a shade over twice it while carrying fourteen more
 /// commands than when that was first true.
+///
+/// The `CMS.*` family took it to 316 names and thirty seven extra probes, with
+/// the worst still one slot. No search was run this time. The one before it
+/// covered three and a half billion multipliers against a table only six names
+/// smaller and found nothing better that keeps every command within a slot, and
+/// six names is not enough of a change to expect a different answer, so the
+/// bound went up by two again. Only one of the six new names collides on the
+/// key, which is `CMS.QUERY` against `CMS.MERGE`, so the floor is sixteen and
+/// the table is still a shade over twice it.
 const MIX: u64 = 0x3e86_68c9_760e_09c9;
 
 /// The four bytes the index is computed from: the length, the first two bytes,
@@ -4933,7 +5037,7 @@ mod tests {
         }
         assert!(worst <= 2, "worst probe is {worst} slots");
         assert!(
-            total <= 35,
+            total <= 37,
             "{total} extra slots walked over the whole table"
         );
     }

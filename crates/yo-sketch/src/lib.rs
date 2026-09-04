@@ -26,10 +26,11 @@
 //!
 //! # What is here so far
 //!
-//! The scaling Bloom filter, which is [`bloom::Bloom`], and the cuckoo filter,
-//! which is [`cuckoo::Cuckoo`]. The count min sketch, the top k and the t digest
-//! go beside them and none of those is written yet.
+//! The scaling Bloom filter, which is [`bloom::Bloom`], the cuckoo filter, which
+//! is [`cuckoo::Cuckoo`], and the count min sketch, which is [`cms::Cms`]. The
+//! top k and the t digest go beside them and neither is written yet.
 
 pub mod bloom;
+pub mod cms;
 pub mod cuckoo;
 mod hash;
