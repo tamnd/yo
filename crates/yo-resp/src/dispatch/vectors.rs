@@ -1,10 +1,25 @@
 //! The vector set commands, on the wire (`10` section 9).
 //!
-//! Twelve of them, and they are Redis's own names and argument order rather
+//! Thirteen of them, and they are Redis's own names and argument order rather
 //! than ours, because a client that already speaks to a vector set should not
 //! have to learn anything to speak to this one. What is underneath is not
 //! Redis's HNSW graph, and where that shows through it says so in
 //! `divergences.toml` instead of pretending.
+//!
+//! # The names are upper case and the commands are in no ACL category
+//!
+//! Both are the module's own doing and both are copied because a client can see
+//! them. The thirteen are registered in upper case, so `COMMAND INFO vadd`
+//! answers `VADD` and an arity error quotes `VADD`, which is the only group here
+//! that is not lower case. Nothing else in the table minds, because a lookup
+//! compares without regard to case.
+//!
+//! None of them is in any ACL category either. There is no `vectorset` category
+//! on a real server, `ACL CAT vectorset` is an unknown category there, and
+//! `COMMAND LIST FILTERBY ACLCAT read` does not answer `VSIM`. Inventing one
+//! would make a rule written against this server mean something it does not
+//! mean against a real one, in the direction that grants access rather than the
+//! one that refuses it.
 //!
 //! # What holds the vectors
 //!
@@ -108,6 +123,15 @@ const BAD_COUNT: &str = "COUNT must be a positive integer";
 const BAD_EF: &str = "EF must be a positive integer";
 /// What `M` gets.
 const BAD_M: &str = "M must be a positive integer";
+/// What a `VRANGE` low end that is not a range gets.
+const BAD_START: &str = "invalid start range format";
+/// What its high end gets.
+const BAD_END: &str = "invalid end range format";
+/// What a `VRANGE` written the other way round gets.
+const BACKWARDS: &str = "'-' can only be used as first argument, '+' only as second";
+/// What a `VRANGE` count that is not a number gets, which is not the sentence
+/// `VSIM` uses for the same word because a real server does not use one either.
+const BAD_COUNT_VALUE: &str = "invalid COUNT value";
 /// How many answers `VSIM` gives when nobody said, which is Redis's.
 const COUNT: usize = 10;
 
@@ -242,18 +266,19 @@ fn similarity(distance: f32) -> f64 {
 
 pub(super) fn execute(db: &mut Keyspace, spec: &Spec, args: Args<'_>, out: &mut Out) -> Result<()> {
     match spec.name {
-        "vadd" => vadd(db, args, out),
-        "vsim" => vsim(db, args, out),
-        "vrem" => vrem(db, args, out),
-        "vcard" => vcard(db, args, out),
-        "vdim" => vdim(db, args, out),
-        "vemb" => vemb(db, args, out),
-        "vinfo" => vinfo(db, args, out),
-        "vismember" => vismember(db, args, out),
-        "vrandmember" => vrandmember(db, args, out),
-        "vlinks" => vlinks(db, args, out),
-        "vsetattr" => vsetattr(db, args, out),
-        "vgetattr" => vgetattr(db, args, out),
+        "VADD" => vadd(db, args, out),
+        "VSIM" => vsim(db, args, out),
+        "VREM" => vrem(db, args, out),
+        "VCARD" => vcard(db, args, out),
+        "VDIM" => vdim(db, args, out),
+        "VEMB" => vemb(db, args, out),
+        "VINFO" => vinfo(db, args, out),
+        "VISMEMBER" => vismember(db, args, out),
+        "VRANDMEMBER" => vrandmember(db, args, out),
+        "VLINKS" => vlinks(db, args, out),
+        "VSETATTR" => vsetattr(db, args, out),
+        "VGETATTR" => vgetattr(db, args, out),
+        "VRANGE" => vrange(db, args, out),
         other => unreachable!("{other} is not a vector set command"),
     }
 }
@@ -548,6 +573,114 @@ fn vgetattr(db: &mut Keyspace, args: Args<'_>, out: &mut Out) -> Result<()> {
         None => out.nil(),
     }
     Ok(())
+}
+
+/// `VRANGE key start end [count]`, which is the element names in a range.
+///
+/// The only command here that has nothing to do with vectors. It reads the
+/// names as names, in the order bytes come in, which is what makes it the way to
+/// page over a set that is being written to without a cursor and without the
+/// repeats and misses a random draw gives.
+fn vrange(db: &mut Keyspace, args: Args<'_>, out: &mut Out) -> Result<()> {
+    let count = match args.len() {
+        4 => None,
+        5 => Some(args.get(4)),
+        _ => return Err(args::wrong_arity("VRANGE")),
+    };
+    // The count is read before the ends, which is the order a real server reads
+    // them in and is worth keeping because it is the order a client sees: a
+    // request with both a bad range and a bad count is told about the count.
+    //
+    // Zero is not the same as leaving it out. A client that asked for no
+    // elements is given none, and only a negative number means every one.
+    let count = match count {
+        None => usize::MAX,
+        Some(arg) => match parse_i64(arg) {
+            Some(n) if n < 0 => usize::MAX,
+            Some(n) => usize::try_from(n).unwrap_or(usize::MAX),
+            None => return Err(Error::new(Code::Invalid, BAD_COUNT_VALUE)),
+        },
+    };
+    // Both ends are read before either is placed, because a client that wrote a
+    // range backwards has two things wrong with it and the one it is told about
+    // is the spelling and not the direction.
+    let start = bound(args.get(2), BAD_START)?;
+    let end = bound(args.get(3), BAD_END)?;
+    if matches!(start, Bound::Above) || matches!(end, Bound::Below) {
+        return Err(Error::new(Code::Invalid, BACKWARDS));
+    }
+    let Some(body) = read(db, args.get(1))? else {
+        out.array(0);
+        return Ok(());
+    };
+    // Filtered first and sorted after, so the sort is over what the range
+    // covers rather than over the whole set, which is the difference between
+    // reading a page off a million element set and sorting a million names to
+    // hand back ten.
+    let mut names: Vec<&[u8]> = (0..body.c.len())
+        .filter_map(|i| body.c.key_at(i))
+        .filter(|name| start.holds_start(name) && end.holds_end(name))
+        .collect();
+    names.sort_unstable();
+    names.truncate(count);
+    out.array(names.len());
+    for name in names {
+        out.bulk(name);
+    }
+    Ok(())
+}
+
+/// One end of the range `VRANGE` reads.
+enum Bound<'a> {
+    /// `-`, which is before every name there could be.
+    Below,
+    /// `+`, which is after every name there could be.
+    Above,
+    /// `[name`, which is that name and everything past it.
+    In(&'a [u8]),
+    /// `(name`, which is everything past that name and not the name.
+    Out(&'a [u8]),
+}
+
+impl Bound<'_> {
+    /// Whether `name` is at or past this end read as the low one.
+    fn holds_start(&self, name: &[u8]) -> bool {
+        match self {
+            Bound::Below => true,
+            Bound::Above => false,
+            Bound::In(at) => name >= *at,
+            Bound::Out(at) => name > *at,
+        }
+    }
+
+    /// Whether `name` is at or before this end read as the high one.
+    fn holds_end(&self, name: &[u8]) -> bool {
+        match self {
+            Bound::Below => false,
+            Bound::Above => true,
+            Bound::In(at) => name <= *at,
+            Bound::Out(at) => name < *at,
+        }
+    }
+}
+
+/// One end of a `VRANGE` as the client spelled it.
+///
+/// A bracket on its own is not a name, which is the one place this differs from
+/// the lex range `ZRANGEBYLEX` reads, where a bracket on its own is the empty
+/// name. An element can be called the empty string, so the two answer
+/// differently about a real element, and this is the answer a vector set gives.
+fn bound<'a>(arg: &'a [u8], bad: &'static str) -> Result<Bound<'a>> {
+    match arg {
+        b"-" => Ok(Bound::Below),
+        b"+" => Ok(Bound::Above),
+        _ if arg.len() < 2 => Err(Error::new(Code::Invalid, bad)),
+        _ => match arg[0] {
+            b'[' => Ok(Bound::In(&arg[1..])),
+            b'(' => Ok(Bound::Out(&arg[1..])),
+            _ => Err(Error::new(Code::Invalid, bad)),
+        },
+    }
 }
 
 /// What `VSIM` was asked about.
