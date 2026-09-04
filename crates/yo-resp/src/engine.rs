@@ -279,6 +279,12 @@ impl Conn {
         self.live = true;
         self.session = Session::new(id);
         self.out.clear();
+        // The protocol lives in the reply buffer and the reply buffer is kept,
+        // so it has to be put back by hand. Without this a client that opened a
+        // connection into a slot the last client had spoken RESP3 on would be
+        // answered in RESP3 without ever sending `HELLO`, which is a nil it
+        // cannot parse on the first `GET` that misses.
+        self.out.set_proto(Proto::Resp2);
         self.buf.clear();
         self.head = 0;
         self.partial = None;
@@ -1163,6 +1169,33 @@ mod tests {
         r.engine_mut().sink_mut().clear();
         let next = r.engine_mut().accept();
         r.engine_mut().feed(next, &wire(&[b"GET", b"foo"]));
+        pump(&mut r, &mut batch);
+        assert_eq!(r.engine().sink().sent(next), b"$-1\r\n");
+    }
+
+    /// A connection that never said `HELLO` is answered in RESP2, whatever the
+    /// last client in that slot was speaking.
+    ///
+    /// The protocol is kept in the reply buffer and the reply buffer outlives
+    /// the connection, so this is the one piece of connection state that a
+    /// recycled slot used to carry over. A client got a RESP3 null back from
+    /// the first `GET` that missed and could not parse it, which is as bad as a
+    /// compatibility bug gets: nothing the client did caused it and nothing it
+    /// could send would have avoided it.
+    #[test]
+    fn a_slot_that_last_spoke_resp3_answers_the_next_client_in_resp2() {
+        let (mut r, conn, mut batch) = engine();
+        r.engine_mut().feed(conn, &wire(&[b"HELLO", b"3"]));
+        r.engine_mut().feed(conn, &wire(&[b"GET", b"nothing"]));
+        pump(&mut r, &mut batch);
+        assert!(r.engine().sink().sent(conn).ends_with(b"_\r\n"));
+        r.engine_mut().feed(conn, &wire(&[b"QUIT"]));
+        pump(&mut r, &mut batch);
+
+        r.engine_mut().sink_mut().clear();
+        let next = r.engine_mut().accept();
+        assert_eq!(next, conn, "the same slot, which is what this is about");
+        r.engine_mut().feed(next, &wire(&[b"GET", b"nothing"]));
         pump(&mut r, &mut batch);
         assert_eq!(r.engine().sink().sent(next), b"$-1\r\n");
     }

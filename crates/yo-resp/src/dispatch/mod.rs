@@ -58,6 +58,7 @@ mod bits;
 mod blocking;
 mod bloom;
 mod cpu;
+mod cuckoo;
 mod geo;
 mod graph;
 mod hashes;
@@ -1154,7 +1155,7 @@ pub fn resolved(
     // two groups that hold them mark all of them rather than the session's.
     server.dirty |= match spec.group {
         "string" | "bitmap" | "hyperloglog" | "geo" | "set" | "hash" | "list" | "zset"
-        | "array" | "stream" | "bloom" => 1u64 << session.db,
+        | "array" | "stream" | "bloom" | "cuckoo" => 1u64 << session.db,
         _ => ALL_DATABASES,
     };
 
@@ -1240,6 +1241,10 @@ pub fn resolved(
             "bloom" => {
                 let db = session.db;
                 bloom::execute(&mut server.dbs[db], spec, args, out).map(|()| Flow::Continue)
+            }
+            "cuckoo" => {
+                let db = session.db;
+                cuckoo::execute(&mut server.dbs[db], spec, args, out).map(|()| Flow::Continue)
             }
             // The clock is read before the database is borrowed, because every
             // stream command needs the time and it lives on the server. An
@@ -12571,6 +12576,566 @@ mod tests {
             f.run(&[b"BF.INFO", b"b", b"CAPACITY"]),
             "%1\r\n+Capacity\r\n:100\r\n"
         );
+    }
+
+    // ---------------------------------------------------------------- cuckoo
+
+    /// A dump header, which is the four counts and the three widths a filter
+    /// writes in front of its fingerprints.
+    ///
+    /// Written by hand rather than taken from a `CF.SCANDUMP`, because what the
+    /// tests below want out of it is the states a filter cannot be put into
+    /// from the wire.
+    fn cf_header(
+        items: u64,
+        buckets: u64,
+        deletes: u64,
+        filters: u64,
+        geometry: [u16; 3],
+    ) -> Vec<u8> {
+        let mut out = Vec::with_capacity(38);
+        for n in [items, buckets, deletes, filters] {
+            out.extend_from_slice(&n.to_le_bytes());
+        }
+        for n in geometry {
+            out.extend_from_slice(&n.to_le_bytes());
+        }
+        out
+    }
+
+    /// The filter a client gets when it does not describe one, and the thing a
+    /// cuckoo filter does that a Bloom filter cannot, which is count copies and
+    /// take them out again.
+    #[test]
+    fn cf_add_makes_the_filter_and_counts_the_copies() {
+        let mut f = Fixture::new();
+        assert_eq!(f.run(&[b"CF.ADD", b"d", b"hello"]), ":1\r\n");
+        assert_eq!(f.run(&[b"CF.ADD", b"d", b"hello"]), ":1\r\n");
+        assert_eq!(f.run(&[b"CF.COUNT", b"d", b"hello"]), ":2\r\n");
+        // The NX form is the one that looks first, which is why it is a command
+        // of its own rather than an option.
+        assert_eq!(f.run(&[b"CF.ADDNX", b"d", b"hello"]), ":0\r\n");
+        assert_eq!(f.run(&[b"CF.ADDNX", b"d", b"other"]), ":1\r\n");
+        assert_eq!(f.run(&[b"CF.EXISTS", b"d", b"hello"]), ":1\r\n");
+        assert_eq!(f.run(&[b"CF.EXISTS", b"d", b"no"]), ":0\r\n");
+        assert_eq!(
+            f.run(&[b"CF.MEXISTS", b"d", b"hello", b"no"]),
+            "*2\r\n:1\r\n:0\r\n"
+        );
+        // The defaults are the module's configs: 1024 entries over buckets of
+        // two, twenty kicks and a chain that grows by one.
+        assert_eq!(
+            f.run(&[b"CF.INFO", b"d"]),
+            "*16\r\n+Size\r\n:1080\r\n+Number of buckets\r\n:512\r\n\
+             +Number of filters\r\n:1\r\n+Number of items inserted\r\n:3\r\n\
+             +Number of items deleted\r\n:0\r\n+Bucket size\r\n:2\r\n\
+             +Expansion rate\r\n:1\r\n+Max iterations\r\n:20\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"CF.DEBUG", b"d"]),
+            "$79\r\nbktsize:2 buckets:512 items:3 deletes:0 filters:1 \
+             max_iterations:20 expansion:1\r\n"
+        );
+        assert_eq!(f.run(&[b"TYPE", b"d"]), "+MBbloomCF\r\n");
+        assert_eq!(f.run(&[b"OBJECT", b"ENCODING", b"d"]), "$3\r\nraw\r\n");
+
+        // A delete takes one copy, so the same item goes twice and then stops.
+        assert_eq!(f.run(&[b"CF.DEL", b"d", b"hello"]), ":1\r\n");
+        assert_eq!(f.run(&[b"CF.COUNT", b"d", b"hello"]), ":1\r\n");
+        assert_eq!(f.run(&[b"CF.DEL", b"d", b"hello"]), ":1\r\n");
+        assert_eq!(f.run(&[b"CF.DEL", b"d", b"hello"]), ":0\r\n");
+        assert_eq!(f.run(&[b"CF.COMPACT", b"d"]), "+OK\r\n");
+
+        // A key with no filter under it gets three different sentences and one
+        // plain miss, depending on which command asked.
+        assert_eq!(f.run(&[b"CF.INFO", b"gone"]), "-ERR not found\r\n");
+        assert_eq!(f.run(&[b"CF.DEL", b"gone", b"x"]), "-Not found\r\n");
+        assert_eq!(
+            f.run(&[b"CF.COMPACT", b"gone"]),
+            "-Cuckoo filter was not found\r\n"
+        );
+        assert_eq!(f.run(&[b"CF.EXISTS", b"gone", b"x"]), ":0\r\n");
+        // And `CF.COMPACT` is declared as taking any number of keys and takes
+        // exactly one, which is the module's own arity being wrong rather than
+        // this table's.
+        assert!(
+            f.run(&[b"CF.COMPACT", b"a", b"b"])
+                .contains("wrong number of arguments")
+        );
+    }
+
+    /// The four that only read fingerprints treat a key holding something else
+    /// as a key with no filter, and everything else answers `WRONGTYPE`.
+    #[test]
+    fn a_wrong_type_is_a_miss_to_the_four_that_only_read_fingerprints() {
+        let mut f = Fixture::new();
+        f.run(&[b"SET", b"s", b"text"]);
+        assert_eq!(f.run(&[b"CF.EXISTS", b"s", b"x"]), ":0\r\n");
+        assert_eq!(f.run(&[b"CF.MEXISTS", b"s", b"x"]), "*1\r\n:0\r\n");
+        assert_eq!(f.run(&[b"CF.COUNT", b"s", b"x"]), ":0\r\n");
+        // `CF.DEL` writes and is still in that group, and `CF.COMPACT` writes
+        // and is declared read only, so neither of the two halves of the family
+        // is the same set as the flags say.
+        assert_eq!(f.run(&[b"CF.DEL", b"s", b"x"]), "-Not found\r\n");
+        assert_eq!(
+            f.run(&[b"CF.COMPACT", b"s"]),
+            "-Cuckoo filter was not found\r\n"
+        );
+        for cmd in [
+            vec![&b"CF.ADD"[..], b"s", b"x"],
+            vec![&b"CF.ADDNX"[..], b"s", b"x"],
+            vec![&b"CF.INSERT"[..], b"s", b"ITEMS", b"x"],
+            vec![&b"CF.INSERTNX"[..], b"s", b"ITEMS", b"x"],
+            vec![&b"CF.INFO"[..], b"s"],
+            vec![&b"CF.DEBUG"[..], b"s"],
+            vec![&b"CF.SCANDUMP"[..], b"s", b"0"],
+            vec![&b"CF.LOADCHUNK"[..], b"s", b"2", b"x"],
+            vec![&b"CF.RESERVE"[..], b"s", b"64"],
+        ] {
+            let name = String::from_utf8_lossy(cmd[0]).into_owned();
+            assert!(f.run(&cmd).starts_with("-WRONGTYPE"), "{name}");
+        }
+    }
+
+    /// `CF.RESERVE` reads its options by name in an order of its own, and the
+    /// first pair with a given name is the only one it looks at.
+    #[test]
+    fn reserve_complains_about_its_options_in_the_order_it_looks_for_them() {
+        let mut f = Fixture::new();
+        assert_eq!(
+            f.run(&[
+                b"CF.RESERVE",
+                b"r",
+                b"64",
+                b"BUCKETSIZE",
+                b"1",
+                b"MAXITERATIONS",
+                b"7",
+                b"EXPANSION",
+                b"4"
+            ]),
+            "+OK\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"CF.DEBUG", b"r"]),
+            "$77\r\nbktsize:1 buckets:64 items:0 deletes:0 filters:1 \
+             max_iterations:7 expansion:4\r\n"
+        );
+        assert_eq!(f.run(&[b"CF.RESERVE", b"r", b"64"]), "-ERR item exists\r\n");
+
+        assert_eq!(f.run(&[b"CF.RESERVE", b"q", b"abc"]), "-Bad capacity\r\n");
+        assert_eq!(
+            f.run(&[b"CF.RESERVE", b"q", b"1"]),
+            "-Capacity must be in the range [2 * BUCKETSIZE, 1073741824]\r\n"
+        );
+        // The range is the bucket size's and not a constant, so a capacity that
+        // was fine at two slots a bucket is not at four.
+        assert_eq!(
+            f.run(&[b"CF.RESERVE", b"q", b"7", b"BUCKETSIZE", b"4"]),
+            "-Capacity must be in the range [2 * BUCKETSIZE, 1073741824]\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"CF.RESERVE", b"q", b"8", b"BUCKETSIZE", b"4"]),
+            "+OK\r\n"
+        );
+
+        // The capacity is checked last, so a command that is wrong twice
+        // answers about the option. Which option it answers about is the order
+        // the module looks for them in and not the order they were written, so
+        // a bad kick budget wins over a bad bucket size wherever the two sit.
+        assert_eq!(
+            f.run(&[b"CF.RESERVE", b"q2", b"64", b"BUCKETSIZE", b"0"]),
+            "-BUCKETSIZE: value must be in the range [1, 255]\r\n"
+        );
+        assert_eq!(
+            f.run(&[
+                b"CF.RESERVE",
+                b"q2",
+                b"64",
+                b"EXPANSION",
+                b"xx",
+                b"BUCKETSIZE",
+                b"0"
+            ]),
+            "-BUCKETSIZE: value must be in the range [1, 255]\r\n"
+        );
+        assert_eq!(
+            f.run(&[
+                b"CF.RESERVE",
+                b"q2",
+                b"64",
+                b"MAXITERATIONS",
+                b"0",
+                b"BUCKETSIZE",
+                b"0"
+            ]),
+            "-MAXITERATIONS: value must be in the range [1, 65535]\r\n"
+        );
+        // A second pair with a name that has already been read is not looked at
+        // at all, so this one is a filter with buckets of one rather than an
+        // error about a bucket size of zero.
+        assert_eq!(
+            f.run(&[
+                b"CF.RESERVE",
+                b"q3",
+                b"64",
+                b"BUCKETSIZE",
+                b"1",
+                b"BUCKETSIZE",
+                b"0"
+            ]),
+            "+OK\r\n"
+        );
+        // A pair nobody knows is dropped, which is the opposite of what
+        // `CF.INSERT` does with the same mistake.
+        assert_eq!(
+            f.run(&[b"CF.RESERVE", b"q4", b"64", b"NOSUCH", b"9"]),
+            "+OK\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"CF.DEBUG", b"q4"]),
+            "$78\r\nbktsize:2 buckets:32 items:0 deletes:0 filters:1 \
+             max_iterations:20 expansion:1\r\n"
+        );
+        // And an option with nothing after it leaves an odd number of them,
+        // which is an arity error rather than a complaint about the option.
+        assert!(
+            f.run(&[b"CF.RESERVE", b"q5", b"64", b"BUCKETSIZE"])
+                .contains("wrong number of arguments")
+        );
+    }
+
+    /// `CF.INSERT` is a reserve and a multi add, with a grammar that agrees
+    /// with `CF.RESERVE` about nothing.
+    #[test]
+    fn insert_checks_every_occurrence_and_matches_on_the_first_letter() {
+        let mut f = Fixture::new();
+        assert_eq!(
+            f.run(&[b"CF.INSERT", b"i", b"CAPACITY", b"64", b"ITEMS", b"a", b"b"]),
+            "*2\r\n:1\r\n:1\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"CF.DEBUG", b"i"]),
+            "$78\r\nbktsize:2 buckets:32 items:2 deletes:0 filters:1 \
+             max_iterations:20 expansion:1\r\n"
+        );
+        // The NX form has three answers rather than two, which is why it stays
+        // integers on both protocols.
+        assert_eq!(
+            f.run(&[b"CF.INSERTNX", b"i", b"ITEMS", b"a", b"c"]),
+            "*2\r\n:0\r\n:1\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"CF.INSERT", b"gone", b"NOCREATE", b"ITEMS", b"a"]),
+            "-ERR not found\r\n"
+        );
+        assert_eq!(f.run(&[b"EXISTS", b"gone"]), ":0\r\n");
+
+        assert_eq!(
+            f.run(&[b"CF.INSERT", b"i", b"CAPACITY", b"abc", b"ITEMS", b"a"]),
+            "-Bad capacity\r\n"
+        );
+        // The bucket size cannot be given here, so the range names the config
+        // that holds it instead of the option `CF.RESERVE` names.
+        assert_eq!(
+            f.run(&[b"CF.INSERT", b"i", b"CAPACITY", b"2", b"ITEMS", b"a"]),
+            "-Capacity must be in the range [cf-bucket-size * 2, 1073741824]\r\n"
+        );
+        // Every occurrence is checked, which is where this differs from
+        // `CF.RESERVE`: the second `CAPACITY` is an error even though the first
+        // one is the one that would have been used.
+        assert_eq!(
+            f.run(&[
+                b"CF.INSERT",
+                b"i",
+                b"CAPACITY",
+                b"8",
+                b"CAPACITY",
+                b"2",
+                b"ITEMS",
+                b"a"
+            ]),
+            "-Capacity must be in the range [cf-bucket-size * 2, 1073741824]\r\n"
+        );
+        // An option is one letter and not a word, so `NOSUCH` is `NOCREATE` and
+        // `ITEMSXYZ` is `ITEMS`, and only a letter that starts nothing is
+        // refused.
+        assert_eq!(
+            f.run(&[b"CF.INSERT", b"i", b"NOSUCH", b"ITEMS", b"a"]),
+            "*1\r\n:1\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"CF.INSERT", b"i", b"ITEMSXYZ", b"a"]),
+            "*1\r\n:1\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"CF.INSERT", b"i", b"ZZZ", b"ITEMS", b"a"]),
+            "-Unknown argument received\r\n"
+        );
+        // Everything after ITEMS is an item, even when it spells an option.
+        assert_eq!(
+            f.run(&[b"CF.INSERT", b"i", b"ITEMS", b"NOCREATE"]),
+            "*1\r\n:1\r\n"
+        );
+        // And the two ways of sending no items at all are the same complaint.
+        assert!(
+            f.run(&[b"CF.INSERT", b"i", b"ITEMS"])
+                .contains("wrong number of arguments")
+        );
+        assert!(
+            f.run(&[b"CF.INSERT", b"i", b"CAPACITY"])
+                .contains("wrong number of arguments")
+        );
+    }
+
+    /// The two walls a filter can hit, which say different things and are not
+    /// the same wall.
+    #[test]
+    fn a_full_filter_and_one_that_ran_out_of_filters_answer_differently() {
+        let mut f = Fixture::new();
+        f.run(&[
+            b"CF.RESERVE",
+            b"s",
+            b"4",
+            b"BUCKETSIZE",
+            b"1",
+            b"EXPANSION",
+            b"0",
+        ]);
+        for i in 0..4u32 {
+            assert_eq!(
+                f.run(&[b"CF.ADD", b"s", i.to_string().as_bytes()]),
+                ":1\r\n"
+            );
+        }
+        assert_eq!(f.run(&[b"CF.ADD", b"s", b"4"]), "-Filter is full\r\n");
+        assert_eq!(f.run(&[b"CF.ADDNX", b"s", b"zz"]), "-Filter is full\r\n");
+        // The add commands say it in a sentence and the insert commands say it
+        // in the array, one value per item, and the array is never short.
+        assert_eq!(
+            f.run(&[b"CF.INSERT", b"s", b"ITEMS", b"p", b"q"]),
+            "*2\r\n:-1\r\n:-1\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"CF.INSERTNX", b"s", b"ITEMS", b"0", b"q"]),
+            "*2\r\n:0\r\n:-1\r\n"
+        );
+
+        // A chain that is allowed to grow stops for a different reason, and the
+        // count it stops at is the filter limit rather than the room: this one
+        // gives up with three slots free. Loading a chain that already has
+        // every filter it is allowed shows why, since it refuses an item
+        // straight into an empty one.
+        let full = cf_header(0, 4, 0, 32, [1, 20, 1]);
+        assert_eq!(f.run(&[b"CF.LOADCHUNK", b"g", b"1", &full]), "+OK\r\n");
+        assert_eq!(
+            f.run(&[b"CF.ADD", b"g", b"q"]),
+            "-Maximum expansions reached\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"CF.INFO", b"g"]),
+            "*16\r\n+Size\r\n:680\r\n+Number of buckets\r\n:4\r\n\
+             +Number of filters\r\n:32\r\n+Number of items inserted\r\n:0\r\n\
+             +Number of items deleted\r\n:0\r\n+Bucket size\r\n:1\r\n\
+             +Expansion rate\r\n:1\r\n+Max iterations\r\n:20\r\n"
+        );
+    }
+
+    /// A filter dumped a chunk at a time and put back under another key is the
+    /// same filter, and the headers that describe one nobody could build are
+    /// refused on the way in.
+    #[test]
+    fn a_cuckoo_dump_replays_into_a_filter_that_answers_the_same() {
+        let mut f = Fixture::new();
+        f.run(&[
+            b"CF.RESERVE",
+            b"src",
+            b"8",
+            b"BUCKETSIZE",
+            b"2",
+            b"EXPANSION",
+            b"2",
+        ]);
+        for i in 0..40u32 {
+            f.run(&[b"CF.ADD", b"src", i.to_string().as_bytes()]);
+        }
+        // Position zero asks for the header and every one after it is a byte
+        // offset across every filter laid end to end, and the walk ends on a
+        // zero and a nil rather than an empty chunk.
+        let mut pos = b"0".to_vec();
+        let mut chunks = 0;
+        loop {
+            let raw = f.raw(&[b"CF.SCANDUMP", b"src", &pos]);
+            let head = String::from_utf8_lossy(&raw[..raw.len().min(24)]).into_owned();
+            let next = head
+                .split("\r\n")
+                .nth(1)
+                .and_then(|n| n.strip_prefix(':'))
+                .expect("a two element reply of a position and a chunk")
+                .to_owned();
+            if next == "0" {
+                assert!(raw.ends_with(b"$-1\r\n"), "the walk ends on a nil");
+                break;
+            }
+            let body = &raw[raw.iter().position(|&b| b == b'$').expect("a bulk chunk")..];
+            let at = body
+                .windows(2)
+                .position(|w| w == b"\r\n")
+                .expect("a length line")
+                + 2;
+            let data = &body[at..body.len() - 2];
+            assert_eq!(
+                f.run(&[b"CF.LOADCHUNK", b"dst", next.as_bytes(), data]),
+                "+OK\r\n",
+                "loading chunk {chunks}"
+            );
+            pos = next.into_bytes();
+            chunks += 1;
+        }
+        assert!(chunks >= 2, "a header and at least one chunk");
+
+        assert_eq!(f.run(&[b"CF.INFO", b"dst"]), f.run(&[b"CF.INFO", b"src"]));
+        assert_eq!(f.run(&[b"CF.DEBUG", b"dst"]), f.run(&[b"CF.DEBUG", b"src"]));
+        for i in 0..40u32 {
+            assert_eq!(
+                f.run(&[b"CF.EXISTS", b"dst", i.to_string().as_bytes()]),
+                ":1\r\n"
+            );
+        }
+
+        // A filter with nothing in it hands out no header at all, so a client
+        // that dumps one has nothing to load back.
+        f.run(&[b"CF.RESERVE", b"empty", b"4", b"BUCKETSIZE", b"1"]);
+        assert_eq!(
+            f.run(&[b"CF.SCANDUMP", b"empty", b"0"]),
+            "*2\r\n:0\r\n$-1\r\n"
+        );
+
+        // The positions this end will not take, which are not the same set at
+        // both ends: a dump refuses a negative one and a load takes it as an
+        // offset and fails to find anything there.
+        assert_eq!(
+            f.run(&[b"CF.SCANDUMP", b"src", b"nope"]),
+            "-Invalid position\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"CF.SCANDUMP", b"src", b"-1"]),
+            "-Invalid position\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"CF.LOADCHUNK", b"dst", b"0", b"x"]),
+            "-Invalid position\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"CF.LOADCHUNK", b"dst", b"99999", b"x"]),
+            "-Couldn't load chunk!\r\n"
+        );
+        // A header on top of a filter is refused rather than merged.
+        let good = cf_header(0, 8, 0, 1, [2, 20, 1]);
+        assert_eq!(
+            f.run(&[b"CF.LOADCHUNK", b"dst", b"1", &good]),
+            "-ERR item exists\r\n"
+        );
+        // A chunk that is not the size of a header where a header should have
+        // been is one sentence, and one that is the size of a header and
+        // describes a filter nobody could build is another.
+        assert_eq!(
+            f.run(&[b"CF.LOADCHUNK", b"n1", b"1", b"short"]),
+            "-Invalid header\r\n"
+        );
+        for (why, bad) in [
+            ("no filters at all", cf_header(0, 8, 0, 0, [2, 20, 1])),
+            ("no buckets", cf_header(0, 0, 0, 1, [2, 20, 1])),
+            (
+                "a bucket count that is not a power of two",
+                cf_header(0, 3, 0, 1, [2, 20, 1]),
+            ),
+            ("an empty bucket", cf_header(0, 8, 0, 1, [0, 20, 1])),
+            ("no kicks", cf_header(0, 8, 0, 1, [2, 0, 1])),
+            (
+                "a growth nobody could reach",
+                cf_header(0, 8, 0, 1, [2, 20, 32769]),
+            ),
+            (
+                "a chain that cannot grow and did",
+                cf_header(0, 8, 0, 2, [2, 20, 0]),
+            ),
+            // The count is written in eight bytes and read into two, so a
+            // number that is a multiple of the second arrives as none.
+            (
+                "a filter count that wraps",
+                cf_header(0, 8, 0, 65_536, [2, 20, 1]),
+            ),
+        ] {
+            assert_eq!(
+                f.run(&[b"CF.LOADCHUNK", b"bad", b"1", &bad]),
+                "-Couldn't create filter!\r\n",
+                "{why}"
+            );
+        }
+    }
+
+    /// The RESP3 shapes, which are where this family differs most from RESP2
+    /// and where one of its answers stops being readable.
+    #[test]
+    fn the_cuckoo_family_answers_in_resp3_spelling_too() {
+        let mut f = Fixture::new();
+        f.out.set_proto(Proto::Resp3);
+        assert_eq!(f.run(&[b"CF.ADD", b"c", b"a"]), "#t\r\n");
+        assert_eq!(f.run(&[b"CF.ADD", b"c", b"a"]), "#t\r\n");
+        assert_eq!(f.run(&[b"CF.ADDNX", b"c", b"a"]), "#f\r\n");
+        assert_eq!(f.run(&[b"CF.EXISTS", b"c", b"a"]), "#t\r\n");
+        assert_eq!(
+            f.run(&[b"CF.MEXISTS", b"c", b"a", b"z"]),
+            "*2\r\n#t\r\n#f\r\n"
+        );
+        assert_eq!(f.run(&[b"CF.DEL", b"c", b"a"]), "#t\r\n");
+        assert_eq!(f.run(&[b"CF.DEL", b"c", b"z"]), "#f\r\n");
+        // The count stays an integer, because it counts rather than answers.
+        assert_eq!(f.run(&[b"CF.COUNT", b"c", b"a"]), ":1\r\n");
+        assert_eq!(
+            f.run(&[b"CF.INFO", b"c"]),
+            "%8\r\n+Size\r\n:1080\r\n+Number of buckets\r\n:512\r\n\
+             +Number of filters\r\n:1\r\n+Number of items inserted\r\n:1\r\n\
+             +Number of items deleted\r\n:1\r\n+Bucket size\r\n:2\r\n\
+             +Expansion rate\r\n:1\r\n+Max iterations\r\n:20\r\n"
+        );
+
+        // `CF.INSERT` writes a boolean per item here and an integer per item on
+        // RESP2, and minus one has nowhere to go in a boolean, so a RESP3
+        // client cannot tell an item that did not fit from one that is already
+        // there. `CF.INSERTNX` keeps its integers for exactly that reason.
+        f.run(&[
+            b"CF.RESERVE",
+            b"s",
+            b"4",
+            b"BUCKETSIZE",
+            b"1",
+            b"EXPANSION",
+            b"0",
+        ]);
+        assert_eq!(
+            f.run(&[
+                b"CF.INSERT",
+                b"s",
+                b"ITEMS",
+                b"a",
+                b"b",
+                b"c",
+                b"d",
+                b"e",
+                b"f"
+            ]),
+            "*6\r\n#t\r\n#t\r\n#t\r\n#f\r\n#f\r\n#f\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"CF.INSERTNX", b"s", b"ITEMS", b"a", b"zz"]),
+            "*2\r\n:0\r\n:-1\r\n"
+        );
+        assert_eq!(f.run(&[b"CF.ADD", b"s", b"zzz"]), "-Filter is full\r\n");
+        // The end of a dump is a nil and not an empty chunk, which is one
+        // underscore here and a negative length on RESP2.
+        assert_eq!(f.run(&[b"CF.SCANDUMP", b"c", b"9999"]), "*2\r\n:0\r\n_\r\n");
     }
 
     /// The three shapes an `XADD` id can take, and the one rule behind all of

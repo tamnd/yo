@@ -175,6 +175,23 @@ const BLOOM_READ: &[&str] = &["readonly", "module", "fast"];
 /// A Bloom write. All of them can grow the filter, `BF.LOADCHUNK` included, so
 /// all of them deny out of memory.
 const BLOOM_WRITE: &[&str] = &["write", "denyoom", "module"];
+/// The cuckoo filter read side, which is the same three flags under a category
+/// of its own. `CF.COMPACT` is in here too, because the module has it down as a
+/// read even though it moves fingerprints between filters.
+const AC_CUCKOO_READ: &[&str] = &["@read", "@cuckoo"];
+/// The one read the module also calls fast, which is `CF.INFO`.
+const AC_CUCKOO_READ_FAST: &[&str] = &["@read", "@fast", "@cuckoo"];
+/// The cuckoo filter write side.
+const AC_CUCKOO_WRITE: &[&str] = &["@write", "@cuckoo"];
+/// `CF.RESERVE`, which is the one write that does no hashing.
+const AC_CUCKOO_WRITE_FAST: &[&str] = &["@write", "@fast", "@cuckoo"];
+/// A cuckoo read, with the `module` flag the whole family carries.
+const CUCKOO_READ: &[&str] = &["readonly", "module", "fast"];
+/// A cuckoo write, all of which can grow the chain.
+const CUCKOO_WRITE: &[&str] = &["write", "denyoom", "module"];
+/// `CF.DEL`, the one write that only ever frees a slot and so does not deny out
+/// of memory.
+const CUCKOO_DELETE: &[&str] = &["write", "module", "fast"];
 /// The graph read side, for the ones that answer without walking the plane.
 const AC_GRAPH_READ_FAST: &[&str] = &["@read", "@graph", "@fast"];
 /// The graph read side for the ones that walk it.
@@ -3093,6 +3110,189 @@ pub static COMMANDS: &[Spec] = &[
         summary: "The chain and a line for each of its links.",
         group: "bloom",
     },
+    // -------------------------------------------------------------- cuckoo
+    Spec {
+        name: "cf.reserve",
+        arity: -3,
+        flags: CUCKOO_WRITE,
+        first_key: 1,
+        last_key: 1,
+        step: 1,
+        acl: AC_CUCKOO_WRITE_FAST,
+        since: "1.0.0",
+        complexity: "O(1)",
+        summary: "Make an empty filter with a given capacity.",
+        group: "cuckoo",
+    },
+    Spec {
+        name: "cf.add",
+        arity: 3,
+        flags: CUCKOO_WRITE,
+        first_key: 1,
+        last_key: 1,
+        step: 1,
+        acl: AC_CUCKOO_WRITE,
+        since: "1.0.0",
+        complexity: "O(1) amortised, O(N) when the chain has to grow",
+        summary: "Add an item, making the filter if the key is free.",
+        group: "cuckoo",
+    },
+    Spec {
+        name: "cf.addnx",
+        arity: 3,
+        flags: CUCKOO_WRITE,
+        first_key: 1,
+        last_key: 1,
+        step: 1,
+        acl: AC_CUCKOO_WRITE,
+        since: "1.0.0",
+        complexity: "O(1) amortised, O(N) when the chain has to grow",
+        summary: "Add an item unless the filter already has it.",
+        group: "cuckoo",
+    },
+    Spec {
+        name: "cf.insert",
+        arity: -4,
+        flags: CUCKOO_WRITE,
+        first_key: 1,
+        last_key: 1,
+        step: 1,
+        acl: AC_CUCKOO_WRITE,
+        since: "1.0.0",
+        complexity: "O(N) with N the number of items",
+        summary: "Add several items to a filter described in the same command.",
+        group: "cuckoo",
+    },
+    Spec {
+        name: "cf.insertnx",
+        arity: -4,
+        flags: CUCKOO_WRITE,
+        first_key: 1,
+        last_key: 1,
+        step: 1,
+        acl: AC_CUCKOO_WRITE,
+        since: "1.0.0",
+        complexity: "O(N) with N the number of items",
+        summary: "Add several items the filter does not already have.",
+        group: "cuckoo",
+    },
+    Spec {
+        name: "cf.exists",
+        arity: 3,
+        flags: CUCKOO_READ,
+        first_key: 1,
+        last_key: 1,
+        step: 1,
+        acl: AC_CUCKOO_READ,
+        since: "1.0.0",
+        complexity: "O(1)",
+        summary: "Whether an item is probably in the filter.",
+        group: "cuckoo",
+    },
+    Spec {
+        name: "cf.mexists",
+        arity: -3,
+        flags: CUCKOO_READ,
+        first_key: 1,
+        last_key: 1,
+        step: 1,
+        acl: AC_CUCKOO_READ,
+        since: "1.0.0",
+        complexity: "O(N) with N the number of items",
+        summary: "Whether each of several items is probably in the filter.",
+        group: "cuckoo",
+    },
+    Spec {
+        name: "cf.count",
+        arity: 3,
+        flags: CUCKOO_READ,
+        first_key: 1,
+        last_key: 1,
+        step: 1,
+        acl: AC_CUCKOO_READ,
+        since: "1.0.0",
+        complexity: "O(1)",
+        summary: "How many copies of an item the filter thinks it has.",
+        group: "cuckoo",
+    },
+    Spec {
+        name: "cf.del",
+        arity: 3,
+        flags: CUCKOO_DELETE,
+        first_key: 1,
+        last_key: 1,
+        step: 1,
+        acl: AC_CUCKOO_WRITE,
+        since: "1.0.0",
+        complexity: "O(1)",
+        summary: "Take one copy of an item out of the filter.",
+        group: "cuckoo",
+    },
+    Spec {
+        name: "cf.scandump",
+        arity: 3,
+        flags: CUCKOO_READ,
+        first_key: 1,
+        last_key: 1,
+        step: 1,
+        acl: AC_CUCKOO_READ,
+        since: "1.0.0",
+        complexity: "O(N) with N the size of the chunk",
+        summary: "One chunk of the filter, to be replayed into CF.LOADCHUNK.",
+        group: "cuckoo",
+    },
+    Spec {
+        name: "cf.loadchunk",
+        arity: 4,
+        flags: CUCKOO_WRITE,
+        first_key: 1,
+        last_key: 1,
+        step: 1,
+        acl: AC_CUCKOO_WRITE,
+        since: "1.0.0",
+        complexity: "O(N) with N the size of the chunk",
+        summary: "Put back a chunk that CF.SCANDUMP handed out.",
+        group: "cuckoo",
+    },
+    Spec {
+        name: "cf.info",
+        arity: 2,
+        flags: CUCKOO_READ,
+        first_key: 1,
+        last_key: 1,
+        step: 1,
+        acl: AC_CUCKOO_READ_FAST,
+        since: "1.0.0",
+        complexity: "O(1)",
+        summary: "The shape of the chain.",
+        group: "cuckoo",
+    },
+    Spec {
+        name: "cf.debug",
+        arity: 2,
+        flags: CUCKOO_READ,
+        first_key: 1,
+        last_key: 1,
+        step: 1,
+        acl: AC_CUCKOO_READ,
+        since: "1.0.0",
+        complexity: "O(1)",
+        summary: "The chain's geometry on one line.",
+        group: "cuckoo",
+    },
+    Spec {
+        name: "cf.compact",
+        arity: -1,
+        flags: CUCKOO_READ,
+        first_key: 1,
+        last_key: 1,
+        step: 1,
+        acl: AC_CUCKOO_READ,
+        since: "1.0.0",
+        complexity: "O(N) with N the number of items in the newer filters",
+        summary: "Pull the newer filters down into the older ones.",
+        group: "cuckoo",
+    },
     // --------------------------------------------------------------- array
     Spec {
         name: "arset",
@@ -4390,6 +4590,19 @@ const FREE: u16 = u16::MAX;
 /// three. Eleven more names, five more probes, and the worst is still a single
 /// slot. None of the eleven collides on the key, so the floor moved by one for
 /// an unrelated reason and stands at fifteen, which this is a shade over twice.
+///
+/// The `CF.*` family took the table to 310 names and thirty five extra probes,
+/// two more than the bound allowed, with the worst still a single slot. The
+/// thirteenth search was run over that and it is the second one that did not
+/// replace the multiplier. Ten shards over one and a half billion multipliers
+/// found nothing better than thirty six at one slot, which is worse than the one
+/// already here, and another two billion with the single slot rule relaxed found
+/// one at two slots and thirty one. Four fewer probes spread over three hundred
+/// and ten lookups is not worth giving up the property that no command is ever
+/// more than one slot from home, so this one stayed and the bound went up by two.
+/// None of the fourteen new names collides on the key, so the floor is still
+/// fifteen and the table is at a shade over twice it while carrying fourteen more
+/// commands than when that was first true.
 const MIX: u64 = 0x3e86_68c9_760e_09c9;
 
 /// The four bytes the index is computed from: the length, the first two bytes,
@@ -4720,7 +4933,7 @@ mod tests {
         }
         assert!(worst <= 2, "worst probe is {worst} slots");
         assert!(
-            total <= 33,
+            total <= 35,
             "{total} extra slots walked over the whole table"
         );
     }

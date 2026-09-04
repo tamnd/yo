@@ -170,6 +170,19 @@ doc = "11 section 8"
 # order, none of which are the ones anybody would pick today.
 
 [[group]]
+name = "cuckoo"
+expected = 14
+status = "shipped"
+doc = "11 section 8"
+# Thirteen public commands and CF.DEBUG, which is undocumented and is in the
+# @cuckoo ACL category on a real server the same way BF.DEBUG is in @bloom. The
+# group is byte compatible rather than behaviour compatible for the same reason
+# the Bloom group is: CF.SCANDUMP hands a client the filter's own fingerprints
+# and CF.LOADCHUNK takes them back, so the geometry, MurmurHash64A, the
+# fingerprint, the alternate bucket and the order a full bucket is kicked in are
+# all fixed by the format rather than chosen.
+
+[[group]]
 name = "stream"
 expected = 20
 status = "partial"
@@ -2993,6 +3006,163 @@ bounded = "inherent"
 status = "shipped"
 wire = "verified"
 notes = "Undocumented and in the ACL category all the same, so a client listing the group finds eleven commands and not ten. The reply is the chain size and then a line for each link with the numbers a client would otherwise have to take a BF.SCANDUMP apart to see. The ratio field is C's %g of the link's error rate, six significant digits with an exponent below a ten thousandth, which is why it says 5e-11 where Rust would say 0.00000000005."
+
+
+# ---------------------------------------------------------------------- cuckoo
+
+[[command]]
+name = "CF.RESERVE"
+group = "cuckoo"
+since = "1.0.0"
+arity = -3
+plan = "whole-value"
+bounded = "risk"
+status = "shipped"
+wire = "verified"
+notes = "The whole filter is allocated on the way in, so a reserve at the top of the capacity range costs a gibibyte of fingerprints before a single item has been added, which is the risk on the row and is the module's design rather than this implementation. Everything after the capacity is read as name and value pairs, an odd number of them is an arity error, and a pair whose name is none of the three is ignored. The first pair with a given name wins and a second with the same name is not even parsed, so a bucket size of one followed by a bucket size of zero is accepted."
+
+[[command]]
+name = "CF.ADD"
+group = "cuckoo"
+since = "1.0.0"
+arity = 3
+plan = "whole-value"
+bounded = "inherent"
+status = "shipped"
+wire = "verified"
+notes = "One hash and then a look at two buckets, so the cost does not depend on how many items are in the filter until the buckets are full, at which point the insert kicks fingerprints around the newest filter up to max iterations times. The key is made at the configured defaults if it is not there, which is cf-initial-size and cf-bucket-size and the rest, and not anything this command can be told. Adding an item that is already there puts a second copy in and CF.COUNT then says two, which is the thing a cuckoo filter can do and a Bloom filter cannot."
+
+[[command]]
+name = "CF.ADDNX"
+group = "cuckoo"
+since = "1.0.0"
+arity = 3
+plan = "whole-value"
+bounded = "inherent"
+status = "shipped"
+wire = "verified"
+notes = "The same as CF.ADD with a membership check in front of it, so an item the filter already has answers 0 and nothing moves. That check is only as good as the fingerprint, so an item that collides with one already in the same bucket answers 0 without ever having been added, which is the false positive rate showing through on the write side."
+
+[[command]]
+name = "CF.INSERT"
+group = "cuckoo"
+since = "1.0.0"
+arity = -4
+plan = "whole-value"
+bounded = "inherent"
+status = "shipped"
+wire = "verified"
+notes = "One answer per item and the array is never short, which is where this differs from BF.MADD: a filter that fills up part way through answers minus one for every item after that rather than stopping and writing an error into the middle of the array. On RESP3 that minus one is false, so a RESP3 client cannot tell a refusal from anything else, which is the module's shape. Options are matched on the first letter, so NOSUCH means NOCREATE and ITEMSXYZ means ITEMS, and every occurrence of CAPACITY is range checked even though the last one is the one used."
+
+[[command]]
+name = "CF.INSERTNX"
+group = "cuckoo"
+since = "1.0.0"
+arity = -4
+plan = "whole-value"
+bounded = "inherent"
+status = "shipped"
+wire = "verified"
+notes = "The same command with the membership check CF.ADDNX has, and it answers integers on both protocols rather than booleans on RESP3, because it has three outcomes and minus one has to survive. That makes it the one command in the family where a RESP3 client can tell a refusal from an item that was already there."
+
+[[command]]
+name = "CF.EXISTS"
+group = "cuckoo"
+since = "1.0.0"
+arity = 3
+plan = "metadata"
+bounded = "inherent"
+status = "shipped"
+wire = "verified"
+notes = "Two buckets in each filter of the chain, newest first, so a chain that has grown thirty two times costs thirty two pairs of lookups for a miss. A key holding something else answers a miss rather than WRONGTYPE, which the three reads and CF.DEL all do and none of the writes does, so the two halves of a check and set disagree about what that key is."
+
+[[command]]
+name = "CF.MEXISTS"
+group = "cuckoo"
+since = "1.0.0"
+arity = -3
+plan = "metadata"
+bounded = "inherent"
+status = "shipped"
+wire = "verified"
+notes = "One CF.EXISTS per item over one key lookup, with the same tolerance for a key holding something else. The array is always as long as the item list."
+
+[[command]]
+name = "CF.COUNT"
+group = "cuckoo"
+since = "1.0.0"
+arity = 3
+plan = "metadata"
+bounded = "inherent"
+status = "shipped"
+wire = "verified"
+notes = "How many slots in the item's two buckets hold its fingerprint, added up over the chain. An item whose two buckets are the same bucket is counted twice, because the module compares the two whole hashes rather than the two bucket numbers and those are never equal, so a filter with one copy of such an item answers 2. That is copied rather than fixed, because a client comparing counts between two servers would otherwise see them disagree."
+
+[[command]]
+name = "CF.DEL"
+group = "cuckoo"
+since = "1.0.0"
+arity = 3
+plan = "point"
+bounded = "inherent"
+status = "shipped"
+wire = "verified"
+notes = "Clearing one slot, which is the whole reason to prefer a cuckoo filter over a Bloom filter. Deleting an item that was never added can clear a slot belonging to another item that shares its fingerprint and bucket, which turns a false positive into a false negative, and that is the trade the structure makes rather than a bug. Once more than a tenth of the filter has been deleted the delete compacts the chain, so an ordinary delete is sometimes a walk over the newest filter."
+
+[[command]]
+name = "CF.SCANDUMP"
+group = "cuckoo"
+since = "1.0.0"
+arity = 3
+plan = "cursor"
+bounded = "inherent"
+status = "shipped"
+wire = "verified"
+notes = "Position zero carries the header and after that the position is one past the last byte handed over, counted across every filter's fingerprints laid end to end, and a chunk never spans two filters. A filter with nothing in it answers zero and a nil rather than a header, so a client that dumps an empty filter has nothing to load back. A negative position is refused here and taken as an offset by CF.LOADCHUNK, which is an asymmetry in the module and is copied."
+
+[[command]]
+name = "CF.LOADCHUNK"
+group = "cuckoo"
+since = "1.0.0"
+arity = 4
+plan = "whole-value"
+bounded = "inherent"
+status = "shipped"
+wire = "verified"
+notes = "Position one carries the header and makes the filter with every slot clear, and the key has to be free for it. A header that is not thirty eight bytes and a header that is thirty eight bytes and describes a filter nobody could build have different sentences, because the module checks the size and then tries to allocate. The filter count in the header is eight bytes on the wire and two in the struct, so a count of 100000 loads a chain of 34464 filters and a count of 65536 loads nothing at all."
+
+[[command]]
+name = "CF.INFO"
+group = "cuckoo"
+since = "1.0.0"
+arity = 2
+plan = "metadata"
+bounded = "inherent"
+status = "shipped"
+wire = "verified"
+notes = "Eight numbers, all derived from the chain rather than recorded beside it, and no field argument: asking for one is an arity error where BF.INFO would have answered it. The bucket count is the first filter's however far the chain has grown, so a client working out how much room is left from it will be wrong, and Size is the module's own accounting of its structs and its fingerprints rather than what the filter costs in this process."
+
+[[command]]
+name = "CF.DEBUG"
+group = "cuckoo"
+since = "1.0.0"
+arity = 2
+plan = "metadata"
+bounded = "inherent"
+status = "shipped"
+wire = "verified"
+notes = "Undocumented and in the ACL category all the same, so a client listing the group finds fourteen commands and not thirteen. One line of the numbers CF.INFO reports and the two it does not, which are how many filters the chain really has and how wide the newest one is."
+
+[[command]]
+name = "CF.COMPACT"
+group = "cuckoo"
+since = "1.0.0"
+arity = -1
+plan = "whole-value"
+bounded = "inherent"
+status = "shipped"
+wire = "verified"
+notes = "Pulls the fingerprints in the newer filters down into the older ones and drops the filters that empty, which is possible at all because every filter's bucket count is a power of two and an item's bucket in a smaller filter is its bucket in a bigger one taken modulo the smaller count. The module has it down as a readonly command in the @read category even though it writes, and the arity says one argument where the command wants two, and both are copied so that COMMAND INFO answers the same on either server."
 
 
 # ---------------------------------------------------------------------- array
