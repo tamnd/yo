@@ -1292,24 +1292,24 @@ pub fn resolved(
         match spec.group {
             "string" => {
                 let db = session.db;
-                strings::execute(&mut server.dbs[db], spec, args, out).map(|()| Flow::Continue)
+                strings::execute(&server.dbs[db], spec, args, out).map(|()| Flow::Continue)
             }
             // Its own group and its own file, and the same values underneath:
             // a bitmap is a string, so `STRLEN` on one answers and `SETBIT` on
             // something a `SET` left behind works.
             "bitmap" => {
                 let db = session.db;
-                bits::execute(&mut server.dbs[db], spec, args, out).map(|()| Flow::Continue)
+                bits::execute(&server.dbs[db], spec, args, out).map(|()| Flow::Continue)
             }
             // The same again: a sketch is a string with a documented layout, so
             // `GET` hands one to a client and `SET` takes it back.
             "hyperloglog" => {
                 let db = session.db;
-                hll::execute(&mut server.dbs[db], spec, args, out).map(|()| Flow::Continue)
+                hll::execute(&server.dbs[db], spec, args, out).map(|()| Flow::Continue)
             }
             "set" => {
                 let db = session.db;
-                sets::execute(&mut server.dbs[db], spec, args, out).map(|()| Flow::Continue)
+                sets::execute(&server.dbs[db], spec, args, out).map(|()| Flow::Continue)
             }
             // The one hash command whose state is not in the keyspace. A
             // fieldset belongs to the connection, so this is handed the session
@@ -1317,35 +1317,35 @@ pub fn resolved(
             // keyspace group for the socket it keeps.
             "hash" if spec.name == "himport" => {
                 let db = session.db;
-                himport::execute(&mut server.dbs[db], &mut session.sets, args, out)
+                himport::execute(&server.dbs[db], &mut session.sets, args, out)
                     .map(|()| Flow::Continue)
             }
             "hash" => {
                 let db = session.db;
-                hashes::execute(&mut server.dbs[db], spec, args, out).map(|()| Flow::Continue)
+                hashes::execute(&server.dbs[db], spec, args, out).map(|()| Flow::Continue)
             }
             "list" => {
                 let db = session.db;
-                lists::execute(&mut server.dbs[db], spec, args, out).map(|()| Flow::Continue)
+                lists::execute(&server.dbs[db], spec, args, out).map(|()| Flow::Continue)
             }
             "zset" => {
                 let db = session.db;
-                zsets::execute(&mut server.dbs[db], spec, args, out).map(|()| Flow::Continue)
+                zsets::execute(&server.dbs[db], spec, args, out).map(|()| Flow::Continue)
             }
             // A geo key is a sorted set and these are sorted set commands with
             // arithmetic on the way in and on the way out, so a client can ZREM
             // a place out of one and ZCARD it to count them.
             "geo" => {
                 let db = session.db;
-                geo::execute(&mut server.dbs[db], spec, args, out).map(|()| Flow::Continue)
+                geo::execute(&server.dbs[db], spec, args, out).map(|()| Flow::Continue)
             }
             "array" => {
                 let db = session.db;
-                arrays::execute(&mut server.dbs[db], spec, args, out).map(|()| Flow::Continue)
+                arrays::execute(&server.dbs[db], spec, args, out).map(|()| Flow::Continue)
             }
             "graph" => {
                 let db = session.db;
-                graph::execute(&mut server.dbs[db], spec, args, out).map(|()| Flow::Continue)
+                graph::execute(&server.dbs[db], spec, args, out).map(|()| Flow::Continue)
             }
             // A document under a key, reached by a path. The group is Redis's
             // module surface and the storage is ours, the same trade the vector
@@ -1356,15 +1356,15 @@ pub fn resolved(
             }
             "vector" => {
                 let db = session.db;
-                vectors::execute(&mut server.dbs[db], spec, args, out).map(|()| Flow::Continue)
+                vectors::execute(&server.dbs[db], spec, args, out).map(|()| Flow::Continue)
             }
             "bloom" => {
                 let db = session.db;
-                bloom::execute(&mut server.dbs[db], spec, args, out).map(|()| Flow::Continue)
+                bloom::execute(&server.dbs[db], spec, args, out).map(|()| Flow::Continue)
             }
             "cuckoo" => {
                 let db = session.db;
-                cuckoo::execute(&mut server.dbs[db], spec, args, out).map(|()| Flow::Continue)
+                cuckoo::execute(&server.dbs[db], spec, args, out).map(|()| Flow::Continue)
             }
             "cms" => {
                 let db = session.db;
@@ -1372,7 +1372,7 @@ pub fn resolved(
             }
             "topk" => {
                 let db = session.db;
-                topk::execute(&mut server.dbs[db], spec, args, out).map(|()| Flow::Continue)
+                topk::execute(&server.dbs[db], spec, args, out).map(|()| Flow::Continue)
             }
             "tdigest" => {
                 let db = session.db;
@@ -1389,7 +1389,7 @@ pub fn resolved(
             "stream" => {
                 let db = session.db;
                 let now = server.now_ms();
-                streams::execute(&mut server.dbs[db], spec, args, now, out).map(|()| Flow::Continue)
+                streams::execute(&server.dbs[db], spec, args, now, out).map(|()| Flow::Continue)
             }
             // The one keyspace command that needs more than the databases,
             // because the socket it talks down is held on the server between

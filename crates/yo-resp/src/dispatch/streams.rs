@@ -131,22 +131,16 @@ const INLINE_FIELDS: usize = 32;
 /// # Errors
 ///
 /// Whatever the keyspace says, plus the argument complaints above.
-pub(super) fn execute(
-    db: &mut Db,
-    spec: &Spec,
-    args: Args<'_>,
-    now: u64,
-    out: &mut Out,
-) -> Result<()> {
+pub(super) fn execute(db: &Db, spec: &Spec, args: Args<'_>, now: u64, out: &mut Out) -> Result<()> {
     match spec.name {
         "xadd" => xadd(db, args, now, out)?,
         "xlen" => {
             let key = args.get(1);
-            out.uint(db.at(key).stream(key)?.map_or(0, Stream::len));
+            out.uint(db.hold(key).stream(key)?.map_or(0, Stream::len));
         }
         "xdel" => {
             let key = args.get(1);
-            out.uint(db.at(key).xdel(key, ids(args, 2)?)?);
+            out.uint(db.hold(key).xdel(key, ids(args, 2)?)?);
         }
         "xdelex" => delex(db, args, out)?,
         "xackdel" => ackdel(db, args, out)?,
@@ -156,7 +150,7 @@ pub(super) fn execute(
         "xrevrange" => range(db, args, true, out)?,
         "xack" => {
             let (key, group) = (args.get(1), args.get(2));
-            out.uint(db.at(key).xack(key, group, ids(args, 3)?)?);
+            out.uint(db.hold(key).xack(key, group, ids(args, 3)?)?);
         }
         "xsetid" => setid(db, args, out)?,
         "xgroup" => group(db, args, now, out)?,
@@ -172,8 +166,8 @@ pub(super) fn execute(
 // ---------------------------------------------------------------- writing
 
 /// `XADD key [NOMKSTREAM] [trim] id field value [field value ...]`.
-fn xadd(db: &mut Db, args: Args<'_>, now: u64, out: &mut Out) -> Result<()> {
-    let stripe = db.at(args.get(1));
+fn xadd(db: &Db, args: Args<'_>, now: u64, out: &mut Out) -> Result<()> {
+    let mut stripe = db.hold(args.get(1));
     let node = stripe.stream_limits().max_node_entries;
     let opts = trimming(args, 2, true, node)?;
     let at = opts.at;
@@ -211,8 +205,8 @@ fn xadd(db: &mut Db, args: Args<'_>, now: u64, out: &mut Out) -> Result<()> {
 }
 
 /// `XTRIM key strategy`.
-fn xtrim(db: &mut Db, args: Args<'_>, out: &mut Out) -> Result<()> {
-    let stripe = db.at(args.get(1));
+fn xtrim(db: &Db, args: Args<'_>, out: &mut Out) -> Result<()> {
+    let mut stripe = db.hold(args.get(1));
     let node = stripe.stream_limits().max_node_entries;
     let opts = trimming(args, 2, false, node)?;
     // A trailing argument the option loop did not recognise, and a command with
@@ -331,7 +325,7 @@ fn trimming(args: Args<'_>, at: usize, xadd: bool, node: usize) -> Result<Trimme
 }
 
 /// `XSETID key id [ENTRIESADDED n] [MAXDELETEDID id]`.
-fn setid(db: &mut Db, args: Args<'_>, out: &mut Out) -> Result<()> {
+fn setid(db: &Db, args: Args<'_>, out: &mut Out) -> Result<()> {
     let last = strict_id(args.get(2))?;
     let mut added = None;
     let mut deleted = None;
@@ -351,7 +345,7 @@ fn setid(db: &mut Db, args: Args<'_>, out: &mut Out) -> Result<()> {
         i += 2;
     }
     let key = args.get(1);
-    db.at(key).xsetid(key, last, added, deleted)?;
+    db.hold(key).xsetid(key, last, added, deleted)?;
     out.ok();
     Ok(())
 }
@@ -362,7 +356,7 @@ fn setid(db: &mut Db, args: Args<'_>, out: &mut Out) -> Result<()> {
 ///
 /// The keyspace takes the low bound first either way, so the two argument orders
 /// are swapped here once rather than in every walk behind it.
-fn range(db: &mut Db, args: Args<'_>, rev: bool, out: &mut Out) -> Result<()> {
+fn range(db: &Db, args: Args<'_>, rev: bool, out: &mut Out) -> Result<()> {
     let (lo, hi) = if rev { (3, 2) } else { (2, 3) };
     let start = bound(args.get(lo), true)?;
     let end = bound(args.get(hi), false)?;
@@ -382,7 +376,7 @@ fn range(db: &mut Db, args: Args<'_>, rev: bool, out: &mut Out) -> Result<()> {
     // why a missing key answers an empty array while a key that is there with a
     // count of zero answers a null array.
     let key = args.get(1);
-    let stripe = db.at(key);
+    let mut stripe = db.hold(key);
     if stripe.stream(key)?.is_none() {
         out.array(0);
         return Ok(());
@@ -405,7 +399,7 @@ fn range(db: &mut Db, args: Args<'_>, rev: bool, out: &mut Out) -> Result<()> {
 /// Two commands under one name. The short one is a summary of the whole pending
 /// list and the long one is the list itself, and they have nothing in common
 /// past the first two arguments.
-fn pending(db: &mut Db, args: Args<'_>, now: u64, out: &mut Out) -> Result<()> {
+fn pending(db: &Db, args: Args<'_>, now: u64, out: &mut Out) -> Result<()> {
     let (key, name) = (args.get(1), args.get(2));
     if args.len() == 3 {
         return summary(db, key, name, out);
@@ -439,7 +433,8 @@ fn pending(db: &mut Db, args: Args<'_>, now: u64, out: &mut Out) -> Result<()> {
     let mut want = want;
     if args.len() == at + 4 {
         let who = args.get(at + 3);
-        let Some(s) = db.at(key).stream(key)? else {
+        let mut stripe = db.hold(key);
+        let Some(s) = stripe.stream(key)? else {
             nogroup(out, &kv::no_key_or_group(key, name));
             return Ok(());
         };
@@ -460,7 +455,7 @@ fn pending(db: &mut Db, args: Args<'_>, now: u64, out: &mut Out) -> Result<()> {
 
     let mark = out.len();
     let seen = db
-        .at(key)
+        .hold(key)
         .xpending_into(key, name, want, now, |id, nack, c| {
             out.array(4);
             id_out(out, id);
@@ -493,8 +488,9 @@ fn pending(db: &mut Db, args: Args<'_>, now: u64, out: &mut Out) -> Result<()> {
 /// consumer counts are bulk strings where every other count in the group is an
 /// integer. Both of those are Redis's and neither is what writing this from the
 /// documentation would produce.
-fn summary(db: &mut Db, key: &[u8], name: &[u8], out: &mut Out) -> Result<()> {
-    let Some(s) = db.at(key).stream(key)? else {
+fn summary(db: &Db, key: &[u8], name: &[u8], out: &mut Out) -> Result<()> {
+    let mut stripe = db.hold(key);
+    let Some(s) = stripe.stream(key)? else {
         nogroup(out, &kv::no_key_or_group(key, name));
         return Ok(());
     };
@@ -541,12 +537,12 @@ fn summary(db: &mut Db, key: &[u8], name: &[u8], out: &mut Out) -> Result<()> {
 /// `XDEL` with a say in what happens to the consumer groups that were handed the
 /// entry, and one integer back per ID instead of a count, because a caller that
 /// asked for `ACKED` needs to know which of its IDs stayed.
-fn delex(db: &mut Db, args: Args<'_>, out: &mut Out) -> Result<()> {
+fn delex(db: &Db, args: Args<'_>, out: &mut Out) -> Result<()> {
     let key = args.get(1);
     // The key is looked up before any of the syntax is read, which is visible
     // from a client: `XDELEX somestring BOGUS IDS 1 1-1` is a wrong type and not
     // a syntax error, and so is the same command with a `numids` of zero.
-    let here = db.at(key).stream(key)?.is_some();
+    let here = db.hold(key).stream(key)?.is_some();
     let (refs, at) = refs_and_ids(args, 2)?;
     let n = args.len() - at;
     // A key that is not there answers before the IDs are read, so
@@ -558,7 +554,7 @@ fn delex(db: &mut Db, args: Args<'_>, out: &mut Out) -> Result<()> {
     }
     let ids = ids_in(args, at, args.len())?;
     out.array(n);
-    db.at(key)
+    db.hold(key)
         .xdelex(key, refs, ids, |fate| out.int(fate.code()))
 }
 
@@ -567,9 +563,9 @@ fn delex(db: &mut Db, args: Args<'_>, out: &mut Out) -> Result<()> {
 /// The same reply, about a different question. Here minus one means the group
 /// was not holding the ID rather than that the stream does not have it, so an
 /// entry that is sitting in the stream unread answers minus one and stays.
-fn ackdel(db: &mut Db, args: Args<'_>, out: &mut Out) -> Result<()> {
+fn ackdel(db: &Db, args: Args<'_>, out: &mut Out) -> Result<()> {
     let (key, name) = (args.get(1), args.get(2));
-    let here = db.at(key).stream(key)?.is_some();
+    let here = db.hold(key).stream(key)?.is_some();
     let (refs, at) = refs_and_ids(args, 3)?;
     let n = args.len() - at;
     if !here {
@@ -578,7 +574,7 @@ fn ackdel(db: &mut Db, args: Args<'_>, out: &mut Out) -> Result<()> {
     }
     let ids = ids_in(args, at, args.len())?;
     out.array(n);
-    db.at(key)
+    db.hold(key)
         .xackdel(key, name, refs, ids, |fate| out.int(fate.code()))
 }
 
@@ -592,12 +588,12 @@ fn ackdel(db: &mut Db, args: Args<'_>, out: &mut Out) -> Result<()> {
 /// The bookmark does not move, so a `>` read will not hand it out again. That is
 /// the whole design: a released entry is offered to a claim and not to the
 /// group's next reader, which is the only way it cannot be delivered twice over.
-fn nack(db: &mut Db, args: Args<'_>, out: &mut Out) -> Result<()> {
+fn nack(db: &Db, args: Args<'_>, out: &mut Out) -> Result<()> {
     let (key, name) = (args.get(1), args.get(2));
     // Before the mode word, which is visible: `XNACK k nosuchgroup BOGUS ...` is
     // told about the group and not about the mode.
     if !db
-        .at(key)
+        .hold(key)
         .stream(key)?
         .is_some_and(|s| s.group(name).is_some())
     {
@@ -650,7 +646,7 @@ fn nack(db: &mut Db, args: Args<'_>, out: &mut Out) -> Result<()> {
     // `RETRYCOUNT` wins over the word, so `FATAL ... RETRYCOUNT 3` leaves the
     // count at three and not at the ceiling `FATAL` on its own would set.
     let done = db
-        .at(key)
+        .hold(key)
         .xnack(key, name, retry.unwrap_or(mode), force, ids)?;
     out.uint(done.expect("the group was there a moment ago"));
     Ok(())
@@ -728,7 +724,7 @@ fn unrecognised(name: &str, opt: &[u8]) -> Error {
 /// option, which is how Redis tells the two apart. It means `XCLAIM k g c 0 -`
 /// complains about an unrecognised option rather than about an ID, and that is
 /// the sentence a real server sends.
-fn claim(db: &mut Db, args: Args<'_>, now: u64, out: &mut Out) -> Result<()> {
+fn claim(db: &Db, args: Args<'_>, now: u64, out: &mut Out) -> Result<()> {
     let (key, name, who) = (args.get(1), args.get(2), args.get(3));
     let min_idle = millis(args.int(4).map_err(|_| bad(BAD_MIN_IDLE))?);
     let mut at = 5;
@@ -788,7 +784,7 @@ fn claim(db: &mut Db, args: Args<'_>, now: u64, out: &mut Out) -> Result<()> {
         let ids: Vec<Id> = (5..5 + count)
             .filter_map(|j| Id::parse(args.get(j), 0))
             .collect();
-        (db.at(key).xclaim(key, &ids, how, now, &mut gone), gone)
+        (db.hold(key).xclaim(key, &ids, how, now, &mut gone), gone)
     });
     gone.clear();
     let Some(took) = took? else {
@@ -807,7 +803,7 @@ fn claim(db: &mut Db, args: Args<'_>, now: u64, out: &mut Out) -> Result<()> {
 /// and what was dropped for no longer being in the stream. The third one is why
 /// a sweep with this converges instead of handing the same dead entry round
 /// forever.
-fn autoclaim(db: &mut Db, args: Args<'_>, now: u64, out: &mut Out) -> Result<()> {
+fn autoclaim(db: &Db, args: Args<'_>, now: u64, out: &mut Out) -> Result<()> {
     let (key, name, who) = (args.get(1), args.get(2), args.get(3));
     let min_idle = millis(args.int(4).map_err(|_| bad(BAD_MIN_IDLE_AUTO))?);
     let start = bound(args.get(5), true)?;
@@ -842,7 +838,7 @@ fn autoclaim(db: &mut Db, args: Args<'_>, now: u64, out: &mut Out) -> Result<()>
     let (claimed, gone) = yo_alloc::allow(|| {
         let mut gone = Vec::new();
         (
-            db.at(key)
+            db.hold(key)
                 .xautoclaim(key, start, how, count, now, &mut gone),
             gone,
         )
@@ -870,7 +866,7 @@ fn autoclaim(db: &mut Db, args: Args<'_>, now: u64, out: &mut Out) -> Result<()>
 /// it per ID rather than as one walk is a probe each into a structure that is
 /// already warm, and it keeps the claim and the reply from having to hold the
 /// stream at the same time.
-fn entries(db: &mut Db, key: &[u8], took: &[Id], justid: bool, out: &mut Out) -> Result<()> {
+fn entries(db: &Db, key: &[u8], took: &[Id], justid: bool, out: &mut Out) -> Result<()> {
     if justid {
         out.array(took.len());
         for &id in took {
@@ -882,7 +878,7 @@ fn entries(db: &mut Db, key: &[u8], took: &[Id], justid: bool, out: &mut Out) ->
     let mut n = 0;
     for &id in took {
         let found = db
-            .at(key)
+            .hold(key)
             .xrange_into(key, id, id, Some(1), false, |id, fields| {
                 entry(out, id, fields);
                 true
@@ -894,8 +890,9 @@ fn entries(db: &mut Db, key: &[u8], took: &[Id], justid: bool, out: &mut Out) ->
 }
 
 /// `XCLAIM LASTID`, which moves the group's bookmark forward and never back.
-fn move_bookmark(db: &mut Db, key: &[u8], name: &[u8], id: Id) -> Result<()> {
-    let Some(s) = db.at(key).stream_mut(key)? else {
+fn move_bookmark(db: &Db, key: &[u8], name: &[u8], id: Id) -> Result<()> {
+    let mut stripe = db.hold(key);
+    let Some(s) = stripe.stream_mut(key)? else {
         return Ok(());
     };
     if let Some(g) = s.group_mut(name)
@@ -916,7 +913,7 @@ fn move_bookmark(db: &mut Db, key: &[u8], name: &[u8], id: Id) -> Result<()> {
 /// the pair, `xgroup|create`, because Redis holds subcommands in its command
 /// table with an arity each. Enough arguments in a shape the handler will not
 /// take is the longer sentence pointing at `XGROUP HELP`.
-fn group(db: &mut Db, args: Args<'_>, now: u64, out: &mut Out) -> Result<()> {
+fn group(db: &Db, args: Args<'_>, now: u64, out: &mut Out) -> Result<()> {
     let sub = args.get(1);
     let n = args.len();
     if args::is(sub, b"create") {
@@ -932,7 +929,7 @@ fn group(db: &mut Db, args: Args<'_>, now: u64, out: &mut Out) -> Result<()> {
         let read = entries_read(args, 5, n)?;
         let at = start_at(args.get(4))?;
         let key = args.get(2);
-        return match db.at(key).xgroup_setid(key, args.get(3), at, read)? {
+        return match db.hold(key).xgroup_setid(key, args.get(3), at, read)? {
             Some(()) => {
                 out.ok();
                 Ok(())
@@ -946,14 +943,14 @@ fn group(db: &mut Db, args: Args<'_>, now: u64, out: &mut Out) -> Result<()> {
     if args::is(sub, b"destroy") {
         arity(n, 4, "destroy")?;
         let key = args.get(2);
-        out.int(i64::from(db.at(key).xgroup_destroy(key, args.get(3))?));
+        out.int(i64::from(db.hold(key).xgroup_destroy(key, args.get(3))?));
         return Ok(());
     }
     if args::is(sub, b"createconsumer") {
         arity(n, 5, "createconsumer")?;
         let key = args.get(2);
         let made = db
-            .at(key)
+            .hold(key)
             .xgroup_create_consumer(key, args.get(3), args.get(4), now)?;
         return match made {
             Some(made) => {
@@ -970,7 +967,7 @@ fn group(db: &mut Db, args: Args<'_>, now: u64, out: &mut Out) -> Result<()> {
         arity(n, 5, "delconsumer")?;
         let key = args.get(2);
         return match db
-            .at(key)
+            .hold(key)
             .xgroup_del_consumer(key, args.get(3), args.get(4))?
         {
             Some(held) => {
@@ -995,7 +992,7 @@ fn group(db: &mut Db, args: Args<'_>, now: u64, out: &mut Out) -> Result<()> {
 ///
 /// The two options come in either order, so this is a loop and not a pair of
 /// positions.
-fn create(db: &mut Db, args: Args<'_>, out: &mut Out) -> Result<()> {
+fn create(db: &Db, args: Args<'_>, out: &mut Out) -> Result<()> {
     let mut mkstream = false;
     let mut read = None;
     let mut i = 5;
@@ -1014,7 +1011,7 @@ fn create(db: &mut Db, args: Args<'_>, out: &mut Out) -> Result<()> {
     let at = start_at(args.get(4))?;
     let key = args.get(2);
     if db
-        .at(key)
+        .hold(key)
         .xgroup_create(key, args.get(3), at, mkstream, read)?
     {
         out.ok();
@@ -1057,7 +1054,7 @@ fn start_at(arg: &[u8]) -> Result<Start> {
 // -------------------------------------------------------------------- info
 
 /// `XINFO STREAM|GROUPS|CONSUMERS|HELP`.
-fn info(db: &mut Db, args: Args<'_>, now: u64, out: &mut Out) -> Result<()> {
+fn info(db: &Db, args: Args<'_>, now: u64, out: &mut Out) -> Result<()> {
     let sub = args.get(1);
     let n = args.len();
     if args::is(sub, b"stream") {
@@ -1083,7 +1080,8 @@ fn info(db: &mut Db, args: Args<'_>, now: u64, out: &mut Out) -> Result<()> {
             }
         }
         let key = args.get(2);
-        let Some(s) = db.at(key).stream(key)? else {
+        let mut stripe = db.hold(key);
+        let Some(s) = stripe.stream(key)? else {
             return Err(Error::new(Code::NotFound, kv::NO_SUCH_KEY));
         };
         if full {
@@ -1096,7 +1094,8 @@ fn info(db: &mut Db, args: Args<'_>, now: u64, out: &mut Out) -> Result<()> {
     if args::is(sub, b"groups") {
         arity(n, 3, "groups")?;
         let key = args.get(2);
-        let Some(s) = db.at(key).stream(key)? else {
+        let mut stripe = db.hold(key);
+        let Some(s) = stripe.stream(key)? else {
             return Err(Error::new(Code::NotFound, kv::NO_SUCH_KEY));
         };
         groups_info(s, out);
@@ -1105,7 +1104,8 @@ fn info(db: &mut Db, args: Args<'_>, now: u64, out: &mut Out) -> Result<()> {
     if args::is(sub, b"consumers") {
         arity(n, 4, "consumers")?;
         let (key, name) = (args.get(2), args.get(3));
-        let Some(s) = db.at(key).stream(key)? else {
+        let mut stripe = db.hold(key);
+        let Some(s) = stripe.stream(key)? else {
             return Err(Error::new(Code::NotFound, kv::NO_SUCH_KEY));
         };
         let Some(g) = s.group(name) else {
@@ -1426,7 +1426,7 @@ pub(super) struct Parsed {
 ///
 /// The option and ID complaints, and a key holding something that is not a
 /// stream, which `$` finds because it has to look.
-pub(super) fn parse_read(name: &str, args: Args<'_>, db: &mut Db, now: u64) -> Result<Parsed> {
+pub(super) fn parse_read(name: &str, args: Args<'_>, db: &Db, now: u64) -> Result<Parsed> {
     let grouped = name == "xreadgroup";
     let mut count = None;
     let mut wait = None;
@@ -1498,13 +1498,14 @@ pub(super) fn parse_read(name: &str, args: Args<'_>, db: &mut Db, now: u64) -> R
             }
         } else {
             At::After(match arg {
-                b"$" => db.at(key).stream(key)?.map_or(Id::MIN, Stream::last_id),
+                b"$" => db.hold(key).stream(key)?.map_or(Id::MIN, Stream::last_id),
                 // The last entry rather than the next one, so `+` answers with
                 // what is already there and then behaves like `$`. On a stream
                 // with nothing in it there is no last entry to step back from,
                 // and Redis falls back to the last ID it handed out.
                 b"+" => {
-                    let s = db.at(key).stream(key)?;
+                    let mut stripe = db.hold(key);
+                    let s = stripe.stream(key)?;
                     let last = s.as_ref().map_or(Id::MIN, |s| s.last_id());
                     s.and_then(Stream::top_id)
                         .and_then(Id::prev)
@@ -1551,7 +1552,7 @@ pub(super) fn parse_read(name: &str, args: Args<'_>, db: &mut Db, now: u64) -> R
 ///
 /// A key holding something that is not a stream, under `strict`.
 pub(super) fn read(
-    db: &mut Db,
+    db: &Db,
     keys: &[Vec<u8>],
     r: &Reads,
     now: u64,
@@ -1560,7 +1561,7 @@ pub(super) fn read(
 ) -> Result<bool> {
     if let Some((name, _)) = &r.group {
         for key in keys {
-            let missing = match db.at(key).stream(key) {
+            let missing = match db.hold(key).stream(key) {
                 Ok(Some(s)) => s.group(name).is_none(),
                 Ok(None) => true,
                 Err(e) if strict => return Err(e),
@@ -1629,7 +1630,7 @@ pub(super) fn read(
 /// nothing be dropped from the reply after the walk rather than counted before
 /// it.
 fn one_stream(
-    db: &mut Db,
+    db: &Db,
     key: &[u8],
     at: &At,
     r: &Reads,
@@ -1638,10 +1639,12 @@ fn one_stream(
 ) -> Result<Option<usize>> {
     match at {
         At::After(after) => {
-            let n = db.at(key).xread_into(key, *after, r.count, |id, fields| {
-                entry(out, id, fields);
-                true
-            })?;
+            let n = db
+                .hold(key)
+                .xread_into(key, *after, r.count, |id, fields| {
+                    entry(out, id, fields);
+                    true
+                })?;
             Ok((n > 0).then_some(n))
         }
         At::Meaningless(_) => unreachable!("read refuses these before it walks"),
@@ -1658,7 +1661,7 @@ fn one_stream(
                 count: r.count,
                 noack: r.noack,
             };
-            let n = db.at(key).xreadgroup_into(key, want, now, |id, fields| {
+            let n = db.hold(key).xreadgroup_into(key, want, now, |id, fields| {
                 match fields {
                     Some(fields) => entry(out, id, fields),
                     // A history read can name an entry that has since been

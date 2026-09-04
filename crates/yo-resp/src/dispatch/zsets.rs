@@ -96,7 +96,7 @@ pub(super) const BAD_MPOP_COUNT: &str = "count should be greater than 0";
 ///
 /// A key holding something that is not a sorted set, an option where one was
 /// not expected, and the three number errors above.
-pub(super) fn execute(db: &mut Db, spec: &Spec, args: Args<'_>, out: &mut Out) -> Result<()> {
+pub(super) fn execute(db: &Db, spec: &Spec, args: Args<'_>, out: &mut Out) -> Result<()> {
     match spec.name {
         "zadd" => zadd(db, args, out)?,
         "zincrby" => {
@@ -105,18 +105,18 @@ pub(super) fn execute(db: &mut Db, spec: &Spec, args: Args<'_>, out: &mut Out) -
             // Never nil, because `ZINCRBY` has no gate to refuse it, so the
             // `None` this cannot produce would be a bug rather than an answer.
             let now = db
-                .at(key)
+                .hold(key)
                 .zincrby(key, args.get(3), by, ZAdd::default())?
                 .expect("ZINCRBY has no gate that can refuse a member");
             out.double(now);
         }
         "zcard" => {
             let key = args.get(1);
-            out.int(count(db.at(key).zcard(key)?));
+            out.int(count(db.hold(key).zcard(key)?));
         }
         "zscore" => {
             let key = args.get(1);
-            match db.at(key).zscore(key, args.get(2))? {
+            match db.hold(key).zscore(key, args.get(2))? {
                 Some(s) => out.double(s),
                 None => out.nil(),
             }
@@ -129,7 +129,7 @@ pub(super) fn execute(db: &mut Db, spec: &Spec, args: Args<'_>, out: &mut Out) -
             // allocation per call on a thread that must not allocate. The stripe
             // is found once here for the same reason.
             let key = args.get(1);
-            let stripe = db.at(key);
+            let mut stripe = db.hold(key);
             for i in 2..args.len() {
                 match stripe.zscore(key, args.get(i))? {
                     Some(s) => out.double(s),
@@ -139,18 +139,18 @@ pub(super) fn execute(db: &mut Db, spec: &Spec, args: Args<'_>, out: &mut Out) -
         }
         "zrem" => {
             let key = args.get(1);
-            out.int(count(db.at(key).zrem(key, members(args))?));
+            out.int(count(db.hold(key).zrem(key, members(args))?));
         }
         "zrank" | "zrevrank" => rank(db, spec.name == "zrevrank", args, out)?,
         "zcount" => {
             let q = Query::score(bound(args.get(2))?, bound(args.get(3))?);
             let key = args.get(1);
-            out.int(count(db.at(key).zcount(key, &q)?));
+            out.int(count(db.hold(key).zcount(key, &q)?));
         }
         "zlexcount" => {
             let q = Query::lex(lex(args.get(2))?, lex(args.get(3))?);
             let key = args.get(1);
-            out.int(count(db.at(key).zcount(key, &q)?));
+            out.int(count(db.hold(key).zcount(key, &q)?));
         }
         // The six that answer members, which are one parse and one walk.
         "zrange" | "zrevrange" | "zrangebyscore" | "zrevrangebyscore" | "zrangebylex"
@@ -158,7 +158,7 @@ pub(super) fn execute(db: &mut Db, spec: &Spec, args: Args<'_>, out: &mut Out) -
             let form = Form::of(spec.name);
             let (q, withscores) = parse_range(form, args, 1)?;
             let key = args.get(1);
-            let stripe = db.at(key);
+            let mut stripe = db.hold(key);
             let w = stripe.zwindow(key, &q)?;
             // The header before the members, because a window knows its own
             // length before anything is walked, which is the whole reason
@@ -190,17 +190,17 @@ pub(super) fn execute(db: &mut Db, spec: &Spec, args: Args<'_>, out: &mut Out) -
         "zremrangebyrank" => {
             let q = Query::rank(args.int(2)?, args.int(3)?);
             let key = args.get(1);
-            out.int(count(db.at(key).zremrange(key, &q)?));
+            out.int(count(db.hold(key).zremrange(key, &q)?));
         }
         "zremrangebyscore" => {
             let q = Query::score(bound(args.get(2))?, bound(args.get(3))?);
             let key = args.get(1);
-            out.int(count(db.at(key).zremrange(key, &q)?));
+            out.int(count(db.hold(key).zremrange(key, &q)?));
         }
         "zremrangebylex" => {
             let q = Query::lex(lex(args.get(2))?, lex(args.get(3))?);
             let key = args.get(1);
-            out.int(count(db.at(key).zremrange(key, &q)?));
+            out.int(count(db.hold(key).zremrange(key, &q)?));
         }
         // The algebra. The three that answer members write them before their
         // own header, the same way SINTER does: the count is what the walk
@@ -257,7 +257,7 @@ pub(super) fn execute(db: &mut Db, spec: &Spec, args: Args<'_>, out: &mut Out) -
 /// The scores are parsed before anything is written, all of them, so
 /// `ZADD key 1 a nonsense b` adds nothing at all. Redis does the same and it is
 /// the only behaviour that makes the command safe to retry.
-fn zadd(db: &mut Db, args: Args<'_>, out: &mut Out) -> Result<()> {
+fn zadd(db: &Db, args: Args<'_>, out: &mut Out) -> Result<()> {
     let (mut nx, mut xx, mut gt, mut lt, mut incr) = (false, false, false, false, false);
     let mut opts = ZAdd::default();
     let mut at = 2;
@@ -319,7 +319,7 @@ fn zadd(db: &mut Db, args: Args<'_>, out: &mut Out) -> Result<()> {
     let key = args.get(1);
     if incr {
         return match db
-            .at(key)
+            .hold(key)
             .zincrby(key, args.get(at + 1), score(args.get(at))?, opts)?
         {
             Some(now) => {
@@ -337,7 +337,7 @@ fn zadd(db: &mut Db, args: Args<'_>, out: &mut Out) -> Result<()> {
     let pairs = (at..args.len())
         .step_by(2)
         .map(|i| (score(args.get(i)).unwrap_or(0.0), args.get(i + 1)));
-    out.int(count(db.at(key).zadd(key, pairs, opts)?));
+    out.int(count(db.hold(key).zadd(key, pairs, opts)?));
     Ok(())
 }
 
@@ -348,7 +348,7 @@ fn zadd(db: &mut Db, args: Args<'_>, out: &mut Out) -> Result<()> {
 /// becomes the array nil rather than the string one. A RESP2 client tells those
 /// two apart, so sending the wrong one is a client that hangs on a reply it
 /// cannot parse.
-fn rank(db: &mut Db, rev: bool, args: Args<'_>, out: &mut Out) -> Result<()> {
+fn rank(db: &Db, rev: bool, args: Args<'_>, out: &mut Out) -> Result<()> {
     // An argument too many is the arity error and not the syntax one, which is
     // Redis's split and looks backwards until you see that the option is
     // optional: `ZRANK k m junk` is a bad option, `ZRANK k m WITHSCORE junk` is
@@ -360,7 +360,7 @@ fn rank(db: &mut Db, rev: bool, args: Args<'_>, out: &mut Out) -> Result<()> {
         _ => return Err(args::wrong_arity(if rev { "zrevrank" } else { "zrank" })),
     };
     let key = args.get(1);
-    match db.at(key).zrank(key, args.get(2), rev)? {
+    match db.hold(key).zrank(key, args.get(2), rev)? {
         Some((at, s)) => {
             if withscore {
                 out.array(2);
@@ -671,7 +671,7 @@ impl Algebra {
 /// store uses for it too, so it goes straight through. A limit that is negative
 /// and a limit that is not a number at all get the same sentence, which looks
 /// like a mistake in Redis and is copied because a client may be matching on it.
-fn intercard(db: &mut Db, args: Args<'_>) -> Result<usize> {
+fn intercard(db: &Db, args: Args<'_>) -> Result<usize> {
     // Its own parse rather than [`Algebra`], because LIMIT is the one option
     // that command takes and none of the three that command takes.
     let numkeys = args.int(1)?;
@@ -708,11 +708,11 @@ fn intercard(db: &mut Db, args: Args<'_>) -> Result<usize> {
 /// A negative count draws with replacement and answers exactly as many as it
 /// was asked for, a positive one draws without and answers at most as many as
 /// there are, and zero answers an empty array either way.
-fn randmember(db: &mut Db, args: Args<'_>, out: &mut Out) -> Result<()> {
+fn randmember(db: &Db, args: Args<'_>, out: &mut Out) -> Result<()> {
     let key = args.get(1);
     if args.len() == 2 {
         let mut wrote = false;
-        db.at(key).zrandmember(key, 1, |m, _| {
+        db.hold(key).zrandmember(key, 1, |m, _| {
             write_member(out, m);
             wrote = true;
         })?;
@@ -730,7 +730,7 @@ fn randmember(db: &mut Db, args: Args<'_>, out: &mut Out) -> Result<()> {
     let nested = withscores && out.proto().is_resp3();
     let start = out.len();
     let mut n = 0;
-    db.at(key).zrandmember(key, want, |m, sc| {
+    db.hold(key).zrandmember(key, want, |m, sc| {
         if nested {
             out.array(2);
         }
@@ -750,7 +750,7 @@ fn randmember(db: &mut Db, args: Args<'_>, out: &mut Out) -> Result<()> {
 /// pairs of bulk strings whatever the protocol, which is Redis's shape and is
 /// the same one `HSCAN` has, so this writes the digits rather than calling
 /// [`Out::double`].
-fn zscan(db: &mut Db, args: Args<'_>, out: &mut Out) -> Result<()> {
+fn zscan(db: &Db, args: Args<'_>, out: &mut Out) -> Result<()> {
     let cursor = scan::parse_cursor(args.get(2))?;
     let mut pattern = None;
     let mut count = scan::COUNT;
@@ -779,7 +779,7 @@ fn zscan(db: &mut Db, args: Args<'_>, out: &mut Out) -> Result<()> {
     let key = args.get(1);
     scan::reply(out, |out| {
         let mut n = 0;
-        let next = db.at(key).zscan(key, cursor, count, |m, sc| {
+        let next = db.hold(key).zscan(key, cursor, count, |m, sc| {
             if !matches(pattern, m) {
                 return;
             }
@@ -803,7 +803,7 @@ fn zscan(db: &mut Db, args: Args<'_>, out: &mut Out) -> Result<()> {
 /// A count that is not a whole number at least zero is the range error and not
 /// the usual complaint about integers, so `ZPOPMIN key x` and `ZPOPMIN key -1`
 /// give the same answer.
-fn pop(db: &mut Db, end: ZEnd, args: Args<'_>, out: &mut Out) -> Result<()> {
+fn pop(db: &Db, end: ZEnd, args: Args<'_>, out: &mut Out) -> Result<()> {
     let want = match args.len() {
         2 => None,
         3 => match args.int(2) {
@@ -816,7 +816,7 @@ fn pop(db: &mut Db, end: ZEnd, args: Args<'_>, out: &mut Out) -> Result<()> {
     let start = out.len();
     let mut n = 0;
     let key = args.get(1);
-    db.at(key).zpop(key, end, want.unwrap_or(1), |m, sc| {
+    db.hold(key).zpop(key, end, want.unwrap_or(1), |m, sc| {
         if nested {
             out.array(2);
         }
@@ -840,7 +840,7 @@ fn pop(db: &mut Db, end: ZEnd, args: Args<'_>, out: &mut Out) -> Result<()> {
 /// The pairs are nested on both protocols here, unlike [`pop`], because the
 /// reply already has a key name in front of them and there is nothing left to
 /// flatten into.
-fn mpop(db: &mut Db, args: Args<'_>, out: &mut Out) -> Result<()> {
+fn mpop(db: &Db, args: Args<'_>, out: &mut Out) -> Result<()> {
     let (end, from, to, want) = parse_mpop(args, 1)?;
     for i in from..to {
         let key = args.get(i);
@@ -850,7 +850,7 @@ fn mpop(db: &mut Db, args: Args<'_>, out: &mut Out) -> Result<()> {
         // as it would be if it were the only key named.
         // Each key on its own stripe, found once and used for both calls, since
         // the pop that follows is against the same key as the count.
-        let stripe = db.at(key);
+        let mut stripe = db.hold(key);
         if stripe.zcard(key)? == 0 {
             continue;
         }

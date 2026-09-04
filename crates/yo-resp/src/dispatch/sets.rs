@@ -44,7 +44,7 @@ const TOO_MANY_KEYS: &str = "Number of keys can't be greater than number of args
 const BAD_LIMIT: &str = "LIMIT can't be negative";
 
 /// Run one set command.
-pub(super) fn execute(db: &mut Db, spec: &Spec, args: Args<'_>, out: &mut Out) -> Result<()> {
+pub(super) fn execute(db: &Db, spec: &Spec, args: Args<'_>, out: &mut Out) -> Result<()> {
     // Every single key command finds the stripe its key is on and hands that
     // one keyspace the work, so the key is read out of the arguments once and
     // used twice. The commands that name several keys reach the database
@@ -52,10 +52,10 @@ pub(super) fn execute(db: &mut Db, spec: &Spec, args: Args<'_>, out: &mut Out) -
     // count rather than a key.
     let key = args.get(1);
     match spec.name {
-        "sadd" => out.int(count(db.at(key).sadd(key, members(args))?)),
-        "srem" => out.int(count(db.at(key).srem(key, members(args))?)),
-        "scard" => out.int(count(db.at(key).scard(key)?)),
-        "sismember" => out.int(i64::from(db.at(key).sismember(key, args.get(2))?)),
+        "sadd" => out.int(count(db.hold(key).sadd(key, members(args))?)),
+        "srem" => out.int(count(db.hold(key).srem(key, members(args))?)),
+        "scard" => out.int(count(db.hold(key).scard(key)?)),
+        "sismember" => out.int(i64::from(db.hold(key).sismember(key, args.get(2))?)),
         // The two that want the body more than once go through `with_set`, not
         // through `Keyspace::smismember` and `Keyspace::smembers`. Those two
         // answer a `Vec` and an iterator, which is the right shape for an
@@ -66,13 +66,13 @@ pub(super) fn execute(db: &mut Db, spec: &Spec, args: Args<'_>, out: &mut Out) -
         // The header goes out inside the callback and not in front of the call,
         // because `with_set` is where WRONGTYPE is decided and a body checks its
         // arguments before it writes anything.
-        "smismember" => db.at(key).with_set(key, |set| {
+        "smismember" => db.hold(key).with_set(key, |set| {
             out.array(args.len() - 2);
             for m in members(args) {
                 out.int(i64::from(set.is_some_and(|s| s.contains(m))));
             }
         })?,
-        "smembers" => db.at(key).with_set(key, |set| match set {
+        "smembers" => db.hold(key).with_set(key, |set| match set {
             Some(s) => {
                 out.set(s.len());
                 for m in s.iter() {
@@ -103,7 +103,7 @@ pub(super) fn execute(db: &mut Db, spec: &Spec, args: Args<'_>, out: &mut Out) -
                 // is written after the fact from the count that came back.
                 let start = out.len();
                 let mut got = false;
-                db.at(key).spop_into(key, 1, |m| {
+                db.hold(key).spop_into(key, 1, |m| {
                     write_member(out, m);
                     got = true;
                 })?;
@@ -116,7 +116,7 @@ pub(super) fn execute(db: &mut Db, spec: &Spec, args: Args<'_>, out: &mut Out) -
                 let want = pop_count(args.get(2))?;
                 let start = out.len();
                 let mut n = 0;
-                db.at(key).spop_into(key, want, |m| {
+                db.hold(key).spop_into(key, want, |m| {
                     write_member(out, m);
                     n += 1;
                 })?;
@@ -125,7 +125,7 @@ pub(super) fn execute(db: &mut Db, spec: &Spec, args: Args<'_>, out: &mut Out) -
             _ => return Err(args::syntax()),
         },
         "srandmember" => match args.len() {
-            2 => db.at(key).srandmember(key, |m| match m {
+            2 => db.hold(key).srandmember(key, |m| match m {
                 Some(m) => write_member(out, m),
                 None => out.nil(),
             })?,
@@ -133,7 +133,7 @@ pub(super) fn execute(db: &mut Db, spec: &Spec, args: Args<'_>, out: &mut Out) -
                 let count = args.int(2)?;
                 let start = out.len();
                 let mut n = 0;
-                db.at(key).srandmember_n(key, count, |m| {
+                db.hold(key).srandmember_n(key, count, |m| {
                     write_member(out, m);
                     n += 1;
                 })?;
@@ -191,7 +191,7 @@ pub(super) fn execute(db: &mut Db, spec: &Spec, args: Args<'_>, out: &mut Out) -
 /// The cursor goes out as a bulk string of unsigned digits rather than through
 /// the integer path, because ours packs a partition count into the top bits and
 /// a large enough collection would make it wider than an `i64`.
-fn scan(db: &mut Db, args: Args<'_>, out: &mut Out) -> Result<()> {
+fn scan(db: &Db, args: Args<'_>, out: &mut Out) -> Result<()> {
     let cursor = scan::parse_cursor(args.get(2))?;
     let mut pattern = None;
     let mut count = scan::COUNT;
@@ -220,7 +220,7 @@ fn scan(db: &mut Db, args: Args<'_>, out: &mut Out) -> Result<()> {
     scan::reply(out, |out| {
         let mut n = 0;
         let key = args.get(1);
-        let next = db.at(key).sscan(key, cursor, count, |m| {
+        let next = db.hold(key).sscan(key, cursor, count, |m| {
             if matches(pattern, m) {
                 write_member(out, m);
                 n += 1;

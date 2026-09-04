@@ -85,8 +85,9 @@ const SETEX_ONE_COND: &str = "Only one of FXX or FNX arguments can be specified"
 /// is found once here and everything below goes on taking a keyspace. A hash
 /// lives on one stripe whatever is done to it, since nothing here reads a
 /// second key.
-pub(super) fn execute(db: &mut Db, spec: &Spec, args: Args<'_>, out: &mut Out) -> Result<()> {
-    let db = db.at(args.get(1));
+pub(super) fn execute(db: &Db, spec: &Spec, args: Args<'_>, out: &mut Out) -> Result<()> {
+    let mut held = db.hold(args.get(1));
+    let db = &mut *held;
     match spec.name {
         // HSET and HMSET are the same write and differ only in the reply, which
         // is why HMSET has been deprecated since 4.0 and still has to work.

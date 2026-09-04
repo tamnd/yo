@@ -50,7 +50,7 @@ const LEN_AND_IDX: &str = "If you want both the length and indexes, please just 
 /// to a switch on the length and then a compare; the table grows to about two
 /// hundred and fifty commands by M8 and this becomes a jump through an index
 /// stored in the [`Spec`], which does not change any of the bodies.
-pub(super) fn execute(db: &mut Db, spec: &Spec, args: Args<'_>, out: &mut Out) -> Result<()> {
+pub(super) fn execute(db: &Db, spec: &Spec, args: Args<'_>, out: &mut Out) -> Result<()> {
     // The five that name more than one key, taken before a stripe is chosen
     // because there is no one stripe to choose. Everything below this names
     // exactly one key and the table says it is at argument one.
@@ -62,7 +62,8 @@ pub(super) fn execute(db: &mut Db, spec: &Spec, args: Args<'_>, out: &mut Out) -
         "lcs" => return lcs(db, args, out),
         _ => {}
     }
-    let db = db.at(args.get(1));
+    let mut held = db.hold(args.get(1));
+    let db = &mut *held;
     match spec.name {
         "get" => match db.get(args.get(1))? {
             Some(v) => write_str(out, v),
@@ -440,7 +441,7 @@ fn getex(db: &mut Keyspace, args: Args<'_>, out: &mut Out) -> Result<()> {
 
 /// `MSETEX numkeys key value [key value ...] [NX|XX]
 /// [EX s|PX ms|EXAT ts|PXAT ts|KEEPTTL]`.
-fn msetex(db: &mut Db, args: Args<'_>, out: &mut Out) -> Result<()> {
+fn msetex(db: &Db, args: Args<'_>, out: &mut Out) -> Result<()> {
     let n = parse_i64(args.get(1))
         .filter(|&n| n > 0)
         .and_then(|n| usize::try_from(n).ok())
@@ -493,8 +494,8 @@ fn msetex(db: &mut Db, args: Args<'_>, out: &mut Out) -> Result<()> {
     }
     let allowed = match exists {
         Exists::Always => true,
-        Exists::IfMissing => pairs(args, 2, n).all(|(k, _)| !db.at(k).exists(k)),
-        Exists::IfPresent => pairs(args, 2, n).all(|(k, _)| db.at(k).exists(k)),
+        Exists::IfMissing => pairs(args, 2, n).all(|(k, _)| !db.hold(k).exists(k)),
+        Exists::IfPresent => pairs(args, 2, n).all(|(k, _)| db.hold(k).exists(k)),
     };
     if !allowed {
         out.int(0);
@@ -505,7 +506,7 @@ fn msetex(db: &mut Db, args: Args<'_>, out: &mut Out) -> Result<()> {
     // of all of them. `Expire::Keep` still has to go through, since what it
     // keeps is that key's own deadline and only its stripe knows it.
     for (k, v) in pairs(args, 2, n) {
-        db.at(k)
+        db.hold(k)
             .msetex(core::iter::once((k, v)), Exists::Always, expire)?;
     }
     out.int(1);
@@ -523,13 +524,13 @@ fn msetex(db: &mut Db, args: Args<'_>, out: &mut Out) -> Result<()> {
 /// before the second found the bad pair. So the check is a pass of its own out
 /// here and the write is one pair at a time through the stripe that pair
 /// belongs on.
-fn mset(db: &mut Db, args: Args<'_>, out: &mut Out) -> Result<()> {
+fn mset(db: &Db, args: Args<'_>, out: &mut Out) -> Result<()> {
     let n = pair_count(args, "mset")?;
     for (k, v) in pairs(args, 1, n) {
         check_len(k, v.len())?;
     }
     for (k, v) in pairs(args, 1, n) {
-        db.at(k).mset(core::iter::once((k, v)))?;
+        db.hold(k).mset(core::iter::once((k, v)))?;
     }
     out.ok();
     Ok(())
@@ -541,17 +542,17 @@ fn mset(db: &mut Db, args: Args<'_>, out: &mut Out) -> Result<()> {
 /// lengths, then whether any of the keys is already there, then the writes. The
 /// middle pass is what makes a key named twice inside one call not defeat
 /// itself, since nothing has been written when it runs.
-fn msetnx(db: &mut Db, args: Args<'_>, out: &mut Out) -> Result<()> {
+fn msetnx(db: &Db, args: Args<'_>, out: &mut Out) -> Result<()> {
     let n = pair_count(args, "msetnx")?;
     for (k, v) in pairs(args, 1, n) {
         check_len(k, v.len())?;
     }
-    if pairs(args, 1, n).any(|(k, _)| db.at(k).exists(k)) {
+    if pairs(args, 1, n).any(|(k, _)| db.hold(k).exists(k)) {
         out.int(0);
         return Ok(());
     }
     for (k, v) in pairs(args, 1, n) {
-        db.at(k).mset(core::iter::once((k, v)))?;
+        db.hold(k).mset(core::iter::once((k, v)))?;
     }
     out.int(1);
     Ok(())
@@ -563,11 +564,11 @@ fn msetnx(db: &mut Db, args: Args<'_>, out: &mut Out) -> Result<()> {
 /// into a `Vec` for a caller that wants them all at once. The wire wants them
 /// one at a time and in order, and a `Vec` here would be an allocation per call
 /// on a thread that must not.
-fn mget(db: &mut Db, args: Args<'_>, out: &mut Out) -> Result<()> {
+fn mget(db: &Db, args: Args<'_>, out: &mut Out) -> Result<()> {
     out.array(args.len() - 1);
     for i in 1..args.len() {
         let key = args.get(i);
-        match db.at(key).mget_one(key) {
+        match db.hold(key).mget_one(key) {
             Some(v) => write_str(out, v),
             None => out.nil(),
         }
@@ -735,7 +736,7 @@ fn write_num(out: &mut Out, n: Num) {
 ///
 /// `MINMATCHLEN` and `WITHMATCHLEN` without `IDX` are accepted and ignored,
 /// which is what a real server does.
-fn lcs(db: &mut Db, args: Args<'_>, out: &mut Out) -> Result<()> {
+fn lcs(db: &Db, args: Args<'_>, out: &mut Out) -> Result<()> {
     let (a, b) = (args.get(1), args.get(2));
     let (mut want_len, mut want_idx, mut with_len) = (false, false, false);
     let mut minmatchlen = 0u32;
@@ -768,7 +769,10 @@ fn lcs(db: &mut Db, args: Args<'_>, out: &mut Out) -> Result<()> {
     // [`Keyspace::lcs`] does inside itself anyway: it builds a table the size of
     // the product of the two lengths, so a pair of copies is not what makes it
     // expensive.
-    let (x, y) = (db.at(a).string_copy(a)?, db.at(b).string_copy(b)?);
+    // One at a time and not as a pair, because a tuple keeps everything in it
+    // alive until the whole tuple is built, and the two stripes can be one.
+    let x = db.hold(a).string_copy(a)?;
+    let y = db.hold(b).string_copy(b)?;
 
     if want_idx {
         let idx = yo_kv::lcs::idx(&x, &y, minmatchlen)?;

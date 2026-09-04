@@ -29,12 +29,12 @@ use yo_kv::hll;
 const UNKNOWN_SUB: &str = "Unknown PFDEBUG subcommand";
 
 /// Run one HyperLogLog command.
-pub(super) fn execute(db: &mut Db, spec: &Spec, args: Args<'_>, out: &mut Out) -> Result<()> {
+pub(super) fn execute(db: &Db, spec: &Spec, args: Args<'_>, out: &mut Out) -> Result<()> {
     match spec.name {
         "pfadd" => {
             let eles = (2..args.len()).map(|i| args.get(i));
             let key = args.get(1);
-            out.int(i64::from(db.at(key).pfadd(key, eles)?));
+            out.int(i64::from(db.hold(key).pfadd(key, eles)?));
         }
         "pfcount" => {
             let keys = (1..args.len()).map(|i| args.get(i));
@@ -57,24 +57,24 @@ pub(super) fn execute(db: &mut Db, spec: &Spec, args: Args<'_>, out: &mut Out) -
 }
 
 /// `PFDEBUG subcommand key`, which is four subcommands and no more.
-fn debug(db: &mut Db, args: Args<'_>, out: &mut Out) -> Result<()> {
+fn debug(db: &Db, args: Args<'_>, out: &mut Out) -> Result<()> {
     let (sub, key) = (args.get(1), args.get(2));
     if is(sub, b"getreg") {
         // Sixteen kibibytes of registers, filled before a byte of the reply is
         // written, since the fill can still fail on a sketch that is corrupt.
         let mut regs = [0u8; hll::REGISTERS];
-        db.at(key).pfgetreg(key, &mut regs)?;
+        db.hold(key).pfgetreg(key, &mut regs)?;
         out.array(regs.len());
         for &val in &regs {
             out.int(i64::from(val));
         }
     } else if is(sub, b"decode") {
-        db.at(key).pfdecode(key, |text| out.bulk(text))?;
+        db.hold(key).pfdecode(key, |text| out.bulk(text))?;
     } else if is(sub, b"encoding") {
-        let enc = db.at(key).pfencoding(key)?;
+        let enc = db.hold(key).pfencoding(key)?;
         out.simple(enc.name().as_bytes());
     } else if is(sub, b"todense") {
-        out.int(i64::from(db.at(key).pftodense(key)?));
+        out.int(i64::from(db.hold(key).pftodense(key)?));
     } else {
         return Err(unknown(sub));
     }
