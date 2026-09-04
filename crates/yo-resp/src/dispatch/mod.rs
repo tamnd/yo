@@ -6671,6 +6671,116 @@ mod tests {
         );
     }
 
+    /// `BLMOVEM` answers exactly what `LMOVEM` answers when it does not have to
+    /// wait, which is the same relationship every other command in this file has
+    /// with the one it wraps.
+    #[test]
+    fn a_blocking_block_move_that_can_be_answered_answers_like_lmovem() {
+        let mut f = Fixture::new();
+        f.run(&[b"RPUSH", b"L", b"a", b"b", b"c", b"d", b"e"]);
+        assert_eq!(
+            f.flow(&[b"BLMOVEM", b"L", b"D", b"LEFT", b"RIGHT", b"0"]),
+            (Flow::Continue, "*1\r\n$1\r\na\r\n".to_owned())
+        );
+        assert_eq!(
+            f.run(&[
+                b"BLMOVEM", b"L", b"D", b"RIGHT", b"RIGHT", b"0", b"COUNT", b"2", b"OBO"
+            ]),
+            bulks(&["e", "d"])
+        );
+        assert_eq!(
+            f.run(&[b"LRANGE", b"D", b"0", b"-1"]),
+            bulks(&["a", "e", "d"])
+        );
+        // `EXACTLY` with enough there does not wait either.
+        assert_eq!(
+            f.run(&[
+                b"BLMOVEM", b"L", b"D", b"LEFT", b"RIGHT", b"0", b"EXACTLY", b"2", b"BULK"
+            ]),
+            bulks(&["b", "c"])
+        );
+        assert_eq!(f.run(&[b"EXISTS", b"L"]), ":0\r\n", "and the key went");
+    }
+
+    /// The one thing `BLMOVEM` decides differently from the other five: `COUNT`
+    /// is ready as soon as there is anything and `EXACTLY` is not ready until the
+    /// whole block has arrived.
+    #[test]
+    fn a_blocking_block_move_waits_for_the_whole_block_only_under_exactly() {
+        let mut f = Fixture::new();
+        f.run(&[b"RPUSH", b"L", b"a", b"b"]);
+        // Two there and three asked for. `COUNT` takes the two.
+        assert_eq!(
+            f.flow(&[
+                b"BLMOVEM", b"L", b"D", b"LEFT", b"RIGHT", b"0", b"COUNT", b"3", b"BULK"
+            ]),
+            (Flow::Continue, bulks(&["a", "b"]))
+        );
+
+        f.run(&[b"RPUSH", b"L", b"a", b"b"]);
+        // The same line with `EXACTLY` parks instead, and takes nothing on the
+        // way past.
+        assert_eq!(
+            f.flow(&[
+                b"BLMOVEM", b"L", b"D", b"LEFT", b"RIGHT", b"0", b"EXACTLY", b"3", b"BULK"
+            ])
+            .0,
+            Flow::Block
+        );
+        assert_eq!(f.run(&[b"LRANGE", b"L", b"0", b"-1"]), bulks(&["a", "b"]));
+    }
+
+    #[test]
+    fn a_blocking_block_move_reads_its_directions_then_its_timeout_then_its_count() {
+        let mut f = Fixture::new();
+        let syntax = "-ERR syntax error\r\n";
+        // All three are wrong and the directions are read first.
+        assert_eq!(
+            f.run(&[
+                b"BLMOVEM", b"a", b"b", b"UP", b"DOWN", b"abc", b"NOPE", b"x", b"y"
+            ]),
+            syntax
+        );
+        // Directions fine, timeout and count both wrong, so the timeout wins.
+        assert_eq!(
+            f.run(&[
+                b"BLMOVEM", b"a", b"b", b"LEFT", b"RIGHT", b"abc", b"COUNT", b"abc", b"BULK"
+            ]),
+            "-ERR timeout is not a float or out of range\r\n"
+        );
+        assert_eq!(
+            f.run(&[
+                b"BLMOVEM", b"a", b"b", b"LEFT", b"RIGHT", b"-1", b"COUNT", b"1", b"BULK"
+            ]),
+            "-ERR timeout is negative\r\n"
+        );
+        // And with the timeout fine, the count before the ordering word.
+        assert_eq!(
+            f.run(&[
+                b"BLMOVEM", b"a", b"b", b"LEFT", b"RIGHT", b"0", b"COUNT", b"abc", b"NOPE"
+            ]),
+            "-ERR count should be greater than 0\r\n"
+        );
+        assert_eq!(
+            f.run(&[
+                b"BLMOVEM", b"a", b"b", b"LEFT", b"RIGHT", b"0", b"COUNT", b"1", b"NOPE"
+            ]),
+            syntax
+        );
+        // Seven and eight arguments are neither of the two forms, the same way
+        // six and seven are for `LMOVEM`.
+        assert_eq!(
+            f.run(&[b"BLMOVEM", b"a", b"b", b"LEFT", b"RIGHT", b"0", b"COUNT"]),
+            syntax
+        );
+        assert_eq!(
+            f.run(&[
+                b"BLMOVEM", b"a", b"b", b"LEFT", b"RIGHT", b"0", b"COUNT", b"2"
+            ]),
+            syntax
+        );
+    }
+
     /// The four ways a blocking command sees a key of another type, and the one
     /// way it does not.
     #[test]
@@ -6691,6 +6801,14 @@ mod tests {
         // something in it.
         assert_eq!(f.run(&[b"BRPOPLPUSH", b"D", b"S", b"0"]), wrong);
         assert_eq!(f.run(&[b"LRANGE", b"D", b"0", b"-1"]), "*1\r\n$1\r\nx\r\n");
+        assert_eq!(
+            f.run(&[b"BLMOVEM", b"S", b"D", b"LEFT", b"RIGHT", b"0"]),
+            wrong
+        );
+        assert_eq!(
+            f.run(&[b"BLMOVEM", b"D", b"S", b"LEFT", b"RIGHT", b"0"]),
+            wrong
+        );
 
         // And the one that does not: an empty source means the destination is
         // never looked at, so this waits rather than erroring, and on a real
@@ -6698,6 +6816,22 @@ mod tests {
         assert_eq!(
             f.flow(&[b"BLMOVE", b"E", b"S", b"LEFT", b"RIGHT", b"0.1"])
                 .0,
+            Flow::Block
+        );
+        // `BLMOVEM` has a second way of not being ready, and it hides the
+        // destination just as well: the source is a list with two elements in it
+        // and `EXACTLY` wants three, so the string never gets looked at.
+        assert_eq!(
+            f.flow(&[b"BLMOVEM", b"E", b"S", b"LEFT", b"RIGHT", b"0.1"])
+                .0,
+            Flow::Block
+        );
+        f.run(&[b"RPUSH", b"E", b"1", b"2"]);
+        assert_eq!(
+            f.flow(&[
+                b"BLMOVEM", b"E", b"S", b"LEFT", b"RIGHT", b"0.1", b"EXACTLY", b"3", b"BULK"
+            ])
+            .0,
             Flow::Block
         );
     }

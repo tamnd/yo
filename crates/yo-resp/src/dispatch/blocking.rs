@@ -1,4 +1,4 @@
-//! The five list commands that wait, and the machinery that lets a client wait.
+//! The six list commands that wait, and the machinery that lets a client wait.
 //!
 //! `BLPOP` is `LPOP` with one difference: when there is nothing to pop, the
 //! client waits instead of being told no. Everything here is about that wait,
@@ -14,7 +14,7 @@
 //! The command handler calls it once to see whether the client has to wait at
 //! all, and the retry calls it again each time something might have arrived.
 //!
-//! That is also why the five commands cost nothing when they do not block. A
+//! That is also why the six commands cost nothing when they do not block. A
 //! `BLPOP` on a list with something in it runs the same three lines `LPOP` runs
 //! and never touches the waiter list.
 //!
@@ -43,10 +43,10 @@
 //! rule about when to look.
 
 use yo_common::{Code, Error, Result, num};
-use yo_kv::{End, Entry, Keyspace, Member, ZEnd};
+use yo_kv::{End, Entry, Keyspace, Member, Movem, ZEnd};
 
 use super::args::{self, Args, NOT_AN_INT};
-use super::lists::{BAD_MPOP_COUNT, BAD_NUMKEYS, end_of};
+use super::lists::{BAD_MPOP_COUNT, BAD_NUMKEYS, end_of, movem_options};
 use super::streams;
 use super::table::Spec;
 use super::zsets;
@@ -97,7 +97,7 @@ pub(super) fn execute(
         return replication(spec.name, args, out).map(|()| Flow::Continue);
     }
     let now = server.now_ms();
-    // The two stream reads, which are here for the same reason the list five
+    // The two stream reads, which are here for the same reason the list six
     // are and leave through a different door. `BLOCK` is optional on both, so
     // where `BLPOP` always has a timeout to read, `XREAD` may have been told to
     // answer now and take nothing for an answer. That is the difference between
@@ -141,6 +141,17 @@ pub(super) fn execute(
             let (from, to) = (end_of(args.get(3))?, end_of(args.get(4))?);
             let deadline = timeout(args.get(5), now)?;
             (deadline, Block::moved(args.get(1), args.get(2), from, to))
+        }
+        // The same order again with one more thing to read: ends, then timeout,
+        // then the options behind it. `BLMOVEM s d UP DOWN abc` complains about
+        // the directions and `BLMOVEM s d LEFT RIGHT abc COUNT abc BULK` about
+        // the timeout, both measured against 8.10.1 rather than assumed, because
+        // a line wrong in two places has exactly one right answer.
+        "blmovem" => {
+            let (from, to) = (end_of(args.get(3))?, end_of(args.get(4))?);
+            let deadline = timeout(args.get(5), now)?;
+            let mv = movem_options(args, 6, from, to)?;
+            (deadline, Block::movem(args.get(1), args.get(2), mv))
         }
         "brpoplpush" => {
             let deadline = timeout(args.get(3), now)?;
@@ -322,6 +333,13 @@ enum Want {
     Pop { end: End },
     /// `BLMOVE` and `BRPOPLPUSH`: one element, onto an end of another list.
     Move { dst: Vec<u8>, from: End, to: End },
+    /// `BLMOVEM`: a block of them, onto an end of another list.
+    ///
+    /// The only want in this file where how many elements are there decides
+    /// whether the client is ready, rather than just whether any are. `COUNT`
+    /// takes what has arrived and so wakes on the first push, and `EXACTLY`
+    /// waits until the source actually holds the whole block.
+    MoveM { dst: Vec<u8>, mv: Movem },
     /// `BLMPOP`: up to `count` elements off the first key that has any.
     Mpop { end: End, count: usize },
     /// `BZPOPMIN` and `BZPOPMAX`: one member and its score off the first sorted
@@ -332,7 +350,7 @@ enum Want {
     /// `XREAD BLOCK` and `XREADGROUP BLOCK`: whatever has arrived on any of the
     /// streams since the ID this asked from.
     ///
-    /// Unlike the other five this takes nothing away, so several clients parked
+    /// Unlike the other six this takes nothing away, so several clients parked
     /// on one stream all get the same entry rather than one of them getting it.
     /// That is the whole point of a stream over a list, and it costs nothing
     /// here because the attempt is a read.
@@ -367,7 +385,7 @@ impl Want {
     ) -> Result<bool> {
         match self {
             // The one arm that needs to know what time it is, because a group
-            // read records when each entry was handed out. The other five take
+            // read records when each entry was handed out. The other six take
             // an element off a collection and the clock does not come into it.
             Want::XRead(r) => streams::read(db, keys, r, now, strict, out),
             Want::Pop { end } => {
@@ -456,6 +474,44 @@ impl Want {
                     // the client goes back to waiting with the queue as it was.
                     Err(_) => Ok(false),
                 }
+            }
+            // The same shape as `Move` with a different question about the
+            // source. `ready` asks whether there is anything and that is not
+            // enough here, because an `EXACTLY` client is not ready until the
+            // whole block has arrived, and asking it any earlier would take
+            // nothing and answer nothing while looking like it had tried.
+            Want::MoveM { dst, mv } => {
+                let src = &keys[0];
+                let have = match db.llen(src) {
+                    Ok(n) => n,
+                    Err(e) if strict => return Err(e),
+                    Err(_) => return Ok(false),
+                };
+                // Not ready is not the same as nothing to do, so the
+                // destination is never looked at from here. `BLMOVEM empty
+                // string LEFT RIGHT 0.1` times out on a running 8.10.1 rather
+                // than answering `WRONGTYPE`, and so does an `EXACTLY` whose
+                // source is short, both of which were measured.
+                if have == 0 || (mv.exactly && have < mv.count) {
+                    return Ok(false);
+                }
+                let mark = out.len();
+                let mut n = 0;
+                match db.lmovem(src, dst, *mv, |v| {
+                    out.bulk(v);
+                    n += 1;
+                }) {
+                    Ok(_) => {}
+                    Err(e) if strict => return Err(e),
+                    // As `Move`: the destination stopped being a list while
+                    // this client waited, and nothing was taken.
+                    Err(_) => {
+                        out.truncate(mark);
+                        return Ok(false);
+                    }
+                }
+                out.close_array(mark, n);
+                Ok(true)
             }
         }
     }
@@ -552,6 +608,17 @@ impl Block {
                 dst: dst.to_vec(),
                 from,
                 to,
+            },
+        })
+    }
+
+    /// `BLMOVEM`.
+    fn movem(src: &[u8], dst: &[u8], mv: Movem) -> Block {
+        yo_alloc::allow(|| Block {
+            keys: vec![src.to_vec()],
+            want: Want::MoveM {
+                dst: dst.to_vec(),
+                mv,
             },
         })
     }
@@ -729,7 +796,7 @@ impl Waiters {
             Err(_) => out.truncate(mark),
         }
         if w.deadline.is_some_and(|d| now >= d) {
-            // A null array for all five, `BLMOVE` and `BRPOPLPUSH` included,
+            // A null array for all six, `BLMOVE` and `BRPOPLPUSH` included,
             // even though what they send when they succeed is a single element.
             // That is Redis's and it is not what reading the reply schema would
             // suggest: a RESP2 client sees `*-1` and not `$-1`.

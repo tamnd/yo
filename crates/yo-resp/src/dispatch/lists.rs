@@ -25,7 +25,7 @@
 //! never a `Vec` of ten thousand anything on this thread (Y18).
 
 use yo_common::{Code, Error, Result, parse_i64};
-use yo_kv::{Block, End, Entry, Keyspace, Order};
+use yo_kv::{End, Entry, Keyspace, Movem, Order};
 
 use super::args::{self, Args};
 use super::table::Spec;
@@ -293,49 +293,12 @@ fn moved(
 fn movem(db: &mut Keyspace, args: Args<'_>, out: &mut Out) -> Result<()> {
     let from = end_of(args.get(3))?;
     let to = end_of(args.get(4))?;
-    let (count, exactly, order) = match args.len() {
-        5 => (1usize, false, Order::Bulk),
-        8 => {
-            let exactly = if args::is(args.get(5), b"exactly") {
-                true
-            } else if args::is(args.get(5), b"count") {
-                false
-            } else {
-                return Err(args::syntax());
-            };
-            // The count is read before the ordering word, which is only visible
-            // on a line that is wrong in both places: 8.10.1 answers about the
-            // count there. The order the two are looked at in is the sort of
-            // thing a client's own test suite pins, so it was measured rather
-            // than picked.
-            let count = match parse_i64(args.get(6)) {
-                Some(n) if n > 0 => usize::try_from(n).unwrap_or(usize::MAX),
-                _ => return Err(Error::new(Code::Invalid, BAD_MPOP_COUNT)),
-            };
-            let order = if args::is(args.get(7), b"obo") {
-                Order::OneByOne
-            } else if args::is(args.get(7), b"bulk") {
-                Order::Bulk
-            } else {
-                return Err(args::syntax());
-            };
-            (count, exactly, order)
-        }
-        _ => return Err(args::syntax()),
-    };
-
+    let block = movem_options(args, 5, from, to)?;
     // Written before the header for the same reason the set algebra's are: how
     // many moved is what the move produced, and an `EXACTLY` that came up short
     // produces none of them.
     let start = out.len();
     let mut n = 0;
-    let block = Block {
-        from,
-        to,
-        count,
-        exactly,
-        order,
-    };
     db.lmovem(args.get(1), args.get(2), block, |v| {
         out.bulk(v);
         n += 1;
@@ -346,6 +309,57 @@ fn movem(db: &mut Keyspace, args: Args<'_>, out: &mut Out) -> Result<()> {
         out.close_array(start, n);
     }
     Ok(())
+}
+
+/// The `COUNT|EXACTLY n OBO|BULK` block, wherever it sits.
+///
+/// `at` is where the first of the three would be, which is 5 for `LMOVEM` and 6
+/// for `BLMOVEM`, since the only difference between the two lines is the timeout
+/// the second one carries in front of the options. Nothing at `at` is the short
+/// form and means one element in source order, all three is the long form, and
+/// anything in between is a syntax error rather than a shorter spelling.
+pub(super) fn movem_options(args: Args<'_>, at: usize, from: End, to: End) -> Result<Movem> {
+    if args.len() == at {
+        return Ok(Movem {
+            from,
+            to,
+            count: 1,
+            exactly: false,
+            order: Order::Bulk,
+        });
+    }
+    if args.len() != at + 3 {
+        return Err(args::syntax());
+    }
+    let exactly = if args::is(args.get(at), b"exactly") {
+        true
+    } else if args::is(args.get(at), b"count") {
+        false
+    } else {
+        return Err(args::syntax());
+    };
+    // The count is read before the ordering word, which is only visible on a
+    // line that is wrong in both places: 8.10.1 answers about the count there.
+    // The order the two are looked at in is the sort of thing a client's own
+    // test suite pins, so it was measured rather than picked.
+    let count = match parse_i64(args.get(at + 1)) {
+        Some(n) if n > 0 => usize::try_from(n).unwrap_or(usize::MAX),
+        _ => return Err(Error::new(Code::Invalid, BAD_MPOP_COUNT)),
+    };
+    let order = if args::is(args.get(at + 2), b"obo") {
+        Order::OneByOne
+    } else if args::is(args.get(at + 2), b"bulk") {
+        Order::Bulk
+    } else {
+        return Err(args::syntax());
+    };
+    Ok(Movem {
+        from,
+        to,
+        count,
+        exactly,
+        order,
+    })
 }
 
 /// `LEFT` or `RIGHT`, and a syntax error for anything else.
