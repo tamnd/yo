@@ -105,7 +105,7 @@ pub(super) fn execute(
     // `None`, which already means wait for as long as it takes.
     if spec.name == "xread" || spec.name == "xreadgroup" {
         let db = session.db();
-        let want = streams::parse_read(spec.name, args, server.db(db), now)?;
+        let want = streams::parse_read(spec.name, args, server.striped(db), now)?;
         let block = Block::xread(want.keys, want.reads);
         if block.now(server.striped(db), now, out)? {
             return Ok(Flow::Continue);
@@ -387,10 +387,7 @@ impl Want {
             // The one arm that needs to know what time it is, because a group
             // read records when each entry was handed out. The other six take
             // an element off a collection and the clock does not come into it.
-            // The one arm still on the bridge, because the stream group has
-            // not been taught about stripes yet and a stream read names its
-            // keys the way every other blocking command does.
-            Want::XRead(r) => streams::read(db.only_mut(), keys, r, now, strict, out),
+            Want::XRead(r) => streams::read(db, keys, r, now, strict, out),
             Want::Pop { end } => {
                 for key in keys {
                     if !ready(db, key, strict)? {
