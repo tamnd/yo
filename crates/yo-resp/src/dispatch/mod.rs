@@ -57,6 +57,7 @@ mod backup;
 mod bits;
 mod blocking;
 mod bloom;
+mod cms;
 mod cpu;
 mod cuckoo;
 mod geo;
@@ -1155,7 +1156,7 @@ pub fn resolved(
     // two groups that hold them mark all of them rather than the session's.
     server.dirty |= match spec.group {
         "string" | "bitmap" | "hyperloglog" | "geo" | "set" | "hash" | "list" | "zset"
-        | "array" | "stream" | "bloom" | "cuckoo" => 1u64 << session.db,
+        | "array" | "stream" | "bloom" | "cuckoo" | "cms" => 1u64 << session.db,
         _ => ALL_DATABASES,
     };
 
@@ -1245,6 +1246,10 @@ pub fn resolved(
             "cuckoo" => {
                 let db = session.db;
                 cuckoo::execute(&mut server.dbs[db], spec, args, out).map(|()| Flow::Continue)
+            }
+            "cms" => {
+                let db = session.db;
+                cms::execute(&mut server.dbs[db], spec, args, out).map(|()| Flow::Continue)
             }
             // The clock is read before the database is borrowed, because every
             // stream command needs the time and it lives on the server. An
@@ -13136,6 +13141,263 @@ mod tests {
         // The end of a dump is a nil and not an empty chunk, which is one
         // underscore here and a negative length on RESP2.
         assert_eq!(f.run(&[b"CF.SCANDUMP", b"c", b"9999"]), "*2\r\n:0\r\n_\r\n");
+    }
+
+    // ------------------------------------------------------------------- cms
+
+    /// A sketch is made from either end, and both constructors look at the key
+    /// before they look at their arguments.
+    #[test]
+    fn a_sketch_is_made_from_a_size_or_from_an_error_rate() {
+        let mut f = Fixture::new();
+        assert_eq!(f.run(&[b"CMS.INITBYDIM", b"d", b"100", b"5"]), "+OK\r\n");
+        assert_eq!(
+            f.run(&[b"CMS.INFO", b"d"]),
+            "*6\r\n+width\r\n:100\r\n+depth\r\n:5\r\n+count\r\n:0\r\n"
+        );
+        assert_eq!(f.run(&[b"TYPE", b"d"]), "+CMSk-TYPE\r\n");
+        assert_eq!(f.run(&[b"OBJECT", b"ENCODING", b"d"]), "$3\r\nraw\r\n");
+        // Two over the error rounded up, and the log of the probability over the
+        // log of a half rounded up, which for these two is 200 by 6.
+        assert_eq!(
+            f.run(&[b"CMS.INITBYPROB", b"p", b"0.01", b"0.03"]),
+            "+OK\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"CMS.INFO", b"p"]),
+            "*6\r\n+width\r\n:200\r\n+depth\r\n:6\r\n+count\r\n:0\r\n"
+        );
+        // The key is checked first, so a width of zero at a key that is already
+        // there is about the key and not about the width.
+        assert_eq!(
+            f.run(&[b"CMS.INITBYDIM", b"d", b"0", b"2"]),
+            "-CMS: key already exists\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"CMS.INITBYDIM", b"new", b"0", b"2"]),
+            "-CMS: invalid width\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"CMS.INITBYDIM", b"new", b"2", b"0"]),
+            "-CMS: invalid depth\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"CMS.INITBYPROB", b"new", b"0", b"0.5"]),
+            "-CMS: invalid overestimation value\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"CMS.INITBYPROB", b"new", b"0.1", b"1"]),
+            "-CMS: invalid prob value\r\n"
+        );
+        // A probability whose float conversion is zero has no depth, and a width
+        // past a signed sixty four bit integer has no width, and both are the
+        // same sentence.
+        assert_eq!(
+            f.run(&[b"CMS.INITBYPROB", b"new", b"0.5", b"1e-46"]),
+            "-CMS: invalid init arguments\r\n"
+        );
+        // And a sketch bigger than a gibibyte of counters is refused here where
+        // the reference reserves address space nobody has touched, which is
+        // D-47.
+        assert_eq!(
+            f.run(&[b"CMS.INITBYDIM", b"new", b"268435457", b"1"]),
+            "-CMS: Insufficient memory to create the key\r\n"
+        );
+        assert_eq!(f.run(&[b"EXISTS", b"new"]), ":0\r\n");
+    }
+
+    /// Every pair is parsed before any of them lands, the counters saturate,
+    /// and the count is a signed total of what was asked for.
+    #[test]
+    fn increments_are_parsed_whole_and_the_counters_saturate() {
+        let mut f = Fixture::new();
+        f.run(&[b"CMS.INITBYDIM", b"c", b"100", b"4"]);
+        assert_eq!(
+            f.run(&[b"CMS.INCRBY", b"c", b"a", b"3", b"b", b"4"]),
+            "*2\r\n:3\r\n:4\r\n"
+        );
+        // An item that is incremented twice in one call sees its own first
+        // increment in the reply to the second.
+        assert_eq!(
+            f.run(&[b"CMS.INCRBY", b"c", b"a", b"1", b"a", b"1"]),
+            "*2\r\n:4\r\n:5\r\n"
+        );
+        // A bad number anywhere means nothing at all is applied.
+        assert_eq!(
+            f.run(&[b"CMS.INCRBY", b"c", b"a", b"9", b"b", b"x"]),
+            "-CMS: Cannot parse number\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"CMS.INCRBY", b"c", b"a", b"9", b"b", b"-1"]),
+            "-CMS: Number cannot be negative\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"CMS.QUERY", b"c", b"a", b"b"]),
+            "*2\r\n:5\r\n:4\r\n"
+        );
+        // The counters stop at four billion and the item that stopped says so in
+        // its own slot while the one beside it answers a number.
+        f.run(&[b"CMS.INCRBY", b"c", b"a", b"4294967295"]);
+        assert_eq!(
+            f.run(&[b"CMS.INCRBY", b"c", b"a", b"1", b"b", b"1"]),
+            "*2\r\n-CMS: INCRBY overflow\r\n:5\r\n"
+        );
+        assert_eq!(f.run(&[b"CMS.QUERY", b"c", b"a"]), "*1\r\n:4294967295\r\n");
+        // The count is what was asked for rather than what landed, and it is
+        // signed, so a big enough total comes back negative.
+        f.run(&[b"CMS.INITBYDIM", b"w", b"4", b"1"]);
+        f.run(&[b"CMS.INCRBY", b"w", b"x", b"9223372036854775807"]);
+        f.run(&[b"CMS.INCRBY", b"w", b"x", b"1"]);
+        assert_eq!(
+            f.run(&[b"CMS.INFO", b"w"]),
+            "*6\r\n+width\r\n:4\r\n+depth\r\n:1\r\n+count\r\n:-9223372036854775808\r\n"
+        );
+        // An odd number of arguments after the key is an arity error and not a
+        // syntax one.
+        assert!(
+            f.run(&[b"CMS.INCRBY", b"c", b"a", b"1", b"b"])
+                .contains("wrong number of arguments")
+        );
+        assert_eq!(
+            f.run(&[b"CMS.INCRBY", b"nope", b"a", b"1"]),
+            "-CMS: key does not exist\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"CMS.QUERY", b"nope", b"a"]),
+            "-CMS: key does not exist\r\n"
+        );
+    }
+
+    /// A merge overwrites its destination, and it is worked out in full before
+    /// any of it is written.
+    #[test]
+    fn a_merge_lands_whole_or_not_at_all() {
+        let mut f = Fixture::new();
+        for name in [&b"m1"[..], b"m2", b"dst"] {
+            f.run(&[b"CMS.INITBYDIM", name, b"64", b"3"]);
+        }
+        f.run(&[b"CMS.INCRBY", b"m1", b"a", b"5"]);
+        f.run(&[b"CMS.INCRBY", b"m2", b"a", b"7"]);
+        assert_eq!(
+            f.run(&[b"CMS.MERGE", b"dst", b"2", b"m1", b"m2"]),
+            "+OK\r\n"
+        );
+        assert_eq!(f.run(&[b"CMS.QUERY", b"dst", b"a"]), "*1\r\n:12\r\n");
+        // Overwritten and not added to, so the same merge twice is the same
+        // answer twice.
+        assert_eq!(
+            f.run(&[b"CMS.MERGE", b"dst", b"2", b"m1", b"m2"]),
+            "+OK\r\n"
+        );
+        assert_eq!(f.run(&[b"CMS.QUERY", b"dst", b"a"]), "*1\r\n:12\r\n");
+        assert_eq!(
+            f.run(&[
+                b"CMS.MERGE",
+                b"dst",
+                b"2",
+                b"m1",
+                b"m2",
+                b"WEIGHTS",
+                b"2",
+                b"3"
+            ]),
+            "+OK\r\n"
+        );
+        assert_eq!(f.run(&[b"CMS.QUERY", b"dst", b"a"]), "*1\r\n:31\r\n");
+        // A cell times a weight is checked wide rather than wrapped, so this is
+        // a refusal and the destination is left exactly as it was.
+        assert_eq!(
+            f.run(&[
+                b"CMS.MERGE",
+                b"dst",
+                b"1",
+                b"m1",
+                b"WEIGHTS",
+                b"4611686018427387904"
+            ]),
+            "-CMS: MERGE overflow\r\n"
+        );
+        assert_eq!(f.run(&[b"CMS.QUERY", b"dst", b"a"]), "*1\r\n:31\r\n");
+        // The destination comes first, then the count, then the layout, then the
+        // weights, then the sources one at a time.
+        f.run(&[b"CMS.INITBYDIM", b"wide", b"128", b"3"]);
+        assert_eq!(
+            f.run(&[b"CMS.MERGE", b"gone", b"1", b"m1"]),
+            "-CMS: key does not exist\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"CMS.MERGE", b"dst", b"0", b"m1"]),
+            "-CMS: Number of keys must be positive\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"CMS.MERGE", b"dst", b"3", b"m1"]),
+            "-CMS: wrong number of keys\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"CMS.MERGE", b"dst", b"1", b"m1", b"WEIGHTS", b"1", b"2"]),
+            "-CMS: wrong number of keys/weights\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"CMS.MERGE", b"dst", b"1", b"wide"]),
+            "-CMS: width/depth is not equal\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"CMS.MERGE", b"dst", b"1", b"gone"]),
+            "-CMS: key does not exist\r\n"
+        );
+    }
+
+    /// A key holding anything else is `WRONGTYPE` to all six, and a key holding
+    /// a sketch is refused by the two commands that would have to serialise it.
+    #[test]
+    fn a_sketch_is_a_module_key_to_the_rest_of_the_keyspace() {
+        let mut f = Fixture::new();
+        f.run(&[b"SET", b"s", b"text"]);
+        for cmd in [
+            vec![&b"CMS.INITBYDIM"[..], b"s", b"8", b"2"],
+            vec![&b"CMS.INCRBY"[..], b"s", b"a", b"1"],
+            vec![&b"CMS.QUERY"[..], b"s", b"a"],
+            vec![&b"CMS.INFO"[..], b"s"],
+            vec![&b"CMS.MERGE"[..], b"s", b"1", b"s"],
+        ] {
+            let name = String::from_utf8_lossy(cmd[0]).into_owned();
+            let reply = f.run(&cmd);
+            // The two constructors see the key before anything else and say so
+            // in the module's own words, and the rest are `WRONGTYPE`.
+            assert!(
+                reply.starts_with("-WRONGTYPE") || reply == "-CMS: key already exists\r\n",
+                "{name}: {reply}"
+            );
+        }
+        f.run(&[b"CMS.INITBYDIM", b"c", b"64", b"2"]);
+        // Redis refuses to copy a module key that has no copy callback, and
+        // these are its words rather than ours. `DUMP` is the other half of
+        // D-48: the reference has a payload for one of these and we do not.
+        assert_eq!(
+            f.run(&[b"COPY", b"c", b"c2"]),
+            "-ERR not supported for this module key\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"DUMP", b"c"]),
+            "-ERR DUMP is not supported for this module key\r\n"
+        );
+        // A graph is nobody's module and keeps its own sentence.
+        f.run(&[b"G.NADD", b"g", b"a"]);
+        assert_eq!(
+            f.run(&[b"COPY", b"g", b"g2"]),
+            "-ERR COPY is not supported for a graph\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"DUMP", b"g"]),
+            "-ERR DUMP is not supported for a graph\r\n"
+        );
+        // Everything that does not need a byte shape works on a sketch key the
+        // way it works on any other.
+        assert_eq!(f.run(&[b"EXPIRE", b"c", b"100"]), ":1\r\n");
+        assert_eq!(f.run(&[b"PERSIST", b"c"]), ":1\r\n");
+        assert_eq!(f.run(&[b"RENAME", b"c", b"c3"]), "+OK\r\n");
+        assert_eq!(f.run(&[b"TYPE", b"c3"]), "+CMSk-TYPE\r\n");
+        assert_eq!(f.run(&[b"DEL", b"c3"]), ":1\r\n");
     }
 
     /// The three shapes an `XADD` id can take, and the one rule behind all of

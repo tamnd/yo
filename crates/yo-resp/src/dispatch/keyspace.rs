@@ -17,7 +17,6 @@
 //! too without a line here changing.
 
 use super::args::{self, Args};
-use super::graph;
 use super::scan;
 use super::table::Spec;
 use crate::reply::Out;
@@ -175,10 +174,10 @@ pub(super) fn execute(
         "scan" => scan(db, args, out)?,
         "keys" => keys(db, args.get(1), out),
         "sort" | "sort_ro" => sort(db, spec.name, args, out)?,
-        // A graph is refused rather than answered with the null bulk a missing
-        // key gets, because there is no byte shape for one and a client that
-        // could not tell the two apart would think its key had gone.
-        "dump" if graph::is_graph(db, args.get(1)) => return Err(no_dump()),
+        // A foreign body is refused rather than answered with the null bulk a
+        // missing key gets, because there is no byte shape for one and a client
+        // that could not tell the two apart would think its key had gone.
+        "dump" if is_foreign(db, args.get(1)) => return Err(no_dump(db, args.get(1))),
         "dump" => match db.dump(args.get(1)) {
             Some(payload) => out.bulk(&payload),
             None => out.nil(),
@@ -291,23 +290,53 @@ fn kind_named(arg: &[u8]) -> Option<Kind> {
     .find(|kind| args::is(arg, kind.name().as_bytes()))
 }
 
-/// A cursor as the client sent it back.
+/// What Redis says when `COPY` is handed a key a module owns.
 ///
-/// Unsigned, because ours uses the top bits and Redis parses a cursor with
-/// `strtoull` too.
+/// Its own sentence, word for word. A module type with no copy callback is
+/// refused there and every module type we answer for is one of those, so the
+/// bloom filter, the cuckoo filter and the count min sketch all say this. The
+/// exception on a real server is `ReJSON-RL`, which does have the callback and
+/// copies, and ours does not yet.
+const MODULE_KEY: &str = "not supported for this module key";
+
+/// Whether `key` holds a body the keyspace cannot carry on its own.
+///
+/// `COPY` and `DUMP` are the two commands that have to ask. Every foreign body
+/// is one: none of them has a byte shape here yet, so both would have to make
+/// one up.
+fn is_foreign(db: &mut Keyspace, key: &[u8]) -> bool {
+    db.kind_of(key) == Some(Kind::Foreign)
+}
+
 /// What `COPY` says about a source there is no way to duplicate.
 ///
 /// A graph is an engine that lives above the keyspace and there is no generic
 /// way to ask one for a copy of itself, which is a decision rather than an
 /// oversight: a deep copy of ten million edges is not something a client should
-/// get from a command that looks like `SET`.
-fn no_copy() -> Error {
-    Error::new(Code::Unsupported, "COPY is not supported for a graph")
+/// get from a command that looks like `SET`. Nothing on a real server answers
+/// for a graph, so that one gets our own words. The rest are module types a
+/// real server does have an answer for, and it is the refusal above.
+fn no_copy(db: &mut Keyspace, key: &[u8]) -> Error {
+    match db.type_name(key) {
+        Some("graph") => Error::new(Code::Unsupported, "COPY is not supported for a graph"),
+        _ => Error::new(Code::Unsupported, MODULE_KEY),
+    }
 }
 
 /// What `DUMP` says about the same key.
-fn no_dump() -> Error {
-    Error::new(Code::Unsupported, "DUMP is not supported for a graph")
+///
+/// A real server dumps every one of these, because a module type that can be
+/// copied can be serialised and the sketches carry their own reader and writer.
+/// Ours has no byte shape for a foreign body yet, so this is a refusal where
+/// Redis has a payload, which is D-48 and not a sentence anyone can match.
+fn no_dump(db: &mut Keyspace, key: &[u8]) -> Error {
+    match db.type_name(key) {
+        Some("graph") => Error::new(Code::Unsupported, "DUMP is not supported for a graph"),
+        _ => Error::new(
+            Code::Unsupported,
+            "DUMP is not supported for this module key",
+        ),
+    }
 }
 
 /// `RENAME src dst` and `RENAMENX src dst`.
@@ -371,7 +400,7 @@ fn copy(dbs: &mut [Keyspace], at: usize, args: Args<'_>, out: &mut Out) -> Resul
             // The one `Moved` a caller cannot answer with a number, because
             // zero would mean the destination was taken and this is a source
             // there is no way to duplicate. See `Moved::Unsupported`.
-            Moved::Unsupported => return Err(no_copy()),
+            Moved::Unsupported => return Err(no_copy(&mut dbs[at], src)),
             done => done,
         }
     } else {
@@ -387,8 +416,8 @@ fn copy(dbs: &mut [Keyspace], at: usize, args: Args<'_>, out: &mut Out) -> Resul
             out.int(0);
             return Ok(());
         }
-        if graph::is_graph(&mut dbs[at], src) {
-            return Err(no_copy());
+        if is_foreign(&mut dbs[at], src) {
+            return Err(no_copy(&mut dbs[at], src));
         }
         let Some(rec) = dbs[at].export(src) else {
             out.int(0);

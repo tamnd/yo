@@ -51,7 +51,7 @@ use std::collections::HashMap;
 use yo_common::{Code, Error, Result, parse_i64};
 use yo_doc::{Builder, Doc};
 use yo_graph::{Dir, Graph};
-use yo_kv::{Foreign, Keyspace, value::Kind};
+use yo_kv::{Foreign, Keyspace};
 
 use super::args::{self, Args};
 use super::table::Spec;
@@ -693,13 +693,4 @@ fn pairs(args: Args<'_>, from: usize) -> Result<()> {
     } else {
         Err(args::syntax())
     }
-}
-
-/// Whether `key` holds a graph, for the commands elsewhere that have to refuse.
-///
-/// `COPY` and `DUMP` are the two. Both would need a byte shape for a graph and
-/// there is not one, so they say so rather than answering as though the key
-/// were missing.
-pub(super) fn is_graph(db: &mut Keyspace, key: &[u8]) -> bool {
-    db.kind_of(key) == Some(Kind::Foreign)
 }

@@ -183,6 +183,21 @@ doc = "11 section 8"
 # all fixed by the format rather than chosen.
 
 [[group]]
+name = "cms"
+expected = 6
+status = "shipped"
+doc = "11 section 8"
+# Six commands and no undocumented seventh, so this is the smallest of the three
+# sketch groups. Nothing here hands a client the counters the way BF.SCANDUMP
+# hands over a filter, but the layout is copied all the same, because CMS.MERGE
+# only works between sketches of the same width and depth and two servers that
+# hashed differently would merge into a sketch whose counts mean nothing. The
+# hash is MurmurHash2 over thirty two bits with the row number for a seed, the
+# cell is the hash taken modulo the width, and both constructors round the way
+# the module rounds, down to CMS.INITBYPROB computing its width in a double and
+# its depth in a float.
+
+[[group]]
 name = "stream"
 expected = 20
 status = "partial"
@@ -894,6 +909,7 @@ plan = "whole-value"
 bounded = "risk"
 status = "shipped"
 wire = "verified"
+divergent = "D-48"
 notes = "The one command in the group that costs what the value is worth. Two records pointing at one slot would be one set answering to two names and SADD to either would show up in both, so the body is cloned, which is Redis's cost too and there is no version of COPY that avoids it. DB n writes into a database the connection is not on, which is why the store splits this into an export that lifts a value out standing on its own and an import that puts one down, and the same pair is what MOVE, DUMP and RESTORE will want. The four failure modes are checked in an order nobody would write from scratch: the options first, so a bad DB is refused before anyone asks whether the source exists, then source and destination being the same object, and only then a missing source becoming the ordinary zero. Same object means same key in the same database, so COPY a a DB 1 is a real copy and COPY a a DB 0 from database zero is the error. A destination whose deadline has gone counts as free, which is the only answer consistent with EXISTS saying zero for the same key."
 
 [[command]]
@@ -997,6 +1013,7 @@ plan = "whole-value"
 bounded = "risk"
 status = "shipped"
 wire = "verified"
+divergent = "D-48"
 notes = "The same export COPY and MOVE use, with Redis's file format on the end of it instead of an import. A payload is one type byte, the value, two bytes of RDB version and eight bytes of CRC64, and the bytes in the middle have to be Redis's bytes rather than ours or the whole command is pointless, so the writer follows rdb.c and not a description of it. Redis's own CRC64 is the one place where reading the source mattered: the header comment and every published table say the initial value is all ones, and the function Redis calls starts from whatever the caller passes and every caller passes zero. Each kind goes out as the plainest legal type for it, which is one shape per kind to get right and is accepted by every Redis since 2.6, and the cost is that a set already sitting in a listpack is written member by member where a memcpy would do. The stream is the one kind where that cost is not paid, because a stream node here is already the sixteen byte rax key and the listpack a real server writes, so the whole of the entry data goes out as a length and a copy each and only the counters and the consumer groups behind it are built field by field. It goes out as LISTPACKS_3 and not as the type 27 an 8.10 writes, since the only thing 27 adds is a per group count and an idempotency block that are empty for every stream this server can hold, and the older type is the same data in a shape more servers accept. The deadline is deliberately left behind, since RESTORE is given a fresh one and a payload carrying a moment would be wrong the instant it crossed a machine with a different clock."
 
 [[command]]
@@ -3163,6 +3180,77 @@ bounded = "inherent"
 status = "shipped"
 wire = "verified"
 notes = "Pulls the fingerprints in the newer filters down into the older ones and drops the filters that empty, which is possible at all because every filter's bucket count is a power of two and an item's bucket in a smaller filter is its bucket in a bigger one taken modulo the smaller count. The module has it down as a readonly command in the @read category even though it writes, and the arity says one argument where the command wants two, and both are copied so that COMMAND INFO answers the same on either server."
+
+
+# ------------------------------------------------------------------------- cms
+
+[[command]]
+name = "CMS.INITBYDIM"
+group = "cms"
+since = "2.0.0"
+arity = 4
+plan = "whole-value"
+bounded = "risk"
+status = "shipped"
+wire = "verified"
+divergent = "D-47"
+notes = "Width times depth counters of four bytes each, all of them allocated here before a single item has been counted, which is the risk on the row. A real server has no cap at all and answers OK to a width of thirty five trillion because calloc hands back address space nobody has touched yet, and ours refuses anything past a gibibyte of counters with the module's own out of memory sentence, which is D-47. The key is looked at before the arguments are, so a width of zero at a key that is already there is key already exists and not invalid width."
+
+[[command]]
+name = "CMS.INITBYPROB"
+group = "cms"
+since = "2.0.0"
+arity = 4
+plan = "whole-value"
+bounded = "risk"
+status = "shipped"
+wire = "verified"
+divergent = "D-47"
+notes = "The same sketch from the other end, an error rate and a probability instead of a width and a depth. Width is two over the error rounded up in a double and depth is the log of the probability over the log of a half rounded up in a float, and the two different sizes are the module's and are visible: a probability of 1e-45 gives a depth of 149 where a double would have given 150. A probability whose float conversion is zero or one is invalid init arguments rather than a depth, and so is a width that does not fit in a signed sixty four bit integer."
+
+[[command]]
+name = "CMS.INCRBY"
+group = "cms"
+since = "2.0.0"
+arity = -4
+plan = "whole-value"
+bounded = "inherent"
+status = "shipped"
+wire = "verified"
+notes = "Item and increment pairs, every one of them parsed before any of them is applied, so a bad number in the last pair leaves the sketch untouched. Each row's counter saturates at four billion and the reply for an item is the smallest of its rows, which means an item that has saturated answers with the overflow error in its own slot while the items beside it answer with numbers. The count the sketch reports is the sum of what was asked for rather than of what landed, and it is a signed integer that wraps, so a long enough run of increments takes it negative on a real server and here."
+
+[[command]]
+name = "CMS.QUERY"
+group = "cms"
+since = "2.0.0"
+arity = -3
+plan = "point"
+bounded = "inherent"
+status = "shipped"
+wire = "verified"
+notes = "One reply an item, each the smallest counter across the rows, which is the estimate that can be too high and never too low. Depth reads of one counter each and no allocation, and a missing key is an error rather than a row of zeros. The read carries the module flag but not the fast one, unlike BF.EXISTS and CF.EXISTS, and that is copied so COMMAND INFO answers the same on either server."
+
+[[command]]
+name = "CMS.MERGE"
+group = "cms"
+since = "2.0.0"
+arity = -4
+plan = "merge"
+bounded = "inherent"
+status = "shipped"
+wire = "verified"
+notes = "The destination is overwritten and not added to, and every source has to have the destination's width and depth, which is why the layout is worth copying byte for byte. The whole sum is worked out into a buffer first and the destination is only written if none of the cells overflowed, so a refused merge leaves it exactly as it was. A cell times a weight is checked as a wide integer rather than a wrapped one, because four times two to the sixty second overflows on a real server too, and a negative weight is fine against a zero cell and a refusal against anything else."
+
+[[command]]
+name = "CMS.INFO"
+group = "cms"
+since = "2.0.0"
+arity = 2
+plan = "metadata"
+bounded = "inherent"
+status = "shipped"
+wire = "verified"
+notes = "Three fields, and they are three separate keys and not a nested one, so the reply is six elements on RESP2 and a map of three on RESP3. No field argument: asking for one is an arity error. The count is the running total the increments added up to and it is signed, so a sketch that has been fed enough reports a negative one."
 
 
 # ---------------------------------------------------------------------- array
