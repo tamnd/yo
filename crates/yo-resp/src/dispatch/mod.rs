@@ -1352,7 +1352,7 @@ pub fn resolved(
             // set group makes.
             "json" => {
                 let db = session.db;
-                json::execute(&mut server.dbs[db], spec, args, out).map(|()| Flow::Continue)
+                json::execute(&server.dbs[db], spec, args, out).map(|()| Flow::Continue)
             }
             "vector" => {
                 let db = session.db;
@@ -1368,7 +1368,7 @@ pub fn resolved(
             }
             "cms" => {
                 let db = session.db;
-                cms::execute(&mut server.dbs[db], spec, args, out).map(|()| Flow::Continue)
+                cms::execute(&server.dbs[db], spec, args, out).map(|()| Flow::Continue)
             }
             "topk" => {
                 let db = session.db;
@@ -1376,7 +1376,7 @@ pub fn resolved(
             }
             "tdigest" => {
                 let db = session.db;
-                tdigest::execute(&mut server.dbs[db], spec, args, out).map(|()| Flow::Continue)
+                tdigest::execute(&server.dbs[db], spec, args, out).map(|()| Flow::Continue)
             }
             "ts" => {
                 let db = session.db;

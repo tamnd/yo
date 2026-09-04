@@ -108,7 +108,7 @@ impl Foreign for JsonBody {
 }
 
 /// Run one JSON command.
-pub(super) fn execute(db: &mut Db, spec: &Spec, args: Args<'_>, out: &mut Out) -> Result<()> {
+pub(super) fn execute(db: &Db, spec: &Spec, args: Args<'_>, out: &mut Out) -> Result<()> {
     // The two that name more than one key take the whole database and find a
     // stripe per key. Every other command here names its key first and reads
     // one document, so it is handed the stripe that key is on and never sees
@@ -117,28 +117,28 @@ pub(super) fn execute(db: &mut Db, spec: &Spec, args: Args<'_>, out: &mut Out) -
     match spec.name {
         "json.mset" => mset(db, args, out),
         "json.mget" => mget(db, args, out),
-        "json.set" => set(db.at(key), args, out),
-        "json.merge" => merge(db.at(key), args, out),
-        "json.get" => get(db.at(key), args, out),
-        "json.resp" => resp(db.at(key), args, out),
-        "json.debug" => debug(db.at(key), args, out),
-        "json.del" | "json.forget" => del(db.at(key), args, out),
-        "json.type" => kind(db.at(key), args, out),
-        "json.toggle" => toggle(db.at(key), args, out),
-        "json.clear" => clear(db.at(key), args, out),
-        "json.arrlen" => sized(db.at(key), args, out, Asked::ArrayLen),
-        "json.objlen" => sized(db.at(key), args, out, Asked::ObjectLen),
-        "json.strlen" => sized(db.at(key), args, out, Asked::TextLen),
-        "json.objkeys" => sized(db.at(key), args, out, Asked::ObjectKeys),
-        "json.arrappend" => arrappend(db.at(key), args, out),
-        "json.arrinsert" => arrinsert(db.at(key), args, out),
-        "json.arrtrim" => arrtrim(db.at(key), args, out),
-        "json.arrpop" => arrpop(db.at(key), args, out),
-        "json.arrindex" => arrindex(db.at(key), args, out),
-        "json.numincrby" => arith(db.at(key), args, out, Arith::Add),
-        "json.nummultby" => arith(db.at(key), args, out, Arith::Mul),
-        "json.numpowby" => arith(db.at(key), args, out, Arith::Pow),
-        "json.strappend" => strappend(db.at(key), args, out),
+        "json.set" => set(&mut db.hold(key), args, out),
+        "json.merge" => merge(&mut db.hold(key), args, out),
+        "json.get" => get(&mut db.hold(key), args, out),
+        "json.resp" => resp(&mut db.hold(key), args, out),
+        "json.debug" => debug(&mut db.hold(key), args, out),
+        "json.del" | "json.forget" => del(&mut db.hold(key), args, out),
+        "json.type" => kind(&mut db.hold(key), args, out),
+        "json.toggle" => toggle(&mut db.hold(key), args, out),
+        "json.clear" => clear(&mut db.hold(key), args, out),
+        "json.arrlen" => sized(&mut db.hold(key), args, out, Asked::ArrayLen),
+        "json.objlen" => sized(&mut db.hold(key), args, out, Asked::ObjectLen),
+        "json.strlen" => sized(&mut db.hold(key), args, out, Asked::TextLen),
+        "json.objkeys" => sized(&mut db.hold(key), args, out, Asked::ObjectKeys),
+        "json.arrappend" => arrappend(&mut db.hold(key), args, out),
+        "json.arrinsert" => arrinsert(&mut db.hold(key), args, out),
+        "json.arrtrim" => arrtrim(&mut db.hold(key), args, out),
+        "json.arrpop" => arrpop(&mut db.hold(key), args, out),
+        "json.arrindex" => arrindex(&mut db.hold(key), args, out),
+        "json.numincrby" => arith(&mut db.hold(key), args, out, Arith::Add),
+        "json.nummultby" => arith(&mut db.hold(key), args, out, Arith::Mul),
+        "json.numpowby" => arith(&mut db.hold(key), args, out, Arith::Pow),
+        "json.strappend" => strappend(&mut db.hold(key), args, out),
         other => unreachable!("{other} is not a JSON command"),
     }
 }
@@ -323,7 +323,7 @@ fn grow<'v>(
 /// Working every triple out against the state the command started in is also
 /// what the reference does, so two triples on one key do not see each other and
 /// the last one written is the one that stays.
-fn mset(db: &mut Db, args: Args<'_>, out: &mut Out) -> Result<()> {
+fn mset(db: &Db, args: Args<'_>, out: &mut Out) -> Result<()> {
     if args.len() < 4 || !(args.len() - 1).is_multiple_of(3) {
         return Err(args::wrong_arity("json.mset"));
     }
@@ -341,7 +341,7 @@ fn mset(db: &mut Db, args: Args<'_>, out: &mut Out) -> Result<()> {
     }
     let mut plans = Vec::with_capacity(jobs.len());
     for (key, path, value) in &jobs {
-        match plan_one(db.at(key), key, path, value, Only::Either, out)? {
+        match plan_one(&mut db.hold(key), key, path, value, Only::Either, out)? {
             Plan::Refused => return Ok(()),
             plan => plans.push(plan),
         }
@@ -349,7 +349,7 @@ fn mset(db: &mut Db, args: Args<'_>, out: &mut Out) -> Result<()> {
     let mut all = true;
     for ((key, _, _), plan) in jobs.iter().zip(plans) {
         match plan {
-            Plan::Store(doc) => store(db.at(key), key, doc),
+            Plan::Store(doc) => store(&mut db.hold(key), key, doc),
             Plan::Nothing => all = false,
             // Every one of these was turned into an early return above.
             Plan::Refused => unreachable!("a refused triple is answered before any is written"),
@@ -820,7 +820,7 @@ fn line(f: &Format<'_>, text: &mut Vec<u8>, depth: usize) {
 }
 
 /// `JSON.MGET key [key ...] path`, one path against many documents.
-fn mget(db: &mut Db, args: Args<'_>, out: &mut Out) -> Result<()> {
+fn mget(db: &Db, args: Args<'_>, out: &mut Out) -> Result<()> {
     let last = args.len() - 1;
     let path = Path::parse(args.get(last))?;
     let f = Format::default();
@@ -832,7 +832,8 @@ fn mget(db: &mut Db, args: Args<'_>, out: &mut Out) -> Result<()> {
         // document are both a hole in the array. `MGET` does the same with a
         // key holding a hash, and for the same reason: one bad key in a hundred
         // should not lose the other ninety nine answers.
-        let Ok(Some(body)) = db.at(key).foreign(key) else {
+        let mut stripe = db.hold(key);
+        let Ok(Some(body)) = stripe.foreign(key) else {
             out.nil();
             continue;
         };

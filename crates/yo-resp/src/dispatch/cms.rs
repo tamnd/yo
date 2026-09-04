@@ -37,7 +37,7 @@
 
 use yo_common::num::{parse_f64, parse_i64};
 use yo_common::{Code, Error, Result};
-use yo_kv::{Db, Foreign};
+use yo_kv::{Db, Foreign, Keyspace};
 use yo_sketch::cms::{Cms, dims_from};
 
 use super::args::{self, Args};
@@ -124,7 +124,7 @@ impl Foreign for CmsBody {
 /// the file, and both of them find the stripe the key they were given is on.
 /// That is what `CMS.MERGE` needs, since it reads a run of sources and writes a
 /// destination and the sources can be anywhere.
-pub(super) fn execute(db: &mut Db, spec: &Spec, args: Args<'_>, out: &mut Out) -> Result<()> {
+pub(super) fn execute(db: &Db, spec: &Spec, args: Args<'_>, out: &mut Out) -> Result<()> {
     match spec.name {
         "cms.initbydim" => initbydim(db, args, out),
         "cms.initbyprob" => initbyprob(db, args, out),
@@ -138,9 +138,9 @@ pub(super) fn execute(db: &mut Db, spec: &Spec, args: Args<'_>, out: &mut Out) -
 
 /// `CMS.INITBYDIM key width depth`, which is the sketch stated rather than
 /// derived.
-fn initbydim(db: &mut Db, args: Args<'_>, out: &mut Out) -> Result<()> {
+fn initbydim(db: &Db, args: Args<'_>, out: &mut Out) -> Result<()> {
     let key = args.get(1);
-    if db.at(key).kind_of(key).is_some() {
+    if db.hold(key).kind_of(key).is_some() {
         out.error(EXISTS);
         return Ok(());
     }
@@ -159,9 +159,9 @@ fn initbydim(db: &mut Db, args: Args<'_>, out: &mut Out) -> Result<()> {
 /// `CMS.INITBYPROB key error probability`, which is the sketch asked for in the
 /// terms the client actually has: how far off the count is allowed to be and how
 /// often it is allowed to be that far off.
-fn initbyprob(db: &mut Db, args: Args<'_>, out: &mut Out) -> Result<()> {
+fn initbyprob(db: &Db, args: Args<'_>, out: &mut Out) -> Result<()> {
     let key = args.get(1);
-    if db.at(key).kind_of(key).is_some() {
+    if db.hold(key).kind_of(key).is_some() {
         out.error(EXISTS);
         return Ok(());
     }
@@ -182,12 +182,12 @@ fn initbyprob(db: &mut Db, args: Args<'_>, out: &mut Out) -> Result<()> {
 }
 
 /// Make the sketch both constructors ended up asking for, or say why not.
-fn build(db: &mut Db, key: &[u8], width: u64, depth: u64, out: &mut Out) {
+fn build(db: &Db, key: &[u8], width: u64, depth: u64, out: &mut Out) {
     let Some(c) = Cms::new(width, depth) else {
         out.error(NO_MEMORY);
         return;
     };
-    db.at(key).put_foreign(key, Box::new(CmsBody { c }));
+    db.hold(key).put_foreign(key, Box::new(CmsBody { c }));
     out.ok();
 }
 
@@ -197,11 +197,12 @@ fn build(db: &mut Db, key: &[u8], width: u64, depth: u64, out: &mut Out) {
 /// number in the middle of it changes nothing at all. Once they are all good the
 /// pairs go in left to right, which means a repeated item sees its own earlier
 /// increment: `a 5 a 5` answers five and then ten.
-fn incrby(db: &mut Db, args: Args<'_>, out: &mut Out) -> Result<()> {
+fn incrby(db: &Db, args: Args<'_>, out: &mut Out) -> Result<()> {
     if !args.len().is_multiple_of(2) {
         return Err(args::wrong_arity("cms.incrby"));
     }
-    let body = match write(db, args.get(1))? {
+    let mut stripe = db.hold(args.get(1));
+    let body = match write(&mut stripe, args.get(1))? {
         Some(body) => body,
         None => {
             out.error(MISSING);
@@ -239,8 +240,9 @@ fn incrby(db: &mut Db, args: Args<'_>, out: &mut Out) -> Result<()> {
 
 /// `CMS.QUERY key item [item ...]`, which is a count per item and never an
 /// error inside the array.
-fn query(db: &mut Db, args: Args<'_>, out: &mut Out) -> Result<()> {
-    let Some(body) = read(db, args.get(1))? else {
+fn query(db: &Db, args: Args<'_>, out: &mut Out) -> Result<()> {
+    let mut stripe = db.hold(args.get(1));
+    let Some(body) = read(&mut stripe, args.get(1))? else {
         out.error(MISSING);
         return Ok(());
     };
@@ -258,13 +260,17 @@ fn query(db: &mut Db, args: Args<'_>, out: &mut Out) -> Result<()> {
 /// client that means `d += s` has to send. Every source has to be exactly the
 /// destination's shape, since a merge is counter by counter and two sketches of
 /// different widths do not have the same counters.
-fn merge(db: &mut Db, args: Args<'_>, out: &mut Out) -> Result<()> {
+fn merge(db: &Db, args: Args<'_>, out: &mut Out) -> Result<()> {
     let dest = args.get(1);
-    let Some(body) = read(db, dest)? else {
-        out.error(MISSING);
-        return Ok(());
+    let shape = {
+        let mut stripe = db.hold(dest);
+        let Some(body) = read(&mut stripe, dest)? else {
+            out.error(MISSING);
+            return Ok(());
+        };
+        (body.c.width(), body.c.depth())
     };
-    let (width, depth) = (body.c.width(), body.c.depth());
+    let (width, depth) = shape;
     let Some(count) = parse_i64(args.get(2)) else {
         out.error(BAD_NUMKEYS);
         return Ok(());
@@ -315,7 +321,9 @@ fn merge(db: &mut Db, args: Args<'_>, out: &mut Out) -> Result<()> {
     // shape, and they are checked in the order they were written, so the first
     // source that is wrong is the one reported.
     for i in 0..count {
-        match read(db, args.get(3 + i))? {
+        let key = args.get(3 + i);
+        let mut stripe = db.hold(key);
+        match read(&mut stripe, key)? {
             None => {
                 out.error(MISSING);
                 return Ok(());
@@ -332,26 +340,33 @@ fn merge(db: &mut Db, args: Args<'_>, out: &mut Out) -> Result<()> {
     // unless all of them fit. That is what makes an overflow leave the
     // destination alone, and it is also what lets the destination be one of its
     // own sources without reading half merged counters.
-    let mut acc = read(db, dest)?
-        .expect("the destination is still there")
-        .c
-        .merge_start();
+    let mut acc = {
+        let mut stripe = db.hold(dest);
+        read(&mut stripe, dest)?
+            .expect("the destination is still there")
+            .c
+            .merge_start()
+    };
     for i in 0..count {
-        let src = read(db, args.get(3 + i))?.expect("checked in the first pass");
+        let key = args.get(3 + i);
+        let mut stripe = db.hold(key);
+        let src = read(&mut stripe, key)?.expect("checked in the first pass");
         if !src.c.merge_add(&mut acc, weight_at(i)) {
             out.error(MERGE_OVERFLOW);
             return Ok(());
         }
     }
-    let body = write(db, dest)?.expect("the destination is still there");
+    let mut stripe = db.hold(dest);
+    let body = write(&mut stripe, dest)?.expect("the destination is still there");
     body.c.merge_finish(acc);
     out.ok();
     Ok(())
 }
 
 /// `CMS.INFO key`, which is the shape and the running total and takes no field.
-fn info(db: &mut Db, args: Args<'_>, out: &mut Out) -> Result<()> {
-    let Some(body) = read(db, args.get(1))? else {
+fn info(db: &Db, args: Args<'_>, out: &mut Out) -> Result<()> {
+    let mut stripe = db.hold(args.get(1));
+    let Some(body) = read(&mut stripe, args.get(1))? else {
         out.error(MISSING);
         return Ok(());
     };
@@ -379,8 +394,8 @@ fn fraction(arg: &[u8]) -> Option<f64> {
 }
 
 /// The sketch under `key` for writing, or `None` if the key is not there.
-fn write<'d>(db: &'d mut Db, key: &[u8]) -> Result<Option<&'d mut CmsBody>> {
-    match db.at(key).foreign_mut(key)? {
+fn write<'k>(stripe: &'k mut Keyspace, key: &[u8]) -> Result<Option<&'k mut CmsBody>> {
+    match stripe.foreign_mut(key)? {
         Some(body) => match body.downcast_mut::<CmsBody>() {
             Some(body) => Ok(Some(body)),
             None => Err(Error::new(Code::WrongType, WRONG_KIND)),
@@ -390,8 +405,8 @@ fn write<'d>(db: &'d mut Db, key: &[u8]) -> Result<Option<&'d mut CmsBody>> {
 }
 
 /// The same, for reading.
-fn read<'d>(db: &'d mut Db, key: &[u8]) -> Result<Option<&'d CmsBody>> {
-    match db.at(key).foreign(key)? {
+fn read<'k>(stripe: &'k mut Keyspace, key: &[u8]) -> Result<Option<&'k CmsBody>> {
+    match stripe.foreign(key)? {
         Some(body) => match body.downcast_ref::<CmsBody>() {
             Some(body) => Ok(Some(body)),
             None => Err(Error::new(Code::WrongType, WRONG_KIND)),
