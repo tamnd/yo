@@ -91,8 +91,12 @@ pub enum Order {
 /// command and none of them means anything without the others. Keeping them in
 /// a struct is also what stops the call from being eight positional arguments
 /// where three of them are ends and flags that read the same at the call site.
+///
+/// Named after the command rather than called `Block`, which is what it holds,
+/// because `BLMOVEM` puts one of these inside the structure the blocking layer
+/// already calls a block and one of those two names had to go.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Block {
+pub struct Movem {
     /// The end of the source to take from.
     pub from: End,
     /// The end of the destination to put on.
@@ -493,7 +497,7 @@ impl Keyspace {
     /// back is how many that was, and zero means the reply is a nil rather than
     /// an empty array.
     ///
-    /// [`Block::exactly`] is the `EXACTLY` spelling against the `COUNT` one: all
+    /// [`Movem::exactly`] is the `EXACTLY` spelling against the `COUNT` one: all
     /// of them or none of them, so a source shorter than the count moves nothing
     /// and answers zero. That is the whole difference and it is checked before
     /// anything is taken, which is the only way to make it true.
@@ -512,7 +516,7 @@ impl Keyspace {
     /// than a `Vec` per element. Both are taken out of the database for the
     /// duration, because the bytes have to be in hand while `push` has
     /// `&mut self`.
-    pub fn lmovem<F>(&mut self, src: &[u8], dst: &[u8], b: Block, mut f: F) -> Result<usize>
+    pub fn lmovem<F>(&mut self, src: &[u8], dst: &[u8], b: Movem, mut f: F) -> Result<usize>
     where
         F: FnMut(&[u8]),
     {
@@ -886,7 +890,7 @@ mod tests {
             let mut d = db();
             rpush(&mut d, b"s", &[b"a", b"b", b"c", b"d", b"e"]);
             let mut got = Vec::new();
-            let b = Block {
+            let b = Movem {
                 from,
                 to,
                 count: 2,
@@ -908,8 +912,8 @@ mod tests {
 
     /// A block for the tests that are not about ordering, which all want the
     /// same one and only care about the ends and the count.
-    fn block(from: End, to: End, count: usize, exactly: bool) -> Block {
-        Block {
+    fn block(from: End, to: End, count: usize, exactly: bool) -> Movem {
+        Movem {
             from,
             to,
             count,

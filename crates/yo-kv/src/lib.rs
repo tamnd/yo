@@ -187,7 +187,7 @@ pub use keyspace::Keyspace;
 pub use lcs::{Idx as LcsIdx, LCS_MAX_CELLS, Match as LcsMatch};
 pub use list::{Limits as ListLimits, List};
 pub use listpack::{Entry, Listpack, Malformed};
-pub use lists::{Block, End, Order};
+pub use lists::{End, Movem, Order};
 pub use parts::{PART_MIN, PARTITION_AT, Parts};
 pub use rank::Rank;
 pub use scan::{Cursor, MAX_PARTS};

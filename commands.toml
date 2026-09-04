@@ -68,14 +68,13 @@ doc = "08 section 8"
 [[group]]
 name = "list"
 expected = 24
-status = "partial"
-# Twenty two are here and LMOVEM and BLMOVEM, which Redis 8.10 added, are not.
+status = "shipped"
 doc = "08 section 6"
-# All twenty two, the five blocking ones included. What a parked client costs is
+# All twenty four, the six blocking ones included. What a parked client costs is
 # a copy of the keys it named and a walk over the waiter list per command, and
 # the walk is behind a check that anybody is parked at all, so a server with no
 # blocked clients pays a load and a branch. The machinery is not list shaped and
-# the blocking stream and sorted set reads will use the same registry.
+# the blocking stream and sorted set reads use the same registry.
 
 [[group]]
 name = "hash"
@@ -1793,9 +1792,9 @@ since = "8.10.0"
 arity = -6
 plan = "point"
 bounded = "yes"
-status = "planned"
-wire = "none"
-notes = "New in 8.10 and not written yet. LMOVEM with a wait, and it goes in the same waiter machinery the other five blocking list commands use."
+status = "shipped"
+wire = "verified"
+notes = "LMOVEM with a wait, in the same waiter machinery the other five blocking list commands use. The options sit behind the timeout rather than in front of it, so the parse is ends, then timeout, then the block, and a line wrong in two of those says the earliest one. The one thing here that is not shared with the other five is what ready means: they wake on anything arriving, and this wakes on anything for COUNT but only on the whole block for EXACTLY. Until it is ready the destination is never looked at, so a short EXACTLY against a destination holding a string times out rather than answering WRONGTYPE, which is what 8.10.1 does and is the same rule BLMOVE already follows."
 
 # ------------------------------------------------------------------ sorted set
 
