@@ -99,6 +99,33 @@ impl Keyspace {
         Ok(added)
     }
 
+    /// Replace whatever is under `key` with a hash of exactly these pairs.
+    ///
+    /// The write side of `HIMPORT SET`, and the one hash write that is a whole
+    /// value rather than an edit. A field the pairs do not name is gone
+    /// afterwards and so is any deadline the old value carried, because the old
+    /// value is gone rather than having been written over, and that is what a
+    /// real server does with the same command.
+    ///
+    /// The lengths and the type are both checked before anything is deleted, so
+    /// a call that cannot go through leaves the key exactly as it was. A caller
+    /// that has its own complaints to make about the arguments still has to ask
+    /// the type first, since `WRONGTYPE` comes before any of them.
+    pub fn hreplace<'a>(
+        &mut self,
+        key: &[u8],
+        pairs: impl Iterator<Item = (&'a [u8], &'a [u8])> + Clone,
+    ) -> Result<()> {
+        for (f, v) in pairs.clone() {
+            strings::check_len(key, f.len())?;
+            strings::check_len(key, v.len())?;
+        }
+        self.hlen(key)?;
+        self.del(key);
+        self.hset(key, pairs)?;
+        Ok(())
+    }
+
     /// `HSETNX key field value`. Answers whether it was written.
     ///
     /// Unlike `SETNX` this is per field and not per key, so it writes into a

@@ -90,6 +90,10 @@ const AC_HASH_READ_FAST: &[&str] = &["@read", "@hash", "@fast"];
 const AC_HASH_READ_SLOW: &[&str] = &["@read", "@hash", "@slow"];
 /// The hash write side.
 const AC_HASH_WRITE_FAST: &[&str] = &["@write", "@hash", "@fast"];
+/// `HIMPORT`, which is a container and so has no write category of its own. The
+/// write flags and the key live on its `SET` subcommand, which the table does
+/// not carry any more than it carries `OBJECT ENCODING`.
+const AC_HASH_SLOW: &[&str] = &["@hash", "@slow"];
 /// Read only and not counted as fast, which is every list read that walks.
 const READ_SLOW: &[&str] = &["readonly"];
 /// A write that is not counted as fast and does not allocate, which on the list
@@ -1376,6 +1380,22 @@ pub static COMMANDS: &[Spec] = &[
         since: "8.0.0",
         complexity: "O(N) with N the number of fields being set",
         summary: "Set hash fields and their deadlines together.",
+        group: "hash",
+    },
+    // A container with no flags and no keys of its own, which is what a real
+    // 8.10.1 reports: the write flags and the key index live on `HIMPORT SET`
+    // and this row is only the name and the categories.
+    Spec {
+        name: "himport",
+        arity: -2,
+        flags: &[],
+        first_key: 0,
+        last_key: 0,
+        step: 0,
+        acl: AC_HASH_SLOW,
+        since: "8.10.0",
+        complexity: "Depends on subcommand.",
+        summary: "A container for session-based hash import commands using fieldsets.",
         group: "hash",
     },
     // ---------------------------------------------------------------- lists

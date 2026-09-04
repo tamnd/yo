@@ -59,6 +59,7 @@ mod cpu;
 mod geo;
 mod graph;
 mod hashes;
+mod himport;
 mod hll;
 mod json;
 mod keyspace;
@@ -969,6 +970,12 @@ pub struct Session {
     db: usize,
     id: u64,
     name: Vec<u8>,
+    /// The `HIMPORT` fieldsets this connection has prepared.
+    ///
+    /// Connection state and not keyspace state, which is the reference's design
+    /// and not a shortcut: a fieldset is invisible to every other connection and
+    /// the keys built from one outlive it.
+    sets: himport::Fieldsets,
 }
 
 impl Session {
@@ -979,6 +986,7 @@ impl Session {
             db: 0,
             id,
             name: Vec::new(),
+            sets: himport::Fieldsets::default(),
         }
     }
 
@@ -1007,6 +1015,10 @@ impl Session {
     pub fn reset(&mut self) {
         self.db = 0;
         self.name.clear();
+        // `SELECT` leaves these alone and `RESET` does not, both checked
+        // against 8.10.1, which is the one pair of answers you could not guess
+        // from what the command is for.
+        self.sets.clear();
     }
 
     /// Record the name from `HELLO ... SETNAME`.
@@ -1122,6 +1134,15 @@ pub fn resolved(
             "set" => {
                 let db = session.db;
                 sets::execute(&mut server.dbs[db], spec, args, out).map(|()| Flow::Continue)
+            }
+            // The one hash command whose state is not in the keyspace. A
+            // fieldset belongs to the connection, so this is handed the session
+            // as well as the database, the same exception `MIGRATE` gets in the
+            // keyspace group for the socket it keeps.
+            "hash" if spec.name == "himport" => {
+                let db = session.db;
+                himport::execute(&mut server.dbs[db], &mut session.sets, args, out)
+                    .map(|()| Flow::Continue)
             }
             "hash" => {
                 let db = session.db;
@@ -5066,6 +5087,177 @@ mod tests {
             assert_eq!(f.run(cmd), wrong, "{:?}", cmd[0]);
         }
         assert_eq!(f.run(&[b"GET", b"str"]), "$1\r\nv\r\n");
+    }
+
+    /// The two orders `HIMPORT` juggles, which are not the same order.
+    ///
+    /// Values arrive in the order the fields were declared in and the hash is
+    /// built in sorted order, so the first value is not generally the first
+    /// field. And the sort is by length before bytes, which nothing else here
+    /// sorts names with: `b` comes before `aa` where a plain byte comparison
+    /// would put `aa` first. Both read off 8.10.1.
+    #[test]
+    fn himport_writes_declared_values_into_sorted_fields() {
+        let mut f = Fixture::new();
+        assert_eq!(
+            f.run(&[b"HIMPORT", b"PREPARE", b"shape", b"b", b"aa", b"a"]),
+            "+OK\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"HIMPORT", b"SET", b"k", b"shape", b"1", b"2", b"3"]),
+            "+OK\r\n"
+        );
+        assert_eq!(f.run(&[b"HKEYS", b"k"]), bulks(&["a", "b", "aa"]));
+        assert_eq!(
+            f.run(&[b"HGETALL", b"k"]),
+            bulks(&["a", "3", "b", "1", "aa", "2"])
+        );
+    }
+
+    /// It replaces the key rather than writing over it, so a field the fieldset
+    /// does not name is gone afterwards and so is the deadline.
+    #[test]
+    fn himport_set_replaces_the_whole_key() {
+        let mut f = Fixture::new();
+        f.run(&[b"HSET", b"k", b"gone", b"old", b"a", b"old"]);
+        f.run(&[b"EXPIRE", b"k", b"100"]);
+        f.run(&[b"HIMPORT", b"PREPARE", b"shape", b"a", b"b"]);
+        assert_eq!(
+            f.run(&[b"HIMPORT", b"SET", b"k", b"shape", b"1", b"2"]),
+            "+OK\r\n"
+        );
+        assert_eq!(f.run(&[b"HGETALL", b"k"]), bulks(&["a", "1", "b", "2"]));
+        assert_eq!(f.run(&[b"TTL", b"k"]), ":-1\r\n");
+    }
+
+    /// A fieldset is connection state. `SELECT` leaves them alone and `RESET`
+    /// throws them away, and a key built from one outlives it.
+    #[test]
+    fn himport_fieldsets_belong_to_the_connection_and_not_to_the_keyspace() {
+        let mut f = Fixture::new();
+        f.run(&[b"HIMPORT", b"PREPARE", b"shape", b"a"]);
+        f.run(&[b"SELECT", b"1"]);
+        assert_eq!(
+            f.run(&[b"HIMPORT", b"SET", b"k", b"shape", b"1"]),
+            "+OK\r\n"
+        );
+        f.run(&[b"SELECT", b"0"]);
+        assert_eq!(f.run(&[b"RESET"]), "+RESET\r\n");
+        assert_eq!(
+            f.run(&[b"HIMPORT", b"SET", b"k2", b"shape", b"1"]),
+            "-ERR no such fieldset\r\n"
+        );
+    }
+
+    /// Which complaint wins when a line is wrong in more than one place.
+    ///
+    /// The type of the key beats both of the others, so a `HIMPORT SET` against
+    /// a string is a WRONGTYPE even when the fieldset is missing too, which is
+    /// the ordering a real server has and not the one the argument order
+    /// suggests.
+    #[test]
+    fn himport_complains_in_the_order_a_real_server_does() {
+        let mut f = Fixture::new();
+        f.run(&[b"SET", b"str", b"v"]);
+        f.run(&[b"HIMPORT", b"PREPARE", b"shape", b"a", b"b"]);
+        let wrong = "-WRONGTYPE Operation against a key holding the wrong kind of value\r\n";
+        assert_eq!(
+            f.run(&[b"HIMPORT", b"SET", b"str", b"nope", b"1"]),
+            wrong,
+            "the type beats a missing fieldset"
+        );
+        assert_eq!(
+            f.run(&[b"HIMPORT", b"SET", b"str", b"shape", b"1"]),
+            wrong,
+            "and it beats a value count that does not fit"
+        );
+        assert_eq!(
+            f.run(&[b"HIMPORT", b"SET", b"k", b"nope", b"1"]),
+            "-ERR no such fieldset\r\n"
+        );
+        // One sentence for too few and for too many alike.
+        for values in [&[b"1".as_slice()][..], &[b"1".as_slice(), b"2", b"3"][..]] {
+            let mut line: Vec<&[u8]> = vec![b"HIMPORT", b"SET", b"k", b"shape"];
+            line.extend_from_slice(values);
+            assert_eq!(
+                f.run(&line),
+                "-ERR value count does not match fieldset field count\r\n",
+                "{} values into two fields",
+                values.len()
+            );
+        }
+        assert_eq!(f.run(&[b"EXISTS", b"k"]), ":0\r\n");
+    }
+
+    /// The arity of each subcommand, and the unknown one.
+    #[test]
+    fn himport_checks_each_subcommand_count_under_its_own_name() {
+        let mut f = Fixture::new();
+        assert_eq!(
+            f.run(&[b"HIMPORT"]),
+            "-ERR wrong number of arguments for 'himport' command\r\n"
+        );
+        for (rest, name) in [
+            (&["PREPARE"][..], "prepare"),
+            (&["PREPARE", "fs"][..], "prepare"),
+            (&["SET"][..], "set"),
+            (&["SET", "k"][..], "set"),
+            (&["SET", "k", "fs"][..], "set"),
+            (&["DISCARD"][..], "discard"),
+            (&["DISCARD", "a", "b"][..], "discard"),
+            (&["DISCARDALL", "x"][..], "discardall"),
+        ] {
+            let mut line: Vec<&[u8]> = vec![b"HIMPORT"];
+            line.extend(rest.iter().map(|a| a.as_bytes()));
+            assert_eq!(
+                f.run(&line),
+                format!("-ERR wrong number of arguments for 'himport|{name}' command\r\n"),
+                "HIMPORT {}",
+                rest.join(" ")
+            );
+        }
+        assert_eq!(
+            f.run(&[b"HIMPORT", b"NOPE", b"x"]),
+            "-ERR unknown subcommand 'NOPE'. Try HIMPORT HELP.\r\n"
+        );
+    }
+
+    /// A `PREPARE` that fails leaves the name pointing where it pointed, which
+    /// is the answer of the two that could not be guessed from outside.
+    #[test]
+    fn a_failed_himport_prepare_leaves_the_old_fieldset_alone() {
+        let mut f = Fixture::new();
+        f.run(&[b"HIMPORT", b"PREPARE", b"shape", b"a", b"b"]);
+        assert_eq!(
+            f.run(&[b"HIMPORT", b"PREPARE", b"shape", b"c", b"c"]),
+            "-ERR duplicate field name in fieldset\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"HIMPORT", b"SET", b"k", b"shape", b"1", b"2"]),
+            "+OK\r\n"
+        );
+        assert_eq!(f.run(&[b"HGETALL", b"k"]), bulks(&["a", "1", "b", "2"]));
+    }
+
+    /// Preparing the same name twice replaces it, and the two discards count
+    /// what they took rather than answering OK.
+    #[test]
+    fn himport_prepare_replaces_and_the_discards_count() {
+        let mut f = Fixture::new();
+        f.run(&[b"HIMPORT", b"PREPARE", b"shape", b"a", b"b"]);
+        f.run(&[b"HIMPORT", b"PREPARE", b"shape", b"z"]);
+        assert_eq!(
+            f.run(&[b"HIMPORT", b"SET", b"k", b"shape", b"1"]),
+            "+OK\r\n"
+        );
+        assert_eq!(f.run(&[b"HGETALL", b"k"]), bulks(&["z", "1"]));
+
+        assert_eq!(f.run(&[b"HIMPORT", b"DISCARD", b"shape"]), ":1\r\n");
+        assert_eq!(f.run(&[b"HIMPORT", b"DISCARD", b"shape"]), ":0\r\n");
+        f.run(&[b"HIMPORT", b"PREPARE", b"one", b"a"]);
+        f.run(&[b"HIMPORT", b"PREPARE", b"two", b"a"]);
+        assert_eq!(f.run(&[b"HIMPORT", b"DISCARDALL"]), ":2\r\n");
+        assert_eq!(f.run(&[b"HIMPORT", b"DISCARDALL"]), ":0\r\n");
     }
 
     /// The one integer of a single element array reply.
