@@ -14654,6 +14654,533 @@ mod tests {
         );
     }
 
+    /// Reading a span back, both ways round, with the two ends and the three
+    /// things that trim what comes out.
+    #[test]
+    fn a_range_walks_a_span_and_a_revrange_walks_it_backwards() {
+        let mut f = Fixture::new();
+        for (at, v) in [
+            (b"100".as_slice(), b"1".as_slice()),
+            (b"200", b"2"),
+            (b"300", b"3"),
+            (b"400", b"4"),
+        ] {
+            f.run(&[b"TS.ADD", b"t", at, v]);
+        }
+        assert_eq!(
+            f.run(&[b"TS.RANGE", b"t", b"-", b"+"]),
+            "*4\r\n*2\r\n:100\r\n+1\r\n*2\r\n:200\r\n+2\r\n\
+             *2\r\n:300\r\n+3\r\n*2\r\n:400\r\n+4\r\n"
+        );
+        // Both ends are included.
+        assert_eq!(
+            f.run(&[b"TS.RANGE", b"t", b"150", b"350"]),
+            "*2\r\n*2\r\n:200\r\n+2\r\n*2\r\n:300\r\n+3\r\n"
+        );
+        // Backwards, and the count takes from the front of what comes out, so
+        // backwards it takes the newest.
+        assert_eq!(
+            f.run(&[b"TS.REVRANGE", b"t", b"-", b"+", b"COUNT", b"2"]),
+            "*2\r\n*2\r\n:400\r\n+4\r\n*2\r\n:300\r\n+3\r\n"
+        );
+        // Ends the wrong way round are empty rather than an error.
+        assert_eq!(f.run(&[b"TS.RANGE", b"t", b"400", b"100"]), "*0\r\n");
+        // The two filters.
+        assert_eq!(
+            f.run(&[
+                b"TS.RANGE",
+                b"t",
+                b"-",
+                b"+",
+                b"FILTER_BY_VALUE",
+                b"2",
+                b"3"
+            ]),
+            "*2\r\n*2\r\n:200\r\n+2\r\n*2\r\n:300\r\n+3\r\n"
+        );
+        assert_eq!(
+            f.run(&[
+                b"TS.RANGE",
+                b"t",
+                b"-",
+                b"+",
+                b"FILTER_BY_TS",
+                b"100",
+                b"400"
+            ]),
+            "*2\r\n*2\r\n:100\r\n+1\r\n*2\r\n:400\r\n+4\r\n"
+        );
+        // A word that is not an option is ignored wherever it sits.
+        assert_eq!(
+            f.run(&[
+                b"TS.RANGE",
+                b"t",
+                b"-",
+                b"+",
+                b"ZZZ",
+                b"FILTER_BY_TS",
+                b"400"
+            ]),
+            "*1\r\n*2\r\n:400\r\n+4\r\n"
+        );
+        // `LATEST` means nothing until there is a compaction rule to follow.
+        assert_eq!(
+            f.run(&[b"TS.RANGE", b"t", b"-", b"+", b"LATEST", b"COUNT", b"1"]),
+            "*1\r\n*2\r\n:100\r\n+1\r\n"
+        );
+    }
+
+    /// The bucketing, which is one column a reduction and a flat row.
+    #[test]
+    fn aggregation_puts_one_column_a_reduction_in_a_flat_row() {
+        let mut f = Fixture::new();
+        for (at, v) in [
+            (b"100".as_slice(), b"1".as_slice()),
+            (b"200", b"2"),
+            (b"300", b"3"),
+            (b"400", b"4"),
+        ] {
+            f.run(&[b"TS.ADD", b"t", at, v]);
+        }
+        assert_eq!(
+            f.run(&[
+                b"TS.RANGE",
+                b"t",
+                b"-",
+                b"+",
+                b"AGGREGATION",
+                b"avg",
+                b"200"
+            ]),
+            "*3\r\n*2\r\n:0\r\n+1\r\n*2\r\n:200\r\n+2.5\r\n*2\r\n:400\r\n+4\r\n"
+        );
+        // Three reductions is a row of four and not a row of two with a nested
+        // three in it.
+        assert_eq!(
+            f.run(&[
+                b"TS.RANGE",
+                b"t",
+                b"-",
+                b"+",
+                b"AGGREGATION",
+                b"min,max,count",
+                b"200"
+            ]),
+            "*3\r\n\
+             *4\r\n:0\r\n+1\r\n+1\r\n+1\r\n\
+             *4\r\n:200\r\n+2\r\n+3\r\n+2\r\n\
+             *4\r\n:400\r\n+4\r\n+4\r\n+1\r\n"
+        );
+        // The timestamp a bucket is reported under.
+        assert_eq!(
+            f.run(&[
+                b"TS.RANGE",
+                b"t",
+                b"-",
+                b"+",
+                b"AGGREGATION",
+                b"avg",
+                b"200",
+                b"BUCKETTIMESTAMP",
+                b"+"
+            ]),
+            "*3\r\n*2\r\n:200\r\n+1\r\n*2\r\n:400\r\n+2.5\r\n*2\r\n:600\r\n+4\r\n"
+        );
+        // An alignment moves where the bucket edges land.
+        assert_eq!(
+            f.run(&[
+                b"TS.RANGE",
+                b"t",
+                b"100",
+                b"400",
+                b"ALIGN",
+                b"100",
+                b"AGGREGATION",
+                b"sum",
+                b"200"
+            ]),
+            "*2\r\n*2\r\n:100\r\n+3\r\n*2\r\n:300\r\n+7\r\n"
+        );
+        // A `COUNT` sitting where the reduction name belongs is that name, and
+        // the scan for a real one starts again two words later.
+        assert_eq!(
+            f.run(&[
+                b"TS.RANGE",
+                b"t",
+                b"-",
+                b"+",
+                b"AGGREGATION",
+                b"count",
+                b"200"
+            ]),
+            "*3\r\n*2\r\n:0\r\n+1\r\n*2\r\n:200\r\n+2\r\n*2\r\n:400\r\n+1\r\n"
+        );
+        assert_eq!(
+            f.run(&[
+                b"TS.RANGE",
+                b"t",
+                b"-",
+                b"+",
+                b"AGGREGATION",
+                b"count",
+                b"200",
+                b"COUNT",
+                b"1"
+            ]),
+            "*1\r\n*2\r\n:0\r\n+1\r\n"
+        );
+    }
+
+    /// `EMPTY` fills the gaps between readings and nothing else, and `last`
+    /// carries two different things depending on which kind of empty it is.
+    #[test]
+    fn empty_fills_a_gap_and_last_carries_the_reading_before_it() {
+        let mut f = Fixture::new();
+        for (at, v) in [
+            (b"0".as_slice(), b"1".as_slice()),
+            (b"100", b"2"),
+            (b"500", b"nan"),
+            (b"600", b"3"),
+        ] {
+            f.run(&[b"TS.ADD", b"g", at, v]);
+        }
+        // Without `EMPTY` the buckets with nothing in them are not there at all,
+        // and neither is the one holding only a reading that is not a number.
+        assert_eq!(
+            f.run(&[
+                b"TS.RANGE",
+                b"g",
+                b"-",
+                b"+",
+                b"AGGREGATION",
+                b"avg",
+                b"100"
+            ]),
+            "*3\r\n*2\r\n:0\r\n+1\r\n*2\r\n:100\r\n+2\r\n*2\r\n:600\r\n+3\r\n"
+        );
+        // The sum of nothing is zero rather than not a number.
+        assert_eq!(
+            f.run(&[
+                b"TS.RANGE",
+                b"g",
+                b"-",
+                b"+",
+                b"AGGREGATION",
+                b"sum",
+                b"100",
+                b"EMPTY"
+            ]),
+            "*7\r\n*2\r\n:0\r\n+1\r\n*2\r\n:100\r\n+2\r\n*2\r\n:200\r\n+0\r\n\
+             *2\r\n:300\r\n+0\r\n*2\r\n:400\r\n+0\r\n*2\r\n:500\r\n+0\r\n\
+             *2\r\n:600\r\n+3\r\n"
+        );
+        // Buckets 200 through 400 have no readings at all and carry the reading
+        // before the gap either way round. Bucket 500 has a reading that is not
+        // a number, so it carries whatever the bucket before it in the reading
+        // direction answered, which is 2 forwards and 3 backwards.
+        assert_eq!(
+            f.run(&[
+                b"TS.RANGE",
+                b"g",
+                b"-",
+                b"+",
+                b"AGGREGATION",
+                b"last",
+                b"100",
+                b"EMPTY"
+            ]),
+            "*7\r\n*2\r\n:0\r\n+1\r\n*2\r\n:100\r\n+2\r\n*2\r\n:200\r\n+2\r\n\
+             *2\r\n:300\r\n+2\r\n*2\r\n:400\r\n+2\r\n*2\r\n:500\r\n+2\r\n\
+             *2\r\n:600\r\n+3\r\n"
+        );
+        assert_eq!(
+            f.run(&[
+                b"TS.REVRANGE",
+                b"g",
+                b"-",
+                b"+",
+                b"AGGREGATION",
+                b"last",
+                b"100",
+                b"EMPTY"
+            ]),
+            "*7\r\n*2\r\n:600\r\n+3\r\n*2\r\n:500\r\n+3\r\n*2\r\n:400\r\n+2\r\n\
+             *2\r\n:300\r\n+2\r\n*2\r\n:200\r\n+2\r\n*2\r\n:100\r\n+2\r\n\
+             *2\r\n:0\r\n+1\r\n"
+        );
+        // And a window that opens on that bucket has nothing in range before it
+        // to carry, so it answers not a number.
+        assert_eq!(
+            f.run(&[
+                b"TS.RANGE",
+                b"g",
+                b"500",
+                b"600",
+                b"AGGREGATION",
+                b"last",
+                b"100",
+                b"EMPTY"
+            ]),
+            "*2\r\n*2\r\n:500\r\n+NaN\r\n*2\r\n:600\r\n+3\r\n"
+        );
+    }
+
+    /// The sentences a read answers when its options do not add up, which are
+    /// the module's own word for word.
+    #[test]
+    fn a_range_says_what_the_module_says_when_the_options_do_not_add_up() {
+        let mut f = Fixture::new();
+        f.run(&[b"TS.ADD", b"t", b"100", b"1"]);
+        f.run(&[b"SET", b"str", b"x"]);
+        let cases: &[(&[&[u8]], &str)] = &[
+            (
+                &[b"TS.RANGE", b"t"],
+                "-ERR wrong number of arguments for 'ts.range' command\r\n",
+            ),
+            // The key is resolved before a single option is read.
+            (
+                &[b"TS.RANGE", b"gone", b"-", b"+", b"COUNT", b"x"],
+                "-ERR TSDB: the key does not exist\r\n",
+            ),
+            (
+                &[b"TS.RANGE", b"str", b"-", b"+"],
+                "-ERR WRONGTYPE Operation against a key holding the wrong kind of value\r\n",
+            ),
+            (
+                &[b"TS.RANGE", b"t", b"abc", b"+"],
+                "-ERR TSDB: wrong fromTimestamp\r\n",
+            ),
+            (
+                &[b"TS.RANGE", b"t", b"-", b"abc"],
+                "-ERR TSDB: wrong toTimestamp\r\n",
+            ),
+            (
+                &[b"TS.RANGE", b"t", b"-", b"+", b"COUNT"],
+                "-ERR TSDB: COUNT argument is missing\r\n",
+            ),
+            (
+                &[b"TS.RANGE", b"t", b"-", b"+", b"COUNT", b"x"],
+                "-ERR TSDB: Couldn't parse COUNT\r\n",
+            ),
+            (
+                &[b"TS.RANGE", b"t", b"-", b"+", b"COUNT", b"0"],
+                "-ERR TSDB: Invalid COUNT value\r\n",
+            ),
+            (
+                &[b"TS.RANGE", b"t", b"-", b"+", b"AGGREGATION", b"avg"],
+                "-ERR TSDB: Couldn't parse AGGREGATION\r\n",
+            ),
+            (
+                &[b"TS.RANGE", b"t", b"-", b"+", b"AGGREGATION", b"avg", b"x"],
+                "-ERR TSDB: Couldn't parse AGGREGATION\r\n",
+            ),
+            (
+                &[
+                    b"TS.RANGE",
+                    b"t",
+                    b"-",
+                    b"+",
+                    b"AGGREGATION",
+                    b"nope",
+                    b"100",
+                ],
+                "-ERR TSDB: Unknown aggregation type\r\n",
+            ),
+            (
+                &[
+                    b"TS.RANGE",
+                    b"t",
+                    b"-",
+                    b"+",
+                    b"AGGREGATION",
+                    b"avg,,min",
+                    b"100",
+                ],
+                "-ERR TSDB: Empty aggregation type in list\r\n",
+            ),
+            // The list of names is read before the width is looked at.
+            (
+                &[b"TS.RANGE", b"t", b"-", b"+", b"AGGREGATION", b"nope", b"0"],
+                "-ERR TSDB: Unknown aggregation type\r\n",
+            ),
+            (
+                &[b"TS.RANGE", b"t", b"-", b"+", b"AGGREGATION", b"avg", b"0"],
+                "-ERR TSDB: bucketDuration must be greater than zero\r\n",
+            ),
+            (
+                &[
+                    b"TS.RANGE",
+                    b"t",
+                    b"-",
+                    b"+",
+                    b"AGGREGATION",
+                    b"avg",
+                    b"100",
+                    b"X",
+                    b"EMPTY",
+                ],
+                "-ERR TSDB: EMPTY flag should be the 3rd or 5th flag after AGGREGATION flag\r\n",
+            ),
+            (
+                &[
+                    b"TS.RANGE",
+                    b"t",
+                    b"-",
+                    b"+",
+                    b"AGGREGATION",
+                    b"avg",
+                    b"100",
+                    b"BUCKETTIMESTAMP",
+                    b"z",
+                ],
+                "-ERR TSDB: unknown BUCKETTIMESTAMP parameter\r\n",
+            ),
+            (
+                &[
+                    b"TS.RANGE",
+                    b"t",
+                    b"-",
+                    b"+",
+                    b"AGGREGATION",
+                    b"avg",
+                    b"100",
+                    b"X",
+                    b"Y",
+                    b"BUCKETTIMESTAMP",
+                    b"-",
+                ],
+                "-ERR TSDB: BUCKETTIMESTAMP flag should be the 3rd or 4th flag after \
+                 AGGREGATION flag\r\n",
+            ),
+            (
+                &[
+                    b"TS.RANGE",
+                    b"t",
+                    b"-",
+                    b"+",
+                    b"ALIGN",
+                    b"z",
+                    b"AGGREGATION",
+                    b"avg",
+                    b"100",
+                ],
+                "-ERR TSDB: unknown ALIGN parameter\r\n",
+            ),
+            (
+                &[b"TS.RANGE", b"t", b"-", b"+", b"ALIGN", b"5"],
+                "-ERR TSDB: ALIGN parameter can only be used with AGGREGATION\r\n",
+            ),
+            (
+                &[
+                    b"TS.RANGE",
+                    b"t",
+                    b"-",
+                    b"+",
+                    b"ALIGN",
+                    b"-",
+                    b"AGGREGATION",
+                    b"avg",
+                    b"100",
+                ],
+                "-ERR TSDB: start alignment can only be used with explicit start timestamp\r\n",
+            ),
+            (
+                &[b"TS.RANGE", b"t", b"-", b"+", b"FILTER_BY_VALUE", b"1"],
+                "-ERR TSDB: FILTER_BY_VALUE one or more arguments are missing\r\n",
+            ),
+            (
+                &[
+                    b"TS.RANGE",
+                    b"t",
+                    b"-",
+                    b"+",
+                    b"FILTER_BY_VALUE",
+                    b"x",
+                    b"2",
+                ],
+                "-ERR TSDB: Couldn't parse MIN\r\n",
+            ),
+            (
+                &[
+                    b"TS.RANGE",
+                    b"t",
+                    b"-",
+                    b"+",
+                    b"FILTER_BY_VALUE",
+                    b"1",
+                    b"y",
+                ],
+                "-ERR TSDB: Couldn't parse MAX\r\n",
+            ),
+            (
+                &[b"TS.RANGE", b"t", b"-", b"+", b"FILTER_BY_TS"],
+                "-ERR TSDB: FILTER_BY_TS one or more arguments are missing\r\n",
+            ),
+        ];
+        for (argv, want) in cases {
+            let got = f.run(argv);
+            assert_eq!(&got, want, "{:?}", argv.last());
+        }
+        // The one sentence here that is yo's own rather than the module's, which
+        // is D-54. A read that would build more rows than yo will build is
+        // refused instead of attempted.
+        f.run(&[b"TS.ADD", b"wide", b"0", b"1"]);
+        f.run(&[b"TS.ADD", b"wide", b"1000000000000", b"2"]);
+        assert_eq!(
+            f.run(&[
+                b"TS.RANGE",
+                b"wide",
+                b"-",
+                b"+",
+                b"AGGREGATION",
+                b"avg",
+                b"1",
+                b"EMPTY"
+            ]),
+            "-ERR TSDB: the requested range holds too many empty buckets\r\n"
+        );
+    }
+
+    /// What RESP3 changes on a read, which is only how a number is written.
+    #[test]
+    fn resp3_writes_a_read_value_as_a_double() {
+        let mut f = Fixture::new();
+        f.out = Out::new(Proto::Resp3);
+        for (at, v) in [
+            (b"0".as_slice(), b"1".as_slice()),
+            (b"100", b"2"),
+            (b"500", b"nan"),
+            (b"600", b"3"),
+        ] {
+            f.run(&[b"TS.ADD", b"g", at, v]);
+        }
+        assert_eq!(
+            f.run(&[
+                b"TS.RANGE",
+                b"g",
+                b"0",
+                b"100",
+                b"AGGREGATION",
+                b"avg,min",
+                b"200"
+            ]),
+            "*1\r\n*3\r\n:0\r\n,1.5\r\n,1\r\n"
+        );
+        assert_eq!(
+            f.run(&[
+                b"TS.RANGE",
+                b"g",
+                b"500",
+                b"600",
+                b"AGGREGATION",
+                b"last",
+                b"100",
+                b"EMPTY"
+            ]),
+            "*2\r\n*2\r\n:500\r\n,nan\r\n*2\r\n:600\r\n,3\r\n"
+        );
+    }
+
     /// The three shapes an `XADD` id can take, and the one rule behind all of
     /// them.
     #[test]

@@ -230,10 +230,11 @@ name = "ts"
 expected = 21
 status = "partial"
 doc = "11 section 9"
-# Twenty one commands, and the nine here are the key type and everything that
-# writes a sample into one or reports on it. Reading a span with the aggregation
-# grammar, the label index the five multi key commands search, compaction rules
-# and the three commands 8.10 added all come next. Samples are squeezed with
+# Twenty one commands, and the eleven here are the key type, everything that
+# writes a sample into one or reports on it, and the two that read a span back
+# with the aggregation grammar. The label index the five multi key commands
+# search, compaction rules and the three commands 8.10 added all come next.
+# Samples are squeezed with
 # Gorilla, which is what the module does too, so a series read at a steady rate
 # costs a couple of bits a sample rather than sixteen bytes. Every error sentence
 # and both of the two the module writes with no ERR in front of them are copied
@@ -3638,6 +3639,30 @@ status = "shipped"
 wire = "verified"
 divergent = "D-53"
 notes = "Fourteen fields, so twenty eight elements on RESP2 and a map of fourteen on RESP3. The chunk type and the duplicate policy are simple strings and never a nil, so a series that was never told what to do about a repeated timestamp reports block. The source key and the rules wait on compaction rules and are a nil and an empty map until those land. Memory usage is ours and not the reference's, which is D-53. The value half of the ignore window goes out as a bulk string on RESP2 where a sample value in TS.GET is a simple one, which is the module's inconsistency and is copied."
+
+[[command]]
+name = "TS.RANGE"
+group = "ts"
+since = "1.0.0"
+arity = -4
+plan = "cursor"
+bounded = "yes"
+status = "shipped"
+wire = "verified"
+divergent = "D-54"
+notes = "The samples in a span, and the fifteen reductions over buckets cut out of it. The key is resolved before an option word is read, so a key that is not there says so whatever else is wrong. LATEST is read and has nothing to do until compaction rules land. EMPTY only fills the gaps between readings and never the run before the first reading in the series or after the last one, which is what keeps a one millisecond bucket over an open span from asking for an unbounded number of rows. A read that would still build more than eight million rows is refused rather than attempted, which is D-54."
+
+[[command]]
+name = "TS.REVRANGE"
+group = "ts"
+since = "1.4.0"
+arity = -4
+plan = "cursor"
+bounded = "yes"
+status = "shipped"
+wire = "verified"
+divergent = "D-54"
+notes = "The same read with the rows turned around. Every reduction is order independent, first and last included, so the buckets are worked out oldest first and reversed afterwards, and COUNT then takes from the newest end. The one thing that is not a mirror is which rows survive a COUNT, and that falls out of doing the reversal before the limit rather than after it."
 
 
 # ---------------------------------------------------------------------- array

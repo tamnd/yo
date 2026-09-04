@@ -24,9 +24,11 @@
 
 mod bits;
 mod chunk;
+mod query;
 mod sample;
 mod series;
 
 pub use chunk::{Chunk, Encoding, Samples};
+pub use query::{Agg, Buckets, MAX_ROWS, Query, Rows, Stamp, Unread};
 pub use sample::Sample;
 pub use series::{DEFAULT_CHUNK_BYTES, Policy, Refused, Series};
