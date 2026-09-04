@@ -1383,8 +1383,7 @@ pub fn resolved(
             "stream" => {
                 let db = session.db;
                 let now = server.now_ms();
-                streams::execute(server.dbs[db].only_mut(), spec, args, now, out)
-                    .map(|()| Flow::Continue)
+                streams::execute(&mut server.dbs[db], spec, args, now, out).map(|()| Flow::Continue)
             }
             // The one keyspace command that needs more than the databases,
             // because the socket it talks down is held on the server between
@@ -19153,5 +19152,182 @@ mod tests {
             "$1\r\nw\r\n"
         );
         assert_eq!(f.run(&[b"LRANGE", far, b"0", b"-1"]), "*1\r\n$1\r\nw\r\n");
+    }
+
+    /// Every stream command, on one stripe and on eight.
+    ///
+    /// Every ID is written out rather than left to the clock, so the two servers
+    /// are being compared on what they store and not on how long the test took
+    /// to get from one of them to the other.
+    #[test]
+    fn the_stream_group_answers_the_same_however_many_stripes_there_are() {
+        let script: &[&[&[u8]]] = &[
+            &[b"XADD", b"s", b"1-1", b"a", b"1"],
+            &[b"XADD", b"s", b"2-1", b"b", b"2", b"c", b"3"],
+            &[b"XADD", b"s", b"3-1", b"d", b"4"],
+            &[b"XADD", b"s", b"1-1", b"e", b"5"],
+            &[b"XADD", b"nomk", b"NOMKSTREAM", b"1-1", b"a", b"1"],
+            &[b"XLEN", b"s"],
+            &[b"XLEN", b"gone"],
+            &[b"XRANGE", b"s", b"-", b"+"],
+            &[b"XRANGE", b"s", b"2", b"+", b"COUNT", b"1"],
+            &[b"XRANGE", b"gone", b"-", b"+", b"COUNT", b"0"],
+            &[b"XRANGE", b"s", b"-", b"+", b"COUNT", b"0"],
+            &[b"XREVRANGE", b"s", b"+", b"-"],
+            &[b"XREAD", b"COUNT", b"2", b"STREAMS", b"s", b"0"],
+            &[b"XREAD", b"STREAMS", b"s", b"gone", b"0", b"0"],
+            &[b"XREAD", b"STREAMS", b"s", b"$"],
+            // The groups, which is where most of the state is.
+            &[b"XGROUP", b"CREATE", b"s", b"g", b"0"],
+            &[b"XGROUP", b"CREATE", b"s", b"g", b"0"],
+            &[b"XGROUP", b"CREATE", b"gone", b"g", b"0"],
+            &[b"XGROUP", b"CREATE", b"made", b"g", b"$", b"MKSTREAM"],
+            &[b"XGROUP", b"CREATECONSUMER", b"s", b"g", b"idle"],
+            &[b"XREADGROUP", b"GROUP", b"g", b"c1", b"STREAMS", b"s", b">"],
+            &[
+                b"XREADGROUP",
+                b"GROUP",
+                b"g",
+                b"c1",
+                b"COUNT",
+                b"1",
+                b"STREAMS",
+                b"s",
+                b"0",
+            ],
+            &[
+                b"XREADGROUP",
+                b"GROUP",
+                b"nope",
+                b"c1",
+                b"STREAMS",
+                b"s",
+                b">",
+            ],
+            &[b"XPENDING", b"s", b"g"],
+            &[b"XPENDING", b"s", b"g", b"-", b"+", b"10"],
+            &[b"XPENDING", b"s", b"g", b"-", b"+", b"10", b"c1"],
+            &[b"XPENDING", b"s", b"nope"],
+            &[b"XCLAIM", b"s", b"g", b"c2", b"0", b"1-1"],
+            &[b"XCLAIM", b"s", b"g", b"c2", b"0", b"2-1", b"JUSTID"],
+            &[b"XAUTOCLAIM", b"s", b"g", b"c3", b"0", b"0"],
+            &[b"XACK", b"s", b"g", b"1-1"],
+            &[b"XACK", b"s", b"g", b"1-1"],
+            &[b"XNACK", b"s", b"g", b"FAIL", b"IDS", b"1", b"2-1"],
+            &[b"XPENDING", b"s", b"g"],
+            &[b"XINFO", b"STREAM", b"s"],
+            &[b"XINFO", b"GROUPS", b"s"],
+            &[b"XINFO", b"CONSUMERS", b"s", b"g"],
+            &[b"XINFO", b"STREAM", b"gone"],
+            // Deleting, trimming and moving the ID on.
+            &[b"XDEL", b"s", b"3-1"],
+            &[b"XDELEX", b"s", b"DELREF", b"IDS", b"1", b"2-1"],
+            &[b"XACKDEL", b"s", b"g", b"KEEPREF", b"IDS", b"1", b"1-1"],
+            &[b"XADD", b"s", b"9-1", b"z", b"9"],
+            &[b"XTRIM", b"s", b"MAXLEN", b"1"],
+            &[b"XTRIM", b"s", b"MINID", b"9"],
+            &[b"XSETID", b"s", b"99-1"],
+            &[b"XSETID", b"s", b"1-1"],
+            &[b"XLEN", b"s"],
+            &[b"XGROUP", b"SETID", b"s", b"g", b"0"],
+            &[b"XGROUP", b"DELCONSUMER", b"s", b"g", b"c1"],
+            &[b"XGROUP", b"DESTROY", b"s", b"g"],
+            &[b"XGROUP", b"DESTROY", b"s", b"g"],
+            // And the errors.
+            &[b"SET", b"plain", b"v"],
+            &[b"XADD", b"plain", b"1-1", b"a", b"1"],
+            &[b"XLEN", b"plain"],
+            &[b"XREAD", b"STREAMS", b"plain", b"0"],
+            &[b"XRANGE", b"s", b"bogus", b"+"],
+            &[b"XADD", b"s", b"1-1", b"a"],
+            &[b"XREAD", b"STREAMS", b"s", b"gone", b"0"],
+            &[b"XREADGROUP", b"GROUP", b"g", b"c", b"STREAMS", b"s", b"$"],
+        ];
+
+        let mut one = Fixture::new();
+        let mut many = Fixture::striped(8);
+        for parts in script {
+            let a = one.run(parts);
+            let b = many.run(parts);
+            assert_eq!(a, b, "{}", String::from_utf8_lossy(parts[0]));
+        }
+    }
+
+    /// An `XREAD` and an `XREADGROUP` naming two keys on two stripes.
+    ///
+    /// Nothing is shared between the two streams, so the only thing this can go
+    /// wrong at is looking both of them up, which is exactly what a read that
+    /// held one database and walked it would get wrong.
+    #[test]
+    fn a_stream_read_across_stripes_reads_every_key() {
+        let mut f = Fixture::striped(8);
+        let other = apart(&mut f, "s1");
+        let (s1, s2) = (b"s1".as_slice(), other.as_bytes());
+
+        f.run(&[b"XADD", s1, b"1-1", b"a", b"1"]);
+        f.run(&[b"XADD", s2, b"2-1", b"b", b"2"]);
+        let got = f.run(&[b"XREAD", b"STREAMS", s1, s2, b"0", b"0"]);
+        assert!(got.starts_with("*2\r\n"), "both streams answered: {got}");
+        assert!(got.contains("1-1"), "the first one is in there: {got}");
+        assert!(got.contains("2-1"), "and so is the second: {got}");
+
+        // A group read looks its group up on every key before it reads any of
+        // them, so a group that is missing on the far key stops the near one.
+        f.run(&[b"XGROUP", b"CREATE", s1, b"g", b"0"]);
+        let got = f.run(&[
+            b"XREADGROUP",
+            b"GROUP",
+            b"g",
+            b"c",
+            b"STREAMS",
+            s1,
+            s2,
+            b">",
+            b">",
+        ]);
+        assert!(got.starts_with("-NOGROUP"), "{got}");
+        assert_eq!(
+            f.run(&[b"XPENDING", s1, b"g"]),
+            "*4\r\n:0\r\n$-1\r\n$-1\r\n*-1\r\n",
+            "and read nothing from the key that did have the group"
+        );
+
+        f.run(&[b"XGROUP", b"CREATE", s2, b"g", b"0"]);
+        let got = f.run(&[
+            b"XREADGROUP",
+            b"GROUP",
+            b"g",
+            b"c",
+            b"STREAMS",
+            s1,
+            s2,
+            b">",
+            b">",
+        ]);
+        assert!(got.starts_with("*2\r\n"), "now both are read: {got}");
+    }
+
+    /// A client parked on an `XREAD` woken by an entry on another stripe.
+    #[test]
+    fn a_parked_stream_reader_is_served_from_the_stripe_its_key_is_on() {
+        let mut f = Fixture::striped(8);
+        let other = apart(&mut f, "s1");
+        let (s1, far) = (b"s1".as_slice(), other.as_bytes());
+        f.run(&[b"XADD", s1, b"1-1", b"a", b"1"]);
+        f.run(&[b"XADD", far, b"1-1", b"a", b"1"]);
+
+        assert_eq!(
+            f.flow(&[b"XREAD", b"BLOCK", b"0", b"STREAMS", s1, far, b"$", b"$"])
+                .0,
+            Flow::Block
+        );
+        f.run(&[b"XADD", far, b"2-1", b"b", b"2"]);
+        let mut out = Out::new(Proto::Resp2);
+        assert!(f.server.serve_waiter(0, 0, &mut out));
+        let want = format!(
+            "*1\r\n*2\r\n${}\r\n{other}\r\n*1\r\n*2\r\n$3\r\n2-1\r\n*2\r\n$1\r\nb\r\n$1\r\n2\r\n",
+            other.len()
+        );
+        assert_eq!(core::str::from_utf8(out.as_slice()).expect("ascii"), want);
     }
 }
