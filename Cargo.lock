@@ -964,6 +964,7 @@ dependencies = [
  "yo-kv",
  "yo-reactor",
  "yo-shape",
+ "yo-sketch",
  "yo-vector",
 ]
 
@@ -986,6 +987,10 @@ dependencies = [
  "yo-graph",
  "yo-index",
 ]
+
+[[package]]
+name = "yo-sketch"
+version = "0.3.13"
 
 [[package]]
 name = "yo-uring"

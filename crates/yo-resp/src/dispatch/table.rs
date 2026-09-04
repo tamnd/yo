@@ -158,6 +158,23 @@ const JSON_WRITE_OOM: &[&str] = &["write", "denyoom", "module"];
 /// A JSON read whose key is not where the arity says it is, which is
 /// `JSON.DEBUG` and its subcommand.
 const JSON_READ_MOVABLE: &[&str] = &["readonly", "module", "movablekeys"];
+/// The Bloom filter read side. RedisBloom marks all of these `@fast` on top of
+/// the two categories, including the ones that walk the whole filter, which is
+/// the module's own answer to `COMMAND INFO` and is copied rather than judged.
+const AC_BLOOM_READ: &[&str] = &["@read", "@bloom"];
+/// The two reads the module also puts in `@fast` as a category of its own,
+/// which is `BF.INFO` and `BF.CARD`. Neither reads the bits at all.
+const AC_BLOOM_READ_FAST: &[&str] = &["@read", "@fast", "@bloom"];
+/// The Bloom filter write side.
+const AC_BLOOM_WRITE: &[&str] = &["@write", "@bloom"];
+/// `BF.RESERVE`, which is the one write that does no hashing.
+const AC_BLOOM_WRITE_FAST: &[&str] = &["@write", "@fast", "@bloom"];
+/// A Bloom read, with the `module` flag every RedisBloom command carries for
+/// the same reason the JSON ones do.
+const BLOOM_READ: &[&str] = &["readonly", "module", "fast"];
+/// A Bloom write. All of them can grow the filter, `BF.LOADCHUNK` included, so
+/// all of them deny out of memory.
+const BLOOM_WRITE: &[&str] = &["write", "denyoom", "module"];
 /// The graph read side, for the ones that answer without walking the plane.
 const AC_GRAPH_READ_FAST: &[&str] = &["@read", "@graph", "@fast"];
 /// The graph read side for the ones that walk it.
@@ -2932,6 +2949,150 @@ pub static COMMANDS: &[Spec] = &[
         summary: "The attribute string on an element.",
         group: "vector",
     },
+    // --------------------------------------------------------------- bloom
+    Spec {
+        name: "bf.reserve",
+        arity: -4,
+        flags: BLOOM_WRITE,
+        first_key: 1,
+        last_key: 1,
+        step: 1,
+        acl: AC_BLOOM_WRITE_FAST,
+        since: "1.0.0",
+        complexity: "O(1)",
+        summary: "Make an empty filter with a given capacity and error rate.",
+        group: "bloom",
+    },
+    Spec {
+        name: "bf.add",
+        arity: 3,
+        flags: BLOOM_WRITE,
+        first_key: 1,
+        last_key: 1,
+        step: 1,
+        acl: AC_BLOOM_WRITE,
+        since: "1.0.0",
+        complexity: "O(K) with K the number of hash functions",
+        summary: "Add an item, making the filter if the key is free.",
+        group: "bloom",
+    },
+    Spec {
+        name: "bf.madd",
+        arity: -3,
+        flags: BLOOM_WRITE,
+        first_key: 1,
+        last_key: 1,
+        step: 1,
+        acl: AC_BLOOM_WRITE,
+        since: "1.0.0",
+        complexity: "O(N * K) with N the number of items",
+        summary: "Add several items, making the filter if the key is free.",
+        group: "bloom",
+    },
+    Spec {
+        name: "bf.insert",
+        arity: -4,
+        flags: BLOOM_WRITE,
+        first_key: 1,
+        last_key: 1,
+        step: 1,
+        acl: AC_BLOOM_WRITE,
+        since: "1.0.0",
+        complexity: "O(N * K) with N the number of items",
+        summary: "Add several items to a filter described in the same command.",
+        group: "bloom",
+    },
+    Spec {
+        name: "bf.exists",
+        arity: 3,
+        flags: BLOOM_READ,
+        first_key: 1,
+        last_key: 1,
+        step: 1,
+        acl: AC_BLOOM_READ,
+        since: "1.0.0",
+        complexity: "O(K) with K the number of hash functions",
+        summary: "Whether an item is probably in the filter.",
+        group: "bloom",
+    },
+    Spec {
+        name: "bf.mexists",
+        arity: -3,
+        flags: BLOOM_READ,
+        first_key: 1,
+        last_key: 1,
+        step: 1,
+        acl: AC_BLOOM_READ,
+        since: "1.0.0",
+        complexity: "O(N * K) with N the number of items",
+        summary: "Whether each of several items is probably in the filter.",
+        group: "bloom",
+    },
+    Spec {
+        name: "bf.scandump",
+        arity: 3,
+        flags: BLOOM_READ,
+        first_key: 1,
+        last_key: 1,
+        step: 1,
+        acl: AC_BLOOM_READ,
+        since: "1.0.0",
+        complexity: "O(N) with N the size of the chunk",
+        summary: "One chunk of the filter, to be replayed into BF.LOADCHUNK.",
+        group: "bloom",
+    },
+    Spec {
+        name: "bf.loadchunk",
+        arity: 4,
+        flags: BLOOM_WRITE,
+        first_key: 1,
+        last_key: 1,
+        step: 1,
+        acl: AC_BLOOM_WRITE,
+        since: "1.0.0",
+        complexity: "O(N) with N the size of the chunk",
+        summary: "Put back a chunk that BF.SCANDUMP handed out.",
+        group: "bloom",
+    },
+    Spec {
+        name: "bf.info",
+        arity: -2,
+        flags: BLOOM_READ,
+        first_key: 1,
+        last_key: 1,
+        step: 1,
+        acl: AC_BLOOM_READ_FAST,
+        since: "1.0.0",
+        complexity: "O(1)",
+        summary: "The shape of the filter, or one field of it.",
+        group: "bloom",
+    },
+    Spec {
+        name: "bf.card",
+        arity: 2,
+        flags: BLOOM_READ,
+        first_key: 1,
+        last_key: 1,
+        step: 1,
+        acl: AC_BLOOM_READ_FAST,
+        since: "2.4.4",
+        complexity: "O(1)",
+        summary: "How many items were added to the filter.",
+        group: "bloom",
+    },
+    Spec {
+        name: "bf.debug",
+        arity: 2,
+        flags: BLOOM_READ,
+        first_key: 1,
+        last_key: 1,
+        step: 1,
+        acl: AC_BLOOM_READ,
+        since: "1.0.0",
+        complexity: "O(1)",
+        summary: "The chain and a line for each of its links.",
+        group: "bloom",
+    },
     // --------------------------------------------------------------- array
     Spec {
         name: "arset",
@@ -4219,7 +4380,17 @@ const FREE: u16 = u16::MAX;
 /// The cost is a kibibyte, and the thing it buys beyond today is room. The
 /// `FT.*` and `TS.*` families are still to be written and both are large, and at
 /// 27 percent full there is somewhere for them to go.
-const MIX: u64 = 0x4950_0d48_92c9_0793;
+///
+/// The `BF.*` family is the first of those to arrive and it took the table to
+/// 296 names, where the doubled table's multiplier went to two slots and thirty
+/// six extra probes. That is well inside what a lookup is allowed to cost, so
+/// the search was run to see whether the single slot result had been luck at 285
+/// names or was a property of the table at this load, and eight shards over a
+/// hundred and sixty million multipliers found this one at one slot and thirty
+/// three. Eleven more names, five more probes, and the worst is still a single
+/// slot. None of the eleven collides on the key, so the floor moved by one for
+/// an unrelated reason and stands at fifteen, which this is a shade over twice.
+const MIX: u64 = 0x3e86_68c9_760e_09c9;
 
 /// The four bytes the index is computed from: the length, the first two bytes,
 /// and the last byte with the middle byte folded into it, all lower cased.
@@ -4549,7 +4720,7 @@ mod tests {
         }
         assert!(worst <= 2, "worst probe is {worst} slots");
         assert!(
-            total <= 28,
+            total <= 33,
             "{total} extra slots walked over the whole table"
         );
     }

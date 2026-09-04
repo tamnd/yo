@@ -156,6 +156,20 @@ doc = "10 section 9"
 # D-33 for the one number beside FILTER that means something else here.
 
 [[group]]
+name = "bloom"
+expected = 11
+status = "shipped"
+doc = "11 section 8"
+# Ten public commands and BF.DEBUG, which is not documented anywhere and is in
+# the @bloom ACL category on a real server, so COMMAND LIST FILTERBY ACLCAT
+# bloom answers eleven names and this has to as well. The whole group is byte
+# compatible rather than behaviour compatible, because BF.SCANDUMP hands a
+# client the filter's own bytes and a client that dumps from one server and
+# loads into another is the reason the two commands exist. That fixes the
+# geometry, the growth rule, the error tightening, MurmurHash64A and the bit
+# order, none of which are the ones anybody would pick today.
+
+[[group]]
 name = "stream"
 expected = 20
 status = "partial"
@@ -2855,6 +2869,130 @@ bounded = "inherent"
 status = "shipped"
 wire = "verified"
 notes = "A null for an element with no attribute and a null for an element that is not there, which is the same reply for two different facts and is what a real vector set answers. VISMEMBER is how a client tells them apart, and adding a third reply here to save that round trip would be a divergence bought for nothing."
+
+
+# ----------------------------------------------------------------------- bloom
+
+[[command]]
+name = "BF.RESERVE"
+group = "bloom"
+since = "1.0.0"
+arity = -4
+plan = "whole-value"
+bounded = "risk"
+status = "shipped"
+wire = "verified"
+notes = "The filter is sized on the way in and the whole thing is allocated then, so a reserve at the top of the capacity range costs a gibibyte of bits before a single item has been added. That is the risk on the row and it is the module's design rather than this implementation: a client that asks for a billion entries at a tenth of a percent gets what it asked for. Every argument is parsed and range checked before the key is looked at, which is visible on the wire because a reserve against a key holding a string with a bad error rate complains about the error rate. Trailing arguments after the capacity are ignored rather than refused, which is also the module's, and NONSCALING together with EXPANSION is an error in either order."
+
+[[command]]
+name = "BF.ADD"
+group = "bloom"
+since = "1.0.0"
+arity = 3
+plan = "whole-value"
+bounded = "inherent"
+status = "shipped"
+wire = "verified"
+notes = "Two hashes and then one bit per hash function, so the cost does not depend on how many items are in the filter, but the bits are spread over the whole of it and there is no part of the value that can be left behind. The key is made at the configured defaults if it is not there, which is bf-error-rate and bf-initial-size and bf-expansion-factor and not anything this command can be told. A membership check runs before the full check, so re-adding an item that is already in a filter that cannot grow answers 0 rather than an error."
+
+[[command]]
+name = "BF.MADD"
+group = "bloom"
+since = "1.0.0"
+arity = -3
+plan = "whole-value"
+bounded = "yes"
+status = "shipped"
+wire = "verified"
+notes = "One answer per item, until one of them does not fit. A filter that cannot grow and fills part way through answers with the items it managed and the error as the last element, so the array is shorter than the argument list and a client that zips the reply against what it sent gets it wrong. That is the module's shape and copying it is the point."
+
+[[command]]
+name = "BF.INSERT"
+group = "bloom"
+since = "1.0.0"
+arity = -4
+plan = "whole-value"
+bounded = "yes"
+status = "shipped"
+wire = "verified"
+notes = "BF.RESERVE and BF.MADD in one command, with its own error sentences for the same mistakes: a bad capacity is Bad capacity here and ERR bad capacity there, and there is one sentence for a bad expansion where BF.RESERVE has two. NOCREATE turns a missing key into an error instead of a filter. Everything after the ITEMS keyword is an item even if it spells an option, and ITEMS with nothing after it is the same wrong arity as leaving it out."
+
+[[command]]
+name = "BF.EXISTS"
+group = "bloom"
+since = "1.0.0"
+arity = 3
+plan = "whole-value"
+bounded = "inherent"
+status = "shipped"
+wire = "verified"
+notes = "A key holding something else answers 0 rather than WRONGTYPE, which is the module's behaviour and is the one place in the family where a wrong type is not an error. BF.ADD on the same key does answer WRONGTYPE, so the two halves of a check and set disagree about what that key is. Copied rather than fixed, because a client that branches on the reply would otherwise start seeing an error where it used to see a miss."
+
+[[command]]
+name = "BF.MEXISTS"
+group = "bloom"
+since = "1.0.0"
+arity = -3
+plan = "whole-value"
+bounded = "yes"
+status = "shipped"
+wire = "verified"
+notes = "The same tolerance as BF.EXISTS, one element per item, and no way for the reply to be shorter than the argument list because nothing here can fill."
+
+[[command]]
+name = "BF.SCANDUMP"
+group = "bloom"
+since = "1.0.0"
+arity = 3
+plan = "whole-value"
+bounded = "risk"
+status = "shipped"
+wire = "verified"
+notes = "Iterator zero asks for the header and comes back with one. After that the iterator is one past the last byte handed over, counted across every link laid end to end, and zero with an empty string means there is nothing left. A chunk never spans two links, so a chain of n links takes n plus two calls, and a chunk is a whole link however big that link is. A single link filter of a million entries answers in one reply of 1.3 megabytes, which is the risk on the row: the module has no chunk cap and adding one here would change the iterator sequence a client is replaying."
+
+[[command]]
+name = "BF.LOADCHUNK"
+group = "bloom"
+since = "1.0.0"
+arity = 4
+plan = "whole-value"
+bounded = "inherent"
+status = "shipped"
+wire = "verified"
+notes = "Iterator one carries the header and makes the filter with every bit clear, and the key has to be free for it. Loading a header onto a filter that is already there is refused rather than merged, because the two chains would have different shapes and every chunk after the header is an offset into one of them. A header that no filter wrote, a chunk whose offset is past the end and a chunk that starts inside a link and runs off it each have their own sentence."
+
+[[command]]
+name = "BF.INFO"
+group = "bloom"
+since = "1.0.0"
+arity = -2
+plan = "metadata"
+bounded = "inherent"
+status = "shipped"
+wire = "verified"
+notes = "Five numbers that are all derived from the chain rather than recorded beside it, so a filter that arrived through BF.LOADCHUNK answers the same as one that was built here. Capacity is the sum of every link's entries and not the capacity that was asked for, and Size is the module's own accounting of 32 bytes for the chain and 64 for each link and then the bits, which is not what the filter costs in this process. One field asked for by name is a map of one on RESP3 and a bare one element array on RESP2, so a RESP2 client gets the number without being told which field it is."
+
+[[command]]
+name = "BF.CARD"
+group = "bloom"
+since = "2.4.4"
+arity = 2
+plan = "metadata"
+bounded = "inherent"
+status = "shipped"
+wire = "verified"
+notes = "How many items went in and not how many bits are set, so it is exact where everything else about a filter is not. Zero for a key that is not there, where BF.INFO answers an error for the same key."
+
+[[command]]
+name = "BF.DEBUG"
+group = "bloom"
+since = "1.0.0"
+arity = 2
+plan = "metadata"
+bounded = "inherent"
+status = "shipped"
+wire = "verified"
+notes = "Undocumented and in the ACL category all the same, so a client listing the group finds eleven commands and not ten. The reply is the chain size and then a line for each link with the numbers a client would otherwise have to take a BF.SCANDUMP apart to see. The ratio field is C's %g of the link's error rate, six significant digits with an exponent below a ten thousandth, which is why it says 5e-11 where Rust would say 0.00000000005."
 
 
 # ---------------------------------------------------------------------- array

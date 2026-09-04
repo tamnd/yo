@@ -22,6 +22,8 @@ yo-kv = { workspace = true }
 yo-reactor = { workspace = true }
 # `Metric`, so that a vector set says cosine in the same word the catalogue does.
 yo-shape = { workspace = true }
+# The filter the `BF.*` family works on, whose bytes go out over BF.SCANDUMP.
+yo-sketch = { workspace = true }
 # The collection the `V*` family works on, which is the same one the embedded
 # API hands out so the two doors cannot answer a replace differently.
 yo-vector = { workspace = true }

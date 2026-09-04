@@ -56,6 +56,7 @@ mod arrays;
 mod backup;
 mod bits;
 mod blocking;
+mod bloom;
 mod cpu;
 mod geo;
 mod graph;
@@ -1153,7 +1154,7 @@ pub fn resolved(
     // two groups that hold them mark all of them rather than the session's.
     server.dirty |= match spec.group {
         "string" | "bitmap" | "hyperloglog" | "geo" | "set" | "hash" | "list" | "zset"
-        | "array" | "stream" => 1u64 << session.db,
+        | "array" | "stream" | "bloom" => 1u64 << session.db,
         _ => ALL_DATABASES,
     };
 
@@ -1235,6 +1236,10 @@ pub fn resolved(
             "vector" => {
                 let db = session.db;
                 vectors::execute(&mut server.dbs[db], spec, args, out).map(|()| Flow::Continue)
+            }
+            "bloom" => {
+                let db = session.db;
+                bloom::execute(&mut server.dbs[db], spec, args, out).map(|()| Flow::Continue)
             }
             // The clock is read before the database is borrowed, because every
             // stream command needs the time and it lives on the server. An
@@ -12173,6 +12178,399 @@ mod tests {
             "-ERR syntax error\r\n"
         );
         assert_eq!(f.run(&[b"EXISTS", b"w"]), ":0\r\n");
+    }
+
+    // ----------------------------------------------------------------- bloom
+
+    /// The filter a client gets when it does not describe one, and the two
+    /// answers an add can give.
+    #[test]
+    fn bf_add_makes_the_filter_and_says_whether_it_was_new() {
+        let mut f = Fixture::new();
+        assert_eq!(f.run(&[b"BF.ADD", b"b", b"hello"]), ":1\r\n");
+        assert_eq!(f.run(&[b"BF.ADD", b"b", b"hello"]), ":0\r\n");
+        assert_eq!(f.run(&[b"BF.EXISTS", b"b", b"hello"]), ":1\r\n");
+        assert_eq!(f.run(&[b"BF.EXISTS", b"b", b"never"]), ":0\r\n");
+        assert_eq!(f.run(&[b"BF.CARD", b"b"]), ":1\r\n");
+        // The defaults are the module's configs and not anything the command
+        // said, which is 100 entries at a hundredth and a growth of 2.
+        assert_eq!(
+            f.run(&[b"BF.INFO", b"b"]),
+            "*10\r\n+Capacity\r\n:100\r\n+Size\r\n:240\r\n\
+             +Number of filters\r\n:1\r\n+Number of items inserted\r\n:1\r\n\
+             +Expansion rate\r\n:2\r\n"
+        );
+        assert_eq!(f.run(&[b"TYPE", b"b"]), "+MBbloom--\r\n");
+        assert_eq!(f.run(&[b"OBJECT", b"ENCODING", b"b"]), "$3\r\nraw\r\n");
+        // A key that is not there has no filter to report on, and answers two
+        // different ways about it depending on which command asked.
+        assert_eq!(f.run(&[b"BF.CARD", b"gone"]), ":0\r\n");
+        assert_eq!(f.run(&[b"BF.INFO", b"gone"]), "-ERR not found\r\n");
+    }
+
+    /// `BF.EXISTS` on a key holding something else answers a miss, and
+    /// everything else in the family answers `WRONGTYPE`.
+    ///
+    /// The two halves of a check and set disagree about what that key is, which
+    /// is the module's behaviour and not a decision taken here.
+    #[test]
+    fn a_wrong_type_is_a_miss_to_the_two_that_only_read_bits() {
+        let mut f = Fixture::new();
+        f.run(&[b"SET", b"s", b"text"]);
+        assert_eq!(f.run(&[b"BF.EXISTS", b"s", b"x"]), ":0\r\n");
+        assert_eq!(f.run(&[b"BF.MEXISTS", b"s", b"x"]), "*1\r\n:0\r\n");
+        for cmd in [
+            vec![&b"BF.ADD"[..], b"s", b"x"],
+            vec![&b"BF.MADD"[..], b"s", b"x"],
+            vec![&b"BF.CARD"[..], b"s"],
+            vec![&b"BF.INFO"[..], b"s"],
+            vec![&b"BF.DEBUG"[..], b"s"],
+            vec![&b"BF.SCANDUMP"[..], b"s", b"0"],
+        ] {
+            let name = String::from_utf8_lossy(cmd[0]).into_owned();
+            assert!(f.run(&cmd).starts_with("-WRONGTYPE"), "{name}");
+        }
+        // The arguments are read before the key is, so a reserve with a bad
+        // error rate complains about the rate and never learns about the string.
+        assert_eq!(
+            f.run(&[b"BF.RESERVE", b"s", b"abc", b"10"]),
+            "-ERR bad error rate\r\n"
+        );
+        assert!(
+            f.run(&[b"BF.RESERVE", b"s", b"0.01", b"10"])
+                .starts_with("-WRONGTYPE")
+        );
+    }
+
+    /// A chain grows by its expansion factor and each link is half as wrong as
+    /// the one before, which is what makes the whole filter hold its rate.
+    #[test]
+    fn a_full_filter_grows_a_link_and_a_fixed_one_says_no() {
+        let mut f = Fixture::new();
+        assert_eq!(f.run(&[b"BF.RESERVE", b"g", b"0.01", b"10"]), "+OK\r\n");
+        for i in 0..10u32 {
+            assert_eq!(
+                f.run(&[b"BF.ADD", b"g", i.to_string().as_bytes()]),
+                ":1\r\n"
+            );
+        }
+        assert_eq!(f.run(&[b"BF.INFO", b"g", b"FILTERS"]), "*1\r\n:1\r\n");
+        assert_eq!(f.run(&[b"BF.ADD", b"g", b"11"]), ":1\r\n");
+        assert_eq!(f.run(&[b"BF.INFO", b"g", b"filters"]), "*1\r\n:2\r\n");
+        // Capacity is the sum of every link and not the number that was asked
+        // for, so it is 10 and then 10 plus 20.
+        assert_eq!(f.run(&[b"BF.INFO", b"g", b"CAPACITY"]), "*1\r\n:30\r\n");
+        assert_eq!(
+            f.run(&[b"BF.DEBUG", b"g"]),
+            "*3\r\n$7\r\nsize:11\r\n\
+             $71\r\nbytes:16 bits:128 hashes:8 hashwidth:64 capacity:10 size:10 ratio:0.005\r\n\
+             $71\r\nbytes:32 bits:256 hashes:9 hashwidth:64 capacity:20 size:1 ratio:0.0025\r\n"
+        );
+
+        // The same filter told not to grow fills instead.
+        assert_eq!(
+            f.run(&[b"BF.RESERVE", b"n", b"0.01", b"2", b"NONSCALING"]),
+            "+OK\r\n"
+        );
+        assert_eq!(f.run(&[b"BF.ADD", b"n", b"a"]), ":1\r\n");
+        assert_eq!(f.run(&[b"BF.ADD", b"n", b"b"]), ":1\r\n");
+        assert_eq!(
+            f.run(&[b"BF.ADD", b"n", b"c"]),
+            "-ERR non scaling filter is full\r\n"
+        );
+        // And an item that is already in it still answers, because membership
+        // is checked before fullness.
+        assert_eq!(f.run(&[b"BF.ADD", b"n", b"a"]), ":0\r\n");
+        // A filter that will not grow has no expansion rate to report, in
+        // either of the two spellings that make one.
+        assert_eq!(f.run(&[b"BF.INFO", b"n", b"EXPANSION"]), "*1\r\n$-1\r\n");
+        f.run(&[b"BF.RESERVE", b"z", b"0.01", b"2", b"EXPANSION", b"0"]);
+        assert_eq!(f.run(&[b"BF.INFO", b"z", b"EXPANSION"]), "*1\r\n$-1\r\n");
+        // Asking for both at once is refused, which is one of the module's
+        // errors that carries no prefix at all.
+        assert_eq!(
+            f.run(&[
+                b"BF.RESERVE",
+                b"q",
+                b"0.01",
+                b"2",
+                b"NONSCALING",
+                b"EXPANSION",
+                b"2"
+            ]),
+            "-Nonscaling filters cannot expand\r\n"
+        );
+    }
+
+    /// A multi add stops where the filter did, so the reply can be shorter than
+    /// the argument list.
+    #[test]
+    fn madd_truncates_its_reply_at_the_item_that_did_not_fit() {
+        let mut f = Fixture::new();
+        f.run(&[b"BF.RESERVE", b"n", b"0.01", b"2", b"NONSCALING"]);
+        assert_eq!(
+            f.run(&[b"BF.MADD", b"n", b"a", b"b", b"c", b"d"]),
+            "*3\r\n:1\r\n:1\r\n-ERR non scaling filter is full\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"BF.MEXISTS", b"n", b"a", b"c"]),
+            "*2\r\n:1\r\n:0\r\n"
+        );
+    }
+
+    /// `BF.INSERT` describes a filter and fills it in one command, with its own
+    /// spelling of every complaint.
+    #[test]
+    fn insert_is_a_reserve_and_a_madd_with_different_errors() {
+        let mut f = Fixture::new();
+        assert_eq!(
+            f.run(&[
+                b"BF.INSERT",
+                b"i",
+                b"CAPACITY",
+                b"50",
+                b"ERROR",
+                b"0.001",
+                b"ITEMS",
+                b"a",
+                b"b"
+            ]),
+            "*2\r\n:1\r\n:1\r\n"
+        );
+        assert_eq!(f.run(&[b"BF.INFO", b"i", b"CAPACITY"]), "*1\r\n:50\r\n");
+        // NOCREATE is the only way to add without making the key.
+        assert_eq!(
+            f.run(&[b"BF.INSERT", b"gone", b"NOCREATE", b"ITEMS", b"a"]),
+            "-ERR not found\r\n"
+        );
+        assert_eq!(f.run(&[b"EXISTS", b"gone"]), ":0\r\n");
+        // The same mistakes as BF.RESERVE, in the sentences this command uses
+        // for them, and one sentence where BF.RESERVE has two.
+        assert_eq!(
+            f.run(&[b"BF.INSERT", b"i", b"CAPACITY", b"abc", b"ITEMS", b"a"]),
+            "-Bad capacity\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"BF.INSERT", b"i", b"ERROR", b"2", b"ITEMS", b"a"]),
+            "-Bad error rate\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"BF.INSERT", b"i", b"EXPANSION", b"99999", b"ITEMS", b"a"]),
+            "-Bad expansion\r\n"
+        );
+        // An option is matched on its first letter and not on the word, so a
+        // token nobody meant as an option is one anyway if it starts with the
+        // right letter. NOSUCHTHING is NONSCALING here, and the filter it
+        // builds says so.
+        assert_eq!(
+            f.run(&[b"BF.INSERT", b"ns", b"NOSUCHTHING", b"ITEMS", b"a"]),
+            "*1\r\n:1\r\n"
+        );
+        assert_eq!(f.run(&[b"BF.INFO", b"ns", b"EXPANSION"]), "*1\r\n$-1\r\n");
+        // Only E and N need a second look, one for ERROR against EXPANSION and
+        // the other for NOCREATE against NONSCALING, and both stop as soon as
+        // they can tell the two apart.
+        assert_eq!(
+            f.run(&[b"BF.INSERT", b"e1", b"E", b"4", b"ITEMS", b"a"]),
+            "*1\r\n:1\r\n"
+        );
+        assert_eq!(f.run(&[b"BF.INFO", b"e1", b"EXPANSION"]), "*1\r\n:4\r\n");
+        assert_eq!(
+            f.run(&[b"BF.INSERT", b"e2", b"ER", b"0.5", b"ITEMS", b"a"]),
+            "*1\r\n:1\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"BF.INSERT", b"gone", b"NOC", b"ITEMS", b"a"]),
+            "-ERR not found\r\n"
+        );
+        // A letter that starts nothing is the one case that is refused.
+        assert_eq!(
+            f.run(&[b"BF.INSERT", b"i", b"ZZZ", b"ITEMS", b"a"]),
+            "-Unknown argument received\r\n"
+        );
+        // Everything after ITEMS is an item, even when it spells an option.
+        assert_eq!(
+            f.run(&[b"BF.INSERT", b"i", b"ITEMS", b"NOCREATE"]),
+            "*1\r\n:1\r\n"
+        );
+        // And ITEMS with nothing after it is the same as leaving it out.
+        assert!(
+            f.run(&[b"BF.INSERT", b"i", b"ITEMS"])
+                .contains("wrong number of arguments")
+        );
+    }
+
+    /// A filter dumped a chunk at a time and put back into another key is the
+    /// same filter.
+    #[test]
+    fn a_dump_replays_into_a_filter_that_answers_the_same() {
+        let mut f = Fixture::new();
+        f.run(&[b"BF.RESERVE", b"src", b"0.01", b"10"]);
+        for i in 0..25u32 {
+            f.run(&[b"BF.ADD", b"src", i.to_string().as_bytes()]);
+        }
+        assert_eq!(f.run(&[b"BF.INFO", b"src", b"FILTERS"]), "*1\r\n:2\r\n");
+
+        // Iterator zero asks for the header and every one after it is a running
+        // byte offset, and a chunk never spans two links.
+        let mut iter = b"0".to_vec();
+        let mut chunks = 0;
+        loop {
+            let raw = f.raw(&[b"BF.SCANDUMP", b"src", &iter]);
+            let text = String::from_utf8_lossy(&raw).into_owned();
+            let next = text
+                .split("\r\n")
+                .nth(1)
+                .and_then(|n| n.strip_prefix(':'))
+                .expect("a two element reply of an iterator and a chunk")
+                .to_owned();
+            let body = &raw[raw.iter().position(|&b| b == b'$').expect("a bulk chunk")..];
+            let data = &body[body
+                .windows(2)
+                .position(|w| w == b"\r\n")
+                .expect("a length line")
+                + 2..body.len() - 2];
+            if next == "0" {
+                assert!(data.is_empty(), "the last chunk is empty");
+                break;
+            }
+            let put = f.run(&[b"BF.LOADCHUNK", b"dst", next.as_bytes(), data]);
+            assert_eq!(put, "+OK\r\n", "loading chunk {chunks}");
+            iter = next.into_bytes();
+            chunks += 1;
+        }
+        assert_eq!(chunks, 3, "a header and one chunk per link");
+
+        assert_eq!(f.run(&[b"BF.INFO", b"dst"]), f.run(&[b"BF.INFO", b"src"]));
+        assert_eq!(f.run(&[b"BF.DEBUG", b"dst"]), f.run(&[b"BF.DEBUG", b"src"]));
+        for i in 0..25u32 {
+            assert_eq!(
+                f.run(&[b"BF.EXISTS", b"dst", i.to_string().as_bytes()]),
+                ":1\r\n"
+            );
+        }
+
+        // A header on top of a filter is refused rather than merged, and so is
+        // one that no filter wrote.
+        assert_eq!(
+            f.run(&[b"BF.LOADCHUNK", b"dst", b"1", b"anything"]),
+            "-ERR received bad data\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"BF.LOADCHUNK", b"fresh", b"1", b"anything"]),
+            "-ERR received bad data\r\n"
+        );
+        // An offset past the end of the filter names itself.
+        assert_eq!(
+            f.run(&[b"BF.LOADCHUNK", b"dst", b"99999", b"x"]),
+            "-ERR invalid offset - no link found\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"BF.LOADCHUNK", b"dst", b"nope", b"x"]),
+            "-ERR Second argument must be numeric\r\n"
+        );
+        // The same complaint without the prefix on the way out, which is the
+        // module's inconsistency and not a slip here.
+        assert_eq!(
+            f.run(&[b"BF.SCANDUMP", b"src", b"nope"]),
+            "-Second argument must be numeric\r\n"
+        );
+    }
+
+    /// The argument checks, which have a sentence each and read numbers the way
+    /// Redis reads them everywhere else.
+    #[test]
+    fn reserve_reads_its_numbers_the_way_string2ll_does() {
+        let mut f = Fixture::new();
+        for (args, want) in [
+            (vec![&b"abc"[..], b"10"], "-ERR bad error rate\r\n"),
+            (vec![&b"nan"[..], b"10"], "-ERR bad error rate\r\n"),
+            (
+                vec![&b"0"[..], b"10"],
+                "-ERR error rate must be in the range (0.000000, 1.000000)\r\n",
+            ),
+            (
+                vec![&b"1"[..], b"10"],
+                "-ERR error rate must be in the range (0.000000, 1.000000)\r\n",
+            ),
+            (
+                vec![&b"inf"[..], b"10"],
+                "-ERR error rate must be in the range (0.000000, 1.000000)\r\n",
+            ),
+            (vec![&b"0.01"[..], b"+10"], "-ERR bad capacity\r\n"),
+            (vec![&b"0.01"[..], b"1e2"], "-ERR bad capacity\r\n"),
+            (vec![&b"0.01"[..], b"007"], "-ERR bad capacity\r\n"),
+            (
+                vec![&b"0.01"[..], b"0"],
+                "-ERR capacity must be in the range [1, 1073741824]\r\n",
+            ),
+            (
+                vec![&b"0.01"[..], b"1073741825"],
+                "-ERR capacity must be in the range [1, 1073741824]\r\n",
+            ),
+        ] {
+            let mut cmd = vec![&b"BF.RESERVE"[..], b"k"];
+            cmd.extend(args.iter().copied());
+            assert_eq!(f.run(&cmd), want, "{}", String::from_utf8_lossy(args[0]));
+        }
+        assert_eq!(
+            f.run(&[b"BF.RESERVE", b"k", b"0.01", b"10", b"EXPANSION"]),
+            "-ERR no expansion\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"BF.RESERVE", b"k", b"0.01", b"10", b"EXPANSION", b"abc"]),
+            "-ERR bad expansion\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"BF.RESERVE", b"k", b"0.01", b"10", b"EXPANSION", b"32769"]),
+            "-ERR expansion must be in the range [0, 32768]\r\n"
+        );
+        // Trailing rubbish after the capacity is ignored rather than refused.
+        assert_eq!(
+            f.run(&[b"BF.RESERVE", b"k", b"0.01", b"10", b"junk"]),
+            "+OK\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"BF.RESERVE", b"k", b"0.01", b"10"]),
+            "-ERR item exists\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"BF.INFO", b"k", b"nosuchfield"]),
+            "-Invalid information value\r\n"
+        );
+        assert!(
+            f.run(&[b"BF.INFO", b"k", b"CAPACITY", b"SIZE"])
+                .contains("wrong number of arguments")
+        );
+    }
+
+    /// The RESP3 shapes, which are where this family differs most from RESP2.
+    #[test]
+    fn the_bloom_family_answers_in_resp3_spelling_too() {
+        let mut f = Fixture::new();
+        f.out.set_proto(Proto::Resp3);
+        assert_eq!(f.run(&[b"BF.ADD", b"b", b"a"]), "#t\r\n");
+        assert_eq!(f.run(&[b"BF.ADD", b"b", b"a"]), "#f\r\n");
+        assert_eq!(f.run(&[b"BF.MADD", b"b", b"a", b"c"]), "*2\r\n#f\r\n#t\r\n");
+        assert_eq!(f.run(&[b"BF.EXISTS", b"b", b"a"]), "#t\r\n");
+        assert_eq!(
+            f.run(&[b"BF.MEXISTS", b"b", b"a", b"z"]),
+            "*2\r\n#t\r\n#f\r\n"
+        );
+        // The count stays an integer, because it counts rather than answers.
+        assert_eq!(f.run(&[b"BF.CARD", b"b"]), ":2\r\n");
+        assert_eq!(
+            f.run(&[b"BF.INFO", b"b"]),
+            "%5\r\n+Capacity\r\n:100\r\n+Size\r\n:240\r\n\
+             +Number of filters\r\n:1\r\n+Number of items inserted\r\n:2\r\n\
+             +Expansion rate\r\n:2\r\n"
+        );
+        // One field is a map of one here and a bare array of one on RESP2, so
+        // this is the reply where the two protocols carry different facts.
+        assert_eq!(
+            f.run(&[b"BF.INFO", b"b", b"CAPACITY"]),
+            "%1\r\n+Capacity\r\n:100\r\n"
+        );
     }
 
     /// The three shapes an `XADD` id can take, and the one rule behind all of
