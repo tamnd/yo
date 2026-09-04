@@ -139,7 +139,7 @@ fn bench_union_and_diff(c: &mut Criterion) {
             let mut sc = setops::Scratch::new();
             b.iter(|| {
                 let mut n = 0usize;
-                setops::union(&mut sc, black_box(&refs), |_| n += 1);
+                setops::union(&mut sc, black_box(&refs), 0, |_| n += 1);
                 n
             })
         });
@@ -147,7 +147,7 @@ fn bench_union_and_diff(c: &mut Criterion) {
         g.bench_with_input(BenchmarkId::new("diff", k), &k, |b, _| {
             b.iter(|| {
                 let mut n = 0usize;
-                setops::diff(black_box(&refs), |_| n += 1);
+                setops::diff(black_box(&refs), 0, |_| n += 1);
                 n
             })
         });
@@ -303,7 +303,7 @@ fn bench_merge(c: &mut Criterion) {
                 let mut sc = setops::Scratch::new();
                 b.iter(|| {
                     let mut n = 0usize;
-                    setops::union_with(&mut sc, how, black_box(&refs), |_| n += 1);
+                    setops::union_with(&mut sc, how, black_box(&refs), 0, |_| n += 1);
                     n
                 })
             });
@@ -312,7 +312,7 @@ fn bench_merge(c: &mut Criterion) {
             g.bench_with_input(BenchmarkId::new(name, k), &k, |b, _| {
                 b.iter(|| {
                     let mut n = 0usize;
-                    setops::diff_with(how, black_box(&refs), |_| n += 1);
+                    setops::diff_with(how, black_box(&refs), 0, |_| n += 1);
                     n
                 })
             });
@@ -385,7 +385,7 @@ fn bench_small(c: &mut Criterion) {
                     let mut sc = setops::Scratch::new();
                     b.iter(|| {
                         let mut c = 0usize;
-                        setops::union(&mut sc, black_box(refs), |_| c += 1);
+                        setops::union(&mut sc, black_box(refs), 0, |_| c += 1);
                         c
                     })
                 });

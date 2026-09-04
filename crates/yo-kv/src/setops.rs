@@ -509,11 +509,16 @@ fn text<'a>(m: crate::set::Member<'a>, digits: &'a mut [u8; DIGITS_MAX]) -> &'a 
 /// visible from outside. The table walks the sets in turn, so it answers in the
 /// order each set holds its members, and the merge answers in ascending order
 /// across all of them. Redis promises neither.
-pub fn union<F>(scratch: &mut Scratch, sets: &[&Set], f: F) -> usize
+///
+/// `limit` is `SUNIONCARD`'s and works the way `SINTERCARD`'s does on [`inter`]:
+/// zero is no limit, and anything else stops the walk the moment it has that
+/// many. Stopping early is only sound because the count is the answer and the
+/// members are not, so which ones it happened to reach first does not matter.
+pub fn union<F>(scratch: &mut Scratch, sets: &[&Set], limit: usize, f: F) -> usize
 where
     F: FnMut(&[u8]),
 {
-    union_with(scratch, plan_for(sets), sets, f)
+    union_with(scratch, plan_for(sets), sets, limit, f)
 }
 
 /// The same, with the plan named rather than assumed.
@@ -524,13 +529,13 @@ where
 ///
 /// There are only two plans here, so anything that is not [`Plan::Merge`] is the
 /// table, and a merge asked for over operands that cannot merge is the table too.
-pub fn union_with<F>(scratch: &mut Scratch, how: Plan, sets: &[&Set], f: F) -> usize
+pub fn union_with<F>(scratch: &mut Scratch, how: Plan, sets: &[&Set], limit: usize, f: F) -> usize
 where
     F: FnMut(&[u8]),
 {
     match (how, as_ints(sets)) {
-        (Plan::Merge, Some(ints)) if !ints.is_empty() => union_merge(&ints, f),
-        _ => union_table(&mut scratch.seen, sets, f),
+        (Plan::Merge, Some(ints)) if !ints.is_empty() => union_merge(&ints, limit, f),
+        _ => union_table(&mut scratch.seen, sets, limit, f),
     }
 }
 
@@ -542,7 +547,7 @@ where
 /// 16 and the two would cross somewhere past k of 50. A heap would turn the scan
 /// into `log k` at the cost of a comparison per push, and it is not worth paying
 /// for a `SUNION` nobody writes.
-fn union_merge<F>(sets: &[&Intset], mut f: F) -> usize
+fn union_merge<F>(sets: &[&Intset], limit: usize, mut f: F) -> usize
 where
     F: FnMut(&[u8]),
 {
@@ -552,6 +557,9 @@ where
     while let Some(low) = walks.iter().filter_map(Walk::peek).min() {
         f(yo_common::num::i64_digits(&mut digits, low));
         found += 1;
+        if limit != 0 && found == limit {
+            return found;
+        }
         // Every cursor sitting on it, because the same member in two sets is
         // one member and this is where that is decided.
         for w in &mut walks {
@@ -564,7 +572,7 @@ where
 }
 
 /// Walk everything into one table, where the table is the duplicate check.
-fn union_table<F>(seen: &mut Elements<()>, sets: &[&Set], mut f: F) -> usize
+fn union_table<F>(seen: &mut Elements<()>, sets: &[&Set], limit: usize, mut f: F) -> usize
 where
     F: FnMut(&[u8]),
 {
@@ -606,6 +614,9 @@ where
             if fresh.is_ok_and(|was| was.is_none()) {
                 f(name);
                 found += 1;
+                if limit != 0 && found == limit {
+                    return found;
+                }
             }
         }
     }
@@ -621,21 +632,23 @@ where
 /// never asked about the third. Against intsets it is a merge, and the order is
 /// the same either way because both walk the first set and the first set is
 /// ascending.
-pub fn diff<F>(sets: &[&Set], f: F) -> usize
+///
+/// `limit` is `SDIFFCARD`'s, and is [`union`]'s in every respect.
+pub fn diff<F>(sets: &[&Set], limit: usize, f: F) -> usize
 where
     F: FnMut(&[u8]),
 {
-    diff_with(plan_for(sets), sets, f)
+    diff_with(plan_for(sets), sets, limit, f)
 }
 
 /// The same, with the plan named rather than assumed. See [`union_with`].
-pub fn diff_with<F>(how: Plan, sets: &[&Set], f: F) -> usize
+pub fn diff_with<F>(how: Plan, sets: &[&Set], limit: usize, f: F) -> usize
 where
     F: FnMut(&[u8]),
 {
     match (how, as_ints(sets)) {
-        (Plan::Merge, Some(ints)) if !ints.is_empty() => diff_merge(&ints, f),
-        _ => diff_probe(sets, f),
+        (Plan::Merge, Some(ints)) if !ints.is_empty() => diff_merge(&ints, limit, f),
+        _ => diff_probe(sets, limit, f),
     }
 }
 
@@ -645,7 +658,7 @@ where
 /// over the first set and at most one pass over each of the others, however many
 /// members are in the answer. A probe pays a hash and a random access per member
 /// per set instead.
-fn diff_merge<F>(sets: &[&Intset], mut f: F) -> usize
+fn diff_merge<F>(sets: &[&Intset], limit: usize, mut f: F) -> usize
 where
     F: FnMut(&[u8]),
 {
@@ -666,6 +679,9 @@ where
         if !anyone {
             f(yo_common::num::i64_digits(&mut digits, v));
             found += 1;
+            if limit != 0 && found == limit {
+                return found;
+            }
         }
         walk.bump();
     }
@@ -673,7 +689,7 @@ where
 }
 
 /// Walk the first set and ask the others about every member.
-fn diff_probe<F>(sets: &[&Set], mut f: F) -> usize
+fn diff_probe<F>(sets: &[&Set], limit: usize, mut f: F) -> usize
 where
     F: FnMut(&[u8]),
 {
@@ -690,6 +706,9 @@ where
         if !order.iter().any(|&i| rest[i].has(&needle)) {
             f(needle.bytes());
             found += 1;
+            if limit != 0 && found == limit {
+                return found;
+            }
         }
     }
     found
@@ -867,6 +886,54 @@ mod tests {
         );
     }
 
+    /// `SUNIONCARD`'s limit, on both of the plans a union has, because the stop
+    /// is written once in each of them.
+    ///
+    /// The merge plan needs every operand to be an intset, which is why these
+    /// two are digits and the ones below are not.
+    #[test]
+    fn a_limit_stops_the_union_early() {
+        let a = set(&["1", "2", "3"]);
+        let b = set(&["3", "4", "5"]);
+        for how in [Plan::Merge, Plan::Accumulate] {
+            let mut s = Scratch::new();
+            assert_eq!(
+                run(|f| union_with(&mut s, how, &[&a, &b], 2, f)).len(),
+                2,
+                "{how:?} ignored the limit"
+            );
+            let mut s = Scratch::new();
+            assert_eq!(run(|f| union_with(&mut s, how, &[&a, &b], 99, f)).len(), 5);
+            let mut s = Scratch::new();
+            assert_eq!(
+                run(|f| union_with(&mut s, how, &[&a, &b], 0, f)).len(),
+                5,
+                "zero is no limit"
+            );
+        }
+    }
+
+    /// `SDIFFCARD`'s, the same way. The difference is four members here so that
+    /// a limit of two is a stop and not a coincidence.
+    #[test]
+    fn a_limit_stops_the_difference_early() {
+        let a = set(&["1", "2", "3", "4", "5"]);
+        let b = set(&["5"]);
+        for how in [Plan::Merge, Plan::Probe] {
+            assert_eq!(
+                run(|f| diff_with(how, &[&a, &b], 2, f)).len(),
+                2,
+                "{how:?} ignored the limit"
+            );
+            assert_eq!(run(|f| diff_with(how, &[&a, &b], 99, f)).len(), 4);
+            assert_eq!(
+                run(|f| diff_with(how, &[&a, &b], 0, f)).len(),
+                4,
+                "zero is no limit"
+            );
+        }
+    }
+
     /// The two plans are two ways to compute the same thing, so they have to
     /// agree on the members and on the order, or a client sees the answer change
     /// when a set grows past a threshold it cannot see.
@@ -900,11 +967,11 @@ mod tests {
         let b = set(&["b", "c"]);
         let c = set(&["c", "d"]);
         assert_eq!(
-            run(|f| union(&mut Scratch::new(), &[&a, &b, &c], f)),
+            run(|f| union(&mut Scratch::new(), &[&a, &b, &c], 0, f)),
             vec!["a", "b", "c", "d"]
         );
         assert_eq!(
-            run(|f| union(&mut Scratch::new(), &[], f)),
+            run(|f| union(&mut Scratch::new(), &[], 0, f)),
             Vec::<String>::new()
         );
     }
@@ -914,9 +981,9 @@ mod tests {
         let a = set(&["a", "b", "c", "d"]);
         let b = set(&["b"]);
         let c = set(&["d", "e"]);
-        assert_eq!(run(|f| diff(&[&a, &b, &c], f)), vec!["a", "c"]);
-        assert_eq!(run(|f| diff(&[&a], f)), vec!["a", "b", "c", "d"]);
-        assert_eq!(run(|f| diff(&[], f)), Vec::<String>::new());
+        assert_eq!(run(|f| diff(&[&a, &b, &c], 0, f)), vec!["a", "c"]);
+        assert_eq!(run(|f| diff(&[&a], 0, f)), vec!["a", "b", "c", "d"]);
+        assert_eq!(run(|f| diff(&[], 0, f)), Vec::<String>::new());
     }
 
     /// Ten sets all holding the same members is the shape that gives probe the
@@ -985,7 +1052,7 @@ mod tests {
         // is not a number is all it takes.
         let c = set(&["x"]);
         let out = collect(4, &Limits::DEFAULT, |f| {
-            union(&mut Scratch::new(), &[&a, &c], f);
+            union(&mut Scratch::new(), &[&a, &c], 0, f);
         })
         .expect("four members");
         assert_ne!(out.encoding(), Encoding::Intset);
@@ -1015,11 +1082,11 @@ mod tests {
                 got.sort();
                 assert_eq!(got, ["3", "4"], "{ln} against {rn}");
 
-                let mut got = run(|f| union(&mut Scratch::new(), &[&a, &b], f));
+                let mut got = run(|f| union(&mut Scratch::new(), &[&a, &b], 0, f));
                 got.sort();
                 assert_eq!(got, ["1", "2", "3", "4", "5", "6"], "{ln} with {rn}");
 
-                let mut got = run(|f| diff(&[&a, &b], f));
+                let mut got = run(|f| diff(&[&a, &b], 0, f));
                 got.sort();
                 assert_eq!(got, ["1", "2"], "{ln} without {rn}");
             }
@@ -1037,10 +1104,10 @@ mod tests {
             run(|f| inter(&mut Scratch::new(), &[&a, &b], 0, f)),
             vec!["42"]
         );
-        let mut got = run(|f| diff(&[&a, &b], f));
+        let mut got = run(|f| diff(&[&a, &b], 0, f));
         got.sort();
         assert_eq!(got, ["-0", "042"]);
-        let mut got = run(|f| union(&mut Scratch::new(), &[&a, &b], f));
+        let mut got = run(|f| union(&mut Scratch::new(), &[&a, &b], 0, f));
         got.sort();
         assert_eq!(
             got,
@@ -1126,9 +1193,9 @@ mod tests {
             );
 
             let subbed = diff_the_slow_way(&vals);
-            assert_eq!(run(|f| diff(&refs, f)), subbed, "sub {what}");
+            assert_eq!(run(|f| diff(&refs, 0, f)), subbed, "sub {what}");
             assert_eq!(
-                run(|f| diff_with(Plan::Probe, &refs, f)),
+                run(|f| diff_with(Plan::Probe, &refs, 0, f)),
                 subbed,
                 "and the probe agrees, {what}"
             );
@@ -1136,7 +1203,7 @@ mod tests {
             let mut piled: Vec<String> = union_the_slow_way(&vals);
             piled.sort();
             for how in [Plan::Merge, Plan::Probe] {
-                let mut got = run(|f| union_with(&mut Scratch::new(), how, &refs, f));
+                let mut got = run(|f| union_with(&mut Scratch::new(), how, &refs, 0, f));
                 got.sort();
                 assert_eq!(got, piled, "union {what} by {how:?}");
             }

@@ -94,9 +94,12 @@ doc = "08 section 3"
 [[group]]
 name = "set"
 expected = 19
-status = "partial"
+status = "shipped"
 doc = "08 section 4"
-# Seventeen are here and the two counting commands Redis 8.10 added are not.
+# All nineteen are here, keyspace and wire both, including the two counting
+# commands Redis 8.10 added. Those two cost almost nothing to add because the
+# union and the difference already walked with a callback, so all they needed was
+# the limit SINTERCARD's walk already carried and somewhere to stop.
 # What else is left on the set is not commands, it is the inline and native
 # bands of the size ladder and the escalation of a hot key, and neither of those
 # changes an answer.
@@ -1191,9 +1194,9 @@ since = "8.10.0"
 arity = -3
 plan = "whole-value"
 bounded = "inherent"
-status = "planned"
-wire = "none"
-notes = "New in 8.10 and not written yet. What SINTERCARD is to SINTER, this is to SUNION: the same walk with the members thrown away so only the count is built, and a LIMIT that stops it as soon as it has enough. The keys go behind a count for the same reason SINTERCARD's do, which is that LIMIT comes after them."
+status = "shipped"
+wire = "verified"
+notes = "What SINTERCARD is to SINTER, this is to SUNION: the same walk with the members thrown away so only the count is built, and a LIMIT that stops it as soon as it has enough. The keys go behind a count for the same reason SINTERCARD's do, which is that LIMIT comes after them. Stopping early is sound here in a way it would not be for SUNION itself, because the count is the answer and the members are not, so which ones the walk happened to reach first does not matter."
 
 [[command]]
 name = "SDIFFCARD"
@@ -1202,9 +1205,9 @@ since = "8.10.0"
 arity = -3
 plan = "whole-value"
 bounded = "inherent"
-status = "planned"
-wire = "none"
-notes = "New in 8.10 and not written yet, and the same shape as SUNIONCARD over a difference rather than a union."
+status = "shipped"
+wire = "verified"
+notes = "The same shape as SUNIONCARD over a difference rather than a union, so it walks the first key and counts the members none of the rest hold. LIMIT stops it the same way and for the same reason."
 
 # ---------------------------------------------------------------------- hashes
 

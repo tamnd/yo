@@ -155,12 +155,23 @@ pub(super) fn execute(db: &mut Keyspace, spec: &Spec, args: Args<'_>, out: &mut 
             };
             match spec.name {
                 "sinter" => db.sinter(keys, 0, &mut take)?,
-                "sunion" => db.sunion(keys, &mut take)?,
-                _ => db.sdiff(keys, &mut take)?,
+                "sunion" => db.sunion(keys, 0, &mut take)?,
+                _ => db.sdiff(keys, 0, &mut take)?,
             };
             out.close_set(start, n);
         }
-        "sintercard" => out.int(count(intercard(db, args)?)),
+        // The three that answer a count rather than the members. They stop the
+        // moment they have `LIMIT` of them, which is only sound because the
+        // count is the answer and the members are not.
+        "sintercard" | "sunioncard" | "sdiffcard" => {
+            let (end, limit) = cardinality(args)?;
+            let keys = rest(args, 2, end);
+            out.int(count(match spec.name {
+                "sintercard" => db.sintercard(keys, limit)?,
+                "sunioncard" => db.sunioncard(keys, limit)?,
+                _ => db.sdiffcard(keys, limit)?,
+            }));
+        }
         "sinterstore" => out.int(count(db.sinterstore(args.get(1), keys(args, 2))?)),
         "sunionstore" => out.int(count(db.sunionstore(args.get(1), keys(args, 2))?)),
         "sdiffstore" => out.int(count(db.sdiffstore(args.get(1), keys(args, 2))?)),
@@ -243,15 +254,22 @@ fn matches(pattern: Option<&[u8]>, m: Member<'_>) -> bool {
     }
 }
 
-/// `SINTERCARD numkeys key [key ...] [LIMIT limit]`.
+/// The `numkeys key [key ...] [LIMIT limit]` line, which `SINTERCARD`,
+/// `SUNIONCARD` and `SDIFFCARD` all take.
 ///
-/// The only set command that is told how many keys it has rather than taking
-/// the rest of the line, because `LIMIT` comes after them and there would
-/// otherwise be no way to tell a key named `LIMIT` from the option.
+/// They are the only set commands told how many keys they have rather than
+/// taking the rest of the line, because `LIMIT` comes after the keys and there
+/// would otherwise be no way to tell a key named `LIMIT` from the option.
 ///
-/// A limit of zero is no limit, which is Redis's reading and is the same value
-/// [`Keyspace::sintercard`] uses for it, so it goes straight through.
-fn intercard(db: &mut Keyspace, args: Args<'_>) -> Result<usize> {
+/// What comes back is where the keys stop and what the limit is. A limit of zero
+/// is no limit, which is Redis's reading and is the same value the keyspace uses
+/// for it, so it goes straight through.
+///
+/// A `LIMIT` that is not a number answers the same "can't be negative" as one
+/// that is negative. That reads like a mistake in the reference and is not worth
+/// arguing with, since a client that gets it wrong wants the same thing either
+/// way, which is to be told which argument it got wrong.
+fn cardinality(args: Args<'_>) -> Result<(usize, usize)> {
     let numkeys = match parse_i64(args.get(1)) {
         Some(n) if n > 0 => usize::try_from(n).unwrap_or(usize::MAX),
         _ => return Err(Error::new(Code::Invalid, BAD_NUMKEYS)),
@@ -269,12 +287,12 @@ fn intercard(db: &mut Keyspace, args: Args<'_>) -> Result<usize> {
         if args.len() != end + 2 || !args::is(args.get(end), b"limit") {
             return Err(args::syntax());
         }
-        limit = match args.int(end + 1)? {
-            n if n >= 0 => usize::try_from(n).unwrap_or(usize::MAX),
+        limit = match parse_i64(args.get(end + 1)) {
+            Some(n) if n >= 0 => usize::try_from(n).unwrap_or(usize::MAX),
             _ => return Err(Error::new(Code::Invalid, BAD_LIMIT)),
         };
     }
-    db.sintercard(rest(args, 2, end), limit)
+    Ok((end, limit))
 }
 
 /// Every argument after the key, which for these commands is every member.

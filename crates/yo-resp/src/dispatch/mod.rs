@@ -5234,6 +5234,97 @@ mod tests {
         assert_eq!(f.run(&[b"SINTERCARD", b"2", b"a", b"LIMIT"]), ":1\r\n");
     }
 
+    /// The two Redis 8.10 added, which are SINTERCARD's shape over a union and
+    /// over a difference. Every number here was read off 8.10.1 first.
+    #[test]
+    fn sunioncard_and_sdiffcard_count_without_building() {
+        let mut f = Fixture::new();
+        f.run(&[b"SADD", b"a", b"1", b"2", b"3", b"4"]);
+        f.run(&[b"SADD", b"b", b"3", b"4", b"5", b"6"]);
+
+        assert_eq!(f.run(&[b"SUNIONCARD", b"2", b"a", b"b"]), ":6\r\n");
+        assert_eq!(
+            f.run(&[b"SUNIONCARD", b"2", b"a", b"b", b"LIMIT", b"2"]),
+            ":2\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"SUNIONCARD", b"2", b"a", b"b", b"LIMIT", b"0"]),
+            ":6\r\n",
+            "a limit of zero is no limit"
+        );
+        assert_eq!(f.run(&[b"SUNIONCARD", b"1", b"a"]), ":4\r\n");
+        assert_eq!(
+            f.run(&[b"SUNIONCARD", b"2", b"a", b"nope"]),
+            ":4\r\n",
+            "a missing key adds nothing to a union"
+        );
+
+        assert_eq!(f.run(&[b"SDIFFCARD", b"2", b"a", b"b"]), ":2\r\n");
+        assert_eq!(
+            f.run(&[b"SDIFFCARD", b"2", b"a", b"b", b"LIMIT", b"1"]),
+            ":1\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"SDIFFCARD", b"2", b"b", b"a"]),
+            ":2\r\n",
+            "a difference is not symmetric"
+        );
+        assert_eq!(f.run(&[b"SDIFFCARD", b"1", b"a"]), ":4\r\n");
+        assert_eq!(f.run(&[b"SDIFFCARD", b"2", b"a", b"nope"]), ":4\r\n");
+        assert_eq!(
+            f.run(&[b"SDIFFCARD", b"2", b"nope", b"a"]),
+            ":0\r\n",
+            "nothing taken away from nothing"
+        );
+
+        // The same three messages SINTERCARD has, because the line is the same
+        // line and is parsed once for all three.
+        for name in [b"SUNIONCARD".as_slice(), b"SDIFFCARD".as_slice()] {
+            assert_eq!(
+                f.run(&[name, b"0", b"a"]),
+                "-ERR numkeys should be greater than 0\r\n"
+            );
+            assert_eq!(
+                f.run(&[name, b"abc", b"a"]),
+                "-ERR numkeys should be greater than 0\r\n"
+            );
+            assert_eq!(
+                f.run(&[name, b"-1", b"a"]),
+                "-ERR numkeys should be greater than 0\r\n"
+            );
+            assert_eq!(
+                f.run(&[name, b"3", b"a", b"b"]),
+                "-ERR Number of keys can't be greater than number of args\r\n"
+            );
+            assert_eq!(
+                f.run(&[name, b"2", b"a", b"b", b"LIMIT", b"-1"]),
+                "-ERR LIMIT can't be negative\r\n"
+            );
+            assert_eq!(
+                f.run(&[name, b"2", b"a", b"b", b"LIMIT", b"abc"]),
+                "-ERR LIMIT can't be negative\r\n",
+                "a LIMIT that is not a number gets the negative message too"
+            );
+            assert_eq!(
+                f.run(&[name, b"2", b"a", b"b", b"NOPE", b"1"]),
+                "-ERR syntax error\r\n"
+            );
+            assert_eq!(
+                f.run(&[name, b"2", b"a", b"b", b"LIMIT"]),
+                "-ERR syntax error\r\n"
+            );
+            assert_eq!(
+                f.run(&[name, b"2", b"a", b"b", b"LIMIT", b"1", b"X"]),
+                "-ERR syntax error\r\n"
+            );
+        }
+
+        // And a key called LIMIT is a key, here as much as on SINTERCARD.
+        f.run(&[b"SADD", b"LIMIT", b"2"]);
+        assert_eq!(f.run(&[b"SUNIONCARD", b"2", b"a", b"LIMIT"]), ":4\r\n");
+        assert_eq!(f.run(&[b"SDIFFCARD", b"2", b"a", b"LIMIT"]), ":3\r\n");
+    }
+
     #[test]
     fn the_algebra_answers_wrongtype_before_it_writes_anything() {
         let mut f = Fixture::new();
