@@ -13,7 +13,8 @@
 //!
 //! This is not a file format even though it is spelled like one. There is no
 //! header, no database selector and no end of file opcode, because the whole
-//! point is that it fits in a bulk string. The version is here so that a server
+//! point is that it fits in a bulk string. [`crate::snapshot`] is the file, and
+//! it is these same bytes with a frame around them. The version is here so that a server
 //! reading a payload can refuse one from a newer server rather than misread it,
 //! and the checksum is here because `RESTORE` takes bytes from a client and a
 //! client is allowed to be wrong.
@@ -187,7 +188,7 @@ pub const VERSION: u16 = 12;
 pub const READS_UP_TO: u16 = 15;
 
 /// The footer: two bytes of version and eight of checksum.
-const FOOTER: usize = 10;
+pub(crate) const FOOTER: usize = 10;
 
 // The object type byte. These are `rdb.h`, and the gaps are types this server
 // cannot hold, so they are not named.
@@ -312,62 +313,89 @@ fn unseal(payload: &[u8]) -> Result<&[u8], Bad> {
 /// land the answer is a missing key and not a dead server.
 pub(crate) fn dump(rec: &Record) -> Option<Vec<u8>> {
     let mut out = Vec::new();
+    if !object(rec, None, &mut out) {
+        return None;
+    }
+    Some(seal(out))
+}
+
+/// Serialise a record's value with no footer, and with a key if there is one.
+///
+/// The two callers want the same bytes in two frames. `DUMP` wants the value on
+/// its own and passes `None`, and [`crate::snapshot`] wants it as one entry in a
+/// file, where the key name sits between the type byte and the value. That is
+/// the whole reason the key is threaded down here rather than written by the
+/// caller: the type byte comes first and the key comes second, so there is no
+/// point either of them could splice a name in without copying the value again.
+///
+/// `false` for a value with no RDB shape at all, and it is answered before
+/// anything has been written, so a caller building a file does not have to undo
+/// a half written entry.
+pub(crate) fn object(rec: &Record, key: Option<&[u8]>, out: &mut Vec<u8>) -> bool {
     match rec.body() {
-        // The same `None` a sparse array gets, and for a stronger reason: a
+        // The same answer a sparse array gets, and for a stronger reason: a
         // foreign body is an engine that lives above this crate and there is no
         // byte shape for it here to write even in principle. `DUMP` on a graph
         // is refused by the dispatch before it reaches this, so nothing sees
         // the null bulk this would otherwise produce.
-        Body::Foreign(_) => return None,
+        //
+        // The sparse array is ours and has no Redis number to write under, so
+        // there is nothing for it to go out as either.
+        Body::Foreign(_) | Body::Array(_) => return false,
         Body::String(bytes) => {
-            out.push(T_STRING);
-            put_str(&mut out, bytes);
+            put_head(out, T_STRING, key);
+            put_str(out, bytes);
         }
         Body::List(list) => {
-            out.push(T_LIST);
-            put_len(&mut out, list.len() as u64);
+            put_head(out, T_LIST, key);
+            put_len(out, list.len() as u64);
             for element in list.iter() {
-                put_entry(&mut out, element);
+                put_entry(out, element);
             }
         }
         Body::Set(set) => match (set.encoding(), set.packed_bytes()) {
             (set::Encoding::Intset, Some(blob)) => {
-                out.push(T_SET_INTSET);
-                put_str(&mut out, blob);
+                put_head(out, T_SET_INTSET, key);
+                put_str(out, blob);
             }
             (set::Encoding::Listpack, Some(blob)) => {
-                out.push(T_SET_LISTPACK);
-                put_str(&mut out, blob);
+                put_head(out, T_SET_LISTPACK, key);
+                put_str(out, blob);
             }
             _ => {
-                out.push(T_SET);
-                put_len(&mut out, set.len() as u64);
+                put_head(out, T_SET, key);
+                put_len(out, set.len() as u64);
                 for member in set.iter() {
-                    put_entry(&mut out, member);
+                    put_entry(out, member);
                 }
             }
         },
         Body::Zset(zset) => match zset.packed_bytes() {
             Some(blob) => {
-                out.push(T_ZSET_LISTPACK);
-                put_str(&mut out, blob);
+                put_head(out, T_ZSET_LISTPACK, key);
+                put_str(out, blob);
             }
             None => {
-                out.push(T_ZSET_2);
-                put_len(&mut out, zset.len() as u64);
+                put_head(out, T_ZSET_2, key);
+                put_len(out, zset.len() as u64);
                 zset.walk(0, zset.len(), false, |member, score| {
-                    put_entry(&mut out, member);
+                    put_entry(out, member);
                     out.extend_from_slice(&score.to_le_bytes());
                 });
             }
         },
-        Body::Hash(hash) => put_hash(&mut out, hash),
-        Body::Stream(stream) => put_stream(&mut out, stream),
-        // The sparse array is ours and has no Redis number to write under, so
-        // there is nothing for it to go out as.
-        Body::Array(_) => return None,
+        Body::Hash(hash) => put_hash(out, hash, key),
+        Body::Stream(stream) => put_stream(out, stream, key),
     }
-    Some(seal(out))
+    true
+}
+
+/// The type byte, and the key name behind it when this is going into a file.
+fn put_head(out: &mut Vec<u8>, ty: u8, key: Option<&[u8]>) {
+    out.push(ty);
+    if let Some(key) = key {
+        put_str(out, key);
+    }
 }
 
 /// A hash, in the plain shape or the one that carries field deadlines.
@@ -378,14 +406,14 @@ pub(crate) fn dump(rec: &Record) -> Option<Vec<u8>> {
 /// worth copying: the earliest deadline in the hash goes in the header, and each
 /// field stores the difference from it plus one, so a field with no deadline is
 /// a zero and everything else is a small number rather than a full timestamp.
-fn put_hash(out: &mut Vec<u8>, hash: &Hash) {
+fn put_hash(out: &mut Vec<u8>, hash: &Hash, key: Option<&[u8]>) {
     let Some(soonest) = hash.soonest_deadline() else {
         if let Some(blob) = hash.packed_bytes() {
-            out.push(T_HASH_LISTPACK);
+            put_head(out, T_HASH_LISTPACK, key);
             put_str(out, blob);
             return;
         }
-        out.push(T_HASH);
+        put_head(out, T_HASH, key);
         put_len(out, hash.len() as u64);
         for (field, value) in hash.iter() {
             put_entry(out, field);
@@ -393,7 +421,7 @@ fn put_hash(out: &mut Vec<u8>, hash: &Hash) {
         }
         return;
     };
-    out.push(T_HASH_METADATA);
+    put_head(out, T_HASH_METADATA, key);
     out.extend_from_slice(&soonest.to_le_bytes());
     put_len(out, hash.len() as u64);
     for i in 0..hash.len() {
@@ -424,8 +452,8 @@ fn put_hash(out: &mut Vec<u8>, hash: &Hash) {
 /// empty for every stream this server can hold because it does not track
 /// producer IDs. Writing the older type is the same data in a shape more servers
 /// accept, which is the rule the rest of this file already follows.
-fn put_stream(out: &mut Vec<u8>, s: &Stream) {
-    out.push(T_STREAM_LISTPACKS_3);
+fn put_stream(out: &mut Vec<u8>, s: &Stream, key: Option<&[u8]>) {
+    put_head(out, T_STREAM_LISTPACKS_3, key);
     put_len(out, s.nodes() as u64);
     for (master, blob) in s.raw_nodes() {
         // The sixteen big endian bytes, which is the rax key Redis writes here
@@ -493,7 +521,7 @@ fn put_millis(out: &mut Vec<u8>, at: i64) {
 }
 
 /// A length, in the smallest of the four forms that holds it.
-fn put_len(out: &mut Vec<u8>, n: u64) {
+pub(crate) fn put_len(out: &mut Vec<u8>, n: u64) {
     if n < 1 << 6 {
         out.push((LEN_6BIT << 6) | n as u8);
     } else if n < 1 << 14 {
@@ -509,7 +537,7 @@ fn put_len(out: &mut Vec<u8>, n: u64) {
 }
 
 /// A string, integer encoded when that is both possible and shorter.
-fn put_str(out: &mut Vec<u8>, s: &[u8]) {
+pub(crate) fn put_str(out: &mut Vec<u8>, s: &[u8]) {
     // Redis only tries the integer encoding on strings short enough to be one,
     // which saves parsing every long value that starts with a digit.
     if s.len() <= 11
@@ -821,24 +849,7 @@ pub(crate) fn load(payload: &[u8], limits: Limits<'_>, now: u64) -> Result<Body,
     let body = unseal(payload)?;
     let mut r = Reader::new(body);
     let kind = r.byte()?;
-    let value = match kind {
-        T_STRING => Body::String(r.str()?.into_owned()),
-        T_LIST => read_list(&mut r, limits.list)?,
-        T_LIST_QUICKLIST_2 => read_quicklist(&mut r, limits.list)?,
-        T_SET => read_set(&mut r, limits.set)?,
-        T_SET_INTSET => read_intset(&mut r, limits.set)?,
-        T_SET_LISTPACK => read_set_listpack(&mut r, limits.set)?,
-        T_ZSET | T_ZSET_2 => read_zset(&mut r, limits.zset, kind == T_ZSET_2)?,
-        T_ZSET_LISTPACK => read_zset_listpack(&mut r, limits.zset)?,
-        T_HASH => read_hash(&mut r, limits.hash)?,
-        T_HASH_METADATA => read_hash_metadata(&mut r, limits.hash, now)?,
-        T_HASH_LISTPACK => read_hash_listpack(&mut r, limits.hash, false, now)?,
-        T_HASH_LISTPACK_EX => read_hash_listpack(&mut r, limits.hash, true, now)?,
-        T_STREAM_LISTPACKS | T_STREAM_LISTPACKS_2 | T_STREAM_LISTPACKS_3 | T_STREAM_LISTPACKS_4 => {
-            read_stream(&mut r, kind)?
-        }
-        _ => return Err(Bad::Format),
-    };
+    let value = read_object(&mut r, kind, limits, now)?;
     // Trailing bytes mean the payload was not what it said it was, even though
     // everything read so far parsed. Redis is stricter than it looks here and so
     // is this, because a payload with something extra on the end is either a
@@ -847,6 +858,59 @@ pub(crate) fn load(payload: &[u8], limits: Limits<'_>, now: u64) -> Result<Body,
         return Err(Bad::Format);
     }
     Ok(value)
+}
+
+/// Read one value, leaving the reader wherever that value ended.
+///
+/// Split out from [`load`] because a payload holds exactly one value and a file
+/// holds a great many, so the file reader cannot use the check that there is
+/// nothing left over. It is also what says how long a value is: nothing in the
+/// format writes that down, and the only way to find the end of one is to read
+/// it.
+fn read_object(r: &mut Reader<'_>, kind: u8, limits: Limits<'_>, now: u64) -> Result<Body, Bad> {
+    Ok(match kind {
+        T_STRING => Body::String(r.str()?.into_owned()),
+        T_LIST => read_list(r, limits.list)?,
+        T_LIST_QUICKLIST_2 => read_quicklist(r, limits.list)?,
+        T_SET => read_set(r, limits.set)?,
+        T_SET_INTSET => read_intset(r, limits.set)?,
+        T_SET_LISTPACK => read_set_listpack(r, limits.set)?,
+        T_ZSET | T_ZSET_2 => read_zset(r, limits.zset, kind == T_ZSET_2)?,
+        T_ZSET_LISTPACK => read_zset_listpack(r, limits.zset)?,
+        T_HASH => read_hash(r, limits.hash)?,
+        T_HASH_METADATA => read_hash_metadata(r, limits.hash, now)?,
+        T_HASH_LISTPACK => read_hash_listpack(r, limits.hash, false, now)?,
+        T_HASH_LISTPACK_EX => read_hash_listpack(r, limits.hash, true, now)?,
+        T_STREAM_LISTPACKS | T_STREAM_LISTPACKS_2 | T_STREAM_LISTPACKS_3 | T_STREAM_LISTPACKS_4 => {
+            read_stream(r, kind)?
+        }
+        _ => return Err(Bad::Format),
+    })
+}
+
+/// How many bytes a value of type `ty` takes at the front of `bytes`.
+///
+/// Only the tests want this, and what they want it for is to walk a file this
+/// crate wrote without trusting this crate's own idea of where each value ends.
+/// It is here rather than in [`crate::snapshot`] because [`Reader`] is private
+/// and should stay that way.
+#[cfg(test)]
+pub(crate) fn measure(ty: u8, bytes: &[u8]) -> Option<usize> {
+    let (s, h, l, z) = (
+        set::Limits::DEFAULT,
+        hash::Limits::DEFAULT,
+        list::Limits::default(),
+        zset::Limits::DEFAULT,
+    );
+    let limits = Limits {
+        set: &s,
+        hash: &h,
+        list: &l,
+        zset: &z,
+    };
+    let mut r = Reader::new(bytes);
+    read_object(&mut r, ty, limits, 0).ok()?;
+    Some(r.at)
 }
 
 /// An empty collection is not a value, it is a deleted key.
