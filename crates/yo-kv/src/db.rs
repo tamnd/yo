@@ -593,6 +593,32 @@ impl<'a> Holds<'a> {
         &self.spill[at].1
     }
 
+    /// The same, for writing.
+    ///
+    /// One stripe at a time even though every one of them is held, because a
+    /// command that writes into two of them at once would need the borrow
+    /// checker told they are different ones and nothing here does that. A
+    /// rename takes the record out of one and puts it in the other, and the
+    /// record owns what it holds in between.
+    ///
+    /// # Panics
+    ///
+    /// As [`Holds::stripe`].
+    #[must_use]
+    pub fn stripe_mut(&mut self, i: usize) -> &mut Keyspace {
+        let home = i as u16;
+        for slot in self.room[..self.n].iter_mut().flatten() {
+            if slot.0 == home {
+                return &mut slot.1;
+            }
+        }
+        let at = self
+            .spill
+            .binary_search_by_key(&home, |&(where_, _)| where_)
+            .expect("a stripe that was asked for");
+        &mut self.spill[at].1
+    }
+
     /// How many stripes are being held.
     #[must_use]
     pub fn len(&self) -> usize {

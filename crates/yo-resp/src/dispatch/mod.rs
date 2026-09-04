@@ -1399,8 +1399,9 @@ pub fn resolved(
             }
             // Every database and not the one the session is on, because `COPY` takes
             // a `DB n` and writes into a database nobody selected.
-            "keyspace" => keyspace::execute(&mut server.dbs, session.db, spec, args, out)
-                .map(|()| Flow::Continue),
+            "keyspace" => {
+                keyspace::execute(&server.dbs, session.db, spec, args, out).map(|()| Flow::Continue)
+            }
             // No database at all, because an index is not a key. The registry
             // is the whole of what these sixteen commands touch.
             "search" => {

@@ -20,10 +20,10 @@ use super::args::{self, Args};
 use super::scan;
 use super::table::Spec;
 use crate::reply::Out;
-use yo_common::{Code, Error, Result, glob_matches};
+use yo_common::{Code, Error, Held, Result, glob_matches};
 use yo_kv::rdb::Bad;
 use yo_kv::sort::Sort;
-use yo_kv::{Applied, Ask, Cond, Db, Keyspace, Kind, MAX_AT, Moved};
+use yo_kv::{Applied, Ask, Cond, Db, Holds, Keyspace, Kind, MAX_AT, Moved};
 
 /// Milliseconds in a second, which is the whole of what the p in `PTTL` means.
 const SECOND: i64 = 1000;
@@ -114,7 +114,7 @@ const OBJECT_HELP: &[&str] = &[
 /// and the three walks, which are about a database rather than about a key and
 /// so go through [`Db`] and reach all of them.
 pub(super) fn execute(
-    dbs: &mut [Db],
+    dbs: &[Db],
     at: usize,
     spec: &Spec,
     args: Args<'_>,
@@ -127,7 +127,7 @@ pub(super) fn execute(
         "move" => return move_key(dbs, at, args, out),
         _ => {}
     }
-    let db = &mut dbs[at];
+    let db = &dbs[at];
     match spec.name {
         // `UNLINK` is `DEL` with the freeing moved to a background thread on a
         // real server. Ours frees on the spot, which is what `UNLINK` promises
@@ -138,7 +138,7 @@ pub(super) fn execute(
             let mut gone = 0i64;
             for i in 1..args.len() {
                 let key = args.get(i);
-                if db.at(key).del(key) {
+                if db.hold(key).del(key) {
                     gone += 1;
                 }
             }
@@ -150,7 +150,7 @@ pub(super) fn execute(
             let mut found = 0i64;
             for i in 1..args.len() {
                 let key = args.get(i);
-                if db.at(key).exists(key) {
+                if db.hold(key).exists(key) {
                     found += 1;
                 }
             }
@@ -161,7 +161,7 @@ pub(super) fn execute(
             // knows its own word and the tag it rides on does not. A client
             // asking about a graph is told `graph`.
             let key = args.get(1);
-            let name = match db.at(key).type_name(key) {
+            let name = match db.hold(key).type_name(key) {
                 Some(name) => name.as_bytes(),
                 None => &b"none"[..],
             };
@@ -181,7 +181,7 @@ pub(super) fn execute(
             let mut hit = 0i64;
             for i in 1..args.len() {
                 let key = args.get(i);
-                hit += db.at(key).touch(core::iter::once(key)) as i64;
+                hit += db.hold(key).touch(core::iter::once(key)) as i64;
             }
             out.int(hit);
         }
@@ -189,7 +189,7 @@ pub(super) fn execute(
         "expire" | "pexpire" | "expireat" | "pexpireat" => expire(db, spec.name, args, out)?,
         "persist" => {
             let key = args.get(1);
-            out.int(i64::from(db.at(key).persist(key)));
+            out.int(i64::from(db.hold(key).persist(key)));
         }
         "ttl" | "pttl" | "expiretime" | "pexpiretime" => ask(db, spec.name, args, out),
         "object" => object(db, args, out)?,
@@ -201,16 +201,16 @@ pub(super) fn execute(
         // element, and every one of those lookups can land on a different
         // stripe, so there is nothing to route once at this end.
         "sort" | "sort_ro" => sort(db, spec.name, args, out)?,
-        // A foreign body is refused rather than answered with the null bulk a
-        // missing key gets, because there is no byte shape for one and a client
-        // that could not tell the two apart would think its key had gone.
-        "dump" if is_foreign(db.at(args.get(1)), args.get(1)) => {
-            let key = args.get(1);
-            return Err(no_dump(db.at(key), key));
-        }
+        // One arm and not a guarded pair, because a guard and the arm behind
+        // it would each want this stripe and the second would be waiting on the
+        // first.
         "dump" => {
             let key = args.get(1);
-            match db.at(key).dump(key) {
+            let mut stripe = db.hold(key);
+            if is_foreign(&mut stripe, key) {
+                return Err(no_dump(&mut stripe, key));
+            }
+            match stripe.dump(key) {
                 Some(payload) => out.bulk(&payload),
                 None => out.nil(),
             }
@@ -249,7 +249,7 @@ pub(super) fn execute(
 /// An unknown `TYPE` is not an error. Redis compares the word against the type
 /// of each key it walks past, so a type nothing can hold matches nothing and
 /// the scan runs to the end answering nothing, which is what happens here.
-fn scan(db: &mut Db, args: Args<'_>, out: &mut Out) -> Result<()> {
+fn scan(db: &Db, args: Args<'_>, out: &mut Out) -> Result<()> {
     let cursor = scan::parse_cursor(args.get(1))?;
     let mut pattern = None;
     let mut count = scan::COUNT;
@@ -302,7 +302,7 @@ fn scan(db: &mut Db, args: Args<'_>, out: &mut Out) -> Result<()> {
 /// which is the command's whole reputation and is deserved. It is here because
 /// tooling and Redis's own test suite both want it, and `SCAN` is the answer
 /// for anything that runs against a database somebody is using.
-fn keys(db: &mut Db, pattern: &[u8], out: &mut Out) {
+fn keys(db: &Db, pattern: &[u8], out: &mut Out) {
     let at = out.len();
     let mut n = 0;
     db.keys(|key| {
@@ -391,14 +391,17 @@ fn no_dump(db: &mut Keyspace, key: &[u8]) -> Error {
 /// stripe this is the store's own rename, which moves thirteen bytes and leaves
 /// the body where it is. Across two it is a take and an import, which moves the
 /// body from one slab to the other and still does not copy it.
-fn rename(db: &mut Db, name: &str, args: Args<'_>, out: &mut Out) -> Result<()> {
+fn rename(db: &Db, name: &str, args: Args<'_>, out: &mut Out) -> Result<()> {
     let nx = name == "renamenx";
     let (src, dst) = (args.get(1), args.get(2));
     let (from, to) = (db.stripe_of(src), db.stripe_of(dst));
     let done = if from == to {
-        db.stripe_mut(from).rename(src, dst, nx)
+        db.hold_stripe(from).rename(src, dst, nx)
     } else {
-        rename_across(db, from, to, src, dst, nx)
+        // Both at once and in stripe order, so the key is never in neither
+        // stripe and never in both, whoever else is reading either of them.
+        let mut held = db.hold_many([from, to].into_iter());
+        rename_across(&mut held, from, to, src, dst, nx)
     };
     let done = done.found()?;
     if nx {
@@ -420,18 +423,25 @@ fn rename(db: &mut Db, name: &str, args: Args<'_>, out: &mut Out) -> Result<()> 
 /// The destination is asked about before the source is taken, which is not the
 /// cost worry it is in `COPY`, since a take does not clone. It is that a take
 /// cannot be put back: the body is out of the slab by then and the key is gone.
-fn rename_across(db: &mut Db, from: usize, to: usize, src: &[u8], dst: &[u8], nx: bool) -> Moved {
-    if !db.stripe_mut(from).exists(src) {
+fn rename_across(
+    held: &mut Holds<'_>,
+    from: usize,
+    to: usize,
+    src: &[u8],
+    dst: &[u8],
+    nx: bool,
+) -> Moved {
+    if !held.stripe_mut(from).exists(src) {
         return Moved::Missing;
     }
-    if nx && db.stripe_mut(to).exists(dst) {
+    if nx && held.stripe_mut(to).exists(dst) {
         return Moved::Taken;
     }
-    let rec = db
+    let rec = held
         .stripe_mut(from)
         .take(src)
         .expect("the source was live a line ago");
-    db.stripe_mut(to).import(dst, rec);
+    held.stripe_mut(to).import(dst, rec);
     Moved::Ok
 }
 
@@ -447,7 +457,7 @@ fn rename_across(db: &mut Db, from: usize, to: usize, src: &[u8], dst: &[u8], nx
 /// `COPY a a DB 1` is a real copy and `COPY a a DB 0` from database zero is
 /// the error. That is why the check is down here and not next to the argument
 /// parsing: it needs to know which database was asked for.
-fn copy(dbs: &mut [Db], at: usize, args: Args<'_>, out: &mut Out) -> Result<()> {
+fn copy(dbs: &[Db], at: usize, args: Args<'_>, out: &mut Out) -> Result<()> {
     let (src, dst) = (args.get(1), args.get(2));
     let mut into = at;
     let mut replace = false;
@@ -475,37 +485,38 @@ fn copy(dbs: &mut [Db], at: usize, args: Args<'_>, out: &mut Out) -> Result<()> 
         return Err(Error::new(Code::Invalid, SAME_OBJECT));
     }
     let (from, to) = (spot(dbs, at, src), spot(dbs, into, dst));
-    let done = if from == to {
-        match at_spot(dbs, from).copy(src, dst, replace) {
+    let done = match hold_both(dbs, from, to) {
+        Both::One(mut ks) => match ks.copy(src, dst, replace) {
             // The one `Moved` a caller cannot answer with a number, because
             // zero would mean the destination was taken and this is a source
             // there is no way to duplicate. See `Moved::Unsupported`.
-            Moved::Unsupported => return Err(no_copy(at_spot(dbs, from), src)),
+            Moved::Unsupported => return Err(no_copy(&mut ks, src)),
             done => done,
-        }
-    } else {
+        },
         // Two keyspaces, whether that is two databases or two stripes of one,
         // so the value comes out of the first standing on its own before the
-        // second is touched. The borrow of the first ends with the export,
-        // which is the reason the pair exists as two calls.
+        // second is touched. Both are held for the whole of it, so neither end
+        // can move while the record is in the air.
         //
         // The destination is asked about first, which is the opposite order from
         // the single keyspace path above and answers the same thing. Export
         // clones the body, so asking first is the difference between a refused
         // copy of a million member set costing nothing and costing the set.
-        if !replace && at_spot(dbs, to).exists(dst) {
-            out.int(0);
-            return Ok(());
+        Both::Two(mut from, mut to) => {
+            if !replace && to.exists(dst) {
+                out.int(0);
+                return Ok(());
+            }
+            if is_foreign(&mut from, src) {
+                return Err(no_copy(&mut from, src));
+            }
+            let Some(rec) = from.export(src) else {
+                out.int(0);
+                return Ok(());
+            };
+            to.import(dst, rec);
+            Moved::Ok
         }
-        if is_foreign(at_spot(dbs, from), src) {
-            return Err(no_copy(at_spot(dbs, from), src));
-        }
-        let Some(rec) = at_spot(dbs, from).export(src) else {
-            out.int(0);
-            return Ok(());
-        };
-        at_spot(dbs, to).import(dst, rec);
-        Moved::Ok
     };
     out.int(i64::from(done == Moved::Ok));
     Ok(())
@@ -520,18 +531,38 @@ fn copy(dbs: &mut [Db], at: usize, args: Args<'_>, out: &mut Out) -> Result<()> 
 type Spot = (usize, usize);
 
 /// Which database and stripe `key` is on.
-fn spot(dbs: &mut [Db], db: usize, key: &[u8]) -> Spot {
+fn spot(dbs: &[Db], db: usize, key: &[u8]) -> Spot {
     (db, dbs[db].stripe_of(key))
 }
 
-/// The keyspace at a spot.
+/// The one or two keyspaces two spots name.
+enum Both<'d> {
+    /// One, because the two spots are the same spot.
+    One(Held<'d, Keyspace>),
+    /// Two, the source first and the destination second whichever order the
+    /// two of them were taken in.
+    Two(Held<'d, Keyspace>, Held<'d, Keyspace>),
+}
+
+/// Both spots, held.
 ///
-/// Taken one call at a time rather than two at once, because two keyspaces held
-/// together would need the borrow checker told they are different ones, and
-/// nothing here holds the first while it uses the second: a record comes out
-/// owning what it holds and the next line puts it somewhere else.
-fn at_spot(dbs: &mut [Db], spot: Spot) -> &mut Keyspace {
-    dbs[spot.0].stripe_mut(spot.1)
+/// The lower spot is taken first whichever of the two it is, so that two
+/// clients copying in opposite directions cannot each end up holding what the
+/// other is waiting for. The same spot twice is held once, since holding one
+/// stripe twice is a wait for yourself.
+fn hold_both(dbs: &[Db], from: Spot, to: Spot) -> Both<'_> {
+    if from == to {
+        return Both::One(dbs[from.0].hold_stripe(from.1));
+    }
+    if from < to {
+        let source = dbs[from.0].hold_stripe(from.1);
+        let dest = dbs[to.0].hold_stripe(to.1);
+        Both::Two(source, dest)
+    } else {
+        let dest = dbs[to.0].hold_stripe(to.1);
+        let source = dbs[from.0].hold_stripe(from.1);
+        Both::Two(source, dest)
+    }
 }
 
 /// `RESTORE key ttl payload [REPLACE] [ABSTTL] [IDLETIME n] [FREQ n]`.
@@ -550,9 +581,9 @@ fn at_spot(dbs: &mut [Db], spot: Spot) -> &mut Keyspace {
 ///
 /// A ttl is milliseconds from now unless `ABSTTL`, in which case it is a unix
 /// time, and a zero means no deadline at all in both readings.
-fn restore(db: &mut Db, args: Args<'_>, out: &mut Out) -> Result<()> {
+fn restore(db: &Db, args: Args<'_>, out: &mut Out) -> Result<()> {
     let key = args.get(1);
-    let db = db.at(key);
+    let mut db = db.hold(key);
     let mut replace = false;
     let mut absolute = false;
     let mut idle = -1i64;
@@ -635,7 +666,7 @@ fn restore(db: &mut Db, args: Args<'_>, out: &mut Out) -> Result<()> {
 /// Redis checks in and answers the same thing both ways round. Here it is not
 /// about cost, it is that a take that has to be put back is not something this
 /// can do: the body is out of the slab by then and the key is gone.
-fn move_key(dbs: &mut [Db], at: usize, args: Args<'_>, out: &mut Out) -> Result<()> {
+fn move_key(dbs: &[Db], at: usize, args: Args<'_>, out: &mut Out) -> Result<()> {
     let key = args.get(1);
     let n = args.int(2)?;
     let into = usize::try_from(n)
@@ -651,15 +682,20 @@ fn move_key(dbs: &mut [Db], at: usize, args: Args<'_>, out: &mut Out) -> Result<
     // one and assumed of the other is the kind of assumption that holds until
     // somebody adds a knob.
     let (from, to) = (spot(dbs, at, key), spot(dbs, into, key));
-    if at_spot(dbs, to).exists(key) {
+    // Two databases, so never one keyspace, which is why this one has no
+    // single keyspace path the way `COPY` does.
+    let Both::Two(mut from, mut to) = hold_both(dbs, from, to) else {
+        unreachable!("a move into the database the key is already in was refused above")
+    };
+    if to.exists(key) {
         out.int(0);
         return Ok(());
     }
-    let Some(rec) = at_spot(dbs, from).take(key) else {
+    let Some(rec) = from.take(key) else {
         out.int(0);
         return Ok(());
     };
-    at_spot(dbs, to).import(key, rec);
+    to.import(key, rec);
     out.int(1);
     Ok(())
 }
@@ -679,7 +715,7 @@ fn move_key(dbs: &mut [Db], at: usize, args: Args<'_>, out: &mut Out) -> Result<
 /// `GET # GET w_*` asks for two things per element and not for the second one
 /// twice. The patterns are collected into a small vector, which is the one
 /// allocation this parser makes and only when a `GET` was given at all.
-fn sort(db: &mut Db, name: &str, args: Args<'_>, out: &mut Out) -> Result<()> {
+fn sort(db: &Db, name: &str, args: Args<'_>, out: &mut Out) -> Result<()> {
     let read_only = name == "sort_ro";
     let key = args.get(1);
     let mut opts = Sort::default();
@@ -750,8 +786,8 @@ fn sort(db: &mut Db, name: &str, args: Args<'_>, out: &mut Out) -> Result<()> {
 /// when it says 1: the deadline went on, or the deadline had already passed and
 /// the key went away. The store answers that distinction and the wire throws it
 /// away, because that is what Redis puts on the wire.
-fn expire(db: &mut Db, name: &str, args: Args<'_>, out: &mut Out) -> Result<()> {
-    let db = db.at(args.get(1));
+fn expire(db: &Db, name: &str, args: Args<'_>, out: &mut Out) -> Result<()> {
+    let mut db = db.hold(args.get(1));
     let relative = matches!(name, "expire" | "pexpire");
     let scale = if matches!(name, "pexpire" | "pexpireat") {
         1
@@ -858,9 +894,9 @@ fn condition(args: Args<'_>) -> Result<Cond> {
 /// what 8.10.1 does: `HPEXPIRE h 400 FIELDS 1 f` then `HTTL` answers 1 where
 /// `PEXPIRE k 400` then `TTL` answers 0. Two commands, two roundings, checked
 /// against a real server rather than reasoned about.
-fn ask(db: &mut Db, name: &str, args: Args<'_>, out: &mut Out) {
+fn ask(db: &Db, name: &str, args: Args<'_>, out: &mut Out) {
     let key = args.get(1);
-    let db = db.at(key);
+    let mut db = db.hold(key);
     let now = db.clock().now_ms();
     let asked = db.deadline_of(key);
     let millis = name == "pttl" || name == "pexpiretime";
@@ -892,7 +928,7 @@ fn ask(db: &mut Db, name: &str, args: Args<'_>, out: &mut Out) {
 /// A missing key answers nil rather than an error, on all four. That reads like
 /// a bug and it is what 8.10.1 does, checked rather than assumed, and it used to
 /// be `no such key` years ago which is where the confusion comes from.
-fn object(db: &mut Db, args: Args<'_>, out: &mut Out) -> Result<()> {
+fn object(db: &Db, args: Args<'_>, out: &mut Out) -> Result<()> {
     let sub = args.get(1);
     if args::is(sub, b"help") {
         if args.len() != 2 {
@@ -924,7 +960,7 @@ fn object(db: &mut Db, args: Args<'_>, out: &mut Out) -> Result<()> {
     // and `HELP` above is the one that names no key at all and so has no stripe
     // to be on.
     let key = args.get(2);
-    let db = db.at(key);
+    let mut db = db.hold(key);
     if !db.exists(key) {
         out.nil();
         return Ok(());

@@ -378,7 +378,7 @@ impl Want {
     fn attempt(
         &self,
         keys: &[Vec<u8>],
-        db: &mut Db,
+        db: &Db,
         now: u64,
         out: &mut Out,
         strict: bool,
@@ -395,7 +395,7 @@ impl Want {
                     }
                     out.array(2);
                     out.bulk(key);
-                    db.at(key).pop_into(key, *end, 1, |e| element(out, e))?;
+                    db.hold(key).pop_into(key, *end, 1, |e| element(out, e))?;
                     return Ok(true);
                 }
                 Ok(false)
@@ -426,7 +426,7 @@ impl Want {
                     }
                     out.array(3);
                     out.bulk(key);
-                    db.at(key).zpop(key, *end, 1, |m, sc| {
+                    db.hold(key).zpop(key, *end, 1, |m, sc| {
                         member(out, m);
                         out.double(sc);
                     })?;
@@ -442,7 +442,7 @@ impl Want {
                     out.array(2);
                     out.bulk(key);
                     let mark = out.len();
-                    let n = db.at(key).zpop(key, *end, *count, |m, sc| {
+                    let n = db.hold(key).zpop(key, *end, *count, |m, sc| {
                         out.array(2);
                         member(out, m);
                         out.double(sc);
@@ -481,7 +481,7 @@ impl Want {
             // nothing and answer nothing while looking like it had tried.
             Want::MoveM { dst, mv } => {
                 let src = &keys[0];
-                let have = match db.at(src).llen(src) {
+                let have = match db.hold(src).llen(src) {
                     Ok(n) => n,
                     Err(e) if strict => return Err(e),
                     Err(_) => return Ok(false),
@@ -520,8 +520,8 @@ impl Want {
 ///
 /// A key of the wrong type is an error to the command handler and not one to the
 /// retry, which is the whole of what `strict` decides.
-fn ready(db: &mut Db, key: &[u8], strict: bool) -> Result<bool> {
-    match db.at(key).llen(key) {
+fn ready(db: &Db, key: &[u8], strict: bool) -> Result<bool> {
+    match db.hold(key).llen(key) {
         Ok(n) => Ok(n > 0),
         Err(e) if strict => Err(e),
         Err(_) => Ok(false),
@@ -529,8 +529,8 @@ fn ready(db: &mut Db, key: &[u8], strict: bool) -> Result<bool> {
 }
 
 /// The same for a sorted set, which has its own emptiness to ask about.
-fn zready(db: &mut Db, key: &[u8], strict: bool) -> Result<bool> {
-    match db.at(key).zcard(key) {
+fn zready(db: &Db, key: &[u8], strict: bool) -> Result<bool> {
+    match db.hold(key).zcard(key) {
         Ok(n) => Ok(n > 0),
         Err(e) if strict => Err(e),
         Err(_) => Ok(false),
@@ -627,7 +627,7 @@ impl Block {
     /// # Errors
     ///
     /// A key of another type, which is an error rather than a wait.
-    fn now(&self, db: &mut Db, now: u64, out: &mut Out) -> Result<bool> {
+    fn now(&self, db: &Db, now: u64, out: &mut Out) -> Result<bool> {
         self.want.attempt(&self.keys, db, now, out, true)
     }
 
@@ -783,10 +783,10 @@ impl Waiters {
     /// # Panics
     ///
     /// As [`Waiters::at`].
-    fn try_serve(&self, at: usize, dbs: &mut [Db], now: u64, out: &mut Out) -> bool {
+    fn try_serve(&self, at: usize, dbs: &[Db], now: u64, out: &mut Out) -> bool {
         let w = &self.list[at];
         let mark = out.len();
-        match w.want.attempt(&w.keys, &mut dbs[w.db], now, out, false) {
+        match w.want.attempt(&w.keys, &dbs[w.db], now, out, false) {
             Ok(true) => return true,
             Ok(false) => {}
             // `strict` is off, so nothing in there returns an error today.
@@ -844,6 +844,6 @@ impl Server {
         // outside `execute` so nothing else has marked the database for the
         // maintenance turn.
         self.dirty |= 1u64 << self.waiters.db_of(at);
-        self.waiters.try_serve(at, &mut self.dbs, now, out)
+        self.waiters.try_serve(at, &self.dbs, now, out)
     }
 }
