@@ -1,11 +1,12 @@
 //! `TS.*`, the time series family RedisTimeSeries put on the wire.
 //!
 //! The series itself is in `yo-series` and this is the wire in front of it, the
-//! same split as `super::cms` and the other module families. Fourteen commands
+//! same split as `super::cms` and the other module families. Sixteen commands
 //! here: the key type, the two that shape a series, the four that write samples
 //! into it, the one that takes the newest sample back out, the one that reports
-//! on it, the two that read a span back either way round and the three that
-//! search on labels. The two multi key reads and the compaction rules come next.
+//! on it, the two that read a span back either way round, the three that search
+//! on labels and the two that read a span out of every series at once. The
+//! compaction rules come next.
 //!
 //! # Errors
 //!
@@ -123,6 +124,46 @@
 //! Two of the sentences the module raises about the keyword `SELECTED_LABELS`
 //! spell it `SELECT_LABELS`, without the `ED`. That is copied as it stands.
 //!
+//! # The multi key range reads
+//!
+//! `TS.MRANGE` and `TS.MREVRANGE` are the single key read with a filter list in
+//! front of them and an optional group behind them, so everything about buckets,
+//! alignment, `COUNT` and the two sample filters is settled one series at a time
+//! before a group ever sees a row. The only new arithmetic is the fold.
+//!
+//! The group grammar is three lookups rather than a parse. The `GROUPBY` is the
+//! first one written and it has to sit behind the `FILTER` or the command is
+//! refused for that alone. Its words are only a group when it is exactly four
+//! from the end of the command, and until that is known its words are read as
+//! filters, so `FILTER nope GROUPBY x REDUCE avg extra` answers about `nope`
+//! rather than about the length. The reducer is the word behind the first
+//! `REDUCE` anywhere in the command and not the word three past the `GROUPBY`,
+//! which is worth knowing because a group on a label spelled `REDUCE` then
+//! reduces by whatever word follows that one and usually fails.
+//!
+//! Ten reductions are allowed as a reducer, which is the fifteen a bucket takes
+//! less the weighted mean, the first, the last and the two counts only a
+//! compaction rule uses. A read already answering more than one number a row has
+//! nothing to hand a reducer and is refused rather than reduced on one column.
+//!
+//! A group folds the rows its members answered by timestamp, and a timestamp
+//! only one member answered for is still a row. Readings that are not numbers
+//! are dropped before the reduction runs, so a moment where every member held an
+//! empty bucket answers not a number, except a count, which answers zero. A
+//! `COUNT` is applied to each member and then again to the fold, so a group can
+//! answer fewer rows than the count asked for and never more. Series that do not
+//! wear the label at all drop out of the reply entirely, a series wearing it
+//! twice lands in the group its first value names, groups come out sorted by
+//! name and the members of one come out sorted by key.
+//!
+//! The two protocols disagree about where the reducer and the member keys go.
+//! RESP2 has nowhere to put them, so a `WITHLABELS` group writes them as two
+//! more labels named `__reducer__` and `__source__`, the second holding the
+//! member keys joined with commas. RESP3 writes them as two fields of their own,
+//! `reducers` and `sources`, and leaves the labels holding only the pair the
+//! group was made on. A `SELECTED_LABELS` on a group is looked up against that
+//! one pair, so any other name comes back against a nil.
+//!
 //! # Where the two protocols disagree
 //!
 //! A sample value is a simple string of the shortest digits that read back as
@@ -169,7 +210,9 @@
 use yo_common::num::{DOUBLE_MAX, parse_f64, parse_i64, write_dragonbox};
 use yo_common::{Code, Error, Result};
 use yo_kv::{Foreign, KeyCursor, Keyspace, Kind};
-use yo_series::{Agg, Buckets, Encoding, Policy, Query, Refused, Sample, Series, Stamp, Unread};
+use yo_series::{
+    Agg, Buckets, Encoding, Policy, Query, Refused, Rows, Sample, Series, Stamp, Unread,
+};
 
 use super::args::{self, Args};
 use super::table::Spec;
@@ -288,6 +331,23 @@ const EXPECTED_FILTER: &[u8] = b"TSDB: unknown argument, expected FILTER";
 const BOTH_LABELS: &[u8] = b"TSDB: cannot accept WITHLABELS and SELECT_LABELS together";
 /// A `SELECTED_LABELS` with no label named behind it, spelled the same way.
 const NO_SELECTED: &[u8] = b"TSDB: SELECT_LABELS should have at least 1 parameter";
+
+/// A multi key range read with no `FILTER` anywhere in it.
+const MISSING_FILTER: &[u8] = b"TSDB: missing FILTER argument";
+
+/// A `FILTER` on a multi key range read with nothing behind it. `TS.MGET` says
+/// something else in the same situation and both sentences are copied.
+const NO_FILTER_LABELS: &[u8] = b"TSDB: missing labels for filter argument";
+
+/// A `GROUPBY` written in front of the filters rather than behind them.
+const GROUPBY_ORDER: &[u8] = b"TSDB: GROUPBY should always come after filter";
+
+/// A reducer name that is not one of the ten a group takes.
+const BAD_REDUCER: &[u8] = b"TSDB: Invalid reducer type";
+
+/// A group over a read that already answers more than one number a row.
+const GROUPBY_COLUMNS: &[u8] =
+    b"TSDB: GROUPBY is not allowed when multiple aggregators are specified";
 /// A retention below zero, which the module writes with no prefix at all where
 /// a retention that is not a number gets one.
 const BARE_RETENTION: &[u8] = b"TSDB: Couldn't parse RETENTION";
@@ -316,13 +376,14 @@ const MAX_AGGS: usize = 16;
 /// How many timestamps `FILTER_BY_TS` will read. The ones past this are left
 /// where they are rather than being an error, which is the module's.
 const MAX_FILTER_TS: usize = 128;
-/// Where the option words on a read start.
+/// Where the two ends of the span sit on a single key read.
 ///
-/// The module scans for them from the `to` slot onwards, and that slot has
-/// already had to be a timestamp by the time the scan runs, so nothing is ever
-/// found there. It is still where the scan starts, so it is where this one
-/// starts too.
-const OPTIONS_AT: usize = 3;
+/// The option words start one slot past that. The module scans for them from
+/// the `to` slot onwards, and that slot has already had to be a timestamp by the
+/// time the scan runs, so nothing is ever found there. It is still where the
+/// scan starts, so it is where this one starts too. A multi key read has no key
+/// in front of the span and passes 1 instead.
+const SPAN_AT: usize = 2;
 
 /// A series under a key.
 #[derive(Debug)]
@@ -369,6 +430,8 @@ pub(super) fn execute(db: &mut Keyspace, spec: &Spec, args: Args<'_>, out: &mut 
         "ts.queryindex" => queryindex(db, &args, out),
         "ts.querylabels" => querylabels(db, &args, out),
         "ts.mget" => mget(db, &args, out),
+        "ts.mrange" => mrange(db, &args, out, false),
+        "ts.mrevrange" => mrange(db, &args, out, true),
         "ts.info" => info(db, &args, out),
         other => unreachable!("{other} is not a time series command"),
     }
@@ -594,7 +657,7 @@ fn range(db: &mut Keyspace, args: &Args<'_>, out: &mut Out, reverse: bool) -> Re
     let Some(body) = read(db, args.get(1))? else {
         return say(out, MISSING);
     };
-    let query = match reading(args, reverse) {
+    let query = match reading(args, reverse, SPAN_AT) {
         Ok(query) => query,
         Err(bad) => return said(bad, name, out),
     };
@@ -602,39 +665,39 @@ fn range(db: &mut Keyspace, args: &Args<'_>, out: &mut Out, reverse: bool) -> Re
         Ok(rows) => rows,
         Err(Unread::TooWide) => return say(out, TOO_WIDE),
     };
-    out.array(rows.len());
-    for i in 0..rows.len() {
-        let row = rows.row(i);
-        out.array(1 + row.len());
-        out.int(rows.stamps[i]);
-        for &d in row {
-            value(out, d);
-        }
-    }
+    spread(out, &rows);
     Ok(())
 }
 
 /// Everything a read asked for, gathered off the command.
-fn reading(args: &Args<'_>, reverse: bool) -> core::result::Result<Query, Bad> {
+fn reading(args: &Args<'_>, reverse: bool, at: usize) -> core::result::Result<Query, Bad> {
+    let opts = at + 1;
     // Which end was written open matters later: an alignment against an end
     // that was never named is an error, and only the one character counts as
     // naming nothing.
-    let open_start = args.get(2) == b"-";
-    let Some(from) = span(args.get(2), b"-", 0) else {
+    let open_start = args.get(at) == b"-";
+    let Some(from) = span(args.get(at), b"-", 0) else {
         return Err(Bad::Said(BAD_FROM));
     };
-    let open_end = args.get(3) == b"+";
-    let Some(to) = span(args.get(3), b"+", i64::MAX) else {
+    let open_end = args.get(at + 1) == b"+";
+    let Some(to) = span(args.get(at + 1), b"+", i64::MAX) else {
         return Err(Bad::Said(BAD_TO));
     };
 
     // LATEST comes first in the module and means read through to the compaction
     // rule that feeds this series. Nothing has rules yet, so it is read for the
     // order of the errors around it and then dropped.
-    let count = count_of(args)?;
-    let mut buckets = buckets_of(args)?;
-    if let Some(align) = align_of(args, buckets.is_some(), open_start, open_end, from, to)?
-        && let Some(buckets) = buckets.as_mut()
+    let count = count_of(args, opts)?;
+    let mut buckets = buckets_of(args, opts)?;
+    if let Some(align) = align_of(
+        args,
+        opts,
+        buckets.is_some(),
+        open_start,
+        open_end,
+        from,
+        to,
+    )? && let Some(buckets) = buckets.as_mut()
     {
         buckets.align = align;
     }
@@ -643,8 +706,8 @@ fn reading(args: &Args<'_>, reverse: bool) -> core::result::Result<Query, Bad> {
         to,
         reverse,
         count,
-        by_ts: by_ts(args)?,
-        by_value: by_value(args)?,
+        by_ts: by_ts(args, opts)?,
+        by_value: by_value(args, opts)?,
         buckets,
     })
 }
@@ -654,12 +717,12 @@ fn reading(args: &Args<'_>, reverse: bool) -> core::result::Result<Query, Bad> {
 /// A `COUNT` sitting where a reduction name or a reducer name goes is that name
 /// and not the keyword, so the scan starts again past it. Two of those in a row
 /// is possible, which is why this is written twice.
-fn count_of(args: &Args<'_>) -> core::result::Result<Option<usize>, Bad> {
-    let Some(mut at) = find_from(args, OPTIONS_AT, b"COUNT") else {
+fn count_of(args: &Args<'_>, opts: usize) -> core::result::Result<Option<usize>, Bad> {
+    let Some(mut at) = find_from(args, opts, b"COUNT") else {
         return Ok(None);
     };
     for word in [b"AGGREGATION".as_slice(), b"REDUCE".as_slice()] {
-        if find_from(args, OPTIONS_AT, word) == Some(at - 1) {
+        if find_from(args, opts, word) == Some(at - 1) {
             match find_from(args, at + 1, b"COUNT") {
                 Some(next) => at = next,
                 None => return Ok(None),
@@ -685,8 +748,8 @@ fn count_of(args: &Args<'_>) -> core::result::Result<Option<usize>, Bad> {
 /// behind it. That is not a grammar, it is a pair of arithmetic checks against
 /// where the keyword was found, and a command that puts the words in the
 /// documented order passes both.
-fn buckets_of(args: &Args<'_>) -> core::result::Result<Option<Buckets>, Bad> {
-    let Some(at) = find_from(args, OPTIONS_AT, b"AGGREGATION") else {
+fn buckets_of(args: &Args<'_>, opts: usize) -> core::result::Result<Option<Buckets>, Bad> {
+    let Some(at) = find_from(args, opts, b"AGGREGATION") else {
         return Ok(None);
     };
     if at + 2 >= args.len() {
@@ -710,13 +773,13 @@ fn buckets_of(args: &Args<'_>) -> core::result::Result<Option<Buckets>, Bad> {
         empty: false,
         stamp: Stamp::Start,
     };
-    if let Some(flag) = find_from(args, OPTIONS_AT, b"EMPTY") {
+    if let Some(flag) = find_from(args, opts, b"EMPTY") {
         if flag != at + 3 && flag != at + 5 {
             return Err(Bad::Said(EMPTY_PLACE));
         }
         buckets.empty = true;
     }
-    if let Some(flag) = find_from(args, OPTIONS_AT, b"BUCKETTIMESTAMP") {
+    if let Some(flag) = find_from(args, opts, b"BUCKETTIMESTAMP") {
         if flag != at + 3 && flag != at + 4 {
             return Err(Bad::Said(BUCKET_TS_PLACE));
         }
@@ -765,13 +828,14 @@ fn reductions(spec: &[u8]) -> core::result::Result<Vec<Agg>, Bad> {
 /// the word rather than about the missing `AGGREGATION`.
 fn align_of(
     args: &Args<'_>,
+    opts: usize,
     bucketed: bool,
     open_start: bool,
     open_end: bool,
     from: i64,
     to: i64,
 ) -> core::result::Result<Option<i64>, Bad> {
-    let Some(at) = find_from(args, OPTIONS_AT, b"ALIGN") else {
+    let Some(at) = find_from(args, opts, b"ALIGN") else {
         return Ok(None);
     };
     if at + 1 >= args.len() {
@@ -803,8 +867,8 @@ fn align_of(
 }
 
 /// The two ends of the value filter, if the read named them.
-fn by_value(args: &Args<'_>) -> core::result::Result<Option<(f64, f64)>, Bad> {
-    let Some(at) = find_from(args, OPTIONS_AT, b"FILTER_BY_VALUE") else {
+fn by_value(args: &Args<'_>, opts: usize) -> core::result::Result<Option<(f64, f64)>, Bad> {
+    let Some(at) = find_from(args, opts, b"FILTER_BY_VALUE") else {
         return Ok(None);
     };
     if at + 2 >= args.len() {
@@ -824,8 +888,8 @@ fn by_value(args: &Args<'_>) -> core::result::Result<Option<(f64, f64)>, Bad> {
 /// The list runs until a word that is not a timestamp, which is how the option
 /// after it is found, so a list that runs to the end of the command is a list
 /// and a list followed by `COUNT` stops at the keyword.
-fn by_ts(args: &Args<'_>) -> core::result::Result<Option<Vec<i64>>, Bad> {
-    let Some(at) = find_from(args, OPTIONS_AT, b"FILTER_BY_TS") else {
+fn by_ts(args: &Args<'_>, opts: usize) -> core::result::Result<Option<Vec<i64>>, Bad> {
+    let Some(at) = find_from(args, opts, b"FILTER_BY_TS") else {
         return Ok(None);
     };
     if at + 1 == args.len() {
@@ -979,8 +1043,14 @@ fn word<'a>(arg: &'a [u8], separator: &[u8], at: &mut usize) -> Option<&'a [u8]>
 
 /// A whole filter list, which has to name at least one thing to take.
 fn rules(args: &Args<'_>, from: usize) -> core::result::Result<Vec<Rule>, Bad> {
-    let mut list = Vec::with_capacity(args.len().saturating_sub(from));
-    for i in from..args.len() {
+    rules_in(args, from, args.len())
+}
+
+/// The same over a span of the command rather than everything behind a word,
+/// which is what a range read needs because its group sits past its filters.
+fn rules_in(args: &Args<'_>, from: usize, to: usize) -> core::result::Result<Vec<Rule>, Bad> {
+    let mut list = Vec::with_capacity(to.saturating_sub(from));
+    for i in from..to {
         list.push(rule(args.get(i))?);
     }
     if !list.iter().any(Rule::positive) {
@@ -1125,7 +1195,7 @@ fn mget(db: &mut Keyspace, args: &Args<'_>, out: &mut Out) -> Result<()> {
     let Some(filter) = find(args, b"FILTER") else {
         return Err(args::wrong_arity("ts.mget"));
     };
-    let wearing = match wearing(args, filter) {
+    let wearing = match wearing(args) {
         Ok(wearing) => wearing,
         Err(bad) => return said(bad, "ts.mget", out),
     };
@@ -1167,15 +1237,44 @@ fn mget(db: &mut Keyspace, args: &Args<'_>, out: &mut Out) -> Result<()> {
     Ok(())
 }
 
-/// Which labels a multi key read asked for, off the words in front of `FILTER`.
-fn wearing(args: &Args<'_>, filter: usize) -> core::result::Result<Wearing, Bad> {
-    let all = find(args, b"WITHLABELS").is_some_and(|at| at < filter);
-    let some = find(args, b"SELECTED_LABELS").filter(|&at| at < filter);
+/// The words that end a `SELECTED_LABELS` list.
+///
+/// Everything after the keyword is a label name until one of these turns up,
+/// and `LATEST`, `EMPTY`, `BUCKETTIMESTAMP` and any word the command does not
+/// know are not among them, so all four are read as label names and come back
+/// against a nil. `TS.MGET` and the two multi key range reads share this list
+/// even though half of it means nothing to `TS.MGET`.
+const ENDS_LABELS: &[&[u8]] = &[
+    b"FILTER",
+    b"FILTER_BY_TS",
+    b"FILTER_BY_VALUE",
+    b"COUNT",
+    b"AGGREGATION",
+    b"ALIGN",
+    b"WITHLABELS",
+    b"REDUCE",
+    b"GROUPBY",
+];
+
+/// Which labels a multi key read asked for.
+///
+/// Both keywords are looked for across the whole command rather than in front of
+/// `FILTER`, so a `WITHLABELS` written behind the filters still collides with a
+/// `SELECTED_LABELS` written in front of them.
+fn wearing(args: &Args<'_>) -> core::result::Result<Wearing, Bad> {
+    let all = find(args, b"WITHLABELS").is_some();
+    let some = find(args, b"SELECTED_LABELS");
     if all && some.is_some() {
         return Err(Bad::Said(BOTH_LABELS));
     }
     if let Some(at) = some {
-        let list: Vec<Vec<u8>> = (at + 1..filter).map(|i| args.get(i).to_vec()).collect();
+        let mut list: Vec<Vec<u8>> = Vec::new();
+        for i in at + 1..args.len() {
+            if ENDS_LABELS.iter().any(|word| args::is(args.get(i), word)) {
+                break;
+            }
+            list.push(args.get(i).to_vec());
+        }
         if list.is_empty() {
             return Err(Bad::Said(NO_SELECTED));
         }
@@ -1220,6 +1319,282 @@ impl Wearing {
                 Some(value) => out.bulk(value),
                 None => out.nil(),
             }
+        }
+    }
+}
+
+/// One series a multi key read took, which is its key, the labels it wears and
+/// the rows it answered.
+type Took = (Vec<u8>, Vec<(Vec<u8>, Vec<u8>)>, Rows);
+
+/// One group a multi key read made, which is the value its members share, the
+/// keys of those members and a set of rows each.
+type Group = (Vec<u8>, Vec<Vec<u8>>, Vec<Rows>);
+
+/// The ten reductions a group is allowed to ask for, which is the fifteen a
+/// bucket takes less the weighted mean, the first, the last and the two counts
+/// that only the compaction rules use.
+const REDUCERS: &[Agg] = &[
+    Agg::Avg,
+    Agg::Sum,
+    Agg::Min,
+    Agg::Max,
+    Agg::Range,
+    Agg::Count,
+    Agg::StdP,
+    Agg::StdS,
+    Agg::VarP,
+    Agg::VarS,
+];
+
+/// `TS.MRANGE from to [FILTER_BY_TS t...] [FILTER_BY_VALUE min max] [WITHLABELS
+/// | SELECTED_LABELS l...] [COUNT n] [[ALIGN a] AGGREGATION spec width
+/// [BUCKETTIMESTAMP b] [EMPTY]] FILTER f... [GROUPBY label REDUCE reducer]` and
+/// `TS.MREVRANGE`, which read a span out of every series a filter list takes.
+///
+/// The span itself is the same read `TS.RANGE` does, one series at a time, so
+/// everything about buckets, alignment and the two sample filters is already
+/// settled by the time this starts. What is new is the filter list in front of
+/// it and the group behind it.
+fn mrange(db: &mut Keyspace, args: &Args<'_>, out: &mut Out, reverse: bool) -> Result<()> {
+    let name = if reverse { "ts.mrevrange" } else { "ts.mrange" };
+    // The order the checks happen in, which is the order their errors come out
+    // in and is not the order the words are written in.
+    let query = match reading(args, reverse, SPAN_AT - 1) {
+        Ok(query) => query,
+        Err(bad) => return said(bad, name, out),
+    };
+    let Some(filter) = find(args, b"FILTER") else {
+        return say(out, MISSING_FILTER);
+    };
+    let wearing = match wearing(args) {
+        Ok(wearing) => wearing,
+        Err(bad) => return said(bad, name, out),
+    };
+    let group = find(args, b"GROUPBY");
+    if group.is_some_and(|at| at < filter) {
+        return say(out, GROUPBY_ORDER);
+    }
+    // The filters stop where the group starts, and a `GROUPBY` written anywhere
+    // other than four words from the end is not a group at all yet, so its words
+    // are read as filters and answer about themselves first.
+    let end = group.unwrap_or_else(|| args.len());
+    if filter + 1 == end {
+        return say(out, NO_FILTER_LABELS);
+    }
+    let rules = match rules_in(args, filter + 1, end) {
+        Ok(rules) => rules,
+        Err(bad) => return said(bad, name, out),
+    };
+    // Only now is a group made to be the last four words of the command, so a
+    // second one or a word past the reducer is an arity error rather than
+    // anything that names what went wrong.
+    if group.is_some_and(|at| at + 4 != args.len()) {
+        return Err(args::wrong_arity(name));
+    }
+    // The reducer is the word behind the first `REDUCE` anywhere in the command
+    // rather than the word three past the `GROUPBY`, so a group whose label is
+    // spelled `REDUCE` reduces by whatever word follows that one.
+    let reducer = match group {
+        None => None,
+        Some(_) => {
+            let word = find(args, b"REDUCE")
+                .filter(|at| at + 1 < args.len())
+                .map_or(&[][..], |at| args.get(at + 1));
+            match Agg::parse(word).filter(|agg| REDUCERS.contains(agg)) {
+                Some(agg) => Some(agg),
+                None => return say(out, BAD_REDUCER),
+            }
+        }
+    };
+    // A read answering more than one number a row has nothing sensible to hand
+    // a reducer, and the module says so rather than picking a column.
+    if reducer.is_some() && query.buckets.as_ref().is_some_and(|b| b.aggs.len() > 1) {
+        return say(out, GROUPBY_COLUMNS);
+    }
+
+    let names = chosen(db, &rules);
+    let mut taken: Vec<Took> = Vec::with_capacity(names.len());
+    for key in names {
+        let Some(body) = read(db, &key)? else {
+            continue;
+        };
+        let labels = body.s.labels().to_vec();
+        let rows = match body.s.read(&query) {
+            Ok(rows) => rows,
+            Err(Unread::TooWide) => return say(out, TOO_WIDE),
+        };
+        taken.push((key, labels, rows));
+    }
+    match (group, reducer) {
+        (Some(at), Some(agg)) => {
+            grouped(out, args.get(at + 1), agg, &wearing, &query, taken);
+        }
+        _ => plainly(out, &wearing, &query, &taken),
+    }
+    Ok(())
+}
+
+/// One series a row, which is what a read with no group answers.
+fn plainly(out: &mut Out, wearing: &Wearing, query: &Query, taken: &[Took]) {
+    let resp3 = out.proto().is_resp3();
+    if resp3 {
+        out.map(taken.len());
+    } else {
+        out.array(taken.len());
+    }
+    for (key, labels, rows) in taken {
+        // RESP3 puts the key in front as the map key and answers three things
+        // behind it, one of which RESP2 has no room for and does not write.
+        if resp3 {
+            out.bulk(key);
+            out.array(3);
+            wearing.write(out, labels);
+            named(out, b"aggregators", query);
+        } else {
+            out.array(3);
+            out.bulk(key);
+            wearing.write(out, labels);
+        }
+        spread(out, rows);
+    }
+}
+
+/// The reductions a read asked for, which only RESP3 writes back and which is an
+/// empty list on a read that asked for no bucketing at all.
+fn named(out: &mut Out, under: &[u8], query: &Query) {
+    let aggs = query.buckets.as_ref().map_or(&[][..], |b| &b.aggs);
+    out.map(1);
+    out.bulk(under);
+    out.array(aggs.len());
+    for agg in aggs {
+        out.bulk(agg.name().as_bytes());
+    }
+}
+
+/// One row a group, each folded out of every series wearing the same value of
+/// one label.
+///
+/// A series that does not wear the label at all is not in any group and drops
+/// out of the reply. A series that wears it twice is in the group its first
+/// value names, the same rule `SELECTED_LABELS` follows.
+fn grouped(
+    out: &mut Out,
+    label: &[u8],
+    agg: Agg,
+    wearing: &Wearing,
+    query: &Query,
+    taken: Vec<Took>,
+) {
+    let mut groups: Vec<Group> = Vec::new();
+    for (key, labels, rows) in taken {
+        let Some((_, value)) = labels.iter().find(|(n, _)| n == label) else {
+            continue;
+        };
+        let at = match groups.iter().position(|(v, _, _)| v == value) {
+            Some(at) => at,
+            None => {
+                groups.push((value.clone(), Vec::new(), Vec::new()));
+                groups.len() - 1
+            }
+        };
+        groups[at].1.push(key);
+        groups[at].2.push(rows);
+    }
+    groups.sort_by(|a, b| a.0.cmp(&b.0));
+
+    let resp3 = out.proto().is_resp3();
+    if resp3 {
+        out.map(groups.len());
+    } else {
+        out.array(groups.len());
+    }
+    for (value, sources, rows) in &groups {
+        let mut title = label.to_vec();
+        title.push(b'=');
+        title.extend_from_slice(value);
+        // The one label a group wears is the one it was grouped on. RESP2 has
+        // nowhere else to put the reducer and the sources, so it writes them as
+        // two more labels, and RESP3 writes them as two fields of their own.
+        let mut labels = vec![(label.to_vec(), value.clone())];
+        if !resp3 && matches!(wearing, Wearing::All) {
+            labels.push((b"__reducer__".to_vec(), agg.name().as_bytes().to_vec()));
+            labels.push((b"__source__".to_vec(), sources.join(&b","[..])));
+        }
+        if resp3 {
+            out.bulk(&title);
+            out.array(4);
+            wearing.write(out, &labels);
+            out.map(1);
+            out.bulk(b"reducers");
+            out.array(1);
+            out.bulk(agg.name().as_bytes());
+            out.map(1);
+            out.bulk(b"sources");
+            out.array(sources.len());
+            for key in sources {
+                out.bulk(key);
+            }
+        } else {
+            out.array(3);
+            out.bulk(&title);
+            wearing.write(out, &labels);
+        }
+        spread(out, &folded(rows, agg, query));
+    }
+}
+
+/// Every series in one group folded into one row a timestamp.
+///
+/// A timestamp only one series answered for is still a row, reduced over the one
+/// reading it holds, and a `COUNT` is applied again over the fold because the
+/// read that built each set already applied it to that set.
+fn folded(taken: &[Rows], agg: Agg, query: &Query) -> Rows {
+    let mut all: Vec<(i64, f64)> = Vec::new();
+    for rows in taken {
+        for i in 0..rows.len() {
+            all.push((rows.stamps[i], rows.row(i)[0]));
+        }
+    }
+    all.sort_by_key(|&(at, _)| at);
+    let mut stamps = Vec::new();
+    let mut values = Vec::new();
+    let mut at = 0;
+    while at < all.len() {
+        let moment = all[at].0;
+        let mut past = at;
+        while past < all.len() && all[past].0 == moment {
+            past += 1;
+        }
+        let readings: Vec<f64> = all[at..past].iter().map(|&(_, v)| v).collect();
+        stamps.push(moment);
+        values.push(yo_series::group(agg, &readings));
+        at = past;
+    }
+    if query.reverse {
+        stamps.reverse();
+        values.reverse();
+    }
+    if let Some(n) = query.count {
+        stamps.truncate(n);
+        values.truncate(n);
+    }
+    Rows {
+        stamps,
+        values,
+        width: 1,
+    }
+}
+
+/// The rows half of a reply, a timestamp and its numbers a row.
+fn spread(out: &mut Out, rows: &Rows) {
+    out.array(rows.len());
+    for i in 0..rows.len() {
+        let row = rows.row(i);
+        out.array(1 + row.len());
+        out.int(rows.stamps[i]);
+        for &d in row {
+            value(out, d);
         }
     }
 }

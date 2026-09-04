@@ -625,6 +625,26 @@ fn plain(kept: &[Sample]) -> Rows {
     }
 }
 
+/// One reduction over readings taken from more than one series at the same
+/// moment, which is what `GROUPBY ... REDUCE ...` asks for.
+///
+/// Readings that are not numbers are dropped before anything is worked out, and
+/// a moment where every series held one of those answers not a number back,
+/// except for a count, which answers nothing rather than not a number. Ten of
+/// the reductions are allowed here and the weighted mean, the first and the last
+/// are not, so this treats those three the same way it treats an empty set.
+#[must_use]
+pub fn group(agg: Agg, taken: &[f64]) -> f64 {
+    let real: Vec<f64> = taken.iter().copied().filter(|v| !v.is_nan()).collect();
+    if agg == Agg::Count || agg == Agg::CountNan || agg == Agg::CountAll {
+        return real.len() as f64;
+    }
+    if real.is_empty() || matches!(agg, Agg::Twa | Agg::First | Agg::Last) {
+        return f64::NAN;
+    }
+    reduce(agg, &real)
+}
+
 /// Everything but the weighted mean, over the readings the reduction takes.
 fn reduce(agg: Agg, taken: &[f64]) -> f64 {
     let n = taken.len() as f64;

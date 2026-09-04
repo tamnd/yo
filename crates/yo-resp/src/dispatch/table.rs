@@ -3900,6 +3900,32 @@ pub static COMMANDS: &[Spec] = &[
         summary: "The newest sample of every series a filter list takes.",
         group: "ts",
     },
+    Spec {
+        name: "ts.mrange",
+        arity: -4,
+        flags: TS_READ,
+        first_key: 0,
+        last_key: 0,
+        step: 0,
+        acl: AC_TS_READ,
+        since: "1.0.0",
+        complexity: "O(n) with n the series in the keyspace",
+        summary: "A span out of every series a filter list takes, oldest first.",
+        group: "ts",
+    },
+    Spec {
+        name: "ts.mrevrange",
+        arity: -4,
+        flags: TS_READ,
+        first_key: 0,
+        last_key: 0,
+        step: 0,
+        acl: AC_TS_READ,
+        since: "1.4.0",
+        complexity: "O(n) with n the series in the keyspace",
+        summary: "The same spans, newest first.",
+        group: "ts",
+    },
     // --------------------------------------------------------------- array
     Spec {
         name: "arset",
@@ -5590,7 +5616,7 @@ mod tests {
         }
         assert!(worst <= 2, "worst probe is {worst} slots");
         assert!(
-            total <= 25,
+            total <= 28,
             "{total} extra slots walked over the whole table"
         );
     }
