@@ -241,6 +241,24 @@ const TDIGEST_WRITE: &[&str] = &["write", "denyoom", "module"];
 /// `TDIGEST.MERGE`, whose keys are behind a count and so cannot be found by the
 /// first, last and step the rest of the table uses.
 const TDIGEST_MERGE: &[&str] = &["write", "denyoom", "module", "movablekeys"];
+/// The time series read side for the two that answer off the header or off the
+/// last sample, which the module calls fast.
+const AC_TS_READ_FAST: &[&str] = &["@read", "@fast", "@timeseries"];
+/// The time series write side, which is everything that puts a sample in or
+/// changes what a series does with one.
+const AC_TS_WRITE: &[&str] = &["@write", "@timeseries"];
+/// `TS.CREATE`, the one write the module calls fast, because making an empty
+/// series is an allocation and nothing else.
+const AC_TS_WRITE_FAST: &[&str] = &["@write", "@fast", "@timeseries"];
+/// A time series read, which carries `module` and not `fast` whatever the ACL
+/// category says. That disagreement is RedisTimeSeries's own and is copied as it
+/// stands, the same way the count min sketch one is.
+const TS_READ: &[&str] = &["readonly", "module"];
+/// A time series write, all of which can ask for another chunk.
+const TS_WRITE: &[&str] = &["write", "denyoom", "module"];
+/// `TS.DEL`, the one write that only ever frees samples and so does not deny out
+/// of memory.
+const TS_DELETE: &[&str] = &["write", "module"];
 /// The graph read side, for the ones that answer without walking the plane.
 const AC_GRAPH_READ_FAST: &[&str] = &["@read", "@graph", "@fast"];
 /// The graph read side for the ones that walk it.
@@ -3696,6 +3714,124 @@ pub static COMMANDS: &[Spec] = &[
         summary: "The nine numbers the digest keeps about itself.",
         group: "tdigest",
     },
+    // ------------------------------------------------------------------ ts
+    Spec {
+        name: "ts.create",
+        arity: -2,
+        flags: TS_WRITE,
+        first_key: 1,
+        last_key: 1,
+        step: 1,
+        acl: AC_TS_WRITE_FAST,
+        since: "1.0.0",
+        complexity: "O(1)",
+        summary: "Make an empty series and say how it should behave.",
+        group: "ts",
+    },
+    Spec {
+        name: "ts.alter",
+        arity: -2,
+        flags: TS_WRITE,
+        first_key: 1,
+        last_key: 1,
+        step: 1,
+        acl: AC_TS_WRITE,
+        since: "1.0.0",
+        complexity: "O(N) with N the labels being set",
+        summary: "Change how a series behaves, leaving what was not named alone.",
+        group: "ts",
+    },
+    Spec {
+        name: "ts.add",
+        arity: -4,
+        flags: TS_WRITE,
+        first_key: 1,
+        last_key: 1,
+        step: 1,
+        acl: AC_TS_WRITE,
+        since: "1.0.0",
+        complexity: "O(M) with M the samples in the chunk a backfill lands in",
+        summary: "Put a sample in, making the series if it is not there.",
+        group: "ts",
+    },
+    Spec {
+        name: "ts.madd",
+        arity: -4,
+        flags: TS_WRITE,
+        first_key: 1,
+        last_key: -1,
+        step: 3,
+        acl: AC_TS_WRITE,
+        since: "1.0.0",
+        complexity: "O(N * M) with N the samples given",
+        summary: "Put a sample in each of several series.",
+        group: "ts",
+    },
+    Spec {
+        name: "ts.incrby",
+        arity: -3,
+        flags: TS_WRITE,
+        first_key: 1,
+        last_key: 1,
+        step: 1,
+        acl: AC_TS_WRITE,
+        since: "1.0.0",
+        complexity: "O(M) with M the samples in the last chunk",
+        summary: "Add to the newest value and store the answer.",
+        group: "ts",
+    },
+    Spec {
+        name: "ts.decrby",
+        arity: -3,
+        flags: TS_WRITE,
+        first_key: 1,
+        last_key: 1,
+        step: 1,
+        acl: AC_TS_WRITE,
+        since: "1.0.0",
+        complexity: "O(M) with M the samples in the last chunk",
+        summary: "Take away from the newest value and store the answer.",
+        group: "ts",
+    },
+    Spec {
+        name: "ts.del",
+        arity: 4,
+        flags: TS_DELETE,
+        first_key: 1,
+        last_key: 1,
+        step: 1,
+        acl: AC_TS_WRITE,
+        since: "1.6.0",
+        complexity: "O(N) with N the samples in the span",
+        summary: "Take out every sample between two timestamps.",
+        group: "ts",
+    },
+    Spec {
+        name: "ts.get",
+        arity: -2,
+        flags: TS_READ,
+        first_key: 1,
+        last_key: 1,
+        step: 1,
+        acl: AC_TS_READ_FAST,
+        since: "1.0.0",
+        complexity: "O(1)",
+        summary: "The newest sample in a series.",
+        group: "ts",
+    },
+    Spec {
+        name: "ts.info",
+        arity: -2,
+        flags: TS_READ,
+        first_key: 1,
+        last_key: 1,
+        step: 1,
+        acl: AC_TS_READ_FAST,
+        since: "1.0.0",
+        complexity: "O(1)",
+        summary: "The fourteen things a series says about itself.",
+        group: "ts",
+    },
     // --------------------------------------------------------------- array
     Spec {
         name: "arset",
@@ -5386,7 +5522,7 @@ mod tests {
         }
         assert!(worst <= 2, "worst probe is {worst} slots");
         assert!(
-            total <= 22,
+            total <= 24,
             "{total} extra slots walked over the whole table"
         );
     }

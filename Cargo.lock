@@ -963,10 +963,15 @@ dependencies = [
  "yo-graph",
  "yo-kv",
  "yo-reactor",
+ "yo-series",
  "yo-shape",
  "yo-sketch",
  "yo-vector",
 ]
+
+[[package]]
+name = "yo-series"
+version = "0.3.14"
 
 [[package]]
 name = "yo-shape"

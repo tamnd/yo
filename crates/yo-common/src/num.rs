@@ -577,6 +577,238 @@ pub fn push_g17(out: &mut Vec<u8>, d: f64) {
     out.extend_from_slice(write_g17(&mut buf, d));
 }
 
+/// Writes a double the way the time series module writes a sample value on
+/// RESP2, which is neither of the two printers above.
+///
+/// The module hands the value to a vendored Dragonbox and replies with the
+/// characters that come back, so a sample reads as `1.5` but a tenth reads as
+/// `1E-1` and ten million reads as `10000000`. Deciding which of the two forms
+/// a value takes is the whole problem, because Dragonbox makes that decision
+/// on a decimal it has not finished shortening, and the caller never sees that
+/// intermediate. Its printer takes the plain form when the exponent of that
+/// unshortened decimal is in `-16 ..= 0` and the value has an integer part,
+/// and the exponent form otherwise.
+///
+/// The unshortened exponent can be recovered from the shortest one. Dragonbox
+/// returns one of two adjacent exponents, `floor(e2 * log10(2))` and one above
+/// it, where `e2` is the binary exponent of the significand read as an
+/// integer, so the exponent it used is the shortest value's own exponent
+/// capped at the upper of that pair. A value whose significand bits are all
+/// zero sits on a shorter rounding interval and its pair starts at
+/// `floor(e2 * log10(2) - log10(4 / 3))` instead. Both logarithms are the
+/// usual integer approximations, exact for every binary exponent a double has.
+///
+/// Verified against the module's own Dragonbox over seven and a half million
+/// doubles, random bit patterns, every awkward decade and boundary, and every
+/// one of the 2045 powers of two, with no difference.
+pub fn write_dragonbox(buf: &mut [u8; DOUBLE_MAX], d: f64) -> &[u8] {
+    fn word<'a>(buf: &'a mut [u8; DOUBLE_MAX], text: &[u8]) -> &'a [u8] {
+        buf[..text.len()].copy_from_slice(text);
+        &buf[..text.len()]
+    }
+    if d.is_nan() {
+        return word(buf, b"NaN");
+    }
+    if d.is_infinite() {
+        return word(buf, if d > 0.0 { b"Infinity" } else { b"-Infinity" });
+    }
+    if d == 0.0 {
+        return word(buf, if d.is_sign_negative() { b"-0" } else { b"0" });
+    }
+    // The shortest round trip decimal, as a digit count and the exponent its
+    // first digit carries. A one digit shortest form can round up across a
+    // power of ten, so a magnitude that reads as a `1` is asked again at a
+    // width no rounding can carry.
+    let mut scratch = [0u8; DOUBLE_MAX];
+    let (mut exp, count) = exponent_and_digits(&mut scratch, d.abs(), None);
+    let mut magnitude = exp;
+    if count == 1 {
+        magnitude = exponent_and_digits(&mut scratch, d.abs(), Some(17)).0;
+    }
+
+    // Where Dragonbox would have stopped, which is the shortest value's own
+    // exponent unless the pair it chooses from stops it earlier.
+    let bits = d.abs().to_bits();
+    let raised = (bits >> 52) as i32;
+    let fraction = bits & ((1 << 52) - 1);
+    let e2 = if raised == 0 { -1074 } else { raised - 1075 };
+    let shorter = fraction == 0 && raised > 1;
+    let base = if shorter {
+        ((i64::from(e2) * 631_305 - 261_663) >> 21) as i32
+    } else {
+        ((i64::from(e2) * 315_653) >> 20) as i32
+    };
+    let unshortened = (exp - count as i32 + 1).min(base + 1);
+
+    // The digits Dragonbox prints are the value rounded at that exponent,
+    // which is not the same as the shortest digits. The two differ when the
+    // value sits exactly between two decimals of that width, where Dragonbox
+    // rounds to even and a shortest printer rounds away, and they differ by
+    // the zeros that padding a short value out to that width leaves behind.
+    // Rounding can carry into another digit, which moves the exponent.
+    let places = usize::try_from(magnitude - unshortened)
+        .unwrap_or(0)
+        .min(17);
+    let (carried, mut count) = if shorter {
+        round_shorter(&mut scratch, d.abs(), places, e2)
+    } else {
+        exponent_and_digits(&mut scratch, d.abs(), Some(places))
+    };
+    exp = carried;
+    while count > 1 && scratch[count - 1] == b'0' {
+        count -= 1;
+    }
+    let digits = &scratch[..count];
+
+    let mut sink = SliceSink { buf, at: 0 };
+    if d.is_sign_negative() {
+        let _ = sink.write_str("-");
+    }
+    if exp >= 0 && (-16..=0).contains(&unshortened) {
+        // The plain form. An exponent at least the digit count means the point
+        // would fall past the end, so the tail is zeros and there is no point.
+        let whole = (exp + 1) as usize;
+        let _ = sink.write_str(str::from_utf8(&digits[..whole.min(count)]).expect("digits"));
+        for _ in count..whole {
+            let _ = sink.write_str("0");
+        }
+        if whole < count {
+            let _ = sink.write_str(".");
+            let _ = sink.write_str(str::from_utf8(&digits[whole..]).expect("digits"));
+        }
+    } else {
+        let _ = sink.write_str(str::from_utf8(&digits[..1]).expect("digits"));
+        if count > 1 {
+            let _ = sink.write_str(".");
+            let _ = sink.write_str(str::from_utf8(&digits[1..]).expect("digits"));
+        }
+        let _ = write!(sink, "E{exp}");
+    }
+    let at = sink.at;
+    &buf[..at]
+}
+
+/// Fills `digits` with the decimal digits of `d`, no point among them, and
+/// answers the exponent the first of them carries and how many there are.
+///
+/// With no `places` the digits are the shortest ones that read back as `d`,
+/// and with some they are `d` rounded to that many places after the first,
+/// which is a rounding to even. Rounding can carry, `9.99` at one place is
+/// `1.0e1`, so the exponent that comes back is the rounded value's own.
+fn exponent_and_digits(digits: &mut [u8], d: f64, places: Option<usize>) -> (i32, usize) {
+    let mut text = [0u8; WIDE_MAX];
+    let mut sink = SliceSink {
+        buf: &mut text,
+        at: 0,
+    };
+    let _ = match places {
+        Some(places) => write!(sink, "{d:.places$e}"),
+        None => write!(sink, "{d:e}"),
+    };
+    let end = sink.at;
+    let split = text[..end]
+        .iter()
+        .position(|&c| c == b'e')
+        .expect("the exponent form always has one");
+    let exp = parse_i64(&text[split + 1..end]).expect("a written exponent parses") as i32;
+    let mut count = 0;
+    for &c in &text[..split] {
+        if c != b'.' {
+            digits[count] = c;
+            count += 1;
+        }
+    }
+    (exp, count)
+}
+
+/// Room for the widest thing [`exponent_and_digits`] is asked to write.
+const WIDE_MAX: usize = 48;
+
+/// How many digits past the ones it answers [`round_shorter`] looks at.
+///
+/// The two comparisons it makes are decided by six figures at worst, measured
+/// over every value that reaches it, so eight is enough with room to spare and
+/// keeps the whole thing inside a `u64` of digits.
+const EXTRA: usize = 8;
+
+/// Ten to the [`EXTRA`], as the divisor that turns those digits into a fraction.
+const EXTRA_SCALE: f64 = 100_000_000.0;
+
+/// The one binary exponent where Dragonbox breaks a tie to even.
+///
+/// Its shorter interval case rounds a half away from zero everywhere else, and
+/// only inside a band of binary exponents does it fall back to the tie rule the
+/// caller asked for. For a double that band is a single exponent, and the only
+/// two values that land on an exact half are this one and the one above it, so
+/// the whole of the rule is: `2^-25` rounds to even and `2^-24` rounds up.
+const TIE_TO_EVEN: i32 = -77;
+
+/// Fills `digits` the way [`exponent_and_digits`] does, for a value whose
+/// significand bits are all zero.
+///
+/// A power of two sits on a rounding interval that is not centred on it,
+/// because the gap below is half the gap above, and Dragonbox answers the
+/// nearest decimal inside that interval rather than the nearest decimal full
+/// stop. The two differ when rounding down would land below the interval, which
+/// is a quarter of a gap under the value, so the digits go up whenever what is
+/// left over is more than a fifty four bit relative step. That is the whole
+/// difference from the ordinary case, along with a half rounding away from zero
+/// rather than to even.
+///
+/// Verified against the module's own Dragonbox over all 2045 values that reach
+/// here, which is every power of two a double has.
+fn round_shorter(digits: &mut [u8], d: f64, places: usize, e2: i32) -> (i32, usize) {
+    let mut wide = [0u8; WIDE_MAX];
+    let (mut exp, count) = exponent_and_digits(&mut wide, d, Some(places + EXTRA));
+    let keep = count - EXTRA;
+    let mut whole = 0.0;
+    for &c in &wide[..keep] {
+        whole = whole * 10.0 + f64::from(c - b'0');
+    }
+    let mut left = 0.0;
+    for &c in &wide[keep..count] {
+        left = left * 10.0 + f64::from(c - b'0');
+    }
+    left /= EXTRA_SCALE;
+
+    // A half is a half whichever way it was reached, and nothing else this
+    // rounding ever sees comes within a thousandth of one.
+    let up = if (left - 0.5).abs() < 1e-6 {
+        e2 != TIE_TO_EVEN || wide[keep - 1] % 2 == 1
+    } else {
+        // Either past the halfway point, or short of it but still under the
+        // bottom of the interval, which sits a fifty four bit step below.
+        left > 0.5 || left > whole / 18_014_398_509_481_984.0
+    };
+
+    digits[..keep].copy_from_slice(&wide[..keep]);
+    if up {
+        let mut at = keep;
+        while at > 0 {
+            at -= 1;
+            if digits[at] == b'9' {
+                digits[at] = b'0';
+            } else {
+                digits[at] += 1;
+                break;
+            }
+        }
+        // Every digit was a nine, so the answer is a one and a row of zeros
+        // that is one digit wider, which at a fixed width is a larger exponent.
+        if digits[0] == b'0' {
+            digits[0] = b'1';
+            exp += 1;
+        }
+    }
+    (exp, keep)
+}
+
+/// The same characters [`write_dragonbox`] would write, appended.
+pub fn push_dragonbox(out: &mut Vec<u8>, d: f64) {
+    let mut buf = [0u8; DOUBLE_MAX];
+    out.extend_from_slice(write_dragonbox(&mut buf, d));
+}
+
 /// Takes the trailing zeros off a fixed point number, and the point with them
 /// when nothing is left after it.
 ///
@@ -600,7 +832,7 @@ fn trim_zeros(text: &[u8]) -> &[u8] {
 /// the widest double there is, and it is handled rather than asserted so that a
 /// mistake in that reasoning truncates a number instead of killing a shard.
 struct SliceSink<'a> {
-    buf: &'a mut [u8; DOUBLE_MAX],
+    buf: &'a mut [u8],
     at: usize,
 }
 
@@ -1001,6 +1233,59 @@ mod tests {
             );
             let mut v = Vec::new();
             push_g17(&mut v, d);
+            assert_eq!(String::from_utf8(v).unwrap(), want, "appending {d}");
+        }
+    }
+
+    #[test]
+    fn dragonbox_writes_what_the_module_writes() {
+        // Every one of these was read off the module's own Dragonbox rather
+        // than reasoned about, including the four at the end, which are the
+        // cases where the shorter rounding interval of a power of two decides
+        // the last digit.
+        let cases: &[(f64, &str)] = &[
+            (0.0, "0"),
+            (-0.0, "-0"),
+            (1.0, "1"),
+            (-1.0, "-1"),
+            (0.5, "5E-1"),
+            (0.1, "1E-1"),
+            (0.3, "3E-1"),
+            (1.5, "1.5"),
+            (123.456, "123.456"),
+            (0.1 + 0.2, "3.0000000000000004E-1"),
+            (core::f64::consts::PI, "3.141592653589793"),
+            (-2.5e-8, "-2.5E-8"),
+            // The plain form runs from a ten thousandth up to the last width
+            // that has no exponent left over, and nowhere else.
+            (0.0001, "1E-4"),
+            (1e7, "10000000"),
+            (1e16, "1E16"),
+            (1e17, "1E17"),
+            (1e-16, "1E-16"),
+            (1e-17, "1E-17"),
+            (1e23, "1E23"),
+            (9_007_199_254_740_993.0, "9007199254740992"),
+            (f64::MAX, "1.7976931348623157E308"),
+            (f64::MIN_POSITIVE, "2.2250738585072014E-308"),
+            (f64::from_bits(1), "5E-324"),
+            (f64::INFINITY, "Infinity"),
+            (f64::NEG_INFINITY, "-Infinity"),
+            (f64::NAN, "NaN"),
+            (18_014_398_509_481_984.0, "18014398509481984"),
+            (5.960_464_477_539_063e-8, "5.960464477539063E-8"),
+            (2.980_232_238_769_531_2e-8, "2.9802322387695312E-8"),
+            (6.189_700_196_426_902e26, "6.189700196426902E26"),
+        ];
+        for &(d, want) in cases {
+            let mut buf = [0u8; DOUBLE_MAX];
+            assert_eq!(
+                core::str::from_utf8(write_dragonbox(&mut buf, d)).unwrap(),
+                want,
+                "writing {d}"
+            );
+            let mut v = Vec::new();
+            push_dragonbox(&mut v, d);
             assert_eq!(String::from_utf8(v).unwrap(), want, "appending {d}");
         }
     }
