@@ -90,7 +90,10 @@ pub use server::parse_memory;
 pub use table::{COMMANDS, Spec, arity_ok, lookup};
 
 use crate::reply::Out;
+use std::cell::Cell;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
 use yo_common::lock::Held;
 use yo_common::{Code, Error};
 use yo_kv::cold::Blocks;
@@ -153,19 +156,122 @@ pub enum Flow {
     Block,
 }
 
+/// A number one thread adds to and any thread may read.
+///
+/// The add is a load, an add and a store rather than a fetch and add, which on
+/// x86 is three ordinary instructions instead of one locked one. That is sound
+/// because every counter here has exactly one writer, which is what the slots
+/// below are for: two threads never hold the same counter, so nothing can be
+/// lost between the load and the store. A reader can be a command or two behind,
+/// and `INFO` on a running server is behind by the time the reply reaches the
+/// client anyway.
+#[derive(Debug, Default)]
+pub struct Counter(AtomicU64);
+
+impl Counter {
+    /// One more.
+    fn bump(&self) {
+        self.0.store(self.get().wrapping_add(1), Relaxed);
+    }
+
+    /// One fewer, stopping at zero.
+    ///
+    /// The floor is for the gauge, which is the number of open connections: a
+    /// close that arrives without its open, which nothing can do now and a
+    /// misplaced call could, is a number that stays at zero rather than one
+    /// that wraps to eighteen quintillion clients.
+    fn drop_one(&self) {
+        self.0.store(self.get().saturating_sub(1), Relaxed);
+    }
+
+    /// What it says.
+    fn get(&self) -> u64 {
+        self.0.load(Relaxed)
+    }
+
+    /// Back to zero, which is `CONFIG RESETSTAT`.
+    fn zero(&self) {
+        self.0.store(0, Relaxed);
+    }
+}
+
 /// The numbers `INFO` reports that this layer cannot see for itself.
 ///
 /// The reactor owns the sockets, so the reactor is what knows how many clients
-/// there are. It writes these directly and nothing here does anything with them
+/// there are. It counts them here and nothing else does anything with them
 /// except report them.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Default)]
 pub struct Stats {
+    /// Connections open right now.
+    clients: Counter,
+    /// Connections accepted since the server started.
+    connections: Counter,
+    /// Commands run since the server started, which this layer counts itself.
+    commands: Counter,
+}
+
+impl Stats {
+    /// A connection arrived.
+    pub fn opened(&self) {
+        self.clients.bump();
+        self.connections.bump();
+    }
+
+    /// A connection went away.
+    pub fn closed(&self) {
+        self.clients.drop_one();
+    }
+}
+
+/// Every thread's [`Stats`] added together, which is what `INFO` answers.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Totals {
     /// Connections open right now.
     pub clients: u64,
     /// Connections accepted since the server started.
     pub connections: u64,
-    /// Commands run since the server started, which this layer counts itself.
+    /// Commands run since the server started.
     pub commands: u64,
+}
+
+thread_local! {
+    /// Which set of counters the running thread writes into.
+    ///
+    /// Claimed the first time a thread counts anything and kept for as long as
+    /// the thread runs. It is a number rather than a pointer, so a thread that
+    /// has counted on one server and then counts on another lands in the same
+    /// place in both, and a process with two servers in it shares the numbering
+    /// between them. That is the tests and it is not `yodb`, which has one.
+    static SLOT: Cell<usize> = const { Cell::new(usize::MAX) };
+}
+
+/// The counters one thread keeps.
+///
+/// One of these per thread and not one per server, because a counter every
+/// thread adds to is a cache line every thread has to own to add to it, and at a
+/// few million commands a second that one line is the server. So each thread
+/// counts into its own set and `INFO` adds the sets up when somebody asks, which
+/// is a walk over a few hundred rows on a command nobody sends in a loop.
+///
+/// A cache line apart for the same reason, so that two threads counting at once
+/// are not two threads passing one line back and forth.
+#[derive(Debug, Default)]
+#[repr(align(64))]
+struct Counters {
+    /// What the reactor counts.
+    stats: Stats,
+    /// A counter per command, for `INFO commandstats`.
+    cmdstats: CommandStats,
+}
+
+/// Room for one thread to count in, which is what a server starts with.
+fn one_thread() -> Box<[Counters]> {
+    slots(1)
+}
+
+/// Room for `threads` of them.
+fn slots(threads: usize) -> Box<[Counters]> {
+    (0..threads.max(1)).map(|_| Counters::default()).collect()
 }
 
 /// Where the process was started, which is what `dir` defaults to.
@@ -208,24 +314,39 @@ impl CommandStat {
     }
 }
 
+/// One command's counters as one thread keeps them.
+///
+/// The same three numbers as [`CommandStat`], which is what they add up to when
+/// `INFO` asks. This is the written form and that is the read one.
+#[derive(Debug, Default)]
+struct Row {
+    /// Times the command ran.
+    calls: Counter,
+    /// Times it was turned away before it ran.
+    rejected: Counter,
+    /// Times it ran and answered with an error.
+    failed: Counter,
+}
+
 /// A counter per command, indexed the way [`table::index_of`] says.
 ///
 /// A flat array and not a map, because the dispatcher is already holding the
 /// spec and the spec's position in the table is two addresses subtracted. That
 /// makes the counting a load, an add and a store on a row the previous command
 /// of the same name has already pulled into cache.
-struct CommandStats(Box<[CommandStat]>);
+#[derive(Debug)]
+struct CommandStats(Box<[Row]>);
 
 impl Default for CommandStats {
     fn default() -> CommandStats {
-        CommandStats(vec![CommandStat::default(); table::count()].into_boxed_slice())
+        CommandStats((0..table::count()).map(|_| Row::default()).collect())
     }
 }
 
 impl CommandStats {
     /// The row for one command.
-    fn at(&mut self, spec: &'static Spec) -> &mut CommandStat {
-        &mut self.0[table::index_of(spec)]
+    fn at(&self, spec: &'static Spec) -> &Row {
+        &self.0[table::index_of(spec)]
     }
 }
 
@@ -334,10 +455,14 @@ pub struct Server {
     /// Empty on a server nobody has migrated a key out of, which is nearly all
     /// of them, and it costs a vector's three words to be empty.
     peers: migrate::Peers,
-    /// The numbers the reactor keeps for `INFO`.
-    pub stats: Stats,
-    /// A counter per command, for `INFO commandstats`.
-    cmdstats: CommandStats,
+    /// One set of counters per thread that runs commands here.
+    ///
+    /// A fixed list, because a thread reading its own set must not have the list
+    /// move under it, and how many threads there will be is known before any of
+    /// them starts. A server nobody told otherwise has one.
+    counters: Box<[Counters]>,
+    /// How many sets have been handed out.
+    claimed: AtomicUsize,
     /// Where `BACKUP` puts its files, and where `CONFIG GET dir` points.
     ///
     /// Absolute, and resolved once when the server is built rather than every
@@ -394,8 +519,8 @@ impl Server {
             expire_ms: 0,
             waiters: Waiters::default(),
             peers: migrate::Peers::default(),
-            stats: Stats::default(),
-            cmdstats: CommandStats::default(),
+            counters: one_thread(),
+            claimed: AtomicUsize::new(0),
             dir: working_dir(),
             backup: backup::State::default(),
             search: Registry::new(),
@@ -444,8 +569,8 @@ impl Server {
             expire_ms: 0,
             waiters: Waiters::default(),
             peers: migrate::Peers::default(),
-            stats: Stats::default(),
-            cmdstats: CommandStats::default(),
+            counters: one_thread(),
+            claimed: AtomicUsize::new(0),
             dir: working_dir(),
             backup: backup::State::default(),
             search: Registry::new(),
@@ -728,12 +853,79 @@ impl Server {
     /// one per command in the table, which is what Redis does and is the
     /// difference between a section a person can read and one they cannot.
     pub fn command_stats(&self) -> impl Iterator<Item = (&'static str, CommandStat)> {
-        self.cmdstats
-            .0
-            .iter()
-            .enumerate()
+        (0..table::count())
+            .map(|at| (table::name_at(at), self.command_stat(at)))
             .filter(|(_, row)| row.seen())
-            .map(|(at, row)| (table::name_at(at), *row))
+    }
+
+    /// One command's counters, added up over every thread.
+    fn command_stat(&self, at: usize) -> CommandStat {
+        let mut sum = CommandStat::default();
+        for thread in &self.counters {
+            let row = &thread.cmdstats.0[at];
+            sum.calls += row.calls.get();
+            sum.rejected += row.rejected.get();
+            sum.failed += row.failed.get();
+        }
+        sum
+    }
+
+    /// The counters the calling thread writes into.
+    ///
+    /// The first call on a thread claims a set and every call after it is a
+    /// thread local read and an index. A server asked to count from more threads
+    /// than it was built for wraps round and shares a set, which loses the odd
+    /// count between two threads and cannot happen to a server `yodb serve`
+    /// built, because that one is told how many threads it will have before it
+    /// starts any of them.
+    pub fn counted(&self) -> &Stats {
+        &self.mine().stats
+    }
+
+    /// The whole set, which is the counters and the command rows.
+    fn mine(&self) -> &Counters {
+        let mut slot = SLOT.get();
+        if slot == usize::MAX {
+            slot = self.claimed.fetch_add(1, Relaxed);
+            SLOT.set(slot);
+        }
+        &self.counters[slot % self.counters.len()]
+    }
+
+    /// Every thread's numbers added together, which is what `INFO` reports.
+    #[must_use]
+    pub fn totals(&self) -> Totals {
+        let mut sum = Totals::default();
+        for thread in &self.counters {
+            sum.clients += thread.stats.clients.get();
+            sum.connections += thread.stats.connections.get();
+            sum.commands += thread.stats.commands.get();
+        }
+        sum
+    }
+
+    /// Put the totals back to zero, which is `CONFIG RESETSTAT`.
+    ///
+    /// Every thread's set and not only the one asking, since the number the
+    /// client is resetting is the sum it was just shown. The open connections
+    /// are left alone because that is a gauge and not a total: the connections
+    /// are still open.
+    pub fn reset_stats(&self) {
+        for thread in &self.counters {
+            thread.stats.connections.zero();
+            thread.stats.commands.zero();
+        }
+    }
+
+    /// Say how many threads will run commands here, before any of them does.
+    ///
+    /// What it changes is how many sets of counters there are. Called once at
+    /// startup by whoever is about to start the threads, and calling it on a
+    /// running server throws away what has been counted so far, which is why it
+    /// wants the server to itself.
+    pub fn set_threads(&mut self, threads: usize) {
+        self.counters = slots(threads);
+        self.claimed = AtomicUsize::new(0);
     }
 
     /// The `maxmemory` limit in bytes, zero when there is not one.
@@ -1238,14 +1430,14 @@ pub fn resolved(
     if args.is_empty() {
         return Flow::Continue;
     }
-    server.stats.commands += 1;
+    server.mine().stats.commands.bump();
 
     let Some(spec) = spec else {
         write_error(out, &args::unknown_command(args));
         return Flow::Continue;
     };
     if !arity_ok(spec, args.len()) {
-        server.cmdstats.at(spec).rejected += 1;
+        server.mine().cmdstats.at(spec).rejected.bump();
         write_error(out, &args::wrong_arity(spec.name));
         return Flow::Continue;
     }
@@ -1260,7 +1452,7 @@ pub fn resolved(
     // Redis's list, so a command that only frees is let through with nothing
     // left, which is what lets a client dig itself out with `DEL`.
     if server.maxmemory != 0 && !server.make_room() && spec.flags.contains(&"denyoom") {
-        server.cmdstats.at(spec).rejected += 1;
+        server.mine().cmdstats.at(spec).rejected.bump();
         out.error_line(b"OOM ", OOM);
         return Flow::Continue;
     }
@@ -1430,10 +1622,10 @@ pub fn resolved(
     // error line and comes back `Ok`, and both of those are a call that failed.
     // The first byte at the mark is what a client would branch on, and it is `-`
     // for an error on either protocol and `!` for RESP3's long form.
-    let row = server.cmdstats.at(spec);
-    row.calls += 1;
+    let row = server.mine().cmdstats.at(spec);
+    row.calls.bump();
     if matches!(out.as_slice().get(mark), Some(b'-' | b'!')) {
-        row.failed += 1;
+        row.failed.bump();
     }
     flow
 }
@@ -4481,7 +4673,38 @@ mod tests {
         f.run(&[b"PING"]);
         f.run(&[b"NOPE"]);
         f.run(&[b"GET"]);
-        assert_eq!(f.server.stats.commands, 3);
+        assert_eq!(f.server.totals().commands, 3);
+    }
+
+    #[test]
+    fn what_two_threads_counted_is_added_up_when_info_asks() {
+        let mut server = Server::new();
+        server.set_threads(2);
+        // Written into the two sets by hand, because what is under test is the
+        // adding up and not the claiming, and one test thread can only ever
+        // claim one set.
+        let ping = lookup(b"PING").expect("PING is a command");
+        for (at, calls) in [(0, 2), (1, 3)] {
+            let counters = &server.counters[at];
+            for _ in 0..calls {
+                counters.stats.commands.bump();
+                counters.cmdstats.at(ping).calls.bump();
+            }
+            counters.stats.opened();
+        }
+        assert_eq!(server.totals().commands, 5);
+        assert_eq!(server.totals().clients, 2);
+        assert_eq!(server.totals().connections, 2);
+        let rows: Vec<_> = server.command_stats().collect();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].0, "ping");
+        assert_eq!(rows[0].1.calls, 5);
+        // A reset takes the totals and leaves the open connections, which are
+        // still open.
+        server.reset_stats();
+        assert_eq!(server.totals().commands, 0);
+        assert_eq!(server.totals().connections, 0);
+        assert_eq!(server.totals().clients, 2);
     }
 
     #[test]
