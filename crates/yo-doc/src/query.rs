@@ -89,9 +89,12 @@
 //! right, and `nin` is its negation over both whole sides. `anyof` and `noneof`
 //! ask whether two arrays share an element, and `subsetof` asks whether every
 //! element of the left array is on the right, which makes `[]` a subset of
-//! anything. `size` takes a bare number and is the length of a string, an array
-//! or an object, and `empty` takes `true` or `false` over the same three, so a
-//! number has neither and satisfies neither.
+//! anything. `size`, which is also spelled `sizeof`, takes a bare number and is
+//! the length of a string, an array or an object, and `empty` takes `true` or
+//! `false` over the same three, so a number has neither and satisfies neither.
+//! The right hand side of all five may be a path rather than a literal, and it
+//! is the values that path answered that are the collection, so `3 in @.list`
+//! and `@.tags anyof $.wanted` both read.
 //!
 //! The postfix methods are `.length()`, `.count()`, `.min()`, `.max()`, `.sum()`
 //! and `.avg()`. `count()` is how many values the operand answered and is a
@@ -105,16 +108,26 @@
 //! Arithmetic is `+ - * / %` over numbers, `*` and `/` and `%` bind tighter than
 //! `+` and `-`, and parentheses group. Subtraction needs its spaces, because
 //! `@.total-vat` is a key called `total-vat` and `@.total - vat` is not. The
-//! other four do not, so `@.p*2 == 6` reads the way it looks.
+//! other four do not, so `@.p*2 == 6` reads the way it looks. A leading `-` or
+//! `+` is a sign, it answers a number or nothing so `-@.name` on a string
+//! answers nothing, and one is as many as go in a row: `--@.p` is refused and
+//! `-(-@.p)` is how a second one is written.
 //!
 //! The postfix `~` answers the key names of an object, one string each, and
 //! nothing at all for an array or a scalar. It is a set rather than an array
 //! value, so `@.p~ == "x"` is true of any object with an `x` in it, and the
 //! operators that want a collection read the whole set as one: `@.p~ size 2` is
 //! an object with two keys, and `@.p~ subsetof ["x","y"]` is an object with no
-//! other key. `in` and `=~` do not take it and are false whatever is on the
-//! other side, which is the reference's behaviour rather than a rule with a
-//! reason behind it.
+//! other key. It is a collection on the right of those operators too, so
+//! `"x" in @.p~` asks whether the object has an `x`. `in` and `=~` do not take
+//! it on the left and are false whatever is on the other side, which is the
+//! reference's behaviour rather than a rule with a reason behind it.
+//!
+//! An object with no keys answers a set that is there and empty, and something
+//! that is not an object answers no set at all, and every one of the collection
+//! operators tells the two apart. On `{}` the tests `@.p~ subsetof ["x"]`,
+//! `@.p~ empty true` and `@.p~ size 0` are all true, and on a number or a
+//! missing key none of the three is.
 //!
 //! # Two orderings that are not Redis's
 //!
@@ -720,9 +733,9 @@ impl<'a> Filter<'a> {
         Ok(e)
     }
 
-    /// An atom and then any number of `* / %` and another atom.
+    /// A signed atom and then any number of `* / %` and another one.
     fn product(&mut self) -> Result<Operand<'a>> {
-        let mut e = self.atom()?;
+        let mut e = self.signed()?;
         loop {
             self.spaces();
             let op = match self.body.get(self.at) {
@@ -732,9 +745,25 @@ impl<'a> Filter<'a> {
                 _ => break,
             };
             self.at += 1;
-            e = Operand::Math(Box::new(e), op, Box::new(self.atom()?));
+            e = Operand::Math(Box::new(e), op, Box::new(self.signed()?));
         }
         Ok(e)
+    }
+
+    /// An atom with a `-` or a `+` in front of it, or an atom.
+    ///
+    /// One sign and no more, which is what the reference does: `--@.a` is
+    /// refused and `-(-@.a)` is not. A sign answers a number or nothing, so
+    /// `-@.name` on a string answers nothing rather than the string.
+    fn signed(&mut self) -> Result<Operand<'a>> {
+        self.spaces();
+        let neg = match self.body.get(self.at) {
+            Some(b'-') => true,
+            Some(b'+') => false,
+            _ => return self.atom(),
+        };
+        self.at += 1;
+        Ok(Operand::Sign(Box::new(self.atom()?), neg))
     }
 
     /// A path from `@` or from `$`, a value written into the path, or either of
@@ -958,6 +987,7 @@ const WORD_OPS: &[(&[u8], Op)] = &[
     (b"noneof", Op::NoneOf),
     (b"nin", Op::Nin),
     (b"in", Op::In),
+    (b"sizeof", Op::Size),
     (b"size", Op::Size),
     (b"empty", Op::Empty),
 ];
@@ -1566,5 +1596,63 @@ mod tests {
         assert_eq!(ask(&d, "$[?(@.p~ size 1)].id"), r#"["one"]"#);
         assert_eq!(ask(&d, "$[?(@.p~ size 2)].id"), r#"["two"]"#);
         assert_eq!(ask(&d, "$[?(@.p~ size 3)].id"), "[]");
+    }
+
+    /// A set of key names is a collection wherever a collection goes, including
+    /// on the right of one of the collection operators.
+    #[test]
+    fn a_key_set_reads_as_a_collection_on_either_side() {
+        assert_eq!(kept(r#"("x" in @.p~)"#), "o");
+        assert_eq!(kept(r#"("q" in @.p~)"#), "");
+        assert_eq!(kept("(@.p~ anyof @.p~)"), "o");
+        assert_eq!(kept("(@.p~ subsetof @.p~)"), "o");
+        assert_eq!(kept("(@.p~ noneof @.p~)"), "iftnbam");
+        assert_eq!(kept(r#"(["x"] subsetof @.p~)"#), "o");
+        // A path is a collection on the right too, so a value can be looked for
+        // in an array the member itself holds.
+        assert_eq!(kept("(1 in @.p)"), "a");
+        assert_eq!(kept("(2 in @.p)"), "");
+    }
+
+    /// An object with no keys answers a set that is there and empty, and
+    /// something that is not an object answers no set at all. Every collection
+    /// operator can tell the two apart.
+    #[test]
+    fn an_empty_object_has_a_key_set_and_a_scalar_has_none() {
+        let d = from_json(br#"[{"p":{},"id":"e"},{"p":1,"id":"s"},{"id":"m"}]"#).expect("parses");
+        for (path, want) in [
+            (r#"$[?(@.p~ subsetof ["x"])].id"#, r#"["e"]"#),
+            (r#"$[?(@.p~ anyof ["x"])].id"#, "[]"),
+            // `noneof` is the negation of the whole comparison, so a side that
+            // answers no set at all makes it true.
+            (r#"$[?(@.p~ noneof ["x"])].id"#, r#"["e","s","m"]"#),
+            ("$[?(@.p~ empty true)].id", r#"["e"]"#),
+            ("$[?(@.p~ empty false)].id", "[]"),
+            ("$[?(@.p~ size 0)].id", r#"["e"]"#),
+            // The bare test is about answering a name, and an empty set answers
+            // none, so it is the one place the two read alike.
+            ("$[?(@.p~)].id", "[]"),
+        ] {
+            assert_eq!(ask(&d, path), want, "{path}");
+        }
+    }
+
+    /// `sizeof` is another spelling of `size`, and a leading `-` or `+` is a
+    /// number or nothing at all.
+    #[test]
+    fn the_alias_and_the_signs_read_the_way_the_reference_reads_them() {
+        assert_eq!(kept("(@.p sizeof 1)"), "tao");
+        assert_eq!(kept("(@.p size 1)"), "tao");
+        assert_eq!(kept("(-@.p == -1)"), "i");
+        assert_eq!(kept("(+@.p == 1)"), "i");
+        assert_eq!(kept("(@.p == +1)"), "i");
+        assert_eq!(kept("(@.p > -1)"), "if");
+        assert_eq!(kept("(@.p - -1 == 2)"), "i");
+        // A sign is a number and nothing else, so it drops a string rather than
+        // passing it along, and the bare test on it is that number's own test.
+        assert_eq!(kept("(-@.p)"), "if");
+        // One sign and no more, and a group is how a second one is written.
+        assert_eq!(kept("(-(-@.p) == 1)"), "i");
+        assert!(why("$[?(--@.p == 1)]").contains("not a value"));
     }
 }

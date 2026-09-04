@@ -78,6 +78,9 @@ pub(crate) enum Operand<'a> {
     Call(Box<Operand<'a>>, Fun),
     /// Arithmetic, which is only ever a number and only ever over numbers.
     Math(Box<Operand<'a>>, Arith, Box<Operand<'a>>),
+    /// A leading `-` or `+`. It answers a number and nothing else, so `-@.name`
+    /// on a string answers nothing rather than answering the string.
+    Sign(Box<Operand<'a>>, bool),
 }
 
 /// A postfix method.
@@ -297,15 +300,7 @@ fn values<'v>(o: &'v Operand<'_>, root: &Value<'v>, cur: &Value<'v>) -> Vec<Item
         // says.
         Operand::Lit(bytes) => out.extend(Value::new(bytes).map(Item::Ref)),
         Operand::Re(_) => {}
-        Operand::Keys(inner) => {
-            for it in values(inner, root, cur) {
-                let Item::Ref(v) = it else { continue };
-                if v.kind() != Kind::Object {
-                    continue;
-                }
-                out.extend((0..v.len()).filter_map(|i| v.key_at(i)).map(Item::Key));
-            }
-        }
+        Operand::Keys(inner) => out.extend(keyset(inner, root, cur).unwrap_or_default()),
         Operand::Call(inner, fun) => {
             let got = values(inner, root, cur);
             call(&got, *fun, &mut out);
@@ -324,6 +319,32 @@ fn values<'v>(o: &'v Operand<'_>, root: &Value<'v>, cur: &Value<'v>) -> Vec<Item
                 }
             }
         }
+        Operand::Sign(inner, neg) => out.extend(
+            values(inner, root, cur)
+                .iter()
+                .filter_map(Item::number)
+                .map(|n| Item::Num(if *neg { -n } else { n })),
+        ),
+    }
+    out
+}
+
+/// The key names an operand answers, and `None` when nothing under it was an
+/// object.
+///
+/// The two are not the same thing, and every collection operator can tell them
+/// apart: `{}~` is an empty set that is there, so `{}~ subsetof ["x"]` is true
+/// and `{}~ empty true` is true, while `1~` and a path that matched nothing
+/// answer no set at all and satisfy neither.
+fn keyset<'v>(of: &'v Operand<'_>, root: &Value<'v>, cur: &Value<'v>) -> Option<Vec<Item<'v>>> {
+    let mut out = None;
+    for it in values(of, root, cur) {
+        let Item::Ref(v) = it else { continue };
+        if v.kind() != Kind::Object {
+            continue;
+        }
+        let into: &mut Vec<Item<'v>> = out.get_or_insert_default();
+        into.extend((0..v.len()).filter_map(|i| v.key_at(i)).map(Item::Key));
     }
     out
 }
@@ -384,87 +405,91 @@ fn cmp<'v>(
     root: &Value<'v>,
     cur: &Value<'v>,
 ) -> bool {
-    // `~` answers a set of key names, and the reference treats that set as the
-    // collection the collection operators work over rather than looking inside
-    // whatever the keys name. It also refuses to read a key name as a string
-    // for `=~` and for `in`, which is the one place the two sides of that are
-    // not the same, so both are answered here.
-    let keys = matches!(l, Operand::Keys(_));
+    // `~` answers a set of key names, and the collection operators read that set
+    // as the collection rather than looking inside whatever the keys name. It is
+    // also the one operand that can answer nothing and still be there, which is
+    // what `Side::live` is about.
+    let (left, right) = (Side::of(l, root, cur), Side::of(r, root, cur));
     if op == Op::Re {
         // A pattern that is not a string literal is not a pattern, and the
-        // reference answers nothing rather than complaining.
+        // reference answers nothing rather than complaining. A key name is not a
+        // string as far as this operator is concerned either.
         let Operand::Re(pat) = r else {
             return false;
         };
-        if keys {
+        if left.keys {
             return false;
         }
         let mut m = Matcher::new();
         m.reserve(&pat.re);
-        return values(l, root, cur)
+        return left
+            .items
             .iter()
             .filter_map(Item::text)
             .any(|s| m.is_match(&pat.re, s));
     }
-    let left = values(l, root, cur);
-    let right = values(r, root, cur);
     // These three are the negation of a comparison over the whole of both sides
     // and not comparisons in their own right, so a side that answers nothing
     // makes them true where it makes every other operator false.
     match op {
-        Op::Ne => return !left.iter().any(|a| right.iter().any(|b| same(a, b))),
-        Op::Nin => return keys || !within(&left, &right),
-        Op::NoneOf => return !shares(&left, &right, keys),
+        Op::Ne => {
+            return !left
+                .items
+                .iter()
+                .any(|a| right.items.iter().any(|b| same(a, b)));
+        }
+        Op::Nin => return !within(&left, &right),
+        Op::NoneOf => return !shares(&left, &right),
         _ => {}
     }
-    // What is left are the operators a side that answers nothing cannot satisfy,
-    // and `~` over anything but an object answers nothing.
-    if keys && left.is_empty() {
-        return false;
-    }
     match op {
-        Op::In => return !keys && within(&left, &right),
-        Op::AnyOf => return shares(&left, &right, keys),
+        Op::In => return within(&left, &right),
+        Op::AnyOf => return shares(&left, &right),
         Op::SubsetOf => {
-            let inside = |a: &Item<'v>| right.iter().any(|b| b.elements().any(|x| same(a, &x)));
-            if keys {
-                return left.iter().all(inside);
+            if !left.live || !right.live {
+                return false;
             }
-            return left.iter().any(|a| {
+            let inside = |a: &Item<'v>| right.bag().any(|x| same(a, &x));
+            if left.keys {
+                return left.items.iter().all(inside);
+            }
+            return left.items.iter().any(|a| {
                 matches!(a, Item::Ref(v) if v.kind() == Kind::Array)
                     && a.elements().all(|e| inside(&e))
             });
         }
         Op::Size => {
-            let Some(want) = right.iter().find_map(|b| b.number()) else {
+            let Some(want) = right.items.iter().find_map(|b| b.number()) else {
                 return false;
             };
             #[expect(
                 clippy::cast_precision_loss,
                 reason = "a length that reaches the precision of a double is not a document"
             )]
-            return if keys {
-                left.len() as f64 == want
+            return if left.keys {
+                left.live && left.items.len() as f64 == want
             } else {
-                left.iter()
+                left.items
+                    .iter()
                     .any(|a| a.size().is_some_and(|n| n as f64 == want))
             };
         }
         Op::Empty => {
-            let Some(want) = right.iter().find_map(|b| b.as_bool()) else {
+            let Some(want) = right.items.iter().find_map(|b| b.as_bool()) else {
                 return false;
             };
-            return if keys {
-                !want
+            return if left.keys {
+                left.live && left.items.is_empty() == want
             } else {
-                left.iter()
+                left.items
+                    .iter()
                     .any(|a| a.size().is_some_and(|n| (n == 0) == want))
             };
         }
         _ => {}
     }
-    left.iter().any(|a| {
-        right.iter().any(|b| match op {
+    left.items.iter().any(|a| {
+        right.items.iter().any(|b| match op {
             Op::Eq => same(a, b),
             Op::Lt => order(a, b) == Some(Ordering::Less),
             Op::Le => matches!(order(a, b), Some(Ordering::Less | Ordering::Equal)),
@@ -483,22 +508,59 @@ fn cmp<'v>(
     })
 }
 
-/// Whether anything on the left is an element of anything on the right, which
-/// is `in`.
-fn within(left: &[Item<'_>], right: &[Item<'_>]) -> bool {
-    left.iter()
-        .any(|a| right.iter().any(|b| b.elements().any(|e| same(a, &e))))
+/// What one side of a comparison answered.
+///
+/// `keys` and `live` are both about `~`, which is the only operand that answers
+/// a collection rather than a value and the only one that can answer an empty
+/// collection that is nonetheless there.
+struct Side<'v> {
+    items: Vec<Item<'v>>,
+    keys: bool,
+    live: bool,
 }
 
-/// Whether an array on the left and an array on the right share an element,
-/// which is `anyof`. `keys` says the left answers are themselves the collection,
-/// which is what a `~` gives.
-fn shares(left: &[Item<'_>], right: &[Item<'_>], keys: bool) -> bool {
-    let hit = |e: &Item<'_>| right.iter().any(|b| b.elements().any(|x| same(e, &x)));
-    if keys {
-        return left.iter().any(hit);
+impl<'v> Side<'v> {
+    fn of(o: &'v Operand<'_>, root: &Value<'v>, cur: &Value<'v>) -> Side<'v> {
+        if let Operand::Keys(inner) = o {
+            let got = keyset(inner, root, cur);
+            return Side {
+                live: got.is_some(),
+                items: got.unwrap_or_default(),
+                keys: true,
+            };
+        }
+        Side {
+            items: values(o, root, cur),
+            keys: false,
+            live: true,
+        }
     }
-    left.iter().any(|a| a.elements().any(|e| hit(&e)))
+
+    /// The collection this side is, for the operators that want one. That is
+    /// the answers themselves for a `~` and the elements of an array otherwise,
+    /// so anything that is not either has no collection and matches nothing.
+    fn bag(&self) -> impl Iterator<Item = Item<'v>> {
+        let (mine, elems) = if self.keys {
+            (Some(self.items.iter().copied()), None)
+        } else {
+            (None, Some(self.items.iter().flat_map(Item::elements)))
+        };
+        mine.into_iter()
+            .flatten()
+            .chain(elems.into_iter().flatten())
+    }
+}
+
+/// Whether anything on the left is an element of the collection on the right,
+/// which is `in`. A key name on the left is not asked, which is the reference's
+/// behaviour and not a rule with a reason behind it.
+fn within(left: &Side<'_>, right: &Side<'_>) -> bool {
+    !left.keys && right.live && left.items.iter().any(|a| right.bag().any(|e| same(a, &e)))
+}
+
+/// Whether the two collections share an element, which is `anyof`.
+fn shares(left: &Side<'_>, right: &Side<'_>) -> bool {
+    left.live && right.live && left.bag().any(|e| right.bag().any(|x| same(&e, &x)))
 }
 
 /// Where two answers stand relative to each other, or `None` when the question
