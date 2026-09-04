@@ -1,11 +1,11 @@
 //! `TS.*`, the time series family RedisTimeSeries put on the wire.
 //!
 //! The series itself is in `yo-series` and this is the wire in front of it, the
-//! same split as `super::cms` and the other module families. Nine commands
+//! same split as `super::cms` and the other module families. Eleven commands
 //! here: the key type, the two that shape a series, the four that write samples
-//! into it, the one that takes the newest sample back out and the one that
-//! reports on it. Reading a span, the label index and compaction rules come
-//! next.
+//! into it, the one that takes the newest sample back out, the one that reports
+//! on it and the two that read a span back either way round. The label index and
+//! compaction rules come next.
 //!
 //! # Errors
 //!
@@ -33,6 +33,41 @@
 //! never reads an option, so a missing key inside it is the key is not a TSDB
 //! key rather than anything about creating one.
 //!
+//! `TS.RANGE` and `TS.REVRANGE` are the other way round again: the arity, then
+//! the key, then the two ends of the span, then everything else. A read of a key
+//! that is not there answers that it is not there even when the rest of the
+//! command is nonsense. The option scan starts at the `to` slot rather than one
+//! past it, which never finds anything because that slot has already had to be a
+//! timestamp, but it is where the reference starts so it is where this starts.
+//!
+//! # What `COUNT` is allowed to be
+//!
+//! A `COUNT` that lands where a reduction name or a reducer name belongs is not
+//! a `COUNT`, it is that name, and the scan starts again two words later. If the
+//! second scan finds nothing then the read has no count at all rather than an
+//! error, so `AGGREGATION count 100` counts and does not truncate.
+//!
+//! # What `last` carries into a bucket it has nothing for
+//!
+//! There are two of these and they do not behave the same way, which is worth
+//! writing down because it looks like one rule until it is measured. A bucket
+//! with no kept readings at all, whether the readings were never there or the
+//! filters took them away, carries the reading before the gap in time, and it
+//! does that whichever way the read runs. A bucket that has kept readings but
+//! none `last` can use, so every one of them is not a number, carries whatever
+//! the bucket before it in the reading direction answered, which means forwards
+//! it takes the older neighbour and backwards it takes the newer one, and a read
+//! whose window opens on such a bucket answers not a number because nothing in
+//! range came before it.
+//!
+//! # `EMPTY` fills gaps and only gaps
+//!
+//! A run of buckets with nothing in them is written out only when the whole
+//! series has a real reading on both sides of it, which it looks for through the
+//! two filters but not through the range. So a window sitting entirely inside a
+//! gap is filled end to end, a run before the first reading the series ever held
+//! is dropped, and a run after the last one is dropped as well.
+//!
 //! # Where the two protocols disagree
 //!
 //! A sample value is a simple string of the shortest digits that read back as
@@ -59,13 +94,27 @@
 //! `TS.INFO` reports a memory usage of its own, which is D-53. It has to: the
 //! number there is the module's own allocator arithmetic over a chunk layout
 //! that is not this one, and an empty series here does not hold the four
-//! kibibytes an empty series holds there. Everything else matches a real Redis
-//! 8.10.1 with RedisTimeSeries in it, sample for sample and error for error.
+//! kibibytes an empty series holds there.
+//!
+//! A read that would build more rows than yo will build is refused with one
+//! sentence rather than attempted, which is D-54. The reference will happily try
+//! to put a hundred million empty buckets in a reply and fall over somewhere
+//! inside that, and asking for it is always a mistake, so this says so instead.
+//!
+//! One more thing shows up in a comparison and is not a difference. The eight
+//! variance and standard deviation reductions are written the way the module
+//! writes them, and a C compiler on arm64 contracts the last multiply and add of
+//! that expression into a fused multiply add while one on x86-64 does not, so
+//! the module answers two slightly different numbers on the two machines. What
+//! this answers is the x86-64 one, on every platform.
+//!
+//! Everything else matches a real Redis 8.10.1 with RedisTimeSeries in it,
+//! sample for sample and error for error.
 
 use yo_common::num::{DOUBLE_MAX, parse_f64, parse_i64, write_dragonbox};
 use yo_common::{Code, Error, Result};
 use yo_kv::{Foreign, Keyspace};
-use yo_series::{Encoding, Policy, Refused, Sample, Series};
+use yo_series::{Agg, Buckets, Encoding, Policy, Query, Refused, Sample, Series, Stamp, Unread};
 
 use super::args::{self, Args};
 use super::table::Spec;
@@ -124,6 +173,51 @@ const UPSERT: &[u8] = b"TSDB: Error at upsert, update is not supported when DUPL
 const BAD_FROM: &[u8] = b"TSDB: wrong fromTimestamp";
 /// One whose second is not.
 const BAD_TO: &[u8] = b"TSDB: wrong toTimestamp";
+/// A `COUNT` on the end of the command with nothing behind it.
+const COUNT_MISSING: &[u8] = b"TSDB: COUNT argument is missing";
+/// One with a word behind it that is not a whole number.
+const BAD_COUNT: &[u8] = b"TSDB: Couldn't parse COUNT";
+/// One that is a whole number and is below one.
+const COUNT_RANGE: &[u8] = b"TSDB: Invalid COUNT value";
+/// An `AGGREGATION` missing either half of the pair behind it, or one whose
+/// bucket width is not a whole number.
+const BAD_AGGREGATION: &[u8] = b"TSDB: Couldn't parse AGGREGATION";
+/// A reduction list with nothing between two commas, or with nothing in it at
+/// all.
+const EMPTY_AGG: &[u8] = b"TSDB: Empty aggregation type in list";
+/// One naming more reductions than a row will hold.
+const TOO_MANY_AGGS: &[u8] = b"TSDB: Too many aggregation types";
+/// One naming something that is not a reduction.
+const UNKNOWN_AGG: &[u8] = b"TSDB: Unknown aggregation type";
+/// A bucket width that is a whole number and is not above zero.
+const BAD_BUCKET: &[u8] = b"TSDB: bucketDuration must be greater than zero";
+/// An `EMPTY` anywhere other than the two places it is allowed to be.
+const EMPTY_PLACE: &[u8] = b"TSDB: EMPTY flag should be the 3rd or 5th flag after AGGREGATION flag";
+/// A `BUCKETTIMESTAMP` in the same position.
+const BUCKET_TS_PLACE: &[u8] =
+    b"TSDB: BUCKETTIMESTAMP flag should be the 3rd or 4th flag after AGGREGATION flag";
+/// One with a word behind it that is not an end of a bucket.
+const BAD_BUCKET_TS: &[u8] = b"TSDB: unknown BUCKETTIMESTAMP parameter";
+/// An `ALIGN` with a word behind it that is neither end of the span nor a
+/// timestamp.
+const BAD_ALIGN: &[u8] = b"TSDB: unknown ALIGN parameter";
+/// One on a read that is not cut into buckets, which has nothing to line up.
+const ALIGN_NO_AGG: &[u8] = b"TSDB: ALIGN parameter can only be used with AGGREGATION";
+/// `ALIGN start` on a read whose start is as far back as the series goes.
+const ALIGN_START: &[u8] = b"TSDB: start alignment can only be used with explicit start timestamp";
+/// `ALIGN end` on one whose end is as far forward as it goes.
+const ALIGN_END: &[u8] = b"TSDB: end alignment can only be used with explicit end timestamp";
+/// A `FILTER_BY_VALUE` without both of its ends behind it.
+const FILTER_VALUE_MISSING: &[u8] = b"TSDB: FILTER_BY_VALUE one or more arguments are missing";
+/// One whose lower end is not a number.
+const BAD_MIN: &[u8] = b"TSDB: Couldn't parse MIN";
+/// One whose upper end is not.
+const BAD_MAX: &[u8] = b"TSDB: Couldn't parse MAX";
+/// A `FILTER_BY_TS` with no timestamp behind it.
+const FILTER_TS_MISSING: &[u8] = b"TSDB: FILTER_BY_TS one or more arguments are missing";
+/// A read that would have built more rows than yo will build, which is D-54 and
+/// is the one sentence here the module has no counterpart for.
+const TOO_WIDE: &[u8] = b"TSDB: the requested range holds too many empty buckets";
 /// A retention below zero, which the module writes with no prefix at all where
 /// a retention that is not a number gets one.
 const BARE_RETENTION: &[u8] = b"TSDB: Couldn't parse RETENTION";
@@ -146,6 +240,19 @@ const WRONG_KIND: &str = "WRONGTYPE Operation against a key holding the wrong ki
 const CHUNK_MIN: i64 = 48;
 /// The largest.
 const CHUNK_MAX: i64 = 1_048_576;
+
+/// How many reductions one read may ask for.
+const MAX_AGGS: usize = 16;
+/// How many timestamps `FILTER_BY_TS` will read. The ones past this are left
+/// where they are rather than being an error, which is the module's.
+const MAX_FILTER_TS: usize = 128;
+/// Where the option words on a read start.
+///
+/// The module scans for them from the `to` slot onwards, and that slot has
+/// already had to be a timestamp by the time the scan runs, so nothing is ever
+/// found there. It is still where the scan starts, so it is where this one
+/// starts too.
+const OPTIONS_AT: usize = 3;
 
 /// A series under a key.
 #[derive(Debug)]
@@ -187,6 +294,8 @@ pub(super) fn execute(db: &mut Keyspace, spec: &Spec, args: Args<'_>, out: &mut 
         "ts.decrby" => incr(db, &args, out, false),
         "ts.del" => del(db, &args, out),
         "ts.get" => get(db, &args, out),
+        "ts.range" => range(db, &args, out, false),
+        "ts.revrange" => range(db, &args, out, true),
         "ts.info" => info(db, &args, out),
         other => unreachable!("{other} is not a time series command"),
     }
@@ -397,6 +506,273 @@ fn get(db: &mut Keyspace, args: &Args<'_>, out: &mut Out) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// `TS.RANGE key from to [LATEST] [FILTER_BY_TS ts ...] [FILTER_BY_VALUE min
+/// max] [COUNT n] [[ALIGN a] AGGREGATION spec width [BUCKETTIMESTAMP b]
+/// [EMPTY]]` and `TS.REVRANGE`, which are one read in two directions.
+///
+/// The key is resolved before a single option word is looked at, so a read of a
+/// key that is not there says so whatever else is wrong with the command. After
+/// that the two ends of the span are read, and only then the options, in the
+/// order their errors come out in.
+fn range(db: &mut Keyspace, args: &Args<'_>, out: &mut Out, reverse: bool) -> Result<()> {
+    let name = if reverse { "ts.revrange" } else { "ts.range" };
+    let Some(body) = read(db, args.get(1))? else {
+        return say(out, MISSING);
+    };
+    let query = match reading(args, reverse) {
+        Ok(query) => query,
+        Err(bad) => return said(bad, name, out),
+    };
+    let rows = match body.s.read(&query) {
+        Ok(rows) => rows,
+        Err(Unread::TooWide) => return say(out, TOO_WIDE),
+    };
+    out.array(rows.len());
+    for i in 0..rows.len() {
+        let row = rows.row(i);
+        out.array(1 + row.len());
+        out.int(rows.stamps[i]);
+        for &d in row {
+            value(out, d);
+        }
+    }
+    Ok(())
+}
+
+/// Everything a read asked for, gathered off the command.
+fn reading(args: &Args<'_>, reverse: bool) -> core::result::Result<Query, Bad> {
+    // Which end was written open matters later: an alignment against an end
+    // that was never named is an error, and only the one character counts as
+    // naming nothing.
+    let open_start = args.get(2) == b"-";
+    let Some(from) = span(args.get(2), b"-", 0) else {
+        return Err(Bad::Said(BAD_FROM));
+    };
+    let open_end = args.get(3) == b"+";
+    let Some(to) = span(args.get(3), b"+", i64::MAX) else {
+        return Err(Bad::Said(BAD_TO));
+    };
+
+    // LATEST comes first in the module and means read through to the compaction
+    // rule that feeds this series. Nothing has rules yet, so it is read for the
+    // order of the errors around it and then dropped.
+    let count = count_of(args)?;
+    let mut buckets = buckets_of(args)?;
+    if let Some(align) = align_of(args, buckets.is_some(), open_start, open_end, from, to)?
+        && let Some(buckets) = buckets.as_mut()
+    {
+        buckets.align = align;
+    }
+    Ok(Query {
+        from,
+        to,
+        reverse,
+        count,
+        by_ts: by_ts(args)?,
+        by_value: by_value(args)?,
+        buckets,
+    })
+}
+
+/// How many rows at most, if the read said.
+///
+/// A `COUNT` sitting where a reduction name or a reducer name goes is that name
+/// and not the keyword, so the scan starts again past it. Two of those in a row
+/// is possible, which is why this is written twice.
+fn count_of(args: &Args<'_>) -> core::result::Result<Option<usize>, Bad> {
+    let Some(mut at) = find_from(args, OPTIONS_AT, b"COUNT") else {
+        return Ok(None);
+    };
+    for word in [b"AGGREGATION".as_slice(), b"REDUCE".as_slice()] {
+        if find_from(args, OPTIONS_AT, word) == Some(at - 1) {
+            match find_from(args, at + 1, b"COUNT") {
+                Some(next) => at = next,
+                None => return Ok(None),
+            }
+        }
+    }
+    if at + 1 == args.len() {
+        return Err(Bad::Said(COUNT_MISSING));
+    }
+    let Some(n) = parse_i64(args.get(at + 1)) else {
+        return Err(Bad::Said(BAD_COUNT));
+    };
+    if n < 1 {
+        return Err(Bad::Said(COUNT_RANGE));
+    }
+    Ok(Some(usize::try_from(n).unwrap_or(usize::MAX)))
+}
+
+/// How the read is cut into buckets, if it asked to be.
+///
+/// `EMPTY` and `BUCKETTIMESTAMP` are only looked for when there is an
+/// `AGGREGATION` to hang them off, and each has to sit a fixed number of words
+/// behind it. That is not a grammar, it is a pair of arithmetic checks against
+/// where the keyword was found, and a command that puts the words in the
+/// documented order passes both.
+fn buckets_of(args: &Args<'_>) -> core::result::Result<Option<Buckets>, Bad> {
+    let Some(at) = find_from(args, OPTIONS_AT, b"AGGREGATION") else {
+        return Ok(None);
+    };
+    if at + 2 >= args.len() {
+        return Err(Bad::Said(BAD_AGGREGATION));
+    }
+    let spec = args.get(at + 1);
+    let Some(delta) = parse_i64(args.get(at + 2)) else {
+        return Err(Bad::Said(BAD_AGGREGATION));
+    };
+    // The list is read before the width is looked at, so a bad name on a zero
+    // width bucket answers about the name.
+    let aggs = reductions(spec)?;
+    if delta <= 0 {
+        return Err(Bad::Said(BAD_BUCKET));
+    }
+
+    let mut buckets = Buckets {
+        aggs,
+        delta,
+        align: 0,
+        empty: false,
+        stamp: Stamp::Start,
+    };
+    if let Some(flag) = find_from(args, OPTIONS_AT, b"EMPTY") {
+        if flag != at + 3 && flag != at + 5 {
+            return Err(Bad::Said(EMPTY_PLACE));
+        }
+        buckets.empty = true;
+    }
+    if let Some(flag) = find_from(args, OPTIONS_AT, b"BUCKETTIMESTAMP") {
+        if flag != at + 3 && flag != at + 4 {
+            return Err(Bad::Said(BUCKET_TS_PLACE));
+        }
+        if flag + 1 >= args.len() {
+            return Err(Bad::Arity);
+        }
+        let word = args.get(flag + 1);
+        buckets.stamp = if args::is(word, b"start") || word == b"-" {
+            Stamp::Start
+        } else if args::is(word, b"end") || word == b"+" {
+            Stamp::End
+        } else if args::is(word, b"mid") || word == b"~" {
+            Stamp::Mid
+        } else {
+            return Err(Bad::Said(BAD_BUCKET_TS));
+        };
+    }
+    Ok(Some(buckets))
+}
+
+/// The reduction list, which is one name or several separated by commas.
+///
+/// A name may appear twice and gets a column each time, because the list is
+/// read as written rather than gathered into a set.
+fn reductions(spec: &[u8]) -> core::result::Result<Vec<Agg>, Bad> {
+    let mut aggs = Vec::new();
+    for word in spec.split(|&b| b == b',') {
+        if word.is_empty() {
+            return Err(Bad::Said(EMPTY_AGG));
+        }
+        if aggs.len() >= MAX_AGGS {
+            return Err(Bad::Said(TOO_MANY_AGGS));
+        }
+        let Some(agg) = Agg::parse(word) else {
+            return Err(Bad::Said(UNKNOWN_AGG));
+        };
+        aggs.push(agg);
+    }
+    Ok(aggs)
+}
+
+/// The timestamp the bucket edges line up against, if the read named one.
+///
+/// The word is read before any of the three things that make an alignment
+/// wrong are checked, so a word that is not an alignment at all answers about
+/// the word rather than about the missing `AGGREGATION`.
+fn align_of(
+    args: &Args<'_>,
+    bucketed: bool,
+    open_start: bool,
+    open_end: bool,
+    from: i64,
+    to: i64,
+) -> core::result::Result<Option<i64>, Bad> {
+    let Some(at) = find_from(args, OPTIONS_AT, b"ALIGN") else {
+        return Ok(None);
+    };
+    if at + 1 >= args.len() {
+        return Err(Bad::Arity);
+    }
+    let word = args.get(at + 1);
+    let start = args::is(word, b"start") || word == b"-";
+    let end = args::is(word, b"end") || word == b"+";
+    let align = if start {
+        from
+    } else if end {
+        to
+    } else {
+        match parse_i64(word).filter(|&n| n >= 0) {
+            Some(n) => n,
+            None => return Err(Bad::Said(BAD_ALIGN)),
+        }
+    };
+    if !bucketed {
+        return Err(Bad::Said(ALIGN_NO_AGG));
+    }
+    if start && open_start {
+        return Err(Bad::Said(ALIGN_START));
+    }
+    if end && open_end {
+        return Err(Bad::Said(ALIGN_END));
+    }
+    Ok(Some(align))
+}
+
+/// The two ends of the value filter, if the read named them.
+fn by_value(args: &Args<'_>) -> core::result::Result<Option<(f64, f64)>, Bad> {
+    let Some(at) = find_from(args, OPTIONS_AT, b"FILTER_BY_VALUE") else {
+        return Ok(None);
+    };
+    if at + 2 >= args.len() {
+        return Err(Bad::Said(FILTER_VALUE_MISSING));
+    }
+    let Some(min) = parse_f64(args.get(at + 1)) else {
+        return Err(Bad::Said(BAD_MIN));
+    };
+    let Some(max) = parse_f64(args.get(at + 2)) else {
+        return Err(Bad::Said(BAD_MAX));
+    };
+    Ok(Some((min, max)))
+}
+
+/// The timestamps the read will take, if it listed any.
+///
+/// The list runs until a word that is not a timestamp, which is how the option
+/// after it is found, so a list that runs to the end of the command is a list
+/// and a list followed by `COUNT` stops at the keyword.
+fn by_ts(args: &Args<'_>) -> core::result::Result<Option<Vec<i64>>, Bad> {
+    let Some(at) = find_from(args, OPTIONS_AT, b"FILTER_BY_TS") else {
+        return Ok(None);
+    };
+    if at + 1 == args.len() {
+        return Err(Bad::Said(FILTER_TS_MISSING));
+    }
+    let mut list = Vec::new();
+    let mut i = at + 1;
+    while i < args.len() && list.len() < MAX_FILTER_TS {
+        match parse_i64(args.get(i)).filter(|&n| n >= 0) {
+            Some(n) => list.push(n),
+            None => break,
+        }
+        i += 1;
+    }
+    if list.is_empty() {
+        return Err(Bad::Said(FILTER_TS_MISSING));
+    }
+    list.sort_unstable();
+    list.dedup();
+    Ok(Some(list))
 }
 
 /// `TS.INFO key`, which is fourteen fields about the series and takes no field

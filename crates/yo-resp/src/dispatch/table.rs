@@ -247,6 +247,9 @@ const AC_TS_READ_FAST: &[&str] = &["@read", "@fast", "@timeseries"];
 /// The time series write side, which is everything that puts a sample in or
 /// changes what a series does with one.
 const AC_TS_WRITE: &[&str] = &["@write", "@timeseries"];
+/// The time series read side for the two that walk a span, which the module
+/// does not call fast.
+const AC_TS_READ: &[&str] = &["@read", "@timeseries"];
 /// `TS.CREATE`, the one write the module calls fast, because making an empty
 /// series is an allocation and nothing else.
 const AC_TS_WRITE_FAST: &[&str] = &["@write", "@fast", "@timeseries"];
@@ -3830,6 +3833,32 @@ pub static COMMANDS: &[Spec] = &[
         since: "1.0.0",
         complexity: "O(1)",
         summary: "The fourteen things a series says about itself.",
+        group: "ts",
+    },
+    Spec {
+        name: "ts.range",
+        arity: -4,
+        flags: TS_READ,
+        first_key: 1,
+        last_key: 1,
+        step: 1,
+        acl: AC_TS_READ,
+        since: "1.0.0",
+        complexity: "O(n/m+k) with n the samples, m the chunk size and k the samples in the span",
+        summary: "The samples in a span, oldest first, in buckets if asked for.",
+        group: "ts",
+    },
+    Spec {
+        name: "ts.revrange",
+        arity: -4,
+        flags: TS_READ,
+        first_key: 1,
+        last_key: 1,
+        step: 1,
+        acl: AC_TS_READ,
+        since: "1.4.0",
+        complexity: "O(n/m+k) with n the samples, m the chunk size and k the samples in the span",
+        summary: "The same span, newest first.",
         group: "ts",
     },
     // --------------------------------------------------------------- array
