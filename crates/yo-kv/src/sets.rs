@@ -32,7 +32,7 @@ use std::collections::HashSet;
 
 use yo_common::Result;
 
-use crate::db::Db;
+use crate::db::{Db, Holds};
 use crate::keyspace::Keyspace;
 use crate::scan::Cursor;
 use crate::set::{Member, Set};
@@ -791,8 +791,10 @@ impl Db {
             return Ok(0);
         }
         let mut scratch = self.take_setops();
-        let sets = self.bodies_of(&slots);
+        let held = self.hold_slots(&slots);
+        let sets = bodies_of(&held, &slots);
         let n = setops::inter(&mut scratch, &sets, limit, f);
+        drop(held);
         self.put_setops(scratch);
         Ok(n)
     }
@@ -821,8 +823,10 @@ impl Db {
         }
         let slots = self.set_slots(keys)?;
         let mut scratch = self.take_setops();
-        let sets = self.bodies_of(&slots);
+        let held = self.hold_slots(&slots);
+        let sets = bodies_of(&held, &slots);
         let n = setops::union(&mut scratch, &sets, limit, f);
+        drop(held);
         self.put_setops(scratch);
         Ok(n)
     }
@@ -853,7 +857,8 @@ impl Db {
         let Some(Some(_)) = slots.first() else {
             return Ok(0);
         };
-        let sets = self.bodies_of(&slots);
+        let held = self.hold_slots(&slots);
+        let sets = bodies_of(&held, &slots);
         Ok(setops::diff(&sets, limit, f))
     }
 
@@ -885,8 +890,9 @@ impl Db {
         let built = if slots.is_empty() || slots.iter().any(Option::is_none) {
             None
         } else {
-            let limits = self.at_ref(destination).limits;
-            let sets = self.bodies_of(&slots);
+            let limits = self.hold(destination).limits;
+            let held = self.hold_slots(&slots);
+            let sets = bodies_of(&held, &slots);
             let upper = sets.iter().map(|s| s.len()).min().unwrap_or(0);
             setops::collect(upper, &limits, |f| {
                 setops::inter(&mut scratch, &sets, 0, f);
@@ -908,8 +914,9 @@ impl Db {
         let slots = self.set_slots(keys)?;
         let mut scratch = self.take_setops();
         let built = {
-            let limits = self.at_ref(destination).limits;
-            let sets = self.bodies_of(&slots);
+            let limits = self.hold(destination).limits;
+            let held = self.hold_slots(&slots);
+            let sets = bodies_of(&held, &slots);
             let upper = sets.iter().map(|s| s.len()).sum();
             setops::collect(upper, &limits, |f| {
                 setops::union(&mut scratch, &sets, 0, f);
@@ -931,8 +938,9 @@ impl Db {
         let slots = self.set_slots(keys)?;
         let built = match slots.first() {
             Some(Some(_)) => {
-                let limits = self.at_ref(destination).limits;
-                let sets = self.bodies_of(&slots);
+                let limits = self.hold(destination).limits;
+                let held = self.hold_slots(&slots);
+                let sets = bodies_of(&held, &slots);
                 let upper = sets[0].len();
                 setops::collect(upper, &limits, |f| {
                     setops::diff(&sets, 0, f);
@@ -963,20 +971,28 @@ impl Db {
         Ok(out)
     }
 
-    /// The bodies those slots point at, with the keys that were not there gone.
+    /// Every stripe those slots name, held at once.
     ///
-    /// Several stripes are borrowed at once here and that is the whole reason
-    /// the resolving above happens first: reaping a key needs the stripe
-    /// mutably, reading a body needs it shared, and an operation over four keys
-    /// on four stripes needs all four bodies at the same time.
+    /// This is the whole reason the resolving above happens first: reaping a
+    /// key needs its stripe mutably, reading a body needs it held, and an
+    /// operation over four keys on four stripes needs all four at the same
+    /// time. Nothing else of this database is held while these are, and they
+    /// are taken in stripe order, which is what keeps two of these from waiting
+    /// on each other.
     #[inline]
-    fn bodies_of(&self, slots: &[Option<Home>]) -> PerSet<&Set> {
-        slots
-            .iter()
-            .flatten()
-            .map(|&(stripe, at)| self.stripe(stripe).set_at(at))
-            .collect()
+    fn hold_slots(&self, slots: &[Option<Home>]) -> Holds<'_> {
+        self.hold_many(slots.iter().flatten().map(|&(stripe, _)| stripe))
     }
+}
+
+/// The bodies those slots point at, with the keys that were not there gone.
+#[inline]
+fn bodies_of<'h>(held: &'h Holds<'_>, slots: &[Option<Home>]) -> PerSet<&'h Set> {
+    slots
+        .iter()
+        .flatten()
+        .map(|&(stripe, at)| held.stripe(stripe).set_at(at))
+        .collect()
 }
 
 #[cfg(test)]

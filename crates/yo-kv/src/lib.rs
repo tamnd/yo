@@ -180,7 +180,7 @@ pub use blob::{Blob, Span};
 pub use clock::Clock;
 pub use cond::Compare;
 pub use counter::{Counted, IncrEx, IncrExpire, Num};
-pub use db::{Db, MAX_STRIPES};
+pub use db::{Db, Holds, MAX_STRIPES};
 pub use elem::{Elements, Full, MAX_ROWS, NAME_MAX};
 pub use foreign::Foreign;
 pub use hash::{Hash, Limits as HashLimits};

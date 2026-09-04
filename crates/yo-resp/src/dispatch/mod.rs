@@ -91,6 +91,7 @@ pub use table::{COMMANDS, Spec, arity_ok, lookup};
 
 use crate::reply::Out;
 use std::path::{Path, PathBuf};
+use yo_common::lock::Held;
 use yo_common::{Code, Error};
 use yo_kv::cold::Blocks;
 use yo_kv::{Clock, Db, Keyspace};
@@ -480,8 +481,10 @@ impl Server {
     /// all of these and the stripe boundaries do not appear in it, which is
     /// what makes the numbers `INFO` reports the same numbers whatever the
     /// server was cut into.
-    fn keyspaces(&self) -> impl Iterator<Item = &Keyspace> {
-        self.dbs.iter().flat_map(Db::stripes)
+    fn keyspaces(&self) -> impl Iterator<Item = Held<'_, Keyspace>> {
+        self.dbs
+            .iter()
+            .flat_map(|db| (0..db.width()).map(|i| db.hold_stripe(i)))
     }
 
     /// The same, mutably.
@@ -510,9 +513,9 @@ impl Server {
     }
 
     /// The same, without taking it mutably.
-    fn slot(&self, i: usize) -> &Keyspace {
+    fn slot(&self, i: usize) -> Held<'_, Keyspace> {
         let (db, stripe) = (i / self.width, i % self.width);
-        self.dbs[db].stripe(stripe)
+        self.dbs[db].hold_stripe(stripe)
     }
 
     /// Where `BACKUP` writes and what `CONFIG GET dir` answers.
@@ -577,8 +580,8 @@ impl Server {
     /// ours rather than the client's problem. A write puts the same value on
     /// every one of them, so any stripe answers for all of them and this is the
     /// first one.
-    fn settings(&self) -> &Keyspace {
-        self.dbs[0].stripe(0)
+    fn settings(&self) -> Held<'_, Keyspace> {
+        self.dbs[0].hold_stripe(0)
     }
 
     /// Take a new clock reading and give it to every database.
@@ -633,7 +636,7 @@ impl Server {
     /// keyspace can change them and the engine has to say when they move.
     #[must_use]
     pub fn memory_bytes(&self) -> usize {
-        self.keyspaces().map(Keyspace::memory_bytes).sum::<usize>() + self.conn_bytes
+        self.keyspaces().map(|db| db.memory_bytes()).sum::<usize>() + self.conn_bytes
     }
 
     /// What the keyspace itself is holding, live records only.
@@ -710,13 +713,13 @@ impl Server {
     /// Keys reclaimed by running into them after their deadline.
     #[must_use]
     pub fn expired_keys(&self) -> u64 {
-        self.keyspaces().map(Keyspace::expired_keys).sum()
+        self.keyspaces().map(|db| db.expired_keys()).sum()
     }
 
     /// Keys thrown away to make room, which is the other number entirely.
     #[must_use]
     pub fn evicted_keys(&self) -> u64 {
-        self.keyspaces().map(Keyspace::evicted_keys).sum()
+        self.keyspaces().map(|db| db.evicted_keys()).sum()
     }
 
     /// Every command that has been seen, with its counters.
@@ -822,7 +825,7 @@ impl Server {
     /// two apart.
     #[must_use]
     pub fn store_bytes(&self) -> u64 {
-        self.keyspaces().filter_map(Keyspace::store_bytes).sum()
+        self.keyspaces().filter_map(|db| db.store_bytes()).sum()
     }
 
     /// What the file has been asked to do, added up over every database.
@@ -885,7 +888,11 @@ impl Server {
         if self.maxstore == Some(0) {
             return false;
         }
-        match self.slot(at).store_bytes() {
+        // Out of the stripe first. A match keeps whatever it is looking at
+        // alive for the whole of itself, and that would be this stripe held
+        // across the arms for no reason.
+        let bytes = self.slot(at).store_bytes();
+        match bytes {
             Some(held) => self.maxstore.is_none_or(|cap| held < cap),
             // Nothing attached, but somewhere to get one from the moment this
             // database needs it, which is what makes the answer yes rather than
@@ -996,7 +1003,8 @@ impl Server {
             let i = (self.evict_db + turn) % self.slots();
             // An empty keyspace has nothing to move and opening a log for one
             // would cost a resident page window to find that out.
-            let gave = if !self.slot(i).is_empty() && self.migrates(i) {
+            let used = !self.slot(i).is_empty();
+            let gave = if used && self.migrates(i) {
                 self.attach_store(i);
                 // Whether it made room and not whether it moved a key. A round
                 // that demoted nothing and handed back a segment is a round
@@ -20411,9 +20419,7 @@ mod tests {
         );
         let db = f.server.striped(0);
         assert!(
-            db.stripes()
-                .iter()
-                .all(|s| s.policy().name() == "allkeys-lru"),
+            db.stripes_mut().all(|s| s.policy().name() == "allkeys-lru"),
             "a stripe kept the old policy"
         );
     }

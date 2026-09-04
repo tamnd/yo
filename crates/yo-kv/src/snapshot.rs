@@ -521,7 +521,7 @@ mod tests {
         }
         // The keys really are spread out, which is the thing this test rests on.
         assert!(
-            d.stripes().iter().all(|s| !s.is_empty()),
+            d.stripes_mut().all(|s| !s.is_empty()),
             "a stripe got nothing, so this proves less than it looks"
         );
         // And one of them has a deadline, since a deadline is written before the

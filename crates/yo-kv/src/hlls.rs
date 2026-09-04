@@ -387,7 +387,7 @@ impl Db {
         }
         let mut max = [0u8; hll::REGISTERS];
         for key in keys {
-            self.at_ref(key).merge_sketch(key, &mut max)?;
+            self.hold(key).merge_sketch(key, &mut max)?;
         }
         Ok(estimate(&max))
     }
@@ -414,7 +414,7 @@ impl Db {
         let mut max = [0u8; hll::REGISTERS];
         let mut dense = false;
         for key in std::iter::once(dest).chain(srcs) {
-            dense |= self.at_ref(key).merge_sketch(key, &mut max)?;
+            dense |= self.hold(key).merge_sketch(key, &mut max)?;
         }
         self.at(dest).pfmerge_into(dest, &max, dense)
     }
