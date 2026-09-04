@@ -10443,6 +10443,10 @@ mod tests {
             (b"$.box[?(@.n[0] + 1 == 2)].t", r#"["a"]"#),
             (b"$.box[?(@~ size 3)].t", r#"["a","b"]"#),
             (b"$.box[?(@.n~)].t", "[]"),
+            (b"$.box[?(@.n sizeof 2)].t", r#"["a"]"#),
+            (b"$.box[?(-@.n[0] == -9)].t", r#"["b"]"#),
+            (b"$.box[?(1 in @.n)].t", r#"["a"]"#),
+            (b"$.box[?(\"g\" in @~)].t", r#"["a","b"]"#),
         ] {
             assert_eq!(f.run(&[b"JSON.GET", b"doc", path]), bulk(want).as_str());
         }
