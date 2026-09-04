@@ -4,6 +4,67 @@ What each release changed, why, and what it costs you. The versioning rules and 
 
 While the major is 0, a minor release may break anything, including the on-disk format. The format is frozen at `M6`, not before.
 
+## 0.3.14 — 2026-09-04
+
+Fifty four pull requests and no milestone has closed, so this is a patch again. The last release said that a patch this size is a process failure rather than a plan, and saying it twice is worse than saying it once, so here is the actual reason: M5, M6 and M7 all have their scope done and all three are held open by exit gates that are measurements rather than features. A gate that is not met cannot be waved through, and a milestone that cannot close cannot take a minor, so the feature work for M8 went in on top and the pile got bigger. The gates are in the known gaps below with the numbers they are currently at.
+
+What is in here is the JSON document surface, the vector index written down and read back, the four RedisBloom sketch families, and a large amount of measurement on the vector and larger than memory paths that changed what got worked on next.
+
+A file written by 0.3.13 opens unchanged under this version and a file written by this version opens under 0.3.13. No record kind was added.
+
+### Added
+
+- **The JSON command surface, thirty odd commands over JSONPath.** Reading and writing JSON text against the document encoding, the selectors that name more than one place, changing a document at every place a path matched, the eight commands a document store needs first, the nine array and size commands, the number family and `JSON.STRAPPEND`, `JSON.MSET`, `JSON.MERGE`, `JSON.RESP` and `JSON.DEBUG`, filter expressions, the rest of the filter operators, the filter language Redis 8.10 added, and projection expressions on `JSON.GET`, `JSON.MGET` and `JSON.RESP`.
+- **The twelve vector set commands, and a vector index on a document path.** `VSIM` filters are answered inside the scan rather than applied to what comes out of it. The vector collection moved into `yo-vector` and the embedded API has a typed collection of vectors.
+- **The vector index is written down and read back.** An image is collection chunk records with its own header rather than a new record kind, it carries the centroids and the postings and nothing derived, and everything that falls out of those is rebuilt in one pass at the end of a load. An image whose header this version does not understand is thrown away and the index is rebuilt, which is what makes it safe to change later.
+- **All four RedisBloom sketch families, verified against a running 8.10.1 over a raw socket on both protocols.** `BF.*` including `BF.DEBUG` at 1143 comparisons, `CF.*` at 1714, `CMS.*` at 2039, `TOPK.*` at 2449 and `TDIGEST.*` at 2540, none of them with a difference. The t digest is a port of the module's own C at the commit its submodule pins, unstable sort included, because two servers behind one load balancer have to answer the same p99 for the same samples.
+- **`BACKUP`, with the seven subcommands and the four state machine states,** all of it read off 8.10.1 rather than guessed.
+- **A whole dataset can be written as one RDB file,** which is half of what `PSYNC` needs and the reason `DUMP` now has a stream envelope.
+- **`SHUTDOWN`, which is how a server is meant to be stopped,** with all five flags taken and the syntax errors read off a real server.
+- **`SUNIONCARD`, `SDIFFCARD`, `LMOVEM`, `BLMOVEM` and `HIMPORT`,** which is the Redis 8.10 delta that was written down in #311 and then implemented.
+
+### Changed
+
+- **A vector search can stop reading once the partitions stop paying.** `Tuning::probe` is a budget every query spends whether it needs it or not, and a query sitting deep inside one partition has found everything it is going to find after two or three. `Tuning::patience` is how many partitions in a row may add nothing before the search stops, and it can only fire once there are already enough candidates, so a filtered search that is still widening is never cut off by it.
+- **A vector near a boundary goes into more than one partition,** which is the other half of the same recall problem.
+- **The last two full centroid scans came off the ingest path.** A merge's rehoming and a sweep's neighbour list both measured a vector against every centroid in the collection, and both now go through the coarse layer. The argument for where that layer is safe is now written down and it is about what the answer is used for rather than which call site asks: deciding where a member that already has a partition should live has to be exact because an approximate answer there feeds back, and neither of these is that case.
+- **`XREADGROUP` no longer walks the node from the front on every read.** A group keeps a mark saying where its last read stopped, believed only when nothing has moved bytes inside a node since and the read is asking for exactly the ID the walk would be asked for next, so an `XGROUP SETID` backwards is safe without the group knowing the mark exists.
+- **An index key is built in one go instead of a byte at a time.** A numeric index key is twelve bytes and the length is known before the first one is written, so `Small` got `from_slice` and `extend_from_slice` and the key is built in a local array and handed over whole.
+- **`DUMP` and `RESTORE` have a stream envelope,** so every type now round trips. That was a known gap in 0.3.13.
+
+### Fixed
+
+- **The vector distance loop was blocked from vectorising, and it is half of what an ingest spends.** The loop indexed both slices by a counter bounded by only one of the two lengths, so the compiler could not prove the second index was in range and emitted a bounds check per element, and a branch in a loop body is one the vectoriser will not cross. `slice::as_chunks` makes the body eight independent multiply adds with no check at all, no intrinsics and no `target_feature` gate. There were two identical copies of the distance and they are now one.
+- **Compaction was copying a segment to get four kilobytes back.** Writes under the larger than memory gate were slow and nothing said why, so three counters went into `INFO` for what arena compaction has walked, moved and copied. The first run with them on said 213 GB copied to load 2.5 GB, which is 85 bytes moved for every byte written, with about three quarters of the server's time inside the walk.
+- **The demotion sweep was compacting an arena the memory was not in.** The set row under the same gate said 3.5 billion records moved to load 655360 keys and 107 GB copied against 2.5 GB written, with a profile on server3 putting 66 percent of the server in the compaction walk. A keyspace full of collections keeps its bodies in slabs the arena has never heard of, so every round of a sweep looking for strings to demote was barren, and the last resort answered each barren round by walking the whole arena on every write and handing back segments that were almost entirely live.
+- **Deciding what to maintain next was linear in the partition count and ran once per vector inserted,** which is the same quadratic the coarse layer exists to remove hiding somewhere else. By 1.6 million vectors it was a fifth of an ingest and it was finding nothing to do almost every time.
+
+### Format
+
+No change. The vector index image is written as collection chunk records, which already existed, and a reader that does not know the image header throws it away and rebuilds rather than failing. A file written by either of 0.3.13 and 0.3.14 opens under the other.
+
+### Performance
+
+Development measurements unless the machine is named. None of these are gate numbers.
+
+- **The distance fix took the insert half of a vector ingest down by three times,** and the maintenance fix on top of it means M6's ingest gate is met on gamingpc, a 13900K. It is not met on server3 at 768 dimensions, which is in the known gaps.
+- **Preparing a query against a partition was a quarter of a query,** which is one pass over a few kilobytes against a scan that reads a hundred times as much, and a third of it came off. It was picked by measuring rather than by reading the code, and reading the code had picked something else.
+- **Ranking the centroids does not go faster by making a centroid smaller, and that is the useful part of the measurement.** Timing the scan against a warm table and against a run of copies far too big for any cache gives the same number at every size including 88 megabytes, so the prefetcher hides the whole latency and the loop runs at the speed of the arithmetic. bfloat16 halves the bytes and is not faster and i8 quarters them and is slower, because unpacking a byte into a float is work and work is the constraint. Fewer coordinates does work, because the centroids are stored rotated and a prefix of the columns is a random projection with nothing to train: at 768 dimensions a sixth of the coordinates plus a rerank of four times the head picks a head 1.0124 times as far in 147 microseconds against 449.
+- **An indexed path equality costs what `HGET` costs, at a matched key width, on a quiet 13900K.** The lookup is 28.7 ns at 1024 documents and 28.8 at 16384, against 27.2 and 29.3 for a hash keyed by twelve byte fields. The earlier comparison charged the index for a longer key and called the difference index overhead, which it is not. The index is also flat where the hash is not, so at the larger size it is the faster of the two.
+- **Vector search on SIFT1M, on gamingpc.** Recall at 10 of 0.9552 with p99 846 us, which meets M6's row for that dataset. MS-MARCO-v2 reaches 0.9504 at posting size 1024 and 128 probes but at p99 21458 us, which does not.
+
+### Known gaps
+
+- **Three milestones have their scope done and are held open by exit gates.** M5 wants every larger than memory row at 10x and wants 1.05 cold faults per `ZRANK` against aki's 1.93 and 100k `SADD` a second under the gate against aki's 4200. M6 wants recall at 10 of 0.95 with p99 under 1 ms on MS-MARCO-v2 as well as SIFT1M, and wants 50 thousand vectors a second per core with recall stable over 24 hours, which server3 gives 13671 a second at 128 dimensions and 857 at 768. M7 wants the stream commands at 10x and is socket bound at 1.60x for `XADD` on server3 with `PING` at 1.09x on the same box, so it has to be read in process before it means anything.
+- **There is no whole file RDB reader yet,** only the writer, so `PSYNC` is still ahead and divergence D-48 is still open.
+- **`MEMORY USAGE` is not implemented in this build** even though D-6 describes what it should answer, which is the one thing the sketch families still differ from a real server on.
+- **`XCFGSET` and `XIDMPRECORD` are the two stream commands left in 8.x,** and both need the idempotency tracking D-27 is about.
+- **`RESTORE` still checks `IDLETIME` and `FREQ` and then drops them, which is D-26.**
+- **`GRAPH.QUERY` is not supported and will not be.** No Cypher, no GQL, and the reasoning is in the divergence register so nobody has to relitigate it.
+- **Log page buffers are not counted against `maxmemory`,** about 96 MiB per attached database.
+- **`keyspace_hits` and `keyspace_misses` are missing from `INFO stats`.**
+- **`GETRANGE` on a demoted value reads the whole value back** rather than only the chunks the window covers.
+
 ## 0.3.13 — 2026-09-03
 
 Seventy pull requests, and no milestone has closed, so by the rule in [RELEASING.md](RELEASING.md) this is a patch. It is a great deal bigger than a patch is meant to be, and that is a process failure rather than a plan: the feature work for three milestones landed over two days and nothing was tagged in between. The rule itself stands, because a minor is what says a milestone is done and none of M5, M6 or M7 has met its exit gate yet.
