@@ -37,7 +37,7 @@
 
 use yo_common::num::{parse_f64, parse_i64};
 use yo_common::{Code, Error, Result};
-use yo_kv::{Foreign, Keyspace};
+use yo_kv::{Db, Foreign};
 use yo_sketch::cms::{Cms, dims_from};
 
 use super::args::{self, Args};
@@ -118,7 +118,13 @@ impl Foreign for CmsBody {
     }
 }
 
-pub(super) fn execute(db: &mut Keyspace, spec: &Spec, args: Args<'_>, out: &mut Out) -> Result<()> {
+/// Run one count min sketch command.
+///
+/// Every command here reaches its key through the two helpers at the bottom of
+/// the file, and both of them find the stripe the key they were given is on.
+/// That is what `CMS.MERGE` needs, since it reads a run of sources and writes a
+/// destination and the sources can be anywhere.
+pub(super) fn execute(db: &mut Db, spec: &Spec, args: Args<'_>, out: &mut Out) -> Result<()> {
     match spec.name {
         "cms.initbydim" => initbydim(db, args, out),
         "cms.initbyprob" => initbyprob(db, args, out),
@@ -132,9 +138,9 @@ pub(super) fn execute(db: &mut Keyspace, spec: &Spec, args: Args<'_>, out: &mut 
 
 /// `CMS.INITBYDIM key width depth`, which is the sketch stated rather than
 /// derived.
-fn initbydim(db: &mut Keyspace, args: Args<'_>, out: &mut Out) -> Result<()> {
+fn initbydim(db: &mut Db, args: Args<'_>, out: &mut Out) -> Result<()> {
     let key = args.get(1);
-    if db.kind_of(key).is_some() {
+    if db.at(key).kind_of(key).is_some() {
         out.error(EXISTS);
         return Ok(());
     }
@@ -153,9 +159,9 @@ fn initbydim(db: &mut Keyspace, args: Args<'_>, out: &mut Out) -> Result<()> {
 /// `CMS.INITBYPROB key error probability`, which is the sketch asked for in the
 /// terms the client actually has: how far off the count is allowed to be and how
 /// often it is allowed to be that far off.
-fn initbyprob(db: &mut Keyspace, args: Args<'_>, out: &mut Out) -> Result<()> {
+fn initbyprob(db: &mut Db, args: Args<'_>, out: &mut Out) -> Result<()> {
     let key = args.get(1);
-    if db.kind_of(key).is_some() {
+    if db.at(key).kind_of(key).is_some() {
         out.error(EXISTS);
         return Ok(());
     }
@@ -176,12 +182,12 @@ fn initbyprob(db: &mut Keyspace, args: Args<'_>, out: &mut Out) -> Result<()> {
 }
 
 /// Make the sketch both constructors ended up asking for, or say why not.
-fn build(db: &mut Keyspace, key: &[u8], width: u64, depth: u64, out: &mut Out) {
+fn build(db: &mut Db, key: &[u8], width: u64, depth: u64, out: &mut Out) {
     let Some(c) = Cms::new(width, depth) else {
         out.error(NO_MEMORY);
         return;
     };
-    db.put_foreign(key, Box::new(CmsBody { c }));
+    db.at(key).put_foreign(key, Box::new(CmsBody { c }));
     out.ok();
 }
 
@@ -191,7 +197,7 @@ fn build(db: &mut Keyspace, key: &[u8], width: u64, depth: u64, out: &mut Out) {
 /// number in the middle of it changes nothing at all. Once they are all good the
 /// pairs go in left to right, which means a repeated item sees its own earlier
 /// increment: `a 5 a 5` answers five and then ten.
-fn incrby(db: &mut Keyspace, args: Args<'_>, out: &mut Out) -> Result<()> {
+fn incrby(db: &mut Db, args: Args<'_>, out: &mut Out) -> Result<()> {
     if !args.len().is_multiple_of(2) {
         return Err(args::wrong_arity("cms.incrby"));
     }
@@ -233,7 +239,7 @@ fn incrby(db: &mut Keyspace, args: Args<'_>, out: &mut Out) -> Result<()> {
 
 /// `CMS.QUERY key item [item ...]`, which is a count per item and never an
 /// error inside the array.
-fn query(db: &mut Keyspace, args: Args<'_>, out: &mut Out) -> Result<()> {
+fn query(db: &mut Db, args: Args<'_>, out: &mut Out) -> Result<()> {
     let Some(body) = read(db, args.get(1))? else {
         out.error(MISSING);
         return Ok(());
@@ -252,7 +258,7 @@ fn query(db: &mut Keyspace, args: Args<'_>, out: &mut Out) -> Result<()> {
 /// client that means `d += s` has to send. Every source has to be exactly the
 /// destination's shape, since a merge is counter by counter and two sketches of
 /// different widths do not have the same counters.
-fn merge(db: &mut Keyspace, args: Args<'_>, out: &mut Out) -> Result<()> {
+fn merge(db: &mut Db, args: Args<'_>, out: &mut Out) -> Result<()> {
     let dest = args.get(1);
     let Some(body) = read(db, dest)? else {
         out.error(MISSING);
@@ -344,7 +350,7 @@ fn merge(db: &mut Keyspace, args: Args<'_>, out: &mut Out) -> Result<()> {
 }
 
 /// `CMS.INFO key`, which is the shape and the running total and takes no field.
-fn info(db: &mut Keyspace, args: Args<'_>, out: &mut Out) -> Result<()> {
+fn info(db: &mut Db, args: Args<'_>, out: &mut Out) -> Result<()> {
     let Some(body) = read(db, args.get(1))? else {
         out.error(MISSING);
         return Ok(());
@@ -373,8 +379,8 @@ fn fraction(arg: &[u8]) -> Option<f64> {
 }
 
 /// The sketch under `key` for writing, or `None` if the key is not there.
-fn write<'d>(db: &'d mut Keyspace, key: &[u8]) -> Result<Option<&'d mut CmsBody>> {
-    match db.foreign_mut(key)? {
+fn write<'d>(db: &'d mut Db, key: &[u8]) -> Result<Option<&'d mut CmsBody>> {
+    match db.at(key).foreign_mut(key)? {
         Some(body) => match body.downcast_mut::<CmsBody>() {
             Some(body) => Ok(Some(body)),
             None => Err(Error::new(Code::WrongType, WRONG_KIND)),
@@ -384,8 +390,8 @@ fn write<'d>(db: &'d mut Keyspace, key: &[u8]) -> Result<Option<&'d mut CmsBody>
 }
 
 /// The same, for reading.
-fn read<'d>(db: &'d mut Keyspace, key: &[u8]) -> Result<Option<&'d CmsBody>> {
-    match db.foreign(key)? {
+fn read<'d>(db: &'d mut Db, key: &[u8]) -> Result<Option<&'d CmsBody>> {
+    match db.at(key).foreign(key)? {
         Some(body) => match body.downcast_ref::<CmsBody>() {
             Some(body) => Ok(Some(body)),
             None => Err(Error::new(Code::WrongType, WRONG_KIND)),

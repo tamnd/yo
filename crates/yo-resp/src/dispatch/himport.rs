@@ -29,7 +29,7 @@
 //! [`Session`]: super::Session
 
 use yo_common::{Code, Error, Result};
-use yo_kv::Keyspace;
+use yo_kv::{Db, Keyspace};
 
 use super::args::{self, Args};
 use crate::reply::Out;
@@ -135,7 +135,7 @@ impl Fieldsets {
 /// the command an arity complaint carries is the container and the subcommand
 /// joined by a pipe, the same as `OBJECT` and `CONFIG`.
 pub(super) fn execute(
-    db: &mut Keyspace,
+    db: &mut Db,
     sets: &mut Fieldsets,
     args: Args<'_>,
     out: &mut Out,
@@ -152,7 +152,9 @@ pub(super) fn execute(
         if args.len() < 5 {
             return Err(args::wrong_arity_sub("himport", "set"));
         }
-        set(db, sets, args, out)?;
+        // The only subcommand that touches the keyspace, and it names its key
+        // third, so that key's stripe is what it is given.
+        set(db.at(args.get(2)), sets, args, out)?;
     } else if args::is(sub, b"discard") {
         if args.len() != 3 {
             return Err(args::wrong_arity_sub("himport", "discard"));

@@ -51,7 +51,7 @@ use std::collections::HashMap;
 use yo_common::{Code, Error, Result, parse_i64};
 use yo_doc::{Builder, Doc};
 use yo_graph::{Dir, Graph};
-use yo_kv::{Foreign, Keyspace};
+use yo_kv::{Db, Foreign, Keyspace};
 
 use super::args::{self, Args};
 use super::table::Spec;
@@ -218,7 +218,13 @@ impl GraphBody {
 }
 
 /// Run one graph command.
-pub(super) fn execute(db: &mut Keyspace, spec: &Spec, args: Args<'_>, out: &mut Out) -> Result<()> {
+///
+/// A graph is one value under one key, and every command here names that key
+/// first, so the stripe is found once and everything below goes on taking a
+/// keyspace. The edges inside a graph name nodes and not keys, so nothing here
+/// reaches past the one it was given.
+pub(super) fn execute(db: &mut Db, spec: &Spec, args: Args<'_>, out: &mut Out) -> Result<()> {
+    let db = db.at(args.get(1));
     match spec.name {
         "g.nadd" => nadd(db, args, out),
         "g.nget" => nget(db, args, out),

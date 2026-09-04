@@ -43,7 +43,7 @@
 
 use yo_common::num::{parse_f64, parse_i64};
 use yo_common::{Code, Error, Result};
-use yo_kv::{Foreign, Keyspace};
+use yo_kv::{Db, Foreign, Keyspace};
 use yo_sketch::topk::TopK;
 
 use super::args::{self, Args};
@@ -117,7 +117,10 @@ impl Foreign for TopKBody {
     }
 }
 
-pub(super) fn execute(db: &mut Keyspace, spec: &Spec, args: Args<'_>, out: &mut Out) -> Result<()> {
+pub(super) fn execute(db: &mut Db, spec: &Spec, args: Args<'_>, out: &mut Out) -> Result<()> {
+    // Every command here names one sketch and names it first, so the stripe is
+    // found once and everything below goes on taking a keyspace.
+    let db = db.at(args.get(1));
     match spec.name {
         "topk.reserve" => reserve(db, args, out),
         "topk.add" => add(db, args, out),

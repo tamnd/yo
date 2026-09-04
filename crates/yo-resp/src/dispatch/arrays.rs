@@ -23,14 +23,18 @@
 use yo_common::num::{DOUBLE_MAX, parse_i64, write_g17};
 use yo_common::{Code, Error, Result};
 use yo_kv::arrays::{Aggregate, Grep, Op, Test, parse_grep_bound, parse_index, parse_seek_index};
-use yo_kv::{ArrayElement, Keyspace};
+use yo_kv::{ArrayElement, Db, Keyspace};
 
 use super::args::{self, Args};
 use super::table::Spec;
 use crate::reply::Out;
 
 /// Run one array command.
-pub(super) fn execute(db: &mut Keyspace, spec: &Spec, args: Args<'_>, out: &mut Out) -> Result<()> {
+///
+/// Every command in the group names one key and names it first, so the stripe
+/// is found once here and everything below goes on taking a keyspace.
+pub(super) fn execute(db: &mut Db, spec: &Spec, args: Args<'_>, out: &mut Out) -> Result<()> {
+    let db = db.at(args.get(1));
     match spec.name {
         "arset" => {
             let index = parse_index(args.get(2))?;
