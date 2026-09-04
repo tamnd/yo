@@ -18016,4 +18016,254 @@ mod tests {
             many.run(&[b"MGET", b"str", b"list", b"gone"])
         );
     }
+
+    /// The same claim for the keyspace group, and the same way of checking it.
+    ///
+    /// `SORT` is not in the script because it is the one command in that file
+    /// that has not been taught about stripes, and `SCAN`, `KEYS` and
+    /// `RANDOMKEY` are not in it either, because those three do not promise an
+    /// order and comparing two replies byte for byte would be asserting one.
+    /// They get tests of their own below.
+    #[test]
+    fn the_keyspace_group_answers_the_same_however_many_stripes_there_are() {
+        let script: &[&[&[u8]]] = &[
+            &[b"SET", b"k1", b"v1"],
+            &[b"SET", b"k2", b"v2"],
+            &[b"EXISTS", b"k1", b"k2", b"k1", b"gone"],
+            &[b"TYPE", b"k1"],
+            &[b"TYPE", b"gone"],
+            &[b"TOUCH", b"k1", b"k2", b"k1", b"gone"],
+            &[b"EXPIRE", b"k1", b"100"],
+            &[b"TTL", b"k1"],
+            &[b"EXPIRE", b"k1", b"200", b"NX"],
+            &[b"PERSIST", b"k1"],
+            &[b"TTL", b"k1"],
+            &[b"PEXPIREAT", b"k2", b"1900000000000"],
+            &[b"EXPIRETIME", b"k2"],
+            &[b"PEXPIRETIME", b"k2"],
+            &[b"PERSIST", b"k2"],
+            &[b"OBJECT", b"ENCODING", b"k1"],
+            &[b"OBJECT", b"REFCOUNT", b"k1"],
+            &[b"OBJECT", b"IDLETIME", b"k1"],
+            &[b"OBJECT", b"FREQ", b"k1"],
+            &[b"OBJECT", b"ENCODING", b"gone"],
+            &[b"OBJECT", b"HELP"],
+            &[b"RENAME", b"k1", b"k9"],
+            &[b"GET", b"k9"],
+            &[b"RENAME", b"gone", b"x"],
+            &[b"RENAMENX", b"k9", b"k2"],
+            &[b"RENAMENX", b"k9", b"k8"],
+            &[b"GET", b"k8"],
+            &[b"COPY", b"k8", b"c1"],
+            &[b"COPY", b"k8", b"c1"],
+            &[b"COPY", b"k8", b"c1", b"REPLACE"],
+            &[b"COPY", b"k8", b"k8"],
+            &[b"COPY", b"gone", b"c2"],
+            &[b"COPY", b"k8", b"k8", b"DB", b"1"],
+            &[b"COPY", b"k8", b"c9", b"DB", b"9"],
+            &[b"MOVE", b"c1", b"1"],
+            &[b"MOVE", b"c1", b"1"],
+            &[b"MOVE", b"k8", b"0"],
+            &[b"DEL", b"k2", b"gone"],
+            &[b"UNLINK", b"k8", b"k8"],
+            &[b"DBSIZE"],
+        ];
+
+        let mut one = Fixture::new();
+        let mut many = Fixture::striped(8);
+        for parts in script {
+            let a = one.run(parts);
+            let b = many.run(parts);
+            assert_eq!(a, b, "{}", String::from_utf8_lossy(parts[0]));
+        }
+
+        // `RESTORE` needs bytes a client would have got from a `DUMP`, so the
+        // payload is taken from the store rather than parsed back out of a
+        // reply that is not text. Both servers dump the same key and the bytes
+        // are the same bytes, which is the first half of what is being checked
+        // here.
+        for f in [&mut one, &mut many] {
+            f.run(&[b"SET", b"d1", b"payload"]);
+            let payload = f
+                .server
+                .striped(0)
+                .at(b"d1")
+                .dump(b"d1")
+                .expect("a key that is there");
+            assert!(
+                f.run(&[b"DUMP", b"d1"])
+                    .starts_with(&format!("${}", payload.len())),
+                "a payload of the length the store gave"
+            );
+            assert_eq!(f.run(&[b"DUMP", b"gone"]), "$-1\r\n");
+            assert_eq!(f.run(&[b"RESTORE", b"d2", b"0", &payload]), "+OK\r\n");
+            assert_eq!(f.run(&[b"GET", b"d2"]), "$7\r\npayload\r\n");
+            assert_eq!(
+                f.run(&[b"RESTORE", b"d2", b"0", &payload]),
+                "-BUSYKEY Target key name already exists.\r\n"
+            );
+            assert_eq!(
+                f.run(&[b"RESTORE", b"d3", b"0", b"rubbish"]),
+                "-ERR DUMP payload version or checksum are wrong\r\n"
+            );
+        }
+    }
+
+    /// A `SCAN` of a database of eight stripes comes back with all of it.
+    ///
+    /// The cursor is the thing under test. It has to carry the stripe as well
+    /// as the place in it, so a client that stops at one stripe and comes back
+    /// carries on in that stripe and not at the top of the database, and the
+    /// walk has to end once rather than eight times.
+    #[test]
+    fn a_scan_of_a_striped_database_walks_all_of_it() {
+        let mut f = Fixture::striped(8);
+        for i in 0..500 {
+            let key = format!("key:{i}");
+            f.run(&[b"SET", key.as_bytes(), b"v"]);
+        }
+
+        let mut seen = Vec::new();
+        let mut cursor = "0".to_owned();
+        let mut calls = 0;
+        loop {
+            let reply = f.run(&[b"SCAN", cursor.as_bytes(), b"COUNT", b"10"]);
+            let (next, keys) = scan_reply(&reply);
+            seen.extend(keys);
+            cursor = next;
+            calls += 1;
+            assert!(calls < 5_000, "a scan that will not finish");
+            if cursor == "0" {
+                break;
+            }
+        }
+        seen.sort();
+        assert_eq!(seen.len(), 500, "a quiet scan answered a key twice");
+        assert_eq!(seen, sorted(&f.run(&[b"KEYS", b"*"])));
+
+        // And the options still work when the walk is over several stripes,
+        // since a `MATCH` is applied to keys a stripe handed up and a `TYPE` is
+        // applied by each stripe on the way.
+        let reply = f.run(&[b"SCAN", b"0", b"COUNT", b"1000", b"MATCH", b"key:4?"]);
+        let (_, keys) = scan_reply(&reply);
+        assert_eq!(keys.len(), 10, "key:40 through key:49");
+        let reply = f.run(&[b"SCAN", b"0", b"COUNT", b"1000", b"TYPE", b"list"]);
+        let (_, keys) = scan_reply(&reply);
+        assert!(keys.is_empty(), "nothing here is a list");
+    }
+
+    /// `RANDOMKEY` on a striped database answers a key from any of the stripes.
+    ///
+    /// The draw picks the stripe first, so the thing that can go wrong is that
+    /// it always picks the same one, and two hundred draws over eight stripes
+    /// would make that obvious.
+    #[test]
+    fn a_random_key_can_come_from_any_stripe() {
+        let mut f = Fixture::striped(8);
+        assert_eq!(f.run(&[b"RANDOMKEY"]), "$-1\r\n");
+        for i in 0..200 {
+            let key = format!("key:{i}");
+            f.run(&[b"SET", key.as_bytes(), b"v"]);
+        }
+        let mut homes = std::collections::HashSet::new();
+        for _ in 0..200 {
+            let got = f.run(&[b"RANDOMKEY"]);
+            let key = got.split("\r\n").nth(1).expect("a key").to_owned();
+            assert_eq!(f.run(&[b"EXISTS", key.as_bytes()]), ":1\r\n");
+            homes.insert(f.server.striped(0).stripe_of(key.as_bytes()));
+        }
+        assert_eq!(homes.len(), 8, "some stripe was never drawn from");
+    }
+
+    /// Two keys that are not on the same stripe, which is what `RENAME` and
+    /// `COPY` have to cope with and what a test has to arrange rather than
+    /// hope for.
+    fn apart(f: &mut Fixture, src: &str) -> String {
+        let home = f.server.striped(0).stripe_of(src.as_bytes());
+        for i in 0..1_000 {
+            let dst = format!("dst:{i}");
+            if f.server.striped(0).stripe_of(dst.as_bytes()) != home {
+                return dst;
+            }
+        }
+        panic!("eight stripes and a thousand keys all landed in one place");
+    }
+
+    /// A rename whose two keys are on two stripes moves the value, the deadline
+    /// and, for a collection, the body itself.
+    #[test]
+    fn a_rename_across_stripes_takes_everything_with_it() {
+        let mut f = Fixture::striped(8);
+        let dst = apart(&mut f, "src");
+        let (src, dst) = (b"src".as_slice(), dst.as_bytes());
+
+        f.run(&[b"SET", src, b"v"]);
+        f.run(&[b"EXPIRE", src, b"100"]);
+        assert_eq!(f.run(&[b"RENAME", src, dst]), "+OK\r\n");
+        assert_eq!(f.run(&[b"EXISTS", src, dst]), ":1\r\n");
+        assert_eq!(f.run(&[b"GET", dst]), "$1\r\nv\r\n");
+        assert_eq!(f.run(&[b"TTL", dst]), ":100\r\n", "the deadline came too");
+
+        // A list, because a string lives in its record and a collection lives
+        // in a slab, and the second of those is the one that can be left
+        // behind. Planted through the store, since the list group has not been
+        // taught about stripes yet.
+        f.server
+            .striped(0)
+            .at(src)
+            .push(src, yo_kv::End::Right, [&b"a"[..], &b"b"[..]].into_iter())
+            .expect("a new list");
+        assert_eq!(f.run(&[b"RENAME", src, dst]), "+OK\r\n");
+        assert_eq!(f.run(&[b"TYPE", dst]), "+list\r\n");
+        assert_eq!(
+            f.server.striped(0).at(dst).llen(dst).expect("a list"),
+            2,
+            "the members are on the stripe the key moved to"
+        );
+
+        // And `RENAMENX` still refuses a destination that is taken, which is
+        // the one answer the cross stripe path has to work out for itself.
+        f.run(&[b"SET", src, b"v"]);
+        assert_eq!(f.run(&[b"RENAMENX", src, dst]), ":0\r\n");
+        assert_eq!(f.run(&[b"TYPE", dst]), "+list\r\n", "and left it alone");
+        assert_eq!(f.run(&[b"GET", src]), "$1\r\nv\r\n", "and left the source");
+    }
+
+    /// And a copy across two stripes leaves both keys behind it.
+    #[test]
+    fn a_copy_across_stripes_leaves_the_source_where_it_was() {
+        let mut f = Fixture::striped(8);
+        let dst = apart(&mut f, "src");
+        let (src, dst) = (b"src".as_slice(), dst.as_bytes());
+
+        f.run(&[b"SET", src, b"v"]);
+        assert_eq!(f.run(&[b"COPY", src, dst]), ":1\r\n");
+        assert_eq!(f.run(&[b"EXISTS", src, dst]), ":2\r\n");
+        assert_eq!(
+            f.run(&[b"COPY", src, dst]),
+            ":0\r\n",
+            "the destination is taken"
+        );
+        f.run(&[b"SET", src, b"w"]);
+        assert_eq!(f.run(&[b"COPY", src, dst, b"REPLACE"]), ":1\r\n");
+        assert_eq!(f.run(&[b"GET", dst]), "$1\r\nw\r\n");
+
+        // A collection is cloned rather than moved, so both keys have a body of
+        // their own afterwards and writing to one does not show up in the
+        // other.
+        f.run(&[b"DEL", src, dst]);
+        f.server
+            .striped(0)
+            .at(src)
+            .push(src, yo_kv::End::Right, [&b"a"[..], &b"b"[..]].into_iter())
+            .expect("a new list");
+        assert_eq!(f.run(&[b"COPY", src, dst]), ":1\r\n");
+        f.server
+            .striped(0)
+            .at(src)
+            .push(src, yo_kv::End::Right, core::iter::once(&b"c"[..]))
+            .expect("a list that is there");
+        assert_eq!(f.server.striped(0).at(src).llen(src).expect("a list"), 3);
+        assert_eq!(f.server.striped(0).at(dst).llen(dst).expect("a list"), 2);
+    }
 }
