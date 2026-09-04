@@ -213,7 +213,7 @@ fn check_divergences(tables: &[Table], bad: &mut Vec<String>) -> BTreeSet<String
 fn check_commands(tables: &[Table], ids: &BTreeSet<String>, bad: &mut Vec<String>) {
     let mut names = BTreeSet::new();
     let mut groups = Vec::new();
-    let mut counted: Vec<(String, String)> = Vec::new();
+    let mut counted: Vec<(String, String, bool)> = Vec::new();
 
     for t in tables {
         match t.name.as_str() {
@@ -258,12 +258,15 @@ fn check_commands(tables: &[Table], ids: &BTreeSet<String>, bad: &mut Vec<String
                 t.line
             ));
         }
-        counted.push((group.clone(), name.clone()));
-
         let plan = one_of(t, "plan", PLANS, &name, bad);
         one_of(t, "bounded", BOUNDED, &name, bad);
         one_of(t, "wire", WIRE, &name, bad);
         let status = one_of(t, "status", STATUSES, &name, bad);
+        counted.push((
+            group.clone(),
+            name.clone(),
+            status.as_deref() == Some("shipped"),
+        ));
 
         if plan.as_deref() == Some("none")
             && !PLANLESS_GROUPS.contains(&group.as_str())
@@ -328,7 +331,18 @@ fn check_commands(tables: &[Table], ids: &BTreeSet<String>, bad: &mut Vec<String
 /// This is what stops the count in `12` section 3 and the file drifting apart
 /// silently. When they disagree, one of the two is wrong and somebody has to
 /// say which, which is exactly what happened to the string group's 28.
-fn check_group_budgets(groups: &[&Table], counted: &[(String, String)], bad: &mut Vec<String>) {
+///
+/// What is counted is the commands that say they are shipped, not the rows in
+/// the file. Those were the same thing until Redis 8.10 added commands nobody
+/// has written yet, and a row for one of those is the file being honest about
+/// what the group owes rather than the group having grown. Counting rows would
+/// have meant either leaving the new commands out of the file or claiming them
+/// as done, and both of those are the drift this check exists to catch.
+fn check_group_budgets(
+    groups: &[&Table],
+    counted: &[(String, String, bool)],
+    bad: &mut Vec<String>,
+) {
     let mut seen = BTreeSet::new();
     for g in groups {
         let name = match g.str("name") {
@@ -358,7 +372,10 @@ fn check_group_budgets(groups: &[&Table], counted: &[(String, String)], bad: &mu
                 g.line
             ));
         }
-        let have = counted.iter().filter(|(gr, _)| *gr == name).count() as i64;
+        let have = counted
+            .iter()
+            .filter(|(gr, _, shipped)| *gr == name && *shipped)
+            .count() as i64;
         if status == "shipped" && have != expected {
             bad.push(format!(
                 "commands.toml line {}: group {name} says {expected} commands and lists {have}",
@@ -380,7 +397,7 @@ fn check_group_budgets(groups: &[&Table], counted: &[(String, String)], bad: &mu
             ));
         }
     }
-    for (group, name) in counted {
+    for (group, name, _) in counted {
         if !group.is_empty() && !seen.contains(group) {
             bad.push(format!(
                 "commands.toml: {name} is in group {group}, which is not declared"
@@ -521,6 +538,30 @@ mod tests {
         check_commands(&tables, &BTreeSet::new(), &mut bad);
         assert!(
             bad.iter().any(|b| b.contains("28 commands and lists 1")),
+            "{bad:?}"
+        );
+    }
+
+    /// A row for a command nobody has written does not count towards the group,
+    /// which is what lets a command Redis added sit in the file honestly.
+    #[test]
+    fn a_planned_command_does_not_fill_a_groups_budget() {
+        let head = "[[group]]\nname = \"set\"\nexpected = 2\nstatus = \"partial\"\n\n\
+             [[command]]\nname = \"SUNION\"\ngroup = \"set\"\nsince = \"1.0.0\"\narity = -2\n\
+             plan = \"whole-value\"\nbounded = \"risk\"\nstatus = \"shipped\"\nwire = \"none\"\n\n\
+             [[command]]\nname = \"SUNIONCARD\"\ngroup = \"set\"\nsince = \"8.10.0\"\narity = -3\n\
+             plan = \"whole-value\"\nbounded = \"inherent\"\nstatus = \"planned\"\nwire = \"none\"\n";
+        let tables = toml::parse(head).unwrap();
+        let mut bad = Vec::new();
+        check_commands(&tables, &BTreeSet::new(), &mut bad);
+        assert!(bad.is_empty(), "{bad:?}");
+        // And the same two rows under a group claiming to be done are caught,
+        // because one of the two is not.
+        let tables = toml::parse(&head.replace("\"partial\"", "\"shipped\"")).unwrap();
+        let mut bad = Vec::new();
+        check_commands(&tables, &BTreeSet::new(), &mut bad);
+        assert!(
+            bad.iter().any(|b| b.contains("2 commands and lists 1")),
             "{bad:?}"
         );
     }
