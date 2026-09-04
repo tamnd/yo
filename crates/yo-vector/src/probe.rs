@@ -58,14 +58,53 @@
 //! `level_code` on the encode path had always done it that way and the query
 //! path had not.
 //!
+//! # At a million
+//!
+//! Those are 60k and 200k vectors and everything in them is resident. On
+//! gamingpc against a real million at 1024 dimensions, at a probe of 128, with
+//! the posting target the only thing that changes between the two columns:
+//!
+//! ```text
+//!                        posting 1024      posting 256
+//!  partitions                    1715             7249
+//!  ranking centroids          304.8 us        4257.4 us
+//!  preparing the query       1534.3 us         730.8 us
+//!  scanning the postings    32635.3 us        8124.7 us
+//!  the whole search          2703.6 us        4928.6 us
+//! ```
+//!
+//! Three things in there are worth more than the numbers.
+//!
+//! The scan is 182 nanoseconds a member at posting 1024 and 189 at posting 256,
+//! against the 18 the 200k run measured at the same dimension. Ten times, for
+//! the same code doing the same arithmetic on the same estimator. Two and a half
+//! million codes at 1024 dimensions is upwards of 300 megabytes and the scan is
+//! reading it out of DRAM in scattered runs, so what the 200k number was really
+//! measuring was a collection that fitted in cache. `benches/rabitq.rs` agreeing
+//! with it did not check that, because a bench that scans one buffer over and
+//! over never leaves cache either. The estimator is not the cost at this size.
+//! Getting the bytes to it is.
+//!
+//! Ranking goes up 14 times for 4.2 times the centroids, which is the same story
+//! one table earlier: 4 kilobytes a centroid, so 1715 of them fit in a last level
+//! cache and 7249 do not. `src/narrow.rs` is what that opens up and says when it
+//! would be worth wiring in.
+//!
+//! And the whole search is smaller than the scan row above it, by twelve times in
+//! the left column, which looks impossible and is not. Every row here probes 128
+//! partitions to the end because that is the worst case worth knowing. A real
+//! search stops when further partitions have gone a while without improving
+//! anything, so it reads a fraction of the 128 unless it is told not to. The
+//! bottom row is what a query costs and the three above it are what the parts of
+//! one cost, and the gap between them is the early stop earning its keep.
+//!
 //! # What is left
 //!
-//! The scan is two thirds of a query and it measures out at 12 nanoseconds a
-//! member at 768 dimensions and 18 at 1024, which is what `benches/rabitq.rs`
-//! says one code costs, so there is no overhead hiding in the loop around it.
 //! Making a query faster from here is a question of scanning fewer members
 //! rather than of scanning them faster, which is what the probe count and the
-//! posting size are, and what boundary replication is trying to buy.
+//! posting size are, and what boundary replication is trying to buy. That was
+//! true when the scan ran at the estimator's speed and it is more true now that
+//! it runs at DRAM's.
 //!
 //! # Running it
 //!

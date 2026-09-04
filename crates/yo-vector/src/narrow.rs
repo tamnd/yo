@@ -45,12 +45,23 @@
 //! as fifty gigabytes a second, which is not a number a single core gets out of
 //! DRAM, and that is the tell.
 //!
-//! So making a centroid smaller does nothing. bfloat16 halves the bytes and is
-//! not faster. An i8 quarters them and is slower, because unpacking a byte into
-//! a float is work and work is the thing there is too much of. Both are kept
-//! below as the record of it.
+//! So on this machine making a centroid smaller does nothing. bfloat16 halves
+//! the bytes and is not faster. An i8 quarters them and is slower, because
+//! unpacking a byte into a float is work and work is the thing there is too much
+//! of. Both are kept below as the record of it.
 //!
-//! # What does work, and why it is still not worth doing
+//! That is a fact about a table small enough to stay resident, and it stops
+//! being true when the table is not. `probe.rs` on gamingpc, on a million real
+//! vectors at 1024 dimensions, ranks 1715 centroids in 305 microseconds and 7249
+//! of them in 4257. That is 4.2 times the centroids for 14 times the cost, where
+//! this laptop's own table above is 4.0 times the centroids for 4.1 times the
+//! cost, dead linear. The number that explains it is 4 kilobytes a centroid:
+//! 1715 of them is 7 megabytes and sits in a 13900K's last level, 7249 is 30
+//! megabytes and does not. So the pass is arithmetic bound while the table fits
+//! and memory bound once it does not, and which one it is depends on the
+//! partition count, which is to say on the posting target.
+//!
+//! # What does work
 //!
 //! If the pass is a multiply and an add a coordinate, the only way to cut it is
 //! fewer coordinates rather than fewer bytes each. The centroids are already
@@ -69,16 +80,30 @@
 //! scattered rows, and that was the bandwidth argument again, so it was turned
 //! down for a reason that does not hold.
 //!
-//! It is still not worth doing, and this is the useful part. The fixed cost
-//! only looks large next to a small posting scan, and a small posting scan is
-//! the configuration that does not reach the recall the gate wants. On
-//! MS-MARCO at 7719 partitions the ranking is about half a millisecond of a
-//! query that tops out at 0.905 recall however long it is given. The
-//! configuration that does reach the gate, 1809 partitions with a posting
-//! target of 1024, hits 0.9504 at probe 128, and there the whole ranking pass is
-//! about a tenth of a millisecond out of sixteen. Three times cheaper on a
+//! # Whether it is worth doing
+//!
+//! It depends entirely on the partition count, and that took two machines to
+//! see. Measured on this laptop at the configuration that meets the recall gate,
+//! 1809 partitions with a posting target of 1024, the whole ranking pass is
+//! about a tenth of a millisecond out of sixteen, and three times cheaper on a
 //! tenth of a millisecond is not what stands between here and a p99 of one
-//! millisecond. The posting scan is.
+//! millisecond. That was the whole of the argument for leaving it alone and it
+//! was drawn from one point.
+//!
+//! The other point says the opposite. gamingpc at a posting target of 256 ranks
+//! 7249 centroids in 4.3 milliseconds of a query that is 12.4 in total, so a
+//! third of the query is the pass, and the reason it is a third is that 30
+//! megabytes of centroids do not fit where 7 megabytes did. A prefix of a sixth
+//! of the coordinates makes that table 5 megabytes, which does fit, so the three
+//! times measured on a resident table is the floor of what it would give there
+//! rather than the ceiling.
+//!
+//! Which leaves it turning on a decision that has not been made. Small postings
+//! rank a lot of centroids and scan few members, large postings do the reverse,
+//! and on MS-MARCO only the large ones have reached 0.95 recall so far, at 1809
+//! partitions where the pass is a tenth of a millisecond and none of this
+//! matters. If a small posting configuration ever gets its recall up, the first
+//! thing it will want is this. Until then it stays here unwired.
 //!
 //! # What it costs to be wrong
 //!
