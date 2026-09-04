@@ -230,10 +230,10 @@ name = "ts"
 expected = 21
 status = "partial"
 doc = "11 section 9"
-# Twenty one commands, and the eleven here are the key type, everything that
-# writes a sample into one or reports on it, and the two that read a span back
-# with the aggregation grammar. The label index the five multi key commands
-# search, compaction rules and the three commands 8.10 added all come next.
+# Twenty one commands, and the fourteen here are the key type, everything that
+# writes a sample into one or reports on it, the two that read a span back with
+# the aggregation grammar and the three that search on labels. The two multi key
+# reads, compaction rules and the three commands 8.10 added all come next.
 # Samples are squeezed with
 # Gorilla, which is what the module does too, so a series read at a steady rate
 # costs a couple of bits a sample rather than sixteen bytes. Every error sentence
@@ -3663,6 +3663,39 @@ status = "shipped"
 wire = "verified"
 divergent = "D-54"
 notes = "The same read with the rows turned around. Every reduction is order independent, first and last included, so the buckets are worked out oldest first and reversed afterwards, and COUNT then takes from the newest end. The one thing that is not a mirror is which rows survive a COUNT, and that falls out of doing the reversal before the limit rather than after it."
+
+[[command]]
+name = "TS.QUERYINDEX"
+group = "ts"
+since = "1.0.0"
+arity = -2
+plan = "metadata"
+bounded = "risk"
+status = "shipped"
+wire = "verified"
+notes = "The key names a filter list takes, sorted. Six predicate forms, and a list made only of the ones that say which series to leave out is refused because it would otherwise mean the whole keyspace. This walks the keys holding a foreign body rather than reading an index beside the keyspace, which is why it is bounded by risk: an index is a second table that DEL, EXPIRE, RENAME, COPY, RESTORE, FLUSHDB and eviction would all have to keep in step, and the walk cannot drift because there is nothing to drift from."
+
+[[command]]
+name = "TS.QUERYLABELS"
+group = "ts"
+since = "8.10.0"
+arity = -2
+plan = "metadata"
+bounded = "risk"
+status = "shipped"
+wire = "verified"
+notes = "The label names in use across the series a filter takes, or the values one named label takes across them. The only command in the family where a filter is optional, and leaving it out means every series rather than none, so the rule about naming at least one thing to take does not apply until a FILTER is written down."
+
+[[command]]
+name = "TS.MGET"
+group = "ts"
+since = "1.0.0"
+arity = -3
+plan = "metadata"
+bounded = "risk"
+status = "shipped"
+wire = "verified"
+notes = "The newest sample of every series a filter list takes, with the labels beside it if the read asked for them. FILTER is not optional and its absence is an arity error rather than a syntax one however many words the command has, because the module counts what it needed after finding the keyword rather than before. WITHLABELS and SELECTED_LABELS together is an error, and the module drops the ED from the second keyword in the sentence it writes about it."
 
 
 # ---------------------------------------------------------------------- array

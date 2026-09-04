@@ -3861,6 +3861,45 @@ pub static COMMANDS: &[Spec] = &[
         summary: "The same span, newest first.",
         group: "ts",
     },
+    Spec {
+        name: "ts.queryindex",
+        arity: -2,
+        flags: TS_READ,
+        first_key: 0,
+        last_key: 0,
+        step: 0,
+        acl: AC_TS_READ,
+        since: "1.0.0",
+        complexity: "O(n) with n the series in the keyspace",
+        summary: "The series a filter list takes, by key name.",
+        group: "ts",
+    },
+    Spec {
+        name: "ts.querylabels",
+        arity: -2,
+        flags: TS_READ,
+        first_key: 0,
+        last_key: 0,
+        step: 0,
+        acl: AC_TS_READ,
+        since: "8.10.0",
+        complexity: "O(n) with n the series in the keyspace",
+        summary: "The label names in use, or the values one of them takes.",
+        group: "ts",
+    },
+    Spec {
+        name: "ts.mget",
+        arity: -3,
+        flags: TS_READ,
+        first_key: 0,
+        last_key: 0,
+        step: 0,
+        acl: AC_TS_READ,
+        since: "1.0.0",
+        complexity: "O(n) with n the series in the keyspace",
+        summary: "The newest sample of every series a filter list takes.",
+        group: "ts",
+    },
     // --------------------------------------------------------------- array
     Spec {
         name: "arset",
@@ -5551,7 +5590,7 @@ mod tests {
         }
         assert!(worst <= 2, "worst probe is {worst} slots");
         assert!(
-            total <= 24,
+            total <= 25,
             "{total} extra slots walked over the whole table"
         );
     }
