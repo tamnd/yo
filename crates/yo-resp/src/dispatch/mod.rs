@@ -1329,7 +1329,7 @@ pub fn resolved(
             // a place out of one and ZCARD it to count them.
             "geo" => {
                 let db = session.db;
-                geo::execute(server.dbs[db].only_mut(), spec, args, out).map(|()| Flow::Continue)
+                geo::execute(&mut server.dbs[db], spec, args, out).map(|()| Flow::Continue)
             }
             "array" => {
                 let db = session.db;
@@ -1344,7 +1344,7 @@ pub fn resolved(
             // set group makes.
             "json" => {
                 let db = session.db;
-                json::execute(server.dbs[db].only_mut(), spec, args, out).map(|()| Flow::Continue)
+                json::execute(&mut server.dbs[db], spec, args, out).map(|()| Flow::Continue)
             }
             "vector" => {
                 let db = session.db;
@@ -19329,5 +19329,375 @@ mod tests {
             other.len()
         );
         assert_eq!(core::str::from_utf8(out.as_slice()).expect("ascii"), want);
+    }
+
+    /// Every JSON command, on one stripe and on eight.
+    #[test]
+    fn the_json_group_answers_the_same_however_many_stripes_there_are() {
+        let script: &[&[&[u8]]] = &[
+            &[
+                b"JSON.SET",
+                b"d",
+                b"$",
+                br#"{"a":1,"b":[1,2,3],"s":"hi","t":true}"#,
+            ],
+            &[b"JSON.SET", b"d", b"$.a", b"2"],
+            &[b"JSON.SET", b"d", b"$.new", b"9", b"NX"],
+            &[b"JSON.SET", b"d", b"$.new", b"8", b"NX"],
+            &[b"JSON.SET", b"d", b"$.nope", b"7", b"XX"],
+            &[b"JSON.GET", b"d"],
+            &[b"JSON.GET", b"d", b"$.b"],
+            &[b"JSON.GET", b"gone", b"$"],
+            &[b"JSON.TYPE", b"d", b"$.b"],
+            &[b"JSON.TYPE", b"d", b"$.s"],
+            &[b"JSON.TOGGLE", b"d", b"$.t"],
+            &[b"JSON.ARRLEN", b"d", b"$.b"],
+            &[b"JSON.OBJLEN", b"d", b"$"],
+            &[b"JSON.OBJKEYS", b"d", b"$"],
+            &[b"JSON.STRLEN", b"d", b"$.s"],
+            &[b"JSON.STRAPPEND", b"d", b"$.s", br#""there""#],
+            &[b"JSON.ARRAPPEND", b"d", b"$.b", b"4"],
+            &[b"JSON.ARRINSERT", b"d", b"$.b", b"0", b"0"],
+            &[b"JSON.ARRINDEX", b"d", b"$.b", b"3"],
+            &[b"JSON.ARRTRIM", b"d", b"$.b", b"1", b"3"],
+            &[b"JSON.ARRPOP", b"d", b"$.b"],
+            &[b"JSON.NUMINCRBY", b"d", b"$.a", b"5"],
+            &[b"JSON.NUMMULTBY", b"d", b"$.a", b"2"],
+            &[b"JSON.NUMPOWBY", b"d", b"$.a", b"2"],
+            &[b"JSON.MERGE", b"d", b"$", br#"{"a":null,"m":1}"#],
+            &[b"JSON.RESP", b"d", b"$.b"],
+            &[b"JSON.DEBUG", b"MEMORY", b"d"],
+            &[b"JSON.CLEAR", b"d", b"$.b"],
+            &[b"JSON.DEL", b"d", b"$.m"],
+            &[b"JSON.FORGET", b"d", b"$.nothere"],
+            // The two that name more than one key.
+            &[
+                b"JSON.MSET",
+                b"m1",
+                b"$",
+                b"1",
+                b"m2",
+                b"$",
+                b"2",
+                b"m3",
+                b"$",
+                b"3",
+            ],
+            &[b"JSON.MGET", b"m1", b"m2", b"m3", b"gone", b"$"],
+            &[b"JSON.MSET", b"m1", b"$", b"9", b"m2", b"$.deep", b"9"],
+            &[b"JSON.GET", b"m1", b"$"],
+            &[b"JSON.MSET", b"m1", b"$", b"nonsense", b"m2", b"$", b"5"],
+            &[b"JSON.GET", b"m2", b"$"],
+            // And the errors.
+            &[b"SET", b"plain", b"v"],
+            &[b"JSON.GET", b"plain", b"$"],
+            &[b"JSON.SET", b"plain", b"$", b"1"],
+            &[b"JSON.MGET", b"m1", b"plain", b"$"],
+            &[b"JSON.SET", b"d", b"$.b", b"["],
+            &[b"JSON.DEL", b"plain"],
+        ];
+
+        let mut one = Fixture::new();
+        let mut many = Fixture::striped(8);
+        for parts in script {
+            let a = one.run(parts);
+            let b = many.run(parts);
+            assert_eq!(a, b, "{}", String::from_utf8_lossy(parts[0]));
+        }
+    }
+
+    /// A `JSON.MSET` and a `JSON.MGET` whose keys are on several stripes.
+    ///
+    /// `JSON.MSET` works every triple out against the keyspace as it was before
+    /// the command and writes nothing until all of them are known to work, so
+    /// the thing to check is that a triple that cannot be written stops the
+    /// ones on other stripes as well as the ones on its own.
+    #[test]
+    fn a_json_multi_write_across_stripes_reaches_every_key() {
+        let mut f = Fixture::striped(8);
+        let second = apart(&mut f, "m1");
+        let third = apart(&mut f, &second);
+        let (m1, m2, m3) = (b"m1".as_slice(), second.as_bytes(), third.as_bytes());
+
+        assert_eq!(
+            f.run(&[b"JSON.MSET", m1, b"$", b"1", m2, b"$", b"2", m3, b"$", b"3"]),
+            "+OK\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"JSON.MGET", m1, m2, m3, b"gone", b"$"]),
+            "*4\r\n$3\r\n[1]\r\n$3\r\n[2]\r\n$3\r\n[3]\r\n$-1\r\n"
+        );
+
+        // A value that is not JSON is refused before anything is written, and
+        // the key on the far stripe keeps what it had.
+        assert_eq!(
+            f.run(&[b"JSON.MSET", m1, b"$", b"9", m2, b"$", b"nonsense"]),
+            "-this is not the start of a value, at byte 0 of the JSON text\r\n"
+        );
+        assert_eq!(f.run(&[b"JSON.GET", m1, b"$"]), "$3\r\n[1]\r\n");
+
+        // A path that names nowhere is not an error. That triple is skipped,
+        // the ones on the other stripes are still written, and the reply is a
+        // nil rather than OK.
+        assert_eq!(
+            f.run(&[
+                b"JSON.MSET",
+                m1,
+                b"$",
+                b"9",
+                m2,
+                b"$.deep",
+                b"9",
+                m3,
+                b"$",
+                b"7"
+            ]),
+            "$-1\r\n"
+        );
+        assert_eq!(f.run(&[b"JSON.GET", m1, b"$"]), "$3\r\n[9]\r\n");
+        assert_eq!(f.run(&[b"JSON.GET", m2, b"$"]), "$3\r\n[2]\r\n");
+        assert_eq!(f.run(&[b"JSON.GET", m3, b"$"]), "$3\r\n[7]\r\n");
+    }
+
+    /// Every geospatial command, on one stripe and on eight.
+    #[test]
+    fn the_geo_group_answers_the_same_however_many_stripes_there_are() {
+        let script: &[&[&[u8]]] = &[
+            &[
+                b"GEOADD",
+                b"g",
+                b"13.361389",
+                b"38.115556",
+                b"palermo",
+                b"15.087269",
+                b"37.502669",
+                b"catania",
+            ],
+            &[
+                b"GEOADD",
+                b"g",
+                b"NX",
+                b"13.361389",
+                b"38.115556",
+                b"palermo",
+            ],
+            &[b"GEOADD", b"g", b"XX", b"CH", b"13.4", b"38.1", b"palermo"],
+            &[b"GEOPOS", b"g", b"palermo", b"nothere"],
+            &[b"GEOHASH", b"g", b"palermo", b"catania"],
+            &[b"GEODIST", b"g", b"palermo", b"catania"],
+            &[b"GEODIST", b"g", b"palermo", b"catania", b"KM"],
+            &[b"GEODIST", b"g", b"palermo", b"nothere"],
+            &[
+                b"GEOSEARCH",
+                b"g",
+                b"FROMLONLAT",
+                b"15",
+                b"37",
+                b"BYRADIUS",
+                b"200",
+                b"KM",
+                b"ASC",
+                b"WITHCOORD",
+                b"WITHDIST",
+                b"WITHHASH",
+            ],
+            &[
+                b"GEOSEARCH",
+                b"g",
+                b"FROMMEMBER",
+                b"palermo",
+                b"BYBOX",
+                b"400",
+                b"400",
+                b"KM",
+                b"DESC",
+            ],
+            &[
+                b"GEORADIUS",
+                b"g",
+                b"15",
+                b"37",
+                b"200",
+                b"KM",
+                b"COUNT",
+                b"1",
+            ],
+            &[b"GEORADIUSBYMEMBER", b"g", b"palermo", b"200", b"KM"],
+            &[b"GEORADIUSBYMEMBER_RO", b"g", b"nothere", b"200", b"KM"],
+            &[
+                b"GEOSEARCHSTORE",
+                b"dst",
+                b"g",
+                b"FROMLONLAT",
+                b"15",
+                b"37",
+                b"BYRADIUS",
+                b"200",
+                b"KM",
+            ],
+            &[b"ZRANGE", b"dst", b"0", b"-1"],
+            &[
+                b"GEOSEARCHSTORE",
+                b"dst",
+                b"g",
+                b"FROMLONLAT",
+                b"15",
+                b"37",
+                b"BYRADIUS",
+                b"1",
+                b"M",
+                b"STOREDIST",
+            ],
+            &[b"EXISTS", b"dst"],
+            &[
+                b"GEORADIUS",
+                b"g",
+                b"15",
+                b"37",
+                b"200",
+                b"KM",
+                b"STORE",
+                b"dst",
+            ],
+            &[b"ZCARD", b"dst"],
+            // And the errors.
+            &[b"GEOADD", b"g", b"181", b"38", b"nowhere"],
+            &[b"SET", b"plain", b"v"],
+            &[b"GEOPOS", b"plain", b"a"],
+            &[b"GEOSEARCH", b"g", b"FROMLONLAT", b"15", b"37"],
+            &[
+                b"GEOSEARCHSTORE",
+                b"dst",
+                b"g",
+                b"FROMLONLAT",
+                b"15",
+                b"37",
+                b"BYRADIUS",
+                b"200",
+                b"KM",
+                b"WITHCOORD",
+            ],
+        ];
+
+        let mut one = Fixture::new();
+        let mut many = Fixture::striped(8);
+        for parts in script {
+            let a = one.run(parts);
+            let b = many.run(parts);
+            assert_eq!(a, b, "{}", String::from_utf8_lossy(parts[0]));
+        }
+    }
+
+    /// A `GEOSEARCHSTORE` whose two keys are on two stripes.
+    #[test]
+    fn a_geo_search_store_across_stripes_writes_what_it_found() {
+        let mut f = Fixture::striped(8);
+        let other = apart(&mut f, "g");
+        let third = apart(&mut f, &other);
+        let (g, dst, plain) = (b"g".as_slice(), other.as_bytes(), third.as_bytes());
+
+        f.run(&[
+            b"GEOADD",
+            g,
+            b"13.361389",
+            b"38.115556",
+            b"palermo",
+            b"15.087269",
+            b"37.502669",
+            b"catania",
+        ]);
+        assert_eq!(
+            f.run(&[
+                b"GEOSEARCHSTORE",
+                dst,
+                g,
+                b"FROMLONLAT",
+                b"15",
+                b"37",
+                b"BYRADIUS",
+                b"200",
+                b"KM",
+                b"ASC",
+            ]),
+            ":2\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"ZRANGE", dst, b"0", b"-1"]),
+            "*2\r\n$7\r\npalermo\r\n$7\r\ncatania\r\n",
+            "the geohash is the score, so the order is not the search order"
+        );
+        assert_eq!(f.run(&[b"ZCARD", g]), ":2\r\n", "the source is untouched");
+
+        // `STOREDIST` stores the distance in the unit the search was asked in,
+        // which is the destination stripe's sorted set and not the source's.
+        assert_eq!(
+            f.run(&[
+                b"GEOSEARCHSTORE",
+                dst,
+                g,
+                b"FROMMEMBER",
+                b"palermo",
+                b"BYRADIUS",
+                b"200",
+                b"KM",
+                b"STOREDIST",
+            ]),
+            ":2\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"ZSCORE", dst, b"palermo"]),
+            "$1\r\n0\r\n",
+            "the centre is nought away from itself"
+        );
+
+        // A search that found nothing deletes the destination on its own
+        // stripe, and a source of the wrong type is refused with the
+        // destination left alone.
+        assert_eq!(
+            f.run(&[
+                b"GEOSEARCHSTORE",
+                dst,
+                g,
+                b"FROMLONLAT",
+                b"0",
+                b"0",
+                b"BYRADIUS",
+                b"1",
+                b"M",
+            ]),
+            ":0\r\n"
+        );
+        assert_eq!(f.run(&[b"EXISTS", dst]), ":0\r\n");
+        f.run(&[
+            b"GEOSEARCHSTORE",
+            dst,
+            g,
+            b"FROMLONLAT",
+            b"15",
+            b"37",
+            b"BYRADIUS",
+            b"200",
+            b"KM",
+        ]);
+        f.run(&[b"SET", plain, b"v"]);
+        assert_eq!(
+            f.run(&[
+                b"GEOSEARCHSTORE",
+                dst,
+                plain,
+                b"FROMLONLAT",
+                b"15",
+                b"37",
+                b"BYRADIUS",
+                b"200",
+                b"KM",
+            ]),
+            "-WRONGTYPE Operation against a key holding the wrong kind of value\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"ZCARD", dst]),
+            ":2\r\n",
+            "and left the destination"
+        );
     }
 }

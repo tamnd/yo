@@ -42,6 +42,7 @@
 use yo_common::num::DIGITS_MAX;
 use yo_common::{Code, Error, Result};
 
+use crate::db::Db;
 use crate::elem::Elements;
 use crate::geo::{self, Kind, Shape, Unit};
 use crate::keyspace::Keyspace;
@@ -409,6 +410,50 @@ impl Keyspace {
         let limits = self.zset_limits;
         let built = Zset::from_elements(got, &limits);
         Ok(self.put_zset(dest, built))
+    }
+}
+
+impl Db {
+    /// `GEOSEARCHSTORE` and the two `GEORADIUS` store forms, when the source and
+    /// the destination are not on the same stripe.
+    ///
+    /// The search runs on the source's stripe and leaves its hits in that
+    /// stripe's scratch, which is where they are read from while the result is
+    /// built. The sorted set that comes out is put on the destination's stripe
+    /// under that stripe's promotion thresholds, the same way every other store
+    /// form works.
+    ///
+    /// # Errors
+    ///
+    /// `WRONGTYPE` from the source, which is checked before the destination is
+    /// touched.
+    pub fn geosearchstore(
+        &mut self,
+        dest: &[u8],
+        src: &[u8],
+        shape: &Shape,
+        limit: Limit,
+        dist: bool,
+    ) -> Result<usize> {
+        let (home, onto) = (self.stripe_of(src), self.stripe_of(dest));
+        if home == onto {
+            return self
+                .stripe_mut(home)
+                .geosearchstore(dest, src, shape, limit, dist);
+        }
+        let n = self.stripe_mut(home).geosearch(src, shape, limit)?;
+        let mut got = Elements::with_capacity(n.max(16));
+        for (name, hit) in self.stripe(home).geohits().iter() {
+            let score = if dist {
+                hit.metres / shape.unit.metres()
+            } else {
+                hit.score as f64
+            };
+            let _ = got.insert(name, score);
+        }
+        let limits = self.stripe(onto).zset_limits;
+        let built = Zset::from_elements(got, &limits);
+        Ok(self.stripe_mut(onto).put_zset(dest, built))
     }
 }
 
