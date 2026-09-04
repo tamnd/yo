@@ -389,7 +389,7 @@ fn image(server: &mut Server) -> (Vec<u8>, usize) {
     snap.aux(b"redis-bits", bits);
     snap.aux(b"aof-base", b"1");
     for i in 0..DATABASES {
-        snap.database(i, server.db(i));
+        snap.database(i, server.striped(i));
     }
     let skipped = snap.skipped();
     (snap.finish(), skipped)

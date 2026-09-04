@@ -14,10 +14,14 @@
 //! record it.
 //!
 //! One stripe is a database exactly as it was, and that is the default here.
-//! What more than one stripe costs is the subject of the rest of this
-//! milestone: a command that names several keys can no longer be handed one
-//! keyspace, and everything that walks a whole database has to walk all of
-//! them.
+//!
+//! What more than one stripe cost was two things, and both of them are paid.
+//! A command that names several keys is no longer handed one keyspace and
+//! resolves each key against the database instead, and everything that walks a
+//! whole database walks all of the stripes: the expiry cycle, eviction,
+//! compaction, `SCAN`, `KEYS`, `RANDOMKEY`, the settings and the snapshot. What
+//! is left before a database can be held by more than one thread is the engine
+//! itself, which is the other half of this milestone.
 
 use yo_index::Cursor as KeyCursor;
 
@@ -255,53 +259,6 @@ impl Db {
     #[must_use]
     pub fn stripe(&self, i: usize) -> &Keyspace {
         &self.stripes[i]
-    }
-
-    /// The one stripe of a database that has one.
-    ///
-    /// The bridge, and a temporary one. Everything that reaches a database
-    /// today does it by taking the whole thing mutably, because until now
-    /// there was only ever one thing to take, and rewriting all of that in the
-    /// change that introduces the type would make one unreviewable diff out of
-    /// two reviewable ones. So this hands back the single stripe and the
-    /// callers that have not been taught about stripes go on working exactly as
-    /// they did.
-    ///
-    /// It is deliberately loud rather than quietly wrong. Nothing asks for a
-    /// database wider than one stripe yet, and the check is what makes sure
-    /// nothing can start asking before the last caller of this is gone.
-    ///
-    /// Every command group has been taught about stripes now, so the last
-    /// caller left is the server's own handle on a database, and this goes when
-    /// that one does.
-    ///
-    /// # Panics
-    ///
-    /// If the database has more than one stripe, which means a caller that
-    /// should have been rewritten was not.
-    #[must_use]
-    pub fn only_mut(&mut self) -> &mut Keyspace {
-        assert_eq!(
-            self.stripes.len(),
-            1,
-            "a caller that has not been taught about stripes was handed a striped database"
-        );
-        &mut self.stripes[0]
-    }
-
-    /// The same, without taking it mutably.
-    ///
-    /// # Panics
-    ///
-    /// As [`Db::only_mut`].
-    #[must_use]
-    pub fn only(&self) -> &Keyspace {
-        assert_eq!(
-            self.stripes.len(),
-            1,
-            "a caller that has not been taught about stripes was handed a striped database"
-        );
-        &self.stripes[0]
     }
 
     /// Every stripe, in order.
