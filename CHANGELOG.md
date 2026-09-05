@@ -4,6 +4,40 @@ What each release changed, why, and what it costs you. The versioning rules and 
 
 While the major is 0, a minor release may break anything, including the on-disk format. The format is frozen at `M6`, not before.
 
+## 0.3.17 — 2026-09-05
+
+Nine pull requests and no milestone has closed, so this is a patch.
+
+Two things are in it. A command that names more than one key now holds every stripe those keys live on before it reads any of them, which closes the window where a multi key command could see two different moments of the same database. And the three pieces of server state a command touches on every call, which are the counters, the two limits and the mask saying which databases need collecting, stopped being fields one thread owns. The tokenizer also grew its document half, and the query half got a set of fixes for tag lists, escapes and accented words.
+
+`serve` is still one thread, so none of the threading work changes anything you can see yet.
+
+A file written by 0.3.16 opens unchanged under this version and a file written by this version opens under 0.3.16. No record kind was added.
+
+### Added
+
+- **A document is split into the words a real server puts in an index.** The query side of the tokenizer was already here and this is the other side of it, so the same value read as a document and read as a query now lands on the same terms. Words split on space, tab and every ASCII punctuation mark except the underscore and the backslash, everything above `0x7f` is part of a word, the value ends at its first zero byte, a stopword is dropped but gives up its place so a phrase does not close up over it, and a stem goes in beside any word of at least four bytes that stems to something different. The two sides differ where a real server makes them differ: a backslash on the document side escapes whatever follows it and on the query side ends the word, the document side unescapes once rather than repeatedly, and the document side cuts every character to sixteen bits, which is why an emoji that goes into a document cannot be asked for by name. Two of the differences are plainly bugs in the original and are copied anyway, because a term that does not match is worse than a term that looks wrong, and both are pinned by tests so nobody quietly fixes them.
+
+### Fixed
+
+- **A multi key command holds every stripe it names before it reads any of them.** `MGET a b`, `SINTERSTORE`, `PFCOUNT`, `BITOP`, `SORT`, `SMOVE`, `ZUNIONSTORE`, `DEL` with several keys, `XREAD` over several streams and the rest of the multi key surface used to take one stripe at a time, which on a database of more than one stripe is a reply that can be half from before another command ran and half from after. Two of them were worse than a torn read: the set and sorted set algebras resolved every key to a slot number, let go of the stripes and then took them again to read the bodies, and a slot number is only good while its stripe is held. `SMOVE` had a moment where the member was in neither set, and `GEOSEARCHSTORE` filled a stripe's scratch and then let the stripe go before reading it. The stripes are always taken in stripe order, which is what keeps two commands naming the same pair of keys from waiting on each other, and a command that names two keys on one stripe holds it once. `SORT` is the one command whose keys cannot be known before it runs, because a `BY` or a `GET` pattern builds key names out of the elements it is sorting, so a patterned sort holds the whole database and an unpatterned one holds the one or two stripes it names. That is no wider than what a client already gets from Redis, where a sort holds the whole server for its whole run.
+- **A search that takes its centre from a member reads it with the stripe held.** `GEOSEARCH FROMMEMBER`, `GEORADIUSBYMEMBER` and the store forms of both looked up where the member was, let the stripe go while the rest of the arguments were parsed and then searched, so a client that moved that place in between got hits measured from where it used to be.
+- **The query parser reads a tag list, an escape and an accented word the way a real server reads them.** The stemmer was counting bytes where the algorithm counts letters, so every word carrying an accent lost a letter off its stem and landed in the wrong bucket of the index. The tag clause is a small language of its own and the parser now knows the rest of it: a value of one word matches byte for byte, a value of several words is a phrase and is folded and unescaped like any other, and a value is the longer of the number and the word that both start where it does. All of it was measured against a running 8.10.1 over a raw socket rather than read out of the documentation, because most of these rules are not written down anywhere.
+
+### Changed
+
+- **Each thread keeps its own counters, its own command stat rows and its own mask of which databases it has touched.** These were fields on the server that the dispatcher wrote through a mutable borrow, which is one cache line every thread would have to take ownership of to write to, and at a few million commands a second that one line is the server. A thread claims its set the first time it writes anything and the writes are a load and an add and a store rather than a locked instruction, which is sound because each set has exactly one writer. `INFO` adds the counters up when somebody asks and the maintenance turn takes the masks with a swap, which cannot lose a mark.
+- **The two limits and the stop flag are atomics.** The `maxmemory` check runs in front of every command and the stop flag is read once a turn by whatever is driving the loop, and with threads both are read from all of them. No storage limit is now a sentinel value rather than an `Option` in the field, because two fields cannot be read as one and a limit that was on when the byte count was read and off by the time the number was would be answering about a server that never existed. `CONFIG GET maxstore` still answers `-1` for no limit, so nothing outside sees the sentinel.
+
+### Format
+
+No change. A file written by either of 0.3.16 and 0.3.17 opens under the other.
+
+### Known gaps
+
+- **`serve` is still one thread.** What has landed is the ownership half of M8: the stripes, the lock, the engine split, every command group taking the database shared, and now the server state a command touches on every call. What is left is the waiter list, the search registry, the backup state and the migrate peers going behind locks, the maintenance cursors staying with one thread, and then the engine and `yodb serve --threads N`. The three number gates that milestone closes on come after that.
+- **`FT.SEARCH` and everything that reads documents are still not here.** The index registry, the analysis pipeline and the query language are in. The search itself is not.
+
 ## 0.3.16 — 2026-09-05
 
 Eight pull requests and no milestone has closed, so this is a patch.
