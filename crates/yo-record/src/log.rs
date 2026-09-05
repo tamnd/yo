@@ -1,11 +1,15 @@
 //! The hybrid log itself.
 //!
-//! `06` section 2. One per shard, owned by that shard, and not `Send`, which is
-//! not a limitation but the design: if a log could be sent, two threads could
-//! append to it, and then installing a record would need a compare and swap.
-//! FASTER needs that CAS because several threads race to install. This log has
-//! one writer, so installing a record is a store, and that difference is worth
-//! more than everything else in this file put together.
+//! `06` section 2. One writer, which is not a limitation but the design: with
+//! several writers racing to install a record, installing one needs a compare
+//! and swap, which is what FASTER needs it for. This log has one writer, so
+//! installing a record is a store, and that difference is worth more than
+//! everything else in this file put together.
+//!
+//! The one writer comes from every append taking `&mut self` and not from the
+//! log belonging to a thread. A log can be moved to another thread, because the
+//! stripe it ends up under is worked on by whichever thread takes that stripe's
+//! lock, and the exclusive borrow is what says only one of them is appending.
 //!
 //! ```text
 //!   <-- older                                                     newer -->
@@ -38,7 +42,6 @@
 //! the block past the sentinel is zeroed on the way out. Under a block per
 //! flush, against a page turn that would be eight thousand times that.
 
-use core::marker::PhantomData;
 use core::sync::atomic::{Ordering, fence};
 
 use yo_common::{Code, Error, Result};
@@ -237,10 +240,15 @@ struct Page {
 
 /// The per shard hybrid log.
 ///
-/// Not `Send` and not `Sync`, deliberately. See the module documentation. That
-/// is a load bearing property rather than an oversight, so it is checked:
+/// One writer, which is what makes installing a record a store rather than a
+/// compare and swap. That is the property this file is built on, and it comes
+/// from every append taking `&mut self`, so the compiler holds it whichever
+/// thread the caller is on. See the module documentation.
 ///
-/// ```compile_fail
+/// It can therefore be sent, and it has to be: a log ends up under a stripe,
+/// and a stripe goes to whichever thread takes its lock.
+///
+/// ```
 /// use yo_record::{Durability, Log, LogConfig};
 /// use yo_record::sink::MemorySink;
 ///
@@ -266,7 +274,6 @@ pub struct Log<S: PageSink> {
     /// vector. Compaction is quiesced and budgeted, so a memcpy through here is
     /// off every statement path.
     pub(crate) scratch: Vec<u8>,
-    _not_send: PhantomData<*const ()>,
 }
 
 impl<S: PageSink> core::fmt::Debug for Log<S> {
@@ -334,7 +341,6 @@ impl<S: PageSink> Log<S> {
             epoch: 0,
             appends: 0,
             scratch: Vec::new(),
-            _not_send: PhantomData,
         };
         log.open_tail_page();
         Ok(log)

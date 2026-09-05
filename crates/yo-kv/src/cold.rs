@@ -106,6 +106,14 @@ pub trait Blocks {
     fn release(&mut self) {}
 }
 
+/// A store chosen at run time, which is how every real one arrives.
+///
+/// `Send` because the stripe it ends up in is worked on by whichever thread has
+/// taken that stripe's lock. Which thread that is changes from one command to
+/// the next, so a store that could not be sent could not be attached. Every
+/// store there is, which is a file and a vector, meets the bound already.
+pub type Store = Box<dyn Blocks + Send>;
+
 /// So that a store can be chosen at run time rather than at compile time.
 ///
 /// [`Keyspace`](crate::Keyspace) holds its tier behind this box, and the reason
@@ -114,7 +122,7 @@ pub trait Blocks {
 /// code opening the file knows. The dispatch it costs is one indirect call on a
 /// path that is about to read a device, and nothing at all on a warm read, which
 /// never reaches this trait.
-impl Blocks for Box<dyn Blocks> {
+impl Blocks for Store {
     fn put(&mut self, bytes: &[u8]) -> Result<Addr> {
         (**self).put(bytes)
     }

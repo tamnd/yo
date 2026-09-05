@@ -58,7 +58,7 @@ use std::path::Path;
 use yo_common::{Addr, Code, Error, Result, Space};
 use yo_file::{CreateOptions, LogFile, Yo};
 use yo_format::{RecordHeader, RecordKind};
-use yo_kv::cold::Blocks;
+use yo_kv::cold::{Blocks, Store as Boxed};
 use yo_record::{Durability, Log, LogConfig};
 
 /// How many databases get a log of their own, which is how many there are.
@@ -94,7 +94,7 @@ impl Store {
     /// Answers `None` for a database this file has no shard for, and for a log
     /// that will not open, because a database that cannot migrate evicts and
     /// that is a worse answer rather than a broken one.
-    pub fn source(mut self) -> impl FnMut(usize) -> Option<Box<dyn Blocks>> {
+    pub fn source(mut self) -> impl FnMut(usize) -> Option<Boxed> {
         move |at| {
             let sink = self.yo.log(u32::try_from(at).ok()?).ok()?;
             let cfg = LogConfig {

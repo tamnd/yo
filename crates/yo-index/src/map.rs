@@ -138,9 +138,10 @@ impl Keys for Records<'_> {
 
 /// A single shard's key value map: bytes in, bytes out, nothing else.
 ///
-/// Not `Sync`, and deliberately so. One of these belongs to one shard thread
-/// and is reached through `ShardLocal`, which is `05` section 1's whole
-/// argument: single ownership means no atomics on the hot path.
+/// Not `Sync`, and deliberately so. One of these is inside one stripe, and the
+/// lock around the stripe is what decides which thread has it, which is `05`
+/// section 1's whole argument: one owner at a time means no atomics on the hot
+/// path.
 ///
 /// ```
 /// let mut m = yo_index::RawMap::new();

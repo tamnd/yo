@@ -14,9 +14,14 @@
 //!
 //! # Not Sync
 //!
-//! Like everything that hangs off a shard. One of these belongs to one thread and
-//! is reached by sending that thread a command, which is Y1, and it is why
-//! nothing here takes a lock or an atomic.
+//! Like everything a stripe holds. One of these is worked on by one thread at a
+//! time and the lock around it is what says which, so nothing in here takes a
+//! lock or an atomic of its own.
+//!
+//! It is `Send`, because which thread that is changes from one command to the
+//! next: a stripe goes to whoever takes it. Nothing in here is tied to a
+//! particular thread, and the arena underneath says the same thing for the same
+//! reason.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -26,7 +31,7 @@ use yo_index::RawMap;
 use crate::Clock;
 use crate::access::{Access, Lfu, Policy};
 use crate::array::Array;
-use crate::cold::Blocks;
+use crate::cold::Store;
 use crate::evict;
 use crate::foreign::Foreign;
 use crate::hash::{self, Hash};
@@ -167,7 +172,7 @@ pub struct Keyspace {
     /// either, all to spell a type that only the code opening the file knows,
     /// and it would be a parameter on the hot path to describe the cold one. See
     /// [`Blocks`].
-    pub(crate) tier: Option<Tier<Box<dyn Blocks>>>,
+    pub(crate) tier: Option<Tier<Store>>,
     /// The last value read off the file, for the read that is being answered.
     ///
     /// A demoted value that is served rather than promoted has to live
@@ -1248,21 +1253,21 @@ impl Keyspace {
     ///
     /// The store is whatever the caller wants it to be. In a server it is the
     /// shard's log. In a test it is a vector. This crate does not depend on
-    /// either and does not want to: [`Blocks`] is an append that hands
-    /// back an address and a read that takes one, and that is the whole of the
-    /// contract between the memory engine and whatever is under it.
-    pub fn attach(&mut self, blocks: Box<dyn Blocks>) {
+    /// either and does not want to: [`Blocks`](crate::cold::Blocks) is an append
+    /// that hands back an address and a read that takes one, and that is the whole
+    /// of the contract between the memory engine and whatever is under it.
+    pub fn attach(&mut self, blocks: Store) {
         self.tier = Some(Tier::new(blocks));
     }
 
     /// The tier, if one was attached, for its counters.
     #[must_use]
-    pub const fn tier(&self) -> Option<&Tier<Box<dyn Blocks>>> {
+    pub const fn tier(&self) -> Option<&Tier<Store>> {
         self.tier.as_ref()
     }
 
     /// The tier, mutably, for a caller driving a sweep.
-    pub const fn tier_mut(&mut self) -> Option<&mut Tier<Box<dyn Blocks>>> {
+    pub const fn tier_mut(&mut self) -> Option<&mut Tier<Store>> {
         self.tier.as_mut()
     }
 

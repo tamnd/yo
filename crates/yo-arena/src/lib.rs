@@ -14,14 +14,15 @@
 //!
 //! # Ownership
 //!
-//! An `Arena` belongs to exactly one shard and is never shared. It is `!Sync`
-//! and `!Send` by construction, so handing one to another thread does not
-//! compile. That is the same rule as everything else the shard owns (`04`
-//! section 1) and it is what makes an unsynchronised bump pointer correct.
+//! An `Arena` belongs to exactly one stripe and is never shared. It is `!Sync`
+//! by construction, so two threads reaching one at the same time does not
+//! compile, and that is what makes an unsynchronised bump pointer correct. It
+//! is `Send`, because the stripe it belongs to is behind a lock and a lock hands
+//! its contents to whichever thread takes it. Which thread that is changes over
+//! the life of the process and nothing in here cares which one it is.
 
 #![deny(missing_docs)]
 
-use core::marker::PhantomData;
 use core::ptr::NonNull;
 use std::alloc::{Layout, alloc, dealloc};
 use yo_common::{Addr, Space};
@@ -218,8 +219,12 @@ impl Drop for Segment {
 
 /// A shard's arena.
 ///
-/// Not `Send` and not `Sync`. Both are removed by the `PhantomData` below
-/// rather than by a negative impl, so that this compiles on stable.
+/// `Send` and not `Sync`. Moving one to another thread is fine: the segments
+/// come from the global allocator, which every thread shares, and the three
+/// bump pointers point into segments this arena owns and nothing else can
+/// name. Sharing one is not fine, because bumping the cursor is a read and a
+/// write of the same three fields, and the raw pointers keep the compiler from
+/// allowing it.
 pub struct Arena {
     segs: Vec<Segment>,
     /// Index of the segment being bumped.
@@ -245,8 +250,14 @@ pub struct Arena {
     /// Dead bytes across every segment, so that deciding whether compaction is
     /// worth doing is one comparison rather than a walk over the headers.
     dead_total: u64,
-    _not_send_sync: PhantomData<*mut ()>,
 }
+
+// SAFETY: what an arena owns is its segments, and a segment is an allocation
+// from the global allocator that nothing outside this arena has an address
+// into. The bump pointers are derived from those allocations, so a move takes
+// the memory and the pointers into it together. Nothing here is tied to the
+// thread that allocated it: no thread local, no handle, no lock.
+unsafe impl Send for Arena {}
 
 impl Arena {
     /// A new arena holding nothing at all.
@@ -272,7 +283,6 @@ impl Arena {
             allocated: 0,
             free_segs: Vec::new(),
             dead_total: 0,
-            _not_send_sync: PhantomData,
         }
     }
 
