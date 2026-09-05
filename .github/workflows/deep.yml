@@ -16,7 +16,8 @@ name: deep
 #
 # Reproducing a Miri shard locally is one shard at a time:
 #
-#     MIRIFLAGS="-Zmiri-strict-provenance -Zmiri-disable-isolation" \
+#     MIRIFLAGS="-Zmiri-deterministic-floats -Zmiri-strict-provenance \
+#       -Zmiri-disable-isolation" \
 #       cargo +nightly miri nextest run --locked -p yo-record --test-threads 4 \
 #         -E 'not test(/^compact::/)'
 #
@@ -151,6 +152,19 @@ jobs:
       # worth 90 seconds against 55 locally even with nextest already running
       # four at a time. If that crate ever stops being the slowest, this special
       # case should go.
+      #
+      # `yo-resp` is the other exception and gets six, for a different reason:
+      # it is not one heavy test but six hundred and thirty of them, which is a
+      # third of every test in the workspace. Miri spends about six seconds
+      # starting a process before it runs a line of the test in it, and nextest
+      # gives every test its own process, so the floor for that crate is over
+      # an hour before the tests themselves are counted. Nothing in the source
+      # can be shrunk to fix that, because the cost is per test rather than per
+      # operation. Splitting the crate by count is the only lever, and nextest
+      # does the splitting itself, so no list of test names has to be kept true
+      # here as tests are added. Six rather than four because a quarter of the
+      # crate is a quarter of an hour on a laptop with nothing else running,
+      # and a runner is neither.
       - id: shards
         run: |
           rm rust-toolchain.toml
@@ -158,13 +172,15 @@ jobs:
           # nextest filter needs single quotes around it in the shell, and a
           # single quote inside this jq program would close the program instead,
           # which is a syntax error the runner reports six lines away from the
-          # cause. The run step below adds the quotes where they belong.
+          # cause. The run step below passes each field as its own argument.
           echo "list=$(cargo metadata --no-deps --format-version 1 | jq -c '
             [ .packages[].name
-              | select(. != "yo-record")
-              | {id: ., pkg: ., filter: ""} ]
-            + [ {id: "yo-record-compact", pkg: "yo-record", filter: "test(/^compact::/)"},
-                {id: "yo-record-rest", pkg: "yo-record", filter: "not test(/^compact::/)"} ]
+              | select(. != "yo-record" and . != "yo-resp")
+              | {id: ., pkg: ., filter: "", part: ""} ]
+            + [ {id: "yo-record-compact", pkg: "yo-record", filter: "test(/^compact::/)", part: ""},
+                {id: "yo-record-rest", pkg: "yo-record", filter: "not test(/^compact::/)", part: ""} ]
+            + [ range(1; 7)
+                | {id: "yo-resp-\(.)", pkg: "yo-resp", filter: "", part: "count:\(.)/6"} ]
             | sort_by(.id)')" >> "$GITHUB_OUTPUT"
       - run: echo "deep checks requested for ${{ github.event.inputs.ref || github.ref }}"
 
@@ -200,7 +216,11 @@ jobs:
     if: needs.wanted.outputs.run == 'true'
     name: miri (${{ matrix.borrows }}, ${{ matrix.shard.id }})
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    # Forty rather than the twenty five the other long jobs get. The heaviest
+    # shard is a third of an hour on a quiet laptop and a runner is not a quiet
+    # laptop, and this runs at three in the morning against nothing, so the only
+    # thing a tighter bound would buy is a red run on a slow morning.
+    timeout-minutes: 40
     strategy:
       # One shard failing is a real finding and every other shard's result is
       # still worth having, so a failure does not cancel its siblings.
@@ -229,18 +249,53 @@ jobs:
       # Pinned to four rather than left to follow the core count, so that a
       # bigger runner cannot quietly turn this into sixteen interpreters and an
       # out of memory kill that reads like a hang.
+      #
+      # A shard with no filter is a whole crate or a count of one, and either is
+      # allowed to come out empty: `yo-derive` is a proc macro whose only job
+      # happens in the compiler, so its shard finds nothing and nextest calls an
+      # empty run a failure. A shard with a filter is a hand written half of
+      # `yo-record`, and that one finding nothing means the filter has stopped
+      # matching, so it keeps the default and stays a failure.
+      #
+      # The fields go in through the environment and into an array rather than
+      # being pasted into the command line, so that a filter with a space or a
+      # quote in it stays one argument.
       - run: |
-          if [ -n "${{ matrix.shard.filter }}" ]; then
-            cargo miri nextest run --locked -p ${{ matrix.shard.pkg }} --test-threads 4 -E '${{ matrix.shard.filter }}'
+          set -u
+          args=(--locked -p "$PKG" --test-threads 4)
+          if [ -n "$FILTER" ]; then
+            args+=(-E "$FILTER")
           else
-            cargo miri nextest run --locked -p ${{ matrix.shard.pkg }} --test-threads 4
+            args+=(--no-tests pass)
           fi
+          if [ -n "$PART" ]; then
+            args+=(--partition "$PART")
+          fi
+          cargo miri nextest run "${args[@]}"
         env:
+          PKG: ${{ matrix.shard.pkg }}
+          FILTER: ${{ matrix.shard.filter }}
+          PART: ${{ matrix.shard.part }}
           # The flags used to live in a matrix `include`, which does not survive
           # the borrow list being decided at run time: an include entry naming a
           # value the matrix no longer has is a job of its own with no shard in
           # it rather than a merge into nothing.
+          #
+          # `-Zmiri-deterministic-floats` is there because Miri does not hand
+          # `ln`, `log2` and `log10` to the host. It works them out itself and
+          # then, by default, moves the answer a little either way on purpose, to
+          # catch code that leans on a precision the language does not promise.
+          # Three tests here read a score or a size back and compare it against
+          # what a real Redis answered, digit for digit, and that is the point of
+          # them: the width of a sketch is `ceil` of one `log10` over another and
+          # comes out 2 instead of 1 when the two no longer cancel, and the older
+          # search scorer is `floor` of a `log2` and drops to zero when its 1.0
+          # arrives as 0.9999999999999999. Neither is a bug, because a real libm
+          # is the same function twice and cancels, and neither is what Miri is
+          # here to look for. The flag keeps the answers exact and leaves the
+          # aliasing and provenance checks doing the job this workflow wants.
           MIRIFLAGS: >-
+            -Zmiri-deterministic-floats
             ${{ matrix.borrows == 'tree'
               && '-Zmiri-tree-borrows -Zmiri-disable-isolation'
               || '-Zmiri-strict-provenance -Zmiri-disable-isolation' }}

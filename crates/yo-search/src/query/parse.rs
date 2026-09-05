@@ -4228,10 +4228,17 @@ mod tests {
 
     #[test]
     fn nesting_far_deeper_than_anyone_writes_is_refused_rather_than_crashing() {
-        roomy(|| {
+        // Four thousand brackets is nothing natively and was thirteen minutes
+        // under Miri, the slowest test in the workspace by a factor of five.
+        // The claim is that a query far past the limit comes back as an error
+        // instead of taking the stack with it, and the limit is 253, so five
+        // hundred is already twice as deep as the parser will go. The full four
+        // thousand still runs everywhere except the interpreter.
+        let deep = if cfg!(miri) { 512 } else { 4096 };
+        roomy(move || {
             let index = index();
             for dialect in [1, 2, 3] {
-                let query = "(".repeat(4096);
+                let query = "(".repeat(deep);
                 let ask = Ask {
                     dialect,
                     ..Ask::default()
@@ -4260,11 +4267,13 @@ mod tests {
 
     #[test]
     fn operators_stacked_far_deeper_than_anyone_writes_are_refused_too() {
-        roomy(|| {
+        // Same trade as the brackets above, for the same reason.
+        let deep = if cfg!(miri) { 512 } else { 4096 };
+        roomy(move || {
             let index = index();
             for sign in ["-", "~"] {
                 for dialect in [1, 2, 3] {
-                    let query = format!("{}hello", sign.repeat(4096));
+                    let query = format!("{}hello", sign.repeat(deep));
                     let ask = Ask {
                         dialect,
                         ..Ask::default()

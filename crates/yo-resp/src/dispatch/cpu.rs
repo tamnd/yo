@@ -53,7 +53,7 @@ pub fn usage() -> Option<Usage> {
 /// A failed call is zero rather than a refusal, because the only documented
 /// failure is an argument that is not one of the constants and both of the ones
 /// passed here are.
-#[cfg(unix)]
+#[cfg(all(unix, not(miri)))]
 fn read(who: libc::c_int) -> (f64, f64) {
     // SAFETY: `getrusage` writes into the struct and reads nothing else, and
     // the struct is a local that lives across the call.
@@ -66,6 +66,23 @@ fn read(who: libc::c_int) -> (f64, f64) {
     };
     let secs = |t: libc::timeval| t.tv_sec as f64 + t.tv_usec as f64 / 1_000_000.0;
     (secs(ru.ru_utime), secs(ru.ru_stime))
+}
+
+/// The same, under an interpreter that has no process to account for.
+///
+/// Miri shims no `getrusage` on any target, so the real one above ends the run
+/// rather than answering, and it is not one test that walks into that: `INFO`
+/// with no argument prints every section, so most of the dispatch tests do.
+///
+/// Zero here is the same answer the call above gives when the kernel refuses,
+/// which is a reading the rest of the code already takes, and it is the true
+/// one as far as anything can tell: what Miri is spending is the host's time
+/// interpreting, not this process's time running. Nothing is monitoring an
+/// interpreter, and the tests that care about the numbers moving say so and
+/// are left out of the Miri run.
+#[cfg(all(unix, miri))]
+fn read(_who: libc::c_int) -> (f64, f64) {
+    (0.0, 0.0)
 }
 
 /// Read the counters, or `None` where the platform has no way to.
