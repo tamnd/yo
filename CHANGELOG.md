@@ -4,6 +4,40 @@ What each release changed, why, and what it costs you. The versioning rules and 
 
 While the major is 0, a minor release may break anything, including the on-disk format. The format is frozen at `M6`, not before.
 
+## 0.3.19 — 2026-09-05
+
+Eleven pull requests and no milestone has closed, so this is a patch.
+
+It is one story with two threading changes on the side. Search stopped being something you could only see through `FT.INFO` and became something you can actually query: a parsed query is walked over the index, what answers is scored, and `FT.SEARCH` and `FT.AGGREGATE` hand it back. The aggregation pipeline is nearly whole with it, `LOAD`, `GROUPBY` with all twelve reducers, `APPLY`, `FILTER`, `SORTBY` with `MAX` and the little expression language behind the last three. Everything in it was measured against Redis 8.10.1 over raw sockets rather than read off the manual, and the differences that are left are registered rather than hidden.
+
+A file written by 0.3.18 opens unchanged under this version and a file written by this version opens under 0.3.18. No record kind was added.
+
+### Added
+
+- **A query is walked over an index and what answers is scored.** A word, a union, an intersection, a negation, an optional, a bare star, a numeric range, a tag with its values and all five expansions all answer now, in document number order, each row carrying the shape of how it answered. Four scoring rules came out of measuring the reference and none of them is the obvious guess: a union adds up what every branch was worth where an expansion counts only the first term in byte order the document holds, a bare star is a term whose idf is one, a prefix, suffix or infix shorter than two bytes stands for nothing at all without an error, and a tag value written as several words is one value with a space in it. A hundred and eleven queries over a twelve document corpus, keys and scores together, agree with 8.10.1 to the last few bits of a double.
+- **A phrase and a slop are answered by where the words are.** It is one rule and not two: each word is given one of the places it was found at, and the words are close enough when the last of those places is no further from the first than the slop plus one less than the number of words. In order the places may repeat, so a phrase of one word written twice answers a document holding it once, and in any order they may not all stand on the same place.
+- **`FT.SEARCH` answers.** The query is parsed, walked, scored, sorted and cut to the window under the registry lock, and the keys are read afterwards with that lock let go of. Fifteen option keywords are read and six are refused on purpose under D-65. The wire comparison against 8.10.1 sits at 32 rows of 1572 differing, eighteen of them `BM25STD.TANH` in the last bit where the reference's libm is not correctly rounded and this is, which is registered as D-66.
+- **`FT.AGGREGATE` answers, with most of its pipeline.** `LOAD` with its counted words and its `AS` names, `GROUPBY` with all twelve reducers, `APPLY` and `FILTER` over the expression language, and `SORTBY` with `MAX`. The count at the front of the reply has four cases and only one of them is the number of documents that answered, which is measured rather than chosen. `WITHCURSOR` and `EXPLAINSCORE` are still refused as unknown arguments under D-67.
+- **The expression language behind `APPLY` and `FILTER`.** All 31 functions with the arities and the error lines a real server answers, and nearly all of the work is in the corners: a number literal carries its own sign so `1+2` is two numbers in a row and not a sum, there is no minus that takes one operand, a comparison cannot be chained, two numbers that cannot be ordered come out equal rather than neither, and both word operators stop as soon as their left hand side settles the answer. The date functions walk the C library's calendar down to the three ISO week fields.
+- **The keyspace commands reach the search indexes.** A key a `DEL`, `UNLINK`, `EXPIRE`, `RENAME`, `COPY`, `RESTORE` or `SORT STORE` touched is read again or erased the way the reference does it, measured over 31 side by side cases. A rename inside a followed prefix moves the document across keeping the number it had and is the one write on a followed key that spends no number.
+
+### Fixed
+
+- **`LIMIT 1 0` is refused on all three search commands**, which this build was accepting.
+- **`FT.EXPLAIN`'s read and drop keyword list no longer leaks into `FT.AGGREGATE`.**
+- **An aggregation's `LIMIT` stands where it was written.** It is a step of the pipeline rather than a window on the answer, sharing one step with the `SORTBY` in front of it, reaching back past an `APPLY` or a `FILTER` and stopping at a `GROUPBY`. Getting that right fixed four ordering differences the expression suite had been carrying.
+
+### Changed
+
+- **The eviction path and the command dispatcher run without the server to themselves.** Along with the four pieces of state that moved behind locks in 0.3.18, that is most of what stood between `serve` and more than one thread. `serve` is still one thread, so none of it changes anything you can see yet.
+
+### Known gaps
+
+- `FT.SEARCH` refuses `SORTBY`, `WITHSORTKEYS`, `SUMMARIZE`, `HIGHLIGHT`, `GEOFILTER` and `EXPLAINSCORE` rather than quietly ignoring them, which is D-65. The first two need the sortable value store a `SORTABLE` field is supposed to keep, and the next two need the offsets of the words that matched.
+- `FT.AGGREGATE` refuses `WITHCURSOR` and `EXPLAINSCORE`, which is D-67. `FT.CURSOR` is next.
+- Ten divergences from the reference were registered in this release, D-64 to D-73. Two of them are cases where the reference is wrong rather than different: D-66 is a last bit rounding error in its libm, and D-71 is an arity that segfaults 8.10.1, reproduced twice.
+- The order rows come back in when nothing sorts them is document number here and keyspace scan order there, which is D-72, and the order groups come back in is first seen here and hash table order there, which is D-68. Neither is reproducible on the reference between two processes, and a `SORTBY` takes the first difference away for every row it can tell apart.
+
 ## 0.3.18 — 2026-09-05
 
 Eight pull requests and no milestone has closed, so this is a patch.
