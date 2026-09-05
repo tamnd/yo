@@ -161,6 +161,15 @@ pub enum Found {
     All(Vec<Found>),
     /// Any branch could have matched, as in a union.
     Any(Vec<Found>),
+    /// The document matched because everything does, which is a bare `*`.
+    ///
+    /// There is no term in a wildcard, so there is nothing to weigh by how rare
+    /// it is, and a real server scores it as one occurrence of a term whose idf
+    /// is one: the length correction and nothing else. Measured, on an index of
+    /// three documents holding seven tokens between them, where the two lengths
+    /// come back as two different scores and both agree to the last digit with
+    /// the same sum with the rarity taken out.
+    Every,
 }
 
 /// One of the nine ways of turning a match into a number.
@@ -267,7 +276,8 @@ impl Scorer {
     /// Adds up a match, which is a sum except where `DISMAX` takes the best.
     fn walk(self, facts: &Facts, doc: &Doc, found: &Found) -> f64 {
         match found {
-            Found::Term(term) => self.one(facts, doc, term),
+            Found::Term(term) => self.one(facts, doc, Some(term)),
+            Found::Every => self.one(facts, doc, None),
             Found::All(under) => under.iter().map(|f| self.walk(facts, doc, f)).sum(),
             Found::Any(under) if self == Scorer::DisMax => under
                 .iter()
@@ -278,28 +288,34 @@ impl Scorer {
     }
 
     /// What one term in one document is worth to this scorer.
-    fn one(self, facts: &Facts, doc: &Doc, term: &Term) -> f64 {
-        let freq = f64::from(term.freq);
-        term.weight
+    ///
+    /// No term at all is a wildcard, which is one occurrence of nothing in
+    /// particular: the frequency and the weight are one and every rarity is
+    /// one, so what is left is whatever the scorer does with the length.
+    fn one(self, facts: &Facts, doc: &Doc, term: Option<&Term>) -> f64 {
+        let freq = term.map_or(1.0, |term| f64::from(term.freq));
+        let idf = || term.map_or(1.0, |term| term.idf(facts.docs));
+        let bits = || term.map_or(1.0, |term| term.bits(facts.docs));
+        term.map_or(1.0, |term| term.weight)
             * match self {
                 Scorer::Bm25 | Scorer::Norm | Scorer::Tanh => {
                     let k1 = f64::from(K1);
                     let long = long(f64::from(doc.tokens), facts.average());
-                    term.idf(facts.docs) * (freq * (k1 + 1.0)) / (freq + k1 * long)
+                    idf() * (freq * (k1 + 1.0)) / (freq + k1 * long)
                 }
                 // The average length where the document's own length belongs,
                 // which is the slip this scorer is kept around for.
                 Scorer::Old => {
                     let long = f64::from(K1) * (1.0 - OLD_B + OLD_B * facts.average());
-                    term.bits(facts.docs) * freq / (freq + long)
+                    bits() * freq / (freq + long)
                 }
                 Scorer::TfIdf => match doc.top {
                     0 => 0.0,
-                    top => term.bits(facts.docs) * freq / f64::from(top),
+                    top => bits() * freq / f64::from(top),
                 },
                 Scorer::Length => match doc.tokens {
                     0 => 0.0,
-                    tokens => term.bits(facts.docs) * freq / f64::from(tokens),
+                    tokens => bits() * freq / f64::from(tokens),
                 },
                 Scorer::DisMax => freq,
                 Scorer::Worth | Scorer::Hamming => 0.0,
