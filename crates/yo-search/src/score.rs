@@ -262,6 +262,13 @@ impl Scorer {
         }
     }
 
+    /// Whether this scorer has to see the whole answer before any of it is
+    /// worth reading, which is the one thing that changes how an aggregation
+    /// hands its rows back.
+    pub fn settles(self) -> bool {
+        self == Scorer::Norm
+    }
+
     /// Divides a whole answer by its best score, for the scorer that wants it.
     ///
     /// This is the one thing a scorer cannot do a document at a time, so it
