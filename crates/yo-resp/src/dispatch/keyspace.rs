@@ -17,6 +17,7 @@
 //! too without a line here changing.
 
 use super::args::{self, Args};
+use super::indexing::Touched;
 use super::scan;
 use super::table::Spec;
 use crate::reply::Out;
@@ -113,17 +114,24 @@ const OBJECT_HELP: &[&str] = &[
 /// the two that name two keys, which take the two stripes those keys are on,
 /// and the three walks, which are about a database rather than about a key and
 /// so go through [`Db`] and reach all of them.
-pub(super) fn execute(
+///
+/// The keys a search index has to hear about go into `touched` as they are
+/// dealt with, because these commands can name several of them and can reach a
+/// database the connection is not on, so there is nothing here that could be an
+/// answer the way a hash command's is. Every arm that leaves a key in a
+/// different state from the one it was in says so, and the rest say nothing.
+pub(super) fn execute<'a>(
     dbs: &[Db],
     at: usize,
     spec: &Spec,
-    args: Args<'_>,
+    args: Args<'a>,
     out: &mut Out,
+    touched: &mut Touched<'a>,
 ) -> Result<()> {
     // The two that reach a database nobody selected, and the reason this
     // function is handed every database rather than one.
     match spec.name {
-        "copy" => return copy(dbs, at, args, out),
+        "copy" => return copy(dbs, at, args, out, touched),
         "move" => return move_key(dbs, at, args, out),
         _ => {}
     }
@@ -141,6 +149,7 @@ pub(super) fn execute(
                 let key = args.get(i);
                 if held.stripe_mut(db.stripe_of(key)).del(key) {
                     gone += 1;
+                    touched.gone(key);
                 }
             }
             out.int(gone);
@@ -190,8 +199,10 @@ pub(super) fn execute(
             }
             out.int(hit);
         }
-        "rename" | "renamenx" => rename(db, spec.name, args, out)?,
-        "expire" | "pexpire" | "expireat" | "pexpireat" => expire(db, spec.name, args, out)?,
+        "rename" | "renamenx" => rename(db, spec.name, args, out, touched)?,
+        "expire" | "pexpire" | "expireat" | "pexpireat" => {
+            expire(db, spec.name, args, out, touched)?;
+        }
         "persist" => {
             let key = args.get(1);
             out.int(i64::from(db.hold(key).persist(key)));
@@ -205,7 +216,7 @@ pub(super) fn execute(
         // `BY w_*` and `GET w_*` are resolved inside the store, one lookup per
         // element, and every one of those lookups can land on a different
         // stripe, so there is nothing to route once at this end.
-        "sort" | "sort_ro" => sort(db, spec.name, args, out)?,
+        "sort" | "sort_ro" => sort(db, spec.name, args, out, touched)?,
         // One arm and not a guarded pair, because a guard and the arm behind
         // it would each want this stripe and the second would be waiting on the
         // first.
@@ -220,7 +231,7 @@ pub(super) fn execute(
                 None => out.nil(),
             }
         }
-        "restore" => restore(db, args, out)?,
+        "restore" => restore(db, args, out, touched)?,
         // Every stripe and not one, and the stripe is drawn first so that the
         // key is still drawn from the database rather than from whichever
         // stripe happened to be asked. See [`Db::random_key`].
@@ -396,7 +407,18 @@ fn no_dump(db: &mut Keyspace, key: &[u8]) -> Error {
 /// stripe this is the store's own rename, which moves thirteen bytes and leaves
 /// the body where it is. Across two it is a take and an import, which moves the
 /// body from one slab to the other and still does not copy it.
-fn rename(db: &Db, name: &str, args: Args<'_>, out: &mut Out) -> Result<()> {
+///
+/// A search index hears about both keys at once rather than about one going and
+/// the other arriving, because a rename inside a prefix an index follows moves
+/// the document across keeping the number it had, and there is no way to say
+/// that in two halves.
+fn rename<'a>(
+    db: &Db,
+    name: &str,
+    args: Args<'a>,
+    out: &mut Out,
+    touched: &mut Touched<'a>,
+) -> Result<()> {
     let nx = name == "renamenx";
     let (src, dst) = (args.get(1), args.get(2));
     let (from, to) = (db.stripe_of(src), db.stripe_of(dst));
@@ -409,6 +431,9 @@ fn rename(db: &Db, name: &str, args: Args<'_>, out: &mut Out) -> Result<()> {
         rename_across(&mut held, from, to, src, dst, nx)
     };
     let done = done.found()?;
+    if done == Moved::Ok {
+        touched.renamed(src, dst);
+    }
     if nx {
         out.int(i64::from(done == Moved::Ok));
     } else {
@@ -462,7 +487,13 @@ fn rename_across(
 /// `COPY a a DB 1` is a real copy and `COPY a a DB 0` from database zero is
 /// the error. That is why the check is down here and not next to the argument
 /// parsing: it needs to know which database was asked for.
-fn copy(dbs: &[Db], at: usize, args: Args<'_>, out: &mut Out) -> Result<()> {
+fn copy<'a>(
+    dbs: &[Db],
+    at: usize,
+    args: Args<'a>,
+    out: &mut Out,
+    touched: &mut Touched<'a>,
+) -> Result<()> {
     let (src, dst) = (args.get(1), args.get(2));
     let mut into = at;
     let mut replace = false;
@@ -523,6 +554,11 @@ fn copy(dbs: &[Db], at: usize, args: Args<'_>, out: &mut Out) -> Result<()> {
             Moved::Ok
         }
     };
+    if done == Moved::Ok {
+        // The destination and not the source, and in the database the copy
+        // landed in rather than the one the connection is on.
+        touched.wrote(dst);
+    }
     out.int(i64::from(done == Moved::Ok));
     Ok(())
 }
@@ -586,7 +622,7 @@ fn hold_both(dbs: &[Db], from: Spot, to: Spot) -> Both<'_> {
 ///
 /// A ttl is milliseconds from now unless `ABSTTL`, in which case it is a unix
 /// time, and a zero means no deadline at all in both readings.
-fn restore(db: &Db, args: Args<'_>, out: &mut Out) -> Result<()> {
+fn restore<'a>(db: &Db, args: Args<'a>, out: &mut Out, touched: &mut Touched<'a>) -> Result<()> {
     let key = args.get(1);
     let mut db = db.hold(key);
     let mut replace = false;
@@ -644,7 +680,10 @@ fn restore(db: &Db, args: Args<'_>, out: &mut Out) -> Result<()> {
     // about these two options today.
     let _ = (idle, freq);
     match db.restore(key, args.get(3), expire_at, replace) {
-        Ok(_) => out.ok(),
+        Ok(_) => {
+            touched.wrote(key);
+            out.ok();
+        }
         Err(Bad::Footer) => return Err(Error::new(Code::Invalid, BAD_FOOTER)),
         Err(Bad::Format) => return Err(Error::new(Code::Invalid, BAD_PAYLOAD)),
     }
@@ -720,7 +759,13 @@ fn move_key(dbs: &[Db], at: usize, args: Args<'_>, out: &mut Out) -> Result<()> 
 /// `GET # GET w_*` asks for two things per element and not for the second one
 /// twice. The patterns are collected into a small vector, which is the one
 /// allocation this parser makes and only when a `GET` was given at all.
-fn sort(db: &Db, name: &str, args: Args<'_>, out: &mut Out) -> Result<()> {
+fn sort<'a>(
+    db: &Db,
+    name: &str,
+    args: Args<'a>,
+    out: &mut Out,
+    touched: &mut Touched<'a>,
+) -> Result<()> {
     let read_only = name == "sort_ro";
     let key = args.get(1);
     let mut opts = Sort::default();
@@ -764,7 +809,14 @@ fn sort(db: &Db, name: &str, args: Args<'_>, out: &mut Out) -> Result<()> {
     opts.get = &get;
 
     match store {
-        Some(dst) => out.int(i64::try_from(db.sort_store(key, dst, &opts)?).unwrap_or(i64::MAX)),
+        Some(dst) => {
+            let rows = db.sort_store(key, dst, &opts)?;
+            // A list where a followed hash used to be, or nothing at all when
+            // the sort came back empty, and the read afterwards tells the two
+            // apart without this having to.
+            touched.wrote(dst);
+            out.int(i64::try_from(rows).unwrap_or(i64::MAX));
+        }
         None => {
             let rows = db.sort(key, &opts)?;
             out.array(rows.len());
@@ -791,7 +843,13 @@ fn sort(db: &Db, name: &str, args: Args<'_>, out: &mut Out) -> Result<()> {
 /// when it says 1: the deadline went on, or the deadline had already passed and
 /// the key went away. The store answers that distinction and the wire throws it
 /// away, because that is what Redis puts on the wire.
-fn expire(db: &Db, name: &str, args: Args<'_>, out: &mut Out) -> Result<()> {
+fn expire<'a>(
+    db: &Db,
+    name: &str,
+    args: Args<'a>,
+    out: &mut Out,
+    touched: &mut Touched<'a>,
+) -> Result<()> {
     let mut db = db.hold(args.get(1));
     let relative = matches!(name, "expire" | "pexpire");
     let scale = if matches!(name, "pexpire" | "pexpireat") {
@@ -804,7 +862,13 @@ fn expire(db: &Db, name: &str, args: Args<'_>, out: &mut Out) -> Result<()> {
     out.int(match db.expire(args.get(1), at, cond) {
         // Nothing there, or the condition said no. Redis does not distinguish.
         Applied::Missing | Applied::NotMet => 0,
-        Applied::Ok | Applied::Deleted => 1,
+        Applied::Ok => 1,
+        // The one of the four the indexes care about: a deadline that has
+        // already passed takes the key with it, so the document goes too.
+        Applied::Deleted => {
+            touched.gone(args.get(1));
+            1
+        }
     });
     Ok(())
 }

@@ -1716,9 +1716,18 @@ pub fn resolved(
                 migrate::execute(server, session.db, args, out).map(|()| Flow::Continue)
             }
             // Every database and not the one the session is on, because `COPY` takes
-            // a `DB n` and writes into a database nobody selected.
+            // a `DB n` and writes into a database nobody selected. The other group
+            // that reaches back into the server afterwards, and it hands back a list
+            // rather than one answer, because `DEL a b c` is three keys and a rename
+            // is two.
             "keyspace" => {
-                keyspace::execute(&server.dbs, session.db, spec, args, out).map(|()| Flow::Continue)
+                let mut touched = indexing::Touched::new(server);
+                let done =
+                    keyspace::execute(&server.dbs, session.db, spec, args, out, &mut touched);
+                done.map(|()| {
+                    indexing::touched(server, &touched);
+                    Flow::Continue
+                })
             }
             // No database at all, because an index is not a key. The registry
             // is the whole of what these sixteen commands touch, and then
@@ -21065,6 +21074,190 @@ mod tests {
             b"HSETEX", b"p:2", b"EXAT", b"1", b"FIELDS", b"1", b"t", b"zqx",
         ]);
         assert_eq!(held(&f, b"ix"), (1, 6));
+    }
+
+    /// The number one key is indexed under, or `None` when it holds no
+    /// document.
+    fn number(f: &Fixture, name: &[u8], key: &[u8]) -> Option<u32> {
+        let search = f.server.search.lock();
+        let index = search.named(name).expect("the index is there");
+        index.held.docs.id(key)
+    }
+
+    /// An index over `p:` with one document under `p:1`, which is where four of
+    /// the tests below start.
+    fn indexed() -> Fixture {
+        let mut f = Fixture::new();
+        f.run(&[
+            b"FT.CREATE",
+            b"ix",
+            b"PREFIX",
+            b"1",
+            b"p:",
+            b"SCHEMA",
+            b"t",
+            b"TEXT",
+        ]);
+        f.run(&[b"HSET", b"p:1", b"t", b"alpha"]);
+        f
+    }
+
+    /// Every way a keyspace command takes a key away leaves no document behind,
+    /// and none of them spends a number or is counted as a refusal.
+    #[test]
+    fn a_key_a_keyspace_command_takes_away_loses_its_document() {
+        for take in [
+            vec![b"DEL".as_slice(), b"p:1"],
+            vec![b"UNLINK".as_slice(), b"p:1"],
+            vec![b"PEXPIREAT".as_slice(), b"p:1", b"1"],
+            vec![b"EXPIRE".as_slice(), b"p:1", b"-1"],
+        ] {
+            let mut f = indexed();
+            assert_eq!(held(&f, b"ix"), (1, 1));
+            f.run(&take);
+            assert_eq!(held(&f, b"ix"), (0, 1), "{:?} left something", take[0]);
+            let search = f.server.search.lock();
+            let index = search.named(b"ix").expect("the index is there");
+            assert_eq!(index.trouble.whole().failures(), 0, "{:?}", take[0]);
+        }
+
+        // A deadline that has not passed yet is not one of them.
+        let mut f = indexed();
+        f.run(&[b"EXPIRE", b"p:1", b"1000"]);
+        assert_eq!(held(&f, b"ix"), (1, 1));
+        f.run(&[b"PERSIST", b"p:1"]);
+        assert_eq!(held(&f, b"ix"), (1, 1));
+    }
+
+    /// A rename inside the prefix keeps the number the document had, which is
+    /// the one write on a followed key that does not spend one. Out of the
+    /// prefix is an erase and into it is a fresh reading, both measured.
+    #[test]
+    fn a_rename_inside_the_prefix_keeps_the_number_the_document_had() {
+        let mut f = indexed();
+        f.run(&[b"RENAME", b"p:1", b"p:2"]);
+        assert_eq!(held(&f, b"ix"), (1, 1), "nothing was read again");
+        assert_eq!(number(&f, b"ix", b"p:2"), Some(1));
+        assert_eq!(number(&f, b"ix", b"p:1"), None);
+
+        f.run(&[b"RENAME", b"p:2", b"q:1"]);
+        assert_eq!(held(&f, b"ix"), (0, 1), "out of the prefix is an erase");
+
+        f.run(&[b"RENAME", b"q:1", b"p:3"]);
+        assert_eq!(held(&f, b"ix"), (1, 2), "and into it is a reading");
+        assert_eq!(number(&f, b"ix", b"p:3"), Some(2));
+
+        // `RENAMENX` goes the same way, and the one that answers zero changes
+        // nothing.
+        f.run(&[b"HSET", b"p:4", b"t", b"beta"]);
+        assert_eq!(f.run(&[b"RENAMENX", b"p:3", b"p:4"]), ":0\r\n");
+        assert_eq!(held(&f, b"ix"), (2, 3));
+        f.run(&[b"RENAMENX", b"p:3", b"p:5"]);
+        assert_eq!(number(&f, b"ix", b"p:5"), Some(2));
+    }
+
+    /// A rename over a key that already had a document leaves one document and
+    /// not two. A real server leaves both, and D-64 is that difference.
+    #[test]
+    fn a_rename_over_a_document_leaves_one_of_them() {
+        let mut f = indexed();
+        f.run(&[b"HSET", b"p:2", b"t", b"beta"]);
+        assert_eq!(held(&f, b"ix"), (2, 2));
+        f.run(&[b"RENAME", b"p:1", b"p:2"]);
+        assert_eq!(held(&f, b"ix"), (1, 2));
+        assert_eq!(number(&f, b"ix", b"p:2"), Some(1));
+    }
+
+    /// A key that arrives under the prefix by being copied or restored is read
+    /// as a new document, and one that is written over by something that is not
+    /// a hash is erased without a word.
+    #[test]
+    fn a_key_that_arrives_under_the_prefix_is_read_and_one_overwritten_is_erased() {
+        let mut f = indexed();
+        f.run(&[b"HSET", b"q:1", b"t", b"beta"]);
+        f.run(&[b"COPY", b"q:1", b"p:2"]);
+        assert_eq!(held(&f, b"ix"), (2, 2));
+        assert_eq!(number(&f, b"ix", b"p:2"), Some(2));
+
+        // Out of the prefix, where the source keeps the document it had.
+        f.run(&[b"COPY", b"p:1", b"q:2"]);
+        assert_eq!(held(&f, b"ix"), (2, 2));
+
+        // Over a key that has one, which is a new reading and not a rename.
+        f.run(&[b"COPY", b"q:1", b"p:1", b"REPLACE"]);
+        assert_eq!(held(&f, b"ix"), (2, 3));
+        assert_eq!(number(&f, b"ix", b"p:1"), Some(3));
+
+        // And a string landing on top of a document takes it away, spending no
+        // number and counting no failure.
+        f.run(&[b"SET", b"s:1", b"plain"]);
+        f.run(&[b"COPY", b"s:1", b"p:1", b"REPLACE"]);
+        assert_eq!(held(&f, b"ix"), (1, 3));
+        let dump = f.run(&[b"DUMP", b"q:1"]);
+        assert!(dump.starts_with('$'), "{dump}");
+    }
+
+    /// The keyspace group reads a key back on database zero whatever database
+    /// the command ran on, which is measured and is not what the hash commands
+    /// do. A `COPY` into another database indexes nothing and takes away
+    /// whatever the destination had, and a `RESTORE` anywhere else is invisible.
+    #[test]
+    fn the_keyspace_group_reads_database_zero_whatever_database_it_ran_on() {
+        let mut f = indexed();
+        f.run(&[b"HSET", b"p:2", b"t", b"beta"]);
+        assert_eq!(held(&f, b"ix"), (2, 2));
+        // Into database one, so the indexes look for `p:2` on database zero,
+        // find the one that is still there and read it again.
+        f.run(&[b"COPY", b"p:1", b"p:2", b"DB", b"1", b"REPLACE"]);
+        assert_eq!(held(&f, b"ix"), (2, 3));
+        // And with nothing under that name on database zero, the copy leaves
+        // the index one document lighter than it found it.
+        f.run(&[b"DEL", b"p:2"]);
+        assert_eq!(held(&f, b"ix"), (1, 3));
+        f.run(&[b"COPY", b"p:1", b"p:2", b"DB", b"1", b"REPLACE"]);
+        assert_eq!(held(&f, b"ix"), (1, 3), "the copy landed out of sight");
+
+        // A restore on another database is the same story.
+        let dump = f.run(&[b"DUMP", b"p:1"]);
+        assert!(dump.starts_with('$'), "{dump}");
+        f.run(&[b"SELECT", b"1"]);
+        f.run(&[b"HSET", b"q:1", b"t", b"gamma"]);
+        f.run(&[b"RENAME", b"q:1", b"p:3"]);
+        assert_eq!(held(&f, b"ix"), (1, 3), "and so is a rename");
+    }
+
+    /// `MOVE` is not a change at all, because an index follows a key by name
+    /// and a write on any database still reaches it.
+    #[test]
+    fn a_move_leaves_the_document_where_it_is() {
+        let mut f = indexed();
+        f.run(&[b"MOVE", b"p:1", b"1"]);
+        assert_eq!(held(&f, b"ix"), (1, 1), "the key moved and nothing else");
+        assert_eq!(number(&f, b"ix", b"p:1"), Some(1));
+
+        f.run(&[b"SELECT", b"1"]);
+        f.run(&[b"HSET", b"p:1", b"t", b"beta"]);
+        assert_eq!(held(&f, b"ix"), (1, 2), "and a write there still lands");
+        f.run(&[b"DEL", b"p:1"]);
+        assert_eq!(held(&f, b"ix"), (0, 2));
+    }
+
+    /// A flush takes every index with it, whichever database it flushed.
+    #[test]
+    fn a_flush_drops_the_indexes() {
+        for flush in [b"FLUSHALL".as_slice(), b"FLUSHDB"] {
+            let mut f = indexed();
+            f.run(&[flush]);
+            assert!(f.server.search.lock().is_empty(), "{flush:?} kept an index");
+            assert_eq!(f.run(&[b"FT._LIST"]), "*0\r\n");
+        }
+
+        // Even on a database no index ever read, which is what a real server
+        // does and is not what anyone would guess.
+        let mut f = indexed();
+        f.run(&[b"SELECT", b"9"]);
+        f.run(&[b"FLUSHDB"]);
+        assert!(f.server.search.lock().is_empty());
     }
 
     /// A key that will not read is counted against the index and against the
