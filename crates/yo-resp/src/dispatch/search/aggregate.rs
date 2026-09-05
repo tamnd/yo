@@ -25,8 +25,8 @@ use super::{
     GROUP_SHORT, MAX_COUNT, MISSING_ARGS, MOST_SAMPLE, NO_AT, NO_AT_END, NO_AT_MID, NO_PROPERTY,
     NO_REDUCER, NOT_A_NUMBER, NOT_LOADED, NOT_MAIN, NOT_THERE, OUT_OF_RANGE, PERCENTAGE, QUOTE_END,
     REDUCE_BARE, RESOLUTION, RESOLUTION_ARG, Row, SAMPLE_BIG, SAMPLE_SIZE, SORT_BOUNDS, SORT_COUNT,
-    SORT_PROP, SORT_PROP_END, SORT_SHORT, SORT_TWICE, SORT_WAY, SORT_WAY_END, STEP_SHORT, UNKNOWN,
-    line, twelve,
+    SORT_PROP, SORT_PROP_END, SORT_SHORT, SORT_TWICE, SORT_WAY, SORT_WAY_END, STEP_SHORT, Shows,
+    UNKNOWN, line, twelve,
 };
 use crate::dispatch::Server;
 use crate::dispatch::args;
@@ -950,7 +950,7 @@ pub(super) fn piped(
         &names,
         &shown,
         sorted,
-        asked,
+        asked.rolls(),
         warning.as_deref(),
         out,
     );
@@ -1184,21 +1184,20 @@ fn answered(answer: reduce::Answer, numeric: bool) -> Value {
 }
 
 /// The reply a pipeline answers with, on either protocol.
-fn writes(
+pub(super) fn writes(
     count: usize,
     names: &[Box<[u8]>],
     shown: &[(Option<&Row>, &Vec<Value>)],
     sorted: Option<usize>,
-    asked: &Asked<'_>,
+    shows: Shows,
     warning: Option<&[u8]>,
     out: &mut Out,
 ) {
-    let pipe = &asked.pipe;
-    let want = &asked.rows;
-    let extras = usize::from(want.scores) + usize::from(want.payloads) + usize::from(pipe.sortkeys);
+    let extras =
+        usize::from(shows.scores) + usize::from(shows.payloads) + usize::from(shows.sortkeys);
     // A row a group step made has no document under it and so has no score of
     // its own, which is why this is asked per row rather than once.
-    let scored = pipe.addscores && !names.iter().any(|name| **name == *b"__score");
+    let scored = shows.addscores && !names.iter().any(|name| **name == *b"__score");
     let scoring = |row: Option<&Row>| scored.then(|| row.map(|row| row.score)).flatten();
     if out.proto().is_resp3() {
         out.map(5);
@@ -1209,26 +1208,26 @@ fn writes(
         out.simple(b"results");
         out.array(shown.len());
         for (row, values) in shown {
-            out.map(1 + extras + usize::from(want.content));
-            if want.scores {
+            out.map(1 + extras + usize::from(shows.fields));
+            if shows.scores {
                 out.simple(b"score");
                 out.double(row.map_or(0.0, |row| row.score));
             }
-            if want.payloads {
+            if shows.payloads {
                 out.simple(b"payload");
                 match row.and_then(|row| row.payload.as_ref()) {
                     Some(payload) => out.bulk(payload),
                     None => out.nil(),
                 }
             }
-            if pipe.sortkeys {
+            if shows.sortkeys {
                 out.simple(b"sortkey");
                 match keyed(values, sorted) {
                     Some(key) => out.bulk(&key),
                     None => out.nil(),
                 }
             }
-            if want.content {
+            if shows.fields {
                 out.simple(b"extra_attributes");
                 mapped(names, values, scoring(*row), out);
             }
@@ -1247,27 +1246,27 @@ fn writes(
         }
         return;
     }
-    out.array(1 + shown.len() * (extras + usize::from(want.content)));
+    out.array(1 + shown.len() * (extras + usize::from(shows.fields)));
     out.int(count as i64);
     for (row, values) in shown {
         // A grouped row has no document behind it, so the score is nought and
         // the payload is nothing, which is what a real server sends for both.
-        if want.scores {
+        if shows.scores {
             out.double(row.map_or(0.0, |row| row.score));
         }
-        if want.payloads {
+        if shows.payloads {
             match row.and_then(|row| row.payload.as_ref()) {
                 Some(payload) => out.bulk(payload),
                 None => out.nil(),
             }
         }
-        if pipe.sortkeys {
+        if shows.sortkeys {
             match keyed(values, sorted) {
                 Some(key) => out.bulk(&key),
                 None => out.nil(),
             }
         }
-        if want.content {
+        if shows.fields {
             mapped(names, values, scoring(*row), out);
         }
     }

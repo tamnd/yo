@@ -1626,6 +1626,32 @@ impl Rows<'_> {
     }
 }
 
+impl Rows<'_> {
+    /// What a search puts on each row, where the fields are gone when a
+    /// `RETURN` of nothing emptied the list as well as when `NOCONTENT` did.
+    fn found(&self) -> Shows {
+        Shows {
+            fields: self.loading(),
+            scores: self.scores,
+            payloads: self.payloads,
+            ..Shows::default()
+        }
+    }
+}
+
+impl Asked<'_> {
+    /// What an aggregation puts on each row.
+    fn rolls(&self) -> Shows {
+        Shows {
+            fields: self.rows.content,
+            scores: self.rows.scores,
+            payloads: self.rows.payloads,
+            sortkeys: self.pipe.sortkeys,
+            addscores: self.pipe.addscores,
+        }
+    }
+}
+
 impl Default for Rows<'_> {
     fn default() -> Rows<'static> {
         Rows {
@@ -1644,6 +1670,23 @@ impl Default for Rows<'_> {
             inorder: false,
         }
     }
+}
+
+/// What goes on a row of a reply beside the fields it carries.
+///
+/// Copied out of the argument list rather than read from it, so that whoever
+/// writes a row does not have to hold on to the words it was asked for with.
+#[derive(Clone, Copy, Default)]
+struct Shows {
+    /// Whether the fields or the properties are on the row at all, which
+    /// `NOCONTENT` takes away from a search and from an aggregation both.
+    fields: bool,
+    scores: bool,
+    payloads: bool,
+    sortkeys: bool,
+    /// Whether the score of the document goes on the row as a property, which
+    /// is an aggregation's `ADDSCORES` and nothing a search takes.
+    addscores: bool,
 }
 
 /// What a client asked for beside the query, and where the reading of it stops.
@@ -2553,7 +2596,7 @@ fn rolled(
         built.push((row, props(doc, pipe)));
     }
     let total = total - lost;
-    let deep = out.proto().is_resp3();
+    let wide = out.proto().is_resp3();
     // `LIMIT 0 0` is a client asking for the count and nothing else, and it gets
     // the real one. So does a pipeline that reads fields and starts at the top,
     // and so does one whose scorer had to see the whole answer before any of it
@@ -2564,44 +2607,50 @@ fn rolled(
     let count = match whole {
         true => total,
         false => {
-            let reached = match deep || pipe.loader {
+            let reached = match wide || pipe.loader {
                 true => built.len(),
                 false => 1,
             };
             want.offset.saturating_add(reached).min(total)
         }
     };
-    if deep {
-        rolled_deep(count, &built, asked, out);
+    rolls(count, &built, asked.rolls(), out);
+}
+
+/// The rows of an aggregation that ran no pipeline step, on either protocol.
+fn rolls(count: usize, built: &[Rolled<'_>], shows: Shows, out: &mut Out) {
+    if out.proto().is_resp3() {
+        rolled_deep(count, built, shows, out);
         return;
     }
     // The count, then a fixed number of elements for every row: whichever of
     // the score, the payload and the sort key were asked for, then the
     // properties unless `NOCONTENT` took them away. A `NOCONTENT` with nothing
     // else on it leaves an array of one.
-    let per = usize::from(want.scores)
-        + usize::from(want.payloads)
-        + usize::from(pipe.sortkeys)
-        + usize::from(want.content);
+    let per = usize::from(shows.scores)
+        + usize::from(shows.payloads)
+        + usize::from(shows.sortkeys)
+        + usize::from(shows.fields);
     out.array(1 + built.len() * per);
     out.int(count as i64);
-    for (row, fields) in &built {
-        if want.scores {
+    for (row, fields) in built {
+        if shows.scores {
             out.double(row.score);
         }
-        if want.payloads {
+        if shows.payloads {
             match &row.payload {
                 Some(payload) => out.bulk(payload),
                 None => out.nil(),
             }
         }
-        if pipe.sortkeys {
-            // Always null, because no step that writes one is built yet.
+        if shows.sortkeys {
+            // Always null, because nothing here sorted: a pipeline with a
+            // `SORTBY` in it is written by the step runner instead.
             out.nil();
         }
-        if want.content {
-            out.map(fields.len() + usize::from(pipe.addscores));
-            if pipe.addscores {
+        if shows.fields {
+            out.map(fields.len() + usize::from(shows.addscores));
+            if shows.addscores {
                 out.bulk(b"__score");
                 out.bulk(twelve(row.score).as_bytes());
             }
@@ -2618,9 +2667,7 @@ fn rolled(
 /// A row is a map too, and the only thing missing from it beside a search is
 /// the `id`: an aggregation is about the properties and not about the keys they
 /// came off.
-fn rolled_deep(count: usize, built: &[Rolled<'_>], asked: &Asked<'_>, out: &mut Out) {
-    let pipe = &asked.pipe;
-    let want = &asked.rows;
+fn rolled_deep(count: usize, built: &[Rolled<'_>], shows: Shows, out: &mut Out) {
     out.map(5);
     out.simple(b"attributes");
     out.array(0);
@@ -2630,30 +2677,30 @@ fn rolled_deep(count: usize, built: &[Rolled<'_>], asked: &Asked<'_>, out: &mut 
     out.array(built.len());
     for (row, fields) in built {
         out.map(
-            1 + usize::from(want.scores)
-                + usize::from(want.payloads)
-                + usize::from(pipe.sortkeys)
-                + usize::from(want.content),
+            1 + usize::from(shows.scores)
+                + usize::from(shows.payloads)
+                + usize::from(shows.sortkeys)
+                + usize::from(shows.fields),
         );
-        if want.scores {
+        if shows.scores {
             out.simple(b"score");
             out.double(row.score);
         }
-        if want.payloads {
+        if shows.payloads {
             out.simple(b"payload");
             match &row.payload {
                 Some(payload) => out.bulk(payload),
                 None => out.nil(),
             }
         }
-        if pipe.sortkeys {
+        if shows.sortkeys {
             out.simple(b"sortkey");
             out.nil();
         }
-        if want.content {
+        if shows.fields {
             out.simple(b"extra_attributes");
-            out.map(fields.len() + usize::from(pipe.addscores));
-            if pipe.addscores {
+            out.map(fields.len() + usize::from(shows.addscores));
+            if shows.addscores {
                 out.bulk(b"__score");
                 out.bulk(twelve(row.score).as_bytes());
             }
@@ -2872,21 +2919,27 @@ fn write(server: &Server, db: usize, total: usize, rows: &[Row], want: &Rows<'_>
         built.push((row, Some(pick(doc, want))));
     }
     let total = total - lost;
+    found(total, &built, want.found(), out);
+}
+
+/// The rows of a search on the wire, on either protocol.
+fn found(total: usize, built: &[Built<'_>], shows: Shows, out: &mut Out) {
     if out.proto().is_resp3() {
-        deep(total, &built, want, out);
+        deep(total, built, shows, out);
         return;
     }
     // One element for the total, then a fixed number for every row: the key,
     // then whichever of the score, the payload and the fields were asked for.
-    let per = 1 + usize::from(want.scores) + usize::from(want.payloads) + usize::from(loading);
+    let per =
+        1 + usize::from(shows.scores) + usize::from(shows.payloads) + usize::from(shows.fields);
     out.array(1 + built.len() * per);
     out.int(total as i64);
-    for (row, fields) in &built {
+    for (row, fields) in built {
         out.bulk(&row.key);
-        if want.scores {
+        if shows.scores {
             out.double(row.score);
         }
-        if want.payloads {
+        if shows.payloads {
             match &row.payload {
                 Some(payload) => out.bulk(payload),
                 None => out.nil(),
@@ -2908,7 +2961,7 @@ fn write(server: &Server, db: usize, total: usize, rows: &[Row], want: &Rows<'_>
 /// answer with nothing in it, and `attributes`, `warning` and every row's
 /// `values` are always empty. That is measured rather than assumed: they are
 /// there for `FT.AGGREGATE` and a client that reads them finds them.
-fn deep(total: usize, built: &[Built<'_>], want: &Rows<'_>, out: &mut Out) {
+fn deep(total: usize, built: &[Built<'_>], shows: Shows, out: &mut Out) {
     out.map(5);
     out.simple(b"attributes");
     out.array(0);
@@ -2918,17 +2971,17 @@ fn deep(total: usize, built: &[Built<'_>], want: &Rows<'_>, out: &mut Out) {
     out.array(built.len());
     for (row, fields) in built {
         out.map(
-            2 + usize::from(want.scores)
-                + usize::from(want.payloads)
+            2 + usize::from(shows.scores)
+                + usize::from(shows.payloads)
                 + usize::from(fields.is_some()),
         );
         out.simple(b"id");
         out.bulk(&row.key);
-        if want.scores {
+        if shows.scores {
             out.simple(b"score");
             out.double(row.score);
         }
-        if want.payloads {
+        if shows.payloads {
             out.simple(b"payload");
             match &row.payload {
                 Some(payload) => out.bulk(payload),
