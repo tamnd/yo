@@ -60,13 +60,39 @@
 //! measured to the last digit as well, which is why [`crate::score::Found`] has
 //! a shape of its own for it rather than borrowing the shape of a term.
 //!
+//! # A phrase is an intersection that asks where
+//!
+//! `"hello world"` is every document holding both words with the second one
+//! next to the first, which means asking each word not only whether it is in a
+//! document but where, and the places are what the posting lists carry beside
+//! the frequency for exactly this.
+//!
+//! There is one rule underneath the phrase, the `SLOP` a client can ask for and
+//! the `INORDER` beside it, and it is measured rather than reasoned about. Give
+//! each word one of the places it was found at. The words are close enough when
+//! the last of those places is no further from the first than the slop plus one
+//! less than the number of words, so a phrase, which is a slop of nothing, wants
+//! them in a run with no room to spare. In order means the places have to climb,
+//! though not strictly, which is the part nobody would guess: `"aa aa"` answers
+//! a document holding one `aa` because both words are allowed to stand on it. In
+//! any order they may not all stand on the same place, which is why the same
+//! query with a slop and no order answers nothing at all unless the word really
+//! is in there twice.
+//!
+//! A word that stands for several terms brings the places of all of them, so a
+//! stem counts where the word it came from would. One tag value, a number, a
+//! negation and an optional stay out of the rule, so they neither fail it nor
+//! count towards how many words there are, which is why a range or a single tag
+//! beside two words under a slop changes nothing about which documents answer.
+//! Two tag values written as a union do take part, and a union has no places of
+//! its own to give, so `(@g:{aa|bb} alpha)=>{$slop:0}` answers nothing where
+//! `(@g:{aa} alpha)=>{$slop:0}` answers. All of that is measured on 8.10.1.
+//!
 //! # What is not walked yet
 //!
-//! A phrase, a geo filter and a vector query. The first needs the places two
-//! terms were found at and the rules for how far apart they may be, which is
-//! the next piece of work here. The other two need fields the document reader
-//! does not read yet, so there is nothing in the index to walk even when there
-//! is a node for it. All three answer nothing rather than answering wrongly.
+//! A geo filter and a vector query, which need fields the document reader does
+//! not read yet, so there is nothing in the index to walk even when there is a
+//! node for it. Both answer nothing rather than answering wrongly.
 
 use crate::docs::Docs;
 use crate::expand;
@@ -111,6 +137,25 @@ trait Step {
     /// Asking for a number already passed gives the last answer back, so the
     /// same question may be put twice and the second time is free.
     fn seek(&mut self, id: Id) -> Option<Hit>;
+
+    /// The places this matched a document at, added to what is there already,
+    /// and whether it takes part in a position check at all.
+    ///
+    /// Only asked right after this answered the number, so what it adds is what
+    /// the last answer was found at. A word takes part and so does anything
+    /// built out of other things, which is where its places come from. A tag
+    /// value, a number, a negation, an optional and a wildcard stay out of it,
+    /// so they neither fail a position check nor count towards how many words
+    /// there are.
+    ///
+    /// Both halves of that are measured. A range beside two words under a slop
+    /// changes nothing about which documents answer, and neither does one tag
+    /// value, where two tag values written as a union answer nothing at all
+    /// under the same slop, because a union takes part and has no places to give.
+    fn places(&mut self, id: Id, into: &mut Vec<u32>) -> bool {
+        let _ = (id, into);
+        false
+    }
 }
 
 /// What one node of the tree turns into.
@@ -122,7 +167,22 @@ fn build<'a>(held: &'a Held, node: &'a Node, weight: f64) -> Box<dyn Step + 'a> 
         What::Wildcard => Box::new(Every::new(&held.docs)),
         What::Term(word) => Box::new(term(held, word, mask, weight)),
         What::Union(list) => Box::new(Any::new(under(held, list, weight), true)),
-        What::Intersect(list) => Box::new(All::new(under(held, list, weight))),
+        What::Intersect(list) => {
+            let under = under(held, list, weight);
+            // A slop of less than nothing is no limit at all, so an intersection
+            // with one and no order asked for is an ordinary intersection and
+            // does not go looking for places it will not read.
+            let slop = node.slop.unwrap_or(-1);
+            if slop >= 0 || node.inorder {
+                Box::new(Near::new(under, slop, node.inorder))
+            } else {
+                Box::new(All::new(under))
+            }
+        }
+        // Measured: the slop and the order a client hangs on a phrase are
+        // printed back and change nothing, so a phrase is a run in order
+        // whatever was asked of it.
+        What::Exact(list) => Box::new(Near::new(under(held, list, weight), 0, true)),
         What::Not(child) => Box::new(Unless {
             docs: &held.docs,
             under: build(held, child, weight),
@@ -153,7 +213,7 @@ fn build<'a>(held: &'a Held, node: &'a Node, weight: f64) -> Box<dyn Step + 'a> 
         What::Numeric(range) => Box::new(numbers(held, range)),
         What::Tag(field, list) => tagged(held, field, list, weight),
         // Measured against nothing yet, so they answer nothing.
-        What::Exact(_) | What::Geo(_) | What::Vector(_) => Box::new(Never),
+        What::Geo(_) | What::Vector(_) => Box::new(Never),
     }
 }
 
@@ -228,10 +288,17 @@ fn tagged<'a>(held: &'a Held, field: &[u8], list: &'a [Node], weight: f64) -> Bo
     let Some(tags) = held.values(field) else {
         return Box::new(Never);
     };
-    let under = list
+    let mut under: Vec<Box<dyn Step + 'a>> = list
         .iter()
         .map(|node| value(held, tags, node, weight))
         .collect();
+    // One value is that value and not a union of one, which is measured through
+    // a position check: `(@g:{aa} alpha)=>{$slop:0}` answers where
+    // `(@g:{aa|bb} alpha)=>{$slop:0}` answers nothing, because one value stays
+    // out of the check and a union takes part in it with no places to give.
+    if under.len() == 1 {
+        return under.pop().unwrap_or_else(|| Box::new(Never));
+    }
     Box::new(Any::new(under, true))
 }
 
@@ -337,6 +404,9 @@ struct One<'a> {
     df: u32,
     /// The answer last given, for giving it again.
     at: Option<Hit>,
+    /// Room for the places of one document, which a reader hands back into a
+    /// buffer of its own rather than onto the end of somebody else's.
+    room: Vec<u32>,
 }
 
 impl<'a> One<'a> {
@@ -348,6 +418,7 @@ impl<'a> One<'a> {
             weight,
             df: posts.map_or(0, Posts::len),
             at: None,
+            room: Vec::new(),
         }
     }
 }
@@ -371,6 +442,16 @@ impl Step for One<'_> {
             }
             want = post.id.checked_add(1)?;
         }
+    }
+
+    fn places(&mut self, id: Id, into: &mut Vec<u32>) -> bool {
+        if self.at.as_ref().is_some_and(|hit| hit.id == id)
+            && let Some(reader) = self.reader.as_ref()
+        {
+            reader.places(&mut self.room);
+            into.extend_from_slice(&self.room);
+        }
+        true
     }
 }
 
@@ -469,6 +550,20 @@ impl Step for Any<'_> {
         };
         Some(Hit { id, found })
     }
+
+    /// Every branch that answered this document, whichever one was scored.
+    ///
+    /// A word and the stem it came from are two branches of one union and a
+    /// phrase counts the places of both, so this is the whole union and not the
+    /// branch a score was taken from.
+    fn places(&mut self, id: Id, into: &mut Vec<u32>) -> bool {
+        for child in &mut self.under {
+            if child.seek(id).is_some_and(|hit| hit.id == id) {
+                child.places(id, into);
+            }
+        }
+        true
+    }
 }
 
 /// All of these, which is what a space between two words means.
@@ -512,6 +607,185 @@ impl Step for All<'_> {
             }
         }
     }
+
+    fn places(&mut self, id: Id, into: &mut Vec<u32>) -> bool {
+        for child in &mut self.under {
+            child.places(id, into);
+        }
+        true
+    }
+}
+
+/// All of these, near enough to each other, which is what a phrase is and what
+/// a slop asks for.
+struct Near<'a> {
+    under: Vec<Box<dyn Step + 'a>>,
+    /// How much room there is beyond a run, where less than nothing is no limit
+    /// at all and only the order is being asked for.
+    slop: i64,
+    /// Whether the places have to climb, which they may do without moving.
+    inorder: bool,
+    /// Where each word that takes part was found, kept between documents so the
+    /// room is taken once rather than per document.
+    at: Vec<Vec<u32>>,
+    /// The answer last given, for giving it again.
+    last: Option<Hit>,
+}
+
+impl<'a> Near<'a> {
+    fn new(under: Vec<Box<dyn Step + 'a>>, slop: i64, inorder: bool) -> Near<'a> {
+        Near {
+            under,
+            slop,
+            inorder,
+            at: Vec::new(),
+            last: None,
+        }
+    }
+
+    /// Whether the words of this document sit close enough together.
+    fn close(&mut self, id: Id) -> bool {
+        self.at.clear();
+        for child in &mut self.under {
+            let mut mine = Vec::new();
+            if child.places(id, &mut mine) {
+                // A union hands over the places of every branch that answered,
+                // so they arrive in branch order and a word and its stem hand
+                // over the same place twice.
+                mine.sort_unstable();
+                mine.dedup();
+                self.at.push(mine);
+            }
+        }
+        close(&self.at, self.slop, self.inorder)
+    }
+}
+
+impl Step for Near<'_> {
+    fn seek(&mut self, id: Id) -> Option<Hit> {
+        if let Some(hit) = &self.last
+            && hit.id >= id
+        {
+            return Some(hit.clone());
+        }
+        if self.under.is_empty() {
+            return None;
+        }
+        let mut want = id;
+        loop {
+            let mut found = Vec::with_capacity(self.under.len());
+            let mut past = None;
+            for child in &mut self.under {
+                let hit = child.seek(want)?;
+                if hit.id != want {
+                    past = Some(hit.id);
+                    break;
+                }
+                found.push(hit.found);
+            }
+            if let Some(at) = past {
+                want = at;
+                continue;
+            }
+            if self.close(want) {
+                let hit = Hit {
+                    id: want,
+                    found: Found::All(found),
+                };
+                self.last = Some(hit.clone());
+                return Some(hit);
+            }
+            // Everybody is here and they are too far apart, so the next document
+            // to try is the one after this and not the one after anybody's list.
+            want = want.checked_add(1)?;
+        }
+    }
+
+    fn places(&mut self, id: Id, into: &mut Vec<u32>) -> bool {
+        for child in &mut self.under {
+            child.places(id, into);
+        }
+        true
+    }
+}
+
+/// Whether one place can be given to each of these so that they sit close
+/// enough together.
+///
+/// The measured rule, on 8.10.1. Fewer than two words are always close enough,
+/// whatever they are and wherever they are, which is why a phrase of one word is
+/// that word. Otherwise the room is the slop plus one less than the number of
+/// words, so a phrase of three words spans three places and a slop of two spans
+/// five. In order the places may repeat, and in any order they may not all be
+/// the same place, which is the whole of the difference between the two.
+fn close(at: &[Vec<u32>], slop: i64, inorder: bool) -> bool {
+    if at.len() < 2 {
+        return true;
+    }
+    // A slop of less than nothing is no room limit at all, so only the order is
+    // being asked for and the words may be as far apart as they like.
+    let room = (slop >= 0)
+        .then(|| slop.checked_add(at.len() as i64 - 1).unwrap_or(i64::MAX))
+        .and_then(|room| u32::try_from(room).ok());
+    if inorder {
+        return climbing(at, room);
+    }
+    // No order and no limit is an ordinary intersection, which everybody here
+    // has already answered.
+    room.is_none_or(|room| window(at, room))
+}
+
+/// Whether the places can be made to climb, within the room there is.
+///
+/// Greedy from each place the first word was found at: the smallest place of the
+/// next word that is not behind where the last one landed is the best one to
+/// take, because taking a later one only makes the run longer.
+fn climbing(at: &[Vec<u32>], room: Option<u32>) -> bool {
+    for first in &at[0] {
+        let mut last = *first;
+        let mut fits = true;
+        for list in &at[1..] {
+            let Some(next) = list[list.partition_point(|place| *place < last)..].first() else {
+                fits = false;
+                break;
+            };
+            last = *next;
+        }
+        if fits && room.is_none_or(|room| last - first <= room) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Whether the places fit inside a window of this much, in any order, without
+/// every word standing on the same place.
+///
+/// Every window worth trying starts at a place somebody was found at, so this
+/// tries each of those in turn and asks whether everybody has something inside
+/// it. The two places rule falls out of the same walk: a window holding one
+/// place and nothing else can only be answered by everybody standing on it.
+fn window(at: &[Vec<u32>], room: u32) -> bool {
+    for list in at {
+        for start in list {
+            let stop = start.saturating_add(room);
+            let mut every = true;
+            let mut two = false;
+            for other in at {
+                let inside = &other[other.partition_point(|place| place < start)..];
+                let inside = &inside[..inside.partition_point(|place| *place <= stop)];
+                if inside.is_empty() {
+                    every = false;
+                    break;
+                }
+                two |= inside.iter().any(|place| place != start);
+            }
+            if every && two {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// None of these, which is a walk over the documents asking each one.
@@ -616,6 +890,27 @@ mod tests {
                 .expect("a document that indexes");
         }
         index
+    }
+
+    /// The keys a query answers under the second dialect, which is the one an
+    /// attribute like `=>{$slop:0}` is read under.
+    fn near(index: &Index, query: &[u8]) -> Vec<Vec<u8>> {
+        let ask = Ask {
+            dialect: 2,
+            ..Ask::default()
+        };
+        let node = parse(query, index, &ask).expect("a query that parses");
+        run(&index.held, &node)
+            .into_iter()
+            .map(|hit| {
+                index
+                    .held
+                    .docs
+                    .key(hit.id)
+                    .expect("a hit is a live document")
+                    .to_vec()
+            })
+            .collect()
     }
 
     /// The keys a query answers, in the order the walk gives them.
@@ -900,5 +1195,229 @@ mod tests {
         assert!(keys(&index, b"*").is_empty());
         assert!(keys(&index, b"-aa").is_empty());
         assert_eq!(Facts::new(0, 0).average(), 0.0);
+    }
+
+    /// The corpus the phrase rule was measured on, nine documents over one text
+    /// field with no stemming, so a word is only ever itself.
+    fn spaced() -> Index {
+        plain(&[
+            (b"r:1", b"alpha beta"),
+            (b"r:2", b"alpha zulu alpha beta"),
+            (b"r:3", b"beta alpha gamma"),
+            (b"r:4", b"alpha zulu beta zulu gamma"),
+            (b"r:5", b"alpha beta gamma"),
+            (b"r:6", b"gamma beta alpha"),
+            (b"r:7", b"alpha"),
+            (b"r:8", b"beta alpha"),
+            (b"r:9", b"alpha zulu beta"),
+        ])
+    }
+
+    /// A phrase is the words in a run and nothing between them, which is every
+    /// document holding `alpha` with `beta` straight after it and no others.
+    ///
+    /// Measured on 8.10.1 over the same nine documents.
+    #[test]
+    fn a_phrase_answers_the_words_in_a_run() {
+        let index = spaced();
+        assert_eq!(near(&index, b"\"alpha beta\""), [b"r:1", b"r:2", b"r:5"]);
+        assert_eq!(near(&index, b"\"alpha zulu\""), [b"r:2", b"r:4", b"r:9"]);
+        assert_eq!(near(&index, b"\"alpha beta gamma\""), [b"r:5".to_vec()]);
+        assert!(near(&index, b"\"alpha beta alpha\"").is_empty());
+        assert!(near(&index, b"\"beta alpha beta\"").is_empty());
+    }
+
+    /// Two words of a phrase may stand on the same place, so a phrase of one
+    /// word written twice answers every document holding it once.
+    ///
+    /// This is the part of the rule nobody would guess and it is measured: the
+    /// nine documents all answer `"alpha alpha"`, and the five holding a `beta`
+    /// after an `alpha` answer `"alpha alpha beta"`.
+    #[test]
+    fn a_phrase_lets_two_words_stand_on_one_place() {
+        let index = spaced();
+        assert_eq!(near(&index, b"\"alpha alpha\"").len(), 9);
+        assert_eq!(
+            near(&index, b"\"alpha alpha beta\""),
+            [b"r:1", b"r:2", b"r:4", b"r:5", b"r:9"]
+        );
+    }
+
+    /// A slop is how much room there is beyond the run, and in any order the
+    /// words may not all stand on one place.
+    ///
+    /// Measured: `alpha beta` under a slop of nothing answers the six documents
+    /// holding the two words next to each other either way round, a slop of one
+    /// adds the two holding them a word apart, and `alpha alpha` under a slop
+    /// answers only the one document holding the word twice.
+    #[test]
+    fn a_slop_is_room_and_any_order_wants_two_places() {
+        let index = spaced();
+        assert_eq!(
+            near(&index, b"(alpha beta)=>{$slop:0}"),
+            [b"r:1", b"r:2", b"r:3", b"r:5", b"r:6", b"r:8"]
+        );
+        assert_eq!(
+            near(&index, b"(alpha beta)=>{$slop:1}"),
+            [
+                b"r:1", b"r:2", b"r:3", b"r:4", b"r:5", b"r:6", b"r:8", b"r:9"
+            ]
+        );
+        assert_eq!(near(&index, b"(alpha alpha)=>{$slop:1}"), [b"r:2".to_vec()]);
+        assert_eq!(
+            near(&index, b"(alpha beta gamma)=>{$slop:2}"),
+            [b"r:3", b"r:4", b"r:5", b"r:6"]
+        );
+    }
+
+    /// In order the places have to climb, and asking for the order without a
+    /// slop asks for nothing else.
+    ///
+    /// Measured: `alpha gamma` in order answers the three documents holding a
+    /// gamma after an alpha however far away, where the same query without the
+    /// order also answers the one holding them the other way round.
+    #[test]
+    fn in_order_with_no_slop_is_the_order_and_nothing_else() {
+        let index = spaced();
+        assert_eq!(
+            near(&index, b"(alpha gamma)=>{$inorder:true}"),
+            [b"r:3", b"r:4", b"r:5"]
+        );
+        assert_eq!(
+            near(&index, b"alpha gamma"),
+            [b"r:3", b"r:4", b"r:5", b"r:6"]
+        );
+        assert_eq!(
+            near(&index, b"(alpha beta)=>{$slop:0;$inorder:true}"),
+            [b"r:1", b"r:2", b"r:5"]
+        );
+        assert_eq!(
+            near(&index, b"(alpha beta)=>{$slop:1;$inorder:true}"),
+            [b"r:1", b"r:2", b"r:4", b"r:5", b"r:9"]
+        );
+    }
+
+    /// One word at controlled distances, which is what pins the threshold down.
+    fn apart() -> Index {
+        plain(&[
+            (b"s:1", b"alpha"),
+            (b"s:2", b"alpha alpha"),
+            (b"s:3", b"alpha zulu alpha"),
+            (b"s:4", b"alpha zulu zulu alpha"),
+            (b"s:5", b"alpha alpha alpha"),
+            (b"s:6", b"alpha zulu alpha zulu alpha"),
+            (b"s:7", b"alpha zulu zulu zulu alpha"),
+        ])
+    }
+
+    /// The room is the slop plus one less than the number of words, which is
+    /// the whole of the threshold and is measured a step at a time.
+    ///
+    /// Two alphas reach two places apart at a slop of one and four apart at a
+    /// slop of three, and three alphas reach a document holding them two apart
+    /// at a slop of nothing, because the third word buys another place of room.
+    #[test]
+    fn the_room_is_the_slop_plus_one_less_than_the_words() {
+        let index = apart();
+        assert_eq!(near(&index, b"(alpha alpha)=>{$slop:0}"), [b"s:2", b"s:5"]);
+        assert_eq!(
+            near(&index, b"(alpha alpha)=>{$slop:1}"),
+            [b"s:2", b"s:3", b"s:5", b"s:6"]
+        );
+        assert_eq!(
+            near(&index, b"(alpha alpha)=>{$slop:2}"),
+            [b"s:2", b"s:3", b"s:4", b"s:5", b"s:6"]
+        );
+        assert_eq!(
+            near(&index, b"(alpha alpha)=>{$slop:3}"),
+            [b"s:2", b"s:3", b"s:4", b"s:5", b"s:6", b"s:7"]
+        );
+        assert_eq!(
+            near(&index, b"(alpha alpha alpha)=>{$slop:0}"),
+            [b"s:2", b"s:3", b"s:5", b"s:6"]
+        );
+        assert_eq!(near(&index, b"(alpha alpha alpha)=>{$slop:2}").len(), 6);
+    }
+
+    /// In order the same query answers every document holding the word at all,
+    /// because the places may repeat, and that holds at any slop.
+    #[test]
+    fn in_order_lets_the_places_repeat_at_any_slop() {
+        let index = apart();
+        assert_eq!(
+            near(&index, b"(alpha alpha)=>{$slop:0;$inorder:true}").len(),
+            7
+        );
+        assert_eq!(
+            near(&index, b"(alpha alpha alpha)=>{$slop:0;$inorder:true}").len(),
+            7
+        );
+    }
+
+    /// What takes part in a position check and what stays out of it.
+    ///
+    /// Measured on an index of two documents, `alpha zulu beta` tagged `aa` and
+    /// `alpha beta` tagged `bb`. A range, a negation and one tag value change
+    /// nothing about which documents answer, and two tag values written as a
+    /// union answer nothing at all, because a union takes part and has no places
+    /// of its own to give.
+    #[test]
+    fn a_range_and_one_tag_stay_out_of_a_position_check() {
+        let index = indexed(&[
+            (
+                b"u:1",
+                &[
+                    (b"t".as_slice(), b"alpha zulu beta".as_slice()),
+                    (b"g", b"aa"),
+                    (b"n", b"5"),
+                ][..],
+            ),
+            (
+                b"u:2",
+                &[
+                    (b"t".as_slice(), b"alpha beta".as_slice()),
+                    (b"g", b"bb"),
+                    (b"n", b"7"),
+                ][..],
+            ),
+        ]);
+        assert_eq!(near(&index, b"(alpha beta)=>{$slop:0}"), [b"u:2".to_vec()]);
+        assert_eq!(
+            near(&index, b"(@n:[1 10] alpha beta)=>{$slop:0}"),
+            [b"u:2".to_vec()]
+        );
+        assert_eq!(
+            near(&index, b"(@g:{aa} alpha)=>{$slop:0}"),
+            [b"u:1".to_vec()]
+        );
+        assert!(near(&index, b"(@g:{aa} alpha beta)=>{$slop:0}").is_empty());
+        assert!(near(&index, b"(@g:{aa|bb} alpha)=>{$slop:0}").is_empty());
+        assert_eq!(near(&index, b"(alpha -zulu)=>{$slop:0}"), [b"u:2".to_vec()]);
+        assert_eq!(near(&index, b"(alpha ~zulu)=>{$slop:0}"), [b"u:1", b"u:2"]);
+    }
+
+    /// A word that stands for several terms brings the places of all of them,
+    /// which is measured through a prefix and through a union.
+    #[test]
+    fn an_expansion_brings_the_places_of_every_term_it_stands_for() {
+        let index = indexed(&[
+            (
+                b"u:1",
+                &[
+                    (b"t".as_slice(), b"alpha zulu beta".as_slice()),
+                    (b"g", b"aa"),
+                ][..],
+            ),
+            (
+                b"u:2",
+                &[(b"t".as_slice(), b"alpha beta".as_slice()), (b"g", b"bb")][..],
+            ),
+        ]);
+        assert_eq!(near(&index, b"(alp* beta)=>{$slop:0}"), [b"u:2".to_vec()]);
+        assert_eq!(near(&index, b"(alp* zulu)=>{$slop:0}"), [b"u:1".to_vec()]);
+        assert_eq!(
+            near(&index, b"((alpha|gamma) beta)=>{$slop:0}"),
+            [b"u:2".to_vec()]
+        );
     }
 }

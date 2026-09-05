@@ -1,4 +1,4 @@
-//! Sixty two queries put to an 8.10.1 and put again to the walk here.
+//! A hundred and eleven queries put to an 8.10.1 and put again to the walk here.
 //!
 //! The corpus is twelve documents over two text fields, a tag and a number,
 //! written into a real server and into an index built the same way, and every
@@ -7,9 +7,10 @@
 //! the order the two of them answer in.
 //!
 //! Regenerating it is a `FT.CREATE` with this schema, twelve `HSET`s with these
-//! values and an `FT.SEARCH ... WITHSCORES NOCONTENT LIMIT 0 100` per line, so
-//! nothing in the file is written by hand and nothing in it is a guess about
-//! what the other side would do.
+//! values and an `FT.SEARCH ... WITHSCORES NOCONTENT LIMIT 0 100 DIALECT 2` per
+//! line, so nothing in the file is written by hand and nothing in it is a guess
+//! about what the other side would do. The second dialect is the one asked for
+//! because a phrase only reads the same way under it.
 
 use yo_search::query::{Ask, parse};
 use yo_search::score::Scorer;
@@ -65,7 +66,11 @@ fn corpus() -> Index {
 
 /// What this build answers one query with, as the file writes it.
 fn answer(index: &Index, query: &str) -> String {
-    let node = parse(query.as_bytes(), index, &Ask::default()).expect("a query that parses");
+    let ask = Ask {
+        dialect: 2,
+        ..Ask::default()
+    };
+    let node = parse(query.as_bytes(), index, &ask).expect("a query that parses");
     let facts = index.held.facts();
     let mut pairs: Vec<String> = walk::run(&index.held, &node)
         .into_iter()
@@ -119,6 +124,6 @@ fn every_query_answers_what_a_real_server_answered() {
             wrong.push(format!("{query}\n  want {want}\n  got  {got}"));
         }
     }
-    assert_eq!(checked, 62, "the file lost a query");
+    assert_eq!(checked, 111, "the file lost a query");
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
 }
