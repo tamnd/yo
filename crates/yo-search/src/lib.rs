@@ -59,17 +59,27 @@
 //! they would not read, which is the `Index Errors` block `FT.INFO` answers
 //! with.
 //!
+//! [`walk`] is the other direction: a parsed tree goes in and every document
+//! that answers it comes out, in number order and each with the shape of how it
+//! answered, which is what a scorer turns into a number. [`expand`] is the part
+//! of that which is not one term but many, a prefix, a suffix, an infix, a
+//! pattern or a fuzzy word standing for every term in the dictionary it covers.
+//!
 //! # What is not here yet
 //!
-//! The queries. A hash command now reaches all of this and `FT.INFO` reports
-//! what it found, so an index on a running server fills up as keys are written,
-//! but nothing answers `FT.SEARCH` yet and the lists are only readable from
-//! Rust.
+//! `FT.SEARCH` itself. A query can be parsed, walked and scored from Rust and
+//! the answers agree with a real server's over sixty two queries on the same
+//! corpus, but nothing on the wire asks for them yet, so a client still cannot
+//! search.
 //!
-//! The other gaps are on the way in. `FILTER` is not parsed, so an index
-//! carrying one follows every key its prefixes cover. The keyspace commands are
-//! not wired, so `DEL`, `RENAME`, `COPY` and a key that expires leave a
-//! document behind, where a hash command that empties a key does not.
+//! Three kinds of node are not walked. A phrase needs the places two terms were
+//! found at and the rules for how far apart they may be. A geo filter and a
+//! vector query need fields the document reader does not read yet, so there is
+//! nothing in the index for them to walk either way. All three answer nothing
+//! rather than answering wrongly.
+//!
+//! `FILTER` is not parsed, so an index carrying one follows every key its
+//! prefixes cover.
 //!
 //! # Why the registry is per server
 //!
@@ -83,6 +93,7 @@
 
 pub mod docs;
 pub mod english;
+pub mod expand;
 pub mod field;
 pub mod follow;
 pub mod held;
@@ -95,6 +106,7 @@ pub mod score;
 pub mod tags;
 pub mod text;
 pub mod token;
+pub mod walk;
 pub mod words;
 
 pub use english::English;
