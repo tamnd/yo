@@ -140,6 +140,13 @@ mod tests {
     /// In the same test as the one below rather than on its own, because both
     /// read one process wide static and two tests reading it in an order nobody
     /// chose is a flake waiting to happen.
+    ///
+    /// Not under Miri, which has no signals to install a handler for and stops
+    /// the run on the `signal` call rather than answering it. There is nothing
+    /// to work around there either: an interpreter with no signals cannot be
+    /// made to deliver one, and the handler is three lines of atomic store with
+    /// no memory for the interpreter to have an opinion about.
+    #[cfg_attr(miri, ignore = "no signals under Miri")]
     #[test]
     fn a_term_sets_the_flag_and_nothing_else_does() {
         assert!(!stopped(), "nothing has been signalled yet");

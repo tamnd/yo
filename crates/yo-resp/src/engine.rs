@@ -755,11 +755,23 @@ mod tests {
     }
 
     /// The point of the whole exercise: two engines, two threads, one server.
+    ///
+    /// The server is told it will have two threads before either starts, the
+    /// way `yodb serve` tells it. Without that it has one set of counters and
+    /// both threads land on it, which is the wrap round `Server::mine_at`
+    /// documents and which loses counts: a bump is a load and a store rather
+    /// than a fetch and add, because the fast path is one thread writing its
+    /// own set and paying for a locked instruction on every command to make a
+    /// shared set exact would be paying it on the path that is never shared.
+    /// Miri found this by running the two threads far enough apart to lose one,
+    /// which a real machine does rarely enough to have passed here for months.
     #[test]
     fn two_threads_write_into_one_server() {
         const EACH: usize = 200;
 
-        let first = Wire::new(Recorder::new());
+        let mut server = Server::new();
+        server.set_threads(2);
+        let first = Wire::with_server(server, Recorder::new());
         let second = Wire::over(first.shared(), Recorder::new());
         let server = first.shared();
 
