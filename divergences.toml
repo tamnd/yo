@@ -494,8 +494,36 @@ spec = "09 section 5"
 
 [[divergence]]
 id = "D-67"
-title = "Six FT.AGGREGATE pipeline steps are refused rather than read"
-reason = "LOAD is the only step of the pipeline built so far. GROUPBY with its REDUCE functions, SORTBY with MAX, APPLY, FILTER, WITHCURSOR and EXPLAINSCORE are read as unknown arguments and answer the line a real server answers for a word nobody knows, so a client learns the step is not there rather than getting a reply that quietly dropped it. Everything either side of the pipeline is exact: the query is the same parser a search uses, the rows come back in ascending document number because nothing sorts them, the properties follow the names and the order the LOAD list gave them, ADDSCORES writes a __score to twelve significant digits where WITHSCORES writes a score to seventeen, and the count at the front of the reply follows the four cases that were measured over a full offset by count sweep on both protocols. APPLY and FILTER both need an expression language that nothing else in the server has and GROUPBY needs the properties to be values rather than the bytes off a hash, so those two are the real work and the rest follow from them."
+title = "Five FT.AGGREGATE pipeline steps are refused rather than read"
+reason = "LOAD and GROUPBY with all twelve of its REDUCE functions are built. SORTBY with MAX, APPLY, FILTER, WITHCURSOR and EXPLAINSCORE are read as unknown arguments and answer the line a real server answers for a word nobody knows, so a client learns the step is not there rather than getting a reply that quietly dropped it. Everything either side of the pipeline is exact: the query is the same parser a search uses, an ungrouped answer comes back in ascending document number because nothing sorts it, the properties follow the names and the order the LOAD list gave them, ADDSCORES writes a __score to twelve significant digits where WITHSCORES writes a score to seventeen, and the count at the front of the reply follows the four cases that were measured over a full offset by count sweep on both protocols. APPLY and FILTER both need an expression language that nothing else in the server has, and SORTBY and WITHCURSOR follow from it."
 status = "until"
 resolved_by = "M8"
+spec = "09 section 5"
+
+[[divergence]]
+id = "D-68"
+title = "FT.AGGREGATE groups come back in the order they were first seen"
+reason = "A real server hands the groups back in the order its own hash table happens to hold them, and that order is not a property of the data. Two Redis 8.10.1 processes holding the same seven documents answer the same five groups in different orders, because the table is seeded per process, and the same server answers a different order after a restart. The values a TOLIST or a COUNT_DISTINCT collected have the same property and so does the value a FIRST_VALUE with no BY picks, because all three read out of that table. Fitting the observed orders to XXH64, XXH32 and CRC32 with khash style linear and quadratic probing at table sizes 8, 16, 32 and 64 matched none of them, which is what a per process seed looks like from outside. This side hands the groups back in the order the documents were walked in, which is ascending document number, so the same query over the same data answers the same rows in the same order every time. A client that wants a particular order has to ask for one, which is what SORTBY is for, and that is true against a real server too."
+status = "permanent"
+spec = "09 section 5"
+
+[[divergence]]
+id = "D-69"
+title = "COUNT_DISTINCTISH counts exactly rather than estimating"
+reason = "The reducer exists on a real server because counting distinct values exactly costs memory that grows with the number of them, so it keeps a HyperLogLog sketch instead and answers an estimate with about a one percent error. This side keeps the set and answers the exact count, which is the same number for every group small enough for the difference to matter and a better number for the ones where it does. The cost is the memory the sketch was there to save, which is bounded here by the aggregation being a single pass over one query's answer rather than a running total. A sketch is the right thing to build once an aggregation can run over a cursor and hold state between calls, and it is a change of number and not of shape, so a client reading the field sees a count either way."
+status = "permanent"
+spec = "09 section 5"
+
+[[divergence]]
+id = "D-70"
+title = "A FIRST_VALUE whose ordering key is missing sorts last here"
+reason = "REDUCE FIRST_VALUE @v BY @k picks the value from the document that sorts first by @k. A real server compares two documents by reading both keys and treating a missing one as neither smaller nor larger than a value, so a group where one document has no @k answers whichever document the sort walk happened to reach first: over a group of two where the first document has no @k, the reference answers that document and not the one that has a key to sort by. This side treats a missing key as sorting last, so it only wins a group where nothing holds the key at all, and the answer is the same whatever order the group was walked in. Every group where every document holds the key agrees exactly, including the rule that decides between comparing as numbers and comparing as bytes, which is the field's type and not the value's shape."
+status = "permanent"
+spec = "09 section 5"
+
+[[divergence]]
+id = "D-71"
+title = "REDUCE QUANTILE with one argument answers an error rather than crashing"
+reason = "FT.AGGREGATE i * GROUPBY 0 REDUCE QUANTILE 1 @n takes Redis 8.10.1 down with a signal 11 on address 0x20, which is the fraction argument being read without checking that it is there. It is that one arity and no other: two arguments and three arguments both work and nought answers a clean line. Reproduced twice on 8.10.1 arm64 and under any GROUPBY, not only GROUPBY 0. This side answers Missing arguments for QUANTILE, which is the line the reducer with no arguments at all answers on both servers. Nothing was filed upstream."
+status = "permanent"
 spec = "09 section 5"
