@@ -32,6 +32,20 @@
 //! there leaves the document alone. So the rule is not "this command was a
 //! write", it is "the value under this key is not what it was".
 //!
+//! # A rename is not a write
+//!
+//! Every other way a followed key changes reads it again, and `RENAME` inside
+//! one prefix does not. The document moves across to the new name keeping the
+//! number it had, nothing is tokenized twice and `max_doc_id` does not move,
+//! which is measured: the id the document had before the rename still answers
+//! with it afterwards. A rename that leaves the prefix erases, one that arrives
+//! in it reads the key, and one that stays inside moves.
+//!
+//! A real server renaming onto a key that already had a document leaves the old
+//! one where it was, so two live numbers answer the same key and `num_docs` is
+//! one too many. This build drops it, which is D-64 and is the one place here
+//! where following the reference would mean copying a leak.
+//!
 //! # The two ways of emptying a hash are not the same
 //!
 //! A key that ends up with no fields left is either a refusal or a document
@@ -218,6 +232,14 @@ impl Index {
         }
     }
 
+    /// Moves a document from one key to another without reading either of them.
+    ///
+    /// `false` when this index had nothing under `from`, which is how the
+    /// caller hears that the target has to be read instead.
+    pub fn moved(&mut self, from: &[u8], to: &[u8]) -> bool {
+        self.held.docs.rename(from, to).is_some()
+    }
+
     /// Counts a key that was not there when this index went to read it.
     ///
     /// Against the index and against no field, since there is no field in the
@@ -277,6 +299,63 @@ impl Registry {
             }
             index.erase(key);
         }
+    }
+
+    /// Tells every index that one key became another.
+    ///
+    /// Not the same as erasing one and writing the other, which is the whole
+    /// reason it is a call of its own. A rename inside a prefix an index
+    /// follows moves the document across with the number it had, so nothing is
+    /// read and nothing is tokenized again.
+    ///
+    /// `fields` is what is under the target now, and the caller reads it back
+    /// only when [`Registry::rereads`] said some index was going to want it.
+    /// Handing over nothing when it said yes erases the target rather than
+    /// indexing it, so the two calls belong together.
+    pub fn renamed(
+        &mut self,
+        source: Source,
+        from: &[u8],
+        to: &[u8],
+        fields: Option<&[(&[u8], &[u8])]>,
+    ) {
+        let (indexes, english) = self.reading();
+        for index in indexes {
+            // The key left this index's ground, so its document goes with it.
+            if !index.follows(source, to) {
+                index.erase(from);
+                continue;
+            }
+            if index.follows(source, from) && index.moved(from, to) {
+                continue;
+            }
+            // Either the key arrived from outside the prefix or there was no
+            // document under it, and either way the target is a fresh reading.
+            index.erase(from);
+            match fields {
+                Some(fields) => {
+                    index.wrote(english, to, fields);
+                }
+                None => {
+                    index.erase(to);
+                }
+            }
+        }
+    }
+
+    /// Whether a rename means going and reading the target back.
+    ///
+    /// No for the ordinary case, which is a rename from one covered key to
+    /// another, since that moves a document this already holds. Yes when the
+    /// key is arriving from outside a prefix, and yes when it is covered and
+    /// has no document, because a key that failed to index once should get
+    /// another go rather than staying out on the strength of the old failure.
+    #[must_use]
+    pub fn rereads(&self, source: Source, from: &[u8], to: &[u8]) -> bool {
+        self.iter().any(|index| {
+            index.follows(source, to)
+                && (!index.follows(source, from) || index.held.docs.id(from).is_none())
+        })
     }
 
     /// Whether reading this key back is worth doing at all.
@@ -628,6 +707,88 @@ mod tests {
             r.named(b"ix").map(|i| i.trouble.whole().failures()),
             Some(1)
         );
+    }
+
+    /// A rename inside the prefix moves the document across with the number it
+    /// had, and nothing is read to do it.
+    #[test]
+    fn a_rename_inside_the_prefix_moves_the_document() {
+        let mut r = registry(on(b"p:", vec![text()]));
+        r.wrote(Source::Hash, b"p:1", &[(&b"t"[..], &b"alpha"[..])]);
+        assert!(!r.rereads(Source::Hash, b"p:1", b"p:2"));
+
+        r.renamed(Source::Hash, b"p:1", b"p:2", None);
+        let ix = r.named(b"ix").expect("the index is there");
+        assert_eq!(ix.held.docs.id(b"p:2"), Some(1));
+        assert_eq!(ix.held.docs.id(b"p:1"), None);
+        assert_eq!(ix.held.docs.len(), 1);
+        assert_eq!(ix.held.docs.last(), 1);
+    }
+
+    /// A rename out of the prefix takes the document away, and one into it
+    /// reads the key, which is the pair the caller has to ask about first.
+    #[test]
+    fn a_rename_across_the_prefix_erases_one_end_and_reads_the_other() {
+        let mut r = registry(on(b"p:", vec![text()]));
+        r.wrote(Source::Hash, b"p:1", &[(&b"t"[..], &b"alpha"[..])]);
+
+        // Out, where the target is nothing this index covers.
+        assert!(!r.rereads(Source::Hash, b"p:1", b"q:1"));
+        r.renamed(Source::Hash, b"p:1", b"q:1", None);
+        assert_eq!(r.named(b"ix").map(|i| i.held.docs.len()), Some(0));
+
+        // And back in, which is a key this index has never seen.
+        assert!(r.rereads(Source::Hash, b"q:1", b"p:1"));
+        r.renamed(
+            Source::Hash,
+            b"q:1",
+            b"p:1",
+            Some(&[(&b"t"[..], &b"alpha"[..])]),
+        );
+        let ix = r.named(b"ix").expect("the index is there");
+        assert_eq!(ix.held.docs.id(b"p:1"), Some(2));
+        assert_eq!(ix.held.docs.len(), 1);
+    }
+
+    /// A rename over a key that already had a document leaves one document and
+    /// not two, which is where this parts company with a real server.
+    #[test]
+    fn a_rename_over_a_document_leaves_one_of_them() {
+        let mut r = registry(on(b"p:", vec![text()]));
+        r.wrote(Source::Hash, b"p:1", &[(&b"t"[..], &b"alpha"[..])]);
+        r.wrote(Source::Hash, b"p:2", &[(&b"t"[..], &b"beta"[..])]);
+
+        r.renamed(Source::Hash, b"p:1", b"p:2", None);
+        let ix = r.named(b"ix").expect("the index is there");
+        assert_eq!(ix.held.docs.len(), 1);
+        assert_eq!(ix.held.docs.id(b"p:2"), Some(1));
+        assert_eq!(ix.held.docs.key(2), None);
+    }
+
+    /// A key inside the prefix with no document is read rather than moved, so a
+    /// value that would not index once gets another go when it is renamed.
+    #[test]
+    fn a_covered_key_with_no_document_is_read_again() {
+        let num = Field::new(b"n", Kind::Numeric);
+        let mut r = registry(on(b"p:", vec![num]));
+        r.wrote(Source::Hash, b"p:1", &[(&b"n"[..], &b"bad"[..])]);
+        assert_eq!(r.named(b"ix").map(|i| i.held.docs.len()), Some(0));
+
+        assert!(r.rereads(Source::Hash, b"p:1", b"p:2"));
+        r.renamed(
+            Source::Hash,
+            b"p:1",
+            b"p:2",
+            Some(&[(&b"n"[..], &b"7"[..])]),
+        );
+        let ix = r.named(b"ix").expect("the index is there");
+        assert_eq!(ix.held.docs.id(b"p:2"), Some(1));
+        assert_eq!(ix.trouble.whole().failures(), 1);
+
+        // And a target that turns out to hold nothing readable is erased.
+        assert!(r.rereads(Source::Hash, b"p:9", b"p:2"));
+        r.renamed(Source::Hash, b"p:9", b"p:2", None);
+        assert_eq!(r.named(b"ix").map(|i| i.held.docs.len()), Some(0));
     }
 
     /// An empty registry answers no to everything, which is what keeps the

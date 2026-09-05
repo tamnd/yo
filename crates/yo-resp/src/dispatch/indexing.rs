@@ -5,10 +5,12 @@
 //! database and the registry lives on the server. So the dispatcher is where
 //! the two meet, and this is that meeting.
 //!
-//! Two directions. [`changed`] is a key that has just been written, which is
+//! Three ways in. [`changed`] is a key that has just been written, which is
 //! read back out of the keyspace and handed to every index that follows it.
-//! [`scan`] is the other way round, an index that has just been made walking
-//! every key that was already there.
+//! [`touched`] is the same thing for the commands that name more than one key,
+//! which write down what they did rather than answering with it. [`scan`] is
+//! the other way round, an index that has just been made walking every key that
+//! was already there.
 //!
 //! # Why the key is read again
 //!
@@ -70,6 +72,14 @@ pub(super) enum Change {
     /// same key emptied by a deadline is not counted and does spend a number.
     /// Nobody would guess this and it is what a real server does.
     Taken,
+    /// A whole key was written rather than a field of one, which is the
+    /// keyspace group.
+    ///
+    /// The same as [`Change::Fields`] until the key is not a hash when the
+    /// indexes go to read it, and then it is simply erased. `COPY` over a
+    /// followed key with a string under the source leaves no document and
+    /// spends no number, where the same key emptied by a deadline spends one.
+    Key,
     /// One command that is two pieces of news, which is `HSETEX` with a
     /// deadline that has already passed.
     ///
@@ -99,6 +109,130 @@ impl Change {
             _ => 1,
         }
     }
+}
+
+/// What a keyspace command did to the keys it named.
+///
+/// A hash command is one key and one answer and these are not. `DEL a b c` is
+/// three keys, `COPY a b DB 1` writes into a database the connection is not on,
+/// and `RENAME` is two keys in one move and is not the same thing as erasing
+/// one and writing the other. So the commands in that group write down what
+/// they did as they go, and the dispatcher reads it back once the reply is
+/// written.
+///
+/// Nothing is written down on a server with no index on it, which is nearly
+/// every server, so `DEL` there is the command it always was.
+#[derive(Debug)]
+pub(super) struct Touched<'a> {
+    /// Whether any index is listening at all.
+    watching: bool,
+    /// What happened, in the order it happened.
+    news: Vec<News<'a>>,
+}
+
+/// One thing that happened to one key.
+#[derive(Debug, Clone, Copy)]
+enum News<'a> {
+    /// The key is not there any more, however it went.
+    Gone(&'a [u8]),
+    /// Something was put under it, and what that is has to be read to find out.
+    Wrote(&'a [u8]),
+    /// One key became another.
+    Renamed(&'a [u8], &'a [u8]),
+}
+
+impl<'a> Touched<'a> {
+    /// A list that collects nothing unless an index is watching.
+    pub(super) fn new(server: &Server) -> Touched<'a> {
+        Touched {
+            watching: server.search.lock().watching(),
+            news: Vec::new(),
+        }
+    }
+
+    /// A key that is not there any more.
+    pub(super) fn gone(&mut self, key: &'a [u8]) {
+        self.note(News::Gone(key));
+    }
+
+    /// A key that has something under it that nobody here has looked at.
+    pub(super) fn wrote(&mut self, key: &'a [u8]) {
+        self.note(News::Wrote(key));
+    }
+
+    /// A key that became another key.
+    pub(super) fn renamed(&mut self, from: &'a [u8], to: &'a [u8]) {
+        self.note(News::Renamed(from, to));
+    }
+
+    /// Keeps one piece of news, or drops it when nobody is listening.
+    fn note(&mut self, news: News<'a>) {
+        if self.watching {
+            self.news.push(news);
+        }
+    }
+}
+
+/// The database the keyspace group reads a key back from, whatever database the
+/// command that named it ran on.
+///
+/// A hash command reads the database it ran on and this does not, which is
+/// measured and is stranger than it sounds. `COPY p:1 p:2 DB 1` from database
+/// zero leaves nothing indexed and takes away whatever `p:2` had, because the
+/// indexes go and look for `p:2` on database zero and it is not there. The same
+/// copy the other way round, into database zero from database one, is indexed.
+/// So is a `RESTORE` on database zero, and the same `RESTORE` on database one
+/// is not.
+///
+/// It reads as a bug and it is at worst a shortcut: an index belongs to the
+/// database it was made on, `FT.CREATE` is refused anywhere but database zero,
+/// so an index reading database zero is an index reading its own database. The
+/// hash path is the odd one out rather than this.
+const INDEXED: usize = 0;
+
+/// Tells the indexes everything a keyspace command did.
+///
+/// After the reply, the same as [`changed`], and for the same reason: an index
+/// that cannot read a key is a number in `FT.INFO` and not an error a client
+/// hears about.
+pub(super) fn touched(server: &Server, touched: &Touched<'_>) {
+    for news in &touched.news {
+        match *news {
+            News::Gone(key) => server.search.lock().went(key),
+            News::Wrote(key) => round(server, INDEXED, key, Change::Key),
+            News::Renamed(from, to) => renamed(server, from, to),
+        }
+    }
+}
+
+/// One key that became another.
+///
+/// The ordinary case is a rename from one covered key to another, and it costs
+/// two questions and a move: the document is already held and the value under
+/// it did not change, so there is nothing to read and no number to spend. The
+/// key is only read back when it is arriving from outside a prefix or when the
+/// index had no document for it, which is what [`Registry::rereads`] answers.
+///
+/// [`Registry::rereads`]: yo_search::Registry::rereads
+fn renamed(server: &Server, from: &[u8], to: &[u8]) {
+    let reread = {
+        let search = server.search.lock();
+        if !search.watching() {
+            return;
+        }
+        search.rereads(Source::Hash, from, to)
+    };
+    // Read with the registry let go, the same order every other path here uses.
+    let doc = if reread {
+        read(&server.dbs[INDEXED], to)
+    } else {
+        None
+    };
+    let pairs = doc.as_ref().map(Document::pairs);
+    server
+        .search
+        .lock()
+        .renamed(Source::Hash, from, to, pairs.as_deref());
 }
 
 /// A hash lifted out of the keyspace so an index can be handed it.
@@ -209,6 +343,11 @@ fn round(server: &Server, db: usize, key: &[u8], change: Change) {
         // is no way to see the difference other than through `FT.INFO`, and it
         // is exactly what a real server reports.
         None if change == Change::Taken => search.vanished(Source::Hash, key),
+        // A keyspace command took the whole key or put something that is not a
+        // hash under it, and either way there is nothing to count and nothing
+        // to number. Only a hash command that emptied a key writes the document
+        // with nothing in it first.
+        None if change == Change::Key => search.went(key),
         None => {
             search.wrote(Source::Hash, key, &[]);
             search.went(key);

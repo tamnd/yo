@@ -112,6 +112,34 @@ impl Docs {
         Some(id)
     }
 
+    /// Moves a document to another key, keeping the number it has.
+    ///
+    /// The one thing that writes a document without giving it a new number, and
+    /// it is not an exception to the rule above so much as the rule not
+    /// applying: nothing was read, the same reading of the same value is now
+    /// under another name. That is what a real server does with a `RENAME`
+    /// inside a prefix an index follows, and it is worth having because the
+    /// alternative is reading a value nobody changed.
+    ///
+    /// Whatever the target had is dropped. A real server leaves it there, so
+    /// two live numbers end up answering the same key and its document count is
+    /// one too many, which is a leak rather than a behaviour and is D-64.
+    ///
+    /// `None` when there is nothing under `from`, and the target is left alone
+    /// in that case, because a caller that hears no has a key to read instead.
+    pub fn rename(&mut self, from: &[u8], to: &[u8]) -> Option<Id> {
+        let id = self.ids.remove(from)?;
+        if to != from {
+            self.remove(to);
+        }
+        let Some(Some(doc)) = self.slot_mut(id) else {
+            return None;
+        };
+        doc.key = to.into();
+        self.ids.insert(to.into(), id);
+        Some(id)
+    }
+
     /// Counts a term's frequency towards a document's length and its largest.
     ///
     /// Called once per term as a document is indexed, which is what makes
@@ -277,6 +305,37 @@ mod tests {
         assert_eq!(d.add(b"c", 1.0), 3);
         assert_eq!(d.len(), 2);
         assert_eq!(d.holes(), 1);
+    }
+
+    /// A rename keeps the number the document had, which is the one write that
+    /// does, and takes whatever the target had away with it.
+    #[test]
+    fn a_rename_keeps_the_number_and_drops_what_the_target_had() {
+        let mut d = Docs::new();
+        d.add(b"p:1", 1.0);
+        d.add(b"p:2", 1.0);
+        assert_eq!(d.rename(b"p:1", b"p:2"), Some(1));
+        assert_eq!(d.id(b"p:2"), Some(1));
+        assert_eq!(d.id(b"p:1"), None);
+        assert_eq!(d.key(1), Some(b"p:2".as_slice()));
+        assert_eq!(d.len(), 1);
+        assert!(d.gone(2));
+        // No number was handed out, so the next document still gets the third.
+        assert_eq!(d.last(), 2);
+        assert_eq!(d.add(b"p:3", 1.0), 3);
+    }
+
+    /// A key with nothing under it renames to nothing and leaves the target
+    /// where it was, and a key renamed to itself is still there afterwards.
+    #[test]
+    fn a_rename_of_nothing_leaves_the_target_alone() {
+        let mut d = Docs::new();
+        d.add(b"p:2", 1.0);
+        assert_eq!(d.rename(b"p:1", b"p:2"), None);
+        assert_eq!(d.id(b"p:2"), Some(1));
+        assert_eq!(d.rename(b"p:2", b"p:2"), Some(1));
+        assert_eq!(d.id(b"p:2"), Some(1));
+        assert_eq!(d.len(), 1);
     }
 
     /// A document's length is the sum of the frequencies put on it and its top
