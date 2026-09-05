@@ -9,8 +9,7 @@
 //! read back out of the keyspace and handed to every index that follows it.
 //! [`touched`] is the same thing for the commands that name more than one key,
 //! which write down what they did rather than answering with it. [`scan`] is
-//! the other way round, an index that has just been made walking every key that
-//! was already there.
+//! the other way round, one index walking every key that was already there.
 //!
 //! # Why the key is read again
 //!
@@ -44,6 +43,7 @@ use yo_kv::hash::Text;
 use yo_search::Source;
 
 use super::Server;
+use super::search::Fill;
 
 /// What a hash command left behind, in the terms a search index needs.
 ///
@@ -375,7 +375,14 @@ fn round(server: &Server, db: usize, key: &[u8], change: Change) {
     }
 }
 
-/// A fresh index reads every key that was already there.
+/// An index reads every key that was already there.
+///
+/// Two commands ask for this. `FT.CREATE` runs it over an index with nothing in
+/// it, which is the initial scan and is what `SKIPINITIALSCAN` on the create
+/// turns off. `FT.SYNUPDATE` runs it over an index that is already full, so
+/// every document in it is written again under a number it did not have before,
+/// which is what a real server does and is the only way a group added today
+/// reaches a document written yesterday.
 ///
 /// One database and not all of them, which is the odd half of a pair. An index
 /// follows a key by name across every database once it is running, so a `HSET`
@@ -390,9 +397,16 @@ fn round(server: &Server, db: usize, key: &[u8], change: Change) {
 /// the registry with a stripe held is the lock order a write does not use. So
 /// the names come out first and the prefixes are matched afterwards, which
 /// costs a list of the names in one database on a command nobody sends twice.
-pub(super) fn scan(server: &Server, db: usize, name: &[u8]) {
-    if !server.search.lock().scanning(name) {
-        return;
+pub(super) fn scan(server: &Server, db: usize, fill: &Fill<'_>) {
+    let name = fill.name;
+    {
+        let search = server.search.lock();
+        // A name that is not there has nothing to read, and the index's own
+        // flag only has a say when the caller says it does.
+        let there = search.named(name).is_some();
+        if !there || (fill.obeys && !search.scanning(name)) {
+            return;
+        }
     }
     let mut keys = Vec::new();
     server.dbs[db].keys(|key| keys.push(key.to_vec()));

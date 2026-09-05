@@ -68,6 +68,7 @@ use crate::nums::Nums;
 use crate::posts::{Id, Posts, Terms, adds, stemmed};
 use crate::score::Facts;
 use crate::sorted::Sorted;
+use crate::synonyms;
 use crate::tags::Tags;
 use crate::words::{Words, stem};
 
@@ -239,9 +240,10 @@ struct Entry {
     mask: u32,
     /// Where it was found, in order and counting from one.
     at: Vec<u32>,
-    /// Whether this is a stem rather than a word, which is what keeps it out of
-    /// the document's length.
-    stem: bool,
+    /// Whether this stands for a word rather than being one, which is what
+    /// keeps it out of the document's length. A stem and a synonym group are
+    /// both of those and a word is not.
+    aside: bool,
 }
 
 impl Index {
@@ -268,6 +270,7 @@ impl Index {
             definition,
             schema,
             held,
+            synonyms,
             ..
         } = self;
         // The old reading goes first and it goes whatever happens next, because
@@ -373,10 +376,23 @@ impl Index {
                     && let Some(root) = stem(english, &word.text)
                 {
                     let entry = found.entry(stemmed(&root).into()).or_default();
-                    entry.stem = true;
+                    entry.aside = true;
                     // One wherever it is found, whatever the field is worth,
                     // which is not what the word itself gets.
                     entry.freq += 1;
+                    entry.mask |= mask;
+                    entry.at.push(at);
+                }
+                // A group the word is in goes in beside the word, worth what
+                // the word is worth rather than the one a stem gets, so a word
+                // in a field of weight three puts three into its group as well.
+                // The word itself and never the stem, which is measured: a
+                // group holding `running` does nothing for a document that
+                // only said `runs`.
+                for group in synonyms.held(&word.text) {
+                    let entry = found.entry(synonyms::term(group).into()).or_default();
+                    entry.aside = true;
+                    entry.freq += worth;
                     entry.mask |= mask;
                     entry.at.push(at);
                 }
@@ -394,8 +410,9 @@ impl Index {
             // A stem counts towards the largest frequency in the document and
             // not towards its length, since it is not a word the document
             // holds. That splits what TFIDF divides by from what BM25 corrects
-            // by, and both halves are measured.
-            match entry.stem {
+            // by, and both halves are measured. A synonym group is the same on
+            // both counts.
+            match entry.aside {
                 true => held.docs.peak(id, entry.freq),
                 false => held.docs.note(id, entry.freq),
             }

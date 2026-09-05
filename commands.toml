@@ -3298,6 +3298,29 @@ wire = "verified"
 notes = "Every term in a dictionary, sorted by its bytes, which puts a capital in front of a small letter. The risk is the same one FT.TAGVALS carries: the whole list goes into one reply and there is nothing to cut it down with. A name nobody ever added to dumps empty rather than complaining, which is the one place in this group where a missing name is not an error. A set on RESP3 and an array on RESP2."
 
 [[command]]
+name = "FT.SYNUPDATE"
+group = "search"
+since = "1.2.0"
+arity = -4
+plan = "none"
+bounded = "inherent"
+status = "shipped"
+wire = "verified"
+notes = "A synonym group is not a comparison made at query time. It is a term of its own, the group id with a tilde in front, written into the index next to every word of the group, and a query for a word in a group turns into a union of the word and that term. So a group of a hundred words costs one posting list and not a hundred lookups. The group term is worth what the word is worth, the field weight and all, and it counts toward the document's largest frequency but not toward its length. The lookup is on the word and never on the stem, so a group holding running does nothing for a document that only said runs, and a stopword is dropped before the lookup so a group holding the never leaves anything behind. Without SKIPINITIALSCAN the whole index is read again from the keyspace and every document is renumbered, and that happens even for an index that was created with SKIPINITIALSCAN, so the two flags have nothing to do with each other. The flag is only recognised in the third word and is an ordinary term anywhere else."
+
+[[command]]
+name = "FT.SYNDUMP"
+group = "search"
+since = "1.2.0"
+arity = 2
+plan = "none"
+bounded = "risk"
+status = "shipped"
+wire = "verified"
+divergent = "D-87"
+notes = "Every term that is in a group and the groups it is in, as a map on RESP3 and a flat list of term then group ids on RESP2. The terms are folded on the way in with the query fold, full unicode lowercase and no cut, so ECOLE dumps as ecole and an emoji dumps whole, while the group ids are kept exactly as they were given. Group ids under a term are in the order the term was added to them and a repeat is dropped. An empty term is a term and dumps as an empty string, and a group with no terms in it leaves nothing behind. The risk is the same one FT.TAGVALS carries, the whole list in one reply with nothing to cut it down with. Order between terms is D-87."
+
+[[command]]
 name = "FT.SUGADD"
 group = "search"
 since = "1.0.0"

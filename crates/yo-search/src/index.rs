@@ -3,6 +3,7 @@
 use crate::field::Field;
 use crate::follow::Trouble;
 use crate::held::Held;
+use crate::synonyms::Synonyms;
 
 /// The score every document in an index gets when nothing says otherwise.
 pub const SCORE: f64 = 1.0;
@@ -162,6 +163,9 @@ pub struct Index {
     pub held: Held,
     /// What it has refused to read, by the index and by the field.
     pub trouble: Trouble,
+    /// The words it treats as the same word, which both the write path and the
+    /// query parser read.
+    pub synonyms: Synonyms,
 }
 
 impl Index {
@@ -175,6 +179,7 @@ impl Index {
             uses: 0,
             held: Held::new(),
             trouble: Trouble::default(),
+            synonyms: Synonyms::new(),
         }
     }
 
