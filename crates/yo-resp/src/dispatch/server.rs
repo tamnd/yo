@@ -295,7 +295,7 @@ pub(super) fn execute(
             for db in &mut server.dbs {
                 db.clear();
             }
-            server.search.clear();
+            server.search.lock().clear();
             out.ok();
         }
         // The search indexes go too, and they go whichever database this is.
@@ -306,7 +306,7 @@ pub(super) fn execute(
         "flushdb" => {
             flush_mode(args)?;
             server.dbs[session.db].clear();
-            server.search.clear();
+            server.search.lock().clear();
             out.ok();
         }
         // Two databases change places and no key moves. A database here is a
@@ -865,7 +865,7 @@ fn config(server: &mut Server, args: Args<'_>, out: &mut Out) -> Result<()> {
         }
         if ttl {
             out.bulk(SEALED_TTL.as_bytes());
-            out.bulk_int(server.backup.ttl() as i64);
+            out.bulk_int(server.backup().ttl() as i64);
         }
     } else if is(sub, b"SET") {
         // Too few is a wrong number of arguments and an odd number is a syntax
@@ -1024,7 +1024,7 @@ fn config(server: &mut Server, args: Args<'_>, out: &mut Out) -> Result<()> {
             }
         }
         if let Some(seconds) = ttl {
-            server.backup.set_ttl(seconds);
+            server.backup().set_ttl(seconds);
         }
         // Last, so that a `CONFIG SET maxmemory 1mb maxmemory-policy allkeys-lru`
         // has the policy in place before the limit that will act on it. The two

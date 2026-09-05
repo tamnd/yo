@@ -512,7 +512,14 @@ pub struct Server {
     ///
     /// Empty on a server nobody has migrated a key out of, which is nearly all
     /// of them, and it costs a vector's three words to be empty.
-    peers: migrate::Peers,
+    ///
+    /// Behind a lock because a socket cannot be written by two threads at once
+    /// and a cache of them cannot be searched by one while another is taking an
+    /// entry out. It is held for the whole of a migration, which is a round trip
+    /// to another server, so two threads migrating at the same time take turns.
+    /// That is the right way round: the alternative is a socket per thread per
+    /// peer, and a `MIGRATE` is not what a server spends its time on.
+    peers: Lock<migrate::Peers>,
     /// What each thread that runs commands here keeps to itself.
     ///
     /// A fixed list, because a thread reading its own entry must not have the
@@ -533,7 +540,22 @@ pub struct Server {
     ///
     /// On the server and not on a session, because a backup outlives the
     /// connection that asked for it and any other connection can seal it.
-    backup: backup::State,
+    ///
+    /// Behind a lock because there is one backup at a time and any thread can be
+    /// the one that starts, seals or abandons it. It is held while the base file
+    /// is written, which is what keeps two `BACKUP START` commands from writing
+    /// over each other's files.
+    backup: Lock<backup::State>,
+    /// Whether a sealed backup is sitting on disk.
+    ///
+    /// Beside the state rather than read out of it, because every batch of
+    /// commands asks whether there is a backup old enough to sweep away and on
+    /// nearly every server the answer is that there is no backup at all. A load
+    /// answers that. Written under the lock by whoever moved the phase, so a
+    /// reader that asks mid-change sees the moment before and sweeps one batch
+    /// later, which is a file staying on disk for a few microseconds longer than
+    /// it had to.
+    sealed: AtomicBool,
     /// The search indexes and the names pointing at them.
     ///
     /// On the server and not on a database, which is the one collection in this
@@ -543,7 +565,12 @@ pub struct Server {
     ///
     /// A server nobody has made an index on holds two empty vectors here, which
     /// is six words and no allocation.
-    search: Registry,
+    ///
+    /// Behind a lock because an index is made and dropped by whichever thread
+    /// ran the command, and the table it goes in is one table. Only the `FT`
+    /// commands take it, so nothing a working server spends its time on comes
+    /// through here.
+    search: Lock<Registry>,
     /// Set by `SHUTDOWN`, and read by whatever is turning the loop.
     ///
     /// A flag rather than an exit, because the command layer is not what owns
@@ -577,12 +604,13 @@ impl Server {
             expire_ms: 0,
             waiters: Lock::default(),
             parked: AtomicUsize::new(0),
-            peers: migrate::Peers::default(),
+            peers: Lock::default(),
             locals: one_thread(),
             claimed: AtomicUsize::new(0),
             dir: working_dir(),
-            backup: backup::State::default(),
-            search: Registry::new(),
+            backup: Lock::default(),
+            sealed: AtomicBool::new(false),
+            search: Lock::new(Registry::new()),
             stopping: AtomicBool::new(false),
         }
     }
@@ -628,12 +656,13 @@ impl Server {
             expire_ms: 0,
             waiters: Lock::default(),
             parked: AtomicUsize::new(0),
-            peers: migrate::Peers::default(),
+            peers: Lock::default(),
             locals: one_thread(),
             claimed: AtomicUsize::new(0),
             dir: working_dir(),
-            backup: backup::State::default(),
-            search: Registry::new(),
+            backup: Lock::default(),
+            sealed: AtomicBool::new(false),
+            search: Lock::new(Registry::new()),
             stopping: AtomicBool::new(false),
         }
     }
@@ -730,7 +759,7 @@ impl Server {
     /// Once per batch, from the same maintenance turn that collects the arena.
     /// It reads two fields and returns on a server that has never taken a
     /// backup, which is nearly all of them.
-    pub fn backup_expire(&mut self) {
+    pub fn backup_expire(&self) {
         backup::expire(self);
     }
 
@@ -1566,131 +1595,130 @@ pub fn resolved(
     // a list of names: it is what `COMMAND INFO` reports about exactly these
     // commands, and the sorted set and stream ones that arrive later carry it
     // too.
-    let done = if spec.flags.contains(&"blocking") {
-        blocking::execute(server, session, spec, args, out)
-    } else {
-        match spec.group {
-            "string" => {
-                let db = session.db;
-                strings::execute(&server.dbs[db], spec, args, out).map(|()| Flow::Continue)
+    let done =
+        if spec.flags.contains(&"blocking") {
+            blocking::execute(server, session, spec, args, out)
+        } else {
+            match spec.group {
+                "string" => {
+                    let db = session.db;
+                    strings::execute(&server.dbs[db], spec, args, out).map(|()| Flow::Continue)
+                }
+                // Its own group and its own file, and the same values underneath:
+                // a bitmap is a string, so `STRLEN` on one answers and `SETBIT` on
+                // something a `SET` left behind works.
+                "bitmap" => {
+                    let db = session.db;
+                    bits::execute(&server.dbs[db], spec, args, out).map(|()| Flow::Continue)
+                }
+                // The same again: a sketch is a string with a documented layout, so
+                // `GET` hands one to a client and `SET` takes it back.
+                "hyperloglog" => {
+                    let db = session.db;
+                    hll::execute(&server.dbs[db], spec, args, out).map(|()| Flow::Continue)
+                }
+                "set" => {
+                    let db = session.db;
+                    sets::execute(&server.dbs[db], spec, args, out).map(|()| Flow::Continue)
+                }
+                // The one hash command whose state is not in the keyspace. A
+                // fieldset belongs to the connection, so this is handed the session
+                // as well as the database, the same exception `MIGRATE` gets in the
+                // keyspace group for the socket it keeps.
+                "hash" if spec.name == "himport" => {
+                    let db = session.db;
+                    himport::execute(&server.dbs[db], &mut session.sets, args, out)
+                        .map(|()| Flow::Continue)
+                }
+                "hash" => {
+                    let db = session.db;
+                    hashes::execute(&server.dbs[db], spec, args, out).map(|()| Flow::Continue)
+                }
+                "list" => {
+                    let db = session.db;
+                    lists::execute(&server.dbs[db], spec, args, out).map(|()| Flow::Continue)
+                }
+                "zset" => {
+                    let db = session.db;
+                    zsets::execute(&server.dbs[db], spec, args, out).map(|()| Flow::Continue)
+                }
+                // A geo key is a sorted set and these are sorted set commands with
+                // arithmetic on the way in and on the way out, so a client can ZREM
+                // a place out of one and ZCARD it to count them.
+                "geo" => {
+                    let db = session.db;
+                    geo::execute(&server.dbs[db], spec, args, out).map(|()| Flow::Continue)
+                }
+                "array" => {
+                    let db = session.db;
+                    arrays::execute(&server.dbs[db], spec, args, out).map(|()| Flow::Continue)
+                }
+                "graph" => {
+                    let db = session.db;
+                    graph::execute(&server.dbs[db], spec, args, out).map(|()| Flow::Continue)
+                }
+                // A document under a key, reached by a path. The group is Redis's
+                // module surface and the storage is ours, the same trade the vector
+                // set group makes.
+                "json" => {
+                    let db = session.db;
+                    json::execute(&server.dbs[db], spec, args, out).map(|()| Flow::Continue)
+                }
+                "vector" => {
+                    let db = session.db;
+                    vectors::execute(&server.dbs[db], spec, args, out).map(|()| Flow::Continue)
+                }
+                "bloom" => {
+                    let db = session.db;
+                    bloom::execute(&server.dbs[db], spec, args, out).map(|()| Flow::Continue)
+                }
+                "cuckoo" => {
+                    let db = session.db;
+                    cuckoo::execute(&server.dbs[db], spec, args, out).map(|()| Flow::Continue)
+                }
+                "cms" => {
+                    let db = session.db;
+                    cms::execute(&server.dbs[db], spec, args, out).map(|()| Flow::Continue)
+                }
+                "topk" => {
+                    let db = session.db;
+                    topk::execute(&server.dbs[db], spec, args, out).map(|()| Flow::Continue)
+                }
+                "tdigest" => {
+                    let db = session.db;
+                    tdigest::execute(&server.dbs[db], spec, args, out).map(|()| Flow::Continue)
+                }
+                "ts" => {
+                    let db = session.db;
+                    ts::execute(&server.dbs[db], spec, args, out).map(|()| Flow::Continue)
+                }
+                // The clock is read before the database is borrowed, because every
+                // stream command needs the time and it lives on the server. An
+                // `XADD` with no ID, an `XCLAIM` working out what is idle and an
+                // `XINFO` reporting it all have to agree about what moment this is.
+                "stream" => {
+                    let db = session.db;
+                    let now = server.now_ms();
+                    streams::execute(&server.dbs[db], spec, args, now, out).map(|()| Flow::Continue)
+                }
+                // The one keyspace command that needs more than the databases,
+                // because the socket it talks down is held on the server between
+                // commands and not opened again for each one.
+                "keyspace" if spec.name == "migrate" => {
+                    migrate::execute(server, session.db, args, out).map(|()| Flow::Continue)
+                }
+                // Every database and not the one the session is on, because `COPY` takes
+                // a `DB n` and writes into a database nobody selected.
+                "keyspace" => keyspace::execute(&server.dbs, session.db, spec, args, out)
+                    .map(|()| Flow::Continue),
+                // No database at all, because an index is not a key. The registry
+                // is the whole of what these sixteen commands touch.
+                "search" => search::execute(&mut server.search.lock(), spec, args, out)
+                    .map(|()| Flow::Continue),
+                "scripting" => scripting::execute(spec, args, out).map(|()| Flow::Continue),
+                _ => server::execute(server, session, spec, args, out),
             }
-            // Its own group and its own file, and the same values underneath:
-            // a bitmap is a string, so `STRLEN` on one answers and `SETBIT` on
-            // something a `SET` left behind works.
-            "bitmap" => {
-                let db = session.db;
-                bits::execute(&server.dbs[db], spec, args, out).map(|()| Flow::Continue)
-            }
-            // The same again: a sketch is a string with a documented layout, so
-            // `GET` hands one to a client and `SET` takes it back.
-            "hyperloglog" => {
-                let db = session.db;
-                hll::execute(&server.dbs[db], spec, args, out).map(|()| Flow::Continue)
-            }
-            "set" => {
-                let db = session.db;
-                sets::execute(&server.dbs[db], spec, args, out).map(|()| Flow::Continue)
-            }
-            // The one hash command whose state is not in the keyspace. A
-            // fieldset belongs to the connection, so this is handed the session
-            // as well as the database, the same exception `MIGRATE` gets in the
-            // keyspace group for the socket it keeps.
-            "hash" if spec.name == "himport" => {
-                let db = session.db;
-                himport::execute(&server.dbs[db], &mut session.sets, args, out)
-                    .map(|()| Flow::Continue)
-            }
-            "hash" => {
-                let db = session.db;
-                hashes::execute(&server.dbs[db], spec, args, out).map(|()| Flow::Continue)
-            }
-            "list" => {
-                let db = session.db;
-                lists::execute(&server.dbs[db], spec, args, out).map(|()| Flow::Continue)
-            }
-            "zset" => {
-                let db = session.db;
-                zsets::execute(&server.dbs[db], spec, args, out).map(|()| Flow::Continue)
-            }
-            // A geo key is a sorted set and these are sorted set commands with
-            // arithmetic on the way in and on the way out, so a client can ZREM
-            // a place out of one and ZCARD it to count them.
-            "geo" => {
-                let db = session.db;
-                geo::execute(&server.dbs[db], spec, args, out).map(|()| Flow::Continue)
-            }
-            "array" => {
-                let db = session.db;
-                arrays::execute(&server.dbs[db], spec, args, out).map(|()| Flow::Continue)
-            }
-            "graph" => {
-                let db = session.db;
-                graph::execute(&server.dbs[db], spec, args, out).map(|()| Flow::Continue)
-            }
-            // A document under a key, reached by a path. The group is Redis's
-            // module surface and the storage is ours, the same trade the vector
-            // set group makes.
-            "json" => {
-                let db = session.db;
-                json::execute(&server.dbs[db], spec, args, out).map(|()| Flow::Continue)
-            }
-            "vector" => {
-                let db = session.db;
-                vectors::execute(&server.dbs[db], spec, args, out).map(|()| Flow::Continue)
-            }
-            "bloom" => {
-                let db = session.db;
-                bloom::execute(&server.dbs[db], spec, args, out).map(|()| Flow::Continue)
-            }
-            "cuckoo" => {
-                let db = session.db;
-                cuckoo::execute(&server.dbs[db], spec, args, out).map(|()| Flow::Continue)
-            }
-            "cms" => {
-                let db = session.db;
-                cms::execute(&server.dbs[db], spec, args, out).map(|()| Flow::Continue)
-            }
-            "topk" => {
-                let db = session.db;
-                topk::execute(&server.dbs[db], spec, args, out).map(|()| Flow::Continue)
-            }
-            "tdigest" => {
-                let db = session.db;
-                tdigest::execute(&server.dbs[db], spec, args, out).map(|()| Flow::Continue)
-            }
-            "ts" => {
-                let db = session.db;
-                ts::execute(&server.dbs[db], spec, args, out).map(|()| Flow::Continue)
-            }
-            // The clock is read before the database is borrowed, because every
-            // stream command needs the time and it lives on the server. An
-            // `XADD` with no ID, an `XCLAIM` working out what is idle and an
-            // `XINFO` reporting it all have to agree about what moment this is.
-            "stream" => {
-                let db = session.db;
-                let now = server.now_ms();
-                streams::execute(&server.dbs[db], spec, args, now, out).map(|()| Flow::Continue)
-            }
-            // The one keyspace command that needs more than the databases,
-            // because the socket it talks down is held on the server between
-            // commands and not opened again for each one.
-            "keyspace" if spec.name == "migrate" => {
-                migrate::execute(server, session.db, args, out).map(|()| Flow::Continue)
-            }
-            // Every database and not the one the session is on, because `COPY` takes
-            // a `DB n` and writes into a database nobody selected.
-            "keyspace" => {
-                keyspace::execute(&server.dbs, session.db, spec, args, out).map(|()| Flow::Continue)
-            }
-            // No database at all, because an index is not a key. The registry
-            // is the whole of what these sixteen commands touch.
-            "search" => {
-                search::execute(&mut server.search, spec, args, out).map(|()| Flow::Continue)
-            }
-            "scripting" => scripting::execute(spec, args, out).map(|()| Flow::Continue),
-            _ => server::execute(server, session, spec, args, out),
-        }
-    };
+        };
     let flow = match done {
         Ok(flow) => flow,
         Err(e) => {
