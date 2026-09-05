@@ -479,8 +479,8 @@ spec = "09 section 5"
 
 [[divergence]]
 id = "D-65"
-title = "Six FT.SEARCH options are refused rather than read"
-reason = "SORTBY and WITHSORTKEYS sort the answer by a field's value and send that value back beside every row, which needs the sortable values a SORTABLE field is supposed to keep and which nothing keeps yet. SUMMARIZE and HIGHLIGHT rewrite the text of a field around the words that matched, which needs the offsets of those words inside the value. GEOFILTER is a circle written outside the query, and the document reader does not read geo fields yet. EXPLAINSCORE prints the arithmetic behind a score as a nested array, which is a shape of its own on top of every scorer. All six are read as unknown arguments here and answer the line a real server answers for a word nobody knows, so a client learns the option is not there rather than getting a reply that quietly ignored it. The fifteen options that are read are read exactly, including the two that surprise everybody: RETURN counts words rather than fields, and INKEYS filters before the total is taken. FT.EXPLAIN takes WITHSORTKEYS and EXPLAINSCORE and drops them the way a real server does, and it does not print the IDS node an INKEYS puts in the reference's tree."
+title = "Four FT.SEARCH options are refused rather than read"
+reason = "SUMMARIZE and HIGHLIGHT rewrite the text of a field around the words that matched, which needs the offsets of those words inside the value. GEOFILTER is a circle written outside the query, and the document reader does not read geo fields yet. EXPLAINSCORE prints the arithmetic behind a score as a nested array, which is a shape of its own on top of every scorer. All four are read as unknown arguments here and answer the line a real server answers for a word nobody knows, so a client learns the option is not there rather than getting a reply that quietly ignored it. The seventeen options that are read are read exactly, including the two that surprise everybody: RETURN counts words rather than fields, and INKEYS filters before the total is taken. FT.EXPLAIN takes WITHSORTKEYS and EXPLAINSCORE and drops them the way a real server does, and it refuses SUMMARIZE and HIGHLIGHT where a real server reads their whole clause and drops it, which goes when those two are built. It does not print the IDS node an INKEYS puts in the reference's tree."
 status = "until"
 resolved_by = "M8"
 spec = "09 section 5"
@@ -554,5 +554,26 @@ spec = "09 section 5"
 id = "D-75"
 title = "A FILTER under a window with an offset can report a different count per chunk"
 reason = "The number in front of a chunk is how far the walk had got when the number went on the wire, and working it out means following how the pipeline pulls documents. Eight hundred and nineteen of eight hundred and fifty measured shapes agree exactly, across both protocols, every chunk size from one to five, offsets nought to three, windows one to four and five different FILTER expressions. The thirty one that do not all have the same shape: a FILTER together with a LIMIT whose offset is not nought, where the chunk size is wider than the window. A real server puts the loader that reads the fields a FILTER needs in one place and the loader that reads the fields the reply needs in another, and where the two land decides how many documents a fill pulls, which is not something the wire shows. The rows are the same rows in the same order either way and so is the number of chunks, and the count itself is already documented on both sides as how far the reply reached rather than how many rows answered."
+status = "permanent"
+spec = "09 section 5"
+
+[[divergence]]
+id = "D-76"
+title = "FT.SEARCH rows that compare equal come back in document number order"
+reason = "A real server ranks an answer through a bounded heap of the size the window asks for and then empties it, so rows that compare equal come back in the order the heap happened to hold them, which is neither the order they were walked in nor any order a client can predict. Four keys that all sort the same under SORTBY k answer w:3, w:4, w:2, w:1 ascending and exactly that backwards descending, and five keys with the same score answer in a fifth order again. This side sorts the walk, which arrives in document number order, with a sort that leaves equal rows where it found them, so equal rows come back as w:1, w:2, w:3, w:4 and a DESC answer is the same run backwards. Every row that compares differently is in the same place on both servers, and a client that wants a defined order among equals has to name a second field on either one, which neither FT.SEARCH takes, so the honest answer to the question is the stable one. The same rule covers rows tied on a score under WITHSCORES and rows tied on a field the index keeps no sortable copy of."
+status = "permanent"
+spec = "09 section 5"
+
+[[divergence]]
+id = "D-77"
+title = "A pipeline step answers its own error before the rest of the list is read"
+reason = "A real server reads the whole argument list and checks every word in it before it works out what any step means, so FT.AGGREGATE i * GROUPBY 1 @zz VERBATIM complains about the VERBATIM at position 4 rather than about the property zz that does not exist, and FT.SEARCH i q FILTER n 1 2 complains about the 1 at position 3 rather than about the symbol n. Drop the trailing word from either and the same command answers the error about the step. This side reads a step and settles it as it goes, so the step's own error is the one that comes back, which is the more useful of the two lines and is the same line the reference gives for the same command with nothing after it. Both servers refuse both commands, so nothing a client does succeeds on one and fails on the other, and the difference is only which of two problems gets named when a command has both."
+status = "permanent"
+spec = "09 section 5"
+
+[[divergence]]
+id = "D-78"
+title = "A numeric field under RETURN comes back as it was written"
+reason = "A real server reads a RETURN list through the same loader an aggregation uses, so a NUMERIC field comes back as the number that loader would print, which is twelve significant digits: a field holding 3.141592653589793 answers 3.14159265359 under RETURN 1 n and answers the whole string with no RETURN at all. This side answers the bytes the key holds either way. The rounded form loses digits a client wrote and cannot be undone, and a client that wants twelve digits can ask for them, so answering what was stored is the answer that keeps the information. Everything else about RETURN is exact, including the two rules that surprise people: the count is words and not fields, and an aliased attribute is read off the key under the name the schema gave it and answered under the name the query calls it."
 status = "permanent"
 spec = "09 section 5"

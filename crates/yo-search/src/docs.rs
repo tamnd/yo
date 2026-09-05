@@ -39,6 +39,7 @@
 use std::collections::HashMap;
 
 use crate::posts::Id;
+use crate::sorted::Sorted;
 
 /// What is known about one document besides which terms are in it.
 #[derive(Debug, Clone, PartialEq)]
@@ -57,6 +58,10 @@ pub struct Doc {
     pub top: u32,
     /// The value of the payload field, when the index names one.
     pub payload: Option<Box<[u8]>>,
+    /// What it holds at each of the schema's sortable fields, in the order the
+    /// schema declares them and with the fields nobody called sortable left
+    /// out. Empty on an index that has no sortable field at all.
+    sortable: Box<[Option<Sorted>]>,
 }
 
 impl Doc {
@@ -69,7 +74,19 @@ impl Doc {
             tokens: 0,
             top: 0,
             payload: None,
+            sortable: Box::default(),
         }
+    }
+
+    /// The value it keeps for one sortable field, by the slot the schema puts
+    /// that field in.
+    ///
+    /// `None` when the document has nothing there, and also when the slot is
+    /// past the end, which is what an `FT.ALTER` that adds a sortable field
+    /// leaves behind on every document written before it.
+    #[must_use]
+    pub fn sorted(&self, slot: usize) -> Option<&Sorted> {
+        self.sortable.get(slot)?.as_ref()
     }
 }
 
@@ -156,6 +173,13 @@ impl Docs {
     pub fn carry(&mut self, id: Id, payload: &[u8]) {
         if let Some(Some(doc)) = self.slot_mut(id) {
             doc.payload = Some(payload.into());
+        }
+    }
+
+    /// Puts the sortable fields' values on a document.
+    pub fn store(&mut self, id: Id, values: Vec<Option<Sorted>>) {
+        if let Some(Some(doc)) = self.slot_mut(id) {
+            doc.sortable = values.into();
         }
     }
 
@@ -383,6 +407,21 @@ mod tests {
             d.get(id).and_then(|doc| doc.payload.clone()).as_deref(),
             Some(b"anything".as_slice())
         );
+    }
+
+    /// The sortable values come back by slot, a slot the document has nothing
+    /// in answers nothing, and so does a slot past the end, which is what a
+    /// document written before the schema grew a sortable field has.
+    #[test]
+    fn a_document_carries_a_value_for_every_sortable_field() {
+        let mut d = Docs::new();
+        let id = d.add(b"a", 1.0);
+        assert_eq!(d.get(id).and_then(|doc| doc.sorted(0)), None);
+        d.store(id, vec![Some(Sorted::Number(2.5)), None]);
+        let doc = d.get(id).expect("the document is there");
+        assert_eq!(doc.sorted(0), Some(&Sorted::Number(2.5)));
+        assert_eq!(doc.sorted(1), None);
+        assert_eq!(doc.sorted(2), None);
     }
 
     /// Walking the table gives the documents that are left, in number order,

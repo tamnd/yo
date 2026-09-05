@@ -263,6 +263,26 @@ impl Document {
         self.ends.push(self.bytes.len());
     }
 
+    /// The value of one field, by the name the key holds it under.
+    ///
+    /// A walk and not a lookup, for the same reason the schema is walked to
+    /// find a field: a hash has a handful of fields and building a map to look
+    /// one of them up in costs more than the walk it saves.
+    pub(super) fn held(&self, name: &[u8]) -> Option<&[u8]> {
+        let mut at = 0;
+        let mut parts = self.ends.iter().map(|&end| {
+            let part = &self.bytes[at..end];
+            at = end;
+            part
+        });
+        while let (Some(field), Some(value)) = (parts.next(), parts.next()) {
+            if field == name {
+                return Some(value);
+            }
+        }
+        None
+    }
+
     /// The pairs, in the order they were added.
     pub(super) fn pairs(&self) -> Vec<(&[u8], &[u8])> {
         let mut at = 0;

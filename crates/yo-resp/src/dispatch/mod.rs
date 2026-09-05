@@ -21541,6 +21541,260 @@ mod tests {
         }
     }
 
+    /// A corpus with something to sort by: a text field the index keeps a copy
+    /// of, a number, the same text field under another name, and a text field
+    /// the index keeps nothing of.
+    fn sortable(f: &mut Fixture) {
+        f.run(&[
+            b"FT.CREATE",
+            b"sy",
+            b"PREFIX",
+            b"1",
+            b"s:",
+            b"SCHEMA",
+            b"t",
+            b"TEXT",
+            b"SORTABLE",
+            b"n",
+            b"NUMERIC",
+            b"SORTABLE",
+            b"body",
+            b"AS",
+            b"b",
+            b"TEXT",
+            b"SORTABLE",
+            b"p",
+            b"TEXT",
+        ]);
+        for (key, text, number) in [
+            (b"s:1".as_slice(), "Banana Split", "2"),
+            (b"s:2", "apple", "10"),
+        ] {
+            f.run(&[
+                b"HSET",
+                key,
+                b"t",
+                text.as_bytes(),
+                b"n",
+                number.as_bytes(),
+                b"body",
+                text.as_bytes(),
+                b"p",
+                b"alpha",
+            ]);
+        }
+        // A key with nothing under either sortable field, which is what sorts
+        // last whichever way round the sort runs.
+        f.run(&[b"HSET", b"s:3", b"p", b"alpha"]);
+    }
+
+    /// A sort runs off the copy of the value the index keeps, and a row with no
+    /// value at all is last both ways round.
+    #[test]
+    fn a_search_sorts_by_a_field_the_index_keeps_a_copy_of() {
+        let mut f = Fixture::new();
+        sortable(&mut f);
+        assert_eq!(
+            f.run(&[b"FT.SEARCH", b"sy", b"alpha", b"SORTBY", b"n", b"NOCONTENT"]),
+            "*4\r\n:3\r\n$3\r\ns:1\r\n$3\r\ns:2\r\n$3\r\ns:3\r\n"
+        );
+        assert_eq!(
+            f.run(&[
+                b"FT.SEARCH",
+                b"sy",
+                b"alpha",
+                b"SORTBY",
+                b"n",
+                b"DESC",
+                b"NOCONTENT"
+            ]),
+            "*4\r\n:3\r\n$3\r\ns:2\r\n$3\r\ns:1\r\n$3\r\ns:3\r\n"
+        );
+        // The copy of a text field is folded, so `apple` sorts before
+        // `Banana Split` where a comparison of the bytes would not.
+        assert_eq!(
+            f.run(&[b"FT.SEARCH", b"sy", b"alpha", b"SORTBY", b"t", b"NOCONTENT"]),
+            "*4\r\n:3\r\n$3\r\ns:2\r\n$3\r\ns:1\r\n$3\r\ns:3\r\n"
+        );
+    }
+
+    /// A field the index keeps no copy of is sorted by the value read off the
+    /// key, which happens after the walk rather than during it.
+    #[test]
+    fn a_search_sorts_by_a_field_it_has_to_read_the_key_for() {
+        let mut f = Fixture::new();
+        sortable(&mut f);
+        f.run(&[b"HSET", b"s:1", b"p", b"alpha zulu"]);
+        assert_eq!(
+            f.run(&[
+                b"FT.SEARCH",
+                b"sy",
+                b"alpha",
+                b"SORTBY",
+                b"p",
+                b"NOCONTENT",
+                b"LIMIT",
+                b"0",
+                b"2"
+            ]),
+            "*3\r\n:3\r\n$3\r\ns:2\r\n$3\r\ns:3\r\n"
+        );
+        // Nothing is folded on this side, because the schema never asked for a
+        // copy to fold, so the value goes into the sort as it was written.
+        assert_eq!(
+            f.run(&[
+                b"FT.SEARCH",
+                b"sy",
+                b"alpha",
+                b"SORTBY",
+                b"p",
+                b"WITHSORTKEYS",
+                b"NOCONTENT",
+                b"LIMIT",
+                b"2",
+                b"1"
+            ]),
+            "*3\r\n:3\r\n$3\r\ns:1\r\n$11\r\n$alpha zulu\r\n"
+        );
+    }
+
+    /// The value the sort compared goes beside every row, as a number after a
+    /// hash, as text after a dollar, and as a null on a row that had none.
+    #[test]
+    fn a_search_can_send_the_value_it_sorted_by_back() {
+        let mut f = Fixture::new();
+        sortable(&mut f);
+        assert_eq!(
+            f.run(&[
+                b"FT.SEARCH",
+                b"sy",
+                b"alpha",
+                b"SORTBY",
+                b"n",
+                b"WITHSORTKEYS",
+                b"NOCONTENT"
+            ]),
+            concat!(
+                "*7\r\n:3\r\n",
+                "$3\r\ns:1\r\n$2\r\n#2\r\n",
+                "$3\r\ns:2\r\n$3\r\n#10\r\n",
+                "$3\r\ns:3\r\n$-1\r\n"
+            )
+        );
+        assert_eq!(
+            f.run(&[
+                b"FT.SEARCH",
+                b"sy",
+                b"alpha",
+                b"SORTBY",
+                b"t",
+                b"WITHSORTKEYS",
+                b"NOCONTENT"
+            ]),
+            concat!(
+                "*7\r\n:3\r\n",
+                "$3\r\ns:2\r\n$6\r\n$apple\r\n",
+                "$3\r\ns:1\r\n$13\r\n$banana split\r\n",
+                "$3\r\ns:3\r\n$-1\r\n"
+            )
+        );
+        // Asking for a sort key without sorting is taken and answers a null on
+        // every row, which is what a real server does.
+        assert_eq!(
+            f.run(&[
+                b"FT.SEARCH",
+                b"sy",
+                b"banana",
+                b"WITHSORTKEYS",
+                b"NOCONTENT"
+            ]),
+            "*3\r\n:1\r\n$3\r\ns:1\r\n$-1\r\n"
+        );
+    }
+
+    /// The field a search sorted by is written in front of the fields of the
+    /// key, and the key's own value for it wins when the two share a name.
+    #[test]
+    fn a_sort_puts_the_field_it_sorted_by_in_front_of_the_row() {
+        let mut f = Fixture::new();
+        sortable(&mut f);
+        // `b` is what the schema calls the field the key calls `body`, so the
+        // folded copy comes back under one name and the value as it was written
+        // comes back under the other.
+        assert_eq!(
+            f.run(&[
+                b"FT.SEARCH",
+                b"sy",
+                b"alpha",
+                b"SORTBY",
+                b"b",
+                b"LIMIT",
+                b"0",
+                b"1"
+            ]),
+            concat!(
+                "*3\r\n:3\r\n$3\r\ns:2\r\n*10\r\n",
+                "$1\r\nb\r\n$5\r\napple\r\n",
+                "$1\r\nt\r\n$5\r\napple\r\n",
+                "$1\r\nn\r\n$2\r\n10\r\n",
+                "$4\r\nbody\r\n$5\r\napple\r\n",
+                "$1\r\np\r\n$5\r\nalpha\r\n"
+            )
+        );
+        // With a `RETURN` list there is nothing to put in, so the field is moved
+        // to the front of the names that were asked for instead.
+        assert_eq!(
+            f.run(&[
+                b"FT.SEARCH",
+                b"sy",
+                b"alpha",
+                b"SORTBY",
+                b"b",
+                b"RETURN",
+                b"2",
+                b"p",
+                b"b",
+                b"LIMIT",
+                b"0",
+                b"1"
+            ]),
+            concat!(
+                "*3\r\n:3\r\n$3\r\ns:2\r\n*4\r\n",
+                "$1\r\nb\r\n$5\r\napple\r\n",
+                "$1\r\np\r\n$5\r\nalpha\r\n"
+            )
+        );
+    }
+
+    /// The four ways a `SORTBY` on a search is refused.
+    #[test]
+    fn a_search_refuses_the_sorts_it_cannot_run() {
+        let mut f = Fixture::new();
+        sortable(&mut f);
+        assert_eq!(
+            f.run(&[b"FT.SEARCH", b"sy", b"alpha", b"SORTBY"]),
+            "-SEARCH_PARSE_ARGS Bad SORTBY arguments\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"FT.SEARCH", b"sy", b"alpha", b"SORTBY", b"n", b"SORTBY"]),
+            "-SEARCH_PARSE_ARGS Multiple SORTBY steps are not allowed\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"FT.SEARCH", b"sy", b"alpha", b"SORTBY", b"n", b"MAX", b"2"]),
+            "-SEARCH_PARSE_ARGS SORTBY MAX is not supported by FT.SEARCH\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"FT.SEARCH", b"sy", b"alpha", b"SORTBY", b"zz"]),
+            "-SEARCH_PROP_NOT_FOUND Property `zz` not loaded nor in schema\r\n"
+        );
+        // The property is looked up once the whole list has read cleanly, so a
+        // word after it that nobody knows is the error that comes back.
+        assert_eq!(
+            f.run(&[b"FT.SEARCH", b"sy", b"alpha", b"SORTBY", b"zz", b"NOPE"]),
+            "-SEARCH_ARG_UNRECOGNIZED Unknown argument `NOPE` at position 3 for <main>\r\n"
+        );
+    }
+
     /// A search answers a total and then a row for every key in the window,
     /// with the fields of that key after it.
     #[test]

@@ -91,6 +91,7 @@ use yo_search::follow::Errors;
 use yo_search::index::{Definition, Source};
 use yo_search::query::{self, Ask, Bad, Mask, Node, Pair, Range, What};
 use yo_search::score::Scorer;
+use yo_search::sorted::{self, Sorted};
 use yo_search::walk;
 use yo_search::{Clash, Field, Index, Registry};
 use yo_shape::Metric;
@@ -1561,6 +1562,19 @@ const SORT_WAY_END: &str = ")";
 const SORT_PROP: &str = "SEARCH_PROP_NOT_FOUND Property `";
 const SORT_PROP_END: &str = "` not loaded nor in schema";
 const SORT_TWICE: &str = "SEARCH_PARSE_ARGS Multiple SORTBY steps are not allowed. Sort multiple fields in a single step";
+/// The same thing on a search, which says the first half of it and stops. The
+/// advice about sorting several fields at once belongs to the step that can do
+/// that, and a search cannot: it sorts by one field or by none.
+const SORT_ONCE: &str = "SEARCH_PARSE_ARGS Multiple SORTBY steps are not allowed";
+/// What a `SORTBY` with no field after it answers on a search, which is not the
+/// line the same mistake gets on an aggregation.
+const SORT_BARE: &str = "SEARCH_PARSE_ARGS Bad SORTBY arguments";
+/// A search sorts the whole answer and hands back a window on it, so the cap a
+/// sort step takes on an aggregation has nothing to do here. The word is
+/// recognised anyway rather than being left to the unknown argument line.
+const SORT_MAX: &str = "SEARCH_PARSE_ARGS SORTBY MAX is not supported by FT.SEARCH";
+/// What `EXPLAINSCORE` answers when nothing asked for the scores it explains.
+const SCORE_ALONE: &str = "SEARCH_PARSE_ARGS EXPLAINSCORE must be accompanied with WITHSCORES";
 const NO_PROPERTY: &str = "SEARCH_PROP_NOT_FOUND No such property `";
 const NOT_LOADED: &str = "SEARCH_PROP_NOT_FOUND Property not loaded nor in pipeline: `";
 const QUOTE_END: &str = "`";
@@ -1589,6 +1603,10 @@ const RESOLUTION_ARG: &str = "SEARCH_PARSE_ARGS Bad arguments for <resolution>";
 /// measured: a thousand is taken and a thousand and one is refused.
 const MOST_SAMPLE: i64 = 1000;
 
+/// What a `RETURN` list came to: for each field, where its value is read from on
+/// the key and what name it comes back under.
+type Wanted<'a> = Vec<(Box<[u8]>, &'a [u8])>;
+
 /// What a client asked for about the rows, which only `FT.SEARCH` acts on.
 ///
 /// `FT.EXPLAIN` reads the same list and throws this half of it away. It still
@@ -1610,7 +1628,12 @@ struct Rows<'a> {
     count: usize,
     /// The fields to send back and the names to send them under, or everything
     /// the key holds when nobody named any.
-    ret: Option<Vec<(&'a [u8], &'a [u8])>>,
+    ///
+    /// The first half is where the value is read from and the second is what it
+    /// comes back as, which are the same bytes unless the client asked for a
+    /// field the schema renamed: `RETURN 1 bb` over `body AS bb` reads `body`
+    /// off the key and answers it under `bb`.
+    ret: Option<Wanted<'a>>,
     /// The text fields the query is narrowed to, or every field.
     infields: Option<Vec<&'a [u8]>>,
     /// The only keys that may answer, when the client listed them.
@@ -1624,6 +1647,29 @@ struct Rows<'a> {
     /// thing an attribute clause hangs on one group of it.
     slop: Option<i64>,
     inorder: bool,
+    /// The field the client wants the answer in the order of and which way
+    /// round, as it was written, before the schema has been looked at.
+    sort: Option<(&'a [u8], bool)>,
+    /// The same once the schema has been looked at, which is what the sort runs
+    /// off. Filled in when the whole argument list has read cleanly, because a
+    /// real server looks the property up last: `SORTBY 2 @n ASC` complains
+    /// about the `@n` at position 3 and not about a property called `2`.
+    sorting: Option<Sorting>,
+    /// Whether the value the sort compared goes on every row.
+    sortkeys: bool,
+}
+
+/// What a `SORTBY` on a search asked for, once the schema has been read.
+struct Sorting {
+    /// The field, which carries both the name the client sorted by and the name
+    /// the key holds the value under. They are the same unless the schema
+    /// renamed it, and the value goes into the reply under the first of them.
+    field: Field,
+    /// Whether the answer runs backwards.
+    desc: bool,
+    /// Which of the document's sortable values this is, or nothing when the
+    /// index keeps no copy of the field and the key has to be read for it.
+    slot: Option<usize>,
 }
 
 impl Rows<'_> {
@@ -1642,6 +1688,7 @@ impl Rows<'_> {
             fields: self.loading(),
             scores: self.scores,
             payloads: self.payloads,
+            sortkeys: self.sortkeys,
             ..Shows::default()
         }
     }
@@ -1676,6 +1723,9 @@ impl Default for Rows<'_> {
             payload: None,
             slop: None,
             inorder: false,
+            sort: None,
+            sorting: None,
+            sortkeys: false,
         }
     }
 }
@@ -1710,6 +1760,9 @@ struct Asked<'a> {
     /// `FT.EXPLAIN` reads the word and everything after it and then throws all
     /// of it away, the same as it does with `WITHSORTKEYS`.
     cursor: Option<Asks>,
+    /// Whether an `EXPLAINSCORE` was read, which has nothing to explain unless
+    /// something asked for the scores as well.
+    explaining: bool,
 }
 
 impl Default for Asked<'_> {
@@ -1722,6 +1775,7 @@ impl Default for Asked<'_> {
             rows: Rows::default(),
             pipe: Pipe::default(),
             cursor: None,
+            explaining: false,
         }
     }
 }
@@ -1729,11 +1783,12 @@ impl Default for Asked<'_> {
 /// Which of the three commands is reading the argument list.
 ///
 /// They share nearly all of it and part company in five places: `FILTER` is a
-/// numeric range on one and an expression on another, `LIMIT` is capped on one
-/// and not on the rest, `LOAD` and `ADDSCORES` belong to one alone, three of
-/// the words a search takes are refused by name on that one, and `FT.EXPLAIN`
-/// reads three words it has nothing to do with so that a search pasted in front
-/// of it is refused in the same place.
+/// numeric range on one and an expression on the other two, `LIMIT` is capped
+/// on one and not on the rest, `SORTBY` names one bare field on one and a
+/// counted list on the other two, three of the words a search takes are refused
+/// by name on the aggregation, and `FT.EXPLAIN` reads three words it has
+/// nothing to do with so that a search pasted in front of it is refused in the
+/// same place.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Mode {
     Search,
@@ -1768,12 +1823,15 @@ fn buffered(asked: &Asked<'_>) -> bool {
 
 /// The keywords `FT.EXPLAIN` takes and drops, with how many words each carries.
 ///
-/// Three of them, and all three are here because a real server reads them on
-/// that command and this one has nothing to do with them. `FILTER` takes one
-/// word rather than three, which is not a guess: `FT.EXPLAIN i q FILTER n 1 2`
-/// is refused for an unknown argument `1` at position 3, so the command that
-/// prints a tree got as far as the field name and stopped.
-const IGNORED: &[(&[u8], usize)] = &[(b"WITHSORTKEYS", 0), (b"EXPLAINSCORE", 0), (b"FILTER", 1)];
+/// All three are here because a real server reads them on that command and this
+/// one has nothing to do with them. Two of them are about the rows of an answer
+/// that command never sends, and the third is about a score it never works out,
+/// which is still checked for having something to explain.
+const IGNORED: &[(&[u8], usize)] = &[
+    (b"WITHSORTKEYS", 0),
+    (b"EXPLAINSCORE", 0),
+    (b"ADDSCORES", 0),
+];
 
 /// Reads the arguments after the query.
 ///
@@ -1798,7 +1856,12 @@ fn options<'a>(
     let mut at = from;
     while at < args.len() {
         let word = args.get(at);
-        if mode == Mode::Aggregate
+        // `FT.EXPLAIN` reads the pipeline as well, and reads it the same way,
+        // because a real server hands the whole argument list to one parser and
+        // then prints the query out of what came back. So a step is checked on
+        // that command and thrown away, and a step closes the door on the words
+        // about the search there too: `LOAD 1 @t VERBATIM` is refused on both.
+        if mode != Mode::Search
             && let Some(next) = step(args, at, &mut asked, index)?
         {
             at = next;
@@ -1854,6 +1917,7 @@ fn options<'a>(
                 if args.opt(at + takes).is_none() {
                     return Err(line(BAD_ARGS, word, NOT_THERE));
                 }
+                asked.explaining |= args::is(word, b"EXPLAINSCORE");
                 at += takes + 1;
                 continue;
             }
@@ -1864,6 +1928,22 @@ fn options<'a>(
     // when nothing else was wrong with the list.
     if asked.pipe.pending {
         return Err(NEED_LOAD_NAME.as_bytes().to_vec());
+    }
+    // Both of these are asked at the end because a real server asks them at the
+    // end: an unknown argument anywhere in the list is answered before either,
+    // and `WITHSCORES` counts for an `EXPLAINSCORE` that came before it.
+    if asked.explaining && !asked.rows.scores {
+        return Err(SCORE_ALONE.as_bytes().to_vec());
+    }
+    if let Some((field, desc)) = asked.rows.sort {
+        let Some(known) = index.field(field) else {
+            return Err(line(SORT_PROP, field, SORT_PROP_END));
+        };
+        asked.rows.sorting = Some(Sorting {
+            field: known.clone(),
+            desc,
+            slot: index.slot(field),
+        });
     }
     aggregate::most(&mut asked);
     Ok(asked)
@@ -1888,10 +1968,12 @@ fn plan<'a>(
         };
         // The cap is on the width of the window and not on where it starts, so
         // `LIMIT 999999 1000000` is a query a real server takes and
-        // `LIMIT 0 1000001` is one it refuses. An aggregation is not capped at
-        // all, because the rows it hands back are not a window on a scored
-        // answer, they are what its pipeline made.
-        if count > MOST && mode != Mode::Aggregate {
+        // `LIMIT 0 1000001` is one it refuses. It is a search's cap alone: the
+        // rows an aggregation hands back are not a window on a scored answer,
+        // they are what its pipeline made, and `FT.EXPLAIN` never sends a row
+        // at all. Both take `LIMIT 0 1000001` and both still refuse
+        // `LIMIT 1 0`.
+        if count > MOST && mode == Mode::Search {
             return Err(LIMIT_OVER.as_bytes().to_vec());
         }
         // A window of nothing is a client asking for the total on its own, and
@@ -2167,7 +2249,14 @@ fn row<'a>(
         return Ok(Some(at + 2));
     }
     if args::is(word, b"RETURN") {
-        return returned(args, at, rows).map(Some);
+        return returned(args, at, rows, index).map(Some);
+    }
+    if main && args::is(word, b"SORTBY") {
+        return sorting(args, at, rows).map(Some);
+    }
+    if main && args::is(word, b"WITHSORTKEYS") {
+        rows.sortkeys = true;
+        return Ok(Some(at + 1));
     }
     if args::is(word, b"INFIELDS") {
         let (names, next) = names(args, at)?;
@@ -2183,6 +2272,46 @@ fn row<'a>(
         return filter(args, at, rows, index).map(Some);
     }
     Ok(None)
+}
+
+/// `SORTBY field [ASC|DESC]` on a search, which is not the shape an
+/// aggregation's sort step takes: one bare field name, no count in front of it
+/// and no `@` on it. `SORTBY @n` is refused for a property called `@n`.
+///
+/// The direction is optional and either word will do, in any case. Anything
+/// else after the field belongs to whatever comes next in the list, so
+/// `SORTBY n DESC DESC` is a sort followed by an unknown argument. `MAX` is the
+/// exception: a sort step takes one and a search has nowhere to put it, and the
+/// word is recognised in both places after the field so that a client hears
+/// what is wrong rather than that the word is unknown.
+///
+/// A second `SORTBY` is refused before its field is read, which is measured:
+/// `SORTBY n SORTBY` with nothing after it answers about the second sort and
+/// not about the argument it is missing.
+fn sorting<'a>(
+    args: Args<'a>,
+    at: usize,
+    rows: &mut Rows<'a>,
+) -> core::result::Result<usize, Vec<u8>> {
+    if rows.sort.is_some() {
+        return Err(SORT_ONCE.as_bytes().to_vec());
+    }
+    let Some(field) = args.opt(at + 1) else {
+        return Err(SORT_BARE.as_bytes().to_vec());
+    };
+    let mut next = at + 2;
+    let mut desc = false;
+    if let Some(word) = args.opt(next)
+        && (args::is(word, b"ASC") || args::is(word, b"DESC"))
+    {
+        desc = args::is(word, b"DESC");
+        next += 1;
+    }
+    if args.opt(next).is_some_and(|word| args::is(word, b"MAX")) {
+        return Err(SORT_MAX.as_bytes().to_vec());
+    }
+    rows.sort = Some((field, desc));
+    Ok(next)
 }
 
 /// A number that is a whole number and not below zero, which is what `LIMIT`
@@ -2204,10 +2333,15 @@ fn counted(value: &[u8]) -> Option<i64> {
 /// count that reaches the `AS` without reaching the name is its own error
 /// rather than a field called `AS`. A count that stops before the `AS` is not:
 /// `RETURN 1 AS` asks for a field called `AS`, which no key holds.
+///
+/// A name the schema knows is read off the key under the identifier that schema
+/// gave it, so `RETURN 1 bb` over `body AS bb` answers what the key holds under
+/// `body`. A name the schema does not know is read off the key as it stands.
 fn returned<'a>(
     args: Args<'a>,
     at: usize,
     rows: &mut Rows<'a>,
+    index: &Index,
 ) -> core::result::Result<usize, Vec<u8>> {
     let Some(count) = args.opt(at + 1) else {
         return Err(line(BAD_ARGS, b"RETURN", NOT_THERE));
@@ -2235,16 +2369,26 @@ fn returned<'a>(
             let Some(name) = args.opt(at + 3 + step) else {
                 return Err(line(BAD_ARGS, b"RETURN", NOT_THERE));
             };
-            want.push((field, name));
+            want.push((reads(index, field), name));
             step += 2;
             continue;
         }
-        want.push((field, field));
+        want.push((reads(index, field), field));
     }
     // The last list wins rather than the lists adding up, so
     // `RETURN 1 t RETURN 1 b` answers `b` on its own.
     rows.ret = Some(want);
     Ok(at + 2 + count)
+}
+
+/// Where a field a client named by hand is read from on the key.
+///
+/// The identifier when the schema knows the name, and the name itself when it
+/// does not, since a client may ask for a field nobody indexed.
+fn reads(index: &Index, name: &[u8]) -> Box<[u8]> {
+    index
+        .field(name)
+        .map_or_else(|| name.into(), |field| field.identifier.clone())
 }
 
 /// `INFIELDS n name ...` and `INKEYS n name ...`, which are the same shape.
@@ -2506,6 +2650,10 @@ struct Row {
     key: Box<[u8]>,
     score: f64,
     payload: Option<Box<[u8]>>,
+    /// What the sort compared this row on, when a `SORTBY` sorted it and the
+    /// document had a value there. Copied out of the index for a field the
+    /// index keeps, and read off the key afterwards for a field it does not.
+    sort: Option<Sorted>,
 }
 
 /// `FT.SEARCH index query [options]`.
@@ -2868,7 +3016,7 @@ fn props<'d, 'w: 'd>(doc: &'d indexing::Document, pipe: &Pipe<'w>) -> Vec<(&'d [
 /// full beside `WITHSCORES`, so the two are not the same formatter. The
 /// spelling lives beside the expression language, because every number an
 /// expression answers goes on the wire the same way.
-use yo_search::expr::twelve;
+use yo_search::expr::{seventeen, twelve};
 
 /// What a field of the key becomes when it is read onto a pipeline row, which
 /// is a number when the schema says the field holds one.
@@ -2966,25 +3114,55 @@ fn gather(
     for (row, score) in found.iter_mut().zip(&scores) {
         row.1 = *score;
     }
+    // A `SORTBY` over a field the index keeps a copy of, which is sorted here
+    // and windowed here. A `SORTBY` over a field it keeps no copy of is not:
+    // the value is in the key, the keyspace is not locked here and the registry
+    // is, and a writer takes those two the other way round. So that one hands
+    // the whole answer back and is sorted once the lock has been let go of.
+    let by = rows.sorting.as_ref().filter(|by| by.slot.is_some());
+    // Whether a sort is still to come, which is what the window and the order
+    // below both turn on.
+    let later = rows.sorting.is_some() && by.is_none();
     // Best first, and a tie goes to the document that was written first. A
     // `NaN` sorts last rather than poisoning the comparison. An aggregation
     // with nothing sorting it hands the documents back in the order the index
     // holds them, which is measured: a five document answer whose scores run
     // 0.93, 0.69, 0.85, 0.27, 0.24 comes back in exactly that order, and those
     // five documents are in ascending document number.
-    match order {
-        Order::Ranked => found.sort_by(|a, b| {
+    match (by, order) {
+        // A sort by a field, where a tie goes to the document written first and
+        // is turned over with everything else by `DESC`: a descending answer is
+        // the ascending one backwards, apart from the rows with no value at
+        // all, which are last either way.
+        (Some(by), _) => {
+            let slot = by.slot.unwrap_or_default();
+            let held = |id: u32| index.held.docs.get(id).and_then(|doc| doc.sorted(slot));
+            found.sort_by(|a, b| {
+                let ids = match by.desc {
+                    true => b.0.cmp(&a.0),
+                    false => a.0.cmp(&b.0),
+                };
+                sorted::order(held(a.0), held(b.0), by.desc).then(ids)
+            });
+        }
+        // A sort that has not run yet, which is sorted once the lock has been
+        // let go of. It goes back in document number order so that its ties come
+        // out the same way round as the ties of a sort that ran here, since the
+        // sort that runs later is stable and keeps whatever order it was handed.
+        (None, _) if later => found.sort_by_key(|(id, _)| *id),
+        (None, Order::Ranked) => found.sort_by(|a, b| {
             b.1.partial_cmp(&a.1)
                 .unwrap_or(core::cmp::Ordering::Equal)
                 .then(a.0.cmp(&b.0))
         }),
-        Order::Forwards => found.sort_by_key(|(id, _)| *id),
-        Order::Backwards => found.sort_by_key(|(id, _)| core::cmp::Reverse(*id)),
+        (None, Order::Forwards) => found.sort_by_key(|(id, _)| *id),
+        (None, Order::Backwards) => found.sort_by_key(|(id, _)| core::cmp::Reverse(*id)),
     }
     let total = found.len();
     // A grouping step folds every document that answered and the window goes on
-    // what came out of it, so the window is not applied here at all.
-    let (offset, count) = match whole {
+    // what came out of it, so the window is not applied here at all. Neither is
+    // it applied to a sort that has not happened yet.
+    let (offset, count) = match whole || later {
         true => (0, usize::MAX),
         false => (rows.offset, rows.count),
     };
@@ -2998,6 +3176,7 @@ fn gather(
                 key: doc.key.clone(),
                 score,
                 payload: doc.payload.clone(),
+                sort: by.and_then(|by| doc.sorted(by.slot.unwrap_or_default()).cloned()),
             })
         })
         .collect();
@@ -3020,8 +3199,12 @@ fn write(
 ) {
     let want = &asked.rows;
     let loading = want.loading();
-    let mut built: Vec<Built<'_>> = Vec::with_capacity(rows.len());
-    let held: Vec<Option<indexing::Document>> = if loading {
+    // A sort by a field the index keeps no copy of is finished here, because
+    // the value is in the key and the key could not be read under the lock. So
+    // the whole answer arrived rather than a window on it, and every row of it
+    // has its key read whether or not the client asked for any fields.
+    let slow = want.sorting.as_ref().is_some_and(|by| by.slot.is_none());
+    let mut held: Vec<Option<indexing::Document>> = if loading || slow {
         rows.iter()
             .map(|row| indexing::read(&server.dbs[db], &row.key))
             .collect()
@@ -3029,6 +3212,43 @@ fn write(
         Vec::new()
     };
     let mut lost = 0;
+    let carried: Vec<Row>;
+    let mut rows = rows;
+    if let Some(by) = want.sorting.as_ref().filter(|by| by.slot.is_none()) {
+        let mut pairs: Vec<(Row, Option<indexing::Document>)> = rows
+            .iter()
+            .cloned()
+            .zip(core::mem::take(&mut held))
+            // A key that answered the query and went away before it could be
+            // read is out of the answer and off the total, the same as it is
+            // when nothing sorted.
+            .filter(|(_, doc)| doc.is_some())
+            .collect();
+        lost = rows.len() - pairs.len();
+        for (row, doc) in &mut pairs {
+            row.sort = doc
+                .as_ref()
+                .and_then(|doc| doc.held(&by.field.identifier))
+                .and_then(|raw| Sorted::read(&by.field, raw));
+        }
+        // The rows arrived in document number order, so turning them over first
+        // and sorting them with a sort that keeps what it does not have to move
+        // gives a descending answer the ascending one's tie order backwards,
+        // which is what the index's own sort does.
+        if by.desc {
+            pairs.reverse();
+        }
+        pairs.sort_by(|a, b| sorted::order(a.0.sort.as_ref(), b.0.sort.as_ref(), by.desc));
+        (carried, held) = pairs.into_iter().skip(want.offset).take(want.count).unzip();
+        rows = &carried;
+    }
+    // The value the sort compared, written out once per row, because the fields
+    // of a row point at what they were read from and this one is worked out.
+    let keys: Vec<Option<Vec<u8>>> = match want.sorting.is_some() {
+        true => rows.iter().map(|row| shown(row.sort.as_ref())).collect(),
+        false => Vec::new(),
+    };
+    let mut built: Vec<Built<'_>> = Vec::with_capacity(rows.len());
     for (at, row) in rows.iter().enumerate() {
         if !loading {
             built.push((row, None));
@@ -3038,8 +3258,10 @@ fn write(
             lost += 1;
             continue;
         };
-        built.push((row, Some(pick(doc, want))));
+        let key = keys.get(at).and_then(Option::as_deref);
+        built.push((row, Some(pick(doc, want, key))));
     }
+    shared(&mut built);
     let total = total - lost;
     if let Some(asks) = asked.cursor {
         // A search is settled: it ranked the whole answer before it wrote a row
@@ -3067,6 +3289,39 @@ fn write(
     found(total, &built, want.found(), out);
 }
 
+/// Puts every row of a window in the one order the whole window shares.
+///
+/// A real server does not answer a key in that key's own order. It keeps one
+/// ordered list of names for the answer, puts a name on the end of it the first
+/// time a row carries one, and then writes each row in that list's order,
+/// leaving out the names that row has nothing under. So the first row of a
+/// window fixes the order of the fields it holds and every row after it can only
+/// add to the end, which is why the same key comes back one way at `LIMIT 0 7`
+/// and another way at `LIMIT 1 2`, and why a sort puts its own field in front of
+/// everything: the sort registers its name before any row is read.
+fn shared(built: &mut [Built<'_>]) {
+    let mut order: Vec<&[u8]> = Vec::new();
+    for (_, fields) in built.iter() {
+        for (name, _) in fields.iter().flatten() {
+            if !order.contains(name) {
+                order.push(name);
+            }
+        }
+    }
+    for (_, fields) in built.iter_mut() {
+        let Some(fields) = fields else {
+            continue;
+        };
+        let mut out = Vec::with_capacity(fields.len());
+        for name in &order {
+            if let Some((_, value)) = fields.iter().find(|(held, _)| held == name) {
+                out.push((*name, *value));
+            }
+        }
+        *fields = out;
+    }
+}
+
 /// Copies a row's fields out of the documents they were read from.
 ///
 /// Only a cursor needs this. A reply that goes out in one piece points at the
@@ -3086,8 +3341,11 @@ fn found(total: usize, built: &[Built<'_>], shows: Shows, out: &mut Out) {
     }
     // One element for the total, then a fixed number for every row: the key,
     // then whichever of the score, the payload and the fields were asked for.
-    let per =
-        1 + usize::from(shows.scores) + usize::from(shows.payloads) + usize::from(shows.fields);
+    let per = 1
+        + usize::from(shows.scores)
+        + usize::from(shows.payloads)
+        + usize::from(shows.sortkeys)
+        + usize::from(shows.fields);
     out.array(1 + built.len() * per);
     out.int(total as i64);
     for (row, fields) in built {
@@ -3098,6 +3356,12 @@ fn found(total: usize, built: &[Built<'_>], shows: Shows, out: &mut Out) {
         if shows.payloads {
             match &row.payload {
                 Some(payload) => out.bulk(payload),
+                None => out.nil(),
+            }
+        }
+        if shows.sortkeys {
+            match sortkey(row.sort.as_ref()) {
+                Some(sorted) => out.bulk(&sorted),
                 None => out.nil(),
             }
         }
@@ -3129,6 +3393,7 @@ fn deep(total: usize, built: &[Built<'_>], shows: Shows, out: &mut Out) {
         out.map(
             2 + usize::from(shows.scores)
                 + usize::from(shows.payloads)
+                + usize::from(shows.sortkeys)
                 + usize::from(fields.is_some()),
         );
         out.simple(b"id");
@@ -3141,6 +3406,13 @@ fn deep(total: usize, built: &[Built<'_>], shows: Shows, out: &mut Out) {
             out.simple(b"payload");
             match &row.payload {
                 Some(payload) => out.bulk(payload),
+                None => out.nil(),
+            }
+        }
+        if shows.sortkeys {
+            out.simple(b"sortkey");
+            match sortkey(row.sort.as_ref()) {
+                Some(sorted) => out.bulk(&sorted),
                 None => out.nil(),
             }
         }
@@ -3168,17 +3440,85 @@ fn deep(total: usize, built: &[Built<'_>], shows: Shows, out: &mut Out) {
 /// them, they come back in the order it named them, a field the key does not
 /// hold is left out rather than sent empty, and a name that is not a field at
 /// all leaves an empty list rather than an error.
-fn pick<'d, 'w: 'd>(doc: &'d indexing::Document, want: &Rows<'w>) -> Vec<(&'d [u8], &'d [u8])> {
+///
+/// A sort puts its own field in front of the rest either way. With no `RETURN`
+/// the value the sort compared goes in first under the name the client sorted
+/// by, and then the key's own fields land on top of it: a field whose name the
+/// key holds keeps the place the sort gave it and takes the value the key has,
+/// and a field the schema renamed appears twice, once folded under the name the
+/// query calls it and once as it was written under the name the key calls it.
+/// With a `RETURN` there is nothing to put in, since the sort field is either
+/// on the list already or was not asked for, so it is moved to the front
+/// instead. All of that is measured.
+fn pick<'d, 'w: 'd>(
+    doc: &'d indexing::Document,
+    want: &'d Rows<'w>,
+    key: Option<&'d [u8]>,
+) -> Vec<(&'d [u8], &'d [u8])> {
     let pairs = doc.pairs();
+    let by = want.sorting.as_ref();
     let Some(ret) = &want.ret else {
-        return pairs;
+        let Some((by, key)) = by.zip(key) else {
+            return pairs;
+        };
+        let mut out: Vec<(&[u8], &[u8])> = Vec::with_capacity(pairs.len() + 1);
+        out.push((&by.field.attribute, key));
+        for (name, value) in pairs {
+            match out.iter_mut().find(|(held, _)| *held == name) {
+                Some(held) => held.1 = value,
+                None => out.push((name, value)),
+            }
+        }
+        return out;
     };
-    ret.iter()
+    let mut out: Vec<(&[u8], &[u8])> = ret
+        .iter()
         .filter_map(|(field, name)| {
-            let (_, value) = pairs.iter().find(|(held, _)| held == field)?;
+            let (_, value) = pairs.iter().find(|(held, _)| *held == &**field)?;
             Some((&**name, *value))
         })
-        .collect()
+        .collect();
+    if let Some(by) = by
+        && let Some(at) = out
+            .iter()
+            .position(|(name, _)| *name == &*by.field.attribute)
+    {
+        let held = out.remove(at);
+        out.insert(0, held);
+    }
+    out
+}
+
+/// The value the sort compared, as it goes on the row beside the other fields.
+///
+/// A number is written the same twelve significant digits everything else on a
+/// row is written to, which is not how the same number goes into a sort key.
+fn shown(sort: Option<&Sorted>) -> Option<Vec<u8>> {
+    match sort? {
+        Sorted::Number(number) => Some(twelve(*number).into_bytes()),
+        Sorted::Text(text) => Some(text.to_vec()),
+    }
+}
+
+/// The sort key element beside a row, when `WITHSORTKEYS` asked for one.
+///
+/// A number after a hash and text after a dollar, the same as an aggregation
+/// writes them, and a null on a row the sort found no value on. The number is
+/// written wider than the same number on the row is: a sort key is the value
+/// the sort compared and a row holds the value the client reads.
+fn sortkey(sort: Option<&Sorted>) -> Option<Vec<u8>> {
+    let mut out = Vec::new();
+    match sort? {
+        Sorted::Number(number) => {
+            out.push(b'#');
+            out.extend_from_slice(seventeen(*number).as_bytes());
+        }
+        Sorted::Text(text) => {
+            out.push(b'$');
+            out.extend_from_slice(text);
+        }
+    }
+    Some(out)
 }
 
 #[cfg(test)]
@@ -3209,5 +3549,66 @@ mod tests {
         assert_eq!(seventeen(1e17), "1e+17");
         assert_eq!(seventeen(0.000_01), "1.0000000000000001e-05");
         assert_eq!(seventeen(0.000_1), "0.0001");
+    }
+
+    #[test]
+    fn a_sort_key_says_which_of_the_two_kinds_of_value_it_is() {
+        let number = Sorted::Number(1.0 / 3.0);
+        let text = Sorted::Text(b"four score".as_slice().into());
+        assert_eq!(
+            sortkey(Some(&number)).as_deref(),
+            Some(&b"#0.33333333333333331"[..])
+        );
+        assert_eq!(sortkey(Some(&text)).as_deref(), Some(&b"$four score"[..]));
+        assert_eq!(sortkey(None), None);
+        // The same value beside the fields of the row is the width every other
+        // number on a row is written to, which is five digits narrower.
+        assert_eq!(
+            shown(Some(&number)).as_deref(),
+            Some(&b"0.333333333333"[..])
+        );
+        assert_eq!(shown(Some(&text)).as_deref(), Some(&b"four score"[..]));
+        assert_eq!(shown(None), None);
+    }
+
+    #[test]
+    fn every_row_of_a_window_is_written_in_the_order_the_window_shares() {
+        let row = Row {
+            key: Box::default(),
+            score: 0.0,
+            payload: None,
+            sort: None,
+        };
+        let mut built: Vec<Built<'_>> = vec![
+            (
+                &row,
+                Some(vec![(&b"n"[..], &b"0"[..]), (&b"p"[..], &b"a"[..])]),
+            ),
+            (
+                &row,
+                Some(vec![
+                    (&b"t"[..], &b"x"[..]),
+                    (&b"p"[..], &b"b"[..]),
+                    (&b"n"[..], &b"2"[..]),
+                ]),
+            ),
+            (&row, None),
+        ];
+        shared(&mut built);
+        // The first row fixes the order of what it holds and the second one can
+        // only add to the end of it, so `t` lands after `n` and `p` even though
+        // the key it was read from holds it first.
+        assert_eq!(
+            built[1].1.as_deref(),
+            Some(
+                &[
+                    (&b"n"[..], &b"2"[..]),
+                    (&b"p"[..], &b"b"[..]),
+                    (&b"t"[..], &b"x"[..])
+                ][..]
+            )
+        );
+        assert_eq!(built[0].1.as_ref().map(Vec::len), Some(2));
+        assert_eq!(built[2].1, None);
     }
 }
