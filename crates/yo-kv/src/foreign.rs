@@ -39,7 +39,12 @@ use std::fmt::Debug;
 /// keyspace owns the box and frees it when the key goes, so a foreign body
 /// cannot outlive its key and cannot be left behind by a `DEL` that forgot
 /// about it.
-pub trait Foreign: Any + Debug {
+///
+/// `Send` for the same reason a value of any other type is: the key it hangs
+/// off lives in a stripe, and a stripe is worked on by whichever thread holds
+/// its lock. Every body in this repo is plain owned data and meets the bound
+/// already.
+pub trait Foreign: Any + Debug + Send {
     /// The word `TYPE` replies with.
     ///
     /// Not `"foreign"`. A client asking `TYPE` about a graph is told `graph`,

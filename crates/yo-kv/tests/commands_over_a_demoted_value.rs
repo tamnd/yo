@@ -10,8 +10,8 @@
 //! use one: it counts its reads, and reads per command is what G9 is a gate on.
 //! `chain_on_the_log.rs` is the same layer against a real log.
 
-use std::cell::Cell;
-use std::rc::Rc;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use yo_common::{Addr, Code, Error, Result, Space};
 use yo_kv::cold::Blocks;
@@ -24,7 +24,7 @@ use yo_kv::{Encoding, Expire, Keyspace, Str};
 /// mutable borrow cannot have both.
 struct Mem {
     blobs: Vec<Vec<u8>>,
-    reads: Rc<Cell<usize>>,
+    reads: Arc<AtomicUsize>,
 }
 
 impl Blocks for Mem {
@@ -34,7 +34,7 @@ impl Blocks for Mem {
     }
 
     fn get(&self, at: Addr) -> Result<&[u8]> {
-        self.reads.set(self.reads.get() + 1);
+        self.reads.fetch_add(1, Ordering::Relaxed);
         self.blobs
             .get(at.offset() as usize)
             .map(Vec::as_slice)
@@ -47,12 +47,12 @@ impl Blocks for Mem {
 }
 
 /// A database with somewhere to put values, and the read counter.
-fn db() -> (Keyspace, Rc<Cell<usize>>) {
-    let reads = Rc::new(Cell::new(0));
+fn db() -> (Keyspace, Arc<AtomicUsize>) {
+    let reads = Arc::new(AtomicUsize::new(0));
     let mut k = Keyspace::new();
     k.attach(Box::new(Mem {
         blobs: Vec::new(),
-        reads: Rc::clone(&reads),
+        reads: Arc::clone(&reads),
     }));
     (k, reads)
 }
@@ -66,14 +66,14 @@ fn value() -> Vec<u8> {
 }
 
 /// A database holding `key` with its value already on the file.
-fn cold(key: &[u8], val: &[u8]) -> (Keyspace, Rc<Cell<usize>>) {
+fn cold(key: &[u8], val: &[u8]) -> (Keyspace, Arc<AtomicUsize>) {
     let (mut k, reads) = db();
     k.set_plain(key, val).expect("stored");
     assert!(
         k.demote(key).expect("demoted"),
         "the value should have gone"
     );
-    reads.set(0);
+    reads.store(0, Ordering::Relaxed);
     (k, reads)
 }
 
@@ -82,7 +82,7 @@ fn get_answers_the_value_that_was_stored() {
     let val = value();
     let (mut k, reads) = cold(b"k", &val);
     assert_eq!(k.get(b"k").expect("read"), Some(Str::Bytes(&val)));
-    assert_eq!(reads.get(), 1, "one chunk is one read");
+    assert_eq!(reads.load(Ordering::Relaxed), 1, "one chunk is one read");
 }
 
 #[test]
@@ -101,10 +101,14 @@ fn the_first_read_does_not_bring_it_back_and_the_second_one_does() {
     assert_eq!(k.tier().expect("attached").stats().promoted, 1);
 
     // And now it is in memory, so nothing else goes to the device.
-    let before = reads.get();
+    let before = reads.load(Ordering::Relaxed);
     assert_eq!(k.get(b"k").expect("read"), Some(Str::Bytes(&val)));
     assert_eq!(k.get(b"k").expect("read"), Some(Str::Bytes(&val)));
-    assert_eq!(reads.get(), before, "a warm read is not a device read");
+    assert_eq!(
+        reads.load(Ordering::Relaxed),
+        before,
+        "a warm read is not a device read"
+    );
 }
 
 #[test]
@@ -122,7 +126,11 @@ fn the_header_still_answers_without_touching_the_device() {
     assert_eq!(k.type_name(b"k"), Some("string"));
     assert_eq!(k.encoding(b"k"), Some(Encoding::Raw));
     assert!(matches!(k.deadline_of(b"k"), yo_kv::Ask::At(w) if w == when));
-    assert_eq!(reads.get(), 0, "the record answered all of it");
+    assert_eq!(
+        reads.load(Ordering::Relaxed),
+        0,
+        "the record answered all of it"
+    );
 }
 
 #[test]
@@ -133,12 +141,16 @@ fn a_deadline_moves_without_reading_the_value_back() {
     let (mut k, reads) = cold(b"k", &val);
     let when = k.clock().now_ms() + 100_000;
     assert!(k.set_expiry(b"k", Some(when)));
-    assert_eq!(reads.get(), 0, "no chunk should have been read");
+    assert_eq!(
+        reads.load(Ordering::Relaxed),
+        0,
+        "no chunk should have been read"
+    );
     assert_eq!(k.expire_at(b"k"), Some(when));
     assert_eq!(k.strlen(b"k").expect("length"), val.len());
     // And the value is still on the file and still readable.
     assert_eq!(k.get(b"k").expect("read"), Some(Str::Bytes(&val)));
-    assert_eq!(reads.get(), 1);
+    assert_eq!(reads.load(Ordering::Relaxed), 1);
 }
 
 #[test]
@@ -244,7 +256,7 @@ fn set_over_a_demoted_key_costs_no_device_read() {
     let val = value();
     let (mut k, reads) = cold(b"k", &val);
     k.set_plain(b"k", b"small").expect("stored");
-    assert_eq!(reads.get(), 0);
+    assert_eq!(reads.load(Ordering::Relaxed), 0);
     assert_eq!(k.get(b"k").expect("read"), Some(Str::Bytes(b"small")));
 }
 

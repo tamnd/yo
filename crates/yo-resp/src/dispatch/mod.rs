@@ -97,7 +97,7 @@ use std::sync::atomic::Ordering::{Acquire, Relaxed, Release};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize};
 use yo_common::lock::{Held, Lock};
 use yo_common::{Code, Error};
-use yo_kv::cold::Blocks;
+use yo_kv::cold::Store;
 use yo_kv::{Clock, Db, Keyspace};
 use yo_search::Registry;
 
@@ -421,14 +421,24 @@ impl CommandStats {
 /// `None` means that database cannot have one. The caller owns whatever the
 /// stores are cut out of, which for `yodb` is one `.yo` file with a log per
 /// database, and this crate never learns what any of that is.
-pub type StoreSource = dyn FnMut(usize) -> Option<Box<dyn Blocks>>;
+pub type StoreSource = dyn FnMut(usize) -> Option<Store> + Send;
+
+/// Every thread that runs commands here shares this server, so it has to be
+/// `Send` and `Sync`, and the check is here so that a type added to it that is
+/// neither is a compile error where it was added rather than an error in the
+/// code that starts the threads.
+const _: () = {
+    const fn shareable<T: Send + Sync>() {}
+    shareable::<Server>();
+};
 
 /// Everything a server holds.
 ///
-/// One of these per shard thread, not one per process: the databases inside are
-/// not `Sync` and are reached by sending their thread a command. What makes
-/// this a server rather than a shard is that it is the whole of what a
-/// connection can address.
+/// One per process, however many threads are serving out of it. What is inside
+/// is either shared outright, which is the counters and the settings, or behind
+/// a lock, which is the stripes and the few pieces of state a command can
+/// change. What makes this a server rather than a shard is that it is the whole
+/// of what a connection can address.
 pub struct Server {
     dbs: Vec<Db>,
     /// How many stripes each database is cut into, the same for all of them.
@@ -1128,7 +1138,7 @@ impl Server {
     /// that is given a file and never fills memory never touches it.
     pub fn set_store_source(
         &mut self,
-        source: impl FnMut(usize) -> Option<Box<dyn Blocks>> + 'static,
+        source: impl FnMut(usize) -> Option<Store> + Send + 'static,
     ) {
         *self.store.lock() = Some(Box::new(source));
     }

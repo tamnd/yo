@@ -105,11 +105,20 @@ impl Drop for Cache {
     }
 }
 
+// SAFETY: every pointer in here came from `Box::into_raw` of a box this cache
+// made and nothing outside it has a copy, so moving the cache moves the
+// allocations with it and leaves nobody pointing at them from where it was.
+// This says nothing about two threads being in one cache at once, which is what
+// `Sync` would say and what `LogFile` deliberately is not.
+unsafe impl Send for Cache {}
+
 /// One shard's log pages, in a file.
 ///
-/// Not `Sync`, and that is not an accident. A log belongs to one shard, a shard
-/// belongs to one core, and the read cache below relies on there being exactly
-/// one thread in here at a time.
+/// Not `Sync`, and that is not an accident: the read cache below relies on there
+/// being exactly one thread in here at a time, and what guarantees that is the
+/// exclusive borrow every caller comes through rather than the thread it is on.
+/// Which thread that is changes with whoever holds the stripe above it, so this
+/// is `Send`.
 pub struct LogFile {
     shard: u32,
     file: Arc<File>,

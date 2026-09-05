@@ -16,8 +16,8 @@
 //! the same reason: reads per command is what G9 is a gate on, and a set that
 //! came back in one read is the number this milestone is about.
 
-use std::cell::Cell;
-use std::rc::Rc;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use yo_common::{Addr, Code, Error, Result, Space};
 use yo_kv::cold::Blocks;
@@ -30,7 +30,7 @@ use yo_kv::{End, Keyspace, array, hash, list, set, zset};
 /// A store that remembers how many times it was read.
 struct Mem {
     blobs: Vec<Vec<u8>>,
-    reads: Rc<Cell<usize>>,
+    reads: Arc<AtomicUsize>,
 }
 
 impl Blocks for Mem {
@@ -40,7 +40,7 @@ impl Blocks for Mem {
     }
 
     fn get(&self, at: Addr) -> Result<&[u8]> {
-        self.reads.set(self.reads.get() + 1);
+        self.reads.fetch_add(1, Ordering::Relaxed);
         self.blobs
             .get(at.offset() as usize)
             .map(Vec::as_slice)
@@ -52,12 +52,12 @@ impl Blocks for Mem {
     }
 }
 
-fn db() -> (Keyspace, Rc<Cell<usize>>) {
-    let reads = Rc::new(Cell::new(0));
+fn db() -> (Keyspace, Arc<AtomicUsize>) {
+    let reads = Arc::new(AtomicUsize::new(0));
     let mut k = Keyspace::new();
     k.attach(Box::new(Mem {
         blobs: Vec::new(),
-        reads: Rc::clone(&reads),
+        reads: Arc::clone(&reads),
     }));
     (k, reads)
 }
@@ -71,11 +71,11 @@ fn members(n: usize) -> Vec<Vec<u8>> {
 }
 
 /// A database holding `key` as a set with its body already on the file.
-fn cold(key: &[u8], of: &[Vec<u8>]) -> (Keyspace, Rc<Cell<usize>>) {
+fn cold(key: &[u8], of: &[Vec<u8>]) -> (Keyspace, Arc<AtomicUsize>) {
     let (mut k, reads) = db();
     k.sadd(key, of.iter().map(Vec::as_slice)).expect("added");
     assert!(k.demote(key).expect("demoted"), "the body should have gone");
-    reads.set(0);
+    reads.store(0, Ordering::Relaxed);
     (k, reads)
 }
 
@@ -92,12 +92,12 @@ fn fields(n: usize) -> Vec<(Vec<u8>, Vec<u8>)> {
 }
 
 /// A database holding `key` as a hash with its body already on the file.
-fn cold_hash(key: &[u8], of: &[(Vec<u8>, Vec<u8>)]) -> (Keyspace, Rc<Cell<usize>>) {
+fn cold_hash(key: &[u8], of: &[(Vec<u8>, Vec<u8>)]) -> (Keyspace, Arc<AtomicUsize>) {
     let (mut k, reads) = db();
     k.hset(key, of.iter().map(|(f, v)| (f.as_slice(), v.as_slice())))
         .expect("set");
     assert!(k.demote(key).expect("demoted"), "the body should have gone");
-    reads.set(0);
+    reads.store(0, Ordering::Relaxed);
     (k, reads)
 }
 
@@ -109,12 +109,12 @@ fn elements(n: usize) -> Vec<Vec<u8>> {
 }
 
 /// A database holding `key` as a list with its body already on the file.
-fn cold_list(key: &[u8], of: &[Vec<u8>]) -> (Keyspace, Rc<Cell<usize>>) {
+fn cold_list(key: &[u8], of: &[Vec<u8>]) -> (Keyspace, Arc<AtomicUsize>) {
     let (mut k, reads) = db();
     k.push(key, End::Right, of.iter().map(Vec::as_slice))
         .expect("pushed");
     assert!(k.demote(key).expect("demoted"), "the body should have gone");
-    reads.set(0);
+    reads.store(0, Ordering::Relaxed);
     (k, reads)
 }
 
@@ -132,7 +132,7 @@ fn scored(n: usize) -> Vec<(f64, Vec<u8>)> {
 }
 
 /// A database holding `key` as a sorted set with its body already on the file.
-fn cold_zset(key: &[u8], of: &[(f64, Vec<u8>)]) -> (Keyspace, Rc<Cell<usize>>) {
+fn cold_zset(key: &[u8], of: &[(f64, Vec<u8>)]) -> (Keyspace, Arc<AtomicUsize>) {
     let (mut k, reads) = db();
     k.zadd(
         key,
@@ -141,7 +141,7 @@ fn cold_zset(key: &[u8], of: &[(f64, Vec<u8>)]) -> (Keyspace, Rc<Cell<usize>>) {
     )
     .expect("added");
     assert!(k.demote(key).expect("demoted"), "the body should have gone");
-    reads.set(0);
+    reads.store(0, Ordering::Relaxed);
     (k, reads)
 }
 
@@ -160,7 +160,7 @@ fn zrange(k: &mut Keyspace, key: &[u8], q: &Query<'_>) -> Vec<Vec<u8>> {
 
 /// A database holding `key` as an array with `n` values in it, one every
 /// seventh index so the slices are sparse, already on the file.
-fn cold_array(key: &[u8], n: u64) -> (Keyspace, Rc<Cell<usize>>) {
+fn cold_array(key: &[u8], n: u64) -> (Keyspace, Arc<AtomicUsize>) {
     let (mut k, reads) = db();
     for i in 0..n {
         let val = format!("value:{i:05} and long enough to reach the blob").into_bytes();
@@ -168,7 +168,7 @@ fn cold_array(key: &[u8], n: u64) -> (Keyspace, Rc<Cell<usize>>) {
             .expect("set");
     }
     assert!(k.demote(key).expect("demoted"), "the body should have gone");
-    reads.set(0);
+    reads.store(0, Ordering::Relaxed);
     (k, reads)
 }
 
@@ -187,7 +187,7 @@ fn arget(k: &mut Keyspace, key: &[u8], at: u64) -> Option<Vec<u8>> {
 
 /// A database holding `key` as a stream of `n` entries with a group that has
 /// read half of them, already on the file.
-fn cold_stream(key: &[u8], n: u64) -> (Keyspace, Rc<Cell<usize>>) {
+fn cold_stream(key: &[u8], n: u64) -> (Keyspace, Arc<AtomicUsize>) {
     let (mut k, reads) = db();
     for ms in 1..=n {
         let job = format!("job:{ms:05}").into_bytes();
@@ -214,7 +214,7 @@ fn cold_stream(key: &[u8], n: u64) -> (Keyspace, Rc<Cell<usize>>) {
     k.xreadgroup_into(key, want, 2_000, |_, _| true)
         .expect("read");
     assert!(k.demote(key).expect("demoted"), "the body should have gone");
-    reads.set(0);
+    reads.store(0, Ordering::Relaxed);
     (k, reads)
 }
 
@@ -257,7 +257,7 @@ fn bringing_a_set_back_costs_one_pass_over_its_chunks_and_then_nothing() {
     let all = members(400);
     let (mut k, reads) = cold(b"s", &all);
     assert_eq!(k.scard(b"s").expect("counted"), 400);
-    let first = reads.get();
+    let first = reads.load(Ordering::Relaxed);
     assert!(first > 0, "the body was on the file");
     // Every command after the first is answered out of the slab. A collection
     // does not have a served path: it is in memory or it is not readable, so one
@@ -266,7 +266,11 @@ fn bringing_a_set_back_costs_one_pass_over_its_chunks_and_then_nothing() {
         k.scard(b"s").expect("counted");
         k.sismember(b"s", b"member:00007").expect("asked");
     }
-    assert_eq!(reads.get(), first, "nothing went back to the device");
+    assert_eq!(
+        reads.load(Ordering::Relaxed),
+        first,
+        "nothing went back to the device"
+    );
 }
 
 #[test]
@@ -311,7 +315,11 @@ fn a_deadline_on_a_demoted_set_costs_no_device_read() {
     // Far enough out that the key is alive for the rest of this test whenever it
     // runs, which is what a deadline in milliseconds since the epoch has to be.
     assert!(k.set_expiry(b"s", Some(9_000_000_000_000)));
-    assert_eq!(reads.get(), 0, "the deadline is in front of the address");
+    assert_eq!(
+        reads.load(Ordering::Relaxed),
+        0,
+        "the deadline is in front of the address"
+    );
     // And the set is still there and still whole afterwards, which is the part
     // that would break if the record had been written as a slot record.
     assert_eq!(k.scard(b"s").expect("counted"), 400);
@@ -381,13 +389,17 @@ fn bringing_a_hash_back_costs_one_pass_and_then_nothing() {
     let all = fields(600);
     let (mut k, reads) = cold_hash(b"h", &all);
     assert_eq!(k.hlen(b"h").expect("counted"), 600);
-    let first = reads.get();
+    let first = reads.load(Ordering::Relaxed);
     assert!(first > 0, "the body was on the file");
     for _ in 0..50 {
         k.hlen(b"h").expect("counted");
         hget(&mut k, b"h", b"field:00007");
     }
-    assert_eq!(reads.get(), first, "nothing went back to the device");
+    assert_eq!(
+        reads.load(Ordering::Relaxed),
+        first,
+        "nothing went back to the device"
+    );
 }
 
 #[test]
@@ -527,13 +539,17 @@ fn bringing_a_list_back_costs_one_pass_and_then_nothing() {
     let all = elements(200);
     let (mut k, reads) = cold_list(b"l", &all);
     assert_eq!(k.llen(b"l").expect("counted"), 200);
-    let first = reads.get();
+    let first = reads.load(Ordering::Relaxed);
     assert!(first > 0, "the body was on the file");
     for _ in 0..50 {
         k.llen(b"l").expect("counted");
         lindex(&mut k, b"l", 7);
     }
-    assert_eq!(reads.get(), first, "nothing went back to the device");
+    assert_eq!(
+        reads.load(Ordering::Relaxed),
+        first,
+        "nothing went back to the device"
+    );
 }
 
 #[test]
@@ -628,14 +644,18 @@ fn bringing_a_sorted_set_back_costs_one_pass_and_then_nothing() {
     let all = scored(400);
     let (mut k, reads) = cold_zset(b"z", &all);
     assert_eq!(k.zcard(b"z").expect("counted"), 400);
-    let first = reads.get();
+    let first = reads.load(Ordering::Relaxed);
     assert!(first > 0, "the body was on the file");
     for _ in 0..50 {
         k.zcard(b"z").expect("counted");
         k.zscore(b"z", b"member:00007").expect("asked");
         k.zrank(b"z", b"member:00007", false).expect("ranked");
     }
-    assert_eq!(reads.get(), first, "nothing went back to the device");
+    assert_eq!(
+        reads.load(Ordering::Relaxed),
+        first,
+        "nothing went back to the device"
+    );
 }
 
 #[test]
@@ -751,13 +771,17 @@ fn a_demoted_array_answers_arlen_arcount_and_arget_with_what_it_held() {
 fn bringing_an_array_back_costs_one_pass_and_then_nothing() {
     let (mut k, reads) = cold_array(b"a", 300);
     assert_eq!(k.arcount(b"a").expect("counted"), 300);
-    let first = reads.get();
+    let first = reads.load(Ordering::Relaxed);
     assert!(first > 0, "the body was on the file");
     for _ in 0..50 {
         k.arcount(b"a").expect("counted");
         arget(&mut k, b"a", 49);
     }
-    assert_eq!(reads.get(), first, "nothing went back to the device");
+    assert_eq!(
+        reads.load(Ordering::Relaxed),
+        first,
+        "nothing went back to the device"
+    );
 }
 
 #[test]
@@ -850,13 +874,17 @@ fn a_demoted_stream_answers_xlen_and_xrange_with_what_it_held() {
 fn bringing_a_stream_back_costs_one_pass_and_then_nothing() {
     let (mut k, reads) = cold_stream(b"x", 400);
     assert_eq!(k.stream(b"x").expect("asked").expect("there").len(), 400);
-    let first = reads.get();
+    let first = reads.load(Ordering::Relaxed);
     assert!(first > 0, "the body was on the file");
     for _ in 0..50 {
         k.stream(b"x").expect("asked");
         xrange(&mut k, b"x");
     }
-    assert_eq!(reads.get(), first, "nothing went back to the device");
+    assert_eq!(
+        reads.load(Ordering::Relaxed),
+        first,
+        "nothing went back to the device"
+    );
 }
 
 #[test]

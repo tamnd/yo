@@ -697,6 +697,29 @@ mod tests {
         db
     }
 
+    /// A stripe goes to whichever thread takes it, so the records in it have to
+    /// survive being written by one thread and read by another.
+    #[test]
+    fn two_threads_take_turns_over_one_stripe() {
+        let db = filled(1, 8);
+        std::thread::scope(|s| {
+            for at in 0..4u32 {
+                let db = &db;
+                s.spawn(move || {
+                    let key = format!("t{at}").into_bytes();
+                    db.hold(&key).setnx(&key, b"v").expect("room");
+                });
+            }
+        });
+        assert_eq!(db.hold_stripe(0).len(), 12);
+        // And what the threads wrote reads back, which is the part a bump
+        // pointer that had been left on another thread would get wrong.
+        for at in 0..4u32 {
+            let key = format!("t{at}").into_bytes();
+            assert!(db.hold_stripe(0).get(&key).expect("a string").is_some());
+        }
+    }
+
     #[test]
     fn a_width_is_always_a_power_of_two_and_never_zero() {
         for asked in [0, 1, 2, 3, 5, 8, 9, 100] {
