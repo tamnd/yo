@@ -1554,7 +1554,7 @@ impl Session {
 ///
 /// The name is looked up and the arity is checked here, once, so that no body
 /// has to. Everything after that is the command's own.
-pub fn execute(server: &mut Server, session: &mut Session, args: Args<'_>, out: &mut Out) -> Flow {
+pub fn execute(server: &Server, session: &mut Session, args: Args<'_>, out: &mut Out) -> Flow {
     // The decoder never produces a command with no name. If one ever arrives,
     // it is not something to answer.
     if args.is_empty() {
@@ -1575,7 +1575,7 @@ pub fn execute(server: &mut Server, session: &mut Session, args: Args<'_>, out: 
 /// `spec` is `None` for a name that is not a command, which is the same thing
 /// [`lookup`] says and lands in the same reply.
 pub fn resolved(
-    server: &mut Server,
+    server: &Server,
     session: &mut Session,
     spec: Option<&'static Spec>,
     args: Args<'_>,
@@ -1905,7 +1905,7 @@ mod tests {
             self.argv.decode(&wire, &Limits::default()).unwrap();
             self.out.clear();
             execute(
-                &mut self.server,
+                &self.server,
                 &mut self.session,
                 Args::new(&self.argv, &wire),
                 &mut self.out,
@@ -1924,7 +1924,7 @@ mod tests {
             self.argv.decode(&wire, &Limits::default()).unwrap();
             self.out.clear();
             let flow = execute(
-                &mut self.server,
+                &self.server,
                 &mut self.session,
                 Args::new(&self.argv, &wire),
                 &mut self.out,
@@ -2374,6 +2374,32 @@ mod tests {
         // A database swapped with itself is fine and changes nothing.
         assert_eq!(f.run(&[b"SWAPDB", b"1", b"1"]), "+OK\r\n");
         assert_eq!(f.run(&[b"GET", b"k"]), "$4\r\nzero\r\n");
+    }
+
+    /// The swap is stripe by stripe, so a database cut into more than one
+    /// stripe is the case that would catch it exchanging some of the keys and
+    /// leaving the rest. Sixteen keys over four stripes is enough that every
+    /// stripe has something in it whatever the hashes come out as.
+    #[test]
+    fn swapdb_swaps_every_stripe_of_a_wide_database() {
+        let mut f = Fixture::striped(4);
+        for i in 0..16u32 {
+            let key = format!("k{i}");
+            assert_eq!(f.run(&[b"SET", key.as_bytes(), b"zero"]), "+OK\r\n");
+        }
+        assert_eq!(f.run(&[b"SELECT", b"1"]), "+OK\r\n");
+        assert_eq!(f.run(&[b"SET", b"only", b"one"]), "+OK\r\n");
+        assert_eq!(f.run(&[b"SELECT", b"0"]), "+OK\r\n");
+
+        assert_eq!(f.run(&[b"SWAPDB", b"0", b"1"]), "+OK\r\n");
+        assert_eq!(f.run(&[b"DBSIZE"]), ":1\r\n");
+        assert_eq!(f.run(&[b"GET", b"only"]), "$3\r\none\r\n");
+        assert_eq!(f.run(&[b"SELECT", b"1"]), "+OK\r\n");
+        assert_eq!(f.run(&[b"DBSIZE"]), ":16\r\n");
+        for i in 0..16u32 {
+            let key = format!("k{i}");
+            assert_eq!(f.run(&[b"GET", key.as_bytes()]), "$4\r\nzero\r\n");
+        }
     }
 
     #[test]

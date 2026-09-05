@@ -859,7 +859,7 @@ mod tests {
                 .expect("the test wrote a legal command");
             self.out.clear();
             execute(
-                &mut self.server,
+                &self.server,
                 &mut self.session,
                 Args::new(&self.argv, &wire),
                 &mut self.out,
