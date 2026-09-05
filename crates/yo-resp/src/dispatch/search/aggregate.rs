@@ -20,18 +20,22 @@ use yo_search::field::Kind;
 use yo_search::reduce;
 use yo_search::token;
 
+use super::cursor::{Kept, Made};
 use super::{
     AS_SHORT, Args, Asked, BAD_ARGS, COUNT_ONLY, DUPLICATE_END, DUPLICATE_PROP, GROUP_COUNT,
     GROUP_SHORT, MAX_COUNT, MISSING_ARGS, MOST_SAMPLE, NO_AT, NO_AT_END, NO_AT_MID, NO_PROPERTY,
     NO_REDUCER, NOT_A_NUMBER, NOT_LOADED, NOT_MAIN, NOT_THERE, OUT_OF_RANGE, PERCENTAGE, QUOTE_END,
     REDUCE_BARE, RESOLUTION, RESOLUTION_ARG, Row, SAMPLE_BIG, SAMPLE_SIZE, SORT_BOUNDS, SORT_COUNT,
     SORT_PROP, SORT_PROP_END, SORT_SHORT, SORT_TWICE, SORT_WAY, SORT_WAY_END, STEP_SHORT, Shows,
-    UNKNOWN, line, twelve,
+    UNKNOWN, cursor, line, twelve,
 };
 use crate::dispatch::Server;
 use crate::dispatch::args;
 use crate::dispatch::indexing;
 use crate::reply::Out;
+
+/// How many rows a `SORTBY` with nothing saying otherwise hands back.
+const SORTED: usize = 10;
 
 /// The half of the argument list only `FT.AGGREGATE` fills in.
 ///
@@ -725,6 +729,25 @@ fn arranged(pipe: &mut Pipe<'_>) -> usize {
     pipe.steps.len() - 1
 }
 
+/// The ten rows a `SORTBY` hands back when nobody said how many.
+///
+/// A sort with keys on it and no width, from a `MAX` of its own or from a
+/// `LIMIT` sharing its step, is capped at ten. `MAX 0` is no cap and so it gets
+/// the ten as well, and a `SORTBY` with no keys is not a sort at all and keeps
+/// every row. Nothing else in a pipeline has a default width: `LOAD`, `APPLY`
+/// and `GROUPBY` on their own all hand back every row they made.
+pub(super) fn most(asked: &mut Asked<'_>) {
+    let Some(spot) = asked.pipe.arrange else {
+        return;
+    };
+    if let Step::Sort(sort) = &mut asked.pipe.steps[spot]
+        && !sort.keys.is_empty()
+        && sort.count.is_none()
+    {
+        sort.count = Some(SORTED);
+    }
+}
+
 /// What a `LIMIT` does to an aggregation, which is not what it does to a
 /// search: it is a step of the pipeline standing where the client wrote it
 /// rather than a window on the answer.
@@ -759,6 +782,7 @@ pub(super) fn piped(
     total: usize,
     rows: &[Row],
     asked: &Asked<'_>,
+    index: &[u8],
     out: &mut Out,
 ) {
     let pipe = &asked.pipe;
@@ -771,6 +795,10 @@ pub(super) fn piped(
             .iter()
             .any(|(_, from)| matches!(from, Reads::Field(..)));
     let mut table: Vec<Held> = Vec::with_capacity(rows.len());
+    // The walk, one entry per document the query answered, which only a cursor
+    // asks for. A document goes false when something takes it out of the answer
+    // rather than when the window steps over it.
+    let mut walk = vec![true; rows.len()];
     let mut lost = 0;
     for (at, row) in rows.iter().enumerate() {
         let doc = match reads {
@@ -781,6 +809,7 @@ pub(super) fn piped(
                 Some(doc) => Some(doc),
                 None => {
                     lost += 1;
+                    walk[at] = false;
                     continue;
                 }
             },
@@ -891,6 +920,9 @@ pub(super) fn piped(
                         }
                         Ok(_) => {
                             over += 1;
+                            if let Some(at) = held.from {
+                                walk[at] = false;
+                            }
                             false
                         }
                         Err(bad) => {
@@ -936,15 +968,27 @@ pub(super) fn piped(
         out.error(bad);
         return;
     }
-    let counted = counting(
-        &table,
-        start,
-        gone,
-        asked,
-        grouped || ranked,
-        shown.len(),
-        out,
-    );
+    let settled = grouped || ranked;
+    let counted = counting(&table, start, gone, asked, settled, shown.len(), out);
+    if asked.cursor.is_some() {
+        drop(shown);
+        // A settled answer reports the real total whatever the walk did, so the
+        // walk is not worth carrying for one.
+        if settled {
+            walk = Vec::new();
+        }
+        let made = Made::Piped {
+            names,
+            sorted,
+            rows: table
+                .into_iter()
+                .map(|held| (held.from.map(|at| rows[at].clone()), held.values))
+                .collect(),
+            warning,
+        };
+        opened(server, index, made, walk, counted, asked, settled, out);
+        return;
+    }
     writes(
         counted,
         &names,
@@ -954,6 +998,62 @@ pub(super) fn piped(
         warning.as_deref(),
         out,
     );
+}
+
+/// Hands the rows the pipeline made to a cursor, which writes them a chunk at a
+/// time.
+///
+/// The rows are copied out of the table, because a cursor outlives the command
+/// that made it and the table is borrowed from the documents that were read.
+#[allow(clippy::too_many_arguments)]
+fn opened(
+    server: &Server,
+    index: &[u8],
+    made: Made,
+    walk: Vec<bool>,
+    counted: usize,
+    asked: &Asked<'_>,
+    settled: bool,
+    out: &mut Out,
+) {
+    let Some(asks) = asked.cursor else {
+        return;
+    };
+    // A pipeline's window is a step standing where the client wrote it rather
+    // than a window on the reply, so it is read back off the last step that has
+    // one. A `SORTBY` with keys on it settles the answer and takes the walk
+    // arithmetic away altogether, so only a bare `LIMIT` is ever read here.
+    let want = window(asked);
+    let kept = Kept {
+        made,
+        walk,
+        shows: asked.rolls(),
+        total: counted,
+        // A pipeline that reads fields and starts at the top reports the real
+        // total when it answers in one piece and reports the chunk when it
+        // answers in several, because a chunk is bounded and so there is no
+        // moment where the whole answer has been read. That one clause of
+        // `counting` is the only place the two part company.
+        whole: settled || asked.rows.count == 0 || super::buffered(asked),
+        loader: asked.pipe.loader,
+        offset: want.0,
+        window: want.1,
+    };
+    cursor::open(server, index, kept, asks, out);
+}
+
+/// Where a pipeline's window starts and how wide it is.
+///
+/// A pipeline can hold more than one `LIMIT` and each one narrows what is left,
+/// so the last of them is the one the rows that came out went through.
+fn window(asked: &Asked<'_>) -> (usize, usize) {
+    let mut found = None;
+    for step in &asked.pipe.steps {
+        if let Step::Sort(sort) = step {
+            found = Some((sort.offset, sort.count.unwrap_or(usize::MAX)));
+        }
+    }
+    found.unwrap_or((asked.rows.offset, asked.rows.count))
 }
 
 /// The number at the front of the reply.

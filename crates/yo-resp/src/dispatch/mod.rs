@@ -101,6 +101,8 @@ use yo_kv::cold::Store;
 use yo_kv::{Clock, Db, Keyspace};
 use yo_search::Registry;
 
+use search::cursor::Cursors;
+
 /// How many databases a server has.
 ///
 /// Redis's default is sixteen and its `databases` setting can change it. Ours
@@ -650,6 +652,15 @@ pub struct Server {
     /// commands take it, so nothing a working server spends its time on comes
     /// through here.
     search: Lock<Registry>,
+    /// The replies that came back in pieces and have pieces left.
+    ///
+    /// Beside the indexes rather than inside one, because a cursor is read
+    /// under its own number and a real server resolves the index name on a read
+    /// and then pays no attention to it, so a cursor made on one index reads
+    /// through the name of another. Behind a lock for the reason the registry is
+    /// behind one, and a server nobody has opened a cursor on holds an empty map
+    /// here.
+    cursors: Lock<Cursors>,
     /// Set by `SHUTDOWN`, and read by whatever is turning the loop.
     ///
     /// A flag rather than an exit, because the command layer is not what owns
@@ -691,6 +702,7 @@ impl Server {
             backup: Lock::default(),
             sealed: AtomicBool::new(false),
             search: Lock::new(Registry::new()),
+            cursors: Lock::default(),
             stopping: AtomicBool::new(false),
         }
     }
@@ -747,6 +759,7 @@ impl Server {
             backup: Lock::default(),
             sealed: AtomicBool::new(false),
             search: Lock::new(Registry::new()),
+            cursors: Lock::default(),
             stopping: AtomicBool::new(false),
         }
     }
@@ -1832,9 +1845,15 @@ pub fn resolved(
             "search" if spec.name == "FT.AGGREGATE" => {
                 search::roll(server, session.db, args, out).map(|()| Flow::Continue)
             }
+            "search" if spec.name == "FT.CURSOR" => {
+                // Its own arm because the cursors are not in the registry, and
+                // it takes and lets go of the registry itself to look up the
+                // index name it is given.
+                search::cursor::execute(server, args, out).map(|()| Flow::Continue)
+            }
             "search" => {
                 let db = session.db;
-                let made = search::execute(&mut server.search.lock(), db, spec, args, out);
+                let made = search::execute(server, &mut server.search.lock(), db, spec, args, out);
                 made.map(|made| {
                     if let Some(name) = made {
                         indexing::scan(server, db, name);
