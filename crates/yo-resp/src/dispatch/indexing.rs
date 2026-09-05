@@ -26,6 +26,16 @@
 //! document is tokenized. So the fields come out into one buffer and the lock
 //! goes, which costs one copy of a document per write and buys back the
 //! contention that would otherwise land on whichever stripe is busiest.
+//!
+//! # One lock at a time
+//!
+//! The registry is behind its own lock and so is every stripe, and nothing here
+//! ever holds both. That is not tidiness, it is the only thing keeping the two
+//! orders apart: a write takes the registry to ask whether the key matters and
+//! then the stripe to read it, and the scan would otherwise take the stripe to
+//! walk the keys and then the registry to ask about each one, which is the same
+//! pair the other way round and is how a deadlock is built. So the scan lists
+//! the names first and asks about them afterwards.
 
 use yo_kv::Db;
 use yo_kv::hash::Text;
@@ -102,23 +112,31 @@ fn read(db: &Db, key: &[u8]) -> Option<Document> {
 /// Called after the command has already written its reply, because indexing is
 /// not something a client can be told went wrong: a document that will not read
 /// is counted in `FT.INFO` and the `HSET` that caused it still answers `OK`.
-pub(super) fn changed(server: &mut Server, db: usize, key: &[u8]) {
+pub(super) fn changed(server: &Server, db: usize, key: &[u8]) {
     // Two questions before any work. The first is a look at an empty vector on
     // nearly every server there will ever be, and the second is a walk over a
     // handful of short prefixes.
-    if !server.search.watching() {
-        return;
-    }
-    if !server.search.follows(Source::Hash, key) {
+    let follows = {
+        let search = server.search.lock();
+        if !search.watching() {
+            return;
+        }
+        search.follows(Source::Hash, key)
+    };
+    if !follows {
         // It could still be a key an index used to hold, which is what a
         // `RENAME` out of a prefix leaves behind, so it is erased rather than
         // ignored.
-        server.search.went(key);
+        server.search.lock().went(key);
         return;
     }
-    match read(&server.dbs[db], key) {
-        Some(doc) => server.search.wrote(Source::Hash, key, &doc.pairs()),
-        None => server.search.went(key),
+    // The read happens with the registry let go, and the lock is taken again to
+    // write what it found.
+    let doc = read(&server.dbs[db], key);
+    let mut search = server.search.lock();
+    match doc {
+        Some(doc) => search.wrote(Source::Hash, key, &doc.pairs()),
+        None => search.went(key),
     }
 }
 
@@ -132,22 +150,27 @@ pub(super) fn changed(server: &mut Server, db: usize, key: &[u8]) {
 /// measured against 8.10.1, and the asymmetry is what falls out of a real
 /// server walking one keyspace while its notifications are server wide.
 ///
-/// The keys are collected before any of them is read, because the walk holds a
-/// stripe and reading one back wants the same stripe. That costs a list of the
-/// names an index wants, which is the names and not the documents.
-pub(super) fn scan(server: &mut Server, db: usize, name: &[u8]) {
-    if !server.search.scanning(name) {
+/// Every key is listed before any of them is asked about, for two reasons. The
+/// walk holds a stripe and reading a key back wants the same stripe, and asking
+/// the registry with a stripe held is the lock order a write does not use. So
+/// the names come out first and the prefixes are matched afterwards, which
+/// costs a list of the names in one database on a command nobody sends twice.
+pub(super) fn scan(server: &Server, db: usize, name: &[u8]) {
+    if !server.search.lock().scanning(name) {
         return;
     }
-    let mut wanted = Vec::new();
-    server.dbs[db].keys(|key| {
-        if server.search.wants(name, Source::Hash, key) {
-            wanted.push(key.to_vec());
-        }
-    });
-    for key in wanted {
+    let mut keys = Vec::new();
+    server.dbs[db].keys(|key| keys.push(key.to_vec()));
+    {
+        let search = server.search.lock();
+        keys.retain(|key| search.wants(name, Source::Hash, key));
+    }
+    for key in keys {
         if let Some(doc) = read(&server.dbs[db], &key) {
-            server.search.filled(name, Source::Hash, &key, &doc.pairs());
+            server
+                .search
+                .lock()
+                .filled(name, Source::Hash, &key, &doc.pairs());
         }
     }
 }

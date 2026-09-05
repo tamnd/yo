@@ -513,7 +513,14 @@ pub struct Server {
     ///
     /// Empty on a server nobody has migrated a key out of, which is nearly all
     /// of them, and it costs a vector's three words to be empty.
-    peers: migrate::Peers,
+    ///
+    /// Behind a lock because a socket cannot be written by two threads at once
+    /// and a cache of them cannot be searched by one while another is taking an
+    /// entry out. It is held for the whole of a migration, which is a round trip
+    /// to another server, so two threads migrating at the same time take turns.
+    /// That is the right way round: the alternative is a socket per thread per
+    /// peer, and a `MIGRATE` is not what a server spends its time on.
+    peers: Lock<migrate::Peers>,
     /// What each thread that runs commands here keeps to itself.
     ///
     /// A fixed list, because a thread reading its own entry must not have the
@@ -534,7 +541,22 @@ pub struct Server {
     ///
     /// On the server and not on a session, because a backup outlives the
     /// connection that asked for it and any other connection can seal it.
-    backup: backup::State,
+    ///
+    /// Behind a lock because there is one backup at a time and any thread can be
+    /// the one that starts, seals or abandons it. It is held while the base file
+    /// is written, which is what keeps two `BACKUP START` commands from writing
+    /// over each other's files.
+    backup: Lock<backup::State>,
+    /// Whether a sealed backup is sitting on disk.
+    ///
+    /// Beside the state rather than read out of it, because every batch of
+    /// commands asks whether there is a backup old enough to sweep away and on
+    /// nearly every server the answer is that there is no backup at all. A load
+    /// answers that. Written under the lock by whoever moved the phase, so a
+    /// reader that asks mid-change sees the moment before and sweeps one batch
+    /// later, which is a file staying on disk for a few microseconds longer than
+    /// it had to.
+    sealed: AtomicBool,
     /// The search indexes and the names pointing at them.
     ///
     /// On the server and not on a database, which is the one collection in this
@@ -544,7 +566,12 @@ pub struct Server {
     ///
     /// A server nobody has made an index on holds two empty vectors here, which
     /// is six words and no allocation.
-    search: Registry,
+    ///
+    /// Behind a lock because an index is made and dropped by whichever thread
+    /// ran the command, and the table it goes in is one table. Only the `FT`
+    /// commands take it, so nothing a working server spends its time on comes
+    /// through here.
+    search: Lock<Registry>,
     /// Set by `SHUTDOWN`, and read by whatever is turning the loop.
     ///
     /// A flag rather than an exit, because the command layer is not what owns
@@ -578,12 +605,13 @@ impl Server {
             expire_ms: 0,
             waiters: Lock::default(),
             parked: AtomicUsize::new(0),
-            peers: migrate::Peers::default(),
+            peers: Lock::default(),
             locals: one_thread(),
             claimed: AtomicUsize::new(0),
             dir: working_dir(),
-            backup: backup::State::default(),
-            search: Registry::new(),
+            backup: Lock::default(),
+            sealed: AtomicBool::new(false),
+            search: Lock::new(Registry::new()),
             stopping: AtomicBool::new(false),
         }
     }
@@ -629,12 +657,13 @@ impl Server {
             expire_ms: 0,
             waiters: Lock::default(),
             parked: AtomicUsize::new(0),
-            peers: migrate::Peers::default(),
+            peers: Lock::default(),
             locals: one_thread(),
             claimed: AtomicUsize::new(0),
             dir: working_dir(),
-            backup: backup::State::default(),
-            search: Registry::new(),
+            backup: Lock::default(),
+            sealed: AtomicBool::new(false),
+            search: Lock::new(Registry::new()),
             stopping: AtomicBool::new(false),
         }
     }
@@ -731,7 +760,7 @@ impl Server {
     /// Once per batch, from the same maintenance turn that collects the arena.
     /// It reads two fields and returns on a server that has never taken a
     /// backup, which is nearly all of them.
-    pub fn backup_expire(&mut self) {
+    pub fn backup_expire(&self) {
         backup::expire(self);
     }
 
@@ -1602,10 +1631,10 @@ pub fn resolved(
                     .map(|()| Flow::Continue)
             }
             // The one group that reaches back into the server after it has
-            // written its reply, because a hash is what a search index is made
-            // of. What comes back is whether the fields under the key are no
-            // longer what they were, which is not the same as whether the
-            // command was a write.
+            // written its reply, because a hash is what a search index is
+            // made of. What comes back is whether the fields under the key
+            // are no longer what they were, which is not the same as
+            // whether the command was a write.
             "hash" => {
                 let db = session.db;
                 let changed = hashes::execute(&server.dbs[db], spec, args, out);
@@ -1696,11 +1725,13 @@ pub fn resolved(
             }
             // No database at all, because an index is not a key. The registry
             // is the whole of what these sixteen commands touch, and then
-            // `FT.CREATE` hands back the name it made so the keys that already
-            // match its prefix can be read into it.
+            // `FT.CREATE` hands back the name it made so the keys that
+            // already match its prefix can be read into it. The lock goes
+            // before the scan runs, since the scan takes it again for every
+            // key it reads.
             "search" => {
                 let db = session.db;
-                let made = search::execute(&mut server.search, db, spec, args, out);
+                let made = search::execute(&mut server.search.lock(), db, spec, args, out);
                 made.map(|made| {
                     if let Some(name) = made {
                         indexing::scan(server, db, name);
@@ -20803,7 +20834,8 @@ mod tests {
     /// because the reply is thirty odd fields and these two are the ones the
     /// keyspace hook moves.
     fn held(f: &Fixture, name: &[u8]) -> (usize, u32) {
-        let index = f.server.search.named(name).expect("the index is there");
+        let search = f.server.search.lock();
+        let index = search.named(name).expect("the index is there");
         (index.held.docs.len(), index.held.docs.last())
     }
 
@@ -20832,7 +20864,8 @@ mod tests {
         f.run(&[b"HSET", b"p:1", b"u", b"beta"]);
         f.run(&[b"HDEL", b"p:1", b"u"]);
         assert_eq!(held(&f, b"ix"), (1, 3));
-        let index = f.server.search.named(b"ix").expect("there");
+        let search = f.server.search.lock();
+        let index = search.named(b"ix").expect("there");
         assert_eq!(index.held.docs.id(b"p:1"), Some(3));
     }
 
@@ -20856,7 +20889,8 @@ mod tests {
         ]);
 
         assert_eq!(held(&f, b"ix"), (1, 1));
-        let index = f.server.search.named(b"ix").expect("there");
+        let search = f.server.search.lock();
+        let index = search.named(b"ix").expect("there");
         assert_eq!(index.trouble.whole().failures(), 0);
     }
 
@@ -20993,7 +21027,7 @@ mod tests {
             f.run(&[b"FT._CREATEIFNX", b"ix", b"SCHEMA", b"t", b"TEXT"]),
             "+OK\r\n"
         );
-        assert_eq!(f.server.search.len(), 1);
+        assert_eq!(f.server.search.lock().len(), 1);
     }
 
     /// The scan reads the database the create was run on, and after that the
