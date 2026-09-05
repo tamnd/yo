@@ -79,6 +79,7 @@ const PLANLESS_COMMANDS: &[&str] = &[
     "FT._ALIASDELIFX",
     "FT.ALIASUPDATE",
     "FT.ALIASLIST",
+    "FT.CURSOR",
     "FT.EXPLAIN",
     "FT.EXPLAINCLI",
 ];

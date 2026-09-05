@@ -102,8 +102,10 @@ use super::table::Spec;
 use crate::reply::Out;
 
 mod aggregate;
+pub(super) mod cursor;
 
 use aggregate::{Pipe, Reads, Shape, apply, group, keeps, piped, sorts, windows};
+use cursor::{Asks, Kept, Made};
 
 /// The languages a document may be stemmed in, in the spelling `FT.INFO`
 /// reports them in.
@@ -274,6 +276,7 @@ fn bad(what: &'static str, why: &'static str) -> Fail<'static> {
 }
 
 pub(super) fn execute<'a>(
+    server: &Server,
     reg: &mut Registry,
     db: usize,
     spec: &Spec,
@@ -293,7 +296,7 @@ pub(super) fn execute<'a>(
         "FT._DROPINDEXIFX" => drop_index(reg, spec, args, out, true, true),
         "FT.DROP" => drop_index(reg, spec, args, out, false, false),
         "FT._DROPIFX" => drop_index(reg, spec, args, out, true, false),
-        "FT.INFO" => info(reg, args, out),
+        "FT.INFO" => info(server, reg, args, out),
         "FT._LIST" => list(reg, spec, args, out),
         "FT.ALIASADD" => alias_add(reg, args, out, false),
         "FT._ALIASADDIFNX" => alias_add(reg, args, out, true),
@@ -1177,7 +1180,7 @@ fn tally(out: &mut Out, name: &str, value: u64) {
 }
 
 /// `FT.INFO index`, everything the server knows about one index.
-fn info<'a>(reg: &mut Registry, args: Args<'a>, out: &mut Out) -> Answer<'a> {
+fn info<'a>(server: &Server, reg: &mut Registry, args: Args<'a>, out: &mut Out) -> Answer<'a> {
     let name = args.get(1);
     // Counted before it is reported, so the first `FT.INFO` after a create says
     // one rather than nought. An alias counts once and not twice, because the
@@ -1186,6 +1189,11 @@ fn info<'a>(reg: &mut Registry, args: Args<'a>, out: &mut Out) -> Answer<'a> {
     let Some(index) = reg.open(name) else {
         return Err(Fail::naming(MISSING, name));
     };
+
+    // A cursor nobody is reading is a cursor nobody has read from since the
+    // command that made it finished, so the two global numbers are the same one.
+    let (whole, mine) = cursor::stats(server, &index.name);
+    let idle = whole;
 
     let d = &index.definition;
     let stopwords = d.stopwords.as_ref();
@@ -1301,10 +1309,10 @@ fn info<'a>(reg: &mut Registry, args: Args<'a>, out: &mut Out) -> Answer<'a> {
 
     out.simple(b"cursor_stats");
     out.map(4);
-    tally(out, "global_idle", 0);
-    tally(out, "global_total", 0);
+    tally(out, "global_idle", idle);
+    tally(out, "global_total", whole);
     tally(out, "index_capacity", CURSOR_CAPACITY);
-    tally(out, "index_total", 0);
+    tally(out, "index_total", mine);
 
     if let Some(list) = stopwords {
         out.simple(b"stopwords_list");
@@ -1697,6 +1705,11 @@ struct Asked<'a> {
     stopwords: bool,
     rows: Rows<'a>,
     pipe: Pipe<'a>,
+    /// What a `WITHCURSOR` asked for, when one was asked for at all.
+    ///
+    /// `FT.EXPLAIN` reads the word and everything after it and then throws all
+    /// of it away, the same as it does with `WITHSORTKEYS`.
+    cursor: Option<Asks>,
 }
 
 impl Default for Asked<'_> {
@@ -1708,6 +1721,7 @@ impl Default for Asked<'_> {
             stopwords: true,
             rows: Rows::default(),
             pipe: Pipe::default(),
+            cursor: None,
         }
     }
 }
@@ -1851,6 +1865,7 @@ fn options<'a>(
     if asked.pipe.pending {
         return Err(NEED_LOAD_NAME.as_bytes().to_vec());
     }
+    aggregate::most(&mut asked);
     Ok(asked)
 }
 
@@ -1895,6 +1910,44 @@ fn plan<'a>(
             windows(asked, offset, count);
         }
         return Ok(Some(at + 3));
+    }
+    if args::is(word, b"WITHCURSOR") {
+        // Not a pipeline step, so it is taken wherever it appears and does not
+        // close the door on the words about the search itself:
+        // `WITHCURSOR COUNT 2 VERBATIM` is a query and `LOAD 1 @t VERBATIM` is
+        // not. A second `WITHCURSOR` keeps what the first one set rather than
+        // going back to the defaults, which is measured.
+        let mut asks = asked.cursor.unwrap_or_default();
+        let mut next = at + 1;
+        while next < args.len() {
+            let word = args.get(next);
+            let count = args::is(word, b"COUNT");
+            if !count && !args::is(word, b"MAXIDLE") {
+                break;
+            }
+            // The name in the line is the keyword and not the word the client
+            // typed, so a lower case `count 0` is refused about `COUNT`.
+            let name: &[u8] = match count {
+                true => b"COUNT",
+                false => b"MAXIDLE",
+            };
+            let Some(value) = args.opt(next + 1) else {
+                return Err(line(BAD_ARGS, name, NOT_THERE));
+            };
+            let Some(number) = parse_i64(value) else {
+                return Err(line(BAD_ARGS, name, NOT_A_NUMBER));
+            };
+            if !(1..=cursor::MOST).contains(&number) {
+                return Err(line(BAD_ARGS, name, OUT_OF_RANGE));
+            }
+            match count {
+                true => asks.count = usize::try_from(number).unwrap_or(usize::MAX),
+                false => asks.idle = u64::try_from(number).unwrap_or(u64::MAX),
+            }
+            next += 2;
+        }
+        asked.cursor = Some(asks);
+        return Ok(Some(next));
     }
     if args::is(word, b"TIMEOUT") {
         let Some(value) = args.opt(at + 1) else {
@@ -2439,11 +2492,16 @@ type Built<'a> = (&'a Row, Option<Vec<(&'a [u8], &'a [u8])>>);
 /// nothing at all.
 type Rolled<'a> = (&'a Row, Vec<(&'a [u8], &'a [u8])>);
 
+/// The names and values a row carries, owned rather than borrowed. A cursor is
+/// written long after the documents it read went away, so it keeps its own copy.
+type Pairs = Vec<(Box<[u8]>, Box<[u8]>)>;
+
 /// One row of an answer, once the registry has been let go of.
 ///
 /// Nothing in here borrows the index, which is the whole point: the query runs
 /// and the scoring happens under the lock, and what comes out is this, so the
 /// keys can be read out of the keyspace with the registry free.
+#[derive(Clone)]
 struct Row {
     key: Box<[u8]>,
     score: f64,
@@ -2459,6 +2517,10 @@ pub(super) fn find(server: &Server, db: usize, args: Args<'_>, out: &mut Out) ->
     let name = args.get(1);
     let query = args.get(2);
     let asked;
+    // The name the index is held under, which is not always the name the client
+    // used, since an alias reaches the same index. A cursor is kept under the
+    // index's own name so that a read through either name finds it.
+    let mut canon: Box<[u8]> = Box::default();
     let (total, rows) = {
         let mut reg = server.search.lock();
         // Counted, like every other command that resolves a name, and resolved
@@ -2489,6 +2551,17 @@ pub(super) fn find(server: &Server, db: usize, args: Args<'_>, out: &mut Out) ->
                 return Ok(());
             }
         };
+        if asked.cursor.is_some() {
+            canon = index.name.clone();
+            // Asked before the query runs, because a real server takes the
+            // cursor's place in the table before it makes the reply that goes in
+            // it, so an index holding its hundred and twenty eight refuses even
+            // a cursor that would close on its first chunk.
+            if let Err(fail) = cursor::room(server, &canon) {
+                fail.write(out);
+                return Ok(());
+            }
+        }
         gather(
             index,
             shape(node, index, &asked.rows),
@@ -2497,7 +2570,7 @@ pub(super) fn find(server: &Server, db: usize, args: Args<'_>, out: &mut Out) ->
             false,
         )
     };
-    write(server, db, total, &rows, &asked.rows, out);
+    write(server, db, total, &rows, &asked, &canon, out);
     Ok(())
 }
 
@@ -2511,6 +2584,7 @@ pub(super) fn roll(server: &Server, db: usize, args: Args<'_>, out: &mut Out) ->
     let name = args.get(1);
     let query = args.get(2);
     let asked;
+    let mut canon: Box<[u8]> = Box::default();
     let (total, rows) = {
         let mut reg = server.search.lock();
         let Some(index) = reg.open(name) else {
@@ -2537,6 +2611,17 @@ pub(super) fn roll(server: &Server, db: usize, args: Args<'_>, out: &mut Out) ->
                 return Ok(());
             }
         };
+        if asked.cursor.is_some() {
+            canon = index.name.clone();
+            // Asked before the query runs, because a real server takes the
+            // cursor's place in the table before it makes the reply that goes in
+            // it, so an index holding its hundred and twenty eight refuses even
+            // a cursor that would close on its first chunk.
+            if let Err(fail) = cursor::room(server, &canon) {
+                fail.write(out);
+                return Ok(());
+            }
+        }
         let order = match buffered(&asked) {
             true => Order::Backwards,
             false => Order::Forwards,
@@ -2549,7 +2634,7 @@ pub(super) fn roll(server: &Server, db: usize, args: Args<'_>, out: &mut Out) ->
             !asked.pipe.steps.is_empty(),
         )
     };
-    rolled(server, db, total, &rows, &asked, out);
+    rolled(server, db, total, &rows, &asked, &canon, out);
     Ok(())
 }
 
@@ -2565,10 +2650,11 @@ fn rolled(
     total: usize,
     rows: &[Row],
     asked: &Asked<'_>,
+    index: &[u8],
     out: &mut Out,
 ) {
     if !asked.pipe.steps.is_empty() {
-        piped(server, db, total, rows, asked, out);
+        piped(server, db, total, rows, asked, index, out);
         return;
     }
     let pipe = &asked.pipe;
@@ -2583,19 +2669,46 @@ fn rolled(
     let mut built: Vec<Rolled<'_>> = Vec::with_capacity(rows.len());
     let mut lost = 0;
     for (at, row) in rows.iter().enumerate() {
-        if !pipe.loader {
+        if pipe.loader {
+            // A key that answered the query and is no longer there takes its
+            // row out of the reply and one off the count, the same way a search
+            // does. The walk still went through it, so it widens the gap in
+            // front of whatever row comes next.
+            let Some(doc) = held.get(at).and_then(Option::as_ref) else {
+                lost += 1;
+                continue;
+            };
+            built.push((row, props(doc, pipe)));
+        } else {
             built.push((row, Vec::new()));
-            continue;
         }
-        // A key that answered the query and is no longer there takes its row
-        // out of the reply and one off the count, the same way a search does.
-        let Some(doc) = held.get(at).and_then(Option::as_ref) else {
-            lost += 1;
-            continue;
-        };
-        built.push((row, props(doc, pipe)));
     }
     let total = total - lost;
+    if let Some(asks) = asked.cursor {
+        // A cursor holds the rows rather than the documents they were read
+        // from, so what is handed over here is a copy. `LIMIT 0 0` is the one
+        // shape where there is nothing to copy and a number all the same.
+        let made = Made::Rolled(
+            built
+                .into_iter()
+                .map(|(row, props)| (row.clone(), owned(props)))
+                .collect(),
+        );
+        let kept = Kept {
+            made,
+            // Nothing here throws a row away, so every document the query
+            // answered is a document that reached the window.
+            walk: vec![true; total],
+            shows: asked.rolls(),
+            total,
+            whole: want.count == 0 || buffered(asked),
+            loader: pipe.loader,
+            offset: want.offset,
+            window: want.count,
+        };
+        cursor::open(server, index, kept, asks, out);
+        return;
+    }
     let wide = out.proto().is_resp3();
     // `LIMIT 0 0` is a client asking for the count and nothing else, and it gets
     // the real one. So does a pipeline that reads fields and starts at the top,
@@ -2896,7 +3009,16 @@ fn gather(
 /// The reading happens first and all of it, because a key that will not read
 /// takes its row out of the reply and one off the total, and the total is the
 /// first thing on the wire under RESP2.
-fn write(server: &Server, db: usize, total: usize, rows: &[Row], want: &Rows<'_>, out: &mut Out) {
+fn write(
+    server: &Server,
+    db: usize,
+    total: usize,
+    rows: &[Row],
+    asked: &Asked<'_>,
+    index: &[u8],
+    out: &mut Out,
+) {
+    let want = &asked.rows;
     let loading = want.loading();
     let mut built: Vec<Built<'_>> = Vec::with_capacity(rows.len());
     let held: Vec<Option<indexing::Document>> = if loading {
@@ -2919,7 +3041,41 @@ fn write(server: &Server, db: usize, total: usize, rows: &[Row], want: &Rows<'_>
         built.push((row, Some(pick(doc, want))));
     }
     let total = total - lost;
+    if let Some(asks) = asked.cursor {
+        // A search is settled: it ranked the whole answer before it wrote a row
+        // of it, so the first chunk carries the real total and the rest carry
+        // nought, and none of the walk arithmetic comes into it.
+        let made = Made::Found(
+            built
+                .into_iter()
+                .map(|(row, fields)| (row.clone(), fields.map(owned)))
+                .collect(),
+        );
+        let kept = Kept {
+            made,
+            walk: Vec::new(),
+            shows: want.found(),
+            total,
+            whole: true,
+            loader: loading,
+            offset: want.offset,
+            window: want.count,
+        };
+        cursor::open(server, index, kept, asks, out);
+        return;
+    }
     found(total, &built, want.found(), out);
+}
+
+/// Copies a row's fields out of the documents they were read from.
+///
+/// Only a cursor needs this. A reply that goes out in one piece points at the
+/// documents, which are alive for as long as writing it takes.
+fn owned(pairs: Vec<(&[u8], &[u8])>) -> Pairs {
+    pairs
+        .into_iter()
+        .map(|(name, value)| (name.into(), value.into()))
+        .collect()
 }
 
 /// The rows of a search on the wire, on either protocol.

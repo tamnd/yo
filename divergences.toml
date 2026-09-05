@@ -495,7 +495,7 @@ spec = "09 section 5"
 [[divergence]]
 id = "D-67"
 title = "Two FT.AGGREGATE pipeline steps are refused rather than read"
-reason = "LOAD, GROUPBY with all twelve of its REDUCE functions, APPLY, FILTER and SORTBY with MAX are built. WITHCURSOR and EXPLAINSCORE are read as unknown arguments and answer the line a real server answers for a word nobody knows, so a client learns the step is not there rather than getting a reply that quietly dropped it. Everything either side of the pipeline is exact: the query is the same parser a search uses, an answer nothing sorted comes back in ascending document number, the properties follow the names and the order the LOAD list gave them, ADDSCORES writes a __score to twelve significant digits where WITHSCORES writes a score to seventeen, and the count at the front of the reply follows the cases that were measured over a full offset by count sweep on both protocols. WITHCURSOR is the one that is left with anything behind it, and it needs a cursor to hold a half finished pipeline between calls rather than anything new about the steps themselves."
+reason = "LOAD, GROUPBY with all twelve of its REDUCE functions, APPLY, FILTER, SORTBY with MAX and WITHCURSOR are built. EXPLAINSCORE is read as an unknown argument and answer the line a real server answers for a word nobody knows, so a client learns the step is not there rather than getting a reply that quietly dropped it. Everything either side of the pipeline is exact: the query is the same parser a search uses, an answer nothing sorted comes back in ascending document number, the properties follow the names and the order the LOAD list gave them, ADDSCORES writes a __score to twelve significant digits where WITHSCORES writes a score to seventeen, and the count at the front of the reply follows the cases that were measured over a full offset by count sweep on both protocols. EXPLAINSCORE is the last one left, and what it needs is the query executor carrying the terms behind every match through to the pipeline, which is the same machinery SUMMARIZE and HIGHLIGHT need, so it is waiting on that rather than on anything about the steps themselves."
 status = "until"
 resolved_by = "M8"
 spec = "09 section 5"
@@ -541,4 +541,18 @@ title = "matched_terms answers nothing rather than the terms that matched"
 reason = "The function is there and takes the nought or one argument a real server takes, and it answers a null where a real server answers the list of terms from the query that the row's document matched, capped at the number the argument asks for or at 100. Answering it properly means the query executor carrying the terms behind every match through to the pipeline, which is the same machinery SUMMARIZE and HIGHLIGHT need to pick the fragments they return, so it is being built once with those rather than twice. Every other function in the language answers exactly, and a null is a value the language already handles, so an expression around this one keeps working: exists is nought, a comparison against it is false, and it goes on the wire as a null rather than as a missing property."
 status = "until"
 resolved_by = "M8"
+spec = "09 section 5"
+
+[[divergence]]
+id = "D-74"
+title = "A cursor holds the rows it made rather than a paused pipeline"
+reason = "A real server's cursor is a pipeline that stopped in the middle, so the chunk a read answers is pulled out of the index at the moment of the read and a document rewritten between two reads can be missed altogether or come back twice. This side runs the whole query when the cursor is opened and keeps the rows, so every chunk of one cursor is a view of one moment and a client walking a cursor while something else writes gets an answer that is consistent with itself. What it costs is the memory of one whole answer per open cursor, which the limit of a hundred and twenty eight cursors per index bounds, and what it buys is that the rows cannot change under the client's feet. Everything a client can see about the cursor itself is the same on both sides: the two element reply, the thirty two bit id, the chunk that closes when it comes back short, the read that checks the index and the delete that does not, the five minute idle sweep, and the numbers FT.INFO reports beside the capacity."
+status = "permanent"
+spec = "09 section 5"
+
+[[divergence]]
+id = "D-75"
+title = "A FILTER under a window with an offset can report a different count per chunk"
+reason = "The number in front of a chunk is how far the walk had got when the number went on the wire, and working it out means following how the pipeline pulls documents. Eight hundred and nineteen of eight hundred and fifty measured shapes agree exactly, across both protocols, every chunk size from one to five, offsets nought to three, windows one to four and five different FILTER expressions. The thirty one that do not all have the same shape: a FILTER together with a LIMIT whose offset is not nought, where the chunk size is wider than the window. A real server puts the loader that reads the fields a FILTER needs in one place and the loader that reads the fields the reply needs in another, and where the two land decides how many documents a fill pulls, which is not something the wire shows. The rows are the same rows in the same order either way and so is the number of chunks, and the count itself is already documented on both sides as how far the reply reached rather than how many rows answered."
+status = "permanent"
 spec = "09 section 5"
