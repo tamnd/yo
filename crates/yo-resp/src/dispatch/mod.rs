@@ -1735,6 +1735,13 @@ pub fn resolved(
             // already match its prefix can be read into it. The lock goes
             // before the scan runs, since the scan takes it again for every
             // key it reads.
+            "search" if spec.name == "FT.SEARCH" => {
+                // The one search command that reads documents, and so the one
+                // that needs the keyspace as well as the registry. It takes and
+                // lets go of the registry itself, because it cannot hold that
+                // and a stripe at the same time.
+                search::find(server, session.db, args, out).map(|()| Flow::Continue)
+            }
             "search" => {
                 let db = session.db;
                 let made = search::execute(&mut server.search.lock(), db, spec, args, out);
@@ -21346,6 +21353,317 @@ mod tests {
             held(&f, b"ix"),
             (2, 2),
             "and then it follows every database"
+        );
+    }
+
+    /// Four documents over the two kinds of field a query can ask about, which
+    /// is the corpus the searches below read.
+    fn corpus(f: &mut Fixture) {
+        f.run(&[
+            b"FT.CREATE",
+            b"sx",
+            b"PREFIX",
+            b"1",
+            b"d:",
+            b"SCHEMA",
+            b"t",
+            b"TEXT",
+            b"g",
+            b"TAG",
+            b"n",
+            b"NUMERIC",
+        ]);
+        for (key, text, tag, number) in [
+            (b"d:1".as_slice(), "alpha beta", "aa,bb", "1"),
+            (b"d:2", "alpha gamma", "bb", "2"),
+            (b"d:3", "delta", "cc", "3"),
+            (b"d:4", "alpha beta gamma", "aa,cc", "4"),
+        ] {
+            f.run(&[
+                b"HSET",
+                key,
+                b"t",
+                text.as_bytes(),
+                b"g",
+                tag.as_bytes(),
+                b"n",
+                number.as_bytes(),
+            ]);
+        }
+    }
+
+    /// A search answers a total and then a row for every key in the window,
+    /// with the fields of that key after it.
+    #[test]
+    fn a_search_answers_a_total_and_then_the_rows() {
+        let mut f = Fixture::new();
+        corpus(&mut f);
+        assert_eq!(
+            f.run(&[b"FT.SEARCH", b"sx", b"delta"]),
+            "*3\r\n:1\r\n$3\r\nd:3\r\n*6\r\n$1\r\nt\r\n$5\r\ndelta\r\n$1\r\ng\r\n$2\r\ncc\r\n$1\r\nn\r\n$1\r\n3\r\n"
+        );
+        // The fields are what the key holds and not what the schema names, so
+        // a field nobody indexed comes back too.
+        f.run(&[b"HSET", b"d:3", b"extra", b"more"]);
+        assert!(f.run(&[b"FT.SEARCH", b"sx", b"delta"]).contains("extra"));
+        // `NOCONTENT` leaves the keys on their own, and `LIMIT 0 0` leaves
+        // the total on its own.
+        assert_eq!(
+            f.run(&[b"FT.SEARCH", b"sx", b"delta", b"NOCONTENT"]),
+            "*2\r\n:1\r\n$3\r\nd:3\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"FT.SEARCH", b"sx", b"alpha", b"LIMIT", b"0", b"0"]),
+            "*1\r\n:3\r\n"
+        );
+    }
+
+    /// The window is ten rows when nobody said, and the cap is on how wide it
+    /// is rather than on where it starts.
+    #[test]
+    fn the_window_is_ten_rows_and_a_million_wide_at_most() {
+        let mut f = Fixture::new();
+        corpus(&mut f);
+        assert_eq!(
+            f.run(&[
+                b"FT.SEARCH",
+                b"sx",
+                b"alpha",
+                b"NOCONTENT",
+                b"LIMIT",
+                b"1",
+                b"1"
+            ]),
+            "*2\r\n:3\r\n$3\r\nd:2\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"FT.SEARCH", b"sx", b"alpha", b"LIMIT", b"0"]),
+            "-SEARCH_PARSE_ARGS LIMIT requires two arguments\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"FT.SEARCH", b"sx", b"alpha", b"LIMIT", b"0", b"-1"]),
+            "-SEARCH_PARSE_ARGS LIMIT needs two numeric arguments\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"FT.SEARCH", b"sx", b"alpha", b"LIMIT", b"0", b"1000001"]),
+            "-SEARCH_LIMIT_OVER LIMIT exceeds maximum of 1000000\r\n"
+        );
+        assert_eq!(
+            f.run(&[
+                b"FT.SEARCH",
+                b"sx",
+                b"alpha",
+                b"NOCONTENT",
+                b"LIMIT",
+                b"999999",
+                b"1000000"
+            ]),
+            "*1\r\n:3\r\n"
+        );
+    }
+
+    /// `RETURN 0` reads on the wire like `NOCONTENT` and is not the same
+    /// thing, because a later `RETURN` puts the fields back and a later
+    /// `RETURN` after a `NOCONTENT` does not.
+    #[test]
+    fn a_return_of_nothing_is_not_the_same_as_nocontent() {
+        let mut f = Fixture::new();
+        corpus(&mut f);
+        let bare = "*2\r\n:1\r\n$3\r\nd:3\r\n";
+        assert_eq!(
+            f.run(&[b"FT.SEARCH", b"sx", b"delta", b"RETURN", b"0"]),
+            bare
+        );
+        assert_eq!(
+            f.run(&[
+                b"FT.SEARCH",
+                b"sx",
+                b"delta",
+                b"NOCONTENT",
+                b"RETURN",
+                b"1",
+                b"t"
+            ]),
+            bare
+        );
+        assert_eq!(
+            f.run(&[
+                b"FT.SEARCH",
+                b"sx",
+                b"delta",
+                b"RETURN",
+                b"0",
+                b"RETURN",
+                b"1",
+                b"t"
+            ]),
+            "*3\r\n:1\r\n$3\r\nd:3\r\n*2\r\n$1\r\nt\r\n$5\r\ndelta\r\n"
+        );
+    }
+
+    /// The count after `RETURN` counts words and not fields, so the `AS` and
+    /// the name after it are two of them.
+    #[test]
+    fn the_count_after_return_counts_words() {
+        let mut f = Fixture::new();
+        corpus(&mut f);
+        // Two words is one renamed field, and the name is the one it comes
+        // back under.
+        assert_eq!(
+            f.run(&[
+                b"FT.SEARCH",
+                b"sx",
+                b"delta",
+                b"RETURN",
+                b"3",
+                b"t",
+                b"AS",
+                b"x"
+            ]),
+            "*3\r\n:1\r\n$3\r\nd:3\r\n*2\r\n$1\r\nx\r\n$5\r\ndelta\r\n"
+        );
+        // A count that stops on the `AS` has nothing to rename to, and one
+        // that reaches past the last word is short an argument.
+        assert_eq!(
+            f.run(&[b"FT.SEARCH", b"sx", b"delta", b"RETURN", b"2", b"t", b"AS"]),
+            "-SEARCH_PARSE_ARGS RETURN path AS name - must be accompanied with NAME\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"FT.SEARCH", b"sx", b"delta", b"RETURN", b"3", b"t", b"AS"]),
+            "-SEARCH_PARSE_ARGS Bad arguments for RETURN: Expected an argument, but none provided\r\n"
+        );
+        // A count that stops before the `AS` asks for a field called `AS`,
+        // which no key holds, and a field the key does not hold is left out
+        // rather than sent empty.
+        assert_eq!(
+            f.run(&[b"FT.SEARCH", b"sx", b"delta", b"RETURN", b"1", b"AS"]),
+            "*3\r\n:1\r\n$3\r\nd:3\r\n*0\r\n"
+        );
+    }
+
+    /// A `FILTER` is a numeric range written outside the query, and it is only
+    /// the wrong way round on a field the schema holds as a number.
+    #[test]
+    fn a_filter_is_a_range_written_outside_the_query() {
+        let mut f = Fixture::new();
+        corpus(&mut f);
+        assert_eq!(
+            f.run(&[
+                b"FT.SEARCH",
+                b"sx",
+                b"alpha",
+                b"NOCONTENT",
+                b"FILTER",
+                b"n",
+                b"2",
+                b"4"
+            ]),
+            "*3\r\n:2\r\n$3\r\nd:2\r\n$3\r\nd:4\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"FT.SEARCH", b"sx", b"alpha", b"FILTER", b"n", b"2"]),
+            "-SEARCH_PARSE_ARGS FILTER requires 3 arguments\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"FT.SEARCH", b"sx", b"alpha", b"FILTER", b"n", b"x", b"1"]),
+            "-SEARCH_PARSE_ARGS Bad lower range: x\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"FT.SEARCH", b"sx", b"alpha", b"FILTER", b"n", b"2", b"1"]),
+            "-SEARCH_SYNTAX Invalid numeric range (min > max): @n:[2.000000 1.000000]\r\n"
+        );
+        // The same range on a field that is not a number at all, and on a
+        // field that is not there, answers nothing rather than refusing.
+        for field in [b"g".as_slice(), b"nope"] {
+            assert_eq!(
+                f.run(&[b"FT.SEARCH", b"sx", b"alpha", b"FILTER", field, b"2", b"1"]),
+                "*1\r\n:0\r\n"
+            );
+        }
+    }
+
+    /// The index is resolved before the arguments after it are read, so a name
+    /// that is not there answers about the name whatever else is wrong.
+    #[test]
+    fn the_index_is_found_before_the_arguments_are_read() {
+        let mut f = Fixture::new();
+        corpus(&mut f);
+        let missing = "-SEARCH_INDEX_NOT_FOUND Index not found: nope\r\n";
+        assert_eq!(f.run(&[b"FT.SEARCH", b"nope", b"alpha", b"BOGUS"]), missing);
+        assert_eq!(
+            f.run(&[b"FT.EXPLAIN", b"nope", b"alpha", b"BOGUS"]),
+            missing
+        );
+        // And the arguments are read before the query is, so a query that
+        // will not parse still answers about the argument.
+        assert_eq!(
+            f.run(&[b"FT.SEARCH", b"sx", b"@@@", b"BOGUS"]),
+            "-SEARCH_ARG_UNRECOGNIZED Unknown argument `BOGUS` at position 1 for <main>\r\n"
+        );
+    }
+
+    /// `INKEYS` filters the answer before the total is taken, which is not
+    /// where a client would guess it happens.
+    #[test]
+    fn inkeys_comes_off_the_total() {
+        let mut f = Fixture::new();
+        corpus(&mut f);
+        assert_eq!(
+            f.run(&[
+                b"FT.SEARCH",
+                b"sx",
+                b"alpha",
+                b"NOCONTENT",
+                b"INKEYS",
+                b"1",
+                b"d:1"
+            ]),
+            "*2\r\n:1\r\n$3\r\nd:1\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"FT.SEARCH", b"sx", b"alpha", b"NOCONTENT", b"INKEYS", b"0"]),
+            "*1\r\n:0\r\n"
+        );
+    }
+
+    /// The fields come from the database the session is on, and a row whose
+    /// key will not load there is dropped from the reply and taken off the
+    /// total.
+    ///
+    /// Measured against a real server, which follows a key on every database
+    /// and then loads it from one.
+    #[test]
+    fn the_fields_are_read_from_the_session_database() {
+        let mut f = Fixture::new();
+        corpus(&mut f);
+        f.run(&[b"SELECT", b"1"]);
+        f.run(&[b"HSET", b"d:9", b"t", b"delta", b"n", b"9"]);
+        // Both documents are in the index, and only one of them is in this
+        // database.
+        assert_eq!(
+            f.run(&[b"FT.SEARCH", b"sx", b"delta", b"NOCONTENT"]),
+            "*3\r\n:2\r\n$3\r\nd:3\r\n$3\r\nd:9\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"FT.SEARCH", b"sx", b"delta", b"RETURN", b"1", b"n"]),
+            "*3\r\n:1\r\n$3\r\nd:9\r\n*2\r\n$1\r\nn\r\n$1\r\n9\r\n"
+        );
+    }
+
+    /// The deeper protocol answers a map of five rather than an array, with
+    /// every row a map of its own.
+    #[test]
+    fn the_third_protocol_answers_a_map_of_five() {
+        let mut f = Fixture::new();
+        corpus(&mut f);
+        f.out = Out::new(Proto::Resp3);
+        assert_eq!(
+            f.run(&[b"FT.SEARCH", b"sx", b"delta", b"RETURN", b"1", b"n"]),
+            concat!(
+                "%5\r\n+attributes\r\n*0\r\n+format\r\n+STRING\r\n+results\r\n*1\r\n",
+                "%3\r\n+id\r\n$3\r\nd:3\r\n+extra_attributes\r\n%1\r\n$1\r\nn\r\n$1\r\n3\r\n",
+                "+values\r\n*0\r\n+total_results\r\n:1\r\n+warning\r\n*0\r\n"
+            )
         );
     }
 }

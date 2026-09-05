@@ -3167,6 +3167,17 @@ wire = "verified"
 notes = "The aliases of one index, which is the only command in the alias family that reads rather than writes and the newest command in the group. The name is misleading in the same way it is on a real server: it does not list every alias on the server, it takes an index and lists that index's own, and calling it with no argument is an arity error rather than a listing. The names come back as bulk strings where FT._LIST writes simple ones, and as a set on RESP3."
 
 [[command]]
+name = "FT.SEARCH"
+group = "search"
+since = "1.0.0"
+arity = -3
+plan = "merge"
+bounded = "risk"
+status = "shipped"
+wire = "verified"
+notes = "The documents a query answers, with the fields of the keys they came from. It is the only command in the group that reads the keyspace as well as the registry, so it runs in two halves: the query is parsed, walked, scored, sorted and cut to the window under the registry lock, and the keys are read afterwards with that lock let go of. The total is how many rows the window could actually build, so a document the index follows whose key is on another database is dropped from the reply and taken off the total, which is measured rather than chosen. Fifteen of the option keywords are read here and SORTBY, WITHSORTKEYS, SUMMARIZE, HIGHLIGHT, GEOFILTER and EXPLAINSCORE are not, which D-65 covers. The window is bounded but the walk behind it is not, since a query can ask every document in the index."
+
+[[command]]
 name = "FT.EXPLAIN"
 group = "search"
 since = "1.0.0"
