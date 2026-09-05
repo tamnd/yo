@@ -66,6 +66,7 @@ use crate::index::Index;
 use crate::nums::Nums;
 use crate::posts::{Id, Posts, Terms, adds, stemmed};
 use crate::score::Facts;
+use crate::sorted::Sorted;
 use crate::tags::Tags;
 use crate::words::{Words, stem};
 
@@ -289,6 +290,17 @@ impl Index {
         for (attribute, number) in numbers {
             held.nums.entry(attribute).or_default().add(id, number);
         }
+        // The copies a sort reads instead of reading the key back, one per
+        // sortable field in the order the schema declares them. A `NOINDEX`
+        // field is in here, unlike everywhere else in this routine, because
+        // `NOINDEX SORTABLE` is a field that cannot be matched and can still be
+        // sorted by and returned, which is measured.
+        let sortable: Vec<Option<Sorted>> = schema
+            .iter()
+            .filter(|f| f.sortable)
+            .map(|f| value(fields, &f.identifier).and_then(|raw| Sorted::read(f, raw)))
+            .collect();
+        held.docs.store(id, sortable);
 
         let stops = definition.stopwords.as_deref();
         let mut found: BTreeMap<Box<[u8]>, Entry> = BTreeMap::new();

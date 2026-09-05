@@ -190,4 +190,22 @@ impl Index {
     pub fn has(&self, attribute: &[u8]) -> bool {
         self.field(attribute).is_some()
     }
+
+    /// Which of a document's sortable values belongs to a field, or `None` when
+    /// the schema keeps no copy of that field or has no such field at all.
+    ///
+    /// The count of the sortable fields declared in front of it, so an
+    /// `FT.ALTER` that adds one to the end of the schema leaves every slot that
+    /// was handed out where it was.
+    #[must_use]
+    pub fn slot(&self, attribute: &[u8]) -> Option<usize> {
+        let mut slot = 0;
+        for field in &self.schema {
+            if *field.attribute == *attribute {
+                return field.sortable.then_some(slot);
+            }
+            slot += usize::from(field.sortable);
+        }
+        None
+    }
 }

@@ -50,6 +50,13 @@
 //! read off its manual, which is how the single precision `k1` in the default
 //! one came to light.
 //!
+//! [`sorted`] is the other way of ordering an answer, by a field rather than by
+//! a score. A field the schema calls `SORTABLE` has its value copied into the
+//! document table as the sort will compare it, folded for text and parsed for a
+//! number, so a `SORTBY` over it never has to go back to the key. A field it
+//! does not is still sortable, just read off the key afterwards, and the same
+//! comparison is used either way so both roads give the same answer.
+//!
 //! [`held`] is the three of them under one index with the routine that fills
 //! them, so a key and its fields go in one end and a document with a number, a
 //! score, a length and a term in every list it belongs to comes out the other.
@@ -105,6 +112,7 @@ pub mod query;
 pub mod reduce;
 pub mod registry;
 pub mod score;
+pub mod sorted;
 pub mod tags;
 pub mod text;
 pub mod token;
