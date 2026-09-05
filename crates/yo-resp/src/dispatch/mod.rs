@@ -401,7 +401,13 @@ pub struct Server {
     started_ms: u64,
     /// Where the next maintenance turn starts looking, so that a database
     /// under constant write load cannot hold the other fifteen's space.
-    next_db: usize,
+    ///
+    /// Shared, because compaction is asked for from two places: the maintenance
+    /// turn, which is one thread, and a command that went over the memory limit
+    /// and is trying to get back under it, which is any thread. Two threads that
+    /// read the same cursor start on the same database, and what that costs is
+    /// one of them finding the other has already moved what was there.
+    next_db: AtomicUsize,
     /// One bit per database, set when a command ran against it.
     ///
     /// The maintenance turn after every batch used to ask all sixteen
@@ -418,7 +424,12 @@ pub struct Server {
     /// path writes here.
     dirty: u64,
     /// What the connections are holding, kept by the engine.
-    conn_bytes: usize,
+    ///
+    /// Shared, because every thread has connections and the memory total is one
+    /// total. Each thread adds and subtracts its own change rather than storing
+    /// a figure it worked out, so two threads whose buffers grew in the same
+    /// moment both count.
+    conn_bytes: AtomicUsize,
     /// The `maxmemory` limit in bytes, zero when there is not one.
     ///
     /// Zero is the default and it is the whole reason the check in front of
@@ -437,7 +448,13 @@ pub struct Server {
     ///
     /// `None` from the closure means that database cannot have one, which is
     /// how the caller says the file it opened has no more room for logs.
-    store: Option<Box<StoreSource>>,
+    ///
+    /// Behind a lock because it is a closure the caller gave us and there is no
+    /// saying it can be run by two threads at once. It is asked once per
+    /// database, the first time that database has to move something, so a
+    /// server that has reached its memory limit takes this lock sixteen times
+    /// in its life.
+    store: Lock<Option<Box<StoreSource>>>,
     /// The `maxstore` limit in bytes, `None` when there is not one.
     ///
     /// The storage limit, and the other half of the inversion `14` section 4.1
@@ -471,13 +488,22 @@ pub struct Server {
     ///
     /// Only kept up to date when there is a limit to judge it against. A server
     /// with no `maxmemory` never reads it and never pays for it.
-    used: usize,
+    ///
+    /// Shared, because it is read in front of every write on every thread and
+    /// written by whichever thread last took a reading. A reader that catches it
+    /// mid write gets one of the two readings and both of them were true a
+    /// moment ago, which is all this number ever claims to be.
+    used: AtomicUsize,
     /// Which database the next eviction draws from.
     ///
     /// Its own cursor and not [`Server::next_db`], because eviction and
     /// compaction move at different rates and sharing one would make the
     /// database that gets compacted depend on how many keys were evicted.
-    evict_db: usize,
+    ///
+    /// Shared for the same reason [`Server::next_db`] is, and with the same
+    /// answer: two threads evicting at once may pick the same database, and one
+    /// of them finds the other got there first and moves on.
+    evict_db: AtomicUsize,
     /// Which database the next active expiry sweep starts at.
     ///
     /// A third cursor for the same reason there is a second one. A sweep runs on
@@ -593,14 +619,14 @@ impl Server {
             width: 1,
             clock,
             started_ms: clock.now_ms(),
-            next_db: 0,
+            next_db: AtomicUsize::new(0),
             dirty: ALL_DATABASES,
-            conn_bytes: 0,
+            conn_bytes: AtomicUsize::new(0),
             maxmemory: AtomicU64::new(0),
-            store: None,
+            store: Lock::new(None),
             maxstore: AtomicU64::new(NO_MAXSTORE),
-            used: 0,
-            evict_db: 0,
+            used: AtomicUsize::new(0),
+            evict_db: AtomicUsize::new(0),
             expire_db: 0,
             expire_ms: 0,
             waiters: Lock::default(),
@@ -645,14 +671,14 @@ impl Server {
             width: 1,
             clock,
             started_ms: clock.now_ms(),
-            next_db: 0,
+            next_db: AtomicUsize::new(0),
             dirty: ALL_DATABASES,
-            conn_bytes: 0,
+            conn_bytes: AtomicUsize::new(0),
             maxmemory: AtomicU64::new(0),
-            store: None,
+            store: Lock::new(None),
             maxstore: AtomicU64::new(NO_MAXSTORE),
-            used: 0,
-            evict_db: 0,
+            used: AtomicUsize::new(0),
+            evict_db: AtomicUsize::new(0),
             expire_db: 0,
             expire_ms: 0,
             waiters: Lock::default(),
@@ -706,11 +732,6 @@ impl Server {
         self.dbs
             .iter()
             .flat_map(|db| (0..db.width()).map(|i| db.hold_stripe(i)))
-    }
-
-    /// The same, mutably.
-    fn keyspaces_mut(&mut self) -> impl Iterator<Item = &mut Keyspace> {
-        self.dbs.iter_mut().flat_map(Db::stripes_mut)
     }
 
     /// How many keyspaces there are, counting every stripe of every database.
@@ -857,7 +878,7 @@ impl Server {
     /// keyspace can change them and the engine has to say when they move.
     #[must_use]
     pub fn memory_bytes(&self) -> usize {
-        self.keyspaces().map(|db| db.memory_bytes()).sum::<usize>() + self.conn_bytes
+        self.keyspaces().map(|db| db.memory_bytes()).sum::<usize>() + self.conn_bytes()
     }
 
     /// What the keyspace itself is holding, live records only.
@@ -916,8 +937,8 @@ impl Server {
 
     /// What the connections' read and reply buffers are holding.
     #[must_use]
-    pub const fn conn_bytes(&self) -> usize {
-        self.conn_bytes
+    pub fn conn_bytes(&self) -> usize {
+        self.conn_bytes.load(Relaxed)
     }
 
     /// Note that the connections are holding `delta` bytes more than they were,
@@ -928,7 +949,13 @@ impl Server {
     /// rather than when `INFO` asks, which puts the cost of a report on the
     /// command path of a server nobody is asking.
     pub fn note_conn_bytes(&mut self, delta: isize) {
-        self.conn_bytes = self.conn_bytes.saturating_add_signed(delta);
+        // A read and a write and not a fetch and add, because the number is a
+        // sum of signed changes and the saturating part has to happen in the
+        // middle. Two threads that change their buffers in the same instant can
+        // lose one of the two changes, which is a report that is a few kilobytes
+        // out until the next connection on either thread moves it again.
+        self.conn_bytes
+            .store(self.conn_bytes().saturating_add_signed(delta), Relaxed);
     }
 
     /// Keys reclaimed by running into them after their deadline.
@@ -1043,12 +1070,12 @@ impl Server {
     /// server with no limit is not paying to count something nobody reads. The
     /// first reading after switching it on is the walk that the total starts
     /// from, and it is the only walk.
-    pub fn set_maxmemory(&mut self, bytes: u64) {
+    pub fn set_maxmemory(&self, bytes: u64) {
         self.maxmemory.store(bytes, Relaxed);
-        for db in &mut self.dbs {
+        for db in &self.dbs {
             db.track_memory(bytes != 0);
         }
-        self.used = self.settled_memory();
+        self.used.store(self.settled_memory(), Relaxed);
     }
 
     /// Say where a database should get its store from when it needs one.
@@ -1064,13 +1091,13 @@ impl Server {
         &mut self,
         source: impl FnMut(usize) -> Option<Box<dyn Blocks>> + 'static,
     ) {
-        self.store = Some(Box::new(source));
+        *self.store.lock() = Some(Box::new(source));
     }
 
     /// Whether this server has been given somewhere to put cold values.
     #[must_use]
-    pub const fn has_store_source(&self) -> bool {
-        self.store.is_some()
+    pub fn has_store_source(&self) -> bool {
+        self.store.lock().is_some()
     }
 
     /// Open database `at`'s store, if it has not got one and there is one to be
@@ -1079,15 +1106,19 @@ impl Server {
     /// A store that will not open leaves the database where it was, which is
     /// evicting, because a memory limit that cannot be answered by moving data
     /// still has to be answered.
-    fn attach_store(&mut self, at: usize) {
+    fn attach_store(&self, at: usize) {
         if self.slot(at).store_bytes().is_some() {
             return;
         }
-        let Some(source) = self.store.as_mut() else {
+        // The closure is run with its lock held and the keyspace is taken after
+        // it has answered, so the file is opened once however many threads asked
+        // for it and the stripe is not held while a file is being opened.
+        let mut source = self.store.lock();
+        let Some(source) = source.as_mut() else {
             return;
         };
         if let Some(blocks) = source(at) {
-            self.slot_mut(at).attach(blocks);
+            self.slot(at).attach(blocks);
         }
     }
 
@@ -1189,7 +1220,7 @@ impl Server {
             // Nothing attached, but somewhere to get one from the moment this
             // database needs it, which is what makes the answer yes rather than
             // no. Opening it here would mean `INFO` opened files.
-            None => self.store.is_some(),
+            None => self.store.lock().is_some(),
         }
     }
 
@@ -1197,9 +1228,9 @@ impl Server {
     ///
     /// Nothing at all when there is no limit, which is the default and is every
     /// server that has not asked for one.
-    pub fn refresh_memory(&mut self) {
+    pub fn refresh_memory(&self) {
         if self.maxmemory() != 0 {
-            self.used = self.settled_memory();
+            self.used.store(self.settled_memory(), Relaxed);
         }
     }
 
@@ -1209,11 +1240,11 @@ impl Server {
     /// about the collections that could have moved since the last time, which is
     /// what a batch touched rather than what the server holds, so it can be
     /// asked once a batch and again on every command that is over the limit.
-    fn settled_memory(&mut self) -> usize {
-        self.keyspaces_mut()
-            .map(Keyspace::settled_memory_bytes)
+    fn settled_memory(&self) -> usize {
+        self.keyspaces()
+            .map(|mut db| db.settled_memory_bytes())
             .sum::<usize>()
-            + self.conn_bytes
+            + self.conn_bytes()
     }
 
     /// Make room under the `maxmemory` limit, throwing keys away if that is what
@@ -1249,24 +1280,26 @@ impl Server {
     /// this holds a server to its limit give or take a segment. A `maxmemory` of
     /// a few hundred megabytes gets what it asked for. A `maxmemory` of four
     /// megabytes is asking for a precision this store does not have.
-    pub fn make_room(&mut self) -> bool {
+    pub fn make_room(&self) -> bool {
         let limit = self.maxmemory();
-        if limit == 0 || self.used as u64 <= limit {
+        if limit == 0 || self.used.load(Relaxed) as u64 <= limit {
             return true;
         }
         // The cached reading is a batch old and the batch may have compacted
         // since, so take a fresh one before throwing anything away. It is the
         // settled reading and not the walk, so what this costs is the handful of
         // collections the last batch touched and not the whole database.
-        self.used = self.settled_memory();
+        let mut used = self.settled_memory();
+        self.used.store(used, Relaxed);
         let mut budget = EVICT_BUDGET;
-        while self.used as u64 > limit {
-            let over = self.used - limit as usize;
+        while used as u64 > limit {
+            let over = used - limit as usize;
             if !self.relieve_step(over) {
                 return false;
             }
             self.compact_hard_step();
-            self.used = self.settled_memory();
+            used = self.settled_memory();
+            self.used.store(used, Relaxed);
             budget -= 1;
             if budget == 0 {
                 break;
@@ -1291,9 +1324,10 @@ impl Server {
     /// so a server using more than one of them does not empty the first before
     /// touching the second. Almost every server is on database zero only, where
     /// this is one call that answers and fifteen that say the map is empty.
-    fn relieve_step(&mut self, over: usize) -> bool {
+    fn relieve_step(&self, over: usize) -> bool {
+        let from = self.evict_db.load(Relaxed);
         for turn in 0..self.slots() {
-            let i = (self.evict_db + turn) % self.slots();
+            let i = (from + turn) % self.slots();
             // An empty keyspace has nothing to move and opening a log for one
             // would cost a resident page window to find that out.
             let used = !self.slot(i).is_empty();
@@ -1303,15 +1337,15 @@ impl Server {
                 // that demoted nothing and handed back a segment is a round
                 // that made room, and reading only the count refuses the write
                 // that provoked it.
-                self.slot_mut(i)
+                self.slot(i)
                     .relieve(over)
                     .is_ok_and(yo_kv::tier::Relief::made_room)
             } else {
-                self.slot_mut(i).evict_one()
+                self.slot(i).evict_one()
             };
             if gave {
-                self.evict_db = (i + 1) % self.slots();
-                self.dirty |= 1u64 << self.slot_db(i);
+                self.evict_db.store((i + 1) % self.slots(), Relaxed);
+                self.mine().mark(1u64 << self.slot_db(i));
                 return true;
             }
         }
@@ -1378,11 +1412,12 @@ impl Server {
     /// Takes the databases in the same order [`Server::compact_step`] does and
     /// stops at the first one that had something to move, and it asks with the
     /// ratios off. See [`Keyspace::compact_hard`] for what that changes.
-    fn compact_hard_step(&mut self) -> Option<usize> {
+    fn compact_hard_step(&self) -> Option<usize> {
+        let from = self.next_db.load(Relaxed);
         for turn in 0..self.slots() {
-            let i = (self.next_db + turn) % self.slots();
-            if let Some(moved) = self.slot_mut(i).compact_hard() {
-                self.next_db = (i + 1) % self.slots();
+            let i = (from + turn) % self.slots();
+            if let Some(moved) = self.slot(i).compact_hard() {
+                self.next_db.store((i + 1) % self.slots(), Relaxed);
                 return Some(moved);
             }
         }
@@ -1419,8 +1454,9 @@ impl Server {
     /// database and the cost of acting is bounded by a segment.
     pub fn compact_step(&mut self) -> Option<usize> {
         self.collect_marks();
+        let from = self.next_db.load(Relaxed);
         for turn in 0..self.slots() {
-            let i = (self.next_db + turn) % self.slots();
+            let i = (from + turn) % self.slots();
             // Nothing has run against this database since it last said it had
             // nothing to collect, so it still has nothing to collect and the
             // line it lives on stays where it is.
@@ -1429,7 +1465,7 @@ impl Server {
                 continue;
             }
             if let Some(moved) = self.slot_mut(i).compact_step() {
-                self.next_db = (i + 1) % self.slots();
+                self.next_db.store((i + 1) % self.slots(), Relaxed);
                 return Some(moved);
             }
             // Only once every stripe of the database has said it has nothing,

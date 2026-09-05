@@ -402,9 +402,9 @@ impl Db {
     }
 
     /// Turn the running memory total on or off in every stripe.
-    pub fn track_memory(&mut self, on: bool) {
-        for stripe in self.stripes_mut() {
-            stripe.track_memory(on);
+    pub fn track_memory(&self, on: bool) {
+        for i in 0..self.stripes.len() {
+            self.hold_stripe(i).track_memory(on);
         }
     }
 
