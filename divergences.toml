@@ -605,3 +605,17 @@ reason = "A real server answers a circle by covering it with geohash cells and r
 status = "until"
 resolved_by = "M8"
 spec = "09 section 5"
+
+[[divergence]]
+id = "D-84"
+title = "Suggestions that score the same come back in an order a real server does not have"
+reason = "FT.SUGGET orders its answer by the score it works out, and a run of terms that work out to the same number is left in whatever order the module's heap happens to hold them in: seven terms all stored at one answer aad aab aaa aac aae to a MAX of five and aad aaf aaa aac aab aae aag to a MAX of a hundred, which is not the order they went in and is not sorted by anything. This side answers ties in byte order, so the same two calls answer aaa aab aac aad aae and aaa aab aac aad aae aaf aag. Which terms are kept is the same on both sides, since a term has to beat the worst one kept rather than tie it and so the first few reached win, and only the order they are handed back in differs. A client that wants a defined order among equal scores has one here and never had one there."
+status = "permanent"
+spec = "09 section 5"
+
+[[divergence]]
+id = "D-85"
+title = "A MAX too large to honour is answered rather than crashing the server"
+reason = "FT.SUGGET takes a MAX anywhere from one to four billion and refuses anything outside that, which is the range a u32 holds, and a real server then tries to make room for that many answers before it has looked at a single term. FT.SUGGET k p MAX 2147483648 segfaults Redis 8.10.1 in Trie_CollectFuzzy and takes the whole server down with it, which was found here rather than looked up and is reproducible on a fresh instance. This side takes the same range and grows the answer to fit what it actually found, so the same command answers the same terms a MAX of five would and costs nothing. The refused range is copied exactly, so a client that gets an error out of one gets the same error out of the other."
+status = "permanent"
+spec = "09 section 5"
