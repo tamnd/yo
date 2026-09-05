@@ -362,6 +362,19 @@ impl<S: Sink> Wire<S> {
         self.front.owed()
     }
 
+    /// Clients of this thread's that are blocked on a key.
+    ///
+    /// The other thing a driver waiting on readability needs to know, and for
+    /// the same reason `owed` is: there is work here that no incoming byte will
+    /// wake it for. A blocked client is answered by a write another thread made
+    /// or by its own deadline passing, and neither of those is a byte arriving
+    /// on this thread's poller, so a driver that reads this keeps its wait short
+    /// while anybody is waiting on it.
+    #[must_use]
+    pub fn waiting(&self) -> usize {
+        self.server.parked_here()
+    }
+
     /// Whether a client has asked the server to stop.
     ///
     /// The driver reads this once a turn, next to the flag a signal sets, and
@@ -545,7 +558,7 @@ impl<S: Sink> Engine for Wire<S> {
         // keys and woken by `RPUSH b` then `RPUSH a` in one pipeline has to
         // answer with `b`, because that is the push that was in front of it, and
         // it can only do that if it was served in between the two.
-        if self.server.parked() != 0 {
+        if self.server.parked_here() != 0 {
             self.serve_waiters();
         }
         yo_reactor::Flow::Next
@@ -555,9 +568,14 @@ impl<S: Sink> Engine for Wire<S> {
         // The deadline sweep, and it is here because this is the one thing the
         // driver calls on a turn that ran nothing at all. A client whose timeout
         // passes while the server is idle is answered within the loop's idle
-        // wait, which is 20ms and is finer than the 10hz Redis checks its own
+        // wait, which the loop shortens to a millisecond on a thread that has
+        // somebody waiting. That is finer than the 10hz Redis checks its own
         // blocked clients at.
-        if self.server.parked() != 0 {
+        //
+        // This thread's count and not the server's, because the sweep can only
+        // answer this thread's waiters, so on any other thread it is a lock
+        // taken to find nothing.
+        if self.server.parked_here() != 0 {
             self.server.refresh_clock();
             self.serve_waiters();
         }
@@ -823,6 +841,61 @@ mod tests {
         });
 
         assert_eq!(server.parked(), 1, "and the other one is still waiting");
+    }
+
+    /// The count a thread branches on before it reaches for the shared list is
+    /// its own, because the list is one lock and a thread can only answer what
+    /// it parked itself. Branching on the server wide count instead would put
+    /// every thread through that lock after every command as soon as one client
+    /// blocked anywhere.
+    #[test]
+    fn a_thread_counts_the_clients_it_blocked_and_nobody_else_s() {
+        let mut server = Server::new();
+        server.set_threads(2);
+        let first = Wire::with_server(server, Recorder::new());
+        let second = Wire::over(first.shared(), Recorder::new());
+        let server = first.shared();
+
+        let parked = std::sync::Barrier::new(2);
+        let looked = std::sync::Barrier::new(2);
+
+        std::thread::scope(|s| {
+            let (parked, looked) = (&parked, &looked);
+            s.spawn(move || {
+                let mut r = Reactor::inline(first);
+                let mut batch = Vec::new();
+                let conn = r.engine_mut().accept();
+                r.engine_mut().feed(conn, &wire(&[b"BLPOP", b"a", b"0"]));
+                pump(&mut r, &mut batch);
+                assert_eq!(r.engine().waiting(), 1, "the one this thread blocked");
+                parked.wait();
+                looked.wait();
+
+                // A second client of this thread's that never blocked, opened
+                // and closed. It is not on the list, so the count stays where
+                // it was rather than following the disconnect down.
+                let other = r.engine_mut().accept();
+                r.engine_mut().feed(other, &wire(&[b"PING"]));
+                pump(&mut r, &mut batch);
+                r.engine_mut().hangup(other);
+                pump(&mut r, &mut batch);
+                assert_eq!(r.engine().waiting(), 1, "still just the blocked one");
+            });
+            s.spawn(move || {
+                let mut r = Reactor::inline(second);
+                let mut batch = Vec::new();
+                parked.wait();
+
+                // A thread with nothing of its own blocked, on a server that
+                // has one client blocked on it.
+                pump(&mut r, &mut batch);
+                assert_eq!(r.engine().waiting(), 0, "none of them are this one's");
+                assert_eq!(r.engine().server().parked(), 1, "one on the server");
+                looked.wait();
+            });
+        });
+
+        assert_eq!(server.parked(), 1);
     }
 
     /// Two fronts hand out connection slots from zero, so the number that tells
