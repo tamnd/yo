@@ -49,6 +49,12 @@
 //! from the registry being per server rather than per database, which is itself
 //! measured rather than chosen.
 //!
+//! The scan is the other half of that and does not match it. An index reads the
+//! database it was created on and no other, so the same key on database one is
+//! invisible to it until something writes to that key. Both halves are measured
+//! and neither is a choice. It matters less than it reads, because a real
+//! server refuses `FT.CREATE` anywhere but on database zero.
+//!
 //! # What the failures are for
 //!
 //! A document that cannot be read is counted twice, once against the index and
@@ -236,6 +242,48 @@ impl Registry {
     #[must_use]
     pub fn watching(&self) -> bool {
         !self.is_empty()
+    }
+
+    /// Whether one named index wants a key, which is what the initial scan asks
+    /// before it goes and reads one back.
+    ///
+    /// The exact name and never an alias, because the only caller is
+    /// `FT.CREATE` handing back the name it just made.
+    #[must_use]
+    pub fn wants(&self, name: &[u8], source: Source, key: &[u8]) -> bool {
+        self.named(name)
+            .is_some_and(|index| index.follows(source, key))
+    }
+
+    /// Reads a key into one index and leaves every other index alone.
+    ///
+    /// The scan a fresh index runs over the keys that were already there.
+    /// [`Registry::wrote`] is the wrong thing for it: an `FT.CREATE` over a
+    /// prefix that another index already covers would renumber every document
+    /// that one holds, and a real server does not do that to an index nobody
+    /// touched.
+    pub fn filled(
+        &mut self,
+        name: &[u8],
+        source: Source,
+        key: &[u8],
+        fields: &[(&[u8], &[u8])],
+    ) -> bool {
+        let (mut indexes, english) = self.reading();
+        let Some(index) = indexes.find(|index| &*index.name == name) else {
+            return false;
+        };
+        index.follows(source, key) && index.wrote(english, key, fields)
+    }
+
+    /// Whether an index by this name is one the scan should run for.
+    ///
+    /// `SKIPINITIALSCAN` says no, and so does a name that is not there, which
+    /// is what a failed create leaves behind.
+    #[must_use]
+    pub fn scanning(&self, name: &[u8]) -> bool {
+        self.named(name)
+            .is_some_and(|index| !index.definition.skip_initial_scan)
     }
 }
 
@@ -463,6 +511,44 @@ mod tests {
         assert_eq!(counts(&r), (4, 5, 8));
         r.wrote(Source::Hash, b"p:5", &[(&b"t"[..], &b"alpha"[..])]);
         assert_eq!(counts(&r), (5, 5, 9));
+    }
+
+    /// The scan fills the index that was just made and does not disturb the one
+    /// that was already over the same prefix.
+    #[test]
+    fn a_scan_fills_one_index_and_leaves_the_others_where_they_were() {
+        let mut r = registry(on(b"p:", vec![text()]));
+        r.wrote(Source::Hash, b"p:1", &[(&b"t"[..], &b"alpha"[..])]);
+        let mut second = on(b"p:", vec![text()]);
+        second.name = b"jx".to_vec().into();
+        r.create(second).expect("free");
+
+        assert!(r.wants(b"jx", Source::Hash, b"p:1"));
+        assert!(!r.wants(b"jx", Source::Hash, b"q:1"));
+        assert!(!r.wants(b"nope", Source::Hash, b"p:1"));
+        assert!(r.filled(b"jx", Source::Hash, b"p:1", &[(&b"t"[..], &b"alpha"[..])]));
+        assert!(!r.filled(b"jx", Source::Hash, b"q:1", &[(&b"t"[..], &b"alpha"[..])]));
+        assert!(!r.filled(b"nope", Source::Hash, b"p:1", &[]));
+
+        // The new one has it, and the old one still has the number it had.
+        assert_eq!(r.named(b"jx").and_then(|i| i.held.docs.id(b"p:1")), Some(1));
+        assert_eq!(r.named(b"ix").and_then(|i| i.held.docs.id(b"p:1")), Some(1));
+    }
+
+    /// `SKIPINITIALSCAN` is the one thing that turns the scan off, and a name
+    /// that is not there answers the same way.
+    #[test]
+    fn an_index_that_asked_to_be_left_alone_is_not_scanned() {
+        let mut skipping = on(b"p:", vec![text()]);
+        skipping.definition.skip_initial_scan = true;
+        let mut r = registry(skipping);
+        assert!(!r.scanning(b"ix"));
+        assert!(!r.scanning(b"nope"));
+
+        let mut second = on(b"p:", vec![text()]);
+        second.name = b"jx".to_vec().into();
+        r.create(second).expect("free");
+        assert!(r.scanning(b"jx"));
     }
 
     /// An empty registry answers no to everything, which is what keeps the
