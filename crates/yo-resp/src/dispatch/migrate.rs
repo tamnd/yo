@@ -189,11 +189,11 @@ struct Going<'a> {
 /// of the store and the socket is a socket. There is no arrangement of this that
 /// does not allocate and no workload where it matters, because a command that
 /// opens a TCP connection is not one whose cost is in a `malloc`.
-pub(super) fn execute(server: &mut Server, at: usize, args: Args<'_>, out: &mut Out) -> Result<()> {
+pub(super) fn execute(server: &Server, at: usize, args: Args<'_>, out: &mut Out) -> Result<()> {
     yo_alloc::allow(|| run(server, at, args, out))
 }
 
-fn run(server: &mut Server, at: usize, args: Args<'_>, out: &mut Out) -> Result<()> {
+fn run(server: &Server, at: usize, args: Args<'_>, out: &mut Out) -> Result<()> {
     let plan = parse(args)?;
 
     // Everything that has to touch the store happens here, and the borrow ends
@@ -240,22 +240,34 @@ fn run(server: &mut Server, at: usize, args: Args<'_>, out: &mut Out) -> Result<
     name.push(':');
     name.push_str(&String::from_utf8_lossy(plan.port));
 
-    server.peers.expire(now);
+    // Held from here to the end, which is across the round trip to the peer. A
+    // socket cannot be shared by two threads halfway through a pipeline, so two
+    // clients migrating at once take turns rather than each getting a socket of
+    // their own. That is the right way round: the cost of a turn is one
+    // `MIGRATE`, and the cost of a socket per thread per peer is paid by every
+    // server that migrates anything.
+    let mut peers = server.peers.lock();
+    peers.expire(now);
 
     // One retry, and only for the errors a stale cached socket produces. A peer
     // that closed the connection while it was sitting in the cache looks exactly
     // like a peer that has gone away, and the difference is that the first one
     // works on the second attempt. A timeout is not retried, because waiting the
     // whole timeout twice is not a retry, it is twice the wait.
+    let sent = Sent {
+        name: &name,
+        plan: &plan,
+        going: &going,
+    };
     let mut retry = true;
     loop {
-        match attempt(server, &name, &plan, &going, now) {
+        match attempt(&mut peers, &sent, now) {
             Ok(replies) => {
-                finish(server, at, &name, &plan, &going, &replies, out);
+                finish(server, &mut peers, at, &sent, &replies, out);
                 return Ok(());
             }
             Err(Broke { failed, timed_out }) => {
-                server.peers.close(&name);
+                peers.close(&name);
                 if retry && !timed_out {
                     retry = false;
                     continue;
@@ -276,6 +288,17 @@ struct Broke {
     timed_out: bool,
 }
 
+/// What one attempt is sending and who it is going to.
+///
+/// The three travel together through the two halves of the command and neither
+/// half changes any of them, so they are one argument rather than three.
+struct Sent<'a, 'k> {
+    /// The host and port joined by a colon, which is the peer cache's key.
+    name: &'a str,
+    plan: &'a Plan<'k>,
+    going: &'a [Going<'k>],
+}
+
 /// What came back, one line per thing that was sent.
 struct Replies {
     /// The `AUTH` reply, when a password was sent.
@@ -292,42 +315,37 @@ struct Replies {
 /// halfway through a pipeline has an unknown number of unread replies in it and
 /// there is no way to get back in step with it.
 fn attempt(
-    server: &mut Server,
-    name: &str,
-    plan: &Plan<'_>,
-    going: &[Going<'_>],
+    peers: &mut Peers,
+    sent: &Sent<'_, '_>,
     now: u64,
 ) -> std::result::Result<Replies, Broke> {
-    let held = server.peers.find(name);
-    let last_db = held.map_or(-1, |i| server.peers.open[i].last_db);
+    let Sent { name, plan, going } = *sent;
+    let held = peers.find(name);
+    let last_db = held.map_or(-1, |i| peers.open[i].last_db);
     let select = last_db != plan.db;
 
     if held.is_none() {
         let sock = connect(plan)?;
         // Room is made by dropping the oldest, which on a cache this size is the
         // one that has gone longest without being wanted.
-        if server.peers.open.len() >= CACHE_MAX {
-            let oldest = server
-                .peers
+        if peers.open.len() >= CACHE_MAX {
+            let oldest = peers
                 .open
                 .iter()
                 .enumerate()
                 .min_by_key(|(_, p)| p.used_ms)
                 .map_or(0, |(i, _)| i);
-            server.peers.open.swap_remove(oldest);
+            peers.open.swap_remove(oldest);
         }
-        server.peers.open.push(Peer {
+        peers.open.push(Peer {
             at: name.to_string(),
             sock,
             last_db: -1,
             used_ms: now,
         });
     }
-    let i = server
-        .peers
-        .find(name)
-        .expect("the socket was just put here");
-    let peer = &mut server.peers.open[i];
+    let i = peers.find(name).expect("the socket was just put here");
+    let peer = &mut peers.open[i];
     peer.used_ms = now;
 
     let mut cmd =
@@ -382,14 +400,14 @@ fn attempt(
 /// running on the peer, and this is where that shows: the local keys stay and
 /// the peer may well have taken copies of them anyway.
 fn finish(
-    server: &mut Server,
+    server: &Server,
+    peers: &mut Peers,
     at: usize,
-    name: &str,
-    plan: &Plan<'_>,
-    going: &[Going<'_>],
+    sent: &Sent<'_, '_>,
     replies: &Replies,
     out: &mut Out,
 ) {
+    let Sent { name, plan, going } = *sent;
     fn bad(r: &Option<Vec<u8>>) -> Option<&[u8]> {
         r.as_deref().filter(|line| line.first() == Some(&b'-'))
     }
@@ -419,8 +437,8 @@ fn finish(
     // The socket is fine either way and stays cached. What changes is whether
     // the database it is selected on is still known: an error may have been the
     // `SELECT` itself, and after one there is nothing to be sure of.
-    if let Some(i) = server.peers.find(name) {
-        server.peers.open[i].last_db = if told.is_some() { -1 } else { plan.db };
+    if let Some(i) = peers.find(name) {
+        peers.open[i].last_db = if told.is_some() { -1 } else { plan.db };
     }
     match told {
         Some(line) => out.error_line(TARGET_ERROR, &line[1..]),

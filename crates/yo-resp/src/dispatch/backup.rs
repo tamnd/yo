@@ -37,7 +37,9 @@
 
 use std::fs;
 use std::path::PathBuf;
+use std::sync::atomic::Ordering::Relaxed;
 
+use yo_common::lock::Held;
 use yo_common::{Code, Error, Result};
 use yo_kv::Snapshot;
 
@@ -160,11 +162,37 @@ impl State {
     }
 }
 
+impl Server {
+    /// The backup state, held.
+    ///
+    /// Private to this module and to `CONFIG`, which reads and writes the one
+    /// setting that lives in here. Everything else about a backup is a `BACKUP`
+    /// subcommand and those are all below.
+    pub(super) fn backup(&self) -> Held<'_, State> {
+        self.backup.lock()
+    }
+
+    /// Whether there is no sealed backup to think about.
+    ///
+    /// The question [`expire`] asks before it takes the lock, and the answer on
+    /// a server nobody has backed up is always yes.
+    fn backup_idle(&self) -> bool {
+        !self.sealed.load(Relaxed)
+    }
+
+    /// Say whether a sealed backup is on disk now.
+    ///
+    /// Called with the state held, by whoever moved the phase.
+    fn set_sealed(&self, yes: bool) {
+        self.sealed.store(yes, Relaxed);
+    }
+}
+
 /// Run one `BACKUP` subcommand.
 ///
 /// The table's arity is exactly two, so every subcommand here has already had
 /// its argument count checked and none of them takes anything else.
-pub(super) fn execute(server: &mut Server, args: Args<'_>, out: &mut Out) -> Result<()> {
+pub(super) fn execute(server: &Server, args: Args<'_>, out: &mut Out) -> Result<()> {
     let sub = args.get(1);
     if args::is(sub, b"start") {
         start(server)?;
@@ -202,13 +230,14 @@ pub(super) fn execute(server: &mut Server, args: Args<'_>, out: &mut Out) -> Res
 /// was, which for the usual case is idle, and the error goes back to the client
 /// rather than into the `error` field: a command that answers `-ERR` has told
 /// the caller already.
-fn start(server: &mut Server) -> Result<()> {
-    match server.backup.phase {
+fn start(server: &Server) -> Result<()> {
+    let mut b = server.backup();
+    match b.phase {
         Phase::Incrementing => return Err(Error::new(Code::Invalid, IN_PROGRESS)),
         Phase::Sealed => return Err(Error::new(Code::Invalid, SEALED_EXISTS)),
         Phase::Idle | Phase::Failed => {}
     }
-    let seq = server.backup.next;
+    let seq = b.next;
     let now = seconds(server);
     yo_alloc::allow(|| {
         let dir = dir(server);
@@ -217,7 +246,6 @@ fn start(server: &mut Server) -> Result<()> {
             .and_then(|()| fs::write(dir.join(base_name(seq)), &file))
             .map_err(failed)?;
 
-        let b = &mut server.backup;
         b.phase = Phase::Incrementing;
         b.seq = seq;
         b.next = seq + 1;
@@ -243,19 +271,21 @@ fn start(server: &mut Server) -> Result<()> {
 /// The incremental file is created here and is empty. It is in the set because
 /// the manifest names it and a loader reads the manifest, so a set without it
 /// is a set a real `redis-server` will not start on.
-fn seal(server: &mut Server) -> Result<()> {
-    if server.backup.phase != Phase::Incrementing {
+fn seal(server: &Server) -> Result<()> {
+    let mut b = server.backup();
+    if b.phase != Phase::Incrementing {
         return Err(Error::new(Code::Invalid, NOT_READY));
     }
-    let seq = server.backup.seq;
+    let seq = b.seq;
     let now = seconds(server);
     yo_alloc::allow(|| {
         let dir = dir(server);
         fs::write(dir.join(incr_name(seq)), [])
             .and_then(|()| fs::write(dir.join(MANIFEST), manifest(seq)))
             .map_err(failed)?;
-        server.backup.phase = Phase::Sealed;
-        server.backup.end_time = now;
+        b.phase = Phase::Sealed;
+        b.end_time = now;
+        server.set_sealed(true);
         Ok(())
     })
 }
@@ -266,15 +296,16 @@ fn seal(server: &mut Server) -> Result<()> {
 /// paying for it. What is left is the `failed` state and the sentence saying
 /// who did it, which is what a client polling `STATUS` from somewhere else
 /// needs to see rather than an idle server that looks like nothing happened.
-fn abort(server: &mut Server) -> Result<()> {
-    if server.backup.phase != Phase::Incrementing {
+fn abort(server: &Server) -> Result<()> {
+    let mut b = server.backup();
+    if b.phase != Phase::Incrementing {
         return Err(Error::new(Code::Invalid, NO_BACKUP));
     }
-    let seq = server.backup.seq;
+    let seq = b.seq;
     yo_alloc::allow(|| {
         let _ = fs::remove_file(dir(server).join(base_name(seq)));
-        server.backup.phase = Phase::Failed;
-        server.backup.error = ABORTED.to_string();
+        b.phase = Phase::Failed;
+        b.error = ABORTED.to_string();
     });
     Ok(())
 }
@@ -283,11 +314,12 @@ fn abort(server: &mut Server) -> Result<()> {
 ///
 /// Legal from every state but `incrementing`, and from idle it is a way of
 /// saying so rather than an error, which is the reference's answer too.
-fn cleanup(server: &mut Server) -> Result<()> {
-    if server.backup.phase == Phase::Incrementing {
+fn cleanup(server: &Server) -> Result<()> {
+    let mut b = server.backup();
+    if b.phase == Phase::Incrementing {
         return Err(Error::new(Code::Invalid, RUNNING));
     }
-    yo_alloc::allow(|| discard(server));
+    yo_alloc::allow(|| discard(server, &mut b));
     Ok(())
 }
 
@@ -297,13 +329,17 @@ fn cleanup(server: &mut Server) -> Result<()> {
 /// two different things asking for it. A file that is not there is not a
 /// problem: `ABORT` already removed the base one, and a backup that was never
 /// sealed never had the other two.
-fn discard(server: &mut Server) {
-    let seq = server.backup.seq;
+///
+/// The state comes in already held rather than being taken here, because both
+/// callers looked at the phase before deciding to call and the lock does not
+/// nest.
+fn discard(server: &Server, b: &mut State) {
+    server.set_sealed(false);
+    let seq = b.seq;
     let dir = dir(server);
     for name in [base_name(seq), incr_name(seq), MANIFEST.to_string()] {
         let _ = fs::remove_file(dir.join(name));
     }
-    let b = &mut server.backup;
     b.phase = Phase::Idle;
     b.start_time = 0;
     b.end_time = 0;
@@ -317,8 +353,11 @@ fn discard(server: &mut Server) {
 /// right trade here: the whole engine is turned by the same loop, and a
 /// timeout that fires on an idle server would mean a thread whose only job is
 /// to delete three files.
-pub(super) fn expire(server: &mut Server) {
-    let b = &server.backup;
+pub(super) fn expire(server: &Server) {
+    if server.backup_idle() {
+        return;
+    }
+    let mut b = server.backup();
     if b.phase != Phase::Sealed || b.ttl == 0 {
         return;
     }
@@ -329,7 +368,7 @@ pub(super) fn expire(server: &mut Server) {
     if seconds(server) < deadline {
         return;
     }
-    yo_alloc::allow(|| discard(server));
+    yo_alloc::allow(|| discard(server, &mut b));
 }
 
 /// `BACKUP STATUS`, which is a map on RESP3 and the same pairs flat on RESP2.
@@ -338,7 +377,7 @@ pub(super) fn expire(server: &mut Server) {
 /// than absent when there is nothing to report, which is what makes this a map
 /// of a fixed four pairs whatever state the server is in.
 fn status(server: &Server, out: &mut Out) {
-    let b = &server.backup;
+    let b = server.backup();
     out.map(4);
     out.bulk(b"state");
     out.bulk(b.phase.name().as_bytes());
@@ -356,8 +395,9 @@ fn status(server: &Server, out: &mut Out) {
 /// manifest names them. Nothing at all from idle or failed, since there is
 /// nothing on disk to copy.
 fn list(server: &Server, out: &mut Out) {
-    let seq = server.backup.seq;
-    let count = match server.backup.phase {
+    let b = server.backup();
+    let seq = b.seq;
+    let count = match b.phase {
         Phase::Incrementing => 1,
         Phase::Sealed => 3,
         Phase::Idle | Phase::Failed => 0,
@@ -382,7 +422,7 @@ fn list(server: &Server, out: &mut Out) {
 /// something to whoever reads it. `aof-base` is the one a loader acts on: it
 /// says this file is the base of an append only file rather than a standalone
 /// dump, which is what lets the manifest point at it.
-fn image(server: &mut Server) -> (Vec<u8>, usize) {
+fn image(server: &Server) -> (Vec<u8>, usize) {
     let bits: &[u8] = if usize::BITS == 64 { b"64" } else { b"32" };
     let mut snap = Snapshot::new();
     snap.aux(b"redis-ver", REPORTED_VERSION.as_bytes());
