@@ -21837,6 +21837,146 @@ mod tests {
         );
     }
 
+    /// An index over two text fields, a number and a tag, holding one key whose
+    /// `a` runs long enough to be worth cutting down and whose `b` and `g` hold
+    /// nothing the query matches.
+    fn marking(f: &mut Fixture) {
+        f.run(&[
+            b"FT.CREATE",
+            b"mk",
+            b"ON",
+            b"HASH",
+            b"PREFIX",
+            b"1",
+            b"m:",
+            b"SCHEMA",
+            b"a",
+            b"TEXT",
+            b"b",
+            b"TEXT",
+            b"n",
+            b"NUMERIC",
+            b"g",
+            b"TAG",
+        ]);
+        f.run(&[
+            b"HSET",
+            b"m:1",
+            b"a",
+            b"c1 c2 c3 fox d1 d2 d3 d4 d5 d6 d7 d8 d9 fox e1 e2 e3",
+            b"b",
+            b"t1 t2 t3 t4 t5 t6 t7 t8",
+            b"n",
+            b"1",
+            b"g",
+            b"red",
+        ]);
+    }
+
+    /// A field the query matched comes back as fragments and a field it did not
+    /// comes back as its own front.
+    #[test]
+    fn a_summarize_cuts_a_field_down_to_what_matched() {
+        let mut f = Fixture::new();
+        marking(&mut f);
+        let got = f.run(&[b"FT.SEARCH", b"mk", b"fox", b"SUMMARIZE", b"LEN", b"2"]);
+        assert!(got.contains("c3 fox d1 d2... d9 fox e1 e2... "), "{got}");
+        // `b` holds no match, so it keeps its front and loses its last word.
+        assert!(got.contains("t1 t2 t3 t4 t5 t6 t7\r\n"), "{got}");
+        // And so does the tag, which is a value like any other to this clause.
+        assert!(got.contains("$1\r\nr\r\n"), "{got}");
+    }
+
+    /// `FRAGS` is applied before the context either side of a fragment is worked
+    /// out, so the fragment that is left runs over the match of the one that was
+    /// dropped rather than stopping on it.
+    #[test]
+    fn a_dropped_fragment_stops_bounding_the_one_that_was_kept() {
+        let mut f = Fixture::new();
+        marking(&mut f);
+        let got = f.run(&[
+            b"FT.SEARCH",
+            b"mk",
+            b"fox",
+            b"SUMMARIZE",
+            b"FRAGS",
+            b"1",
+            b"LEN",
+            b"20",
+        ]);
+        assert!(
+            got.contains("c2 c3 fox d1 d2 d3 d4 d5 d6 d7 d8 d9 fox e1 e2... "),
+            "{got}"
+        );
+        // Keep both and the first stops on the second rather than running over
+        // it, on the same query and the same budget.
+        let two = f.run(&[
+            b"FT.SEARCH",
+            b"mk",
+            b"fox",
+            b"SUMMARIZE",
+            b"FRAGS",
+            b"2",
+            b"LEN",
+            b"20",
+        ]);
+        assert!(
+            two.contains("c2 c3 fox d1 d2 d3 d4 d5 d6 d7 d8 d9... d1"),
+            "{two}"
+        );
+    }
+
+    /// A `HIGHLIGHT` wraps every match, and on a field with no match in it the
+    /// clause also calls off the cutting down a `SUMMARIZE` would have done.
+    #[test]
+    fn a_highlight_marks_the_matches_and_leaves_the_rest_of_the_field_alone() {
+        let mut f = Fixture::new();
+        marking(&mut f);
+        let got = f.run(&[b"FT.SEARCH", b"mk", b"fox", b"HIGHLIGHT"]);
+        assert!(got.contains("<b>fox</b> d1 d2"), "{got}");
+        let both = f.run(&[
+            b"FT.SEARCH",
+            b"mk",
+            b"fox",
+            b"SUMMARIZE",
+            b"LEN",
+            b"2",
+            b"HIGHLIGHT",
+        ]);
+        assert!(both.contains("c3 <b>fox</b> d1 d2... "), "{both}");
+        // `b` still holds no match, and this time it comes back whole.
+        assert!(both.contains("t1 t2 t3 t4 t5 t6 t7 t8\r\n"), "{both}");
+        assert!(both.contains("$3\r\nred\r\n"), "{both}");
+        // Naming a field one clause does not cover leaves it cut down again.
+        let split = f.run(&[
+            b"FT.SEARCH",
+            b"mk",
+            b"fox",
+            b"SUMMARIZE",
+            b"FIELDS",
+            b"1",
+            b"b",
+            b"LEN",
+            b"2",
+            b"HIGHLIGHT",
+            b"FIELDS",
+            b"1",
+            b"a",
+        ]);
+        assert!(split.contains("t1 t2 t3 t4 t5 t6 t7\r\n"), "{split}");
+    }
+
+    /// A tag is never marked, in its own field or in a text field beside it.
+    #[test]
+    fn a_highlight_does_not_mark_a_tag() {
+        let mut f = Fixture::new();
+        marking(&mut f);
+        f.run(&[b"HSET", b"m:1", b"b", b"red and blue"]);
+        let got = f.run(&[b"FT.SEARCH", b"mk", b"@g:{red}", b"HIGHLIGHT"]);
+        assert!(!got.contains("<b>"), "{got}");
+        assert!(got.contains("red and blue"), "{got}");
+    }
+
     /// A search answers a total and then a row for every key in the window,
     /// with the fields of that key after it.
     #[test]

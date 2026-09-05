@@ -57,6 +57,12 @@
 //! does not is still sortable, just read off the key afterwards, and the same
 //! comparison is used either way so both roads give the same answer.
 //!
+//! [`summary`] is what `SUMMARIZE` and `HIGHLIGHT` do to a value on its way
+//! back out: cut it down to the parts the query matched and mark them. It runs
+//! long after the walk did, off the value under the key rather than off the
+//! index, which is why a field the schema does not know is cut but never
+//! marked.
+//!
 //! [`held`] is the three of them under one index with the routine that fills
 //! them, so a key and its fields go in one end and a document with a number, a
 //! score, a length and a term in every list it belongs to comes out the other.
@@ -113,6 +119,7 @@ pub mod reduce;
 pub mod registry;
 pub mod score;
 pub mod sorted;
+pub mod summary;
 pub mod tags;
 pub mod text;
 pub mod token;

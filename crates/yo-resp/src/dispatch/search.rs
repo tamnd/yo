@@ -92,8 +92,9 @@ use yo_search::index::{Definition, Source};
 use yo_search::query::{self, Ask, Bad, Mask, Node, Pair, Range, What};
 use yo_search::score::Scorer;
 use yo_search::sorted::{self, Sorted};
+use yo_search::summary::{self, Trim, Wanted, Wrap};
 use yo_search::walk;
-use yo_search::{Clash, Field, Index, Registry};
+use yo_search::{Clash, English, Field, Index, Registry};
 use yo_shape::Metric;
 
 use super::Server;
@@ -1605,7 +1606,7 @@ const MOST_SAMPLE: i64 = 1000;
 
 /// What a `RETURN` list came to: for each field, where its value is read from on
 /// the key and what name it comes back under.
-type Wanted<'a> = Vec<(Box<[u8]>, &'a [u8])>;
+type Returns<'a> = Vec<(Box<[u8]>, &'a [u8])>;
 
 /// What a client asked for about the rows, which only `FT.SEARCH` acts on.
 ///
@@ -1633,7 +1634,7 @@ struct Rows<'a> {
     /// comes back as, which are the same bytes unless the client asked for a
     /// field the schema renamed: `RETURN 1 bb` over `body AS bb` reads `body`
     /// off the key and answers it under `bb`.
-    ret: Option<Wanted<'a>>,
+    ret: Option<Returns<'a>>,
     /// The text fields the query is narrowed to, or every field.
     infields: Option<Vec<&'a [u8]>>,
     /// The only keys that may answer, when the client listed them.
@@ -1657,6 +1658,28 @@ struct Rows<'a> {
     sorting: Option<Sorting>,
     /// Whether the value the sort compared goes on every row.
     sortkeys: bool,
+    /// What a `SUMMARIZE` asked for and which fields it touches, where an empty
+    /// list means every field the row carries.
+    summarize: Option<(Vec<&'a [u8]>, Trim)>,
+    /// The same for a `HIGHLIGHT`.
+    highlight: Option<(Vec<&'a [u8]>, Wrap)>,
+    /// The names a `FIELDS` list moved to the front of every row, in the order
+    /// the clauses named them. Two clauses each with a list put both lists in
+    /// front, the one written first coming first.
+    upfront: Vec<&'a [u8]>,
+    /// The text fields of the schema, copied out because the marking happens
+    /// once the registry has been let go of. A field that is not one of these
+    /// is cut down but never marked.
+    texts: Vec<Box<[u8]>>,
+    /// The stop words this index was built with, copied out for the same
+    /// reason. A word on the list is free in the arithmetic that decides how
+    /// wide a fragment comes back, so the summary of an English sentence is not
+    /// the summary the same sentence would get under `STOPWORDS 0`.
+    stops: Option<Vec<Box<[u8]>>>,
+    /// What the query was looking for, flattened out of the tree before the tree
+    /// went away with the registry lock. Empty unless one of the two clauses is
+    /// there to use it.
+    wanted: Wanted,
 }
 
 /// What a `SORTBY` on a search asked for, once the schema has been read.
@@ -1726,6 +1749,12 @@ impl Default for Rows<'_> {
             sort: None,
             sorting: None,
             sortkeys: false,
+            summarize: None,
+            highlight: None,
+            upfront: Vec::new(),
+            texts: Vec::new(),
+            stops: None,
+            wanted: Wanted::default(),
         }
     }
 }
@@ -2251,6 +2280,9 @@ fn row<'a>(
     if args::is(word, b"RETURN") {
         return returned(args, at, rows, index).map(Some);
     }
+    if args::is(word, b"SUMMARIZE") || args::is(word, b"HIGHLIGHT") {
+        return marking(args, at, rows, index).map(Some);
+    }
     if main && args::is(word, b"SORTBY") {
         return sorting(args, at, rows).map(Some);
     }
@@ -2379,6 +2411,110 @@ fn returned<'a>(
     // `RETURN 1 t RETURN 1 b` answers `b` on its own.
     rows.ret = Some(want);
     Ok(at + 2 + count)
+}
+
+/// `SUMMARIZE [FIELDS n name...] [FRAGS n] [LEN n] [SEPARATOR s]`, or
+/// `HIGHLIGHT [FIELDS n name...] [TAGS open close]`.
+///
+/// The two are one function because everything about reading them is shared
+/// except which words they take after the `FIELDS` list. Writing one of those
+/// words under the other clause is not an error about the clause, it is the
+/// clause ending and an unknown argument beginning, so `SUMMARIZE TAGS a b`
+/// complains about `TAGS` at its own position.
+///
+/// A `FIELDS` count of nothing means every field, which is also what leaving
+/// the list out means. A name the schema does not hold is refused, and the `@`
+/// a query would write in front of a field counts as part of the name, so `@a`
+/// is not a property either.
+///
+/// Every other way of getting it wrong answers one line: a missing value, a
+/// value that is not a number, a negative number, and a count that promises
+/// more names than the list has left. Both clauses may be written more than
+/// once and the last one wins, which is why the settings start again from the
+/// defaults each time round rather than from what the last one left.
+fn marking<'a>(
+    args: Args<'a>,
+    at: usize,
+    rows: &mut Rows<'a>,
+    index: &Index,
+) -> core::result::Result<usize, Vec<u8>> {
+    let word = args.get(at);
+    let summary = args::is(word, b"SUMMARIZE");
+    let bad = || line(BAD_ARGS, word, "");
+    let mut at = at + 1;
+    let mut fields: Vec<&'a [u8]> = Vec::new();
+    let mut trim = Trim::default();
+    let mut wrap = Wrap::default();
+    while let Some(next) = args.opt(at) {
+        if args::is(next, b"FIELDS") {
+            let Some(count) = args.opt(at + 1).and_then(parse_i64).filter(|n| *n >= 0) else {
+                return Err(bad());
+            };
+            let count = usize::try_from(count).unwrap_or(0);
+            for step in 0..count {
+                let Some(name) = args.opt(at + 2 + step) else {
+                    return Err(bad());
+                };
+                if !index.schema.iter().any(|f| *f.attribute == *name) {
+                    return Err(line(NO_PROPERTY, name, QUOTE_END));
+                }
+                fields.push(name);
+            }
+            at += 2 + count;
+            continue;
+        }
+        if summary && (args::is(next, b"FRAGS") || args::is(next, b"LEN")) {
+            let Some(value) = args.opt(at + 1).and_then(parse_i64).filter(|n| *n >= 0) else {
+                return Err(bad());
+            };
+            let value = usize::try_from(value).unwrap_or(0);
+            match args::is(next, b"FRAGS") {
+                true => trim.frags = value,
+                false => trim.len = value,
+            }
+            at += 2;
+            continue;
+        }
+        if summary && args::is(next, b"SEPARATOR") {
+            let Some(value) = args.opt(at + 1) else {
+                return Err(bad());
+            };
+            trim.separator = value.into();
+            at += 2;
+            continue;
+        }
+        if !summary && args::is(next, b"TAGS") {
+            let (Some(open), Some(close)) = (args.opt(at + 1), args.opt(at + 2)) else {
+                return Err(bad());
+            };
+            wrap.open = open.into();
+            wrap.close = close.into();
+            at += 3;
+            continue;
+        }
+        break;
+    }
+    // The names go in front of every row, in the order the clauses named them,
+    // and a name both clauses named only goes in front once.
+    for name in &fields {
+        if !rows.upfront.contains(name) {
+            rows.upfront.push(name);
+        }
+    }
+    if rows.texts.is_empty() {
+        rows.texts = index
+            .schema
+            .iter()
+            .filter(|field| matches!(field.kind, Kind::Text(_)))
+            .map(|field| field.attribute.clone())
+            .collect();
+        rows.stops = index.definition.stopwords.clone();
+    }
+    match summary {
+        true => rows.summarize = Some((fields, trim)),
+        false => rows.highlight = Some((fields, wrap)),
+    }
+    Ok(at)
 }
 
 /// Where a field a client named by hand is read from on the key.
@@ -2664,7 +2800,7 @@ struct Row {
 pub(super) fn find(server: &Server, db: usize, args: Args<'_>, out: &mut Out) -> Result<()> {
     let name = args.get(1);
     let query = args.get(2);
-    let asked;
+    let mut asked;
     // The name the index is held under, which is not always the name the client
     // used, since an alias reaches the same index. A cursor is kept under the
     // index's own name so that a read through either name finds it.
@@ -2709,6 +2845,11 @@ pub(super) fn find(server: &Server, db: usize, args: Args<'_>, out: &mut Out) ->
                 fail.write(out);
                 return Ok(());
             }
+        }
+        // What a `SUMMARIZE` or a `HIGHLIGHT` marks, taken off the parsed
+        // query before the tree goes away with the lock.
+        if asked.rows.summarize.is_some() || asked.rows.highlight.is_some() {
+            asked.rows.wanted = Wanted::of(&node);
         }
         gather(
             index,
@@ -3183,6 +3324,14 @@ fn gather(
     (total, window)
 }
 
+/// A row that survived the read, with the fields the reply wants off its key.
+///
+/// The fields borrow the document they were read from, which is why these are
+/// kept apart from the rows that go on the wire: a `SUMMARIZE` rewrites some of
+/// the values and the rewritten copies have to outlive the rows pointing at
+/// them.
+type Held<'a> = (&'a Row, Option<Vec<(&'a [u8], &'a [u8])>>);
+
 /// Reads the keys in the window and writes the reply.
 ///
 /// The reading happens first and all of it, because a key that will not read
@@ -3248,10 +3397,14 @@ fn write(
         true => rows.iter().map(|row| shown(row.sort.as_ref())).collect(),
         false => Vec::new(),
     };
-    let mut built: Vec<Built<'_>> = Vec::with_capacity(rows.len());
+    // The rows that survived the read, with their fields as the key holds them.
+    // Kept apart from the reply rows below because a `SUMMARIZE` rewrites some
+    // of these values and the rewritten copies have to outlive the rows that
+    // point at them.
+    let mut kept: Vec<Held<'_>> = Vec::with_capacity(rows.len());
     for (at, row) in rows.iter().enumerate() {
         if !loading {
-            built.push((row, None));
+            kept.push((row, None));
             continue;
         }
         let Some(doc) = held.get(at).and_then(Option::as_ref) else {
@@ -3259,9 +3412,27 @@ fn write(
             continue;
         };
         let key = keys.get(at).and_then(Option::as_deref);
-        built.push((row, Some(pick(doc, want, key))));
+        kept.push((row, Some(pick(doc, want, key))));
     }
-    shared(&mut built);
+    let redone = marked(&kept, want);
+    let mut built: Vec<Built<'_>> = kept
+        .iter()
+        .zip(&redone)
+        .map(|((row, fields), redone)| {
+            let fields = fields.as_ref().map(|fields| {
+                fields
+                    .iter()
+                    .zip(redone)
+                    .map(|((name, value), redone)| match redone {
+                        Some(redone) => (*name, &**redone),
+                        None => (*name, *value),
+                    })
+                    .collect()
+            });
+            (*row, fields)
+        })
+        .collect();
+    shared(&mut built, &want.upfront);
     let total = total - lost;
     if let Some(asks) = asked.cursor {
         // A search is settled: it ranked the whole answer before it wrote a row
@@ -3289,6 +3460,73 @@ fn write(
     found(total, &built, want.found(), out);
 }
 
+/// What a `SUMMARIZE` and a `HIGHLIGHT` made of every value on its way out.
+///
+/// One slot per field of every row, holding nothing where the value goes out as
+/// the key holds it. The slots are kept rather than the rows being rewritten in
+/// place because a row points at the document it was read from, and a value
+/// that has been cut down or marked is neither.
+///
+/// A field the schema does not index is cut down but never marked, and never
+/// treated as holding a match either, which is why an unindexed field of a hash
+/// comes back as its own front however much of the query is written across it.
+fn marked(kept: &[Held<'_>], want: &Rows<'_>) -> Vec<Vec<Option<Vec<u8>>>> {
+    let widths = || {
+        kept.iter()
+            .map(|(_, fields)| vec![None; fields.as_ref().map_or(0, Vec::len)])
+            .collect()
+    };
+    if want.summarize.is_none() && want.highlight.is_none() {
+        return widths();
+    }
+    let mut english = English::new();
+    let nothing = Wanted::default();
+    let stops = want.stops.as_deref();
+    let wanted = &want.wanted;
+    kept.iter()
+        .map(|(_, fields)| {
+            fields
+                .iter()
+                .flatten()
+                .map(|(name, value)| {
+                    let named = |list: &[&[u8]]| list.contains(name);
+                    // Once any of the two clauses has named a field, the fields
+                    // neither of them named are left alone entirely, even by the
+                    // clause that named nothing and so covers everything. That
+                    // is why `SUMMARIZE HIGHLIGHT FIELDS 1 a` cuts nothing down
+                    // but `SUMMARIZE HIGHLIGHT` cuts every field down.
+                    if !want.upfront.is_empty() && !named(&want.upfront) {
+                        return None;
+                    }
+                    let text = want.texts.iter().any(|held| **held == **name);
+                    let touches = |list: &Vec<&[u8]>| list.is_empty() || named(list);
+                    let wrap = want
+                        .highlight
+                        .as_ref()
+                        .filter(|(list, _)| touches(list))
+                        .map(|(_, wrap)| wrap);
+                    let seen = match text {
+                        true => wanted,
+                        false => &nothing,
+                    };
+                    match want.summarize.as_ref().filter(|(list, _)| touches(list)) {
+                        Some((_, trim)) => Some(summary::summarize(
+                            value,
+                            seen,
+                            stops,
+                            trim,
+                            wrap,
+                            &mut english,
+                        )),
+                        None => wrap
+                            .map(|wrap| summary::highlight(value, seen, stops, wrap, &mut english)),
+                    }
+                })
+                .collect()
+        })
+        .collect()
+}
+
 /// Puts every row of a window in the one order the whole window shares.
 ///
 /// A real server does not answer a key in that key's own order. It keeps one
@@ -3299,8 +3537,13 @@ fn write(
 /// add to the end, which is why the same key comes back one way at `LIMIT 0 7`
 /// and another way at `LIMIT 1 2`, and why a sort puts its own field in front of
 /// everything: the sort registers its name before any row is read.
-fn shared(built: &mut [Built<'_>]) {
-    let mut order: Vec<&[u8]> = Vec::new();
+///
+/// `upfront` is the names a `SUMMARIZE FIELDS` or a `HIGHLIGHT FIELDS` list
+/// registered, which happens while the clause is being read and so before any
+/// row is read as well. That is the whole of why naming a field in one of those
+/// lists moves it to the front of the reply.
+fn shared<'a>(built: &mut [Built<'a>], upfront: &[&'a [u8]]) {
+    let mut order: Vec<&[u8]> = upfront.to_vec();
     for (_, fields) in built.iter() {
         for (name, _) in fields.iter().flatten() {
             if !order.contains(name) {
@@ -3594,7 +3837,7 @@ mod tests {
             ),
             (&row, None),
         ];
-        shared(&mut built);
+        shared(&mut built, &[]);
         // The first row fixes the order of what it holds and the second one can
         // only add to the end of it, so `t` lands after `n` and `p` even though
         // the key it was read from holds it first.
