@@ -975,6 +975,7 @@ dependencies = [
 name = "yo-search"
 version = "0.3.18"
 dependencies = [
+ "yo-common",
  "yo-shape",
 ]
 

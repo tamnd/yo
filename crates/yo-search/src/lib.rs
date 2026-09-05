@@ -101,6 +101,7 @@ pub mod index;
 pub mod nums;
 pub mod posts;
 pub mod query;
+pub mod reduce;
 pub mod registry;
 pub mod score;
 pub mod tags;

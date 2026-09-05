@@ -13,6 +13,9 @@ keywords.workspace = true
 categories.workspace = true
 
 [dependencies]
+# `Rng`, so the one reducer that picks a sample picks the same one every time
+# rather than a different one on every call.
+yo-common.workspace = true
 # `Metric`, so a vector field says what it measures in the same word every other
 # vector in this build says it in.
 yo-shape.workspace = true
