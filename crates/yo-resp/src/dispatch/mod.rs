@@ -1926,8 +1926,8 @@ pub fn resolved(
                 let db = session.db;
                 let made = search::execute(server, &mut server.search.lock(), db, spec, args, out);
                 made.map(|made| {
-                    if let Some(name) = made {
-                        indexing::scan(server, db, name);
+                    if let Some(fill) = made {
+                        indexing::scan(server, db, &fill);
                     }
                     Flow::Continue
                 })
@@ -21637,6 +21637,75 @@ mod tests {
             f.run(&[flush]);
             assert_eq!(f.run(&[b"FT.DICTDUMP", b"d"]), "*0\r\n", "{flush:?}");
         }
+    }
+
+    // ------------------------------------------------------------- synonyms
+
+    /// The terms are folded on the way in and the group ids are not, and one
+    /// term can be in more than one group.
+    #[test]
+    fn a_synonym_dump_folds_the_terms_and_keeps_the_ids_as_given() {
+        let mut f = Fixture::new();
+        f.run(&[b"FT.CREATE", b"e", b"SCHEMA", b"t", b"TEXT"]);
+        assert_eq!(
+            f.run(&[b"FT.SYNUPDATE", b"e", b"G1", b"BOY", b"kid"]),
+            "+OK\r\n"
+        );
+        assert_eq!(f.run(&[b"FT.SYNUPDATE", b"e", b"g2", b"boy"]), "+OK\r\n");
+        assert_eq!(
+            f.run(&[b"FT.SYNDUMP", b"e"]),
+            "*4\r\n$3\r\nboy\r\n*2\r\n$2\r\nG1\r\n$2\r\ng2\r\n\
+             $3\r\nkid\r\n*1\r\n$2\r\nG1\r\n"
+        );
+    }
+
+    /// A group is not a comparison made at query time. It is a term of its
+    /// own, so a word in a group reads as a union of the word, the groups it
+    /// is in and its stem.
+    #[test]
+    fn a_word_in_a_group_reads_as_a_union_with_the_group_term() {
+        let mut f = Fixture::new();
+        f.run(&[b"FT.CREATE", b"e", b"SCHEMA", b"t", b"TEXT"]);
+        f.run(&[b"FT.SYNUPDATE", b"e", b"gr", b"jogging"]);
+        assert_eq!(
+            f.run(&[b"FT.EXPLAIN", b"e", b"jogging"]),
+            "$69\r\nUNION {\n  jogging\n  ~gr(expanded)\n  +jog(expanded)\n  jog(expanded)\n}\n\r\n"
+        );
+    }
+
+    /// The lookup on the document side is on the word and never on the stem,
+    /// and a group written after the documents were still finds them because
+    /// the index is read again.
+    ///
+    /// The group holds `running` and `d2` says `runs`, so a query for another
+    /// word of the group finds `d1` and leaves `d2` where it is. A query for
+    /// `running` itself does find `d2`, through the stem branch of the union
+    /// rather than through the group, which is why the two asserts differ.
+    #[test]
+    fn a_group_matches_the_word_it_holds_and_not_a_stem_of_it() {
+        let mut f = Fixture::new();
+        f.run(&[b"FT.CREATE", b"e", b"SCHEMA", b"t", b"TEXT"]);
+        f.run(&[b"HSET", b"d1", b"t", b"boy"]);
+        f.run(&[b"HSET", b"d2", b"t", b"runs"]);
+        f.run(&[b"FT.SYNUPDATE", b"e", b"gr", b"boy", b"child", b"running"]);
+        assert_eq!(
+            f.run(&[b"FT.SEARCH", b"e", b"child", b"NOCONTENT"]),
+            "*2\r\n:1\r\n$2\r\nd1\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"FT.SEARCH", b"e", b"running", b"NOCONTENT"]),
+            "*3\r\n:2\r\n$2\r\nd1\r\n$2\r\nd2\r\n"
+        );
+    }
+
+    /// Neither command makes an index and neither forgives a name that is not
+    /// there, in the same words the rest of the group uses.
+    #[test]
+    fn a_synonym_command_on_a_name_that_is_not_there_fails() {
+        let mut f = Fixture::new();
+        let missing = "-SEARCH_INDEX_NOT_FOUND Index not found: nope\r\n";
+        assert_eq!(f.run(&[b"FT.SYNDUMP", b"nope"]), missing);
+        assert_eq!(f.run(&[b"FT.SYNUPDATE", b"nope", b"g", b"a"]), missing);
     }
 
     // -------------------------------------------------------------- suggest

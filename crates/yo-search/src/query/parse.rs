@@ -29,6 +29,7 @@ use crate::field::Kind;
 use crate::index::Index;
 use crate::query::explain::bit;
 use crate::query::{Circle, EVERY, Mask, Node, Pair, Range, Vector, What, Word, expansion};
+use crate::synonyms;
 use crate::text;
 use crate::token::{bare, control, escapes, fold, wordy};
 use yo_common::geo;
@@ -1790,14 +1791,28 @@ impl Parse<'_> {
         self.ask.stopwords && text::dropped(self.stopwords(), word)
     }
 
-    /// A word and the forms of it the stemmer knows.
+    /// A word, the groups it is in and the forms of it the stemmer knows.
     ///
     /// Three nodes when the stem differs from the word and two when it does not,
     /// because the plain expansion of a word that stems to itself is the word
     /// and a real server does not print it twice.
+    ///
+    /// A synonym group goes in between the two, in the order the word was added
+    /// to the groups, which is the order a real server prints them in. It is a
+    /// term like any other rather than a node of its own, because that is all a
+    /// group is once the documents have been written: `~g1` is in the index
+    /// beside every word of the group, so asking for the group is asking for a
+    /// term and costs one posting list however many words are in it.
     fn expand(&mut self, word: &[u8]) -> Node {
         let stem: Box<[u8]> = self.stemmer.stem(word).into();
         let mut list = vec![Node::term(word)];
+        for group in self.index.synonyms.asked(word) {
+            list.push(Node::new(What::Term(Word {
+                word: synonyms::term(group).into(),
+                expanded: true,
+                stem: false,
+            })));
+        }
         list.push(Node::new(What::Term(Word {
             word: stem.clone(),
             expanded: true,

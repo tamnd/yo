@@ -619,3 +619,17 @@ title = "A MAX too large to honour is answered rather than crashing the server"
 reason = "FT.SUGGET takes a MAX anywhere from one to four billion and refuses anything outside that, which is the range a u32 holds, and a real server then tries to make room for that many answers before it has looked at a single term. FT.SUGGET k p MAX 2147483648 segfaults Redis 8.10.1 in Trie_CollectFuzzy and takes the whole server down with it, which was found here rather than looked up and is reproducible on a fresh instance. This side takes the same range and grows the answer to fit what it actually found, so the same command answers the same terms a MAX of five would and costs nothing. The refused range is copied exactly, so a client that gets an error out of one gets the same error out of the other."
 status = "permanent"
 spec = "09 section 5"
+
+[[divergence]]
+id = "D-86"
+title = "A synonym term with a wide character in it matches a document word a real server would not match"
+reason = "A synonym group is looked up twice, once from the query side against the word the parser read and once from the document side against the word the tokenizer stored, and those are not the same word: the tokenizer cuts every character down to sixteen bits where the parser does not, so a document holding an emoji stores the cut form of it. A real server looks the document side up on the word before the cut, so a group holding U+F600 does nothing for a document holding U+1F600 and a group holding U+1F600 does match it. This side keeps the group under the cut form as well, so the group holding U+F600 matches too, which is one extra document on one query that nobody is going to write. Everything a client can see about the group is the same on both sides: FT.SYNDUMP hands the term back whole, a group holding the emoji itself matches a document holding it, and a term with nothing past the basic plane in it behaves identically. Fixing it means keeping the uncut word on every token, which costs every document in the index to buy back a case that only exists above U+FFFF."
+status = "permanent"
+spec = "09 section 5"
+
+[[divergence]]
+id = "D-87"
+title = "FT.SYNDUMP answers in byte order where a real server answers in hash order"
+reason = "The terms in a dump come out of the module's own hash table, so the order they arrive in is the order the hashes happened to land in and is not the order they went in, not sorted and not stable across a rebuild. This side keeps them in a sorted map and hands them back in byte order, so a capital comes in front of a small letter and a dump is the same dump twice running. The terms and the group ids under each of them are identical on both sides, and the ids under one term are in insertion order on both, which is the one order the module does keep. It is the same shape of difference as FT.DICTDUMP, where a real server does sort and this side matches it."
+status = "permanent"
+spec = "09 section 5"

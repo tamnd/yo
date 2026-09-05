@@ -290,6 +290,21 @@ fn bad(what: &'static str, why: &'static str) -> Fail<'static> {
     Fail::about(BAD_ARGS, what.as_bytes(), why)
 }
 
+/// An index whose keys have to be read, and whether it may refuse.
+///
+/// Two commands ask for a scan and they do not ask for the same thing.
+/// `FT.CREATE` obeys the `SKIPINITIALSCAN` on the index, since that is what the
+/// word means there. `FT.SYNUPDATE` does not: it has a `SKIPINITIALSCAN` of its
+/// own, and when the client leaves it off the index is read again whatever it
+/// was created with. That is measured, and it is why this carries the answer
+/// rather than the registry working it out from the definition.
+pub(super) struct Fill<'a> {
+    /// The index, by the exact name it was made under.
+    pub(super) name: &'a [u8],
+    /// Whether the index's own flag has a say in it.
+    pub(super) obeys: bool,
+}
+
 pub(super) fn execute<'a>(
     server: &Server,
     reg: &mut Registry,
@@ -297,10 +312,10 @@ pub(super) fn execute<'a>(
     spec: &Spec,
     args: Args<'a>,
     out: &mut Out,
-) -> Result<Option<&'a [u8]>> {
-    // The name of an index that was made here, so the caller can run the scan
-    // over the keys that were already there. It stays `None` for the other
-    // sixteen commands, and for a create that answered that the name is taken.
+) -> Result<Option<Fill<'a>>> {
+    // The index the caller has to read the keys of, which stays `None` for the
+    // sixteen commands that ask for nothing of the sort and for a create that
+    // answered that the name is taken.
     let mut made = None;
     let done = match spec.name {
         "FT.CREATE" => create(reg, db, args, out, false).map(|name| made = name),
@@ -325,6 +340,8 @@ pub(super) fn execute<'a>(
         "FT.DICTADD" => dict_add(reg, args, out),
         "FT.DICTDEL" => dict_del(reg, args, out),
         "FT.DICTDUMP" => dict_dump(reg, args, out),
+        "FT.SYNUPDATE" => syn_update(reg, args, out).map(|name| made = name),
+        "FT.SYNDUMP" => syn_dump(reg, args, out),
         other => unreachable!("{other} is not a search command"),
     };
     if let Err(f) = done {
@@ -350,7 +367,7 @@ fn create<'a>(
     args: Args<'a>,
     out: &mut Out,
     ifnx: bool,
-) -> core::result::Result<Option<&'a [u8]>, Fail<'a>> {
+) -> core::result::Result<Option<Fill<'a>>, Fail<'a>> {
     let name = args.get(1);
     // The `IFNX` shortcut comes first and the database comes second, which is
     // the order a real server checks them in and is visible: `FT._CREATEIFNX`
@@ -376,7 +393,7 @@ fn create<'a>(
     // leave half an index behind.
     let _ = reg.create(Index::new(name, definition, schema));
     out.ok();
-    Ok(Some(name))
+    Ok(Some(Fill { name, obeys: true }))
 }
 
 /// The options in front of `SCHEMA`, and where the schema starts.
@@ -1231,6 +1248,63 @@ fn dict_dump<'a>(reg: &Registry, args: Args<'a>, out: &mut Out) -> Answer<'a> {
     out.set(reg.dicts.len(name));
     for term in reg.dicts.dump(name) {
         out.bulk(term);
+    }
+    Ok(())
+}
+
+/// `FT.SYNUPDATE index group [SKIPINITIALSCAN] term [term ...]`
+///
+/// Every term joins the group, and a term already in another group joins this
+/// one as well rather than moving. The terms are folded on the way in, which is
+/// what the dump answers with, and the group id is not: `FT.SYNUPDATE i G1 Boy`
+/// dumps `boy` under `G1`.
+///
+/// A group means nothing to a document that was written before it, because a
+/// group is written into the index at the same time the words are. So the index
+/// is read again from the keyspace unless the client says `SKIPINITIALSCAN`,
+/// and that renumbers every document in it. `SKIPINITIALSCAN` is only that word
+/// in that one place: `FT.SYNUPDATE i g boy SKIPINITIALSCAN` puts the word
+/// `skipinitialscan` in the group and reads the index again.
+///
+/// Looking up the index counts as a use of it, and a wrong arity is refused
+/// before that happens, so the count moves for a command that ran and not for
+/// one that never started.
+fn syn_update<'a>(
+    reg: &mut Registry,
+    args: Args<'a>,
+    out: &mut Out,
+) -> core::result::Result<Option<Fill<'a>>, Fail<'a>> {
+    let name = args.get(1);
+    let group = args.get(2);
+    let skip = args.opt(3).is_some_and(|a| args::is(a, b"skipinitialscan"));
+    let from = if skip { 4 } else { 3 };
+    let terms: Vec<&[u8]> = (from..args.len()).map(|i| args.get(i)).collect();
+    let Some(index) = reg.open(name) else {
+        return Err(Fail::naming(MISSING, name));
+    };
+    index.synonyms.update(group, &terms);
+    out.ok();
+    Ok((!skip).then_some(Fill { name, obeys: false }))
+}
+
+/// `FT.SYNDUMP index`, every term in a group and which groups it is in.
+///
+/// A map on RESP3 and a flat run of a term and its groups on RESP2. The terms
+/// come back in byte order, where a real server answers in whatever order its
+/// hash table holds them, which is D-87. The groups under one term are in the
+/// order the term was added to them and that is the same order either way.
+fn syn_dump<'a>(reg: &mut Registry, args: Args<'a>, out: &mut Out) -> Answer<'a> {
+    let name = args.get(1);
+    let Some(index) = reg.open(name) else {
+        return Err(Fail::naming(MISSING, name));
+    };
+    out.map(index.synonyms.len());
+    for (term, ids) in index.synonyms.dump() {
+        out.bulk(term);
+        out.array(ids.len());
+        for id in ids {
+            out.bulk(id);
+        }
     }
     Ok(())
 }

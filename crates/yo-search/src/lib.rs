@@ -83,6 +83,14 @@
 //! index, which is why a field the schema does not know is cut but never
 //! marked.
 //!
+//! [`synonyms`] is the list of words an index has been told to treat as the
+//! same word. It is not a comparison made at query time: a group is a term of
+//! its own, written into the index next to every word of the group, so a query
+//! for one of them is a union of the word and that term and a group of a
+//! hundred words costs one posting list. Both the write path and the query
+//! parser read it, which is the only reason it lives on the index rather than
+//! beside the dictionaries.
+//!
 //! [`held`] is the three of them under one index with the routine that fills
 //! them, so a key and its fields go in one end and a document with a number, a
 //! score, a length and a term in every list it belongs to comes out the other.
@@ -144,6 +152,7 @@ pub mod score;
 pub mod sorted;
 pub mod suggest;
 pub mod summary;
+pub mod synonyms;
 pub mod tags;
 pub mod text;
 pub mod token;
