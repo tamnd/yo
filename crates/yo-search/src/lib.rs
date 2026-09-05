@@ -94,6 +94,7 @@
 pub mod docs;
 pub mod english;
 pub mod expand;
+pub mod expr;
 pub mod field;
 pub mod follow;
 pub mod held;
