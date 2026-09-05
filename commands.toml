@@ -296,6 +296,17 @@ name = "pubsub"
 expected = 9
 status = "planned"
 doc = "12 section 6"
+# Nothing here is built yet, and the one thing to settle before any of it is
+# that a subscriber and a publisher are not on the same thread. A connection
+# stays with the thread that accepted it and its reply buffer belongs to that
+# thread, so a PUBLISH cannot write into a subscriber's socket the way it could
+# on one thread. The shape that is already here is the waiter list: one shared
+# registry saying who is subscribed to what and which thread each of them is on,
+# and each thread delivering to its own on its turn. What a client sees then is
+# the same message in the same order per channel, arriving a turn later than the
+# PUBLISH that made it, which is what a client already has to assume of anything
+# it did not ask for. The alternative, one lock per channel that a publisher
+# takes to write into somebody else's buffer, is the thing not to build.
 
 [[group]]
 name = "keyspace"
@@ -327,6 +338,18 @@ name = "transactions"
 expected = 5
 status = "planned"
 doc = "12 section 4"
+# Not built yet either, and the two halves of it want different things from the
+# threading. EXEC runs a queue of commands with nothing in between, and on a
+# striped keyspace that means holding every stripe the queue names before the
+# first of them runs and letting them all go after the last, taken in stripe
+# order the way a multi key command already takes them. A queue that names keys
+# on every stripe holds the whole database, which is what a real server's EXEC
+# does to the whole server anyway. WATCH is the half that cannot be done on the
+# connection: a client watching a key has to be told about a write another
+# thread made, so what marks the key as touched belongs beside the key and not
+# beside the client. Any version of this that keeps the watched value on the
+# connection and compares it at EXEC is wrong here in a way it was not wrong on
+# one thread, and that is the thing to get right first rather than to register.
 
 [[group]]
 name = "scripting"
@@ -337,6 +360,15 @@ doc = "12 section 7"
 # on a server with no interpreter, because Redis's own test suite says SCRIPT
 # FLUSH and FUNCTION FLUSH before every start_server block. The six that need
 # Lua, which is EVAL, EVALSHA, EVAL_RO, EVALSHA_RO, FCALL and FCALL_RO, are M6.
+# The eight that are here touch no key and no connection state, so they are the
+# same answer on any thread. The six that are not have the same problem EXEC
+# has, since a script runs a sequence of commands with nothing in between, and
+# the same answer: hold the stripes the declared keys land on for the length of
+# the script. A script that reaches a key it did not declare is already an error
+# on a real server in cluster mode and it has to be one here for the same
+# reason, because there is no stripe held for it. One interpreter per thread and
+# one shared script cache is the split, since a compiled script is bytes and the
+# state a run builds is not.
 
 [[group]]
 name = "connection"

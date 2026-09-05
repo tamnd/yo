@@ -296,6 +296,18 @@ struct Local {
     /// looks at all of them once rather than waiting to be told about the ones
     /// something was loaded into before any command ran.
     turn: AtomicU64,
+    /// How many of this thread's clients are on the waiter list.
+    ///
+    /// The waiter list is one list behind one lock, and a thread can only answer
+    /// the waiters it parked itself, so a thread with none of its own has no
+    /// reason to take that lock at all. Without this the check is the server
+    /// wide count, and one client blocked anywhere puts every thread through the
+    /// shared lock after every command it runs and again on every disconnect.
+    ///
+    /// Only the thread this belongs to writes it, because parking, answering and
+    /// forgetting a waiter all happen on the thread that read the command, so
+    /// the load and the store either side of a change cannot lose one.
+    parked: AtomicUsize,
 }
 
 impl Default for Local {
@@ -305,6 +317,7 @@ impl Default for Local {
             cmdstats: CommandStats::default(),
             dirty: AtomicU64::new(0),
             turn: AtomicU64::new(ALL_DATABASES),
+            parked: AtomicUsize::new(0),
         }
     }
 }
@@ -329,6 +342,18 @@ impl Local {
     /// Whether this thread's turn still has database `at` to look at.
     fn wanted(&self, at: usize) -> bool {
         self.turn.load(Relaxed) & (1u64 << at) != 0
+    }
+
+    /// Note that `n` more of this thread's clients are parked.
+    fn blocked(&self, n: usize) {
+        self.parked
+            .store(self.parked.load(Relaxed).saturating_add(n), Relaxed);
+    }
+
+    /// Note that `n` of them are not parked any more.
+    fn woke(&self, n: usize) {
+        self.parked
+            .store(self.parked.load(Relaxed).saturating_sub(n), Relaxed);
     }
 }
 
