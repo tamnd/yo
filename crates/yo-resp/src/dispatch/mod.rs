@@ -896,7 +896,7 @@ impl Server {
     /// The same thing [`Server::set_clock_ms`] does and by the same argument,
     /// except that it moves from wherever the clock is rather than to a stated
     /// moment, which is what a test that wants a key to have expired asks for.
-    pub fn advance_clock_ms(&mut self, ms: u64) {
+    pub fn advance_clock_ms(&self, ms: u64) {
         let now = self.clock.now_ms() + ms;
         self.set_clock_ms(now);
     }
@@ -997,7 +997,7 @@ impl Server {
     /// connection, and the walk would have to happen on a turn of the loop
     /// rather than when `INFO` asks, which puts the cost of a report on the
     /// command path of a server nobody is asking.
-    pub fn note_conn_bytes(&mut self, delta: isize) {
+    pub fn note_conn_bytes(&self, delta: isize) {
         // A read and a write and not a fetch and add, because the number is a
         // sum of signed changes and the saturating part has to happen in the
         // middle. Two threads that change their buffers in the same instant can
