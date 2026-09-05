@@ -256,7 +256,7 @@ impl Handle {
     pub(crate) fn run<R>(&self, f: impl FnOnce(&mut Inner) -> Result<R>) -> Result<R> {
         let mut inner = self.inner.try_borrow_mut().map_err(|_| reentrant())?;
         if inner.deadlines {
-            inner.strings.clock_mut().refresh();
+            inner.strings.clock().refresh();
         }
         f(&mut inner)
     }
@@ -265,7 +265,7 @@ impl Handle {
     pub(crate) fn deadlines<R>(&self, f: impl FnOnce(&mut Inner) -> Result<R>) -> Result<R> {
         let mut inner = self.inner.try_borrow_mut().map_err(|_| reentrant())?;
         inner.deadlines = true;
-        inner.strings.clock_mut().refresh();
+        inner.strings.clock().refresh();
         f(&mut inner)
     }
 

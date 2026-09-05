@@ -280,7 +280,7 @@ mod tests {
         put(&mut db, b"dead");
         assert!(db.set_expiry(b"dead", Some(1_000_500)));
 
-        db.clock_mut().advance(1_000);
+        db.clock().advance(1_000);
         let before = db.expired_keys();
         assert_eq!(keys_of(&mut db), HashSet::from([b"alive".to_vec()]));
         // Gone from the map and counted, so `DBSIZE` after a walk answers what

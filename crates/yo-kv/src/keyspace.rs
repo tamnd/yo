@@ -419,6 +419,7 @@ impl Keyspace {
     #[must_use]
     pub fn with_clock(clock: Clock) -> Keyspace {
         let made = MADE.fetch_add(1, Ordering::Relaxed);
+        let seed = clock.now_ms() ^ made.wrapping_mul(0x9e37_79b9_7f4a_7c15);
         Keyspace {
             map: RawMap::new(),
             clock,
@@ -441,7 +442,7 @@ impl Keyspace {
             lfu: Lfu::DEFAULT,
             samples: evict::SAMPLES,
             pool: evict::Pool::new(),
-            rng: Rng::new(clock.now_ms() ^ made.wrapping_mul(0x9e37_79b9_7f4a_7c15)),
+            rng: Rng::new(seed),
             tier: None,
             cold: Vec::new(),
             cold_key: Vec::new(),
@@ -742,12 +743,6 @@ impl Keyspace {
     #[inline]
     pub const fn clock(&self) -> &Clock {
         &self.clock
-    }
-
-    /// The clock, to refresh once per turn of the loop.
-    #[inline]
-    pub const fn clock_mut(&mut self) -> &mut Clock {
-        &mut self.clock
     }
 
     /// The map underneath, for statistics and for compaction.
@@ -2467,7 +2462,7 @@ mod tests {
         d.psetex(b"k", 100, b"v").expect("room");
         assert_eq!(d.kind_of(b"k"), Some(Kind::String));
 
-        d.clock_mut().advance(100);
+        d.clock().advance(100);
         assert_eq!(
             d.kind_of(b"k"),
             None,
@@ -2486,7 +2481,7 @@ mod tests {
         d.set_plain(b"k", b"v").expect("room");
         assert_eq!(d.idle_secs(b"k"), Some(0));
 
-        d.clock_mut().advance(60_000);
+        d.clock().advance(60_000);
         assert_eq!(d.idle_secs(b"k"), Some(60), "a minute of nobody asking");
 
         d.get(b"k").expect("a string").expect("still there");
@@ -2500,7 +2495,7 @@ mod tests {
     fn asking_about_a_key_is_not_using_it() {
         let mut d = db();
         d.set_plain(b"k", b"v").expect("room");
-        d.clock_mut().advance(30_000);
+        d.clock().advance(30_000);
 
         assert!(d.exists(b"k"));
         assert_eq!(d.kind_of(b"k"), Some(Kind::String));
@@ -2524,7 +2519,7 @@ mod tests {
             let mut d = db();
             d.set_policy(policy);
             d.set_plain(b"k", b"v").expect("room");
-            d.clock_mut().advance(45_000);
+            d.clock().advance(45_000);
 
             d.get(b"k").expect("a string").expect("still there");
             assert_eq!(
@@ -2558,7 +2553,7 @@ mod tests {
         // Warm the memo, then run the key hard with nothing written in between,
         // which is the case the memo exists for.
         d.scard(b"s").expect("a set");
-        d.clock_mut().advance(120_000);
+        d.clock().advance(120_000);
         for _ in 0..64 {
             d.scard(b"s").expect("a set");
         }
@@ -2583,7 +2578,7 @@ mod tests {
 
         // And a key nobody reads decays rather than holding its place forever.
         d.set_plain(b"cold", b"v").expect("room");
-        d.clock_mut().advance(60_000 * 10);
+        d.clock().advance(60_000 * 10);
         assert!(d.freq(b"cold").expect("there") < start);
     }
 
@@ -2677,7 +2672,7 @@ mod tests {
         check(&mut d, "two deleted");
         d.psetex(b"gone", 50, b"v").expect("room");
         check(&mut d, "and one more with a short deadline");
-        d.clock_mut().advance(60);
+        d.clock().advance(60);
         assert_eq!(d.kind_of(b"gone"), None, "which the read reaped");
         check(&mut d, "so the count lost it too");
         d.set_policy(Policy::VolatileRandom);
@@ -2753,7 +2748,7 @@ mod tests {
         // Two keys is a small enough database that a bucket holds both of them
         // and the pick is between them rather than between whatever turned up.
         d.set_plain(b"cold", b"v").expect("room");
-        d.clock_mut().advance(600_000);
+        d.clock().advance(600_000);
         d.set_plain(b"hot", b"v").expect("room");
 
         assert!(d.evict_one());
@@ -2837,7 +2832,7 @@ mod tests {
         let now = d.clock().now_ms();
         d.set_plain(b"k", b"v").expect("room");
         d.set_expiry(b"k", Some(now + 1000));
-        d.clock_mut().advance(5000);
+        d.clock().advance(5000);
 
         assert!(!d.evict_one(), "it evicted a key that was already dead");
         assert_eq!(d.evicted_keys(), 0);
@@ -2852,7 +2847,7 @@ mod tests {
         d.set_policy(Policy::AllKeysLru);
         for i in 0..40u32 {
             d.set_plain(format!("k{i}").as_bytes(), b"v").expect("room");
-            d.clock_mut().advance(1000);
+            d.clock().advance(1000);
         }
         assert!(d.pool.is_empty(), "nothing has sampled anything yet");
 
@@ -2873,7 +2868,7 @@ mod tests {
         d.set_policy(Policy::AllKeysLru);
         for i in 0..40u32 {
             d.set_plain(format!("k{i}").as_bytes(), b"v").expect("room");
-            d.clock_mut().advance(1000);
+            d.clock().advance(1000);
         }
         assert!(d.evict_one());
         assert!(!d.pool.is_empty());
@@ -2903,7 +2898,7 @@ mod tests {
                 format!("k{i}").as_bytes(),
                 Some(now + 100_000 + u64::from(i)),
             );
-            d.clock_mut().advance(1000);
+            d.clock().advance(1000);
         }
         assert!(d.evict_one());
         assert!(!d.pool.is_empty());
@@ -2947,7 +2942,7 @@ mod tests {
         d.set_policy(Policy::AllKeysLru);
         for i in 0..40u32 {
             d.set_plain(format!("k{i}").as_bytes(), b"v").expect("room");
-            d.clock_mut().advance(1000);
+            d.clock().advance(1000);
         }
         assert!(d.evict_one());
         assert!(!d.pool.is_empty());

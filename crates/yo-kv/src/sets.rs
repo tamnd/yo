@@ -1212,7 +1212,7 @@ mod tests {
         assert_eq!(d.sets.len(), 1);
         assert_eq!(d.scard(b"s").expect("a set"), 1, "still alive at 1000");
 
-        d.clock_mut().advance(100);
+        d.clock().advance(100);
         assert_eq!(d.scard(b"s").expect("gone is not an error"), 0);
         assert_eq!(d.sets.len(), 0, "reaping freed the body");
         assert_eq!(d.bodies, 0);
@@ -2087,7 +2087,7 @@ mod tests {
         assert!(d.set_expiry(b"k", Some(1_500)));
         assert_eq!(d.scard(b"k").expect("still alive"), 2);
 
-        d.clock_mut().advance(600);
+        d.clock().advance(600);
         assert_eq!(d.scard(b"k").expect("past its deadline"), 0);
         assert!(!d.sismember(b"k", b"x").expect("past its deadline"));
     }

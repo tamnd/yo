@@ -990,7 +990,7 @@ mod tests {
         let mut d = db();
         d.sadd(b"s", [b"m1".as_ref()].into_iter()).expect("a set");
         assert_eq!(d.expire(b"s", 1_000_001, Cond::Always), Applied::Ok);
-        d.clock_mut().advance(10);
+        d.clock().advance(10);
 
         assert!(d.take(b"s").is_none());
         assert_eq!(d.sets.len(), 0, "and the body did not stay behind");

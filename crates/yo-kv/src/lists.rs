@@ -1240,7 +1240,7 @@ mod tests {
         rpush(&mut d, b"l", &[b"a", b"b"]);
         assert!(d.set_expiry(b"l", Some(1_500)));
         assert_eq!(all(&mut d, b"l"), ["a", "b"]);
-        d.clock_mut().advance(1_000);
+        d.clock().advance(1_000);
         assert_eq!(d.llen(b"l").expect("gone"), 0);
         assert_eq!(d.kind_of(b"l"), None);
     }
