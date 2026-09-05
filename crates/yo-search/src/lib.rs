@@ -67,6 +67,7 @@ pub mod nums;
 pub mod posts;
 pub mod query;
 pub mod registry;
+pub mod score;
 pub mod text;
 pub mod token;
 pub mod words;
