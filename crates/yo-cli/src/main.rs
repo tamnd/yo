@@ -30,7 +30,7 @@ yodb, an embedded knowledge engine
 usage:
   yodb check FILE [--quick] [--quiet]
   yodb serve [--bind ADDR] [--port PORT] [--unixsocket PATH] [--no-port]
-             [--dir PATH] [--store PATH --maxmemory BYTES]
+             [--threads N] [--dir PATH] [--store PATH --maxmemory BYTES]
 
   check    read a .yo file and report anything wrong with it. Never writes.
              --quick   skip the records and read only the headers
@@ -43,6 +43,11 @@ usage:
                            TCP stack and is the faster way in for a client
                            on the same machine
              --no-port     no TCP at all, socket file only
+             --threads     how many threads serve connections. One by
+                           default. 0 means one per core. A connection
+                           belongs to the thread that accepted it and the
+                           keyspace is shared, so the count also decides
+                           how finely each database is striped
              --dir         where the server writes, which is where BACKUP
                            puts its files and what CONFIG GET dir answers.
                            The directory the command was run from by default
@@ -229,6 +234,7 @@ fn serve_command(args: &[&str]) -> ExitCode {
     let mut store: Option<std::path::PathBuf> = None;
     let mut maxmemory: Option<u64> = None;
     let mut dir: Option<std::path::PathBuf> = None;
+    let mut threads = 1usize;
 
     let mut at = 0;
     while at < args.len() {
@@ -240,7 +246,8 @@ fn serve_command(args: &[&str]) -> ExitCode {
                 return ExitCode::SUCCESS;
             }
             "--no-port" => tcp = false,
-            "--bind" | "--port" | "--unixsocket" | "--store" | "--maxmemory" | "--dir" => {
+            "--bind" | "--port" | "--unixsocket" | "--store" | "--maxmemory" | "--dir"
+            | "--threads" => {
                 let Some(value) = args.get(at) else {
                     eprintln!("yodb serve: {arg} needs a value");
                     return ExitCode::from(2);
@@ -254,6 +261,21 @@ fn serve_command(args: &[&str]) -> ExitCode {
                     store = Some(std::path::PathBuf::from(*value));
                 } else if arg == "--dir" {
                     dir = Some(std::path::PathBuf::from(*value));
+                } else if arg == "--threads" {
+                    match value.parse::<usize>() {
+                        // Zero is one per core, which is what a benchmark
+                        // client means by it and is the only reading of a
+                        // server with no threads that is worth anything.
+                        Ok(0) => {
+                            threads = std::thread::available_parallelism()
+                                .map_or(1, std::num::NonZero::get);
+                        }
+                        Ok(n) => threads = n,
+                        Err(_) => {
+                            eprintln!("yodb serve: {value} is not a number of threads");
+                            return ExitCode::from(2);
+                        }
+                    }
                 } else if arg == "--maxmemory" {
                     // The parser `CONFIG SET maxmemory` uses, so that the two
                     // ways of setting the same limit read it the same way.
@@ -326,7 +348,7 @@ fn serve_command(args: &[&str]) -> ExitCode {
     };
 
     let want = if tcp { Some(addr) } else { None };
-    let mut server = match serve::Server::open(want, unixsocket.clone()) {
+    let mut server = match serve::Server::open(want, unixsocket.clone(), threads) {
         Ok(s) => s,
         Err(e) => {
             eprintln!("yodb serve: {e}");
@@ -362,6 +384,9 @@ fn serve_command(args: &[&str]) -> ExitCode {
             println!("yodb {version} listening on {}", path.display());
         }
         (false, None) => unreachable!("refused above"),
+    }
+    if threads > 1 {
+        println!("yodb {version} serving on {threads} threads");
     }
 
     // Both numbers, on purpose. A server that only printed the quarter would
