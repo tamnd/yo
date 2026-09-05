@@ -1,6 +1,7 @@
 //! What an index is: which keys it follows and what it reads out of them.
 
 use crate::field::Field;
+use crate::held::Held;
 
 /// The score every document in an index gets when nothing says otherwise.
 pub const SCORE: f64 = 1.0;
@@ -156,6 +157,8 @@ pub struct Index {
     /// create answers one. Kept here because it belongs to the index and
     /// survives everything except dropping it.
     pub uses: u64,
+    /// What it has read: the documents, the terms, the numbers and the values.
+    pub held: Held,
 }
 
 impl Index {
@@ -167,6 +170,7 @@ impl Index {
             definition,
             schema,
             uses: 0,
+            held: Held::new(),
         }
     }
 

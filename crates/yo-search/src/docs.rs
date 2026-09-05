@@ -188,6 +188,16 @@ impl Docs {
         self.slots.len() - self.live
     }
 
+    /// How long every document in the table is, added up.
+    ///
+    /// Worked out on the way rather than kept, because the two things that ask
+    /// for it are a scorer setting up and a debug reply, and neither is on the
+    /// path a write takes.
+    #[must_use]
+    pub fn tokens(&self) -> u64 {
+        self.all().map(|(_, doc)| u64::from(doc.tokens)).sum()
+    }
+
     /// The average length of a document, which is what BM25 divides by.
     ///
     /// Zero when there is nothing to average, because a scorer that meets an
@@ -198,8 +208,7 @@ impl Docs {
         if self.live == 0 {
             return 0.0;
         }
-        let total: u64 = self.all().map(|(_, doc)| u64::from(doc.tokens)).sum();
-        total as f64 / self.live as f64
+        self.tokens() as f64 / self.live as f64
     }
 
     /// Every document with its number, in the order the numbers were given out.

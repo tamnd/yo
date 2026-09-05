@@ -96,6 +96,16 @@ impl<'a> Words<'a> {
         }
     }
 
+    /// How many places this value has given out.
+    ///
+    /// Not how many words came back. A word too long to index takes a place and
+    /// is never handed over, so a caller adding one field's places to the next
+    /// field's has to ask rather than watching what it was given.
+    #[must_use]
+    pub const fn seen(&self) -> u32 {
+        self.seen
+    }
+
     /// Takes the escapes and the unprintable bytes out of one word, in place,
     /// and says how long what is left is.
     ///

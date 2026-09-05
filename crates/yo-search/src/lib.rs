@@ -50,11 +50,15 @@
 //! read off its manual, which is how the single precision `k1` in the default
 //! one came to light.
 //!
+//! [`held`] is the three of them under one index with the routine that fills
+//! them, so a key and its fields go in one end and a document with a number, a
+//! score, a length and a term in every list it belongs to comes out the other.
+//!
 //! # What is not here yet
 //!
-//! The wiring. Nothing yet reads a hash as it is written and puts it through the
-//! tokenizer into the lists, and nothing yet answers `FT.SEARCH`, so all of this
-//! is reachable from Rust and not from a client.
+//! The wiring above it. An index can be handed a document but nothing yet hands
+//! it one as a hash is written, and nothing yet answers `FT.SEARCH`, so all of
+//! this is reachable from Rust and not from a client.
 //!
 //! # Why the registry is per server
 //!
@@ -69,6 +73,7 @@
 pub mod docs;
 pub mod english;
 pub mod field;
+pub mod held;
 pub mod index;
 pub mod nums;
 pub mod posts;
