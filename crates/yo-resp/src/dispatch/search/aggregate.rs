@@ -15,16 +15,17 @@ use std::collections::hash_map::Entry;
 use yo_common::num::parse_f64;
 use yo_common::parse_i64;
 use yo_search::Index;
-use yo_search::expr::{Expr, Value};
+use yo_search::expr::{Expr, Value, seventeen};
 use yo_search::field::Kind;
 use yo_search::reduce;
 use yo_search::token;
 
 use super::{
     AS_SHORT, Args, Asked, BAD_ARGS, COUNT_ONLY, DUPLICATE_END, DUPLICATE_PROP, GROUP_COUNT,
-    GROUP_SHORT, MISSING_ARGS, MOST_SAMPLE, NO_AT, NO_AT_END, NO_AT_MID, NO_PROPERTY, NO_REDUCER,
-    NOT_A_NUMBER, NOT_LOADED, NOT_MAIN, NOT_THERE, OUT_OF_RANGE, PERCENTAGE, QUOTE_END,
-    REDUCE_BARE, RESOLUTION, RESOLUTION_ARG, Row, SAMPLE_BIG, SAMPLE_SIZE, STEP_SHORT, UNKNOWN,
+    GROUP_SHORT, MAX_COUNT, MISSING_ARGS, MOST_SAMPLE, NO_AT, NO_AT_END, NO_AT_MID, NO_PROPERTY,
+    NO_REDUCER, NOT_A_NUMBER, NOT_LOADED, NOT_MAIN, NOT_THERE, OUT_OF_RANGE, PERCENTAGE, QUOTE_END,
+    REDUCE_BARE, RESOLUTION, RESOLUTION_ARG, Row, SAMPLE_BIG, SAMPLE_SIZE, SORT_BOUNDS, SORT_COUNT,
+    SORT_PROP, SORT_PROP_END, SORT_SHORT, SORT_TWICE, SORT_WAY, SORT_WAY_END, STEP_SHORT, UNKNOWN,
     line, twelve,
 };
 use crate::dispatch::Server;
@@ -48,8 +49,10 @@ pub(super) struct Pipe<'a> {
     pub(super) loader: bool,
     /// Whether the score of each document is answered as a `__score` property.
     pub(super) addscores: bool,
-    /// Whether a sort key element goes on each row, which is always null here
-    /// because nothing sorts by one yet.
+    /// Whether a sort key element goes on each row. It holds the value the
+    /// first `SORTBY` key found on that row and is null on a pipeline that
+    /// never sorted, on a row a group step made after the sort, and on a row
+    /// the sort could not find the property on.
     pub(super) sortkeys: bool,
     /// A `LOAD` whose count ran out on the `AS`, which is not an error on its
     /// own: it is only reported once the rest of the list has read cleanly.
@@ -74,6 +77,18 @@ pub(super) struct Pipe<'a> {
     pub(super) base: Vec<(Box<[u8]>, Reads)>,
     /// The steps that reshape the rows, in the order they were written.
     pub(super) steps: Vec<Step>,
+    /// Where the sorting step that `SORTBY`, `MAX` and `LIMIT` all write to
+    /// sits in [`Pipe::steps`], when one of them has opened one.
+    ///
+    /// The three of them share a step rather than each having one of their own,
+    /// which is measured and is the whole reason this is here.
+    /// `SORTBY 1 @n MAX 3 APPLY '1' AS y LIMIT 0 5` answers five rows, so the
+    /// `LIMIT` reached back past the `APPLY` and overwrote the `MAX`, and
+    /// `SORTBY 1 @n FILTER '@n > 2' LIMIT 0 1` answers no rows at all, because
+    /// the window it reached back to cut the rows down to one before the filter
+    /// ever saw them. A `GROUPBY` closes the step, so a `LIMIT` after one is a
+    /// window on the groups and not on the documents they were folded from.
+    pub(super) arrange: Option<usize>,
     /// What the row looks like where the parser has got to, which is the base
     /// row until the first `GROUPBY` and that step's own output after it.
     ///
@@ -122,6 +137,21 @@ pub(super) enum Step {
     },
     /// An expression every row has to answer true to.
     Filter(Expr),
+    /// An order to put the rows in and a window to keep of them, either of
+    /// which may be there without the other.
+    Sort(Sort),
+}
+
+/// One sorting step, which is what a `SORTBY` and a `LIMIT` both write.
+#[derive(Default)]
+pub(super) struct Sort {
+    /// Where each property the rows are ordered by is read from, and whether
+    /// that one runs the other way round.
+    keys: Vec<(usize, bool)>,
+    /// Where the window starts and how many rows it keeps, which is every row
+    /// left when nothing said.
+    offset: usize,
+    count: Option<usize>,
 }
 
 /// Which properties a step may read.
@@ -130,9 +160,14 @@ pub(super) enum Step {
 /// anything loaded it. An `APPLY` and a `FILTER` read what is on the row and
 /// nothing else, except that a sortable field is on the row without being
 /// loaded, because a real server keeps a copy of one beside the document.
+///
+/// A `SORTBY` reads any field of the schema as well, and there it stops: it is
+/// the one step a `LOAD *` does not open up, so `LOAD * SORTBY 1 @e` over a key
+/// holding an `e` that the schema never heard of is refused.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Look {
     Any,
+    Named,
     Sorted,
 }
 
@@ -218,6 +253,9 @@ pub(super) fn group<'a>(
         folds.push(fold);
     }
     asked.pipe.steps.push(Step::Group(Group { by, folds }));
+    // A sorting step in front of a group step is finished with: a `LIMIT` after
+    // this one is a window on the groups.
+    asked.pipe.arrange = None;
     // Everything the row held before this step is gone, and what is left is the
     // group properties and whatever the reducers answered.
     asked.pipe.stage = Some(names);
@@ -492,7 +530,7 @@ fn locate(pipe: &mut Pipe<'_>, index: &Index, name: &[u8], look: Look) -> Option
             };
             (field.identifier.clone(), shape)
         }
-        None if pipe.all => (name.into(), Shape::Words),
+        None if pipe.all && look != Look::Named => (name.into(), Shape::Words),
         None => return None,
     };
     pipe.base.push((name.into(), Reads::Field(from, shape)));
@@ -581,6 +619,121 @@ pub(super) fn keeps<'a>(
     let expr = built(src, asked, index)?;
     asked.pipe.steps.push(Step::Filter(expr));
     Ok(at + 2)
+}
+
+/// `SORTBY nargs [@property [ASC|DESC]]... [MAX num]`.
+///
+/// The count is a count of words rather than of properties, so a direction eats
+/// one of them: `SORTBY 4 @g ASC @n DESC` orders by two properties and
+/// `SORTBY 3 @n @g DESC` runs the second one backwards and the first one
+/// forwards. A word in that window that is neither a property nor a direction
+/// is named as a missing direction, and a direction with no property in front
+/// of it is dropped, so `SORTBY 1 ASC` orders by nothing at all and is taken.
+///
+/// The whole list is read before any of it is looked up, which is measured:
+/// `SORTBY 2 @zz NOPE` is refused for the `NOPE` and not for the `zz`.
+pub(super) fn sorts<'a>(
+    args: Args<'a>,
+    at: usize,
+    asked: &mut Asked<'a>,
+    index: &Index,
+) -> core::result::Result<usize, Vec<u8>> {
+    let Some(count) = args.opt(at + 1) else {
+        return Err(SORT_SHORT.as_bytes().to_vec());
+    };
+    let Some(count) = parse_i64(count) else {
+        return Err(SORT_COUNT.as_bytes().to_vec());
+    };
+    // A count below nought is out of bounds where a `GROUPBY` reads the same
+    // thing as a list that ran off the end. The two words do not answer alike.
+    let Ok(count) = usize::try_from(count) else {
+        return Err(SORT_BOUNDS.as_bytes().to_vec());
+    };
+    let mut at = at + 2;
+    let mut keys: Vec<(&[u8], bool)> = Vec::new();
+    for _ in 0..count {
+        let Some(word) = args.opt(at) else {
+            return Err(SORT_SHORT.as_bytes().to_vec());
+        };
+        at += 1;
+        if let Some(name) = word.strip_prefix(b"@") {
+            keys.push((name, false));
+            continue;
+        }
+        let down = match () {
+            () if args::is(word, b"ASC") => false,
+            () if args::is(word, b"DESC") => true,
+            () => return Err(line(SORT_WAY, word, SORT_WAY_END)),
+        };
+        if let Some((_, way)) = keys.last_mut() {
+            *way = down;
+        }
+    }
+    // `MAX` belongs to this word and to nowhere else: on its own or after the
+    // `LIMIT` that followed a `SORTBY` it is an unknown argument.
+    let mut most = None;
+    if args.opt(at).is_some_and(|word| args::is(word, b"MAX")) {
+        let Some(number) = args.opt(at + 1).and_then(parse_i64).filter(|n| *n >= 0) else {
+            return Err(MAX_COUNT.as_bytes().to_vec());
+        };
+        // `MAX 0` is no cap at all, where `LIMIT 0 0` is a window holding
+        // nothing, so the two write the same field with different words for
+        // the same number.
+        most = usize::try_from(number).ok().filter(|n| *n > 0);
+        at += 2;
+    }
+    let spot = arranged(&mut asked.pipe);
+    // Two of these in one pipeline is refused even when a step stands between
+    // them, because both of them reach back to the same sorting step.
+    if matches!(&asked.pipe.steps[spot], Step::Sort(sort) if !sort.keys.is_empty()) {
+        return Err(SORT_TWICE.as_bytes().to_vec());
+    }
+    let mut found = Vec::with_capacity(keys.len());
+    for (name, down) in keys {
+        let Some(from) = locate(&mut asked.pipe, index, name, Look::Named) else {
+            let mut out = SORT_PROP.as_bytes().to_vec();
+            out.extend_from_slice(name);
+            out.extend_from_slice(SORT_PROP_END.as_bytes());
+            return Err(out);
+        };
+        found.push((from, down));
+    }
+    // A sort reads its properties onto the row without anything loading them,
+    // and a row carrying a property is one of the things that decides how the
+    // count at the front of the reply is worked out.
+    asked.pipe.loader |= !found.is_empty();
+    if let Some(most) = most {
+        asked.rows.count = most;
+    }
+    if let Step::Sort(sort) = &mut asked.pipe.steps[spot] {
+        sort.keys = found;
+        if let Some(most) = most {
+            sort.count = Some(most);
+        }
+    }
+    Ok(at)
+}
+
+/// Where the sorting step the next window goes into sits, opening one on the
+/// end of the pipeline when nothing has yet.
+fn arranged(pipe: &mut Pipe<'_>) -> usize {
+    if let Some(at) = pipe.arrange {
+        return at;
+    }
+    pipe.steps.push(Step::Sort(Sort::default()));
+    pipe.arrange = Some(pipe.steps.len() - 1);
+    pipe.steps.len() - 1
+}
+
+/// What a `LIMIT` does to an aggregation, which is not what it does to a
+/// search: it is a step of the pipeline standing where the client wrote it
+/// rather than a window on the answer.
+pub(super) fn windows(asked: &mut Asked<'_>, offset: usize, count: usize) {
+    let spot = arranged(&mut asked.pipe);
+    if let Step::Sort(sort) = &mut asked.pipe.steps[spot] {
+        sort.offset = offset;
+        sort.count = Some(count);
+    }
 }
 
 /// One row of the pipeline and how many rows were thrown away before it.
@@ -675,7 +828,11 @@ pub(super) fn piped(
     let mut start = total - lost;
     let mut warning = None;
     let mut grouped = false;
+    let mut ranked = false;
     let mut gone = 0;
+    // Which column the sort key beside each row is read from, which only a
+    // `SORTBY` writes and a `GROUPBY` after one takes away again.
+    let mut sorted = None;
     for step in &pipe.steps {
         match step {
             Step::Group(group) => {
@@ -691,6 +848,7 @@ pub(super) fn piped(
                 // that were folded into them are not in it.
                 start = table.len();
                 grouped = true;
+                sorted = None;
             }
             Step::Apply { at, name, expr } => {
                 match *at < names.len() {
@@ -747,6 +905,21 @@ pub(super) fn piped(
                 // carry the tally, so the running total is kept beside it.
                 gone += seen - table.len();
             }
+            Step::Sort(sort) => {
+                if let Some((first, _)) = sort.keys.first() {
+                    // Rows that order the same keep the order they arrived in,
+                    // which is the order the documents were walked in.
+                    table.sort_by(|left, right| ordered(&sort.keys, left, right));
+                    ranked = true;
+                    // Only the first key of the list is answered as the sort
+                    // key, however many the sort ran on.
+                    sorted = Some(*first);
+                }
+                table.drain(..sort.offset.min(table.len()));
+                if let Some(count) = sort.count {
+                    table.truncate(count);
+                }
+            }
         }
         if warning.is_some() {
             break;
@@ -754,8 +927,6 @@ pub(super) fn piped(
     }
     let shown: Vec<(Option<&Row>, &Vec<Value>)> = table
         .iter()
-        .skip(asked.rows.offset)
-        .take(asked.rows.count)
         .map(|held| (held.from.map(|at| &rows[at]), &held.values))
         .collect();
     // A step that could not work a row out before a single row of the reply had
@@ -765,8 +936,24 @@ pub(super) fn piped(
         out.error(bad);
         return;
     }
-    let counted = counting(&table, start, gone, asked, grouped, shown.len(), out);
-    writes(counted, &names, &shown, asked, warning.as_deref(), out);
+    let counted = counting(
+        &table,
+        start,
+        gone,
+        asked,
+        grouped || ranked,
+        shown.len(),
+        out,
+    );
+    writes(
+        counted,
+        &names,
+        &shown,
+        sorted,
+        asked,
+        warning.as_deref(),
+        out,
+    );
 }
 
 /// The number at the front of the reply.
@@ -774,15 +961,15 @@ pub(super) fn piped(
 /// It is not the number of rows that answered, except when it is. What it
 /// really reports is how far the reply had got when the number went on the
 /// wire, which is why it moves with the protocol and with whether anything read
-/// a field. A grouped pipeline is the one case where the whole answer has to
-/// exist before any of it can be written, so there is nothing half done to
-/// report and the number is the real one.
+/// a field. A pipeline that groups or sorts is the case where the whole answer
+/// has to exist before any of it can be written, so there is nothing half done
+/// to report and the number is the real one.
 fn counting(
     table: &[Held],
     start: usize,
     gone: usize,
     asked: &Asked<'_>,
-    grouped: bool,
+    settled: bool,
     shown: usize,
     out: &Out,
 ) -> usize {
@@ -791,13 +978,13 @@ fn counting(
     // one off the number, and one thrown away after it does not, because by
     // then the number has already gone. When no row of the reply was written at
     // all the number never went, so every row thrown away counts.
-    let dropped = match table.get(want.offset) {
+    let dropped = match table.first() {
         Some(held) => held.dropped,
         None => gone,
     };
     let count = start - dropped.min(start);
     let deep = out.proto().is_resp3();
-    let whole = grouped
+    let whole = settled
         || want.count == 0
         || super::buffered(asked)
         || (asked.pipe.loader && want.offset == 0);
@@ -809,6 +996,40 @@ fn counting(
         false => 1,
     };
     want.offset.saturating_add(reached).min(count)
+}
+
+/// Where one row goes beside another under a list of sort keys.
+///
+/// Two values order the way the four comparison operators order them, with one
+/// thing on top of that: a row that does not hold the property at all goes to
+/// the end whichever way the key runs, so `SORTBY 2 @m ASC` and
+/// `SORTBY 2 @m DESC` both answer the document with no `m` last. A group key
+/// that nothing filled in is not that. It is a null, it is a value in its own
+/// right, and it sorts under everything else and turns round with the key.
+fn ordered(keys: &[(usize, bool)], left: &Held, right: &Held) -> core::cmp::Ordering {
+    for (from, down) in keys {
+        let this = left.values.get(*from).unwrap_or(&Value::Missing);
+        let that = right.values.get(*from).unwrap_or(&Value::Missing);
+        let held = |value: &Value| !matches!(value, Value::Missing);
+        match (held(this), held(that)) {
+            (false, false) => continue,
+            (false, true) => return core::cmp::Ordering::Greater,
+            (true, false) => return core::cmp::Ordering::Less,
+            (true, true) => {}
+        }
+        // Two values with nothing to compare are left where they are rather
+        // than being an error, because there is no reply to hang one off here.
+        let Some(way) = yo_search::expr::order(this, that) else {
+            continue;
+        };
+        if way != core::cmp::Ordering::Equal {
+            return match down {
+                true => way.reverse(),
+                false => way,
+            };
+        }
+    }
+    core::cmp::Ordering::Equal
 }
 
 /// The bytes of a field as the row holds them.
@@ -967,6 +1188,7 @@ fn writes(
     count: usize,
     names: &[Box<[u8]>],
     shown: &[(Option<&Row>, &Vec<Value>)],
+    sorted: Option<usize>,
     asked: &Asked<'_>,
     warning: Option<&[u8]>,
     out: &mut Out,
@@ -974,6 +1196,10 @@ fn writes(
     let pipe = &asked.pipe;
     let want = &asked.rows;
     let extras = usize::from(want.scores) + usize::from(want.payloads) + usize::from(pipe.sortkeys);
+    // A row a group step made has no document under it and so has no score of
+    // its own, which is why this is asked per row rather than once.
+    let scored = pipe.addscores && !names.iter().any(|name| **name == *b"__score");
+    let scoring = |row: Option<&Row>| scored.then(|| row.map(|row| row.score)).flatten();
     if out.proto().is_resp3() {
         out.map(5);
         out.simple(b"attributes");
@@ -997,11 +1223,14 @@ fn writes(
             }
             if pipe.sortkeys {
                 out.simple(b"sortkey");
-                out.nil();
+                match keyed(values, sorted) {
+                    Some(key) => out.bulk(&key),
+                    None => out.nil(),
+                }
             }
             if want.content {
                 out.simple(b"extra_attributes");
-                mapped(names, values, out);
+                mapped(names, values, scoring(*row), out);
             }
             out.simple(b"values");
             out.array(0);
@@ -1033,12 +1262,38 @@ fn writes(
             }
         }
         if pipe.sortkeys {
-            out.nil();
+            match keyed(values, sorted) {
+                Some(key) => out.bulk(&key),
+                None => out.nil(),
+            }
         }
         if want.content {
-            mapped(names, values, out);
+            mapped(names, values, scoring(*row), out);
         }
     }
+}
+
+/// The sort key element beside a row, when `WITHSORTKEYS` asked for one.
+///
+/// A number is written after a hash and text after a dollar, and the number is
+/// written wider than the same number on the row is: the sort key is the value
+/// the sort compared and the row holds the value the client reads.
+fn keyed(values: &[Value], sorted: Option<usize>) -> Option<Vec<u8>> {
+    let mut out = Vec::new();
+    match values.get(sorted?)? {
+        Value::Number(number) => {
+            out.push(b'#');
+            out.extend_from_slice(seventeen(*number).as_bytes());
+        }
+        Value::Text(text) => {
+            out.push(b'$');
+            out.extend_from_slice(text);
+        }
+        // A row the sort found nothing on has no key of its own, which is the
+        // same null a pipeline that never sorted answers.
+        _ => return None,
+    }
+    Some(out)
 }
 
 /// One row as a map of names to what the pipeline put under them.
@@ -1047,13 +1302,21 @@ fn writes(
 /// the key does not hold does. A property that is there and holds nothing is
 /// sent as a null, which is what a group key over a field nothing filled in
 /// does. The two look the same from the outside and are not the same thing.
-fn mapped(names: &[Box<[u8]>], row: &[Value], out: &mut Out) {
+///
+/// The score goes in front of the lot when `ADDSCORES` asked for it and nothing
+/// in the pipeline named it, wherever in the argument list the word stood: a
+/// `SORTBY` that put a property on the row first still answers the score first.
+fn mapped(names: &[Box<[u8]>], row: &[Value], score: Option<f64>, out: &mut Out) {
     let held: Vec<(&Box<[u8]>, &Value)> = names
         .iter()
         .zip(row)
         .filter(|(_, value)| !matches!(value, Value::Missing))
         .collect();
-    out.map(held.len());
+    out.map(held.len() + usize::from(score.is_some()));
+    if let Some(score) = score {
+        out.bulk(b"__score");
+        out.bulk(twelve(score).as_bytes());
+    }
     for (name, value) in held {
         out.bulk(name);
         written(value, out);
@@ -1105,5 +1368,101 @@ mod tests {
             tagged(&[Value::Nil]),
             tagged(&[Value::Text(Box::default())])
         );
+    }
+
+    fn row(values: &[Value]) -> Held {
+        Held {
+            values: values.to_vec(),
+            dropped: 0,
+            from: None,
+        }
+    }
+
+    #[test]
+    fn a_row_without_the_property_sorts_last_whichever_way_the_key_runs() {
+        let here = row(&[Value::Number(1.0)]);
+        let gone = row(&[Value::Missing]);
+        for down in [false, true] {
+            assert_eq!(
+                ordered(&[(0, down)], &here, &gone),
+                core::cmp::Ordering::Less
+            );
+            assert_eq!(
+                ordered(&[(0, down)], &gone, &here),
+                core::cmp::Ordering::Greater
+            );
+        }
+        assert_eq!(
+            ordered(&[(0, false)], &gone, &gone),
+            core::cmp::Ordering::Equal
+        );
+    }
+
+    #[test]
+    fn a_null_is_a_value_of_its_own_and_turns_round_with_the_key() {
+        // Which is what tells a group key nothing filled in apart from a
+        // property the document never had: one sorts under everything and the
+        // other sorts last.
+        let null = row(&[Value::Nil]);
+        let held = row(&[Value::Number(-9.0)]);
+        assert_eq!(
+            ordered(&[(0, false)], &null, &held),
+            core::cmp::Ordering::Less
+        );
+        assert_eq!(
+            ordered(&[(0, true)], &null, &held),
+            core::cmp::Ordering::Greater
+        );
+    }
+
+    #[test]
+    fn the_keys_are_read_in_turn_until_one_of_them_settles_it() {
+        let first = row(&[Value::Text(b"aa".as_slice().into()), Value::Number(2.0)]);
+        let second = row(&[Value::Text(b"aa".as_slice().into()), Value::Number(1.0)]);
+        let keys = [(0, false), (1, false)];
+        assert_eq!(
+            ordered(&keys, &first, &second),
+            core::cmp::Ordering::Greater
+        );
+        // The direction belongs to the key and not to the sort, so the second
+        // one can run the other way while the first one does not.
+        let keys = [(0, false), (1, true)];
+        assert_eq!(ordered(&keys, &first, &second), core::cmp::Ordering::Less);
+        assert_eq!(ordered(&[], &first, &second), core::cmp::Ordering::Equal);
+    }
+
+    #[test]
+    fn two_values_are_ordered_the_way_a_comparison_orders_them() {
+        let number = row(&[Value::Number(10.0)]);
+        let words = row(&[Value::Text(b"9".as_slice().into())]);
+        // Text beside a number is read as a number, so this is ten against
+        // nine and not the two of them as bytes.
+        assert_eq!(
+            ordered(&[(0, false)], &number, &words),
+            core::cmp::Ordering::Greater
+        );
+        let list = row(&[Value::List(vec![Value::Number(1.0)])]);
+        assert_eq!(
+            ordered(&[(0, false)], &list, &number),
+            core::cmp::Ordering::Less
+        );
+    }
+
+    #[test]
+    fn a_sort_key_says_which_of_the_two_kinds_of_value_it_holds() {
+        let row = [
+            Value::Number(-4.0),
+            Value::Text(b"blue".as_slice().into()),
+            Value::Missing,
+            Value::Nil,
+        ];
+        assert_eq!(keyed(&row, Some(0)).as_deref(), Some(b"#-4".as_slice()));
+        assert_eq!(keyed(&row, Some(1)).as_deref(), Some(b"$blue".as_slice()));
+        // A row the sort found nothing on, a group key nothing filled in, and a
+        // pipeline that never sorted all answer the same null.
+        assert_eq!(keyed(&row, Some(2)), None);
+        assert_eq!(keyed(&row, Some(3)), None);
+        assert_eq!(keyed(&row, Some(9)), None);
+        assert_eq!(keyed(&row, None), None);
     }
 }

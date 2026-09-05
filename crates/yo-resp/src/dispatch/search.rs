@@ -103,7 +103,7 @@ use crate::reply::Out;
 
 mod aggregate;
 
-use aggregate::{Pipe, Reads, Shape, apply, group, keeps, piped};
+use aggregate::{Pipe, Reads, Shape, apply, group, keeps, piped, sorts, windows};
 
 /// The languages a document may be stemmed in, in the spelling `FT.INFO`
 /// reports them in.
@@ -1536,6 +1536,23 @@ const GROUP_COUNT: &str =
 const NO_AT: &str = "SEARCH_PARSE_ARGS Bad arguments for GROUPBY: Unknown property `";
 const NO_AT_MID: &str = "`. Did you mean `@";
 const NO_AT_END: &str = "`?";
+const SORT_SHORT: &str =
+    "SEARCH_PARSE_ARGS Bad arguments for SORTBY: Expected an argument, but none provided";
+const SORT_COUNT: &str =
+    "SEARCH_PARSE_ARGS Bad arguments for SORTBY: Could not convert argument to expected type";
+const SORT_BOUNDS: &str =
+    "SEARCH_PARSE_ARGS Bad arguments for SORTBY: Value is outside acceptable bounds";
+const MAX_COUNT: &str =
+    "SEARCH_PARSE_ARGS Bad arguments for MAX: Could not convert argument to expected type";
+/// What a word inside a `SORTBY` list that is neither a property nor a
+/// direction answers, which names the word in brackets rather than in quotes.
+const SORT_WAY: &str = "SEARCH_PARSE_ARGS MISSING ASC or DESC after sort field (";
+const SORT_WAY_END: &str = ")";
+/// What a `SORTBY` says about a property it cannot find, which is worded its
+/// own way and not the way an `APPLY` or a `FILTER` words the same thing.
+const SORT_PROP: &str = "SEARCH_PROP_NOT_FOUND Property `";
+const SORT_PROP_END: &str = "` not loaded nor in schema";
+const SORT_TWICE: &str = "SEARCH_PARSE_ARGS Multiple SORTBY steps are not allowed. Sort multiple fields in a single step";
 const NO_PROPERTY: &str = "SEARCH_PROP_NOT_FOUND No such property `";
 const NOT_LOADED: &str = "SEARCH_PROP_NOT_FOUND Property not loaded nor in pipeline: `";
 const QUOTE_END: &str = "`";
@@ -1749,7 +1766,7 @@ fn options<'a>(
         // The words about the search itself, which an aggregation stops taking
         // once a step of its pipeline has been read. `LIMIT` and `TIMEOUT` are
         // not among them, which is why they are asked for before this.
-        if let Some(next) = plan(args, at, &mut asked.rows, mode)? {
+        if let Some(next) = plan(args, at, &mut asked, mode)? {
             at = next;
             continue;
         }
@@ -1799,9 +1816,10 @@ fn options<'a>(
 fn plan<'a>(
     args: Args<'a>,
     at: usize,
-    rows: &mut Rows<'a>,
+    asked: &mut Asked<'a>,
     mode: Mode,
 ) -> core::result::Result<Option<usize>, Vec<u8>> {
+    let rows = &mut asked.rows;
     let word = args.get(at);
     if args::is(word, b"LIMIT") {
         let (Some(offset), Some(count)) = (args.opt(at + 1), args.opt(at + 2)) else {
@@ -1826,6 +1844,13 @@ fn plan<'a>(
         }
         rows.offset = usize::try_from(offset).unwrap_or(0);
         rows.count = usize::try_from(count).unwrap_or(0);
+        // An aggregation puts the window where the client wrote it rather than
+        // over the answer, so it goes into the pipeline as well. What stays
+        // here is what the count at the front of the reply is worked out from.
+        if mode == Mode::Aggregate {
+            let (offset, count) = (rows.offset, rows.count);
+            windows(asked, offset, count);
+        }
         return Ok(Some(at + 3));
     }
     if args::is(word, b"TIMEOUT") {
@@ -1866,6 +1891,9 @@ fn step<'a>(
     }
     if args::is(args.get(at), b"FILTER") {
         return keeps(args, at, asked, index).map(Some);
+    }
+    if args::is(args.get(at), b"SORTBY") {
+        return sorts(args, at, asked, index).map(Some);
     }
     if !args::is(args.get(at), b"LOAD") {
         return Ok(None);
@@ -2957,5 +2985,20 @@ mod tests {
         // Twelve significant digits and no more, which is what a `__score` and
         // every reduced number go on the wire as.
         assert_eq!(twelve(0.934_309_237_376_833_4), "0.934309237377");
+    }
+
+    #[test]
+    fn a_sort_key_is_written_five_digits_wider_than_the_row_it_sits_beside() {
+        use yo_search::expr::seventeen;
+
+        assert_eq!(seventeen(1.0 / 3.0), "0.33333333333333331");
+        assert_eq!(seventeen(-4.0), "-4");
+        assert_eq!(seventeen(5.5), "5.5");
+        // The point where a number turns into a scientific one moves with the
+        // width, so this pair is fixed at twelve and split at seventeen.
+        assert_eq!(seventeen(1e16), "10000000000000000");
+        assert_eq!(seventeen(1e17), "1e+17");
+        assert_eq!(seventeen(0.000_01), "1.0000000000000001e-05");
+        assert_eq!(seventeen(0.000_1), "0.0001");
     }
 }
