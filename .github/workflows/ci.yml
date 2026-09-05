@@ -7,8 +7,8 @@ name: ci
 #
 # Everything that cannot meet that budget lives in deep.yml, which runs nightly,
 # on demand against any branch, and on a pull request labelled `deep`. Miri,
-# fuzzing, the release test matrix, the benchmark smoke run and the cold build
-# from source are all there. None of them has ever caught something that only
+# ThreadSanitizer, fuzzing, the release test matrix, the benchmark smoke run and
+# the cold build from source are all there. None of them has ever caught something that only
 # appears between one commit and the next, and all of them were making the
 # common case slow.
 
