@@ -85,7 +85,7 @@ const NO_AOF: &str = "WAITAOF cannot be used when numlocal is set but appendonly
 /// A timeout that is not a timeout, a direction that is not a direction, and a
 /// key holding something that is not a list.
 pub(super) fn execute(
-    server: &mut Server,
+    server: &Server,
     session: &Session,
     spec: &Spec,
     args: Args<'_>,

@@ -234,7 +234,7 @@ impl core::fmt::Display for PolicyNames {
 
 /// Run one connection or server command.
 pub(super) fn execute(
-    server: &mut Server,
+    server: &Server,
     session: &mut Session,
     spec: &Spec,
     args: Args<'_>,
@@ -292,7 +292,7 @@ pub(super) fn execute(
         "dbsize" => out.int(server.dbs[session.db].len() as i64),
         "flushall" => {
             flush_mode(args)?;
-            for db in &mut server.dbs {
+            for db in &server.dbs {
                 db.clear();
             }
             server.search.lock().clear();
@@ -309,10 +309,10 @@ pub(super) fn execute(
             server.search.lock().clear();
             out.ok();
         }
-        // Two databases change places and no key moves. A database here is a
-        // value in a slice, so this is the slice's own swap and it costs two
-        // pointer sized writes whatever is in either of them, which is what
-        // makes `SWAPDB` fast and dangerous at the same time.
+        // Two databases change places and no key moves. What is in the stripes
+        // is exchanged and the databases stay where they are, so this costs two
+        // pointer sized writes per stripe whatever is in either of them, which
+        // is what makes `SWAPDB` fast and dangerous at the same time.
         //
         // No connection is told. A client on database zero is still on database
         // zero and is now looking at what used to be database one, which is the
@@ -323,7 +323,7 @@ pub(super) fn execute(
         "swapdb" => {
             let first = db_index(args.get(1), "invalid first DB index")?;
             let second = db_index(args.get(2), "invalid second DB index")?;
-            server.dbs.swap(first, second);
+            server.striped(first).swap_with(server.striped(second));
             out.ok();
         }
         "time" => time(out),
@@ -381,7 +381,7 @@ fn time(out: &mut Out) {
 /// reached rather than one that happens to be empty: a shutdown is decided and
 /// done inside one turn of the loop, so there is never a window in which one is
 /// in progress and a second client could call it off.
-fn shutdown(server: &mut Server, args: Args<'_>) -> Result<Flow> {
+fn shutdown(server: &Server, args: Args<'_>) -> Result<Flow> {
     let (mut save, mut nosave, mut abort, mut other) = (false, false, false, false);
     for at in 1..args.len() {
         let arg = args.get(at);
@@ -800,7 +800,7 @@ fn bad_setting(name: &str, parsed: bool) -> Error {
 }
 
 /// `CONFIG GET|SET|RESETSTAT|REWRITE|HELP`.
-fn config(server: &mut Server, args: Args<'_>, out: &mut Out) -> Result<()> {
+fn config(server: &Server, args: Args<'_>, out: &mut Out) -> Result<()> {
     let sub = args.get(1);
     if is(sub, b"GET") {
         if args.len() < 3 {

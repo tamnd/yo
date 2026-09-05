@@ -401,6 +401,45 @@ impl Db {
         }
     }
 
+    /// Trade this database's contents with another's, which is `SWAPDB`.
+    ///
+    /// Stripe by stripe rather than by exchanging the two databases where they
+    /// sit, because a caller holding a server shared has references out to the
+    /// databases and those have to go on pointing at the database the client
+    /// selected. What moves is what is in the stripes, which is a handful of
+    /// words each whatever they are holding, so this is still O(1) in the
+    /// number of keys and still the two pointer sized writes per stripe that
+    /// make `SWAPDB` fast and dangerous at the same time.
+    ///
+    /// The pair is held in address order and not in the order the client named
+    /// them, so two clients swapping the same two databases in opposite
+    /// directions take turns rather than each holding what the other is waiting
+    /// for. Swapping a database with itself does nothing, which is the answer a
+    /// real server gives too.
+    ///
+    /// A reader on another thread can see one stripe swapped and the next one
+    /// not, the same as it can see a half finished [`Db::clear`].
+    pub fn swap_with(&self, other: &Db) {
+        if std::ptr::eq(self, other) {
+            return;
+        }
+        debug_assert_eq!(
+            self.stripes.len(),
+            other.stripes.len(),
+            "two databases of one server are cut the same way"
+        );
+        let (first, second) = if std::ptr::from_ref(self) < std::ptr::from_ref(other) {
+            (self, other)
+        } else {
+            (other, self)
+        };
+        for i in 0..first.stripes.len() {
+            let mut a = first.hold_stripe(i);
+            let mut b = second.hold_stripe(i);
+            std::mem::swap(&mut *a, &mut *b);
+        }
+    }
+
     /// Turn the running memory total on or off in every stripe.
     pub fn track_memory(&self, on: bool) {
         for i in 0..self.stripes.len() {
