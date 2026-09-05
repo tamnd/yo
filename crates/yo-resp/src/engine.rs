@@ -15,12 +15,12 @@
 //! and it is in a module of its own that cannot name a [`Server`]: the buffers,
 //! the decoder pool, the framing, the sessions and the queue of framed work.
 //! The other half is the server, which is the databases and the numbers `INFO`
-//! reports. The line matters because it is the line a second thread runs along:
-//! a front belongs to the thread that accepted its connections and is reached by
-//! nothing else, and the server is what the threads come to share. Everything
-//! that needs both is a method on `Wire` and there are three of them, which are
-//! running a command, answering a client that blocked and forgetting a client
-//! that has gone.
+//! reports. The line matters because it is the line the threads run along: a
+//! front belongs to the thread that accepted its connections and is reached by
+//! nothing else, and the server is the handle every thread holds a copy of.
+//! Everything that needs both is a method on `Wire` and there are three of them,
+//! which are running a command, answering a client that blocked and forgetting a
+//! client that has gone.
 //!
 //! # What a piece of work is
 //!
@@ -70,6 +70,8 @@
 //!
 //! assert_eq!(r.engine().sink().sent(conn), b"+OK\r\n$1\r\nv\r\n");
 //! ```
+
+use std::sync::Arc;
 
 use yo_reactor::{BATCH_MAX, Engine, Reactor};
 
@@ -156,16 +158,16 @@ impl Sink for Recorder {
 
 /// The engine: connections on one side, the command layer on the other.
 ///
-/// One per shard thread, and it is two halves rather than one thing. The front
-/// is the connections and everything they own, which never leaves the thread
-/// that accepted them. [`Server`] is the databases, and it is what a second
-/// thread would come to share. This type is where the two meet, and every
-/// method on it that is not a one line delegation is a method that genuinely
-/// needs both: running a command, answering a client that blocked, and
-/// forgetting a client that has gone.
+/// One per thread, and it is two halves rather than one thing. The front is the
+/// connections and everything they own, which never leaves the thread that
+/// accepted them. [`Server`] is the databases, and every thread has a handle on
+/// the same one. This type is where the two meet, and every method on it that is
+/// not a one line delegation is a method that genuinely needs both: running a
+/// command, answering a client that blocked, and forgetting a client that has
+/// gone.
 pub struct Wire<S> {
     front: Front<S>,
-    server: Server,
+    server: Arc<Server>,
 }
 
 impl<S: Sink> Wire<S> {
@@ -179,6 +181,19 @@ impl<S: Sink> Wire<S> {
     /// clock it can move by hand.
     #[must_use]
     pub fn with_server(server: Server, sink: S) -> Wire<S> {
+        Wire::over(Arc::new(server), sink)
+    }
+
+    /// An engine over a server that already exists, which is how the second
+    /// thread and every thread after it gets one.
+    ///
+    /// Each thread builds its own front and they never see each other's. What
+    /// they share is behind the handle, and the reason the handle is counted
+    /// rather than borrowed is that the threads outlive whichever call started
+    /// them by design: a scope that borrows would tie the server's lifetime to
+    /// a frame that is meant to return.
+    #[must_use]
+    pub fn over(server: Arc<Server>, sink: S) -> Wire<S> {
         Wire {
             front: Front::new(sink),
             server,
@@ -187,13 +202,34 @@ impl<S: Sink> Wire<S> {
 
     /// The databases and the numbers `INFO` reports.
     #[must_use]
-    pub const fn server(&self) -> &Server {
+    pub fn server(&self) -> &Server {
         &self.server
     }
 
-    /// The same, for a caller that owns both ends.
-    pub const fn server_mut(&mut self) -> &mut Server {
-        &mut self.server
+    /// Another handle on the same server, for building the next thread's
+    /// engine.
+    #[must_use]
+    pub fn shared(&self) -> Arc<Server> {
+        Arc::clone(&self.server)
+    }
+
+    /// The server, for the few settings that have to be made before it is
+    /// serving.
+    ///
+    /// That is the directory and the thread count, both of which are read
+    /// everywhere and written once at startup, so they are settings and not
+    /// state. This works while this engine holds the only handle, which is the
+    /// case from the moment the server is built until the threads are started,
+    /// and it is the caller's job to do its setting up in that window.
+    ///
+    /// # Panics
+    ///
+    /// If a second handle already exists, because there is no honest answer to
+    /// give: changing the directory under a thread that is already serving out
+    /// of it is the bug this would otherwise hide.
+    pub fn server_mut(&mut self) -> &mut Server {
+        Arc::get_mut(&mut self.server)
+            .expect("the server is set up before the threads that share it are started")
     }
 
     /// Where the replies went.
@@ -685,6 +721,39 @@ mod tests {
         assert_eq!(r.engine().sink().sent(a), b"+OK\r\n+OK\r\n$1\r\na\r\n");
         assert_eq!(r.engine().sink().sent(b), b"+OK\r\n$1\r\nb\r\n");
         assert_eq!(r.engine().clients(), 2);
+    }
+
+    /// The point of the whole exercise: two engines, two threads, one server.
+    #[test]
+    fn two_threads_write_into_one_server() {
+        const EACH: usize = 200;
+
+        let first = Wire::new(Recorder::new());
+        let second = Wire::over(first.shared(), Recorder::new());
+        let server = first.shared();
+
+        std::thread::scope(|s| {
+            for (at, engine) in [first, second].into_iter().enumerate() {
+                s.spawn(move || {
+                    let mut r = Reactor::inline(engine);
+                    let mut batch = Vec::new();
+                    let conn = r.engine_mut().accept();
+                    for i in 0..EACH {
+                        let key = format!("t{at}:{i}");
+                        r.engine_mut()
+                            .feed(conn, &wire(&[b"SET", key.as_bytes(), b"v"]));
+                        pump(&mut r, &mut batch);
+                    }
+                });
+            }
+        });
+
+        // Every key both threads wrote is in the one database, which is the
+        // whole claim: the fronts were separate and the keyspace was not.
+        assert_eq!(server.striped_ref(0).len(), 2 * EACH);
+        // And both threads counted into the same total, each from its own set
+        // of counters, which is what the sum over the threads is for.
+        assert_eq!(server.totals().connections, 2);
     }
 
     #[test]

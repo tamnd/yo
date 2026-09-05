@@ -19,9 +19,8 @@
 //! A command that names several keys is no longer handed one keyspace and
 //! resolves each key against the database instead, and everything that walks a
 //! whole database walks all of the stripes: the expiry cycle, eviction,
-//! compaction, `SCAN`, `KEYS`, `RANDOMKEY`, the settings and the snapshot. What
-//! is left before a database can be held by more than one thread is the engine
-//! itself, which is the other half of this milestone.
+//! compaction, `SCAN`, `KEYS`, `RANDOMKEY`, the settings and the snapshot. A
+//! database is held by more than one thread now, one stripe at a time each.
 
 use yo_common::Small;
 use yo_common::lock::{Held, Lock};
