@@ -52,6 +52,12 @@ jobs:
   # that triggers this workflow runs the lot.
   wanted:
     runs-on: ubuntu-latest
+    # Reading the labels back needs saying out loud. The default for this
+    # repository is read on everything, so this changes nothing today, and it
+    # keeps the job working if that default is ever tightened.
+    permissions:
+      contents: read
+      pull-requests: read
     outputs:
       run: ${{ steps.decide.outputs.run }}
       ref: ${{ steps.pick.outputs.ref }}
@@ -97,13 +103,23 @@ jobs:
       # A push that only moves prose does not need any of this. That is not a
       # nicety: a changelog line on a pull request that already ran deep costs
       # seven minutes and tells nobody anything.
+      #
+      # The label is read back from the API rather than taken from the event.
+      # The event carries a snapshot of the labels at the moment it was made,
+      # and opening a pull request with labels already on it delivers the
+      # `labeled` events first and the `opened` event after, with the older
+      # snapshot in it. The `opened` run then sees no label, decides to skip,
+      # and cancels the three real runs on its way past, because they share a
+      # concurrency group. The whole thing reports success without having run
+      # anything, which is the failure this job exists to avoid.
       - id: decide
         env:
           EVENT: ${{ github.event_name }}
           ACTION: ${{ github.event.action }}
-          LABELLED: ${{ contains(github.event.pull_request.labels.*.name, 'deep') }}
+          NUMBER: ${{ github.event.pull_request.number }}
           BASE: ${{ github.event.pull_request.base.sha }}
           BEFORE: ${{ github.event.before }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -u
           # Everything that is not a pull request runs the lot.
@@ -113,7 +129,9 @@ jobs:
             exit 0
           fi
           echo 'borrows=["stacked"]' >> "$GITHUB_OUTPUT"
-          if [ "$LABELLED" != "true" ]; then
+          labels=$(gh api "repos/${GITHUB_REPOSITORY}/pulls/${NUMBER}" \
+            --jq '.labels[].name')
+          if ! printf '%s\n' "$labels" | grep -qx deep; then
             echo "no deep label, skipping"
             echo "run=false" >> "$GITHUB_OUTPUT"
             exit 0
