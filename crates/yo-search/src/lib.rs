@@ -52,6 +52,13 @@
 //! read off its manual, which is how the single precision `k1` in the default
 //! one came to light.
 //!
+//! [`explain`] is the other half of that, the account a scorer gives of itself
+//! when a client asks for `EXPLAINSCORE`. It walks the same shape the score was
+//! taken off and prints a line per node, and every line in it was read off a
+//! real server rather than worked out from the arithmetic, which is why the
+//! three scorers that divide by how far the words landed apart print the
+//! division at the top and their leaves undivided.
+//!
 //! [`sorted`] is the other way of ordering an answer, by a field rather than by
 //! a score. A field the schema calls `SORTABLE` has its value copied into the
 //! document table as the sort will compare it, folded for text and parsed for a
@@ -109,6 +116,7 @@
 pub mod docs;
 pub mod english;
 pub mod expand;
+pub mod explain;
 pub mod expr;
 pub mod field;
 pub mod follow;

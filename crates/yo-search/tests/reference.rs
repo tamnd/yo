@@ -76,7 +76,7 @@ fn answer(index: &Index, query: &str) -> String {
         .into_iter()
         .map(|hit| {
             let doc = index.held.docs.get(hit.id).expect("a live document");
-            let score = Scorer::default_scorer().of(&facts, doc, &hit.found, None);
+            let score = Scorer::default_scorer().of(&facts, doc, &hit.found, None, 1);
             format!("{}={score}", String::from_utf8_lossy(&doc.key))
         })
         .collect();

@@ -384,6 +384,20 @@ impl Terms {
         self.terms.get(term)
     }
 
+    /// One term as the dictionary spells it, beside the documents it is in.
+    ///
+    /// The same lookup as [`Terms::get`] with the stored name handed back
+    /// alongside, which is what an explanation names a term by. Borrowing the
+    /// dictionary's own key rather than the query's means a stem arrives
+    /// already spelled with its [`STEM`] byte on the front and nothing is
+    /// copied to say so.
+    #[must_use]
+    pub fn entry(&self, term: &[u8]) -> Option<(&[u8], &Posts)> {
+        self.terms
+            .get_key_value(term)
+            .map(|(name, posts)| (&**name, posts))
+    }
+
     /// Every term, in order, stems among them behind their [`STEM`] byte.
     pub fn all(&self) -> impl Iterator<Item = &[u8]> + '_ {
         self.terms.keys().map(|t| &**t)

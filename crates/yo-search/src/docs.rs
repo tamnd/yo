@@ -169,6 +169,20 @@ impl Docs {
         }
     }
 
+    /// Counts a frequency towards the largest in a document and not towards its
+    /// length, which is what a stem is worth.
+    ///
+    /// A stem is not a word the document holds, so it does not make the
+    /// document any longer, and it is still a term the document has as often as
+    /// it has it, so it can be the most frequent thing in there. Measured: a
+    /// document holding `zeta running runs` is three tokens long with a largest
+    /// frequency of two, and the two is the stem behind the last two words.
+    pub fn peak(&mut self, id: Id, freq: u32) {
+        if let Some(Some(doc)) = self.slot_mut(id) {
+            doc.top = doc.top.max(freq);
+        }
+    }
+
     /// Puts the payload on a document.
     pub fn carry(&mut self, id: Id, payload: &[u8]) {
         if let Some(Some(doc)) = self.slot_mut(id) {

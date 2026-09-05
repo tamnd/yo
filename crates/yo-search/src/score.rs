@@ -10,7 +10,7 @@
 //! let mut doc = Doc::new(b"book:1", 1.0);
 //! doc.tokens = 1;
 //! let found = Found::Term(Term::new(1, 1.0, 2));
-//! let score = Scorer::Bm25.of(&facts, &doc, &found, None);
+//! let score = Scorer::Bm25.of(&facts, &doc, &found, None, 1);
 //! assert!((score - 0.9186287989106708).abs() < 1e-12);
 //! ```
 //!
@@ -110,20 +110,41 @@ impl Facts {
 
 /// One term of a query as one document answered it.
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub struct Term {
+pub struct Term<'a> {
     /// How often the term is in the document, weighted by its field.
     pub freq: u32,
     /// What the query said this term is worth, one unless it said otherwise.
     pub weight: f64,
     /// How many documents in the index have the term at all.
     pub docs: u32,
+    /// What the term is called, borrowed from wherever it is stored.
+    ///
+    /// Nothing to do with the score and everything to do with explaining it,
+    /// which is the one place a real server says which word it was. The name is
+    /// the dictionary's own spelling rather than the query's, so a stem is
+    /// already written `+run` and a tag is written the way it was folded.
+    pub name: Option<&'a [u8]>,
 }
 
-impl Term {
+impl<'a> Term<'a> {
     /// A term with a frequency, a query weight and a document count.
     #[must_use]
-    pub fn new(freq: u32, weight: f64, docs: u32) -> Term {
-        Term { freq, weight, docs }
+    pub fn new(freq: u32, weight: f64, docs: u32) -> Term<'a> {
+        Term {
+            freq,
+            weight,
+            docs,
+            name: None,
+        }
+    }
+
+    /// The same term, knowing what it is called.
+    #[must_use]
+    pub fn about(self, name: &'a [u8]) -> Term<'a> {
+        Term {
+            name: Some(name),
+            ..self
+        }
     }
 
     /// The idf the default scorer uses, which is the usual probabilistic one.
@@ -153,14 +174,30 @@ impl Term {
 /// except `DISMAX`, which takes the best branch of a union and the sum of an
 /// intersection, so a document that answers one half of an or is worth what that
 /// half is worth and not more.
+///
+/// A branch carries its own weight rather than having it pushed down into the
+/// leaves under it. The two come to the same number, because a sum times a
+/// weight is the sum of the weighted parts, and they do not come to the same
+/// explanation: `(fox dog) => { $weight: 2.0 }` is measured to print the two on
+/// the branch and one on each leaf.
 #[derive(Debug, Clone, PartialEq)]
-pub enum Found {
+pub enum Found<'a> {
     /// One term in one document.
-    Term(Term),
+    Term(Term<'a>),
     /// Every branch matched, as in an intersection or a phrase.
-    All(Vec<Found>),
+    All {
+        /// What the query said the branch as a whole is worth.
+        weight: f64,
+        /// The branches that matched.
+        under: Vec<Found<'a>>,
+    },
     /// Any branch could have matched, as in a union.
-    Any(Vec<Found>),
+    Any {
+        /// What the query said the branch as a whole is worth.
+        weight: f64,
+        /// The branches that matched, which is not every branch there is.
+        under: Vec<Found<'a>>,
+    },
     /// The document matched because everything does, which is a bare `*`.
     ///
     /// There is no term in a wildcard, so there is nothing to weigh by how rare
@@ -168,16 +205,71 @@ pub enum Found {
     /// is one: the length correction and nothing else. Measured, on an index of
     /// three documents holding seven tokens between them, where the two lengths
     /// come back as two different scores and both agree to the last digit with
-    /// the same sum with the rarity taken out.
+    /// the same sum with the rarity taken out. The three standard scorers name
+    /// it `*` and give it an idf of one where they give a match with no word in
+    /// it nothing at all, which is the whole reason it is not a [`Found::Blank`].
     Every,
-    /// The document answered a filter, which is a match with no word in it.
+    /// A match with no word in it, which is a weight and a count and no more.
     ///
-    /// A numeric range is the one of these there is so far. The three standard
-    /// scorers give it nothing and the four older ones give it what a wildcard
-    /// gets, which is not a rule anybody would guess and is measured: under
-    /// `TFIDF` the query `alpha @n:[1 2]` scores every document exactly twice
-    /// what `alpha` scores it, and under `BM25STD` it scores it the same.
-    Filter,
+    /// Three things come to this and all three are measured. A filter, which is
+    /// a numeric range or a geo circle, weighs one and counts one. An optional
+    /// branch the document did not answer weighs nothing and counts one. A
+    /// negation the document answered weighs one and counts nothing.
+    ///
+    /// The three standard scorers give all three of them nothing, because they
+    /// count words and there is no word here. The rest give them a weight times
+    /// a frequency with every rarity taken as one, which is not a rule anybody
+    /// would guess and is measured: under `TFIDF` the query `alpha @n:[1 2]`
+    /// scores every document exactly twice what `alpha` scores it, and under
+    /// `BM25STD` it scores it the same.
+    Blank {
+        /// What the query said this is worth, which is nothing for an optional
+        /// branch that did not answer.
+        weight: f64,
+        /// How many times it counts, which is nothing for a negation.
+        freq: u32,
+    },
+}
+
+impl<'a> Found<'a> {
+    /// A filter that answered, which weighs one and counts one.
+    #[must_use]
+    pub fn filter() -> Found<'a> {
+        Found::Blank {
+            weight: 1.0,
+            freq: 1,
+        }
+    }
+
+    /// A negation the document answered, which counts nothing.
+    #[must_use]
+    pub fn missing() -> Found<'a> {
+        Found::Blank {
+            weight: 1.0,
+            freq: 0,
+        }
+    }
+
+    /// An optional branch the document did not answer, which is worth nothing.
+    #[must_use]
+    pub fn skipped() -> Found<'a> {
+        Found::Blank {
+            weight: 0.0,
+            freq: 1,
+        }
+    }
+
+    /// An intersection or a phrase, at the weight the query gave it.
+    #[must_use]
+    pub fn all(weight: f64, under: Vec<Found<'a>>) -> Found<'a> {
+        Found::All { weight, under }
+    }
+
+    /// A union, at the weight the query gave it.
+    #[must_use]
+    pub fn any(weight: f64, under: Vec<Found<'a>>) -> Found<'a> {
+        Found::Any { weight, under }
+    }
 }
 
 /// One of the nine ways of turning a match into a number.
@@ -248,9 +340,19 @@ impl Scorer {
 
     /// What one document that matched is worth.
     ///
-    /// `want` is the payload the query carried, which only `HAMMING` reads.
+    /// `want` is the payload the query carried, which only `HAMMING` reads, and
+    /// `slop` is how far apart the query's words landed in this document, which
+    /// only the three older scorers divide by. One is the slop of a query with
+    /// nothing to measure, so a caller that does not work it out passes one.
     #[must_use]
-    pub fn of(self, facts: &Facts, doc: &Doc, found: &Found, want: Option<&[u8]>) -> f64 {
+    pub fn of(
+        self,
+        facts: &Facts,
+        doc: &Doc,
+        found: &Found<'_>,
+        want: Option<&[u8]>,
+        slop: u32,
+    ) -> f64 {
         match self {
             Scorer::Worth => doc.score,
             Scorer::Hamming => near(doc.payload.as_deref(), want),
@@ -258,8 +360,43 @@ impl Scorer {
             // document is worth. A document scored zero still scores here.
             Scorer::DisMax => self.walk(facts, doc, found),
             Scorer::Tanh => (doc.score * self.walk(facts, doc, found) / facts.tanh).tanh(),
-            _ => doc.score * self.walk(facts, doc, found),
+            _ => match self.divisor(doc, slop) {
+                // Nothing to divide by is a document with no words in it under
+                // a scorer that divides by how many it has, and it scores
+                // nothing rather than answering with an infinity.
+                divisor if divisor <= 0.0 => 0.0,
+                divisor => doc.score * self.walk(facts, doc, found) / divisor,
+            },
         }
+    }
+
+    /// What this scorer divides the whole document's worth by at the end.
+    ///
+    /// Measured, and the reason it is here rather than inside a leaf: a real
+    /// server prints every leaf undivided and divides once at the top, so the
+    /// two halves of `TFIDF` come out as `words TFIDF 9.00 / norm 3 / slop 1`
+    /// rather than as three ninths. A sum divided is the sum of the divided
+    /// parts, so the number is the same either way and only the explanation
+    /// tells them apart.
+    #[must_use]
+    pub fn divisor(self, doc: &Doc, slop: u32) -> f64 {
+        let slop = f64::from(slop.max(1));
+        match self {
+            Scorer::TfIdf => f64::from(doc.top) * slop,
+            Scorer::Length => f64::from(doc.tokens) * slop,
+            Scorer::Old => slop,
+            _ => 1.0,
+        }
+    }
+
+    /// Whether how far apart the words landed changes what this scorer says.
+    ///
+    /// Only the three that divide by it, so a caller can skip working the slop
+    /// out for the six that do not, which is most of the traffic because the
+    /// scorer nobody names is one of the six.
+    #[must_use]
+    pub fn divides(self) -> bool {
+        matches!(self, Scorer::TfIdf | Scorer::Length | Scorer::Old)
     }
 
     /// Whether this scorer has to see the whole answer before any of it is
@@ -289,43 +426,67 @@ impl Scorer {
     }
 
     /// Adds up a match, which is a sum except where `DISMAX` takes the best.
-    fn walk(self, facts: &Facts, doc: &Doc, found: &Found) -> f64 {
+    ///
+    /// What comes back is undivided, so it is the number a real server prints
+    /// after `words TFIDF` or `children BM25` rather than the document's score.
+    /// [`Scorer::of`] is the one that divides.
+    #[must_use]
+    pub fn walk(self, facts: &Facts, doc: &Doc, found: &Found<'_>) -> f64 {
         match found {
-            Found::Term(term) => self.one(facts, doc, Some(term)),
-            Found::Every => self.one(facts, doc, None),
-            // The three standard scorers count words and a filter has none, so
-            // it adds nothing to them. The rest count a match, and a filter is
-            // one, so it is worth to them what a wildcard is worth.
-            Found::Filter => match self {
+            Found::Term(term) => self.one(facts, doc, term.weight, term.freq, Some(term)),
+            Found::Every => self.one(facts, doc, 1.0, 1, None),
+            // The three standard scorers count words and there is no word in
+            // any of these, so they add nothing to them. The rest count a
+            // match, and a filter is one, so it is worth to them what a
+            // wildcard is worth and a negation is worth nothing either way.
+            Found::Blank { weight, freq } => match self {
                 Scorer::Bm25 | Scorer::Norm | Scorer::Tanh => 0.0,
-                _ => self.one(facts, doc, None),
+                _ => self.one(facts, doc, *weight, *freq, None),
             },
             // Added up from nought rather than summed, because the sum of no
             // doubles at all is negative zero and a real server never answers
             // a score with a sign on the front of it.
-            Found::All(under) => under
-                .iter()
-                .fold(0.0_f64, |sum, f| sum + self.walk(facts, doc, f)),
-            Found::Any(under) if self == Scorer::DisMax => under
-                .iter()
-                .map(|f| self.walk(facts, doc, f))
-                .fold(0.0_f64, f64::max),
-            Found::Any(under) => under
-                .iter()
-                .fold(0.0_f64, |sum, f| sum + self.walk(facts, doc, f)),
+            Found::All { weight, under } => {
+                weight
+                    * under
+                        .iter()
+                        .fold(0.0_f64, |sum, f| sum + self.walk(facts, doc, f))
+            }
+            Found::Any { weight, under } if self == Scorer::DisMax => {
+                weight
+                    * under
+                        .iter()
+                        .map(|f| self.walk(facts, doc, f))
+                        .fold(0.0_f64, f64::max)
+            }
+            Found::Any { weight, under } => {
+                weight
+                    * under
+                        .iter()
+                        .fold(0.0_f64, |sum, f| sum + self.walk(facts, doc, f))
+            }
         }
     }
 
-    /// What one term in one document is worth to this scorer.
+    /// What one leaf of a match is worth to this scorer, undivided.
     ///
-    /// No term at all is a wildcard, which is one occurrence of nothing in
-    /// particular: the frequency and the weight are one and every rarity is
-    /// one, so what is left is whatever the scorer does with the length.
-    fn one(self, facts: &Facts, doc: &Doc, term: Option<&Term>) -> f64 {
-        let freq = term.map_or(1.0, |term| f64::from(term.freq));
+    /// No term at all is a wildcard or one of the three blanks, and either way
+    /// there is no word to weigh by how rare it is, so every rarity is one and
+    /// what is left is the weight, the count and whatever the scorer does with
+    /// the length.
+    #[must_use]
+    pub fn one(
+        self,
+        facts: &Facts,
+        doc: &Doc,
+        weight: f64,
+        count: u32,
+        term: Option<&Term<'_>>,
+    ) -> f64 {
+        let freq = f64::from(count);
         let idf = || term.map_or(1.0, |term| term.idf(facts.docs));
         let bits = || term.map_or(1.0, |term| term.bits(facts.docs));
-        term.map_or(1.0, |term| term.weight)
+        weight
             * match self {
                 Scorer::Bm25 | Scorer::Norm | Scorer::Tanh => {
                     let k1 = f64::from(K1);
@@ -338,14 +499,9 @@ impl Scorer {
                     let long = f64::from(K1) * (1.0 - OLD_B + OLD_B * facts.average());
                     bits() * freq / (freq + long)
                 }
-                Scorer::TfIdf => match doc.top {
-                    0 => 0.0,
-                    top => bits() * freq / f64::from(top),
-                },
-                Scorer::Length => match doc.tokens {
-                    0 => 0.0,
-                    tokens => bits() * freq / f64::from(tokens),
-                },
+                // The two of these divide by the document rather than by the
+                // term, and [`Scorer::divisor`] is where that happens now.
+                Scorer::TfIdf | Scorer::Length => bits() * freq,
                 Scorer::DisMax => freq,
                 Scorer::Worth | Scorer::Hamming => 0.0,
             }
@@ -363,27 +519,33 @@ fn long(tokens: f64, average: f64) -> f64 {
     1.0 - B + B * tokens / average
 }
 
-/// How close two payloads are, as one over one plus the bits they differ in.
+/// How far apart two payloads are, as a length and a count of bits.
 ///
 /// Nothing without a payload on either side, nothing when the two are different
 /// lengths, and nothing once they differ in [`CLOSE`] bits or more, so this
 /// answers about payloads that are nearly the same and says nothing at all about
-/// the rest.
-fn near(payload: Option<&[u8]>, want: Option<&[u8]>) -> f64 {
-    let (Some(payload), Some(want)) = (payload, want) else {
-        return 0.0;
-    };
+/// the rest. A real server tells all three of those apart in the score and not
+/// in what it says about it, and prints the same line about a payload eight bits
+/// away as it does about one of the wrong length. That is measured.
+#[must_use]
+pub fn apart(payload: Option<&[u8]>, want: Option<&[u8]>) -> Option<(usize, u32)> {
+    let (payload, want) = (payload?, want?);
     if payload.len() != want.len() || want.is_empty() {
-        return 0.0;
+        return None;
     }
-    let mut apart = 0;
+    let mut bits = 0;
     for (a, b) in payload.iter().zip(want) {
-        apart += (a ^ b).count_ones();
-        if apart >= CLOSE {
-            return 0.0;
+        bits += (a ^ b).count_ones();
+        if bits >= CLOSE {
+            return None;
         }
     }
-    1.0 / f64::from(apart + 1)
+    Some((want.len(), bits))
+}
+
+/// How close two payloads are, as one over one plus the bits they differ in.
+fn near(payload: Option<&[u8]>, want: Option<&[u8]>) -> f64 {
+    apart(payload, want).map_or(0.0, |(_, bits)| 1.0 / f64::from(bits + 1))
 }
 
 #[cfg(test)]
@@ -415,8 +577,8 @@ mod tests {
     fn the_default_scorer_is_bm25_to_the_last_digit() {
         let facts = Facts::new(4, 10);
         let found = Found::Term(Term::new(1, 1.0, 2));
-        let short = Scorer::Bm25.of(&facts, &doc(1.0, 1, 1), &found, None);
-        let long = Scorer::Bm25.of(&facts, &doc(1.0, 7, 1), &found, None);
+        let short = Scorer::Bm25.of(&facts, &doc(1.0, 1, 1), &found, None, 1);
+        let long = Scorer::Bm25.of(&facts, &doc(1.0, 7, 1), &found, None, 1);
         same(short, 0.9186287989106708);
         same(long, 0.39919470825949166);
     }
@@ -431,11 +593,11 @@ mod tests {
         let plain = Found::Term(Term::new(1, 1.0, 2));
         let heavy = Found::Term(Term::new(3, 1.0, 2));
         same(
-            Scorer::Bm25.of(&facts, &d, &plain, None),
+            Scorer::Bm25.of(&facts, &d, &plain, None, 1),
             0.4136031928397866,
         );
         same(
-            Scorer::Bm25.of(&facts, &d, &heavy, None),
+            Scorer::Bm25.of(&facts, &d, &heavy, None, 1),
             0.6893386620374727,
         );
     }
@@ -447,7 +609,10 @@ mod tests {
         let facts = Facts::new(3, 36);
         let d = doc(1.0, 16, 3);
         let five = Found::Term(Term::new(1, 5.0, 2));
-        same(Scorer::Bm25.of(&facts, &d, &five, None), 2.0680159641989326);
+        same(
+            Scorer::Bm25.of(&facts, &d, &five, None, 1),
+            2.0680159641989326,
+        );
     }
 
     /// The older scorer ignores how long the document is, which is the point of
@@ -457,8 +622,8 @@ mod tests {
     fn the_older_scorer_does_not_care_how_long_a_document_is() {
         let facts = Facts::new(4, 10);
         let found = Found::Term(Term::new(1, 1.0, 2));
-        let short = Scorer::Old.of(&facts, &doc(1.0, 1, 1), &found, None);
-        let long = Scorer::Old.of(&facts, &doc(1.0, 7, 1), &found, None);
+        let short = Scorer::Old.of(&facts, &doc(1.0, 1, 1), &found, None, 1);
+        let long = Scorer::Old.of(&facts, &doc(1.0, 7, 1), &found, None, 1);
         same(short, 0.3225806364779916);
         same(long, 0.3225806364779916);
 
@@ -468,9 +633,12 @@ mod tests {
         let d = doc(1.0, 16, 3);
         let once = Found::Term(Term::new(1, 1.0, 2));
         let thrice = Found::Term(Term::new(3, 1.0, 2));
-        same(Scorer::Old.of(&facts, &d, &once, None), 0.11363635963398577);
         same(
-            Scorer::Old.of(&facts, &d, &thrice, None),
+            Scorer::Old.of(&facts, &d, &once, None, 1),
+            0.11363635963398577,
+        );
+        same(
+            Scorer::Old.of(&facts, &d, &thrice, None, 1),
             0.27777776980596336,
         );
     }
@@ -505,13 +673,13 @@ mod tests {
         let a = doc(1.0, 4, 3);
         let b = doc(1.0, 7, 5);
         let twice = Found::Term(Term::new(2, 1.0, 2));
-        same(Scorer::TfIdf.of(&facts, &a, &found, None), 1.0 / 3.0);
-        same(Scorer::TfIdf.of(&facts, &b, &twice, None), 0.4);
-        same(Scorer::Length.of(&facts, &a, &found, None), 0.25);
-        same(Scorer::Length.of(&facts, &b, &twice, None), 2.0 / 7.0);
+        same(Scorer::TfIdf.of(&facts, &a, &found, None, 1), 1.0 / 3.0);
+        same(Scorer::TfIdf.of(&facts, &b, &twice, None, 1), 0.4);
+        same(Scorer::Length.of(&facts, &a, &found, None, 1), 0.25);
+        same(Scorer::Length.of(&facts, &b, &twice, None, 1), 2.0 / 7.0);
         let empty = doc(1.0, 0, 0);
-        assert_eq!(Scorer::TfIdf.of(&facts, &empty, &found, None), 0.0);
-        assert_eq!(Scorer::Length.of(&facts, &empty, &found, None), 0.0);
+        assert_eq!(Scorer::TfIdf.of(&facts, &empty, &found, None, 1), 0.0);
+        assert_eq!(Scorer::Length.of(&facts, &empty, &found, None, 1), 0.0);
     }
 
     /// What the client says a document is worth multiplies every scorer except
@@ -521,29 +689,38 @@ mod tests {
     fn what_a_document_is_worth_multiplies_all_but_one() {
         let facts = Facts::new(4, 16);
         let found = Found::Term(Term::new(1, 1.0, 4));
-        let plain = Scorer::Bm25.of(&facts, &doc(1.0, 4, 1), &found, None);
+        let plain = Scorer::Bm25.of(&facts, &doc(1.0, 4, 1), &found, None, 1);
         same(plain, 0.10536051565782635);
         same(
-            Scorer::Bm25.of(&facts, &doc(2.0, 4, 1), &found, None),
+            Scorer::Bm25.of(&facts, &doc(2.0, 4, 1), &found, None, 1),
             plain * 2.0,
         );
         same(
-            Scorer::Bm25.of(&facts, &doc(0.5, 4, 1), &found, None),
+            Scorer::Bm25.of(&facts, &doc(0.5, 4, 1), &found, None, 1),
             plain * 0.5,
         );
-        assert_eq!(Scorer::Bm25.of(&facts, &doc(0.0, 4, 1), &found, None), 0.0);
+        assert_eq!(
+            Scorer::Bm25.of(&facts, &doc(0.0, 4, 1), &found, None, 1),
+            0.0
+        );
         // A half that is not quite a half, because the older scorer folds its
         // constant in single precision and this is what a real server answers.
         same(
-            Scorer::Old.of(&facts, &doc(2.0, 4, 1), &found, None),
+            Scorer::Old.of(&facts, &doc(2.0, 4, 1), &found, None, 1),
             0.49999998509883925,
         );
-        same(Scorer::TfIdf.of(&facts, &doc(2.0, 4, 1), &found, None), 2.0);
-        same(Scorer::Worth.of(&facts, &doc(2.0, 4, 1), &found, None), 2.0);
+        same(
+            Scorer::TfIdf.of(&facts, &doc(2.0, 4, 1), &found, None, 1),
+            2.0,
+        );
+        same(
+            Scorer::Worth.of(&facts, &doc(2.0, 4, 1), &found, None, 1),
+            2.0,
+        );
         // Every document is worth the same to this one whatever it was told.
         for worth in [0.0, 0.5, 1.0, 2.0] {
             same(
-                Scorer::DisMax.of(&facts, &doc(worth, 4, 1), &found, None),
+                Scorer::DisMax.of(&facts, &doc(worth, 4, 1), &found, None, 1),
                 1.0,
             );
         }
@@ -557,23 +734,26 @@ mod tests {
         let d = doc(1.0, 4, 1);
         let one = Term::new(1, 1.0, 2);
         let both = vec![Found::Term(one), Found::Term(one)];
-        let each = Scorer::Bm25.of(&facts, &d, &Found::Term(one), None);
+        let each = Scorer::Bm25.of(&facts, &d, &Found::Term(one), None, 1);
         // A term in half of four documents, in a document of average length, is
         // worth its idf and nothing more, and that idf is the log of two.
         same(each, std::f64::consts::LN_2);
         same(
-            Scorer::Bm25.of(&facts, &d, &Found::All(both.clone()), None),
+            Scorer::Bm25.of(&facts, &d, &Found::all(1.0, both.clone()), None, 1),
             each * 2.0,
         );
         same(
-            Scorer::Bm25.of(&facts, &d, &Found::Any(both.clone()), None),
+            Scorer::Bm25.of(&facts, &d, &Found::any(1.0, both.clone()), None, 1),
             each * 2.0,
         );
         same(
-            Scorer::DisMax.of(&facts, &d, &Found::All(both.clone()), None),
+            Scorer::DisMax.of(&facts, &d, &Found::all(1.0, both.clone()), None, 1),
             2.0,
         );
-        same(Scorer::DisMax.of(&facts, &d, &Found::Any(both), None), 1.0);
+        same(
+            Scorer::DisMax.of(&facts, &d, &Found::any(1.0, both), None, 1),
+            1.0,
+        );
     }
 
     /// Nothing matched is nothing, which is what a document pulled in by a
@@ -589,8 +769,14 @@ mod tests {
             Scorer::Length,
             Scorer::DisMax,
         ] {
-            assert_eq!(scorer.of(&facts, &d, &Found::All(Vec::new()), None), 0.0);
-            assert_eq!(scorer.of(&facts, &d, &Found::Any(Vec::new()), None), 0.0);
+            assert_eq!(
+                scorer.of(&facts, &d, &Found::all(1.0, Vec::new()), None, 1),
+                0.0
+            );
+            assert_eq!(
+                scorer.of(&facts, &d, &Found::any(1.0, Vec::new()), None, 1),
+                0.0
+            );
         }
     }
 
@@ -602,14 +788,17 @@ mod tests {
         let found = Found::Term(Term::new(1, 1.0, 2));
         let d = doc(1.0, 1, 1);
         same(
-            Scorer::Tanh.of(&facts, &d, &found, None),
+            Scorer::Tanh.of(&facts, &d, &found, None, 1),
             0.22570304007310169,
         );
         let two = facts.tanh(2.0);
-        same(Scorer::Tanh.of(&two, &d, &found, None), 0.42952526332812657);
+        same(
+            Scorer::Tanh.of(&two, &d, &found, None, 1),
+            0.42952526332812657,
+        );
         // What the document is worth goes in before the tangent, not after.
         same(
-            Scorer::Tanh.of(&facts, &doc(2.0, 1, 1), &found, None),
+            Scorer::Tanh.of(&facts, &doc(2.0, 1, 1), &found, None, 1),
             0.42952526332812657,
         );
     }
@@ -639,10 +828,10 @@ mod tests {
     #[test]
     fn the_payload_scorer_is_a_near_neighbour_test() {
         let facts = Facts::new(4, 16);
-        let found = Found::All(Vec::new());
+        let found = Found::all(1.0, Vec::new());
         let mut d = doc(1.0, 4, 1);
         d.payload = Some(Box::from(&b"\x00\x00"[..]));
-        let of = |want: &[u8], d: &Doc| Scorer::Hamming.of(&facts, d, &found, Some(want));
+        let of = |want: &[u8], d: &Doc| Scorer::Hamming.of(&facts, d, &found, Some(want), 1);
         same(of(b"\x00\x00", &d), 1.0);
         same(of(b"\x00\x01", &d), 0.5);
         same(of(b"\x00\x03", &d), 1.0 / 3.0);
@@ -653,7 +842,7 @@ mod tests {
         // A different length is not a distance, and neither is no payload.
         same(of(b"\x00", &d), 0.0);
         same(of(b"", &d), 0.0);
-        same(Scorer::Hamming.of(&facts, &d, &found, None), 0.0);
+        same(Scorer::Hamming.of(&facts, &d, &found, None, 1), 0.0);
         same(of(b"\x00\x00", &doc(1.0, 4, 1)), 0.0);
     }
 
@@ -689,7 +878,7 @@ mod tests {
         let d = doc(1.0, 0, 0);
         let found = Found::Term(Term::new(1, 1.0, 0));
         for scorer in [Scorer::Bm25, Scorer::Old, Scorer::TfIdf, Scorer::Length] {
-            assert!(scorer.of(&facts, &d, &found, None).is_finite());
+            assert!(scorer.of(&facts, &d, &found, None, 1).is_finite());
         }
     }
 
