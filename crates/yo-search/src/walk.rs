@@ -88,6 +88,43 @@
 //! its own to give, so `(@g:{aa|bb} alpha)=>{$slop:0}` answers nothing where
 //! `(@g:{aa} alpha)=>{$slop:0}` answers. All of that is measured on 8.10.1.
 //!
+//! # The rarest branch of an intersection goes first
+//!
+//! An intersection asks its children in order until one of them is further
+//! along, and the fewer documents the first child has the sooner that happens,
+//! so the children are sorted by how many documents they are likely to answer
+//! before any of them is asked anything. A word's guess is how many documents
+//! hold it, a union's is its branches added up, an intersection's is the
+//! smallest of its children, and a negation, an optional and a range are guessed
+//! at the whole index because that is roughly what they answer.
+//!
+//! The sort is stable, so two branches that guess the same stay in the order
+//! they were written. That is not only a speed matter: it is the order a real
+//! server explains a score in, and `fox dog` and `dog fox` both explain
+//! themselves as dog and then fox. A phrase and an intersection asked for in
+//! order are left alone, because there the order is the question.
+//!
+//! # How far apart the words landed
+//!
+//! Three of the nine scorers divide what a document is worth by how spread out
+//! the query's words are in it, and the number they divide by is measured:
+//! take the branches of the top of the query in the order above, drop the ones
+//! with no places to give, take the smallest gap between each pair left next to
+//! each other, and the answer is the whole number part of the square root of
+//! the squared gaps added up, or one if there is nothing to add up.
+//!
+//! So `w1 fox v50` over a document with `w1` first, `fox` in the middle and
+//! `v50` last comes to a hundred and eleven, which is the square root of a
+//! hundred squared plus fifty squared with the tail cut off, and that one query
+//! is what pins down both the sort and the square root at once. A tag, a range,
+//! a negation and a wildcard have no places, so they are lifted out of the chain
+//! rather than breaking it, and an optional hands over the places of whatever it
+//! found even though it stays out of a phrase check.
+//!
+//! Working it out costs a pass over the places of every top branch, so it is
+//! only done when the scorer that was asked for divides by it, which the default
+//! one does not.
+//!
 //! # What is not walked yet
 //!
 //! A geo filter and a vector query, which need fields the document reader does
@@ -105,38 +142,84 @@ use crate::tags::Tags;
 
 /// One document that answered, and the shape of how it answered.
 #[derive(Debug, Clone, PartialEq)]
-pub struct Hit {
+pub struct Hit<'a> {
     /// Which document.
     pub id: Id,
     /// What matched in it, which is what a scorer walks.
-    pub found: Found,
+    pub found: Found<'a>,
+    /// How far apart the query's words landed, which three scorers divide by.
+    ///
+    /// One unless [`spaced`] was the way in, because working it out costs a
+    /// pass over the places and most queries never look at it.
+    pub slop: u32,
+}
+
+impl<'a> Hit<'a> {
+    /// A document that answered, with nothing worked out about where.
+    fn new(id: Id, found: Found<'a>) -> Hit<'a> {
+        Hit { id, found, slop: 1 }
+    }
 }
 
 /// Every document that answers a query, in number order.
 #[must_use]
-pub fn run(held: &Held, node: &Node) -> Vec<Hit> {
-    let mut step = build(held, node, 1.0);
+pub fn run<'a>(held: &'a Held, node: &'a Node) -> Vec<Hit<'a>> {
+    gather(held, node, false)
+}
+
+/// The same, with how far apart the query's words landed worked out as well.
+#[must_use]
+pub fn spaced<'a>(held: &'a Held, node: &'a Node) -> Vec<Hit<'a>> {
+    gather(held, node, true)
+}
+
+/// Every document that answers, with the places measured or not.
+fn gather<'a>(held: &'a Held, node: &'a Node, measure: bool) -> Vec<Hit<'a>> {
+    let mut step = build(held, node);
     let mut out = Vec::new();
     let mut want = 1;
-    while let Some(hit) = step.seek(want) {
-        let Some(next) = hit.id.checked_add(1) else {
-            out.push(hit);
-            break;
-        };
-        want = next;
+    while let Some(mut hit) = step.seek(want) {
+        if measure {
+            hit.slop = step.slop(hit.id);
+        }
+        let next = hit.id.checked_add(1);
         out.push(hit);
+        match next {
+            Some(next) => want = next,
+            None => break,
+        }
     }
     out
 }
 
 /// Something that answers where the next document it matches is.
-trait Step {
+trait Step<'a> {
     /// The first document at or after this number that matches, if there is
     /// one.
     ///
     /// Asking for a number already passed gives the last answer back, so the
     /// same question may be put twice and the second time is free.
-    fn seek(&mut self, id: Id) -> Option<Hit>;
+    fn seek(&mut self, id: Id) -> Option<Hit<'a>>;
+
+    /// Roughly how many documents this will answer, for sorting on.
+    ///
+    /// A guess and not a count, and it only has to be right enough to put the
+    /// rarest branch of an intersection first. It is also the order a real
+    /// server explains a score in, so it is measured rather than tuned.
+    fn size(&self) -> u32;
+
+    /// Whether this can never answer anything, which lets a negation over it be
+    /// dropped where it stands rather than kept as a branch that always
+    /// answers and is always worth nothing.
+    fn empty(&self) -> bool {
+        false
+    }
+
+    /// Whether this answers every document and adds nothing to a score, which
+    /// is what a negation over something no document holds comes to.
+    fn always(&self) -> bool {
+        false
+    }
 
     /// The places this matched a document at, added to what is there already,
     /// and whether it takes part in a position check at all.
@@ -156,40 +239,80 @@ trait Step {
         let _ = (id, into);
         false
     }
+
+    /// How far apart this node's branches landed in a document.
+    ///
+    /// One for anything with nothing to measure, which is every leaf and every
+    /// branch whose children have no places between them.
+    fn slop(&mut self, id: Id) -> u32 {
+        let _ = id;
+        1
+    }
 }
 
 /// What one node of the tree turns into.
-fn build<'a>(held: &'a Held, node: &'a Node, weight: f64) -> Box<dyn Step + 'a> {
-    let weight = weight * node.weight.unwrap_or(1.0);
+///
+/// The node's own weight goes on whatever this makes and is not pushed down
+/// into the children, because a real server prints the weight on the branch a
+/// client hung it on and prints one on every leaf underneath.
+fn build<'a>(held: &'a Held, node: &'a Node) -> Box<dyn Step<'a> + 'a> {
+    let weight = node.weight.unwrap_or(1.0);
     let mask = mask(node.mask);
     match &node.what {
         What::Empty => Box::new(Never),
         What::Wildcard => Box::new(Every::new(&held.docs)),
         What::Term(word) => Box::new(term(held, word, mask, weight)),
-        What::Union(list) => Box::new(Any::new(under(held, list, weight), true)),
+        What::Union(list) => {
+            // A branch no document holds is dropped before the union is built,
+            // and a union left with one branch is that branch. It matters
+            // because the parser makes a union out of every word to hold the
+            // stem behind it, so `fox` arrives here as `fox` and `+fox`, the
+            // second of which is never written because the stem and the word
+            // are the same, and a real server explains the whole thing as the
+            // bare word. A union that keeps two branches keeps its wrapper
+            // even when only one of them answered this document, which is
+            // measured on `running`: `+run` alone answers `h:1` and the
+            // wrapper is still printed, because `running` itself is a word
+            // some other document has.
+            let mut under: Vec<Box<dyn Step<'a> + 'a>> = under(held, list)
+                .into_iter()
+                .filter(|child| !child.empty())
+                .collect();
+            match under.len() {
+                0 => Box::new(Never),
+                1 if weight == 1.0 => under.pop().unwrap_or_else(|| Box::new(Never)),
+                _ => Box::new(Any::new(under, true, weight)),
+            }
+        }
         What::Intersect(list) => {
-            let under = under(held, list, weight);
+            let mut under = narrowed(held, list);
             // A slop of less than nothing is no limit at all, so an intersection
             // with one and no order asked for is an ordinary intersection and
             // does not go looking for places it will not read.
             let slop = node.slop.unwrap_or(-1);
             if slop >= 0 || node.inorder {
-                Box::new(Near::new(under, slop, node.inorder))
-            } else {
-                Box::new(All::new(under))
+                return Box::new(Near::new(under, slop, node.inorder, weight));
+            }
+            // One branch is that branch and not an intersection of one, which
+            // is measured twice over: `* FILTER n 1 5` drops the wildcard and
+            // explains itself as the filter alone, and `fox -zebra` drops the
+            // negation and explains itself as the fox alone.
+            match under.len() {
+                1 if weight == 1.0 => under.pop().unwrap_or_else(|| Box::new(Never)),
+                _ => Box::new(All::new(under, weight)),
             }
         }
         // Measured: the slop and the order a client hangs on a phrase are
         // printed back and change nothing, so a phrase is a run in order
         // whatever was asked of it.
-        What::Exact(list) => Box::new(Near::new(under(held, list, weight), 0, true)),
+        What::Exact(list) => Box::new(Near::new(under(held, list), 0, true, weight)),
         What::Not(child) => Box::new(Unless {
             docs: &held.docs,
-            under: build(held, child, weight),
+            under: build(held, child),
         }),
         What::Optional(child) => Box::new(Maybe {
             docs: &held.docs,
-            under: build(held, child, weight),
+            under: build(held, child),
         }),
         What::Prefix(prefix) => {
             spread(held, expand::under(held.dictionary(), prefix), mask, weight)
@@ -234,8 +357,31 @@ fn mask(mask: crate::query::Mask) -> u32 {
 }
 
 /// Every child of a node, built.
-fn under<'a>(held: &'a Held, list: &'a [Node], weight: f64) -> Vec<Box<dyn Step + 'a>> {
-    list.iter().map(|node| build(held, node, weight)).collect()
+fn under<'a>(held: &'a Held, list: &'a [Node]) -> Vec<Box<dyn Step<'a> + 'a>> {
+    list.iter().map(|node| build(held, node)).collect()
+}
+
+/// The same, with a branch that narrows nothing left out.
+///
+/// A negation over a word no document holds answers every document and is worth
+/// nothing, so an intersection is the same query without it. Measured through
+/// the explanation, which a real server prints without the branch rather than
+/// with a branch worth zero. Dropping every branch would turn a query that
+/// answers everything into one that answers nothing, so that one case keeps a
+/// wildcard in their place.
+fn narrowed<'a>(held: &'a Held, list: &'a [Node]) -> Vec<Box<dyn Step<'a> + 'a>> {
+    let mut out: Vec<Box<dyn Step<'a> + 'a>> = Vec::with_capacity(list.len());
+    for node in list {
+        let step = build(held, node);
+        if step.always() {
+            continue;
+        }
+        out.push(step);
+    }
+    if out.is_empty() && !list.is_empty() {
+        out.push(Box::new(Every::new(&held.docs)));
+    }
+    out
 }
 
 /// One term's posting list, or nothing when no document holds it.
@@ -247,7 +393,7 @@ fn term<'a>(held: &'a Held, word: &Word, mask: u32, weight: f64) -> One<'a> {
     } else {
         &word.word
     };
-    One::new(held.posts(name), &held.docs, mask, weight)
+    One::new(held.entry(name), &held.docs, mask, weight)
 }
 
 /// A union over every term one expansion stands for, in dictionary order.
@@ -256,18 +402,25 @@ fn spread<'a>(
     found: Vec<(&'a [u8], &'a Posts)>,
     mask: u32,
     weight: f64,
-) -> Box<dyn Step + 'a> {
+) -> Box<dyn Step<'a> + 'a> {
+    // One term is that term and not a union of one, which is measured: `qu*`
+    // stands for one word and explains itself as a bare leaf, where `w1*`
+    // stands for eleven and explains itself as a union even on the document
+    // that answered only one of them.
+    if let [entry] = found[..] {
+        return Box::new(One::new(Some(entry), &held.docs, mask, weight));
+    }
     let under = found
         .into_iter()
-        .map(|(_, posts)| {
-            Box::new(One::new(Some(posts), &held.docs, mask, weight)) as Box<dyn Step + 'a>
+        .map(|entry| {
+            Box::new(One::new(Some(entry), &held.docs, mask, 1.0)) as Box<dyn Step<'a> + 'a>
         })
         .collect();
-    Box::new(Any::new(under, false))
+    Box::new(Any::new(under, false, weight))
 }
 
 /// The documents whose number in a field is inside a range.
-fn numbers(held: &Held, range: &Range) -> List {
+fn numbers<'a>(held: &'a Held, range: &Range) -> List<'a> {
     let ends = Ends {
         min: range.min,
         max: range.max,
@@ -280,12 +433,12 @@ fn numbers(held: &Held, range: &Range) -> List {
         .unwrap_or_default();
     // A range is a filter and nothing else, and what that is worth depends on
     // the scorer rather than on the range, so the shape says which it is and
-    // the scorer decides. [`Found::Filter`] has the measurement.
-    List::new(live(&held.docs, ids), Found::Filter)
+    // the scorer decides. [`Found::Blank`] has the measurement.
+    List::new(live(&held.docs, ids), Found::filter()).about(held.docs.len() as u32)
 }
 
 /// The documents whose point is inside the circle.
-fn places(held: &Held, circle: &Circle) -> List {
+fn places<'a>(held: &'a Held, circle: &Circle) -> List<'a> {
     let ids = held
         .places(&circle.field)
         .and_then(|geos| geos.circle(circle.lon, circle.lat, circle.radius, &circle.unit))
@@ -293,30 +446,44 @@ fn places(held: &Held, circle: &Circle) -> List {
     // Nothing at all for a field with no points in it, which is what a field of
     // another kind is, and the parser has already refused a unit that is not
     // one of the four rather than leaving it to answer nothing here.
-    List::new(live(&held.docs, ids), Found::Filter)
+    List::new(live(&held.docs, ids), Found::filter())
 }
 
 /// The documents a tag field's values were asked for.
-fn tagged<'a>(held: &'a Held, field: &[u8], list: &'a [Node], weight: f64) -> Box<dyn Step + 'a> {
+fn tagged<'a>(
+    held: &'a Held,
+    field: &[u8],
+    list: &'a [Node],
+    weight: f64,
+) -> Box<dyn Step<'a> + 'a> {
     let Some(tags) = held.values(field) else {
         return Box::new(Never);
     };
-    let mut under: Vec<Box<dyn Step + 'a>> = list
+    // One value is that value and not a union of one, which is measured twice:
+    // through a position check, where `(@g:{aa} alpha)=>{$slop:0}` answers and
+    // `(@g:{aa|bb} alpha)=>{$slop:0}` answers nothing because one value stays
+    // out of the check and a union takes part with no places to give, and
+    // through the explanation, where `@g:{re*}` prints a bare leaf and
+    // `@g:{red|blue}` prints a union.
+    let alone = list.len() == 1;
+    let inner = if alone { weight } else { 1.0 };
+    let mut under: Vec<Box<dyn Step<'a> + 'a>> = list
         .iter()
-        .map(|node| value(held, tags, node, weight))
+        .map(|node| value(held, tags, node, inner))
         .collect();
-    // One value is that value and not a union of one, which is measured through
-    // a position check: `(@g:{aa} alpha)=>{$slop:0}` answers where
-    // `(@g:{aa|bb} alpha)=>{$slop:0}` answers nothing, because one value stays
-    // out of the check and a union takes part in it with no places to give.
-    if under.len() == 1 {
+    if alone {
         return under.pop().unwrap_or_else(|| Box::new(Never));
     }
-    Box::new(Any::new(under, true))
+    Box::new(Any::new(under, true, weight))
 }
 
 /// One value asked of a tag field.
-fn value<'a>(held: &'a Held, tags: &'a Tags, node: &'a Node, weight: f64) -> Box<dyn Step + 'a> {
+fn value<'a>(
+    held: &'a Held,
+    tags: &'a Tags,
+    node: &'a Node,
+    weight: f64,
+) -> Box<dyn Step<'a> + 'a> {
     match &node.what {
         // A value written as several words is one value with a space in it
         // rather than several values, which is measured: an index holding the
@@ -355,11 +522,12 @@ fn value<'a>(held: &'a Held, tags: &'a Tags, node: &'a Node, weight: f64) -> Box
 }
 
 /// One value of a tag field, with the documents holding it.
-fn held_tag(held: &Held, tags: &Tags, value: &[u8], weight: f64) -> List {
-    let ids = tags.get(value);
+fn held_tag<'a>(held: &'a Held, tags: &'a Tags, value: &[u8], weight: f64) -> List<'a> {
+    let (name, ids) = tags.entry(value).unwrap_or((&[], &[]));
     // Measured: a tag that answered is scored the way a term that answered is,
-    // with one occurrence and the rarity of the value.
-    let found = Found::Term(Term::new(1, weight, ids.len() as u32));
+    // with one occurrence and the rarity of the value, and named the way the
+    // index spells it rather than the way the query wrote it.
+    let found = Found::Term(Term::new(1, weight, ids.len() as u32).about(name));
     List::new(live(&held.docs, ids.to_vec()), found)
 }
 
@@ -370,20 +538,28 @@ fn sweep<'a>(
     weight: f64,
     written: usize,
     fits: impl Fn(&[u8]) -> bool,
-) -> Box<dyn Step + 'a> {
+) -> Box<dyn Step<'a> + 'a> {
     if written < expand::SHORTEST {
         return Box::new(Never);
     }
-    let under = tags
+    let values: Vec<(&'a [u8], &'a [Id])> = tags
         .all()
         .filter(|(value, _)| fits(value))
         .take(expand::MOST)
-        .map(|(_, ids)| {
-            let found = Found::Term(Term::new(1, weight, ids.len() as u32));
-            Box::new(List::new(live(&held.docs, ids.to_vec()), found)) as Box<dyn Step + 'a>
+        .collect();
+    let alone = values.len() == 1;
+    let mut under: Vec<Box<dyn Step<'a> + 'a>> = values
+        .into_iter()
+        .map(|(name, ids)| {
+            let each = if alone { weight } else { 1.0 };
+            let found = Found::Term(Term::new(1, each, ids.len() as u32).about(name));
+            Box::new(List::new(live(&held.docs, ids.to_vec()), found)) as Box<dyn Step<'a> + 'a>
         })
         .collect();
-    Box::new(Any::new(under, false))
+    if alone {
+        return under.pop().unwrap_or_else(|| Box::new(Never));
+    }
+    Box::new(Any::new(under, false, weight))
 }
 
 /// The numbers among these that still mean something.
@@ -397,9 +573,17 @@ fn live(docs: &Docs, ids: Vec<Id>) -> Vec<Id> {
 /// node nobody walks yet answers.
 struct Never;
 
-impl Step for Never {
-    fn seek(&mut self, _: Id) -> Option<Hit> {
+impl Step<'_> for Never {
+    fn seek(&mut self, _: Id) -> Option<Hit<'static>> {
         None
+    }
+
+    fn size(&self) -> u32 {
+        0
+    }
+
+    fn empty(&self) -> bool {
+        true
     }
 }
 
@@ -407,6 +591,8 @@ impl Step for Never {
 struct One<'a> {
     /// The list, or nothing when no document holds the term.
     reader: Option<Reader<'a>>,
+    /// What the dictionary calls the term, for saying so in an explanation.
+    name: &'a [u8],
     /// The document table, for skipping numbers that stopped meaning anything.
     docs: &'a Docs,
     /// The fields the query asked for.
@@ -416,28 +602,34 @@ struct One<'a> {
     /// How many documents hold the term, which is the rarity a scorer wants.
     df: u32,
     /// The answer last given, for giving it again.
-    at: Option<Hit>,
+    at: Option<Hit<'a>>,
     /// Room for the places of one document, which a reader hands back into a
     /// buffer of its own rather than onto the end of somebody else's.
     room: Vec<u32>,
 }
 
 impl<'a> One<'a> {
-    fn new(posts: Option<&'a Posts>, docs: &'a Docs, mask: u32, weight: f64) -> One<'a> {
+    fn new(
+        entry: Option<(&'a [u8], &'a Posts)>,
+        docs: &'a Docs,
+        mask: u32,
+        weight: f64,
+    ) -> One<'a> {
         One {
-            reader: posts.map(Posts::read),
+            reader: entry.map(|(_, posts)| posts.read()),
+            name: entry.map_or(&[], |(name, _)| name),
             docs,
             mask,
             weight,
-            df: posts.map_or(0, Posts::len),
+            df: entry.map_or(0, |(_, posts)| posts.len()),
             at: None,
             room: Vec::new(),
         }
     }
 }
 
-impl Step for One<'_> {
-    fn seek(&mut self, id: Id) -> Option<Hit> {
+impl<'a> Step<'a> for One<'a> {
+    fn seek(&mut self, id: Id) -> Option<Hit<'a>> {
         if let Some(hit) = &self.at
             && hit.id >= id
         {
@@ -448,13 +640,21 @@ impl Step for One<'_> {
         loop {
             let post = reader.seek(want)?;
             if post.fields & self.mask != 0 && self.docs.get(post.id).is_some() {
-                let found = Found::Term(Term::new(post.freq, self.weight, self.df));
-                let hit = Hit { id: post.id, found };
+                let term = Term::new(post.freq, self.weight, self.df).about(self.name);
+                let hit = Hit::new(post.id, Found::Term(term));
                 self.at = Some(hit.clone());
                 return Some(hit);
             }
             want = post.id.checked_add(1)?;
         }
+    }
+
+    fn size(&self) -> u32 {
+        self.df
+    }
+
+    fn empty(&self) -> bool {
+        self.reader.is_none()
     }
 
     fn places(&mut self, id: Id, into: &mut Vec<u32>) -> bool {
@@ -470,28 +670,56 @@ impl Step for One<'_> {
 
 /// A list of numbers worked out in advance, which is what a range and a tag
 /// value come to.
-struct List {
+struct List<'a> {
     ids: Vec<Id>,
     at: usize,
-    found: Found,
+    found: Found<'a>,
+    /// How many documents this is worth guessing at when an intersection sorts
+    /// its branches, which is not always how many it actually holds.
+    guess: u32,
 }
 
-impl List {
-    fn new(ids: Vec<Id>, found: Found) -> List {
-        List { ids, at: 0, found }
+impl<'a> List<'a> {
+    fn new(ids: Vec<Id>, found: Found<'a>) -> List<'a> {
+        let guess = ids.len() as u32;
+        List {
+            ids,
+            at: 0,
+            found,
+            guess,
+        }
+    }
+
+    /// The same list, guessed at as this many documents rather than as its own
+    /// length.
+    ///
+    /// A range answers off a sorted run of values rather than off a posting
+    /// list, and a real server does not count the run before it decides where
+    /// the range goes in an intersection, it takes the whole index as the
+    /// guess. Measured: `@n:[1 5] fox` prints the fox first even though four
+    /// documents are in the range and seven hold the word, and `@n:[1 5]
+    /// @g:{red}` prints the tag first even though the range was written first.
+    fn about(mut self, guess: u32) -> List<'a> {
+        self.guess = guess;
+        self
     }
 }
 
-impl Step for List {
-    fn seek(&mut self, id: Id) -> Option<Hit> {
+impl<'a> Step<'a> for List<'a> {
+    fn seek(&mut self, id: Id) -> Option<Hit<'a>> {
         while self.at < self.ids.len() && self.ids[self.at] < id {
             self.at += 1;
         }
         let found = self.ids.get(self.at)?;
-        Some(Hit {
-            id: *found,
-            found: self.found.clone(),
-        })
+        Some(Hit::new(*found, self.found.clone()))
+    }
+
+    fn size(&self) -> u32 {
+        self.guess
+    }
+
+    fn empty(&self) -> bool {
+        self.ids.is_empty()
     }
 }
 
@@ -506,38 +734,45 @@ impl<'a> Every<'a> {
     }
 }
 
-impl Step for Every<'_> {
-    fn seek(&mut self, id: Id) -> Option<Hit> {
+impl<'a> Step<'a> for Every<'a> {
+    fn seek(&mut self, id: Id) -> Option<Hit<'a>> {
         let mut want = id.max(1);
         while want <= self.docs.last() {
             if self.docs.get(want).is_some() {
-                return Some(Hit {
-                    id: want,
-                    found: Found::Every,
-                });
+                return Some(Hit::new(want, Found::Every));
             }
             want = want.checked_add(1)?;
         }
         None
     }
+
+    fn size(&self) -> u32 {
+        self.docs.len() as u32
+    }
+
+    fn empty(&self) -> bool {
+        self.docs.is_empty()
+    }
 }
 
 /// Any of these, either adding up what answered or taking the first.
 struct Any<'a> {
-    under: Vec<Box<dyn Step + 'a>>,
+    under: Vec<Box<dyn Step<'a> + 'a>>,
     /// Whether every branch that answered counts, which a `|` does and an
     /// expansion does not.
     sum: bool,
+    /// What the query said the union as a whole is worth.
+    weight: f64,
 }
 
 impl<'a> Any<'a> {
-    fn new(under: Vec<Box<dyn Step + 'a>>, sum: bool) -> Any<'a> {
-        Any { under, sum }
+    fn new(under: Vec<Box<dyn Step<'a> + 'a>>, sum: bool, weight: f64) -> Any<'a> {
+        Any { under, sum, weight }
     }
 }
 
-impl Step for Any<'_> {
-    fn seek(&mut self, id: Id) -> Option<Hit> {
+impl<'a> Step<'a> for Any<'a> {
+    fn seek(&mut self, id: Id) -> Option<Hit<'a>> {
         let mut first: Option<Id> = None;
         for child in &mut self.under {
             if let Some(hit) = child.seek(id) {
@@ -556,12 +791,19 @@ impl Step for Any<'_> {
                 break;
             }
         }
-        let found = if self.sum {
-            Found::Any(found)
-        } else {
-            found.pop().unwrap_or_else(|| Found::All(Vec::new()))
-        };
-        Some(Hit { id, found })
+        Some(Hit::new(id, Found::any(self.weight, found)))
+    }
+
+    /// Every branch added up, which overshoots when the branches overlap and is
+    /// the guess a real server makes.
+    fn size(&self) -> u32 {
+        self.under
+            .iter()
+            .fold(0_u32, |sum, child| sum.saturating_add(child.size()))
+    }
+
+    fn empty(&self) -> bool {
+        self.under.iter().all(|child| child.empty())
     }
 
     /// Every branch that answered this document, whichever one was scored.
@@ -577,21 +819,44 @@ impl Step for Any<'_> {
         }
         true
     }
+
+    /// An expansion counts as one branch however many terms it stands for, so
+    /// there is nothing to measure between, which is measured: `w1*` reaches
+    /// eleven words of one document and still comes back with a slop of one.
+    fn slop(&mut self, id: Id) -> u32 {
+        if !self.sum {
+            return 1;
+        }
+        let mut lists = Vec::with_capacity(self.under.len());
+        for child in &mut self.under {
+            if child.seek(id).is_some_and(|hit| hit.id == id) {
+                spot(child, id, &mut lists);
+            }
+        }
+        apart(&lists)
+    }
 }
 
 /// All of these, which is what a space between two words means.
 struct All<'a> {
-    under: Vec<Box<dyn Step + 'a>>,
+    under: Vec<Box<dyn Step<'a> + 'a>>,
+    /// What the query said the intersection as a whole is worth.
+    weight: f64,
 }
 
 impl<'a> All<'a> {
-    fn new(under: Vec<Box<dyn Step + 'a>>) -> All<'a> {
-        All { under }
+    fn new(mut under: Vec<Box<dyn Step<'a> + 'a>>, weight: f64) -> All<'a> {
+        // The rarest branch first, so the leapfrog has the fewest documents to
+        // land on, and stable so that two branches that guess the same stay in
+        // the order they were written, which is the order a real server
+        // explains them in.
+        under.sort_by_key(|child| child.size());
+        All { under, weight }
     }
 }
 
-impl Step for All<'_> {
-    fn seek(&mut self, id: Id) -> Option<Hit> {
+impl<'a> Step<'a> for All<'a> {
+    fn seek(&mut self, id: Id) -> Option<Hit<'a>> {
         if self.under.is_empty() {
             return None;
         }
@@ -611,14 +876,23 @@ impl Step for All<'_> {
                 // Somebody is further along, so everybody is asked again from
                 // there, which is what makes this a leapfrog rather than a walk.
                 Some(at) => want = at,
-                None => {
-                    return Some(Hit {
-                        id: want,
-                        found: Found::All(found),
-                    });
-                }
+                None => return Some(Hit::new(want, Found::all(self.weight, found))),
             }
         }
+    }
+
+    /// The smallest branch, because nothing answers this that does not answer
+    /// every branch of it.
+    fn size(&self) -> u32 {
+        self.under
+            .iter()
+            .map(|child| child.size())
+            .min()
+            .unwrap_or(0)
+    }
+
+    fn empty(&self) -> bool {
+        self.under.is_empty() || self.under.iter().any(|child| child.empty())
     }
 
     fn places(&mut self, id: Id, into: &mut Vec<u32>) -> bool {
@@ -627,30 +901,53 @@ impl Step for All<'_> {
         }
         true
     }
+
+    fn slop(&mut self, id: Id) -> u32 {
+        let mut lists = Vec::with_capacity(self.under.len());
+        for child in &mut self.under {
+            spot(child, id, &mut lists);
+        }
+        apart(&lists)
+    }
 }
 
 /// All of these, near enough to each other, which is what a phrase is and what
 /// a slop asks for.
 struct Near<'a> {
-    under: Vec<Box<dyn Step + 'a>>,
+    under: Vec<Box<dyn Step<'a> + 'a>>,
     /// How much room there is beyond a run, where less than nothing is no limit
     /// at all and only the order is being asked for.
     slop: i64,
     /// Whether the places have to climb, which they may do without moving.
     inorder: bool,
+    /// What the query said the whole thing is worth.
+    weight: f64,
     /// Where each word that takes part was found, kept between documents so the
     /// room is taken once rather than per document.
     at: Vec<Vec<u32>>,
     /// The answer last given, for giving it again.
-    last: Option<Hit>,
+    last: Option<Hit<'a>>,
 }
 
 impl<'a> Near<'a> {
-    fn new(under: Vec<Box<dyn Step + 'a>>, slop: i64, inorder: bool) -> Near<'a> {
+    fn new(
+        mut under: Vec<Box<dyn Step<'a> + 'a>>,
+        slop: i64,
+        inorder: bool,
+        weight: f64,
+    ) -> Near<'a> {
+        // Asked for in order the order is the question, so it is left alone.
+        // Asked for in any order it is sorted the way an ordinary intersection
+        // is, which is measured: `fox dog => { $slop: 100 }` explains itself as
+        // dog and then fox.
+        if !inorder {
+            under.sort_by_key(|child| child.size());
+        }
         Near {
             under,
             slop,
             inorder,
+            weight,
             at: Vec::new(),
             last: None,
         }
@@ -674,8 +971,8 @@ impl<'a> Near<'a> {
     }
 }
 
-impl Step for Near<'_> {
-    fn seek(&mut self, id: Id) -> Option<Hit> {
+impl<'a> Step<'a> for Near<'a> {
+    fn seek(&mut self, id: Id) -> Option<Hit<'a>> {
         if let Some(hit) = &self.last
             && hit.id >= id
         {
@@ -701,10 +998,7 @@ impl Step for Near<'_> {
                 continue;
             }
             if self.close(want) {
-                let hit = Hit {
-                    id: want,
-                    found: Found::All(found),
-                };
+                let hit = Hit::new(want, Found::all(self.weight, found));
                 self.last = Some(hit.clone());
                 return Some(hit);
             }
@@ -714,12 +1008,84 @@ impl Step for Near<'_> {
         }
     }
 
+    fn size(&self) -> u32 {
+        self.under
+            .iter()
+            .map(|child| child.size())
+            .min()
+            .unwrap_or(0)
+    }
+
+    fn empty(&self) -> bool {
+        self.under.is_empty() || self.under.iter().any(|child| child.empty())
+    }
+
     fn places(&mut self, id: Id, into: &mut Vec<u32>) -> bool {
         for child in &mut self.under {
             child.places(id, into);
         }
         true
     }
+
+    fn slop(&mut self, id: Id) -> u32 {
+        let mut lists = Vec::with_capacity(self.under.len());
+        for child in &mut self.under {
+            spot(child, id, &mut lists);
+        }
+        apart(&lists)
+    }
+}
+
+/// One branch's places, sorted and with the repeats taken out, added to the
+/// chain unless the branch has none to give.
+fn spot(child: &mut Box<dyn Step<'_> + '_>, id: Id, into: &mut Vec<Vec<u32>>) {
+    let mut mine = Vec::new();
+    child.places(id, &mut mine);
+    if mine.is_empty() {
+        return;
+    }
+    mine.sort_unstable();
+    mine.dedup();
+    into.push(mine);
+}
+
+/// How far apart a chain of branches landed, as a real server counts it.
+///
+/// The smallest gap between each pair of branches next to each other, squared
+/// and added up, and the whole number part of the square root of that. Fewer
+/// than two branches with places between them is nothing to measure, and so is
+/// a chain that has every branch on the same place, and both come back as one
+/// because the answer is something three of the scorers divide by.
+fn apart(at: &[Vec<u32>]) -> u32 {
+    if at.len() < 2 {
+        return 1;
+    }
+    let mut sum = 0_u64;
+    for pair in at.windows(2) {
+        let gap = u64::from(closest(&pair[0], &pair[1]));
+        sum = sum.saturating_add(gap * gap);
+    }
+    #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
+    let root = (sum as f64).sqrt() as u32;
+    root.max(1)
+}
+
+/// The smallest gap between a place in one list and a place in the other.
+///
+/// Both lists are in order, so this is one walk up the two of them together
+/// rather than every pair.
+fn closest(a: &[u32], b: &[u32]) -> u32 {
+    let (mut i, mut j) = (0, 0);
+    let mut best = u32::MAX;
+    while i < a.len() && j < b.len() {
+        best = best.min(a[i].abs_diff(b[j]));
+        if a[i] < b[j] {
+            i += 1;
+        } else {
+            j += 1;
+        }
+    }
+    best
 }
 
 /// Whether one place can be given to each of these so that they sit close
@@ -804,49 +1170,75 @@ fn window(at: &[Vec<u32>], room: u32) -> bool {
 /// None of these, which is a walk over the documents asking each one.
 struct Unless<'a> {
     docs: &'a Docs,
-    under: Box<dyn Step + 'a>,
+    under: Box<dyn Step<'a> + 'a>,
 }
 
-impl Step for Unless<'_> {
-    fn seek(&mut self, id: Id) -> Option<Hit> {
+impl<'a> Step<'a> for Unless<'a> {
+    fn seek(&mut self, id: Id) -> Option<Hit<'a>> {
         let mut want = id.max(1);
         while want <= self.docs.last() {
             if self.docs.get(want).is_some()
                 && self.under.seek(want).is_none_or(|hit| hit.id > want)
             {
                 // Measured: a document that answered a negation and nothing else
-                // scores zero, which is what nothing having matched adds up to.
-                return Some(Hit {
-                    id: want,
-                    found: Found::All(Vec::new()),
-                });
+                // scores zero, which is a match counted no times at all.
+                return Some(Hit::new(want, Found::missing()));
             }
             want = want.checked_add(1)?;
         }
         None
+    }
+
+    /// Roughly everything, because a negation answers what it does not find and
+    /// most words are in most documents no more than a few times.
+    fn size(&self) -> u32 {
+        self.docs.len() as u32
+    }
+
+    fn always(&self) -> bool {
+        self.under.empty()
     }
 }
 
 /// This, but a document without it answers anyway.
 struct Maybe<'a> {
     docs: &'a Docs,
-    under: Box<dyn Step + 'a>,
+    under: Box<dyn Step<'a> + 'a>,
 }
 
-impl Step for Maybe<'_> {
-    fn seek(&mut self, id: Id) -> Option<Hit> {
+impl<'a> Step<'a> for Maybe<'a> {
+    fn seek(&mut self, id: Id) -> Option<Hit<'a>> {
         let mut want = id.max(1);
         while want <= self.docs.last() {
             if self.docs.get(want).is_some() {
                 let found = match self.under.seek(want) {
                     Some(hit) if hit.id == want => hit.found,
-                    _ => Found::All(Vec::new()),
+                    // Measured: a document an optional did not answer is worth
+                    // nothing, which is a match at a weight of nothing.
+                    _ => Found::skipped(),
                 };
-                return Some(Hit { id: want, found });
+                return Some(Hit::new(want, found));
             }
             want = want.checked_add(1)?;
         }
         None
+    }
+
+    fn size(&self) -> u32 {
+        self.docs.len() as u32
+    }
+
+    /// The places of whatever it found, while still saying it takes no part.
+    ///
+    /// Both halves are measured and they pull opposite ways. An optional stays
+    /// out of a position check, so `(alpha ~zulu)=>{$slop:0}` answers a document
+    /// with a word between the two, and it hands its places over to the slop, so
+    /// `w1 ~fox` comes back with the distance from the one to the other.
+    fn places(&mut self, id: Id, into: &mut Vec<u32>) -> bool {
+        if self.under.seek(id).is_some_and(|hit| hit.id == id) {
+            self.under.places(id, into);
+        }
+        false
     }
 }
 
@@ -950,7 +1342,7 @@ mod tests {
             .into_iter()
             .map(|hit| {
                 let doc = index.held.docs.get(hit.id).expect("a live document");
-                let score = Scorer::default_scorer().of(&facts, doc, &hit.found, None);
+                let score = Scorer::default_scorer().of(&facts, doc, &hit.found, None, 1);
                 (doc.key.to_vec(), score)
             })
             .collect()
@@ -1432,5 +1824,72 @@ mod tests {
             near(&index, b"((alpha|gamma) beta)=>{$slop:0}"),
             [b"u:2".to_vec()]
         );
+    }
+
+    /// The shape one query gave one document, which is what an explanation is
+    /// printed off and what the tests below are about.
+    fn shape<'a>(index: &'a Index, query: &[u8], key: &[u8]) -> Found<'a> {
+        let node = parse(query, index, &Ask::default()).expect("a query that parses");
+        let node = Box::leak(Box::new(node));
+        run(&index.held, node)
+            .into_iter()
+            .find(|hit| index.held.docs.key(hit.id) == Some(key))
+            .map(|hit| hit.found)
+            .unwrap_or_else(|| panic!("{} did not answer", String::from_utf8_lossy(query)))
+    }
+
+    /// Measured: `FT.SEARCH hz fox EXPLAINSCORE` prints the one leaf on its own
+    /// and `FT.SEARCH hz running EXPLAINSCORE` prints a branch over it, even on
+    /// a document only the stem answered. The parser gives both of them a union,
+    /// so what tells them apart is that nothing is ever written under `+fox`
+    /// because the stem and the word are the same, while `running` and `+run`
+    /// are both words some document holds.
+    #[test]
+    fn a_union_left_with_one_branch_is_that_branch() {
+        let index = indexed(&[
+            (
+                b"u:1",
+                &[(b"t".as_slice(), b"fox running".as_slice()), (b"g", b"aa")][..],
+            ),
+            (
+                b"u:2",
+                &[(b"t".as_slice(), b"fox runs".as_slice()), (b"g", b"bb")][..],
+            ),
+        ]);
+        assert!(matches!(shape(&index, b"fox", b"u:1"), Found::Term(_)));
+        assert!(matches!(
+            shape(&index, b"running", b"u:2"),
+            Found::Any { .. }
+        ));
+    }
+
+    /// Measured: `@n:[1 5] fox` explains the word first and the range second,
+    /// though four documents are in the range and seven hold the word, because
+    /// a real server guesses a range at the whole index rather than counting it.
+    #[test]
+    fn a_range_is_guessed_at_the_whole_index_when_an_intersection_sorts() {
+        let index = indexed(&[
+            (
+                b"u:1",
+                &[
+                    (b"t".as_slice(), b"fox".as_slice()),
+                    (b"g", b"aa"),
+                    (b"n", b"1"),
+                ][..],
+            ),
+            (
+                b"u:2",
+                &[
+                    (b"t".as_slice(), b"cat".as_slice()),
+                    (b"g", b"bb"),
+                    (b"n", b"2"),
+                ][..],
+            ),
+        ]);
+        let Found::All { under, .. } = shape(&index, b"@n:[1 5] fox", b"u:1") else {
+            panic!("an intersection of a range and a word");
+        };
+        assert!(matches!(under.first(), Some(Found::Term(_))));
+        assert!(matches!(under.get(1), Some(Found::Blank { .. })));
     }
 }

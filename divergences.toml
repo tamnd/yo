@@ -479,8 +479,8 @@ spec = "09 section 5"
 
 [[divergence]]
 id = "D-65"
-title = "One FT.SEARCH option is refused rather than read"
-reason = "EXPLAINSCORE prints the arithmetic behind a score as a nested array, which is a shape of its own on top of every scorer. It is read as an unknown argument here and answers the line a real server answers for a word nobody knows, so a client learns the option is not there rather than getting a reply that quietly ignored it. The twenty options that are read are read exactly, including the two that surprise everybody: RETURN counts words rather than fields, and INKEYS filters before the total is taken. GEOFILTER is one of the twenty now, and so is the same circle written inside the query, over a real geo index that agrees with the reference on fifty one cases including both sides of the date line and both poles. FT.EXPLAIN takes WITHSORTKEYS and EXPLAINSCORE and drops them the way a real server does, and it now reads the whole SUMMARIZE and HIGHLIGHT clause and drops it the same way. It does not print the IDS node an INKEYS puts in the reference's tree."
+title = "An INKEYS list is applied after the walk rather than explained inside it"
+reason = "Every FT.SEARCH option is read now, EXPLAINSCORE included, and the twenty one of them are read exactly, including the two that surprise everybody: RETURN counts words rather than fields, and INKEYS filters before the total is taken. GEOFILTER is one of them, and so is the same circle written inside the query, over a real geo index that agrees with the reference on fifty one cases including both sides of the date line and both poles. What is left of this row is one shape: a real server turns an INKEYS list into a node of the query tree and sorts it into the intersection like any other branch, so `fox INKEYS 1 h:1` explains itself as a branch over an irrelevant token and the word, and this side keeps the list beside the walk and applies it to what came back. The rows and the scores are the same either way and only the explanation tells them apart."
 status = "until"
 resolved_by = "M8"
 spec = "09 section 5"
@@ -490,14 +490,6 @@ id = "D-66"
 title = "BM25STD.TANH scores can differ from a real server in the last bit"
 reason = "The scorer is a hyperbolic tangent of the standard score over a constant, and both servers compute the same argument to the last bit. What they do with it is their platform's tanh, and the one on the reference build is not correctly rounded: for an argument of 0.06029051420422201 it answers 0.060217569339428935 where the correctly rounded double is 0.06021756933942893, which is what this answers and what an arbitrary precision evaluation of the same argument rounds to. Four of the ten documents in a comparison corpus land on an argument where the two disagree, always by one bit and never by more. The ordering of an answer is unaffected because the difference is smaller than the gap between any two documents' scores, and every other scorer agrees to the last bit."
 status = "permanent"
-spec = "09 section 5"
-
-[[divergence]]
-id = "D-67"
-title = "Two FT.AGGREGATE pipeline steps are refused rather than read"
-reason = "LOAD, GROUPBY with all twelve of its REDUCE functions, APPLY, FILTER, SORTBY with MAX and WITHCURSOR are built. EXPLAINSCORE is read as an unknown argument and answer the line a real server answers for a word nobody knows, so a client learns the step is not there rather than getting a reply that quietly dropped it. Everything either side of the pipeline is exact: the query is the same parser a search uses, an answer nothing sorted comes back in ascending document number, the properties follow the names and the order the LOAD list gave them, ADDSCORES writes a __score to twelve significant digits where WITHSCORES writes a score to seventeen, and the count at the front of the reply follows the cases that were measured over a full offset by count sweep on both protocols. EXPLAINSCORE is the last one left, and what it needs is the query executor carrying the terms behind every match through to the pipeline, which is the same machinery SUMMARIZE and HIGHLIGHT need, so it is waiting on that rather than on anything about the steps themselves."
-status = "until"
-resolved_by = "M8"
 spec = "09 section 5"
 
 [[divergence]]
@@ -597,4 +589,19 @@ id = "D-81"
 title = "The fields of a row come back in the order the schema names them"
 reason = "A real server answers the fields of a row in an order that is neither the order the key holds them in nor the order the schema names them in. An index over a TEXT, a TEXT, a NUMERIC and a TAG written to a hash in that order answers g, b, n, a on every row of every query, and a different index gives a different order again, because the order falls out of where each name landed in the lookup table the reply is built from. This side answers schema order, so the same index answers a, b, n, g. It is stable across queries and across runs on both servers, so a client reading fields by name sees no difference at all, and the only client this reaches is one reading a row by position, which no client library does. Naming a field in a SUMMARIZE FIELDS or a HIGHLIGHT FIELDS list moves it to the front on both sides, and that part is exact."
 status = "permanent"
+spec = "09 section 5"
+
+[[divergence]]
+id = "D-82"
+title = "An expansion names the first word it matched rather than the last"
+reason = "A prefix, a suffix, an infix or a fuzzy word stands for several terms, one document can hold more than one of them, and only one is scored and named in an EXPLAINSCORE tree. A real server names whichever the expansion wrote last into its own table, so %%w1%% over a document holding both m1 and m5 names m5, and this side names m1, which is the first one the dictionary walk reached. The score is identical either way, because both sides count the one branch rather than adding them up, and the rows and their order are identical too. It is the same underlying fact as D-80, where a prefix marks one of the words it stood for and which one is whatever the expansion wrote last, so a client cannot lean on either."
+status = "permanent"
+spec = "09 section 5"
+
+[[divergence]]
+id = "D-83"
+title = "A geo filter explains as one leaf rather than as a union of cells"
+reason = "A real server answers a circle by covering it with geohash cells and reading a numeric range out of each, so its EXPLAINSCORE tree has a union under the filter with one branch per cell that answered, and its guess at how many documents a circle holds is the sum over those cells, which puts a geo branch last when an intersection sorts. This side answers a circle in one lookup, so it explains as a single filter leaf and guesses at the number of documents that actually fell inside. The rows, the order and the scores are the same, which fifty one cases over a real geo index say, and only the explanation and the order of the branches inside it tell the two apart."
+status = "until"
+resolved_by = "M8"
 spec = "09 section 5"

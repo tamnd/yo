@@ -145,6 +145,12 @@ impl Held {
         self.terms.get(term)
     }
 
+    /// The same, with the name the dictionary spells the term by.
+    #[must_use]
+    pub fn entry(&self, term: &[u8]) -> Option<(&[u8], &Posts)> {
+        self.terms.entry(term)
+    }
+
     /// One field's numbers.
     #[must_use]
     pub fn numbers(&self, attribute: &[u8]) -> Option<&Nums> {
@@ -385,8 +391,13 @@ impl Index {
         }
 
         for (term, entry) in found {
-            if !entry.stem {
-                held.docs.note(id, entry.freq);
+            // A stem counts towards the largest frequency in the document and
+            // not towards its length, since it is not a word the document
+            // holds. That splits what TFIDF divides by from what BM25 corrects
+            // by, and both halves are measured.
+            match entry.stem {
+                true => held.docs.peak(id, entry.freq),
+                false => held.docs.note(id, entry.freq),
             }
             held.terms.add(&term, id, entry.freq, entry.mask, &entry.at);
         }
@@ -838,8 +849,8 @@ mod tests {
         let doc = ix.held.docs.get(1).expect("it is there");
         let (post, _) = post(&ix, b"alpha", 1);
         let found = Found::Term(Term::new(post.freq, 1.0, 2));
-        let mine = Scorer::Bm25.of(&facts, doc, &found, None);
-        let same = Scorer::Bm25.of(&Facts::new(2, 3), doc, &found, None);
+        let mine = Scorer::Bm25.of(&facts, doc, &found, None, 1);
+        let same = Scorer::Bm25.of(&Facts::new(2, 3), doc, &found, None, 1);
         assert!((mine - same).abs() < f64::EPSILON);
     }
 
@@ -879,14 +890,17 @@ mod tests {
         let asked = |id| {
             let word = post(&ix, b"dogs", id).0.freq;
             let root = post(&ix, b"+dog", id).0.freq;
-            Found::Any(vec![
-                Found::Term(Term::new(word, 1.0, 2)),
-                Found::Term(Term::new(root, 1.0, 2)),
-            ])
+            Found::any(
+                1.0,
+                vec![
+                    Found::Term(Term::new(word, 1.0, 2)),
+                    Found::Term(Term::new(root, 1.0, 2)),
+                ],
+            )
         };
         let scored = |id, scorer: Scorer| {
             let doc = ix.held.docs.get(id).expect("it is there");
-            scorer.of(&facts, doc, &asked(id), None)
+            scorer.of(&facts, doc, &asked(id), None, 1)
         };
         assert_eq!(scored(1, Scorer::Bm25), 0.263_025_532_251_525_86);
         assert_eq!(scored(2, Scorer::Bm25), 0.412_904_703_138_088_5);

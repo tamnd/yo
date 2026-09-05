@@ -87,6 +87,7 @@
 use yo_common::geo;
 use yo_common::num::parse_f64;
 use yo_common::{Result, parse_i64};
+use yo_search::explain::{Note, Why};
 use yo_search::field::{self, Algo, Coords, Kind, Tag, Text, Vector, Width};
 use yo_search::follow::Errors;
 use yo_search::index::{Definition, Source};
@@ -1657,6 +1658,9 @@ struct Rows<'a> {
     scorer: Scorer,
     /// What `HAMMING` compares each document's payload against.
     payload: Option<&'a [u8]>,
+    /// Whether an `EXPLAINSCORE` was read, which has nothing to explain unless
+    /// something asked for the scores as well.
+    explaining: bool,
     /// The room and the order the whole query is read under, which is the same
     /// thing an attribute clause hangs on one group of it.
     slop: Option<i64>,
@@ -1758,6 +1762,7 @@ impl Default for Rows<'_> {
             circles: Vec::new(),
             scorer: Scorer::default_scorer(),
             payload: None,
+            explaining: false,
             slop: None,
             inorder: false,
             sort: None,
@@ -1803,9 +1808,6 @@ struct Asked<'a> {
     /// `FT.EXPLAIN` reads the word and everything after it and then throws all
     /// of it away, the same as it does with `WITHSORTKEYS`.
     cursor: Option<Asks>,
-    /// Whether an `EXPLAINSCORE` was read, which has nothing to explain unless
-    /// something asked for the scores as well.
-    explaining: bool,
 }
 
 impl Default for Asked<'_> {
@@ -1818,7 +1820,6 @@ impl Default for Asked<'_> {
             rows: Rows::default(),
             pipe: Pipe::default(),
             cursor: None,
-            explaining: false,
         }
     }
 }
@@ -1866,15 +1867,12 @@ fn buffered(asked: &Asked<'_>) -> bool {
 
 /// The keywords `FT.EXPLAIN` takes and drops, with how many words each carries.
 ///
-/// All three are here because a real server reads them on that command and this
-/// one has nothing to do with them. Two of them are about the rows of an answer
-/// that command never sends, and the third is about a score it never works out,
-/// which is still checked for having something to explain.
-const IGNORED: &[(&[u8], usize)] = &[
-    (b"WITHSORTKEYS", 0),
-    (b"EXPLAINSCORE", 0),
-    (b"ADDSCORES", 0),
-];
+/// Both are here because a real server reads them on that command and this one
+/// has nothing to do with them, since both are about the rows of an answer it
+/// never sends. `EXPLAINSCORE` is not one of them: every command reads that
+/// word and every command refuses it without something asking for the scores,
+/// so it is read in the ordinary place and checked in the ordinary place.
+const IGNORED: &[(&[u8], usize)] = &[(b"WITHSORTKEYS", 0), (b"ADDSCORES", 0)];
 
 /// Reads the arguments after the query.
 ///
@@ -1960,7 +1958,6 @@ fn options<'a>(
                 if args.opt(at + takes).is_none() {
                     return Err(line(BAD_ARGS, word, NOT_THERE));
                 }
-                asked.explaining |= args::is(word, b"EXPLAINSCORE");
                 at += takes + 1;
                 continue;
             }
@@ -1975,7 +1972,7 @@ fn options<'a>(
     // Both of these are asked at the end because a real server asks them at the
     // end: an unknown argument anywhere in the list is answered before either,
     // and `WITHSCORES` counts for an `EXPLAINSCORE` that came before it.
-    if asked.explaining && !asked.rows.scores {
+    if asked.rows.explaining && !asked.rows.scores {
         return Err(SCORE_ALONE.as_bytes().to_vec());
     }
     if let Some((field, desc)) = asked.rows.sort {
@@ -2091,9 +2088,9 @@ fn plan<'a>(
 
 /// A step of the pipeline, or nothing when this is not one of those.
 ///
-/// `LOAD`, `GROUPBY`, `APPLY` and `FILTER` are the four built so far. The other
-/// two words that start a step fall through to the unknown argument line, which
-/// is divergence D-67.
+/// `LOAD`, `GROUPBY`, `APPLY` and `FILTER` are the four read here. `SORTBY` and
+/// `LIMIT` are steps too and are read beside the words about the search, since
+/// a search takes both of them under the same names.
 ///
 /// A step is read wherever it appears, and reading one closes the door on the
 /// words about the search itself. That is what makes `LOAD 1 @t VERBATIM` a
@@ -2240,6 +2237,13 @@ fn row<'a>(
     }
     if args::is(word, b"WITHPAYLOADS") {
         rows.payloads = true;
+        return Ok(Some(at + 1));
+    }
+    // Read here on all three commands, because all three read it. Two of them
+    // have no score to explain and answer so once the whole list has been read,
+    // rather than refusing the word where it stands.
+    if args::is(word, b"EXPLAINSCORE") {
+        rows.explaining = true;
         return Ok(Some(at + 1));
     }
     if args::is(word, b"INORDER") {
@@ -2877,6 +2881,12 @@ struct Row {
     key: Box<[u8]>,
     score: f64,
     payload: Option<Box<[u8]>>,
+    /// Why the score came out the way it did, when an `EXPLAINSCORE` asked.
+    ///
+    /// Only the rows in the window carry one, because working it out means
+    /// walking what matched a second time and writing a string per branch of
+    /// it, and a client only ever reads the rows it was sent.
+    note: Option<Note>,
     /// What the sort compared this row on, when a `SORTBY` sorted it and the
     /// document had a value there. Copied out of the index for a field the
     /// index keeps, and read off the key afterwards for a field it does not.
@@ -3325,7 +3335,14 @@ fn gather(
     whole: bool,
 ) -> (usize, Vec<Row>) {
     let facts = index.held.facts();
-    let mut found: Vec<(u32, f64)> = walk::run(&index.held, &node)
+    // How far apart the words landed is worked out only for the three scorers
+    // that divide by it, because it costs a pass over the places of every
+    // document that answered and the scorer nobody names is not one of them.
+    let walked = match rows.scorer.divides() {
+        true => walk::spaced(&index.held, &node),
+        false => walk::run(&index.held, &node),
+    };
+    let mut found: Vec<(walk::Hit<'_>, f64)> = walked
         .into_iter()
         .filter_map(|hit| {
             let doc = index.held.docs.get(hit.id)?;
@@ -3338,13 +3355,18 @@ fn gather(
             {
                 return None;
             }
-            let score = rows.scorer.of(&facts, doc, &hit.found, rows.payload);
-            Some((hit.id, score))
+            let score = rows
+                .scorer
+                .of(&facts, doc, &hit.found, rows.payload, hit.slop);
+            Some((hit, score))
         })
         .collect();
     // The one scorer that cannot finish a document at a time, because what it
     // divides by is the best score in the whole answer.
     let mut scores: Vec<f64> = found.iter().map(|(_, score)| *score).collect();
+    // Taken before the settling rather than after, because it is what the
+    // settling divides by and an explanation prints it.
+    let best = scores.iter().copied().fold(0.0_f64, f64::max);
     rows.scorer.settle(&mut scores);
     for (row, score) in found.iter_mut().zip(&scores) {
         row.1 = *score;
@@ -3374,24 +3396,24 @@ fn gather(
             let held = |id: u32| index.held.docs.get(id).and_then(|doc| doc.sorted(slot));
             found.sort_by(|a, b| {
                 let ids = match by.desc {
-                    true => b.0.cmp(&a.0),
-                    false => a.0.cmp(&b.0),
+                    true => b.0.id.cmp(&a.0.id),
+                    false => a.0.id.cmp(&b.0.id),
                 };
-                sorted::order(held(a.0), held(b.0), by.desc).then(ids)
+                sorted::order(held(a.0.id), held(b.0.id), by.desc).then(ids)
             });
         }
         // A sort that has not run yet, which is sorted once the lock has been
         // let go of. It goes back in document number order so that its ties come
         // out the same way round as the ties of a sort that ran here, since the
         // sort that runs later is stable and keeps whatever order it was handed.
-        (None, _) if later => found.sort_by_key(|(id, _)| *id),
+        (None, _) if later => found.sort_by_key(|(hit, _)| hit.id),
         (None, Order::Ranked) => found.sort_by(|a, b| {
             b.1.partial_cmp(&a.1)
                 .unwrap_or(core::cmp::Ordering::Equal)
-                .then(a.0.cmp(&b.0))
+                .then(a.0.id.cmp(&b.0.id))
         }),
-        (None, Order::Forwards) => found.sort_by_key(|(id, _)| *id),
-        (None, Order::Backwards) => found.sort_by_key(|(id, _)| core::cmp::Reverse(*id)),
+        (None, Order::Forwards) => found.sort_by_key(|(hit, _)| hit.id),
+        (None, Order::Backwards) => found.sort_by_key(|(hit, _)| core::cmp::Reverse(hit.id)),
     }
     let total = found.len();
     // A grouping step folds every document that answered and the window goes on
@@ -3401,17 +3423,19 @@ fn gather(
         true => (0, usize::MAX),
         false => (rows.offset, rows.count),
     };
+    let why = Why::new(rows.scorer, facts).about(rows.payload).over(best);
     let window = found
         .into_iter()
         .skip(offset)
         .take(count)
-        .filter_map(|(id, score)| {
-            let doc = index.held.docs.get(id)?;
+        .filter_map(|(hit, score)| {
+            let doc = index.held.docs.get(hit.id)?;
             Some(Row {
                 key: doc.key.clone(),
                 score,
                 payload: doc.payload.clone(),
                 sort: by.and_then(|by| doc.sorted(by.slot.unwrap_or_default()).cloned()),
+                note: rows.explaining.then(|| why.note(doc, &hit.found, hit.slop)),
             })
         })
         .collect();
@@ -3670,6 +3694,42 @@ fn owned(pairs: Vec<(&[u8], &[u8])>) -> Pairs {
         .collect()
 }
 
+/// A row's score, with the explanation beside it when one was asked for.
+///
+/// Measured on both protocols: the score element becomes an array of two, the
+/// score exactly as it would have gone out on its own and then the tree. It is
+/// not a third element beside the score, so a client that asked for the
+/// explanation reads the score out of a pair.
+fn worth(row: &Row, out: &mut Out) {
+    let Some(note) = &row.note else {
+        out.double(row.score);
+        return;
+    };
+    out.array(2);
+    out.double(row.score);
+    reason(note, out);
+}
+
+/// One line of an explanation and everything under it.
+///
+/// A line with nothing under it is a string, and a line with children is an
+/// array of two holding the line and the list. The list is one level of array
+/// on its own rather than the children being spread into the pair, which is
+/// what makes the whole thing readable by walking pairs.
+fn reason(note: &Note, out: &mut Out) {
+    match note {
+        Note::Line(line) => out.bulk(line.as_bytes()),
+        Note::Under(line, under) => {
+            out.array(2);
+            out.bulk(line.as_bytes());
+            out.array(under.len());
+            for note in under {
+                reason(note, out);
+            }
+        }
+    }
+}
+
 /// The rows of a search on the wire, on either protocol.
 fn found(total: usize, built: &[Built<'_>], shows: Shows, out: &mut Out) {
     if out.proto().is_resp3() {
@@ -3688,7 +3748,7 @@ fn found(total: usize, built: &[Built<'_>], shows: Shows, out: &mut Out) {
     for (row, fields) in built {
         out.bulk(&row.key);
         if shows.scores {
-            out.double(row.score);
+            worth(row, out);
         }
         if shows.payloads {
             match &row.payload {
@@ -3737,7 +3797,7 @@ fn deep(total: usize, built: &[Built<'_>], shows: Shows, out: &mut Out) {
         out.bulk(&row.key);
         if shows.scores {
             out.simple(b"score");
-            out.double(row.score);
+            worth(row, out);
         }
         if shows.payloads {
             out.simple(b"payload");
@@ -3932,6 +3992,7 @@ mod tests {
             key: Box::default(),
             score: 0.0,
             payload: None,
+            note: None,
             sort: None,
         };
         let mut built: Vec<Built<'_>> = vec![

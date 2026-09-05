@@ -154,6 +154,19 @@ impl Tags {
         self.by.get(value).map_or(&[], Vec::as_slice)
     }
 
+    /// One value as it is stored, beside the documents that hold it.
+    ///
+    /// The same lookup as [`Tags::get`] with the stored spelling handed back
+    /// alongside, which is what an explanation names the value by. A tag is
+    /// folded on the way in, so the stored spelling and the one a query wrote
+    /// are not always the same string.
+    #[must_use]
+    pub fn entry(&self, value: &[u8]) -> Option<(&[u8], &[Id])> {
+        self.by
+            .get_key_value(value)
+            .map(|(value, ids)| (value.as_slice(), ids.as_slice()))
+    }
+
     /// Every value with its documents, in byte order.
     ///
     /// Which is the order a real server dumps them in and the order `FT.TAGVALS`
