@@ -654,6 +654,13 @@ struct Waiter {
     client: u64,
     /// The slot its reply buffer is on, which is.
     conn: u32,
+    /// The thread holding that slot.
+    ///
+    /// A reply goes into a buffer the accepting thread owns, so a waiter can
+    /// only be answered by the thread it blocked on, and a list every thread
+    /// walks has to say which entries are whose. The slot number alone will not
+    /// do it: two threads number their connections from zero.
+    thread: usize,
     /// The database it was on when it blocked. A push into another database is
     /// not this client's push, even when the key has the same name.
     db: usize,
@@ -701,38 +708,33 @@ impl Waiters {
         self.list.len()
     }
 
-    /// Where the waiter at `at` has to be answered.
+    /// Copy out the waiters `thread` has to answer, oldest first.
     ///
-    /// # Panics
-    ///
-    /// If `at` is past the end, which only a caller that ignored [`Waiters::len`]
-    /// can manage.
-    #[must_use]
-    pub fn at(&self, at: usize) -> Parked {
-        let w = &self.list[at];
-        Parked {
-            conn: w.conn,
-            client: w.client,
-        }
+    /// The caller works from the copy rather than from the list, because
+    /// answering a waiter needs a connection's reply buffer and the list is
+    /// behind a lock that another thread is waiting on. It brings its own
+    /// vector, which after the first parked client is a vector it already has
+    /// the room in.
+    pub fn mine(&self, thread: usize, into: &mut Vec<Parked>) {
+        into.clear();
+        yo_alloc::allow(|| {
+            for w in self.list.iter().filter(|w| w.thread == thread) {
+                into.push(Parked {
+                    conn: w.conn,
+                    client: w.client,
+                });
+            }
+        });
+    }
+
+    /// Where a parked client sits in the list.
+    fn find(&self, client: u64) -> Option<usize> {
+        self.list.iter().position(|w| w.client == client)
     }
 
     /// The database the waiter at `at` blocked on.
-    ///
-    /// # Panics
-    ///
-    /// As [`Waiters::at`].
-    #[must_use]
-    pub fn db_of(&self, at: usize) -> usize {
+    fn db_of(&self, at: usize) -> usize {
         self.list[at].db
-    }
-
-    /// Take a waiter off the list.
-    ///
-    /// # Panics
-    ///
-    /// As [`Waiters::at`].
-    fn drop_at(&mut self, at: usize) {
-        self.list.remove(at);
     }
 
     /// Take off every waiter belonging to a client that has gone.
@@ -760,11 +762,12 @@ impl Waiters {
     ///
     /// The slot is filled in by [`Waiters::bind`] once the engine has it, so
     /// this leaves it at zero rather than pretending to know.
-    fn park(&mut self, client: u64, db: usize, deadline: Option<u64>, block: Block) {
+    fn park(&mut self, client: u64, thread: usize, db: usize, deadline: Option<u64>, block: Block) {
         yo_alloc::allow(|| {
             self.list.push(Waiter {
                 client,
                 conn: 0,
+                thread,
                 db,
                 deadline,
                 keys: block.keys,
@@ -781,10 +784,6 @@ impl Waiters {
     ///
     /// The attempt comes before the deadline, so a push that landed in the same
     /// millisecond the client gave up in serves it rather than racing it.
-    ///
-    /// # Panics
-    ///
-    /// As [`Waiters::at`].
     fn try_serve(&self, at: usize, dbs: &[Db], now: u64, out: &mut Out) -> bool {
         let w = &self.list[at];
         let mark = out.len();
@@ -836,20 +835,14 @@ impl Server {
     }
 
     /// Park a client on a command that could not be answered yet.
+    ///
+    /// Filed under the calling thread, which is the thread that will answer it,
+    /// because a command runs on the thread that read it and a reply goes back
+    /// into that thread's buffer for the connection.
     pub(super) fn park(&self, client: u64, db: usize, deadline: Option<u64>, block: Block) {
+        let thread = self.my_slot();
         let mut list = self.waiters.lock();
-        list.park(client, db, deadline, block);
-        self.note(&list);
-    }
-
-    /// Take the waiter at `at` off the list.
-    ///
-    /// # Panics
-    ///
-    /// If `at` is not a waiter.
-    pub fn drop_waiter(&self, at: usize) {
-        let mut list = self.waiters.lock();
-        list.drop_at(at);
+        list.park(client, thread, db, deadline, block);
         self.note(&list);
     }
 
@@ -874,18 +867,23 @@ impl Server {
         self.parked.store(list.len(), Relaxed);
     }
 
-    /// Try to answer the waiter at `at`, writing into the buffer the engine
-    /// found for it, and say whether it is finished with.
+    /// Try to answer a parked client, writing into the buffer the engine found
+    /// for it, and say whether it is finished with.
     ///
     /// The engine cannot reach the databases and this cannot reach the
     /// connections, so the two meet here: the caller hands in one connection's
     /// reply buffer and gets back whether to unpark the client behind it.
     ///
-    /// # Panics
-    ///
-    /// If `at` is not a waiter.
-    pub fn serve_waiter(&self, at: usize, now: u64, out: &mut Out) -> bool {
+    /// By client and not by position, because the caller let go of the list
+    /// between finding the client and asking about it, and in that gap another
+    /// thread can take one of its own waiters off and move everything behind it
+    /// up one. A client that is no longer parked answers `false`, which is the
+    /// same answer as one that is parked and has nothing waiting for it.
+    pub fn serve_waiter(&self, client: u64, now: u64, out: &mut Out) -> bool {
         let list = self.waiters.lock();
+        let Some(at) = list.find(client) else {
+            return false;
+        };
         // Serving a waiter pops an element, which makes garbage, and it happens
         // outside `execute` so nothing else has marked the database for the
         // maintenance turn.

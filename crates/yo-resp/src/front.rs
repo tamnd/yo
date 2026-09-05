@@ -254,7 +254,6 @@ pub(crate) struct Front<S> {
     /// Where a protocol error line is built before it is copied into a reply.
     scratch: Vec<u8>,
     limits: Limits,
-    next_id: u64,
     /// How much the buffers have grown or shrunk since anybody last asked.
     ///
     /// `INFO memory` reports what every connection is holding and that total
@@ -280,7 +279,6 @@ impl<S: Sink> Front<S> {
             dirty: Vec::with_capacity(16),
             scratch: Vec::with_capacity(128),
             limits: Limits::default(),
-            next_id: 1,
             moved: 0,
         }
     }
@@ -300,15 +298,17 @@ impl<S: Sink> Front<S> {
         self.limits = limits;
     }
 
-    /// Open a connection and give back its slot.
+    /// Open a connection under the given client id and give back its slot.
+    ///
+    /// The id comes from the caller because CLIENT LIST and CLIENT KILL name a
+    /// client by it across the whole server, so two fronts handing out the same
+    /// number would be two clients answering to one name. A front has no way to
+    /// reach the other fronts, so the one thing they share mints it.
     ///
     /// Reuses a closed connection's slot and its two buffers when there is one,
     /// so a server with a churning client population allocates for the high
     /// water mark and not for the total.
-    pub(crate) fn open(&mut self) -> ConnId {
-        let id = self.next_id;
-        self.next_id += 1;
-
+    pub(crate) fn open(&mut self, id: u64) -> ConnId {
         let at = match self.free.pop() {
             Some(at) => {
                 // A reused slot keeps its buffers, so what it holds is already
@@ -764,7 +764,7 @@ mod tests {
     /// point: framing is this side's work alone.
     fn front() -> (Front<Recorder>, ConnId) {
         let mut f = Front::new(Recorder::new());
-        let conn = f.open();
+        let conn = f.open(1);
         (f, conn)
     }
 
@@ -818,7 +818,7 @@ mod tests {
         let held = f.buffer_bytes();
         assert_eq!(f.close(conn), Some(1));
 
-        let next = f.open();
+        let next = f.open(2);
         assert_eq!(next, conn, "the slot comes back");
         assert_eq!(f.client(next), 2, "the client id does not");
         assert_eq!(f.buffer_bytes(), held, "and neither buffer was given up");

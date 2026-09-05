@@ -76,7 +76,7 @@ use std::sync::Arc;
 use yo_reactor::{BATCH_MAX, Engine, Reactor};
 
 use crate::dispatch::table;
-use crate::dispatch::{self, Flow, Server};
+use crate::dispatch::{self, Flow, Parked, Server};
 use crate::front::{Front, Wrote};
 use crate::proto::Limits;
 use yo_kv::Keyspace;
@@ -168,6 +168,13 @@ impl Sink for Recorder {
 pub struct Wire<S> {
     front: Front<S>,
     server: Arc<Server>,
+    /// This thread's parked clients, copied out of the shared list.
+    ///
+    /// Here rather than in `serve_waiters` so that a server with blocked
+    /// clients on it does not allocate once a batch. It is empty between
+    /// batches and it is only ever this thread's, like everything else on this
+    /// side of the engine.
+    parked: Vec<Parked>,
 }
 
 impl<S: Sink> Wire<S> {
@@ -196,6 +203,7 @@ impl<S: Sink> Wire<S> {
     pub fn over(server: Arc<Server>, sink: S) -> Wire<S> {
         Wire {
             front: Front::new(sink),
+            parked: Vec::new(),
             server,
         }
     }
@@ -251,7 +259,7 @@ impl<S: Sink> Wire<S> {
     /// Open a connection and give back its id.
     pub fn accept(&mut self) -> ConnId {
         self.server.counted().opened();
-        let at = self.front.open();
+        let at = self.front.open(self.server.next_client());
         self.note_buffers();
         at
     }
@@ -290,41 +298,46 @@ impl<S: Sink> Wire<S> {
         self.note_buffers();
     }
 
-    /// Answer everybody who can be answered, and let go of everybody whose
+    /// Answer everybody this thread can answer, and let go of everybody whose
     /// deadline has passed.
     ///
     /// The walk is over the waiter list rather than over the connections, so it
     /// costs what blocking costs and not what the server costs. Every caller
     /// checks that somebody is parked before calling, which is the load and the
     /// branch a server with nobody blocked pays.
+    ///
+    /// Only this thread's waiters, because a reply goes into a buffer this
+    /// thread owns and another thread's waiter is another thread's to answer.
+    /// The list is copied out under the lock and then let go of, so the work of
+    /// answering does not hold up a thread trying to park a client.
     fn serve_waiters(&mut self) {
         let now = self.server.now_ms();
-        let mut at = 0;
-        while at < self.server.parked() {
-            let p = self.server.waiters().at(at);
+        let mine = self.server.my_slot();
+        self.server.waiters().mine(mine, &mut self.parked);
+        for at in 0..self.parked.len() {
+            let p = self.parked[at];
             // The slot is reused and the client id is not. `release` forgets
             // waiters, so this should never fire; it is here because being
             // wrong about it writes a reply into somebody else's socket rather
             // than dropping one.
             if !self.front.answers(p.conn, p.client) {
-                self.server.drop_waiter(at);
+                self.server.forget_waiters(p.client);
                 continue;
             }
             // The front cannot reach the databases and the server cannot reach
             // the connections, so the two halves are taken apart here and the
             // one buffer this waiter needs is handed over.
             let served = {
-                let Wire { server, front } = self;
-                server.serve_waiter(at, now, front.out(p.conn))
+                let Wire { server, front, .. } = self;
+                server.serve_waiter(p.client, now, front.out(p.conn))
             };
             if served {
-                self.server.drop_waiter(at);
+                self.server.forget_waiters(p.client);
                 self.front.unpark(p.conn);
                 self.front.soil(p.conn);
-            } else {
-                at += 1;
             }
         }
+        self.parked.clear();
     }
 
     /// How many connections are open.
@@ -493,7 +506,7 @@ impl<S: Sink> Engine for Wire<S> {
         // arguments, the session and the reply buffer, the server hands over
         // the databases, and the command layer sees the two as one call.
         let flow = if self.front.start(&cmd) {
-            let Wire { front, server } = self;
+            let Wire { front, server, .. } = self;
             let (args, session, out) = front.parts(&cmd);
             let spec = table::at(cmd.spec);
             dispatch::resolved(server, session, spec, args, out)
@@ -754,6 +767,90 @@ mod tests {
         // And both threads counted into the same total, each from its own set
         // of counters, which is what the sum over the threads is for.
         assert_eq!(server.totals().connections, 2);
+    }
+
+    /// A blocked client is answered into a buffer one thread owns, so it is
+    /// that thread's to answer and nobody else's to throw away.
+    #[test]
+    fn a_waiter_belongs_to_the_thread_that_parked_it() {
+        let mut server = Server::new();
+        server.set_threads(2);
+        let first = Wire::with_server(server, Recorder::new());
+        let second = Wire::over(first.shared(), Recorder::new());
+        let server = first.shared();
+
+        let parked = std::sync::Barrier::new(2);
+        let swept = std::sync::Barrier::new(2);
+
+        std::thread::scope(|s| {
+            let (parked, swept) = (&parked, &swept);
+            s.spawn(move || {
+                let mut r = Reactor::inline(first);
+                let mut batch = Vec::new();
+                let conn = r.engine_mut().accept();
+                r.engine_mut().feed(conn, &wire(&[b"BLPOP", b"a", b"0"]));
+                pump(&mut r, &mut batch);
+                parked.wait();
+
+                // Turns with nothing on them, each of which walks a list whose
+                // one other entry belongs to the thread next door.
+                for _ in 0..50 {
+                    pump(&mut r, &mut batch);
+                }
+                swept.wait();
+                assert!(r.engine().sink().sent(conn).is_empty(), "nothing to say");
+            });
+            s.spawn(move || {
+                let mut r = Reactor::inline(second);
+                let mut batch = Vec::new();
+                let conn = r.engine_mut().accept();
+                r.engine_mut().feed(conn, &wire(&[b"BLPOP", b"b", b"0"]));
+                pump(&mut r, &mut batch);
+                parked.wait();
+                swept.wait();
+
+                // The push comes in on a second connection, because the first
+                // one is not reading anything while it waits.
+                let pusher = r.engine_mut().accept();
+                r.engine_mut().feed(pusher, &wire(&[b"RPUSH", b"b", b"v"]));
+                pump(&mut r, &mut batch);
+                assert_eq!(
+                    r.engine().sink().sent(conn),
+                    b"*2\r\n$1\r\nb\r\n$1\r\nv\r\n",
+                    "served by the thread that parked it"
+                );
+            });
+        });
+
+        assert_eq!(server.parked(), 1, "and the other one is still waiting");
+    }
+
+    /// Two fronts hand out connection slots from zero, so the number that tells
+    /// two clients apart cannot come from a front.
+    #[test]
+    fn client_ids_are_the_server_s_to_hand_out() {
+        let first = Wire::new(Recorder::new());
+        let second = Wire::over(first.shared(), Recorder::new());
+        let mut a = Reactor::inline(first);
+        let mut b = Reactor::inline(second);
+
+        let (one, two) = (a.engine_mut().accept(), b.engine_mut().accept());
+        assert_eq!(one, two, "the same slot on each front");
+
+        // HELLO answers with the connection id, which is the number CLIENT
+        // KILL and CLIENT UNPAUSE take, so two fronts agreeing on it is two
+        // clients that cannot be told apart. Protocol three so that the proto
+        // field in the same reply is not one of the ids being looked for.
+        let mut batch = Vec::new();
+        a.engine_mut().feed(one, &wire(&[b"HELLO", b"3"]));
+        b.engine_mut().feed(two, &wire(&[b"HELLO", b"3"]));
+        pump(&mut a, &mut batch);
+        pump(&mut b, &mut batch);
+
+        let first = String::from_utf8_lossy(a.engine().sink().sent(one)).into_owned();
+        let second = String::from_utf8_lossy(b.engine().sink().sent(two)).into_owned();
+        assert!(first.contains(":1\r\n"), "{first}");
+        assert!(second.contains(":2\r\n"), "{second}");
     }
 
     #[test]
