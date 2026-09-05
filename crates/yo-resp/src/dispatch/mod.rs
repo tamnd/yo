@@ -609,6 +609,14 @@ pub struct Server {
     locals: Box<[Local]>,
     /// How many entries have been handed out.
     claimed: AtomicUsize,
+    /// The next client id, which is what `CLIENT ID` answers.
+    ///
+    /// On the server and not on a front, because CLIENT LIST and CLIENT KILL
+    /// name a client by this number across the whole server, and two threads
+    /// counting on their own would hand the same number to two clients. Starts
+    /// at one so that zero is never a client, which is what makes it usable as
+    /// the id of a command that came from nowhere.
+    next_client: AtomicU64,
     /// Where `BACKUP` puts its files, and where `CONFIG GET dir` points.
     ///
     /// Absolute, and resolved once when the server is built rather than every
@@ -698,6 +706,7 @@ impl Server {
             peers: Lock::default(),
             locals: one_thread(),
             claimed: AtomicUsize::new(0),
+            next_client: AtomicU64::new(1),
             dir: working_dir(),
             backup: Lock::default(),
             sealed: AtomicBool::new(false),
@@ -755,6 +764,7 @@ impl Server {
             peers: Lock::default(),
             locals: one_thread(),
             claimed: AtomicUsize::new(0),
+            next_client: AtomicU64::new(1),
             dir: working_dir(),
             backup: Lock::default(),
             sealed: AtomicBool::new(false),
@@ -1067,14 +1077,42 @@ impl Server {
         &self.mine().stats
     }
 
+    /// The next client id, taken.
+    ///
+    /// Every accept anywhere on this server comes through here, so no two
+    /// clients share a number however many threads are accepting.
+    pub fn next_client(&self) -> u64 {
+        self.next_client.fetch_add(1, Relaxed)
+    }
+
+    /// Which set of per thread state the calling thread is on.
+    ///
+    /// The number a blocked client is filed under, so that the thread holding
+    /// that client's connection is the one that answers it. Claims a set on the
+    /// first call the same way [`Server::counted`] does, and gives back the same
+    /// number every time after.
+    pub fn my_slot(&self) -> usize {
+        self.mine_at()
+    }
+
     /// Everything the calling thread keeps to itself.
     fn mine(&self) -> &Local {
+        &self.locals[self.mine_at()]
+    }
+
+    /// The calling thread's place in `locals`, claiming one if it has none.
+    ///
+    /// Wraps round when more threads count here than the server was built for,
+    /// which shares a set between two threads and loses the odd count. That
+    /// cannot happen to the server `yodb serve` builds, because it is told how
+    /// many threads it will have before it starts any of them.
+    fn mine_at(&self) -> usize {
         let mut slot = SLOT.get();
         if slot == usize::MAX {
             slot = self.claimed.fetch_add(1, Relaxed);
             SLOT.set(slot);
         }
-        &self.locals[slot % self.locals.len()]
+        slot % self.locals.len()
     }
 
     /// Every thread's numbers added together, which is what `INFO` reports.
@@ -5037,14 +5075,14 @@ mod tests {
         // The three ways the list gets shorter, each of which has to move the
         // number with it, because a number left behind is either a walk of the
         // list that never happens or one that runs off the end of it.
-        f.server.drop_waiter(1);
+        f.server.forget_waiters(2);
         assert_eq!(f.server.parked(), f.server.waiters().len());
         f.server.forget_waiters(1);
         assert_eq!(f.server.parked(), f.server.waiters().len());
         f.run(&[b"RPUSH", b"q", b"v"]);
         let mut out = Out::new(Proto::Resp2);
-        assert!(f.server.serve_waiter(0, 0, &mut out));
-        f.server.drop_waiter(0);
+        assert!(f.server.serve_waiter(3, 0, &mut out));
+        f.server.forget_waiters(3);
         assert_eq!(f.server.parked(), 0);
         assert!(f.server.waiters().is_empty());
     }
@@ -9112,11 +9150,11 @@ mod tests {
         // rather than being handed a WRONGTYPE on a command that was accepted.
         f.run(&[b"SET", b"z", b"v"]);
         let mut out = Out::new(Proto::Resp2);
-        assert!(!f.server.serve_waiter(0, 0, &mut out));
+        assert!(!f.server.serve_waiter(7, 0, &mut out));
         assert!(out.as_slice().is_empty());
         f.run(&[b"DEL", b"z"]);
         f.run(&[b"ZADD", b"z", b"5", b"m"]);
-        assert!(f.server.serve_waiter(0, 0, &mut out));
+        assert!(f.server.serve_waiter(7, 0, &mut out));
         assert_eq!(
             core::str::from_utf8(out.as_slice()).expect("ascii"),
             "*3\r\n$1\r\nz\r\n$1\r\nm\r\n$1\r\n5\r\n"
@@ -17675,28 +17713,32 @@ mod tests {
         assert!(reply.is_empty());
 
         // Everybody parked on the stream gets the entry, because a read takes
-        // nothing away. That is the difference between this and BLPOP.
+        // nothing away. That is the difference between this and BLPOP. Two
+        // clients rather than one twice, since a client that is waiting is not
+        // reading and cannot block again.
+        f.session = Session::new(8);
         let (flow, _) = f.flow(&[b"XREAD", b"BLOCK", b"0", b"STREAMS", b"s", b"$"]);
         assert_eq!(flow, Flow::Block);
         assert_eq!(f.server.parked(), 2);
 
         f.run(&[b"XADD", b"s", b"2-1", b"a", b"2"]);
         let want = "*1\r\n*2\r\n$1\r\ns\r\n*1\r\n*2\r\n$3\r\n2-1\r\n*2\r\n$1\r\na\r\n$1\r\n2\r\n";
-        for at in 0..2 {
+        for client in [7, 8] {
             let mut out = Out::new(Proto::Resp2);
-            assert!(f.server.serve_waiter(at, 0, &mut out));
+            assert!(f.server.serve_waiter(client, 0, &mut out));
             assert_eq!(core::str::from_utf8(out.as_slice()).expect("ascii"), want);
         }
 
         // And a deadline that runs out is a null array, the same as a plain
         // XREAD that found nothing.
         f.server.forget_waiters(7);
+        f.server.forget_waiters(8);
         let (flow, _) = f.flow(&[b"XREAD", b"BLOCK", b"50", b"STREAMS", b"s", b"$"]);
         assert_eq!(flow, Flow::Block);
         let mut out = Out::new(Proto::Resp2);
-        assert!(!f.server.serve_waiter(0, 0, &mut out));
+        assert!(!f.server.serve_waiter(8, 0, &mut out));
         assert!(out.as_slice().is_empty());
-        assert!(f.server.serve_waiter(0, u64::MAX, &mut out));
+        assert!(f.server.serve_waiter(8, u64::MAX, &mut out));
         assert_eq!(
             core::str::from_utf8(out.as_slice()).expect("ascii"),
             "*-1\r\n"
@@ -17724,7 +17766,7 @@ mod tests {
 
         f.run(&[b"XGROUP", b"DESTROY", b"s", b"g"]);
         let mut out = Out::new(Proto::Resp2);
-        assert!(f.server.serve_waiter(0, 0, &mut out));
+        assert!(f.server.serve_waiter(7, 0, &mut out));
         // The ordinary sentence and not a special one about having been parked,
         // which is what a running 8.10 sends.
         assert_eq!(
@@ -19703,7 +19745,7 @@ mod tests {
         assert_eq!(f.server.parked(), 1);
         f.run(&[b"RPUSH", far, b"v"]);
         let mut out = Out::new(Proto::Resp2);
-        assert!(f.server.serve_waiter(0, 0, &mut out));
+        assert!(f.server.serve_waiter(7, 0, &mut out));
         let want = format!("*2\r\n${}\r\n{other}\r\n$1\r\nv\r\n", other.len());
         assert_eq!(core::str::from_utf8(out.as_slice()).expect("ascii"), want);
         assert_eq!(
@@ -19721,7 +19763,7 @@ mod tests {
         );
         f.run(&[b"RPUSH", q, b"w"]);
         let mut out = Out::new(Proto::Resp2);
-        assert!(f.server.serve_waiter(0, 0, &mut out));
+        assert!(f.server.serve_waiter(7, 0, &mut out));
         assert_eq!(
             core::str::from_utf8(out.as_slice()).expect("ascii"),
             "$1\r\nw\r\n"
@@ -19898,7 +19940,7 @@ mod tests {
         );
         f.run(&[b"XADD", far, b"2-1", b"b", b"2"]);
         let mut out = Out::new(Proto::Resp2);
-        assert!(f.server.serve_waiter(0, 0, &mut out));
+        assert!(f.server.serve_waiter(7, 0, &mut out));
         let want = format!(
             "*1\r\n*2\r\n${}\r\n{other}\r\n*1\r\n*2\r\n$3\r\n2-1\r\n*2\r\n$1\r\nb\r\n$1\r\n2\r\n",
             other.len()
