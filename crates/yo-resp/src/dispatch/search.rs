@@ -66,6 +66,7 @@
 use yo_common::num::parse_f64;
 use yo_common::{Result, parse_i64};
 use yo_search::field::{self, Algo, Coords, Kind, Tag, Text, Vector, Width};
+use yo_search::follow::Errors;
 use yo_search::index::{Definition, Source};
 use yo_search::query::{self, Ask, Bad, Pair};
 use yo_search::{Clash, Field, Index, Registry};
@@ -1180,10 +1181,12 @@ fn info<'a>(reg: &mut Registry, args: Args<'a>, out: &mut Out) -> Answer<'a> {
 
     // Nothing is indexed yet, so every one of these is nought rather than a
     // number this server has no way to produce. D-58 is the register entry.
-    tally(out, "num_docs", 0);
-    tally(out, "max_doc_id", 0);
-    tally(out, "num_terms", 0);
-    tally(out, "num_records", 0);
+    let docs = index.held.docs.len() as u64;
+    let records = index.held.records();
+    tally(out, "num_docs", docs);
+    tally(out, "max_doc_id", u64::from(index.held.docs.last()));
+    tally(out, "num_terms", index.held.words() as u64);
+    tally(out, "num_records", records);
     number(out, "inverted_sz_mb", 0.0);
     number(out, "vector_index_sz_mb", 0.0);
     tally(out, "total_inverted_index_blocks", 0);
@@ -1195,14 +1198,19 @@ fn info<'a>(reg: &mut Registry, args: Args<'a>, out: &mut Out) -> Answer<'a> {
     number(out, "text_overhead_sz_mb", 0.0);
     number(out, "total_index_memory_sz_mb", 0.0);
     number(out, "geoshapes_sz_mb", 0.0);
-    // Four averages over the document count, which is nought, so all four are a
-    // division by nought. A real server answers `nan` here for the same reason
-    // and not as a placeholder.
-    number(out, "records_per_doc_avg", f64::NAN);
+    // Four averages, and the three after the first are over byte counts this
+    // build does not keep yet. All four are a division by nought on an empty
+    // index, and a real server answers `nan` there for the same reason rather
+    // than as a placeholder.
+    number(out, "records_per_doc_avg", records as f64 / docs as f64);
     number(out, "bytes_per_record_avg", f64::NAN);
     number(out, "offsets_per_term_avg", f64::NAN);
     number(out, "offset_bits_per_record_avg", f64::NAN);
-    tally(out, "hash_indexing_failures", 0);
+    tally(
+        out,
+        "hash_indexing_failures",
+        index.trouble.whole().failures(),
+    );
     number(out, "total_indexing_time", 0.0);
     tally(out, "indexing", 0);
     number(out, "percent_indexed", 1.0);
@@ -1248,18 +1256,14 @@ fn info<'a>(reg: &mut Registry, args: Args<'a>, out: &mut Out) -> Answer<'a> {
 
     out.simple(b"Index Errors");
     out.map(4);
-    tally(out, "indexing failures", 0);
-    out.simple(b"last indexing error");
-    out.simple(b"N/A");
-    out.simple(b"last indexing error key");
-    out.bulk(b"N/A");
+    errors(out, index.trouble.whole());
     out.simple(b"background indexing status");
     out.simple(b"OK");
 
     out.simple(b"field statistics");
     out.array(index.schema.len());
     for f in &index.schema {
-        statistics(out, f);
+        statistics(out, f, index.trouble.field(&f.attribute));
     }
     Ok(())
 }
@@ -1384,23 +1388,32 @@ fn attribute(out: &mut Out, f: &Field) {
     }
 }
 
-/// One field's own error counters, which are all nought until something is
-/// indexed into it.
+/// The three lines an error block starts with, which are the same for the index
+/// and for each of its fields.
+///
+/// The sentence is a simple string and the key is a bulk, which is not a
+/// consistent pair and is what a real server writes, `N/A` included.
+fn errors(out: &mut Out, e: &Errors) {
+    tally(out, "indexing failures", e.failures());
+    out.simple(b"last indexing error");
+    out.simple(e.sentence());
+    out.simple(b"last indexing error key");
+    out.bulk(e.about());
+}
+
+/// One field's own error counters, which are all nought until a key it could
+/// not read has been written.
 ///
 /// A vector field carries four more than the rest, and they are the four a
 /// client watching an index fill up would read.
-fn statistics(out: &mut Out, f: &Field) {
+fn statistics(out: &mut Out, f: &Field, e: &Errors) {
     let vector = matches!(f.kind, Kind::Vector(_));
     out.map(3 + if vector { 4 } else { 0 });
     pair(out, "identifier", &f.identifier);
     pair(out, "attribute", &f.attribute);
     out.simple(b"Index Errors");
     out.map(3);
-    tally(out, "indexing failures", 0);
-    out.simple(b"last indexing error");
-    out.simple(b"N/A");
-    out.simple(b"last indexing error key");
-    out.bulk(b"N/A");
+    errors(out, e);
     if vector {
         tally(out, "memory", 0);
         tally(out, "marked_deleted", 0);

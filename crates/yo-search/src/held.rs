@@ -64,7 +64,7 @@ use crate::english::English;
 use crate::field::Kind;
 use crate::index::Index;
 use crate::nums::Nums;
-use crate::posts::{Id, Posts, adds, stemmed};
+use crate::posts::{Id, Posts, Terms, adds, stemmed};
 use crate::score::Facts;
 use crate::tags::Tags;
 use crate::words::{Words, stem};
@@ -107,7 +107,7 @@ pub struct Held {
     /// The documents, by number and by key.
     pub docs: Docs,
     /// Every term in the index and the documents that hold it.
-    terms: BTreeMap<Box<[u8]>, Posts>,
+    terms: Terms,
     /// Every `NUMERIC` field's values, by the name a query calls the field.
     nums: BTreeMap<Box<[u8]>, Nums>,
     /// Every `TAG` field's values, by the name a query calls the field.
@@ -123,7 +123,13 @@ impl Held {
 
     /// Every term, in byte order, which is the order a dump answers in.
     pub fn terms(&self) -> impl Iterator<Item = &[u8]> {
-        self.terms.keys().map(|term| &**term)
+        self.terms.all()
+    }
+
+    /// The whole term dictionary, for a walk that needs the lists as well.
+    #[must_use]
+    pub const fn dictionary(&self) -> &Terms {
+        &self.terms
     }
 
     /// The documents a term is in, or `None` when no document has it.
@@ -160,10 +166,40 @@ impl Held {
         Facts::new(self.docs.len() as u32, self.docs.tokens())
     }
 
+    /// How many terms there are, stems counted apart from their words.
+    ///
+    /// The `num_terms` a real server reports, which counts the whole
+    /// dictionary and so counts `dogs` and `+dog` as two.
+    #[must_use]
+    pub fn words(&self) -> usize {
+        self.terms.len()
+    }
+
+    /// How many entries all three kinds of index hold between them.
+    ///
+    /// The `num_records` a real server reports. It is not the number of terms
+    /// and it is not the number of documents, it is every place any of the
+    /// three says a document has something: one per document per term, one per
+    /// number, and one per tag value. Measured, because a hash with one text
+    /// field, one number and a two value tag answers four the first time it is
+    /// written and the arithmetic only works if all three are counted.
+    #[must_use]
+    pub fn records(&self) -> u64 {
+        let terms: u64 = self
+            .terms
+            .all()
+            .filter_map(|term| self.posts(term))
+            .map(|posts| u64::from(posts.len()))
+            .sum();
+        let nums: u64 = self.nums.values().map(|n| n.len() as u64).sum();
+        let tags: u64 = self.tags.values().map(|t| t.entries() as u64).sum();
+        terms + nums + tags
+    }
+
     /// Throws everything away, which is what dropping the index does.
     pub fn clear(&mut self) {
         self.docs = Docs::new();
-        self.terms.clear();
+        self.terms = Terms::new();
         self.nums.clear();
         self.tags.clear();
     }
@@ -308,10 +344,7 @@ impl Index {
             if !entry.stem {
                 held.docs.note(id, entry.freq);
             }
-            held.terms
-                .entry(term)
-                .or_default()
-                .push(id, entry.freq, entry.mask, &entry.at);
+            held.terms.add(&term, id, entry.freq, entry.mask, &entry.at);
         }
         Ok(id)
     }
