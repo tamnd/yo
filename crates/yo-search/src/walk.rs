@@ -277,10 +277,10 @@ fn numbers(held: &Held, range: &Range) -> List {
         .numbers(&range.field)
         .map(|nums| nums.range(ends))
         .unwrap_or_default();
-    // A range is a filter and nothing else: a real server scores a document that
-    // answered one and nothing else at zero, which is what an empty match adds
-    // up to.
-    List::new(live(&held.docs, ids), Found::All(Vec::new()))
+    // A range is a filter and nothing else, and what that is worth depends on
+    // the scorer rather than on the range, so the shape says which it is and
+    // the scorer decides. [`Found::Filter`] has the measurement.
+    List::new(live(&held.docs, ids), Found::Filter)
 }
 
 /// The documents a tag field's values were asked for.

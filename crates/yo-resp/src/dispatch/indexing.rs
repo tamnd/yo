@@ -241,7 +241,7 @@ fn renamed(server: &Server, from: &[u8], to: &[u8]) {
 /// hash of forty fields is two allocations and not eighty. The fields and the
 /// values alternate, the way they arrived.
 #[derive(Debug, Default)]
-struct Document {
+pub(super) struct Document {
     /// Every field name and value, one after another.
     bytes: Vec<u8>,
     /// Where each of them ends.
@@ -264,7 +264,7 @@ impl Document {
     }
 
     /// The pairs, in the order they were added.
-    fn pairs(&self) -> Vec<(&[u8], &[u8])> {
+    pub(super) fn pairs(&self) -> Vec<(&[u8], &[u8])> {
         let mut at = 0;
         let mut out = Vec::with_capacity(self.ends.len() / 2);
         let mut parts = self.ends.iter().map(|&end| {
@@ -285,7 +285,7 @@ impl Document {
 /// past a string sitting under its prefix without a word and without counting a
 /// failure, which is measured against a real server and is the opposite of the
 /// obvious guess.
-fn read(db: &Db, key: &[u8]) -> Option<Document> {
+pub(super) fn read(db: &Db, key: &[u8]) -> Option<Document> {
     let mut doc = Document::default();
     let mut held = db.hold(key);
     let found = held.hgetall(key, |field, value| {

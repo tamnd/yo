@@ -170,6 +170,14 @@ pub enum Found {
     /// come back as two different scores and both agree to the last digit with
     /// the same sum with the rarity taken out.
     Every,
+    /// The document answered a filter, which is a match with no word in it.
+    ///
+    /// A numeric range is the one of these there is so far. The three standard
+    /// scorers give it nothing and the four older ones give it what a wildcard
+    /// gets, which is not a rule anybody would guess and is measured: under
+    /// `TFIDF` the query `alpha @n:[1 2]` scores every document exactly twice
+    /// what `alpha` scores it, and under `BM25STD` it scores it the same.
+    Filter,
 }
 
 /// One of the nine ways of turning a match into a number.
@@ -278,12 +286,26 @@ impl Scorer {
         match found {
             Found::Term(term) => self.one(facts, doc, Some(term)),
             Found::Every => self.one(facts, doc, None),
-            Found::All(under) => under.iter().map(|f| self.walk(facts, doc, f)).sum(),
+            // The three standard scorers count words and a filter has none, so
+            // it adds nothing to them. The rest count a match, and a filter is
+            // one, so it is worth to them what a wildcard is worth.
+            Found::Filter => match self {
+                Scorer::Bm25 | Scorer::Norm | Scorer::Tanh => 0.0,
+                _ => self.one(facts, doc, None),
+            },
+            // Added up from nought rather than summed, because the sum of no
+            // doubles at all is negative zero and a real server never answers
+            // a score with a sign on the front of it.
+            Found::All(under) => under
+                .iter()
+                .fold(0.0_f64, |sum, f| sum + self.walk(facts, doc, f)),
             Found::Any(under) if self == Scorer::DisMax => under
                 .iter()
                 .map(|f| self.walk(facts, doc, f))
                 .fold(0.0_f64, f64::max),
-            Found::Any(under) => under.iter().map(|f| self.walk(facts, doc, f)).sum(),
+            Found::Any(under) => under
+                .iter()
+                .fold(0.0_f64, |sum, f| sum + self.walk(facts, doc, f)),
         }
     }
 

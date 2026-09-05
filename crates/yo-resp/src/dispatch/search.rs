@@ -1,9 +1,10 @@
 //! The search index commands, on the wire (`09` section 5).
 //!
-//! Sixteen of them, and all sixteen are about the index itself rather than
-//! about what is in it: making one, changing its schema, taking it away,
-//! describing it, listing them and naming them. `FT.SEARCH` and everything that
-//! reads documents comes after this, on top of the same [`Registry`].
+//! Sixteen of them are about the index itself rather than about what is in it:
+//! making one, changing its schema, taking it away, describing it, listing them
+//! and naming them. Two more print the tree a query parses into. The nineteenth
+//! is `FT.SEARCH`, which is the only one that reads documents and so the only
+//! one that has to reach the keyspace as well as the registry.
 //!
 //! # There is no key here
 //!
@@ -62,17 +63,41 @@
 //! rather than as an invented number. The four averages are `nan`, which is
 //! what a real server answers for an index with no documents in it too, because
 //! all four are a division by the document count. D-58 has the whole list.
+//!
+//! # `FT.SEARCH` runs in two halves
+//!
+//! Every other command here begins and ends inside the registry lock. This one
+//! cannot, because the rows it answers with carry the fields of the keys they
+//! came from and reading a key takes a stripe. Holding both locks at once is
+//! how a deadlock gets built, and [`indexing`](super::indexing) says so at
+//! length, so the command is split. The first half takes the registry, parses
+//! the query against the schema, walks it, scores what it found, sorts it and
+//! cuts the window the client asked for. What comes out of that is a list of
+//! keys and their scores and nothing borrowed from the index. The lock goes,
+//! and the second half reads those keys out of the keyspace and writes the
+//! reply.
+//!
+//! A key in the window that will not read is dropped from the reply and taken
+//! off the total, which is measured rather than chosen: a document written on
+//! database one is indexed and comes back under `NOCONTENT`, and the same
+//! search without `NOCONTENT` answers a smaller total with that row missing. So
+//! the total a client sees is how many rows the window could actually build,
+//! which is why the loading happens before the first byte goes out.
 
 use yo_common::num::parse_f64;
 use yo_common::{Result, parse_i64};
 use yo_search::field::{self, Algo, Coords, Kind, Tag, Text, Vector, Width};
 use yo_search::follow::Errors;
 use yo_search::index::{Definition, Source};
-use yo_search::query::{self, Ask, Bad, Pair};
+use yo_search::query::{self, Ask, Bad, Mask, Node, Pair, Range, What};
+use yo_search::score::Scorer;
+use yo_search::walk;
 use yo_search::{Clash, Field, Index, Registry};
 use yo_shape::Metric;
 
+use super::Server;
 use super::args::{self, Args};
+use super::indexing;
 use super::table::Spec;
 use crate::reply::Out;
 
@@ -1474,55 +1499,131 @@ const ODD_PARAMS: &str = "SEARCH_ADD_ARGS Parameters must be specified in PARAM 
 const NOT_MAIN: &str = "` at position ";
 const NOT_MAIN_END: &str = " for <main>";
 
-/// What a client asked for beside the query, and where the reading of it stops.
+/// The most rows one `FT.SEARCH` will hand back.
+const MOST: i64 = 1_000_000;
+
+const LIMIT_TWO: &str = "SEARCH_PARSE_ARGS LIMIT requires two arguments";
+const LIMIT_NUMBERS: &str = "SEARCH_PARSE_ARGS LIMIT needs two numeric arguments";
+const LIMIT_OVER: &str = "SEARCH_LIMIT_OVER LIMIT exceeds maximum of 1000000";
+const TIMEOUT_ARG: &str = "SEARCH_PARSE_ARGS Need argument for TIMEOUT";
+const TIMEOUT_NUMBER: &str = "SEARCH_PARSE_ARGS TIMEOUT requires a non negative integer";
+const NO_SCORER: &str = "SEARCH_QUERY_BAD No such scorer ";
+const NO_LANGUAGE: &str = "SEARCH_QUERY_BAD No such language";
+const LOW_RANGE: &str = "SEARCH_PARSE_ARGS Bad lower range: ";
+const HIGH_RANGE: &str = "SEARCH_PARSE_ARGS Bad upper range: ";
+const BACKWARDS: &str = "SEARCH_SYNTAX Invalid numeric range (min > max): @";
+const FILTER_THREE: &str = "SEARCH_PARSE_ARGS FILTER requires 3 arguments";
+const NEED_NAME: &str = "SEARCH_PARSE_ARGS RETURN path AS name - must be accompanied with NAME";
+
+/// What a client asked for about the rows, which only `FT.SEARCH` acts on.
 ///
-/// `FT.EXPLAIN` shares its argument list with `FT.SEARCH`, so most of what can
-/// appear here is about a result set that this command never produces. The ones
-/// that change the tree are taken and the ones that change the rows are taken
-/// and dropped, which is what a real server does with them too when all it is
-/// being asked for is the tree.
-struct Asked {
+/// `FT.EXPLAIN` reads the same list and throws this half of it away. It still
+/// has to read it, because a real server refuses `LIMIT 0 -1` and
+/// `SCORER NOPE` on either command: the argument list is checked once and what
+/// happens to the result set afterwards is a separate question.
+struct Rows<'a> {
+    /// Whether the fields of each key come back, which `NOCONTENT` turns off
+    /// and nothing turns back on. `RETURN 0` leaves this alone and empties the
+    /// list instead, which is why the two are not one flag: a `RETURN 0` with
+    /// another `RETURN` after it answers with fields and a `NOCONTENT` with a
+    /// `RETURN` after it does not.
+    content: bool,
+    scores: bool,
+    payloads: bool,
+    /// Where the window starts and how wide it is, which is `LIMIT 0 10` when
+    /// nobody said.
+    offset: usize,
+    count: usize,
+    /// The fields to send back and the names to send them under, or everything
+    /// the key holds when nobody named any.
+    ret: Option<Vec<(&'a [u8], &'a [u8])>>,
+    /// The text fields the query is narrowed to, or every field.
+    infields: Option<Vec<&'a [u8]>>,
+    /// The only keys that may answer, when the client listed them.
+    inkeys: Option<Vec<&'a [u8]>>,
+    /// The numeric ranges hung on the query from outside it.
+    filters: Vec<(&'a [u8], f64, f64)>,
+    scorer: Scorer,
+    /// What `HAMMING` compares each document's payload against.
+    payload: Option<&'a [u8]>,
+    /// The room and the order the whole query is read under, which is the same
+    /// thing an attribute clause hangs on one group of it.
+    slop: Option<i64>,
+    inorder: bool,
+}
+
+impl Rows<'_> {
+    /// Whether a row carries a field array at all, which `NOCONTENT` and a
+    /// `RETURN` of nothing both take away.
+    fn loading(&self) -> bool {
+        self.content && !self.ret.as_ref().is_some_and(Vec::is_empty)
+    }
+}
+
+impl Default for Rows<'_> {
+    fn default() -> Rows<'static> {
+        Rows {
+            content: true,
+            scores: false,
+            payloads: false,
+            offset: 0,
+            count: 10,
+            ret: None,
+            infields: None,
+            inkeys: None,
+            filters: Vec::new(),
+            scorer: Scorer::default_scorer(),
+            payload: None,
+            slop: None,
+            inorder: false,
+        }
+    }
+}
+
+/// What a client asked for beside the query, and where the reading of it stops.
+struct Asked<'a> {
     dialect: u8,
     params: Vec<Pair>,
     verbatim: bool,
     stopwords: bool,
+    rows: Rows<'a>,
 }
 
-impl Default for Asked {
-    fn default() -> Asked {
+impl Default for Asked<'_> {
+    fn default() -> Asked<'static> {
         Asked {
             dialect: 1,
             params: Vec::new(),
             verbatim: false,
             stopwords: true,
+            rows: Rows::default(),
         }
     }
 }
 
-/// The keywords that mean something to a result set and nothing to a tree,
-/// with how many words each one carries.
-const IGNORED: &[(&[u8], usize)] = &[
-    (b"NOCONTENT", 0),
-    (b"WITHSCORES", 0),
-    (b"WITHPAYLOADS", 0),
-    (b"WITHSORTKEYS", 0),
-    (b"EXPLAINSCORE", 0),
-    (b"LIMIT", 2),
-    (b"TIMEOUT", 1),
-    (b"SLOP", 1),
-    (b"INORDER", 0),
-    (b"LANGUAGE", 1),
-    (b"EXPANDER", 1),
-    (b"SCORER", 1),
-    (b"PAYLOAD", 1),
-];
+/// The keywords `FT.EXPLAIN` takes and drops, with how many words each carries.
+///
+/// Three of them, and all three are here because a real server reads them on
+/// that command and this one has nothing to do with them. `FILTER` takes one
+/// word rather than three, which is not a guess: `FT.EXPLAIN i q FILTER n 1 2`
+/// is refused for an unknown argument `1` at position 3, so the command that
+/// prints a tree got as far as the field name and stopped.
+const IGNORED: &[(&[u8], usize)] = &[(b"WITHSORTKEYS", 0), (b"EXPLAINSCORE", 0), (b"FILTER", 1)];
 
 /// Reads the arguments after the query.
+///
+/// `main` is whether this is `FT.SEARCH`, which decides the two places the two
+/// commands really do read the same words differently and nothing else.
 ///
 /// The error text carries a position, which is why this hands back bytes rather
 /// than a `Fail`: every other error line in this module is three static pieces
 /// around a word the client sent, and this one has a number in it.
-fn options(args: Args<'_>, from: usize) -> core::result::Result<Asked, Vec<u8>> {
+fn options<'a>(
+    args: Args<'a>,
+    from: usize,
+    main: bool,
+    index: &Index,
+) -> core::result::Result<Asked<'a>, Vec<u8>> {
     let mut asked = Asked::default();
     let mut at = from;
     while at < args.len() {
@@ -1553,7 +1654,11 @@ fn options(args: Args<'_>, from: usize) -> core::result::Result<Asked, Vec<u8>> 
             at += 1;
             continue;
         }
-        if let Some((_, takes)) = IGNORED.iter().find(|(k, _)| args::is(word, k)) {
+        if let Some(next) = row(args, at, &mut asked.rows, main, index)? {
+            at = next;
+            continue;
+        }
+        if !main && let Some((_, takes)) = IGNORED.iter().find(|(k, _)| args::is(word, k)) {
             if args.opt(at + takes).is_none() {
                 return Err(line(BAD_ARGS, word, NOT_THERE));
             }
@@ -1565,8 +1670,279 @@ fn options(args: Args<'_>, from: usize) -> core::result::Result<Asked, Vec<u8>> 
     Ok(asked)
 }
 
+/// One argument about the rows, or nothing when this is not one of those.
+///
+/// Everything in here is read by both commands and acted on by one of them, so
+/// a search that a client pastes in front of `FT.EXPLAIN` is refused in the
+/// same place for the same reason as the search itself.
+fn row<'a>(
+    args: Args<'a>,
+    at: usize,
+    rows: &mut Rows<'a>,
+    main: bool,
+    index: &Index,
+) -> core::result::Result<Option<usize>, Vec<u8>> {
+    let word = args.get(at);
+    if args::is(word, b"NOCONTENT") {
+        rows.content = false;
+        return Ok(Some(at + 1));
+    }
+    if args::is(word, b"WITHSCORES") {
+        rows.scores = true;
+        return Ok(Some(at + 1));
+    }
+    if args::is(word, b"WITHPAYLOADS") {
+        rows.payloads = true;
+        return Ok(Some(at + 1));
+    }
+    if args::is(word, b"INORDER") {
+        rows.inorder = true;
+        return Ok(Some(at + 1));
+    }
+    if args::is(word, b"LIMIT") {
+        let (Some(offset), Some(count)) = (args.opt(at + 1), args.opt(at + 2)) else {
+            return Err(LIMIT_TWO.as_bytes().to_vec());
+        };
+        let (Some(offset), Some(count)) = (counted(offset), counted(count)) else {
+            return Err(LIMIT_NUMBERS.as_bytes().to_vec());
+        };
+        // The cap is on the width of the window and not on where it starts, so
+        // `LIMIT 999999 1000000` is a query a real server takes and
+        // `LIMIT 0 1000001` is one it refuses.
+        if count > MOST {
+            return Err(LIMIT_OVER.as_bytes().to_vec());
+        }
+        rows.offset = usize::try_from(offset).unwrap_or(0);
+        rows.count = usize::try_from(count).unwrap_or(0);
+        return Ok(Some(at + 3));
+    }
+    if args::is(word, b"TIMEOUT") {
+        let Some(value) = args.opt(at + 1) else {
+            return Err(TIMEOUT_ARG.as_bytes().to_vec());
+        };
+        if counted(value).is_none() {
+            return Err(TIMEOUT_NUMBER.as_bytes().to_vec());
+        }
+        // Nothing here runs long enough to time out, and a deadline that is
+        // never reached is the same as no deadline, so the number is checked
+        // and dropped.
+        return Ok(Some(at + 2));
+    }
+    if args::is(word, b"SLOP") {
+        let Some(value) = args.opt(at + 1) else {
+            return Err(line(BAD_ARGS, word, NOT_THERE));
+        };
+        let Some(slop) = parse_i64(value) else {
+            return Err(line(BAD_ARGS, word, NOT_A_NUMBER));
+        };
+        rows.slop = Some(slop);
+        return Ok(Some(at + 2));
+    }
+    if args::is(word, b"SCORER") {
+        let Some(name) = args.opt(at + 1) else {
+            return Err(line(BAD_ARGS, word, NOT_THERE));
+        };
+        let Some(scorer) = Scorer::named(name) else {
+            return Err(line(NO_SCORER, name, ""));
+        };
+        rows.scorer = scorer;
+        return Ok(Some(at + 2));
+    }
+    if args::is(word, b"LANGUAGE") {
+        let Some(name) = args.opt(at + 1) else {
+            return Err(line(BAD_ARGS, word, NOT_THERE));
+        };
+        if !LANGUAGES.iter().any(|known| args::is(name, known)) {
+            return Err(NO_LANGUAGE.as_bytes().to_vec());
+        }
+        // The index was built in one language and the words in it were stemmed
+        // in that language, so a query stemmed in another would be asking the
+        // index for words it does not hold. The name is checked and dropped.
+        return Ok(Some(at + 2));
+    }
+    if args::is(word, b"EXPANDER") || args::is(word, b"PAYLOAD") {
+        let Some(value) = args.opt(at + 1) else {
+            return Err(line(BAD_ARGS, word, NOT_THERE));
+        };
+        if args::is(word, b"PAYLOAD") {
+            rows.payload = Some(value);
+        }
+        // An expander is a module a real server loads and there is nowhere to
+        // load one from here, so any name at all is taken and nothing is done
+        // with it, which is what a real server does with a name it does not
+        // know as well.
+        return Ok(Some(at + 2));
+    }
+    if args::is(word, b"RETURN") {
+        return returned(args, at, rows).map(Some);
+    }
+    if args::is(word, b"INFIELDS") {
+        let (names, next) = names(args, at)?;
+        rows.infields = Some(names);
+        return Ok(Some(next));
+    }
+    if args::is(word, b"INKEYS") {
+        let (names, next) = names(args, at)?;
+        rows.inkeys = Some(names);
+        return Ok(Some(next));
+    }
+    if main && args::is(word, b"FILTER") {
+        return filter(args, at, rows, index).map(Some);
+    }
+    Ok(None)
+}
+
+/// A number that is a whole number and not below zero, which is what `LIMIT`
+/// and `TIMEOUT` want.
+fn counted(value: &[u8]) -> Option<i64> {
+    parse_i64(value).filter(|n| *n >= 0)
+}
+
+/// `RETURN n field [AS name] ...`, where `n` counts words and not fields.
+///
+/// That is measured and it is the one thing about this argument that surprises
+/// everybody: `RETURN 2 t NOCONTENT` reads `NOCONTENT` as the name of a second
+/// field, so the rows come back with their content after all. `RETURN 0` names
+/// no fields, which reads on the wire like `NOCONTENT` and is not the same
+/// thing, because a `RETURN` after it puts the fields back and a `RETURN` after
+/// a `NOCONTENT` does not.
+///
+/// The count covers the `AS` and the name after it as well as the field, and a
+/// count that reaches the `AS` without reaching the name is its own error
+/// rather than a field called `AS`. A count that stops before the `AS` is not:
+/// `RETURN 1 AS` asks for a field called `AS`, which no key holds.
+fn returned<'a>(
+    args: Args<'a>,
+    at: usize,
+    rows: &mut Rows<'a>,
+) -> core::result::Result<usize, Vec<u8>> {
+    let Some(count) = args.opt(at + 1) else {
+        return Err(line(BAD_ARGS, b"RETURN", NOT_THERE));
+    };
+    let Some(count) = parse_i64(count).filter(|n| *n >= 0) else {
+        return Err(line(BAD_ARGS, b"RETURN", NOT_A_NUMBER));
+    };
+    let count = usize::try_from(count).unwrap_or(0);
+    let mut want = Vec::new();
+    let mut step = 0;
+    while step < count {
+        let Some(field) = args.opt(at + 2 + step) else {
+            return Err(line(BAD_ARGS, b"RETURN", NOT_THERE));
+        };
+        step += 1;
+        if step < count && args.opt(at + 2 + step).is_some_and(|w| args::is(w, b"AS")) {
+            // The count stopped on the `AS`, so whatever name follows belongs
+            // to what comes after `RETURN` rather than to this field, and the
+            // rename has nothing to rename to. That is asked before the name is
+            // looked for, because `RETURN 2 t AS` with nothing after it at all
+            // answers this line and not the one about a missing argument.
+            if step + 1 >= count {
+                return Err(NEED_NAME.as_bytes().to_vec());
+            }
+            let Some(name) = args.opt(at + 3 + step) else {
+                return Err(line(BAD_ARGS, b"RETURN", NOT_THERE));
+            };
+            want.push((field, name));
+            step += 2;
+            continue;
+        }
+        want.push((field, field));
+    }
+    // The last list wins rather than the lists adding up, so
+    // `RETURN 1 t RETURN 1 b` answers `b` on its own.
+    rows.ret = Some(want);
+    Ok(at + 2 + count)
+}
+
+/// `INFIELDS n name ...` and `INKEYS n name ...`, which are the same shape.
+fn names<'a>(args: Args<'a>, at: usize) -> core::result::Result<(Vec<&'a [u8]>, usize), Vec<u8>> {
+    let word = args.get(at);
+    let Some(count) = args.opt(at + 1) else {
+        return Err(line(BAD_ARGS, word, NOT_THERE));
+    };
+    let Some(count) = parse_i64(count).filter(|n| *n >= 0) else {
+        return Err(line(BAD_ARGS, word, NOT_A_NUMBER));
+    };
+    let count = usize::try_from(count).unwrap_or(0);
+    let mut out = Vec::with_capacity(count);
+    for step in 0..count {
+        let Some(name) = args.opt(at + 2 + step) else {
+            return Err(line(BAD_ARGS, word, NOT_THERE));
+        };
+        out.push(name);
+    }
+    Ok((out, at + 2 + count))
+}
+
+/// `FILTER field min max`, which is a numeric range written outside the query.
+///
+/// A field that is not there or is not a number is not an error and answers
+/// nothing, which falls out of asking the index for a numeric field it does not
+/// have. The two ends are read as numbers whatever the field is, though, so
+/// `FILTER nope x 1` is refused for `x`, and only a field the schema really
+/// does hold as a number is checked for being the wrong way round:
+/// `FILTER n 2 1` is refused and `FILTER nope 2 1` and `FILTER g 2 1` answer
+/// nothing.
+fn filter<'a>(
+    args: Args<'a>,
+    at: usize,
+    rows: &mut Rows<'a>,
+    index: &Index,
+) -> core::result::Result<usize, Vec<u8>> {
+    let (Some(field), Some(min), Some(max)) =
+        (args.opt(at + 1), args.opt(at + 2), args.opt(at + 3))
+    else {
+        return Err(FILTER_THREE.as_bytes().to_vec());
+    };
+    let Some(low) = ends(min) else {
+        return Err(line(LOW_RANGE, min, ""));
+    };
+    let Some(high) = ends(max) else {
+        return Err(line(HIGH_RANGE, max, ""));
+    };
+    if low > high && numeric(index, field) {
+        return Err(backwards(field, low, high));
+    }
+    rows.filters.push((field, low, high));
+    Ok(at + 4)
+}
+
+/// Whether the schema holds this name as a number, which is the one field a
+/// `FILTER` can be the wrong way round on.
+fn numeric(index: &Index, field: &[u8]) -> bool {
+    index
+        .schema
+        .iter()
+        .any(|f| *f.attribute == *field && matches!(f.kind, Kind::Numeric))
+}
+
+/// One end of a `FILTER`, which takes the two infinities by name as well as a
+/// number.
+fn ends(value: &[u8]) -> Option<f64> {
+    match value {
+        b"+inf" | b"inf" | b"INF" | b"+INF" => Some(f64::INFINITY),
+        b"-inf" | b"-INF" => Some(f64::NEG_INFINITY),
+        _ => parse_f64(value),
+    }
+}
+
+/// `Invalid numeric range (min > max): @n:[2.000000 1.000000]`, which prints
+/// both ends to six places however they were written.
+fn backwards(field: &[u8], low: f64, high: f64) -> Vec<u8> {
+    let mut out = BACKWARDS.as_bytes().to_vec();
+    out.extend_from_slice(field);
+    out.extend_from_slice(b":[");
+    out.extend_from_slice(format!("{low:.6} {high:.6}").as_bytes());
+    out.push(b']');
+    out
+}
+
 /// `PARAMS n name value ...`, which is where a `$name` in a query comes from.
-fn params(args: Args<'_>, at: usize, asked: &mut Asked) -> core::result::Result<usize, Vec<u8>> {
+fn params(
+    args: Args<'_>,
+    at: usize,
+    asked: &mut Asked<'_>,
+) -> core::result::Result<usize, Vec<u8>> {
     let Some(count) = args.opt(at + 1) else {
         return Err(line(BAD_ARGS, b"PARAMS", NOT_THERE));
     };
@@ -1675,18 +2051,19 @@ fn spot(head: &str, at: usize, near: &[u8]) -> Vec<u8> {
 fn explain<'a>(reg: &mut Registry, args: Args<'a>, out: &mut Out, cli: bool) -> Answer<'a> {
     let name = args.get(1);
     let query = args.get(2);
-    let asked = match options(args, 3) {
+    // Counted, like every other command that resolves a name, and resolved
+    // before the arguments are read rather than after: `FT.EXPLAIN nope q BOGUS`
+    // answers about the index and not about the word, and a call that goes on to
+    // refuse an argument has still counted as a use.
+    let Some(index) = reg.open(name) else {
+        return Err(Fail::naming(MISSING, name));
+    };
+    let asked = match options(args, 3, false, index) {
         Ok(asked) => asked,
         Err(text) => {
             out.error(&text);
             return Ok(());
         }
-    };
-    // Counted, like every other command that resolves a name, and counted after
-    // the arguments rather than before: an unreadable argument list means the
-    // index was never opened.
-    let Some(index) = reg.open(name) else {
-        return Err(Fail::naming(MISSING, name));
     };
     let ask = Ask {
         dialect: asked.dialect,
@@ -1712,4 +2089,293 @@ fn explain<'a>(reg: &mut Registry, args: Args<'a>, out: &mut Out, cli: bool) -> 
         out.simple(line);
     }
     Ok(())
+}
+
+/// One row of the reply, with the fields of its key once they have been read.
+type Built<'a> = (&'a Row, Option<Vec<(&'a [u8], &'a [u8])>>);
+
+/// One row of an answer, once the registry has been let go of.
+///
+/// Nothing in here borrows the index, which is the whole point: the query runs
+/// and the scoring happens under the lock, and what comes out is this, so the
+/// keys can be read out of the keyspace with the registry free.
+struct Row {
+    key: Box<[u8]>,
+    score: f64,
+    payload: Option<Box<[u8]>>,
+}
+
+/// `FT.SEARCH index query [options]`.
+///
+/// The two halves are described at the top of this file. This is the seam
+/// between them, and the lock is held for exactly as long as the first half
+/// takes.
+pub(super) fn find(server: &Server, db: usize, args: Args<'_>, out: &mut Out) -> Result<()> {
+    let name = args.get(1);
+    let query = args.get(2);
+    let asked;
+    let (total, rows) = {
+        let mut reg = server.search.lock();
+        // Counted, like every other command that resolves a name, and resolved
+        // before the arguments are read: `FT.SEARCH nope q BOGUS` answers about
+        // the index and not about the word, and a `FILTER` that names a field
+        // cannot be read without the schema in front of it anyway.
+        let Some(index) = reg.open(name) else {
+            Fail::naming(MISSING, name).write(out);
+            return Ok(());
+        };
+        asked = match options(args, 3, true, index) {
+            Ok(asked) => asked,
+            Err(text) => {
+                out.error(&text);
+                return Ok(());
+            }
+        };
+        let ask = Ask {
+            dialect: asked.dialect,
+            params: &asked.params,
+            verbatim: asked.verbatim,
+            stopwords: asked.stopwords,
+        };
+        let node = match query::parse(query, index, &ask) {
+            Ok(node) => node,
+            Err(bad) => {
+                out.error(&refused(&bad));
+                return Ok(());
+            }
+        };
+        gather(index, shape(node, index, &asked.rows), &asked.rows)
+    };
+    write(server, db, total, &rows, &asked.rows, out);
+    Ok(())
+}
+
+/// The query with everything the arguments outside it asked for hung on it.
+///
+/// The order matters. The slop and the order go on the query the client wrote,
+/// because they are the same thing an attribute clause hangs on a group and
+/// they are about the words in that group. The filters go on the outside of
+/// that, in a wrapper of their own, so a range written as `FILTER` does not
+/// join the group whose words are being counted and change what the slop means.
+fn shape(node: Node, index: &Index, rows: &Rows<'_>) -> Node {
+    let mut node = node;
+    if let Some(want) = &rows.infields {
+        // A field nobody knows contributes no bit, so `INFIELDS 1 nope` asks
+        // for no field at all and answers nothing, and `INFIELDS 0` narrows
+        // nothing because there was no list to narrow to.
+        if !want.is_empty() {
+            let mask = want
+                .iter()
+                .filter_map(|field| query::explain::bit(index, field))
+                .fold(0 as Mask, |mask, bit| mask | bit);
+            node.narrow(mask);
+        }
+    }
+    node.slop = rows.slop;
+    node.inorder = rows.inorder || node.inorder;
+    if rows.filters.is_empty() {
+        return node;
+    }
+    // A filter beside a bare `*` is the whole query, because asking for every
+    // document and then asking for the ones in a range is asking for the ones
+    // in the range. Measured, and visible in the score: under `TFIDF` the
+    // query `*` with one `FILTER` scores one where two filters score two, so
+    // the wildcard is not there to be counted.
+    let mut under = match node.what {
+        What::Wildcard => Vec::new(),
+        _ => vec![node],
+    };
+    for (field, min, max) in &rows.filters {
+        under.push(Node::new(What::Numeric(Range {
+            field: (*field).into(),
+            min: *min,
+            max: *max,
+            min_open: false,
+            max_open: false,
+        })));
+    }
+    Node::new(What::Intersect(under))
+}
+
+/// Walks the query, scores what it found, sorts it and cuts out the window.
+///
+/// The total comes back beside the window because the window is not the whole
+/// of what answered, and because `LIMIT 0 0` is a client asking for the total
+/// and nothing else.
+fn gather(index: &Index, node: Node, rows: &Rows<'_>) -> (usize, Vec<Row>) {
+    let facts = index.held.facts();
+    let mut found: Vec<(u32, f64)> = walk::run(&index.held, &node)
+        .into_iter()
+        .filter_map(|hit| {
+            let doc = index.held.docs.get(hit.id)?;
+            // `INKEYS` is a filter on the answer and not on the query, and it
+            // comes off before the total is taken, which is measured:
+            // `INKEYS 1 d:1` over a query that answers three keys answers a
+            // total of one.
+            if let Some(keys) = &rows.inkeys
+                && !keys.contains(&&*doc.key)
+            {
+                return None;
+            }
+            let score = rows.scorer.of(&facts, doc, &hit.found, rows.payload);
+            Some((hit.id, score))
+        })
+        .collect();
+    // The one scorer that cannot finish a document at a time, because what it
+    // divides by is the best score in the whole answer.
+    let mut scores: Vec<f64> = found.iter().map(|(_, score)| *score).collect();
+    rows.scorer.settle(&mut scores);
+    for (row, score) in found.iter_mut().zip(&scores) {
+        row.1 = *score;
+    }
+    // Best first, and a tie goes to the document that was written first. A
+    // `NaN` sorts last rather than poisoning the comparison.
+    found.sort_by(|a, b| {
+        b.1.partial_cmp(&a.1)
+            .unwrap_or(core::cmp::Ordering::Equal)
+            .then(a.0.cmp(&b.0))
+    });
+    let total = found.len();
+    let window = found
+        .into_iter()
+        .skip(rows.offset)
+        .take(rows.count)
+        .filter_map(|(id, score)| {
+            let doc = index.held.docs.get(id)?;
+            Some(Row {
+                key: doc.key.clone(),
+                score,
+                payload: doc.payload.clone(),
+            })
+        })
+        .collect();
+    (total, window)
+}
+
+/// Reads the keys in the window and writes the reply.
+///
+/// The reading happens first and all of it, because a key that will not read
+/// takes its row out of the reply and one off the total, and the total is the
+/// first thing on the wire under RESP2.
+fn write(server: &Server, db: usize, total: usize, rows: &[Row], want: &Rows<'_>, out: &mut Out) {
+    let loading = want.loading();
+    let mut built: Vec<Built<'_>> = Vec::with_capacity(rows.len());
+    let held: Vec<Option<indexing::Document>> = if loading {
+        rows.iter()
+            .map(|row| indexing::read(&server.dbs[db], &row.key))
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let mut lost = 0;
+    for (at, row) in rows.iter().enumerate() {
+        if !loading {
+            built.push((row, None));
+            continue;
+        }
+        let Some(doc) = held.get(at).and_then(Option::as_ref) else {
+            lost += 1;
+            continue;
+        };
+        built.push((row, Some(pick(doc, want))));
+    }
+    let total = total - lost;
+    if out.proto().is_resp3() {
+        deep(total, &built, want, out);
+        return;
+    }
+    // One element for the total, then a fixed number for every row: the key,
+    // then whichever of the score, the payload and the fields were asked for.
+    let per = 1 + usize::from(want.scores) + usize::from(want.payloads) + usize::from(loading);
+    out.array(1 + built.len() * per);
+    out.int(total as i64);
+    for (row, fields) in &built {
+        out.bulk(&row.key);
+        if want.scores {
+            out.double(row.score);
+        }
+        if want.payloads {
+            match &row.payload {
+                Some(payload) => out.bulk(payload),
+                None => out.nil(),
+            }
+        }
+        if let Some(fields) = fields {
+            out.map(fields.len());
+            for (field, value) in fields {
+                out.bulk(field);
+                out.bulk(value);
+            }
+        }
+    }
+}
+
+/// The RESP3 shape, which is a map of five and not an array of anything.
+///
+/// The five keys are always all five and always in this order, even for an
+/// answer with nothing in it, and `attributes`, `warning` and every row's
+/// `values` are always empty. That is measured rather than assumed: they are
+/// there for `FT.AGGREGATE` and a client that reads them finds them.
+fn deep(total: usize, built: &[Built<'_>], want: &Rows<'_>, out: &mut Out) {
+    out.map(5);
+    out.simple(b"attributes");
+    out.array(0);
+    out.simple(b"format");
+    out.simple(b"STRING");
+    out.simple(b"results");
+    out.array(built.len());
+    for (row, fields) in built {
+        out.map(
+            2 + usize::from(want.scores)
+                + usize::from(want.payloads)
+                + usize::from(fields.is_some()),
+        );
+        out.simple(b"id");
+        out.bulk(&row.key);
+        if want.scores {
+            out.simple(b"score");
+            out.double(row.score);
+        }
+        if want.payloads {
+            out.simple(b"payload");
+            match &row.payload {
+                Some(payload) => out.bulk(payload),
+                None => out.nil(),
+            }
+        }
+        if let Some(fields) = fields {
+            out.simple(b"extra_attributes");
+            out.map(fields.len());
+            for (field, value) in fields {
+                out.bulk(field);
+                out.bulk(value);
+            }
+        }
+        out.simple(b"values");
+        out.array(0);
+    }
+    out.simple(b"total_results");
+    out.int(total as i64);
+    out.simple(b"warning");
+    out.array(0);
+}
+
+/// The fields of one key that go in the reply, under the names they go under.
+///
+/// Everything the key holds when the client named no fields, which is every
+/// field of the hash and not only the ones in the schema. When it did name
+/// them, they come back in the order it named them, a field the key does not
+/// hold is left out rather than sent empty, and a name that is not a field at
+/// all leaves an empty list rather than an error.
+fn pick<'d, 'w: 'd>(doc: &'d indexing::Document, want: &Rows<'w>) -> Vec<(&'d [u8], &'d [u8])> {
+    let pairs = doc.pairs();
+    let Some(ret) = &want.ret else {
+        return pairs;
+    };
+    ret.iter()
+        .filter_map(|(field, name)| {
+            let (_, value) = pairs.iter().find(|(held, _)| held == field)?;
+            Some((&**name, *value))
+        })
+        .collect()
 }

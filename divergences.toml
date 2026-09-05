@@ -476,3 +476,18 @@ title = "A rename onto a key that already held a document leaves one document an
 reason = "A rename inside a prefix an index follows moves the document across to the new name and keeps the number it had, on both servers, and neither reads the value again because nothing about the value changed. What the reference does not do is take away whatever the target had. RENAME p:1 p:2 where both keys were indexed leaves the old p:2 document sitting in the table under its own number, so the index reports two documents where the keyspace has one key, both numbers answer p:2 when asked which key they belong to, and nothing ever collects the one that is stranded because there is no key left to delete it with. It is a leak rather than a behaviour: the document it keeps is a reading of a value that is not there any more, a query that matches it either answers a row whose fields are loaded from the surviving key or drops the row, and num_docs is one too many from then on. This drops the target's document, which is the same thing the reference does on every other write that lands on a key that already had one. The rest of the rename matches exactly, including the number being kept, max_doc_id not moving, a rename out of a prefix erasing, a rename into one reading the key, and a rename inside a prefix over a key with no document reading it instead of moving nothing."
 status = "permanent"
 spec = "09 section 5"
+
+[[divergence]]
+id = "D-65"
+title = "Six FT.SEARCH options are refused rather than read"
+reason = "SORTBY and WITHSORTKEYS sort the answer by a field's value and send that value back beside every row, which needs the sortable values a SORTABLE field is supposed to keep and which nothing keeps yet. SUMMARIZE and HIGHLIGHT rewrite the text of a field around the words that matched, which needs the offsets of those words inside the value. GEOFILTER is a circle written outside the query, and the document reader does not read geo fields yet. EXPLAINSCORE prints the arithmetic behind a score as a nested array, which is a shape of its own on top of every scorer. All six are read as unknown arguments here and answer the line a real server answers for a word nobody knows, so a client learns the option is not there rather than getting a reply that quietly ignored it. The fifteen options that are read are read exactly, including the two that surprise everybody: RETURN counts words rather than fields, and INKEYS filters before the total is taken. FT.EXPLAIN takes WITHSORTKEYS and EXPLAINSCORE and drops them the way a real server does, and it does not print the IDS node an INKEYS puts in the reference's tree."
+status = "until"
+resolved_by = "M8"
+spec = "09 section 5"
+
+[[divergence]]
+id = "D-66"
+title = "BM25STD.TANH scores can differ from a real server in the last bit"
+reason = "The scorer is a hyperbolic tangent of the standard score over a constant, and both servers compute the same argument to the last bit. What they do with it is their platform's tanh, and the one on the reference build is not correctly rounded: for an argument of 0.06029051420422201 it answers 0.060217569339428935 where the correctly rounded double is 0.06021756933942893, which is what this answers and what an arbitrary precision evaluation of the same argument rounds to. Four of the ten documents in a comparison corpus land on an argument where the two disagree, always by one bit and never by more. The ordering of an answer is unaffected because the difference is smaller than the gap between any two documents' scores, and every other scorer agrees to the last bit."
+status = "permanent"
+spec = "09 section 5"
