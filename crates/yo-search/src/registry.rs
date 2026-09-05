@@ -1,5 +1,6 @@
 //! Every index on the server, and the names that point at them.
 
+use crate::english::English;
 use crate::index::Index;
 
 /// What went wrong with a name, in the terms the caller has to answer in.
@@ -41,6 +42,12 @@ pub struct Registry {
     indexes: Vec<Index>,
     /// Alias to index name, in the order the aliases were added.
     aliases: Vec<Pointer>,
+    /// The stemmer every index reads its documents through.
+    ///
+    /// One per server rather than one per index, because it is a cache of
+    /// words to their stems and two indexes over the same keys would fill two
+    /// copies of it with the same answers.
+    english: English,
 }
 
 impl Registry {
@@ -65,6 +72,15 @@ impl Registry {
     /// Every index, in the order they were created.
     pub fn iter(&self) -> impl Iterator<Item = &Index> {
         self.indexes.iter()
+    }
+
+    /// Every index and the stemmer, both borrowed mutably at once.
+    ///
+    /// Which is the shape reading a key needs, since every index the key
+    /// belongs to reads it through the one stemmer. Handing back the pair is
+    /// how that gets past the borrow checker without a cell or a clone.
+    pub fn reading(&mut self) -> (impl Iterator<Item = &mut Index>, &mut English) {
+        (self.indexes.iter_mut(), &mut self.english)
     }
 
     /// The index with this exact name, ignoring aliases.

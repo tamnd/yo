@@ -170,6 +170,15 @@ impl Tags {
         self.by.len()
     }
 
+    /// How many times a document holds a value, over every value.
+    ///
+    /// The number `num_records` counts, which is not [`Tags::len`]: two
+    /// documents both tagged `red` are one value and two entries.
+    #[must_use]
+    pub fn entries(&self) -> usize {
+        self.by.values().map(Vec::len).sum()
+    }
+
     /// Whether no document holds a value here.
     #[must_use]
     pub fn is_empty(&self) -> bool {

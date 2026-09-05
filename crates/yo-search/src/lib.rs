@@ -54,11 +54,18 @@
 //! them, so a key and its fields go in one end and a document with a number, a
 //! score, a length and a term in every list it belongs to comes out the other.
 //!
+//! [`follow`] is the fan out over that: which indexes a key belongs to, what
+//! happens to each of them when it changes or goes, and the count of the keys
+//! they would not read, which is the `Index Errors` block `FT.INFO` answers
+//! with.
+//!
 //! # What is not here yet
 //!
-//! The wiring above it. An index can be handed a document but nothing yet hands
-//! it one as a hash is written, and nothing yet answers `FT.SEARCH`, so all of
-//! this is reachable from Rust and not from a client.
+//! The wiring above it. A registry can be told that a key changed, but nothing
+//! yet tells it as a hash is written, and nothing yet answers `FT.SEARCH`, so
+//! all of this is reachable from Rust and not from a client. `FILTER` is the
+//! other gap: an index carrying one follows every key its prefixes cover,
+//! because the expression over the value is not parsed yet.
 //!
 //! # Why the registry is per server
 //!
@@ -73,6 +80,7 @@
 pub mod docs;
 pub mod english;
 pub mod field;
+pub mod follow;
 pub mod held;
 pub mod index;
 pub mod nums;
