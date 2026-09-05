@@ -1100,7 +1100,7 @@ fn info(server: &Server, args: Args<'_>, out: &mut Out) {
                 "# Clients\r\nconnected_clients:{}\r\nblocked_clients:{}\r\n\
                  cluster_connections:0\r\n\r\n",
                 server.totals().clients,
-                server.waiters().len(),
+                server.parked(),
             );
         }
         if want("memory") {

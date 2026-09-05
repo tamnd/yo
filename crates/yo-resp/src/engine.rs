@@ -264,14 +264,14 @@ impl<S: Sink> Wire<S> {
     fn serve_waiters(&mut self) {
         let now = self.server.now_ms();
         let mut at = 0;
-        while at < self.server.waiters().len() {
+        while at < self.server.parked() {
             let p = self.server.waiters().at(at);
             // The slot is reused and the client id is not. `release` forgets
             // waiters, so this should never fire; it is here because being
             // wrong about it writes a reply into somebody else's socket rather
             // than dropping one.
             if !self.front.answers(p.conn, p.client) {
-                self.server.waiters_mut().drop_at(at);
+                self.server.drop_waiter(at);
                 continue;
             }
             // The front cannot reach the databases and the server cannot reach
@@ -282,7 +282,7 @@ impl<S: Sink> Wire<S> {
                 server.serve_waiter(at, now, front.out(p.conn))
             };
             if served {
-                self.server.waiters_mut().drop_at(at);
+                self.server.drop_waiter(at);
                 self.front.unpark(p.conn);
                 self.front.soil(p.conn);
             } else {
@@ -361,7 +361,7 @@ impl<S: Sink> Wire<S> {
     /// and a waiter still holding this client id would then be a waiter
     /// pointing at somebody else's connection.
     fn forget(&mut self, client: u64) {
-        self.server.waiters_mut().forget(client);
+        self.server.forget_waiters(client);
         self.server.counted().closed();
     }
 
@@ -486,7 +486,7 @@ impl<S: Sink> Engine for Wire<S> {
                 Flow::Block => {
                     self.front.block(conn);
                     let client = self.front.client(conn);
-                    self.server.waiters_mut().bind(client, conn);
+                    self.server.bind_waiter(client, conn);
                 }
                 Flow::Continue => self.front.soil(conn),
             }
@@ -496,7 +496,7 @@ impl<S: Sink> Engine for Wire<S> {
         // keys and woken by `RPUSH b` then `RPUSH a` in one pipeline has to
         // answer with `b`, because that is the push that was in front of it, and
         // it can only do that if it was served in between the two.
-        if !self.server.waiters().is_empty() {
+        if self.server.parked() != 0 {
             self.serve_waiters();
         }
         yo_reactor::Flow::Next
@@ -508,7 +508,7 @@ impl<S: Sink> Engine for Wire<S> {
         // passes while the server is idle is answered within the loop's idle
         // wait, which is 20ms and is finer than the 10hz Redis checks its own
         // blocked clients at.
-        if !self.server.waiters().is_empty() {
+        if self.server.parked() != 0 {
             self.server.refresh_clock();
             self.serve_waiters();
         }
@@ -994,7 +994,7 @@ mod tests {
             r.engine().sink().sent(conn),
             b":1\r\n*2\r\n$1\r\nq\r\n$1\r\na\r\n"
         );
-        assert_eq!(r.engine().server().waiters().len(), 0);
+        assert_eq!(r.engine().server().parked(), 0);
     }
 
     /// The whole point: a client with nothing to pop is answered later, by
@@ -1007,7 +1007,7 @@ mod tests {
         r.engine_mut().feed(a, &wire(&[b"BLPOP", b"q", b"0"]));
         pump(&mut r, &mut batch);
         assert!(r.engine().sink().sent(a).is_empty(), "nothing to say yet");
-        assert_eq!(r.engine().server().waiters().len(), 1);
+        assert_eq!(r.engine().server().parked(), 1);
 
         r.engine_mut().feed(b, &wire(&[b"RPUSH", b"q", b"one"]));
         pump(&mut r, &mut batch);
@@ -1016,7 +1016,7 @@ mod tests {
         // The push still reports the length it made, even though the element was
         // gone again before the reply was written.
         assert_eq!(r.engine().sink().sent(b), b":1\r\n");
-        assert_eq!(r.engine().server().waiters().len(), 0);
+        assert_eq!(r.engine().server().parked(), 0);
     }
 
     /// A push to a key nobody named, and a key of another type on a key
@@ -1034,7 +1034,7 @@ mod tests {
         pump(&mut r, &mut batch);
 
         assert!(r.engine().sink().sent(a).is_empty());
-        assert_eq!(r.engine().server().waiters().len(), 1, "still waiting");
+        assert_eq!(r.engine().server().parked(), 1, "still waiting");
         // And the set is intact, so the waiter did not take anything out of it
         // on its way past.
         assert_eq!(r.engine().sink().sent(b), b":1\r\n:1\r\n");
@@ -1052,7 +1052,7 @@ mod tests {
         pump(&mut r, &mut batch);
         r.engine_mut().feed(b, &wire(&[b"BLPOP", b"q", b"0"]));
         pump(&mut r, &mut batch);
-        assert_eq!(r.engine().server().waiters().len(), 2);
+        assert_eq!(r.engine().server().parked(), 2);
 
         r.engine_mut()
             .feed(c, &wire(&[b"RPUSH", b"q", b"first", b"second"]));
@@ -1066,7 +1066,7 @@ mod tests {
             r.engine().sink().sent(b),
             b"*2\r\n$1\r\nq\r\n$6\r\nsecond\r\n"
         );
-        assert_eq!(r.engine().server().waiters().len(), 0);
+        assert_eq!(r.engine().server().parked(), 0);
     }
 
     /// A client waiting for an answer is not a client that has sent another
@@ -1147,7 +1147,7 @@ mod tests {
         pump(&mut r, &mut batch);
         r.engine_mut().feed(b, &wire(&[b"BLPOP", b"y", b"0"]));
         pump(&mut r, &mut batch);
-        assert_eq!(r.engine().server().waiters().len(), 2);
+        assert_eq!(r.engine().server().parked(), 2);
 
         r.engine_mut().feed(c, &wire(&[b"RPUSH", b"x", b"chain"]));
         pump(&mut r, &mut batch);
@@ -1157,7 +1157,7 @@ mod tests {
             r.engine().sink().sent(b),
             b"*2\r\n$1\r\ny\r\n$5\r\nchain\r\n"
         );
-        assert_eq!(r.engine().server().waiters().len(), 0);
+        assert_eq!(r.engine().server().parked(), 0);
     }
 
     /// A waiter on one database is not woken by a push on another, even though
@@ -1200,7 +1200,7 @@ mod tests {
         pump(&mut r, &mut batch);
         // A null array and not a null string, which a RESP2 client can see.
         assert_eq!(r.engine().sink().sent(conn), b"*-1\r\n");
-        assert_eq!(r.engine().server().waiters().len(), 0);
+        assert_eq!(r.engine().server().parked(), 0);
     }
 
     /// The four that answer with something other than a two element array all
@@ -1254,11 +1254,11 @@ mod tests {
         let b = r.engine_mut().accept();
         r.engine_mut().feed(a, &wire(&[b"BLPOP", b"q", b"0"]));
         pump(&mut r, &mut batch);
-        assert_eq!(r.engine().server().waiters().len(), 1);
+        assert_eq!(r.engine().server().parked(), 1);
 
         r.engine_mut().hangup(a);
         pump(&mut r, &mut batch);
-        assert_eq!(r.engine().server().waiters().len(), 0);
+        assert_eq!(r.engine().server().parked(), 0);
         assert_eq!(r.engine().clients(), 1);
 
         // The slot is handed straight back out, which is what the waiter would
