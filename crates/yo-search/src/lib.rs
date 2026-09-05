@@ -41,13 +41,20 @@
 //! in which fields and where. [`nums`] is the same thing for a `NUMERIC` field,
 //! a sorted run of values a range is cut out of. [`docs`] is the table the two
 //! of them point into: which key a number was given to, what the client said it
-//! was worth, and how long it turned out to be.
+//! was worth, and how long it turned out to be. [`tags`] is the third index, the
+//! one a `TAG` field gets, where a value is matched whole rather than being
+//! broken into words.
+//!
+//! [`score`] is what turns a walk over those lists into an ordered answer. All
+//! nine scorers a real server takes are there, measured against one rather than
+//! read off its manual, which is how the single precision `k1` in the default
+//! one came to light.
 //!
 //! # What is not here yet
 //!
-//! The scoring. The lists and the table under them are here, so an intersection
-//! has something to walk and every document it lands on can be asked its length,
-//! but nothing yet turns a walk into an ordered answer.
+//! The wiring. Nothing yet reads a hash as it is written and puts it through the
+//! tokenizer into the lists, and nothing yet answers `FT.SEARCH`, so all of this
+//! is reachable from Rust and not from a client.
 //!
 //! # Why the registry is per server
 //!
@@ -68,6 +75,7 @@ pub mod posts;
 pub mod query;
 pub mod registry;
 pub mod score;
+pub mod tags;
 pub mod text;
 pub mod token;
 pub mod words;
