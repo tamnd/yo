@@ -35,13 +35,17 @@
 //! there, because the one a client gets when it does not ask for one is still
 //! the first and they parse the same bytes into different trees.
 //!
+//! [`token`] and [`words`] are the two halves of the tokenizer, the query side
+//! and the document side, and [`posts`] is the inverted index they both feed:
+//! every term in an index and, for each one, which documents have it, how often,
+//! in which fields and where.
+//!
 //! # What is not here yet
 //!
-//! The inverted index and the scoring. This is the shape an index has, the
-//! table it lives in and the queries that can be asked of it, which is what
-//! `FT.CREATE`, `FT.ALTER`, `FT.INFO`, `FT.DROPINDEX`, `FT.EXPLAIN` and the
-//! alias family need and all that they need. `FT.SEARCH` needs postings under
-//! it and that is the next piece.
+//! The scoring, and the tag and numeric indexes. A term and its documents are
+//! here, so an intersection has something to walk, but nothing yet turns a walk
+//! into an ordered answer, and a `TAG` or `NUMERIC` field still has nowhere to
+//! put what it reads.
 //!
 //! # Why the registry is per server
 //!
@@ -56,6 +60,7 @@
 pub mod english;
 pub mod field;
 pub mod index;
+pub mod posts;
 pub mod query;
 pub mod registry;
 pub mod text;
