@@ -4,6 +4,36 @@ What each release changed, why, and what it costs you. The versioning rules and 
 
 While the major is 0, a minor release may break anything, including the on-disk format. The format is frozen at `M6`, not before.
 
+## 0.3.20 — 2026-09-05
+
+Eight pull requests and no milestone has closed, so this is a patch.
+
+`yodb serve --threads N` is the headline and the rest of the threading work is what had to land under it. A server can be shared across threads now, a connection belongs to the thread that accepted it, and the keyspace behind them is one keyspace. `FT.CURSOR` arrived alongside it, so an aggregation or a search can hand its answer back a chunk at a time.
+
+A file written by 0.3.19 opens unchanged under this version and a file written by this version opens under 0.3.19. No record kind was added.
+
+### Added
+
+- **`yodb serve --threads N`.** N threads serve connections instead of one, and `--threads 0` is one per core. The listeners go into every thread's poller and whoever is free takes the connection and keeps it for as long as it is open, so there is no handoff between threads and no work stealing. One thread still runs on the calling thread with nothing spawned, so a single threaded server is exactly what it was. The count also decides how finely each database is striped, at four stripes to a thread, because a stripe is held for the length of a command and with one stripe each two of eight threads are in the same stripe about a third of the time. That multiplier is a starting point rather than a measured answer, and the benchmark numbers are what will settle it.
+- **`FT.CURSOR READ`, `DEL` and `GC`, with `WITHCURSOR` on `FT.AGGREGATE` and `FT.SEARCH`.** A cursor answers a two element reply, the ordinary reply for the chunk and the number to read the next one under, which is 0 on the last chunk. The default chunk is 1000 rows, the default idle time is 300000 ms and an index holds 128 cursors at once, all three measured against Redis 8.10.1 rather than read off the documentation. The hard part was the number at the front of each chunk, which is neither the total nor the chunk size: it is what the pipeline pulled while the chunk was being filled less what a `FILTER` threw away during it, and the two protocols take that number at different moments. The rule came out of about a thousand measured chunk sequences over a grid of filter expressions, offsets, windows, chunk widths and both protocols, and the implementation now matches it on all 850 shapes the grid walks. `FT.INFO` reports `cursor_stats` off the cursors that exist rather than off zero.
+
+### Changed
+
+- **A clock is a handle rather than a value copied everywhere.** Time used to live in the server, in each of its sixteen databases and in every stripe of each of those, and moving it was a walk that wanted all of them exclusively. It is one store now however many stripes there are. The reading every command looks at does not bounce between cores: a refresh only stores when the millisecond has changed, so the line is written about a thousand times a second and read millions.
+- **The maintenance turn, the store source and everything else on a server crossed the thread boundary.** An arena, a log and a log file's read cache became `Send`, with the reasoning written next to each `unsafe impl`: what makes them safe is that two threads are never inside one at the same time, which is `!Sync`, and none of them was ever tied to the thread that built it. There is a compile time check next to the `Server` struct now, so a field added later that is neither `Send` nor `Sync` is an error where it was added.
+- **Client ids come from the server.** They used to come from a counter on the connection front, which with two fronts means two clients answering to one number, and `CLIENT KILL ID` takes that number.
+- **A blocked client belongs to the thread that parked it.** The waiter list is shared and the walk over it is per thread, so each thread answers its own and leaves the rest alone. Serving a waiter is by client id rather than by position in the list, which also closes a gap where a removal on another thread could shift the list between finding a waiter and answering it.
+
+### Fixed
+
+- **`FT.AGGREGATE` with a `SORTBY` that has no width of its own hands back ten rows**, which is what the reference does, where this build was handing back every row. Every search corpus in use up to now was smaller than ten rows, so nothing had ever shown it.
+
+### Known gaps
+
+- The threading numbers are not in yet. `--threads` exists and is correct, and whether it is twice as fast as anything is a question for the benchmark harness rather than for this release. The stripes per thread multiplier is the first thing that measurement will move.
+- `FT.SEARCH` still refuses `SORTBY`, `WITHSORTKEYS`, `SUMMARIZE`, `HIGHLIGHT`, `GEOFILTER` and `EXPLAINSCORE` rather than quietly ignoring them, which is D-65, and `FT.AGGREGATE` still refuses `EXPLAINSCORE`, which is what is left of D-67.
+- Two divergences were registered for the cursor work. D-74 says a cursor holds the rows the query made rather than a paused pipeline, which shows if the data changes between two reads of one cursor. D-75 says a `FILTER` underneath a window with an offset can report a different count per chunk than the reference does, which is 31 of the 850 grid shapes and comes down to where the reference puts its loaders, something the wire does not show.
+
 ## 0.3.19 — 2026-09-05
 
 Eleven pull requests and no milestone has closed, so this is a patch.
