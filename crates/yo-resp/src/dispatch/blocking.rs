@@ -42,6 +42,8 @@
 //! The fix when that matters is an index from key to waiter, not a different
 //! rule about when to look.
 
+use std::sync::atomic::Ordering::Relaxed;
+use yo_common::lock::Held;
 use yo_common::{Code, Error, Result, num};
 use yo_kv::{Db, End, Entry, Member, Movem, ZEnd};
 
@@ -729,7 +731,7 @@ impl Waiters {
     /// # Panics
     ///
     /// As [`Waiters::at`].
-    pub fn drop_at(&mut self, at: usize) {
+    fn drop_at(&mut self, at: usize) {
         self.list.remove(at);
     }
 
@@ -738,7 +740,7 @@ impl Waiters {
     /// Called when a connection closes rather than left for the deadline sweep
     /// to find, because a `BLPOP key 0` on a connection nobody will ever write
     /// to again has no deadline to be found by.
-    pub fn forget(&mut self, client: u64) {
+    fn forget(&mut self, client: u64) {
         self.list.retain(|w| w.client != client);
     }
 
@@ -748,7 +750,7 @@ impl Waiters {
     /// slot that client is on, so the slot is filled in afterwards by the half
     /// that has it. A client can only be parked once, since it is not reading
     /// commands while it waits, so the search finds the one that was just added.
-    pub fn bind(&mut self, client: u64, conn: u32) {
+    fn bind(&mut self, client: u64, conn: u32) {
         if let Some(w) = self.list.iter_mut().rev().find(|w| w.client == client) {
             w.conn = conn;
         }
@@ -813,20 +815,63 @@ impl Server {
         self.clock.now_ms()
     }
 
-    /// Who is parked, for the engine and for `INFO`.
+    /// Who is parked, for the engine walking the list.
+    ///
+    /// Takes the lock for as long as the answer is held, so a caller that only
+    /// wants to know whether anybody is waiting asks [`Server::parked`] instead
+    /// and does not take it at all.
     #[must_use]
-    pub const fn waiters(&self) -> &Waiters {
-        &self.waiters
+    pub fn waiters(&self) -> Held<'_, Waiters> {
+        self.waiters.lock()
     }
 
-    /// The same, for the engine, which is what binds and forgets them.
-    pub const fn waiters_mut(&mut self) -> &mut Waiters {
-        &mut self.waiters
+    /// How many clients are parked, without taking the lock.
+    ///
+    /// What `INFO clients` calls `blocked_clients`, and what every command asks
+    /// before it goes looking for somebody to wake.
+    #[must_use]
+    #[inline]
+    pub fn parked(&self) -> usize {
+        self.parked.load(Relaxed)
     }
 
     /// Park a client on a command that could not be answered yet.
-    pub(super) fn park(&mut self, client: u64, db: usize, deadline: Option<u64>, block: Block) {
-        self.waiters.park(client, db, deadline, block);
+    pub(super) fn park(&self, client: u64, db: usize, deadline: Option<u64>, block: Block) {
+        let mut list = self.waiters.lock();
+        list.park(client, db, deadline, block);
+        self.note(&list);
+    }
+
+    /// Take the waiter at `at` off the list.
+    ///
+    /// # Panics
+    ///
+    /// If `at` is not a waiter.
+    pub fn drop_waiter(&self, at: usize) {
+        let mut list = self.waiters.lock();
+        list.drop_at(at);
+        self.note(&list);
+    }
+
+    /// Take off every waiter belonging to a client that has gone.
+    pub fn forget_waiters(&self, client: u64) {
+        let mut list = self.waiters.lock();
+        list.forget(client);
+        self.note(&list);
+    }
+
+    /// Say which slot the waiter this client just registered is answered on.
+    pub fn bind_waiter(&self, client: u64, conn: u32) {
+        self.waiters.lock().bind(client, conn);
+    }
+
+    /// Publish how long the list is now.
+    ///
+    /// Called with the list held and by whoever changed it, which is what keeps
+    /// the number and the list from disagreeing about anything except a change
+    /// that has not finished.
+    fn note(&self, list: &Waiters) {
+        self.parked.store(list.len(), Relaxed);
     }
 
     /// Try to answer the waiter at `at`, writing into the buffer the engine
@@ -839,11 +884,12 @@ impl Server {
     /// # Panics
     ///
     /// If `at` is not a waiter.
-    pub fn serve_waiter(&mut self, at: usize, now: u64, out: &mut Out) -> bool {
+    pub fn serve_waiter(&self, at: usize, now: u64, out: &mut Out) -> bool {
+        let list = self.waiters.lock();
         // Serving a waiter pops an element, which makes garbage, and it happens
         // outside `execute` so nothing else has marked the database for the
         // maintenance turn.
-        self.dirty |= 1u64 << self.waiters.db_of(at);
-        self.waiters.try_serve(at, &self.dbs, now, out)
+        self.mine().mark(1u64 << list.db_of(at));
+        list.try_serve(at, &self.dbs, now, out)
     }
 }

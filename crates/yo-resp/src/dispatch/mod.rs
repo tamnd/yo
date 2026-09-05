@@ -94,7 +94,7 @@ use std::cell::Cell;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering::{Acquire, Relaxed, Release};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize};
-use yo_common::lock::Held;
+use yo_common::lock::{Held, Lock};
 use yo_common::{Code, Error};
 use yo_kv::cold::Blocks;
 use yo_kv::{Clock, Db, Keyspace};
@@ -488,7 +488,26 @@ pub struct Server {
     /// the same millisecond does not bother.
     expire_ms: u64,
     /// Clients parked on a blocking command.
-    waiters: Waiters,
+    ///
+    /// Behind a lock because a client parks on the thread that ran its command
+    /// and is woken by whichever thread later puts something under a key it
+    /// named, and those are not the same thread. The lock is only ever taken to
+    /// park somebody, to serve somebody or to forget a connection that has gone,
+    /// so a command that does not block never touches it.
+    waiters: Lock<Waiters>,
+    /// How many clients are parked.
+    ///
+    /// Beside the list rather than read out of it, because every command asks
+    /// whether anybody is waiting and nearly every answer is no. Taking a lock
+    /// to be told no would be a cache line every thread has to own to ask, which
+    /// is the cost the list was put behind a lock to avoid.
+    ///
+    /// Written under the lock, by whoever changed the list, so the number and
+    /// the list agree except while a change is in progress. A reader that asks
+    /// during one is told about the moment before it, and the worst that costs
+    /// is a walk of the list that serves nobody or one that has not started yet
+    /// and happens on the next command instead.
+    parked: AtomicUsize,
     /// Sockets `MIGRATE` is holding open to the servers it has talked to.
     ///
     /// Empty on a server nobody has migrated a key out of, which is nearly all
@@ -556,7 +575,8 @@ impl Server {
             evict_db: 0,
             expire_db: 0,
             expire_ms: 0,
-            waiters: Waiters::default(),
+            waiters: Lock::default(),
+            parked: AtomicUsize::new(0),
             peers: migrate::Peers::default(),
             locals: one_thread(),
             claimed: AtomicUsize::new(0),
@@ -606,7 +626,8 @@ impl Server {
             evict_db: 0,
             expire_db: 0,
             expire_ms: 0,
-            waiters: Waiters::default(),
+            waiters: Lock::default(),
+            parked: AtomicUsize::new(0),
             peers: migrate::Peers::default(),
             locals: one_thread(),
             claimed: AtomicUsize::new(0),
@@ -4783,6 +4804,32 @@ mod tests {
     }
 
     #[test]
+    fn the_parked_count_says_what_the_waiter_list_says() {
+        let mut f = Fixture::new();
+        assert_eq!(f.server.parked(), 0);
+        for client in 1..=3u64 {
+            f.session = Session::new(client);
+            assert_eq!(f.flow(&[b"BLPOP", b"q", b"0"]).0, Flow::Block);
+        }
+        assert_eq!(f.server.parked(), 3);
+        assert_eq!(f.server.waiters().len(), 3);
+
+        // The three ways the list gets shorter, each of which has to move the
+        // number with it, because a number left behind is either a walk of the
+        // list that never happens or one that runs off the end of it.
+        f.server.drop_waiter(1);
+        assert_eq!(f.server.parked(), f.server.waiters().len());
+        f.server.forget_waiters(1);
+        assert_eq!(f.server.parked(), f.server.waiters().len());
+        f.run(&[b"RPUSH", b"q", b"v"]);
+        let mut out = Out::new(Proto::Resp2);
+        assert!(f.server.serve_waiter(0, 0, &mut out));
+        f.server.drop_waiter(0);
+        assert_eq!(f.server.parked(), 0);
+        assert!(f.server.waiters().is_empty());
+    }
+
+    #[test]
     fn a_set_goes_from_bytes_to_bytes() {
         let mut f = Fixture::new();
         assert_eq!(f.run(&[b"SADD", b"s", b"a", b"b", b"c"]), ":3\r\n");
@@ -8840,7 +8887,7 @@ mod tests {
     fn a_parked_sorted_set_client_waits_for_a_member_and_not_for_a_key() {
         let mut f = Fixture::new();
         assert_eq!(f.flow(&[b"BZPOPMIN", b"z", b"0"]).0, Flow::Block);
-        assert_eq!(f.server.waiters().len(), 1);
+        assert_eq!(f.server.parked(), 1);
         // A string under the key is not what it asked for, so it stays parked
         // rather than being handed a WRONGTYPE on a command that was accepted.
         f.run(&[b"SET", b"z", b"v"]);
@@ -17411,7 +17458,7 @@ mod tests {
         // nothing away. That is the difference between this and BLPOP.
         let (flow, _) = f.flow(&[b"XREAD", b"BLOCK", b"0", b"STREAMS", b"s", b"$"]);
         assert_eq!(flow, Flow::Block);
-        assert_eq!(f.server.waiters().len(), 2);
+        assert_eq!(f.server.parked(), 2);
 
         f.run(&[b"XADD", b"s", b"2-1", b"a", b"2"]);
         let want = "*1\r\n*2\r\n$1\r\ns\r\n*1\r\n*2\r\n$3\r\n2-1\r\n*2\r\n$1\r\na\r\n$1\r\n2\r\n";
@@ -17423,7 +17470,7 @@ mod tests {
 
         // And a deadline that runs out is a null array, the same as a plain
         // XREAD that found nothing.
-        f.server.waiters_mut().forget(7);
+        f.server.forget_waiters(7);
         let (flow, _) = f.flow(&[b"XREAD", b"BLOCK", b"50", b"STREAMS", b"s", b"$"]);
         assert_eq!(flow, Flow::Block);
         let mut out = Out::new(Proto::Resp2);
@@ -19433,7 +19480,7 @@ mod tests {
         let (q, far) = (b"q".as_slice(), other.as_bytes());
 
         assert_eq!(f.flow(&[b"BLPOP", q, far, b"0"]).0, Flow::Block);
-        assert_eq!(f.server.waiters().len(), 1);
+        assert_eq!(f.server.parked(), 1);
         f.run(&[b"RPUSH", far, b"v"]);
         let mut out = Out::new(Proto::Resp2);
         assert!(f.server.serve_waiter(0, 0, &mut out));
@@ -19447,7 +19494,7 @@ mod tests {
 
         // And a move across two stripes is served the same way, by the push
         // that fills its source.
-        f.server.waiters_mut().forget(7);
+        f.server.forget_waiters(7);
         assert_eq!(
             f.flow(&[b"BLMOVE", q, far, b"LEFT", b"RIGHT", b"0"]).0,
             Flow::Block
