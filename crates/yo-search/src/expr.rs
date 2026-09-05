@@ -114,21 +114,38 @@ fn reading(text: &[u8]) -> Option<f64> {
 /// the way Rust does, so a fold over no numbers answers `nan` and not `NaN`.
 #[must_use]
 pub fn twelve(d: f64) -> String {
+    significant(d, 12)
+}
+
+/// Seventeen significant digits, which is how the sort key beside a row goes on
+/// the wire where the row itself holds twelve.
+///
+/// The two are worked out the same way and only the width differs, which is
+/// measured: a third answers `0.333333333333` on the row and
+/// `0.33333333333333331` beside it.
+#[must_use]
+pub fn seventeen(d: f64) -> String {
+    significant(d, 17)
+}
+
+/// A number written the way C writes it for `%g` at a given width.
+fn significant(d: f64, digits: i32) -> String {
     if d.is_nan() {
         return "nan".to_string();
     }
     if !d.is_finite() {
         return format!("{d}");
     }
-    let sci = format!("{d:.11e}");
+    let places = (digits - 1).max(0) as usize;
+    let sci = format!("{d:.places$e}");
     let (mantissa, exponent) = sci.split_once('e').expect("a scientific form has an e");
     let exponent: i32 = exponent.parse().expect("and a whole number after it");
-    if !(-4..12).contains(&exponent) {
+    if !(-4..digits).contains(&exponent) {
         let m = mantissa.trim_end_matches('0').trim_end_matches('.');
         let sign = if exponent < 0 { '-' } else { '+' };
         return format!("{m}e{sign}{:02}", exponent.abs());
     }
-    let places = (11 - exponent).max(0) as usize;
+    let places = (digits - 1 - exponent).max(0) as usize;
     let fixed = format!("{d:.places$}");
     match fixed.contains('.') {
         true => fixed
@@ -803,6 +820,17 @@ fn operate(op: Op, left: &Node, right: &Node, row: &[Value]) -> Result<Value, Ve
         Op::Rem => a % b,
         _ => a.powf(b),
     }))
+}
+
+/// How two values order beside each other, for a caller that wants the order
+/// rather than the answer to a comparison.
+///
+/// A `SORTBY` orders rows the same way the four ordering operators order two
+/// values, so the rule lives in one place and is read from both. Nothing comes
+/// back when the two have nothing to compare, which is the case an operator
+/// answers an error for and a sort leaves alone.
+pub fn order(left: &Value, right: &Value) -> Option<core::cmp::Ordering> {
+    compared(left, right)
 }
 
 /// How two values compare.
