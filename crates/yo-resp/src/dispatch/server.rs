@@ -1000,17 +1000,26 @@ fn config(server: &mut Server, args: Args<'_>, out: &mut Out) -> Result<()> {
         // a key in a different shape from the same key on the stripe next to it,
         // which `OBJECT ENCODING` would then answer differently for depending on
         // where the key happened to land.
+        // The whole database is held while its stripes are set rather than one
+        // stripe at a time, for the same reason they all get the same number: a
+        // client that read `OBJECT ENCODING` in the middle of a half done change
+        // would be told two different things about two keys depending on nothing
+        // it can see.
         for (knob, n) in writes.iter().flatten() {
             for at in 0..DATABASES {
-                for stripe in server.striped(at).stripes_mut() {
-                    write_knob(stripe, *knob, *n);
+                let db = server.striped(at);
+                let mut held = db.hold_many(0..db.width());
+                for i in 0..db.width() {
+                    write_knob(held.stripe_mut(i), *knob, *n);
                 }
             }
         }
         if let Some(p) = policy {
             for at in 0..DATABASES {
-                for stripe in server.striped(at).stripes_mut() {
-                    stripe.set_policy(p);
+                let db = server.striped(at);
+                let mut held = db.hold_many(0..db.width());
+                for i in 0..db.width() {
+                    held.stripe_mut(i).set_policy(p);
                 }
             }
         }

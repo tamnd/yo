@@ -646,18 +646,24 @@ impl Server {
     /// than about a key, which is the snapshot walk and a setting, works over
     /// all of them.
     ///
-    /// The borrow is mutable, so the database is marked as having had something
-    /// run against it. Anything that only reads has [`Server::striped_ref`] and
-    /// does not come through here.
+    /// The database is marked as having had something run against it, which is
+    /// what this does that [`Server::striped_ref`] does not. Anything that only
+    /// reads asks for that one and leaves the mark alone.
+    ///
+    /// The borrow is shared, and what makes that enough is that a database is
+    /// several stripes behind a lock each. A caller that wants to change
+    /// something holds the stripe it is changing, so two threads working on two
+    /// keys work at once and two working on one key take turns, which is the
+    /// whole point of cutting a database up.
     ///
     /// # Panics
     ///
     /// If `i` is not a database. `SELECT` is the only way a client changes the
     /// index and it checks, so an index that is out of range here is a bug in
     /// the caller and not something a client can ask for.
-    pub fn striped(&mut self, i: usize) -> &mut Db {
-        self.dirty |= 1u64 << i;
-        &mut self.dbs[i]
+    pub fn striped(&self, i: usize) -> &Db {
+        self.mine().mark(1u64 << i);
+        &self.dbs[i]
     }
 
     /// Every keyspace on the server, which is every stripe of every database.
@@ -18077,7 +18083,7 @@ mod tests {
         if attach {
             f.server
                 .striped(0)
-                .stripe_mut(0)
+                .hold_stripe(0)
                 .attach(Box::new(Mem { blobs: Vec::new() }));
         }
         let val = vec![b'v'; 256];
@@ -18361,7 +18367,7 @@ mod tests {
             // key got there.
             f.server
                 .striped(0)
-                .at(b"list")
+                .hold(b"list")
                 .push(b"list", yo_kv::End::Right, core::iter::once(&b"v"[..]))
                 .expect("a new list");
         }
@@ -18441,7 +18447,7 @@ mod tests {
             let payload = f
                 .server
                 .striped(0)
-                .at(b"d1")
+                .hold(b"d1")
                 .dump(b"d1")
                 .expect("a key that is there");
             assert!(
@@ -18564,13 +18570,13 @@ mod tests {
         // taught about stripes yet.
         f.server
             .striped(0)
-            .at(src)
+            .hold(src)
             .push(src, yo_kv::End::Right, [&b"a"[..], &b"b"[..]].into_iter())
             .expect("a new list");
         assert_eq!(f.run(&[b"RENAME", src, dst]), "+OK\r\n");
         assert_eq!(f.run(&[b"TYPE", dst]), "+list\r\n");
         assert_eq!(
-            f.server.striped(0).at(dst).llen(dst).expect("a list"),
+            f.server.striped(0).hold(dst).llen(dst).expect("a list"),
             2,
             "the members are on the stripe the key moved to"
         );
@@ -18608,17 +18614,17 @@ mod tests {
         f.run(&[b"DEL", src, dst]);
         f.server
             .striped(0)
-            .at(src)
+            .hold(src)
             .push(src, yo_kv::End::Right, [&b"a"[..], &b"b"[..]].into_iter())
             .expect("a new list");
         assert_eq!(f.run(&[b"COPY", src, dst]), ":1\r\n");
         f.server
             .striped(0)
-            .at(src)
+            .hold(src)
             .push(src, yo_kv::End::Right, core::iter::once(&b"c"[..]))
             .expect("a list that is there");
-        assert_eq!(f.server.striped(0).at(src).llen(src).expect("a list"), 3);
-        assert_eq!(f.server.striped(0).at(dst).llen(dst).expect("a list"), 2);
+        assert_eq!(f.server.striped(0).hold(src).llen(src).expect("a list"), 3);
+        assert_eq!(f.server.striped(0).hold(dst).llen(dst).expect("a list"), 2);
     }
 
     /// Every bitmap command, on one stripe and on eight, replies compared byte
@@ -18719,7 +18725,7 @@ mod tests {
     fn plant_list(f: &mut Fixture, key: &[u8]) {
         f.server
             .striped(0)
-            .at(key)
+            .hold(key)
             .push(key, yo_kv::End::Right, core::iter::once(&b"x"[..]))
             .expect("a new list");
     }
@@ -20765,7 +20771,7 @@ mod tests {
         );
         let db = f.server.striped(0);
         assert!(
-            db.stripes_mut().all(|s| s.policy().name() == "allkeys-lru"),
+            (0..db.width()).all(|i| db.hold_stripe(i).policy().name() == "allkeys-lru"),
             "a stripe kept the old policy"
         );
     }
