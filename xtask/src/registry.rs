@@ -82,6 +82,10 @@ const PLANLESS_COMMANDS: &[&str] = &[
     "FT.CURSOR",
     "FT.EXPLAIN",
     "FT.EXPLAINCLI",
+    "FT.TAGVALS",
+    "FT.DICTADD",
+    "FT.DICTDEL",
+    "FT.DICTDUMP",
 ];
 /// The bound or materialise verdicts.
 const BOUNDED: &[&str] = &["inherent", "yes", "risk"];

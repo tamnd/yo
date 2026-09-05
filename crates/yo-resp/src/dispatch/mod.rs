@@ -21483,6 +21483,154 @@ mod tests {
         assert!(f.server.search.lock().is_empty());
     }
 
+    /// An index whose schema has one tag field of each kind, plus a number so
+    /// there is something for `FT.TAGVALS` to refuse.
+    fn tagged() -> Fixture {
+        let mut f = Fixture::new();
+        f.run(&[
+            b"FT.CREATE",
+            b"tv",
+            b"PREFIX",
+            b"1",
+            b"tv:",
+            b"SCHEMA",
+            b"g",
+            b"AS",
+            b"gg",
+            b"TAG",
+            b"h",
+            b"TAG",
+            b"SEPARATOR",
+            b"|",
+            b"CASESENSITIVE",
+            b"n",
+            b"NUMERIC",
+        ]);
+        f.run(&[
+            b"HSET",
+            b"tv:1",
+            b"g",
+            b"Red, BLUE ",
+            b"h",
+            b"Aa|bB",
+            b"n",
+            b"1",
+        ]);
+        f.run(&[b"HSET", b"tv:2", b"g", b"red", b"h", b"aa", b"n", b"2"]);
+        f
+    }
+
+    /// The values come back as they are stored, so an ordinary tag field
+    /// answers them folded and trimmed and a `CASESENSITIVE` one answers what
+    /// it was given. Byte order either way, which puts the capital first.
+    #[test]
+    fn tag_values_come_back_as_they_are_stored_and_sorted_by_their_bytes() {
+        let mut f = tagged();
+        assert_eq!(
+            f.run(&[b"FT.TAGVALS", b"tv", b"gg"]),
+            "*2\r\n$4\r\nblue\r\n$3\r\nred\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"FT.TAGVALS", b"tv", b"h"]),
+            "*3\r\n$2\r\nAa\r\n$2\r\naa\r\n$2\r\nbB\r\n"
+        );
+    }
+
+    /// The name asked about is the attribute, so the identifier of a field
+    /// declared `AS` is not a name this knows.
+    #[test]
+    fn tag_values_are_asked_for_by_the_attribute_and_not_the_identifier() {
+        let mut f = tagged();
+        for (name, want) in [
+            (b"g".as_slice(), "-SEARCH_ATTR_BAD No such field\r\n"),
+            (b"zz", "-SEARCH_ATTR_BAD No such field\r\n"),
+            (b"n", "-SEARCH_ATTR_BAD Not a tag field\r\n"),
+        ] {
+            assert_eq!(f.run(&[b"FT.TAGVALS", b"tv", name]), want);
+        }
+        assert_eq!(
+            f.run(&[b"FT.TAGVALS", b"nope", b"g"]),
+            "-SEARCH_INDEX_NOT_FOUND Index not found: nope\r\n"
+        );
+    }
+
+    /// Looking up the index counts as a use of it on the roads that refuse the
+    /// field as well as on the one that answers, which is measured.
+    #[test]
+    fn asking_for_tag_values_counts_a_use_of_the_index() {
+        let mut f = tagged();
+        let uses = |f: &mut Fixture| {
+            let reply = f.run(&[b"FT.INFO", b"tv"]);
+            let at = reply.find("number_of_uses").expect("the field is reported");
+            let value = reply[at..].split("\r\n").nth(1).unwrap();
+            value.trim_start_matches(':').parse::<i64>().unwrap()
+        };
+        let before = uses(&mut f);
+        f.run(&[b"FT.TAGVALS", b"tv", b"gg"]);
+        f.run(&[b"FT.TAGVALS", b"tv", b"zz"]);
+        // Three more than before: two tag lookups and the second `FT.INFO`.
+        assert_eq!(uses(&mut f), before + 3);
+    }
+
+    /// A tag field nothing was ever written to has no list at all, which
+    /// answers the same empty set a list that has been emptied does.
+    #[test]
+    fn a_tag_field_with_nothing_in_it_answers_empty() {
+        let mut f = Fixture::new();
+        f.run(&[b"FT.CREATE", b"e", b"SCHEMA", b"g", b"TAG"]);
+        assert_eq!(f.run(&[b"FT.TAGVALS", b"e", b"g"]), "*0\r\n");
+    }
+
+    /// A dictionary is module state and not a key, so nothing in the keyspace
+    /// can see one.
+    #[test]
+    fn a_dictionary_is_not_a_key() {
+        let mut f = Fixture::new();
+        assert_eq!(f.run(&[b"FT.DICTADD", b"d", b"a", b"b"]), ":2\r\n");
+        assert_eq!(f.run(&[b"TYPE", b"d"]), "+none\r\n");
+        assert_eq!(f.run(&[b"EXISTS", b"d"]), ":0\r\n");
+        assert_eq!(f.run(&[b"KEYS", b"d"]), "*0\r\n");
+    }
+
+    /// The count is how many terms were new, an empty term is not a term, and
+    /// the dump is sorted by bytes rather than folded.
+    #[test]
+    fn a_dictionary_counts_the_terms_it_had_not_seen() {
+        let mut f = Fixture::new();
+        assert_eq!(
+            f.run(&[b"FT.DICTADD", b"d", b"zeta", b"alpha", b"Beta", b"alpha"]),
+            ":3\r\n"
+        );
+        assert_eq!(f.run(&[b"FT.DICTADD", b"d", b"alpha"]), ":0\r\n");
+        assert_eq!(f.run(&[b"FT.DICTADD", b"d", b""]), ":0\r\n");
+        assert_eq!(
+            f.run(&[b"FT.DICTDUMP", b"d"]),
+            "*3\r\n$4\r\nBeta\r\n$5\r\nalpha\r\n$4\r\nzeta\r\n"
+        );
+        assert_eq!(f.run(&[b"FT.DICTDEL", b"d", b"alpha", b"nope"]), ":1\r\n");
+    }
+
+    /// A name nobody ever added to is not an error on either of the two
+    /// commands that will take one, which is the only place in the group where
+    /// a missing name is forgiven.
+    #[test]
+    fn a_dictionary_nobody_made_dumps_empty_rather_than_failing() {
+        let mut f = Fixture::new();
+        assert_eq!(f.run(&[b"FT.DICTDUMP", b"nope"]), "*0\r\n");
+        assert_eq!(f.run(&[b"FT.DICTDEL", b"nope", b"a"]), ":0\r\n");
+    }
+
+    /// The dictionaries go when the keyspace does, the same way the indexes do.
+    #[test]
+    fn a_flush_drops_the_dictionaries() {
+        for flush in [b"FLUSHALL".as_slice(), b"FLUSHDB"] {
+            let mut f = Fixture::new();
+            f.run(&[b"FT.DICTADD", b"d", b"a"]);
+            f.run(&[flush]);
+            assert_eq!(f.run(&[b"FT.DICTDUMP", b"d"]), "*0\r\n", "{flush:?}");
+        }
+    }
+
     /// A key that will not read is counted against the index and against the
     /// field, and `FT.INFO` says so.
     #[test]
