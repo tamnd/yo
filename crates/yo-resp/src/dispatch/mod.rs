@@ -65,6 +65,7 @@ mod graph;
 mod hashes;
 mod himport;
 mod hll;
+mod indexing;
 mod json;
 mod keyspace;
 mod lists;
@@ -1595,130 +1596,150 @@ pub fn resolved(
     // a list of names: it is what `COMMAND INFO` reports about exactly these
     // commands, and the sorted set and stream ones that arrive later carry it
     // too.
-    let done =
-        if spec.flags.contains(&"blocking") {
-            blocking::execute(server, session, spec, args, out)
-        } else {
-            match spec.group {
-                "string" => {
-                    let db = session.db;
-                    strings::execute(&server.dbs[db], spec, args, out).map(|()| Flow::Continue)
-                }
-                // Its own group and its own file, and the same values underneath:
-                // a bitmap is a string, so `STRLEN` on one answers and `SETBIT` on
-                // something a `SET` left behind works.
-                "bitmap" => {
-                    let db = session.db;
-                    bits::execute(&server.dbs[db], spec, args, out).map(|()| Flow::Continue)
-                }
-                // The same again: a sketch is a string with a documented layout, so
-                // `GET` hands one to a client and `SET` takes it back.
-                "hyperloglog" => {
-                    let db = session.db;
-                    hll::execute(&server.dbs[db], spec, args, out).map(|()| Flow::Continue)
-                }
-                "set" => {
-                    let db = session.db;
-                    sets::execute(&server.dbs[db], spec, args, out).map(|()| Flow::Continue)
-                }
-                // The one hash command whose state is not in the keyspace. A
-                // fieldset belongs to the connection, so this is handed the session
-                // as well as the database, the same exception `MIGRATE` gets in the
-                // keyspace group for the socket it keeps.
-                "hash" if spec.name == "himport" => {
-                    let db = session.db;
-                    himport::execute(&server.dbs[db], &mut session.sets, args, out)
-                        .map(|()| Flow::Continue)
-                }
-                "hash" => {
-                    let db = session.db;
-                    hashes::execute(&server.dbs[db], spec, args, out).map(|()| Flow::Continue)
-                }
-                "list" => {
-                    let db = session.db;
-                    lists::execute(&server.dbs[db], spec, args, out).map(|()| Flow::Continue)
-                }
-                "zset" => {
-                    let db = session.db;
-                    zsets::execute(&server.dbs[db], spec, args, out).map(|()| Flow::Continue)
-                }
-                // A geo key is a sorted set and these are sorted set commands with
-                // arithmetic on the way in and on the way out, so a client can ZREM
-                // a place out of one and ZCARD it to count them.
-                "geo" => {
-                    let db = session.db;
-                    geo::execute(&server.dbs[db], spec, args, out).map(|()| Flow::Continue)
-                }
-                "array" => {
-                    let db = session.db;
-                    arrays::execute(&server.dbs[db], spec, args, out).map(|()| Flow::Continue)
-                }
-                "graph" => {
-                    let db = session.db;
-                    graph::execute(&server.dbs[db], spec, args, out).map(|()| Flow::Continue)
-                }
-                // A document under a key, reached by a path. The group is Redis's
-                // module surface and the storage is ours, the same trade the vector
-                // set group makes.
-                "json" => {
-                    let db = session.db;
-                    json::execute(&server.dbs[db], spec, args, out).map(|()| Flow::Continue)
-                }
-                "vector" => {
-                    let db = session.db;
-                    vectors::execute(&server.dbs[db], spec, args, out).map(|()| Flow::Continue)
-                }
-                "bloom" => {
-                    let db = session.db;
-                    bloom::execute(&server.dbs[db], spec, args, out).map(|()| Flow::Continue)
-                }
-                "cuckoo" => {
-                    let db = session.db;
-                    cuckoo::execute(&server.dbs[db], spec, args, out).map(|()| Flow::Continue)
-                }
-                "cms" => {
-                    let db = session.db;
-                    cms::execute(&server.dbs[db], spec, args, out).map(|()| Flow::Continue)
-                }
-                "topk" => {
-                    let db = session.db;
-                    topk::execute(&server.dbs[db], spec, args, out).map(|()| Flow::Continue)
-                }
-                "tdigest" => {
-                    let db = session.db;
-                    tdigest::execute(&server.dbs[db], spec, args, out).map(|()| Flow::Continue)
-                }
-                "ts" => {
-                    let db = session.db;
-                    ts::execute(&server.dbs[db], spec, args, out).map(|()| Flow::Continue)
-                }
-                // The clock is read before the database is borrowed, because every
-                // stream command needs the time and it lives on the server. An
-                // `XADD` with no ID, an `XCLAIM` working out what is idle and an
-                // `XINFO` reporting it all have to agree about what moment this is.
-                "stream" => {
-                    let db = session.db;
-                    let now = server.now_ms();
-                    streams::execute(&server.dbs[db], spec, args, now, out).map(|()| Flow::Continue)
-                }
-                // The one keyspace command that needs more than the databases,
-                // because the socket it talks down is held on the server between
-                // commands and not opened again for each one.
-                "keyspace" if spec.name == "migrate" => {
-                    migrate::execute(server, session.db, args, out).map(|()| Flow::Continue)
-                }
-                // Every database and not the one the session is on, because `COPY` takes
-                // a `DB n` and writes into a database nobody selected.
-                "keyspace" => keyspace::execute(&server.dbs, session.db, spec, args, out)
-                    .map(|()| Flow::Continue),
-                // No database at all, because an index is not a key. The registry
-                // is the whole of what these sixteen commands touch.
-                "search" => search::execute(&mut server.search.lock(), spec, args, out)
-                    .map(|()| Flow::Continue),
-                "scripting" => scripting::execute(spec, args, out).map(|()| Flow::Continue),
-                _ => server::execute(server, session, spec, args, out),
+    let done = if spec.flags.contains(&"blocking") {
+        blocking::execute(server, session, spec, args, out)
+    } else {
+        match spec.group {
+            "string" => {
+                let db = session.db;
+                strings::execute(&server.dbs[db], spec, args, out).map(|()| Flow::Continue)
             }
-        };
+            // Its own group and its own file, and the same values underneath:
+            // a bitmap is a string, so `STRLEN` on one answers and `SETBIT` on
+            // something a `SET` left behind works.
+            "bitmap" => {
+                let db = session.db;
+                bits::execute(&server.dbs[db], spec, args, out).map(|()| Flow::Continue)
+            }
+            // The same again: a sketch is a string with a documented layout, so
+            // `GET` hands one to a client and `SET` takes it back.
+            "hyperloglog" => {
+                let db = session.db;
+                hll::execute(&server.dbs[db], spec, args, out).map(|()| Flow::Continue)
+            }
+            "set" => {
+                let db = session.db;
+                sets::execute(&server.dbs[db], spec, args, out).map(|()| Flow::Continue)
+            }
+            // The one hash command whose state is not in the keyspace. A
+            // fieldset belongs to the connection, so this is handed the session
+            // as well as the database, the same exception `MIGRATE` gets in the
+            // keyspace group for the socket it keeps.
+            "hash" if spec.name == "himport" => {
+                let db = session.db;
+                himport::execute(&server.dbs[db], &mut session.sets, args, out)
+                    .map(|()| Flow::Continue)
+            }
+            // The one group that reaches back into the server after it has
+            // written its reply, because a hash is what a search index is
+            // made of. What comes back is what the indexes have to be told,
+            // which is not the same as whether the command was a write.
+            "hash" => {
+                let db = session.db;
+                let changed = hashes::execute(&server.dbs[db], spec, args, out);
+                changed.map(|changed| {
+                    indexing::changed(server, db, args.get(1), changed);
+                    Flow::Continue
+                })
+            }
+            "list" => {
+                let db = session.db;
+                lists::execute(&server.dbs[db], spec, args, out).map(|()| Flow::Continue)
+            }
+            "zset" => {
+                let db = session.db;
+                zsets::execute(&server.dbs[db], spec, args, out).map(|()| Flow::Continue)
+            }
+            // A geo key is a sorted set and these are sorted set commands with
+            // arithmetic on the way in and on the way out, so a client can ZREM
+            // a place out of one and ZCARD it to count them.
+            "geo" => {
+                let db = session.db;
+                geo::execute(&server.dbs[db], spec, args, out).map(|()| Flow::Continue)
+            }
+            "array" => {
+                let db = session.db;
+                arrays::execute(&server.dbs[db], spec, args, out).map(|()| Flow::Continue)
+            }
+            "graph" => {
+                let db = session.db;
+                graph::execute(&server.dbs[db], spec, args, out).map(|()| Flow::Continue)
+            }
+            // A document under a key, reached by a path. The group is Redis's
+            // module surface and the storage is ours, the same trade the vector
+            // set group makes.
+            "json" => {
+                let db = session.db;
+                json::execute(&server.dbs[db], spec, args, out).map(|()| Flow::Continue)
+            }
+            "vector" => {
+                let db = session.db;
+                vectors::execute(&server.dbs[db], spec, args, out).map(|()| Flow::Continue)
+            }
+            "bloom" => {
+                let db = session.db;
+                bloom::execute(&server.dbs[db], spec, args, out).map(|()| Flow::Continue)
+            }
+            "cuckoo" => {
+                let db = session.db;
+                cuckoo::execute(&server.dbs[db], spec, args, out).map(|()| Flow::Continue)
+            }
+            "cms" => {
+                let db = session.db;
+                cms::execute(&server.dbs[db], spec, args, out).map(|()| Flow::Continue)
+            }
+            "topk" => {
+                let db = session.db;
+                topk::execute(&server.dbs[db], spec, args, out).map(|()| Flow::Continue)
+            }
+            "tdigest" => {
+                let db = session.db;
+                tdigest::execute(&server.dbs[db], spec, args, out).map(|()| Flow::Continue)
+            }
+            "ts" => {
+                let db = session.db;
+                ts::execute(&server.dbs[db], spec, args, out).map(|()| Flow::Continue)
+            }
+            // The clock is read before the database is borrowed, because every
+            // stream command needs the time and it lives on the server. An
+            // `XADD` with no ID, an `XCLAIM` working out what is idle and an
+            // `XINFO` reporting it all have to agree about what moment this is.
+            "stream" => {
+                let db = session.db;
+                let now = server.now_ms();
+                streams::execute(&server.dbs[db], spec, args, now, out).map(|()| Flow::Continue)
+            }
+            // The one keyspace command that needs more than the databases,
+            // because the socket it talks down is held on the server between
+            // commands and not opened again for each one.
+            "keyspace" if spec.name == "migrate" => {
+                migrate::execute(server, session.db, args, out).map(|()| Flow::Continue)
+            }
+            // Every database and not the one the session is on, because `COPY` takes
+            // a `DB n` and writes into a database nobody selected.
+            "keyspace" => {
+                keyspace::execute(&server.dbs, session.db, spec, args, out).map(|()| Flow::Continue)
+            }
+            // No database at all, because an index is not a key. The registry
+            // is the whole of what these sixteen commands touch, and then
+            // `FT.CREATE` hands back the name it made so the keys that
+            // already match its prefix can be read into it. The lock goes
+            // before the scan runs, since the scan takes it again for every
+            // key it reads.
+            "search" => {
+                let db = session.db;
+                let made = search::execute(&mut server.search.lock(), db, spec, args, out);
+                made.map(|made| {
+                    if let Some(name) = made {
+                        indexing::scan(server, db, name);
+                    }
+                    Flow::Continue
+                })
+            }
+            "scripting" => scripting::execute(spec, args, out).map(|()| Flow::Continue),
+            _ => server::execute(server, session, spec, args, out),
+        }
+    };
     let flow = match done {
         Ok(flow) => flow,
         Err(e) => {
@@ -20801,6 +20822,337 @@ mod tests {
         assert!(
             (0..db.width()).all(|i| db.hold_stripe(i).policy().name() == "allkeys-lru"),
             "a stripe kept the old policy"
+        );
+    }
+
+    /// What an index holds, as the two numbers `FT.INFO` reports about it.
+    ///
+    /// Read off the registry rather than parsed back out of an `FT.INFO` reply,
+    /// because the reply is thirty odd fields and these two are the ones the
+    /// keyspace hook moves.
+    fn held(f: &Fixture, name: &[u8]) -> (usize, u32) {
+        let search = f.server.search.lock();
+        let index = search.named(name).expect("the index is there");
+        (index.held.docs.len(), index.held.docs.last())
+    }
+
+    /// A hash written under an index's prefix reaches it, and one written
+    /// outside the prefix does not.
+    #[test]
+    fn a_hash_that_is_written_reaches_the_index_that_follows_it() {
+        let mut f = Fixture::new();
+        f.run(&[
+            b"FT.CREATE",
+            b"ix",
+            b"PREFIX",
+            b"1",
+            b"p:",
+            b"SCHEMA",
+            b"t",
+            b"TEXT",
+        ]);
+        f.run(&[b"HSET", b"p:1", b"t", b"running dogs"]);
+        assert_eq!(held(&f, b"ix"), (1, 1));
+        f.run(&[b"HSET", b"other:1", b"t", b"running dogs"]);
+        assert_eq!(held(&f, b"ix"), (1, 1));
+
+        // Every field of the key and not the one the command named, since a
+        // document is read from nothing every time.
+        f.run(&[b"HSET", b"p:1", b"u", b"beta"]);
+        f.run(&[b"HDEL", b"p:1", b"u"]);
+        assert_eq!(held(&f, b"ix"), (1, 3));
+        let search = f.server.search.lock();
+        let index = search.named(b"ix").expect("there");
+        assert_eq!(index.held.docs.id(b"p:1"), Some(3));
+    }
+
+    /// A fresh index reads the keys that were already there, and walks past a
+    /// key of the wrong type without counting a failure.
+    #[test]
+    fn a_fresh_index_reads_the_keys_that_were_already_there() {
+        let mut f = Fixture::new();
+        f.run(&[b"HSET", b"p:1", b"t", b"alpha"]);
+        f.run(&[b"SET", b"p:str", b"not a hash"]);
+        f.run(&[b"HSET", b"q:1", b"t", b"beta"]);
+        f.run(&[
+            b"FT.CREATE",
+            b"ix",
+            b"PREFIX",
+            b"1",
+            b"p:",
+            b"SCHEMA",
+            b"t",
+            b"TEXT",
+        ]);
+
+        assert_eq!(held(&f, b"ix"), (1, 1));
+        let search = f.server.search.lock();
+        let index = search.named(b"ix").expect("there");
+        assert_eq!(index.trouble.whole().failures(), 0);
+    }
+
+    /// `SKIPINITIALSCAN` leaves what was there alone, and a later write to one
+    /// of those keys still lands.
+    #[test]
+    fn an_index_that_skipped_the_scan_fills_up_on_the_next_write() {
+        let mut f = Fixture::new();
+        f.run(&[b"HSET", b"p:1", b"t", b"alpha"]);
+        f.run(&[
+            b"FT.CREATE",
+            b"ix",
+            b"PREFIX",
+            b"1",
+            b"p:",
+            b"SKIPINITIALSCAN",
+            b"SCHEMA",
+            b"t",
+            b"TEXT",
+        ]);
+        assert_eq!(held(&f, b"ix"), (0, 0));
+        f.run(&[b"HSET", b"p:1", b"t", b"alpha"]);
+        assert_eq!(held(&f, b"ix"), (1, 1));
+    }
+
+    /// A command that changed nothing leaves the document where it was, which
+    /// is not the same as a command that was not a write.
+    ///
+    /// All five of these were measured against 8.10.1. Writing the same value
+    /// again moves the number and a deadline set for later does not, which is
+    /// the pair that makes the rule "the fields are not what they were" rather
+    /// than "this was a write".
+    #[test]
+    fn only_a_real_change_gives_the_document_a_new_number() {
+        let mut f = Fixture::new();
+        f.run(&[
+            b"FT.CREATE",
+            b"ix",
+            b"PREFIX",
+            b"1",
+            b"p:",
+            b"SCHEMA",
+            b"t",
+            b"TEXT",
+        ]);
+        f.run(&[b"HSET", b"p:1", b"t", b"alpha"]);
+        assert_eq!(held(&f, b"ix"), (1, 1));
+
+        f.run(&[b"HSET", b"p:1", b"t", b"alpha"]);
+        assert_eq!(held(&f, b"ix"), (1, 2), "the same value still rewrites");
+
+        for quiet in [
+            vec![b"HSETNX".as_slice(), b"p:1", b"t", b"other"],
+            vec![b"HDEL".as_slice(), b"p:1", b"nosuch"],
+            vec![b"HGET".as_slice(), b"p:1", b"t"],
+            vec![b"HGETALL".as_slice(), b"p:1"],
+            vec![b"HEXPIRE".as_slice(), b"p:1", b"100", b"FIELDS", b"1", b"t"],
+            vec![b"HPERSIST".as_slice(), b"p:1", b"FIELDS", b"1", b"t"],
+            vec![
+                b"HGETEX".as_slice(),
+                b"p:1",
+                b"EX",
+                b"100",
+                b"FIELDS",
+                b"1",
+                b"t",
+            ],
+            vec![b"HGETDEL".as_slice(), b"p:1", b"FIELDS", b"1", b"nosuch"],
+        ] {
+            f.run(&quiet);
+            assert_eq!(held(&f, b"ix"), (1, 2), "{:?} moved the document", quiet[0]);
+        }
+
+        // And the ones that do change something.
+        f.run(&[b"HSET", b"p:2", b"n", b"1"]);
+        f.run(&[b"HINCRBY", b"p:2", b"n", b"1"]);
+        assert_eq!(held(&f, b"ix"), (2, 4));
+        // A deadline that has already passed takes the field away, and taking
+        // the last field away takes the key and the document with it. The
+        // number still moves on the way past, because the field going and the
+        // key going are two separate pieces of news and the first of them
+        // writes the document one last time.
+        f.run(&[b"HEXPIRE", b"p:2", b"0", b"FIELDS", b"1", b"n"]);
+        assert_eq!(held(&f, b"ix"), (1, 5));
+    }
+
+    /// The two ways of emptying a hash, which do not leave the same thing
+    /// behind. `HDEL` of the last field spends no number and is counted as a
+    /// refusal, and a deadline that has already passed spends one on a document
+    /// nobody sees and is counted as nothing. Measured against 8.10.1 and not
+    /// something anyone would guess.
+    #[test]
+    fn a_key_emptied_by_a_deadline_spends_a_number_and_one_emptied_by_hdel_does_not() {
+        /// The index's own failure count.
+        fn refused(f: &Fixture, name: &[u8]) -> u64 {
+            let search = f.server.search.lock();
+            let index = search.named(name).expect("the index is there");
+            index.trouble.whole().failures()
+        }
+
+        let mut f = Fixture::new();
+        f.run(&[
+            b"FT.CREATE",
+            b"ix",
+            b"PREFIX",
+            b"1",
+            b"p:",
+            b"SCHEMA",
+            b"t",
+            b"TEXT",
+        ]);
+        f.run(&[b"HSET", b"p:1", b"t", b"alpha"]);
+        assert_eq!(held(&f, b"ix"), (1, 1));
+        f.run(&[b"HDEL", b"p:1", b"t"]);
+        assert_eq!(
+            held(&f, b"ix"),
+            (0, 1),
+            "HDEL of the last field spends none"
+        );
+        assert_eq!(refused(&f, b"ix"), 1, "and is counted as a refusal");
+
+        f.run(&[b"HSET", b"p:2", b"t", b"alpha"]);
+        assert_eq!(held(&f, b"ix"), (1, 2));
+        f.run(&[b"HEXPIRE", b"p:2", b"0", b"FIELDS", b"1", b"t"]);
+        assert_eq!(held(&f, b"ix"), (0, 3), "a deadline spends one");
+        assert_eq!(refused(&f, b"ix"), 1, "and is counted as nothing");
+
+        f.run(&[b"HSET", b"p:3", b"t", b"alpha"]);
+        assert_eq!(held(&f, b"ix"), (1, 4));
+        f.run(&[b"HGETDEL", b"p:3", b"FIELDS", b"1", b"t"]);
+        assert_eq!(held(&f, b"ix"), (0, 5), "and so does HGETDEL");
+
+        // Two fields and one command is one rewrite and not two, whichever way
+        // the fields go.
+        f.run(&[b"HSET", b"p:4", b"t", b"alpha", b"u", b"beta"]);
+        assert_eq!(held(&f, b"ix"), (1, 6));
+        f.run(&[b"HEXPIRE", b"p:4", b"0", b"FIELDS", b"2", b"t", b"u"]);
+        assert_eq!(held(&f, b"ix"), (0, 7));
+        assert_eq!(refused(&f, b"ix"), 1);
+    }
+
+    /// `HSETEX` with a deadline that has already passed is two pieces of news
+    /// from one command, so the number moves twice and the value never reaches
+    /// the index.
+    #[test]
+    fn a_field_written_already_past_its_deadline_moves_the_number_twice() {
+        let mut f = Fixture::new();
+        f.run(&[
+            b"FT.CREATE",
+            b"ix",
+            b"PREFIX",
+            b"1",
+            b"p:",
+            b"SCHEMA",
+            b"t",
+            b"TEXT",
+            b"u",
+            b"TEXT",
+        ]);
+        f.run(&[b"HSET", b"p:1", b"u", b"keepme"]);
+        assert_eq!(held(&f, b"ix"), (1, 1));
+        f.run(&[
+            b"HSETEX", b"p:1", b"EXAT", b"1", b"FIELDS", b"1", b"t", b"zqx",
+        ]);
+        assert_eq!(
+            held(&f, b"ix"),
+            (1, 3),
+            "the key lived and the field did not"
+        );
+
+        // And the same when the key does not survive it.
+        f.run(&[b"HSET", b"p:2", b"t", b"alpha"]);
+        assert_eq!(held(&f, b"ix"), (2, 4));
+        f.run(&[
+            b"HSETEX", b"p:2", b"EXAT", b"1", b"FIELDS", b"1", b"t", b"zqx",
+        ]);
+        assert_eq!(held(&f, b"ix"), (1, 6));
+    }
+
+    /// A key that will not read is counted against the index and against the
+    /// field, and `FT.INFO` says so.
+    #[test]
+    fn a_hash_that_will_not_read_is_counted_where_ft_info_reports_it() {
+        let mut f = Fixture::new();
+        f.run(&[
+            b"FT.CREATE",
+            b"ix",
+            b"PREFIX",
+            b"1",
+            b"p:",
+            b"SCHEMA",
+            b"n",
+            b"NUMERIC",
+        ]);
+        f.run(&[b"HSET", b"p:1", b"n", b"notanumber"]);
+        assert_eq!(held(&f, b"ix"), (0, 0));
+
+        let reply = f.run(&[b"FT.INFO", b"ix"]);
+        assert!(
+            reply.contains("SEARCH_NUMERIC_VALUE_INVALID Invalid numeric value: 'notanumber'"),
+            "{reply}"
+        );
+        assert!(reply.contains("hash_indexing_failures"), "{reply}");
+    }
+
+    /// An index can only be made on database zero, and the check comes after
+    /// the `IFNX` shortcut and before everything else.
+    #[test]
+    fn an_index_can_only_be_made_on_database_zero() {
+        let mut f = Fixture::new();
+        f.run(&[b"FT.CREATE", b"ix", b"SCHEMA", b"t", b"TEXT"]);
+        f.run(&[b"SELECT", b"1"]);
+        let refused = "-Cannot create index on db != 0\r\n";
+        assert_eq!(
+            f.run(&[b"FT.CREATE", b"jx", b"SCHEMA", b"t", b"TEXT"]),
+            refused
+        );
+        // The name is taken, and it still answers about the database.
+        assert_eq!(
+            f.run(&[b"FT.CREATE", b"ix", b"SCHEMA", b"t", b"TEXT"]),
+            refused
+        );
+        // And so does one whose arguments are nonsense.
+        assert_eq!(
+            f.run(&[b"FT.CREATE", b"zz", b"BOGUS", b"SCHEMA", b"t", b"TEXT"]),
+            refused
+        );
+        // `IFNX` over a name that is taken is the one that gets through.
+        assert_eq!(
+            f.run(&[b"FT._CREATEIFNX", b"ix", b"SCHEMA", b"t", b"TEXT"]),
+            "+OK\r\n"
+        );
+        assert_eq!(f.server.search.lock().len(), 1);
+    }
+
+    /// The scan reads the database the create was run on, and after that the
+    /// index follows its keys in every database.
+    ///
+    /// The asymmetry is a real server's, measured, and it is the sort of thing
+    /// nobody would arrive at by choosing.
+    #[test]
+    fn the_scan_is_one_database_and_the_following_is_all_of_them() {
+        let mut f = Fixture::new();
+        f.run(&[b"SELECT", b"1"]);
+        f.run(&[b"HSET", b"p:9", b"t", b"on one"]);
+        f.run(&[b"SELECT", b"0"]);
+        f.run(&[b"HSET", b"p:0", b"t", b"on zero"]);
+        f.run(&[
+            b"FT.CREATE",
+            b"ix",
+            b"PREFIX",
+            b"1",
+            b"p:",
+            b"SCHEMA",
+            b"t",
+            b"TEXT",
+        ]);
+        assert_eq!(held(&f, b"ix"), (1, 1), "the scan read database zero only");
+
+        f.run(&[b"SELECT", b"1"]);
+        f.run(&[b"HSET", b"p:8", b"t", b"later"]);
+        assert_eq!(
+            held(&f, b"ix"),
+            (2, 2),
+            "and then it follows every database"
         );
     }
 }

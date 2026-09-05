@@ -61,11 +61,15 @@
 //!
 //! # What is not here yet
 //!
-//! The wiring above it. A registry can be told that a key changed, but nothing
-//! yet tells it as a hash is written, and nothing yet answers `FT.SEARCH`, so
-//! all of this is reachable from Rust and not from a client. `FILTER` is the
-//! other gap: an index carrying one follows every key its prefixes cover,
-//! because the expression over the value is not parsed yet.
+//! The queries. A hash command now reaches all of this and `FT.INFO` reports
+//! what it found, so an index on a running server fills up as keys are written,
+//! but nothing answers `FT.SEARCH` yet and the lists are only readable from
+//! Rust.
+//!
+//! The other gaps are on the way in. `FILTER` is not parsed, so an index
+//! carrying one follows every key its prefixes cover. The keyspace commands are
+//! not wired, so `DEL`, `RENAME`, `COPY` and a key that expires leave a
+//! document behind, where a hash command that empties a key does not.
 //!
 //! # Why the registry is per server
 //!

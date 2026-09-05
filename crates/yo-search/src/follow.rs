@@ -32,6 +32,24 @@
 //! there leaves the document alone. So the rule is not "this command was a
 //! write", it is "the value under this key is not what it was".
 //!
+//! # The two ways of emptying a hash are not the same
+//!
+//! A key that ends up with no fields left is either a refusal or a document
+//! with nothing in it, and which one it is depends on how it emptied. `HDEL` of
+//! the last field sends the indexes to read a key that is not there, and that
+//! is counted in `hash_indexing_failures` with the sentence about a key that
+//! does not exist. A deadline that took the last field, which is `HEXPIRE key
+//! 0` or `HGETDEL`, writes the document one more time with nothing in it before
+//! taking it away, so it spends a number and is counted as nothing. There is no
+//! reason for the difference other than that a real server has two code paths,
+//! and no way to see it other than through `FT.INFO`, which is where anyone
+//! would meet it.
+//!
+//! `HSETEX` with a deadline that has already passed is the third shape. It is
+//! one command and two pieces of news, so `max_doc_id` moves twice and the
+//! value it was handed never reaches the index at all, because the field is
+//! dead before anything goes to read it.
+//!
 //! # A key of the wrong type is not a failure
 //!
 //! An index `ON HASH` passes over a string or a list sitting under its prefix
@@ -49,6 +67,12 @@
 //! from the registry being per server rather than per database, which is itself
 //! measured rather than chosen.
 //!
+//! The scan is the other half of that and does not match it. An index reads the
+//! database it was created on and no other, so the same key on database one is
+//! invisible to it until something writes to that key. Both halves are measured
+//! and neither is a choice. It matters less than it reads, because a real
+//! server refuses `FT.CREATE` anywhere but on database zero.
+//!
 //! # What the failures are for
 //!
 //! A document that cannot be read is counted twice, once against the index and
@@ -65,7 +89,7 @@
 use std::collections::BTreeMap;
 
 use crate::english::English;
-use crate::held::Failed;
+use crate::held::{Failed, VANISHED};
 use crate::index::{Index, Source};
 use crate::registry::Registry;
 
@@ -193,6 +217,18 @@ impl Index {
             }
         }
     }
+
+    /// Counts a key that was not there when this index went to read it.
+    ///
+    /// Against the index and against no field, since there is no field in the
+    /// schema to blame for a key that is not there.
+    pub fn vanished(&mut self, key: &[u8]) {
+        let sentence = format!(
+            "{VANISHED} Key does not exist or is not a hash: {}",
+            String::from_utf8_lossy(key)
+        );
+        self.trouble.whole.note(key, &sentence);
+    }
 }
 
 impl Registry {
@@ -222,6 +258,27 @@ impl Registry {
         }
     }
 
+    /// Tells every index that follows a key that the key was not there when it
+    /// went to read it, which is counted as a refusal.
+    ///
+    /// One command does this and it is `HDEL` taking the last field, which
+    /// leaves nothing under the key to read. A real server counts that as an
+    /// indexing failure, where the same key emptied by a deadline is not
+    /// counted at all, and the two are worth telling apart because the counter
+    /// is in `FT.INFO` and it never goes back down.
+    ///
+    /// No field is blamed, because there is no field to blame. A bad number
+    /// names the field it was in and this names nothing, which is the shape a
+    /// real server reports as well.
+    pub fn vanished(&mut self, source: Source, key: &[u8]) {
+        for index in self.reading().0 {
+            if index.follows(source, key) {
+                index.vanished(key);
+            }
+            index.erase(key);
+        }
+    }
+
     /// Whether reading this key back is worth doing at all.
     ///
     /// The question the write path asks before it goes and fetches a hash it
@@ -236,6 +293,48 @@ impl Registry {
     #[must_use]
     pub fn watching(&self) -> bool {
         !self.is_empty()
+    }
+
+    /// Whether one named index wants a key, which is what the initial scan asks
+    /// before it goes and reads one back.
+    ///
+    /// The exact name and never an alias, because the only caller is
+    /// `FT.CREATE` handing back the name it just made.
+    #[must_use]
+    pub fn wants(&self, name: &[u8], source: Source, key: &[u8]) -> bool {
+        self.named(name)
+            .is_some_and(|index| index.follows(source, key))
+    }
+
+    /// Reads a key into one index and leaves every other index alone.
+    ///
+    /// The scan a fresh index runs over the keys that were already there.
+    /// [`Registry::wrote`] is the wrong thing for it: an `FT.CREATE` over a
+    /// prefix that another index already covers would renumber every document
+    /// that one holds, and a real server does not do that to an index nobody
+    /// touched.
+    pub fn filled(
+        &mut self,
+        name: &[u8],
+        source: Source,
+        key: &[u8],
+        fields: &[(&[u8], &[u8])],
+    ) -> bool {
+        let (mut indexes, english) = self.reading();
+        let Some(index) = indexes.find(|index| &*index.name == name) else {
+            return false;
+        };
+        index.follows(source, key) && index.wrote(english, key, fields)
+    }
+
+    /// Whether an index by this name is one the scan should run for.
+    ///
+    /// `SKIPINITIALSCAN` says no, and so does a name that is not there, which
+    /// is what a failed create leaves behind.
+    #[must_use]
+    pub fn scanning(&self, name: &[u8]) -> bool {
+        self.named(name)
+            .is_some_and(|index| !index.definition.skip_initial_scan)
     }
 }
 
@@ -463,6 +562,72 @@ mod tests {
         assert_eq!(counts(&r), (4, 5, 8));
         r.wrote(Source::Hash, b"p:5", &[(&b"t"[..], &b"alpha"[..])]);
         assert_eq!(counts(&r), (5, 5, 9));
+    }
+
+    /// The scan fills the index that was just made and does not disturb the one
+    /// that was already over the same prefix.
+    #[test]
+    fn a_scan_fills_one_index_and_leaves_the_others_where_they_were() {
+        let mut r = registry(on(b"p:", vec![text()]));
+        r.wrote(Source::Hash, b"p:1", &[(&b"t"[..], &b"alpha"[..])]);
+        let mut second = on(b"p:", vec![text()]);
+        second.name = b"jx".to_vec().into();
+        r.create(second).expect("free");
+
+        assert!(r.wants(b"jx", Source::Hash, b"p:1"));
+        assert!(!r.wants(b"jx", Source::Hash, b"q:1"));
+        assert!(!r.wants(b"nope", Source::Hash, b"p:1"));
+        assert!(r.filled(b"jx", Source::Hash, b"p:1", &[(&b"t"[..], &b"alpha"[..])]));
+        assert!(!r.filled(b"jx", Source::Hash, b"q:1", &[(&b"t"[..], &b"alpha"[..])]));
+        assert!(!r.filled(b"nope", Source::Hash, b"p:1", &[]));
+
+        // The new one has it, and the old one still has the number it had.
+        assert_eq!(r.named(b"jx").and_then(|i| i.held.docs.id(b"p:1")), Some(1));
+        assert_eq!(r.named(b"ix").and_then(|i| i.held.docs.id(b"p:1")), Some(1));
+    }
+
+    /// `SKIPINITIALSCAN` is the one thing that turns the scan off, and a name
+    /// that is not there answers the same way.
+    #[test]
+    fn an_index_that_asked_to_be_left_alone_is_not_scanned() {
+        let mut skipping = on(b"p:", vec![text()]);
+        skipping.definition.skip_initial_scan = true;
+        let mut r = registry(skipping);
+        assert!(!r.scanning(b"ix"));
+        assert!(!r.scanning(b"nope"));
+
+        let mut second = on(b"p:", vec![text()]);
+        second.name = b"jx".to_vec().into();
+        r.create(second).expect("free");
+        assert!(r.scanning(b"jx"));
+    }
+
+    /// A key that was not there when the index went to read it is counted
+    /// against the index, is not counted against any field, and takes whatever
+    /// document it had with it.
+    #[test]
+    fn a_key_that_is_not_there_is_counted_and_erased() {
+        let mut r = registry(on(b"p:", vec![text()]));
+        r.wrote(Source::Hash, b"p:1", &[(&b"t"[..], &b"alpha"[..])]);
+        assert_eq!(r.named(b"ix").map(|i| i.held.docs.len()), Some(1));
+
+        r.vanished(Source::Hash, b"p:1");
+        let ix = r.named(b"ix").expect("the index is there");
+        assert_eq!(ix.held.docs.len(), 0);
+        assert_eq!(ix.trouble.whole().failures(), 1);
+        assert_eq!(ix.trouble.whole().key(), Some(&b"p:1"[..]));
+        assert_eq!(
+            ix.trouble.whole().last(),
+            Some(&b"SEARCH_QUERY_BAD Key does not exist or is not a hash: p:1"[..])
+        );
+        assert_eq!(ix.trouble.field(b"t").failures(), 0);
+
+        // A key no index follows is erased and counted against nobody.
+        r.vanished(Source::Hash, b"q:1");
+        assert_eq!(
+            r.named(b"ix").map(|i| i.trouble.whole().failures()),
+            Some(1)
+        );
     }
 
     /// An empty registry answers no to everything, which is what keeps the

@@ -164,6 +164,13 @@ impl<'a> Fail<'a> {
 type Answer<'a> = core::result::Result<(), Fail<'a>>;
 
 const EXISTS: &str = "SEARCH_INDEX_EXISTS Index already exists";
+/// What `FT.CREATE` says anywhere but on database zero.
+///
+/// The only sentence in the group with no code word in front of it, which reads
+/// like an oversight and is what a real server sends. Only the two creates
+/// refuse. `FT.ALTER` and `FT.DROPINDEX` work from any database, and the rest
+/// answer the same everywhere, since the registry is one table for the server.
+const NOT_DB_ZERO: &str = "Cannot create index on db != 0";
 const ALIAS_EXISTS: &str = "SEARCH_INDEX_EXISTS Alias already exists";
 const MISSING: &str = "SEARCH_INDEX_NOT_FOUND Index not found: ";
 const CONFLICT: &str = "SEARCH_ALIAS_CONFLICT Alias conflicts with an existing index name";
@@ -237,15 +244,20 @@ fn bad(what: &'static str, why: &'static str) -> Fail<'static> {
     Fail::about(BAD_ARGS, what.as_bytes(), why)
 }
 
-pub(super) fn execute(
+pub(super) fn execute<'a>(
     reg: &mut Registry,
+    db: usize,
     spec: &Spec,
-    args: Args<'_>,
+    args: Args<'a>,
     out: &mut Out,
-) -> Result<()> {
+) -> Result<Option<&'a [u8]>> {
+    // The name of an index that was made here, so the caller can run the scan
+    // over the keys that were already there. It stays `None` for the other
+    // sixteen commands, and for a create that answered that the name is taken.
+    let mut made = None;
     let done = match spec.name {
-        "FT.CREATE" => create(reg, args, out, false),
-        "FT._CREATEIFNX" => create(reg, args, out, true),
+        "FT.CREATE" => create(reg, db, args, out, false).map(|name| made = name),
+        "FT._CREATEIFNX" => create(reg, db, args, out, true).map(|name| made = name),
         "FT.ALTER" => alter(reg, args, out, false),
         "FT._ALTERIFNX" => alter(reg, args, out, true),
         "FT.DROPINDEX" => drop_index(reg, spec, args, out, false, true),
@@ -266,8 +278,9 @@ pub(super) fn execute(
     };
     if let Err(f) = done {
         f.write(out);
+        return Ok(None);
     }
-    Ok(())
+    Ok(made)
 }
 
 /// `FT.CREATE index [options] SCHEMA field type [options] ...`
@@ -275,13 +288,32 @@ pub(super) fn execute(
 /// The name is checked before the arguments are, which is a real server's order
 /// and is visible: `FT.CREATE i BOGUS SCHEMA t TEXT` over an index that already
 /// exists answers that it exists rather than that `BOGUS` is not an argument.
-fn create<'a>(reg: &mut Registry, args: Args<'a>, out: &mut Out, ifnx: bool) -> Answer<'a> {
+///
+/// The name comes back when an index was made, because the keys that already
+/// match its prefix have to be read into it and this is the only place that
+/// knows one was made. `FT._CREATEIFNX` over a name that is taken answers `OK`
+/// and hands back nothing, since there is nothing new to fill.
+fn create<'a>(
+    reg: &mut Registry,
+    db: usize,
+    args: Args<'a>,
+    out: &mut Out,
+    ifnx: bool,
+) -> core::result::Result<Option<&'a [u8]>, Fail<'a>> {
     let name = args.get(1);
+    // The `IFNX` shortcut comes first and the database comes second, which is
+    // the order a real server checks them in and is visible: `FT._CREATEIFNX`
+    // over a name that is taken answers `OK` from database one, while
+    // `FT.CREATE` over the same name from database one refuses on the database
+    // rather than on the name.
+    if ifnx && reg.named(name).is_some() {
+        out.ok();
+        return Ok(None);
+    }
+    if db != 0 {
+        return Err(Fail::plain(NOT_DB_ZERO));
+    }
     if reg.named(name).is_some() {
-        if ifnx {
-            out.ok();
-            return Ok(());
-        }
         return Err(Fail::plain(EXISTS));
     }
 
@@ -293,7 +325,7 @@ fn create<'a>(reg: &mut Registry, args: Args<'a>, out: &mut Out, ifnx: bool) -> 
     // leave half an index behind.
     let _ = reg.create(Index::new(name, definition, schema));
     out.ok();
-    Ok(())
+    Ok(Some(name))
 }
 
 /// The options in front of `SCHEMA`, and where the schema starts.
@@ -1202,7 +1234,18 @@ fn info<'a>(reg: &mut Registry, args: Args<'a>, out: &mut Out) -> Answer<'a> {
     // build does not keep yet. All four are a division by nought on an empty
     // index, and a real server answers `nan` there for the same reason rather
     // than as a placeholder.
-    number(out, "records_per_doc_avg", records as f64 / docs as f64);
+    //
+    // The division is done in single precision and printed in double, which is
+    // what a real server does and is visible: seventeen records over three
+    // documents comes out as 5.666666507720947 and not 5.666666666666667. The
+    // counters are doubles by the time they reach the reply and the arithmetic
+    // behind them is not, so a client comparing the two builds sees the same
+    // digits.
+    number(
+        out,
+        "records_per_doc_avg",
+        f64::from(records as f32 / docs as f32),
+    );
     number(out, "bytes_per_record_avg", f64::NAN);
     number(out, "offsets_per_term_avg", f64::NAN);
     number(out, "offset_bits_per_record_avg", f64::NAN);

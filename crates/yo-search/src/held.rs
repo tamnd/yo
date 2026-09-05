@@ -72,6 +72,9 @@ use crate::words::{Words, stem};
 /// The name a real server gives the error a bad number raises.
 pub const NUMERIC: &str = "SEARCH_NUMERIC_VALUE_INVALID";
 
+/// And the one it gives a key that was not there when it went to read it.
+pub const VANISHED: &str = "SEARCH_QUERY_BAD";
+
 /// Why a document was not indexed.
 ///
 /// One reason so far, because a number is the only thing in a schema that can

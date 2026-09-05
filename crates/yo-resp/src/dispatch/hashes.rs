@@ -28,9 +28,10 @@
 
 use yo_common::{Code, Error, Result, glob_matches, parse_i64};
 use yo_kv::hash::Text;
-use yo_kv::{Ask, Cond, Db, Exists, Expire, Keyspace, MAX_AT};
+use yo_kv::{Applied, Ask, Cond, Db, Exists, Expire, Keyspace, MAX_AT};
 
 use super::args::{self, Args};
+use super::indexing::Change;
 use super::scan;
 use super::table::Spec;
 use crate::reply::Out;
@@ -85,10 +86,19 @@ const SETEX_ONE_COND: &str = "Only one of FXX or FNX arguments can be specified"
 /// is found once here and everything below goes on taking a keyspace. A hash
 /// lives on one stripe whatever is done to it, since nothing here reads a
 /// second key.
-pub(super) fn execute(db: &Db, spec: &Spec, args: Args<'_>, out: &mut Out) -> Result<()> {
+///
+/// What comes back is what a search index needs in order to know that its copy
+/// of the document is stale, which is not the same as whether the command was a
+/// write: `HSETNX` on a field that is there and `HDEL` of a field that is not
+/// both change nothing, and a real server leaves the document alone for both.
+/// The field deadline commands are the surprise. Setting or clearing a deadline
+/// is not a change by this measure, because the values are the same afterwards,
+/// and a real server does not reindex for it. `HEXPIRE key 0` is, because a
+/// deadline that has already passed takes the field away.
+pub(super) fn execute(db: &Db, spec: &Spec, args: Args<'_>, out: &mut Out) -> Result<Change> {
     let mut held = db.hold(args.get(1));
     let db = &mut *held;
-    match spec.name {
+    let changed = match spec.name {
         // HSET and HMSET are the same write and differ only in the reply, which
         // is why HMSET has been deprecated since 4.0 and still has to work.
         "hset" | "hmset" => {
@@ -101,26 +111,51 @@ pub(super) fn execute(db: &Db, spec: &Spec, args: Args<'_>, out: &mut Out) -> Re
             } else {
                 out.ok();
             }
+            // Writing a field the value it already had still counts. A real
+            // server throws the document away and reads the key again either
+            // way, so the document comes back with a new number, and matching
+            // that is the whole point of this answer.
+            Change::Fields
         }
-        "hsetnx" => out.int(i64::from(db.hsetnx(
-            args.get(1),
-            args.get(2),
-            args.get(3),
-        )?)),
-        "hget" => db.hget(args.get(1), args.get(2), |t| match t {
-            Some(t) => write_text(out, t),
-            None => out.nil(),
-        })?,
-        "hdel" => out.int(count(db.hdel(args.get(1), fields(args, 2))?)),
-        "hlen" => out.int(count(db.hlen(args.get(1))?)),
-        "hexists" => out.int(i64::from(db.hexists(args.get(1), args.get(2))?)),
-        "hstrlen" => out.int(count(db.hstrlen(args.get(1), args.get(2))?)),
+        "hsetnx" => {
+            let wrote = db.hsetnx(args.get(1), args.get(2), args.get(3))?;
+            out.int(i64::from(wrote));
+            Change::when(wrote)
+        }
+        "hget" => {
+            db.hget(args.get(1), args.get(2), |t| match t {
+                Some(t) => write_text(out, t),
+                None => out.nil(),
+            })?;
+            Change::Nothing
+        }
+        "hdel" => {
+            let gone = db.hdel(args.get(1), fields(args, 2))?;
+            out.int(count(gone));
+            // `Taken` and not `Fields`, which is the whole of the difference
+            // between the two: `HDEL` of the last fields is a key the indexes
+            // go to read and do not find, and they count that.
+            Change::taken(gone > 0)
+        }
+        "hlen" => {
+            out.int(count(db.hlen(args.get(1))?));
+            Change::Nothing
+        }
+        "hexists" => {
+            out.int(i64::from(db.hexists(args.get(1), args.get(2))?));
+            Change::Nothing
+        }
+        "hstrlen" => {
+            out.int(count(db.hstrlen(args.get(1), args.get(2))?));
+            Change::Nothing
+        }
         "hmget" => {
             out.array(args.len() - 2);
             db.hmget(args.get(1), fields(args, 2), |t| match t {
                 Some(t) => write_text(out, t),
                 None => out.nil(),
             })?;
+            Change::Nothing
         }
         // The three walks. They go through `with_hash` rather than through
         // `Keyspace::hgetall`, because every one of them needs the count for its
@@ -130,19 +165,22 @@ pub(super) fn execute(db: &Db, spec: &Spec, args: Args<'_>, out: &mut Out) -> Re
         // The header goes out inside the callback and not in front of the call,
         // because `with_hash` is where WRONGTYPE is decided and nothing should
         // be written before that is known.
-        "hgetall" => db.with_hash(args.get(1), |hash| match hash {
-            Some(h) => {
-                out.map(h.len());
-                for (field, value) in h.iter() {
-                    write_text(out, field);
-                    write_text(out, value);
+        "hgetall" => {
+            db.with_hash(args.get(1), |hash| match hash {
+                Some(h) => {
+                    out.map(h.len());
+                    for (field, value) in h.iter() {
+                        write_text(out, field);
+                        write_text(out, value);
+                    }
                 }
-            }
-            // A key that is not there is the empty hash and not a nil, which is
-            // Redis's answer and what makes iterating the reply safe with no
-            // check in front of it.
-            None => out.map(0),
-        })?,
+                // A key that is not there is the empty hash and not a nil,
+                // which is Redis's answer and what makes iterating the reply
+                // safe with no check in front of it.
+                None => out.map(0),
+            })?;
+            Change::Nothing
+        }
         "hkeys" | "hvals" => {
             let want_keys = spec.name == "hkeys";
             db.with_hash(args.get(1), |hash| match hash {
@@ -154,8 +192,12 @@ pub(super) fn execute(db: &Db, spec: &Spec, args: Args<'_>, out: &mut Out) -> Re
                 }
                 None => out.array(0),
             })?;
+            Change::Nothing
         }
-        "hincrby" => out.int(db.hincrby(args.get(1), args.get(2), incr_int(args.get(3))?)?),
+        "hincrby" => {
+            out.int(db.hincrby(args.get(1), args.get(2), incr_int(args.get(3))?)?);
+            Change::Fields
+        }
         // HINCRBYFLOAT answers a bulk string and not a double, on RESP3 as well
         // as RESP2. Redis never changed it, because the exact digits are the
         // point: a client that got a double back would have to trust its own
@@ -164,22 +206,33 @@ pub(super) fn execute(db: &Db, spec: &Spec, args: Args<'_>, out: &mut Out) -> Re
         "hincrbyfloat" => {
             let by = incr_float(args.get(3))?;
             out.human_double(db.hincrbyfloat(args.get(1), args.get(2), by)?);
+            Change::Fields
         }
-        "hrandfield" => randfield(db, args, out)?,
-        "hscan" => scan(db, args, out)?,
+        "hrandfield" => {
+            randfield(db, args, out)?;
+            Change::Nothing
+        }
+        "hscan" => {
+            scan(db, args, out)?;
+            Change::Nothing
+        }
         // The field TTL family. All four setters turn into one absolute
         // millisecond and all five readers turn into one question, which is why
         // there are two helpers here and not nine.
         "hexpire" | "hpexpire" | "hexpireat" | "hpexpireat" => expire(db, spec.name, args, out)?,
         "httl" | "hpttl" | "hexpiretime" | "hpexpiretime" | "hpersist" => {
             ask(db, spec.name, args, out)?;
+            Change::Nothing
         }
         "hgetdel" => getdel(db, args, out)?,
-        "hgetex" => getex(db, args, out)?,
+        "hgetex" => {
+            getex(db, args, out)?;
+            Change::Nothing
+        }
         "hsetex" => setex(db, args, out)?,
         other => unreachable!("{other} is not a hash command"),
-    }
-    Ok(())
+    };
+    Ok(changed)
 }
 
 /// `HRANDFIELD key [count [WITHVALUES]]`.
@@ -301,7 +354,10 @@ fn scan(db: &mut Keyspace, args: Args<'_>, out: &mut Out) -> Result<()> {
 /// Redis refuses a negative number outright rather than reading it as a moment
 /// that has already gone, so `HEXPIRE key -1` is an error while `HEXPIRE key 0`
 /// deletes the field. Both messages are its, and they are different messages.
-fn expire(db: &mut Keyspace, name: &str, args: Args<'_>, out: &mut Out) -> Result<()> {
+/// What comes back is whether a field went, which is the only outcome of the
+/// four that a search index cares about. Setting a deadline for later leaves the
+/// values alone, and a real server does not reread the key for it.
+fn expire(db: &mut Keyspace, name: &str, args: Args<'_>, out: &mut Out) -> Result<Change> {
     // The p is milliseconds and the at is absolute, which is the whole of the
     // difference between the four.
     let relative = matches!(name, "hexpire" | "hpexpire");
@@ -315,9 +371,12 @@ fn expire(db: &mut Keyspace, name: &str, args: Args<'_>, out: &mut Out) -> Resul
     let fields = field_list(args, from, name)?;
 
     out.array(fields.len());
+    let mut gone = false;
     db.hexpire(args.get(1), at, cond, fields.iter(args), |applied| {
+        gone |= applied == Applied::Deleted;
         out.int(applied as i64);
-    })
+    })?;
+    Ok(Change::when(gone))
 }
 
 /// The absolute millisecond a client's number means, or why it is not one.
@@ -402,16 +461,23 @@ fn ask(db: &mut Keyspace, name: &str, args: Args<'_>, out: &mut Out) -> Result<(
 /// The value goes out and the field goes away, which a client could not do
 /// without a race before this existed. The reply is positional the way `HMGET`'s
 /// is, so a field that was not there is a nil in its own place.
-fn getdel(db: &mut Keyspace, args: Args<'_>, out: &mut Out) -> Result<()> {
+fn getdel(db: &mut Keyspace, args: Args<'_>, out: &mut Out) -> Result<Change> {
     if !args::is(args.get(2), b"fields") {
         return Err(Error::new(Code::Invalid, DEL_NO_FIELDS));
     }
     let fields = ex_field_list(args, 2, 1, DEL_BAD_COUNT, DEL_MISMATCH)?;
     out.array(fields.len());
+    // A value handed back is a field taken away, so the reply is also the
+    // answer to whether the key changed.
+    let mut took = false;
     db.hgetdel(args.get(1), fields.iter(args), |t| match t {
-        Some(t) => write_text(out, t),
+        Some(t) => {
+            took = true;
+            write_text(out, t);
+        }
         None => out.nil(),
-    })
+    })?;
+    Ok(Change::when(took))
 }
 
 /// `HGETEX key [EX s | PX ms | EXAT ts | PXAT ts | PERSIST] FIELDS n f [f ...]`.
@@ -434,12 +500,22 @@ fn getex(db: &mut Keyspace, args: Args<'_>, out: &mut Out) -> Result<()> {
 /// One integer back, and it is all of it or none of it. The count after `FIELDS`
 /// is a count of pairs and not of arguments, which is the only place in the hash
 /// group where that word means something other than one argument each.
-fn setex(db: &mut Keyspace, args: Args<'_>, out: &mut Out) -> Result<()> {
-    let opts = options(db.clock().now_ms(), args, "hsetex")?;
+///
+/// A deadline that has already passed writes the fields and takes them away
+/// again, and a search index hears about both, so one command moves `max_doc_id`
+/// twice and the value it was handed is never indexed at all.
+fn setex(db: &mut Keyspace, args: Args<'_>, out: &mut Out) -> Result<Change> {
+    let now = db.clock().now_ms();
+    let opts = options(now, args, "hsetex")?;
     let fields = ex_field_list(args, opts.fields_at, 2, EX_BAD_COUNT, EX_MISMATCH)?;
     let wrote = db.hsetex(args.get(1), opts.exists, opts.expire, fields.pairs(args))?;
     out.int(i64::from(wrote));
-    Ok(())
+    let past = matches!(opts.expire, Expire::At(at) if at <= now);
+    Ok(if wrote && past {
+        Change::Twice
+    } else {
+        Change::when(wrote)
+    })
 }
 
 /// What `HGETEX` and `HSETEX` were asked for, and where their fields start.
