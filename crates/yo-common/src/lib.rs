@@ -1,5 +1,6 @@
 //! Shared vocabulary for the whole engine: addresses, ids, the error model,
-//! the two hash families, and the cache hint the batch walk is built on.
+//! the two hash families, the geohash arithmetic and the cache hint the batch
+//! walk is built on.
 //!
 //! Everything here is used on the hot path, so the rules are strict. No
 //! allocation outside the error path, no dependencies, and every constant that
@@ -13,6 +14,7 @@ pub mod crc;
 pub mod dtoa;
 pub mod eq;
 pub mod error;
+pub mod geo;
 pub mod glob;
 pub mod lock;
 pub mod num;

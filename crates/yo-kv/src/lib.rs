@@ -137,7 +137,9 @@ pub mod evict;
 pub mod expiry;
 pub mod foreign;
 pub mod frozen;
-pub mod geo;
+/// The geohash arithmetic, which lives one crate down so that the search
+/// index and the geo commands cover a circle in exactly the same way.
+pub use yo_common::geo;
 pub mod geos;
 pub mod grow;
 pub mod hash;
