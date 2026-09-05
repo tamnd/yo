@@ -38,14 +38,16 @@
 //! [`token`] and [`words`] are the two halves of the tokenizer, the query side
 //! and the document side, and [`posts`] is the inverted index they both feed:
 //! every term in an index and, for each one, which documents have it, how often,
-//! in which fields and where.
+//! in which fields and where. [`nums`] is the same thing for a `NUMERIC` field,
+//! a sorted run of values a range is cut out of. [`docs`] is the table the two
+//! of them point into: which key a number was given to, what the client said it
+//! was worth, and how long it turned out to be.
 //!
 //! # What is not here yet
 //!
-//! The scoring, and the tag and numeric indexes. A term and its documents are
-//! here, so an intersection has something to walk, but nothing yet turns a walk
-//! into an ordered answer, and a `TAG` or `NUMERIC` field still has nowhere to
-//! put what it reads.
+//! The scoring. The lists and the table under them are here, so an intersection
+//! has something to walk and every document it lands on can be asked its length,
+//! but nothing yet turns a walk into an ordered answer.
 //!
 //! # Why the registry is per server
 //!
@@ -57,6 +59,7 @@
 
 #![deny(missing_docs)]
 
+pub mod docs;
 pub mod english;
 pub mod field;
 pub mod index;
