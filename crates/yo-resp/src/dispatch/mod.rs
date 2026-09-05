@@ -1736,11 +1736,14 @@ pub fn resolved(
             // before the scan runs, since the scan takes it again for every
             // key it reads.
             "search" if spec.name == "FT.SEARCH" => {
-                // The one search command that reads documents, and so the one
-                // that needs the keyspace as well as the registry. It takes and
-                // lets go of the registry itself, because it cannot hold that
-                // and a stripe at the same time.
+                // The two search commands that read documents, and so the two
+                // that need the keyspace as well as the registry. They take and
+                // let go of the registry themselves, because they cannot hold
+                // that and a stripe at the same time.
                 search::find(server, session.db, args, out).map(|()| Flow::Continue)
+            }
+            "search" if spec.name == "FT.AGGREGATE" => {
+                search::roll(server, session.db, args, out).map(|()| Flow::Continue)
             }
             "search" => {
                 let db = session.db;
@@ -21663,6 +21666,400 @@ mod tests {
                 "%5\r\n+attributes\r\n*0\r\n+format\r\n+STRING\r\n+results\r\n*1\r\n",
                 "%3\r\n+id\r\n$3\r\nd:3\r\n+extra_attributes\r\n%1\r\n$1\r\nn\r\n$1\r\n3\r\n",
                 "+values\r\n*0\r\n+total_results\r\n:1\r\n+warning\r\n*0\r\n"
+            )
+        );
+    }
+
+    /// A window of nothing is a client asking for the count on its own, and a
+    /// window of nothing that starts somewhere else is a contradiction all
+    /// three commands refuse in the same words.
+    #[test]
+    fn a_window_of_nothing_has_to_start_at_the_top() {
+        let mut f = Fixture::new();
+        corpus(&mut f);
+        let refused = "-SEARCH_LIMIT_OVER The `offset` of the LIMIT must be 0 when `num` is 0\r\n";
+        assert_eq!(
+            f.run(&[b"FT.SEARCH", b"sx", b"alpha", b"LIMIT", b"1", b"0"]),
+            refused
+        );
+        assert_eq!(
+            f.run(&[b"FT.EXPLAIN", b"sx", b"alpha", b"LIMIT", b"1", b"0"]),
+            refused
+        );
+        assert_eq!(
+            f.run(&[b"FT.AGGREGATE", b"sx", b"alpha", b"LIMIT", b"1", b"0"]),
+            refused
+        );
+        assert_eq!(
+            f.run(&[b"FT.AGGREGATE", b"sx", b"alpha", b"LIMIT", b"0", b"0"]),
+            "*1\r\n:3\r\n"
+        );
+    }
+
+    /// An aggregation answers a count and then a list of properties for every
+    /// row, which is empty until something asks for a field.
+    #[test]
+    fn an_aggregation_answers_a_count_and_then_the_properties() {
+        let mut f = Fixture::new();
+        corpus(&mut f);
+        assert_eq!(
+            f.run(&[b"FT.AGGREGATE", b"sx", b"alpha"]),
+            "*4\r\n:1\r\n*0\r\n*0\r\n*0\r\n"
+        );
+        // Every row, and not the ten a search would have cut it down to.
+        assert_eq!(
+            f.run(&[b"FT.AGGREGATE", b"sx", b"alpha", b"LOAD", b"1", b"@t"]),
+            concat!(
+                "*4\r\n:3\r\n*2\r\n$1\r\nt\r\n$10\r\nalpha beta\r\n",
+                "*2\r\n$1\r\nt\r\n$11\r\nalpha gamma\r\n",
+                "*2\r\n$1\r\nt\r\n$16\r\nalpha beta gamma\r\n"
+            )
+        );
+        // Ascending document number, because nothing sorts the answer. The
+        // second and fourth documents are the ones the window lands on and the
+        // best scoring one is not among them.
+        assert_eq!(
+            f.run(&[
+                b"FT.AGGREGATE",
+                b"sx",
+                b"alpha",
+                b"LOAD",
+                b"1",
+                b"@n",
+                b"LIMIT",
+                b"1",
+                b"2"
+            ]),
+            "*3\r\n:3\r\n*2\r\n$1\r\nn\r\n$1\r\n2\r\n*2\r\n$1\r\nn\r\n$1\r\n4\r\n"
+        );
+        // A query nothing answers is a count of nothing and no rows at all.
+        assert_eq!(
+            f.run(&[b"FT.AGGREGATE", b"sx", b"nope", b"LOAD", b"1", b"@t"]),
+            "*1\r\n:0\r\n"
+        );
+    }
+
+    /// `LOAD` counts words rather than fields, names the property after the
+    /// path unless an `AS` renames it, and reads everything the key holds when
+    /// it is given a star.
+    #[test]
+    fn a_load_counts_words_and_can_rename_what_it_reads() {
+        let mut f = Fixture::new();
+        corpus(&mut f);
+        // Three words, which are the path, the `AS` and the name.
+        assert_eq!(
+            f.run(&[
+                b"FT.AGGREGATE",
+                b"sx",
+                b"alpha",
+                b"LOAD",
+                b"3",
+                b"@t",
+                b"AS",
+                b"text"
+            ]),
+            concat!(
+                "*4\r\n:3\r\n*2\r\n$4\r\ntext\r\n$10\r\nalpha beta\r\n",
+                "*2\r\n$4\r\ntext\r\n$11\r\nalpha gamma\r\n",
+                "*2\r\n$4\r\ntext\r\n$16\r\nalpha beta gamma\r\n"
+            )
+        );
+        assert_eq!(
+            f.run(&[
+                b"FT.AGGREGATE",
+                b"sx",
+                b"alpha",
+                b"LOAD",
+                b"*",
+                b"LIMIT",
+                b"0",
+                b"1"
+            ]),
+            concat!(
+                "*2\r\n:3\r\n*6\r\n$1\r\nt\r\n$10\r\nalpha beta\r\n",
+                "$1\r\ng\r\n$5\r\naa,bb\r\n$1\r\nn\r\n$1\r\n1\r\n"
+            )
+        );
+        // A field the key does not hold is left out rather than sent empty.
+        assert_eq!(
+            f.run(&[
+                b"FT.AGGREGATE",
+                b"sx",
+                b"alpha",
+                b"LOAD",
+                b"2",
+                b"@n",
+                b"@nope",
+                b"LIMIT",
+                b"0",
+                b"2"
+            ]),
+            "*3\r\n:3\r\n*2\r\n$1\r\nn\r\n$1\r\n1\r\n*2\r\n$1\r\nn\r\n$1\r\n2\r\n"
+        );
+    }
+
+    /// The `LOAD` grammar, which has four ways to go wrong and one of them is
+    /// only reported once the rest of the argument list has read cleanly.
+    #[test]
+    fn a_load_refuses_a_count_it_cannot_use() {
+        let mut f = Fixture::new();
+        corpus(&mut f);
+        let head = "-SEARCH_PARSE_ARGS Bad arguments for LOAD: ";
+        assert_eq!(
+            f.run(&[b"FT.AGGREGATE", b"sx", b"alpha", b"LOAD", b"x"]),
+            format!("{head}Expected number of fields or `*`\r\n")
+        );
+        assert_eq!(
+            f.run(&[b"FT.AGGREGATE", b"sx", b"alpha", b"LOAD", b"-1", b"@t"]),
+            format!("{head}Value is outside acceptable bounds\r\n")
+        );
+        assert_eq!(
+            f.run(&[b"FT.AGGREGATE", b"sx", b"alpha", b"LOAD", b"5", b"@t"]),
+            format!("{head}Expected an argument, but none provided\r\n")
+        );
+        assert_eq!(
+            f.run(&[b"FT.AGGREGATE", b"sx", b"alpha", b"LOAD"]),
+            format!("{head}Expected an argument, but none provided\r\n")
+        );
+        // A count that runs out on the `AS` is held back, because the word
+        // after it is read as an argument of its own and may be worth an error
+        // of its own. Nothing follows here, so the held back line is the one.
+        assert_eq!(
+            f.run(&[
+                b"FT.AGGREGATE",
+                b"sx",
+                b"alpha",
+                b"LOAD",
+                b"2",
+                b"@t",
+                b"AS"
+            ]),
+            "-SEARCH_PARSE_ARGS LOAD path AS name - must be accompanied with NAME\r\n"
+        );
+        // And here the word after it is one an aggregation stops taking once a
+        // step has been read, so that is what the client hears about.
+        assert_eq!(
+            f.run(&[
+                b"FT.AGGREGATE",
+                b"sx",
+                b"alpha",
+                b"LOAD",
+                b"2",
+                b"@t",
+                b"AS",
+                b"VERBATIM"
+            ]),
+            "-SEARCH_ARG_UNRECOGNIZED Unknown argument `VERBATIM` at position 5 for <main>\r\n"
+        );
+        // A `LOAD 0` is a step that names nothing. It shuts the same door
+        // without becoming a loader, so the count stays the one a query with no
+        // `LOAD` gets.
+        assert_eq!(
+            f.run(&[
+                b"FT.AGGREGATE",
+                b"sx",
+                b"alpha",
+                b"LOAD",
+                b"0",
+                b"LIMIT",
+                b"0",
+                b"1"
+            ]),
+            "*2\r\n:1\r\n*0\r\n"
+        );
+    }
+
+    /// Reading a step of the pipeline stops the words about the search itself
+    /// being taken, and `LIMIT` and `TIMEOUT` are not steps.
+    #[test]
+    fn a_pipeline_step_closes_the_door_on_the_search_words() {
+        let mut f = Fixture::new();
+        corpus(&mut f);
+        assert_eq!(
+            f.run(&[
+                b"FT.AGGREGATE",
+                b"sx",
+                b"alpha",
+                b"LOAD",
+                b"1",
+                b"@t",
+                b"VERBATIM"
+            ]),
+            "-SEARCH_ARG_UNRECOGNIZED Unknown argument `VERBATIM` at position 4 for <main>\r\n"
+        );
+        assert_eq!(
+            f.run(&[
+                b"FT.AGGREGATE",
+                b"sx",
+                b"alpha",
+                b"LIMIT",
+                b"0",
+                b"1",
+                b"VERBATIM"
+            ]),
+            "*2\r\n:1\r\n*0\r\n"
+        );
+        // Three words a search takes that this command names in its refusal
+        // rather than calling them unknown.
+        for word in [b"RETURN".as_slice(), b"SUMMARIZE", b"HIGHLIGHT"] {
+            let name = core::str::from_utf8(word).expect("the three words are text");
+            assert_eq!(
+                f.run(&[b"FT.AGGREGATE", b"sx", b"alpha", word]),
+                format!("-SEARCH_PARSE_ARGS {name} is not supported on FT.AGGREGATE\r\n")
+            );
+        }
+    }
+
+    /// `ADDSCORES` writes the score as a property to twelve significant digits
+    /// where `WITHSCORES` writes it beside the row in full.
+    #[test]
+    fn addscores_writes_a_shorter_score_than_withscores() {
+        let mut f = Fixture::new();
+        corpus(&mut f);
+        assert_eq!(
+            f.run(&[
+                b"FT.AGGREGATE",
+                b"sx",
+                b"alpha",
+                b"ADDSCORES",
+                b"LOAD",
+                b"1",
+                b"@n",
+                b"LIMIT",
+                b"0",
+                b"2"
+            ]),
+            concat!(
+                "*3\r\n:3\r\n",
+                "*4\r\n$7\r\n__score\r\n$14\r\n0.356674943939\r\n$1\r\nn\r\n$1\r\n1\r\n",
+                "*4\r\n$7\r\n__score\r\n$14\r\n0.356674943939\r\n$1\r\nn\r\n$1\r\n2\r\n"
+            )
+        );
+        // `NOCONTENT` takes the properties away and leaves whatever was asked
+        // for beside them, and a sort key is always null because nothing sorts
+        // by one yet.
+        assert_eq!(
+            f.run(&[
+                b"FT.AGGREGATE",
+                b"sx",
+                b"alpha",
+                b"NOCONTENT",
+                b"WITHSCORES",
+                b"LIMIT",
+                b"0",
+                b"2"
+            ]),
+            "*3\r\n:1\r\n$18\r\n0.3566749439387324\r\n$18\r\n0.3566749439387324\r\n"
+        );
+        assert_eq!(
+            f.run(&[
+                b"FT.AGGREGATE",
+                b"sx",
+                b"alpha",
+                b"WITHSORTKEYS",
+                b"LOAD",
+                b"1",
+                b"@n",
+                b"LIMIT",
+                b"0",
+                b"1"
+            ]),
+            "*3\r\n:3\r\n$-1\r\n*2\r\n$1\r\nn\r\n$1\r\n1\r\n"
+        );
+    }
+
+    /// The one scorer that has to see the whole answer first turns the count
+    /// into the real total and hands the rows back backwards.
+    #[test]
+    fn a_normalising_scorer_answers_the_rows_backwards() {
+        let mut f = Fixture::new();
+        corpus(&mut f);
+        assert_eq!(
+            f.run(&[
+                b"FT.AGGREGATE",
+                b"sx",
+                b"alpha",
+                b"SCORER",
+                b"BM25STD.NORM",
+                b"ADDSCORES",
+                b"LOAD",
+                b"1",
+                b"@n",
+                b"LIMIT",
+                b"1",
+                b"2"
+            ]),
+            concat!(
+                "*3\r\n:3\r\n",
+                "*4\r\n$7\r\n__score\r\n$1\r\n1\r\n$1\r\nn\r\n$1\r\n2\r\n",
+                "*4\r\n$7\r\n__score\r\n$1\r\n1\r\n$1\r\nn\r\n$1\r\n1\r\n"
+            )
+        );
+        // Without `ADDSCORES` nothing on the row needs the score, so the rows
+        // come back the way every other query answers them.
+        assert_eq!(
+            f.run(&[
+                b"FT.AGGREGATE",
+                b"sx",
+                b"alpha",
+                b"SCORER",
+                b"BM25STD.NORM",
+                b"LOAD",
+                b"1",
+                b"@n",
+                b"LIMIT",
+                b"1",
+                b"2"
+            ]),
+            "*3\r\n:3\r\n*2\r\n$1\r\nn\r\n$1\r\n2\r\n*2\r\n$1\r\nn\r\n$1\r\n4\r\n"
+        );
+    }
+
+    /// The deeper protocol answers the same map of five a search answers, with
+    /// the `id` gone because an aggregation is about the properties.
+    #[test]
+    fn an_aggregation_answers_a_map_of_five_as_well() {
+        let mut f = Fixture::new();
+        corpus(&mut f);
+        f.out = Out::new(Proto::Resp3);
+        assert_eq!(
+            f.run(&[
+                b"FT.AGGREGATE",
+                b"sx",
+                b"alpha",
+                b"ADDSCORES",
+                b"WITHSCORES",
+                b"WITHSORTKEYS",
+                b"LOAD",
+                b"1",
+                b"@n",
+                b"LIMIT",
+                b"0",
+                b"1"
+            ]),
+            concat!(
+                "%5\r\n+attributes\r\n*0\r\n+format\r\n+STRING\r\n+results\r\n*1\r\n",
+                "%4\r\n+score\r\n,0.3566749439387324\r\n+sortkey\r\n_\r\n",
+                "+extra_attributes\r\n%2\r\n$7\r\n__score\r\n$14\r\n0.356674943939\r\n",
+                "$1\r\nn\r\n$1\r\n1\r\n+values\r\n*0\r\n",
+                "+total_results\r\n:3\r\n+warning\r\n*0\r\n"
+            )
+        );
+        // The count is worked out from the rows the reply reached under this
+        // protocol, where under RESP2 it is worked out from the first of them.
+        assert_eq!(
+            f.run(&[
+                b"FT.AGGREGATE",
+                b"sx",
+                b"alpha",
+                b"NOCONTENT",
+                b"LIMIT",
+                b"0",
+                b"1"
+            ]),
+            concat!(
+                "%5\r\n+attributes\r\n*0\r\n+format\r\n+STRING\r\n+results\r\n*1\r\n",
+                "%1\r\n+values\r\n*0\r\n+total_results\r\n:1\r\n+warning\r\n*0\r\n"
             )
         );
     }

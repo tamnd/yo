@@ -491,3 +491,11 @@ title = "BM25STD.TANH scores can differ from a real server in the last bit"
 reason = "The scorer is a hyperbolic tangent of the standard score over a constant, and both servers compute the same argument to the last bit. What they do with it is their platform's tanh, and the one on the reference build is not correctly rounded: for an argument of 0.06029051420422201 it answers 0.060217569339428935 where the correctly rounded double is 0.06021756933942893, which is what this answers and what an arbitrary precision evaluation of the same argument rounds to. Four of the ten documents in a comparison corpus land on an argument where the two disagree, always by one bit and never by more. The ordering of an answer is unaffected because the difference is smaller than the gap between any two documents' scores, and every other scorer agrees to the last bit."
 status = "permanent"
 spec = "09 section 5"
+
+[[divergence]]
+id = "D-67"
+title = "Six FT.AGGREGATE pipeline steps are refused rather than read"
+reason = "LOAD is the only step of the pipeline built so far. GROUPBY with its REDUCE functions, SORTBY with MAX, APPLY, FILTER, WITHCURSOR and EXPLAINSCORE are read as unknown arguments and answer the line a real server answers for a word nobody knows, so a client learns the step is not there rather than getting a reply that quietly dropped it. Everything either side of the pipeline is exact: the query is the same parser a search uses, the rows come back in ascending document number because nothing sorts them, the properties follow the names and the order the LOAD list gave them, ADDSCORES writes a __score to twelve significant digits where WITHSCORES writes a score to seventeen, and the count at the front of the reply follows the four cases that were measured over a full offset by count sweep on both protocols. APPLY and FILTER both need an expression language that nothing else in the server has and GROUPBY needs the properties to be values rather than the bytes off a hash, so those two are the real work and the rest follow from them."
+status = "until"
+resolved_by = "M8"
+spec = "09 section 5"

@@ -3175,7 +3175,18 @@ plan = "merge"
 bounded = "risk"
 status = "shipped"
 wire = "verified"
-notes = "The documents a query answers, with the fields of the keys they came from. It is the only command in the group that reads the keyspace as well as the registry, so it runs in two halves: the query is parsed, walked, scored, sorted and cut to the window under the registry lock, and the keys are read afterwards with that lock let go of. The total is how many rows the window could actually build, so a document the index follows whose key is on another database is dropped from the reply and taken off the total, which is measured rather than chosen. Fifteen of the option keywords are read here and SORTBY, WITHSORTKEYS, SUMMARIZE, HIGHLIGHT, GEOFILTER and EXPLAINSCORE are not, which D-65 covers. The window is bounded but the walk behind it is not, since a query can ask every document in the index."
+notes = "The documents a query answers, with the fields of the keys they came from. It is one of two commands in the group that read the keyspace as well as the registry, so it runs in two halves: the query is parsed, walked, scored, sorted and cut to the window under the registry lock, and the keys are read afterwards with that lock let go of. The total is how many rows the window could actually build, so a document the index follows whose key is on another database is dropped from the reply and taken off the total, which is measured rather than chosen. Fifteen of the option keywords are read here and SORTBY, WITHSORTKEYS, SUMMARIZE, HIGHLIGHT, GEOFILTER and EXPLAINSCORE are not, which D-65 covers. The window is bounded but the walk behind it is not, since a query can ask every document in the index."
+
+[[command]]
+name = "FT.AGGREGATE"
+group = "search"
+since = "1.1.0"
+arity = -3
+plan = "merge"
+bounded = "risk"
+status = "shipped"
+wire = "verified"
+notes = "The properties a query answers, run through a pipeline. It shares the whole front half with FT.SEARCH and parts company after the walk: nothing sorts the answer, so the rows come back in ascending document number, and a row is a list of properties rather than a key with its fields hung off it. LOAD is the only pipeline step built so far and GROUPBY, SORTBY, APPLY, FILTER, WITHCURSOR and EXPLAINSCORE are refused as unknown arguments, which D-67 covers. The count at the front of the reply is not the number of documents that answered except in two cases, it is how far the reply reached, which is why it changes with the protocol and with whether anything asked for a field. The window is bounded but the walk behind it is not, and the default window is every row rather than the ten a search hands back."
 
 [[command]]
 name = "FT.EXPLAIN"

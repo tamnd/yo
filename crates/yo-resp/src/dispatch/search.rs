@@ -1505,6 +1505,7 @@ const MOST: i64 = 1_000_000;
 const LIMIT_TWO: &str = "SEARCH_PARSE_ARGS LIMIT requires two arguments";
 const LIMIT_NUMBERS: &str = "SEARCH_PARSE_ARGS LIMIT needs two numeric arguments";
 const LIMIT_OVER: &str = "SEARCH_LIMIT_OVER LIMIT exceeds maximum of 1000000";
+const LIMIT_START: &str = "SEARCH_LIMIT_OVER The `offset` of the LIMIT must be 0 when `num` is 0";
 const TIMEOUT_ARG: &str = "SEARCH_PARSE_ARGS Need argument for TIMEOUT";
 const TIMEOUT_NUMBER: &str = "SEARCH_PARSE_ARGS TIMEOUT requires a non negative integer";
 const NO_SCORER: &str = "SEARCH_QUERY_BAD No such scorer ";
@@ -1514,6 +1515,14 @@ const HIGH_RANGE: &str = "SEARCH_PARSE_ARGS Bad upper range: ";
 const BACKWARDS: &str = "SEARCH_SYNTAX Invalid numeric range (min > max): @";
 const FILTER_THREE: &str = "SEARCH_PARSE_ARGS FILTER requires 3 arguments";
 const NEED_NAME: &str = "SEARCH_PARSE_ARGS RETURN path AS name - must be accompanied with NAME";
+const NEED_LOAD_NAME: &str = "SEARCH_PARSE_ARGS LOAD path AS name - must be accompanied with NAME";
+const LOAD_COUNT: &str =
+    "SEARCH_PARSE_ARGS Bad arguments for LOAD: Expected number of fields or `*`";
+const LOAD_BOUNDS: &str =
+    "SEARCH_PARSE_ARGS Bad arguments for LOAD: Value is outside acceptable bounds";
+const LOAD_SHORT: &str =
+    "SEARCH_PARSE_ARGS Bad arguments for LOAD: Expected an argument, but none provided";
+const NOT_HERE: &str = " is not supported on FT.AGGREGATE";
 
 /// What a client asked for about the rows, which only `FT.SEARCH` acts on.
 ///
@@ -1587,6 +1596,7 @@ struct Asked<'a> {
     verbatim: bool,
     stopwords: bool,
     rows: Rows<'a>,
+    pipe: Pipe<'a>,
 }
 
 impl Default for Asked<'_> {
@@ -1597,8 +1607,82 @@ impl Default for Asked<'_> {
             verbatim: false,
             stopwords: true,
             rows: Rows::default(),
+            pipe: Pipe::default(),
         }
     }
+}
+
+/// The half of the argument list only `FT.AGGREGATE` fills in.
+///
+/// The other two commands leave every field of this alone, because none of the
+/// words that write it are words they take.
+#[derive(Default)]
+struct Pipe<'a> {
+    /// The fields to read off each key and the names to answer them under, in
+    /// the order the client named them.
+    load: Vec<(&'a [u8], &'a [u8])>,
+    /// Whether `LOAD *` asked for everything the key holds as well.
+    all: bool,
+    /// Whether anything at all asked for a field, which is the one thing that
+    /// decides how the count at the front of the reply is worked out.
+    loader: bool,
+    /// Whether the score of each document is answered as a `__score` property.
+    addscores: bool,
+    /// Whether a sort key element goes on each row, which is always null here
+    /// because nothing sorts by one yet.
+    sortkeys: bool,
+    /// A `LOAD` whose count ran out on the `AS`, which is not an error on its
+    /// own: it is only reported once the rest of the list has read cleanly.
+    /// `LOAD 2 @t AS LIMIT 0 1` is refused for the missing name and
+    /// `LOAD 2 @t AS VERBATIM` is refused for the `VERBATIM`, because the word
+    /// after the `AS` is read as an argument of its own either way.
+    pending: bool,
+    /// Whether a step that builds the pipeline has been read. `LOAD` is one and
+    /// `LIMIT`, `TIMEOUT`, `DIALECT` and `PARAMS` are not, and after one of
+    /// them the words about the search itself stop being taken: a real server
+    /// answers `Unknown argument VERBATIM` for `LOAD 1 @t VERBATIM` and takes
+    /// the same `VERBATIM` after a `LIMIT`.
+    stepped: bool,
+}
+
+/// Which of the three commands is reading the argument list.
+///
+/// They share nearly all of it and part company in five places: `FILTER` is a
+/// numeric range on one and an expression on another, `LIMIT` is capped on one
+/// and not on the rest, `LOAD` and `ADDSCORES` belong to one alone, three of
+/// the words a search takes are refused by name on that one, and `FT.EXPLAIN`
+/// reads three words it has nothing to do with so that a search pasted in front
+/// of it is refused in the same place.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Mode {
+    Search,
+    Explain,
+    Aggregate,
+}
+
+/// The order the documents that answered come back in.
+///
+/// A search ranks them. An aggregation with nothing sorting it hands them back
+/// in the order the index holds them, and backwards when its scorer had to see
+/// the whole answer before any of it could be written.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Order {
+    Ranked,
+    Forwards,
+    Backwards,
+}
+
+/// Whether the whole answer has to exist before the first row of it can be
+/// written, which is true of one scorer and only when its scores are asked for.
+///
+/// `BM25STD.NORM` divides every score by the best one in the answer, so a row
+/// cannot be finished until the last of them has been seen. A real server shows
+/// that in two ways at once: the count at the front of the reply is the real
+/// total whatever the window is, and the rows come back in descending document
+/// number rather than ascending. Both go away without `ADDSCORES`, because
+/// without it nothing on the row needs the score.
+fn buffered(asked: &Asked<'_>) -> bool {
+    asked.pipe.addscores && asked.rows.scorer.settles()
 }
 
 /// The keywords `FT.EXPLAIN` takes and drops, with how many words each carries.
@@ -1612,22 +1696,33 @@ const IGNORED: &[(&[u8], usize)] = &[(b"WITHSORTKEYS", 0), (b"EXPLAINSCORE", 0),
 
 /// Reads the arguments after the query.
 ///
-/// `main` is whether this is `FT.SEARCH`, which decides the two places the two
-/// commands really do read the same words differently and nothing else.
-///
 /// The error text carries a position, which is why this hands back bytes rather
 /// than a `Fail`: every other error line in this module is three static pieces
 /// around a word the client sent, and this one has a number in it.
 fn options<'a>(
     args: Args<'a>,
     from: usize,
-    main: bool,
+    mode: Mode,
     index: &Index,
 ) -> core::result::Result<Asked<'a>, Vec<u8>> {
+    let main = mode == Mode::Search;
     let mut asked = Asked::default();
+    if mode == Mode::Aggregate {
+        // A search hands back ten rows when nobody said how many and an
+        // aggregation hands back all of them, and the cap a search puts on the
+        // width of its window is not here either: `LIMIT 0 1000001` is refused
+        // by one command and taken by the other.
+        asked.rows.count = usize::MAX;
+    }
     let mut at = from;
     while at < args.len() {
         let word = args.get(at);
+        if mode == Mode::Aggregate
+            && let Some(next) = step(args, at, &mut asked)?
+        {
+            at = next;
+            continue;
+        }
         if args::is(word, b"DIALECT") {
             let Some(value) = args.opt(at + 1) else {
                 return Err(line(NEED_ARG, b"DIALECT", ""));
@@ -1644,30 +1739,200 @@ fn options<'a>(
             at = params(args, at, &mut asked)?;
             continue;
         }
-        if args::is(word, b"VERBATIM") {
-            asked.verbatim = true;
-            at += 1;
-            continue;
-        }
-        if args::is(word, b"NOSTOPWORDS") {
-            asked.stopwords = false;
-            at += 1;
-            continue;
-        }
-        if let Some(next) = row(args, at, &mut asked.rows, main, index)? {
+        // The words about the search itself, which an aggregation stops taking
+        // once a step of its pipeline has been read. `LIMIT` and `TIMEOUT` are
+        // not among them, which is why they are asked for before this.
+        if let Some(next) = plan(args, at, &mut asked.rows, mode)? {
             at = next;
             continue;
         }
-        if !main && let Some((_, takes)) = IGNORED.iter().find(|(k, _)| args::is(word, k)) {
-            if args.opt(at + takes).is_none() {
-                return Err(line(BAD_ARGS, word, NOT_THERE));
+        if !asked.pipe.stepped {
+            if args::is(word, b"VERBATIM") {
+                asked.verbatim = true;
+                at += 1;
+                continue;
             }
-            at += takes + 1;
-            continue;
+            if args::is(word, b"NOSTOPWORDS") {
+                asked.stopwords = false;
+                at += 1;
+                continue;
+            }
+            if mode == Mode::Aggregate
+                && let Some(next) = extra(args, at, &mut asked)?
+            {
+                at = next;
+                continue;
+            }
+            if let Some(next) = row(args, at, &mut asked.rows, main, index)? {
+                at = next;
+                continue;
+            }
+            if mode == Mode::Explain
+                && let Some((_, takes)) = IGNORED.iter().find(|(k, _)| args::is(word, k))
+            {
+                if args.opt(at + takes).is_none() {
+                    return Err(line(BAD_ARGS, word, NOT_THERE));
+                }
+                at += takes + 1;
+                continue;
+            }
         }
         return Err(unknown(word, at - from + 1));
     }
+    // Kept until here because a `LOAD` that ran out on its `AS` is only refused
+    // when nothing else was wrong with the list.
+    if asked.pipe.pending {
+        return Err(NEED_LOAD_NAME.as_bytes().to_vec());
+    }
     Ok(asked)
+}
+
+/// `LIMIT` and `TIMEOUT`, which every one of the three commands takes wherever
+/// they appear.
+fn plan<'a>(
+    args: Args<'a>,
+    at: usize,
+    rows: &mut Rows<'a>,
+    mode: Mode,
+) -> core::result::Result<Option<usize>, Vec<u8>> {
+    let word = args.get(at);
+    if args::is(word, b"LIMIT") {
+        let (Some(offset), Some(count)) = (args.opt(at + 1), args.opt(at + 2)) else {
+            return Err(LIMIT_TWO.as_bytes().to_vec());
+        };
+        let (Some(offset), Some(count)) = (counted(offset), counted(count)) else {
+            return Err(LIMIT_NUMBERS.as_bytes().to_vec());
+        };
+        // The cap is on the width of the window and not on where it starts, so
+        // `LIMIT 999999 1000000` is a query a real server takes and
+        // `LIMIT 0 1000001` is one it refuses. An aggregation is not capped at
+        // all, because the rows it hands back are not a window on a scored
+        // answer, they are what its pipeline made.
+        if count > MOST && mode != Mode::Aggregate {
+            return Err(LIMIT_OVER.as_bytes().to_vec());
+        }
+        // A window of nothing is a client asking for the total on its own, and
+        // asking for the total starting from somewhere is a contradiction the
+        // three commands all refuse in the same words.
+        if count == 0 && offset != 0 {
+            return Err(LIMIT_START.as_bytes().to_vec());
+        }
+        rows.offset = usize::try_from(offset).unwrap_or(0);
+        rows.count = usize::try_from(count).unwrap_or(0);
+        return Ok(Some(at + 3));
+    }
+    if args::is(word, b"TIMEOUT") {
+        let Some(value) = args.opt(at + 1) else {
+            return Err(TIMEOUT_ARG.as_bytes().to_vec());
+        };
+        if counted(value).is_none() {
+            return Err(TIMEOUT_NUMBER.as_bytes().to_vec());
+        }
+        // Nothing here runs long enough to time out, and a deadline that is
+        // never reached is the same as no deadline, so the number is checked
+        // and dropped.
+        return Ok(Some(at + 2));
+    }
+    Ok(None)
+}
+
+/// A step of the pipeline, or nothing when this is not one of those.
+///
+/// `LOAD` is the only one built so far. The other six words that start a step
+/// fall through to the unknown argument line, which is divergence D-67.
+///
+/// A step is read wherever it appears, and reading one closes the door on the
+/// words about the search itself. That is what makes `LOAD 1 @t VERBATIM` a
+/// refusal and `LIMIT 0 1 VERBATIM` a query.
+fn step<'a>(
+    args: Args<'a>,
+    at: usize,
+    asked: &mut Asked<'a>,
+) -> core::result::Result<Option<usize>, Vec<u8>> {
+    if !args::is(args.get(at), b"LOAD") {
+        return Ok(None);
+    }
+    let Some(count) = args.opt(at + 1) else {
+        return Err(LOAD_SHORT.as_bytes().to_vec());
+    };
+    // A `LOAD` is a step of the pipeline whatever it names, and a `LOAD 0` is a
+    // step that names nothing, so it shuts the door on the words about the
+    // search without becoming a loader: `LOAD 0 VERBATIM` is refused and the
+    // count at the front of the reply is the one a query with no `LOAD` gets.
+    asked.pipe.stepped = true;
+    if count == b"*" {
+        asked.pipe.all = true;
+        asked.pipe.loader = true;
+        return Ok(Some(at + 2));
+    }
+    let Some(count) = parse_i64(count) else {
+        return Err(LOAD_COUNT.as_bytes().to_vec());
+    };
+    let Ok(count) = usize::try_from(count) else {
+        return Err(LOAD_BOUNDS.as_bytes().to_vec());
+    };
+    asked.pipe.loader |= count > 0;
+    let mut at = at + 2;
+    let end = at + count;
+    while at < end {
+        let Some(path) = args.opt(at) else {
+            return Err(LOAD_SHORT.as_bytes().to_vec());
+        };
+        at += 1;
+        // The count is a word count and not a field count, so the `AS` and the
+        // name after it are two of the words it pays for. A count that stops on
+        // the `AS` is a complaint held back until the rest of the list has read
+        // cleanly, because the word after it is read as an argument of its own
+        // and may well be worth an error of its own.
+        // The `@` is part of how a path is written and not part of the name the
+        // property comes back under, so `LOAD 1 @t` and `LOAD 1 t` answer the
+        // same `t`.
+        let field = path.strip_prefix(b"@").unwrap_or(path);
+        let name = match at < end && args::is(args.get(at), b"AS") {
+            false => field,
+            true => {
+                at += 1;
+                match args.opt(at).filter(|_| at < end) {
+                    None => {
+                        asked.pipe.pending = true;
+                        break;
+                    }
+                    Some(name) => {
+                        at += 1;
+                        name
+                    }
+                }
+            }
+        };
+        asked.pipe.load.push((field, name));
+    }
+    Ok(Some(at))
+}
+
+/// One of the words `FT.AGGREGATE` alone reads, or nothing when this is not one
+/// of those.
+fn extra<'a>(
+    args: Args<'a>,
+    at: usize,
+    asked: &mut Asked<'a>,
+) -> core::result::Result<Option<usize>, Vec<u8>> {
+    let word = args.get(at);
+    if args::is(word, b"ADDSCORES") {
+        asked.pipe.addscores = true;
+        return Ok(Some(at + 1));
+    }
+    if args::is(word, b"WITHSORTKEYS") {
+        asked.pipe.sortkeys = true;
+        return Ok(Some(at + 1));
+    }
+    // Three words a search takes that an aggregation names in its refusal
+    // rather than letting them fall through to the unknown argument line.
+    for name in [b"RETURN".as_slice(), b"SUMMARIZE", b"HIGHLIGHT"] {
+        if args::is(word, name) {
+            return Err(line("SEARCH_PARSE_ARGS ", name, NOT_HERE));
+        }
+    }
+    Ok(None)
 }
 
 /// One argument about the rows, or nothing when this is not one of those.
@@ -1698,35 +1963,6 @@ fn row<'a>(
     if args::is(word, b"INORDER") {
         rows.inorder = true;
         return Ok(Some(at + 1));
-    }
-    if args::is(word, b"LIMIT") {
-        let (Some(offset), Some(count)) = (args.opt(at + 1), args.opt(at + 2)) else {
-            return Err(LIMIT_TWO.as_bytes().to_vec());
-        };
-        let (Some(offset), Some(count)) = (counted(offset), counted(count)) else {
-            return Err(LIMIT_NUMBERS.as_bytes().to_vec());
-        };
-        // The cap is on the width of the window and not on where it starts, so
-        // `LIMIT 999999 1000000` is a query a real server takes and
-        // `LIMIT 0 1000001` is one it refuses.
-        if count > MOST {
-            return Err(LIMIT_OVER.as_bytes().to_vec());
-        }
-        rows.offset = usize::try_from(offset).unwrap_or(0);
-        rows.count = usize::try_from(count).unwrap_or(0);
-        return Ok(Some(at + 3));
-    }
-    if args::is(word, b"TIMEOUT") {
-        let Some(value) = args.opt(at + 1) else {
-            return Err(TIMEOUT_ARG.as_bytes().to_vec());
-        };
-        if counted(value).is_none() {
-            return Err(TIMEOUT_NUMBER.as_bytes().to_vec());
-        }
-        // Nothing here runs long enough to time out, and a deadline that is
-        // never reached is the same as no deadline, so the number is checked
-        // and dropped.
-        return Ok(Some(at + 2));
     }
     if args::is(word, b"SLOP") {
         let Some(value) = args.opt(at + 1) else {
@@ -2058,7 +2294,7 @@ fn explain<'a>(reg: &mut Registry, args: Args<'a>, out: &mut Out, cli: bool) -> 
     let Some(index) = reg.open(name) else {
         return Err(Fail::naming(MISSING, name));
     };
-    let asked = match options(args, 3, false, index) {
+    let asked = match options(args, 3, Mode::Explain, index) {
         Ok(asked) => asked,
         Err(text) => {
             out.error(&text);
@@ -2094,6 +2330,11 @@ fn explain<'a>(reg: &mut Registry, args: Args<'a>, out: &mut Out, cli: bool) -> 
 /// One row of the reply, with the fields of its key once they have been read.
 type Built<'a> = (&'a Row, Option<Vec<(&'a [u8], &'a [u8])>>);
 
+/// One row of an aggregation, with its properties. There is no `Option` here
+/// because a row that carries no property carries an empty list rather than
+/// nothing at all.
+type Rolled<'a> = (&'a Row, Vec<(&'a [u8], &'a [u8])>);
+
 /// One row of an answer, once the registry has been let go of.
 ///
 /// Nothing in here borrows the index, which is the whole point: the query runs
@@ -2124,7 +2365,7 @@ pub(super) fn find(server: &Server, db: usize, args: Args<'_>, out: &mut Out) ->
             Fail::naming(MISSING, name).write(out);
             return Ok(());
         };
-        asked = match options(args, 3, true, index) {
+        asked = match options(args, 3, Mode::Search, index) {
             Ok(asked) => asked,
             Err(text) => {
                 out.error(&text);
@@ -2144,10 +2385,276 @@ pub(super) fn find(server: &Server, db: usize, args: Args<'_>, out: &mut Out) ->
                 return Ok(());
             }
         };
-        gather(index, shape(node, index, &asked.rows), &asked.rows)
+        gather(
+            index,
+            shape(node, index, &asked.rows),
+            &asked.rows,
+            Order::Ranked,
+        )
     };
     write(server, db, total, &rows, &asked.rows, out);
     Ok(())
+}
+
+/// `FT.AGGREGATE index query [options]`.
+///
+/// The same two halves as a search, with the same seam between them. What is
+/// different is on either side of it: nothing sorts the answer, so the rows come
+/// back in the order the index holds them, and a row is a list of properties
+/// rather than a key with its fields hung off it.
+pub(super) fn roll(server: &Server, db: usize, args: Args<'_>, out: &mut Out) -> Result<()> {
+    let name = args.get(1);
+    let query = args.get(2);
+    let asked;
+    let (total, rows) = {
+        let mut reg = server.search.lock();
+        let Some(index) = reg.open(name) else {
+            Fail::naming(MISSING, name).write(out);
+            return Ok(());
+        };
+        asked = match options(args, 3, Mode::Aggregate, index) {
+            Ok(asked) => asked,
+            Err(text) => {
+                out.error(&text);
+                return Ok(());
+            }
+        };
+        let ask = Ask {
+            dialect: asked.dialect,
+            params: &asked.params,
+            verbatim: asked.verbatim,
+            stopwords: asked.stopwords,
+        };
+        let node = match query::parse(query, index, &ask) {
+            Ok(node) => node,
+            Err(bad) => {
+                out.error(&refused(&bad));
+                return Ok(());
+            }
+        };
+        let order = match buffered(&asked) {
+            true => Order::Backwards,
+            false => Order::Forwards,
+        };
+        gather(index, shape(node, index, &asked.rows), &asked.rows, order)
+    };
+    rolled(server, db, total, &rows, &asked, out);
+    Ok(())
+}
+
+/// Reads the keys the pipeline asked for and writes the reply.
+///
+/// The count at the front is not the number of documents that answered, except
+/// when it is. What it really reports is how far the reply has got through
+/// them, which is why it changes with the protocol and with whether anything
+/// asked for a field. The four cases are set out where they are worked out.
+fn rolled(
+    server: &Server,
+    db: usize,
+    total: usize,
+    rows: &[Row],
+    asked: &Asked<'_>,
+    out: &mut Out,
+) {
+    let pipe = &asked.pipe;
+    let want = &asked.rows;
+    let held: Vec<Option<indexing::Document>> = match pipe.loader {
+        true => rows
+            .iter()
+            .map(|row| indexing::read(&server.dbs[db], &row.key))
+            .collect(),
+        false => Vec::new(),
+    };
+    let mut built: Vec<Rolled<'_>> = Vec::with_capacity(rows.len());
+    let mut lost = 0;
+    for (at, row) in rows.iter().enumerate() {
+        if !pipe.loader {
+            built.push((row, Vec::new()));
+            continue;
+        }
+        // A key that answered the query and is no longer there takes its row
+        // out of the reply and one off the count, the same way a search does.
+        let Some(doc) = held.get(at).and_then(Option::as_ref) else {
+            lost += 1;
+            continue;
+        };
+        built.push((row, props(doc, pipe)));
+    }
+    let total = total - lost;
+    let deep = out.proto().is_resp3();
+    // `LIMIT 0 0` is a client asking for the count and nothing else, and it gets
+    // the real one. So does a pipeline that reads fields and starts at the top,
+    // and so does one whose scorer had to see the whole answer before any of it
+    // could be written. Everything else reports how far the reply reached,
+    // which under RESP2 without a loader is one row, because the array header
+    // goes on the wire as soon as the first row exists.
+    let whole = want.count == 0 || buffered(asked) || (pipe.loader && want.offset == 0);
+    let count = match whole {
+        true => total,
+        false => {
+            let reached = match deep || pipe.loader {
+                true => built.len(),
+                false => 1,
+            };
+            want.offset.saturating_add(reached).min(total)
+        }
+    };
+    if deep {
+        rolled_deep(count, &built, asked, out);
+        return;
+    }
+    // The count, then a fixed number of elements for every row: whichever of
+    // the score, the payload and the sort key were asked for, then the
+    // properties unless `NOCONTENT` took them away. A `NOCONTENT` with nothing
+    // else on it leaves an array of one.
+    let per = usize::from(want.scores)
+        + usize::from(want.payloads)
+        + usize::from(pipe.sortkeys)
+        + usize::from(want.content);
+    out.array(1 + built.len() * per);
+    out.int(count as i64);
+    for (row, fields) in &built {
+        if want.scores {
+            out.double(row.score);
+        }
+        if want.payloads {
+            match &row.payload {
+                Some(payload) => out.bulk(payload),
+                None => out.nil(),
+            }
+        }
+        if pipe.sortkeys {
+            // Always null, because no step that writes one is built yet.
+            out.nil();
+        }
+        if want.content {
+            out.map(fields.len() + usize::from(pipe.addscores));
+            if pipe.addscores {
+                out.bulk(b"__score");
+                out.bulk(twelve(row.score).as_bytes());
+            }
+            for (field, value) in fields {
+                out.bulk(field);
+                out.bulk(value);
+            }
+        }
+    }
+}
+
+/// The RESP3 shape, which is the same map of five a search answers with.
+///
+/// A row is a map too, and the only thing missing from it beside a search is
+/// the `id`: an aggregation is about the properties and not about the keys they
+/// came off.
+fn rolled_deep(count: usize, built: &[Rolled<'_>], asked: &Asked<'_>, out: &mut Out) {
+    let pipe = &asked.pipe;
+    let want = &asked.rows;
+    out.map(5);
+    out.simple(b"attributes");
+    out.array(0);
+    out.simple(b"format");
+    out.simple(b"STRING");
+    out.simple(b"results");
+    out.array(built.len());
+    for (row, fields) in built {
+        out.map(
+            1 + usize::from(want.scores)
+                + usize::from(want.payloads)
+                + usize::from(pipe.sortkeys)
+                + usize::from(want.content),
+        );
+        if want.scores {
+            out.simple(b"score");
+            out.double(row.score);
+        }
+        if want.payloads {
+            out.simple(b"payload");
+            match &row.payload {
+                Some(payload) => out.bulk(payload),
+                None => out.nil(),
+            }
+        }
+        if pipe.sortkeys {
+            out.simple(b"sortkey");
+            out.nil();
+        }
+        if want.content {
+            out.simple(b"extra_attributes");
+            out.map(fields.len() + usize::from(pipe.addscores));
+            if pipe.addscores {
+                out.bulk(b"__score");
+                out.bulk(twelve(row.score).as_bytes());
+            }
+            for (field, value) in fields {
+                out.bulk(field);
+                out.bulk(value);
+            }
+        }
+        out.simple(b"values");
+        out.array(0);
+    }
+    out.simple(b"total_results");
+    out.int(count as i64);
+    out.simple(b"warning");
+    out.array(0);
+}
+
+/// The properties of one key, under the names the client asked for them under.
+///
+/// The named loads come first in the order they were named, then `LOAD *` adds
+/// whatever the key holds that has not been named yet. A name is only answered
+/// once, so `LOAD 2 @n @n` sends one property, and a rename does not stand in
+/// for the field it renamed, so `LOAD 3 @t AS tt LOAD *` sends both `tt` and
+/// `t`. A field the key does not hold is left out rather than sent empty.
+fn props<'d, 'w: 'd>(doc: &'d indexing::Document, pipe: &Pipe<'w>) -> Vec<(&'d [u8], &'d [u8])> {
+    let pairs = doc.pairs();
+    let mut out: Vec<(&[u8], &[u8])> = Vec::with_capacity(pipe.load.len());
+    for (field, name) in &pipe.load {
+        if out.iter().any(|(held, _)| held == name) {
+            continue;
+        }
+        let Some((_, value)) = pairs.iter().find(|(held, _)| held == field) else {
+            continue;
+        };
+        out.push((*name, *value));
+    }
+    if pipe.all {
+        for (field, value) in pairs {
+            if !out.iter().any(|(held, _)| *held == field) {
+                out.push((field, value));
+            }
+        }
+    }
+    out
+}
+
+/// A double written the way `%.12g` writes it, which is how a `__score` goes on
+/// the wire.
+///
+/// Twelve significant digits and not seventeen, which is measured: a score of
+/// 0.9343092373768334 is answered as `0.934309237377` under `ADDSCORES` and in
+/// full beside `WITHSCORES`, so the two are not the same formatter.
+fn twelve(d: f64) -> String {
+    if !d.is_finite() {
+        return format!("{d}");
+    }
+    let sci = format!("{d:.11e}");
+    let (mantissa, exponent) = sci.split_once('e').expect("a scientific form has an e");
+    let exponent: i32 = exponent.parse().expect("and a whole number after it");
+    if !(-4..12).contains(&exponent) {
+        let m = mantissa.trim_end_matches('0').trim_end_matches('.');
+        let sign = if exponent < 0 { '-' } else { '+' };
+        return format!("{m}e{sign}{:02}", exponent.abs());
+    }
+    let places = (11 - exponent).max(0) as usize;
+    let fixed = format!("{d:.places$}");
+    match fixed.contains('.') {
+        true => fixed
+            .trim_end_matches('0')
+            .trim_end_matches('.')
+            .to_string(),
+        false => fixed,
+    }
 }
 
 /// The query with everything the arguments outside it asked for hung on it.
@@ -2202,7 +2709,7 @@ fn shape(node: Node, index: &Index, rows: &Rows<'_>) -> Node {
 /// The total comes back beside the window because the window is not the whole
 /// of what answered, and because `LIMIT 0 0` is a client asking for the total
 /// and nothing else.
-fn gather(index: &Index, node: Node, rows: &Rows<'_>) -> (usize, Vec<Row>) {
+fn gather(index: &Index, node: Node, rows: &Rows<'_>, order: Order) -> (usize, Vec<Row>) {
     let facts = index.held.facts();
     let mut found: Vec<(u32, f64)> = walk::run(&index.held, &node)
         .into_iter()
@@ -2229,12 +2736,20 @@ fn gather(index: &Index, node: Node, rows: &Rows<'_>) -> (usize, Vec<Row>) {
         row.1 = *score;
     }
     // Best first, and a tie goes to the document that was written first. A
-    // `NaN` sorts last rather than poisoning the comparison.
-    found.sort_by(|a, b| {
-        b.1.partial_cmp(&a.1)
-            .unwrap_or(core::cmp::Ordering::Equal)
-            .then(a.0.cmp(&b.0))
-    });
+    // `NaN` sorts last rather than poisoning the comparison. An aggregation
+    // with nothing sorting it hands the documents back in the order the index
+    // holds them, which is measured: a five document answer whose scores run
+    // 0.93, 0.69, 0.85, 0.27, 0.24 comes back in exactly that order, and those
+    // five documents are in ascending document number.
+    match order {
+        Order::Ranked => found.sort_by(|a, b| {
+            b.1.partial_cmp(&a.1)
+                .unwrap_or(core::cmp::Ordering::Equal)
+                .then(a.0.cmp(&b.0))
+        }),
+        Order::Forwards => found.sort_by_key(|(id, _)| *id),
+        Order::Backwards => found.sort_by_key(|(id, _)| core::cmp::Reverse(*id)),
+    }
     let total = found.len();
     let window = found
         .into_iter()
