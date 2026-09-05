@@ -50,6 +50,7 @@
 use std::io::{self, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
@@ -57,6 +58,7 @@ use std::time::Duration;
 use std::os::unix::net::{UnixListener, UnixStream};
 
 use yo_reactor::Reactor;
+use yo_resp::dispatch::Server as Shared;
 use yo_resp::engine::{Cmd, ConnId, Sink, Wire, pump};
 
 use crate::poll::Poller;
@@ -100,6 +102,20 @@ const LISTENER: u64 = u64::MAX;
 /// One below the other one, for the same reason: ids come from a free list that
 /// starts at zero and there are not four billion connections.
 const UNIX_LISTENER: u64 = u64::MAX - 1;
+
+/// How many stripes each database is cut into, for a given thread count.
+///
+/// Four to a thread rather than one, because a stripe is taken for the length of
+/// a command and threads do not take turns: with one stripe each, two of eight
+/// threads are on the same stripe about a third of the time, and with four each
+/// that falls to under a tenth. The database rounds this up to a power of two
+/// and clamps it, so what comes back is not always what goes in.
+///
+/// The multiplier is a number to settle with a benchmark rather than by
+/// argument, and this is the starting point rather than the answer.
+fn stripes(threads: usize) -> usize {
+    threads * 4
+}
 
 /// One accepted connection, whichever door it came in through.
 ///
@@ -336,24 +352,34 @@ impl Sink for Net {
 /// The doors, with the engine behind them.
 pub struct Server {
     doors: Vec<Door>,
-    reactor: Reactor<Wire<Net>>,
-    poller: Poller,
-    /// The batch the reactor runs, kept across turns so no turn allocates.
-    batch: Vec<Cmd>,
-    /// The tokens the poller said were ready, kept for the same reason.
-    ready: Vec<u64>,
-    buf: Vec<u8>,
+    /// The keyspace and the numbers, which is the one thing the threads share.
+    ///
+    /// Built here rather than in [`Server::run`] because everything a server is
+    /// told at startup, which is the directory, the limit and the file, is told
+    /// to this and has to be told before a thread is looking at it.
+    shared: Arc<Shared>,
+    /// How many threads will serve out of it.
+    threads: usize,
 }
 
 impl Server {
     /// Bind whichever doors were asked for, and hand back a server that has
     /// accepted nothing yet.
     ///
+    /// The thread count is taken here and not in [`Server::run`] because it
+    /// decides how many stripes each database is cut into, and that is fixed
+    /// when the databases are made. Zero is not a count and is read as one,
+    /// which is what the caller should already have resolved.
+    ///
     /// # Errors
     ///
     /// Whatever `bind` says, and an error of its own when neither a port nor a
     /// path was given, because a server nobody can reach is not a server.
-    pub fn open(addr: Option<SocketAddr>, path: Option<PathBuf>) -> io::Result<Server> {
+    pub fn open(
+        addr: Option<SocketAddr>,
+        path: Option<PathBuf>,
+        threads: usize,
+    ) -> io::Result<Server> {
         let mut doors = Vec::new();
         if let Some(addr) = addr {
             let listener = TcpListener::bind(addr)?;
@@ -369,18 +395,29 @@ impl Server {
                 "nothing to listen on: give a port, a socket file, or both",
             ));
         }
-        let mut poller = Poller::new()?;
-        for door in &doors {
-            poller.add(door, door.token())?;
-        }
+        let threads = threads.max(1);
+        let mut shared = if threads == 1 {
+            Shared::new()
+        } else {
+            Shared::with_width(stripes(threads))
+        };
+        shared.set_threads(threads);
         Ok(Server {
             doors,
-            reactor: Reactor::inline(Wire::new(Net::default())),
-            poller,
-            batch: Vec::with_capacity(64),
-            ready: Vec::with_capacity(64),
-            buf: vec![0; READ_CHUNK],
+            shared: Arc::new(shared),
+            threads,
         })
+    }
+
+    /// The server every thread will be serving out of, while it is still this
+    /// one's to change.
+    ///
+    /// # Panics
+    ///
+    /// Never from here. Nothing else holds a handle until [`Server::run`] makes
+    /// the workers, and everything that calls this runs before that.
+    fn setup(&mut self) -> &mut Shared {
+        Arc::get_mut(&mut self.shared).expect("nothing is serving out of it yet")
     }
 
     /// Where the server writes, which today is where `BACKUP` puts its files.
@@ -390,12 +427,12 @@ impl Server {
     /// changed afterwards, the same as on a real server without protected
     /// configs turned on.
     pub fn set_dir(&mut self, dir: PathBuf) {
-        self.reactor.engine_mut().server_mut().set_dir(dir);
+        self.setup().set_dir(dir);
     }
 
     /// How much memory the server may use before something has to go.
     pub fn set_maxmemory(&mut self, bytes: u64) {
-        self.reactor.engine_mut().server_mut().set_maxmemory(bytes);
+        self.setup().set_maxmemory(bytes);
     }
 
     /// Give the engine a file to move cold values into when it hits that limit.
@@ -409,10 +446,7 @@ impl Server {
     /// so a server that is given a file and never fills memory writes nothing to
     /// it and pays nothing for having been offered one.
     pub fn use_store(&mut self, store: Store) {
-        self.reactor
-            .engine_mut()
-            .server_mut()
-            .set_store_source(store.source());
+        self.setup().set_store_source(store.source());
     }
 
     /// Where it actually landed, which is the only way to find out when the
@@ -434,21 +468,119 @@ impl Server {
     /// Turn the loop until `stop` is set, or until a client says `SHUTDOWN`.
     ///
     /// Two doors out and they are the same door. `stop` is what a signal
-    /// handler sets and the engine's flag is what the command sets, and the
-    /// loop leaves on either, so everything that happens after this returns,
+    /// handler sets and the engine's flag is what the command sets, and both
+    /// are read by every thread, so everything that happens after this returns,
     /// which is the socket file going away and the file being closed, happens
-    /// once and in one place regardless of which one asked.
+    /// once and in one place regardless of which one asked and regardless of
+    /// which thread heard it.
+    ///
+    /// Every worker is built before any of them starts, so a poller that will
+    /// not register is an error out of here rather than a thread that quietly
+    /// dies on its own while the rest carry on serving.
+    ///
+    /// # Errors
+    ///
+    /// Only an accept failing for a reason that is not "nothing waiting", or a
+    /// worker that could not be set up. A connection failing is that
+    /// connection's problem and closes it.
+    ///
+    /// # Panics
+    ///
+    /// If a worker thread panicked, which is carried out to this thread rather
+    /// than swallowed.
+    pub fn run(&mut self, stop: &AtomicBool) -> io::Result<()> {
+        let mut workers = Vec::with_capacity(self.threads);
+        for _ in 0..self.threads {
+            workers.push(Worker::new(
+                &self.doors,
+                Wire::over(Arc::clone(&self.shared), Net::default()),
+            )?);
+        }
+        // One thread and there is nothing to spawn: this thread is it, which
+        // keeps a single threaded server exactly as it was and keeps the stack
+        // a panic unwinds through the same one it used to be.
+        if workers.len() == 1 {
+            return workers.remove(0).run(stop);
+        }
+        let mut failed = Ok(());
+        std::thread::scope(|scope| {
+            let mut running = Vec::with_capacity(workers.len());
+            for mut worker in workers {
+                running.push(scope.spawn(move || worker.run(stop)));
+            }
+            for handle in running {
+                match handle.join() {
+                    Ok(Ok(())) => {}
+                    // The first one wins. The ones behind it are usually the
+                    // same failure seen from another thread, and a listener
+                    // that stopped listening stops every worker anyway.
+                    Ok(Err(e)) if failed.is_ok() => failed = Err(e),
+                    Ok(Err(_)) => {}
+                    Err(panic) => std::panic::resume_unwind(panic),
+                }
+            }
+        });
+        failed
+    }
+}
+
+/// One thread's loop, with its own connections in front of the shared server.
+///
+/// Everything here belongs to the thread that made it: the poller, the sockets,
+/// the read buffer and every connection accepted through it. The doors are
+/// borrowed rather than owned, because the listeners are the one thing on this
+/// side that all the threads look at.
+///
+/// # Why every thread accepts
+///
+/// The listeners go into every worker's poller, so a connection waiting at a
+/// door wakes whichever threads are idle and the first one to call `accept`
+/// takes it. The rest get "nothing waiting", which they already handle, since
+/// that is what a listener with no backlog says on an ordinary turn. It spreads
+/// connections by whoever is free rather than round robin, which is the shape
+/// that wants no handoff between threads: a connection belongs to the thread
+/// that accepted it for as long as it is open.
+///
+/// The cost is that an accept wakes more threads than take it. That is a
+/// handful of syscalls per connection and a connection lasts for the length of a
+/// benchmark run, so it is not on any path that matters. A listener per thread
+/// with `SO_REUSEPORT` would remove even that, and is a change to make with a
+/// number rather than on the way past.
+struct Worker<'a> {
+    doors: &'a [Door],
+    reactor: Reactor<Wire<Net>>,
+    poller: Poller,
+    /// The batch the reactor runs, kept across turns so no turn allocates.
+    batch: Vec<Cmd>,
+    /// The tokens the poller said were ready, kept for the same reason.
+    ready: Vec<u64>,
+    buf: Vec<u8>,
+}
+
+impl<'a> Worker<'a> {
+    /// A worker with the doors registered and nothing accepted yet.
+    fn new(doors: &'a [Door], engine: Wire<Net>) -> io::Result<Worker<'a>> {
+        let mut poller = Poller::new()?;
+        for door in doors {
+            poller.add(door, door.token())?;
+        }
+        Ok(Worker {
+            doors,
+            reactor: Reactor::inline(engine),
+            poller,
+            batch: Vec::with_capacity(64),
+            ready: Vec::with_capacity(64),
+            buf: vec![0; READ_CHUNK],
+        })
+    }
+
+    /// Turn this thread's loop until somebody says to stop.
     ///
     /// The engine is asked at the top of a turn rather than the moment the
     /// command runs, so the batch that carried the `SHUTDOWN` finishes and its
     /// replies go out first. There are none for the `SHUTDOWN` itself, and
     /// there may well be some for the commands that shared its batch.
-    ///
-    /// # Errors
-    ///
-    /// Only an accept failing for a reason that is not "nothing waiting". A
-    /// connection failing is that connection's problem and closes it.
-    pub fn run(&mut self, stop: &AtomicBool) -> io::Result<()> {
+    fn run(&mut self, stop: &AtomicBool) -> io::Result<()> {
         let mut idle = 0u32;
         while !stop.load(Ordering::Relaxed) && !self.reactor.engine().stopping() {
             let wait = if idle <= SPIN_TURNS {
@@ -622,13 +754,19 @@ mod tests {
     /// Run a server on a port the operating system picked, and talk to it from
     /// another thread.
     ///
-    /// The client is the one that moves, because the engine and everything
-    /// under it belong to the thread that made them: one shard, one thread, no
-    /// locks (Y1). That is the design and not a limitation of the test.
+    /// The client is the one that moves, because `run` is the calling thread's
+    /// loop when there is one worker and the thread that waits for the rest
+    /// when there are more.
     fn served(client: impl FnOnce(SocketAddr) + Send + 'static) {
+        served_on(1, client);
+    }
+
+    /// The same, on however many threads.
+    fn served_on(threads: usize, client: impl FnOnce(SocketAddr) + Send + 'static) {
         let mut server = Server::open(
             Some("127.0.0.1:0".parse().expect("a literal address")),
             None,
+            threads,
         )
         .expect("a free port");
         let addr = server.local_addr().expect("bound");
@@ -665,6 +803,7 @@ mod tests {
         let mut server = Server::open(
             Some("127.0.0.1:0".parse().expect("a literal address")),
             None,
+            1,
         )
         .expect("a free port");
         // Small enough that the test reaches it by writing rather than by
@@ -950,6 +1089,89 @@ mod tests {
             .trim_end()
     }
 
+    /// Several clients on a server with several threads, all counting into one
+    /// key.
+    ///
+    /// The count is the point. Every `INCR` is a read and a write of the same
+    /// value from whichever thread accepted the client that sent it, so a
+    /// number that comes out short is two threads that were in the same stripe
+    /// at the same time and a number that comes out right is the stripe lock
+    /// doing its job. Eight clients over four threads, so at least two clients
+    /// share a thread and at least two threads share the key.
+    #[test]
+    fn several_threads_count_into_one_key_without_losing_any() {
+        const CLIENTS: usize = 8;
+        const EACH: usize = 500;
+
+        served_on(4, |addr| {
+            let mut sent = Vec::new();
+            for _ in 0..EACH {
+                sent.extend_from_slice(&cmd(&[b"INCR", b"n"]));
+            }
+            let sent = Arc::new(sent);
+
+            let mut clients = Vec::new();
+            for _ in 0..CLIENTS {
+                let sent = Arc::clone(&sent);
+                clients.push(std::thread::spawn(move || {
+                    let mut client = connect(addr);
+                    client.write_all(&sent).expect("sent");
+                    // Read the whole pipeline back, so the client is not gone
+                    // before the server has answered it.
+                    let mut got = 0;
+                    let mut buf = [0u8; 4096];
+                    while got < EACH {
+                        let n = client.read(&mut buf).expect("a reply");
+                        assert!(n > 0, "the server closed the connection");
+                        got += buf[..n].iter().filter(|b| **b == b'\n').count();
+                    }
+                }));
+            }
+            for c in clients {
+                c.join().expect("the client thread");
+            }
+
+            let mut last = connect(addr);
+            last.write_all(&cmd(&[b"GET", b"n"])).expect("sent");
+            let want = (CLIENTS * EACH).to_string();
+            let reply = format!("${}\r\n{want}\r\n", want.len());
+            assert_eq!(
+                read_exact(&mut last, reply.len()),
+                reply.as_bytes(),
+                "every INCR should be in there"
+            );
+        });
+    }
+
+    /// A `SHUTDOWN` heard by one thread stops all of them.
+    ///
+    /// The flag is on the shared server and every worker reads it at the top of
+    /// its turn, so this is a test that the loop asks and not a test that the
+    /// command works. Without it a `SHUTDOWN` would stop the thread that ran it
+    /// and leave the others serving, which is the worst of both answers.
+    #[test]
+    fn shutdown_on_one_thread_stops_the_others() {
+        let mut server = Server::open(
+            Some("127.0.0.1:0".parse().expect("a literal address")),
+            None,
+            4,
+        )
+        .expect("a free port");
+        let addr = server.local_addr().expect("bound");
+        // Never set, so the only way out of `run` is the command.
+        let stop = AtomicBool::new(false);
+
+        let thread = std::thread::spawn(move || {
+            let mut client = connect(addr);
+            client.write_all(&cmd(&[b"PING"])).expect("sent");
+            assert_eq!(read_exact(&mut client, 7), b"+PONG\r\n");
+            client.write_all(&cmd(&[b"SHUTDOWN"])).expect("sent");
+        });
+
+        server.run(&stop).expect("the listener stays up");
+        thread.join().expect("the client thread");
+    }
+
     /// A client that goes away without saying `QUIT`, which is what every
     /// benchmark client does at the end of a run.
     #[test]
@@ -995,7 +1217,7 @@ mod tests {
         /// The same harness as `served`, over a socket file.
         fn served_unix(name: &str, client: impl FnOnce(PathBuf) + Send + 'static) {
             let path = socket_path(name);
-            let mut server = Server::open(None, Some(path.clone())).expect("a fresh path");
+            let mut server = Server::open(None, Some(path.clone()), 1).expect("a fresh path");
             let stop = Arc::new(AtomicBool::new(false));
             let flag = Arc::clone(&stop);
             let theirs = path.clone();
@@ -1043,6 +1265,7 @@ mod tests {
             let mut server = Server::open(
                 Some("127.0.0.1:0".parse().expect("a literal address")),
                 Some(path.clone()),
+                1,
             )
             .expect("a free port and a fresh path");
             let addr = server.local_addr().expect("bound");
@@ -1079,7 +1302,7 @@ mod tests {
         fn a_leftover_socket_file_is_cleared() {
             let path = socket_path("leftover");
             {
-                let _first = Server::open(None, Some(path.clone())).expect("a fresh path");
+                let _first = Server::open(None, Some(path.clone()), 1).expect("a fresh path");
             }
             // The first server is dropped, which unlinks it, so put a file
             // back by hand. Dropping a UnixListener closes the descriptor and
@@ -1088,7 +1311,7 @@ mod tests {
             drop(std::os::unix::net::UnixListener::bind(&path).expect("bound"));
             assert!(path.exists(), "the leftover is there");
 
-            let second = Server::open(None, Some(path.clone()));
+            let second = Server::open(None, Some(path.clone()), 1);
             assert!(second.is_ok(), "{:?}", second.err());
         }
 
@@ -1096,8 +1319,8 @@ mod tests {
         #[test]
         fn a_live_socket_file_is_not_stolen() {
             let path = socket_path("live");
-            let _first = Server::open(None, Some(path.clone())).expect("a fresh path");
-            let e = match Server::open(None, Some(path.clone())) {
+            let _first = Server::open(None, Some(path.clone()), 1).expect("a fresh path");
+            let e = match Server::open(None, Some(path.clone()), 1) {
                 Ok(_) => panic!("something is already serving there"),
                 Err(e) => e,
             };
@@ -1109,7 +1332,7 @@ mod tests {
         fn the_socket_file_is_removed_on_the_way_out() {
             let path = socket_path("cleanup");
             {
-                let _server = Server::open(None, Some(path.clone())).expect("a fresh path");
+                let _server = Server::open(None, Some(path.clone()), 1).expect("a fresh path");
                 assert!(path.exists(), "it is there while the server is");
             }
             assert!(!path.exists(), "and gone once the server is dropped");
@@ -1117,7 +1340,7 @@ mod tests {
 
         #[test]
         fn a_server_with_no_door_is_refused() {
-            let e = match Server::open(None, None) {
+            let e = match Server::open(None, None, 1) {
                 Ok(_) => panic!("nothing to listen on"),
                 Err(e) => e,
             };

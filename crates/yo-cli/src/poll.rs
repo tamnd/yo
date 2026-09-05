@@ -70,6 +70,18 @@ pub struct Poller {
     inner: Inner,
 }
 
+// SAFETY: what a poller owns is a kernel object, referred to by a descriptor,
+// and a buffer of events the kernel fills in. A descriptor is a number that
+// means the same thing on every thread in the process, and the buffer is a
+// plain allocation. The kqueue backend is the reason this is not derived: an
+// event there carries the token in `udata`, whose type is `*mut c_void` because
+// that is what the interface takes, and what this puts in it is a token cast to
+// a pointer rather than an address of anything. Nothing here is tied to the
+// thread that made it, and a poller is still not `Sync`, because two threads
+// waiting on one of these at the same time is a different question and nothing
+// asks it: every thread makes its own.
+unsafe impl Send for Poller {}
+
 impl Poller {
     /// A poller with nothing registered.
     ///
