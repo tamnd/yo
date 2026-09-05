@@ -737,13 +737,18 @@ impl Waiters {
         self.list[at].db
     }
 
-    /// Take off every waiter belonging to a client that has gone.
+    /// Take off every waiter belonging to a client that has gone, and say how
+    /// many that was.
     ///
     /// Called when a connection closes rather than left for the deadline sweep
     /// to find, because a `BLPOP key 0` on a connection nobody will ever write
-    /// to again has no deadline to be found by.
-    fn forget(&mut self, client: u64) {
+    /// to again has no deadline to be found by. The count goes back because the
+    /// caller keeps its own tally of what its thread has waiting, and a client
+    /// that was never parked has to leave that tally alone.
+    fn forget(&mut self, client: u64) -> usize {
+        let before = self.list.len();
         self.list.retain(|w| w.client != client);
+        before - self.list.len()
     }
 
     /// Say which slot the waiter this client just registered is answered on.
@@ -834,6 +839,18 @@ impl Server {
         self.parked.load(Relaxed)
     }
 
+    /// How many of the calling thread's clients are parked.
+    ///
+    /// The number to branch on before reaching for the waiter list, because a
+    /// thread can only answer the waiters it parked itself. [`Server::parked`]
+    /// counts the whole server, so branching on that puts every thread through
+    /// the shared lock as soon as one client blocks anywhere.
+    #[must_use]
+    #[inline]
+    pub fn parked_here(&self) -> usize {
+        self.mine().parked.load(Relaxed)
+    }
+
     /// Park a client on a command that could not be answered yet.
     ///
     /// Filed under the calling thread, which is the thread that will answer it,
@@ -844,13 +861,24 @@ impl Server {
         let mut list = self.waiters.lock();
         list.park(client, thread, db, deadline, block);
         self.note(&list);
+        self.mine().blocked(1);
     }
 
     /// Take off every waiter belonging to a client that has gone.
+    ///
+    /// Called on the thread that parked it, which is the only thread that can
+    /// have parked it, so the count of what this thread has waiting comes down
+    /// by however many the list actually held. A thread with nothing waiting
+    /// does not take the lock, which is what keeps a server with one blocked
+    /// client from paying for it on every disconnect on every other thread.
     pub fn forget_waiters(&self, client: u64) {
+        if self.parked_here() == 0 {
+            return;
+        }
         let mut list = self.waiters.lock();
-        list.forget(client);
+        let gone = list.forget(client);
         self.note(&list);
+        self.mine().woke(gone);
     }
 
     /// Say which slot the waiter this client just registered is answered on.

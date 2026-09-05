@@ -88,6 +88,14 @@ const IDLE_WAIT: Duration = Duration::from_millis(20);
 ///
 /// Writability is not registered, so nothing arriving will wake the loop up to
 /// retry that write, and this is the timer it is retried on instead.
+///
+/// A thread holding a blocked client waits the same millisecond, for the same
+/// reason: what answers a `BLPOP` is a push, and on a server with more than one
+/// thread that push lands on whichever thread its client is on. Nothing arrives
+/// on this thread's poller to say so, so a thread that slept the idle wait would
+/// leave its client blocked for up to twenty milliseconds after the list it is
+/// waiting on already had something in it. One millisecond is also finer than
+/// the ten a second Redis checks its own blocked clients at.
 const OWED_WAIT: Duration = Duration::from_millis(1);
 
 /// The token the listener is registered under.
@@ -583,9 +591,10 @@ impl<'a> Worker<'a> {
     fn run(&mut self, stop: &AtomicBool) -> io::Result<()> {
         let mut idle = 0u32;
         while !stop.load(Ordering::Relaxed) && !self.reactor.engine().stopping() {
+            let engine = self.reactor.engine();
             let wait = if idle <= SPIN_TURNS {
                 Duration::ZERO
-            } else if self.reactor.engine().owed() > 0 {
+            } else if engine.owed() > 0 || engine.waiting() > 0 {
                 OWED_WAIT
             } else {
                 IDLE_WAIT
@@ -1140,6 +1149,58 @@ mod tests {
                 reply.as_bytes(),
                 "every INCR should be in there"
             );
+        });
+    }
+
+    /// A push on one thread answers a client blocked on another.
+    ///
+    /// Eight clients on four threads, so several of them are certainly not on
+    /// the thread the pusher landed on. What could go wrong is not the answer
+    /// but the waiting: nothing arrives on a blocked client's thread to say the
+    /// key it wants now has something in it, so a thread that slept its full
+    /// idle wait would leave its client hanging. The read timeout the harness
+    /// puts on a client is what turns that into a failure instead of a test that
+    /// never finishes.
+    #[test]
+    fn a_push_on_one_thread_answers_a_client_blocked_on_another() {
+        const CLIENTS: usize = 8;
+
+        served_on(4, |addr| {
+            let mut blocked = Vec::new();
+            for i in 0..CLIENTS {
+                let key = format!("q{i}");
+                let mut client = connect(addr);
+                client
+                    .write_all(&cmd(&[b"BLPOP", key.as_bytes(), b"0"]))
+                    .expect("sent");
+                blocked.push(client);
+            }
+
+            // One connection pushing to all eight keys, so whichever thread it
+            // is on is the only thread that hears about any of them.
+            let mut pusher = connect(addr);
+            for i in 0..CLIENTS {
+                let key = format!("q{i}");
+                pusher
+                    .write_all(&cmd(&[b"RPUSH", key.as_bytes(), b"v"]))
+                    .expect("sent");
+            }
+            let mut ack = [0u8; 64];
+            let mut lines = 0;
+            while lines < CLIENTS {
+                let n = pusher.read(&mut ack).expect("a reply to every push");
+                lines += ack[..n].iter().filter(|b| **b == b'\n').count();
+            }
+
+            for (i, client) in blocked.iter_mut().enumerate() {
+                let key = format!("q{i}");
+                let want = format!("*2\r\n${}\r\n{key}\r\n$1\r\nv\r\n", key.len());
+                assert_eq!(
+                    read_exact(client, want.len()),
+                    want.as_bytes(),
+                    "the client blocked on {key} should have been woken"
+                );
+            }
         });
     }
 

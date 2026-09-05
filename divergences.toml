@@ -580,13 +580,20 @@ spec = "09 section 5"
 
 [[divergence]]
 id = "D-79"
+title = "Blocked clients on different threads are not woken in the order they blocked"
+reason = "Two clients blocked on one key are served oldest first, which is what makes a work queue with several workers on it fair, and that still holds for every client that blocked on the same thread. Across threads it does not. A reply goes into a buffer the thread that accepted the connection owns, so a waiter can only be answered by the thread it blocked on, and each thread walks the shared list for its own entries on its own turn. A push that could serve either of two waiters on two threads is taken by whichever thread reaches its next turn first, which is not always the thread holding the older one. Making it strict would mean either handing a reply buffer between threads or letting a push wait for the right thread to come and take it, and both cost every command on the server to order a case a client cannot tell apart from scheduling anyway. yodb serve --threads 1 is the default and has one thread, so nothing there changes, and both orders are inside what Redis itself documents: it serves the oldest blocked client, and which client is oldest is decided by the order two connections arrived in, which nothing about the queue controls."
+status = "permanent"
+spec = "08 section 6"
+
+[[divergence]]
+id = "D-80"
 title = "A prefix marks every word it stood for rather than one of them"
 reason = "A real server works out the words a prefix, a suffix, an infix or a fuzzy term stood for, matches the document on all of them, and then marks one. run* over a field holding running runs runner ran rap answers running runs <b>runner</b> ran rap, with the two words that matched just as squarely left plain, and %runs% marks runs while leaving running plain even though the stem is what found the row. Which one survives is whichever the expansion wrote last, so it is not a rule a client could lean on. This side marks every word the expansion stood for, so run* answers <b>running</b> <b>runs</b> <b>runner</b> ran rap. Nothing else about the answer moves: the same rows come back in the same order with the same scores, and a plain term marks identically on both sides, stem and all."
 status = "permanent"
 spec = "09 section 5"
 
 [[divergence]]
-id = "D-80"
+id = "D-81"
 title = "The fields of a row come back in the order the schema names them"
 reason = "A real server answers the fields of a row in an order that is neither the order the key holds them in nor the order the schema names them in. An index over a TEXT, a TEXT, a NUMERIC and a TAG written to a hash in that order answers g, b, n, a on every row of every query, and a different index gives a different order again, because the order falls out of where each name landed in the lookup table the reply is built from. This side answers schema order, so the same index answers a, b, n, g. It is stable across queries and across runs on both servers, so a client reading fields by name sees no difference at all, and the only client this reaches is one reading a row by position, which no client library does. Naming a field in a SUMMARIZE FIELDS or a HIGHLIGHT FIELDS list moves it to the front on both sides, and that part is exact."
 status = "permanent"
