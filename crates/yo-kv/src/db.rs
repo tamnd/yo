@@ -118,7 +118,7 @@ impl Db {
         let n = stripes.clamp(1, MAX_STRIPES).next_power_of_two();
         Db {
             stripes: (0..n)
-                .map(|_| Lock::new(Keyspace::with_clock(clock)))
+                .map(|_| Lock::new(Keyspace::with_clock(clock.clone())))
                 .collect(),
             mask: (n - 1) as u64,
             clock,
@@ -390,15 +390,12 @@ impl Db {
 
     /// Move every clock in the database to `ms`.
     ///
-    /// Exclusive, and it stays exclusive. A clock is read on every command and
-    /// moved by whatever is turning the loop, so this is the one thing here
-    /// that a thread must not be doing while another thread is serving, and the
-    /// borrow checker saying so is the cheapest way to keep it that way.
-    pub fn set_clock_ms(&mut self, ms: u64) {
+    /// One store, because every stripe of a database and the database itself
+    /// hold handles onto one reading rather than copies of it. It used to be a
+    /// walk that wanted the database exclusively, which is a thing no thread
+    /// could do while another was serving.
+    pub fn set_clock_ms(&self, ms: u64) {
         self.clock.set(ms);
-        for stripe in self.stripes_mut() {
-            stripe.clock_mut().set(ms);
-        }
     }
 
     /// Trade this database's contents with another's, which is `SWAPDB`.

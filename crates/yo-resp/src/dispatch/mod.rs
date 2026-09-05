@@ -615,10 +615,12 @@ impl Server {
     pub fn new() -> Server {
         let clock = Clock::system();
         Server {
-            dbs: (0..DATABASES).map(|_| Db::with_clock(clock, 1)).collect(),
+            dbs: (0..DATABASES)
+                .map(|_| Db::with_clock(clock.clone(), 1))
+                .collect(),
             width: 1,
-            clock,
             started_ms: clock.now_ms(),
+            clock,
             next_db: AtomicUsize::new(0),
             dirty: ALL_DATABASES,
             conn_bytes: AtomicUsize::new(0),
@@ -654,10 +656,13 @@ impl Server {
     /// possible, and it is not what makes more than one thread happen.
     #[must_use]
     pub fn with_width(width: usize) -> Server {
-        let clock = Clock::system();
         let mut server = Server::new();
+        // The server's own clock and not a fresh one, because a database
+        // reading a different clock from the server it is on is a database
+        // whose keys expire against a time nobody set.
+        let clock = server.clock.clone();
         server.dbs = (0..DATABASES)
-            .map(|_| Db::with_clock(clock, width))
+            .map(|_| Db::with_clock(clock.clone(), width))
             .collect();
         server.width = server.dbs[0].width();
         server
@@ -667,10 +672,12 @@ impl Server {
     #[must_use]
     pub fn with_clock(clock: Clock) -> Server {
         Server {
-            dbs: (0..DATABASES).map(|_| Db::with_clock(clock, 1)).collect(),
+            dbs: (0..DATABASES)
+                .map(|_| Db::with_clock(clock.clone(), 1))
+                .collect(),
             width: 1,
-            clock,
             started_ms: clock.now_ms(),
+            clock,
             next_db: AtomicUsize::new(0),
             dirty: ALL_DATABASES,
             conn_bytes: AtomicUsize::new(0),
@@ -826,17 +833,18 @@ impl Server {
         self.dbs[0].hold_stripe(0)
     }
 
-    /// Take a new clock reading and give it to every database.
+    /// Take a new clock reading, which every database is looking at.
     ///
     /// Once per turn of the event loop, which is the only place time moves. A
     /// command asking what the time is gets the answer the whole batch got, so
     /// two keys written by the same batch expire together (`04` section 3).
-    pub fn refresh_clock(&mut self) {
+    ///
+    /// Every thread does this on every turn of its own loop and they do not
+    /// have to agree about when. The reading is only stored when the
+    /// millisecond has changed, so what the threads are sharing is a line that
+    /// is written about a thousand times a second and read millions.
+    pub fn refresh_clock(&self) {
         self.clock.refresh();
-        let now = self.clock.now_ms();
-        for db in &mut self.dbs {
-            db.set_clock_ms(now);
-        }
     }
 
     /// Move every clock here on by `ms`, for tests about expiry.
@@ -856,11 +864,8 @@ impl Server {
     /// request. The system clock underneath will overwrite this on the next
     /// [`Server::refresh_clock`], which is why this is only useful in a test
     /// that drives commands directly rather than through the event loop.
-    pub fn set_clock_ms(&mut self, ms: u64) {
+    pub fn set_clock_ms(&self, ms: u64) {
         self.clock.set(ms);
-        for db in &mut self.dbs {
-            db.set_clock_ms(ms);
-        }
     }
 
     /// Seconds since this server was built.
@@ -2374,6 +2379,21 @@ mod tests {
         // A database swapped with itself is fine and changes nothing.
         assert_eq!(f.run(&[b"SWAPDB", b"1", b"1"]), "+OK\r\n");
         assert_eq!(f.run(&[b"GET", b"k"]), "$4\r\nzero\r\n");
+    }
+
+    /// Every database on a server reads the server's clock and not one of its
+    /// own. They used to be told the time one at a time and now they share the
+    /// reading, so a server that built its databases from a second clock would
+    /// answer a deadline worked out against a time nobody had set.
+    #[test]
+    fn a_wide_server_puts_its_databases_on_its_own_clock() {
+        let mut f = Fixture::striped(8);
+        f.server.set_clock_ms(1_700_000_000_000);
+        assert_eq!(f.run(&[b"SET", b"k", b"v", b"EX", b"100"]), "+OK\r\n");
+        assert_eq!(f.run(&[b"EXPIRETIME", b"k"]), ":1700000100\r\n");
+        assert_eq!(f.run(&[b"TTL", b"k"]), ":100\r\n");
+        f.server.set_clock_ms(1_700_000_050_000);
+        assert_eq!(f.run(&[b"TTL", b"k"]), ":50\r\n");
     }
 
     /// The swap is stripe by stripe, so a database cut into more than one

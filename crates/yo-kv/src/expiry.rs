@@ -186,7 +186,7 @@ mod tests {
             d.set_plain(format!("k{i}").as_bytes(), b"v").expect("room");
         }
         assert_eq!(d.expires(), 2_000);
-        d.clock_mut().advance(200);
+        d.clock().advance(200);
         assert_eq!(
             d.len(),
             4_000,
@@ -233,7 +233,7 @@ mod tests {
                 .expect("room");
         }
         assert_eq!(d.expires(), 100);
-        d.clock_mut().advance(200);
+        d.clock().advance(200);
 
         let mut spent = 0;
         for _ in 0..100 {
@@ -277,7 +277,7 @@ mod tests {
             d.psetex(format!("d{i}").as_bytes(), 100, b"v")
                 .expect("room");
         }
-        d.clock_mut().advance(200);
+        d.clock().advance(200);
         // A budget of one still ends, and it ends having drawn one round rather
         // than having walked the database. One round can overshoot by the rest of
         // a bucket, which is the whole point of charging afterwards instead of
@@ -300,7 +300,7 @@ mod tests {
             d.psetex(format!("d{i}").as_bytes(), 100, b"v")
                 .expect("room");
         }
-        d.clock_mut().advance(200);
+        d.clock().advance(200);
         let mut spent = 0;
         for _ in 0..2_000 {
             spent += d.expire_cycle(4096).examined;
@@ -324,7 +324,7 @@ mod tests {
         }
         d.sadd(b"keep", [b"a".as_slice()].into_iter())
             .expect("room");
-        d.clock_mut().advance(200);
+        d.clock().advance(200);
         for _ in 0..500 {
             d.expire_cycle(4096);
             if d.expires() == 0 {

@@ -1061,7 +1061,7 @@ mod tests {
             "writing the record did not touch the body"
         );
 
-        d.clock_mut().advance(100);
+        d.clock().advance(100);
         assert_eq!(d.kind_of(b"h"), None);
         assert_eq!(d.len(), 0);
         assert_eq!(d.expired_keys(), 1);
@@ -1186,7 +1186,7 @@ mod tests {
         expire(&mut d, b"h", 2_000, &[b"a"]);
 
         assert_eq!(d.hlen(b"h").expect("ok"), 2, "still there at 1000");
-        d.clock_mut().advance(1_000);
+        d.clock().advance(1_000);
         assert_eq!(d.hlen(b"h").expect("ok"), 1, "and gone at 2000");
         assert_eq!(get(&mut d, b"h", b"a"), None);
         assert_eq!(get(&mut d, b"h", b"b").as_deref(), Some("2"));
@@ -1200,7 +1200,7 @@ mod tests {
         expire(&mut d, b"h", 2_000, &[b"a"]);
         assert_eq!(d.kind_of(b"h"), Some(Kind::Hash));
 
-        d.clock_mut().advance(1_000);
+        d.clock().advance(1_000);
         assert_eq!(d.hlen(b"h").expect("ok"), 0);
         assert_eq!(d.kind_of(b"h"), None, "an empty hash is not stored");
         assert_eq!(d.len(), 0);
@@ -1237,7 +1237,7 @@ mod tests {
         assert_eq!(out, [Ask::At(5_000), Ask::Missing]);
         assert_eq!(ttl_of(&mut d, b"h", &[b"a"]), [Ask::NoDeadline]);
 
-        d.clock_mut().advance(100_000);
+        d.clock().advance(100_000);
         assert_eq!(d.hlen(b"h").expect("ok"), 1, "and it outlives its deadline");
     }
 
@@ -1305,7 +1305,7 @@ mod tests {
             set(&mut d, b"h", &[(format!("f{i}").as_bytes(), b"v")]);
         }
         assert_eq!(d.encoding_name(b"h"), Some("hashtable"));
-        d.clock_mut().advance(1_000_000);
+        d.clock().advance(1_000_000);
         assert_eq!(d.hlen(b"h").expect("ok"), 600, "nothing had a deadline");
     }
 

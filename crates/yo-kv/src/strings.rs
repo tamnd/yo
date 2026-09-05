@@ -1390,9 +1390,9 @@ mod tests {
         s.set(b"k", b"v", SetOptions::PLAIN.expiring(Expire::At(1_500)))
             .unwrap();
         assert_eq!(s.expire_at(b"k"), Some(1_500));
-        s.clock_mut().set(1_499);
+        s.clock().set(1_499);
         assert_eq!(got(&mut s, b"k").as_deref(), Some(&b"v"[..]));
-        s.clock_mut().set(1_500);
+        s.clock().set(1_500);
         assert_eq!(got(&mut s, b"k"), None);
         assert_eq!(s.len(), 0, "the dead key was not reclaimed");
         assert_eq!(s.expired_keys(), 1);
@@ -1509,7 +1509,7 @@ mod tests {
         s.set(b"a", b"1", SetOptions::PLAIN.expiring(Expire::At(1_100)))
             .unwrap();
         s.set_plain(b"b", b"2").unwrap();
-        s.clock_mut().set(1_100);
+        s.clock().set(1_100);
         let vals = s.mget(&[&b"a"[..], &b"b"[..]]);
         assert!(vals[0].is_none(), "a dead key came back from mget");
         assert!(vals[1].is_some());
@@ -1695,7 +1695,7 @@ mod tests {
         assert_eq!(s.expire_at(b"k"), Some(2_000), "the deadline was dropped");
         // Past the deadline, the counter starts again from zero and the key has
         // no deadline any more.
-        s.clock_mut().set(2_000);
+        s.clock().set(2_000);
         assert_eq!(s.incr(b"k").unwrap(), 1);
         assert_eq!(s.expire_at(b"k"), None);
         assert_eq!(s.expired_keys(), 1);
@@ -1842,7 +1842,7 @@ mod tests {
         .unwrap();
         assert!(s.exists(b"k"));
         assert_eq!(s.strlen(b"k").expect("a string"), 5);
-        s.clock_mut().set(2_000);
+        s.clock().set(2_000);
         assert!(!s.exists(b"k"));
         assert_eq!(s.strlen(b"k").expect("a string"), 0);
     }
@@ -1989,14 +1989,14 @@ mod tests {
             .unwrap();
         assert_eq!(c.value, Num::Int(1));
         assert_eq!(s.expire_at(b"k"), Some(1_500));
-        s.clock_mut().set(1_200);
+        s.clock().set(1_200);
         let c = s
             .increx(b"k", IncrEx::PLAIN.expiring(IncrExpire::AtIfNone(1_700)))
             .unwrap();
         assert_eq!(c.value, Num::Int(2));
         assert_eq!(s.expire_at(b"k"), Some(1_500), "the window was pushed out");
         // Past the deadline the counter and the window both start again.
-        s.clock_mut().set(1_500);
+        s.clock().set(1_500);
         let c = s
             .increx(b"k", IncrEx::PLAIN.expiring(IncrExpire::AtIfNone(2_000)))
             .unwrap();
@@ -2085,7 +2085,7 @@ mod tests {
         .unwrap();
         s.set_plain(b"b", b"hello").unwrap();
         assert_eq!(s.lcs(b"a", b"b").unwrap(), b"hello");
-        s.clock_mut().set(1_100);
+        s.clock().set(1_100);
         assert_eq!(s.lcs(b"a", b"b").unwrap(), b"");
     }
 
@@ -2116,7 +2116,7 @@ mod tests {
 
         // One key expires, so the counter has something in it to check.
         s.setex(b"gone", 1, b"v").unwrap();
-        s.clock_mut().set(3_000);
+        s.clock().set(3_000);
         assert!(got(&mut s, b"gone").is_none());
         assert_eq!(s.expired_keys(), 1);
 
