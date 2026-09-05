@@ -97,6 +97,7 @@ use yo_search::query::parse::{BAD_POINT, BAD_RADIUS};
 use yo_search::query::{self, Ask, Bad, Circle, Mask, Node, Pair, Range, What};
 use yo_search::score::Scorer;
 use yo_search::sorted::{self, Sorted};
+use yo_search::spell::{self, Lists};
 use yo_search::summary::{self, Trim, Wanted, Wrap};
 use yo_search::tags::Tags;
 use yo_search::walk;
@@ -342,6 +343,7 @@ pub(super) fn execute<'a>(
         "FT.DICTDUMP" => dict_dump(reg, args, out),
         "FT.SYNUPDATE" => syn_update(reg, args, out).map(|name| made = name),
         "FT.SYNDUMP" => syn_dump(reg, args, out),
+        "FT.SPELLCHECK" => spellcheck(reg, args, out),
         other => unreachable!("{other} is not a search command"),
     };
     if let Err(f) = done {
@@ -1307,6 +1309,201 @@ fn syn_dump<'a>(reg: &mut Registry, args: Args<'a>, out: &mut Out) -> Answer<'a>
         }
     }
     Ok(())
+}
+
+/// The word `FT.SPELLCHECK` puts in front of every row it answers with.
+const TERM: &[u8] = b"TERM";
+/// What a `RESP3` spellcheck reply calls the one thing it holds.
+const RESULTS: &[u8] = b"results";
+/// A distance that is not a whole number from one to four.
+const BAD_DISTANCE: &str = "bad distance given, distance must be a natural number between 1 to 4";
+/// `DISTANCE` with nothing after it.
+const NEED_DISTANCE: &str = "DISTANCE arg is given but no DISTANCE comes after";
+/// `TERMS` without both of the words it takes.
+const NEED_TERMS: &str = "TERM arg is given but no TERM params comes after";
+/// `TERMS` followed by something that is neither `INCLUDE` nor `EXCLUDE`.
+const BAD_TERMS: &str = "bad format, exclude/include operation was not given";
+/// A dictionary nobody has put a word in.
+const NO_DICT: &str = "Dict does not exist: ";
+
+/// What the arguments after the query asked for.
+struct Spelling<'a> {
+    /// How far a suggestion may be from the word.
+    distance: u8,
+    /// Whether a distance has already been read, since the first one counts and
+    /// the rest are dropped.
+    fixed: bool,
+    /// The names of the dictionaries whose words are candidates.
+    include: Vec<&'a [u8]>,
+    /// The names of the dictionaries whose words are spelled right.
+    exclude: Vec<&'a [u8]>,
+    /// `DIALECT` and `PARAMS`, which arrive here the way they do everywhere
+    /// else and are handed to the same parser.
+    asked: Asked<'a>,
+}
+
+/// `FT.SPELLCHECK index query [DISTANCE n] [TERMS INCLUDE|EXCLUDE dict] ...`
+///
+/// The query is parsed the way `FT.SEARCH` would parse it and every plain word
+/// in the tree is answered about, in the order it was written and twice when it
+/// was written twice. A prefix, a suffix, an infix, a pattern and a fuzzy word
+/// stand for terms the index already holds and are not words anybody could have
+/// misspelled, so none of them is answered about.
+///
+/// The stopword list is off, because a real server checks `then` and suggests
+/// `thin` for it. Nothing indexes a stopword, so a stopword is always a word the
+/// index does not hold.
+///
+/// An argument nobody knows is stepped over rather than refused, which is not
+/// how the rest of the search surface reads its arguments and is measured:
+/// `FT.SPELLCHECK i q BOGUS` answers. A second `DISTANCE` is dropped the same
+/// way, so `DISTANCE 3 DISTANCE 1` looks three letters out.
+fn spellcheck<'a>(reg: &mut Registry, args: Args<'a>, out: &mut Out) -> Answer<'a> {
+    let name = args.get(1);
+    let query = args.get(2);
+    // Opened rather than named, because a spellcheck counts as a use of the
+    // index the same way a search does. The index itself is let go of straight
+    // away and taken again below, because the dictionaries and the indexes are
+    // both on the registry and the check needs to read the two of them at once.
+    if reg.open(name).is_none() {
+        return Err(Fail::naming(MISSING, name));
+    }
+    let asked = match spelling(args, 3) {
+        Ok(asked) => asked,
+        Err(text) => {
+            out.error(&text);
+            return Ok(());
+        }
+    };
+    for named in asked.include.iter().chain(&asked.exclude) {
+        if reg.dicts.len(named) == 0 {
+            out.error(&line(NO_DICT, named, ""));
+            return Ok(());
+        }
+    }
+    let lists = Lists {
+        include: asked
+            .include
+            .iter()
+            .flat_map(|n| reg.dicts.dump(n))
+            .collect(),
+        exclude: asked
+            .exclude
+            .iter()
+            .flat_map(|n| reg.dicts.dump(n))
+            .collect(),
+    };
+    let index = reg.named(name).expect("an index that was just opened");
+    let ask = Ask {
+        dialect: asked.asked.dialect,
+        params: &asked.asked.params,
+        verbatim: false,
+        // A real server checks a stopword and suggests for it, which it can
+        // only do by reading the query with the list turned off.
+        stopwords: false,
+    };
+    let node = match query::parse(query, index, &ask) {
+        Ok(node) => node,
+        Err(bad) => {
+            out.error(&refused(&bad));
+            return Ok(());
+        }
+    };
+    let found = spell::check(index, &node, asked.distance, &lists);
+    if out.proto().is_resp3() {
+        out.map(1);
+        out.bulk(RESULTS);
+        out.map(found.len());
+        for checked in &found {
+            out.bulk(&checked.word);
+            out.array(checked.guesses.len());
+            for guess in &checked.guesses {
+                out.map(1);
+                out.bulk(&guess.term);
+                out.double(guess.score);
+            }
+        }
+        return Ok(());
+    }
+    out.array(found.len());
+    for checked in &found {
+        out.array(3);
+        out.bulk(TERM);
+        out.bulk(&checked.word);
+        out.array(checked.guesses.len());
+        for guess in &checked.guesses {
+            out.array(2);
+            out.double(guess.score);
+            out.bulk(&guess.term);
+        }
+    }
+    Ok(())
+}
+
+/// The words after the query, which are read leniently on this one command.
+fn spelling(args: Args<'_>, from: usize) -> core::result::Result<Spelling<'_>, Vec<u8>> {
+    let mut spelling = Spelling {
+        distance: spell::NEAREST,
+        fixed: false,
+        include: Vec::new(),
+        exclude: Vec::new(),
+        asked: Asked::default(),
+    };
+    let mut at = from;
+    while at < args.len() {
+        let word = args.get(at);
+        if args::is(word, b"DISTANCE") {
+            let Some(value) = args.opt(at + 1) else {
+                return Err(NEED_DISTANCE.as_bytes().to_vec());
+            };
+            let Some(distance) = parse_i64(value)
+                .filter(|d| (i64::from(spell::NEAREST)..=i64::from(spell::FURTHEST)).contains(d))
+            else {
+                return Err(BAD_DISTANCE.as_bytes().to_vec());
+            };
+            if !spelling.fixed {
+                spelling.distance = u8::try_from(distance).unwrap_or(spell::NEAREST);
+                spelling.fixed = true;
+            }
+            at += 2;
+            continue;
+        }
+        if args::is(word, b"TERMS") {
+            let (Some(how), Some(named)) = (args.opt(at + 1), args.opt(at + 2)) else {
+                return Err(NEED_TERMS.as_bytes().to_vec());
+            };
+            if args::is(how, b"INCLUDE") {
+                spelling.include.push(named);
+            } else if args::is(how, b"EXCLUDE") {
+                spelling.exclude.push(named);
+            } else {
+                return Err(BAD_TERMS.as_bytes().to_vec());
+            }
+            at += 3;
+            continue;
+        }
+        if args::is(word, b"DIALECT") {
+            let Some(value) = args.opt(at + 1) else {
+                return Err(line(NEED_ARG, b"DIALECT", ""));
+            };
+            let Some(dialect) = parse_i64(value).filter(|d| (1..=i64::from(NEWEST)).contains(d))
+            else {
+                return Err(BAD_DIALECT.as_bytes().to_vec());
+            };
+            spelling.asked.dialect = u8::try_from(dialect).unwrap_or(1);
+            at += 2;
+            continue;
+        }
+        if args::is(word, b"PARAMS") {
+            at = params(args, at, &mut spelling.asked)?;
+            continue;
+        }
+        // Everything else is stepped over. A real server reads this list with a
+        // loop that only knows those four words and leaves the rest alone, so
+        // `VERBATIM` here is not an error and is not honoured either.
+        at += 1;
+    }
+    Ok(spelling)
 }
 
 /// A string in a reply, as a simple string when it can be one.
@@ -2877,7 +3074,17 @@ fn params(
     let Some(count) = parse_i64(count) else {
         return Err(line(BAD_ARGS, b"PARAMS", NOT_A_NUMBER));
     };
-    let count = usize::try_from(count).unwrap_or(0);
+    let Ok(count) = usize::try_from(count) else {
+        return Err(line(BAD_ARGS, b"PARAMS", OUT_OF_RANGE));
+    };
+    // The words are counted before their shape is looked at, which is the way
+    // round a real server does it and is worth keeping because the two errors
+    // are different. `PARAMS 3 a b` reaches past the end of the command and
+    // says an argument was expected, while `PARAMS 3 a b c` has all three and
+    // only then gets told the count has to be even.
+    if at + 2 + count > args.len() {
+        return Err(line(BAD_ARGS, b"PARAMS", NOT_THERE));
+    }
     if count == 0 || count % 2 != 0 {
         return Err(ODD_PARAMS.as_bytes().to_vec());
     }

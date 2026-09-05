@@ -175,9 +175,23 @@ pub fn glob(pattern: &[u8], word: &[u8]) -> bool {
 /// all a yes or no answer needs, and it gives up as soon as a whole row is
 /// further out than the distance asked for, because nothing below such a row
 /// can come back.
+///
+/// The edit is a character and not a byte, which is measured: `%ecole%`
+/// answers a document holding `école` on a real server, and it can only do
+/// that if the accent counts as one change rather than as the two bytes it
+/// takes up. A word that is nothing but ASCII costs the same either way, since
+/// the walk below reads one byte per step for it.
 #[must_use]
 pub fn within(word: &[u8], term: &[u8], distance: u8) -> bool {
     let most = usize::from(distance);
+    // The bytes bound the characters from above, so a pair too far apart in
+    // bytes to be saved is still too far apart in characters and never has to
+    // be read.
+    if word.len().abs_diff(term.len()) > most.saturating_mul(4) {
+        return false;
+    }
+    let word: Vec<char> = chars(word);
+    let term: Vec<char> = chars(term);
     if word.len().abs_diff(term.len()) > most {
         return false;
     }
@@ -195,6 +209,15 @@ pub fn within(word: &[u8], term: &[u8], distance: u8) -> bool {
         std::mem::swap(&mut last, &mut row);
     }
     last[term.len()] <= most
+}
+
+/// The characters of a word, with anything that is not valid UTF-8 counted one
+/// byte at a time so a term that came in as rubbish still compares.
+fn chars(word: &[u8]) -> Vec<char> {
+    match str::from_utf8(word) {
+        Ok(text) => text.chars().collect(),
+        Err(_) => word.iter().map(|b| char::from(*b)).collect(),
+    }
 }
 
 #[cfg(test)]
