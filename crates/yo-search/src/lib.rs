@@ -60,6 +60,7 @@
 pub mod english;
 pub mod field;
 pub mod index;
+pub mod nums;
 pub mod posts;
 pub mod query;
 pub mod registry;
