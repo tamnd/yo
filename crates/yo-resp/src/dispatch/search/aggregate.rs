@@ -15,14 +15,17 @@ use std::collections::hash_map::Entry;
 use yo_common::num::parse_f64;
 use yo_common::parse_i64;
 use yo_search::Index;
+use yo_search::expr::{Expr, Value};
 use yo_search::field::Kind;
 use yo_search::reduce;
+use yo_search::token;
 
 use super::{
-    Args, Asked, BAD_ARGS, COUNT_ONLY, DUPLICATE_END, DUPLICATE_PROP, GROUP_COUNT, GROUP_SHORT,
-    MISSING_ARGS, MOST_SAMPLE, NO_AT, NO_AT_END, NO_AT_MID, NO_PROPERTY, NO_REDUCER, NOT_A_NUMBER,
-    NOT_LOADED, NOT_MAIN, NOT_THERE, OUT_OF_RANGE, PERCENTAGE, QUOTE_END, REDUCE_BARE, RESOLUTION,
-    RESOLUTION_ARG, Row, SAMPLE_BIG, SAMPLE_SIZE, UNKNOWN, line, twelve,
+    AS_SHORT, Args, Asked, BAD_ARGS, COUNT_ONLY, DUPLICATE_END, DUPLICATE_PROP, GROUP_COUNT,
+    GROUP_SHORT, MISSING_ARGS, MOST_SAMPLE, NO_AT, NO_AT_END, NO_AT_MID, NO_PROPERTY, NO_REDUCER,
+    NOT_A_NUMBER, NOT_LOADED, NOT_MAIN, NOT_THERE, OUT_OF_RANGE, PERCENTAGE, QUOTE_END,
+    REDUCE_BARE, RESOLUTION, RESOLUTION_ARG, Row, SAMPLE_BIG, SAMPLE_SIZE, STEP_SHORT, UNKNOWN,
+    line, twelve,
 };
 use crate::dispatch::Server;
 use crate::dispatch::args;
@@ -69,8 +72,8 @@ pub(super) struct Pipe<'a> {
     /// that which only shows up beside a `LOAD *`: after one of those any name
     /// at all is readable, because the key might turn out to hold it.
     pub(super) base: Vec<(Box<[u8]>, Reads)>,
-    /// The grouping steps, in the order they were written.
-    pub(super) groups: Vec<Group>,
+    /// The steps that reshape the rows, in the order they were written.
+    pub(super) steps: Vec<Step>,
     /// What the row looks like where the parser has got to, which is the base
     /// row until the first `GROUPBY` and that step's own output after it.
     ///
@@ -84,10 +87,53 @@ pub(super) struct Pipe<'a> {
 pub(super) enum Reads {
     /// A field of the key. The field and the name the property answers under
     /// differ whenever an `AS` renamed it or the schema declared it with one.
-    Field(Box<[u8]>),
+    Field(Box<[u8]>, Shape),
     /// The score the query gave the document, which is only a property when
     /// `ADDSCORES` asked for it.
     Score,
+    /// Nothing off the key at all: a slot an `APPLY` fills in.
+    Made,
+}
+
+/// What the bytes of a field become when they are read onto a row.
+///
+/// A field with a number behind it is a number and not the digits it was
+/// written with, which is measured rather than assumed: `strlen(@n)` over a
+/// `NUMERIC` field is refused for the type of its argument whether or not a
+/// `LOAD` named it. The third one is the sortable copy, which a real server
+/// keeps folded unless the schema said `UNF`, so a field holding `HeLLo` reads
+/// back as `hello` through the sort and as `HeLLo` through a `LOAD`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum Shape {
+    Words,
+    Number,
+    Folded,
+}
+
+/// One step of the pipeline.
+pub(super) enum Step {
+    Group(Group),
+    /// An expression written to a slot of the row, which is a new one unless
+    /// the name it was given already meant something.
+    Apply {
+        at: usize,
+        name: Box<[u8]>,
+        expr: Expr,
+    },
+    /// An expression every row has to answer true to.
+    Filter(Expr),
+}
+
+/// Which properties a step may read.
+///
+/// A `GROUPBY` and a `REDUCE` read any field of the schema whether or not
+/// anything loaded it. An `APPLY` and a `FILTER` read what is on the row and
+/// nothing else, except that a sortable field is on the row without being
+/// loaded, because a real server keeps a copy of one beside the document.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Look {
+    Any,
+    Sorted,
 }
 
 /// One `GROUPBY` and the reducers hanging off it.
@@ -111,17 +157,6 @@ pub(super) struct Reducer {
     /// The name the answer comes back under, which is either the `AS` or the
     /// generated one [`generated`] builds.
     name: Box<[u8]>,
-}
-
-/// One property of a row as it moves through the pipeline.
-///
-/// A list is in here because two of the reducers answer one, and it is the one
-/// thing a property can be that a field of a key never is.
-#[derive(Clone, PartialEq, Eq)]
-pub(super) enum Value {
-    Text(Box<[u8]>),
-    List(Vec<Box<[u8]>>),
-    Nil,
 }
 
 /// `GROUPBY nargs @property... [REDUCE ...]...`.
@@ -167,7 +202,7 @@ pub(super) fn group<'a>(
         if names.iter().any(|held| **held == *name) {
             return Err(line(DUPLICATE_PROP, name, DUPLICATE_END));
         }
-        let Some(from) = locate(&mut asked.pipe, index, name) else {
+        let Some(from) = locate(&mut asked.pipe, index, name, Look::Any) else {
             return Err(line(NO_PROPERTY, name, QUOTE_END));
         };
         by.push((from, name.into()));
@@ -182,7 +217,7 @@ pub(super) fn group<'a>(
         names.push(fold.name.clone());
         folds.push(fold);
     }
-    asked.pipe.groups.push(Group { by, folds });
+    asked.pipe.steps.push(Step::Group(Group { by, folds }));
     // Everything the row held before this step is gone, and what is left is the
     // group properties and whatever the reducers answered.
     asked.pipe.stage = Some(names);
@@ -265,7 +300,7 @@ fn fold(
         None => Err(line(MISSING_ARGS, func, "")),
         Some(word) => {
             let name = word.strip_prefix(b"@").unwrap_or(word);
-            match locate(&mut asked.pipe, index, name) {
+            match locate(&mut asked.pipe, index, name, Look::Any) {
                 Some(from) => Ok(from),
                 None => Err(line(NOT_LOADED, name, QUOTE_END)),
             }
@@ -355,7 +390,7 @@ fn fold(
                 return Err(line(MISSING_ARGS, func, ""));
             };
             let name = word.strip_prefix(b"@").unwrap_or(word);
-            let Some(from) = locate(&mut asked.pipe, index, name) else {
+            let Some(from) = locate(&mut asked.pipe, index, name, Look::Any) else {
                 return Err(line(NOT_LOADED, name, QUOTE_END));
             };
             order.by = true;
@@ -420,12 +455,15 @@ fn generated(func: &[u8], words: &[&[u8]]) -> Box<[u8]> {
 /// field of the key that nothing has read yet.
 ///
 /// Before the first group step a property is one of four things: something a
-/// `LOAD` already named, the score when `ADDSCORES` asked for it, a field of
-/// the schema, or anything at all once a `LOAD *` has said the whole key is
-/// coming. After a group step it is only one thing, a property that step
+/// `LOAD` or an `APPLY` already named, the score when `ADDSCORES` asked for it,
+/// a field of the schema, or anything at all once a `LOAD *` has said the whole
+/// key is coming. After a group step it is only one thing, a property that step
 /// answered, because the key the rest would have been read off is not under the
 /// row any more.
-fn locate(pipe: &mut Pipe<'_>, index: &Index, name: &[u8]) -> Option<usize> {
+///
+/// Which fields of the schema count is the one thing the two kinds of step
+/// disagree about, and [`Look`] carries the answer.
+fn locate(pipe: &mut Pipe<'_>, index: &Index, name: &[u8], look: Look) -> Option<usize> {
     if let Some(stage) = &pipe.stage {
         return stage.iter().position(|held| **held == *name);
     }
@@ -439,71 +477,352 @@ fn locate(pipe: &mut Pipe<'_>, index: &Index, name: &[u8]) -> Option<usize> {
         pipe.base.push((name.into(), Reads::Score));
         return Some(pipe.base.len() - 1);
     }
-    let from = match index.field(name) {
-        Some(field) => field.identifier.clone(),
-        None if pipe.all => name.into(),
+    let (from, shape) = match index.field(name) {
+        Some(field) => {
+            if look == Look::Sorted && !field.sortable && !pipe.all {
+                return None;
+            }
+            let shape = match () {
+                () if field.kind == Kind::Numeric => Shape::Number,
+                // A field read through the sorting vector rather than off the
+                // key comes back the way the index folded it, which is the one
+                // place a value changes on its way onto a row.
+                () if field.sortable && !field.is_unf() => Shape::Folded,
+                () => Shape::Words,
+            };
+            (field.identifier.clone(), shape)
+        }
+        None if pipe.all => (name.into(), Shape::Words),
         None => return None,
     };
-    pipe.base.push((name.into(), Reads::Field(from)));
+    pipe.base.push((name.into(), Reads::Field(from, shape)));
     Some(pipe.base.len() - 1)
 }
 
-/// Reads the keys a grouping pipeline needs and writes what it made.
+/// Where an `APPLY` writes, which is a slot of its own unless the name it was
+/// given already means something on the row.
 ///
-/// Every document that answered is folded whatever the window is, and the
-/// window goes on the groups afterwards. That is why the count at the front is
-/// the number of groups on both protocols and under any `LIMIT`: there is no
-/// half written reply to report a position in, because the whole answer has to
-/// exist before the first group does.
-pub(super) fn grouped(server: &Server, db: usize, rows: &[Row], asked: &Asked<'_>, out: &mut Out) {
+/// An `APPLY` that names a property that is already there overwrites it where
+/// it stands rather than answering it twice, so `LOAD 1 @n APPLY '@n' AS n`
+/// answers one `n`.
+fn makes(pipe: &mut Pipe<'_>, name: &[u8]) -> usize {
+    if let Some(stage) = &mut pipe.stage {
+        if let Some(at) = stage.iter().position(|held| **held == *name) {
+            return at;
+        }
+        stage.push(name.into());
+        return stage.len() - 1;
+    }
+    if let Some(at) = pipe.base.iter().position(|(held, _)| **held == *name) {
+        return at;
+    }
+    pipe.base.push((name.into(), Reads::Made));
+    pipe.base.len() - 1
+}
+
+/// Reads an expression and tells every property in it where it is read from.
+fn built(src: &[u8], asked: &mut Asked<'_>, index: &Index) -> core::result::Result<Expr, Vec<u8>> {
+    let mut expr = Expr::parse(src)?;
+    expr.bind(&mut |name| locate(&mut asked.pipe, index, name, Look::Sorted))
+        .map_err(|missing| line(NOT_LOADED, &missing.0, QUOTE_END))?;
+    Ok(expr)
+}
+
+/// `APPLY expression [AS name]`.
+///
+/// Without the `AS` the property is answered under the expression as the client
+/// wrote it, spaces and all, so `APPLY '1  +   1'` answers under `1  +   1`.
+pub(super) fn apply<'a>(
+    args: Args<'a>,
+    at: usize,
+    asked: &mut Asked<'a>,
+    index: &Index,
+) -> core::result::Result<usize, Vec<u8>> {
+    asked.pipe.stepped = true;
+    let Some(src) = args.opt(at + 1) else {
+        return Err(STEP_SHORT.as_bytes().to_vec());
+    };
+    let mut at = at + 2;
+    let name: Box<[u8]> = match args.opt(at).is_some_and(|word| args::is(word, b"AS")) {
+        false => src.into(),
+        true => {
+            at += 1;
+            let Some(name) = args.opt(at) else {
+                return Err(AS_SHORT.as_bytes().to_vec());
+            };
+            at += 1;
+            name.into()
+        }
+    };
+    // The expression is read against the row in front of this step, which is
+    // why the slot it writes to is worked out after it: `APPLY '@x + 1' AS x`
+    // reads the old `x` and answers the new one.
+    let expr = built(src, asked, index)?;
+    let slot = makes(&mut asked.pipe, &name);
+    asked.pipe.steps.push(Step::Apply {
+        at: slot,
+        name,
+        expr,
+    });
+    Ok(at)
+}
+
+/// `FILTER expression`.
+pub(super) fn keeps<'a>(
+    args: Args<'a>,
+    at: usize,
+    asked: &mut Asked<'a>,
+    index: &Index,
+) -> core::result::Result<usize, Vec<u8>> {
+    asked.pipe.stepped = true;
+    let Some(src) = args.opt(at + 1) else {
+        return Err(STEP_SHORT.as_bytes().to_vec());
+    };
+    let expr = built(src, asked, index)?;
+    asked.pipe.steps.push(Step::Filter(expr));
+    Ok(at + 2)
+}
+
+/// One row of the pipeline and how many rows were thrown away before it.
+///
+/// The second half of that is what the count at the front of the reply is made
+/// of, and it is carried per row because the count a client sees is the one
+/// that stood when the first row of the reply was written.
+struct Held {
+    values: Vec<Value>,
+    dropped: usize,
+    /// Which document the row came off, which a row a group step made has
+    /// nothing to answer.
+    from: Option<usize>,
+}
+
+/// Reads the keys a pipeline needs, runs it, and writes what it made.
+///
+/// Every document that answered is read whatever the window is, because a step
+/// that throws rows away changes which document the window lands on.
+pub(super) fn piped(
+    server: &Server,
+    db: usize,
+    total: usize,
+    rows: &[Row],
+    asked: &Asked<'_>,
+    out: &mut Out,
+) {
     let pipe = &asked.pipe;
     let mut names: Vec<Box<[u8]>> = pipe.base.iter().map(|(name, _)| name.clone()).collect();
     // The key only has to be read when something on the row comes off it, which
     // a pipeline grouping by `@__score` alone does not.
-    let reads = pipe
-        .base
-        .iter()
-        .any(|(_, from)| matches!(from, Reads::Field(_)));
-    let mut table: Vec<Vec<Value>> = Vec::with_capacity(rows.len());
-    for row in rows {
+    let reads = pipe.all
+        || pipe
+            .base
+            .iter()
+            .any(|(_, from)| matches!(from, Reads::Field(..)));
+    let mut table: Vec<Held> = Vec::with_capacity(rows.len());
+    let mut lost = 0;
+    for (at, row) in rows.iter().enumerate() {
         let doc = match reads {
             false => None,
             // A key that answered the query and is no longer there is left out
-            // of the fold, the same way a search leaves it out of the reply.
+            // of the answer, the same way a search leaves it out of the reply.
             true => match indexing::read(&server.dbs[db], &row.key) {
                 Some(doc) => Some(doc),
-                None => continue,
+                None => {
+                    lost += 1;
+                    continue;
+                }
             },
         };
         let pairs = doc.as_ref().map(indexing::Document::pairs);
         let mut made: Vec<Value> = Vec::with_capacity(pipe.base.len());
         for (_, from) in &pipe.base {
             made.push(match from {
+                Reads::Made => Value::Missing,
                 Reads::Score => Value::Text(twelve(row.score).into_bytes().into()),
-                Reads::Field(id) => match pairs.iter().flatten().find(|(held, _)| *held == &**id) {
-                    Some((_, value)) => Value::Text((*value).into()),
-                    None => Value::Nil,
-                },
+                Reads::Field(id, shape) => {
+                    match pairs.iter().flatten().find(|(held, _)| *held == &**id) {
+                        Some((_, value)) => shaped(value, *shape),
+                        None => Value::Missing,
+                    }
+                }
             });
         }
-        table.push(made);
+        // `LOAD *` puts whatever else the key holds on the end of the row.
+        // Nothing can name one of those in an expression, because a name that
+        // was written down has a slot of its own already.
+        if pipe.all {
+            for (field, value) in pairs.iter().flatten() {
+                if pipe.base.iter().any(|(held, _)| **held == **field) {
+                    continue;
+                }
+                let spot = match names.iter().position(|held| **held == **field) {
+                    Some(spot) => spot,
+                    None => {
+                        names.push((*field).into());
+                        names.len() - 1
+                    }
+                };
+                made.resize_with(made.len().max(spot + 1), || Value::Missing);
+                made[spot] = Value::Text((*value).into());
+            }
+        }
+        made.resize_with(names.len(), || Value::Missing);
+        table.push(Held {
+            values: made,
+            dropped: 0,
+            from: Some(at),
+        });
     }
-    for group in &pipe.groups {
-        table = folded(group, &table);
-        names = group
-            .by
-            .iter()
-            .map(|(_, name)| name.clone())
-            .chain(group.folds.iter().map(|fold| fold.name.clone()))
-            .collect();
+    let mut start = total - lost;
+    let mut warning = None;
+    let mut grouped = false;
+    let mut gone = 0;
+    for step in &pipe.steps {
+        match step {
+            Step::Group(group) => {
+                table = folded(group, &table);
+                names = group
+                    .by
+                    .iter()
+                    .map(|(_, name)| name.clone())
+                    .chain(group.folds.iter().map(|fold| fold.name.clone()))
+                    .collect();
+                // A group is a row of its own with no key under it, so the
+                // count starts again from the number of groups and the rows
+                // that were folded into them are not in it.
+                start = table.len();
+                grouped = true;
+            }
+            Step::Apply { at, name, expr } => {
+                match *at < names.len() {
+                    true => names[*at] = name.clone(),
+                    false => names.push(name.clone()),
+                }
+                let mut done = 0;
+                for held in &mut table {
+                    match expr.eval(&held.values) {
+                        Ok(value) => {
+                            held.values.resize_with(names.len(), || Value::Missing);
+                            held.values[*at] = value;
+                        }
+                        Err(bad) => {
+                            warning = Some(bad);
+                            break;
+                        }
+                    }
+                    done += 1;
+                }
+                // A row that cannot be worked out stops the pipeline where it
+                // stands. What was written stays written and the rest is never
+                // sent, which is why this is a warning and not an error.
+                if warning.is_some() {
+                    table.truncate(done);
+                }
+            }
+            Step::Filter(expr) => {
+                let mut over = 0;
+                let mut stop = false;
+                let seen = table.len();
+                table.retain_mut(|held| {
+                    if stop {
+                        return false;
+                    }
+                    match expr.eval(&held.values) {
+                        Ok(value) if value.truth() => {
+                            held.dropped += over;
+                            true
+                        }
+                        Ok(_) => {
+                            over += 1;
+                            false
+                        }
+                        Err(bad) => {
+                            warning = Some(bad);
+                            stop = true;
+                            false
+                        }
+                    }
+                });
+                // Every row the step threw away counts against the number at the
+                // front of the reply, whether or not a row lived long enough to
+                // carry the tally, so the running total is kept beside it.
+                gone += seen - table.len();
+            }
+        }
+        if warning.is_some() {
+            break;
+        }
     }
-    let count = table.len();
-    let shown: Vec<&Vec<Value>> = table
+    let shown: Vec<(Option<&Row>, &Vec<Value>)> = table
         .iter()
         .skip(asked.rows.offset)
         .take(asked.rows.count)
+        .map(|held| (held.from.map(|at| &rows[at]), &held.values))
         .collect();
-    writes(count, &names, &shown, asked, out);
+    // A step that could not work a row out before a single row of the reply had
+    // been written leaves nothing half sent, so the whole command answers the
+    // error instead of a reply with the error hung off the end of it.
+    if let (Some(bad), true) = (&warning, shown.is_empty()) {
+        out.error(bad);
+        return;
+    }
+    let counted = counting(&table, start, gone, asked, grouped, shown.len(), out);
+    writes(counted, &names, &shown, asked, warning.as_deref(), out);
+}
+
+/// The number at the front of the reply.
+///
+/// It is not the number of rows that answered, except when it is. What it
+/// really reports is how far the reply had got when the number went on the
+/// wire, which is why it moves with the protocol and with whether anything read
+/// a field. A grouped pipeline is the one case where the whole answer has to
+/// exist before any of it can be written, so there is nothing half done to
+/// report and the number is the real one.
+fn counting(
+    table: &[Held],
+    start: usize,
+    gone: usize,
+    asked: &Asked<'_>,
+    grouped: bool,
+    shown: usize,
+    out: &Out,
+) -> usize {
+    let want = &asked.rows;
+    // Every row a `FILTER` threw away before the first row of the reply takes
+    // one off the number, and one thrown away after it does not, because by
+    // then the number has already gone. When no row of the reply was written at
+    // all the number never went, so every row thrown away counts.
+    let dropped = match table.get(want.offset) {
+        Some(held) => held.dropped,
+        None => gone,
+    };
+    let count = start - dropped.min(start);
+    let deep = out.proto().is_resp3();
+    let whole = grouped
+        || want.count == 0
+        || super::buffered(asked)
+        || (asked.pipe.loader && want.offset == 0);
+    if whole {
+        return count;
+    }
+    let reached = match deep || asked.pipe.loader {
+        true => shown,
+        false => 1,
+    };
+    want.offset.saturating_add(reached).min(count)
+}
+
+/// The bytes of a field as the row holds them.
+fn shaped(value: &[u8], shape: Shape) -> Value {
+    match shape {
+        Shape::Words => Value::Text(value.into()),
+        Shape::Folded => Value::Text(token::fold(value).into()),
+        // A field with a number behind it always holds one, because a document
+        // whose value would not read as one was never indexed.
+        Shape::Number => match yo_common::num::parse_f64(value) {
+            Some(number) => Value::Number(number),
+            None => Value::Text(value.into()),
+        },
+    }
 }
 
 /// One grouping step over the rows in front of it.
@@ -513,15 +832,25 @@ pub(super) fn grouped(server: &Server, db: usize, rows: &[Row], asked: &Asked<'_
 /// hash table happens to hold them, and that order is not even the same between
 /// two processes holding the same documents, so there is nothing to copy here.
 /// Divergence D-68.
-fn folded(group: &Group, table: &[Vec<Value>]) -> Vec<Vec<Value>> {
+fn folded(group: &Group, table: &[Held]) -> Vec<Held> {
     let mut order: Vec<Vec<Value>> = Vec::new();
     let mut folds: Vec<Vec<reduce::Fold>> = Vec::new();
     let mut seen: HashMap<Vec<u8>, usize> = HashMap::new();
+    // A reducer that hands a value back rather than working one out hands back
+    // the type the property had, so a `FIRST_VALUE` over a number is a number
+    // and not the digits it was spelled with.
+    let mut counts = vec![false; group.folds.len()];
     for row in table {
         let key: Vec<Value> = group
             .by
             .iter()
-            .map(|(from, _)| row[*from].clone())
+            // A group key that the document had nothing under is a value in
+            // its own right and comes back as a null, which is not the same as
+            // a loaded field that is not there and is left out of the row.
+            .map(|(from, _)| match &row.values[*from] {
+                Value::Missing => Value::Nil,
+                held => held.clone(),
+            })
             .collect();
         let at = match seen.entry(tagged(&key)) {
             Entry::Occupied(held) => *held.get(),
@@ -538,41 +867,76 @@ fn folded(group: &Group, table: &[Vec<Value>]) -> Vec<Vec<Value>> {
                 order.len() - 1
             }
         };
-        for (fold, what) in folds[at].iter_mut().zip(&group.folds) {
-            let value = what.of.and_then(|at| text(&row[at]));
-            let by = what.by.and_then(|at| text(&row[at]));
+        for ((fold, what), numeric) in folds[at]
+            .iter_mut()
+            .zip(&group.folds)
+            .zip(counts.iter_mut())
+        {
+            let spelled;
+            let value = match what.of.map(|at| &row.values[at]) {
+                Some(Value::Text(text)) => Some(&**text),
+                Some(Value::Number(number)) => {
+                    *numeric = true;
+                    spelled = twelve(*number).into_bytes();
+                    Some(&spelled[..])
+                }
+                _ => None,
+            };
+            let ordered;
+            let by = match what.by.map(|at| &row.values[at]) {
+                Some(Value::Text(text)) => Some(&**text),
+                Some(Value::Number(number)) => {
+                    ordered = twelve(*number).into_bytes();
+                    Some(&ordered[..])
+                }
+                _ => None,
+            };
             fold.add(value, by);
         }
     }
     order
         .into_iter()
         .zip(folds)
-        .map(|(key, folds)| {
-            key.into_iter()
-                .chain(folds.into_iter().map(|fold| answered(fold.done())))
-                .collect()
+        .map(|(key, folds)| Held {
+            values: key
+                .into_iter()
+                .chain(
+                    folds
+                        .into_iter()
+                        .zip(&counts)
+                        .map(|(fold, numeric)| answered(fold.done(), *numeric)),
+                )
+                .collect(),
+            dropped: 0,
+            from: None,
         })
         .collect()
 }
 
 /// The bytes a group is keyed by, which are the values with their lengths in
 /// front of them so two different groups cannot run together into one.
+///
+/// A number is keyed by the number and not by the digits it arrived as, so a
+/// field holding `1` and a field holding `1.0` are one group.
 fn tagged(values: &[Value]) -> Vec<u8> {
     let mut out = Vec::new();
     for value in values {
         match value {
-            Value::Nil => out.push(0),
+            Value::Missing | Value::Nil => out.push(0),
             Value::Text(text) => {
                 out.push(1);
                 out.extend_from_slice(&text.len().to_le_bytes());
                 out.extend_from_slice(text);
             }
+            Value::Number(number) => {
+                out.push(3);
+                out.extend_from_slice(&number.to_le_bytes());
+            }
             Value::List(list) => {
                 out.push(2);
                 out.extend_from_slice(&list.len().to_le_bytes());
                 for item in list {
-                    out.extend_from_slice(&item.len().to_le_bytes());
-                    out.extend_from_slice(item);
+                    out.extend_from_slice(&tagged(core::slice::from_ref(item)));
                 }
             }
         }
@@ -580,31 +944,31 @@ fn tagged(values: &[Value]) -> Vec<u8> {
     out
 }
 
-/// The bytes a reducer folds, which a property holding nothing and a property
-/// holding a list both leave out.
-fn text(value: &Value) -> Option<&[u8]> {
-    match value {
-        Value::Text(text) => Some(text),
-        Value::Nil | Value::List(_) => None,
-    }
-}
-
 /// What a fold came to, as a property of the row after the step.
-fn answered(answer: reduce::Answer) -> Value {
+///
+/// Nine of the twelve work a number out and hand back a number. The three that
+/// pick values out of the group hand back what they picked, so they are numbers
+/// when the property they read was one.
+fn answered(answer: reduce::Answer, numeric: bool) -> Value {
+    let held = |text: Box<[u8]>| match numeric.then(|| yo_common::num::parse_f64(&text)).flatten() {
+        Some(number) => Value::Number(number),
+        None => Value::Text(text),
+    };
     match answer {
-        reduce::Answer::Number(number) => Value::Text(twelve(number).into_bytes().into()),
-        reduce::Answer::Text(text) => Value::Text(text),
-        reduce::Answer::List(list) => Value::List(list),
+        reduce::Answer::Number(number) => Value::Number(number),
+        reduce::Answer::Text(text) => held(text),
+        reduce::Answer::List(list) => Value::List(list.into_iter().map(held).collect()),
         reduce::Answer::Nil => Value::Nil,
     }
 }
 
-/// The reply a grouping pipeline answers with, on either protocol.
+/// The reply a pipeline answers with, on either protocol.
 fn writes(
     count: usize,
     names: &[Box<[u8]>],
-    shown: &[&Vec<Value>],
+    shown: &[(Option<&Row>, &Vec<Value>)],
     asked: &Asked<'_>,
+    warning: Option<&[u8]>,
     out: &mut Out,
 ) {
     let pipe = &asked.pipe;
@@ -618,15 +982,18 @@ fn writes(
         out.simple(b"STRING");
         out.simple(b"results");
         out.array(shown.len());
-        for row in shown {
+        for (row, values) in shown {
             out.map(1 + extras + usize::from(want.content));
             if want.scores {
                 out.simple(b"score");
-                out.double(0.0);
+                out.double(row.map_or(0.0, |row| row.score));
             }
             if want.payloads {
                 out.simple(b"payload");
-                out.nil();
+                match row.and_then(|row| row.payload.as_ref()) {
+                    Some(payload) => out.bulk(payload),
+                    None => out.nil(),
+                }
             }
             if pipe.sortkeys {
                 out.simple(b"sortkey");
@@ -634,7 +1001,7 @@ fn writes(
             }
             if want.content {
                 out.simple(b"extra_attributes");
-                mapped(names, row, out);
+                mapped(names, values, out);
             }
             out.simple(b"values");
             out.array(0);
@@ -642,46 +1009,67 @@ fn writes(
         out.simple(b"total_results");
         out.int(count as i64);
         out.simple(b"warning");
-        out.array(0);
+        match warning {
+            Some(warning) => {
+                out.array(1);
+                out.bulk(warning);
+            }
+            None => out.array(0),
+        }
         return;
     }
     out.array(1 + shown.len() * (extras + usize::from(want.content)));
     out.int(count as i64);
-    for row in shown {
+    for (row, values) in shown {
         // A grouped row has no document behind it, so the score is nought and
         // the payload is nothing, which is what a real server sends for both.
         if want.scores {
-            out.double(0.0);
+            out.double(row.map_or(0.0, |row| row.score));
         }
         if want.payloads {
-            out.nil();
+            match row.and_then(|row| row.payload.as_ref()) {
+                Some(payload) => out.bulk(payload),
+                None => out.nil(),
+            }
         }
         if pipe.sortkeys {
             out.nil();
         }
         if want.content {
-            mapped(names, row, out);
+            mapped(names, values, out);
         }
     }
 }
 
-/// One grouped row as a map of names to what the pipeline put under them.
+/// One row as a map of names to what the pipeline put under them.
 ///
-/// A property that is not there is sent as a null rather than left out, which
-/// is the opposite of what a `LOAD` does with a field the key does not hold: a
-/// group is a row of a fixed shape and a loaded document is not.
+/// A property the row never had is left out, which is what a `LOAD` of a field
+/// the key does not hold does. A property that is there and holds nothing is
+/// sent as a null, which is what a group key over a field nothing filled in
+/// does. The two look the same from the outside and are not the same thing.
 fn mapped(names: &[Box<[u8]>], row: &[Value], out: &mut Out) {
-    out.map(names.len().min(row.len()));
-    for (name, value) in names.iter().zip(row) {
+    let held: Vec<(&Box<[u8]>, &Value)> = names
+        .iter()
+        .zip(row)
+        .filter(|(_, value)| !matches!(value, Value::Missing))
+        .collect();
+    out.map(held.len());
+    for (name, value) in held {
         out.bulk(name);
-        match value {
-            Value::Text(text) => out.bulk(text),
-            Value::Nil => out.nil(),
-            Value::List(list) => {
-                out.array(list.len());
-                for item in list {
-                    out.bulk(item);
-                }
+        written(value, out);
+    }
+}
+
+/// One value on the wire.
+fn written(value: &Value, out: &mut Out) {
+    match value {
+        Value::Text(text) => out.bulk(text),
+        Value::Number(number) => out.bulk(twelve(*number).as_bytes()),
+        Value::Missing | Value::Nil => out.nil(),
+        Value::List(list) => {
+            out.array(list.len());
+            for item in list {
+                written(item, out);
             }
         }
     }

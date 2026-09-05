@@ -494,8 +494,8 @@ spec = "09 section 5"
 
 [[divergence]]
 id = "D-67"
-title = "Five FT.AGGREGATE pipeline steps are refused rather than read"
-reason = "LOAD and GROUPBY with all twelve of its REDUCE functions are built. SORTBY with MAX, APPLY, FILTER, WITHCURSOR and EXPLAINSCORE are read as unknown arguments and answer the line a real server answers for a word nobody knows, so a client learns the step is not there rather than getting a reply that quietly dropped it. Everything either side of the pipeline is exact: the query is the same parser a search uses, an ungrouped answer comes back in ascending document number because nothing sorts it, the properties follow the names and the order the LOAD list gave them, ADDSCORES writes a __score to twelve significant digits where WITHSCORES writes a score to seventeen, and the count at the front of the reply follows the four cases that were measured over a full offset by count sweep on both protocols. APPLY and FILTER both need an expression language that nothing else in the server has, and SORTBY and WITHCURSOR follow from it."
+title = "Three FT.AGGREGATE pipeline steps are refused rather than read"
+reason = "LOAD, GROUPBY with all twelve of its REDUCE functions, APPLY and FILTER are built. SORTBY with MAX, WITHCURSOR and EXPLAINSCORE are read as unknown arguments and answer the line a real server answers for a word nobody knows, so a client learns the step is not there rather than getting a reply that quietly dropped it. Everything either side of the pipeline is exact: the query is the same parser a search uses, an ungrouped answer comes back in ascending document number because nothing sorts it, the properties follow the names and the order the LOAD list gave them, ADDSCORES writes a __score to twelve significant digits where WITHSCORES writes a score to seventeen, and the count at the front of the reply follows the four cases that were measured over a full offset by count sweep on both protocols. SORTBY and WITHCURSOR are the two that are left and both build on the expression language APPLY and FILTER brought in."
 status = "until"
 resolved_by = "M8"
 spec = "09 section 5"
@@ -526,4 +526,19 @@ id = "D-71"
 title = "REDUCE QUANTILE with one argument answers an error rather than crashing"
 reason = "FT.AGGREGATE i * GROUPBY 0 REDUCE QUANTILE 1 @n takes Redis 8.10.1 down with a signal 11 on address 0x20, which is the fraction argument being read without checking that it is there. It is that one arity and no other: two arguments and three arguments both work and nought answers a clean line. Reproduced twice on 8.10.1 arm64 and under any GROUPBY, not only GROUPBY 0. This side answers Missing arguments for QUANTILE, which is the line the reducer with no arguments at all answers on both servers. Nothing was filed upstream."
 status = "permanent"
+spec = "09 section 5"
+
+[[divergence]]
+id = "D-72"
+title = "An unsorted FT.AGGREGATE walks its documents in document number order"
+reason = "A real server indexes a hash long after the write that made it, on a background scan of the keyspace, so a document's number is the position its key came back in from that scan and not the order the keys were written. Seven keys written as g:1 to g:7 come back from a wildcard aggregation as g:2, g:6, g:3, g:1, g:5, g:7, g:4 once the scan has caught up, and the same seven keys written in the same order into a second process come back in another order, because the scan follows a hash table that is seeded per process. This side indexes on the write, so a document's number is the order it arrived in and a wildcard aggregation walks g:1 to g:7. Nothing about a reply's content turns on this, but three things about its shape do: which rows a LIMIT window lands on, which row a step that fails stops at, and the number at the front of the reply when a FILTER has thrown rows away, because that number freezes when the first row of the reply is written. A client that wants a particular order has to ask for one on either server."
+status = "permanent"
+spec = "09 section 5"
+
+[[divergence]]
+id = "D-73"
+title = "matched_terms answers nothing rather than the terms that matched"
+reason = "The function is there and takes the nought or one argument a real server takes, and it answers a null where a real server answers the list of terms from the query that the row's document matched, capped at the number the argument asks for or at 100. Answering it properly means the query executor carrying the terms behind every match through to the pipeline, which is the same machinery SUMMARIZE and HIGHLIGHT need to pick the fragments they return, so it is being built once with those rather than twice. Every other function in the language answers exactly, and a null is a value the language already handles, so an expression around this one keeps working: exists is nought, a comparison against it is false, and it goes on the wire as a null rather than as a missing property."
+status = "until"
+resolved_by = "M8"
 spec = "09 section 5"

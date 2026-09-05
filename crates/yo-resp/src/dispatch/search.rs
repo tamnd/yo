@@ -103,7 +103,7 @@ use crate::reply::Out;
 
 mod aggregate;
 
-use aggregate::{Pipe, Reads, group, grouped};
+use aggregate::{Pipe, Reads, Shape, apply, group, keeps, piped};
 
 /// The languages a document may be stemmed in, in the spelling `FT.INFO`
 /// reports them in.
@@ -1542,6 +1542,11 @@ const QUOTE_END: &str = "`";
 const DUPLICATE_PROP: &str = "SEARCH_FIELD_DUP Property `";
 const DUPLICATE_END: &str = "` specified more than once";
 const LOAD_LATE: &str = "SEARCH_QUERY_BAD LOAD cannot be applied after projectors or reducers";
+/// What an `APPLY` or a `FILTER` with no expression after it answers, which
+/// names the pair of them rather than the one the client wrote.
+const STEP_SHORT: &str =
+    "SEARCH_PARSE_ARGS Bad arguments for APPLY/FILTER: Expected an argument, but none provided";
+const AS_SHORT: &str = "SEARCH_PARSE_ARGS AS needs argument";
 /// What a bare `REDUCE` answers, which names the reason for the failure as the
 /// word for no failure at all. That is what a real server sends.
 const REDUCE_BARE: &str = "SEARCH_PARSE_ARGS Bad arguments for REDUCE: SUCCESS";
@@ -1840,9 +1845,9 @@ fn plan<'a>(
 
 /// A step of the pipeline, or nothing when this is not one of those.
 ///
-/// `LOAD` and `GROUPBY` are the two built so far. The other four words that
-/// start a step fall through to the unknown argument line, which is divergence
-/// D-67.
+/// `LOAD`, `GROUPBY`, `APPLY` and `FILTER` are the four built so far. The other
+/// two words that start a step fall through to the unknown argument line, which
+/// is divergence D-67.
 ///
 /// A step is read wherever it appears, and reading one closes the door on the
 /// words about the search itself. That is what makes `LOAD 1 @t VERBATIM` a
@@ -1855,6 +1860,12 @@ fn step<'a>(
 ) -> core::result::Result<Option<usize>, Vec<u8>> {
     if args::is(args.get(at), b"GROUPBY") {
         return group(args, at, asked, index).map(Some);
+    }
+    if args::is(args.get(at), b"APPLY") {
+        return apply(args, at, asked, index).map(Some);
+    }
+    if args::is(args.get(at), b"FILTER") {
+        return keeps(args, at, asked, index).map(Some);
     }
     if !args::is(args.get(at), b"LOAD") {
         return Ok(None);
@@ -1925,7 +1936,7 @@ fn step<'a>(
             asked
                 .pipe
                 .base
-                .push((name.into(), Reads::Field(field.into())));
+                .push((name.into(), Reads::Field(field.into(), holds(index, field))));
         }
     }
     Ok(Some(at))
@@ -2464,7 +2475,7 @@ pub(super) fn roll(server: &Server, db: usize, args: Args<'_>, out: &mut Out) ->
             shape(node, index, &asked.rows),
             &asked.rows,
             order,
-            !asked.pipe.groups.is_empty(),
+            !asked.pipe.steps.is_empty(),
         )
     };
     rolled(server, db, total, &rows, &asked, out);
@@ -2485,8 +2496,8 @@ fn rolled(
     asked: &Asked<'_>,
     out: &mut Out,
 ) {
-    if !asked.pipe.groups.is_empty() {
-        grouped(server, db, rows, asked, out);
+    if !asked.pipe.steps.is_empty() {
+        piped(server, db, total, rows, asked, out);
         return;
     }
     let pipe = &asked.pipe;
@@ -2666,32 +2677,20 @@ fn props<'d, 'w: 'd>(doc: &'d indexing::Document, pipe: &Pipe<'w>) -> Vec<(&'d [
 ///
 /// Twelve significant digits and not seventeen, which is measured: a score of
 /// 0.9343092373768334 is answered as `0.934309237377` under `ADDSCORES` and in
-/// full beside `WITHSCORES`, so the two are not the same formatter.
-fn twelve(d: f64) -> String {
-    if d.is_nan() {
-        // Rust spells this `NaN` and the wire spells it `nan`, which is what a
-        // `SUM` over a group holding no number answers.
-        return "nan".to_string();
-    }
-    if !d.is_finite() {
-        return format!("{d}");
-    }
-    let sci = format!("{d:.11e}");
-    let (mantissa, exponent) = sci.split_once('e').expect("a scientific form has an e");
-    let exponent: i32 = exponent.parse().expect("and a whole number after it");
-    if !(-4..12).contains(&exponent) {
-        let m = mantissa.trim_end_matches('0').trim_end_matches('.');
-        let sign = if exponent < 0 { '-' } else { '+' };
-        return format!("{m}e{sign}{:02}", exponent.abs());
-    }
-    let places = (11 - exponent).max(0) as usize;
-    let fixed = format!("{d:.places$}");
-    match fixed.contains('.') {
-        true => fixed
-            .trim_end_matches('0')
-            .trim_end_matches('.')
-            .to_string(),
-        false => fixed,
+/// full beside `WITHSCORES`, so the two are not the same formatter. The
+/// spelling lives beside the expression language, because every number an
+/// expression answers goes on the wire the same way.
+use yo_search::expr::twelve;
+
+/// What a field of the key becomes when it is read onto a pipeline row, which
+/// is a number when the schema says the field holds one.
+fn holds(index: &Index, field: &[u8]) -> Shape {
+    let numeric = index
+        .field(field)
+        .is_some_and(|held| held.kind == Kind::Numeric);
+    match numeric {
+        true => Shape::Number,
+        false => Shape::Words,
     }
 }
 
