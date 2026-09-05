@@ -209,7 +209,11 @@ fn run(server: &mut Server, at: usize, args: Args<'_>, out: &mut Out) -> Result<
         // between. Here the clock is read once per batch and both readings would
         // be the same millisecond, so the second pass cannot find anything the
         // first one missed and there is only one pass.
-        let ttl = match db.at(key).deadline_of(key) {
+        // The deadline and the payload come from one hold, so what is sent is
+        // the key as it was at one moment rather than a time from before another
+        // thread wrote and a value from after it.
+        let mut stripe = db.hold(key);
+        let ttl = match stripe.deadline_of(key) {
             Ask::Missing => continue,
             Ask::NoDeadline => 0,
             Ask::At(when) if when <= now => continue,
@@ -217,9 +221,10 @@ fn run(server: &mut Server, at: usize, args: Args<'_>, out: &mut Out) -> Result<
             // at all and the key would arrive immortal.
             Ask::At(when) => (when - now).max(1) as i64,
         };
-        let Some(payload) = db.at(key).dump(key) else {
+        let Some(payload) = stripe.dump(key) else {
             continue;
         };
+        drop(stripe);
         going.push(Going { key, ttl, payload });
     }
     if going.is_empty() {
@@ -405,7 +410,7 @@ fn finish(
             // other nine from the reply and has to look.
             Some(line) => told = told.or(Some(line)),
             None if !plan.copy => {
-                server.striped(at).at(g.key).del(g.key);
+                server.striped(at).hold(g.key).del(g.key);
             }
             None => {}
         }

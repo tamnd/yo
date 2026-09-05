@@ -169,7 +169,7 @@ impl Snapshot {
     /// about stripes reads them back and puts each one wherever its own hash
     /// says. That is what makes a file written by a wide server loadable by a
     /// narrow one and the other way round.
-    pub fn database(&mut self, index: usize, db: &mut Db) {
+    pub fn database(&mut self, index: usize, db: &Db) {
         if db.is_empty() {
             return;
         }
@@ -203,10 +203,10 @@ impl Snapshot {
                 // so the name is copied into the entry writer instead. It is a
                 // key name and it is a few bytes.
                 let key = self.names[from..to].to_vec();
-                let Some(rec) = db.at(&key).export(&key) else {
-                    // Gone between the walk and here, which nothing can do while
-                    // this holds the database, or read back off the store and
-                    // failed. Either way there is no value to write.
+                let Some(rec) = db.hold(&key).export(&key) else {
+                    // Gone between the walk and here, which is a key that expired
+                    // or one another thread deleted, or read back off the store
+                    // and failed. Either way there is no value to write.
                     continue;
                 };
                 self.entry(&key, &rec);
@@ -378,7 +378,7 @@ mod tests {
     #[test]
     fn an_empty_server_is_a_header_an_aux_field_and_an_end() {
         let mut snap = Snapshot::new();
-        snap.database(0, &mut db());
+        snap.database(0, &db());
         let file = snap.finish();
         let seen = walk(&file);
         assert!(seen.dbs.is_empty(), "no database has anything in it");
@@ -421,7 +421,7 @@ mod tests {
             .unwrap();
 
         let mut snap = Snapshot::new();
-        snap.database(0, &mut d);
+        snap.database(0, &d);
         let file = snap.finish();
         let seen = walk(&file);
 
@@ -450,7 +450,7 @@ mod tests {
         d.at(b"gone").expire(b"gone", 500, Cond::Always);
 
         let mut snap = Snapshot::new();
-        snap.database(0, &mut d);
+        snap.database(0, &d);
         let seen = walk(&snap.finish());
 
         let mut found: Vec<(Vec<u8>, Option<u64>)> = seen
@@ -469,15 +469,15 @@ mod tests {
     #[test]
     fn each_database_is_selected_once_and_the_empty_ones_are_not_there() {
         let mut zero = db();
-        let mut empty = db();
+        let empty = db();
         let mut nine = db();
         zero.at(b"a").set_plain(b"a", b"1").unwrap();
         nine.at(b"b").set_plain(b"b", b"2").unwrap();
 
         let mut snap = Snapshot::new();
-        snap.database(0, &mut zero);
-        snap.database(4, &mut empty);
-        snap.database(9, &mut nine);
+        snap.database(0, &zero);
+        snap.database(4, &empty);
+        snap.database(9, &nine);
         let seen = walk(&snap.finish());
         assert_eq!(seen.dbs, vec![0, 9], "the empty one in the middle is gone");
         assert_eq!(seen.keys.len(), 2);
@@ -493,7 +493,7 @@ mod tests {
                 .unwrap();
         }
         let mut snap = Snapshot::new();
-        snap.database(0, &mut d);
+        snap.database(0, &d);
         let seen = walk(&snap.finish());
 
         let mut names: Vec<&Vec<u8>> = seen.keys.iter().map(|(k, _, _)| k).collect();
@@ -529,7 +529,7 @@ mod tests {
         d.at(b"k5").expire(b"k5", 9_000, Cond::Always);
 
         let mut snap = Snapshot::new();
-        snap.database(3, &mut d);
+        snap.database(3, &d);
         let seen = walk(&snap.finish());
 
         assert_eq!(seen.dbs, vec![3], "one selector for the whole database");
@@ -562,7 +562,7 @@ mod tests {
             .unwrap();
 
         let mut snap = Snapshot::new();
-        snap.database(0, &mut d);
+        snap.database(0, &d);
         assert_eq!(snap.skipped(), 1);
         let seen = walk(&snap.finish());
         assert_eq!(seen.keys.len(), 1);
