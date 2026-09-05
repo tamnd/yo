@@ -1,8 +1,9 @@
 name: deep
 
 # The checks that cannot finish in the three minutes ci.yml is held to. Miri
-# under both borrow models, the fuzzers, the release test matrix, the benchmark
-# smoke run and a cold build from source with no cache and no toolchain file.
+# under both borrow models, ThreadSanitizer over the crates that have two
+# threads in them, the fuzzers, the release test matrix, the benchmark smoke run
+# and a cold build from source with no cache and no toolchain file.
 #
 # They run nightly, on demand against any ref, and on a pull request carrying
 # the `deep` label. A milestone pull request should carry that label, because a
@@ -255,6 +256,67 @@ jobs:
       - run: |
           echo "miri: ${{ needs.miri.result }}"
           test "${{ needs.miri.result }}" = success
+
+  # ThreadSanitizer, which is the other half of what Miri gives and not a
+  # repeat of it. Miri interprets threads on one core, so it finds the races it
+  # can reason about and misses the ones that need two cores really running at
+  # once, and it cannot go near a socket at all, which is where every test of
+  # `yodb serve --threads N` lives. TSan runs the real binary on the real
+  # machine and watches every access, so it sees the server accepting on four
+  # threads into one keyspace and Miri never will.
+  #
+  # Five crates rather than the workspace, and they are the five that have two
+  # threads in them: the spin lock and the SPSC lane in `yo-common` and
+  # `yo-shard`, the striped keyspace in `yo-kv`, the engine over a shared server
+  # in `yo-resp`, and the serve loop in `yo-cli`. Interpreting the rest would
+  # add minutes to find nothing, because a crate whose tests are single threaded
+  # has nothing for a race detector to see.
+  #
+  # `-Zbuild-std` is not optional: the standard library ships without
+  # instrumentation, so without rebuilding it every synchronisation inside
+  # `std` is invisible and TSan reports a race on every channel and every mutex
+  # in the tree.
+  tsan:
+    needs: wanted
+    if: needs.wanted.outputs.run == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          ref: ${{ needs.wanted.outputs.ref }}
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rust-src
+      - uses: Swatinem/rust-cache@v2.9.2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - run: rm rust-toolchain.toml
+      - id: host
+        run: |
+          echo "triple=$(rustc -vV | sed -n 's/^host: //p')" >> "$GITHUB_OUTPUT"
+      # One command and not five, so the standard library is instrumented once
+      # rather than once per crate.
+      - run: |
+          cargo test -Zbuild-std --target ${{ steps.host.outputs.triple }} \
+            --locked -p yo-common -p yo-shard -p yo-kv -p yo-resp --lib
+        env:
+          # No `-D warnings` here, unlike everywhere else in this file. The flag
+          # reaches the standard library too because of `-Zbuild-std`, and a
+          # nightly std that emits one warning would fail this job for something
+          # nobody in this tree wrote. Warnings are already denied by `style`
+          # and by every other job.
+          RUSTFLAGS: -Zsanitizer=thread
+      - run: |
+          cargo test -Zbuild-std --target ${{ steps.host.outputs.triple }} \
+            --locked -p yo-cli --bin yodb
+        env:
+          # No `-D warnings` here, unlike everywhere else in this file. The flag
+          # reaches the standard library too because of `-Zbuild-std`, and a
+          # nightly std that emits one warning would fail this job for something
+          # nobody in this tree wrote. Warnings are already denied by `style`
+          # and by every other job.
+          RUSTFLAGS: -Zsanitizer=thread
 
   # Fuzz targets are built and run briefly, so a target that stops compiling is
   # caught the next morning rather than the next time somebody remembers to run
