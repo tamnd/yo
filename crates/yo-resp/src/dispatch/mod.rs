@@ -265,7 +265,7 @@ thread_local! {
 ///
 /// A cache line apart for the same reason, so that two threads writing at once
 /// are not two threads passing one line back and forth.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 #[repr(align(64))]
 struct Local {
     /// What the reactor counts.
@@ -281,12 +281,52 @@ struct Local {
     /// taken being set again, and that costs one more look at a database with
     /// nothing to collect.
     dirty: AtomicU64,
+    /// The mask this thread's maintenance turn is working from.
+    ///
+    /// Its own and not a shared one, because a turn reads it in place and then
+    /// clears bits of it, and a shared mask cleared that way would lose whatever
+    /// another thread marked in between. Every thread turns a loop and every
+    /// loop maintains, so what stops the same work being done twice is not the
+    /// mask but the stripe lock underneath it: two threads that both look at
+    /// database nine take turns, and the second one finds nothing left to move.
+    ///
+    /// Starts with every database set, so a server that has just been built
+    /// looks at all of them once rather than waiting to be told about the ones
+    /// something was loaded into before any command ran.
+    turn: AtomicU64,
+}
+
+impl Default for Local {
+    fn default() -> Local {
+        Local {
+            stats: Stats::default(),
+            cmdstats: CommandStats::default(),
+            dirty: AtomicU64::new(0),
+            turn: AtomicU64::new(ALL_DATABASES),
+        }
+    }
 }
 
 impl Local {
     /// Note that a command has run against these databases.
     fn mark(&self, dbs: u64) {
         self.dirty.store(self.dirty.load(Relaxed) | dbs, Relaxed);
+    }
+
+    /// Add `dbs` to what this thread's turn is going to look at.
+    fn note(&self, dbs: u64) {
+        self.turn.store(self.turn.load(Relaxed) | dbs, Relaxed);
+    }
+
+    /// Take `at` off the list of databases this thread's turn will look at.
+    fn done(&self, at: usize) {
+        self.turn
+            .store(self.turn.load(Relaxed) & !(1u64 << at), Relaxed);
+    }
+
+    /// Whether this thread's turn still has database `at` to look at.
+    fn wanted(&self, at: usize) -> bool {
+        self.turn.load(Relaxed) & (1u64 << at) != 0
     }
 }
 
@@ -418,11 +458,6 @@ pub struct Server {
     /// database nobody has touched since it last said no cannot have started
     /// saying yes.
     ///
-    /// The maintenance turn's own mask and not a shared one. Threads mark what
-    /// they have touched in [`Local::dirty`] and the turn takes those with
-    /// [`Server::collect_marks`] before it reads this, so nothing on a command
-    /// path writes here.
-    dirty: u64,
     /// What the connections are holding, kept by the engine.
     ///
     /// Shared, because every thread has connections and the memory total is one
@@ -510,10 +545,17 @@ pub struct Server {
     /// every turn of the loop and compaction runs when there is dead space, so
     /// sharing a cursor would make which database gets swept depend on which one
     /// was last collected.
-    expire_db: usize,
+    expire_db: AtomicUsize,
     /// The millisecond the last active expiry sweep ran on, so the next one on
     /// the same millisecond does not bother.
-    expire_ms: u64,
+    ///
+    /// One for the server and not one per thread, so the sweeping a server does
+    /// is a function of how long it has been running and not of how many threads
+    /// it was started with. Two threads that read the same millisecond can both
+    /// decide to sweep, which costs one extra sweep of a budget that is already
+    /// small and cannot happen twice for the same millisecond more than once per
+    /// thread.
+    expire_ms: AtomicU64,
     /// Clients parked on a blocking command.
     ///
     /// Behind a lock because a client parks on the thread that ran its command
@@ -622,15 +664,14 @@ impl Server {
             started_ms: clock.now_ms(),
             clock,
             next_db: AtomicUsize::new(0),
-            dirty: ALL_DATABASES,
             conn_bytes: AtomicUsize::new(0),
             maxmemory: AtomicU64::new(0),
             store: Lock::new(None),
             maxstore: AtomicU64::new(NO_MAXSTORE),
             used: AtomicUsize::new(0),
             evict_db: AtomicUsize::new(0),
-            expire_db: 0,
-            expire_ms: 0,
+            expire_db: AtomicUsize::new(0),
+            expire_ms: AtomicU64::new(0),
             waiters: Lock::default(),
             parked: AtomicUsize::new(0),
             peers: Lock::default(),
@@ -679,15 +720,14 @@ impl Server {
             started_ms: clock.now_ms(),
             clock,
             next_db: AtomicUsize::new(0),
-            dirty: ALL_DATABASES,
             conn_bytes: AtomicUsize::new(0),
             maxmemory: AtomicU64::new(0),
             store: Lock::new(None),
             maxstore: AtomicU64::new(NO_MAXSTORE),
             used: AtomicUsize::new(0),
             evict_db: AtomicUsize::new(0),
-            expire_db: 0,
-            expire_ms: 0,
+            expire_db: AtomicUsize::new(0),
+            expire_ms: AtomicU64::new(0),
             waiters: Lock::default(),
             parked: AtomicUsize::new(0),
             peers: Lock::default(),
@@ -756,12 +796,6 @@ impl Server {
     }
 
     /// Keyspace `i` of [`Server::slots`].
-    fn slot_mut(&mut self, i: usize) -> &mut Keyspace {
-        let (db, stripe) = (i / self.width, i % self.width);
-        self.dbs[db].stripe_mut(stripe)
-    }
-
-    /// The same, without taking it mutably.
     fn slot(&self, i: usize) -> Held<'_, Keyspace> {
         let (db, stripe) = (i / self.width, i % self.width);
         self.dbs[db].hold_stripe(stripe)
@@ -1371,12 +1405,12 @@ impl Server {
     /// hertz, so this is not the thing that decides how promptly memory comes
     /// back. What it decides is that an idle server sweeps a thousand times a
     /// second rather than a million.
-    pub fn expire_slice(&mut self, budget: usize) -> usize {
+    pub fn expire_slice(&self, budget: usize) -> usize {
         let now = self.clock.now_ms();
-        if now == self.expire_ms {
+        if now == self.expire_ms.load(Relaxed) {
             return 0;
         }
-        self.expire_ms = now;
+        self.expire_ms.store(now, Relaxed);
         self.expire_step(budget)
     }
 
@@ -1395,18 +1429,19 @@ impl Server {
     /// The cursor moves to the database after whichever one did the work, so two
     /// busy databases take turns instead of the lower numbered one starving the
     /// other.
-    pub fn expire_step(&mut self, budget: usize) -> usize {
+    pub fn expire_step(&self, budget: usize) -> usize {
         let mut spent = 0;
+        let from = self.expire_db.load(Relaxed);
         for turn in 0..self.slots() {
             if spent >= budget {
                 break;
             }
-            let i = (self.expire_db + turn) % self.slots();
-            let c = self.slot_mut(i).expire_cycle(budget - spent);
+            let i = (from + turn) % self.slots();
+            let c = self.slot(i).expire_cycle(budget - spent);
             spent += c.examined;
             if c.expired > 0 {
-                self.expire_db = (i + 1) % self.slots();
-                self.dirty |= 1u64 << self.slot_db(i);
+                self.expire_db.store((i + 1) % self.slots(), Relaxed);
+                self.mine().note(1u64 << self.slot_db(i));
             }
         }
         spent
@@ -1437,12 +1472,12 @@ impl Server {
     /// thread that ors while the swap happens either gets its bit in before the
     /// swap or leaves it there afterwards, and the second one costs one look at
     /// a database the turn has already been through.
-    fn collect_marks(&mut self) {
+    fn collect_marks(&self) {
         let mut marked = 0;
         for thread in &self.locals {
             marked |= thread.dirty.swap(0, Relaxed);
         }
-        self.dirty |= marked;
+        self.mine().note(marked);
     }
 
     /// Give one database's dead space back, if any database has enough of it to
@@ -1457,8 +1492,9 @@ impl Server {
     /// At most one segment moves per call and the search starts one database
     /// further along each time, so the cost of asking is a comparison per
     /// database and the cost of acting is bounded by a segment.
-    pub fn compact_step(&mut self) -> Option<usize> {
+    pub fn compact_step(&self) -> Option<usize> {
         self.collect_marks();
+        let mine = self.mine();
         let from = self.next_db.load(Relaxed);
         for turn in 0..self.slots() {
             let i = (from + turn) % self.slots();
@@ -1466,10 +1502,10 @@ impl Server {
             // nothing to collect, so it still has nothing to collect and the
             // line it lives on stays where it is.
             let at = self.slot_db(i);
-            if self.dirty & (1 << at) == 0 {
+            if !mine.wanted(at) {
                 continue;
             }
-            if let Some(moved) = self.slot_mut(i).compact_step() {
+            if let Some(moved) = self.slot(i).compact_step() {
                 self.next_db.store((i + 1) % self.slots(), Relaxed);
                 return Some(moved);
             }
@@ -1477,7 +1513,7 @@ impl Server {
             // since the bit is per database and one stripe answering for all of
             // them would stop the others being asked at all.
             if i % self.width == self.width - 1 {
-                self.dirty &= !(1u64 << at);
+                mine.done(at);
             }
         }
         None
@@ -2000,9 +2036,8 @@ mod tests {
             f.run(&[b"SET", k, &val]);
         }
         while f.server.compact_step().is_some() {}
-        assert_eq!(
-            f.server.dirty & (1 << 9),
-            0,
+        assert!(
+            !f.server.mine().wanted(9),
             "database nine was drained and should not be asked again until it is written to"
         );
         let after_first = f.server.memory_bytes();
@@ -4918,12 +4953,12 @@ mod tests {
     fn what_a_thread_marked_is_taken_by_the_maintenance_turn() {
         let mut server = Server::new();
         server.set_threads(2);
-        // A fresh server has every database marked, so start from nothing to
-        // see the one mark arrive.
-        server.dirty = 0;
+        // A fresh server has every database on the turn's list, so start from
+        // nothing to see the one mark arrive.
+        server.mine().turn.store(0, Relaxed);
         server.locals[1].mark(1 << 9);
         server.collect_marks();
-        assert_ne!(server.dirty & (1 << 9), 0);
+        assert!(server.mine().wanted(9));
         // And taken once rather than left to be taken again next turn.
         assert_eq!(server.locals[1].dirty.load(Relaxed), 0);
     }
