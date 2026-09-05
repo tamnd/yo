@@ -1234,7 +1234,18 @@ fn info<'a>(reg: &mut Registry, args: Args<'a>, out: &mut Out) -> Answer<'a> {
     // build does not keep yet. All four are a division by nought on an empty
     // index, and a real server answers `nan` there for the same reason rather
     // than as a placeholder.
-    number(out, "records_per_doc_avg", records as f64 / docs as f64);
+    //
+    // The division is done in single precision and printed in double, which is
+    // what a real server does and is visible: seventeen records over three
+    // documents comes out as 5.666666507720947 and not 5.666666666666667. The
+    // counters are doubles by the time they reach the reply and the arithmetic
+    // behind them is not, so a client comparing the two builds sees the same
+    // digits.
+    number(
+        out,
+        "records_per_doc_avg",
+        f64::from(records as f32 / docs as f32),
+    );
     number(out, "bytes_per_record_avg", f64::NAN);
     number(out, "offsets_per_term_avg", f64::NAN);
     number(out, "offset_bits_per_record_avg", f64::NAN);

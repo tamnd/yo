@@ -32,6 +32,24 @@
 //! there leaves the document alone. So the rule is not "this command was a
 //! write", it is "the value under this key is not what it was".
 //!
+//! # The two ways of emptying a hash are not the same
+//!
+//! A key that ends up with no fields left is either a refusal or a document
+//! with nothing in it, and which one it is depends on how it emptied. `HDEL` of
+//! the last field sends the indexes to read a key that is not there, and that
+//! is counted in `hash_indexing_failures` with the sentence about a key that
+//! does not exist. A deadline that took the last field, which is `HEXPIRE key
+//! 0` or `HGETDEL`, writes the document one more time with nothing in it before
+//! taking it away, so it spends a number and is counted as nothing. There is no
+//! reason for the difference other than that a real server has two code paths,
+//! and no way to see it other than through `FT.INFO`, which is where anyone
+//! would meet it.
+//!
+//! `HSETEX` with a deadline that has already passed is the third shape. It is
+//! one command and two pieces of news, so `max_doc_id` moves twice and the
+//! value it was handed never reaches the index at all, because the field is
+//! dead before anything goes to read it.
+//!
 //! # A key of the wrong type is not a failure
 //!
 //! An index `ON HASH` passes over a string or a list sitting under its prefix
@@ -71,7 +89,7 @@
 use std::collections::BTreeMap;
 
 use crate::english::English;
-use crate::held::Failed;
+use crate::held::{Failed, VANISHED};
 use crate::index::{Index, Source};
 use crate::registry::Registry;
 
@@ -199,6 +217,18 @@ impl Index {
             }
         }
     }
+
+    /// Counts a key that was not there when this index went to read it.
+    ///
+    /// Against the index and against no field, since there is no field in the
+    /// schema to blame for a key that is not there.
+    pub fn vanished(&mut self, key: &[u8]) {
+        let sentence = format!(
+            "{VANISHED} Key does not exist or is not a hash: {}",
+            String::from_utf8_lossy(key)
+        );
+        self.trouble.whole.note(key, &sentence);
+    }
 }
 
 impl Registry {
@@ -224,6 +254,27 @@ impl Registry {
     /// the key has nothing to do about being told.
     pub fn went(&mut self, key: &[u8]) {
         for index in self.reading().0 {
+            index.erase(key);
+        }
+    }
+
+    /// Tells every index that follows a key that the key was not there when it
+    /// went to read it, which is counted as a refusal.
+    ///
+    /// One command does this and it is `HDEL` taking the last field, which
+    /// leaves nothing under the key to read. A real server counts that as an
+    /// indexing failure, where the same key emptied by a deadline is not
+    /// counted at all, and the two are worth telling apart because the counter
+    /// is in `FT.INFO` and it never goes back down.
+    ///
+    /// No field is blamed, because there is no field to blame. A bad number
+    /// names the field it was in and this names nothing, which is the shape a
+    /// real server reports as well.
+    pub fn vanished(&mut self, source: Source, key: &[u8]) {
+        for index in self.reading().0 {
+            if index.follows(source, key) {
+                index.vanished(key);
+            }
             index.erase(key);
         }
     }
@@ -549,6 +600,34 @@ mod tests {
         second.name = b"jx".to_vec().into();
         r.create(second).expect("free");
         assert!(r.scanning(b"jx"));
+    }
+
+    /// A key that was not there when the index went to read it is counted
+    /// against the index, is not counted against any field, and takes whatever
+    /// document it had with it.
+    #[test]
+    fn a_key_that_is_not_there_is_counted_and_erased() {
+        let mut r = registry(on(b"p:", vec![text()]));
+        r.wrote(Source::Hash, b"p:1", &[(&b"t"[..], &b"alpha"[..])]);
+        assert_eq!(r.named(b"ix").map(|i| i.held.docs.len()), Some(1));
+
+        r.vanished(Source::Hash, b"p:1");
+        let ix = r.named(b"ix").expect("the index is there");
+        assert_eq!(ix.held.docs.len(), 0);
+        assert_eq!(ix.trouble.whole().failures(), 1);
+        assert_eq!(ix.trouble.whole().key(), Some(&b"p:1"[..]));
+        assert_eq!(
+            ix.trouble.whole().last(),
+            Some(&b"SEARCH_QUERY_BAD Key does not exist or is not a hash: p:1"[..])
+        );
+        assert_eq!(ix.trouble.field(b"t").failures(), 0);
+
+        // A key no index follows is erased and counted against nobody.
+        r.vanished(Source::Hash, b"q:1");
+        assert_eq!(
+            r.named(b"ix").map(|i| i.trouble.whole().failures()),
+            Some(1)
+        );
     }
 
     /// An empty registry answers no to everything, which is what keeps the

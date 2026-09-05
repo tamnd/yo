@@ -43,6 +43,64 @@ use yo_search::Source;
 
 use super::Server;
 
+/// What a hash command left behind, in the terms a search index needs.
+///
+/// Two states would nearly do, and the other two are there because a real
+/// server does not treat every way of changing a hash the same. A command is
+/// one or more pieces of news, each of which sends the indexes back to the key,
+/// and what they find when the key has gone depends on which piece of news it
+/// was. All of it is measured against 8.10.1 and all of it shows up in
+/// `FT.INFO`, which is the only reason any of it is knowable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Change {
+    /// The fields are what they were, so nothing has to be read again.
+    Nothing,
+    /// They are not, so the key is read again, or erased if it has gone.
+    ///
+    /// A key that has gone is still written first, as a document with nothing
+    /// in it, which spends a number on a document nobody will ever read. That
+    /// is what moves `max_doc_id` when `HEXPIRE key 0` or `HGETDEL` takes the
+    /// last field.
+    Fields,
+    /// A field was taken by the command rather than by a deadline, which is
+    /// `HDEL` and nothing else.
+    ///
+    /// The same as [`Change::Fields`] until the key empties. Then the indexes
+    /// go to read a key that is not there and count it as a refusal, where the
+    /// same key emptied by a deadline is not counted and does spend a number.
+    /// Nobody would guess this and it is what a real server does.
+    Taken,
+    /// One command that is two pieces of news, which is `HSETEX` with a
+    /// deadline that has already passed.
+    ///
+    /// The write is announced and then the deadline is, so `max_doc_id` moves
+    /// twice for one command, whether or not the key survived it. The field
+    /// itself is never indexed, because it is dead before anything reads it.
+    Twice,
+}
+
+impl Change {
+    /// [`Change::Fields`] when something was written, and nothing otherwise.
+    pub(super) fn when(wrote: bool) -> Self {
+        if wrote { Self::Fields } else { Self::Nothing }
+    }
+
+    /// [`Change::Taken`] when a field went, and nothing otherwise.
+    pub(super) fn taken(went: bool) -> Self {
+        if went { Self::Taken } else { Self::Nothing }
+    }
+
+    /// How many times the indexes hear about this, which is one for everything
+    /// except the `HSETEX` that writes a field already past its deadline.
+    fn rounds(self) -> usize {
+        match self {
+            Self::Nothing => 0,
+            Self::Twice => 2,
+            _ => 1,
+        }
+    }
+}
+
 /// A hash lifted out of the keyspace so an index can be handed it.
 ///
 /// One buffer with the ends beside it rather than a vector of vectors, so a
@@ -112,7 +170,15 @@ fn read(db: &Db, key: &[u8]) -> Option<Document> {
 /// Called after the command has already written its reply, because indexing is
 /// not something a client can be told went wrong: a document that will not read
 /// is counted in `FT.INFO` and the `HSET` that caused it still answers `OK`.
-pub(super) fn changed(server: &Server, db: usize, key: &[u8]) {
+pub(super) fn changed(server: &Server, db: usize, key: &[u8], change: Change) {
+    for _ in 0..change.rounds() {
+        round(server, db, key, change);
+    }
+}
+
+/// One piece of news about one key, which is all of them but the `HSETEX` that
+/// writes a field already past its deadline.
+fn round(server: &Server, db: usize, key: &[u8], change: Change) {
     // Two questions before any work. The first is a look at an empty vector on
     // nearly every server there will ever be, and the second is a walk over a
     // handful of short prefixes.
@@ -136,7 +202,17 @@ pub(super) fn changed(server: &Server, db: usize, key: &[u8]) {
     let mut search = server.search.lock();
     match doc {
         Some(doc) => search.wrote(Source::Hash, key, &doc.pairs()),
-        None => search.went(key),
+        // A key that is not there any more is either a refusal or a document
+        // with nothing in it, and which one it is depends on how it emptied.
+        // `HDEL` of the last field is a refusal and spends no number, and a
+        // deadline that took the last field is a document and spends one. There
+        // is no way to see the difference other than through `FT.INFO`, and it
+        // is exactly what a real server reports.
+        None if change == Change::Taken => search.vanished(Source::Hash, key),
+        None => {
+            search.wrote(Source::Hash, key, &[]);
+            search.went(key);
+        }
     }
 }
 

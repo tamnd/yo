@@ -1632,16 +1632,13 @@ pub fn resolved(
             }
             // The one group that reaches back into the server after it has
             // written its reply, because a hash is what a search index is
-            // made of. What comes back is whether the fields under the key
-            // are no longer what they were, which is not the same as
-            // whether the command was a write.
+            // made of. What comes back is what the indexes have to be told,
+            // which is not the same as whether the command was a write.
             "hash" => {
                 let db = session.db;
                 let changed = hashes::execute(&server.dbs[db], spec, args, out);
                 changed.map(|changed| {
-                    if changed {
-                        indexing::changed(server, db, args.get(1));
-                    }
+                    indexing::changed(server, db, args.get(1), changed);
                     Flow::Continue
                 })
             }
@@ -20969,9 +20966,105 @@ mod tests {
         f.run(&[b"HINCRBY", b"p:2", b"n", b"1"]);
         assert_eq!(held(&f, b"ix"), (2, 4));
         // A deadline that has already passed takes the field away, and taking
-        // the last field away takes the key and the document with it.
+        // the last field away takes the key and the document with it. The
+        // number still moves on the way past, because the field going and the
+        // key going are two separate pieces of news and the first of them
+        // writes the document one last time.
         f.run(&[b"HEXPIRE", b"p:2", b"0", b"FIELDS", b"1", b"n"]);
+        assert_eq!(held(&f, b"ix"), (1, 5));
+    }
+
+    /// The two ways of emptying a hash, which do not leave the same thing
+    /// behind. `HDEL` of the last field spends no number and is counted as a
+    /// refusal, and a deadline that has already passed spends one on a document
+    /// nobody sees and is counted as nothing. Measured against 8.10.1 and not
+    /// something anyone would guess.
+    #[test]
+    fn a_key_emptied_by_a_deadline_spends_a_number_and_one_emptied_by_hdel_does_not() {
+        /// The index's own failure count.
+        fn refused(f: &Fixture, name: &[u8]) -> u64 {
+            let search = f.server.search.lock();
+            let index = search.named(name).expect("the index is there");
+            index.trouble.whole().failures()
+        }
+
+        let mut f = Fixture::new();
+        f.run(&[
+            b"FT.CREATE",
+            b"ix",
+            b"PREFIX",
+            b"1",
+            b"p:",
+            b"SCHEMA",
+            b"t",
+            b"TEXT",
+        ]);
+        f.run(&[b"HSET", b"p:1", b"t", b"alpha"]);
+        assert_eq!(held(&f, b"ix"), (1, 1));
+        f.run(&[b"HDEL", b"p:1", b"t"]);
+        assert_eq!(
+            held(&f, b"ix"),
+            (0, 1),
+            "HDEL of the last field spends none"
+        );
+        assert_eq!(refused(&f, b"ix"), 1, "and is counted as a refusal");
+
+        f.run(&[b"HSET", b"p:2", b"t", b"alpha"]);
+        assert_eq!(held(&f, b"ix"), (1, 2));
+        f.run(&[b"HEXPIRE", b"p:2", b"0", b"FIELDS", b"1", b"t"]);
+        assert_eq!(held(&f, b"ix"), (0, 3), "a deadline spends one");
+        assert_eq!(refused(&f, b"ix"), 1, "and is counted as nothing");
+
+        f.run(&[b"HSET", b"p:3", b"t", b"alpha"]);
         assert_eq!(held(&f, b"ix"), (1, 4));
+        f.run(&[b"HGETDEL", b"p:3", b"FIELDS", b"1", b"t"]);
+        assert_eq!(held(&f, b"ix"), (0, 5), "and so does HGETDEL");
+
+        // Two fields and one command is one rewrite and not two, whichever way
+        // the fields go.
+        f.run(&[b"HSET", b"p:4", b"t", b"alpha", b"u", b"beta"]);
+        assert_eq!(held(&f, b"ix"), (1, 6));
+        f.run(&[b"HEXPIRE", b"p:4", b"0", b"FIELDS", b"2", b"t", b"u"]);
+        assert_eq!(held(&f, b"ix"), (0, 7));
+        assert_eq!(refused(&f, b"ix"), 1);
+    }
+
+    /// `HSETEX` with a deadline that has already passed is two pieces of news
+    /// from one command, so the number moves twice and the value never reaches
+    /// the index.
+    #[test]
+    fn a_field_written_already_past_its_deadline_moves_the_number_twice() {
+        let mut f = Fixture::new();
+        f.run(&[
+            b"FT.CREATE",
+            b"ix",
+            b"PREFIX",
+            b"1",
+            b"p:",
+            b"SCHEMA",
+            b"t",
+            b"TEXT",
+            b"u",
+            b"TEXT",
+        ]);
+        f.run(&[b"HSET", b"p:1", b"u", b"keepme"]);
+        assert_eq!(held(&f, b"ix"), (1, 1));
+        f.run(&[
+            b"HSETEX", b"p:1", b"EXAT", b"1", b"FIELDS", b"1", b"t", b"zqx",
+        ]);
+        assert_eq!(
+            held(&f, b"ix"),
+            (1, 3),
+            "the key lived and the field did not"
+        );
+
+        // And the same when the key does not survive it.
+        f.run(&[b"HSET", b"p:2", b"t", b"alpha"]);
+        assert_eq!(held(&f, b"ix"), (2, 4));
+        f.run(&[
+            b"HSETEX", b"p:2", b"EXAT", b"1", b"FIELDS", b"1", b"t", b"zqx",
+        ]);
+        assert_eq!(held(&f, b"ix"), (1, 6));
     }
 
     /// A key that will not read is counted against the index and against the
