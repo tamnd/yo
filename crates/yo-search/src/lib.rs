@@ -30,6 +30,11 @@
 //! [`Index`] is a definition with a schema under a name. [`Registry`] is every
 //! index on the server plus the aliases pointing at them.
 //!
+//! [`dict`] is the other table hanging off the registry, the word lists
+//! `FT.DICT*` keeps. They are not indexes and they are not keys, and they sit
+//! there because they have the same lifetime the indexes do: one table for the
+//! server, reachable from any database, and emptied when the keyspace is.
+//!
 //! [`query`] is the query language: the grammar a client writes, the tree it
 //! parses into and the printout `FT.EXPLAIN` answers with. Both dialects are
 //! there, because the one a client gets when it does not ask for one is still
@@ -113,6 +118,7 @@
 
 #![deny(missing_docs)]
 
+pub mod dict;
 pub mod docs;
 pub mod english;
 pub mod expand;

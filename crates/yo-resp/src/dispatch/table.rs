@@ -172,6 +172,11 @@ const AC_SEARCH_WRITE: &[&str] = &["@write", "@search"];
 /// `FT._LIST`, which the module puts in `@admin` because listing every index is
 /// a question about the server rather than about anything in it.
 const AC_SEARCH_LIST: &[&str] = &["@admin", "@slow", "@search"];
+/// `FT.TAGVALS`, the one search read the module bothers to put in `@read` as
+/// well, and the only one it calls dangerous without also calling it a write.
+/// Both are fair: the whole of a tag index goes into one reply and there is no
+/// way to ask for less of it.
+const AC_SEARCH_TAGS: &[&str] = &["@read", "@slow", "@dangerous", "@search"];
 /// A search read, with the `module` flag every search command carries for the
 /// same reason the JSON and vector set ones do.
 const SEARCH_READ: &[&str] = &["readonly", "module"];
@@ -3373,6 +3378,58 @@ pub static COMMANDS: &[Spec] = &[
         since: "1.0.0",
         complexity: "O(1)",
         summary: "The tree a query parses into, one line per reply element.",
+        group: "search",
+    },
+    Spec {
+        name: "FT.TAGVALS",
+        arity: 3,
+        flags: SEARCH_READ,
+        first_key: 0,
+        last_key: 0,
+        step: 0,
+        acl: AC_SEARCH_TAGS,
+        since: "1.0.0",
+        complexity: "O(N)",
+        summary: "Every distinct value a tag field holds.",
+        group: "search",
+    },
+    Spec {
+        name: "FT.DICTADD",
+        arity: -3,
+        flags: SEARCH_WRITE_OOM,
+        first_key: 0,
+        last_key: 0,
+        step: 0,
+        acl: AC_SEARCH,
+        since: "1.4.0",
+        complexity: "O(1)",
+        summary: "Put terms into a dictionary, making it if it is not there.",
+        group: "search",
+    },
+    Spec {
+        name: "FT.DICTDEL",
+        arity: -3,
+        flags: SEARCH_WRITE,
+        first_key: 0,
+        last_key: 0,
+        step: 0,
+        acl: AC_SEARCH,
+        since: "1.4.0",
+        complexity: "O(1)",
+        summary: "Take terms back out of a dictionary.",
+        group: "search",
+    },
+    Spec {
+        name: "FT.DICTDUMP",
+        arity: 2,
+        flags: SEARCH_READ,
+        first_key: 0,
+        last_key: 0,
+        step: 0,
+        acl: AC_SEARCH,
+        since: "1.4.0",
+        complexity: "O(N)",
+        summary: "Every term in a dictionary.",
         group: "search",
     },
     // --------------------------------------------------------------- bloom

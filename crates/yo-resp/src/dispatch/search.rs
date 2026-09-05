@@ -2,9 +2,11 @@
 //!
 //! Sixteen of them are about the index itself rather than about what is in it:
 //! making one, changing its schema, taking it away, describing it, listing them
-//! and naming them. Two more print the tree a query parses into. The nineteenth
-//! is `FT.SEARCH`, which is the only one that reads documents and so the only
-//! one that has to reach the keyspace as well as the registry.
+//! and naming them. Two more print the tree a query parses into, and one reads
+//! a tag field's values straight back out. Three keep the word lists that are
+//! not attached to any index at all. The last is `FT.SEARCH`, which is the only
+//! one that reads documents and so the only one that has to reach the keyspace
+//! as well as the registry.
 //!
 //! # There is no key here
 //!
@@ -96,6 +98,7 @@ use yo_search::query::{self, Ask, Bad, Circle, Mask, Node, Pair, Range, What};
 use yo_search::score::Scorer;
 use yo_search::sorted::{self, Sorted};
 use yo_search::summary::{self, Trim, Wanted, Wrap};
+use yo_search::tags::Tags;
 use yo_search::walk;
 use yo_search::{Clash, English, Field, Index, Registry};
 use yo_shape::Metric;
@@ -212,6 +215,13 @@ const MISSING: &str = "SEARCH_INDEX_NOT_FOUND Index not found: ";
 const CONFLICT: &str = "SEARCH_ALIAS_CONFLICT Alias conflicts with an existing index name";
 const NOT_MINE: &str = "SEARCH_INDEX_NOT_FOUND Alias does not belong to provided spec";
 const NO_ALIAS: &str = "Alias does not exist";
+/// What `FT.TAGVALS` says about a name the schema does not have, which is the
+/// same line whether the name is nothing at all or the identifier of a field
+/// that a query calls something else. It takes the attribute and never the
+/// path, so `SCHEMA g AS gg TAG` answers about `gg` and refuses `g`.
+const NO_FIELD: &str = "SEARCH_ATTR_BAD No such field";
+/// And about a field that is there and is not a tag.
+const NOT_A_TAG: &str = "SEARCH_ATTR_BAD Not a tag field";
 /// What the two `ALIASADD` spellings answer when the index is not there, which
 /// is not the line the rest of the group uses for the same thing.
 const NO_TARGET: &str = "SEARCH_INDEX_NOT_FOUND Unknown index name (or name is an alias itself)";
@@ -311,6 +321,10 @@ pub(super) fn execute<'a>(
         "FT.ALIASLIST" => alias_list(reg, args, out),
         "FT.EXPLAIN" => explain(reg, args, out, false),
         "FT.EXPLAINCLI" => explain(reg, args, out, true),
+        "FT.TAGVALS" => tag_vals(reg, args, out),
+        "FT.DICTADD" => dict_add(reg, args, out),
+        "FT.DICTDEL" => dict_del(reg, args, out),
+        "FT.DICTDUMP" => dict_dump(reg, args, out),
         other => unreachable!("{other} is not a search command"),
     };
     if let Err(f) = done {
@@ -1145,6 +1159,78 @@ fn alias_list<'a>(reg: &mut Registry, args: Args<'a>, out: &mut Out) -> Answer<'
     out.set(n);
     for alias in reg.aliases_of(&real) {
         out.bulk(alias);
+    }
+    Ok(())
+}
+
+/// `FT.TAGVALS index attribute`, every distinct value a tag field holds.
+///
+/// The values come back as they are stored rather than as they arrived, which
+/// for an ordinary tag field means folded and trimmed: `Red, BLUE ` written to
+/// one document answers `blue` and `red`. A field declared `CASESENSITIVE`
+/// keeps what it was given, so `Aa|bB` answers `Aa` and `bB`. They are sorted
+/// by their bytes either way, which puts a capital in front of a small letter.
+///
+/// The name is the attribute and never the identifier, so a field declared
+/// `AS gg` is asked about by `gg` and asking about `g` answers that there is no
+/// such field. Looking up the index counts as a use of it on every road out of
+/// here, the two that refuse the field included.
+fn tag_vals<'a>(reg: &mut Registry, args: Args<'a>, out: &mut Out) -> Answer<'a> {
+    let name = args.get(1);
+    let attribute = args.get(2);
+    let Some(index) = reg.open(name) else {
+        return Err(Fail::naming(MISSING, name));
+    };
+    match index.field(attribute) {
+        None => return Err(Fail::plain(NO_FIELD)),
+        Some(field) if !matches!(field.kind, Kind::Tag(_)) => {
+            return Err(Fail::plain(NOT_A_TAG));
+        }
+        Some(_) => {}
+    }
+    // A tag field nothing has been written to has no list at all, which answers
+    // the same empty set as a list that has been emptied.
+    let values = index.held.values(attribute);
+    out.set(values.map_or(0, Tags::len));
+    for (value, _) in values.into_iter().flat_map(Tags::all) {
+        out.bulk(value);
+    }
+    Ok(())
+}
+
+/// `FT.DICTADD dict term [term ...]`, and how many of the terms were new.
+///
+/// The dictionary is made by the first word that goes into it and there is no
+/// command to make one, so this is also the create. Nothing here touches an
+/// index, so a dictionary named after one is not attached to it.
+fn dict_add<'a>(reg: &mut Registry, args: Args<'a>, out: &mut Out) -> Answer<'a> {
+    let name = args.get(1);
+    let terms: Vec<&[u8]> = (2..args.len()).map(|i| args.get(i)).collect();
+    out.int(reg.dicts.add(name, &terms) as i64);
+    Ok(())
+}
+
+/// `FT.DICTDEL dict term [term ...]`, and how many of the terms were there.
+///
+/// A dictionary that does not exist is not an error, it is zero terms deleted,
+/// and so is a term the dictionary does not hold.
+fn dict_del<'a>(reg: &mut Registry, args: Args<'a>, out: &mut Out) -> Answer<'a> {
+    let name = args.get(1);
+    let terms: Vec<&[u8]> = (2..args.len()).map(|i| args.get(i)).collect();
+    out.int(reg.dicts.del(name, &terms) as i64);
+    Ok(())
+}
+
+/// `FT.DICTDUMP dict`, every term in it in byte order.
+///
+/// A set on RESP3 and an array of bulk strings on RESP2, and a dictionary
+/// nobody ever made dumps empty rather than complaining, which is the one place
+/// in this group where a missing name is not an error.
+fn dict_dump<'a>(reg: &Registry, args: Args<'a>, out: &mut Out) -> Answer<'a> {
+    let name = args.get(1);
+    out.set(reg.dicts.len(name));
+    for term in reg.dicts.dump(name) {
+        out.bulk(term);
     }
     Ok(())
 }

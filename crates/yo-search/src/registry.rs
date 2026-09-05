@@ -1,5 +1,6 @@
 //! Every index on the server, and the names that point at them.
 
+use crate::dict::Dicts;
 use crate::english::English;
 use crate::index::Index;
 
@@ -48,6 +49,14 @@ pub struct Registry {
     /// words to their stems and two indexes over the same keys would fill two
     /// copies of it with the same answers.
     english: English,
+    /// The word lists `FT.DICT*` keeps.
+    ///
+    /// Not an index and not a key, but module state with the same lifetime as
+    /// the indexes: one table for the server, reachable from any database, and
+    /// emptied when the keyspace is. So it rides along here rather than behind
+    /// a second lock that would always be taken at the same moments this one
+    /// is.
+    pub dicts: Dicts,
 }
 
 impl Registry {
@@ -250,10 +259,12 @@ impl Registry {
     }
 
     /// Throws every index and alias away, which is what emptying the keyspace
-    /// does to them.
+    /// does to them. The dictionaries go with them, which is measured: a word
+    /// list added before `FLUSHALL` dumps empty after it.
     pub fn clear(&mut self) {
         self.indexes.clear();
         self.aliases.clear();
+        self.dicts.clear();
     }
 }
 
@@ -380,8 +391,10 @@ mod tests {
         let mut r = Registry::new();
         r.create(index("a")).unwrap();
         r.alias(b"al", b"a").unwrap();
+        r.dicts.add(b"d", &[b"word"]);
         r.clear();
         assert!(r.is_empty());
         assert_eq!(r.target(b"al"), None);
+        assert!(r.dicts.is_empty());
     }
 }
