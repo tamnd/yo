@@ -3321,6 +3321,18 @@ divergent = "D-87"
 notes = "Every term that is in a group and the groups it is in, as a map on RESP3 and a flat list of term then group ids on RESP2. The terms are folded on the way in with the query fold, full unicode lowercase and no cut, so ECOLE dumps as ecole and an emoji dumps whole, while the group ids are kept exactly as they were given. Group ids under a term are in the order the term was added to them and a repeat is dropped. An empty term is a term and dumps as an empty string, and a group with no terms in it leaves nothing behind. The risk is the same one FT.TAGVALS carries, the whole list in one reply with nothing to cut it down with. Order between terms is D-87."
 
 [[command]]
+name = "FT.SPELLCHECK"
+group = "search"
+since = "1.4.0"
+arity = -3
+plan = "none"
+bounded = "risk"
+status = "shipped"
+wire = "verified"
+divergent = "D-88"
+notes = "The score a suggestion comes back with is how common the word is and has nothing to do with how close it is, documents holding the term over the live document count, so the nearest word is often last. Ties break on the folded term and not on the spelling that is reported, which is what makes a dictionary word Zaaa come after aaab for the query aaaa. A word the index dictionary already holds is dropped before anything else happens and that check is blind to the field the query named, while the search for candidates does honour the field, so @a:world says nothing on an index that only read world out of b. The query is parsed with the stopword list off, because a real server checks then and suggests thin for it. Stems are candidates and only plain words are asked about, so a prefix, a suffix, an infix, a pattern and a fuzzy word contribute nothing. A tag value and a word under a field the schema does not know are reported with an empty list of suggestions. The distance counts characters and not bytes, so ecole reaches école at one, the first DISTANCE wins and the rest are dropped, and an argument nobody recognises is stepped over rather than refused. The risk is that every term in the index is compared against every word asked about and nothing caps how many suggestions come back."
+
+[[command]]
 name = "FT.SUGADD"
 group = "search"
 since = "1.0.0"

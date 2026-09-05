@@ -21708,6 +21708,146 @@ mod tests {
         assert_eq!(f.run(&[b"FT.SYNUPDATE", b"nope", b"g", b"a"]), missing);
     }
 
+    /// The words after `PARAMS n` are counted before their shape is looked at,
+    /// so a count that reaches past the end of the command and a count that is
+    /// merely odd are two different errors.
+    #[test]
+    fn params_counts_the_words_before_it_pairs_them_up() {
+        let mut f = Fixture::new();
+        f.run(&[b"FT.CREATE", b"e", b"SCHEMA", b"t", b"TEXT"]);
+        let none = "-SEARCH_PARSE_ARGS Bad arguments for PARAMS: \
+                    Expected an argument, but none provided\r\n";
+        let odd = "-SEARCH_ADD_ARGS Parameters must be specified in PARAM VALUE pairs\r\n";
+        assert_eq!(f.run(&[b"FT.SEARCH", b"e", b"x", b"PARAMS", b"1"]), none);
+        assert_eq!(
+            f.run(&[b"FT.SEARCH", b"e", b"x", b"PARAMS", b"3", b"a", b"b"]),
+            none
+        );
+        assert_eq!(
+            f.run(&[b"FT.SEARCH", b"e", b"x", b"PARAMS", b"1", b"a"]),
+            odd
+        );
+        assert_eq!(f.run(&[b"FT.SEARCH", b"e", b"x", b"PARAMS", b"0"]), odd);
+        assert_eq!(
+            f.run(&[b"FT.SEARCH", b"e", b"x", b"PARAMS", b"-1"]),
+            "-SEARCH_PARSE_ARGS Bad arguments for PARAMS: Value is outside acceptable bounds\r\n"
+        );
+    }
+
+    // ----------------------------------------------------------- spellcheck
+
+    /// The score is how many documents hold the suggestion over how many
+    /// documents there are, and how close the suggestion is to the word does
+    /// not come into it at all, so the nearer of the two words here is second.
+    #[test]
+    fn a_spellcheck_scores_a_suggestion_by_how_common_it_is() {
+        let mut f = Fixture::new();
+        f.run(&[b"FT.CREATE", b"e", b"SCHEMA", b"t", b"TEXT", b"NOSTEM"]);
+        f.run(&[b"HSET", b"d1", b"t", b"hello"]);
+        f.run(&[b"HSET", b"d2", b"t", b"hallo hello"]);
+        assert_eq!(
+            f.run(&[b"FT.SPELLCHECK", b"e", b"hellp", b"DISTANCE", b"2"]),
+            "*1\r\n*3\r\n$4\r\nTERM\r\n$5\r\nhellp\r\n\
+             *2\r\n*2\r\n$1\r\n1\r\n$5\r\nhello\r\n*2\r\n$3\r\n0.5\r\n$5\r\nhallo\r\n"
+        );
+    }
+
+    /// On RESP3 the whole thing is wrapped in a map under one name, a word
+    /// carries a list of one pair maps, and the score is a double rather than
+    /// a string.
+    #[test]
+    fn a_spellcheck_answers_a_map_of_maps_on_resp3() {
+        let mut f = Fixture::new();
+        f.run(&[b"HELLO", b"3"]);
+        f.run(&[b"FT.CREATE", b"e", b"SCHEMA", b"t", b"TEXT", b"NOSTEM"]);
+        f.run(&[b"HSET", b"d1", b"t", b"hello"]);
+        assert_eq!(
+            f.run(&[b"FT.SPELLCHECK", b"e", b"hellp"]),
+            "%1\r\n$7\r\nresults\r\n%1\r\n$5\r\nhellp\r\n\
+             *1\r\n%1\r\n$5\r\nhello\r\n,1\r\n"
+        );
+    }
+
+    /// A word the index already holds is not a mistake and is left out of the
+    /// answer, and that check never looks at the field the query named, while
+    /// the search for candidates does.
+    #[test]
+    fn a_word_the_index_holds_is_never_asked_about_whatever_field_it_names() {
+        let mut f = Fixture::new();
+        f.run(&[
+            b"FT.CREATE",
+            b"e",
+            b"SCHEMA",
+            b"a",
+            b"TEXT",
+            b"NOSTEM",
+            b"b",
+            b"TEXT",
+            b"NOSTEM",
+        ]);
+        f.run(&[b"HSET", b"d1", b"b", b"world"]);
+        assert_eq!(f.run(&[b"FT.SPELLCHECK", b"e", b"@a:world"]), "*0\r\n");
+        assert_eq!(
+            f.run(&[b"FT.SPELLCHECK", b"e", b"@a:worlt"]),
+            "*1\r\n*3\r\n$4\r\nTERM\r\n$5\r\nworlt\r\n*0\r\n"
+        );
+    }
+
+    /// A dictionary named by `INCLUDE` adds words the index never read, scored
+    /// zero and reported in the spelling the dictionary was given, and one
+    /// named by `EXCLUDE` says a word is spelled right after all.
+    #[test]
+    fn a_spellcheck_reads_the_dictionaries_it_is_pointed_at() {
+        let mut f = Fixture::new();
+        f.run(&[b"FT.CREATE", b"e", b"SCHEMA", b"t", b"TEXT", b"NOSTEM"]);
+        f.run(&[b"FT.DICTADD", b"d", b"Hellp", b"hellq"]);
+        assert_eq!(
+            f.run(&[b"FT.SPELLCHECK", b"e", b"hellz", b"TERMS", b"INCLUDE", b"d"]),
+            "*1\r\n*3\r\n$4\r\nTERM\r\n$5\r\nhellz\r\n\
+             *2\r\n*2\r\n$1\r\n0\r\n$5\r\nHellp\r\n*2\r\n$1\r\n0\r\n$5\r\nhellq\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"FT.SPELLCHECK", b"e", b"hellq", b"TERMS", b"EXCLUDE", b"d"]),
+            "*0\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"FT.SPELLCHECK", b"e", b"x", b"TERMS", b"INCLUDE", b"nope"]),
+            "-Dict does not exist: nope\r\n"
+        );
+    }
+
+    /// The first `DISTANCE` counts and the rest are dropped, an argument
+    /// nobody recognises is stepped over rather than refused, and a distance
+    /// outside one to four is the one thing here that does fail.
+    #[test]
+    fn a_spellcheck_reads_its_arguments_leniently() {
+        let mut f = Fixture::new();
+        f.run(&[b"FT.CREATE", b"e", b"SCHEMA", b"t", b"TEXT", b"NOSTEM"]);
+        f.run(&[b"HSET", b"d1", b"t", b"hello"]);
+        let one = "*1\r\n*3\r\n$4\r\nTERM\r\n$5\r\nhellp\r\n\
+                   *1\r\n*2\r\n$1\r\n1\r\n$5\r\nhello\r\n";
+        assert_eq!(f.run(&[b"FT.SPELLCHECK", b"e", b"hellp", b"BOGUS"]), one);
+        let none = "*1\r\n*3\r\n$4\r\nTERM\r\n$5\r\nhelqp\r\n*0\r\n";
+        let args: &[&[u8]] = &[
+            b"FT.SPELLCHECK",
+            b"e",
+            b"helqp",
+            b"DISTANCE",
+            b"1",
+            b"DISTANCE",
+            b"4",
+        ];
+        assert_eq!(f.run(args), none);
+        assert_eq!(
+            f.run(&[b"FT.SPELLCHECK", b"e", b"hellp", b"DISTANCE", b"5"]),
+            "-bad distance given, distance must be a natural number between 1 to 4\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"FT.SPELLCHECK", b"nope", b"hellp"]),
+            "-SEARCH_INDEX_NOT_FOUND Index not found: nope\r\n"
+        );
+    }
+
     // -------------------------------------------------------------- suggest
 
     /// The reply is the size of the dictionary afterwards, which is neither

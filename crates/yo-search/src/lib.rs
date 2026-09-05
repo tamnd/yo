@@ -150,6 +150,7 @@ pub mod reduce;
 pub mod registry;
 pub mod score;
 pub mod sorted;
+pub mod spell;
 pub mod suggest;
 pub mod summary;
 pub mod synonyms;
