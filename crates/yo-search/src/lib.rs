@@ -35,6 +35,12 @@
 //! there because they have the same lifetime the indexes do: one table for the
 //! server, reachable from any database, and emptied when the keyspace is.
 //!
+//! [`suggest`] is the exception to all of that, and it is the one thing the
+//! search module does put in the keyspace. A suggestion dictionary is a real
+//! key with a type of its own, so it is not in the registry and not in a table
+//! beside it. What is here is the trie and the scoring; the body that hangs it
+//! off a key is up in the dispatch with the other module types.
+//!
 //! [`query`] is the query language: the grammar a client writes, the tree it
 //! parses into and the printout `FT.EXPLAIN` answers with. Both dialects are
 //! there, because the one a client gets when it does not ask for one is still
@@ -136,6 +142,7 @@ pub mod reduce;
 pub mod registry;
 pub mod score;
 pub mod sorted;
+pub mod suggest;
 pub mod summary;
 pub mod tags;
 pub mod text;

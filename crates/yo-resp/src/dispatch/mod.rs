@@ -77,6 +77,7 @@ mod server;
 mod sets;
 mod streams;
 mod strings;
+mod suggest;
 pub mod table;
 mod tdigest;
 mod topk;
@@ -1907,6 +1908,13 @@ pub fn resolved(
             }
             "search" if spec.name == "FT.AGGREGATE" => {
                 search::roll(server, session.db, args, out).map(|()| Flow::Continue)
+            }
+            // The four search commands that name a key rather than an index.
+            // A suggestion dictionary is a real key with a type of its own, so
+            // these are handed a database and never touch the registry.
+            "search" if spec.name.starts_with("FT.SUG") => {
+                let db = session.db;
+                suggest::execute(&server.dbs[db], spec, args, out).map(|()| Flow::Continue)
             }
             "search" if spec.name == "FT.CURSOR" => {
                 // Its own arm because the cursors are not in the registry, and
@@ -21629,6 +21637,274 @@ mod tests {
             f.run(&[flush]);
             assert_eq!(f.run(&[b"FT.DICTDUMP", b"d"]), "*0\r\n", "{flush:?}");
         }
+    }
+
+    // -------------------------------------------------------------- suggest
+
+    /// The reply is the size of the dictionary afterwards, which is neither
+    /// what was added nor whether anything changed.
+    #[test]
+    fn an_add_answers_how_many_suggestions_are_in_there_now() {
+        let mut f = Fixture::new();
+        assert_eq!(f.run(&[b"FT.SUGADD", b"s", b"one", b"1"]), ":1\r\n");
+        assert_eq!(f.run(&[b"FT.SUGADD", b"s", b"one", b"9"]), ":1\r\n");
+        assert_eq!(f.run(&[b"FT.SUGADD", b"s", b"only", b"2"]), ":2\r\n");
+        assert_eq!(f.run(&[b"FT.SUGLEN", b"s"]), ":2\r\n");
+        assert_eq!(f.run(&[b"FT.SUGLEN", b"nokey"]), ":0\r\n");
+    }
+
+    /// A suggestion dictionary is the one thing the search module puts in the
+    /// keyspace, so every keyspace command reaches it.
+    #[test]
+    fn a_suggestion_dictionary_is_a_key_with_a_type_of_its_own() {
+        let mut f = Fixture::new();
+        f.run(&[b"FT.SUGADD", b"s", b"one", b"1"]);
+        assert_eq!(f.run(&[b"TYPE", b"s"]), "+trietype0\r\n");
+        assert_eq!(f.run(&[b"OBJECT", b"ENCODING", b"s"]), "$3\r\nraw\r\n");
+        assert_eq!(f.run(&[b"EXISTS", b"s"]), ":1\r\n");
+        assert_eq!(f.run(&[b"KEYS", b"*"]), "*1\r\n$1\r\ns\r\n");
+        assert_eq!(f.run(&[b"EXPIRE", b"s", b"100"]), ":1\r\n");
+        assert_eq!(f.run(&[b"TTL", b"s"]), ":100\r\n");
+        assert_eq!(f.run(&[b"DEL", b"s"]), ":1\r\n");
+        assert_eq!(f.run(&[b"FT.SUGLEN", b"s"]), ":0\r\n");
+    }
+
+    /// The last suggestion out takes the key with it, which most module types
+    /// do not do.
+    #[test]
+    fn deleting_the_last_suggestion_deletes_the_key() {
+        let mut f = Fixture::new();
+        f.run(&[b"FT.SUGADD", b"s", b"one", b"1"]);
+        assert_eq!(f.run(&[b"FT.SUGDEL", b"s", b"nope"]), ":0\r\n");
+        assert_eq!(f.run(&[b"FT.SUGDEL", b"s", b"one"]), ":1\r\n");
+        assert_eq!(f.run(&[b"EXISTS", b"s"]), ":0\r\n");
+        assert_eq!(f.run(&[b"FT.SUGDEL", b"nokey", b"a"]), ":0\r\n");
+    }
+
+    /// A key holding anything else is refused rather than overwritten, on all
+    /// four of them.
+    #[test]
+    fn a_suggestion_command_on_another_kind_of_key_is_wrongtype() {
+        let mut f = Fixture::new();
+        f.run(&[b"SET", b"s", b"x"]);
+        for cmd in [
+            vec![&b"FT.SUGADD"[..], b"s", b"t", b"1"],
+            vec![&b"FT.SUGGET"[..], b"s", b"t"],
+            vec![&b"FT.SUGDEL"[..], b"s", b"t"],
+            vec![&b"FT.SUGLEN"[..], b"s"],
+        ] {
+            assert!(f.run(&cmd).starts_with("-WRONGTYPE"), "{cmd:?}");
+        }
+        assert_eq!(f.run(&[b"GET", b"s"]), "$1\r\nx\r\n");
+    }
+
+    /// The scores in here were read off a real server, single precision and
+    /// all. An exact match answers a sentinel so it sorts in front.
+    #[test]
+    fn a_lookup_answers_a_score_it_works_out_rather_than_the_one_stored() {
+        let mut f = Fixture::new();
+        f.run(&[b"FT.SUGADD", b"s", b"one", b"1"]);
+        f.run(&[b"FT.SUGADD", b"s", b"only", b"2"]);
+        f.run(&[b"FT.SUGADD", b"s", b"ontario", b"3"]);
+        assert_eq!(
+            f.run(&[b"FT.SUGGET", b"s", b"on", b"WITHSCORES"]),
+            "*6\r\n$7\r\nontario\r\n$18\r\n1.2247449159622192\r\n\
+             $4\r\nonly\r\n$17\r\n1.154700517654419\r\n\
+             $3\r\none\r\n$18\r\n0.7071067690849304\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"FT.SUGGET", b"s", b"one", b"WITHSCORES"]),
+            "*2\r\n$3\r\none\r\n$10\r\n2147483648\r\n"
+        );
+        assert_eq!(f.run(&[b"FT.SUGGET", b"nokey", b"a"]), "*0\r\n");
+    }
+
+    /// `FUZZY` is one edit, and the edit is a rune rather than a byte.
+    #[test]
+    fn fuzzy_allows_one_edit_and_nothing_allows_two() {
+        let mut f = Fixture::new();
+        f.run(&[b"FT.SUGADD", b"s", b"only", b"2"]);
+        assert_eq!(f.run(&[b"FT.SUGGET", b"s", b"one"]), "*0\r\n");
+        assert_eq!(
+            f.run(&[b"FT.SUGGET", b"s", b"one", b"FUZZY", b"WITHSCORES"]),
+            "*2\r\n$4\r\nonly\r\n$19\r\n0.19139298796653748\r\n"
+        );
+        assert_eq!(f.run(&[b"FT.SUGGET", b"s", b"xyz", b"FUZZY"]), "*0\r\n");
+    }
+
+    /// Five without a `MAX`, and the terms come back in score order.
+    #[test]
+    fn a_lookup_answers_five_unless_it_is_told_otherwise() {
+        let mut f = Fixture::new();
+        for (term, score) in [
+            (&b"a1"[..], &b"1"[..]),
+            (b"a2", b"2"),
+            (b"a3", b"3"),
+            (b"a4", b"4"),
+            (b"a5", b"5"),
+            (b"a6", b"6"),
+        ] {
+            f.run(&[b"FT.SUGADD", b"s", term, score]);
+        }
+        assert_eq!(
+            f.run(&[b"FT.SUGGET", b"s", b"a"]),
+            "*5\r\n$2\r\na6\r\n$2\r\na5\r\n$2\r\na4\r\n$2\r\na3\r\n$2\r\na2\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"FT.SUGGET", b"s", b"a", b"MAX", b"2"]),
+            "*2\r\n$2\r\na6\r\n$2\r\na5\r\n"
+        );
+        // A `MAX` larger than the dictionary answers what there is.
+        assert!(
+            f.run(&[b"FT.SUGGET", b"s", b"a", b"MAX", b"100"])
+                .starts_with("*6\r\n")
+        );
+    }
+
+    /// A payload is replaced only when one is given, and an empty one is no
+    /// payload at all.
+    #[test]
+    fn a_payload_comes_back_beside_the_term_or_a_null_does() {
+        let mut f = Fixture::new();
+        f.run(&[b"FT.SUGADD", b"s", b"one", b"1", b"PAYLOAD", b"p"]);
+        assert_eq!(
+            f.run(&[b"FT.SUGGET", b"s", b"o", b"WITHPAYLOADS"]),
+            "*2\r\n$3\r\none\r\n$1\r\np\r\n"
+        );
+        f.run(&[b"FT.SUGADD", b"s", b"one", b"2"]);
+        assert_eq!(
+            f.run(&[b"FT.SUGGET", b"s", b"o", b"WITHPAYLOADS"]),
+            "*2\r\n$3\r\none\r\n$1\r\np\r\n"
+        );
+        // An empty payload is the same as not having given one at all, so it
+        // leaves the payload where it is rather than clearing it.
+        f.run(&[b"FT.SUGADD", b"s", b"one", b"2", b"PAYLOAD", b""]);
+        assert_eq!(
+            f.run(&[b"FT.SUGGET", b"s", b"o", b"WITHPAYLOADS"]),
+            "*2\r\n$3\r\none\r\n$1\r\np\r\n"
+        );
+        // A term that never had one answers a null.
+        f.run(&[b"FT.SUGADD", b"s", b"other", b"1", b"PAYLOAD", b""]);
+        assert_eq!(
+            f.run(&[b"FT.SUGGET", b"s", b"ot", b"WITHPAYLOADS"]),
+            "*2\r\n$5\r\nother\r\n$-1\r\n"
+        );
+    }
+
+    /// `INCR` adds to the score that is there rather than replacing it, and
+    /// three tenths a tenth at a time is the reading that shows the score is
+    /// held in single precision.
+    #[test]
+    fn incr_adds_to_the_score_that_is_already_there() {
+        let mut f = Fixture::new();
+        for _ in 0..3 {
+            f.run(&[b"FT.SUGADD", b"s", b"xxx", b"0.1", b"INCR"]);
+        }
+        assert_eq!(
+            f.run(&[b"FT.SUGGET", b"s", b"xx", b"WITHSCORES"]),
+            "*2\r\n$3\r\nxxx\r\n$18\r\n0.2121320366859436\r\n"
+        );
+    }
+
+    /// The five error sentences, none of which are written the same way.
+    #[test]
+    fn the_suggestion_errors_are_the_lines_the_module_sends() {
+        let mut f = Fixture::new();
+        f.run(&[b"FT.SUGADD", b"s", b"one", b"1"]);
+        assert_eq!(
+            f.run(&[b"FT.SUGADD", b"s", b"t", b"abc"]),
+            "-ERR invalid score\r\n"
+        );
+        // The unknown word is complained about before the score is converted.
+        assert_eq!(
+            f.run(&[b"FT.SUGADD", b"s", b"t", b"abc", b"NOPE"]),
+            "-Unknown argument `NOPE`\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"FT.SUGADD", b"s", b"t", b"1", b"PAYLOAD"]),
+            "-Invalid payload: Expected an argument, but none provided\r\n"
+        );
+        // Too many words is an arity error and not an unknown argument.
+        assert!(
+            f.run(&[
+                b"FT.SUGADD",
+                b"s",
+                b"t",
+                b"1",
+                b"PAYLOAD",
+                b"a",
+                b"PAYLOAD",
+                b"b"
+            ])
+            .contains("wrong number of arguments")
+        );
+        assert_eq!(
+            f.run(&[b"FT.SUGGET", b"s", b"o", b"NOPE"]),
+            "-SEARCH_PARSE_ARGS Unrecognized argument: NOPE\r\n"
+        );
+        // A count read as a whole number and then found to be out of range,
+        // against one that had to be read as a double first, where anything
+        // under one is a conversion that failed rather than a range that did.
+        for max in [&b"0"[..], b"-1", b"4294967296", b"1e10", b"inf"] {
+            assert_eq!(
+                f.run(&[b"FT.SUGGET", b"s", b"o", b"MAX", max]),
+                "-SEARCH_PARSE_ARGS MAX: Value is outside acceptable bounds\r\n",
+                "{}",
+                String::from_utf8_lossy(max)
+            );
+        }
+        for max in [
+            &b"abc"[..],
+            b"0.0",
+            b"00",
+            b"-0",
+            b"+0",
+            b"0.5",
+            b"-1.5",
+            b"1e400",
+        ] {
+            assert_eq!(
+                f.run(&[b"FT.SUGGET", b"s", b"o", b"MAX", max]),
+                "-SEARCH_PARSE_ARGS MAX: Could not convert argument to expected type\r\n",
+                "{}",
+                String::from_utf8_lossy(max)
+            );
+        }
+        for max in [&b"01"[..], b"+1", b"1.5", b"0x10", b"1e2"] {
+            assert_eq!(
+                f.run(&[b"FT.SUGGET", b"s", b"o", b"MAX", max]),
+                "*1\r\n$3\r\none\r\n",
+                "{}",
+                String::from_utf8_lossy(max)
+            );
+        }
+        assert_eq!(
+            f.run(&[b"FT.SUGGET", b"s", b"o", b"MAX"]),
+            "-SEARCH_PARSE_ARGS MAX: Expected an argument, but none provided\r\n"
+        );
+        // A score too large for a double is refused where one spelled out is
+        // taken, which is the module reading errno after the conversion.
+        assert_eq!(
+            f.run(&[b"FT.SUGADD", b"s", b"t", b"1e400"]),
+            "-ERR invalid score\r\n"
+        );
+        assert_eq!(f.run(&[b"FT.SUGADD", b"s", b"t", b"inf"]), ":2\r\n");
+    }
+
+    /// An empty term is taken and not stored, so the reply is the length that
+    /// was already there and nothing new comes back. The key is still made,
+    /// and a delete that finds nothing is what clears it away again.
+    #[test]
+    fn an_empty_suggestion_is_taken_and_dropped_but_still_makes_the_key() {
+        let mut f = Fixture::new();
+        f.run(&[b"FT.SUGADD", b"s", b"one", b"1"]);
+        assert_eq!(f.run(&[b"FT.SUGADD", b"s", b"", b"1"]), ":1\r\n");
+        assert_eq!(f.run(&[b"FT.SUGGET", b"s", b""]), "*1\r\n$3\r\none\r\n");
+        assert_eq!(f.run(&[b"FT.SUGADD", b"e", b"", b"1"]), ":0\r\n");
+        assert_eq!(f.run(&[b"EXISTS", b"e"]), ":1\r\n");
+        assert_eq!(f.run(&[b"TYPE", b"e"]), "+trietype0\r\n");
+        assert_eq!(f.run(&[b"FT.SUGDEL", b"e", b"nothing"]), ":0\r\n");
+        assert_eq!(f.run(&[b"EXISTS", b"e"]), ":0\r\n");
     }
 
     /// A key that will not read is counted against the index and against the

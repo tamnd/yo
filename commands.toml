@@ -3297,6 +3297,51 @@ status = "shipped"
 wire = "verified"
 notes = "Every term in a dictionary, sorted by its bytes, which puts a capital in front of a small letter. The risk is the same one FT.TAGVALS carries: the whole list goes into one reply and there is nothing to cut it down with. A name nobody ever added to dumps empty rather than complaining, which is the one place in this group where a missing name is not an error. A set on RESP3 and an array on RESP2."
 
+[[command]]
+name = "FT.SUGADD"
+group = "search"
+since = "1.0.0"
+arity = -4
+plan = "whole-value"
+bounded = "yes"
+status = "shipped"
+wire = "verified"
+notes = "The one search family that lives in the keyspace, so this row has a storage plan where every other FT row has none. The reply is how many suggestions the dictionary holds afterwards rather than whether anything was added. The score is held in single precision, so a score past what a float can hold reads back as infinity, and a term with no bytes in it is taken and not stored. INCR adds to the score that is there and a PAYLOAD replaces the one that is there only when it is given. Between four and seven words, so a second PAYLOAD is a wrong arity."
+
+[[command]]
+name = "FT.SUGGET"
+group = "search"
+since = "1.0.0"
+arity = -3
+plan = "whole-value"
+bounded = "yes"
+status = "shipped"
+wire = "verified"
+divergent = "D-84,D-85"
+notes = "The score that comes back is not the score that went in. It is the stored score divided by e to the twice the edit distance and again by the square root of one plus the difference in the lengths, worked out in single precision, and a term that is exactly the prefix once the prefix has been lowered is scored as two to the thirty first so it sorts in front. The two lengths are not measured the same way, the term in runes and the prefix in bytes, which only shows on something that is not plain ASCII. MAX defaults to five and is bounded here where a real server takes any number a u32 holds and then crashes trying to honour it, which is D-85. Order among terms that score the same is D-84."
+
+[[command]]
+name = "FT.SUGDEL"
+group = "search"
+since = "1.0.0"
+arity = 3
+plan = "whole-value"
+bounded = "inherent"
+status = "shipped"
+wire = "verified"
+notes = "One or zero, and an integer on both protocols rather than a boolean on RESP3. The spelling has to match byte for byte even though a lookup does not care about case, so deleting ABC leaves abc where it is. The last suggestion out takes the key with it, which is one of the few module types that really does go when it empties."
+
+[[command]]
+name = "FT.SUGLEN"
+group = "search"
+since = "1.0.0"
+arity = 2
+plan = "whole-value"
+bounded = "inherent"
+status = "shipped"
+wire = "verified"
+notes = "How many suggestions are in there, counting the ones no lookup will ever answer with. Zero for a key that is not there rather than an error."
+
 # ----------------------------------------------------------------------- bloom
 
 [[command]]

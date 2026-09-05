@@ -177,6 +177,10 @@ const AC_SEARCH_LIST: &[&str] = &["@admin", "@slow", "@search"];
 /// Both are fair: the whole of a tag index goes into one reply and there is no
 /// way to ask for less of it.
 const AC_SEARCH_TAGS: &[&str] = &["@read", "@slow", "@dangerous", "@search"];
+/// The two suggestion reads. These are the search commands that work on a real
+/// key, so the module pairs `@search` with the category the key access deserves
+/// rather than leaving it on its own.
+const AC_SEARCH_READ: &[&str] = &["@read", "@search"];
 /// A search read, with the `module` flag every search command carries for the
 /// same reason the JSON and vector set ones do.
 const SEARCH_READ: &[&str] = &["readonly", "module"];
@@ -3430,6 +3434,58 @@ pub static COMMANDS: &[Spec] = &[
         since: "1.4.0",
         complexity: "O(N)",
         summary: "Every term in a dictionary.",
+        group: "search",
+    },
+    Spec {
+        name: "FT.SUGADD",
+        arity: -4,
+        flags: SEARCH_WRITE_OOM,
+        first_key: 1,
+        last_key: 1,
+        step: 1,
+        acl: AC_SEARCH_WRITE,
+        since: "1.0.0",
+        complexity: "O(1)",
+        summary: "Put a suggestion in a dictionary, or change the one that is there.",
+        group: "search",
+    },
+    Spec {
+        name: "FT.SUGGET",
+        arity: -3,
+        flags: SEARCH_READ,
+        first_key: 1,
+        last_key: 1,
+        step: 1,
+        acl: AC_SEARCH_READ,
+        since: "1.0.0",
+        complexity: "O(N) with N the suggestions the prefix reaches",
+        summary: "The best suggestions starting with a prefix.",
+        group: "search",
+    },
+    Spec {
+        name: "FT.SUGDEL",
+        arity: 3,
+        flags: SEARCH_WRITE,
+        first_key: 1,
+        last_key: 1,
+        step: 1,
+        acl: AC_SEARCH_WRITE,
+        since: "1.0.0",
+        complexity: "O(1)",
+        summary: "Take a suggestion out of a dictionary.",
+        group: "search",
+    },
+    Spec {
+        name: "FT.SUGLEN",
+        arity: 2,
+        flags: SEARCH_READ,
+        first_key: 1,
+        last_key: 1,
+        step: 1,
+        acl: AC_SEARCH_READ,
+        since: "1.0.0",
+        complexity: "O(1)",
+        summary: "How many suggestions a dictionary holds.",
         group: "search",
     },
     // --------------------------------------------------------------- bloom
