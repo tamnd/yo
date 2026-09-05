@@ -4,6 +4,32 @@ What each release changed, why, and what it costs you. The versioning rules and 
 
 While the major is 0, a minor release may break anything, including the on-disk format. The format is frozen at `M6`, not before.
 
+## 0.3.18 — 2026-09-05
+
+Eight pull requests and no milestone has closed, so this is a patch.
+
+It is one story with a threading change either side of it. Search went from a parser and a set of data structures nobody could reach to something a client can use: an index created on a running server now reads the keys that are already there, fills up as keys are written, and reports what it holds. `FT.SEARCH` still does not answer, so the way to see any of this is `FT.INFO`, but everything behind that command is now real and measured.
+
+A file written by 0.3.17 opens unchanged under this version and a file written by this version opens under 0.3.17. No record kind was added.
+
+### Added
+
+- **An index fills up as keys are written.** A hash command on a followed key hands the search registry the whole of what is under the key now, and every index whose prefix covers it reads the document again from nothing. `FT.CREATE` walks the database it was run on for keys that already match and fills the index it just made, and `SKIPINITIALSCAN` leaves them for the next write. `FT.INFO` reports `num_docs`, `max_doc_id`, `num_terms`, `num_records`, `records_per_doc_avg`, `hash_indexing_failures` and both `Index Errors` blocks off what the index actually holds rather than off zero.
+- **What a document that matched is worth.** All nine scorers a real server takes are in, and the default `BM25STD` agrees with 8.10.1 to the last digit of a double, which needed the single precision `k1` constant the other side folds into its arithmetic and nothing in its manual mentions.
+- **A tag field is split into the values it holds.** The whole byte model is measured over seven probes against 8.10.1, including the truncation at the first zero byte, the six bytes the trim treats as space, and the rule that a value whose fold comes out empty is indexed as the bytes it arrived as rather than dropped.
+- **A document is read into an index.** A key and its fields go in one end and a document with a number, a score, a payload, a weighted length, a largest frequency, a term in every list it belongs to, its numbers and its tag values comes out the other. Two rules nobody would guess are measured rather than assumed: a stem occurrence is worth one whatever the field weight is, and a numeric field that will not parse loses the whole document instead of being skipped.
+
+### Fixed
+
+- **The three ways a hash empties are three different things to an index.** `HDEL` of the last field sends the indexes to read a key that is not there, which a real server counts in `hash_indexing_failures` and which spends no document number. A deadline that took the last field, so `HEXPIRE key 0` or `HGETDEL`, writes the document one more time with nothing in it, so it spends a number and is counted as nothing. `HSETEX` with a deadline that has already passed is one command and two pieces of news, so the number moves twice and the value it was handed never reaches the index at all. Three keys that end up in the same state and three different sets of counters, all measured against 8.10.1 and visible only through `FT.INFO`.
+- **`FT.CREATE` is refused anywhere but on database zero**, which this build was quietly accepting. The sentence carries no error code in front of it. The `IFNX` shortcut is checked before the database and the name after it, so `FT._CREATEIFNX` over a taken name answers `OK` from database one while `FT.CREATE` over the same name refuses on the database rather than on the name.
+- **The initial scan reads one database and the following reads all of them.** An index follows a key by name across every database once it is running, so a `HSET` on database one reaches an index made on database zero, but the scan reads only the database the create ran on. The asymmetry is measured, not chosen, and it falls out of a real server walking one keyspace while its notifications are server wide.
+- **`records_per_doc_avg` is divided in single precision and printed in double**, the way a real server does it, so seventeen records over three documents now reads `5.666666507720947` rather than `5.666666666666667`.
+
+### Changed
+
+- **The search registry, the backup state and the peer cache moved behind locks**, and a database is handed out of the server without a mutable borrow. Along with the waiter list, which got a lock with its count beside it so a blocked client is counted without walking the list, that is four more pieces of server state that stopped being owned by one thread. `serve` is still one thread, so none of it changes anything you can see yet.
+
 ## 0.3.17 — 2026-09-05
 
 Nine pull requests and no milestone has closed, so this is a patch.
