@@ -479,8 +479,8 @@ spec = "09 section 5"
 
 [[divergence]]
 id = "D-65"
-title = "Two FT.SEARCH options are refused rather than read"
-reason = "GEOFILTER is a circle written outside the query, and the document reader does not read geo fields yet. EXPLAINSCORE prints the arithmetic behind a score as a nested array, which is a shape of its own on top of every scorer. Both are read as unknown arguments here and answer the line a real server answers for a word nobody knows, so a client learns the option is not there rather than getting a reply that quietly ignored it. The nineteen options that are read are read exactly, including the two that surprise everybody: RETURN counts words rather than fields, and INKEYS filters before the total is taken. FT.EXPLAIN takes WITHSORTKEYS and EXPLAINSCORE and drops them the way a real server does, and it now reads the whole SUMMARIZE and HIGHLIGHT clause and drops it the same way. It does not print the IDS node an INKEYS puts in the reference's tree."
+title = "One FT.SEARCH option is refused rather than read"
+reason = "EXPLAINSCORE prints the arithmetic behind a score as a nested array, which is a shape of its own on top of every scorer. It is read as an unknown argument here and answers the line a real server answers for a word nobody knows, so a client learns the option is not there rather than getting a reply that quietly ignored it. The twenty options that are read are read exactly, including the two that surprise everybody: RETURN counts words rather than fields, and INKEYS filters before the total is taken. GEOFILTER is one of the twenty now, and so is the same circle written inside the query, over a real geo index that agrees with the reference on fifty one cases including both sides of the date line and both poles. FT.EXPLAIN takes WITHSORTKEYS and EXPLAINSCORE and drops them the way a real server does, and it now reads the whole SUMMARIZE and HIGHLIGHT clause and drops it the same way. It does not print the IDS node an INKEYS puts in the reference's tree."
 status = "until"
 resolved_by = "M8"
 spec = "09 section 5"

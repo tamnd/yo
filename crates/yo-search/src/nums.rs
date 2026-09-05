@@ -197,24 +197,34 @@ impl Nums {
     #[must_use]
     pub fn range(&self, ends: Ends) -> Vec<Id> {
         let mut out = Vec::new();
+        self.within(ends, |id, _| out.push(id));
+        out.sort_unstable();
+        out.dedup();
+        out
+    }
+
+    /// Every entry in the range, with the number it held, in no useful order.
+    ///
+    /// A document arrives once per number it has in the range, so the caller
+    /// has to fold the duplicates itself. That is what a geo walk wants anyway,
+    /// because it is going to throw some of them away on distance and cannot
+    /// know which until it has seen the number.
+    pub fn within(&self, ends: Ends, mut f: impl FnMut(Id, f64)) {
         if ends.min.is_nan() || ends.max.is_nan() {
-            return out;
+            return;
         }
         let from = self.kept.partition_point(|p| !ends.above(p.value));
         for point in &self.kept[from..] {
             if !ends.below(point.value) {
                 break;
             }
-            out.push(point.id);
+            f(point.id, point.value);
         }
         for point in &self.fresh {
             if ends.holds(point.value) {
-                out.push(point.id);
+                f(point.id, point.value);
             }
         }
-        out.sort_unstable();
-        out.dedup();
-        out
     }
 
     /// How many numbers are held, counting a document twice if it holds two.

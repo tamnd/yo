@@ -62,6 +62,7 @@ use std::collections::BTreeMap;
 use crate::docs::Docs;
 use crate::english::English;
 use crate::field::Kind;
+use crate::geos::{self, Geos};
 use crate::index::Index;
 use crate::nums::Nums;
 use crate::posts::{Id, Posts, Terms, adds, stemmed};
@@ -116,6 +117,8 @@ pub struct Held {
     nums: BTreeMap<Box<[u8]>, Nums>,
     /// Every `TAG` field's values, by the name a query calls the field.
     tags: BTreeMap<Box<[u8]>, Tags>,
+    /// Every `GEO` field's points, by the name a query calls the field.
+    geos: BTreeMap<Box<[u8]>, Geos>,
 }
 
 impl Held {
@@ -154,6 +157,12 @@ impl Held {
         self.tags.get(attribute)
     }
 
+    /// One field's points.
+    #[must_use]
+    pub fn places(&self, attribute: &[u8]) -> Option<&Geos> {
+        self.geos.get(attribute)
+    }
+
     /// Folds every numeric field's fresh writes into its ordered list.
     ///
     /// Worth doing after a batch of documents and not after each one, which is
@@ -161,6 +170,9 @@ impl Held {
     pub fn settle(&mut self) {
         for nums in self.nums.values_mut() {
             nums.settle();
+        }
+        for geos in self.geos.values_mut() {
+            geos.settle();
         }
     }
 
@@ -183,10 +195,11 @@ impl Held {
     ///
     /// The `num_records` a real server reports. It is not the number of terms
     /// and it is not the number of documents, it is every place any of the
-    /// three says a document has something: one per document per term, one per
-    /// number, and one per tag value. Measured, because a hash with one text
-    /// field, one number and a two value tag answers four the first time it is
-    /// written and the arithmetic only works if all three are counted.
+    /// four says a document has something: one per document per term, one per
+    /// number, one per tag value and one per point. Measured, because a hash
+    /// with one text field, one number and a two value tag answers four the
+    /// first time it is written and the arithmetic only works if all of them
+    /// are counted.
     #[must_use]
     pub fn records(&self) -> u64 {
         let terms: u64 = self
@@ -197,7 +210,8 @@ impl Held {
             .sum();
         let nums: u64 = self.nums.values().map(|n| n.len() as u64).sum();
         let tags: u64 = self.tags.values().map(|t| t.entries() as u64).sum();
-        terms + nums + tags
+        let geos: u64 = self.geos.values().map(|g| g.len() as u64).sum();
+        terms + nums + tags + geos
     }
 
     /// Throws everything away, which is what dropping the index does.
@@ -206,6 +220,7 @@ impl Held {
         self.terms = Terms::new();
         self.nums.clear();
         self.tags.clear();
+        self.geos.clear();
     }
 }
 
@@ -234,9 +249,9 @@ impl Index {
     ///
     /// # Errors
     ///
-    /// [`Failed`] when a numeric field holds something that is not a number, in
-    /// which case the document is not in the index at all and no number was
-    /// handed out.
+    /// [`Failed`] when a numeric field holds something that is not a number or a
+    /// geo field holds something that is not a point, in which case the
+    /// document is not in the index at all and no number was handed out.
     pub fn write(
         &mut self,
         english: &mut English,
@@ -253,24 +268,35 @@ impl Index {
         // a rewrite that cannot be indexed leaves the key out of the index
         // rather than leaving what was there before.
         held.docs.remove(key);
-        // Every number is read before anything is written, since one that will
-        // not parse loses the document and a half indexed document would leave
-        // terms pointing at a number nobody handed out.
+        // Every number and every point is read before anything is written,
+        // since one that will not parse loses the document and a half indexed
+        // document would leave terms pointing at a number nobody handed out.
         let mut numbers = Vec::new();
+        let mut places = Vec::new();
         for field in schema.iter().filter(|f| !f.noindex) {
-            if field.kind != Kind::Numeric {
-                continue;
-            }
+            let geo = match field.kind {
+                Kind::Numeric => false,
+                Kind::Geo => true,
+                _ => continue,
+            };
             let Some(raw) = value(fields, &field.identifier) else {
                 continue;
             };
-            let Some(number) = number(raw) else {
-                return Err(Failed {
-                    field: field.attribute.clone(),
-                    value: raw.into(),
-                });
+            let bad = || Failed {
+                field: field.attribute.clone(),
+                value: raw.into(),
             };
-            numbers.push((field.attribute.clone(), number));
+            if geo {
+                let Some((lon, lat)) = geos::point(raw) else {
+                    return Err(bad());
+                };
+                places.push((field.attribute.clone(), lon, lat));
+            } else {
+                let Some(number) = number(raw) else {
+                    return Err(bad());
+                };
+                numbers.push((field.attribute.clone(), number));
+            }
         }
 
         let score = definition
@@ -289,6 +315,9 @@ impl Index {
         }
         for (attribute, number) in numbers {
             held.nums.entry(attribute).or_default().add(id, number);
+        }
+        for (attribute, lon, lat) in places {
+            held.geos.entry(attribute).or_default().add(id, lon, lat);
         }
         // The copies a sort reads instead of reading the key back, one per
         // sortable field in the order the schema declares them. A `NOINDEX`
@@ -318,7 +347,7 @@ impl Index {
                     }
                     continue;
                 }
-                // A number is already in, and a coordinate pair, a shape and a
+                // A number and a point are already in, and a shape and a
                 // vector are not read yet.
                 _ => continue,
             };

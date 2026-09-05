@@ -99,7 +99,7 @@ use crate::expand;
 use crate::held::Held;
 use crate::nums::Ends;
 use crate::posts::{Id, Posts, Reader, stemmed};
-use crate::query::{Node, Range, What, Word};
+use crate::query::{Circle, Node, Range, What, Word};
 use crate::score::{Found, Term};
 use crate::tags::Tags;
 
@@ -211,9 +211,10 @@ fn build<'a>(held: &'a Held, node: &'a Node, weight: f64) -> Box<dyn Step + 'a> 
             weight,
         ),
         What::Numeric(range) => Box::new(numbers(held, range)),
+        What::Geo(circle) => Box::new(places(held, circle)),
         What::Tag(field, list) => tagged(held, field, list, weight),
-        // Measured against nothing yet, so they answer nothing.
-        What::Geo(_) | What::Vector(_) => Box::new(Never),
+        // Measured against nothing yet, so it answers nothing.
+        What::Vector(_) => Box::new(Never),
     }
 }
 
@@ -280,6 +281,18 @@ fn numbers(held: &Held, range: &Range) -> List {
     // A range is a filter and nothing else, and what that is worth depends on
     // the scorer rather than on the range, so the shape says which it is and
     // the scorer decides. [`Found::Filter`] has the measurement.
+    List::new(live(&held.docs, ids), Found::Filter)
+}
+
+/// The documents whose point is inside the circle.
+fn places(held: &Held, circle: &Circle) -> List {
+    let ids = held
+        .places(&circle.field)
+        .and_then(|geos| geos.circle(circle.lon, circle.lat, circle.radius, &circle.unit))
+        .unwrap_or_default();
+    // Nothing at all for a field with no points in it, which is what a field of
+    // another kind is, and the parser has already refused a unit that is not
+    // one of the four rather than leaving it to answer nothing here.
     List::new(live(&held.docs, ids), Found::Filter)
 }
 

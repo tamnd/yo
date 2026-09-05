@@ -84,12 +84,14 @@
 //! the total a client sees is how many rows the window could actually build,
 //! which is why the loading happens before the first byte goes out.
 
+use yo_common::geo;
 use yo_common::num::parse_f64;
 use yo_common::{Result, parse_i64};
 use yo_search::field::{self, Algo, Coords, Kind, Tag, Text, Vector, Width};
 use yo_search::follow::Errors;
 use yo_search::index::{Definition, Source};
-use yo_search::query::{self, Ask, Bad, Mask, Node, Pair, Range, What};
+use yo_search::query::parse::{BAD_POINT, BAD_RADIUS};
+use yo_search::query::{self, Ask, Bad, Circle, Mask, Node, Pair, Range, What};
 use yo_search::score::Scorer;
 use yo_search::sorted::{self, Sorted};
 use yo_search::summary::{self, Trim, Wanted, Wrap};
@@ -1528,6 +1530,12 @@ const LOW_RANGE: &str = "SEARCH_PARSE_ARGS Bad lower range: ";
 const HIGH_RANGE: &str = "SEARCH_PARSE_ARGS Bad upper range: ";
 const BACKWARDS: &str = "SEARCH_SYNTAX Invalid numeric range (min > max): @";
 const FILTER_THREE: &str = "SEARCH_PARSE_ARGS FILTER requires 3 arguments";
+const GEO_FIVE: &str = "SEARCH_PARSE_ARGS GEOFILTER requires 5 arguments";
+const GEO_UNIT: &str = "SEARCH_PARSE_ARGS Unknown distance unit ";
+/// The code word in front of the two geo lines the parser also sends, which
+/// reach the wire from here when the filter was written as an option rather
+/// than inside the query.
+const SYNTAX: &str = "SEARCH_SYNTAX ";
 const NEED_NAME: &str = "SEARCH_PARSE_ARGS RETURN path AS name - must be accompanied with NAME";
 const NEED_LOAD_NAME: &str = "SEARCH_PARSE_ARGS LOAD path AS name - must be accompanied with NAME";
 const LOAD_COUNT: &str =
@@ -1641,6 +1649,11 @@ struct Rows<'a> {
     inkeys: Option<Vec<&'a [u8]>>,
     /// The numeric ranges hung on the query from outside it.
     filters: Vec<(&'a [u8], f64, f64)>,
+    /// The circles hung on the query from outside it, which is the same idea
+    /// written for a geo field. Owned rather than borrowed like the ranges
+    /// above, because a circle carries the unit as the client spelled it and
+    /// the query tree wants that on the node.
+    circles: Vec<Circle>,
     scorer: Scorer,
     /// What `HAMMING` compares each document's payload against.
     payload: Option<&'a [u8]>,
@@ -1742,6 +1755,7 @@ impl Default for Rows<'_> {
             infields: None,
             inkeys: None,
             filters: Vec::new(),
+            circles: Vec::new(),
             scorer: Scorer::default_scorer(),
             payload: None,
             slop: None,
@@ -2303,6 +2317,9 @@ fn row<'a>(
     if main && args::is(word, b"FILTER") {
         return filter(args, at, rows, index).map(Some);
     }
+    if main && args::is(word, b"GEOFILTER") {
+        return geofilter(args, at, rows).map(Some);
+    }
     Ok(None)
 }
 
@@ -2578,6 +2595,80 @@ fn filter<'a>(
     }
     rows.filters.push((field, low, high));
     Ok(at + 4)
+}
+
+/// `GEOFILTER field lon lat radius unit`, which is a circle written outside the
+/// query.
+///
+/// The field is not looked at here at all. A name the schema has never heard of
+/// and a name it holds as something other than a geo field both answer nothing
+/// rather than being refused, which is the same thing a `FILTER` on a field
+/// that is not a number does, and it falls out of asking the index for points
+/// under a name that has none.
+///
+/// The five things that are refused are refused in this order, which is
+/// measured: too few arguments, then a number that will not parse, then a unit
+/// that is not one of the four, then a centre off the projection, then a radius
+/// with no size to it.
+fn geofilter<'a>(
+    args: Args<'a>,
+    at: usize,
+    rows: &mut Rows<'a>,
+) -> core::result::Result<usize, Vec<u8>> {
+    let (Some(field), Some(lon), Some(lat), Some(radius), Some(unit)) = (
+        args.opt(at + 1),
+        args.opt(at + 2),
+        args.opt(at + 3),
+        args.opt(at + 4),
+        args.opt(at + 5),
+    ) else {
+        return Err(GEO_FIVE.as_bytes().to_vec());
+    };
+    let mut ends = [0.0; 3];
+    // The three names go on the wire inside angle brackets, which nothing else
+    // in this family does and is what a real server sends.
+    for (slot, (raw, what)) in ends.iter_mut().zip([
+        (lon, &b"<lon>"[..]),
+        (lat, &b"<lat>"[..]),
+        (radius, &b"<radius>"[..]),
+    ]) {
+        let Some(value) = coord(raw) else {
+            return Err(line(BAD_ARGS, what, NOT_A_NUMBER));
+        };
+        *slot = value;
+    }
+    if geo::Unit::parse(unit).is_none() {
+        return Err(line(GEO_UNIT, unit, ""));
+    }
+    // A NaN goes through both of these, since it is neither outside the limits
+    // nor at or below zero, and then answers nothing because it is inside no
+    // circle. That is what a real server does with one.
+    if !ends[0].is_nan() && !ends[1].is_nan() && !geo::in_range(ends[0], ends[1]) {
+        return Err(line(SYNTAX, BAD_POINT.as_bytes(), ""));
+    }
+    if ends[2] <= 0.0 {
+        return Err(line(SYNTAX, BAD_RADIUS.as_bytes(), ""));
+    }
+    rows.circles.push(Circle {
+        field: field.into(),
+        lon: ends[0],
+        lat: ends[1],
+        radius: ends[2],
+        unit: unit.into(),
+    });
+    Ok(at + 6)
+}
+
+/// One of the three numbers a `GEOFILTER` is written with.
+///
+/// A NaN is read and an infinity is not, which is the other way round from
+/// every other number on this command and is measured: `GEOFILTER loc nan 0 1
+/// km` answers no rows and `GEOFILTER loc inf 0 1 km` is refused. Space in
+/// front is allowed and space behind is not, which is also measured.
+fn coord(raw: &[u8]) -> Option<f64> {
+    let text = core::str::from_utf8(raw).ok()?;
+    let value: f64 = text.trim_ascii_start().parse().ok()?;
+    (!value.is_infinite()).then_some(value)
 }
 
 /// Whether the schema holds this name as a number, which is the one field a
@@ -3194,7 +3285,7 @@ fn shape(node: Node, index: &Index, rows: &Rows<'_>) -> Node {
     }
     node.slop = rows.slop;
     node.inorder = rows.inorder || node.inorder;
-    if rows.filters.is_empty() {
+    if rows.filters.is_empty() && rows.circles.is_empty() {
         return node;
     }
     // A filter beside a bare `*` is the whole query, because asking for every
@@ -3214,6 +3305,9 @@ fn shape(node: Node, index: &Index, rows: &Rows<'_>) -> Node {
             min_open: false,
             max_open: false,
         })));
+    }
+    for circle in &rows.circles {
+        under.push(Node::new(What::Geo(circle.clone())));
     }
     Node::new(What::Intersect(under))
 }
@@ -3777,6 +3871,24 @@ mod tests {
         // Twelve significant digits and no more, which is what a `__score` and
         // every reduced number go on the wire as.
         assert_eq!(twelve(0.934_309_237_376_833_4), "0.934309237377");
+    }
+
+    #[test]
+    fn a_geofilter_reads_a_number_the_way_that_one_option_reads_one() {
+        assert_eq!(coord(b"0"), Some(0.0));
+        assert_eq!(coord(b"-0.1278"), Some(-0.1278));
+        assert_eq!(coord(b"1e2"), Some(100.0));
+        // Space in front is allowed and space behind is not.
+        assert_eq!(coord(b" 5"), Some(5.0));
+        assert_eq!(coord(b"5 "), None);
+        // A NaN is a number here and an infinity is not, which is the other way
+        // round from every other number the command takes.
+        assert!(coord(b"nan").is_some_and(f64::is_nan));
+        assert_eq!(coord(b"inf"), None);
+        assert_eq!(coord(b"-inf"), None);
+        assert_eq!(coord(b"1e400"), None);
+        assert_eq!(coord(b"x"), None);
+        assert_eq!(coord(b""), None);
     }
 
     #[test]

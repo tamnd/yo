@@ -31,6 +31,7 @@ use crate::query::explain::bit;
 use crate::query::{Circle, EVERY, Mask, Node, Pair, Range, Vector, What, Word, expansion};
 use crate::text;
 use crate::token::{bare, control, escapes, fold, wordy};
+use yo_common::geo;
 
 /// Why a query was refused.
 ///
@@ -83,6 +84,13 @@ pub enum Bad {
 
 /// The wording a real server uses for a geo filter in a unit it does not know.
 pub const BAD_UNIT: &str = "Invalid GeoFilter unit";
+
+/// The wording a real server uses for a geo filter centred somewhere that is
+/// not on the projection.
+pub const BAD_POINT: &str = "Invalid GeoFilter lat/lon";
+
+/// The wording a real server uses for a geo filter with no size to it.
+pub const BAD_RADIUS: &str = "Invalid GeoFilter radius";
 
 /// The units a geo filter may be written in.
 const UNITS: [&[u8]; 4] = [b"m", b"km", b"mi", b"ft"];
@@ -2387,7 +2395,10 @@ impl Parse<'_> {
         let mut ends = Vec::new();
         for (word, _, spot) in &items[..3] {
             let text = String::from_utf8_lossy(word).into_owned();
-            let Some(value) = number(&text) else {
+            // A NaN is not a number here, unlike in a numeric range where it is
+            // read and then matches nothing, so `[0 0 nan km]` is a syntax
+            // error about the word rather than a filter of no size.
+            let Some(value) = number(&text).filter(|value: &f64| !value.is_nan()) else {
                 return Err(self.not_a_number(items, *spot));
             };
             ends.push(value);
@@ -2402,6 +2413,16 @@ impl Parse<'_> {
                 return Err(Bad::Plain(BAD_UNIT));
             }
             self.unit = true;
+        }
+        // Both of these are checked before the field is, so a filter with a
+        // radius of zero on a field the schema has never heard of is an error
+        // about the radius. The order between them is measured as well:
+        // `[200 0 0 km]` complains about the point and not about the radius.
+        if !geo::in_range(ends[0], ends[1]) {
+            return Err(Bad::Plain(BAD_POINT));
+        }
+        if ends[2] <= 0.0 {
+            return Err(Bad::Plain(BAD_RADIUS));
         }
         if self.index.field(name).is_none() {
             return Ok(Node::empty());

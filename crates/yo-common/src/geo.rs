@@ -1,5 +1,11 @@
 //! The geospatial kernels, which are Redis's geohash arithmetic.
 //!
+//! This sits here rather than beside the geo commands because two very
+//! different callers need the same arithmetic. `GEOSEARCH` walks a sorted set
+//! with it and a `GEOFILTER` on a search index walks a numeric index with it,
+//! and the two only agree with each other about where a boundary falls if they
+//! share a single copy of the interleave, the haversine and the box cover.
+//!
 //! A geo key in Redis is not a type. It is a sorted set whose scores happen to
 //! be 52 bit interleaved geohashes, and every geo command is a sorted set
 //! command with some arithmetic in front of it. `ZSCORE` on a geo key answers
@@ -415,12 +421,20 @@ pub fn score(lon: f64, lat: f64) -> Option<u64> {
 
 /// The point a score decodes to, which is the middle of the box it names.
 ///
-/// A stored score is always 52 bits, so this never fails on anything that came
-/// out of [`score`]. It takes an `f64` because that is what the sorted set holds
-/// and a score that is not a whole number in range was not written by us.
+/// This never fails on anything that came out of [`score`]. It takes an `f64`
+/// because that is what the sorted set holds and a score that is not a whole
+/// number in range was not written by us.
+///
+/// A score is fifty two bits everywhere except at the two far edges. A point at
+/// longitude 180 exactly scales to bucket `1 << 26`, which is one past the
+/// twenty six bits the axis has, and the same happens at the top latitude, so
+/// those two scores carry a fifty third and a fifty fourth bit. Redis stores
+/// them like that and reads them back the same way, so the limit here is what a
+/// full score can reach and not what it usually is. Refusing them left `GEOPOS`
+/// answering nothing for a point on the date line.
 #[must_use]
 pub fn decode(raw: f64) -> Option<(f64, f64)> {
-    if !raw.is_finite() || raw < 0.0 || raw >= (1u64 << 52) as f64 {
+    if !raw.is_finite() || raw < 0.0 || raw >= (1u64 << 54) as f64 {
         return None;
     }
     let bits = raw as u64;
@@ -847,7 +861,20 @@ mod tests {
         assert_eq!(decode(0.0), None);
         assert_eq!(decode(f64::NAN), None);
         assert_eq!(decode(f64::INFINITY), None);
-        assert_eq!(decode((1u64 << 52) as f64), None);
+        assert_eq!(decode((1u64 << 54) as f64), None);
+        // Not this one though. A point on the top edge of an axis scales to one
+        // bucket past that axis, so the score carries a fifty third bit for
+        // longitude and a fifty fourth for latitude, and Redis reads both back.
+        // `ZADD k 4503599627370496 m` then `GEOPOS k m` answers the top of the
+        // projection rather than nothing.
+        assert_eq!(
+            decode((1u64 << 52) as f64),
+            Some((-179.999_997_317_790_99, LAT_MAX))
+        );
+        assert_eq!(
+            decode((1u64 << 53) as f64),
+            Some((LON_MAX, -85.051_127_512_639_43))
+        );
         // A score with a fraction in it is truncated rather than refused, the
         // same as Redis's cast does, so `ZADD k 1.5 m` then `GEOPOS k m` answers
         // the point score 1 names rather than an error.

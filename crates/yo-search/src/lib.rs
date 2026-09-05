@@ -43,7 +43,9 @@
 //! of them point into: which key a number was given to, what the client said it
 //! was worth, and how long it turned out to be. [`tags`] is the third index, the
 //! one a `TAG` field gets, where a value is matched whole rather than being
-//! broken into words.
+//! broken into words. [`geos`] is the fourth, and it is the numeric one again
+//! with a point folded into the number, so a circle is a handful of ranges out
+//! of it with the distance checked on whatever they turn up.
 //!
 //! [`score`] is what turns a walk over those lists into an ordered answer. All
 //! nine scorers a real server takes are there, measured against one rather than
@@ -85,11 +87,11 @@
 //! corpus, but nothing on the wire asks for them yet, so a client still cannot
 //! search.
 //!
-//! Three kinds of node are not walked. A phrase needs the places two terms were
-//! found at and the rules for how far apart they may be. A geo filter and a
-//! vector query need fields the document reader does not read yet, so there is
-//! nothing in the index for them to walk either way. All three answer nothing
-//! rather than answering wrongly.
+//! Two kinds of node are not walked. A phrase needs the places two terms were
+//! found at and the rules for how far apart they may be. A vector query needs a
+//! field the document reader does not read yet, so there is nothing in the
+//! index for it to walk either way. Both answer nothing rather than answering
+//! wrongly.
 //!
 //! `FILTER` is not parsed, so an index carrying one follows every key its
 //! prefixes cover.
@@ -110,6 +112,7 @@ pub mod expand;
 pub mod expr;
 pub mod field;
 pub mod follow;
+pub mod geos;
 pub mod held;
 pub mod index;
 pub mod nums;
