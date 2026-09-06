@@ -760,3 +760,10 @@ title = "cjson refuses a document nested deeper than two thousand whatever the l
 reason = "Both halves of the library are plain recursion in Rust, one frame per level, so the depth a document can reach is bounded by the thread stack rather than by the setting. The setting is honoured up to two thousand levels, which is twice the default limit of a thousand, and past that the answer is the same sentence the configured limit gives rather than a crash. The only script this is visible to is one that raised encode_max_depth or decode_max_depth above two thousand on purpose and then handed over a document deeper than that, which is not a shape any real payload has. Lifting it would mean writing both halves with an explicit stack, which costs every ordinary document a heap allocation and a slower inner loop to make a pathological one work."
 status = "permanent"
 spec = "12 section 7"
+
+[[divergence]]
+id = "D-107"
+title = "struct sizes are the sixty four bit ones on every build"
+reason = "The C library reads its sizes off the compiler, so l is a C long, T is a size_t and i with no number after it is a C int, and struct.size('l') is eight on a normal server and four on a thirty two bit one. This is a port rather than a wrapper, so the sizes here are the ones the C picks on the platform Redis is actually built and shipped for, which is little endian and sixty four bit, and they do not change with the machine this happens to be running on. On the platforms anyone runs a server on the two agree byte for byte. On a thirty two bit build they would not, and the answer here is the one that keeps a packed record readable by the same script on every machine in a cluster, which is what a script packing bytes wants in the first place. Byte order is not affected, since the format string says what it wants and the default is what the machine does."
+status = "permanent"
+spec = "12 section 7"

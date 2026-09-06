@@ -100,7 +100,7 @@ impl Config {
 }
 
 /// The name Lua would give a value, which is what a failure sentence names.
-fn typename(v: &Value) -> &'static str {
+pub(super) fn typename(v: &Value) -> &'static str {
     match v {
         Value::Nil => "nil",
         Value::Boolean(_) => "boolean",

@@ -4201,6 +4201,184 @@ mod tests {
     }
 
     #[test]
+    fn a_script_gets_the_struct_library_a_real_server_carries() {
+        let mut f = Fixture::new();
+        // Packing, where the sizes are the ones a sixty four bit build gives
+        // and the order is the machine's own unless the format says otherwise.
+        for (body, want) in [
+            ("#struct.pack('i4', 1)", ":4\r\n"),
+            ("#struct.pack('l', 1)", ":8\r\n"),
+            ("#struct.pack('d', 1)", ":8\r\n"),
+            ("#struct.pack('f', 1)", ":4\r\n"),
+            ("#struct.pack('s', 'abc')", ":4\r\n"),
+            ("#struct.pack('c3', 'abcdef')", ":3\r\n"),
+            ("#struct.pack('x')", ":1\r\n"),
+            ("string.byte(struct.pack('i4', 1), 1)", ":1\r\n"),
+            ("string.byte(struct.pack('>i4', 1), 4)", ":1\r\n"),
+            ("string.byte(struct.pack('<i4', 1), 1)", ":1\r\n"),
+            // Past eight bytes the C shifts an unsigned long off the end, so
+            // the rest of the bytes are zero and a negative is not carried.
+            ("string.byte(struct.pack('i16', -1), 9)", ":0\r\n"),
+            ("string.byte(struct.pack('i8', -1), 8)", ":255\r\n"),
+            // A count of zero on `c` writes the whole string, `s` adds the
+            // terminator, and `x` writes a zero byte nobody reads back.
+            ("#struct.pack('c0', 'abcd')", ":4\r\n"),
+            ("string.byte(struct.pack('s', 'a'), 2)", ":0\r\n"),
+            ("string.byte(struct.pack('bxb', 1, 2), 2)", ":0\r\n"),
+        ] {
+            let script = format!("return {body}");
+            assert_eq!(f.run(&[b"EVAL", script.as_bytes(), b"0"]), want, "{body}");
+        }
+        // Sizes, including the two the C is lenient about: an unknown letter
+        // and a bare digit are both nothing at all rather than a complaint.
+        for (body, want) in [
+            ("struct.size('i')", ":4\r\n"),
+            ("struct.size('l')", ":8\r\n"),
+            ("struct.size('T')", ":8\r\n"),
+            ("struct.size('h')", ":2\r\n"),
+            ("struct.size('c10')", ":10\r\n"),
+            ("struct.size('ic')", ":5\r\n"),
+            ("struct.size('!8ic')", ":5\r\n"),
+            ("struct.size('!4i')", ":4\r\n"),
+            // Nothing is padded until `!` turns alignment on, and then a
+            // double is pushed out to the next eight byte boundary.
+            ("struct.size('bd')", ":9\r\n"),
+            ("struct.size('!bd')", ":16\r\n"),
+            ("struct.size('A')", ":0\r\n"),
+            ("struct.size('7')", ":0\r\n"),
+        ] {
+            let script = format!("return {body}");
+            assert_eq!(f.run(&[b"EVAL", script.as_bytes(), b"0"]), want, "{body}");
+        }
+        // Unpacking, which hands back the values and then where it stopped, so
+        // the last number can be passed straight back in as the next offset.
+        for (body, want) in [
+            ("select('#', struct.unpack('i4', '\\1\\0\\0\\0'))", ":2\r\n"),
+            ("select(1, struct.unpack('i4', '\\1\\0\\0\\0'))", ":1\r\n"),
+            ("select(2, struct.unpack('i4', '\\1\\0\\0\\0'))", ":5\r\n"),
+            ("select(1, struct.unpack('i1', '\\255'))", ":-1\r\n"),
+            ("select(1, struct.unpack('I1', '\\255'))", ":255\r\n"),
+            (
+                "select(1, struct.unpack('i4', struct.pack('i4', -70000)))",
+                ":-70000\r\n",
+            ),
+            ("select(2, struct.unpack('i1', 'abc', 2))", ":3\r\n"),
+            // A `c0` takes its length from the value read just before it and
+            // swallows it, so one byte says how long the next three are and
+            // only the string and the position come back.
+            ("select('#', struct.unpack('bc0', '\\3abcd'))", ":2\r\n"),
+            ("select(2, struct.unpack('bc0', '\\3abcd'))", ":5\r\n"),
+        ] {
+            let script = format!("return {body}");
+            assert_eq!(f.run(&[b"EVAL", script.as_bytes(), b"0"]), want, "{body}");
+        }
+        for (body, want) in [
+            ("select(1, struct.unpack('bc0', '\\3abcd'))", "abc"),
+            ("select(1, struct.unpack('s', 'ab\\0cd'))", "ab"),
+            ("select(1, struct.unpack('c3', 'abcdef'))", "abc"),
+        ] {
+            let script = format!("return {body}");
+            assert_eq!(
+                f.run(&[b"EVAL", script.as_bytes(), b"0"]),
+                format!("${}\r\n{want}\r\n", want.len()),
+                "{body}",
+            );
+        }
+        // A failure names the argument the C names, which is not always the
+        // argument a reader would pick.
+        for (body, want) in [
+            (
+                "return struct.pack()",
+                "bad argument #1 to 'pack' (string expected, got no value)",
+            ),
+            // The C pushes a nil before it reads anything, so a missing value
+            // is a nil rather than nothing at all.
+            (
+                "return struct.pack('i4')",
+                "bad argument #2 to 'pack' (number expected, got nil)",
+            ),
+            // And it reads the string with a post increment before it checks
+            // the length, so the number here is one past the real argument.
+            (
+                "return struct.pack('c6', 'abc')",
+                "bad argument #3 to 'pack' (string too short)",
+            ),
+            (
+                "return struct.pack('A', 'x')",
+                "bad argument #1 to 'pack' (invalid format option 'A')",
+            ),
+            (
+                "return struct.pack('i33', 1)",
+                "integral size 33 is larger than limit of 32",
+            ),
+            (
+                "return struct.pack('!3i', 1)",
+                "alignment 3 is not a power of 2",
+            ),
+            (
+                "return struct.unpack()",
+                "bad argument #1 to 'unpack' (string expected, got no value)",
+            ),
+            (
+                "return struct.unpack('i4')",
+                "bad argument #2 to 'unpack' (string expected, got no value)",
+            ),
+            (
+                "return struct.unpack('i4', 'ab')",
+                "bad argument #2 to 'unpack' (data string too short)",
+            ),
+            (
+                "return struct.unpack('i1', 'abc', 0)",
+                "bad argument #3 to 'unpack' (offset must be 1 or greater)",
+            ),
+            (
+                "return struct.unpack('c0', 'abc')",
+                "format 'c0' needs a previous size",
+            ),
+            (
+                "return struct.unpack('s', 'abc')",
+                "unfinished string in data",
+            ),
+            (
+                "return struct.size()",
+                "bad argument #1 to 'size' (string expected, got no value)",
+            ),
+            (
+                "return struct.size('s')",
+                "bad argument #1 to 'size' (option 's' has no fixed size)",
+            ),
+            (
+                "return struct.size('c0')",
+                "bad argument #1 to 'size' (option 'c0' has no fixed size)",
+            ),
+        ] {
+            let reply = f.run(&[b"EVAL", body.as_bytes(), b"0"]);
+            assert!(
+                reply.starts_with(&format!("-ERR user_script:1: {want} script: ")),
+                "{body} gave {reply}",
+            );
+        }
+        // Three members and no version, which is all the C registers.
+        let names = "pack size unpack";
+        assert_eq!(
+            f.run(&[
+                b"EVAL",
+                b"local t = {} for k in pairs(struct) do t[#t+1] = k end \
+                  table.sort(t) return table.concat(t, ' ')",
+                b"0",
+            ]),
+            format!("${}\r\n{names}\r\n", names.len())
+        );
+        for body in [&b"struct.pack = 1"[..], b"rawset(struct, 'zz', 1)"] {
+            assert!(
+                f.run(&[b"EVAL", body, b"0"])
+                    .contains("Attempt to modify a readonly table script: "),
+                "{body:?}",
+            );
+        }
+    }
+
+    #[test]
     fn command_getkeys_reads_the_key_count_out_of_a_script_call() {
         let mut f = Fixture::new();
         assert_eq!(
