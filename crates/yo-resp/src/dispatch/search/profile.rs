@@ -170,11 +170,29 @@ fn shard(watch: &Watch, whole: Duration, limited: bool, out: &mut Out) {
 /// a list of one.
 fn tree(node: &Ran, spent: f64, limited: bool, out: &mut Out) {
     let named = node.term.is_some();
+    // A vector step is a leaf even when a clause narrowed it down first,
+    // because the clause hangs under it as a single child rather than as a
+    // list and because a vector clause with nothing in front of it says
+    // nothing about a child at all, where a union with nothing under it would
+    // still say it had none.
     let branch = !matches!(
         node.kind,
-        "TEXT" | "TAG" | "NUMERIC" | "GEO" | "WILDCARD" | "EMPTY"
+        "TEXT"
+            | "TAG"
+            | "NUMERIC"
+            | "GEO"
+            | "WILDCARD"
+            | "EMPTY"
+            | "VECTOR"
+            | "ID-LIST-SORTED"
+            | "METRIC SORTED BY ID - VECTOR DISTANCE"
     );
-    out.map(3 + usize::from(named) * 2 + usize::from(node.about.is_some()) + usize::from(branch));
+    out.map(
+        3 + usize::from(named) * 2
+            + usize::from(node.about.is_some())
+            + usize::from(node.mode.is_some())
+            + usize::from(branch || node.alone),
+    );
     out.simple(b"Type");
     out.simple(node.kind.as_bytes());
     if let Some(term) = &node.term {
@@ -200,12 +218,16 @@ fn tree(node: &Ran, spent: f64, limited: bool, out: &mut Out) {
         out.simple(b"Estimated number of matches");
         out.uint(u64::from(size));
     }
-    if !branch {
-        return;
+    if let Some(mode) = node.mode {
+        out.simple(b"Vector search mode");
+        out.simple(mode.as_bytes());
     }
     if node.alone {
         out.simple(b"Child iterator");
         tree(&node.under[0], 0.0, limited, out);
+        return;
+    }
+    if !branch {
         return;
     }
     out.simple(b"Child iterators");

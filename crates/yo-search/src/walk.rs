@@ -212,6 +212,10 @@ pub struct Ran {
     /// The guess an intersection sorts its branches on, which a profile reports
     /// for a leaf and leaves off a branch.
     pub size: Option<u32>,
+    /// Which of the four ways a vector clause can be answered this was, which
+    /// only a vector clause has and which a range with nothing to yield leaves
+    /// off as well.
+    pub mode: Option<&'static str>,
     /// What is under it.
     pub under: Vec<Ran>,
     /// Whether a profile writes the one thing under this as a single child
@@ -231,6 +235,7 @@ impl Ran {
             term: None,
             reads,
             size: None,
+            mode: None,
             under: Vec::new(),
             alone: false,
             folds: false,
@@ -459,14 +464,19 @@ fn build<'a>(held: &'a Held, node: &'a Node) -> Box<dyn Step<'a> + 'a> {
 /// alpha rather than the alpha ones among the five nearest overall.
 fn nearby<'a>(held: &'a Held, vector: &'a crate::query::Vector) -> Nearby<'a> {
     let Some(vecs) = held.vecs(&vector.field) else {
-        return Nearby::new(Vec::new(), held.docs.len() as u32);
+        return Nearby::new(Vec::new(), held.docs.len() as u32, vector, None);
     };
     let Some(asked) = &vector.asked else {
-        return Nearby::new(Vec::new(), held.docs.len() as u32);
+        return Nearby::new(Vec::new(), held.docs.len() as u32, vector, None);
     };
+    // The clause in front is profiled as well as walked, because a profile
+    // hangs it under the vector step as a single child rather than beside it.
+    let mut child = None;
     let over = vector.over.as_ref().map(|node| {
         let mut step = build(held, node);
-        drain(&mut step, false)
+        let hits = drain(&mut step, false);
+        child = Some(step.ran());
+        hits
     });
     let narrow = over
         .as_ref()
@@ -502,7 +512,7 @@ fn nearby<'a>(held: &'a Held, vector: &'a crate::query::Vector) -> Nearby<'a> {
         }
         None => near.into_iter().map(|id| (id, Found::filter())).collect(),
     };
-    Nearby::new(ids, guess)
+    Nearby::new(ids, guess, vector, child)
 }
 
 /// The documents a vector clause found, with what the clause in front of it
@@ -513,16 +523,43 @@ struct Nearby<'a> {
     reads: u64,
     gave: Option<Id>,
     guess: u32,
+    /// What a profile calls this step, which is not one word but three, and
+    /// which of the ways of answering a vector clause this was.
+    kind: &'static str,
+    mode: Option<&'static str>,
+    /// The clause in front of it, already profiled.
+    child: Option<Ran>,
 }
 
 impl<'a> Nearby<'a> {
-    fn new(ids: Vec<(Id, Found<'a>)>, guess: u32) -> Nearby<'a> {
+    fn new(
+        ids: Vec<(Id, Found<'a>)>,
+        guess: u32,
+        vector: &crate::query::Vector,
+        child: Option<Ran>,
+    ) -> Nearby<'a> {
+        // Measured against a real server on both index kinds. A nearest
+        // neighbour clause is a `VECTOR` step either way, and it says it ran
+        // the whole thing when nothing narrowed it down first and that it
+        // compared every document the clause in front answered when something
+        // did. A range clause is not a `VECTOR` step at all: with nothing to
+        // yield it is a plain list of numbers and says nothing about a mode,
+        // and with a distance to yield it names the distance in its own type.
+        let (kind, mode) = match (vector.k.is_some(), vector.alias.is_some()) {
+            (true, _) if child.is_some() => ("VECTOR", Some("HYBRID_ADHOC_BF")),
+            (true, _) => ("VECTOR", Some("STANDARD_KNN")),
+            (false, true) => ("METRIC SORTED BY ID - VECTOR DISTANCE", Some("RANGE_QUERY")),
+            (false, false) => ("ID-LIST-SORTED", None),
+        };
         Nearby {
             ids,
             at: 0,
             reads: 0,
             gave: None,
             guess,
+            kind,
+            mode,
+            child,
         }
     }
 }
@@ -551,7 +588,12 @@ impl<'a> Step<'a> for Nearby<'a> {
     }
 
     fn ran(&self) -> Ran {
-        Ran::leaf("VECTOR", self.reads)
+        Ran {
+            mode: self.mode,
+            alone: self.child.is_some(),
+            under: self.child.clone().into_iter().collect(),
+            ..Ran::leaf(self.kind, self.reads)
+        }
     }
 }
 

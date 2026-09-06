@@ -3561,6 +3561,12 @@ pub(super) fn searched(
 /// and only what the window kept is sorted, loaded and marked up.
 fn searching(rows: &Rows<'_>, total: usize, window: usize) -> Vec<(Vec<u8>, usize)> {
     let mut out = vec![(b"Index".to_vec(), total)];
+    // The step that works the distances out, which is there whenever the query
+    // yields one and is not there for a range clause nobody named. It sits
+    // directly behind the index because every row it touches came off the walk.
+    if !rows.distance.is_empty() {
+        out.push((b"Metrics Applier".to_vec(), total));
+    }
     // A window of nothing is a client asking for the total and nothing else, so
     // there is nothing to score and nothing to sort. Measured: `LIMIT 0 0`
     // answers an index step and a counter and no other step at all.
@@ -3694,6 +3700,9 @@ pub(super) fn aggregated(
                 watch.walking = spent;
             }
             watch.steps.push((b"Index".to_vec(), total));
+            if !asked.rows.distance.is_empty() {
+                watch.steps.push((b"Metrics Applier".to_vec(), total));
+            }
         }
         (total, rows)
     };
