@@ -52,10 +52,12 @@ const PLANLESS_GROUPS: &[&str] = &["connection", "scripting", "server"];
 /// server puts it in, and it names no key and reads none. It asks whether the
 /// sketch code works, which is a fact about the build rather than about a value,
 /// and the honest plan for it is `none` as well.
-/// The sixteen search commands that are about an index rather than a document
-/// are here for the same reason and are named one by one for the same reason.
-/// An index is not a key, none of the sixteen names one, and `COMMAND INFO`
-/// reports no key spec for any of them. The rest of the search group is a
+/// The search commands that are about an index rather than a document are here
+/// for the same reason and are named one by one for the same reason. An index is
+/// not a key, none of them names one, and `COMMAND INFO` reports no key spec for
+/// any of them. `_FT.DEBUG` is the furthest in of the lot, since it reads the
+/// structures an index built rather than the definition it was built from, and
+/// it still never reaches the keyspace to do it. The rest of the search group is a
 /// different matter: `FT.SEARCH` and `FT.AGGREGATE` read documents out of the
 /// keyspace and have a real plan to state, so widening the group here would let
 /// the commands the gate is for through without one.
@@ -91,6 +93,7 @@ const PLANLESS_COMMANDS: &[&str] = &[
     "FT.SPELLCHECK",
     "FT.CONFIG",
     "FT.PROFILE",
+    "_FT.DEBUG",
 ];
 /// The bound or materialise verdicts.
 const BOUNDED: &[&str] = &["inherent", "yes", "risk"];

@@ -679,3 +679,24 @@ title = "An index FILTER that names no field does not crash the server"
 reason = "FT.CREATE c PREFIX 1 c: FILTER 1==1 SCHEMA t TEXT is accepted by Redis 8.10.1 and then the first write under the prefix kills it. HSET c:1 t alpha segfaults, signal 11 at address 0xfffffffffffffff8 inside redisearch.so in rlookup::RLookup::load_rule_fields, and the container has to be recreated. Reproduced twice from a clean container. The cause is visible from the shape of the thing: the filter is evaluated over a row loaded from the key, the row is built out of the fields the expression names, an expression naming none leaves nothing to load and the loader walks off the end of it. Here the same create is accepted and the same write is filtered on a constant, so 1==1 indexes every key under the prefix and 0 indexes none, which is what the expression says. There is nothing to match on the other side because the other side is a crash rather than an answer, and copying it is not on the table."
 status = "permanent"
 spec = "09 section 2"
+
+[[divergence]]
+id = "D-95"
+title = "_FT.DEBUG answers without having to be turned on at startup"
+reason = "Redis refuses every _FT.DEBUG subcommand with `Debug commands are disabled, please follow the redis configuration guide to enable them` unless the server was started with enable-debug-command. That gate is on the container command rather than on any one subcommand, so a default install has the whole family and can use none of it, and the only way to turn it on is a restart. Here they always answer. Nothing in the eight that are implemented writes anything: they read the term dictionary, one posting list, one tag or numeric field, one row of the document table and the document number counter, and every one of them is a question the same client could answer more slowly with FT.SEARCH and FT.INFO. A debugging aid that needs a restart before it can be used is not there at the moment somebody needs it, which is the only moment it is worth having. A client that wants the gate can refuse the command itself; a client that has the gate cannot ask for the answer."
+status = "permanent"
+spec = "09 section 5"
+
+[[divergence]]
+id = "D-96"
+title = "DUMP_NUMIDX answers one range where a real server answers several"
+reason = "A real server keeps a numeric field as a tree of ranges and splits a range once it holds enough distinct values, so a dump of one comes back as a list of lists with one list per range: three hundred documents over three hundred values answer four ranges here of 134, 123, 35 and 8 documents, and the split points depend on the order the values arrived in as well as on the values. We keep one ordered list per field, so a dump answers exactly one list holding every document in the field, ascending and each once, and a field nobody has written to answers no lists at all rather than one empty one. The documents named are the same set on both sides, including the numbers that belong to documents which have since been deleted or rewritten, because neither server walks the list to take those out. The outer nesting is the whole of the difference and it is a report about the shape of the index rather than about its contents, which is why it is not worth building a range tree to match."
+status = "permanent"
+spec = "09 section 5"
+
+[[divergence]]
+id = "D-97"
+title = "_FT.DEBUG HELP names the eight subcommands that answer"
+reason = "HELP on Redis 8.10.1 answers sixty two names with no usage text against any of them, and most of them are about machinery this server does not have: a garbage collector that can be forced, a worker pool that can be counted, a topology updater that can be paused, an HNSW graph that can be dumped, a phonetic hash, a prefix trie and a suffix trie, a shard connection table, and eight names that are just the search commands again. Answering that list here would be a list of things to try that mostly do not work, and a client reading it to find out what it can ask would be worse off than one that asked and got told the subcommand is unknown. So HELP names the eight that are implemented, in the order a client is likely to want them, and every name it prints answers. The unknown subcommand line is byte for byte the one Redis writes, so a client that goes looking for a name from the real list finds out the same way it would there."
+status = "permanent"
+spec = "09 section 5"

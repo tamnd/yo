@@ -174,15 +174,16 @@ doc = "09 section 5"
 # Forty six is what COMMAND LIST FILTERBY ACLCAT search answers on a running
 # Redis 8.10, and it is the forty one FT names plus five that are not FT names
 # at all: _FT.CONFIG, _FT.DEBUG, search.CLUSTERINFO, search.CLUSTERREFRESH and
-# search.CLUSTERSET. Those five belong to the coordinator rather than to the
-# index and arrive with the cluster work, so the group cannot reach shipped
+# search.CLUSTERSET. Four of those five belong to the coordinator rather than to
+# the index and arrive with the cluster work, so the group cannot reach shipped
 # before that lands however many FT commands are done.
-# The eighteen listed here are the ones about the index itself: making one,
-# altering one, dropping one, reading one back, the alias family and the two
-# that print what a query parses into. None of them names a key, and the four
-# with an underscore in front are the forms the coordinator calls, which differ
-# from the plain ones only in what they do when the index is already there or
-# already gone.
+# The nineteen listed here are the ones about the index itself: making one,
+# altering one, dropping one, reading one back, the alias family, the two that
+# print what a query parses into and _FT.DEBUG, which reads the structures an
+# index built rather than the definition it was built from. None of them names a
+# key, and the four with an underscore in front are the forms the coordinator
+# calls, which differ from the plain ones only in what they do when the index is
+# already there or already gone.
 
 [[group]]
 name = "bloom"
@@ -3143,6 +3144,18 @@ status = "shipped"
 wire = "verified"
 divergent = "D-89"
 notes = "Sixty nine settings the search module keeps beside the indexes, and they are not keys and not part of the keyspace, so FLUSHALL leaves every one of them where it was while the dictionaries and the synonym groups beside them go. A name is matched whole and the case of it does not count, nothing globs, and the single word star is the only way to ask for all of them, so TIMEOUT* and TIME both answer nothing rather than an error. Words after the name are stepped over. SET checks in an order that shows: the name first, then whether the setting can move at all, then the value, and only after all three have passed does it notice there were extra words, which it answers with the status EXCESSARGS after the value has already been written. A number is read twice, strictly the way Redis reads an integer and then loosely the way C reads a double, so 0x10 is sixteen, 010 is ten rather than eight, 1e3 is a thousand and 1.5 is refused, and which reader found it changes the sentence a negative gets back. Twenty six of the settings cannot move at runtime and OSS_GLOBAL_PASSWORD always reads back as stars. MAXEXPANSIONS and MAXPREFIXEXPANSIONS are two names for one number and so are FORK_GC_CLEAN_NUMERIC_EMPTY_NODES and the underscored spelling of it, and the first of that pair takes no value at all."
+
+[[command]]
+name = "_FT.DEBUG"
+group = "search"
+since = "1.0.0"
+arity = -2
+plan = "none"
+bounded = "risk"
+status = "shipped"
+wire = "verified"
+divergent = "D-95, D-96, D-97"
+notes = "Eight of the sixty two subcommands a real server registers, and they are the eight that read a structure back: DUMP_TERMS, DUMP_INVIDX, DUMP_TAGIDX, DUMP_NUMIDX, DOCINFO, IDTODOCID, DOCIDTOID and GET_MAX_DOC_ID. Six error lines that carry no code word at all, so a client branching on the first word gets the module's own sentence: Can not create a search ctx for an index nobody made, Can not find the inverted index, Could not find given field in index spec for a field the schema does not have or has of the wrong kind, bad id given, document was removed and Document not found in index. Only the arity of a subcommand and an unknown subcommand come back under ERR. A field is named the way a query names it and not the way the schema reads it, so SCHEMA n AS num TAG is dumped as num and n is not a field. A GEO field answers DUMP_NUMIDX, because a point is a number underneath. DOCINFO takes REVEAL or OBFUSCATE after the key and looks the key up before it reads the keyword, and OBFUSCATE replaces every field name with the place it sits in the schema. It reports the document flags as a number and then the names, the score as a bulk string on RESP2 and a double on RESP3, and the sortable values only when the document actually wrote one. IDTODOCID reads its number the strict way Redis reads an integer, so a leading zero and a leading plus are both refused. A number that a document has since given up is still in every list it was in, so a dump answers numbers that IDTODOCID says were removed. DOCINFO is the one subcommand that does not count its arguments exactly: it reads the keyword at the place it belongs and steps over anything after it, so REVEAL more answers and more REVEAL does not, whatever the line about the last argument says. A real server hides the whole family behind enable-debug-command and this one does not, which is D-95. DUMP_NUMIDX answers one list where a range tree answers one per range, which is D-96, and HELP names the eight that answer rather than all sixty two, which is D-97."
 
 [[command]]
 name = "FT.ALIASADD"

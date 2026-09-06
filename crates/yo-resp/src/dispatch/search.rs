@@ -115,6 +115,7 @@ use crate::reply::Out;
 mod aggregate;
 mod config;
 pub(super) mod cursor;
+mod debug;
 pub(super) mod docs;
 mod hybrid;
 mod profile;
@@ -385,6 +386,12 @@ pub(super) fn execute<'a>(
     // in the `Fail` shape the rest of these share.
     if spec.name == "FT.CONFIG" {
         config::run(reg, args, out)?;
+        return Ok(None);
+    }
+    // The other one, which writes six error lines of its own on top of those
+    // two and answers about the structures rather than about the definition.
+    if spec.name == "_FT.DEBUG" {
+        debug::run(reg, args, out)?;
         return Ok(None);
     }
     // The keyspace work the caller has to do, which stays `None` for the twelve
