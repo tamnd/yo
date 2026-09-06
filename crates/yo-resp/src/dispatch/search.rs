@@ -111,6 +111,7 @@ use super::table::Spec;
 use crate::reply::Out;
 
 mod aggregate;
+mod config;
 pub(super) mod cursor;
 
 use aggregate::{Pipe, Reads, Shape, apply, group, keeps, piped, sorts, windows};
@@ -314,6 +315,13 @@ pub(super) fn execute<'a>(
     args: Args<'a>,
     out: &mut Out,
 ) -> Result<Option<Fill<'a>>> {
+    // The one command in the group that is a container of subcommands, so it
+    // writes its own arity and unknown subcommand lines rather than answering
+    // in the `Fail` shape the rest of these share.
+    if spec.name == "FT.CONFIG" {
+        config::run(reg, args, out)?;
+        return Ok(None);
+    }
     // The index the caller has to read the keys of, which stays `None` for the
     // sixteen commands that ask for nothing of the sort and for a create that
     // answered that the name is taken.

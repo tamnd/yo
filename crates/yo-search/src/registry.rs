@@ -1,5 +1,6 @@
 //! Every index on the server, and the names that point at them.
 
+use crate::config::Config;
 use crate::dict::Dicts;
 use crate::english::English;
 use crate::index::Index;
@@ -57,6 +58,12 @@ pub struct Registry {
     /// a second lock that would always be taken at the same moments this one
     /// is.
     pub dicts: Dicts,
+    /// The knobs `FT.CONFIG` turns.
+    ///
+    /// Beside the dictionaries for the same reason they are here, and unlike
+    /// them it lives through an emptied keyspace: a `TIMEOUT` written before
+    /// `FLUSHALL` still reads back after it, which is measured.
+    pub config: Config,
 }
 
 impl Registry {
@@ -260,7 +267,8 @@ impl Registry {
 
     /// Throws every index and alias away, which is what emptying the keyspace
     /// does to them. The dictionaries go with them, which is measured: a word
-    /// list added before `FLUSHALL` dumps empty after it.
+    /// list added before `FLUSHALL` dumps empty after it. The `FT.CONFIG`
+    /// settings stay, which is measured the same way and the other way round.
     pub fn clear(&mut self) {
         self.indexes.clear();
         self.aliases.clear();

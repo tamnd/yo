@@ -132,6 +132,7 @@
 
 #![deny(missing_docs)]
 
+pub mod config;
 pub mod dict;
 pub mod docs;
 pub mod english;

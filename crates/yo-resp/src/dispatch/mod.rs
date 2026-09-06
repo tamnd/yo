@@ -21639,6 +21639,495 @@ mod tests {
         }
     }
 
+    // --------------------------------------------------------------- config
+
+    /// The two shapes a dump comes back in, which are the one mix of simple
+    /// strings and bulk strings the group sends.
+    #[test]
+    fn a_setting_reads_back_as_a_pair_on_one_protocol_and_a_map_on_the_other() {
+        let mut f = Fixture::new();
+        assert_eq!(
+            f.run(&[b"FT.CONFIG", b"GET", b"TIMEOUT"]),
+            "*1\r\n*2\r\n+TIMEOUT\r\n$3\r\n500\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"FT.CONFIG", b"GET", b"EXTLOAD"]),
+            "*1\r\n*2\r\n+EXTLOAD\r\n$-1\r\n"
+        );
+        let mut g = Fixture::new();
+        g.run(&[b"HELLO", b"3"]);
+        assert_eq!(
+            g.run(&[b"FT.CONFIG", b"GET", b"TIMEOUT"]),
+            "%1\r\n+TIMEOUT\r\n$3\r\n500\r\n"
+        );
+        assert_eq!(
+            g.run(&[b"FT.CONFIG", b"GET", b"EXTLOAD"]),
+            "%1\r\n+EXTLOAD\r\n_\r\n"
+        );
+    }
+
+    /// The help text rides along in the middle of the same row, flat on RESP2
+    /// and as a map of its own on RESP3.
+    #[test]
+    fn a_help_row_carries_the_description_and_the_value_together() {
+        let mut f = Fixture::new();
+        assert_eq!(
+            f.run(&[b"FT.CONFIG", b"HELP", b"TIMEOUT"]),
+            "*1\r\n*5\r\n+TIMEOUT\r\n+Description\r\n+Query (search) timeout\r\n\
+             +Value\r\n$3\r\n500\r\n"
+        );
+        let mut g = Fixture::new();
+        g.run(&[b"HELLO", b"3"]);
+        assert_eq!(
+            g.run(&[b"FT.CONFIG", b"HELP", b"TIMEOUT"]),
+            "%1\r\n+TIMEOUT\r\n%2\r\n+Description\r\n+Query (search) timeout\r\n\
+             +Value\r\n$3\r\n500\r\n"
+        );
+    }
+
+    /// A name is matched whole, ignoring case, and the single word star is the
+    /// only thing that means all of them.
+    #[test]
+    fn only_a_bare_star_asks_for_every_setting_and_nothing_else_globs() {
+        let mut f = Fixture::new();
+        assert_eq!(
+            f.run(&[b"FT.CONFIG", b"GET", b"timeout"]),
+            "*1\r\n*2\r\n+TIMEOUT\r\n$3\r\n500\r\n"
+        );
+        for name in [
+            b"TIMEOUT*".as_slice(),
+            b"?IMEOUT",
+            b"*TIMEOUT*",
+            b"TIME",
+            b"NOSUCH",
+            b"",
+        ] {
+            assert_eq!(f.run(&[b"FT.CONFIG", b"GET", name]), "*0\r\n", "{name:?}");
+        }
+        assert!(f.run(&[b"FT.CONFIG", b"GET", b"*"]).starts_with("*69\r\n"));
+        assert!(f.run(&[b"FT.CONFIG", b"HELP", b"*"]).starts_with("*69\r\n"));
+    }
+
+    /// Words after the name are stepped over rather than refused, on both of
+    /// the two reads.
+    #[test]
+    fn a_read_ignores_whatever_follows_the_name() {
+        let mut f = Fixture::new();
+        assert_eq!(
+            f.run(&[b"FT.CONFIG", b"GET", b"timeout", b"extra", b"more"]),
+            "*1\r\n*2\r\n+TIMEOUT\r\n$3\r\n500\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"FT.CONFIG", b"HELP", b"timeout", b"extra"]),
+            "*1\r\n*5\r\n+TIMEOUT\r\n+Description\r\n+Query (search) timeout\r\n\
+             +Value\r\n$3\r\n500\r\n"
+        );
+    }
+
+    /// The container reports its own name and the subcommand it was given in
+    /// the two lines the dispatcher writes.
+    #[test]
+    fn a_missing_subcommand_and_a_missing_name_are_told_apart() {
+        let mut f = Fixture::new();
+        assert_eq!(
+            f.run(&[b"FT.CONFIG"]),
+            "-ERR wrong number of arguments for 'FT.CONFIG' command\r\n"
+        );
+        for sub in [b"GET".as_slice(), b"SET", b"HELP"] {
+            let want = format!(
+                "-ERR wrong number of arguments for 'FT.CONFIG|{}' command\r\n",
+                String::from_utf8_lossy(sub)
+            );
+            assert_eq!(f.run(&[b"FT.CONFIG", sub]), want);
+        }
+        assert_eq!(
+            f.run(&[b"ft.config", b"get"]),
+            "-ERR wrong number of arguments for 'FT.CONFIG|GET' command\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"FT.CONFIG", b"bogus"]),
+            "-ERR unknown subcommand 'bogus'. Try FT.CONFIG HELP.\r\n"
+        );
+    }
+
+    /// The name, then whether it can move, then the value, then the count of
+    /// words, and each of the first three answers before the next is looked at.
+    #[test]
+    fn a_write_checks_the_name_then_the_setting_then_the_value() {
+        let mut f = Fixture::new();
+        for tail in [vec![b"1".as_slice()], vec![], vec![b"1", b"2", b"3"]] {
+            let mut cmd: Vec<&[u8]> = vec![b"FT.CONFIG", b"SET", b"NOSUCH"];
+            cmd.extend(tail);
+            assert_eq!(f.run(&cmd), "-SEARCH_OPTION_INVALID Invalid option\r\n");
+        }
+        for tail in [vec![b"1000".as_slice()], vec![], vec![b"x", b"y"]] {
+            let mut cmd: Vec<&[u8]> = vec![b"FT.CONFIG", b"SET", b"MAXDOCTABLESIZE"];
+            cmd.extend(tail);
+            assert_eq!(
+                f.run(&cmd),
+                "-SEARCH_OPTION_BAD Not modifiable at runtime\r\n"
+            );
+        }
+        assert_eq!(
+            f.run(&[b"FT.CONFIG", b"SET", b"TIMEOUT", b"x", b"y", b"z"]),
+            "-SEARCH_PARSE_ARGS Could not convert argument to expected type\r\n"
+        );
+    }
+
+    /// Too many words is a status and not an error, and the value has already
+    /// been written by the time it goes out.
+    #[test]
+    fn an_excess_of_words_is_noticed_after_the_value_is_kept() {
+        let mut f = Fixture::new();
+        assert_eq!(
+            f.run(&[b"FT.CONFIG", b"SET", b"TIMEOUT", b"500"]),
+            "+OK\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"FT.CONFIG", b"SET", b"TIMEOUT", b"600", b"junk"]),
+            "+EXCESSARGS\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"FT.CONFIG", b"GET", b"TIMEOUT"]),
+            "*1\r\n*2\r\n+TIMEOUT\r\n$3\r\n600\r\n"
+        );
+    }
+
+    /// Strictly first and loosely second, so a hexadecimal and a leading zero
+    /// and an exponent all land and a fraction does not.
+    #[test]
+    fn a_number_is_read_the_strict_way_and_then_the_loose_one() {
+        let mut f = Fixture::new();
+        for (given, want) in [
+            (b"0x10".as_slice(), "16"),
+            (b"0X1f", "31"),
+            (b"+0x10", "16"),
+            (b"+5", "5"),
+            (b"010", "10"),
+            (b"08", "8"),
+            (b"0777", "777"),
+            (b"1e3", "1000"),
+            (b"0.0", "0"),
+            (b"-0.0", "0"),
+        ] {
+            assert_eq!(
+                f.run(&[b"FT.CONFIG", b"SET", b"TIMEOUT", given]),
+                "+OK\r\n",
+                "{given:?}"
+            );
+            let want = format!("*1\r\n*2\r\n+TIMEOUT\r\n${}\r\n{want}\r\n", want.len());
+            assert_eq!(
+                f.run(&[b"FT.CONFIG", b"GET", b"TIMEOUT"]),
+                want,
+                "{given:?}"
+            );
+        }
+        for given in [
+            b" 5".as_slice(),
+            b"5 ",
+            b"1.5",
+            b"1e-3",
+            b"x",
+            b"",
+            b"0b11",
+            b"0xg",
+            b"nan",
+            b"inf",
+            b"1e100",
+            b"99999999999999999999",
+        ] {
+            assert_eq!(
+                f.run(&[b"FT.CONFIG", b"SET", b"TIMEOUT", given]),
+                "-SEARCH_PARSE_ARGS Could not convert argument to expected type\r\n",
+                "{given:?}"
+            );
+        }
+    }
+
+    /// Which of the two readers found a negative decides what it is told, and
+    /// on a setting with no range at all neither of them is refused.
+    #[test]
+    fn a_negative_is_answered_by_whichever_reader_found_it() {
+        let mut f = Fixture::new();
+        for given in [b"-1".as_slice(), b"-16"] {
+            assert_eq!(
+                f.run(&[b"FT.CONFIG", b"SET", b"TIMEOUT", given]),
+                "-SEARCH_PARSE_ARGS Value is outside acceptable bounds\r\n",
+                "{given:?}"
+            );
+        }
+        for given in [b"-0x10".as_slice(), b"-1e3", b"-010", b"-2.0"] {
+            assert_eq!(
+                f.run(&[b"FT.CONFIG", b"SET", b"TIMEOUT", given]),
+                "-SEARCH_PARSE_ARGS Could not convert argument to expected type\r\n",
+                "{given:?}"
+            );
+        }
+        let unlimited = "*1\r\n*2\r\n+MAXSEARCHRESULTS\r\n$9\r\nunlimited\r\n";
+        for given in [b"-1".as_slice(), b"-0x10", b"-1e3", b"-010"] {
+            assert_eq!(
+                f.run(&[b"FT.CONFIG", b"SET", b"MAXSEARCHRESULTS", given]),
+                "+OK\r\n",
+                "{given:?}"
+            );
+            assert_eq!(
+                f.run(&[b"FT.CONFIG", b"GET", b"MAXSEARCHRESULTS"]),
+                unlimited,
+                "{given:?}"
+            );
+        }
+    }
+
+    /// The two settings with no range truncate into a signed thirty two bit
+    /// slot and say so once the number has gone under.
+    #[test]
+    fn a_wide_setting_wraps_into_its_slot_before_it_is_read_back() {
+        let mut f = Fixture::new();
+        for (given, want) in [
+            (b"2147483647".as_slice(), "2147483647"),
+            (b"2147483648", "unlimited"),
+            (b"4294967295", "unlimited"),
+            (b"9223372036854775806", "unlimited"),
+            (b"0", "0"),
+        ] {
+            assert_eq!(
+                f.run(&[b"FT.CONFIG", b"SET", b"MAXSEARCHRESULTS", given]),
+                "+OK\r\n",
+                "{given:?}"
+            );
+            let want = format!(
+                "*1\r\n*2\r\n+MAXSEARCHRESULTS\r\n${}\r\n{want}\r\n",
+                want.len()
+            );
+            assert_eq!(
+                f.run(&[b"FT.CONFIG", b"GET", b"MAXSEARCHRESULTS"]),
+                want,
+                "{given:?}"
+            );
+        }
+    }
+
+    /// A number past what a setting will take says which way it went, and the
+    /// ones with a softer roof of their own say what that roof is about.
+    #[test]
+    fn a_number_out_of_range_names_the_limit_it_crossed() {
+        let mut f = Fixture::new();
+        let bounds = "-SEARCH_PARSE_ARGS Value is outside acceptable bounds\r\n";
+        for (name, given) in [
+            (b"MINPREFIX".as_slice(), b"0".as_slice()),
+            (b"MAX_AGGREGATE_GROUPS", b"0"),
+            (b"BM25STD_TANH_FACTOR", b"0"),
+            (b"DEFAULT_DIALECT", b"0"),
+            (b"MINSTEMLEN", b"4294967296"),
+            (b"_BG_INDEX_OOM_PAUSE_TIME", b"4294967296"),
+            (b"INDEXER_YIELD_EVERY_OPS", b"4294967296"),
+            (b"CONNECT_TIMEOUT", b"2147483648"),
+        ] {
+            assert_eq!(
+                f.run(&[b"FT.CONFIG", b"SET", name, given]),
+                bounds,
+                "{name:?}"
+            );
+        }
+        for (name, given, want) in [
+            (
+                b"MINSTEMLEN".as_slice(),
+                b"1".as_slice(),
+                "-SEARCH_SYNTAX Minimum stem length cannot be lower than 2\r\n",
+            ),
+            (
+                b"MAX_AGGREGATE_GROUPS",
+                b"67108865",
+                "-SEARCH_LIMIT_OVER Value exceeds maximum possible aggregate groups\r\n",
+            ),
+            (
+                b"WORKERS",
+                b"17",
+                "-SEARCH_LIMIT_OVER Number of worker threads cannot exceed 16\r\n",
+            ),
+            (
+                b"_NUMERIC_RANGES_PARENTS",
+                b"3",
+                "-SEARCH_PARSE_ARGS Max depth for range cannot be higher than max \
+                 depth for balance\r\n",
+            ),
+            (
+                b"DEFAULT_DIALECT",
+                b"5",
+                "-SEARCH_VALUE_BAD Default dialect version cannot be higher than 4\r\n",
+            ),
+            (
+                b"_BG_INDEX_MEM_PCT_THR",
+                b"101",
+                "-SEARCH_LIMIT_OVER Memory limit for indexing cannot be greater then \
+                 100%\r\n",
+            ),
+            (
+                b"BM25STD_TANH_FACTOR",
+                b"10001",
+                "-SEARCH_LIMIT_OVER BM25STD_TANH_FACTOR must be between 1 and 10000 \
+                 inclusive\r\n",
+            ),
+            (
+                b"BG_INDEX_SLEEP_DURATION_US",
+                b"1000000",
+                "-SEARCH_LIMIT_OVER BG_INDEX_SLEEP_DURATION_US must be between 1 and \
+                 999999 (usleep POSIX limit)\r\n",
+            ),
+        ] {
+            assert_eq!(
+                f.run(&[b"FT.CONFIG", b"SET", name, given]),
+                want,
+                "{name:?}"
+            );
+        }
+    }
+
+    /// The two trimming delays are measured against each other, and the answer
+    /// names both settings and both numbers.
+    #[test]
+    fn the_trimming_delays_are_checked_against_one_another() {
+        let mut f = Fixture::new();
+        assert_eq!(
+            f.run(&[b"FT.CONFIG", b"SET", b"_MIN_TRIM_DELAY_MS", b"5000"]),
+            "-SEARCH_PARSE_ARGS _MIN_TRIM_DELAY_MS (5000) must be less than \
+             _MAX_TRIM_DELAY_MS (5000)\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"FT.CONFIG", b"SET", b"_MAX_TRIM_DELAY_MS", b"1999"]),
+            "-SEARCH_PARSE_ARGS _MAX_TRIM_DELAY_MS (1999) must be greater than \
+             _MIN_TRIM_DELAY_MS (2000)\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"FT.CONFIG", b"SET", b"_MIN_TRIM_DELAY_MS", b"4999"]),
+            "+OK\r\n"
+        );
+    }
+
+    /// Two of the word settings fold the spelling on the way in and the scorer
+    /// does not, which is the one place in the table case counts.
+    #[test]
+    fn a_word_setting_folds_where_a_real_server_folds_and_not_otherwise() {
+        let mut f = Fixture::new();
+        assert_eq!(
+            f.run(&[b"FT.CONFIG", b"SET", b"ON_TIMEOUT", b"RETURN"]),
+            "+OK\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"FT.CONFIG", b"GET", b"ON_TIMEOUT"]),
+            "*1\r\n*2\r\n+ON_TIMEOUT\r\n$6\r\nreturn\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"FT.CONFIG", b"SET", b"ON_TIMEOUT", b"nope"]),
+            "-SEARCH_VALUE_BAD Invalid ON_TIMEOUT value\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"FT.CONFIG", b"SET", b"ON_OOM", b"IGNORE"]),
+            "+OK\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"FT.CONFIG", b"GET", b"ON_OOM"]),
+            "*1\r\n*2\r\n+ON_OOM\r\n$6\r\nignore\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"FT.CONFIG", b"SET", b"ON_OOM", b"nope"]),
+            "-SEARCH_VALUE_BAD Invalid ON_OOM value\r\n"
+        );
+        let bad = "-SEARCH_VALUE_BAD Invalid default scorer value\r\n";
+        for given in [b"bm25std".as_slice(), b"Bm25", b"TFIDF.docnorm", b""] {
+            assert_eq!(
+                f.run(&[b"FT.CONFIG", b"SET", b"DEFAULT_SCORER", given]),
+                bad,
+                "{given:?}"
+            );
+        }
+        assert_eq!(
+            f.run(&[b"FT.CONFIG", b"SET", b"DEFAULT_SCORER", b"TFIDF.DOCNORM"]),
+            "+OK\r\n"
+        );
+    }
+
+    /// True and false, either case, and none of the other words a client might
+    /// reach for.
+    #[test]
+    fn a_yes_or_no_setting_takes_those_two_words_only() {
+        let mut f = Fixture::new();
+        assert_eq!(
+            f.run(&[b"FT.CONFIG", b"SET", b"_NUMERIC_COMPRESS", b"TRUE"]),
+            "+OK\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"FT.CONFIG", b"GET", b"_NUMERIC_COMPRESS"]),
+            "*1\r\n*2\r\n+_NUMERIC_COMPRESS\r\n$4\r\ntrue\r\n"
+        );
+        for given in [b"yes".as_slice(), b"no", b"1", b"0", b"enabled", b""] {
+            assert_eq!(
+                f.run(&[b"FT.CONFIG", b"SET", b"_NUMERIC_COMPRESS", given]),
+                "-SEARCH_PARSE_ARGS Could not convert argument to expected type\r\n",
+                "{given:?}"
+            );
+        }
+    }
+
+    /// Two pairs of names sit over one number each, and one of that second pair
+    /// takes no value at all.
+    #[test]
+    fn two_names_for_one_setting_move_together() {
+        let mut f = Fixture::new();
+        f.run(&[b"FT.CONFIG", b"SET", b"MAXEXPANSIONS", b"300"]);
+        assert_eq!(
+            f.run(&[b"FT.CONFIG", b"GET", b"MAXPREFIXEXPANSIONS"]),
+            "*1\r\n*2\r\n+MAXPREFIXEXPANSIONS\r\n$3\r\n300\r\n"
+        );
+        f.run(&[b"FT.CONFIG", b"SET", b"MAXPREFIXEXPANSIONS", b"200"]);
+        assert_eq!(
+            f.run(&[b"FT.CONFIG", b"GET", b"MAXEXPANSIONS"]),
+            "*1\r\n*2\r\n+MAXEXPANSIONS\r\n$3\r\n200\r\n"
+        );
+        let long = b"_FORK_GC_CLEAN_NUMERIC_EMPTY_NODES".as_slice();
+        let short = b"FORK_GC_CLEAN_NUMERIC_EMPTY_NODES".as_slice();
+        f.run(&[b"FT.CONFIG", b"SET", long, b"false"]);
+        assert_eq!(
+            f.run(&[b"FT.CONFIG", b"GET", short]),
+            "*1\r\n*2\r\n+FORK_GC_CLEAN_NUMERIC_EMPTY_NODES\r\n$5\r\nfalse\r\n"
+        );
+        assert_eq!(f.run(&[b"FT.CONFIG", b"SET", short]), "+OK\r\n");
+        assert_eq!(
+            f.run(&[b"FT.CONFIG", b"GET", long]),
+            "*1\r\n*2\r\n+_FORK_GC_CLEAN_NUMERIC_EMPTY_NODES\r\n$4\r\ntrue\r\n"
+        );
+    }
+
+    /// The one setting that takes a write and never gives it back.
+    #[test]
+    fn a_password_reads_back_as_stars_whatever_was_written() {
+        let mut f = Fixture::new();
+        assert_eq!(
+            f.run(&[b"FT.CONFIG", b"SET", b"OSS_GLOBAL_PASSWORD", b"hunter2"]),
+            "+OK\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"FT.CONFIG", b"GET", b"OSS_GLOBAL_PASSWORD"]),
+            "*1\r\n*2\r\n+OSS_GLOBAL_PASSWORD\r\n$17\r\nPassword: *******\r\n"
+        );
+    }
+
+    /// The settings are not in the keyspace, so unlike the dictionaries and the
+    /// synonym groups beside them they live through an emptied one.
+    #[test]
+    fn a_flush_leaves_the_settings_alone() {
+        for flush in [b"FLUSHALL".as_slice(), b"FLUSHDB"] {
+            let mut f = Fixture::new();
+            f.run(&[b"FT.CONFIG", b"SET", b"TIMEOUT", b"777"]);
+            f.run(&[flush]);
+            assert_eq!(
+                f.run(&[b"FT.CONFIG", b"GET", b"TIMEOUT"]),
+                "*1\r\n*2\r\n+TIMEOUT\r\n$3\r\n777\r\n",
+                "{flush:?}"
+            );
+        }
+    }
+
     // ------------------------------------------------------------- synonyms
 
     /// The terms are folded on the way in and the group ids are not, and one
