@@ -172,6 +172,10 @@ const AC_SEARCH_WRITE: &[&str] = &["@write", "@search"];
 /// `FT._LIST`, which the module puts in `@admin` because listing every index is
 /// a question about the server rather than about anything in it.
 const AC_SEARCH_LIST: &[&str] = &["@admin", "@slow", "@search"];
+/// `FT.CONFIG`, which is a question about the server rather than about an index
+/// and is the only search command the module leaves the `@slow` category off
+/// while still calling it admin.
+const AC_SEARCH_ADMIN: &[&str] = &["@admin", "@search"];
 /// `FT.TAGVALS`, the one search read the module bothers to put in `@read` as
 /// well, and the only one it calls dangerous without also calling it a write.
 /// Both are fair: the whole of a tag index goes into one reply and there is no
@@ -3242,6 +3246,19 @@ pub static COMMANDS: &[Spec] = &[
         group: "search",
     },
     Spec {
+        name: "FT.CONFIG",
+        arity: -2,
+        flags: SEARCH_READ,
+        first_key: 0,
+        last_key: 0,
+        step: 0,
+        acl: AC_SEARCH_ADMIN,
+        since: "1.0.0",
+        complexity: "O(1)",
+        summary: "Read, write or describe the search module's settings.",
+        group: "search",
+    },
+    Spec {
         name: "FT.ALIASADD",
         arity: 3,
         flags: SEARCH_WRITE_OOM,
@@ -5863,7 +5880,19 @@ const FREE: u16 = u16::MAX;
 /// against a floor of twelve. That is the best either number has ever been here
 /// while carrying the most names it has ever carried. The old multiplier was
 /// `0x2f0cc21a638ae49d` and it served for one search.
-const MIX: u64 = 0x5525_1c10_f29d_4c29;
+///
+/// `FT.CONFIG` then took the table to 392 names and put the worst probe back to
+/// three slots on its own. It does not collide on the key with anything, so the
+/// floor is still twelve and this was a slot run and not a key problem, which
+/// meant a seventeenth multiplier search rather than another key. Eight hundred
+/// million multipliers over two independent seeds both bottomed out at one slot
+/// and twenty one extra probes and neither ever went below it, so twenty one
+/// looks like where this key and this table actually sit with 392 names in
+/// them. Three more probes than the last search spent over one more name is the
+/// ordinary cost of a name, and every command is still within one slot, which
+/// is the number a lookup feels. The old multiplier was `0x55251c10f29d4c29`
+/// and it served for one search as well.
+const MIX: u64 = 0xda8b_d262_ac59_8c57;
 
 /// The four bytes the index is computed from: the length, the first two bytes,
 /// and the last byte with the second to last and the middle folded into it, all
@@ -6222,7 +6251,7 @@ mod tests {
             "the multiplier stopped keeping every command close"
         );
         assert!(
-            total <= 22,
+            total <= 21,
             "{total} extra slots walked over the whole table"
         );
     }

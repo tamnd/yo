@@ -3133,6 +3133,18 @@ divergent = "D-59"
 notes = "Every index name, as simple strings, and a set rather than an array on RESP3. The order is creation order here and hash order there, which is D-52: a real server walks its own dictionary and the order it gives back is stable for a given set of names and means nothing, so a client that sorts is right on both and a client that does not is reading an accident either way."
 
 [[command]]
+name = "FT.CONFIG"
+group = "search"
+since = "1.0.0"
+arity = -2
+plan = "none"
+bounded = "yes"
+status = "shipped"
+wire = "verified"
+divergent = "D-89"
+notes = "Sixty nine settings the search module keeps beside the indexes, and they are not keys and not part of the keyspace, so FLUSHALL leaves every one of them where it was while the dictionaries and the synonym groups beside them go. A name is matched whole and the case of it does not count, nothing globs, and the single word star is the only way to ask for all of them, so TIMEOUT* and TIME both answer nothing rather than an error. Words after the name are stepped over. SET checks in an order that shows: the name first, then whether the setting can move at all, then the value, and only after all three have passed does it notice there were extra words, which it answers with the status EXCESSARGS after the value has already been written. A number is read twice, strictly the way Redis reads an integer and then loosely the way C reads a double, so 0x10 is sixteen, 010 is ten rather than eight, 1e3 is a thousand and 1.5 is refused, and which reader found it changes the sentence a negative gets back. Twenty six of the settings cannot move at runtime and OSS_GLOBAL_PASSWORD always reads back as stars. MAXEXPANSIONS and MAXPREFIXEXPANSIONS are two names for one number and so are FORK_GC_CLEAN_NUMERIC_EMPTY_NODES and the underscored spelling of it, and the first of that pair takes no value at all."
+
+[[command]]
 name = "FT.ALIASADD"
 group = "search"
 since = "1.0.0"
