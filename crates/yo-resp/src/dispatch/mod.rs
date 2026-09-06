@@ -4019,6 +4019,188 @@ mod tests {
     }
 
     #[test]
+    fn a_script_gets_the_cjson_library_a_real_server_carries() {
+        let mut f = Fixture::new();
+        // Encoding, including the three shapes nobody guesses right: an empty
+        // table is an object, a number is fourteen significant digits, and a
+        // hole in an array is a null rather than a shorter array.
+        for (body, want) in [
+            ("cjson.encode(nil)", "null"),
+            ("cjson.encode(true)", "true"),
+            ("cjson.encode(cjson.null)", "null"),
+            ("cjson.encode(100)", "100"),
+            ("cjson.encode(1/3)", "0.33333333333333"),
+            ("cjson.encode(1e300)", "1e+300"),
+            ("cjson.encode(2^53)", "9.007199254741e+15"),
+            ("cjson.encode({})", "{}"),
+            ("cjson.encode({1,2,3})", "[1,2,3]"),
+            ("cjson.encode({a=1})", "{\"a\":1}"),
+            ("cjson.encode({[1]=1,[3]=3})", "[1,null,3]"),
+            ("cjson.encode({[0]=1})", "{\"0\":1}"),
+            ("cjson.encode('a\\nb')", "\"a\\nb\""),
+            // A tab and a backslash have short escapes, a vertical tab does not.
+            ("cjson.encode('\\t\\\\')", "\"\\t\\\\\""),
+            ("cjson.encode('\\11')", "\"\\u000b\""),
+            // Reading and writing again is the shortest way to say the decoder
+            // built what the encoder expected.
+            (
+                "cjson.encode(cjson.decode('[1,[2,{\"a\":null}]]'))",
+                "[1,[2,{\"a\":null}]]",
+            ),
+            // An empty array comes back as an object, because a table with
+            // nothing in it has nothing to say about which it was.
+            ("cjson.encode(cjson.decode('[]'))", "{}"),
+        ] {
+            let script = format!("return {body}");
+            assert_eq!(
+                f.run(&[b"EVAL", script.as_bytes(), b"0"]),
+                format!("${}\r\n{want}\r\n", want.len()),
+                "{body}",
+            );
+        }
+        // Decoding, where the leniency about numbers is on by default and a
+        // null is a value of its own rather than a missing key.
+        for (body, want) in [
+            ("cjson.decode('[1,2,3]')[2]", ":2\r\n"),
+            ("cjson.decode('{\"a\":41}').a + 1", ":42\r\n"),
+            ("cjson.decode('0x10')", ":16\r\n"),
+            ("cjson.decode('+1')", ":1\r\n"),
+            ("cjson.decode('01')", ":1\r\n"),
+            ("cjson.decode(1) + 1", ":2\r\n"),
+            // A long bracket, because Lua 5.1 would eat the backslash first.
+            ("cjson.decode([[\"\\u0041\"]]) == 'A' and 1 or 0", ":1\r\n"),
+            ("cjson.decode('null') == cjson.null and 1 or 0", ":1\r\n"),
+            ("cjson.decode('null') == nil and 1 or 0", ":0\r\n"),
+        ] {
+            let script = format!("return {body}");
+            assert_eq!(f.run(&[b"EVAL", script.as_bytes(), b"0"]), want, "{body}");
+        }
+        // The settings, each of which answers with what it now holds.
+        for (body, want) in [
+            (
+                "cjson.encode_number_precision(3) return cjson.encode(1/3)",
+                "0.333",
+            ),
+            (
+                "cjson.encode_invalid_numbers('null') return cjson.encode(1/0)",
+                "null",
+            ),
+            (
+                "cjson.encode_invalid_numbers(true) return cjson.encode(1/0)",
+                "inf",
+            ),
+            (
+                "cjson.encode_sparse_array(true) return cjson.encode({[1]=1,[100]=1})",
+                "{\"1\":1,\"100\":1}",
+            ),
+            (
+                "cjson.decode_array_with_array_mt(true) return cjson.encode(cjson.decode('[]'))",
+                "[]",
+            ),
+            ("return tostring(cjson.encode_max_depth())", "1000"),
+            ("return tostring(cjson.encode_keep_buffer(false))", "false"),
+            ("return tostring(cjson.encode_sparse_array())", "false"),
+            // A setting one script changed is not a setting the next one sees,
+            // which is D-105.
+            ("return tostring(cjson.encode_number_precision())", "14"),
+        ] {
+            assert_eq!(
+                f.run(&[b"EVAL", body.as_bytes(), b"0"]),
+                format!("${}\r\n{want}\r\n", want.len()),
+                "{body}",
+            );
+        }
+        // A failure names what stopped it and, when it was the text, where.
+        for (body, want) in [
+            (
+                "return cjson.encode(1/0)",
+                "Cannot serialise number: must not be NaN or Inf",
+            ),
+            (
+                "return cjson.encode({[1]=1,[100]=1})",
+                "Cannot serialise table: excessively sparse array",
+            ),
+            (
+                "return cjson.encode({[true]=1})",
+                "Cannot serialise boolean: table key must be a number or string",
+            ),
+            (
+                "return cjson.encode(tostring)",
+                "Cannot serialise function: type not supported",
+            ),
+            (
+                "return cjson.encode()",
+                "bad argument #1 to 'encode' (expected 1 argument)",
+            ),
+            (
+                "return cjson.decode('[1,2')",
+                "Expected comma or array end but found T_END at character 5",
+            ),
+            (
+                "return cjson.decode('{\"a\" 1}')",
+                "Expected colon but found T_NUMBER at character 6",
+            ),
+            (
+                "return cjson.decode('tru')",
+                "Expected value but found invalid token at character 1",
+            ),
+            (
+                "return cjson.decode('[1] 2')",
+                "Expected the end but found T_NUMBER at character 5",
+            ),
+            (
+                "return cjson.encode_max_depth(0)",
+                "bad argument #1 to 'encode_max_depth' (expected integer between 1 and 2147483647)",
+            ),
+            (
+                "return cjson.encode_invalid_numbers('yes')",
+                "bad argument #1 to 'encode_invalid_numbers' (invalid option 'yes')",
+            ),
+            (
+                "return cjson.encode_max_depth(1, 2)",
+                "bad argument #2 to 'encode_max_depth' (found too many arguments)",
+            ),
+        ] {
+            let reply = f.run(&[b"EVAL", body.as_bytes(), b"0"]);
+            assert!(
+                reply.starts_with(&format!("-ERR user_script:1: {want} script: ")),
+                "{body} gave {reply}",
+            );
+        }
+        // A module of its own, with settings of its own and no guard on it,
+        // which is what a real server hands back.
+        assert_eq!(
+            f.run(&[
+                b"EVAL",
+                b"local n = cjson.new() n.encode_number_precision(3) \
+                  return cjson.encode(1/3) .. ' ' .. n.encode(1/3)",
+                b"0",
+            ]),
+            "$22\r\n0.33333333333333 0.333\r\n"
+        );
+        // The table is readable and not writable, the same as `redis`.
+        let names = "_NAME _VERSION decode decode_array_with_array_mt decode_invalid_numbers \
+                     decode_max_depth encode encode_invalid_numbers encode_keep_buffer \
+                     encode_max_depth encode_number_precision encode_sparse_array new null";
+        assert_eq!(
+            f.run(&[
+                b"EVAL",
+                b"local t = {} for k in pairs(cjson) do t[#t+1] = k end \
+                  table.sort(t) return table.concat(t, ' ')",
+                b"0",
+            ]),
+            format!("${}\r\n{names}\r\n", names.len())
+        );
+        for body in [&b"cjson.encode = 1"[..], b"rawset(cjson, 'zz', 1)"] {
+            assert!(
+                f.run(&[b"EVAL", body, b"0"])
+                    .contains("Attempt to modify a readonly table script: "),
+                "{body:?}",
+            );
+        }
+    }
+
+    #[test]
     fn command_getkeys_reads_the_key_count_out_of_a_script_call() {
         let mut f = Fixture::new();
         assert_eq!(

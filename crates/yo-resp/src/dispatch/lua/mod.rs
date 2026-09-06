@@ -54,6 +54,7 @@
 
 mod api;
 mod bit;
+mod cjson;
 mod convert;
 mod sha1;
 
@@ -337,23 +338,25 @@ fn interpreter() -> mlua::Result<Lua> {
         )
     };
     lua.globals().raw_set("redis", api::table(&lua)?)?;
-    // The prelude hands back four things. `run` is the function every script is
-    // put through. `raw` is the private table its wrappers reach us through,
-    // and it is the reason any of this works: it is a local of the prelude
-    // chunk, so it is reachable from the wrappers and from the registry and
-    // from nowhere a script can get to. `lib` is the real `redis` table, which
-    // by then is behind a proxy. `written` holds the library functions that go
-    // out through a C function of ours rather than straight onto `lib`.
-    let boot: Table = lua.load(PRELUDE).set_name("@lua_prelude").call(())?;
+    // The prelude is handed the two things it cannot write for itself. One is
+    // the C function that goes in front of every library function so that a
+    // failure on a tail call still knows which line of the script it was on.
+    // The other is the light userdata a JSON null decodes to.
+    //
+    // It hands back two things. `run` is the function every script is put
+    // through. `raw` is the private table its wrappers reach us through, and it
+    // is the reason any of this works: it is a local of the prelude chunk, so
+    // it is reachable from the wrappers and from the registry and from nowhere
+    // a script can get to. Rust fills it in after the chunk has run, which is
+    // fine because nothing in there reads it until a script calls something.
+    let boot: Table = lua
+        .load(PRELUDE)
+        .set_name("@lua_prelude")
+        .call((api::bridge(&lua)?, cjson::null()))?;
     let raw: Table = boot.raw_get("raw")?;
     api::statics(&lua, &raw)?;
     bit::statics(&lua, &raw)?;
-    let lib: Table = boot.raw_get("lib")?;
-    let written: Table = boot.raw_get("written")?;
-    api::bridges(&lua, &lib, &written)?;
-    let bitlib: Table = boot.raw_get("bitlib")?;
-    let written_bit: Table = boot.raw_get("written_bit")?;
-    api::bit_bridges(&lua, &bitlib, &written_bit)?;
+    cjson::statics(&lua, &raw)?;
     lua.set_named_registry_value("yo_run", boot.raw_get::<mlua::Function>("run")?)?;
     lua.set_named_registry_value("yo_raw", raw)?;
     Ok(lua)
@@ -380,6 +383,13 @@ fn interpreter() -> mlua::Result<Lua> {
 /// not by the raise, which is why `redis.sha1hex()` reports the script's line
 /// and not a line in here.
 const PRELUDE: &str = r#"
+-- Two things Rust hands in because neither can be written in Lua. `bridge` is
+-- the C function that goes in front of a library function, and the comment on
+-- `bridge` in `api.rs` says what it is for. `null` is the light userdata a JSON
+-- null decodes to, which has to come from Rust because Lua has no way to make
+-- one.
+local bridge, null = ...
+
 -- Held here so that taking them off the global table does not take them away
 -- from the sandbox itself.
 local dbg = debug
@@ -389,15 +399,11 @@ local setmetatable, rawset, select, next = setmetatable, rawset, select, next
 local getmetatable, setfenv, ipairs = getmetatable, setfenv, ipairs
 local rawloadstring, rawload = loadstring, load
 local sub, find, concat = string.sub, string.find, table.concat
+local floor = math.floor
 
 -- Where the functions Rust hands over live. A local of this chunk and an
 -- upvalue of everything below, so a script cannot reach it and Rust can.
 local raw = {}
-
--- The library functions that go out through a C function of ours rather than
--- straight onto the table. Every one of them can fail, and that is the whole
--- reason for the detour: see the comment on `bridges` in `api.rs`.
-local written = {}
 
 -- The real `redis` table, with the constants Rust has already put on it. A
 -- script never gets a reference to this one.
@@ -448,35 +454,35 @@ local proxy = shield('redis', lib)
 -- an `err` field when the command failed. `redis.call` is the same call with
 -- that turned back into a failure, which is the only difference between them.
 lib.pcall = function(...) return raw.pcall(...) end
-written.call = function(...)
+lib.call = bridge(function(...)
   local reply = raw.pcall(...)
   if type(reply) == 'table' and reply.err ~= nil then
     error(reply)
   end
   return reply
-end
+end)
 
 -- The digest of one value. Anything that is not a string or a number hashes as
 -- nothing at all, so `redis.sha1hex({})` is the digest of the empty string, and
 -- that is a real server's answer and not a shortcut taken here.
-written.sha1hex = function(...)
+lib.sha1hex = bridge(function(...)
   if select('#', ...) ~= 1 then error('wrong number of arguments', 0) end
   return raw.sha1hex((select(1, ...)))
-end
+end)
 
 -- Which protocol the replies a script reads are written in. It moves what the
 -- script sees and not what the client is answered in, so a script can read a
 -- map as a map while still replying to a RESP2 client.
-written.setresp = function(...)
+lib.setresp = bridge(function(...)
   if select('#', ...) ~= 1 then error('redis.setresp() requires one argument.', 0) end
   local version = select(1, ...)
   if version ~= 2 and version ~= 3 then error('RESP version must be 2 or 3.', 0) end
   raw.setresp(version == 3)
-end
+end)
 
 -- A line in the server's log. Everything after the level is joined with spaces,
 -- which is why `redis.log(redis.LOG_WARNING, 'k', key)` reads the way it does.
-written.log = function(...)
+lib.log = bridge(function(...)
   local n = select('#', ...)
   if n < 2 then error('redis.log() requires two arguments or more.', 0) end
   local level = select(1, ...)
@@ -484,13 +490,13 @@ written.log = function(...)
   local parts = {}
   for i = 2, n do parts[i - 1] = tostring((select(i, ...))) end
   raw.log(level, concat(parts, ' '))
-end
+end)
 
 -- Which of a script's effects reach the replica and the log. Accepted and then
 -- ignored, because every effect this server produces goes to both. Kept because
 -- a script that narrows replication and then widens it again would otherwise
 -- fail on the first call, and registered as D-99.
-written.set_repl = function(...)
+lib.set_repl = bridge(function(...)
   if select('#', ...) ~= 1 then error('redis.set_repl() requires one argument.', 0) end
   -- A value that is not a number counts as zero rather than as a mistake, which
   -- is why `redis.set_repl('x')` is accepted and `redis.set_repl(9)` is not.
@@ -498,13 +504,13 @@ written.set_repl = function(...)
   if flags < 0 or flags > 3 then
     error('Invalid replication flags. Use REPL_AOF, REPL_REPLICA, REPL_ALL or REPL_NONE.', 0)
   end
-end
+end)
 
 -- Whether the connection may run a command. There are no users here yet, so the
 -- only thing this can answer is whether the command exists and whether it was
 -- handed the right number of arguments, and it says yes to everything that gets
 -- past those two. Registered as D-100.
-written.acl_check_cmd = function(...)
+lib.acl_check_cmd = bridge(function(...)
   local n = select('#', ...)
   if n < 1 then
     error('Please specify at least one argument for this redis lib call', 0)
@@ -519,7 +525,7 @@ written.acl_check_cmd = function(...)
     error('Wrong number of args for redis.acl_check_cmd()', 0)
   end
   return true
-end
+end)
 
 -- The two that build a reply rather than sending one. Neither raises, even on
 -- arguments that make no sense: a bad call answers a table with its own
@@ -573,13 +579,28 @@ lib.debug = function() return false end
 -- script's own line, which is what a level of three works out to from inside a
 -- helper called by a wrapper called by the script.
 local bitlib = {}
-local written_bit = {}
 
--- What a bad argument reads like. The name is the one the call site used rather
--- than the one the function was defined under, which is why
--- `pcall(bit.band, 'x')` complains about a function called `?`, and the level is
--- the script's own frame counted through the wrapper and the C function in
--- front of it.
+-- What a bad argument reads like, for every library that raises one.
+--
+-- The name is the one the call site used rather than the one the function was
+-- defined under, which is why `pcall(bit.band, 'x')` complains about a function
+-- called `?`. `up` is how many frames stand between here and the wrapper the
+-- script called: one when a wrapper raises this itself, two when it goes through
+-- a helper of its own. Everything above that is the C function the bridge put in
+-- front and then the script, which is the frame a client wants named.
+local function argue(up, i, why)
+  local at = dbg.getinfo(up + 2, 'n')
+  local name = (at and at.name) or '?'
+  error("bad argument #" .. i .. " to '" .. name .. "' (" .. why .. ")", up + 3)
+end
+
+-- A library failure that is not about an argument, raised from the wrapper
+-- itself so that the script's own line goes in front of it.
+local function fault(why)
+  error(why, 4)
+end
+
+-- One argument as the word the arithmetic works on.
 local function word(i, n, value)
   local why
   if i > n then
@@ -589,9 +610,7 @@ local function word(i, n, value)
     if x ~= nil then return x end
     why = type(value)
   end
-  local at = dbg.getinfo(3, 'n')
-  local name = (at and at.name) or '?'
-  error("bad argument #" .. i .. " to '" .. name .. "' (number expected, got " .. why .. ")", 4)
+  argue(2, i, 'number expected, got ' .. why)
 end
 
 -- The three that take as many arguments as a script cares to hand them. The
@@ -599,22 +618,22 @@ end
 -- are folded into it one pair at a time.
 for _, name in ipairs({'band', 'bor', 'bxor'}) do
   local key = 'bit_' .. name
-  written_bit[name] = function(...)
+  bitlib[name] = bridge(function(...)
     local n = select('#', ...)
     local acc = raw.bit_tobit(word(1, n, (select(1, ...))))
     for i = 2, n do
       acc = raw[key](acc, word(i, n, (select(i, ...))))
     end
     return acc
-  end
+  end)
 end
 
 -- The three that take one value and nothing else.
 for _, name in ipairs({'tobit', 'bnot', 'bswap'}) do
   local key = 'bit_' .. name
-  written_bit[name] = function(...)
+  bitlib[name] = bridge(function(...)
     return raw[key](word(1, select('#', ...), (select(1, ...))))
-  end
+  end)
 end
 
 -- The five that take a value and a count. Only the low five bits of the count
@@ -622,25 +641,208 @@ end
 -- nothing and `bit.lshift(1, 33)` is two.
 for _, name in ipairs({'lshift', 'rshift', 'arshift', 'rol', 'ror'}) do
   local key = 'bit_' .. name
-  written_bit[name] = function(...)
+  bitlib[name] = bridge(function(...)
     local n = select('#', ...)
     local x = word(1, n, (select(1, ...)))
     return raw[key](x, word(2, n, (select(2, ...))))
-  end
+  end)
 end
 
 -- The one with a default. Eight digits unless a count says otherwise, and a
 -- negative count asks for upper case rather than for a different number of
 -- them.
-written_bit.tohex = function(...)
+bitlib.tohex = bridge(function(...)
   local n = select('#', ...)
   local x = word(1, n, (select(1, ...)))
   local digits = 8
   if n > 1 then digits = word(2, n, (select(2, ...))) end
   return raw.bit_tohex(x, digits)
-end
+end)
 
 shield('bit', bitlib)
+
+-- The `cjson` library, which is Mark Pulford's and is the one a real script
+-- reaches for more than any other, because a Redis value is a byte string and
+-- JSON is how anything with a shape gets into one.
+--
+-- The encoding and the decoding are in Rust and the settings and the checking
+-- are here. What the settings are worth is deliberately plain numbers rather
+-- than booleans, because that is what the C holds and because
+-- `encode_invalid_numbers` has three states rather than two.
+local cjson_defaults = {
+  encode_sparse_convert = 0,
+  encode_sparse_ratio = 2,
+  encode_sparse_safe = 10,
+  encode_max_depth = 1000,
+  decode_max_depth = 1000,
+  encode_invalid_numbers = 0,
+  decode_invalid_numbers = 1,
+  encode_keep_buffer = 1,
+  encode_number_precision = 14,
+  decode_array_with_array_mt = 0,
+}
+
+-- The largest number a setting will take, which is a C `int` and not anything
+-- Lua would have picked.
+local cjson_max = 2147483647
+local cjson_flags = {'off', 'on'}
+
+-- A whole module table, its own settings and all. This is `cjson.new`, and it
+-- is also how the one a script finds under the name is built, because on a real
+-- server they are the same function.
+local function cjson_new()
+  local cfg = {}
+  for name, value in next, cjson_defaults do cfg[name] = value end
+  local mod = {}
+
+  -- One setting that is a number in a range, checked the way Lua checks an
+  -- integer argument, which is to throw away everything past the point. The
+  -- range complaint says argument one whichever argument it was, which is the
+  -- library's own quirk and shows up in `cjson.encode_sparse_array`.
+  local function whole(index, key, low, high, given)
+    if given ~= nil then
+      local value = tonumber(given)
+      if value == nil then argue(2, index, 'number expected, got ' .. type(given)) end
+      if value < 0 then value = -floor(-value) else value = floor(value) end
+      if value < low or value > high then
+        argue(2, 1, 'expected integer between ' .. low .. ' and ' .. high)
+      end
+      cfg[key] = value
+    end
+    return cfg[key]
+  end
+
+  -- One setting that is a choice. A boolean is the choice by number, a string
+  -- is the choice by name, and a number is a string as far as this is
+  -- concerned, so `cjson.encode_invalid_numbers(1)` complains about an option
+  -- called `1` rather than turning anything on.
+  local function flag(index, key, options, given)
+    if given ~= nil then
+      if type(given) == 'boolean' then
+        cfg[key] = given and 1 or 0
+      else
+        local name = given
+        if type(name) == 'number' then name = tostring(name) end
+        if type(name) ~= 'string' then
+          argue(2, index, 'string expected, got ' .. type(given))
+        end
+        local found
+        for i = 1, #options do
+          if options[i] == name then found = i - 1 end
+        end
+        if found == nil then argue(2, index, "invalid option '" .. name .. "'") end
+        cfg[key] = found
+      end
+    end
+    local value = cfg[key]
+    if value == 0 or value == 1 then return value == 1 end
+    return options[value + 1]
+  end
+
+  mod.encode = bridge(function(...)
+    if select('#', ...) ~= 1 then argue(1, 1, 'expected 1 argument') end
+    local ok, out = raw.cjson_encode((select(1, ...)), cfg)
+    if not ok then fault(out) end
+    return out
+  end)
+
+  mod.decode = bridge(function(...)
+    if select('#', ...) ~= 1 then argue(1, 1, 'expected 1 argument') end
+    local text = select(1, ...)
+    -- A number is a string here, because the C reads the argument with the
+    -- checker that coerces one, so `cjson.decode(1)` decodes the text `1`.
+    if type(text) == 'number' then text = tostring(text) end
+    if type(text) ~= 'string' then
+      argue(1, 1, 'string expected, got ' .. type((select(1, ...))))
+    end
+    local ok, out = raw.cjson_decode(text, cfg)
+    if not ok then fault(out) end
+    return out
+  end)
+
+  mod.encode_sparse_array = bridge(function(...)
+    if select('#', ...) > 3 then argue(1, 4, 'found too many arguments') end
+    local convert = flag(1, 'encode_sparse_convert', cjson_flags, (select(1, ...)))
+    local ratio = whole(2, 'encode_sparse_ratio', 0, cjson_max, (select(2, ...)))
+    local safe = whole(3, 'encode_sparse_safe', 0, cjson_max, (select(3, ...)))
+    return convert, ratio, safe
+  end)
+
+  mod.encode_invalid_numbers = bridge(function(...)
+    if select('#', ...) > 1 then argue(1, 2, 'found too many arguments') end
+    -- Not a tail call, because the frame this sits in is the one a raise
+    -- below counts back from.
+    local answer = flag(1, 'encode_invalid_numbers', {'off', 'on', 'null'}, (select(1, ...)))
+    return answer
+  end)
+
+  mod.encode_max_depth = bridge(function(...)
+    if select('#', ...) > 1 then argue(1, 2, 'found too many arguments') end
+    -- Not a tail call, because the frame this sits in is the one a raise
+    -- below counts back from.
+    local answer = whole(1, 'encode_max_depth', 1, cjson_max, (select(1, ...)))
+    return answer
+  end)
+
+  mod.decode_max_depth = bridge(function(...)
+    if select('#', ...) > 1 then argue(1, 2, 'found too many arguments') end
+    -- Not a tail call, because the frame this sits in is the one a raise
+    -- below counts back from.
+    local answer = whole(1, 'decode_max_depth', 1, cjson_max, (select(1, ...)))
+    return answer
+  end)
+
+  mod.encode_number_precision = bridge(function(...)
+    if select('#', ...) > 1 then argue(1, 2, 'found too many arguments') end
+    -- Not a tail call, because the frame this sits in is the one a raise
+    -- below counts back from.
+    local answer = whole(1, 'encode_number_precision', 1, 14, (select(1, ...)))
+    return answer
+  end)
+
+  -- Whether the encoder keeps its scratch buffer between calls, which this
+  -- server does not have to decide because Rust builds a fresh one every time.
+  -- Taken and remembered anyway, so that a script that reads it back gets what
+  -- it set, which is the whole of what the setting is observable through.
+  mod.encode_keep_buffer = bridge(function(...)
+    if select('#', ...) > 1 then argue(1, 2, 'found too many arguments') end
+    -- Not a tail call, because the frame this sits in is the one a raise
+    -- below counts back from.
+    local answer = flag(1, 'encode_keep_buffer', cjson_flags, (select(1, ...)))
+    return answer
+  end)
+
+  mod.decode_invalid_numbers = bridge(function(...)
+    if select('#', ...) > 1 then argue(1, 2, 'found too many arguments') end
+    -- Not a tail call, because the frame this sits in is the one a raise
+    -- below counts back from.
+    local answer = flag(1, 'decode_invalid_numbers', cjson_flags, (select(1, ...)))
+    return answer
+  end)
+
+  mod.decode_array_with_array_mt = bridge(function(...)
+    if select('#', ...) > 1 then argue(1, 2, 'found too many arguments') end
+    -- Not a tail call, because the frame this sits in is the one a raise
+    -- below counts back from.
+    local answer = flag(1, 'decode_array_with_array_mt', cjson_flags, (select(1, ...)))
+    return answer
+  end)
+
+  -- A whole other module with settings of its own, which is a plain table and
+  -- not a guarded one, because that is what a real server hands back. Only the
+  -- first of the two return values goes out, since the settings are ours.
+  mod.new = bridge(function() return (cjson_new()) end)
+  -- The value a `null` in the text decodes to. Not `nil`, because `t[k] = nil`
+  -- takes the key out of the table and a decoded object would quietly lose
+  -- every null field it had.
+  mod.null = null
+  mod._NAME = 'cjson'
+  mod._VERSION = '2.1.0'
+  return mod, cfg
+end
+
+local cjsonlib, cjson_cfg = cjson_new()
+shield('cjson', cjsonlib)
 
 -- A failure that is a table with an `err` field reaches a script as the string
 -- inside it rather than as the table. That is what a real server does and it is
@@ -834,6 +1036,13 @@ local function restore()
   end
   setmetatable(_G, guard)
   for _, one in ipairs(shielded) do setmetatable(one.proxy, one.front) end
+  -- The `cjson` settings go back to what they ship as. A real server keeps them
+  -- for the life of the process because it has one interpreter, and this one
+  -- has an interpreter for every thread, so keeping them would mean a script
+  -- got whatever the last script on the same thread happened to leave. Handing
+  -- every script the defaults is the only answer that is the same twice, and it
+  -- is D-105.
+  for name, value in next, cjson_defaults do cjson_cfg[name] = value end
 end
 
 local function run(chunk)
@@ -845,8 +1054,7 @@ local function run(chunk)
   return ok, result
 end
 
-return {run = run, raw = raw, lib = lib, written = written,
-        bitlib = bitlib, written_bit = written_bit}
+return {run = run, raw = raw}
 "#;
 
 #[cfg(test)]
@@ -875,10 +1083,10 @@ mod tests {
         // interpreter is this list and a running script is this list plus two.
         assert_eq!(
             names(&lua.globals()),
-            "_G _VERSION __redis__err__handler assert bit collectgarbage coroutine error \
-             gcinfo getmetatable ipairs load loadstring math next os pairs pcall rawequal \
-             rawget rawset redis select setmetatable string table tonumber tostring type \
-             unpack xpcall"
+            "_G _VERSION __redis__err__handler assert bit cjson collectgarbage coroutine \
+             error gcinfo getmetatable ipairs load loadstring math next os pairs pcall \
+             rawequal rawget rawset redis select setmetatable string table tonumber tostring \
+             type unpack xpcall"
         );
         // The libraries that reach outside the process are not there at all
         // rather than there and stubbed, so a script that wants one finds out.
