@@ -25,7 +25,7 @@
 //! the phrase never calls it.
 
 use crate::english::English;
-use crate::field::Kind;
+use crate::field::{Algo, Kind};
 use crate::index::Index;
 use crate::query::explain::bit;
 use crate::query::{Circle, EVERY, Mask, Node, Pair, Range, Vector, What, Word, expansion};
@@ -102,6 +102,67 @@ pub enum Bad {
     /// Something a real server words for itself, such as a field that cannot be
     /// matched the way the query asked for.
     Refused(&'static str),
+    /// A runtime option on a vector clause the field or the clause will not
+    /// take.
+    Option(Vecsim),
+    /// A distance was named twice on one clause, once in the bracket and again
+    /// in the attributes hung off it.
+    Twice(Box<[u8]>, Box<[u8]>),
+}
+
+/// The seven ways a runtime option on a vector clause can be refused.
+///
+/// They are one family because a real server writes them all the same way, a
+/// code, a sentence and the same parenthesis at the end saying which parser
+/// was reading. All seven are measured.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Vecsim {
+    /// A name the field's index has never heard of, which is also what a name
+    /// the other kind of clause takes comes back as.
+    Unknown,
+    /// A range clause's option on a nearest neighbour clause.
+    Range,
+    /// A hybrid option on a clause with nothing in front of it to be hybrid
+    /// with.
+    Hybrid,
+    /// A number that is not one, or is not above zero.
+    Value,
+    /// A hybrid policy that is neither of the two there are.
+    Policy,
+    /// A batch size next to the policy that does not run in batches.
+    Batch,
+    /// The same option twice on one clause.
+    Twice,
+}
+
+impl Vecsim {
+    /// The code in front of the sentence.
+    #[must_use]
+    pub const fn code(self) -> &'static str {
+        match self {
+            Vecsim::Unknown => "SEARCH_OPTION_INVALID",
+            Vecsim::Range => "SEARCH_RANGE_ATTR_NON_RANGE",
+            Vecsim::Hybrid => "SEARCH_HYBRID_ATTR_NON_HYBRID",
+            Vecsim::Value => "SEARCH_VALUE_BAD",
+            Vecsim::Policy => "SEARCH_HYBRID_POLICY_BAD",
+            Vecsim::Batch => "SEARCH_ADHOC_BATCH_SIZE_IRRELEVANT",
+            Vecsim::Twice => "SEARCH_PARAM_DUP",
+        }
+    }
+
+    /// The sentence itself, which the parenthesis is added to.
+    #[must_use]
+    pub const fn words(self) -> &'static str {
+        match self {
+            Vecsim::Unknown => "Invalid option",
+            Vecsim::Range => "range query attributes were sent for a non-range query",
+            Vecsim::Hybrid => "hybrid query attributes were sent for a non-hybrid query",
+            Vecsim::Value => "Invalid value was given",
+            Vecsim::Policy => "invalid hybrid policy was given",
+            Vecsim::Batch => "'batch size' is irrelevant for the selected policy",
+            Vecsim::Twice => "Parameter was specified twice",
+        }
+    }
 }
 
 /// The most neighbours a `KNN` may ask for, which a real server names in the
@@ -289,6 +350,7 @@ pub fn parse(query: &[u8], index: &Index, ask: &Ask) -> Result<Node, Bad> {
         solo: true,
         gone: Vec::new(),
         taken: None,
+        bracket: None,
         unit: false,
         hush: false,
         fielded: false,
@@ -346,6 +408,13 @@ struct Parse<'a> {
     gone: Vec<Box<[u8]>>,
     /// The name a vector clause gave its distance that the schema already uses.
     taken: Option<Box<[u8]>>,
+    /// The name a vector clause's bracket gave its distance, while the
+    /// attributes hung off that same clause are being read.
+    ///
+    /// Only there to tell a name in the bracket followed by a name in the
+    /// attributes, which is refused, from two names in the attributes, which is
+    /// the last one written winning.
+    bracket: Option<Box<[u8]>>,
     /// Whether a geo filter named a unit that does not exist.
     unit: bool,
     /// Whether a pattern has been read, which empties the word an unknown or
@@ -1828,6 +1897,50 @@ impl Parse<'_> {
         self.word()
     }
 
+    /// Where a runtime option's value ends, which is the longer of a word and a
+    /// number.
+    ///
+    /// Neither shape on its own reads them all. A point and a sign are not part
+    /// of a word, so `0.1` and `-1` would come out short, and a base marker and
+    /// letters are not part of a number, so `0x10` and `abc` would too. Taking
+    /// whichever reaches further settles both, and settles the awkward pair as
+    /// well: `1-0` ends after the one because the sign only counts at the front
+    /// of a number, which is why it is a syntax error near the `-0` rather than
+    /// a bad value.
+    fn settled_end(&self, from: usize) -> usize {
+        let word = self.word_end(from);
+        let digits = number_len(self.src, from).unwrap_or(from);
+        word.max(digits)
+    }
+
+    /// The same, taken and kept as the last token read.
+    fn settled(&mut self) -> Box<[u8]> {
+        let start = self.at;
+        self.at = self.settled_end(start);
+        let out: Box<[u8]> = self.src[start..self.at].into();
+        if !out.is_empty() {
+            self.mark = start;
+            self.word = out.clone();
+        }
+        out
+    }
+
+    /// The error for a runtime option list that stopped somewhere it should not
+    /// have.
+    ///
+    /// What it names is the token in front of the parser when there is one and
+    /// the last token read when there is not, which is the difference between
+    /// `EF_RUNTIME 1-0` being refused near the `-0` and `AS a-b` being refused
+    /// near the `a`. Both point at the same place either way.
+    fn stopped(&self) -> Bad {
+        let end = self.settled_end(self.at);
+        let near = match end > self.at {
+            true => self.src[self.at..end].into(),
+            false => self.word.clone(),
+        };
+        Bad::Syntax { at: self.at, near }
+    }
+
     /// Everything up to a closing byte, taken as it stands.
     fn until(&mut self, shut: u8) -> Result<Box<[u8]>, Bad> {
         let start = self.at;
@@ -3061,6 +3174,7 @@ impl Parse<'_> {
                     // for anything nested inside it, because the thing on the
                     // outside is always read last.
                     self.hung = any;
+                    settled_policy(&out)?;
                     return Ok(out);
                 }
                 (out, true) => {
@@ -3342,9 +3456,29 @@ impl Parse<'_> {
                 }
             }
             b"yield_distance_as" if matches!(node.what, What::Vector(_)) => {
+                // A name in the bracket and a name here are two names for the
+                // one thing, even when they are the same name. Two names here
+                // are not, because there was only ever one place to write them
+                // and the second simply lands on top of the first.
+                if let Some(had) = self.bracket.take() {
+                    return Err(Bad::Twice(had, value.into()));
+                }
                 if let What::Vector(vector) = &mut node.what {
                     vector.alias = Some(value.into());
                 }
+            }
+            // A vector clause takes its runtime options either way round,
+            // written inside the bracket or hung off it afterwards, and it is
+            // the same set and the same checks both times. The only thing that
+            // differs is the name nobody has heard of, which inside a bracket
+            // is an invalid option and here is an invalid attribute. A name
+            // that is one of the four but does not belong on this field is an
+            // invalid option either way round.
+            _ if matches!(node.what, What::Vector(_)) && family(name) => {
+                let What::Vector(vector) = &mut node.what else {
+                    return Err(Bad::Attribute(name.into()));
+                };
+                self.runtime(vector, name, value)?;
             }
             _ => return Err(Bad::Attribute(name.into())),
         }
@@ -3464,6 +3598,17 @@ impl Parse<'_> {
             // `the=>[KNN 2 @v $B]` is the plain shape a bare `*` gives.
             over: (!matches!(over.what, What::Wildcard | What::Empty)).then(|| Box::new(over)),
         };
+        // `AS` closes the list: a real server takes the runtime options first
+        // and the name for the distance last, so anything written after the
+        // name is a syntax error at the word that was written rather than an
+        // option out of order.
+        let mut named = false;
+        // The whole bracket is read before any of it is checked, which is what
+        // makes `EF_RUNTIME 1-0` a syntax error near the `-0` on a field that
+        // would have refused the option itself. Nothing in the bracket is
+        // looked at twice: the values a client wrote as parameters are filled
+        // in here and it is the filled in ones that get checked.
+        let mut written: Vec<Pair> = Vec::new();
         loop {
             self.spaces();
             match self.peek() {
@@ -3475,6 +3620,9 @@ impl Parse<'_> {
                 Some(b) if wordy(b) => {
                     let name = self.token();
                     self.word = name.clone();
+                    if named {
+                        return Err(self.syntax_at(self.mark));
+                    }
                     self.spaces();
                     // A runtime option may be given as a parameter the same way
                     // the count and the vector are.
@@ -3482,7 +3630,7 @@ impl Parse<'_> {
                         let held = self.dollar()?;
                         self.param(&held)
                     } else {
-                        let word = self.word();
+                        let word = self.settled();
                         // An option with nothing after it is refused where it
                         // ran out, ahead of any parameter the client forgot.
                         if word.is_empty() {
@@ -3499,20 +3647,101 @@ impl Parse<'_> {
                             self.taken = Some(value.clone());
                         }
                         vector.alias = Some(value);
+                        named = true;
                     } else {
-                        vector
-                            .options
-                            .push((name.to_ascii_uppercase().into(), value));
+                        written.push((name, value));
                     }
                 }
-                _ => return Err(self.syntax()),
+                _ => return Err(self.stopped()),
             }
+        }
+        for (name, value) in written {
+            self.runtime(&mut vector, &name, &value)?;
         }
         if self.gone.is_empty() {
             self.gone = outer;
         }
-        let node = Node::new(What::Vector(Box::new(vector)));
-        self.attributes(node)
+        // Remembered so that a name in the bracket and a name in the attributes
+        // after it can be told from two names in the attributes. The first pair
+        // is an error and the second is the last one written winning.
+        self.bracket = vector.alias.clone();
+        let node = self.attributes(Node::new(What::Vector(Box::new(vector))))?;
+        self.bracket = None;
+        Ok(node)
+    }
+
+    /// One runtime option on a vector clause, checked and kept.
+    ///
+    /// Three checks in this order, each finished before the next option is even
+    /// read, which is measured: `EPSILON 0.1 BOGUS x` on a nearest neighbour
+    /// clause complains about the epsilon and `BOGUS x EPSILON 0.1` complains
+    /// about the word.
+    ///
+    /// The first is whether the field's index has heard of the name at all,
+    /// which is not the same set for every index. Only a graph takes an
+    /// `EF_RUNTIME` and only a graph or a Vamana takes an `EPSILON`, so the
+    /// same option is an unknown one on a flat field and a real one that does
+    /// not belong here on the others.
+    fn runtime(&mut self, vector: &mut Vector, name: &[u8], value: &[u8]) -> Result<(), Bad> {
+        let algo = match self.index.field(&vector.field).map(|f| &f.kind) {
+            Some(Kind::Vector(held)) => held.algo,
+            _ => return Err(Bad::Option(Vecsim::Unknown)),
+        };
+        let knn = vector.k.is_some();
+        // A clause is hybrid when something else narrowed it down first, which
+        // only a nearest neighbour clause can have.
+        let hybrid = vector.over.is_some();
+        let upper: Box<[u8]> = name.to_ascii_uppercase().into();
+        let known = match &*upper {
+            b"EF_RUNTIME" => algo == Algo::Hnsw && knn,
+            b"EPSILON" => matches!(algo, Algo::Hnsw | Algo::Svs),
+            b"HYBRID_POLICY" | b"BATCH_SIZE" => true,
+            _ => false,
+        };
+        if !known {
+            return Err(Bad::Option(Vecsim::Unknown));
+        }
+        if vector.options.iter().any(|(had, _)| *had == upper) {
+            return Err(Bad::Option(Vecsim::Twice));
+        }
+        // An epsilon says how far past the radius a range reaches, so there is
+        // nothing for it to reach past on a clause counting neighbours.
+        if &*upper == b"EPSILON" && knn {
+            return Err(Bad::Option(Vecsim::Range));
+        }
+        if matches!(&*upper, b"HYBRID_POLICY" | b"BATCH_SIZE") && !hybrid {
+            return Err(Bad::Option(Vecsim::Hybrid));
+        }
+        match &*upper {
+            b"EPSILON" => {
+                // Read as a double and refused at zero and below, which lets
+                // an infinity through and lets a nan through as well, because
+                // a nan is not below anything either.
+                let read = String::from_utf8_lossy(value).parse::<f64>();
+                match read {
+                    Ok(read) if read > 0.0 || read.is_nan() => {}
+                    _ => return Err(Bad::Option(Vecsim::Value)),
+                }
+            }
+            b"HYBRID_POLICY" => {
+                let named = value.eq_ignore_ascii_case(b"adhoc_bf")
+                    || value.eq_ignore_ascii_case(b"batches");
+                if !named {
+                    return Err(Bad::Option(Vecsim::Policy));
+                }
+            }
+            // A beam width and a batch size are both counts, read the way C
+            // reads one with no base given, so a hexadecimal number and a plus
+            // are both taken and a point, an exponent and anything left over
+            // are not.
+            _ => {
+                if counting(value).is_none() {
+                    return Err(Bad::Option(Vecsim::Value));
+                }
+            }
+        }
+        vector.options.push((upper, value.into()));
+        Ok(())
     }
 
     /// `$name`, which is how a query refers to something passed with `PARAMS`.
@@ -3776,6 +4005,77 @@ fn carrier(node: &mut Node) -> &mut Node {
     }
 }
 
+/// Whether a name is one of the four runtime options at all, whatever the field
+/// it was written on can do with it.
+///
+/// The four are one family because a name outside it and a name inside it that
+/// does not belong on this field are refused differently when they are written
+/// as attributes. An `$epsilon` on a flat field is an invalid option and a
+/// `$bogus` is an invalid attribute, even though a flat field can do nothing
+/// with either of them.
+fn family(name: &[u8]) -> bool {
+    matches!(
+        &*name.to_ascii_uppercase(),
+        b"EF_RUNTIME" | b"EPSILON" | b"HYBRID_POLICY" | b"BATCH_SIZE"
+    )
+}
+
+/// A count the way C reads one when it is not told which base to read in.
+///
+/// Base ten unless the token starts `0x`, a leading sign is allowed, the whole
+/// token has to be used up, and what comes out has to be above zero. So `10`,
+/// `+10` and `0x10` are counts and `0`, `-1`, `1.5`, `1e2`, `abc` and a number
+/// too big to hold are not.
+fn counting(src: &[u8]) -> Option<i64> {
+    let text = core::str::from_utf8(src).ok()?;
+    let (body, sign) = match text.as_bytes().first() {
+        Some(b'-') => (&text[1..], -1i64),
+        Some(b'+') => (&text[1..], 1),
+        _ => (text, 1),
+    };
+    // A second sign is not a sign, and neither is a token that is nothing but
+    // one, so the body has to start with a digit before it is worth reading.
+    if !body.starts_with(|c: char| c.is_ascii_digit()) {
+        return None;
+    }
+    let read = match body.strip_prefix("0x").or_else(|| body.strip_prefix("0X")) {
+        Some(hex) => i64::from_str_radix(hex, 16).ok()?,
+        None => body.parse::<i64>().ok()?,
+    };
+    let read = sign.checked_mul(read)?;
+    (read > 0).then_some(read)
+}
+
+/// The last check a vector clause gets, once its attributes have been read too.
+///
+/// A batch size only means anything to the policy that runs the search in
+/// batches, so naming the other policy and giving one as well is refused. It
+/// comes after everything else because either half can be written first and
+/// either half can come from the bracket or from the attributes, so there is
+/// nowhere earlier that both are known.
+///
+/// A batch size on its own is fine even though the policy it ends up under is
+/// the one that would have refused it, which reads as an oversight and is what
+/// a real server does.
+fn settled_policy(node: &Node) -> Result<(), Bad> {
+    let What::Vector(vector) = &node.what else {
+        return Ok(());
+    };
+    let named = |want: &[u8]| {
+        vector
+            .options
+            .iter()
+            .find(|(name, _)| &**name == want)
+            .map(|(_, value)| value)
+    };
+    let adhoc =
+        named(b"HYBRID_POLICY").is_some_and(|value| value.eq_ignore_ascii_case(b"adhoc_bf"));
+    if adhoc && named(b"BATCH_SIZE").is_some() {
+        return Err(Bad::Option(Vecsim::Batch));
+    }
+    Ok(())
+}
+
 /// A number the way a query writes one, including the infinities.
 fn number(text: &str) -> Option<f64> {
     let text = text.trim();
@@ -3849,6 +4149,24 @@ mod tests {
                 b"v",
                 Kind::Vector(crate::field::Vector::new(
                     crate::field::Algo::Flat,
+                    crate::field::Width::Float32,
+                    4,
+                    yo_shape::Metric::L2,
+                )),
+            ),
+            Field::new(
+                b"h",
+                Kind::Vector(crate::field::Vector::new(
+                    crate::field::Algo::Hnsw,
+                    crate::field::Width::Float32,
+                    4,
+                    yo_shape::Metric::L2,
+                )),
+            ),
+            Field::new(
+                b"s",
+                Kind::Vector(crate::field::Vector::new(
+                    crate::field::Algo::Svs,
                     crate::field::Width::Float32,
                     4,
                     yo_shape::Metric::L2,
@@ -4133,6 +4451,31 @@ mod tests {
     /// A parameter is passed along the way because the queries that ask for a
     /// vector name one, and what is being measured is where the refusal lands
     /// rather than whether the parameter was there.
+    /// A query parsed with a vector that is the size the schema asked for, which
+    /// the runtime option cases need because a vector the wrong size is refused
+    /// before any of the options are read.
+    fn vectored(query: &str) -> Result<(), Bad> {
+        let index = index();
+        let params = vec![(b"B".to_vec().into(), vec![0u8; 16].into())];
+        let ask = Ask {
+            dialect: 2,
+            params: &params,
+            ..Ask::default()
+        };
+        parse(query.as_bytes(), &index, &ask).map(|_| ())
+    }
+
+    /// Whether such a query gets through the parser at all, for the cases where
+    /// what it parses into is beside the point.
+    fn parses(query: &str) -> bool {
+        vectored(query).is_ok()
+    }
+
+    /// The error such a query is refused with.
+    fn option(query: &str) -> Bad {
+        vectored(query).expect_err("the query is refused")
+    }
+
     fn refused(query: &str, dialect: u8) -> Bad {
         let index = index();
         let params = vec![(b"B".to_vec().into(), b"aaaa".to_vec().into())];
@@ -4306,6 +4649,271 @@ mod tests {
             Bad::Unknown {
                 at: 0,
                 near: Some(b"zz".to_vec().into())
+            }
+        );
+    }
+
+    // -------------------------------------------------- vector runtime options
+
+    /// Which options a field takes depends on the index behind it, so the same
+    /// word is a real option on one field and a word nobody has heard of on
+    /// another.
+    #[test]
+    fn a_runtime_option_belongs_to_an_index_and_not_to_vectors_in_general() {
+        assert!(parses("*=>[KNN 2 @h $B EF_RUNTIME 10]"));
+        assert_eq!(
+            option("*=>[KNN 2 @v $B EF_RUNTIME 10]"),
+            Bad::Option(Vecsim::Unknown)
+        );
+        assert_eq!(
+            option("*=>[KNN 2 @s $B EF_RUNTIME 10]"),
+            Bad::Option(Vecsim::Unknown)
+        );
+    }
+
+    /// An epsilon says how far past a radius to reach, so a clause counting
+    /// neighbours has nothing for it to reach past and says so rather than
+    /// pretending never to have heard of it.
+    #[test]
+    fn an_epsilon_is_known_on_a_clause_that_counts_neighbours_and_refused_there() {
+        assert_eq!(
+            option("*=>[KNN 2 @h $B EPSILON 0.1]"),
+            Bad::Option(Vecsim::Range)
+        );
+        assert_eq!(
+            option("*=>[KNN 2 @s $B EPSILON 0.1]"),
+            Bad::Option(Vecsim::Range)
+        );
+        assert!(parses("@h:[VECTOR_RANGE 10 $B]=>{$epsilon: 0.1}"));
+    }
+
+    /// A policy and a batch size are about running a search over something that
+    /// was narrowed down first, so a clause with nothing under it takes neither.
+    #[test]
+    fn a_policy_needs_something_for_the_search_to_run_over() {
+        assert_eq!(
+            option("*=>[KNN 2 @v $B HYBRID_POLICY BATCHES]"),
+            Bad::Option(Vecsim::Hybrid)
+        );
+        assert_eq!(
+            option("*=>[KNN 2 @v $B BATCH_SIZE 5]"),
+            Bad::Option(Vecsim::Hybrid)
+        );
+        assert!(parses("@a:hello=>[KNN 2 @v $B HYBRID_POLICY BATCHES]"));
+    }
+
+    /// A beam width and a batch size are counts the way C reads one with no base
+    /// given, so a base marker and a sign are both taken and a point, an
+    /// exponent and a number too big to hold are not.
+    #[test]
+    fn a_count_option_is_read_the_way_c_reads_one() {
+        for good in ["10", "+10", "0x10", "99999999999"] {
+            let query = format!("*=>[KNN 2 @h $B EF_RUNTIME {good}]");
+            assert!(parses(&query), "{good} is a count");
+        }
+        for bad in [
+            "0",
+            "-1",
+            "1.5",
+            "10.0",
+            "1e2",
+            "abc",
+            "18446744073709551616",
+        ] {
+            let query = format!("*=>[KNN 2 @h $B EF_RUNTIME {bad}]");
+            assert_eq!(option(&query), Bad::Option(Vecsim::Value), "{bad}");
+        }
+    }
+
+    /// An epsilon is a double refused at zero and below, which lets an infinity
+    /// through and lets a nan through with it, because a nan is not below
+    /// anything.
+    #[test]
+    fn an_epsilon_is_a_double_that_has_to_be_above_zero() {
+        for good in ["1", "1.5", "inf", "nan"] {
+            let query = format!("@h:[VECTOR_RANGE 10 $B]=>{{$epsilon: {good}}}");
+            assert!(parses(&query), "{good} is an epsilon");
+        }
+        for bad in ["0", "0.0", "-1", "-0.1", "abc"] {
+            let query = format!("@h:[VECTOR_RANGE 10 $B]=>{{$epsilon: {bad}}}");
+            assert_eq!(option(&query), Bad::Option(Vecsim::Value), "{bad}");
+        }
+    }
+
+    #[test]
+    fn a_policy_is_one_of_two_words_and_the_case_does_not_matter() {
+        assert!(parses("@a:hello=>[KNN 2 @v $B hybrid_policy Adhoc_BF]"));
+        assert!(parses("@a:hello=>[KNN 2 @v $B HYBRID_POLICY batches]"));
+        assert_eq!(
+            option("@a:hello=>[KNN 2 @v $B HYBRID_POLICY BOGUS]"),
+            Bad::Option(Vecsim::Policy)
+        );
+    }
+
+    /// The same option twice is refused whichever side of the bracket each one
+    /// was written on, because the bracket and the attributes after it are one
+    /// list as far as this is concerned.
+    #[test]
+    fn the_same_option_twice_on_one_clause_is_refused() {
+        assert_eq!(
+            option("*=>[KNN 2 @h $B EF_RUNTIME 10 EF_RUNTIME 20]"),
+            Bad::Option(Vecsim::Twice)
+        );
+        assert_eq!(
+            option("*=>[KNN 2 @h $B]=>{$ef_runtime: 10; $ef_runtime: 20}"),
+            Bad::Option(Vecsim::Twice)
+        );
+        assert_eq!(
+            option("*=>[KNN 2 @h $B EF_RUNTIME 10]=>{$ef_runtime: 20}"),
+            Bad::Option(Vecsim::Twice)
+        );
+    }
+
+    /// Each option is finished before the next one is looked at, so which of two
+    /// bad ones gets reported is whichever was written first.
+    #[test]
+    fn options_are_checked_one_at_a_time_in_the_order_they_were_written() {
+        assert_eq!(
+            option("*=>[KNN 2 @h $B EPSILON 0.1 BOGUS x]"),
+            Bad::Option(Vecsim::Range)
+        );
+        assert_eq!(
+            option("*=>[KNN 2 @h $B BOGUS x EPSILON 0.1]"),
+            Bad::Option(Vecsim::Unknown)
+        );
+        assert_eq!(
+            option("@a:hello=>[KNN 2 @h $B EF_RUNTIME abc HYBRID_POLICY BOGUS]"),
+            Bad::Option(Vecsim::Value)
+        );
+        assert_eq!(
+            option("@a:hello=>[KNN 2 @h $B HYBRID_POLICY BOGUS EF_RUNTIME abc]"),
+            Bad::Option(Vecsim::Policy)
+        );
+    }
+
+    /// A batch size only means anything to the policy that runs in batches, and
+    /// the pair is caught however it was written, because either half can come
+    /// from the bracket and either half can come from the attributes.
+    #[test]
+    fn a_batch_size_and_the_policy_that_ignores_it_are_refused_together() {
+        for query in [
+            "@a:hello=>[KNN 2 @v $B HYBRID_POLICY ADHOC_BF BATCH_SIZE 5]",
+            "@a:hello=>[KNN 2 @v $B BATCH_SIZE 5 HYBRID_POLICY ADHOC_BF]",
+            "@a:hello=>[KNN 2 @v $B HYBRID_POLICY ADHOC_BF]=>{$batch_size: 5}",
+            "@a:hello=>[KNN 2 @v $B BATCH_SIZE 5]=>{$hybrid_policy: ADHOC_BF}",
+        ] {
+            assert_eq!(option(query), Bad::Option(Vecsim::Batch), "{query}");
+        }
+        // The policy a batch size ends up under when nobody names one is the
+        // same one that refuses it when they do, which reads as an oversight
+        // and is what a real server does.
+        assert!(parses("@a:hello=>[KNN 2 @v $B BATCH_SIZE 5]"));
+        assert!(parses(
+            "@a:hello=>[KNN 2 @v $B HYBRID_POLICY BATCHES BATCH_SIZE 5]"
+        ));
+    }
+
+    /// A name for the distance closes the bracket, so an option after it is a
+    /// syntax error at the option rather than an option out of order.
+    #[test]
+    fn nothing_may_follow_the_name_a_clause_gives_its_distance() {
+        assert_eq!(
+            option("*=>[KNN 2 @h $B AS d EF_RUNTIME 10]"),
+            Bad::Syntax {
+                at: 21,
+                near: b"EF_RUNTIME".to_vec().into()
+            }
+        );
+        assert_eq!(
+            option("*=>[KNN 2 @h $B AS d AS e]"),
+            Bad::Syntax {
+                at: 21,
+                near: b"AS".to_vec().into()
+            }
+        );
+        assert!(parses("*=>[KNN 2 @h $B EF_RUNTIME 10 AS d]"));
+    }
+
+    /// A name in the bracket and a name in the attributes are two names for the
+    /// one thing even when they read the same, and two names in the attributes
+    /// are not, because there was only ever one place to write the second.
+    #[test]
+    fn a_distance_named_in_both_places_is_named_twice() {
+        assert_eq!(
+            option("*=>[KNN 2 @h $B AS d]=>{$yield_distance_as: e}"),
+            Bad::Twice(b"d".to_vec().into(), b"e".to_vec().into())
+        );
+        assert_eq!(
+            option("*=>[KNN 2 @h $B AS d]=>{$yield_distance_as: d}"),
+            Bad::Twice(b"d".to_vec().into(), b"d".to_vec().into())
+        );
+        assert!(parses(
+            "*=>[KNN 2 @h $B]=>{$yield_distance_as: d; $yield_distance_as: e}"
+        ));
+    }
+
+    /// An option name written as an attribute that nobody has heard of is an
+    /// invalid attribute, and one that exists but does not belong on this field
+    /// is an invalid option, even though the field can do nothing with either.
+    #[test]
+    fn an_attribute_nobody_knows_and_one_that_does_not_belong_here_read_apart() {
+        assert_eq!(
+            option("@v:[VECTOR_RANGE 10 $B]=>{$bogus: x}"),
+            Bad::Attribute(b"bogus".to_vec().into())
+        );
+        assert_eq!(
+            option("@v:[VECTOR_RANGE 10 $B]=>{$as: d}"),
+            Bad::Attribute(b"as".to_vec().into())
+        );
+        assert_eq!(
+            option("@v:[VECTOR_RANGE 10 $B]=>{$epsilon: 0.1}"),
+            Bad::Option(Vecsim::Unknown)
+        );
+        assert_eq!(
+            option("@h:[VECTOR_RANGE 10 $B]=>{$ef_runtime: 10}"),
+            Bad::Option(Vecsim::Unknown)
+        );
+    }
+
+    /// The whole bracket is read before any of it is checked, so a value that is
+    /// two tokens rather than one is a syntax error even on a field that would
+    /// have refused the option itself.
+    #[test]
+    fn a_value_that_is_two_tokens_is_refused_before_the_option_is_looked_at() {
+        assert_eq!(
+            option("*=>[KNN 2 @v $B EF_RUNTIME 1-0]"),
+            Bad::Syntax {
+                at: 28,
+                near: b"-0".to_vec().into()
+            }
+        );
+        // Nothing in front of the parser to name, so the last word read is
+        // quoted instead.
+        assert_eq!(
+            option("*=>[KNN 2 @v $B AS a-b]"),
+            Bad::Syntax {
+                at: 20,
+                near: b"a".to_vec().into()
+            }
+        );
+    }
+
+    /// A name with nothing after it inside the bracket is a syntax error at the
+    /// closing bracket, quoting the name.
+    #[test]
+    fn an_option_with_no_value_runs_out_where_the_bracket_shuts() {
+        assert_eq!(
+            option("*=>[KNN 2 @v $B BOGUS]"),
+            Bad::Syntax {
+                at: 21,
+                near: b"BOGUS".to_vec().into()
+            }
+        );
+        assert_eq!(
+            option("*=>[KNN 2 @h $B EF_RUNTIME]"),
+            Bad::Syntax {
+                at: 26,
+                near: b"EF_RUNTIME".to_vec().into()
             }
         );
     }
