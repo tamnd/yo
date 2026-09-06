@@ -5,11 +5,13 @@
 //! database and the registry lives on the server. So the dispatcher is where
 //! the two meet, and this is that meeting.
 //!
-//! Three ways in. [`changed`] is a key that has just been written, which is
+//! Four ways in. [`changed`] is a key that has just been written, which is
 //! read back out of the keyspace and handed to every index that follows it.
 //! [`touched`] is the same thing for the commands that name more than one key,
 //! which write down what they did rather than answering with it. [`scan`] is
 //! the other way round, one index walking every key that was already there.
+//! [`sweep`] is the other way round again, an index that has just been dropped
+//! taking the keys it was holding out of the keyspace with it.
 //!
 //! # Why the key is read again
 //!
@@ -420,6 +422,30 @@ pub(super) fn scan(server: &Server, db: usize, fill: &Fill<'_>) {
                 .search
                 .lock()
                 .filled(name, Source::Hash, &key, &doc.pairs());
+        }
+    }
+}
+
+/// Deletes the keys a dropped index was holding.
+///
+/// The list comes from the index's own document table rather than from its
+/// prefix, so only what it actually read is deleted and anything else under the
+/// same prefix stays. Which database is the one the drop ran on and not the one
+/// the index was made on, measured: an `FT.DROPINDEX i DD` sent from database
+/// one takes nothing off database zero.
+///
+/// Every other index hears about each key going, because two indexes can follow
+/// the same prefix and the one still standing would otherwise keep answering
+/// with documents whose keys are not there any more.
+pub(super) fn sweep(server: &Server, db: usize, keys: &[Box<[u8]>]) {
+    let at = &server.dbs[db];
+    for key in keys {
+        // One key at a time and one stripe at a time, because the registry is
+        // taken between them and holding a stripe across that is the lock order
+        // the write path does not use.
+        let gone = at.hold(key).del(key);
+        if gone {
+            server.search.lock().went(key);
         }
     }
 }

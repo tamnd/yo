@@ -1931,8 +1931,10 @@ pub fn resolved(
                 let db = session.db;
                 let made = search::execute(server, &mut server.search.lock(), db, spec, args, out);
                 made.map(|made| {
-                    if let Some(fill) = made {
-                        indexing::scan(server, db, &fill);
+                    match made {
+                        Some(search::After::Scan(fill)) => indexing::scan(server, db, &fill),
+                        Some(search::After::Sweep(keys)) => indexing::sweep(server, db, &keys),
+                        None => {}
                     }
                     Flow::Continue
                 })
@@ -22203,6 +22205,86 @@ mod tests {
             b"alpha",
         ]);
         assert_eq!(timeless(&one), timeless(&two));
+    }
+
+    // -------------------------------------------------------------- dropping
+
+    /// The two spellings take opposite defaults, which is measured and is the
+    /// only difference between them that a client can see.
+    #[test]
+    fn the_two_ways_of_dropping_an_index_disagree_about_the_documents() {
+        let mut f = profiling();
+        assert_eq!(f.run(&[b"FT.DROPINDEX", b"ix"]), "+OK\r\n");
+        assert_eq!(f.run(&[b"EXISTS", b"p:1", b"p:2", b"p:3"]), ":3\r\n");
+
+        let mut f = profiling();
+        assert_eq!(f.run(&[b"FT.DROPINDEX", b"ix", b"DD"]), "+OK\r\n");
+        assert_eq!(f.run(&[b"EXISTS", b"p:1", b"p:2", b"p:3"]), ":0\r\n");
+
+        let mut f = profiling();
+        assert_eq!(f.run(&[b"FT.DROP", b"ix"]), "+OK\r\n");
+        assert_eq!(f.run(&[b"EXISTS", b"p:1", b"p:2", b"p:3"]), ":0\r\n");
+
+        let mut f = profiling();
+        assert_eq!(f.run(&[b"FT.DROP", b"ix", b"KEEPDOCS"]), "+OK\r\n");
+        assert_eq!(f.run(&[b"EXISTS", b"p:1", b"p:2", b"p:3"]), ":3\r\n");
+    }
+
+    /// Each spelling takes its own word and refuses the other one's, which
+    /// reads as an oversight and is what a real server answers.
+    #[test]
+    fn neither_way_of_dropping_an_index_takes_the_other_ones_word() {
+        let mut f = profiling();
+        let line = "-SEARCH_ARG_UNRECOGNIZED Unknown argument\r\n";
+        assert_eq!(f.run(&[b"FT.DROPINDEX", b"ix", b"KEEPDOCS"]), line);
+        assert_eq!(f.run(&[b"FT.DROP", b"ix", b"DD"]), line);
+        // Refused rather than half done, so the index is still there.
+        assert_eq!(f.run(&[b"FT._LIST"]), "*1\r\n+ix\r\n");
+    }
+
+    /// Only what the index read is deleted, which is not the same as
+    /// everything under its prefix.
+    #[test]
+    fn dropping_the_documents_leaves_a_key_the_index_never_read() {
+        let mut f = profiling();
+        f.run(&[b"SET", b"p:4", b"alpha"]);
+        f.run(&[b"HSET", b"q:1", b"t", b"alpha"]);
+        assert_eq!(f.run(&[b"FT.DROPINDEX", b"ix", b"DD"]), "+OK\r\n");
+        assert_eq!(f.run(&[b"EXISTS", b"p:1", b"p:2", b"p:3"]), ":0\r\n");
+        assert_eq!(f.run(&[b"EXISTS", b"p:4", b"q:1"]), ":2\r\n");
+    }
+
+    /// An index still standing over the same keys hears about them going,
+    /// rather than answering later with keys that are not there.
+    #[test]
+    fn another_index_over_the_same_keys_loses_the_documents_too() {
+        let mut f = profiling();
+        f.run(&[
+            b"FT.CREATE",
+            b"other",
+            b"PREFIX",
+            b"1",
+            b"p:",
+            b"SCHEMA",
+            b"t",
+            b"TEXT",
+        ]);
+        assert_eq!(f.run(&[b"FT.DROPINDEX", b"ix", b"DD"]), "+OK\r\n");
+        assert_eq!(
+            f.run(&[b"FT.SEARCH", b"other", b"alpha", b"NOCONTENT"]),
+            "*1\r\n:0\r\n"
+        );
+    }
+
+    /// A drop that found nothing to drop deletes nothing either, which is the
+    /// one case where the shortcut spelling answers `OK` without a sweep.
+    #[test]
+    fn a_drop_of_an_index_that_is_not_there_touches_no_keys() {
+        let mut f = profiling();
+        assert_eq!(f.run(&[b"FT._DROPINDEXIFX", b"nope", b"DD"]), "+OK\r\n");
+        assert_eq!(f.run(&[b"EXISTS", b"p:1", b"p:2", b"p:3"]), ":3\r\n");
+        assert_eq!(f.run(&[b"FT._DROPIFX", b"nope"]), "+OK\r\n");
+        assert_eq!(f.run(&[b"EXISTS", b"p:1", b"p:2", b"p:3"]), ":3\r\n");
     }
 
     // --------------------------------------------------------------- config
