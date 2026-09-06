@@ -2013,11 +2013,16 @@ mod tests {
     /// renumber the one that was last.
     #[test]
     fn the_candidate_lists_answer_what_the_two_passes_answered() {
-        let store = corpus(16, 3000, 12, 0x105E);
-        let mut ix = Partitions::new(16, Bits::One, 7, Tuning::default());
+        let (n, dim, posting) = shrunk(3000, 16, Tuning::default().posting);
+        let store = corpus(dim, n, 12, 0x105E);
+        let tuning = Tuning {
+            posting,
+            ..Tuning::default()
+        };
+        let mut ix = Partitions::new(dim, Bits::One, 7, tuning);
         let mut rng = Rng::new(0x105F);
         let mut live: Vec<u64> = Vec::new();
-        for id in 0..3000u64 {
+        for id in 0..n as u64 {
             ix.insert(id, &store.0[id as usize]);
             live.push(id);
             if id % 7 == 3 && !live.is_empty() {
@@ -2105,6 +2110,53 @@ mod tests {
                 })
                 .collect(),
         )
+    }
+
+    /// A corpus size, a width and a posting size, shrunk together for Miri.
+    ///
+    /// The corpus and the posting have to move together. What the tests using
+    /// this are about is the shape the index takes: how many partitions there
+    /// are, that a posting splits when it grows and merges when it shrinks, that
+    /// a member near a boundary ends up copied into a second partition. All of
+    /// that is set by the ratio of those two numbers rather than by either of
+    /// them, so cutting both by twenty leaves every one of those claims where it
+    /// was and takes a twentieth of the arithmetic to get there.
+    ///
+    /// Cutting only the corpus is the obvious half of this and it is the wrong
+    /// half. It gives a collection that never splits and a set of tests that
+    /// pass without having looked at anything, which is worse than leaving them
+    /// out. That mistake is what kept `yo-index` out of the Miri run for a
+    /// month, from the other direction: a count that had been shrunk sitting
+    /// next to a count that had not.
+    ///
+    /// The width is the third one because it is the one that costs the most and
+    /// says the least. A rotation is `dim` squared multiplications and every
+    /// insert and every query pays for one, so a corpus in 96 dimensions is a
+    /// hundred and forty times the arithmetic of the same corpus in 8 for a
+    /// claim that is about placement rather than about geometry. Eight is where
+    /// the floor is because `corpus` now puts the energy in at least one
+    /// coordinate at any width, and a corpus with no heavy coordinate at all is
+    /// not a smaller version of the test, it is uniform noise where nothing is
+    /// near anything.
+    ///
+    /// The floors on the other two are there because below a hundred or so
+    /// members, or six or so to a posting, a split stops being a thing that
+    /// happens inside the index and becomes the whole index. Where a floor
+    /// bites, the ratio moves a little and the partition count comes out higher
+    /// rather than lower, which is the safe direction: more partitions is more
+    /// of the thing being tested.
+    ///
+    /// Tests whose claim is a number rather than a shape do not come through
+    /// here. A recall figure, a saving measured over a hundred queries, a
+    /// drifted-member count against another drifted-member count: shrinking any
+    /// of those leaves a test that still passes and no longer means anything, so
+    /// those are skipped under Miri and each one says so.
+    fn shrunk(n: usize, dim: usize, posting: usize) -> (usize, usize, usize) {
+        if cfg!(miri) {
+            ((n / 20).max(120), dim.min(8), (posting / 20).max(6))
+        } else {
+            (n, dim, posting)
+        }
     }
 
     /// One vector of the shape above, unit length.
@@ -2253,6 +2305,10 @@ mod tests {
     /// a filter down has to do, finds almost none of them, and the ones it
     /// misses were nearer than the ones it kept.
     #[test]
+    #[cfg_attr(
+        miri,
+        ignore = "the count is the claim: one document in fifty of three thousand, and the whole point is what the near misses were, which needs a corpus with near misses in it"
+    )]
     fn a_filter_in_the_scan_finds_what_a_filter_after_it_cannot() {
         let dim = 96;
         let store = corpus(dim, 3000, 12, 47);
@@ -2310,6 +2366,10 @@ mod tests {
     /// lets a superset through, so an answer that passes it and fails the exact
     /// test must not have cost an answer that passes both.
     #[test]
+    #[cfg_attr(
+        miri,
+        ignore = "the count is the claim: recall at ten where the tag lets one in ten through and the exact test keeps one in fifty"
+    )]
     fn the_exact_test_decides_and_the_scan_widens_for_it() {
         struct Summary;
 
@@ -2366,9 +2426,13 @@ mod tests {
 
     #[test]
     fn a_filter_that_matches_nothing_answers_nothing() {
-        let dim = 64;
-        let store = corpus(dim, 500, 4, 53);
-        let ix = build_tagged(&store, dim, Tuning::default(), |_| 1);
+        let (n, dim, posting) = shrunk(500, 64, Tuning::default().posting);
+        let store = corpus(dim, n, 4, 53);
+        let tuning = Tuning {
+            posting,
+            ..Tuning::default()
+        };
+        let ix = build_tagged(&store, dim, tuning, |_| 1);
         assert!(
             ix.search_where(&store.0[0], 10, &|tag: u64| tag == 2, &store)
                 .is_empty()
@@ -2380,25 +2444,29 @@ mod tests {
 
     #[test]
     fn a_tag_survives_a_split_and_a_merge() {
-        let dim = 64;
-        let store = corpus(dim, 800, 6, 59);
+        let (n, dim, posting) = shrunk(800, 64, 24);
+        let store = corpus(dim, n, 6, 59);
         let tuning = Tuning {
-            posting: 24,
+            posting,
             ..Tuning::default()
         };
         let mut ix = build_tagged(&store, dim, tuning, |id| id * 7 + 1);
         assert!(ix.partitions() > 4, "it never split");
-        for id in 0..800u64 {
+        for id in 0..n as u64 {
             assert_eq!(ix.tag(id), Some(id * 7 + 1), "id {id} after the splits");
         }
 
         // Now shrink it until partitions merge, and the survivors keep theirs.
-        for id in 0..760u64 {
+        // Forty left, whatever the corpus was, because forty is what makes the
+        // postings small enough to merge and the survivors are counted rather
+        // than sampled.
+        let left = n as u64 - 40;
+        for id in 0..left {
             ix.remove(id);
         }
         ix.maintain(&store, 1 << 20);
         consistent(&ix);
-        for id in 760..800u64 {
+        for id in left..n as u64 {
             assert_eq!(ix.tag(id), Some(id * 7 + 1), "id {id} after the merges");
         }
         assert_eq!(ix.tag(0), None);
@@ -2407,6 +2475,10 @@ mod tests {
     /// A selective filter means the answers are not in the nearest partitions,
     /// and a search that will not look further returns fewer than it should.
     #[test]
+    #[cfg_attr(
+        miri,
+        ignore = "the count is the claim: one member in a hundred of two thousand is twenty answers, and the assertion is that exact number"
+    )]
     fn a_selective_filter_makes_the_search_look_further() {
         let dim = 64;
         let store = corpus(dim, 2000, 10, 61);
@@ -2477,6 +2549,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        miri,
+        ignore = "the count is the claim: recall at ten over two thousand vectors, and a recall figure over a corpus small enough to interpret is a number about nothing"
+    )]
     fn a_search_finds_what_brute_force_finds() {
         let dim = 128;
         let store = corpus(dim, 2000, 12, 5);
@@ -2489,23 +2565,29 @@ mod tests {
 
     #[test]
     fn a_posting_that_grows_too_big_splits() {
-        let dim = 64;
+        let (n, dim, posting) = shrunk(600, 64, 32);
         let tuning = Tuning {
-            posting: 32,
+            posting,
             ..Tuning::default()
         };
-        let store = corpus(dim, 600, 6, 9);
+        let store = corpus(dim, n, 6, 9);
         let ix = build(&store, dim, tuning);
         assert!(
-            ix.partitions() >= 600 / (32 * 2),
-            "600 vectors in {} partitions",
+            ix.partitions() >= n / (posting * 2),
+            "{n} vectors in {} partitions",
             ix.partitions()
         );
-        for posting in &ix.postings {
+        // Over the limit is allowed for a posting that gave up, which is a
+        // posting with no cut in it worth taking, and `stuck` is how it says so.
+        // That case does not come up at six hundred vectors in sixty four
+        // dimensions and does come up at a size Miri can afford, where the merge
+        // threshold is low enough that a lopsided cut would be undone as fast as
+        // it was made.
+        for held in &ix.postings {
             assert!(
-                posting.len() <= 32 * 2,
-                "a posting is {} long",
-                posting.len()
+                held.len() <= posting * 2 || held.len() <= held.stuck,
+                "a posting is {} long and did not give up splitting",
+                held.len()
             );
         }
         consistent(&ix);
@@ -2513,18 +2595,21 @@ mod tests {
 
     #[test]
     fn a_posting_that_shrinks_merges() {
-        let dim = 64;
+        let (n, dim, posting) = shrunk(600, 64, 32);
         let tuning = Tuning {
-            posting: 32,
+            posting,
             ..Tuning::default()
         };
-        let store = corpus(dim, 600, 6, 9);
+        let store = corpus(dim, n, 6, 9);
         let mut ix = build(&store, dim, tuning);
         let grown = ix.partitions();
         assert!(grown > 4);
 
-        // Take away almost everything and let maintenance settle.
-        for id in 0..570u64 {
+        // Take away almost everything and let maintenance settle. Thirty left,
+        // whatever the corpus was, because thirty is under the merge threshold
+        // for any posting size this runs at.
+        let left = n as u64 - 30;
+        for id in 0..left {
             assert!(ix.remove(id));
         }
         ix.maintain(&store, 1 << 20);
@@ -2536,8 +2621,9 @@ mod tests {
             ix.partitions()
         );
         // And it still answers.
-        let hits = ix.search(&store.0[599], 1, &store);
-        assert_eq!(hits[0].id, 599);
+        let last = n as u64 - 1;
+        let hits = ix.search(&store.0[last as usize], 1, &store);
+        assert_eq!(hits[0].id, last);
     }
 
     /// Maintenance finishes, rather than taking turns with itself forever.
@@ -2575,16 +2661,23 @@ mod tests {
 
     #[test]
     fn a_removed_vector_stops_coming_back() {
-        let dim = 64;
-        let store = corpus(dim, 400, 4, 11);
-        let mut ix = build(&store, dim, Tuning::default());
+        let (n, dim, posting) = shrunk(400, 64, Tuning::default().posting);
+        let store = corpus(dim, n, 4, 11);
+        let mut ix = build(
+            &store,
+            dim,
+            Tuning {
+                posting,
+                ..Tuning::default()
+            },
+        );
         let q = store.0[7].clone();
         assert_eq!(ix.search(&q, 1, &store)[0].id, 7);
 
         assert!(ix.remove(7));
         assert!(!ix.remove(7), "removing it twice should say so");
         assert!(!ix.contains(7));
-        assert_eq!(ix.len(), 399);
+        assert_eq!(ix.len(), n - 1);
         consistent(&ix);
         assert!(ix.search(&q, 5, &store).iter().all(|h| h.id != 7));
     }
@@ -2600,17 +2693,18 @@ mod tests {
     /// means more than one copy of some things and not of everything.
     #[test]
     fn spilling_puts_boundary_vectors_in_more_than_one_partition() {
-        let dim = 32;
-        let store = corpus(dim, 3000, 12, 5);
-        let off = Tuning {
-            spill: 1,
+        let (n, dim, posting) = shrunk(3000, 32, Tuning::default().posting);
+        let store = corpus(dim, n, 12, 5);
+        let base = Tuning {
+            posting,
             ..Tuning::default()
         };
+        let off = Tuning { spill: 1, ..base };
         let none = build(&store, dim, off);
         consistent(&none);
         assert_eq!(copies(&none), 1.0, "spill of one is one copy of everything");
 
-        let on = build(&store, dim, Tuning::default());
+        let on = build(&store, dim, base);
         consistent(&on);
         let rate = copies(&on);
         assert!(rate > 1.0, "spilling should make copies, made {rate}");
@@ -2640,14 +2734,15 @@ mod tests {
     /// else made.
     #[test]
     fn a_copy_is_found_from_the_partition_it_was_copied_into() {
-        let dim = 32;
-        let store = corpus(dim, 3000, 12, 5);
+        let (n, dim, posting) = shrunk(3000, 32, Tuning::default().posting);
+        let store = corpus(dim, n, 12, 5);
         let t = Tuning {
+            posting,
             slack: 0.25,
             ..Tuning::default()
         };
         let mut ix = build(&store, dim, t);
-        let (id, copies) = (0..3000u64)
+        let (id, copies) = (0..n as u64)
             .filter_map(|id| {
                 let mut places = Vec::new();
                 ix.every_place(id, &mut places);
@@ -2682,6 +2777,10 @@ mod tests {
     /// partitions that had stopped paying, so the two things to show are that it
     /// reads fewer of them and that the answers survive it.
     #[test]
+    #[cfg_attr(
+        miri,
+        ignore = "the count is the claim: a saving measured as partitions read per query over a hundred queries, against a recall that has to survive it"
+    )]
     fn patience_reads_fewer_partitions_and_keeps_the_answers() {
         let dim = 32;
         let store = corpus(dim, 4000, 16, 77);
@@ -2725,6 +2824,10 @@ mod tests {
     /// nothing passes is why `widen` exists, and a search that gave up on it
     /// after two quiet partitions would return nothing at all.
     #[test]
+    #[cfg_attr(
+        miri,
+        ignore = "the count is the claim: ten answers at one member in fifty, spread over enough partitions that the first few cannot hold them"
+    )]
     fn patience_does_not_cut_off_a_filter_that_is_still_short() {
         let dim = 32;
         let store = corpus(dim, 4000, 16, 91);
@@ -2760,11 +2863,12 @@ mod tests {
     /// caller sees.
     #[test]
     fn a_replicated_member_comes_back_once() {
-        let dim = 32;
-        let store = corpus(dim, 2000, 8, 31);
+        let (n, dim, posting) = shrunk(2000, 32, Tuning::default().posting);
+        let store = corpus(dim, n, 8, 31);
         // Every partition, so that every copy of every member is read and the
         // duplicates are certain rather than likely.
         let t = Tuning {
+            posting,
             probe: 1 << 20,
             ..Tuning::default()
         };
@@ -2784,12 +2888,19 @@ mod tests {
     /// and `consistent` is what says it did not.
     #[test]
     fn removing_a_replicated_member_takes_every_copy() {
-        let dim = 32;
-        let store = corpus(dim, 1500, 6, 41);
-        let mut ix = build(&store, dim, Tuning::default());
+        let (n, dim, posting) = shrunk(1500, 32, Tuning::default().posting);
+        let store = corpus(dim, n, 6, 41);
+        let mut ix = build(
+            &store,
+            dim,
+            Tuning {
+                posting,
+                ..Tuning::default()
+            },
+        );
         let before: usize = ix.postings.iter().map(Posting::len).sum();
         let mut gone = 0usize;
-        for id in (0..1500u64).step_by(3) {
+        for id in (0..n as u64).step_by(3) {
             gone += ix.placements_of(id);
             assert!(ix.remove(id));
             assert!(!ix.contains(id));
@@ -2797,8 +2908,8 @@ mod tests {
         consistent(&ix);
         let after: usize = ix.postings.iter().map(Posting::len).sum();
         assert_eq!(before - after, gone, "a copy was left behind");
-        assert_eq!(ix.len(), 1000);
-        for id in (0..1500u64).step_by(3) {
+        assert_eq!(ix.len(), n - n.div_ceil(3));
+        for id in (0..n as u64).step_by(3) {
             let q = &store.0[id as usize];
             assert!(ix.search(q, 5, &store).iter().all(|h| h.id != id));
         }
@@ -2809,9 +2920,13 @@ mod tests {
     /// fresh one in another is the worst kind of wrong.
     #[test]
     fn retagging_a_replicated_member_reaches_every_copy() {
-        let dim = 32;
-        let store = corpus(dim, 1200, 6, 47);
-        let mut ix = Partitions::new(dim, Bits::One, 7, Tuning::default());
+        let (n, dim, posting) = shrunk(1200, 32, Tuning::default().posting);
+        let store = corpus(dim, n, 6, 47);
+        let tuning = Tuning {
+            posting,
+            ..Tuning::default()
+        };
+        let mut ix = Partitions::new(dim, Bits::One, 7, tuning);
         for (i, v) in store.0.iter().enumerate() {
             ix.insert_tagged(i as u64, v, 1);
             if i % 64 == 0 {
@@ -2819,8 +2934,37 @@ mod tests {
             }
         }
         ix.maintain(&store, 1 << 20);
-        let spread = (0..1200u64).find(|&id| ix.placements_of(id) > 1);
-        let id = spread.expect("some member is in more than one partition");
+
+        // A member put on a boundary rather than one the corpus happened to
+        // leave there. Halfway between the two centroids nearest each other is
+        // the same distance from both, which is inside the slack at any width
+        // and any corpus size, so this is a copy by construction. Scanning for a
+        // member that spilled on its own worked at twelve hundred vectors in
+        // thirty two dimensions and found nothing at all at a size Miri can
+        // afford, which is the usual reward for a test that waits for luck.
+        let mut pair = (0, 1, f32::INFINITY);
+        for a in 0..ix.partitions() {
+            for b in a + 1..ix.partitions() {
+                let d = sqdist(ix.centroid(a), ix.centroid(b));
+                if d < pair.2 {
+                    pair = (a, b, d);
+                }
+            }
+        }
+        let (a, b, _) = pair;
+        let mid: Vec<f32> = ix
+            .centroid(a)
+            .iter()
+            .zip(ix.centroid(b))
+            .map(|(x, y)| (x + y) / 2.0)
+            .collect();
+        let id = n as u64;
+        ix.insert_tagged(id, &mid, 1);
+        assert!(
+            ix.placements_of(id) > 1,
+            "a member equidistant from the two nearest centroids was not copied"
+        );
+
         assert!(ix.retag(id, 9));
         let mut copies = Vec::new();
         ix.every_place(id, &mut copies);
@@ -2835,9 +2979,16 @@ mod tests {
 
     #[test]
     fn inserting_the_same_id_twice_replaces_it() {
-        let dim = 64;
-        let store = corpus(dim, 200, 2, 13);
-        let mut ix = build(&store, dim, Tuning::default());
+        let (n, dim, posting) = shrunk(200, 64, Tuning::default().posting);
+        let store = corpus(dim, n, 2, 13);
+        let mut ix = build(
+            &store,
+            dim,
+            Tuning {
+                posting,
+                ..Tuning::default()
+            },
+        );
         let before = ix.len();
         ix.insert(3, &store.0[3]);
         assert_eq!(ix.len(), before);
@@ -2852,6 +3003,10 @@ mod tests {
     /// collection looks like when a pipeline embeds the same document a thousand
     /// times, and getting it wrong is a hang rather than a wrong answer.
     #[test]
+    #[cfg_attr(
+        miri,
+        ignore = "the count is the claim: a thousand identical vectors is what makes maintenance try the same split over and over, and the failure it looks for is a hang"
+    )]
     fn a_thousand_copies_of_one_vector_do_not_spin() {
         let dim = 32;
         let one = corpus(dim, 1, 1, 41).0.pop().expect("one vector");
@@ -2879,6 +3034,10 @@ mod tests {
     /// writes and deletes rather than on a fresh build, because a fresh build is
     /// the measurement that hides drift.
     #[test]
+    #[cfg_attr(
+        miri,
+        ignore = "the count is the claim: recall at the end of three thousand writes with a tenth of them churned, and a short stream is a fresh build, which is the measurement this one exists to avoid"
+    )]
     fn recall_holds_over_a_write_stream_with_no_rebuild() {
         let dim = 96;
         let store = corpus(dim, 3000, 15, 17);
@@ -2917,6 +3076,10 @@ mod tests {
     /// by a percent for reasons that have nothing to do with this, so the
     /// straight count is the honest measurement.
     #[test]
+    #[cfg_attr(
+        miri,
+        ignore = "the count is the claim: drifted members with the sweep against drifted members without it, and the assertion is the ratio between the two"
+    )]
     fn the_sweep_is_what_keeps_members_under_their_nearest_centroid() {
         let dim = 96;
         let store = corpus(dim, 2000, 10, 29);
@@ -2957,10 +3120,10 @@ mod tests {
 
     #[test]
     fn a_vector_the_log_forgot_is_dropped_rather_than_returned() {
-        let dim = 64;
-        let store = corpus(dim, 400, 4, 31);
+        let (n, dim, posting) = shrunk(400, 64, 24);
+        let store = corpus(dim, n, 4, 31);
         let tuning = Tuning {
-            posting: 24,
+            posting,
             ..Tuning::default()
         };
         let mut ix = build(&store, dim, tuning);
@@ -2975,8 +3138,10 @@ mod tests {
                 .all(|h| h.id != 11)
         );
 
-        // And maintenance walking over it takes it out for good.
-        for id in 0..300u64 {
+        // And maintenance walking over it takes it out for good. Everything but
+        // the last hundred, so that the postings around the hole get rewritten
+        // whatever the corpus was.
+        for id in 0..n as u64 - 100 {
             ix.remove(id);
         }
         ix.maintain(&holey, 1 << 20);

@@ -910,6 +910,10 @@ mod tests {
     /// rather than an index, so this is the one that actually exercises the
     /// splits and the maintenance the writes pay for.
     #[test]
+    #[cfg_attr(
+        miri,
+        ignore = "the count is the claim: recall over two thousand writes, and two thousand writes is also the only reason there is more than one partition to measure"
+    )]
     fn recall_holds_once_the_index_has_split() {
         let mut c = Collection::new(8, Metric::L2).unwrap();
         let mut seed = 0x2026u64;

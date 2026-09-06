@@ -203,6 +203,10 @@ fn full_head(u: &[f32], centroids: &[f32], dim: usize, n: usize, want: usize) ->
 /// The half of the idea that worked, kept so that the doc's claim about it is
 /// checkable: at four bits the shortlist really does bring back the exact head.
 #[test]
+#[cfg_attr(
+    miri,
+    ignore = "the count is the claim: an exact shortlist of sixteen out of two thousand centroids, a hundred queries deep and at two widths, and none of that survives being made small"
+)]
 fn coding_the_centroids_would_have_given_the_right_answer() {
     for dim in [32usize, 128] {
         let n = 2000;

@@ -488,6 +488,33 @@ mod tests {
         c
     }
 
+    /// A width, a corpus size and a posting size, shrunk together for Miri.
+    ///
+    /// Everything in this module is a round trip, and a round trip is the kind
+    /// of claim that holds at any size: the shape that went in is the shape that
+    /// comes back, the codes were not recomputed, a copy is still a copy. None
+    /// of it is a number about how well the index answers. So the three tests
+    /// that were too slow to run interpreted are made small rather than skipped,
+    /// which is worth doing here more than anywhere else in the crate, because
+    /// saving and loading is where the unaligned reads and the raw offsets live
+    /// and those are the only thing Miri is actually here for.
+    ///
+    /// The three move together for the reason the same helper in `partition`
+    /// gives. The corpus and the posting set the partition count between them,
+    /// and cutting the corpus on its own gives a collection with one partition
+    /// in it, which passes every assertion here without having saved anything
+    /// worth loading. The width is separate and is the one that costs the most:
+    /// a rotation is `dim` squared multiplications, so a collection 8 wide is a
+    /// sixteenth of the arithmetic of the same collection 32 wide, for a claim
+    /// that never mentions geometry.
+    fn shrunk(dim: usize, n: usize, posting: usize) -> (usize, usize, usize) {
+        if cfg!(miri) {
+            (dim.min(8), (n / 4).max(200), (posting / 8).max(24))
+        } else {
+            (dim, n, posting)
+        }
+    }
+
     fn round_trip(c: &Collection, stored: &impl Stored) -> Restored {
         let mut mem = Mem::new();
         let mut scratch = Scratch::new();
@@ -497,7 +524,12 @@ mod tests {
 
     #[test]
     fn a_collection_comes_back_answering_the_same_questions() {
-        let c = built(32, 900, Metric::L2);
+        let (dim, n, posting) = shrunk(32, 900, Tuning::default().posting);
+        let tuning = Tuning {
+            posting,
+            ..Tuning::default()
+        };
+        let c = built_from(dim, Metric::L2, tuning, corpus(dim, n, 42));
         let back = round_trip(&c, &Table::of(&c)).collection;
 
         assert_eq!(back.len(), c.len());
@@ -518,7 +550,7 @@ mod tests {
         // recomputed, so the candidates are the same candidates and the rerank
         // measures the same vectors. Queries the collection has never seen, so
         // that this is a search and not a lookup.
-        for (_, q) in corpus(32, 50, 7) {
+        for (_, q) in corpus(dim, if cfg!(miri) { 8 } else { 50 }, 7) {
             assert_eq!(
                 back.search(&q, 10, None).expect("search"),
                 c.search(&q, 10, None).expect("search"),
@@ -544,11 +576,13 @@ mod tests {
     /// the test would pass without ever exercising what it is named after.
     #[test]
     fn the_boundary_copies_survive_a_round_trip() {
+        let (dim, n, posting) = shrunk(32, 3000, Tuning::default().posting);
         let tuning = Tuning {
             slack: 0.25,
+            posting,
             ..Tuning::default()
         };
-        let c = built_from(32, Metric::L2, tuning, clustered(32, 3000, 12, 42));
+        let c = built_from(dim, Metric::L2, tuning, clustered(dim, n, 12, 42));
         assert!(
             c.entries() > c.len(),
             "a collection with no copies in it proves nothing here"
@@ -634,11 +668,19 @@ mod tests {
     /// than one record, and the key table is the section that gets there first:
     /// five thousand short keys is already past 64 KiB. Nothing above this
     /// module knows the difference, which is the thing being checked.
+    ///
+    /// What has to be past 64 KiB is the table, not the number of rows in it, so
+    /// under Miri it gets there on four hundred long keys instead of five
+    /// thousand short ones. That is the same section over the same chunk
+    /// boundary for an eighth of the writes, and the assertion below that some
+    /// section really was cut up is what says the substitution worked.
     #[test]
     fn a_section_longer_than_a_chunk_is_still_one_section() {
+        let (rows, pad) = if cfg!(miri) { (400, 160) } else { (5000, 0) };
         let mut c = Collection::new(8, Metric::L2).expect("a collection");
-        for (i, (_, v)) in corpus(8, 5000, 11).into_iter().enumerate() {
-            c.put(format!("key{i}").as_bytes(), &v).expect("put");
+        for (i, (_, v)) in corpus(8, rows, 11).into_iter().enumerate() {
+            let key = format!("key{i}{}", "x".repeat(pad));
+            c.put(key.as_bytes(), &v).expect("put");
         }
 
         let mut mem = Mem::new();
