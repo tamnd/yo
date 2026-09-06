@@ -708,6 +708,13 @@ pub struct Server {
     /// across a run: a running script calls commands, and those take locks of
     /// their own.
     scripts: Lock<lua::Scripts>,
+    /// Every library `FUNCTION LOAD` has taken, and what each one registered.
+    ///
+    /// Data only. A callback is a Lua value and there is an interpreter per
+    /// thread, so what is here is the name, the code, the digest of the code and
+    /// one row per function, and every thread compiles the code for itself the
+    /// first time one of its clients calls into the library.
+    libraries: Lock<lua::library::Libraries>,
     /// Set by `SHUTDOWN`, and read by whatever is turning the loop.
     ///
     /// A flag rather than an exit, because the command layer is not what owns
@@ -752,6 +759,7 @@ impl Server {
             search: Lock::new(Registry::new()),
             cursors: Lock::default(),
             scripts: Lock::default(),
+            libraries: Lock::default(),
             stopping: AtomicBool::new(false),
         }
     }
@@ -811,6 +819,7 @@ impl Server {
             search: Lock::new(Registry::new()),
             cursors: Lock::default(),
             scripts: Lock::default(),
+            libraries: Lock::default(),
             stopping: AtomicBool::new(false),
         }
     }
@@ -3377,10 +3386,12 @@ mod tests {
             "-ERR FUNCTION FLUSH only supports SYNC|ASYNC option\r\n"
         );
         // A second argument after the mode is the generic one instead, because
-        // the count is checked before the word is looked at.
+        // the count is checked before the word is looked at. The subcommand in
+        // the sentence is the client's own spelling and not the canonical one,
+        // which is the same thing `unknown subcommand` does.
         assert_eq!(
             f.run(&[b"FUNCTION", b"FLUSH", b"sync", b"sync"]),
-            "-ERR unknown subcommand or wrong number of arguments for 'flush'. Try FUNCTION HELP.\r\n"
+            "-ERR unknown subcommand or wrong number of arguments for 'FLUSH'. Try FUNCTION HELP.\r\n"
         );
         assert_eq!(
             f.run(&[b"FUNCTION", b"LIST", b"bogus"]),
@@ -3391,11 +3402,11 @@ mod tests {
             "-ERR wrong number of arguments for 'script|exists' command\r\n"
         );
 
-        // The library half still needs somewhere for a library to come from,
-        // and says so rather than answering OK to a load that loaded nothing.
+        // DUMP and RESTORE are the two that are still not here, since both are
+        // about the RDB payload rather than about libraries.
         assert_eq!(
-            f.run(&[b"FUNCTION", b"STATS"]),
-            "-ERR unknown subcommand 'STATS'. Try FUNCTION HELP.\r\n"
+            f.run(&[b"FUNCTION", b"DUMP"]),
+            "-ERR unknown subcommand 'DUMP'. Try FUNCTION HELP.\r\n"
         );
     }
 
@@ -4554,6 +4565,506 @@ mod tests {
                 b"0",
             ]),
             "$8\r\ncmsgpack\r\n"
+        );
+    }
+
+    /// The library used by most of the function tests below.
+    ///
+    /// Written out once because every one of them wants a library that has
+    /// something to call, and because the line numbers in the failures a couple
+    /// of them check are line numbers in this.
+    const LIB: &[u8] = b"#!lua name=mylib\n\
+        local counter = 0\n\
+        redis.register_function{function_name = 'ping', description = 'says pong',\n\
+        callback = function(keys, args) return 'pong' end, flags = {'no-writes'}}\n\
+        redis.register_function('count', function() counter = counter + 1 return counter end)\n\
+        redis.register_function('echo', function(keys, args) return {keys, args} end)\n\
+        redis.register_function('setit', function(keys, args) \
+        return redis.call('SET', keys[1], args[1]) end)\n\
+        redis.register_function('raise', function() error('boom') end)\n";
+
+    #[test]
+    fn a_library_is_loaded_once_and_called_by_name_forever_after() {
+        let mut f = Fixture::new();
+        assert_eq!(f.run(&[b"FUNCTION", b"LOAD", LIB]), "$5\r\nmylib\r\n");
+        assert_eq!(f.run(&[b"FCALL", b"ping", b"0"]), "$4\r\npong\r\n");
+        // The dictionary FCALL looks in is one for the whole server and it does
+        // not care about case, which is why this finds the same function.
+        assert_eq!(f.run(&[b"FCALL", b"PiNg", b"0"]), "$4\r\npong\r\n");
+        // Keys and arguments arrive as the two arguments of the callback rather
+        // than as globals, and a function that reads KEYS is reading a name
+        // that is not there.
+        assert_eq!(
+            f.run(&[b"FCALL", b"echo", b"1", b"k", b"a", b"b"]),
+            "*2\r\n*1\r\n$1\r\nk\r\n*2\r\n$1\r\na\r\n$1\r\nb\r\n"
+        );
+        assert_eq!(f.run(&[b"FCALL", b"setit", b"1", b"s", b"v"]), "+OK\r\n");
+        assert_eq!(f.run(&[b"GET", b"s"]), "$1\r\nv\r\n");
+        // A library's own local outlives the call that made it, which is the
+        // whole reason a library is not a script.
+        assert_eq!(f.run(&[b"FCALL", b"count", b"0"]), ":1\r\n");
+        assert_eq!(f.run(&[b"FCALL", b"count", b"0"]), ":2\r\n");
+        // The name a failure ends with is the function's, where a script's is
+        // its digest, and the line is a line in the library.
+        assert_eq!(
+            f.run(&[b"FCALL", b"raise", b"0"]),
+            "-ERR user_function:8: boom script: raise, on @user_function:8.\r\n"
+        );
+        // Deleting is by the exact name, so the upper case spelling that found
+        // the function a moment ago does not find the library.
+        assert_eq!(
+            f.run(&[b"FUNCTION", b"DELETE", b"MYLIB"]),
+            "-ERR Library not found\r\n"
+        );
+        assert_eq!(f.run(&[b"FUNCTION", b"DELETE", b"mylib"]), "+OK\r\n");
+        assert_eq!(
+            f.run(&[b"FCALL", b"ping", b"0"]),
+            "-ERR Function not found\r\n"
+        );
+    }
+
+    #[test]
+    fn a_library_that_is_wrong_says_which_way_it_is_wrong() {
+        let mut f = Fixture::new();
+        for (code, want) in [
+            (&b"return 1"[..], "ERR Missing library metadata"),
+            (b"#!lua name=x", "ERR Invalid library metadata"),
+            (b"#!\n", "ERR Library name was not given"),
+            (b"#!lua\nx", "ERR Library name was not given"),
+            (
+                b"#!lua name=a name=b\nx",
+                "ERR Invalid metadata value, name argument was given multiple times",
+            ),
+            (
+                b"#!lua nome=a\nx",
+                "ERR Invalid metadata value given: nome=a",
+            ),
+            (b"#!lua name=\"q\nx", "ERR Invalid library metadata"),
+            (
+                b"#!lua name=a-b\nx",
+                "ERR Library names can only contain letters, numbers, or underscores(_) \
+                 and must be at least one character long",
+            ),
+            (b"#!zz name=x\nx", "ERR Engine 'zz' not found"),
+            (
+                b"#!lua name=c\nthis is not lua",
+                "ERR Error compiling function: user_function:2: '=' expected near 'is'",
+            ),
+            // Nothing at all is on the global table during a load except one
+            // table with eight names on it, so `error` is as absent as anything
+            // a library misspelled would be.
+            (
+                b"#!lua name=r\nerror('boom')",
+                "ERR Error registering functions: ERR user_function:2: \
+                 Script attempted to access nonexistent global variable 'error'",
+            ),
+            // And `redis` is there but `redis.call` is not, so the name the
+            // complaint gives is `call` and not `redis`.
+            (
+                b"#!lua name=r\nredis.call('PING')",
+                "ERR Error registering functions: ERR user_function:2: \
+                 Script attempted to access nonexistent global variable 'call'",
+            ),
+            (
+                b"#!lua name=r\nx = 1",
+                "ERR Error registering functions: ERR user_function:2: \
+                 Attempt to modify a readonly table",
+            ),
+            (b"#!lua name=n\nlocal x = 1", "ERR No functions registered"),
+        ] {
+            assert_eq!(
+                f.run(&[b"FUNCTION", b"LOAD", code]),
+                format!("-{want}\r\n"),
+                "{}",
+                String::from_utf8_lossy(code),
+            );
+        }
+    }
+
+    #[test]
+    fn register_function_turns_away_every_call_it_cannot_make_sense_of() {
+        let mut f = Fixture::new();
+        for (call, want) in [
+            (
+                &b"redis.register_function()"[..],
+                "wrong number of arguments to redis.register_function",
+            ),
+            (
+                b"redis.register_function('a', function() end, 1)",
+                "wrong number of arguments to redis.register_function",
+            ),
+            (
+                b"redis.register_function('a')",
+                "calling redis.register_function with a single argument is only \
+                 applicable to Lua table (representing named arguments).",
+            ),
+            (
+                b"redis.register_function({foo = 'a'})",
+                "unknown argument given to redis.register_function",
+            ),
+            (
+                b"redis.register_function({callback = function() end})",
+                "redis.register_function must get a function name argument",
+            ),
+            (
+                b"redis.register_function({function_name = 'a'})",
+                "redis.register_function must get a callback argument",
+            ),
+            (
+                b"redis.register_function({function_name = {}, callback = function() end})",
+                "function_name argument given to redis.register_function must be a string",
+            ),
+            (
+                b"redis.register_function({function_name = 'a', description = {}, \
+                  callback = function() end})",
+                "description argument given to redis.register_function must be a string",
+            ),
+            (
+                b"redis.register_function({function_name = 'a', callback = 1})",
+                "callback argument given to redis.register_function must be a function",
+            ),
+            (
+                b"redis.register_function({function_name = 'a', callback = function() end, \
+                  flags = 1})",
+                "flags argument to redis.register_function must be a table \
+                 representing function flags",
+            ),
+            (
+                b"redis.register_function({function_name = 'a', callback = function() end, \
+                  flags = {'zz'}})",
+                "unknown flag given",
+            ),
+            (
+                b"redis.register_function({}, function() end)",
+                "first argument to redis.register_function must be a string",
+            ),
+            (
+                b"redis.register_function('a', 1)",
+                "second argument to redis.register_function must be a function",
+            ),
+            (
+                b"redis.register_function('a-b', function() end)",
+                "Library names can only contain letters, numbers, or underscores(_) \
+                 and must be at least one character long",
+            ),
+            (
+                b"redis.register_function('d', function() end) \
+                  redis.register_function('d', function() end)",
+                "Function already exists in the library",
+            ),
+        ] {
+            let mut code = b"#!lua name=e\n".to_vec();
+            code.extend_from_slice(call);
+            // Two `ERR` in a row on purpose. The sentence comes back as a table
+            // with the code already on it, which is what keeps the position off
+            // the front of it, and then the code goes on the line as well.
+            assert_eq!(
+                f.run(&[b"FUNCTION", b"LOAD", &code]),
+                format!("-ERR Error registering functions: ERR {want}\r\n"),
+                "{}",
+                String::from_utf8_lossy(call),
+            );
+        }
+        // A number is a name, because the C reads an argument that should be a
+        // string through a helper that takes a number and prints it.
+        assert_eq!(
+            f.run(&[
+                b"FUNCTION",
+                b"LOAD",
+                b"#!lua name=n\nredis.register_function(12, function() return 1 end)",
+            ]),
+            "$1\r\nn\r\n"
+        );
+        assert_eq!(f.run(&[b"FCALL", b"12", b"0"]), ":1\r\n");
+        // The dictionary inside one library is case sensitive where the one
+        // across libraries is not, so these are two functions.
+        assert_eq!(
+            f.run(&[
+                b"FUNCTION",
+                b"LOAD",
+                b"#!lua name=c\nredis.register_function('d', function() return 1 end) \
+                  redis.register_function('D', function() return 2 end)",
+            ]),
+            "$1\r\nc\r\n"
+        );
+    }
+
+    #[test]
+    fn a_library_cannot_take_a_name_another_library_already_has() {
+        let mut f = Fixture::new();
+        assert_eq!(f.run(&[b"FUNCTION", b"LOAD", LIB]), "$5\r\nmylib\r\n");
+        assert_eq!(
+            f.run(&[b"FUNCTION", b"LOAD", LIB]),
+            "-ERR Library 'mylib' already exists\r\n"
+        );
+        // A different library that registers a name the first one already has,
+        // which is checked without regard to case because the dictionary it is
+        // checked against is.
+        assert_eq!(
+            f.run(&[
+                b"FUNCTION",
+                b"LOAD",
+                b"#!lua name=other\nredis.register_function('PING', function() return 1 end)",
+            ]),
+            "-ERR Function PING already exists\r\n"
+        );
+        // REPLACE reloads a library over itself, and the collision check leaves
+        // the library being replaced out or nothing could ever be reloaded.
+        assert_eq!(
+            f.run(&[b"FUNCTION", b"LOAD", b"REPLACE", LIB]),
+            "$5\r\nmylib\r\n"
+        );
+        // The counter went back to zero with the reload, since the library is a
+        // new one and its locals are new with it.
+        assert_eq!(f.run(&[b"FCALL", b"count", b"0"]), ":1\r\n");
+        assert_eq!(
+            f.run(&[b"FUNCTION", b"LOAD", b"NOPE", LIB]),
+            "-ERR Unknown option given: NOPE\r\n"
+        );
+        // The loop that reads the options stops one short of the end, so the
+        // last argument is the code whatever it looks like.
+        assert_eq!(
+            f.run(&[b"FUNCTION", b"LOAD", b"REPLACE"]),
+            "-ERR Missing library metadata\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"FUNCTION", b"LOAD"]),
+            "-ERR wrong number of arguments for 'function|load' command\r\n"
+        );
+    }
+
+    #[test]
+    fn fcall_checks_the_name_before_it_looks_at_anything_else() {
+        let mut f = Fixture::new();
+        assert_eq!(f.run(&[b"FUNCTION", b"LOAD", LIB]), "$5\r\nmylib\r\n");
+        for (args, want) in [
+            (&[&b"nosuch"[..], b"x"][..], "ERR Function not found"),
+            (&[b"ping", b"x"], "ERR Bad number of keys provided"),
+            (&[b"ping", b"1.5"], "ERR Bad number of keys provided"),
+            (&[b"ping", b"+1"], "ERR Bad number of keys provided"),
+            (
+                &[b"ping", b"99999999999999999999"],
+                "ERR Bad number of keys provided",
+            ),
+            (
+                &[b"ping", b"3", b"a"],
+                "ERR Number of keys can't be greater than number of args",
+            ),
+            (&[b"ping", b"-1"], "ERR Number of keys can't be negative"),
+        ] {
+            let mut wire: Vec<&[u8]> = vec![b"FCALL"];
+            wire.extend_from_slice(args);
+            assert_eq!(f.run(&wire), format!("-{want}\r\n"), "{args:?}");
+        }
+        // The read-only spelling refuses a function the library did not mark
+        // no-writes, and it refuses it before anything runs.
+        assert_eq!(
+            f.run(&[b"FCALL_RO", b"setit", b"1", b"s", b"v"]),
+            "-ERR Can not execute a script with write flag using *_ro command.\r\n"
+        );
+        assert_eq!(f.run(&[b"FCALL_RO", b"ping", b"0"]), "$4\r\npong\r\n");
+        assert_eq!(
+            f.run(&[b"FCALL_RO", b"nosuch", b"0"]),
+            "-ERR Function not found\r\n"
+        );
+        // And a function that was marked no-writes is held to it whichever
+        // spelling called it.
+        assert_eq!(
+            f.run(&[
+                b"FUNCTION",
+                b"LOAD",
+                b"#!lua name=w\nredis.register_function{function_name = 'w', \
+                  flags = {'no-writes'}, callback = function(keys) \
+                  return redis.call('SET', keys[1], 'x') end}",
+            ]),
+            "$1\r\nw\r\n"
+        );
+        assert!(
+            f.run(&[b"FCALL", b"w", b"1", b"k"])
+                .starts_with("-ERR Write commands are not allowed from read-only scripts."),
+        );
+    }
+
+    #[test]
+    fn a_function_gets_the_globals_a_script_gets_minus_the_ones_only_eval_has() {
+        let mut f = Fixture::new();
+        // The three names on the `redis` table that only mean something inside
+        // EVAL are not there, and neither is the error handler EVAL installs.
+        let names = "LOG_DEBUG LOG_NOTICE LOG_VERBOSE LOG_WARNING REDIS_VERSION \
+                     REDIS_VERSION_NUM REPL_ALL REPL_AOF REPL_NONE REPL_REPLICA REPL_SLAVE \
+                     acl_check_cmd call error_reply log pcall set_repl setresp sha1hex \
+                     status_reply";
+        let globals = "_G _VERSION assert bit cjson cmsgpack collectgarbage coroutine error \
+                       gcinfo getmetatable ipairs load loadstring math next os pairs pcall \
+                       rawequal rawget rawset redis select setmetatable string struct table \
+                       tonumber tostring type unpack xpcall";
+        assert_eq!(
+            f.run(&[
+                b"FUNCTION",
+                b"LOAD",
+                b"#!lua name=g\n\
+                  local function sorted(t) local o = {} for k in pairs(t) do o[#o+1] = k end \
+                  table.sort(o) return table.concat(o, ' ') end\n\
+                  redis.register_function('names', function() return sorted(redis) end)\n\
+                  redis.register_function('globals', function() return sorted(_G) end)\n\
+                  redis.register_function('keysg', function() return KEYS[1] end)\n\
+                  redis.register_function('zzz', function() return tostring(redis.zzz) end)\n\
+                  redis.register_function('wr', function() rawset(_G, 'x', 1) end)\n\
+                  redis.register_function('gwr', function() _G.pcall = 1 end)\n",
+            ]),
+            "$1\r\ng\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"FCALL", b"names", b"0"]),
+            format!("${}\r\n{names}\r\n", names.len())
+        );
+        assert_eq!(
+            f.run(&[b"FCALL", b"globals", b"0"]),
+            format!("${}\r\n{globals}\r\n", globals.len())
+        );
+        // No `KEYS`, and reading a global that is not there is a mistake rather
+        // than a nil, so this is the sandbox's own complaint.
+        assert!(
+            f.run(&[b"FCALL", b"keysg", b"1", b"k"])
+                .contains("nonexistent global variable 'KEYS'"),
+        );
+        // The `redis` table has no error metatable on it, unlike the global
+        // table, so a name that is not on it is a nil and not a complaint.
+        assert_eq!(f.run(&[b"FCALL", b"zzz", b"0"]), "$3\r\nnil\r\n");
+        // The global table cannot be written to either way round, which is a
+        // stricter rule than the one a script runs under.
+        for name in [&b"wr"[..], b"gwr"] {
+            assert!(
+                f.run(&[b"FCALL", name, b"0"])
+                    .contains("Attempt to modify a readonly table"),
+                "{}",
+                String::from_utf8_lossy(name),
+            );
+        }
+    }
+
+    #[test]
+    fn function_list_says_what_every_library_registered() {
+        let mut f = Fixture::new();
+        assert_eq!(f.run(&[b"FUNCTION", b"LOAD", LIB]), "$5\r\nmylib\r\n");
+        // One map per library on RESP3, and the functions inside it in the
+        // order the library registered them, which is D-109.
+        f.out = Out::new(Proto::Resp3);
+        let listed = f.run(&[b"FUNCTION", b"LIST"]);
+        assert!(listed.starts_with("*1\r\n%3\r\n$12\r\nlibrary_name\r\n$5\r\nmylib\r\n"));
+        assert!(listed.contains("$6\r\nengine\r\n$3\r\nLUA\r\n"));
+        assert!(listed.contains(
+            "%3\r\n$4\r\nname\r\n$4\r\nping\r\n\
+             $11\r\ndescription\r\n$9\r\nsays pong\r\n$5\r\nflags\r\n~1\r\n+no-writes\r\n"
+        ));
+        // A function with no description gets a null rather than an empty
+        // string, and no flags is an empty set rather than a missing field.
+        assert!(listed.contains(
+            "$4\r\nname\r\n$5\r\ncount\r\n$11\r\ndescription\r\n_\r\n$5\r\nflags\r\n~0\r\n"
+        ));
+        assert!(!listed.contains("library_code"));
+        assert!(
+            f.run(&[b"FUNCTION", b"LIST", b"WITHCODE"])
+                .contains("library_code")
+        );
+        // The pattern is matched without regard to case, which is a third rule
+        // again next to the two the two dictionaries use.
+        assert!(
+            f.run(&[b"FUNCTION", b"LIST", b"LIBRARYNAME", b"MY*"])
+                .starts_with("*1\r\n")
+        );
+        assert_eq!(
+            f.run(&[b"FUNCTION", b"LIST", b"LIBRARYNAME", b"zz*"]),
+            "*0\r\n"
+        );
+        // On RESP2 the same reply is a flat array of six, which is what `map`
+        // means on a protocol that has no map.
+        f.out = Out::new(Proto::Resp2);
+        assert!(f.run(&[b"FUNCTION", b"LIST"]).starts_with("*1\r\n*6\r\n"));
+        for (args, want) in [
+            (&[&b"ZZ"[..]][..], "ERR Unknown argument ZZ"),
+            (&[b"WITHCODE", b"WITHCODE"], "ERR Unknown argument WITHCODE"),
+            (
+                &[b"LIBRARYNAME", b"a", b"LIBRARYNAME", b"b"],
+                "ERR Unknown argument LIBRARYNAME",
+            ),
+            (&[b"LIBRARYNAME"], "ERR library name argument was not given"),
+        ] {
+            let mut wire: Vec<&[u8]> = vec![b"FUNCTION", b"LIST"];
+            wire.extend_from_slice(args);
+            assert_eq!(f.run(&wire), format!("-{want}\r\n"), "{args:?}");
+        }
+    }
+
+    #[test]
+    fn function_stats_counts_what_is_loaded_and_says_nothing_is_running() {
+        let mut f = Fixture::new();
+        f.out = Out::new(Proto::Resp3);
+        assert_eq!(
+            f.run(&[b"FUNCTION", b"STATS"]),
+            "%2\r\n$14\r\nrunning_script\r\n_\r\n$7\r\nengines\r\n%1\r\n$3\r\nLUA\r\n\
+             %2\r\n$15\r\nlibraries_count\r\n:0\r\n$15\r\nfunctions_count\r\n:0\r\n"
+        );
+        assert_eq!(f.run(&[b"FUNCTION", b"LOAD", LIB]), "$5\r\nmylib\r\n");
+        assert!(
+            f.run(&[b"FUNCTION", b"STATS"])
+                .ends_with("libraries_count\r\n:1\r\n$15\r\nfunctions_count\r\n:5\r\n"),
+        );
+        assert_eq!(f.run(&[b"FUNCTION", b"FLUSH"]), "+OK\r\n");
+        assert!(
+            f.run(&[b"FUNCTION", b"STATS"])
+                .ends_with(":0\r\n$15\r\nfunctions_count\r\n:0\r\n")
+        );
+    }
+
+    #[test]
+    fn every_function_subcommand_complains_about_its_own_arity() {
+        let mut f = Fixture::new();
+        for (args, want) in [
+            (
+                &[&b"STATS"[..], b"X"][..],
+                "ERR wrong number of arguments for 'function|stats' command",
+            ),
+            (
+                &[b"KILL", b"X"],
+                "ERR wrong number of arguments for 'function|kill' command",
+            ),
+            (
+                &[b"HELP", b"X"],
+                "ERR wrong number of arguments for 'function|help' command",
+            ),
+            (
+                &[b"DELETE"],
+                "ERR wrong number of arguments for 'function|delete' command",
+            ),
+            (
+                &[b"DELETE", b"a", b"b"],
+                "ERR wrong number of arguments for 'function|delete' command",
+            ),
+            // FLUSH is the one that does not, because it checks the count
+            // itself before it looks at the argument.
+            (
+                &[b"FLUSH", b"SYNC", b"X"],
+                "ERR unknown subcommand or wrong number of arguments for 'FLUSH'. \
+                 Try FUNCTION HELP.",
+            ),
+            (
+                &[b"FLUSH", b"ZZ"],
+                "ERR FUNCTION FLUSH only supports SYNC|ASYNC option",
+            ),
+            (&[b"ZZ"], "ERR unknown subcommand 'ZZ'. Try FUNCTION HELP."),
+        ] {
+            let mut wire: Vec<&[u8]> = vec![b"FUNCTION"];
+            wire.extend_from_slice(args);
+            assert_eq!(f.run(&wire), format!("-{want}\r\n"), "{args:?}");
+        }
+        assert_eq!(
+            f.run(&[b"FUNCTION"]),
+            "-ERR wrong number of arguments for 'function' command\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"FUNCTION", b"KILL"]),
+            "-NOTBUSY No scripts in execution right now.\r\n"
         );
     }
 

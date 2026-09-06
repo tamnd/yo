@@ -24,14 +24,21 @@
 //!
 //! # `FUNCTION`
 //!
-//! Still no libraries, so `LIST` is empty and `DELETE` reports that the library
-//! is not there, both of which are the true answers. `LOAD` and the rest are
-//! the next piece of work and are not here, so a client that asks for one gets
-//! `unknown subcommand` rather than an `OK` that did nothing. D-16 says which
-//! are which.
+//! A library is a script that is loaded once and called by name forever after,
+//! which is the same trade `SCRIPT LOAD` and `EVALSHA` make and a better one: a
+//! client calls `FCALL addtocart 1 cart:9 sku` instead of shipping a digest it
+//! has to keep in step with a file. `LOAD`, `LIST`, `DELETE`, `FLUSH`, `STATS`
+//! and `KILL` are here. `DUMP` and `RESTORE` are not, because both are about
+//! the RDB payload rather than about libraries and that is the next piece of
+//! work.
+//!
+//! What is kept here is the registry in [`lua::library`] and nothing else. The
+//! compiled callbacks live in whichever interpreters have run the library,
+//! which is one per thread, and the digest beside each library is what tells a
+//! thread its copy has been replaced under it.
 
 use super::args::{self, Args, is};
-use super::lua;
+use super::lua::{self, library};
 use super::table::Spec;
 use super::{Server, Session};
 use crate::reply::Out;
@@ -48,8 +55,9 @@ pub(super) fn execute(
     match spec.name {
         "eval" | "eval_ro" => eval(server, session, spec.name.ends_with("_ro"), args, out),
         "evalsha" | "evalsha_ro" => evalsha(server, session, spec.name.ends_with("_ro"), args, out),
+        "fcall" | "fcall_ro" => fcall(server, session, spec.name.ends_with("_ro"), args, out),
         "script" => script(server, args, out),
-        "function" => function(args, out),
+        "function" => function(server, args, out),
         other => unreachable!("scripting command with no body: {other}"),
     }
 }
@@ -131,7 +139,7 @@ fn run(server: &Server, session: &mut Session, found: &Found<'_>, args: Args<'_>
         let ask = lua::Ask {
             keys,
             argv,
-            sha: found.sha,
+            name: found.sha,
             ro: found.ro,
         };
         lua::run(server, session, found.body, &ask, out);
@@ -264,6 +272,9 @@ fn script(server: &Server, args: Args<'_>, out: &mut Out) -> Result<()> {
         }
         out.ok();
     } else if is(sub, b"HELP") {
+        if args.len() != 2 {
+            return Err(args::wrong_arity_sub("script", "help"));
+        }
         super::server::help(out, SCRIPT_HELP);
     } else {
         return Err(args::unknown_subcommand(sub, "SCRIPT"));
@@ -271,15 +282,149 @@ fn script(server: &Server, args: Args<'_>, out: &mut Out) -> Result<()> {
     Ok(())
 }
 
-/// `FUNCTION FLUSH|LIST|DELETE|HELP`.
-fn function(args: Args<'_>, out: &mut Out) -> Result<()> {
+/// `FCALL function numkeys [key ...] [arg ...]`, and `FCALL_RO` beside it.
+///
+/// The order of the checks is the order a client sees them fail in, and it is
+/// not the order that reads best: the name is looked up before the key count is
+/// even parsed, so `FCALL nosuch x` is `Function not found` and not a complaint
+/// about `x`. A client that gets both wrong is told about the name.
+fn fcall(
+    server: &Server,
+    session: &mut Session,
+    ro: bool,
+    args: Args<'_>,
+    out: &mut Out,
+) -> Result<()> {
+    // Copied out from under the lock, because what happens next calls commands
+    // and one of the commands it can call is `FUNCTION LIST`. A library is a few
+    // hundred bytes and this is the one copy per `FCALL`, next to an interpreter
+    // call that costs more than the copy by orders of magnitude.
+    let found = yo_alloc::allow(|| {
+        let held = server.libraries.lock();
+        held.function(args.get(1)).map(|(lib, f)| Taken {
+            library: lib.name.to_string(),
+            function: f.name.to_string(),
+            sha: lib.sha,
+            body: lib.code[lib.at..].to_vec(),
+            no_writes: f.flags & library::NO_WRITES != 0,
+        })
+    });
+    let Some(found) = found else {
+        return Err(Error::new(Code::Unsupported, "Function not found"));
+    };
+
+    // Not `numkeys` above, because every one of these three sentences is
+    // different from the one `EVAL` answers with. A count that is not a number
+    // at all is the one that differs most: `EVAL` quotes Redis's generic
+    // integer complaint and `FCALL` has a sentence of its own.
+    let Ok(n) = args.int(2) else {
+        return Err(Error::new(Code::Invalid, "Bad number of keys provided"));
+    };
+    let usable = i64::try_from(args.len() - 3).unwrap_or(i64::MAX);
+    if n > usable {
+        return Err(Error::new(
+            Code::Invalid,
+            "Number of keys can't be greater than number of args",
+        ));
+    }
+    if n < 0 {
+        return Err(Error::new(
+            Code::Invalid,
+            "Number of keys can't be negative",
+        ));
+    }
+    // Refused before anything runs, and refused on the flag the library declared
+    // rather than on what the function turns out to do. A function without
+    // `no-writes` is a function that might write, and `FCALL_RO` is a promise a
+    // replica makes to a client before it knows either way.
+    if ro && !found.no_writes {
+        return Err(Error::new(
+            Code::Unsupported,
+            "Can not execute a script with write flag using *_ro command.",
+        ));
+    }
+
+    yo_alloc::allow(|| {
+        let words: Vec<&[u8]> = (3..args.len()).map(|i| args.get(i)).collect();
+        let (keys, argv) = words.split_at(usize::try_from(n).unwrap_or(0));
+        let call = lua::Call {
+            library: &found.library,
+            sha: &found.sha,
+            body: &found.body,
+            function: &found.function,
+        };
+        let ask = lua::Ask {
+            keys,
+            argv,
+            name: found.function.as_bytes(),
+            // A `no-writes` function is held to it whichever spelling called
+            // it. The flag is a promise the library made about what the
+            // function does, not a mode the caller asked for, so `FCALL` on one
+            // is as read only as `FCALL_RO` on one and a write inside it fails
+            // the same way.
+            ro: ro || found.no_writes,
+        };
+        lua::fcall(server, session, &call, &ask, out);
+    });
+    Ok(())
+}
+
+/// What `FCALL` read out of the registry before it let the lock go.
+struct Taken {
+    /// The library's name, spelled the way it was loaded.
+    library: String,
+    /// The function's name, spelled the way it was registered rather than the
+    /// way the client asked for it. The registry matches without regard to
+    /// case and the interpreter does not, so this is the one that has to travel.
+    function: String,
+    /// The digest of the library's code.
+    sha: [u8; 40],
+    /// The code from the newline that ends the shebang.
+    body: Vec<u8>,
+    /// Whether the function was registered `no-writes`.
+    no_writes: bool,
+}
+
+/// `FUNCTION LOAD|LIST|DELETE|FLUSH|STATS|KILL|HELP`.
+fn function(server: &Server, args: Args<'_>, out: &mut Out) -> Result<()> {
     let sub = args.get(1);
-    if is(sub, b"FLUSH") {
+    if is(sub, b"LOAD") {
+        return load(server, args, out);
+    } else if is(sub, b"LIST") {
+        return list(server, args, out);
+    } else if is(sub, b"STATS") {
+        if args.len() != 2 {
+            return Err(args::wrong_arity_sub("function", "stats"));
+        }
+        // No script is ever running when this is answered, for the same reason
+        // `SCRIPT KILL` always says nobody is running: a function here runs to
+        // the end of the command that started it, on the thread that started it.
+        // That is D-101 from the other side.
+        let (libraries, functions) = server.libraries.lock().counts();
+        out.map(2);
+        out.bulk(b"running_script");
+        out.nil();
+        out.bulk(b"engines");
+        out.map(1);
+        out.bulk(library::ENGINE.as_bytes());
+        out.map(2);
+        out.bulk(b"libraries_count");
+        out.int(i64::try_from(libraries).unwrap_or(i64::MAX));
+        out.bulk(b"functions_count");
+        out.int(i64::try_from(functions).unwrap_or(i64::MAX));
+        return Ok(());
+    } else if is(sub, b"KILL") {
+        if args.len() != 2 {
+            return Err(args::wrong_arity_sub("function", "kill"));
+        }
+        out.error_line(b"NOTBUSY ", b"No scripts in execution right now.");
+        return Ok(());
+    } else if is(sub, b"FLUSH") {
         // Redis splits these two: a bad mode is a sentence about the mode, and
         // a second one after it is the generic subcommand error, because the
         // arity is checked before the argument is looked at.
         if args.len() > 3 {
-            return Err(unknown_or_arity("flush"));
+            return Err(unknown_or_arity(sub));
         }
         if args.len() == 3 && !mode(args.get(2)) {
             return Err(Error::new(
@@ -287,43 +432,209 @@ fn function(args: Args<'_>, out: &mut Out) -> Result<()> {
                 "FUNCTION FLUSH only supports SYNC|ASYNC option",
             ));
         }
+        // The mode is checked and then ignored for the same reason `SCRIPT
+        // FLUSH` ignores it: dropping a vector is dropping it. What the threads
+        // still hold is left alone, because a thread only reaches its copy
+        // through a library the registry still has.
+        yo_alloc::allow(|| server.libraries.lock().wipe());
         out.ok();
-    } else if is(sub, b"LIST") {
-        // `LIBRARYNAME <pattern>` and `WITHCODE`, in any order and any number
-        // of times, which is how Redis parses it. Every one of them narrows an
-        // empty list to an empty list, so the parse exists to reject a word
-        // that is not one of them.
-        let mut i = 2;
-        while i < args.len() {
-            let a = args.get(i);
-            if is(a, b"WITHCODE") {
-                i += 1;
-            } else if is(a, b"LIBRARYNAME") && i + 1 < args.len() {
-                i += 2;
-            } else {
-                return Err(yo_alloc::allow(|| {
-                    Error::fmt(
-                        Code::Invalid,
-                        format_args!("Unknown argument {}", String::from_utf8_lossy(a)),
-                    )
-                }));
-            }
-        }
-        out.array(0);
     } else if is(sub, b"DELETE") {
         if args.len() != 3 {
-            return Err(unknown_or_arity("delete"));
+            return Err(args::wrong_arity_sub("function", "delete"));
         }
-        // Always, and truthfully. There are no libraries to find.
-        return Err(Error::new(Code::Unsupported, "Library not found"));
+        // Matched exactly, so `FUNCTION DELETE MYLIB` does not find `mylib`.
+        // That is the library dictionary's rule and it disagrees with the
+        // function dictionary's rule two commands up, which is Redis's own
+        // inconsistency and not one introduced here.
+        if !yo_alloc::allow(|| server.libraries.lock().remove(args.get(2))) {
+            return Err(Error::new(Code::Unsupported, "Library not found"));
+        }
+        out.ok();
     } else if is(sub, b"HELP") {
+        if args.len() != 2 {
+            return Err(args::wrong_arity_sub("function", "help"));
+        }
         super::server::help(out, FUNCTION_HELP);
     } else {
-        // LOAD, RESTORE, KILL, DUMP and STATS are not here. STATS is the one
-        // that looks answerable and is not: a real server lists LUA in its
-        // engines map, and there is no engine here to list, so an empty map
-        // would be a different answer rather than the same one.
+        // DUMP and RESTORE are not here. Both are about the RDB payload rather
+        // than about libraries, so they land with the rest of that work, and a
+        // client that asks for one gets `unknown subcommand` rather than an
+        // answer that is not one. D-16 says which are which.
         return Err(args::unknown_subcommand(sub, "FUNCTION"));
+    }
+    Ok(())
+}
+
+/// `FUNCTION LOAD [REPLACE] code`.
+///
+/// The parse is a loop that stops one short of the end, so the last argument is
+/// always the code no matter what it looks like. That is why `FUNCTION LOAD
+/// REPLACE` with nothing after it does not complain about a missing body: it
+/// takes `REPLACE` as the body and complains that the body has no shebang.
+fn load(server: &Server, args: Args<'_>, out: &mut Out) -> Result<()> {
+    if args.len() < 3 {
+        return Err(args::wrong_arity_sub("function", "load"));
+    }
+    let mut replace = false;
+    for i in 2..args.len() - 1 {
+        if is(args.get(i), b"REPLACE") {
+            replace = true;
+        } else {
+            return Err(yo_alloc::allow(|| {
+                Error::fmt(
+                    Code::Invalid,
+                    format_args!(
+                        "Unknown option given: {}",
+                        String::from_utf8_lossy(args.get(i))
+                    ),
+                )
+            }));
+        }
+    }
+    let code = args.get(args.len() - 1);
+
+    yo_alloc::allow(|| {
+        let meta = library::metadata(code)?;
+        if !library::named(&meta.name) {
+            return Err(library::bad_name());
+        }
+        // Case insensitive because the engine dictionary is, which is what makes
+        // `#!LUA` a working shebang, and the name in the reply is `LUA` either
+        // way because that is the engine's own spelling and not the client's.
+        if !meta.engine.eq_ignore_ascii_case(library::ENGINE.as_bytes()) {
+            return Err(Error::fmt(
+                Code::Unsupported,
+                format_args!(
+                    "Engine '{}' not found",
+                    String::from_utf8_lossy(&meta.engine)
+                ),
+            ));
+        }
+        let name = String::from_utf8_lossy(&meta.name).into_owned();
+        let at = code.len() - meta.body.len();
+        let sha = lua::fingerprint(code);
+
+        // Held across the compile, which is safe because a library cannot call
+        // a command while it is loading: the only names it can reach are the
+        // eight that describe it to the server.
+        let mut held = server.libraries.lock();
+        if !replace && held.library(meta.name.as_slice()).is_some() {
+            return Err(Error::fmt(
+                Code::Unsupported,
+                format_args!("Library '{name}' already exists"),
+            ));
+        }
+        let funcs = match lua::install(&name, &sha, meta.body) {
+            Ok(funcs) => funcs,
+            Err(why) => return Err(Error::fmt(Code::Invalid, format_args!("{why}"))),
+        };
+        if funcs.is_empty() {
+            return Err(Error::new(Code::Invalid, "No functions registered"));
+        }
+        // Against every other library, and without regard to case, because the
+        // dictionary `FCALL` looks in is one dictionary for the whole server.
+        // The library being replaced is not one of the others, which is what
+        // makes reloading a library over itself work at all.
+        for f in &funcs {
+            if held.taken(&f.name, &name) {
+                return Err(Error::fmt(
+                    Code::Unsupported,
+                    format_args!("Function {} already exists", f.name),
+                ));
+            }
+        }
+        held.insert(library::Library {
+            name: name.clone().into(),
+            code: code.to_vec().into_boxed_slice(),
+            at,
+            sha,
+            funcs,
+        });
+        drop(held);
+        out.bulk(name.as_bytes());
+        Ok(())
+    })
+}
+
+/// `FUNCTION LIST [LIBRARYNAME pattern] [WITHCODE]`.
+fn list(server: &Server, args: Args<'_>, out: &mut Out) -> Result<()> {
+    // Each of the two is allowed once, and a second one is not a complaint
+    // about repetition: the parse falls off the end of its own branches and
+    // reports the word as one it does not know. That is Redis's shape, and
+    // `FUNCTION LIST WITHCODE WITHCODE` really does say `Unknown argument
+    // WITHCODE`.
+    let mut code = false;
+    let mut pattern: Option<&[u8]> = None;
+    let mut i = 2;
+    while i < args.len() {
+        let a = args.get(i);
+        if is(a, b"WITHCODE") && !code {
+            code = true;
+            i += 1;
+        } else if is(a, b"LIBRARYNAME") && pattern.is_none() {
+            if i + 1 >= args.len() {
+                return Err(Error::new(
+                    Code::Invalid,
+                    "library name argument was not given",
+                ));
+            }
+            pattern = Some(args.get(i + 1));
+            i += 2;
+        } else {
+            return Err(yo_alloc::allow(|| {
+                Error::fmt(
+                    Code::Invalid,
+                    format_args!("Unknown argument {}", String::from_utf8_lossy(a)),
+                )
+            }));
+        }
+    }
+
+    let held = server.libraries.lock();
+    let shown = || {
+        held.all().iter().filter(|l| match pattern {
+            // Redis matches the pattern without regard to case here, which
+            // is a third rule again: the name is stored case sensitively,
+            // deleted case sensitively and listed case insensitively.
+            Some(p) => yo_common::glob::matches_nocase(p, l.name.as_bytes(), true),
+            None => true,
+        })
+    };
+    out.array(shown().count());
+    for lib in shown() {
+        out.map(if code { 4 } else { 3 });
+        out.bulk(b"library_name");
+        out.bulk(lib.name.as_bytes());
+        out.bulk(b"engine");
+        out.bulk(library::ENGINE.as_bytes());
+        out.bulk(b"functions");
+        out.array(lib.funcs.len());
+        for f in &lib.funcs {
+            out.map(3);
+            out.bulk(b"name");
+            out.bulk(f.name.as_bytes());
+            out.bulk(b"description");
+            match &f.desc {
+                Some(d) => out.bulk(d),
+                None => out.nil(),
+            }
+            out.bulk(b"flags");
+            let count = library::FLAGS
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| f.flags & (1 << i) != 0)
+                .count();
+            out.set(count);
+            for (i, name) in library::FLAGS.iter().enumerate() {
+                if f.flags & (1 << i) != 0 {
+                    out.simple(name.as_bytes());
+                }
+            }
+        }
+        if code {
+            out.bulk(b"library_code");
+            out.bulk(&lib.code);
+        }
     }
     Ok(())
 }
@@ -339,13 +650,16 @@ fn mode(arg: &[u8]) -> bool {
 /// One sentence for two different mistakes, which is Redis's shape here and not
 /// ours: `FUNCTION` reports a subcommand it does not know and a subcommand with
 /// the wrong number of arguments the same way.
-fn unknown_or_arity(sub: &str) -> Error {
-    Error::fmt(
-        Code::Unsupported,
-        format_args!(
-            "unknown subcommand or wrong number of arguments for '{sub}'. Try FUNCTION HELP."
-        ),
-    )
+fn unknown_or_arity(sub: &[u8]) -> Error {
+    yo_alloc::allow(|| {
+        Error::fmt(
+            Code::Unsupported,
+            format_args!(
+                "unknown subcommand or wrong number of arguments for '{}'. Try FUNCTION HELP.",
+                String::from_utf8_lossy(sub)
+            ),
+        )
+    })
 }
 
 /// What `SCRIPT HELP` says, which is Redis's text and not ours.
