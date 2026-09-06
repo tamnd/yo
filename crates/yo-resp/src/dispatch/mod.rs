@@ -1924,6 +1924,18 @@ pub fn resolved(
                 let db = session.db;
                 suggest::execute(&server.dbs[db], spec, args, out).map(|()| Flow::Continue)
             }
+            // The five deprecated document commands, which are the other search
+            // commands that need the keyspace as well as the registry: what they
+            // write and read is an ordinary hash.
+            "search"
+                if matches!(
+                    spec.name,
+                    "FT.ADD" | "FT.SAFEADD" | "FT.GET" | "FT.MGET" | "FT.DEL"
+                ) =>
+            {
+                let db = session.db;
+                search::docs::execute(server, db, spec, args, out).map(|()| Flow::Continue)
+            }
             "search" if spec.name == "FT.CURSOR" => {
                 // Its own arm because the cursors are not in the registry, and
                 // it takes and lets go of the registry itself to look up the

@@ -3109,12 +3109,13 @@ pub static COMMANDS: &[Spec] = &[
     },
     // -------------------------------------------------------------- search
     //
-    // None of these carries a key spec, and the three zeros are the module's
-    // own answer rather than a gap here. An index name is not a key: it is not
-    // in the keyspace, `TYPE` has nothing to say about it, and a cluster client
-    // has nothing to route on. `FT.SUGADD` and the four deprecated document
-    // commands do carry real keys, and they arrive with the rest of the search
-    // surface rather than here.
+    // Most of these carry no key spec, and the three zeros are the module's own
+    // answer rather than a gap here. An index name is not a key: it is not in
+    // the keyspace, `TYPE` has nothing to say about it, and a cluster client has
+    // nothing to route on. The suggestion family and four of the five deprecated
+    // document commands do name real keys and say so. `FT.MGET` is the odd one:
+    // it names as many keys as a client cares to send and reports none of them,
+    // which is the module's answer and is copied rather than tidied up.
     Spec {
         name: "FT.CREATE",
         arity: -5,
@@ -3516,6 +3517,71 @@ pub static COMMANDS: &[Spec] = &[
         since: "1.4.0",
         complexity: "O(1)",
         summary: "Suggestions for the words in a query the index does not hold.",
+        group: "search",
+    },
+    Spec {
+        name: "FT.ADD",
+        arity: -1,
+        flags: SEARCH_WRITE_OOM,
+        first_key: 2,
+        last_key: 2,
+        step: 1,
+        acl: AC_SEARCH_WRITE,
+        since: "1.0.0",
+        complexity: "O(N) with N the tokens in the document",
+        summary: "Write a hash and record what the index should think it is worth.",
+        group: "search",
+    },
+    Spec {
+        name: "FT.SAFEADD",
+        arity: -1,
+        flags: SEARCH_WRITE_OOM,
+        first_key: 2,
+        last_key: 2,
+        step: 1,
+        acl: AC_SEARCH_WRITE,
+        since: "1.0.0",
+        complexity: "O(N) with N the tokens in the document",
+        summary: "The same write, under the name a cluster client used to send.",
+        group: "search",
+    },
+    Spec {
+        name: "FT.GET",
+        arity: -1,
+        flags: SEARCH_READ,
+        first_key: 2,
+        last_key: 2,
+        step: 1,
+        acl: AC_SEARCH_READ,
+        since: "1.0.0",
+        complexity: "O(1)",
+        summary: "The hash under a key, when the index is holding it.",
+        group: "search",
+    },
+    Spec {
+        name: "FT.MGET",
+        arity: -1,
+        flags: SEARCH_READ,
+        first_key: 0,
+        last_key: 0,
+        step: 0,
+        acl: AC_SEARCH_READ,
+        since: "1.0.0",
+        complexity: "O(N) with N the keys asked about",
+        summary: "The same, for as many keys as were named.",
+        group: "search",
+    },
+    Spec {
+        name: "FT.DEL",
+        arity: -1,
+        flags: SEARCH_WRITE,
+        first_key: 2,
+        last_key: 2,
+        step: 1,
+        acl: AC_SEARCH_WRITE,
+        since: "1.0.0",
+        complexity: "O(1)",
+        summary: "Delete a key, with an index name in front of it.",
         group: "search",
     },
     Spec {
@@ -5918,7 +5984,19 @@ const FREE: u16 = u16::MAX;
 /// ordinary cost of a name, and every command is still within one slot, which
 /// is the number a lookup feels. The old multiplier was `0x55251c10f29d4c29`
 /// and it served for one search as well.
-const MIX: u64 = 0xda8b_d262_ac59_8c57;
+///
+/// The five deprecated document commands took the table to 399 names and the
+/// worst probe to two slots, which is inside the bound and outside what this
+/// table has held itself to since it was doubled, so an eighteenth search ran.
+/// One of the five raises the floor as well: `FT.SAFEADD` agrees with
+/// `FT.PROFILE` on all four key bytes, which makes thirteen colliding pairs
+/// instead of twelve and thirteen the fewest extra probes any multiplier can
+/// spend. Four billion multipliers over two independent seeds both reached one
+/// slot, one of them at twenty two extra probes and the other at twenty one,
+/// which is the same twenty one the last search settled on while carrying one
+/// more collision than it did. The old multiplier was `0xda8bd262ac598c57` and
+/// it served for one search as well.
+const MIX: u64 = 0x91de_5d5e_2166_1fbd;
 
 /// The four bytes the index is computed from: the length, the first two bytes,
 /// and the last byte with the second to last and the middle folded into it, all
@@ -5932,8 +6010,8 @@ const MIX: u64 = 0xda8b_d262_ac59_8c57;
 /// slot, and reading less of the name is a shorter dependency chain in front of
 /// the multiply. Names that agree on all four collide whatever the multiplier is
 /// and probe once more, and the probe is the same compare the lookup was always
-/// going to do. Over the 358 commands there are twelve such pairs and no group
-/// larger than a pair, so twelve extra probes is the floor.
+/// going to do. Over the 399 commands there are thirteen such pairs and no group
+/// larger than a pair, so thirteen extra probes is the floor.
 ///
 /// The middle byte is the part that was added last and it is worth saying why,
 /// because for a long time the key was the length and the first two bytes and
