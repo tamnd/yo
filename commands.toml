@@ -354,20 +354,25 @@ doc = "12 section 4"
 
 [[group]]
 name = "scripting"
-expected = 8
+expected = 10
 status = "partial"
 doc = "12 section 7"
 # SCRIPT and FUNCTION arrived in M2 with the subcommands that are exactly right
 # on a server with no interpreter, because Redis's own test suite says SCRIPT
 # FLUSH and FUNCTION FLUSH before every start_server block. M8 put a real Lua
 # 5.1 behind them, so EVAL, EVALSHA, EVAL_RO and EVALSHA_RO run and SCRIPT LOAD,
-# KILL and DEBUG answer. FCALL and FCALL_RO are the two that are still not here,
-# and they wait on FUNCTION LOAD and redis.register_function rather than on
-# anything about the interpreter. The split that made the rest work is one
-# interpreter per thread and one shared script cache, since a compiled script is
-# bytes and the state a run builds is not, and a run puts the global table back
-# the way it found it on the way out so nothing a script does can reach the next
-# script that lands on the same thread.
+# KILL and DEBUG answer, and then FUNCTION LOAD and redis.register_function
+# arrived and FCALL and FCALL_RO with them. The split that made the rest work is
+# one interpreter per thread and one shared script cache, since a compiled script
+# is bytes and the state a run builds is not, and a run puts the global table
+# back the way it found it on the way out so nothing a script does can reach the
+# next script that lands on the same thread. Libraries take the same split one
+# step further: the registry is data only, and each thread compiles a library for
+# itself the first time one of its clients calls into it, with the digest of the
+# code beside the compiled copy so a load that replaced the library on another
+# thread is noticed rather than missed. The group stays partial while FUNCTION
+# DUMP and FUNCTION RESTORE are outstanding, since both are about the RDB payload
+# rather than about libraries.
 
 [[group]]
 name = "connection"
@@ -4742,7 +4747,7 @@ bounded = "inherent"
 status = "shipped"
 wire = "verified"
 divergent = "D-16"
-notes = "FLUSH, LIST, DELETE and HELP, all of which are exactly right with no libraries loaded. STATS is the one that looks answerable and is not, because a real server lists LUA in its engines map and there is no engine here to list, so an empty map would be a different answer rather than the same one."
+notes = "LOAD, LIST, DELETE, FLUSH, STATS, KILL and HELP. LOAD reads the shebang the way sdssplitargs reads an inline command, so a quoted name works, and then runs the library once in an environment that holds one table with eight names on it and nothing else, which is why redis.call during a load complains about a global called call. DUMP and RESTORE are the two that are not here, because both are about the RDB payload rather than about libraries. KILL always says NOTBUSY for the same reason SCRIPT KILL does."
 
 [[command]]
 name = "EVAL"
@@ -4787,6 +4792,30 @@ bounded = "risk"
 status = "shipped"
 wire = "verified"
 notes = "EVALSHA under the same read-only rule EVAL_RO runs under."
+
+[[command]]
+name = "FCALL"
+group = "scripting"
+since = "7.0.0"
+arity = -3
+plan = "merge"
+bounded = "risk"
+status = "shipped"
+divergent = "D-110"
+wire = "verified"
+notes = "The function name is looked up without regard to case across every library, which is one dictionary for the whole server, and the name is checked before the key count is even parsed so a call that gets both wrong is told about the name. A function registered no-writes runs read-only whichever spelling called it, since the flag is a promise the library made and not a mode the caller asked for."
+
+[[command]]
+name = "FCALL_RO"
+group = "scripting"
+since = "7.0.0"
+arity = -3
+plan = "merge"
+bounded = "risk"
+status = "shipped"
+divergent = "D-110"
+wire = "verified"
+notes = "FCALL against a function the library registered no-writes. A function without the flag is refused at the door rather than from inside, which is the opposite of EVAL_RO and is right for the same reason: the library already said what the function does."
 
 # ----------------------------------------------------------------- connection
 

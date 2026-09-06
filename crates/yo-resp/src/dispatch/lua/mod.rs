@@ -51,6 +51,16 @@
 //! `err` field, and it is what attaches the source and line a client reads at
 //! the end of the message. Doing it in Rust would mean getting the raised Lua
 //! value across the boundary, and a raised value can be any Lua value at all.
+//!
+//! # Functions are the same interpreter with different globals
+//!
+//! `FCALL` runs in the state this thread already has, not in one of its own. A
+//! real server keeps a second Lua state for libraries and this keeps a second
+//! set of globals, which comes to the same thing from a client's side: no
+//! `KEYS`, no `ARGV`, no error handler on the global table, and a `redis` table
+//! without the three names that only mean something inside `EVAL`. What it does
+//! not come to the same thing on is a library's own locals, which are per
+//! thread here and per process there, and that is D-110.
 
 mod api;
 mod argue;
@@ -58,6 +68,7 @@ mod bit;
 mod cjson;
 mod cmsgpack;
 mod convert;
+pub(in crate::dispatch) mod library;
 mod sha1;
 mod r#struct;
 
@@ -125,9 +136,10 @@ pub(in crate::dispatch) struct Ask<'a> {
     pub keys: &'a [&'a [u8]],
     /// `ARGV`, which is everything after the keys.
     pub argv: &'a [&'a [u8]],
-    /// The name the message ends with, which is the digest of the body whether
-    /// the client sent the body or the name.
-    pub sha: &'a [u8; 40],
+    /// The name the message ends with. For a script that is the digest of the
+    /// body, whether the client sent the body or the digest, and for a function
+    /// it is the function's own name.
+    pub name: &'a [u8],
     /// Set by the `_RO` spellings, and checked in `redis.call` rather than here
     /// so that a script that only reads still runs.
     pub ro: bool,
@@ -197,6 +209,166 @@ pub(in crate::dispatch) fn compiles(body: &[u8]) -> Result<(), String> {
     })
 }
 
+/// The digest of a library's code, which is how one thread's copy is told apart
+/// from another's.
+pub(in crate::dispatch) fn fingerprint(code: &[u8]) -> [u8; 40] {
+    sha1::hex(code)
+}
+
+/// Which library and which function inside it an `FCALL` is about.
+///
+/// Copied out of the registry rather than borrowed from it, because the lock
+/// over the registry has to be let go before anything runs: a function calls
+/// commands and those take locks of their own, and one of the commands it can
+/// call is `FUNCTION LIST`.
+pub(in crate::dispatch) struct Call<'a> {
+    /// The library the function was registered by.
+    pub library: &'a str,
+    /// The digest of the library's code, which is how a thread works out
+    /// whether the copy it compiled earlier is still the current one.
+    pub sha: &'a [u8; 40],
+    /// The library's code, from the newline after the shebang.
+    pub body: &'a [u8],
+    /// The function's own name, spelled the way it was registered rather than
+    /// the way the client asked for it.
+    pub function: &'a str,
+}
+
+/// Compile a library on this thread and run it once, so that it registers what
+/// it registers.
+///
+/// This is `FUNCTION LOAD` on the thread the client sent it to, and it is also
+/// what every other thread does the first time one of its clients calls into
+/// the library. The failure is the whole sentence a client reads, with no code
+/// in front of it, because the two it can be already read as sentences:
+/// `Error compiling function: ...` and `Error registering functions: ...`.
+pub(in crate::dispatch) fn install(
+    name: &str,
+    sha: &[u8; 40],
+    body: &[u8],
+) -> Result<Vec<library::Func>, String> {
+    yo_alloc::allow(|| {
+        VM.with(|vm| {
+            let mut held = vm.borrow_mut();
+            if held.is_none() {
+                *held = interpreter().ok();
+            }
+            let Some(lua) = held.as_ref() else {
+                return Err("the script interpreter could not be started".to_string());
+            };
+            compile(lua, name, sha, body)
+        })
+    })
+}
+
+/// Run one function and write its reply.
+///
+/// Nothing comes back as an `Err` here for the same reason nothing does out of
+/// [`run`]: a function that fails writes a line that carries its own code and
+/// ends with its own name and line.
+pub(in crate::dispatch) fn fcall(
+    server: &Server,
+    session: &mut Session,
+    call: &Call<'_>,
+    ask: &Ask<'_>,
+    out: &mut Out,
+) {
+    yo_alloc::allow(|| {
+        let Some(lua) = VM.with(|vm| vm.borrow_mut().take().or_else(|| interpreter().ok())) else {
+            out.error(b"ERR the script interpreter could not be started");
+            return;
+        };
+        let outer = session.scripted;
+        session.scripted = true;
+        calling(&lua, server, session, call, ask, out);
+        session.scripted = outer;
+        VM.with(|vm| *vm.borrow_mut() = Some(lua));
+    });
+}
+
+/// The body of [`install`], with the interpreter in hand.
+fn compile(
+    lua: &Lua,
+    name: &str,
+    sha: &[u8; 40],
+    body: &[u8],
+) -> Result<Vec<library::Func>, String> {
+    let loaded: mlua::Result<(bool, Value)> = (|| {
+        let loader: mlua::Function = lua.named_registry_value("yo_load")?;
+        loader.call((name, lua.create_string(sha)?, lua.create_string(body)?))
+    })();
+    let (ok, value) = loaded.map_err(|e| e.to_string())?;
+    if !ok {
+        return Err(match &value {
+            Value::String(s) => String::from_utf8_lossy(&s.as_bytes()).into_owned(),
+            other => format!("{other:?}"),
+        });
+    }
+    let Value::Table(list) = value else {
+        return Err("the library did not say what it registered".to_string());
+    };
+    let mut found = Vec::new();
+    for one in list.sequence_values::<Table>() {
+        let one = one.map_err(|e| e.to_string())?;
+        let name: mlua::LuaString = one.raw_get("name").map_err(|e| e.to_string())?;
+        let desc: Option<mlua::LuaString> = one.raw_get("desc").map_err(|e| e.to_string())?;
+        let flags: u32 = one.raw_get("flags").map_err(|e| e.to_string())?;
+        found.push(library::Func {
+            name: String::from_utf8_lossy(&name.as_bytes()).into(),
+            desc: desc.map(|d| d.as_bytes().to_vec().into_boxed_slice()),
+            flags,
+        });
+    }
+    Ok(found)
+}
+
+/// The body of [`fcall`], with the interpreter in hand.
+fn calling(
+    lua: &Lua,
+    server: &Server,
+    session: &mut Session,
+    call: &Call<'_>,
+    ask: &Ask<'_>,
+    out: &mut Out,
+) {
+    // Compiled here when this thread has never run anything out of this
+    // library, which is every thread but the one the load arrived on, and again
+    // after a `FUNCTION LOAD REPLACE` that some other thread took. The digest is
+    // what tells the two apart.
+    let held: mlua::Result<bool> = (|| {
+        let holds: mlua::Function = lua.named_registry_value("yo_holds")?;
+        holds.call((call.library, lua.create_string(call.sha)?))
+    })();
+    if !held.unwrap_or(false)
+        && let Err(why) = compile(lua, call.library, call.sha, call.body)
+    {
+        out.error_line(b"ERR ", why.as_bytes());
+        return;
+    }
+
+    let ctx = api::Ctx::new(server, session, ask.ro);
+    let done = lua.scope(|scope| {
+        api::lend(lua, scope, &ctx)?;
+        let runner: mlua::Function = lua.named_registry_value("yo_fcall")?;
+        runner.call::<(bool, Value)>((
+            call.library,
+            call.function,
+            strings(lua, ask.keys)?,
+            strings(lua, ask.argv)?,
+        ))
+    });
+
+    match done {
+        Ok((true, value)) => convert::push(out, &value),
+        Ok((false, value)) => out.error(&failure(&value, ask.name)),
+        Err(e) => {
+            let mut line = b"ERR ".to_vec();
+            line.extend_from_slice(e.to_string().as_bytes());
+            out.error_line(b"", &line);
+        }
+    }
+}
+
 /// The body of [`run`], with the interpreter in hand.
 fn running(
     lua: &Lua,
@@ -233,7 +405,7 @@ fn running(
 
     match done {
         Ok((true, value)) => convert::push(out, &value),
-        Ok((false, value)) => out.error(&failure(&value, ask.sha)),
+        Ok((false, value)) => out.error(&failure(&value, ask.name)),
         // The handler cannot fail and the runner cannot fail, so this is Lua
         // running out of memory or a bug here. Either way the client gets a
         // line rather than a connection that answered nothing.
@@ -251,7 +423,7 @@ fn running(
 /// `err` field and, when it could work out where the failure was, a `source`
 /// and a `line`. The two halves are joined here because the name of the script
 /// belongs on the end and the handler does not know it.
-fn failure(value: &Value, sha: &[u8; 40]) -> Vec<u8> {
+fn failure(value: &Value, called: &[u8]) -> Vec<u8> {
     let Value::Table(t) = value else {
         return b"ERR the script failed and said nothing".to_vec();
     };
@@ -271,7 +443,7 @@ fn failure(value: &Value, sha: &[u8; 40]) -> Vec<u8> {
     };
     let mut out = msg;
     out.extend_from_slice(b" script: ");
-    out.extend_from_slice(sha);
+    out.extend_from_slice(called);
     out.extend_from_slice(b", on ");
     out.extend_from_slice(&source.as_bytes());
     out.extend_from_slice(format!(":{n}.").as_bytes());
@@ -362,7 +534,10 @@ fn interpreter() -> mlua::Result<Lua> {
     cjson::statics(&lua, &raw)?;
     r#struct::statics(&lua, &raw)?;
     cmsgpack::statics(&lua, &raw)?;
-    lua.set_named_registry_value("yo_run", boot.raw_get::<mlua::Function>("run")?)?;
+    library::statics(&lua, &raw)?;
+    for name in ["run", "load", "holds", "fcall"] {
+        lua.set_named_registry_value(&format!("yo_{name}"), boot.raw_get::<mlua::Function>(name)?)?;
+    }
     lua.set_named_registry_value("yo_raw", raw)?;
     Ok(lua)
 }
@@ -405,6 +580,7 @@ local getmetatable, setfenv, ipairs = getmetatable, setfenv, ipairs
 local rawloadstring, rawload = loadstring, load
 local rawunpack = unpack
 local sub, find, concat = string.sub, string.find, table.concat
+local lower = string.lower
 local floor = math.floor
 
 -- Where the functions Rust hands over live. A local of this chunk and an
@@ -446,12 +622,18 @@ end
 -- read and cannot change.
 local shielded = {}
 
-local function shield(name, real)
-  -- `__yo_real` is how anything on the Rust side that walks a table raw
-  -- finds the real one, since the proxy itself is empty. It sits on the
-  -- metatable, which a script cannot reach.
+-- An empty table in front of a real one, and the metatable that joins them.
+--
+-- `__yo_real` is how anything on the Rust side that walks a table raw finds the
+-- real one, since the proxy itself is empty. It sits on the metatable, which a
+-- script cannot reach.
+local function guarded(real)
   local front = {__index = real, __newindex = readonly, __yo_real = real}
-  local proxy = setmetatable({}, front)
+  return setmetatable({}, front), front
+end
+
+local function shield(name, real)
+  local proxy, front = guarded(real)
   shielded[#shielded + 1] = {proxy = proxy, front = front, real = real}
   rawset(_G, name, proxy)
   return proxy
@@ -930,6 +1112,210 @@ cmsgpacklib.unpack_limit = unpacker('cmsgpack_unpack_limit')
 
 shield('cmsgpack', cmsgpacklib)
 
+-- ---------------------------------------------------------------------------
+-- Libraries, which is what `FUNCTION LOAD` compiles and `FCALL` runs.
+--
+-- A library is a chunk that runs once, at load time, and everything it does
+-- that outlives that run is a call to `redis.register_function`. What it
+-- registers are closures, so a library's own locals are alive for as long as
+-- the library is, and reading one is what a library is for.
+--
+-- A library sees two different worlds. While it is loading it can reach one
+-- table with one name on it, and the eight names on that, and nothing else at
+-- all: no `tostring`, no `error`, not even `redis.call`. Once it is loaded, its
+-- callbacks can reach everything a script can reach except `KEYS`, `ARGV` and
+-- the error handler, and the `redis` table they get is missing the three names
+-- that only mean something inside `EVAL`. That is one swap of one `__index` on
+-- one environment, and it is the same swap a real server does to its own
+-- globals metatable.
+
+-- Every library this thread has compiled, by name, with the digest of the code
+-- it was compiled from beside it. A library that was replaced by a client on
+-- another thread is found here under the old digest and compiled again.
+local libs = {}
+
+-- The library being loaded right now, or nil when none is.
+local loading = nil
+
+-- The `redis` table a callback gets. The same one a script gets, without the
+-- three that answer for a debugger and for a replication mode that has not
+-- existed since 7.0, none of which a function has any business calling.
+local flib = {}
+for name, value in next, lib do flib[name] = value end
+flib.breakpoint = nil
+flib.debug = nil
+flib.replicate_commands = nil
+
+local fproxy, ffront = guarded(flib)
+
+-- The five flags a function can be registered with, as the bits Rust reads
+-- them back as.
+local flagbit = {
+  ['no-writes'] = 1,
+  ['allow-oom'] = 2,
+  ['allow-stale'] = 4,
+  ['no-cluster'] = 8,
+  ['allow-cross-slot-keys'] = 16,
+}
+
+-- One argument the way `luaGetStringSds` reads one, which takes a number as the
+-- digits Lua would print it as and takes nothing else at all. It is why
+-- `redis.register_function(1, f)` registers a function called `1`.
+local function sdsarg(value)
+  local kind = type(value)
+  if kind == 'string' then return value end
+  if kind == 'number' then return tostring(value) end
+  return nil
+end
+
+-- The flags table as a number, or nil if it holds anything that is not one of
+-- the five. The walk stops at the first hole rather than at the last key, so
+-- `{'no-writes', nil, 'allow-oom'}` is one flag and not two.
+local function flagmask(t)
+  local mask = 0
+  local i = 1
+  while true do
+    local value = t[i]
+    if value == nil then return mask end
+    local name = sdsarg(value)
+    if name == nil then return nil end
+    local one = flagbit[lower(name)]
+    if one == nil then return nil end
+    if mask % (one + one) < one then mask = mask + one end
+    i = i + 1
+  end
+end
+
+-- What a bad call to `redis.register_function` raises, which is a table rather
+-- than a string so that no position ends up in front of it. A real server
+-- builds the same table for every failure it reports out of a C function, and
+-- the `ERR` is on the front for the same reason: the sentence has to carry a
+-- code by the time it reaches a client, and this is the only place that knows
+-- it does not already have one.
+local function reject(why)
+  error({err = 'ERR ' .. why}, 0)
+end
+
+local function register(...)
+  -- Checked first, and reachable, because a library can keep this function in
+  -- an upvalue at load time and call it from a callback later.
+  if loading == nil then
+    reject('redis.register_function can only be called on FUNCTION LOAD command')
+  end
+  local n = select('#', ...)
+  if n < 1 or n > 2 then
+    reject('wrong number of arguments to redis.register_function')
+  end
+  local name, desc, callback, mask
+  if n == 1 then
+    local named = select(1, ...)
+    if type(named) ~= 'table' then
+      reject('calling redis.register_function with a single argument is only ' ..
+             'applicable to Lua table (representing named arguments).')
+    end
+    mask = 0
+    for key, value in next, named do
+      if type(key) ~= 'string' and type(key) ~= 'number' then
+        reject('unknown argument given to redis.register_function')
+      end
+      local which = lower(key)
+      if which == 'function_name' then
+        name = sdsarg(value)
+        if name == nil then
+          reject('function_name argument given to redis.register_function must be a string')
+        end
+      elseif which == 'description' then
+        desc = sdsarg(value)
+        if desc == nil then
+          reject('description argument given to redis.register_function must be a string')
+        end
+      elseif which == 'callback' then
+        if type(value) ~= 'function' then
+          reject('callback argument given to redis.register_function must be a function')
+        end
+        callback = value
+      elseif which == 'flags' then
+        if type(value) ~= 'table' then
+          reject('flags argument to redis.register_function must be a table ' ..
+                 'representing function flags')
+        end
+        mask = flagmask(value)
+        if mask == nil then reject('unknown flag given') end
+      else
+        reject('unknown argument given to redis.register_function')
+      end
+    end
+    if name == nil then reject('redis.register_function must get a function name argument') end
+    if callback == nil then reject('redis.register_function must get a callback argument') end
+  else
+    name = sdsarg((select(1, ...)))
+    if name == nil then
+      reject('first argument to redis.register_function must be a string')
+    end
+    callback = select(2, ...)
+    if type(callback) ~= 'function' then
+      reject('second argument to redis.register_function must be a function')
+    end
+    mask = 0
+  end
+  -- The sentence says library where it means function, which is a real server's
+  -- own slip: it checks both names with the same function and hands back the
+  -- same string.
+  if not raw.named(name) then
+    reject('Library names can only contain letters, numbers, or underscores(_) ' ..
+           'and must be at least one character long')
+  end
+  if loading.byname[name] ~= nil then
+    reject('Function already exists in the library')
+  end
+  loading.byname[name] = callback
+  loading.order[#loading.order + 1] = {name = name, desc = desc, flags = mask}
+end
+
+-- The whole of what a library can reach while it is loading. Reading a name
+-- that is not on it is the same mistake as reading a global that is not there,
+-- which is why `redis.call` during a load complains about a nonexistent global
+-- variable called `call` rather than about `redis`.
+local loadredis = {
+  register_function = register,
+  log = lib.log,
+  LOG_DEBUG = lib.LOG_DEBUG,
+  LOG_VERBOSE = lib.LOG_VERBOSE,
+  LOG_NOTICE = lib.LOG_NOTICE,
+  LOG_WARNING = lib.LOG_WARNING,
+  REDIS_VERSION = lib.REDIS_VERSION,
+  REDIS_VERSION_NUM = lib.REDIS_VERSION_NUM,
+}
+
+-- What reading a name that is not there says. Only the sentence, because the
+-- raise itself has to happen inside whichever metamethod was asked, so that the
+-- position on the front of the message is the line that did the reading and not
+-- a line in here.
+local function missing(name)
+  return "Script attempted to access nonexistent global variable '" .. tostring(name) .. "'"
+end
+
+local loadfront = {
+  __index = function(_, name)
+    local value = loadredis[name]
+    if value ~= nil then return value end
+    error(missing(name), 2)
+  end,
+  __newindex = readonly,
+  __yo_real = loadredis,
+}
+local loadproxy = setmetatable({}, loadfront)
+
+-- The two tables above go through the same readers and writers the script side
+-- goes through, so a function that walks `redis` sees the real names and a
+-- function that writes to it is turned away.
+local fshielded = {
+  {proxy = fproxy, front = ffront, real = flib},
+  {proxy = loadproxy, front = loadfront, real = loadredis},
+}
+
+local loadapi = {redis = loadproxy}
+
 -- A failure that is a table with an `err` field reaches a script as the string
 -- inside it rather than as the table. That is what a real server does and it is
 -- what every script that prints the error it caught depends on.
@@ -1012,9 +1398,7 @@ end)
 -- `_G.pcall = 1` lands, which is D-103, and `restore` below takes it back out
 -- before the next script sees the table.
 local guard = {
-  __index = function(_, name)
-    error("Script attempted to access nonexistent global variable '" .. tostring(name) .. "'", 2)
-  end,
+  __index = function(_, name) error(missing(name), 2) end,
   __newindex = readonly,
 }
 setmetatable(_G, guard)
@@ -1037,6 +1421,7 @@ hidden[env] = false
 hidden[shadow] = false
 hidden[_G] = shadow
 for _, one in ipairs(shielded) do hidden[one.proxy] = false end
+for _, one in ipairs(fshielded) do hidden[one.proxy] = false end
 
 local rawrawset, rawgetmeta, rawsetmeta = rawset, getmetatable, setmetatable
 rawset(_G, 'rawset', function(t, name, value)
@@ -1071,6 +1456,7 @@ end)
 -- already sees the real names.
 local mirror = {}
 for _, one in ipairs(shielded) do mirror[one.proxy] = one.real end
+for _, one in ipairs(fshielded) do mirror[one.proxy] = one.real end
 
 local rawrawget, rawnext, rawpairs = rawget, next, pairs
 rawset(_G, 'rawget', function(t, name)
@@ -1140,7 +1526,158 @@ local function run(chunk)
   return ok, result
 end
 
-return {run = run, raw = raw}
+-- ---------------------------------------------------------------------------
+-- The second set of globals, which is what makes a function a function.
+--
+-- Everything above this line is one global table with one set of names on it. A
+-- function does not run against that table. It runs against this one, which is
+-- a copy of it taken before any script ran, without the error handler a script
+-- needs and with a `redis` table that is missing the three names only `EVAL`
+-- answers for. `KEYS` and `ARGV` are not on it and never will be, because a
+-- function is handed its keys and its arguments as the two arguments of its
+-- callback and reading a global called `KEYS` is a mistake a real server
+-- reports as one.
+--
+-- A real server gets here by keeping a whole second interpreter. This gets here
+-- by keeping a second table, which costs one table and gives the same answers,
+-- and which matters because a library's callbacks and a script's chunks then
+-- share a garbage collector and a string table instead of doubling both.
+local fglobals = {}
+for name, value in next, pristine do fglobals[name] = value end
+fglobals.__redis__err__handler = nil
+fglobals.redis = fproxy
+setmetatable(fglobals, guard)
+hidden[fglobals] = shadow
+
+-- `_G` is a proxy for the same reason the `redis` table is one. On the script
+-- side `_G` cannot be, because it is the table every global read goes through
+-- and a proxy would put a metatable lookup in front of all of them, which is
+-- why `_G.pcall = 1` lands there and is D-103. Here nothing reads through it:
+-- a function reads its globals through the environment below, and `_G` is only
+-- ever the long way round. So it can be empty, and `_G.pcall = 1` ends at a
+-- guard the way a real server ends it.
+local gproxy, gfront = guarded(fglobals)
+fglobals._G = gproxy
+fshielded[#fshielded + 1] = {proxy = gproxy, front = gfront, real = fglobals}
+hidden[gproxy] = shadow
+mirror[gproxy] = fglobals
+
+local fpristine = {}
+for name, value in next, fglobals do fpristine[name] = value end
+
+-- The environment a library chunk and every callback it makes runs in.
+--
+-- One table, and an `__index` that answers from a different place depending on
+-- whether a load is running. That is the whole of the difference between load
+-- time and call time: during a load the only name there is is `redis`, and the
+-- only names on that are the eight a library needs to describe itself. After
+-- the load the same environment answers from the globals above, which is what
+-- lets a callback that was written during the load call `redis.call` when it is
+-- finally called.
+--
+-- It has to be one table rather than two, because a chunk's environment is
+-- fixed by `setfenv` at load time and every closure the chunk makes inherits
+-- it. Swapping what the environment resolves against is the only way to give
+-- the closures a different world than the chunk that made them, and it is what
+-- a real server does to its own globals metatable for the same reason.
+local libenv = setmetatable({}, {
+  __index = function(_, name)
+    local value = rawrawget(loading and loadapi or fglobals, name)
+    if value ~= nil then return value end
+    error(missing(name), 2)
+  end,
+  __newindex = readonly,
+})
+hidden[libenv] = false
+
+-- The function globals as they were, for the same reason `restore` exists: the
+-- `_G.pcall = 1` spelling lands because `__newindex` does not fire for a key
+-- that is already there, and the next call on this thread must not find it.
+local function frestore()
+  local name, value = next(fglobals)
+  while name ~= nil do
+    local want = fpristine[name]
+    if want ~= nil then
+      if value ~= want then rawset(fglobals, name, want) end
+    else
+      rawset(fglobals, name, nil)
+    end
+    name, value = next(fglobals, name)
+  end
+  setmetatable(fglobals, guard)
+  for _, one in ipairs(fshielded) do setmetatable(one.proxy, one.front) end
+  for name, value in next, cjson_defaults do cjson_cfg[name] = value end
+end
+
+local function tidy()
+  wipe(libenv)
+  for _, one in ipairs(fshielded) do wipe(one.proxy) end
+  frestore()
+end
+
+-- Compile a library and run it once, which is the only time its own code runs.
+--
+-- The digest of the code is kept beside the callbacks so that a library another
+-- thread replaced is noticed here: the caller asks `holds` first, and a digest
+-- that does not match means this thread compiles the new code before it calls
+-- anything.
+local function loadlib(name, sha, code)
+  local chunk, why = rawloadstring(code, '@user_function')
+  if not chunk then
+    tidy()
+    return false, 'Error compiling function: ' .. tostring(why)
+  end
+  setfenv(chunk, libenv)
+  local outer = loading
+  loading = {byname = {}, order = {}}
+  local ok, err = rawpcall(chunk)
+  local built = loading
+  loading = outer
+  if not ok then
+    tidy()
+    -- A table with an `err` field is one of the sentences `register` turned the
+    -- call away with, and it already carries a code. A string is Lua's own,
+    -- with the line it happened on already on the front of it, and it needs
+    -- one. That is the whole reason a registration failure reads `ERR ERR` and
+    -- a runtime failure does not.
+    local said
+    if type(err) == 'table' and type(err.err) == 'string' then
+      said = err.err
+    else
+      said = 'ERR ' .. tostring(err)
+    end
+    return false, 'Error registering functions: ' .. said
+  end
+  tidy()
+  if #built.order == 0 then
+    return false, 'No functions registered'
+  end
+  libs[name] = {sha = sha, byname = built.byname}
+  return true, built.order
+end
+
+-- Whether this thread has the library the server is holding, rather than an
+-- older one under the same name.
+local function holds(name, sha)
+  local one = libs[name]
+  return one ~= nil and one.sha == sha
+end
+
+local function fcall(name, fname, keys, args)
+  local callback = libs[name].byname[fname]
+  -- `xpcall` in 5.1 takes no arguments for the function it calls, so the call
+  -- goes inside a closure. The result goes through a local on the way out
+  -- because `return callback(...)` would be a tail call, and a tail call has no
+  -- frame for the error handler to read a line number off.
+  local ok, result = rawxpcall(function()
+    local answer = callback(keys, args)
+    return answer
+  end, handler)
+  tidy()
+  return ok, result
+end
+
+return {run = run, load = loadlib, holds = holds, fcall = fcall, raw = raw}
 "#;
 
 #[cfg(test)]

@@ -684,7 +684,9 @@ fn getkeys(args: Args<'_>, out: &mut Out) -> Result<()> {
     if let Some((at, step, least, lenient)) = match spec.name {
         "msetex" => Some((3, 2, 1, false)),
         "ts.nrange" | "ts.nrevrange" => Some((3, 1, 1, false)),
-        "eval" | "eval_ro" | "evalsha" | "evalsha_ro" => Some((4, 1, 0, true)),
+        "eval" | "eval_ro" | "evalsha" | "evalsha_ro" | "fcall" | "fcall_ro" => {
+            Some((4, 1, 0, true))
+        }
         _ => None,
     } {
         let found = parse_i64(args.get(at))
