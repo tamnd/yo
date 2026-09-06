@@ -290,7 +290,14 @@ fn unseal(payload: &[u8]) -> Result<&[u8], Bad> {
         return Err(Bad::Footer);
     }
     let stored = u64::from_le_bytes(foot[2..].try_into().expect("ten byte footer, eight left"));
-    if stored != crc64(0, &payload[..payload.len() - 8]) {
+    // A checksum of zero means there is no checksum. Redis writes one when it
+    // has been told not to spend the time on it, and it reads one the same way,
+    // so a payload from a server with checksumming turned off has to be accepted
+    // here or `MIGRATE` from such a server never lands. The cost is that a
+    // payload damaged into exactly eight zero bytes gets read anyway, which is
+    // the same cost Redis pays and a smaller one than refusing a whole class of
+    // real payloads.
+    if stored != 0 && stored != crc64(0, &payload[..payload.len() - 8]) {
         return Err(Bad::Footer);
     }
     Ok(body)
@@ -858,6 +865,79 @@ pub(crate) fn load(payload: &[u8], limits: Limits<'_>, now: u64) -> Result<Body,
         return Err(Bad::Format);
     }
     Ok(value)
+}
+
+// ---------------------------------------------------------------------------
+// The function payload.
+// ---------------------------------------------------------------------------
+
+/// The opcode in front of each library in a function payload.
+const OP_FUNCTION2: u8 = 245;
+
+/// The opcode the two 7.0 release candidates wrote and nothing since has read.
+///
+/// Named rather than left to fall through with everything else because a client
+/// holding one of these deserves to be told what it is holding. The format
+/// changed between rc2 and the release and no server has ever converted it, so
+/// the only honest answer is that it is not supported.
+const OP_FUNCTION_PRE_GA: u8 = 246;
+
+/// Why a function payload was not accepted.
+///
+/// Four variants and not two, because `FUNCTION RESTORE` has four complaints and
+/// a client can tell them apart. Everything past the framing is the engine's
+/// problem and comes back from the caller instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BadLibs {
+    /// The version is from the future or the checksum does not match.
+    Footer,
+    /// A library was written in the format the 7.0 release candidates used.
+    PreGa,
+    /// An opcode that does not introduce a library at all.
+    NotFunction,
+    /// A library's code ran off the end of the payload.
+    Truncated,
+}
+
+/// The bytes `FUNCTION DUMP` hands out.
+///
+/// One opcode and one string per library, with the same footer every other
+/// payload gets. The string is the whole library code including its shebang,
+/// which is what makes a restore able to work out the name and the engine
+/// without any of that being written down twice.
+///
+/// Nothing else about a library goes in. The function names, their descriptions
+/// and their flags are all recovered by running the code again on the way back,
+/// which is why a payload survives a change in how a library describes itself
+/// and why restoring one costs a compile per library.
+pub fn functions<'a>(codes: impl IntoIterator<Item = &'a [u8]>) -> Vec<u8> {
+    let mut out = Vec::new();
+    for code in codes {
+        out.push(OP_FUNCTION2);
+        put_str(&mut out, code);
+    }
+    seal(out)
+}
+
+/// The library code out of a payload `FUNCTION DUMP` produced.
+///
+/// Only the framing is checked here. Whether a given piece of code is a library
+/// at all is a question for whoever compiles it, and answering it here would
+/// mean this crate knowing what a shebang is.
+pub fn libraries(payload: &[u8]) -> Result<Vec<Vec<u8>>, BadLibs> {
+    let body = unseal(payload).map_err(|_| BadLibs::Footer)?;
+    let mut r = Reader::new(body);
+    let mut found = Vec::new();
+    while !r.done() {
+        match r.byte().map_err(|_| BadLibs::Truncated)? {
+            OP_FUNCTION2 => {}
+            OP_FUNCTION_PRE_GA => return Err(BadLibs::PreGa),
+            _ => return Err(BadLibs::NotFunction),
+        }
+        let code = r.str().map_err(|_| BadLibs::Truncated)?;
+        found.push(code.into_owned());
+    }
+    Ok(found)
 }
 
 /// Read one value, leaving the reader wherever that value ended.

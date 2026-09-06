@@ -3402,11 +3402,9 @@ mod tests {
             "-ERR wrong number of arguments for 'script|exists' command\r\n"
         );
 
-        // DUMP and RESTORE are the two that are still not here, since both are
-        // about the RDB payload rather than about libraries.
         assert_eq!(
-            f.run(&[b"FUNCTION", b"DUMP"]),
-            "-ERR unknown subcommand 'DUMP'. Try FUNCTION HELP.\r\n"
+            f.run(&[b"FUNCTION", b"NOPE"]),
+            "-ERR unknown subcommand 'NOPE'. Try FUNCTION HELP.\r\n"
         );
     }
 
@@ -4583,6 +4581,10 @@ mod tests {
         return redis.call('SET', keys[1], args[1]) end)\n\
         redis.register_function('raise', function() error('boom') end)\n";
 
+    /// A second library, for the tests that need two of them.
+    const OTHER: &[u8] = b"#!lua name=other\n\
+        redis.register_function('twice', function(keys, args) return 2 end)\n";
+
     #[test]
     fn a_library_is_loaded_once_and_called_by_name_forever_after() {
         let mut f = Fixture::new();
@@ -5041,6 +5043,26 @@ mod tests {
                 &[b"DELETE", b"a", b"b"],
                 "ERR wrong number of arguments for 'function|delete' command",
             ),
+            (
+                &[b"DUMP", b"X"],
+                "ERR wrong number of arguments for 'function|dump' command",
+            ),
+            (
+                &[b"RESTORE"],
+                "ERR wrong number of arguments for 'function|restore' command",
+            ),
+            // RESTORE is the other one that falls through to the generic
+            // sentence, and for the same reason FLUSH does.
+            (
+                &[b"RESTORE", b"a", b"FLUSH", b"X"],
+                "ERR unknown subcommand or wrong number of arguments for 'RESTORE'. \
+                 Try FUNCTION HELP.",
+            ),
+            (
+                &[b"RESTORE", b"a", b"ZZ"],
+                "ERR Wrong restore policy given, value should be either FLUSH, APPEND \
+                 or REPLACE.",
+            ),
             // FLUSH is the one that does not, because it checks the count
             // itself before it looks at the argument.
             (
@@ -5066,6 +5088,138 @@ mod tests {
             f.run(&[b"FUNCTION", b"KILL"]),
             "-NOTBUSY No scripts in execution right now.\r\n"
         );
+    }
+
+    /// The two ends of the same pipe, so they are tested as one.
+    ///
+    /// An empty server dumps ten bytes rather than nothing, because the footer
+    /// is there whether or not a library is in front of it, and restoring those
+    /// ten bytes is a working no op.
+    #[test]
+    fn a_library_survives_a_dump_and_a_restore() {
+        let mut f = Fixture::new();
+        let empty = payload(&f.raw(&[b"FUNCTION", b"DUMP"]));
+        assert_eq!(empty.len(), 10);
+        assert_eq!(f.run(&[b"FUNCTION", b"RESTORE", &empty]), "+OK\r\n");
+
+        assert_eq!(f.run(&[b"FUNCTION", b"LOAD", LIB]), "$5\r\nmylib\r\n");
+        let full = payload(&f.raw(&[b"FUNCTION", b"DUMP"]));
+        assert!(full.len() > empty.len());
+
+        // The default policy is APPEND, so restoring onto the library the
+        // payload came from is a name collision and not a quiet replacement.
+        assert_eq!(
+            f.run(&[b"FUNCTION", b"RESTORE", &full]),
+            "-ERR Library mylib already exists\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"FUNCTION", b"RESTORE", &full, b"REPLACE"]),
+            "+OK\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"FUNCTION", b"RESTORE", &full, b"FLUSH"]),
+            "+OK\r\n"
+        );
+        // Whichever way it went back, the functions in it still run.
+        assert_eq!(f.run(&[b"FCALL", b"ping", b"0"]), "$4\r\npong\r\n");
+
+        // FLUSH keeps only what the payload held, so a library that was there
+        // and is not in the payload is gone.
+        assert_eq!(f.run(&[b"FUNCTION", b"LOAD", OTHER]), "$5\r\nother\r\n");
+        assert_eq!(
+            f.run(&[b"FUNCTION", b"RESTORE", &full, b"FLUSH"]),
+            "+OK\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"FUNCTION", b"DELETE", b"other"]),
+            "-ERR Library not found\r\n"
+        );
+    }
+
+    /// A payload that is going to be refused has to leave the server alone.
+    ///
+    /// Every one of these is refused for a different reason and at a different
+    /// depth, from bytes that are not a payload at all down to a library that
+    /// compiles and then collides, and the library that was already there has to
+    /// still be there afterwards in every case.
+    #[test]
+    fn a_restore_that_fails_changes_nothing() {
+        let mut f = Fixture::new();
+        assert_eq!(f.run(&[b"FUNCTION", b"LOAD", LIB]), "$5\r\nmylib\r\n");
+        let good = payload(&f.raw(&[b"FUNCTION", b"DUMP"]));
+
+        // Put the footer back on, so that each of these is refused for the
+        // reason it is meant to be testing rather than for a checksum the edit
+        // broke on the way.
+        let reseal = |body: &[u8], version: u16| {
+            let mut out = body.to_vec();
+            out.extend_from_slice(&version.to_le_bytes());
+            let crc = yo_common::crc::crc64(0, &out);
+            out.extend_from_slice(&crc.to_le_bytes());
+            out
+        };
+        let body = &good[..good.len() - 10];
+
+        let mut torn = good.clone();
+        let n = torn.len();
+        torn[n - 1] ^= 0xff;
+        let future = reseal(body, 999);
+        // The opcode in front of the one library, changed to the one the 7.0
+        // release candidates wrote and then to one that is not a library at all.
+        let mut pre_ga = body.to_vec();
+        pre_ga[0] = 246;
+        let pre_ga = reseal(&pre_ga, yo_kv::rdb::VERSION);
+        let mut other = body.to_vec();
+        other[0] = 0;
+        let other = reseal(&other, yo_kv::rdb::VERSION);
+        // A library whose length says there is more of it than there is.
+        let mut cut = body.to_vec();
+        cut.truncate(body.len() - 1);
+        let cut = reseal(&cut, yo_kv::rdb::VERSION);
+
+        for (bytes, want) in [
+            (vec![], "ERR DUMP payload version or checksum are wrong"),
+            (
+                b"0123456789".to_vec(),
+                "ERR DUMP payload version or checksum are wrong",
+            ),
+            (torn, "ERR DUMP payload version or checksum are wrong"),
+            (future, "ERR DUMP payload version or checksum are wrong"),
+            (pre_ga, "ERR Pre-GA function format not supported"),
+            (other, "ERR given type is not a function"),
+            (cut, "ERR Failed loading library payload"),
+        ] {
+            assert_eq!(
+                f.run(&[b"FUNCTION", b"RESTORE", &bytes]),
+                format!("-{want}\r\n")
+            );
+        }
+
+        // Still exactly the one library, and it still runs.
+        assert_eq!(f.run(&[b"FCALL", b"ping", b"0"]), "$4\r\npong\r\n");
+        let again = payload(&f.raw(&[b"FUNCTION", b"DUMP"]));
+        assert_eq!(again, good);
+    }
+
+    /// A REPLACE takes a library's name off another library and still refuses to
+    /// take a function name off one it is leaving alone.
+    #[test]
+    fn a_restore_will_not_take_a_function_name_off_a_library_it_keeps() {
+        let mut f = Fixture::new();
+        assert_eq!(f.run(&[b"FUNCTION", b"LOAD", LIB]), "$5\r\nmylib\r\n");
+        let full = payload(&f.raw(&[b"FUNCTION", b"DUMP"]));
+        // A second library registering the name the payload's library uses.
+        let clash =
+            b"#!lua name=cl\nredis.register_function('ping', function() return 'other' end)"
+                .as_slice();
+        assert_eq!(f.run(&[b"FUNCTION", b"FLUSH"]), "+OK\r\n");
+        assert_eq!(f.run(&[b"FUNCTION", b"LOAD", clash]), "$2\r\ncl\r\n");
+        assert_eq!(
+            f.run(&[b"FUNCTION", b"RESTORE", &full, b"REPLACE"]),
+            "-ERR Function ping already exists\r\n"
+        );
+        // Untouched, so the name still belongs to the library that had it.
+        assert_eq!(f.run(&[b"FCALL", b"ping", b"0"]), "$5\r\nother\r\n");
     }
 
     #[test]
