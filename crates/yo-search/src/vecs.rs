@@ -137,6 +137,17 @@ impl Vecs {
         Some(&self.data[slot * self.dim..(slot + 1) * self.dim])
     }
 
+    /// How far one document is from a query, at this field's metric.
+    ///
+    /// This is the number a client reads off the row, which is not always the
+    /// number that ordered the answer: a query can ask to see the distance from
+    /// a clause that did no ordering at all, and a query with two vector clauses
+    /// in it shows one distance for each of them.
+    #[must_use]
+    pub fn distance(&self, id: Id, query: &[f32]) -> Option<f32> {
+        Some(measure(self.metric, query, self.get(id)?))
+    }
+
     /// The `k` nearest documents to a query, nearest first.
     ///
     /// `allowed` is what the query narrowed the field down to first, and `None`

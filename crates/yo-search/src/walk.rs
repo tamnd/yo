@@ -131,8 +131,9 @@
 //! document at or after a number is, and a nearest neighbour question has no
 //! such answer until every candidate has been measured, so the whole clause is
 //! worked out at once and handed back in document number order like everything
-//! else. The distance rides along on the hit, because this is the only place
-//! that has both vectors and the reply is the only place that wants the number.
+//! else. The distance itself is not carried out of here: a reply that wants to
+//! show it asks the field for it again, because a query can ask to see the
+//! distance from a clause that never ordered anything.
 //!
 //! A clause that narrowed the index down first is walked first and only what it
 //! answered is measured. That is what the query means as well as what is quick:
@@ -169,24 +170,12 @@ pub struct Hit<'a> {
     /// One unless [`spaced`] was the way in, because working it out costs a
     /// pass over the places and most queries never look at it.
     pub slop: u32,
-    /// How far this document's vector was from the one the query asked about,
-    /// for a query that asked about one.
-    ///
-    /// Carried here rather than worked out again above, because the walk is the
-    /// only place that has both vectors and the reply is the only place that
-    /// needs the number.
-    pub dist: Option<f32>,
 }
 
 impl<'a> Hit<'a> {
     /// A document that answered, with nothing worked out about where.
     fn new(id: Id, found: Found<'a>) -> Hit<'a> {
-        Hit {
-            id,
-            found,
-            slop: 1,
-            dist: None,
-        }
+        Hit { id, found, slop: 1 }
     }
 }
 
@@ -487,15 +476,15 @@ fn nearby<'a>(held: &'a Held, vector: &'a crate::query::Vector) -> Nearby<'a> {
         (None, Some(radius)) => vecs.within(asked, radius as f32, narrow.as_deref()),
         (None, None) => Vec::new(),
     };
-    // Answered in document number order like every other step, with the
-    // distance carried alongside so that whoever sorts the answer can put it
-    // back in the order the search found it.
-    let mut near: Vec<(Id, f32)> = found
+    // Answered in document number order like every other step, which is what a
+    // real server answers a vector clause in: five documents written furthest
+    // first come back in the order they were written.
+    let mut near: Vec<Id> = found
         .into_iter()
         .filter(|near| held.docs.get(near.id).is_some())
-        .map(|near| (near.id, near.distance))
+        .map(|near| near.id)
         .collect();
-    near.sort_unstable_by_key(|(id, _)| *id);
+    near.sort_unstable();
     let guess = near.len() as u32;
     // What the clause in front matched is carried through rather than dropped,
     // because a vector clause narrows an answer and does not rescore it: the
@@ -508,21 +497,18 @@ fn nearby<'a>(held: &'a Held, vector: &'a crate::query::Vector) -> Nearby<'a> {
             let mut carried: BTreeMap<Id, Found<'a>> =
                 hits.into_iter().map(|hit| (hit.id, hit.found)).collect();
             near.into_iter()
-                .filter_map(|(id, away)| carried.remove(&id).map(|found| (id, away, found)))
+                .filter_map(|id| carried.remove(&id).map(|found| (id, found)))
                 .collect()
         }
-        None => near
-            .into_iter()
-            .map(|(id, away)| (id, away, Found::filter()))
-            .collect(),
+        None => near.into_iter().map(|id| (id, Found::filter())).collect(),
     };
     Nearby::new(ids, guess)
 }
 
-/// The documents a vector clause found, with how far away each one was and
-/// what the clause in front of it matched in them.
+/// The documents a vector clause found, with what the clause in front of it
+/// matched in them.
 struct Nearby<'a> {
-    ids: Vec<(Id, f32, Found<'a>)>,
+    ids: Vec<(Id, Found<'a>)>,
     at: usize,
     reads: u64,
     gave: Option<Id>,
@@ -530,7 +516,7 @@ struct Nearby<'a> {
 }
 
 impl<'a> Nearby<'a> {
-    fn new(ids: Vec<(Id, f32, Found<'a>)>, guess: u32) -> Nearby<'a> {
+    fn new(ids: Vec<(Id, Found<'a>)>, guess: u32) -> Nearby<'a> {
         Nearby {
             ids,
             at: 0,
@@ -546,16 +532,14 @@ impl<'a> Step<'a> for Nearby<'a> {
         while self.at < self.ids.len() && self.ids[self.at].0 < id {
             self.at += 1;
         }
-        let (found, distance, what) = self.ids.get(self.at)?;
-        let (found, distance) = (*found, *distance);
+        let (found, what) = self.ids.get(self.at)?;
+        let found = *found;
         let what = what.clone();
         if self.gave != Some(found) {
             self.gave = Some(found);
             self.reads += 1;
         }
-        let mut hit = Hit::new(found, what);
-        hit.dist = Some(distance);
-        Some(hit)
+        Some(Hit::new(found, what))
     }
 
     fn size(&self) -> u32 {

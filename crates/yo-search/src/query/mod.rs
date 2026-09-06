@@ -214,6 +214,73 @@ pub struct Vector {
     pub over: Option<Box<Node>>,
 }
 
+/// One distance a query asks to see on every row it answers, and everything it
+/// takes to work that distance out again.
+///
+/// A nearest neighbour clause shows its distance whether or not anybody asked,
+/// under `__v_score` unless the client renamed it. A range clause shows nothing
+/// unless the client named it, which is what `YIELD_DISTANCE_AS` is for.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Yield {
+    /// What the distance is called on the row.
+    pub name: Box<[u8]>,
+    /// The field it was measured against.
+    pub field: Box<[u8]>,
+    /// The vector it was measured from.
+    pub asked: Box<[f32]>,
+}
+
+/// Every distance a query asks to see, outermost clause first.
+///
+/// Measured that way round: a range that names its distance with a nearest
+/// neighbour clause wrapped around it answers the outer clause's distance
+/// first and the inner one's after it.
+#[must_use]
+pub fn yields(node: &Node) -> Vec<Yield> {
+    let mut out = Vec::new();
+    collect(node, &mut out);
+    out
+}
+
+/// Walks the tree in the order the distances come back in.
+fn collect(node: &Node, out: &mut Vec<Yield>) {
+    match &node.what {
+        What::Vector(vector) => {
+            // A clause with no vector behind it was refused before this, so the
+            // only way there is nothing here is a clause that asked for neither
+            // a count nor a radius, which matches nothing and shows nothing.
+            let name = vector
+                .alias
+                .clone()
+                .or_else(|| vector.k.map(|_| Box::from(&b"__v_score"[..])));
+            if let Some((name, asked)) = name.zip(vector.asked.clone())
+                && !out.iter().any(|held: &Yield| held.name == name)
+            {
+                out.push(Yield {
+                    name,
+                    field: vector.field.clone(),
+                    asked,
+                });
+            }
+            if let Some(over) = &vector.over {
+                collect(over, out);
+            }
+        }
+        What::Union(nodes) | What::Intersect(nodes) | What::Exact(nodes) => {
+            for node in nodes {
+                collect(node, out);
+            }
+        }
+        What::Tag(_, nodes) => {
+            for node in nodes {
+                collect(node, out);
+            }
+        }
+        What::Not(node) | What::Optional(node) => collect(node, out),
+        _ => {}
+    }
+}
+
 /// Whether a list of children is a word and the forms of it, rather than
 /// something the client wrote as a union.
 ///

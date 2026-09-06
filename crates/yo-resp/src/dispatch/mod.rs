@@ -23080,6 +23080,166 @@ mod tests {
         );
     }
 
+    /// A nearest neighbour clause puts its distance on every row it answers,
+    /// under `__v_score` unless the query renamed it. A range clause puts
+    /// nothing there at all unless the query named it, which is what
+    /// `YIELD_DISTANCE_AS` is for.
+    #[test]
+    fn a_vector_clause_yields_its_distance_under_the_name_it_was_given() {
+        let mut f = Fixture::new();
+        vectored(&mut f);
+        let ask = |f: &mut Fixture, query: &str| {
+            f.run(&[
+                b"FT.SEARCH",
+                b"h",
+                query.as_bytes(),
+                b"PARAMS",
+                b"2",
+                b"vec",
+                ORIGIN,
+                b"DIALECT",
+                b"2",
+                b"LIMIT",
+                b"0",
+                b"1",
+            ])
+        };
+        assert_eq!(
+            ask(&mut f, "*=>[KNN 3 @v $vec]"),
+            "*3\r\n:3\r\n$2\r\nd3\r\n*6\r\n$9\r\n__v_score\r\n$1\r\n4\r\n$1\r\nt\r\n$4\r\nbeta\r\n$1\r\nv\r\n$8\r\n\0\0\0@\0\0\0\0\r\n"
+        );
+        assert_eq!(
+            ask(&mut f, "*=>[KNN 3 @v $vec AS d]"),
+            "*3\r\n:3\r\n$2\r\nd3\r\n*6\r\n$1\r\nd\r\n$1\r\n4\r\n$1\r\nt\r\n$4\r\nbeta\r\n$1\r\nv\r\n$8\r\n\0\0\0@\0\0\0\0\r\n"
+        );
+        assert_eq!(
+            ask(&mut f, "@v:[VECTOR_RANGE 4 $vec]"),
+            "*3\r\n:3\r\n$2\r\nd3\r\n*4\r\n$1\r\nt\r\n$4\r\nbeta\r\n$1\r\nv\r\n$8\r\n\0\0\0@\0\0\0\0\r\n"
+        );
+        assert_eq!(
+            ask(&mut f, "@v:[VECTOR_RANGE 4 $vec]=>{$YIELD_DISTANCE_AS: d}"),
+            "*3\r\n:3\r\n$2\r\nd3\r\n*6\r\n$1\r\nd\r\n$1\r\n4\r\n$1\r\nt\r\n$4\r\nbeta\r\n$1\r\nv\r\n$8\r\n\0\0\0@\0\0\0\0\r\n"
+        );
+    }
+
+    /// What decides whether a `RETURN` answers the distance is the name the row
+    /// would carry it under and not the field it would have been read from,
+    /// because it is on the row before any key is read.
+    ///
+    /// So naming it answers it, renaming it answers nothing at all, and giving
+    /// its name to another field answers the distance under that name.
+    #[test]
+    fn a_return_answers_the_distance_by_the_name_the_row_carries_it_under() {
+        let mut f = Fixture::new();
+        vectored(&mut f);
+        let ask = |f: &mut Fixture, ret: &[&[u8]]| {
+            let mut args: Vec<&[u8]> = vec![b"FT.SEARCH", b"h", b"*=>[KNN 1 @v $vec]"];
+            args.extend_from_slice(ret);
+            args.extend_from_slice(&[b"PARAMS", b"2", b"vec", ORIGIN, b"DIALECT", b"2"]);
+            f.run(&args)
+        };
+        assert_eq!(
+            ask(&mut f, &[b"RETURN", b"1", b"__v_score"]),
+            "*3\r\n:1\r\n$2\r\nd5\r\n*2\r\n$9\r\n__v_score\r\n$1\r\n0\r\n"
+        );
+        assert_eq!(
+            ask(&mut f, &[b"RETURN", b"3", b"__v_score", b"AS", b"x"]),
+            "*3\r\n:1\r\n$2\r\nd5\r\n*0\r\n"
+        );
+        assert_eq!(
+            ask(&mut f, &[b"RETURN", b"3", b"t", b"AS", b"__v_score"]),
+            "*3\r\n:1\r\n$2\r\nd5\r\n*2\r\n$9\r\n__v_score\r\n$1\r\n0\r\n"
+        );
+        assert_eq!(
+            ask(&mut f, &[b"RETURN", b"1", b"t"]),
+            "*3\r\n:1\r\n$2\r\nd5\r\n*2\r\n$1\r\nt\r\n$4\r\nbeta\r\n"
+        );
+        // The distance goes in front of the rest whatever order they were
+        // named in, and `NOCONTENT` takes it away with everything else.
+        assert_eq!(
+            ask(&mut f, &[b"RETURN", b"2", b"t", b"__v_score"]),
+            "*3\r\n:1\r\n$2\r\nd5\r\n*4\r\n$9\r\n__v_score\r\n$1\r\n0\r\n$1\r\nt\r\n$4\r\nbeta\r\n"
+        );
+        assert_eq!(ask(&mut f, &[b"NOCONTENT"]), "*2\r\n:1\r\n$2\r\nd5\r\n");
+    }
+
+    /// A `SORTBY` can name a distance the query yielded, which sorts by the
+    /// number rather than by anything the key holds. A name the query did not
+    /// yield is refused the way any other unknown property is.
+    #[test]
+    fn a_sortby_can_name_a_distance_the_query_yielded() {
+        let mut f = Fixture::new();
+        vectored(&mut f);
+        let ask = |f: &mut Fixture, query: &str, by: &[u8], desc: bool| {
+            let mut args: Vec<&[u8]> = vec![b"FT.SEARCH", b"h", query.as_bytes(), b"SORTBY", by];
+            if desc {
+                args.push(b"DESC");
+            }
+            args.extend_from_slice(&[
+                b"PARAMS",
+                b"2",
+                b"vec",
+                ORIGIN,
+                b"DIALECT",
+                b"2",
+                b"NOCONTENT",
+            ]);
+            f.run(&args)
+        };
+        assert_eq!(
+            ask(&mut f, "*=>[KNN 3 @v $vec]", b"__v_score", false),
+            "*4\r\n:3\r\n$2\r\nd5\r\n$2\r\nd4\r\n$2\r\nd3\r\n"
+        );
+        assert_eq!(
+            ask(&mut f, "*=>[KNN 3 @v $vec]", b"__v_score", true),
+            "*4\r\n:3\r\n$2\r\nd3\r\n$2\r\nd4\r\n$2\r\nd5\r\n"
+        );
+        assert_eq!(
+            ask(&mut f, "*=>[KNN 3 @v $vec AS d]", b"d", false),
+            "*4\r\n:3\r\n$2\r\nd5\r\n$2\r\nd4\r\n$2\r\nd3\r\n"
+        );
+        // Renaming it takes the old name away, and a query with no vector
+        // clause in it never had the property at all.
+        let missing = "-SEARCH_PROP_NOT_FOUND Property `__v_score` \
+                       not loaded nor in schema\r\n";
+        assert_eq!(
+            ask(&mut f, "*=>[KNN 3 @v $vec AS d]", b"__v_score", false),
+            missing
+        );
+        assert_eq!(ask(&mut f, "alpha", b"__v_score", false), missing);
+        // The query is read before the property is looked up, which is
+        // measured: a query that will not parse is answered first.
+        assert_eq!(
+            ask(&mut f, "foo(", b"zz", false),
+            "-SEARCH_SYNTAX Syntax error at offset 3 near foo\r\n"
+        );
+    }
+
+    /// Two vector clauses in one query answer two distances, outermost first.
+    #[test]
+    fn two_vector_clauses_answer_two_distances() {
+        let mut f = Fixture::new();
+        vectored(&mut f);
+        assert_eq!(
+            f.run(&[
+                b"FT.SEARCH",
+                b"h",
+                b"@v:[VECTOR_RANGE 9 $vec]=>{$YIELD_DISTANCE_AS: rr}=>[KNN 2 @v $vec]",
+                b"RETURN",
+                b"2",
+                b"rr",
+                b"__v_score",
+                b"PARAMS",
+                b"2",
+                b"vec",
+                ORIGIN,
+                b"DIALECT",
+                b"2",
+            ]),
+            "*5\r\n:2\r\n$2\r\nd4\r\n*4\r\n$9\r\n__v_score\r\n$1\r\n1\r\n$2\r\nrr\r\n$1\r\n1\r\n$2\r\nd5\r\n*4\r\n$9\r\n__v_score\r\n$1\r\n0\r\n$2\r\nrr\r\n$1\r\n0\r\n"
+        );
+    }
+
     // ----------------------------------------------------------- spellcheck
 
     /// The score is how many documents hold the suggestion over how many
