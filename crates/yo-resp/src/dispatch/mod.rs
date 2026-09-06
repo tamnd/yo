@@ -72,6 +72,7 @@ mod lists;
 mod lua;
 mod migrate;
 mod multi;
+mod pubsub;
 mod scan;
 mod scripting;
 mod search;
@@ -90,6 +91,7 @@ mod zsets;
 
 pub use args::Args;
 pub use blocking::{Parked, Waiters};
+pub(crate) use pubsub::Envelope;
 pub use server::parse_memory;
 pub use table::{COMMANDS, Spec, arity_ok, lookup};
 
@@ -740,6 +742,25 @@ pub struct Server {
     /// of them, and that is what keeps the cost of watches on a server that has
     /// none down to one relaxed load per write.
     watched: AtomicUsize,
+    /// Who is listening on what, for pub/sub.
+    ///
+    /// Here and not on the connection for the reason the watches are: a publish
+    /// arrives on a connection that knows nothing about the subscribers, so what
+    /// finds them has to sit beside the name rather than beside the client. See
+    /// the `pubsub` module for the rest of it.
+    pubsub: Lock<pubsub::Registry>,
+    /// How many subscriptions there are, so a publish can ask without taking
+    /// the lock.
+    ///
+    /// Zero on every server nobody has subscribed on, which is what keeps
+    /// `PUBLISH` on a server with no listeners down to one relaxed load.
+    subs: AtomicUsize,
+    /// One inbox per thread, for messages published on another one.
+    ///
+    /// Its own array and not a field on [`Local`], which is a cache line per
+    /// thread precisely so that no other thread writes to it. A mailbox is a
+    /// line another thread is meant to write to, so it gets one of its own.
+    mail: Box<[pubsub::Mailbox]>,
 }
 
 impl Server {
@@ -779,6 +800,9 @@ impl Server {
             stopping: AtomicBool::new(false),
             watches: Lock::default(),
             watched: AtomicUsize::new(0),
+            pubsub: Lock::default(),
+            subs: AtomicUsize::new(0),
+            mail: pubsub::boxes(1),
         }
     }
 
@@ -841,6 +865,9 @@ impl Server {
             stopping: AtomicBool::new(false),
             watches: Lock::default(),
             watched: AtomicUsize::new(0),
+            pubsub: Lock::default(),
+            subs: AtomicUsize::new(0),
+            mail: pubsub::boxes(1),
         }
     }
 
@@ -1212,12 +1239,13 @@ impl Server {
 
     /// Say how many threads will run commands here, before any of them does.
     ///
-    /// What it changes is how many sets of counters there are. Called once at
-    /// startup by whoever is about to start the threads, and calling it on a
-    /// running server throws away what has been counted so far, which is why it
-    /// wants the server to itself.
+    /// What it changes is how many sets of counters there are, and how many
+    /// pub/sub mailboxes. Called once at startup by whoever is about to start
+    /// the threads, and calling it on a running server throws away what has been
+    /// counted so far, which is why it wants the server to itself.
     pub fn set_threads(&mut self, threads: usize) {
         self.locals = slots(threads);
+        self.mail = pubsub::boxes(threads);
         self.claimed = AtomicUsize::new(0);
     }
 
@@ -1683,6 +1711,14 @@ impl Default for Server {
 pub struct Session {
     db: usize,
     id: u64,
+    /// Which connection slot on the front this session belongs to.
+    ///
+    /// Carried here so that a command can say where a reply for this connection
+    /// goes without the front having to be asked. Pub/sub is what needs it: a
+    /// subscription is a row on the server naming a slot, and the subscribe
+    /// command is the only moment the connection and the server are both in
+    /// hand. [`u32::MAX`] for a session that is not on a front, which is a test.
+    conn: u32,
     name: Vec<u8>,
     /// The `HIMPORT` fieldsets this connection has prepared.
     ///
@@ -1713,6 +1749,21 @@ pub struct Session {
     /// another thread has to reach it. See `multi` for why keeping the value
     /// here and comparing it at `EXEC` is not the same thing.
     watching: Vec<multi::Watched>,
+    /// Whether the command running right now was handed over by `EXEC`.
+    ///
+    /// The one thing it changes is the RESP2 subscribe mode refusal, which a
+    /// real server makes in `processCommand` and so does not make for a command
+    /// that was queued: `MULTI`, `SUBSCRIBE z`, `GET x`, `EXEC` runs the `GET`
+    /// on 8.10.1 even though sending it on its own would have been refused.
+    running: bool,
+    /// What this connection has subscribed to, `None` until it subscribes to
+    /// anything.
+    ///
+    /// Boxed so that a connection that never subscribes carries a null pointer
+    /// rather than three empty vectors. The other half is on the server, keyed
+    /// by name, because a publish arrives on a connection that cannot see this
+    /// one. See the `pubsub` module.
+    subs: Option<Box<pubsub::Subs>>,
 }
 
 impl Session {
@@ -1722,17 +1773,34 @@ impl Session {
         Session {
             db: 0,
             id,
+            conn: u32::MAX,
             name: Vec::new(),
             sets: himport::Fieldsets::default(),
             scripted: false,
             multi: None,
             watching: Vec::new(),
+            running: false,
+            subs: None,
         }
     }
 
     /// Whether a script is what is asking, which only a blocking command reads.
     pub(crate) const fn scripted(&self) -> bool {
         self.scripted
+    }
+
+    /// Whether `EXEC` is what is asking.
+    pub(crate) const fn running(&self) -> bool {
+        self.running
+    }
+
+    /// Say which connection slot this session is in.
+    ///
+    /// Called by the front when it opens the connection, which is the only place
+    /// that knows. A session nobody tells is not on a front, and the one thing
+    /// that reads this checks the client id before it acts on it.
+    pub(crate) const fn set_conn(&mut self, conn: u32) {
+        self.conn = conn;
     }
 
     /// The connection id, which `HELLO` reports and `CLIENT` will.
@@ -1777,13 +1845,15 @@ impl Session {
 
 /// Give back everything a connection was holding on the server.
 ///
-/// Today that is the transaction and the watches, and it is here rather than in
-/// [`Session::reset`] because letting go of a watch is a change to the server.
-/// A `Session` on its own cannot reach one, and a connection that dropped its
-/// list without saying so would leave rows nobody is watching, which would keep
-/// every write on the server paying for watches that are not there.
+/// The transaction, the watches and the subscriptions, and it is here rather
+/// than in [`Session::reset`] because letting go of any of the three is a change
+/// to the server. A `Session` on its own cannot reach one, and a connection that
+/// dropped its lists without saying so would leave rows nobody is watching and
+/// subscriptions nobody is listening to, which would keep every write and every
+/// publish on the server paying for clients that are not there.
 pub fn forget_session(server: &Server, session: &mut Session) {
     multi::release(server, session);
+    pubsub::release(server, session);
 }
 
 /// Run one command and write its reply.
@@ -1864,6 +1934,19 @@ pub fn resolved(
         server.mine().cmdstats.at(spec).rejected.bump();
         session.dirty_multi();
         out.error_line(b"OOM ", OOM);
+        return Flow::Continue;
+    }
+
+    // A RESP2 connection that has subscribed to something may only send a
+    // handful of commands, because RESP2 sends a published message as an
+    // ordinary array and a client with a reply outstanding could not tell the
+    // two apart. Here, after the refusals above and before the queue below,
+    // which is where a real server puts it: `EXEC` sent while subscribed comes
+    // back as an `EXECABORT` rather than as this error, and a command `EXEC`
+    // hands over is not asked at all.
+    if let Some(e) = pubsub::refused(session, spec, out) {
+        server.mine().cmdstats.at(spec).rejected.bump();
+        multi::refuse(server, session, Some(spec), &e, out);
         return Flow::Continue;
     }
 
@@ -2094,6 +2177,10 @@ pub fn resolved(
                 scripting::execute(server, session, spec, args, out).map(|()| Flow::Continue)
             }
             "transactions" => multi::execute(server, session, spec, args, out),
+            // No database either, and the one group whose replies do not all go
+            // to the connection that asked. The session is in it because a
+            // subscription is connection state as well as server state.
+            "pubsub" => pubsub::execute(server, session, spec, args, out),
             _ => server::execute(server, session, spec, args, out),
         }
     };
@@ -2586,6 +2673,208 @@ mod tests {
         assert!(!f.server.watching());
         f.run(&[b"SET", b"k", b"1"]);
         assert!(!f.server.watching());
+    }
+
+    /// The count on the end of a subscribe reply is channels and patterns
+    /// together, which is a thing a client uses to know when it is out of
+    /// subscribe mode and so has to be the number the mode is decided on.
+    /// Shard channels are counted on their own because they are their own
+    /// namespace.
+    #[test]
+    fn the_count_a_subscribe_answers_covers_channels_and_patterns() {
+        let mut f = Fixture::new();
+        assert_eq!(
+            f.run(&[b"SUBSCRIBE", b"a", b"b"]),
+            "*3\r\n$9\r\nsubscribe\r\n$1\r\na\r\n:1\r\n*3\r\n$9\r\nsubscribe\r\n$1\r\nb\r\n:2\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"PSUBSCRIBE", b"c*"]),
+            "*3\r\n$10\r\npsubscribe\r\n$2\r\nc*\r\n:3\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"SSUBSCRIBE", b"s"]),
+            "*3\r\n$10\r\nssubscribe\r\n$1\r\ns\r\n:1\r\n"
+        );
+        // Subscribing again to something already held answers again with the
+        // count unchanged, rather than counting it twice or saying nothing.
+        assert_eq!(
+            f.run(&[b"SUBSCRIBE", b"a"]),
+            "*3\r\n$9\r\nsubscribe\r\n$1\r\na\r\n:3\r\n"
+        );
+    }
+
+    /// Unsubscribe has three shapes and a client has to be able to tell them
+    /// apart, because the last one is what tells it the mode is over.
+    #[test]
+    fn unsubscribe_answers_for_names_it_was_not_holding_too() {
+        let mut f = Fixture::new();
+        f.run(&[b"SUBSCRIBE", b"a"]);
+
+        // A name that was never subscribed still gets a reply, with the count
+        // as it stands.
+        assert_eq!(
+            f.run(&[b"UNSUBSCRIBE", b"zz"]),
+            "*3\r\n$11\r\nunsubscribe\r\n$2\r\nzz\r\n:1\r\n"
+        );
+        // With no names, one reply per channel held, counting down.
+        f.run(&[b"SUBSCRIBE", b"b"]);
+        f.run(&[b"PSUBSCRIBE", b"p*"]);
+        assert_eq!(
+            f.run(&[b"UNSUBSCRIBE"]),
+            "*3\r\n$11\r\nunsubscribe\r\n$1\r\na\r\n:2\r\n*3\r\n$11\r\nunsubscribe\r\n$1\r\nb\r\n:1\r\n"
+        );
+        // With no names and none of that family held, one reply with a nil
+        // where the name goes and the count that is left.
+        assert_eq!(
+            f.run(&[b"UNSUBSCRIBE"]),
+            "*3\r\n$11\r\nunsubscribe\r\n$-1\r\n:1\r\n",
+            "the pattern is still held, so the count is one"
+        );
+        assert_eq!(
+            f.run(&[b"SUNSUBSCRIBE"]),
+            "*3\r\n$12\r\nsunsubscribe\r\n$-1\r\n:0\r\n",
+            "shard channels are counted on their own"
+        );
+    }
+
+    /// The gate is on the funnel and the funnel is what `EXEC` goes through
+    /// for the commands it queued, so it has to know it is running one.
+    /// Redis lets a queued command through, and a transaction that subscribes
+    /// and then reads is the case that says which way round it is.
+    #[test]
+    fn the_subscribe_gate_does_not_reach_inside_exec() {
+        let mut f = Fixture::new();
+        f.run(&[b"SET", b"k", b"1"]);
+        f.run(&[b"MULTI"]);
+        assert_eq!(f.run(&[b"SUBSCRIBE", b"z"]), "+QUEUED\r\n");
+        assert_eq!(f.run(&[b"GET", b"k"]), "+QUEUED\r\n");
+        assert_eq!(
+            f.run(&[b"EXEC"]),
+            "*2\r\n*3\r\n$9\r\nsubscribe\r\n$1\r\nz\r\n:1\r\n$1\r\n1\r\n"
+        );
+        // And once EXEC is done the connection really is subscribed, so the
+        // gate is back on.
+        assert_eq!(
+            f.run(&[b"GET", b"k"]),
+            "-ERR Can't execute 'get': only (P|S)SUBSCRIBE / (P|S)UNSUBSCRIBE / PING / QUIT / RESET are allowed in this context\r\n"
+        );
+    }
+
+    /// `EXEC` sent by a subscribed RESP2 client is refused by the gate like
+    /// anything else, and a refusal on the funnel kills the transaction.
+    #[test]
+    fn exec_sent_by_a_subscriber_aborts_the_transaction() {
+        let mut f = Fixture::new();
+        f.run(&[b"MULTI"]);
+        f.run(&[b"SET", b"k", b"1"]);
+        f.run(&[b"SUBSCRIBE", b"z"]);
+        f.run(&[b"EXEC"]);
+        f.run(&[b"MULTI"]);
+        assert_eq!(
+            f.run(&[b"EXEC"]),
+            "-EXECABORT Transaction discarded because of: Can't execute 'exec': only (P|S)SUBSCRIBE / (P|S)UNSUBSCRIBE / PING / QUIT / RESET are allowed in this context\r\n"
+        );
+    }
+
+    /// `RESET` is one of the few things a subscriber may send, and what it
+    /// resets includes every subscription it is holding.
+    #[test]
+    fn reset_lets_go_of_every_subscription() {
+        let mut f = Fixture::new();
+        f.run(&[b"SUBSCRIBE", b"a"]);
+        f.run(&[b"PSUBSCRIBE", b"p*"]);
+        f.run(&[b"SSUBSCRIBE", b"s"]);
+        assert_eq!(f.run(&[b"RESET"]), "+RESET\r\n");
+        assert_eq!(f.run(&[b"PUBSUB", b"NUMPAT"]), ":0\r\n");
+        assert_eq!(f.run(&[b"PUBSUB", b"CHANNELS"]), "*0\r\n");
+        assert_eq!(f.run(&[b"PUBSUB", b"SHARDCHANNELS"]), "*0\r\n");
+        // And the connection takes ordinary commands again.
+        assert_eq!(f.run(&[b"GET", b"k"]), "$-1\r\n");
+    }
+
+    /// What `PUBSUB` can be asked, on a server with one subscriber holding one
+    /// of each.
+    #[test]
+    fn pubsub_reports_channels_patterns_and_shard_channels_apart() {
+        let mut f = Fixture::new();
+        let mut sub = Session::new(9);
+        f.by(&mut sub, &[b"SUBSCRIBE", b"a"]);
+        f.by(&mut sub, &[b"PSUBSCRIBE", b"a*"]);
+        f.by(&mut sub, &[b"SSUBSCRIBE", b"a"]);
+
+        assert_eq!(f.run(&[b"PUBSUB", b"CHANNELS"]), "*1\r\n$1\r\na\r\n");
+        assert_eq!(f.run(&[b"PUBSUB", b"CHANNELS", b"b*"]), "*0\r\n");
+        assert_eq!(f.run(&[b"PUBSUB", b"SHARDCHANNELS"]), "*1\r\n$1\r\na\r\n");
+        assert_eq!(f.run(&[b"PUBSUB", b"NUMPAT"]), ":1\r\n");
+        assert_eq!(
+            f.run(&[b"PUBSUB", b"NUMSUB", b"a", b"zz"]),
+            "*4\r\n$1\r\na\r\n:1\r\n$2\r\nzz\r\n:0\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"PUBSUB", b"SHARDNUMSUB", b"a"]),
+            "*2\r\n$1\r\na\r\n:1\r\n",
+            "the shard channel and the channel share a name and not a count"
+        );
+        assert_eq!(f.run(&[b"PUBSUB", b"NUMSUB"]), "*0\r\n");
+
+        forget_session(&f.server, &mut sub);
+        assert_eq!(f.run(&[b"PUBSUB", b"NUMPAT"]), ":0\r\n");
+        assert_eq!(f.run(&[b"PUBSUB", b"CHANNELS"]), "*0\r\n");
+    }
+
+    /// One mistake in a `PUBSUB` subcommand has two error shapes depending on
+    /// which subcommand it is, because the ones with a fixed argument count are
+    /// checked by the subcommand table and the ones without fall through to
+    /// the generic syntax error. Both are copied here rather than tidied,
+    /// since a client that matches on the text sees the difference.
+    #[test]
+    fn pubsub_says_no_two_different_ways() {
+        let mut f = Fixture::new();
+        assert_eq!(
+            f.run(&[b"PUBSUB"]),
+            "-ERR wrong number of arguments for 'pubsub' command\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"PUBSUB", b"NOPE"]),
+            "-ERR unknown subcommand 'NOPE'. Try PUBSUB HELP.\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"PUBSUB", b"CHANNELS", b"a*", b"b"]),
+            "-ERR unknown subcommand or wrong number of arguments for 'CHANNELS'. Try PUBSUB HELP.\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"PUBSUB", b"NUMPAT", b"x"]),
+            "-ERR wrong number of arguments for 'pubsub|numpat' command\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"PUBSUB", b"HELP", b"x"]),
+            "-ERR wrong number of arguments for 'pubsub|help' command\r\n"
+        );
+    }
+
+    /// Publishing to nobody costs a lookup and answers zero, which is the
+    /// common case on a server that has pub/sub compiled in and not in use.
+    #[test]
+    fn publishing_to_nobody_answers_zero() {
+        let mut f = Fixture::new();
+        assert_eq!(f.run(&[b"PUBLISH", b"a", b"hi"]), ":0\r\n");
+        assert_eq!(f.run(&[b"SPUBLISH", b"a", b"hi"]), ":0\r\n");
+        // An empty channel name is a name like any other.
+        assert_eq!(f.run(&[b"PUBLISH", b"", b"hi"]), ":0\r\n");
+    }
+
+    /// A publish counts everybody it reached, which is not the same as the
+    /// number of subscribers: one connection holding two patterns that both
+    /// match is two.
+    #[test]
+    fn a_publish_counts_the_deliveries_and_not_the_clients() {
+        let mut f = Fixture::new();
+        let mut sub = Session::new(9);
+        f.by(&mut sub, &[b"SUBSCRIBE", b"news"]);
+        f.by(&mut sub, &[b"PSUBSCRIBE", b"ne*"]);
+        f.by(&mut sub, &[b"PSUBSCRIBE", b"n*s"]);
+        assert_eq!(f.run(&[b"PUBLISH", b"news", b"hi"]), ":3\r\n");
+        forget_session(&f.server, &mut sub);
     }
 
     /// What a client does all day: write the same keys again and again. Every

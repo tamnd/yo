@@ -48,6 +48,11 @@ pub struct Spec {
 /// The four transaction commands Redis counts as fast, which is all of them
 /// except `EXEC`, whose cost is whatever it was asked to run.
 const AC_TX_FAST: &[&str] = &["@fast", "@transaction"];
+/// The six subscribe and unsubscribe commands, none of which Redis counts as
+/// fast because all of them take a list.
+const AC_PUBSUB_SLOW: &[&str] = &["@pubsub", "@slow"];
+/// The two publishes, which Redis does count as fast.
+const AC_PUBSUB_FAST: &[&str] = &["@pubsub", "@fast"];
 /// Read only, fast, one key at argument one, which is most of the getters.
 const READ_FAST: &[&str] = &["readonly", "fast"];
 /// A write that allocates, fast, one key at argument one.
@@ -5825,6 +5830,129 @@ pub static COMMANDS: &[Spec] = &[
         summary: "Stop watching everything this connection was watching.",
         group: "transactions",
     },
+    // -------------------------------------------------------------- pubsub
+    // The three shard commands carry a key at argument one and are not about a
+    // key at all. Redis marks that spec `not_key`, which is its way of saying
+    // that the argument is there to be hashed to a cluster slot and nothing
+    // else, so that a shard channel and the keys it belongs with land on the
+    // same node. The triple is what `COMMAND GETKEYS` reads, so it is kept.
+    Spec {
+        name: "subscribe",
+        arity: -2,
+        flags: &["denyoom", "pubsub", "noscript", "loading", "stale"],
+        first_key: 0,
+        last_key: 0,
+        step: 0,
+        acl: AC_PUBSUB_SLOW,
+        since: "2.0.0",
+        complexity: "O(N) in the number of channels named.",
+        summary: "Listen on these channels.",
+        group: "pubsub",
+    },
+    Spec {
+        name: "unsubscribe",
+        arity: -1,
+        flags: &["pubsub", "noscript", "loading", "stale"],
+        first_key: 0,
+        last_key: 0,
+        step: 0,
+        acl: AC_PUBSUB_SLOW,
+        since: "2.0.0",
+        complexity: "O(N) in the number of channels named, or held if none are.",
+        summary: "Stop listening on these channels, or on all of them.",
+        group: "pubsub",
+    },
+    Spec {
+        name: "psubscribe",
+        arity: -2,
+        flags: &["denyoom", "pubsub", "noscript", "loading", "stale"],
+        first_key: 0,
+        last_key: 0,
+        step: 0,
+        acl: AC_PUBSUB_SLOW,
+        since: "2.0.0",
+        complexity: "O(N) in the number of patterns named.",
+        summary: "Listen on every channel matching these patterns.",
+        group: "pubsub",
+    },
+    Spec {
+        name: "punsubscribe",
+        arity: -1,
+        flags: &["pubsub", "noscript", "loading", "stale"],
+        first_key: 0,
+        last_key: 0,
+        step: 0,
+        acl: AC_PUBSUB_SLOW,
+        since: "2.0.0",
+        complexity: "O(N) in the number of patterns named, or held if none are.",
+        summary: "Stop listening on these patterns, or on all of them.",
+        group: "pubsub",
+    },
+    Spec {
+        name: "ssubscribe",
+        arity: -2,
+        flags: &["denyoom", "pubsub", "noscript", "loading", "stale"],
+        first_key: 1,
+        last_key: -1,
+        step: 1,
+        acl: AC_PUBSUB_SLOW,
+        since: "7.0.0",
+        complexity: "O(N) in the number of shard channels named.",
+        summary: "Listen on these shard channels.",
+        group: "pubsub",
+    },
+    Spec {
+        name: "sunsubscribe",
+        arity: -1,
+        flags: &["pubsub", "noscript", "loading", "stale"],
+        first_key: 1,
+        last_key: -1,
+        step: 1,
+        acl: AC_PUBSUB_SLOW,
+        since: "7.0.0",
+        complexity: "O(N) in the number of shard channels named, or held if none are.",
+        summary: "Stop listening on these shard channels, or on all of them.",
+        group: "pubsub",
+    },
+    Spec {
+        name: "publish",
+        arity: 3,
+        flags: &["pubsub", "loading", "stale", "fast"],
+        first_key: 0,
+        last_key: 0,
+        step: 0,
+        acl: AC_PUBSUB_FAST,
+        since: "2.0.0",
+        complexity: "O(N+M) with N the subscribers and M the patterns.",
+        summary: "Send a message to everybody listening on a channel.",
+        group: "pubsub",
+    },
+    Spec {
+        name: "spublish",
+        arity: 3,
+        flags: &["pubsub", "loading", "stale", "fast"],
+        first_key: 1,
+        last_key: 1,
+        step: 1,
+        acl: AC_PUBSUB_FAST,
+        since: "7.0.0",
+        complexity: "O(N) in the shard channel's subscribers.",
+        summary: "Send a message to everybody listening on a shard channel.",
+        group: "pubsub",
+    },
+    Spec {
+        name: "pubsub",
+        arity: -2,
+        flags: &[],
+        first_key: 0,
+        last_key: 0,
+        step: 0,
+        acl: &["@slow"],
+        since: "2.8.0",
+        complexity: "O(N) in the number of channels or patterns on the server.",
+        summary: "What the server's subscriptions look like from outside.",
+        group: "pubsub",
+    },
     // -------------------------------------------------------------- server
     // COMMAND is in the connection ACL category and in the server group, which
     // is not a contradiction: the category is about what a connection is
@@ -6232,7 +6360,16 @@ const FREE: u16 = u16::MAX;
 /// changing a constant that is already at one slot for every name, so this is
 /// the first search that ended by keeping the multiplier it started with. The
 /// floor is still thirteen and the number a lookup feels is still one.
-const MIX: u64 = 0x91de_5d5e_2166_1fbd;
+///
+/// The nine pub/sub commands took the table to 420 names and the worst probe to
+/// two slots, so the multiplier the last search declined to replace had to be
+/// replaced after all. A twentieth search ran, four billion multipliers over ten
+/// threads, and the best of them is back to one slot for every name at twenty
+/// four extra probes, which is the same twenty four the nineteenth search found
+/// and did not take. The floor is still thirteen, because none of the nine
+/// agrees with anything already in the table on all four key bytes. The old
+/// multiplier was `0x91de5d5e21661fbd` and it served for two searches.
+const MIX: u64 = 0x71ee_9b00_ab8a_5fd7;
 
 /// The four bytes the index is computed from: the length, the first two bytes,
 /// and the last byte with the second to last and the middle folded into it, all
@@ -6246,7 +6383,7 @@ const MIX: u64 = 0x91de_5d5e_2166_1fbd;
 /// slot, and reading less of the name is a shorter dependency chain in front of
 /// the multiply. Names that agree on all four collide whatever the multiplier is
 /// and probe once more, and the probe is the same compare the lookup was always
-/// going to do. Over the 411 commands there are thirteen such pairs and no group
+/// going to do. Over the 420 commands there are thirteen such pairs and no group
 /// larger than a pair, so thirteen extra probes is the floor.
 ///
 /// The middle byte is the part that was added last and it is worth saying why,
@@ -6652,7 +6789,7 @@ mod tests {
     /// The index is still worth having, which is a thing that can rot.
     ///
     /// The multiplier was searched for against the 191 commands that were in the
-    /// table when it was written, and fifteen times since. Adding commands cannot
+    /// table when it was written, and nineteen times since. Adding commands cannot
     /// make a lookup wrong, because a probe walks to an empty slot and every
     /// candidate has its name compared, but it can make one slow, and a slow
     /// lookup is exactly the thing this replaced. So the worst probe is written
@@ -6688,7 +6825,7 @@ mod tests {
             "the multiplier stopped keeping every command close"
         );
         assert!(
-            total <= 25,
+            total <= 24,
             "{total} extra slots walked over the whole table"
         );
     }

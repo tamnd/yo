@@ -295,19 +295,38 @@ notes = "A geo key is a sorted set with a 52 bit interleave of longitude and lat
 [[group]]
 name = "pubsub"
 expected = 9
-status = "planned"
+status = "shipped"
 doc = "12 section 6"
-# Nothing here is built yet, and the one thing to settle before any of it is
-# that a subscriber and a publisher are not on the same thread. A connection
-# stays with the thread that accepted it and its reply buffer belongs to that
-# thread, so a PUBLISH cannot write into a subscriber's socket the way it could
-# on one thread. The shape that is already here is the waiter list: one shared
-# registry saying who is subscribed to what and which thread each of them is on,
-# and each thread delivering to its own on its turn. What a client sees then is
-# the same message in the same order per channel, arriving a turn later than the
-# PUBLISH that made it, which is what a client already has to assume of anything
-# it did not ask for. The alternative, one lock per channel that a publisher
-# takes to write into somebody else's buffer, is the thing not to build.
+# All nine, and the thing that had to be settled first is that a subscriber and
+# a publisher are not on the same thread. A connection stays with the thread
+# that accepted it and its reply buffer belongs to that thread, so a PUBLISH
+# cannot write into a subscriber's socket the way it could on one thread. What
+# was built is the shape this file said to build: one shared registry saying who
+# is subscribed to what and which thread each of them is on, and each thread
+# delivering to its own connections at the end of its own batch. A publish
+# renders nothing and takes no reply buffer, it posts an envelope into a mailbox
+# belonging to the subscriber's thread, and the payload sits behind an Arc so a
+# publish to a thousand subscribers copies the bytes once. The alternative, one
+# lock per channel that a publisher takes to write into somebody else's buffer,
+# was not built.
+#
+# The mailboxes are their own array and not a field on the per thread counters,
+# which are a cache line each precisely so that no other thread writes to them.
+# A mailbox is a line another thread is meant to write to, so it gets one.
+#
+# The other half is the RESP2 subscribe mode gate, which is a refusal in the
+# funnel and not in a command body: a RESP2 connection that has subscribed to
+# anything may only send the six subscribe commands, PING, QUIT and RESET,
+# because RESP2 sends a message as a plain array and a client with a reply
+# outstanding could not tell the two apart. It sits where a real server puts it,
+# after the arity and memory refusals and before the MULTI queue, so EXEC sent
+# while subscribed comes back as an EXECABORT and a command EXEC hands over is
+# not asked at all. Both were checked against 8.10.1 rather than reasoned about.
+#
+# What is left is that a thread with a subscriber stays on the short poller wait
+# rather than being woken, because the poller has no wakeup of its own. That
+# bounds delivery by a millisecond instead of by the idle wait, and it is
+# D-115.
 
 [[group]]
 name = "keyspace"
@@ -4890,6 +4909,108 @@ bounded = "yes"
 status = "shipped"
 wire = "verified"
 notes = "Lets go of every row this connection was holding, dropping each one that nobody else is watching."
+
+# --------------------------------------------------------------------- pubsub
+
+[[command]]
+name = "SUBSCRIBE"
+group = "pubsub"
+since = "2.0.0"
+arity = -2
+plan = "none"
+bounded = "yes"
+status = "shipped"
+wire = "verified"
+notes = "One reply per name, whatever was already subscribed to. The count it carries is channels plus patterns, which is not the count SSUBSCRIBE carries."
+
+[[command]]
+name = "UNSUBSCRIBE"
+group = "pubsub"
+since = "2.0.0"
+arity = -1
+plan = "none"
+bounded = "yes"
+status = "shipped"
+wire = "verified"
+notes = "With no names it answers once per name it holds so the counts walk down, and once with a null name when it holds none. Both were read off 8.10.1."
+
+[[command]]
+name = "PSUBSCRIBE"
+group = "pubsub"
+since = "2.0.0"
+arity = -2
+plan = "none"
+bounded = "yes"
+status = "shipped"
+wire = "verified"
+notes = "The pattern is matched against the channel a PUBLISH names, with the same glob KEYS uses."
+
+[[command]]
+name = "PUNSUBSCRIBE"
+group = "pubsub"
+since = "2.0.0"
+arity = -1
+plan = "none"
+bounded = "yes"
+status = "shipped"
+wire = "verified"
+notes = "The same three shapes UNSUBSCRIBE has, over the pattern list."
+
+[[command]]
+name = "SSUBSCRIBE"
+group = "pubsub"
+since = "7.0.0"
+arity = -2
+plan = "none"
+bounded = "yes"
+status = "shipped"
+wire = "verified"
+notes = "A shard channel is its own namespace. A pattern never matches one and the count in the reply is shard channels alone, both checked against 8.10.1."
+
+[[command]]
+name = "SUNSUBSCRIBE"
+group = "pubsub"
+since = "7.0.0"
+arity = -1
+plan = "none"
+bounded = "yes"
+status = "shipped"
+wire = "verified"
+notes = "The shard side of UNSUBSCRIBE, counting shard channels only."
+
+[[command]]
+name = "PUBLISH"
+group = "pubsub"
+since = "2.0.0"
+arity = 3
+plan = "none"
+bounded = "yes"
+status = "shipped"
+wire = "verified"
+notes = "Reaches channel subscribers and matching pattern subscribers, and no shard subscriber. The reply is how many it went to at the moment of the publish. One relaxed load on a server nobody has subscribed on."
+
+[[command]]
+name = "SPUBLISH"
+group = "pubsub"
+since = "7.0.0"
+arity = 3
+plan = "none"
+bounded = "yes"
+status = "shipped"
+wire = "verified"
+notes = "Reaches shard subscribers of that channel and nobody else, patterns included. The key spec is there for cluster slot routing and the argument is not a key."
+
+[[command]]
+name = "PUBSUB"
+group = "pubsub"
+since = "2.8.0"
+arity = -2
+plan = "none"
+bounded = "yes"
+status = "shipped"
+wire = "verified"
+divergent = "D-116"
+notes = "Six subcommands. CHANNELS and SHARDCHANNELS answer the names somebody is listening on, which is why a name with no listeners is dropped rather than left empty. NUMSUB is a flat array on both protocols even though it looks like a map."
 
 # ----------------------------------------------------------------- connection
 

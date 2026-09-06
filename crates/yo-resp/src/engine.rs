@@ -175,6 +175,13 @@ pub struct Wire<S> {
     /// batches and it is only ever this thread's, like everything else on this
     /// side of the engine.
     parked: Vec<Parked>,
+    /// Messages published for this thread's connections, copied out of the
+    /// mailbox.
+    ///
+    /// Here for the reason `parked` is here: a server with subscribers on it
+    /// should not allocate a vector once a batch to drain into. It is empty
+    /// between batches.
+    post: Vec<dispatch::Envelope>,
 }
 
 impl<S: Sink> Wire<S> {
@@ -204,6 +211,7 @@ impl<S: Sink> Wire<S> {
         Wire {
             front: Front::new(sink),
             parked: Vec::new(),
+            post: Vec::new(),
             server,
         }
     }
@@ -340,6 +348,30 @@ impl<S: Sink> Wire<S> {
         self.parked.clear();
     }
 
+    /// Write out everything published for this thread's connections.
+    ///
+    /// The mailbox is emptied under its lock and then let go of, so a thread
+    /// rendering a thousand messages is not holding up the publishers filling
+    /// its box. The client id on each envelope is checked against the slot
+    /// because a slot is reused and an id is not, which is the same guard the
+    /// waiter list uses and for the same reason: being wrong here writes into
+    /// somebody else's socket rather than dropping a message.
+    fn deliver(&mut self) {
+        // Taken and put back so the loop can reach the front, the way the dirty
+        // list is. The capacity comes back with it.
+        let mut post = core::mem::take(&mut self.post);
+        self.server.take_mail(&mut post);
+        for env in post.drain(..) {
+            let conn = env.conn();
+            if !self.front.answers(conn, env.client()) {
+                continue;
+            }
+            env.write(self.front.out(conn));
+            self.front.soil(conn);
+        }
+        self.post = post;
+    }
+
     /// How many connections are open.
     #[must_use]
     pub fn clients(&self) -> usize {
@@ -373,6 +405,19 @@ impl<S: Sink> Wire<S> {
     #[must_use]
     pub fn waiting(&self) -> usize {
         self.server.parked_here()
+    }
+
+    /// Mail waiting for this thread, plus subscribers of its own that mail
+    /// could arrive for.
+    ///
+    /// The third thing a driver waiting on readability needs to know, and for
+    /// the reason the other two are: a published message is a write another
+    /// thread made and no byte arriving here will wake this thread for it. So a
+    /// thread that has a subscriber keeps its wait short, and one that has none
+    /// is not affected.
+    #[must_use]
+    pub fn posted(&self) -> usize {
+        self.server.posted()
     }
 
     /// Whether a client has asked the server to stop.
@@ -584,6 +629,14 @@ impl<S: Sink> Engine for Wire<S> {
         if self.server.parked_here() != 0 {
             self.server.refresh_clock();
             self.serve_waiters();
+        }
+
+        // Then the published messages, before the write out below and after
+        // everything this batch answered, which is the order a client that
+        // publishes to itself sees on a real server: the count first and the
+        // message second, checked on the wire against 8.10.1.
+        if self.server.mail_here() != 0 {
+            self.deliver();
         }
 
         // Taken and put back so the loop below can reach the rest of the
@@ -1560,6 +1613,178 @@ mod tests {
         r.engine_mut().feed(again, &wire(&[b"PING"]));
         pump(&mut r, &mut batch);
         assert_eq!(r.engine().sink().sent(again), b"+PONG\r\n");
+    }
+
+    /// The whole point of a mailbox: a publish on one connection turns into
+    /// bytes on another, in the same flush.
+    #[test]
+    fn a_published_message_lands_on_the_subscriber() {
+        let (mut r, sub, mut batch) = engine();
+        let pubr = r.engine_mut().accept();
+
+        r.engine_mut().feed(sub, &wire(&[b"SUBSCRIBE", b"news"]));
+        pump(&mut r, &mut batch);
+        assert_eq!(
+            r.engine().sink().sent(sub),
+            b"*3\r\n$9\r\nsubscribe\r\n$4\r\nnews\r\n:1\r\n"
+        );
+        r.engine_mut().sink_mut().clear();
+
+        r.engine_mut()
+            .feed(pubr, &wire(&[b"PUBLISH", b"news", b"hi"]));
+        pump(&mut r, &mut batch);
+        assert_eq!(r.engine().sink().sent(pubr), b":1\r\n");
+        assert_eq!(
+            r.engine().sink().sent(sub),
+            b"*3\r\n$7\r\nmessage\r\n$4\r\nnews\r\n$2\r\nhi\r\n"
+        );
+    }
+
+    /// A pattern subscriber is told which of its patterns matched as well as
+    /// which channel the message went to, so the reply is one field longer.
+    #[test]
+    fn a_pattern_subscriber_is_told_the_pattern_and_the_channel() {
+        let (mut r, sub, mut batch) = engine();
+        let pubr = r.engine_mut().accept();
+
+        r.engine_mut().feed(sub, &wire(&[b"PSUBSCRIBE", b"ne*"]));
+        pump(&mut r, &mut batch);
+        r.engine_mut().sink_mut().clear();
+
+        r.engine_mut()
+            .feed(pubr, &wire(&[b"PUBLISH", b"news", b"hi"]));
+        pump(&mut r, &mut batch);
+        assert_eq!(r.engine().sink().sent(pubr), b":1\r\n");
+        assert_eq!(
+            r.engine().sink().sent(sub),
+            b"*4\r\n$8\r\npmessage\r\n$3\r\nne*\r\n$4\r\nnews\r\n$2\r\nhi\r\n"
+        );
+    }
+
+    /// A RESP2 client that has subscribed to anything can only leave, ping or
+    /// subscribe to something else until it unsubscribes, because on RESP2 a
+    /// message and a reply are the same shape and a client reading one cannot
+    /// tell them apart.
+    #[test]
+    fn resp2_takes_almost_nothing_from_a_subscriber() {
+        let (mut r, conn, mut batch) = engine();
+
+        r.engine_mut().feed(conn, &wire(&[b"SUBSCRIBE", b"a"]));
+        pump(&mut r, &mut batch);
+        r.engine_mut().sink_mut().clear();
+
+        r.engine_mut().feed(conn, &wire(&[b"GET", b"k"]));
+        pump(&mut r, &mut batch);
+        assert_eq!(
+            r.engine().sink().sent(conn),
+            b"-ERR Can't execute 'get': only (P|S)SUBSCRIBE / (P|S)UNSUBSCRIBE / PING / QUIT / RESET are allowed in this context\r\n"
+        );
+        r.engine_mut().sink_mut().clear();
+
+        // Ping is allowed, and answers in the shape the mode uses.
+        r.engine_mut().feed(conn, &wire(&[b"PING"]));
+        pump(&mut r, &mut batch);
+        assert_eq!(
+            r.engine().sink().sent(conn),
+            b"*2\r\n$4\r\npong\r\n$0\r\n\r\n"
+        );
+        r.engine_mut().sink_mut().clear();
+
+        // And unsubscribing puts the connection back to ordinary work.
+        r.engine_mut().feed(conn, &wire(&[b"UNSUBSCRIBE", b"a"]));
+        r.engine_mut().feed(conn, &wire(&[b"GET", b"k"]));
+        pump(&mut r, &mut batch);
+        assert_eq!(
+            r.engine().sink().sent(conn),
+            b"*3\r\n$11\r\nunsubscribe\r\n$1\r\na\r\n:0\r\n$-1\r\n"
+        );
+    }
+
+    /// Shard channels are their own namespace. A name subscribed as a shard
+    /// channel does not hear a plain publish to the same name, and a pattern
+    /// never matches a shard publish.
+    #[test]
+    fn a_shard_channel_and_a_pattern_do_not_hear_each_other() {
+        let (mut r, sub, mut batch) = engine();
+        let pubr = r.engine_mut().accept();
+
+        r.engine_mut().feed(sub, &wire(&[b"SSUBSCRIBE", b"sx"]));
+        r.engine_mut().feed(sub, &wire(&[b"PSUBSCRIBE", b"s*"]));
+        pump(&mut r, &mut batch);
+        r.engine_mut().sink_mut().clear();
+
+        r.engine_mut()
+            .feed(pubr, &wire(&[b"SPUBLISH", b"sx", b"one"]));
+        pump(&mut r, &mut batch);
+        assert_eq!(r.engine().sink().sent(pubr), b":1\r\n");
+        assert_eq!(
+            r.engine().sink().sent(sub),
+            b"*3\r\n$8\r\nsmessage\r\n$2\r\nsx\r\n$3\r\none\r\n"
+        );
+        r.engine_mut().sink_mut().clear();
+
+        r.engine_mut()
+            .feed(pubr, &wire(&[b"PUBLISH", b"sx", b"two"]));
+        pump(&mut r, &mut batch);
+        assert_eq!(r.engine().sink().sent(pubr), b":1\r\n");
+        assert_eq!(
+            r.engine().sink().sent(sub),
+            b"*4\r\n$8\r\npmessage\r\n$2\r\ns*\r\n$2\r\nsx\r\n$3\r\ntwo\r\n"
+        );
+    }
+
+    /// A subscriber that hangs up stops being one, which matters because the
+    /// registry holds a connection id and that id gets handed to the next
+    /// client through the door.
+    #[test]
+    fn a_subscriber_that_goes_away_leaves_the_registry() {
+        let (mut r, sub, mut batch) = engine();
+        let pubr = r.engine_mut().accept();
+
+        r.engine_mut().feed(sub, &wire(&[b"SUBSCRIBE", b"news"]));
+        pump(&mut r, &mut batch);
+        r.engine_mut().hangup(sub);
+        pump(&mut r, &mut batch);
+        r.engine_mut().sink_mut().clear();
+
+        r.engine_mut()
+            .feed(pubr, &wire(&[b"PUBLISH", b"news", b"hi"]));
+        pump(&mut r, &mut batch);
+        assert_eq!(r.engine().sink().sent(pubr), b":0\r\n");
+
+        // And the slot is clean for whoever gets it next.
+        let next = r.engine_mut().accept();
+        assert_eq!(next, sub);
+        r.engine_mut()
+            .feed(pubr, &wire(&[b"PUBLISH", b"news", b"hi"]));
+        pump(&mut r, &mut batch);
+        assert_eq!(r.engine().sink().sent(next), b"");
+    }
+
+    /// On RESP3 a message is a push, not a reply, so it can be read off a
+    /// connection that is doing something else, and that connection is free to
+    /// run ordinary commands while it is subscribed.
+    ///
+    /// It also pins the order a publish to yourself comes out in. Nothing in
+    /// the code special cases it: the count is the reply to the command and the
+    /// message is delivered on the way out with everybody else's, so the count
+    /// is first.
+    #[test]
+    fn resp3_delivers_a_message_as_a_push() {
+        let (mut r, conn, mut batch) = engine();
+
+        r.engine_mut().feed(conn, &wire(&[b"HELLO", b"3"]));
+        r.engine_mut().feed(conn, &wire(&[b"SUBSCRIBE", b"a"]));
+        pump(&mut r, &mut batch);
+        r.engine_mut().sink_mut().clear();
+
+        r.engine_mut().feed(conn, &wire(&[b"GET", b"k"]));
+        r.engine_mut().feed(conn, &wire(&[b"PUBLISH", b"a", b"w"]));
+        pump(&mut r, &mut batch);
+        assert_eq!(
+            r.engine().sink().sent(conn),
+            b"_\r\n:1\r\n>3\r\n$7\r\nmessage\r\n$1\r\na\r\n$1\r\nw\r\n"
+        );
     }
 
     #[test]

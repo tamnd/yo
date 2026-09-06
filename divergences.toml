@@ -819,3 +819,18 @@ reason = "The reference looks a container command's subcommand up in the same ta
 status = "until"
 resolved_by = "M8"
 spec = "12 section 4"
+
+[[divergence]]
+id = "D-115"
+title = "A published message can wait a millisecond before it goes out"
+reason = "The reference publishes and delivers in the same call, because everything it does happens on one thread and the subscriber's reply buffer is right there. Here a connection belongs to the thread that accepted it and only that thread may write into its buffer, so a publish leaves an envelope in a mailbox and the subscriber's thread renders it at the end of its next batch. On a server with one shard thread, which is the default, that is the same turn and there is no wait at all. Above one thread the subscriber's thread may be asleep on its poller, and the poller has no wakeup of its own, so what keeps the message moving is that a thread with any subscriber of its own stays on the short poller wait rather than the idle one. Delivery is therefore bounded by a millisecond instead of by twenty, and a thread with no subscribers pays nothing for the rule. What closes it is a wakeup the publisher can fire, which is an eventfd on Linux and a self pipe elsewhere, and that is a change to the driver rather than to pub/sub. Ordering is not affected either way: messages to one channel arrive in the order they were published, because one mailbox is one queue."
+status = "until"
+resolved_by = "M8"
+spec = "12 section 6"
+
+[[divergence]]
+id = "D-116"
+title = "PUBSUB CHANNELS answers in a different order"
+reason = "The reference walks its own hash table and answers the channels in whatever order the buckets fall in, which is not sorted, not insertion order, and not stable across a rehash. Here the walk is over a different hash table and comes out in a different order that is equally arbitrary. There is nothing to fix, because there is no order to match: a client that cares has to sort what it gets back, and one that reads the reference's order as meaningful is reading something the reference does not promise. The same goes for PUBSUB SHARDCHANNELS and for the order of the replies UNSUBSCRIBE with no arguments sends, which walks the same kind of table on both sides. What the two do agree on exactly is the set of names, the counts and the shape of every reply."
+status = "permanent"
+spec = "12 section 6"
