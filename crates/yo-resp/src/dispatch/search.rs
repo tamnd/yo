@@ -397,6 +397,14 @@ pub(super) fn execute<'a>(
         f.write(out);
         return Ok(None);
     }
+    // The cursors an index was holding go with it, whichever of the four
+    // spellings of the drop took it away.
+    if matches!(
+        spec.name,
+        "FT.DROPINDEX" | "FT._DROPINDEXIFX" | "FT.DROP" | "FT._DROPIFX"
+    ) {
+        server.cursors.lock().strays(reg);
+    }
     Ok(made)
 }
 
@@ -3570,7 +3578,7 @@ pub(super) fn searched(
             // cursor's place in the table before it makes the reply that goes in
             // it, so an index holding its hundred and twenty eight refuses even
             // a cursor that would close on its first chunk.
-            if let Err(fail) = cursor::room(server, &canon) {
+            if let Err(fail) = cursor::room(server, &canon, 1) {
                 fail.write(out);
                 return Ok(());
             }
@@ -3728,7 +3736,7 @@ pub(super) fn aggregated(
             // cursor's place in the table before it makes the reply that goes in
             // it, so an index holding its hundred and twenty eight refuses even
             // a cursor that would close on its first chunk.
-            if let Err(fail) = cursor::room(server, &canon) {
+            if let Err(fail) = cursor::room(server, &canon, 1) {
                 fail.write(out);
                 return Ok(());
             }

@@ -13,14 +13,17 @@
 use std::time::Instant;
 
 use yo_common::Result;
-use yo_common::num::parse_f64;
+use yo_common::num::{DOUBLE_MAX, parse_f64, write_g17};
 use yo_common::parse_i64;
 use yo_search::Index;
+use yo_search::explain::Note;
+use yo_search::expr::Value;
 use yo_search::field::Kind;
 use yo_search::query::{self, Ask, Node, What, Yield};
 use yo_search::score::Scorer;
 
 use super::aggregate::{self, Reads};
+use super::cursor::{Kept, Made};
 use super::{Args, Asked, Order, Row, Rows, Watch};
 use crate::dispatch::Server;
 use crate::dispatch::args;
@@ -99,6 +102,21 @@ const LONGEST: i64 = 60_000;
 
 /// What it says when it caps one.
 const CAPPED: &str = "Query TIMEOUT exceeded the configured maximum (search-_max-foreground-timeout-limit) while search-workers is disabled; effective timeout was capped";
+
+/// What a grouping is told when it is asked to show its working.
+const NO_WORKING: &str = "SEARCH_PARSE_ARGS EXPLAINSCORE is not supported with GROUPBY";
+
+/// A double the way the working writes one, which is C's `%.17g` rather than
+/// the shortest round trip a score itself comes back as.
+///
+/// The two really are different in the same reply: the number at the head of an
+/// explanation is the round trip one and the number at the end of the line under
+/// it is this one, so three tenths of a merged score can be written two ways a
+/// few bytes apart.
+fn g17(value: f64) -> String {
+    let mut buf = [0u8; DOUBLE_MAX];
+    String::from_utf8_lossy(write_g17(&mut buf, value)).into_owned()
+}
 
 /// How the two rankings become one number.
 enum Combine {
@@ -193,6 +211,11 @@ struct Asks<'a> {
     /// What the reply has to say about how the command was written, which today
     /// is only ever the capped timeout.
     warn: Option<&'static str>,
+    /// Whether an `EXPLAINSCORE` asked for the working behind every score.
+    explaining: bool,
+    /// Whether a `GROUPBY` was written, which there is no working to show for
+    /// because a group is not a document and has no rank in either branch.
+    grouped: bool,
 }
 
 /// `FT.HYBRID index [count] SEARCH ... VSIM ... [COMBINE ...] [pipeline]`.
@@ -239,11 +262,169 @@ pub(crate) fn hybrid(server: &Server, db: usize, args: Args<'_>, out: &mut Out) 
             return Ok(());
         }
     };
-    let (total, rows) = merged(index, &asks, text, vector);
+    let canon = index.name.clone();
+    // Asked before either branch runs, and asked for two, because a hybrid takes
+    // both its places in the table before it makes either of the answers that go
+    // in them: an index already holding a hundred and twenty seven cursors takes
+    // another aggregation and refuses this.
+    if asks.asked.cursor.is_some()
+        && let Err(fail) = super::cursor::room(server, &canon, 2)
+    {
+        fail.write(out);
+        return Ok(());
+    }
+    let (found, mut texts, mut nears) = walked(index, &asks, text, vector);
+    if let Some(want) = asks.asked.cursor {
+        // Read a third and a fourth time, one argument list per branch, so that
+        // every step still parses against the row the merged form parsed
+        // against and a property the other branch yields is still a property
+        // the pipeline has heard of. Neither read can fail: the same words came
+        // back clean a moment ago.
+        let (Ok(mut mine), Ok(mut theirs)) = (
+            reads(args, index, Some(held)),
+            reads(args, index, Some(held)),
+        ) else {
+            return Ok(());
+        };
+        let told = asks.explaining;
+        alone(
+            &mut mine.asked,
+            asks.scored.as_deref(),
+            asks.nears.as_deref(),
+            told,
+        );
+        alone(
+            &mut theirs.asked,
+            asks.nears.as_deref(),
+            asks.scored.as_deref(),
+            told,
+        );
+        drop(reg);
+        soloed(&mut texts, asks.scored.as_deref(), false);
+        soloed(&mut nears, asks.nears.as_deref(), true);
+        // The capped timeout is the text branch's to report. The vector branch
+        // says nothing about it, which is measured and is not what the merged
+        // form does: that one says it once for the pair.
+        let said = asks.warn.map(|warn| warn.as_bytes().to_vec());
+        let one = branch(server, db, found, &texts, &mine.asked, said);
+        let two = branch(server, db, nears.len(), &nears, &theirs.asked, None);
+        let one = super::cursor::hold(server, &canon, one, want);
+        let two = super::cursor::hold(server, &canon, two, want);
+        match out.proto().is_resp3() {
+            true => out.map(3),
+            false => out.array(6),
+        }
+        out.bulk(b"SEARCH");
+        out.int(one as i64);
+        out.bulk(b"VSIM");
+        out.int(two as i64);
+        out.bulk(b"warnings");
+        out.array(0);
+        return Ok(());
+    }
+    let (total, rows) = merged(&asks, &texts, &nears);
     drop(reg);
     let spent = clock.elapsed();
     writes(server, db, total, &rows, &asks, spent, out);
     Ok(())
+}
+
+/// Turns the whole command's pipeline into the one a branch's cursor runs.
+///
+/// A cursor over a hybrid is a cursor per branch rather than one over the merge,
+/// and what a branch hands back is its own rows with its own yield in front of
+/// them. The rest goes: the other branch's yield, the merged score, and every
+/// step there is, so a `SORTBY` or an `APPLY` written beside a `WITHCURSOR`
+/// changes nothing at all. A `LOAD` is the one thing that still counts, because
+/// it wrote the row itself rather than a step over it.
+///
+/// That last part is why the load list is read here: a schema field a step
+/// named is on the row of the merged form, because the step is going to read
+/// it, and a branch that never runs the step has no reason to carry it.
+fn alone(asked: &mut Asked<'_>, mine: Option<&[u8]>, theirs: Option<&[u8]>, explaining: bool) {
+    let loaded: Vec<&[u8]> = asked.pipe.load.iter().map(|(_, name)| *name).collect();
+    asked.pipe.base.retain(|(name, from)| match from {
+        // The merged score is not a number either branch has, so the property
+        // that answers it is not on the row at all rather than empty on it.
+        Reads::Score => false,
+        Reads::Field(..) => loaded.contains(&&**name),
+        _ => theirs != Some(&**name),
+    });
+    if let Some(mine) = mine
+        && let Some(at) = asked.pipe.base.iter().position(|(name, _)| &**name == mine)
+    {
+        let held = asked.pipe.base.remove(at);
+        asked.pipe.base.insert(0, held);
+    }
+    asked.pipe.steps.clear();
+    asked.pipe.arrange = None;
+    asked.pipe.stage = None;
+    asked.rows.offset = 0;
+    asked.rows.count = usize::MAX;
+    // The working goes beside the row here rather than in front of the map the
+    // way the merged form writes it, because a branch's chunk is an ordinary
+    // aggregation chunk and that is where an aggregation puts a score.
+    asked.rows.scores = explaining;
+}
+
+/// Puts a branch's own yield on its rows, which the merge does while it folds
+/// and a cursor over one branch has to do for itself.
+///
+/// The vector branch's score becomes the closeness at the same time, because a
+/// walk leaves nothing on the row there and a chunk showing its working has a
+/// number to write.
+fn soloed(rows: &mut [Row], name: Option<&[u8]>, near: bool) {
+    for row in rows {
+        let value = match near {
+            true => 1.0 / (1.0 + row.away(AWAY).unwrap_or(f64::INFINITY)),
+            false => row.score,
+        };
+        if near {
+            row.score = value;
+        }
+        if let Some(name) = name {
+            row.dists.push((name.into(), value));
+        }
+    }
+}
+
+/// One branch's rows, kept as the whole answer a cursor over it hands out.
+fn branch(
+    server: &Server,
+    db: usize,
+    total: usize,
+    rows: &[Row],
+    asked: &Asked<'_>,
+    said: Option<Vec<u8>>,
+) -> Kept {
+    let watch: Option<&mut Watch> = None;
+    let made = aggregate::runs(server, db, total, rows, asked, watch);
+    let total = made.start - made.gone.min(made.start);
+    let held: Vec<(Option<Row>, Vec<Value>)> = made
+        .table
+        .into_iter()
+        .map(|held| (held.from.map(|at| rows[at].clone()), held.values))
+        .collect();
+    Kept {
+        made: Made::Piped {
+            names: made.names,
+            rows: held,
+            sorted: made.sorted,
+            // The capped timeout is said on the chunks rather than at the top of
+            // the reply that handed the two numbers over.
+            warning: made.warning.or(said),
+        },
+        // Nothing here is worked out per chunk: the rows were all made before
+        // the cursor was, so the first chunk reports the whole number and every
+        // chunk after it reports nought.
+        walk: Vec::new(),
+        shows: asked.rolls(),
+        total,
+        whole: true,
+        loader: asked.pipe.loader,
+        offset: 0,
+        window: usize::MAX,
+    }
 }
 
 /// A yield that carries a score the merge worked out rather than a distance a
@@ -437,6 +618,8 @@ fn reads<'a>(
         loaded: false,
         once: Vec::new(),
         warn: None,
+        explaining: false,
+        grouped: false,
     };
     pipeline(args, at, index, &mut asks)?;
     // A `LOAD` can name either of the two properties a row carries without
@@ -482,10 +665,13 @@ fn pipeline<'a>(
                 "SEARCH_PARSE_ARGS DIALECT is not supported in FT.HYBRID or any of its subqueries. Please check the documentation on search-default-dialect configuration.",
             ));
         }
-        // A grouping over nothing at all is a whole table in one row, which an
-        // aggregation takes and this does not.
-        if args::is(word, b"GROUPBY") && args.opt(at + 1).and_then(counting).is_none() {
-            return Err(about(b"GROUPBY", b"Invalid argument count"));
+        if args::is(word, b"GROUPBY") {
+            asks.grouped = true;
+            // A grouping over nothing at all is a whole table in one row, which
+            // an aggregation takes and this does not.
+            if args.opt(at + 1).and_then(counting).is_none() {
+                return Err(about(b"GROUPBY", b"Invalid argument count"));
+            }
         }
         if let Some(next) = super::step(args, at, &mut asks.asked, index)? {
             asks.loaded |= args::is(word, b"LOAD");
@@ -525,14 +711,26 @@ fn pipeline<'a>(
         }
         if args::is(word, b"EXPLAINSCORE") {
             asks.only(b"EXPLAINSCORE")?;
+            asks.explaining = true;
             at += 1;
             continue;
+        }
+        // An aggregation takes a second one and keeps what the first one set.
+        // This refuses it, which is measured on both.
+        if args::is(word, b"WITHCURSOR") {
+            asks.only(b"WITHCURSOR")?;
         }
         if let Some(next) = super::plan(args, at, &mut asks.asked, super::Mode::Aggregate)? {
             at = next;
             continue;
         }
         return Err(unknown(word));
+    }
+    // Read after the whole list rather than where the second of the two words
+    // stands, so a word nobody knows anywhere in the list is still refused
+    // first whichever order the two were written in.
+    if asks.explaining && asks.grouped {
+        return Err(plain(NO_WORKING));
     }
     Ok(())
 }
@@ -799,16 +997,40 @@ fn branches(asks: &Asks<'_>, index: &Index) -> core::result::Result<(Node, Node)
     Ok((text, vector))
 }
 
-/// Runs both branches and folds them into one list of rows.
-fn merged(index: &Index, asks: &Asks<'_>, text: Node, vector: Node) -> (usize, Vec<Row>) {
+/// What each branch had to say about one row, kept while the two are being
+/// merged so that the working can be written once both of them have spoken.
+///
+/// Only filled when an `EXPLAINSCORE` asked for it. Every row has one either
+/// way, because the list runs beside the rows and the two are read by the same
+/// index.
+#[derive(Default)]
+struct Parts {
+    /// Where the text branch put it, what it scored there, and the scorer's own
+    /// working.
+    text: Option<(usize, f64, Option<Note>)>,
+    /// Where the vector branch put it and how close it came out.
+    near: Option<(usize, f64)>,
+}
+
+/// Runs both branches and cuts each of them down to what the merge may see.
+///
+/// The two lists come back apart rather than folded, because a `WITHCURSOR`
+/// hands out a cursor per branch and each of those is a cursor over one
+/// branch's own rows. The number is the text branch's whole match count, which
+/// is what a text cursor reports however much of it the window left behind.
+fn walked(index: &Index, asks: &Asks<'_>, text: Node, vector: Node) -> (usize, Vec<Row>, Vec<Row>) {
     let window = asks.combine.window();
     let mut want = Rows {
         scorer: asks.scorer,
         count: usize::MAX,
+        explaining: asks.explaining,
         ..Rows::default()
     };
     let shaped = super::shape(text, index, &want);
-    let (_, texts, _) = super::gather(index, shaped, &want, Order::Ranked, true, false);
+    let (found, mut texts, _) = super::gather(index, shaped, &want, Order::Ranked, true, false);
+    // Only the text branch has a scorer to show its working for, so the vector
+    // walk is not asked to keep one.
+    want.explaining = false;
     let held = query::yields(&vector);
     want.nearest = held
         .iter()
@@ -833,29 +1055,38 @@ fn merged(index: &Index, asks: &Asks<'_>, text: Node, vector: Node) -> (usize, V
         Some(Reach::Knn(k)) => usize::try_from(*k).unwrap_or(usize::MAX).min(window),
         Some(Reach::Range(_)) | None => window,
     };
+    texts.truncate(window);
+    nears.truncate(reach);
+    (found, texts, nears)
+}
+
+/// Folds what both branches said into one list of rows.
+fn merged(asks: &Asks<'_>, texts: &[Row], nears: &[Row]) -> (usize, Vec<Row>) {
     let mut rows: Vec<Row> = Vec::new();
+    let mut parts: Vec<Parts> = Vec::new();
     let mut where_at: Vec<(Box<[u8]>, usize)> = Vec::new();
-    let place =
-        |rows: &mut Vec<Row>, where_at: &mut Vec<(Box<[u8]>, usize)>, key: &[u8]| match where_at
-            .iter()
-            .find(|(held, _)| **held == *key)
-        {
-            Some((_, at)) => *at,
-            None => {
-                rows.push(Row {
-                    key: key.into(),
-                    score: 0.0,
-                    payload: None,
-                    note: None,
-                    sort: None,
-                    dists: Vec::new(),
-                });
-                where_at.push((key.into(), rows.len() - 1));
-                rows.len() - 1
-            }
-        };
-    for (rank, row) in texts.iter().take(window).enumerate() {
-        let at = place(&mut rows, &mut where_at, &row.key);
+    let place = |rows: &mut Vec<Row>,
+                 parts: &mut Vec<Parts>,
+                 where_at: &mut Vec<(Box<[u8]>, usize)>,
+                 key: &[u8]| match where_at.iter().find(|(held, _)| **held == *key)
+    {
+        Some((_, at)) => *at,
+        None => {
+            rows.push(Row {
+                key: key.into(),
+                score: 0.0,
+                payload: None,
+                note: None,
+                sort: None,
+                dists: Vec::new(),
+            });
+            parts.push(Parts::default());
+            where_at.push((key.into(), rows.len() - 1));
+            rows.len() - 1
+        }
+    };
+    for (rank, row) in texts.iter().enumerate() {
+        let at = place(&mut rows, &mut parts, &mut where_at, &row.key);
         rows[at].score += match &asks.combine {
             Combine::Rrf { constant, .. } => 1.0 / (constant + (rank + 1) as f64),
             Combine::Linear { alpha, .. } => alpha * row.score,
@@ -863,17 +1094,30 @@ fn merged(index: &Index, asks: &Asks<'_>, text: Node, vector: Node) -> (usize, V
         if let Some(name) = &asks.scored {
             rows[at].dists.push((name.clone(), row.score));
         }
+        if asks.explaining {
+            parts[at].text = Some((rank + 1, row.score, row.note.clone()));
+        }
     }
-    for (rank, row) in nears.iter().take(reach).enumerate() {
+    for (rank, row) in nears.iter().enumerate() {
         let away = row.away(AWAY).unwrap_or(f64::INFINITY);
         let close = 1.0 / (1.0 + away);
-        let at = place(&mut rows, &mut where_at, &row.key);
+        let at = place(&mut rows, &mut parts, &mut where_at, &row.key);
         rows[at].score += match &asks.combine {
             Combine::Rrf { constant, .. } => 1.0 / (constant + (rank + 1) as f64),
             Combine::Linear { beta, .. } => beta * close,
         };
         if let Some(name) = &asks.nears {
             rows[at].dists.push((name.clone(), close));
+        }
+        if asks.explaining {
+            parts[at].near = Some((rank + 1, close));
+        }
+    }
+    // The working is written here rather than at the end, because it names the
+    // merged number and nothing after this adds to one.
+    if asks.explaining {
+        for (at, row) in rows.iter_mut().enumerate() {
+            row.note = Some(working(asks, &parts[at], row.score));
         }
     }
     // Best first, and a document that came out of both branches with the same
@@ -888,6 +1132,122 @@ fn merged(index: &Index, asks: &Asks<'_>, text: Node, vector: Node) -> (usize, V
     });
     let total = rows.len();
     (total, rows)
+}
+
+/// The working behind one merged score, as the tree of lines it goes back as.
+///
+/// The two branches each contribute one child of the hybrid line, and a branch
+/// that never found this document contributes a bare line rather than a line
+/// with anything under it, which is why the tree is a level flatter for a
+/// document only one of them saw.
+fn working(asks: &Asks<'_>, parts: &Parts, score: f64) -> Note {
+    // A range clause says what it was measured against and whether the document
+    // came inside it, where a nearest neighbour clause has nothing to say for
+    // itself beyond its name.
+    let (head, inside) = match &asks.reach {
+        Some(Reach::Range(radius)) => (
+            format!(
+                "vector branch (RANGE: radius={:.4})",
+                parse_f64(radius).unwrap_or_default()
+            ),
+            Some(Note::Line(format!(
+                "matched within radius = {}",
+                parts.near.is_some()
+            ))),
+        ),
+        Some(Reach::Knn(_)) | None => ("vector branch (KNN)".to_owned(), None),
+    };
+    let scorer = String::from_utf8_lossy(asks.scorer.name()).into_owned();
+    let (top, text, mut near) = match &asks.combine {
+        Combine::Rrf { constant, window } => {
+            let rank = |place: usize| format!("1 / (constant {constant:.2} + rank {place})");
+            let text = match &parts.text {
+                Some((place, _, note)) => (
+                    rank(*place),
+                    Note::Under(
+                        format!("text rank = {place}"),
+                        vec![Note::Under(
+                            format!("Text scorer: {scorer}"),
+                            note.clone().into_iter().collect(),
+                        )],
+                    ),
+                ),
+                None => (
+                    "0 [text: no match]".to_owned(),
+                    Note::Line("text rank = <no match>".to_owned()),
+                ),
+            };
+            let near = match &parts.near {
+                Some((place, _)) => (
+                    rank(*place),
+                    vec![Note::Line(format!("vector rank = {place}"))],
+                ),
+                None => (
+                    "0 [vector: no match]".to_owned(),
+                    vec![Note::Line("vector rank = <no match>".to_owned())],
+                ),
+            };
+            (
+                format!("Hybrid score (RRF: window={window}, constant={constant:.2})"),
+                text,
+                near,
+            )
+        }
+        Combine::Linear {
+            alpha,
+            beta,
+            window,
+        } => {
+            let text = match &parts.text {
+                Some((_, held, note)) => {
+                    let mut under = vec![Note::Line(format!("normalized text score = {held:.4}"))];
+                    under.extend(note.clone());
+                    (
+                        format!("{alpha:.4} * {held:.4}"),
+                        Note::Under(
+                            format!(
+                                "text contribution = {alpha:.4} * {held:.4} = {:.4}",
+                                alpha * held
+                            ),
+                            vec![Note::Under(format!("Text scorer: {scorer}"), under)],
+                        ),
+                    )
+                }
+                None => (
+                    "0 [text: no match]".to_owned(),
+                    Note::Line("text contribution = <no match>".to_owned()),
+                ),
+            };
+            let near = match &parts.near {
+                Some((_, close)) => (
+                    format!("{beta:.4} * {close:.4}"),
+                    vec![
+                        Note::Line(format!(
+                            "vector contribution = {beta:.4} * {close:.4} = {:.4}",
+                            beta * close
+                        )),
+                        Note::Line(format!("normalized vector score = {close:.4}")),
+                    ],
+                ),
+                None => (
+                    "0 [vector: no match]".to_owned(),
+                    vec![Note::Line("vector contribution = <no match>".to_owned())],
+                ),
+            };
+            (
+                format!("Hybrid score (LINEAR: alpha={alpha:.4}, beta={beta:.4}, window={window})"),
+                text,
+                near,
+            )
+        }
+    };
+    if let Some(line) = inside {
+        near.1.insert(0, line);
+    }
+    Note::Under(
+        format!("final score: {} + {} = {}", text.0, near.0, g17(score)),
+        vec![Note::Under(top, vec![text.1, Note::Under(head, near.1)])],
+    )
 }
 
 /// Runs the pipeline over the merged rows and writes the reply.
@@ -916,8 +1276,14 @@ fn writes(
     out.int((made.start - made.gone.min(made.start)) as i64);
     out.bulk(b"results");
     out.array(shown.len());
-    for (_, values) in &shown {
-        aggregate::mapped(&made.names, values, None, out);
+    for (row, values) in &shown {
+        // A row the pipeline built out of nothing has no working of its own, so
+        // there is nothing to put in front of it either.
+        let told = match asks.explaining {
+            true => row.and_then(|row| row.note.as_ref().map(|note| (row.score, note))),
+            false => None,
+        };
+        aggregate::mapped(&made.names, values, None, told, out);
     }
     out.bulk(b"warnings");
     let said = made.warning.as_deref().or(asks.warn.map(str::as_bytes));
@@ -933,5 +1299,109 @@ fn writes(
     match deep {
         true => out.double(ms),
         false => out.bulk(format!("{ms:.6}").as_bytes()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::dispatch::search::aggregate::Shape;
+
+    /// The base row a `WITHCURSOR` starts from, in the order the merged form
+    /// builds it: the text yield, the two properties nothing asked for, the
+    /// vector yield, and then whatever the words after them named.
+    fn base() -> Asked<'static> {
+        let mut asked = Asked::default();
+        asked.pipe.base = vec![
+            (b"ts".to_vec().into(), Reads::Distance),
+            (b"__key".to_vec().into(), Reads::Key),
+            (b"__score".to_vec().into(), Reads::Score),
+            (b"vs".to_vec().into(), Reads::Distance),
+        ];
+        asked
+    }
+
+    fn names(asked: &Asked<'_>) -> Vec<String> {
+        asked
+            .pipe
+            .base
+            .iter()
+            .map(|(name, _)| String::from_utf8_lossy(name).into_owned())
+            .collect()
+    }
+
+    #[test]
+    fn a_branch_keeps_its_own_yield_and_puts_it_first() {
+        let mut asked = base();
+        alone(&mut asked, Some(b"vs"), Some(b"ts"), false);
+        assert_eq!(names(&asked), vec!["vs", "__key"]);
+        let mut asked = base();
+        alone(&mut asked, Some(b"ts"), Some(b"vs"), false);
+        assert_eq!(names(&asked), vec!["ts", "__key"]);
+    }
+
+    #[test]
+    fn a_field_a_step_named_goes_and_a_field_a_load_named_stays() {
+        let mut asked = base();
+        asked.pipe.load = vec![(b"t", b"t")];
+        asked.pipe.base.push((
+            b"t".to_vec().into(),
+            Reads::Field(b"t".to_vec().into(), Shape::Words),
+        ));
+        asked.pipe.base.push((
+            b"n".to_vec().into(),
+            Reads::Field(b"n".to_vec().into(), Shape::Number),
+        ));
+        alone(&mut asked, Some(b"ts"), Some(b"vs"), false);
+        assert_eq!(names(&asked), vec!["ts", "__key", "t"]);
+    }
+
+    #[test]
+    fn a_branch_runs_no_step_and_takes_no_window() {
+        let mut asked = base();
+        asked.rows.offset = 2;
+        asked.rows.count = 3;
+        asked.pipe.arrange = Some(0);
+        alone(&mut asked, None, None, true);
+        assert!(asked.pipe.steps.is_empty());
+        assert!(asked.pipe.arrange.is_none());
+        assert_eq!(asked.rows.offset, 0);
+        assert_eq!(asked.rows.count, usize::MAX);
+        // Showing the working is the one thing that puts a score on the row of
+        // a branch's chunk.
+        assert!(asked.rows.scores);
+    }
+
+    #[test]
+    fn the_vector_branch_scores_a_row_by_how_close_it_came() {
+        let row = |away: f64| Row {
+            key: b"k".to_vec().into(),
+            score: 0.0,
+            payload: None,
+            note: None,
+            sort: None,
+            dists: vec![(AWAY.to_vec().into(), away)],
+        };
+        let mut rows = vec![row(0.0), row(1.0), row(4.0)];
+        soloed(&mut rows, Some(b"vs"), true);
+        let scores: Vec<f64> = rows.iter().map(|row| row.score).collect();
+        assert_eq!(scores, vec![1.0, 0.5, 0.2]);
+        // The yield answers the same number the score does.
+        assert_eq!(rows[2].away(b"vs"), Some(0.2));
+    }
+
+    #[test]
+    fn the_text_branch_leaves_the_score_where_the_scorer_put_it() {
+        let mut rows = vec![Row {
+            key: b"k".to_vec().into(),
+            score: 0.75,
+            payload: None,
+            note: None,
+            sort: None,
+            dists: Vec::new(),
+        }];
+        soloed(&mut rows, Some(b"ts"), false);
+        assert_eq!(rows[0].score, 0.75);
+        assert_eq!(rows[0].away(b"ts"), Some(0.75));
     }
 }
