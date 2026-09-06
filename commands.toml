@@ -3368,6 +3368,61 @@ divergent = "D-88"
 notes = "The score a suggestion comes back with is how common the word is and has nothing to do with how close it is, documents holding the term over the live document count, so the nearest word is often last. Ties break on the folded term and not on the spelling that is reported, which is what makes a dictionary word Zaaa come after aaab for the query aaaa. A word the index dictionary already holds is dropped before anything else happens and that check is blind to the field the query named, while the search for candidates does honour the field, so @a:world says nothing on an index that only read world out of b. The query is parsed with the stopword list off, because a real server checks then and suggests thin for it. Stems are candidates and only plain words are asked about, so a prefix, a suffix, an infix, a pattern and a fuzzy word contribute nothing. A tag value and a word under a field the schema does not know are reported with an empty list of suggestions. The distance counts characters and not bytes, so ecole reaches école at one, the first DISTANCE wins and the rest are dropped, and an argument nobody recognises is stepped over rather than refused. The risk is that every term in the index is compared against every word asked about and nothing caps how many suggestions come back."
 
 [[command]]
+name = "FT.ADD"
+group = "search"
+since = "1.0.0"
+arity = -1
+plan = "whole-value"
+bounded = "inherent"
+status = "shipped"
+wire = "verified"
+notes = "The original way of putting a document in an index, from before a document was simply a hash, and still there and still working. What it does now is write the hash: the key is the document id verbatim with no prefix applied, so an add under a name the index does not follow leaves a hash nothing ever indexes and does not complain about it. Between four and any number of words, and the arity in the table is the module's own -1 rather than the real minimum. REPLACE deletes what is there first and PARTIAL merges into it. The score, the language and the payload are written into the hash beside the client's own fields, under __score, __language and __payload in that order, and each one that goes in also sets the matching field on the index definition, so SCORE_FIELD __score, LANGUAGE_FIELD __language or PAYLOAD_FIELD __payload. That is a permanent change to the index, it shows in FT.INFO, and from then on every document the index reads takes its score off the hash, which is why a plain HSET writing __score does nothing on a fresh index and does something on an index one FT.ADD has already touched. Documents already in the index keep the score they have until they are next written. __score goes into the hash when the score is not one and always on a PARTIAL, the other two go in whenever the option was given, and all three keep the client's own spelling, so 0.50 comes back as 0.50 and FrEnCh comes back as FrEnCh. IF only means something beside a REPLACE and only when the key is already there: a key that is not there is a plain add and the expression is never parsed, a key that is there and is not in the index refuses with SEARCH_DOC_NOT_FOUND and an empty message before the expression is parsed, and a document the index does hold gets the expression read against it and answers the status NOADD when it comes back false. LANGUAGE is checked against the list the module knows and then written into the hash rather than being used to stem anything here. NOSAVE is no longer a word this takes."
+
+[[command]]
+name = "FT.SAFEADD"
+group = "search"
+since = "1.0.0"
+arity = -1
+plan = "whole-value"
+bounded = "inherent"
+status = "shipped"
+wire = "verified"
+notes = "The same command under another name. It was the spelling a cluster client sent when the coordinator had to wait for the shard to answer, and there is nothing safe about it any more: every argument, every error line and every write is FT.ADD's. The only thing that tells them apart is the arity line, which names whichever of the two the client sent."
+
+[[command]]
+name = "FT.GET"
+group = "search"
+since = "1.0.0"
+arity = -1
+plan = "point"
+bounded = "yes"
+status = "shipped"
+wire = "verified"
+notes = "The hash under a key, when the index is holding it, and nothing at all when it is not. Held by the index and not merely covered by its prefix, which is the same answer nearly always and is not the same question: an index with a FILTER answers nothing for a key under its prefix that the filter left out. The fields the index reads the score, the language and the payload out of come off the reply, and which fields those are is whatever the index was told, so an index naming sc hides sc and shows a __score a client wrote by hand. A document the index holds whose key is not a hash is an empty list rather than nothing, which is what an index ON JSON answers for every document in it, since the reading is a hash read. Exactly three words, though the arity in the table is the module's own -1."
+
+[[command]]
+name = "FT.MGET"
+group = "search"
+since = "1.0.0"
+arity = -1
+plan = "point"
+bounded = "yes"
+status = "shipped"
+wire = "verified"
+notes = "FT.GET once per key, in the order the keys were named, with a nothing in the place of every key the index is not holding. The same key twice answers twice. It reports no key spec at all where FT.GET reports one, which is the module's own answer to COMMAND INFO and leaves a cluster client with nothing to route on."
+
+[[command]]
+name = "FT.DEL"
+group = "search"
+since = "1.0.0"
+arity = -1
+plan = "point"
+bounded = "yes"
+status = "shipped"
+wire = "verified"
+notes = "A DEL with an index name in front of it. The key goes whether or not the index was holding it and whether or not it is a hash, and the answer is whether there was anything there. The word after the key is read and thrown away whatever it says: DD used to mean delete the document as well as the entry and KEEPDOCS used to mean the opposite, and now the key goes either way, so the only thing the word still does is take up the fourth place. Three words or four, and anything else is the arity line."
+
+[[command]]
 name = "FT.SUGADD"
 group = "search"
 since = "1.0.0"

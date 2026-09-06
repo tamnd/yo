@@ -115,6 +115,7 @@ use crate::reply::Out;
 mod aggregate;
 mod config;
 pub(super) mod cursor;
+pub(super) mod docs;
 mod hybrid;
 mod profile;
 
