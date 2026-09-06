@@ -3626,16 +3626,15 @@ fn rolled(
     }
     let wide = out.proto().is_resp3();
     // `LIMIT 0 0` is a client asking for the count and nothing else, and it gets
-    // the real one. So does a pipeline that reads fields and starts at the top,
-    // and so does one whose scorer had to see the whole answer before any of it
-    // could be written. Everything else reports how far the reply reached,
-    // which under RESP2 without a loader is one row, because the array header
-    // goes on the wire as soon as the first row exists.
-    let whole = want.count == 0 || buffered(asked) || (pipe.loader && want.offset == 0);
+    // the real one. So does one whose scorer had to see the whole answer before
+    // any of it could be written. Everything else reports how far the reply
+    // reached, which under RESP2 is one row, because the array header and the
+    // number in front of it go on the wire as soon as the first row exists.
+    let whole = want.count == 0 || buffered(asked);
     let count = match whole {
         true => total,
         false => {
-            let reached = match wide || pipe.loader {
+            let reached = match wide {
                 true => built.len(),
                 false => 1,
             };
