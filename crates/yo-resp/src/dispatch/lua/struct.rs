@@ -44,19 +44,8 @@
 //! format itself. So this reads the arguments and says which one was wrong, and
 //! the prelude does nothing but turn that into the raise.
 
-use super::cjson::typename;
+use super::argue::{Answer, Stop, answer, number, text};
 use mlua::{Lua, MultiValue, Table, Value};
-
-/// What went wrong, in the shape the prelude needs to raise it.
-enum Stop {
-    /// A plain failure, which comes out with the script's position in front.
-    Plain(Vec<u8>),
-    /// A complaint about one argument, which also names the position and the
-    /// function the call site used.
-    Arg(usize, Vec<u8>),
-}
-
-type Answer<T> = Result<T, Stop>;
 
 /// Where the reading has got to in a format string.
 struct Fmt<'a> {
@@ -183,43 +172,6 @@ fn control(opt: u8, fmt: &mut Fmt<'_>, h: &mut Header) -> Answer<()> {
             why.push(b'\'');
             Err(Stop::Arg(1, why))
         }
-    }
-}
-
-/// What Lua says when an argument is the wrong type.
-///
-/// `missing` is what the message calls an argument that is not there at all,
-/// and it is not the same for all three functions: `pack` pushes a nil of its
-/// own before it starts reading, so the first argument it runs out of is a nil
-/// rather than nothing, and it says so.
-fn expected(want: &str, what: &str) -> Vec<u8> {
-    format!("{want} expected, got {what}").into_bytes()
-}
-
-/// One argument as a string, the way `luaL_checklstring` reads one.
-///
-/// A number counts as a string, because Lua converts one on the way in.
-fn text(lua: &Lua, args: &[Value], i: usize, missing: &str) -> Answer<Vec<u8>> {
-    let Some(value) = args.get(i - 1) else {
-        return Err(Stop::Arg(i, expected("string", missing)));
-    };
-    match lua.coerce_string(value.clone()) {
-        Ok(Some(s)) => Ok(s.as_bytes().to_vec()),
-        _ => Err(Stop::Arg(i, expected("string", typename(value)))),
-    }
-}
-
-/// One argument as a number, the way `luaL_checknumber` reads one.
-///
-/// A string that reads as a number counts, which is the same courtesy Lua
-/// extends everywhere else.
-fn number(lua: &Lua, args: &[Value], i: usize, missing: &str) -> Answer<f64> {
-    let Some(value) = args.get(i - 1) else {
-        return Err(Stop::Arg(i, expected("number", missing)));
-    };
-    match lua.coerce_number(value.clone()) {
-        Ok(Some(n)) => Ok(n),
-        _ => Err(Stop::Arg(i, expected("number", typename(value)))),
     }
 }
 
@@ -490,25 +442,6 @@ fn string(lua: &Lua, bytes: &[u8]) -> Answer<Value> {
     lua.create_string(bytes)
         .map(Value::String)
         .map_err(|e| Stop::Plain(e.to_string().into_bytes()))
-}
-
-/// Turn an answer into the three values the prelude reads.
-///
-/// The first says which of the three it is, which is nought for a result, one
-/// for a plain failure and two for a complaint about an argument. Doing it this
-/// way rather than raising from Rust is the same split the other libraries
-/// make: a message a script reads has to be raised from Lua so that the line in
-/// front of it is the script's own.
-fn answer(lua: &Lua, given: Answer<Value>) -> mlua::Result<(i64, Value, Value)> {
-    match given {
-        Ok(value) => Ok((0, value, Value::Nil)),
-        Err(Stop::Plain(why)) => Ok((1, Value::String(lua.create_string(&why)?), Value::Nil)),
-        Err(Stop::Arg(at, why)) => Ok((
-            2,
-            Value::Integer(at as i64),
-            Value::String(lua.create_string(&why)?),
-        )),
-    }
 }
 
 /// Put the three functions on the private table the prelude reaches us through.

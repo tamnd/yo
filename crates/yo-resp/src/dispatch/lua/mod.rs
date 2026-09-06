@@ -53,8 +53,10 @@
 //! value across the boundary, and a raised value can be any Lua value at all.
 
 mod api;
+mod argue;
 mod bit;
 mod cjson;
+mod cmsgpack;
 mod convert;
 mod sha1;
 mod r#struct;
@@ -359,6 +361,7 @@ fn interpreter() -> mlua::Result<Lua> {
     bit::statics(&lua, &raw)?;
     cjson::statics(&lua, &raw)?;
     r#struct::statics(&lua, &raw)?;
+    cmsgpack::statics(&lua, &raw)?;
     lua.set_named_registry_value("yo_run", boot.raw_get::<mlua::Function>("run")?)?;
     lua.set_named_registry_value("yo_raw", raw)?;
     Ok(lua)
@@ -444,7 +447,10 @@ end
 local shielded = {}
 
 local function shield(name, real)
-  local front = {__index = real, __newindex = readonly}
+  -- `__yo_real` is how anything on the Rust side that walks a table raw
+  -- finds the real one, since the proxy itself is empty. It sits on the
+  -- metatable, which a script cannot reach.
+  local front = {__index = real, __newindex = readonly, __yo_real = real}
   local proxy = setmetatable({}, front)
   shielded[#shielded + 1] = {proxy = proxy, front = front, real = real}
   rawset(_G, name, proxy)
@@ -601,6 +607,12 @@ end
 -- itself so that the script's own line goes in front of it.
 local function fault(why)
   error(why, 4)
+end
+
+-- A failure with no position in front of it at all, which is what the runtime
+-- raises from inside a C function since there is no line to point at.
+local function bare(why)
+  error(why, 0)
 end
 
 -- One argument as the word the arithmetic works on.
@@ -882,6 +894,42 @@ end)
 
 shield('struct', structlib)
 
+-- cmsgpack, which is Salvatore Sanfilippo's lua-cmsgpack 0.4.0. Same shape as
+-- struct: Rust reads the arguments and says which one was wrong, and the raise
+-- happens here so the script's own line goes in front of it. The third kind of
+-- answer is the one the runtime rather than the library raises, which is a bad
+-- table key and comes out with no position on it at all.
+local cmsgpacklib = {
+  _NAME = 'cmsgpack',
+  _VERSION = 'lua-cmsgpack 0.4.0',
+  _COPYRIGHT = 'Copyright (C) 2012, Salvatore Sanfilippo',
+  _DESCRIPTION = 'MessagePack C implementation for Lua',
+}
+
+cmsgpacklib.pack = bridge(function(...)
+  local kind, value, why = raw.cmsgpack_pack(...)
+  if kind == 1 then fault(value) end
+  if kind == 2 then argue(1, value, why) end
+  if kind == 3 then bare(value) end
+  return value
+end)
+
+local function unpacker(name)
+  return bridge(function(...)
+    local kind, value, why = raw[name](...)
+    if kind == 1 then fault(value) end
+    if kind == 2 then argue(1, value, why) end
+    if kind == 3 then bare(value) end
+    return rawunpack(value, 1, value.n)
+  end)
+end
+
+cmsgpacklib.unpack = unpacker('cmsgpack_unpack')
+cmsgpacklib.unpack_one = unpacker('cmsgpack_unpack_one')
+cmsgpacklib.unpack_limit = unpacker('cmsgpack_unpack_limit')
+
+shield('cmsgpack', cmsgpacklib)
+
 -- A failure that is a table with an `err` field reaches a script as the string
 -- inside it rather than as the table. That is what a real server does and it is
 -- what every script that prints the error it caught depends on.
@@ -1121,10 +1169,10 @@ mod tests {
         // interpreter is this list and a running script is this list plus two.
         assert_eq!(
             names(&lua.globals()),
-            "_G _VERSION __redis__err__handler assert bit cjson collectgarbage coroutine \
-             error gcinfo getmetatable ipairs load loadstring math next os pairs pcall \
-             rawequal rawget rawset redis select setmetatable string struct table tonumber \
-             tostring type unpack xpcall"
+            "_G _VERSION __redis__err__handler assert bit cjson cmsgpack collectgarbage \
+             coroutine error gcinfo getmetatable ipairs load loadstring math next os pairs \
+             pcall rawequal rawget rawset redis select setmetatable string struct table \
+             tonumber tostring type unpack xpcall"
         );
         // The libraries that reach outside the process are not there at all
         // rather than there and stubbed, so a script that wants one finds out.
