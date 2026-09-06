@@ -1118,10 +1118,10 @@ fn window(asked: &Asked<'_>) -> (usize, usize) {
 ///
 /// It is not the number of rows that answered, except when it is. What it
 /// really reports is how far the reply had got when the number went on the
-/// wire, which is why it moves with the protocol and with whether anything read
-/// a field. A pipeline that groups or sorts is the case where the whole answer
-/// has to exist before any of it can be written, so there is nothing half done
-/// to report and the number is the real one.
+/// wire, which is why it moves with the protocol. A pipeline that groups or
+/// sorts is the case where the whole answer has to exist before any of it can
+/// be written, so there is nothing half done to report and the number is the
+/// real one. So is `LIMIT 0 0`, which asks for the count and no rows at all.
 fn counting(
     table: &[Held],
     start: usize,
@@ -1142,14 +1142,14 @@ fn counting(
     };
     let count = start - dropped.min(start);
     let deep = out.proto().is_resp3();
-    let whole = settled
-        || want.count == 0
-        || super::buffered(asked)
-        || (asked.pipe.loader && want.offset == 0);
+    let whole = settled || want.count == 0 || super::buffered(asked);
     if whole {
         return count;
     }
-    let reached = match deep || asked.pipe.loader {
+    // Under RESP3 the number is written after the rows, so every row that got
+    // written is a row it can see. Under RESP2 it goes out in front of them and
+    // the only row that exists by then is the first.
+    let reached = match deep {
         true => shown,
         false => 1,
     };

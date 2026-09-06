@@ -23876,11 +23876,13 @@ mod tests {
             f.run(&[b"FT.AGGREGATE", b"sx", b"alpha"]),
             "*4\r\n:1\r\n*0\r\n*0\r\n*0\r\n"
         );
-        // Every row, and not the ten a search would have cut it down to.
+        // Every row, and not the ten a search would have cut it down to. The
+        // count in front of them is one because that is how far the reply had
+        // got when it was written, which is measured against a real server.
         assert_eq!(
             f.run(&[b"FT.AGGREGATE", b"sx", b"alpha", b"LOAD", b"1", b"@t"]),
             concat!(
-                "*4\r\n:3\r\n*2\r\n$1\r\nt\r\n$10\r\nalpha beta\r\n",
+                "*4\r\n:1\r\n*2\r\n$1\r\nt\r\n$10\r\nalpha beta\r\n",
                 "*2\r\n$1\r\nt\r\n$11\r\nalpha gamma\r\n",
                 "*2\r\n$1\r\nt\r\n$16\r\nalpha beta gamma\r\n"
             )
@@ -23900,7 +23902,7 @@ mod tests {
                 b"1",
                 b"2"
             ]),
-            "*3\r\n:3\r\n*2\r\n$1\r\nn\r\n$1\r\n2\r\n*2\r\n$1\r\nn\r\n$1\r\n4\r\n"
+            "*3\r\n:2\r\n*2\r\n$1\r\nn\r\n$1\r\n2\r\n*2\r\n$1\r\nn\r\n$1\r\n4\r\n"
         );
         // A query nothing answers is a count of nothing and no rows at all.
         assert_eq!(
@@ -23929,7 +23931,7 @@ mod tests {
                 b"text"
             ]),
             concat!(
-                "*4\r\n:3\r\n*2\r\n$4\r\ntext\r\n$10\r\nalpha beta\r\n",
+                "*4\r\n:1\r\n*2\r\n$4\r\ntext\r\n$10\r\nalpha beta\r\n",
                 "*2\r\n$4\r\ntext\r\n$11\r\nalpha gamma\r\n",
                 "*2\r\n$4\r\ntext\r\n$16\r\nalpha beta gamma\r\n"
             )
@@ -23946,7 +23948,7 @@ mod tests {
                 b"1"
             ]),
             concat!(
-                "*2\r\n:3\r\n*6\r\n$1\r\nt\r\n$10\r\nalpha beta\r\n",
+                "*2\r\n:1\r\n*6\r\n$1\r\nt\r\n$10\r\nalpha beta\r\n",
                 "$1\r\ng\r\n$5\r\naa,bb\r\n$1\r\nn\r\n$1\r\n1\r\n"
             )
         );
@@ -23964,7 +23966,7 @@ mod tests {
                 b"0",
                 b"2"
             ]),
-            "*3\r\n:3\r\n*2\r\n$1\r\nn\r\n$1\r\n1\r\n*2\r\n$1\r\nn\r\n$1\r\n2\r\n"
+            "*3\r\n:1\r\n*2\r\n$1\r\nn\r\n$1\r\n1\r\n*2\r\n$1\r\nn\r\n$1\r\n2\r\n"
         );
     }
 
@@ -24100,7 +24102,7 @@ mod tests {
                 b"2"
             ]),
             concat!(
-                "*3\r\n:3\r\n",
+                "*3\r\n:1\r\n",
                 "*4\r\n$7\r\n__score\r\n$14\r\n0.356674943939\r\n$1\r\nn\r\n$1\r\n1\r\n",
                 "*4\r\n$7\r\n__score\r\n$14\r\n0.356674943939\r\n$1\r\nn\r\n$1\r\n2\r\n"
             )
@@ -24134,7 +24136,7 @@ mod tests {
                 b"0",
                 b"1"
             ]),
-            "*3\r\n:3\r\n$-1\r\n*2\r\n$1\r\nn\r\n$1\r\n1\r\n"
+            "*3\r\n:1\r\n$-1\r\n*2\r\n$1\r\nn\r\n$1\r\n1\r\n"
         );
     }
 
@@ -24181,7 +24183,7 @@ mod tests {
                 b"1",
                 b"2"
             ]),
-            "*3\r\n:3\r\n*2\r\n$1\r\nn\r\n$1\r\n2\r\n*2\r\n$1\r\nn\r\n$1\r\n4\r\n"
+            "*3\r\n:2\r\n*2\r\n$1\r\nn\r\n$1\r\n2\r\n*2\r\n$1\r\nn\r\n$1\r\n4\r\n"
         );
     }
 
@@ -24212,7 +24214,7 @@ mod tests {
                 "%4\r\n+score\r\n,0.3566749439387324\r\n+sortkey\r\n_\r\n",
                 "+extra_attributes\r\n%2\r\n$7\r\n__score\r\n$14\r\n0.356674943939\r\n",
                 "$1\r\nn\r\n$1\r\n1\r\n+values\r\n*0\r\n",
-                "+total_results\r\n:3\r\n+warning\r\n*0\r\n"
+                "+total_results\r\n:1\r\n+warning\r\n*0\r\n"
             )
         );
         // The count is worked out from the rows the reply reached under this
