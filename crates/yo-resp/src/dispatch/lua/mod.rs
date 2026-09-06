@@ -57,6 +57,7 @@ mod bit;
 mod cjson;
 mod convert;
 mod sha1;
+mod r#struct;
 
 use super::{Server, Session};
 use crate::proto::Proto;
@@ -357,6 +358,7 @@ fn interpreter() -> mlua::Result<Lua> {
     api::statics(&lua, &raw)?;
     bit::statics(&lua, &raw)?;
     cjson::statics(&lua, &raw)?;
+    r#struct::statics(&lua, &raw)?;
     lua.set_named_registry_value("yo_run", boot.raw_get::<mlua::Function>("run")?)?;
     lua.set_named_registry_value("yo_raw", raw)?;
     Ok(lua)
@@ -398,6 +400,7 @@ local error, type, tostring, tonumber = error, type, tostring, tonumber
 local setmetatable, rawset, select, next = setmetatable, rawset, select, next
 local getmetatable, setfenv, ipairs = getmetatable, setfenv, ipairs
 local rawloadstring, rawload = loadstring, load
+local rawunpack = unpack
 local sub, find, concat = string.sub, string.find, table.concat
 local floor = math.floor
 
@@ -844,6 +847,41 @@ end
 local cjsonlib, cjson_cfg = cjson_new()
 shield('cjson', cjsonlib)
 
+-- The `struct` library, which is Roberto Ierusalimschy's and is the answer to
+-- the thing Lua 5.1 is worst at: a string is a byte string, so a script can
+-- hold a packed record perfectly well, and the language gives it no way to
+-- build one or take one apart.
+--
+-- All three of these are thinner than the wrappers in the other libraries,
+-- because the format is what decides how many arguments there are and what
+-- each one has to be, so Rust does the checking and hands back which argument
+-- was wrong along with why. Nought means it worked, one is a plain failure and
+-- two is a complaint about an argument.
+local structlib = {}
+
+structlib.pack = bridge(function(...)
+  local kind, value, why = raw.struct_pack(...)
+  if kind == 1 then fault(value) end
+  if kind == 2 then argue(1, value, why) end
+  return value
+end)
+
+structlib.unpack = bridge(function(...)
+  local kind, value, why = raw.struct_unpack(...)
+  if kind == 1 then fault(value) end
+  if kind == 2 then argue(1, value, why) end
+  return rawunpack(value, 1, value.n)
+end)
+
+structlib.size = bridge(function(...)
+  local kind, value, why = raw.struct_size(...)
+  if kind == 1 then fault(value) end
+  if kind == 2 then argue(1, value, why) end
+  return value
+end)
+
+shield('struct', structlib)
+
 -- A failure that is a table with an `err` field reaches a script as the string
 -- inside it rather than as the table. That is what a real server does and it is
 -- what every script that prints the error it caught depends on.
@@ -1085,8 +1123,8 @@ mod tests {
             names(&lua.globals()),
             "_G _VERSION __redis__err__handler assert bit cjson collectgarbage coroutine \
              error gcinfo getmetatable ipairs load loadstring math next os pairs pcall \
-             rawequal rawget rawset redis select setmetatable string table tonumber tostring \
-             type unpack xpcall"
+             rawequal rawget rawset redis select setmetatable string struct table tonumber \
+             tostring type unpack xpcall"
         );
         // The libraries that reach outside the process are not there at all
         // rather than there and stubbed, so a script that wants one finds out.
