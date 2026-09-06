@@ -666,24 +666,44 @@ fn getkeys(args: Args<'_>, out: &mut Out) -> Result<()> {
             "Invalid number of arguments specified for command",
         ));
     }
-    // Three commands here keep their keys somewhere the triple cannot describe,
+    // A few commands keep their keys somewhere the triple cannot describe,
     // behind a count of how many there are. That is why a real server marks them
     // `movablekeys` and why a client has to ask this question about them at all.
-    // `MSETEX` counts pairs and the two joined time series reads count single
-    // keys, so the step is the only thing that differs between them.
-    if let Some(step) = match spec.name {
-        "msetex" => Some(2),
-        "ts.nrange" | "ts.nrevrange" => Some(1),
+    // `MSETEX` counts pairs and the rest count single keys, so what differs
+    // between them is the step and where the count sits: the script family has
+    // the body in front of it and the others have nothing.
+    //
+    // The script family is also the only one where none is a real answer. A
+    // script with no keys is an ordinary thing to write and `EVAL body 0`
+    // answers an empty list rather than complaining, where `MSETEX 0` is a
+    // command that would do nothing and is refused. The last flag says the same
+    // thing about a count that makes no sense at all: a real server reads the
+    // script family through a key spec that finds no keys and answers nothing,
+    // and refuses the others, so `EVAL body -1` and `EVAL body abc` are both an
+    // empty list here rather than an error.
+    if let Some((at, step, least, lenient)) = match spec.name {
+        "msetex" => Some((3, 2, 1, false)),
+        "ts.nrange" | "ts.nrevrange" => Some((3, 1, 1, false)),
+        "eval" | "eval_ro" | "evalsha" | "evalsha_ro" => Some((4, 1, 0, true)),
         _ => None,
     } {
-        let n = parse_i64(args.get(3))
-            .filter(|&n| n > 0)
+        let found = parse_i64(args.get(at))
+            .filter(|&n| n >= least)
             .and_then(|n| usize::try_from(n).ok())
-            .filter(|&n| 4 + step * n <= args.len())
-            .ok_or_else(|| Error::new(Code::Invalid, "Invalid arguments specified for command"))?;
+            .filter(|&n| at + 1 + step * n <= args.len());
+        let n = match found {
+            Some(n) => n,
+            None if lenient => 0,
+            None => {
+                return Err(Error::new(
+                    Code::Invalid,
+                    "Invalid arguments specified for command",
+                ));
+            }
+        };
         out.array(n);
         for i in 0..n {
-            out.bulk(args.get(4 + step * i));
+            out.bulk(args.get(at + 1 + step * i));
         }
         return Ok(());
     }

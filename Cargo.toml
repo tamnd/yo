@@ -82,6 +82,11 @@ yo-vector = { path = "crates/yo-vector", version = "0.3.21" }
 criterion = "0.8"
 libc = "0.2"
 loom = "0.7"
+# Lua 5.1, which is the version a script written for Redis is written against
+# and not a choice with alternatives. `vendored` builds the interpreter from
+# source inside the build rather than looking for one on the machine, so a
+# server built here runs the same Lua wherever it was built.
+mlua = { version = "0.12", default-features = false, features = ["lua51", "vendored"] }
 windows-sys = { version = "0.61", default-features = false }
 
 [workspace.lints.rust]

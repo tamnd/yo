@@ -69,6 +69,7 @@ mod indexing;
 mod json;
 mod keyspace;
 mod lists;
+mod lua;
 mod migrate;
 mod scan;
 mod scripting;
@@ -695,6 +696,18 @@ pub struct Server {
     /// behind one, and a server nobody has opened a cursor on holds an empty map
     /// here.
     cursors: Lock<Cursors>,
+    /// The script bodies `EVALSHA` runs, by their digests.
+    ///
+    /// On the server rather than on a connection, because that is the whole
+    /// point of the cache. A client loads its scripts once when it starts up,
+    /// on whichever connection it happened to open first, and then sends nothing
+    /// but digests forever after, from every connection in its pool.
+    ///
+    /// Behind a lock because loading is a write and every thread can be the one
+    /// doing it. Held only long enough to add a body or copy one out, never
+    /// across a run: a running script calls commands, and those take locks of
+    /// their own.
+    scripts: Lock<lua::Scripts>,
     /// Set by `SHUTDOWN`, and read by whatever is turning the loop.
     ///
     /// A flag rather than an exit, because the command layer is not what owns
@@ -738,6 +751,7 @@ impl Server {
             sealed: AtomicBool::new(false),
             search: Lock::new(Registry::new()),
             cursors: Lock::default(),
+            scripts: Lock::default(),
             stopping: AtomicBool::new(false),
         }
     }
@@ -796,6 +810,7 @@ impl Server {
             sealed: AtomicBool::new(false),
             search: Lock::new(Registry::new()),
             cursors: Lock::default(),
+            scripts: Lock::default(),
             stopping: AtomicBool::new(false),
         }
     }
@@ -1624,6 +1639,16 @@ pub struct Session {
     /// and not a shortcut: a fieldset is invisible to every other connection and
     /// the keys built from one outlive it.
     sets: himport::Fieldsets,
+    /// Whether the command running right now was called by a script.
+    ///
+    /// The one thing it changes is what a blocking command does when it finds
+    /// nothing to take. A client that sent `BLPOP` waits; a script that called
+    /// `BLPOP` cannot, because the whole server is waiting on the script, and a
+    /// script that parked would park everything behind it. So inside a script a
+    /// blocking command times out at once and answers the null a client that
+    /// waited its full timeout would have got. That is a real server's rule and
+    /// it is why `BLPOP` is not on the list a script may not call.
+    scripted: bool,
 }
 
 impl Session {
@@ -1635,7 +1660,13 @@ impl Session {
             id,
             name: Vec::new(),
             sets: himport::Fieldsets::default(),
+            scripted: false,
         }
+    }
+
+    /// Whether a script is what is asking, which only a blocking command reads.
+    pub(crate) const fn scripted(&self) -> bool {
+        self.scripted
     }
 
     /// The connection id, which `HELLO` reports and `CLIENT` will.
@@ -1954,7 +1985,9 @@ pub fn resolved(
                     Flow::Continue
                 })
             }
-            "scripting" => scripting::execute(spec, args, out).map(|()| Flow::Continue),
+            "scripting" => {
+                scripting::execute(server, session, spec, args, out).map(|()| Flow::Continue)
+            }
             _ => server::execute(server, session, spec, args, out),
         }
     };
@@ -3358,15 +3391,559 @@ mod tests {
             "-ERR wrong number of arguments for 'script|exists' command\r\n"
         );
 
-        // The ones that need an interpreter are not here, and say so rather
-        // than answering OK to a load that loaded nothing.
-        assert_eq!(
-            f.run(&[b"SCRIPT", b"LOAD", b"return 1"]),
-            "-ERR unknown subcommand 'LOAD'. Try SCRIPT HELP.\r\n"
-        );
+        // The library half still needs somewhere for a library to come from,
+        // and says so rather than answering OK to a load that loaded nothing.
         assert_eq!(
             f.run(&[b"FUNCTION", b"STATS"]),
             "-ERR unknown subcommand 'STATS'. Try FUNCTION HELP.\r\n"
+        );
+    }
+
+    #[test]
+    fn the_script_cache_holds_what_was_loaded_into_it() {
+        let mut f = Fixture::new();
+        // The hash is the sha1 of the body and nothing else, so it is the same
+        // number a real server answers and a client can compute it itself.
+        let sha = b"e0e1f9fabfc9d4800c877a703b823ac0578ff8db";
+        assert_eq!(
+            f.run(&[b"SCRIPT", b"LOAD", b"return 1"]),
+            "$40\r\ne0e1f9fabfc9d4800c877a703b823ac0578ff8db\r\n"
+        );
+        assert_eq!(f.run(&[b"SCRIPT", b"EXISTS", sha]), "*1\r\n:1\r\n");
+        assert_eq!(f.run(&[b"EVALSHA", sha, b"0"]), ":1\r\n");
+        // Loading is idempotent and a body that will not parse is refused
+        // where it was written rather than where it is called.
+        assert_eq!(
+            f.run(&[b"SCRIPT", b"LOAD", b"return 1"]),
+            "$40\r\ne0e1f9fabfc9d4800c877a703b823ac0578ff8db\r\n"
+        );
+        assert!(
+            f.run(&[b"SCRIPT", b"LOAD", b"this is not lua"])
+                .starts_with("-ERR Error compiling script"),
+        );
+
+        assert_eq!(f.run(&[b"SCRIPT", b"FLUSH"]), "+OK\r\n");
+        assert_eq!(f.run(&[b"SCRIPT", b"EXISTS", sha]), "*1\r\n:0\r\n");
+        assert_eq!(
+            f.run(&[b"EVALSHA", sha, b"0"]),
+            "-NOSCRIPT No matching script. Please use EVAL.\r\n"
+        );
+
+        // Running the body puts it in the cache too, which is what makes the
+        // load then call then fall back to load pattern a client uses work.
+        assert_eq!(f.run(&[b"EVAL", b"return 1", b"0"]), ":1\r\n");
+        assert_eq!(f.run(&[b"SCRIPT", b"EXISTS", sha]), "*1\r\n:1\r\n");
+
+        // Nothing here can run long enough to be killed, which is D-101, so
+        // the answer is the one a real server gives when nothing is stuck.
+        assert_eq!(
+            f.run(&[b"SCRIPT", b"KILL"]),
+            "-NOTBUSY No scripts in execution right now.\r\n"
+        );
+        assert_eq!(f.run(&[b"SCRIPT", b"DEBUG", b"NO"]), "+OK\r\n");
+        assert_eq!(f.run(&[b"SCRIPT", b"DEBUG", b"yes"]), "+OK\r\n");
+        assert_eq!(
+            f.run(&[b"SCRIPT", b"DEBUG", b"maybe"]),
+            "-ERR Use SCRIPT DEBUG YES/SYNC/NO\r\n"
+        );
+    }
+
+    #[test]
+    fn eval_counts_its_keys_before_it_compiles_anything() {
+        let mut f = Fixture::new();
+        assert_eq!(
+            f.run(&[b"EVAL", b"return 1"]),
+            "-ERR wrong number of arguments for 'eval' command\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"EVAL", b"return 1", b"abc"]),
+            "-ERR value is not an integer or out of range\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"EVAL", b"return 1", b"-1"]),
+            "-ERR Number of keys can't be negative\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"EVAL", b"return 1", b"1"]),
+            "-ERR Number of keys can't be greater than number of args\r\n"
+        );
+        // The count splits the tail, and everything past the keys is ARGV.
+        assert_eq!(
+            f.run(&[
+                b"EVAL",
+                b"return {KEYS[1],KEYS[2],ARGV[1]}",
+                b"2",
+                b"a",
+                b"b",
+                b"c"
+            ]),
+            "*3\r\n$1\r\na\r\n$1\r\nb\r\n$1\r\nc\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"EVAL", b"return #KEYS", b"0", b"a", b"b"]),
+            ":0\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"EVAL", b"return #ARGV", b"0", b"a", b"b"]),
+            ":2\r\n"
+        );
+    }
+
+    #[test]
+    fn a_lua_value_comes_back_as_the_reply_it_maps_to() {
+        let mut f = Fixture::new();
+        let eval = |f: &mut Fixture, body: &[u8]| f.run(&[b"EVAL", body, b"0"]);
+
+        // A number is truncated toward zero rather than rounded, and the two
+        // ends of the range saturate the way the cast does.
+        assert_eq!(eval(&mut f, b"return 3.99"), ":3\r\n");
+        assert_eq!(eval(&mut f, b"return -3.99"), ":-3\r\n");
+        assert_eq!(eval(&mut f, b"return 0.5"), ":0\r\n");
+        assert_eq!(eval(&mut f, b"return 2^63"), ":9223372036854775807\r\n");
+        assert_eq!(eval(&mut f, b"return -2^63"), ":-9223372036854775808\r\n");
+        assert_eq!(eval(&mut f, b"return 1/0"), ":9223372036854775807\r\n");
+        assert_eq!(eval(&mut f, b"return 0/0"), ":0\r\n");
+
+        assert_eq!(eval(&mut f, b"return 'hello'"), "$5\r\nhello\r\n");
+        assert_eq!(eval(&mut f, b"return true"), ":1\r\n");
+        // Everything that is not there is the same nothing.
+        assert_eq!(eval(&mut f, b"return false"), "$-1\r\n");
+        assert_eq!(eval(&mut f, b"return nil"), "$-1\r\n");
+        assert_eq!(eval(&mut f, b"return"), "$-1\r\n");
+        assert_eq!(eval(&mut f, b""), "$-1\r\n");
+
+        // A table is an array that stops at the first hole, which is what makes
+        // a script build a reply by appending rather than by indexing.
+        assert_eq!(eval(&mut f, b"return {}"), "*0\r\n");
+        assert_eq!(eval(&mut f, b"return {1,2,nil,4}"), "*2\r\n:1\r\n:2\r\n");
+        assert_eq!(
+            eval(&mut f, b"return {1,'a',{2}}"),
+            "*3\r\n:1\r\n$1\r\na\r\n*1\r\n:2\r\n"
+        );
+
+        // The named fields, in the order a real server looks for them.
+        assert_eq!(eval(&mut f, b"return {ok='fine'}"), "+fine\r\n");
+        assert_eq!(eval(&mut f, b"return {err='mine'}"), "-mine\r\n");
+        assert_eq!(eval(&mut f, b"return {err='a', ok='b'}"), "-a\r\n");
+        assert_eq!(eval(&mut f, b"return {ok='b', double=1.5}"), "+b\r\n");
+        // A line break inside one of them becomes a space, because the reply is
+        // a single line and a client that saw the break would lose the frame.
+        assert_eq!(eval(&mut f, b"return {ok='a\\r\\nb'}"), "+a  b\r\n");
+        // A field of the wrong type is not that kind of reply at all, and falls
+        // through to the array walk, which finds nothing.
+        assert_eq!(eval(&mut f, b"return {ok=1}"), "*0\r\n");
+        assert_eq!(eval(&mut f, b"return {err={}}"), "*0\r\n");
+    }
+
+    #[test]
+    fn the_protocol_the_client_asked_for_is_the_one_a_table_answers_in() {
+        let mut f = Fixture::new();
+        // Under RESP2 the four typed tables have to come back as something a
+        // client that only knows RESP2 can read.
+        assert_eq!(
+            f.run(&[b"EVAL", b"return {double=3.5}", b"0"]),
+            "$3\r\n3.5\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"EVAL", b"return {big_number='123'}", b"0"]),
+            "$3\r\n123\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"EVAL", b"return {map={a='b'}}", b"0"]),
+            "*2\r\n$1\r\na\r\n$1\r\nb\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"EVAL", b"return {set={a=true}}", b"0"]),
+            "*1\r\n$1\r\na\r\n"
+        );
+        assert_eq!(f.run(&[b"EVAL", b"return false", b"0"]), "$-1\r\n");
+
+        f.out = Out::new(Proto::Resp3);
+        assert_eq!(f.run(&[b"EVAL", b"return {double=3.5}", b"0"]), ",3.5\r\n");
+        assert_eq!(
+            f.run(&[b"EVAL", b"return {big_number='123'}", b"0"]),
+            "(123\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"EVAL", b"return {map={a='b'}}", b"0"]),
+            "%1\r\n$1\r\na\r\n$1\r\nb\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"EVAL", b"return {set={a=true}}", b"0"]),
+            "~1\r\n$1\r\na\r\n"
+        );
+        assert_eq!(f.run(&[b"EVAL", b"return false", b"0"]), "_\r\n");
+    }
+
+    #[test]
+    fn a_reply_comes_back_into_lua_as_the_value_it_maps_to() {
+        let mut f = Fixture::new();
+        f.run(&[b"SET", b"s", b"hello"]);
+        f.run(&[b"RPUSH", b"l", b"a", b"b"]);
+        let eval = |f: &mut Fixture, body: &[u8]| f.run(&[b"EVAL", body, b"0"]);
+
+        assert_eq!(
+            eval(&mut f, b"return type(redis.call('get','s'))"),
+            "$6\r\nstring\r\n"
+        );
+        assert_eq!(
+            eval(&mut f, b"return type(redis.call('llen','l'))"),
+            "$6\r\nnumber\r\n"
+        );
+        assert_eq!(
+            eval(&mut f, b"return type(redis.call('lrange','l',0,-1))"),
+            "$5\r\ntable\r\n"
+        );
+        // A status is a table with one field, which is what lets a script pass
+        // one straight back out again.
+        assert_eq!(
+            eval(&mut f, b"return redis.call('set','s','v')['ok']"),
+            "$2\r\nOK\r\n"
+        );
+        // A missing key is false under RESP2 and nil once the script asks for
+        // RESP3, which is the one conversion the script gets to choose.
+        assert_eq!(
+            eval(&mut f, b"return tostring(redis.call('get','nosuch'))"),
+            "$5\r\nfalse\r\n"
+        );
+        assert_eq!(
+            eval(
+                &mut f,
+                b"redis.setresp(3) return tostring(redis.call('get','nosuch'))"
+            ),
+            "$3\r\nnil\r\n"
+        );
+        // The choice does not outlive the script that made it.
+        assert_eq!(
+            eval(&mut f, b"return tostring(redis.call('get','nosuch'))"),
+            "$5\r\nfalse\r\n"
+        );
+    }
+
+    #[test]
+    fn an_error_from_a_script_names_the_line_it_came_from() {
+        let mut f = Fixture::new();
+        // The position is the script's own, not the prelude's, and the suffix
+        // names the script so a client can find it in the cache.
+        assert_eq!(
+            f.run(&[b"EVAL", b"error('boom')", b"0"]),
+            "-ERR user_script:1: boom script: \
+             82903a0434f1503e152f89c03c9acd881a0e8150, on @user_script:1.\r\n"
+        );
+        // Level zero says the message already knows where it came from.
+        assert_eq!(
+            f.run(&[b"EVAL", b"error('boom', 0)", b"0"]),
+            "-ERR boom script: 90724e16396e5864c1184910ba6d7440461cee4f, on @user_script:1.\r\n"
+        );
+        // A table with an err field keeps its own text and gets the suffix.
+        assert!(
+            f.run(&[b"EVAL", b"error({err='structured'})", b"0"])
+                .starts_with("-structured script: "),
+        );
+        // A script that will not parse is refused before it runs, so there is
+        // no script and nothing to name.
+        assert_eq!(
+            f.run(&[b"EVAL", b"return this is not lua", b"0"]),
+            "-ERR Error compiling script (new function): user_script:1: '<eof>' expected near 'is'\r\n"
+        );
+
+        // A table that came out of pcall is a string by the time the script
+        // sees it, which is a real server's own wrapping and not Lua's.
+        assert_eq!(
+            f.run(&[
+                b"EVAL",
+                b"local a, b = pcall(function() error({err='z'}) end) return type(b) .. ':' .. tostring(b)",
+                b"0"
+            ]),
+            "$8\r\nstring:z\r\n"
+        );
+        assert_eq!(
+            f.run(&[
+                b"EVAL",
+                b"local a, b = pcall(function() error({a=1}) end) return type(b)",
+                b"0"
+            ]),
+            "$5\r\ntable\r\n"
+        );
+    }
+
+    #[test]
+    fn redis_call_refuses_what_it_cannot_run_and_pcall_hands_it_back() {
+        let mut f = Fixture::new();
+        let sentence = |f: &mut Fixture, body: &[u8]| {
+            let reply = f.run(&[b"EVAL", body, b"0"]);
+            reply.split(" script: ").next().unwrap().to_owned()
+        };
+
+        assert_eq!(
+            sentence(&mut f, b"return redis.call()"),
+            "-ERR Please specify at least one argument for this redis lib call"
+        );
+        assert_eq!(
+            sentence(&mut f, b"return redis.call('get', {})"),
+            "-ERR Lua redis lib command arguments must be strings or integers"
+        );
+        assert_eq!(
+            sentence(&mut f, b"return redis.call('nosuchcmd')"),
+            "-ERR Unknown Redis command called from script"
+        );
+        assert_eq!(
+            sentence(&mut f, b"return redis.call('get')"),
+            "-ERR Wrong number of args calling Redis command from script"
+        );
+        // The commands that make no sense inside a script are refused by name
+        // rather than by not being implemented, so the sentence is the same one
+        // a real server writes for each of them.
+        for name in [
+            &b"return redis.call('multi')"[..],
+            b"return redis.call('exec')",
+            b"return redis.call('watch','k')",
+            b"return redis.call('subscribe','c')",
+            b"return redis.call('debug','jmap')",
+            b"return redis.call('eval','return 1',0)",
+            b"return redis.call('config','get','maxmemory')",
+        ] {
+            assert_eq!(
+                sentence(&mut f, name),
+                "-ERR This Redis command is not allowed from script",
+                "for {}",
+                String::from_utf8_lossy(name)
+            );
+        }
+        // HELP is the one subcommand of a refused container that is allowed,
+        // because it reads nothing and changes nothing.
+        assert!(
+            f.run(&[b"EVAL", b"return redis.call('config','help')", b"0"])
+                .starts_with('*'),
+        );
+
+        // pcall answers the same sentence as a value instead of raising it, and
+        // the value has an err field a script can read.
+        assert_eq!(
+            f.run(&[
+                b"EVAL",
+                b"local x = redis.pcall('nosuchcmd') return x.err",
+                b"0"
+            ]),
+            "$44\r\nERR Unknown Redis command called from script\r\n"
+        );
+        // Returning it unread raises it, because the table has an err field.
+        assert_eq!(
+            f.run(&[b"EVAL", b"return redis.pcall('nosuchcmd')", b"0"]),
+            "-ERR Unknown Redis command called from script\r\n"
+        );
+    }
+
+    #[test]
+    fn a_read_only_script_is_stopped_at_the_write_and_not_at_the_door() {
+        let mut f = Fixture::new();
+        f.run(&[b"SET", b"k", b"v"]);
+        assert_eq!(
+            f.run(&[b"EVAL_RO", b"return redis.call('get', KEYS[1])", b"1", b"k"]),
+            "$1\r\nv\r\n"
+        );
+        assert!(
+            f.run(&[
+                b"EVAL_RO",
+                b"return redis.call('set', KEYS[1], 'x')",
+                b"1",
+                b"k"
+            ])
+            .starts_with("-ERR Write commands are not allowed from read-only scripts."),
+        );
+        // The write did not happen, and the same body under EVAL does.
+        assert_eq!(f.run(&[b"GET", b"k"]), "$1\r\nv\r\n");
+        assert_eq!(
+            f.run(&[
+                b"EVAL",
+                b"return redis.call('set', KEYS[1], 'x')",
+                b"1",
+                b"k"
+            ]),
+            "+OK\r\n"
+        );
+        assert_eq!(f.run(&[b"GET", b"k"]), "$1\r\nx\r\n");
+
+        // EVALSHA_RO runs a cached body under the same rule.
+        let sha = b"e0e1f9fabfc9d4800c877a703b823ac0578ff8db";
+        f.run(&[b"SCRIPT", b"LOAD", b"return 1"]);
+        assert_eq!(f.run(&[b"EVALSHA_RO", sha, b"0"]), ":1\r\n");
+    }
+
+    #[test]
+    fn a_script_cannot_leave_anything_behind_for_the_next_one() {
+        let mut f = Fixture::new();
+        // A plain global write and a write through a name on the redis table
+        // both raise, with the position the script wrote them at.
+        for body in [&b"x = 1"[..], b"pcall = 1", b"redis = 1", b"redis.call = 1"] {
+            let reply = f.run(&[b"EVAL", body, b"0"]);
+            assert!(
+                reply
+                    .starts_with("-ERR user_script:1: Attempt to modify a readonly table script: "),
+                "{body:?} gave {reply}",
+            );
+        }
+        // Walking round the guard with rawset or setmetatable raises too, and
+        // without the position, which is where a real server raises it from.
+        for body in [
+            &b"rawset(redis, 'call', 1)"[..],
+            b"rawset(_G, 'zz', 1)",
+            b"setmetatable(_G, {})",
+            b"setmetatable(redis, {})",
+        ] {
+            let reply = f.run(&[b"EVAL", body, b"0"]);
+            assert!(
+                reply.starts_with("-ERR Attempt to modify a readonly table script: "),
+                "{body:?} gave {reply}",
+            );
+        }
+        // Reading a name that is not there is a mistake rather than a nil, so a
+        // misspelled global stops the script instead of doing nothing quietly.
+        assert!(
+            f.run(&[b"EVAL", b"return nosuchglobal", b"0"])
+                .contains("Script attempted to access nonexistent global variable 'nosuchglobal'"),
+        );
+        // Reading a name that is not on the redis table is a nil, which is how
+        // a script tests for a helper that an older server does not have.
+        assert_eq!(
+            f.run(&[b"EVAL", b"return tostring(redis.nosuchfield)", b"0"]),
+            "$3\r\nnil\r\n"
+        );
+
+        // The one write that lands, D-103, is taken back out before the next
+        // script starts, so nothing a script does reaches the one after it.
+        assert_eq!(f.run(&[b"EVAL", b"_G.pcall = 1 return 1", b"0"]), ":1\r\n");
+        assert_eq!(
+            f.run(&[b"EVAL", b"return type(pcall)", b"0"]),
+            "$8\r\nfunction\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"EVAL", b"return type(redis.call)", b"0"]),
+            "$8\r\nfunction\r\n"
+        );
+    }
+
+    #[test]
+    fn command_getkeys_reads_the_key_count_out_of_a_script_call() {
+        let mut f = Fixture::new();
+        assert_eq!(
+            f.run(&[b"COMMAND", b"GETKEYS", b"EVAL", b"return 1", b"1", b"k"]),
+            "*1\r\n$1\r\nk\r\n"
+        );
+        assert_eq!(
+            f.run(&[
+                b"COMMAND", b"GETKEYS", b"EVALSHA", b"abc", b"2", b"k1", b"k2"
+            ]),
+            "*2\r\n$2\r\nk1\r\n$2\r\nk2\r\n"
+        );
+        // None is a real answer for a script and the arguments past the count
+        // are not keys, so they are not listed.
+        assert_eq!(
+            f.run(&[b"COMMAND", b"GETKEYS", b"EVAL_RO", b"return 1", b"0", b"a"]),
+            "*0\r\n"
+        );
+        // A count that makes no sense finds no keys rather than being an error,
+        // which is what a real server's key spec does with it.
+        assert_eq!(
+            f.run(&[b"COMMAND", b"GETKEYS", b"EVAL", b"return 1", b"3", b"k"]),
+            "*0\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"COMMAND", b"GETKEYS", b"EVAL", b"return 1", b"-1"]),
+            "*0\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"COMMAND", b"GETKEYS", b"EVAL", b"return 1", b"abc"]),
+            "*0\r\n"
+        );
+        // The count itself has to be there, and that is an arity question.
+        assert_eq!(
+            f.run(&[b"COMMAND", b"GETKEYS", b"EVAL", b"return 1"]),
+            "-ERR Invalid number of arguments specified for command\r\n"
+        );
+    }
+
+    #[test]
+    fn the_helpers_on_the_redis_table_answer_the_way_they_are_documented() {
+        let mut f = Fixture::new();
+        let eval = |f: &mut Fixture, body: &[u8]| f.run(&[b"EVAL", body, b"0"]);
+
+        assert_eq!(
+            eval(&mut f, b"return redis.sha1hex('')"),
+            "$40\r\nda39a3ee5e6b4b0d3255bfef95601890afd80709\r\n"
+        );
+        assert_eq!(
+            eval(&mut f, b"return redis.sha1hex('return 1')"),
+            "$40\r\ne0e1f9fabfc9d4800c877a703b823ac0578ff8db\r\n"
+        );
+        // A message with no space in it gets the generic code in front, and one
+        // that already looks like a coded error is left alone.
+        assert_eq!(
+            eval(&mut f, b"return redis.error_reply('boom')"),
+            "-ERR boom\r\n"
+        );
+        assert_eq!(
+            eval(&mut f, b"return redis.error_reply('WRONGTYPE nope')"),
+            "-WRONGTYPE nope\r\n"
+        );
+        assert_eq!(
+            eval(&mut f, b"return redis.status_reply('fine')"),
+            "+fine\r\n"
+        );
+        // Neither of them raises when it is called wrongly, they answer a value
+        // that is an error, which is a difference a script can see.
+        assert_eq!(
+            eval(&mut f, b"return redis.error_reply(1)"),
+            "-ERR wrong number or type of arguments\r\n"
+        );
+        assert_eq!(
+            eval(&mut f, b"local x = redis.status_reply() return x.err"),
+            "$37\r\nERR wrong number or type of arguments\r\n"
+        );
+
+        // The constants a script branches on.
+        assert_eq!(
+            eval(
+                &mut f,
+                b"return redis.LOG_DEBUG .. redis.LOG_VERBOSE .. redis.LOG_NOTICE .. redis.LOG_WARNING"
+            ),
+            "$4\r\n0123\r\n"
+        );
+        assert_eq!(
+            eval(
+                &mut f,
+                b"return redis.REPL_NONE .. redis.REPL_AOF .. redis.REPL_SLAVE .. redis.REPL_REPLICA .. redis.REPL_ALL"
+            ),
+            "$5\r\n01223\r\n"
+        );
+        // The calls that exist so an old script keeps working.
+        assert_eq!(eval(&mut f, b"return redis.replicate_commands()"), ":1\r\n");
+        assert_eq!(
+            eval(&mut f, b"redis.set_repl(redis.REPL_ALL) return 1"),
+            ":1\r\n"
+        );
+        assert_eq!(
+            eval(&mut f, b"redis.log(redis.LOG_WARNING, 'x') return 1"),
+            ":1\r\n"
+        );
+        assert_eq!(
+            eval(&mut f, b"return redis.acl_check_cmd('get', 'k')"),
+            ":1\r\n"
+        );
+        // Each of those checks its arguments the way a real server does.
+        assert!(eval(&mut f, b"redis.setresp(4)").contains("RESP version must be 2 or 3."),);
+        assert!(eval(&mut f, b"redis.set_repl(9)").contains("Invalid replication flags."));
+        assert!(
+            eval(&mut f, b"redis.log('x', 'y')")
+                .contains("First argument must be a number (log level)."),
+        );
+        assert!(
+            eval(&mut f, b"return redis.acl_check_cmd('nosuchcmd')")
+                .contains("Invalid command passed to redis.acl_check_cmd()"),
+        );
+        assert!(
+            eval(&mut f, b"return redis.acl_check_cmd('get')")
+                .contains("Wrong number of args for redis.acl_check_cmd()"),
         );
     }
 
