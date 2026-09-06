@@ -228,6 +228,13 @@ pub struct Yield {
     pub field: Box<[u8]>,
     /// The vector it was measured from.
     pub asked: Box<[f32]>,
+    /// Whether the clause put the answer in distance order, which a nearest
+    /// neighbour clause does and a range does not.
+    ///
+    /// A search hides that again by answering in document order, so the only
+    /// place it shows is an aggregation, whose rows arrive in the order the
+    /// clause made and stay there unless a step of the pipeline sorts them.
+    pub ordered: bool,
 }
 
 /// Every distance a query asks to see, outermost clause first.
@@ -260,6 +267,7 @@ fn collect(node: &Node, out: &mut Vec<Yield>) {
                     name,
                     field: vector.field.clone(),
                     asked,
+                    ordered: vector.k.is_some(),
                 });
             }
             if let Some(over) = &vector.over {

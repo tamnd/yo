@@ -23240,6 +23240,198 @@ mod tests {
         );
     }
 
+    /// An aggregation carries the distance on every row whether or not the
+    /// pipeline ever mentions it, and carries it in front of everything a
+    /// `LOAD` asked for.
+    #[test]
+    fn an_aggregation_answers_a_distance_nothing_asked_for() {
+        let mut f = Fixture::new();
+        vectored(&mut f);
+        let ask = |f: &mut Fixture, query: &str, rest: &[&[u8]]| {
+            let mut args: Vec<&[u8]> = vec![b"FT.AGGREGATE", b"h", query.as_bytes()];
+            args.extend_from_slice(rest);
+            args.extend_from_slice(&[b"PARAMS", b"2", b"vec", ORIGIN, b"DIALECT", b"2"]);
+            f.run(&args)
+        };
+        assert_eq!(
+            ask(&mut f, "*=>[KNN 2 @v $vec]", &[]),
+            "*3\r\n:1\r\n*2\r\n$9\r\n__v_score\r\n$1\r\n0\r\n*2\r\n$9\r\n__v_score\r\n$1\r\n1\r\n"
+        );
+        assert_eq!(
+            ask(&mut f, "*=>[KNN 2 @v $vec]", &[b"LOAD", b"1", b"@t"]),
+            "*3\r\n:1\r\n*4\r\n$9\r\n__v_score\r\n$1\r\n0\r\n$1\r\nt\r\n$4\r\nbeta\r\n*4\r\n$9\r\n__v_score\r\n$1\r\n1\r\n$1\r\nt\r\n$5\r\nalpha\r\n"
+        );
+        assert_eq!(
+            ask(&mut f, "*=>[KNN 2 @v $vec AS d]", &[]),
+            "*3\r\n:1\r\n*2\r\n$1\r\nd\r\n$1\r\n0\r\n*2\r\n$1\r\nd\r\n$1\r\n1\r\n"
+        );
+        // A range shows nothing until the query names it.
+        assert_eq!(
+            ask(&mut f, "@v:[VECTOR_RANGE 1 $vec]", &[]),
+            "*3\r\n:1\r\n*0\r\n*0\r\n"
+        );
+        assert_eq!(
+            ask(
+                &mut f,
+                "@v:[VECTOR_RANGE 1 $vec]=>{$YIELD_DISTANCE_AS: rr}",
+                &[]
+            ),
+            "*3\r\n:1\r\n*2\r\n$2\r\nrr\r\n$1\r\n1\r\n*2\r\n$2\r\nrr\r\n$1\r\n0\r\n"
+        );
+    }
+
+    /// A nearest neighbour clause hands its documents back nearest first and an
+    /// aggregation keeps them that way, where a search sorts them into document
+    /// order. A tie goes to the document written first.
+    #[test]
+    fn an_aggregation_keeps_the_order_a_nearest_neighbour_clause_made() {
+        let mut f = Fixture::new();
+        vectored(&mut f);
+        // Sitting on `d3`, so `d2` and `d4` are the same distance away.
+        const MIDDLE: &[u8] = b"\x00\x00\x00\x40\x00\x00\x00\x00";
+        let ask = |f: &mut Fixture, query: &str, vec: &[u8]| {
+            f.run(&[
+                b"FT.AGGREGATE",
+                b"h",
+                query.as_bytes(),
+                b"LOAD",
+                b"1",
+                b"@t",
+                b"PARAMS",
+                b"2",
+                b"vec",
+                vec,
+                b"DIALECT",
+                b"2",
+            ])
+        };
+        assert_eq!(
+            ask(&mut f, "*=>[KNN 3 @v $vec]", MIDDLE),
+            "*4\r\n:1\r\n*4\r\n$9\r\n__v_score\r\n$1\r\n0\r\n$1\r\nt\r\n$4\r\nbeta\r\n*4\r\n$9\r\n__v_score\r\n$1\r\n1\r\n$1\r\nt\r\n$5\r\nalpha\r\n*4\r\n$9\r\n__v_score\r\n$1\r\n1\r\n$1\r\nt\r\n$5\r\nalpha\r\n"
+        );
+        // A range does no ordering, so those rows stay in document order.
+        assert_eq!(
+            ask(
+                &mut f,
+                "@v:[VECTOR_RANGE 1 $vec]=>{$YIELD_DISTANCE_AS: rr}",
+                MIDDLE
+            ),
+            "*4\r\n:1\r\n*4\r\n$2\r\nrr\r\n$1\r\n1\r\n$1\r\nt\r\n$5\r\nalpha\r\n*4\r\n$2\r\nrr\r\n$1\r\n0\r\n$1\r\nt\r\n$4\r\nbeta\r\n*4\r\n$2\r\nrr\r\n$1\r\n1\r\n$1\r\nt\r\n$5\r\nalpha\r\n"
+        );
+    }
+
+    /// Every step of the pipeline can name a distance the query yielded, and a
+    /// query with no vector clause in it is refused for the name three
+    /// different ways depending on which step asked.
+    #[test]
+    fn a_pipeline_step_can_name_a_distance_the_query_yielded() {
+        let mut f = Fixture::new();
+        vectored(&mut f);
+        let ask = |f: &mut Fixture, query: &str, rest: &[&[u8]]| {
+            let mut args: Vec<&[u8]> = vec![b"FT.AGGREGATE", b"h", query.as_bytes()];
+            args.extend_from_slice(rest);
+            args.extend_from_slice(&[b"PARAMS", b"2", b"vec", ORIGIN, b"DIALECT", b"2"]);
+            f.run(&args)
+        };
+        let knn = "*=>[KNN 2 @v $vec]";
+        assert_eq!(
+            ask(&mut f, knn, &[b"APPLY", b"@__v_score * 2", b"AS", b"x"]),
+            "*3\r\n:1\r\n*4\r\n$9\r\n__v_score\r\n$1\r\n0\r\n$1\r\nx\r\n$1\r\n0\r\n*4\r\n$9\r\n__v_score\r\n$1\r\n1\r\n$1\r\nx\r\n$1\r\n2\r\n"
+        );
+        assert_eq!(
+            ask(&mut f, knn, &[b"FILTER", b"@__v_score > 0"]),
+            "*2\r\n:1\r\n*2\r\n$9\r\n__v_score\r\n$1\r\n1\r\n"
+        );
+        assert_eq!(
+            ask(&mut f, knn, &[b"SORTBY", b"2", b"@__v_score", b"DESC"]),
+            "*3\r\n:2\r\n*2\r\n$9\r\n__v_score\r\n$1\r\n1\r\n*2\r\n$9\r\n__v_score\r\n$1\r\n0\r\n"
+        );
+        assert_eq!(
+            ask(
+                &mut f,
+                knn,
+                &[
+                    b"GROUPBY",
+                    b"1",
+                    b"@t",
+                    b"REDUCE",
+                    b"MAX",
+                    b"1",
+                    b"@__v_score",
+                    b"AS",
+                    b"m"
+                ]
+            ),
+            "*3\r\n:2\r\n*4\r\n$1\r\nt\r\n$4\r\nbeta\r\n$1\r\nm\r\n$1\r\n0\r\n*4\r\n$1\r\nt\r\n$5\r\nalpha\r\n$1\r\nm\r\n$1\r\n1\r\n"
+        );
+        assert_eq!(
+            ask(&mut f, "*", &[b"APPLY", b"@__v_score", b"AS", b"x"]),
+            "-SEARCH_PROP_NOT_FOUND Property not loaded nor in pipeline: \
+             `__v_score`\r\n"
+        );
+        assert_eq!(
+            ask(&mut f, "*", &[b"GROUPBY", b"1", b"@__v_score"]),
+            "-SEARCH_PROP_NOT_FOUND No such property `__v_score`\r\n"
+        );
+        assert_eq!(
+            ask(&mut f, "*", &[b"SORTBY", b"2", b"@__v_score", b"ASC"]),
+            "-SEARCH_PROP_NOT_FOUND Property `__v_score` not loaded nor in \
+             schema\r\n"
+        );
+    }
+
+    /// An aggregation reads every word before it reads the query, and reads the
+    /// query before it ties anything on the pipeline to a place on the row.
+    ///
+    /// So a command with a fault in all three answers the one about the words,
+    /// a command with a fault in the last two answers the one about the query,
+    /// and the pipeline speaks last. That is measured, and it is the whole
+    /// reason the arguments are read twice.
+    #[test]
+    fn the_words_come_before_the_query_and_the_query_before_the_pipeline() {
+        let mut f = Fixture::new();
+        vectored(&mut f);
+        let ask = |f: &mut Fixture, rest: &[&[u8]]| {
+            let mut args: Vec<&[u8]> = vec![b"FT.AGGREGATE", b"h"];
+            args.extend_from_slice(rest);
+            f.run(&args)
+        };
+        assert_eq!(
+            ask(
+                &mut f,
+                &[b"foo(", b"APPLY", b"@zz", b"AS", b"x", b"LIMIT", b"x", b"1"]
+            ),
+            "-SEARCH_PARSE_ARGS LIMIT needs two numeric arguments\r\n"
+        );
+        assert_eq!(
+            ask(&mut f, &[b"foo(", b"APPLY", b"@zz", b"AS", b"x"]),
+            "-SEARCH_SYNTAX Syntax error at offset 3 near foo\r\n"
+        );
+        assert_eq!(
+            ask(&mut f, &[b"*", b"APPLY", b"@zz", b"AS", b"x"]),
+            "-SEARCH_PROP_NOT_FOUND Property not loaded nor in pipeline: `zz`\r\n"
+        );
+        // An expression that will not read is the pipeline's fault too, so it
+        // speaks after the query and after a property named before it.
+        assert_eq!(
+            ask(&mut f, &[b"foo(", b"APPLY", b"@@@", b"AS", b"x"]),
+            "-SEARCH_SYNTAX Syntax error at offset 3 near foo\r\n"
+        );
+        assert_eq!(
+            ask(
+                &mut f,
+                &[
+                    b"*", b"APPLY", b"@zz", b"AS", b"x", b"APPLY", b"@@@", b"AS", b"y"
+                ]
+            ),
+            "-SEARCH_PROP_NOT_FOUND Property not loaded nor in pipeline: `zz`\r\n"
+        );
+        assert_eq!(
+            ask(&mut f, &[b"*", b"APPLY", b"@@@", b"AS", b"x"]),
+            "-SEARCH_EXPR Syntax error at offset 0 near ''\r\n"
+        );
+    }
+
     // ----------------------------------------------------------- spellcheck
 
     /// The score is how many documents hold the suggestion over how many

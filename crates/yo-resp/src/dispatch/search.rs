@@ -2095,6 +2095,15 @@ struct Rows<'a> {
     /// it. Empty for a query with no vector clause in it, which is why nothing
     /// else here has to ask whether there was one.
     distance: Vec<Yield>,
+    /// The distance the rows themselves are in the order of, which only an
+    /// aggregation sets.
+    ///
+    /// A nearest neighbour clause hands its documents back nearest first. A
+    /// search then sorts that away, because it orders by score and every
+    /// document a vector clause answered scores the same, so what a client sees
+    /// is document order. An aggregation does no such sort, so the rows keep
+    /// the order the clause made and ties fall back to document order.
+    nearest: Option<Box<[u8]>>,
 }
 
 /// What a `SORTBY` on a search asked for, once the schema has been read.
@@ -2177,6 +2186,7 @@ impl Default for Rows<'_> {
             stops: None,
             wanted: Wanted::default(),
             distance: Vec::new(),
+            nearest: None,
         }
     }
 }
@@ -2243,6 +2253,24 @@ enum Mode {
     Aggregate,
 }
 
+/// Whether reading the arguments is also tying every property a step names to
+/// a place on the row, and what distances the query yields when it is.
+///
+/// An aggregation reads its arguments twice. The names a step is allowed to use
+/// include the ones the query yields, and the query cannot be read until the
+/// words that say how to read it have been, so the first pass takes the words
+/// and looks nothing up and the second pass does the looking up with the query
+/// already parsed. That is the order a real server does it in and it shows:
+/// `FT.AGGREGATE i "foo(" LIMIT x 1` is refused for the `LIMIT` and
+/// `FT.AGGREGATE i "foo(" APPLY '@zz' AS x` is refused for the query, so every
+/// word is checked before the query is read and every property is looked up
+/// after it.
+#[derive(Clone, Copy)]
+enum Bind<'a> {
+    Reading,
+    Binding(&'a [Yield]),
+}
+
 /// The order the documents that answered come back in.
 ///
 /// A search ranks them. An aggregation with nothing sorting it hands them back
@@ -2287,9 +2315,23 @@ fn options<'a>(
     from: usize,
     mode: Mode,
     index: &Index,
+    bind: Bind<'_>,
 ) -> core::result::Result<Asked<'a>, Vec<u8>> {
     let main = mode == Mode::Search;
     let mut asked = Asked::default();
+    if let Bind::Binding(held) = bind {
+        asked.pipe.binding = true;
+        // The distances go on the row before anything a `LOAD` asked for,
+        // which is measured: a query with a nearest neighbour clause in it
+        // answers `__v_score` first on every row whether or not the pipeline
+        // ever mentions it.
+        for want in held {
+            asked
+                .pipe
+                .base
+                .push((want.name.clone(), aggregate::Reads::Distance));
+        }
+    }
     if mode == Mode::Aggregate {
         // A search hands back ten rows when nobody said how many and an
         // aggregation hands back all of them, and the cap a search puts on the
@@ -3293,7 +3335,7 @@ fn explain<'a>(reg: &mut Registry, args: Args<'a>, out: &mut Out, cli: bool) -> 
     let Some(index) = reg.open(name) else {
         return Err(Fail::naming(MISSING, name));
     };
-    let asked = match options(args, 3, Mode::Explain, index) {
+    let asked = match options(args, 3, Mode::Explain, index, Bind::Binding(&[])) {
         Ok(asked) => asked,
         Err(text) => {
             out.error(&text);
@@ -3375,6 +3417,16 @@ struct Row {
     dists: Vec<Away>,
 }
 
+impl Row {
+    /// The distance this row carries under one name, when it carries one.
+    fn away(&self, name: &[u8]) -> Option<f64> {
+        self.dists
+            .iter()
+            .find(|(held, _)| **held == *name)
+            .map(|(_, away)| *away)
+    }
+}
+
 /// `FT.SEARCH index query [options]`.
 ///
 /// The two halves are described at the top of this file. This is the seam
@@ -3427,7 +3479,7 @@ pub(super) fn searched(
             Fail::naming(MISSING, name).write(out);
             return Ok(());
         };
-        asked = match options(args, at + 1, Mode::Search, index) {
+        asked = match options(args, at + 1, Mode::Search, index, Bind::Binding(&[])) {
             Ok(asked) => asked,
             Err(text) => {
                 out.error(&text);
@@ -3563,23 +3615,46 @@ pub(super) fn aggregated(
             Fail::naming(MISSING, name).write(out);
             return Ok(());
         };
-        asked = match options(args, at + 1, Mode::Aggregate, index) {
-            Ok(asked) => asked,
+        // The first of the two passes, which reads every word and looks no
+        // property up. All it is really for is the handful of words that say
+        // how the query itself is read, and it is a whole pass rather than a
+        // scan for those four because every other word has to be checked
+        // before the query is, which is measured.
+        let read = match options(args, at + 1, Mode::Aggregate, index, Bind::Reading) {
+            Ok(read) => read,
             Err(text) => {
                 out.error(&text);
                 return Ok(());
             }
         };
         let ask = Ask {
-            dialect: asked.dialect,
-            params: &asked.params,
-            verbatim: asked.verbatim,
-            stopwords: asked.stopwords,
+            dialect: read.dialect,
+            params: &read.params,
+            verbatim: read.verbatim,
+            stopwords: read.stopwords,
         };
         let node = match query::parse(query, index, &ask) {
             Ok(node) => node,
             Err(bad) => {
                 out.error(&refused(&bad));
+                return Ok(());
+            }
+        };
+        // The second pass, with the distances the query yields already on the
+        // row, so a step naming one of them finds it where a step naming a
+        // field of the key finds that.
+        let held = query::yields(&node);
+        asked = match options(args, at + 1, Mode::Aggregate, index, Bind::Binding(&held)) {
+            Ok(mut asked) => {
+                asked.rows.nearest = held
+                    .iter()
+                    .find(|want| want.ordered)
+                    .map(|want| want.name.clone());
+                asked.rows.distance = held;
+                asked
+            }
+            Err(text) => {
+                out.error(&text);
                 return Ok(());
             }
         };
@@ -3761,7 +3836,8 @@ fn rolls(count: usize, built: &[Rolled<'_>], shows: Shows, out: &mut Out) {
             out.nil();
         }
         if shows.fields {
-            out.map(fields.len() + usize::from(shows.addscores));
+            out.map(fields.len() + usize::from(shows.addscores) + row.dists.len());
+            spaced(row, out);
             if shows.addscores {
                 out.bulk(b"__score");
                 out.bulk(twelve(row.score).as_bytes());
@@ -3771,6 +3847,19 @@ fn rolls(count: usize, built: &[Rolled<'_>], shows: Shows, out: &mut Out) {
                 out.bulk(value);
             }
         }
+    }
+}
+
+/// The distances a vector clause measured, which lead the properties of a row
+/// the way they lead the fields of a search reply.
+///
+/// They are written here rather than read onto the row like everything else
+/// because nothing read them off the key: an aggregation with no step in it
+/// never opens a key at all and still answers them.
+fn spaced(row: &Row, out: &mut Out) {
+    for (name, away) in &row.dists {
+        out.bulk(name);
+        out.bulk(twelve(*away).as_bytes());
     }
 }
 
@@ -3811,7 +3900,8 @@ fn rolled_deep(count: usize, built: &[Rolled<'_>], shows: Shows, out: &mut Out) 
         }
         if shows.fields {
             out.simple(b"extra_attributes");
-            out.map(fields.len() + usize::from(shows.addscores));
+            out.map(fields.len() + usize::from(shows.addscores) + row.dists.len());
+            spaced(row, out);
             if shows.addscores {
                 out.bulk(b"__score");
                 out.bulk(twelve(row.score).as_bytes());
@@ -4071,6 +4161,25 @@ fn gather(
                 .unwrap_or(core::cmp::Ordering::Equal)
                 .then(a.0.id.cmp(&b.0.id))
         }),
+        // An aggregation over a nearest neighbour clause, whose rows arrive
+        // nearest first and stay that way because no step has sorted them. A
+        // tie goes to the document written first, which is measured: a query
+        // sitting between two documents answers the lower number of the two
+        // ahead of the higher.
+        (None, Order::Forwards) if let Some(name) = &rows.nearest => {
+            let away = |row: &Scored<'_>| {
+                row.2
+                    .iter()
+                    .find(|(held, _)| **held == **name)
+                    .map_or(f64::INFINITY, |(_, away)| *away)
+            };
+            found.sort_by(|a, b| {
+                away(a)
+                    .partial_cmp(&away(b))
+                    .unwrap_or(core::cmp::Ordering::Equal)
+                    .then(a.0.id.cmp(&b.0.id))
+            });
+        }
         (None, Order::Forwards) => found.sort_by_key(|(hit, _, _)| hit.id),
         (None, Order::Backwards) => {
             found.sort_by_key(|(hit, _, _)| core::cmp::Reverse(hit.id));
