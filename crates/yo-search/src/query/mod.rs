@@ -193,6 +193,14 @@ pub struct Vector {
     /// The name of the parameter holding the vector to compare against, without
     /// its dollar sign.
     pub param: Box<[u8]>,
+    /// That parameter's value, read at the width the field declared.
+    ///
+    /// Read here rather than at the walk because this is where the schema is:
+    /// the same bytes are a different vector in a field of half precision and a
+    /// field of single, and the walk has the index but not the field the query
+    /// named. `None` when the parameter was never passed, which is an error
+    /// about the parameter and is raised before this is looked at.
+    pub asked: Option<Box<[f32]>>,
     /// How many to return, for a nearest neighbour query.
     pub k: Option<u64>,
     /// How far out, for a range query.

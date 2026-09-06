@@ -3168,6 +3168,29 @@ fn refused(bad: &Bad) -> Vec<u8> {
             named(&head, *at, near.as_deref())
         }
         Bad::Attribute(name) => line("SEARCH_OPTION_INVALID Invalid attribute ", name, ""),
+        Bad::Blob { got, want } => format!(
+            "SEARCH_QUERY_BAD Error parsing vector similarity query: query vector blob size ({got}) does not match index's expected size ({want})."
+        )
+        .into_bytes(),
+        Bad::Large => b"SEARCH_QUERY_BAD Error parsing vector similarity query: \
+             query KNN K parameter is too large, must not exceed 288230376151711744"
+            .to_vec(),
+        Bad::Count { name, value } => {
+            let mut out = b"SEARCH_NUMERIC_VALUE_INVALID Invalid numeric value (".to_vec();
+            out.extend_from_slice(value);
+            out.extend_from_slice(b") for parameter `");
+            out.extend_from_slice(name);
+            out.push(b'`');
+            out
+        }
+        Bad::Radius(radius) => {
+            let mut out =
+                b"SEARCH_QUERY_BAD Error parsing vector similarity query: negative radius ("
+                    .to_vec();
+            out.extend_from_slice(radius);
+            out.extend_from_slice(b") given in a range query");
+            out
+        }
         Bad::Value { name, value } => {
             let mut out = b"SEARCH_SYNTAX Invalid value (".to_vec();
             out.extend_from_slice(value);

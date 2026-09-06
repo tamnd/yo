@@ -70,6 +70,7 @@ use crate::score::Facts;
 use crate::sorted::Sorted;
 use crate::synonyms;
 use crate::tags::Tags;
+use crate::vecs::{self, Vecs};
 use crate::words::{Words, stem};
 
 /// The name a real server gives the error a bad number raises.
@@ -120,6 +121,8 @@ pub struct Held {
     tags: BTreeMap<Box<[u8]>, Tags>,
     /// Every `GEO` field's points, by the name a query calls the field.
     geos: BTreeMap<Box<[u8]>, Geos>,
+    /// Every `VECTOR` field's vectors, by the name a query calls the field.
+    vecs: BTreeMap<Box<[u8]>, Vecs>,
 }
 
 impl Held {
@@ -138,6 +141,20 @@ impl Held {
     #[must_use]
     pub const fn dictionary(&self) -> &Terms {
         &self.terms
+    }
+
+    /// One `VECTOR` field's vectors, or `None` when no document has written
+    /// one to that field yet.
+    #[must_use]
+    pub fn vecs(&self, field: &[u8]) -> Option<&Vecs> {
+        self.vecs.get(field)
+    }
+
+    /// Takes a document's vectors out of every field that had one.
+    fn drop_vectors(&mut self, id: Id) {
+        for field in self.vecs.values_mut() {
+            field.remove(id);
+        }
     }
 
     /// The documents a term is in, or `None` when no document has it.
@@ -276,18 +293,16 @@ impl Index {
         // The old reading goes first and it goes whatever happens next, because
         // a rewrite that cannot be indexed leaves the key out of the index
         // rather than leaving what was there before.
-        held.docs.remove(key);
+        if let Some(old) = held.docs.remove(key) {
+            held.drop_vectors(old);
+        }
         // Every number and every point is read before anything is written,
         // since one that will not parse loses the document and a half indexed
         // document would leave terms pointing at a number nobody handed out.
         let mut numbers = Vec::new();
         let mut places = Vec::new();
+        let mut vectors = Vec::new();
         for field in schema.iter().filter(|f| !f.noindex) {
-            let geo = match field.kind {
-                Kind::Numeric => false,
-                Kind::Geo => true,
-                _ => continue,
-            };
             let Some(raw) = value(fields, &field.identifier) else {
                 continue;
             };
@@ -295,16 +310,31 @@ impl Index {
                 field: field.attribute.clone(),
                 value: raw.into(),
             };
-            if geo {
-                let Some((lon, lat)) = geos::point(raw) else {
-                    return Err(bad());
-                };
-                places.push((field.attribute.clone(), lon, lat));
-            } else {
-                let Some(number) = number(raw) else {
-                    return Err(bad());
-                };
-                numbers.push((field.attribute.clone(), number));
+            match &field.kind {
+                Kind::Numeric => {
+                    let Some(number) = number(raw) else {
+                        return Err(bad());
+                    };
+                    numbers.push((field.attribute.clone(), number));
+                }
+                Kind::Geo => {
+                    let Some((lon, lat)) = geos::point(raw) else {
+                        return Err(bad());
+                    };
+                    places.push((field.attribute.clone(), lon, lat));
+                }
+                Kind::Vector(vector) => {
+                    // A blob that is not a whole number of coordinates of the
+                    // declared width, or is the wrong number of them, loses the
+                    // document the same way a number that will not parse does.
+                    let read = vecs::read(vector.width, raw)
+                        .filter(|read| read.len() as u64 == vector.dim);
+                    let Some(read) = read else {
+                        return Err(bad());
+                    };
+                    vectors.push((field.attribute.clone(), vector.clone(), read));
+                }
+                _ => continue,
             }
         }
 
@@ -327,6 +357,12 @@ impl Index {
         }
         for (attribute, lon, lat) in places {
             held.geos.entry(attribute).or_default().add(id, lon, lat);
+        }
+        for (attribute, field, read) in vectors {
+            held.vecs
+                .entry(attribute)
+                .or_insert_with(|| Vecs::of(&field))
+                .add(id, &read);
         }
         // The copies a sort reads instead of reading the key back, one per
         // sortable field in the order the schema declares them. A `NOINDEX`
@@ -426,8 +462,15 @@ impl Index {
     /// The terms it was in are left alone, the same as a rewrite, because a
     /// number that means nothing is skipped by whoever walks past it and going
     /// back over every list to take it out is the cost this whole design avoids.
+    ///
+    /// A vector is the one thing that does come out, because nothing walks past
+    /// it: a nearest neighbour search measures every vector in the field and
+    /// then keeps the best few, so one belonging to a document that is gone
+    /// would take a place in the answer away from one that is not.
     pub fn erase(&mut self, key: &[u8]) -> Option<Id> {
-        self.held.docs.remove(key)
+        let id = self.held.docs.remove(key)?;
+        self.held.drop_vectors(id);
+        Some(id)
     }
 }
 

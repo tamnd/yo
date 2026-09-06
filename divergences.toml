@@ -656,3 +656,11 @@ reason = "The tree a profile prints carries a time on every iterator and the lis
 status = "until"
 resolved_by = "M8"
 spec = "09 section 5"
+
+[[divergence]]
+id = "D-91"
+title = "Every vector field is searched exactly, whatever index the schema asked for"
+reason = "A schema declares a vector field as FLAT or as HNSW, and this side stores both the same way: every document's vector at full precision in one flat run of floats, with a KNN and a range each a pass over it. FLAT is exactly that already, so a FLAT field behaves identically. An HNSW field asked for a graph and gets an exact answer instead, which is more than the graph promises rather than less, because a graph is an approximation with a recall short of one and a pass has perfect recall by construction. So an HNSW field on this side never misses a neighbour a real server would have found, and can find one a real server misses. The cost is the pass, which is linear in the number of documents that have written to the field where a graph is meant to be sublinear, and that is the part a later change replaces with a real graph. Everything about the reply is identical in the meantime: the same neighbours come back in the same order, the distances match to the last digit on all four metrics, EF_RUNTIME and the other graph knobs parse and are accepted and simply have nothing to tune, and a query that narrows before it measures narrows first on both sides."
+status = "until"
+resolved_by = "M6"
+spec = "10 section 3"

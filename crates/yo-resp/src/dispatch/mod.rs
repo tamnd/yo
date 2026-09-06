@@ -22664,6 +22664,297 @@ mod tests {
         );
     }
 
+    // --------------------------------------------------------------- vectors
+
+    /// Five documents a unit apart along one axis, written in the opposite
+    /// order to the one they sit in, so a reply in document order and a reply
+    /// in distance order are two different replies.
+    ///
+    /// `d1` is furthest from the origin and `d5` is on it. The text field
+    /// splits them so a query can narrow before it measures: `d1`, `d2` and
+    /// `d4` say `alpha` and the other two say `beta`.
+    fn vectored(f: &mut Fixture) {
+        f.run(&[
+            b"FT.CREATE",
+            b"h",
+            b"SCHEMA",
+            b"t",
+            b"TEXT",
+            b"v",
+            b"VECTOR",
+            b"FLAT",
+            b"6",
+            b"TYPE",
+            b"FLOAT32",
+            b"DIM",
+            b"2",
+            b"DISTANCE_METRIC",
+            b"L2",
+        ]);
+        let at: [&[u8]; 5] = [
+            b"\x00\x00\x80\x40\x00\x00\x00\x00",
+            b"\x00\x00\x40\x40\x00\x00\x00\x00",
+            b"\x00\x00\x00\x40\x00\x00\x00\x00",
+            b"\x00\x00\x80\x3f\x00\x00\x00\x00",
+            b"\x00\x00\x00\x00\x00\x00\x00\x00",
+        ];
+        for (n, point) in at.iter().enumerate() {
+            let key = format!("d{}", n + 1);
+            let word: &[u8] = match n {
+                0 | 1 | 3 => b"alpha",
+                _ => b"beta",
+            };
+            f.run(&[b"HSET", key.as_bytes(), b"t", word, b"v", point]);
+        }
+    }
+
+    /// The origin, which every query below asks about.
+    const ORIGIN: &[u8] = b"\x00\x00\x00\x00\x00\x00\x00\x00";
+
+    /// A `KNN` picks the k nearest and then answers them in document order,
+    /// which is measured: asking for three of five that were written furthest
+    /// first answers the last three written and not the first three.
+    #[test]
+    fn a_knn_picks_the_nearest_and_answers_them_in_document_order() {
+        let mut f = Fixture::new();
+        vectored(&mut f);
+        assert_eq!(
+            f.run(&[
+                b"FT.SEARCH",
+                b"h",
+                b"*=>[KNN 5 @v $vec]",
+                b"PARAMS",
+                b"2",
+                b"vec",
+                ORIGIN,
+                b"DIALECT",
+                b"2",
+                b"NOCONTENT",
+            ]),
+            "*6\r\n:5\r\n$2\r\nd1\r\n$2\r\nd2\r\n$2\r\nd3\r\n$2\r\nd4\r\n$2\r\nd5\r\n"
+        );
+        assert_eq!(
+            f.run(&[
+                b"FT.SEARCH",
+                b"h",
+                b"*=>[KNN 3 @v $vec]",
+                b"PARAMS",
+                b"2",
+                b"vec",
+                ORIGIN,
+                b"DIALECT",
+                b"2",
+                b"NOCONTENT",
+            ]),
+            "*4\r\n:3\r\n$2\r\nd3\r\n$2\r\nd4\r\n$2\r\nd5\r\n"
+        );
+    }
+
+    /// A range takes what is really inside it, where the distances are squared
+    /// so the five documents sit at 16, 9, 4, 1 and 0.
+    #[test]
+    fn a_range_takes_what_is_inside_it_and_the_distance_is_squared() {
+        let mut f = Fixture::new();
+        vectored(&mut f);
+        for (radius, want) in [
+            ("0", "*2\r\n:1\r\n$2\r\nd5\r\n"),
+            ("2", "*3\r\n:2\r\n$2\r\nd4\r\n$2\r\nd5\r\n"),
+            (
+                "9",
+                "*5\r\n:4\r\n$2\r\nd2\r\n$2\r\nd3\r\n$2\r\nd4\r\n$2\r\nd5\r\n",
+            ),
+        ] {
+            let query = format!("@v:[VECTOR_RANGE {radius} $vec]");
+            assert_eq!(
+                f.run(&[
+                    b"FT.SEARCH",
+                    b"h",
+                    query.as_bytes(),
+                    b"PARAMS",
+                    b"2",
+                    b"vec",
+                    ORIGIN,
+                    b"DIALECT",
+                    b"2",
+                    b"NOCONTENT",
+                ]),
+                want,
+                "radius {radius}"
+            );
+        }
+    }
+
+    /// A `KNN` behind a query is the nearest of what the query matched, so
+    /// asking for two of the three documents that say `alpha` answers the two
+    /// of those three that are nearest and not the two nearest overall.
+    #[test]
+    fn a_knn_measures_what_the_query_in_front_of_it_matched() {
+        let mut f = Fixture::new();
+        vectored(&mut f);
+        assert_eq!(
+            f.run(&[
+                b"FT.SEARCH",
+                b"h",
+                b"alpha=>[KNN 2 @v $vec]",
+                b"PARAMS",
+                b"2",
+                b"vec",
+                ORIGIN,
+                b"DIALECT",
+                b"2",
+                b"NOCONTENT",
+            ]),
+            "*3\r\n:2\r\n$2\r\nd2\r\n$2\r\nd4\r\n"
+        );
+    }
+
+    /// A `KNN` counts in whole numbers and a range measures from zero, and the
+    /// two are refused in their own words.
+    ///
+    /// The count is a token of its own and is checked where it stands, ahead of
+    /// the field and ahead of the vector. A count that arrives through `PARAMS`
+    /// is read by looser rules than one written into the query, which is
+    /// measured: a leading plus is fine in a parameter and a syntax error in
+    /// the query text.
+    #[test]
+    fn a_count_and_a_radius_are_refused_in_their_own_words() {
+        let mut f = Fixture::new();
+        vectored(&mut f);
+        let ask = |f: &mut Fixture, query: &str| {
+            f.run(&[
+                b"FT.SEARCH",
+                b"h",
+                query.as_bytes(),
+                b"PARAMS",
+                b"2",
+                b"vec",
+                ORIGIN,
+                b"DIALECT",
+                b"2",
+                b"NOCONTENT",
+            ])
+        };
+        for (query, at, near) in [
+            ("*=>[KNN -1 @v $vec]", 8, "-1"),
+            ("*=>[KNN 1.5 @v $vec]", 8, "1.5"),
+            ("*=>[KNN +3 @v $vec]", 8, "+3"),
+            ("*=>[KNN 0x10 @v $vec]", 8, "0x10"),
+            ("*=>[KNN abc @v $vec]", 8, "abc"),
+            ("*=>[KNN 3 $vec]", 10, "vec"),
+            ("*=>[KNN 3 @v vec]", 13, "vec"),
+            ("@v:[VECTOR_RANGE 2 -1]", 19, "-1"),
+        ] {
+            assert_eq!(
+                ask(&mut f, query),
+                format!("-SEARCH_SYNTAX Syntax error at offset {at} near {near}\r\n"),
+                "{query}"
+            );
+        }
+
+        // Read as a double the way a real server reads it, so the bound plus
+        // thirty two rounds back onto the bound and gets in.
+        let large = "-SEARCH_QUERY_BAD Error parsing vector similarity query: \
+                     query KNN K parameter is too large, must not exceed 288230376151711744\r\n";
+        assert_eq!(
+            ask(&mut f, "*=>[KNN 288230376151711776 @v $vec]"),
+            "*6\r\n:5\r\n$2\r\nd1\r\n$2\r\nd2\r\n$2\r\nd3\r\n$2\r\nd4\r\n$2\r\nd5\r\n"
+        );
+        assert_eq!(ask(&mut f, "*=>[KNN 288230376151711777 @v $vec]"), large);
+        assert_eq!(ask(&mut f, "*=>[KNN 99999999999999999999 @v $vec]"), large);
+
+        for (radius, printed) in [("-1", "-1"), ("-0.5", "-0.5"), ("-1e2", "-100")] {
+            let query = format!("@v:[VECTOR_RANGE {radius} $vec]");
+            assert_eq!(
+                ask(&mut f, &query),
+                format!(
+                    "-SEARCH_QUERY_BAD Error parsing vector similarity query: \
+                     negative radius ({printed}) given in a range query\r\n"
+                ),
+                "{query}"
+            );
+        }
+        // A radius of minus zero is not below zero and is a radius of zero.
+        assert_eq!(
+            ask(&mut f, "@v:[VECTOR_RANGE -0 $vec]"),
+            "*2\r\n:1\r\n$2\r\nd5\r\n"
+        );
+    }
+
+    /// A count passed with `PARAMS` is read the way a real server reads one,
+    /// which is not the way the same digits are read in the query text.
+    #[test]
+    fn a_count_that_came_from_params_is_read_by_its_own_rules() {
+        let mut f = Fixture::new();
+        vectored(&mut f);
+        let ask = |f: &mut Fixture, count: &[u8]| {
+            f.run(&[
+                b"FT.SEARCH",
+                b"h",
+                b"*=>[KNN $k @v $vec]",
+                b"PARAMS",
+                b"4",
+                b"vec",
+                ORIGIN,
+                b"k",
+                count,
+                b"DIALECT",
+                b"2",
+                b"NOCONTENT",
+            ])
+        };
+        let three = "*4\r\n:3\r\n$2\r\nd3\r\n$2\r\nd4\r\n$2\r\nd5\r\n";
+        assert_eq!(ask(&mut f, b"3"), three);
+        assert_eq!(ask(&mut f, b"  3"), three);
+        assert_eq!(ask(&mut f, b"+3"), three);
+        for bad in [
+            &b"3.0"[..],
+            b"0x3",
+            b"-1",
+            b"abc",
+            b"",
+            b"99999999999999999999",
+        ] {
+            let value = String::from_utf8_lossy(bad).into_owned();
+            assert_eq!(
+                ask(&mut f, bad),
+                format!(
+                    "-SEARCH_NUMERIC_VALUE_INVALID Invalid numeric value ({value}) \
+                     for parameter `k`\r\n"
+                ),
+                "{value}"
+            );
+        }
+        assert_eq!(
+            ask(&mut f, b"288230376151711777"),
+            "-SEARCH_QUERY_BAD Error parsing vector similarity query: \
+             query KNN K parameter is too large, must not exceed 288230376151711744\r\n"
+        );
+    }
+
+    /// A vector the wrong size is refused against the field it was passed to,
+    /// naming both sizes in bytes.
+    #[test]
+    fn a_vector_the_wrong_size_is_refused_by_the_field_it_reached() {
+        let mut f = Fixture::new();
+        vectored(&mut f);
+        assert_eq!(
+            f.run(&[
+                b"FT.SEARCH",
+                b"h",
+                b"*=>[KNN 5 @v $vec]",
+                b"PARAMS",
+                b"2",
+                b"vec",
+                b"abc",
+                b"DIALECT",
+                b"2",
+                b"NOCONTENT",
+            ]),
+            "-SEARCH_QUERY_BAD Error parsing vector similarity query: \
+             query vector blob size (3) does not match index's expected size (8).\r\n"
+        );
+    }
+
     // ----------------------------------------------------------- spellcheck
 
     /// The score is how many documents hold the suggestion over how many
