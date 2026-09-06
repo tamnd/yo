@@ -40,7 +40,18 @@ const PLANS: &[&str] = &[
 /// name no key, and what EXEC runs states its own plan when it runs. WATCH does
 /// name keys and is a `point` read of each of them, so the group being here does
 /// not let it through without one either.
-const PLANLESS_GROUPS: &[&str] = &["connection", "scripting", "server", "transactions"];
+///
+/// Pub/sub is on it for all nine. Nothing in the group reads or writes a value,
+/// and the three shard commands that carry a key spec carry it for cluster slot
+/// routing: Redis marks that spec `not_key` itself, which is its way of saying
+/// the argument is hashed and never looked up.
+const PLANLESS_GROUPS: &[&str] = &[
+    "connection",
+    "pubsub",
+    "scripting",
+    "server",
+    "transactions",
+];
 /// The commands allowed to claim the `none` plan outside those groups.
 ///
 /// Two of them, and they are named one by one rather than by widening the group

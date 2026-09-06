@@ -357,6 +357,12 @@ fn exec(server: &Server, session: &mut Session, out: &mut Out) -> Flow {
     // the last, which on a server with one shard thread is true because there is
     // nobody else to run. It is not true with `--threads` above one, and that is
     // D-112.
+    // A real server runs a queued command through `call` and not through
+    // `processCommand`, so the refusals `processCommand` makes are not made
+    // again here. Only one of them can tell the difference today, which is the
+    // RESP2 subscribe mode gate, and this is how it finds out.
+    let was = session.running;
+    session.running = true;
     for wire in &queue.cmds {
         if argv.decode(wire, &limits).is_err() {
             // Unreachable: these bytes were built here from a command that had
@@ -371,6 +377,7 @@ fn exec(server: &Server, session: &mut Session, out: &mut Out) -> Flow {
             flow = Flow::Close;
         }
     }
+    session.running = was;
     flow
 }
 

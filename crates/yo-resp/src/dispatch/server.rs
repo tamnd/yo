@@ -247,6 +247,13 @@ pub(super) fn execute(
             if args.len() > 2 {
                 return Err(args::wrong_arity("ping"));
             }
+            // A RESP2 connection in subscribe mode is answered a two element
+            // array with `pong` in front, so that everything reaching a
+            // subscribed client on RESP2 has the same shape. The one place a
+            // command in this file cares what the connection has subscribed to.
+            if super::pubsub::ping(session, args, out) {
+                return Ok(Flow::Continue);
+            }
             if args.len() == 2 {
                 out.bulk(args.get(1));
             } else {
@@ -275,7 +282,12 @@ pub(super) fn execute(
             // server that nobody is watching. `RESET` inside `MULTI` answers
             // `+RESET` and leaves no transaction, which is why it is one of the
             // six commands a transaction does not queue.
+            // The subscriptions go with them, and for the same reason: a
+            // subscription is a row on the server naming this connection, so
+            // clearing the connection's list alone would leave the server
+            // delivering into a slot that is not listening any more.
             multi::release(server, session);
+            super::pubsub::release(server, session);
             session.reset();
             out.set_proto(Proto::Resp2);
             out.simple(b"RESET");
@@ -1087,9 +1099,10 @@ fn info(server: &Server, args: Args<'_>, out: &mut Out) {
             let _ = write!(
                 s,
                 "# Clients\r\nconnected_clients:{}\r\nblocked_clients:{}\r\n\
-                 cluster_connections:0\r\n\r\n",
+                 pubsub_clients:{}\r\ncluster_connections:0\r\n\r\n",
                 server.totals().clients,
                 server.parked(),
+                server.pubsub_counts().clients,
             );
         }
         if want("memory") {
@@ -1143,13 +1156,15 @@ fn info(server: &Server, args: Args<'_>, out: &mut Out) {
             // cannot be worked out from outside the server.
             let cold = server.cold_stats();
             let totals = server.totals();
+            let subs = server.pubsub_counts();
             let _ = write!(
                 s,
                 "# Stats\r\ntotal_connections_received:{}\r\n\
                  total_commands_processed:{}\r\nexpired_keys:{}\r\n\
                  evicted_keys:{}\r\nyo_cold_demoted:{}\r\nyo_cold_promoted:{}\r\n\
                  yo_cold_faults:{}\r\nyo_cold_served:{}\r\nyo_cold_bytes_out:{}\r\n\
-                 yo_cold_bytes_in:{}\r\n\r\n",
+                 yo_cold_bytes_in:{}\r\npubsub_channels:{}\r\n\
+                 pubsub_patterns:{}\r\npubsubshard_channels:{}\r\n\r\n",
                 totals.connections,
                 totals.commands,
                 server.expired_keys(),
@@ -1160,6 +1175,9 @@ fn info(server: &Server, args: Args<'_>, out: &mut Out) {
                 cold.served,
                 cold.bytes_out,
                 cold.bytes_in,
+                subs.channels,
+                subs.patterns,
+                subs.shard,
             );
         }
         if want("cpu") {

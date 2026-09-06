@@ -322,6 +322,11 @@ impl<S: Sink> Front<S> {
                 (self.conns.len() - 1) as ConnId
             }
         };
+        // The session carries the slot from here, because the slot is what a
+        // subscription on the server names and the front is the only place that
+        // knows it. Both arms above make a fresh session, so this is the one
+        // place it has to be said.
+        self.conns[at as usize].session.set_conn(at);
         self.note_size(at);
         at
     }
@@ -486,12 +491,6 @@ impl<S: Sink> Front<S> {
         }
     }
 
-    /// Hand the slot and its buffers back, and say which client has gone.
-    ///
-    /// `None` for a slot that was already closed. The id is what the server
-    /// finds a waiter by, and the caller forgets it before anything else runs,
-    /// because this slot is on the free list from here and the next accept
-    /// hands it to somebody else.
     /// The session on a connection, for the server side of it going away.
     ///
     /// `None` for a slot that is already free, so that closing twice is not two
@@ -501,6 +500,12 @@ impl<S: Sink> Front<S> {
         c.live.then_some(&mut c.session)
     }
 
+    /// Hand the slot and its buffers back, and say which client has gone.
+    ///
+    /// `None` for a slot that was already closed. The id is what the server
+    /// finds a waiter by, and the caller forgets it before anything else runs,
+    /// because this slot is on the free list from here and the next accept
+    /// hands it to somebody else.
     pub(crate) fn close(&mut self, conn: ConnId) -> Option<u64> {
         {
             let c = &mut self.conns[conn as usize];

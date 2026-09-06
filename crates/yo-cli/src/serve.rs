@@ -594,7 +594,7 @@ impl<'a> Worker<'a> {
             let engine = self.reactor.engine();
             let wait = if idle <= SPIN_TURNS {
                 Duration::ZERO
-            } else if engine.owed() > 0 || engine.waiting() > 0 {
+            } else if engine.owed() > 0 || engine.waiting() > 0 || engine.posted() > 0 {
                 OWED_WAIT
             } else {
                 IDLE_WAIT
