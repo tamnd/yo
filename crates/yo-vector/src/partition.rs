@@ -1331,12 +1331,24 @@ impl Partitions {
                 sqdist(&xs[i * dim..(i + 1) * dim], &a) <= sqdist(&xs[i * dim..(i + 1) * dim], &b)
             })
             .collect();
-        // A thousand copies of the same vector is one point as far as two means
-        // is concerned, and there is no cut that divides it. Put them back, and
-        // do not come back until the posting has doubled, so that a collection
-        // that really is all one vector costs a re-encode of it a logarithmic
-        // number of times rather than once per insert.
-        if sides.iter().all(|&s| s) || sides.iter().all(|&s| !s) {
+        // A cut that leaves one side small enough to merge straight back has not
+        // divided anything, and taking it is worse than leaving the posting
+        // alone. A thousand copies of the same vector is the obvious case: two
+        // means sees one point, everything lands on one side, and there is no
+        // cut at all. The case that actually bit is milder and does not look
+        // like a problem from inside the split. One outlier in an otherwise
+        // round cloud gets cut off on its own, `merge` sees a partition of one,
+        // hands the outlier back to its nearest centroid, which is the partition
+        // it just came out of, and that partition is over the limit again. Split
+        // and merge then take turns for as long as anyone is willing to call
+        // `maintain`, at a full budget a call, on a collection that is not
+        // changing. So both cases put the members back and do not come back
+        // until the posting has doubled, which costs a collection that really is
+        // all one vector a re-encode a logarithmic number of times rather than
+        // once per insert.
+        let small = sides.iter().filter(|&&s| s).count();
+        let small = small.min(members.len() - small);
+        if small == 0 || small * 4 < self.tuning.posting {
             for (i, m) in members.iter().enumerate() {
                 self.place(p, m.id, m.tag, &xs[i * dim..(i + 1) * dim]);
             }
@@ -2100,7 +2112,10 @@ mod tests {
         let mut v: Vec<f32> = (0..dim)
             .map(|i| {
                 let u = (rng.next_u64() >> 40) as f32 / (1u32 << 24) as f32;
-                let heavy = if i < dim / 16 { 6.0 } else { 1.0 };
+                // At least one, so that a narrow corpus is a smaller version of
+                // a wide one rather than uniform noise where nothing is near
+                // anything and no quantiser can pick out a nearest anything.
+                let heavy = if i < (dim / 16).max(1) { 6.0 } else { 1.0 };
                 (u * 2.0 - 1.0) * heavy
             })
             .collect();
@@ -2523,6 +2538,39 @@ mod tests {
         // And it still answers.
         let hits = ix.search(&store.0[599], 1, &store);
         assert_eq!(hits[0].id, 599);
+    }
+
+    /// Maintenance finishes, rather than taking turns with itself forever.
+    ///
+    /// A settled collection that nobody is writing to should have nothing left
+    /// for `maintain` to do, and for a long time one shape of collection had an
+    /// endless amount. A cloud with one outlier in it splits into the cloud and
+    /// the outlier, the outlier is a partition of one so `merge` gives it back
+    /// to its nearest centroid, which is the cloud it just came out of, and the
+    /// cloud is over the limit again. Nothing about that is visible from inside
+    /// either job. Both of them do exactly what they are for, the collection
+    /// does not change, and every call to `maintain` spends its whole budget.
+    ///
+    /// It was found under Miri, where a hundred and sixty vectors took longer
+    /// than fifteen minutes, and it is checked here across a spread of posting
+    /// sizes because whether a given corpus falls into it depends on where the
+    /// merge threshold lands relative to the cut two means happens to make.
+    /// Twelve is the size that caught it. Six and sixteen, on the same vectors,
+    /// settle in a few hundred.
+    #[test]
+    fn maintenance_runs_out_of_things_to_do() {
+        for posting in [6, 8, 12, 16, 24] {
+            let store = corpus(16, 160, 4, 11);
+            let tuning = Tuning {
+                posting,
+                ..Tuning::default()
+            };
+            let mut ix = build(&store, 16, tuning);
+            let left = ix.maintain(&store, 1 << 20);
+            assert_eq!(left, 0, "a posting of {posting} never settles");
+            consistent(&ix);
+            assert_eq!(ix.len(), 160, "settling lost something");
+        }
     }
 
     #[test]
