@@ -410,6 +410,12 @@ impl<S: Sink> Wire<S> {
 
     /// Hand the slot and its buffers back, and let the server go of the client.
     fn release(&mut self, conn: ConnId) {
+        // Before the slot goes back, because the watches this connection took
+        // are rows on the server and the session that names them is about to be
+        // reused by whoever gets the slot next.
+        if let Some(session) = self.front.session_mut(conn) {
+            dispatch::forget_session(&self.server, session);
+        }
         let Some(client) = self.front.close(conn) else {
             return;
         };
