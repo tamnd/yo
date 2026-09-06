@@ -86,6 +86,8 @@
 //! the total a client sees is how many rows the window could actually build,
 //! which is why the loading happens before the first byte goes out.
 
+use std::time::{Duration, Instant};
+
 use yo_common::geo;
 use yo_common::num::parse_f64;
 use yo_common::{Result, parse_i64};
@@ -113,9 +115,32 @@ use crate::reply::Out;
 mod aggregate;
 mod config;
 pub(super) mod cursor;
+mod profile;
 
 use aggregate::{Pipe, Reads, Shape, apply, group, keeps, piped, sorts, windows};
 use cursor::{Asks, Kept, Made};
+
+/// What somebody profiling a search or an aggregation wants to know about the
+/// run, filled in as it goes and read once it is over.
+///
+/// Nothing here is looked at unless a client asked for it. A search that nobody
+/// is watching builds none of it, which is why the walk only puts a tree
+/// together when this is present.
+#[derive(Default)]
+pub(super) struct Watch {
+    /// How long the arguments and the query took to read.
+    pub(super) parsing: Duration,
+    /// How long the query took to turn into something walkable, after it had
+    /// been read and before the first document was asked for.
+    pub(super) creating: Duration,
+    /// How long the walk took, from the first document asked for to the last
+    /// one answered.
+    pub(super) walking: Duration,
+    /// What the walk turned out to be.
+    pub(super) ran: Option<walk::Ran>,
+    /// Each step the rows went through and how many of them came out of it.
+    pub(super) steps: Vec<(Vec<u8>, usize)>,
+}
 
 /// The languages a document may be stemmed in, in the spelling `FT.INFO`
 /// reports them in.
@@ -2498,6 +2523,7 @@ fn step<'a>(
     if count == b"*" {
         asked.pipe.all = true;
         asked.pipe.loader = true;
+        asked.pipe.loads = true;
         return Ok(Some(at + 2));
     }
     let Some(count) = parse_i64(count) else {
@@ -2540,6 +2566,9 @@ fn step<'a>(
             }
         };
         asked.pipe.load.push((field, name));
+        // A sortable field is held beside the document number, so naming one is
+        // not on its own a reason to open the key.
+        asked.pipe.loads |= !index.field(field).is_some_and(|held| held.sortable);
         // The same pair again for the pipeline, which reads a row by position
         // rather than by name. A name loaded twice is answered once and located
         // once, so the second copy is dropped here rather than later.
@@ -3274,8 +3303,37 @@ struct Row {
 /// between them, and the lock is held for exactly as long as the first half
 /// takes.
 pub(super) fn find(server: &Server, db: usize, args: Args<'_>, out: &mut Out) -> Result<()> {
+    searched(server, db, args, 2, None, out)
+}
+
+/// `FT.PROFILE index SEARCH|AGGREGATE [LIMITED] QUERY query [options]`.
+///
+/// # Errors
+///
+/// The arity line, when the words run out before the query does.
+pub(super) fn profiled(server: &Server, db: usize, args: Args<'_>, out: &mut Out) -> Result<()> {
+    profile::run(server, db, args, out)
+}
+
+/// The same, with the query somewhere other than the third word and with
+/// somebody watching.
+///
+/// `FT.PROFILE` runs a search through here with its own words in front, so what
+/// moves is where the query sits and where the options start after it. Nothing
+/// else about the search changes, which is the point: a profiled search is the
+/// same search.
+pub(super) fn searched(
+    server: &Server,
+    db: usize,
+    args: Args<'_>,
+    at: usize,
+    watch: Option<&mut Watch>,
+    out: &mut Out,
+) -> Result<()> {
+    let mut watch = watch;
     let name = args.get(1);
-    let query = args.get(2);
+    let query = args.get(at);
+    let clock = Instant::now();
     let mut asked;
     // The name the index is held under, which is not always the name the client
     // used, since an alias reaches the same index. A cursor is kept under the
@@ -3291,7 +3349,7 @@ pub(super) fn find(server: &Server, db: usize, args: Args<'_>, out: &mut Out) ->
             Fail::naming(MISSING, name).write(out);
             return Ok(());
         };
-        asked = match options(args, 3, Mode::Search, index) {
+        asked = match options(args, at + 1, Mode::Search, index) {
             Ok(asked) => asked,
             Err(text) => {
                 out.error(&text);
@@ -3327,16 +3385,65 @@ pub(super) fn find(server: &Server, db: usize, args: Args<'_>, out: &mut Out) ->
         if asked.rows.summarize.is_some() || asked.rows.highlight.is_some() {
             asked.rows.wanted = Wanted::of(&node);
         }
-        gather(
+        if let Some(watch) = watch.as_deref_mut() {
+            watch.parsing = clock.elapsed();
+        }
+        let shaped = shape(node, index, &asked.rows);
+        if let Some(watch) = watch.as_deref_mut() {
+            watch.creating = clock.elapsed() - watch.parsing;
+        }
+        let (total, rows, ran) = gather(
             index,
-            shape(node, index, &asked.rows),
+            shaped,
             &asked.rows,
             Order::Ranked,
             false,
-        )
+            watch.is_some(),
+        );
+        if let Some(watch) = watch.as_deref_mut()
+            && let Some((ran, spent)) = ran
+        {
+            watch.ran = Some(ran);
+            watch.walking = spent;
+        }
+        (total, rows)
     };
+    if let Some(watch) = watch {
+        watch.steps = searching(&asked.rows, total, rows.len());
+    }
     write(server, db, total, &rows, &asked, &canon, out);
     Ok(())
+}
+
+/// What a search ran the documents that answered through, and how many of them
+/// came out of each step.
+///
+/// Measured against a real server, on which the counts are the number of rows
+/// the step handed on rather than the number it was given. The window is what
+/// separates the first two from the rest: everything that answered is scored
+/// and only what the window kept is sorted, loaded and marked up.
+fn searching(rows: &Rows<'_>, total: usize, window: usize) -> Vec<(Vec<u8>, usize)> {
+    let mut out = vec![(b"Index".to_vec(), total)];
+    // A window of nothing is a client asking for the total and nothing else, so
+    // there is nothing to score and nothing to sort. Measured: `LIMIT 0 0`
+    // answers an index step and a counter and no other step at all.
+    if rows.count == 0 {
+        out.push((b"Counter".to_vec(), 1));
+        return out;
+    }
+    // A sort by a field does not need a score, and asking for the scores puts
+    // the step back whether or not anything is ordered by them.
+    if rows.sorting.is_none() || rows.scores {
+        out.push((b"Scorer".to_vec(), total));
+    }
+    out.push((b"Sorter".to_vec(), window));
+    if rows.content {
+        out.push((b"Loader".to_vec(), window));
+        if rows.summarize.is_some() || rows.highlight.is_some() {
+            out.push((b"Highlighter".to_vec(), window));
+        }
+    }
+    out
 }
 
 /// `FT.AGGREGATE index query [options]`.
@@ -3346,8 +3453,23 @@ pub(super) fn find(server: &Server, db: usize, args: Args<'_>, out: &mut Out) ->
 /// back in the order the index holds them, and a row is a list of properties
 /// rather than a key with its fields hung off it.
 pub(super) fn roll(server: &Server, db: usize, args: Args<'_>, out: &mut Out) -> Result<()> {
+    aggregated(server, db, args, 2, None, out)
+}
+
+/// The same, with the query somewhere other than the third word and with
+/// somebody watching, which is how `FT.PROFILE` runs an aggregation.
+pub(super) fn aggregated(
+    server: &Server,
+    db: usize,
+    args: Args<'_>,
+    at: usize,
+    watch: Option<&mut Watch>,
+    out: &mut Out,
+) -> Result<()> {
+    let mut watch = watch;
     let name = args.get(1);
-    let query = args.get(2);
+    let query = args.get(at);
+    let clock = Instant::now();
     let asked;
     let mut canon: Box<[u8]> = Box::default();
     let (total, rows) = {
@@ -3356,7 +3478,7 @@ pub(super) fn roll(server: &Server, db: usize, args: Args<'_>, out: &mut Out) ->
             Fail::naming(MISSING, name).write(out);
             return Ok(());
         };
-        asked = match options(args, 3, Mode::Aggregate, index) {
+        asked = match options(args, at + 1, Mode::Aggregate, index) {
             Ok(asked) => asked,
             Err(text) => {
                 out.error(&text);
@@ -3391,15 +3513,31 @@ pub(super) fn roll(server: &Server, db: usize, args: Args<'_>, out: &mut Out) ->
             true => Order::Backwards,
             false => Order::Forwards,
         };
-        gather(
+        if let Some(watch) = watch.as_deref_mut() {
+            watch.parsing = clock.elapsed();
+        }
+        let shaped = shape(node, index, &asked.rows);
+        if let Some(watch) = watch.as_deref_mut() {
+            watch.creating = clock.elapsed() - watch.parsing;
+        }
+        let (total, rows, ran) = gather(
             index,
-            shape(node, index, &asked.rows),
+            shaped,
             &asked.rows,
             order,
             !asked.pipe.steps.is_empty(),
-        )
+            watch.is_some(),
+        );
+        if let Some(watch) = watch.as_deref_mut() {
+            if let Some((ran, spent)) = ran {
+                watch.ran = Some(ran);
+                watch.walking = spent;
+            }
+            watch.steps.push((b"Index".to_vec(), total));
+        }
+        (total, rows)
     };
-    rolled(server, db, total, &rows, &asked, &canon, out);
+    rolled(server, db, total, &rows, &asked, &canon, watch, out);
     Ok(())
 }
 
@@ -3409,6 +3547,7 @@ pub(super) fn roll(server: &Server, db: usize, args: Args<'_>, out: &mut Out) ->
 /// when it is. What it really reports is how far the reply has got through
 /// them, which is why it changes with the protocol and with whether anything
 /// asked for a field. The four cases are set out where they are worked out.
+#[allow(clippy::too_many_arguments)]
 fn rolled(
     server: &Server,
     db: usize,
@@ -3416,10 +3555,11 @@ fn rolled(
     rows: &[Row],
     asked: &Asked<'_>,
     index: &[u8],
+    watch: Option<&mut Watch>,
     out: &mut Out,
 ) {
     if !asked.pipe.steps.is_empty() {
-        piped(server, db, total, rows, asked, index, out);
+        piped(server, db, total, rows, asked, index, watch, out);
         return;
     }
     let pipe = &asked.pipe;
@@ -3449,6 +3589,16 @@ fn rolled(
         }
     }
     let total = total - lost;
+    // The same two steps a pipeline reports, for a pipeline that has no steps
+    // of its own. A bare `LOAD` still opens the key it names.
+    if let Some(watch) = watch {
+        if pipe.addscores {
+            watch.steps.push((b"Scorer".to_vec(), built.len()));
+        }
+        if pipe.loads {
+            watch.steps.push((b"Loader".to_vec(), built.len()));
+        }
+    }
     if let Some(asks) = asked.cursor {
         // A cursor holds the rows rather than the documents they were read
         // from, so what is handed over here is a copy. `LIMIT 0 0` is the one
@@ -3708,14 +3858,25 @@ fn gather(
     rows: &Rows<'_>,
     order: Order,
     whole: bool,
-) -> (usize, Vec<Row>) {
+    profiling: bool,
+) -> (usize, Vec<Row>, Option<(walk::Ran, Duration)>) {
     let facts = index.held.facts();
     // How far apart the words landed is worked out only for the three scorers
     // that divide by it, because it costs a pass over the places of every
     // document that answered and the scorer nobody names is not one of them.
-    let walked = match rows.scorer.divides() {
-        true => walk::spaced(&index.held, &node),
-        false => walk::run(&index.held, &node),
+    let measure = rows.scorer.divides();
+    let mut ran = None;
+    let mut spent = Duration::ZERO;
+    let walked = if profiling {
+        let clock = Instant::now();
+        let (walked, tree) = walk::profiled(&index.held, &node, measure);
+        spent = clock.elapsed();
+        ran = Some(tree);
+        walked
+    } else if measure {
+        walk::spaced(&index.held, &node)
+    } else {
+        walk::run(&index.held, &node)
     };
     let mut found: Vec<(walk::Hit<'_>, f64)> = walked
         .into_iter()
@@ -3814,7 +3975,7 @@ fn gather(
             })
         })
         .collect();
-    (total, window)
+    (total, window, ran.map(|ran| (ran, spent)))
 }
 
 /// A row that survived the read, with the fields the reply wants off its key.

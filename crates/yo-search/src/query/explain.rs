@@ -343,7 +343,7 @@ fn sentence(vector: &Vector) -> Vec<u8> {
 }
 
 /// Six decimal places, which is what C's `%f` gives and what the printout has.
-fn fixed(value: f64) -> String {
+pub(crate) fn fixed(value: f64) -> String {
     if value.is_infinite() {
         return if value > 0.0 {
             "inf".to_owned()

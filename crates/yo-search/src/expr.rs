@@ -199,6 +199,38 @@ enum Op {
     Pow,
 }
 
+impl Op {
+    /// Whether this asks a question about its two sides rather than working a
+    /// new value out of them, which is what tells a filter's predicate from a
+    /// projection's operator.
+    fn asks(self) -> bool {
+        matches!(
+            self,
+            Op::Or | Op::And | Op::Eq | Op::Ne | Op::Lt | Op::Le | Op::Gt | Op::Ge
+        )
+    }
+
+    /// How the operator is written, which is how a profile prints it.
+    fn written(self) -> &'static [u8] {
+        match self {
+            Op::Or => b"||",
+            Op::And => b"&&",
+            Op::Eq => b"==",
+            Op::Ne => b"!=",
+            Op::Lt => b"<",
+            Op::Le => b"<=",
+            Op::Gt => b">",
+            Op::Ge => b">=",
+            Op::Add => b"+",
+            Op::Sub => b"-",
+            Op::Mul => b"*",
+            Op::Div => b"/",
+            Op::Rem => b"%",
+            Op::Pow => b"^",
+        }
+    }
+}
+
 /// One function, named the way the parser found it so an error can quote the
 /// client's own spelling back.
 #[derive(Debug)]
@@ -324,6 +356,50 @@ impl Expr {
     /// error a step reports before a single row has been looked at.
     pub fn bind(&mut self, at: &mut dyn FnMut(&[u8]) -> Option<usize>) -> Result<(), Unknown> {
         bind(&mut self.node, at)
+    }
+
+    /// What a profile calls this expression.
+    ///
+    /// The outermost piece and nothing under it, which is what a real server
+    /// prints beside the step that runs it: `@n*2` is an operator and a star,
+    /// `@n>5` is a predicate and a caret, `1` is a literal and its digit. The
+    /// difference between an operator and a predicate is what the answer is
+    /// used for rather than how it was written, so the comparisons and the two
+    /// words that join them are predicates and the arithmetic is not.
+    #[must_use]
+    pub fn about(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        match &self.node {
+            Node::Value(value) => {
+                out.extend_from_slice(b"Literal ");
+                match value {
+                    Value::Number(n) => out.extend_from_slice(twelve(*n).as_bytes()),
+                    Value::Text(text) => out.extend_from_slice(text),
+                    _ => {}
+                }
+            }
+            Node::Named(name) => {
+                out.extend_from_slice(b"Property ");
+                out.extend_from_slice(name);
+            }
+            Node::Slot(_, name) => {
+                out.extend_from_slice(b"Property ");
+                out.extend_from_slice(name);
+            }
+            Node::Not(_) => out.extend_from_slice(b"Inverted"),
+            Node::Op(op, ..) => {
+                out.extend_from_slice(match op.asks() {
+                    true => b"Predicate ".as_slice(),
+                    false => b"Operator ".as_slice(),
+                });
+                out.extend_from_slice(op.written());
+            }
+            Node::Call(func, _) => {
+                out.extend_from_slice(b"Function ");
+                out.extend_from_slice(&func.spelled);
+            }
+        }
+        out
     }
 
     /// Works the expression out over one row.

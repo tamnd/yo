@@ -90,6 +90,7 @@ const PLANLESS_COMMANDS: &[&str] = &[
     "FT.SYNDUMP",
     "FT.SPELLCHECK",
     "FT.CONFIG",
+    "FT.PROFILE",
 ];
 /// The bound or materialise verdicts.
 const BOUNDED: &[&str] = &["inherent", "yes", "risk"];
