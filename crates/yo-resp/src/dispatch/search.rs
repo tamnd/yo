@@ -3330,6 +3330,25 @@ fn refused(bad: &Bad) -> Vec<u8> {
             out.extend_from_slice(b"` already exists in schema");
             out
         }
+        // The whole family says which parser was reading at the end of the
+        // line, because the same seven sentences come back from a range clause
+        // and a nearest neighbour clause and there would otherwise be nothing
+        // in them saying it was the vector half of the query that objected.
+        Bad::Option(why) => {
+            let mut out = why.code().as_bytes().to_vec();
+            out.push(b' ');
+            out.extend_from_slice(why.words().as_bytes());
+            out.extend_from_slice(b" (Error parsing vector similarity parameters)");
+            out
+        }
+        Bad::Twice(first, second) => {
+            let mut out =
+                b"SEARCH_FIELD_DUP Distance field was specified twice for vector query: ".to_vec();
+            out.extend_from_slice(first);
+            out.extend_from_slice(b" and ");
+            out.extend_from_slice(second);
+            out
+        }
         Bad::Plain(text) => line("SEARCH_SYNTAX ", text.as_bytes(), ""),
         Bad::Refused(text) => line("SEARCH_QUERY_BAD ", text.as_bytes(), ""),
     }
