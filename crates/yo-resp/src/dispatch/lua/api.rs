@@ -32,7 +32,7 @@ use crate::reply::Out;
 use crate::request::{Argv, Step};
 use mlua::{Lua, MultiValue, Scope, Table, Value, ffi};
 use std::cell::{Cell, RefCell};
-use std::os::raw::{c_char, c_int};
+use std::os::raw::c_int;
 
 /// Everything one running script is allowed to reach.
 pub(super) struct Ctx<'a> {
@@ -151,8 +151,8 @@ pub(super) fn statics(lua: &Lua, raw: &Table) -> mlua::Result<()> {
     Ok(())
 }
 
-/// Call the Lua function the registry holds under `key` with the arguments this
-/// one was called with, and answer everything it answered.
+/// Call the Lua function this one carries as its first upvalue with the
+/// arguments this one was called with, and answer everything it answered.
 ///
 /// Nothing here catches anything. A failure inside the function jumps straight
 /// out through this frame the way it would through any other C function, which
@@ -162,8 +162,9 @@ pub(super) fn statics(lua: &Lua, raw: &Table) -> mlua::Result<()> {
 /// # Safety
 ///
 /// Lua calls this with a state whose stack holds only the arguments, which is
-/// what the stack arithmetic below assumes.
-unsafe fn forward(state: *mut mlua::lua_State, key: *const c_char) -> c_int {
+/// what the stack arithmetic below assumes, and only ever as a closure that
+/// [`bridge`] built, which is where the upvalue comes from.
+unsafe extern "C-unwind" fn forward(state: *mut mlua::lua_State) -> c_int {
     // SAFETY: the caller is Lua, so the state is live and the stack is the one
     // it just built for this call. Room for one more slot is asked for before
     // anything is pushed, and the count handed to `lua_call` is the count that
@@ -173,82 +174,45 @@ unsafe fn forward(state: *mut mlua::lua_State, key: *const c_char) -> c_int {
         if ffi::lua_checkstack(state, 1) == 0 {
             return 0;
         }
-        ffi::lua_getfield(state, ffi::LUA_REGISTRYINDEX, key);
+        ffi::lua_pushvalue(state, ffi::lua_upvalueindex(1));
         ffi::lua_insert(state, 1);
         ffi::lua_call(state, given, ffi::LUA_MULTRET);
         ffi::lua_gettop(state)
     }
 }
 
-/// The library functions a script reaches through a C function of ours.
+/// The function the prelude puts in front of every library function it wrote.
 ///
-/// Every one of these is written in Lua and every one of them can fail, and
+/// Every library function is written in Lua and every one of them can fail, and
 /// those two facts together are the reason for the indirection. Lua 5.1 throws
 /// the caller's stack frame away on `return f(...)` when `f` is a Lua function
-/// and keeps it when `f` is a C function. A real server's library is C, so
+/// and keeps it when `f` is a C function. A real server's libraries are C, so
 /// `return redis.call('get', KEYS[1])` still knows it was on line one of the
 /// script when the call fails. Ours would have reported `(tail call)` and no
 /// line at all, on the single most common line anybody writes.
 ///
-/// So each name below is a C function that does nothing but call the Lua one.
-/// The frame survives, and because the jump out of a failure goes through C
-/// rather than through Rust, what the script raised is still the table it
-/// raised rather than something wrapped on the way past.
+/// So what comes back from here is a C function that does nothing but call the
+/// Lua one it was handed. The frame survives, and because the jump out of a
+/// failure goes through C rather than through Rust, what the script raised is
+/// still the table it raised rather than something wrapped on the way past.
 ///
-/// One group of names per library, because the registry key a bridge reads from
-/// is written into the C function at compile time and two libraries may want
-/// the same name.
-macro_rules! bridges {
-    ($($group:ident($prefix:literal) { $($rust:ident => $name:literal,)* })*) => {
-        $(
-            $(
-                unsafe extern "C-unwind" fn $rust(state: *mut mlua::lua_State) -> c_int {
-                    // SAFETY: Lua is the only caller and the name is a literal
-                    // with its terminator written into it, so it is a C string.
-                    unsafe { forward(state, concat!("yo_", $prefix, $name, "\0").as_ptr().cast()) }
-                }
-            )*
-
-            /// Put a C function on the library for each Lua one the prelude wrote.
-            pub(super) fn $group(lua: &Lua, lib: &Table, written: &Table) -> mlua::Result<()> {
-                $(
-                    let body: mlua::Function = written.raw_get($name)?;
-                    lua.set_named_registry_value(concat!("yo_", $prefix, $name), &body)?;
-                    // SAFETY: the function is the one just above, and all it
-                    // does is hand the call on to a Lua function that is in the
-                    // registry before the name it is under is reachable.
-                    lib.raw_set($name, unsafe { lua.create_c_function($rust) }?)?;
-                )*
-                Ok(())
-            }
-        )*
-    };
-}
-
-bridges! {
-    bridges("") {
-        bridge_call => "call",
-        bridge_sha1hex => "sha1hex",
-        bridge_setresp => "setresp",
-        bridge_log => "log",
-        bridge_set_repl => "set_repl",
-        bridge_acl_check_cmd => "acl_check_cmd",
-    }
-
-    bit_bridges("bit_") {
-        bridge_tobit => "tobit",
-        bridge_tohex => "tohex",
-        bridge_bnot => "bnot",
-        bridge_bswap => "bswap",
-        bridge_band => "band",
-        bridge_bor => "bor",
-        bridge_bxor => "bxor",
-        bridge_lshift => "lshift",
-        bridge_rshift => "rshift",
-        bridge_arshift => "arshift",
-        bridge_rol => "rol",
-        bridge_ror => "ror",
-    }
+/// The Lua one rides along as an upvalue rather than sitting under a name
+/// somewhere, which is what lets the prelude build a bridge whenever it likes
+/// rather than only while the interpreter is being set up. `cjson.new()` needs
+/// that, since it hands a script a fresh table of functions in the middle of a
+/// script.
+pub(super) fn bridge(lua: &Lua) -> mlua::Result<mlua::Function> {
+    lua.create_function(|lua, body: mlua::Function| {
+        // SAFETY: `exec_raw` pushes the one argument and hands over a stack
+        // that holds nothing else, so the closure below takes that function off
+        // and leaves the C one in its place, which is the single value the call
+        // then reads back.
+        unsafe {
+            lua.exec_raw::<mlua::Function>(body, |state| {
+                ffi::lua_pushcclosure(state, forward, 1);
+            })
+        }
+    })
 }
 
 /// Put the two functions that need the server into the raw table for one run.

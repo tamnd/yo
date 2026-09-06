@@ -746,3 +746,17 @@ title = "SCRIPT DEBUG takes the mode and there is no debugger behind it"
 reason = "A real server answering YES or SYNC puts the connection into a Lua debugging session, where the next EVAL forks a child, stops on the first line and talks a line protocol back over the same connection until the client is done stepping. It is a whole second protocol on top of RESP and it needs a fork to be safe, since the debugged script is allowed to write and the session is allowed to be abandoned. Neither of those exists here, so the mode is validated and dropped and scripts run the way they always do. A client that turns the debugger off, which is what a library does defensively at the start of a connection, gets the same OK it would get anywhere. A client that turns it on gets an OK and then a script that runs to the end instead of stopping, which is the wrong answer, and the alternative of refusing YES outright would break the defensive NO case for nobody's benefit since a client that wanted to step would find out one command later either way."
 status = "permanent"
 spec = "12 section 7"
+
+[[divergence]]
+id = "D-105"
+title = "cjson settings go back to their defaults at the end of every script"
+reason = "A real server has one Lua interpreter for the whole process, so cjson.encode_max_depth(20) in one script is still in force for the next script and for every other connection, and that is documented behaviour a few libraries lean on. This server has an interpreter per thread, so keeping a setting would mean a script got whatever the last script that happened to land on the same thread left behind, which is a different answer depending on which thread took the connection and is worse than either choice made on purpose. Every script therefore starts from the settings the library ships with. A script that sets one and reads it back in the same run sees what it set, which covers the case that actually shows up, and a script that expects a setting to outlive it gets the defaults rather than a coin toss. Making it stick would mean one shared interpreter behind a lock, which is the thing this server is built not to have."
+status = "permanent"
+spec = "12 section 7"
+
+[[divergence]]
+id = "D-106"
+title = "cjson refuses a document nested deeper than two thousand whatever the limit says"
+reason = "Both halves of the library are plain recursion in Rust, one frame per level, so the depth a document can reach is bounded by the thread stack rather than by the setting. The setting is honoured up to two thousand levels, which is twice the default limit of a thousand, and past that the answer is the same sentence the configured limit gives rather than a crash. The only script this is visible to is one that raised encode_max_depth or decode_max_depth above two thousand on purpose and then handed over a document deeper than that, which is not a shape any real payload has. Lifting it would mean writing both halves with an explicit stack, which costs every ordinary document a heap allocation and a slower inner loop to make a pathological one work."
+status = "permanent"
+spec = "12 section 7"
