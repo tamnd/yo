@@ -183,22 +183,30 @@ jobs:
       # splitting itself, so no list of test names has to be kept true here as
       # tests are added.
       #
-      # Five crates are left out, and it is worth being straight about what that
-      # costs. `yo-kv`, `yo-vector`, `yo-graph`, `yo-doc` and `yo-index` have
-      # about a hundred and fifty tests between them that take over two minutes
-      # each interpreted and about thirty that run past forty. They are slow
-      # because of what they measure: a recall figure over a few thousand
-      # vectors is a few thousand times the arithmetic of an ordinary test, and
-      # a betweenness score checked against its own definition is the definition
-      # walked. There is no smaller version of either that measures the same
-      # thing, so the fix is to go through them test by test, shrinking the ones
-      # where the count is incidental and skipping the ones where the count is
-      # the claim, which is what `yo-resp` got and what these need. That is its
-      # own piece of work and it is issue 418.
+      # Four crates are left out, and it is worth being straight about what that
+      # costs. `yo-kv`, `yo-vector`, `yo-graph` and `yo-doc` have about a
+      # hundred and fifty tests between them that take over two minutes each
+      # interpreted and about thirty that run past forty. They are slow because
+      # of what they measure: a recall figure over a few thousand vectors is a
+      # few thousand times the arithmetic of an ordinary test, and a betweenness
+      # score checked against its own definition is the definition walked. There
+      # is no smaller version of either that measures the same thing, so the fix
+      # is to go through them test by test, shrinking the ones where the count is
+      # incidental and skipping the ones where the count is the claim, which is
+      # what `yo-resp` got and what these need. That is its own piece of work and
+      # it is issue 418.
       #
-      # Three of the five have no unsafe code of their own. The other two have
-      # ten blocks between them, and those are uninterpreted until this is
-      # finished, which is the real cost of leaving them out.
+      # `yo-index` was the fifth and is back in. It took one number: the walk
+      # that grows the map underneath itself put 64 keys back for every 8 it
+      # walked, so the map grew eight times faster than the walk ate it and the
+      # loop ran until the directory had doubled its way out from under the whole
+      # thing. That number was left at 64 when the starting population was cut
+      # for Miri, which kept the ratio and so kept the cost. The crate now runs
+      # all 57 of its tests in under seven minutes.
+      #
+      # Three of the four that are left have no unsafe code of their own.
+      # `yo-kv` has eighteen unsafe lines and those are uninterpreted until this
+      # is finished, which is the real cost of leaving it out.
       - id: shards
         run: |
           rm rust-toolchain.toml
@@ -208,7 +216,7 @@ jobs:
           # which is a syntax error the runner reports six lines away from the
           # cause. The run step below passes each field as its own argument.
           echo "list=$(cargo metadata --no-deps --format-version 1 | jq -c '
-            ["yo-kv", "yo-vector", "yo-graph", "yo-doc", "yo-index"] as $out
+            ["yo-kv", "yo-vector", "yo-graph", "yo-doc"] as $out
             | { "yo-resp": 6, "yo-cli": 2 } as $split
             | [ .packages[].name
                 | select(. != "yo-record" and ($split[.] | not) and (IN($out[]) | not))
