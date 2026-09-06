@@ -16,7 +16,8 @@ name: deep
 #
 # Reproducing a Miri shard locally is one shard at a time:
 #
-#     MIRIFLAGS="-Zmiri-strict-provenance -Zmiri-disable-isolation" \
+#     MIRIFLAGS="-Zmiri-deterministic-floats -Zmiri-strict-provenance \
+#       -Zmiri-disable-isolation" \
 #       cargo +nightly miri nextest run --locked -p yo-record --test-threads 4 \
 #         -E 'not test(/^compact::/)'
 #
@@ -51,6 +52,12 @@ jobs:
   # that triggers this workflow runs the lot.
   wanted:
     runs-on: ubuntu-latest
+    # Reading the labels back needs saying out loud. The default for this
+    # repository is read on everything, so this changes nothing today, and it
+    # keeps the job working if that default is ever tightened.
+    permissions:
+      contents: read
+      pull-requests: read
     outputs:
       run: ${{ steps.decide.outputs.run }}
       ref: ${{ steps.pick.outputs.ref }}
@@ -96,13 +103,23 @@ jobs:
       # A push that only moves prose does not need any of this. That is not a
       # nicety: a changelog line on a pull request that already ran deep costs
       # seven minutes and tells nobody anything.
+      #
+      # The label is read back from the API rather than taken from the event.
+      # The event carries a snapshot of the labels at the moment it was made,
+      # and opening a pull request with labels already on it delivers the
+      # `labeled` events first and the `opened` event after, with the older
+      # snapshot in it. The `opened` run then sees no label, decides to skip,
+      # and cancels the three real runs on its way past, because they share a
+      # concurrency group. The whole thing reports success without having run
+      # anything, which is the failure this job exists to avoid.
       - id: decide
         env:
           EVENT: ${{ github.event_name }}
           ACTION: ${{ github.event.action }}
-          LABELLED: ${{ contains(github.event.pull_request.labels.*.name, 'deep') }}
+          NUMBER: ${{ github.event.pull_request.number }}
           BASE: ${{ github.event.pull_request.base.sha }}
           BEFORE: ${{ github.event.before }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -u
           # Everything that is not a pull request runs the lot.
@@ -112,7 +129,9 @@ jobs:
             exit 0
           fi
           echo 'borrows=["stacked"]' >> "$GITHUB_OUTPUT"
-          if [ "$LABELLED" != "true" ]; then
+          labels=$(gh api "repos/${GITHUB_REPOSITORY}/pulls/${NUMBER}" \
+            --jq '.labels[].name')
+          if ! printf '%s\n' "$labels" | grep -qx deep; then
             echo "no deep label, skipping"
             echo "run=false" >> "$GITHUB_OUTPUT"
             exit 0
@@ -151,6 +170,34 @@ jobs:
       # worth 90 seconds against 55 locally even with nextest already running
       # four at a time. If that crate ever stops being the slowest, this special
       # case should go.
+      #
+      # `yo-resp` and `yo-cli` are split by count, and the table in the step
+      # below says how many ways. They are split for a different reason than
+      # `yo-record`. Miri spends about six seconds starting a process before it
+      # runs a line of the test in it, and nextest gives every test its own
+      # process, so `yo-resp` has a floor of over an hour before any of its six
+      # hundred and thirty tests does any work. Nothing in the source can be
+      # shrunk to fix that, because the cost is per test rather than per
+      # operation. Splitting by count weakens no test and nextest does the
+      # splitting itself, so no list of test names has to be kept true here as
+      # tests are added.
+      #
+      # Five crates are left out, and it is worth being straight about what that
+      # costs. `yo-kv`, `yo-vector`, `yo-graph`, `yo-doc` and `yo-index` have
+      # about a hundred and fifty tests between them that take over two minutes
+      # each interpreted and about thirty that run past forty. They are slow
+      # because of what they measure: a recall figure over a few thousand
+      # vectors is a few thousand times the arithmetic of an ordinary test, and
+      # a betweenness score checked against its own definition is the definition
+      # walked. There is no smaller version of either that measures the same
+      # thing, so the fix is to go through them test by test, shrinking the ones
+      # where the count is incidental and skipping the ones where the count is
+      # the claim, which is what `yo-resp` got and what these need. That is its
+      # own piece of work and it is issue 418.
+      #
+      # Three of the five have no unsafe code of their own. The other two have
+      # ten blocks between them, and those are uninterpreted until this is
+      # finished, which is the real cost of leaving them out.
       - id: shards
         run: |
           rm rust-toolchain.toml
@@ -158,13 +205,18 @@ jobs:
           # nextest filter needs single quotes around it in the shell, and a
           # single quote inside this jq program would close the program instead,
           # which is a syntax error the runner reports six lines away from the
-          # cause. The run step below adds the quotes where they belong.
+          # cause. The run step below passes each field as its own argument.
           echo "list=$(cargo metadata --no-deps --format-version 1 | jq -c '
-            [ .packages[].name
-              | select(. != "yo-record")
-              | {id: ., pkg: ., filter: ""} ]
-            + [ {id: "yo-record-compact", pkg: "yo-record", filter: "test(/^compact::/)"},
-                {id: "yo-record-rest", pkg: "yo-record", filter: "not test(/^compact::/)"} ]
+            ["yo-kv", "yo-vector", "yo-graph", "yo-doc", "yo-index"] as $out
+            | { "yo-resp": 6, "yo-cli": 2 } as $split
+            | [ .packages[].name
+                | select(. != "yo-record" and ($split[.] | not) and (IN($out[]) | not))
+                | {id: ., pkg: ., filter: "", part: ""} ]
+            + [ {id: "yo-record-compact", pkg: "yo-record", filter: "test(/^compact::/)", part: ""},
+                {id: "yo-record-rest", pkg: "yo-record", filter: "not test(/^compact::/)", part: ""} ]
+            + [ $split | to_entries[] as $s
+                | range(1; $s.value + 1)
+                | {id: "\($s.key)-\(.)", pkg: $s.key, filter: "", part: "count:\(.)/\($s.value)"} ]
             | sort_by(.id)')" >> "$GITHUB_OUTPUT"
       - run: echo "deep checks requested for ${{ github.event.inputs.ref || github.ref }}"
 
@@ -200,7 +252,11 @@ jobs:
     if: needs.wanted.outputs.run == 'true'
     name: miri (${{ matrix.borrows }}, ${{ matrix.shard.id }})
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    # Forty rather than the twenty five the other long jobs get. The heaviest
+    # shard is a third of an hour on a quiet laptop and a runner is not a quiet
+    # laptop, and this runs at three in the morning against nothing, so the only
+    # thing a tighter bound would buy is a red run on a slow morning.
+    timeout-minutes: 40
     strategy:
       # One shard failing is a real finding and every other shard's result is
       # still worth having, so a failure does not cancel its siblings.
@@ -229,18 +285,53 @@ jobs:
       # Pinned to four rather than left to follow the core count, so that a
       # bigger runner cannot quietly turn this into sixteen interpreters and an
       # out of memory kill that reads like a hang.
+      #
+      # A shard with no filter is a whole crate or a count of one, and either is
+      # allowed to come out empty: `yo-derive` is a proc macro whose only job
+      # happens in the compiler, so its shard finds nothing and nextest calls an
+      # empty run a failure. A shard with a filter is a hand written half of
+      # `yo-record`, and that one finding nothing means the filter has stopped
+      # matching, so it keeps the default and stays a failure.
+      #
+      # The fields go in through the environment and into an array rather than
+      # being pasted into the command line, so that a filter with a space or a
+      # quote in it stays one argument.
       - run: |
-          if [ -n "${{ matrix.shard.filter }}" ]; then
-            cargo miri nextest run --locked -p ${{ matrix.shard.pkg }} --test-threads 4 -E '${{ matrix.shard.filter }}'
+          set -u
+          args=(--locked -p "$PKG" --test-threads 4)
+          if [ -n "$FILTER" ]; then
+            args+=(-E "$FILTER")
           else
-            cargo miri nextest run --locked -p ${{ matrix.shard.pkg }} --test-threads 4
+            args+=(--no-tests pass)
           fi
+          if [ -n "$PART" ]; then
+            args+=(--partition "$PART")
+          fi
+          cargo miri nextest run "${args[@]}"
         env:
+          PKG: ${{ matrix.shard.pkg }}
+          FILTER: ${{ matrix.shard.filter }}
+          PART: ${{ matrix.shard.part }}
           # The flags used to live in a matrix `include`, which does not survive
           # the borrow list being decided at run time: an include entry naming a
           # value the matrix no longer has is a job of its own with no shard in
           # it rather than a merge into nothing.
+          #
+          # `-Zmiri-deterministic-floats` is there because Miri does not hand
+          # `ln`, `log2` and `log10` to the host. It works them out itself and
+          # then, by default, moves the answer a little either way on purpose, to
+          # catch code that leans on a precision the language does not promise.
+          # Three tests here read a score or a size back and compare it against
+          # what a real Redis answered, digit for digit, and that is the point of
+          # them: the width of a sketch is `ceil` of one `log10` over another and
+          # comes out 2 instead of 1 when the two no longer cancel, and the older
+          # search scorer is `floor` of a `log2` and drops to zero when its 1.0
+          # arrives as 0.9999999999999999. Neither is a bug, because a real libm
+          # is the same function twice and cancels, and neither is what Miri is
+          # here to look for. The flag keeps the answers exact and leaves the
+          # aliasing and provenance checks doing the job this workflow wants.
           MIRIFLAGS: >-
+            -Zmiri-deterministic-floats
             ${{ matrix.borrows == 'tree'
               && '-Zmiri-tree-borrows -Zmiri-disable-isolation'
               || '-Zmiri-strict-provenance -Zmiri-disable-isolation' }}

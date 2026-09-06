@@ -2085,6 +2085,16 @@ mod tests {
     /// What a client does all day: write the same keys again and again. Every
     /// one of those writes leaves the previous record behind, so a server that
     /// never compacts holds every version of every key it has ever been sent.
+    ///
+    /// Not under Miri, and not because of anything it would find. The bound
+    /// only means something once several megabytes have gone through the
+    /// arena, which reclaims a segment at a time and has segments of two
+    /// megabytes, so a server that reclaimed nothing would still be under the
+    /// bound in any smaller version of this. Thirty two megabytes is thirty
+    /// two thousand commands and was over forty minutes interpreted. The paths
+    /// it walks are walked by the hundreds of tests around it that write a key
+    /// and read it back, which do run there.
+    #[cfg_attr(miri, ignore = "megabytes through the arena")]
     #[test]
     fn rewriting_the_same_keys_does_not_grow_the_server() {
         let mut f = Fixture::new();
@@ -2130,6 +2140,10 @@ mod tests {
     /// until it says there is nothing left, checks the mark really is gone, and
     /// then writes another thirty two megabytes through the same sixty four
     /// keys. If either went wrong the server would hold all of it.
+    ///
+    /// Not under Miri, for the reason on the test above: the volume is the
+    /// claim, and the volume is what the interpreter charges for.
+    #[cfg_attr(miri, ignore = "megabytes through the arena")]
     #[test]
     fn a_database_nobody_started_on_is_still_collected() {
         let mut f = Fixture::new();
@@ -2914,8 +2928,12 @@ mod tests {
 
     #[test]
     fn a_keyspace_scan_walks_every_key_once() {
+        // The count below is thirty two, so ninety six keys is three pages of
+        // cursor and says the same thing as five hundred at a fifth of the
+        // interpreted work.
+        let n = if cfg!(miri) { 96 } else { 500 };
         let mut f = Fixture::new();
-        for i in 0..500 {
+        for i in 0..n {
             f.run(&[b"SET", format!("k{i}").as_bytes(), b"v"]);
         }
 
@@ -2935,10 +2953,10 @@ mod tests {
 
         seen.sort();
         seen.dedup();
-        assert_eq!(seen.len(), 500, "every key once and only once");
+        assert_eq!(seen.len(), n, "every key once and only once");
         // And more than one call to get them, or the COUNT is being ignored and
         // the loop above proved nothing about resuming.
-        assert!(calls > 1, "500 keys came back in one batch");
+        assert!(calls > 1, "{n} keys came back in one batch");
     }
 
     #[test]
@@ -3897,6 +3915,10 @@ mod tests {
         assert_eq!(f.run(&[b"SET", b"k", b"v"]), "+OK\r\n");
     }
 
+    /// Not under Miri, for the reason in `filled`: what it is watching is a
+    /// whole two megabyte segment going back, so the megabytes are the claim
+    /// and there is no smaller version of it that says the same thing.
+    #[cfg_attr(miri, ignore = "several megabytes of arena, see `filled`")]
     #[test]
     fn an_allkeys_policy_makes_room_instead_of_refusing() {
         let mut f = Fixture::new();
@@ -3951,6 +3973,17 @@ mod tests {
         );
     }
 
+    /// Not under Miri. Every round is eleven commands over six collections
+    /// holding two hundred byte values, which is a third of a second each
+    /// interpreted, and the rounds cannot come down far: one in seven takes an
+    /// entry back out, so under about a hundred and seventy of them the
+    /// collections never reach the hundred and twenty eight entries where the
+    /// small representations give up and become the big ones, and a
+    /// representation changing under the running total is one of the five
+    /// things this is here to watch. What is left is an hour, for an accounting
+    /// claim rather than a safety one, and the commands it sends are sent a few
+    /// at a time by the tests around it.
+    #[cfg_attr(miri, ignore = "an hour of commands, and they cannot come down")]
     #[test]
     fn the_running_total_and_the_walk_agree_on_a_mixed_keyspace() {
         // The limit is judged against a number kept as the collections move,
@@ -4432,32 +4465,48 @@ mod tests {
     /// past a key before it can reclaim it and nobody ever did.
     #[test]
     fn the_active_sweep_reclaims_keys_no_client_comes_back_for() {
+        // Four thousand keys is four thousand trips through dispatch, and what
+        // Miri charges for is trips rather than keys, so this was over five
+        // minutes there. An eighth of each keeps everything the test is about,
+        // which is three keys with a deadline for every one without and a
+        // sweep that has to reclaim all of the first kind and none of the
+        // second.
+        let (dead, live) = if cfg!(miri) {
+            (375, 125)
+        } else {
+            (3_000, 1_000)
+        };
         let mut f = Fixture::new();
-        for i in 0..3_000u32 {
+        for i in 0..dead {
             f.run(&[b"SET", format!("d{i}").as_bytes(), b"v", b"PX", b"50"]);
         }
-        for i in 0..1_000u32 {
+        for i in 0..live {
             f.run(&[b"SET", format!("k{i}").as_bytes(), b"v"]);
         }
-        assert_eq!(f.run(&[b"DBSIZE"]), ":4000\r\n");
+        let all = format!(":{}\r\n", dead + live);
+        assert_eq!(f.run(&[b"DBSIZE"]), all);
         f.advance(100);
         assert_eq!(
             f.run(&[b"DBSIZE"]),
-            ":4000\r\n",
+            all,
             "DBSIZE counts records and nothing has read past the dead ones yet"
         );
 
         // What the shard loop does, one slice at a time.
+        let rest = format!(":{live}\r\n");
         let mut spent = 0;
         for _ in 0..2_000 {
             spent += f.server.expire_step(4096);
-            if f.run(&[b"DBSIZE"]) == ":1000\r\n" {
+            if f.run(&[b"DBSIZE"]) == rest {
                 break;
             }
         }
-        assert_eq!(f.run(&[b"DBSIZE"]), ":1000\r\n", "spent {spent} looks");
-        assert!(f.run(&[b"INFO", b"stats"]).contains("expired_keys:3000"));
-        for i in 0..1_000u32 {
+        assert_eq!(f.run(&[b"DBSIZE"]), rest, "spent {spent} looks");
+        assert!(
+            f.run(&[b"INFO", b"stats"])
+                .contains(&format!("expired_keys:{dead}"))
+        );
+        for i in 0..live {
             assert_eq!(
                 f.run(&[b"GET", format!("k{i}").as_bytes()]),
                 "$1\r\nv\r\n",
@@ -4468,8 +4517,12 @@ mod tests {
 
     #[test]
     fn a_sweep_of_a_server_with_no_deadlines_anywhere_costs_nothing() {
+        // The keys are only here so that the database the sweep walks is not an
+        // empty one. Two hundred of them fills as many slots as a sweep looks
+        // at and is a tenth of the interpreted work.
+        let n = if cfg!(miri) { 200 } else { 2_000 };
         let mut f = Fixture::new();
-        for i in 0..2_000u32 {
+        for i in 0..n {
             f.run(&[b"SET", format!("k{i}").as_bytes(), b"v"]);
         }
         assert_eq!(f.server.expire_step(4096), 0);
@@ -4482,7 +4535,7 @@ mod tests {
         }
         assert_eq!(f.run(&[b"DBSIZE"]), ":0\r\n");
         f.run(&[b"SELECT", b"0"]);
-        assert_eq!(f.run(&[b"DBSIZE"]), ":2000\r\n");
+        assert_eq!(f.run(&[b"DBSIZE"]), format!(":{n}\r\n"));
         assert_eq!(f.server.expire_step(4096), 0, "and it is quiet again");
     }
 
@@ -4544,7 +4597,14 @@ mod tests {
         assert!(both.contains("db1:keys=1,expires=1"), "{both}");
     }
 
+    /// Not under Miri, which reads a zero on purpose because it has no
+    /// `getrusage` to call, so the second half of this would burn a billion
+    /// interpreted multiplications waiting for a number that is never going to
+    /// move. The first half, that the section is there and has the fields Redis
+    /// clients look for, is checked by the `INFO` tests above as well, and
+    /// those do run there.
     #[cfg(unix)]
+    #[cfg_attr(miri, ignore = "no getrusage under Miri, so the number is fixed")]
     #[test]
     fn info_cpu_reports_processor_time_that_was_really_measured() {
         let mut f = Fixture::new();
@@ -5558,8 +5618,13 @@ mod tests {
 
     #[test]
     fn a_hash_scan_walks_every_pair_once_and_novalues_drops_half_of_it() {
+        // Fourteen minutes under Miri at five hundred, which was the slowest
+        // test in this crate that was not about megabytes. What the count has
+        // to be is more than one page of the cursor, and the count below is
+        // thirty two, so ninety six is three pages and asks the same question.
+        let fields = if cfg!(miri) { 96 } else { 500 };
         let mut f = Fixture::new();
-        for i in 0..500 {
+        for i in 0..fields {
             let field = format!("field-{i}");
             let value = format!("value-{i}");
             f.run(&[b"HSET", b"h", field.as_bytes(), value.as_bytes()]);
@@ -5586,7 +5651,7 @@ mod tests {
         }
         seen.sort();
         seen.dedup();
-        assert_eq!(seen.len(), 500, "every field once and only once");
+        assert_eq!(seen.len(), fields, "every field once and only once");
 
         let (_, items) = scan_reply(&f.run(&[b"HSCAN", b"h", b"0", b"NOVALUES", b"COUNT", b"32"]));
         assert!(
@@ -5594,16 +5659,21 @@ mod tests {
             "NOVALUES still sent the values"
         );
 
+        let last = fields - 1;
         let (_, one) = scan_reply(&f.run(&[
             b"HSCAN",
             b"h",
             b"0",
             b"MATCH",
-            b"field-499",
+            format!("field-{last}").as_bytes(),
             b"COUNT",
             b"1000",
         ]));
-        assert_eq!(one, ["field-499", "value-499"], "MATCH is on the field");
+        assert_eq!(
+            one,
+            [format!("field-{last}"), format!("value-{last}")],
+            "MATCH is on the field"
+        );
     }
 
     #[test]
@@ -6755,6 +6825,16 @@ mod tests {
 
     /// The leak a set can spring that nothing on the wire would ever show: the
     /// key goes, the body does not, and `DBSIZE` looks right the whole time.
+    /// Not under Miri. What this claims is that memory does not grow over two
+    /// hundred passes, so the passes are the claim rather than the way it
+    /// happens to be written, and two hundred passes of a two hundred member
+    /// collection is forty thousand trips through dispatch, which is what an
+    /// interpreter charges for. A count small enough to run there would leave a
+    /// server that reclaims nothing inside the bound and the test would pass on
+    /// a leak. Nothing about memory safety goes uninterpreted either way: this
+    /// is an accounting claim, and the same commands are run a few at a time by
+    /// the tests around it.
+    #[cfg_attr(miri, ignore = "the volume is the claim")]
     #[test]
     fn churning_sets_does_not_grow_the_server() {
         let mut f = Fixture::new();
@@ -7253,6 +7333,15 @@ mod tests {
         assert_eq!(f.run(&[b"PFCOUNT", b"fresh"]), ":0\r\n");
     }
 
+    /// Not under Miri, and not for the number of commands: a dense sketch is
+    /// sixteen thousand three hundred and eighty four registers and every
+    /// command here walks all of them, so one `PFCOUNT` is more interpreted
+    /// work than a hundred ordinary tests. The registers and the walking are in
+    /// `yo-kv`, where fifteen tests of their own cover both encodings and where
+    /// the interpreter does run over them. What is left here is the dispatch
+    /// around it, which is the same dispatch every other command in this file
+    /// goes through.
+    #[cfg_attr(miri, ignore = "sixteen thousand registers a command")]
     #[test]
     fn the_debug_forms_answer_four_different_shapes() {
         let mut f = Fixture::new();
@@ -7351,9 +7440,20 @@ mod tests {
         // One that stays sparse and one that has gone dense, since the payload
         // carries the bytes and the two encodings are different lengths.
         f.run(&[b"PFADD", b"small", b"a", b"b", b"c"]);
-        for i in 0..10_000u32 {
-            let ele = format!("e{i}");
-            f.run(&[b"PFADD", b"big", ele.as_bytes()]);
+        // Ten thousand elements is what takes a sketch dense on its own, and it
+        // is ten thousand trips through dispatch, which is what Miri charges
+        // for. There the same sketch is taken across by hand. What this test is
+        // about is a dense payload surviving a round trip and the encoding is
+        // dense either way: that a sketch converts when it fills up is what
+        // `the_debug_forms_answer_four_different_shapes` is for.
+        if cfg!(miri) {
+            f.run(&[b"PFADD", b"big", b"a", b"b", b"c"]);
+            f.run(&[b"PFDEBUG", b"TODENSE", b"big"]);
+        } else {
+            for i in 0..10_000u32 {
+                let ele = format!("e{i}");
+                f.run(&[b"PFADD", b"big", ele.as_bytes()]);
+            }
         }
         assert_eq!(f.run(&[b"PFDEBUG", b"ENCODING", b"small"]), "+sparse\r\n");
         assert_eq!(f.run(&[b"PFDEBUG", b"ENCODING", b"big"]), "+dense\r\n");
@@ -8240,6 +8340,8 @@ mod tests {
     /// The same churn the set and the string get, because a list that leaks a
     /// chunk per push looks exactly like one that does not until it has run for
     /// an afternoon.
+    /// Not under Miri, for the reason on `churning_sets_does_not_grow_the_server`.
+    #[cfg_attr(miri, ignore = "the volume is the claim")]
     #[test]
     fn churning_lists_does_not_grow_the_server() {
         let mut f = Fixture::new();
@@ -9252,6 +9354,8 @@ mod tests {
     /// The same churn the set, the string and the list get, because a sorted
     /// set that leaks a tree node per add looks exactly like one that does not
     /// until it has run for an afternoon.
+    /// Not under Miri, for the reason on `churning_sets_does_not_grow_the_server`.
+    #[cfg_attr(miri, ignore = "the volume is the claim")]
     #[test]
     fn churning_sorted_sets_does_not_grow_the_server() {
         let mut f = Fixture::new();
@@ -18372,6 +18476,15 @@ mod tests {
     /// A server holding several segments of strings, with somewhere to put them.
     ///
     /// Answers the fixture and what it was holding when it stopped filling.
+    /// The three tests that call this are the ones Miri is not run over.
+    ///
+    /// What they are about is the regime a database is in once the arena has
+    /// several segments, and a segment is two megabytes, so there is no smaller
+    /// version of the question: twenty four thousand keys is already the least
+    /// that gets there. Interpreted, each of them sat for over forty minutes
+    /// and was still going. The arena's own segment handling is interpreted in
+    /// full in its own crate, and the policy these three check is ordinary
+    /// bookkeeping with no unsafe block anywhere in it.
     fn filled(attach: bool) -> (Fixture, usize) {
         let mut f = Fixture::new();
         if attach {
@@ -18455,6 +18568,7 @@ mod tests {
         assert!(info.contains("yo_store_bytes:0"), "{info}");
     }
 
+    #[cfg_attr(miri, ignore = "several megabytes of arena, see `filled`")]
     #[test]
     fn a_memory_limit_moves_values_to_the_file_instead_of_dropping_keys() {
         // The inversion. The same pressure that makes a Redis server throw keys
@@ -18499,6 +18613,7 @@ mod tests {
         assert_eq!(f.run(&[b"GET", b"key:00023999"]), val);
     }
 
+    #[cfg_attr(miri, ignore = "several megabytes of arena, see `filled`")]
     #[test]
     fn a_storage_limit_of_zero_restores_redis_behaviour_exactly() {
         // The documented setting for a drop in cache. A file that may hold
@@ -18529,6 +18644,7 @@ mod tests {
         assert_eq!(f.server.store_bytes(), 0, "and the file was never written");
     }
 
+    #[cfg_attr(miri, ignore = "several megabytes of arena, see `filled`")]
     #[test]
     fn a_full_file_goes_back_to_evicting() {
         // A storage limit reached is a storage limit, and eviction is the right
@@ -18771,8 +18887,12 @@ mod tests {
     /// walk has to end once rather than eight times.
     #[test]
     fn a_scan_of_a_striped_database_walks_all_of_it() {
+        // Eight stripes and a COUNT of ten, so eighty keys is already more than
+        // one page on every stripe and the cursor has to carry which stripe it
+        // was on, which is the thing being checked.
+        let n = if cfg!(miri) { 80 } else { 500 };
         let mut f = Fixture::striped(8);
-        for i in 0..500 {
+        for i in 0..n {
             let key = format!("key:{i}");
             f.run(&[b"SET", key.as_bytes(), b"v"]);
         }
@@ -18792,7 +18912,7 @@ mod tests {
             }
         }
         seen.sort();
-        assert_eq!(seen.len(), 500, "a quiet scan answered a key twice");
+        assert_eq!(seen.len(), n, "a quiet scan answered a key twice");
         assert_eq!(seen, sorted(&f.run(&[b"KEYS", b"*"])));
 
         // And the options still work when the walk is over several stripes,
@@ -19075,6 +19195,11 @@ mod tests {
     }
 
     /// Every HyperLogLog command, on one stripe and on eight.
+    ///
+    /// Not under Miri, for the reason on
+    /// `the_debug_forms_answer_four_different_shapes`, and twice over here
+    /// because the script is run against both shapes of server.
+    #[cfg_attr(miri, ignore = "sixteen thousand registers a command")]
     #[test]
     fn the_hyperloglog_group_answers_the_same_however_many_stripes_there_are() {
         let script: &[&[&[u8]]] = &[

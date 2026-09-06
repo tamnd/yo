@@ -755,11 +755,23 @@ mod tests {
     }
 
     /// The point of the whole exercise: two engines, two threads, one server.
+    ///
+    /// The server is told it will have two threads before either starts, the
+    /// way `yodb serve` tells it. Without that it has one set of counters and
+    /// both threads land on it, which is the wrap round `Server::mine_at`
+    /// documents and which loses counts: a bump is a load and a store rather
+    /// than a fetch and add, because the fast path is one thread writing its
+    /// own set and paying for a locked instruction on every command to make a
+    /// shared set exact would be paying it on the path that is never shared.
+    /// Miri found this by running the two threads far enough apart to lose one,
+    /// which a real machine does rarely enough to have passed here for months.
     #[test]
     fn two_threads_write_into_one_server() {
         const EACH: usize = 200;
 
-        let first = Wire::new(Recorder::new());
+        let mut server = Server::new();
+        server.set_threads(2);
+        let first = Wire::with_server(server, Recorder::new());
         let second = Wire::over(first.shared(), Recorder::new());
         let server = first.shared();
 
@@ -1142,7 +1154,14 @@ mod tests {
 
         // A thousand rounds is sixteen thousand commands and about a megabyte
         // of wire bytes, which is a hundred times what the buffer starts with.
-        for _ in 0..1000 {
+        // Fifty is a twentieth of that and it is what runs under Miri, where
+        // sixteen thousand commands through the whole engine was a quarter of
+        // an hour. The check below is that the size is the one it was after the
+        // first round, exactly, so a buffer that keeps anything at all is
+        // caught on the second round and every one after it, whichever count
+        // this is.
+        let rounds = if cfg!(miri) { 50 } else { 1000 };
+        for _ in 0..rounds {
             r.engine_mut().feed(conn, &round);
             pump(&mut r, &mut batch);
             r.engine_mut().sink_mut().clear();
@@ -1151,7 +1170,7 @@ mod tests {
         assert_eq!(
             r.engine().buffer_bytes(),
             after_one,
-            "the buffers grew over a thousand rounds of the same sixteen commands"
+            "the buffers grew over {rounds} rounds of the same sixteen commands"
         );
         assert!(
             r.engine().server().memory_bytes() >= after_one,

@@ -744,7 +744,22 @@ fn unix_door(path: &Path) -> io::Result<Door> {
     ))
 }
 
-#[cfg(test)]
+// Every test below stands a real server on a real socket and talks to it from
+// another thread, which is not something Miri can be asked to do. Unix sockets
+// it refuses outright, since it only knows `AF_INET` and `AF_INET6`. The port
+// ones it will run, but an interpreter is slow enough that a client waiting on
+// a reply hits the ten second read timeout and fails a test that has nothing
+// wrong with it: two of them took over three and a half minutes each in CI
+// before giving up. Raising the timeout would only trade a false failure for a
+// job that runs out of its twenty five minutes.
+//
+// Nothing is lost by leaving these out. Miri is here for unsafe code, and this
+// file has none: it is a listener, a poller and some bookkeeping over the
+// engine, and the engine's own crates are interpreted in full. What these tests
+// are really watching for is threads getting in each other's way, and that is
+// what the `tsan` job runs them for, natively and at full speed with the
+// thread sanitizer underneath.
+#[cfg(all(test, not(miri)))]
 mod tests {
     use super::*;
     use std::sync::Arc;

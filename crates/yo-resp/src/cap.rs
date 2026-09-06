@@ -168,7 +168,7 @@ fn v2_limit(root: &Path, self_cgroup: &Path) -> Option<u64> {
 }
 
 /// What the machine has.
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", not(miri)))]
 fn host_memory() -> Option<u64> {
     // SAFETY: two reads of process independent configuration, neither of which
     // takes a pointer or leaves anything behind.
@@ -186,7 +186,7 @@ fn host_memory() -> Option<u64> {
 }
 
 /// What the machine has.
-#[cfg(target_vendor = "apple")]
+#[cfg(all(target_vendor = "apple", not(miri)))]
 fn host_memory() -> Option<u64> {
     let mut out: u64 = 0;
     let mut len = size_of::<u64>();
@@ -205,8 +205,22 @@ fn host_memory() -> Option<u64> {
     if rc == 0 && out > 0 { Some(out) } else { None }
 }
 
-/// What the machine has, on a system with no way to ask that is worth linking.
-#[cfg(not(any(target_os = "linux", target_vendor = "apple")))]
+/// What the machine has, where there is no machine to ask.
+///
+/// That is either a system with no way to ask that is worth linking, or Miri,
+/// which is an interpreter and not a computer. Both of the calls above are
+/// foreign functions it does not carry out: on Linux it knows a handful of
+/// `sysconf` names and stops the program on the rest, so `_SC_PHYS_PAGES` ends
+/// the run with `unimplemented sysconf name: 85`, and on macOS it refuses
+/// `sysctlbyname` outright. It is not only the one test that reads the size
+/// that runs into this, either. `INFO` reports the budget, so every dispatch
+/// test that asks for `INFO` comes through here as well.
+///
+/// `None` is a reading this code already handles, because a container with no
+/// limit set and no way to read the machine gives the same answer, and
+/// everything that follows from a number is covered by the tests that hand
+/// `Cap` its numbers rather than asking for them.
+#[cfg(any(miri, not(any(target_os = "linux", target_vendor = "apple"))))]
 fn host_memory() -> Option<u64> {
     None
 }
@@ -369,6 +383,9 @@ mod tests {
         assert_eq!(Cap::default().budget(), 0);
     }
 
+    /// Under Miri this reads the `host_memory` that answers `None`, and the
+    /// check below is written to take that answer, so the test still runs
+    /// there and still says that whatever came back is usable.
     #[test]
     fn asking_the_real_machine_answers_something_sensible() {
         let cap = Cap::read();

@@ -742,15 +742,23 @@ mod tests {
     /// the whole reason the ids are gaps and the numbers are varints.
     #[test]
     fn a_common_term_costs_about_a_byte_a_document() {
+        // The claim is a cost per document, so a fifth of the documents at a
+        // fifth of the budget says exactly the same thing, and it says it in
+        // thirteen seconds under Miri rather than sixty six.
+        let (n, packed, spread) = if cfg!(miri) {
+            (2_000, 9_000, 11_000)
+        } else {
+            (10_000, 45_000, 55_000)
+        };
         let mut p = Posts::new();
-        for id in 1..=10_000 {
+        for id in 1..=n {
             p.push(id, 1, 1, &[]);
         }
-        assert!(p.bytes() < 45_000, "{} bytes", p.bytes());
+        assert!(p.bytes() < packed, "{} bytes", p.bytes());
         let mut plain = Posts::new();
-        for id in (1..=10_000).map(|n| n * 1000) {
+        for id in (1..=n).map(|n| n * 1000) {
             plain.push(id, 1, 1, &[]);
         }
-        assert!(plain.bytes() < 55_000, "{} bytes", plain.bytes());
+        assert!(plain.bytes() < spread, "{} bytes", plain.bytes());
     }
 }

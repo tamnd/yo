@@ -851,14 +851,22 @@ mod tests {
 
     #[test]
     fn a_thousand_samples_compress_to_a_bounded_number_of_centroids() {
+        // A hundred thousand samples is a tenth of a second natively and over
+        // nine minutes under Miri. What is being checked is that a digest of a
+        // hundred holds a bounded number of centroids however much goes in and
+        // still knows where the middle is, and ten thousand samples is already
+        // a hundred times its capacity, so Miri runs a tenth of them. Every
+        // value from 0 to 999 still goes in, ten times each, which is what the
+        // median claim below rests on.
+        let n: i32 = if cfg!(miri) { 10_000 } else { 100_000 };
         let mut t = TDigest::new(100).expect("small enough");
-        for i in 0..100_000 {
+        for i in 0..n {
             t.add(f64::from(i % 1000), 1).expect("no overflow");
         }
         t.compress().expect("no overflow");
         assert!(t.merged_nodes() < t.capacity());
-        assert_eq!(t.size(), 100_000);
-        assert_eq!(t.merged_weight(), 100_000);
+        assert_eq!(t.size(), i64::from(n));
+        assert_eq!(t.merged_weight(), i64::from(n));
         let q = t.quantile(0.5);
         assert!((q - 500.0).abs() < 20.0, "median came out at {q}");
     }

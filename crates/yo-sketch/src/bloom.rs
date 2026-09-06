@@ -705,13 +705,27 @@ mod tests {
     /// property that is about the filter rather than about the format.
     #[test]
     fn the_error_rate_is_near_the_one_that_was_asked_for() {
-        let mut b = Bloom::new(10_000, 0.01, 2, false);
-        for i in 0..10_000 {
+        // Twenty thousand hashes is nothing natively and close to eight minutes
+        // under Miri, which was the single slowest test in the workspace. The
+        // claim is about the rate and not about the size, and a filter asked
+        // for a thousand items at one percent is the same filter as one asked
+        // for ten thousand, so Miri builds the small one and asks it the same
+        // question. The bound moves with the size, with room for the wider
+        // swing a smaller sample has: ten wrong answers are expected out of a
+        // thousand, and thirty is far enough out to mean the filter is broken
+        // rather than unlucky.
+        let (n, bound): (u64, usize) = if cfg!(miri) {
+            (1_000, 30)
+        } else {
+            (10_000, 100)
+        };
+        let mut b = Bloom::new(n, 0.01, 2, false);
+        for i in 0..n {
             b.add(format!("in{i}").as_bytes());
         }
-        let wrong = (0..10_000)
+        let wrong = (0..n)
             .filter(|i| b.contains(format!("out{i}").as_bytes()))
             .count();
-        assert!(wrong < 100, "{wrong} false positives in ten thousand");
+        assert!(wrong < bound, "{wrong} false positives in {n}");
     }
 }

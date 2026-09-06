@@ -973,13 +973,24 @@ mod tests {
     /// about the format.
     #[test]
     fn the_error_rate_is_what_a_one_byte_fingerprint_gives() {
-        let mut c = Cuckoo::new(16_384, 2, 20, 2);
-        for i in 0..10_000 {
+        // Nearly six minutes under Miri for a claim that does not depend on how
+        // big the table is. What decides the rate is the fingerprint being one
+        // byte, the buckets holding two, and how full the table is, so Miri
+        // takes an eighth of everything and leaves the table just as full: 2048
+        // slots with 1250 items in them is the same 61 percent as 16384 with
+        // 10000. The bound comes down by the same eighth.
+        let (cap, n, bound): (u64, u32, usize) = if cfg!(miri) {
+            (2_048, 1_250, 50)
+        } else {
+            (16_384, 10_000, 400)
+        };
+        let mut c = Cuckoo::new(cap, 2, 20, 2);
+        for i in 0..n {
             c.insert(format!("in{i}").as_bytes());
         }
-        let wrong = (0..10_000)
+        let wrong = (0..n)
             .filter(|i| c.contains(format!("out{i}").as_bytes()))
             .count();
-        assert!(wrong < 400, "{wrong} false positives in ten thousand");
+        assert!(wrong < bound, "{wrong} false positives in {n}");
     }
 }

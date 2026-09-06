@@ -691,6 +691,36 @@ mod tests {
     struct Fake {
         port: String,
         seen: Arc<Mutex<Vec<u8>>>,
+        peer: Option<std::thread::JoinHandle<()>>,
+    }
+
+    /// Wait for the peer thread on the way out rather than walking off and
+    /// leaving it.
+    ///
+    /// Two of these tests never migrate anything, because the key is gone or
+    /// has expired, so nothing ever connects and the peer is still sitting in
+    /// `accept` when the test ends. Natively that is a thread the process takes
+    /// with it. Under Miri it is `the main thread terminated without waiting for
+    /// all remaining threads`, and the test fails after passing, which is a
+    /// confusing thing to read.
+    ///
+    /// Opening a connection is what gets a thread out of `accept`, so that is
+    /// what this does, and dropping it straight away is what gets the peer out
+    /// of the read loop after it. A peer that has already been connected to
+    /// ignores this one, since it only accepts once, and is on its way out
+    /// anyway: `At` is declared after `Fake` in every test here and so drops
+    /// before it, which closes the socket the peer is reading.
+    impl Drop for Fake {
+        fn drop(&mut self) {
+            let Some(peer) = self.peer.take() else {
+                return;
+            };
+            drop(std::net::TcpStream::connect(format!(
+                "127.0.0.1:{}",
+                self.port
+            )));
+            let _ = peer.join();
+        }
     }
 
     impl Fake {
@@ -721,7 +751,7 @@ mod tests {
             .to_string();
         let seen = Arc::new(Mutex::new(Vec::new()));
         let mine = Arc::clone(&seen);
-        std::thread::spawn(move || {
+        let peer = std::thread::spawn(move || {
             let Ok((mut sock, _)) = listener.accept() else {
                 return;
             };
@@ -749,7 +779,11 @@ mod tests {
             // cached is still there for the next migration in the test.
             while sock.read(&mut chunk).is_ok_and(|n| n > 0) {}
         });
-        Fake { port, seen }
+        Fake {
+            port,
+            seen,
+            peer: Some(peer),
+        }
     }
 
     /// Split a stream of requests into commands, stopping at a partial one.
