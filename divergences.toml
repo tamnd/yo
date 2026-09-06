@@ -734,16 +734,9 @@ resolved_by = "M8"
 spec = "12 section 7"
 
 [[divergence]]
-id = "D-102"
-title = "pairs(redis) lists nothing because the table is behind an empty proxy"
-reason = "Redis ships a patched Lua 5.1 with a readonly flag on the table itself, and vanilla 5.1 has no such flag. The only way to make a write to an existing field fail is a metatable, and __newindex only fires for keys the table does not have, so the table a script sees has to be empty for the guard to work. It is an empty table with __index pointing at the real one, which means every read works, every write raises the sentence a real server raises, and a traversal finds no keys. The other way round would give pairs the right twenty two names and let a script overwrite redis.call, which is the trade that matters: a script that enumerates the redis table is doing something unusual, and a script that overwrites redis.call breaks every script that runs after it. The names are all still readable one at a time, and redis.nosuchfield still reads as nil."
-status = "permanent"
-spec = "12 section 7"
-
-[[divergence]]
 id = "D-103"
 title = "Writing an existing global through the _G name is accepted and then undone"
-reason = "This is the same vanilla Lua 5.1 limit D-102 is about, applied to the global table instead of the redis table, and the choice was made the other way. A plain global write is caught, because a script runs in an empty environment whose __newindex fires on everything, so x = 1 and pcall = 1 both raise the sentence a real server raises. Reaching through the _G name to a field that already exists, as in _G.pcall = 1, is the one hole a metatable cannot close, and closing it would mean putting the global table behind an empty proxy as well, which would make pairs(_G) list nothing. Enumerating the globals is a thing scripts and test suites actually do and overwriting them through _G is not, so the table stays enumerable. What stops it mattering is that every run ends by walking the global table and putting back anything that moved, so a script that does this can only break itself and the next script on that thread starts from a clean table."
+reason = "Redis ships a patched Lua 5.1 with a readonly flag on the table itself and vanilla 5.1 has no such flag, so the only way to refuse a write here is a metatable, and __newindex only fires for keys the table does not have. A plain global write is caught, because a script runs in an empty environment whose __newindex fires on everything, so x = 1 and pcall = 1 both raise the sentence a real server raises. Reaching through the _G name to a field that already exists, as in _G.pcall = 1, is the one hole that leaves. Closing it would mean putting the global table behind an empty proxy, the way the redis table is, and the global table is the environment every script runs in, so that would put a metatable lookup in front of every read of every global in every script for the sake of a write nobody makes. What stops it mattering is that every run ends by walking the global table and putting back anything that moved, so a script that does this can only break itself and the next script on that thread starts from a clean table."
 status = "permanent"
 spec = "12 section 7"
 

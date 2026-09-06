@@ -3824,6 +3824,94 @@ mod tests {
     }
 
     #[test]
+    fn a_script_can_walk_the_redis_table_it_is_not_allowed_to_write_to() {
+        let mut f = Fixture::new();
+        // The guard in front of the table is empty, so the three base library
+        // readers that skip a metatable are pointed at the real table behind
+        // it. A script counts what a real server counts.
+        assert_eq!(
+            f.run(&[
+                b"EVAL",
+                b"local n = 0 for k in pairs(redis) do n = n + 1 end return n",
+                b"0",
+            ]),
+            ":23\r\n"
+        );
+        assert_eq!(
+            f.run(&[
+                b"EVAL",
+                b"local t = {} for k in pairs(redis) do t[#t+1] = k end \
+                  table.sort(t) return table.concat(t, ' ')",
+                b"0",
+            ]),
+            "$243\r\nLOG_DEBUG LOG_NOTICE LOG_VERBOSE LOG_WARNING REDIS_VERSION \
+             REDIS_VERSION_NUM REPL_ALL REPL_AOF REPL_NONE REPL_REPLICA REPL_SLAVE \
+             acl_check_cmd breakpoint call debug error_reply log pcall replicate_commands \
+             set_repl setresp sha1hex status_reply\r\n"
+        );
+        // The loop hands over the values as well as the names, so the twelve
+        // helpers are callable from inside a traversal and not just findable.
+        assert_eq!(
+            f.run(&[
+                b"EVAL",
+                b"local n = 0 for k, v in pairs(redis) do \
+                  if type(v) == 'function' then n = n + 1 end end return n",
+                b"0",
+            ]),
+            ":12\r\n"
+        );
+        // The other two readers agree with it.
+        assert_eq!(
+            f.run(&[b"EVAL", b"return type(next(redis))", b"0"]),
+            "$6\r\nstring\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"EVAL", b"return type(rawget(redis, 'call'))", b"0"]),
+            "$8\r\nfunction\r\n"
+        );
+        assert_eq!(
+            f.run(&[
+                b"EVAL",
+                b"return tostring(rawget(redis, 'nosuchfield'))",
+                b"0",
+            ]),
+            "$3\r\nnil\r\n"
+        );
+        // Reading round the guard is the only thing that was given back. A
+        // write still lands on the guard and still raises.
+        for body in [&b"redis.call = 1"[..], b"rawset(redis, 'call', 1)"] {
+            assert!(
+                f.run(&[b"EVAL", body, b"0"])
+                    .contains("Attempt to modify a readonly table script: "),
+                "{body:?}",
+            );
+        }
+        // A table nobody guards walks the way it always did, whether a script
+        // made it or the standard library did.
+        assert_eq!(
+            f.run(&[
+                b"EVAL",
+                b"local t = {a=1,b=2} local n = 0 for k in pairs(t) do n = n + 1 end return n",
+                b"0",
+            ]),
+            ":2\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"EVAL", b"return tostring(next({}))", b"0"]),
+            "$3\r\nnil\r\n"
+        );
+        assert_eq!(
+            f.run(&[
+                b"EVAL",
+                b"local f for k, v in pairs(string) do if k == 'sub' then f = v end end \
+                  return type(f)",
+                b"0",
+            ]),
+            "$8\r\nfunction\r\n"
+        );
+    }
+
+    #[test]
     fn command_getkeys_reads_the_key_count_out_of_a_script_call() {
         let mut f = Fixture::new();
         assert_eq!(
