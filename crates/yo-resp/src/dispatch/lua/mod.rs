@@ -413,7 +413,8 @@ end
 -- this thread would find `redis.call` was a number. A real server closes that
 -- with a change to its own copy of Lua that vanilla 5.1 does not have. An empty
 -- table in front costs one more lookup per call and closes it here. What it
--- costs a script is `pairs(redis)`, which lists nothing, and that is D-102.
+-- would cost a script is `pairs(redis)`, and the three readers further down
+-- give that back.
 local front = {__index = lib, __newindex = readonly}
 local proxy = setmetatable({}, front)
 rawset(_G, 'redis', proxy)
@@ -611,11 +612,12 @@ end)
 -- above already covers, and is here for the `_G.x = 1` spelling.
 --
 -- It catches a name that is not there and not a name that is, because
--- `__newindex` only fires for keys a table does not have and this table has to
--- stay enumerable so that `pairs(_G)` answers. That is the opposite of the
--- choice made for the `redis` table a few paragraphs up, for the opposite
--- reason, and it is D-103. `_G.pcall = 1` therefore lands, and `restore` below
--- takes it back out before the next script sees the table.
+-- `__newindex` only fires for keys a table does not have. The `redis` table a
+-- few paragraphs up closes that hole by hiding behind an empty proxy, and this
+-- table cannot, because it is the environment every script runs in and a proxy
+-- would put a metatable lookup in front of every read of every global. So
+-- `_G.pcall = 1` lands, which is D-103, and `restore` below takes it back out
+-- before the next script sees the table.
 local guard = {
   __index = function(_, name)
     error("Script attempted to access nonexistent global variable '" .. tostring(name) .. "'", 2)
@@ -659,6 +661,37 @@ rawset(_G, 'getmetatable', function(t)
     return answer
   end
   return rawgetmeta(t)
+end)
+
+-- The three base functions that read a table without asking the table.
+--
+-- The empty proxy that closes `redis.call = 1` closes `pairs(redis)` with it,
+-- since a traversal of an empty table finds nothing where a real server's
+-- traversal finds every name, and the same goes for `next` and `rawget`. It
+-- does not have to. The proxy is ours and the table behind it is ours, so a
+-- read that walks round a metatable can be pointed at the real table while
+-- every write still lands on the guard. A script gets back exactly what a real
+-- server hands it and can still do nothing with it.
+--
+-- Only these three, because they are the only readers in the base library that
+-- skip `__index`. Everything else already goes through the metatable and
+-- already sees the real names.
+local mirror = {}
+mirror[proxy] = lib
+
+local rawrawget, rawnext, rawpairs = rawget, next, pairs
+rawset(_G, 'rawget', function(t, name)
+  return rawrawget(mirror[t] or t, name)
+end)
+rawset(_G, 'next', function(t, name)
+  return rawnext(mirror[t] or t, name)
+end)
+rawset(_G, 'pairs', function(t)
+  local real = mirror[t]
+  if real == nil then return rawpairs(t) end
+  -- The raw one, so that a script cannot make the loop lie by replacing the
+  -- global `next` it would otherwise have been handed.
+  return rawnext, real, nil
 end)
 
 -- What the global table looks like before any script has run. Taken last, so it
@@ -769,8 +802,11 @@ mod tests {
     #[test]
     fn the_redis_table_holds_the_names_a_script_calls() {
         let lua = interpreter().expect("prelude");
-        // What a script sees is an empty table with the real one behind it,
-        // which is D-102, so the names are on the other side of `__index`.
+        // The table under the name is the empty guard with the real one behind
+        // it, and mlua walks it with the raw `lua_next` rather than the wrapped
+        // `pairs` the prelude puts on the global table, so this is the one view
+        // in the world that finds nothing. A script gets the other one, and the
+        // end to end tests are where that is checked.
         let seen: Table = lua.globals().get("redis").expect("redis");
         assert_eq!(names(&seen), "");
         let front = seen.metatable().expect("front");
