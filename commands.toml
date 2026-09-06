@@ -3073,7 +3073,7 @@ plan = "none"
 bounded = "inherent"
 status = "shipped"
 wire = "verified"
-notes = "The index and every alias pointing at it go, and DD is taken and does nothing because there are no indexed documents to delete yet. It counts its own arguments rather than leaving it to the arity in the table, and the sentence it writes when the count is wrong names the command with an underscore in front of it, so a client sending three arguments and a word that is not DD is told about '_FT.DROPINDEX' with a leading underscore that is not in the name it sent. That is the module quoting its own internal registration and it is copied because a client can see it."
+notes = "The index and every alias pointing at it go, and DD deletes the documents the index actually read as well. Only those: a key under the same prefix the index never read, because it was the wrong type or a FILTER threw it out, stays where it is. The keys go from the database the drop ran on rather than the one the index was made on, so a DD sent from database one takes nothing off database zero, which is measured. It counts its own arguments rather than leaving it to the arity in the table, and the sentence it writes when the count is wrong names the command with an underscore in front of it, so a client sending three arguments and a word that is not DD is told about '_FT.DROPINDEX' with a leading underscore that is not in the name it sent. That is the module quoting its own internal registration and it is copied because a client can see it."
 
 [[command]]
 name = "FT._DROPINDEXIFX"
@@ -3095,7 +3095,7 @@ plan = "none"
 bounded = "inherent"
 status = "shipped"
 wire = "verified"
-notes = "The old name for dropping an index, still registered and still working, and not the same command underneath. It does not take DD, it looks the index up before it complains about anything extra after the name, and the complaint is a bare Unknown argument with no word quoted after it. It also carries no since in COMMAND DOCS because the module never documented it, so the version here is the one the module first shipped it in rather than one read off a running server."
+notes = "The old name for dropping an index, still registered and still working, and not the same command underneath. It deletes the documents by default and takes KEEPDOCS to say not to, which is the other way round from FT.DROPINDEX, and neither spelling takes the other one's word: FT.DROP i DD is refused and so is FT.DROPINDEX i KEEPDOCS. It looks the index up before it complains about anything extra after the name, and the complaint is a bare Unknown argument with no word quoted after it. It also carries no since in COMMAND DOCS because the module never documented it, so the version here is the one the module first shipped it in rather than one read off a running server."
 
 [[command]]
 name = "FT._DROPIFX"

@@ -332,6 +332,18 @@ pub(super) struct Fill<'a> {
     pub(super) obeys: bool,
 }
 
+/// What the caller has to do to the keyspace once the registry lock is gone.
+///
+/// Both of these want a stripe and neither can have one here, because the whole
+/// group runs with the registry held and taking a stripe under it is the lock
+/// order a write does not use. So the work comes back out and is done above.
+pub(super) enum After<'a> {
+    /// An index that was just made and wants the keys already there read in.
+    Scan(Fill<'a>),
+    /// An index that was just dropped and wants the keys it followed deleted.
+    Sweep(Vec<Box<[u8]>>),
+}
+
 pub(super) fn execute<'a>(
     server: &Server,
     reg: &mut Registry,
@@ -339,7 +351,7 @@ pub(super) fn execute<'a>(
     spec: &Spec,
     args: Args<'a>,
     out: &mut Out,
-) -> Result<Option<Fill<'a>>> {
+) -> Result<Option<After<'a>>> {
     // The one command in the group that is a container of subcommands, so it
     // writes its own arity and unknown subcommand lines rather than answering
     // in the `Fail` shape the rest of these share.
@@ -347,19 +359,19 @@ pub(super) fn execute<'a>(
         config::run(reg, args, out)?;
         return Ok(None);
     }
-    // The index the caller has to read the keys of, which stays `None` for the
-    // sixteen commands that ask for nothing of the sort and for a create that
-    // answered that the name is taken.
+    // The keyspace work the caller has to do, which stays `None` for the twelve
+    // commands that ask for nothing of the sort, for a create that answered that
+    // the name is taken and for a drop that was told to keep the documents.
     let mut made = None;
     let done = match spec.name {
-        "FT.CREATE" => create(reg, db, args, out, false).map(|name| made = name),
-        "FT._CREATEIFNX" => create(reg, db, args, out, true).map(|name| made = name),
+        "FT.CREATE" => create(reg, db, args, out, false).map(|next| made = next),
+        "FT._CREATEIFNX" => create(reg, db, args, out, true).map(|next| made = next),
         "FT.ALTER" => alter(reg, args, out, false),
         "FT._ALTERIFNX" => alter(reg, args, out, true),
-        "FT.DROPINDEX" => drop_index(reg, spec, args, out, false, true),
-        "FT._DROPINDEXIFX" => drop_index(reg, spec, args, out, true, true),
-        "FT.DROP" => drop_index(reg, spec, args, out, false, false),
-        "FT._DROPIFX" => drop_index(reg, spec, args, out, true, false),
+        "FT.DROPINDEX" => drop_index(reg, spec, args, out, false, true).map(|next| made = next),
+        "FT._DROPINDEXIFX" => drop_index(reg, spec, args, out, true, true).map(|next| made = next),
+        "FT.DROP" => drop_index(reg, spec, args, out, false, false).map(|next| made = next),
+        "FT._DROPIFX" => drop_index(reg, spec, args, out, true, false).map(|next| made = next),
         "FT.INFO" => info(server, reg, args, out),
         "FT._LIST" => list(reg, spec, args, out),
         "FT.ALIASADD" => alias_add(reg, args, out, false),
@@ -374,7 +386,7 @@ pub(super) fn execute<'a>(
         "FT.DICTADD" => dict_add(reg, args, out),
         "FT.DICTDEL" => dict_del(reg, args, out),
         "FT.DICTDUMP" => dict_dump(reg, args, out),
-        "FT.SYNUPDATE" => syn_update(reg, args, out).map(|name| made = name),
+        "FT.SYNUPDATE" => syn_update(reg, args, out).map(|next| made = next),
         "FT.SYNDUMP" => syn_dump(reg, args, out),
         "FT.SPELLCHECK" => spellcheck(reg, args, out),
         other => unreachable!("{other} is not a search command"),
@@ -402,7 +414,7 @@ fn create<'a>(
     args: Args<'a>,
     out: &mut Out,
     ifnx: bool,
-) -> core::result::Result<Option<Fill<'a>>, Fail<'a>> {
+) -> core::result::Result<Option<After<'a>>, Fail<'a>> {
     let name = args.get(1);
     // The `IFNX` shortcut comes first and the database comes second, which is
     // the order a real server checks them in and is visible: `FT._CREATEIFNX`
@@ -428,7 +440,7 @@ fn create<'a>(
     // leave half an index behind.
     let _ = reg.create(Index::new(name, definition, schema));
     out.ok();
-    Ok(Some(Fill { name, obeys: true }))
+    Ok(Some(After::Scan(Fill { name, obeys: true })))
 }
 
 /// The options in front of `SCHEMA`, and where the schema starts.
@@ -1024,11 +1036,17 @@ fn alter<'a>(reg: &mut Registry, args: Args<'a>, out: &mut Out, ifnx: bool) -> A
 
 /// `FT.DROPINDEX index [DD]`, and the three other spellings of it.
 ///
-/// `DD` says to delete the documents the index followed as well as the index
-/// itself. There are no documents under an index yet, so it is taken and does
-/// nothing, which is the right answer for an empty index either way. Only the
-/// two `DROPINDEX` spellings take it: `FT.DROP i DD` is an unknown argument on
-/// a real server, which is the sort of thing that only turns up by asking.
+/// The two spellings take opposite defaults and each takes only its own word,
+/// which is measured and is the whole reason this is one function with a flag
+/// rather than two. `FT.DROPINDEX` keeps the documents and deletes them when it
+/// is given `DD`, and `FT.DROP` deletes them and keeps them when it is given
+/// `KEEPDOCS`. The word the other one takes is an unknown argument on both:
+/// `FT.DROP i DD` is refused and so is `FT.DROPINDEX i KEEPDOCS`.
+///
+/// What comes back is the keys to delete, which are the ones the index actually
+/// read and not the ones its prefix would have covered. A plain string under the
+/// same prefix was never a document, so it stays. They are deleted above rather
+/// than here because the registry is held and a stripe cannot be taken under it.
 ///
 /// The index is looked up before the arguments after it are, so
 /// `FT.DROP nope junk` answers that there is no such index and `FT.DROP i junk`
@@ -1039,8 +1057,8 @@ fn drop_index<'a>(
     args: Args<'a>,
     out: &mut Out,
     ifx: bool,
-    dd: bool,
-) -> Answer<'a> {
+    newer: bool,
+) -> core::result::Result<Option<After<'a>>, Fail<'a>> {
     // All four spellings count their own arguments, which is why the table
     // cannot do it for them. Which name goes in the line depends on which end
     // the count went wrong at: too few names the command plainly and too many
@@ -1058,18 +1076,37 @@ fn drop_index<'a>(
     if !reg.touch(name) {
         if ifx {
             out.ok();
-            return Ok(());
+            return Ok(None);
         }
         return Err(Fail::naming(MISSING, name));
     }
-    if let Some(a) = args.opt(2)
-        && !(dd && args::is(a, b"dd"))
-    {
-        return Err(Fail::plain(UNKNOWN_BARE));
-    }
-    let _ = reg.drop(name);
+    let word = match newer {
+        true => &b"dd"[..],
+        false => &b"keepdocs"[..],
+    };
+    let said = match args.opt(2) {
+        Some(a) if args::is(a, word) => true,
+        Some(_) => return Err(Fail::plain(UNKNOWN_BARE)),
+        None => false,
+    };
+    let index = reg.drop(name);
     out.ok();
-    Ok(())
+    // The newer spelling deletes when it was asked to and the older one deletes
+    // unless it was asked not to, so the word means the same thing on both and
+    // the default does not.
+    if said != newer {
+        return Ok(None);
+    }
+    Ok(index.ok().map(|index| {
+        After::Sweep(
+            index
+                .held
+                .docs
+                .all()
+                .map(|(_, doc)| doc.key.clone())
+                .collect(),
+        )
+    }))
 }
 
 /// `FT._LIST`, every index by name.
@@ -1308,7 +1345,7 @@ fn syn_update<'a>(
     reg: &mut Registry,
     args: Args<'a>,
     out: &mut Out,
-) -> core::result::Result<Option<Fill<'a>>, Fail<'a>> {
+) -> core::result::Result<Option<After<'a>>, Fail<'a>> {
     let name = args.get(1);
     let group = args.get(2);
     let skip = args.opt(3).is_some_and(|a| args::is(a, b"skipinitialscan"));
@@ -1319,7 +1356,7 @@ fn syn_update<'a>(
     };
     index.synonyms.update(group, &terms);
     out.ok();
-    Ok((!skip).then_some(Fill { name, obeys: false }))
+    Ok((!skip).then_some(After::Scan(Fill { name, obeys: false })))
 }
 
 /// `FT.SYNDUMP index`, every term in a group and which groups it is in.
