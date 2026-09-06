@@ -337,20 +337,34 @@ doc = "14"
 [[group]]
 name = "transactions"
 expected = 5
-status = "planned"
+status = "shipped"
 doc = "12 section 4"
-# Not built yet either, and the two halves of it want different things from the
-# threading. EXEC runs a queue of commands with nothing in between, and on a
-# striped keyspace that means holding every stripe the queue names before the
-# first of them runs and letting them all go after the last, taken in stripe
-# order the way a multi key command already takes them. A queue that names keys
-# on every stripe holds the whole database, which is what a real server's EXEC
-# does to the whole server anyway. WATCH is the half that cannot be done on the
-# connection: a client watching a key has to be told about a write another
-# thread made, so what marks the key as touched belongs beside the key and not
-# beside the client. Any version of this that keeps the watched value on the
-# connection and compares it at EXEC is wrong here in a way it was not wrong on
-# one thread, and that is the thing to get right first rather than to register.
+# All five, and the half of it that was worth getting right first is WATCH. A
+# client watching a key has to be told about a write another thread made, so what
+# marks the key as touched belongs beside the key and not beside the client. It
+# is a table on the server keyed by database and key, each row carrying a stamp
+# and whether the key was there at the last look, and every write bumps the rows
+# for the keys it named. A watch records the stamp it saw and EXEC fails when one
+# moved. The version that keeps the watched value on the connection and compares
+# it at EXEC would have been right on one thread and useless on several, because
+# another thread can write and undo a key between the two reads. What it costs a
+# server nobody has sent WATCH to is one relaxed load per write, since the row
+# count is zero and everything else is behind that.
+#
+# The row's liveness is what reproduces Redis's one exception, that deleting a
+# key which was not there does not dirty a watch, and EXEC comparing liveness
+# again is what covers expiry and eviction, neither of which passes through the
+# command layer at all.
+#
+# The queue is the wire bytes of each command rather than its decoded arguments,
+# because the arguments are slices of a read buffer the next command reuses.
+# EXEC decodes them again and sends each one back through the same funnel a fresh
+# command takes, so a queued command is counted in INFO commandstats and touches
+# watched keys without any of that being written twice.
+#
+# What is left is the atomicity, which is D-112. EXEC runs its queue with nothing
+# in between on a server with one shard thread, which is the default, and with
+# --threads above one another thread's command can land between two queued ones.
 
 [[group]]
 name = "scripting"
@@ -4816,6 +4830,66 @@ status = "shipped"
 divergent = "D-110"
 wire = "verified"
 notes = "FCALL against a function the library registered no-writes. A function without the flag is refused at the door rather than from inside, which is the opposite of EVAL_RO and is right for the same reason: the library already said what the function does."
+
+# --------------------------------------------------------------- transactions
+
+[[command]]
+name = "MULTI"
+group = "transactions"
+since = "2.0.0"
+arity = 1
+plan = "none"
+bounded = "inherent"
+status = "shipped"
+wire = "verified"
+divergent = "D-114"
+notes = "Opens a queue on the connection and touches nothing else. Nested MULTI is an error the command raises rather than one the funnel raises, which is the difference that decides whether the transaction survives it, and it does."
+
+[[command]]
+name = "EXEC"
+group = "transactions"
+since = "1.2.0"
+arity = 1
+plan = "none"
+bounded = "risk"
+status = "shipped"
+wire = "verified"
+divergent = "D-112"
+notes = "Decodes each queued command from the wire bytes it was held as and sends it back through the dispatcher, so a queued command is counted, checked against maxmemory and marks watched keys the same way a fresh one is. The cost is whatever the queue costs, which is why the bound is a risk. Aborts before it runs anything if a queued command was refused when it was sent, and answers a null array if a watched key moved."
+
+[[command]]
+name = "DISCARD"
+group = "transactions"
+since = "2.0.0"
+arity = 1
+plan = "none"
+bounded = "yes"
+status = "shipped"
+wire = "verified"
+notes = "Drops the queue and every watch the connection was holding, which is the same thing a finished EXEC does."
+
+[[command]]
+name = "WATCH"
+group = "transactions"
+since = "2.2.0"
+arity = -2
+plan = "point"
+bounded = "yes"
+status = "shipped"
+wire = "verified"
+divergent = "D-113"
+notes = "One probe per key, for whether it is there, and one row per key on the server carrying the stamp the connection remembers. Watching the same key twice is one watch, since the row counts watchers and letting go twice would take somebody else's row with it."
+
+[[command]]
+name = "UNWATCH"
+group = "transactions"
+since = "2.2.0"
+arity = 1
+plan = "none"
+bounded = "yes"
+status = "shipped"
+wire = "verified"
+notes = "Lets go of every row this connection was holding, dropping each one that nobody else is watching."
 
 # ----------------------------------------------------------------- connection
 

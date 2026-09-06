@@ -71,6 +71,7 @@ mod keyspace;
 mod lists;
 mod lua;
 mod migrate;
+mod multi;
 mod scan;
 mod scripting;
 mod search;
@@ -103,6 +104,7 @@ use yo_kv::cold::Store;
 use yo_kv::{Clock, Db, Keyspace};
 use yo_search::Registry;
 
+use multi::Watches;
 use search::cursor::Cursors;
 
 /// How many databases a server has.
@@ -724,6 +726,20 @@ pub struct Server {
     /// of that. So the command says stop and the driver stops, on the same turn
     /// and through the same door a signal uses.
     stopping: AtomicBool,
+    /// Every key any connection is watching, with a stamp on each.
+    ///
+    /// Here and not on the connection, and that is the whole design of `WATCH`
+    /// rather than an implementation detail. A connection cannot see a write
+    /// another thread made, so what records the write has to sit beside the key.
+    /// See the `multi` module for the rest of it.
+    watches: Lock<Watches>,
+    /// How many watched keys there are, so the write path can ask without
+    /// taking the lock.
+    ///
+    /// Zero on every server nobody has sent `WATCH` to, which is very nearly all
+    /// of them, and that is what keeps the cost of watches on a server that has
+    /// none down to one relaxed load per write.
+    watched: AtomicUsize,
 }
 
 impl Server {
@@ -761,6 +777,8 @@ impl Server {
             scripts: Lock::default(),
             libraries: Lock::default(),
             stopping: AtomicBool::new(false),
+            watches: Lock::default(),
+            watched: AtomicUsize::new(0),
         }
     }
 
@@ -821,6 +839,8 @@ impl Server {
             scripts: Lock::default(),
             libraries: Lock::default(),
             stopping: AtomicBool::new(false),
+            watches: Lock::default(),
+            watched: AtomicUsize::new(0),
         }
     }
 
@@ -1631,6 +1651,28 @@ impl Server {
     }
 }
 
+impl Server {
+    /// Whether anybody is watching anything.
+    ///
+    /// The one thing every write asks about watches, and it is a relaxed load of
+    /// a word that is zero and shared on a server where no client has ever sent
+    /// `WATCH`. Relaxed is enough because the answer only has to be right by the
+    /// time it matters: a `WATCH` that has not been published yet has not
+    /// returned to its client either, so no client can have started a
+    /// transaction that depends on it.
+    fn watching(&self) -> bool {
+        self.watched.load(Relaxed) != 0
+    }
+
+    /// Note how many watched keys there are, after the table changed.
+    ///
+    /// Taken from the table under the same lock the change was made under, so
+    /// the count can never say nobody is watching while somebody is.
+    fn recount(&self, watches: &Watches) {
+        self.watched.store(watches.len(), Relaxed);
+    }
+}
+
 impl Default for Server {
     fn default() -> Server {
         Server::new()
@@ -1658,6 +1700,19 @@ pub struct Session {
     /// waited its full timeout would have got. That is a real server's rule and
     /// it is why `BLPOP` is not on the list a script may not call.
     scripted: bool,
+    /// The commands held since `MULTI`, `None` when no transaction is open.
+    ///
+    /// Connection state and nothing else. A transaction is invisible to every
+    /// other connection until `EXEC` runs it, and a connection that goes away
+    /// with one open has simply not run it.
+    multi: Option<multi::Queue>,
+    /// What this connection asked `WATCH` about, and what those keys looked
+    /// like at the time.
+    ///
+    /// The other half is on the server, beside the keys, because a write by
+    /// another thread has to reach it. See `multi` for why keeping the value
+    /// here and comparing it at `EXEC` is not the same thing.
+    watching: Vec<multi::Watched>,
 }
 
 impl Session {
@@ -1670,6 +1725,8 @@ impl Session {
             name: Vec::new(),
             sets: himport::Fieldsets::default(),
             scripted: false,
+            multi: None,
+            watching: Vec::new(),
         }
     }
 
@@ -1718,6 +1775,17 @@ impl Session {
     }
 }
 
+/// Give back everything a connection was holding on the server.
+///
+/// Today that is the transaction and the watches, and it is here rather than in
+/// [`Session::reset`] because letting go of a watch is a change to the server.
+/// A `Session` on its own cannot reach one, and a connection that dropped its
+/// list without saying so would leave rows nobody is watching, which would keep
+/// every write on the server paying for watches that are not there.
+pub fn forget_session(server: &Server, session: &mut Session) {
+    multi::release(server, session);
+}
+
 /// Run one command and write its reply.
 ///
 /// The name is looked up and the arity is checked here, once, so that no body
@@ -1754,13 +1822,32 @@ pub fn resolved(
     }
     server.mine().stats.commands.bump();
 
+    // The four refusals below are the ones a real server makes in
+    // `processCommand`, before the command's own body is reached, and they are
+    // the ones that kill an open transaction. That is the whole of the rule: an
+    // error raised here means `EXEC` will refuse to run anything, and an error
+    // raised by a command body does not, which is why `MULTI` inside `MULTI`
+    // complains and leaves the transaction alive.
     let Some(spec) = spec else {
-        write_error(out, &args::unknown_command(args));
+        multi::refuse(server, session, None, &args::unknown_command(args), out);
         return Flow::Continue;
     };
     if !arity_ok(spec, args.len()) {
         server.mine().cmdstats.at(spec).rejected.bump();
-        write_error(out, &args::wrong_arity(spec.name));
+        multi::refuse(
+            server,
+            session,
+            Some(spec),
+            &args::wrong_arity(spec.name),
+            out,
+        );
+        return Flow::Continue;
+    }
+    if session.in_multi()
+        && let Some(e) = multi::refused_in_multi(spec)
+    {
+        server.mine().cmdstats.at(spec).rejected.bump();
+        multi::refuse(server, session, Some(spec), &e, out);
         return Flow::Continue;
     }
 
@@ -1775,8 +1862,17 @@ pub fn resolved(
     // left, which is what lets a client dig itself out with `DEL`.
     if server.maxmemory() != 0 && !server.make_room() && spec.flags.contains(&"denyoom") {
         server.mine().cmdstats.at(spec).rejected.bump();
+        session.dirty_multi();
         out.error_line(b"OOM ", OOM);
         return Flow::Continue;
+    }
+
+    // Held rather than run, and the reply is `QUEUED`. After the refusals above
+    // and before everything below, which is where a real server puts it: a
+    // command has to be a real command with the right number of arguments to be
+    // queued at all, and nothing it would have done gets done now.
+    if session.queues(spec.name) {
+        return multi::queue(session, args, out);
     }
 
     // Which databases the maintenance turn after this batch has to ask. Marked
@@ -1997,6 +2093,7 @@ pub fn resolved(
             "scripting" => {
                 scripting::execute(server, session, spec, args, out).map(|()| Flow::Continue)
             }
+            "transactions" => multi::execute(server, session, spec, args, out),
             _ => server::execute(server, session, spec, args, out),
         }
     };
@@ -2008,6 +2105,14 @@ pub fn resolved(
             Flow::Continue
         }
     };
+
+    // After the command rather than before, so that whether each key it named is
+    // there is read at the moment a real server would have signalled the change.
+    // The load is what this costs a server nobody has sent `WATCH` to, and the
+    // flag is Redis's own, so a command that only reads is never asked.
+    if server.watching() && spec.flags.contains(&"write") {
+        multi::touched(server, session, spec, args);
+    }
 
     // Counted here and not before the call, which is where Redis counts it, so
     // that `INFO commandstats` leaves out the `INFO` that asked for it in the
@@ -2123,6 +2228,33 @@ mod tests {
             self.server.advance_clock_ms(ms);
         }
 
+        /// Run one command as a second connection to the same server.
+        ///
+        /// What `WATCH` is for is a write another connection made, and a test
+        /// that only has one connection cannot tell the two apart.
+        fn other(&mut self, parts: &[&[u8]]) -> String {
+            self.other_in(self.session.db(), parts)
+        }
+
+        /// The same, on a database of its own.
+        fn other_in(&mut self, db: usize, parts: &[&[u8]]) -> String {
+            let mut session = Session::new(8);
+            session.db = db;
+            let reply = self.by(&mut session, parts);
+            forget_session(&self.server, &mut session);
+            reply
+        }
+
+        /// Run one command on a session the caller holds.
+        fn by(&mut self, session: &mut Session, parts: &[&[u8]]) -> String {
+            let wire = encode(parts);
+            let mut argv = Argv::new();
+            argv.decode(&wire, &Limits::default()).unwrap();
+            let mut out = Out::new(Proto::Resp2);
+            execute(&self.server, session, Args::new(&argv, &wire), &mut out);
+            String::from_utf8_lossy(out.as_slice()).into_owned()
+        }
+
         /// The same, with what the connection should do next.
         fn flow(&mut self, parts: &[&[u8]]) -> (Flow, String) {
             let wire = encode(parts);
@@ -2139,6 +2271,321 @@ mod tests {
                 String::from_utf8_lossy(self.out.as_slice()).into_owned(),
             )
         }
+    }
+
+    #[test]
+    fn multi_holds_commands_and_exec_runs_them() {
+        let mut f = Fixture::new();
+        assert_eq!(f.run(&[b"MULTI"]), "+OK\r\n");
+        assert_eq!(f.run(&[b"SET", b"k", b"1"]), "+QUEUED\r\n");
+        assert_eq!(f.run(&[b"INCR", b"k"]), "+QUEUED\r\n");
+        // Nothing ran while it was being queued.
+        assert_eq!(f.other(&[b"GET", b"k"]), "$-1\r\n");
+        assert_eq!(f.run(&[b"EXEC"]), "*2\r\n+OK\r\n:2\r\n");
+        assert_eq!(f.run(&[b"GET", b"k"]), "$1\r\n2\r\n");
+    }
+
+    #[test]
+    fn an_empty_transaction_answers_an_empty_array() {
+        let mut f = Fixture::new();
+        f.run(&[b"MULTI"]);
+        assert_eq!(f.run(&[b"EXEC"]), "*0\r\n");
+    }
+
+    #[test]
+    fn exec_and_discard_want_a_transaction_to_be_open() {
+        let mut f = Fixture::new();
+        assert_eq!(f.run(&[b"EXEC"]), "-ERR EXEC without MULTI\r\n");
+        assert_eq!(f.run(&[b"DISCARD"]), "-ERR DISCARD without MULTI\r\n");
+        // And `UNWATCH` does not, which is the one of the three that is happy
+        // being sent for no reason.
+        assert_eq!(f.run(&[b"UNWATCH"]), "+OK\r\n");
+    }
+
+    #[test]
+    fn an_error_a_command_body_raises_leaves_the_transaction_alive() {
+        let mut f = Fixture::new();
+        f.run(&[b"MULTI"]);
+        assert_eq!(
+            f.run(&[b"MULTI"]),
+            "-ERR MULTI calls can not be nested\r\n",
+            "nested MULTI is raised by the command and not by the funnel"
+        );
+        assert_eq!(
+            f.run(&[b"WATCH", b"k"]),
+            "-ERR WATCH inside MULTI is not allowed\r\n"
+        );
+        f.run(&[b"SET", b"k", b"1"]);
+        assert_eq!(f.run(&[b"EXEC"]), "*1\r\n+OK\r\n");
+    }
+
+    #[test]
+    fn an_error_the_funnel_raises_kills_the_transaction() {
+        for bad in [
+            &[b"NOSUCHCOMMAND".as_slice()] as &[&[u8]],
+            &[b"GET".as_slice()],
+        ] {
+            let mut f = Fixture::new();
+            f.run(&[b"MULTI"]);
+            assert!(f.run(bad).starts_with("-ERR "));
+            assert_eq!(
+                f.run(&[b"SET", b"k", b"1"]),
+                "+QUEUED\r\n",
+                "a dead transaction still answers QUEUED, which is Redis"
+            );
+            assert_eq!(
+                f.run(&[b"EXEC"]),
+                "-EXECABORT Transaction discarded because of previous errors.\r\n"
+            );
+            assert_eq!(f.run(&[b"GET", b"k"]), "$-1\r\n");
+        }
+    }
+
+    #[test]
+    fn exec_with_an_argument_is_an_abort_and_not_an_arity_error() {
+        let mut f = Fixture::new();
+        f.run(&[b"MULTI"]);
+        f.run(&[b"SET", b"k", b"1"]);
+        assert_eq!(
+            f.run(&[b"EXEC", b"x"]),
+            "-EXECABORT Transaction discarded because of: wrong number of arguments for 'exec' command\r\n"
+        );
+        assert_eq!(f.run(&[b"EXEC"]), "-ERR EXEC without MULTI\r\n");
+        assert_eq!(f.run(&[b"GET", b"k"]), "$-1\r\n");
+    }
+
+    #[test]
+    fn a_command_a_transaction_may_not_hold_kills_it() {
+        let mut f = Fixture::new();
+        f.run(&[b"MULTI"]);
+        assert_eq!(
+            f.run(&[b"SHUTDOWN", b"NOSAVE"]),
+            "-ERR Command not allowed inside a transaction\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"EXEC"]),
+            "-EXECABORT Transaction discarded because of previous errors.\r\n"
+        );
+    }
+
+    #[test]
+    fn a_failing_command_inside_exec_is_an_element_and_the_rest_still_runs() {
+        let mut f = Fixture::new();
+        f.run(&[b"RPUSH", b"l", b"v"]);
+        f.run(&[b"MULTI"]);
+        f.run(&[b"INCR", b"l"]);
+        f.run(&[b"SET", b"y", b"2"]);
+        assert_eq!(
+            f.run(&[b"EXEC"]),
+            "*2\r\n-WRONGTYPE Operation against a key holding the wrong kind of value\r\n+OK\r\n"
+        );
+        assert_eq!(f.run(&[b"GET", b"y"]), "$1\r\n2\r\n");
+    }
+
+    #[test]
+    fn discard_and_reset_both_throw_the_queue_away() {
+        let mut f = Fixture::new();
+        f.run(&[b"MULTI"]);
+        f.run(&[b"SET", b"k", b"1"]);
+        assert_eq!(f.run(&[b"DISCARD"]), "+OK\r\n");
+        assert_eq!(f.run(&[b"EXEC"]), "-ERR EXEC without MULTI\r\n");
+        assert_eq!(f.run(&[b"GET", b"k"]), "$-1\r\n");
+
+        f.run(&[b"MULTI"]);
+        f.run(&[b"SET", b"k", b"1"]);
+        assert_eq!(f.run(&[b"RESET"]), "+RESET\r\n");
+        assert_eq!(f.run(&[b"EXEC"]), "-ERR EXEC without MULTI\r\n");
+        assert_eq!(f.run(&[b"GET", b"k"]), "$-1\r\n");
+    }
+
+    #[test]
+    fn select_is_queued_and_applied_when_exec_runs_it() {
+        let mut f = Fixture::new();
+        f.run(&[b"MULTI"]);
+        assert_eq!(f.run(&[b"SELECT", b"3"]), "+QUEUED\r\n");
+        f.run(&[b"SET", b"k", b"1"]);
+        assert_eq!(f.run(&[b"EXEC"]), "*2\r\n+OK\r\n+OK\r\n");
+        assert_eq!(f.session.db(), 3, "the SELECT applied and stayed applied");
+        assert_eq!(f.run(&[b"GET", b"k"]), "$1\r\n1\r\n");
+    }
+
+    #[test]
+    fn a_write_by_another_connection_fails_the_transaction() {
+        let mut f = Fixture::new();
+        f.run(&[b"SET", b"k", b"1"]);
+        assert_eq!(f.run(&[b"WATCH", b"k"]), "+OK\r\n");
+        f.other(&[b"SET", b"k", b"2"]);
+        f.run(&[b"MULTI"]);
+        f.run(&[b"GET", b"k"]);
+        assert_eq!(f.run(&[b"EXEC"]), "*-1\r\n");
+    }
+
+    #[test]
+    fn a_write_that_puts_the_same_value_back_still_fails_it() {
+        let mut f = Fixture::new();
+        f.run(&[b"SET", b"k", b"1"]);
+        f.run(&[b"WATCH", b"k"]);
+        f.other(&[b"SET", b"k", b"1"]);
+        f.run(&[b"MULTI"]);
+        assert_eq!(f.run(&[b"EXEC"]), "*-1\r\n");
+    }
+
+    #[test]
+    fn a_read_by_another_connection_does_not() {
+        let mut f = Fixture::new();
+        f.run(&[b"SET", b"k", b"1"]);
+        f.run(&[b"WATCH", b"k"]);
+        f.other(&[b"GET", b"k"]);
+        f.other(&[b"STRLEN", b"k"]);
+        f.run(&[b"MULTI"]);
+        f.run(&[b"GET", b"k"]);
+        assert_eq!(f.run(&[b"EXEC"]), "*1\r\n$1\r\n1\r\n");
+    }
+
+    #[test]
+    fn deleting_a_key_that_was_never_there_does_not_fail_a_watch_on_it() {
+        let mut f = Fixture::new();
+        f.run(&[b"WATCH", b"k"]);
+        f.other(&[b"DEL", b"k"]);
+        f.run(&[b"MULTI"]);
+        f.run(&[b"PING"]);
+        assert_eq!(f.run(&[b"EXEC"]), "*1\r\n+PONG\r\n");
+        // And creating it does, which is the other half of the same rule.
+        f.run(&[b"WATCH", b"k"]);
+        f.other(&[b"SET", b"k", b"1"]);
+        f.run(&[b"MULTI"]);
+        assert_eq!(f.run(&[b"EXEC"]), "*-1\r\n");
+    }
+
+    #[test]
+    fn a_watched_key_that_expires_fails_the_transaction() {
+        let mut f = Fixture::new();
+        f.run(&[b"SET", b"k", b"1", b"PX", b"50"]);
+        f.run(&[b"WATCH", b"k"]);
+        f.run(&[b"MULTI"]);
+        f.advance(100);
+        assert_eq!(
+            f.run(&[b"EXEC"]),
+            "*-1\r\n",
+            "nothing wrote to the key, so only the liveness check can catch this"
+        );
+    }
+
+    #[test]
+    fn every_way_a_transaction_ends_lets_go_of_the_watches() {
+        for end in [
+            &[b"EXEC".as_slice()] as &[&[u8]],
+            &[b"DISCARD".as_slice()],
+            &[b"UNWATCH".as_slice()],
+            &[b"RESET".as_slice()],
+        ] {
+            let mut f = Fixture::new();
+            f.run(&[b"SET", b"k", b"1"]);
+            f.run(&[b"WATCH", b"k"]);
+            if end[0] != b"UNWATCH" && end[0] != b"RESET" {
+                f.run(&[b"MULTI"]);
+            }
+            f.run(end);
+            assert!(!f.server.watching(), "{end:?} left a row behind");
+            // And the connection can start again with nothing carried over.
+            f.other(&[b"SET", b"k", b"2"]);
+            f.run(&[b"MULTI"]);
+            f.run(&[b"GET", b"k"]);
+            assert_eq!(f.run(&[b"EXEC"]), "*1\r\n$1\r\n2\r\n");
+        }
+    }
+
+    #[test]
+    fn a_connection_going_away_lets_go_of_its_watches() {
+        let mut f = Fixture::new();
+        f.run(&[b"SET", b"k", b"1"]);
+        f.run(&[b"WATCH", b"k"]);
+        assert!(f.server.watching());
+        forget_session(&f.server, &mut f.session);
+        assert!(!f.server.watching());
+    }
+
+    #[test]
+    fn watching_the_same_key_twice_is_one_watch() {
+        let mut f = Fixture::new();
+        f.run(&[b"SET", b"k", b"1"]);
+        f.run(&[b"WATCH", b"k", b"k"]);
+        f.run(&[b"UNWATCH"]);
+        assert!(
+            !f.server.watching(),
+            "the row counts watchers, so a doubled watch would leave one behind"
+        );
+    }
+
+    #[test]
+    fn two_connections_can_watch_the_same_key() {
+        let mut f = Fixture::new();
+        f.run(&[b"SET", b"k", b"1"]);
+        f.run(&[b"WATCH", b"k"]);
+        let mut second = Session::new(9);
+        second.db = f.session.db();
+        assert_eq!(f.by(&mut second, &[b"WATCH", b"k"]), "+OK\r\n");
+        // One lets go and the other's watch still works.
+        forget_session(&f.server, &mut second);
+        assert!(f.server.watching());
+        f.other(&[b"SET", b"k", b"2"]);
+        f.run(&[b"MULTI"]);
+        assert_eq!(f.run(&[b"EXEC"]), "*-1\r\n");
+    }
+
+    #[test]
+    fn flushdb_fails_a_watch_on_a_key_that_was_there() {
+        let mut f = Fixture::new();
+        f.run(&[b"SET", b"k", b"1"]);
+        f.run(&[b"WATCH", b"k"]);
+        f.other(&[b"FLUSHDB"]);
+        f.run(&[b"MULTI"]);
+        assert_eq!(f.run(&[b"EXEC"]), "*-1\r\n");
+    }
+
+    #[test]
+    fn flushdb_does_not_fail_a_watch_on_a_key_that_was_not() {
+        let mut f = Fixture::new();
+        f.run(&[b"WATCH", b"k"]);
+        f.other(&[b"FLUSHDB"]);
+        f.run(&[b"MULTI"]);
+        f.run(&[b"PING"]);
+        assert_eq!(f.run(&[b"EXEC"]), "*1\r\n+PONG\r\n");
+    }
+
+    #[test]
+    fn a_watch_is_on_a_database_and_a_key_and_not_on_a_key() {
+        let mut f = Fixture::new();
+        f.run(&[b"SET", b"k", b"1"]);
+        f.run(&[b"WATCH", b"k"]);
+        // The same name in another database is another key.
+        let elsewhere = f.session.db() + 1;
+        f.other_in(elsewhere, &[b"SET", b"k", b"9"]);
+        f.run(&[b"MULTI"]);
+        f.run(&[b"GET", b"k"]);
+        assert_eq!(f.run(&[b"EXEC"]), "*1\r\n$1\r\n1\r\n");
+    }
+
+    #[test]
+    fn a_write_that_reaches_a_key_it_did_not_name_still_fails_a_watch() {
+        let mut f = Fixture::new();
+        f.run(&[b"RPUSH", b"src", b"1"]);
+        f.run(&[b"WATCH", b"dst"]);
+        f.other(&[b"SORT", b"src", b"STORE", b"dst"]);
+        f.run(&[b"MULTI"]);
+        assert_eq!(
+            f.run(&[b"EXEC"]),
+            "*-1\r\n",
+            "SORT is movablekeys, so every watched key in the database is asked"
+        );
+    }
+
+    #[test]
+    fn a_server_nobody_is_watching_says_so() {
+        let mut f = Fixture::new();
+        assert!(!f.server.watching());
+        f.run(&[b"SET", b"k", b"1"]);
+        assert!(!f.server.watching());
     }
 
     /// What a client does all day: write the same keys again and again. Every

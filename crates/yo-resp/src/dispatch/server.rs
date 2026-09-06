@@ -16,7 +16,7 @@
 
 use super::args::{self, Args, is};
 use super::table::{self, Spec};
-use super::{DATABASES, Flow, Server, Session, backup, cpu};
+use super::{DATABASES, Flow, Server, Session, backup, cpu, multi};
 use crate::proto::Proto;
 use crate::reply::Out;
 use core::fmt::Write;
@@ -268,6 +268,14 @@ pub(super) fn execute(
             // Everything a connection carries goes back to what it was when it
             // was opened, and that includes the protocol: a connection that
             // said `HELLO 3` is speaking RESP2 again after this.
+            //
+            // The transaction and the watches go first because letting go of a
+            // watch is a change to the server and not to the connection, so
+            // clearing the list here without saying so would leave rows on the
+            // server that nobody is watching. `RESET` inside `MULTI` answers
+            // `+RESET` and leaves no transaction, which is why it is one of the
+            // six commands a transaction does not queue.
+            multi::release(server, session);
             session.reset();
             out.set_proto(Proto::Resp2);
             out.simple(b"RESET");
@@ -666,70 +674,18 @@ fn getkeys(args: Args<'_>, out: &mut Out) -> Result<()> {
             "Invalid number of arguments specified for command",
         ));
     }
-    // A few commands keep their keys somewhere the triple cannot describe,
-    // behind a count of how many there are. That is why a real server marks them
-    // `movablekeys` and why a client has to ask this question about them at all.
-    // `MSETEX` counts pairs and the rest count single keys, so what differs
-    // between them is the step and where the count sits: the script family has
-    // the body in front of it and the others have nothing.
-    //
-    // The script family is also the only one where none is a real answer. A
-    // script with no keys is an ordinary thing to write and `EVAL body 0`
-    // answers an empty list rather than complaining, where `MSETEX 0` is a
-    // command that would do nothing and is refused. The last flag says the same
-    // thing about a count that makes no sense at all: a real server reads the
-    // script family through a key spec that finds no keys and answers nothing,
-    // and refuses the others, so `EVAL body -1` and `EVAL body abc` are both an
-    // empty list here rather than an error.
-    if let Some((at, step, least, lenient)) = match spec.name {
-        "msetex" => Some((3, 2, 1, false)),
-        "ts.nrange" | "ts.nrevrange" => Some((3, 1, 1, false)),
-        "eval" | "eval_ro" | "evalsha" | "evalsha_ro" | "fcall" | "fcall_ro" => {
-            Some((4, 1, 0, true))
+    // Where the keys are is the same question `WATCH` asks about a command that
+    // has just run, so the answer is worked out in one place and the two
+    // callers differ only in how many arguments sit in front of the command.
+    let span = table::key_span(spec, args, 2).map_err(|why| match why {
+        table::NoKeys::Never => Error::new(Code::Invalid, "The command has no key arguments"),
+        table::NoKeys::BadCount => {
+            Error::new(Code::Invalid, "Invalid arguments specified for command")
         }
-        _ => None,
-    } {
-        let found = parse_i64(args.get(at))
-            .filter(|&n| n >= least)
-            .and_then(|n| usize::try_from(n).ok())
-            .filter(|&n| at + 1 + step * n <= args.len());
-        let n = match found {
-            Some(n) => n,
-            None if lenient => 0,
-            None => {
-                return Err(Error::new(
-                    Code::Invalid,
-                    "Invalid arguments specified for command",
-                ));
-            }
-        };
-        out.array(n);
-        for i in 0..n {
-            out.bulk(args.get(at + 1 + step * i));
-        }
-        return Ok(());
-    }
-    if spec.first_key == 0 {
-        return Err(Error::new(
-            Code::Invalid,
-            "The command has no key arguments",
-        ));
-    }
-    let last = if spec.last_key < 0 {
-        (argc as i64) + i64::from(spec.last_key)
-    } else {
-        i64::from(spec.last_key)
-    };
-    let step = i64::from(spec.step).max(1);
-    let first = i64::from(spec.first_key);
-    let count = if last < first {
-        0
-    } else {
-        ((last - first) / step + 1) as usize
-    };
-    out.array(count);
-    for i in 0..count {
-        out.bulk(args.get(2 + (first + (i as i64) * step) as usize));
+    })?;
+    out.array(span.count);
+    for i in 0..span.count {
+        out.bulk(args.get(span.first + i * span.step));
     }
     Ok(())
 }

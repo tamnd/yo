@@ -35,7 +35,12 @@ const PLANS: &[&str] = &[
 /// never name a key. EVAL and the rest take their keys in an argument and are
 /// in the `merge` plan when they land, so adding the group here does not let
 /// them through without one.
-const PLANLESS_GROUPS: &[&str] = &["connection", "scripting", "server"];
+///
+/// Transactions is on it for four of the five. MULTI, EXEC, DISCARD and UNWATCH
+/// name no key, and what EXEC runs states its own plan when it runs. WATCH does
+/// name keys and is a `point` read of each of them, so the group being here does
+/// not let it through without one either.
+const PLANLESS_GROUPS: &[&str] = &["connection", "scripting", "server", "transactions"];
 /// The commands allowed to claim the `none` plan outside those groups.
 ///
 /// Two of them, and they are named one by one rather than by widening the group

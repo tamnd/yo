@@ -795,3 +795,27 @@ title = "A dumped payload is stamped with an older version and is never compress
 reason = "DUMP and FUNCTION DUMP both hand back the same framing a real server does, and the bytes inside it are not identical. Two things differ and both are deliberate. The version in the footer is twelve here and fifteen on 8.10.1, because what that number promises is how old a server can be and still read the payload, so writing the lowest version that covers every shape this server produces is what makes a payload loadable by more servers rather than fewer. The strings inside are never LZF compressed, where a real server compresses anything over twenty bytes unless rdbcompression is off, so a payload from here is larger and a payload with a long value in it can be a lot larger. Neither changes what a payload means. An uncompressed string is a legal RDB string and every reader accepts one, and a payload written here loads into 8.10.1 and a payload written there loads here, which is checked in both directions for values and for function libraries including compressed ones. What a client can see is the length of the bulk string and the two version bytes, so anything comparing two payloads byte for byte across servers will see this, and nothing that restores one will. Compression on the way out is worth having for the bytes it saves on MIGRATE and in a snapshot and it is its own piece of work, at which point this note keeps only the version half."
 status = "permanent"
 spec = "12 section 7"
+
+[[divergence]]
+id = "D-112"
+title = "EXEC is atomic on one shard thread and not on several"
+reason = "A real server runs a transaction with nothing at all in between its commands, because everything a real server does happens on one thread. Here EXEC decodes its queue and sends each command back through the dispatcher in turn, and each of those takes and lets go of the stripe locks it needs, so on a server with more than one shard thread another connection's command can land between two queued ones. The default is one shard thread and yodb serve --threads defaults to one, so on the default server the guarantee holds for the reason the reference's does: there is nobody else to run. What closes it is a lock every ordinary command takes for reading and EXEC takes for writing, sharded per thread so the read side is a local counter rather than a shared line, skipped entirely at one thread. That is a piece of work with its own measurement to do, and registering it is better than a version of it that is nearly right. What is already true either way is that a queued command is never half run: each one still holds every stripe it needs for as long as it needs, so a client can never see one command of the queue partly applied."
+status = "until"
+resolved_by = "M8"
+spec = "12 section 4"
+
+[[divergence]]
+id = "D-113"
+title = "A write that turned out to change nothing still fails a watch on the key it named"
+reason = "The reference marks a watched key from inside the command, at the point the command knows it has changed something, so PERSIST on a key with no deadline and GETEX with no options both leave a watch on that key alone. Here the marking happens in the dispatcher after the command has run, over the keys the command named, so both of those fail the next EXEC. The same goes for every other write that decides against itself: SETNX on a key that is there, EXPIRE XX on a key with no deadline, SREM of a member that is not in the set. Two things keep this from being the wrong kind of wrong. It only ever fails a transaction that would have succeeded and never lets one through that should have failed, and a client using WATCH has to retry on a failed EXEC anyway, so the behaviour is one a correct client already handles. What closes it is a change counter the commands report into, which is the reference's own server.dirty and is wanted for replication as well, at which point the mark happens only when the count moved. Deleting a key that was not there is already exempt, because the marking asks whether the key exists now or existed at the last look and skips it when neither is true."
+status = "until"
+resolved_by = "M8"
+spec = "12 section 4"
+
+[[divergence]]
+id = "D-114"
+title = "An unknown subcommand inside MULTI is queued rather than refused"
+reason = "The reference looks a container command's subcommand up in the same table it looks the command up in, so CONFIG NOPE is not a command at all and is refused where the client wrote it, which kills the transaction and makes EXEC an abort. Here a container is one row in the table and the subcommand is read by the command's own body, so CONFIG NOPE is queued, answers QUEUED, and fails with the same message when EXEC runs it, leaving the rest of the queue to run. Everything else about the queue is the same, including the far more common case of a command that is not a command at all and the case of a container sent with the wrong number of arguments outright. What closes it is a subcommand table, which is the same thing missing from COMMAND INFO's subcommands field and from COMMAND COUNT, so it is one piece of work and not three."
+status = "until"
+resolved_by = "M8"
+spec = "12 section 4"

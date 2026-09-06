@@ -492,6 +492,15 @@ impl<S: Sink> Front<S> {
     /// finds a waiter by, and the caller forgets it before anything else runs,
     /// because this slot is on the free list from here and the next accept
     /// hands it to somebody else.
+    /// The session on a connection, for the server side of it going away.
+    ///
+    /// `None` for a slot that is already free, so that closing twice is not two
+    /// chances to hand back the same watches.
+    pub(crate) fn session_mut(&mut self, conn: ConnId) -> Option<&mut Session> {
+        let c = &mut self.conns[conn as usize];
+        c.live.then_some(&mut c.session)
+    }
+
     pub(crate) fn close(&mut self, conn: ConnId) -> Option<u64> {
         {
             let c = &mut self.conns[conn as usize];

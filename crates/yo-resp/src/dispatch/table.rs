@@ -13,6 +13,9 @@
 //! directions, so a command cannot be dispatched without a storage plan and
 //! cannot claim `wire = "verified"` without an entry here.
 
+use super::Args;
+use yo_common::parse_i64;
+
 /// Everything `COMMAND` has to be able to say about one command.
 #[derive(Debug, Clone, Copy)]
 pub struct Spec {
@@ -42,6 +45,9 @@ pub struct Spec {
     pub group: &'static str,
 }
 
+/// The four transaction commands Redis counts as fast, which is all of them
+/// except `EXEC`, whose cost is whatever it was asked to run.
+const AC_TX_FAST: &[&str] = &["@fast", "@transaction"];
 /// Read only, fast, one key at argument one, which is most of the getters.
 const READ_FAST: &[&str] = &["readonly", "fast"];
 /// A write that allocates, fast, one key at argument one.
@@ -5748,6 +5754,77 @@ pub static COMMANDS: &[Spec] = &[
         summary: "Close the connection after the replies already queued.",
         group: "connection",
     },
+    // -------------------------------------------------------- transactions
+    // None of the five is a write and none of them names a key the table can
+    // describe, `WATCH` included: a watched key is read, and the key spec Redis
+    // publishes for it says `RO`. What makes them their own group is that they
+    // are the only commands the funnel looks at before it decides whether to run
+    // anything at all.
+    Spec {
+        name: "multi",
+        arity: 1,
+        flags: &["noscript", "loading", "stale", "fast", "allow_busy"],
+        first_key: 0,
+        last_key: 0,
+        step: 0,
+        acl: AC_TX_FAST,
+        since: "2.0.0",
+        complexity: "O(1)",
+        summary: "Start holding commands instead of running them.",
+        group: "transactions",
+    },
+    Spec {
+        name: "exec",
+        arity: 1,
+        flags: &["noscript", "loading", "stale", "skip_slowlog"],
+        first_key: 0,
+        last_key: 0,
+        step: 0,
+        acl: &["@slow", "@transaction"],
+        since: "1.2.0",
+        complexity: "Whatever the queued commands cost.",
+        summary: "Run everything held since MULTI.",
+        group: "transactions",
+    },
+    Spec {
+        name: "discard",
+        arity: 1,
+        flags: &["noscript", "loading", "stale", "fast", "allow_busy"],
+        first_key: 0,
+        last_key: 0,
+        step: 0,
+        acl: AC_TX_FAST,
+        since: "2.0.0",
+        complexity: "O(N) in the number of commands held.",
+        summary: "Throw away everything held since MULTI.",
+        group: "transactions",
+    },
+    Spec {
+        name: "watch",
+        arity: -2,
+        flags: &["noscript", "loading", "stale", "fast", "allow_busy"],
+        first_key: 1,
+        last_key: -1,
+        step: 1,
+        acl: AC_TX_FAST,
+        since: "2.2.0",
+        complexity: "O(1) a key.",
+        summary: "Fail the next EXEC if any of these keys changes.",
+        group: "transactions",
+    },
+    Spec {
+        name: "unwatch",
+        arity: 1,
+        flags: &["noscript", "loading", "stale", "fast", "allow_busy"],
+        first_key: 0,
+        last_key: 0,
+        step: 0,
+        acl: AC_TX_FAST,
+        since: "2.2.0",
+        complexity: "O(N) in the number of keys watched.",
+        summary: "Stop watching everything this connection was watching.",
+        group: "transactions",
+    },
     // -------------------------------------------------------------- server
     // COMMAND is in the connection ACL category and in the server group, which
     // is not a contradiction: the category is about what a connection is
@@ -6146,6 +6223,15 @@ const FREE: u16 = u16::MAX;
 /// which is the same twenty one the last search settled on while carrying one
 /// more collision than it did. The old multiplier was `0xda8bd262ac598c57` and
 /// it served for one search as well.
+///
+/// The five transaction commands took the table to 411 names and the total to
+/// twenty five, which is over what this table had been holding and is the first
+/// time the number moved without the worst probe moving with it. A nineteenth
+/// search ran anyway, four billion multipliers, and the best of them spends
+/// twenty four. One probe over four hundred and eleven commands is not worth
+/// changing a constant that is already at one slot for every name, so this is
+/// the first search that ended by keeping the multiplier it started with. The
+/// floor is still thirteen and the number a lookup feels is still one.
 const MIX: u64 = 0x91de_5d5e_2166_1fbd;
 
 /// The four bytes the index is computed from: the length, the first two bytes,
@@ -6160,7 +6246,7 @@ const MIX: u64 = 0x91de_5d5e_2166_1fbd;
 /// slot, and reading less of the name is a shorter dependency chain in front of
 /// the multiply. Names that agree on all four collide whatever the multiplier is
 /// and probe once more, and the probe is the same compare the lookup was always
-/// going to do. Over the 399 commands there are thirteen such pairs and no group
+/// going to do. Over the 411 commands there are thirteen such pairs and no group
 /// larger than a pair, so thirteen extra probes is the floor.
 ///
 /// The middle byte is the part that was added last and it is worth saying why,
@@ -6366,6 +6452,103 @@ pub fn arity_ok(spec: &Spec, n: usize) -> bool {
     }
 }
 
+/// Where a command's key arguments are: the first one, how many there are, and
+/// how far apart they sit.
+///
+/// Three numbers is enough for every command in this table, the ones Redis marks
+/// `movablekeys` included, because those keep their keys behind a count and a
+/// count still gives a first, a many and a step. What three numbers cannot
+/// describe is a command whose keys are found by scanning for a keyword, and
+/// there are none of those here.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct KeySpan {
+    /// The argument index of the first key.
+    pub first: usize,
+    /// How many keys there are.
+    pub count: usize,
+    /// How many arguments apart consecutive keys are.
+    pub step: usize,
+}
+
+/// Why a command has no key span.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NoKeys {
+    /// It names no keys at all, whatever it is sent.
+    Never,
+    /// It keeps its keys behind a count, and the count is not a usable number.
+    BadCount,
+}
+
+/// Work out where `spec`'s keys are in `args`.
+///
+/// `base` is how many arguments sit in front of the command itself, which is two
+/// for `COMMAND GETKEYS <command> ...` and zero for a command that is running.
+/// The positions in the answer are absolute, so they go straight to
+/// [`Args::get`].
+///
+/// A few commands keep their keys somewhere the first, last and step triple
+/// cannot describe, behind a count of how many there are. That is why a real
+/// server marks them `movablekeys` and why a cluster aware client has to ask
+/// `COMMAND GETKEYS` about them at all. `MSETEX` counts pairs and the rest count
+/// single keys, so what differs between them is the step and where the count
+/// sits: the script family has the body in front of it and the others have
+/// nothing.
+///
+/// The script family is also the only one where none is a real answer. A script
+/// with no keys is an ordinary thing to write and `EVAL body 0` answers an empty
+/// list rather than complaining, where `MSETEX 0` is a command that would do
+/// nothing and is refused. So a count that makes no sense at all is an empty
+/// span for the script family and a [`NoKeys::BadCount`] for the others, which
+/// is a real server reading the script family through a key spec that finds no
+/// keys and refusing the rest.
+pub(crate) fn key_span(spec: &Spec, args: Args<'_>, base: usize) -> Result<KeySpan, NoKeys> {
+    if let Some((rel, step, least, lenient)) = match spec.name {
+        "msetex" => Some((1, 2, 1, false)),
+        "ts.nrange" | "ts.nrevrange" => Some((1, 1, 1, false)),
+        "eval" | "eval_ro" | "evalsha" | "evalsha_ro" | "fcall" | "fcall_ro" => {
+            Some((2, 1, 0, true))
+        }
+        _ => None,
+    } {
+        let at = base + rel;
+        let found = parse_i64(args.get(at))
+            .filter(|&n| n >= least)
+            .and_then(|n| usize::try_from(n).ok())
+            .filter(|&n| at + 1 + step * n <= args.len());
+        let count = match found {
+            Some(n) => n,
+            None if lenient => 0,
+            None => return Err(NoKeys::BadCount),
+        };
+        return Ok(KeySpan {
+            first: at + 1,
+            count,
+            step,
+        });
+    }
+    if spec.first_key == 0 {
+        return Err(NoKeys::Never);
+    }
+    let argc = args.len() - base;
+    let last = if spec.last_key < 0 {
+        (argc as i64) + i64::from(spec.last_key)
+    } else {
+        i64::from(spec.last_key)
+    };
+    let step = i64::from(spec.step).max(1);
+    let first = i64::from(spec.first_key);
+    let count = if last < first {
+        0
+    } else {
+        ((last - first) / step + 1) as usize
+    };
+    Ok(KeySpan {
+        first: base + first as usize,
+        count,
+        step: step as usize,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -6505,7 +6688,7 @@ mod tests {
             "the multiplier stopped keeping every command close"
         );
         assert!(
-            total <= 22,
+            total <= 25,
             "{total} extra slots walked over the whole table"
         );
     }
