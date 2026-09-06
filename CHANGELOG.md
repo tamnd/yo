@@ -4,6 +4,43 @@ What each release changed, why, and what it costs you. The versioning rules and 
 
 While the major is 0, a minor release may break anything, including the on-disk format. The format is frozen at `M6`, not before.
 
+## 0.3.21 — 2026-09-06
+
+Fifteen pull requests and no milestone has closed, so this is a patch.
+
+Nearly all of it is the search surface. Thirteen of the fifteen added or corrected an `FT` command, which takes the module from the handful that worked to most of what a client will reach for, and the two that are left made the deep gate real. A file written by 0.3.20 opens unchanged under this version and a file written by this version opens under 0.3.20. No record kind was added.
+
+### Added
+
+- **`FT.SEARCH SORTBY` and `WITHSORTKEYS`.** A field the schema calls `SORTABLE` has its value copied into the document table as the sort will compare it, folded for text and parsed for a number, so a sort never goes back to the key to find out what it is comparing.
+- **`SUMMARIZE` and `HIGHLIGHT` do the work.** A field the query matched comes back as fragments, one per match, each the match with as much text either side as the budget allows, and a field it did not comes back as its own front cut at a word. Both budgets are six bytes per unit of `LEN` spent against real bytes, so a field of short words keeps more of them than a field of long ones under the same `LEN`.
+- **A `GEO` field is indexed and walked.** A point is a fifty two bit interleave of its longitude and latitude, which an f64 holds exactly, so a circle is nine score ranges out of the numeric index with the real distance checked on everything they turn up. The geohash arithmetic moved down from `yo-kv` to `yo-common` so the two callers share one copy rather than agreeing by luck about where a boundary falls.
+- **`EXPLAINSCORE`.** The arithmetic behind a score, printed as a tree beside the number, every line of it read off Redis 8.10.1 rather than derived from the formula. The printed shape is not the shape of the arithmetic: the three scorers that divide by how far the words landed apart print their leaves undivided and divide once at the top. The walk hands back a shape now rather than a flat list, and the scorer and the explainer both read it, which is what stops the number and the account of it drifting apart.
+- **`FT.TAGVALS`.** Every distinct value a tag field holds, stored rather than as it arrived, so an ordinary field answers folded and trimmed and a `CASESENSITIVE` one answers what it was given. The name asked about is the attribute and never the identifier.
+- **`FT.SUGADD`, `FT.SUGGET`, `FT.SUGDEL` and `FT.SUGLEN`.** A suggestion dictionary is the one thing the search module puts in the keyspace, so `TYPE` answers `trietype0`, `EXISTS` sees it, `KEYS` lists it, `EXPIRE` and `TTL` work on it, and a key holding anything else answers `WRONGTYPE`.
+- **`FT.SYNUPDATE` and `FT.SYNDUMP`.** A synonym group is a term of its own rather than a comparison made at query time, the group id with a tilde in front, written next to every word of the group. A group of a hundred words costs one posting list and one extra branch in the union rather than a hundred lookups.
+- **`FT.SPELLCHECK`.** Takes a query, parses it the way `FT.SEARCH` would, and answers about every plain word the index does not already hold. The model was measured against 8.10.1 over sixteen rounds of probes rather than read off the manual, and a fair bit of it is not what anybody would have designed.
+- **`FT.CONFIG GET`, `SET` and `HELP` for all sixty nine settings.** Every name, default, description and bound read off a real server, and the wire compared against it byte for byte on both protocols over a hundred and forty three cases each, with zero differences.
+- **`FT.PROFILE`.** The ordinary reply with the query tree and its reading counts bolted on, plus the list of steps the rows went through with a row count on each. One shard because there is one server, and an empty coordinator for the same reason.
+- **Vectors are stored and walked.** A `VECTOR` field kept nothing before, so every `KNN` and `VECTOR_RANGE` answered nothing. A field now keeps every document's vector at full precision in one flat run of floats and both questions are a pass over it, which is exact. The cost is that the pass is linear where a graph is meant to be sublinear, so an `HNSW` field gets perfect recall and pays for it. That is D-91 until the graph lands under M6.
+
+### Changed
+
+- **The Miri job runs over the workspace.** It used to run a handful of crates, and because the deep workflow skips itself without the `deep` label, a run that never started reported success. It is 28 shards under both borrow models now. Getting there meant an arm in `host_memory` that returns `None` under the interpreter, because Miri answers neither `sysconf` nor `sysctlbyname`, and an arm in the dispatch resource reader that returns zeros, because Miri shims no `getrusage` anywhere and `INFO` with no argument prints every section.
+- **The thread sanitizer runs over the crates that have two threads.** Miri interprets threads on a single core and cannot go near a socket, so the tests of `yodb serve --threads N` are exactly the ones it has never looked at. ThreadSanitizer runs the real binary on the real machine with every access watched, which is the other half of the answer rather than a second opinion on the same one.
+- **A blocked client is branched on by the thread that parked it**, which is the semantics half of the threading milestone for the one of those five surfaces that is built.
+- **The deep workflow reads its labels back from the API.** Opening a pull request with labels already attached delivers the `labeled` events first and the `opened` event after, carrying a snapshot from before the labels were added. The `opened` run saw no label, skipped, and cancelled the three real runs on its way past because they share a concurrency group, so the whole thing reported success without having run anything.
+
+### Fixed
+
+- **A lost update in the command counters.** `Counter::bump` is a relaxed load and a relaxed store rather than a fetch and add, which is right, because the fast path is one thread writing its own set and a locked instruction on every command would be paid on the path that is never shared. A `Server` built without being told its thread count has one set, so two threads pointed at it can lose a count. Miri found it by scheduling the two far enough apart; a real machine does that rarely enough that this had passed for months.
+- **The number at the front of an `FT.AGGREGATE` reply.** It was worked out from whether the pipeline had to read a field off a key, which is not what a real server does. It answers 1 for `LOAD 1 @n APPLY @n * 2 AS d` on RESP2 where this build answered 6. What the number really says is how far the reply had got when the number itself went on the wire, which is why it moves with the protocol.
+
+### Known gaps
+
+- Five crates are out of the Miri run. `yo-kv`, `yo-vector`, `yo-graph`, `yo-doc` and `yo-index` have about a hundred and fifty tests between them that take over two minutes each interpreted and about thirty that run past the forty minute shard timeout. Splitting `yo-kv` twelve ways still left shards killed with tests half an hour old, so this is not a sharding problem. Three of the five have no unsafe code of their own and the other two have ten blocks between them, and those are uninterpreted until this is finished. That is issue 418.
+- The threading numbers are still not in. Both benchmark hosts have other work on them and a number off a loaded machine is worse than no number.
+
 ## 0.3.20 — 2026-09-05
 
 Eight pull requests and no milestone has closed, so this is a patch.
