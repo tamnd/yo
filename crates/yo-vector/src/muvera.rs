@@ -667,6 +667,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        miri,
+        ignore = "the count is the claim: how often the top ten holds the right document, over a corpus"
+    )]
     fn the_encoding_finds_the_document_a_query_came_from() {
         let got = found(48, Shape::default(), 10, 4242);
         assert!(
@@ -680,6 +684,10 @@ mod tests {
     /// match land in the same bucket is a coin toss, and repetitions are what
     /// average it out.
     #[test]
+    #[cfg_attr(
+        miri,
+        ignore = "the count is the claim: whether a query token and its match land in the same bucket is a coin toss, and this is the average of it"
+    )]
     fn more_repetitions_find_it_more_often() {
         let one = found(
             48,
@@ -728,6 +736,10 @@ mod tests {
     /// exact score runs on the forty documents the index handed back rather
     /// than on all three hundred.
     #[test]
+    #[cfg_attr(
+        miri,
+        ignore = "the count is the claim: three hundred documents, forty queries and a shortlist, measured end to end"
+    )]
     fn retrieval_then_a_chamfer_rerank_finds_the_right_document() {
         let dim = 48;
         let enc = Encoder::new(dim, Shape::default(), 909);
@@ -771,6 +783,10 @@ mod tests {
     /// token of every document. The encoding turns that into one dot product a
     /// document, and then one Chamfer against the few the index kept.
     #[test]
+    #[cfg_attr(
+        miri,
+        ignore = "the count is the claim: how much of a full chamfer scan the rerank got away with not doing"
+    )]
     fn the_rerank_is_the_only_chamfer_anyone_pays_for() {
         let dim = 32;
         let enc = Encoder::new(dim, Shape::default(), 5);

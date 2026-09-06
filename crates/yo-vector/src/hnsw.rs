@@ -395,6 +395,10 @@ mod tests {
     /// graph, which it does not and could not. That turning it up finds more,
     /// which is the thing somebody turning it up is relying on.
     #[test]
+    #[cfg_attr(
+        miri,
+        ignore = "the count is the claim: a knob shows up as the gap between two recall figures, and a corpus small enough for Miri has no gap in it"
+    )]
     fn an_ef_runtime_client_gets_what_it_turned_the_knob_for() {
         let dim = 64;
         let low = recall(
@@ -423,6 +427,10 @@ mod tests {
     /// The same for `EF_CONSTRUCTION`, which is a build time knob, so what it
     /// buys is a finer cut of the space for the same probe.
     #[test]
+    #[cfg_attr(
+        miri,
+        ignore = "the count is the claim: a knob shows up as the gap between two recall figures, and a corpus small enough for Miri has no gap in it"
+    )]
     fn an_ef_construction_client_gets_what_it_turned_the_knob_for() {
         let dim = 64;
         let coarse = recall(

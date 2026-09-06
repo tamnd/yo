@@ -433,6 +433,27 @@ mod tests {
             .collect()
     }
 
+    /// The size to actually build a layer at, given the size a test asked for.
+    ///
+    /// A rebuild is four passes of `n * sqrt(n)` distances over `dim` floats
+    /// each, so these two numbers are the whole cost of the tests below and
+    /// neither of them is what any of those tests claims. The claims are that
+    /// every centroid lands under exactly one anchor, that adding, dropping and
+    /// moving partitions keeps it that way, and that the count a rebuild is
+    /// triggered at is a proportion rather than a constant. All of those are as
+    /// true of the smallest layer there is as of a larger one, so under Miri,
+    /// where a distance costs thousands of times what it costs compiled, that is
+    /// what they get: a layer right on [`FLOOR`], in four dimensions.
+    ///
+    /// The two tests here that are about a number rather than an invariant, the
+    /// recall figure over five hundred queries and the shortlist that does not
+    /// grow with the collection, do not go through this. Shrinking either would
+    /// leave it passing without measuring anything, so they are skipped under
+    /// Miri instead and say so.
+    fn sized(n: usize, dim: usize) -> (usize, usize) {
+        if cfg!(miri) { (FLOOR, 4) } else { (n, dim) }
+    }
+
     fn built(n: usize, dim: usize, seed: u64) -> (Coarse, Vec<f32>) {
         let centroids = spread(n, dim, seed);
         let mut c = Coarse::default();
@@ -469,19 +490,20 @@ mod tests {
 
     #[test]
     fn every_centroid_ends_up_under_exactly_one_anchor() {
-        let n = 1000;
-        let (c, _) = built(n, 16, 2);
+        let (n, dim) = sized(1000, 16);
+        let (c, _) = built(n, dim, 2);
         assert!(c.ready());
-        // sqrt(1000) rounded up, which is what keeps the two halves of the
-        // lookup near enough the same size.
-        assert_eq!(c.anchors(), 32);
+        // sqrt(n) rounded up, which is what keeps the two halves of the lookup
+        // near enough the same size. Written out for both sizes rather than
+        // computed, because computing it here would be running the same line
+        // twice and calling it a test.
+        assert_eq!(c.anchors(), if cfg!(miri) { 16 } else { 32 });
         intact(&c, n);
     }
 
     #[test]
     fn adding_and_dropping_partitions_keeps_the_lists_straight() {
-        let dim = 16;
-        let n = 400;
+        let (n, dim) = sized(400, 16);
         let (mut c, mut centroids) = built(n, dim, 3);
         let mut n = n;
 
@@ -512,8 +534,7 @@ mod tests {
 
     #[test]
     fn a_centroid_that_moves_moves_between_anchors() {
-        let dim = 16;
-        let n = 500;
+        let (n, dim) = sized(500, 16);
         let (mut c, mut centroids) = built(n, dim, 5);
         // Put centroid 3 exactly on top of anchor 9, which is somewhere else.
         let target: Vec<f32> = c.points[9 * dim..10 * dim].to_vec();
@@ -528,6 +549,10 @@ mod tests {
     /// nearest one has to be in the shortlist almost every time, because the
     /// caller ranks the shortlist exactly and anything not in it cannot win.
     #[test]
+    #[cfg_attr(
+        miri,
+        ignore = "the count is the claim: a recall rate over five hundred queries against a thousand centroids, which is nothing at all at a size Miri can afford"
+    )]
     fn the_nearest_centroid_is_almost_always_on_the_shortlist() {
         let dim = 32;
         let n = 1000;
@@ -576,6 +601,10 @@ mod tests {
     /// [`KEEP`] rather than at some fraction of the partition count. Ten times
     /// as many centroids, and the same amount of work.
     #[test]
+    #[cfg_attr(
+        miri,
+        ignore = "the count is the claim: ten times as many centroids and the same amount of work, and the bigger of the two sizes is the point"
+    )]
     fn a_bigger_collection_does_not_mean_a_bigger_shortlist() {
         let dim = 16;
         let x = spread(1, dim, 9);
@@ -601,10 +630,13 @@ mod tests {
 
     #[test]
     fn the_layer_is_rebuilt_when_the_collection_has_moved_a_quarter() {
-        let (c, _) = built(1000, 8, 10);
-        assert!(!c.stale(1000));
-        assert!(!c.stale(1100), "a tenth is not worth a rebuild");
-        assert!(c.stale(1400), "nearly a half is");
-        assert!(c.stale(700), "and so is shrinking by a third");
+        // As proportions of whatever size the layer was built at, because the
+        // proportion is the claim and the size is not.
+        let (n, dim) = sized(1000, 8);
+        let (c, _) = built(n, dim, 10);
+        assert!(!c.stale(n));
+        assert!(!c.stale(n * 11 / 10), "a tenth is not worth a rebuild");
+        assert!(c.stale(n * 7 / 5), "nearly a half is");
+        assert!(c.stale(n * 7 / 10), "and so is shrinking by a third");
     }
 }

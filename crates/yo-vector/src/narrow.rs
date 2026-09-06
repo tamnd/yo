@@ -406,6 +406,10 @@ fn timed(queries: usize, run: impl FnOnce()) -> f64 {
 /// have either. How many partitions they have in common is printed beside it to
 /// show how little it has to do with the answer.
 #[test]
+#[cfg_attr(
+    miri,
+    ignore = "the count is the claim: a distance ratio over sixty queries against three thousand centroids at two widths, which is the table in the module doc"
+)]
 fn a_rougher_centroid_pass_picks_a_head_that_is_just_as_near() {
     for dim in [128usize, 768] {
         let n = 3000;

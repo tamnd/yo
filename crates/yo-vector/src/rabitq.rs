@@ -987,6 +987,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        miri,
+        ignore = "the count is the claim: recall at ten out of a forty candidate rerank over 256 wide vectors, and a rerank short enough for Miri is not a rerank"
+    )]
     fn one_bit_finds_the_true_neighbours_inside_a_short_rerank() {
         // Forty candidates for ten answers, which is the 4k rerank the search
         // path defaults to.
@@ -995,6 +999,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        miri,
+        ignore = "the count is the claim: it is one recall figure against another, and the gap between them is only there because both were measured on a corpus big enough to have a wrong answer in it"
+    )]
     fn four_bits_is_better_than_one() {
         // Twenty candidates for ten answers, which one bit does not manage and
         // four does, so this measures the difference rather than asserting it.
@@ -1005,6 +1013,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        miri,
+        ignore = "the count is the claim: the worst error anywhere in a corpus, and a smaller corpus has less of it to find"
+    )]
     fn the_estimate_is_close_to_the_truth_rather_than_merely_ordered() {
         let dim = 256;
         let vs = corpus(dim, 200, 5);
@@ -1047,6 +1059,10 @@ mod tests {
     /// would pass at four bit codes while the query was throwing away the whole
     /// reason to pay for them, which is exactly what the first cut did.
     #[test]
+    #[cfg_attr(
+        miri,
+        ignore = "the count is the claim: one error measured as a proportion of another, and shrinking the corpus moves both of them"
+    )]
     fn the_query_is_quantised_finer_than_the_code_it_is_measured_against() {
         for (bits, dim) in [
             (Bits::One, 128),
