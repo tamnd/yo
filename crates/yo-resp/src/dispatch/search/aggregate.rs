@@ -181,8 +181,13 @@ impl Step {
                 out.extend_from_slice(&expr.about());
                 out
             }
-            // One step covers both, and which of the two it is depends on
-            // whether anything asked for an order or only for a window.
+            // One step covers all three, and which of them it is depends on
+            // what was asked for. A window of nothing is a client asking for
+            // the total and nothing else, so it counts rather than sorts and
+            // it counts even when a `SORTBY` put an order in front of it,
+            // which is measured. Otherwise it is a sort when something asked
+            // for an order and a window when nothing did.
+            Step::Sort(sort) if sort.count == Some(0) => b"Counter".to_vec(),
             Step::Sort(sort) => match sort.keys.is_empty() {
                 true => b"Pager/Limiter".to_vec(),
                 false => b"Sorter".to_vec(),
@@ -1038,7 +1043,12 @@ pub(super) fn piped(
             }
         }
         if let Some(watch) = watch.as_deref_mut() {
-            watch.steps.push((step.about(), table.len()));
+            // A counter answers the one number it was asked for rather than
+            // the nothing it left on the table.
+            let one = matches!(step, Step::Sort(sort) if sort.count == Some(0));
+            watch
+                .steps
+                .push((step.about(), if one { 1 } else { table.len() }));
         }
         if warning.is_some() {
             break;

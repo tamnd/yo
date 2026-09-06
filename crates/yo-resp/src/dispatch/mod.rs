@@ -23432,6 +23432,144 @@ mod tests {
         );
     }
 
+    /// A vector clause says which of the ways of answering one it took, and a
+    /// range says nothing at all when there is no distance to hand back.
+    #[test]
+    fn a_vector_step_says_which_way_it_was_answered() {
+        let mut f = Fixture::new();
+        vectored(&mut f);
+        let tree = |f: &mut Fixture, query: &[u8]| {
+            let reply = timeless(&f.run(&[
+                b"FT.PROFILE",
+                b"h",
+                b"AGGREGATE",
+                b"QUERY",
+                query,
+                b"PARAMS",
+                b"2",
+                b"vec",
+                ORIGIN,
+                b"DIALECT",
+                b"2",
+            ]));
+            let at = reply.find("+Iterators profile").expect("a tree");
+            let end = reply.find("+Result processors").expect("a list of steps");
+            reply[at..end].to_string()
+        };
+        assert_eq!(
+            tree(&mut f, b"*=>[KNN 3 @v $vec]"),
+            "+Iterators profile\r\n*8\r\n+Type\r\n+VECTOR\r\n+Time\r\n<t>\r\n\
+             +Number of reading operations\r\n:3\r\n\
+             +Vector search mode\r\n+STANDARD_KNN\r\n"
+        );
+        // Renaming the distance changes nothing about how it was answered.
+        assert_eq!(
+            tree(&mut f, b"*=>[KNN 3 @v $vec AS d]"),
+            tree(&mut f, b"*=>[KNN 3 @v $vec]")
+        );
+        // A range with nothing to yield is not a vector step at all, and one
+        // that yields names the distance in its own type.
+        assert_eq!(
+            tree(&mut f, b"@v:[VECTOR_RANGE 9 $vec]"),
+            "+Iterators profile\r\n*6\r\n+Type\r\n+ID-LIST-SORTED\r\n+Time\r\n<t>\r\n\
+             +Number of reading operations\r\n:4\r\n"
+        );
+        assert_eq!(
+            tree(
+                &mut f,
+                b"@v:[VECTOR_RANGE 9 $vec]=>{$YIELD_DISTANCE_AS: rr}"
+            ),
+            "+Iterators profile\r\n*8\r\n\
+             +Type\r\n+METRIC SORTED BY ID - VECTOR DISTANCE\r\n+Time\r\n<t>\r\n\
+             +Number of reading operations\r\n:4\r\n\
+             +Vector search mode\r\n+RANGE_QUERY\r\n"
+        );
+    }
+
+    /// What a vector clause narrowed itself down with hangs under it as a
+    /// single child, and the step that works the distances out is behind the
+    /// index whenever the query yields one.
+    #[test]
+    fn a_clause_in_front_of_a_vector_hangs_under_it_as_one_child() {
+        let mut f = Fixture::new();
+        vectored(&mut f);
+        let ask = |f: &mut Fixture, query: &[u8]| {
+            timeless(&f.run(&[
+                b"FT.PROFILE",
+                b"h",
+                b"AGGREGATE",
+                b"QUERY",
+                query,
+                b"PARAMS",
+                b"2",
+                b"vec",
+                ORIGIN,
+                b"DIALECT",
+                b"2",
+            ]))
+        };
+        let cut = |reply: &str| {
+            let at = reply.find("+Iterators profile").expect("a tree");
+            reply[at..].to_string()
+        };
+        assert_eq!(
+            cut(&ask(&mut f, b"@t:alpha=>[KNN 3 @v $vec]")),
+            "+Iterators profile\r\n*10\r\n+Type\r\n+VECTOR\r\n+Time\r\n<t>\r\n\
+             +Number of reading operations\r\n:3\r\n\
+             +Vector search mode\r\n+HYBRID_ADHOC_BF\r\n+Child iterator\r\n\
+             *10\r\n+Type\r\n+TEXT\r\n+Term\r\n$5\r\nalpha\r\n+Time\r\n<t>\r\n\
+             +Number of reading operations\r\n:3\r\n\
+             +Estimated number of matches\r\n:3\r\n\
+             +Result processors profile\r\n*2\r\n\
+             *6\r\n+Type\r\n+Index\r\n+Time\r\n<t>\r\n+Results processed\r\n:3\r\n\
+             *6\r\n+Type\r\n+Metrics Applier\r\n+Time\r\n<t>\r\n\
+             +Results processed\r\n:3\r\n+Coordinator\r\n*0\r\n"
+        );
+        // A range nobody named yields nothing, so nothing works a distance out
+        // and the step is not there.
+        assert!(ask(&mut f, b"@v:[VECTOR_RANGE 9 $vec]").ends_with(
+            "+Result processors profile\r\n*1\r\n*6\r\n+Type\r\n+Index\r\n\
+             +Time\r\n<t>\r\n+Results processed\r\n:4\r\n+Coordinator\r\n*0\r\n"
+        ));
+        // A nearest neighbour clause with nothing in front of it yields all
+        // the same, so the step is there without a child above it.
+        assert!(ask(&mut f, b"*=>[KNN 3 @v $vec]").contains("+Type\r\n+Metrics Applier\r\n"));
+    }
+
+    /// A `LIMIT 0 0` on an aggregation is a client asking for the total and
+    /// nothing else, so the step that would have paged the rows counts them
+    /// instead, whether or not a `SORTBY` put an order in front of it.
+    #[test]
+    fn a_window_of_nothing_on_an_aggregation_counts_rather_than_pages() {
+        let mut f = profiling();
+        let steps = |f: &mut Fixture, words: &[&[u8]]| {
+            let mut argv: Vec<&[u8]> = vec![b"FT.PROFILE", b"ix", b"AGGREGATE", b"QUERY", b"*"];
+            argv.extend_from_slice(words);
+            let reply = timeless(&f.run(&argv));
+            let at = reply.find("+Result processors").expect("a list of steps");
+            reply[at..].to_string()
+        };
+        assert_eq!(
+            steps(&mut f, &[b"LIMIT", b"0", b"0"]),
+            "+Result processors profile\r\n*2\r\n\
+             *6\r\n+Type\r\n+Index\r\n+Time\r\n<t>\r\n+Results processed\r\n:3\r\n\
+             *6\r\n+Type\r\n+Counter\r\n+Time\r\n<t>\r\n+Results processed\r\n:1\r\n\
+             +Coordinator\r\n*0\r\n"
+        );
+        assert!(
+            steps(
+                &mut f,
+                &[b"SORTBY", b"2", b"@n", b"ASC", b"LIMIT", b"0", b"0"]
+            )
+            .contains("+Type\r\n+Counter\r\n")
+        );
+        // A window that keeps something is still a window.
+        assert!(steps(&mut f, &[b"LIMIT", b"0", b"2"]).contains(
+            "+Type\r\n+Pager/Limiter\r\n+Time\r\n<t>\r\n\
+             +Results processed\r\n:2\r\n"
+        ));
+    }
+
     // ----------------------------------------------------------- spellcheck
 
     /// The score is how many documents hold the suggestion over how many
