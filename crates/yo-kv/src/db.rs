@@ -685,7 +685,7 @@ mod tests {
     use yo_index::Cursor as KeyCursor;
 
     use super::{Db, MAX_STRIPES};
-    use crate::{Clock, Keyspace};
+    use crate::{Clock, Keyspace, many};
 
     fn filled(stripes: usize, keys: u32) -> Db {
         let mut db = Db::with_clock(Clock::fixed(1_000_000), stripes);
@@ -802,7 +802,10 @@ mod tests {
 
     #[test]
     fn a_scan_walks_every_stripe_and_answers_every_key_once() {
-        let db = filled(8, 2_000);
+        // Eight stripes whatever happens, because the claim is about stripes.
+        // How many keys are spread over them is not.
+        let keys = many(2_000u32);
+        let db = filled(8, keys);
         let mut seen: Vec<Vec<u8>> = Vec::new();
         let mut at = KeyCursor::START;
         let mut calls = 0;
@@ -815,8 +818,12 @@ mod tests {
             assert!(calls < 10_000, "a scan that will not finish");
         }
         let unique: HashSet<Vec<u8>> = seen.iter().cloned().collect();
-        assert_eq!(unique.len(), 2_000);
-        assert_eq!(seen.len(), 2_000, "a quiet scan returned a key twice");
+        assert_eq!(unique.len(), keys as usize);
+        assert_eq!(
+            seen.len(),
+            keys as usize,
+            "a quiet scan returned a key twice"
+        );
 
         let mut walked = HashSet::new();
         db.keys(|key| {
@@ -831,7 +838,10 @@ mod tests {
     // that says the walk is over rather than a panic.
     #[test]
     fn a_scan_carries_the_stripe_in_the_cursor() {
-        let db = filled(8, 2_000);
+        // Enough keys that every one of the eight stripes has some, which two
+        // hundred does as surely as two thousand. The assert on the stripe count
+        // below is what would catch it if it did not.
+        let db = filled(8, many(2_000u32));
         let first = db.scan(KeyCursor::START, 10, None, |_| {});
         assert!(!first.is_end());
 
@@ -854,7 +864,12 @@ mod tests {
 
     #[test]
     fn a_random_key_comes_from_whichever_stripe_still_has_one() {
-        let mut db = filled(8, 5_000);
+        let keys = many(5_000u32);
+        // The one key that survives the emptying below, somewhere in the middle
+        // so that the stripe it lands in is not the first or the last.
+        let last = keys / 2 + 42;
+        let last_key = format!("k{last}").into_bytes();
+        let mut db = filled(8, keys);
         let mut all = HashSet::new();
         db.keys(|key| {
             all.insert(key.to_vec());
@@ -874,8 +889,8 @@ mod tests {
         // One key left in a database of eight stripes, so seven of the eight
         // have nothing to answer with and the draw lands on one of those seven
         // nearly every time.
-        for i in 0..5_000u32 {
-            if i != 4_242 {
+        for i in 0..keys {
+            if i != last {
                 let key = format!("k{i}").into_bytes();
                 db.at(&key).del(&key);
             }
@@ -883,9 +898,9 @@ mod tests {
         for _ in 0..20 {
             let mut key = Vec::new();
             assert!(db.random_key(|k| key.extend_from_slice(k)));
-            assert_eq!(key, b"k4242");
+            assert_eq!(key, last_key);
         }
-        db.at(b"k4242").del(b"k4242");
+        db.at(&last_key).del(&last_key);
         assert!(!db.random_key(|_| unreachable!("there are no keys left")));
     }
 

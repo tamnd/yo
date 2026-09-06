@@ -1550,6 +1550,7 @@ fn float_word(val: &[u8]) -> Option<Word> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::many;
 
     /// The bytes a client would see for whatever is at `idx`.
     fn read(a: &Array, idx: u64) -> Option<Vec<u8>> {
@@ -1750,17 +1751,20 @@ mod tests {
 
     #[test]
     fn a_range_delete_takes_the_ends_and_leaves_the_rest() {
+        // A hundred left at each end whatever the length is, because the ends
+        // are what this is about and the middle is only there to be long.
+        let n = many(30_000u64);
         let mut a = Array::new();
-        for i in 0..30_000u64 {
+        for i in 0..n {
             set(&mut a, i, b"x");
         }
-        assert_eq!(a.delete_range(100, 29_899), 29_800);
+        assert_eq!(a.delete_range(100, n - 101), n - 200);
         assert_eq!(a.count(), 200);
         assert_eq!(read(&a, 99).as_deref(), Some(&b"x"[..]));
         assert_eq!(read(&a, 100), None);
-        assert_eq!(read(&a, 29_899), None);
-        assert_eq!(read(&a, 29_900).as_deref(), Some(&b"x"[..]));
-        assert_eq!(a.len(), 30_000);
+        assert_eq!(read(&a, n - 101), None);
+        assert_eq!(read(&a, n - 100).as_deref(), Some(&b"x"[..]));
+        assert_eq!(a.len(), n);
     }
 
     #[test]
@@ -1857,17 +1861,21 @@ mod tests {
     /// blob has to be moved with them.
     #[test]
     fn compaction_keeps_the_values_that_survive_it() {
+        let n = many(2000u64);
         let mut a = Array::new();
-        for i in 0..2000u64 {
+        for i in 0..n {
             let val = format!("value number {i} padded out past the inline limit");
             set(&mut a, i, val.as_bytes());
         }
         // Kill the even ones, which is enough dead bytes to trigger a rewrite.
-        for i in (0..2000u64).step_by(2) {
+        // Half of them at fifty bytes each is still tens of kilobytes when this
+        // runs small, so the rewrite happens there too and the assert below is
+        // what says so rather than anything here.
+        for i in (0..n).step_by(2) {
             a.del(i);
         }
         assert!(a.dead * 2 < a.blob.len(), "the blob was rewritten");
-        for i in (1..2000u64).step_by(2) {
+        for i in (1..n).step_by(2) {
             let want = format!("value number {i} padded out past the inline limit");
             assert_eq!(read(&a, i).as_deref(), Some(want.as_bytes()), "at {i}");
         }
@@ -1929,7 +1937,7 @@ mod tests {
         );
     }
 
-    /// A thousand writes in a random order against a plain map, to catch the
+    /// A long run of writes in a random order against a plain map, to catch the
     /// promotion, demotion, window and blob paths interacting.
     #[test]
     fn it_agrees_with_a_map_over_a_scramble_of_writes() {
@@ -1945,8 +1953,15 @@ mod tests {
             seed
         };
 
-        for step in 0..20_000u64 {
-            let idx = next() % 20_000;
+        // Three numbers that have to move together. The index space is the step
+        // count so that a write lands on an occupied slot about as often as not,
+        // and the range width is a fortieth of the index space so that a range
+        // delete takes a handful rather than everything or nothing. Shrinking
+        // any one of them alone changes which paths this actually reaches.
+        let steps = many(20_000u64);
+        let width = many(500u64);
+        for step in 0..steps {
+            let idx = next() % steps;
             match step % 5 {
                 0..=2 => {
                     let val = format!("v{step}");
@@ -1957,7 +1972,7 @@ mod tests {
                     assert_eq!(a.del(idx), want.remove(&idx).is_some());
                 }
                 _ => {
-                    let hi = idx + (next() % 500);
+                    let hi = idx + (next() % width);
                     let gone = a.delete_range(idx, hi);
                     let keys: Vec<u64> = want.range(idx..=hi).map(|(k, _)| *k).collect();
                     assert_eq!(gone, keys.len() as u64);
@@ -2310,8 +2325,11 @@ mod tests {
 
     #[test]
     fn a_frozen_array_that_arrives_damaged_is_an_error_and_not_a_panic() {
+        // The population is only here to give the freeze several slices and a
+        // blob to point into. The sweep below is over the first 96 bytes of what
+        // comes out and does not care how much came after them.
         let mut a = Array::new();
-        for i in 0..200u64 {
+        for i in 0..many(200u64) {
             set(
                 &mut a,
                 i * 7,

@@ -486,16 +486,21 @@ mod tests {
 
     #[test]
     fn a_range_inside_one_chunk_only_fetches_that_chunk() {
+        // What matters is that the chunk being read is neither the first nor the
+        // last, so the walk has to have skipped something to get there. Ten
+        // chunks is 640 kilobytes, which is most of a minute interpreted, and
+        // three chunks makes the same point.
+        let (chunks, at) = if cfg!(miri) { (3u64, 1u64) } else { (10, 7) };
         let mut m = Mem::new();
-        let value = pattern(10 * CHUNK);
+        let value = pattern(chunks as usize * CHUNK);
         let chain = write(&mut m, &value, &mut Scratch::new()).expect("written");
 
         let r = Reader::open(&m, chain).expect("opened");
         let before = m.reads();
         let mut got = Vec::new();
-        // Somewhere in the middle of chunk 7, which is the case that would go
-        // wrong if the walk started at the beginning.
-        let (from, to) = (7 * CHUNK as u64 + 100, 7 * CHUNK as u64 + 300);
+        // Somewhere in the middle of a chunk that is not the first, which is the
+        // case that would go wrong if the walk started at the beginning.
+        let (from, to) = (at * CHUNK as u64 + 100, at * CHUNK as u64 + 300);
         for piece in r.range(from, to) {
             got.extend_from_slice(piece.expect("a piece"));
         }
@@ -503,14 +508,18 @@ mod tests {
         assert_eq!(
             m.reads() - before,
             1,
-            "a range inside one chunk of a ten chunk value should be one fetch"
+            "a range inside one chunk of a {chunks} chunk value should be one fetch"
         );
     }
 
     #[test]
     fn a_range_across_a_boundary_comes_back_in_two_pieces() {
+        // Two chunks under Miri. The boundary being crossed is the one at the
+        // end of the first chunk, and a third chunk sits past everything this
+        // looks at.
+        let chunks = if cfg!(miri) { 2 } else { 3 };
         let mut m = Mem::new();
-        let value = pattern(3 * CHUNK);
+        let value = pattern(chunks * CHUNK);
         let chain = write(&mut m, &value, &mut Scratch::new()).expect("written");
         let r = Reader::open(&m, chain).expect("opened");
 
@@ -556,8 +565,11 @@ mod tests {
 
     #[test]
     fn a_multi_chunk_value_is_two_reads_and_not_more() {
+        // Three chunks under Miri rather than five. The claim is a count of
+        // reads and not a count of chunks, and it reads the last one either way.
+        let chunks: u64 = if cfg!(miri) { 3 } else { 5 };
         let mut m = Mem::new();
-        let value = pattern(5 * CHUNK);
+        let value = pattern(chunks as usize * CHUNK);
         let chain = write(&mut m, &value, &mut Scratch::new()).expect("written");
         let before = m.reads();
         let r = Reader::open(&m, chain).expect("opened");
@@ -565,7 +577,7 @@ mod tests {
         // whatever the value's size, which is the property the whole layout
         // exists for.
         assert_eq!(m.reads() - before, 1);
-        r.chunk(4).expect("the last chunk");
+        r.chunk(chunks - 1).expect("the last chunk");
         assert_eq!(m.reads() - before, 2);
     }
 
@@ -598,10 +610,14 @@ mod tests {
 
     #[test]
     fn the_scratch_is_reused_and_does_not_grow_with_every_write() {
+        // Repeated writes of a value big enough to need a directory. Three of
+        // them show a reused buffer as well as eight do, and the assert is on
+        // the buffer's size rather than on how many times it was used.
+        let (writes, chunks) = if cfg!(miri) { (3, 2) } else { (8, 4) };
         let mut m = Mem::new();
         let mut scratch = Scratch::new();
-        let value = pattern(4 * CHUNK);
-        for _ in 0..8 {
+        let value = pattern(chunks * CHUNK);
+        for _ in 0..writes {
             write(&mut m, &value, &mut scratch).expect("written");
         }
         assert_eq!(

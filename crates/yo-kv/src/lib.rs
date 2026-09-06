@@ -217,3 +217,22 @@ pub use zsets::{By, Gate, Move, Query, Window, ZAdd};
 // `From` is in every Rust prelude and a second one under that name would be a
 // trap for every file that imports this crate with a glob.
 pub use zsets::From as ZEnd;
+
+/// A count in a test that is only there to make something happen more than
+/// once: a table to grow and rehash, a blob to pass the ratio that rewrites it,
+/// a window to fill and turn over. What each of those tests claims is true of a
+/// hundred members as much as of a hundred thousand, so under Miri the count
+/// comes down tenfold and every threshold it crossed before is still crossed.
+///
+/// Dividing rather than clamping at a floor is deliberate. Several of these
+/// tests hold two counts whose ratio is the thing being checked, and passing
+/// both through this keeps the ratio where a floor would quietly flatten it.
+///
+/// This is not for a count that is itself the claim. A test that measures the
+/// worst case over a population is measuring the population, and a smaller one
+/// has less of the worst case in it: those are skipped under Miri instead, and
+/// each one says so where it is skipped.
+#[cfg(test)]
+pub(crate) fn many<T: core::ops::Div<Output = T> + From<u8>>(n: T) -> T {
+    if cfg!(miri) { n / T::from(10) } else { n }
+}
