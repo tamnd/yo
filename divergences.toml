@@ -664,3 +664,11 @@ reason = "A schema declares a vector field as FLAT or as HNSW, and this side sto
 status = "until"
 resolved_by = "M6"
 spec = "10 section 3"
+
+[[divergence]]
+id = "D-92"
+title = "A WITHSORTKEYS sort key on a numeric field is always tagged as a number"
+reason = "A sort key comes back with a sigil in front of it saying what kind of thing it is, `#` for a number and `$` for a string, and a real server picks the sigil from where it read the value rather than from what the schema calls the field. There is exactly one cell where that shows. A numeric field that is not SORTABLE, sorted on by a query that loads the whole document, is read back off the key as text on a real server and so comes back as `$1` where we say `#1`. Every other combination already matches: a SORTABLE numeric is `#` on both sides whatever else the query asked for, the same non-sortable numeric under NOCONTENT or under a RETURN is `#` on both sides because neither loads the key, and a text field is `$` on both sides throughout. The value itself is identical in all of them and only the one leading byte differs, so a client that reads the number rather than the tag sees no difference at all. This is old and has nothing to do with vectors; it turned up while comparing a vector query that happened to sort on a plain numeric field."
+status = "until"
+resolved_by = "M8"
+spec = "09 section 2"

@@ -214,11 +214,19 @@ impl Wanted {
                 }
             }
             What::Optional(node) => self.read(node),
+            // A vector clause marks nothing itself, but what it narrowed down
+            // first is ordinary query text and is marked as such:
+            // `alpha=>[KNN 3 @v $B]` summarises around the word alpha.
+            What::Vector(vector) => {
+                if let Some(over) = &vector.over {
+                    self.read(over);
+                }
+            }
             // Everything else marks nothing: a `NOT` because no document that
-            // answered holds it, a number, a point and a vector because none of
-            // them is a word in the text, and a `TAG` because a real server
-            // does not mark one. `@g:{red}` leaves the word red alone wherever
-            // it stands, in the tag field and in every text field beside it.
+            // answered holds it, a number and a point because neither is a word
+            // in the text, and a `TAG` because a real server does not mark one.
+            // `@g:{red}` leaves the word red alone wherever it stands, in the
+            // tag field and in every text field beside it.
             _ => {}
         }
     }

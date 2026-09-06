@@ -96,7 +96,7 @@ use yo_search::field::{self, Algo, Coords, Kind, Tag, Text, Vector, Width};
 use yo_search::follow::Errors;
 use yo_search::index::{Definition, Source};
 use yo_search::query::parse::{BAD_POINT, BAD_RADIUS};
-use yo_search::query::{self, Ask, Bad, Circle, Mask, Node, Pair, Range, What};
+use yo_search::query::{self, Ask, Bad, Circle, Mask, Node, Pair, Range, What, Yield};
 use yo_search::score::Scorer;
 use yo_search::sorted::{self, Sorted};
 use yo_search::spell::{self, Lists};
@@ -2087,6 +2087,14 @@ struct Rows<'a> {
     /// went away with the registry lock. Empty unless one of the two clauses is
     /// there to use it.
     wanted: Wanted,
+    /// The distances the query asks to see on every row, outermost clause
+    /// first, taken off the tree in the same place and for the same reason.
+    ///
+    /// A vector clause puts its distance on the row under `__v_score` or under
+    /// the name the client gave it, and a `SORTBY` and a `RETURN` can both name
+    /// it. Empty for a query with no vector clause in it, which is why nothing
+    /// else here has to ask whether there was one.
+    distance: Vec<Yield>,
 }
 
 /// What a `SORTBY` on a search asked for, once the schema has been read.
@@ -2100,6 +2108,10 @@ struct Sorting {
     /// Which of the document's sortable values this is, or nothing when the
     /// index keeps no copy of the field and the key has to be read for it.
     slot: Option<usize>,
+    /// Whether this is sorting by a distance the query yielded rather than by
+    /// anything the key holds, in which case there is no field to read and the
+    /// number is worked out where the answer is gathered.
+    distance: bool,
 }
 
 impl Rows<'_> {
@@ -2164,6 +2176,7 @@ impl Default for Rows<'_> {
             texts: Vec::new(),
             stops: None,
             wanted: Wanted::default(),
+            distance: Vec::new(),
         }
     }
 }
@@ -2365,18 +2378,45 @@ fn options<'a>(
     if asked.rows.explaining && !asked.rows.scores {
         return Err(SCORE_ALONE.as_bytes().to_vec());
     }
-    if let Some((field, desc)) = asked.rows.sort {
-        let Some(known) = index.field(field) else {
-            return Err(line(SORT_PROP, field, SORT_PROP_END));
-        };
-        asked.rows.sorting = Some(Sorting {
-            field: known.clone(),
-            desc,
-            slot: index.slot(field),
-        });
-    }
     aggregate::most(&mut asked);
     Ok(asked)
+}
+
+/// Looks the `SORTBY` field up, once the query has been parsed and the tree has
+/// said which distances the rows will carry.
+///
+/// Left until after the parse because a real server leaves it until after the
+/// parse: `FT.SEARCH i "foo(" SORTBY zz` answers about the query and not about
+/// `zz`, and a sort by `__v_score` is a sort by a property that only exists
+/// because the query put it there.
+fn settle<'a>(
+    asked: &mut Asked<'a>,
+    index: &Index,
+    node: &Node,
+) -> core::result::Result<(), Vec<u8>> {
+    asked.rows.distance = query::yields(node);
+    let Some((field, desc)) = asked.rows.sort else {
+        return Ok(());
+    };
+    if asked.rows.distance.iter().any(|held| *held.name == *field) {
+        asked.rows.sorting = Some(Sorting {
+            field: Field::new(field, Kind::Numeric),
+            desc,
+            slot: None,
+            distance: true,
+        });
+        return Ok(());
+    }
+    let Some(known) = index.field(field) else {
+        return Err(line(SORT_PROP, field, SORT_PROP_END));
+    };
+    asked.rows.sorting = Some(Sorting {
+        field: known.clone(),
+        desc,
+        slot: index.slot(field),
+        distance: false,
+    });
+    Ok(())
 }
 
 /// `LIMIT` and `TIMEOUT`, which every one of the three commands takes wherever
@@ -3294,9 +3334,18 @@ type Built<'a> = (&'a Row, Option<Vec<(&'a [u8], &'a [u8])>>);
 /// nothing at all.
 type Rolled<'a> = (&'a Row, Vec<(&'a [u8], &'a [u8])>);
 
+/// One name and one value a row carries, owned rather than borrowed.
+type Named = (Box<[u8]>, Box<[u8]>);
+
 /// The names and values a row carries, owned rather than borrowed. A cursor is
 /// written long after the documents it read went away, so it keeps its own copy.
-type Pairs = Vec<(Box<[u8]>, Box<[u8]>)>;
+type Pairs = Vec<Named>;
+
+/// One distance a row carries, under the name the row answers it under.
+type Away = (Box<[u8]>, f64);
+
+/// A document that answered, what it scored, and the distances it carries.
+type Scored<'a> = (walk::Hit<'a>, f64, Vec<Away>);
 
 /// One row of an answer, once the registry has been let go of.
 ///
@@ -3318,6 +3367,12 @@ struct Row {
     /// document had a value there. Copied out of the index for a field the
     /// index keeps, and read off the key afterwards for a field it does not.
     sort: Option<Sorted>,
+    /// The distances the query asked to see, in the order they go on the row.
+    ///
+    /// Worked out here rather than carried out of the walk, because a query can
+    /// ask to see the distance from a clause that ordered nothing, and because
+    /// two vector clauses in one query show two distances.
+    dists: Vec<Away>,
 }
 
 /// `FT.SEARCH index query [options]`.
@@ -3392,6 +3447,13 @@ pub(super) fn searched(
                 return Ok(());
             }
         };
+        // The tree says which distances go on a row and a `SORTBY` may be
+        // sorting by one of them, so the field it named is looked up here and
+        // not while the arguments were being read.
+        if let Err(text) = settle(&mut asked, index, &node) {
+            out.error(&text);
+            return Ok(());
+        }
         if asked.cursor.is_some() {
             canon = index.name.clone();
             // Asked before the query runs, because a real server takes the
@@ -3900,7 +3962,15 @@ fn gather(
     } else {
         walk::run(&index.held, &node)
     };
-    let mut found: Vec<(walk::Hit<'_>, f64)> = walked
+    // What each distance the query asked for was measured against, looked up
+    // once rather than once a row. A field the schema does not hold vectors for
+    // is not one of these, which is a query naming a field that went away.
+    let asking: Vec<(&Yield, &yo_search::vecs::Vecs)> = rows
+        .distance
+        .iter()
+        .filter_map(|want| Some((want, index.held.vecs(&want.field)?)))
+        .collect();
+    let mut found: Vec<Scored<'_>> = walked
         .into_iter()
         .filter_map(|hit| {
             let doc = index.held.docs.get(hit.id)?;
@@ -3916,12 +3986,22 @@ fn gather(
             let score = rows
                 .scorer
                 .of(&facts, doc, &hit.found, rows.payload, hit.slop);
-            Some((hit, score))
+            // Worked out here because a `SORTBY` may be about to sort on one of
+            // them, so they cannot wait for the window the way the marking up
+            // of a row does.
+            let dists = asking
+                .iter()
+                .filter_map(|(want, vecs)| {
+                    let away = vecs.distance(hit.id, &want.asked)?;
+                    Some((want.name.clone(), f64::from(away)))
+                })
+                .collect();
+            Some((hit, score, dists))
         })
         .collect();
     // The one scorer that cannot finish a document at a time, because what it
     // divides by is the best score in the whole answer.
-    let mut scores: Vec<f64> = found.iter().map(|(_, score)| *score).collect();
+    let mut scores: Vec<f64> = found.iter().map(|(_, score, _)| *score).collect();
     // Taken before the settling rather than after, because it is what the
     // settling divides by and an explanation prints it.
     let best = scores.iter().copied().fold(0.0_f64, f64::max);
@@ -3934,7 +4014,10 @@ fn gather(
     // the value is in the key, the keyspace is not locked here and the registry
     // is, and a writer takes those two the other way round. So that one hands
     // the whole answer back and is sorted once the lock has been let go of.
-    let by = rows.sorting.as_ref().filter(|by| by.slot.is_some());
+    let by = rows
+        .sorting
+        .as_ref()
+        .filter(|by| by.slot.is_some() || by.distance);
     // Whether a sort is still to come, which is what the window and the order
     // below both turn on.
     let later = rows.sorting.is_some() && by.is_none();
@@ -3949,6 +4032,24 @@ fn gather(
         // is turned over with everything else by `DESC`: a descending answer is
         // the ascending one backwards, apart from the rows with no value at
         // all, which are last either way.
+        // A sort by a distance the query yielded, which is a number this
+        // gathering worked out rather than anything the key holds, so it never
+        // reaches the slower sort that reads the keys back.
+        (Some(by), _) if by.distance => {
+            found.sort_by(|a, b| {
+                let ids = match by.desc {
+                    true => b.0.id.cmp(&a.0.id),
+                    false => a.0.id.cmp(&b.0.id),
+                };
+                let held = |row: &Scored<'_>| {
+                    row.2
+                        .iter()
+                        .find(|(name, _)| **name == *by.field.attribute)
+                        .map(|(_, away)| Sorted::Number(*away))
+                };
+                sorted::order(held(a).as_ref(), held(b).as_ref(), by.desc).then(ids)
+            });
+        }
         (Some(by), _) => {
             let slot = by.slot.unwrap_or_default();
             let held = |id: u32| index.held.docs.get(id).and_then(|doc| doc.sorted(slot));
@@ -3964,14 +4065,16 @@ fn gather(
         // let go of. It goes back in document number order so that its ties come
         // out the same way round as the ties of a sort that ran here, since the
         // sort that runs later is stable and keeps whatever order it was handed.
-        (None, _) if later => found.sort_by_key(|(hit, _)| hit.id),
+        (None, _) if later => found.sort_by_key(|(hit, _, _)| hit.id),
         (None, Order::Ranked) => found.sort_by(|a, b| {
             b.1.partial_cmp(&a.1)
                 .unwrap_or(core::cmp::Ordering::Equal)
                 .then(a.0.id.cmp(&b.0.id))
         }),
-        (None, Order::Forwards) => found.sort_by_key(|(hit, _)| hit.id),
-        (None, Order::Backwards) => found.sort_by_key(|(hit, _)| core::cmp::Reverse(hit.id)),
+        (None, Order::Forwards) => found.sort_by_key(|(hit, _, _)| hit.id),
+        (None, Order::Backwards) => {
+            found.sort_by_key(|(hit, _, _)| core::cmp::Reverse(hit.id));
+        }
     }
     let total = found.len();
     // A grouping step folds every document that answered and the window goes on
@@ -3986,14 +4089,25 @@ fn gather(
         .into_iter()
         .skip(offset)
         .take(count)
-        .filter_map(|(hit, score)| {
+        .filter_map(|(hit, score, dists)| {
             let doc = index.held.docs.get(hit.id)?;
+            let sort = match by {
+                // The value a distance sort compared, which goes on the row the
+                // same way the value a field sort compared goes on it.
+                Some(by) if by.distance => dists
+                    .iter()
+                    .find(|(name, _)| **name == *by.field.attribute)
+                    .map(|(_, away)| Sorted::Number(*away)),
+                Some(by) => doc.sorted(by.slot.unwrap_or_default()).cloned(),
+                None => None,
+            };
             Some(Row {
                 key: doc.key.clone(),
                 score,
                 payload: doc.payload.clone(),
-                sort: by.and_then(|by| doc.sorted(by.slot.unwrap_or_default()).cloned()),
+                sort,
                 note: rows.explaining.then(|| why.note(doc, &hit.found, hit.slop)),
+                dists,
             })
         })
         .collect();
@@ -4028,7 +4142,10 @@ fn write(
     // the value is in the key and the key could not be read under the lock. So
     // the whole answer arrived rather than a window on it, and every row of it
     // has its key read whether or not the client asked for any fields.
-    let slow = want.sorting.as_ref().is_some_and(|by| by.slot.is_none());
+    let slow = want
+        .sorting
+        .as_ref()
+        .is_some_and(|by| by.slot.is_none() && !by.distance);
     let mut held: Vec<Option<indexing::Document>> = if loading || slow {
         rows.iter()
             .map(|row| indexing::read(&server.dbs[db], &row.key))
@@ -4039,7 +4156,11 @@ fn write(
     let mut lost = 0;
     let carried: Vec<Row>;
     let mut rows = rows;
-    if let Some(by) = want.sorting.as_ref().filter(|by| by.slot.is_none()) {
+    if let Some(by) = want
+        .sorting
+        .as_ref()
+        .filter(|by| by.slot.is_none() && !by.distance)
+    {
         let mut pairs: Vec<(Row, Option<indexing::Document>)> = rows
             .iter()
             .cloned()
@@ -4073,6 +4194,18 @@ fn write(
         true => rows.iter().map(|row| shown(row.sort.as_ref())).collect(),
         false => Vec::new(),
     };
+    // The distances, written out once per row for the same reason: they are
+    // worked out rather than read, so the bytes have to live somewhere the
+    // fields of a row can point at.
+    let aways: Vec<Pairs> = rows
+        .iter()
+        .map(|row| {
+            row.dists
+                .iter()
+                .map(|(name, away)| (name.clone(), twelve(*away).into_bytes().into()))
+                .collect()
+        })
+        .collect();
     // The rows that survived the read, with their fields as the key holds them.
     // Kept apart from the reply rows below because a `SUMMARIZE` rewrites some
     // of these values and the rewritten copies have to outlive the rows that
@@ -4088,7 +4221,8 @@ fn write(
             continue;
         };
         let key = keys.get(at).and_then(Option::as_deref);
-        kept.push((row, Some(pick(doc, want, key))));
+        let away = aways.get(at).map_or(&[][..], Pairs::as_slice);
+        kept.push((row, Some(pick(doc, want, key, away))));
     }
     let redone = marked(&kept, want);
     let mut built: Vec<Built<'_>> = kept
@@ -4165,6 +4299,12 @@ fn marked(kept: &[Held<'_>], want: &Rows<'_>) -> Vec<Vec<Option<Vec<u8>>>> {
                 .iter()
                 .flatten()
                 .map(|(name, value)| {
+                    // A distance is worked out rather than read off the key, so
+                    // neither clause touches it: a `SUMMARIZE` over every field
+                    // leaves `__v_score` whole.
+                    if want.distance.iter().any(|held| *held.name == **name) {
+                        return None;
+                    }
                     let named = |list: &[&[u8]]| list.contains(name);
                     // Once any of the two clauses has named a field, the fields
                     // neither of them named are left alone entirely, even by the
@@ -4409,15 +4549,28 @@ fn pick<'d, 'w: 'd>(
     doc: &'d indexing::Document,
     want: &'d Rows<'w>,
     key: Option<&'d [u8]>,
+    away: &'d [Named],
 ) -> Vec<(&'d [u8], &'d [u8])> {
     let pairs = doc.pairs();
     let by = want.sorting.as_ref();
     let Some(ret) = &want.ret else {
-        let Some((by, key)) = by.zip(key) else {
+        let sorted = by.zip(key);
+        if sorted.is_none() && away.is_empty() {
             return pairs;
-        };
-        let mut out: Vec<(&[u8], &[u8])> = Vec::with_capacity(pairs.len() + 1);
-        out.push((&by.field.attribute, key));
+        }
+        let mut out: Vec<(&[u8], &[u8])> = Vec::with_capacity(pairs.len() + away.len() + 1);
+        for (name, value) in away {
+            out.push((&**name, &**value));
+        }
+        // A sort by a distance named its value once already, so it is not put
+        // in twice. A sort by anything else goes in after the distances, which
+        // is measured: a `SORTBY n` over a nearest neighbour query answers the
+        // distance first and `n` after it.
+        if let Some((by, key)) = sorted
+            && !out.iter().any(|(held, _)| *held == &*by.field.attribute)
+        {
+            out.push((&by.field.attribute, key));
+        }
         for (name, value) in pairs {
             match out.iter_mut().find(|(held, _)| *held == name) {
                 Some(held) => held.1 = value,
@@ -4429,6 +4582,15 @@ fn pick<'d, 'w: 'd>(
     let mut out: Vec<(&[u8], &[u8])> = ret
         .iter()
         .filter_map(|(field, name)| {
+            // A distance is on the row before the key is read, so what decides
+            // whether it comes back is the name the row would answer under and
+            // not the field the value would have been read from. That is why a
+            // `RETURN 1 __v_score` answers the distance and a
+            // `RETURN 3 __v_score AS x` answers nothing at all: the rename
+            // sends the reader to the key, which holds no such field.
+            if let Some((_, value)) = away.iter().find(|(held, _)| **held == **name) {
+                return Some((&**name, &**value));
+            }
             let (_, value) = pairs.iter().find(|(held, _)| *held == &**field)?;
             Some((&**name, *value))
         })
@@ -4441,7 +4603,16 @@ fn pick<'d, 'w: 'd>(
         let held = out.remove(at);
         out.insert(0, held);
     }
-    out
+    // The distances go in front of all of it, in the order the query yielded
+    // them and whatever order the `RETURN` named them in.
+    let mut front: Vec<(&[u8], &[u8])> = Vec::with_capacity(away.len());
+    for (name, _) in away {
+        if let Some(at) = out.iter().position(|(held, _)| *held == &**name) {
+            front.push(out.remove(at));
+        }
+    }
+    front.append(&mut out);
+    front
 }
 
 /// The value the sort compared, as it goes on the row beside the other fields.
@@ -4552,6 +4723,7 @@ mod tests {
             payload: None,
             note: None,
             sort: None,
+            dists: Vec::new(),
         };
         let mut built: Vec<Built<'_>> = vec![
             (
