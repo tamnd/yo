@@ -166,7 +166,7 @@ enum Pair<'a> {
 }
 
 /// What one piece of an expression does.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 enum Node {
     /// A literal, which is either a number or a string.
     Value(Value),
@@ -233,7 +233,7 @@ impl Op {
 
 /// One function, named the way the parser found it so an error can quote the
 /// client's own spelling back.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct Func {
     which: Which,
     spelled: Box<[u8]>,
@@ -315,7 +315,7 @@ const FUNCTIONS: &[(&str, Which, usize, usize)] = &[
 ];
 
 /// One expression, ready to be given a row.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct Expr {
     node: Node,
 }
@@ -410,7 +410,26 @@ impl Expr {
     /// not a number is used as one, or when a function is handed the wrong kind
     /// of value.
     pub fn eval(&self, row: &[Value]) -> Result<Value, Vec<u8>> {
-        eval(&self.node, row)
+        eval(&self.node, row, false)
+    }
+
+    /// Whether an index `FILTER` keeps a document this row came out of.
+    ///
+    /// The same expression read a different way, because an index filter is
+    /// handed a hash rather than a pipeline and a hash is allowed to be missing
+    /// a field. Reading one is not an error here, it is a value that no
+    /// comparison is ever true of and that `&&` and `||` treat as false, so
+    /// `@n<3` and `@n>3` are both false for a document with no `n` and
+    /// `@n<3 || !exists(@n)` is true for it. Everything else still refuses it,
+    /// so `abs(@n)` is an error and an error means the document stays out.
+    ///
+    /// All measured against 8.10.1, including the part that reads oddly:
+    /// `!(@n<3)` is true for a document with no `n`, because the comparison
+    /// under it was a plain false, while `!@n` is not, because there is nothing
+    /// there to invert.
+    #[must_use]
+    pub fn holds(&self, row: &[Value]) -> bool {
+        eval(&self.node, row, true).is_ok_and(|value| value.truth())
     }
 }
 
@@ -829,8 +848,17 @@ fn call(lex: &mut Lex<'_>, name: &[u8]) -> Result<Node, Vec<u8>> {
 const NOT_A_NUMBER: &str = "SEARCH_NUMERIC_VALUE_INVALID Invalid numeric value";
 const NOT_COMPARABLE: &str = "Error converting string";
 const NOT_FOUND: &str = "SEARCH_VALUE_NOT_FOUND Could not find the value for a parameter name, consider using EXISTS if applicable for ";
+/// Only an index filter raises this and nothing answers it to a client, since
+/// the document it is about is left out rather than reported.
+const NOTHING_TO_READ: &str = "SEARCH_VALUE_NOT_FOUND Nothing to hand to ";
 
-fn eval(node: &Node, row: &[Value]) -> Result<Value, Vec<u8>> {
+/// Works one node out, with `sieve` for the index filter reading.
+///
+/// The flag only ever reaches three places: the property read, which hands back
+/// the absence rather than refusing it, the comparison, which is false of it,
+/// and the inversion, which passes it through. Everywhere else an absence is a
+/// value that will not read as a number or as text, which is already an error.
+fn eval(node: &Node, row: &[Value], sieve: bool) -> Result<Value, Vec<u8>> {
     match node {
         Node::Value(value) => Ok(value.clone()),
         Node::Named(name) | Node::Slot(_, name) => {
@@ -838,23 +866,33 @@ fn eval(node: &Node, row: &[Value]) -> Result<Value, Vec<u8>> {
                 Node::Slot(at, _) => row.get(*at).unwrap_or(&Value::Missing),
                 _ => &Value::Missing,
             };
-            if matches!(held, Value::Missing) {
+            if matches!(held, Value::Missing) && !sieve {
                 let name = String::from_utf8_lossy(name).into_owned();
                 return Err(format!("{NOT_FOUND}{name}").into_bytes());
             }
             Ok(held.clone())
         }
-        Node::Not(inner) => Ok(Value::Number(f64::from(u8::from(
-            !eval(inner, row)?.truth(),
-        )))),
-        Node::Op(op, left, right) => operate(*op, left, right, row),
-        Node::Call(func, args) => run(func, args, row),
+        Node::Not(inner) => {
+            let held = eval(inner, row, sieve)?;
+            if sieve && matches!(held, Value::Missing) {
+                return Ok(Value::Missing);
+            }
+            Ok(Value::Number(f64::from(u8::from(!held.truth()))))
+        }
+        Node::Op(op, left, right) => operate(*op, left, right, row, sieve),
+        Node::Call(func, args) => run(func, args, row, sieve),
     }
 }
 
-fn operate(op: Op, left: &Node, right: &Node, row: &[Value]) -> Result<Value, Vec<u8>> {
+fn operate(
+    op: Op,
+    left: &Node,
+    right: &Node,
+    row: &[Value],
+    sieve: bool,
+) -> Result<Value, Vec<u8>> {
     if matches!(op, Op::And | Op::Or) {
-        let left = eval(left, row)?.truth();
+        let left = eval(left, row, sieve)?.truth();
         // Both operators stop early. A true left of an `||` and a false left of
         // an `&&` settle the answer, and the right hand side is never looked at,
         // so an error waiting there never happens.
@@ -865,12 +903,19 @@ fn operate(op: Op, left: &Node, right: &Node, row: &[Value]) -> Result<Value, Ve
         if stops {
             return Ok(Value::Number(f64::from(u8::from(left))));
         }
-        let right = eval(right, row)?.truth();
+        let right = eval(right, row, sieve)?.truth();
         return Ok(Value::Number(f64::from(u8::from(right))));
     }
-    let left = eval(left, row)?;
-    let right = eval(right, row)?;
+    let left = eval(left, row, sieve)?;
+    let right = eval(right, row, sieve)?;
     if matches!(op, Op::Eq | Op::Ne | Op::Lt | Op::Le | Op::Gt | Op::Ge) {
+        // A field the hash does not hold is false of every comparison, not only
+        // of the ones that read that way, so `@n!=1` leaves a document with no
+        // `n` out just as `@n==1` does. Only an index filter ever gets here,
+        // since a pipeline refuses the read before the comparison sees it.
+        if sieve && (matches!(left, Value::Missing) || matches!(right, Value::Missing)) {
+            return Ok(Value::Number(0.0));
+        }
         // Two values that cannot be compared are not equal rather than an
         // error, which is why `'a' == 1` is nought where `'a' < 1` is refused.
         let order = compared(&left, &right);
@@ -968,7 +1013,7 @@ fn pairing<'a>(left: &'a Value, right: &'a Value) -> Pair<'a> {
     }
 }
 
-fn run(func: &Func, args: &[Node], row: &[Value]) -> Result<Value, Vec<u8>> {
+fn run(func: &Func, args: &[Node], row: &[Value], sieve: bool) -> Result<Value, Vec<u8>> {
     if func.which == Which::Exists {
         // The one function that is handed a property rather than its value, so
         // that asking whether a row holds one is not itself an error.
@@ -979,12 +1024,23 @@ fn run(func: &Func, args: &[Node], row: &[Value]) -> Result<Value, Vec<u8>> {
                 Value::Missing
             )))));
         }
-        eval(&args[0], row)?;
+        eval(&args[0], row, sieve)?;
         return Ok(Value::Number(1.0));
     }
     let mut held = Vec::with_capacity(args.len());
     for arg in args {
-        held.push(eval(arg, row)?);
+        let value = eval(arg, row, sieve)?;
+        // A function handed a field the hash does not hold is an error and the
+        // document stays out, which is measured: `abs(@n)>0` and `upper(@n)=='X'`
+        // both leave out a document with no `n` rather than reading as false.
+        // It is checked here rather than left to the function because several
+        // of them would quietly take it, and only an index filter can get one
+        // this far anyway.
+        if sieve && matches!(value, Value::Missing) {
+            let name = String::from_utf8_lossy(&func.spelled).into_owned();
+            return Err(format!("{NOTHING_TO_READ}{name}").into_bytes());
+        }
+        held.push(value);
     }
     apply(func, &held)
 }

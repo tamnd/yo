@@ -32,6 +32,24 @@
 //! there leaves the document alone. So the rule is not "this command was a
 //! write", it is "the value under this key is not what it was".
 //!
+//! # A `FILTER` is the other half of following
+//!
+//! A prefix says which keys to go and read and a `FILTER` says which of the
+//! values that come back are worth keeping, so it is applied where the value
+//! arrives rather than where the key is matched. A key it turns down loses
+//! whatever document it had and costs no `hash_indexing_failures`, because
+//! being none of this index's business is not the same as being unreadable.
+//! One it lets in that then will not read is counted the ordinary way.
+//!
+//! The expression is the one the pipeline uses, read a little differently
+//! because a hash is allowed to be missing a field where a pipeline row is not.
+//! [`Expr::holds`](crate::expr::Expr::holds) has the rules and they are all
+//! measured against 8.10.1.
+//!
+//! A rename does not re-read the filter and does not have to. It changes the
+//! name of a key and not the value under it, so a document that belonged here a
+//! moment ago still belongs here under its new name.
+//!
 //! # A rename is not a write
 //!
 //! Every other way a followed key changes reads it again, and `RENAME` inside
@@ -210,9 +228,10 @@ impl Trouble {
 impl Index {
     /// Whether this index follows a key, on its name and its kind alone.
     ///
-    /// The `FILTER` is not applied here. It is an expression over the value, it
-    /// is not parsed yet, and an index carrying one currently follows everything
-    /// its prefixes cover.
+    /// The `FILTER` is not applied here, because it is an expression over the
+    /// value and this is the half that can be answered from the key. Everything
+    /// that asks this question is asking whether to go and read the value, and
+    /// the filter is what happens once it has.
     #[must_use]
     pub fn follows(&self, source: Source, key: &[u8]) -> bool {
         self.definition.on == source && self.definition.covers(key)
@@ -222,7 +241,17 @@ impl Index {
     ///
     /// A key that cannot be read is counted and left out, and whatever this
     /// index had for it before is gone either way.
+    ///
+    /// A key the `FILTER` turns down is left out as well and is not counted,
+    /// which is the difference between the two: a document that does not belong
+    /// here is not a document that went wrong. It still loses whatever it had,
+    /// so an `HSET` that takes a key out of the filter's reach takes its
+    /// document with it.
     pub fn wrote(&mut self, english: &mut English, key: &[u8], fields: &[(&[u8], &[u8])]) -> bool {
+        if !self.takes(fields) {
+            self.erase(key);
+            return false;
+        }
         match self.write(english, key, fields) {
             Ok(_) => true,
             Err(failed) => {
@@ -789,6 +818,143 @@ mod tests {
         assert!(r.rereads(Source::Hash, b"p:9", b"p:2"));
         r.renamed(Source::Hash, b"p:9", b"p:2", None);
         assert_eq!(r.named(b"ix").map(|i| i.held.docs.len()), Some(0));
+    }
+
+    /// An index with a `FILTER` over a prefix it covers, for the write path
+    /// tests below.
+    fn sieving(expr: &[u8], fields: Vec<Field>) -> Index {
+        let definition = Definition {
+            prefixes: vec![b"p:"[..].into()],
+            filter: Some(expr.into()),
+            ..Definition::default()
+        };
+        Index::new(b"ix", definition, fields)
+    }
+
+    fn num() -> Field {
+        Field::new(b"n", Kind::Numeric)
+    }
+
+    /// The keys the filter turns down are not indexed and are not counted, and
+    /// the ones it lets in are read the ordinary way.
+    #[test]
+    fn a_filter_decides_which_covered_keys_are_read() {
+        let mut r = registry(sieving(b"@n<3", vec![text(), num()]));
+        for (key, held) in [(&b"p:1"[..], &b"1"[..]), (b"p:2", b"9"), (b"p:3", b"2")] {
+            r.wrote(
+                Source::Hash,
+                key,
+                &[(&b"t"[..], &b"alpha"[..]), (&b"n"[..], held)],
+            );
+        }
+
+        let ix = r.named(b"ix").expect("the index is there");
+        assert_eq!(ix.held.docs.len(), 2);
+        assert_eq!(ix.held.docs.id(b"p:2"), None);
+        // The key it turned down is none of its business rather than a failure,
+        // and the two it took are the only ones that spent a number.
+        assert_eq!(ix.trouble.whole().failures(), 0);
+        assert_eq!(ix.held.docs.last(), 2);
+        // A key outside the prefix is not read at all, filter or no filter.
+        assert!(!r.follows(Source::Hash, b"q:1"));
+    }
+
+    /// A key that stops matching loses the document it had, and one that starts
+    /// matching gets a fresh number.
+    #[test]
+    fn a_key_that_falls_out_of_the_filter_loses_its_document() {
+        let mut r = registry(sieving(b"@n<3", vec![num()]));
+        r.wrote(Source::Hash, b"p:1", &[(&b"n"[..], &b"1"[..])]);
+        assert_eq!(r.named(b"ix").and_then(|i| i.held.docs.id(b"p:1")), Some(1));
+
+        r.wrote(Source::Hash, b"p:1", &[(&b"n"[..], &b"9"[..])]);
+        assert_eq!(r.named(b"ix").map(|i| i.held.docs.len()), Some(0));
+
+        r.wrote(Source::Hash, b"p:1", &[(&b"n"[..], &b"0"[..])]);
+        let ix = r.named(b"ix").expect("the index is there");
+        assert_eq!(ix.held.docs.id(b"p:1"), Some(2));
+        assert_eq!(ix.trouble.whole().failures(), 0);
+    }
+
+    /// A field the key does not hold is false of every comparison and only
+    /// `exists` can see it, which is the whole of the odd part of the model.
+    #[test]
+    fn a_field_that_is_not_there_is_false_of_every_comparison() {
+        let holds = |expr: &[u8], fields: &[(&[u8], &[u8])]| {
+            sieving(expr, vec![text(), num()]).takes(fields)
+        };
+        let none: &[(&[u8], &[u8])] = &[(&b"t"[..], &b"alpha"[..])];
+        let one: &[(&[u8], &[u8])] = &[(&b"t"[..], &b"alpha"[..]), (&b"n"[..], &b"1"[..])];
+
+        for expr in [
+            &b"@n<3"[..],
+            b"@n>3",
+            b"@n==1",
+            b"@n!=1",
+            b"@n==@n",
+            b"@n",
+            b"!@n",
+            b"abs(@n)>0",
+            b"exists(@n)",
+        ] {
+            assert!(!holds(expr, none), "{}", String::from_utf8_lossy(expr));
+        }
+        // Inverting a comparison that was a plain false is true, where
+        // inverting the read itself is not.
+        assert!(holds(b"!(@n<3)", none));
+        assert!(holds(b"!exists(@n)", none));
+        assert!(holds(b"@n<3 || !exists(@n)", none));
+        assert!(holds(b"@t=='alpha'", none));
+        // And the key that does hold it answers the ordinary way.
+        assert!(holds(b"@n<3", one));
+        assert!(!holds(b"@n>3", one));
+        assert!(holds(b"exists(@n)", one));
+        assert!(!holds(b"!exists(@n)", one));
+    }
+
+    /// Values are compared as the bytes they are, not as the numbers the schema
+    /// would read them as.
+    #[test]
+    fn a_filter_reads_the_bytes_under_the_key() {
+        let holds = |expr: &[u8], raw: &[u8]| sieving(expr, vec![num()]).takes(&[(&b"n"[..], raw)]);
+        assert!(!holds(b"@n=='1'", b"1.0"));
+        assert!(holds(b"@n=='1.0'", b"1.0"));
+        // A number on the other side is still read out of the bytes.
+        assert!(holds(b"@n==1", b"1.0"));
+        assert!(holds(b"startswith(@n,'1')", b"1.0"));
+    }
+
+    /// A name the schema never declared is read straight off the key, and one
+    /// that is an identifier without being an attribute reads nothing at all.
+    #[test]
+    fn a_filter_can_name_a_field_the_schema_does_not_index() {
+        let outside = sieving(b"@zz==1", vec![text()]);
+        assert!(outside.takes(&[(&b"t"[..], &b"alpha"[..]), (&b"zz"[..], &b"1"[..])]));
+        assert!(!outside.takes(&[(&b"t"[..], &b"alpha"[..]), (&b"zz"[..], &b"2"[..])]));
+        assert!(!outside.takes(&[(&b"t"[..], &b"alpha"[..])]));
+
+        // `SCHEMA n AS num NUMERIC` answers about `num` and about nothing else,
+        // so a filter over `n` indexes not one document.
+        let renamed = Field {
+            attribute: b"num"[..].into(),
+            ..Field::new(b"n", Kind::Numeric)
+        };
+        let hidden = sieving(b"@n<3", vec![renamed.clone()]);
+        assert!(!hidden.takes(&[(&b"n"[..], &b"1"[..])]));
+        assert!(!hidden.takes(&[(&b"n"[..], &b"9"[..])]));
+        assert!(!sieving(b"!exists(@n)", vec![renamed.clone()]).takes(&[]));
+        // And the name a query uses reads the field it was declared over.
+        assert!(sieving(b"@num<3", vec![renamed.clone()]).takes(&[(&b"n"[..], &b"1"[..])]));
+        assert!(!sieving(b"@num<3", vec![renamed]).takes(&[(&b"n"[..], &b"9"[..])]));
+    }
+
+    /// An index with no filter takes everything its prefix covers, which is the
+    /// path nearly every index is on.
+    #[test]
+    fn an_index_with_no_filter_takes_everything() {
+        let ix = on(b"p:", vec![text()]);
+        assert!(ix.takes(&[]));
+        assert!(ix.takes(&[(&b"t"[..], &b"alpha"[..])]));
     }
 
     /// An empty registry answers no to everything, which is what keeps the

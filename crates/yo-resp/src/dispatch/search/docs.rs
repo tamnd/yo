@@ -502,8 +502,21 @@ mod tests {
     fn the_option_words_come_in_any_order_and_any_case() {
         read(
             &[
-                b"FT.ADD", b"i", b"k", b"1.0", b"partial", b"LaNgUaGe", b"FrEnCh", b"REPLACE",
-                b"PAYLOAD", b"pp", b"IF", b"@n>1", b"FIELDS", b"t", b"a",
+                b"FT.ADD",
+                b"i",
+                b"k",
+                b"1.0",
+                b"partial",
+                b"LaNgUaGe",
+                b"FrEnCh",
+                b"REPLACE",
+                b"PAYLOAD",
+                b"pp",
+                b"IF",
+                b"@n>1",
+                b"FIELDS",
+                b"t",
+                b"a",
             ],
             |got| {
                 let asked = got.ok().expect("it reads");
@@ -582,7 +595,15 @@ mod tests {
     fn only_a_language_the_module_knows() {
         read(
             &[
-                b"FT.ADD", b"i", b"k", b"1.0", b"LANGUAGE", b"klingon", b"FIELDS", b"t", b"a",
+                b"FT.ADD",
+                b"i",
+                b"k",
+                b"1.0",
+                b"LANGUAGE",
+                b"klingon",
+                b"FIELDS",
+                b"t",
+                b"a",
             ],
             |got| {
                 assert_eq!(got.err().expect("it refuses").head, BAD_LANGUAGE);
