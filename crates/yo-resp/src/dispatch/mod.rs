@@ -3912,6 +3912,113 @@ mod tests {
     }
 
     #[test]
+    fn a_script_gets_the_bit_library_a_real_server_carries() {
+        let mut f = Fixture::new();
+        // Every answer is a signed word, which is why the ones past two to the
+        // thirty one come back negative.
+        for (body, want) in [
+            ("bit.tobit(1)", ":1\r\n"),
+            ("bit.tobit(2^32 + 1)", ":1\r\n"),
+            ("bit.tobit(2^31)", ":-2147483648\r\n"),
+            ("bit.tobit(0xffffffff)", ":-1\r\n"),
+            // The rounding is to the nearest and not toward zero.
+            ("bit.tobit(1.5)", ":2\r\n"),
+            ("bit.tobit(2.5)", ":2\r\n"),
+            ("bit.bnot(0)", ":-1\r\n"),
+            ("bit.band(0xff, 0x0f)", ":15\r\n"),
+            ("bit.band(1, 2, 3)", ":0\r\n"),
+            ("bit.bor(1, 2, 4)", ":7\r\n"),
+            ("bit.bxor(0xff, 0x0f)", ":240\r\n"),
+            // Only the low five bits of a count are read.
+            ("bit.lshift(1, 31)", ":-2147483648\r\n"),
+            ("bit.lshift(1, 32)", ":1\r\n"),
+            ("bit.lshift(1, 33)", ":2\r\n"),
+            ("bit.rshift(-1, 1)", ":2147483647\r\n"),
+            ("bit.arshift(-1, 1)", ":-1\r\n"),
+            ("bit.rol(0x12345678, 8)", ":878082066\r\n"),
+            ("bit.ror(0x12345678, 8)", ":2014458966\r\n"),
+            ("bit.bswap(0x12345678)", ":2018915346\r\n"),
+            // A string that reads as a number is a number, which is Lua's rule
+            // and not a courtesy of this library.
+            ("bit.tobit('0x10')", ":16\r\n"),
+        ] {
+            let script = format!("return {body}");
+            assert_eq!(f.run(&[b"EVAL", script.as_bytes(), b"0"]), want, "{body}");
+        }
+        // The digits are the low ones, a negative count asks for upper case,
+        // and a count outside eight is brought back to it.
+        for (body, want) in [
+            ("bit.tohex(1)", "00000001"),
+            ("bit.tohex(-1)", "ffffffff"),
+            ("bit.tohex(255, 2)", "ff"),
+            ("bit.tohex(255, -8)", "000000FF"),
+            ("bit.tohex(0x87654321, 4)", "4321"),
+            ("bit.tohex(1, 0)", ""),
+            ("bit.tohex(1, 9)", "00000001"),
+        ] {
+            let script = format!("return {body}");
+            assert_eq!(
+                f.run(&[b"EVAL", script.as_bytes(), b"0"]),
+                format!("${}\r\n{want}\r\n", want.len()),
+                "{body}",
+            );
+        }
+        // A bad argument names the position, the function and what was passed,
+        // and the line in front of it is the script's own.
+        for (body, want) in [
+            (
+                "return bit.band()",
+                "bad argument #1 to 'band' (number expected, got no value)",
+            ),
+            (
+                "return bit.band('x')",
+                "bad argument #1 to 'band' (number expected, got string)",
+            ),
+            (
+                "return bit.tobit(true)",
+                "bad argument #1 to 'tobit' (number expected, got boolean)",
+            ),
+            (
+                "return bit.lshift(1)",
+                "bad argument #2 to 'lshift' (number expected, got no value)",
+            ),
+        ] {
+            let reply = f.run(&[b"EVAL", body.as_bytes(), b"0"]);
+            assert!(
+                reply.starts_with(&format!("-ERR user_script:1: {want} script: ")),
+                "{body} gave {reply}",
+            );
+        }
+        // The name in the message is the one the call site used, so a call that
+        // went through `pcall` has no name to report.
+        assert_eq!(
+            f.run(&[
+                b"EVAL",
+                b"local ok, e = pcall(bit.band, 'x') return tostring(e)",
+                b"0",
+            ]),
+            "$52\r\nbad argument #1 to '?' (number expected, got string)\r\n"
+        );
+        // The table is readable and not writable, the same as `redis`.
+        assert_eq!(
+            f.run(&[
+                b"EVAL",
+                b"local t = {} for k in pairs(bit) do t[#t+1] = k end \
+                  table.sort(t) return table.concat(t, ' ')",
+                b"0",
+            ]),
+            "$66\r\narshift band bnot bor bswap bxor lshift rol ror rshift tobit tohex\r\n"
+        );
+        for body in [&b"bit.band = 1"[..], b"rawset(bit, 'zz', 1)"] {
+            assert!(
+                f.run(&[b"EVAL", body, b"0"])
+                    .contains("Attempt to modify a readonly table script: "),
+                "{body:?}",
+            );
+        }
+    }
+
+    #[test]
     fn command_getkeys_reads_the_key_count_out_of_a_script_call() {
         let mut f = Fixture::new();
         assert_eq!(
