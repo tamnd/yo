@@ -106,7 +106,37 @@ fn main() {
 /// Nothing here is built or linked. Clippy stops after analysis, so a target
 /// needs its standard library and nothing else, and `rustup target add` is the
 /// whole setup.
-const CROSS: &[&str] = &["x86_64-pc-windows-msvc", "x86_64-unknown-linux-gnu"];
+const CROSS: &[Target] = &[
+    Target {
+        triple: "x86_64-pc-windows-msvc",
+        zig: "x86_64-windows-gnu",
+        archiver: "lib",
+    },
+    Target {
+        triple: "x86_64-unknown-linux-gnu",
+        zig: "x86_64-linux-gnu",
+        archiver: "ar",
+    },
+];
+
+/// A target `cross` lints for, and what zig has to be told to compile C for it.
+///
+/// `zig` is the third column because the two spellings do not match. Rust names
+/// a vendor and zig does not, so `x86_64-unknown-linux-gnu` has to become
+/// `x86_64-linux-gnu` on the way through, and the MSVC target has to become the
+/// GNU one because a mac has no MSVC runtime headers to compile against. That
+/// substitution is only sound because nothing here is linked or run: clippy
+/// stops after analysis, so the archive the build script produces is never read
+/// by anything, and the ABI it was built for does not matter.
+struct Target {
+    triple: &'static str,
+    zig: &'static str,
+    /// `ar` or `lib`, which is the archiver the `cc` crate will drive for this
+    /// target. It picks by ABI, so the MSVC target gets `lib.exe` style
+    /// arguments and everything else gets `ar` style, and the two do not
+    /// understand each other's flags at all.
+    archiver: &'static str,
+}
 
 /// Run clippy for the platforms this machine is not.
 ///
@@ -120,10 +150,25 @@ const CROSS: &[&str] = &["x86_64-pc-windows-msvc", "x86_64-unknown-linux-gnu"];
 /// `--all-targets` is deliberately not passed. It pulls in criterion, whose
 /// `alloca` has a C build script that needs a real MSVC to build, and the benches
 /// are not where the platform code is anyway.
+///
+/// The workspace stopped being pure Rust when the Lua engine landed. `mlua-sys`
+/// compiles the interpreter from C in a build script, and a build script runs
+/// for the target being linted, so from that point on this command needed a C
+/// compiler for linux and one for windows and a mac has neither. It brings its
+/// own now: zig ships a clang that can target anything, and `cross_toolchain`
+/// writes the two wrapper scripts that point the `cc` crate at it.
 fn cross() {
+    let tools = match cross_toolchain() {
+        Ok(tools) => tools,
+        Err(why) => {
+            eprintln!("{why}");
+            process::exit(1);
+        }
+    };
     let mut bad = false;
     for target in CROSS {
-        println!("clippy {target}");
+        println!("clippy {}", target.triple);
+        let under = target.triple.replace('-', "_");
         let status = process::Command::new(env!("CARGO"))
             .current_dir(root())
             .args([
@@ -131,15 +176,23 @@ fn cross() {
                 "--workspace",
                 "--all-features",
                 "--target",
-                target,
+                target.triple,
             ])
+            .env(
+                format!("CC_{under}"),
+                tools.join(format!("cc-{}", target.zig)),
+            )
+            .env(
+                format!("AR_{under}"),
+                tools.join(format!("{}-{}", target.archiver, target.zig)),
+            )
             .status();
         match status {
             Ok(s) if s.success() => {}
             Ok(_) => bad = true,
             Err(e) => {
-                eprintln!("could not run cargo clippy for {target}: {e}");
-                eprintln!("Add the target first: rustup target add {target}");
+                eprintln!("could not run cargo clippy for {}: {e}", target.triple);
+                eprintln!("Add the target first: rustup target add {}", target.triple);
                 bad = true;
             }
         }
@@ -148,6 +201,102 @@ fn cross() {
         process::exit(1);
     }
     println!("ok       every target lints clean");
+}
+
+/// Write the compiler and archiver wrappers `cross` hands to the `cc` crate,
+/// and answer the directory holding them.
+///
+/// The wrappers exist because of one argument. `cc` appends `-target <triple>`
+/// with the Rust spelling, zig only understands its own, and the last `-target`
+/// on the line wins, so a wrapper that merely appended the right one would be
+/// overruled by the wrong one. Each wrapper therefore drops every `-target` it
+/// was handed and supplies its own.
+fn cross_toolchain() -> Result<PathBuf, String> {
+    let zig = find_zig()?;
+    let dir = std::env::temp_dir().join("yo-xtask-cross");
+    fs::create_dir_all(&dir).map_err(|e| format!("could not make {}: {e}", dir.display()))?;
+    for target in CROSS {
+        let cc = dir.join(format!("cc-{}", target.zig));
+        write_tool(
+            &cc,
+            &format!(
+                "#!/bin/sh\n\
+                 kept=\"\"\n\
+                 skip=0\n\
+                 for a in \"$@\"; do\n\
+                 \x20 if [ $skip -eq 1 ]; then skip=0; continue; fi\n\
+                 \x20 case \"$a\" in\n\
+                 \x20   -target) skip=1; continue ;;\n\
+                 \x20   --target=*) continue ;;\n\
+                 \x20 esac\n\
+                 \x20 kept=\"$kept $a\"\n\
+                 done\n\
+                 exec {zig} cc -target {} $kept\n",
+                target.zig,
+                zig = zig.display(),
+            ),
+        )?;
+        let ar = dir.join(format!("{}-{}", target.archiver, target.zig));
+        write_tool(
+            &ar,
+            &format!(
+                "#!/bin/sh\nexec {} {} \"$@\"\n",
+                zig.display(),
+                target.archiver
+            ),
+        )?;
+    }
+    Ok(dir)
+}
+
+/// Write one wrapper and make it runnable.
+fn write_tool(path: &Path, body: &str) -> Result<(), String> {
+    fs::write(path, body).map_err(|e| format!("could not write {}: {e}", path.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o755))
+            .map_err(|e| format!("could not chmod {}: {e}", path.display()))?;
+    }
+    Ok(())
+}
+
+/// Find a zig, on the path or in the `ziglang` wheel that pip installs.
+///
+/// The wheel is worth looking in because it is how this ends up on a machine
+/// that already has Python for the other xtask commands, and because
+/// `cargo-zigbuild` looks there too, so a developer who set one of these up has
+/// usually set up the other by accident.
+fn find_zig() -> Result<PathBuf, String> {
+    if let Ok(out) = process::Command::new("zig").arg("version").output()
+        && out.status.success()
+    {
+        return Ok(PathBuf::from("zig"));
+    }
+    let out = process::Command::new("python3")
+        .args([
+            "-c",
+            "import ziglang, os; print(os.path.dirname(ziglang.__file__))",
+        ])
+        .output();
+    if let Ok(out) = out
+        && out.status.success()
+    {
+        let dir = PathBuf::from(String::from_utf8_lossy(&out.stdout).trim());
+        let zig = dir.join("zig");
+        if zig.exists() {
+            return Ok(zig);
+        }
+    }
+    Err(
+        "cross needs a C compiler for linux and for windows, and this machine has \
+         neither. The workspace builds Lua from C, so clippy for another target \
+         runs a build script that has to compile it.\n\
+         Install one with `pip install ziglang`, or `brew install zig`, and run \
+         this again. Without it the release matrix in CI is the only cross check \
+         there is."
+            .to_string(),
+    )
 }
 
 /// Hands everything after the subcommand to a script in `xtask/` and exits with
