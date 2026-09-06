@@ -672,3 +672,10 @@ reason = "A sort key comes back with a sigil in front of it saying what kind of 
 status = "until"
 resolved_by = "M8"
 spec = "09 section 2"
+
+[[divergence]]
+id = "D-94"
+title = "An index FILTER that names no field does not crash the server"
+reason = "FT.CREATE c PREFIX 1 c: FILTER 1==1 SCHEMA t TEXT is accepted by Redis 8.10.1 and then the first write under the prefix kills it. HSET c:1 t alpha segfaults, signal 11 at address 0xfffffffffffffff8 inside redisearch.so in rlookup::RLookup::load_rule_fields, and the container has to be recreated. Reproduced twice from a clean container. The cause is visible from the shape of the thing: the filter is evaluated over a row loaded from the key, the row is built out of the fields the expression names, an expression naming none leaves nothing to load and the loader walks off the end of it. Here the same create is accepted and the same write is filtered on a constant, so 1==1 indexes every key under the prefix and 0 indexes none, which is what the expression says. There is nothing to match on the other side because the other side is a crash rather than an answer, and copying it is not on the table."
+status = "permanent"
+spec = "09 section 2"

@@ -61,6 +61,7 @@ use std::collections::BTreeMap;
 
 use crate::docs::Docs;
 use crate::english::English;
+use crate::expr::Value;
 use crate::field::Kind;
 use crate::geos::{self, Geos};
 use crate::index::Index;
@@ -471,6 +472,53 @@ impl Index {
         let id = self.held.docs.remove(key)?;
         self.held.drop_vectors(id);
         Some(id)
+    }
+
+    /// Whether the definition's `FILTER` lets a key's fields in.
+    ///
+    /// Yes for the ordinary index, which has no filter at all. For one that
+    /// does, every value the expression asks for is read out of the key as text
+    /// whatever the schema calls it, which is measured: an index on a numeric
+    /// `n` holding `1.0` is not kept by `@n=='1'` and is kept by `@n=='1.0'`,
+    /// so the comparison is between the bytes and not between the numbers they
+    /// read as.
+    #[must_use]
+    pub fn takes(&self, fields: &[(&[u8], &[u8])]) -> bool {
+        let Some(sieve) = &self.sieve else {
+            return true;
+        };
+        let mut row = Vec::with_capacity(sieve.names.len());
+        for name in &sieve.names {
+            let Some(from) = self.reads(name) else {
+                return false;
+            };
+            row.push(match value(fields, from) {
+                Some(raw) => Value::Text(raw.into()),
+                None => Value::Missing,
+            });
+        }
+        sieve.expr.holds(&row)
+    }
+
+    /// Which field of a key one name in a `FILTER` reads, or `None` for a name
+    /// that reads nothing at all.
+    ///
+    /// Three answers and not two. A name the schema declares reads the field
+    /// that schema field was declared over, so `SCHEMA n AS num NUMERIC` with
+    /// `FILTER @num<3` reads `n`. A name the schema has never heard of reads the
+    /// field of that name straight off the key, so `FILTER @zz==1` follows the
+    /// keys holding `zz` with nothing in the schema mentioning it. And a name
+    /// that is an identifier without being an attribute reads nothing, which is
+    /// the same `SCHEMA n AS num NUMERIC` with `FILTER @n<3`: a real server
+    /// indexes not one document under it, not even the ones a `!exists` would
+    /// otherwise let through, so the whole filter is answered no rather than
+    /// that one name being answered nothing.
+    fn reads<'a>(&'a self, name: &'a [u8]) -> Option<&'a [u8]> {
+        if let Some(field) = self.field(name) {
+            return Some(&field.identifier);
+        }
+        let hidden = self.schema.iter().any(|field| *field.identifier == *name);
+        (!hidden).then_some(name)
     }
 }
 

@@ -94,7 +94,7 @@ use yo_common::{Result, parse_i64};
 use yo_search::explain::{Note, Why};
 use yo_search::field::{self, Algo, Coords, Kind, Tag, Text, Vector, Width};
 use yo_search::follow::Errors;
-use yo_search::index::{Definition, Source};
+use yo_search::index::{Definition, Sieve, Source};
 use yo_search::query::parse::{BAD_POINT, BAD_RADIUS};
 use yo_search::query::{self, Ask, Bad, Circle, Mask, Node, Pair, Range, What, Yield};
 use yo_search::score::Scorer;
@@ -193,10 +193,15 @@ const PHONETICS: &[&[u8]] = &[b"dm:en", b"dm:fr", b"dm:pt", b"dm:es"];
 /// server's text, which is the only arrangement any of these lines take. A line
 /// with nothing to quote has an empty middle and an empty tail, which writes
 /// the head on its own.
+///
+/// The one exception is a line that was built somewhere else and arrives whole,
+/// which is the expression reader's, since where it went wrong and what it was
+/// reading are both counted out of the client's own bytes.
 struct Fail<'a> {
     head: &'static str,
     word: &'a [u8],
     tail: &'static str,
+    whole: Option<Vec<u8>>,
 }
 
 impl<'a> Fail<'a> {
@@ -206,6 +211,7 @@ impl<'a> Fail<'a> {
             head,
             word: b"",
             tail: "",
+            whole: None,
         }
     }
 
@@ -215,17 +221,36 @@ impl<'a> Fail<'a> {
             head,
             word,
             tail: "",
+            whole: None,
         }
     }
 
     /// A line with a word the client sent in the middle of it.
     const fn about(head: &'static str, word: &'a [u8], tail: &'static str) -> Fail<'a> {
-        Fail { head, word, tail }
+        Fail {
+            head,
+            word,
+            tail,
+            whole: None,
+        }
+    }
+
+    /// A line somebody else wrote, taken as it stands.
+    const fn said(whole: Vec<u8>) -> Fail<'a> {
+        Fail {
+            head: "",
+            word: b"",
+            tail: "",
+            whole: Some(whole),
+        }
     }
 
     /// Writes it out.
     fn write(&self, out: &mut Out) {
-        out.error_about(self.head.as_bytes(), self.word, self.tail.as_bytes());
+        match &self.whole {
+            Some(line) => out.error(line),
+            None => out.error_about(self.head.as_bytes(), self.word, self.tail.as_bytes()),
+        }
     }
 }
 
@@ -488,7 +513,13 @@ fn definition(args: Args<'_>, from: usize) -> core::result::Result<(Definition, 
             }
             prefixes = Some(list);
         } else if args::is(a, b"filter") {
-            d.filter = Some(value(args, &mut at, "FILTER")?.into());
+            let src = value(args, &mut at, "FILTER")?;
+            // Read here and thrown away, only so that a filter that will not
+            // read refuses the create. It is refused where it is written rather
+            // than at the end, which is measured: a create with a bad filter and
+            // no `SCHEMA` at all answers about the filter.
+            Sieve::parse(src).map_err(Fail::said)?;
+            d.filter = Some(src.into());
         } else if args::is(a, b"language") {
             let v = value(args, &mut at, "LANGUAGE")?;
             d.language = Some(language(v).ok_or(Fail::plain(LANGUAGE))?.into());

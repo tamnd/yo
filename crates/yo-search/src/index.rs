@@ -1,5 +1,6 @@
 //! What an index is: which keys it follows and what it reads out of them.
 
+use crate::expr::Expr;
 use crate::field::Field;
 use crate::follow::Trouble;
 use crate::held::Held;
@@ -166,12 +167,60 @@ pub struct Index {
     /// The words it treats as the same word, which both the write path and the
     /// query parser read.
     pub synonyms: Synonyms,
+    /// The definition's `FILTER`, read once here rather than once a document.
+    ///
+    /// Only ever `None` when the definition names no filter, since a filter that
+    /// will not read is refused when the index is created.
+    pub sieve: Option<Sieve>,
+}
+
+/// A definition's `FILTER`, parsed and bound to a row of its own.
+///
+/// The row is built per document out of the names the expression asks for, so
+/// the binding is done once when the index is made and only the reading is done
+/// per write. A name that is not in the schema is read straight off the key,
+/// which is measured: an index filtering on `@zz==1` follows the keys holding
+/// `zz` even though nothing indexes `zz`.
+#[derive(Clone, Debug)]
+pub struct Sieve {
+    /// The expression, with every property already bound to a slot.
+    pub expr: Expr,
+    /// What each slot is called, in slot order.
+    pub names: Vec<Box<[u8]>>,
+}
+
+impl Sieve {
+    /// Reads a filter, or the line a real server refuses the create with.
+    ///
+    /// The binder answers every name, so the only way this fails is the parse,
+    /// which is why `FT.CREATE ... FILTER @nope<3` is accepted and an index
+    /// filtering on a field nothing writes simply holds nothing.
+    pub fn parse(src: &[u8]) -> Result<Sieve, Vec<u8>> {
+        let mut names: Vec<Box<[u8]>> = Vec::new();
+        let mut expr = Expr::parse(src)?;
+        let bound = expr.bind(&mut |name| {
+            if let Some(at) = names.iter().position(|held| **held == *name) {
+                return Some(at);
+            }
+            names.push(name.into());
+            Some(names.len() - 1)
+        });
+        debug_assert!(bound.is_ok(), "the binder answers every name");
+        Ok(Sieve { expr, names })
+    }
 }
 
 impl Index {
     /// An index with a definition and a schema and nothing in it yet.
+    ///
+    /// A definition carrying a filter that will not read leaves the index with
+    /// none, which no caller can reach: the create refuses first.
     #[must_use]
     pub fn new(name: &[u8], definition: Definition, schema: Vec<Field>) -> Index {
+        let sieve = definition
+            .filter
+            .as_deref()
+            .and_then(|src| Sieve::parse(src).ok());
         Index {
             name: name.into(),
             definition,
@@ -180,6 +229,7 @@ impl Index {
             held: Held::new(),
             trouble: Trouble::default(),
             synonyms: Synonyms::new(),
+            sieve,
         }
     }
 
