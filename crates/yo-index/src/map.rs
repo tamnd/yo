@@ -1761,6 +1761,24 @@ mod tests {
     #[cfg(not(miri))]
     const SCAN_N: usize = 20_000;
 
+    /// How many keys go in between one call of a growing walk and the next.
+    ///
+    /// This is the number that decides what that test costs, and not `SCAN_N`,
+    /// which is why it is its own constant. The walk takes eight keys a call
+    /// and this puts keys back in behind it, so at 64 the map grows eight times
+    /// faster than the walk eats it and the loop runs until the directory has
+    /// doubled its way out from under the whole thing. Shrinking the starting
+    /// population without shrinking this leaves the ratio where it was and the
+    /// test still runs for twenty minutes interpreted.
+    ///
+    /// Eight is one call's worth, so the map still grows during the walk and
+    /// the directory still doubles, which is the assertion. What goes away is
+    /// the number of times over.
+    #[cfg(miri)]
+    const GREW_PER_CALL: usize = 8;
+    #[cfg(not(miri))]
+    const GREW_PER_CALL: usize = 64;
+
     #[test]
     fn a_walk_of_an_empty_map_ends_on_the_first_call() {
         let m = RawMap::new();
@@ -1855,7 +1873,7 @@ mod tests {
                 break;
             }
             // Between one call and the next, which is where a client would be.
-            for _ in 0..64 {
+            for _ in 0..GREW_PER_CALL {
                 m.set(&key(added), &val(added));
                 added += 1;
             }
