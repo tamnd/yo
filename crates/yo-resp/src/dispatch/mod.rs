@@ -1909,6 +1909,9 @@ pub fn resolved(
             "search" if spec.name == "FT.AGGREGATE" => {
                 search::roll(server, session.db, args, out).map(|()| Flow::Continue)
             }
+            "search" if spec.name == "FT.HYBRID" => {
+                search::hybrid(server, session.db, args, out).map(|()| Flow::Continue)
+            }
             "search" if spec.name == "FT.PROFILE" => {
                 // Which is one of those two with the working shown, so it needs
                 // everything they need and takes the same route to it.

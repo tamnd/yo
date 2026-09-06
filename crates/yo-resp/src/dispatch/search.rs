@@ -115,10 +115,12 @@ use crate::reply::Out;
 mod aggregate;
 mod config;
 pub(super) mod cursor;
+mod hybrid;
 mod profile;
 
 use aggregate::{Pipe, Reads, Shape, apply, group, keeps, piped, sorts, windows};
 use cursor::{Asks, Kept, Made};
+pub(super) use hybrid::hybrid;
 
 /// What somebody profiling a search or an aggregation wants to know about the
 /// run, filled in as it goes and read once it is over.

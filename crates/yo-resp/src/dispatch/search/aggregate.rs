@@ -129,6 +129,9 @@ pub(super) enum Reads {
     /// A distance a vector clause in the query measured, which is on the row
     /// whether or not anything asked and is on it before anything else.
     Distance,
+    /// The name of the key the row came off, which only `FT.HYBRID` puts on a
+    /// row without something asking for it.
+    Key,
     /// Nothing off the key at all: a slot an `APPLY` fills in.
     Made,
 }
@@ -833,29 +836,52 @@ pub(super) fn windows(asked: &mut Asked<'_>, offset: usize, count: usize) {
 /// The second half of that is what the count at the front of the reply is made
 /// of, and it is carried per row because the count a client sees is the one
 /// that stood when the first row of the reply was written.
-struct Held {
-    values: Vec<Value>,
-    dropped: usize,
+pub(super) struct Held {
+    pub(super) values: Vec<Value>,
+    pub(super) dropped: usize,
     /// Which document the row came off, which a row a group step made has
     /// nothing to answer.
-    from: Option<usize>,
+    pub(super) from: Option<usize>,
 }
 
-/// Reads the keys a pipeline needs, runs it, and writes what it made.
+/// What running a pipeline left behind, before anything of it is written.
+///
+/// Split out from the writing because `FT.HYBRID` runs the same steps over its
+/// merged rows and then puts them in an envelope of its own.
+pub(super) struct Table {
+    /// What each column of a row is called, in the order the columns sit in.
+    pub(super) names: Vec<Box<[u8]>>,
+    /// The rows the last step left.
+    pub(super) table: Vec<Held>,
+    /// One entry per document the query answered, false once something took it
+    /// out of the answer.
+    pub(super) walk: Vec<bool>,
+    /// How many rows the count starts from, which a group step resets.
+    pub(super) start: usize,
+    /// How many rows a filter threw away altogether.
+    pub(super) gone: usize,
+    /// The error a step could not get past, which stops the pipeline where it
+    /// stands rather than refusing the whole command.
+    pub(super) warning: Option<Vec<u8>>,
+    /// Whether the whole answer had to exist before any of it could be
+    /// written, which a group step and a sort both make true.
+    pub(super) settled: bool,
+    /// Which column the sort key beside each row is read from.
+    pub(super) sorted: Option<usize>,
+}
+
+/// Reads the keys a pipeline needs and runs its steps.
 ///
 /// Every document that answered is read whatever the window is, because a step
 /// that throws rows away changes which document the window lands on.
-#[allow(clippy::too_many_arguments)]
-pub(super) fn piped(
+pub(super) fn runs(
     server: &Server,
     db: usize,
     total: usize,
     rows: &[Row],
     asked: &Asked<'_>,
-    index: &[u8],
     watch: Option<&mut Watch>,
-    out: &mut Out,
-) {
+) -> Table {
     let mut watch = watch;
     let pipe = &asked.pipe;
     let mut names: Vec<Box<[u8]>> = pipe.base.iter().map(|(name, _)| name.clone()).collect();
@@ -891,6 +917,7 @@ pub(super) fn piped(
         for (name, from) in &pipe.base {
             made.push(match from {
                 Reads::Made => Value::Missing,
+                Reads::Key => Value::Text(row.key.clone()),
                 Reads::Score => Value::Text(twelve(row.score).into_bytes().into()),
                 // Worked out while the query ran rather than read off the key,
                 // so it is on the row even when nothing was loaded at all.
@@ -1054,6 +1081,40 @@ pub(super) fn piped(
             break;
         }
     }
+    Table {
+        names,
+        table,
+        walk,
+        start,
+        gone,
+        warning,
+        settled: grouped || ranked,
+        sorted,
+    }
+}
+
+/// Runs a pipeline and writes what it made.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn piped(
+    server: &Server,
+    db: usize,
+    total: usize,
+    rows: &[Row],
+    asked: &Asked<'_>,
+    index: &[u8],
+    watch: Option<&mut Watch>,
+    out: &mut Out,
+) {
+    let Table {
+        names,
+        table,
+        mut walk,
+        start,
+        gone,
+        warning,
+        settled,
+        sorted,
+    } = runs(server, db, total, rows, asked, watch);
     let shown: Vec<(Option<&Row>, &Vec<Value>)> = table
         .iter()
         .map(|held| (held.from.map(|at| &rows[at]), &held.values))
@@ -1065,7 +1126,6 @@ pub(super) fn piped(
         out.error(bad);
         return;
     }
-    let settled = grouped || ranked;
     let counted = counting(&table, start, gone, asked, settled, shown.len(), out);
     if asked.cursor.is_some() {
         drop(shown);
@@ -1502,7 +1562,7 @@ fn keyed(values: &[Value], sorted: Option<usize>) -> Option<Vec<u8>> {
 /// The score goes in front of the lot when `ADDSCORES` asked for it and nothing
 /// in the pipeline named it, wherever in the argument list the word stood: a
 /// `SORTBY` that put a property on the row first still answers the score first.
-fn mapped(names: &[Box<[u8]>], row: &[Value], score: Option<f64>, out: &mut Out) {
+pub(super) fn mapped(names: &[Box<[u8]>], row: &[Value], score: Option<f64>, out: &mut Out) {
     let held: Vec<(&Box<[u8]>, &Value)> = names
         .iter()
         .zip(row)

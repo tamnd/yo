@@ -672,3 +672,11 @@ reason = "A sort key comes back with a sigil in front of it saying what kind of 
 status = "until"
 resolved_by = "M8"
 spec = "09 section 2"
+
+[[divergence]]
+id = "D-93"
+title = "FT.HYBRID reads EXPLAINSCORE and WITHCURSOR and drops them"
+reason = "Everything else about the command is exact, which is both sections and all their words, both ways of folding the two rankings with their defaults and their arithmetic, the pre-filter on the vector branch, the window, the row property order, the pipeline and the reply envelope on both protocols. These two are the pieces of the reply that are not there yet. EXPLAINSCORE puts a score entry in front of every row on a real server holding the merged number as a string, the line it was worked out from and a tree under it naming the rank a document took in each branch with the text scorer's own explanation nested inside, and a row here comes back without it. WITHCURSOR is stranger: a real server answers a pair of cursor ids under SEARCH and VSIM and no rows at all, one cursor per branch rather than one over the merged answer, so it is a different execution of the whole command and not a window on this one, and a row here comes back as the ordinary reply. Both are read and accepted rather than refused, because the words are real words that a later change fills in rather than words nobody should write, and a client that writes either gets a smaller answer rather than a wrong one. Neither of them changes a score, a ranking, a total or a row, so a client that reads the answer rather than the explanation of it sees no difference at all."
+status = "until"
+resolved_by = "M8"
+spec = "09 section 5"
