@@ -22791,6 +22791,475 @@ mod tests {
         }
     }
 
+    // ---------------------------------------------------------------- debug
+
+    /// A small index with one of everything a dump can read, so the tests below
+    /// all name the same three documents and the same four fields.
+    fn debugging() -> Fixture {
+        let mut f = Fixture::new();
+        f.run(&[
+            b"FT.CREATE",
+            b"dx",
+            b"PREFIX",
+            b"1",
+            b"d:",
+            b"SCHEMA",
+            b"t",
+            b"TEXT",
+            b"g",
+            b"TAG",
+            b"n",
+            b"NUMERIC",
+            b"s",
+            b"TEXT",
+            b"SORTABLE",
+        ]);
+        f.run(&[
+            b"HSET",
+            b"d:1",
+            b"t",
+            b"running dogs",
+            b"g",
+            b"red,blue",
+            b"n",
+            b"1",
+            b"s",
+            b"Alpha",
+        ]);
+        f.run(&[
+            b"HSET", b"d:2", b"t", b"running", b"g", b"red", b"n", b"2", b"s", b"beta",
+        ]);
+        f.run(&[
+            b"HSET",
+            b"d:3",
+            b"t",
+            b"dogs alpha",
+            b"g",
+            b"green",
+            b"n",
+            b"3",
+        ]);
+        f
+    }
+
+    /// The whole dictionary in byte order, with the stems in it as entries of
+    /// their own rather than hidden behind the words they came from.
+    #[test]
+    fn a_term_dump_lists_the_stems_beside_the_words() {
+        let mut f = debugging();
+        assert_eq!(
+            f.run(&[b"_FT.DEBUG", b"DUMP_TERMS", b"dx"]),
+            "*6\r\n$4\r\n+dog\r\n$4\r\n+run\r\n$5\r\nalpha\r\n$4\r\nbeta\r\n\
+             $4\r\ndogs\r\n$7\r\nrunning\r\n"
+        );
+    }
+
+    /// A posting list is looked up on the bytes given and nothing folds them, so
+    /// the term that a query would have found is not the term a dump wants.
+    #[test]
+    fn a_posting_list_is_read_by_the_bytes_and_not_by_the_word() {
+        let mut f = debugging();
+        assert_eq!(
+            f.run(&[b"_FT.DEBUG", b"DUMP_INVIDX", b"dx", b"running"]),
+            "*2\r\n:1\r\n:2\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"_FT.DEBUG", b"DUMP_INVIDX", b"dx", b"+run"]),
+            "*2\r\n:1\r\n:2\r\n"
+        );
+        for term in [b"RUNNING".as_slice(), b"nosuchterm", b""] {
+            assert_eq!(
+                f.run(&[b"_FT.DEBUG", b"DUMP_INVIDX", b"dx", term]),
+                "-Can not find the inverted index\r\n",
+                "{term:?}"
+            );
+        }
+    }
+
+    /// Tag values come back folded and in byte order, each with the documents
+    /// that hold it, and a document with two values is under both of them.
+    #[test]
+    fn a_tag_dump_pairs_every_value_with_its_documents() {
+        let mut f = debugging();
+        assert_eq!(
+            f.run(&[b"_FT.DEBUG", b"DUMP_TAGIDX", b"dx", b"g"]),
+            "*3\r\n*2\r\n$4\r\nblue\r\n*1\r\n:1\r\n*2\r\n$5\r\ngreen\r\n*1\r\n:3\r\n\
+             *2\r\n$3\r\nred\r\n*2\r\n:1\r\n:2\r\n"
+        );
+    }
+
+    /// One list holding every document in the field, which is D-96: a range tree
+    /// answers one list per range and this answers the one it keeps.
+    #[test]
+    fn a_number_dump_answers_a_single_range() {
+        let mut f = debugging();
+        assert_eq!(
+            f.run(&[b"_FT.DEBUG", b"DUMP_NUMIDX", b"dx", b"n"]),
+            "*1\r\n*3\r\n:1\r\n:2\r\n:3\r\n"
+        );
+    }
+
+    /// A point is a number underneath, so the field that holds points answers
+    /// the subcommand that dumps numbers and not the one that dumps tags.
+    #[test]
+    fn a_geo_field_is_dumped_as_a_numeric_one() {
+        let mut f = Fixture::new();
+        f.run(&[
+            b"FT.CREATE",
+            b"gx",
+            b"PREFIX",
+            b"1",
+            b"q:",
+            b"SCHEMA",
+            b"loc",
+            b"GEO",
+            b"gg",
+            b"AS",
+            b"tag",
+            b"TAG",
+        ]);
+        f.run(&[b"HSET", b"q:1", b"loc", b"1,2", b"gg", b"red"]);
+        f.run(&[b"HSET", b"q:2", b"loc", b"3,4", b"gg", b"BLUE"]);
+        assert_eq!(
+            f.run(&[b"_FT.DEBUG", b"DUMP_NUMIDX", b"gx", b"loc"]),
+            "*1\r\n*2\r\n:1\r\n:2\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"_FT.DEBUG", b"DUMP_TAGIDX", b"gx", b"loc"]),
+            "-Could not find given field in index spec\r\n"
+        );
+    }
+
+    /// A field is named the way a query names it, so the attribute is the name
+    /// and the identifier the value was read from is not one.
+    #[test]
+    fn a_dump_takes_the_attribute_and_not_the_identifier() {
+        let mut f = Fixture::new();
+        f.run(&[
+            b"FT.CREATE",
+            b"zx",
+            b"PREFIX",
+            b"1",
+            b"z:",
+            b"SCHEMA",
+            b"gg",
+            b"AS",
+            b"tag",
+            b"TAG",
+        ]);
+        f.run(&[b"HSET", b"z:1", b"gg", b"red"]);
+        assert_eq!(
+            f.run(&[b"_FT.DEBUG", b"DUMP_TAGIDX", b"zx", b"tag"]),
+            "*1\r\n*2\r\n$3\r\nred\r\n*1\r\n:1\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"_FT.DEBUG", b"DUMP_TAGIDX", b"zx", b"gg"]),
+            "-Could not find given field in index spec\r\n"
+        );
+    }
+
+    /// The seven keys, with the score as a bulk string here and a double there,
+    /// and the whole row flat on one protocol and a map on the other.
+    #[test]
+    fn a_document_row_is_flat_on_one_protocol_and_a_map_on_the_other() {
+        let mut f = debugging();
+        assert_eq!(
+            f.run(&[b"_FT.DEBUG", b"DOCINFO", b"dx", b"d:1", b"REVEAL"]),
+            "*14\r\n+internal_id\r\n:1\r\n$5\r\nflags\r\n\
+             $36\r\n(0xc):HasSortVector,HasOffsetVector,\r\n+score\r\n$1\r\n1\r\n\
+             +num_tokens\r\n:3\r\n+max_freq\r\n:1\r\n+refcount\r\n:1\r\n\
+             +sortables\r\n*1\r\n*6\r\n+index\r\n:0\r\n$5\r\nfield\r\n$6\r\ns AS s\r\n\
+             $5\r\nvalue\r\n$5\r\nalpha\r\n"
+        );
+        let mut g = debugging();
+        g.run(&[b"HELLO", b"3"]);
+        assert_eq!(
+            g.run(&[b"_FT.DEBUG", b"DOCINFO", b"dx", b"d:1", b"REVEAL"]),
+            "%7\r\n+internal_id\r\n:1\r\n$5\r\nflags\r\n\
+             $36\r\n(0xc):HasSortVector,HasOffsetVector,\r\n+score\r\n,1\r\n\
+             +num_tokens\r\n:3\r\n+max_freq\r\n:1\r\n+refcount\r\n:1\r\n\
+             +sortables\r\n*1\r\n*6\r\n+index\r\n:0\r\n$5\r\nfield\r\n$6\r\ns AS s\r\n\
+             $5\r\nvalue\r\n$5\r\nalpha\r\n"
+        );
+    }
+
+    /// A document that wrote nothing into a sortable slot has no sortables key
+    /// at all, so the row is a key shorter rather than carrying an empty list.
+    #[test]
+    fn a_document_with_no_sortable_value_drops_the_key() {
+        let mut f = debugging();
+        assert_eq!(
+            f.run(&[b"_FT.DEBUG", b"DOCINFO", b"dx", b"d:3", b"REVEAL"]),
+            "*12\r\n+internal_id\r\n:3\r\n$5\r\nflags\r\n$22\r\n(0x8):HasOffsetVector,\r\n\
+             +score\r\n$1\r\n1\r\n+num_tokens\r\n:2\r\n+max_freq\r\n:1\r\n+refcount\r\n:1\r\n"
+        );
+    }
+
+    /// The flag word is the number and then the names it stands for, and an
+    /// index built without offsets has none of the three set.
+    #[test]
+    fn the_flag_word_spells_out_the_bits_it_carries() {
+        let mut f = Fixture::new();
+        f.run(&[
+            b"FT.CREATE",
+            b"nx",
+            b"NOOFFSETS",
+            b"PREFIX",
+            b"1",
+            b"o:",
+            b"SCHEMA",
+            b"t",
+            b"TEXT",
+        ]);
+        f.run(&[b"HSET", b"o:1", b"t", b"alpha"]);
+        assert!(
+            f.run(&[b"_FT.DEBUG", b"DOCINFO", b"nx", b"o:1", b"REVEAL"])
+                .contains("$6\r\n(0x0):\r\n")
+        );
+    }
+
+    /// Obfuscation replaces the field name with where the field sits in the
+    /// whole schema, which is not where its value sits among the sortables.
+    #[test]
+    fn obfuscation_numbers_a_field_by_its_place_in_the_schema() {
+        let mut f = debugging();
+        assert!(
+            f.run(&[b"_FT.DEBUG", b"DOCINFO", b"dx", b"d:1", b"OBFUSCATE"])
+                .contains("$22\r\nFieldPath@3 AS Field@3\r\n")
+        );
+    }
+
+    /// The keyword is read where it belongs and anything after it is stepped
+    /// over, whatever the line that complains about it says.
+    #[test]
+    fn a_document_row_reads_its_keyword_at_a_fixed_place() {
+        let mut f = debugging();
+        let want = f.run(&[b"_FT.DEBUG", b"DOCINFO", b"dx", b"d:1", b"REVEAL"]);
+        assert_eq!(
+            f.run(&[b"_FT.DEBUG", b"DOCINFO", b"dx", b"d:1", b"REVEAL", b"more"]),
+            want
+        );
+        assert_eq!(
+            f.run(&[b"_FT.DEBUG", b"DOCINFO", b"dx", b"d:1", b"more", b"REVEAL"]),
+            "-Invalid argument. Expected REVEAL or OBFUSCATE as the last argument\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"_FT.DEBUG", b"DOCINFO", b"dx", b"d:1"]),
+            "-ERR wrong number of arguments for '_FT.DEBUG|DOCINFO' command\r\n"
+        );
+    }
+
+    /// The key is looked up before the keyword is read, so a key nobody indexed
+    /// beats a keyword nobody wrote.
+    #[test]
+    fn a_document_row_looks_the_key_up_before_it_reads_the_keyword() {
+        let mut f = debugging();
+        assert_eq!(
+            f.run(&[b"_FT.DEBUG", b"DOCINFO", b"dx", b"nope", b"zz"]),
+            "-Document not found in index\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"_FT.DEBUG", b"DOCINFO", b"dx", b"d:1", b"zz"]),
+            "-Invalid argument. Expected REVEAL or OBFUSCATE as the last argument\r\n"
+        );
+    }
+
+    /// The two directions of the document table, and the number nobody handed
+    /// out reads as one that was given up rather than as one that never was.
+    #[test]
+    fn a_document_number_goes_both_ways() {
+        let mut f = debugging();
+        assert_eq!(
+            f.run(&[b"_FT.DEBUG", b"IDTODOCID", b"dx", b"2"]),
+            "$3\r\nd:2\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"_FT.DEBUG", b"DOCIDTOID", b"dx", b"d:2"]),
+            ":2\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"_FT.DEBUG", b"DOCIDTOID", b"dx", b"nope"]),
+            ":0\r\n"
+        );
+        assert_eq!(f.run(&[b"_FT.DEBUG", b"GET_MAX_DOC_ID", b"dx"]), ":3\r\n");
+        for id in [b"9".as_slice(), b"0", b"-1", b"9223372036854775807"] {
+            assert_eq!(
+                f.run(&[b"_FT.DEBUG", b"IDTODOCID", b"dx", id]),
+                "-document was removed\r\n",
+                "{id:?}"
+            );
+        }
+    }
+
+    /// A document number is read the strict way Redis reads an integer, so a
+    /// leading zero, a leading plus and a leading space are all refused.
+    #[test]
+    fn a_document_number_is_read_the_strict_way() {
+        let mut f = debugging();
+        for id in [
+            b"x".as_slice(),
+            b"1.5",
+            b" 1",
+            b"+1",
+            b"01",
+            b"0x1",
+            b"",
+            b"9223372036854775808",
+            b"18446744073709551615",
+        ] {
+            assert_eq!(
+                f.run(&[b"_FT.DEBUG", b"IDTODOCID", b"dx", id]),
+                "-bad id given\r\n",
+                "{id:?}"
+            );
+        }
+    }
+
+    /// A number a document has given up is still in every list it was in, so a
+    /// dump names documents that the table says are gone.
+    #[test]
+    fn a_dump_keeps_a_number_the_table_has_given_up() {
+        let mut f = debugging();
+        f.run(&[b"DEL", b"d:2"]);
+        assert_eq!(
+            f.run(&[b"_FT.DEBUG", b"DUMP_INVIDX", b"dx", b"running"]),
+            "*2\r\n:1\r\n:2\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"_FT.DEBUG", b"IDTODOCID", b"dx", b"2"]),
+            "-document was removed\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"_FT.DEBUG", b"DOCIDTOID", b"dx", b"d:2"]),
+            ":0\r\n"
+        );
+    }
+
+    /// A rewrite hands out a new number and leaves the old one behind, so the
+    /// counter climbs past the number of documents there are.
+    #[test]
+    fn a_rewrite_takes_a_number_of_its_own() {
+        let mut f = debugging();
+        f.run(&[b"HSET", b"d:1", b"t", b"cats"]);
+        assert_eq!(
+            f.run(&[b"_FT.DEBUG", b"DOCIDTOID", b"dx", b"d:1"]),
+            ":4\r\n"
+        );
+        assert_eq!(f.run(&[b"_FT.DEBUG", b"GET_MAX_DOC_ID", b"dx"]), ":4\r\n");
+        assert_eq!(
+            f.run(&[b"_FT.DEBUG", b"IDTODOCID", b"dx", b"1"]),
+            "-document was removed\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"_FT.DEBUG", b"DUMP_INVIDX", b"dx", b"running"]),
+            "*2\r\n:1\r\n:2\r\n"
+        );
+    }
+
+    /// An alias reads the index it stands for, the same as a query does.
+    #[test]
+    fn a_dump_follows_an_alias() {
+        let mut f = debugging();
+        f.run(&[b"FT.ALIASADD", b"da", b"dx"]);
+        assert_eq!(f.run(&[b"_FT.DEBUG", b"GET_MAX_DOC_ID", b"da"]), ":3\r\n");
+        assert_eq!(
+            f.run(&[b"_FT.DEBUG", b"IDTODOCID", b"da", b"1"]),
+            "$3\r\nd:1\r\n"
+        );
+    }
+
+    /// The index name is matched as written and the subcommand name is not, and
+    /// an index nobody made is reported as a context that could not be built.
+    #[test]
+    fn an_index_name_is_case_sensitive_and_a_subcommand_name_is_not() {
+        let mut f = debugging();
+        assert_eq!(f.run(&[b"_FT.DEBUG", b"get_max_doc_id", b"dx"]), ":3\r\n");
+        assert_eq!(
+            f.run(&[b"_FT.DEBUG", b"GET_MAX_DOC_ID", b"DX"]),
+            "-Can not create a search ctx\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"_FT.DEBUG", b"DUMP_TERMS", b"nope"]),
+            "-Can not create a search ctx\r\n"
+        );
+    }
+
+    /// A field with nothing written into it answers an empty dump rather than an
+    /// error, since the field is in the schema and only the values are missing.
+    #[test]
+    fn an_empty_field_dumps_as_nothing_at_all() {
+        let mut f = Fixture::new();
+        f.run(&[
+            b"FT.CREATE",
+            b"ex",
+            b"PREFIX",
+            b"1",
+            b"e:",
+            b"SCHEMA",
+            b"t",
+            b"TEXT",
+            b"g",
+            b"TAG",
+            b"n",
+            b"NUMERIC",
+        ]);
+        assert_eq!(f.run(&[b"_FT.DEBUG", b"DUMP_TERMS", b"ex"]), "*0\r\n");
+        assert_eq!(
+            f.run(&[b"_FT.DEBUG", b"DUMP_TAGIDX", b"ex", b"g"]),
+            "*0\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"_FT.DEBUG", b"DUMP_NUMIDX", b"ex", b"n"]),
+            "*0\r\n"
+        );
+        assert_eq!(f.run(&[b"_FT.DEBUG", b"GET_MAX_DOC_ID", b"ex"]), ":0\r\n");
+    }
+
+    /// The two lines the dispatcher owns are the two that carry a code word, and
+    /// every subcommand but `DOCINFO` counts its arguments exactly.
+    #[test]
+    fn the_two_lines_with_a_code_word_are_the_arity_and_the_unknown_one() {
+        let mut f = debugging();
+        for (sub, extra) in [
+            (b"DUMP_TERMS".as_slice(), 1),
+            (b"GET_MAX_DOC_ID", 1),
+            (b"DUMP_INVIDX", 2),
+            (b"DUMP_TAGIDX", 2),
+            (b"DUMP_NUMIDX", 2),
+            (b"IDTODOCID", 2),
+            (b"DOCIDTOID", 2),
+        ] {
+            let want = format!(
+                "-ERR wrong number of arguments for '_FT.DEBUG|{}' command\r\n",
+                str::from_utf8(sub).unwrap()
+            );
+            for given in [extra - 1, extra + 1] {
+                let mut cmd: Vec<&[u8]> = vec![b"_FT.DEBUG", sub];
+                cmd.extend(std::iter::repeat_n(b"dx".as_slice(), given));
+                assert_eq!(f.run(&cmd), want, "{sub:?} {given}");
+            }
+            let mut right: Vec<&[u8]> = vec![b"_FT.DEBUG", sub, b"dx"];
+            right.extend(std::iter::repeat_n(b"g".as_slice(), extra - 1));
+            assert_ne!(f.run(&right), want, "{sub:?}");
+        }
+        assert_eq!(
+            f.run(&[b"_FT.DEBUG", b"bogus", b"dx"]),
+            "-ERR unknown subcommand 'bogus'. Try _FT.DEBUG HELP.\r\n"
+        );
+    }
+
+    /// The eight names that answer rather than the sixty two a real server
+    /// registers, which is D-97, and anything after the name is stepped over.
+    #[test]
+    fn the_help_names_the_subcommands_that_answer() {
+        let mut f = Fixture::new();
+        let want = "*8\r\n$11\r\nDUMP_INVIDX\r\n$11\r\nDUMP_NUMIDX\r\n$11\r\nDUMP_TAGIDX\r\n\
+             $9\r\nIDTODOCID\r\n$9\r\nDOCIDTOID\r\n$7\r\nDOCINFO\r\n$10\r\nDUMP_TERMS\r\n\
+             $14\r\nGET_MAX_DOC_ID\r\n";
+        assert_eq!(f.run(&[b"_FT.DEBUG", b"HELP"]), want);
+        assert_eq!(f.run(&[b"_FT.DEBUG", b"HELP", b"extra"]), want);
+    }
+
     // ------------------------------------------------------------- synonyms
 
     /// The terms are folded on the way in and the group ids are not, and one

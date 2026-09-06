@@ -227,6 +227,20 @@ impl Nums {
         }
     }
 
+    /// Every document that holds a number here, ascending and each once.
+    ///
+    /// A document that holds two numbers is one answer, the same way a range
+    /// answers it once, and a document that has since been deleted is still in
+    /// here because nothing walks the list to take it out. Both of those are
+    /// what a dump of this index reports on a real server.
+    #[must_use]
+    pub fn ids(&self) -> Vec<Id> {
+        let mut out: Vec<Id> = self.kept.iter().chain(&self.fresh).map(|p| p.id).collect();
+        out.sort_unstable();
+        out.dedup();
+        out
+    }
+
     /// How many numbers are held, counting a document twice if it holds two.
     #[must_use]
     pub fn len(&self) -> usize {

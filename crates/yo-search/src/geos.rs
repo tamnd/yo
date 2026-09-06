@@ -107,6 +107,15 @@ impl Geos {
         Some(out)
     }
 
+    /// Every document that holds a point here, ascending and each once.
+    ///
+    /// A point is a number underneath, so a dump of this field is a dump of a
+    /// numeric index and a real server answers one from the same subcommand.
+    #[must_use]
+    pub fn ids(&self) -> Vec<Id> {
+        self.points.ids()
+    }
+
     /// How many points are held, counting a document twice if it holds two.
     #[must_use]
     pub fn len(&self) -> usize {

@@ -176,6 +176,10 @@ const AC_SEARCH_LIST: &[&str] = &["@admin", "@slow", "@search"];
 /// and is the only search command the module leaves the `@slow` category off
 /// while still calling it admin.
 const AC_SEARCH_ADMIN: &[&str] = &["@admin", "@search"];
+/// `_FT.DEBUG`, which the module calls dangerous as well as admin because what
+/// it answers is the module's own bookkeeping and nothing about it is promised
+/// to stay the same shape between versions.
+const AC_SEARCH_DEBUG: &[&str] = &["@admin", "@slow", "@dangerous", "@search"];
 /// `FT.TAGVALS`, the one search read the module bothers to put in `@read` as
 /// well, and the only one it calls dangerous without also calling it a write.
 /// Both are fair: the whole of a tag index goes into one reply and there is no
@@ -3257,6 +3261,19 @@ pub static COMMANDS: &[Spec] = &[
         since: "1.0.0",
         complexity: "O(1)",
         summary: "Read, write or describe the search module's settings.",
+        group: "search",
+    },
+    Spec {
+        name: "_FT.DEBUG",
+        arity: -2,
+        flags: SEARCH_READ,
+        first_key: 0,
+        last_key: 0,
+        step: 0,
+        acl: AC_SEARCH_DEBUG,
+        since: "1.0.0",
+        complexity: "O(N) with N the size of whatever is being dumped.",
+        summary: "Read an index's own structures back.",
         group: "search",
     },
     Spec {
