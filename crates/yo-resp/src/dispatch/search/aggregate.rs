@@ -15,6 +15,7 @@ use std::collections::hash_map::Entry;
 use yo_common::num::parse_f64;
 use yo_common::parse_i64;
 use yo_search::Index;
+use yo_search::explain::Note;
 use yo_search::expr::{Expr, Value, seventeen};
 use yo_search::field::Kind;
 use yo_search::reduce;
@@ -1456,6 +1457,16 @@ pub(super) fn writes(
     // its own, which is why this is asked per row rather than once.
     let scored = shows.addscores && !names.iter().any(|name| **name == *b"__score");
     let scoring = |row: Option<&Row>| scored.then(|| row.map(|row| row.score)).flatten();
+    // A row that came with working behind its score answers the two together,
+    // which only a branch of an `FT.HYBRID WITHCURSOR EXPLAINSCORE` does.
+    let telling = |row: Option<&Row>, out: &mut Out| match row.and_then(|row| row.note.as_ref()) {
+        Some(note) => {
+            out.array(2);
+            out.double(row.map_or(0.0, |row| row.score));
+            super::reason(note, out);
+        }
+        None => out.double(row.map_or(0.0, |row| row.score)),
+    };
     if out.proto().is_resp3() {
         out.map(5);
         out.simple(b"attributes");
@@ -1468,7 +1479,7 @@ pub(super) fn writes(
             out.map(1 + extras + usize::from(shows.fields));
             if shows.scores {
                 out.simple(b"score");
-                out.double(row.map_or(0.0, |row| row.score));
+                telling(*row, out);
             }
             if shows.payloads {
                 out.simple(b"payload");
@@ -1486,7 +1497,7 @@ pub(super) fn writes(
             }
             if shows.fields {
                 out.simple(b"extra_attributes");
-                mapped(names, values, scoring(*row), out);
+                mapped(names, values, scoring(*row), None, out);
             }
             out.simple(b"values");
             out.array(0);
@@ -1509,7 +1520,7 @@ pub(super) fn writes(
         // A grouped row has no document behind it, so the score is nought and
         // the payload is nothing, which is what a real server sends for both.
         if shows.scores {
-            out.double(row.map_or(0.0, |row| row.score));
+            telling(*row, out);
         }
         if shows.payloads {
             match row.and_then(|row| row.payload.as_ref()) {
@@ -1524,7 +1535,7 @@ pub(super) fn writes(
             }
         }
         if shows.fields {
-            mapped(names, values, scoring(*row), out);
+            mapped(names, values, scoring(*row), None, out);
         }
     }
 }
@@ -1562,13 +1573,27 @@ fn keyed(values: &[Value], sorted: Option<usize>) -> Option<Vec<u8>> {
 /// The score goes in front of the lot when `ADDSCORES` asked for it and nothing
 /// in the pipeline named it, wherever in the argument list the word stood: a
 /// `SORTBY` that put a property on the row first still answers the score first.
-pub(super) fn mapped(names: &[Box<[u8]>], row: &[Value], score: Option<f64>, out: &mut Out) {
+pub(super) fn mapped(
+    names: &[Box<[u8]>],
+    row: &[Value],
+    score: Option<f64>,
+    told: Option<(f64, &Note)>,
+    out: &mut Out,
+) {
     let held: Vec<(&Box<[u8]>, &Value)> = names
         .iter()
         .zip(row)
         .filter(|(_, value)| !matches!(value, Value::Missing))
         .collect();
-    out.map(held.len() + usize::from(score.is_some()));
+    out.map(held.len() + usize::from(score.is_some()) + usize::from(told.is_some()));
+    // The working goes in front of everything, including the two properties a
+    // row carries without being asked, which is where `FT.HYBRID` puts it.
+    if let Some((score, note)) = told {
+        out.bulk(b"score");
+        out.array(2);
+        out.double(score);
+        super::reason(note, out);
+    }
     if let Some(score) = score {
         out.bulk(b"__score");
         out.bulk(twelve(score).as_bytes());

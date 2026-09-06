@@ -296,6 +296,7 @@ pub(super) fn execute(
                 db.clear();
             }
             server.search.lock().clear();
+            server.cursors.lock().wipe();
             out.ok();
         }
         // The search indexes go too, and they go whichever database this is.
@@ -307,6 +308,7 @@ pub(super) fn execute(
             flush_mode(args)?;
             server.dbs[session.db].clear();
             server.search.lock().clear();
+            server.cursors.lock().wipe();
             out.ok();
         }
         // Two databases change places and no key moves. What is in the stripes

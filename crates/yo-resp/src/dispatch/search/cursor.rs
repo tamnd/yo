@@ -44,6 +44,7 @@
 use std::collections::HashMap;
 
 use yo_common::{Result, parse_i64};
+use yo_search::Registry;
 use yo_search::expr::Value;
 
 use super::super::Server;
@@ -369,6 +370,22 @@ impl Cursors {
         self.held.iter().filter(|(_, h)| *h.index == *index).count()
     }
 
+    /// Takes away every cursor whose index is no longer there.
+    ///
+    /// A cursor is held under the name of the index it was made on, and a real
+    /// server takes the cursors away with the index, so an index made again
+    /// under a name that was dropped starts with its whole hundred and twenty
+    /// eight free rather than with the last one's still counted against it.
+    pub(super) fn strays(&mut self, reg: &Registry) {
+        self.held.retain(|_, held| reg.named(&held.index).is_some());
+    }
+
+    /// Takes away every cursor there is, which a flush does because it takes
+    /// every index with it.
+    pub(in crate::dispatch) fn wipe(&mut self) {
+        self.held.clear();
+    }
+
     /// How many are open in all, which `FT.INFO` reports twice: once as the
     /// number that exist and once as the number nobody is reading, and here
     /// those are the same number because a read runs to the end before the next
@@ -411,8 +428,16 @@ pub(super) fn stats(server: &Server, index: &[u8]) -> (u64, u64) {
 /// before it runs the pipeline: a `WITHCURSOR COUNT 1000` over seven rows, which
 /// would hand everything back and close, is refused all the same when the index
 /// is already holding its hundred and twenty eight.
-pub(super) fn room<'a>(server: &Server, index: &[u8]) -> core::result::Result<(), Fail<'a>> {
-    match server.cursors.lock().on(index) < LIMIT {
+/// `want` is how many will be opened at once, which is one for every command
+/// but `FT.HYBRID`: that one opens a cursor per branch and is refused unless
+/// there is room for both, so an index holding a hundred and twenty seven of
+/// them takes another aggregation and refuses another hybrid.
+pub(super) fn room<'a>(
+    server: &Server,
+    index: &[u8],
+    want: usize,
+) -> core::result::Result<(), Fail<'a>> {
+    match server.cursors.lock().on(index) + want <= LIMIT {
         true => Ok(()),
         false => Err(Fail::plain(OVER)),
     }
@@ -421,18 +446,7 @@ pub(super) fn room<'a>(server: &Server, index: &[u8]) -> core::result::Result<()
 /// Answers the first chunk of a cursor and keeps the rest of it.
 pub(super) fn open(server: &Server, index: &[u8], kept: Kept, asks: Asks, out: &mut Out) {
     let now = server.clock.now_ms();
-    let mut cursor = Cursor {
-        skip: kept.offset,
-        kept,
-        at: 0,
-        count: asks.count,
-        idle: asks.idle,
-        touched: now,
-        first: true,
-        buffer: 0,
-        pulled: 0,
-        given: 0,
-    };
+    let mut cursor = started(kept, asks, now);
     out.array(2);
     // The two element array goes out whatever happens next, because a cursor
     // that hands everything over at once still answers in the shape a cursor
@@ -452,6 +466,44 @@ pub(super) fn open(server: &Server, index: &[u8], kept: Kept, asks: Asks, out: &
         },
     );
     out.int(id as i64);
+}
+
+/// Keeps a whole answer and answers the number that reads it back, with no
+/// chunk of it written now.
+///
+/// `FT.HYBRID` opens one of these for each of its two branches and hands back
+/// the two numbers on their own, so the first chunk of either goes out on the
+/// first `FT.CURSOR READ` rather than with the command that made it.
+pub(super) fn hold(server: &Server, index: &[u8], kept: Kept, asks: Asks) -> u64 {
+    let now = server.clock.now_ms();
+    let cursor = started(kept, asks, now);
+    let mut cursors = server.cursors.lock();
+    cursors.sweep(now);
+    let id = cursors.mint(now);
+    cursors.held.insert(
+        id,
+        Held {
+            index: index.into(),
+            cursor,
+        },
+    );
+    id
+}
+
+/// A cursor at the top of the answer it hands out.
+fn started(kept: Kept, asks: Asks, now: u64) -> Cursor {
+    Cursor {
+        skip: kept.offset,
+        kept,
+        at: 0,
+        count: asks.count,
+        idle: asks.idle,
+        touched: now,
+        first: true,
+        buffer: 0,
+        pulled: 0,
+        given: 0,
+    }
 }
 
 /// `FT.CURSOR READ|DEL|GC index id`.
