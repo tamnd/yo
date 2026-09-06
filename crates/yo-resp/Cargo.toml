@@ -13,6 +13,10 @@ keywords.workspace = true
 categories.workspace = true
 
 [dependencies]
+# The interpreter behind EVAL and the only thing in this crate that is not ours.
+# A script is Lua 5.1 whatever we would have preferred, and writing one of those
+# is not a thing anybody should do twice.
+mlua = { workspace = true }
 yo-alloc = { workspace = true }
 yo-common = { workspace = true }
 # The graph the `G.*` family works on, held under a key through `yo_kv::Foreign`.

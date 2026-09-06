@@ -112,7 +112,12 @@ pub(super) fn execute(
         if block.now(server.striped(db), now, out)? {
             return Ok(Flow::Continue);
         }
-        let Some(deadline) = want.wait else {
+        // A script is the other way there is nothing to wait for. It cannot
+        // park, because the thing it would be waiting for is a command from
+        // another client and the script is what that client is queued behind,
+        // so the wait would never end. Timing out at once is what a real server
+        // does and it answers the same null a full timeout would have.
+        let Some(deadline) = want.wait.filter(|_| !session.scripted()) else {
             // No `BLOCK` at all, so nothing arriving is the answer and not a
             // reason to wait for it. A null array on both protocols, which is
             // also what a `BLOCK` that runs out sends.
@@ -188,6 +193,13 @@ pub(super) fn execute(
 
     let db = session.db();
     if block.now(server.striped(db), now, out)? {
+        return Ok(Flow::Continue);
+    }
+    // Called from a script, so there is nobody left to deliver what it is
+    // waiting for. The same null a timeout writes, for the reason the stream
+    // reads above give.
+    if session.scripted() {
+        out.nil_array();
         return Ok(Flow::Continue);
     }
     server.park(session.id(), db, deadline, block);

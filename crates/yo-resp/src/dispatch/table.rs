@@ -5487,8 +5487,100 @@ pub static COMMANDS: &[Spec] = &[
         group: "keyspace",
     },
     // ----------------------------------------------------------- scripting
-    // Both are containers with no flags and no keys of their own, which is what
-    // a real 8.10.1 reports: the flags live on the subcommands.
+    // The four spellings of running a script differ in two things and nothing
+    // else: whether the client sent the body or its digest, and whether the
+    // script may write. So the four rows are the same row four times, and the
+    // `_RO` pair says `readonly` first because that is the order a real 8.10.1
+    // lists them in and `COMMAND INFO` is compared byte for byte.
+    //
+    // `movablekeys` is on all four because the keys are not at a fixed offset:
+    // the client says how many there are. `no_mandatory_keys` is on all four
+    // because it may say none. `script_runner` is what tells a client that the
+    // command's real cost is whatever the script does.
+    Spec {
+        name: "eval",
+        arity: -3,
+        flags: &[
+            "noscript",
+            "stale",
+            "skip_monitor",
+            "no_mandatory_keys",
+            "movablekeys",
+            "script_runner",
+        ],
+        first_key: 0,
+        last_key: 0,
+        step: 0,
+        acl: &["@slow", "@scripting"],
+        since: "2.6.0",
+        complexity: "Whatever the script does.",
+        summary: "Run a Lua script sent with the command.",
+        group: "scripting",
+    },
+    Spec {
+        name: "evalsha",
+        arity: -3,
+        flags: &[
+            "noscript",
+            "stale",
+            "skip_monitor",
+            "no_mandatory_keys",
+            "movablekeys",
+            "script_runner",
+        ],
+        first_key: 0,
+        last_key: 0,
+        step: 0,
+        acl: &["@slow", "@scripting"],
+        since: "2.6.0",
+        complexity: "Whatever the script does.",
+        summary: "Run a Lua script the cache already holds.",
+        group: "scripting",
+    },
+    Spec {
+        name: "eval_ro",
+        arity: -3,
+        flags: &[
+            "readonly",
+            "noscript",
+            "stale",
+            "skip_monitor",
+            "no_mandatory_keys",
+            "movablekeys",
+            "script_runner",
+        ],
+        first_key: 0,
+        last_key: 0,
+        step: 0,
+        acl: &["@slow", "@scripting"],
+        since: "7.0.0",
+        complexity: "Whatever the script does.",
+        summary: "Run a Lua script that is not allowed to write.",
+        group: "scripting",
+    },
+    Spec {
+        name: "evalsha_ro",
+        arity: -3,
+        flags: &[
+            "readonly",
+            "noscript",
+            "stale",
+            "skip_monitor",
+            "no_mandatory_keys",
+            "movablekeys",
+            "script_runner",
+        ],
+        first_key: 0,
+        last_key: 0,
+        step: 0,
+        acl: &["@slow", "@scripting"],
+        since: "7.0.0",
+        complexity: "Whatever the script does.",
+        summary: "Run a cached Lua script that is not allowed to write.",
+        group: "scripting",
+    },
+    // Both containers have no flags and no keys of their own, which is what a
+    // real 8.10.1 reports: the flags live on the subcommands.
     Spec {
         name: "script",
         arity: -2,
@@ -5499,7 +5591,7 @@ pub static COMMANDS: &[Spec] = &[
         acl: &["@slow"],
         since: "2.6.0",
         complexity: "O(1) for the subcommands that are here.",
-        summary: "The script cache, which is empty and stays empty until M6.",
+        summary: "The cache EVALSHA runs scripts out of.",
         group: "scripting",
     },
     Spec {
@@ -5512,7 +5604,7 @@ pub static COMMANDS: &[Spec] = &[
         acl: &["@slow"],
         since: "7.0.0",
         complexity: "O(1) for the subcommands that are here.",
-        summary: "The function libraries, of which there are none until M6.",
+        summary: "The function libraries, of which there are none yet.",
         group: "scripting",
     },
     // ---------------------------------------------------------- connection
@@ -6372,7 +6464,7 @@ mod tests {
             "the multiplier stopped keeping every command close"
         );
         assert!(
-            total <= 21,
+            total <= 22,
             "{total} extra slots walked over the whole table"
         );
     }

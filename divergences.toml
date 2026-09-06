@@ -127,10 +127,10 @@ spec = "14 section 1"
 
 [[divergence]]
 id = "D-16"
-title = "SCRIPT and FUNCTION answer for an empty cache and refuse the rest"
-reason = "There is no Lua here until M6, so nothing can be loaded and nothing can run. The subcommands that are exactly right on a server whose script cache and library set are empty are answered, which is SCRIPT FLUSH, SCRIPT EXISTS, FUNCTION FLUSH, FUNCTION LIST, FUNCTION DELETE and both HELPs. The ones that would need an interpreter are not there at all and report unknown subcommand, because an OK that did nothing is worse than an error: a client that loads a script and gets an OK believes it can call it. FUNCTION STATS is the borderline one and it is refused, since a real server lists LUA in its engines map and an empty map would be a different answer rather than the same one."
+title = "FUNCTION answers for an empty library set and refuses the rest"
+reason = "The interpreter arrived in M8 and the script half of the group runs on it, but the function half needs more than an interpreter: a library is a body that registers named entry points through redis.register_function, and until that call exists there is nothing a load could put in the set. So the subcommands that are exactly right with no libraries loaded are answered, which is FLUSH, LIST, DELETE and HELP, and LOAD, DUMP, RESTORE, STATS and KILL are not there at all and report unknown subcommand. An OK that did nothing would be worse than an error, because a client that loads a library and gets an OK believes it can call into it. STATS is the borderline one and it is refused for the same reason it was before, since a real server lists LUA in its engines map and an empty map would be a different answer rather than the same one."
 status = "until"
-resolved_by = "M6"
+resolved_by = "M8"
 spec = "12 section 7"
 
 [[divergence]]
@@ -700,3 +700,56 @@ title = "_FT.DEBUG HELP names the eight subcommands that answer"
 reason = "HELP on Redis 8.10.1 answers sixty two names with no usage text against any of them, and most of them are about machinery this server does not have: a garbage collector that can be forced, a worker pool that can be counted, a topology updater that can be paused, an HNSW graph that can be dumped, a phonetic hash, a prefix trie and a suffix trie, a shard connection table, and eight names that are just the search commands again. Answering that list here would be a list of things to try that mostly do not work, and a client reading it to find out what it can ask would be worse off than one that asked and got told the subcommand is unknown. So HELP names the eight that are implemented, in the order a client is likely to want them, and every name it prints answers. The unknown subcommand line is byte for byte the one Redis writes, so a client that goes looking for a name from the real list finds out the same way it would there."
 status = "permanent"
 spec = "09 section 5"
+
+[[divergence]]
+id = "D-98"
+title = "redis.log writes at every level because there is no level to filter against"
+reason = "A real server compares the level a script asks for against the loglevel in its config and drops anything below it, so redis.log(redis.LOG_DEBUG, ...) is normally invisible. There is no loglevel setting here yet, so every call is written and the level goes out as part of the line rather than as a reason to drop it. The visible difference is a busier log on a server that asked for a quiet one, and it goes away on its own once the config key lands, at which point the comparison is one line of code. Dropping the low levels now instead would mean picking a threshold that nothing can configure, which is a worse answer than writing more than was asked for."
+status = "until"
+resolved_by = "M8"
+spec = "12 section 7"
+
+[[divergence]]
+id = "D-99"
+title = "redis.set_repl is accepted and does nothing"
+reason = "The call chooses which of the AOF and the replication stream a script's writes go to, and there is no AOF and no replication stream here yet, so there is nothing for the choice to select between. It validates its argument exactly the way a real server does, refuses a flag that is not one of the four with the same sentence, and then returns without changing anything. Refusing the call instead would break a script that sets REPL_ALL defensively at the top and never relies on the effect, which is the common shape, and accepting it silently is only wrong once there is a stream to leave a write out of."
+status = "until"
+resolved_by = "M8"
+spec = "12 section 7"
+
+[[divergence]]
+id = "D-100"
+title = "redis.acl_check_cmd checks that the command exists and that the arity fits"
+reason = "The call is supposed to answer whether the current user is allowed to run the command with those arguments, and there are no users and no rules here, so the honest part of the answer is the part that does not depend on them. It looks the command up, refuses a name that is not a command with the sentence a real server uses, refuses an argument count the command itself would refuse, and otherwise answers true. On a server with the default user and no restrictions that is the same answer a real one gives, which is the case a script is usually written against. It becomes a real check rather than a shape check when ACL lands, and until then answering false for something it cannot evaluate would be worse, since a script that guards a call on this would skip work it is allowed to do."
+status = "until"
+resolved_by = "M8"
+spec = "12 section 7"
+
+[[divergence]]
+id = "D-101"
+title = "SCRIPT KILL always answers NOTBUSY because a script cannot run long"
+reason = "A real server runs a script on the thread that took the command and lets it go past busy-reply-threshold, at which point other connections start getting BUSY and SCRIPT KILL is how you get out of it. There is no time limit here and no way to reach a running script from another connection, so the state SCRIPT KILL exists to break out of never exists and the command has nothing to say but NOTBUSY. The sentence is the one a real server writes for an idle server, so a client that calls it as part of a recovery path gets the answer it would get there when nothing is stuck. A time limit is worth having on its own and it brings the rest of this with it."
+status = "until"
+resolved_by = "M8"
+spec = "12 section 7"
+
+[[divergence]]
+id = "D-102"
+title = "pairs(redis) lists nothing because the table is behind an empty proxy"
+reason = "Redis ships a patched Lua 5.1 with a readonly flag on the table itself, and vanilla 5.1 has no such flag. The only way to make a write to an existing field fail is a metatable, and __newindex only fires for keys the table does not have, so the table a script sees has to be empty for the guard to work. It is an empty table with __index pointing at the real one, which means every read works, every write raises the sentence a real server raises, and a traversal finds no keys. The other way round would give pairs the right twenty two names and let a script overwrite redis.call, which is the trade that matters: a script that enumerates the redis table is doing something unusual, and a script that overwrites redis.call breaks every script that runs after it. The names are all still readable one at a time, and redis.nosuchfield still reads as nil."
+status = "permanent"
+spec = "12 section 7"
+
+[[divergence]]
+id = "D-103"
+title = "Writing an existing global through the _G name is accepted and then undone"
+reason = "This is the same vanilla Lua 5.1 limit D-102 is about, applied to the global table instead of the redis table, and the choice was made the other way. A plain global write is caught, because a script runs in an empty environment whose __newindex fires on everything, so x = 1 and pcall = 1 both raise the sentence a real server raises. Reaching through the _G name to a field that already exists, as in _G.pcall = 1, is the one hole a metatable cannot close, and closing it would mean putting the global table behind an empty proxy as well, which would make pairs(_G) list nothing. Enumerating the globals is a thing scripts and test suites actually do and overwriting them through _G is not, so the table stays enumerable. What stops it mattering is that every run ends by walking the global table and putting back anything that moved, so a script that does this can only break itself and the next script on that thread starts from a clean table."
+status = "permanent"
+spec = "12 section 7"
+
+[[divergence]]
+id = "D-104"
+title = "SCRIPT DEBUG takes the mode and there is no debugger behind it"
+reason = "A real server answering YES or SYNC puts the connection into a Lua debugging session, where the next EVAL forks a child, stops on the first line and talks a line protocol back over the same connection until the client is done stepping. It is a whole second protocol on top of RESP and it needs a fork to be safe, since the debugged script is allowed to write and the session is allowed to be abandoned. Neither of those exists here, so the mode is validated and dropped and scripts run the way they always do. A client that turns the debugger off, which is what a library does defensively at the start of a connection, gets the same OK it would get anywhere. A client that turns it on gets an OK and then a script that runs to the end instead of stopping, which is the wrong answer, and the alternative of refusing YES outright would break the defensive NO case for nobody's benefit since a client that wanted to step would find out one command later either way."
+status = "permanent"
+spec = "12 section 7"
