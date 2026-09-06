@@ -109,6 +109,13 @@ pub(super) struct Pipe<'a> {
     /// nothing else. A schema field is not readable after a step, because the
     /// document it would have been read off is not there any more.
     pub(super) stage: Option<Vec<Box<[u8]>>>,
+    /// Whether a property a step names is being looked up at all.
+    ///
+    /// False on the first of the two passes an aggregation makes over its
+    /// arguments, which reads every word and checks it and leaves the row
+    /// alone, because the row is not knowable until the query has been parsed
+    /// and the query cannot be parsed until the words have been read.
+    pub(super) binding: bool,
 }
 
 /// Where one property of the base row is read from.
@@ -119,6 +126,9 @@ pub(super) enum Reads {
     /// The score the query gave the document, which is only a property when
     /// `ADDSCORES` asked for it.
     Score,
+    /// A distance a vector clause in the query measured, which is on the row
+    /// whether or not anything asked and is on it before anything else.
+    Distance,
     /// Nothing off the key at all: a slot an `APPLY` fills in.
     Made,
 }
@@ -541,6 +551,12 @@ fn generated(func: &[u8], words: &[&[u8]]) -> Box<[u8]> {
 /// Which fields of the schema count is the one thing the two kinds of step
 /// disagree about, and [`Look`] carries the answer.
 fn locate(pipe: &mut Pipe<'_>, index: &Index, name: &[u8], look: Look) -> Option<usize> {
+    // The first pass over the arguments has no row to look anything up on, so
+    // every name is taken and nothing is written down. The second pass throws
+    // this away and does it properly.
+    if !pipe.binding {
+        return Some(0);
+    }
     if let Some(stage) = &pipe.stage {
         return stage.iter().position(|held| **held == *name);
     }
@@ -605,6 +621,13 @@ fn makes(pipe: &mut Pipe<'_>, name: &[u8]) -> usize {
 
 /// Reads an expression and tells every property in it where it is read from.
 fn built(src: &[u8], asked: &mut Asked<'_>, index: &Index) -> core::result::Result<Expr, Vec<u8>> {
+    // An expression that will not read is a fault of the pipeline and not of
+    // the argument list, so the first pass leaves it alone: a real server
+    // answers the query's own syntax error ahead of it and answers a property
+    // that does not exist ahead of it too when that property came first.
+    if !asked.pipe.binding {
+        return Expr::parse(b"0");
+    }
     let mut expr = Expr::parse(src)?;
     expr.bind(&mut |name| locate(&mut asked.pipe, index, name, Look::Sorted))
         .map_err(|missing| line(NOT_LOADED, &missing.0, QUOTE_END))?;
@@ -860,10 +883,16 @@ pub(super) fn piped(
         };
         let pairs = doc.as_ref().map(indexing::Document::pairs);
         let mut made: Vec<Value> = Vec::with_capacity(pipe.base.len());
-        for (_, from) in &pipe.base {
+        for (name, from) in &pipe.base {
             made.push(match from {
                 Reads::Made => Value::Missing,
                 Reads::Score => Value::Text(twelve(row.score).into_bytes().into()),
+                // Worked out while the query ran rather than read off the key,
+                // so it is on the row even when nothing was loaded at all.
+                Reads::Distance => match row.away(name) {
+                    Some(away) => Value::Text(twelve(away).into_bytes().into()),
+                    None => Value::Missing,
+                },
                 Reads::Field(id, shape) => {
                     match pairs.iter().flatten().find(|(held, _)| *held == &**id) {
                         Some((_, value)) => shaped(value, *shape),
