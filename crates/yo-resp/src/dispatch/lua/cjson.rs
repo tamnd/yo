@@ -230,6 +230,11 @@ impl Encoder<'_> {
         if depth > self.cfg.encode_max_depth || depth > CEILING {
             return Err(format!("Cannot serialise, excessive nesting ({depth})"));
         }
+        // A library table is a guard in front of the real one, and the real one
+        // is what a server with no guard would be walking here.
+        if let Some(real) = super::argue::behind(t) {
+            return self.table(&real, depth);
+        }
         // A table the decoder marked is an array whatever its keys say, which is
         // the only way an empty one comes back out as `[]`.
         if marked(t) {

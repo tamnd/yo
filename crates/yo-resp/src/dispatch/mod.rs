@@ -4379,6 +4379,185 @@ mod tests {
     }
 
     #[test]
+    fn a_script_gets_the_cmsgpack_library_a_real_server_carries() {
+        let mut f = Fixture::new();
+        // Every value goes out in the shortest form that holds it, and several
+        // arguments are packed one after another into one string.
+        let hex = "local function hx(s) return (string.gsub(s, '.', \
+                   function(c) return string.format('%02x', string.byte(c)) end)) end ";
+        for (body, want) in [
+            ("cmsgpack.pack(nil)", "c0"),
+            ("cmsgpack.pack(true)", "c3"),
+            ("cmsgpack.pack(false)", "c2"),
+            ("cmsgpack.pack(0)", "00"),
+            ("cmsgpack.pack(127)", "7f"),
+            ("cmsgpack.pack(128)", "cc80"),
+            ("cmsgpack.pack(-1)", "ff"),
+            ("cmsgpack.pack(-33)", "d0df"),
+            ("cmsgpack.pack(65535)", "cdffff"),
+            ("cmsgpack.pack(4294967296)", "cf0000000100000000"),
+            ("cmsgpack.pack(2^53)", "cf0020000000000000"),
+            ("cmsgpack.pack(-2^63)", "d38000000000000000"),
+            // Past what an integer holds it is a number again, and a number
+            // goes out narrow whenever four bytes give it back unchanged.
+            ("cmsgpack.pack(2^64)", "ca5f800000"),
+            ("cmsgpack.pack(1.5)", "ca3fc00000"),
+            ("cmsgpack.pack(0.1)", "cb3fb999999999999a"),
+            ("cmsgpack.pack('abc')", "a3616263"),
+            ("cmsgpack.pack('')", "a0"),
+            ("cmsgpack.pack({})", "90"),
+            ("cmsgpack.pack({1, 2})", "920102"),
+            ("cmsgpack.pack({a = 1})", "81a16101"),
+            ("cmsgpack.pack(1, 'a', true)", "01a161c3"),
+            // Sixteen levels of table are packed and the seventeenth is a nil,
+            // which is what the C does rather than refusing the whole thing.
+            (
+                "(function() local t = {} local c = t \
+                 for i = 1, 20 do c.n = {} c = c.n end return cmsgpack.pack(t) end)()",
+                "81a16e81a16e81a16e81a16e81a16e81a16e81a16e81a16e\
+                 81a16e81a16e81a16e81a16e81a16e81a16e81a16e81a16ec0",
+            ),
+        ] {
+            let script = format!("{hex} return hx({body})");
+            assert_eq!(
+                f.run(&[b"EVAL", script.as_bytes(), b"0"]),
+                format!("${}\r\n{want}\r\n", want.len()),
+                "{body}",
+            );
+        }
+        // Unpacking reads the whole stream, so a string holding three values
+        // hands back three. The two that take an offset put where they got to
+        // in front of the values, and answer minus one when nothing is left.
+        for (body, want) in [
+            ("cmsgpack.unpack(cmsgpack.pack(42))", 42),
+            ("select('#', cmsgpack.unpack('\\1\\2\\3'))", 3),
+            ("select(3, cmsgpack.unpack('\\1\\2\\3'))", 3),
+            ("select('#', cmsgpack.unpack(''))", 0),
+            ("select('#', cmsgpack.unpack_one('\\1\\2\\3'))", 2),
+            ("select(1, cmsgpack.unpack_one('\\1\\2\\3'))", 1),
+            ("select(2, cmsgpack.unpack_one('\\1\\2\\3'))", 1),
+            ("select(1, cmsgpack.unpack_one('\\1\\2\\3', 2))", -1),
+            ("select(1, cmsgpack.unpack_one('\\1'))", -1),
+            ("select(1, cmsgpack.unpack_one('', 0))", -1),
+            ("select('#', cmsgpack.unpack_limit('\\1\\2\\3', 2))", 3),
+            ("select(1, cmsgpack.unpack_limit('\\1\\2\\3', 2))", 2),
+            // A limit of nothing at all takes the read everything path, which
+            // has no offset in front of it.
+            ("select('#', cmsgpack.unpack_limit('\\1\\2\\3', 0, 0))", 3),
+            ("cmsgpack.unpack(cmsgpack.pack({1, 2, 3}))[2]", 2),
+        ] {
+            let script = format!("return {body}");
+            assert_eq!(
+                f.run(&[b"EVAL", script.as_bytes(), b"0"]),
+                format!(":{want}\r\n"),
+                "{body}",
+            );
+        }
+        for (body, want) in [
+            ("cmsgpack.unpack(cmsgpack.pack({a = 'b'})).a", "b"),
+            ("tostring(cmsgpack.unpack(cmsgpack.pack(1.5)))", "1.5"),
+            ("tostring(cmsgpack.unpack(cmsgpack.pack(nil)))", "nil"),
+            (
+                "tostring(cmsgpack.unpack(string.char(0xcb, 0x7f, 0xf0, 0, 0, 0, 0, 0, 0)))",
+                "inf",
+            ),
+            ("cmsgpack._NAME", "cmsgpack"),
+            ("cmsgpack._VERSION", "lua-cmsgpack 0.4.0"),
+            (
+                "cmsgpack._COPYRIGHT",
+                "Copyright (C) 2012, Salvatore Sanfilippo",
+            ),
+            (
+                "cmsgpack._DESCRIPTION",
+                "MessagePack C implementation for Lua",
+            ),
+        ] {
+            let script = format!("return {body}");
+            assert_eq!(
+                f.run(&[b"EVAL", script.as_bytes(), b"0"]),
+                format!("${}\r\n{want}\r\n", want.len()),
+                "{body}",
+            );
+        }
+        for (body, want) in [
+            // The C counts the arguments before it reads any of them, so the
+            // one it names when there are none is the one before the first.
+            (
+                "return cmsgpack.pack()",
+                "bad argument #0 to 'pack' (MessagePack pack needs input.)",
+            ),
+            (
+                "return cmsgpack.unpack()",
+                "bad argument #1 to 'unpack' (string expected, got no value)",
+            ),
+            (
+                "return cmsgpack.unpack(string.char(193))",
+                "Bad data format in input.",
+            ),
+            (
+                "return cmsgpack.unpack(string.char(204))",
+                "Missing bytes in input.",
+            ),
+            (
+                "return cmsgpack.unpack(string.char(146, 1))",
+                "Missing bytes in input.",
+            ),
+            (
+                "return cmsgpack.unpack_one('\\1', 5)",
+                "Start offset 5 greater than input length 1.",
+            ),
+            (
+                "return cmsgpack.unpack_limit('\\1\\2', 1, 5)",
+                "Start offset 5 greater than input length 2.",
+            ),
+            // The second number here is the length of the input rather than
+            // the limit, which is a mixed up argument in the C kept on purpose.
+            (
+                "return cmsgpack.unpack_one('\\1', -1)",
+                "Invalid request to unpack with offset of -1 and limit of 1.",
+            ),
+            (
+                "return cmsgpack.unpack_limit('\\1', -1, 0)",
+                "Invalid request to unpack with offset of 0 and limit of 1.",
+            ),
+        ] {
+            let reply = f.run(&[b"EVAL", body.as_bytes(), b"0"]);
+            assert!(
+                reply.starts_with(&format!("-ERR user_script:1: {want} script: ")),
+                "{body} gave {reply}",
+            );
+        }
+        // Four calls and the four names the C sets on the table beside them.
+        let names = "_COPYRIGHT _DESCRIPTION _NAME _VERSION pack unpack unpack_limit unpack_one";
+        assert_eq!(
+            f.run(&[
+                b"EVAL",
+                b"local t = {} for k in pairs(cmsgpack) do t[#t+1] = k end \
+                  table.sort(t) return table.concat(t, ' ')",
+                b"0",
+            ]),
+            format!("${}\r\n{names}\r\n", names.len())
+        );
+        for body in [&b"cmsgpack.pack = 1"[..], b"rawset(cmsgpack, 'zz', 1)"] {
+            assert!(
+                f.run(&[b"EVAL", body, b"0"])
+                    .contains("Attempt to modify a readonly table script: "),
+                "{body:?}",
+            );
+        }
+        // A library is a table like any other from a script's side, so packing
+        // one walks its members rather than finding the guard in front empty.
+        assert_eq!(
+            f.run(&[
+                b"EVAL",
+                b"return cmsgpack.unpack(cmsgpack.pack(cmsgpack))._NAME",
+                b"0",
+            ]),
+            "$8\r\ncmsgpack\r\n"
+        );
+    }
+
+    #[test]
     fn command_getkeys_reads_the_key_count_out_of_a_script_call() {
         let mut f = Fixture::new();
         assert_eq!(
