@@ -27,7 +27,7 @@ use super::{
     NO_REDUCER, NOT_A_NUMBER, NOT_LOADED, NOT_MAIN, NOT_THERE, OUT_OF_RANGE, PERCENTAGE, QUOTE_END,
     REDUCE_BARE, RESOLUTION, RESOLUTION_ARG, Row, SAMPLE_BIG, SAMPLE_SIZE, SORT_BOUNDS, SORT_COUNT,
     SORT_PROP, SORT_PROP_END, SORT_SHORT, SORT_TWICE, SORT_WAY, SORT_WAY_END, STEP_SHORT, Shows,
-    UNKNOWN, cursor, line, twelve,
+    UNKNOWN, Watch, cursor, line, twelve,
 };
 use crate::dispatch::Server;
 use crate::dispatch::args;
@@ -51,6 +51,15 @@ pub(super) struct Pipe<'a> {
     /// Whether anything at all asked for a field, which is the one thing that
     /// decides how the count at the front of the reply is worked out.
     pub(super) loader: bool,
+    /// Whether anything the pipeline needs has to be read off the key rather
+    /// than out of the index.
+    ///
+    /// A sortable field is held beside the document number and comes back
+    /// without the key being opened, so a pipeline that only names sortable
+    /// fields never reads a key at all. This is what a profile calls the
+    /// `Loader` step, and it is measured: `LOAD 1 @n` on a sortable `n` has no
+    /// such step and `LOAD 1 @g` on a tag field has one.
+    pub(super) loads: bool,
     /// Whether the score of each document is answered as a `__score` property.
     pub(super) addscores: bool,
     /// Whether a sort key element goes on each row. It holds the value the
@@ -144,6 +153,32 @@ pub(super) enum Step {
     /// An order to put the rows in and a window to keep of them, either of
     /// which may be there without the other.
     Sort(Sort),
+}
+
+impl Step {
+    /// What a profile calls this step, which for the two that run an expression
+    /// names the expression as well.
+    fn about(&self) -> Vec<u8> {
+        match self {
+            Step::Group(_) => b"Grouper".to_vec(),
+            Step::Apply { expr, .. } => {
+                let mut out = b"Projector - ".to_vec();
+                out.extend_from_slice(&expr.about());
+                out
+            }
+            Step::Filter(expr) => {
+                let mut out = b"Filter - ".to_vec();
+                out.extend_from_slice(&expr.about());
+                out
+            }
+            // One step covers both, and which of the two it is depends on
+            // whether anything asked for an order or only for a window.
+            Step::Sort(sort) => match sort.keys.is_empty() {
+                true => b"Pager/Limiter".to_vec(),
+                false => b"Sorter".to_vec(),
+            },
+        }
+    }
 }
 
 /// One sorting step, which is what a `SORTBY` and a `LIMIT` both write.
@@ -532,9 +567,15 @@ fn locate(pipe: &mut Pipe<'_>, index: &Index, name: &[u8], look: Look) -> Option
                 () if field.sortable && !field.is_unf() => Shape::Folded,
                 () => Shape::Words,
             };
+            pipe.loads |= !field.sortable;
             (field.identifier.clone(), shape)
         }
-        None if pipe.all && look != Look::Named => (name.into(), Shape::Words),
+        None if pipe.all && look != Look::Named => {
+            // Not in the schema at all, so the only place it can come from is
+            // the key itself.
+            pipe.loads = true;
+            (name.into(), Shape::Words)
+        }
         None => return None,
     };
     pipe.base.push((name.into(), Reads::Field(from, shape)));
@@ -776,6 +817,7 @@ struct Held {
 ///
 /// Every document that answered is read whatever the window is, because a step
 /// that throws rows away changes which document the window lands on.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn piped(
     server: &Server,
     db: usize,
@@ -783,8 +825,10 @@ pub(super) fn piped(
     rows: &[Row],
     asked: &Asked<'_>,
     index: &[u8],
+    watch: Option<&mut Watch>,
     out: &mut Out,
 ) {
+    let mut watch = watch;
     let pipe = &asked.pipe;
     let mut names: Vec<Box<[u8]>> = pipe.base.iter().map(|(name, _)| name.clone()).collect();
     // The key only has to be read when something on the row comes off it, which
@@ -853,6 +897,17 @@ pub(super) fn piped(
             dropped: 0,
             from: Some(at),
         });
+    }
+    // Scoring and reading the keys are steps of their own to a profile. The
+    // first is there when the score was asked for by name and the second when
+    // something on the row is not held beside the document number already.
+    if let Some(watch) = watch.as_deref_mut() {
+        if pipe.addscores {
+            watch.steps.push((b"Scorer".to_vec(), table.len()));
+        }
+        if pipe.loads {
+            watch.steps.push((b"Loader".to_vec(), table.len()));
+        }
     }
     let mut start = total - lost;
     let mut warning = None;
@@ -952,6 +1007,9 @@ pub(super) fn piped(
                     table.truncate(count);
                 }
             }
+        }
+        if let Some(watch) = watch.as_deref_mut() {
+            watch.steps.push((step.about(), table.len()));
         }
         if warning.is_some() {
             break;

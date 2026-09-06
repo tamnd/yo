@@ -648,3 +648,11 @@ reason = "The command surface is exact: all sixty nine names, their defaults, th
 status = "until"
 resolved_by = "M8"
 spec = "09 section 5"
+
+[[divergence]]
+id = "D-90"
+title = "FT.PROFILE reports counts exactly and does not time every step"
+reason = "The tree a profile prints carries a time on every iterator and the list of steps carries one on every step. Ours are real for the three that cost nothing to take, which are how long the words took to read, how long the query took to turn into something walkable and how long the whole command took, and real for the root of the tree, which is the whole walk. Everything under the root and every step in the list reports nothing, because reading a clock twice for every document a branch answers costs more than answering it does and this is a command a client is allowed to run in production. The shape of the tree also differs in one place that is not about time. A real server splits a numeric or a geo range into one child iterator per index block under a union, so a range over a wide index prints a union of a dozen leaves where we print one leaf naming the ends of the range, and the reading counts underneath are per block where ours are per range. There is a third difference, which shows up under a bare LIMIT on an aggregation. A real server runs the pipeline a row at a time and stops walking as soon as the window is full, so FT.AGGREGATE i * LIMIT 0 3 over six documents reports three reads and two rows through the index step. We walk the whole answer and then cut it, so the same command reports six and six. The rows that come back are the same either way and only the counts differ. The counts everywhere else are measured to match, down to the way a branch asked twice for the same document counts it once."
+status = "until"
+resolved_by = "M8"
+spec = "09 section 5"

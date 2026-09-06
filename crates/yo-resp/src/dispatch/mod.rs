@@ -1909,6 +1909,11 @@ pub fn resolved(
             "search" if spec.name == "FT.AGGREGATE" => {
                 search::roll(server, session.db, args, out).map(|()| Flow::Continue)
             }
+            "search" if spec.name == "FT.PROFILE" => {
+                // Which is one of those two with the working shown, so it needs
+                // everything they need and takes the same route to it.
+                search::profiled(server, session.db, args, out).map(|()| Flow::Continue)
+            }
             // The four search commands that name a key rather than an index.
             // A suggestion dictionary is a real key with a type of its own, so
             // these are handed a database and never touch the registry.
@@ -21637,6 +21642,442 @@ mod tests {
             f.run(&[flush]);
             assert_eq!(f.run(&[b"FT.DICTDUMP", b"d"]), "*0\r\n", "{flush:?}");
         }
+    }
+
+    // -------------------------------------------------------------- profile
+
+    /// A fixture holding one index over three documents, two of which hold the
+    /// first word and two the second.
+    fn profiling() -> Fixture {
+        let mut f = Fixture::new();
+        f.run(&[
+            b"FT.CREATE",
+            b"ix",
+            b"PREFIX",
+            b"1",
+            b"p:",
+            b"SCHEMA",
+            b"t",
+            b"TEXT",
+            b"n",
+            b"NUMERIC",
+        ]);
+        f.run(&[b"HSET", b"p:1", b"t", b"alpha", b"n", b"1"]);
+        f.run(&[b"HSET", b"p:2", b"t", b"alpha beta", b"n", b"2"]);
+        f.run(&[b"HSET", b"p:3", b"t", b"beta", b"n", b"3"]);
+        f
+    }
+
+    /// The reply with every time taken out of it, since no two runs agree on
+    /// those and everything else about a profile is exact.
+    fn timeless(reply: &str) -> String {
+        const KEYS: &[&str] = &[
+            "+Total profile time",
+            "+Parsing time",
+            "+Workers queue time",
+            "+Pipeline creation time",
+            "+Time",
+        ];
+        let mut out = String::new();
+        let mut parts = reply.split("\r\n").peekable();
+        while let Some(part) = parts.next() {
+            out.push_str(part);
+            out.push_str("\r\n");
+            if !KEYS.contains(&part) {
+                continue;
+            }
+            // A double is one line on RESP3 and a bulk header and its digits on
+            // RESP2, and both of them stand for the same one value.
+            match parts.next() {
+                Some(head) if head.starts_with('$') => {
+                    parts.next();
+                }
+                _ => {}
+            }
+            out.push_str("<t>\r\n");
+        }
+        // The split leaves an empty piece past the last line ending.
+        out.truncate(out.len() - 2);
+        out
+    }
+
+    /// The whole envelope on both protocols, which is a two element array on
+    /// one and a two key map on the other.
+    #[test]
+    fn a_profile_wraps_the_reply_it_would_have_answered_anyway() {
+        let mut f = profiling();
+        assert_eq!(
+            timeless(&f.run(&[b"FT.PROFILE", b"ix", b"SEARCH", b"QUERY", b"alpha"])),
+            "*2\r\n\
+             *5\r\n:2\r\n$3\r\np:1\r\n*4\r\n$1\r\nt\r\n$5\r\nalpha\r\n$1\r\nn\r\n$1\r\n1\r\n\
+             $3\r\np:2\r\n*4\r\n$1\r\nt\r\n$10\r\nalpha beta\r\n$1\r\nn\r\n$1\r\n2\r\n\
+             *4\r\n+Shards\r\n*1\r\n*14\r\n\
+             +Total profile time\r\n<t>\r\n+Parsing time\r\n<t>\r\n\
+             +Workers queue time\r\n<t>\r\n+Pipeline creation time\r\n<t>\r\n\
+             +Warning\r\n*1\r\n+None\r\n\
+             +Iterators profile\r\n*10\r\n+Type\r\n+TEXT\r\n+Term\r\n$5\r\nalpha\r\n\
+             +Time\r\n<t>\r\n+Number of reading operations\r\n:2\r\n\
+             +Estimated number of matches\r\n:2\r\n\
+             +Result processors profile\r\n*4\r\n\
+             *6\r\n+Type\r\n+Index\r\n+Time\r\n<t>\r\n+Results processed\r\n:2\r\n\
+             *6\r\n+Type\r\n+Scorer\r\n+Time\r\n<t>\r\n+Results processed\r\n:2\r\n\
+             *6\r\n+Type\r\n+Sorter\r\n+Time\r\n<t>\r\n+Results processed\r\n:2\r\n\
+             *6\r\n+Type\r\n+Loader\r\n+Time\r\n<t>\r\n+Results processed\r\n:2\r\n\
+             +Coordinator\r\n*0\r\n"
+        );
+        let mut g = profiling();
+        g.run(&[b"HELLO", b"3"]);
+        let three = timeless(&g.run(&[b"FT.PROFILE", b"ix", b"SEARCH", b"QUERY", b"alpha"]));
+        assert!(three.starts_with("%2\r\n+Results\r\n"), "{three}");
+        assert!(
+            three.contains("+Profile\r\n%2\r\n+Shards\r\n*1\r\n%7\r\n"),
+            "{three}"
+        );
+        assert!(three.ends_with("+Coordinator\r\n%0\r\n"), "{three}");
+        assert!(
+            three.contains(
+                "+Iterators profile\r\n%5\r\n+Type\r\n+TEXT\r\n+Term\r\n$5\r\nalpha\r\n\
+                 +Time\r\n<t>\r\n+Number of reading operations\r\n:2\r\n\
+                 +Estimated number of matches\r\n:2\r\n"
+            ),
+            "{three}"
+        );
+    }
+
+    /// Every kind of step names itself, and the three that hold other steps say
+    /// so in the singular or the plural depending on how many they hold.
+    #[test]
+    fn each_kind_of_step_writes_the_keys_that_belong_to_it() {
+        let mut f = profiling();
+        let tree = |f: &mut Fixture, query: &[u8]| {
+            let reply = timeless(&f.run(&[b"FT.PROFILE", b"ix", b"SEARCH", b"QUERY", query]));
+            let at = reply.find("+Iterators profile").expect("a tree");
+            let end = reply.find("+Result processors").expect("a list of steps");
+            reply[at..end].to_string()
+        };
+        assert_eq!(
+            tree(&mut f, b"alpha beta"),
+            "+Iterators profile\r\n*8\r\n+Type\r\n+INTERSECT\r\n+Time\r\n<t>\r\n\
+             +Number of reading operations\r\n:1\r\n+Child iterators\r\n*2\r\n\
+             *10\r\n+Type\r\n+TEXT\r\n+Term\r\n$5\r\nalpha\r\n+Time\r\n<t>\r\n\
+             +Number of reading operations\r\n:2\r\n+Estimated number of matches\r\n:2\r\n\
+             *10\r\n+Type\r\n+TEXT\r\n+Term\r\n$4\r\nbeta\r\n+Time\r\n<t>\r\n\
+             +Number of reading operations\r\n:1\r\n+Estimated number of matches\r\n:2\r\n"
+        );
+        assert!(tree(&mut f, b"alpha|beta").starts_with(
+            "+Iterators profile\r\n*10\r\n+Type\r\n+UNION\r\n+Query type\r\n+UNION\r\n\
+             +Time\r\n<t>\r\n+Number of reading operations\r\n:3\r\n+Child iterators\r\n*2\r\n"
+        ));
+        // One thing under it, named in the singular, which is a different key
+        // and not a list holding one.
+        assert!(tree(&mut f, b"-alpha").starts_with(
+            "+Iterators profile\r\n*8\r\n+Type\r\n+NOT\r\n+Time\r\n<t>\r\n\
+             +Number of reading operations\r\n:1\r\n+Child iterator\r\n*10\r\n"
+        ));
+        assert!(tree(&mut f, b"~alpha").starts_with(
+            "+Iterators profile\r\n*8\r\n+Type\r\n+OPTIONAL\r\n+Time\r\n<t>\r\n\
+             +Number of reading operations\r\n:3\r\n+Child iterator\r\n*10\r\n"
+        ));
+        // No guess at how many, which is the one leaf that leaves it off.
+        assert_eq!(
+            tree(&mut f, b"*"),
+            "+Iterators profile\r\n*6\r\n+Type\r\n+WILDCARD\r\n+Time\r\n<t>\r\n\
+             +Number of reading operations\r\n:3\r\n"
+        );
+        assert!(tree(&mut f, b"@n:[1 2]").starts_with(
+            "+Iterators profile\r\n*10\r\n+Type\r\n+NUMERIC\r\n+Term\r\n\
+             $19\r\n1.000000 - 2.000000\r\n"
+        ));
+    }
+
+    /// A union an expansion made folds into a count of its branches and a union
+    /// a client wrote with a bar does not.
+    #[test]
+    fn limited_folds_the_branches_an_expansion_made_and_leaves_a_bar_alone() {
+        let mut f = profiling();
+        f.run(&[b"HSET", b"p:4", b"t", b"alps"]);
+        let tree = |f: &mut Fixture, words: &[&[u8]]| {
+            let mut argv: Vec<&[u8]> = vec![b"FT.PROFILE", b"ix", b"SEARCH"];
+            argv.extend_from_slice(words);
+            let reply = timeless(&f.run(&argv));
+            let at = reply.find("+Iterators profile").expect("a tree");
+            let end = reply.find("+Result processors").expect("a list of steps");
+            reply[at..end].to_string()
+        };
+        assert_eq!(
+            tree(&mut f, &[b"LIMITED", b"QUERY", b"al*"]),
+            "+Iterators profile\r\n*10\r\n+Type\r\n+UNION\r\n\
+             +Query type\r\n$11\r\nPREFIX - al\r\n+Time\r\n<t>\r\n\
+             +Number of reading operations\r\n:3\r\n+Child iterators\r\n\
+             +The number of iterators in the union is 2\r\n"
+        );
+        assert!(tree(&mut f, &[b"QUERY", b"al*"]).contains("+Child iterators\r\n*2\r\n"));
+        assert!(
+            tree(&mut f, &[b"LIMITED", b"QUERY", b"alpha|beta"])
+                .contains("+Child iterators\r\n*2\r\n")
+        );
+        // A union that says nothing but its own name says it as a status, and
+        // one that says what it stood for says that as a string. Measured, and
+        // it is the one place in this reply where the two are told apart.
+        assert!(tree(&mut f, &[b"QUERY", b"alpha|beta"]).contains("+Query type\r\n+UNION\r\n"));
+        assert!(
+            tree(&mut f, &[b"QUERY", b"al*"]).contains("+Query type\r\n$11\r\nPREFIX - al\r\n")
+        );
+    }
+
+    /// Which steps a search runs the rows through, which turns on the window,
+    /// on whether anything asked for the fields and on what the order is.
+    #[test]
+    fn the_steps_a_search_runs_depend_on_what_was_asked_for() {
+        let mut f = profiling();
+        let steps = |f: &mut Fixture, words: &[&[u8]]| {
+            let mut argv: Vec<&[u8]> = vec![b"FT.PROFILE", b"ix", b"SEARCH", b"QUERY", b"alpha"];
+            argv.extend_from_slice(words);
+            let reply = timeless(&f.run(&argv));
+            let at = reply.find("+Result processors").expect("a list of steps");
+            let end = reply.find("+Coordinator").expect("an end");
+            let mut out = Vec::new();
+            let mut parts = reply[at..end].split("\r\n").peekable();
+            while let Some(part) = parts.next() {
+                if part == "+Type" {
+                    out.push(parts.next().unwrap_or_default().to_string());
+                }
+            }
+            out
+        };
+        assert_eq!(
+            steps(&mut f, &[]),
+            ["+Index", "+Scorer", "+Sorter", "+Loader"]
+        );
+        assert_eq!(
+            steps(&mut f, &[b"NOCONTENT"]),
+            ["+Index", "+Scorer", "+Sorter"]
+        );
+        // A window of nothing is a client asking for the total and nothing
+        // else, so nothing is scored and nothing is sorted.
+        assert_eq!(
+            steps(&mut f, &[b"LIMIT", b"0", b"0"]),
+            ["+Index", "+Counter"]
+        );
+        // A sort by a field does not need a score, and asking for the scores
+        // puts the step back.
+        assert_eq!(
+            steps(&mut f, &[b"SORTBY", b"n"]),
+            ["+Index", "+Sorter", "+Loader"]
+        );
+        assert_eq!(
+            steps(&mut f, &[b"SORTBY", b"n", b"WITHSCORES"]),
+            ["+Index", "+Scorer", "+Sorter", "+Loader"]
+        );
+        assert_eq!(
+            steps(&mut f, &[b"HIGHLIGHT"]),
+            ["+Index", "+Scorer", "+Sorter", "+Loader", "+Highlighter"]
+        );
+        assert_eq!(
+            steps(&mut f, &[b"SUMMARIZE", b"NOCONTENT"]),
+            ["+Index", "+Scorer", "+Sorter"]
+        );
+    }
+
+    /// A pipeline names each of its steps after the expression it runs, which
+    /// is what a real server prints beside them.
+    #[test]
+    fn a_pipeline_names_every_step_after_what_it_runs() {
+        let mut f = profiling();
+        let steps = |f: &mut Fixture, words: &[&[u8]]| {
+            let mut argv: Vec<&[u8]> = vec![b"FT.PROFILE", b"ix", b"AGGREGATE", b"QUERY", b"*"];
+            argv.extend_from_slice(words);
+            let reply = timeless(&f.run(&argv));
+            let at = reply.find("+Result processors").expect("a list of steps");
+            let end = reply.find("+Coordinator").expect("an end");
+            let mut out = Vec::new();
+            let mut parts = reply[at..end].split("\r\n").peekable();
+            while let Some(part) = parts.next() {
+                if part == "+Type" {
+                    out.push(parts.next().unwrap_or_default().to_string());
+                }
+            }
+            out
+        };
+        assert_eq!(steps(&mut f, &[]), ["+Index"]);
+        assert_eq!(
+            steps(&mut f, &[b"APPLY", b"1", b"AS", b"one"]),
+            ["+Index", "+Projector - Literal 1"]
+        );
+        assert_eq!(
+            steps(
+                &mut f,
+                &[b"LOAD", b"1", b"@n", b"APPLY", b"@n * 2", b"AS", b"d"]
+            ),
+            ["+Index", "+Loader", "+Projector - Operator *"]
+        );
+        assert_eq!(
+            steps(&mut f, &[b"LOAD", b"1", b"@n", b"FILTER", b"@n > 1"]),
+            ["+Index", "+Loader", "+Filter - Predicate >"]
+        );
+        assert_eq!(
+            steps(
+                &mut f,
+                &[b"GROUPBY", b"1", b"@n", b"REDUCE", b"COUNT", b"0"]
+            ),
+            ["+Index", "+Loader", "+Grouper"]
+        );
+        assert_eq!(
+            steps(&mut f, &[b"SORTBY", b"1", b"@n"]),
+            ["+Index", "+Loader", "+Sorter"]
+        );
+        assert_eq!(
+            steps(&mut f, &[b"LIMIT", b"0", b"2"]),
+            ["+Index", "+Pager/Limiter"]
+        );
+        // Asking for the score by name is a step of its own, and it goes in
+        // front of the read rather than after it.
+        assert_eq!(
+            steps(
+                &mut f,
+                &[
+                    b"ADDSCORES",
+                    b"LOAD",
+                    b"1",
+                    b"@n",
+                    b"APPLY",
+                    b"@__score",
+                    b"AS",
+                    b"s"
+                ]
+            ),
+            [
+                "+Index",
+                "+Scorer",
+                "+Loader",
+                "+Projector - Property __score"
+            ]
+        );
+    }
+
+    /// A field the schema marked sortable is held beside the document number,
+    /// so a pipeline that only names those never opens a key and never reports
+    /// a read.
+    ///
+    /// Measured: on a schema of `n NUMERIC SORTABLE g TAG`, `LOAD 1 @n` has no
+    /// `Loader` step and `LOAD 1 @g` has one. So does `LOAD *`, because what a
+    /// key turns out to hold is not knowable without opening it.
+    #[test]
+    fn a_sortable_field_is_read_without_the_key_being_opened() {
+        let mut f = Fixture::new();
+        f.run(&[
+            b"FT.CREATE",
+            b"sx",
+            b"PREFIX",
+            b"1",
+            b"s:",
+            b"SCHEMA",
+            b"n",
+            b"NUMERIC",
+            b"SORTABLE",
+            b"g",
+            b"TAG",
+        ]);
+        f.run(&[b"HSET", b"s:1", b"n", b"1", b"g", b"one"]);
+        f.run(&[b"HSET", b"s:2", b"n", b"2", b"g", b"two"]);
+        let loads = |f: &mut Fixture, words: &[&[u8]]| {
+            let mut argv: Vec<&[u8]> = vec![b"FT.PROFILE", b"sx", b"AGGREGATE", b"QUERY", b"*"];
+            argv.extend_from_slice(words);
+            f.run(&argv).contains("+Loader")
+        };
+        assert!(!loads(&mut f, &[b"LOAD", b"1", b"@n"]));
+        assert!(!loads(&mut f, &[b"SORTBY", b"1", b"@n"]));
+        assert!(!loads(&mut f, &[b"APPLY", b"@n * 2", b"AS", b"d"]));
+        assert!(loads(&mut f, &[b"LOAD", b"1", b"@g"]));
+        assert!(loads(&mut f, &[b"LOAD", b"2", b"@n", b"@g"]));
+        assert!(loads(
+            &mut f,
+            &[b"GROUPBY", b"1", b"@g", b"REDUCE", b"COUNT", b"0"]
+        ));
+        assert!(loads(&mut f, &[b"LOAD", b"*"]));
+    }
+
+    /// The four ways the words can be wrong, none of which reaches the search
+    /// underneath.
+    #[test]
+    fn a_profile_checks_its_own_words_before_it_runs_anything() {
+        let mut f = profiling();
+        assert_eq!(
+            f.run(&[b"FT.PROFILE", b"ix", b"SEARCH", b"QUERY"]),
+            "-ERR wrong number of arguments for 'FT.PROFILE' command\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"FT.PROFILE", b"ix", b"BOGUS", b"QUERY", b"alpha"]),
+            "-No `SEARCH`, `AGGREGATE`, or `HYBRID` provided\r\n"
+        );
+        // The word goes between the two and nowhere else, so one written in
+        // front of them is not the word at all.
+        assert_eq!(
+            f.run(&[
+                b"FT.PROFILE",
+                b"ix",
+                b"LIMITED",
+                b"SEARCH",
+                b"QUERY",
+                b"alpha"
+            ]),
+            "-No `SEARCH`, `AGGREGATE`, or `HYBRID` provided\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"FT.PROFILE", b"ix", b"SEARCH", b"BOGUS", b"alpha"]),
+            "-The QUERY keyword is expected\r\n"
+        );
+        assert_eq!(
+            f.run(&[
+                b"FT.PROFILE",
+                b"ix",
+                b"AGGREGATE",
+                b"QUERY",
+                b"alpha",
+                b"WITHCURSOR"
+            ]),
+            "-FT.PROFILE does not support cursor\r\n"
+        );
+        // And what the search itself complains about comes back on its own,
+        // without an envelope around it saying the command worked.
+        assert_eq!(
+            f.run(&[b"FT.PROFILE", b"nope", b"SEARCH", b"QUERY", b"alpha"]),
+            "-SEARCH_INDEX_NOT_FOUND Index not found: nope\r\n"
+        );
+        assert_eq!(
+            f.run(&[
+                b"FT.PROFILE",
+                b"ix",
+                b"SEARCH",
+                b"QUERY",
+                b"alpha",
+                b"extra"
+            ]),
+            "-SEARCH_ARG_UNRECOGNIZED Unknown argument `extra` at position 1 for <main>\r\n"
+        );
+    }
+
+    /// Every word of the command's own is read without regard to case.
+    #[test]
+    fn the_words_of_a_profile_are_read_the_way_every_other_word_is() {
+        let mut f = profiling();
+        let one = f.run(&[
+            b"FT.PROFILE",
+            b"ix",
+            b"search",
+            b"limited",
+            b"query",
+            b"alpha",
+        ]);
+        let two = f.run(&[
+            b"FT.PROFILE",
+            b"ix",
+            b"SEARCH",
+            b"LIMITED",
+            b"QUERY",
+            b"alpha",
+        ]);
+        assert_eq!(timeless(&one), timeless(&two));
     }
 
     // --------------------------------------------------------------- config

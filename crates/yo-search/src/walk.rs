@@ -136,6 +136,7 @@ use crate::expand;
 use crate::held::Held;
 use crate::nums::Ends;
 use crate::posts::{Id, Posts, Reader, stemmed};
+use crate::query::explain::fixed;
 use crate::query::{Circle, Node, Range, What, Word};
 use crate::score::{Found, Term};
 use crate::tags::Tags;
@@ -173,9 +174,79 @@ pub fn spaced<'a>(held: &'a Held, node: &'a Node) -> Vec<Hit<'a>> {
     gather(held, node, true)
 }
 
+/// What one step of a walk turned out to be, which is what a profile reports.
+///
+/// Built after the walk rather than during it, so nothing here costs anything
+/// until somebody asks. The counts are the exception: they are kept as the walk
+/// runs because there is no way to work out afterwards how many times a branch
+/// was asked.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Ran {
+    /// The word a profile calls this kind of step.
+    pub kind: &'static str,
+    /// What a union is a union of, which is the word `UNION` when a client
+    /// wrote the bar and the name of the expansion when one made it.
+    pub about: Option<Box<[u8]>>,
+    /// The term, the tag value or the range this answered off, which the leaves
+    /// have and the branches do not.
+    pub term: Option<Box<[u8]>>,
+    /// How many different documents this answered.
+    pub reads: u64,
+    /// The guess an intersection sorts its branches on, which a profile reports
+    /// for a leaf and leaves off a branch.
+    pub size: Option<u32>,
+    /// What is under it.
+    pub under: Vec<Ran>,
+    /// Whether a profile writes the one thing under this as a single child
+    /// rather than as a list, which a negation and an optional do.
+    pub alone: bool,
+    /// Whether `LIMITED` folds the children away into a count, which it does
+    /// for a union an expansion made and not for one a client wrote.
+    pub folds: bool,
+}
+
+impl Ran {
+    /// A step with nothing under it and nothing to say about a term.
+    fn leaf(kind: &'static str, reads: u64) -> Ran {
+        Ran {
+            kind,
+            about: None,
+            term: None,
+            reads,
+            size: None,
+            under: Vec::new(),
+            alone: false,
+            folds: false,
+        }
+    }
+
+    /// The same, naming what it answered off and how much of it there is.
+    fn named(kind: &'static str, reads: u64, term: &[u8], size: u32) -> Ran {
+        Ran {
+            term: Some(term.into()),
+            size: Some(size),
+            ..Ran::leaf(kind, reads)
+        }
+    }
+}
+
+/// Every document that answers, and what the walk that found them was.
+#[must_use]
+pub fn profiled<'a>(held: &'a Held, node: &'a Node, measure: bool) -> (Vec<Hit<'a>>, Ran) {
+    let mut step = build(held, node);
+    let out = drain(&mut step, measure);
+    let ran = step.ran();
+    (out, ran)
+}
+
 /// Every document that answers, with the places measured or not.
 fn gather<'a>(held: &'a Held, node: &'a Node, measure: bool) -> Vec<Hit<'a>> {
     let mut step = build(held, node);
+    drain(&mut step, measure)
+}
+
+/// Asks a built step for every document it has, from the first number up.
+fn drain<'a>(step: &mut Box<dyn Step<'a> + 'a>, measure: bool) -> Vec<Hit<'a>> {
     let mut out = Vec::new();
     let mut want = 1;
     while let Some(mut hit) = step.seek(want) {
@@ -248,6 +319,9 @@ trait Step<'a> {
         let _ = id;
         1
     }
+
+    /// What this turned out to be, for a profile to report.
+    fn ran(&self) -> Ran;
 }
 
 /// What one node of the tree turns into.
@@ -309,29 +383,49 @@ fn build<'a>(held: &'a Held, node: &'a Node) -> Box<dyn Step<'a> + 'a> {
         What::Not(child) => Box::new(Unless {
             docs: &held.docs,
             under: build(held, child),
+            reads: 0,
+            gave: None,
         }),
         What::Optional(child) => Box::new(Maybe {
             docs: &held.docs,
             under: build(held, child),
+            reads: 0,
+            gave: None,
         }),
-        What::Prefix(prefix) => {
-            spread(held, expand::under(held.dictionary(), prefix), mask, weight)
-        }
+        What::Prefix(prefix) => spread(
+            held,
+            expand::under(held.dictionary(), prefix),
+            mask,
+            weight,
+            &told("PREFIX", prefix),
+        ),
         What::Suffix(suffix) => spread(
             held,
             expand::ending(held.dictionary(), suffix),
             mask,
             weight,
+            &told("SUFFIX", suffix),
         ),
-        What::Infix(part) => spread(held, expand::inside(held.dictionary(), part), mask, weight),
-        What::Pattern(pattern) => {
-            spread(held, expand::like(held.dictionary(), pattern), mask, weight)
-        }
+        What::Infix(part) => spread(
+            held,
+            expand::inside(held.dictionary(), part),
+            mask,
+            weight,
+            &told("INFIX", part),
+        ),
+        What::Pattern(pattern) => spread(
+            held,
+            expand::like(held.dictionary(), pattern),
+            mask,
+            weight,
+            &told("WILDCARD", pattern),
+        ),
         What::Fuzzy(word, distance) => spread(
             held,
             expand::near(held.dictionary(), word, *distance),
             mask,
             weight,
+            &told("FUZZY", word),
         ),
         What::Numeric(range) => Box::new(numbers(held, range)),
         What::Geo(circle) => Box::new(places(held, circle)),
@@ -396,12 +490,22 @@ fn term<'a>(held: &'a Held, word: &Word, mask: u32, weight: f64) -> One<'a> {
     One::new(held.entry(name), &held.docs, mask, weight)
 }
 
+/// How a profile names the expansion a union came out of, which is the kind of
+/// expansion and then what was written.
+fn told(kind: &str, written: &[u8]) -> Vec<u8> {
+    let mut out = kind.as_bytes().to_vec();
+    out.extend_from_slice(b" - ");
+    out.extend_from_slice(written);
+    out
+}
+
 /// A union over every term one expansion stands for, in dictionary order.
 fn spread<'a>(
     held: &'a Held,
     found: Vec<(&'a [u8], &'a Posts)>,
     mask: u32,
     weight: f64,
+    about: &[u8],
 ) -> Box<dyn Step<'a> + 'a> {
     // One term is that term and not a union of one, which is measured: `qu*`
     // stands for one word and explains itself as a bare leaf, where `w1*`
@@ -416,7 +520,7 @@ fn spread<'a>(
             Box::new(One::new(Some(entry), &held.docs, mask, 1.0)) as Box<dyn Step<'a> + 'a>
         })
         .collect();
-    Box::new(Any::new(under, false, weight))
+    Box::new(Any::new(under, false, weight).tells(about.to_vec()))
 }
 
 /// The documents whose number in a field is inside a range.
@@ -434,7 +538,10 @@ fn numbers<'a>(held: &'a Held, range: &Range) -> List<'a> {
     // A range is a filter and nothing else, and what that is worth depends on
     // the scorer rather than on the range, so the shape says which it is and
     // the scorer decides. [`Found::Blank`] has the measurement.
-    List::new(live(&held.docs, ids), Found::filter()).about(held.docs.len() as u32)
+    let ends = fixed(range.min) + " - " + &fixed(range.max);
+    List::new(live(&held.docs, ids), Found::filter())
+        .about(held.docs.len() as u32)
+        .tells("NUMERIC", ends.into_bytes())
 }
 
 /// The documents whose point is inside the circle.
@@ -446,7 +553,14 @@ fn places<'a>(held: &'a Held, circle: &Circle) -> List<'a> {
     // Nothing at all for a field with no points in it, which is what a field of
     // another kind is, and the parser has already refused a unit that is not
     // one of the four rather than leaving it to answer nothing here.
-    List::new(live(&held.docs, ids), Found::filter())
+    let round = format!(
+        "{},{} - {} {}",
+        fixed(circle.lon),
+        fixed(circle.lat),
+        fixed(circle.radius),
+        String::from_utf8_lossy(&circle.unit),
+    );
+    List::new(live(&held.docs, ids), Found::filter()).tells("GEO", round.into_bytes())
 }
 
 /// The documents a tag field's values were asked for.
@@ -474,7 +588,7 @@ fn tagged<'a>(
     if alone {
         return under.pop().unwrap_or_else(|| Box::new(Never));
     }
-    Box::new(Any::new(under, true, weight))
+    Box::new(Any::new(under, true, weight).tells(b"TAG".to_vec()))
 }
 
 /// One value asked of a tag field.
@@ -528,7 +642,7 @@ fn held_tag<'a>(held: &'a Held, tags: &'a Tags, value: &[u8], weight: f64) -> Li
     // with one occurrence and the rarity of the value, and named the way the
     // index spells it rather than the way the query wrote it.
     let found = Found::Term(Term::new(1, weight, ids.len() as u32).about(name));
-    List::new(live(&held.docs, ids.to_vec()), found)
+    List::new(live(&held.docs, ids.to_vec()), found).tells("TAG", name.to_vec())
 }
 
 /// Every value of a tag field that fits, as a union in byte order.
@@ -553,13 +667,14 @@ fn sweep<'a>(
         .map(|(name, ids)| {
             let each = if alone { weight } else { 1.0 };
             let found = Found::Term(Term::new(1, each, ids.len() as u32).about(name));
-            Box::new(List::new(live(&held.docs, ids.to_vec()), found)) as Box<dyn Step<'a> + 'a>
+            Box::new(List::new(live(&held.docs, ids.to_vec()), found).tells("TAG", name.to_vec()))
+                as Box<dyn Step<'a> + 'a>
         })
         .collect();
     if alone {
         return under.pop().unwrap_or_else(|| Box::new(Never));
     }
-    Box::new(Any::new(under, false, weight))
+    Box::new(Any::new(under, false, weight).tells(b"TAG".to_vec()))
 }
 
 /// The numbers among these that still mean something.
@@ -585,6 +700,10 @@ impl Step<'_> for Never {
     fn empty(&self) -> bool {
         true
     }
+
+    fn ran(&self) -> Ran {
+        Ran::leaf("EMPTY", 0)
+    }
 }
 
 /// One term's posting list.
@@ -603,6 +722,8 @@ struct One<'a> {
     df: u32,
     /// The answer last given, for giving it again.
     at: Option<Hit<'a>>,
+    /// How many different documents this has answered.
+    reads: u64,
     /// Room for the places of one document, which a reader hands back into a
     /// buffer of its own rather than onto the end of somebody else's.
     room: Vec<u32>,
@@ -623,6 +744,7 @@ impl<'a> One<'a> {
             weight,
             df: entry.map_or(0, |(_, posts)| posts.len()),
             at: None,
+            reads: 0,
             room: Vec::new(),
         }
     }
@@ -643,6 +765,7 @@ impl<'a> Step<'a> for One<'a> {
                 let term = Term::new(post.freq, self.weight, self.df).about(self.name);
                 let hit = Hit::new(post.id, Found::Term(term));
                 self.at = Some(hit.clone());
+                self.reads += 1;
                 return Some(hit);
             }
             want = post.id.checked_add(1)?;
@@ -666,6 +789,10 @@ impl<'a> Step<'a> for One<'a> {
         }
         true
     }
+
+    fn ran(&self) -> Ran {
+        Ran::named("TEXT", self.reads, self.name, self.df)
+    }
 }
 
 /// A list of numbers worked out in advance, which is what a range and a tag
@@ -673,6 +800,15 @@ impl<'a> Step<'a> for One<'a> {
 struct List<'a> {
     ids: Vec<Id>,
     at: usize,
+    /// Which of the three kinds of list this is, for a profile to name it.
+    kind: &'static str,
+    /// What a profile reports this answered off, which is a value for a tag and
+    /// the ends of the range for a number or a circle.
+    term: Vec<u8>,
+    /// How many different documents this has answered.
+    reads: u64,
+    /// The number last given, so that giving it again is not counted twice.
+    gave: Option<Id>,
     found: Found<'a>,
     /// How many documents this is worth guessing at when an intersection sorts
     /// its branches, which is not always how many it actually holds.
@@ -685,9 +821,21 @@ impl<'a> List<'a> {
         List {
             ids,
             at: 0,
+            kind: "TAG",
+            term: Vec::new(),
+            reads: 0,
+            gave: None,
             found,
             guess,
         }
+    }
+
+    /// The same list, saying what kind of thing it answered off and which one,
+    /// which is what a profile prints and nothing else looks at.
+    fn tells(mut self, kind: &'static str, term: Vec<u8>) -> List<'a> {
+        self.kind = kind;
+        self.term = term;
+        self
     }
 
     /// The same list, guessed at as this many documents rather than as its own
@@ -710,8 +858,12 @@ impl<'a> Step<'a> for List<'a> {
         while self.at < self.ids.len() && self.ids[self.at] < id {
             self.at += 1;
         }
-        let found = self.ids.get(self.at)?;
-        Some(Hit::new(*found, self.found.clone()))
+        let found = *self.ids.get(self.at)?;
+        if self.gave != Some(found) {
+            self.gave = Some(found);
+            self.reads += 1;
+        }
+        Some(Hit::new(found, self.found.clone()))
     }
 
     fn size(&self) -> u32 {
@@ -721,16 +873,28 @@ impl<'a> Step<'a> for List<'a> {
     fn empty(&self) -> bool {
         self.ids.is_empty()
     }
+
+    fn ran(&self) -> Ran {
+        Ran::named(self.kind, self.reads, &self.term, self.guess)
+    }
 }
 
 /// Every document there is, which is what a bare `*` asks for.
 struct Every<'a> {
     docs: &'a Docs,
+    /// How many different documents this has answered.
+    reads: u64,
+    /// The number last given, so that giving it again is not counted twice.
+    gave: Option<Id>,
 }
 
 impl<'a> Every<'a> {
     fn new(docs: &'a Docs) -> Every<'a> {
-        Every { docs }
+        Every {
+            docs,
+            reads: 0,
+            gave: None,
+        }
     }
 }
 
@@ -739,6 +903,10 @@ impl<'a> Step<'a> for Every<'a> {
         let mut want = id.max(1);
         while want <= self.docs.last() {
             if self.docs.get(want).is_some() {
+                if self.gave != Some(want) {
+                    self.gave = Some(want);
+                    self.reads += 1;
+                }
                 return Some(Hit::new(want, Found::Every));
             }
             want = want.checked_add(1)?;
@@ -753,6 +921,12 @@ impl<'a> Step<'a> for Every<'a> {
     fn empty(&self) -> bool {
         self.docs.is_empty()
     }
+
+    /// No guess at how many, which is the one leaf a real server leaves the
+    /// estimate off.
+    fn ran(&self) -> Ran {
+        Ran::leaf("WILDCARD", self.reads)
+    }
 }
 
 /// Any of these, either adding up what answered or taking the first.
@@ -763,11 +937,32 @@ struct Any<'a> {
     sum: bool,
     /// What the query said the union as a whole is worth.
     weight: f64,
+    /// What a profile calls this a union of, which is the bare word for one a
+    /// client wrote and the name of the expansion for one that made itself.
+    about: Vec<u8>,
+    /// How many different documents this has answered.
+    reads: u64,
+    /// The number last given, so that giving it again is not counted twice.
+    gave: Option<Id>,
 }
 
 impl<'a> Any<'a> {
     fn new(under: Vec<Box<dyn Step<'a> + 'a>>, sum: bool, weight: f64) -> Any<'a> {
-        Any { under, sum, weight }
+        Any {
+            under,
+            sum,
+            weight,
+            about: b"UNION".to_vec(),
+            reads: 0,
+            gave: None,
+        }
+    }
+
+    /// The same union, saying what made it, which is what a profile prints and
+    /// what decides whether `LIMITED` folds the branches away.
+    fn tells(mut self, about: Vec<u8>) -> Any<'a> {
+        self.about = about;
+        self
     }
 }
 
@@ -790,6 +985,10 @@ impl<'a> Step<'a> for Any<'a> {
             if !self.sum {
                 break;
             }
+        }
+        if self.gave != Some(id) {
+            self.gave = Some(id);
+            self.reads += 1;
         }
         Some(Hit::new(id, Found::any(self.weight, found)))
     }
@@ -835,6 +1034,17 @@ impl<'a> Step<'a> for Any<'a> {
         }
         apart(&lists)
     }
+
+    /// A union an expansion made is the one a `LIMITED` profile folds into a
+    /// count, and a union a client wrote with a bar is not.
+    fn ran(&self) -> Ran {
+        Ran {
+            about: Some(self.about.as_slice().into()),
+            under: self.under.iter().map(|child| child.ran()).collect(),
+            folds: self.about != b"UNION",
+            ..Ran::leaf("UNION", self.reads)
+        }
+    }
 }
 
 /// All of these, which is what a space between two words means.
@@ -842,6 +1052,10 @@ struct All<'a> {
     under: Vec<Box<dyn Step<'a> + 'a>>,
     /// What the query said the intersection as a whole is worth.
     weight: f64,
+    /// How many different documents this has answered.
+    reads: u64,
+    /// The number last given, so that giving it again is not counted twice.
+    gave: Option<Id>,
 }
 
 impl<'a> All<'a> {
@@ -851,7 +1065,12 @@ impl<'a> All<'a> {
         // the order they were written, which is the order a real server
         // explains them in.
         under.sort_by_key(|child| child.size());
-        All { under, weight }
+        All {
+            under,
+            weight,
+            reads: 0,
+            gave: None,
+        }
     }
 }
 
@@ -876,7 +1095,13 @@ impl<'a> Step<'a> for All<'a> {
                 // Somebody is further along, so everybody is asked again from
                 // there, which is what makes this a leapfrog rather than a walk.
                 Some(at) => want = at,
-                None => return Some(Hit::new(want, Found::all(self.weight, found))),
+                None => {
+                    if self.gave != Some(want) {
+                        self.gave = Some(want);
+                        self.reads += 1;
+                    }
+                    return Some(Hit::new(want, Found::all(self.weight, found)));
+                }
             }
         }
     }
@@ -909,6 +1134,13 @@ impl<'a> Step<'a> for All<'a> {
         }
         apart(&lists)
     }
+
+    fn ran(&self) -> Ran {
+        Ran {
+            under: self.under.iter().map(|child| child.ran()).collect(),
+            ..Ran::leaf("INTERSECT", self.reads)
+        }
+    }
 }
 
 /// All of these, near enough to each other, which is what a phrase is and what
@@ -927,6 +1159,8 @@ struct Near<'a> {
     at: Vec<Vec<u32>>,
     /// The answer last given, for giving it again.
     last: Option<Hit<'a>>,
+    /// How many different documents this has answered.
+    reads: u64,
 }
 
 impl<'a> Near<'a> {
@@ -950,6 +1184,7 @@ impl<'a> Near<'a> {
             weight,
             at: Vec::new(),
             last: None,
+            reads: 0,
         }
     }
 
@@ -1000,6 +1235,7 @@ impl<'a> Step<'a> for Near<'a> {
             if self.close(want) {
                 let hit = Hit::new(want, Found::all(self.weight, found));
                 self.last = Some(hit.clone());
+                self.reads += 1;
                 return Some(hit);
             }
             // Everybody is here and they are too far apart, so the next document
@@ -1033,6 +1269,15 @@ impl<'a> Step<'a> for Near<'a> {
             spot(child, id, &mut lists);
         }
         apart(&lists)
+    }
+
+    /// A phrase is an intersection that also checks where the words landed, and
+    /// a real server profiles it as one.
+    fn ran(&self) -> Ran {
+        Ran {
+            under: self.under.iter().map(|child| child.ran()).collect(),
+            ..Ran::leaf("INTERSECT", self.reads)
+        }
     }
 }
 
@@ -1171,6 +1416,10 @@ fn window(at: &[Vec<u32>], room: u32) -> bool {
 struct Unless<'a> {
     docs: &'a Docs,
     under: Box<dyn Step<'a> + 'a>,
+    /// How many different documents this has answered.
+    reads: u64,
+    /// The number last given, so that giving it again is not counted twice.
+    gave: Option<Id>,
 }
 
 impl<'a> Step<'a> for Unless<'a> {
@@ -1182,6 +1431,10 @@ impl<'a> Step<'a> for Unless<'a> {
             {
                 // Measured: a document that answered a negation and nothing else
                 // scores zero, which is a match counted no times at all.
+                if self.gave != Some(want) {
+                    self.gave = Some(want);
+                    self.reads += 1;
+                }
                 return Some(Hit::new(want, Found::missing()));
             }
             want = want.checked_add(1)?;
@@ -1198,12 +1451,24 @@ impl<'a> Step<'a> for Unless<'a> {
     fn always(&self) -> bool {
         self.under.empty()
     }
+
+    fn ran(&self) -> Ran {
+        Ran {
+            under: vec![self.under.ran()],
+            alone: true,
+            ..Ran::leaf("NOT", self.reads)
+        }
+    }
 }
 
 /// This, but a document without it answers anyway.
 struct Maybe<'a> {
     docs: &'a Docs,
     under: Box<dyn Step<'a> + 'a>,
+    /// How many different documents this has answered.
+    reads: u64,
+    /// The number last given, so that giving it again is not counted twice.
+    gave: Option<Id>,
 }
 
 impl<'a> Step<'a> for Maybe<'a> {
@@ -1217,6 +1482,10 @@ impl<'a> Step<'a> for Maybe<'a> {
                     // nothing, which is a match at a weight of nothing.
                     _ => Found::skipped(),
                 };
+                if self.gave != Some(want) {
+                    self.gave = Some(want);
+                    self.reads += 1;
+                }
                 return Some(Hit::new(want, found));
             }
             want = want.checked_add(1)?;
@@ -1239,6 +1508,14 @@ impl<'a> Step<'a> for Maybe<'a> {
             self.under.places(id, into);
         }
         false
+    }
+
+    fn ran(&self) -> Ran {
+        Ran {
+            under: vec![self.under.ran()],
+            alone: true,
+            ..Ran::leaf("OPTIONAL", self.reads)
+        }
     }
 }
 
@@ -1891,5 +2168,128 @@ mod tests {
         };
         assert!(matches!(under.first(), Some(Found::Term(_))));
         assert!(matches!(under.get(1), Some(Found::Blank { .. })));
+    }
+
+    /// What a walk of this query turned out to be.
+    fn ran(index: &Index, query: &[u8]) -> Ran {
+        let node = parse(query, index, &Ask::default()).expect("a query that parses");
+        profiled(&index.held, &node, false).1
+    }
+
+    /// Three documents, two of which hold the first word and two the second.
+    fn three() -> Index {
+        plain(&[
+            (b"k:1", b"alpha"),
+            (b"k:2", b"alpha beta"),
+            (b"k:3", b"beta"),
+        ])
+    }
+
+    #[test]
+    fn a_word_says_what_it_is_and_how_many_hold_it() {
+        let index = three();
+        let ran = ran(&index, b"alpha");
+        assert_eq!(ran.kind, "TEXT");
+        assert_eq!(ran.term.as_deref(), Some(&b"alpha"[..]));
+        assert_eq!(ran.size, Some(2));
+        assert_eq!(ran.reads, 2);
+        assert!(ran.under.is_empty());
+    }
+
+    #[test]
+    fn a_union_counts_a_document_once_however_many_branches_answered_it() {
+        let index = three();
+        let ran = ran(&index, b"alpha|beta");
+        assert_eq!(ran.kind, "UNION");
+        assert_eq!(ran.about.as_deref(), Some(&b"UNION"[..]));
+        assert_eq!(ran.reads, 3);
+        // Nothing guesses how many a branch will answer, which is the one thing
+        // a real server prints on a leaf and leaves off a branch.
+        assert_eq!(ran.size, None);
+        let counts: Vec<u64> = ran.under.iter().map(|child| child.reads).collect();
+        assert_eq!(counts, vec![2, 2]);
+    }
+
+    #[test]
+    fn an_intersection_counts_what_answered_and_not_what_it_stepped_over() {
+        let index = three();
+        let ran = ran(&index, b"alpha beta");
+        assert_eq!(ran.kind, "INTERSECT");
+        assert_eq!(ran.reads, 1);
+        // The second word was asked twice and answered the same document both
+        // times, which counts once. Measured on a real server over these three
+        // documents, which answers two and one for the same two words.
+        let counts: Vec<u64> = ran.under.iter().map(|child| child.reads).collect();
+        assert_eq!(counts, vec![2, 1]);
+    }
+
+    #[test]
+    fn a_negation_and_an_optional_each_hold_one_thing() {
+        let index = three();
+        let no = ran(&index, b"-alpha");
+        assert_eq!(no.kind, "NOT");
+        assert!(no.alone);
+        assert_eq!(no.reads, 1);
+        assert_eq!(no.under.len(), 1);
+        assert_eq!(no.under[0].reads, 2);
+        let maybe = ran(&index, b"~alpha");
+        assert_eq!(maybe.kind, "OPTIONAL");
+        assert!(maybe.alone);
+        assert_eq!(maybe.reads, 3);
+        assert_eq!(maybe.under[0].reads, 2);
+    }
+
+    #[test]
+    fn a_wildcard_and_a_query_of_nothing_are_told_apart() {
+        let index = three();
+        let every = ran(&index, b"*");
+        assert_eq!(every.kind, "WILDCARD");
+        assert_eq!(every.reads, 3);
+        assert_eq!(every.size, None);
+        let none = ran(&index, b"the");
+        assert_eq!(none.kind, "EMPTY");
+        assert_eq!(none.reads, 0);
+        assert_eq!(none.size, None);
+    }
+
+    #[test]
+    fn an_expansion_says_what_made_it_and_a_bar_does_not() {
+        let index = plain(&[(b"k:1", b"alpha"), (b"k:2", b"alps"), (b"k:3", b"beta")]);
+        let spread = ran(&index, b"alp*");
+        assert_eq!(spread.kind, "UNION");
+        assert_eq!(spread.about.as_deref(), Some(&b"PREFIX - alp"[..]));
+        // Which is the whole of what `LIMITED` looks at when it decides to fold
+        // the branches away into a count.
+        assert!(spread.folds);
+        assert_eq!(spread.under.len(), 2);
+        assert!(!ran(&index, b"alpha|beta").folds);
+    }
+
+    #[test]
+    fn a_range_a_circle_and_a_tag_each_name_what_they_answered_off() {
+        let index = indexed(&[(
+            b"u:1",
+            &[
+                (b"t".as_slice(), b"fox".as_slice()),
+                (b"g", b"aa"),
+                (b"n", b"1"),
+            ][..],
+        )]);
+        let range = ran(&index, b"@n:[1 5]");
+        assert_eq!(range.kind, "NUMERIC");
+        assert_eq!(range.term.as_deref(), Some(&b"1.000000 - 5.000000"[..]));
+        let tag = ran(&index, b"@g:{aa}");
+        assert_eq!(tag.kind, "TAG");
+        assert_eq!(tag.term.as_deref(), Some(&b"aa"[..]));
+        assert_eq!(tag.reads, 1);
+    }
+
+    #[test]
+    fn a_phrase_is_profiled_as_an_intersection() {
+        let index = plain(&[(b"k:1", b"alpha beta"), (b"k:2", b"beta alpha")]);
+        let ran = ran(&index, b"\"alpha beta\"");
+        assert_eq!(ran.kind, "INTERSECT");
+        assert_eq!(ran.reads, 1);
+        assert_eq!(ran.under.len(), 2);
     }
 }
