@@ -4242,21 +4242,28 @@ fn gather(
         // tie goes to the document written first, which is measured: a query
         // sitting between two documents answers the lower number of the two
         // ahead of the higher.
-        (None, Order::Forwards) if let Some(name) = &rows.nearest => {
-            let away = |row: &Scored<'_>| {
-                row.2
-                    .iter()
-                    .find(|(held, _)| **held == **name)
-                    .map_or(f64::INFINITY, |(_, away)| *away)
-            };
-            found.sort_by(|a, b| {
-                away(a)
-                    .partial_cmp(&away(b))
-                    .unwrap_or(core::cmp::Ordering::Equal)
-                    .then(a.0.id.cmp(&b.0.id))
-            });
-        }
-        (None, Order::Forwards) => found.sort_by_key(|(hit, _, _)| hit.id),
+        //
+        // Written as a match inside the arm rather than as an `if let` guard on
+        // it. The guard reads better and says the same thing, but `if_let_guard`
+        // is not stable in 1.94, which is what `rust-version` says and what the
+        // msrv job builds with.
+        (None, Order::Forwards) => match &rows.nearest {
+            Some(name) => {
+                let away = |row: &Scored<'_>| {
+                    row.2
+                        .iter()
+                        .find(|(held, _)| **held == **name)
+                        .map_or(f64::INFINITY, |(_, away)| *away)
+                };
+                found.sort_by(|a, b| {
+                    away(a)
+                        .partial_cmp(&away(b))
+                        .unwrap_or(core::cmp::Ordering::Equal)
+                        .then(a.0.id.cmp(&b.0.id))
+                });
+            }
+            None => found.sort_by_key(|(hit, _, _)| hit.id),
+        },
         (None, Order::Backwards) => {
             found.sort_by_key(|(hit, _, _)| core::cmp::Reverse(hit.id));
         }
