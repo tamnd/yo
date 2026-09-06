@@ -4,6 +4,38 @@ What each release changed, why, and what it costs you. The versioning rules and 
 
 While the major is 0, a minor release may break anything, including the on-disk format. The format is frozen at `M6`, not before.
 
+## 0.3.22 — 2026-09-07
+
+Twenty three pull requests and no milestone has closed, so this is a patch.
+
+Almost all of it is scripting. `EVAL` used to run on an interpreter written here that understood a useful subset of Lua, and it now runs on a real Lua 5.1 built from source inside our own build, with the four libraries a real server links in and the whole `FUNCTION` surface behind it. A file written by 0.3.21 opens unchanged under this version and a file written by this version opens under 0.3.21. No record kind was added.
+
+### Added
+
+- **`EVAL` runs on a real Lua 5.1.** One interpreter per thread, so two clients running scripts never wait for each other, which is the thing a real server cannot offer at all. The value conversion was measured in both directions against Redis 8.10.1 on both protocols rather than read off the documentation, including the order the six named table fields are looked for in and what a field of the wrong type does. The error handling is Redis's own, so a script gets its line number, its script name and its raised table back the way a real server hands them over.
+- **The sandbox a script runs in.** An empty environment per run, the `redis` table behind a proxy that cannot be written to, wrappers on the three base functions that walk round a metatable, and a pass after every run that puts the global table back the way it was found. Verified over 289 raw socket comparisons across four probe suites.
+- **The four Lua libraries a real server links in.** `bit` is Mike Pall's LuaBitOp, `cjson` is Mark Pulford's 2.1.0, `struct` is Roberto Ierusalimschy's and `cmsgpack` is Salvatore Sanfilippo's 0.4.0, and all four were ported from the C in the Redis source rather than probed from the outside, which is what got the parse errors right down to the character offset. That also means they carry the mistakes the C has been making for years, because a script has been told them all along. Verified over more than six thousand bodies in total.
+- **`FUNCTION` and `FCALL`.** A library is a script loaded once and called by name forever after, so a client calls `FCALL addtocart 1 cart:9 sku` instead of shipping a digest it has to keep in step with a file. The whole subcommand set is here, including `DUMP` and `RESTORE`, whose payload is an RDB payload rather than anything invented here: a payload written by this server loads into a real Redis and one written by a real Redis loads here, compressed libraries included.
+- **`FT.HYBRID`, and the vector clause options behind it.** The command Redis 8.4 added, plus the runtime options a vector clause takes, the distance a query measured coming back through both `FT.SEARCH` and `FT.AGGREGATE`, and a profile of a vector query in the shape a real server prints.
+- **`_FT.DEBUG`.** An index's own structures read back, which is how the inverted index, the numeric index and the document table are checked against what they are meant to hold rather than against what a query happens to return.
+- **An index `FILTER` is applied on the write path**, so a document that does not match the expression is not indexed rather than being indexed and then hidden.
+- **The five deprecated document commands.** `FT.ADD`, `FT.DEL`, `FT.GET`, `FT.MGET` and `FT.SYNADD` answer the way a real server answers them, which for four of them is a refusal with the sentence a client is expecting.
+
+### Fixed
+
+- **A split and a merge could undo each other forever.** Two thresholds that touched meant a node could be split by one write and merged by the next, back and forth, with the tree doing work and making no progress. The two now have a gap between them.
+- **`FT.DROPINDEX` deletes the documents it indexed** when it is asked to, which it was not doing.
+- **The aggregation sort compiles on the MSRV**, which a sort added last release did not.
+- **A payload with no checksum is accepted.** A checksum of zero means there is no checksum and a server with checksumming turned off writes exactly that, so `RESTORE` was refusing a whole class of real payloads with a message about the checksum that sends the reader to entirely the wrong place.
+- **`cargo xtask cross` runs again.** Building Lua from C meant the cross lint needed a C compiler for linux and one for windows, which a mac has neither of, and it died naming a compiler nobody has ever had. It finds a zig and drives clang through it now, so the check RELEASING.md asks for before every release push works on a laptop again. If there is no zig it says what to install.
+
+### Known gaps
+
+- Scripting has no timeout, so `SCRIPT KILL` and `FUNCTION KILL` always answer `NOTBUSY`. A script here runs to the end of the command that started it, on the thread that started it, which is D-101.
+- A library's own variables are per thread rather than per process, which follows from one interpreter per thread and is D-110. Redis's own documentation tells a library not to keep state that way.
+- A payload this server writes is not byte for byte the one a real server writes. The version in the footer is lower on purpose and the strings are never LZF compressed, which is D-111. Both directions load.
+- `MULTI`, `EXEC`, `DISCARD`, `WATCH` and `UNWATCH` are not implemented, and neither is pub/sub or replication. All three are what is left of M8.
+
 ## 0.3.21 — 2026-09-06
 
 Fifteen pull requests and no milestone has closed, so this is a patch.
