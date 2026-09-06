@@ -2239,16 +2239,24 @@ mod tests {
         );
     }
 
+    /// A query parsed against an index, for the tests below to hold on to.
+    ///
+    /// `shape` hands back a borrow of the tree it walked, so the tree has to
+    /// outlive the call and cannot be a local inside it. Parsing here and
+    /// keeping the result at the call site is one line more to read and leaves
+    /// nothing behind, which the Miri run in `deep.yml` checks for.
+    fn parsed(index: &Index, query: &[u8]) -> Node {
+        parse(query, index, &Ask::default()).expect("a query that parses")
+    }
+
     /// The shape one query gave one document, which is what an explanation is
     /// printed off and what the tests below are about.
-    fn shape<'a>(index: &'a Index, query: &[u8], key: &[u8]) -> Found<'a> {
-        let node = parse(query, index, &Ask::default()).expect("a query that parses");
-        let node = Box::leak(Box::new(node));
+    fn shape<'a>(index: &'a Index, node: &'a Node, key: &[u8]) -> Found<'a> {
         run(&index.held, node)
             .into_iter()
             .find(|hit| index.held.docs.key(hit.id) == Some(key))
             .map(|hit| hit.found)
-            .unwrap_or_else(|| panic!("{} did not answer", String::from_utf8_lossy(query)))
+            .unwrap_or_else(|| panic!("nothing answered for {}", String::from_utf8_lossy(key)))
     }
 
     /// Measured: `FT.SEARCH hz fox EXPLAINSCORE` prints the one leaf on its own
@@ -2269,11 +2277,10 @@ mod tests {
                 &[(b"t".as_slice(), b"fox runs".as_slice()), (b"g", b"bb")][..],
             ),
         ]);
-        assert!(matches!(shape(&index, b"fox", b"u:1"), Found::Term(_)));
-        assert!(matches!(
-            shape(&index, b"running", b"u:2"),
-            Found::Any { .. }
-        ));
+        let fox = parsed(&index, b"fox");
+        let running = parsed(&index, b"running");
+        assert!(matches!(shape(&index, &fox, b"u:1"), Found::Term(_)));
+        assert!(matches!(shape(&index, &running, b"u:2"), Found::Any { .. }));
     }
 
     /// Measured: `@n:[1 5] fox` explains the word first and the range second,
@@ -2299,7 +2306,8 @@ mod tests {
                 ][..],
             ),
         ]);
-        let Found::All { under, .. } = shape(&index, b"@n:[1 5] fox", b"u:1") else {
+        let node = parsed(&index, b"@n:[1 5] fox");
+        let Found::All { under, .. } = shape(&index, &node, b"u:1") else {
             panic!("an intersection of a range and a word");
         };
         assert!(matches!(under.first(), Some(Found::Term(_))));
