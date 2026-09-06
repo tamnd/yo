@@ -125,11 +125,27 @@
 //! only done when the scorer that was asked for divides by it, which the default
 //! one does not.
 //!
+//! # A vector clause
+//!
+//! Measured rather than walked. Every other step here answers where the next
+//! document at or after a number is, and a nearest neighbour question has no
+//! such answer until every candidate has been measured, so the whole clause is
+//! worked out at once and handed back in document number order like everything
+//! else. The distance rides along on the hit, because this is the only place
+//! that has both vectors and the reply is the only place that wants the number.
+//!
+//! A clause that narrowed the index down first is walked first and only what it
+//! answered is measured. That is what the query means as well as what is quick:
+//! `alpha=>[KNN 5 @v $B]` is the five nearest of the documents that say alpha,
+//! not the alpha ones among the five nearest overall.
+//!
 //! # What is not walked yet
 //!
-//! A geo filter and a vector query, which need fields the document reader does
-//! not read yet, so there is nothing in the index to walk even when there is a
-//! node for it. Both answer nothing rather than answering wrongly.
+//! A geo shape, which needs a field the document reader does not read yet, so
+//! there is nothing in the index to walk even when there is a node for it. It
+//! answers nothing rather than answering wrongly.
+
+use std::collections::BTreeMap;
 
 use crate::docs::Docs;
 use crate::expand;
@@ -153,12 +169,24 @@ pub struct Hit<'a> {
     /// One unless [`spaced`] was the way in, because working it out costs a
     /// pass over the places and most queries never look at it.
     pub slop: u32,
+    /// How far this document's vector was from the one the query asked about,
+    /// for a query that asked about one.
+    ///
+    /// Carried here rather than worked out again above, because the walk is the
+    /// only place that has both vectors and the reply is the only place that
+    /// needs the number.
+    pub dist: Option<f32>,
 }
 
 impl<'a> Hit<'a> {
     /// A document that answered, with nothing worked out about where.
     fn new(id: Id, found: Found<'a>) -> Hit<'a> {
-        Hit { id, found, slop: 1 }
+        Hit {
+            id,
+            found,
+            slop: 1,
+            dist: None,
+        }
     }
 }
 
@@ -430,8 +458,116 @@ fn build<'a>(held: &'a Held, node: &'a Node) -> Box<dyn Step<'a> + 'a> {
         What::Numeric(range) => Box::new(numbers(held, range)),
         What::Geo(circle) => Box::new(places(held, circle)),
         What::Tag(field, list) => tagged(held, field, list, weight),
-        // Measured against nothing yet, so it answers nothing.
-        What::Vector(_) => Box::new(Never),
+        What::Vector(vector) => Box::new(nearby(held, vector)),
+    }
+}
+
+/// The documents whose vector is nearest a query, or is within a range of it.
+///
+/// A clause that narrowed the index down first is walked first and what it
+/// answered is what gets measured, which is both faster and what the answer
+/// means: `alpha=>[KNN 5 @v $B]` is the five nearest of the documents that say
+/// alpha rather than the alpha ones among the five nearest overall.
+fn nearby<'a>(held: &'a Held, vector: &'a crate::query::Vector) -> Nearby<'a> {
+    let Some(vecs) = held.vecs(&vector.field) else {
+        return Nearby::new(Vec::new(), held.docs.len() as u32);
+    };
+    let Some(asked) = &vector.asked else {
+        return Nearby::new(Vec::new(), held.docs.len() as u32);
+    };
+    let over = vector.over.as_ref().map(|node| {
+        let mut step = build(held, node);
+        drain(&mut step, false)
+    });
+    let narrow = over
+        .as_ref()
+        .map(|hits| hits.iter().map(|hit| hit.id).collect::<Vec<Id>>());
+    let found = match (vector.k, vector.radius) {
+        (Some(k), _) => vecs.nearest(asked, k as usize, narrow.as_deref()),
+        (None, Some(radius)) => vecs.within(asked, radius as f32, narrow.as_deref()),
+        (None, None) => Vec::new(),
+    };
+    // Answered in document number order like every other step, with the
+    // distance carried alongside so that whoever sorts the answer can put it
+    // back in the order the search found it.
+    let mut near: Vec<(Id, f32)> = found
+        .into_iter()
+        .filter(|near| held.docs.get(near.id).is_some())
+        .map(|near| (near.id, near.distance))
+        .collect();
+    near.sort_unstable_by_key(|(id, _)| *id);
+    let guess = near.len() as u32;
+    // What the clause in front matched is carried through rather than dropped,
+    // because a vector clause narrows an answer and does not rescore it: the
+    // three nearest of `(alpha|beta)` come back in the order `alpha|beta` put
+    // them in, with the scores that query gave them, which is measured. With
+    // no clause in front there is nothing to carry and a vector clause scores
+    // the way a range does, which is as a filter.
+    let ids = match over {
+        Some(hits) => {
+            let mut carried: BTreeMap<Id, Found<'a>> =
+                hits.into_iter().map(|hit| (hit.id, hit.found)).collect();
+            near.into_iter()
+                .filter_map(|(id, away)| carried.remove(&id).map(|found| (id, away, found)))
+                .collect()
+        }
+        None => near
+            .into_iter()
+            .map(|(id, away)| (id, away, Found::filter()))
+            .collect(),
+    };
+    Nearby::new(ids, guess)
+}
+
+/// The documents a vector clause found, with how far away each one was and
+/// what the clause in front of it matched in them.
+struct Nearby<'a> {
+    ids: Vec<(Id, f32, Found<'a>)>,
+    at: usize,
+    reads: u64,
+    gave: Option<Id>,
+    guess: u32,
+}
+
+impl<'a> Nearby<'a> {
+    fn new(ids: Vec<(Id, f32, Found<'a>)>, guess: u32) -> Nearby<'a> {
+        Nearby {
+            ids,
+            at: 0,
+            reads: 0,
+            gave: None,
+            guess,
+        }
+    }
+}
+
+impl<'a> Step<'a> for Nearby<'a> {
+    fn seek(&mut self, id: Id) -> Option<Hit<'a>> {
+        while self.at < self.ids.len() && self.ids[self.at].0 < id {
+            self.at += 1;
+        }
+        let (found, distance, what) = self.ids.get(self.at)?;
+        let (found, distance) = (*found, *distance);
+        let what = what.clone();
+        if self.gave != Some(found) {
+            self.gave = Some(found);
+            self.reads += 1;
+        }
+        let mut hit = Hit::new(found, what);
+        hit.dist = Some(distance);
+        Some(hit)
+    }
+
+    fn size(&self) -> u32 {
+        self.guess
+    }
+
+    fn empty(&self) -> bool {
+        self.ids.is_empty()
+    }
+
+    fn ran(&self) -> Ran {
+        Ran::leaf("VECTOR", self.reads)
     }
 }
 

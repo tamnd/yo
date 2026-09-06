@@ -158,6 +158,7 @@ pub mod synonyms;
 pub mod tags;
 pub mod text;
 pub mod token;
+pub mod vecs;
 pub mod walk;
 pub mod words;
 

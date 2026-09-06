@@ -32,6 +32,7 @@ use crate::query::{Circle, EVERY, Mask, Node, Pair, Range, Vector, What, Word, e
 use crate::synonyms;
 use crate::text;
 use crate::token::{bare, control, escapes, fold, wordy};
+use crate::vecs;
 use yo_common::geo;
 
 /// Why a query was refused.
@@ -65,6 +66,26 @@ pub enum Bad {
     },
     /// An attribute clause named something that is not an attribute.
     Attribute(Box<[u8]>),
+    /// The vector a query passed is not the size the field holds.
+    Blob {
+        /// How many bytes the client sent.
+        got: usize,
+        /// How many the field's width and dimension come to.
+        want: usize,
+    },
+    /// A `KNN` asked for more neighbours than a real server will count to.
+    Large,
+    /// A `KNN` took its count from a parameter that does not hold one.
+    Count {
+        /// The parameter, spelled the way the query spelled it.
+        name: Box<[u8]>,
+        /// What was passed under that name.
+        value: Box<[u8]>,
+    },
+    /// A range was given a radius below zero, printed the way a real server
+    /// prints it back, which is the number and not the text: a radius written
+    /// `-1e2` comes back as `-100`.
+    Radius(Box<[u8]>),
     /// An attribute was given something it cannot hold.
     Value {
         /// The attribute, spelled the way the client spelled it.
@@ -81,6 +102,34 @@ pub enum Bad {
     /// Something a real server words for itself, such as a field that cannot be
     /// matched the way the query asked for.
     Refused(&'static str),
+}
+
+/// The most neighbours a `KNN` may ask for, which a real server names in the
+/// line it refuses a bigger count with.
+pub const MOST_NEIGHBOURS: u64 = 288_230_376_151_711_744;
+
+/// The same bound as a double, which is how the count written into a query is
+/// compared against it.
+fn most() -> f64 {
+    MOST_NEIGHBOURS as f64
+}
+
+/// A `KNN` count that arrived through `PARAMS`, read the way a real server
+/// reads one.
+///
+/// This is not how the same digits are read in the query text, and both are
+/// measured. A parameter may have spaces in front of it and may carry a plus,
+/// and neither is allowed in the query. A point, a base marker and a minus are
+/// refused either way, and so is a number too big to hold, which comes back as
+/// a bad parameter rather than as a count that is too large.
+fn whole(value: &[u8]) -> Option<u64> {
+    let start = value.iter().position(|b| !b.is_ascii_whitespace())?;
+    let rest = &value[start..];
+    let digits = rest.strip_prefix(b"+").unwrap_or(rest);
+    if digits.is_empty() || !digits.iter().all(u8::is_ascii_digit) {
+        return None;
+    }
+    String::from_utf8_lossy(digits).parse::<u64>().ok()
 }
 
 /// The wording a real server uses for a geo filter in a unit it does not know.
@@ -656,6 +705,21 @@ impl Parse<'_> {
             _ => return Box::default(),
         };
         self.src[from..self.word_end(from)].into()
+    }
+
+    /// Where a `KNN` count written at `at` ends, which is the next space, the
+    /// field after it or the bracket that shuts the clause.
+    ///
+    /// Wider than a word on purpose, so that `-1`, `1.5` and `0x10` each come
+    /// back whole and an error can quote the lot rather than the first byte of
+    /// it that happens to be a letter.
+    fn counted(&self, at: usize) -> usize {
+        let mut end = at;
+        while matches!(self.src.get(end), Some(b) if !b.is_ascii_whitespace() && *b != b'@' && *b != b']')
+        {
+            end += 1;
+        }
+        end
     }
 
     /// Where a pattern written at `at` begins and what is in it, for an error
@@ -2452,6 +2516,40 @@ impl Parse<'_> {
         Ok(Node::new(What::Geo(circle)))
     }
 
+    /// The vector a clause named, read at the width the field it names holds.
+    ///
+    /// `None` for a parameter that was never passed, which [`Self::param`] has
+    /// already recorded and which is reported once the whole query has parsed,
+    /// so complaining about the size of the nothing that stood in for it would
+    /// be complaining about the wrong thing.
+    ///
+    /// # Errors
+    ///
+    /// [`Bad::Blob`] when the bytes are not the number of coordinates the field
+    /// declared, which is the one thing that can be wrong about a vector and is
+    /// checked here because this is where the field is known.
+    fn asked(&mut self, field: &[u8], name: &[u8]) -> Result<Option<Box<[f32]>>, Bad> {
+        let raw = self.param(name);
+        if !self.ask.params.iter().any(|(k, _)| **k == *name) {
+            return Ok(None);
+        }
+        let Some(held) = self.index.field(field) else {
+            return Ok(None);
+        };
+        let Kind::Vector(held) = &held.kind else {
+            return Ok(None);
+        };
+        let want = held.width.bytes() * held.dim as usize;
+        let read = vecs::read(held.width, &raw).filter(|read| read.len() as u64 == held.dim);
+        match read {
+            Some(read) => Ok(Some(read.into())),
+            None => Err(Bad::Blob {
+                got: raw.len(),
+                want,
+            }),
+        }
+    }
+
     /// `[VECTOR_RANGE radius $param]`.
     fn vector_range(&mut self, name: &[u8]) -> Result<Node, Bad> {
         self.spaces();
@@ -2463,14 +2561,21 @@ impl Parse<'_> {
         };
         self.spaces();
         let param = self.dollar()?;
-        self.param(&param);
+        let asked = self.asked(name, &param)?;
         self.spaces();
         if !self.eat(b']') {
             return Err(self.syntax());
         }
+        // Checked here rather than where the number was read, because a real
+        // server settles the vector first: a range with both a negative radius
+        // and a parameter that is the wrong size reports the size.
+        if radius < 0.0 {
+            return Err(Bad::Radius(radius.to_string().into_bytes().into()));
+        }
         let vector = Vector {
             field: name.into(),
             param,
+            asked,
             k: None,
             radius: Some(radius),
             alias: None,
@@ -3277,19 +3382,39 @@ impl Parse<'_> {
             self.word = name.clone();
             Some(name)
         } else {
+            // A count written out in the query is a token of its own and is
+            // checked where it stands, ahead of the field and ahead of the
+            // vector, which is measured: `KNN abc @v $nope` names the count
+            // and not the parameter that was never passed. It runs to the next
+            // space, field or bracket and has to be digits and nothing else,
+            // so a sign, a point or a base marker is refused here.
             let held = self.mark;
-            if self.token().is_empty() {
-                // Nothing was read, so the keyword before it is still the last
-                // token and is what an error points at.
-                self.mark = held;
+            let end = self.counted(at);
+            let written = &self.src[at..end];
+            if written.is_empty() || !written.iter().all(u8::is_ascii_digit) {
+                let near = match written.is_empty() {
+                    true => self.near_at(at),
+                    false => written.into(),
+                };
+                if near.is_empty() {
+                    // Nothing was read, so the keyword before it is still the
+                    // last token and is what an error points at.
+                    self.mark = held;
+                } else {
+                    self.word = near;
+                }
+                return Err(self.syntax_at(at));
             }
+            self.at = end;
+            self.mark = at;
+            self.word = written.into();
             None
         };
         let count = self.src[at..self.at].to_vec();
         self.spaces();
         let spot = self.at;
         if !self.eat(b'@') {
-            return Err(self.syntax());
+            return Err(self.syntax_near());
         }
         let field = self.token();
         // The sign is part of the field token, so an error after it points at
@@ -3298,17 +3423,38 @@ impl Parse<'_> {
         self.expect(&field, spot, Want::Vector)?;
         self.spaces();
         let param = self.dollar()?;
-        self.param(&param);
-        let count = match held {
-            Some(name) => self.param(&name),
-            None => count.into(),
-        };
-        let Ok(k) = String::from_utf8_lossy(&count).parse::<u64>() else {
-            return Err(self.syntax_at(at));
+        let asked = self.asked(&field, &param)?;
+        let k = match held {
+            Some(name) => {
+                let value = self.param(&name);
+                let Some(read) = whole(&value) else {
+                    return Err(Bad::Count { name, value });
+                };
+                if read > MOST_NEIGHBOURS {
+                    return Err(Bad::Large);
+                }
+                read
+            }
+            // Digits already, so the only thing left to go wrong is the size.
+            // Read as a double the way a real server reads it, which is why a
+            // count a little over the bound still gets in: doubles that big sit
+            // sixty four apart, so the bound plus thirty two rounds back onto
+            // the bound and the bound plus thirty three does not, and that is
+            // exactly where a real server starts refusing.
+            None => {
+                let read = String::from_utf8_lossy(&count)
+                    .parse::<f64>()
+                    .unwrap_or(f64::INFINITY);
+                if read > most() {
+                    return Err(Bad::Large);
+                }
+                read as u64
+            }
         };
         let mut vector = Vector {
             field,
             param,
+            asked,
             k: Some(k),
             radius: None,
             alias: None,
@@ -3372,7 +3518,19 @@ impl Parse<'_> {
     /// `$name`, which is how a query refers to something passed with `PARAMS`.
     fn dollar(&mut self) -> Result<Box<[u8]>, Bad> {
         if !self.eat(b'$') {
-            return Err(self.syntax());
+            // Whatever stands where the parameter should have been is what the
+            // error names, and the word before it when there is nothing there:
+            // `[KNN 3 @v q]` names `q` and `[KNN 3 @v ]` names `v`. A sign is
+            // not the start of a word, so something like `-1` is read the way
+            // a count is read rather than being passed over.
+            let mut near = self.near_at(self.at);
+            if near.is_empty() {
+                near = self.src[self.at..self.counted(self.at)].into();
+            }
+            if near.is_empty() {
+                near = self.word.clone();
+            }
+            return Err(Bad::Syntax { at: self.at, near });
         }
         let name = self.word();
         if name.is_empty() {
