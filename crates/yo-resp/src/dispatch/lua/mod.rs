@@ -34,6 +34,15 @@
 //! scripting is not a performance path, and this is the one place in the crate
 //! where that is the whole design.
 //!
+//! # The libraries that came with the interpreter
+//!
+//! A script gets more than the `redis` table. Redis links four libraries into
+//! its Lua and a script written against Redis calls them without thinking about
+//! where they came from, so they are part of the surface and not an extra. Each
+//! one lives in its own module here, with the arithmetic in Rust and the
+//! argument checking in the prelude, for the same reason the `redis` table
+//! splits the same way: a message a script reads has to be raised from Lua.
+//!
 //! # Where the error handling lives
 //!
 //! In Lua, not here, because that is where a real server puts it. The prelude
@@ -44,6 +53,7 @@
 //! value across the boundary, and a raised value can be any Lua value at all.
 
 mod api;
+mod bit;
 mod convert;
 mod sha1;
 
@@ -337,9 +347,13 @@ fn interpreter() -> mlua::Result<Lua> {
     let boot: Table = lua.load(PRELUDE).set_name("@lua_prelude").call(())?;
     let raw: Table = boot.raw_get("raw")?;
     api::statics(&lua, &raw)?;
+    bit::statics(&lua, &raw)?;
     let lib: Table = boot.raw_get("lib")?;
     let written: Table = boot.raw_get("written")?;
     api::bridges(&lua, &lib, &written)?;
+    let bitlib: Table = boot.raw_get("bitlib")?;
+    let written_bit: Table = boot.raw_get("written_bit")?;
+    api::bit_bridges(&lua, &bitlib, &written_bit)?;
     lua.set_named_registry_value("yo_run", boot.raw_get::<mlua::Function>("run")?)?;
     lua.set_named_registry_value("yo_raw", raw)?;
     Ok(lua)
@@ -405,7 +419,7 @@ local function readonly()
   error('Attempt to modify a readonly table', 2)
 end
 
--- `redis` as a script sees it is an empty table in front of the real one.
+-- A library as a script sees it is an empty table in front of the real one.
 --
 -- It has to be empty. Lua 5.1 only calls `__newindex` for a key a table does
 -- not already have, so a guard on a table that holds its own functions guards
@@ -415,9 +429,20 @@ end
 -- table in front costs one more lookup per call and closes it here. What it
 -- would cost a script is `pairs(redis)`, and the three readers further down
 -- give that back.
-local front = {__index = lib, __newindex = readonly}
-local proxy = setmetatable({}, front)
-rawset(_G, 'redis', proxy)
+--
+-- Every library gets one, so the list here is the list of tables a script can
+-- read and cannot change.
+local shielded = {}
+
+local function shield(name, real)
+  local front = {__index = real, __newindex = readonly}
+  local proxy = setmetatable({}, front)
+  shielded[#shielded + 1] = {proxy = proxy, front = front, real = real}
+  rawset(_G, name, proxy)
+  return proxy
+end
+
+local proxy = shield('redis', lib)
 
 -- `redis.pcall` is the one that reaches the server and it answers a table with
 -- an `err` field when the command failed. `redis.call` is the same call with
@@ -537,6 +562,86 @@ lib.replicate_commands = function() return true end
 lib.breakpoint = function() return false end
 lib.debug = function() return false end
 
+-- The `bit` library, which is Mike Pall's and is what a script reaches for when
+-- it has to work on a word rather than on a number. Lua 5.1 has doubles and
+-- nothing else, so without this a script cannot and two flags together.
+--
+-- The arithmetic is in Rust and the checking is here, because a Rust callback
+-- cannot raise the sentence a real server raises and this can. What counts as a
+-- number is what Lua counts as one, so the string '0x10' is sixteen and the
+-- boolean true is a mistake. The position in front of the message is the
+-- script's own line, which is what a level of three works out to from inside a
+-- helper called by a wrapper called by the script.
+local bitlib = {}
+local written_bit = {}
+
+-- What a bad argument reads like. The name is the one the call site used rather
+-- than the one the function was defined under, which is why
+-- `pcall(bit.band, 'x')` complains about a function called `?`, and the level is
+-- the script's own frame counted through the wrapper and the C function in
+-- front of it.
+local function word(i, n, value)
+  local why
+  if i > n then
+    why = 'no value'
+  else
+    local x = tonumber(value)
+    if x ~= nil then return x end
+    why = type(value)
+  end
+  local at = dbg.getinfo(3, 'n')
+  local name = (at and at.name) or '?'
+  error("bad argument #" .. i .. " to '" .. name .. "' (number expected, got " .. why .. ")", 4)
+end
+
+-- The three that take as many arguments as a script cares to hand them. The
+-- first is a word on its own, so `bit.band(x)` is `bit.tobit(x)`, and the rest
+-- are folded into it one pair at a time.
+for _, name in ipairs({'band', 'bor', 'bxor'}) do
+  local key = 'bit_' .. name
+  written_bit[name] = function(...)
+    local n = select('#', ...)
+    local acc = raw.bit_tobit(word(1, n, (select(1, ...))))
+    for i = 2, n do
+      acc = raw[key](acc, word(i, n, (select(i, ...))))
+    end
+    return acc
+  end
+end
+
+-- The three that take one value and nothing else.
+for _, name in ipairs({'tobit', 'bnot', 'bswap'}) do
+  local key = 'bit_' .. name
+  written_bit[name] = function(...)
+    return raw[key](word(1, select('#', ...), (select(1, ...))))
+  end
+end
+
+-- The five that take a value and a count. Only the low five bits of the count
+-- are read, which is what the hardware does, so a shift of thirty two moves
+-- nothing and `bit.lshift(1, 33)` is two.
+for _, name in ipairs({'lshift', 'rshift', 'arshift', 'rol', 'ror'}) do
+  local key = 'bit_' .. name
+  written_bit[name] = function(...)
+    local n = select('#', ...)
+    local x = word(1, n, (select(1, ...)))
+    return raw[key](x, word(2, n, (select(2, ...))))
+  end
+end
+
+-- The one with a default. Eight digits unless a count says otherwise, and a
+-- negative count asks for upper case rather than for a different number of
+-- them.
+written_bit.tohex = function(...)
+  local n = select('#', ...)
+  local x = word(1, n, (select(1, ...)))
+  local digits = 8
+  if n > 1 then digits = word(2, n, (select(2, ...))) end
+  return raw.bit_tohex(x, digits)
+end
+
+shield('bit', bitlib)
+
 -- A failure that is a table with an `err` field reaches a script as the string
 -- inside it rather than as the table. That is what a real server does and it is
 -- what every script that prints the error it caught depends on.
@@ -640,10 +745,10 @@ setmetatable(_G, guard)
 -- an empty table with a guard of its own rather than the real one.
 local shadow = setmetatable({}, {__newindex = readonly})
 local hidden = {}
-hidden[proxy] = false
 hidden[env] = false
 hidden[shadow] = false
 hidden[_G] = shadow
+for _, one in ipairs(shielded) do hidden[one.proxy] = false end
 
 local rawrawset, rawgetmeta, rawsetmeta = rawset, getmetatable, setmetatable
 rawset(_G, 'rawset', function(t, name, value)
@@ -677,7 +782,7 @@ end)
 -- skip `__index`. Everything else already goes through the metatable and
 -- already sees the real names.
 local mirror = {}
-mirror[proxy] = lib
+for _, one in ipairs(shielded) do mirror[one.proxy] = one.real end
 
 local rawrawget, rawnext, rawpairs = rawget, next, pairs
 rawset(_G, 'rawget', function(t, name)
@@ -728,19 +833,20 @@ local function restore()
     name, value = next(_G, name)
   end
   setmetatable(_G, guard)
-  setmetatable(proxy, front)
+  for _, one in ipairs(shielded) do setmetatable(one.proxy, one.front) end
 end
 
 local function run(chunk)
   setfenv(chunk, env)
   local ok, result = rawxpcall(chunk, handler)
   wipe(env)
-  wipe(proxy)
+  for _, one in ipairs(shielded) do wipe(one.proxy) end
   restore()
   return ok, result
 end
 
-return {run = run, raw = raw, lib = lib, written = written}
+return {run = run, raw = raw, lib = lib, written = written,
+        bitlib = bitlib, written_bit = written_bit}
 "#;
 
 #[cfg(test)]
@@ -769,7 +875,7 @@ mod tests {
         // interpreter is this list and a running script is this list plus two.
         assert_eq!(
             names(&lua.globals()),
-            "_G _VERSION __redis__err__handler assert collectgarbage coroutine error \
+            "_G _VERSION __redis__err__handler assert bit collectgarbage coroutine error \
              gcinfo getmetatable ipairs load loadstring math next os pairs pcall rawequal \
              rawget rawset redis select setmetatable string table tonumber tostring type \
              unpack xpcall"

@@ -194,38 +194,61 @@ unsafe fn forward(state: *mut mlua::lua_State, key: *const c_char) -> c_int {
 /// The frame survives, and because the jump out of a failure goes through C
 /// rather than through Rust, what the script raised is still the table it
 /// raised rather than something wrapped on the way past.
+///
+/// One group of names per library, because the registry key a bridge reads from
+/// is written into the C function at compile time and two libraries may want
+/// the same name.
 macro_rules! bridges {
-    ($($rust:ident => $name:literal,)*) => {
+    ($($group:ident($prefix:literal) { $($rust:ident => $name:literal,)* })*) => {
         $(
-            unsafe extern "C-unwind" fn $rust(state: *mut mlua::lua_State) -> c_int {
-                // SAFETY: Lua is the only caller and the name is a literal with
-                // its terminator written into it, so it is a C string.
-                unsafe { forward(state, concat!("yo_", $name, "\0").as_ptr().cast()) }
+            $(
+                unsafe extern "C-unwind" fn $rust(state: *mut mlua::lua_State) -> c_int {
+                    // SAFETY: Lua is the only caller and the name is a literal
+                    // with its terminator written into it, so it is a C string.
+                    unsafe { forward(state, concat!("yo_", $prefix, $name, "\0").as_ptr().cast()) }
+                }
+            )*
+
+            /// Put a C function on the library for each Lua one the prelude wrote.
+            pub(super) fn $group(lua: &Lua, lib: &Table, written: &Table) -> mlua::Result<()> {
+                $(
+                    let body: mlua::Function = written.raw_get($name)?;
+                    lua.set_named_registry_value(concat!("yo_", $prefix, $name), &body)?;
+                    // SAFETY: the function is the one just above, and all it
+                    // does is hand the call on to a Lua function that is in the
+                    // registry before the name it is under is reachable.
+                    lib.raw_set($name, unsafe { lua.create_c_function($rust) }?)?;
+                )*
+                Ok(())
             }
         )*
-
-        /// Put a C function on the library for each Lua one the prelude wrote.
-        pub(super) fn bridges(lua: &Lua, lib: &Table, written: &Table) -> mlua::Result<()> {
-            $(
-                let body: mlua::Function = written.raw_get($name)?;
-                lua.set_named_registry_value(concat!("yo_", $name), &body)?;
-                // SAFETY: the function is the one just above, and all it does
-                // is hand the call on to a Lua function that is in the registry
-                // before the name it is under is reachable.
-                lib.raw_set($name, unsafe { lua.create_c_function($rust) }?)?;
-            )*
-            Ok(())
-        }
     };
 }
 
 bridges! {
-    bridge_call => "call",
-    bridge_sha1hex => "sha1hex",
-    bridge_setresp => "setresp",
-    bridge_log => "log",
-    bridge_set_repl => "set_repl",
-    bridge_acl_check_cmd => "acl_check_cmd",
+    bridges("") {
+        bridge_call => "call",
+        bridge_sha1hex => "sha1hex",
+        bridge_setresp => "setresp",
+        bridge_log => "log",
+        bridge_set_repl => "set_repl",
+        bridge_acl_check_cmd => "acl_check_cmd",
+    }
+
+    bit_bridges("bit_") {
+        bridge_tobit => "tobit",
+        bridge_tohex => "tohex",
+        bridge_bnot => "bnot",
+        bridge_bswap => "bswap",
+        bridge_band => "band",
+        bridge_bor => "bor",
+        bridge_bxor => "bxor",
+        bridge_lshift => "lshift",
+        bridge_rshift => "rshift",
+        bridge_arshift => "arshift",
+        bridge_rol => "rol",
+        bridge_ror => "ror",
+    }
 }
 
 /// Put the two functions that need the server into the raw table for one run.
