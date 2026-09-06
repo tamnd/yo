@@ -268,6 +268,16 @@ mod tests {
     /// purpose. Everything below the window comes off the device, several
     /// borrows are alive at once because that is what reading a chained value
     /// looks like, and they all still say what was put in them.
+    ///
+    /// Not under Miri, because the window is the claim. The pages are 32 MiB
+    /// and the log keeps three of them, so anything that fits in memory never
+    /// reaches the device and the test passes without having tried the path it
+    /// is named after. Four pages is 128 MiB written and read back in 64 KiB
+    /// chunks, which is a few minutes interpreted and rather more resident than
+    /// a runner has to spare. The borrows the interpreter would have an opinion
+    /// about are the same ones `yo_kv::cold` takes a few chunks at a time in its
+    /// own tests, and those do run there.
+    #[cfg_attr(miri, ignore = "128 MiB, and the volume is the claim")]
     #[test]
     fn chunks_past_the_resident_window_read_back_off_the_device() {
         let path = tmp("window");

@@ -171,18 +171,30 @@ jobs:
       # four at a time. If that crate ever stops being the slowest, this special
       # case should go.
       #
-      # `yo-resp` is the other exception and gets six, for a different reason:
-      # it is not one heavy test but six hundred and thirty of them, which is a
-      # third of every test in the workspace. Miri spends about six seconds
-      # starting a process before it runs a line of the test in it, and nextest
-      # gives every test its own process, so the floor for that crate is over
-      # an hour before the tests themselves are counted. Nothing in the source
-      # can be shrunk to fix that, because the cost is per test rather than per
-      # operation. Splitting the crate by count is the only lever, and nextest
-      # does the splitting itself, so no list of test names has to be kept true
-      # here as tests are added. Six rather than four because a quarter of the
-      # crate is a quarter of an hour on a laptop with nothing else running,
-      # and a runner is neither.
+      # The rest of the exceptions are split by count, and the table in the step
+      # below says how many ways each one goes. They are there for a different
+      # reason than `yo-record`. Miri spends about six seconds starting a
+      # process before it runs a line of the test in it, and nextest gives
+      # every test its own process, so a crate with a thousand tests has a floor
+      # of hours before any of them does any work, and nothing in the source can
+      # be shrunk to fix that because the cost is per test rather than per
+      # operation. On top of the floor these crates have tests that are minutes
+      # each interpreted, which is what they cost: a recall measurement over a
+      # few thousand vectors is a few thousand times the arithmetic of an
+      # ordinary test, and it is measuring recall, so there is no smaller
+      # version of it that measures the same thing.
+      #
+      # Splitting by count is the only lever that costs nothing. It weakens no
+      # test, and nextest does the splitting itself, so no list of test names
+      # has to be kept true here as tests are added. The numbers came from
+      # running each crate under Miri with every test capped at two minutes and
+      # counting what went over. They are worth revisiting when a shard starts
+      # timing out or when they all finish in five minutes.
+      #
+      # Runner minutes are free on a public repository and the concurrency limit
+      # is what actually bounds this, so the shards run in waves rather than all
+      # at once. That is the right trade for a job that runs at three in the
+      # morning against nothing.
       - id: shards
         run: |
           rm rust-toolchain.toml
@@ -192,13 +204,16 @@ jobs:
           # which is a syntax error the runner reports six lines away from the
           # cause. The run step below passes each field as its own argument.
           echo "list=$(cargo metadata --no-deps --format-version 1 | jq -c '
-            [ .packages[].name
-              | select(. != "yo-record" and . != "yo-resp")
-              | {id: ., pkg: ., filter: "", part: ""} ]
+            { "yo-kv": 12, "yo-resp": 6, "yo-vector": 6, "yo-doc": 4,
+              "yo-graph": 4, "yo-index": 3, "yo-cli": 2 } as $split
+            | [ .packages[].name
+                | select(. != "yo-record" and ($split[.] | not))
+                | {id: ., pkg: ., filter: "", part: ""} ]
             + [ {id: "yo-record-compact", pkg: "yo-record", filter: "test(/^compact::/)", part: ""},
                 {id: "yo-record-rest", pkg: "yo-record", filter: "not test(/^compact::/)", part: ""} ]
-            + [ range(1; 7)
-                | {id: "yo-resp-\(.)", pkg: "yo-resp", filter: "", part: "count:\(.)/6"} ]
+            + [ $split | to_entries[] as $s
+                | range(1; $s.value + 1)
+                | {id: "\($s.key)-\(.)", pkg: $s.key, filter: "", part: "count:\(.)/\($s.value)"} ]
             | sort_by(.id)')" >> "$GITHUB_OUTPUT"
       - run: echo "deep checks requested for ${{ github.event.inputs.ref || github.ref }}"
 
