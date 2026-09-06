@@ -2226,6 +2226,14 @@ impl Parse<'_> {
             }
         }
         if broke.is_some() || !self.eat(b':') {
+            // A comparison written where the colon belongs narrows a numeric
+            // field the way a bracket does, so `@n>2` asks what `@n:[(2 +inf]`
+            // asks. Only a name list that held together can carry one.
+            if broke.is_none()
+                && let Some(node) = self.compared(&names)?
+            {
+                return Ok(node);
+            }
             // A modifier with no colon after it is a modifier that named a
             // field and then did nothing with it. A field nobody has heard of
             // is worth saying so about, and a real one is a plain syntax error
@@ -2284,6 +2292,137 @@ impl Parse<'_> {
             Some(b'{') => self.tag(&names[0].0, names[0].1),
             _ => self.scoped(&names),
         }
+    }
+
+    /// A comparison against a numeric field, which is the second dialect's
+    /// shorthand for a range: `@n>2`, `@n>=2`, `@n<2`, `@n<=2`, `@n==2` and
+    /// `@n!=2`.
+    ///
+    /// Answers `None` when there is no comparison here at all, which leaves the
+    /// caller to refuse the modifier itself. The signs are read as one run so
+    /// that a run nobody has a reading for is refused past the whole of it
+    /// rather than partway through, which is where a real server refuses
+    /// `@n===2`.
+    fn compared(&mut self, names: &[(Box<[u8]>, usize)]) -> Result<Option<Node>, Bad> {
+        let save = self.at;
+        self.spaces();
+        let head = self.at;
+        let mut end = head;
+        while matches!(self.src.get(end), Some(b'=' | b'<' | b'>' | b'!')) {
+            end += 1;
+        }
+        // `=>` is the arrow in front of a vector clause and never the start of
+        // a comparison, whatever is written after it.
+        if end == head || self.src[head..end].starts_with(b"=>") {
+            self.at = save;
+            return Ok(None);
+        }
+        // A part of a union that may not name a field has nowhere to put a
+        // comparison either.
+        if self.barred.is_some() {
+            let (name, spot) = &names[0];
+            return Err(Bad::Syntax {
+                at: *spot,
+                near: name.clone(),
+            });
+        }
+        // A list of names is a text thing, so a list is refused at the first
+        // name that cannot hold text before the comparison is looked at at all.
+        if names.len() > 1 {
+            for (name, at) in names {
+                self.expect(name, *at, Want::Text)?;
+            }
+        }
+        let (name, at) = &names[0];
+        self.expect(name, *at, Want::Numeric)?;
+        let sign: Box<[u8]> = self.src[head..end].into();
+        self.at = end;
+        self.spaces();
+        // Nothing after the signs leaves the error pointing back at the
+        // modifier, which is the only thing left in the query to name.
+        if self.done() {
+            return Err(self.syntax_at(self.mark));
+        }
+        // The first dialect has no reading for a comparison at all, so the
+        // value after one is read by the ordinary word rules, where a `+` is a
+        // splitter and not the sign of a number.
+        while self.ask.dialect == 1 && self.peek() == Some(b'+') {
+            self.at += 1;
+        }
+        let spot = self.at;
+        let word = if self.peek() == Some(b'$') {
+            self.mark = self.at;
+            self.at += 1;
+            let named = self.word();
+            if named.is_empty() || self.ask.dialect == 1 {
+                return Err(Bad::Syntax {
+                    at: spot,
+                    near: named,
+                });
+            }
+            self.param(&named)
+        } else {
+            self.number_word()
+        };
+        if word.is_empty() {
+            // A value in quotes is quoted by what is between them, single ones
+            // as well as double, and neither is a number whatever is in there.
+            let near = match self.src.get(spot) {
+                Some(b'\'') => self.src[spot + 1..]
+                    .iter()
+                    .position(|b| *b == b'\'')
+                    .map(|end| self.src[spot + 1..spot + 1 + end].into())
+                    .unwrap_or_default(),
+                _ => self.near_at(spot),
+            };
+            let near = if near.is_empty() {
+                self.word.clone()
+            } else {
+                near
+            };
+            return Err(Bad::Syntax { at: spot, near });
+        }
+        self.mark = spot;
+        self.word = word.clone();
+        // The signs and the value are answered for in the same place, because
+        // a real server reads the value before it decides whether it had a
+        // reading for the signs at all. The first dialect has no reading for
+        // any of them, which is why it refuses `@n>2` at the `2`.
+        let known =
+            self.ask.dialect >= 2 && matches!(&*sign, b">" | b">=" | b"<" | b"<=" | b"==" | b"!=");
+        let text = String::from_utf8_lossy(&word).into_owned();
+        let Some(value) = number(&text).filter(|_| known) else {
+            return Err(Bad::Syntax {
+                at: spot,
+                near: word,
+            });
+        };
+        self.fielded = true;
+        // A comparison leaves nothing quoted behind it, unlike a bracket, so
+        // whatever is refused after `@n>2` names an offset and no word.
+        self.word = Box::default();
+        if self.index.field(name).is_none() {
+            return Ok(Some(Node::empty()));
+        }
+        let (min, max, min_open, max_open) = match &*sign {
+            b">" => (value, f64::INFINITY, true, false),
+            b">=" => (value, f64::INFINITY, false, false),
+            b"<" => (f64::NEG_INFINITY, value, false, true),
+            b"<=" => (f64::NEG_INFINITY, value, false, false),
+            _ => (value, value, false, false),
+        };
+        let range = Node::new(What::Numeric(Range {
+            field: name.clone(),
+            min,
+            max,
+            min_open,
+            max_open,
+        }));
+        Ok(Some(if &*sign == b"!=" {
+            Node::new(What::Not(Box::new(range)))
+        } else {
+            range
+        }))
     }
 
     /// A modifier over text, which narrows everything it reaches to a field set.
@@ -4485,6 +4624,62 @@ mod tests {
             ..Ask::default()
         };
         parse(query.as_bytes(), &index, &ask).expect_err("the query is refused")
+    }
+
+    /// The six comparisons and the ranges they stand for.
+    #[test]
+    fn a_comparison_is_the_range_it_stands_for() {
+        assert_eq!(shown("@n>2", 2), "NUMERIC {2.000000 < @n <= inf}\n");
+        assert_eq!(shown("@n>=2", 2), "NUMERIC {2.000000 <= @n <= inf}\n");
+        assert_eq!(shown("@n<2", 2), "NUMERIC {-inf <= @n < 2.000000}\n");
+        assert_eq!(shown("@n<=2", 2), "NUMERIC {-inf <= @n <= 2.000000}\n");
+        assert_eq!(shown("@n==2", 2), "NUMERIC {2.000000 <= @n <= 2.000000}\n");
+        assert_eq!(
+            shown("@n!=2", 2),
+            "NOT{\n  NUMERIC {2.000000 <= @n <= 2.000000}\n}\n"
+        );
+    }
+
+    /// Space is allowed on both sides of the signs, and the value may be a
+    /// name, a decimal or an infinity.
+    #[test]
+    fn a_comparison_takes_its_value_the_way_a_bracket_takes_one() {
+        assert_eq!(shown("@n >= 2", 2), "NUMERIC {2.000000 <= @n <= inf}\n");
+        assert_eq!(shown("@n> -1.5", 2), "NUMERIC {-1.500000 < @n <= inf}\n");
+        assert_eq!(shown("@n>+inf", 2), "NUMERIC {inf < @n <= inf}\n");
+        assert!(matches!(refused("@n<$nope", 2), Bad::Missing(_)));
+    }
+
+    /// The first dialect has no reading for one, and refuses it at the value.
+    #[test]
+    fn only_the_second_dialect_reads_a_comparison() {
+        assert!(matches!(refused("@n>2", 1), Bad::Syntax { at: 3, .. }));
+    }
+
+    /// A run of signs nobody has a reading for is refused past the whole run,
+    /// and `=>` is the vector arrow rather than the start of one.
+    #[test]
+    fn a_comparison_is_refused_at_the_value_after_the_signs() {
+        assert!(matches!(refused("@n=2", 2), Bad::Syntax { at: 3, .. }));
+        assert!(matches!(refused("@n===2", 2), Bad::Syntax { at: 5, .. }));
+        assert!(matches!(refused("@n<>2", 2), Bad::Syntax { at: 4, .. }));
+        assert!(matches!(refused("@n>abc", 2), Bad::Syntax { at: 3, .. }));
+        assert!(matches!(refused("@n=>2", 2), Bad::Syntax { at: 2, .. }));
+    }
+
+    /// A field that cannot be compared is answered for before the value is
+    /// read, and one nobody has heard of before that.
+    #[test]
+    fn a_comparison_wants_a_numeric_field() {
+        assert!(matches!(
+            refused("@a>2", 2),
+            Bad::Wrong {
+                kind: "NUMERIC",
+                at: 0,
+                ..
+            }
+        ));
+        assert!(matches!(refused("@zz>2", 2), Bad::Unknown { at: 0, .. }));
     }
 
     #[test]
