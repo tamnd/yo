@@ -161,6 +161,55 @@ impl Libraries {
     pub(in crate::dispatch) fn all(&self) -> &[Library] {
         &self.held
     }
+
+    /// Take everything in `other` on, or refuse the lot and change nothing.
+    ///
+    /// This is what `FUNCTION RESTORE` does with the libraries it has already
+    /// built and compiled, and the all or nothing part is the whole point: a
+    /// payload of five libraries where the fourth collides has to leave the
+    /// server exactly as it was, not four fifths restored.
+    ///
+    /// Redis gets that by unlinking, and then linking back on the way out of a
+    /// failure. This checks first and mutates second, which is the same answer
+    /// with no revert to get wrong. The order the two checks are made in is not
+    /// arbitrary either: names first and functions second, because a `REPLACE`
+    /// that drops a library also drops the functions in it, so asking about the
+    /// functions before the drops are known would refuse a restore that is fine.
+    pub(in crate::dispatch) fn join(&mut self, other: Self, replace: bool) -> Result<()> {
+        let mut dropped: Vec<&str> = Vec::new();
+        for lib in &other.held {
+            if self.library(lib.name.as_bytes()).is_some() {
+                if !replace {
+                    return Err(Error::fmt(
+                        Code::Unsupported,
+                        format_args!("Library {} already exists", lib.name),
+                    ));
+                }
+                dropped.push(&lib.name);
+            }
+        }
+        for lib in &other.held {
+            for f in &lib.funcs {
+                let clash = self.held.iter().any(|held| {
+                    !dropped.contains(&&*held.name)
+                        && held
+                            .funcs
+                            .iter()
+                            .any(|g| g.name.eq_ignore_ascii_case(&f.name))
+                });
+                if clash {
+                    return Err(Error::fmt(
+                        Code::Unsupported,
+                        format_args!("Function {} already exists", f.name),
+                    ));
+                }
+            }
+        }
+        for lib in other.held {
+            self.insert(lib);
+        }
+        Ok(())
+    }
 }
 
 /// What the shebang line said, and where the code after it starts.

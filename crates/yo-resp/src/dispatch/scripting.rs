@@ -27,10 +27,14 @@
 //! A library is a script that is loaded once and called by name forever after,
 //! which is the same trade `SCRIPT LOAD` and `EVALSHA` make and a better one: a
 //! client calls `FCALL addtocart 1 cart:9 sku` instead of shipping a digest it
-//! has to keep in step with a file. `LOAD`, `LIST`, `DELETE`, `FLUSH`, `STATS`
-//! and `KILL` are here. `DUMP` and `RESTORE` are not, because both are about
-//! the RDB payload rather than about libraries and that is the next piece of
-//! work.
+//! has to keep in step with a file. The whole subcommand set is here.
+//!
+//! `DUMP` and `RESTORE` are the pair that move a set of libraries between
+//! servers, and the bytes they use are an RDB payload rather than anything this
+//! server invented, so the framing is over in [`yo_kv::rdb`] with the rest of
+//! the RDB and nothing in this file reads a byte of it. What comes back is the
+//! library code, one string per library, and everything else about a library is
+//! recovered by compiling that code again.
 //!
 //! What is kept here is the registry in [`lua::library`] and nothing else. The
 //! compiled callbacks live in whichever interpreters have run the library,
@@ -43,6 +47,7 @@ use super::table::Spec;
 use super::{Server, Session};
 use crate::reply::Out;
 use yo_common::{Code, Error, Result};
+use yo_kv::rdb;
 
 /// Run one scripting command.
 pub(super) fn execute(
@@ -385,7 +390,7 @@ struct Taken {
     no_writes: bool,
 }
 
-/// `FUNCTION LOAD|LIST|DELETE|FLUSH|STATS|KILL|HELP`.
+/// `FUNCTION LOAD|LIST|DELETE|FLUSH|DUMP|RESTORE|STATS|KILL|HELP`.
 fn function(server: &Server, args: Args<'_>, out: &mut Out) -> Result<()> {
     let sub = args.get(1);
     if is(sub, b"LOAD") {
@@ -450,16 +455,16 @@ fn function(server: &Server, args: Args<'_>, out: &mut Out) -> Result<()> {
             return Err(Error::new(Code::Unsupported, "Library not found"));
         }
         out.ok();
+    } else if is(sub, b"DUMP") {
+        return dump(server, args, out);
+    } else if is(sub, b"RESTORE") {
+        return restore(server, args, out);
     } else if is(sub, b"HELP") {
         if args.len() != 2 {
             return Err(args::wrong_arity_sub("function", "help"));
         }
         super::server::help(out, FUNCTION_HELP);
     } else {
-        // DUMP and RESTORE are not here. Both are about the RDB payload rather
-        // than about libraries, so they land with the rest of that work, and a
-        // client that asks for one gets `unknown subcommand` rather than an
-        // answer that is not one. D-16 says which are which.
         return Err(args::unknown_subcommand(sub, "FUNCTION"));
     }
     Ok(())
@@ -494,66 +499,184 @@ fn load(server: &Server, args: Args<'_>, out: &mut Out) -> Result<()> {
     let code = args.get(args.len() - 1);
 
     yo_alloc::allow(|| {
-        let meta = library::metadata(code)?;
-        if !library::named(&meta.name) {
-            return Err(library::bad_name());
-        }
-        // Case insensitive because the engine dictionary is, which is what makes
-        // `#!LUA` a working shebang, and the name in the reply is `LUA` either
-        // way because that is the engine's own spelling and not the client's.
-        if !meta.engine.eq_ignore_ascii_case(library::ENGINE.as_bytes()) {
-            return Err(Error::fmt(
-                Code::Unsupported,
-                format_args!(
-                    "Engine '{}' not found",
-                    String::from_utf8_lossy(&meta.engine)
-                ),
-            ));
-        }
-        let name = String::from_utf8_lossy(&meta.name).into_owned();
-        let at = code.len() - meta.body.len();
-        let sha = lua::fingerprint(code);
-
         // Held across the compile, which is safe because a library cannot call
         // a command while it is loading: the only names it can reach are the
         // eight that describe it to the server.
         let mut held = server.libraries.lock();
-        if !replace && held.library(meta.name.as_slice()).is_some() {
-            return Err(Error::fmt(
-                Code::Unsupported,
-                format_args!("Library '{name}' already exists"),
-            ));
-        }
-        let funcs = match lua::install(&name, &sha, meta.body) {
-            Ok(funcs) => funcs,
-            Err(why) => return Err(Error::fmt(Code::Invalid, format_args!("{why}"))),
-        };
-        if funcs.is_empty() {
-            return Err(Error::new(Code::Invalid, "No functions registered"));
-        }
-        // Against every other library, and without regard to case, because the
-        // dictionary `FCALL` looks in is one dictionary for the whole server.
-        // The library being replaced is not one of the others, which is what
-        // makes reloading a library over itself work at all.
-        for f in &funcs {
-            if held.taken(&f.name, &name) {
-                return Err(Error::fmt(
-                    Code::Unsupported,
-                    format_args!("Function {} already exists", f.name),
-                ));
-            }
-        }
-        held.insert(library::Library {
-            name: name.clone().into(),
-            code: code.to_vec().into_boxed_slice(),
-            at,
-            sha,
-            funcs,
-        });
+        let name = take(&mut held, code, replace)?;
         drop(held);
         out.bulk(name.as_bytes());
         Ok(())
     })
+}
+
+/// Read one library's code, compile it, and put it in a registry.
+///
+/// Shared by `FUNCTION LOAD`, which puts it straight into the server's registry,
+/// and `FUNCTION RESTORE`, which puts every library in a payload into an empty
+/// one and only then decides whether the whole lot can be taken on. The checks
+/// are in Redis's order and the order is visible: a library with a bad shebang
+/// and a name that is already taken complains about the shebang.
+fn take(held: &mut library::Libraries, code: &[u8], replace: bool) -> Result<String> {
+    let meta = library::metadata(code)?;
+    if !library::named(&meta.name) {
+        return Err(library::bad_name());
+    }
+    // Case insensitive because the engine dictionary is, which is what makes
+    // `#!LUA` a working shebang, and the name in the reply is `LUA` either
+    // way because that is the engine's own spelling and not the client's.
+    if !meta.engine.eq_ignore_ascii_case(library::ENGINE.as_bytes()) {
+        return Err(Error::fmt(
+            Code::Unsupported,
+            format_args!(
+                "Engine '{}' not found",
+                String::from_utf8_lossy(&meta.engine)
+            ),
+        ));
+    }
+    let name = String::from_utf8_lossy(&meta.name).into_owned();
+    let at = code.len() - meta.body.len();
+    let sha = lua::fingerprint(code);
+
+    if !replace && held.library(meta.name.as_slice()).is_some() {
+        return Err(Error::fmt(
+            Code::Unsupported,
+            format_args!("Library '{name}' already exists"),
+        ));
+    }
+    let funcs = match lua::install(&name, &sha, meta.body) {
+        Ok(funcs) => funcs,
+        Err(why) => return Err(Error::fmt(Code::Invalid, format_args!("{why}"))),
+    };
+    if funcs.is_empty() {
+        return Err(Error::new(Code::Invalid, "No functions registered"));
+    }
+    // Against every other library, and without regard to case, because the
+    // dictionary `FCALL` looks in is one dictionary for the whole server.
+    // The library being replaced is not one of the others, which is what
+    // makes reloading a library over itself work at all.
+    for f in &funcs {
+        if held.taken(&f.name, &name) {
+            return Err(Error::fmt(
+                Code::Unsupported,
+                format_args!("Function {} already exists", f.name),
+            ));
+        }
+    }
+    held.insert(library::Library {
+        name: name.clone().into(),
+        code: code.to_vec().into_boxed_slice(),
+        at,
+        sha,
+        funcs,
+    });
+    Ok(name)
+}
+
+/// `FUNCTION DUMP`.
+///
+/// One bulk string holding every library on the server, in the same framing an
+/// RDB file uses, which is what makes it loadable by a real Redis and makes a
+/// real Redis's own payload loadable here. An empty server answers ten bytes
+/// rather than an empty string, because the footer is there whether or not
+/// anything is in front of it.
+fn dump(server: &Server, args: Args<'_>, out: &mut Out) -> Result<()> {
+    if args.len() != 2 {
+        return Err(args::wrong_arity_sub("function", "dump"));
+    }
+    let payload = yo_alloc::allow(|| {
+        let held = server.libraries.lock();
+        rdb::functions(held.all().iter().map(|l| &*l.code))
+    });
+    out.bulk(&payload);
+    Ok(())
+}
+
+/// `FUNCTION RESTORE payload [FLUSH|APPEND|REPLACE]`.
+///
+/// The policy is read before the payload is looked at, so a client that got both
+/// wrong hears about the policy. Every library in the payload is compiled into
+/// an empty registry first and the whole lot is taken on or none of it is, which
+/// is what makes a failed restore leave a working server alone rather than half
+/// replaced.
+fn restore(server: &Server, args: Args<'_>, out: &mut Out) -> Result<()> {
+    if args.len() < 3 {
+        return Err(args::wrong_arity_sub("function", "restore"));
+    }
+    if args.len() > 4 {
+        return Err(unknown_or_arity(args.get(1)));
+    }
+    let mut policy = Policy::Append;
+    if args.len() == 4 {
+        let word = args.get(3);
+        policy = if is(word, b"APPEND") {
+            Policy::Append
+        } else if is(word, b"REPLACE") {
+            Policy::Replace
+        } else if is(word, b"FLUSH") {
+            Policy::Flush
+        } else {
+            return Err(Error::new(
+                Code::Invalid,
+                "Wrong restore policy given, value should be either FLUSH, APPEND or REPLACE.",
+            ));
+        };
+    }
+    yo_alloc::allow(|| {
+        let codes = match rdb::libraries(args.get(2)) {
+            Ok(codes) => codes,
+            Err(why) => return Err(payload_error(why)),
+        };
+        // Built and compiled before anything is taken, so that a payload that
+        // is going to be refused is refused with the server untouched. The
+        // interpreter is not untouched, because compiling is what tells us what
+        // a library registered, and a library the registry then throws away
+        // leaves a copy behind in this thread. That copy is unreachable, since
+        // nothing can name a library the registry does not have, and the next
+        // load of the same name finds a digest that does not match and compiles
+        // over it.
+        let mut fresh = library::Libraries::default();
+        for code in &codes {
+            take(&mut fresh, code, false)?;
+        }
+        let mut held = server.libraries.lock();
+        match policy {
+            Policy::Flush => *held = fresh,
+            Policy::Append => held.join(fresh, false)?,
+            Policy::Replace => held.join(fresh, true)?,
+        }
+        drop(held);
+        out.ok();
+        Ok(())
+    })
+}
+
+/// What `FUNCTION RESTORE` does with the libraries that are already there.
+#[derive(Clone, Copy)]
+enum Policy {
+    /// Add to them, and refuse the payload if any name is already taken.
+    Append,
+    /// Add to them, and let a payload take a name that is already there.
+    Replace,
+    /// Forget them, and keep only what the payload holds.
+    Flush,
+}
+
+/// What a payload that is not one says.
+///
+/// Four sentences and not one, because they send a reader to four different
+/// places: a bad footer means the bytes were damaged or came from a newer
+/// server, a pre GA opcode means they came from a server old enough that nobody
+/// ever wrote the conversion, another opcode means they are a payload of
+/// something else entirely, and a short read means they were cut off.
+fn payload_error(why: rdb::BadLibs) -> Error {
+    let said = match why {
+        rdb::BadLibs::Footer => "DUMP payload version or checksum are wrong",
+        rdb::BadLibs::PreGa => "Pre-GA function format not supported",
+        rdb::BadLibs::NotFunction => "given type is not a function",
+        rdb::BadLibs::Truncated => "Failed loading library payload",
+    };
+    Error::new(Code::Invalid, said)
 }
 
 /// `FUNCTION LIST [LIBRARYNAME pattern] [WITHCODE]`.

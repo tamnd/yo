@@ -4747,7 +4747,7 @@ bounded = "inherent"
 status = "shipped"
 wire = "verified"
 divergent = "D-16"
-notes = "LOAD, LIST, DELETE, FLUSH, STATS, KILL and HELP. LOAD reads the shebang the way sdssplitargs reads an inline command, so a quoted name works, and then runs the library once in an environment that holds one table with eight names on it and nothing else, which is why redis.call during a load complains about a global called call. DUMP and RESTORE are the two that are not here, because both are about the RDB payload rather than about libraries. KILL always says NOTBUSY for the same reason SCRIPT KILL does."
+notes = "The whole subcommand set. LOAD reads the shebang the way sdssplitargs reads an inline command, so a quoted name works, and then runs the library once in an environment that holds one table with eight names on it and nothing else, which is why redis.call during a load complains about a global called call. DUMP writes one RDB opcode and one string per library with the usual ten byte footer, and RESTORE compiles every library in a payload into an empty registry before it takes any of them on, so a payload that is going to be refused leaves the server exactly as it was. A payload from here loads into a real server and one from a real server loads here, compressed strings included, and the bytes are not identical either way, which is D-111. KILL always says NOTBUSY for the same reason SCRIPT KILL does."
 
 [[command]]
 name = "EVAL"
