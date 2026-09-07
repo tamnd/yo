@@ -19,6 +19,7 @@
 //! bulk string, so a client cannot tell them apart by reply type by accident.
 
 use super::args::{self, Args, is};
+use super::notify::{self, class};
 use super::table::Spec;
 use crate::reply::Out;
 use yo_common::{Code, Error, Result};
@@ -29,12 +30,27 @@ use yo_kv::hll;
 const UNKNOWN_SUB: &str = "Unknown PFDEBUG subcommand";
 
 /// Run one HyperLogLog command.
-pub(super) fn execute(db: &Db, spec: &Spec, args: Args<'_>, out: &mut Out) -> Result<()> {
+pub(super) fn execute(
+    db: &Db,
+    on: usize,
+    spec: &Spec,
+    args: Args<'_>,
+    out: &mut Out,
+) -> Result<()> {
     match spec.name {
         "pfadd" => {
             let eles = (2..args.len()).map(|i| args.get(i));
             let key = args.get(1);
-            out.int(i64::from(db.hold(key).pfadd(key, eles)?));
+            let updated = db.hold(key).pfadd(key, eles)?;
+            out.int(i64::from(updated));
+            // Only when a register moved or the key was created, which is the
+            // same answer the reply gives, so `PFADD h` on a sketch that is
+            // already there says nothing and the same call on a name that is
+            // free says it. The class is the string one, since that is what a
+            // sketch is stored as.
+            if updated {
+                notify::fire(on, class::STRING, "pfadd", key);
+            }
         }
         "pfcount" => {
             let keys = (1..args.len()).map(|i| args.get(i));
@@ -42,8 +58,14 @@ pub(super) fn execute(db: &Db, spec: &Spec, args: Args<'_>, out: &mut Out) -> Re
         }
         "pfmerge" => {
             let srcs = (2..args.len()).map(|i| args.get(i));
-            db.pfmerge(args.get(1), srcs)?;
+            let dest = args.get(1);
+            db.pfmerge(dest, srcs)?;
             out.ok();
+            // Always, where `PFADD` asks first, and under `PFADD`'s name rather
+            // than one of its own. Redis calls a merge a mass add and says so
+            // whatever it merged, including `PFMERGE d` with no sources at all,
+            // which touches nothing and still says it.
+            notify::fire(on, class::STRING, "pfadd", dest);
         }
         "pfdebug" => debug(db, args, out)?,
         // Redis runs a few thousand additions and checks the estimate is within

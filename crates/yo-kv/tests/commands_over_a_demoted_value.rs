@@ -192,7 +192,7 @@ fn setbit_and_getbit_see_the_same_bitmap() {
     let val = value();
     let (mut k, _) = cold(b"k", &val);
     let before = k.getbit(b"k", 3).expect("read a bit");
-    assert_eq!(k.setbit(b"k", 3, !before).expect("wrote a bit"), before);
+    assert_eq!(k.setbit(b"k", 3, !before).expect("wrote a bit").0, before);
     assert_eq!(k.getbit(b"k", 3).expect("read a bit"), !before);
     assert_eq!(k.strlen(b"k").expect("length"), val.len());
 }

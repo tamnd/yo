@@ -326,6 +326,23 @@ pub(super) fn arm(server: &Server, db: usize) -> Armed {
     }
 }
 
+/// Attribute what the storage layer says next to `db` rather than to the one the
+/// connection is on, and answer where it was being attributed before.
+///
+/// For the two commands that put a key in a database other than the one that
+/// asked for it. A key arriving is noticed underneath, where there is no
+/// database number to be had, so [`arm`] leaves the connection's number here on
+/// the way in and that is the right answer for every command but these two.
+/// `MOVE k 1` and `COPY a b DB 1` both make a key on database one, and it is a
+/// client watching database one that hears about it.
+///
+/// The caller puts back what it was told, around the one call that writes on the
+/// far side and no wider, so that anything the same command says about a key on
+/// its own database is still attributed there.
+pub(crate) fn about(db: usize) -> usize {
+    WHERE.replace(db)
+}
+
 /// Say what happened to a key that no command's reply covers.
 ///
 /// Installed by [`arm`] and called by the storage layer at the moment it

@@ -235,13 +235,32 @@ impl Keyspace {
     where
         I: Iterator<Item = (f64, f64, &'m [u8])> + Clone,
     {
+        let (added, changed) = self.geoadd_counts(key, points, opts)?;
+        Ok(if opts.changed { added + changed } else { added })
+    }
+
+    /// The same write, with both halves of the count kept apart.
+    ///
+    /// For the reason [`Keyspace::zadd_counts`] exists: the reply wants one
+    /// number and the notification wants to know whether either half was more
+    /// than nothing, since a `GEOADD` that moved a member without adding one has
+    /// written to the key and says so.
+    pub fn geoadd_counts<'m, I>(
+        &mut self,
+        key: &[u8],
+        points: I,
+        opts: ZAdd,
+    ) -> Result<(usize, usize)>
+    where
+        I: Iterator<Item = (f64, f64, &'m [u8])> + Clone,
+    {
         for (lon, lat, member) in points.clone() {
             strings::check_len(key, member.len())?;
             if geo::score(lon, lat).is_none() {
                 return Err(out_of_range(lon, lat));
             }
         }
-        self.zadd(
+        self.zadd_counts(
             key,
             points.map(|(lon, lat, m)| {
                 // Checked in the pass above, and nothing between the two passes

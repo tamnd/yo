@@ -2052,7 +2052,7 @@ pub fn resolved(
             // `GET` hands one to a client and `SET` takes it back.
             "hyperloglog" => {
                 let db = session.db;
-                hll::execute(&server.dbs[db], spec, args, out).map(|()| Flow::Continue)
+                hll::execute(&server.dbs[db], db, spec, args, out).map(|()| Flow::Continue)
             }
             "set" => {
                 let db = session.db;
@@ -2092,7 +2092,7 @@ pub fn resolved(
             // a place out of one and ZCARD it to count them.
             "geo" => {
                 let db = session.db;
-                geo::execute(&server.dbs[db], spec, args, out).map(|()| Flow::Continue)
+                geo::execute(&server.dbs[db], db, spec, args, out).map(|()| Flow::Continue)
             }
             "array" => {
                 let db = session.db;

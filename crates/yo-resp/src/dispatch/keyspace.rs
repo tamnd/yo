@@ -593,7 +593,13 @@ fn copy<'a>(
                 out.int(0);
                 return Ok(());
             };
+            // The copy lands on the far database when there is one, so the news
+            // of a key arriving belongs there rather than on the one the
+            // connection is on. Around the import alone, since that is the only
+            // part of this that writes on the far side.
+            let back = notify::about(into);
             to.import(dst, rec);
+            notify::about(back);
             Moved::Ok
         }
     };
@@ -795,7 +801,13 @@ fn move_key(dbs: &[Db], at: usize, args: Args<'_>, out: &mut Out) -> Result<()> 
         out.int(0);
         return Ok(());
     };
+    // The key arrives on the far database, so a client watching this one hears
+    // that it is new and a client watching the one the connection is on does
+    // not, which is what a real server does and is the whole difference between
+    // this and every other write.
+    let back = notify::about(into);
     to.import(key, rec);
+    notify::about(back);
     // One key, two events, on two databases, so a client watching database zero
     // for a move out of it hears only the first of them.
     notify::fire(at, class::GENERIC, "move_from", key);

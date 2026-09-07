@@ -121,12 +121,21 @@ impl Keyspace {
         Ok(bytes.get(byte).is_some_and(|b| b & mask(offset) != 0))
     }
 
-    /// `SETBIT key offset value`, answering the bit that was there before.
+    /// `SETBIT key offset value`, answering the bit that was there before and
+    /// whether the value had to get longer to hold the offset.
     ///
     /// The value grows to hold the offset, padded with zero bytes, and keeps
     /// whatever deadline it had. A key that was not there is created, even when
     /// the bit being written is zero.
-    pub fn setbit(&mut self, key: &[u8], offset: u64, bit: bool) -> Result<bool> {
+    ///
+    /// The reply is the first half and the second half is for the notification.
+    /// A real server only says `setbit` when the write did something, and doing
+    /// something means either the bit came out different or the value got
+    /// longer, so `SETBIT k 1 0` on a bit that was already zero says nothing
+    /// while `SETBIT k 1000 0` on a short value says it. The caller cannot work
+    /// the second half out from the reply, since a value that was created or
+    /// padded reads back as a zero bit either way.
+    pub fn setbit(&mut self, key: &[u8], offset: u64, bit: bool) -> Result<(bool, bool)> {
         if offset > BIT_OFFSET_MAX {
             return Err(Error::new(Code::Invalid, BAD_BIT_OFFSET));
         }
@@ -156,7 +165,9 @@ impl Keyspace {
                 } else {
                     *b &= !mask(offset);
                 }
-                return Ok(had);
+                // Nothing grew on this path by definition, since it is the one
+                // taken when the byte is already inside the value.
+                return Ok((had, false));
             }
         }
         if dead {
@@ -176,7 +187,12 @@ impl Keyspace {
             }
             None => None,
         };
-        if bytes.len() <= byte {
+        // Whether the value got longer, which is not the same question as
+        // whether this path was taken. A key holding an int encoded value comes
+        // through here to be written out as digits even when the byte being
+        // written is already inside those digits, and that is not growth.
+        let grew = bytes.len() <= byte;
+        if grew {
             bytes.resize(byte + 1, 0);
         }
         let had = bytes[byte] & mask(offset) != 0;
@@ -187,7 +203,7 @@ impl Keyspace {
         }
         self.store_raw(key, &bytes, deadline);
         self.scratch = bytes;
-        Ok(had)
+        Ok((had, grew))
     }
 
     /// `BITCOUNT key [start end [BYTE | BIT]]`.
@@ -347,9 +363,10 @@ impl Keyspace {
     /// falls out of it growing the string before it looks at the values.
     pub fn bitfield(&mut self, key: &[u8], ops: &[Sub]) -> Result<Vec<Option<i64>>> {
         let grow = ops.iter().filter(|s| s.op.writes()).map(reach).max();
-        self.bitfield_with(key, grow, |bytes| {
-            ops.iter().map(|&sub| apply(bytes, sub)).collect()
-        })
+        let (out, _) = self.bitfield_with(key, grow, |bytes| {
+            ops.iter().map(|&sub| apply(bytes, sub).0).collect()
+        })?;
+        Ok(out)
     }
 
     /// `BITFIELD`, with the subcommands run against the value in place.
@@ -367,12 +384,17 @@ impl Keyspace {
     /// only then starts on the values. A call that only reads stores nothing,
     /// which is what keeps `BITFIELD k GET u8 0` from turning an `embstr` into a
     /// `raw`.
+    ///
+    /// The second half of the answer is whether the value did get longer, which
+    /// the notification wants for the reason [`Keyspace::setbit`] gives: a write
+    /// that grew the value counts as having done something even when every bit
+    /// it wrote came out the same as the one it replaced.
     pub fn bitfield_with<T>(
         &mut self,
         key: &[u8],
         grow: Option<usize>,
         run: impl FnOnce(&mut [u8]) -> T,
-    ) -> Result<T> {
+    ) -> Result<(T, bool)> {
         self.reap(key);
         self.string_only(key)?;
         // Every path here materialises the value and most of them write it
@@ -393,7 +415,8 @@ impl Keyspace {
             }
             None => None,
         };
-        if bytes.len() < need {
+        let grew = bytes.len() < need;
+        if grew {
             bytes.resize(need, 0);
         }
         let out = run(&mut bytes);
@@ -401,7 +424,7 @@ impl Keyspace {
             self.store_raw(key, &bytes, deadline);
         }
         self.scratch = bytes;
-        Ok(out)
+        Ok((out, grew))
     }
 
     /// The bytes of a string key, as the bit commands want to see them.
@@ -505,26 +528,40 @@ fn parts<'a>(flat: &'a [u8], ends: &'a [usize]) -> impl Iterator<Item = &'a [u8]
         .map(|(from, to)| &flat[from..to])
 }
 
-/// Run one subcommand against a value, answering what the client is owed.
+/// Run one subcommand against a value, answering what the client is owed and
+/// whether it left the value different from how it found it.
 ///
 /// `None` is the nil an `OVERFLOW FAIL` subcommand gives when its value would
 /// not fit; that one writes nothing and the ones around it still do. A `SET`
 /// answers what was there before and an `INCRBY` answers what is there now,
 /// which is not symmetry anybody would have chosen but is what Redis does.
 ///
+/// The second half is what the notification wants, and no call site can work it
+/// out from the first: a `SET` answering the old value has not said what the new
+/// one is, and an `INCRBY` answering the new one has not said what the old one
+/// was. A `GET` never changes anything and a subcommand that failed its overflow
+/// check wrote nothing, so both of those are false.
+///
 /// The bytes have to be long enough already, which is [`reach`]'s job.
 #[must_use]
-pub fn apply(bytes: &mut [u8], sub: Sub) -> Option<i64> {
+pub fn apply(bytes: &mut [u8], sub: Sub) -> (Option<i64>, bool) {
     let had = bits::get(bytes, sub.at, sub.field);
     match sub.op {
-        SubOp::Get => Some(had),
-        SubOp::Set(val) => bits::setting(sub.field, val, sub.on).map(|next| {
-            bits::set(bytes, sub.at, sub.field, next);
-            had
-        }),
-        SubOp::Incr(by) => bits::adding(sub.field, had, by, sub.on).inspect(|&next| {
-            bits::set(bytes, sub.at, sub.field, next);
-        }),
+        SubOp::Get => (Some(had), false),
+        SubOp::Set(val) => match bits::setting(sub.field, val, sub.on) {
+            Some(next) => {
+                bits::set(bytes, sub.at, sub.field, next);
+                (Some(had), next != had)
+            }
+            None => (None, false),
+        },
+        SubOp::Incr(by) => match bits::adding(sub.field, had, by, sub.on) {
+            Some(next) => {
+                bits::set(bytes, sub.at, sub.field, next);
+                (Some(next), next != had)
+            }
+            None => (None, false),
+        },
     }
 }
 
@@ -600,7 +637,7 @@ mod tests {
     #[test]
     fn a_bit_is_set_and_read_back() {
         let mut db = db();
-        assert!(!db.setbit(b"k", 7, true).expect("a bit"));
+        assert!(!db.setbit(b"k", 7, true).expect("a bit").0);
         assert!(db.getbit(b"k", 7).expect("a bit"));
         assert!(!db.getbit(b"k", 6).expect("a bit"));
         assert_eq!(db.strlen(b"k").expect("a length"), 1);
@@ -609,14 +646,14 @@ mod tests {
             b"\x01"
         );
         // The answer is what was there, not what is there now.
-        assert!(db.setbit(b"k", 7, false).expect("a bit"));
-        assert!(!db.setbit(b"k", 7, false).expect("a bit"));
+        assert!(db.setbit(b"k", 7, false).expect("a bit").0);
+        assert!(!db.setbit(b"k", 7, false).expect("a bit").0);
     }
 
     #[test]
     fn a_write_creates_and_pads_even_when_the_bit_is_zero() {
         let mut db = db();
-        assert!(!db.setbit(b"k", 0, false).expect("a bit"));
+        assert!(!db.setbit(b"k", 0, false).expect("a bit").0);
         assert!(db.exists(b"k"));
         assert_eq!(db.strlen(b"k").expect("a length"), 1);
         db.setbit(b"k", 40, true).expect("a bit");
@@ -632,7 +669,7 @@ mod tests {
         assert!(db.getbit(b"n", 3).expect("a bit"));
         assert_eq!(db.encoding(b"n"), Some(value::Encoding::Int));
         // Writing one, even a write that changes nothing, does not leave an int.
-        assert!(!db.setbit(b"n", 0, false).expect("a bit"));
+        assert!(!db.setbit(b"n", 0, false).expect("a bit").0);
         assert_eq!(db.encoding(b"n"), Some(value::Encoding::Raw));
         assert_eq!(
             db.get(b"n").expect("a value").expect("bytes").to_vec(),

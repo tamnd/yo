@@ -62,10 +62,17 @@ pub(super) fn execute(
                 _ => return Err(Error::new(Code::Invalid, BAD_BIT)),
             };
             let key = args.get(1);
-            out.int(i64::from(db.hold(key).setbit(key, offset, bit)?));
-            // Whatever the bit was before and whatever it is now, including a
-            // `SETBIT k 0 0` that changed nothing. Redis says it too.
-            notify::fire(on, class::STRING, "setbit", key);
+            let (had, grew) = db.hold(key).setbit(key, offset, bit)?;
+            out.int(i64::from(had));
+            // Only when the write did something, which is either the bit coming
+            // out different or the value having to get longer to hold it. A
+            // `SETBIT k 1 0` on a bit that was already zero says nothing, and a
+            // `SETBIT k 1000 0` on a short value says `setbit` even though every
+            // bit it wrote is a zero, because the value it wrote them into was
+            // not there before.
+            if grew || had != bit {
+                notify::fire(on, class::STRING, "setbit", key);
+            }
         }
         "getbit" => {
             let offset = offset(args.get(2))?;
@@ -170,9 +177,10 @@ fn bitfield(db: &Db, on: usize, args: Args<'_>, out: &mut Out, readonly: bool) -
 
     out.array(n);
     let key = args.get(1);
-    db.hold(key).bitfield_with(key, grow, |bytes| {
+    let (changed, grew) = db.hold(key).bitfield_with(key, grow, |bytes| {
         let mut at = 2;
         let mut over = Overflow::Wrap;
+        let mut changed = false;
         while at < args.len() {
             // The arguments have been through `parse` once already, so anything
             // it could refuse has been refused and the second pass cannot fail.
@@ -181,19 +189,23 @@ fn bitfield(db: &Db, on: usize, args: Args<'_>, out: &mut Out, readonly: bool) -
                 Err(_) => break,
             };
             if let Some(sub) = sub {
-                match bitmaps::apply(bytes, sub) {
+                let (reply, wrote) = bitmaps::apply(bytes, sub);
+                match reply {
                     Some(n) => out.int(n),
                     None => out.nil(),
                 }
+                changed |= wrote;
             }
             at = next;
         }
+        changed
     })?;
-    // `grow` is `Some` exactly when one of the subcommands was a `SET` or an
-    // `INCRBY`, so it doubles as the answer to whether anything was written.
-    // A `BITFIELD` of nothing but `GET`s says nothing, and `BITFIELD_RO` cannot
-    // reach this at all.
-    if grow.is_some() {
+    // The same rule `SETBIT` follows and for the same reason, one subcommand at
+    // a time: a value that got longer counts, and so does any write that left a
+    // field holding something else. A `BITFIELD` of nothing but `GET`s says
+    // nothing, one whose only write was an `OVERFLOW FAIL` that failed says
+    // nothing, and `BITFIELD_RO` cannot reach this at all.
+    if changed || grew {
         notify::fire(on, class::STRING, "setbit", key);
     }
     Ok(())
