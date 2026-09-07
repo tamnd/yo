@@ -94,6 +94,37 @@ pub struct Keyspace {
     /// Lookups a client's read made that did not, which Redis reports as
     /// `keyspace_misses`.
     pub(crate) misses: u64,
+    /// Hash fields that reached their own deadline, whoever found them.
+    ///
+    /// Redis's `expired_subkeys`, and kept apart from
+    /// [`Keyspace::expired`] there and here, because a field going is not a key
+    /// going and a hash of a thousand fields can lose all thousand without the
+    /// key count moving at all.
+    pub(crate) expired_fields: u64,
+    /// How many of those the cycle found rather than a command tripping over.
+    ///
+    /// Redis's `expired_subkeys_active`, and the only reason it is a second
+    /// number is that it is the one that says whether the cycle is keeping up.
+    pub(crate) expired_fields_active: u64,
+    /// Keys of hashes that have been given a field deadline at some point.
+    ///
+    /// The list [`Keyspace::field_expire_cycle`] sweeps, and the reason it can
+    /// be a sweep at all. A field deadline is not in the record, so the marked
+    /// index the key cycle draws from cannot see one, and the alternative to a
+    /// list is walking every hash in the database asking each whether it has a
+    /// deadline that has passed.
+    ///
+    /// Keys and not slab slots, because the sweep has to name the key: it
+    /// publishes `hexpired` against it and deletes it when the last field goes,
+    /// and a body does not know what it is called.
+    ///
+    /// A name goes on here the first time a hash takes a deadline, which each
+    /// hash does once, and comes off when the key is no longer a hash. It is
+    /// empty and costs nothing on a server that has never used the `HEXPIRE`
+    /// family, which is nearly all of them.
+    pub(crate) field_deadlines: Vec<Box<[u8]>>,
+    /// Where the next sweep of that list starts.
+    pub(crate) field_at: usize,
     /// Every set in this database, addressed by the number in its record.
     pub(crate) sets: Slab<Set>,
     /// Every hash in this database, addressed the same way.
@@ -440,6 +471,10 @@ impl Keyspace {
             evicted: 0,
             hits: 0,
             misses: 0,
+            expired_fields: 0,
+            expired_fields_active: 0,
+            field_deadlines: Vec::new(),
+            field_at: 0,
             sets: Slab::new(),
             hashes: Slab::new(),
             lists: Slab::new(),
@@ -2222,6 +2257,10 @@ impl Keyspace {
         self.foreign.clear();
         self.pool.clear();
         self.bodies = 0;
+        // The same argument as the deadline count above. It is a list of keys
+        // that are in the database, and there are none.
+        self.field_deadlines.clear();
+        self.field_at = 0;
     }
 
     /// Keys reclaimed by running into them after their deadline.
@@ -2234,6 +2273,27 @@ impl Keyspace {
     #[inline]
     pub const fn expired_keys(&self) -> u64 {
         self.expired
+    }
+
+    /// Hash fields reclaimed after their own deadline passed.
+    ///
+    /// Redis calls this `expired_subkeys` and counts both halves into it, the
+    /// fields a command tripped over on its way past and the fields
+    /// [`Keyspace::field_expire_cycle`] went looking for.
+    #[inline]
+    pub const fn expired_fields(&self) -> u64 {
+        self.expired_fields
+    }
+
+    /// The share of those the cycle found.
+    ///
+    /// Redis calls this `expired_subkeys_active`. It is the number that says
+    /// whether the cycle is keeping up: a server where it stays far behind the
+    /// total is one where the fields are only going because clients keep asking
+    /// for the hashes they are in.
+    #[inline]
+    pub const fn expired_fields_active(&self) -> u64 {
+        self.expired_fields_active
     }
 
     /// Keys thrown away to make room.
@@ -2269,10 +2329,24 @@ impl Keyspace {
         self.misses
     }
 
-    /// Put both of them back to zero, which is `CONFIG RESETSTAT`.
-    pub const fn zero_lookups(&mut self) {
+    /// Put every running total this database keeps back to zero, which is
+    /// `CONFIG RESETSTAT`.
+    ///
+    /// All six and not just the two lookup counters, because Redis's
+    /// `resetServerStats` clears the expiry and eviction totals in the same
+    /// breath. They are totals since the server started and this is the command
+    /// that says start again from here, so a dashboard that resets and then
+    /// watches has to see all of them move together or none of them.
+    ///
+    /// Not the same thing as `FLUSHDB`, which throws away the keys and leaves
+    /// every one of these alone. See [`Keyspace::clear`].
+    pub const fn zero_stats(&mut self) {
         self.hits = 0;
         self.misses = 0;
+        self.expired = 0;
+        self.evicted = 0;
+        self.expired_fields = 0;
+        self.expired_fields_active = 0;
     }
 
     /// How many live keys carry a deadline.
@@ -2655,7 +2729,7 @@ mod tests {
             "and it stopped when it was dropped"
         );
 
-        d.zero_lookups();
+        d.zero_stats();
         assert_eq!((d.hits(), d.misses()), (0, 0));
     }
 

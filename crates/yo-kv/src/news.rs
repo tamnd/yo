@@ -64,6 +64,20 @@ pub enum What {
     TypeChanged,
     /// Its deadline had passed, found on the way past or by the cycle.
     Expired,
+    /// One field of the hash under it reached its own deadline and has gone.
+    ///
+    /// The only one of these that names something smaller than a key, which is
+    /// why the field travels alongside. A reap that takes several fields says
+    /// this once per field and the layer above puts them back together, since
+    /// what a real server publishes is one event carrying the whole list.
+    FieldExpired,
+    /// It has just gone because the last of what was in it went, and no
+    /// command's reply says so.
+    ///
+    /// Not the same news as [`What::Expired`]: the key itself had no deadline
+    /// and was not past one. Its last field did, and a hash with no fields is
+    /// not a key, so the key went with the field. Redis calls this one `del`.
+    Deleted,
     /// A write needed the memory and the policy chose this one.
     Evicted,
     /// A read went looking for it and it was not there.
@@ -84,7 +98,12 @@ pub enum What {
 /// nothing allocated and nothing dropped. What a listener needs to know beyond
 /// the key and what happened, the database number in practice, it keeps on the
 /// side, since it is the one arranging for this to be installed at all.
-pub type Told = fn(&[u8], What);
+///
+/// The third argument is the field an event names, which is empty for all of
+/// them but [`What::FieldExpired`]. It rides on the same pointer rather than on
+/// a second one because a second hook would be a second thread local to install,
+/// to put back and to get wrong, for the sake of one caller.
+pub type Told = fn(&[u8], What, &[u8]);
 
 thread_local! {
     /// Whoever wants to hear about it on this thread, and usually nobody.
@@ -114,8 +133,13 @@ pub(crate) fn listening() -> bool {
 
 /// Say what happened to a key, if anybody asked to hear about it.
 pub(crate) fn say(key: &[u8], what: What) {
+    say_of(key, what, b"");
+}
+
+/// Say what happened to one field of a key, if anybody asked to hear about it.
+pub(crate) fn say_of(key: &[u8], what: What, field: &[u8]) {
     if let Some(told) = TELL.get() {
-        told(key, what);
+        told(key, what, field);
     }
 }
 
@@ -124,12 +148,16 @@ mod tests {
     use super::*;
     use std::cell::RefCell;
 
+    /// One thing the listener below heard, in the order the three arguments
+    /// arrive in.
+    type Item = (Vec<u8>, What, Vec<u8>);
+
     thread_local! {
-        static HEARD: RefCell<Vec<(Vec<u8>, What)>> = const { RefCell::new(Vec::new()) };
+        static HEARD: RefCell<Vec<Item>> = const { RefCell::new(Vec::new()) };
     }
 
-    fn note(key: &[u8], what: What) {
-        HEARD.with_borrow_mut(|heard| heard.push((key.to_vec(), what)));
+    fn note(key: &[u8], what: What, field: &[u8]) {
+        HEARD.with_borrow_mut(|heard| heard.push((key.to_vec(), what, field.to_vec())));
     }
 
     /// Nobody listening is the usual case and it has to be the cheap one, which
@@ -148,14 +176,16 @@ mod tests {
         say(b"a", What::Born);
         say(b"b", What::Expired);
         say(b"c", What::Evicted);
+        say_of(b"d", What::FieldExpired, b"f");
         tell(was);
         HEARD.with_borrow(|heard| {
             assert_eq!(
                 heard.as_slice(),
                 [
-                    (b"a".to_vec(), What::Born),
-                    (b"b".to_vec(), What::Expired),
-                    (b"c".to_vec(), What::Evicted)
+                    (b"a".to_vec(), What::Born, Vec::new()),
+                    (b"b".to_vec(), What::Expired, Vec::new()),
+                    (b"c".to_vec(), What::Evicted, Vec::new()),
+                    (b"d".to_vec(), What::FieldExpired, b"f".to_vec()),
                 ]
             );
         });

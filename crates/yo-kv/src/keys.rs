@@ -330,9 +330,18 @@ impl Keyspace {
                 self.write_slot(key, Kind::Set, slot, at);
             }
             Body::Hash(hash) => {
+                // A hash arriving whole is the other way onto the field expiry
+                // list. `RESTORE`, `COPY`, `MOVE` and the snapshot reader all
+                // land here with a body that may already carry deadlines, and
+                // none of them goes through the `HEXPIRE` family that would
+                // otherwise put the name on.
+                let watch = hash.takes_deadlines();
                 let slot = self.hashes.insert(hash);
                 self.bodies += 1;
                 self.write_slot(key, Kind::Hash, slot, at);
+                if watch {
+                    self.field_deadlines.push(key.into());
+                }
             }
             Body::List(list) => {
                 let slot = self.lists.insert(list);

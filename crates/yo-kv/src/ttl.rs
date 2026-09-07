@@ -224,6 +224,19 @@ impl Deadlines {
         self.live
     }
 
+    /// Whether the array is there at all, which says the collection has been
+    /// given a deadline at some point rather than that it has one now.
+    ///
+    /// The active cycle asks this and not [`Deadlines::is_empty`], because what
+    /// it is deciding is whether to keep this collection on the list of ones
+    /// worth looking at, and a hash whose only deadline was just persisted can
+    /// be given another one without the list hearing about it.
+    #[inline]
+    #[must_use]
+    pub const fn armed(&self) -> bool {
+        !self.at.is_empty()
+    }
+
     /// A lower bound on the earliest deadline, or `None` if nothing has one.
     ///
     /// What M5's active cycle registers so it can pass over a whole hash without

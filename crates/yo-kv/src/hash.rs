@@ -349,12 +349,20 @@ impl Packed {
     }
 
     /// Drop every field whose deadline has passed, and say how many went.
-    fn reap(&mut self, now: u64) -> usize {
+    fn reap(&mut self, now: u64, went: &mut impl FnMut(&[u8])) -> usize {
         let mut gone = 0;
         let mut at = 0;
         while at < self.lp.len() {
             match self.deadline(at) {
                 Some(deadline) if deadline <= now => {
+                    // The name goes to the caller before the row does, since
+                    // after the delete there is nothing to borrow it from. A
+                    // listpack holds a field that looks like a number as one,
+                    // so this is the same turn back into bytes that every other
+                    // read of a field name does.
+                    let mut digits = [0u8; num::DIGITS_MAX];
+                    let name = self.lp.get(at).expect("the row starts with a name");
+                    went(bytes_of(name, &mut digits));
                     self.remove_at(at);
                     gone += 1;
                 }
@@ -973,17 +981,22 @@ impl Hash {
     /// comparison. Only a hash that has actually been given a deadline that has
     /// actually passed pays for the walk.
     ///
+    /// `went` is handed the name of each field as it goes, because that is the
+    /// only moment it can be had: the field is about to be taken out and after
+    /// that there is nothing left to read it from. What the caller does with it
+    /// is publish `hexpired`, which carries the whole list.
+    ///
     /// The caller deletes the key when this empties the hash, the same way it
     /// does after an `HDEL` that takes the last field, because an empty hash is
     /// not a thing Redis stores.
-    pub fn reap(&mut self, now: u64) -> usize {
+    pub fn reap(&mut self, now: u64, mut went: impl FnMut(&[u8])) -> usize {
         match self.soonest_deadline() {
             Some(soonest) if soonest <= now => {}
             _ => return 0,
         }
         match &mut self.body {
             Body::Packed(p) => {
-                let gone = p.reap(now);
+                let gone = p.reap(now, &mut went);
                 // The bound has been leaning early and this walk is the one that
                 // knows the truth, so it is the one that pays to fix it.
                 p.soonest = p.earliest();
@@ -994,6 +1007,8 @@ impl Hash {
                 let mut row = 0;
                 while row < t.fields.len() {
                     if t.ttl.is_expired(row, now) {
+                        let (name, _) = t.fields.pair_at(row).expect("the row is in range");
+                        went(name);
                         // The last row moves into this one, so stay put and look
                         // at whatever landed here.
                         t.remove_at(row);
@@ -1099,6 +1114,21 @@ impl Hash {
         }
     }
 
+    /// Whether this hash is set up to carry field deadlines.
+    ///
+    /// Not the same question as whether any field has one now. Both bands widen
+    /// once, the first time a deadline lands on them, and neither narrows again
+    /// when the last one is taken off, so this is the thing that stays true for
+    /// as long as the hash is worth the active cycle's attention. See
+    /// [`crate::keyspace::Keyspace::field_expire_cycle`] for what asks.
+    #[must_use]
+    pub fn takes_deadlines(&self) -> bool {
+        match &self.body {
+            Body::Packed(p) => p.ex,
+            Body::Table(t) => t.ttl.armed(),
+        }
+    }
+
     /// How many fields carry a deadline.
     #[must_use]
     pub fn deadline_count(&self) -> usize {
@@ -1175,6 +1205,18 @@ pub fn stores_as_int(bytes: &[u8]) -> bool {
 mod tests {
     use super::*;
     use crate::many;
+
+    /// A reap that throws the names away, for the tests that only count.
+    fn reap(h: &mut Hash, now: u64) -> usize {
+        h.reap(now, |_| {})
+    }
+
+    /// And one that keeps them, for the tests that are about the names.
+    fn reaped(h: &mut Hash, now: u64) -> Vec<Vec<u8>> {
+        let mut names = Vec::new();
+        h.reap(now, |field| names.push(field.to_vec()));
+        names
+    }
 
     /// What a hash actually costs per field, which is the other half of M3's
     /// memory gate row and was an argument rather than a number until this was
@@ -1844,17 +1886,47 @@ mod tests {
             let mut h = filled(3, limits);
             h.expire(b"f1", 1000, Cond::Always, 0);
 
-            assert_eq!(h.reap(999), 0, "not yet");
+            assert_eq!(reap(&mut h, 999), 0, "not yet");
             assert_eq!(h.len(), 3);
             assert!(h.contains(b"f1"), "and it is still readable until then");
 
-            assert_eq!(h.reap(1000), 1, "the deadline itself has passed");
+            assert_eq!(reap(&mut h, 1000), 1, "the deadline itself has passed");
             assert_eq!(h.len(), 2);
             assert!(!h.contains(b"f1"));
             assert!(h.contains(b"f0") && h.contains(b"f2"), "and only that one");
-            assert_eq!(h.reap(1000), 0, "twice takes nothing");
+            assert_eq!(reap(&mut h, 1000), 0, "twice takes nothing");
             assert_eq!(h.soonest_deadline(), None, "the bound is exact again");
         }
+    }
+
+    /// The names are the whole reason the reap takes a callback, and the moment
+    /// they can be had is the moment before each field goes, so a reap that
+    /// takes several has to hand them over one at a time as it walks.
+    #[test]
+    fn a_reap_names_every_field_it_took() {
+        for limits in [&SMALL, &AS_TABLE] {
+            let mut h = filled(4, limits);
+            h.expire(b"f0", 1000, Cond::Always, 0);
+            h.expire(b"f2", 1000, Cond::Always, 0);
+
+            assert!(reaped(&mut h, 999).is_empty(), "nothing has gone yet");
+            let mut names = reaped(&mut h, 1000);
+            names.sort();
+            assert_eq!(names, [b"f0".to_vec(), b"f2".to_vec()]);
+            assert_eq!(h.len(), 2);
+            assert!(reaped(&mut h, 1000).is_empty(), "and they only go once");
+        }
+    }
+
+    /// A listpack holds a field that looks like a number as a number, so the
+    /// name that comes back has to be the digits it went in as.
+    #[test]
+    fn a_reap_names_a_numeric_field_the_way_it_was_written() {
+        let mut h = Hash::new();
+        h.set(b"10", b"v", &SMALL);
+        h.expire(b"10", 1000, Cond::Always, 0);
+        assert_eq!(h.encoding(), Encoding::ListpackEx);
+        assert_eq!(reaped(&mut h, 1000), [b"10".to_vec()]);
     }
 
     #[test]
@@ -1862,7 +1934,7 @@ mod tests {
         for limits in [&SMALL, &AS_TABLE] {
             let mut h = filled(50, limits);
             assert_eq!(h.soonest_deadline(), None);
-            assert_eq!(h.reap(u64::MAX), 0);
+            assert_eq!(reap(&mut h, u64::MAX), 0);
             assert_eq!(h.len(), 50);
         }
     }
@@ -1880,7 +1952,7 @@ mod tests {
                 Ask::NoDeadline,
                 "and HSET took the deadline off"
             );
-            assert_eq!(h.reap(u64::MAX), 0, "so nothing expires it");
+            assert_eq!(reap(&mut h, u64::MAX), 0, "so nothing expires it");
             assert_eq!(h.get(b"f1").map(text), Some(b"fresh".to_vec()));
         }
     }
@@ -1929,7 +2001,7 @@ mod tests {
             );
             assert_eq!(h.persist(b"gone"), Ask::Missing);
             assert_eq!(h.deadline_count(), 0);
-            assert_eq!(h.reap(u64::MAX), 0, "and it does not expire any more");
+            assert_eq!(reap(&mut h, u64::MAX), 0, "and it does not expire any more");
             assert_eq!(h.len(), 3);
         }
     }
@@ -1988,7 +2060,7 @@ mod tests {
         assert_eq!(h.deadline_count(), 2);
         assert_eq!(h.soonest_deadline(), Some(2000));
 
-        assert_eq!(h.reap(3000), 1, "f9 and not f7");
+        assert_eq!(reap(&mut h, 3000), 1, "f9 and not f7");
         assert!(!h.contains(b"f9") && h.contains(b"f7"));
     }
 
@@ -2045,7 +2117,7 @@ mod tests {
             for i in [1u32, 2, 3] {
                 h.expire(format!("f{i}").as_bytes(), 100, Cond::Always, 0);
             }
-            assert_eq!(h.reap(200), 3);
+            assert_eq!(reap(&mut h, 200), 3);
             assert_eq!(h.len(), 3);
             for i in [0u32, 4, 5] {
                 assert!(h.contains(format!("f{i}").as_bytes()), "f{i} went too");
