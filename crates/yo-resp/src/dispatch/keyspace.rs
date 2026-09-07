@@ -23,6 +23,7 @@ use super::scan;
 use super::table::Spec;
 use crate::reply::Out;
 use yo_common::{Code, Error, Held, Result, glob_matches};
+use yo_kv::lookups;
 use yo_kv::rdb::Bad;
 use yo_kv::sort::Sort;
 use yo_kv::{Applied, Ask, Cond, Db, Holds, Keyspace, Kind, MAX_AT, Moved};
@@ -238,6 +239,9 @@ pub(super) fn execute<'a>(
             if is_foreign(&mut stripe, key) {
                 return Err(no_dump(&mut stripe, key));
             }
+            // The type question above is the lookup this is counted for, and
+            // the dump below is the same key again.
+            let _quiet = lookups::quiet();
             match stripe.dump(key) {
                 Some(payload) => out.bulk(&payload),
                 None => out.nil(),
@@ -1127,6 +1131,9 @@ fn object(db: &Db, args: Args<'_>, out: &mut Out) -> Result<()> {
         out.nil();
         return Ok(());
     }
+    // That is the lookup `OBJECT` is counted for, and every subcommand below
+    // asks about the same key again.
+    let _quiet = lookups::quiet();
     match named {
         "encoding" => {
             let name = db

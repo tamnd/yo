@@ -50,6 +50,7 @@ use crate::foreign::Foreign;
 use crate::hash::Hash;
 use crate::keyspace::Keyspace;
 use crate::list::List;
+use crate::lookups;
 use crate::rdb;
 use crate::set::Set;
 use crate::stream::Stream;
@@ -506,6 +507,10 @@ impl Keyspace {
         if self.live_rec(src).is_none() {
             return Moved::Missing;
         }
+        // The lookup above is the one a real server counts. Everything below is
+        // either the source over again or the destination on the way to being
+        // written, and Redis counts neither. See [`crate::lookups::quiet`].
+        let _quiet = lookups::quiet();
         let same = src == dst;
         if !replace && (same || self.live_rec(dst).is_some()) {
             return Moved::Taken;

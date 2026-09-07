@@ -1200,7 +1200,8 @@ fn info(server: &Server, args: Args<'_>, out: &mut Out) {
                 s,
                 "# Stats\r\ntotal_connections_received:{}\r\n\
                  total_commands_processed:{}\r\nexpired_keys:{}\r\n\
-                 evicted_keys:{}\r\nyo_cold_demoted:{}\r\nyo_cold_promoted:{}\r\n\
+                 evicted_keys:{}\r\nkeyspace_hits:{}\r\nkeyspace_misses:{}\r\n\
+                 yo_cold_demoted:{}\r\nyo_cold_promoted:{}\r\n\
                  yo_cold_faults:{}\r\nyo_cold_served:{}\r\nyo_cold_bytes_out:{}\r\n\
                  yo_cold_bytes_in:{}\r\npubsub_channels:{}\r\n\
                  pubsub_patterns:{}\r\npubsubshard_channels:{}\r\n\r\n",
@@ -1208,6 +1209,8 @@ fn info(server: &Server, args: Args<'_>, out: &mut Out) {
                 totals.commands,
                 server.expired_keys(),
                 server.evicted_keys(),
+                server.keyspace_hits(),
+                server.keyspace_misses(),
                 cold.demoted,
                 cold.promoted,
                 cold.faults,

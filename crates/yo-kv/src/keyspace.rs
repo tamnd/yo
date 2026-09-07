@@ -36,6 +36,7 @@ use crate::evict;
 use crate::foreign::Foreign;
 use crate::hash::{self, Hash};
 use crate::list::{self, List};
+use crate::lookups;
 use crate::news;
 use crate::set::{self, Set};
 use crate::slab::{Bytes, Slab};
@@ -87,6 +88,12 @@ pub struct Keyspace {
     /// asked for, and eviction is the server deciding it cannot keep a promise
     /// nobody asked it to break.
     pub(crate) evicted: u64,
+    /// Lookups a client's read made that found the key, which Redis reports as
+    /// `keyspace_hits`.
+    pub(crate) hits: u64,
+    /// Lookups a client's read made that did not, which Redis reports as
+    /// `keyspace_misses`.
+    pub(crate) misses: u64,
     /// Every set in this database, addressed by the number in its record.
     pub(crate) sets: Slab<Set>,
     /// Every hash in this database, addressed the same way.
@@ -431,6 +438,8 @@ impl Keyspace {
             clock,
             expired: 0,
             evicted: 0,
+            hits: 0,
+            misses: 0,
             sets: Slab::new(),
             hashes: Slab::new(),
             lists: Slab::new(),
@@ -837,14 +846,20 @@ impl Keyspace {
     /// reason.
     pub fn kind_of(&mut self, key: &[u8]) -> Option<Kind> {
         let now = self.clock.now_ms();
-        let (kind, dead) = self
+        let found = self
             .map
             .get(key)
-            .map(|rec| (value::kind(rec), value::is_expired(rec, now)))?;
+            .map(|rec| (value::kind(rec), value::is_expired(rec, now)));
+        let Some((kind, dead)) = found else {
+            self.looked(false);
+            return None;
+        };
         if dead {
             self.reaped(key);
+            self.looked(false);
             return None;
         }
+        self.looked(true);
         Some(kind)
     }
 
@@ -1288,10 +1303,16 @@ impl Keyspace {
     #[inline]
     pub(crate) fn reap(&mut self, key: &[u8]) {
         let now = self.clock.now_ms();
-        let dead = self.map.get(key).is_some_and(|r| value::is_expired(r, now));
-        if dead {
+        let found = self.map.get(key).map(|r| value::is_expired(r, now));
+        if found == Some(true) {
             self.reaped(key);
         }
+        // The other half of what [`Keyspace::looked`] is for. The groups whose
+        // values are read straight out of the record come through here and not
+        // through the funnels below, because a string is its own record and
+        // there is no slot to resolve, so this is where `BITCOUNT` and `PFCOUNT`
+        // and `GETDEL` are counted.
+        self.looked(found == Some(false));
     }
 
     /// Take a key whose deadline has passed, count it, and say that it went.
@@ -2002,12 +2023,39 @@ impl Keyspace {
     /// that it does not.
     pub(crate) fn live_rec_untouched(&mut self, key: &[u8]) -> Option<Addr> {
         let now = self.clock.now_ms();
-        let addr = self.map.find(key)?;
+        let Some(addr) = self.map.find(key) else {
+            self.looked(false);
+            return None;
+        };
         if value::is_expired(self.map.value_at(addr), now) {
             self.reaped(key);
+            self.looked(false);
             return None;
         }
+        self.looked(true);
         Some(addr)
+    }
+
+    /// Count a lookup a client's read made, whichever way it went.
+    ///
+    /// Only what a read did. Every command comes through the funnels above this
+    /// and the ones that write are not what the hit rate is about, so the
+    /// dispatcher says which kind is running and [`lookups`] carries the answer
+    /// down. See that module for why it is a thread local.
+    ///
+    /// A key found and then refused for holding the wrong type is a hit, since
+    /// the lookup did find what was under the name. That is Redis's rule as
+    /// well, and it falls out of where the count sits rather than being decided
+    /// here: the type check is above this and this has already counted.
+    #[inline]
+    fn looked(&mut self, found: bool) {
+        if lookups::is_reading() {
+            if found {
+                self.hits += 1;
+            } else {
+                self.misses += 1;
+            }
+        }
     }
 
     /// The slot under `key`, having thrown the key away first if it is dead.
@@ -2040,6 +2088,10 @@ impl Keyspace {
         // hottest key in the database, and it is the one that would have looked
         // steadily more idle the harder it was used.
         if let Some((kind, slot, addr)) = self.memo.get(self.map.writes(), key) {
+            // Remembering where a key was is still finding it, so the count
+            // happens on this path too. A pipeline of `SISMEMBER` on one key
+            // would otherwise report a hit rate that fell as the key got hotter.
+            self.looked(true);
             if kind != want {
                 return Err(wrong_type());
             }
@@ -2053,20 +2105,29 @@ impl Keyspace {
         // would mean probing a second time for a record already read.
         let now = self.clock.now_ms();
         let Some(addr) = self.map.find(key) else {
+            self.looked(false);
             return Ok(None);
         };
         let rec = self.map.value_at(addr);
         if value::is_expired(rec, now) {
             self.reaped(key);
+            self.looked(false);
             return Ok(None);
         }
         if value::kind(rec) != want {
+            // Counted on the way out of each of the three exits below rather
+            // than once above them, because the record is borrowed here and
+            // counting needs the keyspace mutably. On the path that takes an
+            // exit the borrow is over, which is why this compiles and a single
+            // call in front of them would not.
+            self.looked(true);
             return Err(wrong_type());
         }
         // One test of a bit in a byte that is already in a register, on the
         // funnel every collection command comes through. A database with no file
         // behind it never sets it and pays that test and nothing else.
         if value::Meta::from_byte(rec[0]).is_cold() {
+            self.looked(true);
             return self.promote_body(key);
         }
         let slot = value::slot(rec);
@@ -2076,6 +2137,7 @@ impl Keyspace {
         // Both of these are read off the record before the stamp, which needs it
         // mutably and is the end of this borrow.
         let dated = value::expire_at(rec).is_some();
+        self.looked(true);
         if self.policy.stamps_on_read() {
             self.stamp(addr);
         }
@@ -2098,6 +2160,7 @@ impl Keyspace {
         b: Kind,
     ) -> Result<Option<(Kind, u32)>> {
         if let Some((kind, slot, addr)) = self.memo.get(self.map.writes(), key) {
+            self.looked(true);
             if kind != a && kind != b {
                 return Err(wrong_type());
             }
@@ -2108,24 +2171,29 @@ impl Keyspace {
         }
         let now = self.clock.now_ms();
         let Some(addr) = self.map.find(key) else {
+            self.looked(false);
             return Ok(None);
         };
         let rec = self.map.value_at(addr);
         if value::is_expired(rec, now) {
             self.reaped(key);
+            self.looked(false);
             return Ok(None);
         }
         let kind = value::kind(rec);
         if kind != a && kind != b {
+            self.looked(true);
             return Err(wrong_type());
         }
         // As in `live_slot`, and the kind was read before the record was given
         // up because promotion rewrites it.
         if value::Meta::from_byte(rec[0]).is_cold() {
+            self.looked(true);
             return Ok(self.promote_body(key)?.map(|slot| (kind, slot)));
         }
         let slot = value::slot(rec);
         let dated = value::expire_at(rec).is_some();
+        self.looked(true);
         if self.policy.stamps_on_read() {
             self.stamp(addr);
         }
@@ -2177,6 +2245,34 @@ impl Keyspace {
     #[inline]
     pub const fn evicted_keys(&self) -> u64 {
         self.evicted
+    }
+
+    /// Lookups a client's read made here that found the key.
+    ///
+    /// Redis calls this `keyspace_hits` in `INFO stats`, and with the number
+    /// below it is the hit rate every dashboard watching a cache is drawn from.
+    /// Only reads are in it: the lookup a `SET` does on its way to writing a key
+    /// is not a hit and its failing to find one is not a miss. See [`lookups`]
+    /// for how the two are told apart.
+    #[inline]
+    pub const fn hits(&self) -> u64 {
+        self.hits
+    }
+
+    /// Lookups a client's read made here that did not find the key.
+    ///
+    /// Redis calls this `keyspace_misses`. A key found and refused for holding
+    /// the wrong type is not one of these, and neither is a field a hash does not
+    /// have: both of those are lookups that found the key.
+    #[inline]
+    pub const fn misses(&self) -> u64 {
+        self.misses
+    }
+
+    /// Put both of them back to zero, which is `CONFIG RESETSTAT`.
+    pub const fn zero_lookups(&mut self) {
+        self.hits = 0;
+        self.misses = 0;
     }
 
     /// How many live keys carry a deadline.
@@ -2520,6 +2616,64 @@ mod tests {
 
     fn db() -> Keyspace {
         Keyspace::with_clock(Clock::fixed(1_000))
+    }
+
+    #[test]
+    fn the_two_counters_move_only_while_a_read_is_armed() {
+        let mut d = db();
+        d.set_plain(b"k", b"v").expect("room");
+        // The write above and the reads below it are the same lookups as far as
+        // anything in here can tell, and the only thing that separates them is
+        // the setting the wire layer arms.
+        assert_eq!((d.hits(), d.misses()), (0, 0));
+        assert!(d.get(b"k").expect("a string").is_some());
+        assert_eq!((d.hits(), d.misses()), (0, 0), "nothing was armed");
+
+        let armed = lookups::reading(true);
+        assert!(d.get(b"k").expect("a string").is_some());
+        assert!(d.get(b"nope").expect("nothing there").is_none());
+        assert_eq!((d.hits(), d.misses()), (1, 1));
+
+        // And a lookup on the way to a write is not one of them, which is what
+        // every command that reads a key and then writes it turns on.
+        {
+            let _quiet = lookups::quiet();
+            assert!(d.get(b"k").expect("a string").is_some());
+            assert!(d.get(b"nope").expect("nothing there").is_none());
+        }
+        assert_eq!(
+            (d.hits(), d.misses()),
+            (1, 1),
+            "the quiet ones are not in it"
+        );
+
+        drop(armed);
+        assert!(d.get(b"k").expect("a string").is_some());
+        assert_eq!(
+            (d.hits(), d.misses()),
+            (1, 1),
+            "and it stopped when it was dropped"
+        );
+
+        d.zero_lookups();
+        assert_eq!((d.hits(), d.misses()), (0, 0));
+    }
+
+    /// A key that is there but holds the wrong thing was found, so it is a hit,
+    /// and a key that has passed its deadline was not, so it is a miss. Both are
+    /// Redis's answers and neither falls out of what the command returned.
+    #[test]
+    fn a_wrong_type_is_a_hit_and_a_key_past_its_deadline_is_a_miss() {
+        let mut d = db();
+        d.set_plain(b"s", b"v").expect("room");
+        d.psetex(b"dead", 100, b"v").expect("room");
+        let _armed = lookups::reading(true);
+        assert!(d.lrange(b"s", 0, -1).is_err(), "a list read of a string");
+        assert_eq!((d.hits(), d.misses()), (1, 0));
+
+        d.clock().advance(100);
+        assert!(d.get(b"dead").expect("nothing there").is_none());
+        assert_eq!((d.hits(), d.misses()), (1, 1));
     }
 
     #[test]

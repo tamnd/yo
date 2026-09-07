@@ -30,6 +30,7 @@
 use crate::bits::{self, Field, Op, Overflow};
 use crate::db::Db;
 use crate::keyspace::Keyspace;
+use crate::lookups;
 use crate::strings::{STRING_MAX, check_len};
 use crate::value::{self, Kind, Str};
 use yo_common::num::{self, DIGITS_MAX};
@@ -332,6 +333,10 @@ impl Keyspace {
         let (read, write) = flat.split_at_mut(split);
         bits::combine(op, parts(read, &ends), write);
 
+        // The sources above are what a real server counts here. The destination
+        // is written and never read, so the lookups it takes are the ones
+        // Redis's `LOOKUP_WRITE` leaves out. See [`crate::lookups::quiet`].
+        let _quiet = lookups::quiet();
         let outcome = if len == 0 {
             self.del(dest);
             Ok(0)

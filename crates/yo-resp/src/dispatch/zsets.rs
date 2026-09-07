@@ -50,6 +50,7 @@ use yo_common::lock::Held;
 use yo_common::num::DIGITS_MAX;
 use yo_common::num::i64_digits;
 use yo_common::{Error, Result, glob_matches, parse_i64};
+use yo_kv::lookups;
 use yo_kv::{Aggregate, Db, Member, Query, ZAdd, ZBound, ZEnd, ZOp};
 
 use super::args::{self, Args};
@@ -143,11 +144,16 @@ pub(super) fn execute(
             // is found once here for the same reason.
             let key = args.get(1);
             let mut stripe = db.hold(key);
+            // Only the first of these is a lookup of the key. The rest are the
+            // memo answering about the key it has already found, and a real
+            // server counts one lookup here however many members were asked for.
+            let mut quiet = None;
             for i in 2..args.len() {
                 match stripe.zscore(key, args.get(i))? {
                     Some(s) => out.double(s),
                     None => out.nil(),
                 }
+                quiet.get_or_insert_with(lookups::quiet);
             }
         }
         "zrem" => {
@@ -178,6 +184,9 @@ pub(super) fn execute(
             let key = args.get(1);
             let mut stripe = db.hold(key);
             let w = stripe.zwindow(key, &q)?;
+            // The window is the lookup this read is counted for, and the walk
+            // below is the same key a second time.
+            let _quiet = lookups::quiet();
             // The header before the members, because a window knows its own
             // length before anything is walked, which is the whole reason
             // `zwindow` and `zwalk` are two calls.
