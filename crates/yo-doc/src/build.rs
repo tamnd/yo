@@ -737,7 +737,12 @@ mod tests {
 
     #[test]
     fn a_thousand_keys_are_all_findable() {
-        let names: Vec<String> = (0..1_000).map(|i| format!("field{i}")).collect();
+        // Fewer names under Miri. What is being checked is that a lookup finds
+        // every one of them, which is the binary search over the entry table,
+        // and that search is the same search at a hundred and fifty keys as at
+        // a thousand. Both counts below come from the list itself.
+        let count = if cfg!(miri) { 150 } else { 1_000 };
+        let names: Vec<String> = (0..count).map(|i| format!("field{i}")).collect();
         let bytes = built(|b| {
             b.begin_object()?;
             for (i, name) in names.iter().enumerate() {
@@ -747,14 +752,14 @@ mod tests {
             b.end_object()
         });
         let v = Value::new(&bytes).expect("readable");
-        assert_eq!(v.len(), 1_000);
+        assert_eq!(v.len(), names.len());
         for (i, name) in names.iter().enumerate() {
             assert_eq!(
                 v.get(name.as_bytes()).expect("found").as_int(),
                 Some(i as i64)
             );
         }
-        assert!(v.get(b"field1000").is_none());
+        assert!(v.get(format!("field{count}").as_bytes()).is_none());
     }
 
     #[test]
@@ -907,7 +912,13 @@ mod tests {
         );
     }
 
+    /// Not shrunk. The depth is the claim on both sides: that the builder takes
+    /// [`DEPTH_MAX`] levels and refuses the one after it, and that the reader
+    /// then walks all of them. A shallower version says nothing about where the
+    /// limit is, and the limit is a compile time constant so there is no knob
+    /// to move it.
     #[test]
+    #[cfg_attr(miri, ignore = "the depth limit is the claim and it is 128 levels")]
     fn a_document_nests_as_deep_as_the_reader_will_walk_and_no_deeper() {
         let mut b = Builder::new();
         for _ in 0..DEPTH_MAX {

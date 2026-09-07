@@ -122,3 +122,32 @@ pub use read::{Elems, Members, Value, key_order};
 pub use text::{Format, from_json};
 pub use vector::VectorIndex;
 pub use yo_kv::Cursor;
+
+/// Why a test in this crate names two sizes rather than dividing one.
+///
+/// Miri charges per operation, and the operations here are not one price. A
+/// [`Builder`] call is cheap and a count of them can be cut tenfold without
+/// much thought. A [`Docs::put_bytes`] writes the document, hashes its names
+/// into the key table and offers it to every index that is declared, so a
+/// hundred of them inside a test that then runs a search is a minute. The most
+/// expensive thing in the crate is reading a damaged document: the reader
+/// sweeps in [`read`] touch every accessor on every part of a document, and one
+/// of those walks is around six tenths of a second, which is why the fuzz
+/// budget there is cut from twenty thousand rounds to thirty two while the
+/// truncation sweep next to it is left alone.
+///
+/// Where the count is the claim rather than a way of reaching it, the test
+/// keeps its number and is skipped under Miri instead, and says so where it is
+/// skipped. In this crate those are the two limits that are compile time
+/// constants: [`DEPTH_MAX`], which two tests sit exactly on so that the refusal
+/// is the limit and not something short of it, and [`KEYS_MAX`], which two more
+/// fill so that the table has somewhere to overflow from. Neither has a runtime
+/// knob and a smaller version of either would be testing a limit the code does
+/// not have.
+///
+/// The figures above came off a census taken single threaded. Nextest charges a
+/// test that is queued behind another one for the wait, so a parallel census
+/// reads as much as fourteen times too slow and is no use for deciding any of
+/// this.
+#[cfg(test)]
+mod miri {}
