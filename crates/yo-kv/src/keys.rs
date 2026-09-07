@@ -308,51 +308,52 @@ impl Keyspace {
     ///
     /// The caller has already decided that writing over the destination is
     /// allowed, which is why this answers nothing. Whatever was under `key` is
-    /// freed first, body and all, so this cannot leak a slab slot.
+    /// taken away first, record and body both, so this cannot leak a slab slot.
+    ///
+    /// The record goes rather than being written over because this is a key
+    /// arriving and not a value changing. `RESTORE`, `COPY` and `MOVE` all land
+    /// here, and all three of them put a key somewhere it was not, even when
+    /// the name was taken and they were told to take it. The store forms are
+    /// the other case and they go through `Keyspace::put_set` and its
+    /// neighbours, which keep the record where it stands. A client watching for
+    /// keys that were not there before can tell the two apart, so they have to
+    /// be told apart here.
     pub fn import(&mut self, key: &[u8], rec: Record) {
         let at = rec.expire_at;
+        self.drop_key(key);
         match rec.body {
-            // The string path frees the old body itself, because every string
-            // write has to and this is not the place to make it special.
             Body::String(bytes) => self.store(key, &bytes, at),
             Body::Set(set) => {
-                self.free_body(key);
                 let slot = self.sets.insert(set);
                 self.bodies += 1;
                 self.write_slot(key, Kind::Set, slot, at);
             }
             Body::Hash(hash) => {
-                self.free_body(key);
                 let slot = self.hashes.insert(hash);
                 self.bodies += 1;
                 self.write_slot(key, Kind::Hash, slot, at);
             }
             Body::List(list) => {
-                self.free_body(key);
                 let slot = self.lists.insert(list);
                 self.bodies += 1;
                 self.write_slot(key, Kind::List, slot, at);
             }
             Body::Zset(zset) => {
-                self.free_body(key);
                 let slot = self.zsets.insert(zset);
                 self.bodies += 1;
                 self.write_slot(key, Kind::Zset, slot, at);
             }
             Body::Array(array) => {
-                self.free_body(key);
                 let slot = self.arrays.insert(array);
                 self.bodies += 1;
                 self.write_slot(key, Kind::Array, slot, at);
             }
             Body::Stream(stream) => {
-                self.free_body(key);
                 let slot = self.streams.insert(stream);
                 self.bodies += 1;
                 self.write_slot(key, Kind::Stream, slot, at);
             }
             Body::Foreign(body) => {
-                self.free_body(key);
                 let slot = self.foreign.insert(body);
                 self.bodies += 1;
                 self.write_slot(key, Kind::Foreign, slot, at);
@@ -466,7 +467,10 @@ impl Keyspace {
         let mut bytes = std::mem::take(&mut self.scratch);
         bytes.clear();
         bytes.extend_from_slice(self.map.value_at(addr));
-        self.free_body(dst);
+        // The whole key and not just its body, for the reason
+        // [`Keyspace::import`] gives: what lands on the destination is a key
+        // arriving, whether or not the name was taken.
+        self.drop_key(dst);
         self.write_rec(dst, bytes.len(), |out| {
             out.copy_from_slice(&bytes);
         });
@@ -535,7 +539,7 @@ impl Keyspace {
             let mut bytes = std::mem::take(&mut self.scratch);
             bytes.clear();
             bytes.extend_from_slice(self.map.value_at(addr));
-            self.free_body(dst);
+            self.drop_key(dst);
             self.write_rec(dst, bytes.len(), |out| {
                 out.copy_from_slice(&bytes);
             });

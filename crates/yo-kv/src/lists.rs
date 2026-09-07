@@ -644,6 +644,40 @@ impl Keyspace {
         self.bodies += 1;
         at
     }
+
+    /// Put a list of `values` under `key`, replacing whatever was there.
+    ///
+    /// What `SORT ... STORE` writes, and the same shape [`Keyspace::put_set`]
+    /// has for the store forms of the set commands: the value under the name
+    /// changes and the name stays where it stands. That is not the same thing
+    /// as taking the key away and putting a new one there under the same
+    /// spelling, which is what [`Keyspace::import`] does, and a client watching
+    /// for keys that were not there before can tell the difference.
+    ///
+    /// The destination is allowed to be the key that was sorted, because the
+    /// caller has already read out everything it needs. Any deadline the
+    /// destination carried goes with the value, which is what every store form
+    /// does and for the reason [`Keyspace::put_set`] gives.
+    pub(crate) fn put_list<'v>(
+        &mut self,
+        key: &[u8],
+        values: impl Iterator<Item = &'v [u8]> + Clone,
+    ) -> Result<usize> {
+        for v in values.clone() {
+            strings::check_len(key, v.len())?;
+        }
+        self.free_body(key);
+        let at = self.new_list(key);
+        let limits = self.list_limits;
+        let list = self
+            .lists
+            .get_mut(at)
+            .expect("the record points at its body");
+        for v in values {
+            list.push_back(v, &limits);
+        }
+        Ok(list.len())
+    }
 }
 
 impl Db {

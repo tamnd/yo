@@ -36,7 +36,7 @@ use crate::evict;
 use crate::foreign::Foreign;
 use crate::hash::{self, Hash};
 use crate::list::{self, List};
-use crate::reap;
+use crate::news;
 use crate::set::{self, Set};
 use crate::slab::{Bytes, Slab};
 use crate::stream::{self, Stream};
@@ -570,6 +570,13 @@ impl Keyspace {
     ///
     /// Redis stamps at the same moment, in `createObject`, and for the same
     /// reason.
+    ///
+    /// It is also where a key is noticed to be new. The map hands the old value
+    /// to the peek closure and only calls it when there was one, so a call that
+    /// went past without it is a name that was free a moment ago, which is the
+    /// one piece of news [`crate::news`] carries that a command provoked rather
+    /// than nobody. Said after the write and not before it, because a listener
+    /// that goes looking should find the key there.
     pub(crate) fn write_rec(
         &mut self,
         key: &[u8],
@@ -577,6 +584,7 @@ impl Keyspace {
         fill: impl FnOnce(&mut [u8]),
     ) -> Option<usize> {
         let a = self.access_for_write(key);
+        let mut had = false;
         // The one bit in the record that says the key has a deadline, handed
         // straight back to the map. What the map does with it is keep a second
         // index of just those records, so the expire cycle and the volatile
@@ -584,16 +592,20 @@ impl Keyspace {
         // keyspace. Nothing here counts anything: the map's own count of marked
         // records is the number, and a number kept in two places is a number
         // that eventually disagrees with itself.
-        self.map.set_with(
+        let wrote = self.map.set_with(
             key,
             len,
-            |_| {},
+            |_| had = true,
             |out| {
                 fill(out);
                 value::set_access(out, a);
                 value::has_expiry(out)
             },
-        )
+        );
+        if !had {
+            news::say(key, news::What::Born);
+        }
+        wrote
     }
 
     /// Take `key` out of the map, keeping the deadline count right.
@@ -1259,7 +1271,7 @@ impl Keyspace {
         let gone = self.drop_key(key);
         if gone {
             self.expired += 1;
-            reap::went(key, reap::Why::Expired);
+            news::say(key, news::What::Expired);
         }
         gone
     }
@@ -2191,7 +2203,7 @@ impl Keyspace {
             self.evicted += 1;
             // Before the buffer goes back, since that is what is holding the
             // key, and a listener wants the name of what it lost.
-            reap::went(&buf, reap::Why::Evicted);
+            news::say(&buf, news::What::Evicted);
         }
         self.scratch = buf;
         gone
