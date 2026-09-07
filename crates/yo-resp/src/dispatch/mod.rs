@@ -2252,7 +2252,7 @@ pub fn resolved(
     // have failed on its own arguments, since a server that fires from inside
     // the lookup never reached one.
     if let Err(e) = &done {
-        misses::undo(e);
+        misses::undo(spec, e);
     }
     notify::drain(server, armed);
 

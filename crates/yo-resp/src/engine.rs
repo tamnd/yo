@@ -2783,6 +2783,146 @@ mod tests {
         );
     }
 
+    /// A module read says it the same way a core read does, because the module
+    /// API opens its key through the same lookup.
+    #[test]
+    fn a_module_read_says_it_the_way_a_core_read_does() {
+        let (mut r, sub, writer, mut batch) = watching_flags(b"Em");
+
+        r.engine_mut().feed(writer, &wire(&[b"JSON.GET", b"nk"]));
+        r.engine_mut().feed(writer, &wire(&[b"TS.GET", b"nj"]));
+        r.engine_mut()
+            .feed(writer, &wire(&[b"BF.EXISTS", b"nl", b"x"]));
+        r.engine_mut().feed(writer, &wire(&[b"TDIGEST.MIN", b"nm"]));
+        r.engine_mut().feed(writer, &wire(&[b"TOPK.LIST", b"nn"]));
+        r.engine_mut().feed(writer, &wire(&[b"CMS.INFO", b"no"]));
+        r.engine_mut().feed(writer, &wire(&[b"VCARD", b"np"]));
+        pump(&mut r, &mut batch);
+        assert_eq!(
+            fired(&r, sub),
+            [
+                ("keymiss", "nk"),
+                ("keymiss", "nj"),
+                ("keymiss", "nl"),
+                ("keymiss", "nm"),
+                ("keymiss", "nn"),
+                ("keymiss", "no"),
+                ("keymiss", "np")
+            ]
+            .map(|(e, k)| (e.to_owned(), k.to_owned()))
+        );
+
+        // And the one of them that reads a list of keys says it for each,
+        // without stopping at the first empty name.
+        r.engine_mut().sink_mut().clear();
+        r.engine_mut()
+            .feed(writer, &wire(&[b"JSON.MGET", b"nk", b"nj", b"$"]));
+        pump(&mut r, &mut batch);
+        assert_eq!(
+            fired(&r, sub),
+            [("keymiss", "nk"), ("keymiss", "nj")].map(|(e, k)| (e.to_owned(), k.to_owned()))
+        );
+    }
+
+    /// The module commands that say nothing, which are the writes, the two
+    /// reads that were measured quiet, and the whole of the search group bar
+    /// the pair that reads a key rather than an index.
+    #[test]
+    fn the_quiet_module_commands_stay_quiet() {
+        let (mut r, sub, writer, mut batch) = watching_flags(b"Em");
+
+        r.engine_mut()
+            .feed(writer, &wire(&[b"JSON.SET", b"nk", b"$", b"1"]));
+        r.engine_mut()
+            .feed(writer, &wire(&[b"BF.ADD", b"nj", b"x"]));
+        r.engine_mut()
+            .feed(writer, &wire(&[b"TS.ADD", b"nl", b"1000", b"1"]));
+        r.engine_mut().feed(writer, &wire(&[b"TS.INFO", b"nm"]));
+        r.engine_mut().feed(writer, &wire(&[b"CF.COMPACT", b"nn"]));
+        r.engine_mut()
+            .feed(writer, &wire(&[b"JSON.DEBUG", b"HELP"]));
+        r.engine_mut()
+            .feed(writer, &wire(&[b"FT.GET", b"ni", b"no"]));
+        r.engine_mut()
+            .feed(writer, &wire(&[b"FT.SEARCH", b"ni", b"*"]));
+        pump(&mut r, &mut batch);
+        assert_eq!(fired(&r, sub), []);
+
+        // The three that do have a key of their own to be missing.
+        r.engine_mut()
+            .feed(writer, &wire(&[b"JSON.DEBUG", b"MEMORY", b"np"]));
+        r.engine_mut()
+            .feed(writer, &wire(&[b"FT.SUGGET", b"nq", b"x"]));
+        r.engine_mut().feed(writer, &wire(&[b"FT.SUGLEN", b"nr"]));
+        pump(&mut r, &mut batch);
+        assert_eq!(
+            fired(&r, sub),
+            [("keymiss", "np"), ("keymiss", "nq"), ("keymiss", "nr")]
+                .map(|(e, k)| (e.to_owned(), k.to_owned()))
+        );
+    }
+
+    /// A module read keeps a miss that its own arguments went on to spoil,
+    /// where a core read in the same shape takes it back.
+    ///
+    /// The two are the same question asked in a different order. A core command
+    /// reads everything it was sent and then looks, a module command opens its
+    /// key and then reads the rest.
+    #[test]
+    fn a_module_read_keeps_the_miss_a_later_argument_spoiled() {
+        let (mut r, sub, writer, mut batch) = watching_flags(b"Em");
+
+        r.engine_mut()
+            .feed(writer, &wire(&[b"JSON.GET", b"nk", b"$..["]));
+        r.engine_mut().feed(
+            writer,
+            &wire(&[b"VSIM", b"nj", b"ELE", b"e", b"COUNT", b"x"]),
+        );
+        pump(&mut r, &mut batch);
+        assert_eq!(
+            fired(&r, sub),
+            [("keymiss", "nk"), ("keymiss", "nj")].map(|(e, k)| (e.to_owned(), k.to_owned()))
+        );
+    }
+
+    /// The two merges read a destination and then their sources, and stop at
+    /// the first source that is not there because that is where they fail.
+    #[test]
+    fn the_module_merges_stop_at_the_first_empty_source() {
+        let (mut r, sub, writer, mut batch) = watching_flags(b"Em");
+
+        r.engine_mut().feed(
+            writer,
+            &wire(&[b"TDIGEST.MERGE", b"nk", b"2", b"nj", b"nl"]),
+        );
+        pump(&mut r, &mut batch);
+        assert_eq!(
+            fired(&r, sub),
+            [("keymiss", "nk"), ("keymiss", "nj")].map(|(e, k)| (e.to_owned(), k.to_owned()))
+        );
+
+        // The sketch writes its destination rather than reading it, so an empty
+        // name there is not a miss, and it is the end of the command, so the
+        // sources behind it are never opened.
+        r.engine_mut().sink_mut().clear();
+        r.engine_mut()
+            .feed(writer, &wire(&[b"CMS.MERGE", b"nk", b"1", b"nj"]));
+        pump(&mut r, &mut batch);
+        assert_eq!(fired(&r, sub), []);
+
+        // With a destination that is there, the sources are read and the first
+        // empty one is the last thing looked at.
+        r.engine_mut()
+            .feed(writer, &wire(&[b"CMS.INITBYDIM", b"cm", b"100", b"5"]));
+        pump(&mut r, &mut batch);
+        r.engine_mut().sink_mut().clear();
+
+        r.engine_mut()
+            .feed(writer, &wire(&[b"CMS.MERGE", b"cm", b"2", b"nj", b"nl"]));
+        pump(&mut r, &mut batch);
+        assert_eq!(fired(&r, sub), [("keymiss".to_owned(), "nj".to_owned())]);
+    }
+
     /// A subscriber on the four subkey channels and the writer that will feed
     /// them.
     ///

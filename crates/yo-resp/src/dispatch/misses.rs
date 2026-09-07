@@ -43,13 +43,44 @@
 //! out of that for free, since their row says they have no key at argument one,
 //! and `WATCH` falls out because it is not a read.
 //!
-//! # What is not here yet
+//! # The module commands
 //!
-//! The module commands. `JSON.GET`, `TS.GET`, `BF.EXISTS` and the rest do say
-//! `keymiss` on a real server, because the module API's `RedisModule_OpenKey`
-//! goes through the same lookup unless the module passes the flag that turns it
-//! off. Their groups are left out of the list below and it is registered as a
-//! divergence rather than left silent.
+//! They say it too, and for the same reason from one level up: the module API's
+//! `RedisModule_OpenKey` goes through the same lookup, so every module read that
+//! does not pass the flag turning it off fires a miss on an empty name. So a
+//! module command flagged read only reads the keys its row names, which is the
+//! same fallback as the core groups with a different list of groups.
+//!
+//! Four things are not that, and all four were measured rather than reasoned.
+//!
+//! `TS.INFO` and `CF.COMPACT` say nothing, though both are flagged read only.
+//! The first passes the flag and the second opens its key to write it, and
+//! neither is anything the table row can be asked about.
+//!
+//! The search group says nothing at all, and not only for the index commands
+//! that have no key: `FT.GET` and `FT.MGET` name a document key and stay quiet
+//! about it even against an index that exists. The two suggestion dictionary
+//! reads are the exception inside the exception, since what they read is an
+//! ordinary key rather than an index.
+//!
+//! `JSON.DEBUG` keeps its key behind the subcommand, and only the one
+//! subcommand that takes one.
+//!
+//! `TDIGEST.MERGE` and `CMS.MERGE` read a destination and then a list of
+//! sources behind a count, and a source that is not there is an error, so they
+//! stop at the first one. They differ at the destination: the t-digest reads
+//! its own and misses it, the sketch opens its own to write and errors if it is
+//! empty, which means an empty destination there is not a miss and the sources
+//! behind it are never looked at.
+//!
+//! # Why a module command keeps a miss its arguments went on to spoil
+//!
+//! Because the lookup happens first. A core read parses everything it was sent
+//! and only then goes looking, so a bad argument means no lookup and no miss,
+//! which is what [`undo`] is for. A module read opens its key as its first act
+//! and finds out about the rest afterwards, so `TS.RANGE nk notatime +` says
+//! the miss and then complains about the timestamp. Module commands are
+//! therefore left out of the retraction.
 
 use super::args::{self, Args};
 use super::notify::{self, MISS, class};
@@ -61,7 +92,8 @@ use yo_kv::{Db, Kind};
 ///
 /// Everything outside them either has no key at all, like the connection and
 /// server commands, or keeps its state somewhere else, like a search index or a
-/// consumer's fieldset, or is a module command and is waiting its turn.
+/// consumer's fieldset. The module groups are not here because they are picked
+/// out by their flag instead, in [`reads`].
 const READS: &[&str] = &[
     "string",
     "bitmap",
@@ -73,8 +105,63 @@ const READS: &[&str] = &[
     "geo",
     "array",
     "stream",
+    "graph",
     "keyspace",
 ];
+
+/// What was under a key, as much of it as a walk needs to know.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum At {
+    /// Nothing, and a miss was said for it.
+    Gone,
+    /// Something the command will take.
+    Fine,
+    /// Something else, which is where the command stops.
+    Wrong,
+}
+
+impl At {
+    /// Whether the usual walk carries on past this key, which it does unless the
+    /// command is about to fail on what was found.
+    fn goes_on(self) -> bool {
+        self != At::Wrong
+    }
+}
+
+/// Where a walk asks its questions and where the answers go.
+struct Probe<'a> {
+    db: &'a Db,
+    on: usize,
+    accepts: Option<&'static [Kind]>,
+}
+
+impl Probe<'_> {
+    /// What is under a key, said nothing about.
+    ///
+    /// For the one place that has to know whether a name is taken without that
+    /// counting as a read of it, which is `CMS.MERGE` at its destination.
+    fn peek(&self, key: &[u8]) -> Option<Kind> {
+        // This reaps a key whose deadline has passed, which is the same thing
+        // the command's own lookup would have done a moment later. It says
+        // `expired` on the way, and it says it before the miss, which is the
+        // order a real server publishes the pair in.
+        self.db.hold(key).kind_of(key)
+    }
+
+    /// What is under a key, with `keymiss` said for a key that is not there.
+    fn read(&self, key: &[u8]) -> At {
+        match self.peek(key) {
+            None => {
+                notify::fire(self.on, class::KEY_MISS, MISS, key);
+                At::Gone
+            }
+            Some(kind) => match self.accepts {
+                Some(kinds) if !kinds.contains(&kind) => At::Wrong,
+                _ => At::Fine,
+            },
+        }
+    }
+}
 
 /// Say `keymiss` for each key this command is about to read and not find.
 ///
@@ -85,24 +172,12 @@ pub(super) fn report(db: &Db, on: usize, spec: &Spec, args: Args<'_>) {
     if !notify::wanted(class::KEY_MISS) {
         return;
     }
-    let accepts = accepts(spec.name);
-    reads(spec, args, &mut |key| {
-        // The probe reaps a key whose deadline has passed, which is the same
-        // thing the command's own lookup would have done a moment later. It
-        // says `expired` on the way, and it says it before the miss, which is
-        // the order a real server publishes the pair in.
-        match db.hold(key).kind_of(key) {
-            None => {
-                notify::fire(on, class::KEY_MISS, MISS, key);
-                true
-            }
-            // A key that is there and is the wrong thing is where the command
-            // is going to stop, so this stops there too and says nothing about
-            // the keys behind it: `SINTER s nk` with a string at `s` answers
-            // `WRONGTYPE` without ever having looked at `nk`.
-            Some(kind) => accepts.is_none_or(|kinds| kinds.contains(&kind)),
-        }
-    });
+    let probe = Probe {
+        db,
+        on,
+        accepts: accepts(spec.name),
+    };
+    reads(spec, args, &probe);
 }
 
 /// What a command will take at each of the keys it reads, or `None` for one
@@ -125,6 +200,12 @@ fn accepts(name: &str) -> Option<&'static [Kind]> {
         // list at the first key does not stop it from missing at the second.
         "bitop" | "pfcount" | "pfmerge" => Some(&[Kind::String]),
         "xread" | "xreadgroup" => Some(&[Kind::Stream]),
+        // The two merges, whose keys all have to be the module's own type. Every
+        // module body is foreign, so this is as fine a sieve as there is here:
+        // it catches a core value at one of them, which is the case that stops a
+        // real server, and takes another module's value for the module's own,
+        // which is the case nobody sends.
+        "tdigest.merge" | "cms.merge" => Some(&[Kind::Foreign]),
         _ => None,
     }
 }
@@ -143,14 +224,21 @@ fn accepts(name: &str) -> Option<&'static [Kind]> {
 /// are the arguments themselves being wrong, which is the half that never
 /// reached a lookup. `WrongType` and `NotFound` are answers about what was
 /// under the keys, which means the lookups happened.
-pub(super) fn undo(e: &Error) {
+///
+/// Module commands are not in it at all, since theirs is the other order: the
+/// key is opened first and the arguments are read afterwards, so a miss said in
+/// front of one stands whatever the rest of the line turned out to be.
+pub(super) fn undo(spec: &Spec, e: &Error) {
+    if spec.flags.contains(&"module") {
+        return;
+    }
     if matches!(e.code(), Code::Invalid | Code::Unsupported) {
         notify::unsay_misses();
     }
 }
 
-/// Call `say` with each key this command reads, in the order it reads them.
-fn reads(spec: &Spec, args: Args<'_>, say: &mut impl FnMut(&[u8]) -> bool) -> bool {
+/// Ask `probe` about each key this command reads, in the order it reads them.
+fn reads(spec: &Spec, args: Args<'_>, probe: &Probe<'_>) -> bool {
     match spec.name {
         // The writes that read one key first. `GETEX` and `GETDEL` answer with
         // what was there, `COPY` and the stream four go looking for the key
@@ -158,13 +246,13 @@ fn reads(spec: &Spec, args: Args<'_>, say: &mut impl FnMut(&[u8]) -> bool) -> bo
         // or not it stores the answer.
         "getdel" | "getex" | "getset" | "copy" | "delex" | "sort" | "xack" | "xackdel"
         | "xnack" | "xclaim" | "xautoclaim" | "georadius" | "georadiusbymember" => {
-            one(args, 1, say)
+            one(args, 1, probe)
         }
         // `SET` reads only in the shape that answers with the old value, which
         // is the one carrying `GET` somewhere after the value.
         "set" => {
             if (3..args.len()).any(|i| args::is(args.get(i), b"get")) {
-                one(args, 1, say)
+                one(args, 1, probe)
             } else {
                 true
             }
@@ -175,41 +263,100 @@ fn reads(spec: &Spec, args: Args<'_>, say: &mut impl FnMut(&[u8]) -> bool) -> bo
         "bitfield" => {
             let writes = (2..args.len())
                 .any(|i| args::is(args.get(i), b"set") || args::is(args.get(i), b"incrby"));
-            if writes { true } else { one(args, 1, say) }
+            if writes { true } else { one(args, 1, probe) }
         }
         // The store forms whose destination is argument one and whose sources
         // are the rest of the line.
-        "bitop" | "sinterstore" | "sunionstore" | "sdiffstore" => span(spec, args, 1, say),
+        "bitop" | "sinterstore" | "sunionstore" | "sdiffstore" => span(spec, args, 1, probe),
         // The store forms whose sources are behind a count, which starts after
         // the destination.
-        "zunionstore" | "zinterstore" | "zdiffstore" => counted(args, 2, say),
+        "zunionstore" | "zinterstore" | "zdiffstore" => counted(args, 2, probe),
         // The two that store into argument one and read argument two.
-        "zrangestore" | "geosearchstore" => one(args, 2, say),
+        "zrangestore" | "geosearchstore" => one(args, 2, probe),
         // The odd one out: `PFMERGE` reads its destination as well, as a source
         // of its own and before the others, and then writes it.
-        "pfmerge" => span(spec, args, 0, say),
+        "pfmerge" => span(spec, args, 0, probe),
         // The reads whose keys are behind a count at argument one.
         "sintercard" | "sunioncard" | "sdiffcard" | "zdiff" | "zunion" | "zinter"
-        | "zintercard" => counted(args, 1, say),
+        | "zintercard" => counted(args, 1, probe),
         // `XREAD` looks each stream up twice, once to resolve the identifier it
         // was given and once to serve from it, and says the miss both times.
         // `XREADGROUP` reads the group's own position and so only looks once.
-        "xread" => streams(args, say) && streams(args, say),
-        "xreadgroup" => streams(args, say),
+        "xread" => streams(args, probe) && streams(args, probe),
+        "xreadgroup" => streams(args, probe),
         // The container whose key is on the subcommand rather than on the name.
-        "xinfo" => one(args, 2, say),
-        "migrate" => migrated(args, say),
-        _ if spec.flags.contains(&"readonly") && READS.contains(&spec.group) => {
-            span(spec, args, 0, say)
+        "xinfo" => one(args, 2, probe),
+        "migrate" => migrated(args, probe),
+        // The two module reads that say nothing where their row says they
+        // should, and the one that keeps its key behind a subcommand.
+        "ts.info" | "cf.compact" => true,
+        "json.debug" => debugged(args, probe),
+        // The two merges, whose destination is read by one of them and written
+        // by the other, and whose sources stop at the first empty name.
+        "tdigest.merge" | "cms.merge" => merged(spec.name, args, probe),
+        // The one pair in the search group that reads a key rather than an
+        // index. Everything else there says nothing, `FT.GET` and `FT.MGET`
+        // included, so the group is left out of the fallback below.
+        "FT.SUGGET" | "FT.SUGLEN" => one(args, 1, probe),
+        _ if spec.flags.contains(&"readonly")
+            && (READS.contains(&spec.group)
+                || (spec.flags.contains(&"module") && spec.group != "search")) =>
+        {
+            span(spec, args, 0, probe)
         }
         _ => true,
     }
 }
 
+/// `JSON.DEBUG`, whose key is at argument two and only under the one subcommand
+/// that takes one.
+fn debugged(args: Args<'_>, probe: &Probe<'_>) -> bool {
+    if !args::is(args.get(1), b"memory") {
+        return true;
+    }
+    one(args, 2, probe)
+}
+
+/// `TDIGEST.MERGE` and `CMS.MERGE`, which are a destination, a count and that
+/// many sources.
+///
+/// The sources stop at the first one that is not there, because a merge from a
+/// name that is empty is an error and the ones behind it are never opened. The
+/// destinations differ: the t-digest merges into whatever was there and so reads
+/// its own, the sketch has to have been sized already and so writes to its own
+/// and gives up on the spot when the name is empty.
+fn merged(name: &str, args: Args<'_>, probe: &Probe<'_>) -> bool {
+    let Some(dest) = args.opt(1) else {
+        return true;
+    };
+    if name == "cms.merge" {
+        if probe.peek(dest).is_none() {
+            return true;
+        }
+    } else if !probe.read(dest).goes_on() {
+        return true;
+    }
+    let Ok(count) = args.int(2) else {
+        return true;
+    };
+    let Ok(count) = usize::try_from(count) else {
+        return true;
+    };
+    if 3 + count > args.len() {
+        return true;
+    }
+    for i in 0..count {
+        if probe.read(args.get(3 + i)) != At::Fine {
+            return false;
+        }
+    }
+    true
+}
+
 /// One key, at `at`, for a command that reads a single key at a fixed place.
-fn one(args: Args<'_>, at: usize, say: &mut impl FnMut(&[u8]) -> bool) -> bool {
+fn one(args: Args<'_>, at: usize, probe: &Probe<'_>) -> bool {
     match args.opt(at) {
-        Some(key) => say(key),
+        Some(key) => probe.read(key).goes_on(),
         None => true,
     }
 }
@@ -218,7 +365,7 @@ fn one(args: Args<'_>, at: usize, say: &mut impl FnMut(&[u8]) -> bool) -> bool {
 ///
 /// The skip is for the store forms, whose row covers a destination this is not
 /// interested in.
-fn span(spec: &Spec, args: Args<'_>, skip: i32, say: &mut impl FnMut(&[u8]) -> bool) -> bool {
+fn span(spec: &Spec, args: Args<'_>, skip: i32, probe: &Probe<'_>) -> bool {
     if spec.first_key <= 0 {
         return true;
     }
@@ -231,7 +378,7 @@ fn span(spec: &Spec, args: Args<'_>, skip: i32, say: &mut impl FnMut(&[u8]) -> b
     };
     let mut at = spec.first_key + skip * step;
     while at <= last && at < argc {
-        if !say(args.get(at as usize)) {
+        if !probe.read(args.get(at as usize)).goes_on() {
             return false;
         }
         at += step;
@@ -244,7 +391,7 @@ fn span(spec: &Spec, args: Args<'_>, skip: i32, say: &mut impl FnMut(&[u8]) -> b
 /// A count that is not a number, or is negative, or claims more keys than were
 /// sent, is a command that is about to fail on its arguments, so nothing is
 /// said for it rather than something for the part that fits.
-fn counted(args: Args<'_>, at: usize, say: &mut impl FnMut(&[u8]) -> bool) -> bool {
+fn counted(args: Args<'_>, at: usize, probe: &Probe<'_>) -> bool {
     let Ok(count) = args.int(at) else {
         return true;
     };
@@ -255,7 +402,7 @@ fn counted(args: Args<'_>, at: usize, say: &mut impl FnMut(&[u8]) -> bool) -> bo
         return true;
     }
     for i in 0..count {
-        if !say(args.get(at + 1 + i)) {
+        if !probe.read(args.get(at + 1 + i)).goes_on() {
             return false;
         }
     }
@@ -264,9 +411,9 @@ fn counted(args: Args<'_>, at: usize, say: &mut impl FnMut(&[u8]) -> bool) -> bo
 
 /// `MIGRATE`'s keys, which are either the single one at argument three or the
 /// list behind `KEYS` when that argument is the empty string.
-fn migrated(args: Args<'_>, say: &mut impl FnMut(&[u8]) -> bool) -> bool {
+fn migrated(args: Args<'_>, probe: &Probe<'_>) -> bool {
     match args.opt(3) {
-        Some(key) if !key.is_empty() => say(key),
+        Some(key) if !key.is_empty() => probe.read(key).goes_on(),
         _ => {
             // From argument six, which is the first place the option can be:
             // everything before it is the host, the port, the empty key, the
@@ -275,7 +422,7 @@ fn migrated(args: Args<'_>, say: &mut impl FnMut(&[u8]) -> bool) -> bool {
                 return true;
             };
             for i in at + 1..args.len() {
-                if !say(args.get(i)) {
+                if !probe.read(args.get(i)).goes_on() {
                     return false;
                 }
             }
@@ -290,16 +437,16 @@ fn migrated(args: Args<'_>, say: &mut impl FnMut(&[u8]) -> bool) -> bool {
 /// The keyword is looked for from argument one, the same way a real server's own
 /// key finder for these does it, so a group or consumer named `streams` moves
 /// the answer in both places alike.
-fn streams(args: Args<'_>, say: &mut impl FnMut(&[u8]) -> bool) -> bool {
+fn streams(args: Args<'_>, probe: &Probe<'_>) -> bool {
     let Some(at) = (1..args.len()).find(|&i| args::is(args.get(i), b"streams")) else {
         return true;
     };
     let rest = args.len() - at - 1;
-    if rest == 0 || rest % 2 != 0 {
+    if rest == 0 || !rest.is_multiple_of(2) {
         return true;
     }
     for i in 0..rest / 2 {
-        if !say(args.get(at + 1 + i)) {
+        if !probe.read(args.get(at + 1 + i)).goes_on() {
             return false;
         }
     }
