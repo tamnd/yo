@@ -16,7 +16,7 @@
 
 use super::args::{self, Args, is};
 use super::table::{self, Spec};
-use super::{DATABASES, Flow, Server, Session, backup, cpu, multi};
+use super::{DATABASES, Flow, Server, Session, backup, cpu, multi, notify};
 use crate::proto::Proto;
 use crate::reply::Out;
 use core::fmt::Write;
@@ -167,6 +167,15 @@ const DIR: &str = "dir";
 /// `BACKUP CLEANUP`. Writable, since a backup taken by a script that then died
 /// is exactly the thing this is for and setting it afterwards has to work.
 const SEALED_TTL: &str = "backup-sealed-ttl";
+
+/// Which classes of keyspace change are published, and on which two channels.
+///
+/// On its own for a fifth reason: it is the only setting whose value is neither
+/// a number nor one of a fixed list of words, but a set of characters that reads
+/// back in a different spelling from the one it was written in. `CONFIG SET
+/// notify-keyspace-events KEA` reads back as `AKE`. See the `notify` module for
+/// what each character means and why the order is what it is.
+const NOTIFY: &str = "notify-keyspace-events";
 
 /// Read a byte count the way `CONFIG SET maxmemory` reads one.
 ///
@@ -812,6 +821,7 @@ fn config(server: &Server, args: Args<'_>, out: &mut Out) -> Result<()> {
         let store = wanted(MAXSTORE);
         let where_ = wanted(DIR);
         let ttl = wanted(SEALED_TTL);
+        let events = wanted(NOTIFY);
         out.map(
             fixed.clone().count()
                 + ladder.clone().count()
@@ -819,7 +829,8 @@ fn config(server: &Server, args: Args<'_>, out: &mut Out) -> Result<()> {
                 + usize::from(limit)
                 + usize::from(store)
                 + usize::from(where_)
-                + usize::from(ttl),
+                + usize::from(ttl)
+                + usize::from(events),
         );
         for (k, v) in fixed {
             out.bulk(k.as_bytes());
@@ -859,6 +870,14 @@ fn config(server: &Server, args: Args<'_>, out: &mut Out) -> Result<()> {
             out.bulk(SEALED_TTL.as_bytes());
             out.bulk_int(server.backup().ttl() as i64);
         }
+        if events {
+            // The flags and not the string that set them, which is what a real
+            // server answers too and is why the parser has a formatter next to
+            // it rather than the text being kept.
+            out.bulk(NOTIFY.as_bytes());
+            let (buf, len) = notify::format(server.notify_flags());
+            out.bulk(&buf[..len]);
+        }
     } else if is(sub, b"SET") {
         // Too few is a wrong number of arguments and an odd number is a syntax
         // error, which is not the same sentence and is not the same rule. A
@@ -881,6 +900,7 @@ fn config(server: &Server, args: Args<'_>, out: &mut Out) -> Result<()> {
         let mut limit = None;
         let mut store = None;
         let mut ttl = None;
+        let mut events = None;
         let mut i = 2;
         while i < args.len() {
             let (name, value) = (args.get(i), args.get(i + 1));
@@ -944,6 +964,22 @@ fn config(server: &Server, args: Args<'_>, out: &mut Out) -> Result<()> {
                         "CONFIG SET failed (possibly related to argument '{DIR}') - can't set protected config"
                     ),
                 ));
+            }
+            if is(name, NOTIFY.as_bytes()) {
+                // The only setting here whose error names what was wrong with
+                // the value rather than what the value should have been, and it
+                // quotes the accepted characters in the reference's order.
+                let Some(flags) = notify::parse(value) else {
+                    return Err(Error::fmt(
+                        Code::Invalid,
+                        format_args!(
+                            "CONFIG SET failed (possibly related to argument '{NOTIFY}') - Invalid event class character. Use '{}'.",
+                            notify::ACCEPTED
+                        ),
+                    ));
+                };
+                events = Some(flags);
+                continue;
             }
             if is(name, SEALED_TTL.as_bytes()) {
                 let Some(n) = parse_i64(value).filter(|&n| n >= 0) else {
@@ -1017,6 +1053,9 @@ fn config(server: &Server, args: Args<'_>, out: &mut Out) -> Result<()> {
         }
         if let Some(seconds) = ttl {
             server.backup().set_ttl(seconds);
+        }
+        if let Some(flags) = events {
+            server.set_notify_flags(flags);
         }
         // Last, so that a `CONFIG SET maxmemory 1mb maxmemory-policy allkeys-lru`
         // has the policy in place before the limit that will act on it. The two

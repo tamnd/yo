@@ -389,7 +389,7 @@ impl Server {
     /// the same reason it is enough for watches: a subscribe that has not been
     /// published yet has not been answered either, so no client can be waiting
     /// on a message it was never told it would get.
-    fn anyone_subscribed(&self) -> bool {
+    pub(crate) fn anyone_subscribed(&self) -> bool {
         self.subs.load(Relaxed) != 0
     }
 
@@ -590,8 +590,18 @@ fn publish(server: &Server, args: Args<'_>, out: &mut Out, kind: Kind) {
         out.uint(0);
         return;
     }
-    let channel = args.get(1);
-    let payload = args.get(2);
+    out.uint(deliver(server, kind, args.get(1), args.get(2)));
+}
+
+/// Put a message in front of everybody listening for it, and say how many that
+/// was.
+///
+/// Split out from [`publish`] because a keyspace notification is a publish that
+/// no client asked for and that has no reply to write, so it needs everything
+/// this does and none of what is around it. The caller checks
+/// [`Server::anyone_subscribed`] first, since that is the check that makes a
+/// publish to an empty server free and both callers want it.
+pub(crate) fn deliver(server: &Server, kind: Kind, channel: &[u8], payload: &[u8]) -> u64 {
     let reg = server.pubsub.lock();
     let mut body: Option<Arc<Body>> = None;
     let mut sent = 0u64;
@@ -633,7 +643,7 @@ fn publish(server: &Server, args: Args<'_>, out: &mut Out, kind: Kind) {
             }
         }
     }
-    out.uint(sent);
+    sent
 }
 
 /// The message body, built the first time it turns out somebody is listening.

@@ -20,6 +20,7 @@
 //! has a third one with a full stop on the end of it.
 
 use super::args::{self, Args, is};
+use super::notify::{self, class};
 use super::table::Spec;
 use crate::reply::Out;
 use yo_common::num::parse_i64;
@@ -45,7 +46,13 @@ const BAD_OVERFLOW: &str = "Invalid OVERFLOW type specified";
 const RO_GET_ONLY: &str = "BITFIELD_RO only supports the GET subcommand";
 
 /// Run one bitmap command.
-pub(super) fn execute(db: &Db, spec: &Spec, args: Args<'_>, out: &mut Out) -> Result<()> {
+pub(super) fn execute(
+    db: &Db,
+    on: usize,
+    spec: &Spec,
+    args: Args<'_>,
+    out: &mut Out,
+) -> Result<()> {
     match spec.name {
         "setbit" => {
             let offset = offset(args.get(2))?;
@@ -56,6 +63,9 @@ pub(super) fn execute(db: &Db, spec: &Spec, args: Args<'_>, out: &mut Out) -> Re
             };
             let key = args.get(1);
             out.int(i64::from(db.hold(key).setbit(key, offset, bit)?));
+            // Whatever the bit was before and whatever it is now, including a
+            // `SETBIT k 0 0` that changed nothing. Redis says it too.
+            notify::fire(on, class::STRING, "setbit", key);
         }
         "getbit" => {
             let offset = offset(args.get(2))?;
@@ -69,9 +79,9 @@ pub(super) fn execute(db: &Db, spec: &Spec, args: Args<'_>, out: &mut Out) -> Re
             out.int(i64::try_from(set).unwrap_or(i64::MAX));
         }
         "bitpos" => bitpos(db, args, out)?,
-        "bitop" => bitop(db, args, out)?,
-        "bitfield" => bitfield(db, args, out, false)?,
-        "bitfield_ro" => bitfield(db, args, out, true)?,
+        "bitop" => bitop(db, on, args, out)?,
+        "bitfield" => bitfield(db, on, args, out, false)?,
+        "bitfield_ro" => bitfield(db, on, args, out, true)?,
         _ => return Err(args::syntax()),
     }
     Ok(())
@@ -102,7 +112,7 @@ fn bitpos(db: &Db, args: Args<'_>, out: &mut Out) -> Result<()> {
 }
 
 /// `BITOP op dest src [src ...]`.
-fn bitop(db: &Db, args: Args<'_>, out: &mut Out) -> Result<()> {
+fn bitop(db: &Db, on: usize, args: Args<'_>, out: &mut Out) -> Result<()> {
     let op = Op::parse(args.get(1)).ok_or_else(args::syntax)?;
     let sources = args.len() - 3;
     if op == Op::Not && sources != 1 {
@@ -111,8 +121,21 @@ fn bitop(db: &Db, args: Args<'_>, out: &mut Out) -> Result<()> {
     if sources < 2 && matches!(op, Op::Diff | Op::Diff1 | Op::AndOr) {
         return Err(bad(op, "must be called with at least two source keys."));
     }
+    let dst = args.get(2);
+    // Whether the destination was there beforehand, asked only when somebody is
+    // listening, because an operation whose result is empty deletes it and says
+    // `del` and there is no other way to tell that from a delete of nothing.
+    let had = notify::armed() && db.hold(dst).exists(dst);
     let srcs = (3..args.len()).map(|i| args.get(i));
-    out.int(count(db.bitop(op, args.get(2), srcs)?));
+    let len = db.bitop(op, dst, srcs)?;
+    if len > 0 {
+        // `set` and not a name of its own, because what the destination now
+        // holds is a string that was written whole.
+        notify::fire(on, class::STRING, "set", dst);
+    } else if had {
+        notify::fire(on, class::GENERIC, "del", dst);
+    }
+    out.int(count(len));
     Ok(())
 }
 
@@ -128,13 +151,13 @@ fn bad(op: Op, tail: &str) -> Error {
 /// the key alone, and it works out how far the value has to grow on the way
 /// past. The second one parses them again and runs them, writing each reply as
 /// it goes.
-fn bitfield(db: &Db, args: Args<'_>, out: &mut Out, readonly: bool) -> Result<()> {
+fn bitfield(db: &Db, on: usize, args: Args<'_>, out: &mut Out, readonly: bool) -> Result<()> {
     let mut grow: Option<usize> = None;
     let mut at = 2;
     let mut n = 0;
-    let mut on = Overflow::Wrap;
+    let mut over = Overflow::Wrap;
     while at < args.len() {
-        let (sub, next) = parse(args, at, &mut on, readonly)?;
+        let (sub, next) = parse(args, at, &mut over, readonly)?;
         if let Some(sub) = sub {
             n += 1;
             if sub.op != SubOp::Get {
@@ -149,11 +172,11 @@ fn bitfield(db: &Db, args: Args<'_>, out: &mut Out, readonly: bool) -> Result<()
     let key = args.get(1);
     db.hold(key).bitfield_with(key, grow, |bytes| {
         let mut at = 2;
-        let mut on = Overflow::Wrap;
+        let mut over = Overflow::Wrap;
         while at < args.len() {
             // The arguments have been through `parse` once already, so anything
             // it could refuse has been refused and the second pass cannot fail.
-            let (sub, next) = match parse(args, at, &mut on, readonly) {
+            let (sub, next) = match parse(args, at, &mut over, readonly) {
                 Ok(step) => step,
                 Err(_) => break,
             };
@@ -166,6 +189,13 @@ fn bitfield(db: &Db, args: Args<'_>, out: &mut Out, readonly: bool) -> Result<()
             at = next;
         }
     })?;
+    // `grow` is `Some` exactly when one of the subcommands was a `SET` or an
+    // `INCRBY`, so it doubles as the answer to whether anything was written.
+    // A `BITFIELD` of nothing but `GET`s says nothing, and `BITFIELD_RO` cannot
+    // reach this at all.
+    if grow.is_some() {
+        notify::fire(on, class::STRING, "setbit", key);
+    }
     Ok(())
 }
 

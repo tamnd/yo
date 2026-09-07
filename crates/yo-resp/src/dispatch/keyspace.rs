@@ -18,6 +18,7 @@
 
 use super::args::{self, Args};
 use super::indexing::Touched;
+use super::notify::{self, class};
 use super::scan;
 use super::table::Spec;
 use crate::reply::Out;
@@ -150,6 +151,10 @@ pub(super) fn execute<'a>(
                 if held.stripe_mut(db.stripe_of(key)).del(key) {
                     gone += 1;
                     touched.gone(key);
+                    // `UNLINK` says `del` as well, which is measured: the event
+                    // is named after what happened to the key and not after the
+                    // command that did it.
+                    notify::fire(at, class::GENERIC, "del", key);
                 }
             }
             out.int(gone);
@@ -199,13 +204,20 @@ pub(super) fn execute<'a>(
             }
             out.int(hit);
         }
-        "rename" | "renamenx" => rename(db, spec.name, args, out, touched)?,
+        "rename" | "renamenx" => rename(db, at, spec.name, args, out, touched)?,
         "expire" | "pexpire" | "expireat" | "pexpireat" => {
-            expire(db, spec.name, args, out, touched)?;
+            expire(db, at, spec.name, args, out, touched)?;
         }
         "persist" => {
             let key = args.get(1);
-            out.int(i64::from(db.hold(key).persist(key)));
+            let dropped = db.hold(key).persist(key);
+            // Only when a deadline really went. `PERSIST` on a key with no
+            // deadline answers zero and says nothing, which is the rule every
+            // event here follows.
+            if dropped {
+                notify::fire(at, class::GENERIC, "persist", key);
+            }
+            out.int(i64::from(dropped));
         }
         "ttl" | "pttl" | "expiretime" | "pexpiretime" => ask(db, spec.name, args, out),
         "object" => object(db, args, out)?,
@@ -216,7 +228,7 @@ pub(super) fn execute<'a>(
         // `BY w_*` and `GET w_*` are resolved inside the store, one lookup per
         // element, and every one of those lookups can land on a different
         // stripe, so there is nothing to route once at this end.
-        "sort" | "sort_ro" => sort(db, spec.name, args, out, touched)?,
+        "sort" | "sort_ro" => sort(db, at, spec.name, args, out, touched)?,
         // One arm and not a guarded pair, because a guard and the arm behind
         // it would each want this stripe and the second would be waiting on the
         // first.
@@ -231,7 +243,7 @@ pub(super) fn execute<'a>(
                 None => out.nil(),
             }
         }
-        "restore" => restore(db, args, out, touched)?,
+        "restore" => restore(db, at, args, out, touched)?,
         // Every stripe and not one, and the stripe is drawn first so that the
         // key is still drawn from the database rather than from whichever
         // stripe happened to be asked. See [`Db::random_key`].
@@ -414,6 +426,7 @@ fn no_dump(db: &mut Keyspace, key: &[u8]) -> Error {
 /// that in two halves.
 fn rename<'a>(
     db: &Db,
+    at: usize,
     name: &str,
     args: Args<'a>,
     out: &mut Out,
@@ -433,6 +446,12 @@ fn rename<'a>(
     let done = done.found()?;
     if done == Moved::Ok {
         touched.renamed(src, dst);
+        // Two events and in this order, which is what a rename looks like from
+        // a subscriber's side: the old name went and the new name arrived.
+        // `RENAMENX` says the same two, since what happened to the keys is the
+        // same thing.
+        notify::fire(at, class::GENERIC, "rename_from", src);
+        notify::fire(at, class::GENERIC, "rename_to", dst);
     }
     if nx {
         out.int(i64::from(done == Moved::Ok));
@@ -556,8 +575,10 @@ fn copy<'a>(
     };
     if done == Moved::Ok {
         // The destination and not the source, and in the database the copy
-        // landed in rather than the one the connection is on.
+        // landed in rather than the one the connection is on. The event says
+        // the same thing, which is why it is `into` and not `at`.
         touched.wrote(dst);
+        notify::fire(into, class::GENERIC, "copy_to", dst);
     }
     out.int(i64::from(done == Moved::Ok));
     Ok(())
@@ -622,7 +643,13 @@ fn hold_both(dbs: &[Db], from: Spot, to: Spot) -> Both<'_> {
 ///
 /// A ttl is milliseconds from now unless `ABSTTL`, in which case it is a unix
 /// time, and a zero means no deadline at all in both readings.
-fn restore<'a>(db: &Db, args: Args<'a>, out: &mut Out, touched: &mut Touched<'a>) -> Result<()> {
+fn restore<'a>(
+    db: &Db,
+    at: usize,
+    args: Args<'a>,
+    out: &mut Out,
+    touched: &mut Touched<'a>,
+) -> Result<()> {
     let key = args.get(1);
     let mut db = db.hold(key);
     let mut replace = false;
@@ -682,6 +709,9 @@ fn restore<'a>(db: &Db, args: Args<'a>, out: &mut Out, touched: &mut Touched<'a>
     match db.restore(key, args.get(3), expire_at, replace) {
         Ok(_) => {
             touched.wrote(key);
+            // Named after the command for once, because there is no shorter way
+            // to say what happened to the key than that it was restored.
+            notify::fire(at, class::GENERIC, "restore", key);
             out.ok();
         }
         Err(Bad::Footer) => return Err(Error::new(Code::Invalid, BAD_FOOTER)),
@@ -740,6 +770,10 @@ fn move_key(dbs: &[Db], at: usize, args: Args<'_>, out: &mut Out) -> Result<()> 
         return Ok(());
     };
     to.import(key, rec);
+    // One key, two events, on two databases, so a client watching database zero
+    // for a move out of it hears only the first of them.
+    notify::fire(at, class::GENERIC, "move_from", key);
+    notify::fire(into, class::GENERIC, "move_to", key);
     out.int(1);
     Ok(())
 }
@@ -761,6 +795,7 @@ fn move_key(dbs: &[Db], at: usize, args: Args<'_>, out: &mut Out) -> Result<()> 
 /// allocation this parser makes and only when a `GET` was given at all.
 fn sort<'a>(
     db: &Db,
+    at: usize,
     name: &str,
     args: Args<'a>,
     out: &mut Out,
@@ -810,11 +845,24 @@ fn sort<'a>(
 
     match store {
         Some(dst) => {
+            // Whether the destination was there beforehand is something only a
+            // subscriber cares about, because an empty sort deletes it and says
+            // so, and asking costs a stripe lock. So it is asked only when
+            // somebody is listening for the answer.
+            let had = notify::armed() && db.hold(dst).exists(dst);
             let rows = db.sort_store(key, dst, &opts)?;
             // A list where a followed hash used to be, or nothing at all when
             // the sort came back empty, and the read afterwards tells the two
             // apart without this having to.
             touched.wrote(dst);
+            if rows > 0 {
+                // A list event and not a generic one, even though the command
+                // sorts whatever it is pointed at, because what it wrote is a
+                // list.
+                notify::fire(at, class::LIST, "sortstore", dst);
+            } else if had {
+                notify::fire(at, class::GENERIC, "del", dst);
+            }
             out.int(i64::try_from(rows).unwrap_or(i64::MAX));
         }
         None => {
@@ -845,6 +893,7 @@ fn sort<'a>(
 /// away, because that is what Redis puts on the wire.
 fn expire<'a>(
     db: &Db,
+    on: usize,
     name: &str,
     args: Args<'a>,
     out: &mut Out,
@@ -862,11 +911,17 @@ fn expire<'a>(
     out.int(match db.expire(args.get(1), at, cond) {
         // Nothing there, or the condition said no. Redis does not distinguish.
         Applied::Missing | Applied::NotMet => 0,
-        Applied::Ok => 1,
+        Applied::Ok => {
+            notify::fire(on, class::GENERIC, "expire", args.get(1));
+            1
+        }
         // The one of the four the indexes care about: a deadline that has
-        // already passed takes the key with it, so the document goes too.
+        // already passed takes the key with it, so the document goes too. The
+        // event is `del` and not `expired`, because the key did not run out of
+        // time on its own, a client asked for it to be gone.
         Applied::Deleted => {
             touched.gone(args.get(1));
+            notify::fire(on, class::GENERIC, "del", args.get(1));
             1
         }
     });
