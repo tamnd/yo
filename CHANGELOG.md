@@ -4,6 +4,28 @@ What each release changed, why, and what it costs you. The versioning rules and 
 
 While the major is 0, a minor release may break anything, including the on-disk format. The format is frozen at `M6`, not before.
 
+## 0.3.24 — 2026-09-07
+
+Seven pull requests and no milestone has closed, so this is a patch.
+
+All of it is `M8` compatibility work, and almost all of that is keyspace notifications: the six collection classes, the four subkey channels Redis 8 added, and the three events a client hears about that no command's reply covers. A file written by 0.3.23 opens unchanged under this version and a file written by this version opens under 0.3.23. No record kind was added.
+
+### Added
+
+- **The list, set, sorted set, stream and hash notification classes.** A client subscribed to `__keyspace@0__:mykey` or `__keyevent@0__:rpush` now hears about every write those five groups make, which takes the setting from the three classes 0.3.23 shipped to all of them. Four hundred and eleven cases were run against Redis 8.10.1 over a raw socket under twenty settings of the flag, comparing every channel and payload in the order they arrived and the replies alongside them, and they agree on all of them. Most of the work in a class is deciding when to stay quiet, because the reply and the notification answer different questions: `LTRIM` says so even when nothing moved, `SMOVE` onto the set the member came from says nothing, `ZADD` on a member already at that score is not a write, and `HGETEX ... PERSIST` replies the value whether or not there was a deadline to take off.
+- **The four subkey channels Redis 8 added**, which is `__subkeyspace@0__`, `__subkeyevent@0__`, `__subkeyspaceitem@0__` and `__subkeyspaceevent@0__`. They carry the hash fields a command touched, with the length prefixed comma joined field list a real server sends and the same two rules about a key or an event name that would not read back apart, so a client that cares about one field of a large hash can subscribe to that field rather than to the key.
+- **Keys that reached their deadline and keys an eviction took now say so.** These are the first events here that no command asked for, so they leave `yo-kv` on a hook rather than from a call site, and neither of them drags a `del` along behind it, which is what a real server does and is easy to get wrong. The sweep reports the same way the lazy path does, so a key nobody read back still says it went.
+- **A key coming into being now says so too**, on the `new` class that Redis keeps out of `A` on purpose. It goes out on the same hook and from the one function underneath every group that puts a record in the map, which is what puts it in front of the write that caused it without anything having to be told what that order is. Eighty two cases covering every way a key can be created were run against 8.10.1, including `RENAME`, `COPY`, `MOVE`, `RESTORE`, `SORT ... STORE`, `MSET` and the store forms.
+
+### Changed
+
+- **`EXEC` keeps its decode buffer on the session** rather than building one per queued command, so a transaction of a hundred commands allocates once instead of a hundred times.
+- **The allocation gate prints the frames when the site is not in this repository**, which turns a failure that named a file nobody here wrote into one that shows the path from our code into it.
+
+### Fixed
+
+- **The active expire cycle had never run in the deployed server.** The sweep hung off a maintenance slice that the serve loop does not use, so a server that wrote under a deadline and never read the keys back held every one of them until somebody looked. It now runs from the housekeeping call the loop does make, gated to once a millisecond and to a slice of keys, and two hundred keys written with `PX 60` go from `DBSIZE 200` to `0` inside two seconds on an idle server. Anybody who set a deadline and watched memory not come back was hitting this.
+
 ## 0.3.23 — 2026-09-07
 
 Four pull requests and no milestone has closed, so this is a patch.
