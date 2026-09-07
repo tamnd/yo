@@ -190,6 +190,14 @@ pub struct Wire<S> {
     /// should not allocate a vector once a batch to drain into. It is empty
     /// between batches.
     post: Vec<dispatch::Envelope>,
+    /// This thread's connections that are holding a command because the server
+    /// is paused.
+    ///
+    /// The connection and the client id that was on it, for the reason the
+    /// waiter list keeps both: a slot is reused and an id is not, and this is
+    /// what decides which connection gets let go of. Empty on a server nobody
+    /// has paused, which is what keeps the check on the flush path to a length.
+    held: Vec<(ConnId, u64)>,
 }
 
 impl<S: Sink> Wire<S> {
@@ -220,6 +228,7 @@ impl<S: Sink> Wire<S> {
             front: Front::new(sink),
             parked: Vec::new(),
             post: Vec::new(),
+            held: Vec::new(),
             server,
         }
     }
@@ -431,17 +440,19 @@ impl<S: Sink> Wire<S> {
         self.front.owed()
     }
 
-    /// Clients of this thread's that are blocked on a key.
+    /// Clients of this thread's that are blocked on a key, and ones it is
+    /// holding a command for because the server is paused.
     ///
     /// The other thing a driver waiting on readability needs to know, and for
     /// the same reason `owed` is: there is work here that no incoming byte will
     /// wake it for. A blocked client is answered by a write another thread made
-    /// or by its own deadline passing, and neither of those is a byte arriving
-    /// on this thread's poller, so a driver that reads this keeps its wait short
-    /// while anybody is waiting on it.
+    /// or by its own deadline passing, a held one by a deadline nobody else can
+    /// see, and none of those is a byte arriving on this thread's poller, so a
+    /// driver that reads this keeps its wait short while anybody is waiting on
+    /// it.
     #[must_use]
     pub fn waiting(&self) -> usize {
-        self.server.parked_here()
+        self.server.parked_here() + self.held.len()
     }
 
     /// Mail waiting for this thread, plus subscribers of its own that mail
@@ -522,6 +533,30 @@ impl<S: Sink> Wire<S> {
     /// while the id is not, so the id is checked back against the front before
     /// anything happens: a row that outlived its connection would otherwise
     /// close whoever took the slot next.
+    /// Give every connection this thread is holding its commands back.
+    ///
+    /// In the order they were held, so a pause that caught two connections lets
+    /// them go in the order they arrived. The commands go back to the front of
+    /// the ready queue and run on the next pass, which is this same turn of the
+    /// loop: nothing is written here, because nothing was written when they were
+    /// held.
+    fn resume(&mut self) {
+        // Taken and put back so the loop can reach the front, the way the dirty
+        // list is. The capacity comes back with it.
+        let mut held = core::mem::take(&mut self.held);
+        for &(conn, client) in &held {
+            // The slot is reused and the client id is not. A connection that
+            // went away while it was held was already given its commands back by
+            // `hangup`, so this is the check that stops them being handed back
+            // twice, to whoever has the slot now.
+            if self.front.answers(conn, client) && self.front.blocked(conn) {
+                self.front.unpark(conn);
+            }
+        }
+        held.clear();
+        self.held = held;
+    }
+
     fn reap(&mut self) {
         for (conn, client) in self.server.my_kills() {
             self.server.kill_done();
@@ -635,18 +670,24 @@ impl<S: Sink> Engine for Wire<S> {
             let spec = table::at(cmd.spec);
             let mark = out.len();
             let flow = dispatch::resolved(server, session, spec, args, out);
-            // `CLIENT REPLY` is the one thing that can take a reply back after
-            // the command has written it, and this is the only place holding
-            // both the buffer and the decision. The mode is read after the
-            // command rather than before so that `CLIENT REPLY ON` still
-            // answers, which is what a client turning replies back on needs and
-            // is what a real server does.
-            session.finished();
-            session.note_proto(out.proto().version());
-            let mode = session.reply_mode();
-            session.step_reply();
-            if mode != Reply::On {
-                out.truncate(mark);
+            // A command the pause held has not run and is going to be run
+            // again, so none of the bookkeeping below happens for it: it is not
+            // a command this connection has sent yet, as far as everything that
+            // counts commands and steps the reply mode is concerned.
+            if flow != Flow::Hold {
+                // `CLIENT REPLY` is the one thing that can take a reply back
+                // after the command has written it, and this is the only place
+                // holding both the buffer and the decision. The mode is read
+                // after the command rather than before so that `CLIENT REPLY
+                // ON` still answers, which is what a client turning replies
+                // back on needs and is what a real server does.
+                session.finished();
+                session.note_proto(out.proto().version());
+                let mode = session.reply_mode();
+                session.step_reply();
+                if mode != Reply::On {
+                    out.truncate(mark);
+                }
             }
             flow
         } else {
@@ -655,6 +696,19 @@ impl<S: Sink> Engine for Wire<S> {
             // this is not an early return.
             Flow::Continue
         };
+
+        // The server is paused and this command has not run. It goes back to the
+        // connection, decoder and all, and the connection stops taking commands
+        // until the pause is over, which is the same shape a blocking command
+        // leaves things in. The client id goes on this thread's list because a
+        // slot is reused and an id is not, and letting go is the one thing that
+        // must not happen to the wrong connection.
+        if flow == Flow::Hold {
+            self.front.hold(conn, cmd);
+            let client = self.front.client(conn);
+            yo_alloc::allow(|| self.held.push((conn, client)));
+            return yo_reactor::Flow::Next;
+        }
 
         self.front.done(&cmd);
         if self.front.gone(conn) {
@@ -676,6 +730,9 @@ impl<S: Sink> Engine for Wire<S> {
                     let client = self.front.client(conn);
                     self.server.bind_waiter(client, conn);
                 }
+                // Answered above and returned from there, so there is nothing
+                // left to do with it here.
+                Flow::Hold => {}
                 Flow::Continue => self.front.soil(conn),
             }
         }
@@ -704,6 +761,18 @@ impl<S: Sink> Engine for Wire<S> {
         if self.server.parked_here() != 0 {
             self.server.refresh_clock();
             self.serve_waiters();
+        }
+
+        // Then the connections this thread is holding a command for, if the
+        // pause they are waiting on has run out. A length on a server nobody has
+        // paused, and it is here for the reason the sweep above is: the pause
+        // ends by a clock and not by anything arriving, so the turn that ran
+        // nothing is the turn that has to notice.
+        if !self.held.is_empty() {
+            self.server.refresh_clock();
+            if self.server.paused(self.server.now_ms()).is_none() {
+                self.resume();
+            }
         }
 
         // Then the connections another thread asked to have closed. One load on
@@ -774,39 +843,49 @@ impl<S: Sink> Engine for Wire<S> {
 pub fn pump<S: Sink>(reactor: &mut Reactor<Wire<S>>, batch: &mut Vec<Cmd>) -> usize {
     let mut ran = 0;
     reactor.engine_mut().tick();
+    // The outer round is for the pause and nothing else. The flush at the end of
+    // the inner one is what lets go of a connection the pause was holding, and
+    // what that hands back is commands rather than replies, so there has to be
+    // somewhere for them to run. It goes round twice at most: the pause is over
+    // by the time anything is handed back, so nothing can be held again.
     loop {
-        batch.clear();
-        if reactor.engine_mut().take_ready(batch, BATCH_MAX) == 0 {
+        loop {
+            batch.clear();
+            if reactor.engine_mut().take_ready(batch, BATCH_MAX) == 0 {
+                break;
+            }
+            // The command path, and therefore the thing Y7 is about. The guard is
+            // what arms `yo-alloc`, and it covers dispatch and nothing else: framing
+            // before it and writing the replies after it are both allowed to reach
+            // for the heap, and only running the commands is not.
+            //
+            // It goes here rather than around the whole loop because `take_ready`
+            // and `flush` are on the other side of that line, and because a batch is
+            // the unit a caller can reason about. Under the default mode this is one
+            // relaxed load.
+            let armed = yo_alloc::guard();
+            ran += reactor.execute_all(batch.drain(..));
+            drop(armed);
+            reactor.engine_mut().flush();
+            // After the replies are out, so the batch that made the garbage is not
+            // the batch that waits for it to be collected.
+            reactor.engine_mut().maintain();
+        }
+        // Once for a turn that ran nothing at all, which is where a server that has
+        // gone quiet catches up on what the last busy turn left behind.
+        reactor.engine_mut().maintain();
+        // Then once more for a connection with something to say and nothing to run:
+        // a protocol error, or a socket that was full the last time round, or a
+        // subscriber the housekeeping above owes the news that a key it was told to
+        // watch reached its deadline. That last one is why the flush is after the
+        // call rather than before it: an idle server turns every twenty
+        // milliseconds, and news that waits for the next turn is news that arrives
+        // twenty milliseconds after the thing it is about.
+        reactor.engine_mut().flush();
+        if reactor.engine().ready() == 0 {
             break;
         }
-        // The command path, and therefore the thing Y7 is about. The guard is
-        // what arms `yo-alloc`, and it covers dispatch and nothing else: framing
-        // before it and writing the replies after it are both allowed to reach
-        // for the heap, and only running the commands is not.
-        //
-        // It goes here rather than around the whole loop because `take_ready`
-        // and `flush` are on the other side of that line, and because a batch is
-        // the unit a caller can reason about. Under the default mode this is one
-        // relaxed load.
-        let armed = yo_alloc::guard();
-        ran += reactor.execute_all(batch.drain(..));
-        drop(armed);
-        reactor.engine_mut().flush();
-        // After the replies are out, so the batch that made the garbage is not
-        // the batch that waits for it to be collected.
-        reactor.engine_mut().maintain();
     }
-    // Once for a turn that ran nothing at all, which is where a server that has
-    // gone quiet catches up on what the last busy turn left behind.
-    reactor.engine_mut().maintain();
-    // Then once more for a connection with something to say and nothing to run:
-    // a protocol error, or a socket that was full the last time round, or a
-    // subscriber the housekeeping above owes the news that a key it was told to
-    // watch reached its deadline. That last one is why the flush is after the
-    // call rather than before it: an idle server turns every twenty
-    // milliseconds, and news that waits for the next turn is news that arrives
-    // twenty milliseconds after the thing it is about.
-    reactor.engine_mut().flush();
     ran
 }
 
@@ -3436,10 +3515,7 @@ mod tests {
         r.engine_mut()
             .feed(one, &wire(&[b"CLIENT", b"KILL", b"10.0.0.9:9999"]));
         pump(&mut r, &mut batch);
-        assert_eq!(
-            r.engine().sink().sent(one),
-            b"-ERR No such client\r\n"
-        );
+        assert_eq!(r.engine().sink().sent(one), b"-ERR No such client\r\n");
 
         r.engine_mut().sink_mut().clear();
         r.engine_mut()
@@ -3487,5 +3563,208 @@ mod tests {
         pump(&mut r, &mut batch);
         let sent = String::from_utf8_lossy(r.engine().sink().sent(one)).into_owned();
         assert_eq!(sent.lines().filter(|l| l.starts_with("id=")).count(), 1);
+    }
+
+    /// A write pause holds the writes and lets the reads through, and the write
+    /// runs by itself once the pause has run out.
+    #[test]
+    fn a_write_pause_holds_the_writes_and_lets_the_reads_through() {
+        let (mut r, one, mut batch) = timed();
+        let two = r.engine_mut().accept();
+
+        r.engine_mut()
+            .feed(one, &wire(&[b"CLIENT", b"PAUSE", b"500", b"WRITE"]));
+        pump(&mut r, &mut batch);
+        assert_eq!(r.engine().sink().sent(one), b"+OK\r\n");
+
+        r.engine_mut().sink_mut().clear();
+        r.engine_mut().feed(two, &wire(&[b"GET", b"k"]));
+        r.engine_mut().feed(two, &wire(&[b"SET", b"k", b"v"]));
+        pump(&mut r, &mut batch);
+        assert_eq!(
+            r.engine().sink().sent(two),
+            b"$-1\r\n",
+            "the read answered and the write is being held"
+        );
+        assert_eq!(r.engine().waiting(), 1, "the held connection");
+
+        r.engine_mut().sink_mut().clear();
+        r.engine().server().advance_clock_ms(500);
+        pump(&mut r, &mut batch);
+        assert_eq!(r.engine().sink().sent(two), b"+OK\r\n");
+        assert_eq!(r.engine().waiting(), 0);
+    }
+
+    /// Everything, including the command that would call the pause off.
+    #[test]
+    fn an_all_pause_holds_every_command_and_cannot_be_called_off() {
+        let (mut r, one, mut batch) = timed();
+        let two = r.engine_mut().accept();
+
+        r.engine_mut()
+            .feed(one, &wire(&[b"CLIENT", b"PAUSE", b"500", b"ALL"]));
+        pump(&mut r, &mut batch);
+
+        r.engine_mut().sink_mut().clear();
+        r.engine_mut().feed(two, &wire(&[b"PING"]));
+        r.engine_mut().feed(two, &wire(&[b"CLIENT", b"UNPAUSE"]));
+        pump(&mut r, &mut batch);
+        assert_eq!(r.engine().sink().sent(two), b"", "not even the ping");
+
+        r.engine().server().advance_clock_ms(499);
+        pump(&mut r, &mut batch);
+        assert_eq!(r.engine().sink().sent(two), b"", "still inside the pause");
+
+        r.engine().server().advance_clock_ms(1);
+        pump(&mut r, &mut batch);
+        assert_eq!(
+            r.engine().sink().sent(two),
+            b"+PONG\r\n+OK\r\n",
+            "both, in the order they were sent"
+        );
+    }
+
+    /// A pause already running is widened by the next one and never narrowed.
+    #[test]
+    fn a_shorter_pause_does_not_shorten_the_one_already_running() {
+        let (mut r, one, mut batch) = timed();
+        let two = r.engine_mut().accept();
+
+        r.engine_mut()
+            .feed(one, &wire(&[b"CLIENT", b"PAUSE", b"500", b"WRITE"]));
+        r.engine_mut()
+            .feed(one, &wire(&[b"CLIENT", b"PAUSE", b"10", b"WRITE"]));
+        pump(&mut r, &mut batch);
+        assert_eq!(r.engine().server().pause_ends(), START_MS + 500);
+
+        r.engine_mut().sink_mut().clear();
+        r.engine_mut().feed(two, &wire(&[b"SET", b"k", b"v"]));
+        r.engine().server().advance_clock_ms(100);
+        pump(&mut r, &mut batch);
+        assert_eq!(r.engine().sink().sent(two), b"", "the longer end holds");
+
+        r.engine().server().advance_clock_ms(400);
+        pump(&mut r, &mut batch);
+        assert_eq!(r.engine().sink().sent(two), b"+OK\r\n");
+    }
+
+    /// And a write pause on top of an all pause leaves it holding everything.
+    #[test]
+    fn a_write_pause_on_top_of_an_all_pause_still_holds_the_reads() {
+        let (mut r, one, mut batch) = timed();
+        let two = r.engine_mut().accept();
+
+        r.engine_mut()
+            .feed(one, &wire(&[b"CLIENT", b"PAUSE", b"500", b"ALL"]));
+        pump(&mut r, &mut batch);
+        // From the connection that armed it, which is held by it as well, so
+        // this is the one that runs when the pause runs out.
+        r.engine_mut()
+            .feed(one, &wire(&[b"CLIENT", b"PAUSE", b"500", b"WRITE"]));
+
+        r.engine_mut().sink_mut().clear();
+        r.engine_mut().feed(two, &wire(&[b"GET", b"k"]));
+        r.engine().server().advance_clock_ms(200);
+        pump(&mut r, &mut batch);
+        assert_eq!(r.engine().sink().sent(two), b"", "still everything");
+    }
+
+    /// `CLIENT UNPAUSE` lets go of a write pause at once.
+    #[test]
+    fn unpause_lets_go_of_a_write_pause_at_once() {
+        let (mut r, one, mut batch) = timed();
+        let two = r.engine_mut().accept();
+
+        r.engine_mut()
+            .feed(one, &wire(&[b"CLIENT", b"PAUSE", b"5000", b"WRITE"]));
+        pump(&mut r, &mut batch);
+        r.engine_mut().feed(two, &wire(&[b"SET", b"k", b"v"]));
+        pump(&mut r, &mut batch);
+        assert_eq!(r.engine().sink().sent(two), b"");
+
+        r.engine_mut().sink_mut().clear();
+        r.engine_mut().feed(one, &wire(&[b"CLIENT", b"UNPAUSE"]));
+        pump(&mut r, &mut batch);
+        assert_eq!(r.engine().sink().sent(two), b"+OK\r\n");
+    }
+
+    /// A transaction of nothing but reads runs through a write pause, and one
+    /// write anywhere in it makes the whole transaction wait.
+    #[test]
+    fn a_write_pause_holds_an_exec_only_when_the_transaction_writes() {
+        let (mut r, one, mut batch) = timed();
+        let two = r.engine_mut().accept();
+        let three = r.engine_mut().accept();
+
+        for conn in [two, three] {
+            r.engine_mut().feed(conn, &wire(&[b"MULTI"]));
+            r.engine_mut().feed(conn, &wire(&[b"GET", b"k"]));
+        }
+        r.engine_mut().feed(three, &wire(&[b"SET", b"k", b"v"]));
+        pump(&mut r, &mut batch);
+
+        r.engine_mut()
+            .feed(one, &wire(&[b"CLIENT", b"PAUSE", b"500", b"WRITE"]));
+        pump(&mut r, &mut batch);
+
+        r.engine_mut().sink_mut().clear();
+        r.engine_mut().feed(two, &wire(&[b"EXEC"]));
+        r.engine_mut().feed(three, &wire(&[b"EXEC"]));
+        pump(&mut r, &mut batch);
+        assert_eq!(r.engine().sink().sent(two), b"*1\r\n$-1\r\n", "reads only");
+        assert_eq!(r.engine().sink().sent(three), b"", "one write in it");
+
+        r.engine_mut().sink_mut().clear();
+        r.engine().server().advance_clock_ms(500);
+        pump(&mut r, &mut batch);
+        assert_eq!(r.engine().sink().sent(three), b"*2\r\n$-1\r\n+OK\r\n");
+    }
+
+    /// A connection that goes away while it is being held does not leave the
+    /// slot owed to somebody who is never coming back for it.
+    #[test]
+    fn a_held_connection_that_hangs_up_lets_go_of_its_slot() {
+        let (mut r, one, mut batch) = timed();
+        let two = r.engine_mut().accept();
+
+        r.engine_mut()
+            .feed(one, &wire(&[b"CLIENT", b"PAUSE", b"500", b"ALL"]));
+        pump(&mut r, &mut batch);
+        r.engine_mut().feed(two, &wire(&[b"PING"]));
+        pump(&mut r, &mut batch);
+        assert_eq!(r.engine().waiting(), 1);
+
+        r.engine_mut().hangup(two);
+        pump(&mut r, &mut batch);
+        assert_eq!(r.engine().server().client_count(), 1);
+
+        r.engine().server().advance_clock_ms(500);
+        pump(&mut r, &mut batch);
+        assert_eq!(r.engine().waiting(), 0, "nothing left holding a slot");
+    }
+
+    /// The command a connection is being held on is the one its row names, the
+    /// way a real server names the command it postponed.
+    #[test]
+    fn a_held_connection_names_the_command_it_is_waiting_to_run() {
+        let (mut r, one, mut batch) = timed();
+        let two = r.engine_mut().accept();
+
+        r.engine_mut()
+            .feed(one, &wire(&[b"CLIENT", b"PAUSE", b"500", b"WRITE"]));
+        pump(&mut r, &mut batch);
+        r.engine_mut().feed(two, &wire(&[b"SET", b"k", b"v"]));
+        pump(&mut r, &mut batch);
+
+        r.engine_mut().sink_mut().clear();
+        r.engine().server().advance_clock_ms(0);
+        r.engine_mut().feed(one, &wire(&[b"CLIENT", b"LIST"]));
+        // The connection that asked is held by its own pause, so the answer only
+        // arrives once the pause is over, and the row it reports is the one the
+        // held connection published before it was held.
+        r.engine().server().advance_clock_ms(500);
+        pump(&mut r, &mut batch);
+        let sent = String::from_utf8_lossy(r.engine().sink().sent(one)).into_owned();
+        assert!(sent.contains("cmd=set"), "{sent}");
     }
 }

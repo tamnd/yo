@@ -27,11 +27,20 @@
 //! # Why the rows are a vector
 //!
 //! A connection opening pushes and a connection closing scans for its id and
-//! swaps the last row into the hole. That is linear in the number of clients on
-//! a disconnect, which sounds worse than it is: the same walk is what `CLIENT
-//! LIST` does, Redis keeps its clients in a list and walks it in the same
-//! places, and a server with ten thousand connections is doing ten thousand
+//! lifts that row out, keeping the ones behind it in the order they opened in,
+//! which is the order `CLIENT LIST` reports. That is linear in the number of
+//! clients on a disconnect, which sounds worse than it is: the same walk is what
+//! `CLIENT LIST` does, Redis keeps its clients in a list and walks it in the
+//! same places, and a server with ten thousand connections is doing ten thousand
 //! compares on a socket close and nothing on a command.
+//!
+//! # The pause is here too
+//!
+//! `CLIENT PAUSE` is not about one connection and does not touch a row, but it
+//! is the same shape of problem: one connection arms something that every other
+//! connection on every other thread has to see. It is one word on the server,
+//! read once per command, and it lives beside the rows because `CLIENT` is what
+//! writes it and what clears it.
 
 use std::sync::Arc;
 use std::sync::atomic::Ordering::{Acquire, Relaxed, Release};
@@ -370,5 +379,70 @@ impl super::Server {
                 .map(|row| (row.conn.load(Relaxed), row.id))
                 .collect()
         })
+    }
+
+    /// Hold commands until `until_ms`, either all of them or only the writes.
+    ///
+    /// A pause already running is not replaced, it is widened. The later of the
+    /// two deadlines wins and the stricter of the two modes wins, so a client
+    /// that asked for everything to stop cannot have that undone by another
+    /// client asking for only the writes to stop. That is Redis's rule and it is
+    /// the one that makes the command safe to use for a failover, which is what
+    /// it is for.
+    ///
+    /// A pause whose deadline has already gone by counts as no pause, so the
+    /// widening only ever looks at one that is still running.
+    pub fn pause(&self, until_ms: u64, all: bool) {
+        // The deadline shares the word with the mode bit, so it has one bit less
+        // than a `u64` to sit in. A pause of a hundred and forty million years
+        // is the same as one of two hundred and eighty for everybody who has to
+        // live through it.
+        let until_ms = until_ms.min(u64::MAX >> 1);
+        let want = (until_ms << 1) | u64::from(all);
+        let mut have = self.pause.load(Relaxed);
+        loop {
+            let live = have != 0 && (have >> 1) > self.now_ms();
+            let next = if live {
+                ((have >> 1).max(until_ms) << 1) | (have & 1) | u64::from(all)
+            } else {
+                want
+            };
+            match self
+                .pause
+                .compare_exchange_weak(have, next, Release, Relaxed)
+            {
+                Ok(_) => return,
+                Err(seen) => have = seen,
+            }
+        }
+    }
+
+    /// Let everybody go, which is `CLIENT UNPAUSE`.
+    pub fn unpause(&self) {
+        self.pause.store(0, Release);
+    }
+
+    /// Whether commands are being held right now, and whether that is all of
+    /// them.
+    ///
+    /// `None` is the answer on a server nobody has paused, and it costs one
+    /// relaxed load and a test against zero, which is what every command pays.
+    /// The deadline is only read on a server where somebody has.
+    #[must_use]
+    pub fn paused(&self, now_ms: u64) -> Option<bool> {
+        let word = self.pause.load(Relaxed);
+        if word == 0 || (word >> 1) <= now_ms {
+            return None;
+        }
+        Some(word & 1 == 1)
+    }
+
+    /// When the pause runs out, in milliseconds, or zero if none is armed.
+    ///
+    /// Read by a test rather than by the command path, which asks the question
+    /// above instead.
+    #[must_use]
+    pub fn pause_ends(&self) -> u64 {
+        self.pause.load(Relaxed) >> 1
     }
 }

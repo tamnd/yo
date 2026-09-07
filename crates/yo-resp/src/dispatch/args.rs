@@ -160,6 +160,28 @@ pub fn unknown_subcommand(sub: &[u8], container: &str) -> Error {
     })
 }
 
+/// `ERR unknown subcommand or wrong number of arguments for 'X'. Try CLIENT
+/// HELP.`
+///
+/// The other sentence a container says, and Redis keeps the two apart by which
+/// end of the parse found the problem. A name that is no subcommand at all gets
+/// the one above, and a subcommand that is real but was handed something it
+/// cannot read gets this one, which is why it names the subcommand rather than
+/// what was wrong with it.
+#[must_use]
+pub fn subcommand_syntax(sub: &[u8], container: &str) -> Error {
+    yo_alloc::allow(|| {
+        Error::fmt(
+            Code::Unsupported,
+            format_args!(
+                "unknown subcommand or wrong number of arguments for '{}'. Try {} HELP.",
+                String::from_utf8_lossy(sub),
+                container
+            ),
+        )
+    })
+}
+
 /// `ERR invalid expire time in 'x' command`.
 #[must_use]
 pub fn invalid_expire(name: &str) -> Error {
