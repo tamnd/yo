@@ -1653,7 +1653,7 @@ mod tests {
         // The bound leans early and only a reap that walks puts it right, so
         // this is what it takes to get a hash that is on the wider band and has
         // nothing left to say about deadlines.
-        hash.reap(6_000);
+        hash.reap(6_000, |_| {});
         assert_eq!(hash.encoding(), hash::Encoding::ListpackEx);
         assert_eq!(hash.soonest_deadline(), None);
         let rec = Record::new(Body::Hash(hash.clone()), None);

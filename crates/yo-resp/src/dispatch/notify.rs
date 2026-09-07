@@ -349,7 +349,7 @@ pub(crate) fn about(db: usize) -> usize {
 /// happens, which is before the command that provoked it has said what it did.
 /// That is the order a real server publishes in and it comes out of where this
 /// is called from rather than out of anything here.
-fn heard(key: &[u8], what: news::What) {
+fn heard(key: &[u8], what: news::What, field: &[u8]) {
     // None of them brings a companion event along with it. A key that reached
     // its deadline and a key a client deleted are two different pieces of news,
     // and so are a key that was created and the write that created it, and a
@@ -359,10 +359,56 @@ fn heard(key: &[u8], what: news::What) {
         news::What::Overwritten => (class::OVERWRITTEN, "overwritten"),
         news::What::TypeChanged => (class::TYPE_CHANGED, "type_changed"),
         news::What::Expired => (class::EXPIRED, "expired"),
+        news::What::FieldExpired => return field_expired(key, field),
+        news::What::Deleted => (class::GENERIC, "del"),
         news::What::Evicted => (class::EVICTED, "evicted"),
         news::What::Missed => (class::KEY_MISS, MISS),
     };
     fire(WHERE.get(), class, name, key);
+}
+
+/// What a hash field reaching its own deadline is called.
+///
+/// Named here for the reason [`MISS`] is: the batching below has to recognise
+/// the event it is adding to, and a name two places agree on is a constant.
+const HEXPIRED: &str = "hexpired";
+
+/// Add one field to the `hexpired` this key is already saying, or start one.
+///
+/// A reap goes field by field and a real server sends one event carrying the
+/// whole list, so the list is put back together here. That is what the storage
+/// layer would otherwise have to build itself, and it would have to build it out
+/// of names it is in the middle of deleting.
+///
+/// Looking at the last event queued is enough to find the one to add to. A reap
+/// is one key at a time and says nothing else while it runs, so an `hexpired`
+/// for this key anywhere further back belongs to an earlier reap and is a
+/// separate event, which is what a real server sends for it too.
+fn field_expired(key: &[u8], field: &[u8]) {
+    if ARMED.get() & class::HASH == 0 {
+        return;
+    }
+    let db = WHERE.get();
+    let wanted = subkeys_wanted(class::HASH);
+    PENDING.with_borrow_mut(|pending| {
+        yo_alloc::allow(|| match pending.last_mut() {
+            Some(last) if last.name == HEXPIRED && last.db == db && last.key == key => {
+                if wanted {
+                    last.subs.push(field.to_vec());
+                }
+            }
+            _ => pending.push(Event {
+                db,
+                name: HEXPIRED,
+                key: key.to_vec(),
+                subs: if wanted {
+                    vec![field.to_vec()]
+                } else {
+                    Vec::new()
+                },
+            }),
+        });
+    });
 }
 
 /// What a read that found nothing is called.
@@ -825,6 +871,59 @@ mod tests {
         let mut out = Vec::new();
         cat(&mut out, &[]);
         assert_eq!(out, b"");
+    }
+
+    /// A reap that takes several fields of one hash says so once, because that
+    /// is what a real server publishes and a client counting events would see a
+    /// different number otherwise. Two keys are two events even when they are
+    /// reaped in the same breath.
+    #[test]
+    fn several_fields_of_one_key_come_out_as_one_event() {
+        ARMED.set(class::HASH | class::SUBKEYSPACE);
+        WHERE.set(3);
+        heard(b"h", news::What::FieldExpired, b"a");
+        heard(b"h", news::What::FieldExpired, b"b");
+        heard(b"g", news::What::FieldExpired, b"c");
+        heard(b"h", news::What::FieldExpired, b"d");
+        let events = PENDING.with_borrow_mut(std::mem::take);
+        ARMED.set(0);
+        WHERE.set(0);
+        let seen: Vec<_> = events
+            .iter()
+            .map(|e| (e.name, e.db, e.key.clone(), e.subs.clone()))
+            .collect();
+        assert_eq!(
+            seen,
+            vec![
+                (
+                    "hexpired",
+                    3,
+                    b"h".to_vec(),
+                    vec![b"a".to_vec(), b"b".to_vec()]
+                ),
+                ("hexpired", 3, b"g".to_vec(), vec![b"c".to_vec()]),
+                // The same key again after another one is a second event, since
+                // only the last one queued is looked at. Nothing reaps two keys
+                // at once, so this shape does not arise, and if it ever does the
+                // worst of it is an extra publish.
+                ("hexpired", 3, b"h".to_vec(), vec![b"d".to_vec()]),
+            ]
+        );
+    }
+
+    /// And with the subkey channels off the event still fires, since `hexpired`
+    /// goes out on the two ordinary channels like every other event. It just has
+    /// no field list to carry, so there is nothing to copy.
+    #[test]
+    fn the_field_names_are_only_collected_when_something_wants_them() {
+        ARMED.set(class::HASH | class::KEYSPACE);
+        heard(b"h", news::What::FieldExpired, b"a");
+        heard(b"h", news::What::FieldExpired, b"b");
+        let events = PENDING.with_borrow_mut(std::mem::take);
+        ARMED.set(0);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].name, "hexpired");
+        assert!(events[0].subs.is_empty());
     }
 
     /// The four subkey channels are channels and not classes, so a setting that

@@ -38,6 +38,7 @@ use yo_common::{Code, Error, Result};
 
 use crate::hash::{Hash, Text};
 use crate::keyspace::Keyspace;
+use crate::news;
 use crate::scan::Cursor;
 use crate::strings;
 use crate::ttl::{self, Applied, Ask, Cond};
@@ -272,6 +273,7 @@ impl Keyspace {
             return Ok(());
         };
         let now = self.clock.now_ms();
+        let listed = self.hash_at(slot).takes_deadlines();
         let mut emptied = false;
         for field in fields {
             let hash = self.hash_at_mut(slot);
@@ -281,6 +283,8 @@ impl Keyspace {
         }
         if emptied {
             self.drop_key(key);
+        } else {
+            self.watch_fields(key, slot, listed);
         }
         Ok(())
     }
@@ -402,6 +406,7 @@ impl Keyspace {
             return Ok(());
         };
         let now = self.clock.now_ms();
+        let listed = self.hash_at(slot).takes_deadlines();
         for field in fields {
             let hash = self.hash_at_mut(slot);
             f(hash.get(field));
@@ -421,6 +426,8 @@ impl Keyspace {
         }
         if self.hash_at(slot).is_empty() {
             self.drop_key(key);
+        } else {
+            self.watch_fields(key, slot, listed);
         }
         Ok(())
     }
@@ -482,6 +489,7 @@ impl Keyspace {
 
         let limits = self.hash_limits;
         let now = self.clock.now_ms();
+        let listed = self.hash_at(slot).takes_deadlines();
         for (field, value) in pairs {
             let hash = self.hash_at_mut(slot);
             // KEEPTTL has to read the deadline first, because the write is what
@@ -507,6 +515,8 @@ impl Keyspace {
         }
         if self.hash_at(slot).is_empty() {
             self.drop_key(key);
+        } else {
+            self.watch_fields(key, slot, listed);
         }
         Ok(true)
     }
@@ -757,17 +767,80 @@ impl Keyspace {
         // becomes live, and it is a load and a comparison on a hash that has
         // never been given a field deadline, which is nearly all of them.
         let now = self.clock.now_ms();
+        if self.reap_fields(key, at, now, false) {
+            return Ok(None);
+        }
+        Ok(Some(at))
+    }
+
+    /// Take the fields of the hash in `at` that are past their deadline, and say
+    /// whether that took the key with them.
+    ///
+    /// Both halves of field expiry end up here, the command that walked into a
+    /// dead field and the cycle that went looking for one, and `active` is which
+    /// of the two it was. That is the only difference between them: they count
+    /// into the same total, they say the same things, and a subscriber cannot
+    /// tell which one it was hearing from, exactly as on a real server.
+    ///
+    /// What it says is `hexpired` naming every field that went, and then `del`
+    /// if the hash has nothing left, because a hash with no fields is not a key.
+    /// Both travel out on [`news`], since neither has a command to report it: a
+    /// `HLEN` that answers two has not said that a third field went on the way
+    /// to counting them.
+    pub(crate) fn reap_fields(&mut self, key: &[u8], at: u32, now: u64, active: bool) -> bool {
+        let mut gone = 0u64;
         let hash = self
             .hashes
             .get_mut(at)
             .expect("the record points at its body");
-        if hash.reap(now) > 0 && hash.is_empty() {
-            // The last field expiring deletes the key, exactly as the last HDEL
-            // does, because an empty hash is not a thing Redis stores.
-            self.drop_key(key);
-            return Ok(None);
+        hash.reap(now, |field| {
+            gone += 1;
+            news::say_of(key, news::What::FieldExpired, field);
+        });
+        if gone == 0 {
+            return false;
         }
-        Ok(Some(at))
+        self.expired_fields += gone;
+        if active {
+            self.expired_fields_active += gone;
+        }
+        if !self.hash_at(at).is_empty() {
+            return false;
+        }
+        // The last field expiring deletes the key, exactly as the last HDEL
+        // does, because an empty hash is not a thing Redis stores.
+        self.drop_key(key);
+        news::say(key, news::What::Deleted);
+        true
+    }
+
+    /// Put `key` on the list [`Keyspace::field_expire_cycle`] sweeps, if this is
+    /// the moment its hash started taking field deadlines.
+    ///
+    /// `listed` is what [`Hash::takes_deadlines`] said before the command wrote
+    /// anything, so what this tests is the change and not the state. A hash
+    /// crosses that line once, the first time a deadline lands on it, which is
+    /// what keeps one name on the list per hash however many times the
+    /// `HEXPIRE` family is called on it.
+    ///
+    /// The one case that gets past the change test is a key that was deleted and
+    /// made again before the sweep noticed the first one, since the new hash
+    /// starts over. The check against the last name on the list covers the shape
+    /// that would actually run away, a client deleting and remaking the same key
+    /// in a loop, and anything else costs a second name for a key that is really
+    /// there and is really worth sweeping.
+    fn watch_fields(&mut self, key: &[u8], at: u32, listed: bool) {
+        if listed || !self.hash_at(at).takes_deadlines() {
+            return;
+        }
+        if self
+            .field_deadlines
+            .last()
+            .is_some_and(|last| **last == *key)
+        {
+            return;
+        }
+        self.field_deadlines.push(key.into());
     }
 
     /// The body in a slot the record pointed at, to be written.

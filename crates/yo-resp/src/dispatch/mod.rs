@@ -1145,6 +1145,18 @@ impl Server {
         self.keyspaces().map(|db| db.expired_keys()).sum()
     }
 
+    /// Hash fields reclaimed after their own deadline passed.
+    #[must_use]
+    pub fn expired_fields(&self) -> u64 {
+        self.keyspaces().map(|db| db.expired_fields()).sum()
+    }
+
+    /// The share of those the cycle found rather than a command tripping over.
+    #[must_use]
+    pub fn expired_fields_active(&self) -> u64 {
+        self.keyspaces().map(|db| db.expired_fields_active()).sum()
+    }
+
     /// Keys thrown away to make room, which is the other number entirely.
     #[must_use]
     pub fn evicted_keys(&self) -> u64 {
@@ -1260,11 +1272,11 @@ impl Server {
             thread.stats.commands.zero();
         }
         // These live on the stripes rather than on the threads, so resetting
-        // them means holding each stripe for as long as it takes to write two
-        // zeroes. `CONFIG RESETSTAT` is a command a person types, and the
-        // alternative is a pair of numbers a dashboard cannot put back.
+        // them means holding each stripe for as long as it takes to write a
+        // handful of zeroes. `CONFIG RESETSTAT` is a command a person types, and
+        // the alternative is a set of numbers a dashboard cannot put back.
         for mut db in self.keyspaces() {
-            db.zero_lookups();
+            db.zero_stats();
         }
     }
 
@@ -1641,8 +1653,15 @@ impl Server {
             // same way a key a lookup took on the way past is.
             let armed = notify::arm(self, self.slot_db(i));
             let c = self.slot(i).expire_cycle(budget - spent);
+            // And the fields, which are the other thing with a deadline nobody
+            // is waiting on. It draws from its own list and charges the same
+            // budget, so a database with no hash field deadlines anywhere pays a
+            // comparison for it and a database full of them cannot starve the
+            // key sweep.
+            let left = (budget - spent).saturating_sub(c.examined);
+            let fields = self.slot(i).field_expire_cycle(left);
             notify::drain(self, armed);
-            spent += c.examined;
+            spent += c.examined + fields;
             if c.expired > 0 {
                 self.expire_db.store((i + 1) % self.slots(), Relaxed);
                 self.mine().note(1u64 << self.slot_db(i));

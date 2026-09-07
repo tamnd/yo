@@ -1199,7 +1199,8 @@ fn info(server: &Server, args: Args<'_>, out: &mut Out) {
             let _ = write!(
                 s,
                 "# Stats\r\ntotal_connections_received:{}\r\n\
-                 total_commands_processed:{}\r\nexpired_keys:{}\r\n\
+                 total_commands_processed:{}\r\nexpired_subkeys:{}\r\n\
+                 expired_subkeys_active:{}\r\nexpired_keys:{}\r\n\
                  evicted_keys:{}\r\nkeyspace_hits:{}\r\nkeyspace_misses:{}\r\n\
                  yo_cold_demoted:{}\r\nyo_cold_promoted:{}\r\n\
                  yo_cold_faults:{}\r\nyo_cold_served:{}\r\nyo_cold_bytes_out:{}\r\n\
@@ -1207,6 +1208,8 @@ fn info(server: &Server, args: Args<'_>, out: &mut Out) {
                  pubsub_patterns:{}\r\npubsubshard_channels:{}\r\n\r\n",
                 totals.connections,
                 totals.commands,
+                server.expired_fields(),
+                server.expired_fields_active(),
                 server.expired_keys(),
                 server.evicted_keys(),
                 server.keyspace_hits(),

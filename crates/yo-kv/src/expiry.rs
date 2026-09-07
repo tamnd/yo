@@ -39,6 +39,7 @@
 //! carrying a deadline sits in the keyspace, and a zero there ends this before it
 //! draws anything.
 
+use crate::hash::Hash;
 use crate::keyspace::Keyspace;
 use crate::value;
 use yo_common::Addr;
@@ -152,6 +153,106 @@ impl Keyspace {
         }
         round
     }
+
+    /// Sweep hash fields that are past their deadline, looking at no more than
+    /// `budget` hashes, and answer how many it looked at.
+    ///
+    /// The other cycle, and it is a different shape because the thing it hunts
+    /// is not in a record. A field deadline lives inside the hash body, so the
+    /// marked index above cannot see one and the sample it draws would never
+    /// offer a hash that has fields to lose but a key with no deadline of its
+    /// own, which is the usual way the `HEXPIRE` family is used. What this draws
+    /// from instead is a list the keyspace keeps of the keys whose hashes have
+    /// ever taken a field deadline, and the list is short because most servers
+    /// have none.
+    ///
+    /// A straight walk with a cursor rather than a random sample, for the same
+    /// reason: the list holds only candidates, so there is nothing for a sample
+    /// to filter out and going round it in order gets to every one of them in
+    /// bounded time. A hash whose earliest deadline has not passed costs a load
+    /// and a comparison, which is what makes the whole list affordable to walk.
+    ///
+    /// Why a server needs this at all is the question [`Keyspace::expire_cycle`]
+    /// answers for keys, and the answer for fields has a second half. Memory is
+    /// the first: a hash that nobody reads again holds every field it was told
+    /// to drop. The second is that the events are observable. A client watching
+    /// `hexpired` on a key hears about the field within a tick of its deadline
+    /// on a real server, whether or not anybody touches the hash, and a server
+    /// that only reaped lazily would go quiet until the next command arrived.
+    pub fn field_expire_cycle(&mut self, budget: usize) -> usize {
+        // The point of the list, the same way the count of keys with deadlines
+        // is the point of the one above.
+        if budget == 0 || self.field_deadlines.is_empty() {
+            return 0;
+        }
+        let now = self.clock.now_ms();
+        // One pass round the list at most, however much budget is left over. A
+        // server with three hashes on the list and a big budget would otherwise
+        // spend the whole of it going round those three again and again, and the
+        // second look at a name in the same tick can only say what the first one
+        // said.
+        let mut left = budget.min(self.field_deadlines.len());
+        let mut looked = 0;
+        while left > 0 && !self.field_deadlines.is_empty() {
+            left -= 1;
+            if self.field_at >= self.field_deadlines.len() {
+                self.field_at = 0;
+            }
+            looked += 1;
+            if self.field_look(self.field_at, now) {
+                self.field_at += 1;
+            } else {
+                // The name came off, so whatever was moved into its place is
+                // what the cursor is already pointing at.
+                self.field_deadlines.swap_remove(self.field_at);
+            }
+        }
+        looked
+    }
+
+    /// Look at one name on the list, and say whether it is worth keeping there.
+    ///
+    /// A name stays for as long as the key under it is a hash. It does not have
+    /// to have a deadline on anything right now: a hash whose only deadline was
+    /// taken off with `HPERSIST` can be given another one without this list
+    /// hearing about it, so dropping the name then would be dropping it for
+    /// good. What ends a name is the key going, or something else taking it,
+    /// which is when the hash this was about no longer exists to sweep.
+    fn field_look(&mut self, at: usize, now: u64) -> bool {
+        let key = &self.field_deadlines[at];
+        let Some(rec) = self.map.get(key) else {
+            return false;
+        };
+        let meta = value::Meta::from_byte(rec[0]);
+        if meta.kind() != value::Kind::Hash {
+            return false;
+        }
+        // A hash whose body is on the device is left alone rather than brought
+        // back for this. Reading a hash off the file to find out whether one of
+        // its fields is a second late is the whole cost of a fault spent on
+        // something no client is waiting for, and the next command that promotes
+        // it reaps the field on the way past.
+        if meta.is_cold() {
+            return true;
+        }
+        let slot = value::slot(rec);
+        // The cheap question first, and it is the one nearly every look answers.
+        // A hash with no deadline that has passed is a load of the bound it
+        // carries and a comparison against the clock.
+        match self.hashes.get(slot).map(Hash::soonest_deadline) {
+            Some(Some(soonest)) if soonest <= now => {}
+            _ => return true,
+        }
+        // Through the scratch buffer, the same way the sweep above does it,
+        // because the reap needs the key by name and the name is borrowed from
+        // the list this is walking.
+        let mut buf = core::mem::take(&mut self.scratch);
+        buf.clear();
+        buf.extend_from_slice(&self.field_deadlines[at]);
+        let gone = self.reap_fields(&buf, slot, now, true);
+        self.scratch = buf;
+        !gone
+    }
 }
 
 #[cfg(test)]
@@ -159,6 +260,7 @@ mod tests {
     use super::*;
     use crate::clock::Clock;
     use crate::many;
+    use crate::ttl::Cond;
 
     fn db() -> Keyspace {
         Keyspace::with_clock(Clock::fixed(1_000))
@@ -354,5 +456,127 @@ mod tests {
         // The bodies went back with the records rather than being left behind in
         // their slabs, which a length check on the keyspace alone would not see.
         assert_eq!(d.bodies, 1);
+    }
+
+    /// Give a hash a field deadline and let it pass with nobody reading the
+    /// hash. The field has to go anyway, because that is what the field cycle is
+    /// for, and the counters have to say it was the cycle that took it.
+    #[test]
+    fn a_field_nobody_reads_goes_on_its_own() {
+        let mut d = db();
+        let now = d.clock().now_ms();
+        d.hset(b"h", [(b"a".as_slice(), b"1".as_slice())].into_iter())
+            .expect("room");
+        d.hset(b"h", [(b"b".as_slice(), b"2".as_slice())].into_iter())
+            .expect("room");
+        d.hexpire(
+            b"h",
+            now + 100,
+            Cond::Always,
+            [b"a".as_slice()].into_iter(),
+            |_| {},
+        )
+        .expect("room");
+        d.clock().advance(200);
+        assert_eq!(d.field_expire_cycle(16), 1, "one hash to look at");
+        assert_eq!(d.hlen(b"h"), Ok(1), "and the other field is still there");
+        assert_eq!(d.expired_fields(), 1);
+        assert_eq!(d.expired_fields_active(), 1);
+        assert_eq!(d.expired_keys(), 0, "the key itself had no deadline");
+    }
+
+    /// And when it was the only field, the key goes with it, since an empty hash
+    /// is not a key.
+    #[test]
+    fn the_last_field_takes_the_key_with_it() {
+        let mut d = db();
+        let now = d.clock().now_ms();
+        d.hset(b"h", [(b"a".as_slice(), b"1".as_slice())].into_iter())
+            .expect("room");
+        d.hexpire(
+            b"h",
+            now + 100,
+            Cond::Always,
+            [b"a".as_slice()].into_iter(),
+            |_| {},
+        )
+        .expect("room");
+        d.clock().advance(200);
+        d.field_expire_cycle(16);
+        assert!(!d.exists(b"h"));
+        assert_eq!(d.len(), 0);
+        assert_eq!(d.bodies, 0, "and the body went back to its slab");
+        // The name came off the list with the key, so a second sweep has nothing
+        // to look at rather than a dangling name to look up.
+        assert_eq!(d.field_expire_cycle(16), 0);
+    }
+
+    /// The list only holds hashes that took a deadline at some point, so a
+    /// database full of ordinary hashes costs the cycle nothing.
+    #[test]
+    fn hashes_with_no_field_deadlines_are_not_swept() {
+        let mut d = db();
+        for i in 0..100u32 {
+            d.hset(
+                format!("h{i}").as_bytes(),
+                [(b"a".as_slice(), b"1".as_slice())].into_iter(),
+            )
+            .expect("room");
+        }
+        assert_eq!(d.field_expire_cycle(4096), 0);
+    }
+
+    /// A name whose key is gone, or is no longer a hash, comes off the list the
+    /// first time the cycle reaches it. Nothing else prunes it, because nothing
+    /// else knows the list is there.
+    #[test]
+    fn a_name_that_is_no_longer_a_hash_comes_off_the_list() {
+        let mut d = db();
+        let now = d.clock().now_ms();
+        for i in 0..3u32 {
+            let k = format!("h{i}");
+            d.hset(
+                k.as_bytes(),
+                [(b"a".as_slice(), b"1".as_slice())].into_iter(),
+            )
+            .expect("room");
+            d.hexpire(
+                k.as_bytes(),
+                now + 100_000,
+                Cond::Always,
+                [b"a".as_slice()].into_iter(),
+                |_| {},
+            )
+            .expect("room");
+        }
+        d.del(b"h0");
+        d.set_plain(b"h1", b"v").expect("room");
+        // Three looks is one round of the list, and two of the three names have
+        // nothing behind them any more.
+        d.field_expire_cycle(3);
+        assert_eq!(d.field_deadlines.len(), 1);
+        assert_eq!(d.field_deadlines[0].as_ref(), b"h2");
+    }
+
+    /// Setting the same deadline over and over on the same hash puts its name on
+    /// the list once, which is the thing that would otherwise grow without
+    /// bound on a key a client keeps refreshing.
+    #[test]
+    fn a_hash_is_only_listed_once_however_often_it_is_touched() {
+        let mut d = db();
+        let now = d.clock().now_ms();
+        d.hset(b"h", [(b"a".as_slice(), b"1".as_slice())].into_iter())
+            .expect("room");
+        for i in 0..50u64 {
+            d.hexpire(
+                b"h",
+                now + 100_000 + i,
+                Cond::Always,
+                [b"a".as_slice()].into_iter(),
+                |_| {},
+            )
+            .expect("room");
+        }
+        assert_eq!(d.field_deadlines.len(), 1);
     }
 }
