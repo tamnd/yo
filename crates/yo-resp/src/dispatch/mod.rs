@@ -57,6 +57,7 @@ mod backup;
 mod bits;
 mod blocking;
 mod bloom;
+mod client;
 mod cms;
 mod cpu;
 mod cuckoo;
@@ -1786,6 +1787,70 @@ impl Default for Server {
     }
 }
 
+/// What the socket under a connection is, and what has gone over it.
+///
+/// Everything `CLIENT INFO` reports that is not a choice the client made. It
+/// lives on the session rather than on the front because the command that
+/// reports it is handed a session and never sees the front, and it is filled in
+/// by the front and by whatever opened the socket, which are the only two places
+/// that know any of it.
+///
+/// A session nobody tells has an empty address and a file descriptor of minus
+/// one, which is what an embedded caller and every test gets.
+#[derive(Default)]
+pub struct Socket {
+    /// Where the client is dialling from, as `ip:port`, or the socket path with
+    /// `:0` after it for a Unix connection, which is Redis's spelling for both.
+    peer: Vec<u8>,
+    /// The address on this side, in the same two spellings.
+    local: Vec<u8>,
+    /// The descriptor number, or minus one when there is no socket.
+    fd: i32,
+    /// Whether it is a Unix socket, which the `flags` field reports as `U`.
+    ///
+    /// Kept as a flag rather than read back out of the address, because the two
+    /// addresses are strings meant for a person and nothing else should be
+    /// deciding anything by looking at them.
+    unix: bool,
+    /// When the connection was accepted, for `age`.
+    since_ms: u64,
+    /// When it last sent a command, for `idle`.
+    last_ms: u64,
+    /// Bytes read off the socket and bytes handed to it.
+    net_in: u64,
+    net_out: u64,
+    /// Commands run for this connection, and reads that carried at least one.
+    ///
+    /// The pair behind `avg-pipeline-len-sum` and `avg-pipeline-len-cnt`, which
+    /// a client divides one by the other to see how deep the pipelining is.
+    cmds: u64,
+    reads: u64,
+    /// The name of the last command, with the subcommand after a bar when it
+    /// had one, which is `cmd` in the report.
+    ///
+    /// A static string because it is the table's own name for the command and
+    /// the table outlives every connection, so noting it is a pointer store and
+    /// not a copy.
+    last: &'static str,
+    /// The subcommand alongside it, and the same argument for the lifetime: it
+    /// is a slice of the connection's read buffer only for as long as the
+    /// command runs, so it is copied, and the copy is short and reused.
+    sub: Vec<u8>,
+    /// Bytes sitting in the read buffer waiting to be framed, and the room
+    /// after them, which are `qbuf` and `qbuf-free`.
+    ///
+    /// Written by the front, because the read buffer is the front's and a
+    /// command cannot reach one. It is the number as of the last read or flush
+    /// rather than as of this instant, which is the only two moments it can
+    /// change and so the only two worth a store.
+    qbuf: u64,
+    qbuf_free: u64,
+    /// The reply buffer's room, and the largest it has been at a flush, which
+    /// are `rbs` and `rbp`.
+    rbs: u64,
+    rbp: u64,
+}
+
 /// What one connection has chosen.
 pub struct Session {
     db: usize,
@@ -1852,6 +1917,48 @@ pub struct Session {
     /// by name, because a publish arrives on a connection that cannot see this
     /// one. See the `pubsub` module.
     subs: Option<Box<pubsub::Subs>>,
+    /// The library name and version a client library announces with
+    /// `CLIENT SETINFO`, empty when it has not.
+    ///
+    /// Nothing on the server reads them. They are here because an operator
+    /// looking at `CLIENT LIST` on a server with a hundred connections wants to
+    /// know which of them is the Python worker and which is the dashboard, and
+    /// every mainstream client library sends them on connect.
+    lib_name: Vec<u8>,
+    lib_ver: Vec<u8>,
+    /// `CLIENT NO-EVICT`, which asks that this connection's buffers are not the
+    /// ones given up when the server is short of memory.
+    ///
+    /// Nothing gives up a connection's buffers here yet, so this is remembered
+    /// and reported and does nothing else, which is the honest half of the
+    /// command: a client that sets it and reads it back sees what it set.
+    no_evict: bool,
+    /// `CLIENT NO-TOUCH`, which asks that reads by this connection do not move
+    /// a key's place in the eviction order.
+    no_touch: bool,
+    /// What this connection has asked to be told about, which is `CLIENT REPLY`.
+    reply: Reply,
+    /// What the socket is and what has gone over it.
+    sock: Socket,
+}
+
+/// What a connection has asked to hear back, which is `CLIENT REPLY`.
+///
+/// The two skipping states are one command apart on purpose. `CLIENT REPLY
+/// SKIP` says nothing itself and skips the reply of the command after it, so
+/// the state has to survive one command and no more, and the way Redis does
+/// that is with a pair of flags that step forward once a command.
+#[derive(Clone, Copy, PartialEq, Eq, Default, Debug)]
+pub enum Reply {
+    /// Everything, which is where every connection starts.
+    #[default]
+    On,
+    /// Nothing at all until the client says `ON` again.
+    Off,
+    /// Nothing for the command after this one.
+    SkipNext,
+    /// This is that command.
+    SkipNow,
 }
 
 impl Session {
@@ -1870,7 +1977,109 @@ impl Session {
             running: false,
             replay: crate::request::Argv::new(),
             subs: None,
+            lib_name: Vec::new(),
+            lib_ver: Vec::new(),
+            no_evict: false,
+            no_touch: false,
+            reply: Reply::On,
+            sock: Socket {
+                fd: -1,
+                last: "",
+                ..Socket::default()
+            },
         }
+    }
+
+    /// Say when this connection was opened, which is what `age` counts from.
+    ///
+    /// Called by whoever opened it, which is the only place that knows. A
+    /// session nobody tells has no age and reports zero, which is every
+    /// embedded caller and every test.
+    pub fn opened(&mut self, now_ms: u64) {
+        self.sock.since_ms = now_ms;
+        self.sock.last_ms = now_ms;
+    }
+
+    /// Say what the socket under this connection is.
+    ///
+    /// Called once, by whoever accepted it, which is the only place that knows.
+    /// The two addresses are already in the spelling `CLIENT INFO` reports them
+    /// in, because turning a socket address into that spelling is the job of the
+    /// layer that has the socket.
+    pub fn set_socket(&mut self, peer: &str, local: &str, fd: i32, unix: bool) {
+        yo_alloc::allow(|| {
+            self.sock.peer.clear();
+            self.sock.peer.extend_from_slice(peer.as_bytes());
+            self.sock.local.clear();
+            self.sock.local.extend_from_slice(local.as_bytes());
+        });
+        self.sock.fd = fd;
+        self.sock.unix = unix;
+    }
+
+    /// Note bytes that arrived, and that a read carried them.
+    pub fn read_bytes(&mut self, n: usize) {
+        self.sock.net_in += n as u64;
+        self.sock.reads += 1;
+    }
+
+    /// Note bytes that went out.
+    pub fn wrote_bytes(&mut self, n: usize) {
+        self.sock.net_out += n as u64;
+    }
+
+    /// Note what the two buffers are holding.
+    ///
+    /// `waiting` is the framed bytes that have not been read yet, `room` is what
+    /// is left in the read buffer after them, and `reply` is the reply buffer's
+    /// capacity. The high water mark is kept here rather than by the caller so
+    /// that the caller only has to say what is true now.
+    pub fn note_buffers(&mut self, waiting: usize, room: usize, reply: usize) {
+        self.sock.qbuf = waiting as u64;
+        self.sock.qbuf_free = room as u64;
+        self.sock.rbs = reply as u64;
+        self.sock.rbp = self.sock.rbp.max(reply as u64);
+    }
+
+    /// Note which command is running, before it runs.
+    ///
+    /// The clock is passed in because the session has no way to reach one, and
+    /// the caller is holding the server anyway.
+    pub(crate) fn ran(&mut self, name: &'static str, sub: Option<&[u8]>, now_ms: u64) {
+        self.sock.last_ms = now_ms;
+        self.sock.last = name;
+        self.sock.sub.clear();
+        if let Some(sub) = sub {
+            yo_alloc::allow(|| self.sock.sub.extend_from_slice(sub));
+        }
+    }
+
+    /// Note that the command running is over.
+    ///
+    /// The count goes up here and not where the command name is noted, so that
+    /// a connection asking `CLIENT INFO` is told how many commands it had sent
+    /// before this one. That is what a real server answers: it counts in
+    /// `commandProcessed` and that runs after the body.
+    pub fn finished(&mut self) {
+        self.sock.cmds += 1;
+    }
+
+    /// What this connection has asked to hear back.
+    #[must_use]
+    pub const fn reply_mode(&self) -> Reply {
+        self.reply
+    }
+
+    /// Step the skipping state on by one command.
+    ///
+    /// Called after every command by whoever is deciding whether to keep the
+    /// reply, so that `SKIP` covers exactly the one command after it.
+    pub const fn step_reply(&mut self) {
+        self.reply = match self.reply {
+            Reply::SkipNext => Reply::SkipNow,
+            Reply::SkipNow => Reply::On,
+            other => other,
+        };
     }
 
     /// Whether a script is what is asking, which only a blocking command reads.
@@ -1921,6 +2130,13 @@ impl Session {
         // against 8.10.1, which is the one pair of answers you could not guess
         // from what the command is for.
         self.sets.clear();
+        // The three `CLIENT` settings that are a choice about this connection go
+        // back to their defaults, and the library name and version stay, since
+        // the library behind the socket is the same library it was. Both halves
+        // are `clearClientConnectionState`'s.
+        self.reply = Reply::On;
+        self.no_evict = false;
+        self.no_touch = false;
     }
 
     /// Record the name from `HELLO ... SETNAME`.
@@ -1956,6 +2172,25 @@ pub fn execute(server: &Server, session: &mut Session, args: Args<'_>, out: &mut
         return Flow::Continue;
     }
     resolved(server, session, lookup(args.name()), args, out)
+}
+
+/// The commands that are a container for a set of subcommands.
+///
+/// A hand written list because the table has one row per container and none per
+/// subcommand, so there is nothing to ask. It goes away with D-114, which gives
+/// every subcommand a row of its own and makes this a flag on the container.
+const CONTAINERS: [&str; 10] = [
+    "backup", "client", "command", "config", "function", "object", "pubsub", "script", "xgroup",
+    "xinfo",
+];
+
+/// The subcommand a container command was given, for the `cmd` field of
+/// `CLIENT INFO`, which reads `client|info` and not `client`.
+///
+/// `None` for everything else, and for a container called with nothing after
+/// it, which is a wrong arity and has no subcommand to name.
+fn container_sub<'a>(spec: &Spec, args: &Args<'a>) -> Option<&'a [u8]> {
+    (args.len() > 1 && CONTAINERS.contains(&spec.name)).then(|| args.get(1))
 }
 
 /// The same, for a caller that has already found the command.
@@ -2002,6 +2237,13 @@ pub fn resolved(
         );
         return Flow::Continue;
     }
+    // What this connection is doing, which only `CLIENT` reads back. Here and
+    // not further down because a command that is about to be refused or queued
+    // is still the last command the connection sent, which is what a real
+    // server reports: it notes the name in `processCommand` before any of the
+    // decisions below.
+    session.ran(spec.name, container_sub(spec, &args), server.now_ms());
+
     if session.in_multi()
         && let Some(e) = multi::refused_in_multi(spec)
     {
@@ -28659,5 +28901,236 @@ mod tests {
                 "%1\r\n+values\r\n*0\r\n+total_results\r\n:1\r\n+warning\r\n*0\r\n"
             )
         );
+    }
+    // ------------------------------------------------------------- CLIENT
+
+    /// The field names `CLIENT INFO` reports, in the order 8.10.1 reports them.
+    ///
+    /// Written out rather than derived, because the whole point of the command
+    /// is that a parser somewhere else knows this list, so a change to it is a
+    /// change a test should have to be edited for.
+    const INFO_FIELDS: &[&str] = &[
+        "id",
+        "addr",
+        "laddr",
+        "fd",
+        "name",
+        "age",
+        "idle",
+        "flags",
+        "db",
+        "sub",
+        "psub",
+        "ssub",
+        "multi",
+        "watch",
+        "qbuf",
+        "qbuf-free",
+        "argv-mem",
+        "multi-mem",
+        "rbs",
+        "rbp",
+        "obl",
+        "oll",
+        "omem",
+        "omem-shared",
+        "omem-unshared",
+        "tot-mem",
+        "events",
+        "cmd",
+        "user",
+        "redir",
+        "resp",
+        "lib-name",
+        "lib-ver",
+        "io-thread",
+        "tot-net-in",
+        "tot-net-out",
+        "tot-cmds",
+        "read-events",
+        "avg-pipeline-len-sum",
+        "avg-pipeline-len-cnt",
+    ];
+
+    /// The report as a list of name and value pairs, taken out of the bulk
+    /// string the reply is on RESP2.
+    fn client_info(f: &mut Fixture) -> Vec<(String, String)> {
+        let reply = f.run(&[b"CLIENT", b"INFO"]);
+        let body = reply.split_once("\r\n").expect("a bulk header").1;
+        // A verbatim string on RESP3 carries its format in front of the text,
+        // and the same reply is a plain bulk string on RESP2.
+        let line = body.trim_end_matches("\r\n").trim_start_matches("txt:");
+        assert!(
+            line.ends_with('\n'),
+            "the report ends in a newline: {line:?}"
+        );
+        line.trim_end()
+            .split(' ')
+            .map(|pair| {
+                let (name, value) = pair.split_once('=').expect("name=value");
+                (name.to_string(), value.to_string())
+            })
+            .collect()
+    }
+
+    /// One field of the report.
+    fn client_field(f: &mut Fixture, name: &str) -> String {
+        client_info(f)
+            .into_iter()
+            .find(|(n, _)| n == name)
+            .map(|(_, v)| v)
+            .unwrap_or_else(|| panic!("no {name} field"))
+    }
+
+    #[test]
+    fn client_info_names_every_field_a_real_server_names() {
+        let mut f = Fixture::new();
+        let got: Vec<String> = client_info(&mut f).into_iter().map(|(n, _)| n).collect();
+        assert_eq!(got, INFO_FIELDS);
+    }
+
+    /// A session nobody told about a socket is what an embedded caller gets, and
+    /// it has to answer rather than pretend to have an address.
+    #[test]
+    fn a_connection_with_no_socket_reports_no_address_and_no_descriptor() {
+        let mut f = Fixture::new();
+        assert_eq!(client_field(&mut f, "addr"), "");
+        assert_eq!(client_field(&mut f, "laddr"), "");
+        assert_eq!(client_field(&mut f, "fd"), "-1");
+        assert_eq!(client_field(&mut f, "id"), "7");
+    }
+
+    #[test]
+    fn client_setname_takes_a_name_back_and_refuses_one_with_a_space_in_it() {
+        let mut f = Fixture::new();
+        assert_eq!(f.run(&[b"CLIENT", b"GETNAME"]), "$-1\r\n");
+        assert_eq!(f.run(&[b"CLIENT", b"SETNAME", b"worker"]), "+OK\r\n");
+        assert_eq!(f.run(&[b"CLIENT", b"GETNAME"]), "$6\r\nworker\r\n");
+        assert_eq!(client_field(&mut f, "name"), "worker");
+        assert_eq!(
+            f.run(&[b"CLIENT", b"SETNAME", b"two words"]),
+            "-ERR Client names cannot contain spaces, newlines or special characters.\r\n"
+        );
+        // And the name it had is still the name it has.
+        assert_eq!(f.run(&[b"CLIENT", b"GETNAME"]), "$6\r\nworker\r\n");
+    }
+
+    /// `RESET` is `clearClientConnectionState`, and the surprising half of it is
+    /// what it keeps: the library behind the socket is the same library it was.
+    #[test]
+    fn reset_clears_the_name_and_the_switches_and_keeps_the_library() {
+        let mut f = Fixture::new();
+        f.run(&[b"CLIENT", b"SETNAME", b"worker"]);
+        f.run(&[b"CLIENT", b"SETINFO", b"LIB-NAME", b"yo-py"]);
+        f.run(&[b"CLIENT", b"SETINFO", b"LIB-VER", b"1.2.3"]);
+        f.run(&[b"CLIENT", b"NO-EVICT", b"on"]);
+        f.run(&[b"CLIENT", b"NO-TOUCH", b"on"]);
+        assert_eq!(client_field(&mut f, "flags"), "eT");
+
+        assert_eq!(f.run(&[b"RESET"]), "+RESET\r\n");
+        assert_eq!(client_field(&mut f, "name"), "");
+        assert_eq!(client_field(&mut f, "flags"), "N");
+        assert_eq!(client_field(&mut f, "lib-name"), "yo-py");
+        assert_eq!(client_field(&mut f, "lib-ver"), "1.2.3");
+    }
+
+    #[test]
+    fn client_setinfo_complains_the_way_a_real_server_does() {
+        let mut f = Fixture::new();
+        assert_eq!(
+            f.run(&[b"CLIENT", b"SETINFO", b"LIB-NAME"]),
+            "-ERR wrong number of arguments for 'client|setinfo' command\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"CLIENT", b"SETINFO", b"NOPE", b"x"]),
+            "-ERR Unrecognized option 'NOPE'\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"CLIENT", b"SETINFO", b"lib-name", b"ok x"]),
+            "-ERR lib-name cannot contain spaces, newlines or special characters.\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"CLIENT", b"SETINFO", b"LIB-VER", b"has space"]),
+            "-ERR lib-ver cannot contain spaces, newlines or special characters.\r\n"
+        );
+    }
+
+    #[test]
+    fn client_refuses_a_subcommand_it_does_not_have_and_arguments_it_did_not_ask_for() {
+        let mut f = Fixture::new();
+        assert_eq!(
+            f.run(&[b"CLIENT", b"NOPE"]),
+            "-ERR unknown subcommand 'NOPE'. Try CLIENT HELP.\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"CLIENT", b"GETNAME", b"extra"]),
+            "-ERR wrong number of arguments for 'client|getname' command\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"CLIENT", b"NO-EVICT", b"maybe"]),
+            "-ERR syntax error\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"CLIENT", b"REPLY", b"BAD"]),
+            "-ERR syntax error\r\n"
+        );
+    }
+
+    /// The three subscribe namespaces are counted apart, which is not the same
+    /// count a subscribe reply carries: that one puts channels and patterns
+    /// together.
+    #[test]
+    fn client_info_counts_the_three_subscribe_namespaces_apart() {
+        let mut f = Fixture::new();
+        // On RESP3, because a subscribed RESP2 connection may only send nine
+        // commands and `CLIENT` is not one of them.
+        f.run(&[b"HELLO", b"3"]);
+        f.run(&[b"SUBSCRIBE", b"a", b"b"]);
+        f.run(&[b"PSUBSCRIBE", b"p*"]);
+        f.run(&[b"SSUBSCRIBE", b"s"]);
+        let info = client_info(&mut f);
+        let at = |name: &str| {
+            info.iter()
+                .find(|(n, _)| n == name)
+                .map(|(_, v)| v.clone())
+                .unwrap()
+        };
+        assert_eq!(at("sub"), "2");
+        assert_eq!(at("psub"), "1");
+        assert_eq!(at("ssub"), "1");
+        assert_eq!(at("flags"), "P");
+        forget_session(&f.server, &mut f.session);
+    }
+
+    /// The `cmd` field names the subcommand, which for this command is always
+    /// `client|info` and is the one field that reports the command asking.
+    #[test]
+    fn client_info_reports_itself_as_the_command_running() {
+        let mut f = Fixture::new();
+        assert_eq!(client_field(&mut f, "cmd"), "client|info");
+        f.run(&[b"GET", b"nothing"]);
+        // Still `client|info`, because the field is about the command asking
+        // and the command asking is this one.
+        assert_eq!(client_field(&mut f, "cmd"), "client|info");
+    }
+
+    /// A container called in mixed case is still the same command underneath.
+    #[test]
+    fn the_command_field_is_lower_case_however_the_client_spelled_it() {
+        let mut f = Fixture::new();
+        let reply = f.run(&[b"CLIENT", b"Info"]);
+        assert!(reply.contains("cmd=client|info"), "{reply}");
+    }
+
+    #[test]
+    fn client_help_lists_the_subcommands_that_are_here() {
+        let mut f = Fixture::new();
+        let reply = f.run(&[b"CLIENT", b"HELP"]);
+        for sub in ["ID", "GETNAME", "SETNAME", "SETINFO", "INFO", "REPLY"] {
+            assert!(reply.contains(sub), "no {sub} in {reply}");
+        }
+        // And not the ones that are not, since a client reads this to find out
+        // what it can send.
+        assert!(!reply.contains("TRACKING"), "{reply}");
     }
 }

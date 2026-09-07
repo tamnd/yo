@@ -195,6 +195,17 @@ impl Session {
         self.subs.as_ref().map_or(0, |s| s.reported(kind))
     }
 
+    /// How many names it is listening to in each namespace, which is what
+    /// `CLIENT INFO` reports as `sub`, `psub` and `ssub`.
+    ///
+    /// Not [`Session::sub_count`], which answers the number a subscribe reply
+    /// carries and counts channels and patterns together.
+    pub(super) fn sub_counts(&self) -> (usize, usize, usize) {
+        self.subs.as_ref().map_or((0, 0, 0), |s| {
+            (s.channels.len(), s.patterns.len(), s.shard.len())
+        })
+    }
+
     /// This connection's subscriptions, made if it has none yet.
     fn subs_mut(&mut self) -> &mut Subs {
         if self.subs.is_none() {

@@ -432,6 +432,19 @@ impl Session {
         self.multi.is_some() && !exempt(name)
     }
 
+    /// How many commands are queued and how many bytes they are holding, which
+    /// is `multi` and `multi-mem` in `CLIENT INFO`.
+    ///
+    /// Minus one for a connection with no transaction open, which is Redis's
+    /// spelling for none and not for an empty one: a connection that has sent
+    /// `MULTI` and nothing since reports zero.
+    pub(super) fn queued(&self) -> (i64, u64) {
+        self.multi.as_ref().map_or((-1, 0), |q| {
+            let bytes = q.cmds.iter().map(|c| c.len() as u64).sum();
+            (q.len() as i64, bytes)
+        })
+    }
+
     /// Mark the open transaction, if there is one, as one that cannot run.
     ///
     /// This is Redis's `flagTransaction`, and what is worth knowing about it is

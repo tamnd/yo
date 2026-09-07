@@ -5036,6 +5036,18 @@ status = "shipped"
 wire = "verified"
 
 [[command]]
+name = "CLIENT"
+group = "connection"
+since = "2.4.0"
+arity = -2
+plan = "none"
+bounded = "inherent"
+status = "shipped"
+wire = "verified"
+divergent = "D-123"
+notes = "Nine subcommands, ID, GETNAME, SETNAME, SETINFO, INFO, REPLY, NO-EVICT, NO-TOUCH and HELP, all of them about the connection the command arrived on and none of them needing to reach another thread. LIST, KILL, PAUSE and UNPAUSE are the rest of the container and they all need a table of every live connection on every thread, so they come with that table rather than before it. The forty fields of INFO were read off 8.10.1 one at a time, in its order and with its trailing newline, because the tooling that parses this splits on spaces and looks for names it knows. REPLY is not a thing the body can do on its own, since OFF and SKIP mean the reply that has already been written has to be taken back, so the body marks the connection and the engine truncates the buffer after the command, and it reads the mark after rather than before so that REPLY ON still answers. NO-EVICT and NO-TOUCH are remembered and reported and change nothing else, which is the honest half of both: nothing here gives up a connection's buffers under memory pressure and nothing here moves a key's place in an eviction order on a read. HELP lists what is here rather than what Redis has, so a client reading it to find out what it can send is not told about TRACKING by a server that would refuse it."
+
+[[command]]
 name = "HELLO"
 group = "connection"
 since = "6.0.0"

@@ -185,6 +185,63 @@ impl std::os::windows::io::AsRawSocket for Sock {
     }
 }
 
+impl Sock {
+    /// The two ends of this connection, as `CLIENT INFO` spells them.
+    ///
+    /// A TCP connection is `ip:port` on both sides, and IPv6 keeps the brackets
+    /// Rust's formatting gives it, which is what Redis reports too. A Unix
+    /// connection is the socket file's path with `:0` after it, on both sides,
+    /// because the accepted end of a Unix socket has no name of its own and the
+    /// path is what an operator is looking for. An address the system will not
+    /// give us leaves the empty string rather than an error, since a connection
+    /// is not worth refusing over a field only a report reads.
+    fn ends(&self) -> (String, String) {
+        match self {
+            Sock::Tcp(s) => {
+                let peer = s.peer_addr().map(|a| a.to_string()).unwrap_or_default();
+                let local = s.local_addr().map(|a| a.to_string()).unwrap_or_default();
+                (peer, local)
+            }
+            #[cfg(unix)]
+            Sock::Unix(s) => {
+                let path = s
+                    .local_addr()
+                    .ok()
+                    .and_then(|a| a.as_pathname().map(|p| p.display().to_string()))
+                    .unwrap_or_default();
+                let both = format!("{path}:0");
+                (both.clone(), both)
+            }
+        }
+    }
+
+    /// Whether this is a Unix socket, which `CLIENT INFO` reports as a flag.
+    fn is_unix(&self) -> bool {
+        #[cfg(unix)]
+        {
+            matches!(self, Sock::Unix(_))
+        }
+        #[cfg(not(unix))]
+        {
+            false
+        }
+    }
+
+    /// The descriptor number, or minus one on a platform where a socket is not
+    /// one.
+    fn fd(&self) -> i32 {
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsRawFd;
+            self.as_raw_fd()
+        }
+        #[cfg(not(unix))]
+        {
+            -1
+        }
+    }
+}
+
 /// A door the server is listening at.
 enum Door {
     Tcp(TcpListener),
@@ -634,7 +691,13 @@ impl<'a> Worker<'a> {
         loop {
             match self.doors[at].accept() {
                 Ok(stream) => {
-                    let conn = self.reactor.engine_mut().accept();
+                    let (peer, local) = stream.ends();
+                    let conn = self.reactor.engine_mut().accept_from(
+                        &peer,
+                        &local,
+                        stream.fd(),
+                        stream.is_unix(),
+                    );
                     // Registered before the socket is handed over, because
                     // after that the sink owns it and this is the last look.
                     self.poller.add(&stream, u64::from(conn))?;
