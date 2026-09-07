@@ -346,6 +346,7 @@ impl<S: Sink> Front<S> {
             // grows for a client sending a bulk larger than that, which is a
             // real allocation for a real reason.
             yo_alloc::allow(|| c.buf.extend_from_slice(bytes));
+            c.session.read_bytes(bytes.len());
         }
         self.frame(conn);
         self.note_size(conn);
@@ -360,6 +361,14 @@ impl<S: Sink> Front<S> {
     /// a report nobody has asked for on the command path.
     fn note_size(&mut self, conn: ConnId) {
         let c = &mut self.conns[conn as usize];
+        // What `CLIENT INFO` reports about the two buffers, taken here because
+        // this already runs at the two moments they can change and because a
+        // command has no way to reach a connection's buffers.
+        c.session.note_buffers(
+            c.buf.len() - c.head,
+            c.buf.capacity() - c.buf.len(),
+            c.out.capacity(),
+        );
         let now = c.size();
         if now == c.held {
             return;
@@ -566,6 +575,7 @@ impl<S: Sink> Front<S> {
         };
 
         let c = &mut self.conns[conn as usize];
+        c.session.wrote_bytes(taken);
         if taken >= c.out.len() {
             c.out.clear();
         } else {

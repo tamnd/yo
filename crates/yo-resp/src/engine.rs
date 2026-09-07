@@ -76,7 +76,7 @@ use std::sync::Arc;
 use yo_reactor::{BATCH_MAX, Engine, Reactor};
 
 use crate::dispatch::table;
-use crate::dispatch::{self, Flow, Parked, Server};
+use crate::dispatch::{self, Flow, Parked, Reply, Server};
 use crate::front::{Front, Wrote};
 use crate::proto::Limits;
 use yo_kv::Keyspace;
@@ -276,7 +276,26 @@ impl<S: Sink> Wire<S> {
     pub fn accept(&mut self) -> ConnId {
         self.server.counted().opened();
         let at = self.front.open(self.server.next_client());
+        let now = self.server.now_ms();
+        if let Some(session) = self.front.session_mut(at) {
+            session.opened(now);
+        }
         self.note_buffers();
+        at
+    }
+
+    /// The same, for a caller that knows what the socket underneath is.
+    ///
+    /// The two addresses arrive already in the spelling `CLIENT INFO` reports
+    /// them in, because turning a socket address into that spelling belongs to
+    /// whoever has the socket. A caller with no socket to describe uses
+    /// `Engine::accept` and the connection reports an empty address and a
+    /// descriptor of minus one, which is every embedded caller and every test.
+    pub fn accept_from(&mut self, peer: &str, local: &str, fd: i32, unix: bool) -> ConnId {
+        let at = self.accept();
+        if let Some(session) = self.front.session_mut(at) {
+            session.set_socket(peer, local, fd, unix);
+        }
         at
     }
 
@@ -588,7 +607,21 @@ impl<S: Sink> Engine for Wire<S> {
             let Wire { front, server, .. } = self;
             let (args, session, out) = front.parts(&cmd);
             let spec = table::at(cmd.spec);
-            dispatch::resolved(server, session, spec, args, out)
+            let mark = out.len();
+            let flow = dispatch::resolved(server, session, spec, args, out);
+            // `CLIENT REPLY` is the one thing that can take a reply back after
+            // the command has written it, and this is the only place holding
+            // both the buffer and the decision. The mode is read after the
+            // command rather than before so that `CLIENT REPLY ON` still
+            // answers, which is what a client turning replies back on needs and
+            // is what a real server does.
+            session.finished();
+            let mode = session.reply_mode();
+            session.step_reply();
+            if mode != Reply::On {
+                out.truncate(mark);
+            }
+            flow
         } else {
             // Nobody to answer, or nobody who should be. The decoder still has
             // to come back and the slot still has to be released, which is why
@@ -3192,5 +3225,90 @@ mod tests {
         // Two flushes in a pump, so four bytes and then three.
         assert_eq!(r.engine().sink().sent, b"+PONG\r\n");
         assert_eq!(r.engine().sink().writes, 2);
+    }
+    /// `CLIENT REPLY OFF` and `SKIP` are the one thing that takes a reply back
+    /// after the command has written it, and the engine is the only place
+    /// holding both the buffer and the decision.
+    #[test]
+    fn client_reply_skip_covers_the_command_after_it_and_nothing_else() {
+        let (mut r, conn, mut batch) = engine();
+
+        r.engine_mut()
+            .feed(conn, &wire(&[b"CLIENT", b"REPLY", b"SKIP"]));
+        r.engine_mut().feed(conn, &wire(&[b"SET", b"a", b"1"]));
+        r.engine_mut().feed(conn, &wire(&[b"SET", b"b", b"2"]));
+        pump(&mut r, &mut batch);
+        // Nothing for the `SKIP` itself, nothing for the `SET` after it, and
+        // the second `SET` is answered. Byte for byte what 8.10.1 sends.
+        assert_eq!(r.engine().sink().sent(conn), b"+OK\r\n");
+    }
+
+    #[test]
+    fn client_reply_off_stays_off_until_it_is_turned_back_on() {
+        let (mut r, conn, mut batch) = engine();
+
+        r.engine_mut()
+            .feed(conn, &wire(&[b"CLIENT", b"REPLY", b"OFF"]));
+        r.engine_mut().feed(conn, &wire(&[b"SET", b"c", b"3"]));
+        r.engine_mut().feed(conn, &wire(&[b"PING"]));
+        r.engine_mut()
+            .feed(conn, &wire(&[b"CLIENT", b"REPLY", b"ON"]));
+        r.engine_mut().feed(conn, &wire(&[b"PING"]));
+        pump(&mut r, &mut batch);
+        // The `ON` answers, because the mode is read after the command rather
+        // than before it, and everything between the two is silent.
+        assert_eq!(r.engine().sink().sent(conn), b"+OK\r\n+PONG\r\n");
+
+        // And the writes went through while nobody was being answered.
+        r.engine_mut().sink_mut().clear();
+        r.engine_mut().feed(conn, &wire(&[b"GET", b"c"]));
+        pump(&mut r, &mut batch);
+        assert_eq!(r.engine().sink().sent(conn), b"$1\r\n3\r\n");
+    }
+
+    /// The two addresses and the descriptor come from whoever accepted the
+    /// socket, and a caller that has one has to be able to say so.
+    #[test]
+    fn a_connection_reports_the_socket_it_was_opened_on() {
+        let mut r = Reactor::inline(Wire::new(Recorder::new()));
+        let conn = r
+            .engine_mut()
+            .accept_from("10.0.0.7:54321", "10.0.0.1:6379", 11, false);
+        let mut batch = Vec::new();
+
+        r.engine_mut().feed(conn, &wire(&[b"CLIENT", b"INFO"]));
+        pump(&mut r, &mut batch);
+        let sent = String::from_utf8_lossy(r.engine().sink().sent(conn)).into_owned();
+        assert!(sent.contains("addr=10.0.0.7:54321"), "{sent}");
+        assert!(sent.contains("laddr=10.0.0.1:6379"), "{sent}");
+        assert!(sent.contains("fd=11"), "{sent}");
+    }
+
+    /// `tot-net-in`, `tot-net-out` and `tot-cmds` are counted by the front and
+    /// by the engine, so nothing below the engine can check them.
+    #[test]
+    fn a_connection_counts_the_bytes_and_the_commands_that_went_over_it() {
+        let (mut r, conn, mut batch) = engine();
+        let mut stream = wire(&[b"PING"]);
+        stream.extend(wire(&[b"PING"]));
+        let sent_in = stream.len();
+
+        r.engine_mut().feed(conn, &stream);
+        pump(&mut r, &mut batch);
+        r.engine_mut().sink_mut().clear();
+
+        r.engine_mut().feed(conn, &wire(&[b"CLIENT", b"INFO"]));
+        pump(&mut r, &mut batch);
+        let sent = String::from_utf8_lossy(r.engine().sink().sent(conn)).into_owned();
+        // Two pings, counted after they ran, so the report asking does not
+        // count itself, which is what a real server answers too. Two reads,
+        // because the two pings arrived in one and the report in the other.
+        assert!(sent.contains("tot-cmds=2"), "{sent}");
+        assert!(sent.contains("read-events=2"), "{sent}");
+        assert!(
+            sent.contains(&format!("tot-net-in={}", sent_in + 26)),
+            "{sent}"
+        );
+        assert!(sent.contains("tot-net-out=14"), "{sent}");
     }
 }

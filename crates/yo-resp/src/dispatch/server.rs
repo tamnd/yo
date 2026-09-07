@@ -307,6 +307,7 @@ pub(super) fn execute(
             out.ok();
             return Ok(Flow::Close);
         }
+        "client" => return super::client::execute(server, session, spec, args, out),
         "command" => command(args, out)?,
         "config" => config(server, args, out)?,
         "info" => info(server, args, out),
