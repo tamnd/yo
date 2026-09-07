@@ -5187,6 +5187,61 @@ wire = "verified"
 notes = "Two bulk strings and not one integer, seconds and then microseconds within that second, both as decimal text. It reads the wall clock and not the coarse cached millisecond the keyspace uses, because the coarse one is refreshed on a tick and a client that calls TIME twice and gets the same microsecond has been lied to. The ACL categories are @fast and nothing else, which reads like an omission and is not: the categories say what a command can reach and this one reaches nothing."
 
 [[command]]
+name = "SAVE"
+group = "server"
+since = "1.0.0"
+arity = 1
+plan = "none"
+bounded = "inherent"
+status = "shipped"
+wire = "verified"
+notes = "Writes the whole dataset out as an RDB file under dir, named by dbfilename, and waits for it. The file is an export and not a checkpoint: the keyspace already sits on its own file and was durable before this ran, and what this produces is the format the rest of the Redis world reads. A real redis-server 8.10.1 starts on one of these and answers every value, every encoding, every deadline and every database identically, which was checked rather than assumed, and redis-check-rdb reads one and says it is fine. It is written to a temporary name and renamed over the old file, so a reader gets one whole dataset or the other and never half of each, and it is synced before the rename. The failure reply is a bare -ERR with nothing after it, which is Redis's shared.err and says nothing because whatever went wrong went wrong in the file system. Arity one, so a second argument is a wrong number of them. It carries no_multi, so a transaction refuses it at queue time with Command not allowed inside a transaction and EXEC then answers EXECABORT, and it carries noscript, so a script is refused it. Because it is admin it is not reported to a monitor. Every database is walked in turn rather than all at once, so a file is not one instant of the whole keyspace, which is the same trade BACKUP makes and is D-46."
+
+[[command]]
+name = "BGSAVE"
+group = "server"
+since = "1.0.0"
+arity = -1
+plan = "none"
+bounded = "inherent"
+status = "shipped"
+wire = "verified"
+notes = "The same file SAVE writes, and the same words a real server answers. SCHEDULE is the only argument and it is not case sensitive, anything else is a syntax error, and so is SCHEDULE with anything after it. Outside a transaction the reply is Background saving started and inside one it is Background saving scheduled, which is a real server not being able to fork in the middle of a batch it has promised to run without interruption. Nothing forks here, so the file is on disk before either sentence is answered and a script polling LASTSAVE afterwards sees the number it wants on the first read. That is D-125: rdb_bgsave_in_progress is never one, and the Background save already in progress error a real server gives a second BGSAVE cannot happen. A save that fails does not change the reply, which is a real server too: it answers the sentence when the fork works and reports what the child did in rdb_last_bgsave_status. Admin, so it is not reported to a monitor, and noscript, so a script is refused it."
+
+[[command]]
+name = "BGREWRITEAOF"
+group = "server"
+since = "1.0.0"
+arity = 1
+plan = "none"
+bounded = "inherent"
+status = "shipped"
+wire = "verified"
+notes = "Answers Background append only file rewriting started, counts itself in aof_rewrites and does nothing, because there is no append only file to rewrite: appendonly reads no here and cannot be set to yes. That is D-126. Inside a transaction the sentence ends in scheduled rather than started, for the same reason BGSAVE's does. It is here because tooling calls it blind on the way to something else rather than because anybody needs it. Admin, so it is not reported to a monitor, and noscript, so a script is refused it."
+
+[[command]]
+name = "LASTSAVE"
+group = "server"
+since = "1.0.0"
+arity = 1
+plan = "none"
+bounded = "inherent"
+status = "shipped"
+wire = "verified"
+notes = "An integer, the whole second the last save that worked finished at. A server that has not saved answers the second it started, which is Redis's answer too and is on the grounds that what is in memory came off a file and has not moved. It is the same number rdb_last_save_time reports, so a backup script can poll either. Only a save moves it and a failed save does not. Not admin, so unlike the other three it is reported to a monitor, and not noscript, so a script may call it. Redis tags it nondeterministic_output in COMMAND INFO and yo sends no tips for any command, which is D-13."
+
+[[command]]
+name = "ROLE"
+group = "server"
+since = "2.8.12"
+arity = 1
+plan = "none"
+bounded = "inherent"
+status = "shipped"
+wire = "verified"
+notes = "Three elements: the word master, then the replication offset as an integer, then the list of replicas attached. Zero and an empty list, which is the same pair INFO replication reports next to it and is true rather than a placeholder: nothing has been written to a stream that does not exist and nothing is following this server. It becomes a real answer when replication lands. Noscript, so a script is refused it, which is a real server too and is the one thing about this command that surprises people. Not admin, so it is reported to a monitor."
+
+[[command]]
 name = "MONITOR"
 group = "server"
 since = "1.0.0"
@@ -5206,7 +5261,7 @@ plan = "none"
 bounded = "inherent"
 status = "shipped"
 wire = "verified"
-notes = "Nothing is written back on success and the connection closes under the client, which is what a stopped server looks like from the outside and is what the client libraries already expect. All five flags are taken and none of them changes what happens, because this server has no save points and no snapshot to write: what durability there is belongs to the file underneath and is already on disk before a command returns, so SAVE has nothing to do and NOSAVE has nothing to skip, and NOW and FORCE are about replicas and failed saves that do not exist here. The syntax errors were read off 8.10.1 rather than guessed. SAVE and NOSAVE together is an error, ABORT next to any other flag is an error, and ABORT next to a second ABORT is fine, as is any flag repeated. ABORT on its own answers No shutdown in progress, and here that is a state that cannot be reached at all rather than one that happens to be empty, because the decision and the stop land inside one turn of the loop. The command sets a flag and the driver leaves its loop on the next turn, so the batch this arrived in finishes and its other replies go out, and the socket file and the file get taken away by the same code a signal reaches."
+notes = "Nothing is written back on success and the connection closes under the client, which is what a stopped server looks like from the outside and is what the client libraries already expect. SAVE writes the file SAVE writes and is the only flag that does anything. NOSAVE is the default rather than an instruction, because this server has no save points and never will: what durability there is belongs to the file underneath and is already on disk before a command returns, so there is nothing for NOSAVE to skip and the file SAVE asks for is an export somebody wants a copy of on the way down. NOW and FORCE are about replicas and failed saves that do not exist here. The syntax errors were read off 8.10.1 rather than guessed. SAVE and NOSAVE together is an error, ABORT next to any other flag is an error, and ABORT next to a second ABORT is fine, as is any flag repeated. ABORT on its own answers No shutdown in progress, and here that is a state that cannot be reached at all rather than one that happens to be empty, because the decision and the stop land inside one turn of the loop. The command sets a flag and the driver leaves its loop on the next turn, so the batch this arrived in finishes and its other replies go out, and the socket file and the file get taken away by the same code a signal reaches."
 
 [[command]]
 name = "BACKUP"

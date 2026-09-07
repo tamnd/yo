@@ -77,6 +77,7 @@ mod misses;
 mod monitor;
 mod multi;
 mod notify;
+mod persist;
 mod pubsub;
 mod scan;
 mod scripting;
@@ -811,6 +812,8 @@ pub struct Server {
     /// the command being reported is running on a thread that cannot reach the
     /// connection being told about it. See the `monitor` module.
     monitors: monitor::Monitors,
+    /// What the saves have done, which is all `INFO persistence` has to report.
+    persist: persist::Persistence,
 }
 
 impl Server {
@@ -857,6 +860,7 @@ impl Server {
             kills: AtomicUsize::new(0),
             pause: AtomicU64::new(0),
             monitors: monitor::Monitors::default(),
+            persist: persist::Persistence::default(),
             mail: pubsub::boxes(1),
         }
     }
@@ -927,6 +931,7 @@ impl Server {
             kills: AtomicUsize::new(0),
             pause: AtomicU64::new(0),
             monitors: monitor::Monitors::default(),
+            persist: persist::Persistence::default(),
             mail: pubsub::boxes(1),
         }
     }
@@ -8097,8 +8102,13 @@ mod tests {
     /// combined with a word about how to do it, and repeating any one of them
     /// is fine. All of it was read off a running 8.10.1 rather than worked out
     /// from the documentation, which does not say.
+    ///
+    /// The fixtures here save into a directory of their own because two of the
+    /// combinations carry `SAVE`, and a test that writes a file into whatever
+    /// directory the test runner happened to start in leaves it there.
     #[test]
     fn shutdown_takes_the_flags_redis_takes() {
+        let s = Saves::new("shutdown-flags");
         for flags in [
             &[b"NOSAVE".as_slice()][..],
             &[b"SAVE"],
@@ -8110,6 +8120,7 @@ mod tests {
             &[b"NOSAVE", b"NOW", b"FORCE"],
         ] {
             let mut f = Fixture::new();
+            f.server.set_dir(s.dir.clone());
             let mut parts = vec![b"SHUTDOWN".as_slice()];
             parts.extend_from_slice(flags);
             let (flow, reply) = f.flow(&parts);
@@ -8510,6 +8521,250 @@ mod tests {
             f.run(&[b"BACKUP", b"NOPE"]),
             "-ERR unknown subcommand 'NOPE'. Try BACKUP HELP.\r\n"
         );
+    }
+
+    /// A fixture whose server saves into a directory of its own.
+    ///
+    /// The same shape and the same reason as [`Backups`]: these tests write real
+    /// files, because a save that only moved a counter would pass a test suite
+    /// and hand somebody an empty file.
+    struct Saves {
+        f: Fixture,
+        dir: PathBuf,
+    }
+
+    impl Saves {
+        fn new(name: &str) -> Saves {
+            let dir = std::env::temp_dir().join(format!("yo-save-{name}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).expect("could not make a temporary directory");
+            let mut f = Fixture::new();
+            f.server.set_dir(dir.clone());
+            Saves { f, dir }
+        }
+
+        fn run(&mut self, parts: &[&[u8]]) -> String {
+            self.f.run(parts)
+        }
+
+        /// The names in the directory, sorted.
+        fn files(&self) -> Vec<String> {
+            let mut names: Vec<String> = match std::fs::read_dir(&self.dir) {
+                Ok(entries) => entries
+                    .filter_map(|e| e.ok())
+                    .map(|e| e.file_name().to_string_lossy().into_owned())
+                    .collect(),
+                Err(_) => Vec::new(),
+            };
+            names.sort();
+            names
+        }
+
+        fn image(&self) -> Vec<u8> {
+            std::fs::read(self.dir.join("dump.rdb")).expect("could not read the file")
+        }
+
+        /// One field out of `INFO persistence`.
+        fn field(&mut self, name: &str) -> String {
+            let text = self.run(&[b"INFO", b"persistence"]);
+            let head = format!("\r\n{name}:");
+            let at = text.find(&head).expect("the field is not in the section");
+            let rest = &text[at + head.len()..];
+            rest[..rest.find("\r\n").expect("the field has no end")].to_owned()
+        }
+    }
+
+    impl Drop for Saves {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    #[test]
+    fn save_writes_a_file_that_carries_the_dataset() {
+        let mut s = Saves::new("writes");
+        s.run(&[b"SET", b"k", b"v"]);
+        s.run(&[b"RPUSH", b"l", b"a", b"b"]);
+        assert!(
+            s.files().is_empty(),
+            "a server has saved without being asked"
+        );
+
+        assert_eq!(s.run(&[b"SAVE"]), "+OK\r\n");
+        assert_eq!(s.files(), ["dump.rdb"]);
+
+        // The header, the two databases the keys are in and the end marker,
+        // which is as far as this test goes: what is between them is the
+        // snapshot writer's own test, and a real server starting on one of
+        // these files is what the harness checks.
+        let image = s.image();
+        assert!(
+            image.starts_with(b"REDIS00"),
+            "the header is not an RDB one"
+        );
+        assert!(
+            image.windows(1).any(|w| w == [0xFF]),
+            "there is no end marker"
+        );
+        assert!(image.len() > 40, "the file is too small to hold anything");
+    }
+
+    #[test]
+    fn a_save_leaves_no_temporary_file_behind() {
+        let mut s = Saves::new("temp");
+        s.run(&[b"SET", b"k", b"v"]);
+        s.run(&[b"SAVE"]);
+        s.run(&[b"BGSAVE"]);
+        assert_eq!(s.files(), ["dump.rdb"]);
+    }
+
+    #[test]
+    fn a_save_that_cannot_write_says_so_in_one_word() {
+        let mut s = Saves::new("nowhere");
+        // A directory that is not there, which is the failure a real server
+        // answers `-ERR` to with nothing after it.
+        s.f.server.set_dir(s.dir.join("gone"));
+        assert_eq!(s.run(&[b"SAVE"]), "-ERR\r\n");
+        assert_eq!(s.field("rdb_last_bgsave_status"), "err");
+        // And the count of attempts moved, because the attempt happened.
+        assert_eq!(s.field("rdb_saves"), "1");
+    }
+
+    #[test]
+    fn lastsave_starts_at_the_time_the_server_did_and_moves_on_a_save() {
+        let mut s = Saves::new("lastsave");
+        let started = s.run(&[b"LASTSAVE"]);
+        assert_eq!(started, format!(":{}\r\n", s.f.server.started_ms / 1_000));
+
+        s.f.server.set_clock_ms(s.f.server.started_ms + 5_000);
+        s.run(&[b"SAVE"]);
+        let after = s.run(&[b"LASTSAVE"]);
+        assert_eq!(after, format!(":{}\r\n", s.f.server.started_ms / 1_000 + 5));
+
+        // A write does not move it. Only a save does.
+        s.run(&[b"SET", b"k", b"v"]);
+        assert_eq!(s.run(&[b"LASTSAVE"]), after);
+    }
+
+    #[test]
+    fn bgsave_takes_the_one_word_it_takes_and_nothing_else() {
+        let mut s = Saves::new("bgsave");
+        for parts in [
+            &[b"BGSAVE".as_slice()][..],
+            &[b"BGSAVE", b"SCHEDULE"],
+            &[b"BGSAVE", b"schedule"],
+        ] {
+            assert_eq!(s.run(parts), "+Background saving started\r\n");
+        }
+        for parts in [
+            &[b"BGSAVE".as_slice(), b"x"][..],
+            &[b"BGSAVE", b"SCHEDULE", b"x"],
+            &[b"BGSAVE", b"SCHEDULE", b"SCHEDULE"],
+        ] {
+            assert_eq!(s.run(parts), "-ERR syntax error\r\n");
+        }
+    }
+
+    #[test]
+    fn a_save_inside_a_transaction_says_it_was_scheduled() {
+        let mut s = Saves::new("queued");
+        // `SAVE` never gets there, because it carries `no_multi`.
+        assert_eq!(s.run(&[b"MULTI"]), "+OK\r\n");
+        assert_eq!(
+            s.run(&[b"SAVE"]),
+            "-ERR Command not allowed inside a transaction\r\n"
+        );
+        assert_eq!(
+            s.run(&[b"EXEC"]),
+            "-EXECABORT Transaction discarded because of previous errors.\r\n"
+        );
+
+        assert_eq!(s.run(&[b"MULTI"]), "+OK\r\n");
+        assert_eq!(s.run(&[b"BGSAVE"]), "+QUEUED\r\n");
+        assert_eq!(s.run(&[b"BGREWRITEAOF"]), "+QUEUED\r\n");
+        assert_eq!(
+            s.run(&[b"EXEC"]),
+            "*2\r\n+Background saving scheduled\r\n\
+             +Background append only file rewriting scheduled\r\n"
+        );
+        // And the file is there, which is the half of it that is not the words.
+        assert_eq!(s.files(), ["dump.rdb"]);
+    }
+
+    #[test]
+    fn a_rewrite_counts_itself_and_writes_nothing() {
+        let mut s = Saves::new("rewrite");
+        assert_eq!(
+            s.run(&[b"BGREWRITEAOF"]),
+            "+Background append only file rewriting started\r\n"
+        );
+        assert_eq!(s.field("aof_rewrites"), "1");
+        assert_eq!(s.field("aof_enabled"), "0");
+        assert!(s.files().is_empty(), "a rewrite has written a file");
+    }
+
+    #[test]
+    fn role_says_master_with_nothing_following_it() {
+        let mut f = Fixture::new();
+        assert_eq!(f.run(&[b"ROLE"]), "*3\r\n$6\r\nmaster\r\n:0\r\n*0\r\n");
+        assert_eq!(
+            f.run(&[b"ROLE", b"x"]),
+            "-ERR wrong number of arguments for 'role' command\r\n"
+        );
+    }
+
+    #[test]
+    fn the_persistence_section_counts_the_saves_that_were_asked_for() {
+        let mut s = Saves::new("counts");
+        assert_eq!(s.field("rdb_saves"), "0");
+        assert_eq!(s.field("rdb_last_bgsave_status"), "ok");
+        s.run(&[b"SAVE"]);
+        s.run(&[b"BGSAVE"]);
+        s.run(&[b"BGSAVE", b"SCHEDULE"]);
+        assert_eq!(s.field("rdb_saves"), "3");
+        assert_eq!(s.field("rdb_bgsave_in_progress"), "0");
+        assert_eq!(s.field("loading"), "0");
+    }
+
+    #[test]
+    fn the_persistence_section_is_in_a_bare_info_and_not_in_another_one() {
+        let mut f = Fixture::new();
+        assert!(f.run(&[b"INFO"]).contains("# Persistence"));
+        assert!(f.run(&[b"INFO", b"persistence"]).contains("# Persistence"));
+        assert!(f.run(&[b"INFO", b"all"]).contains("# Persistence"));
+        assert!(!f.run(&[b"INFO", b"clients"]).contains("# Persistence"));
+    }
+
+    #[test]
+    fn the_file_name_reads_back_and_cannot_be_written() {
+        let mut f = Fixture::new();
+        assert_eq!(
+            f.run(&[b"CONFIG", b"GET", b"dbfilename"]),
+            "*2\r\n$10\r\ndbfilename\r\n$8\r\ndump.rdb\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"CONFIG", b"SET", b"dbfilename", b"other.rdb"]),
+            "-ERR CONFIG SET failed (possibly related to argument 'dbfilename') - can't set protected config\r\n"
+        );
+        // Refused even when it is set to what it already is, which is what
+        // being protected means and is not what being immutable means.
+        assert_eq!(
+            f.run(&[b"CONFIG", b"SET", b"dbfilename", b"dump.rdb"]),
+            "-ERR CONFIG SET failed (possibly related to argument 'dbfilename') - can't set protected config\r\n"
+        );
+    }
+
+    #[test]
+    fn shutdown_save_writes_the_file_and_shutdown_on_its_own_does_not() {
+        let mut s = Saves::new("shutdown");
+        s.run(&[b"SET", b"k", b"v"]);
+        s.run(&[b"SHUTDOWN", b"NOSAVE"]);
+        assert!(s.files().is_empty(), "a nosave shutdown wrote a file");
+
+        let mut s = Saves::new("shutdown-save");
+        s.run(&[b"SET", b"k", b"v"]);
+        s.run(&[b"SHUTDOWN", b"SAVE"]);
+        assert_eq!(s.files(), ["dump.rdb"]);
     }
 
     #[test]

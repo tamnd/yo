@@ -16,7 +16,7 @@
 
 use super::args::{self, Args, is};
 use super::table::{self, Spec};
-use super::{DATABASES, Flow, Server, Session, backup, cpu, multi, notify};
+use super::{DATABASES, Flow, Server, Session, backup, cpu, multi, notify, persist};
 use crate::proto::Proto;
 use crate::reply::Out;
 use core::fmt::Write;
@@ -160,6 +160,14 @@ const MAXSTORE: &str = "maxstore";
 /// enabled. That distinction is copied, because the two messages are what an
 /// operator reads when a `CONFIG SET` does not take.
 const DIR: &str = "dir";
+
+/// What `SAVE` writes, under [`DIR`].
+///
+/// Protected in the same way and for a weaker version of the same reason: a
+/// server whose file name moved under a running backup script leaves a file
+/// nothing goes looking for. Redis protects it too, so `CONFIG SET dbfilename`
+/// is refused there as well without protected configs turned on.
+const DBFILENAME: &str = "dbfilename";
 
 /// How long a sealed backup is kept before it cleans itself up.
 ///
@@ -384,6 +392,12 @@ pub(super) fn execute(
             out.ok();
         }
         "time" => time(out),
+        // The four commands about writing the dataset to a file and the one
+        // about who this server is, all in the `persist` module because a client
+        // asks them together.
+        "save" | "bgsave" | "bgrewriteaof" | "lastsave" | "role" => {
+            persist::execute(server, session, spec, args, out)?;
+        }
         "backup" => backup::execute(server, args, out)?,
         "shutdown" => return shutdown(server, args),
         _ => return Err(args::unknown_command(args)),
@@ -420,14 +434,15 @@ fn time(out: &mut Out) {
 /// and is what every client library already expects. There is no `OK`, because
 /// an `OK` would be a promise made by a process that is about to not exist.
 ///
-/// The flags are taken and none of them changes what happens, which is the same
-/// answer `SAVE` gets from `CONFIG GET`: this server has no save points and no
-/// snapshot to write, so saving and not saving are the same act. What durability
-/// there is belongs to the file underneath and is already on disk by the time a
-/// command returns, so there is nothing for `SAVE` to do and nothing for
-/// `NOSAVE` to skip. `NOW` and `FORCE` are about not waiting for replicas and
-/// about going anyway when a save failed, and neither has anything to wait for
-/// or to fail here.
+/// `SAVE` writes the file [`persist`] writes, and it is the only word here that
+/// does anything. `NOSAVE` is the default rather than an instruction, which is
+/// the same answer `save` gets from `CONFIG GET`: this server has no save points
+/// and never will, because what durability there is belongs to the file
+/// underneath and is already on disk by the time a command returns. So there is
+/// nothing for `NOSAVE` to skip and the file `SAVE` asks for is an export
+/// somebody wants a copy of on the way down. `NOW` and `FORCE` are about not
+/// waiting for replicas and about going anyway when a save failed, and neither
+/// has anything to wait for or to fail here.
 ///
 /// # Errors
 ///
@@ -457,6 +472,9 @@ fn shutdown(server: &Server, args: Args<'_>) -> Result<Flow> {
     }
     if abort {
         return Err(Error::new(Code::Invalid, "No shutdown in progress."));
+    }
+    if save {
+        persist::on_shutdown(server);
     }
     server.stop();
     // Closing is what stops anything the client pipelined behind this from
@@ -846,6 +864,7 @@ fn config(server: &Server, args: Args<'_>, out: &mut Out) -> Result<()> {
         let limit = wanted(MAXMEMORY);
         let store = wanted(MAXSTORE);
         let where_ = wanted(DIR);
+        let file = wanted(DBFILENAME);
         let ttl = wanted(SEALED_TTL);
         let events = wanted(NOTIFY);
         out.map(
@@ -855,6 +874,7 @@ fn config(server: &Server, args: Args<'_>, out: &mut Out) -> Result<()> {
                 + usize::from(limit)
                 + usize::from(store)
                 + usize::from(where_)
+                + usize::from(file)
                 + usize::from(ttl)
                 + usize::from(events),
         );
@@ -891,6 +911,12 @@ fn config(server: &Server, args: Args<'_>, out: &mut Out) -> Result<()> {
             // launched from.
             out.bulk(DIR.as_bytes());
             yo_alloc::allow(|| out.bulk(server.dir().to_string_lossy().as_bytes()));
+        }
+        if file {
+            // The name on its own and not the path, which is how a real server
+            // answers it too: the two settings are joined by whoever reads them.
+            out.bulk(DBFILENAME.as_bytes());
+            out.bulk(persist::FILE.as_bytes());
         }
         if ttl {
             out.bulk(SEALED_TTL.as_bytes());
@@ -978,16 +1004,19 @@ fn config(server: &Server, args: Args<'_>, out: &mut Out) -> Result<()> {
                 policy = Some(p);
                 continue;
             }
-            if is(name, DIR.as_bytes()) {
-                // Refused whatever the value is, including the one it is already
-                // set to, which is the one place a setting here does not take
-                // the write that changes nothing. That is the reference's
-                // answer: a protected config is refused before anybody looks at
-                // what was asked for.
+            // Refused whatever the value is, including the one they are already
+            // set to, which is the one place a setting here does not take the
+            // write that changes nothing. That is the reference's answer: a
+            // protected config is refused before anybody looks at what was
+            // asked for.
+            if let Some(protected) = [DIR, DBFILENAME]
+                .into_iter()
+                .find(|p| is(name, p.as_bytes()))
+            {
                 return Err(Error::fmt(
                     Code::Unsupported,
                     format_args!(
-                        "CONFIG SET failed (possibly related to argument '{DIR}') - can't set protected config"
+                        "CONFIG SET failed (possibly related to argument '{protected}') - can't set protected config"
                     ),
                 ));
             }
@@ -1212,6 +1241,9 @@ fn info(server: &Server, args: Args<'_>, out: &mut Out) {
                 server.store_bytes(),
                 server.regime(),
             );
+        }
+        if want("persistence") {
+            persist::info(server, &mut s);
         }
         if want("stats") {
             // The cold counters live here and not in the memory section,

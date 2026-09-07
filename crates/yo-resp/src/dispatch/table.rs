@@ -6099,6 +6099,80 @@ pub static COMMANDS: &[Spec] = &[
         summary: "The server's clock, as seconds and microseconds.",
         group: "server",
     },
+    // The four about writing the dataset out and the one about who this server
+    // is. The first three are `admin` and so stay off a monitor's feed, and the
+    // last two are not and so are reported, which was measured rather than read
+    // off the flags.
+    //
+    // `no_multi` on `SAVE` alone. A transaction has been promised that nothing
+    // runs in between, and a save that blocks the server for as long as the
+    // dataset takes to write is the one command here that would break that
+    // promise rather than defer it.
+    Spec {
+        name: "save",
+        arity: 1,
+        flags: &["admin", "noscript", "no_async_loading", "no_multi"],
+        first_key: 0,
+        last_key: 0,
+        step: 0,
+        acl: &["@admin", "@slow", "@dangerous"],
+        since: "1.0.0",
+        complexity: "O(N) in the number of keys",
+        summary: "Write the whole dataset out as an RDB file, and wait for it.",
+        group: "server",
+    },
+    Spec {
+        name: "bgsave",
+        arity: -1,
+        flags: &["admin", "noscript", "no_async_loading"],
+        first_key: 0,
+        last_key: 0,
+        step: 0,
+        acl: &["@admin", "@slow", "@dangerous"],
+        since: "1.0.0",
+        complexity: "O(N) in the number of keys",
+        summary: "Write the whole dataset out as an RDB file.",
+        group: "server",
+    },
+    Spec {
+        name: "bgrewriteaof",
+        arity: 1,
+        flags: &["admin", "noscript", "no_async_loading"],
+        first_key: 0,
+        last_key: 0,
+        step: 0,
+        acl: &["@admin", "@slow", "@dangerous"],
+        since: "1.0.0",
+        complexity: "O(1)",
+        summary: "Rewrite the append only file, which this server has not got.",
+        group: "server",
+    },
+    Spec {
+        name: "lastsave",
+        arity: 1,
+        flags: &["loading", "stale", "fast"],
+        first_key: 0,
+        last_key: 0,
+        step: 0,
+        acl: &["@admin", "@fast", "@dangerous"],
+        since: "1.0.0",
+        complexity: "O(1)",
+        summary: "When the dataset was last written out, in seconds.",
+        group: "server",
+    },
+    Spec {
+        name: "role",
+        arity: 1,
+        flags: &["noscript", "loading", "stale", "fast"],
+        first_key: 0,
+        last_key: 0,
+        step: 0,
+        acl: &["@admin", "@fast", "@dangerous"],
+        since: "2.8.12",
+        complexity: "O(1)",
+        summary: "Whether this server is a master or a replica, and of what.",
+        group: "server",
+    },
     // Marked `admin` for the usual reason and one more: the flag is what keeps a
     // command out of the feed, and a `MONITOR` that reported itself to the
     // monitor it had just made would be reporting the audience to itself.
@@ -6398,7 +6472,16 @@ const FREE: u16 = u16::MAX;
 /// and did not take. The floor is still thirteen, because none of the nine
 /// agrees with anything already in the table on all four key bytes. The old
 /// multiplier was `0x91de5d5e21661fbd` and it served for two searches.
-const MIX: u64 = 0x71ee_9b00_ab8a_5fd7;
+///
+/// The five persistence commands took the table to 427 names and the worst probe
+/// to two slots again. A twenty first search ran, four billion multipliers over
+/// ten threads on each of two independent seeds, and the two seeds reached one
+/// slot for every name at twenty eight extra probes and at twenty nine. Four
+/// probes more than the last search over seven more names is the ordinary cost
+/// of a name and none of the seven collides with anything already there, so the
+/// floor is still thirteen and the number a lookup feels is still one. The old
+/// multiplier was `0x71ee9b00ab8a5fd7` and it served for one search.
+const MIX: u64 = 0xc7f9_d8be_b27e_8381;
 
 /// The four bytes the index is computed from: the length, the first two bytes,
 /// and the last byte with the second to last and the middle folded into it, all
@@ -6818,7 +6901,7 @@ mod tests {
     /// The index is still worth having, which is a thing that can rot.
     ///
     /// The multiplier was searched for against the 191 commands that were in the
-    /// table when it was written, and nineteen times since. Adding commands cannot
+    /// table when it was written, and twenty one times since. Adding commands cannot
     /// make a lookup wrong, because a probe walks to an empty slot and every
     /// candidate has its name compared, but it can make one slow, and a slow
     /// lookup is exactly the thing this replaced. So the worst probe is written
@@ -6854,7 +6937,7 @@ mod tests {
             "the multiplier stopped keeping every command close"
         );
         assert!(
-            total <= 24,
+            total <= 28,
             "{total} extra slots walked over the whole table"
         );
     }
