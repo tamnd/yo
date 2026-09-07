@@ -4,6 +4,30 @@ What each release changed, why, and what it costs you. The versioning rules and 
 
 While the major is 0, a minor release may break anything, including the on-disk format. The format is frozen at `M6`, not before.
 
+## 0.3.26 — 2026-09-07
+
+Four pull requests and no milestone has closed, so this is a patch.
+
+Two of them are `M8` compatibility work and two of them finish putting the workspace back under Miri. A file written by 0.3.25 opens unchanged under this version and a file written by this version opens under 0.3.25. No record kind was added.
+
+### Added
+
+- **`keyspace_hits` and `keyspace_misses` in `INFO stats`.** The reads that found the key they went looking for and the reads that did not, which are the two numbers the hit rate everybody quotes is made of. Redis counts them inside `lookupKey`, next to the `keymiss` notification and skipped for the same reasons, so the keys it misses are exactly the keys it says `keymiss` for. Here the counting happens in the lookup funnels in `yo-kv` rather than in the key walk in front of the command, because the walk would cost a stripe lock and a map probe per key on every read and these counters are always on where the notification is off on nearly every server. The one fact the storage layer cannot know, whether the command running now is a read, is armed once per command by the dispatcher. A real server reaches its lookup once per key it was sent and this one reaches its own as many times as the command needs, so the first lookup that counts turns the rest of the command quiet. Measured against 8.10.1 over a hundred and eighty five cases in both the hit shape and the miss shape, and the two agree everywhere except `XREAD`, which is D-121.
+- **`expired_subkeys` and `expired_subkeys_active` in `INFO stats`**, in the position the reference writes them.
+
+### Fixed
+
+- **A hash field given a deadline with `HEXPIRE` only went when a command next read the hash.** So a hash nobody touched held every field it had been told to drop, and a client subscribed to `hexpired` heard nothing at all. There is now a second expiry cycle with its own list of the keys whose hashes have ever taken a field deadline, walked with a cursor at most once a tick. A field deadline lives inside the hash body rather than in the record, so the marked index the key sweep draws from cannot see one, and that index is spoken for by the volatile eviction policies anyway. A hash whose earliest deadline has not passed costs a load and a comparison, a hash whose body is on the device is left alone rather than faulted in for this, and a server that has never used the `HEXPIRE` family pays one comparison for the whole thing. All 25 of the hash field expiry cases now agree with 8.10.1, where 20 of them differed. D-117 comes out of the divergence register.
+- **`CONFIG RESETSTAT` was leaving the expiry and eviction totals alone.** It now clears them alongside the two lookup counters, which is what `resetServerStats` does.
+
+### Changed
+
+- **The Miri run covers the whole workspace again.** `yo-graph` and `yo-doc` were the last two crates left out of it because they had tests that took minutes each interpreted, and both are back in as two shards. Between them 16 tests are skipped and each says why where it is skipped: they are measurements where the size is the claim rather than a way of reaching it, which is bits an edge, how close a sampled estimate lands, a margin one numbering beats another by, two stack depths, and four compile time limits that a test sits exactly on. Everything else came down as a count and every cut was checked by forcing the Miri branches on and running the suite compiled, which is what catches a test that goes vacuous when a size written down twice only moves in one of the two places. That work also turned up a real bug: `modularity` panics on a label above the node count although its documentation says any grouping of the nodes will do, which is issue 462 and is not fixed here.
+
+### Known gaps
+
+- All six `yo-resp` Miri shards are still red, because Miri cannot interpret the Lua tests. That is issue 449 and it is a different problem from a crate being too slow.
+
 ## 0.3.25 — 2026-09-07
 
 Four pull requests and no milestone has closed, so this is a patch.
