@@ -1393,13 +1393,18 @@ mod tests {
     fn shrinkage(shape: impl Fn(i64) -> Vec<u8>) -> f64 {
         let mut docs = Docs::new();
         let mut plain = 0usize;
-        for i in 0..256i64 {
+        // Fewer documents under Miri. What comes back is the stored bytes over
+        // the plain bytes summed across the documents, and neither half of that
+        // counts the name table, so the ratio is a per document number and the
+        // count only decides how many times it is averaged.
+        let n = if cfg!(miri) { 16i64 } else { 256 };
+        for i in 0..n {
             let bytes = shape(i);
             plain += bytes.len();
             docs.put_bytes(format!("d:{i}").as_bytes(), &bytes)
                 .expect("put");
         }
-        let stored: usize = (0..256i64)
+        let stored: usize = (0..n)
             .map(|i| {
                 docs.bytes(format!("d:{i}").as_bytes())
                     .expect("stored")
@@ -1465,15 +1470,20 @@ mod tests {
     #[test]
     fn a_removal_leaves_every_other_document_where_it_was() {
         let mut docs = Docs::new();
-        for i in 0..64i64 {
+        // Fewer documents under Miri. Every count below comes off this one so
+        // that a smaller run still removes a third of them and still looks at
+        // all of the rest.
+        let n = if cfg!(miri) { 24i64 } else { 64 };
+        for i in 0..n {
             docs.put_bytes(format!("order:{i}").as_bytes(), &order(i, "open", 1))
                 .expect("put");
         }
-        for i in (0..64i64).step_by(3) {
+        let gone = (0..n).step_by(3).count();
+        for i in (0..n).step_by(3) {
             assert!(docs.remove(format!("order:{i}").as_bytes()));
         }
-        assert_eq!(docs.len(), 64 - 22);
-        for i in 0..64i64 {
+        assert_eq!(docs.len(), n as usize - gone);
+        for i in 0..n {
             let id = format!("order:{i}");
             match docs.get(id.as_bytes()) {
                 Some(d) => {
@@ -1488,8 +1498,12 @@ mod tests {
 
     #[test]
     fn a_walk_sees_every_document_once() {
+        // Fewer documents under Miri, but still several batches of the scan,
+        // which is what the cursor is being checked over. Every count below
+        // comes from this one.
+        let n = if cfg!(miri) { 48i64 } else { 200 };
         let mut docs = Docs::new();
-        for i in 0..200i64 {
+        for i in 0..n {
             docs.put_bytes(format!("order:{i}").as_bytes(), &order(i, "open", 1))
                 .expect("put");
         }
@@ -1499,7 +1513,7 @@ mod tests {
             .map(|(_, d)| d.get(b"id").and_then(|v| v.as_int()).expect("an id"))
             .collect();
         seen.sort_unstable();
-        assert_eq!(seen, (0..200).collect::<Vec<i64>>());
+        assert_eq!(seen, (0..n).collect::<Vec<i64>>());
 
         let mut scanned = Vec::new();
         let mut cursor = Cursor::START;
@@ -1511,7 +1525,7 @@ mod tests {
         }
         scanned.sort_unstable();
         scanned.dedup();
-        assert_eq!(scanned.len(), 200);
+        assert_eq!(scanned.len(), n as usize);
     }
 
     #[test]
@@ -1550,23 +1564,31 @@ mod tests {
 
     #[test]
     fn an_index_declared_after_the_documents_finds_them() {
+        // A quarter of them shut, whatever the count is. Fewer under Miri, and
+        // the two counts below come from it rather than being written out
+        // again, which is what would go quietly wrong here.
+        let n = if cfg!(miri) { 24i64 } else { 64 };
+        let (shut, open) = ((n / 4) as usize, (n - n / 4) as usize);
         let mut docs = Docs::new();
-        for i in 0..64i64 {
+        for i in 0..n {
             let status = if i % 4 == 0 { "shut" } else { "open" };
             docs.put_bytes(format!("order:{i}").as_bytes(), &order(i, status, 1))
                 .expect("put");
         }
         docs.create_index("$.status").expect("indexed");
         assert_eq!(docs.index("$.status").expect("there").len(), 2);
-        assert_eq!(docs.count("$.status", &Key::text("shut")).expect("i"), 16);
-        assert_eq!(docs.count("$.status", &Key::text("open")).expect("i"), 48);
-        assert_eq!(found(&docs, "$.status", &Key::text("shut")).len(), 16);
+        assert_eq!(docs.count("$.status", &Key::text("shut")).expect("i"), shut);
+        assert_eq!(docs.count("$.status", &Key::text("open")).expect("i"), open);
+        assert_eq!(found(&docs, "$.status", &Key::text("shut")).len(), shut);
         assert!(found(&docs, "$.status", &Key::text("gone")).is_empty());
 
         // A document written after the index exists is filed by the write.
-        docs.put_bytes(b"order:64", &order(64, "shut", 1))
+        docs.put_bytes(format!("order:{n}").as_bytes(), &order(n, "shut", 1))
             .expect("put");
-        assert_eq!(docs.count("$.status", &Key::text("shut")).expect("i"), 17);
+        assert_eq!(
+            docs.count("$.status", &Key::text("shut")).expect("i"),
+            shut + 1
+        );
     }
 
     #[test]
@@ -1781,14 +1803,18 @@ mod tests {
         let mut docs = Docs::new();
         docs.create_ordered_index("$.customer").expect("ordered");
         // Customer is seven times the id, so the values are 0, 7, 14 and on.
-        for i in 0..64i64 {
+        // Fewer under Miri. The bounds below are all well inside a collection
+        // this size and the empty one is well past the end of either, so they
+        // ask the same questions of a shorter run of values.
+        let n = if cfg!(miri) { 24i64 } else { 64 };
+        for i in 0..n {
             docs.put_bytes(format!("order:{i}").as_bytes(), &order(i, "open", 1))
                 .expect("put");
         }
 
         assert_eq!(
             ranged(&docs, Bound::Unbounded, Bound::Unbounded),
-            (0..64i64).map(|i| i * 7).collect::<Vec<i64>>()
+            (0..n).map(|i| i * 7).collect::<Vec<i64>>()
         );
         let (lo, hi) = (Key::int(70), Key::int(105));
         assert_eq!(
@@ -1820,24 +1846,31 @@ mod tests {
 
     #[test]
     fn a_range_stays_right_through_writes_and_removals() {
+        // Fewer documents under Miri. Half of them are removed either way, so
+        // the renumbering still runs through the whole collection, and every
+        // count below comes from this one rather than being written out again.
+        let n = if cfg!(miri) { 32i64 } else { 128 };
         let mut docs = Docs::new();
-        for i in 0..128i64 {
+        for i in 0..n {
             docs.put_bytes(format!("order:{i}").as_bytes(), &order(i, "open", 1))
                 .expect("put");
         }
         // Declared after the fact, so this is the backfill and not the write
         // path putting the tree together.
         docs.create_ordered_index("$.customer").expect("ordered");
-        assert_eq!(ranged(&docs, Bound::Unbounded, Bound::Unbounded).len(), 128);
+        assert_eq!(
+            ranged(&docs, Bound::Unbounded, Bound::Unbounded).len(),
+            n as usize
+        );
 
         // Every removal moves the key table's last row into the hole, so this is
         // the renumbering going through the whole collection.
-        for i in (0..128i64).step_by(2) {
+        for i in (0..n).step_by(2) {
             assert!(docs.remove(format!("order:{i}").as_bytes()));
         }
         assert_eq!(
             ranged(&docs, Bound::Unbounded, Bound::Unbounded),
-            (0..128i64)
+            (0..n)
                 .filter(|i| i % 2 == 1)
                 .map(|i| i * 7)
                 .collect::<Vec<i64>>()
@@ -2066,6 +2099,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "a full key table is the claim and it is 65536 names")]
     fn a_collection_whose_key_table_is_full_stores_the_rest_with_names() {
         // Fill the table with names no document below uses, then write one and
         // check it is stored whole rather than refused.
@@ -2221,9 +2255,12 @@ mod tests {
         docs.create_index("$.lang").expect("index");
         docs.create_vector_index("$.embedding", 8).expect("index");
 
-        // Four hundred English documents spread about, and one French one that
-        // sits nowhere near the query.
-        for n in 0..400u64 {
+        // English documents spread about, and one French one that sits nowhere
+        // near the query. Fewer under Miri: what the test needs is more English
+        // documents near the query than the twenty the first search asks for,
+        // so that the French one is not in the answer by accident.
+        let count = if cfg!(miri) { 30u64 } else { 400 };
+        for n in 0..count {
             let id = format!("en:{n}");
             docs.put_bytes(id.as_bytes(), &item("en", &spread(n)))
                 .expect("put");
@@ -2265,10 +2302,15 @@ mod tests {
 
         // Vectors first, then the field the filter reads, so every tag was
         // written before there was anything to put in it.
+        // Fewer documents under Miri, with the French ones proportionally as
+        // often, so there are still the four the asserts below ask for. The two
+        // collections are built the same way twice, so this test costs double
+        // whatever the count is.
+        let (count, every) = if cfg!(miri) { (20u64, 5) } else { (200, 50) };
         let mut late = Docs::new();
         late.create_vector_index("$.embedding", 8).expect("index");
-        for n in 0..200u64 {
-            let lang = if n % 50 == 0 { "fr" } else { "en" };
+        for n in 0..count {
+            let lang = if n % every == 0 { "fr" } else { "en" };
             let id = format!("{n}");
             late.put_bytes(id.as_bytes(), &item(lang, &spread(n)))
                 .expect("put");
@@ -2278,8 +2320,8 @@ mod tests {
         // The other way round, where every write already knew.
         let mut early = Docs::new();
         early.create_index("$.lang").expect("index");
-        for n in 0..200u64 {
-            let lang = if n % 50 == 0 { "fr" } else { "en" };
+        for n in 0..count {
+            let lang = if n % every == 0 { "fr" } else { "en" };
             let id = format!("{n}");
             early
                 .put_bytes(id.as_bytes(), &item(lang, &spread(n)))

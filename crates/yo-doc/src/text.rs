@@ -999,7 +999,11 @@ mod tests {
     #[test]
     fn a_document_survives_being_written_out_and_read_back() {
         let mut rng = Rng::new(0x0d0c);
-        for _ in 0..500 {
+        // Fewer documents under Miri. Each one is grown at random and the
+        // shapes repeat long before the count runs out, so this is a budget
+        // rather than a size.
+        let rounds = if cfg!(miri) { 60 } else { 500 };
+        for _ in 0..rounds {
             let mut b = Builder::new();
             grow(&mut b, &mut rng, 0);
             let first = b.finish().expect("finished").to_vec();
@@ -1082,7 +1086,13 @@ mod tests {
         assert!(e.message().contains("not UTF-8"));
     }
 
+    /// Not shrunk, for the same reason as the builder side of it: the second
+    /// half of this test parses a document that sits exactly on
+    /// [`DEPTH_MAX`] and asks for it back unchanged, so the refusal is the
+    /// limit rather than something short of it. Any smaller number tests a
+    /// different limit than the one the parser has.
     #[test]
+    #[cfg_attr(miri, ignore = "the depth limit is the claim and it is 128 levels")]
     fn a_document_deeper_than_the_limit_is_refused_rather_than_recursed_into() {
         let deep = format!("{}1{}", "[".repeat(200), "]".repeat(200));
         assert!(why(&deep).contains("nests at most"));

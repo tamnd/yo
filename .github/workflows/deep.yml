@@ -172,7 +172,7 @@ jobs:
       # four at a time. If that crate ever stops being the slowest, this special
       # case should go.
       #
-      # `yo-resp`, `yo-cli`, `yo-kv` and `yo-graph` are split by count, and the
+      # `yo-resp`, `yo-cli`, `yo-kv`, `yo-graph` and `yo-doc` are split by count, and the
       # table in the step below says how many ways. They are split for a
       # different reason than `yo-record`. Miri spends about six seconds starting a process before it
       # runs a line of the test in it, and nextest gives every test its own
@@ -183,12 +183,12 @@ jobs:
       # splitting itself, so no list of test names has to be kept true here as
       # tests are added.
       #
-      # One crate is left out, and it is worth being straight about what that
-      # costs. `yo-doc` has tests that take over two minutes each interpreted.
-      # The fix is to go through it test by test, shrinking the ones where the
-      # count is incidental and skipping the ones where the count is the claim,
-      # which is what `yo-resp` got and what it needs. That is its own piece of
-      # work and it is issue 418. It has no unsafe code of its own.
+      # Nothing is left out any more. Five crates used to be, because they had
+      # tests that took minutes each interpreted, and they went back in one at a
+      # time over issue 418. The paragraphs below say what each of them took,
+      # because the same two questions came up every time: whether a count is
+      # the claim or a way of reaching it, and whether the runner is measuring
+      # the tests or measuring the queue.
       #
       # `yo-index` was one of the five and is back in. It took one number: the
       # walk that grows the map underneath itself put 64 keys back for every 8 it
@@ -254,6 +254,25 @@ jobs:
       # do, and that is issue 462. The crate now runs all 162 of its remaining
       # tests in eleven minutes single threaded, against at least ninety five
       # before, and the slowest one is under two minutes.
+      #
+      # `yo-doc` was the last one back and it was the shortest job of the five,
+      # because the cost was in nine tests rather than spread about. Four are
+      # skipped and all four are a compile time limit that a test sits exactly
+      # on: two nest to `DEPTH_MAX` so that the refusal is the limit rather than
+      # something short of it, and two fill the key table to `KEYS_MAX` so that
+      # there is somewhere to overflow from. Neither constant has a runtime knob
+      # and a smaller version of either would be checking a limit the code does
+      # not have. The rest came down as counts, and the sharpest cut is the fuzz
+      # that flips one bit and then reads every accessor on every part of the
+      # document: one of those walks is around six tenths of a second
+      # interpreted, so twenty thousand rounds would take most of a day and
+      # thirty two of them find the same undefined behaviour. The truncation
+      # sweep beside it keeps its full size, because cutting the document at
+      # every byte offset is what that one claims. Every cut was checked by
+      # forcing the Miri branches on and running the whole suite compiled. The
+      # crate now runs all 153 of its remaining tests in eighteen minutes single
+      # threaded against twenty seven before, and nothing in it is near the two
+      # minute mark where five tests were being cut off at it.
       - id: shards
         run: |
           rm rust-toolchain.toml
@@ -263,10 +282,9 @@ jobs:
           # which is a syntax error the runner reports six lines away from the
           # cause. The run step below passes each field as its own argument.
           echo "list=$(cargo metadata --no-deps --format-version 1 | jq -c '
-            ["yo-doc"] as $out
-            | { "yo-resp": 6, "yo-cli": 2, "yo-kv": 8, "yo-graph": 2 } as $split
+            { "yo-resp": 6, "yo-cli": 2, "yo-kv": 8, "yo-graph": 2, "yo-doc": 2 } as $split
             | [ .packages[].name
-                | select(. != "yo-record" and ($split[.] | not) and (IN($out[]) | not))
+                | select(. != "yo-record" and ($split[.] | not))
                 | {id: ., pkg: ., filter: "", part: ""} ]
             + [ {id: "yo-record-compact", pkg: "yo-record", filter: "test(/^compact::/)", part: ""},
                 {id: "yo-record-rest", pkg: "yo-record", filter: "not test(/^compact::/)", part: ""} ]

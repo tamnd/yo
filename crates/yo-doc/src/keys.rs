@@ -178,6 +178,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        miri,
+        ignore = "a full table is the claim and a full table is 65536 names"
+    )]
     fn a_full_table_refuses_rather_than_failing_the_write() {
         let mut keys = Keys::with_capacity(KEYS_MAX);
         for i in 0..KEYS_MAX {

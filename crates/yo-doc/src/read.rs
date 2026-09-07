@@ -658,6 +658,12 @@ mod tests {
         }
     }
 
+    /// Not shrunk. Anywhere is the claim: the sweep is one cut at every byte
+    /// offset in the document, and stepping over some of them would leave a
+    /// test that says a document cut short in some places is refused. It is the
+    /// slowest test in the crate under Miri at around a minute, and it earns it,
+    /// because most of the prefixes are refused early and the ones that are not
+    /// are exactly the interesting ones.
     #[test]
     fn a_document_cut_short_anywhere_is_refused_and_never_panics() {
         let bytes = sample();
@@ -675,7 +681,16 @@ mod tests {
     fn a_document_with_a_byte_changed_is_never_worse_than_wrong() {
         let bytes = sample();
         let mut rng = Rng::new(0x5eed_0d0c);
-        for _ in 0..20_000 {
+        // Far fewer rounds under Miri, and this one is the sharpest cut in the
+        // crate. A round is one flipped bit and then a full [`walk`], and a
+        // full walk of a document this shape costs about six tenths of a second
+        // under Miri, so the twenty thousand rounds a native run does would take
+        // most of a day. The count is a fuzz budget rather than a claim, and
+        // what Miri is here for is the undefined behaviour a single round would
+        // find as well as the twenty thousandth, so it gets a small budget and
+        // the native run keeps the large one.
+        let rounds = if cfg!(miri) { 32 } else { 20_000 };
+        for _ in 0..rounds {
             let mut damaged = bytes.clone();
             let at = rng.below(damaged.len());
             damaged[at] ^= 1 << rng.below(8);

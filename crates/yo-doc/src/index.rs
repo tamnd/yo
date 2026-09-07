@@ -1276,13 +1276,18 @@ mod tests {
     #[test]
     fn an_ordered_index_walks_its_keys_in_order() {
         // Written in an order that is neither sorted nor reverse sorted, and
-        // over enough keys to push the tree past one leaf.
-        let index = ordered((0..500i64).map(|i| (i * 137) % 500 - 250));
-        assert_eq!(index.len(), 500);
+        // over enough keys to push the tree past one leaf. Fewer under Miri,
+        // and still past one leaf. The stride is coprime with the count either
+        // way, which is what makes the order neither of the two easy ones, and
+        // the bounds further down are all well inside the range.
+        let (n, stride) = if cfg!(miri) { (120i64, 37) } else { (500, 137) };
+        let half = n / 2;
+        let index = ordered((0..n).map(|i| (i * stride) % n - half));
+        assert_eq!(index.len(), n as usize);
         assert_eq!(index.kind(), IndexKind::Ordered);
 
         let all = walked(&index, Bound::Unbounded, Bound::Unbounded);
-        assert_eq!(all, (-250..250).collect::<Vec<i64>>());
+        assert_eq!(all, (-half..half).collect::<Vec<i64>>());
 
         let (lo, hi) = (Key::int(-3), Key::int(4));
         assert_eq!(
@@ -1294,12 +1299,20 @@ mod tests {
             [-2, -1, 0, 1, 2, 3, 4]
         );
         assert_eq!(
-            walked(&index, Bound::Unbounded, Bound::Excluded(&Key::int(-247))),
-            [-250, -249, -248]
+            walked(
+                &index,
+                Bound::Unbounded,
+                Bound::Excluded(&Key::int(-half + 3))
+            ),
+            [-half, -half + 1, -half + 2]
         );
         assert_eq!(
-            walked(&index, Bound::Included(&Key::int(247)), Bound::Unbounded),
-            [247, 248, 249]
+            walked(
+                &index,
+                Bound::Included(&Key::int(half - 3)),
+                Bound::Unbounded
+            ),
+            [half - 3, half - 2, half - 1]
         );
     }
 
@@ -1350,11 +1363,16 @@ mod tests {
         // Every removal moves the element table's last row into the hole, so the
         // tree is holding a row number that has come to mean a different key.
         // This is the test that the renumbering is told to it.
-        let mut index = ordered(0..200i64);
-        for n in (0..200i64).step_by(3) {
+        // Fewer keys under Miri. What is being checked is that a hole is filled
+        // from the end and the tree hears about it, which happens on every
+        // removal, so the count is how many chances the test gets rather than
+        // part of the claim. Every count below is derived from this one.
+        let count = if cfg!(miri) { 60i64 } else { 200 };
+        let mut index = ordered(0..count);
+        for n in (0..count).step_by(3) {
             index.take(Key::int(n).as_bytes(), n.to_string().as_bytes());
         }
-        let left: Vec<i64> = (0..200i64).filter(|n| n % 3 != 0).collect();
+        let left: Vec<i64> = (0..count).filter(|n| n % 3 != 0).collect();
         assert_eq!(index.len(), left.len());
         assert_eq!(walked(&index, Bound::Unbounded, Bound::Unbounded), left);
 
@@ -1362,7 +1380,7 @@ mod tests {
         for n in &left {
             assert_eq!(index.count(&Key::int(*n)), 1, "{n} lost its list");
         }
-        for n in (0..200i64).step_by(3) {
+        for n in (0..count).step_by(3) {
             assert_eq!(index.count(&Key::int(n)), 0, "{n} kept one");
         }
     }
