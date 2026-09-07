@@ -93,6 +93,7 @@
 
 use crate::db::{Db, Holds};
 use crate::keyspace::wrong_type;
+use crate::news::{self, What};
 use crate::value::Kind;
 use crate::zsets::Window;
 use std::cmp::Ordering;
@@ -435,18 +436,35 @@ impl Db {
         key.extend_from_slice(&key_part[star + 1..]);
 
         let stripe = held.stripe_mut(self.stripe_of(&key));
-        match field {
-            Some(f) => stripe
-                .hget(&key, f, |t| {
+        // Whether the name was taken at all, which is not the same question as
+        // whether this read got anything and is only asked when the answer has
+        // somewhere to go. A key holding the wrong type was found, and so was a
+        // hash that does not have the field, and neither of those is a miss.
+        let (found, missed) = match field {
+            Some(f) => {
+                let got = stripe.hget(&key, f, |t| {
                     t.map(|t| {
                         let mut v = Vec::new();
                         t.write_to(&mut v);
                         v
                     })
-                })
-                .unwrap_or(None),
-            None => stripe.get(&key).ok().flatten().map(|s| s.to_vec()),
+                });
+                match got {
+                    Ok(None) => (None, news::listening() && stripe.kind_of(&key).is_none()),
+                    Ok(found) => (found, false),
+                    Err(_) => (None, false),
+                }
+            }
+            None => match stripe.get(&key) {
+                Ok(None) => (None, true),
+                Ok(found) => (found.map(|s| s.to_vec()), false),
+                Err(_) => (None, false),
+            },
+        };
+        if missed {
+            news::say(&key, What::Missed);
         }
+        found
     }
 }
 

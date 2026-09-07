@@ -360,8 +360,34 @@ fn heard(key: &[u8], what: news::What) {
         news::What::TypeChanged => (class::TYPE_CHANGED, "type_changed"),
         news::What::Expired => (class::EXPIRED, "expired"),
         news::What::Evicted => (class::EVICTED, "evicted"),
+        news::What::Missed => (class::KEY_MISS, MISS),
     };
     fire(WHERE.get(), class, name, key);
+}
+
+/// What a read that found nothing is called.
+///
+/// Named here rather than spelled at each call site because [`unsay`] has to
+/// match on it, and a name that two places have to agree on is a constant.
+pub(crate) const MISS: &str = "keymiss";
+
+/// Take back every `keymiss` this command has queued so far.
+///
+/// For a command that turned out never to have looked anything up. Redis fires
+/// a miss inside the lookup, so a command that fails while it is still reading
+/// its own arguments fires nothing, and one that fails on what it found has
+/// already fired. [`misses`](super::misses) asks in front of the command
+/// instead, which cannot tell those two apart, so the caller undoes the first
+/// case afterwards once the error says which it was.
+///
+/// Only the misses go. The existence probe that found one can itself have
+/// reaped a key on the way past, and that `expired` happened whatever the
+/// command went on to do with its arguments.
+pub(crate) fn unsay_misses() {
+    if ARMED.get() & class::KEY_MISS == 0 {
+        return;
+    }
+    PENDING.with_borrow_mut(|pending| pending.retain(|event| event.name != MISS));
 }
 
 /// Whether anything this command says will go anywhere.

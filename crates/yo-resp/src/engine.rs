@@ -2578,6 +2578,211 @@ mod tests {
         );
     }
 
+    /// A read that found nothing says so, once for each key it went looking
+    /// for and in the order it was given them.
+    ///
+    /// The class is not in `A`, the same way it is not in Redis's, so these ask
+    /// for it by letter.
+    #[test]
+    fn a_read_that_found_nothing_says_which_key_it_was() {
+        let (mut r, sub, writer, mut batch) = watching_flags(b"Em");
+
+        r.engine_mut().feed(writer, &wire(&[b"SET", b"a", b"v"]));
+        r.engine_mut()
+            .feed(writer, &wire(&[b"MGET", b"a", b"nk", b"nk"]));
+        r.engine_mut()
+            .feed(writer, &wire(&[b"EXISTS", b"nj", b"a"]));
+        pump(&mut r, &mut batch);
+        assert_eq!(
+            fired(&r, sub),
+            [("keymiss", "nk"), ("keymiss", "nk"), ("keymiss", "nj")]
+                .map(|(e, k)| (e.to_owned(), k.to_owned()))
+        );
+    }
+
+    /// A write says nothing about a name that was free, and the shapes of the
+    /// same command that read say it.
+    #[test]
+    fn only_the_shape_of_a_write_that_reads_says_it() {
+        let (mut r, sub, writer, mut batch) = watching_flags(b"Em");
+
+        // A plain `SET` never looks, and neither does a `BITFIELD` with a
+        // write anywhere in the line.
+        r.engine_mut().feed(writer, &wire(&[b"SET", b"a", b"v"]));
+        r.engine_mut().feed(
+            writer,
+            &wire(&[b"BITFIELD", b"nk", b"SET", b"u8", b"0", b"1"]),
+        );
+        r.engine_mut().feed(writer, &wire(&[b"LPOP", b"nk"]));
+        pump(&mut r, &mut batch);
+        assert_eq!(fired(&r, sub), []);
+
+        // The two that do, which are the same two commands.
+        r.engine_mut()
+            .feed(writer, &wire(&[b"SET", b"nj", b"v", b"GET"]));
+        r.engine_mut()
+            .feed(writer, &wire(&[b"BITFIELD", b"nl", b"GET", b"u8", b"0"]));
+        r.engine_mut().feed(writer, &wire(&[b"GETDEL", b"nm"]));
+        pump(&mut r, &mut batch);
+        assert_eq!(
+            fired(&r, sub),
+            [("keymiss", "nj"), ("keymiss", "nl"), ("keymiss", "nm")]
+                .map(|(e, k)| (e.to_owned(), k.to_owned()))
+        );
+    }
+
+    /// A store form says it for the keys it read and not for the one it is
+    /// about to write, however empty that name is.
+    #[test]
+    fn a_store_form_says_it_only_for_its_sources() {
+        let (mut r, sub, writer, mut batch) = watching_flags(b"Em");
+
+        r.engine_mut()
+            .feed(writer, &wire(&[b"SINTERSTORE", b"dst", b"nk", b"nj"]));
+        r.engine_mut()
+            .feed(writer, &wire(&[b"ZUNIONSTORE", b"dst", b"1", b"nz"]));
+        r.engine_mut()
+            .feed(writer, &wire(&[b"ZRANGESTORE", b"dst", b"nz", b"0", b"-1"]));
+        pump(&mut r, &mut batch);
+        assert_eq!(
+            fired(&r, sub),
+            [
+                ("keymiss", "nk"),
+                ("keymiss", "nj"),
+                ("keymiss", "nz"),
+                ("keymiss", "nz")
+            ]
+            .map(|(e, k)| (e.to_owned(), k.to_owned()))
+        );
+    }
+
+    /// Both stream reads find their keys behind `STREAMS`, and `XREAD` looks
+    /// each of them up twice, once to resolve the identifier it was handed and
+    /// once to serve from it.
+    #[test]
+    fn the_stream_reads_say_it_for_the_keys_behind_the_keyword() {
+        let (mut r, sub, writer, mut batch) = watching_flags(b"Em");
+
+        r.engine_mut().feed(
+            writer,
+            &wire(&[b"XREAD", b"STREAMS", b"nk", b"nj", b"0", b"0"]),
+        );
+        pump(&mut r, &mut batch);
+        assert_eq!(
+            fired(&r, sub),
+            [
+                ("keymiss", "nk"),
+                ("keymiss", "nj"),
+                ("keymiss", "nk"),
+                ("keymiss", "nj")
+            ]
+            .map(|(e, k)| (e.to_owned(), k.to_owned()))
+        );
+    }
+
+    /// A command that failed while it was still reading its own arguments never
+    /// looked a key up, so it says nothing, and one that failed on what it
+    /// found keeps what it had already said.
+    #[test]
+    fn an_argument_that_did_not_parse_takes_the_miss_back() {
+        let (mut r, sub, writer, mut batch) = watching_flags(b"Em");
+
+        r.engine_mut()
+            .feed(writer, &wire(&[b"GETRANGE", b"nk", b"x", b"-1"]));
+        r.engine_mut()
+            .feed(writer, &wire(&[b"LPOS", b"nk", b"a", b"RANK", b"0"]));
+        pump(&mut r, &mut batch);
+        assert_eq!(fired(&r, sub), []);
+
+        // A `WRONGTYPE` is an answer about what was under a key, which means
+        // the lookups happened and the misses in front of the one that failed
+        // stand.
+        r.engine_mut().feed(writer, &wire(&[b"SET", b"s", b"v"]));
+        pump(&mut r, &mut batch);
+        r.engine_mut().sink_mut().clear();
+
+        r.engine_mut()
+            .feed(writer, &wire(&[b"SINTER", b"nk", b"s"]));
+        pump(&mut r, &mut batch);
+        assert_eq!(fired(&r, sub), [("keymiss".to_owned(), "nk".to_owned())]);
+    }
+
+    /// A read over several keys says nothing about the ones behind a key that
+    /// holds the wrong thing, because the command stops there and never looks
+    /// at them.
+    #[test]
+    fn a_read_stops_missing_where_it_stops_looking() {
+        let (mut r, sub, writer, mut batch) = watching_flags(b"Em");
+
+        r.engine_mut().feed(writer, &wire(&[b"SET", b"s", b"v"]));
+        r.engine_mut().feed(writer, &wire(&[b"RPUSH", b"l", b"x"]));
+        pump(&mut r, &mut batch);
+        r.engine_mut().sink_mut().clear();
+
+        r.engine_mut()
+            .feed(writer, &wire(&[b"SINTER", b"s", b"nk"]));
+        pump(&mut r, &mut batch);
+        assert_eq!(fired(&r, sub), []);
+
+        // And a read that does not stop keeps going. `MGET` answers a nil for
+        // the list and goes on to look at the key behind it.
+        r.engine_mut().feed(writer, &wire(&[b"MGET", b"l", b"nk"]));
+        pump(&mut r, &mut batch);
+        assert_eq!(fired(&r, sub), [("keymiss".to_owned(), "nk".to_owned())]);
+    }
+
+    /// The keys a `SORT` builds out of its elements say it too, and they are
+    /// the one set of keys nothing could have asked about in front of the
+    /// command, since they do not exist until it is running.
+    #[test]
+    fn the_keys_a_sort_pattern_names_say_it_as_they_are_read() {
+        let (mut r, sub, writer, mut batch) = watching_flags(b"Em");
+
+        r.engine_mut()
+            .feed(writer, &wire(&[b"RPUSH", b"l", b"1", b"2"]));
+        r.engine_mut().feed(writer, &wire(&[b"SET", b"w_1", b"5"]));
+        pump(&mut r, &mut batch);
+        r.engine_mut().sink_mut().clear();
+
+        r.engine_mut().feed(
+            writer,
+            &wire(&[b"SORT", b"l", b"BY", b"w_*", b"GET", b"p_*"]),
+        );
+        pump(&mut r, &mut batch);
+        assert_eq!(
+            fired(&r, sub),
+            [("keymiss", "w_2"), ("keymiss", "p_2"), ("keymiss", "p_1")]
+                .map(|(e, k)| (e.to_owned(), k.to_owned()))
+        );
+    }
+
+    /// A key that was there and had run out says both things in the order they
+    /// happened: the deadline first, because the probe that noticed the key was
+    /// gone is what reaped it.
+    #[test]
+    fn a_deadline_that_passed_is_news_before_the_miss_it_causes() {
+        let (mut r, sub, mut batch) = timed();
+        let writer = r.engine_mut().accept();
+        r.engine_mut().feed(
+            writer,
+            &wire(&[b"CONFIG", b"SET", b"notify-keyspace-events", b"EgAm"]),
+        );
+        r.engine_mut()
+            .feed(sub, &wire(&[b"PSUBSCRIBE", b"__keyevent@0__:*"]));
+        r.engine_mut()
+            .feed(writer, &wire(&[b"SET", b"k", b"v", b"PX", b"10"]));
+        pump(&mut r, &mut batch);
+        r.engine_mut().sink_mut().clear();
+
+        r.engine().server().advance_clock_ms(50);
+        r.engine_mut().feed(writer, &wire(&[b"GET", b"k"]));
+        pump(&mut r, &mut batch);
+        assert_eq!(
+            fired(&r, sub),
+            [("expired", "k"), ("keymiss", "k")].map(|(e, k)| (e.to_owned(), k.to_owned()))
+        );
+    }
+
     /// A subscriber on the four subkey channels and the writer that will feed
     /// them.
     ///
