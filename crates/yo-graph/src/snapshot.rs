@@ -519,13 +519,19 @@ mod tests {
 
     #[test]
     fn a_long_chain_reads_back_end_to_end() {
-        let s = Snapshot::of(&chain(10_000));
-        assert_eq!(s.nodes(), 10_000);
-        assert_eq!(s.edges(), 9_999);
+        // A shorter chain under Miri. Every node is read back, so this costs
+        // its length twice over, once to build and once to check, and a chain
+        // reads back end to end at any length. The counts below all come from
+        // the one number: written out again they would stop agreeing with it
+        // and the loop would walk a chain the asserts were not about.
+        let n = if cfg!(miri) { 60u64 } else { 10_000 };
+        let s = Snapshot::of(&chain(n));
+        assert_eq!(u64::from(s.nodes()), n);
+        assert_eq!(s.edges(), n - 1);
         for i in 0..s.nodes() - 1 {
             assert_eq!(s.out(i), [i + 1], "at {i}");
         }
-        assert!(s.out(9_999).is_empty());
+        assert!(s.out(s.nodes() - 1).is_empty());
         s.prefetch(0);
         assert!(s.memory_bytes() > 0);
     }

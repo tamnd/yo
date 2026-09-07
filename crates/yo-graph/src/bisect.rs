@@ -517,6 +517,14 @@ mod tests {
 
     /// The whole point. On a graph whose communities are real, the numbering has
     /// to find them, and finding them has to be worth bits.
+    ///
+    /// Not shrunk. Two bits an edge is the claim and it does not survive a cut:
+    /// on sixteen groups of sixteen the pass still finds the communities and
+    /// still wins, but by well under two bits, because most of what it wins is
+    /// the splits it makes after the first few and a small graph runs out of
+    /// them. A version with a smaller margin would pass without saying the
+    /// thing this test is here to say.
+    #[cfg_attr(miri, ignore = "two bits an edge is the claim and it needs the graph")]
     #[test]
     fn bisection_beats_degree_ordering_on_a_graph_with_communities() {
         let (groups, size) = (64u32, 64u32);
@@ -537,6 +545,16 @@ mod tests {
     /// does not beat it. Recording that here rather than leaving it to be
     /// rediscovered, because it is the reason the real graphs are the ones the
     /// module documentation quotes.
+    ///
+    /// Not shrunk, and this one is interesting: at scale nine bisection does
+    /// beat degree ordering, by a hundredth of a bit. R-MAT only stops having
+    /// community structure once it is big enough for the hubs to be shared by
+    /// everything, so the scale is the claim here rather than a way of reaching
+    /// it.
+    #[cfg_attr(
+        miri,
+        ignore = "the scale is the claim, R-MAT only stops looking like communities at size"
+    )]
     #[test]
     fn r_mat_is_not_a_community_graph_and_degree_ordering_is_enough_for_it() {
         let scale = 12;
@@ -560,7 +578,9 @@ mod tests {
     /// the encoder rather than a property of the graph.
     #[test]
     fn there_is_nothing_to_win_on_a_graph_with_no_structure() {
-        let nodes = 1u32 << 11;
+        // A uniform graph has no structure at any size, and the assert is that
+        // nothing moves, so a smaller one asks the same question.
+        let nodes = 1u32 << if cfg!(miri) { 6 } else { 11 };
         let edges = uniform(nodes, 8, 11);
         let plain = bits(nodes, &edges, &identity(nodes));
         let bisected = bits(nodes, &edges, &order(nodes, &edges));
@@ -575,8 +595,11 @@ mod tests {
     /// what was left.
     #[test]
     fn the_answer_is_a_permutation() {
-        let nodes = 1u32 << 10;
-        let edges = rmat(10, 8, 3);
+        // A permutation is a permutation at any size, and a duplicate id comes
+        // out of the split rather than out of the number of splits.
+        let scale = if cfg!(miri) { 7 } else { 10 };
+        let nodes = 1u32 << scale;
+        let edges = rmat(scale, 8, 3);
         let to = order(nodes, &edges);
         let mut seen = vec![false; nodes as usize];
         for new in &to {
@@ -591,8 +614,18 @@ mod tests {
     /// every published bits an edge number unreproducible.
     #[test]
     fn the_numbering_does_not_depend_on_the_machine() {
-        let nodes = 1u32 << 11;
-        let edges = rmat(11, 8, 5);
+        // Smaller under Miri. Note that no size a test can afford forks at all,
+        // because a partition under `SPLIT_OFF` is recursed into on the same
+        // thread whatever the budget says, so what this checks is that the
+        // thread count is carried through the recursion without changing the
+        // answer. That was already true of the larger size and the cut does not
+        // give anything up.
+        // Three orderings of the same graph, so this costs three times what a
+        // test that orders once costs, which is why the scale is lower here
+        // than anywhere else in the module.
+        let scale = if cfg!(miri) { 6 } else { 11 };
+        let nodes = 1u32 << scale;
+        let edges = rmat(scale, 8, 5);
         let once = order(nodes, &edges);
         assert_eq!(once, order(nodes, &edges));
         let threaded = order_with(
@@ -622,7 +655,16 @@ mod tests {
     /// should be undone by the pass rather than fought by it.
     #[test]
     fn a_shuffle_costs_and_bisection_takes_most_of_it_back() {
-        let scale = 12;
+        // A shuffle costs whatever the graph is, and the bit the pass takes
+        // back is the structure R-MAT has at every scale. Nine is as low as
+        // this one goes and the two asserts say why: at eight the pass takes
+        // back 0.94 bits where the assert wants one, and at seven the shuffle
+        // stops costing anything at all, because a graph that small is already
+        // as good as random. It is the slowest test in the crate under Miri at
+        // just under two minutes, three times the next one, and that is the
+        // price of the only check that the numbering undoes a shuffle rather
+        // than fights it.
+        let scale = if cfg!(miri) { 9 } else { 12 };
         let nodes = 1u32 << scale;
         let mut edges = rmat(scale, 8, 13);
         let plain = bits(nodes, &edges, &identity(nodes));

@@ -759,14 +759,28 @@ mod tests {
     #[test]
     fn the_measure_agrees_with_the_definition() {
         let mut rng = Rng::new(0x9d1);
-        for case in 0..40 {
-            let nodes = 2 + rng.next_u64() % 30;
+        // Fewer and smaller cases under Miri. Each edge goes in through
+        // `Graph`, which is a document put per end and one for the edge, and
+        // that is what the size costs here. The definition is a sum over pairs
+        // and it either agrees on a graph or it does not, so what the cases buy
+        // is the odd shape rather than the size: an isolated node, a self loop,
+        // a community nobody is in. All of those turn up in a handful of small
+        // graphs.
+        let (cases, spread) = if cfg!(miri) { (3, 8) } else { (40, 30) };
+        for case in 0..cases {
+            let nodes = 2 + rng.next_u64() % spread;
             let edges: Vec<(u64, u64)> = (0..nodes * 2)
                 .map(|_| (rng.next_u64() % nodes, rng.next_u64() % nodes))
                 .collect();
             let s = Snapshot::of(&linked(&edges));
+            // Three groups, or one a node where there are fewer than three
+            // nodes. A label above the node count is a valid grouping by the
+            // documented contract and `modularity` panics on one, which is
+            // issue #462 and not this test's business. The larger
+            // graphs never handed it one by luck.
+            let groups = u64::from(s.nodes()).clamp(1, 3);
             let of: Vec<u32> = (0..s.nodes())
-                .map(|_| (rng.next_u64() % 3) as u32)
+                .map(|_| (rng.next_u64() % groups) as u32)
                 .collect();
             for resolution in [0.5, 1.0, 2.0] {
                 let (mine, theirs) = (
@@ -819,8 +833,13 @@ mod tests {
     #[test]
     fn leiden_communities_are_never_disconnected() {
         let mut rng = Rng::new(0x1ead);
-        for case in 0..30 {
-            let nodes = 10 + rng.next_u64() % 90;
+        // A community that is not connected is one Leiden built wrong, and it
+        // builds it wrong on a small graph the same way, so fewer and smaller
+        // under Miri. Three edges a node is kept because that is what makes the
+        // refinement step have anything to do.
+        let (cases, spread) = if cfg!(miri) { (3, 6) } else { (30, 90) };
+        for case in 0..cases {
+            let nodes = if cfg!(miri) { 6 } else { 10 } + rng.next_u64() % spread;
             let edges: Vec<(u64, u64)> = (0..nodes * 3)
                 .map(|_| (rng.next_u64() % nodes, rng.next_u64() % nodes))
                 .collect();
@@ -860,8 +879,12 @@ mod tests {
     #[test]
     fn a_community_never_crosses_a_component() {
         let mut rng = Rng::new(0x1ea0);
-        for case in 0..30 {
-            let nodes = 2 + rng.next_u64() % 50;
+        // One edge a node, so the graph comes out in several pieces, which is
+        // the whole point of it. Fewer and smaller under Miri, and it still
+        // comes out in pieces because that is the degree rather than the size.
+        let (cases, spread) = if cfg!(miri) { (3, 10) } else { (30, 50) };
+        for case in 0..cases {
+            let nodes = 2 + rng.next_u64() % spread;
             let edges: Vec<(u64, u64)> = (0..nodes)
                 .map(|_| (rng.next_u64() % nodes, rng.next_u64() % nodes))
                 .collect();
@@ -947,8 +970,13 @@ mod tests {
     #[test]
     fn no_single_node_move_helps() {
         let mut rng = Rng::new(0x1ea2);
-        for case in 0..15 {
-            let nodes = 20 + rng.next_u64() % 40;
+        // The assert walks every node and tries it in every neighbouring
+        // community, so a case costs its nodes times its degree twice over,
+        // once for each algorithm. Fewer and smaller under Miri. What it says
+        // is that the answer is a local optimum, and a local optimum is local.
+        let (cases, base, spread) = if cfg!(miri) { (2, 6, 4) } else { (15, 20, 40) };
+        for case in 0..cases {
+            let nodes = base + rng.next_u64() % spread;
             let edges: Vec<(u64, u64)> = (0..nodes * 4)
                 .map(|_| (rng.next_u64() % nodes, rng.next_u64() % nodes))
                 .collect();

@@ -895,8 +895,12 @@ mod tests {
 
     #[test]
     fn the_bits_add_up_to_the_bytes() {
-        let mut edges = rmat(12, 8, 0xadd);
-        let cold = Csr::build(1 << 12, &mut edges);
+        // The accounting has to add up on any graph, and the gaps outweigh the
+        // offsets at any scale above a toy, so a smaller R-MAT is the same two
+        // claims about the same three counters.
+        let scale = if cfg!(miri) { 8 } else { 12 };
+        let mut edges = rmat(scale, 8, 0xadd);
+        let cold = Csr::build(1 << scale, &mut edges);
         let c = cold.cost();
         assert_eq!(c.total(), cold.bytes() as u64 * 8, "{c:?}");
         assert!(
@@ -957,14 +961,22 @@ mod tests {
 
     #[test]
     fn a_hub_spans_as_many_blocks_as_it_needs() {
-        // Two hundred thousand edges out of one node is over six thousand
-        // blocks, and one neighbour placed far away so the run is not uniform.
-        let mut edges: Vec<(u32, u32)> = (0..200_000u32).map(|i| (1, i)).collect();
-        edges.push((1, 999_999));
-        let cold = agrees(1_000_000, edges);
-        assert_eq!(cold.degree(1), 200_001);
+        // A run far longer than one block, with one neighbour placed at the
+        // far end of the graph so it is not uniform. Two hundred thousand edges
+        // is over six thousand blocks, and fifteen hundred is still forty five,
+        // which is as many as the claim needs: what a hub does wrong it does at
+        // the second block.
+        let hub = if cfg!(miri) { 1_500u32 } else { 200_000 };
+        let nodes = hub * 5;
+        let mut edges: Vec<(u32, u32)> = (0..hub).map(|i| (1, i)).collect();
+        edges.push((1, nodes - 1));
+        let cold = agrees(nodes, edges);
+        assert_eq!(cold.degree(1), hub + 1);
     }
 
+    // Not shrunk: four bits an edge is the claim, and a shorter run pays its offsets over
+    // fewer edges and misses it for a reason that has nothing to do with gaps.
+    #[cfg_attr(miri, ignore = "the number of bits an edge is the claim")]
     #[test]
     fn a_block_of_one_enormous_gap_does_not_price_the_rest() {
         // The whole reason the width is per block. Fifty thousand edges one
@@ -985,9 +997,17 @@ mod tests {
     #[test]
     fn the_cold_form_agrees_with_a_graph_someone_made_up() {
         let mut rng = Rng::new(0x51de);
-        let nodes = 5000u32;
+        // What is checked is that every run comes back out the way it went in,
+        // which is a claim about each run rather than about how many there are.
+        // The average degree stays at twelve so the groups still differ in the
+        // widths they choose and the partial and empty runs are still hit.
+        let (nodes, edges_wanted) = if cfg!(miri) {
+            (500u32, 6_000)
+        } else {
+            (5000, 60_000)
+        };
         let mut edges = Vec::new();
-        for _ in 0..60_000 {
+        for _ in 0..edges_wanted {
             // A degree distribution with a tail, so groups differ in every
             // width they choose and the partial and empty runs are both hit.
             let src = if rng.next_u64().is_multiple_of(10) {
@@ -1006,31 +1026,40 @@ mod tests {
         const BLOCKS: u32 = 2;
         let mut hot = Adjacency::new();
         let mut rng = Rng::new(0x40ce);
-        let mut want: Vec<Vec<u32>> = vec![Vec::new(); 4000];
-        for _ in 0..40_000 {
-            let (s, d) = (rng.next_u64() % 4000, rng.next_u64() % 4000);
+        // Ten edges a node either way, so the runs are the same shape and the
+        // second label is still a quarter of the first. Every number below
+        // comes from these two, because a size written down twice stops
+        // agreeing with itself as soon as one of the two is cut.
+        let (nodes, wanted) = if cfg!(miri) {
+            (200u64, 2_000)
+        } else {
+            (4000, 40_000)
+        };
+        let mut want: Vec<Vec<u32>> = vec![Vec::new(); nodes as usize];
+        for _ in 0..wanted {
+            let (s, d) = (rng.next_u64() % nodes, rng.next_u64() % nodes);
             hot.link(s, d, FOLLOWS, 0);
             want[s as usize].push(d as u32);
         }
         // Another label, which promotion has to leave behind entirely.
-        for _ in 0..1000 {
-            hot.link(rng.next_u64() % 4000, rng.next_u64() % 4000, BLOCKS, 0);
+        for _ in 0..wanted / 40 {
+            hot.link(rng.next_u64() % nodes, rng.next_u64() % nodes, BLOCKS, 0);
         }
         for v in &mut want {
             v.sort_unstable();
         }
 
-        let cold = Csr::from_hot(&hot, FOLLOWS, Dir::Out, 4000, |n| n as u32);
-        assert_eq!(cold.edges(), 40_000);
+        let cold = Csr::from_hot(&hot, FOLLOWS, Dir::Out, nodes as u32, |n| n as u32);
+        assert_eq!(cold.edges(), wanted);
         let mut got = Vec::new();
-        for node in 0..4000u32 {
+        for node in 0..nodes as u32 {
             cold.neighbours_into(node, &mut got);
             assert_eq!(got, want[node as usize], "node {node}");
         }
 
         // And the transpose, which the hot plane indexes and which has to come
         // out as the mirror of what went in.
-        let mut mirror: Vec<Vec<u32>> = vec![Vec::new(); 4000];
+        let mut mirror: Vec<Vec<u32>> = vec![Vec::new(); nodes as usize];
         for (s, ds) in want.iter().enumerate() {
             for d in ds {
                 mirror[*d as usize].push(s as u32);
@@ -1039,8 +1068,8 @@ mod tests {
         for v in &mut mirror {
             v.sort_unstable();
         }
-        let back = Csr::from_hot(&hot, FOLLOWS, Dir::In, 4000, |n| n as u32);
-        for node in 0..4000u32 {
+        let back = Csr::from_hot(&hot, FOLLOWS, Dir::In, nodes as u32, |n| n as u32);
+        for node in 0..nodes as u32 {
             back.neighbours_into(node, &mut got);
             assert_eq!(got, mirror[node as usize], "incoming to {node}");
         }
@@ -1049,6 +1078,9 @@ mod tests {
     /// The number the target in `11` is about, on the two graphs that bracket
     /// it: one where nothing can help and one shaped like the graphs the target
     /// was written for.
+    // Not shrunk: bits an edge against a published floor is the claim, and the floor is a
+    // function of the graph.
+    #[cfg_attr(miri, ignore = "the number of bits an edge is the claim")]
     #[test]
     fn what_a_random_graph_costs_and_what_a_real_one_saves() {
         let nodes = 1u32 << 16;
@@ -1098,6 +1130,8 @@ mod tests {
     /// The control on the ordering pass. It has to be worth nothing at all on a
     /// graph with no structure in it, because if it moves this number then it
     /// is not doing what it says it is doing.
+    // Not shrunk: it is the control on the test above and has to measure the same graph.
+    #[cfg_attr(miri, ignore = "the number of bits an edge is the claim")]
     #[test]
     fn ordering_a_graph_with_no_structure_saves_nothing() {
         let nodes = 1u32 << 16;
@@ -1137,6 +1171,9 @@ mod tests {
     }
 
     /// The cold form against the hot one, which is the whole reason it exists.
+    // Not shrunk: the order of magnitude is the claim, and it is between two structures
+    // whose overheads only settle at scale.
+    #[cfg_attr(miri, ignore = "the number of bits an edge is the claim")]
     #[test]
     fn the_cold_form_is_an_order_of_magnitude_under_the_hot_one() {
         let nodes = 1u32 << 16;

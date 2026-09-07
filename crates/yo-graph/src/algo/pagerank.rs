@@ -334,8 +334,10 @@ mod tests {
     #[test]
     fn two_runs_agree_to_the_bit() {
         let mut rng = Rng::new(0x51ee);
-        let edges: Vec<(u64, u64)> = (0..2000)
-            .map(|_| (rng.next_u64() % 300, rng.next_u64() % 300))
+        // Two runs agree on any graph, so a small one under Miri.
+        let (wanted, nodes) = if cfg!(miri) { (60, 30) } else { (2000, 300) };
+        let edges: Vec<(u64, u64)> = (0..wanted)
+            .map(|_| (rng.next_u64() % nodes, rng.next_u64() % nodes))
             .collect();
         let s = Snapshot::of(&linked(&edges));
         assert_eq!(pagerank(&s).scores(), pagerank(&s).scores());
@@ -354,8 +356,13 @@ mod tests {
     #[test]
     fn it_agrees_with_the_slow_one() {
         let mut rng = Rng::new(0xbead);
-        for case in 0..40 {
-            let nodes = 2 + rng.next_u64() % 60;
+        // Fewer and smaller cases under Miri. Three edges a node is kept,
+        // because the thing that separates the two is what they do with a node
+        // that points nowhere and how the rank of one is spread, and that is
+        // the degree rather than the size.
+        let (cases, spread) = if cfg!(miri) { (3, 8) } else { (40, 60) };
+        for case in 0..cases {
+            let nodes = 2 + rng.next_u64() % spread;
             let edges: Vec<(u64, u64)> = (0..nodes * 3)
                 .map(|_| (rng.next_u64() % nodes, rng.next_u64() % nodes))
                 .collect();

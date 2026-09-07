@@ -709,8 +709,13 @@ mod tests {
         // removed one at a time, with only one ever live, so a slot allocator
         // that only counted up would leave an edge store ten thousand
         // documents deep holding one edge.
+        // Fewer rounds under Miri. What says the free list works is that the
+        // store is one document deep after all of them, and a store that counts
+        // up rather than reusing is two hundred deep after two hundred rounds
+        // as surely as it is ten thousand deep after ten thousand.
+        let rounds = if cfg!(miri) { 200i64 } else { 10_000 };
         let mut g = Graph::new();
-        for year in 0..10_000i64 {
+        for year in 0..rounds {
             g.link(1, 2, FOLLOWS, &since(year)).unwrap();
             assert!(g.unlink(1, 2, FOLLOWS).is_some());
         }
@@ -721,11 +726,15 @@ mod tests {
 
     #[test]
     fn the_names_of_edge_properties_are_stored_once() {
+        // Fewer edges under Miri. One name for fifty edges says the same thing
+        // as one name for a thousand: the second edge is the one that would
+        // have stored the name again.
+        let edges = if cfg!(miri) { 50u64 } else { 1000 };
         let mut g = Graph::new();
-        for dst in 2..1002u64 {
+        for dst in 2..2 + edges {
             g.link(1, dst, FOLLOWS, &since(2026)).unwrap();
         }
-        assert_eq!(g.edges(), 1000);
+        assert_eq!(g.edges() as u64, edges);
         // One field name for a thousand edges, which is the whole reason edge
         // properties are documents rather than their own store.
         assert_eq!(g.edge_props().keys().len(), 1);

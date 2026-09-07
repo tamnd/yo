@@ -297,6 +297,10 @@ mod tests {
     /// of one bucket per band over that range would be twenty five gigabytes,
     /// so the band has to widen on its own and the answer has to stay right.
     #[test]
+    #[cfg_attr(
+        miri,
+        ignore = "the ring the huge weight asks for is the claim, and it is 65536 buckets"
+    )]
     fn a_huge_weight_does_not_ask_for_a_huge_ring() {
         let heaviest = i64::from(u32::MAX);
         let (s, w) = weighted(&[
@@ -328,6 +332,10 @@ mod tests {
 
     /// A weight far bigger than the band, which is the heavy edge path.
     #[test]
+    #[cfg_attr(
+        miri,
+        ignore = "the ring the heavy edge asks for is the claim, and it is 65536 buckets"
+    )]
     fn a_very_heavy_edge() {
         let (s, w) = weighted(&[(1, 2, 1), (2, 3, 1_000_000), (1, 3, 999_999)]);
         let far = sssp(&s, &w, s.dense(1).expect("1"));
@@ -336,10 +344,13 @@ mod tests {
 
     #[test]
     fn all_the_same_weight_is_the_hop_count() {
-        let edges: Vec<(u64, u64, i64)> = (0..50u64).map(|i| (i, i + 1, 1)).collect();
+        // A chain of ones is the hop count at any length, and the assert walks
+        // every node of whichever chain it was given.
+        let n = if cfg!(miri) { 8u64 } else { 50 };
+        let edges: Vec<(u64, u64, i64)> = (0..n).map(|i| (i, i + 1, 1)).collect();
         let (s, w) = weighted(&edges);
         let far = sssp(&s, &w, s.dense(0).expect("0"));
-        for id in 0..=50u64 {
+        for id in 0..=n {
             assert_eq!(far[s.dense(id).expect("a node") as usize], id);
         }
     }
@@ -348,11 +359,19 @@ mod tests {
     #[test]
     fn the_band_width_does_not_change_the_answer() {
         let mut rng = Rng::new(0x5551);
-        let edges: Vec<(u64, u64, i64)> = (0..600)
+        // Six edges a node either way, so the graph is as dense and the
+        // weights spread over the buckets the same. Every delta below is tried
+        // on it, so a case costs five runs and the size has to allow for that.
+        let (edges_wanted, nodes) = if cfg!(miri) {
+            (36u64, 6u64)
+        } else {
+            (600, 100)
+        };
+        let edges: Vec<(u64, u64, i64)> = (0..edges_wanted)
             .map(|_| {
                 (
-                    rng.next_u64() % 100,
-                    rng.next_u64() % 100,
+                    rng.next_u64() % nodes,
+                    rng.next_u64() % nodes,
                     (rng.next_u64() % 50) as i64,
                 )
             })
@@ -368,8 +387,13 @@ mod tests {
     #[test]
     fn it_agrees_with_dijkstra() {
         let mut rng = Rng::new(0x5550);
-        for case in 0..40 {
-            let nodes = 2 + rng.next_u64() % 80;
+        // Fewer and smaller cases under Miri. The weights are left alone: what
+        // separates this from Dijkstra is which bucket an edge lands in, and
+        // that is the weight against `DELTA` rather than anything to do with
+        // how many nodes there are.
+        let (cases, spread) = if cfg!(miri) { (3, 8) } else { (40, 80) };
+        for case in 0..cases {
+            let nodes = 2 + rng.next_u64() % spread;
             let edges: Vec<(u64, u64, i64)> = (0..nodes * 3)
                 .map(|_| {
                     (

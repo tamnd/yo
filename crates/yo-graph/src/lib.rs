@@ -92,3 +92,34 @@ pub use csr::Csr;
 pub use graph::{Graph, NO_PROPS};
 pub use props::{Props, id_key};
 pub use snapshot::Snapshot;
+
+/// Why a test in this crate names two sizes rather than dividing one.
+///
+/// Miri charges per operation, and the two planes here are three orders of
+/// magnitude apart. An [`Adjacency::link`] is a push onto a run, so a thousand
+/// of them is around half a minute and cutting a count tenfold does what you
+/// would expect. A [`Graph::link`] puts a document for the source, one for the
+/// destination and one for the edge, and a document put hashes and indexes. It
+/// is far more expensive, and it does not stay at one price: eleven of them
+/// inside a test that then runs a search is under three seconds, and ninety
+/// nine of the same thing does not finish inside two minutes. The cost grows
+/// with the graph rather than with the edge, which is why the cuts here are
+/// large, and why they are written as a pair of sizes rather than as a divide
+/// through one helper. A tenth of a count that was chosen for a native run is
+/// usually still too big to interpret, and now and then it is small enough to
+/// make the test vacuous, and only the test itself knows which.
+///
+/// Where the count is the claim rather than a way of reaching it, the test
+/// keeps its number and is skipped under Miri instead, and says so where it is
+/// skipped. Those are worth naming because they come up together: a test that
+/// measures bits an edge, or how close an estimate lands, or that one ordering
+/// beats another by a margin, is measuring a population, and a smaller
+/// population is a different measurement rather than a cheaper one.
+///
+/// The two figures above came off a census taken single threaded. Nextest
+/// charges a test that is queued behind another one for the wait, so a parallel
+/// census reads as much as fourteen times too slow and is no use for deciding
+/// any of this. They are a laptop's numbers and the runner's will differ, but
+/// the distance between the two planes is the code rather than the machine.
+#[cfg(test)]
+mod miri {}
