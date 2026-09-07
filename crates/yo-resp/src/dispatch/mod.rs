@@ -71,6 +71,7 @@ mod keyspace;
 mod lists;
 mod lua;
 mod migrate;
+mod misses;
 mod multi;
 mod notify;
 mod pubsub;
@@ -2033,6 +2034,11 @@ pub fn resolved(
     // below are handed a database and their arguments and have no way to reach
     // the pub/sub registry from there. Off costs one thread local store.
     let armed = notify::arm(server, session.db);
+    // Which of the keys this command reads are not there. A real server says
+    // this from inside each lookup and this says all of them in front, which is
+    // the same order for every command whose first act is to read what it was
+    // given, and that is nearly all of them.
+    misses::report(&server.dbs[session.db], session.db, spec, args);
     let done = if spec.flags.contains(&"blocking") {
         blocking::execute(server, session, spec, args, out)
     } else {
@@ -2242,6 +2248,12 @@ pub fn resolved(
     // half way through still changed whatever it changed before it failed and a
     // real server has already published those. Draining here also keeps the
     // notifications of a command run by `EXEC` in front of the next one's.
+    // And back out the misses reported in front of a command that turned out to
+    // have failed on its own arguments, since a server that fires from inside
+    // the lookup never reached one.
+    if let Err(e) = &done {
+        misses::undo(e);
+    }
     notify::drain(server, armed);
 
     let flow = match done {

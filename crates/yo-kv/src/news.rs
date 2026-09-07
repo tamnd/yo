@@ -66,6 +66,15 @@ pub enum What {
     Expired,
     /// A write needed the memory and the policy chose this one.
     Evicted,
+    /// A read went looking for it and it was not there.
+    ///
+    /// The one of these that a command's own reply does cover, since a read that
+    /// found nothing answers nothing. It is here because of `SORT`: the keys a
+    /// `BY` or a `GET` pattern names are built out of the elements while the
+    /// sort is running, so the layer above never sees them and cannot ask about
+    /// them in front of the command the way it does for the keys in the
+    /// arguments.
+    Missed,
 }
 
 /// What gets called when one of them happens.
