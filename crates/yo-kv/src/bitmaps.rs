@@ -262,7 +262,9 @@ impl Keyspace {
     /// A result with no bytes in it deletes the destination, and any other
     /// result creates it whatever it holds, so a `BITOP AND` over sources that
     /// share nothing leaves a destination full of zero bytes rather than no
-    /// destination at all. Sources that are shorter than the longest read as
+    /// destination at all. Whatever the destination held before goes, even if
+    /// it was not a string: it is written and never read, so its type is not
+    /// part of the operation, and only the sources have to be strings. Sources that are shorter than the longest read as
     /// zeros past their end, and a source that is not there reads as empty.
     ///
     /// # Panics
@@ -318,14 +320,14 @@ impl Keyspace {
             self.del(dest);
             Ok(0)
         } else {
+            // Whatever the destination held and not only a string. It is
+            // never read, so its type is not part of the operation, and a real
+            // server writes over a list or a set here rather than refusing.
+            // The sources are the ones that have to be strings.
             self.reap(dest);
-            match self.string_only(dest) {
-                Ok(()) => {
-                    self.store_raw(dest, &flat[split..], None);
-                    Ok(len)
-                }
-                Err(e) => Err(e),
-            }
+            self.replacing(dest, Kind::String);
+            self.store_raw(dest, &flat[split..], None);
+            Ok(len)
         };
         self.scratch = flat;
         self.rows = ends;
@@ -479,9 +481,11 @@ impl Db {
             held.stripe_mut(onto).del(dest);
             return Ok(0);
         }
+        // Whatever the destination held, for the reason [`Keyspace::bitop`]
+        // gives: it is written and never read.
         let stripe = held.stripe_mut(onto);
         stripe.reap(dest);
-        stripe.string_only(dest)?;
+        stripe.replacing(dest, Kind::String);
         stripe.store_raw(dest, &flat[split..], None);
         Ok(len)
     }
@@ -750,6 +754,27 @@ mod tests {
             .expect("a length");
         assert_eq!(n, 0);
         assert!(!db.exists(b"d"));
+    }
+
+    /// The destination is written and never read, so what it held before does
+    /// not have to be a string and does not have to be anything.
+    #[test]
+    fn combining_writes_over_a_destination_of_any_type() {
+        let mut db = db();
+        db.set_plain(b"a", b"abc").expect("a set");
+        db.sadd(b"d", [b"m".as_slice()].into_iter())
+            .expect("a member");
+        let n = db.bitop(Op::And, b"d", keys(&[b"a"])).expect("a length");
+        assert_eq!(n, 3);
+        assert_eq!(
+            db.get(b"d").expect("a value").expect("bytes").to_vec(),
+            b"abc"
+        );
+        // And a source that is not a string is still refused, which is what
+        // makes the line above the destination rather than the check going.
+        db.sadd(b"s", [b"m".as_slice()].into_iter())
+            .expect("a member");
+        assert!(db.bitop(Op::Or, b"d", keys(&[b"s"])).is_err());
     }
 
     #[test]

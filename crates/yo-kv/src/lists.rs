@@ -666,6 +666,7 @@ impl Keyspace {
         for v in values.clone() {
             strings::check_len(key, v.len())?;
         }
+        self.replacing(key, Kind::List);
         self.free_body(key);
         let at = self.new_list(key);
         let limits = self.list_limits;

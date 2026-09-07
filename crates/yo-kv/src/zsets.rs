@@ -791,6 +791,7 @@ impl Keyspace {
             self.drop_key(key);
             return 0;
         };
+        self.replacing(key, Kind::Zset);
         self.free_body(key);
         let len = z.len();
         let at = self.zsets.insert(z);
