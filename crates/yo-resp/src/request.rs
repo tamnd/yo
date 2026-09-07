@@ -92,6 +92,15 @@ impl Argv {
         }
     }
 
+    /// How many arguments there is room for before the spans grow again.
+    ///
+    /// Only a test asks. A `Vec` reaches the allocator exactly when this
+    /// changes, so a test that wants to say a decode did not allocate can say
+    /// it by reading this on either side of the decode.
+    pub(crate) fn room(&self) -> usize {
+        self.spans.capacity()
+    }
+
     /// Forgets everything, including any half read command.
     ///
     /// The connection calls this if it discards unread bytes for any reason,

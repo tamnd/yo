@@ -2418,6 +2418,32 @@ mod tests {
         assert_eq!(f.run(&[b"GET", b"k"]), "$1\r\n2\r\n");
     }
 
+    /// The test the `high_water` claim in `multi::exec` asks for.
+    ///
+    /// A `Vec` reaches the allocator exactly when its capacity changes, so a
+    /// replay buffer whose room is the same before and after is one that did
+    /// not allocate. The first transaction is what sets the room, which is the
+    /// high water mark, and the second is the one that has to be free. Before
+    /// the buffer moved onto the session this failed on every transaction,
+    /// because `exec` made a new one each time and the room went back to zero.
+    #[test]
+    fn the_second_exec_of_a_shape_does_not_grow_the_buffer() {
+        let mut f = Fixture::new();
+        for _ in 0..2 {
+            f.run(&[b"MULTI"]);
+            f.run(&[b"SET", b"k", b"1"]);
+            f.run(&[b"INCR", b"k"]);
+            f.run(&[b"EXEC"]);
+        }
+        let room = f.session.replay.room();
+        assert!(room > 0, "the first transaction should have set the room");
+        f.run(&[b"MULTI"]);
+        f.run(&[b"SET", b"k", b"1"]);
+        f.run(&[b"INCR", b"k"]);
+        f.run(&[b"EXEC"]);
+        assert_eq!(f.session.replay.room(), room);
+    }
+
     #[test]
     fn an_empty_transaction_answers_an_empty_array() {
         let mut f = Fixture::new();

@@ -367,7 +367,13 @@ fn exec(server: &Server, session: &mut Session, out: &mut Out) -> Flow {
     let was = session.running;
     session.running = true;
     for wire in &queue.cmds {
-        if argv.decode(wire, &limits).is_err() {
+        // `yo_alloc::high_water` because the spans grow to the widest command
+        // this connection has ever queued and then stop. That claim is only
+        // true because the buffer lives on the session: made here it would have
+        // grown once per transaction forever, which is a command path
+        // allocating and not a high water mark. `the_second_exec_of_a_shape_
+        // does_not_grow_the_buffer` is the test the claim asks for.
+        if yo_alloc::high_water(|| argv.decode(wire, &limits)).is_err() {
             // Unreachable: these bytes were built here from a command that had
             // already been decoded once. An element still has to go in the
             // array, because the length is already written.
