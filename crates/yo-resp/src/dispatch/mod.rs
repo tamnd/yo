@@ -4770,6 +4770,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "a Lua state is C, and Miri interprets Rust")]
     fn the_script_cache_holds_what_was_loaded_into_it() {
         let mut f = Fixture::new();
         // The hash is the sha1 of the body and nothing else, so it is the same
@@ -4819,6 +4820,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "a Lua state is C, and Miri interprets Rust")]
     fn eval_counts_its_keys_before_it_compiles_anything() {
         let mut f = Fixture::new();
         assert_eq!(
@@ -4860,6 +4862,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "a Lua state is C, and Miri interprets Rust")]
     fn a_lua_value_comes_back_as_the_reply_it_maps_to() {
         let mut f = Fixture::new();
         let eval = |f: &mut Fixture, body: &[u8]| f.run(&[b"EVAL", body, b"0"]);
@@ -4906,6 +4909,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "a Lua state is C, and Miri interprets Rust")]
     fn the_protocol_the_client_asked_for_is_the_one_a_table_answers_in() {
         let mut f = Fixture::new();
         // Under RESP2 the four typed tables have to come back as something a
@@ -4946,6 +4950,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "a Lua state is C, and Miri interprets Rust")]
     fn a_reply_comes_back_into_lua_as_the_value_it_maps_to() {
         let mut f = Fixture::new();
         f.run(&[b"SET", b"s", b"hello"]);
@@ -4991,6 +4996,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "a Lua state is C, and Miri interprets Rust")]
     fn an_error_from_a_script_names_the_line_it_came_from() {
         let mut f = Fixture::new();
         // The position is the script's own, not the prelude's, and the suffix
@@ -5038,6 +5044,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "a Lua state is C, and Miri interprets Rust")]
     fn redis_call_refuses_what_it_cannot_run_and_pcall_hands_it_back() {
         let mut f = Fixture::new();
         let sentence = |f: &mut Fixture, body: &[u8]| {
@@ -5105,6 +5112,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "a Lua state is C, and Miri interprets Rust")]
     fn a_read_only_script_is_stopped_at_the_write_and_not_at_the_door() {
         let mut f = Fixture::new();
         f.run(&[b"SET", b"k", b"v"]);
@@ -5141,6 +5149,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "a Lua state is C, and Miri interprets Rust")]
     fn a_script_cannot_leave_anything_behind_for_the_next_one() {
         let mut f = Fixture::new();
         // A plain global write and a write through a name on the redis table
@@ -5194,6 +5203,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "a Lua state is C, and Miri interprets Rust")]
     fn a_script_can_walk_the_redis_table_it_is_not_allowed_to_write_to() {
         let mut f = Fixture::new();
         // The guard in front of the table is empty, so the three base library
@@ -5282,6 +5292,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "a Lua state is C, and Miri interprets Rust")]
     fn a_script_gets_the_bit_library_a_real_server_carries() {
         let mut f = Fixture::new();
         // Every answer is a signed word, which is why the ones past two to the
@@ -5389,6 +5400,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "a Lua state is C, and Miri interprets Rust")]
     fn a_script_gets_the_cjson_library_a_real_server_carries() {
         let mut f = Fixture::new();
         // Encoding, including the three shapes nobody guesses right: an empty
@@ -5571,6 +5583,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "a Lua state is C, and Miri interprets Rust")]
     fn a_script_gets_the_struct_library_a_real_server_carries() {
         let mut f = Fixture::new();
         // Packing, where the sizes are the ones a sixty four bit build gives
@@ -5749,6 +5762,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "a Lua state is C, and Miri interprets Rust")]
     fn a_script_gets_the_cmsgpack_library_a_real_server_carries() {
         let mut f = Fixture::new();
         // Every value goes out in the shortest form that holds it, and several
@@ -5947,6 +5961,7 @@ mod tests {
         redis.register_function('twice', function(keys, args) return 2 end)\n";
 
     #[test]
+    #[cfg_attr(miri, ignore = "a Lua state is C, and Miri interprets Rust")]
     fn a_library_is_loaded_once_and_called_by_name_forever_after() {
         let mut f = Fixture::new();
         assert_eq!(f.run(&[b"FUNCTION", b"LOAD", LIB]), "$5\r\nmylib\r\n");
@@ -5987,6 +6002,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "a Lua state is C, and Miri interprets Rust")]
     fn a_library_that_is_wrong_says_which_way_it_is_wrong() {
         let mut f = Fixture::new();
         for (code, want) in [
@@ -6045,6 +6061,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "a Lua state is C, and Miri interprets Rust")]
     fn register_function_turns_away_every_call_it_cannot_make_sense_of() {
         let mut f = Fixture::new();
         for (call, want) in [
@@ -6153,6 +6170,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "a Lua state is C, and Miri interprets Rust")]
     fn a_library_cannot_take_a_name_another_library_already_has() {
         let mut f = Fixture::new();
         assert_eq!(f.run(&[b"FUNCTION", b"LOAD", LIB]), "$5\r\nmylib\r\n");
@@ -6197,6 +6215,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "a Lua state is C, and Miri interprets Rust")]
     fn fcall_checks_the_name_before_it_looks_at_anything_else() {
         let mut f = Fixture::new();
         assert_eq!(f.run(&[b"FUNCTION", b"LOAD", LIB]), "$5\r\nmylib\r\n");
@@ -6249,6 +6268,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "a Lua state is C, and Miri interprets Rust")]
     fn a_function_gets_the_globals_a_script_gets_minus_the_ones_only_eval_has() {
         let mut f = Fixture::new();
         // The three names on the `redis` table that only mean something inside
@@ -6307,6 +6327,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "a Lua state is C, and Miri interprets Rust")]
     fn function_list_says_what_every_library_registered() {
         let mut f = Fixture::new();
         assert_eq!(f.run(&[b"FUNCTION", b"LOAD", LIB]), "$5\r\nmylib\r\n");
@@ -6360,6 +6381,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "a Lua state is C, and Miri interprets Rust")]
     fn function_stats_counts_what_is_loaded_and_says_nothing_is_running() {
         let mut f = Fixture::new();
         f.out = Out::new(Proto::Resp3);
@@ -6457,6 +6479,7 @@ mod tests {
     /// is there whether or not a library is in front of it, and restoring those
     /// ten bytes is a working no op.
     #[test]
+    #[cfg_attr(miri, ignore = "a Lua state is C, and Miri interprets Rust")]
     fn a_library_survives_a_dump_and_a_restore() {
         let mut f = Fixture::new();
         let empty = payload(&f.raw(&[b"FUNCTION", b"DUMP"]));
@@ -6504,6 +6527,7 @@ mod tests {
     /// compiles and then collides, and the library that was already there has to
     /// still be there afterwards in every case.
     #[test]
+    #[cfg_attr(miri, ignore = "a Lua state is C, and Miri interprets Rust")]
     fn a_restore_that_fails_changes_nothing() {
         let mut f = Fixture::new();
         assert_eq!(f.run(&[b"FUNCTION", b"LOAD", LIB]), "$5\r\nmylib\r\n");
@@ -6565,6 +6589,7 @@ mod tests {
     /// A REPLACE takes a library's name off another library and still refuses to
     /// take a function name off one it is leaving alone.
     #[test]
+    #[cfg_attr(miri, ignore = "a Lua state is C, and Miri interprets Rust")]
     fn a_restore_will_not_take_a_function_name_off_a_library_it_keeps() {
         let mut f = Fixture::new();
         assert_eq!(f.run(&[b"FUNCTION", b"LOAD", LIB]), "$5\r\nmylib\r\n");
@@ -6624,6 +6649,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "a Lua state is C, and Miri interprets Rust")]
     fn the_helpers_on_the_redis_table_answer_the_way_they_are_documented() {
         let mut f = Fixture::new();
         let eval = |f: &mut Fixture, body: &[u8]| f.run(&[b"EVAL", body, b"0"]);

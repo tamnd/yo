@@ -133,6 +133,34 @@ pub use request::{Argv, Step};
 /// so that `yo_resp::num` keeps meaning what it meant.
 pub use yo_common::num;
 
+/// Why the scripting tests are skipped under Miri.
+///
+/// Thirty tests in this crate open a Lua state, and every one of them is
+/// skipped under Miri with the same reason on it. This is not the kind of skip
+/// the rest of the workspace has. Those are tests whose count is the claim, and
+/// a smaller version of one measures something else. This one is not a count at
+/// all: a Lua state lives inside LuaJIT, which is C compiled by a build script,
+/// and Miri interprets Rust, so it stops at the first call across with
+/// `unsupported operation: can't call foreign function`. There is nothing to
+/// shrink and nothing an interpreter could check even in principle, because the
+/// code the test is exercising is not Rust.
+///
+/// What Miri still gets is everything on this side of the boundary. The bit,
+/// cjson, cmsgpack, sha1 and struct libraries are Rust here rather than the C
+/// the real server links, so their own tests run and are interpreted. What
+/// stops is the end to end path, which starts a script and therefore starts a
+/// state.
+///
+/// The list came out of a run rather than out of reading names. Four of the
+/// thirty are in the `lua` module and read like it, but the rest are engine
+/// tests that send `EVAL`, `FCALL` or `FUNCTION` through the dispatcher, and at
+/// least one of them, the one that checks `EVAL` counts its keys before it
+/// compiles anything, reads as though it stops short of Lua and does not. The
+/// way to find them again after a change is to run the crate under Miri with
+/// `--no-fail-fast` and take the failures, not to grep.
+#[cfg(test)]
+mod miri {}
+
 #[cfg(test)]
 mod tests {
     use super::*;

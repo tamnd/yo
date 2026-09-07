@@ -273,6 +273,16 @@ jobs:
       # crate now runs all 153 of its remaining tests in eighteen minutes single
       # threaded against twenty seven before, and nothing in it is near the two
       # minute mark where five tests were being cut off at it.
+      #
+      # `yo-resp` has thirty skips of a different kind, and they are worth
+      # telling apart from the ones above. All of them open a Lua state, which
+      # lives inside LuaJIT, which is C, and Miri interprets Rust, so it stops
+      # at the first call across. Nothing there can be shrunk and there is
+      # nothing for the interpreter to check even in principle, because the code
+      # under test is not Rust. They are named at the crate rather than here,
+      # and the way to find them again after a change is a run with
+      # `--no-fail-fast` rather than a grep, since several of them are engine
+      # tests whose names do not say Lua anywhere.
       - id: shards
         run: |
           rm rust-toolchain.toml
