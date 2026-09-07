@@ -64,6 +64,13 @@ pub(super) const NO_TOUCH: u32 = 16;
 /// Not one of the letters. It is in the same word because it is set by another
 /// thread and read by the owner on a path that is already loading this word.
 pub(super) const KILLED: u32 = 32;
+/// The connection sent `MONITOR` and is being fed every command, which the
+/// report spells `O`.
+///
+/// Redis flags a monitor a replica as well and reports only the `O`, because
+/// that is the letter for a replica that is a monitor rather than a real one.
+/// yo has no replicas yet, so the one bit says both things it has to say.
+pub(super) const MONITOR: u32 = 128;
 /// The thread that owns the connection has seen the kill and acted on it.
 ///
 /// Set by the owner and read by the owner, so that a connection which cannot be

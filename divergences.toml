@@ -879,3 +879,10 @@ reason = "The container has ID, GETNAME, SETNAME, SETINFO, INFO, LIST, KILL, PAU
 status = "until"
 resolved_by = "M8"
 spec = "12 section 9"
+
+[[divergence]]
+id = "D-124"
+title = "A monitor is fed at the end of the batch rather than inside the command"
+reason = "The line itself agrees with a real server everywhere it was measured, which is seventy cases covering the format, the quoting, the database, what is fed and what is not, the transaction order, the script order, the redaction, the keyspace refusal, the pause exemption and the two monitors that get identical bytes. What differs is when the line arrives. A real server writes it into the monitor's reply buffer from inside call, so a monitor that pipelined two commands of its own reads its first reply, then the line for it, then its second reply. Here the command runs on whichever thread its connection landed on and the monitor is on whichever thread it landed on, so the line goes into that thread's mailbox and is delivered at the end of the batch, the way a published message is. A monitor that sends one command at a time and reads the answer sees the same order a real server gives, because the batch is that one command. A monitor that pipelines gets both of its replies and then both of the lines. Nothing else is affected: lines about other connections are in the order the commands ran in, since one mailbox is drained in order, and the stamp is read when the line is rendered rather than when it is delivered, so the times are the times the commands ran at. Fixing it means the feed writing into a reply buffer another thread owns, which is the thing the mailbox exists to avoid, so it stays until there is a reason to pay for it. Three of the probes a comparison would use name commands yo has not got yet, which is MEMORY USAGE, LASTSAVE and ROLE, and those are an unknown command here rather than a command that was hidden."
+status = "permanent"
+spec = "12 section 9"

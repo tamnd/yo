@@ -9,9 +9,11 @@
 //! thread can read, and both work off the table of those rows. See the `clients`
 //! module for the row.
 //!
-//! `CLIENT PAUSE` and `CLIENT UNPAUSE` are not here. They are not a report or a
-//! close, they are a gate in front of the command path, and they come with that
-//! gate rather than beside these.
+//! `PAUSE` and `UNPAUSE` are the third shape. They are not a report and not a
+//! close, they are a gate in front of every command on every thread, so all
+//! that is here is the parse of the timeout and the mode. What they arm is one
+//! word on the server, which the `clients` module keeps beside the rows and the
+//! funnel reads once per command.
 //!
 //! # Why a report nobody on the server reads
 //!
@@ -618,6 +620,10 @@ struct Flags(u32);
 impl core::fmt::Display for Flags {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         let letters = [
+            // In front of the rest because that is the order a real server
+            // writes them in, so a monitor that has also subscribed reads `OP`
+            // and never `PO`.
+            (clients::MONITOR, 'O'),
             (clients::SUBSCRIBED, 'P'),
             (clients::IN_MULTI, 'x'),
             (clients::UNIX, 'U'),

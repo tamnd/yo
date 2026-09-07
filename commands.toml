@@ -5187,6 +5187,17 @@ wire = "verified"
 notes = "Two bulk strings and not one integer, seconds and then microseconds within that second, both as decimal text. It reads the wall clock and not the coarse cached millisecond the keyspace uses, because the coarse one is refreshed on a tick and a client that calls TIME twice and gets the same microsecond has been lied to. The ACL categories are @fast and nothing else, which reads like an omission and is not: the categories say what a command can reach and this one reaches nothing."
 
 [[command]]
+name = "MONITOR"
+group = "server"
+since = "1.0.0"
+arity = 1
+plan = "none"
+bounded = "inherent"
+status = "shipped"
+wire = "verified"
+notes = "The line is a simple string, on RESP2 and RESP3 alike, and it carries the time to the microsecond, then the database and the address in brackets, then the command and every argument quoted the way sdscatrepr quotes them: a backslash for a quote and a backslash, the five short escapes, hex for everything else outside printable ASCII, and a space left alone inside the quotes. The command name is echoed in the case the client sent it. The database is the one the connection is on after the command ran, so SELECT 3 reports itself on three. A command that never reached its body is not reported, which is an unknown command, a wrong arity and anything a refusal in the funnel caught, and a command that failed inside its body is reported. MULTI is reported when it is sent, the queued commands are reported as EXEC replays them, and EXEC comes last. The six script commands are reported before they run rather than after, so that what a script does arrives behind the EVAL that caused it, and a script's own calls carry lua in place of an address. HELLO AUTH has its user and password replaced with (redacted). The administrative commands are not reported at all, which Redis decides per subcommand and not per container, so CLIENT ID is reported and CLIENT LIST is not. A monitor is refused every command that reaches the keyspace with Replica can't interact with the keyspace, including at MULTI queue time, which is what makes EXEC answer EXECABORT. It is exempt from CLIENT PAUSE, which is why that refusal has to be there. MONITOR sent by a connection that is already one answers nothing at all, MONITOR inside a transaction fails at EXEC with MONITOR isn't allowed for DENY BLOCKING client, and RESET answers +RESET and turns the feed off. CLIENT LIST shows a monitor as flags=O, in front of the other letters. Two monitors watching the same command get byte identical lines, because the line is rendered once and shared. The one thing that differs is when a monitor's own line arrives against its own reply when it is pipelining, which is D-124."
+
+[[command]]
 name = "SHUTDOWN"
 group = "server"
 since = "1.0.0"

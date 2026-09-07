@@ -74,6 +74,7 @@ mod lists;
 mod lua;
 mod migrate;
 mod misses;
+mod monitor;
 mod multi;
 mod notify;
 mod pubsub;
@@ -804,6 +805,12 @@ pub struct Server {
     /// shifted up rather than packed into the top bits: the whole word is zero
     /// exactly when nothing is armed.
     pause: AtomicU64,
+    /// The connections `MONITOR` is feeding, and a count of them.
+    ///
+    /// Here for the third time and for the third version of the same reason:
+    /// the command being reported is running on a thread that cannot reach the
+    /// connection being told about it. See the `monitor` module.
+    monitors: monitor::Monitors,
 }
 
 impl Server {
@@ -849,6 +856,7 @@ impl Server {
             clients: Lock::default(),
             kills: AtomicUsize::new(0),
             pause: AtomicU64::new(0),
+            monitors: monitor::Monitors::default(),
             mail: pubsub::boxes(1),
         }
     }
@@ -918,6 +926,7 @@ impl Server {
             clients: Lock::default(),
             kills: AtomicUsize::new(0),
             pause: AtomicU64::new(0),
+            monitors: monitor::Monitors::default(),
             mail: pubsub::boxes(1),
         }
     }
@@ -2120,6 +2129,16 @@ impl Session {
         self.running
     }
 
+    /// Whether this connection has sent `MONITOR` and stopped being a client.
+    ///
+    /// Read off the row rather than kept beside it, so there is one answer to
+    /// the question and not two that could disagree. The row is a line this
+    /// session has already touched by the time anything asks, since noting the
+    /// command it is running writes to it.
+    pub(crate) fn monitoring(&self) -> bool {
+        self.sock.flag(clients::MONITOR)
+    }
+
     /// Say which connection slot this session is in.
     ///
     /// Called by the front when it opens the connection, which is the only place
@@ -2211,15 +2230,19 @@ impl Session {
 
 /// Give back everything a connection was holding on the server.
 ///
-/// The transaction, the watches and the subscriptions, and it is here rather
-/// than in [`Session::reset`] because letting go of any of the three is a change
-/// to the server. A `Session` on its own cannot reach one, and a connection that
-/// dropped its lists without saying so would leave rows nobody is watching and
-/// subscriptions nobody is listening to, which would keep every write and every
-/// publish on the server paying for clients that are not there.
+/// The transaction, the watches, the subscriptions and the monitor, and it is
+/// here rather than in [`Session::reset`] because letting go of any of the four
+/// is a change to the server. A `Session` on its own cannot reach one, and a
+/// connection that dropped its lists without saying so would leave rows nobody
+/// is watching, subscriptions nobody is listening to and a monitor nobody is
+/// reading, which would keep every write, every publish and every command on the
+/// server paying for clients that are not there.
 pub fn forget_session(server: &Server, session: &mut Session) {
     multi::release(server, session);
     pubsub::release(server, session);
+    if session.monitoring() {
+        server.watch_no_more(session.row());
+    }
 }
 
 /// Run one command and write its reply.
@@ -2284,6 +2307,19 @@ fn may_replicate(spec: &Spec, session: &Session) -> bool {
     spec.flags.contains(&"write")
         || MAY_REPLICATE.contains(&spec.name)
         || (spec.name == "exec" && session.queued_writes())
+}
+
+/// Whether a monitor is refused this command, which is anything that goes near
+/// the keyspace.
+///
+/// The writes, the reads and the six above, which is Redis's list read out of
+/// the same three questions in the same order. `EXEC` is not on it and does not
+/// need to be: a monitor cannot have queued one of these, because the refusal is
+/// in front of the queue.
+fn touches_keyspace(spec: &Spec) -> bool {
+    spec.flags.contains(&"write")
+        || spec.flags.contains(&"readonly")
+        || MAY_REPLICATE.contains(&spec.name)
 }
 
 /// The same, for a caller that has already found the command.
@@ -2380,6 +2416,22 @@ pub fn resolved(
         return Flow::Continue;
     }
 
+    // A monitor may not touch the keyspace. Redis flags one a replica and this
+    // is the refusal a replica gets, which reads like an accident of the
+    // implementation and is not one: a monitor is exempt from the pause below,
+    // so a connection that could pause the server and then become a monitor
+    // would have a way past its own pause that nothing else has.
+    //
+    // Here, in front of the pause and in front of the queue, which is where a
+    // real server puts it. In front of the queue is what makes `MULTI`, `GET x`,
+    // `EXEC` on a monitor come back as an `EXECABORT`: the `GET` is refused as
+    // it is queued rather than as it runs.
+    if session.monitoring() && touches_keyspace(spec) {
+        server.mine().cmdstats.at(spec).rejected.bump();
+        multi::refuse(server, session, Some(spec), &monitor::replica(), out);
+        return Flow::Continue;
+    }
+
     // `CLIENT PAUSE`, and this is the whole of it on the command path: one
     // relaxed load on a server nobody has paused. Here, after every refusal
     // above and before the queue below, which is where a real server puts it. So
@@ -2387,14 +2439,18 @@ pub fn resolved(
     // is paused, and `MULTI` on a paused server waits rather than opening a
     // transaction that would queue commands nobody is allowed to send yet.
     //
-    // Nothing is exempt, not even `CLIENT UNPAUSE`, which is Redis's behaviour
-    // and is worth being clear about: a `CLIENT PAUSE 10000 ALL` cannot be
-    // called off, by anybody, until it runs out.
+    // Nothing is exempt but a monitor, not even `CLIENT UNPAUSE`, which is
+    // Redis's behaviour and is worth being clear about: a `CLIENT PAUSE 10000
+    // ALL` cannot be called off, by anybody, until it runs out. The monitor is
+    // exempt because a real server exempts its replicas and a monitor is flagged
+    // one, and it costs nothing to let through because the gate above has
+    // already refused it everything that reaches a key.
     // A command `EXEC` is replaying is not a command the client just sent, and a
     // real server runs those through `call` rather than through
     // `processCommand`, so the gate is not in front of them. Holding one would
     // mean a transaction that has written half of itself and stopped.
     if !session.running
+        && !session.monitoring()
         && let Some(all) = server.paused(server.now_ms())
         && (all || may_replicate(spec, session))
     {
@@ -2422,6 +2478,19 @@ pub fn resolved(
         }
         _ => ALL_DATABASES,
     });
+
+    // Everybody watching, told about a command that is going to run. The load is
+    // what this costs a server nobody is watching, which is nearly all of them.
+    //
+    // A script is reported before it runs and everything else after, because a
+    // script's own calls come back through here and a reader wants the `EVAL`
+    // in front of what it did. Every other command goes below, next to where a
+    // real server feeds from, which is what puts `EXEC` after the commands it
+    // replayed rather than in front of them.
+    let watched = server.monitored() && !monitor::hidden(spec, args);
+    if watched && monitor::SCRIPTS.contains(&spec.name) {
+        monitor::feed(server, session, args);
+    }
 
     let mark = out.len();
     // Before the group, because the five that block are list commands and would
@@ -2651,6 +2720,12 @@ pub fn resolved(
         }
     };
     drop(reading);
+    // The other half of the feed. After the body, so that `SELECT 3` is reported
+    // on the database it moved to, and before the reply is written, which is
+    // where a real server has it.
+    if watched && !monitor::SCRIPTS.contains(&spec.name) {
+        monitor::feed(server, session, args);
+    }
     // Before the error is written and not after, because a command that failed
     // half way through still changed whatever it changed before it failed and a
     // real server has already published those. Draining here also keeps the
