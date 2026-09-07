@@ -36,6 +36,7 @@ use crate::evict;
 use crate::foreign::Foreign;
 use crate::hash::{self, Hash};
 use crate::list::{self, List};
+use crate::reap;
 use crate::set::{self, Set};
 use crate::slab::{Bytes, Slab};
 use crate::stream::{self, Stream};
@@ -791,8 +792,7 @@ impl Keyspace {
             .get(key)
             .map(|rec| (value::kind(rec), value::is_expired(rec, now)))?;
         if dead {
-            self.drop_key(key);
-            self.expired += 1;
+            self.reaped(key);
             return None;
         }
         Some(kind)
@@ -1240,9 +1240,28 @@ impl Keyspace {
         let now = self.clock.now_ms();
         let dead = self.map.get(key).is_some_and(|r| value::is_expired(r, now));
         if dead {
-            self.drop_key(key);
-            self.expired += 1;
+            self.reaped(key);
         }
+    }
+
+    /// Take a key whose deadline has passed, count it, and say that it went.
+    ///
+    /// Every lazy reap in the crate ends here, and so does the cycle, because
+    /// all of them owe the same three things and `INFO stats` reports one number
+    /// over the lot. Answers whether there was anything there to take, which the
+    /// cycle reads and the readers do not, since a reader has already looked.
+    ///
+    /// The caller decides whether the deadline has passed. This does not check
+    /// again, because every caller has just read the record to find out and a
+    /// second look would be a second probe for an answer already in hand.
+    #[inline]
+    pub(crate) fn reaped(&mut self, key: &[u8]) -> bool {
+        let gone = self.drop_key(key);
+        if gone {
+            self.expired += 1;
+            reap::went(key, reap::Why::Expired);
+        }
+        gone
     }
 
     /// Give this database somewhere to keep values that are not in memory.
@@ -1935,8 +1954,7 @@ impl Keyspace {
         let now = self.clock.now_ms();
         let addr = self.map.find(key)?;
         if value::is_expired(self.map.value_at(addr), now) {
-            self.drop_key(key);
-            self.expired += 1;
+            self.reaped(key);
             return None;
         }
         Some(addr)
@@ -1989,8 +2007,7 @@ impl Keyspace {
         };
         let rec = self.map.value_at(addr);
         if value::is_expired(rec, now) {
-            self.drop_key(key);
-            self.expired += 1;
+            self.reaped(key);
             return Ok(None);
         }
         if value::kind(rec) != want {
@@ -2045,8 +2062,7 @@ impl Keyspace {
         };
         let rec = self.map.value_at(addr);
         if value::is_expired(rec, now) {
-            self.drop_key(key);
-            self.expired += 1;
+            self.reaped(key);
             return Ok(None);
         }
         let kind = value::kind(rec);
@@ -2171,10 +2187,13 @@ impl Keyspace {
         buf.clear();
         buf.extend_from_slice(self.map.entry_at(addr).0);
         let gone = self.drop_key(&buf);
-        self.scratch = buf;
         if gone {
             self.evicted += 1;
+            // Before the buffer goes back, since that is what is holding the
+            // key, and a listener wants the name of what it lost.
+            reap::went(&buf, reap::Why::Evicted);
         }
+        self.scratch = buf;
         gone
     }
 

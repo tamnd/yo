@@ -67,6 +67,7 @@
 use std::cell::{Cell, RefCell};
 
 use yo_kv::Db;
+use yo_kv::reap;
 
 use super::Server;
 use super::pubsub::{self, Kind};
@@ -274,25 +275,69 @@ thread_local! {
     /// a whole word rather than a flag and a separate mask: one load and one
     /// test.
     static ARMED: Cell<u32> = const { Cell::new(0) };
+
+    /// Which database the keys a reap takes belong to.
+    ///
+    /// Every other event names its database at the call site, because the call
+    /// site is a command and a command knows which one it is running against. A
+    /// reap has no call site in that sense: it happens under a lookup, or under
+    /// the cycle, and the storage layer that notices it has never heard of a
+    /// database number. So the funnel leaves the answer here on its way in.
+    static WHERE: Cell<usize> = const { Cell::new(0) };
 }
 
-/// Get this thread ready for one command, and answer what it was ready for
-/// before.
+/// What a thread was set up for, so that it can be put back that way.
 ///
-/// The answer goes back to [`drain`], because `EXEC` and a script run commands
-/// through the funnel while a command is already running and the inner one must
-/// not leave the outer one disarmed.
+/// `EXEC` and a script run commands through the funnel while a command is
+/// already running, so the inner one has to leave the outer one as it found it.
+/// Both halves matter: `SELECT` is allowed inside `MULTI`, so the database a
+/// reap belongs to is not the same for the whole of an `EXEC`.
+#[derive(Clone, Copy)]
+pub(super) struct Armed {
+    /// The classes that were worth saying anything about.
+    flags: u32,
+    /// The database reaps were being attributed to.
+    db: usize,
+}
+
+/// Get this thread ready for one command against `db`, and answer what it was
+/// ready for before.
 ///
-/// Zero when nothing would come of a notification: notifications off, or on but
-/// with none of the six channels selected, or on with all of them but with
-/// nobody subscribed to anything at all. The last of those is the one that
-/// matters in practice,
+/// The flags are zero when nothing would come of a notification: notifications
+/// off, or on but with none of the six channels selected, or on with all of them
+/// but with nobody subscribed to anything at all. The last of those is the one
+/// that matters in practice,
 /// since it is what a server with the setting in its config file and no clients
 /// listening looks like.
-pub(super) fn arm(server: &Server) -> u32 {
+pub(super) fn arm(server: &Server, db: usize) -> Armed {
     let flags = server.notify_flags();
     let live = flags & CHANNELS != 0 && server.anyone_subscribed();
-    ARMED.replace(if live { flags } else { 0 })
+    // Unconditionally, because a listener that is installed and not armed costs
+    // one load and one test on a path that has just deleted a key, and because
+    // taking it off again would mean knowing whether this is the outermost
+    // funnel, which is a thing nothing else here has to know.
+    reap::tell(Some(reaped));
+    Armed {
+        flags: ARMED.replace(if live { flags } else { 0 }),
+        db: WHERE.replace(db),
+    }
+}
+
+/// Say that a key went when nobody asked for it.
+///
+/// Installed by [`arm`] and called by the storage layer at the moment the key
+/// goes, which is before the command that provoked it has done its own work.
+/// That is the order a real server publishes in and it comes out of where this
+/// is called from rather than out of anything here.
+fn reaped(key: &[u8], why: reap::Why) {
+    let (class, name) = match why {
+        reap::Why::Expired => (class::EXPIRED, "expired"),
+        reap::Why::Evicted => (class::EVICTED, "evicted"),
+    };
+    // And not a `del` alongside it. A key that reached its deadline and a key a
+    // client deleted are two different pieces of news, and a subscriber that
+    // wanted both asked for both.
+    fire(WHERE.get(), class, name, key);
 }
 
 /// Whether anything this command says will go anywhere.
@@ -431,8 +476,9 @@ fn keep(db: usize, name: &'static str, key: &[u8], subs: Vec<Vec<u8>>) {
 
 /// Publish everything the command said, and put the thread back the way [`arm`]
 /// found it.
-pub(super) fn drain(server: &Server, was: u32) {
-    let flags = ARMED.replace(was);
+pub(super) fn drain(server: &Server, was: Armed) {
+    WHERE.set(was.db);
+    let flags = ARMED.replace(was.flags);
     if flags == 0 {
         return;
     }

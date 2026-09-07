@@ -782,8 +782,7 @@ impl Keyspace {
         }
 
         if dead {
-            self.drop_key(key);
-            self.expired += 1;
+            self.reaped(key);
             deadline = None;
         }
         let next = step(current.unwrap_or(0), by, subtract)?;

@@ -86,6 +86,14 @@ pub use crate::front::Cmd;
 /// Which connection. An index, reused after a connection closes.
 pub type ConnId = u32;
 
+/// Keys a housekeeping call is allowed to look at while hunting dead ones.
+///
+/// The same number the loop's maintenance slice gets, because it buys the same
+/// thing: the sweep walks twenty keys at a time, so this is a couple of hundred
+/// draws in the worst case and one comparison in the common one, where no key
+/// in the database carries a deadline at all.
+const SWEEP_LOOKS: usize = yo_reactor::MAINTENANCE_UNITS as usize;
+
 /// Where replies go.
 ///
 /// One call per connection per batch, with however many replies are waiting.
@@ -497,11 +505,13 @@ impl<S: Sink> Wire<S> {
 
     /// Do one batch's worth of housekeeping.
     ///
-    /// Today that is one segment of arena compaction at most, which is what
-    /// stops a server that rewrites the same keys from holding every version of
-    /// them. It is separate from [`Wire::tick`] because the clock has to move
-    /// before a batch runs and this does not: it can wait until the replies are
-    /// out, and the driver decides when that is.
+    /// That is the dead keys and then one segment of arena compaction at most,
+    /// which between them are what stop a server that rewrites the same keys,
+    /// or writes them under a deadline and never reads them back, from holding
+    /// every version of everything it has ever been sent. It is separate from
+    /// [`Wire::tick`] because the clock has to move before a batch runs and this
+    /// does not: it can wait until the replies are out, and the driver decides
+    /// when that is.
     ///
     /// Per batch and not per turn of the loop. A turn can carry one command or
     /// a thousand, so a per turn call means the rate at which garbage is
@@ -521,6 +531,11 @@ impl<S: Sink> Wire<S> {
         // which is nearly all of them. It is here rather than on a timer for the
         // same reason the compaction is: one loop turns everything.
         self.server.backup_expire();
+        // The keys whose deadline has passed with nobody there to read them
+        // back. A slice's worth at most and gated to once a millisecond inside,
+        // so a driver that calls this after every batch does not turn a busy
+        // server into a server that spends its time sampling.
+        self.server.expire_slice(SWEEP_LOOKS);
         self.server.compact_step()
     }
 }
@@ -713,12 +728,17 @@ pub fn pump<S: Sink>(reactor: &mut Reactor<Wire<S>>, batch: &mut Vec<Cmd>) -> us
         // the batch that waits for it to be collected.
         reactor.engine_mut().maintain();
     }
-    // Once more, for a connection with something to say and nothing to run: a
-    // protocol error, or a socket that was full the last time round.
-    reactor.engine_mut().flush();
-    // And once for a turn that ran nothing at all, which is where a server that
-    // has gone quiet catches up on what the last busy turn left behind.
+    // Once for a turn that ran nothing at all, which is where a server that has
+    // gone quiet catches up on what the last busy turn left behind.
     reactor.engine_mut().maintain();
+    // Then once more for a connection with something to say and nothing to run:
+    // a protocol error, or a socket that was full the last time round, or a
+    // subscriber the housekeeping above owes the news that a key it was told to
+    // watch reached its deadline. That last one is why the flush is after the
+    // call rather than before it: an idle server turns every twenty
+    // milliseconds, and news that waits for the next turn is news that arrives
+    // twenty milliseconds after the thing it is about.
+    reactor.engine_mut().flush();
     ran
 }
 
@@ -2250,6 +2270,122 @@ mod tests {
                 ("__subkeyspace@0__:h", "hdel|1:f"),
             ]
             .map(|(c, p)| (c.to_owned(), p.to_owned()))
+        );
+    }
+
+    /// A subscriber, a writer and a clock the test moves by hand.
+    ///
+    /// The same arrangement [`watching`] sets up, on the fixed clock
+    /// [`timed`] builds, because every deadline in a test has to arrive on
+    /// request rather than in its own time.
+    fn watching_clock() -> (Reactor<Wire<Recorder>>, ConnId, ConnId, Vec<Cmd>) {
+        let (mut r, sub, mut batch) = timed();
+        let writer = r.engine_mut().accept();
+        r.engine_mut().feed(
+            writer,
+            &wire(&[b"CONFIG", b"SET", b"notify-keyspace-events", b"EA"]),
+        );
+        r.engine_mut()
+            .feed(sub, &wire(&[b"PSUBSCRIBE", b"__keyevent@0__:*"]));
+        pump(&mut r, &mut batch);
+        r.engine_mut().sink_mut().clear();
+        (r, sub, writer, batch)
+    }
+
+    /// A key that reached its deadline says so when a reader trips over it, and
+    /// the reader's own command says nothing, because as far as it is concerned
+    /// the key was never there.
+    #[test]
+    fn a_deadline_that_passed_is_news_when_a_reader_finds_it() {
+        let (mut r, sub, writer, mut batch) = watching_clock();
+
+        r.engine_mut()
+            .feed(writer, &wire(&[b"SET", b"k", b"v", b"PX", b"10"]));
+        pump(&mut r, &mut batch);
+        r.engine_mut().sink_mut().clear();
+
+        r.engine().server().advance_clock_ms(50);
+        r.engine_mut().feed(writer, &wire(&[b"GET", b"k"]));
+        pump(&mut r, &mut batch);
+        assert_eq!(
+            fired(&r, sub),
+            [("expired", "k")].map(|(e, k)| (e.to_owned(), k.to_owned())),
+            "and not a del alongside it, which is a different piece of news"
+        );
+    }
+
+    /// And a key nobody ever reads back says it too, because the housekeeping
+    /// the driver runs between batches goes looking for them.
+    ///
+    /// This is the whole reason a cache that writes under a deadline and never
+    /// reads does not grow forever, and it is worth a test of its own: the sweep
+    /// lives behind a driver call rather than behind a command, so nothing in
+    /// the command tests would notice if it stopped running.
+    #[test]
+    fn a_deadline_that_passed_is_news_with_nobody_reading() {
+        let (mut r, sub, writer, mut batch) = watching_clock();
+
+        r.engine_mut()
+            .feed(writer, &wire(&[b"SET", b"k", b"v", b"PX", b"10"]));
+        pump(&mut r, &mut batch);
+        r.engine_mut().sink_mut().clear();
+
+        r.engine().server().advance_clock_ms(50);
+        // Nothing to run, so this turn is housekeeping and nothing else.
+        pump(&mut r, &mut batch);
+        assert_eq!(
+            fired(&r, sub),
+            [("expired", "k")].map(|(e, k)| (e.to_owned(), k.to_owned()))
+        );
+
+        r.engine_mut().sink_mut().clear();
+        pump(&mut r, &mut batch);
+        assert!(fired(&r, sub).is_empty(), "and it only goes once");
+    }
+
+    /// A key an eviction took says that instead, since a client that lost a key
+    /// to a memory limit and a client whose key ran out of time are owed two
+    /// different explanations.
+    #[test]
+    fn a_key_a_limit_took_says_it_was_evicted() {
+        let (mut r, sub, writer, mut batch) = watching();
+
+        let val = vec![b'v'; 256];
+        for i in 0..2000u32 {
+            let k = format!("key:{i:08}");
+            r.engine_mut()
+                .feed(writer, &wire(&[b"SET", k.as_bytes(), &val]));
+        }
+        pump(&mut r, &mut batch);
+        r.engine().server().refresh_memory();
+        let full = r.engine().server().memory_bytes();
+        r.engine_mut().sink_mut().clear();
+
+        // Under what it is already holding, so the next write has to take
+        // something out before it can put anything in.
+        let limit = (full / 2).to_string();
+        r.engine_mut().feed(
+            writer,
+            &wire(&[b"CONFIG", b"SET", b"maxmemory-policy", b"allkeys-random"]),
+        );
+        r.engine_mut().feed(
+            writer,
+            &wire(&[b"CONFIG", b"SET", b"maxmemory", limit.as_bytes()]),
+        );
+        r.engine_mut()
+            .feed(writer, &wire(&[b"SET", b"newcomer", &val]));
+        pump(&mut r, &mut batch);
+
+        let events = fired(&r, sub);
+        assert!(
+            events.iter().any(|(e, _)| e == "evicted"),
+            "the write made room and never said so: {events:?}"
+        );
+        assert!(
+            events
+                .iter()
+                .all(|(e, k)| e != "evicted" || k != "newcomer"),
+            "the key the write was for is the one key it cannot have taken"
         );
     }
 

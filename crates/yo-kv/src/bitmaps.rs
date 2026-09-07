@@ -160,8 +160,7 @@ impl Keyspace {
             }
         }
         if dead {
-            self.drop_key(key);
-            self.expired += 1;
+            self.reaped(key);
         }
 
         // The slow path, which is every first write to a key and every write

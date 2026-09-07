@@ -157,6 +157,7 @@ pub mod orderkey;
 pub mod parts;
 pub mod rank;
 pub mod rdb;
+pub mod reap;
 pub mod scan;
 pub mod set;
 pub mod setops;

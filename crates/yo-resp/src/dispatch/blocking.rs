@@ -954,12 +954,14 @@ impl Server {
         // Serving a waiter pops an element, which makes garbage, and it happens
         // outside `execute` so nothing else has marked the database for the
         // maintenance turn.
-        self.mine().mark(1u64 << list.db_of(at));
+        let db = list.db_of(at);
+        self.mine().mark(1u64 << db);
         // Armed here for the same reason, and it is the one place outside the
         // funnel that has to do it. A pop that answers a parked client is a pop
         // and says so, and the client whose push woke it has long since had its
-        // own events published.
-        let armed = notify::arm(self);
+        // own events published. The database is the waiter's own, since the
+        // thread running this is not the one the client is on.
+        let armed = notify::arm(self, db);
         let done = list.try_serve(at, &self.dbs, now, out);
         drop(list);
         notify::drain(self, armed);

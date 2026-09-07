@@ -111,8 +111,7 @@ impl Keyspace {
     /// its active cycle into it too.
     fn reap_all(&mut self, dead: Vec<Vec<u8>>) {
         for key in dead {
-            self.drop_key(&key);
-            self.expired += 1;
+            self.reaped(&key);
         }
     }
 
