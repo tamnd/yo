@@ -1936,11 +1936,18 @@ mod tests {
     /// actually got, and a command that fires four events in a fixed order
     /// makes for a byte literal nobody can read.
     fn fired(r: &Reactor<Wire<Recorder>>, sub: ConnId) -> Vec<(String, String)> {
+        fired_on(r, sub, 0)
+    }
+
+    /// The same, for a test watching a database other than the one the writer is
+    /// on, which is the two commands that put a key somewhere else.
+    fn fired_on(r: &Reactor<Wire<Recorder>>, sub: ConnId, db: usize) -> Vec<(String, String)> {
+        let head = format!("__keyevent@{db}__:");
         let sent = String::from_utf8_lossy(r.engine().sink().sent(sub)).into_owned();
         let mut out = Vec::new();
         let mut parts = sent.split("\r\n");
         while let Some(p) = parts.next() {
-            let Some(event) = p.strip_prefix("__keyevent@0__:") else {
+            let Some(event) = p.strip_prefix(head.as_str()) else {
                 continue;
             };
             // The pattern itself comes past on every frame ahead of the channel
@@ -2327,6 +2334,247 @@ mod tests {
                 ("sinterstore", "d")
             ]
             .map(|(e, k)| (e.to_owned(), k.to_owned()))
+        );
+    }
+
+    /// A bit write says so when it did something and stays quiet when it did
+    /// not, which is not the same as whether it was a write.
+    #[test]
+    fn a_bit_write_that_left_the_value_alone_says_nothing() {
+        let (mut r, sub, writer, mut batch) = watching();
+
+        // `a` is 0x61, so the second bit from the top is already one and the
+        // first of these three changes nothing. The second clears it and the
+        // third finds it clear.
+        r.engine_mut().feed(writer, &wire(&[b"SET", b"k", b"abc"]));
+        pump(&mut r, &mut batch);
+        r.engine_mut().sink_mut().clear();
+
+        r.engine_mut()
+            .feed(writer, &wire(&[b"SETBIT", b"k", b"1", b"1"]));
+        r.engine_mut()
+            .feed(writer, &wire(&[b"SETBIT", b"k", b"1", b"0"]));
+        r.engine_mut()
+            .feed(writer, &wire(&[b"SETBIT", b"k", b"1", b"0"]));
+        // And one that writes a zero into a value too short to hold it, which
+        // changed no bit that was there and still counts, because the bytes it
+        // wrote the zero into were not there before.
+        r.engine_mut()
+            .feed(writer, &wire(&[b"SETBIT", b"k", b"100", b"0"]));
+        pump(&mut r, &mut batch);
+        assert_eq!(
+            fired(&r, sub),
+            [("setbit", "k"), ("setbit", "k")].map(|(e, k)| (e.to_owned(), k.to_owned()))
+        );
+    }
+
+    /// And `BITFIELD` follows the same rule one subcommand at a time, so a call
+    /// that wrote every field back the way it found it says nothing.
+    #[test]
+    fn a_bitfield_that_wrote_the_same_values_back_says_nothing() {
+        let (mut r, sub, writer, mut batch) = watching();
+
+        r.engine_mut().feed(writer, &wire(&[b"SET", b"k", b"abc"]));
+        pump(&mut r, &mut batch);
+        r.engine_mut().sink_mut().clear();
+
+        // `a` again, written back over itself.
+        r.engine_mut().feed(
+            writer,
+            &wire(&[b"BITFIELD", b"k", b"SET", b"u8", b"0", b"97"]),
+        );
+        r.engine_mut()
+            .feed(writer, &wire(&[b"BITFIELD", b"k", b"GET", b"u8", b"0"]));
+        r.engine_mut().feed(
+            writer,
+            &wire(&[b"BITFIELD", b"k", b"INCRBY", b"u8", b"0", b"0"]),
+        );
+        pump(&mut r, &mut batch);
+        assert_eq!(fired(&r, sub), []);
+
+        // One that does change a field, and one that only makes the value
+        // longer without changing a bit that was in it.
+        r.engine_mut().feed(
+            writer,
+            &wire(&[b"BITFIELD", b"k", b"SET", b"u8", b"0", b"98"]),
+        );
+        r.engine_mut().feed(
+            writer,
+            &wire(&[b"BITFIELD", b"k", b"SET", b"u8", b"800", b"0"]),
+        );
+        pump(&mut r, &mut batch);
+        assert_eq!(
+            fired(&r, sub),
+            [("setbit", "k"), ("setbit", "k")].map(|(e, k)| (e.to_owned(), k.to_owned()))
+        );
+    }
+
+    /// A sketch says `pfadd` when a register moved, and a merge says it under
+    /// the same name whatever it merged.
+    #[test]
+    fn the_sketch_commands_say_what_a_mass_add_says() {
+        let (mut r, sub, writer, mut batch) = watching();
+
+        r.engine_mut().feed(writer, &wire(&[b"PFADD", b"h", b"a"]));
+        // The same element again, which moves nothing.
+        r.engine_mut().feed(writer, &wire(&[b"PFADD", b"h", b"a"]));
+        // And no elements at all on a sketch that is already there.
+        r.engine_mut().feed(writer, &wire(&[b"PFADD", b"h"]));
+        // A merge with no sources, which touches nothing and says it anyway.
+        r.engine_mut().feed(writer, &wire(&[b"PFMERGE", b"d"]));
+        r.engine_mut()
+            .feed(writer, &wire(&[b"PFMERGE", b"d", b"h"]));
+        pump(&mut r, &mut batch);
+        assert_eq!(
+            fired(&r, sub),
+            [("pfadd", "h"), ("pfadd", "d"), ("pfadd", "d")]
+                .map(|(e, k)| (e.to_owned(), k.to_owned()))
+        );
+    }
+
+    /// A geo key is a sorted set, so writing to one says what the `ZADD`
+    /// underneath says, and storing a search says a name of its own.
+    #[test]
+    fn the_geo_commands_say_what_the_sorted_set_under_them_did() {
+        let (mut r, sub, writer, mut batch) = watching();
+
+        let point: &[&[u8]] = &[b"GEOADD", b"g", b"13.361389", b"38.115556", b"P"];
+        r.engine_mut().feed(writer, &wire(point));
+        // The same member at the same place, which is neither an add nor a move.
+        r.engine_mut().feed(writer, &wire(point));
+        // The same member somewhere else, which is a move and is a write.
+        r.engine_mut().feed(
+            writer,
+            &wire(&[b"GEOADD", b"g", b"14.0", b"38.115556", b"P"]),
+        );
+        r.engine_mut().feed(
+            writer,
+            &wire(&[
+                b"GEORADIUS",
+                b"g",
+                b"14.0",
+                b"38.0",
+                b"200",
+                b"km",
+                b"STORE",
+                b"d",
+            ]),
+        );
+        r.engine_mut().feed(
+            writer,
+            &wire(&[
+                b"GEOSEARCHSTORE",
+                b"e",
+                b"g",
+                b"FROMLONLAT",
+                b"14.0",
+                b"38.0",
+                b"BYRADIUS",
+                b"200",
+                b"km",
+            ]),
+        );
+        pump(&mut r, &mut batch);
+        assert_eq!(
+            fired(&r, sub),
+            [
+                ("zadd", "g"),
+                ("zadd", "g"),
+                ("georadiusstore", "d"),
+                ("geosearchstore", "e")
+            ]
+            .map(|(e, k)| (e.to_owned(), k.to_owned()))
+        );
+    }
+
+    /// And a store whose search found nothing deletes the destination and says
+    /// so, which is the rule every store form follows.
+    #[test]
+    fn a_geo_store_that_found_nothing_takes_the_destination_with_it() {
+        let (mut r, sub, writer, mut batch) = watching();
+
+        r.engine_mut().feed(
+            writer,
+            &wire(&[b"GEOADD", b"g", b"13.361389", b"38.115556", b"P"]),
+        );
+        r.engine_mut().feed(writer, &wire(&[b"SET", b"d", b"x"]));
+        pump(&mut r, &mut batch);
+        r.engine_mut().sink_mut().clear();
+
+        r.engine_mut().feed(
+            writer,
+            &wire(&[
+                b"GEORADIUS",
+                b"g",
+                b"1.0",
+                b"1.0",
+                b"1",
+                b"km",
+                b"STORE",
+                b"d",
+            ]),
+        );
+        // And again, now that the destination is not there, which deletes
+        // nothing and says nothing.
+        r.engine_mut().feed(
+            writer,
+            &wire(&[
+                b"GEORADIUS",
+                b"g",
+                b"1.0",
+                b"1.0",
+                b"1",
+                b"km",
+                b"STORE",
+                b"d",
+            ]),
+        );
+        pump(&mut r, &mut batch);
+        assert_eq!(
+            fired(&r, sub),
+            [("del", "d")].map(|(e, k)| (e.to_owned(), k.to_owned()))
+        );
+    }
+
+    /// A key that arrives on a database other than the one that asked for it
+    /// says it is new there, and says nothing on the database the command ran
+    /// on.
+    #[test]
+    fn a_key_that_lands_on_another_database_is_new_over_there() {
+        let (mut r, sub, mut batch) = engine();
+        let writer = r.engine_mut().accept();
+        r.engine_mut().feed(
+            writer,
+            &wire(&[b"CONFIG", b"SET", b"notify-keyspace-events", b"EAnoc"]),
+        );
+        r.engine_mut().feed(
+            sub,
+            &wire(&[b"PSUBSCRIBE", b"__keyevent@0__:*", b"__keyevent@1__:*"]),
+        );
+        r.engine_mut().feed(writer, &wire(&[b"SET", b"a", b"v"]));
+        r.engine_mut().feed(writer, &wire(&[b"SET", b"k", b"v"]));
+        pump(&mut r, &mut batch);
+        r.engine_mut().sink_mut().clear();
+
+        r.engine_mut()
+            .feed(writer, &wire(&[b"COPY", b"a", b"b", b"DB", b"1"]));
+        r.engine_mut().feed(writer, &wire(&[b"MOVE", b"k", b"1"]));
+        pump(&mut r, &mut batch);
+        assert_eq!(
+            fired_on(&r, sub, 1),
+            [
+                ("new", "b"),
+                ("copy_to", "b"),
+                ("new", "k"),
+                ("move_to", "k")
+            ]
+            .map(|(e, k)| (e.to_owned(), k.to_owned()))
+        );
+        // And nothing of the sort on the database the two commands ran on,
+        // which hears only the half of the move that happened there.
+        assert_eq!(
+            fired_on(&r, sub, 0),
+            [("move_from", "k")].map(|(e, k)| (e.to_owned(), k.to_owned()))
         );
     }
 

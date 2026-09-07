@@ -43,6 +43,7 @@ use yo_kv::geos::{self, Limit, Scratch, Sort};
 use yo_kv::{Db, Gate, Keyspace, ZAdd};
 
 use super::args::{self, Args, is};
+use super::notify::{self, class};
 use super::table::Spec;
 use crate::reply::Out;
 
@@ -159,17 +160,23 @@ impl Form {
 }
 
 /// Run one geospatial command.
-pub(super) fn execute(db: &Db, spec: &Spec, args: Args<'_>, out: &mut Out) -> Result<()> {
+pub(super) fn execute(
+    db: &Db,
+    on: usize,
+    spec: &Spec,
+    args: Args<'_>,
+    out: &mut Out,
+) -> Result<()> {
     // The four that read or write one key are handed the stripe that key is on.
     // The search forms take the database, because a store form names a second
     // key and the two of them can be anywhere.
     let key = args.get(1);
     match spec.name {
-        "geoadd" => add(&mut db.hold(key), args, out),
+        "geoadd" => add(&mut db.hold(key), on, args, out),
         "geopos" => pos(&mut db.hold(key), args, out),
         "geohash" => hash(&mut db.hold(key), args, out),
         "geodist" => dist(&mut db.hold(key), args, out),
-        _ => search(db, spec, args, out),
+        _ => search(db, on, spec, args, out),
     }
 }
 
@@ -179,7 +186,7 @@ pub(super) fn execute(db: &Db, spec: &Spec, args: Args<'_>, out: &mut Out) -> Re
 /// rule the keyspace layer applies to the range check and is there for the same
 /// reason: a bulk load that stops halfway with no way to tell where is worse
 /// than one that refuses.
-fn add(db: &mut Keyspace, args: Args<'_>, out: &mut Out) -> Result<()> {
+fn add(db: &mut Keyspace, on: usize, args: Args<'_>, out: &mut Out) -> Result<()> {
     let (mut nx, mut xx) = (false, false);
     let mut opts = ZAdd::default();
     let mut at = 2;
@@ -223,7 +230,18 @@ fn add(db: &mut Keyspace, args: Args<'_>, out: &mut Out) -> Result<()> {
             args.get(i + 2),
         )
     });
-    out.uint(db.geoadd(args.get(1), points, opts)? as u64);
+    // Both halves of the count, for the reason `ZADD` wants them both: the reply
+    // wants one number and the notification wants to know whether either was
+    // more than nothing, so a `GEOADD` that only moved a member has written to
+    // the key and says so.
+    let key = args.get(1);
+    let (added, changed) = db.geoadd_counts(key, points, opts)?;
+    out.uint(if opts.changed { added + changed } else { added } as u64);
+    // Under `ZADD`'s name and on the sorted set class, since a geo key is a
+    // sorted set and this is the `ZADD` underneath saying what it did.
+    if added + changed > 0 {
+        notify::fire(on, class::ZSET, "zadd", key);
+    }
     Ok(())
 }
 
@@ -279,7 +297,7 @@ fn dist(db: &mut Keyspace, args: Args<'_>, out: &mut Out) -> Result<()> {
 }
 
 /// The six search forms, which are one command with six front ends.
-fn search(db: &Db, spec: &Spec, args: Args<'_>, out: &mut Out) -> Result<()> {
+fn search(db: &Db, on: usize, spec: &Spec, args: Args<'_>, out: &mut Out) -> Result<()> {
     let form = Form::of(spec.name);
     let key = args.get(form.src);
     // Before any argument is read, because that is where Redis looks it up and
@@ -408,7 +426,19 @@ fn search(db: &Db, spec: &Spec, args: Args<'_>, out: &mut Out) -> Result<()> {
     // deleted in the other, so there is no early return for it.
     match dest {
         Some(into) => {
-            out.uint(db.geosearchstore(into, key, from, &shape, limit, storedist)? as u64);
+            // Whether the destination was there beforehand, asked only when
+            // somebody is listening, for the reason every other store form asks
+            // it: a search that found nothing deletes the destination and says
+            // `del`, and there is no other way to tell that from a delete of
+            // nothing.
+            let had = notify::armed() && db.hold(into).exists(into);
+            let n = db.geosearchstore(into, key, from, &shape, limit, storedist)?;
+            out.uint(n as u64);
+            if n > 0 {
+                notify::fire(on, class::ZSET, stored(spec.name), into);
+            } else if had {
+                notify::fire(on, class::GENERIC, "del", into);
+            }
         }
         None => {
             let mut stripe = db.hold(key);
@@ -454,6 +484,21 @@ fn found(hits: &Scratch, unit: Unit, with: [bool; 3], out: &mut Out) {
             out.double(hit.lon);
             out.double(hit.lat);
         }
+    }
+}
+
+/// What a store form calls what it just did.
+///
+/// Two names for one write, and which one a client hears is which spelling asked
+/// for it rather than what the result looks like. `GEOSEARCHSTORE` says
+/// `geosearchstore` and both of the writable `GEORADIUS` forms say
+/// `georadiusstore`, including `GEORADIUSBYMEMBER`, which does not have a name
+/// of its own here.
+fn stored(name: &str) -> &'static str {
+    if name == "geosearchstore" {
+        "geosearchstore"
+    } else {
+        "georadiusstore"
     }
 }
 
