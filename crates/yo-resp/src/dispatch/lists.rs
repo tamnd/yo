@@ -28,6 +28,7 @@ use yo_common::{Code, Error, Result, parse_i64};
 use yo_kv::{Db, End, Entry, Movem, Order};
 
 use super::args::{self, Args};
+use super::notify::{self, class};
 use super::table::Spec;
 use crate::reply::Out;
 
@@ -48,26 +49,36 @@ const BAD_COUNT: &str = "COUNT can't be negative";
 const BAD_MAXLEN: &str = "MAXLEN can't be negative";
 
 /// Run one list command.
-pub(super) fn execute(db: &Db, spec: &Spec, args: Args<'_>, out: &mut Out) -> Result<()> {
+pub(super) fn execute(
+    db: &Db,
+    on: usize,
+    spec: &Spec,
+    args: Args<'_>,
+    out: &mut Out,
+) -> Result<()> {
     match spec.name {
-        "lpush" => {
+        "lpush" | "rpush" => {
+            let end = end_of_name(spec.name);
             let key = args.get(1);
-            out.int(count(db.hold(key).push(key, End::Left, rest(args))?));
+            out.int(count(db.hold(key).push(key, end, rest(args))?));
+            // A push always pushes, since a name with no elements behind it is
+            // an arity error and never gets here, so there is nothing to check
+            // before saying so.
+            notify::fire(on, class::LIST, pushed(end), key);
         }
-        "rpush" => {
+        "lpushx" | "rpushx" => {
+            let end = end_of_name(spec.name);
             let key = args.get(1);
-            out.int(count(db.hold(key).push(key, End::Right, rest(args))?));
+            let len = db.hold(key).pushx(key, end, rest(args))?;
+            out.int(count(len));
+            // Zero is the key not being there, which is the whole of what the
+            // `x` forms do differently, and a list that is there is never empty.
+            if len > 0 {
+                notify::fire(on, class::LIST, pushed(end), key);
+            }
         }
-        "lpushx" => {
-            let key = args.get(1);
-            out.int(count(db.hold(key).pushx(key, End::Left, rest(args))?));
-        }
-        "rpushx" => {
-            let key = args.get(1);
-            out.int(count(db.hold(key).pushx(key, End::Right, rest(args))?));
-        }
-        "lpop" => pop(db, spec, args, End::Left, out)?,
-        "rpop" => pop(db, spec, args, End::Right, out)?,
+        "lpop" => pop(db, on, spec, args, End::Left, out)?,
+        "rpop" => pop(db, on, spec, args, End::Right, out)?,
         "llen" => {
             let key = args.get(1);
             out.int(count(db.hold(key).llen(key)?));
@@ -94,6 +105,7 @@ pub(super) fn execute(db: &Db, spec: &Spec, args: Args<'_>, out: &mut Out) -> Re
             let key = args.get(1);
             db.hold(key).lset(key, args.int(2)?, args.get(3))?;
             out.ok();
+            notify::fire(on, class::LIST, "lset", key);
         }
         "linsert" => {
             let before = if args::is(args.get(2), b"before") {
@@ -104,32 +116,56 @@ pub(super) fn execute(db: &Db, spec: &Spec, args: Args<'_>, out: &mut Out) -> Re
                 return Err(args::syntax());
             };
             let key = args.get(1);
-            out.int(
-                db.hold(key)
-                    .linsert(key, before, args.get(3), args.get(4))?,
-            );
+            let len = db
+                .hold(key)
+                .linsert(key, before, args.get(3), args.get(4))?;
+            out.int(len);
+            // Minus one is a pivot that was not found and zero is a key that
+            // was not there, and neither of those inserted anything.
+            if len > 0 {
+                notify::fire(on, class::LIST, "linsert", key);
+            }
         }
         "lrem" => {
             let key = args.get(1);
-            out.int(count(db.hold(key).lrem(key, args.int(2)?, args.get(3))?));
+            let gone = db.hold(key).lrem(key, args.int(2)?, args.get(3))?;
+            out.int(count(gone));
+            if gone > 0 {
+                notify::fire(on, class::LIST, "lrem", key);
+                notify::emptied(db, on, key);
+            }
         }
         "ltrim" => {
             let key = args.get(1);
-            db.hold(key).ltrim(key, args.int(2)?, args.int(3)?)?;
+            // Both bounds first, because a line that is wrong in two places
+            // complains about the numbers and not about the key, and the check
+            // below would otherwise reach the key ahead of them.
+            let (start, stop) = (args.int(2)?, args.int(3)?);
+            // Whether the trim moved anything does not come into it: a `LTRIM k
+            // 0 -1` on a list that is already exactly that long says `ltrim`
+            // anyway, and only a key that was not there says nothing. That is
+            // measured, and it is why the length is asked for rather than the
+            // trim's own answer being used.
+            let there = notify::armed() && db.hold(key).llen(key)? > 0;
+            db.hold(key).ltrim(key, start, stop)?;
             out.ok();
+            if there {
+                notify::fire(on, class::LIST, "ltrim", key);
+                notify::emptied(db, on, key);
+            }
         }
         "lpos" => lpos(db, args, out)?,
         // `RPOPLPUSH` is `LMOVE` with its two ends fixed, and Redis says as much
         // in its own source. It stays a separate name because it is the one
         // every client library still sends.
-        "rpoplpush" => moved(db, args.get(1), args.get(2), End::Right, End::Left, out)?,
+        "rpoplpush" => moved(db, on, args.get(1), args.get(2), End::Right, End::Left, out)?,
         "lmove" => {
             let from = end_of(args.get(3))?;
             let to = end_of(args.get(4))?;
-            moved(db, args.get(1), args.get(2), from, to, out)?;
+            moved(db, on, args.get(1), args.get(2), from, to, out)?;
         }
-        "lmovem" => movem(db, args, out)?,
-        "lmpop" => mpop(db, args, out)?,
+        "lmovem" => movem(db, on, args, out)?,
+        "lmpop" => mpop(db, on, args, out)?,
         other => unreachable!("the table sent {other} to the list group"),
     }
     Ok(())
@@ -141,7 +177,7 @@ pub(super) fn execute(db: &Db, spec: &Spec, args: Args<'_>, out: &mut Out) -> Re
 /// is why the count is looked at before anything is popped: without it the
 /// answer is one element or a null, and with it an array or a null array, even
 /// when the count is one.
-fn pop(db: &Db, spec: &Spec, args: Args<'_>, end: End, out: &mut Out) -> Result<()> {
+fn pop(db: &Db, on: usize, spec: &Spec, args: Args<'_>, end: End, out: &mut Out) -> Result<()> {
     let key = args.get(1);
     if args.len() == 2 {
         let mut got = false;
@@ -151,7 +187,10 @@ fn pop(db: &Db, spec: &Spec, args: Args<'_>, end: End, out: &mut Out) -> Result<
         })?;
         if !got {
             out.nil();
+            return Ok(());
         }
+        notify::fire(on, class::LIST, popped(end), key);
+        notify::emptied(db, on, key);
         return Ok(());
     }
     // The arity in the table is a minimum, because a count is optional, so a
@@ -179,7 +218,19 @@ fn pop(db: &Db, spec: &Spec, args: Args<'_>, end: End, out: &mut Out) -> Result<
     }
     let mark = out.len();
     let n = stripe.pop_into(key, end, want, |e| element(out, e))?;
+    // Asked here rather than through [`emptied`] because the stripe is already
+    // held, and asking again after letting it go would be a second lock on the
+    // same key for an answer that is right in front of us.
+    let empty = notify::armed() && stripe.llen(key)? == 0;
+    drop(stripe);
     out.close_array(mark, n);
+    // One event for the pop and not one per element, whatever the count said.
+    if n > 0 {
+        notify::fire(on, class::LIST, popped(end), key);
+        if empty {
+            notify::fire(on, class::GENERIC, "del", key);
+        }
+    }
     Ok(())
 }
 
@@ -241,7 +292,7 @@ fn lpos(db: &Db, args: Args<'_>, out: &mut Out) -> Result<()> {
 /// The keys are tried in the order they were sent and the first one holding
 /// anything is the one that is popped, which is the whole point of the command:
 /// one round trip instead of a `LLEN` per key followed by an `LPOP`.
-fn mpop(db: &Db, args: Args<'_>, out: &mut Out) -> Result<()> {
+fn mpop(db: &Db, on: usize, args: Args<'_>, out: &mut Out) -> Result<()> {
     let numkeys = match args.int(1) {
         Ok(n) if n > 0 => usize::try_from(n).unwrap_or(usize::MAX),
         _ => return Err(Error::new(Code::Invalid, BAD_NUMKEYS)),
@@ -285,7 +336,12 @@ fn mpop(db: &Db, args: Args<'_>, out: &mut Out) -> Result<()> {
         out.bulk(key);
         let mark = out.len();
         let n = stripe.pop_into(key, end, want, |e| element(out, e))?;
+        let empty = notify::armed() && stripe.llen(key)? == 0;
         out.close_array(mark, n);
+        notify::fire(on, class::LIST, popped(end), key);
+        if empty {
+            notify::fire(on, class::GENERIC, "del", key);
+        }
         return Ok(());
     }
     // A null array and not a null, even though the reply that would have been
@@ -296,12 +352,30 @@ fn mpop(db: &Db, args: Args<'_>, out: &mut Out) -> Result<()> {
 }
 
 /// `LMOVE` and `RPOPLPUSH`, which are the same command.
-fn moved(db: &Db, src: &[u8], dst: &[u8], from: End, to: End, out: &mut Out) -> Result<()> {
+fn moved(
+    db: &Db,
+    on: usize,
+    src: &[u8],
+    dst: &[u8],
+    from: End,
+    to: End,
+    out: &mut Out,
+) -> Result<()> {
     // The element is written from inside the move rather than answered by it,
     // because what it is borrowed from is a stripe that is still held while the
     // reply is being written and is let go of straight after.
     if !db.lmove(src, dst, from, to, |v| out.bulk(v))? {
         out.nil();
+        return Ok(());
+    }
+    // The push before the pop, which is the order Redis fires them in and not
+    // the order the command reads in. A move onto itself gets both events on
+    // the one key and cannot empty it, since what came off one end went back on
+    // the other.
+    notify::fire(on, class::LIST, pushed(to), dst);
+    notify::fire(on, class::LIST, popped(from), src);
+    if src != dst {
+        notify::emptied(db, on, src);
     }
     Ok(())
 }
@@ -324,24 +398,36 @@ fn moved(db: &Db, src: &[u8], dst: &[u8], from: End, to: End, out: &mut Out) -> 
 /// have sent is one element, and `LMOVEM` answers `*-1` because what it would
 /// have sent is an array, which is the same rule that makes `LPOP k` a `$-1` and
 /// `LPOP k 2` a `*-1`. Read off the wire rather than off a client.
-fn movem(db: &Db, args: Args<'_>, out: &mut Out) -> Result<()> {
+fn movem(db: &Db, on: usize, args: Args<'_>, out: &mut Out) -> Result<()> {
     let from = end_of(args.get(3))?;
     let to = end_of(args.get(4))?;
     let block = movem_options(args, 5, from, to)?;
+    let (src, dst) = (args.get(1), args.get(2));
     // Written before the header for the same reason the set algebra's are: how
     // many moved is what the move produced, and an `EXACTLY` that came up short
     // produces none of them.
     let start = out.len();
     let mut n = 0;
-    db.lmovem(args.get(1), args.get(2), block, |v| {
+    db.lmovem(src, dst, block, |v| {
         out.bulk(v);
         n += 1;
     })?;
     if n == 0 {
         out.nil_array();
-    } else {
-        out.close_array(start, n);
+        return Ok(());
     }
+    out.close_array(start, n);
+    // A block move onto itself says the pop first and the push second, which is
+    // the other way round from every other move, and it is 8.10.1's order
+    // rather than a slip here.
+    if src == dst {
+        notify::fire(on, class::LIST, popped(from), src);
+        notify::fire(on, class::LIST, pushed(to), src);
+        return Ok(());
+    }
+    notify::fire(on, class::LIST, pushed(to), dst);
+    notify::fire(on, class::LIST, popped(from), src);
+    notify::emptied(db, on, src);
     Ok(())
 }
 
@@ -394,6 +480,35 @@ pub(super) fn movem_options(args: Args<'_>, at: usize, from: End, to: End) -> Re
         exactly,
         order,
     })
+}
+
+/// What a push onto this end is called.
+pub(super) const fn pushed(end: End) -> &'static str {
+    match end {
+        End::Left => "lpush",
+        End::Right => "rpush",
+    }
+}
+
+/// What a pop off this end is called.
+pub(super) const fn popped(end: End) -> &'static str {
+    match end {
+        End::Left => "lpop",
+        End::Right => "rpop",
+    }
+}
+
+/// Which end the four push names mean, read off the letter in front.
+///
+/// `LPUSH` and `LPUSHX` are the same end and so are the two on the right, so the
+/// first byte is the whole of the answer and the table has already made sure it
+/// is one of the four.
+fn end_of_name(name: &str) -> End {
+    if name.as_bytes()[0] == b'l' {
+        End::Left
+    } else {
+        End::Right
+    }
 }
 
 /// `LEFT` or `RIGHT`, and a syntax error for anything else.

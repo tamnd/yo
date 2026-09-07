@@ -54,6 +54,8 @@
 
 use std::cell::{Cell, RefCell};
 
+use yo_kv::Db;
+
 use super::Server;
 use super::pubsub::{self, Kind};
 
@@ -275,6 +277,19 @@ pub(super) fn arm(server: &Server) -> u32 {
 /// so it is worth not paying for it on a server nobody is subscribed to.
 pub(crate) fn armed() -> bool {
     ARMED.get() != 0
+}
+
+/// The `del` that follows a removal which took the last of a collection.
+///
+/// A list, set, hash or sorted set with nothing in it is not a key, so a pop, a
+/// trim or a removal that took everything leaves the key gone, and Redis says so
+/// on the generic class straight after saying what it did. Whether the key is
+/// still there costs a stripe lock to ask, so it is asked only when somebody is
+/// listening for the answer.
+pub(crate) fn emptied(db: &Db, on: usize, key: &[u8]) {
+    if armed() && !db.hold(key).exists(key) {
+        fire(on, class::GENERIC, "del", key);
+    }
 }
 
 /// Say that something happened to a key.

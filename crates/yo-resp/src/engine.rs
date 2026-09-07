@@ -1886,6 +1886,113 @@ mod tests {
         );
     }
 
+    /// A subscriber on every event, and the writer that will make them.
+    ///
+    /// The three collection tests below all start the same way and all care
+    /// about the order of what came out rather than about the bytes, so the
+    /// setup is here once and the checking is done by [`fired`].
+    fn watching() -> (Reactor<Wire<Recorder>>, ConnId, ConnId, Vec<Cmd>) {
+        let (mut r, sub, mut batch) = engine();
+        let writer = r.engine_mut().accept();
+        r.engine_mut().feed(
+            writer,
+            &wire(&[b"CONFIG", b"SET", b"notify-keyspace-events", b"EA"]),
+        );
+        r.engine_mut()
+            .feed(sub, &wire(&[b"PSUBSCRIBE", b"__keyevent@0__:*"]));
+        pump(&mut r, &mut batch);
+        r.engine_mut().sink_mut().clear();
+        (r, sub, writer, batch)
+    }
+
+    /// The event and key of every notification the subscriber has been sent.
+    ///
+    /// Written against the wire bytes because that is what the subscriber
+    /// actually got, and a command that fires four events in a fixed order
+    /// makes for a byte literal nobody can read.
+    fn fired(r: &Reactor<Wire<Recorder>>, sub: ConnId) -> Vec<(String, String)> {
+        let sent = String::from_utf8_lossy(r.engine().sink().sent(sub)).into_owned();
+        let mut out = Vec::new();
+        let mut parts = sent.split("\r\n");
+        while let Some(p) = parts.next() {
+            let Some(event) = p.strip_prefix("__keyevent@0__:") else {
+                continue;
+            };
+            // The pattern itself comes past on every frame ahead of the channel
+            // and is not one of these.
+            if event == "*" {
+                continue;
+            }
+            parts.next();
+            let key = parts.next().unwrap_or_default();
+            out.push((event.to_owned(), key.to_owned()));
+        }
+        out
+    }
+
+    /// A pop that took the last of a list says what it did and then that the
+    /// key is gone, because a list with nothing in it is not a key.
+    #[test]
+    fn taking_the_last_of_a_collection_says_the_key_went_with_it() {
+        let (mut r, sub, writer, mut batch) = watching();
+
+        r.engine_mut().feed(writer, &wire(&[b"RPUSH", b"k", b"a"]));
+        r.engine_mut().feed(writer, &wire(&[b"LPOP", b"k"]));
+        pump(&mut r, &mut batch);
+        assert_eq!(
+            fired(&r, sub),
+            [("rpush", "k"), ("lpop", "k"), ("del", "k")]
+                .map(|(e, k)| (e.to_owned(), k.to_owned()))
+        );
+    }
+
+    /// A move whose destination already holds the member says only the half
+    /// that happened, since there was nothing to add on the far side.
+    #[test]
+    fn a_move_onto_a_member_already_there_says_only_the_removal() {
+        let (mut r, sub, writer, mut batch) = watching();
+
+        r.engine_mut().feed(writer, &wire(&[b"SADD", b"a", b"m"]));
+        r.engine_mut()
+            .feed(writer, &wire(&[b"SADD", b"b", b"m", b"n"]));
+        pump(&mut r, &mut batch);
+        r.engine_mut().sink_mut().clear();
+
+        r.engine_mut()
+            .feed(writer, &wire(&[b"SMOVE", b"a", b"b", b"m"]));
+        pump(&mut r, &mut batch);
+        assert_eq!(
+            fired(&r, sub),
+            [("srem", "a"), ("del", "a")].map(|(e, k)| (e.to_owned(), k.to_owned()))
+        );
+    }
+
+    /// Writing a member the score it is already sitting at is not a write, and
+    /// the reply says as much about it as the silence does.
+    #[test]
+    fn a_score_that_did_not_move_says_nothing() {
+        let (mut r, sub, writer, mut batch) = watching();
+
+        r.engine_mut()
+            .feed(writer, &wire(&[b"ZADD", b"z", b"4", b"m"]));
+        pump(&mut r, &mut batch);
+        r.engine_mut().sink_mut().clear();
+
+        r.engine_mut()
+            .feed(writer, &wire(&[b"ZADD", b"z", b"4", b"m"]));
+        r.engine_mut()
+            .feed(writer, &wire(&[b"ZINCRBY", b"z", b"0", b"m"]));
+        pump(&mut r, &mut batch);
+        assert_eq!(fired(&r, sub), []);
+
+        // And one that does move says so, so the silence above is the score
+        // and not the subscriber having gone away.
+        r.engine_mut()
+            .feed(writer, &wire(&[b"ZINCRBY", b"z", b"1", b"m"]));
+        pump(&mut r, &mut batch);
+        assert_eq!(fired(&r, sub), [("zincr".to_owned(), "z".to_owned())]);
+    }
+
     /// Inside a transaction each command's notifications go out before the
     /// next command runs, so `EXEC` does not bunch them all up at the end.
     #[test]

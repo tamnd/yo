@@ -48,7 +48,8 @@ use yo_common::{Code, Error, Result, num};
 use yo_kv::{Db, End, Entry, Member, Movem, ZEnd};
 
 use super::args::{self, Args, NOT_AN_INT};
-use super::lists::{BAD_MPOP_COUNT, BAD_NUMKEYS, end_of, movem_options};
+use super::lists::{self, BAD_MPOP_COUNT, BAD_NUMKEYS, end_of, movem_options};
+use super::notify::{self, class};
 use super::streams;
 use super::table::Spec;
 use super::zsets;
@@ -109,7 +110,7 @@ pub(super) fn execute(
         let db = session.db();
         let want = streams::parse_read(spec.name, args, server.striped(db), now)?;
         let block = Block::xread(want.keys, want.reads);
-        if block.now(server.striped(db), now, out)? {
+        if block.now(server.striped(db), db, now, out)? {
             return Ok(Flow::Continue);
         }
         // A script is the other way there is nothing to wait for. It cannot
@@ -192,7 +193,7 @@ pub(super) fn execute(
     };
 
     let db = session.db();
-    if block.now(server.striped(db), now, out)? {
+    if block.now(server.striped(db), db, now, out)? {
         return Ok(Flow::Continue);
     }
     // Called from a script, so there is nobody left to deliver what it is
@@ -393,6 +394,7 @@ impl Want {
         &self,
         keys: &[Vec<u8>],
         db: &Db,
+        on: usize,
         now: u64,
         out: &mut Out,
         strict: bool,
@@ -410,6 +412,8 @@ impl Want {
                     out.array(2);
                     out.bulk(key);
                     db.hold(key).pop_into(key, *end, 1, |e| element(out, e))?;
+                    notify::fire(on, class::LIST, lists::popped(*end), key);
+                    notify::emptied(db, on, key);
                     return Ok(true);
                 }
                 Ok(false)
@@ -426,6 +430,8 @@ impl Want {
                         .hold(key)
                         .pop_into(key, *end, *count, |e| element(out, e))?;
                     out.close_array(mark, n);
+                    notify::fire(on, class::LIST, lists::popped(*end), key);
+                    notify::emptied(db, on, key);
                     return Ok(true);
                 }
                 Ok(false)
@@ -444,6 +450,8 @@ impl Want {
                         member(out, m);
                         out.double(sc);
                     })?;
+                    notify::fire(on, class::ZSET, zsets::popped(*end), key);
+                    notify::emptied(db, on, key);
                     return Ok(true);
                 }
                 Ok(false)
@@ -462,6 +470,8 @@ impl Want {
                         out.double(sc);
                     })?;
                     out.close_array(mark, n);
+                    notify::fire(on, class::ZSET, zsets::popped(*end), key);
+                    notify::emptied(db, on, key);
                     return Ok(true);
                 }
                 Ok(false)
@@ -477,7 +487,16 @@ impl Want {
                     return Ok(false);
                 }
                 match db.lmove(src, dst, *from, *to, |v| out.bulk(v)) {
-                    Ok(true) => Ok(true),
+                    Ok(true) => {
+                        // The same two events `LMOVE` says, in the same order,
+                        // because this is `LMOVE` arriving late.
+                        notify::fire(on, class::LIST, lists::pushed(*to), dst);
+                        notify::fire(on, class::LIST, lists::popped(*from), src);
+                        if src != dst {
+                            notify::emptied(db, on, src);
+                        }
+                        Ok(true)
+                    }
                     // The source had something in it a line ago and this is the
                     // only thread that could have taken it.
                     Ok(false) => Ok(false),
@@ -524,6 +543,14 @@ impl Want {
                     }
                 }
                 out.close_array(mark, n);
+                if src == dst {
+                    notify::fire(on, class::LIST, lists::popped(mv.from), src);
+                    notify::fire(on, class::LIST, lists::pushed(mv.to), src);
+                } else {
+                    notify::fire(on, class::LIST, lists::pushed(mv.to), dst);
+                    notify::fire(on, class::LIST, lists::popped(mv.from), src);
+                    notify::emptied(db, on, src);
+                }
                 Ok(true)
             }
         }
@@ -641,8 +668,8 @@ impl Block {
     /// # Errors
     ///
     /// A key of another type, which is an error rather than a wait.
-    fn now(&self, db: &Db, now: u64, out: &mut Out) -> Result<bool> {
-        self.want.attempt(&self.keys, db, now, out, true)
+    fn now(&self, db: &Db, on: usize, now: u64, out: &mut Out) -> Result<bool> {
+        self.want.attempt(&self.keys, db, on, now, out, true)
     }
 
     /// `XREAD BLOCK` and `XREADGROUP BLOCK`, whose keys and IDs were read
@@ -804,7 +831,7 @@ impl Waiters {
     fn try_serve(&self, at: usize, dbs: &[Db], now: u64, out: &mut Out) -> bool {
         let w = &self.list[at];
         let mark = out.len();
-        match w.want.attempt(&w.keys, &dbs[w.db], now, out, false) {
+        match w.want.attempt(&w.keys, &dbs[w.db], w.db, now, out, false) {
             Ok(true) => return true,
             Ok(false) => {}
             // `strict` is off, so nothing in there returns an error today.
@@ -928,6 +955,14 @@ impl Server {
         // outside `execute` so nothing else has marked the database for the
         // maintenance turn.
         self.mine().mark(1u64 << list.db_of(at));
-        list.try_serve(at, &self.dbs, now, out)
+        // Armed here for the same reason, and it is the one place outside the
+        // funnel that has to do it. A pop that answers a parked client is a pop
+        // and says so, and the client whose push woke it has long since had its
+        // own events published.
+        let armed = notify::arm(self);
+        let done = list.try_serve(at, &self.dbs, now, out);
+        drop(list);
+        notify::drain(self, armed);
+        done
     }
 }
