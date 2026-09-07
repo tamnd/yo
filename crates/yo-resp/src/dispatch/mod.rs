@@ -1781,6 +1781,15 @@ pub struct Session {
     /// that was queued: `MULTI`, `SUBSCRIBE z`, `GET x`, `EXEC` runs the `GET`
     /// on 8.10.1 even though sending it on its own would have been refused.
     running: bool,
+    /// The buffer `EXEC` decodes the queued commands through.
+    ///
+    /// It lives here rather than in `exec` so that its capacity survives the
+    /// transaction. A fresh one has no room for spans, so the first command of
+    /// every transaction would allocate, and a client that runs transactions in
+    /// a loop would be allocating on a command path forever. Everywhere else
+    /// the buffer belongs to the connection already and the same reserve is
+    /// free after the first command.
+    replay: crate::request::Argv,
     /// What this connection has subscribed to, `None` until it subscribes to
     /// anything.
     ///
@@ -1805,6 +1814,7 @@ impl Session {
             multi: None,
             watching: Vec::new(),
             running: false,
+            replay: crate::request::Argv::new(),
             subs: None,
         }
     }

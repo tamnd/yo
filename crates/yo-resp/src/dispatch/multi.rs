@@ -60,7 +60,6 @@ use super::table::Spec;
 use super::{Args, Flow, Server, Session, resolved, write_error};
 use crate::proto::Limits;
 use crate::reply::Out;
-use crate::request::Argv;
 use yo_common::{Code, Error, Result};
 
 /// The six commands `MULTI` does not queue.
@@ -351,7 +350,11 @@ fn exec(server: &Server, session: &mut Session, out: &mut Out) -> Flow {
     }
     out.array(queue.len());
     let limits = Limits::default();
-    let mut argv = Argv::new();
+    // Taken out of the session rather than made here, so that the room it has
+    // for spans outlives the transaction and only the first `EXEC` on a
+    // connection pays for it. It is taken rather than borrowed because the
+    // arguments are read out of it while `resolved` is holding the session.
+    let mut argv = std::mem::take(&mut session.replay);
     let mut flow = Flow::Continue;
     // Nothing else may run against the databases between the first of these and
     // the last, which on a server with one shard thread is true because there is
@@ -378,6 +381,7 @@ fn exec(server: &Server, session: &mut Session, out: &mut Out) -> Flow {
         }
     }
     session.running = was;
+    session.replay = argv;
     flow
 }
 
