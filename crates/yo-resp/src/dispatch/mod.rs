@@ -1781,6 +1781,15 @@ pub struct Session {
     /// that was queued: `MULTI`, `SUBSCRIBE z`, `GET x`, `EXEC` runs the `GET`
     /// on 8.10.1 even though sending it on its own would have been refused.
     running: bool,
+    /// The buffer `EXEC` decodes the queued commands through.
+    ///
+    /// It lives here rather than in `exec` so that its capacity survives the
+    /// transaction. A fresh one has no room for spans, so the first command of
+    /// every transaction would allocate, and a client that runs transactions in
+    /// a loop would be allocating on a command path forever. Everywhere else
+    /// the buffer belongs to the connection already and the same reserve is
+    /// free after the first command.
+    replay: crate::request::Argv,
     /// What this connection has subscribed to, `None` until it subscribes to
     /// anything.
     ///
@@ -1805,6 +1814,7 @@ impl Session {
             multi: None,
             watching: Vec::new(),
             running: false,
+            replay: crate::request::Argv::new(),
             subs: None,
         }
     }
@@ -2406,6 +2416,32 @@ mod tests {
         assert_eq!(f.other(&[b"GET", b"k"]), "$-1\r\n");
         assert_eq!(f.run(&[b"EXEC"]), "*2\r\n+OK\r\n:2\r\n");
         assert_eq!(f.run(&[b"GET", b"k"]), "$1\r\n2\r\n");
+    }
+
+    /// The test the `high_water` claim in `multi::exec` asks for.
+    ///
+    /// A `Vec` reaches the allocator exactly when its capacity changes, so a
+    /// replay buffer whose room is the same before and after is one that did
+    /// not allocate. The first transaction is what sets the room, which is the
+    /// high water mark, and the second is the one that has to be free. Before
+    /// the buffer moved onto the session this failed on every transaction,
+    /// because `exec` made a new one each time and the room went back to zero.
+    #[test]
+    fn the_second_exec_of_a_shape_does_not_grow_the_buffer() {
+        let mut f = Fixture::new();
+        for _ in 0..2 {
+            f.run(&[b"MULTI"]);
+            f.run(&[b"SET", b"k", b"1"]);
+            f.run(&[b"INCR", b"k"]);
+            f.run(&[b"EXEC"]);
+        }
+        let room = f.session.replay.room();
+        assert!(room > 0, "the first transaction should have set the room");
+        f.run(&[b"MULTI"]);
+        f.run(&[b"SET", b"k", b"1"]);
+        f.run(&[b"INCR", b"k"]);
+        f.run(&[b"EXEC"]);
+        assert_eq!(f.session.replay.room(), room);
     }
 
     #[test]

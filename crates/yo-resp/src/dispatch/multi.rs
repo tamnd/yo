@@ -60,7 +60,6 @@ use super::table::Spec;
 use super::{Args, Flow, Server, Session, resolved, write_error};
 use crate::proto::Limits;
 use crate::reply::Out;
-use crate::request::Argv;
 use yo_common::{Code, Error, Result};
 
 /// The six commands `MULTI` does not queue.
@@ -351,7 +350,11 @@ fn exec(server: &Server, session: &mut Session, out: &mut Out) -> Flow {
     }
     out.array(queue.len());
     let limits = Limits::default();
-    let mut argv = Argv::new();
+    // Taken out of the session rather than made here, so that the room it has
+    // for spans outlives the transaction and only the first `EXEC` on a
+    // connection pays for it. It is taken rather than borrowed because the
+    // arguments are read out of it while `resolved` is holding the session.
+    let mut argv = std::mem::take(&mut session.replay);
     let mut flow = Flow::Continue;
     // Nothing else may run against the databases between the first of these and
     // the last, which on a server with one shard thread is true because there is
@@ -364,7 +367,13 @@ fn exec(server: &Server, session: &mut Session, out: &mut Out) -> Flow {
     let was = session.running;
     session.running = true;
     for wire in &queue.cmds {
-        if argv.decode(wire, &limits).is_err() {
+        // `yo_alloc::high_water` because the spans grow to the widest command
+        // this connection has ever queued and then stop. That claim is only
+        // true because the buffer lives on the session: made here it would have
+        // grown once per transaction forever, which is a command path
+        // allocating and not a high water mark. `the_second_exec_of_a_shape_
+        // does_not_grow_the_buffer` is the test the claim asks for.
+        if yo_alloc::high_water(|| argv.decode(wire, &limits)).is_err() {
             // Unreachable: these bytes were built here from a command that had
             // already been decoded once. An element still has to go in the
             // array, because the length is already written.
@@ -378,6 +387,7 @@ fn exec(server: &Server, session: &mut Session, out: &mut Out) -> Flow {
         }
     }
     session.running = was;
+    session.replay = argv;
     flow
 }
 
