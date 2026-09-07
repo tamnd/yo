@@ -2032,7 +2032,7 @@ pub fn resolved(
             }
             "set" => {
                 let db = session.db;
-                sets::execute(&server.dbs[db], spec, args, out).map(|()| Flow::Continue)
+                sets::execute(&server.dbs[db], db, spec, args, out).map(|()| Flow::Continue)
             }
             // The one hash command whose state is not in the keyspace. A
             // fieldset belongs to the connection, so this is handed the session
@@ -2057,11 +2057,11 @@ pub fn resolved(
             }
             "list" => {
                 let db = session.db;
-                lists::execute(&server.dbs[db], spec, args, out).map(|()| Flow::Continue)
+                lists::execute(&server.dbs[db], db, spec, args, out).map(|()| Flow::Continue)
             }
             "zset" => {
                 let db = session.db;
-                zsets::execute(&server.dbs[db], spec, args, out).map(|()| Flow::Continue)
+                zsets::execute(&server.dbs[db], db, spec, args, out).map(|()| Flow::Continue)
             }
             // A geo key is a sorted set and these are sorted set commands with
             // arithmetic on the way in and on the way out, so a client can ZREM

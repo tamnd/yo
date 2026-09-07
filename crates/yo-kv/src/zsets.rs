@@ -247,6 +247,27 @@ impl Keyspace {
     where
         I: Iterator<Item = (f64, &'m [u8])> + Clone,
     {
+        let (added, changed) = self.zadd_counts(key, pairs, opts)?;
+        Ok(if opts.changed { added + changed } else { added })
+    }
+
+    /// The same write, with both halves of the count kept apart.
+    ///
+    /// `CH` folds the two together and the reply only ever wants one number, so
+    /// [`Keyspace::zadd`] is this with the fold applied. The wire layer wants
+    /// them apart because a keyspace notification goes out when anything at all
+    /// happened, which is a different question from the one the reply answers:
+    /// `ZADD k 5 m` on a member already sitting at four says one either way, and
+    /// `ZADD k 4 m` says zero and still counts as a write.
+    ///
+    /// # Errors
+    ///
+    /// A member too long for the limit and a score that is not a number, both
+    /// checked across every pair before the first one is stored.
+    pub fn zadd_counts<'m, I>(&mut self, key: &[u8], pairs: I, opts: ZAdd) -> Result<(usize, usize)>
+    where
+        I: Iterator<Item = (f64, &'m [u8])> + Clone,
+    {
         for (score, m) in pairs.clone() {
             strings::check_len(key, m.len())?;
             if score.is_nan() {
@@ -262,7 +283,7 @@ impl Keyspace {
                 // embedded API has no parser in front of it and an empty sorted
                 // set left behind would be a key that exists and holds nothing.
                 if opts.gate == Gate::IfPresent || pairs.clone().next().is_none() {
-                    return Ok(0);
+                    return Ok((0, 0));
                 }
                 self.new_zset(key)
             }
@@ -295,7 +316,7 @@ impl Keyspace {
         if z.is_empty() {
             self.drop_key(key);
         }
-        Ok(if opts.changed { added + changed } else { added })
+        Ok((added, changed))
     }
 
     /// `ZADD key ... INCR score member`, and `ZINCRBY key increment member`.

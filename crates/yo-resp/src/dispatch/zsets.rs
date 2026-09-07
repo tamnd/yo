@@ -46,12 +46,14 @@
 //! one place in this group where the two protocols disagree about the shape of
 //! a reply rather than the type of one value in it.
 
+use yo_common::lock::Held;
 use yo_common::num::DIGITS_MAX;
 use yo_common::num::i64_digits;
 use yo_common::{Error, Result, glob_matches, parse_i64};
 use yo_kv::{Aggregate, Db, Member, Query, ZAdd, ZBound, ZEnd, ZOp};
 
 use super::args::{self, Args};
+use super::notify::{self, class};
 use super::scan;
 use super::table::Spec;
 use crate::reply::Out;
@@ -96,19 +98,30 @@ pub(super) const BAD_MPOP_COUNT: &str = "count should be greater than 0";
 ///
 /// A key holding something that is not a sorted set, an option where one was
 /// not expected, and the three number errors above.
-pub(super) fn execute(db: &Db, spec: &Spec, args: Args<'_>, out: &mut Out) -> Result<()> {
+pub(super) fn execute(
+    db: &Db,
+    on: usize,
+    spec: &Spec,
+    args: Args<'_>,
+    out: &mut Out,
+) -> Result<()> {
     match spec.name {
-        "zadd" => zadd(db, args, out)?,
+        "zadd" => zadd(db, on, args, out)?,
         "zincrby" => {
             let by = score(args.get(2))?;
-            let key = args.get(1);
+            let (key, m) = (args.get(1), args.get(3));
+            let mut stripe = db.hold(key);
+            let before = moved_from(&mut stripe, key, m)?;
             // Never nil, because `ZINCRBY` has no gate to refuse it, so the
             // `None` this cannot produce would be a bug rather than an answer.
-            let now = db
-                .hold(key)
-                .zincrby(key, args.get(3), by, ZAdd::default())?
+            let now = stripe
+                .zincrby(key, m, by, ZAdd::default())?
                 .expect("ZINCRBY has no gate that can refuse a member");
+            drop(stripe);
             out.double(now);
+            if before != Some(now) {
+                notify::fire(on, class::ZSET, "zincr", key);
+            }
         }
         "zcard" => {
             let key = args.get(1);
@@ -139,7 +152,12 @@ pub(super) fn execute(db: &Db, spec: &Spec, args: Args<'_>, out: &mut Out) -> Re
         }
         "zrem" => {
             let key = args.get(1);
-            out.int(count(db.hold(key).zrem(key, members(args))?));
+            let gone = db.hold(key).zrem(key, members(args))?;
+            out.int(count(gone));
+            if gone > 0 {
+                notify::fire(on, class::ZSET, "zrem", key);
+                notify::emptied(db, on, key);
+            }
         }
         "zrank" | "zrevrank" => rank(db, spec.name == "zrevrank", args, out)?,
         "zcount" => {
@@ -182,25 +200,37 @@ pub(super) fn execute(db: &Db, spec: &Spec, args: Args<'_>, out: &mut Out) -> Re
         // The same parse, with the destination in front and no WITHSCORES.
         "zrangestore" => {
             let (q, _) = parse_range(Form::Store, args, 2)?;
-            out.int(count(db.zrangestore(args.get(1), args.get(2), &q)?));
+            let dst = args.get(1);
+            // As `SORT ... STORE` does it: an empty range deletes whatever was
+            // under the destination and says so, and whether there was anything
+            // to delete costs a stripe lock to ask.
+            let had = notify::armed() && db.hold(dst).exists(dst);
+            let stored = db.zrangestore(dst, args.get(2), &q)?;
+            out.int(count(stored));
+            if stored > 0 {
+                notify::fire(on, class::ZSET, "zrangestore", dst);
+            } else if had {
+                notify::fire(on, class::GENERIC, "del", dst);
+            }
         }
         // And the same parse again with the walk turned into a removal. These
         // three have their by-mode in the name and take no options at all, so
         // the arity check has already done the whole of the syntax.
-        "zremrangebyrank" => {
-            let q = Query::rank(args.int(2)?, args.int(3)?);
+        "zremrangebyrank" | "zremrangebyscore" | "zremrangebylex" => {
+            let q = match spec.name {
+                "zremrangebyrank" => Query::rank(args.int(2)?, args.int(3)?),
+                "zremrangebyscore" => Query::score(bound(args.get(2))?, bound(args.get(3))?),
+                _ => Query::lex(lex(args.get(2))?, lex(args.get(3))?),
+            };
             let key = args.get(1);
-            out.int(count(db.hold(key).zremrange(key, &q)?));
-        }
-        "zremrangebyscore" => {
-            let q = Query::score(bound(args.get(2))?, bound(args.get(3))?);
-            let key = args.get(1);
-            out.int(count(db.hold(key).zremrange(key, &q)?));
-        }
-        "zremrangebylex" => {
-            let q = Query::lex(lex(args.get(2))?, lex(args.get(3))?);
-            let key = args.get(1);
-            out.int(count(db.hold(key).zremrange(key, &q)?));
+            let gone = db.hold(key).zremrange(key, &q)?;
+            out.int(count(gone));
+            // Each of the three says its own name, which is the command's, and
+            // a range that matched nothing says nothing at all.
+            if gone > 0 {
+                notify::fire(on, class::ZSET, spec.name, key);
+                notify::emptied(db, on, key);
+            }
         }
         // The algebra. The three that answer members write them before their
         // own header, the same way SINTER does: the count is what the walk
@@ -230,14 +260,21 @@ pub(super) fn execute(db: &Db, spec: &Spec, args: Args<'_>, out: &mut Out) -> Re
         "zunionstore" | "zinterstore" | "zdiffstore" => {
             let op = op_of(spec.name);
             let a = Algebra::parse(spec.name, op, args, 2, Scores::Refused)?;
-            let got = db.zsetop_store(op, args.get(1), a.keys(args), &a.weights, a.agg)?;
+            let dst = args.get(1);
+            let had = notify::armed() && db.hold(dst).exists(dst);
+            let got = db.zsetop_store(op, dst, a.keys(args), &a.weights, a.agg)?;
             out.int(count(got));
+            if got > 0 {
+                notify::fire(on, class::ZSET, spec.name, dst);
+            } else if had {
+                notify::fire(on, class::GENERIC, "del", dst);
+            }
         }
         "zintercard" => out.int(count(intercard(db, args)?)),
         "zrandmember" => randmember(db, args, out)?,
         "zscan" => zscan(db, args, out)?,
-        "zpopmin" | "zpopmax" => pop(db, end_of_name(spec.name), args, out)?,
-        "zmpop" => mpop(db, args, out)?,
+        "zpopmin" | "zpopmax" => pop(db, on, spec.name, end_of_name(spec.name), args, out)?,
+        "zmpop" => mpop(db, on, args, out)?,
         // The table and this match are checked against each other by
         // `cargo xtask check`, so a name reaching here is a table row without a
         // handler and there is nothing sensible to answer.
@@ -257,7 +294,7 @@ pub(super) fn execute(db: &Db, spec: &Spec, args: Args<'_>, out: &mut Out) -> Re
 /// The scores are parsed before anything is written, all of them, so
 /// `ZADD key 1 a nonsense b` adds nothing at all. Redis does the same and it is
 /// the only behaviour that makes the command safe to retry.
-fn zadd(db: &Db, args: Args<'_>, out: &mut Out) -> Result<()> {
+fn zadd(db: &Db, on: usize, args: Args<'_>, out: &mut Out) -> Result<()> {
     let (mut nx, mut xx, mut gt, mut lt, mut incr) = (false, false, false, false, false);
     let mut opts = ZAdd::default();
     let mut at = 2;
@@ -318,27 +355,64 @@ fn zadd(db: &Db, args: Args<'_>, out: &mut Out) -> Result<()> {
     }
     let key = args.get(1);
     if incr {
-        return match db
-            .hold(key)
-            .zincrby(key, args.get(at + 1), score(args.get(at))?, opts)?
-        {
+        let m = args.get(at + 1);
+        let mut stripe = db.hold(key);
+        let before = moved_from(&mut stripe, key, m)?;
+        let done = stripe.zincrby(key, m, score(args.get(at))?, opts)?;
+        drop(stripe);
+        match done {
             Some(now) => {
                 out.double(now);
-                Ok(())
+                // A score that came out where it went in is a gate that said no
+                // or an increment of nothing, and neither is a write. `INCR`
+                // has its own event name, which is the one place a command and
+                // the event it fires do not share a name.
+                if before != Some(now) {
+                    notify::fire(on, class::ZSET, "zincr", key);
+                }
             }
             // A gate refused it. Redis answers the string nil here and not the
             // array one, because the reply this is standing in for is a score.
-            None => {
-                out.nil();
-                Ok(())
-            }
-        };
+            None => out.nil(),
+        }
+        return Ok(());
     }
     let pairs = (at..args.len())
         .step_by(2)
         .map(|i| (score(args.get(i)).unwrap_or(0.0), args.get(i + 1)));
-    out.int(count(db.hold(key).zadd(key, pairs, opts)?));
+    // Both halves of the count, because the reply wants one of them and the
+    // notification wants to know whether either was more than nothing. `ZADD k
+    // 4 m` on a member already at four is neither, and says nothing.
+    let (added, changed) = db.hold(key).zadd_counts(key, pairs, opts)?;
+    out.int(count(if opts.changed { added + changed } else { added }));
+    if added + changed > 0 {
+        notify::fire(on, class::ZSET, "zadd", key);
+    }
     Ok(())
+}
+
+/// The score a member is sitting at now, when anybody is listening.
+///
+/// `ZINCRBY` and `ZADD INCR` both answer the score they ended up with, and that
+/// is not enough to know whether anything moved: an increment of zero, and a
+/// `GT` or `LT` that did not apply, both come back with a score and change
+/// nothing. Redis says nothing in either case, so the score before the write is
+/// what the two are compared against, and it is only looked up when there is
+/// somebody to tell.
+///
+/// # Errors
+///
+/// A key holding something that is not a sorted set, which the write behind
+/// this would say the same thing about.
+fn moved_from(
+    stripe: &mut Held<'_, yo_kv::Keyspace>,
+    key: &[u8],
+    member: &[u8],
+) -> Result<Option<f64>> {
+    if !notify::armed() {
+        return Ok(None);
+    }
+    stripe.zscore(key, member)
 }
 
 /// `ZRANK key member [WITHSCORE]` and `ZREVRANK`.
@@ -803,7 +877,14 @@ fn zscan(db: &Db, args: Args<'_>, out: &mut Out) -> Result<()> {
 /// A count that is not a whole number at least zero is the range error and not
 /// the usual complaint about integers, so `ZPOPMIN key x` and `ZPOPMIN key -1`
 /// give the same answer.
-fn pop(db: &Db, end: ZEnd, args: Args<'_>, out: &mut Out) -> Result<()> {
+fn pop(
+    db: &Db,
+    on: usize,
+    name: &'static str,
+    end: ZEnd,
+    args: Args<'_>,
+    out: &mut Out,
+) -> Result<()> {
     let want = match args.len() {
         2 => None,
         3 => match args.int(2) {
@@ -828,6 +909,10 @@ fn pop(db: &Db, end: ZEnd, args: Args<'_>, out: &mut Out) -> Result<()> {
     // form with one is as many pairs as were popped, which is that many elements
     // nested and twice that many flat.
     out.close_array(start, if nested { n } else { n * 2 });
+    if n > 0 {
+        notify::fire(on, class::ZSET, name, key);
+        notify::emptied(db, on, key);
+    }
     Ok(())
 }
 
@@ -840,7 +925,7 @@ fn pop(db: &Db, end: ZEnd, args: Args<'_>, out: &mut Out) -> Result<()> {
 /// The pairs are nested on both protocols here, unlike [`pop`], because the
 /// reply already has a key name in front of them and there is nothing left to
 /// flatten into.
-fn mpop(db: &Db, args: Args<'_>, out: &mut Out) -> Result<()> {
+fn mpop(db: &Db, on: usize, args: Args<'_>, out: &mut Out) -> Result<()> {
     let (end, from, to, want) = parse_mpop(args, 1)?;
     // Every key at once, as [`super::lists::mpop`] takes them, and for the same
     // reason: the key that answers is the first that had anything in it at one
@@ -866,7 +951,12 @@ fn mpop(db: &Db, args: Args<'_>, out: &mut Out) -> Result<()> {
             write_member(out, m);
             out.double(sc);
         })?;
+        let empty = notify::armed() && stripe.zcard(key)? == 0;
         out.close_array(mark, n);
+        notify::fire(on, class::ZSET, popped(end), key);
+        if empty {
+            notify::fire(on, class::GENERIC, "del", key);
+        }
         return Ok(());
     }
     // A null array and not a null, the same as `LMPOP`, so a RESP2 client sees
@@ -928,6 +1018,14 @@ pub(super) fn end_of_name(name: &str) -> ZEnd {
         ZEnd::Min
     } else {
         ZEnd::Max
+    }
+}
+
+/// What a pop off this end is called, which is the command's own name.
+pub(super) const fn popped(end: ZEnd) -> &'static str {
+    match end {
+        ZEnd::Min => "zpopmin",
+        ZEnd::Max => "zpopmax",
     }
 }
 

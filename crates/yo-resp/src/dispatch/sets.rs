@@ -28,6 +28,7 @@ use yo_common::{Code, Error, Result, glob_matches, parse_i64};
 use yo_kv::{Db, Member};
 
 use super::args::{self, Args};
+use super::notify::{self, class};
 use super::scan;
 use super::table::Spec;
 use crate::reply::Out;
@@ -44,7 +45,13 @@ const TOO_MANY_KEYS: &str = "Number of keys can't be greater than number of args
 const BAD_LIMIT: &str = "LIMIT can't be negative";
 
 /// Run one set command.
-pub(super) fn execute(db: &Db, spec: &Spec, args: Args<'_>, out: &mut Out) -> Result<()> {
+pub(super) fn execute(
+    db: &Db,
+    on: usize,
+    spec: &Spec,
+    args: Args<'_>,
+    out: &mut Out,
+) -> Result<()> {
     // Every single key command finds the stripe its key is on and hands that
     // one keyspace the work, so the key is read out of the arguments once and
     // used twice. The commands that name several keys reach the database
@@ -52,8 +59,23 @@ pub(super) fn execute(db: &Db, spec: &Spec, args: Args<'_>, out: &mut Out) -> Re
     // count rather than a key.
     let key = args.get(1);
     match spec.name {
-        "sadd" => out.int(count(db.hold(key).sadd(key, members(args))?)),
-        "srem" => out.int(count(db.hold(key).srem(key, members(args))?)),
+        "sadd" => {
+            let added = db.hold(key).sadd(key, members(args))?;
+            out.int(count(added));
+            // One event and not one per member, and nothing at all when every
+            // member named was already in there.
+            if added > 0 {
+                notify::fire(on, class::SET, "sadd", key);
+            }
+        }
+        "srem" => {
+            let gone = db.hold(key).srem(key, members(args))?;
+            out.int(count(gone));
+            if gone > 0 {
+                notify::fire(on, class::SET, "srem", key);
+                notify::emptied(db, on, key);
+            }
+        }
         "scard" => out.int(count(db.hold(key).scard(key)?)),
         "sismember" => out.int(i64::from(db.hold(key).sismember(key, args.get(2))?)),
         // The two that want the body more than once go through `with_set`, not
@@ -111,6 +133,10 @@ pub(super) fn execute(db: &Db, spec: &Spec, args: Args<'_>, out: &mut Out) -> Re
                     out.nil();
                 }
                 debug_assert!(out.len() > start, "a reply went out either way");
+                if got {
+                    notify::fire(on, class::SET, "spop", key);
+                    notify::emptied(db, on, key);
+                }
             }
             3 => {
                 let want = pop_count(args.get(2))?;
@@ -121,6 +147,14 @@ pub(super) fn execute(db: &Db, spec: &Spec, args: Args<'_>, out: &mut Out) -> Re
                     n += 1;
                 })?;
                 out.close_set(start, n);
+                // A set that is there is never empty, so nothing drawn means
+                // either a missing key or a count of zero, and neither of those
+                // says anything. A count that took the whole set says `spop`
+                // and then `del`, which is the one draw that says two things.
+                if n > 0 {
+                    notify::fire(on, class::SET, "spop", key);
+                    notify::emptied(db, on, key);
+                }
             }
             _ => return Err(args::syntax()),
         },
@@ -141,7 +175,26 @@ pub(super) fn execute(db: &Db, spec: &Spec, args: Args<'_>, out: &mut Out) -> Re
             }
             _ => return Err(args::syntax()),
         },
-        "smove" => out.int(i64::from(db.smove(key, args.get(2), args.get(3))?)),
+        "smove" => {
+            let (dst, m) = (args.get(2), args.get(3));
+            // A move onto the set the member came from says nothing, because
+            // nothing happened to either set, and it still answers one. Whether
+            // the destination already held the member decides whether there is
+            // a `sadd` to say, and neither question can be answered from what
+            // the move gives back, so both are asked in front of it and only
+            // when somebody is listening.
+            let ask = notify::armed() && key != dst;
+            let had = ask && db.hold(dst).sismember(dst, m).unwrap_or(false);
+            let done = db.smove(key, dst, m)?;
+            out.int(i64::from(done));
+            if done && ask {
+                notify::fire(on, class::SET, "srem", key);
+                notify::emptied(db, on, key);
+                if !had {
+                    notify::fire(on, class::SET, "sadd", dst);
+                }
+            }
+        }
         "sscan" => scan(db, args, out)?,
         // The algebra. The three that answer members write them before their
         // own header, the same way SSCAN does and for the same reason: the
@@ -174,9 +227,26 @@ pub(super) fn execute(db: &Db, spec: &Spec, args: Args<'_>, out: &mut Out) -> Re
                 _ => db.sdiffcard(keys, limit)?,
             }));
         }
-        "sinterstore" => out.int(count(db.sinterstore(args.get(1), keys(args, 2))?)),
-        "sunionstore" => out.int(count(db.sunionstore(args.get(1), keys(args, 2))?)),
-        "sdiffstore" => out.int(count(db.sdiffstore(args.get(1), keys(args, 2))?)),
+        // The three that write their answer somewhere. Each says its own name
+        // when it stored anything, and a result of nothing deletes whatever was
+        // under the destination and says `del` instead, which is only worth
+        // saying when there was something there to delete. Asking costs a
+        // stripe lock, so it is asked only when somebody is listening.
+        "sinterstore" | "sunionstore" | "sdiffstore" => {
+            let had = notify::armed() && db.hold(key).exists(key);
+            let rest = keys(args, 2);
+            let stored = match spec.name {
+                "sinterstore" => db.sinterstore(key, rest)?,
+                "sunionstore" => db.sunionstore(key, rest)?,
+                _ => db.sdiffstore(key, rest)?,
+            };
+            out.int(count(stored));
+            if stored > 0 {
+                notify::fire(on, class::SET, spec.name, key);
+            } else if had {
+                notify::fire(on, class::GENERIC, "del", key);
+            }
+        }
         other => unreachable!("{other} is not a set command"),
     }
     Ok(())
