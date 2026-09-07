@@ -39,6 +39,7 @@
 
 use yo_common::num::{DIGITS_MAX, u64_digits};
 use yo_common::{Code, Error, Result, num};
+use yo_kv::lookups;
 use yo_kv::stream::{Consumer, Fate, Fields, Filter, Group, Id, Refs, Retry, Stream};
 use yo_kv::streams::{self as kv, Add, Claim, Read, Start, Trim};
 use yo_kv::{Db, Entry, Holds};
@@ -418,6 +419,9 @@ fn range(db: &Db, args: Args<'_>, rev: bool, out: &mut Out) -> Result<()> {
         out.array(0);
         return Ok(());
     }
+    // The probe above is what the read is counted for, and the walk below is
+    // the same key again.
+    let _quiet = lookups::quiet();
     if count == Some(0) {
         out.nil_array();
         return Ok(());

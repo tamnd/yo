@@ -93,6 +93,7 @@
 
 use crate::db::{Db, Holds};
 use crate::keyspace::wrong_type;
+use crate::lookups;
 use crate::news::{self, What};
 use crate::value::Kind;
 use crate::zsets::Window;
@@ -226,7 +227,14 @@ impl Db {
         opts: &Sort<'_>,
     ) -> Result<Vec<Option<Vec<u8>>>> {
         let kind = held.stripe_mut(self.stripe_of(key)).kind_of(key);
-        let elems = self.elements(held, key, kind)?;
+        // The lookup above is the one the sort's own key gets counted for, and
+        // the read below is the same key again. The `BY` and `GET` patterns are
+        // outside this on purpose, since a real server counts each of those.
+        // See [`crate::lookups::quiet`].
+        let elems = {
+            let _quiet = lookups::quiet();
+            self.elements(held, key, kind)?
+        };
 
         // A `BY` with no `*` cannot name a key per element, so it is an order to
         // leave things alone. The exception is the one the module doc explains.

@@ -40,6 +40,7 @@ use yo_common::num::parse_f64;
 use yo_common::{Code, Error, Result};
 use yo_kv::geo::{self, Kind, Shape, Unit};
 use yo_kv::geos::{self, Limit, Scratch, Sort};
+use yo_kv::lookups;
 use yo_kv::{Db, Gate, Keyspace, ZAdd};
 
 use super::args::{self, Args, is};
@@ -304,6 +305,10 @@ fn search(db: &Db, on: usize, spec: &Spec, args: Args<'_>, out: &mut Out) -> Res
     // a wrong type has to win over a bad radius. It answers the existence
     // question at the same time, which two later decisions need.
     let here = db.hold(key).zcard(key)? != 0;
+    // And that is the lookup a real server counts for this. What follows looks
+    // the same key up again for the centre member and once more for the search
+    // itself, and in the store forms it looks up a destination it only writes.
+    let _quiet = lookups::quiet();
 
     let mut dest = (form.store == Store::Argument).then(|| args.get(1));
     let mut storedist = false;

@@ -865,3 +865,17 @@ reason = "JSON.GET nk with a path that does not parse answers a nil on a real se
 status = "until"
 resolved_by = "M8"
 spec = "12 section 6"
+
+[[divergence]]
+id = "D-121"
+title = "XREAD counts one keyspace lookup per stream where a real server counts two"
+reason = "keyspace_hits and keyspace_misses agree with a real server command for command across every group, measured against 8.10.1 over a hundred and eighty five cases, and XREAD is the one shape where the number of lookups differs rather than the answer. Redis looks each stream up twice, once in the command itself to settle the identifier it was given and check the type, and once again to serve the entries out, and it counts both, so XREAD on a name that is not there adds two to the misses. Here the stream is looked up once, because the read is done under a hold that is taken over every named stream at the start and the entries come out of the same visit that resolved the identifier. The keymiss notification is not affected and still fires twice per stream, since that is said by the walk in front of the command and the walk models Redis's two lookups. Matching the counters would mean adding a second probe of every stream to a command that does not need one, on the path M7 is measured on, for a statistic. So the events agree and the counter is off by one lookup per stream on this one command."
+status = "permanent"
+spec = "12 section 6"
+
+[[divergence]]
+id = "D-122"
+title = "The bundled modules on a real server add their own lookups to the two counters"
+reason = "This one runs the other way round, since it is a real server counting something we do not. Redis calls moduleNotifyKeyspaceEvent before the check that would drop the event for the classes nobody subscribed to, so a module subscriber is told about every write whatever notify-keyspace-events says, and one of the modules that ships with 8.10.1 opens the event key in database zero when it is told. That lookup goes through the same lookupKey the counters live in, so SET k v on a fresh server adds one to keyspace_hits and DEL k adds one to keyspace_misses, and the same two lines run in database nine count the other way, because the key the module opens is in database zero and is not there. MODULE UNLOAD cannot take any of the four loadable modules out, so there is no way to turn it off and no way for a client to tell the module's lookups from its own. The numbers here are the ones a server with no modules loaded would report, which is the rule the counters are documented by, and every case in the comparison is measured with the module's share taken out by running it twice, once with database zero empty and once with a decoy under every name."
+status = "permanent"
+spec = "12 section 6"

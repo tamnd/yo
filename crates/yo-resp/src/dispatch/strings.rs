@@ -29,6 +29,7 @@ use super::table::Spec;
 use crate::reply::Out;
 use yo_common::num::{parse_f64, parse_i64};
 use yo_common::{Code, Error, Result, xxh3};
+use yo_kv::lookups;
 use yo_kv::strings::check_len;
 use yo_kv::{Compare, Db, Exists, Expire, IncrEx, IncrExpire, Keyspace, Num, SetOptions, Str};
 
@@ -495,6 +496,9 @@ fn getex(db: &mut Keyspace, on: usize, args: Args<'_>, out: &mut Out) -> Result<
         out.nil();
         return Ok(());
     }
+    // That lookup is the one the read is counted for, and the rest of this reads
+    // the same key again and then writes its deadline.
+    let _quiet = lookups::quiet();
 
     let wanted = match expire {
         Some((u, at)) => Expire::At(deadline(u, args.int(at)?, db.clock().now_ms(), "getex")?),

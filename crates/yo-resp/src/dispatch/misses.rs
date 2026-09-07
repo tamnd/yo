@@ -81,6 +81,31 @@
 //! and finds out about the rest afterwards, so `TS.RANGE nk notatime +` says
 //! the miss and then complains about the timestamp. Module commands are
 //! therefore left out of the retraction.
+//!
+//! # The two counters
+//!
+//! `keyspace_hits` and `keyspace_misses` in `INFO stats` are the same question
+//! asked about the same lookups. Redis counts them in `lookupKey` beside the
+//! notification and skips both for the same reason, a lookup on the way to a
+//! write, which is why the keys a real server misses are exactly the keys it
+//! says `keymiss` for.
+//!
+//! They are not counted from here, though. The notification is off on nearly
+//! every server and the counters are always on, so a walk in front of every read
+//! would be a second lookup of every key on the hot path for the sake of a
+//! statistic. So the counting happens where the lookup already is, down in
+//! [`yo_kv::lookups`], and what this file contributes is the one thing that
+//! layer cannot know: whether the command running now is a read.
+//! [`reading`] answers that, off nearly the same list of names as [`reads`].
+//!
+//! The two lists come apart in one place and it is worth knowing which. `OBJECT`
+//! looks its key up with `LOOKUP_NONOTIFY`, which turns off the notification and
+//! leaves the counters on, so it is the one command in the tree that counts a
+//! miss and says nothing about it. Everything else that differs between the two
+//! is shape rather than substance: a command whose key the walk finds through an
+//! arm of its own still has to be named here, and a command that looks the same
+//! key up more than once is counted once by turning the counting off for the
+//! rest of it.
 
 use super::args::{self, Args};
 use super::notify::{self, MISS, class};
@@ -234,6 +259,58 @@ pub(super) fn undo(spec: &Spec, e: &Error) {
     }
     if matches!(e.code(), Code::Invalid | Code::Unsupported) {
         notify::unsay_misses();
+    }
+}
+
+/// Whether the lookups this command is about to make count as a client reading
+/// a key.
+///
+/// The same question [`reads`] answers key by key, asked once about the whole
+/// command and off nearly the same list of names. A command that reads any of
+/// its keys is armed here, and what happens after that is up to the command:
+/// the lookups it makes on the way to a write, and the second and third looks it
+/// takes at a key it has already found, turn the counting off again with
+/// [`yo_kv::lookups::quiet`] where they happen. That is a line in `COPY` and in
+/// `BITOP` and in seven other places, each of them next to the lookup it is
+/// about, which is the only place the answer is obvious.
+///
+/// The three names above the fallback are where this list and the walk's differ.
+/// Two of them the walk reaches through arms of its own that say nothing about
+/// whether the command is a read, and the third is `OBJECT`, which really is a
+/// different answer to the two questions rather than a different shape of the
+/// same one.
+pub(super) fn reading(spec: &Spec, args: Args<'_>) -> bool {
+    match spec.name {
+        // The writes that read a key first, which is the list at the top of
+        // [`reads`] and has to stay the same list.
+        "getdel" | "getex" | "getset" | "copy" | "delex" | "sort" | "xack" | "xackdel"
+        | "xnack" | "xclaim" | "xautoclaim" | "georadius" | "georadiusbymember" | "bitop"
+        | "sinterstore" | "sunionstore" | "sdiffstore" | "zunionstore" | "zinterstore"
+        | "zdiffstore" | "zrangestore" | "geosearchstore" | "pfmerge" | "migrate"
+        | "tdigest.merge" | "cms.merge" => true,
+        // And the three the walk cannot answer for. `XINFO` keeps its key on the
+        // subcommand and `XREADGROUP` is flagged a write, so neither reaches the
+        // fallback, and both look their stream up the way any other read does.
+        // `OBJECT` is the one command in the tree where the two questions have
+        // different answers: it looks its key up with `LOOKUP_NONOTIFY`, so it
+        // counts the lookup and says no `keymiss` for it.
+        "xinfo" | "xreadgroup" | "object" => true,
+        "set" => (3..args.len()).any(|i| args::is(args.get(i), b"get")),
+        "bitfield" => !(2..args.len())
+            .any(|i| args::is(args.get(i), b"set") || args::is(args.get(i), b"incrby")),
+        // And the module commands that look up nothing where their row says they
+        // would, which are the same three exceptions the walk carries.
+        "ts.info" | "cf.compact" => false,
+        "json.debug" => args::is(args.get(1), b"memory"),
+        "FT.SUGGET" | "FT.SUGLEN" => true,
+        // And the ordinary case, which is every read that keeps what it reads in
+        // the keyspace. The groups that keep it somewhere else are left out for
+        // the same reason they are left out of the walk.
+        _ => {
+            spec.flags.contains(&"readonly")
+                && (READS.contains(&spec.group)
+                    || (spec.flags.contains(&"module") && spec.group != "search"))
+        }
     }
 }
 

@@ -153,6 +153,7 @@ pub mod lcs;
 pub mod list;
 pub mod listpack;
 pub mod lists;
+pub mod lookups;
 pub mod news;
 pub mod orderkey;
 pub mod parts;

@@ -105,6 +105,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize};
 use yo_common::lock::{Held, Lock};
 use yo_common::{Code, Error};
 use yo_kv::cold::Store;
+use yo_kv::lookups;
 use yo_kv::{Clock, Db, Keyspace};
 use yo_search::Registry;
 
@@ -1150,6 +1151,18 @@ impl Server {
         self.keyspaces().map(|db| db.evicted_keys()).sum()
     }
 
+    /// Lookups a client's read made that found the key.
+    #[must_use]
+    pub fn keyspace_hits(&self) -> u64 {
+        self.keyspaces().map(|db| db.hits()).sum()
+    }
+
+    /// Lookups a client's read made that did not.
+    #[must_use]
+    pub fn keyspace_misses(&self) -> u64 {
+        self.keyspaces().map(|db| db.misses()).sum()
+    }
+
     /// Every command that has been seen, with its counters.
     ///
     /// Only the ones that have. A server reports a handful of lines rather than
@@ -1245,6 +1258,13 @@ impl Server {
         for thread in &self.locals {
             thread.stats.connections.zero();
             thread.stats.commands.zero();
+        }
+        // These live on the stripes rather than on the threads, so resetting
+        // them means holding each stripe for as long as it takes to write two
+        // zeroes. `CONFIG RESETSTAT` is a command a person types, and the
+        // alternative is a pair of numbers a dashboard cannot put back.
+        for mut db in self.keyspaces() {
+            db.zero_lookups();
         }
     }
 
@@ -2039,6 +2059,11 @@ pub fn resolved(
     // the same order for every command whose first act is to read what it was
     // given, and that is nearly all of them.
     misses::report(&server.dbs[session.db], session.db, spec, args);
+    // And whether the lookups it is about to make are reads, for the two
+    // counters in `INFO stats`. Armed after the walk above so that the walk's
+    // own probes are not counted, and dropped after the body so that nothing the
+    // dispatcher does afterwards is either.
+    let reading = lookups::reading(misses::reading(spec, args));
     let done = if spec.flags.contains(&"blocking") {
         blocking::execute(server, session, spec, args, out)
     } else {
@@ -2244,6 +2269,7 @@ pub fn resolved(
             _ => server::execute(server, session, spec, args, out),
         }
     };
+    drop(reading);
     // Before the error is written and not after, because a command that failed
     // half way through still changed whatever it changed before it failed and a
     // real server has already published those. Draining here also keeps the
@@ -6949,6 +6975,59 @@ mod tests {
         let info = f.run(&[b"INFO", b"stats"]);
         assert!(info.contains("expired_keys:1"), "{info}");
         assert!(info.contains("evicted_keys:0"), "{info}");
+    }
+
+    #[test]
+    fn the_two_counters_count_the_reads_and_nothing_else() {
+        let mut f = Fixture::new();
+        f.run(&[b"SET", b"k", b"v"]);
+        f.run(&[b"GET", b"k"]);
+        f.run(&[b"GET", b"nope"]);
+        f.run(&[b"EXISTS", b"k", b"nope"]);
+        // The write at the top is not in either number, and the three reads
+        // under it are, once for each key each of them names.
+        let info = f.run(&[b"INFO", b"stats"]);
+        assert!(info.contains("keyspace_hits:2"), "{info}");
+        assert!(info.contains("keyspace_misses:2"), "{info}");
+
+        f.run(&[b"CONFIG", b"RESETSTAT"]);
+        let info = f.run(&[b"INFO", b"stats"]);
+        assert!(info.contains("keyspace_hits:0"), "{info}");
+        assert!(info.contains("keyspace_misses:0"), "{info}");
+    }
+
+    /// The shapes that look one key up more than once, which a real server
+    /// counts once because it only looks once. See `misses::reading`.
+    #[test]
+    fn a_read_that_visits_its_key_twice_is_counted_once() {
+        let mut f = Fixture::new();
+        f.run(&[b"ZADD", b"z", b"1", b"m"]);
+        f.run(&[b"ZRANGE", b"z", b"0", b"-1"]);
+        f.run(&[b"ZMSCORE", b"z", b"m", b"gone", b"also gone"]);
+        f.run(&[b"OBJECT", b"ENCODING", b"z"]);
+        f.run(&[b"DUMP", b"z"]);
+        let info = f.run(&[b"INFO", b"stats"]);
+        assert!(info.contains("keyspace_hits:4"), "{info}");
+        // A member that is not in the sorted set is not a miss. Only a key that
+        // is not there is one.
+        assert!(info.contains("keyspace_misses:0"), "{info}");
+    }
+
+    /// A lookup on the way to a write is not a read, which is the other half of
+    /// what `lookups::quiet` is for.
+    #[test]
+    fn the_key_a_read_writes_afterwards_is_not_counted() {
+        let mut f = Fixture::new();
+        f.run(&[b"SET", b"s", b"v"]);
+        f.run(&[b"COPY", b"s", b"dst"]);
+        f.run(&[b"GETEX", b"s", b"EX", b"100"]);
+        f.run(&[b"BITOP", b"AND", b"into", b"s", b"nope"]);
+        let info = f.run(&[b"INFO", b"stats"]);
+        // The source of the copy, the key `GETEX` answers with, and one of the
+        // two sources of the operation. The three destinations are written and
+        // never read, so none of them is in here.
+        assert!(info.contains("keyspace_hits:3"), "{info}");
+        assert!(info.contains("keyspace_misses:1"), "{info}");
     }
 
     #[test]
