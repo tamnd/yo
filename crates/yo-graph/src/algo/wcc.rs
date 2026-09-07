@@ -274,9 +274,20 @@ mod tests {
     #[test]
     fn it_agrees_with_union_find_on_a_hundred_random_graphs() {
         let mut rng = Rng::new(0xbeef);
-        for trial in 0..100 {
-            let n = 1 + rng.below(80) as u64;
-            let m = rng.below(120);
+        // Fewer and smaller graphs under Miri. Every edge is a `Graph::link`,
+        // which is three document puts, so a trial costs its edges and it is
+        // the total across the trials that has to come down rather than either
+        // half of it. The ratio of edges to nodes is left where it was, because
+        // that is what decides whether the graph comes out in one piece or
+        // several and that is the thing being checked.
+        let (trials, nodes, edges) = if cfg!(miri) {
+            (3, 8, 12)
+        } else {
+            (100, 80, 120)
+        };
+        for trial in 0..trials {
+            let n = 1 + rng.below(nodes) as u64;
+            let m = rng.below(edges);
             let mut g = Graph::new();
             for i in 0..n {
                 g.add_node(i).unwrap();
@@ -298,7 +309,11 @@ mod tests {
     #[test]
     fn a_graph_with_a_giant_component_comes_out_right() {
         let mut rng = Rng::new(0x9a1);
-        let n = 20_000u64;
+        // The ring is nine tenths of the graph however big the graph is, so a
+        // small one is the same shape: one giant component and a tenth of the
+        // nodes loose around it. Everything below is a fraction of this so
+        // there is nothing to keep in step by hand.
+        let n = if cfg!(miri) { 40u64 } else { 20_000 };
         let mut g = Graph::new();
         for i in 0..n {
             g.add_node(i).unwrap();
@@ -309,7 +324,9 @@ mod tests {
         for i in 0..big {
             g.link(i, (i + 1) % big, 1, NO_PROPS).unwrap();
         }
-        for _ in 0..5_000 {
+        // A quarter of the node count, so the tenth of the graph outside the
+        // ring keeps the same chance of being joined up whatever the size is.
+        for _ in 0..n / 4 {
             let src = big + rng.next_u64() % (n - big);
             let dst = big + rng.next_u64() % (n - big);
             g.link(src, dst, 1, NO_PROPS).unwrap();

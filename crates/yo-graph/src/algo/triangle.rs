@@ -270,7 +270,10 @@ mod tests {
     /// there for, and the shape that takes the skewed intersection path.
     #[test]
     fn a_hub_over_a_ring() {
-        let size = 2000u64;
+        // A ring with a hub over it has a triangle for every ring edge at any
+        // size, and the assert counts them, so the size only has to be big
+        // enough to be a ring.
+        let size = if cfg!(miri) { 30u64 } else { 2000 };
         let mut edges: Vec<(u64, u64)> = (0..size).map(|i| (i, (i + 1) % size)).collect();
         edges.extend((0..size).map(|i| (size + 1, i)));
         let s = Snapshot::of(&linked(&edges));
@@ -282,8 +285,12 @@ mod tests {
     #[test]
     fn it_agrees_with_the_slow_one() {
         let mut rng = Rng::new(0x7a13);
-        for case in 0..60 {
-            let nodes = 3 + rng.next_u64() % 40;
+        // Fewer and smaller cases under Miri. Four edges a node is kept
+        // because a graph too sparse to have a triangle in it would agree with
+        // the slow one about zero and say nothing.
+        let (cases, spread) = if cfg!(miri) { (3, 8) } else { (60, 40) };
+        for case in 0..cases {
+            let nodes = 3 + rng.next_u64() % spread;
             let edges: Vec<(u64, u64)> = (0..nodes * 4)
                 .map(|_| (rng.next_u64() % nodes, rng.next_u64() % nodes))
                 .collect();

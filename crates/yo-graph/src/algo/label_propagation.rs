@@ -226,8 +226,11 @@ mod tests {
     #[test]
     fn it_never_crosses_a_component() {
         let mut rng = Rng::new(0x1ab0);
-        for case in 0..30 {
-            let nodes = 2 + rng.next_u64() % 60;
+        // One edge a node, so the graph is in several pieces, which is what
+        // the test needs. Fewer and smaller under Miri, and still in pieces.
+        let (cases, spread) = if cfg!(miri) { (3, 10) } else { (30, 60) };
+        for case in 0..cases {
+            let nodes = 2 + rng.next_u64() % spread;
             let edges: Vec<(u64, u64)> = (0..nodes)
                 .map(|_| (rng.next_u64() % nodes, rng.next_u64() % nodes))
                 .collect();

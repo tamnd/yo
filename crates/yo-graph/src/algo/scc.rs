@@ -247,6 +247,10 @@ mod tests {
 
     /// The reason the frames are on the heap. A recursive Tarjan dies here.
     #[test]
+    #[cfg_attr(
+        miri,
+        ignore = "a depth that would overflow a recursive one is the claim"
+    )]
     fn a_very_deep_chain_does_not_blow_the_stack() {
         let deep = 150_000u64;
         let edges: Vec<(u64, u64)> = (0..deep).map(|i| (i, i + 1)).collect();
@@ -256,6 +260,10 @@ mod tests {
 
     /// And a very long cycle, which is one component the same depth down.
     #[test]
+    #[cfg_attr(
+        miri,
+        ignore = "a depth that would overflow a recursive one is the claim"
+    )]
     fn a_very_deep_cycle_is_one_component() {
         let deep = 150_000u64;
         let mut edges: Vec<(u64, u64)> = (0..deep).map(|i| (i, i + 1)).collect();
@@ -268,8 +276,12 @@ mod tests {
     #[test]
     fn it_agrees_with_the_slow_one() {
         let mut rng = Rng::new(0x5cc);
-        for case in 0..80 {
-            let nodes = 2 + rng.next_u64() % 40;
+        // Fewer and smaller cases under Miri. Two edges a node is kept: that
+        // is what makes a random graph have a cycle in it at all, and a graph
+        // with no cycle would agree with the slow one about singletons.
+        let (cases, spread) = if cfg!(miri) { (3, 8) } else { (80, 40) };
+        for case in 0..cases {
+            let nodes = 2 + rng.next_u64() % spread;
             let edges: Vec<(u64, u64)> = (0..nodes * 2)
                 .map(|_| (rng.next_u64() % nodes, rng.next_u64() % nodes))
                 .collect();

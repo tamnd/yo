@@ -268,17 +268,25 @@ fn the_field_names_are_paid_for_once_across_the_whole_graph() {
     // A thousand people each following ten others, which is ten thousand edges
     // carrying a score. The names of the fields are what an edge property store
     // is mostly made of, and interning is why they are not.
+    // Fewer people and fewer of them followed under Miri. Three names across
+    // any graph with more than one edge in it is the same claim, and it is the
+    // second edge that would pay for the name a second time.
+    let (people, each) = if cfg!(miri) {
+        (20u64, 3u64)
+    } else {
+        (1000, 10)
+    };
     let mut g = Graph::new();
-    for id in 0..1000u64 {
+    for id in 0..people {
         g.put_node(id, &person("someone")).expect("a person");
     }
-    for id in 0..1000u64 {
-        for n in 1..11u64 {
-            g.link(id, (id + n) % 1000, FOLLOWS, &rating((id % 5) as i64 + 1))
+    for id in 0..people {
+        for n in 1..=each {
+            g.link(id, (id + n) % people, FOLLOWS, &rating((id % 5) as i64 + 1))
                 .expect("linked");
         }
     }
-    assert_eq!(g.edges(), 10_000);
+    assert_eq!(g.edges() as u64, people * each);
     assert_eq!(g.node_props().keys().len(), 2, "kind and name, once");
     assert_eq!(g.edge_props().keys().len(), 1, "score, once");
 }

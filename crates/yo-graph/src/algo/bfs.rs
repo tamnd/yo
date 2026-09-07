@@ -242,12 +242,15 @@ mod tests {
     #[test]
     fn a_chain_is_as_deep_as_it_is_long() {
         let mut g = Graph::new();
-        for i in 0..999u64 {
+        // A chain is as deep as it is long at every length, so under Miri it is
+        // a short one. See `many` for what an edge through `Graph` costs.
+        let n = if cfg!(miri) { 12u64 } else { 1000 };
+        for i in 0..n - 1 {
             g.link(i, i + 1, 1, NO_PROPS).unwrap();
         }
         let s = Snapshot::of(&g);
         let depth = bfs(&s, 0);
-        for i in 0..1000u32 {
+        for i in 0..n as u32 {
             assert_eq!(depth[i as usize], i, "at {i}");
         }
     }
@@ -279,17 +282,25 @@ mod tests {
 
     /// The whole point of the algorithm is that it switches, and the only thing
     /// that matters about the switch is that the answer does not change. This
-    /// graph is a hub with a hundred thousand edges hanging off it, which is
-    /// shaped to make the second level cross the ALPHA threshold.
+    /// graph is a hub with random edges hanging off it, which is shaped to make
+    /// the second level cross the ALPHA threshold.
+    ///
+    /// The size is not what makes it switch, so the size can come down. The
+    /// first frontier is the hub alone and it scouts every one of its `n - 1`
+    /// edges against a `left` of `n - 1`, so `scout > left / ALPHA` holds for
+    /// any `n` above one. The random edges are there to give the second level
+    /// somewhere to go, and their number is kept at five times the nodes so the
+    /// average degree stays where it was, which is the ratio the shape is made
+    /// of and the one thing that must not be cut on its own.
     #[test]
     fn the_two_directions_agree_on_a_graph_that_switches() {
         let mut rng = Rng::new(0x5eed);
         let mut g = Graph::new();
-        let n = 20_000u64;
+        let n = if cfg!(miri) { 5u64 } else { 20_000 };
         for i in 1..n {
             g.link(0, i, 1, NO_PROPS).unwrap();
         }
-        for _ in 0..100_000 {
+        for _ in 0..n * 5 {
             let src = rng.next_u64() % n;
             let dst = rng.next_u64() % n;
             g.link(src, dst, 1, NO_PROPS).unwrap();
@@ -302,9 +313,12 @@ mod tests {
 
     /// A grid is the case a bottom up step is worst at and the search still has
     /// to be right on it, because the frontier never gets big enough to switch.
+    ///
+    /// A grid of any side has that property, and the assert walks every cell of
+    /// whichever one it was given, so the side comes down to four under Miri.
     #[test]
     fn a_grid_is_the_distance_you_would_walk() {
-        let side = 40u64;
+        let side = if cfg!(miri) { 4u64 } else { 40 };
         let mut g = Graph::new();
         let at = |r: u64, c: u64| r * side + c;
         for r in 0..side {
@@ -328,13 +342,24 @@ mod tests {
     }
 
     /// Random graphs, checked edge for edge against the plain search, because
-    /// the switch has enough state in it that one shape is not enough.
+    /// the switch has enough state in it that one shape is not enough. A
+    /// hundred of them is a number of shapes rather than a claim about a
+    /// hundred, so under Miri it is fewer of the same thing.
+    ///
+    /// The graphs get smaller as well as fewer. Every one of them is checked
+    /// from every node, so a trial costs its nodes times its edges, and it is
+    /// the product that has to fit rather than either half of it.
     #[test]
     fn it_agrees_with_a_plain_search_on_a_hundred_random_graphs() {
         let mut rng = Rng::new(0xa11ce);
-        for trial in 0..100 {
-            let n = 1 + rng.below(60) as u64;
-            let m = rng.below(200);
+        let (trials, nodes, edges) = if cfg!(miri) {
+            (2, 6, 10)
+        } else {
+            (100, 60, 200)
+        };
+        for trial in 0..trials {
+            let n = 1 + rng.below(nodes) as u64;
+            let m = rng.below(edges);
             let mut g = Graph::new();
             for i in 0..n {
                 g.add_node(i).unwrap();

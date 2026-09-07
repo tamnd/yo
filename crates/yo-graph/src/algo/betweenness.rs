@@ -385,8 +385,15 @@ mod tests {
     #[test]
     fn it_agrees_with_the_definition() {
         let mut rng = Rng::new(0xb17e);
-        for case in 0..40 {
-            let nodes = 2 + rng.next_u64() % 25;
+        // Fewer and smaller cases under Miri. Every edge here goes in through
+        // `Graph`, which puts a document for each end and one for the edge, and
+        // that is the most expensive thing in this crate to interpret. What is
+        // being checked is agreement with the definition on a graph nobody
+        // chose, and a handful of small ones still covers the ties, the
+        // unreachable pairs and the self loops that are what goes wrong.
+        let (cases, spread) = if cfg!(miri) { (3, 6) } else { (40, 25) };
+        for case in 0..cases {
+            let nodes = 2 + rng.next_u64() % spread;
             let edges: Vec<(u64, u64)> = (0..nodes * 2)
                 .map(|_| (rng.next_u64() % nodes, rng.next_u64() % nodes))
                 .collect();
@@ -404,8 +411,9 @@ mod tests {
     #[test]
     fn it_agrees_with_the_definition_both_ways() {
         let mut rng = Rng::new(0xb17f);
-        for case in 0..30 {
-            let nodes = 3 + rng.next_u64() % 20;
+        let (cases, spread) = if cfg!(miri) { (3, 5) } else { (30, 20) };
+        for case in 0..cases {
+            let nodes = 3 + rng.next_u64() % spread;
             let edges: Vec<(u64, u64)> = (0..nodes)
                 .map(|_| (rng.next_u64() % nodes, rng.next_u64() % nodes))
                 .collect();
@@ -424,22 +432,30 @@ mod tests {
     /// graph where one node obviously belongs there.
     #[test]
     fn the_estimate_finds_the_bridge() {
+        // Two cliques and one edge between them. Smaller cliques and fewer
+        // pivots under Miri, because the graph the claim asks for is two dense
+        // halves joined at one point rather than two halves of any given size.
+        // The pivot count has to stay under the node count or the estimate
+        // would be the exact answer and the assert below would be checking
+        // nothing, which is why it is cut alongside the cliques.
+        let (side, pivots) = if cfg!(miri) { (6u64, 5) } else { (30, 20) };
         let mut edges = Vec::new();
         for group in 0..2u64 {
-            for a in 0..30u64 {
-                for b in a + 1..30 {
+            for a in 0..side {
+                for b in a + 1..side {
                     edges.push((group * 100 + a, group * 100 + b));
                 }
             }
         }
-        edges.push((29, 100));
+        let end = side - 1;
+        edges.push((end, 100));
         let s = Snapshot::of(&undirected(&edges));
-        let sampled = betweenness_with(&s, 20);
+        let sampled = betweenness_with(&s, pivots);
         let exact = betweenness_exact(&s);
         assert!(!sampled.exact());
-        assert_eq!(sampled.pivots(), 20);
+        assert_eq!(sampled.pivots(), pivots);
 
-        let ends = [s.dense(29).expect("29"), s.dense(100).expect("100")];
+        let ends = [s.dense(end).expect("an end"), s.dense(100).expect("100")];
         assert!(ends.contains(&sampled.top(1)[0].0));
         assert!(ends.contains(&exact.top(1)[0].0));
     }
@@ -449,6 +465,15 @@ mod tests {
     /// fifth of the largest score now and then, which is what an estimate is,
     /// so what is checked is the error across the whole graph: on average a
     /// small fraction of the largest score, and never wildly out.
+    ///
+    /// Not shrunk. How close a sample lands is a claim about the sample and the
+    /// graph together, and both bounds below are averages over the nodes, so a
+    /// graph small enough for Miri would be one where the average is over a
+    /// dozen numbers and passes or fails on which dozen.
+    #[cfg_attr(
+        miri,
+        ignore = "how close the estimate lands is the claim and an average needs the graph"
+    )]
     #[test]
     fn the_estimate_is_close() {
         let mut rng = Rng::new(0xb180);
@@ -519,8 +544,10 @@ mod tests {
     #[test]
     fn two_runs_agree() {
         let mut rng = Rng::new(0xb181);
-        let edges: Vec<(u64, u64)> = (0..200)
-            .map(|_| (rng.next_u64() % 60, rng.next_u64() % 60))
+        // Two runs agree on any graph, so a small one under Miri.
+        let (wanted, nodes) = if cfg!(miri) { (30, 12) } else { (200, 60) };
+        let edges: Vec<(u64, u64)> = (0..wanted)
+            .map(|_| (rng.next_u64() % nodes, rng.next_u64() % nodes))
             .collect();
         let s = Snapshot::of(&undirected(&edges));
         assert_eq!(

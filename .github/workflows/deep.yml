@@ -172,9 +172,9 @@ jobs:
       # four at a time. If that crate ever stops being the slowest, this special
       # case should go.
       #
-      # `yo-resp`, `yo-cli` and `yo-kv` are split by count, and the table in the
-      # step below says how many ways. They are split for a different reason than
-      # `yo-record`. Miri spends about six seconds starting a process before it
+      # `yo-resp`, `yo-cli`, `yo-kv` and `yo-graph` are split by count, and the
+      # table in the step below says how many ways. They are split for a
+      # different reason than `yo-record`. Miri spends about six seconds starting a process before it
       # runs a line of the test in it, and nextest gives every test its own
       # process, so `yo-resp` has a floor of over an hour before any of its six
       # hundred and thirty tests does any work. Nothing in the source can be
@@ -183,15 +183,12 @@ jobs:
       # splitting itself, so no list of test names has to be kept true here as
       # tests are added.
       #
-      # Two crates are left out, and it is worth being straight about what that
-      # costs. `yo-graph` and `yo-doc` have tests that take over two minutes each
-      # interpreted. They are slow because of what they measure: a betweenness
-      # score checked against its own definition is the definition walked, and
-      # there is no smaller version of it that measures the same thing. The fix
-      # is to go through them test by test, shrinking the ones where the count is
-      # incidental and skipping the ones where the count is the claim, which is
-      # what `yo-resp` got and what these need. That is its own piece of work and
-      # it is issue 418. Neither has any unsafe code of its own.
+      # One crate is left out, and it is worth being straight about what that
+      # costs. `yo-doc` has tests that take over two minutes each interpreted.
+      # The fix is to go through it test by test, shrinking the ones where the
+      # count is incidental and skipping the ones where the count is the claim,
+      # which is what `yo-resp` got and what it needs. That is its own piece of
+      # work and it is issue 418. It has no unsafe code of its own.
       #
       # `yo-index` was one of the five and is back in. It took one number: the
       # walk that grows the map underneath itself put 64 keys back for every 8 it
@@ -239,6 +236,24 @@ jobs:
       # down with it, over the same boundary in the same code. Its eighteen
       # unsafe lines are interpreted now, which is what leaving it out had been
       # costing.
+      #
+      # `yo-graph` was the fourth one back. Its two planes are three orders of
+      # magnitude apart interpreted: an `Adjacency::link` is a push onto a run,
+      # and a `Graph::link` puts a document for each end and one for the edge,
+      # and a document put hashes and indexes. So the cuts are large and they
+      # are written as a pair of sizes at each test rather than through one
+      # divide, because a tenth of a count chosen for a native run is usually
+      # still too big to interpret and now and then small enough to make the
+      # test vacuous. Twelve tests are skipped and every one of them is a
+      # measurement: bits an edge, bytes an edge, how close a sampled estimate
+      # lands, a margin one numbering beats another by, and two stack depths
+      # that are the claim. The rest were made smaller and then checked by
+      # forcing every Miri branch on and running the whole suite compiled. That
+      # run also turned up a real bug in `modularity`, which panics on a label
+      # above the node count although its documentation says any grouping will
+      # do, and that is issue 462. The crate now runs all 162 of its remaining
+      # tests in eleven minutes single threaded, against at least ninety five
+      # before, and the slowest one is under two minutes.
       - id: shards
         run: |
           rm rust-toolchain.toml
@@ -248,8 +263,8 @@ jobs:
           # which is a syntax error the runner reports six lines away from the
           # cause. The run step below passes each field as its own argument.
           echo "list=$(cargo metadata --no-deps --format-version 1 | jq -c '
-            ["yo-graph", "yo-doc"] as $out
-            | { "yo-resp": 6, "yo-cli": 2, "yo-kv": 8 } as $split
+            ["yo-doc"] as $out
+            | { "yo-resp": 6, "yo-cli": 2, "yo-kv": 8, "yo-graph": 2 } as $split
             | [ .packages[].name
                 | select(. != "yo-record" and ($split[.] | not) and (IN($out[]) | not))
                 | {id: ., pkg: ., filter: "", part: ""} ]
