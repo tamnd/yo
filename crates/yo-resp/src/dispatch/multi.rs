@@ -89,6 +89,13 @@ pub(crate) struct Queue {
     /// command, and a walk of the queue there would make a transaction cost the
     /// square of its length.
     bytes: u64,
+    /// Whether any of them writes, or would replicate without writing.
+    ///
+    /// Asked by the pause gate, which holds an `EXEC` for a write pause only
+    /// when the transaction has something in it a write pause is about. Noted as
+    /// the commands go in because the command is what carries the answer, and by
+    /// `EXEC` the queue is wire bytes that would have to be looked up again.
+    writes: bool,
     /// Whether the funnel turned one of them away.
     ///
     /// A queued command that is not a command at all, or that has the wrong
@@ -403,10 +410,12 @@ fn exec(server: &Server, session: &mut Session, out: &mut Out) -> Flow {
 /// The reply is `QUEUED` even when the transaction is already dead, which looks
 /// wrong and is what a real server does. The client finds out at `EXEC`, once,
 /// rather than at whichever command happened to be the one that broke it.
-pub(crate) fn queue(session: &mut Session, args: Args<'_>, out: &mut Out) -> Flow {
+pub(crate) fn queue(session: &mut Session, spec: &Spec, args: Args<'_>, out: &mut Out) -> Flow {
+    let writes = super::may_replicate(spec, session);
     if let Some(q) = session.multi.as_mut()
         && !q.dirty
     {
+        q.writes |= writes;
         yo_alloc::allow(|| {
             let mut wire = format!("*{}\r\n", args.len()).into_bytes();
             for i in 0..args.len() {
@@ -438,6 +447,15 @@ impl Session {
     /// Whether this command has to be held rather than run.
     pub(crate) fn queues(&self, name: &str) -> bool {
         self.multi.is_some() && !exempt(name)
+    }
+
+    /// Whether the open transaction holds a command a write pause is about.
+    ///
+    /// False when there is no transaction, which is the answer the pause gate
+    /// wants: a bare `EXEC` with no `MULTI` in front of it is an error and not
+    /// a write.
+    pub(crate) fn queued_writes(&self) -> bool {
+        self.multi.as_ref().is_some_and(|q| q.writes)
     }
 
     /// How many commands are queued and how many bytes they are holding, which

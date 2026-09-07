@@ -91,6 +91,13 @@ pub(super) fn execute(
             // the engine does with a close: the buffer is written first.
             return Ok(Flow::Close);
         }
+    } else if is(sub, b"PAUSE") {
+        pause(server, args)?;
+        out.ok();
+    } else if is(sub, b"UNPAUSE") {
+        one(args, "unpause")?;
+        server.unpause();
+        out.ok();
     } else if is(sub, b"REPLY") {
         reply(session, args)?;
         // Only `ON` says anything, and it says it here. The other two are
@@ -475,6 +482,56 @@ fn maxage(value: &[u8]) -> Result<u64> {
     Ok(age as u64)
 }
 
+/// `CLIENT PAUSE <timeout> [WRITE|ALL]`.
+///
+/// The timeout is in milliseconds and it is how long from now rather than a
+/// point in time, so a client that means to hold the server for a second asks
+/// for a thousand. `ALL` is the default and holds every command; `WRITE` holds
+/// the ones that change something or would replicate.
+///
+/// Nothing here is exempt from the gate this arms, including `CLIENT UNPAUSE`,
+/// so a long `ALL` pause cannot be called off before it runs out. That is
+/// Redis's behaviour and it is the reason the timeout is a required argument
+/// rather than something with a sensible default.
+fn pause(server: &Server, args: Args<'_>) -> Result<()> {
+    if args.len() < 3 {
+        return Err(args::wrong_arity_sub("client", "pause"));
+    }
+    if args.len() > 4 {
+        // Not a wrong arity, which is the one place `CLIENT` says this instead:
+        // a real server reads the mode itself and complains about the whole
+        // subcommand when there is something after it.
+        return Err(args::subcommand_syntax(args.get(1), "CLIENT"));
+    }
+    let text = core::str::from_utf8(args.get(2)).ok();
+    let Some(ms) = text.and_then(|t| t.parse::<i64>().ok()) else {
+        return Err(Error::new(
+            Code::Invalid,
+            "timeout is not an integer or out of range",
+        ));
+    };
+    if ms < 0 {
+        return Err(Error::new(Code::Invalid, "timeout is negative"));
+    }
+    let all = if args.len() == 3 {
+        true
+    } else {
+        let mode = args.get(3);
+        if is(mode, b"ALL") {
+            true
+        } else if is(mode, b"WRITE") {
+            false
+        } else {
+            return Err(Error::new(
+                Code::Invalid,
+                "CLIENT PAUSE mode must be WRITE or ALL",
+            ));
+        }
+    };
+    server.pause(server.now_ms().saturating_add(ms as u64), all);
+    Ok(())
+}
+
 /// The one line `CLIENT INFO` answers with and `CLIENT LIST` prints one of per
 /// connection.
 ///
@@ -650,6 +707,10 @@ const CLIENT_HELP: &[&str] = &[
     "    Protect current client connection from eviction.",
     "NO-TOUCH (ON|OFF)",
     "    Will not touch LRU/LFU stats when this mode is on.",
+    "UNPAUSE",
+    "    Stop the current client pause, resuming traffic.",
+    "PAUSE <timeout> [WRITE|ALL]",
+    "    Suspend all, or just write, clients for <timeout> milliseconds.",
     "REPLY (ON|OFF|SKIP)",
     "    Control the replies sent to the current connection.",
     "SETINFO <option> <value>",

@@ -179,6 +179,13 @@ pub enum Flow {
     /// Until then the connection stops reading commands, because a client that
     /// is waiting for an answer is not a client that has sent another question.
     Block,
+    /// Nothing was written and the command has not run at all.
+    ///
+    /// The server is paused, so the connection keeps the command it was about to
+    /// run and runs it again once the pause is over. Everything the client
+    /// pipelined behind it is kept in the order it arrived, the same way a
+    /// blocking command keeps it.
+    Hold,
 }
 
 /// A number one thread adds to and any thread may read.
@@ -787,6 +794,16 @@ pub struct Server {
     /// Zero on every server nobody has run `CLIENT KILL` on, which is what keeps
     /// the check on the flush path down to one load.
     kills: AtomicUsize,
+    /// When the pause `CLIENT PAUSE` armed runs out, and what it covers.
+    ///
+    /// One word rather than a deadline and a mode beside it, because every
+    /// command on every thread reads this and a server that has never been
+    /// paused should pay one load and one test for it. The low bit says whether
+    /// everything is held or only the writes, and the rest is the deadline in
+    /// milliseconds. Zero is no pause at all, which is why the deadline is
+    /// shifted up rather than packed into the top bits: the whole word is zero
+    /// exactly when nothing is armed.
+    pause: AtomicU64,
 }
 
 impl Server {
@@ -831,6 +848,7 @@ impl Server {
             notify: AtomicU32::new(0),
             clients: Lock::default(),
             kills: AtomicUsize::new(0),
+            pause: AtomicU64::new(0),
             mail: pubsub::boxes(1),
         }
     }
@@ -899,6 +917,7 @@ impl Server {
             notify: AtomicU32::new(0),
             clients: Lock::default(),
             kills: AtomicUsize::new(0),
+            pause: AtomicU64::new(0),
             mail: pubsub::boxes(1),
         }
     }
@@ -2218,7 +2237,14 @@ pub fn execute(server: &Server, session: &mut Session, args: Args<'_>, out: &mut
     // is also what settles `CLIENT REPLY`. An embedded caller has no engine, so
     // it happens here instead, and the two paths never both run: the engine
     // reaches the funnel through `resolved` and not through this.
-    session.finished();
+    //
+    // Not for a command the pause held, because that command has not run and is
+    // going to be run again. An embedded caller has nowhere to park it, so it
+    // gets the answer back and decides for itself; a caller that has not paused
+    // its own server, which is nearly all of them, never sees this.
+    if flow != Flow::Hold {
+        session.finished();
+    }
     flow
 }
 
@@ -2239,6 +2265,25 @@ const CONTAINERS: [&str; 10] = [
 /// it, which is a wrong arity and has no subcommand to name.
 fn container_sub<'a>(spec: &Spec, args: &Args<'a>) -> Option<&'a [u8]> {
     (args.len() > 1 && CONTAINERS.contains(&spec.name)).then(|| args.get(1))
+}
+
+/// The six commands Redis marks `may-replicate` and does not mark `write`.
+///
+/// A short list rather than a flag on every row, because six is what it is and
+/// the only thing that asks is the pause gate below. It goes away with the flag
+/// if anything else ever needs the same question answered.
+const MAY_REPLICATE: [&str; 6] = ["eval", "evalsha", "fcall", "pfcount", "publish", "spublish"];
+
+/// Whether `CLIENT PAUSE WRITE` holds this command.
+///
+/// The writes, the six above, and `EXEC` when the transaction it is about to run
+/// holds one of either. That last part is why this is asked of the session as
+/// well as of the command: a transaction of nothing but reads runs through a
+/// write pause, and one write anywhere in it makes the whole transaction wait.
+fn may_replicate(spec: &Spec, session: &Session) -> bool {
+    spec.flags.contains(&"write")
+        || MAY_REPLICATE.contains(&spec.name)
+        || (spec.name == "exec" && session.queued_writes())
 }
 
 /// The same, for a caller that has already found the command.
@@ -2335,12 +2380,33 @@ pub fn resolved(
         return Flow::Continue;
     }
 
+    // `CLIENT PAUSE`, and this is the whole of it on the command path: one
+    // relaxed load on a server nobody has paused. Here, after every refusal
+    // above and before the queue below, which is where a real server puts it. So
+    // a command that would have been refused is still refused while the server
+    // is paused, and `MULTI` on a paused server waits rather than opening a
+    // transaction that would queue commands nobody is allowed to send yet.
+    //
+    // Nothing is exempt, not even `CLIENT UNPAUSE`, which is Redis's behaviour
+    // and is worth being clear about: a `CLIENT PAUSE 10000 ALL` cannot be
+    // called off, by anybody, until it runs out.
+    // A command `EXEC` is replaying is not a command the client just sent, and a
+    // real server runs those through `call` rather than through
+    // `processCommand`, so the gate is not in front of them. Holding one would
+    // mean a transaction that has written half of itself and stopped.
+    if !session.running
+        && let Some(all) = server.paused(server.now_ms())
+        && (all || may_replicate(spec, session))
+    {
+        return Flow::Hold;
+    }
+
     // Held rather than run, and the reply is `QUEUED`. After the refusals above
     // and before everything below, which is where a real server puts it: a
     // command has to be a real command with the right number of arguments to be
     // queued at all, and nothing it would have done gets done now.
     if session.queues(spec.name) {
-        return multi::queue(session, args, out);
+        return multi::queue(session, spec, args, out);
     }
 
     // Which databases the maintenance turn after this batch has to ask. Marked

@@ -711,6 +711,20 @@ impl<S: Sink> Front<S> {
         yo_alloc::allow(|| self.conns[conn as usize].parked.push(cmd));
     }
 
+    /// Take a command back off the connection that was about to run it.
+    ///
+    /// The pause is the one thing that can stop a command after it has been
+    /// handed over, so this is `park` with the two things `start` already did
+    /// undone: the command goes back into `pending`, which is what stops the
+    /// buffer its arguments point into being compacted underneath it, and the
+    /// caller keeps its decoder rather than handing it back.
+    pub(crate) fn hold(&mut self, conn: ConnId, cmd: Cmd) {
+        let c = &mut self.conns[conn as usize];
+        c.pending += 1;
+        c.blocked = true;
+        yo_alloc::allow(|| c.parked.push(cmd));
+    }
+
     /// The client is not waiting any more: give it back its commands.
     ///
     /// The ones it had already sent go to the front of the queue in the order
