@@ -4,6 +4,27 @@ What each release changed, why, and what it costs you. The versioning rules and 
 
 While the major is 0, a minor release may break anything, including the on-disk format. The format is frozen at `M6`, not before.
 
+## 0.3.26 — 2026-09-07
+
+Seven pull requests and no milestone has closed, so this is a patch.
+
+Most of it is `M8` compatibility work on the `CLIENT` container, which was missing entirely and is now thirteen subcommands, plus the two `INFO` counters every dashboard reads and the active half of hash field expiry. The rest is test work that puts the last two crates back under Miri. A file written by 0.3.25 opens unchanged under this version and a file written by this version opens under 0.3.25. No record kind was added.
+
+### Added
+
+- **The `CLIENT` container, thirteen subcommands of it.** `ID`, `GETNAME`, `SETNAME`, `SETINFO`, `INFO`, `REPLY`, `NO-EVICT`, `NO-TOUCH` and `HELP` are about the connection that asked and needed nothing new to answer. `LIST`, `KILL`, `PAUSE` and `UNPAUSE` are about every connection on every thread, so they come with a registry of live connections that the accept path pushes to and the close path lifts out of, in the order they opened in, which is the order `CLIENT LIST` reports. `CLIENT INFO` is forty fields read off 8.10.1 one at a time, in its order and with its spelling, because the tooling that parses this line splits on spaces and looks for names it knows. Nine of them describe memory a real server holds in a shape yo does not and are answered with yo's own honest numbers, which is `D-123` along with `TRACKING`, the one part of the container still missing.
+- **`CLIENT PAUSE` and `CLIENT UNPAUSE`, which stop the server rather than a connection.** The state is one word on the server, a deadline and a mode bit, so the command path pays a relaxed load and a test against zero when nothing is armed. Arming widens and never narrows: the later deadline wins and the stricter mode wins, so a short pause on top of a long one does not cut it short. A held command has not run at all, and the connection keeps it and everything pipelined behind it in order until the pause ends, the same way a blocking command keeps them. Nothing is exempt, including `CLIENT UNPAUSE` itself under an `ALL` pause, which reads like a bug and is what 8.10.1 does, measured on the wire rather than assumed.
+- **`keyspace_hits` and `keyspace_misses` in `INFO stats`.** These were the hole in a section that already carried every other counter a dashboard reads, and the hit rate everyone quotes is the first over the sum. A real server counts them in `lookupKey`, next to the `keymiss` notification and skipped for the same reasons, so the keys it misses are the keys it says `keymiss` for. The counting happens where the lookups already are rather than in the walk the notification uses, because that walk costs a stripe lock and a map probe per key and the notification is off nearly everywhere while these two are always on. A command that reaches its lookup more times than a real server does only counts the first, so `ZRANGE` asking for the window and then walking it is one read and not two.
+- **`expired_subkeys` and `expired_subkeys_active` in `INFO stats`**, alongside the active reap below.
+
+### Fixed
+
+- **A hash field with a deadline waited for somebody to read the hash.** A field given a deadline with `HEXPIRE` went when a command next touched the key and not before, so a hash nobody read held every field it had been told to drop, and a client subscribed to `hexpired` heard nothing at all. The reap now names every field it took and the dispatch layer puts the per field news back into the one event a real server publishes, on all four subkey channels, with `del` after it when the hash is left empty. The active side is its own cycle with its own list, because a field deadline lives inside the hash body where the marked index the key sweep draws from cannot see it. A name goes on that list once, when its hash first takes a field deadline, and comes off when the key is gone or is no longer a hash. A hash whose earliest deadline has not passed costs a load and a comparison, and a server that has never sent `HEXPIRE` has an empty list and pays nothing.
+
+### Changed
+
+- **`yo-graph` and `yo-doc` are back in the deep Miri run**, which was the last of the five crates that did not fit. `yo-graph` went from at least 5731 seconds with 38 tests still running when the cap cut them off, to 162 tests in 666 seconds. `yo-doc` went from 27 tests to all 153 of them in eighteen minutes, single threaded in both cases. Sixteen tests are skipped between the two and every one says why where it is skipped: twelve of them are a measurement rather than a shape, and four sit exactly on a compile time limit that has no runtime knob. Every size that came down was checked by forcing the Miri branches on and running the suite compiled, which is what catches a cut that leaves an assert looking at nothing, and that check turned up a real bug in `modularity` on a label above the node count, which is issue 462 and is not fixed here.
+
 ## 0.3.25 — 2026-09-07
 
 Four pull requests and no milestone has closed, so this is a patch.
