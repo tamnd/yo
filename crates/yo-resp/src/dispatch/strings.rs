@@ -24,6 +24,7 @@
 //! EX 5 EX 5` is accepted and `SET k v EX 5 PX 5` is not.
 
 use super::args::{self, Args, is, syntax};
+use super::notify::{self, class};
 use super::table::Spec;
 use crate::reply::Out;
 use yo_common::num::{parse_f64, parse_i64};
@@ -50,15 +51,21 @@ const LEN_AND_IDX: &str = "If you want both the length and indexes, please just 
 /// to a switch on the length and then a compare; the table grows to about two
 /// hundred and fifty commands by M8 and this becomes a jump through an index
 /// stored in the [`Spec`], which does not change any of the bodies.
-pub(super) fn execute(db: &Db, spec: &Spec, args: Args<'_>, out: &mut Out) -> Result<()> {
+pub(super) fn execute(
+    db: &Db,
+    on: usize,
+    spec: &Spec,
+    args: Args<'_>,
+    out: &mut Out,
+) -> Result<()> {
     // The five that name more than one key, taken before a stripe is chosen
     // because there is no one stripe to choose. Everything below this names
     // exactly one key and the table says it is at argument one.
     match spec.name {
-        "mset" => return mset(db, args, out),
-        "msetnx" => return msetnx(db, args, out),
+        "mset" => return mset(db, on, args, out),
+        "msetnx" => return msetnx(db, on, args, out),
         "mget" => return mget(db, args, out),
-        "msetex" => return msetex(db, args, out),
+        "msetex" => return msetex(db, on, args, out),
         "lcs" => return lcs(db, args, out),
         _ => {}
     }
@@ -69,7 +76,7 @@ pub(super) fn execute(db: &Db, spec: &Spec, args: Args<'_>, out: &mut Out) -> Re
             Some(v) => write_str(out, v),
             None => out.nil(),
         },
-        "set" => set(db, args, out)?,
+        "set" => set(db, on, args, out)?,
         // Both of these have an owning form the embedded caller wants and a
         // `_with` form that hands the old value over where it lies. On the wire
         // the value is written into the reply and never looked at again, so the
@@ -88,28 +95,52 @@ pub(super) fn execute(db: &Db, spec: &Spec, args: Args<'_>, out: &mut Out) -> Re
             if !had {
                 out.nil();
             }
+            // `GETSET` always stores, so there is no condition on this the way
+            // there is on `SET`. It says `set` and not a name of its own.
+            notify::fire(on, class::STRING, "set", args.get(1));
         }
         "getdel" => {
-            if !db.getdel_with(args.get(1), |v| write_str(out, v))? {
+            if db.getdel_with(args.get(1), |v| write_str(out, v))? {
+                notify::fire(on, class::GENERIC, "del", args.get(1));
+            } else {
                 out.nil();
             }
         }
-        "getex" => getex(db, args, out)?,
-        "setnx" => out.int(i64::from(db.setnx(args.get(1), args.get(2))?)),
+        "getex" => getex(db, on, args, out)?,
+        "setnx" => {
+            let stored = db.setnx(args.get(1), args.get(2))?;
+            if stored {
+                notify::fire(on, class::STRING, "set", args.get(1));
+            }
+            out.int(i64::from(stored));
+        }
         "setex" => {
             db.setex(args.get(1), args.int(2)?, args.get(3))?;
+            timed_set(on, args.get(1));
             out.ok();
         }
         "psetex" => {
             db.psetex(args.get(1), args.int(2)?, args.get(3))?;
+            timed_set(on, args.get(1));
             out.ok();
         }
-        "append" => out.int(count(db.append(args.get(1), args.get(2))?)),
+        // Even `APPEND k ''`, which appends nothing and creates the key if it
+        // was not there. Redis says `append` for that one too.
+        "append" => {
+            out.int(count(db.append(args.get(1), args.get(2))?));
+            notify::fire(on, class::STRING, "append", args.get(1));
+        }
         "strlen" => out.int(count(db.strlen(args.get(1))?)),
         "setrange" => {
             let offset =
                 usize::try_from(args.int(2)?).map_err(|_| Error::new(Code::Invalid, BAD_OFFSET))?;
             out.int(count(db.setrange(args.get(1), offset, args.get(3))?));
+            // Nothing to say when there was nothing to write. `SETRANGE k 5 ""`
+            // answers the length and leaves the key exactly as it found it, so
+            // a real server does not announce it and neither does this.
+            if !args.get(3).is_empty() {
+                notify::fire(on, class::STRING, "setrange", args.get(1));
+            }
         }
         // `SUBSTR` is `GETRANGE` under the name it had before 2.0, and Redis
         // still ships both as separate entries in its table.
@@ -117,19 +148,37 @@ pub(super) fn execute(db: &Db, spec: &Spec, args: Args<'_>, out: &mut Out) -> Re
             let (start, end) = (args.int(2)?, args.int(3)?);
             out.bulk(&db.getrange(args.get(1), start, end)?);
         }
-        "incr" => out.int(db.incr(args.get(1))?),
-        "decr" => out.int(db.decr(args.get(1))?),
-        "incrby" => out.int(db.incrby(args.get(1), args.int(2)?)?),
-        "decrby" => out.int(db.decrby(args.get(1), args.int(2)?)?),
+        // All four say `incrby`, including the two that take away. The event
+        // is named after the one function underneath rather than after the
+        // command, which is Redis's own wording and not a shortcut taken here.
+        "incr" => {
+            out.int(db.incr(args.get(1))?);
+            notify::fire(on, class::STRING, "incrby", args.get(1));
+        }
+        "decr" => {
+            out.int(db.decr(args.get(1))?);
+            notify::fire(on, class::STRING, "incrby", args.get(1));
+        }
+        "incrby" => {
+            out.int(db.incrby(args.get(1), args.int(2)?)?);
+            notify::fire(on, class::STRING, "incrby", args.get(1));
+        }
+        "decrby" => {
+            out.int(db.decrby(args.get(1), args.int(2)?)?);
+            notify::fire(on, class::STRING, "incrby", args.get(1));
+        }
         // A bulk string on both protocols, not a RESP3 double. Redis has never
         // changed this one and a client that parses the digits would break.
-        "incrbyfloat" => out.human_double(db.incrbyfloat(args.get(1), args.float(2)?)?),
-        "delex" => delex(db, args, out)?,
+        "incrbyfloat" => {
+            out.human_double(db.incrbyfloat(args.get(1), args.float(2)?)?);
+            notify::fire(on, class::STRING, "incrbyfloat", args.get(1));
+        }
+        "delex" => delex(db, on, args, out)?,
         "digest" => match db.digest(args.get(1))? {
             Some(h) => out.bulk(&xxh3::hex(h)),
             None => out.nil(),
         },
-        "increx" => increx(db, args, out)?,
+        "increx" => increx(db, on, args, out)?,
         // Unreachable: the dispatcher only sends this function commands whose
         // group is `string`, and every one of those is above. An error rather
         // than a panic, because a table that has grown a row nobody wrote a
@@ -181,6 +230,17 @@ fn pairs<'a>(
     count: usize,
 ) -> impl Iterator<Item = (&'a [u8], &'a [u8])> + Clone {
     (0..count).map(move |i| (args.get(from + 2 * i), args.get(from + 2 * i + 1)))
+}
+
+/// A store that came with a deadline, as the two events it is.
+///
+/// `SETEX`, `PSETEX` and `SET ... EX` all say `set` and then `expire`, in that
+/// order and on two different classes, because to a subscriber they are a write
+/// followed by a deadline being put on what was written. `SET ... KEEPTTL` is
+/// only the first of the two, since it did not touch the deadline.
+fn timed_set(on: usize, key: &[u8]) {
+    notify::fire(on, class::STRING, "set", key);
+    notify::fire(on, class::GENERIC, "expire", key);
 }
 
 // ------------------------------------------------------------------ expiry
@@ -286,7 +346,7 @@ fn unit_bit(unit: Unit) -> u16 {
 
 /// `SET key value [NX|XX] [GET] [EX s|PX ms|EXAT ts|PXAT ts|KEEPTTL]
 /// [IFEQ v|IFNE v|IFDEQ d|IFDNE d]`.
-fn set(db: &mut Keyspace, args: Args<'_>, out: &mut Out) -> Result<()> {
+fn set(db: &mut Keyspace, on: usize, args: Args<'_>, out: &mut Out) -> Result<()> {
     let (key, val) = (args.get(1), args.get(2));
     let mut opts = SetOptions::PLAIN;
     let mut seen = 0u16;
@@ -351,6 +411,17 @@ fn set(db: &mut Keyspace, args: Args<'_>, out: &mut Out) -> Result<()> {
         had = true;
         write_str(out, v);
     })?;
+    // Said here rather than down among the three ways the reply is written,
+    // because `SET ... GET` writes the old value and stores the new one and
+    // both of those are true at once. A `SET` refused by `NX`, `XX` or one of
+    // the compare and swap conditions stored nothing and says nothing.
+    if done.stored {
+        if expire.is_some() {
+            timed_set(on, key);
+        } else {
+            notify::fire(on, class::STRING, "set", key);
+        }
+    }
     if opts.get {
         if !had {
             out.nil();
@@ -394,7 +465,7 @@ fn condition<'a>(keyword: &[u8], arg: &'a [u8]) -> Result<Compare<'a>> {
 // ------------------------------------------------------------------- GETEX
 
 /// `GETEX key [EX s|PX ms|EXAT ts|PXAT ts|PERSIST]`.
-fn getex(db: &mut Keyspace, args: Args<'_>, out: &mut Out) -> Result<()> {
+fn getex(db: &mut Keyspace, on: usize, args: Args<'_>, out: &mut Out) -> Result<()> {
     let key = args.get(1);
     let mut seen = 0u16;
     let mut expire: Option<(Unit, usize)> = None;
@@ -430,9 +501,21 @@ fn getex(db: &mut Keyspace, args: Args<'_>, out: &mut Out) -> Result<()> {
         None if seen & bits::PERSIST != 0 => Expire::Clear,
         None => Expire::Keep,
     };
+    // Asked before the call, because afterwards there is no way to tell a
+    // `PERSIST` that dropped a deadline from one that had nothing to drop, and
+    // only the first of those says anything. The stripe is already held, so it
+    // is a lookup and not a second acquisition.
+    let had_deadline = wanted == Expire::Clear && matches!(db.deadline_of(key), yo_kv::Ask::At(_));
     match db.getex(key, wanted)? {
         Some(v) => write_str(out, v),
         None => out.nil(),
+    }
+    match wanted {
+        Expire::At(_) => notify::fire(on, class::GENERIC, "expire", key),
+        Expire::Clear if had_deadline => notify::fire(on, class::GENERIC, "persist", key),
+        // Plain `GETEX` is a read and says nothing, and a `PERSIST` that found
+        // no deadline changed nothing and says nothing either.
+        _ => {}
     }
     Ok(())
 }
@@ -441,7 +524,7 @@ fn getex(db: &mut Keyspace, args: Args<'_>, out: &mut Out) -> Result<()> {
 
 /// `MSETEX numkeys key value [key value ...] [NX|XX]
 /// [EX s|PX ms|EXAT ts|PXAT ts|KEEPTTL]`.
-fn msetex(db: &Db, args: Args<'_>, out: &mut Out) -> Result<()> {
+fn msetex(db: &Db, on: usize, args: Args<'_>, out: &mut Out) -> Result<()> {
     let n = parse_i64(args.get(1))
         .filter(|&n| n > 0)
         .and_then(|n| usize::try_from(n).ok())
@@ -516,6 +599,18 @@ fn msetex(db: &Db, args: Args<'_>, out: &mut Out) -> Result<()> {
             Exists::Always,
             expire,
         )?;
+        // One key at a time and in the order they were given, which is what
+        // `MSET` does too and what somebody watching several of these keys
+        // would expect to see.
+        //
+        // The deadline comes first here, which is the other way round from
+        // `SET ... EX` and from `SETEX`. That is measured against a real server
+        // and not a slip: `MSETEX` is newer and its body sets the deadline on
+        // the way past rather than after the write.
+        if let Expire::At(_) = expire {
+            notify::fire(on, class::GENERIC, "expire", k);
+        }
+        notify::fire(on, class::STRING, "set", k);
     }
     out.int(1);
     Ok(())
@@ -533,7 +628,7 @@ fn msetex(db: &Db, args: Args<'_>, out: &mut Out) -> Result<()> {
 /// here and the write is one pair at a time through the stripe that pair
 /// belongs on, with every stripe the command names held for the whole of it so
 /// that nobody sees half of an `MSET`.
-fn mset(db: &Db, args: Args<'_>, out: &mut Out) -> Result<()> {
+fn mset(db: &Db, on: usize, args: Args<'_>, out: &mut Out) -> Result<()> {
     let n = pair_count(args, "mset")?;
     for (k, v) in pairs(args, 1, n) {
         check_len(k, v.len())?;
@@ -542,6 +637,7 @@ fn mset(db: &Db, args: Args<'_>, out: &mut Out) -> Result<()> {
     for (k, v) in pairs(args, 1, n) {
         held.stripe_mut(db.stripe_of(k))
             .mset(core::iter::once((k, v)))?;
+        notify::fire(on, class::STRING, "set", k);
     }
     out.ok();
     Ok(())
@@ -553,7 +649,7 @@ fn mset(db: &Db, args: Args<'_>, out: &mut Out) -> Result<()> {
 /// lengths, then whether any of the keys is already there, then the writes. The
 /// middle pass is what makes a key named twice inside one call not defeat
 /// itself, since nothing has been written when it runs.
-fn msetnx(db: &Db, args: Args<'_>, out: &mut Out) -> Result<()> {
+fn msetnx(db: &Db, on: usize, args: Args<'_>, out: &mut Out) -> Result<()> {
     let n = pair_count(args, "msetnx")?;
     for (k, v) in pairs(args, 1, n) {
         check_len(k, v.len())?;
@@ -566,6 +662,7 @@ fn msetnx(db: &Db, args: Args<'_>, out: &mut Out) -> Result<()> {
     for (k, v) in pairs(args, 1, n) {
         held.stripe_mut(db.stripe_of(k))
             .mset(core::iter::once((k, v)))?;
+        notify::fire(on, class::STRING, "set", k);
     }
     out.int(1);
     Ok(())
@@ -599,7 +696,7 @@ fn mget(db: &Db, args: Args<'_>, out: &mut Out) -> Result<()> {
 /// The arity in the table is a minimum of two, and a real server then refuses
 /// anything that is not two or four arguments as a wrong number of them rather
 /// than as a syntax error.
-fn delex(db: &mut Keyspace, args: Args<'_>, out: &mut Out) -> Result<()> {
+fn delex(db: &mut Keyspace, on: usize, args: Args<'_>, out: &mut Out) -> Result<()> {
     if args.len() != 2 && args.len() != 4 {
         return Err(args::wrong_arity("delex"));
     }
@@ -611,7 +708,13 @@ fn delex(db: &mut Keyspace, args: Args<'_>, out: &mut Out) -> Result<()> {
     } else {
         None
     };
-    out.int(i64::from(db.delex(args.get(1), compare)));
+    let gone = db.delex(args.get(1), compare);
+    if gone {
+        // `del` and not a name of its own, for the reason `UNLINK` says `del`:
+        // the event is what happened to the key.
+        notify::fire(on, class::GENERIC, "del", args.get(1));
+    }
+    out.int(i64::from(gone));
     Ok(())
 }
 
@@ -623,7 +726,7 @@ fn delex(db: &mut Keyspace, args: Args<'_>, out: &mut Out) -> Result<()> {
 /// Unlike `SET`, `INCREX` refuses a keyword it has already seen. It is a newer
 /// command and it was written with a stricter parser, and a client that sends
 /// `BYINT 1 BYINT 2` has a bug either way.
-fn increx(db: &mut Keyspace, args: Args<'_>, out: &mut Out) -> Result<()> {
+fn increx(db: &mut Keyspace, on: usize, args: Args<'_>, out: &mut Out) -> Result<()> {
     /// `BYINT` or `BYFLOAT`.
     const BY: u16 = 1 << 9;
     /// `SATURATE`.
@@ -707,7 +810,27 @@ fn increx(db: &mut Keyspace, args: Args<'_>, out: &mut Out) -> Result<()> {
         opts = opts.expiring(IncrExpire::Persist);
     }
 
+    // `ENX` only puts a deadline on a key that has none, so whether it did
+    // anything cannot be read off the reply. Asked before the call and only
+    // when somebody is listening, the same way `GETEX PERSIST` asks.
+    let kept =
+        seen & ENX != 0 && notify::armed() && matches!(db.deadline_of(key), yo_kv::Ask::At(_));
     let done = db.increx(key, opts)?;
+    // The same two names `INCRBY` and `INCRBYFLOAT` use, chosen by the kind the
+    // increment was counted in, and then the deadline if one was asked for. A
+    // saturated increment that moved the value by nothing still moved it, so
+    // there is no condition on this beyond the command having worked.
+    notify::fire(
+        on,
+        class::STRING,
+        if int_kind { "incrby" } else { "incrbyfloat" },
+        key,
+    );
+    if at.is_some() && !kept {
+        notify::fire(on, class::GENERIC, "expire", key);
+    } else if seen & bits::PERSIST != 0 {
+        notify::fire(on, class::GENERIC, "persist", key);
+    }
     out.array(2);
     write_num(out, done.value);
     write_num(out, done.applied);

@@ -72,6 +72,7 @@ mod lists;
 mod lua;
 mod migrate;
 mod multi;
+mod notify;
 mod pubsub;
 mod scan;
 mod scripting;
@@ -99,7 +100,7 @@ use crate::reply::Out;
 use std::cell::Cell;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering::{Acquire, Relaxed, Release};
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize};
 use yo_common::lock::{Held, Lock};
 use yo_common::{Code, Error};
 use yo_kv::cold::Store;
@@ -761,6 +762,13 @@ pub struct Server {
     /// thread precisely so that no other thread writes to it. A mailbox is a
     /// line another thread is meant to write to, so it gets one of its own.
     mail: Box<[pubsub::Mailbox]>,
+    /// Which classes of keyspace notification are turned on.
+    ///
+    /// Zero is off and is the default, so the read every write does costs one
+    /// relaxed load and a test. It is `notify-keyspace-events` and the bits are
+    /// Redis's own, kept in the `notify` module beside the two parsers that
+    /// turn them into the setting text and back.
+    notify: AtomicU32,
 }
 
 impl Server {
@@ -802,6 +810,7 @@ impl Server {
             watched: AtomicUsize::new(0),
             pubsub: Lock::default(),
             subs: AtomicUsize::new(0),
+            notify: AtomicU32::new(0),
             mail: pubsub::boxes(1),
         }
     }
@@ -867,6 +876,7 @@ impl Server {
             watched: AtomicUsize::new(0),
             pubsub: Lock::default(),
             subs: AtomicUsize::new(0),
+            notify: AtomicU32::new(0),
             mail: pubsub::boxes(1),
         }
     }
@@ -1692,6 +1702,21 @@ impl Server {
         self.watched.load(Relaxed) != 0
     }
 
+    /// Which classes of keyspace notification are turned on.
+    ///
+    /// Zero is off, which is the default and is what nearly every server runs
+    /// with. Relaxed for the same reason the watch count is: a `CONFIG SET` that
+    /// has not been published to another thread yet has not answered its client
+    /// either.
+    pub(crate) fn notify_flags(&self) -> u32 {
+        self.notify.load(Relaxed)
+    }
+
+    /// Turn a set of notification classes on, or turn them all off with zero.
+    pub(crate) fn set_notify_flags(&self, flags: u32) {
+        self.notify.store(flags, Relaxed);
+    }
+
     /// Note how many watched keys there are, after the table changed.
     ///
     /// Taken from the table under the same lock the change was made under, so
@@ -1979,20 +2004,25 @@ pub fn resolved(
     // a list of names: it is what `COMMAND INFO` reports about exactly these
     // commands, and the sorted set and stream ones that arrive later carry it
     // too.
+    // What the command is about to do to the keyspace, for anybody subscribed to
+    // hear about it. Armed here and drained after the group, because the bodies
+    // below are handed a database and their arguments and have no way to reach
+    // the pub/sub registry from there. Off costs one thread local store.
+    let armed = notify::arm(server);
     let done = if spec.flags.contains(&"blocking") {
         blocking::execute(server, session, spec, args, out)
     } else {
         match spec.group {
             "string" => {
                 let db = session.db;
-                strings::execute(&server.dbs[db], spec, args, out).map(|()| Flow::Continue)
+                strings::execute(&server.dbs[db], db, spec, args, out).map(|()| Flow::Continue)
             }
             // Its own group and its own file, and the same values underneath:
             // a bitmap is a string, so `STRLEN` on one answers and `SETBIT` on
             // something a `SET` left behind works.
             "bitmap" => {
                 let db = session.db;
-                bits::execute(&server.dbs[db], spec, args, out).map(|()| Flow::Continue)
+                bits::execute(&server.dbs[db], db, spec, args, out).map(|()| Flow::Continue)
             }
             // The same again: a sketch is a string with a documented layout, so
             // `GET` hands one to a client and `SET` takes it back.
@@ -2184,6 +2214,12 @@ pub fn resolved(
             _ => server::execute(server, session, spec, args, out),
         }
     };
+    // Before the error is written and not after, because a command that failed
+    // half way through still changed whatever it changed before it failed and a
+    // real server has already published those. Draining here also keeps the
+    // notifications of a command run by `EXEC` in front of the next one's.
+    notify::drain(server, armed);
+
     let flow = match done {
         Ok(flow) => flow,
         Err(e) => {
@@ -2820,6 +2856,51 @@ mod tests {
         forget_session(&f.server, &mut sub);
         assert_eq!(f.run(&[b"PUBSUB", b"NUMPAT"]), ":0\r\n");
         assert_eq!(f.run(&[b"PUBSUB", b"CHANNELS"]), "*0\r\n");
+    }
+
+    /// The one setting whose value is neither a number nor a word, and whose
+    /// spelling on the way out is not the spelling on the way in.
+    #[test]
+    fn the_notification_setting_reads_back_in_the_servers_own_spelling() {
+        let mut f = Fixture::new();
+        assert_eq!(
+            f.run(&[b"CONFIG", b"GET", b"notify-keyspace-events"]),
+            "*2\r\n$22\r\nnotify-keyspace-events\r\n$0\r\n\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"CONFIG", b"SET", b"notify-keyspace-events", b"KEA"]),
+            "+OK\r\n"
+        );
+        // `A` is a class of its own on the way in and stays one on the way out,
+        // and the two channel letters move to the end.
+        assert_eq!(
+            f.run(&[b"CONFIG", b"GET", b"notify-keyspace-events"]),
+            "*2\r\n$22\r\nnotify-keyspace-events\r\n$3\r\nAKE\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"CONFIG", b"SET", b"notify-keyspace-events", b"Kg"]),
+            "+OK\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"CONFIG", b"GET", b"notify-keyspace-events"]),
+            "*2\r\n$22\r\nnotify-keyspace-events\r\n$2\r\ngK\r\n"
+        );
+    }
+
+    #[test]
+    fn a_letter_the_notification_setting_does_not_know_is_refused() {
+        let mut f = Fixture::new();
+        assert_eq!(
+            f.run(&[b"CONFIG", b"SET", b"notify-keyspace-events", b"KEQ"]),
+            "-ERR CONFIG SET failed (possibly related to argument 'notify-keyspace-events') \
+             - Invalid event class character. Use 'Ag$lshzxeKEtmdnocaSTIV'.\r\n"
+        );
+        // And nothing was applied, since the whole setting is parsed before any
+        // of it is stored.
+        assert_eq!(
+            f.run(&[b"CONFIG", b"GET", b"notify-keyspace-events"]),
+            "*2\r\n$22\r\nnotify-keyspace-events\r\n$0\r\n\r\n"
+        );
     }
 
     /// One mistake in a `PUBSUB` subcommand has two error shapes depending on

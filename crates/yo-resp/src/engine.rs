@@ -1787,6 +1787,135 @@ mod tests {
         );
     }
 
+    /// A write publishes twice, once on the channel named after the key and
+    /// once on the channel named after the event, in that order.
+    #[test]
+    fn a_write_reaches_a_keyspace_subscriber() {
+        let (mut r, sub, mut batch) = engine();
+        let writer = r.engine_mut().accept();
+
+        r.engine_mut().feed(
+            writer,
+            &wire(&[b"CONFIG", b"SET", b"notify-keyspace-events", b"KEA"]),
+        );
+        r.engine_mut()
+            .feed(sub, &wire(&[b"PSUBSCRIBE", b"__key*@0__:*"]));
+        pump(&mut r, &mut batch);
+        r.engine_mut().sink_mut().clear();
+
+        r.engine_mut().feed(writer, &wire(&[b"SET", b"k", b"v"]));
+        pump(&mut r, &mut batch);
+        assert_eq!(r.engine().sink().sent(writer), b"+OK\r\n");
+        assert_eq!(
+            r.engine().sink().sent(sub),
+            b"*4\r\n$8\r\npmessage\r\n$12\r\n__key*@0__:*\r\n\
+              $16\r\n__keyspace@0__:k\r\n$3\r\nset\r\n\
+              *4\r\n$8\r\npmessage\r\n$12\r\n__key*@0__:*\r\n\
+              $18\r\n__keyevent@0__:set\r\n$1\r\nk\r\n"
+        );
+    }
+
+    /// The setting is off by default, so a subscriber on the notification
+    /// channels of a server nobody has turned them on for hears nothing.
+    #[test]
+    fn a_write_says_nothing_until_the_setting_turns_it_on() {
+        let (mut r, sub, mut batch) = engine();
+        let writer = r.engine_mut().accept();
+
+        r.engine_mut()
+            .feed(sub, &wire(&[b"PSUBSCRIBE", b"__key*@0__:*"]));
+        pump(&mut r, &mut batch);
+        r.engine_mut().sink_mut().clear();
+
+        r.engine_mut().feed(writer, &wire(&[b"SET", b"k", b"v"]));
+        pump(&mut r, &mut batch);
+        assert_eq!(r.engine().sink().sent(sub), b"");
+    }
+
+    /// `g` without `$` is the generic class and not the string one, so a
+    /// delete goes out and the write that made the key does not.
+    #[test]
+    fn only_the_classes_that_were_asked_for_are_published() {
+        let (mut r, sub, mut batch) = engine();
+        let writer = r.engine_mut().accept();
+
+        r.engine_mut().feed(
+            writer,
+            &wire(&[b"CONFIG", b"SET", b"notify-keyspace-events", b"Eg"]),
+        );
+        r.engine_mut()
+            .feed(sub, &wire(&[b"PSUBSCRIBE", b"__key*@0__:*"]));
+        pump(&mut r, &mut batch);
+        r.engine_mut().sink_mut().clear();
+
+        r.engine_mut().feed(writer, &wire(&[b"SET", b"k", b"v"]));
+        r.engine_mut().feed(writer, &wire(&[b"DEL", b"k"]));
+        pump(&mut r, &mut batch);
+        assert_eq!(
+            r.engine().sink().sent(sub),
+            b"*4\r\n$8\r\npmessage\r\n$12\r\n__key*@0__:*\r\n\
+              $18\r\n__keyevent@0__:del\r\n$1\r\nk\r\n"
+        );
+    }
+
+    /// A command that took a deadline with it says two things, and they come
+    /// out in the order the server did them rather than all at the end.
+    #[test]
+    fn a_write_with_a_deadline_on_it_says_two_things() {
+        let (mut r, sub, mut batch) = engine();
+        let writer = r.engine_mut().accept();
+
+        r.engine_mut().feed(
+            writer,
+            &wire(&[b"CONFIG", b"SET", b"notify-keyspace-events", b"EA"]),
+        );
+        r.engine_mut()
+            .feed(sub, &wire(&[b"PSUBSCRIBE", b"__keyevent@0__:*"]));
+        pump(&mut r, &mut batch);
+        r.engine_mut().sink_mut().clear();
+
+        r.engine_mut()
+            .feed(writer, &wire(&[b"SETEX", b"k", b"100", b"v"]));
+        pump(&mut r, &mut batch);
+        assert_eq!(
+            r.engine().sink().sent(sub),
+            b"*4\r\n$8\r\npmessage\r\n$16\r\n__keyevent@0__:*\r\n\
+              $18\r\n__keyevent@0__:set\r\n$1\r\nk\r\n\
+              *4\r\n$8\r\npmessage\r\n$16\r\n__keyevent@0__:*\r\n\
+              $21\r\n__keyevent@0__:expire\r\n$1\r\nk\r\n"
+        );
+    }
+
+    /// Inside a transaction each command's notifications go out before the
+    /// next command runs, so `EXEC` does not bunch them all up at the end.
+    #[test]
+    fn a_transaction_publishes_between_its_commands_and_not_after_them() {
+        let (mut r, sub, mut batch) = engine();
+        let writer = r.engine_mut().accept();
+
+        r.engine_mut().feed(
+            writer,
+            &wire(&[b"CONFIG", b"SET", b"notify-keyspace-events", b"EA"]),
+        );
+        r.engine_mut()
+            .feed(sub, &wire(&[b"PSUBSCRIBE", b"__keyevent@0__:*"]));
+        pump(&mut r, &mut batch);
+        r.engine_mut().sink_mut().clear();
+
+        r.engine_mut().feed(writer, &wire(&[b"MULTI"]));
+        r.engine_mut().feed(writer, &wire(&[b"SET", b"k", b"v"]));
+        r.engine_mut().feed(writer, &wire(&[b"DEL", b"k"]));
+        r.engine_mut().feed(writer, &wire(&[b"EXEC"]));
+        pump(&mut r, &mut batch);
+        assert_eq!(
+            r.engine().sink().sent(sub),
+            b"*4\r\n$8\r\npmessage\r\n$16\r\n__keyevent@0__:*\r\n\
+              $18\r\n__keyevent@0__:set\r\n$1\r\nk\r\n\
+              *4\r\n$8\r\npmessage\r\n$16\r\n__keyevent@0__:*\r\n\
+              $18\r\n__keyevent@0__:del\r\n$1\r\nk\r\n"
+        );
+    }
+
     #[test]
     fn a_reply_the_socket_would_not_take_is_offered_again() {
         let mut r = Reactor::inline(Wire::new(Trickle::default()));
