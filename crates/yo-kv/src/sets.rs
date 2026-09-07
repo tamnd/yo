@@ -649,6 +649,7 @@ impl Keyspace {
             self.drop_key(key);
             return 0;
         };
+        self.replacing(key, Kind::Set);
         self.free_body(key);
         let len = set.len();
         let at = self.sets.insert(set);

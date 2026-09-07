@@ -313,11 +313,13 @@ pub(super) struct Armed {
 pub(super) fn arm(server: &Server, db: usize) -> Armed {
     let flags = server.notify_flags();
     let live = flags & CHANNELS != 0 && server.anyone_subscribed();
-    // Unconditionally, because a listener that is installed and not armed costs
-    // one load and one test on a path that has just written or deleted a key,
-    // and because taking it off again would mean knowing whether this is the
-    // outermost funnel, which is a thing nothing else here has to know.
-    news::tell(Some(heard));
+    // Installed for a command that has somewhere to send what it hears and not
+    // for one that does not, which is the storage layer's only way of knowing
+    // whether the questions it would have to ask to say anything are worth
+    // asking. Nothing puts back what was there before, and nothing has to: this
+    // runs in front of every command, so the answer is never stale by the time
+    // it is read.
+    news::tell(live.then_some(heard as news::Told));
     Armed {
         flags: ARMED.replace(if live { flags } else { 0 }),
         db: WHERE.replace(db),
@@ -331,12 +333,14 @@ pub(super) fn arm(server: &Server, db: usize) -> Armed {
 /// That is the order a real server publishes in and it comes out of where this
 /// is called from rather than out of anything here.
 fn heard(key: &[u8], what: news::What) {
-    // None of the three brings a companion event along with it. A key that
-    // reached its deadline and a key a client deleted are two different pieces
-    // of news, and so are a key that was created and the write that created it,
-    // and a subscriber that wanted both asked for both.
+    // None of them brings a companion event along with it. A key that reached
+    // its deadline and a key a client deleted are two different pieces of news,
+    // and so are a key that was created and the write that created it, and a
+    // subscriber that wanted both asked for both.
     let (class, name) = match what {
         news::What::Born => (class::NEW, "new"),
+        news::What::Overwritten => (class::OVERWRITTEN, "overwritten"),
+        news::What::TypeChanged => (class::TYPE_CHANGED, "type_changed"),
         news::What::Expired => (class::EXPIRED, "expired"),
         news::What::Evicted => (class::EVICTED, "evicted"),
     };
@@ -385,6 +389,44 @@ pub(crate) fn subkeys_wanted(class: u32) -> bool {
 pub(crate) fn emptied(db: &Db, on: usize, key: &[u8]) {
     if armed() && !db.hold(key).exists(key) {
         fire(on, class::GENERIC, "del", key);
+    }
+}
+
+/// The pair that says a key that was already taken has something else under it
+/// now.
+///
+/// Everywhere else this comes out of the storage layer at the moment the old
+/// value goes, which puts it in front of whatever the command says it did. The
+/// four that move a key rather than change one are the exception and say it
+/// afterwards: `RENAME`, `RENAMENX`, `COPY` and `RESTORE` take the destination
+/// away and put a key in its place, so there is nothing under the name by the
+/// time the write happens and nothing for the storage layer to notice. Redis
+/// says it afterwards for them too, from its own separate call, so the order
+/// here is the order on the wire and not an accident of where this sits.
+///
+/// `was` is what the destination held before, or `None` for a name that was
+/// free, which is the case where neither event happens.
+pub(crate) fn replaced(db: usize, key: &[u8], was: Option<yo_kv::Kind>, now: Option<yo_kv::Kind>) {
+    let Some(was) = was else {
+        return;
+    };
+    fire(db, class::OVERWRITTEN, "overwritten", key);
+    if Some(was) != now {
+        fire(db, class::TYPE_CHANGED, "type_changed", key);
+    }
+}
+
+/// What a key holds, for the caller of [`replaced`] to ask before and after,
+/// and only when the answer would go anywhere.
+///
+/// It is a probe of the map either way, so a server with nobody listening for
+/// these two does not pay for it, and one that is listening pays it twice on a
+/// rename and not at all on anything else.
+pub(crate) fn kind_now(look: impl FnOnce() -> Option<yo_kv::Kind>) -> Option<yo_kv::Kind> {
+    if wanted(class::OVERWRITTEN | class::TYPE_CHANGED) {
+        look()
+    } else {
+        None
     }
 }
 

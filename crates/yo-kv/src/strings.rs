@@ -436,6 +436,7 @@ impl Keyspace {
             Expire::At(ms) => Some(ms),
             Expire::Keep => present.and_then(value::expire_at),
         };
+        self.replacing(key, Kind::String);
         self.store(key, val, deadline);
         out.stored = true;
         Ok(out)
@@ -444,6 +445,7 @@ impl Keyspace {
     /// `SET key value`, with nothing else asked for.
     pub fn set_plain(&mut self, key: &[u8], val: &[u8]) -> Result<()> {
         check_len(key, val.len())?;
+        self.replacing(key, Kind::String);
         self.store(key, val, None);
         Ok(())
     }
@@ -593,6 +595,7 @@ impl Keyspace {
             check_len(k, v.len())?;
         }
         for (k, v) in pairs {
+            self.replacing(k, Kind::String);
             self.store(k, v, None);
         }
         Ok(())
@@ -616,6 +619,7 @@ impl Keyspace {
             }
         }
         for (k, v) in pairs {
+            self.replacing(k, Kind::String);
             self.store(k, v, None);
         }
         Ok(true)
@@ -874,6 +878,7 @@ impl Keyspace {
                 Expire::At(ms) => Some(ms),
                 Expire::Keep => self.map.get(k).and_then(value::expire_at),
             };
+            self.replacing(k, Kind::String);
             self.store(k, v, deadline);
         }
         Ok(true)

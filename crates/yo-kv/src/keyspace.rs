@@ -559,6 +559,44 @@ impl Keyspace {
         Some(self.access_at(addr).freq(now, lfu))
     }
 
+    /// Say that whatever is under `key` is about to be thrown away for a
+    /// `becoming`, if there is anything under it and anybody is listening.
+    ///
+    /// The distinction the two events draw is between a write that replaces the
+    /// whole value and a write that changes part of one. `SET`, `MSET`,
+    /// `GETSET` and every store form replace it. `APPEND`, `SETRANGE`, `INCR`,
+    /// `RPUSH`, `SADD` and the rest do not, however much of the value they end
+    /// up moving, and they say nothing here. That is the line Redis draws too,
+    /// and it draws it in the same place: at the call that swaps one value
+    /// object for another rather than at the ones that reach into the object
+    /// that is already there.
+    ///
+    /// Said in front of the write, so a listener that goes looking still finds
+    /// the old value under the name, and so that the news comes out ahead of
+    /// whatever the command itself says it did.
+    ///
+    /// The keys that arrive rather than change, which is `RENAME`, `COPY`,
+    /// `MOVE` and `RESTORE`, are not here. They take the whole record away
+    /// first, so there is nothing left for this to find, and the layer that
+    /// runs them says it afterwards instead. That is not a detail of this
+    /// implementation: a real server says it after the rename too, and before
+    /// the write everywhere else.
+    pub(crate) fn replacing(&mut self, key: &[u8], becoming: Kind) {
+        if !news::listening() {
+            return;
+        }
+        // Through the reaping lookup, because a key whose deadline has passed is
+        // a key that is not there, and a write landing on one is a key arriving
+        // rather than a value being replaced.
+        let Some(was) = self.kind_of(key) else {
+            return;
+        };
+        news::say(key, news::What::Overwritten);
+        if was != becoming {
+            news::say(key, news::What::TypeChanged);
+        }
+    }
+
     /// Write a record under `key`, with the access field the policy wants on it.
     ///
     /// Every record this crate writes goes through here, which is the point of

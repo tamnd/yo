@@ -435,12 +435,23 @@ fn rename<'a>(
     let nx = name == "renamenx";
     let (src, dst) = (args.get(1), args.get(2));
     let (from, to) = (db.stripe_of(src), db.stripe_of(dst));
+    // What the two names hold before any of it, for the pair of events at the
+    // end. Asked here rather than there because by then the source is gone and
+    // the destination is whatever the source used to be, so neither question
+    // has an answer any more. Both cost a probe of the map and both are only
+    // asked when somebody is listening for what they are for.
+    let (was, now);
     let done = if from == to {
-        db.hold_stripe(from).rename(src, dst, nx)
+        let mut ks = db.hold_stripe(from);
+        was = notify::kind_now(|| ks.kind_of(dst));
+        now = notify::kind_now(|| ks.kind_of(src));
+        ks.rename(src, dst, nx)
     } else {
         // Both at once and in stripe order, so the key is never in neither
         // stripe and never in both, whoever else is reading either of them.
         let mut held = db.hold_many([from, to].into_iter());
+        was = notify::kind_now(|| held.stripe_mut(to).kind_of(dst));
+        now = notify::kind_now(|| held.stripe_mut(from).kind_of(src));
         rename_across(&mut held, from, to, src, dst, nx)
     };
     let done = done.found()?;
@@ -452,6 +463,9 @@ fn rename<'a>(
         // same thing.
         notify::fire(at, class::GENERIC, "rename_from", src);
         notify::fire(at, class::GENERIC, "rename_to", dst);
+        // And after them, not before, which is the one place these two come
+        // last. See `notify::replaced`.
+        notify::replaced(at, dst, was, now);
     }
     if nx {
         out.int(i64::from(done == Moved::Ok));
@@ -540,14 +554,22 @@ fn copy<'a>(
         return Err(Error::new(Code::Invalid, SAME_OBJECT));
     }
     let (from, to) = (spot(dbs, at, src), spot(dbs, into, dst));
+    // What each end holds before any of it, for the same reason `RENAME` asks
+    // in front of itself: afterwards the destination is a copy of the source
+    // and there is nothing left to compare.
+    let (was, now);
     let done = match hold_both(dbs, from, to) {
-        Both::One(mut ks) => match ks.copy(src, dst, replace) {
-            // The one `Moved` a caller cannot answer with a number, because
-            // zero would mean the destination was taken and this is a source
-            // there is no way to duplicate. See `Moved::Unsupported`.
-            Moved::Unsupported => return Err(no_copy(&mut ks, src)),
-            done => done,
-        },
+        Both::One(mut ks) => {
+            was = notify::kind_now(|| ks.kind_of(dst));
+            now = notify::kind_now(|| ks.kind_of(src));
+            match ks.copy(src, dst, replace) {
+                // The one `Moved` a caller cannot answer with a number, because
+                // zero would mean the destination was taken and this is a
+                // source there is no way to duplicate. See `Moved::Unsupported`.
+                Moved::Unsupported => return Err(no_copy(&mut ks, src)),
+                done => done,
+            }
+        }
         // Two keyspaces, whether that is two databases or two stripes of one,
         // so the value comes out of the first standing on its own before the
         // second is touched. Both are held for the whole of it, so neither end
@@ -558,6 +580,8 @@ fn copy<'a>(
         // clones the body, so asking first is the difference between a refused
         // copy of a million member set costing nothing and costing the set.
         Both::Two(mut from, mut to) => {
+            was = notify::kind_now(|| to.kind_of(dst));
+            now = notify::kind_now(|| from.kind_of(src));
             if !replace && to.exists(dst) {
                 out.int(0);
                 return Ok(());
@@ -579,6 +603,8 @@ fn copy<'a>(
         // the same thing, which is why it is `into` and not `at`.
         touched.wrote(dst);
         notify::fire(into, class::GENERIC, "copy_to", dst);
+        // And after it, not before. See `notify::replaced`.
+        notify::replaced(into, dst, was, now);
     }
     out.int(i64::from(done == Moved::Ok));
     Ok(())

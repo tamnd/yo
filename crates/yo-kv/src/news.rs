@@ -7,10 +7,12 @@
 //! needed the memory of goes because the policy picked it. A key coming into
 //! being is the other way round: a command did ask, but what it asked for was
 //! `SET` or `RPUSH` or `XADD`, and whether the name was already taken is not
-//! part of the answer it gets back.
+//! part of the answer it gets back. Neither is what was under the name before,
+//! which a write that replaces the whole value throws away, nor whether it was
+//! even the same kind of thing.
 //!
-//! All three are things a client watching a key wants to hear about and nothing
-//! on the way out would otherwise mention.
+//! All of them are things a client watching a key wants to hear about and
+//! nothing on the way out would otherwise mention.
 //!
 //! # Why a hook and not a return value
 //!
@@ -54,6 +56,12 @@ use core::cell::Cell;
 pub enum What {
     /// It was not there a moment ago and now it is.
     Born,
+    /// The whole of what was under it has just been thrown away for something
+    /// else, which is not the same as a write that changed part of it.
+    Overwritten,
+    /// And what replaced it is a different kind of thing. Always said straight
+    /// after an [`What::Overwritten`] and never on its own.
+    TypeChanged,
     /// Its deadline had passed, found on the way past or by the cycle.
     Expired,
     /// A write needed the memory and the policy chose this one.
@@ -82,6 +90,17 @@ thread_local! {
 /// inside something that has already done it.
 pub fn tell(who: Option<Told>) -> Option<Told> {
     TELL.replace(who)
+}
+
+/// Whether anybody is listening at all.
+///
+/// For a caller that has to look something up before it can say anything. A
+/// write that replaces the whole of what was under a key has to know what kind
+/// of thing was there to say whether the kind changed, and that is a probe of
+/// the map on the way into `SET`, which is not a thing to pay for on a server
+/// where the answer would go nowhere.
+pub(crate) fn listening() -> bool {
+    TELL.get().is_some()
 }
 
 /// Say what happened to a key, if anybody asked to hear about it.

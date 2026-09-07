@@ -2239,6 +2239,97 @@ mod tests {
         );
     }
 
+    /// A write that throws away the whole of what was under a name says so, and
+    /// says the kind changed when it did.
+    #[test]
+    fn replacing_a_value_says_what_went_and_whether_the_kind_changed() {
+        let (mut r, sub, writer, mut batch) = watching_flags(b"Eoc");
+
+        r.engine_mut().feed(writer, &wire(&[b"SET", b"k", b"v"]));
+        r.engine_mut().feed(writer, &wire(&[b"SET", b"k", b"w"]));
+        r.engine_mut().feed(writer, &wire(&[b"RPUSH", b"l", b"a"]));
+        r.engine_mut().feed(writer, &wire(&[b"SET", b"l", b"v"]));
+        pump(&mut r, &mut batch);
+        assert_eq!(
+            fired(&r, sub),
+            [
+                ("overwritten", "k"),
+                ("overwritten", "l"),
+                ("type_changed", "l")
+            ]
+            .map(|(e, k)| (e.to_owned(), k.to_owned()))
+        );
+    }
+
+    /// And a write that reaches into the value that is already there says
+    /// nothing, however much of it moves.
+    #[test]
+    fn a_write_that_changes_part_of_a_value_has_not_replaced_it() {
+        let (mut r, sub, writer, mut batch) = watching_flags(b"Eoc");
+
+        r.engine_mut().feed(writer, &wire(&[b"SET", b"k", b"1"]));
+        r.engine_mut().feed(writer, &wire(&[b"APPEND", b"k", b"2"]));
+        r.engine_mut().feed(writer, &wire(&[b"INCR", b"k"]));
+        r.engine_mut()
+            .feed(writer, &wire(&[b"SETRANGE", b"k", b"0", b"9"]));
+        r.engine_mut().feed(writer, &wire(&[b"RPUSH", b"l", b"a"]));
+        r.engine_mut().feed(writer, &wire(&[b"RPUSH", b"l", b"b"]));
+        pump(&mut r, &mut batch);
+        assert_eq!(fired(&r, sub), []);
+    }
+
+    /// The one place the pair comes last rather than first, because there the
+    /// destination is a key arriving and not a value changing, so nothing
+    /// notices it going until the command says what it did.
+    #[test]
+    fn a_rename_says_what_it_replaced_after_saying_what_it_did() {
+        let (mut r, sub, writer, mut batch) = watching_flags(b"EAnoc");
+
+        r.engine_mut().feed(writer, &wire(&[b"SET", b"a", b"1"]));
+        r.engine_mut().feed(writer, &wire(&[b"RPUSH", b"b", b"x"]));
+        pump(&mut r, &mut batch);
+        r.engine_mut().sink_mut().clear();
+
+        r.engine_mut().feed(writer, &wire(&[b"RENAME", b"a", b"b"]));
+        pump(&mut r, &mut batch);
+        assert_eq!(
+            fired(&r, sub),
+            [
+                ("new", "b"),
+                ("rename_from", "a"),
+                ("rename_to", "b"),
+                ("overwritten", "b"),
+                ("type_changed", "b")
+            ]
+            .map(|(e, k)| (e.to_owned(), k.to_owned()))
+        );
+    }
+
+    /// A store form is the other way round, since there the name stays where it
+    /// stands and the old value goes before the command has done anything.
+    #[test]
+    fn a_store_form_says_what_it_replaced_before_saying_what_it_did() {
+        let (mut r, sub, writer, mut batch) = watching_flags(b"EAnoc");
+
+        r.engine_mut().feed(writer, &wire(&[b"SADD", b"s", b"m"]));
+        r.engine_mut().feed(writer, &wire(&[b"SET", b"d", b"q"]));
+        pump(&mut r, &mut batch);
+        r.engine_mut().sink_mut().clear();
+
+        r.engine_mut()
+            .feed(writer, &wire(&[b"SINTERSTORE", b"d", b"s"]));
+        pump(&mut r, &mut batch);
+        assert_eq!(
+            fired(&r, sub),
+            [
+                ("overwritten", "d"),
+                ("type_changed", "d"),
+                ("sinterstore", "d")
+            ]
+            .map(|(e, k)| (e.to_owned(), k.to_owned()))
+        );
+    }
+
     /// A subscriber on the four subkey channels and the writer that will feed
     /// them.
     ///
