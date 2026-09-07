@@ -2043,6 +2043,216 @@ mod tests {
         assert_eq!(fired(&r, sub), []);
     }
 
+    /// Taking the last field out of a hash says the key went with it, the same
+    /// as taking the last of a list or a set does.
+    #[test]
+    fn emptying_a_hash_says_the_key_went_with_the_last_field() {
+        let (mut r, sub, writer, mut batch) = watching();
+
+        r.engine_mut()
+            .feed(writer, &wire(&[b"HSET", b"h", b"a", b"1", b"b", b"2"]));
+        r.engine_mut().feed(writer, &wire(&[b"HDEL", b"h", b"a"]));
+        // The second names a field that has already gone and one that has not,
+        // so it still removed something and the hash is empty behind it.
+        r.engine_mut()
+            .feed(writer, &wire(&[b"HDEL", b"h", b"b", b"a"]));
+        pump(&mut r, &mut batch);
+        assert_eq!(
+            fired(&r, sub),
+            [("hset", "h"), ("hdel", "h"), ("hdel", "h"), ("del", "h")]
+                .map(|(e, k)| (e.to_owned(), k.to_owned()))
+        );
+    }
+
+    /// A deadline that has already passed takes the field with it, so what
+    /// comes out is the removal and not the deadline.
+    #[test]
+    fn a_field_deadline_already_past_reads_as_a_removal() {
+        let (mut r, sub, writer, mut batch) = watching();
+
+        r.engine_mut()
+            .feed(writer, &wire(&[b"HSET", b"h", b"a", b"1", b"b", b"2"]));
+        pump(&mut r, &mut batch);
+        r.engine_mut().sink_mut().clear();
+
+        r.engine_mut().feed(
+            writer,
+            &wire(&[b"HEXPIRE", b"h", b"0", b"FIELDS", b"1", b"a"]),
+        );
+        r.engine_mut().feed(
+            writer,
+            &wire(&[b"HEXPIRE", b"h", b"100", b"FIELDS", b"1", b"b"]),
+        );
+        pump(&mut r, &mut batch);
+        assert_eq!(
+            fired(&r, sub),
+            [("hdel", "h"), ("hexpire", "h")].map(|(e, k)| (e.to_owned(), k.to_owned()))
+        );
+    }
+
+    /// Writing fields under a deadline that has already gone says all three
+    /// things in order: the write, the removal it brought on, and the key.
+    #[test]
+    fn a_write_under_a_deadline_already_gone_says_the_write_first() {
+        let (mut r, sub, writer, mut batch) = watching();
+
+        r.engine_mut().feed(
+            writer,
+            &wire(&[b"HSETEX", b"h", b"EXAT", b"1", b"FIELDS", b"1", b"a", b"1"]),
+        );
+        pump(&mut r, &mut batch);
+        assert_eq!(
+            fired(&r, sub),
+            [("hset", "h"), ("hdel", "h"), ("del", "h")].map(|(e, k)| (e.to_owned(), k.to_owned()))
+        );
+    }
+
+    /// Clearing a deadline is only news for a field that had one to clear, and
+    /// the reply cannot be read for that: it is the value either way.
+    #[test]
+    fn clearing_a_deadline_that_was_never_set_says_nothing() {
+        let (mut r, sub, writer, mut batch) = watching();
+
+        r.engine_mut()
+            .feed(writer, &wire(&[b"HSET", b"h", b"a", b"1", b"b", b"2"]));
+        r.engine_mut().feed(
+            writer,
+            &wire(&[b"HEXPIRE", b"h", b"100", b"FIELDS", b"1", b"a"]),
+        );
+        pump(&mut r, &mut batch);
+        r.engine_mut().sink_mut().clear();
+
+        r.engine_mut()
+            .feed(writer, &wire(&[b"HPERSIST", b"h", b"FIELDS", b"1", b"b"]));
+        r.engine_mut().feed(
+            writer,
+            &wire(&[b"HGETEX", b"h", b"PERSIST", b"FIELDS", b"1", b"b"]),
+        );
+        pump(&mut r, &mut batch);
+        assert_eq!(fired(&r, sub), []);
+
+        // And the field that did have one says so, so the silence above is the
+        // deadline and not the subscriber having gone away.
+        r.engine_mut().feed(
+            writer,
+            &wire(&[b"HGETEX", b"h", b"PERSIST", b"FIELDS", b"2", b"a", b"b"]),
+        );
+        pump(&mut r, &mut batch);
+        assert_eq!(fired(&r, sub), [("hpersist".to_owned(), "h".to_owned())]);
+    }
+
+    /// A subscriber on the four subkey channels and the writer that will feed
+    /// them.
+    ///
+    /// The flags name no class channel, so what the subscriber gets is only
+    /// what those four published and nothing is in the answer twice.
+    fn watching_fields(flags: &[u8]) -> (Reactor<Wire<Recorder>>, ConnId, ConnId, Vec<Cmd>) {
+        let (mut r, sub, mut batch) = engine();
+        let writer = r.engine_mut().accept();
+        r.engine_mut().feed(
+            writer,
+            &wire(&[b"CONFIG", b"SET", b"notify-keyspace-events", flags]),
+        );
+        r.engine_mut()
+            .feed(sub, &wire(&[b"PSUBSCRIBE", b"__subkey*@0__:*"]));
+        pump(&mut r, &mut batch);
+        r.engine_mut().sink_mut().clear();
+        (r, sub, writer, batch)
+    }
+
+    /// The channel and payload of every subkey notification the subscriber got.
+    ///
+    /// Read off the wire rather than checked as one byte literal, because a
+    /// command that publishes on all four channels at once makes for a literal
+    /// nobody can hold in their head.
+    fn carried(r: &Reactor<Wire<Recorder>>, sub: ConnId) -> Vec<(String, String)> {
+        let sent = String::from_utf8_lossy(r.engine().sink().sent(sub)).into_owned();
+        let mut out = Vec::new();
+        let mut parts = sent.split("\r\n");
+        while let Some(p) = parts.next() {
+            if p != "pmessage" {
+                continue;
+            }
+            // Each of the three that follow is a length and then the bytes, and
+            // the first of them is the pattern, which is the same every time.
+            let mut next = || {
+                parts.next();
+                parts.next().unwrap_or_default().to_owned()
+            };
+            next();
+            let channel = next();
+            out.push((channel, next()));
+        }
+        out
+    }
+
+    /// The four channels each spell the same event a different way, and the
+    /// field list they carry is length prefixed so that a field holding a comma
+    /// reads back as one field and not two.
+    #[test]
+    fn the_subkey_channels_carry_the_fields_an_event_touched() {
+        let (mut r, sub, writer, mut batch) = watching_fields(b"ASTIV");
+
+        r.engine_mut()
+            .feed(writer, &wire(&[b"HSET", b"h", b"a,b", b"1", b"c", b"2"]));
+        pump(&mut r, &mut batch);
+        assert_eq!(
+            carried(&r, sub),
+            [
+                ("__subkeyspace@0__:h", "hset|3:a,b,1:c"),
+                ("__subkeyevent@0__:hset", "1:h|3:a,b,1:c"),
+                ("__subkeyspaceitem@0__:h\na,b", "hset"),
+                ("__subkeyspaceitem@0__:h\nc", "hset"),
+                ("__subkeyspaceevent@0__:hset|h", "3:a,b,1:c"),
+            ]
+            .map(|(c, p)| (c.to_owned(), p.to_owned()))
+        );
+    }
+
+    /// A key holding a newline cannot be told apart from the field spelled
+    /// after it on the per field channel, so that one channel is left out for
+    /// it rather than sent something nobody can read back.
+    #[test]
+    fn a_key_holding_a_newline_skips_the_per_field_channel() {
+        let (mut r, sub, writer, mut batch) = watching_fields(b"ASTIV");
+
+        r.engine_mut()
+            .feed(writer, &wire(&[b"HSET", b"h\nx", b"f", b"1"]));
+        pump(&mut r, &mut batch);
+        assert_eq!(
+            carried(&r, sub),
+            [
+                ("__subkeyspace@0__:h\nx", "hset|1:f"),
+                ("__subkeyevent@0__:hset", "3:h\nx|1:f"),
+                ("__subkeyspaceevent@0__:hset|h\nx", "1:f"),
+            ]
+            .map(|(c, p)| (c.to_owned(), p.to_owned()))
+        );
+    }
+
+    /// An event with no fields behind it goes out on the two ordinary channels
+    /// and on none of these four, however they are set, which is every event
+    /// outside the hash class and the `del` behind an emptied hash with it.
+    #[test]
+    fn an_event_with_no_fields_stays_off_the_subkey_channels() {
+        let (mut r, sub, writer, mut batch) = watching_fields(b"AS");
+
+        r.engine_mut().feed(writer, &wire(&[b"SET", b"k", b"v"]));
+        r.engine_mut().feed(writer, &wire(&[b"RPUSH", b"l", b"a"]));
+        r.engine_mut()
+            .feed(writer, &wire(&[b"HSET", b"h", b"f", b"1"]));
+        r.engine_mut().feed(writer, &wire(&[b"HDEL", b"h", b"f"]));
+        pump(&mut r, &mut batch);
+        assert_eq!(
+            carried(&r, sub),
+            [
+                ("__subkeyspace@0__:h", "hset|1:f"),
+                ("__subkeyspace@0__:h", "hdel|1:f"),
+            ]
+            .map(|(c, p)| (c.to_owned(), p.to_owned()))
+        );
+    }
+
     /// Inside a transaction each command's notifications go out before the
     /// next command runs, so `EXEC` does not bunch them all up at the end.
     #[test]

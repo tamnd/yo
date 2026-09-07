@@ -49,8 +49,20 @@
 //!
 //! Every notification belongs to a class, and a class is a character in the
 //! `notify-keyspace-events` setting. `K` and `E` are not classes but the two
-//! channels: a setting with classes and neither of those publishes nothing,
-//! which is why [`arm`] treats it as off.
+//! channels: a setting with classes and none of the channel characters publishes
+//! nothing, which is why [`arm`] treats it as off.
+//!
+//! # The subkey channels
+//!
+//! `S`, `T`, `I` and `V` are four more channels rather than four more classes,
+//! and they carry the fields an event touched alongside the key it touched. Only
+//! the hash class has fields today, so only the hash class fills them in, and an
+//! event with no fields behind it is published on the two ordinary channels and
+//! nowhere else however those four are set.
+//!
+//! They are outside `A` because they are extra copies of events that are already
+//! in it, so a client that wants both the key level and the field level view has
+//! to ask for both.
 
 use std::cell::{Cell, RefCell};
 
@@ -119,9 +131,17 @@ pub(crate) mod class {
         GENERIC | STRING | LIST | SET | HASH | ZSET | EXPIRED | EVICTED | STREAM | MODULE | ARRAY;
 }
 
-/// The two channels, so that a setting with classes and neither of them can be
+/// The four subkey channels, which are turned on and off on their own.
+///
+/// A setting of `hS` and nothing else publishes on `__subkeyspace@0__:` and on
+/// neither of the two ordinary channels, so these count towards a server having
+/// something to say just as `K` and `E` do.
+const SUBKEY: u32 =
+    class::SUBKEYSPACE | class::SUBKEYEVENT | class::SUBKEYSPACEITEM | class::SUBKEYSPACEEVENT;
+
+/// Every channel, so that a setting with classes and none of them can be
 /// recognised as publishing nothing.
-const CHANNELS: u32 = class::KEYSPACE | class::KEYEVENT;
+const CHANNELS: u32 = class::KEYSPACE | class::KEYEVENT | SUBKEY;
 
 /// Every class character, in the order `CONFIG GET` writes them.
 ///
@@ -233,6 +253,12 @@ struct Event {
     name: &'static str,
     /// The key it happened to.
     key: Vec<u8>,
+    /// The fields of that key it happened to, for the four subkey channels.
+    ///
+    /// Empty for every event outside the hash class, and empty inside it when
+    /// none of those four channels is on, which is why an empty vector has to
+    /// stay free: it is the case on nearly every notification a server sends.
+    subs: Vec<Vec<u8>>,
 }
 
 thread_local! {
@@ -258,8 +284,9 @@ thread_local! {
 /// not leave the outer one disarmed.
 ///
 /// Zero when nothing would come of a notification: notifications off, or on but
-/// with neither channel selected, or on with both but with nobody subscribed to
-/// anything at all. The last of those is the one that matters in practice,
+/// with none of the six channels selected, or on with all of them but with
+/// nobody subscribed to anything at all. The last of those is the one that
+/// matters in practice,
 /// since it is what a server with the setting in its config file and no clients
 /// listening looks like.
 pub(super) fn arm(server: &Server) -> u32 {
@@ -277,6 +304,27 @@ pub(super) fn arm(server: &Server) -> u32 {
 /// so it is worth not paying for it on a server nobody is subscribed to.
 pub(crate) fn armed() -> bool {
     ARMED.get() != 0
+}
+
+/// Whether an event in this class would reach anybody.
+///
+/// A tighter question than [`armed`], for a call site that has to build a list
+/// of field names before it can say anything at all. The hash commands are all
+/// of them: what a `HEXPIRE` says depends on which fields took the deadline and
+/// which were deleted by it, and neither list is the reply.
+pub(crate) fn wanted(class: u32) -> bool {
+    ARMED.get() & class != 0
+}
+
+/// Whether the field names alongside an event in this class would reach anybody.
+///
+/// The names cost more to collect than the event itself and they are only ever
+/// read by the four subkey channels, so a call site that would have to copy them
+/// out asks this first. This is Redis's `isSubkeyNotifyEnabled` and it is asked
+/// in the same places.
+pub(crate) fn subkeys_wanted(class: u32) -> bool {
+    let armed = ARMED.get();
+    armed & class != 0 && armed & SUBKEY != 0
 }
 
 /// The `del` that follows a removal which took the last of a collection.
@@ -301,7 +349,66 @@ pub(crate) fn fire(db: usize, class: u32, name: &'static str, key: &[u8]) {
     if ARMED.get() & class == 0 {
         return;
     }
-    keep(db, name, key);
+    keep(db, name, key, Vec::new());
+}
+
+/// The field names an event is going to carry.
+///
+/// A hash command finds out which fields it really touched while it is touching
+/// them, and its reply does not say: `HDEL k a b` answering one has not said
+/// whether it was `a` or `b` that went. So the call sites collect the names as
+/// they go, through this, which copies nothing and allocates nothing unless one
+/// of the four subkey channels is on. On a server where they are off, which is
+/// every server that has not asked for them, a `push` is a load and a branch.
+pub(crate) struct Subkeys {
+    /// The names so far, empty when nobody asked for them.
+    names: Vec<Vec<u8>>,
+    /// Whether to bother, read once when this was made.
+    wanted: bool,
+}
+
+impl Subkeys {
+    /// A collector for one class of event.
+    pub(crate) fn new(class: u32) -> Self {
+        Self {
+            names: Vec::new(),
+            wanted: subkeys_wanted(class),
+        }
+    }
+
+    /// A collector already holding these names.
+    ///
+    /// For the commands that know what they touched from their arguments alone.
+    /// `HSET` is the pattern: every field it names is a field it wrote, so there
+    /// is nothing to find out as it goes.
+    pub(crate) fn of<'a>(class: u32, names: impl Iterator<Item = &'a [u8]>) -> Self {
+        let mut subs = Self::new(class);
+        for name in names {
+            subs.push(name);
+        }
+        subs
+    }
+
+    /// Add a field name the event is about.
+    pub(crate) fn push(&mut self, name: &[u8]) {
+        if self.wanted {
+            yo_alloc::allow(|| self.names.push(name.to_vec()));
+        }
+    }
+}
+
+/// Say that something happened to some fields of a key.
+///
+/// The same event as [`fire`] on the two ordinary channels, and four more
+/// publishes on top of it on the channels that are on and have something to
+/// carry. Whether the event fires at all is the caller's question and not this
+/// one's: an empty collector is a server with the subkey channels off just as
+/// much as it is a command that touched no fields, and the caller knows which.
+pub(crate) fn fire_subkeys(db: usize, class: u32, name: &'static str, key: &[u8], subs: Subkeys) {
+    if ARMED.get() & class == 0 {
+        return;
+    }
+    keep(db, name, key, subs.names);
 }
 
 /// Copy the key out and remember it.
@@ -312,11 +419,12 @@ pub(crate) fn fire(db: usize, class: u32, name: &'static str, key: &[u8]) {
 /// command body has given that borrow back.
 #[cold]
 #[inline(never)]
-fn keep(db: usize, name: &'static str, key: &[u8]) {
+fn keep(db: usize, name: &'static str, key: &[u8], subs: Vec<Vec<u8>>) {
     let event = yo_alloc::allow(|| Event {
         db,
         name,
         key: key.to_vec(),
+        subs,
     });
     PENDING.with_borrow_mut(|pending| yo_alloc::allow(|| pending.push(event)));
 }
@@ -369,10 +477,97 @@ fn send(server: &Server, flags: u32, event: &Event) {
             pubsub::deliver(server, Kind::Channel, &name, &event.key);
         });
     }
+    // Only for an event that named fields, which is the hash class and nothing
+    // else so far. The four are independent of the two above, so a setting of
+    // `hS` publishes here and nowhere else.
+    if flags & SUBKEY != 0 && !event.subs.is_empty() {
+        yo_alloc::allow(|| subkeys(server, flags, event));
+    }
 }
 
-/// Room for `__keyspace@` and `__keyevent@`, a database number and `__:`.
-const CHANNEL_MAX: usize = 11 + 20 + 3;
+/// Publish one event on whichever of the four subkey channels is turned on.
+///
+/// Two of them put the event name in front of something else with a `|` between,
+/// so an event whose own name held a `|` could not be read back apart and those
+/// two are skipped for it. One of them puts the field after the key with a
+/// newline between and is skipped for a key holding a newline for the same
+/// reason. Both rules are Redis's, and no event fired today trips the first one.
+fn subkeys(server: &Server, flags: u32, event: &Event) {
+    let mut channel = [0u8; CHANNEL_MAX];
+    let bar = event.name.contains('|');
+    // `__subkeyspace@<db>__:<key>` carrying `<event>|<fields>`.
+    if flags & class::SUBKEYSPACE != 0 && !bar {
+        let head = prefix(&mut channel, b"__subkeyspace@", event.db);
+        let mut name = channel[..head].to_vec();
+        name.extend_from_slice(&event.key);
+        let mut payload = event.name.as_bytes().to_vec();
+        payload.push(b'|');
+        cat(&mut payload, &event.subs);
+        pubsub::deliver(server, Kind::Channel, &name, &payload);
+    }
+    // `__subkeyevent@<db>__:<event>` carrying `<keylen>:<key>|<fields>`. The key
+    // is length prefixed here because it is followed by the fields and a client
+    // splitting on the `|` alone would cut a key that holds one in half.
+    if flags & class::SUBKEYEVENT != 0 {
+        let head = prefix(&mut channel, b"__subkeyevent@", event.db);
+        let mut name = channel[..head].to_vec();
+        name.extend_from_slice(event.name.as_bytes());
+        let mut payload = Vec::new();
+        len_prefixed(&mut payload, &event.key);
+        payload.push(b'|');
+        cat(&mut payload, &event.subs);
+        pubsub::deliver(server, Kind::Channel, &name, &payload);
+    }
+    // `__subkeyspaceitem@<db>__:<key>\n<field>` carrying the event, one publish
+    // a field, which is the only one of the four a client can subscribe to
+    // without a pattern when it cares about one field of one key.
+    if flags & class::SUBKEYSPACEITEM != 0 && !event.key.contains(&b'\n') {
+        let head = prefix(&mut channel, b"__subkeyspaceitem@", event.db);
+        for sub in &event.subs {
+            let mut name = channel[..head].to_vec();
+            name.extend_from_slice(&event.key);
+            name.push(b'\n');
+            name.extend_from_slice(sub);
+            pubsub::deliver(server, Kind::Channel, &name, event.name.as_bytes());
+        }
+    }
+    // `__subkeyspaceevent@<db>__:<event>|<key>` carrying the fields on their own.
+    if flags & class::SUBKEYSPACEEVENT != 0 && !bar {
+        let head = prefix(&mut channel, b"__subkeyspaceevent@", event.db);
+        let mut name = channel[..head].to_vec();
+        name.extend_from_slice(event.name.as_bytes());
+        name.push(b'|');
+        name.extend_from_slice(&event.key);
+        let mut payload = Vec::new();
+        cat(&mut payload, &event.subs);
+        pubsub::deliver(server, Kind::Channel, &name, &payload);
+    }
+}
+
+/// Write a list of fields as `<len>:<field>[,<len>:<field>...]`.
+///
+/// Length prefixed and not just comma joined, because a field name can hold a
+/// comma and a client splitting on that alone would read one field as two.
+fn cat(into: &mut Vec<u8>, subs: &[Vec<u8>]) {
+    for (i, sub) in subs.iter().enumerate() {
+        if i > 0 {
+            into.push(b',');
+        }
+        len_prefixed(into, sub);
+    }
+}
+
+/// Write one `<len>:<bytes>`, which is what the payloads are built out of.
+fn len_prefixed(into: &mut Vec<u8>, bytes: &[u8]) {
+    let mut digits = [0u8; yo_common::num::DIGITS_MAX];
+    let len = i64::try_from(bytes.len()).unwrap_or(i64::MAX);
+    into.extend_from_slice(yo_common::num::i64_digits(&mut digits, len));
+    into.push(b':');
+    into.extend_from_slice(bytes);
+}
+
+/// Room for the longest of the six channel prefixes, a database number and `__:`.
+const CHANNEL_MAX: usize = 19 + 20 + 3;
 
 /// Write `__keyspace@<db>__:` into a buffer and answer how long it came out.
 fn prefix(into: &mut [u8; CHANNEL_MAX], head: &[u8], db: usize) -> usize {
@@ -477,5 +672,35 @@ mod tests {
         assert_eq!(&buf[..len], b"__keyspace@0__:");
         let len = prefix(&mut buf, b"__keyevent@", 15);
         assert_eq!(&buf[..len], b"__keyevent@15__:");
+        // The longest of the six has to fit alongside a database number, which
+        // is what the buffer is sized for.
+        let len = prefix(&mut buf, b"__subkeyspaceevent@", 15);
+        assert_eq!(&buf[..len], b"__subkeyspaceevent@15__:");
+    }
+
+    /// The field list a subkey payload carries, which is length prefixed so that
+    /// a field holding a comma reads back as one field.
+    #[test]
+    fn a_field_list_is_length_prefixed_and_comma_joined() {
+        let mut out = Vec::new();
+        cat(&mut out, &[b"foo".to_vec(), b"hello".to_vec()]);
+        assert_eq!(out, b"3:foo,5:hello");
+        let mut out = Vec::new();
+        cat(&mut out, &[b"a,b".to_vec()]);
+        assert_eq!(out, b"3:a,b");
+        let mut out = Vec::new();
+        cat(&mut out, &[]);
+        assert_eq!(out, b"");
+    }
+
+    /// The four subkey channels are channels and not classes, so a setting that
+    /// names one of them and no class has something to say.
+    #[test]
+    fn the_subkey_channels_count_as_channels() {
+        for one in ["S", "T", "I", "V"] {
+            let flags = parse(one.as_bytes()).unwrap();
+            assert_ne!(flags & CHANNELS, 0, "{one} should be a channel");
+        }
+        assert_eq!(parse(b"h").unwrap() & CHANNELS, 0, "h is a class");
     }
 }

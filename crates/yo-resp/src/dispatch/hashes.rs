@@ -32,6 +32,7 @@ use yo_kv::{Applied, Ask, Cond, Db, Exists, Expire, Keyspace, MAX_AT};
 
 use super::args::{self, Args};
 use super::indexing::Change;
+use super::notify::{self, Subkeys, class};
 use super::scan;
 use super::table::Spec;
 use crate::reply::Out;
@@ -95,8 +96,15 @@ const SETEX_ONE_COND: &str = "Only one of FXX or FNX arguments can be specified"
 /// is not a change by this measure, because the values are the same afterwards,
 /// and a real server does not reindex for it. `HEXPIRE key 0` is, because a
 /// deadline that has already passed takes the field away.
-pub(super) fn execute(db: &Db, spec: &Spec, args: Args<'_>, out: &mut Out) -> Result<Change> {
-    let mut held = db.hold(args.get(1));
+pub(super) fn execute(
+    db: &Db,
+    on: usize,
+    spec: &Spec,
+    args: Args<'_>,
+    out: &mut Out,
+) -> Result<Change> {
+    let key = args.get(1);
+    let mut held = db.hold(key);
     let db = &mut *held;
     let changed = match spec.name {
         // HSET and HMSET are the same write and differ only in the reply, which
@@ -105,12 +113,18 @@ pub(super) fn execute(db: &Db, spec: &Spec, args: Args<'_>, out: &mut Out) -> Re
             if args.len() < 4 || !args.len().is_multiple_of(2) {
                 return Err(args::wrong_arity(spec.name));
             }
-            let added = db.hset(args.get(1), pairs(args))?;
+            let added = db.hset(key, pairs(args))?;
             if spec.name == "hset" {
                 out.int(count(added));
             } else {
                 out.ok();
             }
+            // Every field the command named and not only the new ones, and a
+            // field written the value it already had is in there too. A real
+            // server says the same, because the event is about what the command
+            // wrote and not about what moved.
+            let named = Subkeys::of(class::HASH, pairs(args).map(|(f, _)| f));
+            notify::fire_subkeys(on, class::HASH, "hset", key, named);
             // Writing a field the value it already had still counts. A real
             // server throws the document away and reads the key again either
             // way, so the document comes back with a new number, and matching
@@ -118,40 +132,54 @@ pub(super) fn execute(db: &Db, spec: &Spec, args: Args<'_>, out: &mut Out) -> Re
             Change::Fields
         }
         "hsetnx" => {
-            let wrote = db.hsetnx(args.get(1), args.get(2), args.get(3))?;
+            let wrote = db.hsetnx(key, args.get(2), args.get(3))?;
             out.int(i64::from(wrote));
+            // `hset` and not a name of its own, so a subscriber sees one event
+            // for a field being written however it was written.
+            if wrote {
+                let one = Subkeys::of(class::HASH, std::iter::once(args.get(2)));
+                notify::fire_subkeys(on, class::HASH, "hset", key, one);
+            }
             Change::when(wrote)
         }
         "hget" => {
-            db.hget(args.get(1), args.get(2), |t| match t {
+            db.hget(key, args.get(2), |t| match t {
                 Some(t) => write_text(out, t),
                 None => out.nil(),
             })?;
             Change::Nothing
         }
         "hdel" => {
-            let gone = db.hdel(args.get(1), fields(args, 2))?;
+            // Which fields went and not how many, because the count does not
+            // say: `HDEL k a b` answering one has not said which of the two it
+            // was, and a field named twice is only reported once.
+            let mut took = Subkeys::new(class::HASH);
+            let gone = db.hdel_each(key, fields(args, 2), |field| took.push(field))?;
             out.int(count(gone));
+            if gone > 0 {
+                notify::fire_subkeys(on, class::HASH, "hdel", key, took);
+                emptied(db, on, key);
+            }
             // `Taken` and not `Fields`, which is the whole of the difference
             // between the two: `HDEL` of the last fields is a key the indexes
             // go to read and do not find, and they count that.
             Change::taken(gone > 0)
         }
         "hlen" => {
-            out.int(count(db.hlen(args.get(1))?));
+            out.int(count(db.hlen(key)?));
             Change::Nothing
         }
         "hexists" => {
-            out.int(i64::from(db.hexists(args.get(1), args.get(2))?));
+            out.int(i64::from(db.hexists(key, args.get(2))?));
             Change::Nothing
         }
         "hstrlen" => {
-            out.int(count(db.hstrlen(args.get(1), args.get(2))?));
+            out.int(count(db.hstrlen(key, args.get(2))?));
             Change::Nothing
         }
         "hmget" => {
             out.array(args.len() - 2);
-            db.hmget(args.get(1), fields(args, 2), |t| match t {
+            db.hmget(key, fields(args, 2), |t| match t {
                 Some(t) => write_text(out, t),
                 None => out.nil(),
             })?;
@@ -195,7 +223,9 @@ pub(super) fn execute(db: &Db, spec: &Spec, args: Args<'_>, out: &mut Out) -> Re
             Change::Nothing
         }
         "hincrby" => {
-            out.int(db.hincrby(args.get(1), args.get(2), incr_int(args.get(3))?)?);
+            out.int(db.hincrby(key, args.get(2), incr_int(args.get(3))?)?);
+            let one = Subkeys::of(class::HASH, std::iter::once(args.get(2)));
+            notify::fire_subkeys(on, class::HASH, "hincrby", key, one);
             Change::Fields
         }
         // HINCRBYFLOAT answers a bulk string and not a double, on RESP3 as well
@@ -205,7 +235,9 @@ pub(super) fn execute(db: &Db, spec: &Spec, args: Args<'_>, out: &mut Out) -> Re
         // what the client sees and what the next read returns.
         "hincrbyfloat" => {
             let by = incr_float(args.get(3))?;
-            out.human_double(db.hincrbyfloat(args.get(1), args.get(2), by)?);
+            out.human_double(db.hincrbyfloat(key, args.get(2), by)?);
+            let one = Subkeys::of(class::HASH, std::iter::once(args.get(2)));
+            notify::fire_subkeys(on, class::HASH, "hincrbyfloat", key, one);
             Change::Fields
         }
         "hrandfield" => {
@@ -219,20 +251,37 @@ pub(super) fn execute(db: &Db, spec: &Spec, args: Args<'_>, out: &mut Out) -> Re
         // The field TTL family. All four setters turn into one absolute
         // millisecond and all five readers turn into one question, which is why
         // there are two helpers here and not nine.
-        "hexpire" | "hpexpire" | "hexpireat" | "hpexpireat" => expire(db, spec.name, args, out)?,
+        "hexpire" | "hpexpire" | "hexpireat" | "hpexpireat" => {
+            expire(db, on, spec.name, args, out)?
+        }
         "httl" | "hpttl" | "hexpiretime" | "hpexpiretime" | "hpersist" => {
-            ask(db, spec.name, args, out)?;
+            ask(db, on, spec.name, args, out)?;
             Change::Nothing
         }
-        "hgetdel" => getdel(db, args, out)?,
+        "hgetdel" => getdel(db, on, args, out)?,
         "hgetex" => {
-            getex(db, args, out)?;
+            getex(db, on, args, out)?;
             Change::Nothing
         }
-        "hsetex" => setex(db, args, out)?,
+        "hsetex" => setex(db, on, args, out)?,
         other => unreachable!("{other} is not a hash command"),
     };
     Ok(changed)
+}
+
+/// The `del` that follows a hash losing its last field.
+///
+/// [`super::notify::emptied`] is this for every other collection and is not used
+/// here, because it takes the stripe lock to ask and every one of these commands
+/// is still holding it. From in here the question is a lookup.
+///
+/// Only called where fields really left, since a command that removed nothing
+/// from a key that was never there would otherwise answer that the key is not
+/// there and say so.
+fn emptied(db: &mut Keyspace, on: usize, key: &[u8]) {
+    if notify::armed() && !db.exists(key) {
+        notify::fire(on, class::GENERIC, "del", key);
+    }
 }
 
 /// `HRANDFIELD key [count [WITHVALUES]]`.
@@ -357,7 +406,13 @@ fn scan(db: &mut Keyspace, args: Args<'_>, out: &mut Out) -> Result<()> {
 /// What comes back is whether a field went, which is the only outcome of the
 /// four that a search index cares about. Setting a deadline for later leaves the
 /// values alone, and a real server does not reread the key for it.
-fn expire(db: &mut Keyspace, name: &str, args: Args<'_>, out: &mut Out) -> Result<Change> {
+fn expire(
+    db: &mut Keyspace,
+    on: usize,
+    name: &str,
+    args: Args<'_>,
+    out: &mut Out,
+) -> Result<Change> {
     // The p is milliseconds and the at is absolute, which is the whole of the
     // difference between the four.
     let relative = matches!(name, "hexpire" | "hpexpire");
@@ -369,13 +424,44 @@ fn expire(db: &mut Keyspace, name: &str, args: Args<'_>, out: &mut Out) -> Resul
     let at = moment(args.int(2)?, scale, relative, name, db.clock().now_ms())?;
     let (cond, from) = condition(args, 3)?;
     let fields = field_list(args, from, name)?;
+    let key = args.get(1);
 
     out.array(fields.len());
+    // Two events out of one command and the reply tells them apart: a field that
+    // took the deadline is a 1 and a field the deadline took away is a 2, and a
+    // condition that was not met is a 0 and is neither.
+    let mut took = Subkeys::new(class::HASH);
+    let mut set = Subkeys::new(class::HASH);
     let mut gone = false;
-    db.hexpire(args.get(1), at, cond, fields.iter(args), |applied| {
-        gone |= applied == Applied::Deleted;
+    let mut later = false;
+    let mut at_field = fields.from;
+    db.hexpire(key, at, cond, fields.iter(args), |applied| {
+        let field = args.get(at_field);
+        at_field += 1;
+        match applied {
+            Applied::Deleted => {
+                gone = true;
+                took.push(field);
+            }
+            Applied::Ok => {
+                later = true;
+                set.push(field);
+            }
+            Applied::Missing | Applied::NotMet => {}
+        }
         out.int(applied as i64);
     })?;
+    // The removals first and the deadlines after, which is the order a real
+    // server says them in and not the order the fields were named in.
+    if gone {
+        notify::fire_subkeys(on, class::HASH, "hdel", key, took);
+    }
+    if later {
+        notify::fire_subkeys(on, class::HASH, "hexpire", key, set);
+    }
+    if gone {
+        emptied(db, on, key);
+    }
     Ok(Change::when(gone))
 }
 
@@ -414,20 +500,36 @@ fn moment(by: i64, scale: i64, relative: bool, name: &str, now: u64) -> Result<u
 /// same question answered in four units, and `HPERSIST` asks the same question
 /// and then takes the deadline off, which is why it is here and not with the
 /// writers: its reply is built out of the same three cases.
-fn ask(db: &mut Keyspace, name: &str, args: Args<'_>, out: &mut Out) -> Result<()> {
+fn ask(db: &mut Keyspace, on: usize, name: &str, args: Args<'_>, out: &mut Out) -> Result<()> {
     let fields = field_list(args, 2, name)?;
     out.array(fields.len());
     let now = db.clock().now_ms();
     if name == "hpersist" {
-        return db.hpersist(args.get(1), fields.iter(args), |asked| {
+        let key = args.get(1);
+        // Only the fields that had a deadline to take off. A field that was
+        // already going to live forever answers -1 and is not news.
+        let mut off = Subkeys::new(class::HASH);
+        let mut any = false;
+        let mut at_field = fields.from;
+        db.hpersist(key, fields.iter(args), |asked| {
+            let field = args.get(at_field);
+            at_field += 1;
             out.int(match asked {
                 Ask::Missing => -2,
                 Ask::NoDeadline => -1,
                 // Redis replies 1 for a deadline taken off and does not say
                 // what it was, so the moment is dropped here.
-                Ask::At(_) => 1,
+                Ask::At(_) => {
+                    any = true;
+                    off.push(field);
+                    1
+                }
             });
-        });
+        })?;
+        if any {
+            notify::fire_subkeys(on, class::HASH, "hpersist", key, off);
+        }
+        return Ok(());
     }
     // What is left against when it falls due, and seconds against
     // milliseconds. The two sentinels, -2 and -1, are the same in every unit,
@@ -461,22 +563,37 @@ fn ask(db: &mut Keyspace, name: &str, args: Args<'_>, out: &mut Out) -> Result<(
 /// The value goes out and the field goes away, which a client could not do
 /// without a race before this existed. The reply is positional the way `HMGET`'s
 /// is, so a field that was not there is a nil in its own place.
-fn getdel(db: &mut Keyspace, args: Args<'_>, out: &mut Out) -> Result<Change> {
+fn getdel(db: &mut Keyspace, on: usize, args: Args<'_>, out: &mut Out) -> Result<Change> {
     if !args::is(args.get(2), b"fields") {
         return Err(Error::new(Code::Invalid, DEL_NO_FIELDS));
     }
     let fields = ex_field_list(args, 2, 1, DEL_BAD_COUNT, DEL_MISMATCH)?;
+    let key = args.get(1);
     out.array(fields.len());
     // A value handed back is a field taken away, so the reply is also the
-    // answer to whether the key changed.
+    // answer to whether the key changed and to which fields a subscriber is
+    // told about.
     let mut took = false;
-    db.hgetdel(args.get(1), fields.iter(args), |t| match t {
-        Some(t) => {
-            took = true;
-            write_text(out, t);
+    let mut gone = Subkeys::new(class::HASH);
+    let mut at_field = fields.from;
+    db.hgetdel(key, fields.iter(args), |t| {
+        let field = args.get(at_field);
+        at_field += 1;
+        match t {
+            Some(t) => {
+                took = true;
+                gone.push(field);
+                write_text(out, t);
+            }
+            None => out.nil(),
         }
-        None => out.nil(),
     })?;
+    // `hdel`, because that is what it was, and a real server even rewrites the
+    // command into an `HDEL` before it goes to a replica.
+    if took {
+        notify::fire_subkeys(on, class::HASH, "hdel", key, gone);
+        emptied(db, on, key);
+    }
     Ok(Change::when(took))
 }
 
@@ -485,14 +602,67 @@ fn getdel(db: &mut Keyspace, args: Args<'_>, out: &mut Out) -> Result<Change> {
 /// A plain `HGETEX` with no option leaves the deadline where it is, which is the
 /// one place this disagrees with `GETEX`, and it is why [`Expire::Keep`] is the
 /// default here rather than [`Expire::Clear`].
-fn getex(db: &mut Keyspace, args: Args<'_>, out: &mut Out) -> Result<()> {
-    let opts = options(db.clock().now_ms(), args, "hgetex")?;
+fn getex(db: &mut Keyspace, on: usize, args: Args<'_>, out: &mut Out) -> Result<()> {
+    let now = db.clock().now_ms();
+    let opts = options(now, args, "hgetex")?;
     let fields = ex_field_list(args, opts.fields_at, 1, EX_BAD_COUNT, EX_MISMATCH)?;
+    let key = args.get(1);
+    // `PERSIST` says nothing about a field that had no deadline to take off, and
+    // the reply is the value either way, so which fields had one is read before
+    // the command takes them off. The other four options do not need this, since
+    // there the reply already says which fields were there to touch.
+    let mut off = Subkeys::new(class::HASH);
+    let mut persisted = false;
+    if matches!(opts.expire, Expire::Clear) && notify::wanted(class::HASH) {
+        let mut at_field = fields.from;
+        db.httl(key, fields.iter(args), |asked| {
+            let field = args.get(at_field);
+            at_field += 1;
+            if matches!(asked, Ask::At(_)) {
+                persisted = true;
+                off.push(field);
+            }
+        })?;
+    }
+
     out.array(fields.len());
-    db.hgetex(args.get(1), opts.expire, fields.iter(args), |t| match t {
-        Some(t) => write_text(out, t),
-        None => out.nil(),
-    })
+    let mut touched = Subkeys::new(class::HASH);
+    let mut any = false;
+    let mut at_field = fields.from;
+    db.hgetex(key, opts.expire, fields.iter(args), |t| {
+        let field = args.get(at_field);
+        at_field += 1;
+        match t {
+            Some(t) => {
+                any = true;
+                touched.push(field);
+                write_text(out, t);
+            }
+            None => out.nil(),
+        }
+    })?;
+
+    // A deadline that has already gone takes the field with it, which is an
+    // `hdel` and not an `hexpire`, and can leave the key gone behind it.
+    let past = matches!(opts.expire, Expire::At(at) if at <= now);
+    match opts.expire {
+        // A plain `HGETEX` with no option is a read and says nothing.
+        Expire::Keep => {}
+        Expire::Clear => {
+            if persisted {
+                notify::fire_subkeys(on, class::HASH, "hpersist", key, off);
+            }
+        }
+        Expire::At(_) if any => {
+            let name = if past { "hdel" } else { "hexpire" };
+            notify::fire_subkeys(on, class::HASH, name, key, touched);
+            if past {
+                emptied(db, on, key);
+            }
+        }
+        Expire::At(_) => {}
+    }
+    Ok(())
 }
 
 /// `HSETEX key [FNX|FXX] [EX .. | KEEPTTL] FIELDS n field value [field value]`.
@@ -504,13 +674,31 @@ fn getex(db: &mut Keyspace, args: Args<'_>, out: &mut Out) -> Result<()> {
 /// A deadline that has already passed writes the fields and takes them away
 /// again, and a search index hears about both, so one command moves `max_doc_id`
 /// twice and the value it was handed is never indexed at all.
-fn setex(db: &mut Keyspace, args: Args<'_>, out: &mut Out) -> Result<Change> {
+fn setex(db: &mut Keyspace, on: usize, args: Args<'_>, out: &mut Out) -> Result<Change> {
     let now = db.clock().now_ms();
     let opts = options(now, args, "hsetex")?;
     let fields = ex_field_list(args, opts.fields_at, 2, EX_BAD_COUNT, EX_MISMATCH)?;
-    let wrote = db.hsetex(args.get(1), opts.exists, opts.expire, fields.pairs(args))?;
+    let key = args.get(1);
+    let wrote = db.hsetex(key, opts.exists, opts.expire, fields.pairs(args))?;
     out.int(i64::from(wrote));
     let past = matches!(opts.expire, Expire::At(at) if at <= now);
+    // All of it or none of it, so one look at the reply says which fields every
+    // event is about. The write first and then what the deadline did to it,
+    // which for a deadline already gone is the fields leaving again.
+    if wrote {
+        let names = || Subkeys::of(class::HASH, fields.pairs(args).map(|(f, _)| f));
+        notify::fire_subkeys(on, class::HASH, "hset", key, names());
+        match opts.expire {
+            Expire::At(_) if past => {
+                notify::fire_subkeys(on, class::HASH, "hdel", key, names());
+                emptied(db, on, key);
+            }
+            Expire::At(_) => notify::fire_subkeys(on, class::HASH, "hexpire", key, names()),
+            // A plain `HSETEX` clears the deadline and `KEEPTTL` leaves it, and
+            // neither is a deadline being set, so neither is an `hexpire`.
+            Expire::Clear | Expire::Keep => {}
+        }
+    }
     Ok(if wrote && past {
         Change::Twice
     } else {

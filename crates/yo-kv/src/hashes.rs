@@ -200,6 +200,22 @@ impl Keyspace {
         key: &[u8],
         fields: impl Iterator<Item = &'a [u8]>,
     ) -> Result<usize> {
+        self.hdel_each(key, fields, |_| {})
+    }
+
+    /// The same removal, naming each field that was actually there.
+    ///
+    /// [`Keyspace::hdel`] is this with the names thrown away, which is all a
+    /// caller wants when it is only writing. The wire layer wants them because a
+    /// keyspace subscriber is told which fields went and the count does not say:
+    /// `HDEL k a b` that answers one has not said whether it was `a` or `b`, and
+    /// a field named twice is only reported once.
+    pub fn hdel_each<'a>(
+        &mut self,
+        key: &[u8],
+        fields: impl Iterator<Item = &'a [u8]>,
+        mut f: impl FnMut(&'a [u8]),
+    ) -> Result<usize> {
         let Some(at) = self.hash_slot(key)? else {
             return Ok(0);
         };
@@ -211,6 +227,7 @@ impl Keyspace {
         for field in fields {
             if hash.remove(field) {
                 gone += 1;
+                f(field);
             }
         }
         if hash.is_empty() {
