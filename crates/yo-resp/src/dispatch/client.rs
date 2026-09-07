@@ -19,7 +19,7 @@
 //! same spelling and the same trailing newline. Where yo has nothing that
 //! matches, the field is still there with the honest number in it rather than
 //! being left out, because a parser that splits on spaces and expects a name it
-//! knows breaks on a missing field and copes with a zero. Divergence D-122 says
+//! knows breaks on a missing field and copes with a zero. Divergence D-123 says
 //! which those are.
 
 use super::args::{self, Args, is};
