@@ -1923,6 +1923,7 @@ struct Mark {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::many;
 
     fn pairs<'a>(of: &'a [(&'a str, &'a str)]) -> Vec<(&'a [u8], &'a [u8])> {
         of.iter()
@@ -2449,6 +2450,9 @@ mod tests {
     /// Nothing about the answer may depend on where the node boundaries fell.
     #[test]
     fn the_node_size_changes_nothing_but_the_node_count() {
+        // The list of node sizes stays, since it is the thing being varied.
+        // Only the number of entries poured through each one comes down.
+        let last = many(400u64);
         let mut want = None;
         for entries in [1usize, 2, 7, 100, 4096] {
             let mut s = Stream::new();
@@ -2456,12 +2460,12 @@ mod tests {
                 max_node_bytes: NODE_BYTES,
                 max_node_entries: entries,
             };
-            for ms in 1..=400u64 {
+            for ms in 1..=last {
                 let value = format!("v{ms}");
                 s.append(Id::new(ms, 0), &[(b"n", value.as_bytes())], limits)
                     .expect("an append");
             }
-            for ms in (1..=400u64).step_by(7) {
+            for ms in (1..=last).step_by(7) {
                 s.delete(Id::new(ms, 0));
             }
             let got = dump(&s);

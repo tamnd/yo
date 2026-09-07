@@ -93,13 +93,13 @@ jobs:
           fetch-depth: 0
       # Whether to run at all, and how much Miri to run when we do.
       #
-      # Two borrow models on every crate is 34 jobs and around 90 runner minutes
-      # for one push. That is the right amount for a nightly run and the wrong
-      # amount to sit through while working, so a pull request gets stacked
-      # borrows and the nightly run gets both. Stacked is the model the unsafe
-      # code was written against, tree borrows disagrees with it rarely, and
-      # when it does the nightly run says so the same day rather than the same
-      # minute.
+      # Two borrow models on every shard is 72 jobs and a couple of hours of
+      # runner time for one push. That is the right amount for a nightly run and
+      # the wrong amount to sit through while working, so a pull request gets
+      # stacked borrows and the nightly run gets both. Stacked is the model the
+      # unsafe code was written against, tree borrows disagrees with it rarely,
+      # and when it does the nightly run says so the same day rather than the
+      # same minute.
       #
       # A push that only moves prose does not need any of this. That is not a
       # nicety: a changelog line on a pull request that already ran deep costs
@@ -172,8 +172,8 @@ jobs:
       # four at a time. If that crate ever stops being the slowest, this special
       # case should go.
       #
-      # `yo-resp` and `yo-cli` are split by count, and the table in the step
-      # below says how many ways. They are split for a different reason than
+      # `yo-resp`, `yo-cli` and `yo-kv` are split by count, and the table in the
+      # step below says how many ways. They are split for a different reason than
       # `yo-record`. Miri spends about six seconds starting a process before it
       # runs a line of the test in it, and nextest gives every test its own
       # process, so `yo-resp` has a floor of over an hour before any of its six
@@ -183,18 +183,15 @@ jobs:
       # splitting itself, so no list of test names has to be kept true here as
       # tests are added.
       #
-      # Three crates are left out, and it is worth being straight about what
-      # that costs. `yo-kv`, `yo-graph` and `yo-doc` have about a hundred tests
-      # between them that take over two minutes each interpreted and about
-      # twenty that run past forty. They are slow because of what they measure: a
-      # recall figure over a few thousand vectors is a few thousand times the
-      # arithmetic of an ordinary test, and a betweenness score checked against
-      # its own definition is the definition walked. There is no smaller version
-      # of either that measures the same thing, so the fix is to go through them
-      # test by test, shrinking the ones where the count is incidental and
-      # skipping the ones where the count is the claim, which is what `yo-resp`
-      # got and what these need. That is its own piece of work and it is issue
-      # 418.
+      # Two crates are left out, and it is worth being straight about what that
+      # costs. `yo-graph` and `yo-doc` have tests that take over two minutes each
+      # interpreted. They are slow because of what they measure: a betweenness
+      # score checked against its own definition is the definition walked, and
+      # there is no smaller version of it that measures the same thing. The fix
+      # is to go through them test by test, shrinking the ones where the count is
+      # incidental and skipping the ones where the count is the claim, which is
+      # what `yo-resp` got and what these need. That is its own piece of work and
+      # it is issue 418. Neither has any unsafe code of its own.
       #
       # `yo-index` was one of the five and is back in. It took one number: the
       # walk that grows the map underneath itself put 64 keys back for every 8 it
@@ -215,9 +212,33 @@ jobs:
       # merge undoing each other forever, which cost the compiled test run half
       # its time as well. All 86 of its tests now run in about ten minutes.
       #
-      # Two of the three that are left have no unsafe code of their own. `yo-kv`
-      # has eighteen unsafe lines and those are uninterpreted until this is
-      # finished, which is the real cost of leaving it out.
+      # `yo-kv` was the third one back, and finding out why it was slow took two
+      # goes. Timing it on a laptop said the cost was spread evenly over all
+      # 1131 tests, which would have meant no amount of shrinking could help and
+      # only a wider split would. That was wrong, and it was wrong because a
+      # laptop runs the tests four at a time and charges the waiting to whoever
+      # is measuring. The numbers that count came from the runner itself, out of
+      # the six shard logs of the run that timed out. Across the 856 tests that
+      # finished there, the median is 10.9 seconds, which is the process floor
+      # and nothing more, while the mean is 42.5 seconds and twenty six tests
+      # are over half of the total. So it is outliers after all, and the worst
+      # of them never appeared in any log because it never finished: an estimate
+      # checked at ten, a hundred, a thousand, ten thousand and a hundred
+      # thousand elements, which is a hundred and eleven thousand insertions
+      # under an interpreter.
+      #
+      # Seventy eight tests were made smaller and eight are skipped. The skipped
+      # ones are all error bounds and encoding sizes, where the count is the
+      # claim and a smaller version measures something else. The rest keep an
+      # assert that would fail if the smaller number had made them vacuous, and
+      # that was checked by forcing every Miri branch on and running the whole
+      # suite compiled, which caught two of them relying on a size written down
+      # twice. Where a test crosses a threshold rather than counts to one, the
+      # threshold moves instead of the test being skipped: the listpack band is
+      # a runtime limit, so under Miri it comes down and the field count comes
+      # down with it, over the same boundary in the same code. Its eighteen
+      # unsafe lines are interpreted now, which is what leaving it out had been
+      # costing.
       - id: shards
         run: |
           rm rust-toolchain.toml
@@ -227,8 +248,8 @@ jobs:
           # which is a syntax error the runner reports six lines away from the
           # cause. The run step below passes each field as its own argument.
           echo "list=$(cargo metadata --no-deps --format-version 1 | jq -c '
-            ["yo-kv", "yo-graph", "yo-doc"] as $out
-            | { "yo-resp": 6, "yo-cli": 2 } as $split
+            ["yo-graph", "yo-doc"] as $out
+            | { "yo-resp": 6, "yo-cli": 2, "yo-kv": 8 } as $split
             | [ .packages[].name
                 | select(. != "yo-record" and ($split[.] | not) and (IN($out[]) | not))
                 | {id: ., pkg: ., filter: "", part: ""} ]
@@ -356,8 +377,10 @@ jobs:
               && '-Zmiri-tree-borrows -Zmiri-disable-isolation'
               || '-Zmiri-strict-provenance -Zmiri-disable-isolation' }}
 
-  # Twenty four shards is twenty four check names, which is more than a branch
-  # protection rule wants to know about. This is the one to require.
+  # Every shard is its own check name and there are getting on for forty of
+  # them, which is more than a branch protection rule wants to know about, and
+  # the count moves whenever a crate is added or a split is retuned. That is why
+  # the number is not written down here. This is the one to require.
   miri-done:
     needs: [wanted, miri]
     if: always() && needs.wanted.outputs.run == 'true'

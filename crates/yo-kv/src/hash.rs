@@ -1174,6 +1174,7 @@ pub fn stores_as_int(bytes: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::many;
 
     /// What a hash actually costs per field, which is the other half of M3's
     /// memory gate row and was an argument rather than a number until this was
@@ -1366,18 +1367,25 @@ mod tests {
     /// opened at the right size.
     #[test]
     fn a_promoted_hash_does_not_size_its_values_by_guesswork() {
+        // Under Miri the band moves down instead of the field count going up
+        // to meet it, so a quarter of the fields still land in a table.
+        let (limits, n) = if cfg!(miri) {
+            (&AS_TABLE, 250)
+        } else {
+            (&Limits::DEFAULT, 1000)
+        };
         let mut h = Hash::new();
-        for i in 0..1000 {
+        for i in 0..n {
             h.set(
                 format!("f{i:07}").as_bytes(),
                 format!("v{i:07}").as_bytes(),
-                &Limits::DEFAULT,
+                limits,
             );
         }
         let Body::Table(t) = &h.body else {
-            panic!("a thousand fields is the table band");
+            panic!("this many fields is the table band");
         };
-        let held = 1000 * 17;
+        let held = n * 17;
         assert!(
             t.fields.name_bytes() < held + held / 4,
             "the blob is {} bytes to hold {held}",
@@ -1708,7 +1716,7 @@ mod tests {
 
     #[test]
     fn a_scan_walks_a_hash_of_any_size_exactly_once() {
-        for hint in [0usize, 2000] {
+        for hint in [0usize, many(2000)] {
             let mut h = Hash::with_hint(hint, &SMALL);
             for i in 0..100u32 {
                 h.set(
@@ -1986,7 +1994,7 @@ mod tests {
 
     #[test]
     fn a_widened_hash_still_scans_and_draws_every_pair_once() {
-        for hint in [0usize, 2000] {
+        for hint in [0usize, many(2000)] {
             let mut h = Hash::with_hint(hint, &SMALL);
             for i in 0..100u32 {
                 h.set(

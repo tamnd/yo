@@ -1170,6 +1170,7 @@ fn slots_for(n: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::many;
 
     /// A set is this table with nothing stored against a member.
     type Set = Elements<()>;
@@ -1258,7 +1259,9 @@ mod tests {
     /// table answers correctly the whole way down.
     #[test]
     fn a_set_drained_one_draw_at_a_time_stays_correct() {
-        let names: Vec<Vec<u8>> = (0..500u32).map(|i| format!("m{i}").into_bytes()).collect();
+        let names: Vec<Vec<u8>> = (0..many(500))
+            .map(|i| format!("m{i}").into_bytes())
+            .collect();
         let mut s = Set::new();
         for n in &names {
             s.insert(n, ()).expect("room");
@@ -1298,18 +1301,19 @@ mod tests {
 
     #[test]
     fn growth_keeps_everything_findable() {
-        let names: Vec<Vec<u8>> = (0..5000u32)
+        let n = many(5000);
+        let names: Vec<Vec<u8>> = (0..n)
             .map(|i| format!("member-number-{i}").into_bytes())
             .collect();
         let mut s = Set::new();
-        for n in &names {
-            s.insert(n, ()).expect("room");
+        for name in &names {
+            s.insert(name, ()).expect("room");
         }
         assert_eq!(s.len(), names.len());
-        for n in &names {
-            assert!(s.contains(n));
+        for name in &names {
+            assert!(s.contains(name));
         }
-        assert!(!s.contains(b"member-number-5000"));
+        assert!(!s.contains(format!("member-number-{n}").as_bytes()));
     }
 
     #[test]
@@ -1321,15 +1325,18 @@ mod tests {
 
     #[test]
     fn presizing_does_not_change_what_the_table_says() {
-        let mut a = Set::with_capacity(1000);
+        // The capacity and the member count are the same number on purpose: the
+        // presized table is meant to be given exactly what it was asked for.
+        let n = many(1000);
+        let mut a = Set::with_capacity(n as usize);
         let mut b = Set::new();
-        for i in 0..1000u32 {
-            let n = format!("m{i}").into_bytes();
-            a.insert(&n, ()).expect("room");
-            b.insert(&n, ()).expect("room");
+        for i in 0..n {
+            let name = format!("m{i}").into_bytes();
+            a.insert(&name, ()).expect("room");
+            b.insert(&name, ()).expect("room");
         }
         assert_eq!(a.len(), b.len());
-        for i in 0..1000u32 {
+        for i in 0..n {
             assert!(a.contains(format!("m{i}").as_bytes()));
         }
     }
@@ -1350,7 +1357,17 @@ mod tests {
     /// where an off by one lives, so this walks across it.
     #[test]
     fn a_name_too_long_to_measure_in_a_row_reads_back_whole() {
-        let lens = [0, 1, 2, 253, 254, 255, 256, 257, 1000, NAME_MAX];
+        // The five in the middle are the line and they stay whatever happens.
+        // The last two are only there to be comfortably past it, and under Miri
+        // they come down, because a name of NAME_MAX bytes is 64 kilobytes
+        // hashed and copied on every insert, every lookup and every removal, and
+        // that one length is most of what this test costs. The largest legal
+        // name has a test of its own either way.
+        let lens = if cfg!(miri) {
+            [0, 1, 2, 253, 254, 255, 256, 257, 300, 600]
+        } else {
+            [0, 1, 2, 253, 254, 255, 256, 257, 1000, NAME_MAX]
+        };
         // Distinct bytes per name as well as distinct lengths, so a read that
         // lands on the wrong name is not hidden by every name being x's.
         let names: Vec<Vec<u8>> = lens
@@ -1389,13 +1406,13 @@ mod tests {
     #[test]
     fn long_names_survive_the_blob_giving_its_dead_bytes_back() {
         let mut s = Set::new();
-        let names: Vec<Vec<u8>> = (0..200u32)
+        let names: Vec<Vec<u8>> = (0..many(200))
             .map(|i| format!("{i:0>500}").into_bytes())
             .collect();
         for name in &names {
             s.insert(name, ()).expect("room");
         }
-        let keep: Vec<Vec<u8>> = (0..100u32)
+        let keep: Vec<Vec<u8>> = (0..many(100))
             .map(|i| format!("keep-{i:0>500}").into_bytes())
             .collect();
         for name in &keep {
@@ -1403,7 +1420,9 @@ mod tests {
         }
         let before = s.name_bytes();
         // A hundred kilobytes of dead names against fifty of live ones, which is
-        // over the floor and past the ratio, so the removals rebuild.
+        // over the floor and past the ratio, so the removals rebuild. Under Miri
+        // it is ten against five, which is the same ratio and still well over
+        // the floor.
         for name in &names {
             assert_eq!(s.remove(name), Some(()));
         }
@@ -1428,14 +1447,20 @@ mod tests {
     #[test]
     fn dead_name_bytes_come_back() {
         let mut s = Set::new();
-        let long: Vec<Vec<u8>> = (0..400u32)
-            .map(|i| format!("{i:0>64}").into_bytes())
+        // Fewer names under Miri but longer ones, because what has to hold is
+        // that the dead bytes clear the 4096 byte floor below which the blob is
+        // left alone. Ten names short of four hundred at 64 bytes is 25 kilobytes
+        // dead, and ten short of a hundred at 256 is the same 25 kilobytes for a
+        // quarter of the operations.
+        let (count, width) = if cfg!(miri) { (100, 256) } else { (400, 64) };
+        let long: Vec<Vec<u8>> = (0..count)
+            .map(|i| format!("{i:0>width$}").into_bytes())
             .collect();
         for n in &long {
             s.insert(n, ()).expect("room");
         }
         let full = s.memory_bytes();
-        for n in long.iter().take(390) {
+        for n in long.iter().take(count - 10) {
             s.remove(n).expect("there");
         }
         assert!(
@@ -1450,7 +1475,7 @@ mod tests {
             "{} bytes left dead",
             s.dead_name_bytes()
         );
-        for n in long.iter().skip(390) {
+        for n in long.iter().skip(count - 10) {
             assert!(s.contains(n), "still findable after the blob moved");
         }
     }
@@ -1473,7 +1498,7 @@ mod tests {
     #[test]
     fn no_live_slot_can_look_like_a_marker() {
         let mut s = Set::new();
-        for i in 0..2000u32 {
+        for i in 0..many(2000) {
             s.insert(format!("m{i}").as_bytes(), ()).expect("room");
         }
         let live = s.slots.iter().filter(|v| **v & ROW != ROW).count();
@@ -1520,7 +1545,9 @@ mod tests {
 
     #[test]
     fn a_removal_leaves_the_table_whole() {
-        let names: Vec<Vec<u8>> = (0..500u32).map(|i| format!("m{i}").into_bytes()).collect();
+        let names: Vec<Vec<u8>> = (0..many(500))
+            .map(|i| format!("m{i}").into_bytes())
+            .collect();
         let mut s = Set::new();
         for name in &names {
             s.insert(name, ()).expect("room");
@@ -1543,20 +1570,25 @@ mod tests {
     /// array with no empty slot in it and the next probe never stops.
     #[test]
     fn a_table_churned_in_place_does_not_fill_up_with_markers() {
+        // The two counts move together. What fills an array with markers is how
+        // many removals happen per live member, so the churn has to stay ninety
+        // nine times the population or there is nothing here to catch.
+        let held = many(1000);
+        let churn = many(100_000);
         let mut s = Set::new();
-        for i in 0..1000u32 {
+        for i in 0..held {
             s.insert(format!("m{i}").as_bytes(), ()).expect("room");
         }
         let slots = s.slots.len();
 
-        for i in 1000..100_000u32 {
-            let gone = format!("m{}", i - 1000);
+        for i in held..churn {
+            let gone = format!("m{}", i - held);
             assert!(s.remove(gone.as_bytes()).is_some());
             s.insert(format!("m{i}").as_bytes(), ()).expect("room");
-            assert_eq!(s.len(), 1000);
+            assert_eq!(s.len(), held as usize);
         }
         assert_eq!(s.slots.len(), slots, "the array is the size it started at");
-        let live: Vec<Vec<u8>> = (99_000..100_000u32)
+        let live: Vec<Vec<u8>> = (churn - held..churn)
             .map(|i| format!("m{i}").into_bytes())
             .collect();
         for name in &live {
@@ -1569,7 +1601,9 @@ mod tests {
     /// member is gone there is nothing left in the array at all.
     #[test]
     fn emptying_a_set_a_member_at_a_time_leaves_nothing_behind() {
-        let names: Vec<Vec<u8>> = (0..2000u32).map(|i| format!("m{i}").into_bytes()).collect();
+        let names: Vec<Vec<u8>> = (0..many(2000))
+            .map(|i| format!("m{i}").into_bytes())
+            .collect();
         let mut s = Set::new();
         for name in &names {
             s.insert(name, ()).expect("room");
@@ -1597,7 +1631,9 @@ mod tests {
     /// removal, so an unsuccessful probe is never longer after one than before.
     #[test]
     fn a_removal_never_makes_the_array_fuller() {
-        let names: Vec<Vec<u8>> = (0..3000u32).map(|i| format!("m{i}").into_bytes()).collect();
+        let names: Vec<Vec<u8>> = (0..many(3000))
+            .map(|i| format!("m{i}").into_bytes())
+            .collect();
         let mut s = Set::new();
         for name in &names {
             s.insert(name, ()).expect("room");
@@ -1617,18 +1653,19 @@ mod tests {
 
     #[test]
     fn a_rebuild_clears_the_markers() {
+        let n = many(1000);
         let mut s = Set::new();
-        for i in 0..1000u32 {
+        for i in 0..n {
             s.insert(format!("m{i}").as_bytes(), ()).expect("room");
         }
         // Out of order, so most of these leave a marker rather than clearing one.
-        for i in (0..1000u32).step_by(2) {
+        for i in (0..n).step_by(2) {
             s.remove(format!("m{i}").as_bytes()).expect("was there");
         }
         assert!(s.dead > 0, "some of those removals left a marker");
         s.grow_to(s.slots.len() * 2);
         assert_eq!(s.dead, 0, "and a rebuild took all of them");
-        for i in (1..1000u32).step_by(2) {
+        for i in (1..n).step_by(2) {
             assert!(s.contains(format!("m{i}").as_bytes()));
         }
     }
@@ -1647,7 +1684,9 @@ mod tests {
 
     #[test]
     fn a_scan_of_a_still_collection_returns_everything_once() {
-        let names: Vec<Vec<u8>> = (0..300u32).map(|i| format!("m{i}").into_bytes()).collect();
+        let names: Vec<Vec<u8>> = (0..many(300))
+            .map(|i| format!("m{i}").into_bytes())
+            .collect();
         let mut s = Set::new();
         for n in &names {
             s.insert(n, ()).expect("room");
@@ -1676,7 +1715,9 @@ mod tests {
     /// are not what this is checking.
     #[test]
     fn a_scan_never_misses_a_member_that_stayed() {
-        let names: Vec<Vec<u8>> = (0..400u32).map(|i| format!("m{i}").into_bytes()).collect();
+        let names: Vec<Vec<u8>> = (0..many(400))
+            .map(|i| format!("m{i}").into_bytes())
+            .collect();
         let mut s = Set::new();
         for n in &names {
             s.insert(n, ()).expect("room");

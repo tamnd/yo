@@ -555,6 +555,7 @@ impl Doorkeeper {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::many;
 
     /// A fingerprint per slot, distinct and not zero.
     fn finger(slot: Slot) -> u64 {
@@ -741,14 +742,21 @@ mod tests {
         // back an entry that is not resident and never lose one, because a
         // demotion of something that is not there writes a file record for
         // nothing and a leak is a slot the caller can never reuse.
-        let slots = 200u32;
+        // Three numbers that only mean anything against each other. The small
+        // queue is a fifth of the slots, and the workload is a hundred
+        // operations per slot so that everything gets inserted, touched,
+        // demoted and removed several times over. All three go through `many`
+        // together, which leaves both proportions where they were.
+        let slots = many(200u32);
+        let small = many(40usize);
+        let steps = many(20_000u32);
         let mut sieve = Sieve::new(slots as usize);
-        let mut s3 = S3Fifo::new(slots as usize, 40);
+        let mut s3 = S3Fifo::new(slots as usize, small);
         let mut resident_sieve = vec![false; slots as usize];
         let mut resident_s3 = vec![false; slots as usize];
         let mut x = 0x1234_5678_9abc_def0u64;
 
-        for _ in 0..20_000 {
+        for _ in 0..steps {
             x ^= x << 13;
             x ^= x >> 7;
             x ^= x << 17;

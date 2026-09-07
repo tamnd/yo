@@ -1318,6 +1318,7 @@ impl Deque {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::many;
 
     fn all(l: &List) -> Vec<Vec<u8>> {
         l.iter().map(|e| e.to_vec()).collect()
@@ -1446,10 +1447,11 @@ mod tests {
     fn a_queue_drains_in_the_order_it_filled() {
         let mut l = List::new();
         let limits = Limits::default();
-        for i in 0..5000 {
+        let n = many(5000);
+        for i in 0..n {
             l.push_back(format!("job:{i:0>40}").as_bytes(), &limits);
         }
-        for i in 0..5000 {
+        for i in 0..n {
             assert_eq!(
                 l.pop_front(&limits).unwrap(),
                 format!("job:{i:0>40}").into_bytes(),
@@ -1465,10 +1467,11 @@ mod tests {
     fn a_stack_comes_back_in_reverse() {
         let mut l = List::new();
         let limits = Limits::default();
-        for i in 0..2000 {
+        let n = many(2000);
+        for i in 0..n {
             l.push_front(format!("frame:{i:0>40}").as_bytes(), &limits);
         }
-        for i in (0..2000).rev() {
+        for i in (0..n).rev() {
             assert_eq!(
                 l.pop_front(&limits).unwrap(),
                 format!("frame:{i:0>40}").into_bytes()
@@ -1479,7 +1482,7 @@ mod tests {
 
     #[test]
     fn indexing_agrees_with_the_walk_from_both_ends() {
-        let l = chunked(1000);
+        let l = chunked(if cfg!(miri) { 300 } else { 1000 });
         let walked = all(&l);
         for (i, want) in walked.iter().enumerate() {
             assert_eq!(&l.get(i).unwrap().to_vec(), want, "at {i}");
@@ -1718,17 +1721,25 @@ mod tests {
         let mut l = List::new();
         // Long enough elements that this is many chunks and not one, and enough
         // of them that a start position lands in the middle of a chunk, at the
-        // front of one, and at the back of one.
-        for i in 0..500 {
+        // front of one, and at the back of one. The Miri size is a fifth of
+        // that, which is still several chunks, and it costs a twentieth rather
+        // than a fifth because this is every window from every start.
+        let n = if cfg!(miri) { 100usize } else { 500 };
+        let counts = if cfg!(miri) {
+            [0usize, 1, 7, 26, 100]
+        } else {
+            [0, 1, 7, 130, 500]
+        };
+        for i in 0..n {
             l.push_back(format!("e{i}:{}", "p".repeat(200)).as_bytes(), &limits);
         }
         assert_eq!(l.encoding(), Encoding::Quicklist);
         let all_of_it = all(&l);
 
-        for start in 0..=500 {
-            for count in [0usize, 1, 7, 130, 500] {
+        for start in 0..=n {
+            for count in counts {
                 let got: Vec<Vec<u8>> = l.range(start, count).map(|e| e.to_vec()).collect();
-                let want = &all_of_it[start.min(500)..(start + count).min(500)];
+                let want = &all_of_it[start.min(n)..(start + count).min(n)];
                 assert_eq!(got, want, "{count} from {start}");
             }
         }
@@ -1744,21 +1755,30 @@ mod tests {
     fn a_packed_window_lands_in_the_right_place_from_either_end() {
         let limits = Limits::default();
         let mut l = List::new();
-        for i in 0..400 {
+        // A quarter of the elements under Miri, which still puts the seam
+        // between the two directions in the middle of the blob and still costs
+        // the square of the count rather than the count.
+        let n = if cfg!(miri) { 100usize } else { 400 };
+        let counts = if cfg!(miri) {
+            [0usize, 1, 7, 33, 100]
+        } else {
+            [0, 1, 7, 130, 400]
+        };
+        for i in 0..n {
             l.push_back(format!("e{i:0>9}").as_bytes(), &limits);
         }
         assert_eq!(l.encoding(), Encoding::Listpack);
         let all_of_it = all(&l);
 
-        for start in 0..=400 {
+        for start in 0..=n {
             assert_eq!(
                 l.get(start).map(|e| e.to_vec()).as_ref(),
                 all_of_it.get(start),
                 "element {start}"
             );
-            for count in [0usize, 1, 7, 130, 400] {
+            for count in counts {
                 let got: Vec<Vec<u8>> = l.range(start, count).map(|e| e.to_vec()).collect();
-                let want = &all_of_it[start.min(400)..(start + count).min(400)];
+                let want = &all_of_it[start.min(n)..(start + count).min(n)];
                 assert_eq!(got, want, "{count} from {start}");
             }
         }
@@ -1775,14 +1795,16 @@ mod tests {
         let limits = Limits::default();
         let mut l = List::new();
         let mut want: Vec<Vec<u8>> = Vec::new();
-        for i in 0..2000 {
+        for i in 0..many(2000) {
             let v = format!("e{i}:{}", "p".repeat(100)).into_bytes();
             l.push_back(&v, &limits);
             want.push(v);
         }
         assert_eq!(l.encoding(), Encoding::Quicklist);
 
-        for round in 0..400 {
+        // The rounds come down with the list, so the head still walks the same
+        // share of it and still crosses its own chunk boundary both ways.
+        for round in 0..many(400) {
             // Enough pushes and pops to walk the head chunk across its own
             // boundary in both directions rather than only inside it.
             if round % 3 == 0 {
@@ -1889,7 +1911,8 @@ mod tests {
     fn positions_agree_with_the_element_walk_across_a_ring_of_chunks() {
         let limits = Limits::default();
         let mut l = List::new();
-        for i in 0..4_000usize {
+        let n = many(4_000usize);
+        for i in 0..n {
             let v = if i % 7 == 0 {
                 b"wanted".to_vec()
             } else {
@@ -1898,7 +1921,7 @@ mod tests {
             l.push_back(&v, &limits);
         }
         assert_eq!(l.encoding(), Encoding::Quicklist, "this needs the ring");
-        let want: Vec<usize> = (0..4_000).filter(|i| i % 7 == 0).collect();
+        let want: Vec<usize> = (0..n).filter(|i| i % 7 == 0).collect();
 
         let mut got = Vec::new();
         assert_eq!(
@@ -1926,24 +1949,26 @@ mod tests {
         assert_eq!(got, tail);
 
         // And a budget, which has to be spent across the whole ring rather than
-        // per chunk: a thousand elements reaches every match under a thousand.
+        // per chunk: a quarter of the list reaches the matches in that quarter
+        // and no others, from whichever end the walk starts.
+        let budget = n / 4;
         let mut got = Vec::new();
-        l.positions(b"wanted", 1, 0, 1_000, &mut |at| got.push(at));
+        l.positions(b"wanted", 1, 0, budget, &mut |at| got.push(at));
         assert_eq!(
             got,
             want.iter()
                 .copied()
-                .filter(|&i| i < 1_000)
+                .filter(|&i| i < budget)
                 .collect::<Vec<_>>()
         );
         let mut got = Vec::new();
-        l.positions(b"wanted", -1, 0, 1_000, &mut |at| got.push(at));
+        l.positions(b"wanted", -1, 0, budget, &mut |at| got.push(at));
         got.reverse();
         assert_eq!(
             got,
             want.iter()
                 .copied()
-                .filter(|&i| i >= 3_000)
+                .filter(|&i| i >= n - budget)
                 .collect::<Vec<_>>()
         );
     }
@@ -1954,9 +1979,12 @@ mod tests {
     #[test]
     fn removing_across_a_ring_takes_out_exactly_what_was_asked_for() {
         let limits = Limits::default();
+        // Every one in five is a match either way, so the counts below are
+        // written against the size rather than spelled out.
+        let n: usize = if cfg!(miri) { 600 } else { 3_000 };
         let build = || {
             let mut l = List::new();
-            for i in 0..3_000usize {
+            for i in 0..n {
                 let v = if i % 5 == 0 {
                     b"gone".to_vec()
                 } else {
@@ -1967,30 +1995,30 @@ mod tests {
             assert_eq!(l.encoding(), Encoding::Quicklist, "this needs the ring");
             l
         };
-        let kept: Vec<Vec<u8>> = (0..3_000usize)
+        let kept: Vec<Vec<u8>> = (0..n)
             .filter(|i| i % 5 != 0)
             .map(|i| format!("element:{i:0width$}", width = 8 + i % 30).into_bytes())
             .collect();
 
         let mut l = build();
-        assert_eq!(l.remove(0, b"gone", &limits), 600);
+        assert_eq!(l.remove(0, b"gone", &limits), n / 5);
         assert_eq!(all(&l), kept);
 
         // From the front, which takes the first ten and leaves the rest.
         let mut l = build();
         assert_eq!(l.remove(10, b"gone", &limits), 10);
-        assert_eq!(l.len(), 2_990);
+        assert_eq!(l.len(), n - 10);
         assert_eq!(l.find(b"gone"), Some(40), "the eleventh was at 50");
 
         // And from the back, which takes the last ten.
         let mut l = build();
         assert_eq!(l.remove(-10, b"gone", &limits), 10);
-        assert_eq!(l.len(), 2_990);
+        assert_eq!(l.len(), n - 10);
         let mut last = 0usize;
         l.positions(b"gone", -1, 1, 0, &mut |at| last = at);
-        // The last ten matches were at 2950 up, so 2945 is now the last one and
-        // nothing in front of it moved.
-        assert_eq!(last, 2_945);
+        // The last ten matches ran up to the end, so the one before them is now
+        // the last and nothing in front of it moved.
+        assert_eq!(last, n - 55);
     }
 
     #[test]
@@ -2022,17 +2050,18 @@ mod tests {
 
     #[test]
     fn an_insert_by_index_takes_both_ends_and_the_middle() {
-        for at in [0usize, 1, 200, 399, 400] {
-            let mut l = chunked(400);
+        let n: usize = if cfg!(miri) { 200 } else { 400 };
+        for at in [0usize, 1, n / 2, n - 1, n] {
+            let mut l = chunked(n);
             let limits = Limits::default();
             let mut want = all(&l);
             assert!(l.insert(at, b"new", &limits), "inserting at {at}");
             want.insert(at, b"new".to_vec());
             assert_eq!(all(&l), want, "inserting at {at}");
-            assert_eq!(l.len(), 401);
+            assert_eq!(l.len(), n + 1);
         }
-        let mut l = chunked(400);
-        assert!(!l.insert(401, b"new", &Limits::default()));
+        let mut l = chunked(n);
+        assert!(!l.insert(n + 1, b"new", &Limits::default()));
     }
 
     #[test]
@@ -2077,15 +2106,18 @@ mod tests {
 
     #[test]
     fn a_trim_keeps_the_window_and_nothing_else() {
+        // Half the elements under Miri, which is still more than one chunk, and
+        // every window is written against the size so the ends stay the ends.
+        let n: usize = if cfg!(miri) { 200 } else { 400 };
         for (start, count) in [
-            (0usize, 400usize),
+            (0usize, n),
             (0, 10),
-            (390, 10),
-            (100, 200),
+            (n - 10, 10),
+            (n / 4, n / 2),
             (0, 0),
-            (399, 1),
+            (n - 1, 1),
         ] {
-            let mut l = chunked(400);
+            let mut l = chunked(n);
             let limits = Limits::default();
             let want = all(&l)[start..start + count].to_vec();
             l.trim(start, count, &limits);
@@ -2195,16 +2227,18 @@ mod tests {
         // whole way and never walk the code that splits and joins chunks. A
         // `list-max-listpack-size` of 8 is a real setting and it puts the band
         // change within reach of a few pushes, so the second run crosses it in
-        // both directions hundreds of times.
+        // both directions over and over.
         let (_, chunked) = model_run(&Limits::default());
         assert_eq!(chunked, 0, "the default limits should not chunk this list");
         let (packed, chunked) = model_run(&Limits::of(8));
-        assert!(packed > 200, "{packed} rounds packed");
-        assert!(chunked > 200, "{chunked} rounds chunked");
+        // Both counts come down with the round count, so the share of the run
+        // spent in each band is the thing that stays fixed.
+        assert!(packed > many(200), "{packed} rounds packed");
+        assert!(chunked > many(200), "{chunked} rounds chunked");
     }
 
-    /// Four thousand rounds of a fixed sequence of list operations against a
-    /// `Vec` that says what the answer is, and the two band counts it saw.
+    /// A long run of a fixed sequence of list operations against a `Vec` that
+    /// says what the answer is, and the two band counts it saw.
     fn model_run(limits: &Limits) -> (usize, usize) {
         let mut l = List::new();
         let mut want: Vec<Vec<u8>> = Vec::new();
@@ -2216,7 +2250,7 @@ mod tests {
             (seed >> 33) as usize
         };
         let (mut packed, mut chunked) = (0, 0);
-        for round in 0..4000 {
+        for round in 0..many(4000) {
             let n = next();
             let value = match n % 4 {
                 0 => format!("{}", n % 97).into_bytes(),
@@ -2350,7 +2384,9 @@ mod tests {
     /// and then a walk inside one.
     #[test]
     fn a_ring_comes_back_with_the_same_chunk_boundaries() {
-        let l = chunked(2000);
+        // Fewer chunks under Miri but still more than the two that would make
+        // it a ring only by name.
+        let l = chunked(if cfg!(miri) { 500 } else { 2000 });
         let Body::Chunks(before) = &l.body else {
             unreachable!("chunked built a ring");
         };

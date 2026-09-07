@@ -159,6 +159,7 @@ impl Keyspace {
 mod tests {
     use super::*;
     use crate::clock::Clock;
+    use crate::many;
 
     fn db() -> Keyspace {
         Keyspace::with_clock(Clock::fixed(1_000))
@@ -166,30 +167,34 @@ mod tests {
 
     #[test]
     fn a_database_with_no_deadlines_anywhere_is_not_swept() {
+        let n = many(2_000u32);
         let mut d = db();
-        for i in 0..2_000u32 {
+        for i in 0..n {
             d.set_plain(format!("k{i}").as_bytes(), b"v").expect("room");
         }
         let c = d.expire_cycle(4096);
         assert_eq!(c, Cycle::default(), "it should not have drawn anything");
-        assert_eq!(d.len(), 2_000);
+        assert_eq!(d.len(), n as usize);
     }
 
     #[test]
     fn dead_keys_nobody_reads_are_reclaimed() {
+        // Half with a deadline and half without either way, which is the mix
+        // the sweep has to pick its way through.
+        let n = many(2_000u32);
         let mut d = db();
-        for i in 0..2_000u32 {
+        for i in 0..n {
             d.psetex(format!("d{i}").as_bytes(), 100, b"v")
                 .expect("room");
         }
-        for i in 0..2_000u32 {
+        for i in 0..n {
             d.set_plain(format!("k{i}").as_bytes(), b"v").expect("room");
         }
-        assert_eq!(d.expires(), 2_000);
+        assert_eq!(d.expires(), n as usize);
         d.clock().advance(200);
         assert_eq!(
             d.len(),
-            4_000,
+            n as usize * 2,
             "and nothing has read them, so they are all still there"
         );
 
@@ -203,9 +208,13 @@ mod tests {
             }
         }
         assert_eq!(d.expires(), 0, "spent {spent} looks and did not finish");
-        assert_eq!(d.len(), 2_000, "the keys with no deadline are untouched");
-        assert_eq!(d.expired_keys(), 2_000);
-        for i in 0..2_000u32 {
+        assert_eq!(
+            d.len(),
+            n as usize,
+            "the keys with no deadline are untouched"
+        );
+        assert_eq!(d.expired_keys(), u64::from(n));
+        for i in 0..n {
             assert!(d.exists(format!("k{i}").as_bytes()));
         }
     }
@@ -224,8 +233,13 @@ mod tests {
     /// number a test should hold is the shape and not the arithmetic.
     #[test]
     fn a_sweep_only_looks_at_keys_that_could_have_expired() {
+        // Only the permanent keys come down under Miri. The hundred with
+        // deadlines stay, because the bound below is written against them and
+        // a round that overshoots by the rest of a bucket would eat a smaller
+        // one.
+        let keys = many(10_000u32);
         let mut d = db();
-        for i in 0..10_000u32 {
+        for i in 0..keys {
             d.set_plain(format!("k{i}").as_bytes(), b"v").expect("room");
         }
         for i in 0..100u32 {
@@ -248,7 +262,7 @@ mod tests {
             }
         }
         assert_eq!(d.expires(), 0);
-        assert_eq!(d.len(), 10_000, "and it took none of the others");
+        assert_eq!(d.len(), keys as usize, "and it took none of the others");
         assert!(
             spent <= 200,
             "spent {spent} looks to reclaim a hundred keys"
@@ -272,8 +286,9 @@ mod tests {
 
     #[test]
     fn the_budget_is_a_ceiling_on_what_a_sweep_looks_at() {
+        let n = many(5_000u32);
         let mut d = db();
-        for i in 0..5_000u32 {
+        for i in 0..n {
             d.psetex(format!("d{i}").as_bytes(), 100, b"v")
                 .expect("room");
         }
@@ -284,7 +299,8 @@ mod tests {
         // asking before every entry.
         let c = d.expire_cycle(1);
         assert!(c.examined <= 8, "one round looked at {} keys", c.examined);
-        assert!(d.expires() > 4_900, "and it barely touched the database");
+        let left = n as usize - n as usize / 50;
+        assert!(d.expires() > left, "and it barely touched the database");
     }
 
     /// The ratio has to be over the keys that could expire and not over every key
@@ -292,11 +308,14 @@ mod tests {
     /// bar and its dead keys are never swept however many there are.
     #[test]
     fn a_mostly_permanent_database_still_gets_its_dead_keys_back() {
+        // Both counts come down together, because one percent volatile is the
+        // thing being claimed and not the ten thousand it is one percent of.
+        let (keys, dying) = (many(10_000u32), many(100u32));
         let mut d = db();
-        for i in 0..10_000u32 {
+        for i in 0..keys {
             d.set_plain(format!("k{i}").as_bytes(), b"v").expect("room");
         }
-        for i in 0..100u32 {
+        for i in 0..dying {
             d.psetex(format!("d{i}").as_bytes(), 100, b"v")
                 .expect("room");
         }
@@ -309,7 +328,7 @@ mod tests {
             }
         }
         assert_eq!(d.expires(), 0, "one percent volatile, spent {spent} looks");
-        assert_eq!(d.len(), 10_000);
+        assert_eq!(d.len(), keys as usize);
     }
 
     #[test]
