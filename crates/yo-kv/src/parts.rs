@@ -579,6 +579,7 @@ impl<V: Copy> Parts<V> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::many;
 
     /// A collection of `n` members named the way a benchmark would name them.
     fn filled(n: usize, parts: u32) -> Parts<u32> {
@@ -746,7 +747,9 @@ mod tests {
     /// straightforward O(P) walk it replaces.
     #[test]
     fn the_two_level_resolve_agrees_with_the_flat_one() {
-        let p = filled(5_000, 128);
+        // The partition count stays, because two levels is what is being
+        // resolved, and this costs the members times the partitions.
+        let p = filled(many(5_000), 128);
         for idx in 0..p.len() {
             let mut seen = 0usize;
             let flat = p
@@ -834,7 +837,10 @@ mod tests {
     /// instead of down and never finishes.
     #[test]
     fn a_scan_finishes_at_the_largest_layout() {
-        let p = filled(8_000, MAX_PARTS);
+        // The layout is what is being scanned here, not the fill, so only the
+        // member count comes down and the partition count stays at the ceiling.
+        let n = many(8_000);
+        let p = filled(n, MAX_PARTS);
         assert_eq!(p.parts(), MAX_PARTS);
         assert_eq!(
             Cursor::at(p.parts(), p.parts() - 1, 0).parts(),
@@ -855,8 +861,8 @@ mod tests {
         seen.sort_unstable();
         let before = seen.len();
         seen.dedup();
-        assert_eq!(before, 8_000);
-        assert_eq!(seen.len(), 8_000);
+        assert_eq!(before, n);
+        assert_eq!(seen.len(), n);
     }
 
     #[test]
@@ -881,16 +887,19 @@ mod tests {
     /// though the collection doubled its layout halfway through.
     #[test]
     fn a_scan_survives_the_collection_growing_underneath_it() {
-        let mut p = filled(4_000, 4);
+        // The page comes down with the fill, so the first read still covers
+        // about a sixth of the collection and the growth still lands part way.
+        let (n, page) = (many(4_000), many(700));
+        let mut p = filled(n, 4);
         let mut seen = Vec::new();
-        let mut cursor = p.scan(Cursor::START, 700, |_, &v| seen.push(v));
+        let mut cursor = p.scan(Cursor::START, page, |_, &v| seen.push(v));
         assert!(!cursor.is_end());
         assert!(p.grow_to(16));
         assert_eq!(p.parts(), 16);
-        assert_eq!(p.len(), 4_000);
+        assert_eq!(p.len(), n);
         let mut rounds = 0;
         loop {
-            cursor = p.scan(cursor, 700, |_, &v| seen.push(v));
+            cursor = p.scan(cursor, page, |_, &v| seen.push(v));
             rounds += 1;
             assert!(rounds < 1_000, "the scan is not finishing");
             if cursor.is_end() {
@@ -899,22 +908,25 @@ mod tests {
         }
         seen.sort_unstable();
         seen.dedup();
-        assert_eq!(seen.len(), 4_000, "the growth lost a member");
+        assert_eq!(seen.len(), n, "the growth lost a member");
     }
 
     /// The other half of the same guarantee. Members removed during a scan may
     /// or may not come back, but every member left at the end must.
     #[test]
     fn a_scan_under_removals_returns_everything_that_stayed() {
-        let mut p = filled(2_000, 8);
+        // A quarter of the collection goes away mid scan either way, and the
+        // page comes down with it so the removals still land part way through.
+        let (n, page, gone) = (many(2_000u32), many(300), many(500u32));
+        let mut p = filled(n as usize, 8);
         let mut seen = Vec::new();
-        let mut cursor = p.scan(Cursor::START, 300, |_, &v| seen.push(v));
-        for i in 0..500 {
+        let mut cursor = p.scan(Cursor::START, page, |_, &v| seen.push(v));
+        for i in 0..gone {
             p.remove(format!("member:{i}").as_bytes());
         }
         let mut rounds = 0;
         loop {
-            cursor = p.scan(cursor, 300, |_, &v| seen.push(v));
+            cursor = p.scan(cursor, page, |_, &v| seen.push(v));
             rounds += 1;
             assert!(rounds < 1_000, "the scan is not finishing");
             if cursor.is_end() {
@@ -923,7 +935,7 @@ mod tests {
         }
         seen.sort_unstable();
         seen.dedup();
-        for v in 500..2_000u32 {
+        for v in gone..n {
             assert!(
                 seen.contains(&v),
                 "member:{v} stayed and was never returned"
@@ -933,7 +945,8 @@ mod tests {
 
     #[test]
     fn growing_splits_a_partition_and_moves_nothing_else() {
-        let mut p = filled(4_000, 4);
+        let n = many(4_000);
+        let mut p = filled(n, 4);
         // Where every member sat before, by partition.
         let before: Vec<(Vec<u8>, usize)> = (0..4)
             .flat_map(|at| {
@@ -952,11 +965,8 @@ mod tests {
                 "{name:?} moved from {was} to {now}, which is not a split"
             );
         }
-        assert_eq!(p.len(), 4_000);
-        assert_eq!(
-            p.lengths().iter().map(|&n| n as usize).sum::<usize>(),
-            4_000
-        );
+        assert_eq!(p.len(), n);
+        assert_eq!(p.lengths().iter().map(|&n| n as usize).sum::<usize>(), n);
     }
 
     #[test]
@@ -984,20 +994,21 @@ mod tests {
 
     #[test]
     fn promotion_carries_every_element_across() {
+        let n = many(5_000u32);
         let mut one = Elements::<u32>::new();
-        for i in 0..5_000u32 {
+        for i in 0..n {
             one.insert(format!("member:{i}").as_bytes(), i)
                 .expect("room");
         }
         let p = Parts::from_table(&one, 8);
-        assert_eq!(p.len(), 5_000);
+        assert_eq!(p.len(), n as usize);
         assert_eq!(p.parts(), 8);
-        for i in 0..5_000u32 {
+        for i in 0..n {
             assert_eq!(p.get(format!("member:{i}").as_bytes()), Some(&i));
         }
         assert_eq!(
             p.lengths().iter().map(|&n| n as usize).sum::<usize>(),
-            5_000
+            n as usize
         );
     }
 

@@ -599,6 +599,7 @@ impl<B: Blocks> Tier<B> {
 mod tests {
     use super::*;
     use crate::access::Access;
+    use crate::many;
     use yo_common::{Addr, Code, Error, Space};
 
     /// The same in memory store the `cold` unit tests use, counting its reads.
@@ -915,9 +916,10 @@ mod tests {
         // Demotion on its own frees nothing: the record it replaces becomes dead
         // bytes in a segment the arena still owns. This is the check that the
         // compaction in `relieve` is doing the part that gives it back.
+        let n = many(4_000u32);
         let mut m = RawMap::new();
         let val = vec![b'v'; 2000];
-        for i in 0..4_000u32 {
+        for i in 0..n {
             put(&mut m, &i.to_le_bytes(), &val, None);
         }
         let before = m.memory_bytes();
@@ -925,13 +927,13 @@ mod tests {
         t.relieve(&mut m, 1, Policy::AllKeysLru, 2_000_000, Lfu::default())
             .expect("relieved");
 
-        // What the same four thousand keys would have cost if their values had
-        // never been in memory at all. The arena cannot hand back its last
-        // segment, so this is the floor, and asking the sweep to reach it says
-        // more than a fraction of `before` picked because it passes.
+        // What the same keys would have cost if their values had never been in
+        // memory at all. The arena cannot hand back its last segment, so this
+        // is the floor, and asking the sweep to reach it says more than a
+        // fraction of `before` picked because it passes.
         let mut bare = RawMap::new();
         let stub = vec![b'v'; 4];
-        for i in 0..4_000u32 {
+        for i in 0..n {
             put(&mut bare, &i.to_le_bytes(), &stub, None);
         }
         let floor = bare.memory_bytes();

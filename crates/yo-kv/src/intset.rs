@@ -1272,22 +1272,25 @@ mod tests {
     /// a few thousand of them.
     #[test]
     fn a_set_of_large_integers_still_stores_them_in_two_bytes() {
+        // Still several runs at the Miri size, which is what the two byte width
+        // has to survive here.
+        let n: i64 = if cfg!(miri) { 3_000 } else { 10_000 };
         let mut s = Intset::new();
-        for i in 0..10_000i64 {
+        for i in 0..n {
             s.add(1_000_000_000 + i * 3);
         }
         assert_eq!(s.width(), W16 as usize, "every run is two bytes a member");
         assert!(
-            s.byte_len() < 10_000 * 2 + s.runs() * 16,
-            "{} bytes for ten thousand members over {} runs",
+            s.byte_len() < n as usize * 2 + s.runs() * 16,
+            "{} bytes for {n} members over {} runs",
             s.byte_len(),
             s.runs()
         );
-        for i in 0..10_000i64 {
+        for i in 0..n {
             assert!(s.contains(1_000_000_000 + i * 3), "member {i}");
             assert!(!s.contains(1_000_000_000 + i * 3 + 1), "gap after {i}");
         }
-        assert_eq!(s.len(), 10_000);
+        assert_eq!(s.len(), n as usize);
     }
 
     /// A member arriving under a run's smallest moves the frame down rather
@@ -1316,17 +1319,18 @@ mod tests {
     /// could disagree with each other and nothing else would notice.
     #[test]
     fn the_frame_holds_negative_members_too() {
+        let n: i64 = if cfg!(miri) { 1_500 } else { 3_000 };
         let mut s = Intset::new();
-        for i in 0..3_000i64 {
+        for i in 0..n {
             s.add(-2_000_000_000 + i * 7);
         }
         assert_eq!(s.width(), W16 as usize);
         assert_eq!(s.min(), Some(-2_000_000_000));
-        assert_eq!(s.max(), Some(-2_000_000_000 + 2_999 * 7));
-        for i in 0..3_000i64 {
+        assert_eq!(s.max(), Some(-2_000_000_000 + (n - 1) * 7));
+        for i in 0..n {
             assert!(s.contains(-2_000_000_000 + i * 7), "member {i}");
         }
-        assert_eq!(members(&s).len(), 3_000);
+        assert_eq!(members(&s).len(), n as usize);
     }
 
     /// A run holding both ends of the sixty four bit line, which no frame helps
@@ -1361,13 +1365,16 @@ mod tests {
 
     #[test]
     fn a_set_drained_back_to_one_run_is_a_redis_intset_again() {
+        // Enough to be several runs either way, since one run is the thing this
+        // has to drain back down to.
+        let n: i64 = if cfg!(miri) { 1_500 } else { 4_000 };
         let mut s = Intset::new();
-        for i in 0..4_000i64 {
+        for i in 0..n {
             s.add(1_000_000_000 + i * 3);
         }
         assert!(s.runs.len() > 1, "several runs to start with");
         assert!(s.as_bytes().is_none(), "framed, so not a Redis intset");
-        for i in 100..4_000i64 {
+        for i in 100..n {
             s.remove(1_000_000_000 + i * 3);
         }
         sound(&s);
@@ -1679,13 +1686,20 @@ mod tests {
         // Scattered, so the splits land in the middle of runs rather than at
         // the end of the last one, which is the case an ascending fill never
         // reaches.
-        let n = 20_000i64;
+        // Under Miri it is a fifth of the members and a fifth of the runs to
+        // expect, since what makes the case is splitting many times over and
+        // not the number of times.
+        let (n, least) = if cfg!(miri) {
+            (4_000i64, 6)
+        } else {
+            (20_000, 30)
+        };
         let mut s = Intset::new();
         for i in 0..n {
             assert!(s.add((i * 7919) % n), "{i}");
         }
         assert_eq!(s.len(), n as usize);
-        assert!(s.runs() > 30, "it really did split, {} runs", s.runs());
+        assert!(s.runs() > least, "it really did split, {} runs", s.runs());
         sound(&s);
         for i in 0..n {
             assert!(s.contains(i), "{i} is a member");
@@ -1697,13 +1711,19 @@ mod tests {
 
     #[test]
     fn draining_a_split_set_folds_the_runs_back_together() {
-        let n = 5_000i64;
+        // A run holds 512, so the Miri size still splits three times and the
+        // merge still has a neighbour on both sides to choose between.
+        let (n, least) = if cfg!(miri) {
+            (1_600i64, 2)
+        } else {
+            (5_000, 5)
+        };
         let mut s = Intset::new();
         for i in 0..n {
             s.add(i);
         }
         let split = s.runs();
-        assert!(split > 5, "{split} runs to start with");
+        assert!(split > least, "{split} runs to start with");
         // Out from the middle, so runs empty out in the middle of the list and
         // the merge has a neighbour on both sides to choose between.
         for i in (0..n).map(|i| (i * 7919) % n) {
@@ -1724,12 +1744,19 @@ mod tests {
         use std::collections::BTreeSet;
         let mut s = Intset::new();
         let mut want = BTreeSet::new();
+        // Three writes for every value in the space either way, so the mix of
+        // adds that land and removes that find something is the same mix.
+        let (steps, space) = if cfg!(miri) {
+            (4_500, 1_500)
+        } else {
+            (12_000, 4_000)
+        };
         let mut x = 12_345i64;
-        for step in 0..12_000 {
+        for step in 0..steps {
             // A cheap deterministic spread, so the run boundaries move around
             // rather than the whole thing filling in one direction.
             x = x.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
-            let v = (x >> 33) % 4_000;
+            let v = (x >> 33) % space;
             if step % 3 == 2 {
                 assert_eq!(s.remove(v), want.remove(&v), "removing {v} at {step}");
             } else {
@@ -1746,19 +1773,28 @@ mod tests {
         // One array would have rewritten every member to eight bytes. Here only
         // the run the big member lands in pays for it, which is the one thing
         // this layout gives that Redis's cannot.
+        let (n, least) = if cfg!(miri) {
+            (2_000i64, 2)
+        } else {
+            (5_000, 5)
+        };
         let mut s = Intset::new();
-        for i in 0..5_000i64 {
+        for i in 0..n {
             s.add(i);
         }
         s.add(i64::MAX);
         assert_eq!(s.width(), 8, "the widest run is eight");
         let narrow = s.runs.iter().filter(|r| r.width() == 2).count();
-        assert!(narrow > 5, "only {narrow} runs stayed narrow");
+        assert!(narrow > least, "only {narrow} runs stayed narrow");
         assert_eq!(s.max(), Some(i64::MAX));
         sound(&s);
     }
 
     #[test]
+    #[cfg_attr(
+        miri,
+        ignore = "a cost spread over a population is a claim about the population"
+    )]
     fn a_run_never_holds_much_more_than_it_uses() {
         // The whole point of the representation. A `Vec` that doubled would put
         // this near four bytes a member at two byte width, and `STEP` is what
@@ -1778,7 +1814,7 @@ mod tests {
         // `at` goes down the tree and `iter` goes along the runs, and the two
         // of them agreeing at every position either side of a run boundary is
         // what makes `SRANDMEMBER` on a split set draw uniformly.
-        let n = 3_000usize;
+        let n: usize = if cfg!(miri) { 1_500 } else { 3_000 };
         let mut s = Intset::new();
         for i in 0..n as i64 {
             s.add(i * 3);

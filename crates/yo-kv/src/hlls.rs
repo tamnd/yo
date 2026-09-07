@@ -500,6 +500,10 @@ mod tests {
 
     /// The numbers a real server gives for the same elements, at three sizes.
     #[test]
+    #[cfg_attr(
+        miri,
+        ignore = "the counts are the claim, so there is no smaller version of it"
+    )]
     fn the_count_is_the_number_a_real_server_gives() {
         for (n, want) in [(100usize, 100u64), (1000, 995), (10_000, 10_077)] {
             let mut db = db();
@@ -513,6 +517,10 @@ mod tests {
 
     /// The two sizes the milestone gate names.
     #[test]
+    #[cfg_attr(
+        miri,
+        ignore = "the sizes are the claim, and only these counts reach them"
+    )]
     fn a_sketch_is_sparse_until_it_is_not() {
         let mut db = db();
         for i in 0..1000 {
@@ -585,7 +593,14 @@ mod tests {
     }
 
     /// A dense source makes the result dense, whatever the destination was.
+    ///
+    /// It takes this many elements to make a source dense in the first place,
+    /// and the count the merge comes out at is a real server's answer for them.
     #[test]
+    #[cfg_attr(
+        miri,
+        ignore = "nothing smaller is dense, and the merged count is a real server's"
+    )]
     fn a_dense_source_makes_the_result_dense() {
         let mut db = db();
         for i in 0..100 {

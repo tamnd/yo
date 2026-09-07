@@ -1151,6 +1151,7 @@ pub(crate) fn member_bytes<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::many;
     use yo_common::num::DIGITS_MAX;
 
     fn ks() -> Keyspace {
@@ -1676,8 +1677,13 @@ mod tests {
 
     #[test]
     fn a_big_sorted_set_promotes_and_still_answers_every_rank() {
+        // Every position below is a fraction of the size rather than a number,
+        // so the Miri run asks the same questions of a smaller set. It is still
+        // far past the listpack band, which is what promotes it.
+        let n = many(5_000);
+        let (mid, low) = (n / 2, n / 5);
         let mut k = ks();
-        let pairs: Vec<(f64, Vec<u8>)> = (0..5_000)
+        let pairs: Vec<(f64, Vec<u8>)> = (0..n)
             .map(|i| (f64::from(i), format!("m{i:05}").into_bytes()))
             .collect();
         assert_eq!(
@@ -1687,24 +1693,35 @@ mod tests {
                 ZAdd::default()
             )
             .unwrap(),
-            5_000
+            n as usize
         );
         assert_eq!(k.encoding_name(b"z"), Some("skiplist"));
-        assert_eq!(k.zcard(b"z").unwrap(), 5_000);
+        assert_eq!(k.zcard(b"z").unwrap(), n as usize);
+        let at_mid = format!("m{mid:05}").into_bytes();
         assert_eq!(
-            k.zrank(b"z", b"m02500", false).unwrap(),
-            Some((2_500, 2500.0))
+            k.zrank(b"z", &at_mid, false).unwrap(),
+            Some((mid as usize, f64::from(mid)))
         );
-        let q = Query::score(Bound::closed(1000.0), Bound::open(1010.0));
+        let q = Query::score(
+            Bound::closed(f64::from(low)),
+            Bound::open(f64::from(low + 10)),
+        );
         assert_eq!(k.zcount(b"z", &q).unwrap(), 10);
         assert_eq!(
             names(&mut k, b"z", &q).first().map(String::as_str),
-            Some("m01000")
+            Some(format!("m{low:05}").as_str())
         );
-        // Everything still lines up after a few thousand removals.
-        assert_eq!(k.zremrange(b"z", &Query::rank(0, 2_499)).unwrap(), 2_500);
-        assert_eq!(k.zcard(b"z").unwrap(), 2_500);
-        assert_eq!(k.zrank(b"z", b"m02500", false).unwrap(), Some((0, 2500.0)));
+        // Everything still lines up after the bottom half is taken out.
+        assert_eq!(
+            k.zremrange(b"z", &Query::rank(0, i64::from(mid) - 1))
+                .unwrap(),
+            mid as usize
+        );
+        assert_eq!(k.zcard(b"z").unwrap(), mid as usize);
+        assert_eq!(
+            k.zrank(b"z", &at_mid, false).unwrap(),
+            Some((0, f64::from(mid)))
+        );
         assert_eq!(k.zrank(b"z", b"m00000", false).unwrap(), None);
     }
 

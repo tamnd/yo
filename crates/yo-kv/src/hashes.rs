@@ -807,11 +807,30 @@ fn check_at(expire: strings::Expire) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::Clock;
     use crate::hash::Encoding;
+    use crate::{Clock, many};
 
     fn db() -> Keyspace {
         Keyspace::with_clock(Clock::fixed(1_000))
+    }
+
+    /// A keyspace and the number of fields that takes a hash past the listpack
+    /// band in it.
+    ///
+    /// The band is a runtime setting rather than a constant, so under Miri it
+    /// moves down and the field count moves with it. What is crossed is the
+    /// same boundary in the same code, and the default of 512 is pinned where
+    /// it belongs, in the limits themselves.
+    fn promoting() -> (Keyspace, u32) {
+        let mut d = db();
+        if cfg!(miri) {
+            d.set_hash_limits(crate::hash::Limits {
+                max_listpack_entries: 40,
+                ..crate::hash::Limits::DEFAULT
+            });
+            return (d, 50);
+        }
+        (d, 600)
     }
 
     fn set(d: &mut Keyspace, key: &[u8], pairs: &[(&[u8], &[u8])]) -> usize {
@@ -1031,18 +1050,18 @@ mod tests {
 
     #[test]
     fn a_hash_promotes_in_the_keyspace_and_object_encoding_says_so() {
-        let mut d = db();
+        let (mut d, n) = promoting();
         set(&mut d, b"h", &[(b"f", b"v")]);
         assert_eq!(d.hash_encoding(b"h"), Some(Encoding::Listpack));
         assert_eq!(d.encoding_name(b"h"), Some("listpack"));
 
-        for i in 0..600u32 {
+        for i in 0..n {
             let f = format!("field-{i}");
             set(&mut d, b"h", &[(f.as_bytes(), b"v")]);
         }
         assert_eq!(d.hash_encoding(b"h"), Some(Encoding::Hashtable));
         assert_eq!(d.encoding_name(b"h"), Some("hashtable"));
-        assert_eq!(d.hlen(b"h").expect("ok"), 601);
+        assert_eq!(d.hlen(b"h").expect("ok"), n as usize + 1);
         assert_eq!(
             d.hash_encoding(b"missing"),
             None,
@@ -1070,7 +1089,7 @@ mod tests {
     #[test]
     fn writing_a_string_over_a_hash_gives_the_body_back() {
         let mut d = db();
-        for i in 0..300u32 {
+        for i in 0..many(300u32) {
             let f = format!("field-{i}");
             set(&mut d, b"h", &[(f.as_bytes(), b"a value of some length")]);
         }
@@ -1089,8 +1108,12 @@ mod tests {
 
     #[test]
     fn a_scan_walks_a_hash_in_the_keyspace_exactly_once() {
+        // Fewer fields and a smaller page under Miri, so the scan still takes
+        // about fifteen rounds to get through the hash and the cursor still has
+        // to come back to the right place fourteen times.
+        let (n, page) = if cfg!(miri) { (150u32, 10) } else { (500, 32) };
         let mut d = db();
-        for i in 0..500u32 {
+        for i in 0..n {
             let f = format!("field-{i}");
             let v = format!("value-{i}");
             set(&mut d, b"h", &[(f.as_bytes(), v.as_bytes())]);
@@ -1100,7 +1123,7 @@ mod tests {
         let mut cursor = Cursor::START;
         loop {
             cursor = d
-                .hscan(b"h", cursor, 32, |f, v| seen.push((text(&f), text(&v))))
+                .hscan(b"h", cursor, page, |f, v| seen.push((text(&f), text(&v))))
                 .expect("a hash");
             if cursor == Cursor::END {
                 break;
@@ -1108,7 +1131,7 @@ mod tests {
         }
         seen.sort();
         seen.dedup();
-        assert_eq!(seen.len(), 500, "every field once and only once");
+        assert_eq!(seen.len(), n as usize, "every field once and only once");
         for (f, v) in &seen {
             assert_eq!(
                 f.strip_prefix("field-"),
@@ -1300,13 +1323,17 @@ mod tests {
 
     #[test]
     fn a_hash_that_never_expires_a_field_is_untouched_by_all_of_this() {
-        let mut d = db();
-        for i in 0..600u32 {
+        let (mut d, n) = promoting();
+        for i in 0..n {
             set(&mut d, b"h", &[(format!("f{i}").as_bytes(), b"v")]);
         }
         assert_eq!(d.encoding_name(b"h"), Some("hashtable"));
         d.clock().advance(1_000_000);
-        assert_eq!(d.hlen(b"h").expect("ok"), 600, "nothing had a deadline");
+        assert_eq!(
+            d.hlen(b"h").expect("ok"),
+            n as usize,
+            "nothing had a deadline"
+        );
     }
 
     /// `HGETDEL`, as the strings it handed back.
@@ -1616,8 +1643,8 @@ mod tests {
 
     #[test]
     fn the_last_three_reach_a_table_the_same_way_they_reach_a_listpack() {
-        let mut d = db();
-        for i in 0..600u32 {
+        let (mut d, n) = promoting();
+        for i in 0..n {
             set(&mut d, b"h", &[(format!("f{i}").as_bytes(), b"v")]);
         }
         assert_eq!(d.encoding_name(b"h"), Some("hashtable"));
@@ -1636,13 +1663,13 @@ mod tests {
         );
         assert_eq!(ttl_of(&mut d, b"h", &[b"f0"]), [Ask::NoDeadline]);
         assert_eq!(getdel(&mut d, b"h", &[b"f0"]), [Some("x".to_owned())]);
-        assert_eq!(d.hlen(b"h").expect("ok"), 599);
+        assert_eq!(d.hlen(b"h").expect("ok"), n as usize - 1);
     }
 
     #[test]
     fn a_flush_takes_the_hashes_with_it() {
         let mut d = db();
-        for i in 0..200u32 {
+        for i in 0..many(200u32) {
             let f = format!("field-{i}");
             set(&mut d, b"h", &[(f.as_bytes(), b"v")]);
         }

@@ -212,15 +212,33 @@ jobs:
       # merge undoing each other forever, which cost the compiled test run half
       # its time as well. All 86 of its tests now run in about ten minutes.
       #
-      # `yo-kv` was the third one back, and it went differently from the other
-      # two. It has 1131 tests whose median cost interpreted is seventeen
-      # seconds, so it is not slow because of a handful of outliers and shrinking
-      # them was never going to be enough on its own. Twenty six of them did
-      # come down, the ones where a member count was only there to make a table
-      # grow or a blob pass the ratio that rewrites it, and each of those keeps
-      # an assert that would fail if the smaller number had made it vacuous. The
-      # rest of the answer is the count split above. Its eighteen unsafe lines
-      # are interpreted now, which is what leaving it out had been costing.
+      # `yo-kv` was the third one back, and finding out why it was slow took two
+      # goes. Timing it on a laptop said the cost was spread evenly over all
+      # 1131 tests, which would have meant no amount of shrinking could help and
+      # only a wider split would. That was wrong, and it was wrong because a
+      # laptop runs the tests four at a time and charges the waiting to whoever
+      # is measuring. The numbers that count came from the runner itself, out of
+      # the six shard logs of the run that timed out. Across the 856 tests that
+      # finished there, the median is 10.9 seconds, which is the process floor
+      # and nothing more, while the mean is 42.5 seconds and twenty six tests
+      # are over half of the total. So it is outliers after all, and the worst
+      # of them never appeared in any log because it never finished: an estimate
+      # checked at ten, a hundred, a thousand, ten thousand and a hundred
+      # thousand elements, which is a hundred and eleven thousand insertions
+      # under an interpreter.
+      #
+      # Seventy eight tests were made smaller and eight are skipped. The skipped
+      # ones are all error bounds and encoding sizes, where the count is the
+      # claim and a smaller version measures something else. The rest keep an
+      # assert that would fail if the smaller number had made them vacuous, and
+      # that was checked by forcing every Miri branch on and running the whole
+      # suite compiled, which caught two of them relying on a size written down
+      # twice. Where a test crosses a threshold rather than counts to one, the
+      # threshold moves instead of the test being skipped: the listpack band is
+      # a runtime limit, so under Miri it comes down and the field count comes
+      # down with it, over the same boundary in the same code. Its eighteen
+      # unsafe lines are interpreted now, which is what leaving it out had been
+      # costing.
       - id: shards
         run: |
           rm rust-toolchain.toml
@@ -231,7 +249,7 @@ jobs:
           # cause. The run step below passes each field as its own argument.
           echo "list=$(cargo metadata --no-deps --format-version 1 | jq -c '
             ["yo-graph", "yo-doc"] as $out
-            | { "yo-resp": 6, "yo-cli": 2, "yo-kv": 6 } as $split
+            | { "yo-resp": 6, "yo-cli": 2, "yo-kv": 8 } as $split
             | [ .packages[].name
                 | select(. != "yo-record" and ($split[.] | not) and (IN($out[]) | not))
                 | {id: ., pkg: ., filter: "", part: ""} ]
@@ -359,9 +377,10 @@ jobs:
               && '-Zmiri-tree-borrows -Zmiri-disable-isolation'
               || '-Zmiri-strict-provenance -Zmiri-disable-isolation' }}
 
-  # Thirty six shards is thirty six check names, which is more than a branch
-  # protection rule wants to know about, and the count moves whenever a crate is
-  # added or a split is retuned. This is the one to require.
+  # Every shard is its own check name and there are getting on for forty of
+  # them, which is more than a branch protection rule wants to know about, and
+  # the count moves whenever a crate is added or a split is retuned. That is why
+  # the number is not written down here. This is the one to require.
   miri-done:
     needs: [wanted, miri]
     if: always() && needs.wanted.outputs.run == 'true'

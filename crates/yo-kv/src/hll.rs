@@ -712,6 +712,7 @@ pub fn decode(bytes: &[u8], out: &mut Vec<u8>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::many;
 
     /// The hash is the file format, so it is pinned against a real server.
     ///
@@ -815,6 +816,10 @@ mod tests {
 
     /// Enough elements to push a sketch over the sparse limit on its own.
     #[test]
+    #[cfg_attr(
+        miri,
+        ignore = "fewer elements do not outgrow the sparse form, which is the claim"
+    )]
     fn a_sketch_turns_dense_when_it_outgrows_the_sparse_form() {
         let mut buf = Vec::new();
         empty(&mut buf);
@@ -885,6 +890,10 @@ mod tests {
     /// than the two percent the parameters promise, which is what would catch a
     /// register being written in the wrong place.
     #[test]
+    #[cfg_attr(
+        miri,
+        ignore = "an error bound only means something at the sizes that produce it"
+    )]
     fn the_estimate_is_close_to_the_truth() {
         for n in [10usize, 100, 1000, 10_000, 100_000] {
             let mut buf = Vec::new();
@@ -906,6 +915,10 @@ mod tests {
     /// A sketch that counted correctly and not identically would be useless for
     /// the thing this is for, which is a client moving sketches between servers.
     #[test]
+    #[cfg_attr(
+        miri,
+        ignore = "the counts are the claim, so there is no smaller version of it"
+    )]
     fn the_estimate_is_the_number_a_real_server_gives() {
         for (n, want) in [(100usize, 100u64), (1000, 995), (10_000, 10_077)] {
             let mut buf = Vec::new();
@@ -922,6 +935,10 @@ mod tests {
 
     /// The two sizes the milestone gate names, on the elements that reach them.
     #[test]
+    #[cfg_attr(
+        miri,
+        ignore = "the sizes are the claim, and only these counts reach them"
+    )]
     fn the_two_sizes_are_the_ones_a_real_server_has() {
         let build = |n: usize| {
             let mut buf = Vec::new();
@@ -985,13 +1002,16 @@ mod tests {
             }
             buf
         };
-        let a = build(0, 500);
-        let b = build(400, 900);
+        // Two runs that overlap in the middle, so the merge has registers only
+        // one side has and registers both sides disagree about.
+        let (mid, end) = (many(400usize), many(900usize));
+        let a = build(0, end - mid);
+        let b = build(mid, end);
         let mut max = [0u8; REGISTERS];
         assert!(merge(&mut max, &a, Encoding::Sparse));
         assert!(merge(&mut max, &b, Encoding::Sparse));
 
-        let both = build(0, 900);
+        let both = build(0, end);
         let mut want = [0u8; REGISTERS];
         assert!(merge(&mut want, &both, check(&both).expect("a sketch")));
         assert_eq!(max, want);
