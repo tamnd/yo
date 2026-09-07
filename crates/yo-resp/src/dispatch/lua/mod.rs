@@ -1695,11 +1695,13 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "a Lua state is C, and Miri interprets Rust")]
     fn the_interpreter_builds() {
         interpreter().expect("prelude");
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "a Lua state is C, and Miri interprets Rust")]
     fn the_global_table_holds_what_a_script_is_allowed_to_reach() {
         let lua = interpreter().expect("prelude");
         // `KEYS` and `ARGV` are the two a run puts there, so a fresh
@@ -1737,6 +1739,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "a Lua state is C, and Miri interprets Rust")]
     fn the_redis_table_holds_the_names_a_script_calls() {
         let lua = interpreter().expect("prelude");
         // The table under the name is the empty guard with the real one behind
@@ -1758,6 +1761,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "a Lua state is C, and Miri interprets Rust")]
     fn a_body_is_checked_for_being_lua_before_it_is_remembered() {
         assert!(compiles(b"return 1").is_ok());
         assert!(compiles(b"").is_ok());
