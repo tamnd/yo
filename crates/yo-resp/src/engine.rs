@@ -1912,11 +1912,16 @@ mod tests {
     /// about the order of what came out rather than about the bytes, so the
     /// setup is here once and the checking is done by [`fired`].
     fn watching() -> (Reactor<Wire<Recorder>>, ConnId, ConnId, Vec<Cmd>) {
+        watching_flags(b"EA")
+    }
+
+    /// The same, for a test that needs a class `A` does not turn on.
+    fn watching_flags(flags: &[u8]) -> (Reactor<Wire<Recorder>>, ConnId, ConnId, Vec<Cmd>) {
         let (mut r, sub, mut batch) = engine();
         let writer = r.engine_mut().accept();
         r.engine_mut().feed(
             writer,
-            &wire(&[b"CONFIG", b"SET", b"notify-keyspace-events", b"EA"]),
+            &wire(&[b"CONFIG", b"SET", b"notify-keyspace-events", flags]),
         );
         r.engine_mut()
             .feed(sub, &wire(&[b"PSUBSCRIBE", b"__keyevent@0__:*"]));
@@ -2159,6 +2164,79 @@ mod tests {
         );
         pump(&mut r, &mut batch);
         assert_eq!(fired(&r, sub), [("hpersist".to_owned(), "h".to_owned())]);
+    }
+
+    /// A name that was free is news on its own, and a name that was taken is
+    /// not, whatever the write did to what was under it.
+    #[test]
+    fn a_key_that_was_not_there_before_says_so() {
+        let (mut r, sub, writer, mut batch) = watching_flags(b"En");
+
+        r.engine_mut().feed(writer, &wire(&[b"SET", b"k", b"v"]));
+        r.engine_mut().feed(writer, &wire(&[b"SET", b"k", b"w"]));
+        r.engine_mut().feed(writer, &wire(&[b"APPEND", b"k", b"x"]));
+        r.engine_mut().feed(writer, &wire(&[b"RPUSH", b"l", b"a"]));
+        r.engine_mut().feed(writer, &wire(&[b"RPUSH", b"l", b"b"]));
+        pump(&mut r, &mut batch);
+        assert_eq!(
+            fired(&r, sub),
+            [("new", "k"), ("new", "l")].map(|(e, k)| (e.to_owned(), k.to_owned()))
+        );
+    }
+
+    /// And it arrives in front of the write that made it, because at the moment
+    /// it is said the write has not finished happening yet.
+    #[test]
+    fn the_news_of_a_new_key_comes_before_the_write_that_made_it() {
+        let (mut r, sub, writer, mut batch) = watching_flags(b"EAn");
+
+        r.engine_mut().feed(writer, &wire(&[b"SET", b"a", b"1"]));
+        r.engine_mut().feed(writer, &wire(&[b"SET", b"b", b"2"]));
+        pump(&mut r, &mut batch);
+        r.engine_mut().sink_mut().clear();
+
+        // A rename is a key arriving under a name that was already taken, and
+        // it is still a key arriving: what was there is gone and what is there
+        // now was somewhere else a moment ago.
+        r.engine_mut().feed(writer, &wire(&[b"RENAME", b"a", b"b"]));
+        pump(&mut r, &mut batch);
+        assert_eq!(
+            fired(&r, sub),
+            [("new", "b"), ("rename_from", "a"), ("rename_to", "b")]
+                .map(|(e, k)| (e.to_owned(), k.to_owned()))
+        );
+    }
+
+    /// A store form is the other case: the name stays where it stands and only
+    /// what is under it changes, so there is no key arriving to say anything
+    /// about unless the destination was not there at all.
+    #[test]
+    fn writing_over_a_destination_is_not_a_key_arriving() {
+        let (mut r, sub, writer, mut batch) = watching_flags(b"EAn");
+
+        r.engine_mut()
+            .feed(writer, &wire(&[b"RPUSH", b"l", b"c", b"a", b"b"]));
+        r.engine_mut().feed(writer, &wire(&[b"RPUSH", b"d", b"x"]));
+        pump(&mut r, &mut batch);
+        r.engine_mut().sink_mut().clear();
+
+        r.engine_mut()
+            .feed(writer, &wire(&[b"SORT", b"l", b"ALPHA", b"STORE", b"d"]));
+        pump(&mut r, &mut batch);
+        assert_eq!(fired(&r, sub), [("sortstore".to_owned(), "d".to_owned())]);
+        r.engine_mut().sink_mut().clear();
+
+        // And the same store onto a name nobody is using says both, which is
+        // what makes the silence above the destination and not the flag.
+        r.engine_mut().feed(writer, &wire(&[b"DEL", b"d"]));
+        r.engine_mut()
+            .feed(writer, &wire(&[b"SORT", b"l", b"ALPHA", b"STORE", b"d"]));
+        pump(&mut r, &mut batch);
+        assert_eq!(
+            fired(&r, sub),
+            [("del", "d"), ("new", "d"), ("sortstore", "d")]
+                .map(|(e, k)| (e.to_owned(), k.to_owned()))
+        );
     }
 
     /// A subscriber on the four subkey channels and the writer that will feed

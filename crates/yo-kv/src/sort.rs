@@ -191,17 +191,13 @@ impl Db {
             held.stripe_mut(onto).del(dest);
             return Ok(0);
         }
-        // Written into a fresh key rather than appended to whatever was there,
-        // and the delete comes first so that `SORT k STORE k` reads k, then
-        // throws it away, then writes the answer. Redis is the same, and it is
-        // the reason the elements had to be copied out before any of this.
-        held.stripe_mut(onto).del(dest);
+        // Written over whatever was there rather than appended to it, so that
+        // `SORT k STORE k` reads k, throws away what it read, then writes the
+        // answer. Redis is the same, and it is the reason the elements had to
+        // be copied out before any of this.
         let owned: Vec<Vec<u8>> = rows.into_iter().map(Option::unwrap_or_default).collect();
-        held.stripe_mut(onto).push(
-            dest,
-            crate::lists::End::Right,
-            owned.iter().map(Vec::as_slice),
-        )
+        held.stripe_mut(onto)
+            .put_list(dest, owned.iter().map(Vec::as_slice))
     }
 
     /// Every stripe this sort can touch, held, in stripe order.

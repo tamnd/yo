@@ -67,7 +67,7 @@
 use std::cell::{Cell, RefCell};
 
 use yo_kv::Db;
-use yo_kv::reap;
+use yo_kv::news;
 
 use super::Server;
 use super::pubsub::{self, Kind};
@@ -276,13 +276,14 @@ thread_local! {
     /// test.
     static ARMED: Cell<u32> = const { Cell::new(0) };
 
-    /// Which database the keys a reap takes belong to.
+    /// Which database the keys [`heard`] is told about belong to.
     ///
     /// Every other event names its database at the call site, because the call
-    /// site is a command and a command knows which one it is running against. A
-    /// reap has no call site in that sense: it happens under a lookup, or under
-    /// the cycle, and the storage layer that notices it has never heard of a
-    /// database number. So the funnel leaves the answer here on its way in.
+    /// site is a command and a command knows which one it is running against.
+    /// These have no call site in that sense: a key goes under a lookup or under
+    /// the expire cycle and a key arrives under whatever wrote it, and the
+    /// storage layer that notices either has never heard of a database number.
+    /// So the funnel leaves the answer here on its way in.
     static WHERE: Cell<usize> = const { Cell::new(0) };
 }
 
@@ -290,13 +291,13 @@ thread_local! {
 ///
 /// `EXEC` and a script run commands through the funnel while a command is
 /// already running, so the inner one has to leave the outer one as it found it.
-/// Both halves matter: `SELECT` is allowed inside `MULTI`, so the database a
-/// reap belongs to is not the same for the whole of an `EXEC`.
+/// Both halves matter: `SELECT` is allowed inside `MULTI`, so the database the
+/// storage layer's news belongs to is not the same for the whole of an `EXEC`.
 #[derive(Clone, Copy)]
 pub(super) struct Armed {
     /// The classes that were worth saying anything about.
     flags: u32,
-    /// The database reaps were being attributed to.
+    /// The database the storage layer's news was being attributed to.
     db: usize,
 }
 
@@ -313,30 +314,32 @@ pub(super) fn arm(server: &Server, db: usize) -> Armed {
     let flags = server.notify_flags();
     let live = flags & CHANNELS != 0 && server.anyone_subscribed();
     // Unconditionally, because a listener that is installed and not armed costs
-    // one load and one test on a path that has just deleted a key, and because
-    // taking it off again would mean knowing whether this is the outermost
-    // funnel, which is a thing nothing else here has to know.
-    reap::tell(Some(reaped));
+    // one load and one test on a path that has just written or deleted a key,
+    // and because taking it off again would mean knowing whether this is the
+    // outermost funnel, which is a thing nothing else here has to know.
+    news::tell(Some(heard));
     Armed {
         flags: ARMED.replace(if live { flags } else { 0 }),
         db: WHERE.replace(db),
     }
 }
 
-/// Say that a key went when nobody asked for it.
+/// Say what happened to a key that no command's reply covers.
 ///
-/// Installed by [`arm`] and called by the storage layer at the moment the key
-/// goes, which is before the command that provoked it has done its own work.
+/// Installed by [`arm`] and called by the storage layer at the moment it
+/// happens, which is before the command that provoked it has said what it did.
 /// That is the order a real server publishes in and it comes out of where this
 /// is called from rather than out of anything here.
-fn reaped(key: &[u8], why: reap::Why) {
-    let (class, name) = match why {
-        reap::Why::Expired => (class::EXPIRED, "expired"),
-        reap::Why::Evicted => (class::EVICTED, "evicted"),
+fn heard(key: &[u8], what: news::What) {
+    // None of the three brings a companion event along with it. A key that
+    // reached its deadline and a key a client deleted are two different pieces
+    // of news, and so are a key that was created and the write that created it,
+    // and a subscriber that wanted both asked for both.
+    let (class, name) = match what {
+        news::What::Born => (class::NEW, "new"),
+        news::What::Expired => (class::EXPIRED, "expired"),
+        news::What::Evicted => (class::EVICTED, "evicted"),
     };
-    // And not a `del` alongside it. A key that reached its deadline and a key a
-    // client deleted are two different pieces of news, and a subscriber that
-    // wanted both asked for both.
     fire(WHERE.get(), class, name, key);
 }
 
