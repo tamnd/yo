@@ -58,6 +58,7 @@ mod bits;
 mod blocking;
 mod bloom;
 mod client;
+mod clients;
 mod cms;
 mod cpu;
 mod cuckoo;
@@ -94,6 +95,7 @@ mod zsets;
 
 pub use args::Args;
 pub use blocking::{Parked, Waiters};
+pub use clients::Client;
 pub(crate) use pubsub::Envelope;
 pub use server::parse_memory;
 pub use table::{COMMANDS, Spec, arity_ok, lookup};
@@ -101,6 +103,7 @@ pub use table::{COMMANDS, Spec, arity_ok, lookup};
 use crate::reply::Out;
 use std::cell::Cell;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::atomic::Ordering::{Acquire, Relaxed, Release};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize};
 use yo_common::lock::{Held, Lock};
@@ -772,6 +775,18 @@ pub struct Server {
     /// Redis's own, kept in the `notify` module beside the two parsers that
     /// turn them into the setting text and back.
     notify: AtomicU32,
+    /// One row per open connection, which is what `CLIENT LIST` reads and what
+    /// `CLIENT KILL` writes to.
+    ///
+    /// Here and not on the front for the reason the watches and the
+    /// subscriptions are here: both commands are about connections the thread
+    /// running them does not own and cannot borrow. See the `clients` module.
+    clients: Lock<clients::Clients>,
+    /// How many connections have been asked to close and not closed yet.
+    ///
+    /// Zero on every server nobody has run `CLIENT KILL` on, which is what keeps
+    /// the check on the flush path down to one load.
+    kills: AtomicUsize,
 }
 
 impl Server {
@@ -814,6 +829,8 @@ impl Server {
             pubsub: Lock::default(),
             subs: AtomicUsize::new(0),
             notify: AtomicU32::new(0),
+            clients: Lock::default(),
+            kills: AtomicUsize::new(0),
             mail: pubsub::boxes(1),
         }
     }
@@ -880,6 +897,8 @@ impl Server {
             pubsub: Lock::default(),
             subs: AtomicUsize::new(0),
             notify: AtomicU32::new(0),
+            clients: Lock::default(),
+            kills: AtomicUsize::new(0),
             mail: pubsub::boxes(1),
         }
     }
@@ -1787,70 +1806,6 @@ impl Default for Server {
     }
 }
 
-/// What the socket under a connection is, and what has gone over it.
-///
-/// Everything `CLIENT INFO` reports that is not a choice the client made. It
-/// lives on the session rather than on the front because the command that
-/// reports it is handed a session and never sees the front, and it is filled in
-/// by the front and by whatever opened the socket, which are the only two places
-/// that know any of it.
-///
-/// A session nobody tells has an empty address and a file descriptor of minus
-/// one, which is what an embedded caller and every test gets.
-#[derive(Default)]
-pub struct Socket {
-    /// Where the client is dialling from, as `ip:port`, or the socket path with
-    /// `:0` after it for a Unix connection, which is Redis's spelling for both.
-    peer: Vec<u8>,
-    /// The address on this side, in the same two spellings.
-    local: Vec<u8>,
-    /// The descriptor number, or minus one when there is no socket.
-    fd: i32,
-    /// Whether it is a Unix socket, which the `flags` field reports as `U`.
-    ///
-    /// Kept as a flag rather than read back out of the address, because the two
-    /// addresses are strings meant for a person and nothing else should be
-    /// deciding anything by looking at them.
-    unix: bool,
-    /// When the connection was accepted, for `age`.
-    since_ms: u64,
-    /// When it last sent a command, for `idle`.
-    last_ms: u64,
-    /// Bytes read off the socket and bytes handed to it.
-    net_in: u64,
-    net_out: u64,
-    /// Commands run for this connection, and reads that carried at least one.
-    ///
-    /// The pair behind `avg-pipeline-len-sum` and `avg-pipeline-len-cnt`, which
-    /// a client divides one by the other to see how deep the pipelining is.
-    cmds: u64,
-    reads: u64,
-    /// The name of the last command, with the subcommand after a bar when it
-    /// had one, which is `cmd` in the report.
-    ///
-    /// A static string because it is the table's own name for the command and
-    /// the table outlives every connection, so noting it is a pointer store and
-    /// not a copy.
-    last: &'static str,
-    /// The subcommand alongside it, and the same argument for the lifetime: it
-    /// is a slice of the connection's read buffer only for as long as the
-    /// command runs, so it is copied, and the copy is short and reused.
-    sub: Vec<u8>,
-    /// Bytes sitting in the read buffer waiting to be framed, and the room
-    /// after them, which are `qbuf` and `qbuf-free`.
-    ///
-    /// Written by the front, because the read buffer is the front's and a
-    /// command cannot reach one. It is the number as of the last read or flush
-    /// rather than as of this instant, which is the only two moments it can
-    /// change and so the only two worth a store.
-    qbuf: u64,
-    qbuf_free: u64,
-    /// The reply buffer's room, and the largest it has been at a flush, which
-    /// are `rbs` and `rbp`.
-    rbs: u64,
-    rbp: u64,
-}
-
 /// What one connection has chosen.
 pub struct Session {
     db: usize,
@@ -1938,8 +1893,15 @@ pub struct Session {
     no_touch: bool,
     /// What this connection has asked to be told about, which is `CLIENT REPLY`.
     reply: Reply,
-    /// What the socket is and what has gone over it.
-    sock: Socket,
+    /// The row every other thread sees this connection through.
+    ///
+    /// Shared rather than owned, because `CLIENT LIST` and `CLIENT KILL` run on
+    /// whichever thread the client asking is on and that is very often not this
+    /// one. Everything the report says about the socket lives in there and
+    /// nowhere else, and the handful of things the session needs for itself are
+    /// kept here as well and written to both. See the `clients` module for why
+    /// the row is words and a small lock rather than one lock.
+    sock: Arc<Client>,
 }
 
 /// What a connection has asked to hear back, which is `CLIENT REPLY`.
@@ -1982,12 +1944,18 @@ impl Session {
             no_evict: false,
             no_touch: false,
             reply: Reply::On,
-            sock: Socket {
-                fd: -1,
-                last: "",
-                ..Socket::default()
-            },
+            sock: Arc::new(Client::new(id)),
         }
+    }
+
+    /// The row every other thread sees this connection through.
+    ///
+    /// Handed to the server once, when the connection is accepted, so that
+    /// `CLIENT LIST` can find it. A session nobody hands over is one no other
+    /// thread can see, which is every embedded caller and every test.
+    #[must_use]
+    pub fn row(&self) -> &Arc<Client> {
+        &self.sock
     }
 
     /// Say when this connection was opened, which is what `age` counts from.
@@ -1996,8 +1964,8 @@ impl Session {
     /// session nobody tells has no age and reports zero, which is every
     /// embedded caller and every test.
     pub fn opened(&mut self, now_ms: u64) {
-        self.sock.since_ms = now_ms;
-        self.sock.last_ms = now_ms;
+        self.sock.since_ms.store(now_ms, Relaxed);
+        self.sock.last_ms.store(now_ms, Relaxed);
     }
 
     /// Say what the socket under this connection is.
@@ -2008,60 +1976,101 @@ impl Session {
     /// layer that has the socket.
     pub fn set_socket(&mut self, peer: &str, local: &str, fd: i32, unix: bool) {
         yo_alloc::allow(|| {
-            self.sock.peer.clear();
-            self.sock.peer.extend_from_slice(peer.as_bytes());
-            self.sock.local.clear();
-            self.sock.local.extend_from_slice(local.as_bytes());
+            let mut text = self.sock.text.lock();
+            text.peer.clear();
+            text.peer.extend_from_slice(peer.as_bytes());
+            text.local.clear();
+            text.local.extend_from_slice(local.as_bytes());
         });
-        self.sock.fd = fd;
-        self.sock.unix = unix;
+        self.sock.fd.store(fd, Relaxed);
+        self.sock.set_flag(clients::UNIX, unix);
     }
 
     /// Note bytes that arrived, and that a read carried them.
     pub fn read_bytes(&mut self, n: usize) {
-        self.sock.net_in += n as u64;
-        self.sock.reads += 1;
+        let row = &self.sock;
+        row.net_in
+            .store(row.net_in.load(Relaxed) + n as u64, Relaxed);
+        row.reads.store(row.reads.load(Relaxed) + 1, Relaxed);
     }
 
     /// Note bytes that went out.
     pub fn wrote_bytes(&mut self, n: usize) {
-        self.sock.net_out += n as u64;
+        let row = &self.sock;
+        row.net_out
+            .store(row.net_out.load(Relaxed) + n as u64, Relaxed);
     }
 
-    /// Note what the two buffers are holding.
+    /// Note what the two buffers are holding, and which protocol they are in.
     ///
     /// `waiting` is the framed bytes that have not been read yet, `room` is what
-    /// is left in the read buffer after them, and `reply` is the reply buffer's
-    /// capacity. The high water mark is kept here rather than by the caller so
-    /// that the caller only has to say what is true now.
-    pub fn note_buffers(&mut self, waiting: usize, room: usize, reply: usize) {
-        self.sock.qbuf = waiting as u64;
-        self.sock.qbuf_free = room as u64;
-        self.sock.rbs = reply as u64;
-        self.sock.rbp = self.sock.rbp.max(reply as u64);
+    /// is left in the read buffer after them, `held` is what the reply buffer
+    /// still owes and `reply` is its capacity. The high water mark is kept here
+    /// rather than by the caller so that the caller only has to say what is true
+    /// now.
+    pub fn note_buffers(&mut self, waiting: usize, room: usize, held: usize, reply: usize) {
+        let row = &self.sock;
+        row.qbuf.store(waiting as u64, Relaxed);
+        row.qbuf_free.store(room as u64, Relaxed);
+        row.obl.store(held as u64, Relaxed);
+        row.rbs.store(reply as u64, Relaxed);
+        row.rbp
+            .store(row.rbp.load(Relaxed).max(reply as u64), Relaxed);
+    }
+
+    /// Note which protocol this connection is being answered in.
+    ///
+    /// Written after each command rather than with the buffers, because `HELLO`
+    /// changes it in the reply buffer and a connection that switched to RESP3
+    /// halfway through a pipeline should be listed as being on it.
+    pub fn note_proto(&mut self, version: i64) {
+        self.sock.resp.store(version as u32, Relaxed);
     }
 
     /// Note which command is running, before it runs.
     ///
     /// The clock is passed in because the session has no way to reach one, and
-    /// the caller is holding the server anyway.
-    pub(crate) fn ran(&mut self, name: &'static str, sub: Option<&[u8]>, now_ms: u64) {
-        self.sock.last_ms = now_ms;
-        self.sock.last = name;
-        self.sock.sub.clear();
-        if let Some(sub) = sub {
-            yo_alloc::allow(|| self.sock.sub.extend_from_slice(sub));
-        }
+    /// the caller is holding the server anyway. `at` is where the command is in
+    /// the table, since an index is a word another thread can read and a name is
+    /// not.
+    pub(crate) fn ran(&mut self, at: usize, sub: Option<&[u8]>, argv: u64, now_ms: u64) {
+        self.sock.last_ms.store(now_ms, Relaxed);
+        self.sock.argv_mem.store(argv, Relaxed);
+        self.sock.note_command(at, sub);
     }
 
-    /// Note that the command running is over.
+    /// Note that the command running is over, and put what it changed about this
+    /// connection where another thread can see it.
     ///
     /// The count goes up here and not where the command name is noted, so that
     /// a connection asking `CLIENT INFO` is told how many commands it had sent
     /// before this one. That is what a real server answers: it counts in
     /// `commandProcessed` and that runs after the body.
+    ///
+    /// The rest is the publishing. Which database a connection is in, what it is
+    /// subscribed to, whether it is in a transaction and how many keys it is
+    /// watching are all things a command can have just changed, and they are all
+    /// things `CLIENT LIST` on another thread reports. Rather than hunting down
+    /// every command that can move one of them, all six are written out here,
+    /// which is six ordinary stores to a line this thread already owns.
     pub fn finished(&mut self) {
-        self.sock.cmds += 1;
+        let (sub, psub, ssub) = self.sub_counts();
+        let (multi, multi_mem) = self.queued();
+        let subscribed = self.subscribed();
+        let in_multi = self.in_multi();
+        let watching = self.watching.len();
+        let db = self.db;
+        let row = &self.sock;
+        row.cmds.store(row.cmds.load(Relaxed) + 1, Relaxed);
+        row.db.store(db as u32, Relaxed);
+        row.sub.store(sub as u32, Relaxed);
+        row.psub.store(psub as u32, Relaxed);
+        row.ssub.store(ssub as u32, Relaxed);
+        row.watch.store(watching as u32, Relaxed);
+        row.multi.store(multi, Relaxed);
+        row.multi_mem.store(multi_mem, Relaxed);
+        row.set_flag(clients::SUBSCRIBED, subscribed);
+        row.set_flag(clients::IN_MULTI, in_multi);
     }
 
     /// What this connection has asked to hear back.
@@ -2097,8 +2106,9 @@ impl Session {
     /// Called by the front when it opens the connection, which is the only place
     /// that knows. A session nobody tells is not on a front, and the one thing
     /// that reads this checks the client id before it acts on it.
-    pub(crate) const fn set_conn(&mut self, conn: u32) {
+    pub(crate) fn set_conn(&mut self, conn: u32) {
         self.conn = conn;
+        self.sock.conn.store(conn, Relaxed);
     }
 
     /// The connection id, which `HELLO` reports and `CLIENT` will.
@@ -2126,6 +2136,7 @@ impl Session {
     pub fn reset(&mut self) {
         self.db = 0;
         self.name.clear();
+        self.sock.set_text(|text| &mut text.name, b"");
         // `SELECT` leaves these alone and `RESET` does not, both checked
         // against 8.10.1, which is the one pair of answers you could not guess
         // from what the command is for.
@@ -2135,16 +2146,47 @@ impl Session {
         // the library behind the socket is the same library it was. Both halves
         // are `clearClientConnectionState`'s.
         self.reply = Reply::On;
-        self.no_evict = false;
-        self.no_touch = false;
+        self.set_no_evict(false);
+        self.set_no_touch(false);
     }
 
-    /// Record the name from `HELLO ... SETNAME`.
+    /// Record the name from `HELLO ... SETNAME` or `CLIENT SETNAME`.
     fn set_name(&mut self, name: &[u8]) {
         yo_alloc::allow(|| {
             self.name.clear();
             self.name.extend_from_slice(name);
         });
+        self.sock.set_text(|text| &mut text.name, name);
+    }
+
+    /// Record what `CLIENT SETINFO LIB-NAME` was told.
+    fn set_lib_name(&mut self, value: &[u8]) {
+        yo_alloc::allow(|| {
+            self.lib_name.clear();
+            self.lib_name.extend_from_slice(value);
+        });
+        self.sock.set_text(|text| &mut text.lib_name, value);
+    }
+
+    /// Record what `CLIENT SETINFO LIB-VER` was told.
+    fn set_lib_ver(&mut self, value: &[u8]) {
+        yo_alloc::allow(|| {
+            self.lib_ver.clear();
+            self.lib_ver.extend_from_slice(value);
+        });
+        self.sock.set_text(|text| &mut text.lib_ver, value);
+    }
+
+    /// Record `CLIENT NO-EVICT`.
+    fn set_no_evict(&mut self, on: bool) {
+        self.no_evict = on;
+        self.sock.set_flag(clients::NO_EVICT, on);
+    }
+
+    /// Record `CLIENT NO-TOUCH`.
+    fn set_no_touch(&mut self, on: bool) {
+        self.no_touch = on;
+        self.sock.set_flag(clients::NO_TOUCH, on);
     }
 }
 
@@ -2171,7 +2213,13 @@ pub fn execute(server: &Server, session: &mut Session, args: Args<'_>, out: &mut
     if args.is_empty() {
         return Flow::Continue;
     }
-    resolved(server, session, lookup(args.name()), args, out)
+    let flow = resolved(server, session, lookup(args.name()), args, out);
+    // The engine does this itself, after the reply has been decided, because it
+    // is also what settles `CLIENT REPLY`. An embedded caller has no engine, so
+    // it happens here instead, and the two paths never both run: the engine
+    // reaches the funnel through `resolved` and not through this.
+    session.finished();
+    flow
 }
 
 /// The commands that are a container for a set of subcommands.
@@ -2242,7 +2290,13 @@ pub fn resolved(
     // is still the last command the connection sent, which is what a real
     // server reports: it notes the name in `processCommand` before any of the
     // decisions below.
-    session.ran(spec.name, container_sub(spec, &args), server.now_ms());
+    let argv = (0..args.len()).map(|i| args.get(i).len() as u64).sum();
+    session.ran(
+        table::index_of(spec),
+        container_sub(spec, &args),
+        argv,
+        server.now_ms(),
+    );
 
     if session.in_multi()
         && let Some(e) = multi::refused_in_multi(spec)

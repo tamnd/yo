@@ -277,8 +277,18 @@ impl<S: Sink> Wire<S> {
         self.server.counted().opened();
         let at = self.front.open(self.server.next_client());
         let now = self.server.now_ms();
-        if let Some(session) = self.front.session_mut(at) {
+        let row = if let Some(session) = self.front.session_mut(at) {
             session.opened(now);
+            Some(session.row().clone())
+        } else {
+            None
+        };
+        // The row goes into the table here and not in the front, because the
+        // front cannot reach the server and because this is the one place that
+        // knows both which thread the connection landed on and that it is now
+        // ready to be reported on.
+        if let Some(row) = row {
+            self.server.register_client(&row);
         }
         self.note_buffers();
         at
@@ -502,7 +512,23 @@ impl<S: Sink> Wire<S> {
     /// pointing at somebody else's connection.
     fn forget(&mut self, client: u64) {
         self.server.forget_waiters(client);
+        self.server.forget_client(client);
         self.server.counted().closed();
+    }
+
+    /// Close the connections of this thread's that somebody has killed.
+    ///
+    /// The pair on the row is a slot and a client id, and the slot is reused
+    /// while the id is not, so the id is checked back against the front before
+    /// anything happens: a row that outlived its connection would otherwise
+    /// close whoever took the slot next.
+    fn reap(&mut self) {
+        for (conn, client) in self.server.my_kills() {
+            self.server.kill_done();
+            if self.front.answers(conn, client) {
+                self.hangup(conn);
+            }
+        }
     }
 
     /// Move up to `max` framed commands into `into`.
@@ -616,6 +642,7 @@ impl<S: Sink> Engine for Wire<S> {
             // answers, which is what a client turning replies back on needs and
             // is what a real server does.
             session.finished();
+            session.note_proto(out.proto().version());
             let mode = session.reply_mode();
             session.step_reply();
             if mode != Reply::On {
@@ -677,6 +704,14 @@ impl<S: Sink> Engine for Wire<S> {
         if self.server.parked_here() != 0 {
             self.server.refresh_clock();
             self.serve_waiters();
+        }
+
+        // Then the connections another thread asked to have closed. One load on
+        // a server nobody has run `CLIENT KILL` on, which is nearly all of them,
+        // and it is here rather than beside the command because the buffers of
+        // the connection being closed belong to this thread.
+        if self.server.kills() != 0 {
+            self.reap();
         }
 
         // Then the published messages, before the write out below and after
@@ -3310,5 +3345,147 @@ mod tests {
             "{sent}"
         );
         assert!(sent.contains("tot-net-out=14"), "{sent}");
+    }
+
+    /// `CLIENT LIST` is the one command that reports connections other than the
+    /// one asking, so nothing below the engine can check it: it needs two
+    /// connections and a front to hold them both.
+    #[test]
+    fn client_list_reports_every_connection_and_not_just_the_one_asking() {
+        let mut r = Reactor::inline(Wire::new(Recorder::new()));
+        let one = r
+            .engine_mut()
+            .accept_from("10.0.0.7:1111", "10.0.0.1:6379", 11, false);
+        let two = r
+            .engine_mut()
+            .accept_from("10.0.0.8:2222", "10.0.0.1:6379", 12, false);
+        let mut batch = Vec::new();
+
+        r.engine_mut()
+            .feed(two, &wire(&[b"CLIENT", b"SETNAME", b"worker"]));
+        r.engine_mut().feed(one, &wire(&[b"CLIENT", b"LIST"]));
+        pump(&mut r, &mut batch);
+
+        let sent = String::from_utf8_lossy(r.engine().sink().sent(one)).into_owned();
+        let lines: Vec<&str> = sent.lines().filter(|l| l.starts_with("id=")).collect();
+        assert_eq!(lines.len(), 2, "{sent}");
+        assert!(lines[0].contains("addr=10.0.0.7:1111"), "{sent}");
+        assert!(lines[0].contains("cmd=client|list"), "{sent}");
+        assert!(lines[1].contains("addr=10.0.0.8:2222"), "{sent}");
+        assert!(lines[1].contains("name=worker"), "{sent}");
+        assert!(lines[1].contains("cmd=client|setname"), "{sent}");
+    }
+
+    /// The listing is in the order the connections were opened, with the holes
+    /// left by the ones that closed taken out.
+    #[test]
+    fn client_list_keeps_the_order_the_connections_were_opened_in() {
+        let mut r = Reactor::inline(Wire::new(Recorder::new()));
+        let one = r.engine_mut().accept();
+        let two = r.engine_mut().accept();
+        let three = r.engine_mut().accept();
+        let mut batch = Vec::new();
+
+        r.engine_mut().hangup(two);
+        r.engine_mut().feed(three, &wire(&[b"CLIENT", b"LIST"]));
+        pump(&mut r, &mut batch);
+
+        let sent = String::from_utf8_lossy(r.engine().sink().sent(three)).into_owned();
+        let ids: Vec<&str> = sent
+            .lines()
+            .filter(|l| l.starts_with("id="))
+            .map(|l| l.split(' ').next().unwrap_or(""))
+            .collect();
+        assert_eq!(ids, vec!["id=1", "id=3"], "{sent}");
+        let _ = one;
+    }
+
+    /// A kill on somebody else is not carried out by the thread that ran it, so
+    /// the close has to be checked through the front rather than through the
+    /// reply.
+    #[test]
+    fn client_kill_closes_the_connection_it_names_and_answers_a_count() {
+        let mut r = Reactor::inline(Wire::new(Recorder::new()));
+        let one = r
+            .engine_mut()
+            .accept_from("10.0.0.7:1111", "10.0.0.1:6379", 11, false);
+        let two = r
+            .engine_mut()
+            .accept_from("10.0.0.8:2222", "10.0.0.1:6379", 12, false);
+        let mut batch = Vec::new();
+
+        r.engine_mut()
+            .feed(one, &wire(&[b"CLIENT", b"KILL", b"ADDR", b"10.0.0.8:2222"]));
+        pump(&mut r, &mut batch);
+
+        assert_eq!(r.engine().sink().sent(one), b":1\r\n");
+        assert!(r.engine().sink().was_closed(two), "the named one went away");
+        assert!(!r.engine().sink().was_closed(one), "the caller did not");
+    }
+
+    /// The old form names one address, answers `OK`, and is the one shape that
+    /// will take the caller's own connection.
+    #[test]
+    fn the_old_kill_takes_one_address_and_will_take_the_caller() {
+        let mut r = Reactor::inline(Wire::new(Recorder::new()));
+        let one = r
+            .engine_mut()
+            .accept_from("10.0.0.7:1111", "10.0.0.1:6379", 11, false);
+        let mut batch = Vec::new();
+
+        r.engine_mut()
+            .feed(one, &wire(&[b"CLIENT", b"KILL", b"10.0.0.9:9999"]));
+        pump(&mut r, &mut batch);
+        assert_eq!(
+            r.engine().sink().sent(one),
+            b"-ERR No such client\r\n"
+        );
+
+        r.engine_mut().sink_mut().clear();
+        r.engine_mut()
+            .feed(one, &wire(&[b"CLIENT", b"KILL", b"10.0.0.7:1111"]));
+        pump(&mut r, &mut batch);
+        assert_eq!(r.engine().sink().sent(one), b"+OK\r\n");
+        assert!(r.engine().sink().was_closed(one), "it took itself");
+    }
+
+    /// `SKIPME no` is the only way the new form reaches the caller, and the
+    /// reply still goes out before the socket does.
+    #[test]
+    fn a_kill_spares_the_caller_unless_it_is_told_not_to() {
+        let (mut r, conn, mut batch) = engine();
+        r.engine_mut()
+            .feed(conn, &wire(&[b"CLIENT", b"KILL", b"TYPE", b"normal"]));
+        pump(&mut r, &mut batch);
+        assert_eq!(r.engine().sink().sent(conn), b":0\r\n");
+        assert!(!r.engine().sink().was_closed(conn));
+
+        r.engine_mut().sink_mut().clear();
+        r.engine_mut().feed(
+            conn,
+            &wire(&[b"CLIENT", b"KILL", b"TYPE", b"normal", b"SKIPME", b"no"]),
+        );
+        pump(&mut r, &mut batch);
+        assert_eq!(r.engine().sink().sent(conn), b":1\r\n");
+        assert!(r.engine().sink().was_closed(conn));
+    }
+
+    /// A connection that closed is out of the table, so the report is of what is
+    /// open and not of what has ever been open.
+    #[test]
+    fn a_connection_that_went_away_is_off_the_list() {
+        let mut r = Reactor::inline(Wire::new(Recorder::new()));
+        let one = r.engine_mut().accept();
+        let two = r.engine_mut().accept();
+        let mut batch = Vec::new();
+        assert_eq!(r.engine().server().client_count(), 2);
+
+        r.engine_mut().hangup(two);
+        assert_eq!(r.engine().server().client_count(), 1);
+
+        r.engine_mut().feed(one, &wire(&[b"CLIENT", b"LIST"]));
+        pump(&mut r, &mut batch);
+        let sent = String::from_utf8_lossy(r.engine().sink().sent(one)).into_owned();
+        assert_eq!(sent.lines().filter(|l| l.starts_with("id=")).count(), 1);
     }
 }

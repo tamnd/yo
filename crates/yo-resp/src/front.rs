@@ -367,6 +367,7 @@ impl<S: Sink> Front<S> {
         c.session.note_buffers(
             c.buf.len() - c.head,
             c.buf.capacity() - c.buf.len(),
+            c.out.len(),
             c.out.capacity(),
         );
         let now = c.size();
