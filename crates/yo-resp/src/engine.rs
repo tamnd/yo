@@ -3767,4 +3767,331 @@ mod tests {
         let sent = String::from_utf8_lossy(r.engine().sink().sent(one)).into_owned();
         assert!(sent.contains("cmd=set"), "{sent}");
     }
+
+    /// A monitor watching, with the clock stopped so the stamp is a constant.
+    ///
+    /// The first connection back is the monitor and the second is the client,
+    /// which is the way round every test below wants them.
+    fn watched() -> (Reactor<Wire<Recorder>>, ConnId, ConnId, Vec<Cmd>) {
+        let (mut r, eye, mut batch) = timed();
+        let one = r.engine_mut().accept();
+        r.engine_mut().feed(eye, &wire(&[b"MONITOR"]));
+        pump(&mut r, &mut batch);
+        assert_eq!(r.engine().sink().sent(eye), b"+OK\r\n");
+        r.engine_mut().sink_mut().clear();
+        (r, eye, one, batch)
+    }
+
+    /// What the fixed clock stamps every line in these tests with.
+    const STAMP: &str = "1000.000000";
+
+    /// Everything the monitor has been sent, as a string.
+    fn fed(r: &Reactor<Wire<Recorder>>, eye: ConnId) -> String {
+        String::from_utf8_lossy(r.engine().sink().sent(eye)).into_owned()
+    }
+
+    #[test]
+    fn a_monitor_is_fed_a_command_another_connection_ran() {
+        let (mut r, eye, one, mut batch) = watched();
+
+        r.engine_mut().feed(one, &wire(&[b"SET", b"k", b"v"]));
+        pump(&mut r, &mut batch);
+
+        assert_eq!(
+            fed(&r, eye),
+            format!("+{STAMP} [0 ?:0] \"SET\" \"k\" \"v\"\r\n")
+        );
+    }
+
+    /// The database is the one the connection is on afterwards, which is what
+    /// makes `SELECT` report itself where it landed rather than where it was.
+    #[test]
+    fn a_select_is_reported_on_the_database_it_moved_to() {
+        let (mut r, eye, one, mut batch) = watched();
+
+        r.engine_mut().feed(one, &wire(&[b"SELECT", b"3"]));
+        r.engine_mut().feed(one, &wire(&[b"GET", b"k"]));
+        r.engine_mut().feed(one, &wire(&[b"SELECT", b"0"]));
+        pump(&mut r, &mut batch);
+
+        assert_eq!(
+            fed(&r, eye),
+            format!(
+                "+{STAMP} [3 ?:0] \"SELECT\" \"3\"\r\n\
+                 +{STAMP} [3 ?:0] \"GET\" \"k\"\r\n\
+                 +{STAMP} [0 ?:0] \"SELECT\" \"0\"\r\n"
+            )
+        );
+    }
+
+    /// The quoting is `sdscatrepr`, which is what every tool that reads this
+    /// feed is written against.
+    #[test]
+    fn an_argument_is_quoted_the_way_a_real_server_quotes_it() {
+        let (mut r, eye, one, mut batch) = watched();
+
+        r.engine_mut()
+            .feed(one, &wire(&[b"SET", b"a b", b"q\"s\\n\nt\tz\x01\xff"]));
+        pump(&mut r, &mut batch);
+
+        assert_eq!(
+            fed(&r, eye),
+            format!("+{STAMP} [0 ?:0] \"SET\" \"a b\" \"q\\\"s\\\\n\\nt\\tz\\x01\\xff\"\r\n")
+        );
+    }
+
+    /// A command that never reached its body is not reported, and one that
+    /// failed inside it is.
+    #[test]
+    fn only_a_command_that_ran_is_reported() {
+        let (mut r, eye, one, mut batch) = watched();
+
+        r.engine_mut().feed(one, &wire(&[b"NOSUCHCOMMAND", b"a"]));
+        r.engine_mut().feed(one, &wire(&[b"GET"]));
+        r.engine_mut().feed(one, &wire(&[b"LPUSH", b"l", b"x"]));
+        r.engine_mut().feed(one, &wire(&[b"GET", b"l"]));
+        pump(&mut r, &mut batch);
+
+        assert_eq!(
+            fed(&r, eye),
+            format!(
+                "+{STAMP} [0 ?:0] \"LPUSH\" \"l\" \"x\"\r\n\
+                 +{STAMP} [0 ?:0] \"GET\" \"l\"\r\n"
+            ),
+            "the unknown command and the wrong arity are not commands that ran"
+        );
+    }
+
+    /// `MULTI` when it is sent, the queued commands as `EXEC` replays them, and
+    /// `EXEC` last, which falls out of every one of those being its own trip
+    /// through the funnel.
+    #[test]
+    fn a_transaction_is_reported_at_exec_and_in_order() {
+        let (mut r, eye, one, mut batch) = watched();
+
+        r.engine_mut().feed(one, &wire(&[b"MULTI"]));
+        r.engine_mut().feed(one, &wire(&[b"SET", b"t", b"1"]));
+        r.engine_mut().feed(one, &wire(&[b"INCR", b"t"]));
+        r.engine_mut().feed(one, &wire(&[b"EXEC"]));
+        pump(&mut r, &mut batch);
+
+        assert_eq!(
+            fed(&r, eye),
+            format!(
+                "+{STAMP} [0 ?:0] \"MULTI\"\r\n\
+                 +{STAMP} [0 ?:0] \"SET\" \"t\" \"1\"\r\n\
+                 +{STAMP} [0 ?:0] \"INCR\" \"t\"\r\n\
+                 +{STAMP} [0 ?:0] \"EXEC\"\r\n"
+            )
+        );
+    }
+
+    /// A script is reported before it runs, so that what it did arrives behind
+    /// it, and what it did is reported against `lua` rather than an address.
+    #[test]
+    fn a_script_is_reported_in_front_of_its_own_effects() {
+        let (mut r, eye, one, mut batch) = watched();
+
+        r.engine_mut().feed(
+            one,
+            &wire(&[
+                b"EVAL",
+                b"redis.call('set', KEYS[1], 'z') return 1",
+                b"1",
+                b"sk",
+            ]),
+        );
+        pump(&mut r, &mut batch);
+
+        assert_eq!(
+            fed(&r, eye),
+            format!(
+                "+{STAMP} [0 ?:0] \"EVAL\" \"redis.call('set', KEYS[1], 'z') return 1\" \"1\" \"sk\"\r\n\
+                 +{STAMP} [0 lua] \"set\" \"sk\" \"z\"\r\n"
+            )
+        );
+    }
+
+    /// The administrative commands are kept off the feed, and that is decided
+    /// per subcommand: `CLIENT ID` is on it and `CLIENT LIST` is not.
+    #[test]
+    fn an_administrative_command_is_not_reported() {
+        let (mut r, eye, one, mut batch) = watched();
+
+        r.engine_mut().feed(one, &wire(&[b"CLIENT", b"LIST"]));
+        r.engine_mut()
+            .feed(one, &wire(&[b"CONFIG", b"GET", b"maxmemory"]));
+        r.engine_mut().feed(one, &wire(&[b"CLIENT", b"ID"]));
+        r.engine_mut().feed(one, &wire(&[b"CONFIG", b"HELP"]));
+        pump(&mut r, &mut batch);
+
+        assert_eq!(
+            fed(&r, eye),
+            format!(
+                "+{STAMP} [0 ?:0] \"CLIENT\" \"ID\"\r\n\
+                 +{STAMP} [0 ?:0] \"CONFIG\" \"HELP\"\r\n"
+            )
+        );
+    }
+
+    /// The password in a `HELLO` is replaced rather than left out, so the line
+    /// still has the shape the command had.
+    #[test]
+    fn a_password_is_not_echoed_to_a_monitor() {
+        let (mut r, eye, one, mut batch) = watched();
+
+        r.engine_mut().feed(
+            one,
+            &wire(&[b"HELLO", b"3", b"AUTH", b"default", b"hunter2"]),
+        );
+        pump(&mut r, &mut batch);
+
+        let sent = fed(&r, eye);
+        assert!(
+            sent.contains("\"HELLO\" \"3\" \"AUTH\" \"(redacted)\" \"(redacted)\""),
+            "{sent}"
+        );
+        assert!(!sent.contains("hunter2"), "{sent}");
+    }
+
+    /// A monitor is not a client any more, so it is refused everything that
+    /// reaches a key and allowed everything that does not.
+    #[test]
+    fn a_monitor_may_not_touch_the_keyspace() {
+        let (mut r, eye, _one, mut batch) = watched();
+
+        // One at a time, because a monitor watching itself reads its own reply
+        // and then the line, and the mail is handed over at the end of a batch.
+        // A monitor that pipelines gets both replies and then both lines, which
+        // is D-124 and is the only place the order differs from a real server's.
+        r.engine_mut().feed(eye, &wire(&[b"PING"]));
+        pump(&mut r, &mut batch);
+        r.engine_mut().feed(eye, &wire(&[b"GET", b"k"]));
+        pump(&mut r, &mut batch);
+
+        assert_eq!(
+            fed(&r, eye),
+            format!(
+                "+PONG\r\n\
+                 +{STAMP} [0 ?:0] \"PING\"\r\n\
+                 -ERR Replica can't interact with the keyspace\r\n"
+            )
+        );
+    }
+
+    /// And the refusal lands as the command is queued, which is what turns the
+    /// transaction into an `EXECABORT`.
+    #[test]
+    fn a_monitor_is_refused_the_keyspace_at_queue_time() {
+        let (mut r, eye, _one, mut batch) = watched();
+
+        r.engine_mut().feed(eye, &wire(&[b"MULTI"]));
+        r.engine_mut().feed(eye, &wire(&[b"GET", b"k"]));
+        r.engine_mut().feed(eye, &wire(&[b"EXEC"]));
+        pump(&mut r, &mut batch);
+
+        let sent = fed(&r, eye);
+        assert!(
+            sent.contains("-ERR Replica can't interact with the keyspace"),
+            "{sent}"
+        );
+        assert!(sent.contains("-EXECABORT"), "{sent}");
+    }
+
+    /// A monitor is exempt from a pause, which is the whole reason the refusal
+    /// above has to be there.
+    #[test]
+    fn a_monitor_runs_through_a_pause() {
+        let (mut r, eye, one, mut batch) = watched();
+
+        r.engine_mut()
+            .feed(one, &wire(&[b"CLIENT", b"PAUSE", b"5000", b"ALL"]));
+        pump(&mut r, &mut batch);
+        r.engine_mut().sink_mut().clear();
+
+        r.engine_mut().feed(eye, &wire(&[b"PING"]));
+        r.engine_mut().feed(one, &wire(&[b"PING"]));
+        pump(&mut r, &mut batch);
+
+        assert!(
+            fed(&r, eye).starts_with("+PONG\r\n"),
+            "the monitor is let through"
+        );
+        assert_eq!(r.engine().sink().sent(one), b"", "and the client is not");
+    }
+
+    /// `MONITOR` from a connection that is already one is answered nothing at
+    /// all, which is a real server's behaviour and not an oversight of one.
+    #[test]
+    fn monitor_sent_twice_answers_nothing_the_second_time() {
+        let (mut r, eye, _one, mut batch) = watched();
+
+        r.engine_mut().feed(eye, &wire(&[b"MONITOR"]));
+        pump(&mut r, &mut batch);
+
+        assert_eq!(fed(&r, eye), "", "no reply and no line either");
+    }
+
+    /// `RESET` is the way out, and the connection is a client again after it.
+    #[test]
+    fn reset_takes_a_connection_out_of_monitor_mode() {
+        let (mut r, eye, one, mut batch) = watched();
+
+        r.engine_mut().feed(eye, &wire(&[b"RESET"]));
+        pump(&mut r, &mut batch);
+        r.engine_mut().sink_mut().clear();
+
+        r.engine_mut().feed(one, &wire(&[b"SET", b"k", b"v"]));
+        r.engine_mut().feed(eye, &wire(&[b"GET", b"k"]));
+        pump(&mut r, &mut batch);
+
+        assert_eq!(fed(&r, eye), "$1\r\nv\r\n", "not watching and not refused");
+    }
+
+    /// A monitor that closes is taken off the list, which is what puts the
+    /// server back to one load per command.
+    #[test]
+    fn a_monitor_that_closes_stops_being_one() {
+        let (mut r, eye, one, mut batch) = watched();
+
+        r.engine_mut().hangup(eye);
+        pump(&mut r, &mut batch);
+        assert!(!r.engine().server().monitored());
+
+        r.engine_mut().feed(one, &wire(&[b"SET", b"k", b"v"]));
+        pump(&mut r, &mut batch);
+        assert_eq!(r.engine().sink().sent(one), b"+OK\r\n");
+    }
+
+    /// Two monitors get the same line, because it is rendered once.
+    #[test]
+    fn two_monitors_are_fed_the_same_bytes() {
+        let (mut r, eye, one, mut batch) = watched();
+        let other = r.engine_mut().accept();
+        r.engine_mut().feed(other, &wire(&[b"MONITOR"]));
+        pump(&mut r, &mut batch);
+        r.engine_mut().sink_mut().clear();
+
+        r.engine_mut().feed(one, &wire(&[b"SET", b"k", b"v"]));
+        pump(&mut r, &mut batch);
+
+        assert_eq!(fed(&r, eye), fed(&r, other));
+        assert_eq!(
+            fed(&r, eye),
+            format!("+{STAMP} [0 ?:0] \"SET\" \"k\" \"v\"\r\n")
+        );
+    }
+
+    /// And it is reported as a monitor, with the letter in front of the others.
+    #[test]
+    fn a_monitor_is_reported_as_one_in_client_list() {
+        let (mut r, _eye, one, mut batch) = watched();
+
+        r.engine_mut().feed(one, &wire(&[b"CLIENT", b"LIST"]));
+        pump(&mut r, &mut batch);
+
+        let sent = String::from_utf8_lossy(r.engine().sink().sent(one)).into_owned();
+        assert!(sent.contains("flags=O"), "{sent}");
+        assert!(sent.contains("flags=N"), "and the other one is not: {sent}");
+    }
 }

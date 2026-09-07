@@ -117,6 +117,24 @@ impl Clock {
         self.set(self.now_ms().saturating_add(ms));
     }
 
+    /// The time now in microseconds, which is what a report of the time needs
+    /// and what a comparison against it does not.
+    ///
+    /// A system clock reads the operating system, because the whole point of
+    /// asking for microseconds is that the coarse reading is not precise enough
+    /// to be worth having. A fixed clock answers its own reading scaled up, so
+    /// that a test which put the clock somewhere sees it there and every line
+    /// stamped in one batch carries the same time.
+    #[inline]
+    pub fn now_us(&self) -> u64 {
+        match self.source {
+            Source::System => SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_or(0, |d| d.as_micros() as u64),
+            Source::Fixed => self.now_ms().saturating_mul(1_000),
+        }
+    }
+
     /// Read the operating system's clock right now.
     ///
     /// A time before the unix epoch reads as zero rather than failing. There is
@@ -151,6 +169,26 @@ mod tests {
         assert_eq!(c.now_ms(), 1_500);
         c.set(7);
         assert_eq!(c.now_ms(), 7);
+    }
+
+    #[test]
+    fn a_fixed_clock_reads_microseconds_off_its_own_reading() {
+        let c = Clock::fixed(1_700_000_000_123);
+        assert_eq!(c.now_us(), 1_700_000_000_123_000);
+        c.advance(1);
+        assert_eq!(c.now_us(), 1_700_000_000_124_000);
+    }
+
+    #[test]
+    fn a_system_clock_reads_microseconds_around_where_its_milliseconds_are() {
+        let c = Clock::system();
+        c.refresh();
+        let us = c.now_us();
+        assert!(
+            us / 1_000 >= c.now_ms() && us / 1_000 <= c.now_ms() + 1_000,
+            "{us} microseconds against {} milliseconds",
+            c.now_ms()
+        );
     }
 
     #[test]

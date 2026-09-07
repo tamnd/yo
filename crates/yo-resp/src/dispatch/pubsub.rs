@@ -310,21 +310,49 @@ struct Body {
     payload: Vec<u8>,
 }
 
-/// One message on its way to one connection.
+/// What is being carried, which is a message for a subscriber or a line for a
+/// monitor.
+///
+/// Two things go into a mailbox because two things have the same problem: they
+/// are written by whichever thread ran the command and they have to land on a
+/// connection some other thread owns. Giving `MONITOR` a second mailbox would
+/// have meant a second lock, a second length to poll and a second drain in the
+/// engine, all to move bytes that arrive by the same route for the same reason.
+enum Cargo {
+    /// A `PUBLISH`, a `SPUBLISH` or a keyspace notification.
+    Message {
+        kind: Kind,
+        /// The pattern that matched, for a pattern delivery and nothing else.
+        ///
+        /// Not shared, because each pattern delivery has its own and there is
+        /// only ever one connection per pattern per publish.
+        pattern: Vec<u8>,
+        body: Arc<Body>,
+    },
+    /// One `MONITOR` line, rendered once and shared by every monitor.
+    Line(Arc<Vec<u8>>),
+}
+
+/// One message or one line on its way to one connection.
 ///
 /// The body is shared, so a `PUBLISH` to a thousand subscribers copies the
-/// channel and the payload once and hands out a thousand refcount bumps. The
-/// pattern is not shared because only pattern deliveries have one and each of
-/// those carries its own.
+/// channel and the payload once and hands out a thousand refcount bumps.
 pub(crate) struct Envelope {
     conn: u32,
     client: u64,
-    kind: Kind,
-    pattern: Vec<u8>,
-    body: Arc<Body>,
+    cargo: Cargo,
 }
 
 impl Envelope {
+    /// A rendered `MONITOR` line for one watcher.
+    pub(crate) fn line(conn: u32, client: u64, line: Arc<Vec<u8>>) -> Envelope {
+        Envelope {
+            conn,
+            client,
+            cargo: Cargo::Line(line),
+        }
+    }
+
     /// Which connection slot this is for.
     pub(crate) const fn conn(&self) -> u32 {
         self.conn
@@ -341,20 +369,32 @@ impl Envelope {
     /// an ordinary array because RESP2 has no way to say this. That is the whole
     /// reason a RESP2 client in subscribe mode is not allowed to send much: its
     /// library has no way to tell a message from the reply to whatever it sent.
+    ///
+    /// A monitor line is a simple string on both protocols and not a push, which
+    /// is Redis's choice and is why `redis-cli monitor` works against a RESP2
+    /// server: the connection has stopped being a client, so there is no reply
+    /// it could be confused with.
     pub(crate) fn write(&self, out: &mut Out) {
-        match self.kind {
-            Kind::Pattern => {
+        match &self.cargo {
+            Cargo::Line(line) => out.simple(line),
+            Cargo::Message {
+                kind: Kind::Pattern,
+                pattern,
+                body,
+            } => {
                 out.push(4);
                 out.bulk(Kind::Pattern.word());
-                out.bulk(&self.pattern);
+                out.bulk(pattern);
+                out.bulk(&body.channel);
+                out.bulk(&body.payload);
             }
-            kind => {
+            Cargo::Message { kind, body, .. } => {
                 out.push(3);
                 out.bulk(kind.word());
+                out.bulk(&body.channel);
+                out.bulk(&body.payload);
             }
         }
-        out.bulk(&self.body.channel);
-        out.bulk(&self.body.payload);
     }
 }
 
@@ -409,8 +449,9 @@ impl Server {
         self.subs.store(reg.rows, Relaxed);
     }
 
-    /// Note that this thread has one more, or one fewer, subscribed connection.
-    fn note_here(&self, thread: usize, by: isize) {
+    /// Note that this thread has one more, or one fewer, connection that mail
+    /// could arrive for, which is a subscriber or a monitor.
+    pub(super) fn note_here(&self, thread: usize, by: isize) {
         let Some(mail) = self.mail.get(thread) else {
             return;
         };
@@ -424,7 +465,7 @@ impl Server {
     }
 
     /// Leave a message for another thread to deliver.
-    fn post(&self, thread: usize, env: Envelope) {
+    pub(super) fn post(&self, thread: usize, env: Envelope) {
         let Some(mail) = self.mail.get(thread) else {
             return;
         };
@@ -624,9 +665,11 @@ pub(crate) fn deliver(server: &Server, kind: Kind, channel: &[u8], payload: &[u8
                 Envelope {
                     conn: row.conn,
                     client: row.client,
-                    kind,
-                    pattern: Vec::new(),
-                    body: Arc::clone(body),
+                    cargo: Cargo::Message {
+                        kind,
+                        pattern: Vec::new(),
+                        body: Arc::clone(body),
+                    },
                 },
             );
             sent += 1;
@@ -645,9 +688,11 @@ pub(crate) fn deliver(server: &Server, kind: Kind, channel: &[u8], payload: &[u8
                 let env = yo_alloc::allow(|| Envelope {
                     conn: row.conn,
                     client: row.client,
-                    kind: Kind::Pattern,
-                    pattern: pattern.clone(),
-                    body: Arc::clone(body),
+                    cargo: Cargo::Message {
+                        kind: Kind::Pattern,
+                        pattern: pattern.clone(),
+                        body: Arc::clone(body),
+                    },
                 });
                 server.post(row.thread, env);
                 sent += 1;

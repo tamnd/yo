@@ -6099,6 +6099,22 @@ pub static COMMANDS: &[Spec] = &[
         summary: "The server's clock, as seconds and microseconds.",
         group: "server",
     },
+    // Marked `admin` for the usual reason and one more: the flag is what keeps a
+    // command out of the feed, and a `MONITOR` that reported itself to the
+    // monitor it had just made would be reporting the audience to itself.
+    Spec {
+        name: "monitor",
+        arity: 1,
+        flags: &["admin", "noscript", "loading", "stale"],
+        first_key: 0,
+        last_key: 0,
+        step: 0,
+        acl: &["@admin", "@slow", "@dangerous"],
+        since: "1.0.0",
+        complexity: "O(1)",
+        summary: "Watch every command the server runs, as it runs them.",
+        group: "server",
+    },
     Spec {
         name: "shutdown",
         arity: -1,

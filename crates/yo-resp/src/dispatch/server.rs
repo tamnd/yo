@@ -295,8 +295,15 @@ pub(super) fn execute(
             // subscription is a row on the server naming this connection, so
             // clearing the connection's list alone would leave the server
             // delivering into a slot that is not listening any more.
+            // And the monitor with them, which is the one way out of monitor
+            // mode short of closing the socket. `RESET` still answers `+RESET`
+            // on a connection that was one, because the reply belongs to the
+            // client the connection has just gone back to being.
             multi::release(server, session);
             super::pubsub::release(server, session);
+            if session.monitoring() {
+                server.watch_no_more(session.row());
+            }
             session.reset();
             out.set_proto(Proto::Resp2);
             out.simple(b"RESET");
@@ -306,6 +313,24 @@ pub(super) fn execute(
         "quit" => {
             out.ok();
             return Ok(Flow::Close);
+        }
+        // Every command on the server, from here on, on this connection. The
+        // reply is `OK` once and nothing after it, and a connection that sends
+        // it twice is answered nothing at all the second time, which is a real
+        // server's behaviour and not an oversight of one.
+        "monitor" => {
+            // A transaction replaying this has been promised a reply for every
+            // command it queued, and a connection that has turned into a feed
+            // cannot give one. A real server refuses it in the same words.
+            if session.running() {
+                return Err(Error::new(
+                    Code::Invalid,
+                    "MONITOR isn't allowed for DENY BLOCKING client",
+                ));
+            }
+            if server.watch_all(session.row()) {
+                out.ok();
+            }
         }
         "client" => return super::client::execute(server, session, spec, args, out),
         "command" => command(args, out)?,
