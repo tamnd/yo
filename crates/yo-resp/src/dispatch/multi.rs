@@ -82,6 +82,13 @@ fn exempt(name: &str) -> bool {
 pub(crate) struct Queue {
     /// Each queued command, as the wire bytes it arrived as.
     cmds: Vec<Vec<u8>>,
+    /// How many bytes those hold between them, which is `multi-mem`.
+    ///
+    /// Kept as the commands go in rather than added up when it is asked for,
+    /// because the one thing that asks is a report published after every
+    /// command, and a walk of the queue there would make a transaction cost the
+    /// square of its length.
+    bytes: u64,
     /// Whether the funnel turned one of them away.
     ///
     /// A queued command that is not a command at all, or that has the wrong
@@ -408,6 +415,7 @@ pub(crate) fn queue(session: &mut Session, args: Args<'_>, out: &mut Out) -> Flo
                 wire.extend_from_slice(a);
                 wire.extend_from_slice(b"\r\n");
             }
+            q.bytes += wire.len() as u64;
             q.cmds.push(wire);
         });
     }
@@ -439,10 +447,9 @@ impl Session {
     /// spelling for none and not for an empty one: a connection that has sent
     /// `MULTI` and nothing since reports zero.
     pub(super) fn queued(&self) -> (i64, u64) {
-        self.multi.as_ref().map_or((-1, 0), |q| {
-            let bytes = q.cmds.iter().map(|c| c.len() as u64).sum();
-            (q.len() as i64, bytes)
-        })
+        self.multi
+            .as_ref()
+            .map_or((-1, 0), |q| (q.len() as i64, q.bytes))
     }
 
     /// Mark the open transaction, if there is one, as one that cannot run.
