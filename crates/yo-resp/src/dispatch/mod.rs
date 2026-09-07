@@ -2049,7 +2049,7 @@ pub fn resolved(
             // which is not the same as whether the command was a write.
             "hash" => {
                 let db = session.db;
-                let changed = hashes::execute(&server.dbs[db], spec, args, out);
+                let changed = hashes::execute(&server.dbs[db], db, spec, args, out);
                 changed.map(|changed| {
                     indexing::changed(server, db, args.get(1), changed);
                     Flow::Continue
