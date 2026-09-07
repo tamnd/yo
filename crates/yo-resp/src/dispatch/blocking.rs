@@ -403,7 +403,7 @@ impl Want {
             // The one arm that needs to know what time it is, because a group
             // read records when each entry was handed out. The other six take
             // an element off a collection and the clock does not come into it.
-            Want::XRead(r) => streams::read(db, keys, r, now, strict, out),
+            Want::XRead(r) => streams::read(streams::On { db, at: on }, keys, r, now, strict, out),
             Want::Pop { end } => {
                 for key in keys {
                     if !ready(db, key, strict)? {

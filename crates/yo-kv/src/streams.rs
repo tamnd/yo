@@ -307,6 +307,31 @@ impl Keyspace {
         mkstream: bool,
         now: u64,
     ) -> Result<Option<Id>> {
+        Ok(self
+            .xadd_trimmed(key, id, fields, trim, mkstream, now)?
+            .map(|(id, _)| id))
+    }
+
+    /// The same write, saying how many entries the trim behind it took.
+    ///
+    /// [`Keyspace::xadd`] is this with that count dropped, which is all a caller
+    /// wants when it is only writing. The wire layer wants it because a trim
+    /// that removed something is a second keyspace notification and a trim that
+    /// found nothing over the threshold is not, and the ID that comes back says
+    /// nothing either way.
+    ///
+    /// # Errors
+    ///
+    /// The same as [`Keyspace::xadd`].
+    pub fn xadd_trimmed(
+        &mut self,
+        key: &[u8],
+        id: Add,
+        fields: &[(&[u8], &[u8])],
+        trim: Trim,
+        mkstream: bool,
+        now: u64,
+    ) -> Result<Option<(Id, u64)>> {
         let limits = self.stream_limits;
         let at = match self.live_slot(key, Kind::Stream)? {
             Some(at) => at,
@@ -328,8 +353,8 @@ impl Keyspace {
             Add::At(id) => id,
         };
         s.append(want, fields, limits).map_err(refused)?;
-        cut(s, trim);
-        Ok(Some(want))
+        let cut = cut(s, trim);
+        Ok(Some((want, cut)))
     }
 
     /// `XDEL key id [id ...]`. Answers how many were there to delete.
@@ -347,10 +372,11 @@ impl Keyspace {
 
     /// `XDELEX key [KEEPREF|DELREF|ACKED] IDS numids id [id ...]`.
     ///
-    /// The callback gets what became of each ID, in the order they were given. A
-    /// key that is not there is not an error and not a short reply either: every
-    /// ID gets [`Fate::Missing`], which is what a real server answers and is why
-    /// the ID list is walked even when there is nothing to walk it against.
+    /// The callback gets what became of each ID, in the order they were given,
+    /// and the answer is how many entries left the log. A key that is not there
+    /// is not an error and not a short reply either: every ID gets
+    /// [`Fate::Missing`], which is what a real server answers and is why the ID
+    /// list is walked even when there is nothing to walk it against.
     ///
     /// # Errors
     ///
@@ -361,17 +387,22 @@ impl Keyspace {
         refs: Refs,
         ids: impl Iterator<Item = Id>,
         mut f: F,
-    ) -> Result<()>
+    ) -> Result<u64>
     where
         F: FnMut(Fate),
     {
         let Some(at) = self.live_slot(key, Kind::Stream)? else {
             ids.for_each(|_| f(Fate::Missing));
-            return Ok(());
+            return Ok(0);
         };
         let s = self.stream_at(at);
-        ids.for_each(|id| f(s.delete_ref(id, refs)));
-        Ok(())
+        let mut gone = 0;
+        ids.for_each(|id| {
+            let fate = s.delete_ref(id, refs);
+            gone += u64::from(fate == Fate::Gone);
+            f(fate);
+        });
+        Ok(gone)
     }
 
     /// `XACKDEL key group [KEEPREF|DELREF|ACKED] IDS numids id [id ...]`.
@@ -380,6 +411,9 @@ impl Keyspace {
     /// not there rather than raising `NOGROUP`, because the answer this command
     /// gives per ID is about the pending list and an absent group is holding
     /// nothing.
+    ///
+    /// The count that comes back is how many entries left the log, which is not
+    /// how many IDs answered [`Fate::Gone`]. See [`Stream::ack_delete`].
     ///
     /// # Errors
     ///
@@ -391,17 +425,22 @@ impl Keyspace {
         refs: Refs,
         ids: impl Iterator<Item = Id>,
         mut f: F,
-    ) -> Result<()>
+    ) -> Result<u64>
     where
         F: FnMut(Fate),
     {
         let Some(at) = self.live_slot(key, Kind::Stream)? else {
             ids.for_each(|_| f(Fate::Missing));
-            return Ok(());
+            return Ok(0);
         };
         let s = self.stream_at(at);
-        ids.for_each(|id| f(s.ack_delete(group, id, refs)));
-        Ok(())
+        let mut gone = 0;
+        ids.for_each(|id| {
+            let (fate, took) = s.ack_delete(group, id, refs);
+            gone += u64::from(took);
+            f(fate);
+        });
+        Ok(gone)
     }
 
     /// `XNACK key group <SILENT|FAIL|FATAL> IDS numids id [id ...] [RETRYCOUNT n] [FORCE]`.

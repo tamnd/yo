@@ -1993,6 +1993,56 @@ mod tests {
         assert_eq!(fired(&r, sub), [("zincr".to_owned(), "z".to_owned())]);
     }
 
+    /// A write that trimmed says two things, and a trim that found nothing over
+    /// the threshold says only the one.
+    #[test]
+    fn a_stream_write_says_what_the_trim_behind_it_took() {
+        let (mut r, sub, writer, mut batch) = watching();
+
+        r.engine_mut()
+            .feed(writer, &wire(&[b"XADD", b"s", b"1-1", b"f", b"v"]));
+        r.engine_mut().feed(
+            writer,
+            &wire(&[b"XADD", b"s", b"MAXLEN", b"9", b"2-1", b"f", b"v"]),
+        );
+        r.engine_mut().feed(
+            writer,
+            &wire(&[b"XADD", b"s", b"MAXLEN", b"1", b"3-1", b"f", b"v"]),
+        );
+        pump(&mut r, &mut batch);
+        assert_eq!(
+            fired(&r, sub),
+            [("xadd", "s"), ("xadd", "s"), ("xadd", "s"), ("xtrim", "s")]
+                .map(|(e, k)| (e.to_owned(), k.to_owned()))
+        );
+    }
+
+    /// Acknowledging an entry that has already been deleted from under the
+    /// group takes nothing out of the log, so it says nothing, even though the
+    /// reply calls it deleted.
+    #[test]
+    fn acknowledging_an_entry_that_is_already_gone_says_nothing() {
+        let (mut r, sub, writer, mut batch) = watching();
+
+        for cmd in [
+            wire(&[b"XADD", b"s", b"1-1", b"f", b"v"]),
+            wire(&[b"XGROUP", b"CREATE", b"s", b"g", b"0"]),
+            wire(&[b"XREADGROUP", b"GROUP", b"g", b"c", b"STREAMS", b"s", b">"]),
+            wire(&[b"XDEL", b"s", b"1-1"]),
+        ] {
+            r.engine_mut().feed(writer, &cmd);
+        }
+        pump(&mut r, &mut batch);
+        r.engine_mut().sink_mut().clear();
+
+        r.engine_mut().feed(
+            writer,
+            &wire(&[b"XACKDEL", b"s", b"g", b"IDS", b"1", b"1-1"]),
+        );
+        pump(&mut r, &mut batch);
+        assert_eq!(fired(&r, sub), []);
+    }
+
     /// Inside a transaction each command's notifications go out before the
     /// next command runs, so `EXEC` does not bunch them all up at the end.
     #[test]

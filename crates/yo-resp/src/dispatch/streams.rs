@@ -44,6 +44,7 @@ use yo_kv::streams::{self as kv, Add, Claim, Read, Start, Trim};
 use yo_kv::{Db, Entry, Holds};
 
 use super::args::{self, Args};
+use super::notify::{self, class};
 use super::table::Spec;
 use crate::reply::Out;
 
@@ -131,33 +132,50 @@ const INLINE_FIELDS: usize = 32;
 /// # Errors
 ///
 /// Whatever the keyspace says, plus the argument complaints above.
-pub(super) fn execute(db: &Db, spec: &Spec, args: Args<'_>, now: u64, out: &mut Out) -> Result<()> {
+pub(super) fn execute(
+    db: &Db,
+    on: usize,
+    spec: &Spec,
+    args: Args<'_>,
+    now: u64,
+    out: &mut Out,
+) -> Result<()> {
     match spec.name {
-        "xadd" => xadd(db, args, now, out)?,
+        "xadd" => xadd(db, on, args, now, out)?,
         "xlen" => {
             let key = args.get(1);
             out.uint(db.hold(key).stream(key)?.map_or(0, Stream::len));
         }
         "xdel" => {
             let key = args.get(1);
-            out.uint(db.hold(key).xdel(key, ids(args, 2)?)?);
+            let gone = db.hold(key).xdel(key, ids(args, 2)?)?;
+            out.uint(gone);
+            // No `del` behind it, whatever it took. A stream with nothing in it
+            // is still a key, because it is still carrying the last ID it handed
+            // out and the groups reading it.
+            if gone > 0 {
+                notify::fire(on, class::STREAM, "xdel", key);
+            }
         }
-        "xdelex" => delex(db, args, out)?,
-        "xackdel" => ackdel(db, args, out)?,
+        "xdelex" => delex(db, on, args, out)?,
+        "xackdel" => ackdel(db, on, args, out)?,
+        // `XACK` and `XNACK` say nothing at all. Both of them move an entry
+        // between a group's pending list and its consumers and neither of them
+        // touches the log, and the stream class is about the log.
         "xnack" => nack(db, args, out)?,
-        "xtrim" => xtrim(db, args, out)?,
+        "xtrim" => xtrim(db, on, args, out)?,
         "xrange" => range(db, args, false, out)?,
         "xrevrange" => range(db, args, true, out)?,
         "xack" => {
             let (key, group) = (args.get(1), args.get(2));
             out.uint(db.hold(key).xack(key, group, ids(args, 3)?)?);
         }
-        "xsetid" => setid(db, args, out)?,
-        "xgroup" => group(db, args, now, out)?,
+        "xsetid" => setid(db, on, args, out)?,
+        "xgroup" => group(db, on, args, now, out)?,
         "xinfo" => info(db, args, now, out)?,
         "xpending" => pending(db, args, now, out)?,
-        "xclaim" => claim(db, args, now, out)?,
-        "xautoclaim" => autoclaim(db, args, now, out)?,
+        "xclaim" => claim(db, on, args, now, out)?,
+        "xautoclaim" => autoclaim(db, on, args, now, out)?,
         other => unreachable!("the table sent {other} to the stream group"),
     }
     Ok(())
@@ -166,7 +184,7 @@ pub(super) fn execute(db: &Db, spec: &Spec, args: Args<'_>, now: u64, out: &mut 
 // ---------------------------------------------------------------- writing
 
 /// `XADD key [NOMKSTREAM] [trim] id field value [field value ...]`.
-fn xadd(db: &Db, args: Args<'_>, now: u64, out: &mut Out) -> Result<()> {
+fn xadd(db: &Db, on: usize, args: Args<'_>, now: u64, out: &mut Out) -> Result<()> {
     let mut stripe = db.hold(args.get(1));
     let node = stripe.stream_limits().max_node_entries;
     let opts = trimming(args, 2, true, node)?;
@@ -187,25 +205,35 @@ fn xadd(db: &Db, args: Args<'_>, now: u64, out: &mut Out) -> Result<()> {
         for (i, slot) in buf[..pairs].iter_mut().enumerate() {
             *slot = field(i);
         }
-        stripe.xadd(key, id, &buf[..pairs], opts.trim, opts.mkstream, now)?
+        stripe.xadd_trimmed(key, id, &buf[..pairs], opts.trim, opts.mkstream, now)?
     } else {
         // A producer sending more than thirty two fields an entry gets one
         // allocation for the pair list and nothing else.
         let fields: Vec<(&[u8], &[u8])> = yo_alloc::allow(|| (0..pairs).map(field).collect());
-        stripe.xadd(key, id, &fields, opts.trim, opts.mkstream, now)?
+        stripe.xadd_trimmed(key, id, &fields, opts.trim, opts.mkstream, now)?
     };
+    drop(stripe);
     match written {
-        Some(id) => id_out(out, id),
+        Some((id, cut)) => {
+            id_out(out, id);
+            // The write, and then the trim behind it as a second event when it
+            // actually took something. A `MAXLEN` the stream is already under
+            // says nothing, and neither does an `XADD` with no trim on it.
+            notify::fire(on, class::STREAM, "xadd", key);
+            if cut > 0 {
+                notify::fire(on, class::STREAM, "xtrim", key);
+            }
+        }
         // `NOMKSTREAM` on a key that is not there, which is a null and not a
         // zero, so a producer can tell "nobody is consuming this yet" from
-        // "the write happened".
+        // "the write happened", and nothing was written so nothing is said.
         None => out.nil(),
     }
     Ok(())
 }
 
 /// `XTRIM key strategy`.
-fn xtrim(db: &Db, args: Args<'_>, out: &mut Out) -> Result<()> {
+fn xtrim(db: &Db, on: usize, args: Args<'_>, out: &mut Out) -> Result<()> {
     let mut stripe = db.hold(args.get(1));
     let node = stripe.stream_limits().max_node_entries;
     let opts = trimming(args, 2, false, node)?;
@@ -215,7 +243,13 @@ fn xtrim(db: &Db, args: Args<'_>, out: &mut Out) -> Result<()> {
     if opts.at != args.len() || matches!(opts.trim, Trim::None) {
         return Err(args::syntax());
     }
-    out.uint(stripe.xtrim(args.get(1), opts.trim)?);
+    let key = args.get(1);
+    let gone = stripe.xtrim(key, opts.trim)?;
+    drop(stripe);
+    out.uint(gone);
+    if gone > 0 {
+        notify::fire(on, class::STREAM, "xtrim", key);
+    }
     Ok(())
 }
 
@@ -325,7 +359,7 @@ fn trimming(args: Args<'_>, at: usize, xadd: bool, node: usize) -> Result<Trimme
 }
 
 /// `XSETID key id [ENTRIESADDED n] [MAXDELETEDID id]`.
-fn setid(db: &Db, args: Args<'_>, out: &mut Out) -> Result<()> {
+fn setid(db: &Db, on: usize, args: Args<'_>, out: &mut Out) -> Result<()> {
     let last = strict_id(args.get(2))?;
     let mut added = None;
     let mut deleted = None;
@@ -347,6 +381,9 @@ fn setid(db: &Db, args: Args<'_>, out: &mut Out) -> Result<()> {
     let key = args.get(1);
     db.hold(key).xsetid(key, last, added, deleted)?;
     out.ok();
+    // Every way this command can decline to do the work is an error, so
+    // reaching here at all means the bookmark moved.
+    notify::fire(on, class::STREAM, "xsetid", key);
     Ok(())
 }
 
@@ -537,7 +574,7 @@ fn summary(db: &Db, key: &[u8], name: &[u8], out: &mut Out) -> Result<()> {
 /// `XDEL` with a say in what happens to the consumer groups that were handed the
 /// entry, and one integer back per ID instead of a count, because a caller that
 /// asked for `ACKED` needs to know which of its IDs stayed.
-fn delex(db: &Db, args: Args<'_>, out: &mut Out) -> Result<()> {
+fn delex(db: &Db, on: usize, args: Args<'_>, out: &mut Out) -> Result<()> {
     let key = args.get(1);
     // The key is looked up before any of the syntax is read, which is visible
     // from a client: `XDELEX somestring BOGUS IDS 1 1-1` is a wrong type and not
@@ -554,8 +591,16 @@ fn delex(db: &Db, args: Args<'_>, out: &mut Out) -> Result<()> {
     }
     let ids = ids_in(args, at, args.len())?;
     out.array(n);
-    db.hold(key)
-        .xdelex(key, refs, ids, |fate| out.int(fate.code()))
+    let gone = db
+        .hold(key)
+        .xdelex(key, refs, ids, |fate| out.int(fate.code()))?;
+    // The same `xdel` a plain `XDEL` says, since what the log lost is the same
+    // thing however it was asked. An `ACKED` run where every ID was still
+    // referenced took nothing and says nothing.
+    if gone > 0 {
+        notify::fire(on, class::STREAM, "xdel", key);
+    }
+    Ok(())
 }
 
 /// `XACKDEL key group [KEEPREF|DELREF|ACKED] IDS numids id [id ...]`.
@@ -563,7 +608,7 @@ fn delex(db: &Db, args: Args<'_>, out: &mut Out) -> Result<()> {
 /// The same reply, about a different question. Here minus one means the group
 /// was not holding the ID rather than that the stream does not have it, so an
 /// entry that is sitting in the stream unread answers minus one and stays.
-fn ackdel(db: &Db, args: Args<'_>, out: &mut Out) -> Result<()> {
+fn ackdel(db: &Db, on: usize, args: Args<'_>, out: &mut Out) -> Result<()> {
     let (key, name) = (args.get(1), args.get(2));
     let here = db.hold(key).stream(key)?.is_some();
     let (refs, at) = refs_and_ids(args, 3)?;
@@ -574,8 +619,17 @@ fn ackdel(db: &Db, args: Args<'_>, out: &mut Out) -> Result<()> {
     }
     let ids = ids_in(args, at, args.len())?;
     out.array(n);
-    db.hold(key)
-        .xackdel(key, name, refs, ids, |fate| out.int(fate.code()))
+    let gone = db
+        .hold(key)
+        .xackdel(key, name, refs, ids, |fate| out.int(fate.code()))?;
+    // Counted off the log and not off the reply, and the two do not agree. An
+    // ID this group was holding that has already been deleted from under it
+    // answers one, because the pending list did lose it, and takes nothing out
+    // of the log, so a command made entirely of those says nothing.
+    if gone > 0 {
+        notify::fire(on, class::STREAM, "xdel", key);
+    }
+    Ok(())
 }
 
 /// `XNACK key group <SILENT|FAIL|FATAL> IDS numids id [id ...] [RETRYCOUNT n] [FORCE]`.
@@ -724,7 +778,7 @@ fn unrecognised(name: &str, opt: &[u8]) -> Error {
 /// option, which is how Redis tells the two apart. It means `XCLAIM k g c 0 -`
 /// complains about an unrecognised option rather than about an ID, and that is
 /// the sentence a real server sends.
-fn claim(db: &Db, args: Args<'_>, now: u64, out: &mut Out) -> Result<()> {
+fn claim(db: &Db, on: usize, args: Args<'_>, now: u64, out: &mut Out) -> Result<()> {
     let (key, name, who) = (args.get(1), args.get(2), args.get(3));
     let min_idle = millis(args.int(4).map_err(|_| bad(BAD_MIN_IDLE))?);
     let mut at = 5;
@@ -779,6 +833,7 @@ fn claim(db: &Db, args: Args<'_>, now: u64, out: &mut Out) -> Result<()> {
     // before the reply can start: an entry that turns out to have been deleted
     // leaves the pending list on the way past, and the reply only carries what
     // survived that.
+    let fresh = fresh_consumer(db, key, name, who);
     let (took, mut gone) = yo_alloc::allow(|| {
         let mut gone = Vec::new();
         let ids: Vec<Id> = (5..5 + count)
@@ -791,6 +846,9 @@ fn claim(db: &Db, args: Args<'_>, now: u64, out: &mut Out) -> Result<()> {
         nogroup(out, &kv::no_key_or_group(key, name));
         return Ok(());
     };
+    if fresh {
+        notify::fire(on, class::STREAM, "xgroup-createconsumer", key);
+    }
     if let Some(id) = last {
         move_bookmark(db, key, name, id)?;
     }
@@ -803,7 +861,7 @@ fn claim(db: &Db, args: Args<'_>, now: u64, out: &mut Out) -> Result<()> {
 /// and what was dropped for no longer being in the stream. The third one is why
 /// a sweep with this converges instead of handing the same dead entry round
 /// forever.
-fn autoclaim(db: &Db, args: Args<'_>, now: u64, out: &mut Out) -> Result<()> {
+fn autoclaim(db: &Db, on: usize, args: Args<'_>, now: u64, out: &mut Out) -> Result<()> {
     let (key, name, who) = (args.get(1), args.get(2), args.get(3));
     let min_idle = millis(args.int(4).map_err(|_| bad(BAD_MIN_IDLE_AUTO))?);
     let start = bound(args.get(5), true)?;
@@ -835,6 +893,7 @@ fn autoclaim(db: &Db, args: Args<'_>, now: u64, out: &mut Out) -> Result<()> {
         bump: !justid,
         ..Claim::default()
     };
+    let fresh = fresh_consumer(db, key, name, who);
     let (claimed, gone) = yo_alloc::allow(|| {
         let mut gone = Vec::new();
         (
@@ -847,6 +906,9 @@ fn autoclaim(db: &Db, args: Args<'_>, now: u64, out: &mut Out) -> Result<()> {
         nogroup(out, &kv::no_key_or_group(key, name));
         return Ok(());
     };
+    if fresh {
+        notify::fire(on, class::STREAM, "xgroup-createconsumer", key);
+    }
 
     out.array(3);
     // `0-0` at the end of the sweep, which is what a caller loops until.
@@ -857,6 +919,27 @@ fn autoclaim(db: &Db, args: Args<'_>, now: u64, out: &mut Out) -> Result<()> {
         id_out(out, id);
     }
     Ok(())
+}
+
+/// Whether the work about to be done will have to make this consumer.
+///
+/// `XREADGROUP`, `XCLAIM` and `XAUTOCLAIM` all name a consumer and make one
+/// where there was none, and a real server says `xgroup-createconsumer` when
+/// they do, exactly as if the client had asked for it in so many words. None of
+/// the three answers say whether it happened, so the question is asked in front
+/// of the work, and only when there is somebody to tell, because asking costs a
+/// stripe lock. A group that is not there makes nothing, since all three answer
+/// `NOGROUP` instead, and a key holding something else is the same: the work
+/// behind this raises the wrong type and this says no.
+fn fresh_consumer(db: &Db, key: &[u8], group: &[u8], who: &[u8]) -> bool {
+    notify::armed()
+        && db
+            .hold(key)
+            .stream(key)
+            .ok()
+            .flatten()
+            .and_then(|s| s.group(group))
+            .is_some_and(|g| g.slot(who).is_none())
 }
 
 /// The claimed IDs as the reply carries them, which is either the entries or the
@@ -913,12 +996,12 @@ fn move_bookmark(db: &Db, key: &[u8], name: &[u8], id: Id) -> Result<()> {
 /// the pair, `xgroup|create`, because Redis holds subcommands in its command
 /// table with an arity each. Enough arguments in a shape the handler will not
 /// take is the longer sentence pointing at `XGROUP HELP`.
-fn group(db: &Db, args: Args<'_>, now: u64, out: &mut Out) -> Result<()> {
+fn group(db: &Db, on: usize, args: Args<'_>, now: u64, out: &mut Out) -> Result<()> {
     let sub = args.get(1);
     let n = args.len();
     if args::is(sub, b"create") {
         arity(n, -5, "create")?;
-        return create(db, args, out);
+        return create(db, on, args, out);
     }
     if args::is(sub, b"setid") {
         arity(n, -5, "setid")?;
@@ -932,6 +1015,7 @@ fn group(db: &Db, args: Args<'_>, now: u64, out: &mut Out) -> Result<()> {
         return match db.hold(key).xgroup_setid(key, args.get(3), at, read)? {
             Some(()) => {
                 out.ok();
+                notify::fire(on, class::STREAM, "xgroup-setid", key);
                 Ok(())
             }
             None => {
@@ -943,7 +1027,13 @@ fn group(db: &Db, args: Args<'_>, now: u64, out: &mut Out) -> Result<()> {
     if args::is(sub, b"destroy") {
         arity(n, 4, "destroy")?;
         let key = args.get(2);
-        out.int(i64::from(db.hold(key).xgroup_destroy(key, args.get(3))?));
+        let gone = db.hold(key).xgroup_destroy(key, args.get(3))?;
+        out.int(i64::from(gone));
+        // A group that was not there answers zero and says nothing, which is
+        // the same shape every removal in every class has.
+        if gone {
+            notify::fire(on, class::STREAM, "xgroup-destroy", key);
+        }
         return Ok(());
     }
     if args::is(sub, b"createconsumer") {
@@ -955,6 +1045,11 @@ fn group(db: &Db, args: Args<'_>, now: u64, out: &mut Out) -> Result<()> {
         return match made {
             Some(made) => {
                 out.int(i64::from(made));
+                // Only when it was really made. A `CREATECONSUMER` naming one
+                // that is already there answers zero and says nothing.
+                if made {
+                    notify::fire(on, class::STREAM, "xgroup-createconsumer", key);
+                }
                 Ok(())
             }
             None => {
@@ -965,13 +1060,25 @@ fn group(db: &Db, args: Args<'_>, now: u64, out: &mut Out) -> Result<()> {
     }
     if args::is(sub, b"delconsumer") {
         arity(n, 5, "delconsumer")?;
-        let key = args.get(2);
-        return match db
-            .hold(key)
-            .xgroup_del_consumer(key, args.get(3), args.get(4))?
-        {
+        let (key, name, who) = (args.get(2), args.get(3), args.get(4));
+        let mut stripe = db.hold(key);
+        // The count that comes back is how many pending entries went with the
+        // consumer, and a consumer that was not there and one that was there
+        // holding nothing both answer zero, so whether it was there has to be
+        // asked in front of the removal.
+        let there = notify::armed()
+            && stripe
+                .stream(key)?
+                .and_then(|s| s.group(name))
+                .is_some_and(|g| g.slot(who).is_some());
+        let held = stripe.xgroup_del_consumer(key, name, who)?;
+        drop(stripe);
+        return match held {
             Some(held) => {
                 out.uint(held);
+                if there {
+                    notify::fire(on, class::STREAM, "xgroup-delconsumer", key);
+                }
                 Ok(())
             }
             None => {
@@ -992,7 +1099,7 @@ fn group(db: &Db, args: Args<'_>, now: u64, out: &mut Out) -> Result<()> {
 ///
 /// The two options come in either order, so this is a loop and not a pair of
 /// positions.
-fn create(db: &Db, args: Args<'_>, out: &mut Out) -> Result<()> {
+fn create(db: &Db, on: usize, args: Args<'_>, out: &mut Out) -> Result<()> {
     let mut mkstream = false;
     let mut read = None;
     let mut i = 5;
@@ -1015,6 +1122,7 @@ fn create(db: &Db, args: Args<'_>, out: &mut Out) -> Result<()> {
         .xgroup_create(key, args.get(3), at, mkstream, read)?
     {
         out.ok();
+        notify::fire(on, class::STREAM, "xgroup-create", key);
     } else {
         // Its own prefix, because a client that races another one to create the
         // same group treats this as "somebody else got there" and not as an
@@ -1529,6 +1637,20 @@ pub(super) fn parse_read(name: &str, args: Args<'_>, db: &Db, now: u64) -> Resul
     })
 }
 
+/// One database and the number it answers to.
+///
+/// The read path wants both and wants them everywhere: one to find the stripe a
+/// key is on, and one to name the channel a notification goes out on. Passing
+/// them as a pair is what keeps the two functions below inside an argument
+/// count anybody can read.
+#[derive(Clone, Copy)]
+pub(super) struct On<'a> {
+    /// The database the read is against.
+    pub(super) db: &'a Db,
+    /// Which number that is, which only the notification cares about.
+    pub(super) at: usize,
+}
+
 /// Try to answer an `XREAD` or `XREADGROUP` now.
 ///
 /// `Ok(true)` means a reply was written and the client is finished with, which
@@ -1552,7 +1674,7 @@ pub(super) fn parse_read(name: &str, args: Args<'_>, db: &Db, now: u64) -> Resul
 ///
 /// A key holding something that is not a stream, under `strict`.
 pub(super) fn read(
-    db: &Db,
+    on: On<'_>,
     keys: &[Vec<u8>],
     r: &Reads,
     now: u64,
@@ -1562,6 +1684,7 @@ pub(super) fn read(
     // Every stream at once, so that a read over four of them is one answer
     // about four streams rather than four answers taken at four moments, and so
     // that a group cannot be dropped between the check below and the read.
+    let db = on.db;
     let mut held = db.hold_keys(keys.iter().map(Vec::as_slice));
     if let Some((name, _)) = &r.group {
         for key in keys {
@@ -1602,7 +1725,7 @@ pub(super) fn read(
         }
         out.bulk(key);
         let body = out.len();
-        let got = match one_stream(db, &mut held, key, at, r, now, out) {
+        let got = match one_stream(on, &mut held, key, at, r, now, out) {
             Ok(n) => n,
             Err(e) if strict => return Err(e),
             Err(_) => {
@@ -1634,7 +1757,7 @@ pub(super) fn read(
 /// nothing be dropped from the reply after the walk rather than counted before
 /// it.
 fn one_stream(
-    db: &Db,
+    on: On<'_>,
     held: &mut Holds<'_>,
     key: &[u8],
     at: &At,
@@ -1642,6 +1765,7 @@ fn one_stream(
     now: u64,
     out: &mut Out,
 ) -> Result<Option<usize>> {
+    let db = on.db;
     match at {
         At::After(after) => {
             let n = held.stripe_mut(db.stripe_of(key)).xread_into(
@@ -1670,6 +1794,16 @@ fn one_stream(
                 noack: r.noack,
             };
             let stripe = held.stripe_mut(db.stripe_of(key));
+            // In front of the read, because the read is what makes the consumer
+            // and its answer says nothing about that. The group is there: the
+            // caller checked every key for it before any of them was read.
+            let fresh = notify::armed()
+                && stripe
+                    .stream(key)
+                    .ok()
+                    .flatten()
+                    .and_then(|s| s.group(group))
+                    .is_some_and(|g| g.slot(consumer).is_none());
             let n = stripe.xreadgroup_into(key, want, now, |id, fields| {
                 match fields {
                     Some(fields) => entry(out, id, fields),
@@ -1685,6 +1819,9 @@ fn one_stream(
                 }
                 true
             })?;
+            if fresh {
+                notify::fire(on.at, class::STREAM, "xgroup-createconsumer", key);
+            }
             Ok(match n {
                 Some(n) if history || n > 0 => Some(n),
                 _ => None,

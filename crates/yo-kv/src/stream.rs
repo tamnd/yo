@@ -951,21 +951,27 @@ impl Stream {
     /// was not holding is [`Fate::Missing`] whether or not the entry is in the
     /// stream, and an ID it was holding is never `Missing`, so a caller reading
     /// the reply is being told about its own pending list and not about the log.
-    pub fn ack_delete(&mut self, group: &[u8], id: Id, refs: Refs) -> Fate {
+    ///
+    /// The flag beside the answer is whether an entry really left the log, which
+    /// is not the same question. A group can be holding an ID that has since
+    /// been deleted from under it, and acknowledging that one answers
+    /// [`Fate::Gone`] because the pending list did lose it, while the log lost
+    /// nothing. Only the flag is worth telling a keyspace subscriber about.
+    pub fn ack_delete(&mut self, group: &[u8], id: Id, refs: Refs) -> (Fate, bool) {
         let Some(g) = self.group_mut(group) else {
-            return Fate::Missing;
+            return (Fate::Missing, false);
         };
         if !g.ack(id) {
-            return Fate::Missing;
+            return (Fate::Missing, false);
         }
         if refs == Refs::Acked && self.still_wanted(id) {
-            return Fate::Held;
+            return (Fate::Held, false);
         }
-        self.delete(id);
+        let gone = self.delete(id);
         if refs == Refs::Drop {
             self.drop_refs(id);
         }
-        Fate::Gone
+        (Fate::Gone, gone)
     }
 
     /// Hand an entry back to a group without acknowledging it, which is `XNACK`.
