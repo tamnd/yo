@@ -663,12 +663,41 @@ fn aggregate(g: &Weighted, split: &[u32], comm: &[u32]) -> (Weighted, Vec<u32>, 
 }
 
 /// The same grouping with the labels numbered from zero, and how many there are.
+///
+/// Either way the new numbers are handed out in the order the labels are first
+/// seen walking the slice, so the answer does not depend on which of the two
+/// paths below ran.
 fn renumber(of: &[u32]) -> (Vec<u32>, usize) {
-    let mut seen = vec![u32::MAX; of.len()];
+    // Every label that comes out of one of the algorithms here is a node id of
+    // the level it came from, so it is already below the node count and a table
+    // that size can be indexed by the label directly. That is the whole of the
+    // hot path: a level of Louvain renumbers twice and both of those go through
+    // here.
+    //
+    // A caller's own grouping is under no such rule. `modularity` takes any
+    // grouping of the nodes, and a caller who numbered their groups by a hash
+    // or by a database id hands over labels with nothing to do with the node
+    // count. Sizing the table by the largest label would let one of those ask
+    // for sixteen gigabytes, so the labels are ranked instead, which costs a
+    // sort and a binary search a node and never more memory than the slice.
+    if of.iter().all(|at| (*at as usize) < of.len()) {
+        let mut seen = vec![u32::MAX; of.len()];
+        return fill(of, |at| *at as usize, &mut seen);
+    }
+    let mut sorted = of.to_vec();
+    sorted.sort_unstable();
+    sorted.dedup();
+    let mut seen = vec![u32::MAX; sorted.len()];
+    fill(of, |at| sorted.partition_point(|x| x < at), &mut seen)
+}
+
+/// Walk `of` handing out the next number to each label the first time it shows
+/// up, with `rank` saying where a label's slot in `seen` is.
+fn fill(of: &[u32], rank: impl Fn(&u32) -> usize, seen: &mut [u32]) -> (Vec<u32>, usize) {
     let mut next = 0u32;
     let mut out = vec![0u32; of.len()];
     for (node, at) in of.iter().enumerate() {
-        let seen = &mut seen[*at as usize];
+        let seen = &mut seen[rank(at)];
         if *seen == u32::MAX {
             *seen = next;
             next += 1;
@@ -773,14 +802,12 @@ mod tests {
                 .map(|_| (rng.next_u64() % nodes, rng.next_u64() % nodes))
                 .collect();
             let s = Snapshot::of(&linked(&edges));
-            // Three groups, or one a node where there are fewer than three
-            // nodes. A label above the node count is a valid grouping by the
-            // documented contract and `modularity` panics on one, which is
-            // issue #462 and not this test's business. The larger
-            // graphs never handed it one by luck.
-            let groups = u64::from(s.nodes()).clamp(1, 3);
+            // Three groups, whatever the node count is, so a two node graph
+            // here is asked about a grouping whose labels run above its own
+            // node count. That is a valid grouping by the documented contract
+            // and it used to panic, which is issue #462.
             let of: Vec<u32> = (0..s.nodes())
-                .map(|_| (rng.next_u64() % groups) as u32)
+                .map(|_| (rng.next_u64() % 3) as u32)
                 .collect();
             for resolution in [0.5, 1.0, 2.0] {
                 let (mine, theirs) = (
@@ -793,6 +820,25 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn the_labels_a_grouping_uses_do_not_have_to_be_small() {
+        // The contract is that the labels mean nothing beyond which nodes share
+        // one, so a caller who numbered their groups by a hash or by a database
+        // id is handing over a valid grouping. It used to panic on the first
+        // label above the node count, which is issue #462, because the table
+        // that ranks the labels was sized by the node count and indexed by the
+        // label.
+        let s = Snapshot::of(&linked(&ring(4, 8)));
+        let small: Vec<u32> = (0..s.nodes()).map(|node| node / 8).collect();
+        let large: Vec<u32> = small.iter().map(|g| g * 900_000_007).collect();
+        let apart: Vec<u32> = (0..s.nodes()).map(|node| u32::MAX - node).collect();
+        assert_eq!(modularity(&s, &large), modularity(&s, &small));
+        assert!(
+            modularity(&s, &apart) < 0.0,
+            "one group a node is a bad split"
+        );
     }
 
     #[test]
