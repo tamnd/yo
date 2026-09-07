@@ -97,6 +97,7 @@ impl Argv {
     /// Only a test asks. A `Vec` reaches the allocator exactly when this
     /// changes, so a test that wants to say a decode did not allocate can say
     /// it by reading this on either side of the decode.
+    #[cfg(test)]
     pub(crate) fn room(&self) -> usize {
         self.spans.capacity()
     }
