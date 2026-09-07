@@ -10,6 +10,11 @@ It builds yodb, starts it on a free port with the check armed, sends about nine
 thousand commands covering every type, stops the server and prints one line per
 distinct site with the innermost frame that is in this repository.
 
+Some sites have no frame in this repository at all, and those used to print as
+"outside this repository" and nothing else, which is a byte count and no way to
+find what asked for it. Those now print their innermost frames instead, minus
+the allocator and the vector growth that every trace has.
+
 It is a gate and not just a report. An empty list exits 0 and anything else
 exits 1, so CI runs this and a new allocation on a command path fails the pull
 request that added it, with the file and the line in the log. Report mode rather
@@ -247,6 +252,40 @@ def innermost(trace):
     return None, None
 
 
+# Frames every backtrace has and none of them says which line asked for the
+# memory: the allocator itself, the reporting machinery, and the vector and
+# string growth that sits between a push and the allocator.
+NOISE = re.compile(
+    r"yo_alloc|__rust_alloc|alloc::alloc|alloc::raw_vec|RawVec|"
+    r"alloc::vec::Vec|alloc::string|core::fmt|std::backtrace|"
+    r"backtrace::|std::sys|_?rust_begin"
+)
+
+
+def nearby(trace, want=8):
+    """The frames worth showing when none of them is in this repository.
+
+    Without this the report says the site is outside the repository and stops,
+    which leaves a reader with a byte count and nothing to go and look at. The
+    frames are still in the trace, they are just all in dependencies, so print
+    them rather than throwing them away. Noise frames come out because they are
+    the same for every site.
+    """
+    lines = trace.split("\n")
+    out = []
+    for i, line in enumerate(lines):
+        m = re.match(r"\s*\d+: (.*)", line)
+        if not m or NOISE.search(m.group(1)):
+            continue
+        where = ""
+        if i + 1 < len(lines) and lines[i + 1].strip().startswith("at "):
+            where = lines[i + 1].strip()[3:]
+        out.append((m.group(1), where))
+        if len(out) == want:
+            break
+    return out
+
+
 def main():
     print("building yodb, debug, so the backtraces keep their line numbers")
     build = subprocess.run(
@@ -297,6 +336,15 @@ def main():
         print("  %-22s %s" % (head, where or "outside this repository"))
         if what:
             print("  %-22s   %s" % ("", what))
+        if not where:
+            # Nothing of ours is in this trace, so the file and line the rest of
+            # this report is built around do not exist for it. Print the frames
+            # themselves, otherwise the only way to find the site is to guess
+            # from the byte count.
+            for sym, at in nearby(b):
+                print("  %-22s   %s" % ("", sym))
+                if at:
+                    print("  %-22s     at %s" % ("", at))
     if KEEP:
         print("")
         print("raw log at %s" % log.name)
