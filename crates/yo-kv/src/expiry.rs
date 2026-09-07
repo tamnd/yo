@@ -143,12 +143,11 @@ impl Keyspace {
             let mut buf = core::mem::take(&mut self.scratch);
             buf.clear();
             buf.extend_from_slice(self.map.entry_at(*addr).0);
-            let gone = self.drop_key(&buf);
+            let gone = self.reaped(&buf);
             self.scratch = buf;
             if gone {
                 c.expired += 1;
                 round.expired += 1;
-                self.expired += 1;
             }
         }
         round

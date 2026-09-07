@@ -1549,7 +1549,15 @@ impl Server {
                     .relieve(over)
                     .is_ok_and(yo_kv::tier::Relief::made_room)
             } else {
-                self.slot(i).evict_one()
+                // Against this database rather than whichever one the write
+                // that provoked the eviction was aimed at, since the key that
+                // goes is this one's. The funnel is already armed above and
+                // this is a second one inside it, which is what the answer
+                // going back into the drain is for.
+                let armed = notify::arm(self, self.slot_db(i));
+                let gone = self.slot(i).evict_one();
+                notify::drain(self, armed);
+                gone
             };
             if gave {
                 self.evict_db.store((i + 1) % self.slots(), Relaxed);
@@ -1606,7 +1614,13 @@ impl Server {
                 break;
             }
             let i = (from + turn) % self.slots();
+            // Nothing armed this thread, because nothing asked for any of this:
+            // the shard loop is between commands. So the sweep arms and drains
+            // around itself, and a key it takes is news to a subscriber in the
+            // same way a key a lookup took on the way past is.
+            let armed = notify::arm(self, self.slot_db(i));
             let c = self.slot(i).expire_cycle(budget - spent);
+            notify::drain(self, armed);
             spent += c.examined;
             if c.expired > 0 {
                 self.expire_db.store((i + 1) % self.slots(), Relaxed);
@@ -2008,7 +2022,7 @@ pub fn resolved(
     // hear about it. Armed here and drained after the group, because the bodies
     // below are handed a database and their arguments and have no way to reach
     // the pub/sub registry from there. Off costs one thread local store.
-    let armed = notify::arm(server);
+    let armed = notify::arm(server, session.db);
     let done = if spec.flags.contains(&"blocking") {
         blocking::execute(server, session, spec, args, out)
     } else {
