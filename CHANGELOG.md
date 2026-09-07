@@ -4,6 +4,23 @@ What each release changed, why, and what it costs you. The versioning rules and 
 
 While the major is 0, a minor release may break anything, including the on-disk format. The format is frozen at `M6`, not before.
 
+## 0.3.23 — 2026-09-07
+
+Four pull requests and no milestone has closed, so this is a patch.
+
+All of it is `M8` compatibility work on the connection side: transactions, pub/sub and the keyspace notifications that ride on pub/sub. A file written by 0.3.22 opens unchanged under this version and a file written by this version opens under 0.3.22. No record kind was added.
+
+### Added
+
+- **Transactions, which is `MULTI`, `EXEC`, `DISCARD`, `WATCH` and `UNWATCH`.** All five are in and verified against Redis 8.10.1 over sixty six scripted cases plus a second round of twenty, covering what gets queued, what refuses to be queued, what an error inside a queue does to the rest of it and what a watch on a key that moved does to the `EXEC` that follows. A queued command is never half run: each one holds every stripe it needs for as long as it needs, so a client cannot see one command of the queue partly applied.
+- **Pub/sub, which is `SUBSCRIBE`, `UNSUBSCRIBE`, `PSUBSCRIBE`, `PUNSUBSCRIBE`, `SSUBSCRIBE`, `SUNSUBSCRIBE`, `PUBLISH`, `SPUBLISH` and `PUBSUB`.** All nine are in and verified over fifteen RESP2 cases and five RESP3 cases at no differences. The three namespaces are kept apart the way a real server keeps them apart, so a channel, a pattern and a shard channel can share a name and hear none of each other. Getting a message from the thread that published it to the thread that owns the subscriber goes through a mailbox per thread, and a publish allocates the body once behind an `Arc` however many subscribers it reaches, so a subscriber costs nothing until there is one.
+- **Keyspace notifications, which is `notify-keyspace-events` and the two channels it publishes on.** A client subscribed to `__keyspace@0__:mykey` or `__keyevent@0__:del` hears about every write the keyspace, string and bitmap groups make. Eighty two cases were run against 8.10.1 under five settings of the flag, comparing every channel and payload in the order they arrived, and they agree on all of them. A server with the setting off pays a load and a branch per call site and nothing else, and so does a server with the setting on and nobody listening.
+
+### Changed
+
+- **The command table's multiplier was searched again.** Nine new command names took the table to 420 and the worst probe to two slots, so a twentieth search ran over four billion candidates and put it back to one slot for every name at twenty four extra probes.
+- **`yo-kv` is back in the Miri run**, which it had dropped out of.
+
 ## 0.3.22 — 2026-09-07
 
 Twenty three pull requests and no milestone has closed, so this is a patch.
