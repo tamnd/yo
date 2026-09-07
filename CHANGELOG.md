@@ -4,6 +4,23 @@ What each release changed, why, and what it costs you. The versioning rules and 
 
 While the major is 0, a minor release may break anything, including the on-disk format. The format is frozen at `M6`, not before.
 
+## 0.3.25 — 2026-09-07
+
+Four pull requests and no milestone has closed, so this is a patch.
+
+All of it is `M8` compatibility work on keyspace notifications, which finishes the classes: the two that say a value was thrown away, the six commands that had been writing in silence, and the class that says a read found nothing. A file written by 0.3.24 opens unchanged under this version and a file written by this version opens under 0.3.24. No record kind was added.
+
+### Added
+
+- **The `overwritten` and `type_changed` classes.** A write that throws away the whole of what was under a name now says so, and says the kind changed when it did. The line is between replacing a value and reaching into one rather than between kinds of write, so `SET`, `MSET`, `GETSET` and every store form are on one side of it and `APPEND`, `SETRANGE`, `INCR`, `RPUSH` and `SADD` are on the other, the same way round as Redis 8.10.1. `RENAME` and `COPY` say the pair last where everything else says it first, on both sides and for the same reason, which is that they take the destination away and put another key in its place.
+- **The `keymiss` class, which is a read saying it found nothing.** A real server fires this from inside `lookupKey`, which covers every command at once because every read there goes through one function. There is no such funnel here, so the question is asked in front of the command out of a table of which of a command's arguments are keys it is going to read: the read only commands whose values live in the keyspace, the forms whose keys hide behind a count, the store families' sources rather than their destinations, the two stream reads whose keys sit after `STREAMS` with `XREAD` looking at each of them twice, and the dozen writes that read something before they change it. The module commands are in it too, since the module API's own key opener goes through the same lookup, with the handful a real server keeps quiet measured rather than guessed: `TS.INFO`, `CF.COMPACT` and the whole of the search group bar the two suggestion dictionary reads. Three hundred and twenty cases agree with the reference across the flag settings.
+- **Six commands that had been writing in silence now say what they did.** `SETBIT` and `BITFIELD` say `setbit`, `PFADD` and `PFMERGE` say `pfadd`, `GEOADD` says `zadd` on the sorted set class, and both writable `GEORADIUS` forms and `GEOSEARCHSTORE` say their own names. The rule they share is a dirty guard rather than the fact that a write ran, so `SETBIT k 1 0` on a bit that was already zero says nothing while `SETBIT k 1000 0` on a short value says it, and neither half of that is readable from the reply.
+
+### Fixed
+
+- **`MOVE` and `COPY ... DB` were putting the news of a new key on the wrong database.** Both were publishing on the database the connection was on rather than the one the key landed on, which nothing caught because the birth notice comes from a layer with no database number to hand. A client subscribed to `__keyevent@1__:new` now hears about a key moved into database one.
+- **Three commands were treating a key arriving and a value changing as the same thing.** `RENAME`, `COPY` and `RESTORE` wrote over the destination's body where they should take the whole record away first, and `SORT ... STORE` took the record away where it should keep it, so all four said the wrong thing about whether the destination was new.
+
 ## 0.3.24 — 2026-09-07
 
 Seven pull requests and no milestone has closed, so this is a patch.
