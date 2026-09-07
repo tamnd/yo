@@ -3436,10 +3436,7 @@ mod tests {
         r.engine_mut()
             .feed(one, &wire(&[b"CLIENT", b"KILL", b"10.0.0.9:9999"]));
         pump(&mut r, &mut batch);
-        assert_eq!(
-            r.engine().sink().sent(one),
-            b"-ERR No such client\r\n"
-        );
+        assert_eq!(r.engine().sink().sent(one), b"-ERR No such client\r\n");
 
         r.engine_mut().sink_mut().clear();
         r.engine_mut()
