@@ -2120,7 +2120,7 @@ pub fn resolved(
             "stream" => {
                 let db = session.db;
                 let now = server.now_ms();
-                streams::execute(&server.dbs[db], spec, args, now, out).map(|()| Flow::Continue)
+                streams::execute(&server.dbs[db], db, spec, args, now, out).map(|()| Flow::Continue)
             }
             // The one keyspace command that needs more than the databases,
             // because the socket it talks down is held on the server between
