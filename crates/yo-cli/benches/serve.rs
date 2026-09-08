@@ -127,6 +127,21 @@
 //! of them walking every stripe of every database on every worker and taking
 //! each stripe's lock to find nothing.
 //!
+//! Those four numbers are four separate runs, which is why they were taken on a
+//! quiet machine and why they could not be taken again on a busy one.
+//! `YO_BENCH_DEBUG_AGAINST` sets the far side of a pair instead, so the same
+//! attribution becomes one paired run of the same build against itself with one
+//! job turned off, and the ratio is what that job costs.
+//!
+//! ```text
+//! YO_BENCH_DEBUG="PAUSE-CRON 1" YO_BENCH_DEBUG_AGAINST= YO_BENCH_REPEATS=11 \
+//!   YO_BENCH_AGAINST=target/release/yodb cargo bench -p yo-cli --bench serve
+//! ```
+//!
+//! Unset, the far side is set up the same way this one is, which is what a
+//! comparison of two builds wants. Set, including set to nothing as above, the
+//! two sides differ by that and by nothing else.
+//!
 //! A number measured with any of this set is a number about a server that is
 //! not doing its job, and belongs in an argument about where time goes rather
 //! than in a claim about how fast yo is.
@@ -231,8 +246,21 @@ mod unix {
 
         let mine = PathBuf::from(env!("CARGO_BIN_EXE_yodb"));
         let against = std::env::var_os("YO_BENCH_AGAINST").map(PathBuf::from);
+        let debug = text("YO_BENCH_DEBUG");
+        // Unset means the far side is set up the same way this one is, which is
+        // what a comparison of two builds wants. Set, including set to nothing,
+        // means the two sides differ by that and by nothing else, which is what
+        // an attribution wants.
+        let debug_against = std::env::var_os("YO_BENCH_DEBUG_AGAINST")
+            .map(|t| t.to_string_lossy().into_owned())
+            .unwrap_or_else(|| debug.clone());
         if let Some(that) = &against {
-            println!("this {}\nthat {}", mine.display(), that.display());
+            println!("this {}", mine.display());
+            println!("that {}", that.display());
+            if debug != debug_against {
+                println!("this DEBUG {debug:?}");
+                println!("that DEBUG {debug_against:?}");
+            }
         }
 
         let mut bad = 0;
@@ -264,7 +292,7 @@ mod unix {
                 let mut ratios = Vec::with_capacity(repeats);
                 for round in 0..repeats {
                     let Some(that) = &against else {
-                        rates.push(cell(&spec, &mine, 0));
+                        rates.push(cell(&spec, &mine, 0, &debug));
                         continue;
                     };
                     // Alternating, so that whichever binary goes first is not
@@ -273,11 +301,11 @@ mod unix {
                     // one that has just had a server killed on it, and that is
                     // a difference worth cancelling rather than measuring.
                     let (a, b) = if round % 2 == 0 {
-                        let a = cell(&spec, &mine, 0);
-                        (a, cell(&spec, that, 1))
+                        let a = cell(&spec, &mine, 0, &debug);
+                        (a, cell(&spec, that, 1, &debug_against))
                     } else {
-                        let b = cell(&spec, that, 1);
-                        (cell(&spec, &mine, 0), b)
+                        let b = cell(&spec, that, 1, &debug_against);
+                        (cell(&spec, &mine, 0, &debug), b)
                     };
                     rates.push(a);
                     theirs.push(b);
@@ -400,7 +428,12 @@ mod unix {
     /// beside, which is what lets a pair of them be measured against each
     /// other. `side` only keeps the two off one socket path, so that a server
     /// taking its time to die cannot be found by the run after it.
-    fn cell(cell: &Cell, bin: &Path, side: usize) -> f64 {
+    ///
+    /// `debug` is per side rather than read from the environment down in the
+    /// client, because the two halves of a pair are allowed to be the same
+    /// build with a different job turned off, and that is how a cost gets
+    /// attributed on a machine that cannot hold still.
+    fn cell(cell: &Cell, bin: &Path, side: usize, debug: &str) -> f64 {
         let Cell {
             threads,
             pipeline,
@@ -428,6 +461,7 @@ mod unix {
             let stop = Arc::clone(&stop);
             let done = Arc::clone(&done);
             let gate = Arc::clone(&gate);
+            let debug = debug.to_owned();
             hands.push(std::thread::spawn(move || {
                 let mut conns: Vec<UnixStream> =
                     (0..per_client).map(|_| connect(&socket)).collect();
@@ -436,7 +470,7 @@ mod unix {
                 // change the server rather than the connection and sending
                 // them four times only means saying the same thing four times.
                 if id == 0 {
-                    debug_setup(&mut conns[0]);
+                    debug_setup(&mut conns[0], &debug);
                 }
                 fill(&mut conns[0], id);
                 gate.wait();
@@ -604,17 +638,13 @@ mod unix {
         stream
     }
 
-    /// Send whatever `YO_BENCH_DEBUG` asks for, before anything is measured.
+    /// Send whatever this side was asked to send, before anything is measured.
     ///
     /// Semicolons between subcommands, spaces inside one, and `DEBUG` is added
     /// rather than typed. Nothing checks the replies beyond reading them, since
     /// a subcommand this build does not have answers an error and the run that
     /// follows is then a run with that job still on, which the number will say.
-    fn debug_setup(conn: &mut UnixStream) {
-        let Some(text) = std::env::var_os("YO_BENCH_DEBUG") else {
-            return;
-        };
-        let text = text.to_string_lossy().into_owned();
+    fn debug_setup(conn: &mut UnixStream, text: &str) {
         for one in text.split(';').map(str::trim).filter(|s| !s.is_empty()) {
             let parts: Vec<&[u8]> = std::iter::once(b"DEBUG".as_slice())
                 .chain(one.split_whitespace().map(str::as_bytes))
@@ -698,6 +728,13 @@ mod unix {
             std::process::id()
         ));
         path
+    }
+
+    /// A string out of the environment, empty if it is not there.
+    fn text(name: &str) -> String {
+        std::env::var_os(name)
+            .map(|t| t.to_string_lossy().into_owned())
+            .unwrap_or_default()
     }
 
     /// One number out of the environment, or the default.
