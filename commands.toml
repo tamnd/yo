@@ -5109,7 +5109,7 @@ bounded = "inherent"
 status = "shipped"
 wire = "verified"
 divergent = "D-13"
-notes = "COUNT, LIST, INFO, DOCS, GETKEYS and HELP. GETKEYS is the one a cluster aware client routes on, so MSETEX, whose keys are not where the first, last and step triple says, is special cased there rather than being answered wrongly."
+notes = "COUNT, LIST, INFO, DOCS, GETKEYS, GETKEYSANDFLAGS and HELP. INFO reports the key specs Redis added in 7.0 beside the legacy triple, which is where a cluster aware client and the ACL both read where a command's keys are and what it does to each one, and every one of the four hundred and twenty nine rows carries the reference's own answer. GETKEYS and GETKEYSANDFLAGS resolve them the way getKeysUsingKeySpecs does, including the three rules that read as mistakes and are not: a run reaching past the last argument is a syntax error rather than a shorter run, a keyword search stops one argument short of the end because a keyword in the last argument has no key behind it, and a spec that says it is incomplete throws away the whole answer rather than half of it. Eleven commands either keep their keys somewhere a spec cannot say or decide from their options what they do to a key, and each of those is answered by a function written for that command once the specs have failed, which is the same split and the same order the reference has. A container asked about a subcommand that is not one answers the wrong one of two errors, which is D-114."
 
 [[command]]
 name = "CONFIG"

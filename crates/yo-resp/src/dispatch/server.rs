@@ -15,6 +15,7 @@
 //! `COMMAND INFO` are simple strings inside an array rather than bulk strings.
 
 use super::args::{self, Args, is};
+use super::keyspec::{self, Begin, Find, KeySpec};
 use super::table::{self, Spec};
 use super::{DATABASES, Flow, Server, Session, auth, backup, cpu, debug, multi, notify, persist};
 use crate::proto::Proto;
@@ -673,7 +674,9 @@ fn command(args: Args<'_>, out: &mut Out) -> Result<()> {
     } else if is(sub, b"DOCS") {
         docs(args, out);
     } else if is(sub, b"GETKEYS") {
-        getkeys(args, out)?;
+        getkeys(args, out, false)?;
+    } else if is(sub, b"GETKEYSANDFLAGS") {
+        getkeys(args, out, true)?;
     } else if is(sub, b"HELP") {
         help(out, COMMAND_HELP);
     } else {
@@ -756,18 +759,32 @@ fn write_docs(out: &mut Out, spec: &Spec) {
     out.bulk(spec.complexity.as_bytes());
 }
 
-/// `COMMAND GETKEYS <full command>`.
+/// `COMMAND GETKEYS <full command>` and `COMMAND GETKEYSANDFLAGS <full command>`.
 ///
 /// This is how a cluster aware client routes a command it does not have a rule
 /// for, so a wrong answer here is a client that sends a write to the wrong
-/// node. The generic path is the first, last and step triple from the table.
-fn getkeys(args: Args<'_>, out: &mut Out) -> Result<()> {
+/// node. The answer comes off the key specs, which is the same place the ACL
+/// reads, so the two can never drift apart.
+///
+/// The three errors are the reference's own and they mean different things. A
+/// name nobody registered is one, a command that never takes a key whatever it
+/// is sent is another, and a command that does take keys and was handed
+/// arguments the specs cannot resolve is the third. Only the last is about what
+/// was actually typed.
+fn getkeys(args: Args<'_>, out: &mut Out, flags: bool) -> Result<()> {
+    let sub = if flags { "getkeysandflags" } else { "getkeys" };
     if args.len() < 3 {
-        return Err(args::wrong_arity_sub("command", "getkeys"));
+        return Err(args::wrong_arity_sub("command", sub));
     }
     let inner = args.get(2);
     let spec = table::lookup(inner)
         .ok_or_else(|| Error::new(Code::Unsupported, "Invalid command specified"))?;
+    if !keyspec::takes_keys(spec, args, 2) {
+        return Err(Error::new(
+            Code::Invalid,
+            "The command has no key arguments",
+        ));
+    }
     let argc = args.len() - 2;
     if !table::arity_ok(spec, argc) {
         return Err(Error::new(
@@ -775,28 +792,57 @@ fn getkeys(args: Args<'_>, out: &mut Out) -> Result<()> {
             "Invalid number of arguments specified for command",
         ));
     }
-    // Where the keys are is the same question `WATCH` asks about a command that
-    // has just run, so the answer is worked out in one place and the two
-    // callers differ only in how many arguments sit in front of the command.
-    let span = table::key_span(spec, args, 2).map_err(|why| match why {
-        table::NoKeys::Never => Error::new(Code::Invalid, "The command has no key arguments"),
-        table::NoKeys::BadCount => {
-            Error::new(Code::Invalid, "Invalid arguments specified for command")
+    // Three specs at most a command and one run each, so the answer is worked
+    // out into a fixed array rather than a list that grows. A run is a first
+    // argument and a count, so a hundred keys behind a count is still one of
+    // these.
+    let mut runs = [None; 4];
+    let mut at = 0;
+    let whole = keyspec::find(spec, args, 2, &mut |run| {
+        if at < runs.len() {
+            runs[at] = Some(run);
+            at += 1;
         }
-    })?;
-    out.array(span.count);
-    for i in 0..span.count {
-        out.bulk(args.get(span.first + i * span.step));
+    });
+    let found: usize = runs.iter().flatten().map(|r| r.count).sum();
+    // A command that resolves to nothing is a syntax error, unless it is one of
+    // the six that may honestly have no keys, which is the script family: `EVAL
+    // body 0` is an ordinary thing to write and answers an empty list.
+    if (!whole || found == 0) && !spec.flags.contains(&"no_mandatory_keys") {
+        return Err(Error::new(
+            Code::Invalid,
+            "Invalid arguments specified for command",
+        ));
+    }
+    let found = if whole { found } else { 0 };
+    out.array(found);
+    if found == 0 {
+        return Ok(());
+    }
+    for run in runs.iter().flatten() {
+        for i in 0..run.count {
+            let key = args.get(run.first + i * run.step);
+            if flags {
+                out.array(2);
+                out.bulk(key);
+                out.set(run.flags.len());
+                for f in run.flags {
+                    out.simple(f.as_bytes());
+                }
+            } else {
+                out.bulk(key);
+            }
+        }
     }
     Ok(())
 }
 
 /// One command, in the ten field shape `COMMAND INFO` has had since 7.0.
 ///
-/// The tips, the key specs and the subcommands are all empty. The triple above
-/// them says where the keys are for everything in this table except `MSETEX`,
-/// `TS.NRANGE` and `TS.NREVRANGE`, which is what `COMMAND GETKEYS` is for, and
-/// divergence D-13 says so.
+/// The tips and the subcommands are still empty, which is what is left of
+/// divergence D-13. The key specs are not: they say where the keys are for
+/// everything in this table, including the commands the triple above them
+/// cannot describe.
 ///
 /// Five of the ten fields are sets rather than arrays, which only shows on
 /// RESP3 and shows there on every command. A set is what the reference sends
@@ -818,8 +864,86 @@ fn write_spec(out: &mut Out, spec: &Spec) {
         out.simple(a.as_bytes());
     }
     out.set(0);
+    out.set(spec.keys.len());
+    for key in spec.keys {
+        write_key_spec(out, key);
+    }
     out.set(0);
-    out.set(0);
+}
+
+/// One key spec, as the map `COMMAND INFO` reports it.
+///
+/// The notes come first and only when there are any, which is why the map is
+/// three long or four rather than always four.
+fn write_key_spec(out: &mut Out, key: &KeySpec) {
+    out.map(if key.notes.is_empty() { 3 } else { 4 });
+    if !key.notes.is_empty() {
+        out.bulk(b"notes");
+        out.bulk(key.notes.as_bytes());
+    }
+    out.bulk(b"flags");
+    out.set(key.flags.len());
+    for f in key.flags {
+        out.simple(f.as_bytes());
+    }
+    out.bulk(b"begin_search");
+    out.map(2);
+    out.bulk(b"type");
+    match key.begin {
+        Begin::At(index) => {
+            out.bulk(b"index");
+            out.bulk(b"spec");
+            out.map(1);
+            out.bulk(b"index");
+            out.int(i64::from(index));
+        }
+        Begin::After(word, from) => {
+            out.bulk(b"keyword");
+            out.bulk(b"spec");
+            out.map(2);
+            out.bulk(b"keyword");
+            out.bulk(word);
+            out.bulk(b"startfrom");
+            out.int(i64::from(from));
+        }
+        Begin::Unknown => {
+            out.bulk(b"unknown");
+            out.bulk(b"spec");
+            out.map(0);
+        }
+    }
+    out.bulk(b"find_keys");
+    out.map(2);
+    out.bulk(b"type");
+    match key.find {
+        Find::Range { last, step, limit } => {
+            out.bulk(b"range");
+            out.bulk(b"spec");
+            out.map(3);
+            out.bulk(b"lastkey");
+            out.int(i64::from(last));
+            out.bulk(b"keystep");
+            out.int(i64::from(step));
+            out.bulk(b"limit");
+            out.int(i64::from(limit));
+        }
+        Find::Counted { count, first, step } => {
+            out.bulk(b"keynum");
+            out.bulk(b"spec");
+            out.map(3);
+            out.bulk(b"keynumidx");
+            out.int(i64::from(count));
+            out.bulk(b"firstkey");
+            out.int(i64::from(first));
+            out.bulk(b"keystep");
+            out.int(i64::from(step));
+        }
+        Find::Unknown => {
+            out.bulk(b"unknown");
+            out.bulk(b"spec");
+            out.map(0);
+        }
+    }
 }
 
 // ------------------------------------------------------------------ CONFIG
