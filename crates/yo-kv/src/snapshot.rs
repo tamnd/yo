@@ -49,7 +49,7 @@ use yo_common::crc::crc64;
 
 use crate::db::Db;
 use crate::keys::Record;
-use crate::rdb;
+use crate::rdb::{self, OP_AUX, OP_EOF, OP_EXPIRETIME_MS, OP_RESIZEDB, OP_SELECTDB};
 use crate::value::Kind;
 use yo_index::Cursor as KeyCursor;
 
@@ -60,17 +60,6 @@ use yo_index::Cursor as KeyCursor;
 /// that silently followed a payload bump would be a compatibility change nobody
 /// asked for.
 const HEADER: &[u8] = b"REDIS0012";
-
-/// An aux field: two strings, a name and a value, that a loader may ignore.
-const OP_AUX: u8 = 0xFA;
-/// How many keys are in this database and how many of them carry a deadline.
-const OP_RESIZEDB: u8 = 0xFB;
-/// The deadline of the key that follows, in milliseconds since the epoch.
-const OP_EXPIRETIME_MS: u8 = 0xFC;
-/// Everything after this belongs to the database whose number follows.
-const OP_SELECTDB: u8 = 0xFE;
-/// The end of the file, followed by the checksum.
-const OP_EOF: u8 = 0xFF;
 
 /// How many key names to take out of the index before going back for the values.
 ///

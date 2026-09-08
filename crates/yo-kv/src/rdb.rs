@@ -143,8 +143,8 @@
 //! on, which it is by default, and so does this. It is not a saving that could
 //! be skipped: LZF is not a canonical format, so a payload that is compressed
 //! differently is a payload with different bytes in it, and `DUMP` matching
-//! Redis byte for byte is a thing this project claims. [`crate::lzf`] says how
-//! that is kept. There is no `rdbcompression` setting here to turn it off, which
+//! Redis byte for byte is a thing this project claims. The `lzf` module next
+//! door says how that is kept. There is no `rdbcompression` setting here to turn it off, which
 //! is one of the hundreds of settings D-14 covers and is not a knob worth adding
 //! on its own: turning it off would save a little processor time and cost the
 //! byte for byte match, which is the wrong trade in a payload that is about to
@@ -237,6 +237,42 @@ const NODE_PACKED: u64 = 2;
 /// A quicklist node that is one value too big for a listpack.
 const NODE_PLAIN: u64 = 1;
 
+// The opcodes, which are the bytes a file uses where a type byte would otherwise
+// be. A payload has none of them and a file is made of them, so they live here
+// with the rest of the format and are used by [`crate::snapshot`] on the way out
+// and [`crate::restore`] on the way in. They are `rdb.h` and the numbering starts
+// where it does because a type byte can never reach that high.
+
+/// One slot's key count, which only a cluster writes and only a cluster reads.
+pub(crate) const OP_SLOT_INFO: u8 = 0xF4;
+/// The opcode in front of each library in a function payload.
+pub(crate) const OP_FUNCTION2: u8 = 0xF5;
+/// The opcode the two 7.0 release candidates wrote and nothing since has read.
+///
+/// Named rather than left to fall through with everything else because a client
+/// holding one of these deserves to be told what it is holding. The format
+/// changed between rc2 and the release and no server has ever converted it, so
+/// the only honest answer is that it is not supported.
+pub(crate) const OP_FUNCTION_PRE_GA: u8 = 0xF6;
+/// A module's own data, which only that module can read past.
+pub(crate) const OP_MODULE_AUX: u8 = 0xF7;
+/// How long the key that follows had been idle, for an LRU policy.
+pub(crate) const OP_IDLE: u8 = 0xF8;
+/// How often the key that follows was used, for an LFU policy.
+pub(crate) const OP_FREQ: u8 = 0xF9;
+/// An aux field: two strings, a name and a value, that a loader may ignore.
+pub(crate) const OP_AUX: u8 = 0xFA;
+/// How many keys are in this database and how many of them carry a deadline.
+pub(crate) const OP_RESIZEDB: u8 = 0xFB;
+/// The deadline of the key that follows, in milliseconds since the epoch.
+pub(crate) const OP_EXPIRETIME_MS: u8 = 0xFC;
+/// The deadline of the key that follows, in whole seconds, which is the old form.
+pub(crate) const OP_EXPIRETIME: u8 = 0xFD;
+/// Everything after this belongs to the database whose number follows.
+pub(crate) const OP_SELECTDB: u8 = 0xFE;
+/// The end of the file, followed by the checksum.
+pub(crate) const OP_EOF: u8 = 0xFF;
+
 /// Why a payload was not accepted.
 ///
 /// Two variants because `RESTORE` has two complaints and a client can tell them
@@ -322,7 +358,7 @@ fn unseal(payload: &[u8]) -> Result<&[u8], Bad> {
 static SKIPPING: AtomicBool = AtomicBool::new(false);
 
 /// Whether to take a payload whose checksum does not match.
-fn skipping() -> bool {
+pub(crate) fn skipping() -> bool {
     SKIPPING.load(Relaxed)
 }
 
@@ -658,23 +694,23 @@ fn put_int(out: &mut Vec<u8>, n: i64) -> bool {
 ///
 /// Every read goes through here so that a truncated payload is one error at one
 /// place rather than a bounds check per field that somebody eventually forgets.
-struct Reader<'a> {
+pub(crate) struct Reader<'a> {
     buf: &'a [u8],
     at: usize,
 }
 
 impl<'a> Reader<'a> {
-    const fn new(buf: &'a [u8]) -> Reader<'a> {
+    pub(crate) const fn new(buf: &'a [u8]) -> Reader<'a> {
         Reader { buf, at: 0 }
     }
 
-    fn byte(&mut self) -> Result<u8, Bad> {
+    pub(crate) fn byte(&mut self) -> Result<u8, Bad> {
         let b = *self.buf.get(self.at).ok_or(Bad::Format)?;
         self.at += 1;
         Ok(b)
     }
 
-    fn take(&mut self, n: usize) -> Result<&'a [u8], Bad> {
+    pub(crate) fn take(&mut self, n: usize) -> Result<&'a [u8], Bad> {
         let end = self.at.checked_add(n).ok_or(Bad::Format)?;
         let s = self.buf.get(self.at..end).ok_or(Bad::Format)?;
         self.at = end;
@@ -722,7 +758,7 @@ impl<'a> Reader<'a> {
     }
 
     /// A length, refusing the `11` forms that are not lengths at all.
-    fn len(&mut self) -> Result<usize, Bad> {
+    pub(crate) fn len(&mut self) -> Result<usize, Bad> {
         usize::try_from(self.num()?).map_err(|_| Bad::Format)
     }
 
@@ -733,7 +769,7 @@ impl<'a> Reader<'a> {
     /// and are routinely past what a `usize` has to hold: a millisecond
     /// timestamp is one, and an unknown `entries-read` is written as the whole
     /// sixty four bits set.
-    fn num(&mut self) -> Result<u64, Bad> {
+    pub(crate) fn num(&mut self) -> Result<u64, Bad> {
         match self.len_or_encoding()? {
             (n, false) => Ok(n),
             (_, true) => Err(Bad::Format),
@@ -794,7 +830,7 @@ impl<'a> Reader<'a> {
     /// Borrowed when the bytes are already there and owned when they had to be
     /// built, which is the integer encodings and LZF. Most strings in a payload
     /// are plain, so most of them cost nothing here.
-    fn str(&mut self) -> Result<Cow<'a, [u8]>, Bad> {
+    pub(crate) fn str(&mut self) -> Result<Cow<'a, [u8]>, Bad> {
         let (n, encoded) = self.len_or_encoding()?;
         if !encoded {
             let n = usize::try_from(n).map_err(|_| Bad::Format)?;
@@ -845,7 +881,7 @@ impl<'a> Reader<'a> {
     }
 
     /// Whether every byte has been read, which a well formed payload has.
-    const fn done(&self) -> bool {
+    pub(crate) const fn done(&self) -> bool {
         self.at == self.buf.len()
     }
 }
@@ -874,17 +910,6 @@ pub(crate) fn load(payload: &[u8], limits: Limits<'_>, now: u64) -> Result<Body,
 // ---------------------------------------------------------------------------
 // The function payload.
 // ---------------------------------------------------------------------------
-
-/// The opcode in front of each library in a function payload.
-const OP_FUNCTION2: u8 = 245;
-
-/// The opcode the two 7.0 release candidates wrote and nothing since has read.
-///
-/// Named rather than left to fall through with everything else because a client
-/// holding one of these deserves to be told what it is holding. The format
-/// changed between rc2 and the release and no server has ever converted it, so
-/// the only honest answer is that it is not supported.
-const OP_FUNCTION_PRE_GA: u8 = 246;
 
 /// Why a function payload was not accepted.
 ///
@@ -951,7 +976,12 @@ pub fn libraries(payload: &[u8]) -> Result<Vec<Vec<u8>>, BadLibs> {
 /// nothing left over. It is also what says how long a value is: nothing in the
 /// format writes that down, and the only way to find the end of one is to read
 /// it.
-fn read_object(r: &mut Reader<'_>, kind: u8, limits: Limits<'_>, now: u64) -> Result<Body, Bad> {
+pub(crate) fn read_object(
+    r: &mut Reader<'_>,
+    kind: u8,
+    limits: Limits<'_>,
+    now: u64,
+) -> Result<Body, Bad> {
     Ok(match kind {
         T_STRING => Body::String(r.str()?.into_owned()),
         T_LIST => read_list(r, limits.list)?,
