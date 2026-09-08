@@ -62,3 +62,11 @@ windows-sys = { workspace = true, features = [
 [[bin]]
 name = "yodb"
 path = "src/main.rs"
+
+# What a thread count is worth over a real socket, on whatever machine is in
+# front of you. Its own harness rather than criterion's, because what it reports
+# is one throughput per cell rather than a distribution, and because it has to
+# start and stop a server between cells.
+[[bench]]
+name = "serve"
+harness = false
