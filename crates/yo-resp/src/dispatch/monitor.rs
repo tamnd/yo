@@ -241,11 +241,19 @@ fn who(session: &Session, line: &mut Vec<u8>) {
 ///
 /// A password is not a thing to put in a log, and a monitor is a log. Redis
 /// replaces the argument with `(redacted)` rather than leaving it out, so the
-/// line still has the shape the command had. `HELLO ... AUTH` is the only place
-/// yo has to do it: `AUTH` is not a command here yet, and every other command
-/// that carries a secret is a `CONFIG` subcommand, which no monitor is shown at
-/// all.
+/// line still has the shape the command had. Two commands need it: `AUTH`, where
+/// everything after the name is hidden whichever of its two forms was sent, and
+/// `HELLO ... AUTH`, where the two arguments after the option word are. Every
+/// other command that carries a secret is a `CONFIG` subcommand, which no
+/// monitor is shown at all.
 fn redacted(args: Args<'_>) -> u32 {
+    if super::args::is(args.name(), b"auth") {
+        // Every argument, and not the name. `AUTH user pass` hides the user name
+        // as well, which is the reference's answer and is the right one: a user
+        // name a client got wrong is very often a password typed one field up.
+        // The reader clamps an index at 31, so the mask stops there too.
+        return ((1u32 << args.len().min(31)) - 1) & !1;
+    }
     if !super::args::is(args.name(), b"hello") {
         return 0;
     }

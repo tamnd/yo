@@ -31,6 +31,7 @@ usage:
   yodb check FILE [--quick] [--quiet]
   yodb serve [--bind ADDR] [--port PORT] [--unixsocket PATH] [--no-port]
              [--threads N] [--dir PATH] [--store PATH --maxmemory BYTES]
+             [--requirepass PASSWORD]
 
   check    read a .yo file and report anything wrong with it. Never writes.
              --quick   skip the records and read only the headers
@@ -48,6 +49,10 @@ usage:
                            belongs to the thread that accepted it and the
                            keyspace is shared, so the count also decides
                            how finely each database is striped
+             --requirepass the password every connection has to send AUTH
+                           with before it can send anything else. No
+                           password by default, which is a server anybody
+                           who can reach the port can read and write.
              --dir         where the server writes, which is where BACKUP
                            puts its files and what CONFIG GET dir answers.
                            The directory the command was run from by default
@@ -235,6 +240,7 @@ fn serve_command(args: &[&str]) -> ExitCode {
     let mut maxmemory: Option<u64> = None;
     let mut dir: Option<std::path::PathBuf> = None;
     let mut threads = 1usize;
+    let mut requirepass: Option<&str> = None;
 
     let mut at = 0;
     while at < args.len() {
@@ -247,7 +253,7 @@ fn serve_command(args: &[&str]) -> ExitCode {
             }
             "--no-port" => tcp = false,
             "--bind" | "--port" | "--unixsocket" | "--store" | "--maxmemory" | "--dir"
-            | "--threads" => {
+            | "--threads" | "--requirepass" => {
                 let Some(value) = args.get(at) else {
                     eprintln!("yodb serve: {arg} needs a value");
                     return ExitCode::from(2);
@@ -261,6 +267,10 @@ fn serve_command(args: &[&str]) -> ExitCode {
                     store = Some(std::path::PathBuf::from(*value));
                 } else if arg == "--dir" {
                     dir = Some(std::path::PathBuf::from(*value));
+                } else if arg == "--requirepass" {
+                    // An empty one is no password, which is the same thing
+                    // `CONFIG SET requirepass ""` means by it.
+                    requirepass = Some(value);
                 } else if arg == "--threads" {
                     match value.parse::<usize>() {
                         // Zero is one per core, which is what a benchmark
@@ -355,6 +365,9 @@ fn serve_command(args: &[&str]) -> ExitCode {
             return ExitCode::from(2);
         }
     };
+    if let Some(password) = requirepass {
+        server.set_password(password.as_bytes());
+    }
     if let Some(limit) = maxmemory {
         server.set_maxmemory(limit);
     }

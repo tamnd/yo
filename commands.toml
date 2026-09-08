@@ -410,8 +410,13 @@ doc = "12 section 7"
 [[group]]
 name = "connection"
 expected = 8
-status = "partial"
+status = "shipped"
 doc = "12 section 9"
+# AUTH was the last one, and with it the eight are PING, ECHO, SELECT, RESET,
+# QUIT, HELLO, CLIENT and AUTH. Shipped here counts commands and not
+# subcommands, and CLIENT is short three of those: TRACKING, TRACKINGINFO and
+# CACHING, which are one feature and wait on the invalidation channel rather
+# than on anything in this group.
 
 [[group]]
 name = "server"
@@ -5057,7 +5062,7 @@ bounded = "inherent"
 status = "shipped"
 wire = "verified"
 divergent = "D-12"
-notes = "AUTH is accepted for the default user with any password, which is how a real server with no requirepass behaves. The reply goes out in the protocol just agreed rather than the one the request arrived in."
+notes = "The AUTH option takes the same user and password AUTH itself takes and makes the same decision about them, so on a server with no password it lets the default user in with anything and on a server with one it wants the right password. What is only here is the order the three complaints come in, which was measured rather than reasoned about: an unsupported protocol version is NOPROTO before anything else is looked at, a wrong password is WRONGPASS, and a HELLO with no AUTH option on a guarded connection is NOAUTH with a sentence pointing at the option that would have worked. A protocol version agreed on a HELLO that then failed is not kept, so a client that got WRONGPASS is still speaking what it was speaking. The reply goes out in the protocol just agreed rather than the one the request arrived in."
 
 [[command]]
 name = "SELECT"
@@ -5116,7 +5121,7 @@ bounded = "inherent"
 status = "shipped"
 wire = "verified"
 divergent = "D-14"
-notes = "Every setting is fixed for the life of the process, so SET accepts a write that changes nothing and refuses everything else rather than pretending to have taken it."
+notes = "GET answers about the twenty six settings that mean something here, matching each pattern against every name and reporting a name once however many patterns hit it. Sixteen of those really move and SET takes them, and the rest are fixed for the life of the process, so SET accepts a write that changes nothing and refuses everything else rather than pretending to have taken it. The whole SET is read and checked before any of it is applied, which is the reference's rule and matters when one command names several settings and the third one is wrong. requirepass is the one that reads back in the clear rather than as a hash, which is D-127, and it is also the one that does not lock out the connection that set it, since a connection is asked for a password based on how things stood when it was accepted."
 
 [[command]]
 name = "INFO"
@@ -5242,6 +5247,17 @@ wire = "verified"
 notes = "Three elements: the word master, then the replication offset as an integer, then the list of replicas attached. Zero and an empty list, which is the same pair INFO replication reports next to it and is true rather than a placeholder: nothing has been written to a stream that does not exist and nothing is following this server. It becomes a real answer when replication lands. Noscript, so a script is refused it, which is a real server too and is the one thing about this command that surprises people. Not admin, so it is reported to a monitor."
 
 [[command]]
+name = "AUTH"
+group = "connection"
+since = "1.0.0"
+arity = -2
+plan = "none"
+bounded = "inherent"
+status = "shipped"
+wire = "verified"
+notes = "Both forms, AUTH password and AUTH username password, and there is one user and it is called default. On a server with a password the two forms mean the same thing and a wrong one is WRONGPASS invalid username-password pair or user is disabled. On a server without one the default user is nopass, so the two argument form takes any password at all and says OK and the one argument form is the exception: it gets AUTH <password> called without any password configured for the default user. Are you sure your configuration is correct?, because a client that sends it has almost certainly reached a server it did not mean to reach. Any user name other than default is WRONGPASS whether a password is set or not, which is deliberate on a real server too, since the difference between a name that does not exist and a password that was wrong is a list of user names. A fourth argument is a syntax error rather than a wrong arity, which was read off 8.10.1. A failed AUTH does not throw out a connection that had already got in. The flags are noscript, loading, stale, fast, no_auth and allow_busy, and the acl categories are @fast and @connection. A monitor is shown the command with every argument after the name replaced by (redacted), including the user name. The password compare is written out byte by byte so that how long it took does not say how much of the guess was right."
+
+[[command]]
 name = "MONITOR"
 group = "server"
 since = "1.0.0"
@@ -5250,7 +5266,7 @@ plan = "none"
 bounded = "inherent"
 status = "shipped"
 wire = "verified"
-notes = "The line is a simple string, on RESP2 and RESP3 alike, and it carries the time to the microsecond, then the database and the address in brackets, then the command and every argument quoted the way sdscatrepr quotes them: a backslash for a quote and a backslash, the five short escapes, hex for everything else outside printable ASCII, and a space left alone inside the quotes. The command name is echoed in the case the client sent it. The database is the one the connection is on after the command ran, so SELECT 3 reports itself on three. A command that never reached its body is not reported, which is an unknown command, a wrong arity and anything a refusal in the funnel caught, and a command that failed inside its body is reported. MULTI is reported when it is sent, the queued commands are reported as EXEC replays them, and EXEC comes last. The six script commands are reported before they run rather than after, so that what a script does arrives behind the EVAL that caused it, and a script's own calls carry lua in place of an address. HELLO AUTH has its user and password replaced with (redacted). The administrative commands are not reported at all, which Redis decides per subcommand and not per container, so CLIENT ID is reported and CLIENT LIST is not. A monitor is refused every command that reaches the keyspace with Replica can't interact with the keyspace, including at MULTI queue time, which is what makes EXEC answer EXECABORT. It is exempt from CLIENT PAUSE, which is why that refusal has to be there. MONITOR sent by a connection that is already one answers nothing at all, MONITOR inside a transaction fails at EXEC with MONITOR isn't allowed for DENY BLOCKING client, and RESET answers +RESET and turns the feed off. CLIENT LIST shows a monitor as flags=O, in front of the other letters. Two monitors watching the same command get byte identical lines, because the line is rendered once and shared. The one thing that differs is when a monitor's own line arrives against its own reply when it is pipelining, which is D-124."
+notes = "The line is a simple string, on RESP2 and RESP3 alike, and it carries the time to the microsecond, then the database and the address in brackets, then the command and every argument quoted the way sdscatrepr quotes them: a backslash for a quote and a backslash, the five short escapes, hex for everything else outside printable ASCII, and a space left alone inside the quotes. The command name is echoed in the case the client sent it. The database is the one the connection is on after the command ran, so SELECT 3 reports itself on three. A command that never reached its body is not reported, which is an unknown command, a wrong arity and anything a refusal in the funnel caught, and a command that failed inside its body is reported. MULTI is reported when it is sent, the queued commands are reported as EXEC replays them, and EXEC comes last. The six script commands are reported before they run rather than after, so that what a script does arrives behind the EVAL that caused it, and a script's own calls carry lua in place of an address. HELLO AUTH has its user and password replaced with (redacted), and AUTH has everything after the name replaced the same way. The administrative commands are not reported at all, which Redis decides per subcommand and not per container, so CLIENT ID is reported and CLIENT LIST is not. A monitor is refused every command that reaches the keyspace with Replica can't interact with the keyspace, including at MULTI queue time, which is what makes EXEC answer EXECABORT. It is exempt from CLIENT PAUSE, which is why that refusal has to be there. MONITOR sent by a connection that is already one answers nothing at all, MONITOR inside a transaction fails at EXEC with MONITOR isn't allowed for DENY BLOCKING client, and RESET answers +RESET and turns the feed off. CLIENT LIST shows a monitor as flags=O, in front of the other letters. Two monitors watching the same command get byte identical lines, because the line is rendered once and shared. The one thing that differs is when a monitor's own line arrives against its own reply when it is pipelining, which is D-124."
 
 [[command]]
 name = "SHUTDOWN"

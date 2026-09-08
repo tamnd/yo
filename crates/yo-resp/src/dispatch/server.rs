@@ -16,7 +16,7 @@
 
 use super::args::{self, Args, is};
 use super::table::{self, Spec};
-use super::{DATABASES, Flow, Server, Session, backup, cpu, multi, notify, persist};
+use super::{DATABASES, Flow, Server, Session, auth, backup, cpu, multi, notify, persist};
 use crate::proto::Proto;
 use crate::reply::Out;
 use core::fmt::Write;
@@ -169,6 +169,14 @@ const DIR: &str = "dir";
 /// is refused there as well without protected configs turned on.
 const DBFILENAME: &str = "dbfilename";
 
+/// The password every connection is asked for, empty when none is.
+///
+/// Writable, and the one setting here whose value is a secret. It reads back in
+/// the clear, which is what a real server does and is not an oversight of one:
+/// an operator who can send `CONFIG GET` on this server can already read
+/// everything in it.
+const REQUIREPASS: &str = "requirepass";
+
 /// How long a sealed backup is kept before it cleans itself up.
 ///
 /// Seconds, and zero is the default and means it is kept until somebody says
@@ -278,7 +286,8 @@ pub(super) fn execute(
             }
         }
         "echo" => out.bulk(args.get(1)),
-        "hello" => hello(session, args, out)?,
+        "auth" => auth::execute(server, session, args, out)?,
+        "hello" => hello(server, session, args, out)?,
         "select" => {
             let n = args.int(1)?;
             let ok = usize::try_from(n).is_ok_and(|n| n < DATABASES);
@@ -313,6 +322,11 @@ pub(super) fn execute(
                 server.watch_no_more(session.row());
             }
             session.reset();
+            // Including the password, which is what `RESET` means by putting
+            // the connection back the way it was accepted: on a server with a
+            // password the client has to send `AUTH` again, and on a server
+            // without one it never had to.
+            session.admit(!server.guarded());
             out.set_proto(Proto::Resp2);
             out.simple(b"RESET");
         }
@@ -530,7 +544,20 @@ fn db_index(arg: &[u8], bad: &'static str) -> Result<usize> {
 // ------------------------------------------------------------------- HELLO
 
 /// `HELLO [protover [AUTH username password] [SETNAME name]]`.
-fn hello(session: &mut Session, args: Args<'_>, out: &mut Out) -> Result<()> {
+///
+/// The order of the three things that can go wrong here is the reference's and
+/// is worth writing down, because it is not the order they appear in. The
+/// protocol version is read and refused first, so `HELLO 9 AUTH default right`
+/// on a connection that has not authenticated is a `NOPROTO` and leaves the
+/// connection unauthenticated. The `AUTH` option is applied next, so a wrong
+/// password is a `WRONGPASS` and the protocol stays where it was. Only then does
+/// the connection have to be authenticated at all, which is what makes a bare
+/// `HELLO` on a server with a password a `NOAUTH` rather than a greeting.
+fn hello(server: &Server, session: &mut Session, args: Args<'_>, out: &mut Out) -> Result<()> {
+    // The version this call agreed on, if it named one. Held rather than applied
+    // where it is read, because the reply buffer must not change protocol until
+    // the password below has been asked for and answered.
+    let mut agreed = None;
     if args.len() > 1 {
         let v = parse_i64(args.get(1)).ok_or_else(|| {
             Error::new(
@@ -550,14 +577,11 @@ fn hello(session: &mut Session, args: Args<'_>, out: &mut Out) -> Result<()> {
         while i < args.len() {
             let o = args.get(i);
             if is(o, b"AUTH") && i + 2 < args.len() {
-                // No password is configured, so the default user is `nopass`
-                // and any password for it is the right one, which is how a
-                // real server with no `requirepass` behaves. Any other user
-                // does not exist.
-                if !is(args.get(i + 1), b"default") {
+                if !auth::admits(server, args.get(i + 1), args.get(i + 2)) {
                     out.error(b"WRONGPASS invalid username-password pair or user is disabled.");
                     return Ok(());
                 }
+                session.admit(true);
                 i += 3;
             } else if is(o, b"SETNAME") && i + 1 < args.len() {
                 session.set_name(args.get(i + 1));
@@ -574,8 +598,19 @@ fn hello(session: &mut Session, args: Args<'_>, out: &mut Out) -> Result<()> {
                 }));
             }
         }
-        // The reply is written in the protocol that was just agreed, not the
-        // one the request arrived in.
+        agreed = Some(proto);
+    }
+
+    if server.guarded() && !session.authenticated() {
+        // Its own sentence rather than the one every other command gets, because
+        // a client that speaks RESP3 has to send `HELLO` before it can send
+        // `AUTH` and would otherwise be told to do the thing it is doing.
+        out.error(auth::HELLO_NOAUTH.as_bytes());
+        return Ok(());
+    }
+    // The reply is written in the protocol that was just agreed, not the one the
+    // request arrived in.
+    if let Some(proto) = agreed {
         out.set_proto(proto);
     }
 
@@ -865,6 +900,7 @@ fn config(server: &Server, args: Args<'_>, out: &mut Out) -> Result<()> {
         let store = wanted(MAXSTORE);
         let where_ = wanted(DIR);
         let file = wanted(DBFILENAME);
+        let pass = wanted(REQUIREPASS);
         let ttl = wanted(SEALED_TTL);
         let events = wanted(NOTIFY);
         out.map(
@@ -875,6 +911,7 @@ fn config(server: &Server, args: Args<'_>, out: &mut Out) -> Result<()> {
                 + usize::from(store)
                 + usize::from(where_)
                 + usize::from(file)
+                + usize::from(pass)
                 + usize::from(ttl)
                 + usize::from(events),
         );
@@ -918,6 +955,10 @@ fn config(server: &Server, args: Args<'_>, out: &mut Out) -> Result<()> {
             out.bulk(DBFILENAME.as_bytes());
             out.bulk(persist::FILE.as_bytes());
         }
+        if pass {
+            out.bulk(REQUIREPASS.as_bytes());
+            server.with_password(|p| out.bulk(p));
+        }
         if ttl {
             out.bulk(SEALED_TTL.as_bytes());
             out.bulk_int(server.backup().ttl() as i64);
@@ -953,6 +994,7 @@ fn config(server: &Server, args: Args<'_>, out: &mut Out) -> Result<()> {
         let mut store = None;
         let mut ttl = None;
         let mut events = None;
+        let mut password = None;
         let mut i = 2;
         while i < args.len() {
             let (name, value) = (args.get(i), args.get(i + 1));
@@ -1019,6 +1061,13 @@ fn config(server: &Server, args: Args<'_>, out: &mut Out) -> Result<()> {
                         "CONFIG SET failed (possibly related to argument '{protected}') - can't set protected config"
                     ),
                 ));
+            }
+            if is(name, REQUIREPASS.as_bytes()) {
+                // Anything at all is a password, including an empty one, which
+                // is how a password is taken off again. There is nothing to
+                // refuse here and a real server refuses nothing either.
+                password = Some(value);
+                continue;
             }
             if is(name, NOTIFY.as_bytes()) {
                 // The only setting here whose error names what was wrong with
@@ -1111,6 +1160,12 @@ fn config(server: &Server, args: Args<'_>, out: &mut Out) -> Result<()> {
         }
         if let Some(flags) = events {
             server.set_notify_flags(flags);
+        }
+        if let Some(value) = password {
+            // The connections that are already open are left where they are,
+            // including the one that sent this. See the `auth` module for why
+            // that is the reference's rule and not an accident of it.
+            server.set_password(value);
         }
         // Last, so that a `CONFIG SET maxmemory 1mb maxmemory-policy allkeys-lru`
         // has the policy in place before the limit that will act on it. The two

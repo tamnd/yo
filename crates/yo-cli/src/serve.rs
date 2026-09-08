@@ -500,6 +500,15 @@ impl Server {
         self.setup().set_maxmemory(bytes);
     }
 
+    /// The password every connection has to send `AUTH` with.
+    ///
+    /// Taken here at startup so that the first connection after the port opens
+    /// is already asked for it. An empty one is no password, the same as
+    /// `CONFIG SET requirepass ""`, and no password is the default.
+    pub fn set_password(&mut self, password: &[u8]) {
+        self.setup().set_password(password);
+    }
+
     /// Give the engine a file to move cold values into when it hits that limit.
     ///
     /// With a file under it a memory limit stops meaning "delete keys" and

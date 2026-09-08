@@ -53,6 +53,7 @@
 
 mod args;
 mod arrays;
+mod auth;
 mod backup;
 mod bits;
 mod blocking;
@@ -814,6 +815,8 @@ pub struct Server {
     monitors: monitor::Monitors,
     /// What the saves have done, which is all `INFO persistence` has to report.
     persist: persist::Persistence,
+    /// The password connections are asked for, if they are asked for one.
+    access: auth::Access,
 }
 
 impl Server {
@@ -861,6 +864,7 @@ impl Server {
             pause: AtomicU64::new(0),
             monitors: monitor::Monitors::default(),
             persist: persist::Persistence::default(),
+            access: auth::Access::default(),
             mail: pubsub::boxes(1),
         }
     }
@@ -932,6 +936,7 @@ impl Server {
             pause: AtomicU64::new(0),
             monitors: monitor::Monitors::default(),
             persist: persist::Persistence::default(),
+            access: auth::Access::default(),
             mail: pubsub::boxes(1),
         }
     }
@@ -1935,6 +1940,14 @@ pub struct Session {
     /// kept here as well and written to both. See the `clients` module for why
     /// the row is words and a small lock rather than one lock.
     sock: Arc<Client>,
+    /// Whether this connection has got past the password, if there is one.
+    ///
+    /// Decided when the connection is accepted and not when it first sends
+    /// something, which is what makes `CONFIG SET requirepass` leave the clients
+    /// that are already connected alone. False here rather than true because a
+    /// session nobody told is a session on a server nobody gave a password to,
+    /// and the gate only reads this when there is one. See the `auth` module.
+    authenticated: bool,
 }
 
 /// What a connection has asked to hear back, which is `CLIENT REPLY`.
@@ -1978,7 +1991,24 @@ impl Session {
             no_touch: false,
             reply: Reply::On,
             sock: Arc::new(Client::new(id)),
+            authenticated: false,
         }
+    }
+
+    /// Say whether this connection starts out past the password.
+    ///
+    /// Called once by whoever accepted it, which is the one place that can see
+    /// both the connection and the server. A connection nobody tells is
+    /// unauthenticated and gets through anyway on a server with no password,
+    /// which is every embedded caller and every test.
+    pub fn admit(&mut self, yes: bool) {
+        self.authenticated = yes;
+    }
+
+    /// Whether this connection has got past the password.
+    #[must_use]
+    pub(crate) fn authenticated(&self) -> bool {
+        self.authenticated
     }
 
     /// The row every other thread sees this connection through.
@@ -2383,6 +2413,28 @@ pub fn resolved(
         argv,
         server.now_ms(),
     );
+
+    // The password, and this is the whole of it on the command path: one
+    // acquire load on a server nobody gave a password to. Here, after the two
+    // refusals above and before everything below, which is where a real server
+    // puts it, so a command with the wrong number of arguments is told that
+    // rather than told to authenticate, and everything else is told to
+    // authenticate before it is told anything at all.
+    //
+    // The commands carrying `no_auth` go through, which is `AUTH` itself and the
+    // three that a client has to be able to send before it has a password
+    // accepted: `HELLO`, which carries the option that authenticates, `RESET`,
+    // which is how a client says it is starting over, and `QUIT`.
+    if server.guarded() && !session.authenticated() && !spec.flags.contains(&"no_auth") {
+        server.mine().cmdstats.at(spec).rejected.bump();
+        if spec.name == "exec" {
+            multi::abort(server, session, auth::NOAUTH, out);
+        } else {
+            session.dirty_multi();
+            out.error(auth::NOAUTH.as_bytes());
+        }
+        return Flow::Continue;
+    }
 
     if session.in_multi()
         && let Some(e) = multi::refused_in_multi(spec)
@@ -8791,6 +8843,235 @@ mod tests {
         s.run(&[b"SET", b"k", b"v"]);
         s.run(&[b"SHUTDOWN", b"SAVE"]);
         assert_eq!(s.files(), ["dump.rdb"]);
+    }
+
+    /// A fixture on a server with a password, on a connection that has not met
+    /// it.
+    ///
+    /// The two calls have to be in this order and both have to happen. Setting
+    /// the password is the server's half and admitting nothing is the
+    /// connection's, and the connection's half is what a real front does at
+    /// accept time. A fixture that only set the password would be a connection
+    /// that was open before it went on, which is the case in
+    /// [`a_password_set_under_an_open_connection_leaves_it_alone`].
+    fn guarded(password: &[u8]) -> Fixture {
+        let mut f = Fixture::new();
+        f.server.set_password(password);
+        f.session.admit(false);
+        f
+    }
+
+    /// Nothing gets through without the password, and the sentence is the one
+    /// a client branches on.
+    #[test]
+    fn a_server_with_a_password_answers_everything_else_with_noauth() {
+        let mut f = guarded(b"hunter2");
+        for parts in [
+            &[b"PING".as_slice()][..],
+            &[b"GET", b"k"],
+            &[b"SET", b"k", b"v"],
+            &[b"COMMAND", b"COUNT"],
+            &[b"SUBSCRIBE", b"ch"],
+            &[b"MULTI"],
+            &[b"INFO"],
+        ] {
+            assert_eq!(
+                f.run(parts),
+                "-NOAUTH Authentication required.\r\n",
+                "{parts:?} got through"
+            );
+        }
+    }
+
+    /// The four commands a client may send before it has authenticated.
+    ///
+    /// `AUTH` because it is the way in, `HELLO` because it carries the option
+    /// that is the other way in, `RESET` because starting over cannot need a
+    /// password, and `QUIT` because leaving cannot either. Redis marks all four
+    /// `no_auth` and the gate reads the flag rather than the names.
+    #[test]
+    fn the_four_commands_that_do_not_need_the_password_get_through() {
+        for name in ["auth", "hello", "reset", "quit"] {
+            let spec = table::lookup(name.as_bytes()).expect(name);
+            assert!(spec.flags.contains(&"no_auth"), "{name} is not no_auth");
+        }
+        let mut f = guarded(b"hunter2");
+        assert_eq!(f.run(&[b"QUIT"]), "+OK\r\n");
+        assert_eq!(f.run(&[b"RESET"]), "+RESET\r\n");
+        assert_eq!(
+            f.run(&[b"AUTH", b"wrong"]),
+            "-WRONGPASS invalid username-password pair or user is disabled.\r\n"
+        );
+        assert_eq!(f.run(&[b"AUTH", b"hunter2"]), "+OK\r\n");
+        assert_eq!(f.run(&[b"PING"]), "+PONG\r\n");
+    }
+
+    /// Both spellings of `AUTH`, and the one user there is.
+    #[test]
+    fn auth_takes_the_password_on_its_own_or_behind_the_user_name() {
+        let mut f = guarded(b"hunter2");
+        let wrong = "-WRONGPASS invalid username-password pair or user is disabled.\r\n";
+        assert_eq!(f.run(&[b"AUTH", b"default", b"hunter2"]), "+OK\r\n");
+        assert_eq!(f.run(&[b"AUTH", b"default", b"wrong"]), wrong);
+        // And a failed attempt does not throw out the connection that had
+        // already got in, which was read off 8.10.1 rather than assumed.
+        assert_eq!(f.run(&[b"PING"]), "+PONG\r\n");
+        assert_eq!(f.run(&[b"AUTH", b"someone", b"hunter2"]), wrong);
+        assert_eq!(
+            f.run(&[b"AUTH"]),
+            "-ERR wrong number of arguments for 'auth' command\r\n"
+        );
+        assert_eq!(f.run(&[b"AUTH", b"a", b"b", b"c"]), "-ERR syntax error\r\n");
+    }
+
+    /// On a server with no password the default user is `nopass`, and what that
+    /// means is not what it sounds like.
+    ///
+    /// Any password at all is the right one for it, so the two argument form
+    /// says `OK`. The one argument form is the exception and gets a sentence
+    /// about the configuration instead, because a client that sends it has
+    /// almost certainly reached a server it did not mean to reach.
+    #[test]
+    fn auth_on_a_server_with_no_password_says_so_at_length() {
+        let mut f = Fixture::new();
+        assert_eq!(
+            f.run(&[b"AUTH", b"anything"]),
+            "-ERR AUTH <password> called without any password configured for the \
+             default user. Are you sure your configuration is correct?\r\n"
+        );
+        assert_eq!(f.run(&[b"AUTH", b"default", b"anything"]), "+OK\r\n");
+        assert_eq!(
+            f.run(&[b"AUTH", b"nobody", b"anything"]),
+            "-WRONGPASS invalid username-password pair or user is disabled.\r\n"
+        );
+        assert_eq!(f.run(&[b"PING"]), "+PONG\r\n");
+    }
+
+    /// `HELLO` has a sentence of its own, and the order it decides things in is
+    /// not the order they are written in.
+    ///
+    /// The protocol version first, so a bad one is a `NOPROTO` even from a
+    /// connection that has not authenticated and would have been let in by the
+    /// `AUTH` option on the same line. Then the option, so a wrong password is a
+    /// `WRONGPASS`. Then the password at all, which is what a bare `HELLO` on a
+    /// guarded server gets. All three read off 8.10.1.
+    #[test]
+    fn hello_says_which_option_would_have_worked() {
+        let long = "-NOAUTH HELLO must be called with the client already authenticated, \
+                    otherwise the HELLO <proto> AUTH <user> <pass> option can be used to \
+                    authenticate the client and select the RESP protocol version at the \
+                    same time\r\n";
+        let mut f = guarded(b"hunter2");
+        assert_eq!(f.run(&[b"HELLO"]), long);
+        assert_eq!(f.run(&[b"HELLO", b"3"]), long);
+        assert_eq!(
+            f.run(&[b"HELLO", b"9"]),
+            "-NOPROTO unsupported protocol version\r\n"
+        );
+        // The version is refused before the option is applied, so this leaves
+        // the connection exactly as unauthenticated as it found it.
+        assert_eq!(
+            f.run(&[b"HELLO", b"9", b"AUTH", b"default", b"hunter2"]),
+            "-NOPROTO unsupported protocol version\r\n"
+        );
+        assert_eq!(f.run(&[b"PING"]), "-NOAUTH Authentication required.\r\n");
+        assert_eq!(
+            f.run(&[b"HELLO", b"2", b"AUTH", b"default", b"wrong"]),
+            "-WRONGPASS invalid username-password pair or user is disabled.\r\n"
+        );
+        assert!(
+            f.run(&[b"HELLO", b"3", b"AUTH", b"default", b"hunter2"])
+                .starts_with("%7\r\n"),
+            "the option did not let it in"
+        );
+        assert_eq!(f.run(&[b"PING"]), "+PONG\r\n");
+    }
+
+    /// `EXEC` is answered the abort rather than the refusal, with the refusal
+    /// spliced into it.
+    ///
+    /// A client that sent `EXEC` is waiting for the transaction to be over one
+    /// way or another, so the reference turns every refusal the funnel makes of
+    /// an `EXEC` into an abort carrying the reason. The code word is in the
+    /// spliced reason as well as in front of the reply it would have been.
+    #[test]
+    fn exec_without_the_password_is_an_abort_and_says_why() {
+        let mut f = guarded(b"hunter2");
+        assert_eq!(f.run(&[b"MULTI"]), "-NOAUTH Authentication required.\r\n");
+        assert_eq!(
+            f.run(&[b"EXEC"]),
+            "-EXECABORT Transaction discarded because of: NOAUTH Authentication \
+             required.\r\n"
+        );
+    }
+
+    /// `RESET` puts the connection back to how it was accepted, password and
+    /// all.
+    #[test]
+    fn reset_gives_the_password_back_to_the_server_to_ask_for_again() {
+        let mut f = guarded(b"hunter2");
+        assert_eq!(f.run(&[b"AUTH", b"hunter2"]), "+OK\r\n");
+        assert_eq!(f.run(&[b"PING"]), "+PONG\r\n");
+        assert_eq!(f.run(&[b"RESET"]), "+RESET\r\n");
+        assert_eq!(f.run(&[b"PING"]), "-NOAUTH Authentication required.\r\n");
+
+        // And on a server with no password it puts back the same nothing.
+        let mut f = Fixture::new();
+        assert_eq!(f.run(&[b"RESET"]), "+RESET\r\n");
+        assert_eq!(f.run(&[b"PING"]), "+PONG\r\n");
+    }
+
+    /// A password set under a connection that is already open leaves it alone.
+    ///
+    /// This is the rule nobody would guess and it is the reference's: the flag
+    /// is decided when the connection is accepted, so `CONFIG SET requirepass`
+    /// locks out everybody who connects after it and nobody who is already
+    /// there, including the connection that sent it.
+    #[test]
+    fn a_password_set_under_an_open_connection_leaves_it_alone() {
+        let mut f = Fixture::new();
+        f.session.admit(true);
+        assert_eq!(
+            f.run(&[b"CONFIG", b"SET", b"requirepass", b"hunter2"]),
+            "+OK\r\n"
+        );
+        assert_eq!(f.run(&[b"PING"]), "+PONG\r\n");
+        // And taking it off again lets in a connection that never met it.
+        let mut later = Fixture::on(Server::new());
+        later.server.set_password(b"hunter2");
+        later.session.admit(false);
+        assert_eq!(
+            later.run(&[b"PING"]),
+            "-NOAUTH Authentication required.\r\n"
+        );
+        later.server.set_password(b"");
+        assert_eq!(later.run(&[b"PING"]), "+PONG\r\n");
+    }
+
+    /// The password reads back in the clear and is set and cleared by the same
+    /// pair of words.
+    #[test]
+    fn requirepass_reads_back_what_was_written_and_an_empty_one_clears_it() {
+        let mut f = Fixture::new();
+        // Open before the password goes on, so the connection keeps talking
+        // after it does and can read it back.
+        f.session.admit(true);
+        assert_eq!(
+            f.run(&[b"CONFIG", b"GET", b"requirepass"]),
+            "*2\r\n$11\r\nrequirepass\r\n$0\r\n\r\n"
+        );
+        f.run(&[b"CONFIG", b"SET", b"requirepass", b"hunter2"]);
+        assert_eq!(
+            f.run(&[b"CONFIG", b"GET", b"requirepass"]),
+            "*2\r\n$11\r\nrequirepass\r\n$7\r\nhunter2\r\n"
+        );
+        assert!(f.server.guarded());
+        f.run(&[b"CONFIG", b"SET", b"requirepass", b""]);
+        assert!(!f.server.guarded(), "an empty password did not clear it");
+        assert_eq!(
+            f.run(&[b"CONFIG", b"GET", b"requirepass"]),
+            "*2\r\n$11\r\nrequirepass\r\n$0\r\n\r\n"
+        );
     }
 
     #[test]
