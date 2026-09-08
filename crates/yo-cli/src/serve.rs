@@ -368,8 +368,10 @@ impl Net {
 
     /// How many sockets this worker is holding, which is how many connections
     /// it took. Only the test about sharing a burst out asks, because nothing
-    /// the server does depends on the number.
-    #[cfg(test)]
+    /// the server does depends on the number, and that test opens a unix
+    /// socket, so on Windows this is a method with no callers rather than one
+    /// with a caller that is compiled out.
+    #[cfg(all(test, unix))]
     fn held(&self) -> usize {
         self.streams.iter().filter(|s| s.is_some()).count()
     }
