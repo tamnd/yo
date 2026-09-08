@@ -7,6 +7,11 @@
 //! same digest offered to the script, and a script that computes a name and
 //! then calls it has to get the same forty characters a client would.
 //!
+//! The second caller is the keyspace digest behind `DEBUG DIGEST`, where the
+//! same reasoning applies for the same reason: that number exists to be compared
+//! against another server's, so it has to be the number the other one would have
+//! computed.
+//!
 //! Sixty lines rather than a dependency. This is the whole of the algorithm and
 //! it is a fixed one, so there is nothing here that will need updating and
 //! nothing that a crate would do differently.

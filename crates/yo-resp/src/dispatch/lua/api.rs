@@ -25,7 +25,9 @@
 
 use super::super::table::{Spec, arity_ok, lookup};
 use super::super::{Args, Server, Session, resolved};
-use super::{convert, nested, sha1};
+use yo_common::sha1;
+
+use super::{convert, nested};
 use crate::frame;
 use crate::proto::Limits;
 use crate::reply::Out;

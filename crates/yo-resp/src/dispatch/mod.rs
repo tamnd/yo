@@ -9476,6 +9476,145 @@ mod tests {
         );
     }
 
+    /// Every one of these is a number read off redis-server 8.10.1 rather than
+    /// one this build produced, which is the only kind of assertion worth
+    /// making about a digest: a number computed a different way is not a worse
+    /// digest, it is a useless one.
+    #[test]
+    fn a_value_digest_is_the_number_the_reference_computes() {
+        let mut f = Fixture::new();
+        f.run(&[b"SET", b"s", b"hello"]);
+        f.run(&[b"RPUSH", b"l", b"a", b"b", b"c"]);
+        f.run(&[b"SADD", b"t", b"a", b"b", b"c"]);
+        f.run(&[b"HSET", b"h", b"f", b"v"]);
+        f.run(&[b"ZADD", b"z", b"1", b"a", b"2.5", b"b"]);
+        f.run(&[b"XADD", b"x", b"1-1", b"f", b"v"]);
+
+        for (key, want) in [
+            (&b"s"[..], "36b23a1456b2dce2c3ed252c456761301dba8060"),
+            (b"l", "8bf72d812571eea9b927f3c11beb0c4165a6ff89"),
+            (b"t", "593c2414786d75446e97f4ea5d4b731f3313da72"),
+            (b"h", "90c76e9e9f4c62d642a34fc97c7dad503b51f906"),
+            (b"z", "c45c5b051acd64070e5ed1a949939d5145f806c5"),
+            (b"x", "2ed9a7a81688084b1f7eae33456ef7727d357031"),
+        ] {
+            assert_eq!(
+                f.run(&[b"DEBUG", b"DIGEST-VALUE", key]),
+                format!("*1\r\n+{want}\r\n"),
+                "{}",
+                String::from_utf8_lossy(key)
+            );
+        }
+    }
+
+    /// The deadline is in the digest and the time left is not, which is what
+    /// lets two servers that agree about a dataset agree about the number.
+    #[test]
+    fn a_deadline_shows_up_without_the_time_left_showing_up() {
+        let mut f = Fixture::new();
+        f.run(&[b"SET", b"e", b"value"]);
+        let bare = "*1\r\n+d59ec93db87f4cd915db3cdf44bb63755bc4a635\r\n";
+        let dated = "*1\r\n+331b37c26446a68dd4cdd72701d1acee416ae7b6\r\n";
+        assert_eq!(f.run(&[b"DEBUG", b"DIGEST-VALUE", b"e"]), bare);
+
+        f.run(&[b"EXPIRE", b"e", b"1000"]);
+        assert_eq!(f.run(&[b"DEBUG", b"DIGEST-VALUE", b"e"]), dated);
+        // A different deadline on the same value is the same digest.
+        f.run(&[b"EXPIRE", b"e", b"999999"]);
+        assert_eq!(f.run(&[b"DEBUG", b"DIGEST-VALUE", b"e"]), dated);
+        f.run(&[b"PERSIST", b"e"]);
+        assert_eq!(f.run(&[b"DEBUG", b"DIGEST-VALUE", b"e"]), bare);
+
+        // The same again for a field of a hash, which says so with its own
+        // word rather than with the key's.
+        f.run(&[b"HSET", b"he", b"f1", b"v1", b"f2", b"v2"]);
+        f.run(&[b"HEXPIRE", b"he", b"1000", b"FIELDS", b"1", b"f2"]);
+        assert_eq!(
+            f.run(&[b"DEBUG", b"DIGEST-VALUE", b"he"]),
+            "*1\r\n+8911d6d4d198f5e022f80dfefd5e15d6c0eaabe3\r\n"
+        );
+    }
+
+    /// The value and not the entry, which is the difference between the two
+    /// subcommands and is why a copy answers the same forty characters.
+    #[test]
+    fn a_value_digest_does_not_know_what_the_key_is_called() {
+        let mut f = Fixture::new();
+        f.run(&[b"RPUSH", b"l", b"a", b"b", b"c"]);
+        f.run(&[b"COPY", b"l", b"l2"]);
+        let want = "*1\r\n+8bf72d812571eea9b927f3c11beb0c4165a6ff89\r\n";
+        assert_eq!(f.run(&[b"DEBUG", b"DIGEST-VALUE", b"l"]), want);
+        assert_eq!(f.run(&[b"DEBUG", b"DIGEST-VALUE", b"l2"]), want);
+
+        // Several at once, in the order asked for, with a key that is not
+        // there answering forty zeros rather than an error.
+        assert_eq!(
+            f.run(&[b"DEBUG", b"DIGEST-VALUE", b"l", b"gone", b"l2"]),
+            format!(
+                "*3\r\n+8bf72d812571eea9b927f3c11beb0c4165a6ff89\r\n+{0}\r\n\
+                 +8bf72d812571eea9b927f3c11beb0c4165a6ff89\r\n",
+                "0".repeat(40)
+            )
+        );
+        assert_eq!(f.run(&[b"DEBUG", b"DIGEST-VALUE"]), "*0\r\n");
+    }
+
+    /// The whole server, where the name is in it and the database number is
+    /// in it and an empty database is not.
+    #[test]
+    fn the_whole_digest_folds_in_the_names_and_the_database_numbers() {
+        let mut f = Fixture::new();
+        let empty = format!("+{}\r\n", "0".repeat(40));
+        assert_eq!(f.run(&[b"DEBUG", b"DIGEST"]), empty);
+
+        f.run(&[b"SET", b"k", b"hello"]);
+        assert_eq!(
+            f.run(&[b"DEBUG", b"DIGEST"]),
+            "+d101db227d1e3b31616b18b0b8700f84c3ffa5e9\r\n"
+        );
+
+        f.run(&[b"SELECT", b"3"]);
+        f.run(&[b"SET", b"k", b"hello"]);
+        assert_eq!(
+            f.run(&[b"DEBUG", b"DIGEST"]),
+            "+a541f66c15932c1014da1569ff27c15bcde7d1dc\r\n"
+        );
+
+        // Emptying the first one leaves the same key in the same place and a
+        // different number, because the database it is in is folded in.
+        f.run(&[b"SELECT", b"0"]);
+        f.run(&[b"FLUSHDB"]);
+        assert_eq!(
+            f.run(&[b"DEBUG", b"DIGEST"]),
+            "+f9b35ab00ad2f456386a2f73d316bf8266013606\r\n"
+        );
+
+        f.run(&[b"FLUSHALL"]);
+        assert_eq!(f.run(&[b"DEBUG", b"DIGEST"]), empty);
+    }
+
+    /// Digesting is not using, which is what makes it safe for a suite to call
+    /// between every step of whatever it is measuring.
+    #[test]
+    fn digesting_does_not_count_as_using_anything() {
+        let mut f = Fixture::new();
+        f.run(&[b"SET", b"k", b"value"]);
+        f.run(&[b"CONFIG", b"RESETSTAT"]);
+        f.run(&[b"DEBUG", b"DIGEST"]);
+        f.run(&[b"DEBUG", b"DIGEST-VALUE", b"k", b"gone"]);
+        let stats = f.run(&[b"INFO", b"stats"]);
+        assert!(stats.contains("keyspace_hits:0\r\n"), "{stats}");
+        assert!(stats.contains("keyspace_misses:0\r\n"), "{stats}");
+
+        // And the counters are working, so the nought above is the command
+        // holding still rather than the statistic never moving.
+        f.run(&[b"GET", b"k"]);
+        f.run(&[b"GET", b"gone"]);
+        let stats = f.run(&[b"INFO", b"stats"]);
+        assert!(stats.contains("keyspace_hits:1\r\n"), "{stats}");
+        assert!(stats.contains("keyspace_misses:1\r\n"), "{stats}");
+    }
+
     /// One field out of a `DEBUG OBJECT` line, named by its label.
     fn field<'a>(line: &'a str, label: &str) -> &'a str {
         let at = line
