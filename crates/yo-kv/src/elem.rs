@@ -28,6 +28,15 @@
 //! is thrown out without reading the name bytes at all, and the name is only
 //! compared when the tag says it is worth comparing.
 //!
+//! The load is eight slots wide and the compare is one instruction over all
+//! eight of them, which is what keeps the probe from getting longer as the
+//! table fills. Linear probing one slot at a time has the opposite property:
+//! the memory the array costs and the length of an unsuccessful probe through
+//! it are the same number seen twice, so nothing can be spent less on the array
+//! without the probe running further. Eight at a time breaks that, because at
+//! three quarters full a miss reads a little over one group whichever way the
+//! keys fell.
+//!
 //! A walk is sequential. `HGETALL`, `SMEMBERS` and `HSCAN` read the row array
 //! front to back with no pointer chasing, which is the difference between the
 //! 13.6 nanoseconds a field walk actually costs and the number a linked
@@ -50,11 +59,13 @@
 //!
 //! The slot the removed member sat in is closed by writing a marker over it,
 //! and the marker is the empty one rather than the dead one whenever it can
-//! prove no probe ever ran past the slot, which is when the slot after it is
-//! already empty. A run of markers directly behind that one is cleared too, by
-//! the same argument applied to each in turn. So the common shapes leave nothing
-//! behind at all: a set filled and then drained collects its own markers on the
-//! way down, and a table with short runs in it almost never writes one.
+//! prove no probe ever ran past the slot, which is when the group the slot is
+//! in already holds an empty one. A table with room in it almost never writes a
+//! dead marker, because most groups have an empty slot in them. A group that
+//! filled up does write them, and they stay until a rebuild, which is the part
+//! of the older one slot at a time rule that group probing gives up: it could
+//! ask about the single slot after this one and could clear a run of markers
+//! behind it, and a group has no such single slot to ask about.
 //!
 //! What is left over is counted and it counts against the load exactly as a live
 //! member does, so a table churned in place rebuilds on the same schedule as one
@@ -66,8 +77,8 @@
 //! It is not free, and the case where it is not is a table drained and then read
 //! from. Shifting the run back really did give the slot up, so a set emptied
 //! from a million down to ten used to answer a miss like a table holding ten,
-//! and now it answers like a table that once held a million, which is under
-//! three slots looked at either way and is the whole of the trade.
+//! and now it answers like a table that once held a million, which is one group
+//! looked at either way and is the whole of the trade.
 //!
 //! This used to shift the run behind the hole back instead, which leaves no
 //! marker and costs a walk over that run with a home slot computed for every
@@ -149,6 +160,119 @@ const LOAD_DEN: usize = 4;
 
 /// The smallest slot array, which is one cache line of slots.
 const MIN_SLOTS: usize = 16;
+
+/// How many slots a probe looks at in one go.
+///
+/// Eight slots is thirty two bytes, which is one register on a machine with
+/// AVX2, two on one with only SSE2, and two on NEON. A group starts at a
+/// multiple of eight, so a group is thirty two byte aligned and never straddles
+/// a cache line, and the slot array is a power of two at least [`MIN_SLOTS`],
+/// so it holds a whole number of groups and a group never wraps off the end.
+const GROUP: usize = 8;
+
+/// The group of slots starting at `at`.
+///
+/// An array and not a slice, because the four questions below are written as a
+/// loop over a count the compiler knows, which is what turns each of them into
+/// one wide compare rather than eight narrow ones. Callers always pass a
+/// multiple of [`GROUP`] into an array that holds a whole number of groups, so
+/// the length is always right and the check is a branch that goes the same way
+/// every time.
+#[inline(always)]
+fn group_at(slots: &[u32], at: usize) -> &[u32; GROUP] {
+    slots[at..at + GROUP].try_into().expect("a whole group")
+}
+
+/// Which slots of a group have `slot & keep == want`, one bit each, lowest slot
+/// in the lowest bit.
+///
+/// Every question the probe asks of a group is this one question. A tag match
+/// keeps the top byte, a row match keeps the low twenty four bits, and both
+/// markers are a value in those same low bits, so one primitive covers the
+/// four and there is one piece of platform code rather than four.
+///
+/// Written out by hand rather than left to the compiler, because the compiler
+/// does not do it. The obvious loop that shifts each comparison into place
+/// comes out of LLVM on aarch64 as eight compares, eight selects and a chain of
+/// ors, which is more work than the short linear probe this replaces, and the
+/// measurement said so before the disassembly did.
+#[inline(always)]
+fn mask_eq(group: &[u32; GROUP], keep: u32, want: u32) -> u32 {
+    // SSE2 and NEON are both baseline, on x86-64 and on aarch64 respectively,
+    // so there is nothing to detect at runtime and nothing to dispatch on. A
+    // group is two registers on either, and eight is the group width because
+    // that is what the memory the array costs wants, not what a register holds.
+    #[cfg(all(target_arch = "x86_64", not(miri)))]
+    // SAFETY: SSE2 is part of x86-64 and cannot be absent. The two loads are
+    // unaligned loads of sixteen bytes each out of an array of eight `u32`,
+    // which is thirty two bytes, so both are inside it.
+    unsafe {
+        use std::arch::x86_64::*;
+        let keep = _mm_set1_epi32(keep as i32);
+        let want = _mm_set1_epi32(want as i32);
+        let at = group.as_ptr().cast::<__m128i>();
+        let one = _mm_cmpeq_epi32(_mm_and_si128(_mm_loadu_si128(at), keep), want);
+        let two = _mm_cmpeq_epi32(_mm_and_si128(_mm_loadu_si128(at.add(1)), keep), want);
+        let one = _mm_movemask_ps(_mm_castsi128_ps(one)) as u32;
+        let two = _mm_movemask_ps(_mm_castsi128_ps(two)) as u32;
+        return one | (two << 4);
+    }
+    #[cfg(all(target_arch = "aarch64", not(miri)))]
+    // SAFETY: NEON is part of aarch64 and cannot be absent. The two loads are
+    // sixteen bytes each out of a thirty two byte array, so both are inside it.
+    unsafe {
+        use std::arch::aarch64::*;
+        // There is no movemask on NEON. Anding the all ones a compare leaves
+        // with one bit per lane and adding the lanes across is the usual stand
+        // in, and it is three instructions rather than one.
+        let bit = [1u32, 2, 4, 8];
+        let bit = vld1q_u32(bit.as_ptr());
+        let keep = vdupq_n_u32(keep);
+        let want = vdupq_n_u32(want);
+        let at = group.as_ptr();
+        let one = vceqq_u32(vandq_u32(vld1q_u32(at), keep), want);
+        let two = vceqq_u32(vandq_u32(vld1q_u32(at.add(4)), keep), want);
+        return vaddvq_u32(vandq_u32(one, bit)) | (vaddvq_u32(vandq_u32(two, bit)) << 4);
+    }
+    // Everywhere else, and under Miri, which has no NEON to interpret. This is
+    // the definition the two above are answering, and the tests that check them
+    // against each other are what say they agree.
+    #[cfg(any(
+        miri,
+        not(any(target_arch = "x86_64", target_arch = "aarch64"))
+    ))]
+    {
+        let mut hit = 0;
+        for (i, &slot) in group.iter().enumerate() {
+            hit |= u32::from(slot & keep == want) << i;
+        }
+        hit
+    }
+}
+
+/// Which slots of the group carry this tag.
+#[inline(always)]
+fn tagged(group: &[u32; GROUP], tag: u32) -> u32 {
+    mask_eq(group, 0xFF00_0000, tag << 24)
+}
+
+/// Which slots of the group point at this row.
+#[inline(always)]
+fn holding(group: &[u32; GROUP], row: u32) -> u32 {
+    mask_eq(group, ROW, row)
+}
+
+/// Which slots of the group have never been written to.
+#[inline(always)]
+fn empties(group: &[u32; GROUP]) -> u32 {
+    mask_eq(group, EMPTY, EMPTY)
+}
+
+/// Which slots of the group are a marker of either kind.
+#[inline(always)]
+fn frees(group: &[u32; GROUP]) -> u32 {
+    mask_eq(group, ROW, ROW)
+}
 
 /// The shortest name that keeps its length in the blob instead of in its row.
 ///
@@ -786,35 +910,45 @@ impl<V: Copy> Elements<V> {
 
     /// The probe itself, with the hash already in hand.
     ///
-    /// One load from the slot array. The tag in the top byte throws out a
-    /// collision on the low bits without touching the row, so the name
-    /// comparison below runs about once per hit and not once per probe.
+    /// A group of eight slots at a time. One load, one compare against the
+    /// wanted tag broadcast, and a bitmask of the slots that agreed, which is
+    /// what makes the probe stop getting longer as the table fills: at three
+    /// quarters full a miss reads a little over one group, where one slot at a
+    /// time reads about eight.
     ///
-    /// The stop is [`EMPTY`] and only [`EMPTY`], because a [`TOMB`] means
-    /// something used to be here and whatever probed past it is still behind it.
-    /// A marker cannot be mistaken for a match: its row bits are all ones and no
-    /// row index is, so the check that rejects it is on the arm the tag already
-    /// agreed with, which is one comparison in two hundred and fifty six.
+    /// The tag in the top byte throws out a collision on the low bits without
+    /// touching the row, so the name comparison below runs about once per hit
+    /// and not once per slot looked at. A marker cannot be mistaken for a
+    /// match: its row bits are all ones and no row index is, so the check that
+    /// rejects it is on the arm the tag already agreed with, which is one
+    /// comparison in two hundred and fifty six.
+    ///
+    /// The stop is a group holding an [`EMPTY`], because an insert takes the
+    /// first free slot the same walk reaches, so nothing was ever written past
+    /// an empty slot. A [`TOMB`] does not stop it: something used to be there
+    /// and whatever probed past it is still behind it.
     #[inline]
     fn find_hashed(&self, h: u64, name: &[u8]) -> Option<usize> {
         if self.rows.is_empty() {
             return None;
         }
         let mask = self.slots.len() - 1;
-        let tag = tag_of(h);
-        let mut at = (h as usize) & mask;
+        let tag = u32::from(tag_of(h));
+        let mut at = (h as usize) & mask & !(GROUP - 1);
         loop {
-            let slot = self.slots[at];
-            if slot == EMPTY {
-                return None;
-            }
-            if slot >> 24 == u32::from(tag) {
-                let row = slot & ROW;
+            let group = group_at(&self.slots, at);
+            let mut hit = tagged(group, tag);
+            while hit != 0 {
+                let row = group[hit.trailing_zeros() as usize] & ROW;
+                hit &= hit - 1;
                 if row != ROW && bytes_eq(self.name_of(&self.rows[row as usize]), name) {
                     return Some(row as usize);
                 }
             }
-            at = (at + 1) & mask;
+            if empties(group) != 0 {
+                return None;
+            }
+            at = (at + GROUP) & mask;
         }
     }
 
@@ -823,18 +957,28 @@ impl<V: Copy> Elements<V> {
     /// Free rather than empty, so an insert takes a marker back as soon as it
     /// meets one. That is correct because the caller has already probed for this
     /// name and not found it, and because a later probe for the same name walks
-    /// these slots in this order and stops only at an [`EMPTY`], which is at or
-    /// after wherever this lands.
+    /// these groups in this order and stops only at a group holding an
+    /// [`EMPTY`], which is at or after the group this lands in.
+    ///
+    /// A slot before the home slot but inside the home group is fair game, and
+    /// that is the one place group probing differs from where one slot at a
+    /// time would have put this. It costs nothing, because every walk that
+    /// reads this slot reads the whole group it is in.
     fn put_slot(&mut self, h: u64, row: u32) {
         let mask = self.slots.len() - 1;
-        let mut at = (h as usize) & mask;
-        while self.slots[at] & ROW != ROW {
-            at = (at + 1) & mask;
+        let mut at = (h as usize) & mask & !(GROUP - 1);
+        loop {
+            let open = frees(group_at(&self.slots, at));
+            if open != 0 {
+                let at = at + open.trailing_zeros() as usize;
+                if self.slots[at] == TOMB {
+                    self.dead -= 1;
+                }
+                self.slots[at] = (u32::from(tag_of(h)) << 24) | row;
+                return;
+            }
+            at = (at + GROUP) & mask;
         }
-        if self.slots[at] == TOMB {
-            self.dead -= 1;
-        }
-        self.slots[at] = (u32::from(tag_of(h)) << 24) | row;
     }
 
     /// Take the row at `at` out, keeping the row array dense.
@@ -859,31 +1003,26 @@ impl<V: Copy> Elements<V> {
 
     /// Close the slot holding `row`.
     ///
-    /// A slot whose neighbour is already [`EMPTY`] is a slot nothing ever probed
-    /// past, because a probe stops at the first empty one, so it can go straight
-    /// back to empty and cost nothing. Any run of markers directly behind it goes
-    /// with it, since the same argument now holds for each of them in turn, and
-    /// that is what makes a drain collect after itself.
+    /// A slot in a group that already holds an [`EMPTY`] is a slot nothing ever
+    /// probed past, because a probe stops at the first such group, so it can go
+    /// straight back to empty and cost nothing. Otherwise the slot becomes a
+    /// [`TOMB`], which says keep going and counts against the load until the
+    /// next rebuild.
     ///
-    /// Otherwise the slot becomes a [`TOMB`], which says keep going and counts
-    /// against the load until the next rebuild.
+    /// The group is the unit here, where one slot at a time could ask about the
+    /// single slot after this one and could clear a run of markers behind it.
+    /// So a group that filled up leaves markers on the way down where the older
+    /// rule would have collected them. They are counted, a rebuild clears every
+    /// one of them, and the probe that walks them reads the whole group in one
+    /// go, which is what the group is for.
     fn clear_slot(&mut self, row: usize) {
-        let mask = self.slots.len() - 1;
         let at = self.slot_of(row);
-        if self.slots[(at + 1) & mask] != EMPTY {
-            self.slots[at] = TOMB;
-            self.dead += 1;
+        if empties(group_at(&self.slots, at & !(GROUP - 1))) != 0 {
+            self.slots[at] = EMPTY;
             return;
         }
-        self.slots[at] = EMPTY;
-        // This terminates on the slot just emptied at the latest, so an array of
-        // nothing but markers is walked once and not forever.
-        let mut back = at.wrapping_sub(1) & mask;
-        while self.slots[back] == TOMB {
-            self.slots[back] = EMPTY;
-            self.dead -= 1;
-            back = back.wrapping_sub(1) & mask;
-        }
+        self.slots[at] = TOMB;
+        self.dead += 1;
     }
 
     /// Point the slot holding `from` at `to` instead.
@@ -903,13 +1042,15 @@ impl<V: Copy> Elements<V> {
     fn slot_of(&self, row: usize) -> usize {
         let mask = self.slots.len() - 1;
         let want = u32::try_from(row).expect("a row index fits in 24 bits");
-        let mut at = self.home_of(row, mask);
+        let mut at = self.home_of(row, mask) & !(GROUP - 1);
         loop {
-            debug_assert!(self.slots[at] != EMPTY, "the row being moved has a slot");
-            if self.slots[at] & ROW == want {
-                return at;
+            let group = group_at(&self.slots, at);
+            let hit = holding(group, want);
+            if hit != 0 {
+                return at + hit.trailing_zeros() as usize;
             }
-            at = (at + 1) & mask;
+            debug_assert!(empties(group) == 0, "the row being moved has a slot");
+            at = (at + GROUP) & mask;
         }
     }
 
@@ -949,11 +1090,15 @@ impl<V: Copy> Elements<V> {
                 continue;
             }
             let row = (slot & ROW) as usize;
-            let mut at = self.home_of(row, mask);
-            while self.slots[at] != EMPTY {
-                at = (at + 1) & mask;
+            let mut at = self.home_of(row, mask) & !(GROUP - 1);
+            loop {
+                let open = empties(group_at(&self.slots, at));
+                if open != 0 {
+                    self.slots[at + open.trailing_zeros() as usize] = slot;
+                    break;
+                }
+                at = (at + GROUP) & mask;
             }
-            self.slots[at] = slot;
         }
     }
 
@@ -1181,6 +1326,57 @@ mod tests {
             s.insert(m, ()).expect("room");
         }
         s
+    }
+
+    /// What [`mask_eq`] is supposed to answer, written the slow way.
+    fn mask_eq_slow(group: &[u32; GROUP], keep: u32, want: u32) -> u32 {
+        let mut hit = 0;
+        for (i, &slot) in group.iter().enumerate() {
+            hit |= u32::from(slot & keep == want) << i;
+        }
+        hit
+    }
+
+    /// The one piece of platform code in this file, against the definition it
+    /// is answering. Whichever of the three arms this build took, it agrees
+    /// with the loop, on the four questions the probe actually asks and on a
+    /// group made of the values it actually meets.
+    #[test]
+    fn a_group_compare_agrees_with_the_loop_it_replaces() {
+        let mut seed = 0x243f_6a88_85a3_08d3u64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for _ in 0..many(4000) {
+            let mut group = [EMPTY; GROUP];
+            for slot in &mut group {
+                let n = next();
+                // A live slot, an empty one and a marker, in roughly the mix a
+                // table at its load factor holds.
+                *slot = match n % 8 {
+                    0 => EMPTY,
+                    1 => TOMB,
+                    _ => ((n >> 32) as u32 & 0x00FF_FFFE) | (((n >> 8) as u32 & 0xFF) << 24),
+                };
+            }
+            let tag = (next() >> 16) as u32 & 0xFF;
+            let row = (next() >> 16) as u32 & ROW;
+            for (keep, want) in [
+                (0xFF00_0000, tag << 24),
+                (ROW, row),
+                (EMPTY, EMPTY),
+                (ROW, ROW),
+            ] {
+                assert_eq!(
+                    mask_eq(&group, keep, want),
+                    mask_eq_slow(&group, keep, want),
+                    "{group:08x?} keep {keep:08x} want {want:08x}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -1596,11 +1792,12 @@ mod tests {
         }
     }
 
-    /// A drain collects after itself. Every removal that meets an empty slot on
-    /// its right takes the markers behind it with it, and by the time the last
-    /// member is gone there is nothing left in the array at all.
+    /// A drain collects nearly all of itself. A removal out of a group that
+    /// still holds an empty slot gives the slot straight back, and the only
+    /// markers left at the end are the ones out of groups that had filled up,
+    /// which at this size is a few percent of the array.
     #[test]
-    fn emptying_a_set_a_member_at_a_time_leaves_nothing_behind() {
+    fn emptying_a_set_a_member_at_a_time_leaves_only_the_groups_that_filled() {
         let names: Vec<Vec<u8>> = (0..many(2000))
             .map(|i| format!("m{i}").into_bytes())
             .collect();
@@ -1613,8 +1810,19 @@ mod tests {
             assert!(s.remove(name).is_some(), "{name:?} was there");
         }
         assert!(s.is_empty());
-        assert_eq!(s.dead, 0, "the drain cleared its own markers");
-        assert!(s.slots.iter().all(|v| *v == EMPTY));
+        assert!(
+            s.slots.iter().all(|v| *v & ROW == ROW),
+            "a drained table holds no live slot"
+        );
+        // A tenth of the array is far above what this shape leaves, which is
+        // around a twenty fifth, and far below what it would take to make the
+        // probe below walk anything. The bound is here rather than the exact
+        // count because the count is the hash's business.
+        assert!(
+            (s.dead as usize) * 10 < slots,
+            "{} markers left in {slots} slots",
+            s.dead
+        );
         for name in &names {
             assert!(!s.contains(name), "{name:?} came back");
         }
