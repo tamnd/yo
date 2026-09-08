@@ -908,3 +908,25 @@ reason = "A real server keeps a SHA-256 of the password and never the password, 
 status = "until"
 resolved_by = "M8"
 spec = "12 section 3"
+
+[[divergence]]
+id = "D-128"
+title = "DEBUG QUICKLIST-PACKED-THRESHOLD is remembered and read by nothing"
+reason = "On a real server this is the size above which a list element stops being packed into a listpack node and gets a plain node of its own, and a test suite turns it down to a few bytes so that a list of short strings takes the path a list of long ones would. There are no quicklists here. A list is a rope of arena runs and what decides whether an element sits inline or gets its own run is the run layout and not a threshold anybody can set, so there is nothing for the number to change. It is accepted rather than refused because the suite that sets it carries on regardless of the answer and a refusal would read as the command missing, and the value is kept rather than dropped so that the day a size threshold does mean something here it is already being parsed and bounded the way the reference parses and bounds it. The bound is the reference's real one, bigger than nothing and no bigger than four gigabytes less a megabyte, which is not what its own error sentence claims."
+status = "permanent"
+spec = "12 section 9"
+
+[[divergence]]
+id = "D-129"
+title = "DEBUG SLEEP holds one thread rather than the whole server"
+reason = "A real server is one thread doing the commands, so DEBUG SLEEP stops everything and that is what it is for: a test that wants a slow command to block another client, or wants a timeout to fire. Here the connection lands on one of several shard threads and the sleep holds that one, so another connection on another thread carries on. Running the server with --threads 1 gives the reference behaviour exactly, and that is the answer for a test that needs it rather than a lock across every thread, because a lock every command has to take on the way in would cost the whole design to make one debug command block harder. What still works on any number of threads is the part most tests actually use, which is that the sleeping connection itself is late by the time asked for."
+status = "permanent"
+spec = "12 section 9"
+
+[[divergence]]
+id = "D-130"
+title = "COMMAND DOCS sends no doc_flags field"
+reason = "A real server tags a handful of commands in COMMAND DOCS with doc_flags, which is a set holding some of deprecated, syscmd and comingsoon, and leaves the field out of every command that has none. Nothing here carries any of the three, so the field is left out everywhere rather than sent empty, which is what the reference does for a command with no flags and is why this only shows on the few that have one. DEBUG is the first of those to ship here, and its syscmd tag means what it says: this is a command for the system and not for a user, so a documentation generator hides it. Nothing branches on it and no client library reads it, which is why it is written down rather than invented. It goes in with the rest of the documentation fields, next to the arguments list and the replies, which is the same change as D-13's tips and key specs and wants the same new column in the command table."
+status = "until"
+resolved_by = "M8"
+spec = "12 section 9"

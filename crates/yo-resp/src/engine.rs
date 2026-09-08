@@ -607,6 +607,14 @@ impl<S: Sink> Wire<S> {
     /// worth of keys, which is where an unloaded process running the same
     /// writes settled at six.
     pub fn maintain(&mut self) -> Option<usize> {
+        // `DEBUG PAUSE-CRON 1`, which stops the lot rather than any one part of
+        // it, because that is what it stops on a real server: the whole of
+        // `serverCron` and not a chosen job inside it. The clock is not in here,
+        // so a paused server still knows what time it is and still expires a key
+        // somebody reads.
+        if !self.server.cron_running() {
+            return None;
+        }
         // Before the compaction and not after it, because the reading the next
         // batch judges its limit against should be the one taken after the last
         // batch's writes rather than the one taken after this call's collecting.
