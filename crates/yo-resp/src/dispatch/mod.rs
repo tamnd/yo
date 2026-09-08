@@ -9191,6 +9191,222 @@ mod tests {
         assert_eq!(f.run(&[b"GET", b"k"]), "$1\r\nv\r\n");
     }
 
+    /// The fields of one `DEBUG OBJECT` line, read off a string.
+    ///
+    /// Every number in it is checked somewhere and this is the one that checks
+    /// the shape: the field order, the spacing and the two that are constant.
+    #[test]
+    fn debug_object_describes_how_a_value_is_written_down() {
+        let mut f = Fixture::new();
+        f.run(&[b"SET", b"s", b"hello"]);
+
+        let line = f.run(&[b"DEBUG", b"OBJECT", b"s"]);
+        let line = line
+            .strip_prefix('+')
+            .and_then(|l| l.strip_suffix("\r\n"))
+            .expect("a simple string");
+        let mut fields = line.split(' ');
+        assert_eq!(fields.next(), Some("Value"));
+        assert!(
+            fields.next().expect("an address").starts_with("at:0x"),
+            "{line}"
+        );
+        assert_eq!(fields.next(), Some("refcount:1"));
+        assert_eq!(fields.next(), Some("encoding:embstr"));
+        // Five bytes of hello and the one byte header a short string is
+        // written with, which is the body and neither the type byte in front
+        // of it nor the footer behind.
+        assert_eq!(fields.next(), Some("serializedlength:6"));
+        assert!(
+            fields.next().expect("a clock").starts_with("lru:"),
+            "{line}"
+        );
+        assert_eq!(fields.next(), Some("lru_seconds_idle:0"));
+        assert_eq!(fields.next(), None);
+    }
+
+    /// The five extra fields a list that broke into nodes carries.
+    #[test]
+    fn debug_object_counts_the_nodes_a_list_broke_into() {
+        let mut f = Fixture::new();
+        // Enough long members to be past the eight kilobyte band, so that the
+        // list is a quicklist rather than one packed run.
+        let member = vec![b'x'; 200];
+        for _ in 0..100 {
+            f.run(&[b"RPUSH", b"l", &member]);
+        }
+        assert_eq!(
+            f.run(&[b"OBJECT", b"ENCODING", b"l"]),
+            "$9\r\nquicklist\r\n"
+        );
+
+        let line = f.run(&[b"DEBUG", b"OBJECT", b"l"]);
+        let nodes: usize = field(&line, "ql_nodes:").parse().expect("a count");
+        assert!(nodes > 1, "{line}");
+        let avg: f64 = field(&line, "ql_avg_node:").parse().expect("an average");
+        assert!((avg - 100.0 / nodes as f64).abs() < 0.01, "{line}");
+        assert_eq!(field(&line, "ql_listpack_max:"), "-2");
+        assert_eq!(field(&line, "ql_compressed:"), "0");
+        let bytes: usize = field(&line, "ql_uncompressed_size:")
+            .parse()
+            .expect("a size");
+        assert!(bytes > 100 * 200, "{line}");
+
+        // A list small enough to stay packed has none of them.
+        f.run(&[b"RPUSH", b"small", b"a"]);
+        let line = f.run(&[b"DEBUG", b"OBJECT", b"small"]);
+        assert!(!line.contains("ql_nodes"), "{line}");
+    }
+
+    /// Looking is not using, which is the property the whole subcommand rests
+    /// on: a diagnostic that reset the number it reports would answer nought
+    /// every time it was asked.
+    #[test]
+    fn debug_object_does_not_count_as_using_the_key() {
+        let mut f = Fixture::new();
+        f.run(&[b"SET", b"s", b"hello"]);
+        let was = field(&f.run(&[b"DEBUG", b"OBJECT", b"s"]), "lru:").to_owned();
+
+        f.server.set_clock_ms(f.server.clock.now_ms() + 60_000);
+        let line = f.run(&[b"DEBUG", b"OBJECT", b"s"]);
+
+        assert_eq!(field(&line, "lru_seconds_idle:"), "60");
+        // The clock the idle time counts back from has not moved, because
+        // nothing has touched the key.
+        assert_eq!(field(&line, "lru:"), was);
+    }
+
+    /// The two lengths `DEBUG SDSLEN` is read for, and the four numbers about
+    /// an allocator that is not here, which is D-135.
+    #[test]
+    fn debug_sdslen_measures_the_name_and_the_string_under_it() {
+        let mut f = Fixture::new();
+        f.run(&[b"SET", b"name", b"hello"]);
+
+        assert_eq!(
+            f.run(&[b"DEBUG", b"SDSLEN", b"name"]),
+            "+key_sds_len:4, key_sds_avail:0, key_zmalloc: 4, \
+             val_sds_len:5, val_sds_avail:0, val_zmalloc: 5\r\n"
+        );
+    }
+
+    /// What each of the four refuses, which is the half a suite branches on.
+    #[test]
+    fn the_inspecting_subcommands_refuse_what_they_cannot_describe() {
+        let mut f = Fixture::new();
+        f.run(&[b"SET", b"s", b"hello"]);
+        f.run(&[b"SET", b"n", b"12345"]);
+        f.run(&[b"RPUSH", b"l", b"a"]);
+
+        // A key that is not there is the same sentence from all four, and it is
+        // an error rather than the nil `OBJECT ENCODING` answers.
+        for sub in [
+            b"OBJECT".as_slice(),
+            b"SDSLEN".as_slice(),
+            b"LISTPACK".as_slice(),
+            b"QUICKLIST".as_slice(),
+        ] {
+            assert_eq!(
+                f.run(&[b"DEBUG", sub, b"nosuch"]),
+                "-ERR no such key\r\n",
+                "{}",
+                String::from_utf8_lossy(sub)
+            );
+        }
+
+        // An integer encoded string has no string in it to measure.
+        assert_eq!(
+            f.run(&[b"DEBUG", b"SDSLEN", b"n"]),
+            "-ERR Not an sds encoded string.\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"DEBUG", b"SDSLEN", b"l"]),
+            "-ERR Not an sds encoded string.\r\n"
+        );
+
+        // Each structure dump takes the representation it is named after and
+        // nothing else, whatever type the value is.
+        assert_eq!(
+            f.run(&[b"DEBUG", b"LISTPACK", b"l"]),
+            "+Listpack structure printed on stdout\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"DEBUG", b"QUICKLIST", b"l"]),
+            "-ERR Not a quicklist encoded object.\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"DEBUG", b"LISTPACK", b"s"]),
+            "-ERR Not a listpack encoded object.\r\n"
+        );
+    }
+
+    /// A listpack is a representation and not a type, so the same subcommand
+    /// answers for four different types and refuses the intset next to them.
+    #[test]
+    fn debug_listpack_answers_for_anything_written_as_one() {
+        let mut f = Fixture::new();
+        f.run(&[b"RPUSH", b"l", b"a"]);
+        f.run(&[b"HSET", b"h", b"f", b"v"]);
+        f.run(&[b"SADD", b"st", b"a"]);
+        f.run(&[b"ZADD", b"z", b"1", b"m"]);
+        f.run(&[b"SADD", b"ints", b"1", b"2"]);
+
+        for key in [b"l".as_slice(), b"h", b"st", b"z"] {
+            assert_eq!(
+                f.run(&[b"DEBUG", b"LISTPACK", key]),
+                "+Listpack structure printed on stdout\r\n",
+                "{}",
+                String::from_utf8_lossy(key)
+            );
+        }
+        assert_eq!(
+            f.run(&[b"OBJECT", b"ENCODING", b"ints"]),
+            "$6\r\nintset\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"DEBUG", b"LISTPACK", b"ints"]),
+            "-ERR Not a listpack encoded object.\r\n"
+        );
+    }
+
+    /// The level argument on `QUICKLIST`, which is read and dropped, and the
+    /// wrong argument count on either, which is the container's own sentence.
+    #[test]
+    fn debug_quicklist_takes_a_level_it_does_nothing_with() {
+        let mut f = Fixture::new();
+        let member = vec![b'x'; 200];
+        for _ in 0..100 {
+            f.run(&[b"RPUSH", b"l", &member]);
+        }
+
+        let said = "+Quicklist structure printed on stdout\r\n";
+        assert_eq!(f.run(&[b"DEBUG", b"QUICKLIST", b"l"]), said);
+        assert_eq!(f.run(&[b"DEBUG", b"QUICKLIST", b"l", b"1"]), said);
+        // A word that is not a number is taken rather than refused, which is
+        // the reference: it reads the argument with atoi and gets nought.
+        assert_eq!(f.run(&[b"DEBUG", b"QUICKLIST", b"l", b"abc"]), said);
+
+        assert_eq!(
+            f.run(&[b"DEBUG", b"QUICKLIST", b"l", b"1", b"2"]),
+            "-ERR unknown subcommand or wrong number of arguments for \
+             'QUICKLIST'. Try DEBUG HELP.\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"DEBUG", b"LISTPACK", b"l", b"0"]),
+            "-ERR unknown subcommand or wrong number of arguments for \
+             'LISTPACK'. Try DEBUG HELP.\r\n"
+        );
+    }
+
+    /// One field out of a `DEBUG OBJECT` line, named by its label.
+    fn field<'a>(line: &'a str, label: &str) -> &'a str {
+        let at = line
+            .find(label)
+            .unwrap_or_else(|| panic!("no {label} in {line}"));
+        let rest = &line[at + label.len()..];
+        rest.split([' ', '\r']).next().expect("a value")
+    }
+
     /// A fixture on a server with a password, on a connection that has not met
     /// it.
     ///
