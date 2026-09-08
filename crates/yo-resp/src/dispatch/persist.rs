@@ -86,6 +86,10 @@ pub(crate) struct Persistence {
     skipped: AtomicUsize,
     /// How many rewrites have been asked for.
     rewrites: AtomicU64,
+    /// Keys the last load off a file put into the keyspace.
+    loaded: AtomicUsize,
+    /// Keys the last load read and threw away for having already died.
+    load_expired: AtomicUsize,
 }
 
 impl Default for Persistence {
@@ -100,7 +104,22 @@ impl Default for Persistence {
             ok: AtomicBool::new(true),
             skipped: AtomicUsize::new(0),
             rewrites: AtomicU64::new(0),
+            loaded: AtomicUsize::new(0),
+            load_expired: AtomicUsize::new(0),
         }
+    }
+}
+
+impl Persistence {
+    /// Remember what a load off a file did, for `INFO persistence` to report.
+    ///
+    /// The last one and not a running total, which is what Redis means by these
+    /// two fields as well. A server that has loaded twice is answering about the
+    /// second load, and a server that has never loaded answers nought, which is
+    /// true rather than a placeholder.
+    pub(super) fn note_load(&self, done: &super::load::Loaded) {
+        self.loaded.store(done.total(), Relaxed);
+        self.load_expired.store(done.expired, Relaxed);
     }
 }
 
@@ -310,14 +329,19 @@ fn seconds(server: &Server) -> i64 {
 
 /// The `Persistence` section of `INFO`.
 ///
-/// Redis reports thirty odd fields here and this reports thirteen. What is
-/// missing is missing because it is about a fork, an append only file or a load,
-/// and there is no fork, no append only file and no load off one of these files:
-/// `rdb_bgsave_in_progress` would be a zero that is never anything else,
-/// `rdb_last_cow_size` would be a zero about a copy that never happens, and
-/// `rdb_last_load_keys_loaded` would be a zero about a file this server has
-/// never started from. A field that is not there is a client falling back, and a
-/// field that is there and always zero is a client believing it.
+/// Redis reports thirty odd fields here and this reports fifteen. What is
+/// missing is missing because it is about a fork or an append only file, and
+/// there is neither: `rdb_bgsave_in_progress` would be a zero that is never
+/// anything else and `rdb_last_cow_size` would be a zero about a copy that never
+/// happens. A field that is not there is a client falling back, and a field that
+/// is there and always zero is a client believing it.
+///
+/// The two load fields are here because there is a load now. `DEBUG RELOAD` and
+/// `yodb serve --restore` both read a whole file into the keyspace, so
+/// `rdb_last_load_keys_loaded` is a number about something that happened and
+/// `rdb_last_load_keys_expired` says how much of the file was too old to keep.
+/// A server that has not loaded reports nought for both, which is Redis's answer
+/// on a server started with no file to load as well.
 ///
 /// `rdb_changes_since_last_save` is the one absence that is a gap rather than a
 /// decision. It is Redis's dirty counter, which every command adds the number of
@@ -333,6 +357,7 @@ pub(super) fn info(server: &Server, s: &mut String) {
         "# Persistence\r\nloading:0\r\nasync_loading:0\r\n\
          rdb_bgsave_in_progress:0\r\nrdb_last_save_time:{}\r\n\
          rdb_last_bgsave_status:{}\r\nrdb_saves:{}\r\n\
+         rdb_last_load_keys_expired:{}\r\nrdb_last_load_keys_loaded:{}\r\n\
          yo_rdb_last_save_skipped_keys:{}\r\n\
          aof_enabled:0\r\naof_rewrite_in_progress:0\r\n\
          aof_rewrite_scheduled:0\r\naof_last_bgrewrite_status:ok\r\n\
@@ -340,6 +365,8 @@ pub(super) fn info(server: &Server, s: &mut String) {
         server.last_save(),
         status(p.ok.load(Relaxed)),
         p.saves.load(Relaxed),
+        p.load_expired.load(Relaxed),
+        p.loaded.load(Relaxed),
         p.skipped.load(Relaxed),
         p.rewrites.load(Relaxed),
     );

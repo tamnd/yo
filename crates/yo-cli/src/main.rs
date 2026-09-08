@@ -1,8 +1,8 @@
 //! The `yodb` command line tool.
 //!
-//! Two subcommands: `check`, which is the M1 deliverable, and `serve`, which
-//! puts the RESP engine on a socket. The others arrive with the milestones that
-//! need them.
+//! Three subcommands: `check`, which is the M1 deliverable, `serve`, which puts
+//! the RESP engine on a socket, and `restore`, which reads a Redis RDB file and
+//! says what is in it. The others arrive with the milestones that need them.
 //!
 //! Argument parsing is done by hand rather than with a library. That is a
 //! choice worth defending exactly once, here: `yodb check` is the tool you run
@@ -14,6 +14,7 @@
 
 mod check;
 mod poll;
+mod restore;
 mod serve;
 mod signal;
 mod store;
@@ -29,13 +30,20 @@ yodb, an embedded knowledge engine
 
 usage:
   yodb check FILE [--quick] [--quiet]
+  yodb restore FILE [--quiet]
   yodb serve [--bind ADDR] [--port PORT] [--unixsocket PATH] [--no-port]
              [--threads N] [--dir PATH] [--store PATH --maxmemory BYTES]
-             [--requirepass PASSWORD]
+             [--requirepass PASSWORD] [--restore FILE]
 
   check    read a .yo file and report anything wrong with it. Never writes.
              --quick   skip the records and read only the headers
              --quiet   print findings and the summary, nothing else
+
+  restore  read a Redis RDB file, build every value in it and report what
+           it holds. Nothing is written and no server is started, so this
+           is the safe way to find out whether a dump from somewhere else
+           will load here. Use serve --restore to start a server on it.
+             --quiet   print the summary, nothing else
 
   serve    speak RESP on a socket, so a Redis client can talk to it.
              --bind        address to listen on, 127.0.0.1 by default
@@ -60,6 +68,13 @@ usage:
                            go, in the units CONFIG SET takes, so 100mb is
                            a hundred mebibytes and 100m is a hundred
                            million. No limit by default
+             --restore     a Redis RDB file to build the dataset out of
+                           before the port opens, so the first client to
+                           connect finds the data already there. The file
+                           is read and not held, and nothing writes back
+                           to it. A file that will not load stops the
+                           server from starting rather than leaving it
+                           serving half a dataset
              --store       a file to put cold values in when memory fills
                            up, instead of throwing keys away. The path has
                            to be a new one, because what a previous run
@@ -127,6 +142,10 @@ fn run() -> ExitCode {
         Some("check") => {
             rest.remove(0);
             check_command(&rest)
+        }
+        Some("restore") => {
+            rest.remove(0);
+            restore_command(&rest)
         }
         Some("serve") => {
             rest.remove(0);
@@ -231,6 +250,62 @@ fn check_command(args: &[&str]) -> ExitCode {
     }
 }
 
+/// `yodb restore FILE [--quiet]`.
+///
+/// Shaped like `check` on purpose, down to the exit codes, because it is the
+/// same job on the other format: read a file somebody handed you and say whether
+/// it is any good. The difference is that a file with something wrong in it does
+/// not produce a list of findings, since an RDB is a chain where each item says
+/// how long it is and one that does not parse takes the rest of the file with it.
+/// So there is one sentence and it is the first thing that went wrong.
+fn restore_command(args: &[&str]) -> ExitCode {
+    let mut path: Option<PathBuf> = None;
+    let mut quiet = false;
+
+    for a in args {
+        match *a {
+            "--quiet" => quiet = true,
+            "-h" | "--help" => {
+                print!("{USAGE}");
+                return ExitCode::SUCCESS;
+            }
+            other if other.starts_with('-') => {
+                eprintln!("yodb restore: no such option: {other}");
+                return ExitCode::from(2);
+            }
+            other if path.is_none() => path = Some(PathBuf::from(other)),
+            other => {
+                eprintln!("yodb restore: takes one file, and was also given {other}");
+                return ExitCode::from(2);
+            }
+        }
+    }
+
+    let Some(path) = path else {
+        eprintln!("yodb restore: which file?\n");
+        eprint!("{USAGE}");
+        return ExitCode::from(2);
+    };
+
+    let done = match restore::restore(&path) {
+        Ok(done) => done,
+        Err(trouble) => {
+            eprintln!("yodb restore: {trouble}");
+            return match trouble {
+                restore::Trouble::Unreadable(_) => ExitCode::from(2),
+                restore::Trouble::Refused(_) => ExitCode::FAILURE,
+            };
+        }
+    };
+    if !quiet {
+        println!("{}", path.display());
+    }
+    let mut lines = String::new();
+    restore::report(&done, &mut lines);
+    print!("{lines}");
+    ExitCode::SUCCESS
+}
+
 fn serve_command(args: &[&str]) -> ExitCode {
     let mut bind = DEFAULT_BIND.to_string();
     let mut port = DEFAULT_PORT;
@@ -241,6 +316,7 @@ fn serve_command(args: &[&str]) -> ExitCode {
     let mut dir: Option<std::path::PathBuf> = None;
     let mut threads = 1usize;
     let mut requirepass: Option<&str> = None;
+    let mut from_rdb: Option<std::path::PathBuf> = None;
 
     let mut at = 0;
     while at < args.len() {
@@ -253,7 +329,7 @@ fn serve_command(args: &[&str]) -> ExitCode {
             }
             "--no-port" => tcp = false,
             "--bind" | "--port" | "--unixsocket" | "--store" | "--maxmemory" | "--dir"
-            | "--threads" | "--requirepass" => {
+            | "--threads" | "--requirepass" | "--restore" => {
                 let Some(value) = args.get(at) else {
                     eprintln!("yodb serve: {arg} needs a value");
                     return ExitCode::from(2);
@@ -267,6 +343,8 @@ fn serve_command(args: &[&str]) -> ExitCode {
                     store = Some(std::path::PathBuf::from(*value));
                 } else if arg == "--dir" {
                     dir = Some(std::path::PathBuf::from(*value));
+                } else if arg == "--restore" {
+                    from_rdb = Some(std::path::PathBuf::from(*value));
                 } else if arg == "--requirepass" {
                     // An empty one is no password, which is the same thing
                     // `CONFIG SET requirepass ""` means by it.
@@ -343,6 +421,22 @@ fn serve_command(args: &[&str]) -> ExitCode {
         None => None,
     };
 
+    // Read before the listener for the same reason the store is opened before
+    // it, which is that a mistyped path should not leave a port bound behind it.
+    // The bytes are held rather than the file, because the load wants the whole
+    // image anyway and holding a file open across the startup would keep a handle
+    // on something the server has no further use for.
+    let image = match &from_rdb {
+        Some(path) => match std::fs::read(path) {
+            Ok(bytes) => Some(bytes),
+            Err(e) => {
+                eprintln!("yodb serve: {}: {e}", path.display());
+                return ExitCode::from(2);
+            }
+        },
+        None => None,
+    };
+
     // Before the listener, because a file that cannot be made should not leave a
     // port bound behind it, and because failing here is a mistyped path and the
     // person who typed it is still watching.
@@ -376,6 +470,29 @@ fn serve_command(args: &[&str]) -> ExitCode {
     }
     if let Some(opened) = opened {
         server.use_store(opened);
+    }
+
+    // Last of the startup steps, because it is the only one that can take a while
+    // and because everything above changes how the keyspace behaves. A limit set
+    // after the dataset was built would be a limit the dataset has already gone
+    // past without anything noticing.
+    if let Some(image) = &image {
+        let path = from_rdb.as_ref().expect("an image came from a path");
+        match server.restore(image) {
+            Ok(done) => {
+                let total = done.total();
+                println!(
+                    "yodb {} restored {total} key{} from {}",
+                    env!("CARGO_PKG_VERSION"),
+                    plural(total),
+                    path.display()
+                );
+            }
+            Err(refused) => {
+                eprintln!("yodb serve: {}: {refused}", path.display());
+                return ExitCode::FAILURE;
+            }
+        }
     }
 
     // What it actually bound to, which is the only way to find out when the
