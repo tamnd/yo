@@ -154,6 +154,7 @@ pub mod list;
 pub mod listpack;
 pub mod lists;
 pub mod lookups;
+mod lzf;
 pub mod news;
 pub mod orderkey;
 pub mod parts;

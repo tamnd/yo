@@ -140,10 +140,15 @@
 //! # Compression
 //!
 //! Redis compresses strings over twenty bytes with LZF when `rdbcompression` is
-//! on, which it is by default. Nothing here compresses on the way out, because
-//! an uncompressed string is legal and every reader accepts it. Decompression on
-//! the way in is not optional, because payloads arriving from a real Redis are
-//! full of LZF strings.
+//! on, which it is by default, and so does this. It is not a saving that could
+//! be skipped: LZF is not a canonical format, so a payload that is compressed
+//! differently is a payload with different bytes in it, and `DUMP` matching
+//! Redis byte for byte is a thing this project claims. [`crate::lzf`] says how
+//! that is kept. There is no `rdbcompression` setting here to turn it off, which
+//! is one of the hundreds of settings D-14 covers and is not a knob worth adding
+//! on its own: turning it off would save a little processor time and cost the
+//! byte for byte match, which is the wrong trade in a payload that is about to
+//! go over a network.
 
 use std::borrow::Cow;
 use std::sync::atomic::AtomicBool;
@@ -157,6 +162,7 @@ use crate::intset::Intset;
 use crate::keys::{Body, Record};
 use crate::list::{self, List};
 use crate::listpack::{Entry, Listpack};
+use crate::lzf;
 use crate::set::{self, Set};
 use crate::stream::{Group, Id, Stream};
 use crate::zset::{self, Zset};
@@ -571,16 +577,31 @@ pub(crate) fn put_len(out: &mut Vec<u8>, n: u64) {
     }
 }
 
-/// A string, integer encoded when that is both possible and shorter.
+/// A string, integer encoded or compressed when either is both possible and
+/// shorter, and plain when neither is.
+///
+/// The order is Redis's and the two bounds are Redis's. The integer encoding is
+/// only tried on a string short enough to be one, which saves parsing every long
+/// value that happens to start with a digit. Compression is only tried past
+/// twenty bytes, on the grounds that nothing shorter compresses, and a run of
+/// twenty identical bytes is the case that proves the grounds: it does compress,
+/// by one byte, which is less than the header costs.
 pub(crate) fn put_str(out: &mut Vec<u8>, s: &[u8]) {
-    // Redis only tries the integer encoding on strings short enough to be one,
-    // which saves parsing every long value that starts with a digit.
     if s.len() <= 11
         && let Some(n) = num::parse_i64(s)
         && let mut buf = [0u8; DIGITS_MAX]
         && num::i64_digits(&mut buf, n) == s
         && put_int(out, n)
     {
+        return;
+    }
+    if s.len() > 20
+        && let Some(packed) = lzf::pack(s)
+    {
+        out.push((LEN_ENCODED << 6) | ENC_LZF as u8);
+        put_len(out, packed.len() as u64);
+        put_len(out, s.len() as u64);
+        out.extend_from_slice(&packed);
         return;
     }
     put_len(out, s.len() as u64);
@@ -793,7 +814,7 @@ impl<'a> Reader<'a> {
                 let packed = self.len()?;
                 let plain = self.len()?;
                 let bytes = self.take(packed)?;
-                return unpack(bytes, plain).map(Cow::Owned).ok_or(Bad::Format);
+                return lzf::unpack(bytes, plain).map(Cow::Owned).ok_or(Bad::Format);
             }
             _ => return Err(Bad::Format),
         };
@@ -827,51 +848,6 @@ impl<'a> Reader<'a> {
     const fn done(&self) -> bool {
         self.at == self.buf.len()
     }
-}
-
-/// LZF, the one compression Redis puts in an RDB payload.
-///
-/// A control byte either introduces a run of literals or points backwards into
-/// what has already been written. The back reference is allowed to overlap what
-/// it is producing, which is how a long run of one byte compresses, so the copy
-/// has to go one byte at a time rather than through a slice copy.
-///
-/// `plain` is the length the payload claims the result will be, and it is used
-/// as the bound rather than trusted, so a payload claiming four bytes and
-/// describing four gigabytes stops at four.
-fn unpack(packed: &[u8], plain: usize) -> Option<Vec<u8>> {
-    let mut out = Vec::with_capacity(plain.min(1 << 20));
-    let mut i = 0;
-    while i < packed.len() {
-        let ctrl = usize::from(packed[i]);
-        i += 1;
-        if ctrl < 32 {
-            let run = ctrl + 1;
-            let end = i.checked_add(run)?;
-            if end > packed.len() || out.len() + run > plain {
-                return None;
-            }
-            out.extend_from_slice(&packed[i..end]);
-            i = end;
-        } else {
-            let mut run = ctrl >> 5;
-            if run == 7 {
-                run += usize::from(*packed.get(i)?);
-                i += 1;
-            }
-            let back = ((ctrl & 0x1f) << 8) + usize::from(*packed.get(i)?) + 1;
-            i += 1;
-            let run = run + 2;
-            if back > out.len() || out.len() + run > plain {
-                return None;
-            }
-            let from = out.len() - back;
-            for at in from..from + run {
-                out.push(out[at]);
-            }
-        }
-    }
-    (out.len() == plain).then_some(out)
 }
 
 /// Turn a payload back into a value.
@@ -1904,33 +1880,6 @@ mod tests {
         put_str(&mut body, b"a");
         put_str(&mut body, b"b");
         assert!(load(&seal(body), all, 0).is_ok());
-    }
-
-    #[test]
-    fn lzf_unpacks_a_literal_run() {
-        // One control byte saying four literals, then the four.
-        assert_eq!(
-            unpack(&[3, b'a', b'b', b'c', b'd'], 4).as_deref(),
-            Some(&b"abcd"[..])
-        );
-    }
-
-    /// The case the byte at a time copy exists for: a back reference that reads
-    /// bytes it is in the middle of writing.
-    #[test]
-    fn lzf_unpacks_an_overlapping_reference() {
-        // One literal `a`, then a reference one byte back for five bytes. The
-        // low five bits of the control byte and the byte after it are the
-        // distance, and they are both zero because a distance is stored one
-        // less than it is.
-        let packed = [0u8, b'a', 3 << 5, 0];
-        assert_eq!(unpack(&packed, 6).as_deref(), Some(&b"aaaaaa"[..]));
-    }
-
-    #[test]
-    fn lzf_refuses_a_reference_to_nothing() {
-        assert_eq!(unpack(&[(3 << 5), 0], 5), None);
-        assert_eq!(unpack(&[3, b'a'], 4), None);
     }
 
     #[test]
