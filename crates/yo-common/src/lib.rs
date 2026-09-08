@@ -21,6 +21,7 @@ pub mod num;
 pub mod prefetch;
 pub mod re;
 pub mod rng;
+pub mod sha1;
 pub mod small;
 pub(crate) mod sync;
 pub mod wyhash;

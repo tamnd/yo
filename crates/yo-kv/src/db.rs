@@ -26,6 +26,7 @@ use yo_common::Small;
 use yo_common::lock::{Held, Lock};
 use yo_index::Cursor as KeyCursor;
 
+use crate::digest::{self, Digest};
 use crate::value::Kind;
 use crate::{Clock, Keyspace};
 
@@ -365,6 +366,46 @@ impl Db {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         (0..self.stripes.len()).all(|i| self.stripes[i].lock().is_empty())
+    }
+
+    /// Fold every key in the database into `into`, name and value both.
+    ///
+    /// The per key part of `DEBUG DIGEST`. Each key is digested on its own,
+    /// starting from its name, and the twenty bytes that come out are exclusive
+    /// ored in, so the order the keys arrive in does not change the answer.
+    /// That is what lets this be one stripe at a time, and it is also what lets
+    /// a server with four stripes agree with a server with sixty four.
+    ///
+    /// Not a consistent view of the whole database. Each stripe is held while
+    /// it is walked and let go afterwards, so a write to a stripe that is
+    /// already done lands in nothing. Redis has the same hole for the same
+    /// reason it does not matter: this is compared between two servers that
+    /// have both stopped changing, and a digest taken while writes are going is
+    /// a number about no particular moment on any server.
+    pub fn digest(&self, into: &mut Digest) {
+        let mut names = Vec::new();
+        let mut bounds: Vec<(usize, usize)> = Vec::new();
+        for i in 0..self.stripes.len() {
+            let mut held = self.hold_stripe(i);
+            names.clear();
+            bounds.clear();
+            // The names first and the digests after, because the walk borrows
+            // the stripe and digesting a value wants it the other way. They are
+            // key names, so the copy is a few bytes each.
+            held.keys(|key| {
+                let from = names.len();
+                names.extend_from_slice(key);
+                bounds.push((from, names.len()));
+            });
+            for &(from, to) in &bounds {
+                let key = &names[from..to];
+                let mut one = digest::EMPTY;
+                digest::mix(&mut one, key);
+                if held.digest_value(key, &mut one) {
+                    digest::xor(into, &one);
+                }
+            }
+        }
     }
 
     /// How many of the keys have a deadline on them.

@@ -132,6 +132,7 @@ pub mod cond;
 pub mod counter;
 pub mod db;
 pub mod demote;
+pub mod digest;
 pub mod elem;
 pub mod evict;
 pub mod expiry;

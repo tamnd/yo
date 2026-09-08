@@ -32,6 +32,7 @@ use crate::Clock;
 use crate::access::{Access, Lfu, Policy};
 use crate::array::Array;
 use crate::cold::Store;
+use crate::digest;
 use crate::evict;
 use crate::foreign::Foreign;
 use crate::hash::{self, Hash};
@@ -1138,6 +1139,95 @@ impl Keyspace {
     pub fn value_address(&mut self, key: &[u8]) -> Option<usize> {
         self.reap(key);
         Some(self.map.get(key)?.as_ptr() as usize)
+    }
+
+    /// Fold what is under `key` into `into`, deadline included, and say whether
+    /// there was anything there.
+    ///
+    /// `DEBUG DIGEST-VALUE` starts this from nothing and `DEBUG DIGEST` starts
+    /// it from the digest of the key name, which is why the seed is a parameter
+    /// rather than something this decides. It cannot be split into a name part
+    /// and a value part and combined afterwards, because mixing is sequential:
+    /// what the type number does to the accumulator depends on what the name
+    /// already did to it. `into` is left alone when the key is not there.
+    ///
+    /// This does not count as a use of the key, the same as every other command
+    /// that asks about a key rather than reading it. A test that digests the
+    /// whole dataset between every step would otherwise rewrite the working set
+    /// on its way past and change the thing it was measuring.
+    ///
+    /// A value that was written out to the file is read back first, which is
+    /// what `DUMP` does and is unavoidable: there is no way to hash bytes that
+    /// are not here. A chain that will not read back answers as a key that is
+    /// not there, the same as it does for an export.
+    pub fn digest_value(&mut self, key: &[u8], into: &mut digest::Digest) -> bool {
+        let Some(addr) = self.live_rec_untouched(key) else {
+            return false;
+        };
+        let rec = self.map.value_at(addr);
+        let away = value::cold(rec).is_some() || value::Meta::from_byte(rec[0]).is_cold();
+        if away && self.warm(key).is_err() {
+            return false;
+        }
+        let Some(addr) = self.map.find(key) else {
+            return false;
+        };
+        let rec = self.map.value_at(addr);
+        // The slot is read inside the arms and not before them, for the reason
+        // [`Keyspace::export`] gives.
+        let found = match value::kind(rec) {
+            Kind::String => {
+                match self.value_of(key, rec) {
+                    Str::Bytes(b) => digest::string(into, b),
+                    Str::Int(n) => {
+                        let mut buf = [0u8; yo_common::num::DIGITS_MAX];
+                        digest::string(into, yo_common::num::i64_digits(&mut buf, n));
+                    }
+                }
+                true
+            }
+            Kind::Set => self
+                .sets
+                .get(value::slot(rec))
+                .map(|v| digest::set(into, v))
+                .is_some(),
+            Kind::Hash => self
+                .hashes
+                .get(value::slot(rec))
+                .map(|v| digest::hash(into, v))
+                .is_some(),
+            Kind::List => self
+                .lists
+                .get(value::slot(rec))
+                .map(|v| digest::list(into, v))
+                .is_some(),
+            Kind::Zset => self
+                .zsets
+                .get(value::slot(rec))
+                .map(|v| digest::zset(into, v))
+                .is_some(),
+            Kind::Array => self
+                .arrays
+                .get(value::slot(rec))
+                .map(|v| digest::array(into, v))
+                .is_some(),
+            Kind::Stream => self
+                .streams
+                .get(value::slot(rec))
+                .map(|v| digest::stream(into, v))
+                .is_some(),
+            Kind::Foreign => {
+                digest::foreign(into);
+                true
+            }
+        };
+        if !found {
+            return false;
+        }
+        if value::expire_at(rec).is_some() {
+            digest::xor(into, digest::EXPIRE);
+        }
+        true
     }
 
     /// Put a deadline on `key`, or take one off. Answers whether it was there.

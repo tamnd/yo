@@ -69,7 +69,6 @@ mod cjson;
 mod cmsgpack;
 mod convert;
 pub(in crate::dispatch) mod library;
-mod sha1;
 mod r#struct;
 
 use super::{Server, Session};
@@ -103,7 +102,7 @@ pub(in crate::dispatch) struct Scripts {
 impl Scripts {
     /// Remember a body and answer the name it is now under.
     pub(in crate::dispatch) fn add(&mut self, body: &[u8]) -> [u8; 40] {
-        let sha = sha1::hex(body);
+        let sha = yo_common::sha1::hex(body);
         self.held.entry(sha).or_insert_with(|| body.into());
         sha
     }
@@ -212,7 +211,7 @@ pub(in crate::dispatch) fn compiles(body: &[u8]) -> Result<(), String> {
 /// The digest of a library's code, which is how one thread's copy is told apart
 /// from another's.
 pub(in crate::dispatch) fn fingerprint(code: &[u8]) -> [u8; 40] {
-    sha1::hex(code)
+    yo_common::sha1::hex(code)
 }
 
 /// Which library and which function inside it an `FCALL` is about.

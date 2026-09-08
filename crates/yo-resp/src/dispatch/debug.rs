@@ -46,6 +46,13 @@
 //! command surface answers about the value rather than about the way it is
 //! written down.
 //!
+//! `DIGEST` and `DIGEST-VALUE` only look as well, and they are the pair the
+//! suite leans on hardest. One number for a whole server, another for one value,
+//! and the whole worth of both is that another server computes them the same
+//! way, so the recipe in [`yo_kv::digest`] is copied to the byte. Everything the
+//! suite checks after a reload, a replica catching up or a rewrite comes down to
+//! holding two of these next to each other.
+//!
 //! # How the errors work
 //!
 //! Every complaint in this file is the same sentence, `unknown subcommand or
@@ -66,7 +73,7 @@ use std::sync::atomic::Ordering::Relaxed;
 
 use yo_common::num::parse_i64;
 use yo_common::{Code, Error, Result};
-use yo_kv::{SetOptions, lookups};
+use yo_kv::{SetOptions, digest, lookups};
 
 use super::args::{self, Args, is};
 use super::{Server, Session, persist};
@@ -195,6 +202,10 @@ pub(super) fn execute(
         return packing(server, session, args.get(2), Packing::Listpack, out);
     } else if is(sub, b"QUICKLIST") && (3..=4).contains(&args.len()) {
         return packing(server, session, args.get(2), Packing::Quicklist, out);
+    } else if is(sub, b"DIGEST") && args.len() == 2 {
+        whole_digest(server, out);
+    } else if is(sub, b"DIGEST-VALUE") {
+        value_digests(server, session, args, out);
     } else {
         return Err(args::subcommand_syntax(sub, "DEBUG"));
     }
@@ -632,6 +643,65 @@ fn packing(
     Ok(())
 }
 
+/// `DEBUG DIGEST`, the forty characters that stand for everything in the server.
+///
+/// This is the check the Redis suite runs after nearly every interesting thing
+/// it does. Load a file and digest, promote a replica and digest, rewrite the
+/// log and digest, and the assertion is that the number did not move. It is the
+/// only affordable way to say two servers hold the same million keys, and it
+/// only works because both of them compute it the same way, which is why
+/// [`yo_kv::digest`] copies the recipe rather than choosing a better hash.
+///
+/// Every database in order, the empty ones passed over, the number of each one
+/// folded in before its keys. Inside a database the keys are order free, which
+/// is what lets this walk the stripes one at a time and what lets a server with
+/// four stripes agree with a server with sixty four.
+///
+/// Reading a key here is not using it. A suite that digests between every step
+/// would otherwise be rewriting the working set it is testing, so the whole walk
+/// runs with the lookup counters held quiet. `DEBUG DIGEST-VALUE` does count,
+/// because a real server counts there and not here.
+fn whole_digest(server: &Server, out: &mut Out) {
+    let _quiet = lookups::quiet();
+    let mut whole = digest::EMPTY;
+    for (i, db) in server.dbs.iter().enumerate() {
+        // An empty database is passed over entirely rather than folded in as an
+        // empty one, so a server with one key in database nine answers the same
+        // as a server with sixteen databases and the same one key.
+        if db.is_empty() {
+            continue;
+        }
+        digest::number(&mut whole, i as u32);
+        db.digest(&mut whole);
+    }
+    out.simple(&digest::hex(&whole));
+}
+
+/// `DEBUG DIGEST-VALUE <key> [<key> ...]`, the same thing for one value at a
+/// time.
+///
+/// One simple string per key, in the order they were asked for. The key name is
+/// not folded in, which is what makes this the digest of a value rather than of
+/// an entry: the same list under two names answers the same forty characters,
+/// and that is the point, since the usual use is checking that a key survived a
+/// rename or arrived on a replica under a different name.
+///
+/// A key that is not there is forty zeros rather than an error, so a client can
+/// ask about several keys without having to know first which of them exist.
+/// That also means a key holding nothing and a key holding a value that happens
+/// to digest to zero are told apart by `EXISTS` and not by this, which is a
+/// theoretical complaint about a hash nobody is going to hit.
+fn value_digests(server: &Server, session: &Session, args: Args<'_>, out: &mut Out) {
+    out.array(args.len() - 2);
+    for i in 2..args.len() {
+        let key = args.get(i);
+        let mut one = digest::EMPTY;
+        // Left at nothing when the key is not there, which is the forty zeros.
+        server.dbs[session.db].hold(key).digest_value(key, &mut one);
+        out.simple(&digest::hex(&one));
+    }
+}
+
 /// `DEBUG POPULATE <count> [<prefix> [<size>]]`.
 ///
 /// Keys are `<prefix>:<n>` counting from nought, with `key` as the prefix if
@@ -806,6 +876,10 @@ const HELP: &[&str] = &[
     "DICT-RESIZING <0|1>",
     "    Enable or disable the background reclaim of room the store no longer",
     "    needs.",
+    "DIGEST",
+    "    Output a hex signature representing the current DB content.",
+    "DIGEST-VALUE <key> [<key> ...]",
+    "    Output a hex signature of the values of all the specified keys.",
     "ERROR <string>",
     "    Return a Redis protocol error with <string> as message. Useful for",
     "    clients unit tests to simulate Redis errors.",
