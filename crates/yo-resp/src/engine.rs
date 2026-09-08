@@ -286,8 +286,14 @@ impl<S: Sink> Wire<S> {
         self.server.counted().opened();
         let at = self.front.open(self.server.next_client());
         let now = self.server.now_ms();
+        // Whether this connection has to say a password before it says anything
+        // else, decided here and not on the first command, which is what leaves
+        // the connections that are already open alone when a password is set
+        // under them. See the `auth` module.
+        let guarded = self.server.guarded();
         let row = if let Some(session) = self.front.session_mut(at) {
             session.opened(now);
+            session.admit(!guarded);
             Some(session.row().clone())
         } else {
             None

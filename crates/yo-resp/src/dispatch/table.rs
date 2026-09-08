@@ -5686,6 +5686,31 @@ pub static COMMANDS: &[Spec] = &[
         summary: "Send a string back unchanged.",
         group: "connection",
     },
+    // `no_auth` is the flag that lets a command through before the connection
+    // has a password accepted, and four commands carry it: this one, `HELLO`,
+    // which carries the option that authenticates, `RESET`, which is how a
+    // client says it is starting over, and `QUIT`. Everything else on the server
+    // is refused until one of them has done its work.
+    Spec {
+        name: "auth",
+        arity: -2,
+        flags: &[
+            "noscript",
+            "loading",
+            "stale",
+            "fast",
+            "no_auth",
+            "allow_busy",
+        ],
+        first_key: 0,
+        last_key: 0,
+        step: 0,
+        acl: AC_CONN,
+        since: "1.0.0",
+        complexity: "O(1)",
+        summary: "Hand over the password this connection is asked for.",
+        group: "connection",
+    },
     Spec {
         name: "hello",
         arity: -1,

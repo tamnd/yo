@@ -111,8 +111,8 @@ spec = "12 section 9"
 
 [[divergence]]
 id = "D-14"
-title = "CONFIG reports nine settings and refuses a change to any of them"
-reason = "A real server carries hundreds of settings and lets a client change most of them at runtime. Nine of them mean something here, and none of them can move yet, so CONFIG GET answers about those nine and CONFIG SET accepts a write that changes nothing and refuses one that does not. The refusal uses the same sentence a real server uses for a setting that really is immutable. Accepting a change nothing acts on would be worse: a client that sets maxmemory and gets an OK has been told it has a limit."
+title = "CONFIG reports twenty six settings where a real server has hundreds"
+reason = "A real server carries hundreds of settings and lets a client change most of them at runtime. Twenty six of them mean something here and CONFIG GET answers about those. Sixteen of the twenty six really move: the ten size ladder names over their eight knobs, maxmemory, maxstore, maxmemory-policy, notify-keyspace-events, backup-sealed-ttl and requirepass, and each of those changes something a client can then read back. Eight of them are fixed for the life of the process, so a write that sets one to what it already is says OK and a write that changes it is refused with the sentence a real server uses for a setting that really is immutable. Accepting a change nothing acts on would be worse: a client that sets a limit and gets an OK has been told it has a limit. The last two are dir and dbfilename, which are refused outright as protected config whatever the value is, including the value they already hold, because that is what the reference does with them."
 status = "until"
 resolved_by = "M5"
 spec = "12 section 9"
@@ -900,3 +900,11 @@ title = "BGREWRITEAOF answers the sentence and rewrites nothing"
 reason = "There is no append only file here. appendonly reads no, it is an immutable setting and it cannot be set to yes, so a client that looks before it asks already knows there is nothing to rewrite. The command is here because tooling calls it blind on the way to something else, and refusing it would break a script that has no way to act on the refusal. So it answers Background append only file rewriting started, adds one to aof_rewrites and does nothing, and a client that polls aof_rewrite_in_progress afterwards reads the zero it is waiting for. The one thing that could mislead somebody is aof_rewrites counting rewrites that did not happen, and it counts requests rather than files for exactly that reason: the number says how many times the command was called, which is true, and aof_enabled next to it says there was nothing to write. Durability here belongs to the file the keyspace sits on and is already on disk before a command returns, which is what makes an append only file a second copy rather than the copy, and that is why there is not one."
 status = "permanent"
 spec = "07 section 5"
+
+[[divergence]]
+id = "D-127"
+title = "The password is kept as it was typed rather than as a hash of itself"
+reason = "A real server keeps a SHA-256 of the password and never the password, and ACL SETUSER takes a hash directly with a hash sigil so that a configuration file can carry one without carrying the secret. There is no ACL here yet and no configuration file rewrite, so the two places a hash would be read back do not exist, and what is kept is the bytes CONFIG SET requirepass or the --requirepass flag was given. What that costs is the thing it sounds like: a core dump or a debugger on a running process has the password in it in the clear, where a real server would only have the hash. What it does not cost is anything on the wire, because CONFIG GET requirepass answers the password in the clear on a real server too. The compare is already written to run in time that does not depend on how much of a guess was right, so the timing half of the reason for hashing is paid for. This goes in when the ACL lands, because the hash has to be the thing ACL GETUSER answers and building it before there is anything to answer would mean building it twice."
+status = "until"
+resolved_by = "M8"
+spec = "12 section 3"
