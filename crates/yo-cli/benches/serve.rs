@@ -14,13 +14,22 @@
 //!
 //! # Reading it
 //!
-//! The column that matters is the last one, which is throughput at N threads
-//! over throughput at one. A server that scales gets a number near N and a
-//! server that does not gets a number near one, and no amount of absolute
-//! throughput makes up for the second one. The first published sweep has yo
-//! going from 1890 to 2980 Kops between one thread and eight where Pogocache
-//! goes from 1696 to 13244, which is 1.6 against 7.8, and that ratio is the
-//! whole problem this bench exists to shorten the loop on.
+//! The column that matters is `vs 1`, which is throughput at N threads over
+//! throughput at one. A server that scales gets a number near N and a server
+//! that does not gets a number near one, and no amount of absolute throughput
+//! makes up for the second one. The first published sweep has yo going from
+//! 1890 to 2980 Kops between one thread and eight where Pogocache goes from
+//! 1696 to 13244, which is 1.6 against 7.8, and that ratio is the whole problem
+//! this bench exists to shorten the loop on.
+//!
+//! The column to read before that one is `cv`. Every cell is measured three
+//! times and what is reported is the median of the three and how far apart they
+//! were, because the first thing a bench has to be able to say is that the
+//! machine it is on cannot answer. A laptop with a virtual machine and two
+//! builds running answered 36 Kops one run and 133 the next for the same
+//! server. A cell above 0.05 is marked noisy and there is a line at the end
+//! saying how many were, and a run with any of those in it is a run to throw
+//! away rather than a run to read carefully.
 //!
 //! Absolute throughput here is not comparable with anything from the harness.
 //! The clients are on the same machine and are not pinned away from the server,
@@ -35,6 +44,7 @@
 //! cargo bench -p yo-cli --bench serve
 //! YO_BENCH_THREADS=1,2,4,8 YO_BENCH_PIPELINE=1,50 cargo bench -p yo-cli --bench serve
 //! YO_BENCH_CLIENTS=2 YO_BENCH_CONNS=8 cargo bench -p yo-cli --bench serve
+//! YO_BENCH_REPEATS=7 cargo bench -p yo-cli --bench serve
 //! ```
 //!
 //! `YO_BENCH_SMOKE` cuts it to one short cell, which is what CI runs to find
@@ -133,38 +143,101 @@ mod unix {
     /// over, and few enough that filling them is a second rather than a minute.
     const KEYS: usize = 100_000;
 
+    /// How many times a cell is measured before one of its numbers is reported.
+    ///
+    /// Three, which is the fewest that gives a median and a spread. The median
+    /// is what gets reported and the spread is what says whether reporting it
+    /// means anything.
+    const REPEATS: usize = 3;
+
+    /// The coefficient of variation above which a cell is not worth quoting.
+    ///
+    /// A ten core laptop with a virtual machine and two builds on it answered
+    /// 36 Kops one run and 133 the next for the same server, so the first thing
+    /// this has to be able to say is that the box it is on cannot answer. Five
+    /// percent is well inside what a quiet machine does and well outside what a
+    /// busy one does, and the published sweeps use the same figure as their
+    /// exit condition.
+    const NOISY: f64 = 0.05;
+
     pub fn main() {
         let smoke = std::env::var_os("YO_BENCH_SMOKE").is_some();
         let threads = counts("YO_BENCH_THREADS", if smoke { &[1] } else { THREADS });
         let pipelines = counts("YO_BENCH_PIPELINE", if smoke { &[50] } else { PIPELINE });
         let clients = one("YO_BENCH_CLIENTS", CLIENT_THREADS);
         let conns = one("YO_BENCH_CONNS", CONNS_PER_CLIENT);
+        let repeats = one("YO_BENCH_REPEATS", if smoke { 1 } else { REPEATS });
         let (warmup, measure) = if smoke {
             (Duration::from_millis(100), Duration::from_millis(400))
         } else {
             (WARMUP, MEASURE)
         };
 
+        let mut noisy = 0;
         for pipeline in pipelines {
             println!("\npipeline {pipeline}, {clients} client threads of {conns} connections");
-            println!("{:>8}  {:>12}  {:>8}", "threads", "Kops/sec", "vs 1");
+            println!(
+                "{:>8}  {:>12}  {:>8}  {:>6}",
+                "threads", "Kops/sec", "vs 1", "cv"
+            );
             let mut first = 0.0_f64;
             for (at, &count) in threads.iter().enumerate() {
-                let rate = cell(&Cell {
-                    threads: count,
-                    pipeline,
-                    clients,
-                    conns,
-                    warmup,
-                    measure,
-                });
+                let mut rates = Vec::with_capacity(repeats);
+                for _ in 0..repeats {
+                    rates.push(cell(&Cell {
+                        threads: count,
+                        pipeline,
+                        clients,
+                        conns,
+                        warmup,
+                        measure,
+                    }));
+                }
+                let (rate, cv) = middle(&mut rates);
                 if at == 0 {
                     first = rate;
                 }
                 let ratio = if first > 0.0 { rate / first } else { 0.0 };
-                println!("{count:>8}  {:>12.0}  {ratio:>7.2}x", rate / 1000.0);
+                let flag = if cv > NOISY {
+                    noisy += 1;
+                    " noisy"
+                } else {
+                    ""
+                };
+                println!(
+                    "{count:>8}  {:>12.0}  {ratio:>7.2}x  {cv:>6.2}{flag}",
+                    rate / 1000.0
+                );
             }
         }
+        if noisy > 0 {
+            println!(
+                "\n{noisy} cells came out above a coefficient of variation of {NOISY:.2}, so this \
+                 machine is not quiet enough to be measuring anything. Nothing here is worth \
+                 quoting until it runs clean."
+            );
+        }
+    }
+
+    /// The median of a cell's runs, and how far apart they were.
+    ///
+    /// The median rather than the mean, because a run that lost the machine to
+    /// something else is an outlier rather than evidence, and the whole point of
+    /// the spread beside it is that it is reported instead of being averaged
+    /// away. The spread is the coefficient of variation, which is what the
+    /// published sweeps report per cell and what the exit condition on the
+    /// milestone is written in.
+    fn middle(rates: &mut [f64]) -> (f64, f64) {
+        rates.sort_by(f64::total_cmp);
+        let median = rates[rates.len() / 2];
+        if rates.len() < 2 {
+            return (median, 0.0);
+        }
+        let mean = rates.iter().sum::<f64>() / rates.len() as f64;
+        let spread = rates.iter().map(|r| (r - mean) * (r - mean)).sum::<f64>();
+        let sd = (spread / (rates.len() - 1) as f64).sqrt();
+        let cv = if mean > 0.0 { sd / mean } else { 0.0 };
+        (median, cv)
     }
 
     /// One cell of the sweep: a server at one thread count, driven one way.
