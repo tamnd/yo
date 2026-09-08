@@ -58,7 +58,6 @@ use std::sync::atomic::Ordering::Relaxed;
 use yo_common::num::parse_i64;
 use yo_common::{Code, Error, Result};
 use yo_kv::SetOptions;
-use yo_kv::restore::{Item, Load};
 
 use super::args::{self, Args, is};
 use super::{Server, Session, persist};
@@ -337,11 +336,16 @@ fn reload(server: &Server, args: Args<'_>, out: &mut Out) -> Result<()> {
 
 /// Read `dump.rdb` back over the keyspace, and say whether all of it landed.
 ///
-/// The flush happens after the file has been opened and before the first key is
-/// read out of it, which is the order that matters: a file whose header or
-/// checksum is wrong is refused while the dataset is still there, and a file
-/// that goes wrong halfway leaves a half loaded database, which is what a real
-/// server does too.
+/// The walk itself is [`Server::load_image`], which is shared with the restore
+/// the tool does at startup. What is here is the two things that are this
+/// command's own: the file it reads is always the one `SAVE` writes, and a
+/// reason it could not is a line in the log rather than a sentence to a client,
+/// for the reason [`LOAD_FAILED`] gives.
+///
+/// The libraries the file carries are counted and dropped rather than loaded.
+/// They are already here, because the flush above takes the databases and not
+/// the function registry, and loading a library that is already registered is an
+/// error rather than a no op.
 fn load_file(server: &Server, flush: bool) -> bool {
     let path = server.dir().join(persist::FILE);
     let image = match std::fs::read(&path) {
@@ -351,47 +355,13 @@ fn load_file(server: &Server, flush: bool) -> bool {
             return false;
         }
     };
-    // Any stripe of any database carries the same four thresholds, and they are
-    // copied out rather than borrowed because the keyspace they came off is
-    // about to be written into.
-    let bands = server.dbs[0].hold_stripe(0).bands();
-    let load = match Load::open(&image, bands.limits(), server.clock.now_ms()) {
-        Ok(load) => load,
-        Err(fault) => {
-            eprintln!("yodb: DEBUG RELOAD: {fault}");
-            return false;
-        }
-    };
-    if flush {
-        // The databases and not the indexes. An index is a schema and its own
-        // copy of what it has read, and every key it was following is about to
-        // come back under the same name with the same value, so dropping it
-        // would mean rebuilding it against a keyspace that already agrees with
-        // it. This is the one thing `FLUSHALL` does that a reload must not.
-        for db in &server.dbs {
-            db.clear();
+    match server.load_image(&image, flush) {
+        Ok(_) => true,
+        Err(refused) => {
+            eprintln!("yodb: DEBUG RELOAD: {refused}");
+            false
         }
     }
-    for item in load {
-        match item {
-            Ok(Item::Key { db, key, record }) => {
-                let Some(into) = server.dbs.get(db) else {
-                    eprintln!("yodb: DEBUG RELOAD: the file has a key in database {db}");
-                    return false;
-                };
-                into.hold(&key).import(&key, record);
-            }
-            // The aux fields are the writer talking about itself. The libraries
-            // are already here, because nothing above flushed them, and loading
-            // one twice is an error rather than a no op.
-            Ok(Item::Aux { .. } | Item::Library(_)) => {}
-            Err(fault) => {
-                eprintln!("yodb: DEBUG RELOAD: {fault}");
-                return false;
-            }
-        }
-    }
-    true
 }
 
 /// `DEBUG POPULATE <count> [<prefix> [<size>]]`.

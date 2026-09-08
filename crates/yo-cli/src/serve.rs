@@ -59,6 +59,7 @@ use std::os::unix::net::{UnixListener, UnixStream};
 
 use yo_reactor::Reactor;
 use yo_resp::dispatch::Server as Shared;
+use yo_resp::dispatch::{Loaded, Refused};
 use yo_resp::engine::{Cmd, ConnId, Sink, Wire, pump};
 
 use crate::poll::Poller;
@@ -531,6 +532,29 @@ impl Server {
     /// it and pays nothing for having been offered one.
     pub fn use_store(&mut self, store: Store) {
         self.setup().set_store_source(store.source());
+    }
+
+    /// Build the dataset out of a Redis RDB image before anybody connects.
+    ///
+    /// The doors are already bound at this point, because the keyspace being
+    /// filled lives behind them, but nothing has been accepted: a client that
+    /// connects while this is running is sitting in the backlog and gets a whole
+    /// dataset the moment [`Server::run`] starts. So there is no window in which
+    /// a connection can read half a file.
+    ///
+    /// The flush is asked for and there is nothing to flush, since this runs on a
+    /// server that has served nothing. It is passed anyway rather than left to
+    /// chance, because what this means is "the dataset is the file" and that is
+    /// the same sentence whether or not there was something in the way.
+    ///
+    /// # Errors
+    ///
+    /// [`Refused`] for a file that will not parse or that wants a database this
+    /// server has not got. The caller ends the process, because a server that
+    /// came up holding half of the file it was pointed at is worse than one that
+    /// did not come up.
+    pub fn restore(&self, image: &[u8]) -> Result<Loaded, Refused> {
+        yo_alloc::allow(|| self.shared.load_image(image, true))
     }
 
     /// Where it actually landed, which is the only way to find out when the

@@ -73,6 +73,7 @@ mod indexing;
 mod json;
 mod keyspace;
 mod lists;
+mod load;
 mod lua;
 mod migrate;
 mod misses;
@@ -100,6 +101,7 @@ mod zsets;
 pub use args::Args;
 pub use blocking::{Parked, Waiters};
 pub use clients::Client;
+pub use load::{Loaded, Refused};
 pub(crate) use pubsub::Envelope;
 pub use server::parse_memory;
 pub use table::{COMMANDS, Spec, arity_ok, lookup};
@@ -9069,6 +9071,124 @@ mod tests {
 
         assert_eq!(s.run(&[b"EXISTS", b"gone"]), ":0\r\n");
         assert_eq!(s.run(&[b"GET", b"stays"]), "$1\r\nv\r\n");
+    }
+
+    /// The other caller of the same walk, which is `yodb serve --restore` and
+    /// `yodb restore`: a file one server wrote, read into a server that has never
+    /// seen it.
+    ///
+    /// The interesting half is that the second server is a different one. A
+    /// reload reads a file its own writer produced a moment ago into a keyspace
+    /// whose thresholds have not moved, and a restore does not, so this is the
+    /// shape the migration story actually has.
+    #[test]
+    fn a_file_one_server_wrote_loads_into_a_server_that_has_never_seen_it() {
+        let mut wrote = Saves::new("restore-across");
+        wrote.run(&[b"SET", b"s", b"hello"]);
+        wrote.run(&[b"RPUSH", b"l", b"a", b"b", b"c"]);
+        wrote.run(&[b"HSET", b"h", b"f", b"v"]);
+        wrote.run(&[b"ZADD", b"z", b"1.5", b"m"]);
+        wrote.run(&[b"SELECT", b"7"]);
+        wrote.run(&[b"SADD", b"far", b"x"]);
+        assert_eq!(wrote.run(&[b"SAVE"]), "+OK\r\n");
+
+        let mut fresh = Fixture::new();
+        let done = fresh
+            .server
+            .load_image(&wrote.image(), true)
+            .expect("the file one server wrote is a file another can read");
+        assert_eq!(done.keys[0], 4);
+        assert_eq!(done.keys[7], 1);
+        assert_eq!(done.total(), 5);
+        assert_eq!(done.expired, 0);
+
+        assert_eq!(fresh.run(&[b"GET", b"s"]), "$5\r\nhello\r\n");
+        assert_eq!(
+            fresh.run(&[b"LRANGE", b"l", b"0", b"-1"]),
+            "*3\r\n$1\r\na\r\n$1\r\nb\r\n$1\r\nc\r\n"
+        );
+        assert_eq!(fresh.run(&[b"HGET", b"h", b"f"]), "$1\r\nv\r\n");
+        assert_eq!(fresh.run(&[b"ZSCORE", b"z", b"m"]), "$3\r\n1.5\r\n");
+        fresh.run(&[b"SELECT", b"7"]);
+        assert_eq!(fresh.run(&[b"SMEMBERS", b"far"]), "*1\r\n$1\r\nx\r\n");
+    }
+
+    /// A load says how much of the file landed and how much of it was too old to
+    /// keep, and `INFO persistence` says the same two numbers afterwards.
+    #[test]
+    fn a_load_reports_what_it_kept_and_what_had_already_died() {
+        let mut wrote = Saves::new("restore-counts");
+        wrote.run(&[b"SET", b"gone", b"v"]);
+        wrote.run(&[b"SET", b"stays", b"v"]);
+        wrote.run(&[b"PEXPIREAT", b"gone", b"4102444800000"]);
+        assert_eq!(wrote.run(&[b"SAVE"]), "+OK\r\n");
+
+        let mut fresh = Saves::new("restore-counts-into");
+        fresh.f.server.set_clock_ms(4_102_444_800_001);
+        let done = fresh
+            .f
+            .server
+            .load_image(&wrote.image(), true)
+            .expect("a file with a dead key in it is still a good file");
+        assert_eq!(done.total(), 1);
+        assert_eq!(done.expired, 1);
+
+        assert_eq!(fresh.field("rdb_last_load_keys_loaded"), "1");
+        assert_eq!(fresh.field("rdb_last_load_keys_expired"), "1");
+        assert_eq!(fresh.run(&[b"EXISTS", b"gone"]), ":0\r\n");
+        assert_eq!(fresh.run(&[b"GET", b"stays"]), "$1\r\nv\r\n");
+    }
+
+    /// A server that has not loaded anything reports nought for both, which is
+    /// true rather than a placeholder.
+    #[test]
+    fn a_server_that_has_loaded_nothing_says_so() {
+        let mut s = Saves::new("restore-never");
+        assert_eq!(s.field("rdb_last_load_keys_loaded"), "0");
+        assert_eq!(s.field("rdb_last_load_keys_expired"), "0");
+    }
+
+    /// Bytes that are not an RDB at all leave the keyspace exactly as it was.
+    ///
+    /// The magic is checked before anything is thrown away, which is the whole
+    /// reason a restore is safe to point at the wrong file.
+    #[test]
+    fn a_file_that_is_not_an_rdb_is_refused_with_the_dataset_still_there() {
+        let mut f = Fixture::new();
+        f.run(&[b"SET", b"k", b"v"]);
+        let refused = f
+            .server
+            .load_image(b"this is not a Redis dump at all, not even close", true)
+            .expect_err("that is not an RDB");
+        assert_eq!(refused.to_string(), "the file does not start with REDIS");
+        assert_eq!(f.run(&[b"GET", b"k"]), "$1\r\nv\r\n");
+    }
+
+    /// A file whose last eight bytes do not add up is refused too, and for the
+    /// same reason it is safe: the checksum is over the whole file and is read
+    /// before the first key comes out.
+    #[test]
+    fn a_damaged_file_is_refused_with_the_dataset_still_there() {
+        let mut wrote = Saves::new("restore-damaged");
+        wrote.run(&[b"SET", b"a", b"b"]);
+        assert_eq!(wrote.run(&[b"SAVE"]), "+OK\r\n");
+        let mut image = wrote.image();
+        // One byte in the middle, so that the frame still parses and only the
+        // checksum knows. Flipping the footer would be a different test.
+        let middle = image.len() / 2;
+        image[middle] ^= 0xff;
+
+        let mut f = Fixture::new();
+        f.run(&[b"SET", b"k", b"v"]);
+        let refused = f
+            .server
+            .load_image(&image, true)
+            .expect_err("the checksum does not match");
+        assert_eq!(
+            refused.to_string(),
+            "the checksum does not match, so the file is damaged"
+        );
+        assert_eq!(f.run(&[b"GET", b"k"]), "$1\r\nv\r\n");
     }
 
     /// A fixture on a server with a password, on a connection that has not met
