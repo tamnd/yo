@@ -156,6 +156,31 @@ const _: () = assert!(DATABASES <= 64);
 /// the rest goes to the next command that runs.
 const EVICT_BUDGET: usize = 64;
 
+/// How many stripes one compaction turn looks at before it leaves the rest to
+/// the next turn.
+///
+/// The walk used to run from its cursor to the end of [`Server::slots`], which
+/// is [`DATABASES`] times the stripe width, and the width is derived from the
+/// thread count. It does not stop early on a server with nothing to collect,
+/// since nothing to collect is exactly the answer that does not end the walk, so
+/// an idle stripe still cost a lock taken and given back. Every worker paid that
+/// on every batch and the locks it took were the same stripe locks the commands
+/// wanted, which put the thread count into the price every thread pays. Measured
+/// on a ten core laptop at pipeline 50, one thread ran at 6417 Kops and four ran
+/// at 3283, and turning this walk off with `DEBUG DICT-RESIZING 0` took four
+/// threads to 4518.
+///
+/// Eight stripes is a bound with no thread count in it. The cursor moves on
+/// every turn rather than only when something was found, so a walk that stops
+/// after eight still comes round to the far end of the databases, and it comes
+/// round after the same number of turns however many threads are turning.
+///
+/// The active expiry walk is not bounded the same way. It is already gated to
+/// once a millisecond for the whole server rather than running once a batch per
+/// worker, and a bound there would mean a key with a deadline waiting several
+/// sweeps to be noticed rather than one.
+const COMPACT_LOOKS: usize = 8;
+
 /// The `maxstore` a server with no storage limit carries.
 ///
 /// Sixteen exabytes, which is every disk there is and then some, so a server
@@ -334,6 +359,18 @@ struct Local {
     /// forgetting a waiter all happen on the thread that read the command, so
     /// the load and the store either side of a change cannot lose one.
     parked: AtomicUsize,
+    /// The millisecond this thread last took every thread's marks.
+    ///
+    /// One per thread rather than one for the server, which is the opposite of
+    /// [`Server::expire_ms`] and for a reason. Taking the marks moves them out
+    /// of the shared counters and into the mask of whoever took them, so a
+    /// thread that skips a collection is a thread that never hears about a
+    /// database somebody else wrote to. A server wide gate would leave every
+    /// thread but one with a stale mask.
+    ///
+    /// Only the thread this belongs to reads or writes it, so it is a plain
+    /// number in an atomic rather than anything that needs ordering.
+    collect_ms: AtomicU64,
 }
 
 impl Default for Local {
@@ -344,6 +381,7 @@ impl Default for Local {
             dirty: AtomicU64::new(0),
             turn: AtomicU64::new(ALL_DATABASES),
             parked: AtomicUsize::new(0),
+            collect_ms: AtomicU64::new(u64::MAX),
         }
     }
 }
@@ -368,6 +406,18 @@ impl Local {
     /// Whether this thread's turn still has database `at` to look at.
     fn wanted(&self, at: usize) -> bool {
         self.turn.load(Relaxed) & (1u64 << at) != 0
+    }
+
+    /// Whether this thread has yet to take the marks on millisecond `now`.
+    ///
+    /// Says yes once a millisecond and remembers that it did, so the caller can
+    /// ask on every batch and pay for it a thousand times a second.
+    fn collecting(&self, now: u64) -> bool {
+        if self.collect_ms.load(Relaxed) == now {
+            return false;
+        }
+        self.collect_ms.store(now, Relaxed);
+        true
     }
 
     /// Note that `n` more of this thread's clients are parked.
@@ -1712,30 +1762,37 @@ impl Server {
     /// busy databases take turns instead of the lower numbered one starving the
     /// other.
     pub fn expire_step(&self, budget: usize) -> usize {
+        let slots = self.slots();
         let mut spent = 0;
         let from = self.expire_db.load(Relaxed);
-        for turn in 0..self.slots() {
+        for turn in 0..slots {
             if spent >= budget {
                 break;
             }
-            let i = (from + turn) % self.slots();
+            let i = (from + turn) % slots;
             // Nothing armed this thread, because nothing asked for any of this:
             // the shard loop is between commands. So the sweep arms and drains
             // around itself, and a key it takes is news to a subscriber in the
             // same way a key a lookup took on the way past is.
             let armed = notify::arm(self, self.slot_db(i));
-            let c = self.slot(i).expire_cycle(budget - spent);
+            // Held once for both cycles rather than taken again for the second.
+            // Two takes of a stripe lock to ask two questions about the same
+            // stripe is one more line every other thread has to wait for, and
+            // this asks on every turn of every worker's loop.
+            let mut slot = self.slot(i);
+            let c = slot.expire_cycle(budget - spent);
             // And the fields, which are the other thing with a deadline nobody
             // is waiting on. It draws from its own list and charges the same
             // budget, so a database with no hash field deadlines anywhere pays a
             // comparison for it and a database full of them cannot starve the
             // key sweep.
             let left = (budget - spent).saturating_sub(c.examined);
-            let fields = self.slot(i).field_expire_cycle(left);
+            let fields = slot.field_expire_cycle(left);
+            drop(slot);
             notify::drain(self, armed);
             spent += c.examined + fields;
             if c.expired > 0 {
-                self.expire_db.store((i + 1) % self.slots(), Relaxed);
+                self.expire_db.store((i + 1) % slots, Relaxed);
                 self.mine().note(1u64 << self.slot_db(i));
             }
         }
@@ -1795,11 +1852,20 @@ impl Server {
         if !self.resizing() {
             return None;
         }
-        self.collect_marks();
+        let slots = self.slots();
+        let looks = COMPACT_LOOKS.min(slots);
+        // Once a millisecond per thread rather than once a batch, because the
+        // swap is over every thread's counter and a call per batch per worker is
+        // the thread count squared per batch across the server. A mark a
+        // millisecond old is still a database somebody wrote to, which is the
+        // only thing the mask is ever asked.
+        if self.mine().collecting(self.clock.now_ms()) {
+            self.collect_marks();
+        }
         let mine = self.mine();
         let from = self.next_db.load(Relaxed);
-        for turn in 0..self.slots() {
-            let i = (from + turn) % self.slots();
+        for turn in 0..looks {
+            let i = (from + turn) % slots;
             // Nothing has run against this database since it last said it had
             // nothing to collect, so it still has nothing to collect and the
             // line it lives on stays where it is.
@@ -1808,7 +1874,7 @@ impl Server {
                 continue;
             }
             if let Some(moved) = self.slot(i).compact_step() {
-                self.next_db.store((i + 1) % self.slots(), Relaxed);
+                self.next_db.store((i + 1) % slots, Relaxed);
                 return Some(moved);
             }
             // Only once every stripe of the database has said it has nothing,
@@ -1818,6 +1884,7 @@ impl Server {
                 mine.done(at);
             }
         }
+        self.next_db.store((from + looks) % slots, Relaxed);
         None
     }
 }
@@ -3652,7 +3719,18 @@ mod tests {
         for k in &keys {
             f.run(&[b"SET", k, &val]);
         }
-        while f.server.compact_step().is_some() {}
+        // A call looks at [`COMPACT_LOOKS`] stripes and not at all of them, so
+        // draining takes calls in proportion to the width and one call saying
+        // there was nothing to move is not the whole database saying it.
+        let drain = |f: &Fixture| {
+            for _ in 0..4 * f.server.slots() {
+                if f.server.compact_step().is_none() && !f.server.mine().wanted(9) {
+                    return;
+                }
+            }
+            panic!("compaction never got to the end of database nine");
+        };
+        drain(&f);
         assert!(
             !f.server.mine().wanted(9),
             "database nine was drained and should not be asked again until it is written to"
