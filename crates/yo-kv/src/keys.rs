@@ -389,6 +389,22 @@ impl Keyspace {
         rdb::dump(&rec)
     }
 
+    /// The four representation thresholds this stripe builds values under.
+    ///
+    /// Owned, so that whoever is loading can keep them while it writes into the
+    /// keyspace they came off. Every stripe of a database carries the same four,
+    /// since they are configuration and `CONFIG SET` writes all of them, so one
+    /// stripe is as good as another to ask.
+    #[must_use]
+    pub fn bands(&self) -> rdb::Bands {
+        rdb::Bands {
+            set: self.limits,
+            hash: self.hash_limits,
+            list: self.list_limits,
+            zset: self.zset_limits,
+        }
+    }
+
     /// `RESTORE key ttl payload`, with `replace` for the `REPLACE` option.
     ///
     /// [`Moved::Taken`] for a key that is already there without `REPLACE`, which
@@ -416,14 +432,9 @@ impl Keyspace {
         if !replace && self.exists(key) {
             return Ok(Moved::Taken);
         }
-        let limits = rdb::Limits {
-            set: &self.limits,
-            hash: &self.hash_limits,
-            list: &self.list_limits,
-            zset: &self.zset_limits,
-        };
+        let bands = self.bands();
         let now = self.clock.now_ms();
-        let body = rdb::load(payload, limits, now)?;
+        let body = rdb::load(payload, bands.limits(), now)?;
         // A deadline that has already gone means there is nothing to create, and
         // the payload is still parsed first rather than skipped. A client that
         // sent bad bytes and a stale deadline should be told about the bytes,

@@ -233,7 +233,7 @@ fn role(out: &mut Out) {
 /// reason: the writer hands back a buffer rather than taking a sink, and turning
 /// it into one is the borrowing walk that is a bigger change than this file
 /// should make.
-fn write_file(server: &Server) -> bool {
+pub(super) fn write_file(server: &Server) -> bool {
     server.persist.saves.fetch_add(1, Relaxed);
     let done = yo_alloc::allow(|| {
         let (image, skipped) = build(server);
@@ -267,6 +267,14 @@ fn spill(temp: &PathBuf, image: &[u8]) -> core::result::Result<(), ()> {
     let mut file = fs::File::create(temp).map_err(|_| ())?;
     file.write_all(image).map_err(|_| ())?;
     file.sync_all().map_err(|_| ())
+}
+
+/// How many keys the last file could not carry.
+///
+/// Read by `DEBUG RELOAD`, which has to know before it throws the keyspace away
+/// whether the file it is about to read back holds all of it.
+pub(super) fn skipped(server: &Server) -> usize {
+    server.persist.skipped.load(Relaxed)
 }
 
 /// The whole dataset as one RDB image, and how many keys could not go in it.

@@ -192,12 +192,22 @@ impl Snapshot {
                 // so the name is copied into the entry writer instead. It is a
                 // key name and it is a few bytes.
                 let key = self.names[from..to].to_vec();
-                let Some(rec) = db.hold(&key).export(&key) else {
+                let mut held = db.hold(&key);
+                // The kind before the copy, because a foreign body cannot be
+                // copied at all and answers as a key that is not there. Asking
+                // first is the difference between a key that was passed over and
+                // counted and one that quietly went missing.
+                if matches!(held.kind_of(&key), Some(Kind::Foreign | Kind::Array)) {
+                    self.skipped += 1;
+                    continue;
+                }
+                let Some(rec) = held.export(&key) else {
                     // Gone between the walk and here, which is a key that expired
                     // or one another thread deleted, or read back off the store
                     // and failed. Either way there is no value to write.
                     continue;
                 };
+                drop(held);
                 self.entry(&key, &rec);
             }
             if at.is_end() {
@@ -227,13 +237,10 @@ impl Snapshot {
     }
 
     /// One key: the deadline if it has one, then the type, name and value.
+    ///
+    /// The kinds with no RDB shape have already been counted and dropped by the
+    /// walk above, which has to ask before it takes the copy rather than after.
     fn entry(&mut self, key: &[u8], rec: &Record) {
-        // Asked before a byte is written, because the alternative is finding out
-        // halfway through an entry and having to unwind it.
-        if matches!(rec.kind(), Kind::Foreign | Kind::Array) {
-            self.skipped += 1;
-            return;
-        }
         if let Some(at) = rec.expire_at() {
             self.out.push(OP_EXPIRETIME_MS);
             self.out.extend_from_slice(&at.to_le_bytes());
@@ -549,6 +556,47 @@ mod tests {
         d.at(b"sparse")
             .arset(b"sparse", 7, [&b"a"[..]].into_iter())
             .unwrap();
+
+        let mut snap = Snapshot::new();
+        snap.database(0, &d);
+        assert_eq!(snap.skipped(), 1);
+        let seen = walk(&snap.finish());
+        assert_eq!(seen.keys.len(), 1);
+        assert_eq!(seen.keys[0].0, b"ordinary");
+    }
+
+    /// A body belonging to an engine above this crate.
+    ///
+    /// The interesting half of the two kinds with no RDB shape, because a
+    /// sparse array can at least be copied and this cannot: asking one for a
+    /// duplicate of itself answers as a key that is not there, so a walk that
+    /// took the copy first would drop it and count nothing.
+    #[derive(Debug)]
+    struct Outsider;
+
+    impl crate::foreign::Foreign for Outsider {
+        fn type_name(&self) -> &'static str {
+            "outsider"
+        }
+
+        fn encoding(&self) -> &'static str {
+            "outsider"
+        }
+
+        fn memory_bytes(&self) -> usize {
+            0
+        }
+
+        fn is_empty(&self) -> bool {
+            false
+        }
+    }
+
+    #[test]
+    fn a_foreign_body_is_counted_and_left_out_as_well() {
+        let mut d = db();
+        d.at(b"ordinary").set_plain(b"ordinary", b"1").unwrap();
+        d.at(b"outside").put_foreign(b"outside", Box::new(Outsider));
 
         let mut snap = Snapshot::new();
         snap.database(0, &d);

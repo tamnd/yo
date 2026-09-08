@@ -305,6 +305,39 @@ pub struct Limits<'a> {
     pub zset: &'a zset::Limits,
 }
 
+/// The same four thresholds, owned.
+///
+/// [`Limits`] borrows them from the keyspace they came off, which is the right
+/// shape for a `RESTORE`, where the keyspace is already held and the value goes
+/// straight back into it. It is the wrong shape for a whole file, because
+/// building a value needs the thresholds and importing one needs the keyspace
+/// mutably, and those two borrows cannot both be alive. A copy of four small
+/// structs breaks that and costs nothing worth counting once per file.
+#[derive(Debug, Clone, Copy)]
+pub struct Bands {
+    /// The set thresholds.
+    pub set: set::Limits,
+    /// The hash thresholds.
+    pub hash: hash::Limits,
+    /// The list thresholds.
+    pub list: list::Limits,
+    /// The sorted set thresholds.
+    pub zset: zset::Limits,
+}
+
+impl Bands {
+    /// The borrowed form, for handing to a reader.
+    #[must_use]
+    pub const fn limits(&self) -> Limits<'_> {
+        Limits {
+            set: &self.set,
+            hash: &self.hash,
+            list: &self.list,
+            zset: &self.zset,
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // The wrapper: version and checksum.
 // ---------------------------------------------------------------------------

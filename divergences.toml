@@ -930,3 +930,24 @@ reason = "A real server tags a handful of commands in COMMAND DOCS with doc_flag
 status = "until"
 resolved_by = "M8"
 spec = "12 section 9"
+
+[[divergence]]
+id = "D-131"
+title = "DEBUG RELOAD takes MERGE and does nothing with it"
+reason = "On a real server MERGE is what makes a key that is in the file and also in memory legal. Without it a NOFLUSH reload that finds a name twice logs RDB has duplicated key and then takes the server down with a Guru Meditation, which is measured against 8.10.1 rather than read off the documentation: the reference dies on the spot. A key arriving over one that is already there is an ordinary import here, the same import RESTORE REPLACE, COPY and MOVE all use, so the word has nothing to turn on and NOFLUSH on its own behaves the way NOFLUSH MERGE does. The word is accepted rather than refused because a suite that sends it is asking for the behaviour it already gets, and refusing it would read as the option missing. Nothing a client can see is worse off, and one thing is better, which is that a debug command cannot end the process."
+status = "permanent"
+spec = "12 section 9"
+
+[[divergence]]
+id = "D-132"
+title = "A reload is not one instant of the keyspace"
+reason = "A real server forks for the save and then loads on the one thread that runs commands, so nothing can be written between the two halves and the dataset that comes back is exactly the dataset that went out. Here the save walks one stripe of one database at a time, the load walks the file the same way, and another connection on another thread can write in between. A key written after its stripe was walked and before the load reaches it is dropped by the flush, which is the visible cost: on a real server the same write would either be in the file or arrive after the reload and survive. This is the same window SAVE already has, for the same reason, and it closes with the same change, which is a writer that takes a consistent read of the whole keyspace. Running with --threads 1 removes it entirely, because then there is no other thread to write, and that is what the compatibility suite runs under."
+status = "permanent"
+spec = "12 section 9"
+
+[[divergence]]
+id = "D-133"
+title = "DEBUG RELOAD refuses rather than dropping a key with no RDB form"
+reason = "A graph, a vector index and a sparse array have no RDB type byte, so they are not in the file a save writes and the count of what was left out is already reported as yo_rdb_last_save_skipped_keys. A reload flushes and reads the file back, so on a dataset holding one of those the flush would be a delete dressed as a round trip. Rather than do that quietly it answers with the number of keys that would go and says to use NOFLUSH, which keeps them and lets everything else land on top. Nothing on a real server can be in this position, since every type it has can be written, so there is no reference behaviour to match and the sentence is ours. A client that wants the reference behaviour on a dataset that is all Redis types never sees this, because the count is nought and the reload goes ahead."
+status = "permanent"
+spec = "12 section 9"

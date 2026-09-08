@@ -392,32 +392,13 @@ mod tests {
     use crate::zset;
     use crate::zsets::ZAdd;
 
-    /// The four thresholds, owned, so that a test can hand out a [`Limits`] and
-    /// still have the database mutably.
-    struct Bands {
-        set: set::Limits,
-        hash: hash::Limits,
-        list: list::Limits,
-        zset: zset::Limits,
-    }
-
-    impl Bands {
-        fn new() -> Bands {
-            Bands {
-                set: set::Limits::DEFAULT,
-                hash: hash::Limits::DEFAULT,
-                list: list::Limits::default(),
-                zset: zset::Limits::DEFAULT,
-            }
-        }
-
-        fn limits(&self) -> Limits<'_> {
-            Limits {
-                set: &self.set,
-                hash: &self.hash,
-                list: &self.list,
-                zset: &self.zset,
-            }
+    /// The four thresholds a test loads under, which are the defaults.
+    fn bands() -> rdb::Bands {
+        rdb::Bands {
+            set: set::Limits::DEFAULT,
+            hash: hash::Limits::DEFAULT,
+            list: list::Limits::default(),
+            zset: zset::Limits::DEFAULT,
         }
     }
 
@@ -468,7 +449,7 @@ mod tests {
 
     /// Load a file into a fresh database per selector, panicking on a fault.
     fn into_dbs(file: &[u8], now: u64) -> Vec<(usize, Db)> {
-        let bands = Bands::new();
+        let bands = bands();
         let mut out: Vec<(usize, Db)> = Vec::new();
         for item in Load::open(file, bands.limits(), now).unwrap() {
             if let Item::Key { db: n, key, record } = item.unwrap() {
@@ -542,7 +523,7 @@ mod tests {
         let file = snap.finish();
 
         // Read at a moment after one of the two deadlines but not the other.
-        let bands = Bands::new();
+        let bands = bands();
         let mut load = Load::open(&file, bands.limits(), 7_000).unwrap();
         let mut found: Vec<(Vec<u8>, Option<u64>)> = Vec::new();
         for item in &mut load {
@@ -565,7 +546,7 @@ mod tests {
         snap.aux(b"aof-base", b"0");
         let file = snap.finish();
 
-        let bands = Bands::new();
+        let bands = bands();
         let seen: Vec<(Vec<u8>, Vec<u8>)> = Load::open(&file, bands.limits(), 0)
             .unwrap()
             .map(|item| match item.unwrap() {
@@ -604,7 +585,7 @@ mod tests {
         let mut snap = Snapshot::new();
         snap.database(0, &filled());
         let file = snap.finish();
-        let bands = Bands::new();
+        let bands = bands();
 
         // The checksum covers the header, so the version cannot be changed
         // without the sum being taken again.
@@ -637,7 +618,7 @@ mod tests {
 
     #[test]
     fn a_file_that_is_not_one_is_turned_down_before_anything_is_built() {
-        let bands = Bands::new();
+        let bands = bands();
         let short = b"REDIS0012";
         assert_eq!(
             Load::open(short, bands.limits(), 0).err(),
@@ -668,7 +649,7 @@ mod tests {
         let middle = file.len() / 2;
         file[middle] ^= 0x01;
 
-        let bands = Bands::new();
+        let bands = bands();
         assert_eq!(
             Load::open(&file, bands.limits(), 1_000).err(),
             Some(Fault::Checksum)
@@ -686,7 +667,7 @@ mod tests {
         let crc = crc64(0, &cut);
         cut.extend_from_slice(&crc.to_le_bytes());
 
-        let bands = Bands::new();
+        let bands = bands();
         let load = Load::open(&cut, bands.limits(), 1_000).unwrap();
         let faults: Vec<Fault> = load.filter_map(|item| item.err()).collect();
         assert_eq!(faults.len(), 1, "the walk stops at the first fault");
@@ -720,7 +701,7 @@ mod tests {
         let crc = crc64(0, &edited);
         edited.extend_from_slice(&crc.to_le_bytes());
 
-        let bands = Bands::new();
+        let bands = bands();
         let keys = Load::open(&edited, bands.limits(), 1_000)
             .unwrap()
             .filter(|item| matches!(item, Ok(Item::Key { .. })))
@@ -752,7 +733,7 @@ mod tests {
         let end = file.len() - FOOTER;
         file[end..].fill(0);
 
-        let bands = Bands::new();
+        let bands = bands();
         let keys = Load::open(&file, bands.limits(), 1_000)
             .unwrap()
             .filter(|item| matches!(item, Ok(Item::Key { .. })))
@@ -798,7 +779,7 @@ mod tests {
     #[test]
     fn a_file_a_real_redis_wrote_comes_back_whole() {
         let file = unhex(REAL);
-        let bands = Bands::new();
+        let bands = bands();
         let mut load = Load::open(&file, bands.limits(), 1_000).unwrap();
         assert_eq!(load.version(), 15, "the header 8.10.1 writes");
 

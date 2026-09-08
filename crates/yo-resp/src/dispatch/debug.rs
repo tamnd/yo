@@ -33,6 +33,11 @@
 //! one that is remembered and does nothing is
 //! `QUICKLIST-PACKED-THRESHOLD`, which is D-128.
 //!
+//! `RELOAD` is the odd one out, because it moves the whole dataset rather than a
+//! knob. It is here for the same reason the knobs are: the suite calls it after
+//! almost every case, and a case that passes on both sides of it has proved that
+//! the writer and the reader of the file agree about the value it just made.
+//!
 //! # How the errors work
 //!
 //! Every complaint in this file is the same sentence, `unknown subcommand or
@@ -53,9 +58,10 @@ use std::sync::atomic::Ordering::Relaxed;
 use yo_common::num::parse_i64;
 use yo_common::{Code, Error, Result};
 use yo_kv::SetOptions;
+use yo_kv::restore::{Item, Load};
 
 use super::args::{self, Args, is};
-use super::{Server, Session};
+use super::{Server, Session, persist};
 use crate::reply::Out;
 
 /// The knobs `DEBUG` turns, all of them on a word each.
@@ -171,6 +177,8 @@ pub(super) fn execute(
         out.ok();
     } else if is(sub, b"QUICKLIST-PACKED-THRESHOLD") && args.len() == 3 {
         return packed(server, args.get(2), out);
+    } else if is(sub, b"RELOAD") {
+        return reload(server, args, out);
     } else {
         return Err(args::subcommand_syntax(sub, "DEBUG"));
     }
@@ -244,6 +252,146 @@ fn packed(server: &Server, value: &[u8], out: &mut Out) -> Result<()> {
     server.debug.packed.store(size, Relaxed);
     out.ok();
     Ok(())
+}
+
+/// What a reload says when the file did not come back.
+///
+/// One sentence for every way it can go wrong, which is the reference's answer
+/// too. A client can do nothing with the difference between a bad checksum and a
+/// file that stops halfway, and whoever can is reading the log, so that is where
+/// the reason goes.
+const LOAD_FAILED: &str = "Error trying to load the RDB dump, check server logs.";
+
+/// `DEBUG RELOAD [MERGE] [NOFLUSH] [NOSAVE]`, the round trip a suite leans on.
+///
+/// Write the whole dataset out as an RDB, throw away what is in memory and build
+/// it again out of the file. It is here because Redis's own suite calls it after
+/// almost every case: a value that comes back the same way it went in has proved
+/// its writer and its reader agree, and a value that does not has found a bug in
+/// one of them without anybody having to say which.
+///
+/// The three options are the reference's three. `NOSAVE` skips the write and
+/// reads whatever file is already on disk, which is how a suite loads a file it
+/// put there itself. `NOFLUSH` keeps what is in memory and lets the file land on
+/// top of it. `MERGE` is read and changes nothing here, and that is D-131: on a
+/// real server it is what makes a key that is in the file and in memory legal,
+/// and without it the server takes itself down with `Duplicated key found in RDB
+/// file`. A key arriving over one that is already there is an ordinary import
+/// here, so there is nothing for the word to turn on.
+///
+/// The other difference from a real server is the window. Redis forks for the
+/// save and has one thread for the load, so nothing can write in between. Here
+/// the save walks one stripe at a time and another connection can write to a
+/// stripe that has already been walked, which is D-132 and is the same window
+/// [`super::persist::build`] already has for `SAVE`.
+fn reload(server: &Server, args: Args<'_>, out: &mut Out) -> Result<()> {
+    let (mut save, mut flush) = (true, true);
+    for i in 2..args.len() {
+        let word = args.get(i);
+        if is(word, b"NOSAVE") {
+            save = false;
+        } else if is(word, b"NOFLUSH") {
+            flush = false;
+        } else if !is(word, b"MERGE") {
+            return Err(Error::new(
+                Code::Invalid,
+                "DEBUG RELOAD only supports the MERGE, NOFLUSH and NOSAVE options.",
+            ));
+        }
+    }
+    if save {
+        if !persist::write_file(server) {
+            // The bare line `SAVE` answers, for the reason it gives.
+            out.error(b"ERR");
+            return Ok(());
+        }
+        // A key with no RDB shape is not in the file that was just written, so
+        // flushing and reading it back would be a way of deleting it. Nothing on
+        // a real server can be in this position, which is why the sentence is
+        // ours: the reply says which way out there is rather than leaving the
+        // caller to find out from a `DBSIZE` that came back short.
+        let lost = persist::skipped(server);
+        if flush && lost > 0 {
+            return Err(if lost == 1 {
+                Error::new(
+                    Code::Invalid,
+                    "DEBUG RELOAD would drop 1 key with no RDB form, use NOFLUSH to keep it",
+                )
+            } else {
+                Error::fmt(
+                    Code::Invalid,
+                    format_args!(
+                        "DEBUG RELOAD would drop {lost} keys with no RDB form, use NOFLUSH to keep them"
+                    ),
+                )
+            });
+        }
+    }
+    if yo_alloc::allow(|| load_file(server, flush)) {
+        out.ok();
+        Ok(())
+    } else {
+        Err(Error::new(Code::Invalid, LOAD_FAILED))
+    }
+}
+
+/// Read `dump.rdb` back over the keyspace, and say whether all of it landed.
+///
+/// The flush happens after the file has been opened and before the first key is
+/// read out of it, which is the order that matters: a file whose header or
+/// checksum is wrong is refused while the dataset is still there, and a file
+/// that goes wrong halfway leaves a half loaded database, which is what a real
+/// server does too.
+fn load_file(server: &Server, flush: bool) -> bool {
+    let path = server.dir().join(persist::FILE);
+    let image = match std::fs::read(&path) {
+        Ok(image) => image,
+        Err(e) => {
+            eprintln!("yodb: DEBUG RELOAD: {}: {e}", path.display());
+            return false;
+        }
+    };
+    // Any stripe of any database carries the same four thresholds, and they are
+    // copied out rather than borrowed because the keyspace they came off is
+    // about to be written into.
+    let bands = server.dbs[0].hold_stripe(0).bands();
+    let load = match Load::open(&image, bands.limits(), server.clock.now_ms()) {
+        Ok(load) => load,
+        Err(fault) => {
+            eprintln!("yodb: DEBUG RELOAD: {fault}");
+            return false;
+        }
+    };
+    if flush {
+        // The databases and not the indexes. An index is a schema and its own
+        // copy of what it has read, and every key it was following is about to
+        // come back under the same name with the same value, so dropping it
+        // would mean rebuilding it against a keyspace that already agrees with
+        // it. This is the one thing `FLUSHALL` does that a reload must not.
+        for db in &server.dbs {
+            db.clear();
+        }
+    }
+    for item in load {
+        match item {
+            Ok(Item::Key { db, key, record }) => {
+                let Some(into) = server.dbs.get(db) else {
+                    eprintln!("yodb: DEBUG RELOAD: the file has a key in database {db}");
+                    return false;
+                };
+                into.hold(&key).import(&key, record);
+            }
+            // The aux fields are the writer talking about itself. The libraries
+            // are already here, because nothing above flushed them, and loading
+            // one twice is an error rather than a no op.
+            Ok(Item::Aux { .. } | Item::Library(_)) => {}
+            Err(fault) => {
+                eprintln!("yodb: DEBUG RELOAD: {fault}");
+                return false;
+            }
+        }
+    }
+    true
 }
 
 /// `DEBUG POPULATE <count> [<prefix> [<size>]]`.
@@ -438,6 +586,10 @@ const HELP: &[&str] = &[
     "QUICKLIST-PACKED-THRESHOLD <size>",
     "    Sets the threshold for elements to be inserted as plain vs packed nodes",
     "    Default value is 1GB, allows values up to 4GB. Setting to 0 restores to default.",
+    "RELOAD [MERGE] [NOFLUSH] [NOSAVE]",
+    "    Save the dataset to the RDB file and load it back. NOSAVE reads the file",
+    "    that is already there, NOFLUSH keeps what is in memory and lets the file",
+    "    land on top of it, and MERGE is accepted and does nothing.",
     "SET-ACTIVE-EXPIRE <0|1>",
     "    Setting it to 0 disables expiring keys in background when they are not",
     "    accessed (otherwise the Redis behavior). Setting it to 1 reenables back",
