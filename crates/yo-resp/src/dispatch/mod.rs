@@ -63,6 +63,7 @@ mod clients;
 mod cms;
 mod cpu;
 mod cuckoo;
+mod debug;
 mod geo;
 mod graph;
 mod hashes;
@@ -817,6 +818,8 @@ pub struct Server {
     persist: persist::Persistence,
     /// The password connections are asked for, if they are asked for one.
     access: auth::Access,
+    /// The knobs `DEBUG` turns, which is what a test suite reaches for.
+    debug: debug::Knobs,
 }
 
 impl Server {
@@ -865,6 +868,7 @@ impl Server {
             monitors: monitor::Monitors::default(),
             persist: persist::Persistence::default(),
             access: auth::Access::default(),
+            debug: debug::Knobs::default(),
             mail: pubsub::boxes(1),
         }
     }
@@ -937,6 +941,7 @@ impl Server {
             monitors: monitor::Monitors::default(),
             persist: persist::Persistence::default(),
             access: auth::Access::default(),
+            debug: debug::Knobs::default(),
             mail: pubsub::boxes(1),
         }
     }
@@ -1674,6 +1679,13 @@ impl Server {
     /// back. What it decides is that an idle server sweeps a thousand times a
     /// second rather than a million.
     pub fn expire_slice(&self, budget: usize) -> usize {
+        // `DEBUG SET-ACTIVE-EXPIRE 0`, which is what a test that wants to see a
+        // key that is logically gone but still on the shelf turns off. Read
+        // before the clock because it is the cheaper of the two and because a
+        // server with the sweep off should not be paying for the clock either.
+        if !self.expiring() {
+            return 0;
+        }
         let now = self.clock.now_ms();
         if now == self.expire_ms.load(Relaxed) {
             return 0;
@@ -1774,6 +1786,13 @@ impl Server {
     /// further along each time, so the cost of asking is a comparison per
     /// database and the cost of acting is bounded by a segment.
     pub fn compact_step(&self) -> Option<usize> {
+        // `DEBUG DICT-RESIZING 0`. On a real server that stops a dictionary
+        // giving back the room it grew into, and this is where the same thing
+        // happens here: the arena keeps every segment it has taken until this
+        // walks over and hands one back.
+        if !self.resizing() {
+            return None;
+        }
         self.collect_marks();
         let mine = self.mine();
         let from = self.next_db.load(Relaxed);
@@ -9072,6 +9091,301 @@ mod tests {
             f.run(&[b"CONFIG", b"GET", b"requirepass"]),
             "*2\r\n$11\r\nrequirepass\r\n$0\r\n\r\n"
         );
+    }
+
+    /// Every `DEBUG PROTOCOL` type, on RESP2, byte for byte off 8.10.1.
+    #[test]
+    fn debug_protocol_writes_what_the_reference_writes_on_resp2() {
+        let mut f = Fixture::new();
+        for (kind, want) in [
+            ("string", "$11\r\nHello World\r\n"),
+            ("integer", ":12345\r\n"),
+            ("double", "$5\r\n3.141\r\n"),
+            ("bignum", "$37\r\n1234567999999999999999999999999999999\r\n"),
+            ("null", "$-1\r\n"),
+            ("array", "*3\r\n:0\r\n:1\r\n:2\r\n"),
+            ("set", "*3\r\n:0\r\n:1\r\n:2\r\n"),
+            ("map", "*6\r\n:0\r\n:0\r\n:1\r\n:1\r\n:2\r\n:0\r\n"),
+            (
+                "attrib",
+                "$39\r\nSome real reply following the attribute\r\n",
+            ),
+            ("push", "-ERR RESP2 is not supported by this command\r\n"),
+            ("verbatim", "$25\r\nThis is a verbatim\nstring\r\n"),
+            ("true", ":1\r\n"),
+            ("false", ":0\r\n"),
+        ] {
+            assert_eq!(
+                f.run(&[b"DEBUG", b"PROTOCOL", kind.as_bytes()]),
+                want,
+                "{kind}"
+            );
+        }
+    }
+
+    /// And on RESP3, where all thirteen are their own type.
+    #[test]
+    fn debug_protocol_writes_what_the_reference_writes_on_resp3() {
+        let mut f = Fixture::new();
+        f.out = Out::new(Proto::Resp3);
+        for (kind, want) in [
+            ("string", "$11\r\nHello World\r\n"),
+            ("integer", ":12345\r\n"),
+            ("double", ",3.141\r\n"),
+            ("bignum", "(1234567999999999999999999999999999999\r\n"),
+            ("null", "_\r\n"),
+            ("array", "*3\r\n:0\r\n:1\r\n:2\r\n"),
+            ("set", "~3\r\n:0\r\n:1\r\n:2\r\n"),
+            ("map", "%3\r\n:0\r\n#f\r\n:1\r\n#t\r\n:2\r\n#f\r\n"),
+            (
+                "attrib",
+                "|1\r\n$14\r\nkey-popularity\r\n*2\r\n$7\r\nkey:123\r\n:90\r\n\
+                 $39\r\nSome real reply following the attribute\r\n",
+            ),
+            (
+                "push",
+                "$40\r\nSome real reply following the push reply\r\n\
+                 >2\r\n$16\r\nserver-cpu-usage\r\n:42\r\n",
+            ),
+            ("verbatim", "=29\r\ntxt:This is a verbatim\nstring\r\n"),
+            ("true", "#t\r\n"),
+            ("false", "#f\r\n"),
+        ] {
+            assert_eq!(
+                f.run(&[b"DEBUG", b"PROTOCOL", kind.as_bytes()]),
+                want,
+                "{kind}"
+            );
+        }
+    }
+
+    /// A type name that is not one of the thirteen lists all thirteen.
+    #[test]
+    fn debug_protocol_names_every_type_when_it_is_given_none_of_them() {
+        let mut f = Fixture::new();
+        for kind in [&b"bogus"[..], b""] {
+            assert_eq!(
+                f.run(&[b"DEBUG", b"PROTOCOL", kind]),
+                "-ERR Wrong protocol type name. Please use one of the following: \
+                 string|integer|double|bignum|null|array|set|map|attrib|push|verbatim|true|false\r\n"
+            );
+        }
+    }
+
+    /// The one sentence `DEBUG` says about everything it cannot do.
+    ///
+    /// A subcommand that does not exist and a subcommand handed the wrong number
+    /// of arguments are the same case on a real server, because both fall off
+    /// the end of the same chain of tests, and the name is echoed in the case it
+    /// arrived in.
+    #[test]
+    fn debug_says_the_same_thing_about_a_bad_name_and_a_bad_count() {
+        let mut f = Fixture::new();
+        for parts in [
+            &[b"DEBUG".as_slice(), b"NOSUCH"][..],
+            &[b"DEBUG", b"PROTOCOL"],
+            &[b"DEBUG", b"PROTOCOL", b"string", b"extra"],
+            &[b"DEBUG", b"SLEEP"],
+            &[b"DEBUG", b"SET-ACTIVE-EXPIRE", b"1", b"2"],
+            &[b"DEBUG", b"HELP", b"me"],
+        ] {
+            let got = f.run(parts);
+            let name = String::from_utf8_lossy(parts[1]).to_string();
+            assert_eq!(
+                got,
+                format!(
+                    "-ERR unknown subcommand or wrong number of arguments for '{name}'. \
+                     Try DEBUG HELP.\r\n"
+                ),
+                "{name}"
+            );
+        }
+        assert_eq!(
+            f.run(&[b"DEBUG"]),
+            "-ERR wrong number of arguments for 'debug' command\r\n"
+        );
+    }
+
+    /// `DEBUG ERROR` writes the line it was given and nothing around it.
+    #[test]
+    fn debug_error_hands_back_whatever_it_was_given() {
+        let mut f = Fixture::new();
+        assert_eq!(f.run(&[b"DEBUG", b"ERROR", b"my error"]), "-my error\r\n");
+        assert_eq!(f.run(&[b"DEBUG", b"ERROR", b""]), "-\r\n");
+        // A code the caller made up goes out as the code, which is the whole use
+        // of this: a client library testing that it branches on one.
+        assert_eq!(
+            f.run(&[b"DEBUG", b"ERROR", b"-WEIRD thing"]),
+            "--WEIRD thing\r\n"
+        );
+        // And a newline in the middle cannot become a second reply.
+        assert_eq!(
+            f.run(&[b"DEBUG", b"ERROR", b"two\nlines"]),
+            "-two lines\r\n"
+        );
+    }
+
+    /// `DEBUG POPULATE` fills a database and leaves what is already there.
+    #[test]
+    fn debug_populate_fills_and_skips_what_is_there() {
+        let mut f = Fixture::new();
+        assert_eq!(f.run(&[b"SET", b"key:0", b"mine"]), "+OK\r\n");
+        assert_eq!(f.run(&[b"DEBUG", b"POPULATE", b"3"]), "+OK\r\n");
+        assert_eq!(f.run(&[b"DBSIZE"]), ":3\r\n");
+        assert_eq!(f.run(&[b"GET", b"key:0"]), "$4\r\nmine\r\n");
+        assert_eq!(f.run(&[b"GET", b"key:2"]), "$7\r\nvalue:2\r\n");
+        // A prefix is the whole of the name in front of the colon, so the colon
+        // in a prefix that has one is not the separator and there are two.
+        assert_eq!(f.run(&[b"DEBUG", b"POPULATE", b"1", b"p:"]), "+OK\r\n");
+        assert_eq!(f.run(&[b"GET", b"p::0"]), "$7\r\nvalue:0\r\n");
+        // A size pads with zero bytes, and one shorter than the name cuts it.
+        assert_eq!(f.run(&[b"DEBUG", b"POPULATE", b"1", b"q", b"9"]), "+OK\r\n");
+        assert_eq!(f.raw(&[b"GET", b"q:0"]), b"$9\r\nvalue:0\0\0\r\n");
+        assert_eq!(f.run(&[b"DEBUG", b"POPULATE", b"1", b"r", b"4"]), "+OK\r\n");
+        assert_eq!(f.run(&[b"GET", b"r:0"]), "$4\r\nvalu\r\n");
+        // And nought is not a size of nothing, it is no size at all.
+        assert_eq!(f.run(&[b"DEBUG", b"POPULATE", b"1", b"s", b"0"]), "+OK\r\n");
+        assert_eq!(f.run(&[b"GET", b"s:0"]), "$7\r\nvalue:0\r\n");
+    }
+
+    /// Both of `POPULATE`'s numbers complain about the range and not the digits.
+    #[test]
+    fn debug_populate_wants_two_numbers_that_are_not_negative() {
+        let mut f = Fixture::new();
+        for parts in [
+            &[b"DEBUG".as_slice(), b"POPULATE", b"abc"][..],
+            &[b"DEBUG", b"POPULATE", b"-1"],
+            &[b"DEBUG", b"POPULATE", b"1.5"],
+            &[b"DEBUG", b"POPULATE", b"1", b"p", b"-1"],
+            &[b"DEBUG", b"POPULATE", b"1", b"p", b"x"],
+        ] {
+            assert_eq!(
+                f.run(parts),
+                "-ERR value is out of range, must be positive\r\n"
+            );
+        }
+        assert_eq!(f.run(&[b"DEBUG", b"POPULATE", b"0"]), "+OK\r\n");
+        assert_eq!(f.run(&[b"DBSIZE"]), ":0\r\n");
+    }
+
+    /// The packed threshold takes a memory value up to just under four gigabytes.
+    ///
+    /// The error sentence says bigger than one and smaller than 4gb and neither
+    /// half of that is what is checked, which is why the numbers here were taken
+    /// off a running server rather than off the sentence.
+    #[test]
+    fn debug_quicklist_packed_threshold_takes_what_the_reference_takes() {
+        let mut f = Fixture::new();
+        for good in [
+            &b"1"[..],
+            b"2",
+            b"1b",
+            b"1K",
+            b"1kb",
+            b"1G",
+            b"3gb",
+            b"0",
+            b"0b",
+        ] {
+            assert_eq!(
+                f.run(&[b"DEBUG", b"QUICKLIST-PACKED-THRESHOLD", good]),
+                "+OK\r\n",
+                "{}",
+                String::from_utf8_lossy(good)
+            );
+        }
+        for bad in [
+            &b"4gb"[..],
+            b"4294967295",
+            b"4294967296",
+            b"abc",
+            b"",
+            b"+5",
+            b"1.5",
+        ] {
+            assert_eq!(
+                f.run(&[b"DEBUG", b"QUICKLIST-PACKED-THRESHOLD", bad]),
+                "-ERR argument must be a memory value bigger than 1 and smaller than 4gb\r\n",
+                "{}",
+                String::from_utf8_lossy(bad)
+            );
+        }
+    }
+
+    /// The three gates really gate, and they say `OK` to anything.
+    #[test]
+    fn the_debug_gates_turn_the_things_they_name_off_and_on_again() {
+        let mut f = Fixture::new();
+        for (sub, read) in [
+            (&b"SET-ACTIVE-EXPIRE"[..], 0),
+            (b"DICT-RESIZING", 1),
+            (b"PAUSE-CRON", 2),
+        ] {
+            let reads: [fn(&Server) -> bool; 3] =
+                [Server::expiring, Server::resizing, Server::cron_running];
+            let on = reads[read];
+            // `PAUSE-CRON` is the one whose argument means the opposite of the
+            // gate, since it names the stopping and the gate names the running.
+            let stop: &[u8] = if read == 2 { b"1" } else { b"0" };
+            let go: &[u8] = if read == 2 { b"0" } else { b"1" };
+            assert!(on(&f.server), "{}", String::from_utf8_lossy(sub));
+            assert_eq!(f.run(&[b"DEBUG", sub, stop]), "+OK\r\n");
+            assert!(!on(&f.server), "{}", String::from_utf8_lossy(sub));
+            // A word is nought to `atoi`, so it turns the gate off rather than
+            // being refused, and on `PAUSE-CRON` that means it starts the cron.
+            assert_eq!(f.run(&[b"DEBUG", sub, b"nonsense"]), "+OK\r\n");
+            assert_eq!(on(&f.server), read == 2);
+            assert_eq!(f.run(&[b"DEBUG", sub, go]), "+OK\r\n");
+            assert!(on(&f.server), "{}", String::from_utf8_lossy(sub));
+        }
+    }
+
+    /// A key past its deadline is not swept while the sweep is off.
+    ///
+    /// The lazy read still reports it gone, which is the same split a real
+    /// server has: `SET-ACTIVE-EXPIRE 0` stops the background cycle and does not
+    /// make an expired key readable.
+    #[test]
+    fn the_sweep_stops_when_debug_turns_it_off() {
+        let mut f = Fixture::new();
+        assert_eq!(f.run(&[b"SET", b"k", b"v", b"PX", b"10"]), "+OK\r\n");
+        assert_eq!(f.run(&[b"DEBUG", b"SET-ACTIVE-EXPIRE", b"0"]), "+OK\r\n");
+        f.advance(50);
+        assert_eq!(f.server.expire_slice(64), 0);
+        assert_eq!(f.run(&[b"DEBUG", b"SET-ACTIVE-EXPIRE", b"1"]), "+OK\r\n");
+        assert_eq!(f.server.expire_slice(64), 1);
+    }
+
+    /// Five of the ten `COMMAND INFO` fields are sets once RESP3 has a set.
+    ///
+    /// This is every command and not just `DEBUG`, and it only shows on RESP3,
+    /// which is why it went unnoticed until a wire compare looked at the bytes
+    /// rather than at what a client decoded them into.
+    #[test]
+    fn command_info_sends_sets_where_the_reference_sends_sets() {
+        let mut f = Fixture::new();
+        f.out = Out::new(Proto::Resp3);
+        assert_eq!(
+            f.run(&[b"COMMAND", b"INFO", b"get"]),
+            "*1\r\n*10\r\n$3\r\nget\r\n:2\r\n~2\r\n+readonly\r\n+fast\r\n:1\r\n:1\r\n:1\r\n\
+             ~3\r\n+@read\r\n+@string\r\n+@fast\r\n~0\r\n~0\r\n~0\r\n"
+        );
+        // And RESP2, where a set is an array and nothing moved.
+        let mut f = Fixture::new();
+        assert_eq!(
+            f.run(&[b"COMMAND", b"INFO", b"get"]),
+            "*1\r\n*10\r\n$3\r\nget\r\n:2\r\n*2\r\n+readonly\r\n+fast\r\n:1\r\n:1\r\n:1\r\n\
+             *3\r\n+@read\r\n+@string\r\n+@fast\r\n*0\r\n*0\r\n*0\r\n"
+        );
+    }
+
+    /// `DEBUG` is admin, so no monitor is ever shown one.
+    #[test]
+    fn debug_is_admin_and_stays_off_a_monitor_feed() {
+        let spec = table::lookup(b"debug").expect("debug is in the table");
+        assert!(spec.flags.contains(&"admin"));
+        assert_eq!(spec.arity, -2);
+        assert_eq!(spec.acl, ["@admin", "@slow", "@dangerous"]);
     }
 
     #[test]

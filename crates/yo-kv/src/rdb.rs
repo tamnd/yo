@@ -146,6 +146,8 @@
 //! full of LZF strings.
 
 use std::borrow::Cow;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering::Relaxed;
 
 use yo_common::crc::crc64;
 use yo_common::num::{self, DIGITS_MAX};
@@ -297,10 +299,36 @@ fn unseal(payload: &[u8]) -> Result<&[u8], Bad> {
     // payload damaged into exactly eight zero bytes gets read anyway, which is
     // the same cost Redis pays and a smaller one than refusing a whole class of
     // real payloads.
-    if stored != 0 && stored != crc64(0, &payload[..payload.len() - 8]) {
+    if stored != 0 && stored != crc64(0, &payload[..payload.len() - 8]) && !skipping() {
         return Err(Bad::Footer);
     }
     Ok(body)
+}
+
+/// Whether the checksum on a payload is being ignored.
+///
+/// One word for the process rather than a flag threaded through every caller,
+/// because that is what it is on a real server too: `DEBUG
+/// SET-SKIP-CHECKSUM-VALIDATION` writes `server.skip_checksum_validation` and
+/// every reader in the build looks at that one field. The load is behind the
+/// comparison that already failed, so a payload whose checksum is right never
+/// touches it.
+static SKIPPING: AtomicBool = AtomicBool::new(false);
+
+/// Whether to take a payload whose checksum does not match.
+fn skipping() -> bool {
+    SKIPPING.load(Relaxed)
+}
+
+/// Turn the checksum check off, or back on.
+///
+/// This is a debugging knob and it is a loaded one: with it off, a payload that
+/// has been damaged in exactly the way a checksum is there to catch is read as
+/// though it were fine, and what comes out of it is whatever the damage says.
+/// It exists because a test suite needs to hand a server a payload it built by
+/// hand, and computing a crc64 in Tcl to do that is not a test of anything.
+pub fn skip_checksums(off: bool) {
+    SKIPPING.store(off, Relaxed);
 }
 
 // ---------------------------------------------------------------------------

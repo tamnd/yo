@@ -5247,6 +5247,17 @@ wire = "verified"
 notes = "Three elements: the word master, then the replication offset as an integer, then the list of replicas attached. Zero and an empty list, which is the same pair INFO replication reports next to it and is true rather than a placeholder: nothing has been written to a stream that does not exist and nothing is following this server. It becomes a real answer when replication lands. Noscript, so a script is refused it, which is a real server too and is the one thing about this command that surprises people. Not admin, so it is reported to a monitor."
 
 [[command]]
+name = "DEBUG"
+group = "server"
+since = "1.0.0"
+arity = -2
+plan = "none"
+bounded = "inherent"
+status = "shipped"
+wire = "verified"
+notes = "The subcommands that are about this server, which is eleven of them: HELP, PROTOCOL, ERROR, LOG, SLEEP, POPULATE, SET-ACTIVE-EXPIRE, PAUSE-CRON, DICT-RESIZING, SET-SKIP-CHECKSUM-VALIDATION and QUICKLIST-PACKED-THRESHOLD. PROTOCOL is the one a client library reaches for, and all thirteen type names answer the exact bytes 8.10.1 answers on both protocols, including the two that are not the shape people expect: on RESP3 attrib is an attribute followed by a string and push is a string followed by the push, in that order, and on RESP2 push is the only one that is an error. A name that is none of the thirteen lists all thirteen. An unknown subcommand and a subcommand handed the wrong number of arguments are the same sentence on a real server, ERR unknown subcommand or wrong number of arguments for <name>. Try DEBUG HELP., with the name echoed in the case it arrived in, and that is what happens here. The four flags are read by atoi, so anything unreadable means nought, which turns three of them off and PAUSE-CRON on, and all four always answer OK. Three of them gate something real: SET-ACTIVE-EXPIRE stops the background expiry sweep and does not make an expired key readable, PAUSE-CRON stops the whole maintenance pass, and DICT-RESIZING stops arena compaction, which is the nearest thing here to the dictionary resize it turns off on a real server. SET-SKIP-CHECKSUM-VALIDATION is read after a payload checksum has already failed, which is where the reference reads it too. QUICKLIST-PACKED-THRESHOLD takes the memory value a real server takes, refusing anything over four gigabytes less a megabyte, and is remembered and read by nothing, which is D-128. SLEEP holds the thread the connection landed on and not the whole server when threads is above one, which is D-129. POPULATE writes <prefix>:<n> with the default prefix key and the value value:<n>, padded with zero bytes to size or cut short by it, leaving a key that is already there completely alone and firing no keyspace notification, both of which are the reference. Admin, so no monitor is shown one, and noscript, loading and stale. The inspection half, OBJECT and SDSLEN and LISTPACK and QUICKLIST and DIGEST and DIGEST-VALUE, is a separate change, and RELOAD, LOADAOF and CHANGE-REPL-ID wait on a whole file RDB reader, an append only file and a replication id, none of which exist yet."
+
+[[command]]
 name = "AUTH"
 group = "connection"
 since = "1.0.0"

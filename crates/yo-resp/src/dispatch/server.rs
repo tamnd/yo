@@ -16,7 +16,7 @@
 
 use super::args::{self, Args, is};
 use super::table::{self, Spec};
-use super::{DATABASES, Flow, Server, Session, auth, backup, cpu, multi, notify, persist};
+use super::{DATABASES, Flow, Server, Session, auth, backup, cpu, debug, multi, notify, persist};
 use crate::proto::Proto;
 use crate::reply::Out;
 use core::fmt::Write;
@@ -287,6 +287,7 @@ pub(super) fn execute(
         }
         "echo" => out.bulk(args.get(1)),
         "auth" => auth::execute(server, session, args, out)?,
+        "debug" => debug::execute(server, session, args, out)?,
         "hello" => hello(server, session, args, out)?,
         "select" => {
             let n = args.int(1)?;
@@ -796,24 +797,29 @@ fn getkeys(args: Args<'_>, out: &mut Out) -> Result<()> {
 /// them says where the keys are for everything in this table except `MSETEX`,
 /// `TS.NRANGE` and `TS.NREVRANGE`, which is what `COMMAND GETKEYS` is for, and
 /// divergence D-13 says so.
+///
+/// Five of the ten fields are sets rather than arrays, which only shows on
+/// RESP3 and shows there on every command. A set is what the reference sends
+/// for all five, and it is the honest type for them: nothing in a flag list or
+/// an acl category list is ordered or repeated.
 fn write_spec(out: &mut Out, spec: &Spec) {
     out.array(10);
     out.bulk(spec.name.as_bytes());
     out.int(i64::from(spec.arity));
-    out.array(spec.flags.len());
+    out.set(spec.flags.len());
     for f in spec.flags {
         out.simple(f.as_bytes());
     }
     out.int(i64::from(spec.first_key));
     out.int(i64::from(spec.last_key));
     out.int(i64::from(spec.step));
-    out.array(spec.acl.len());
+    out.set(spec.acl.len());
     for a in spec.acl {
         out.simple(a.as_bytes());
     }
-    out.array(0);
-    out.array(0);
-    out.array(0);
+    out.set(0);
+    out.set(0);
+    out.set(0);
 }
 
 // ------------------------------------------------------------------ CONFIG
