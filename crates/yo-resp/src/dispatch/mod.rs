@@ -8864,6 +8864,213 @@ mod tests {
         assert_eq!(s.files(), ["dump.rdb"]);
     }
 
+    /// Every type survives the trip out to the file and back.
+    ///
+    /// This is the test the Redis suite is really running when it calls `DEBUG
+    /// RELOAD` after a case: not that the command answers, but that what was in
+    /// memory before it is what is in memory after it.
+    #[test]
+    fn debug_reload_brings_every_type_back_the_way_it_went_in() {
+        let mut s = Saves::new("reload-types");
+        s.run(&[b"SET", b"str", b"hello"]);
+        s.run(&[b"SET", b"num", b"1234"]);
+        s.run(&[b"RPUSH", b"list", b"a", b"b", b"c"]);
+        s.run(&[b"SADD", b"set", b"x", b"y"]);
+        s.run(&[b"SADD", b"ints", b"1", b"2", b"3"]);
+        s.run(&[b"HSET", b"hash", b"f", b"v", b"g", b"w"]);
+        s.run(&[b"ZADD", b"zset", b"1.5", b"m", b"2", b"n"]);
+        s.run(&[b"XADD", b"stream", b"1-1", b"f", b"v"]);
+        s.run(&[b"PEXPIREAT", b"str", b"4102444800000"]);
+        let before = s.run(&[b"DBSIZE"]);
+
+        assert_eq!(s.run(&[b"DEBUG", b"RELOAD"]), "+OK\r\n");
+
+        assert_eq!(s.run(&[b"DBSIZE"]), before);
+        assert_eq!(s.run(&[b"GET", b"str"]), "$5\r\nhello\r\n");
+        assert_eq!(s.run(&[b"GET", b"num"]), "$4\r\n1234\r\n");
+        assert_eq!(
+            s.run(&[b"LRANGE", b"list", b"0", b"-1"]),
+            "*3\r\n$1\r\na\r\n$1\r\nb\r\n$1\r\nc\r\n"
+        );
+        assert_eq!(s.run(&[b"SCARD", b"set"]), ":2\r\n");
+        assert_eq!(s.run(&[b"SISMEMBER", b"set", b"y"]), ":1\r\n");
+        assert_eq!(s.run(&[b"SCARD", b"ints"]), ":3\r\n");
+        assert_eq!(s.run(&[b"HGET", b"hash", b"g"]), "$1\r\nw\r\n");
+        assert_eq!(s.run(&[b"ZSCORE", b"zset", b"m"]), "$3\r\n1.5\r\n");
+        assert_eq!(s.run(&[b"XLEN", b"stream"]), ":1\r\n");
+        // The deadline travels with the key, and it is the same deadline and not
+        // one worked out again from a remaining time.
+        assert_eq!(s.run(&[b"PEXPIRETIME", b"str"]), ":4102444800000\r\n");
+        assert_eq!(s.run(&[b"PEXPIRETIME", b"num"]), ":-1\r\n");
+    }
+
+    /// A key goes back into the database it came out of.
+    #[test]
+    fn debug_reload_puts_every_key_back_in_its_own_database() {
+        let mut s = Saves::new("reload-dbs");
+        s.run(&[b"SET", b"home", b"zero"]);
+        s.run(&[b"SELECT", b"9"]);
+        s.run(&[b"SET", b"away", b"nine"]);
+        s.run(&[b"SELECT", b"0"]);
+
+        assert_eq!(s.run(&[b"DEBUG", b"RELOAD"]), "+OK\r\n");
+
+        assert_eq!(s.run(&[b"GET", b"home"]), "$4\r\nzero\r\n");
+        assert_eq!(s.run(&[b"EXISTS", b"away"]), ":0\r\n");
+        s.run(&[b"SELECT", b"9"]);
+        assert_eq!(s.run(&[b"GET", b"away"]), "$4\r\nnine\r\n");
+        assert_eq!(s.run(&[b"EXISTS", b"home"]), ":0\r\n");
+    }
+
+    /// `NOSAVE` reads the file that is there rather than writing a new one.
+    #[test]
+    fn debug_reload_nosave_reads_the_file_that_is_already_there() {
+        let mut s = Saves::new("reload-nosave");
+        s.run(&[b"SET", b"k", b"first"]);
+        s.run(&[b"SAVE"]);
+        s.run(&[b"SET", b"k", b"second"]);
+        s.run(&[b"SET", b"later", b"x"]);
+
+        assert_eq!(s.run(&[b"DEBUG", b"RELOAD", b"NOSAVE"]), "+OK\r\n");
+
+        // Both changes are gone, because the file knows nothing about either.
+        assert_eq!(s.run(&[b"GET", b"k"]), "$5\r\nfirst\r\n");
+        assert_eq!(s.run(&[b"EXISTS", b"later"]), ":0\r\n");
+    }
+
+    /// `NOFLUSH` lets the file land on what is already in memory.
+    #[test]
+    fn debug_reload_noflush_keeps_what_the_file_does_not_mention() {
+        let mut s = Saves::new("reload-noflush");
+        s.run(&[b"SET", b"k", b"first"]);
+        s.run(&[b"SAVE"]);
+        s.run(&[b"SET", b"k", b"second"]);
+        s.run(&[b"SET", b"later", b"x"]);
+
+        assert_eq!(
+            s.run(&[b"DEBUG", b"RELOAD", b"NOSAVE", b"NOFLUSH"]),
+            "+OK\r\n"
+        );
+
+        // The file wins where the two disagree and memory keeps the rest, which
+        // is what `MERGE` buys on a real server and is what happens here whether
+        // the word was sent or not.
+        assert_eq!(s.run(&[b"GET", b"k"]), "$5\r\nfirst\r\n");
+        assert_eq!(s.run(&[b"GET", b"later"]), "$1\r\nx\r\n");
+    }
+
+    /// The three words it takes, in any case, and one sentence for anything else.
+    #[test]
+    fn debug_reload_takes_its_three_words_and_no_others() {
+        let mut s = Saves::new("reload-words");
+        s.run(&[b"SET", b"k", b"v"]);
+        for parts in [
+            &[b"DEBUG".as_slice(), b"RELOAD"][..],
+            &[b"DEBUG", b"RELOAD", b"NOSAVE"],
+            &[b"DEBUG", b"RELOAD", b"nosave"],
+            &[b"DEBUG", b"RELOAD", b"MERGE"],
+            &[b"DEBUG", b"RELOAD", b"NOFLUSH"],
+            &[b"DEBUG", b"RELOAD", b"MERGE", b"NOFLUSH", b"NOSAVE"],
+            // Repeated is not an error on a real server either.
+            &[b"DEBUG", b"RELOAD", b"NOSAVE", b"NOSAVE"],
+        ] {
+            assert_eq!(s.run(parts), "+OK\r\n", "{parts:?}");
+        }
+        for parts in [
+            &[b"DEBUG".as_slice(), b"RELOAD", b"BOGUS"][..],
+            &[b"DEBUG", b"RELOAD", b"NOSAVE", b"BOGUS"],
+            &[b"DEBUG", b"RELOAD", b""],
+        ] {
+            assert_eq!(
+                s.run(parts),
+                "-ERR DEBUG RELOAD only supports the MERGE, NOFLUSH and NOSAVE options.\r\n",
+                "{parts:?}"
+            );
+        }
+        // And the dataset is still there after all of that.
+        assert_eq!(s.run(&[b"GET", b"k"]), "$1\r\nv\r\n");
+    }
+
+    /// A reload that cannot write its file says what a save says.
+    #[test]
+    fn debug_reload_that_cannot_write_the_file_says_so_in_one_word() {
+        let mut s = Saves::new("reload-nowhere");
+        s.run(&[b"SET", b"k", b"v"]);
+        s.f.server.set_dir(s.dir.join("gone"));
+        assert_eq!(s.run(&[b"DEBUG", b"RELOAD"]), "-ERR\r\n");
+        // Nothing was thrown away, because nothing was read.
+        assert_eq!(s.run(&[b"GET", b"k"]), "$1\r\nv\r\n");
+    }
+
+    /// A reload that cannot read its file says to look in the log.
+    ///
+    /// Two ways to get there, a file that is not there and a file that is not
+    /// one, and the reply is the same sentence for both because a client can do
+    /// nothing with the difference.
+    #[test]
+    fn debug_reload_that_cannot_read_the_file_says_to_check_the_log() {
+        let mut s = Saves::new("reload-unreadable");
+        s.run(&[b"SET", b"k", b"v"]);
+        let failed = "-ERR Error trying to load the RDB dump, check server logs.\r\n";
+        assert_eq!(s.run(&[b"DEBUG", b"RELOAD", b"NOSAVE"]), failed);
+        // Refused before the flush, so the dataset is still here.
+        assert_eq!(s.run(&[b"GET", b"k"]), "$1\r\nv\r\n");
+
+        s.run(&[b"SAVE"]);
+        std::fs::write(s.dir.join("dump.rdb"), b"not an RDB file at all")
+            .expect("could not write over the file");
+        assert_eq!(s.run(&[b"DEBUG", b"RELOAD", b"NOSAVE"]), failed);
+        assert_eq!(s.run(&[b"GET", b"k"]), "$1\r\nv\r\n");
+    }
+
+    /// A reload says what it would lose rather than losing it.
+    ///
+    /// A time series has no RDB type byte, so it is not in the file the save
+    /// wrote, and flushing would make the round trip a delete. `NOFLUSH` is the
+    /// way through: everything in the file lands on top of what is there and the
+    /// key that could not be written stays where it is.
+    #[test]
+    fn debug_reload_refuses_to_drop_a_key_with_no_rdb_form() {
+        let mut s = Saves::new("reload-foreign");
+        s.run(&[b"SET", b"k", b"v"]);
+        s.run(&[b"TS.CREATE", b"ts"]);
+        s.run(&[b"TS.ADD", b"ts", b"1000", b"1.5"]);
+
+        assert_eq!(
+            s.run(&[b"DEBUG", b"RELOAD"]),
+            "-ERR DEBUG RELOAD would drop 1 key with no RDB form, use NOFLUSH to keep it\r\n"
+        );
+        assert_eq!(s.run(&[b"EXISTS", b"ts"]), ":1\r\n");
+
+        s.run(&[b"TS.CREATE", b"ts2"]);
+        assert_eq!(
+            s.run(&[b"DEBUG", b"RELOAD"]),
+            "-ERR DEBUG RELOAD would drop 2 keys with no RDB form, use NOFLUSH to keep them\r\n"
+        );
+
+        // And the way through keeps everything.
+        assert_eq!(s.run(&[b"DEBUG", b"RELOAD", b"NOFLUSH"]), "+OK\r\n");
+        assert_eq!(s.run(&[b"EXISTS", b"ts"]), ":1\r\n");
+        assert_eq!(s.run(&[b"GET", b"k"]), "$1\r\nv\r\n");
+        assert_eq!(s.run(&[b"TS.GET", b"ts"]), "*2\r\n:1000\r\n+1.5\r\n");
+    }
+
+    /// A key that died while the file was on disk does not come back.
+    #[test]
+    fn debug_reload_drops_a_key_whose_deadline_went_by() {
+        let mut s = Saves::new("reload-expired");
+        s.run(&[b"SET", b"gone", b"v"]);
+        s.run(&[b"SET", b"stays", b"v"]);
+        s.run(&[b"PEXPIREAT", b"gone", b"4102444800000"]);
+        s.run(&[b"SAVE"]);
+        s.f.server.set_clock_ms(4_102_444_800_001);
+
+        assert_eq!(s.run(&[b"DEBUG", b"RELOAD", b"NOSAVE"]), "+OK\r\n");
+
+        assert_eq!(s.run(&[b"EXISTS", b"gone"]), ":0\r\n");
+        assert_eq!(s.run(&[b"GET", b"stays"]), "$1\r\nv\r\n");
+    }
+
     /// A fixture on a server with a password, on a connection that has not met
     /// it.
     ///
