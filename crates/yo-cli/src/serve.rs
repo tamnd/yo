@@ -371,8 +371,9 @@ impl Net {
     /// it took. Only the test about sharing a burst out asks, because nothing
     /// the server does depends on the number, and that test opens a unix
     /// socket, so on Windows this is a method with no callers rather than one
-    /// with a caller that is compiled out.
-    #[cfg(all(test, unix))]
+    /// with a caller that is compiled out. Under Miri the whole test module
+    /// goes, so this has to go with it for the same reason.
+    #[cfg(all(test, unix, not(miri)))]
     fn held(&self) -> usize {
         self.streams.iter().filter(|s| s.is_some()).count()
     }

@@ -3903,6 +3903,7 @@ mod tests {
     /// A script is reported before it runs, so that what it did arrives behind
     /// it, and what it did is reported against `lua` rather than an address.
     #[test]
+    #[cfg_attr(miri, ignore = "a Lua state is C, and Miri interprets Rust")]
     fn a_script_is_reported_in_front_of_its_own_effects() {
         let (mut r, eye, one, mut batch) = watched();
 
