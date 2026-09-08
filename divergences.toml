@@ -103,10 +103,10 @@ spec = "12 section 9"
 
 [[divergence]]
 id = "D-13"
-title = "COMMAND INFO sends empty tips, key specs and subcommands"
-reason = "The first, last and step triple is filled in and correct, which is what a cluster aware client routes on, and COMMAND GETKEYS answers for the one command whose keys are not where the triple says. The three fields after it describe request policies and key flags that nothing in this engine has yet, and an invented answer is worse than an empty one because a client that finds the field trusts it."
+title = "COMMAND INFO sends empty tips and subcommands"
+reason = "The key specs are filled in now, and they are the reference's own rather than a guess: every one of them was read off a running 8.10.1 and every command both servers have reports the same field. The two fields left are the tips, which describe request policies for a proxy nothing here has yet, and the subcommands, which wait on the subcommand table D-114 is about. An invented answer is worse than an empty one because a client that finds the field trusts it."
 status = "until"
-resolved_by = "M6"
+resolved_by = "M8"
 spec = "12 section 9"
 
 [[divergence]]
@@ -815,7 +815,7 @@ spec = "12 section 4"
 [[divergence]]
 id = "D-114"
 title = "An unknown subcommand inside MULTI is queued rather than refused"
-reason = "The reference looks a container command's subcommand up in the same table it looks the command up in, so CONFIG NOPE is not a command at all and is refused where the client wrote it, which kills the transaction and makes EXEC an abort. Here a container is one row in the table and the subcommand is read by the command's own body, so CONFIG NOPE is queued, answers QUEUED, and fails with the same message when EXEC runs it, leaving the rest of the queue to run. Everything else about the queue is the same, including the far more common case of a command that is not a command at all and the case of a container sent with the wrong number of arguments outright. What closes it is a subcommand table, which is the same thing missing from COMMAND INFO's subcommands field and from COMMAND COUNT, so it is one piece of work and not three."
+reason = "The reference looks a container command's subcommand up in the same table it looks the command up in, so CONFIG NOPE is not a command at all and is refused where the client wrote it, which kills the transaction and makes EXEC an abort. Here a container is one row in the table and the subcommand is read by the command's own body, so CONFIG NOPE is queued, answers QUEUED, and fails with the same message when EXEC runs it, leaving the rest of the queue to run. Everything else about the queue is the same, including the far more common case of a command that is not a command at all and the case of a container sent with the wrong number of arguments outright. What closes it is a subcommand table, which is the same thing missing from COMMAND INFO's subcommands field and from COMMAND COUNT, so it is one piece of work and not three. The fourth thing it closes is COMMAND GETKEYS over a container: the reference looks up the pair, fails, and answers Invalid command specified, and here the container is found and asked about its keys, so an unknown subcommand answers The command has no key arguments instead. Both are errors and both name the same problem, and the eleven containers are the whole of it."
 status = "until"
 resolved_by = "M8"
 spec = "12 section 4"

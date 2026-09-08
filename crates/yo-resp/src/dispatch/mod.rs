@@ -72,6 +72,7 @@ mod hll;
 mod indexing;
 mod json;
 mod keyspace;
+pub mod keyspec;
 mod lists;
 mod load;
 mod lua;
@@ -7202,7 +7203,13 @@ mod tests {
         assert_eq!(
             info,
             "*1\r\n*10\r\n$3\r\nget\r\n:2\r\n*2\r\n+readonly\r\n+fast\r\n:1\r\n:1\r\n:1\r\n\
-             *3\r\n+@read\r\n+@string\r\n+@fast\r\n*0\r\n*0\r\n*0\r\n"
+             *3\r\n+@read\r\n+@string\r\n+@fast\r\n*0\r\n*1\r\n*6\r\n\
+             $5\r\nflags\r\n*2\r\n+RO\r\n+access\r\n\
+             $12\r\nbegin_search\r\n*4\r\n$4\r\ntype\r\n$5\r\nindex\r\n$4\r\nspec\r\n\
+             *2\r\n$5\r\nindex\r\n:1\r\n\
+             $9\r\nfind_keys\r\n*4\r\n$4\r\ntype\r\n$5\r\nrange\r\n$4\r\nspec\r\n\
+             *6\r\n$7\r\nlastkey\r\n:0\r\n$7\r\nkeystep\r\n:1\r\n$5\r\nlimit\r\n:0\r\n\
+             *0\r\n"
         );
         // A null in the list, and the plain one: `$-1` and not `*-1`.
         assert_eq!(f.run(&[b"COMMAND", b"INFO", b"nosuch"]), "*1\r\n$-1\r\n");
@@ -10128,14 +10135,26 @@ mod tests {
         assert_eq!(
             f.run(&[b"COMMAND", b"INFO", b"get"]),
             "*1\r\n*10\r\n$3\r\nget\r\n:2\r\n~2\r\n+readonly\r\n+fast\r\n:1\r\n:1\r\n:1\r\n\
-             ~3\r\n+@read\r\n+@string\r\n+@fast\r\n~0\r\n~0\r\n~0\r\n"
+             ~3\r\n+@read\r\n+@string\r\n+@fast\r\n~0\r\n~1\r\n%3\r\n\
+             $5\r\nflags\r\n~2\r\n+RO\r\n+access\r\n\
+             $12\r\nbegin_search\r\n%2\r\n$4\r\ntype\r\n$5\r\nindex\r\n$4\r\nspec\r\n\
+             %1\r\n$5\r\nindex\r\n:1\r\n\
+             $9\r\nfind_keys\r\n%2\r\n$4\r\ntype\r\n$5\r\nrange\r\n$4\r\nspec\r\n\
+             %3\r\n$7\r\nlastkey\r\n:0\r\n$7\r\nkeystep\r\n:1\r\n$5\r\nlimit\r\n:0\r\n\
+             ~0\r\n"
         );
         // And RESP2, where a set is an array and nothing moved.
         let mut f = Fixture::new();
         assert_eq!(
             f.run(&[b"COMMAND", b"INFO", b"get"]),
             "*1\r\n*10\r\n$3\r\nget\r\n:2\r\n*2\r\n+readonly\r\n+fast\r\n:1\r\n:1\r\n:1\r\n\
-             *3\r\n+@read\r\n+@string\r\n+@fast\r\n*0\r\n*0\r\n*0\r\n"
+             *3\r\n+@read\r\n+@string\r\n+@fast\r\n*0\r\n*1\r\n*6\r\n\
+             $5\r\nflags\r\n*2\r\n+RO\r\n+access\r\n\
+             $12\r\nbegin_search\r\n*4\r\n$4\r\ntype\r\n$5\r\nindex\r\n$4\r\nspec\r\n\
+             *2\r\n$5\r\nindex\r\n:1\r\n\
+             $9\r\nfind_keys\r\n*4\r\n$4\r\ntype\r\n$5\r\nrange\r\n$4\r\nspec\r\n\
+             *6\r\n$7\r\nlastkey\r\n:0\r\n$7\r\nkeystep\r\n:1\r\n$5\r\nlimit\r\n:0\r\n\
+             *0\r\n"
         );
     }
 
