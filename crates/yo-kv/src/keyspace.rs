@@ -969,6 +969,28 @@ impl Keyspace {
         Some(self.lists.get(at)?.encoding())
     }
 
+    /// How many chunks a list is in and what its entries take, or `None` if
+    /// `key` is not a list.
+    ///
+    /// The two numbers `DEBUG OBJECT` adds for a quicklist, which is the only
+    /// place either of them is on the wire. Both are asked of the body for the
+    /// reason [`Keyspace::list_encoding`] gives.
+    pub fn list_shape(&mut self, key: &[u8]) -> Option<(usize, usize)> {
+        self.reap(key);
+        let rec = self.map.get(key)?;
+        if value::kind(rec) != Kind::List {
+            return None;
+        }
+        let cold = value::Meta::from_byte(rec[0]).is_cold();
+        let at = if cold {
+            self.promote_body(key).ok()??
+        } else {
+            value::slot(rec)
+        };
+        let list = self.lists.get(at)?;
+        Some((list.nodes(), list.packed_bytes()))
+    }
+
     /// How a sorted set is represented, or `None` if `key` is not one.
     pub fn zset_encoding(&mut self, key: &[u8]) -> Option<zset::Encoding> {
         self.reap(key);
@@ -1100,6 +1122,22 @@ impl Keyspace {
             // The body knows and this does not, which is the whole point of it.
             Kind::Foreign => self.foreign_at(key).map(Foreign::encoding),
         }
+    }
+
+    /// Where the record for `key` currently sits in memory.
+    ///
+    /// `DEBUG OBJECT`'s `at` field, and nothing else asks. A real server prints
+    /// the address of the `robj` there, and what a person does with it is tell
+    /// two values apart or watch one stop moving, neither of which needs the
+    /// number to point at any particular part of the value.
+    ///
+    /// So this is the record rather than the body, which is the nearest thing
+    /// here to the object header Redis prints. It moves when the arena the
+    /// record is in compacts, the same way Redis's moves when the value is
+    /// rewritten, and dereferencing it is no more possible on either server.
+    pub fn value_address(&mut self, key: &[u8]) -> Option<usize> {
+        self.reap(key);
+        Some(self.map.get(key)?.as_ptr() as usize)
     }
 
     /// Put a deadline on `key`, or take one off. Answers whether it was there.

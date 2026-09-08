@@ -64,6 +64,15 @@ const FORM_CHUNKS: u8 = 2;
 /// A list element: bytes as they lie, or an integer not yet formatted.
 pub type Element<'a> = Entry<'a>;
 
+/// What a listpack costs beyond the entries in it.
+///
+/// Four bytes of total size, two of element count and one terminator on the end.
+/// Nothing here stores a listpack in that shape, and the number is still worth
+/// having: it is the difference between what this holds and what a real server
+/// would hold for the same list, which is exactly the question
+/// [`List::packed_bytes`] is answering.
+const LISTPACK_AROUND: usize = 7;
+
 /// Where a list changes representation.
 ///
 /// One number, because Redis has one: `list-max-listpack-size`. A negative value
@@ -298,6 +307,43 @@ impl List {
         match &self.body {
             Body::Packed(lp) => lp.byte_len(),
             Body::Chunks(d) => d.memory_bytes(),
+        }
+    }
+
+    /// How many chunks the ring is in, which a listpack answers as one.
+    ///
+    /// `DEBUG OBJECT` calls this `ql_nodes` and it is the number a person
+    /// looking at a list is actually after: a list of a thousand elements in
+    /// three nodes and the same list in a thousand nodes behave nothing alike,
+    /// and nothing else on the wire tells the two apart.
+    #[must_use]
+    pub fn nodes(&self) -> usize {
+        match &self.body {
+            Body::Packed(_) => 1,
+            Body::Chunks(d) => d.nodes(),
+        }
+    }
+
+    /// What the elements would take written out as listpacks, one per node.
+    ///
+    /// `DEBUG OBJECT` calls this `ql_uncompressed_size`, and the name is about
+    /// the thing a real server compares it against: on Redis the middle nodes of
+    /// a long list can be held compressed, so the size before compression is a
+    /// separate question from the size. Nothing here compresses a node, so the
+    /// two are the same number and this is it.
+    ///
+    /// Encoded rather than held, because the two differ. A chunk keeps its
+    /// entries in a ring with room at both ends and no header, and Redis keeps
+    /// the same entries in a listpack with a six byte header and a terminator,
+    /// so this is the entries as they lie plus the seven bytes of that header
+    /// and terminator per node. It comes to the same number for the same list, which is what makes
+    /// it worth reporting: a person comparing this against a real server is
+    /// asking about the data and not about either layout.
+    #[must_use]
+    pub fn packed_bytes(&self) -> usize {
+        match &self.body {
+            Body::Packed(lp) => lp.byte_len() + LISTPACK_AROUND,
+            Body::Chunks(d) => d.packed_bytes(),
         }
     }
 
@@ -820,6 +866,19 @@ impl Deque {
         self.chunks.iter().map(Chunk::memory_bytes).sum::<usize>()
             + spare * size_of::<Chunk>()
             + self.starts.borrow().capacity() * size_of::<i64>()
+    }
+
+    /// How many chunks are in the ring.
+    fn nodes(&self) -> usize {
+        self.chunks.len()
+    }
+
+    /// What the entries in every chunk would take as one listpack each.
+    fn packed_bytes(&self) -> usize {
+        self.chunks
+            .iter()
+            .map(|c| c.live_bytes() + LISTPACK_AROUND)
+            .sum()
     }
 
     /// The first element.

@@ -38,6 +38,14 @@
 //! almost every case, and a case that passes on both sides of it has proved that
 //! the writer and the reader of the file agree about the value it just made.
 //!
+//! Then there are the four that only look: `OBJECT`, `SDSLEN`, `LISTPACK` and
+//! `QUICKLIST`. None of them change anything and none of them count as a use of
+//! the key they are about, which is the property that makes them worth having at
+//! all. A suite that wants to know how big a value really is, or how many nodes
+//! a list broke into, has nowhere else to ask, because everything on the ordinary
+//! command surface answers about the value rather than about the way it is
+//! written down.
+//!
 //! # How the errors work
 //!
 //! Every complaint in this file is the same sentence, `unknown subcommand or
@@ -52,12 +60,13 @@
 //! fail on the value rather than on the count, which are
 //! `QUICKLIST-PACKED-THRESHOLD` and `POPULATE`, and each has its own sentence.
 
+use core::fmt::Write as _;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering::Relaxed;
 
 use yo_common::num::parse_i64;
 use yo_common::{Code, Error, Result};
-use yo_kv::SetOptions;
+use yo_kv::{SetOptions, lookups};
 
 use super::args::{self, Args, is};
 use super::{Server, Session, persist};
@@ -178,6 +187,14 @@ pub(super) fn execute(
         return packed(server, args.get(2), out);
     } else if is(sub, b"RELOAD") {
         return reload(server, args, out);
+    } else if is(sub, b"OBJECT") && args.len() == 3 {
+        return object(server, session, args.get(2), out);
+    } else if is(sub, b"SDSLEN") && args.len() == 3 {
+        return sdslen(server, session, args.get(2), out);
+    } else if is(sub, b"LISTPACK") && args.len() == 3 {
+        return packing(server, session, args.get(2), Packing::Listpack, out);
+    } else if is(sub, b"QUICKLIST") && (3..=4).contains(&args.len()) {
+        return packing(server, session, args.get(2), Packing::Quicklist, out);
     } else {
         return Err(args::subcommand_syntax(sub, "DEBUG"));
     }
@@ -364,6 +381,257 @@ fn load_file(server: &Server, flush: bool) -> bool {
     }
 }
 
+/// What every one of the inspection subcommands says about a key that is not
+/// there.
+///
+/// `OBJECT` is the odd one out among the key commands generally, since
+/// `OBJECT ENCODING` on a missing key is a nil rather than this. `DEBUG OBJECT`
+/// is not `OBJECT` and answers the error, which is checked rather than assumed.
+const NO_SUCH_KEY: &str = "no such key";
+
+/// The LRU clock is twenty four bits of seconds, and wraps every 194 days.
+///
+/// A real server keeps the same three bytes for the same reason it is worth
+/// keeping here: the field lives inside the object header next to the type and
+/// the encoding, and a client that reads it is comparing two of them rather than
+/// reading it as a date.
+const LRU_CLOCK_MAX: u64 = (1 << 24) - 1;
+
+/// What a `DUMP` payload carries that the value itself is not.
+///
+/// One type byte in front, then two bytes of RDB version and eight of checksum
+/// behind. `serializedlength` is the body between them, which is what
+/// `rdbSavedObjectLen` counts on a real server, so taking these off the payload
+/// this server already knows how to build is the whole of that number.
+const DUMP_AROUND: usize = 11;
+
+/// `DEBUG OBJECT <key>`, the low level line about one value.
+///
+/// Seven fields, or twelve for a quicklist. Three of them are about the value as
+/// bytes, which is the encoding, the serialized length and the quicklist shape,
+/// and those are the ones a person actually reads. The rest are about the object
+/// header a real server keeps: the address it is at, how many things point at it
+/// and when it was last touched.
+///
+/// `serializedlength` is the value's RDB body, without the type byte in front of
+/// it and without the version and checksum a `DUMP` puts behind it. That is
+/// `rdbSavedObjectLen` on a real server and it means the same thing here, so a
+/// value this build writes differently is a value with a different number, and
+/// the five list shapes D-111 already covers are the ones that differ.
+///
+/// `refcount` is one, always, for the reason `OBJECT REFCOUNT` gives. `at` is
+/// where the record sits rather than where an object header would, which is
+/// D-134: see [`yo_kv::keyspace::Keyspace::value_address`] for why that is the
+/// same answer to the question anybody asks it.
+///
+/// `lru` is the same clock `OBJECT IDLETIME` counts back from, so the two agree
+/// by construction: the clock now, less the seconds the key has been idle,
+/// wrapped into twenty four bits. Reading it is not using the key, so a second
+/// call answers a larger idle time and the same `lru`.
+fn object(server: &Server, session: &Session, key: &[u8], out: &mut Out) -> Result<()> {
+    let mut held = server.dbs[session.db].hold(key);
+    let Some(encoding) = held.encoding_name(key) else {
+        return Err(Error::new(Code::Invalid, NO_SUCH_KEY));
+    };
+    // The encoding above is the lookup this is counted for, and everything
+    // below asks about the same key again.
+    let _quiet = lookups::quiet();
+    let at = held.value_address(key).unwrap_or(0);
+    let idle = held.idle_secs(key).unwrap_or(0);
+    // A value with no RDB shape has no serialized length either, and nought is
+    // the honest answer rather than a refusal: the rest of the line is about
+    // the same value and is still true.
+    let serialized = held
+        .dump(key)
+        .map_or(0, |payload| payload.len() - DUMP_AROUND);
+    let quicklist = (encoding == "quicklist")
+        .then(|| held.list_shape(key))
+        .flatten()
+        .map(|(nodes, bytes)| {
+            // The average is elements over nodes, which is what the reference
+            // divides too, and both sides print it to two places.
+            let len = held.llen(key).unwrap_or(0);
+            let fill = list_fill(&held.bands().list);
+            (nodes, len as f64 / nodes.max(1) as f64, fill, bytes)
+        });
+    drop(held);
+
+    let now = server.clock.now_ms() / 1_000;
+    let lru = now.saturating_sub(idle) & LRU_CLOCK_MAX;
+    let mut line = String::with_capacity(192);
+    yo_alloc::allow(|| {
+        let _ = write!(
+            line,
+            "Value at:{at:#x} refcount:1 encoding:{encoding} \
+             serializedlength:{serialized} lru:{lru} lru_seconds_idle:{idle}",
+        );
+        if let Some((nodes, avg, fill, bytes)) = quicklist {
+            let _ = write!(
+                line,
+                " ql_nodes:{nodes} ql_avg_node:{avg:.2} ql_listpack_max:{fill} \
+                 ql_compressed:0 ql_uncompressed_size:{bytes}",
+            );
+        }
+    });
+    out.simple(line.as_bytes());
+    Ok(())
+}
+
+/// The `list-max-listpack-size` a set of list thresholds came from.
+///
+/// Backwards, because the setting is one number and the bands are two fields,
+/// and the two fields are what everything downstream of the parse wants. A count
+/// is itself and a size is the index into Redis's five, so this reads a band
+/// nobody set as the `-2` that made it.
+fn list_fill(limits: &yo_kv::list::Limits) -> i32 {
+    if let Some(count) = limits.max_packed_entries {
+        return i32::try_from(count).unwrap_or(i32::MAX);
+    }
+    match limits.max_packed_bytes {
+        4096 => -1,
+        16384 => -3,
+        32768 => -4,
+        65536 => -5,
+        _ => -2,
+    }
+}
+
+/// `DEBUG SDSLEN <key>`, the six numbers about a string and its name.
+///
+/// The two lengths are real and the four numbers around them are D-135. On a
+/// real server they are `sds` and `zmalloc` internals: how much spare room the
+/// string header left on the end and how many bytes the allocator handed back
+/// for the request, which are questions about jemalloc rather than about the
+/// value. Nothing here has either. A name is held packed with no spare and a
+/// string value is held at exactly its length, so the spare is nought and the
+/// allocation is the length, and those are true statements rather than
+/// placeholders.
+///
+/// An integer encoded string is refused, which is the reference's answer too and
+/// is for the same reason: there is no string there to measure, only the number
+/// it was read as.
+fn sdslen(server: &Server, session: &Session, key: &[u8], out: &mut Out) -> Result<()> {
+    let mut held = server.dbs[session.db].hold(key);
+    let Some(encoding) = held.encoding_name(key) else {
+        return Err(Error::new(Code::Invalid, NO_SUCH_KEY));
+    };
+    if !matches!(encoding, "raw" | "embstr") {
+        return Err(Error::new(Code::Invalid, "Not an sds encoded string."));
+    }
+    let _quiet = lookups::quiet();
+    let len = held.strlen(key).unwrap_or(0);
+    drop(held);
+
+    let mut line = String::with_capacity(128);
+    yo_alloc::allow(|| {
+        // The space after each `zmalloc:` and after nothing else is the
+        // reference's, and a suite reading the line by column would notice.
+        let _ = write!(
+            line,
+            "key_sds_len:{}, key_sds_avail:0, key_zmalloc: {}, \
+             val_sds_len:{len}, val_sds_avail:0, val_zmalloc: {len}",
+            key.len(),
+            key.len(),
+        );
+    });
+    out.simple(line.as_bytes());
+    Ok(())
+}
+
+/// Which of the two structure dumps was asked for.
+#[derive(Clone, Copy)]
+enum Packing {
+    Listpack,
+    Quicklist,
+}
+
+impl Packing {
+    /// The word for it, which is also the encoding a value has to be in.
+    const fn word(self) -> &'static str {
+        match self {
+            Packing::Listpack => "LISTPACK",
+            Packing::Quicklist => "QUICKLIST",
+        }
+    }
+
+    /// The encoding this dump is about.
+    const fn encoding(self) -> &'static str {
+        match self {
+            Packing::Listpack => "listpack",
+            Packing::Quicklist => "quicklist",
+        }
+    }
+
+    /// The sentence the client gets, which says where the real answer went.
+    const fn said(self) -> &'static [u8] {
+        match self {
+            Packing::Listpack => b"Listpack structure printed on stdout",
+            Packing::Quicklist => b"Quicklist structure printed on stdout",
+        }
+    }
+
+    /// The refusal for a value that is not in that representation.
+    const fn refusal(self) -> &'static str {
+        match self {
+            Packing::Listpack => "Not a listpack encoded object.",
+            Packing::Quicklist => "Not a quicklist encoded object.",
+        }
+    }
+}
+
+/// `DEBUG LISTPACK <key>` and `DEBUG QUICKLIST <key> [<level>]`.
+///
+/// Both of them write to the server's own output and answer the client a
+/// sentence saying so, which is what makes them usable at all: the structure of
+/// a listpack is pages of entry headers and nobody wants it on a socket. So the
+/// reply is fixed and the interesting part goes where the log goes.
+///
+/// The level argument on `QUICKLIST` is read and dropped, and a level that is not
+/// a number is accepted rather than refused, both of which are the reference's
+/// behaviour. It reads the word with `atoi` and prints more or less depending on
+/// what came back, and there is one amount of detail here.
+///
+/// A listpack is any value whose encoding is `listpack`, whatever type it is on,
+/// so a small list, hash, set and sorted set all answer. An `intset` does not,
+/// which is the one that reads like an exception and is not: an intset is a
+/// different packing with a different header.
+fn packing(
+    server: &Server,
+    session: &Session,
+    key: &[u8],
+    which: Packing,
+    out: &mut Out,
+) -> Result<()> {
+    let mut held = server.dbs[session.db].hold(key);
+    let Some(encoding) = held.encoding_name(key) else {
+        return Err(Error::new(Code::Invalid, NO_SUCH_KEY));
+    };
+    if encoding != which.encoding() {
+        return Err(Error::new(Code::Invalid, which.refusal()));
+    }
+    let _quiet = lookups::quiet();
+    let kind = held.type_name(key).unwrap_or("none");
+    let shape = held.list_shape(key);
+    let serialized = held
+        .dump(key)
+        .map_or(0, |payload| payload.len() - DUMP_AROUND);
+    drop(held);
+
+    yo_alloc::allow(|| {
+        let name = String::from_utf8_lossy(key);
+        let mut line = format!(
+            "yodb: DEBUG {}: {name}: {kind}, {serialized} byte(s)",
+            which.word()
+        );
+        if let Some((nodes, bytes)) = shape {
+            let _ = write!(line, ", {nodes} node(s) holding {bytes}");
+        }
+        println!("{line}");
+    });
+    out.simple(which.said());
+    Ok(())
+}
+
 /// `DEBUG POPULATE <count> [<prefix> [<size>]]`.
 ///
 /// Keys are `<prefix>:<n>` counting from nought, with `key` as the prefix if
@@ -541,8 +809,12 @@ const HELP: &[&str] = &[
     "ERROR <string>",
     "    Return a Redis protocol error with <string> as message. Useful for",
     "    clients unit tests to simulate Redis errors.",
+    "LISTPACK <key>",
+    "    Show low level info about the listpack encoding of <key>.",
     "LOG <message>",
     "    Write <message> to the server log.",
+    "OBJECT <key>",
+    "    Show low level info about `key` and associated value.",
     "PAUSE-CRON <0|1>",
     "    Stop periodic cron job processing.",
     "POPULATE <count> [<prefix>] [<size>]",
@@ -553,6 +825,9 @@ const HELP: &[&str] = &[
     "    Reply with a test value of the specified type. <type> can be: string,",
     "    integer, double, bignum, null, array, set, map, attrib, push, verbatim,",
     "    true, false.",
+    "QUICKLIST <key> [<0|1>]",
+    "    Show low level info about the quicklist encoding of <key>.",
+    "    The optional argument (0 by default) sets the level of detail",
     "QUICKLIST-PACKED-THRESHOLD <size>",
     "    Sets the threshold for elements to be inserted as plain vs packed nodes",
     "    Default value is 1GB, allows values up to 4GB. Setting to 0 restores to default.",
@@ -560,6 +835,8 @@ const HELP: &[&str] = &[
     "    Save the dataset to the RDB file and load it back. NOSAVE reads the file",
     "    that is already there, NOFLUSH keeps what is in memory and lets the file",
     "    land on top of it, and MERGE is accepted and does nothing.",
+    "SDSLEN <key>",
+    "    Show low level SDS string info representing `key` and value.",
     "SET-ACTIVE-EXPIRE <0|1>",
     "    Setting it to 0 disables expiring keys in background when they are not",
     "    accessed (otherwise the Redis behavior). Setting it to 1 reenables back",
