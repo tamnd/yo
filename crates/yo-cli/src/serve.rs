@@ -366,6 +366,14 @@ impl Net {
         self.streams.get(conn as usize).is_some_and(Option::is_some)
     }
 
+    /// How many sockets this worker is holding, which is how many connections
+    /// it took. Only the test about sharing a burst out asks, because nothing
+    /// the server does depends on the number.
+    #[cfg(test)]
+    fn held(&self) -> usize {
+        self.streams.iter().filter(|s| s.is_some()).count()
+    }
+
     /// Read whatever is waiting, or `None` if the peer has gone or the socket
     /// failed.
     fn read(&mut self, conn: ConnId, buf: &mut [u8]) -> Option<usize> {
@@ -605,7 +613,7 @@ impl Server {
 /// borrowed rather than owned, because the listeners are the one thing on this
 /// side that all the threads look at.
 ///
-/// # Why every thread accepts
+/// # Why every thread accepts, and why it takes one at a time
 ///
 /// The listeners go into every worker's poller, so a connection waiting at a
 /// door wakes whichever threads are idle and the first one to call `accept`
@@ -615,11 +623,27 @@ impl Server {
 /// that wants no handoff between threads: a connection belongs to the thread
 /// that accepted it for as long as it is open.
 ///
-/// The cost is that an accept wakes more threads than take it. That is a
-/// handful of syscalls per connection and a connection lasts for the length of a
-/// benchmark run, so it is not on any path that matters. A listener per thread
-/// with `SO_REUSEPORT` would remove even that, and is a change to make with a
-/// number rather than on the way past.
+/// A worker takes one connection per ready event and goes back to the poller
+/// rather than draining the door, and that is the whole of what keeps the
+/// spreading honest. Draining looks like the obvious thing and is what this did
+/// first. It is wrong here because clients do not arrive one at a time: a
+/// benchmark opens its two hundred and fifty six connections at once, every
+/// worker is idle at that moment, and whichever one wins the wakeup drains the
+/// entire backlog into itself while the rest find nothing. The split is then
+/// decided, once, by a race, and it lasts for as long as the connections do. It
+/// was measured at eight and sixteen threads as a coefficient of variation
+/// between 0.40 and 0.77 where six rival servers on the same box in the same
+/// sweep sat between 0.00 and 0.02, and as sixteen threads coming out slower
+/// than eight.
+///
+/// The doors are level triggered, so a door with more waiting is ready again
+/// straight away and the next worker round the loop takes the next one. The cost
+/// is one extra wakeup per connection, which is paid once per connection rather
+/// than once per command.
+///
+/// `SO_REUSEPORT` would let the kernel do the split with no race at all, and
+/// does not help here: it is a TCP and UDP option, and the sweep that found this
+/// runs every server over a unix socket.
 struct Worker<'a> {
     doors: &'a [Door],
     reactor: Reactor<Wire<Net>>,
@@ -692,7 +716,12 @@ impl<'a> Worker<'a> {
         Ok(())
     }
 
-    /// Take every connection waiting at one door.
+    /// Take one connection waiting at one door, and leave the rest for the
+    /// other workers.
+    ///
+    /// One rather than all of them, for the reason on the struct. The door is
+    /// level triggered, so anything still queued behind this one makes the door
+    /// ready again immediately and the next worker to look takes it.
     fn accept_ready(&mut self, token: u64) -> io::Result<()> {
         let Some(at) = self.doors.iter().position(|d| d.token() == token) else {
             return Ok(());
@@ -711,8 +740,11 @@ impl<'a> Worker<'a> {
                     // after that the sink owns it and this is the last look.
                     self.poller.add(&stream, u64::from(conn))?;
                     self.reactor.engine_mut().sink_mut().attach(conn, stream);
+                    return Ok(());
                 }
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => return Ok(()),
+                // A signal arrived before anything was accepted, so this has
+                // taken nothing yet and asks again.
                 Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
                 Err(e) => return Err(e),
             }
@@ -1493,6 +1525,56 @@ mod tests {
                 Err(e) => e,
             };
             assert_eq!(e.kind(), io::ErrorKind::InvalidInput);
+        }
+
+        /// A burst of connections is shared out, and this is the test the
+        /// change to `accept_ready` exists for.
+        ///
+        /// Clients do not arrive one at a time. A benchmark opens all of them
+        /// at once, every worker is idle at that moment, and a worker that
+        /// drained the door would take the lot and keep them for as long as
+        /// they stayed open. Four workers are given a door with sixteen
+        /// connections queued at it and asked in turn, and the count each ends
+        /// up with is the whole assertion. Before, it was sixteen, zero, zero,
+        /// zero.
+        ///
+        /// The workers are driven by hand rather than by starting a server,
+        /// because the point is what one call to `accept_ready` takes, and a
+        /// running server would make that a race and this test a coin toss.
+        #[test]
+        fn a_burst_of_connections_is_shared_out_between_the_workers() {
+            let path = socket_path("accept_share");
+            let server = Server::open(None, Some(path.clone()), 4).expect("a fresh path");
+            let mut workers: Vec<Worker<'_>> = (0..4)
+                .map(|_| {
+                    Worker::new(
+                        &server.doors,
+                        Wire::over(Arc::clone(&server.shared), Net::default()),
+                    )
+                    .expect("a poller")
+                })
+                .collect();
+
+            // Held open for the length of the test, because a connection the
+            // client dropped is one the worker would bury before it is counted.
+            let _clients: Vec<UnixStream> = (0..16)
+                .map(|_| UnixStream::connect(&path).expect("the door is open"))
+                .collect();
+
+            for _ in 0..16 {
+                for worker in &mut workers {
+                    worker
+                        .accept_ready(UNIX_LISTENER)
+                        .expect("the door is open");
+                }
+            }
+
+            let held: Vec<usize> = workers
+                .iter()
+                .map(|w| w.reactor.engine().sink().held())
+                .collect();
+            assert_eq!(held.iter().sum::<usize>(), 16, "{held:?}");
+            assert_eq!(held, vec![4, 4, 4, 4], "{held:?}");
         }
     }
 }
