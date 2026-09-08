@@ -50,6 +50,62 @@
 //! `YO_BENCH_SMOKE` cuts it to one short cell, which is what CI runs to find
 //! out that it still builds and still runs.
 //!
+//! # Comparing two builds on a machine that is not quiet
+//!
+//! `YO_BENCH_AGAINST` points at a second `yodb` binary and turns the sweep into
+//! an A/B. Every cell is then measured twice per repeat, once with each binary,
+//! back to back and in alternating order, and what is reported is the ratio
+//! between them.
+//!
+//! This is the mode to reach for when the box will not hold still, and what
+//! makes it work is the median rather than the pairing. A pair is measured
+//! minutes apart at most, which cancels the slow drift, and it does not cancel
+//! a compiler that had half the cores for six seconds of one half of it. So an
+//! individual pair on a busy machine is still a coin toss and the median of
+//! enough of them is not.
+//!
+//! That is measured rather than assumed. On a laptop at a load average of ten,
+//! with a virtual machine and two builds on it, this binary against a copy of
+//! itself read as follows.
+//!
+//! ```text
+//! three pairs      1689 Kops against 1527      1.16x
+//! eleven pairs     3680 Kops against 3242      1.02x
+//! ```
+//!
+//! The true answer is 1.00x, the absolute throughput moved by a factor of two
+//! between those two runs, and eleven pairs got within two percent of the
+//! truth anyway. Three did not.
+//!
+//! So the column to read is `agree`, which is how many of the pairs came out on
+//! the same side of 1.00 as the median did. Ten of eleven is a result and six
+//! of eleven is a coin toss, whatever the median says, and a cell where fewer
+//! than three quarters agree is marked. The `cv` beside it is the spread of the
+//! ratio, which on a busy box is large and is not by itself a reason to throw
+//! the cell away. The way to find out what this machine needs is to run it
+//! against a copy of the same binary and turn the repeats up until it says
+//! 1.00x, which is a calibration nothing else here can give you.
+//!
+//! Both binaries have to be built the same way, since half of a ratio built at
+//! a different optimisation level is not a comparison of anything. The binary
+//! this drives by default is the one cargo built for the bench, which is the
+//! `bench` profile, so the other one is built with `--profile bench` too and
+//! lands in `target/release`.
+//!
+//! ```text
+//! git worktree add /tmp/before <commit>
+//! (cd /tmp/before && cargo build --profile bench -p yo-cli)
+//! YO_BENCH_REPEATS=11 YO_BENCH_AGAINST=/tmp/before/target/release/yodb \
+//!   cargo bench -p yo-cli --bench serve
+//! ```
+//!
+//! What it cannot do is tell you the machine was quiet. A ratio measured while
+//! a compiler had half the cores is a true ratio under that load, and a change
+//! that only pays off on an idle box will look smaller than it is. It answers
+//! whether this build beats that one on this machine, which is the question a
+//! change is judged on, and not what either of them is worth, which is the
+//! question the published sweep answers.
+//!
 //! `YO_BENCH_DEBUG` is sent to the server as `DEBUG` subcommands before the
 //! clients start, separated by semicolons, and it is how a cost gets pinned on
 //! a part of the server rather than guessed at. Turning a job off and measuring
@@ -173,50 +229,138 @@ mod unix {
             (WARMUP, MEASURE)
         };
 
-        let mut noisy = 0;
+        let mine = PathBuf::from(env!("CARGO_BIN_EXE_yodb"));
+        let against = std::env::var_os("YO_BENCH_AGAINST").map(PathBuf::from);
+        if let Some(that) = &against {
+            println!("this {}\nthat {}", mine.display(), that.display());
+        }
+
+        let mut bad = 0;
         for pipeline in pipelines {
             println!("\npipeline {pipeline}, {clients} client threads of {conns} connections");
-            println!(
-                "{:>8}  {:>12}  {:>8}  {:>6}",
-                "threads", "Kops/sec", "vs 1", "cv"
-            );
+            if against.is_some() {
+                println!(
+                    "{:>8}  {:>12}  {:>12}  {:>9}  {:>6}  {:>5}",
+                    "threads", "Kops/sec", "that", "this/that", "cv", "agree"
+                );
+            } else {
+                println!(
+                    "{:>8}  {:>12}  {:>8}  {:>6}",
+                    "threads", "Kops/sec", "vs 1", "cv"
+                );
+            }
             let mut first = 0.0_f64;
             for (at, &count) in threads.iter().enumerate() {
+                let spec = Cell {
+                    threads: count,
+                    pipeline,
+                    clients,
+                    conns,
+                    warmup,
+                    measure,
+                };
                 let mut rates = Vec::with_capacity(repeats);
-                for _ in 0..repeats {
-                    rates.push(cell(&Cell {
-                        threads: count,
-                        pipeline,
-                        clients,
-                        conns,
-                        warmup,
-                        measure,
-                    }));
+                let mut theirs = Vec::with_capacity(repeats);
+                let mut ratios = Vec::with_capacity(repeats);
+                for round in 0..repeats {
+                    let Some(that) = &against else {
+                        rates.push(cell(&spec, &mine, 0));
+                        continue;
+                    };
+                    // Alternating, so that whichever binary goes first is not
+                    // the same one every time. The first of a pair starts on a
+                    // machine that has just been left alone and the second on
+                    // one that has just had a server killed on it, and that is
+                    // a difference worth cancelling rather than measuring.
+                    let (a, b) = if round % 2 == 0 {
+                        let a = cell(&spec, &mine, 0);
+                        (a, cell(&spec, that, 1))
+                    } else {
+                        let b = cell(&spec, that, 1);
+                        (cell(&spec, &mine, 0), b)
+                    };
+                    rates.push(a);
+                    theirs.push(b);
+                    ratios.push(if b > 0.0 { a / b } else { 0.0 });
                 }
-                let (rate, cv) = middle(&mut rates);
+
+                let (rate, spread) = middle(&mut rates);
+                if against.is_some() {
+                    let that = middle(&mut theirs).0;
+                    // The ratio's spread rather than the throughput's, because
+                    // the throughput either side of a pair is allowed to move
+                    // with the machine. It is printed and it is not what the
+                    // cell is judged on, since on a busy box it stays large
+                    // while the median beside it converges anyway.
+                    let (ratio, cv) = middle(&mut ratios);
+                    let with = agreeing(&ratios, ratio);
+                    let flag = if with * 4 < repeats * 3 {
+                        bad += 1;
+                        " toss"
+                    } else {
+                        ""
+                    };
+                    println!(
+                        "{count:>8}  {:>12.0}  {:>12.0}  {ratio:>8.2}x  {cv:>6.2}  {:>5}{flag}",
+                        rate / 1000.0,
+                        that / 1000.0,
+                        format!("{with}/{repeats}")
+                    );
+                    continue;
+                }
                 if at == 0 {
                     first = rate;
                 }
                 let ratio = if first > 0.0 { rate / first } else { 0.0 };
-                let flag = if cv > NOISY {
-                    noisy += 1;
+                let flag = if spread > NOISY {
+                    bad += 1;
                     " noisy"
                 } else {
                     ""
                 };
                 println!(
-                    "{count:>8}  {:>12.0}  {ratio:>7.2}x  {cv:>6.2}{flag}",
+                    "{count:>8}  {:>12.0}  {ratio:>7.2}x  {spread:>6.2}{flag}",
                     rate / 1000.0
                 );
             }
         }
-        if noisy > 0 {
+        if bad > 0 && against.is_some() {
             println!(
-                "\n{noisy} cells came out above a coefficient of variation of {NOISY:.2}, so this \
+                "\n{bad} cells had fewer than three quarters of their pairs on the same side of \
+                 1.00 as the median, so what those cells report is which run won. Turn \
+                 YO_BENCH_REPEATS up, because the median of enough pairs converges where a single \
+                 pair does not: on a laptop at a load average of ten, this binary against a copy \
+                 of itself read 1.16x over three pairs and 1.02x over eleven, and the true answer \
+                 is 1.00x."
+            );
+        } else if bad > 0 {
+            println!(
+                "\n{bad} cells came out above a coefficient of variation of {NOISY:.2}, so this \
                  machine is not quiet enough to be measuring anything. Nothing here is worth \
-                 quoting until it runs clean."
+                 quoting until it runs clean. If what you need is whether one build beats \
+                 another rather than what either is worth, point YO_BENCH_AGAINST at the other \
+                 one, which is the question a busy box can still answer."
             );
         }
+    }
+
+    /// How many pairs came out on the same side of parity as the median did.
+    ///
+    /// The sign of a pair rather than its size, because a pair that lost the
+    /// machine for a second has a size that means nothing and a side that still
+    /// usually means something. Ten of eleven pairs agreeing is a result and six
+    /// of eleven is a coin toss, whatever the median between them says.
+    ///
+    /// A pair that came out exactly at parity counts for neither side, which is
+    /// the honest reading of it and is rare enough not to matter.
+    fn agreeing(ratios: &[f64], median: f64) -> usize {
+        if median > 1.0 {
+            return ratios.iter().filter(|r| **r > 1.0).count();
+        }
+        if median < 1.0 {
+            return ratios.iter().filter(|r| **r < 1.0).count();
+        }
+        ratios.len()
     }
 
     /// The median of a cell's runs, and how far apart they were.
@@ -251,7 +395,12 @@ mod unix {
     }
 
     /// One server at one thread count, driven at one pipeline depth.
-    fn cell(cell: &Cell) -> f64 {
+    ///
+    /// The binary is a parameter rather than the one this bench was built
+    /// beside, which is what lets a pair of them be measured against each
+    /// other. `side` only keeps the two off one socket path, so that a server
+    /// taking its time to die cannot be found by the run after it.
+    fn cell(cell: &Cell, bin: &Path, side: usize) -> f64 {
         let Cell {
             threads,
             pipeline,
@@ -260,8 +409,8 @@ mod unix {
             warmup,
             measure,
         } = *cell;
-        let socket = socket_path(threads, pipeline);
-        let mut server = Server::start(&socket, threads);
+        let socket = socket_path(threads, pipeline, side);
+        let mut server = Server::start(bin, &socket, threads);
         server.wait_until_listening();
 
         let go = Arc::new(AtomicBool::new(false));
@@ -400,9 +549,9 @@ mod unix {
     }
 
     impl Server {
-        fn start(socket: &Path, threads: usize) -> Server {
+        fn start(bin: &Path, socket: &Path, threads: usize) -> Server {
             let _ = std::fs::remove_file(socket);
-            let child = Command::new(env!("CARGO_BIN_EXE_yodb"))
+            let child = Command::new(bin)
                 .arg("serve")
                 .arg("--no-port")
                 .arg("--unixsocket")
@@ -414,7 +563,7 @@ mod unix {
                 // something to say and the panic below only says that it did.
                 .stdout(Stdio::null())
                 .spawn()
-                .expect("cargo builds the binary before a bench in its own package runs");
+                .unwrap_or_else(|e| panic!("{} would not start: {e}", bin.display()));
             Server {
                 child,
                 socket: socket.to_path_buf(),
@@ -542,10 +691,10 @@ mod unix {
     }
 
     /// A socket path this run owns, so two benches at once do not fight.
-    fn socket_path(threads: usize, pipeline: usize) -> PathBuf {
+    fn socket_path(threads: usize, pipeline: usize, side: usize) -> PathBuf {
         let mut path = std::env::temp_dir();
         path.push(format!(
-            "yodb-bench-{}-t{threads}-p{pipeline}.sock",
+            "yodb-bench-{}-t{threads}-p{pipeline}-s{side}.sock",
             std::process::id()
         ));
         path
