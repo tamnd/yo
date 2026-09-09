@@ -31,6 +31,7 @@ import re
 import subprocess
 import sys
 import tempfile
+import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
@@ -39,6 +40,14 @@ from typing import Callable
 
 UA = "yo-name-audit (+https://github.com/tamnd/yo)"
 TIMEOUT = 20
+# How many times a request that did not come back at all is asked again. A
+# refusal from a registry is an answer and is taken the first time; a timeout or
+# a dropped connection is not an answer, and the thing `verify` tells a person
+# to do about one is to retry, which it may as well do itself. It matters
+# because `verify` gates the release: one read timing out against one of eleven
+# registries is what stopped 0.3.28 from ever reaching crates.io, and nobody
+# noticed for a day because the failure was in a job nobody had reason to read.
+TRIES = 3
 IDENTITY = "tamnd"
 
 # The version the next placeholder publish goes out at, which is a publishing
@@ -72,14 +81,24 @@ REGRESSIONS = {
 
 def get(url: str, headers: dict[str, str] | None = None) -> tuple[int, bytes]:
     req = urllib.request.Request(url, headers={"User-Agent": UA, **(headers or {})})
-    try:
-        with urllib.request.urlopen(req, timeout=TIMEOUT) as r:
-            return r.status, r.read()
-    except urllib.error.HTTPError as e:
-        return e.code, e.read()
-    except Exception as e:  # noqa: BLE001 — a network failure is `unknown`, not `free`
-        print(f"    ! {type(e).__name__}: {e}", file=sys.stderr)
-        return 0, b""
+    for attempt in range(1, TRIES + 1):
+        try:
+            with urllib.request.urlopen(req, timeout=TIMEOUT) as r:
+                return r.status, r.read()
+        except urllib.error.HTTPError as e:
+            # A status is a verdict, including a 404 and including a 403, so it
+            # goes back as it is. Asking again would only get it again.
+            return e.code, e.read()
+        except Exception as e:  # noqa: BLE001 — a network failure is `unknown`, not `free`
+            print(f"    ! {type(e).__name__}: {e}", file=sys.stderr)
+            if attempt == TRIES:
+                return 0, b""
+            # A couple of seconds, doubling, because the failures worth waiting
+            # out are a rate limiter and a load balancer changing its mind, and
+            # both of those are over in seconds. A longer wait would only make
+            # a registry that is genuinely down cost more to find out about.
+            time.sleep(2 ** attempt)
+    return 0, b""
 
 
 def get_json(url: str, headers: dict[str, str] | None = None):
