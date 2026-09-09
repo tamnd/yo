@@ -563,7 +563,7 @@ fn line(row: &Client, now_ms: u64, obl: u64, resp: u32, into: &mut String) {
          flags={flags} db={db} sub={sub} psub={psub} ssub={ssub} multi={multi} watch={watch} \
          qbuf={qbuf} qbuf-free={qbuf_free} argv-mem={argv_mem} multi-mem={multi_mem} \
          rbs={rbs} rbp={rbp} obl={obl} oll=0 omem=0 omem-shared=0 omem-unshared=0 \
-         tot-mem={tot_mem} events=r cmd={cmd} user=default redir=-1 resp={resp} \
+         tot-mem={tot_mem} events=r cmd={cmd} user={user} redir=-1 resp={resp} \
          lib-name={lib_name} lib-ver={lib_ver} io-thread={io_thread} tot-net-in={net_in} \
          tot-net-out={net_out} tot-cmds={cmds} read-events={reads} \
          avg-pipeline-len-sum={cmds} avg-pipeline-len-cnt={reads}",
@@ -572,6 +572,11 @@ fn line(row: &Client, now_ms: u64, obl: u64, resp: u32, into: &mut String) {
         laddr = String::from_utf8_lossy(&text.local),
         fd = row.fd.load(Relaxed),
         name = String::from_utf8_lossy(&text.name),
+        user = String::from_utf8_lossy(if text.user.is_empty() {
+            super::acl::DEFAULT
+        } else {
+            &text.user
+        }),
         age = (now.saturating_sub(since)) / 1000,
         idle = (now.saturating_sub(row.last_ms.load(Relaxed))) / 1000,
         flags = Flags(row.flags.load(Relaxed)),

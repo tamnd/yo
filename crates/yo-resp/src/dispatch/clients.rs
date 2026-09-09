@@ -94,6 +94,11 @@ pub(super) struct Text {
     pub(super) lib_ver: Vec<u8>,
     /// The subcommand of the last command, when it had one.
     pub(super) sub: Vec<u8>,
+    /// The ACL user this connection authenticated as.
+    ///
+    /// Empty means the default user, which is what a connection that never sent
+    /// `AUTH` is, so the common case costs no allocation at all.
+    pub(super) user: Vec<u8>,
 }
 
 /// One connection, as everybody except the connection itself sees it.

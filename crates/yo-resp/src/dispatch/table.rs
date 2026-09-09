@@ -38,6 +38,10 @@ pub struct Spec {
     /// How far apart the keys are, for the commands that take pairs.
     pub step: i32,
     /// The ACL categories, which are what `COMMAND LIST FILTERBY ACLCAT` reads.
+    ///
+    /// A container row carries only what the container itself is in, which is
+    /// what a real server reports for it. The categories its subcommands add on
+    /// top are in [`SUBCATS`].
     pub acl: &'static [&'static str],
     /// The Redis this command first appeared in.
     pub since: &'static str,
@@ -447,6 +451,115 @@ const AC_SORT_READ: &[&str] = &[
     "@slow",
     "@dangerous",
 ];
+
+/// The categories a container's subcommands hold on top of the container's own.
+///
+/// A real server has a row a subcommand, so `config|get` is `@admin @dangerous
+/// @slow` while `config` itself is only `@slow`, and `-@admin` on a user takes
+/// CONFIG GET away without touching CONFIG HELP. This table has one row a
+/// container that has none, so it needs this on the side: a rule about a
+/// category walks the commands for the ones it names outright and then walks
+/// this for the subcommands, allowing or refusing them one first argument at a
+/// time. It goes away with D-114, when the subcommands get rows of their own and
+/// carry their own categories like everything else.
+///
+/// Every subcommand also holds every category its container holds, which was
+/// read off 8.10.1 rather than assumed, and is why a rule about the container's
+/// own categories can still set one bit and be done.
+///
+/// The list is sorted by container and then by subcommand, and a subcommand with
+/// nothing to add is left out, which is why COMMAND has no rows at all.
+pub static SUBCATS: &[(&str, &str, &[&str])] = &[
+    ("acl", "deluser", AC_SUB_ADMIN),
+    ("acl", "dryrun", AC_SUB_ADMIN),
+    ("acl", "getuser", AC_SUB_ADMIN),
+    ("acl", "list", AC_SUB_ADMIN),
+    ("acl", "load", AC_SUB_ADMIN),
+    ("acl", "log", AC_SUB_ADMIN),
+    ("acl", "save", AC_SUB_ADMIN),
+    ("acl", "setuser", AC_SUB_ADMIN),
+    ("acl", "users", AC_SUB_ADMIN),
+    ("client", "caching", AC_SUB_CONNECTION),
+    ("client", "getname", AC_SUB_CONNECTION),
+    ("client", "getredir", AC_SUB_CONNECTION),
+    ("client", "help", AC_SUB_CONNECTION),
+    ("client", "id", AC_SUB_CONNECTION),
+    ("client", "info", AC_SUB_CONNECTION),
+    ("client", "kill", AC_SUB_ADMIN_CONNECTION),
+    ("client", "list", AC_SUB_ADMIN_CONNECTION),
+    ("client", "no-evict", AC_SUB_ADMIN_CONNECTION),
+    ("client", "no-touch", AC_SUB_CONNECTION),
+    ("client", "pause", AC_SUB_ADMIN_CONNECTION),
+    ("client", "reply", AC_SUB_CONNECTION),
+    ("client", "setinfo", AC_SUB_CONNECTION),
+    ("client", "setname", AC_SUB_CONNECTION),
+    ("client", "tracking", AC_SUB_CONNECTION),
+    ("client", "trackinginfo", AC_SUB_CONNECTION),
+    ("client", "unblock", AC_SUB_ADMIN_CONNECTION),
+    ("client", "unpause", AC_SUB_ADMIN_CONNECTION),
+    ("config", "get", AC_SUB_ADMIN),
+    ("config", "resetstat", AC_SUB_ADMIN),
+    ("config", "rewrite", AC_SUB_ADMIN),
+    ("config", "set", AC_SUB_ADMIN),
+    ("function", "delete", AC_SUB_SCRIPTING_WRITE),
+    ("function", "dump", AC_SUB_SCRIPTING),
+    ("function", "flush", AC_SUB_SCRIPTING_WRITE),
+    ("function", "help", AC_SUB_SCRIPTING),
+    ("function", "kill", AC_SUB_SCRIPTING),
+    ("function", "list", AC_SUB_SCRIPTING),
+    ("function", "load", AC_SUB_SCRIPTING_WRITE),
+    ("function", "restore", AC_SUB_SCRIPTING_WRITE),
+    ("function", "stats", AC_SUB_SCRIPTING),
+    ("object", "encoding", AC_SUB_KEYSPACE_READ),
+    ("object", "freq", AC_SUB_KEYSPACE_READ),
+    ("object", "help", AC_SUB_KEYSPACE),
+    ("object", "idletime", AC_SUB_KEYSPACE_READ),
+    ("object", "refcount", AC_SUB_KEYSPACE_READ),
+    ("pubsub", "channels", AC_SUB_PUBSUB),
+    ("pubsub", "numpat", AC_SUB_PUBSUB),
+    ("pubsub", "numsub", AC_SUB_PUBSUB),
+    ("pubsub", "shardchannels", AC_SUB_PUBSUB),
+    ("pubsub", "shardnumsub", AC_SUB_PUBSUB),
+    ("script", "debug", AC_SUB_SCRIPTING),
+    ("script", "exists", AC_SUB_SCRIPTING),
+    ("script", "flush", AC_SUB_SCRIPTING),
+    ("script", "help", AC_SUB_SCRIPTING),
+    ("script", "kill", AC_SUB_SCRIPTING),
+    ("script", "load", AC_SUB_SCRIPTING),
+    ("xgroup", "create", AC_SUB_STREAM_WRITE),
+    ("xgroup", "createconsumer", AC_SUB_STREAM_WRITE),
+    ("xgroup", "delconsumer", AC_SUB_STREAM_WRITE),
+    ("xgroup", "destroy", AC_SUB_STREAM_WRITE),
+    ("xgroup", "help", AC_SUB_STREAM),
+    ("xgroup", "setid", AC_SUB_STREAM_WRITE),
+    ("xinfo", "consumers", AC_SUB_STREAM_READ),
+    ("xinfo", "groups", AC_SUB_STREAM_READ),
+    ("xinfo", "help", AC_SUB_STREAM),
+    ("xinfo", "stream", AC_SUB_STREAM_READ),
+];
+
+/// The subcommands of ACL and CONFIG that only an administrator should have.
+const AC_SUB_ADMIN: &[&str] = &["@admin", "@dangerous"];
+/// The subcommands of CLIENT that anybody may use.
+const AC_SUB_CONNECTION: &[&str] = &["@connection"];
+/// The subcommands of CLIENT that reach another connection.
+const AC_SUB_ADMIN_CONNECTION: &[&str] = &["@admin", "@connection", "@dangerous"];
+/// The subcommands of FUNCTION and SCRIPT that only read.
+const AC_SUB_SCRIPTING: &[&str] = &["@scripting"];
+/// The subcommands of FUNCTION that change what is loaded.
+const AC_SUB_SCRIPTING_WRITE: &[&str] = &["@scripting", "@write"];
+/// `OBJECT HELP`, which names the keyspace without reading one.
+const AC_SUB_KEYSPACE: &[&str] = &["@keyspace"];
+/// The subcommands of OBJECT that read a key.
+const AC_SUB_KEYSPACE_READ: &[&str] = &["@keyspace", "@read"];
+/// The subcommands of PUBSUB, all but HELP.
+const AC_SUB_PUBSUB: &[&str] = &["@pubsub"];
+/// `XGROUP HELP` and `XINFO HELP`.
+const AC_SUB_STREAM: &[&str] = &["@stream"];
+/// The subcommands of XGROUP that change a group.
+const AC_SUB_STREAM_WRITE: &[&str] = &["@stream", "@write"];
+/// The subcommands of XINFO that read a stream.
+const AC_SUB_STREAM_READ: &[&str] = &["@read", "@stream"];
 
 /// Every command this server answers, in the order the groups ship.
 pub static COMMANDS: &[Spec] = &[
@@ -6432,6 +6545,20 @@ pub static COMMANDS: &[Spec] = &[
         complexity: "Depends on the subcommand.",
         summary: "Ask about or change the connection the command arrived on.",
         group: "connection",
+    },
+    Spec {
+        name: "acl",
+        arity: -2,
+        flags: &[],
+        first_key: 0,
+        last_key: 0,
+        step: 0,
+        keys: &[],
+        acl: &["@slow"],
+        since: "6.0.0",
+        complexity: "Depends on subcommand.",
+        summary: "A container for Access List Control commands.",
+        group: "server",
     },
     Spec {
         name: "config",

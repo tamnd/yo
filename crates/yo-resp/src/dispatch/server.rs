@@ -17,7 +17,9 @@
 use super::args::{self, Args, is};
 use super::keyspec::{self, Begin, Find, KeySpec};
 use super::table::{self, Spec};
-use super::{DATABASES, Flow, Server, Session, auth, backup, cpu, debug, multi, notify, persist};
+use super::{
+    DATABASES, Flow, Server, Session, acl, auth, backup, cpu, debug, multi, notify, persist,
+};
 use crate::proto::Proto;
 use crate::reply::Out;
 use core::fmt::Write;
@@ -287,6 +289,7 @@ pub(super) fn execute(
             }
         }
         "echo" => out.bulk(args.get(1)),
+        "acl" => acl::execute(server, session, args, out)?,
         "auth" => auth::execute(server, session, args, out)?,
         "debug" => debug::execute(server, session, args, out)?,
         "hello" => hello(server, session, args, out)?,
@@ -579,11 +582,10 @@ fn hello(server: &Server, session: &mut Session, args: Args<'_>, out: &mut Out) 
         while i < args.len() {
             let o = args.get(i);
             if is(o, b"AUTH") && i + 2 < args.len() {
-                if !auth::admits(server, args.get(i + 1), args.get(i + 2)) {
+                if !acl::authenticate(server, session, args.get(i + 1), args.get(i + 2)) {
                     out.error(b"WRONGPASS invalid username-password pair or user is disabled.");
                     return Ok(());
                 }
-                session.admit(true);
                 i += 3;
             } else if is(o, b"SETNAME") && i + 1 < args.len() {
                 session.set_name(args.get(i + 1));
