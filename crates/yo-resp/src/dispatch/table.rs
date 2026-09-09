@@ -6835,6 +6835,38 @@ pub static COMMANDS: &[Spec] = &[
         summary: "The same, from before there was anything to negotiate.",
         group: "server",
     },
+    // The same command under the name it had and the name it has. Both rows are
+    // real rows rather than one being an alias, because `COMMAND INFO` answers
+    // for both names and a client that asks about the old one is asking a fair
+    // question.
+    Spec {
+        name: "replicaof",
+        arity: 3,
+        flags: &["admin", "noscript", "stale", "no_async_loading"],
+        first_key: 0,
+        last_key: 0,
+        step: 0,
+        keys: &[],
+        acl: AC_ADMIN_SLOW,
+        since: "5.0.0",
+        complexity: "O(1)",
+        summary: "Follow another server, or stop following one.",
+        group: "server",
+    },
+    Spec {
+        name: "slaveof",
+        arity: 3,
+        flags: &["admin", "noscript", "stale", "no_async_loading"],
+        first_key: 0,
+        last_key: 0,
+        step: 0,
+        keys: &[],
+        acl: AC_ADMIN_SLOW,
+        since: "1.0.0",
+        complexity: "O(1)",
+        summary: "What REPLICAOF was called before it was called that.",
+        group: "server",
+    },
     Spec {
         name: "role",
         arity: 1,

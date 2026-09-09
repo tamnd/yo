@@ -60,6 +60,13 @@ const SETTINGS: &[(&str, &str)] = &[
     ("databases", "16"),
     ("io-threads", "1"),
     ("proto-max-bulk-len", "536870912"),
+    // How much of the command stream a master keeps for a replica that comes
+    // back, which is a compiled in size here and happens to be the size Redis
+    // ships with. Fixed rather than writable because the backlog is one buffer
+    // that is allocated once and resizing it under a replica that is reading
+    // out of it is a change of its own. There is a test below that this number
+    // and `repl::BACKLOG_BYTES` are the same number.
+    ("repl-backlog-size", "1048576"),
     ("save", ""),
     ("timeout", "0"),
 ];
@@ -214,6 +221,32 @@ const ACL_PUBSUB_DEFAULT: &str = "acl-pubsub-default";
 /// The two words `acl-pubsub-default` is allowed to be, in Redis's order.
 const CHANNEL_DEFAULTS: [&str; 2] = ["allchannels", "resetchannels"];
 
+/// Whether a client's write is refused while this server follows a master.
+///
+/// Writable, and on by default, which is Redis's default and is the only safe
+/// one: a write that lands on a replica is a write the master never hears about
+/// and that the next full resync throws away. Turning it off is a real thing to
+/// do and is what a cache in front of a slow master wants.
+///
+/// The `slave` spelling is the name this had before Redis renamed it and it
+/// still answers to both, so this does too, the same way the size ladder answers
+/// to `ziplist`. Two names, one setting.
+const REPLICA_READ_ONLY: [&str; 2] = ["replica-read-only", "slave-read-only"];
+
+/// The password and user the link to a master authenticates with.
+///
+/// Writable and both empty by default, which is a master that asks for nothing.
+/// A user without a password is not a thing to send, so an empty `masterauth`
+/// means the link sends no `AUTH` at all whatever `masteruser` says. They read
+/// back in the clear for the same reason `requirepass` does.
+const MASTERAUTH: &str = "masterauth";
+/// The user half of [`MASTERAUTH`], for a master with an ACL rather than a
+/// password.
+const MASTERUSER: &str = "masteruser";
+
+/// The two words a yes or no setting is allowed to be.
+const BOOLS: [&str; 2] = ["yes", "no"];
+
 /// Which classes of keyspace change are published, and on which two channels.
 ///
 /// On its own for a fifth reason: it is the only setting whose value is neither
@@ -322,6 +355,7 @@ pub(super) fn execute(
         "memory" => super::memory::execute(server, session, args, out)?,
         "replconf" => super::repl::replconf(server, session, args, out)?,
         "psync" | "sync" => super::repl::psync(server, session, args, out)?,
+        "replicaof" | "slaveof" => super::follow::replicaof(server, args, out)?,
         "hello" => hello(server, session, args, out)?,
         "select" => {
             let n = args.int(1)?;
@@ -1069,6 +1103,12 @@ fn config(server: &Server, args: Args<'_>, out: &mut Out) -> Result<()> {
         let acls = wanted(ACLFILE);
         let logged = wanted(ACLLOG_MAX_LEN);
         let channels = wanted(ACL_PUBSUB_DEFAULT);
+        // Both spellings are two settings by the same rule the ladder follows,
+        // so `CONFIG GET *read-only*` sends the replica name and the slave name
+        // and the same word under both.
+        let readonly = REPLICA_READ_ONLY.map(wanted);
+        let mauth = wanted(MASTERAUTH);
+        let muser = wanted(MASTERUSER);
         out.map(
             fixed.clone().count()
                 + ladder.clone().count()
@@ -1082,7 +1122,11 @@ fn config(server: &Server, args: Args<'_>, out: &mut Out) -> Result<()> {
                 + usize::from(events)
                 + usize::from(acls)
                 + usize::from(logged)
-                + usize::from(channels),
+                + usize::from(channels)
+                + usize::from(readonly[0])
+                + usize::from(readonly[1])
+                + usize::from(mauth)
+                + usize::from(muser),
         );
         for (k, v) in fixed {
             out.bulk(k.as_bytes());
@@ -1163,6 +1207,24 @@ fn config(server: &Server, args: Args<'_>, out: &mut Out) -> Result<()> {
             out.bulk(ACL_PUBSUB_DEFAULT.as_bytes());
             out.bulk(CHANNEL_DEFAULTS[usize::from(!server.users().open_channels())].as_bytes());
         }
+        for (name, asked) in REPLICA_READ_ONLY.iter().zip(readonly) {
+            if asked {
+                out.bulk(name.as_bytes());
+                out.bulk(BOOLS[usize::from(!server.replica_read_only_setting())].as_bytes());
+            }
+        }
+        if mauth || muser {
+            server.with_master_auth(|user, pass| {
+                if mauth {
+                    out.bulk(MASTERAUTH.as_bytes());
+                    out.bulk(pass);
+                }
+                if muser {
+                    out.bulk(MASTERUSER.as_bytes());
+                    out.bulk(user);
+                }
+            });
+        }
     } else if is(sub, b"SET") {
         // Too few is a wrong number of arguments and an odd number is a syntax
         // error, which is not the same sentence and is not the same rule. A
@@ -1189,6 +1251,9 @@ fn config(server: &Server, args: Args<'_>, out: &mut Out) -> Result<()> {
         let mut password = None;
         let mut logged = None;
         let mut channels = None;
+        let mut readonly = None;
+        let mut mauth = None;
+        let mut muser = None;
         let mut i = 2;
         while i < args.len() {
             let (name, value) = (args.get(i), args.get(i + 1));
@@ -1300,6 +1365,30 @@ fn config(server: &Server, args: Args<'_>, out: &mut Out) -> Result<()> {
                 password = Some(value);
                 continue;
             }
+            if let Some(spelling) = REPLICA_READ_ONLY.iter().find(|k| is(name, k.as_bytes())) {
+                let Some(at) = BOOLS.iter().position(|w| is(value, w.as_bytes())) else {
+                    return Err(Error::fmt(
+                        Code::Invalid,
+                        format_args!(
+                            "CONFIG SET failed (possibly related to argument '{spelling}') - argument must be 'yes' or 'no'"
+                        ),
+                    ));
+                };
+                readonly = Some(at == 0);
+                continue;
+            }
+            if is(name, MASTERAUTH.as_bytes()) {
+                // Anything at all, including nothing, which is how the password
+                // is taken off again. It is read at the next dial rather than
+                // now, so setting it on a replica whose link is already up takes
+                // effect the next time that link breaks and comes back.
+                mauth = Some(value);
+                continue;
+            }
+            if is(name, MASTERUSER.as_bytes()) {
+                muser = Some(value);
+                continue;
+            }
             if is(name, NOTIFY.as_bytes()) {
                 // The only setting here whose error names what was wrong with
                 // the value rather than what the value should have been, and it
@@ -1397,6 +1486,16 @@ fn config(server: &Server, args: Args<'_>, out: &mut Out) -> Result<()> {
         }
         if let Some(open) = channels {
             server.users().set_open_channels(open);
+        }
+        if let Some(yes) = readonly {
+            server.set_replica_read_only(yes);
+        }
+        // One write of the pair whichever of the two was named, because they
+        // live together and a set of one has to leave the other where it was.
+        if mauth.is_some() || muser.is_some() {
+            let (user, pass) =
+                yo_alloc::allow(|| server.with_master_auth(|u, p| (u.to_vec(), p.to_vec())));
+            server.master_auth(muser.unwrap_or(&user), mauth.unwrap_or(&pass));
         }
         if let Some(value) = password {
             // The connections that are already open are left where they are,
@@ -1682,3 +1781,33 @@ const CONFIG_HELP: &[&str] = &[
     "HELP",
     "    Print this help.",
 ];
+
+#[cfg(test)]
+mod tests {
+    use super::{BOOLS, REPLICA_READ_ONLY, SETTINGS};
+
+    /// The backlog setting is a compiled in number written out twice, and the
+    /// two have to be the same number: a client that reads `repl-backlog-size`
+    /// and then works out how far behind a replica may fall before a full resync
+    /// is reading this to answer that question.
+    #[test]
+    fn the_backlog_setting_is_the_size_the_backlog_actually_is() {
+        let said = SETTINGS
+            .iter()
+            .find(|(k, _)| *k == "repl-backlog-size")
+            .expect("the setting is there")
+            .1;
+        assert_eq!(
+            said.parse::<usize>().expect("a number"),
+            super::super::repl::BACKLOG_BYTES
+        );
+    }
+
+    /// The two spellings are one setting and the reference answers to both, so a
+    /// script written against either works here.
+    #[test]
+    fn the_read_only_setting_answers_to_both_of_its_names() {
+        assert_eq!(REPLICA_READ_ONLY, ["replica-read-only", "slave-read-only"]);
+        assert_eq!(BOOLS, ["yes", "no"]);
+    }
+}

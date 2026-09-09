@@ -556,6 +556,41 @@ impl Server {
         self.setup().set_store_source(store.source());
     }
 
+    /// Tell the engine which port to announce to a master.
+    ///
+    /// Whoever bound the socket is the only one who knows it, and a port of zero
+    /// means the number a master would be told is not the number it could dial
+    /// back on. So this is called with what the listener actually got rather than
+    /// with what was asked for.
+    pub fn announce_port(&self, port: u16) {
+        self.shared.announce_port(port);
+    }
+
+    /// What the link to a master authenticates with, if anything.
+    ///
+    /// An empty password is no password and the link sends no `AUTH` at all,
+    /// which is what a master that asks for nothing wants.
+    pub fn set_master_auth(&self, user: &[u8], pass: &[u8]) {
+        self.shared.master_auth(user, pass);
+    }
+
+    /// Whether an ordinary client's write is refused while this server follows.
+    pub fn set_replica_read_only(&self, yes: bool) {
+        self.shared.set_replica_read_only(yes);
+    }
+
+    /// Start following a master, the same as `REPLICAOF host port` would.
+    ///
+    /// Called after everything else at startup, because the link starts applying
+    /// the moment it is up and every other setting decides what applying means.
+    /// It returns as soon as the intent is recorded: the dial, the snapshot and
+    /// the stream all happen on a thread of their own, so a master that is not
+    /// up yet is a replica that keeps trying rather than a server that will not
+    /// start.
+    pub fn follow(&self, host: &str, port: u16) {
+        self.shared.follow_master(host, port);
+    }
+
     /// Build the dataset out of a Redis RDB image before anybody connects.
     ///
     /// The doors are already bound at this point, because the keyspace being

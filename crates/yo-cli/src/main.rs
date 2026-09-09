@@ -34,6 +34,8 @@ usage:
   yodb serve [--bind ADDR] [--port PORT] [--unixsocket PATH] [--no-port]
              [--threads N] [--dir PATH] [--store PATH --maxmemory BYTES]
              [--requirepass PASSWORD] [--aclfile PATH] [--restore FILE]
+             [--replicaof HOST PORT] [--masterauth PASSWORD]
+             [--masteruser USER] [--replica-read-only yes|no]
 
   check    read a .yo file and report anything wrong with it. Never writes.
              --quick   skip the records and read only the headers
@@ -81,6 +83,27 @@ usage:
                            to it. A file that will not load stops the
                            server from starting rather than leaving it
                            serving half a dataset
+             --replicaof   a master to follow, given as a host and a port the
+                           same way redis-server takes them. The server comes
+                           up as a replica: it takes a snapshot of the master,
+                           applies everything the master does from then on, and
+                           refuses writes from ordinary clients. A master that
+                           is not up yet is a replica that keeps trying rather
+                           than a server that will not start, and REPLICAOF NO
+                           ONE at any point makes it a master again
+             --masterauth  the password the link to the master sends AUTH with.
+                           Nothing by default, which is a master that asks for
+                           nothing
+             --masteruser  the user to send with that password, for a master
+                           with an access control list rather than a single
+                           password. Ignored without --masterauth, since a user
+                           with no password is not a thing to send
+             --replica-read-only
+                           whether a write from an ordinary client is refused
+                           while this server follows a master. yes by default,
+                           which is the only safe setting: a write that lands on
+                           a replica is one the master never hears about and
+                           that the next full resync throws away
              --store       a file to put cold values in when memory fills
                            up, instead of throwing keys away. The path has
                            to be a new one, because what a previous run
@@ -324,6 +347,10 @@ fn serve_command(args: &[&str]) -> ExitCode {
     let mut requirepass: Option<&str> = None;
     let mut aclfile: Option<std::path::PathBuf> = None;
     let mut from_rdb: Option<std::path::PathBuf> = None;
+    let mut upstream: Option<(String, u16)> = None;
+    let mut masterauth: &str = "";
+    let mut masteruser: &str = "";
+    let mut replica_read_only = true;
 
     let mut at = 0;
     while at < args.len() {
@@ -335,8 +362,34 @@ fn serve_command(args: &[&str]) -> ExitCode {
                 return ExitCode::SUCCESS;
             }
             "--no-port" => tcp = false,
-            "--bind" | "--port" | "--unixsocket" | "--store" | "--maxmemory" | "--dir"
-            | "--threads" | "--requirepass" | "--aclfile" | "--restore" => {
+            // Two values rather than one, because that is how redis-server takes
+            // it and the whole point of the spelling is that a line somebody
+            // already has works here.
+            "--replicaof" | "--slaveof" => {
+                let (Some(host), Some(port)) = (args.get(at), args.get(at + 1)) else {
+                    eprintln!("yodb serve: {arg} needs a host and a port");
+                    return ExitCode::from(2);
+                };
+                at += 2;
+                let Ok(port) = port.parse::<u16>() else {
+                    eprintln!("yodb serve: {port} is not a port to follow");
+                    return ExitCode::from(2);
+                };
+                upstream = Some(((*host).to_string(), port));
+            }
+            "--bind"
+            | "--port"
+            | "--unixsocket"
+            | "--store"
+            | "--maxmemory"
+            | "--dir"
+            | "--threads"
+            | "--requirepass"
+            | "--aclfile"
+            | "--restore"
+            | "--masterauth"
+            | "--masteruser"
+            | "--replica-read-only" => {
                 let Some(value) = args.get(at) else {
                     eprintln!("yodb serve: {arg} needs a value");
                     return ExitCode::from(2);
@@ -354,6 +407,19 @@ fn serve_command(args: &[&str]) -> ExitCode {
                     from_rdb = Some(std::path::PathBuf::from(*value));
                 } else if arg == "--aclfile" {
                     aclfile = Some(std::path::PathBuf::from(*value));
+                } else if arg == "--masterauth" {
+                    masterauth = value;
+                } else if arg == "--masteruser" {
+                    masteruser = value;
+                } else if arg == "--replica-read-only" {
+                    match *value {
+                        "yes" => replica_read_only = true,
+                        "no" => replica_read_only = false,
+                        other => {
+                            eprintln!("yodb serve: --replica-read-only is yes or no, not {other}");
+                            return ExitCode::from(2);
+                        }
+                    }
                 } else if arg == "--requirepass" {
                     // An empty one is no password, which is the same thing
                     // `CONFIG SET requirepass ""` means by it.
@@ -489,6 +555,15 @@ fn serve_command(args: &[&str]) -> ExitCode {
     if let Some(opened) = opened {
         server.use_store(opened);
     }
+    server.set_replica_read_only(replica_read_only);
+    server.set_master_auth(masteruser.as_bytes(), masterauth.as_bytes());
+    // What the listener actually got and not what was asked for, because a
+    // server started on port zero would otherwise tell its master to dial back
+    // on a port nobody is listening on. A server with no port at all announces
+    // nothing, which is what a master shows for a replica that did not say.
+    if let Ok(bound) = server.local_addr() {
+        server.announce_port(bound.port());
+    }
 
     // Last of the startup steps, because it is the only one that can take a while
     // and because everything above changes how the keyspace behaves. A limit set
@@ -561,6 +636,15 @@ fn serve_command(args: &[&str]) -> ExitCode {
         ),
         (None, Some(limit)) => println!("yodb {version} evicts keys above {}", bytes(limit)),
         (_, None) => {}
+    }
+
+    // Last of everything, because from here on a thread is applying a master's
+    // writes and every setting above decides what applying means. The restore
+    // is above it too, so a server given both a file and a master starts from
+    // the file and then has whatever the master has instead.
+    if let Some((host, port)) = &upstream {
+        server.follow(host, *port);
+        println!("yodb {version} following {host} port {port}");
     }
 
     // After the listening line and not before it, so a Ctrl-C that arrives in

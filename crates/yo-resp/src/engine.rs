@@ -224,6 +224,10 @@ impl<S: Sink> Wire<S> {
     /// a frame that is meant to return.
     #[must_use]
     pub fn over(server: Arc<Server>, sink: S) -> Wire<S> {
+        // The one place that has both the server and the handle it is behind,
+        // which is what a replica link needs to be able to outlive the command
+        // that started it. See `Server::myself`.
+        server.is_behind();
         Wire {
             front: Front::new(sink),
             parked: Vec::new(),
@@ -261,6 +265,10 @@ impl<S: Sink> Wire<S> {
     /// give: changing the directory under a thread that is already serving out
     /// of it is the bug this would otherwise hide.
     pub fn server_mut(&mut self) -> &mut Server {
+        // The handle the server keeps on itself is a weak one and `Arc::get_mut`
+        // counts those too, so it is put down here. The next `Wire::over` picks
+        // it up again, and that is every path that ever starts a thread.
+        self.server.forget_behind();
         Arc::get_mut(&mut self.server)
             .expect("the server is set up before the threads that share it are started")
     }
