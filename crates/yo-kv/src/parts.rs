@@ -980,6 +980,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        miri,
+        ignore = "the target is the claim and five of them is 327680 elements"
+    )]
     fn the_layout_is_asked_for_rather_than_decided() {
         let mut p: Parts<u32> = Parts::with_parts(PART_MIN);
         assert_eq!(p.wants_parts(), None);

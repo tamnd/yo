@@ -55,6 +55,10 @@ impl Blocks for Mem {
 fn db() -> (Keyspace, Arc<AtomicUsize>) {
     let reads = Arc::new(AtomicUsize::new(0));
     let mut k = Keyspace::new();
+    k.set_zset_limits(zset::Limits {
+        max_listpack_entries: ZBAND,
+        ..zset::Limits::DEFAULT
+    });
     k.attach(Box::new(Mem {
         blobs: Vec::new(),
         reads: Arc::clone(&reads),
@@ -123,8 +127,30 @@ fn lindex(k: &mut Keyspace, key: &[u8], at: i64) -> Option<Vec<u8>> {
     k.lindex(key, at).expect("asked").map(|e| e.to_vec())
 }
 
+/// The listpack band every sorted set here is measured against.
+///
+/// A sorted set is far and away the most expensive body to build interpreted,
+/// somewhere near a second a member against fifteen milliseconds for a set
+/// member, so a band left where Redis puts it leaves three of these tests over
+/// five minutes each under Miri however few members past it they use. The band
+/// is a runtime knob, so under Miri it comes down instead and the counts either
+/// side of it come down with it, which is the same boundary in the same code
+/// with less to carry over it.
+const ZBAND: usize = if cfg!(miri) { 8 } else { 128 };
+
+/// Enough members to put a sorted set past [`ZBAND`] and into a table, which is
+/// the body worth moving and so the one these tests are about.
+const ZMANY: usize = if cfg!(miri) { 12 } else { 400 };
+
+/// Few enough members to leave a sorted set as one packed blob.
+const ZFEW: usize = if cfg!(miri) { 4 } else { 40 };
+
 /// Members and the scores they go in with, one score a member so the order is
 /// the order the names are in.
+///
+/// Every test reads what it expects off the list this returns rather than off
+/// the number it asked for, so the counts above are the only place a size is
+/// written down.
 fn scored(n: usize) -> Vec<(f64, Vec<u8>)> {
     (0..n)
         .map(|i| (i as f64, format!("member:{i:05}").into_bytes()))
@@ -620,19 +646,24 @@ fn dumping_and_restoring_a_demoted_list_gives_the_same_list_back() {
 
 #[test]
 fn a_demoted_sorted_set_answers_zcard_zscore_and_zrank_with_what_it_held() {
-    let all = scored(400);
+    let all = scored(ZMANY);
+    let (top, last) = all.last().expect("members").clone();
     let (mut k, _) = cold_zset(b"z", &all);
-    assert_eq!(k.zcard(b"z").expect("counted"), 400);
+    assert_eq!(k.zcard(b"z").expect("counted"), all.len());
     assert_eq!(k.zscore(b"z", b"member:00000").expect("asked"), Some(0.0));
-    assert_eq!(k.zscore(b"z", b"member:00399").expect("asked"), Some(399.0));
+    assert_eq!(k.zscore(b"z", &last).expect("asked"), Some(top));
     assert_eq!(k.zscore(b"z", b"nobody").expect("asked"), None);
+    // A member from the middle, taken off the list rather than named, so the
+    // rank it is asked for is the rank it went in at whatever the count is.
+    let at = all.len() / 3;
+    let (score, name) = all[at].clone();
     assert_eq!(
-        k.zrank(b"z", b"member:00042", false).expect("ranked"),
-        Some((42, 42.0))
+        k.zrank(b"z", &name, false).expect("ranked"),
+        Some((at, score))
     );
     assert_eq!(
-        k.zrank(b"z", b"member:00042", true).expect("ranked"),
-        Some((357, 42.0))
+        k.zrank(b"z", &name, true).expect("ranked"),
+        Some((all.len() - at - 1, score))
     );
     let got = zrange(&mut k, b"z", &Query::rank(0, -1));
     let want: Vec<Vec<u8>> = all.iter().map(|(_, m)| m.clone()).collect();
@@ -641,15 +672,16 @@ fn a_demoted_sorted_set_answers_zcard_zscore_and_zrank_with_what_it_held() {
 
 #[test]
 fn bringing_a_sorted_set_back_costs_one_pass_and_then_nothing() {
-    let all = scored(400);
+    let all = scored(ZMANY);
+    let (_, name) = all[all.len() / 3].clone();
     let (mut k, reads) = cold_zset(b"z", &all);
-    assert_eq!(k.zcard(b"z").expect("counted"), 400);
+    assert_eq!(k.zcard(b"z").expect("counted"), all.len());
     let first = reads.load(Ordering::Relaxed);
     assert!(first > 0, "the body was on the file");
     for _ in 0..50 {
         k.zcard(b"z").expect("counted");
-        k.zscore(b"z", b"member:00007").expect("asked");
-        k.zrank(b"z", b"member:00007", false).expect("ranked");
+        k.zscore(b"z", &name).expect("asked");
+        k.zrank(b"z", &name, false).expect("ranked");
     }
     assert_eq!(
         reads.load(Ordering::Relaxed),
@@ -660,7 +692,7 @@ fn bringing_a_sorted_set_back_costs_one_pass_and_then_nothing() {
 
 #[test]
 fn a_demoted_sorted_set_can_be_added_to_and_the_ranks_still_come_out_right() {
-    let all = scored(400);
+    let all = scored(ZMANY);
     let (mut k, _) = cold_zset(b"z", &all);
     assert_eq!(
         k.zadd(
@@ -671,14 +703,14 @@ fn a_demoted_sorted_set_can_be_added_to_and_the_ranks_still_come_out_right() {
         .expect("added"),
         2
     );
-    assert_eq!(k.zcard(b"z").expect("counted"), 402);
+    assert_eq!(k.zcard(b"z").expect("counted"), all.len() + 2);
     assert_eq!(
         k.zrank(b"z", b"first", false).expect("ranked"),
         Some((0, -1.0))
     );
     assert_eq!(
         k.zrank(b"z", b"last", false).expect("ranked"),
-        Some((401, 1000.0))
+        Some((all.len() + 1, 1000.0))
     );
     assert_eq!(
         k.zrank(b"z", b"member:00000", false).expect("ranked"),
@@ -693,31 +725,30 @@ fn a_demoted_sorted_set_can_be_added_to_and_the_ranks_still_come_out_right() {
     .expect("moved");
     assert_eq!(
         k.zrank(b"z", b"member:00000", false).expect("ranked"),
-        Some((400, 500.0))
+        Some((all.len(), 500.0))
     );
 }
 
 #[test]
 fn a_demoted_sorted_set_keeps_the_word_object_encoding_answers() {
-    // The table, which is what four hundred members make.
-    let (mut k, _) = cold_zset(b"table", &scored(400));
+    // The table, which is what a count past the band makes.
+    let (mut k, _) = cold_zset(b"table", &scored(ZMANY));
     assert_eq!(k.zset_encoding(b"table"), Some(zset::Encoding::Skiplist));
 
     // And one small enough to still be one packed blob, which has to come back
     // one, because the word is a property of the body and not of the record.
-    let (mut k, _) = cold_zset(b"blob", &scored(40));
+    let few = scored(ZFEW);
+    let (top, last) = few.last().expect("members").clone();
+    let (mut k, _) = cold_zset(b"blob", &few);
     assert_eq!(k.zset_encoding(b"blob"), Some(zset::Encoding::Listpack));
-    assert_eq!(k.zcard(b"blob").expect("counted"), 40);
-    assert_eq!(
-        k.zscore(b"blob", b"member:00039").expect("asked"),
-        Some(39.0)
-    );
+    assert_eq!(k.zcard(b"blob").expect("counted"), few.len());
+    assert_eq!(k.zscore(b"blob", &last).expect("asked"), Some(top));
 }
 
 #[test]
 fn deleting_a_demoted_sorted_set_does_not_free_somebody_elses_slab_slot() {
     let (mut k, _) = db();
-    let all = scored(400);
+    let all = scored(ZMANY);
     for name in [b"cold".as_slice(), b"warm".as_slice()] {
         k.zadd(
             name,
@@ -728,28 +759,28 @@ fn deleting_a_demoted_sorted_set_does_not_free_somebody_elses_slab_slot() {
     }
     assert!(k.demote(b"cold").expect("demoted"));
     k.del(b"cold");
-    assert_eq!(k.zcard(b"warm").expect("counted"), 400);
+    assert_eq!(k.zcard(b"warm").expect("counted"), all.len());
+    let at = all.len() / 3;
+    let (score, name) = all[at].clone();
     assert_eq!(
-        k.zrank(b"warm", b"member:00042", false).expect("ranked"),
-        Some((42, 42.0))
+        k.zrank(b"warm", &name, false).expect("ranked"),
+        Some((at, score))
     );
     assert_eq!(k.zcard(b"cold").expect("counted"), 0);
 }
 
 #[test]
 fn dumping_and_restoring_a_demoted_sorted_set_gives_the_same_one_back() {
-    let all = scored(400);
+    let all = scored(ZMANY);
+    let (top, last) = all.last().expect("members").clone();
     let (mut k, _) = cold_zset(b"z", &all);
     let blob = k.dump(b"z").expect("dumped");
     assert!(k.restore(b"back", &blob, None, false).is_ok());
-    assert_eq!(k.zcard(b"back").expect("counted"), 400);
+    assert_eq!(k.zcard(b"back").expect("counted"), all.len());
     let got = zrange(&mut k, b"back", &Query::rank(0, -1));
     let want: Vec<Vec<u8>> = all.iter().map(|(_, m)| m.clone()).collect();
     assert_eq!(got, want);
-    assert_eq!(
-        k.zscore(b"back", b"member:00399").expect("asked"),
-        Some(399.0)
-    );
+    assert_eq!(k.zscore(b"back", &last).expect("asked"), Some(top));
 }
 
 #[test]
@@ -976,6 +1007,7 @@ fn deleting_a_demoted_stream_does_not_free_somebody_elses_slab_slot() {
 }
 
 #[test]
+#[cfg_attr(miri, ignore = "a keyspace of twelve hundred bodies is the claim")]
 fn a_sweep_moves_collection_bodies_and_the_memory_goes_down() {
     let (mut k, _) = db();
     let pairs = fields(200);

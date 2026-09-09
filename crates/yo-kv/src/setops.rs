@@ -1142,6 +1142,10 @@ mod tests {
     /// against a huge one is what it exists for, and disjoint ranges are where a
     /// single seek is meant to cross the whole of the other set at once.
     #[test]
+    #[cfg_attr(
+        miri,
+        ignore = "the shapes are the claim and one of them is a hundred thousand"
+    )]
     fn the_merge_and_the_probe_agree_on_every_shape() {
         let shapes: [(&str, Vec<Vec<i64>>); 5] = [
             (

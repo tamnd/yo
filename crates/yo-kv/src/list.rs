@@ -1710,10 +1710,16 @@ mod tests {
     /// that stopped giving its spare room back when it was sealed, or a ring
     /// that started holding something per element, and either of those is a
     /// multiple rather than a few percent.
+    ///
+    /// The count is how the list comes to have many sealed chunks in it and it
+    /// is not the claim, so under Miri it comes down. Three thousand elements
+    /// of sixteen bytes is still several chunks with sealed ones behind the
+    /// live one, which is the shape the bound is about, and the per element
+    /// figure is the same to two decimal places at either size.
     #[test]
     fn a_long_list_does_not_hold_much_more_than_it_stores() {
         let limits = Limits::default();
-        let n = 100_000;
+        let n = if cfg!(miri) { 3_000 } else { 100_000 };
         let (l, payload) = weighed(n, 16, &limits);
         assert_eq!(l.encoding(), Encoding::Quicklist);
         let total = l.memory_bytes();

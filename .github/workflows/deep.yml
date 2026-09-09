@@ -237,6 +237,47 @@ jobs:
       # unsafe lines are interpreted now, which is what leaving it out had been
       # costing.
       #
+      # That was not enough and the crate went on timing out, so there was a
+      # second round over issue 499, and this one started from timings rather
+      # than from a reading of the source. Sorted sets are the whole of what was
+      # left. A member of one costs somewhere near a second to build
+      # interpreted, against about fifteen milliseconds for a member of a set,
+      # which is a gap of fifty to eighty times and is worth a look on its own
+      # account. Several tests could not be fixed by counting less, because even
+      # the smallest count that is still past the listpack band was over five
+      # minutes. So the band came down instead, the way the hash band already
+      # did in one place, and the counts either side of it came down with it,
+      # which leaves the same boundary in the same code with a twelfth of the
+      # members to carry over it. Three demoted body tests went from over five
+      # minutes each to under three seconds that way, and a sorted set union and
+      # a hash round trip went the same way. Nineteen counts and bands came down
+      # and thirteen more tests are skipped, each naming what its count is for.
+      #
+      # Where the band is a constant rather than a knob there is a floor and the
+      # count stops there. A run in an intset is capped at five hundred and
+      # twelve by a `const`, so the smallest set of integers that splits at all
+      # has five hundred and thirteen members in it, and that test is as small as
+      # it goes.
+      #
+      # The rule those two numbers come out of is worth writing down, because it
+      # is the one to apply next time. A count that is the claim of the test does
+      # not get smaller, it gets skipped with a reason saying what the count is
+      # for. A count that is only a way of reaching a state does get smaller, and
+      # the assert that would go vacuous if the smaller number were wrong stays
+      # and is checked by forcing the Miri branches on and running the suite
+      # compiled. That run earned its keep twice here. It caught a hash field
+      # count picked against a band of a hundred and twenty eight when the hash
+      # band is five hundred and twelve, which had quietly stopped testing the
+      # table. It also caught a shorter value in `tier` making a budget that
+      # nothing could meet, because the arena hands memory back one two megabyte
+      # segment at a time and half of a map that fits inside one segment is not
+      # a number the arena can reach.
+      #
+      # One thing that was measured and turned out not to matter, so that nobody
+      # measures it again: `-Zmiri-deterministic-floats` is not what makes sorted
+      # sets slow. The same eight tests take 495.6 seconds without the flag and
+      # 544.7 with it.
+      #
       # `yo-graph` was the fourth one back. Its two planes are three orders of
       # magnitude apart interpreted: an `Adjacency::link` is a push onto a run,
       # and a `Graph::link` puts a document for each end and one for the edge,

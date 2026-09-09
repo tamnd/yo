@@ -459,6 +459,7 @@ mod tests {
     /// between the fixed left neighbour and the key the last insert produced,
     /// which is the adversary that a fixed precision key dies to at about 52.
     #[test]
+    #[cfg_attr(miri, ignore = "the rate is the claim and it is 20000 inserts")]
     fn a_hammer_at_one_spot_grows_by_a_byte_every_eight_inserts() {
         const N: usize = 20_000;
         let lo = end(0);
@@ -488,6 +489,7 @@ mod tests {
     /// The same hammer from the other side, because the descent takes a
     /// different branch going up than it does going down.
     #[test]
+    #[cfg_attr(miri, ignore = "the rate is the claim and it is 20000 inserts")]
     fn a_hammer_under_the_upper_neighbour_grows_at_the_same_rate() {
         const N: usize = 20_000;
         let hi = end(1);

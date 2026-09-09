@@ -1034,8 +1034,14 @@ mod tests {
     fn a_large_set_of_integers_does_not_come_back_as_a_table() {
         // Past the point where the runs split, which is the case the gap form
         // exists for. Through a table it would be thirty bytes a member.
+        // A run holds 512 and that is a constant rather than a knob, so the
+        // smallest count that splits at all is five hundred and thirteen. Twelve
+        // hundred is three runs, which is a split and a run either side of the
+        // one that was split, and how far past that the set goes is not the
+        // claim.
+        let n: i64 = if cfg!(miri) { 1_200 } else { 200_000 };
         let mut s = Set::new();
-        for i in 0..200_000i64 {
+        for i in 0..n {
             s.add((i * 3).to_string().as_bytes(), &Limits::DEFAULT);
         }
         assert!(s.ints().is_some_and(|i| i.as_bytes().is_none()), "split");
@@ -1049,7 +1055,12 @@ mod tests {
         assert!(out.len() < s.len() * 3, "{} bytes", out.len());
     }
 
+    /// The count is the claim. A thawed set picks its body off how many
+    /// members arrived, so a smaller one comes back a table however it was
+    /// built, and a hinted split with a thousand members in it proves nothing
+    /// about the round trip.
     #[test]
+    #[cfg_attr(miri, ignore = "the threshold is the claim and it is 262144 members")]
     fn a_partitioned_set_comes_back_partitioned() {
         let mut s = Set::new();
         for i in 0..=PARTITION_AT {
@@ -1169,6 +1180,7 @@ mod tests {
     /// threshold, in one test, because building 262,145 members is the expensive
     /// part and there is no reason to pay for it four times.
     #[test]
+    #[cfg_attr(miri, ignore = "the threshold is the claim and it is 262144 members")]
     fn a_set_past_the_threshold_splits_without_the_client_being_able_to_tell() {
         let limits = Limits::DEFAULT;
         let mut s = Set::new();
@@ -1240,6 +1252,10 @@ mod tests {
     /// cursor from before the split. It has to see every member that stayed, and
     /// repeats are what the `SCAN` guarantee gives up in exchange.
     #[test]
+    #[cfg_attr(
+        miri,
+        ignore = "a split under a live cursor takes 262144 members to reach"
+    )]
     fn a_scan_survives_the_set_splitting_underneath_it() {
         let limits = Limits::DEFAULT;
         let mut s = Set::new();

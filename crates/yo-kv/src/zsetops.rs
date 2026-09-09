@@ -508,21 +508,32 @@ mod tests {
         assert_eq!(intercard(&[], 0), 0);
     }
 
+    /// The count is how both sides come to be on the table band with half of
+    /// one inside the other, and it is not the claim, so under Miri it comes
+    /// down. The band comes down with it, because a member of a sorted set is
+    /// about a second to build interpreted and a count left far enough past a
+    /// band of a hundred and twenty eight to mean anything is a quarter of an
+    /// hour on its own. Forty members against a band of eight is five times
+    /// past the ceiling and the overlap is still exactly half.
     #[test]
     fn a_union_of_thousands_agrees_with_the_slow_way_of_working_it_out() {
-        let one: Vec<(String, f64)> = (0..3_000)
-            .map(|i| (format!("m{i:05}"), f64::from(i)))
-            .collect();
-        let two: Vec<(String, f64)> = (1_500..4_500)
+        let band = Limits {
+            max_listpack_entries: if cfg!(miri) { 8 } else { 128 },
+            ..Limits::DEFAULT
+        };
+        let n: u32 = if cfg!(miri) { 40 } else { 3_000 };
+        let half = n / 2;
+        let one: Vec<(String, f64)> = (0..n).map(|i| (format!("m{i:05}"), f64::from(i))).collect();
+        let two: Vec<(String, f64)> = (half..half + n)
             .map(|i| (format!("m{i:05}"), f64::from(i) * 2.0))
             .collect();
         let mut a = Zset::new();
         for (m, s) in &one {
-            a.add(m.as_bytes(), *s, &Limits::DEFAULT);
+            a.add(m.as_bytes(), *s, &band);
         }
         let mut b = Zset::new();
         for (m, s) in &two {
-            b.add(m.as_bytes(), *s, &Limits::DEFAULT);
+            b.add(m.as_bytes(), *s, &band);
         }
         let ops = [Operand::Zset(&a), Operand::Zset(&b)];
 
@@ -533,6 +544,6 @@ mod tests {
         let mut want: Vec<(String, f64)> = want.into_iter().collect();
         want.sort_by(|x, y| cmp_key((x.1, x.0.as_bytes()), (y.1, y.0.as_bytes())));
         assert_eq!(ordered(gather(Op::Union, &ops, &[], Aggregate::Sum)), want);
-        assert_eq!(intercard(&ops, 0), 1_500);
+        assert_eq!(intercard(&ops, 0), usize::try_from(half).expect("a count"));
     }
 }

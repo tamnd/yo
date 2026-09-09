@@ -2037,10 +2037,15 @@ mod tests {
     /// entries with field names that cannot be shared. Thirty two is a bar with
     /// room in it rather than a target, because the point is to catch a
     /// regression and not to freeze the encoder.
+    ///
+    /// The count is how the nodes come to be full and share their field names,
+    /// and it is not the claim, so under Miri it comes down. A thousand entries
+    /// is still several full nodes and the figure moves by a tenth of a byte.
     #[test]
     fn an_entry_costs_about_two_dozen_bytes() {
+        let n = crate::many(10_000u64);
         let mut s = Stream::new();
-        for ms in 1..=10_000u64 {
+        for ms in 1..=n {
             let reading = format!("{:.3}", ms as f64 / 7.0);
             s.append(
                 Id::new(ms, 0),
@@ -2049,7 +2054,7 @@ mod tests {
             )
             .expect("an append");
         }
-        let each = s.memory_bytes() as f64 / 10_000.0;
+        let each = s.memory_bytes() as f64 / n as f64;
         assert!(each < 32.0, "{each:.2} bytes an entry");
     }
 
