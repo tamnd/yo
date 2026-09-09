@@ -844,7 +844,15 @@ mod tests {
         assert_eq!(out, val);
     }
 
+    /// The size here is the claim. Half of a map that spans several two
+    /// megabyte segments is the only budget the arena can actually meet, so
+    /// there is no smaller version of this test, and eight megabytes of
+    /// copying is what makes it slow interpreted.
     #[test]
+    #[cfg_attr(
+        miri,
+        ignore = "the budget is half of several two megabyte arena segments"
+    )]
     fn relieve_moves_values_out_until_the_map_fits() {
         // Enough data to span several arena segments. A budget below one
         // segment is a budget nothing can meet, because a segment is the unit
@@ -891,23 +899,34 @@ mod tests {
         // stalled at eighty five percent, because by then almost every entry a
         // round walked was one it had already moved.
         let mut m = RawMap::new();
-        let val = vec![b'u'; 2000];
-        for i in 0..4_000u32 {
+        // The budget here is one byte, so the sweep has to move everything
+        // whatever the values weigh, and the value length is only how much
+        // copying that comes to. Two hundred bytes is still well past the
+        // length below which a value is not worth moving.
+        let val = vec![b'u'; if cfg!(miri) { 200 } else { 2000 }];
+        // What the count buys is rounds, since a round moves sixteen, and it is
+        // rounds that both bugs were about. Four hundred is twenty five of them,
+        // which is enough for a round to draw nothing and enough that the
+        // eighty five percent the second bug stalled at is well under the bar
+        // below.
+        let n = crate::many(4_000u32);
+        for i in 0..n {
             put(&mut m, &i.to_le_bytes(), &val, None);
         }
         let mut t = tier();
         t.relieve(&mut m, 1, Policy::AllKeysLru, 2_000_000, Lfu::default())
             .expect("relieved");
 
-        let cold = (0..4_000u32)
+        let cold = (0..n)
             .filter(|i| {
                 let addr = m.find(&i.to_le_bytes()).expect("still there");
                 value::cold(m.value_at(addr)).is_some()
             })
             .count();
+        let bar = n as usize - n as usize / 40;
         assert!(
-            cold > 3_900,
-            "only {cold} of 4000 were moved, so the sweep gave up early"
+            cold > bar,
+            "only {cold} of {n} were moved, so the sweep gave up early"
         );
     }
 
@@ -1004,9 +1023,15 @@ mod tests {
 
     #[test]
     fn what_relieve_moved_still_reads_back_byte_for_byte() {
+        // The claim is that what went out comes back the same bytes, so what
+        // the count has to do is get some values moved and leave others where
+        // they are. Four hundred of them does that as well as four thousand,
+        // and the assert that nothing moved is still there to catch it if it
+        // ever stops doing it.
+        let n = many(4_000u32);
         let mut m = RawMap::new();
         let mut want = Vec::new();
-        for i in 0..4_000u32 {
+        for i in 0..n {
             let val: Vec<u8> = (0..900).map(|j| (i as usize + j) as u8).collect();
             put(&mut m, &i.to_le_bytes(), &val, None);
             want.push(val);

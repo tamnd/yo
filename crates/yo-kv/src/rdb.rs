@@ -1645,11 +1645,20 @@ mod tests {
 
     #[test]
     fn a_hash_with_no_deadlines_uses_the_plain_type() {
-        let l = hash::Limits::DEFAULT;
-        let mut hash = Hash::new();
         // Past the packed band, so this is the table and there is no blob to
         // copy. The small case is the listpack one and it is tested below.
-        for i in 0..1000 {
+        // A hash packs up to five hundred and twelve fields, so a count past
+        // the band is six hundred at least and that is still ten minutes
+        // interpreted. The band is a runtime knob, so under Miri it comes down
+        // and the field count comes down with it, over the same boundary in the
+        // same code.
+        let l = hash::Limits {
+            max_listpack_entries: if cfg!(miri) { 8 } else { 512 },
+            ..hash::Limits::DEFAULT
+        };
+        let mut hash = Hash::new();
+        let n: usize = if cfg!(miri) { 12 } else { 1000 };
+        for i in 0..n {
             hash.set(format!("f{i}").as_bytes(), b"1", &l);
         }
         assert_eq!(hash.encoding(), hash::Encoding::Hashtable);
@@ -1658,7 +1667,7 @@ mod tests {
         let Body::Hash(back) = round_trip(Body::Hash(hash)) else {
             panic!("a hash came back as something else");
         };
-        assert_eq!(back.len(), 1000);
+        assert_eq!(back.len(), n);
         assert_eq!(back.get(b"f7").map(|v| v.byte_len()), Some(1));
     }
 

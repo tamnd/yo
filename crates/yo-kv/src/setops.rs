@@ -1142,6 +1142,10 @@ mod tests {
     /// against a huge one is what it exists for, and disjoint ranges are where a
     /// single seek is meant to cross the whole of the other set at once.
     #[test]
+    #[cfg_attr(
+        miri,
+        ignore = "the shapes are the claim and one of them is a hundred thousand"
+    )]
     fn the_merge_and_the_probe_agree_on_every_shape() {
         let shapes: [(&str, Vec<Vec<i64>>); 5] = [
             (
@@ -1251,7 +1255,10 @@ mod tests {
     /// change what it had already handed over.
     #[test]
     fn a_limit_stops_a_merged_intersection_early() {
-        let vals: Vec<i64> = (0..2_000).collect();
+        // The count is only how both sides come to be shapes the planner
+        // answers Merge for, and the assert below is what would catch it if a
+        // smaller one stopped being one.
+        let vals: Vec<i64> = (0..crate::many(2_000)).collect();
         let a = ints(&vals);
         let b = ints(&vals);
         assert_eq!(plan_for(&[&a, &b]), Plan::Merge);
@@ -1261,7 +1268,7 @@ mod tests {
         );
         assert_eq!(
             run(|f| inter(&mut Scratch::new(), &[&a, &b], 0, f)).len(),
-            2_000
+            vals.len()
         );
         assert_eq!(
             run(|f| inter(&mut Scratch::new(), &[&a], 3, f)),
@@ -1293,20 +1300,34 @@ mod tests {
     /// been measuring the probe.
     #[test]
     fn a_set_past_the_intset_ceiling_still_merges() {
+        // The count is only how the set comes to be past both of the bands that
+        // would otherwise name it, and both of those are runtime knobs, so
+        // under Miri they come down and the count comes down with them. It has
+        // to be past the listpack band as well as the intset ceiling, because
+        // the word below is the one the server uses and a set inside the
+        // listpack band is called a listpack whatever it holds. Forty members
+        // against a pair of eights is five times past the further of them.
+        let band = if cfg!(miri) { 8 } else { 512 };
+        let n: i64 = if cfg!(miri) { 40 } else { 5_000 };
+        let limits = Limits {
+            max_intset_entries: band,
+            max_listpack_entries: band.min(Limits::DEFAULT.max_listpack_entries),
+            ..Limits::DEFAULT
+        };
         let a: Set = {
             let mut s = Set::new();
-            for i in 0..5_000i64 {
-                s.add(i.to_string().as_bytes(), &Limits::DEFAULT);
+            for i in 0..n {
+                s.add(i.to_string().as_bytes(), &limits);
             }
             s
         };
         assert_eq!(a.encoding(), Encoding::Hashtable, "the word a server uses");
         assert!(a.ints().is_some(), "and an intset underneath it");
-        let b = ints(&[4_998, 4_999, 5_000]);
+        let b = ints(&[n - 2, n - 1, n]);
         assert_eq!(plan_for(&[&a, &b]), Plan::Merge);
         assert_eq!(
             run(|f| inter(&mut Scratch::new(), &[&a, &b], 0, f)),
-            vec!["4998", "4999"]
+            vec![(n - 2).to_string(), (n - 1).to_string()]
         );
     }
 

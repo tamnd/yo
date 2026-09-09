@@ -1065,8 +1065,10 @@ mod tests {
         assert_eq!(small.encoding(), Encoding::Listpack);
 
         // And a hint is only a hint, so the table takes members like anything
-        // else and reports them in order.
-        let mut z = Zset::with_hint(1_000_000, &Limits::DEFAULT);
+        // else and reports them in order. How big the hint is only decides how
+        // much room gets reserved, so under Miri it comes down: reserving room
+        // for a million rows is most of what this costs interpreted.
+        let mut z = Zset::with_hint(crate::many(1_000_000), &Limits::DEFAULT);
         z.add(b"b", 2.0, &Limits::DEFAULT);
         z.add(b"a", 1.0, &Limits::DEFAULT);
         assert_eq!(z.len(), 2);
@@ -1150,6 +1152,10 @@ mod tests {
     /// quarter now, so the bound below is one a doubling array cannot meet and
     /// this test fails if either of them goes back to `Vec`'s policy.
     #[test]
+    #[cfg_attr(
+        miri,
+        ignore = "the slack is the claim and 40000 is the count that shows it"
+    )]
     fn a_large_sorted_set_does_not_hold_much_more_than_it_stores() {
         let n = 40_000usize;
         let (z, payload) = filled(n);
@@ -1467,7 +1473,12 @@ mod tests {
                 seed ^= seed << 17;
                 seed
             };
-            for round in 0..3_000 {
+            // The rounds are how the set comes to be added to, moved about and
+            // emptied in every order, and the number of them is not the claim,
+            // so under Miri it comes down. Three hundred rounds over forty
+            // names still crosses the band in both directions and still checks
+            // the whole set against the model three times over.
+            for round in 0..crate::many(3_000) {
                 let name = format!("m{:02}", roll() % 40);
                 // Scores land on a handful of values so that ties are the rule
                 // and not an accident.
@@ -1500,6 +1511,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        miri,
+        ignore = "bytes an element is the claim and it is 100000 members"
+    )]
     fn a_big_set_costs_what_the_tree_said_it_would() {
         let limits = &TABLE;
         let mut z = Zset::new();

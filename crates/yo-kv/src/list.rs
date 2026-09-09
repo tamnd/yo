@@ -1710,10 +1710,16 @@ mod tests {
     /// that stopped giving its spare room back when it was sealed, or a ring
     /// that started holding something per element, and either of those is a
     /// multiple rather than a few percent.
+    ///
+    /// The count is how the list comes to have many sealed chunks in it and it
+    /// is not the claim, so under Miri it comes down. Three thousand elements
+    /// of sixteen bytes is still several chunks with sealed ones behind the
+    /// live one, which is the shape the bound is about, and the per element
+    /// figure is the same to two decimal places at either size.
     #[test]
     fn a_long_list_does_not_hold_much_more_than_it_stores() {
         let limits = Limits::default();
-        let n = 100_000;
+        let n = if cfg!(miri) { 3_000 } else { 100_000 };
         let (l, payload) = weighed(n, 16, &limits);
         assert_eq!(l.encoding(), Encoding::Quicklist);
         let total = l.memory_bytes();
@@ -1935,7 +1941,14 @@ mod tests {
         let limits = Limits::default();
         let mut l = List::new();
         let mut want: Vec<Vec<u8>> = Vec::new();
-        for i in 0..4_000usize {
+        // The loop below asks for every element by value, and a find is a walk,
+        // so the cost of this one is the count squared. What the count has to
+        // buy is a ring of several chunks with the four shapes spread over the
+        // breaks, and four hundred elements is already several chunks against a
+        // node limit of a hundred and twenty eight. The encoding assert below is
+        // what would catch it if it ever stopped being a ring.
+        let n = crate::many(4_000usize);
+        for i in 0..n {
             // Four shapes, cycling: a plain number, a number too big for the
             // small encodings, a short string and a long one. The lengths vary
             // with the index so that no two chunks break in the same place.
@@ -1950,7 +1963,13 @@ mod tests {
         }
         assert_eq!(l.encoding(), Encoding::Quicklist, "this needs the ring");
         assert_eq!(l.len(), want.len());
-        for (at, v) in want.iter().enumerate() {
+        // A find is a walk, so asking for every element is the count squared
+        // even after the count came down. Under Miri a stride is walked
+        // instead, and seven is coprime with both the node limit and the four
+        // shapes, so the positions it lands on move across the chunk breaks and
+        // through all four shapes rather than sitting on one of each.
+        let step = if cfg!(miri) { 7 } else { 1 };
+        for (at, v) in want.iter().enumerate().step_by(step) {
             assert_eq!(l.find(v), Some(at), "element {at} is not where it is");
         }
         assert_eq!(l.find(b"not in here at all"), None);

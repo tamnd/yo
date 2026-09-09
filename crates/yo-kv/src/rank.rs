@@ -961,7 +961,11 @@ mod tests {
     #[test]
     fn a_sorted_run_of_appends_fills_its_leaves() {
         let mut tree = Rank::new();
-        let n = 10_000;
+        // A leaf is what fills up here, so the count has to be several leaves
+        // and not one, and a thousand rows is well past that. The bytes a row
+        // below is what would fail if it were not, because at one leaf the root
+        // is the whole cost and the figure comes out nowhere near four.
+        let n = crate::many(10_000);
         for i in 0..n {
             tree.insert_at(i as usize, i);
         }
@@ -977,7 +981,11 @@ mod tests {
     #[test]
     fn a_sorted_run_of_prepends_fills_its_leaves_too() {
         let mut tree = Rank::new();
-        let n = 10_000;
+        // A leaf is what fills up here, so the count has to be several leaves
+        // and not one, and a thousand rows is well past that. The bytes a row
+        // below is what would fail if it were not, because at one leaf the root
+        // is the whole cost and the figure comes out nowhere near four.
+        let n = crate::many(10_000);
         for i in 0..n {
             tree.insert_at(0, i);
         }
@@ -1013,11 +1021,17 @@ mod tests {
 
     #[test]
     fn taking_rows_out_puts_the_tree_back_together() {
+        // The rows are how the tree comes to have branches over its leaves and
+        // the count of them is not the claim, so under Miri it comes down. Five
+        // hundred is still several leaves under a branch, which is the level
+        // that has to collapse, and the tree is checked whole every ninety
+        // seven removals either way.
+        let n = crate::many(5_000u32);
         let mut tree = Rank::new();
-        for i in 0..5_000u32 {
+        for i in 0..n {
             tree.insert_at(i as usize, i);
         }
-        let mut model: Vec<u32> = (0..5_000).collect();
+        let mut model: Vec<u32> = (0..n).collect();
         let mut seed = 0x2545_F491_4F6C_DD1Du64;
         while !model.is_empty() {
             seed ^= seed << 13;
@@ -1118,6 +1132,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "bytes a row is the claim and it is a million rows")]
     fn a_million_rows_cost_under_five_bytes_each() {
         let mut tree = Rank::new();
         let n = 1_000_000u32;

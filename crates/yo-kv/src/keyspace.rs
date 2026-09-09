@@ -3147,6 +3147,7 @@ mod tests {
     /// Three of them and not one, so that the test is about finding an eligible
     /// key rather than about a table with a single entry in it.
     #[test]
+    #[cfg_attr(miri, ignore = "three volatile keys in fifty thousand is the claim")]
     fn a_volatile_policy_finds_the_one_key_in_a_database_that_is_not_volatile() {
         let mut d = db();
         d.set_policy(Policy::VolatileLru);

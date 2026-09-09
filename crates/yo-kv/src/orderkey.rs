@@ -421,7 +421,15 @@ mod tests {
     fn every_pair_that_honours_the_invariant_has_a_key_between_it() {
         let alphabet = [0x00u8, 0x01, 0x02, 0x7f, 0x80, 0xfe, 0xff];
         let mut keys: Vec<Vec<u8>> = Vec::new();
-        for len in 1..=3 {
+        // The sweep below is every ordered pair, so it costs the key count
+        // squared, and the key count is the alphabet size to the power of the
+        // length. Under Miri the longest key comes down by one byte, which
+        // leaves forty eight keys and eleven hundred pairs against three
+        // hundred and forty two and fifty eight thousand. It is still every
+        // pair of every key that can be written in that many bytes, which is
+        // what the claim is, over a shorter set of lengths.
+        let longest = if cfg!(miri) { 2 } else { 3 };
+        for len in 1..=longest {
             let mut key = vec![0u8; len];
             let mut counter = 0usize;
             let total = alphabet.len().pow(u32::try_from(len).unwrap());
@@ -452,13 +460,20 @@ mod tests {
                 pairs += 1;
             }
         }
-        assert_eq!(pairs, 58_311, "every ordered pair of the 342 legal keys");
+        let want = keys.len() * (keys.len() - 1) / 2;
+        assert_eq!(
+            pairs,
+            want,
+            "every ordered pair of the {} legal keys",
+            keys.len()
+        );
     }
 
     /// K14, measured. Twenty thousand inserts at one spot, every one of them
     /// between the fixed left neighbour and the key the last insert produced,
     /// which is the adversary that a fixed precision key dies to at about 52.
     #[test]
+    #[cfg_attr(miri, ignore = "the rate is the claim and it is 20000 inserts")]
     fn a_hammer_at_one_spot_grows_by_a_byte_every_eight_inserts() {
         const N: usize = 20_000;
         let lo = end(0);
@@ -488,6 +503,7 @@ mod tests {
     /// The same hammer from the other side, because the descent takes a
     /// different branch going up than it does going down.
     #[test]
+    #[cfg_attr(miri, ignore = "the rate is the claim and it is 20000 inserts")]
     fn a_hammer_under_the_upper_neighbour_grows_at_the_same_rate() {
         const N: usize = 20_000;
         let hi = end(1);
@@ -521,7 +537,12 @@ mod tests {
         // A cheap deterministic spread, so the inserts land all over the list
         // rather than at one spot.
         let mut seed = 0x2545_f491_4f6c_dd1du64;
-        for _ in 0..5_000 {
+        // The count is how many inserts the list has to stay ordered through
+        // and not a rate, which is what the two hammers above are for, so under
+        // Miri it comes down. Five hundred inserts spread over the list still
+        // has the descent reaching every part of it.
+        let n = crate::many(5_000);
+        for _ in 0..n {
             seed ^= seed << 13;
             seed ^= seed >> 7;
             seed ^= seed << 17;
@@ -531,6 +552,6 @@ mod tests {
         }
         assert!(keys.windows(2).all(|w| w[0] < w[1]), "the list is ordered");
         assert!(keys.iter().all(|k| *k.last().unwrap() != 0), "invariant");
-        assert_eq!(keys.len(), 5_002);
+        assert_eq!(keys.len(), n as usize + 2);
     }
 }

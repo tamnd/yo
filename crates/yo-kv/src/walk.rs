@@ -345,31 +345,45 @@ mod tests {
 
     #[test]
     fn the_last_key_left_is_the_one_randomkey_finds() {
+        // The keys are how the directory comes to be far bigger than what is
+        // left in it, and how many of them there were is not the claim, so
+        // under Miri it comes down. Five hundred buckets holding one key is
+        // the same fallback walk as five thousand.
+        let n = crate::many(5_000u32);
+        let keep = n / 2 + 42;
         let mut db = db();
-        for i in 0..5_000u32 {
+        for i in 0..n {
             put(&mut db, format!("k{i}").as_bytes());
         }
-        for i in 0..5_000u32 {
-            if i != 4_242 {
+        for i in 0..n {
+            if i != keep {
                 db.del(format!("k{i}").as_bytes());
             }
         }
 
-        // One key in a directory that grew to hold five thousand, so every
-        // random try misses and the fallback walk is what answers.
-        assert_eq!(db.random_key(), Some(&b"k4242"[..]));
+        // One key in a directory that grew to hold thousands, so every random
+        // try misses and the fallback walk is what answers.
+        let left = format!("k{keep}");
+        assert_eq!(db.random_key(), Some(left.as_bytes()));
     }
 
     #[test]
     fn a_scan_survives_the_keyspace_growing_underneath_it() {
+        // Both counts are how the directory comes to rehash while a cursor is
+        // out in it, and neither of them is the claim, so under Miri they come
+        // down together. What has to stay true is that keys keep arriving for
+        // as long as the cursor is out, because a directory that grew before
+        // the scan started is not the case this is about.
+        let start = crate::many(2_000u32);
+        let per_round = crate::many(64);
         let mut db = db();
-        for i in 0..2_000u32 {
+        for i in 0..start {
             put(&mut db, format!("k{i}").as_bytes());
         }
 
         let mut seen: HashSet<Vec<u8>> = HashSet::new();
         let mut at = KeyCursor::START;
-        let mut added = 2_000u32;
+        let mut added = start;
         loop {
             at = db.scan(at, 8, None, |k| {
                 seen.insert(k.to_vec());
@@ -377,13 +391,13 @@ mod tests {
             if at.is_end() {
                 break;
             }
-            for _ in 0..64 {
+            for _ in 0..per_round {
                 put(&mut db, format!("k{added}").as_bytes());
                 added += 1;
             }
         }
 
-        for i in 0..2_000u32 {
+        for i in 0..start {
             let k = format!("k{i}").into_bytes();
             assert!(
                 seen.contains(&k),
