@@ -356,6 +356,7 @@ pub(super) fn execute(
         "replconf" => super::repl::replconf(server, session, args, out)?,
         "psync" | "sync" => super::repl::psync(server, session, args, out)?,
         "replicaof" | "slaveof" => super::follow::replicaof(server, args, out)?,
+        "failover" => super::failover::execute(server, args, out)?,
         "hello" => hello(server, session, args, out)?,
         "select" => {
             let n = args.int(1)?;

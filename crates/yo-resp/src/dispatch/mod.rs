@@ -65,6 +65,7 @@ mod cms;
 mod cpu;
 mod cuckoo;
 mod debug;
+mod failover;
 mod follow;
 mod geo;
 mod graph;
@@ -934,6 +935,12 @@ pub struct Server {
     /// opposite halves of the same idea and a server is nearly always neither.
     /// See the `follow` module.
     follow: follow::Follower,
+    /// Handing the master's job over on purpose, which is `FAILOVER`.
+    ///
+    /// Beside the other two because it is the one thing that reaches into both:
+    /// it starts on a master, waits on a replica, and ends with this server
+    /// being one. See the `failover` module.
+    failover: failover::Failover,
     /// A handle on this server, for the one thing that outlives the command
     /// that started it.
     ///
@@ -1015,6 +1022,7 @@ impl Server {
             monitors: monitor::Monitors::default(),
             repl: repl::Replication::default(),
             follow: follow::Follower::default(),
+            failover: failover::Failover::default(),
             myself: Lock::new(Weak::new()),
             persist: persist::Persistence::default(),
             acl: acl::Users::default(),
@@ -1102,6 +1110,7 @@ impl Server {
             monitors: monitor::Monitors::default(),
             repl: repl::Replication::default(),
             follow: follow::Follower::default(),
+            failover: failover::Failover::default(),
             myself: Lock::new(Weak::new()),
             persist: persist::Persistence::default(),
             acl: acl::Users::default(),
@@ -32129,6 +32138,81 @@ mod tests {
         assert!(
             info.contains(&format!("master_replid2:{}", "0".repeat(40))),
             "{info}"
+        );
+    }
+
+    /// Every way of getting `FAILOVER` wrong, in the order a real server checks
+    /// them, because the order is what a script sees when it gets two things
+    /// wrong at once.
+    #[test]
+    fn failover_refuses_in_the_order_the_reference_refuses() {
+        let mut f = Fixture::new();
+        // Nothing going on, so ABORT has nothing to abort.
+        assert_eq!(
+            f.run(&[b"FAILOVER", b"ABORT"]),
+            "-ERR No failover in progress.\r\n"
+        );
+        // The parsing comes before any of the state checks, and a timeout of
+        // nought or less has a sentence of its own rather than being a syntax
+        // error.
+        assert_eq!(
+            f.run(&[b"FAILOVER", b"TIMEOUT", b"0"]),
+            "-ERR FAILOVER timeout must be greater than 0\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"FAILOVER", b"TIMEOUT", b"-1"]),
+            "-ERR FAILOVER timeout must be greater than 0\r\n"
+        );
+        assert!(
+            f.run(&[b"FAILOVER", b"TIMEOUT", b"abc"])
+                .starts_with("-ERR value is not an integer")
+        );
+        // Each word is taken at most once, so a second one is a syntax error and
+        // not an overwrite, and anything unrecognised is one too.
+        assert_eq!(f.run(&[b"FAILOVER", b"bogus"]), "-ERR syntax error\r\n");
+        assert_eq!(
+            f.run(&[b"FAILOVER", b"TIMEOUT", b"1", b"TIMEOUT", b"2"]),
+            "-ERR syntax error\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"FAILOVER", b"FORCE", b"FORCE"]),
+            "-ERR syntax error\r\n"
+        );
+        // TO wants both of its words, so one word short of it is a syntax error
+        // rather than a target with a missing port.
+        assert_eq!(f.run(&[b"FAILOVER", b"TO", b"h"]), "-ERR syntax error\r\n");
+        // ABORT is only ABORT when it is the whole command.
+        assert_eq!(
+            f.run(&[b"FAILOVER", b"ABORT", b"TIMEOUT", b"1"]),
+            "-ERR syntax error\r\n"
+        );
+        // Then the state checks. Nobody is following this server, so there is
+        // nobody to hand the job to, and that is asked before FORCE is.
+        assert_eq!(
+            f.run(&[b"FAILOVER"]),
+            "-ERR FAILOVER requires connected replicas.\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"FAILOVER", b"FORCE"]),
+            "-ERR FAILOVER requires connected replicas.\r\n"
+        );
+        // A replica has nothing of its own to give away.
+        f.server.pretend_following("10.0.0.4", 7000, true);
+        assert_eq!(
+            f.run(&[b"FAILOVER"]),
+            "-ERR FAILOVER is not valid when server is a replica.\r\n"
+        );
+    }
+
+    /// The state word `INFO` reports, which is what an operator watching a
+    /// handover reads, and which is `no-failover` on a server that is not in one.
+    #[test]
+    fn a_server_that_is_not_failing_over_says_no_failover() {
+        let mut f = Fixture::new();
+        assert!(
+            f.run(&[b"INFO", b"replication"])
+                .contains("master_failover_state:no-failover"),
+            "the field is there and says nothing is going on"
         );
     }
 
