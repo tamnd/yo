@@ -68,6 +68,13 @@ mod imp {
     /// handle first, so there is no state here and nothing to shut down.
     const USE_SYSTEM_PREFERRED_RNG: u32 = 0x0000_0002;
 
+    // The library has to be named, because nothing else in the tree pulls it
+    // in. The standard library used to, back when its own generator was this
+    // same call, and it has since moved to `ProcessPrng` in another library,
+    // so a build that linked by accident stopped linking when the toolchain
+    // caught up. The failure is at link time and only on the MSVC target,
+    // which is not a target a person developing this is usually on.
+    #[link(name = "bcrypt")]
     unsafe extern "system" {
         fn BCryptGenRandom(
             algorithm: *mut core::ffi::c_void,
