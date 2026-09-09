@@ -375,10 +375,36 @@ struct Local {
     /// Only the thread this belongs to reads or writes it, so it is a plain
     /// number in an atomic rather than anything that needs ordering.
     collect_ms: AtomicU64,
+    /// Where this thread's maintenance turn starts looking for a segment to
+    /// hand back.
+    ///
+    /// One per thread rather than one for the server, for the same reason
+    /// [`Local::collect_ms`] is one per thread and for one more. The turn runs
+    /// after every batch on every thread and it moves the cursor whether or not
+    /// it found anything, so a shared cursor is a line every thread writes at
+    /// batch rate, and what that costs grows with the thread count rather than
+    /// staying still. It is the only shared write left on a maintenance turn
+    /// that has nothing to do, which is nearly every turn on a server that is
+    /// keeping up.
+    ///
+    /// Sharing bought one thing, which is two threads not looking at the same
+    /// database at the same time, and that was already worth very little: the
+    /// second one takes the stripe lock, finds the first has moved what was
+    /// there and goes on. Starting each thread at its own index keeps most of
+    /// that anyway.
+    ///
+    /// [`Server::next_db`] stays shared and stays where it is, because the path
+    /// that reads it runs when a server is over its memory limit and writes it
+    /// only when it moved something.
+    ///
+    /// Only the thread this belongs to reads or writes it, so it is a plain
+    /// number in an atomic rather than anything that needs ordering.
+    compact_db: AtomicUsize,
 }
 
-impl Default for Local {
-    fn default() -> Local {
+impl Local {
+    /// A thread's counters, starting its compaction cursor at `at`.
+    fn at(at: usize) -> Local {
         Local {
             stats: Stats::default(),
             cmdstats: CommandStats::default(),
@@ -386,7 +412,14 @@ impl Default for Local {
             turn: AtomicU64::new(ALL_DATABASES),
             parked: AtomicUsize::new(0),
             collect_ms: AtomicU64::new(u64::MAX),
+            compact_db: AtomicUsize::new(at),
         }
+    }
+}
+
+impl Default for Local {
+    fn default() -> Local {
+        Local::at(0)
     }
 }
 
@@ -444,7 +477,9 @@ fn one_thread() -> Box<[Local]> {
 
 /// Room for `threads` of them.
 fn slots(threads: usize) -> Box<[Local]> {
-    (0..threads.max(1)).map(|_| Local::default()).collect()
+    // By index, so that the compaction cursors start spread out over the
+    // databases rather than every thread walking in on the same one.
+    (0..threads.max(1)).map(Local::at).collect()
 }
 
 /// Where the process was started, which is what `dir` defaults to.
@@ -556,14 +591,18 @@ pub struct Server {
     width: usize,
     clock: Clock,
     started_ms: u64,
-    /// Where the next maintenance turn starts looking, so that a database
-    /// under constant write load cannot hold the other fifteen's space.
+    /// Where the next hard compaction starts looking, so that a database under
+    /// constant write load cannot hold the other fifteen's space.
     ///
-    /// Shared, because compaction is asked for from two places: the maintenance
-    /// turn, which is one thread, and a command that went over the memory limit
-    /// and is trying to get back under it, which is any thread. Two threads that
-    /// read the same cursor start on the same database, and what that costs is
-    /// one of them finding the other has already moved what was there.
+    /// Shared, because the thing that asks for one is a command that went over
+    /// the memory limit and is trying to get back under it, and that is any
+    /// thread. Two threads that read the same cursor start on the same
+    /// database, and what that costs is one of them finding the other has
+    /// already moved what was there. It is only written when a segment did
+    /// move, so a server that is not over its limit never touches it at all.
+    ///
+    /// The maintenance turn has its own cursor per thread rather than sharing
+    /// this one. See [`Local::compact_db`] for why.
     next_db: AtomicUsize,
     /// One bit per database, set when a command ran against it.
     ///
@@ -1926,9 +1965,10 @@ impl Server {
 
     /// One slice of compaction for a server that is over its limit.
     ///
-    /// Takes the databases in the same order [`Server::compact_step`] does and
-    /// stops at the first one that had something to move, and it asks with the
-    /// ratios off. See [`Keyspace::compact_hard`] for what that changes.
+    /// Round robin the way [`Server::compact_step`] is, from its own cursor
+    /// rather than that one's, and it stops at the first database that had
+    /// something to move and asks with the ratios off. See
+    /// [`Keyspace::compact_hard`] for what that changes.
     fn compact_hard_step(&self) -> Option<usize> {
         let from = self.next_db.load(Relaxed);
         for turn in 0..self.slots() {
@@ -1988,7 +2028,11 @@ impl Server {
             self.collect_marks();
         }
         let mine = self.mine();
-        let from = self.next_db.load(Relaxed);
+        // This thread's cursor and not the server's. The load and the store
+        // either side of this walk happen after every batch on every thread,
+        // and on the server's cursor that is one line every thread is writing
+        // to at batch rate for no reason other than to say where to start.
+        let from = mine.compact_db.load(Relaxed);
         for turn in 0..looks {
             let i = (from + turn) % slots;
             // Nothing has run against this database since it last said it had
@@ -1999,7 +2043,7 @@ impl Server {
                 continue;
             }
             if let Some(moved) = self.slot(i).compact_step() {
-                self.next_db.store((i + 1) % slots, Relaxed);
+                mine.compact_db.store((i + 1) % slots, Relaxed);
                 return Some(moved);
             }
             // Only once every stripe of the database has said it has nothing,
@@ -2009,7 +2053,7 @@ impl Server {
                 mine.done(at);
             }
         }
-        self.next_db.store((from + looks) % slots, Relaxed);
+        mine.compact_db.store((from + looks) % slots, Relaxed);
         None
     }
 }
@@ -4007,6 +4051,58 @@ mod tests {
         // And nothing landed anywhere else on the way.
         f.run(&[b"SELECT", b"0"]);
         assert_eq!(f.run(&[b"DBSIZE"]), ":0\r\n");
+    }
+
+    /// The maintenance turn moves its own cursor and leaves the server's alone.
+    ///
+    /// The turn runs after every batch on every thread, so anything it writes
+    /// that the whole server can see is a line every thread is writing to at
+    /// batch rate, and the cost of that goes up with the thread count instead
+    /// of staying still. The cursor is the last thing in the turn that was
+    /// shared, and it was shared for a reason that only ever applied to the
+    /// other caller: [`Server::compact_hard_step`] runs when a server is over
+    /// its memory limit, which is a rare thing and not a per batch thing.
+    ///
+    /// What is checked is both halves of that. The turn is asked to walk, and
+    /// afterwards this thread's cursor has moved and the server's has not.
+    #[test]
+    fn the_maintenance_turn_does_not_write_a_shared_cursor() {
+        let f = Fixture::new();
+        let before = f.server.next_db.load(Relaxed);
+        let mine = f.server.mine().compact_db.load(Relaxed);
+        // Nothing to compact, which is the case that matters: a turn that found
+        // nothing is nearly every turn, and it used to write the shared cursor
+        // anyway just to say where the next one should start.
+        assert!(f.server.compact_step().is_none());
+        assert_eq!(
+            f.server.next_db.load(Relaxed),
+            before,
+            "the turn wrote the cursor the over limit path reads"
+        );
+        assert_ne!(
+            f.server.mine().compact_db.load(Relaxed),
+            mine,
+            "the turn did not move on, so it will look at the same stripes forever"
+        );
+    }
+
+    /// Two threads start their walk in different places.
+    ///
+    /// Splitting the cursor gave up the one thing sharing bought, which is two
+    /// threads not arriving at the same database at the same moment. Seeding
+    /// each thread's cursor at its own index buys most of it back for nothing,
+    /// and this is that: a server built for eight threads has eight cursors and
+    /// no two of them start together.
+    #[test]
+    fn each_thread_starts_its_compaction_somewhere_else() {
+        let mut server = Server::new();
+        server.set_threads(8);
+        let starts: Vec<usize> = server
+            .locals
+            .iter()
+            .map(|t| t.compact_db.load(Relaxed))
+            .collect();
+        assert_eq!(starts, (0..8).collect::<Vec<usize>>());
     }
 
     #[test]
