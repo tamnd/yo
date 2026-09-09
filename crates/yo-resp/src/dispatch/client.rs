@@ -227,10 +227,11 @@ enum Kind {
     Normal,
     /// A client that is.
     Pubsub,
-    /// A replication link in one direction or the other, of which there are
-    /// none here yet, so naming one is a filter nothing matches rather than an
-    /// error.
-    Link,
+    /// A connection that asked for the command stream and is being fed it.
+    Replica,
+    /// The link to the server this one is following, of which there is none
+    /// here yet, so naming it is a filter nothing matches rather than an error.
+    Master,
 }
 
 impl Kind {
@@ -240,8 +241,10 @@ impl Kind {
             Ok(Kind::Normal)
         } else if is(word, b"pubsub") {
             Ok(Kind::Pubsub)
-        } else if is(word, b"master") || is(word, b"replica") || is(word, b"slave") {
-            Ok(Kind::Link)
+        } else if is(word, b"replica") || is(word, b"slave") {
+            Ok(Kind::Replica)
+        } else if is(word, b"master") {
+            Ok(Kind::Master)
         } else {
             Err(Error::fmt(
                 Code::Invalid,
@@ -254,9 +257,13 @@ impl Kind {
     fn covers(self, row: &Client) -> bool {
         match self {
             Kind::Any => true,
-            Kind::Normal => !row.flag(clients::SUBSCRIBED),
-            Kind::Pubsub => row.flag(clients::SUBSCRIBED),
-            Kind::Link => false,
+            // Redis asks the three questions in order and stops at the first
+            // yes, so a replica is a replica and never also a normal client,
+            // and normal is what is left over.
+            Kind::Normal => !row.flag(clients::REPLICA) && !row.flag(clients::SUBSCRIBED),
+            Kind::Pubsub => !row.flag(clients::REPLICA) && row.flag(clients::SUBSCRIBED),
+            Kind::Replica => row.flag(clients::REPLICA),
+            Kind::Master => false,
         }
     }
 }
