@@ -149,6 +149,27 @@ impl Access {
     pub const fn is_none(self) -> bool {
         self.0 == 0
     }
+
+    /// The two bits on their own, for something that has to store a lot of
+    /// these and cannot spare a byte each.
+    ///
+    /// The ACL is the caller. A user can carry hundreds of key patterns and
+    /// every one of them holds a copy of this, so it is packed in beside the
+    /// glob rather than kept as a type.
+    #[must_use]
+    pub const fn bits(self) -> u8 {
+        self.0
+    }
+
+    /// The other half of [`Access::bits`].
+    ///
+    /// Anything outside the two bits is dropped rather than trusted, so a
+    /// caller that has stored the byte somewhere and read back rubbish gets a
+    /// permission that is too small rather than one that is too large.
+    #[must_use]
+    pub const fn from_bits(bits: u8) -> Access {
+        Access(bits & 3)
+    }
 }
 
 impl KeySpec {

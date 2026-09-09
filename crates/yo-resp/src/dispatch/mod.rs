@@ -51,6 +51,7 @@
 //! that do allocate, an error message and the text of `INFO`, say so and wrap
 //! it, because a shard thread that allocates aborts.
 
+mod acl;
 mod args;
 mod arrays;
 mod auth;
@@ -869,8 +870,10 @@ pub struct Server {
     monitors: monitor::Monitors,
     /// What the saves have done, which is all `INFO persistence` has to report.
     persist: persist::Persistence,
-    /// The password connections are asked for, if they are asked for one.
-    access: auth::Access,
+    /// Who is allowed to run what, which is also where `requirepass` lives.
+    acl: acl::Users,
+    /// The plain `requirepass`, kept only so `CONFIG GET` can report it.
+    plain: acl::Plain,
     /// The knobs `DEBUG` turns, which is what a test suite reaches for.
     debug: debug::Knobs,
 }
@@ -920,7 +923,8 @@ impl Server {
             pause: AtomicU64::new(0),
             monitors: monitor::Monitors::default(),
             persist: persist::Persistence::default(),
-            access: auth::Access::default(),
+            acl: acl::Users::default(),
+            plain: acl::Plain::default(),
             debug: debug::Knobs::default(),
             mail: pubsub::boxes(1),
         }
@@ -993,7 +997,8 @@ impl Server {
             pause: AtomicU64::new(0),
             monitors: monitor::Monitors::default(),
             persist: persist::Persistence::default(),
-            access: auth::Access::default(),
+            acl: acl::Users::default(),
+            plain: acl::Plain::default(),
             debug: debug::Knobs::default(),
             mail: pubsub::boxes(1),
         }
@@ -2037,6 +2042,13 @@ pub struct Session {
     /// session nobody told is a session on a server nobody gave a password to,
     /// and the gate only reads this when there is one. See the `auth` module.
     authenticated: bool,
+    /// Which user this connection is, and the copy of it its commands are
+    /// checked against.
+    ///
+    /// Boxed because it is three allocations and a connection on a server that
+    /// has no ACL never reads past the first field of it. See the `acl` module
+    /// for why a copy rather than a lookup.
+    acl: Box<acl::Identity>,
 }
 
 /// What a connection has asked to hear back, which is `CLIENT REPLY`.
@@ -2081,6 +2093,7 @@ impl Session {
             reply: Reply::On,
             sock: Arc::new(Client::new(id)),
             authenticated: false,
+            acl: Box::default(),
         }
     }
 
@@ -2310,6 +2323,10 @@ impl Session {
         self.reply = Reply::On;
         self.set_no_evict(false);
         self.set_no_touch(false);
+        // Back on the default user, whatever it had authenticated as. The
+        // password half of that is the caller's, because only it can see the
+        // server and know whether there is one to ask for.
+        self.forget_user();
     }
 
     /// Record the name from `HELLO ... SETNAME` or `CLIENT SETNAME`.
@@ -2400,9 +2417,9 @@ pub fn execute(server: &Server, session: &mut Session, args: Args<'_>, out: &mut
 /// A hand written list because the table has one row per container and none per
 /// subcommand, so there is nothing to ask. It goes away with D-114, which gives
 /// every subcommand a row of its own and makes this a flag on the container.
-const CONTAINERS: [&str; 10] = [
-    "backup", "client", "command", "config", "function", "object", "pubsub", "script", "xgroup",
-    "xinfo",
+const CONTAINERS: [&str; 11] = [
+    "acl", "backup", "client", "command", "config", "function", "object", "pubsub", "script",
+    "xgroup", "xinfo",
 ];
 
 /// The subcommand a container command was given, for the `cmd` field of
@@ -2530,6 +2547,27 @@ pub fn resolved(
     {
         server.mine().cmdstats.at(spec).rejected.bump();
         multi::refuse(server, session, Some(spec), &e, out);
+        return Flow::Continue;
+    }
+
+    // The ACL, here and in this order because this is where a real server puts
+    // it: after the refusal above and before the memory limit, so a user who may
+    // not run a command is told that rather than told the server is full.
+    //
+    // One relaxed load on a server nobody has written an ACL for, which is every
+    // server that only ever set `requirepass`, because setting a password leaves
+    // the default user able to do everything and a user who can do everything
+    // cannot be refused anything.
+    if server.restricted()
+        && let Some(said) = acl::gate(server, session, spec, args)
+    {
+        server.mine().cmdstats.at(spec).rejected.bump();
+        if spec.name == "exec" {
+            multi::abort(server, session, &said, out);
+        } else {
+            session.dirty_multi();
+            out.error(said.as_bytes());
+        }
         return Flow::Continue;
     }
 
