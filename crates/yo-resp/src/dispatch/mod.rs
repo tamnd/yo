@@ -872,6 +872,16 @@ pub struct Server {
     persist: persist::Persistence,
     /// Who is allowed to run what, which is also where `requirepass` lives.
     acl: acl::Users,
+    /// Every refusal the ACL has made, which is what `ACL LOG` reports.
+    acllog: acl::Log,
+    /// The file `ACL LOAD` reads and `ACL SAVE` writes, empty when there is
+    /// none, which is the default and is every server nobody gave one to.
+    ///
+    /// Taken at startup and never changed, the same as on a real server, where
+    /// `aclfile` is an immutable config: a server that could be pointed at a
+    /// different ACL file while it was running would be a server an operator
+    /// could not reason about.
+    aclfile: PathBuf,
     /// The plain `requirepass`, kept only so `CONFIG GET` can report it.
     plain: acl::Plain,
     /// The knobs `DEBUG` turns, which is what a test suite reaches for.
@@ -924,6 +934,8 @@ impl Server {
             monitors: monitor::Monitors::default(),
             persist: persist::Persistence::default(),
             acl: acl::Users::default(),
+            acllog: acl::Log::default(),
+            aclfile: PathBuf::new(),
             plain: acl::Plain::default(),
             debug: debug::Knobs::default(),
             mail: pubsub::boxes(1),
@@ -998,6 +1010,8 @@ impl Server {
             monitors: monitor::Monitors::default(),
             persist: persist::Persistence::default(),
             acl: acl::Users::default(),
+            acllog: acl::Log::default(),
+            aclfile: PathBuf::new(),
             plain: acl::Plain::default(),
             debug: debug::Knobs::default(),
             mail: pubsub::boxes(1),
@@ -1078,6 +1092,36 @@ impl Server {
     /// leave files nothing can find again.
     pub fn set_dir(&mut self, dir: PathBuf) {
         self.dir = dir;
+    }
+
+    /// The file `ACL LOAD` reads and `ACL SAVE` writes, or `None` for a server
+    /// that was not given one.
+    #[must_use]
+    pub fn aclfile(&self) -> Option<&Path> {
+        Some(self.aclfile.as_path()).filter(|p| !p.as_os_str().is_empty())
+    }
+
+    /// Point the server at an ACL file, which `yodb serve --aclfile` does.
+    ///
+    /// Only before it is serving, and giving one does not read it: the caller
+    /// asks for that with [`Server::load_acl`], so that a file that will not
+    /// parse can stop the process before the port opens rather than after.
+    pub fn set_aclfile(&mut self, path: PathBuf) {
+        self.aclfile = path;
+    }
+
+    /// Read the ACL file, if there is one, and make it the server's users.
+    ///
+    /// # Errors
+    ///
+    /// Everything the file got wrong, in one sentence. A caller starting a
+    /// server should print it and stop, which is what a real server does: coming
+    /// up with the users an operator did not ask for is worse than not coming up.
+    pub fn load_acl(&self) -> std::result::Result<(), String> {
+        match self.aclfile() {
+            Some(path) => yo_alloc::allow(|| acl::load_file(self, path)),
+            None => Ok(()),
+        }
     }
 
     /// Drop a sealed backup that has outlived `backup-sealed-ttl`.
@@ -2559,7 +2603,7 @@ pub fn resolved(
     // the default user able to do everything and a user who can do everything
     // cannot be refused anything.
     if server.restricted()
-        && let Some(said) = acl::gate(server, session, spec, args)
+        && let Some(said) = acl::gate(server, session, spec, args, out)
     {
         server.mine().cmdstats.at(spec).rejected.bump();
         if spec.name == "exec" {

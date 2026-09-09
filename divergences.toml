@@ -972,3 +972,11 @@ reason = "ACL SETUSER u +config|nope is an unknown command on a real server and 
 status = "until"
 resolved_by = "M8"
 spec = "12 section 3"
+
+[[divergence]]
+id = "D-138"
+title = "CONFIG SET takes the same setting twice and keeps the last value"
+reason = "CONFIG SET maxmemory 0 maxmemory 0 answers OK here and is refused on a real server with CONFIG SET failed (possibly related to argument 'maxmemory') - duplicate parameter. The reference reads the names in one pass and the values in another, which is why it can see a repeat at all: the first pass looks each name up and puts it in a set, and a name already in the set is the refusal. It matches on the setting rather than on the spelling, so hash-max-ziplist-entries and hash-max-listpack-entries are the same name twice, and an unknown name is found before a repeat is, since the lookup comes first. Here the names and the values are read together in one pass, each setting is staged into its own slot, and a second write to a slot simply overwrites the first, so the command takes the last value and applies it. Nothing else about the command differs: the whole set is still read and checked before any of it is applied, which is the part that matters when one command names several settings and the third one is wrong. It goes away when CONFIG SET is split into the two passes the reference uses, which is also what would let an unknown name be reported ahead of a value that could not be parsed."
+status = "until"
+resolved_by = "M8"
+spec = "12 section 2"

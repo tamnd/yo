@@ -75,7 +75,7 @@ pub(super) fn execute(
             "AUTH <password> called without any password configured for the default user. Are you sure your configuration is correct?",
         ));
     }
-    if !acl::authenticate(server, session, user, password) {
+    if !acl::authenticate(server, session, user, password, args, out) {
         // Written straight into the buffer, because the code in front of it is
         // what a client branches on and this is the only place in the engine
         // that sends it. The same reason `NOPROTO` is written where it is
