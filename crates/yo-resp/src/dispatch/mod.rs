@@ -31682,6 +31682,41 @@ mod tests {
         );
     }
 
+    /// A replica that lost the link for a moment is given the bytes it missed.
+    ///
+    /// The number it sends is the position of the first byte it wants counted
+    /// from one, so a replica that has everything asks for one past the end.
+    /// Reading that as a count of bytes written instead is an off by one that
+    /// turns every reconnect into a full resync, which is exactly what a real
+    /// replica did until this was fixed.
+    #[test]
+    fn a_replica_asking_to_carry_on_is_caught_up_from_the_backlog() {
+        let mut f = Fixture::replicated();
+        f.crossed(&[b"SET", b"k", b"v"]);
+        let id = f.server.repl_id();
+        let had = f.mark;
+        f.crossed(&[b"SET", b"k2", b"later"]);
+        let asked = (had + 1).to_string();
+        let reply = f.run(&[b"PSYNC", &id, asked.as_bytes()]);
+        assert!(reply.starts_with("+CONTINUE "), "{reply}");
+        assert!(reply.contains("later"), "{reply}");
+        // And what it already had is not sent twice.
+        assert_eq!(reply.matches("k2").count(), 1, "{reply}");
+    }
+
+    /// A replica with nothing to carry on from is sent the whole dataset.
+    #[test]
+    fn a_replica_with_no_history_is_sent_a_snapshot() {
+        let mut f = Fixture::replicated();
+        f.crossed(&[b"SET", b"k", b"v"]);
+        let reply = f.run(&[b"PSYNC", b"?", b"-1"]);
+        assert!(reply.starts_with("+FULLRESYNC "), "{reply}");
+        // The header, then the image as a bulk string with no newline after it.
+        let body = reply.split_once("\r\n").expect("a header ends").1;
+        assert!(body.starts_with('$'), "{body:?}");
+        assert!(!body.ends_with("\r\n"), "{body:?}");
+    }
+
     /// A transaction crosses as the commands it ran, which is D-141: a real
     /// server wraps them in `MULTI` and `EXEC`.
     #[test]

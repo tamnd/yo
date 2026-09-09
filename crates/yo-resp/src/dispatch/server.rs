@@ -1486,7 +1486,10 @@ fn info(server: &Server, args: Args<'_>, out: &mut Out) {
                 s,
                 "# Clients\r\nconnected_clients:{}\r\nblocked_clients:{}\r\n\
                  pubsub_clients:{}\r\ncluster_connections:0\r\n\r\n",
-                server.totals().clients,
+                server
+                    .totals()
+                    .clients
+                    .saturating_sub(server.replica_count()),
                 server.parked(),
                 server.pubsub_counts().clients,
             );

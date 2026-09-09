@@ -411,6 +411,18 @@ impl Server {
         self.repl.live.load(Relaxed) != 0
     }
 
+    /// How many of them there are, which `INFO clients` takes off its count.
+    ///
+    /// A replica is a connection and is not a client: Redis counts the sockets
+    /// and then subtracts the replicas, so `connected_clients` is the number of
+    /// people talking to the server rather than the number of file descriptors
+    /// it is holding, and the replicas are reported next door as their own
+    /// number.
+    #[must_use]
+    pub(crate) fn replica_count(&self) -> u64 {
+        self.repl.live.load(Relaxed) as u64
+    }
+
     /// The forty characters naming this server's history.
     pub(crate) fn repl_id(&self) -> [u8; ID_LEN] {
         *self.repl.id.lock()
@@ -766,7 +778,14 @@ pub(super) fn psync(
         }
         let asked = args.get(1);
         let from = args.int(2)?;
-        (asked != b"?" && from >= 0).then(|| (asked.to_vec(), from as u64))
+        // The number a replica sends is the position of the first byte it
+        // wants counted from one, so a replica that has everything asks for one
+        // past the end of the stream. Everything on this side counts bytes
+        // written, so the two are a step apart, and the step is taken here
+        // rather than inside the backlog, where every other caller means the
+        // count. A nought is nobody's answer and would mean the byte before the
+        // first, so it starts again, which is what a real master does with it.
+        (asked != b"?" && from >= 1).then(|| (asked.to_vec(), from as u64 - 1))
     };
     if session.running() {
         return Err(Error::new(
@@ -942,7 +961,16 @@ pub(super) fn info(server: &Server, s: &mut String) {
         let backlog = server.repl.backlog.lock();
         (
             usize::from(!backlog.ring.is_empty()),
-            backlog.first,
+            // Counted from one, the way a replica counts when it asks to carry
+            // on, because this is the number it is being compared against. A
+            // server that has never had a replica has no backlog and reports a
+            // nought rather than the one that would be the first byte of the
+            // one it has not made.
+            if backlog.ring.is_empty() {
+                0
+            } else {
+                backlog.first + 1
+            },
             backlog.filled,
         )
     };
