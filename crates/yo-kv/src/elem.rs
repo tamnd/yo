@@ -1573,8 +1573,16 @@ mod tests {
         // The two counts move together. What fills an array with markers is how
         // many removals happen per live member, so the churn has to stay ninety
         // nine times the population or there is nothing here to catch.
-        let held = many(1000);
-        let churn = many(100_000);
+        //
+        // Every turn of the loop below is a removal, an insertion and a length
+        // check, and interpreted that is seven minutes over ten thousand of
+        // them. The ratio is what the test is about and the population is not,
+        // so under Miri both come down together and the ratio stays where it
+        // was. Ten members sit in an array of sixteen slots, so nine hundred
+        // and ninety removals is sixty markers a slot, which is many times over
+        // what it takes to fill an array that never collects them.
+        let held: u64 = if cfg!(miri) { 10 } else { 1000 };
+        let churn: u64 = held * 100;
         let mut s = Set::new();
         for i in 0..held {
             s.insert(format!("m{i}").as_bytes(), ()).expect("room");
