@@ -1514,8 +1514,9 @@ impl Server {
     /// one.
     ///
     /// Called by whoever wrapped it up, as many times as there are threads, and
-    /// every call after the first says the same thing. See [`Server::myself`]
-    /// for why it cannot be worked out from the inside.
+    /// every call after the first says the same thing. It cannot be worked out
+    /// from the inside, because a `&Server` has no way to reach the handle it
+    /// is behind, so whoever made the handle has to say.
     pub fn is_behind(self: &Arc<Server>) {
         let mut myself = self.myself.lock();
         if myself.strong_count() == 0 {
