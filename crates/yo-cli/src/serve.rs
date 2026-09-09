@@ -528,6 +528,18 @@ impl Server {
         self.setup().set_aclfile(path);
     }
 
+    /// Make this server a cluster node, holding the sixteen thousand slots.
+    ///
+    /// Taken here at startup and fixed for the life of the process, which is a
+    /// real server's rule and the only sane one: a server that could be turned
+    /// into a cluster node while it was holding keys would be a server whose
+    /// keys were suddenly in slots it does not own. The port is what the
+    /// listener actually got, because it is what this node writes into its own
+    /// config file and what a redirection sends a client to.
+    pub fn enable_cluster(&mut self, file: &str, port: u16) {
+        self.setup().enable_cluster(file, port);
+    }
+
     /// Read the ACL file and make it the server's users.
     ///
     /// # Errors

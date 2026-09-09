@@ -281,6 +281,16 @@ impl Server {
         self.follow.port.store(u64::from(port), Relaxed);
     }
 
+    /// The port whoever bound the socket said this server is on, which `INFO`
+    /// reports and a cluster node writes into its config file.
+    ///
+    /// Nought on an embedded caller that never opened a socket, which is what a
+    /// reader should see rather than a guess.
+    #[must_use]
+    pub(crate) fn announced_port(&self) -> u16 {
+        self.follow.port.load(Relaxed) as u16
+    }
+
     /// Say what the link should authenticate with, which is Redis's
     /// `masteruser` and `masterauth`.
     pub fn master_auth(&self, user: &[u8], pass: &[u8]) {
