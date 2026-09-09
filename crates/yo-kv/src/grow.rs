@@ -119,7 +119,11 @@ mod tests {
     #[test]
     fn a_reserve_takes_the_size_the_policy_chose() {
         let mut v: Vec<u64> = Vec::new();
-        for _ in 0..200_000 {
+        // What the count buys is being well past the threshold with the eighth
+        // rule having shaped the capacity, and twenty thousand is more than
+        // twice the threshold, so the smaller number under Miri measures the
+        // same rule.
+        for _ in 0..crate::many(200_000) {
             reserve(&mut v, 1);
             v.push(0);
         }

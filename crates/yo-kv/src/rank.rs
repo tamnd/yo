@@ -961,7 +961,11 @@ mod tests {
     #[test]
     fn a_sorted_run_of_appends_fills_its_leaves() {
         let mut tree = Rank::new();
-        let n = 10_000;
+        // A leaf is what fills up here, so the count has to be several leaves
+        // and not one, and a thousand rows is well past that. The bytes a row
+        // below is what would fail if it were not, because at one leaf the root
+        // is the whole cost and the figure comes out nowhere near four.
+        let n = crate::many(10_000);
         for i in 0..n {
             tree.insert_at(i as usize, i);
         }
@@ -977,7 +981,11 @@ mod tests {
     #[test]
     fn a_sorted_run_of_prepends_fills_its_leaves_too() {
         let mut tree = Rank::new();
-        let n = 10_000;
+        // A leaf is what fills up here, so the count has to be several leaves
+        // and not one, and a thousand rows is well past that. The bytes a row
+        // below is what would fail if it were not, because at one leaf the root
+        // is the whole cost and the figure comes out nowhere near four.
+        let n = crate::many(10_000);
         for i in 0..n {
             tree.insert_at(0, i);
         }

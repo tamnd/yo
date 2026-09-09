@@ -1180,6 +1180,24 @@ mod tests {
         Keyspace::new()
     }
 
+    /// A keyspace whose sorted sets change band at `entries` members.
+    ///
+    /// A member of a sorted set costs somewhere near a second to build
+    /// interpreted, so a count picked only to be past a band of a hundred and
+    /// twenty eight is minutes on its own account. The band is a runtime knob,
+    /// so where the claim of a test is the band rather than a number, the band
+    /// comes down under Miri and the counts either side of it come down with
+    /// it. That is the same boundary in the same code with fewer members to
+    /// carry over it.
+    fn ks_band(entries: usize) -> Keyspace {
+        let mut k = Keyspace::new();
+        k.set_zset_limits(crate::zset::Limits {
+            max_listpack_entries: entries,
+            ..crate::zset::Limits::DEFAULT
+        });
+        k
+    }
+
     /// Add a run of pairs the plain way.
     fn add(k: &mut Keyspace, key: &[u8], pairs: &[(f64, &[u8])]) -> usize {
         k.zadd(key, pairs.iter().copied(), ZAdd::default()).unwrap()
@@ -1664,8 +1682,16 @@ mod tests {
 
     #[test]
     fn a_scan_of_either_band_walks_every_member_once() {
-        let mut k = ks();
-        for entries in [8usize, 4096] {
+        // The claim is the two bands, one set packed and one set on the table,
+        // and neither count is the claim. So under Miri the band comes down to
+        // eight and the two counts sit either side of it, four packed and forty
+        // on the table, which is the same pair of shapes over the same scan.
+        // The page size stays at sixteen, so the table case is still several
+        // pages and a cursor that lost its place would still show up as a
+        // member seen twice or not at all.
+        let band = if cfg!(miri) { 8 } else { 128 };
+        let mut k = ks_band(band);
+        for entries in [band / 2, if cfg!(miri) { 40 } else { 4096 }] {
             k.del(b"z");
             let pairs: Vec<(f64, Vec<u8>)> = (0..entries)
                 .map(|i| (i as f64, format!("m{i:05}").into_bytes()))
@@ -2097,15 +2123,24 @@ mod tests {
 
     #[test]
     fn a_big_result_comes_out_on_the_table_band_in_the_right_order() {
-        let mut k = ks();
-        let names: Vec<String> = (0..3000).map(|i| format!("member-{i:05}")).collect();
+        // What the count buys is a union whose result lands on the table band
+        // with every third member scored from both sides, and that is a shape
+        // rather than a size. So under Miri the band comes down and the count
+        // comes down with it. Sixty members against a band of eight is well
+        // past it, the seventeen scores still repeat several times over, and
+        // the encoding assert below is what would catch it if the result ever
+        // stopped being a table.
+        let band = if cfg!(miri) { 8 } else { 128 };
+        let mut k = ks_band(band);
+        let n = if cfg!(miri) { 60 } else { 3000 };
+        let names: Vec<String> = (0..n).map(|i| format!("member-{i:05}")).collect();
         for (i, name) in names.iter().enumerate() {
             add(&mut k, b"a", &[((i % 17) as f64, name.as_bytes())]);
         }
         for name in names.iter().step_by(3) {
             add(&mut k, b"b", &[(100.0, name.as_bytes())]);
         }
-        let n = k
+        let stored = k
             .zsetop_store(
                 Op::Union,
                 b"d",
@@ -2114,13 +2149,13 @@ mod tests {
                 Aggregate::Sum,
             )
             .unwrap();
-        assert_eq!(n, 3000);
+        assert_eq!(stored, names.len());
         assert_eq!(
             k.zset_encoding(b"d").map(crate::zset::Encoding::name),
             Some("skiplist")
         );
         let out = all(&mut k, b"d");
-        assert_eq!(out.len(), 3000);
+        assert_eq!(out.len(), names.len());
         let mut want = out.clone();
         want.sort_by(|x, y| x.1.partial_cmp(&y.1).unwrap().then_with(|| x.0.cmp(&y.0)));
         assert_eq!(out, want, "the result came out in the wrong order");
