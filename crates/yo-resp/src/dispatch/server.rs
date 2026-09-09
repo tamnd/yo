@@ -319,6 +319,7 @@ pub(super) fn execute(
         "acl" => acl::execute(server, session, args, out)?,
         "auth" => auth::execute(server, session, args, out)?,
         "debug" => debug::execute(server, session, args, out)?,
+        "memory" => super::memory::execute(server, session, args, out)?,
         "hello" => hello(server, session, args, out)?,
         "select" => {
             let n = args.int(1)?;

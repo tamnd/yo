@@ -1141,6 +1141,57 @@ impl Keyspace {
         Some(self.map.get(key)?.as_ptr() as usize)
     }
 
+    /// What `key` costs this database, or `None` if there is nothing under it.
+    ///
+    /// This is `MEMORY USAGE`, and it is three things added up: the record in
+    /// the arena, which holds the header, the name and, for a string, the value
+    /// itself; the body hanging off the record for a type that has one; and one
+    /// key's share of the index. A real server adds up the same three, calling
+    /// them the sds key, the object and the dict entry, so the shape of the
+    /// answer matches even though none of the three numbers does.
+    ///
+    /// The index share is a bucket divided by the slots in it. That is the
+    /// average and not this key's actual cost, because a hash table does not
+    /// have a per key cost: the same key is free in a bucket that already exists
+    /// and expensive in the one whose arrival doubled the directory. Redis has
+    /// the same problem and answers it the same way, with a fixed number per
+    /// key that is right on average and never right exactly.
+    ///
+    /// A value that has been written out to the file is counted as the record
+    /// alone, because that is all of it that is in memory, and this is a
+    /// question about memory. It is deliberately not read back in to answer:
+    /// asking what a key costs should not be the thing that makes it cost that.
+    pub fn key_bytes(&mut self, key: &[u8]) -> Option<usize> {
+        self.reap(key);
+        let rec = self.map.get(key)?;
+        let record = yo_index::RawMap::header_len() + key.len() + rec.len();
+        let share = size_of::<yo_index::Bucket>() / yo_index::SLOTS;
+        if value::Meta::from_byte(rec[0]).is_cold() {
+            return Some(record + share);
+        }
+        // The kind before the slot, and the string arm before either, because a
+        // string record has no slot number in it: it holds the value where the
+        // other seven hold four bytes saying where the body is, so reading a
+        // slot out of one runs off the end of a short record.
+        if value::kind(rec) == Kind::String {
+            return Some(record + share);
+        }
+        let (kind, at) = (value::kind(rec), value::slot(rec));
+        let body = match kind {
+            // Handled above, and unreachable rather than nought so that a
+            // reordering of the two would fail loudly rather than quietly.
+            Kind::String => unreachable!("a string was answered before the slot was read"),
+            Kind::Hash => self.hashes.get(at).map_or(0, Hash::memory_bytes),
+            Kind::Set => self.sets.get(at).map_or(0, Set::memory_bytes),
+            Kind::Zset => self.zsets.get(at).map_or(0, Zset::memory_bytes),
+            Kind::List => self.lists.get(at).map_or(0, List::memory_bytes),
+            Kind::Stream => self.streams.get(at).map_or(0, Stream::memory_bytes),
+            Kind::Array => self.arrays.get(at).map_or(0, Array::memory_bytes),
+            Kind::Foreign => self.foreign.get(at).map_or(0, Bytes::memory_bytes),
+        };
+        Some(record + body + share)
+    }
+
     /// Fold what is under `key` into `into`, deadline included, and say whether
     /// there was anything there.
     ///

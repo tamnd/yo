@@ -510,6 +510,7 @@ pub static SUBCATS: &[(&str, &str, &[&str])] = &[
     ("function", "load", AC_SUB_SCRIPTING_WRITE),
     ("function", "restore", AC_SUB_SCRIPTING_WRITE),
     ("function", "stats", AC_SUB_SCRIPTING),
+    ("memory", "usage", AC_SUB_READ),
     ("object", "encoding", AC_SUB_KEYSPACE_READ),
     ("object", "freq", AC_SUB_KEYSPACE_READ),
     ("object", "help", AC_SUB_KEYSPACE),
@@ -548,6 +549,9 @@ const AC_SUB_ADMIN_CONNECTION: &[&str] = &["@admin", "@connection", "@dangerous"
 const AC_SUB_SCRIPTING: &[&str] = &["@scripting"];
 /// The subcommands of FUNCTION that change what is loaded.
 const AC_SUB_SCRIPTING_WRITE: &[&str] = &["@scripting", "@write"];
+/// `MEMORY USAGE`, which is the one subcommand of MEMORY that reads a key and
+/// so the one that is in a category its container is not.
+const AC_SUB_READ: &[&str] = &["@read"];
 /// `OBJECT HELP`, which names the keyspace without reading one.
 const AC_SUB_KEYSPACE: &[&str] = &["@keyspace"];
 /// The subcommands of OBJECT that read a key.
@@ -6760,6 +6764,25 @@ pub static COMMANDS: &[Spec] = &[
         since: "1.0.0",
         complexity: "O(1)",
         summary: "When the dataset was last written out, in seconds.",
+        group: "server",
+    },
+    // No flags at all on the container, because the container is a name and
+    // every property that matters belongs to one of the six subcommands under
+    // it. `USAGE` is the only one that reads a key and the only one that is
+    // marked `readonly`, and the key spec on this row is what says where the key
+    // is when it does.
+    Spec {
+        name: "memory",
+        arity: -2,
+        flags: &[],
+        first_key: 0,
+        last_key: 0,
+        step: 0,
+        keys: &[],
+        acl: &["@slow"],
+        since: "4.0.0",
+        complexity: "O(1)",
+        summary: "What the server is holding, and what one key of it costs.",
         group: "server",
     },
     Spec {
