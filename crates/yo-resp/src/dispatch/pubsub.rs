@@ -75,6 +75,7 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering::Relaxed;
 
+use super::repl;
 use super::table::Spec;
 use super::{Args, Flow, Server, Session, args};
 use crate::reply::Out;
@@ -331,6 +332,12 @@ enum Cargo {
     },
     /// One `MONITOR` line, rendered once and shared by every monitor.
     Line(Arc<Vec<u8>>),
+    /// A stretch of the replication stream, already framed.
+    ///
+    /// Bytes rather than a reply because a replica is not being replied to. What
+    /// goes down that socket is commands, in exactly the shape a client sends
+    /// them, and anything this layer added to them would be read as one.
+    Raw(Arc<Vec<u8>>),
 }
 
 /// One message or one line on its way to one connection.
@@ -350,6 +357,15 @@ impl Envelope {
             conn,
             client,
             cargo: Cargo::Line(line),
+        }
+    }
+
+    /// A stretch of replication stream for one replica.
+    pub(crate) fn raw(conn: u32, client: u64, bytes: Arc<Vec<u8>>) -> Envelope {
+        Envelope {
+            conn,
+            client,
+            cargo: Cargo::Raw(bytes),
         }
     }
 
@@ -377,6 +393,7 @@ impl Envelope {
     pub(crate) fn write(&self, out: &mut Out) {
         match &self.cargo {
             Cargo::Line(line) => out.simple(line),
+            Cargo::Raw(bytes) => out.raw(bytes),
             Cargo::Message {
                 kind: Kind::Pattern,
                 pattern,
@@ -637,7 +654,18 @@ fn drop_one(session: &mut Session, reg: &mut Registry, kind: Kind, client: u64, 
 /// messages land, which is what Redis reports too: it is the number of
 /// subscribers at the moment of the publish and not the number that were still
 /// there when the bytes went out.
+///
+/// It crosses to a replica even though it is not a write and touches no key,
+/// because a client subscribed to a replica is subscribed to the whole server
+/// and expects to hear what was published anywhere in it. That is why the
+/// command carries `may_replicate` on a real server, and it is said here rather
+/// than left to the funnel because the funnel sends the verbatim form only for
+/// a write. The count is not affected: the reply is the subscribers on this
+/// server, and a replica's are its own.
 fn publish(server: &Server, args: Args<'_>, out: &mut Out, kind: Kind) {
+    if repl::armed() {
+        repl::rewrite(&[args.get(0), args.get(1), args.get(2)]);
+    }
     if !server.anyone_subscribed() {
         out.uint(0);
         return;

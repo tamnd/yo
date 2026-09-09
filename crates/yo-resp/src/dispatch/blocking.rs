@@ -50,6 +50,7 @@ use yo_kv::{Db, End, Entry, Member, Movem, ZEnd};
 use super::args::{self, Args, NOT_AN_INT};
 use super::lists::{self, BAD_MPOP_COUNT, BAD_NUMKEYS, end_of, movem_options};
 use super::notify::{self, class};
+use super::repl;
 use super::streams;
 use super::table::Spec;
 use super::zsets;
@@ -92,12 +93,20 @@ pub(super) fn execute(
     args: Args<'_>,
     out: &mut Out,
 ) -> Result<Flow> {
+    // Nothing crosses to a replica unless one of the arms below says otherwise.
+    // A blocking command that parks has done nothing yet, and sending it on as
+    // it arrived would have the replica stop and wait on the master's own link,
+    // which is the one connection that must never stop. The arms that do
+    // something replace this with what they did.
+    if repl::armed() {
+        repl::nothing();
+    }
     // The two that wait on replication rather than on a key. They are here
     // because they carry the blocking flag and that flag is what routes a
     // command to this file, and they leave immediately because there is nothing
     // for them to wait for yet. See [`replication`] for what they answer.
     if spec.name == "wait" || spec.name == "waitaof" {
-        return replication(spec.name, args, out).map(|()| Flow::Continue);
+        return replication(server, spec.name, args, out).map(|()| Flow::Continue);
     }
     let now = server.now_ms();
     // The two stream reads, which are here for the same reason the list six
@@ -244,23 +253,28 @@ fn mpop(args: Args<'_>, now: u64) -> Result<(Option<u64>, Block)> {
 /// `WAIT numreplicas timeout` and `WAITAOF numlocal numreplicas timeout`.
 ///
 /// Both of them ask the same question, which is whether this connection's writes
-/// have got somewhere durable, and both of them answer zero here. There are no
-/// replicas because there is no replication, and there is no append only file
-/// because `appendonly` is fixed at `no`, so nothing can ever move either count
-/// off zero and there is nothing to wait for. Redis in the same state gives the
-/// same numbers, it just takes the timeout to do it, and that is registered as
-/// D-25.
+/// have got somewhere durable. `WAIT` answers how many replicas have said they
+/// are level, which is a real count taken from what each one last acknowledged,
+/// and `WAITAOF` answers two noughts, because `appendonly` is fixed at `no` so
+/// there is no local file to be behind and a replica acknowledges bytes received
+/// rather than bytes written to a file it does not keep either.
+///
+/// Neither of them waits. A client that asked for more replicas than are level
+/// is given the smaller number at once instead of the timeout, which is D-25.
+/// Waiting means holding a connection until an acknowledgement arrives, and the
+/// waiter list here is woken by a key changing and by nothing else, so it is the
+/// same wakeup D-115 is about.
 ///
 /// What is not a formality is the argument checking, because that is what a
 /// client sees when it gets something wrong, and the three numbers are read by
 /// three different Redis helpers with three different complaints. `numlocal` is
 /// a range and says so. `numreplicas` is a positive number for `WAITAOF` and any
 /// number at all for `WAIT`, where a negative one is accepted and satisfied on
-/// the spot because zero replicas is already more than it asked for. The timeout
+/// the spot because any count at all is more than it asked for. The timeout
 /// is milliseconds here and not the seconds the list commands take, so it does
 /// not go through [`timeout`] above, and a negative one is refused with its own
 /// message rather than the range one.
-fn replication(name: &str, args: Args<'_>, out: &mut Out) -> Result<()> {
+fn replication(server: &Server, name: &str, args: Args<'_>, out: &mut Out) -> Result<()> {
     let aof = name == "waitaof";
     // `WAITAOF` has one number in front of the two `WAIT` has, and everything
     // after it is in the same place, so the offset is the whole difference.
@@ -297,7 +311,10 @@ fn replication(name: &str, args: Args<'_>, out: &mut Out) -> Result<()> {
         out.int(0);
         out.int(0);
     } else {
-        out.int(0);
+        // Whoever is already level, and never fewer than asked for by waiting:
+        // see [`repl::caught_up`] for why the waiting half is not here yet.
+        let _ = replicas;
+        out.int(repl::caught_up(server) as i64);
     }
     Ok(())
 }
@@ -412,6 +429,12 @@ impl Want {
                     out.array(2);
                     out.bulk(key);
                     db.hold(key).pop_into(key, *end, 1, |e| element(out, e))?;
+                    // The key it settled on, which is the first of the ones it
+                    // was given that had anything in it and is not something a
+                    // replica running the same command would arrive at, since by
+                    // then the answer is on its way to a client and the list is
+                    // one shorter. The same reason applies to all five below.
+                    copy(&[lists::popped(*end).as_bytes(), key]);
                     notify::fire(on, class::LIST, lists::popped(*end), key);
                     notify::emptied(db, on, key);
                     return Ok(true);
@@ -430,6 +453,11 @@ impl Want {
                         .hold(key)
                         .pop_into(key, *end, *count, |e| element(out, e))?;
                     out.close_array(mark, n);
+                    copy(&[
+                        lists::popped(*end).as_bytes(),
+                        key,
+                        n.to_string().as_bytes(),
+                    ]);
                     notify::fire(on, class::LIST, lists::popped(*end), key);
                     notify::emptied(db, on, key);
                     return Ok(true);
@@ -450,6 +478,7 @@ impl Want {
                         member(out, m);
                         out.double(sc);
                     })?;
+                    copy(&[zsets::popped(*end).as_bytes(), key]);
                     notify::fire(on, class::ZSET, zsets::popped(*end), key);
                     notify::emptied(db, on, key);
                     return Ok(true);
@@ -470,6 +499,11 @@ impl Want {
                         out.double(sc);
                     })?;
                     out.close_array(mark, n);
+                    copy(&[
+                        zsets::popped(*end).as_bytes(),
+                        key,
+                        n.to_string().as_bytes(),
+                    ]);
                     notify::fire(on, class::ZSET, zsets::popped(*end), key);
                     notify::emptied(db, on, key);
                     return Ok(true);
@@ -488,6 +522,7 @@ impl Want {
                 }
                 match db.lmove(src, dst, *from, *to, |v| out.bulk(v)) {
                     Ok(true) => {
+                        copy(&[b"LMOVE", src, dst, lists::word(*from), lists::word(*to)]);
                         // The same two events `LMOVE` says, in the same order,
                         // because this is `LMOVE` arriving late.
                         notify::fire(on, class::LIST, lists::pushed(*to), dst);
@@ -543,6 +578,19 @@ impl Want {
                     }
                 }
                 out.close_array(mark, n);
+                // `COUNT` and never `EXACTLY`, because an `EXACTLY` that came up
+                // short moved nothing and never reaches this line, so by here the
+                // two mean the same thing and the plainer one travels.
+                copy(&[
+                    b"LMOVEM",
+                    src,
+                    dst,
+                    lists::word(mv.from),
+                    lists::word(mv.to),
+                    b"COUNT",
+                    n.to_string().as_bytes(),
+                    lists::order_word(mv.order),
+                ]);
                 if src == dst {
                     notify::fire(on, class::LIST, lists::popped(mv.from), src);
                     notify::fire(on, class::LIST, lists::pushed(mv.to), src);
@@ -554,6 +602,19 @@ impl Want {
                 Ok(true)
             }
         }
+    }
+}
+
+/// Copy this to a replica instead of the command that is running.
+///
+/// Every one of these commands picks a key or a moment that the wire form does
+/// not name, and half of them are answered long after the client sent them, so
+/// none of them can travel as they arrived. The one place all seven decide what
+/// they did is here, which is why the rewrites are here too rather than spread
+/// between the funnel and the waiter list.
+fn copy(parts: &[&[u8]]) {
+    if repl::armed() {
+        repl::rewrite(parts);
     }
 }
 
@@ -962,8 +1023,14 @@ impl Server {
         // own events published. The database is the waiter's own, since the
         // thread running this is not the one the client is on.
         let armed = notify::arm(self, db);
+        // That arming covers the replicas as well, so what is left below is
+        // sending whatever the pop pushed. A pop that answers a parked client is
+        // the client's command finally running, so it has to cross like any
+        // other write, and it can only say so from in here.
         let done = list.try_serve(at, &self.dbs, now, out);
         drop(list);
+        repl::swept(self, db);
+        repl::served(self, db);
         notify::drain(self, armed);
         done
     }

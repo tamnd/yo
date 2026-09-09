@@ -93,6 +93,10 @@ const AC_HLL_WRITE: &[&str] = &["@write", "@hyperloglog", "@slow"];
 const AC_HLL_READ: &[&str] = &["@read", "@hyperloglog", "@slow"];
 /// The two that are not for clients, and are tagged so an ACL can say so.
 const AC_HLL_ADMIN: &[&str] = &["@hyperloglog", "@admin", "@slow", "@dangerous"];
+
+/// What the three replication commands are in, which is the same three every
+/// other administrative command is in.
+const AC_ADMIN_SLOW: &[&str] = &["@admin", "@slow", "@dangerous"];
 /// The read side categories for the ones that walk the value.
 const AC_READ_SLOW: &[&str] = &["@read", "@string", "@slow"];
 /// The write side categories.
@@ -6783,6 +6787,52 @@ pub static COMMANDS: &[Spec] = &[
         since: "4.0.0",
         complexity: "O(1)",
         summary: "What the server is holding, and what one key of it costs.",
+        group: "server",
+    },
+    // The three a replica sends and nothing else ever does. `REPLCONF` is the
+    // only one that stays a command: by the time a replica sends the other two
+    // the connection has stopped being a client, so what they answer is the head
+    // of a stream rather than a reply, which is why neither is in a transaction.
+    Spec {
+        name: "replconf",
+        arity: -1,
+        flags: &["admin", "noscript", "loading", "stale", "allow_busy"],
+        first_key: 0,
+        last_key: 0,
+        step: 0,
+        keys: &[],
+        acl: AC_ADMIN_SLOW,
+        since: "3.0.0",
+        complexity: "O(1)",
+        summary: "What a replica tells a master about itself.",
+        group: "server",
+    },
+    Spec {
+        name: "psync",
+        arity: -3,
+        flags: &["admin", "noscript", "no_async_loading", "no_multi"],
+        first_key: 0,
+        last_key: 0,
+        step: 0,
+        keys: &[],
+        acl: AC_ADMIN_SLOW,
+        since: "2.8.0",
+        complexity: "O(N) for a full resync, where N is the dataset.",
+        summary: "Become a replica of this server, from here or from scratch.",
+        group: "server",
+    },
+    Spec {
+        name: "sync",
+        arity: 1,
+        flags: &["admin", "noscript", "no_async_loading", "no_multi"],
+        first_key: 0,
+        last_key: 0,
+        step: 0,
+        keys: &[],
+        acl: AC_ADMIN_SLOW,
+        since: "1.0.0",
+        complexity: "O(N), where N is the dataset.",
+        summary: "The same, from before there was anything to negotiate.",
         group: "server",
     },
     Spec {

@@ -69,8 +69,16 @@ pub(super) const KILLED: u32 = 32;
 ///
 /// Redis flags a monitor a replica as well and reports only the `O`, because
 /// that is the letter for a replica that is a monitor rather than a real one.
-/// yo has no replicas yet, so the one bit says both things it has to say.
+/// Here the two are separate bits and a monitor sets only this one, which comes
+/// to the same reported letter by a shorter route.
 pub(super) const MONITOR: u32 = 128;
+/// The connection sent `PSYNC` and is being fed the command stream, which the
+/// report spells `S`.
+///
+/// Set on the connection itself as well as recorded in the replication module,
+/// because `CLIENT LIST` and `CLIENT KILL TYPE replica` both ask the connection
+/// what it is rather than asking the module who it has.
+pub(super) const REPLICA: u32 = 256;
 /// The thread that owns the connection has seen the kill and acted on it.
 ///
 /// Set by the owner and read by the owner, so that a connection which cannot be

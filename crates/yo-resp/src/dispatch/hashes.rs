@@ -33,6 +33,7 @@ use yo_kv::{Applied, Ask, Cond, Db, Exists, Expire, Keyspace, MAX_AT};
 use super::args::{self, Args};
 use super::indexing::Change;
 use super::notify::{self, Subkeys, class};
+use super::repl;
 use super::scan;
 use super::table::Spec;
 use crate::reply::Out;
@@ -235,7 +236,26 @@ pub(super) fn execute(
         // what the client sees and what the next read returns.
         "hincrbyfloat" => {
             let by = incr_float(args.get(3))?;
-            out.human_double(db.hincrbyfloat(key, args.get(2), by)?);
+            let now = db.hincrbyfloat(key, args.get(2), by)?;
+            // The sum rather than the addend, for the reason `INCRBYFLOAT` sends
+            // the sum: two machines adding the same fraction to the same number
+            // is not the same as two machines being told the answer. `HSETEX`
+            // with `KEEPTTL` is the only way to write one field and leave its
+            // deadline alone, which is why this is the shape a real master uses.
+            if repl::armed() {
+                let mut text = Vec::new();
+                yo_common::num::push_human(&mut text, now);
+                repl::rewrite(&[
+                    b"HSETEX",
+                    key,
+                    b"KEEPTTL",
+                    b"FIELDS",
+                    b"1",
+                    args.get(2),
+                    &text,
+                ]);
+            }
+            out.human_double(now);
             let one = Subkeys::of(class::HASH, std::iter::once(args.get(2)));
             notify::fire_subkeys(on, class::HASH, "hincrbyfloat", key, one);
             Change::Fields
@@ -434,6 +454,12 @@ fn expire(
     let mut set = Subkeys::new(class::HASH);
     let mut gone = false;
     let mut later = false;
+    // The same two lists again for a replica, which needs the names rather than
+    // the digest of them a subscriber gets. Only filled when somebody is going
+    // to read them.
+    let copying = repl::armed();
+    let mut deleted: Vec<&[u8]> = Vec::new();
+    let mut dated: Vec<&[u8]> = Vec::new();
     let mut at_field = fields.from;
     db.hexpire(key, at, cond, fields.iter(args), |applied| {
         let field = args.get(at_field);
@@ -442,15 +468,42 @@ fn expire(
             Applied::Deleted => {
                 gone = true;
                 took.push(field);
+                if copying {
+                    deleted.push(field);
+                }
             }
             Applied::Ok => {
                 later = true;
                 set.push(field);
+                if copying {
+                    dated.push(field);
+                }
             }
             Applied::Missing | Applied::NotMet => {}
         }
         out.int(applied as i64);
     })?;
+    // What crosses is the fields this one actually decided about, at the instant
+    // it decided on. The condition and the relative deadline both stay behind:
+    // they were questions, and the answers are here.
+    if copying {
+        if deleted.is_empty() && dated.is_empty() {
+            repl::nothing();
+        }
+        if !deleted.is_empty() {
+            let mut parts: Vec<&[u8]> = vec![b"HDEL", key];
+            parts.extend(deleted);
+            repl::rewrite(&parts);
+        }
+        if !dated.is_empty() {
+            let ms = at.to_string();
+            let n = dated.len().to_string();
+            let mut parts: Vec<&[u8]> =
+                vec![b"HPEXPIREAT", key, ms.as_bytes(), b"FIELDS", n.as_bytes()];
+            parts.extend(dated);
+            repl::rewrite(&parts);
+        }
+    }
     // The removals first and the deadlines after, which is the order a real
     // server says them in and not the order the fields were named in.
     if gone {
@@ -591,8 +644,19 @@ fn getdel(db: &mut Keyspace, on: usize, args: Args<'_>, out: &mut Out) -> Result
     // `hdel`, because that is what it was, and a real server even rewrites the
     // command into an `HDEL` before it goes to a replica.
     if took {
+        // The delete on its own, naming every field that was asked for rather
+        // than only the ones that were there: a field a replica has not got is
+        // an `HDEL` that removes nothing, which is the same nothing that
+        // happened here.
+        if repl::armed() {
+            let mut parts: Vec<&[u8]> = vec![b"HDEL", key];
+            parts.extend(fields.iter(args));
+            repl::rewrite(&parts);
+        }
         notify::fire_subkeys(on, class::HASH, "hdel", key, gone);
         emptied(db, on, key);
+    } else if repl::armed() {
+        repl::nothing();
     }
     Ok(Change::when(took))
 }
@@ -642,6 +706,34 @@ fn getex(db: &mut Keyspace, on: usize, args: Args<'_>, out: &mut Out) -> Result<
         }
     })?;
 
+    // What a replica has to be told, which is the deadline clause on its own
+    // with the read left out. Every field that was named goes across rather than
+    // only the ones that were there, because setting the deadline of a field
+    // that does not exist does nothing at either end, and that is cheaper than
+    // carrying a second list about. A deadline already in the past deletes the
+    // fields on arrival exactly as it did here, so there is no separate `HDEL`
+    // to send.
+    if repl::armed() {
+        match opts.expire {
+            Expire::At(ms) => {
+                let ms = ms.to_string();
+                let n = fields.len().to_string();
+                let mut parts: Vec<&[u8]> =
+                    vec![b"HPEXPIREAT", key, ms.as_bytes(), b"FIELDS", n.as_bytes()];
+                parts.extend(fields.iter(args));
+                repl::rewrite(&parts);
+            }
+            Expire::Clear => {
+                let n = fields.len().to_string();
+                let mut parts: Vec<&[u8]> = vec![b"HPERSIST", key, b"FIELDS", n.as_bytes()];
+                parts.extend(fields.iter(args));
+                repl::rewrite(&parts);
+            }
+            // A plain `HGETEX` is a read.
+            Expire::Keep => repl::nothing(),
+        }
+    }
+
     // A deadline that has already gone takes the field with it, which is an
     // `hdel` and not an `hexpire`, and can leave the key gone behind it.
     let past = matches!(opts.expire, Expire::At(at) if at <= now);
@@ -681,6 +773,34 @@ fn setex(db: &mut Keyspace, on: usize, args: Args<'_>, out: &mut Out) -> Result<
     let key = args.get(1);
     let wrote = db.hsetex(key, opts.exists, opts.expire, fields.pairs(args))?;
     out.int(i64::from(wrote));
+    // All of it or none of it, and when it was all of it the condition has
+    // already been decided and the deadline is already an instant, so what
+    // crosses is the write with neither of them left to work out again.
+    if repl::armed() {
+        if !wrote {
+            repl::nothing();
+        } else {
+            let ms;
+            let n = fields.len().to_string();
+            let mut parts: Vec<&[u8]> = vec![b"HSETEX", key];
+            match opts.expire {
+                Expire::At(at) => {
+                    ms = at.to_string();
+                    parts.push(b"PXAT");
+                    parts.push(ms.as_bytes());
+                }
+                Expire::Keep => parts.push(b"KEEPTTL"),
+                Expire::Clear => {}
+            }
+            parts.push(b"FIELDS");
+            parts.push(n.as_bytes());
+            for (f, v) in fields.pairs(args) {
+                parts.push(f);
+                parts.push(v);
+            }
+            repl::rewrite(&parts);
+        }
+    }
     let past = matches!(opts.expire, Expire::At(at) if at <= now);
     // All of it or none of it, so one look at the reply says which fields every
     // event is about. The write first and then what the deadline did to it,

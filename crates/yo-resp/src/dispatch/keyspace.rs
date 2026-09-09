@@ -19,6 +19,7 @@
 use super::args::{self, Args};
 use super::indexing::Touched;
 use super::notify::{self, class};
+use super::repl;
 use super::scan;
 use super::table::Spec;
 use crate::reply::Out;
@@ -950,10 +951,26 @@ fn expire<'a>(
     };
     let at = moment(args.int(2)?, scale, relative, name, db.clock().now_ms())?;
     let cond = condition(args)?;
+    let copying = repl::armed();
     out.int(match db.expire(args.get(1), at, cond) {
         // Nothing there, or the condition said no. Redis does not distinguish.
-        Applied::Missing | Applied::NotMet => 0,
+        Applied::Missing | Applied::NotMet => {
+            if copying {
+                repl::nothing();
+            }
+            0
+        }
         Applied::Ok => {
+            // A replica reads the command a moment later than the master ran it,
+            // so `EXPIRE key 50` there would mean a later deadline than the one
+            // that was just set. What goes across is the instant, which is why a
+            // real master turns all four of these into `PEXPIREAT` and why this
+            // sends the number the store kept rather than the one the client
+            // named: past D-17's ceiling the two are different and the store's is
+            // the one that has to be copied.
+            if copying {
+                repl::rewrite(&[b"PEXPIREAT", args.get(1), at.to_string().as_bytes()]);
+            }
             notify::fire(on, class::GENERIC, "expire", args.get(1));
             1
         }
@@ -962,6 +979,9 @@ fn expire<'a>(
         // event is `del` and not `expired`, because the key did not run out of
         // time on its own, a client asked for it to be gone.
         Applied::Deleted => {
+            if copying {
+                repl::rewrite(&[b"DEL", args.get(1)]);
+            }
             touched.gone(args.get(1));
             notify::fire(on, class::GENERIC, "del", args.get(1));
             1

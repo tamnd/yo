@@ -25,6 +25,7 @@
 
 use super::args::{self, Args, is, syntax};
 use super::notify::{self, class};
+use super::repl;
 use super::table::Spec;
 use crate::reply::Out;
 use yo_common::num::{parse_f64, parse_i64};
@@ -102,26 +103,40 @@ pub(super) fn execute(
         }
         "getdel" => {
             if db.getdel_with(args.get(1), |v| write_str(out, v))? {
+                // The delete on its own, which is all a replica has to do and is
+                // what a real master sends. Reading the value is the part the
+                // client asked for and the part nobody else needs.
+                copy(&[b"DEL", args.get(1)]);
                 notify::fire(on, class::GENERIC, "del", args.get(1));
             } else {
                 out.nil();
+                nothing();
             }
         }
         "getex" => getex(db, on, args, out)?,
         "setnx" => {
             let stored = db.setnx(args.get(1), args.get(2))?;
             if stored {
+                // The plain form rather than this one, so that the replica is
+                // not asked to work out again whether the key was there. It was
+                // decided here and the answer travels with the command, which is
+                // the rule every conditional write below follows.
+                copy(&[b"SET", args.get(1), args.get(2)]);
                 notify::fire(on, class::STRING, "set", args.get(1));
+            } else {
+                nothing();
             }
             out.int(i64::from(stored));
         }
         "setex" => {
             db.setex(args.get(1), args.int(2)?, args.get(3))?;
+            stored(db, args.get(1), args.get(3));
             timed_set(on, args.get(1));
             out.ok();
         }
         "psetex" => {
             db.psetex(args.get(1), args.int(2)?, args.get(3))?;
+            stored(db, args.get(1), args.get(3));
             timed_set(on, args.get(1));
             out.ok();
         }
@@ -171,7 +186,19 @@ pub(super) fn execute(
         // A bulk string on both protocols, not a RESP3 double. Redis has never
         // changed this one and a client that parses the digits would break.
         "incrbyfloat" => {
-            out.human_double(db.incrbyfloat(args.get(1), args.float(2)?)?);
+            let now = db.incrbyfloat(args.get(1), args.float(2)?)?;
+            // The sum and not the addend. Adding a fraction twice on two
+            // machines is the textbook way to end up with two different numbers,
+            // because the order the bits round in depends on what was there
+            // first, so what crosses is the answer this one arrived at.
+            // `KEEPTTL` because the addition did not touch the deadline and the
+            // plain `SET` a replica would otherwise run would clear it.
+            if armed() {
+                let mut text = Vec::new();
+                yo_common::num::push_human(&mut text, now);
+                copy(&[b"SET", args.get(1), &text, b"KEEPTTL"]);
+            }
+            out.human_double(now);
             notify::fire(on, class::STRING, "incrbyfloat", args.get(1));
         }
         "delex" => delex(db, on, args, out)?,
@@ -242,6 +269,56 @@ fn pairs<'a>(
 fn timed_set(on: usize, key: &[u8]) {
     notify::fire(on, class::STRING, "set", key);
     notify::fire(on, class::GENERIC, "expire", key);
+}
+
+// ------------------------------------------------------------- propagation
+
+/// Whether what is running is going to be copied to a replica.
+///
+/// Named again here so that the sites below read as a question about this
+/// command rather than about the module it is answered in, and so that the ones
+/// that build nothing but a slice of arguments they already have can skip the
+/// question entirely.
+fn armed() -> bool {
+    repl::armed()
+}
+
+/// Copy this instead of the command that is running.
+fn copy(parts: &[&[u8]]) {
+    if armed() {
+        repl::rewrite(parts);
+    }
+}
+
+/// Copy nothing at all, for a write that turned out not to write.
+fn nothing() {
+    if armed() {
+        repl::nothing();
+    }
+}
+
+/// Copy a store as the plain `SET` that leaves the key in the state it is in
+/// now, deadline and all.
+///
+/// The deadline is read back out of the record rather than worked out again from
+/// the arguments, which settles four things at once: a relative `EX` becomes the
+/// instant this server picked rather than an instant the replica would pick a
+/// moment later, `KEEPTTL` becomes the deadline it kept, `PERSIST` becomes the
+/// absence of one, and D-17's ceiling is applied once here instead of twice with
+/// two different answers.
+fn stored(db: &mut Keyspace, key: &[u8], val: &[u8]) {
+    if !armed() {
+        return;
+    }
+    match db.deadline_of(key) {
+        yo_kv::Ask::At(ms) => {
+            repl::rewrite(&[b"SET", key, val, b"PXAT", ms.to_string().as_bytes()])
+        }
+        yo_kv::Ask::NoDeadline => repl::rewrite(&[b"SET", key, val]),
+        // A deadline already in the past takes the key with it on the way in, so
+        // there is nothing left to store and only the delete has to cross.
+        yo_kv::Ask::Missing => repl::rewrite(&[b"DEL", key]),
+    }
 }
 
 // ------------------------------------------------------------------ expiry
@@ -417,11 +494,21 @@ fn set(db: &mut Keyspace, on: usize, args: Args<'_>, out: &mut Out) -> Result<()
     // both of those are true at once. A `SET` refused by `NX`, `XX` or one of
     // the compare and swap conditions stored nothing and says nothing.
     if done.stored {
+        // What crosses to a replica is the plain form: this one already worked
+        // out whether the condition held and what instant the deadline means,
+        // and neither answer is one the other end could arrive at on its own. A
+        // `SET` with no options at all is already the plain form and is left to
+        // travel as it came.
+        if seen != 0 || opts.get {
+            stored(db, key, val);
+        }
         if expire.is_some() {
             timed_set(on, key);
         } else {
             notify::fire(on, class::STRING, "set", key);
         }
+    } else {
+        nothing();
     }
     if opts.get {
         if !had {
@@ -494,6 +581,7 @@ fn getex(db: &mut Keyspace, on: usize, args: Args<'_>, out: &mut Out) -> Result<
     // why that loop is above this and not below it.
     if !db.exists(key) {
         out.nil();
+        nothing();
         return Ok(());
     }
     // That lookup is the one the read is counted for, and the rest of this reads
@@ -515,11 +603,26 @@ fn getex(db: &mut Keyspace, on: usize, args: Args<'_>, out: &mut Out) -> Result<
         None => out.nil(),
     }
     match wanted {
-        Expire::At(_) => notify::fire(on, class::GENERIC, "expire", key),
-        Expire::Clear if had_deadline => notify::fire(on, class::GENERIC, "persist", key),
+        Expire::At(_) => {
+            // The deadline the store settled on, for the reason every other
+            // deadline crosses that way, and no mention of the read.
+            if armed() {
+                match db.deadline_of(key) {
+                    yo_kv::Ask::At(ms) => {
+                        repl::rewrite(&[b"PEXPIREAT", key, ms.to_string().as_bytes()]);
+                    }
+                    _ => repl::rewrite(&[b"DEL", key]),
+                }
+            }
+            notify::fire(on, class::GENERIC, "expire", key);
+        }
+        Expire::Clear if had_deadline => {
+            copy(&[b"PERSIST", key]);
+            notify::fire(on, class::GENERIC, "persist", key);
+        }
         // Plain `GETEX` is a read and says nothing, and a `PERSIST` that found
         // no deadline changed nothing and says nothing either.
-        _ => {}
+        _ => nothing(),
     }
     Ok(())
 }
@@ -591,18 +694,22 @@ fn msetex(db: &Db, on: usize, args: Args<'_>, out: &mut Out) -> Result<()> {
     };
     if !allowed {
         out.int(0);
+        nothing();
         return Ok(());
     }
+    // Whatever this writes crosses as one `SET` a pair, added below as each pair
+    // is written. The condition has already been decided and the deadline is
+    // about to be, so there is nothing left of this command's own form that a
+    // replica could use, and no other server has heard of it either.
+    nothing();
     // `Exists::Always` on each pair, because the condition has been decided
     // already and asking again per stripe would ask it of one key rather than
     // of all of them. `Expire::Keep` still has to go through, since what it
     // keeps is that key's own deadline and only its stripe knows it.
     for (k, v) in pairs(args, 2, n) {
-        held.stripe_mut(db.stripe_of(k)).msetex(
-            core::iter::once((k, v)),
-            Exists::Always,
-            expire,
-        )?;
+        let stripe = held.stripe_mut(db.stripe_of(k));
+        stripe.msetex(core::iter::once((k, v)), Exists::Always, expire)?;
+        stored(stripe, k, v);
         // One key at a time and in the order they were given, which is what
         // `MSET` does too and what somebody watching several of these keys
         // would expect to see.
@@ -661,7 +768,18 @@ fn msetnx(db: &Db, on: usize, args: Args<'_>, out: &mut Out) -> Result<()> {
     let mut held = db.hold_keys(pairs(args, 1, n).map(|(k, _)| k));
     if pairs(args, 1, n).any(|(k, _)| held.stripe_mut(db.stripe_of(k)).exists(k)) {
         out.int(0);
+        nothing();
         return Ok(());
+    }
+    // The condition held, so what crosses is the store without it, for the
+    // reason `SETNX` sends a plain `SET`.
+    if armed() {
+        let mut parts: Vec<&[u8]> = vec![b"MSET"];
+        for (k, v) in pairs(args, 1, n) {
+            parts.push(k);
+            parts.push(v);
+        }
+        repl::rewrite(&parts);
     }
     for (k, v) in pairs(args, 1, n) {
         held.stripe_mut(db.stripe_of(k))
@@ -714,9 +832,15 @@ fn delex(db: &mut Keyspace, on: usize, args: Args<'_>, out: &mut Out) -> Result<
     };
     let gone = db.delex(args.get(1), compare);
     if gone {
+        // The delete on its own. The comparison was made here and a replica has
+        // no business making it again, quite apart from a real one having never
+        // heard of this command.
+        copy(&[b"DEL", args.get(1)]);
         // `del` and not a name of its own, for the reason `UNLINK` says `del`:
         // the event is what happened to the key.
         notify::fire(on, class::GENERIC, "del", args.get(1));
+    } else {
+        nothing();
     }
     out.int(i64::from(gone));
     Ok(())
@@ -820,6 +944,18 @@ fn increx(db: &mut Keyspace, on: usize, args: Args<'_>, out: &mut Out) -> Result
     let kept =
         seen & ENX != 0 && notify::armed() && matches!(db.deadline_of(key), yo_kv::Ask::At(_));
     let done = db.increx(key, opts)?;
+    // The value it landed on and the deadline it ended up with, which between
+    // them are the whole of what this command did. Sent that way rather than
+    // verbatim for three reasons at once: the arithmetic can be floating point,
+    // the deadline can be relative, and no other server has this command.
+    if armed() {
+        let mut text = Vec::new();
+        match done.value {
+            Num::Int(v) => yo_common::num::push_i64(&mut text, v),
+            Num::Float(v) => yo_common::num::push_human(&mut text, v),
+        }
+        stored(db, key, &text);
+    }
     // The same two names `INCRBY` and `INCRBYFLOAT` use, chosen by the kind the
     // increment was counted in, and then the deadline if one was asked for. A
     // saturated increment that moved the value by nothing still moved it, so
