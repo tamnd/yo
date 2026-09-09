@@ -51,7 +51,7 @@ use std::io::{self, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::time::Duration;
 
 #[cfg(unix)]
@@ -351,6 +351,13 @@ struct Net {
     /// Connections whose socket has just been dropped, to be taken out of the
     /// poller after the batch for the same reason.
     gone: Vec<ConnId>,
+    /// How many of the slots above have a socket in them.
+    ///
+    /// Kept rather than counted because it is read once a turn by the code that
+    /// decides whether this worker should still be in the queue for the doors,
+    /// and the slot vector only ever grows, so counting it would get slower for
+    /// the rest of the run every time a connection with a high id arrives.
+    open: usize,
 }
 
 impl Net {
@@ -359,7 +366,9 @@ impl Net {
         if self.streams.len() <= conn as usize {
             self.streams.resize_with(conn as usize + 1, || None);
         }
-        self.streams[conn as usize] = Some(stream);
+        if self.streams[conn as usize].replace(stream).is_none() {
+            self.open += 1;
+        }
     }
 
     /// Whether this id currently has a socket.
@@ -368,14 +377,9 @@ impl Net {
     }
 
     /// How many sockets this worker is holding, which is how many connections
-    /// it took. Only the test about sharing a burst out asks, because nothing
-    /// the server does depends on the number, and that test opens a unix
-    /// socket, so on Windows this is a method with no callers rather than one
-    /// with a caller that is compiled out. Under Miri the whole test module
-    /// goes, so this has to go with it for the same reason.
-    #[cfg(all(test, unix, not(miri)))]
+    /// it took.
     fn held(&self) -> usize {
-        self.streams.iter().filter(|s| s.is_some()).count()
+        self.open
     }
 
     /// Read whatever is waiting, or `None` if the peer has gone or the socket
@@ -419,8 +423,10 @@ impl Sink for Net {
         // The one place a socket is dropped. The engine calls this when the
         // last command holding that connection's buffer has run, so a client
         // that hangs up mid batch does not free a buffer still being read.
-        if let Some(slot) = self.streams.get_mut(conn as usize) {
-            *slot = None;
+        if let Some(slot) = self.streams.get_mut(conn as usize)
+            && slot.take().is_some()
+        {
+            self.open -= 1;
         }
         self.gone.push(conn);
     }
@@ -655,10 +661,13 @@ impl Server {
     /// than swallowed.
     pub fn run(&mut self, stop: &AtomicBool) -> io::Result<()> {
         let mut workers = Vec::with_capacity(self.threads);
-        for _ in 0..self.threads {
+        let split = Arc::new(Split::new(self.threads));
+        for me in 0..self.threads {
             workers.push(Worker::new(
                 &self.doors,
                 Wire::over(Arc::clone(&self.shared), Net::default()),
+                Arc::clone(&split),
+                me,
             )?);
         }
         // One thread and there is nothing to spawn: this thread is it, which
@@ -689,6 +698,117 @@ impl Server {
     }
 }
 
+/// Who is in the queue for the doors.
+///
+/// Every worker publishes how many connections it is holding and reads what the
+/// others published, and a worker keeps the doors in its poller only while it is
+/// holding no more than the fewest of them. A worker that has just accepted is
+/// above the rest by one and steps out, so the next connection wakes somebody
+/// who has not, and when everybody has taken one they are level again and all of
+/// them step back in. That is round robin without anybody having to keep a turn
+/// counter, and unlike a turn counter it is still right when the connections do
+/// not close at the same rate: a worker whose clients went away drops back to the
+/// fewest and starts taking again.
+///
+/// A count and not a rate, because the number that was wrong is the number of
+/// connections a thread ends up owning for the life of the benchmark, and
+/// because a count is the one thing a worker can publish without a lock.
+///
+/// # Why the counts are atomics and the per thread `Stats` are not
+///
+/// A worker's own statistics are single writer cells on purpose, so nothing else
+/// may look at them. These are written by one thread and read by all of them, so
+/// they are `AtomicU32` and every access is relaxed: a stale count means a
+/// connection goes to the second least loaded worker instead of the least, which
+/// is not worth a fence.
+struct Split {
+    /// How many connections each worker is holding, indexed by worker.
+    live: Vec<AtomicU32>,
+    /// How many workers have the doors in their poller.
+    ///
+    /// The one thing here that has to be exactly right. A worker will not step
+    /// out if it is the last one in, because a moment with nobody watching the
+    /// doors is a client waiting on a connection that nothing is going to
+    /// accept, and level triggered means nothing wakes anybody to fix it.
+    ///
+    /// The price is that the last worker in the queue keeps taking connections
+    /// while it is ahead, until one of the others notices that it is now the one
+    /// with the fewest and comes back. That is a handful of connections in a
+    /// burst, because a worker with a connection on it is running rather than
+    /// waiting and comes back round within microseconds, and it is the same
+    /// direction of error as before rather than the old one: a few extra on one
+    /// thread instead of the whole backlog. The alternative, letting the count
+    /// reach nought and having whoever notices put it right, trades that for a
+    /// client that waits a whole idle wait to be accepted, and a connection that
+    /// is not accepted for twenty milliseconds is worse than a thread that has
+    /// two more than its neighbours.
+    watchers: AtomicU32,
+    /// Moved on whenever any of the above changes.
+    ///
+    /// A worker reads this once a turn and does nothing further if it has not
+    /// moved, which is what keeps the ordinary turn at one relaxed load rather
+    /// than a walk of every worker's count.
+    epoch: AtomicU64,
+}
+
+impl Split {
+    /// Everybody holding nothing and everybody in the queue, which is the state
+    /// [`Worker::new`] leaves behind it.
+    fn new(threads: usize) -> Split {
+        Split {
+            live: (0..threads).map(|_| AtomicU32::new(0)).collect(),
+            watchers: AtomicU32::new(u32::try_from(threads).unwrap_or(u32::MAX)),
+            epoch: AtomicU64::new(0),
+        }
+    }
+
+    /// Say how many connections a worker is holding now.
+    fn publish(&self, me: usize, held: u32) {
+        self.live[me].store(held, Ordering::Relaxed);
+        self.stir();
+    }
+
+    /// The fewest connections any worker is holding.
+    fn fewest(&self) -> u32 {
+        self.live
+            .iter()
+            .map(|n| n.load(Ordering::Relaxed))
+            .min()
+            .unwrap_or(0)
+    }
+
+    /// Take a worker out of the queue for the doors, or refuse if it is the
+    /// last one in it.
+    ///
+    /// The decrement happens first and is put back if it went too far, so two
+    /// workers leaving at once cannot both read the count as safe: one of them
+    /// sees the value the other already took away.
+    fn step_out(&self) -> bool {
+        if self.watchers.fetch_sub(1, Ordering::Relaxed) > 1 {
+            self.stir();
+            return true;
+        }
+        self.watchers.fetch_add(1, Ordering::Relaxed);
+        false
+    }
+
+    /// Put a worker back in the queue for the doors.
+    fn step_in(&self) {
+        self.watchers.fetch_add(1, Ordering::Relaxed);
+        self.stir();
+    }
+
+    /// Tell every worker to look again.
+    fn stir(&self) {
+        self.epoch.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// What a worker compares against what it saw last turn.
+    fn turn(&self) -> u64 {
+        self.epoch.load(Ordering::Relaxed)
+    }
+}
+
 /// One thread's loop, with its own connections in front of the shared server.
 ///
 /// Everything here belongs to the thread that made it: the poller, the sockets,
@@ -699,34 +819,42 @@ impl Server {
 /// # Why every thread accepts, and why it takes one at a time
 ///
 /// The listeners go into every worker's poller, so a connection waiting at a
-/// door wakes whichever threads are idle and the first one to call `accept`
-/// takes it. The rest get "nothing waiting", which they already handle, since
-/// that is what a listener with no backlog says on an ordinary turn. It spreads
-/// connections by whoever is free rather than round robin, which is the shape
-/// that wants no handoff between threads: a connection belongs to the thread
+/// door wakes the threads that are in the queue for it and the first one to call
+/// `accept` takes it. The rest get "nothing waiting", which they already handle,
+/// since that is what a listener with no backlog says on an ordinary turn. There
+/// is no handoff between threads at any point: a connection belongs to the thread
 /// that accepted it for as long as it is open.
 ///
 /// A worker takes one connection per ready event and goes back to the poller
-/// rather than draining the door, and that is the whole of what keeps the
-/// spreading honest. Draining looks like the obvious thing and is what this did
-/// first. It is wrong here because clients do not arrive one at a time: a
-/// benchmark opens its two hundred and fifty six connections at once, every
-/// worker is idle at that moment, and whichever one wins the wakeup drains the
-/// entire backlog into itself while the rest find nothing. The split is then
-/// decided, once, by a race, and it lasts for as long as the connections do. It
-/// was measured at eight and sixteen threads as a coefficient of variation
-/// between 0.40 and 0.77 where six rival servers on the same box in the same
-/// sweep sat between 0.00 and 0.02, and as sixteen threads coming out slower
-/// than eight.
+/// rather than draining the door. Draining looks like the obvious thing and is
+/// what this did first. It is wrong here because clients do not arrive one at a
+/// time: a benchmark opens its two hundred and fifty six connections at once,
+/// every worker is idle at that moment, and whichever one wins the wakeup drains
+/// the entire backlog into itself while the rest find nothing.
+///
+/// Taking one at a time is not enough on its own, which is what the numbers from
+/// the sweep said next. Whoever wins the wakeup wins it again straight away,
+/// because it is already awake and running and the others are coming back from a
+/// wait, so the connections still pile up on the threads that got there first.
+/// Measured at sixteen threads, one thread accepted 215 of 771 connections and
+/// another accepted 22, and since the work follows the connections exactly, the
+/// busiest thread ran two and a half times the commands of the quietest.
+///
+/// So a worker steps out of the queue for the doors once it is holding more than
+/// the fewest of them, and steps back in when it is level again. That is
+/// [`Split`], and it turns the burst above into round robin: each worker takes
+/// one, drops out, and the door wakes somebody who has not taken one yet. It
+/// costs one relaxed load a turn in the ordinary case and one `epoll_ctl` per
+/// accept in the busy one.
 ///
 /// The doors are level triggered, so a door with more waiting is ready again
-/// straight away and the next worker round the loop takes the next one. The cost
-/// is one extra wakeup per connection, which is paid once per connection rather
-/// than once per command.
+/// straight away and the next worker in the queue takes the next one. The cost is
+/// one extra wakeup per connection, which is paid once per connection rather than
+/// once per command.
 ///
-/// `SO_REUSEPORT` would let the kernel do the split with no race at all, and
-/// does not help here: it is a TCP and UDP option, and the sweep that found this
-/// runs every server over a unix socket.
+/// `SO_REUSEPORT` would let the kernel do the split and does not help here: it is
+/// a TCP and UDP option, and the sweep that found this runs every server over a
+/// unix socket.
 struct Worker<'a> {
     doors: &'a [Door],
     reactor: Reactor<Wire<Net>>,
@@ -736,11 +864,26 @@ struct Worker<'a> {
     /// The tokens the poller said were ready, kept for the same reason.
     ready: Vec<u64>,
     buf: Vec<u8>,
+    /// Which worker this is, which is the slot it publishes its count into.
+    me: usize,
+    split: Arc<Split>,
+    /// Whether the doors are in this worker's poller right now.
+    watching: bool,
+    /// The count this worker last published, so an unchanged turn writes
+    /// nothing that another thread has to fetch the line for.
+    held: u32,
+    /// The epoch this worker last looked at.
+    seen: u64,
 }
 
 impl<'a> Worker<'a> {
     /// A worker with the doors registered and nothing accepted yet.
-    fn new(doors: &'a [Door], engine: Wire<Net>) -> io::Result<Worker<'a>> {
+    fn new(
+        doors: &'a [Door],
+        engine: Wire<Net>,
+        split: Arc<Split>,
+        me: usize,
+    ) -> io::Result<Worker<'a>> {
         let mut poller = Poller::new()?;
         for door in doors {
             poller.add(door, door.token())?;
@@ -752,6 +895,15 @@ impl<'a> Worker<'a> {
             batch: Vec::with_capacity(64),
             ready: Vec::with_capacity(64),
             buf: vec![0; READ_CHUNK],
+            me,
+            // Everybody starts in the queue for the doors, which is what
+            // `Split::new` counted, and holding nothing, which is what it put in
+            // every slot. So the first turn has nothing to publish and nothing
+            // to decide.
+            split,
+            watching: true,
+            held: 0,
+            seen: 0,
         })
     }
 
@@ -789,6 +941,7 @@ impl<'a> Worker<'a> {
             }
             self.bury_dead();
             self.forget_closed();
+            self.share_the_doors()?;
 
             if worked {
                 idle = 0;
@@ -834,6 +987,58 @@ impl<'a> Worker<'a> {
         }
     }
 
+    /// Step out of the queue for the doors, or back into it.
+    ///
+    /// Run at the end of every turn, because both halves of the decision can
+    /// have changed during it: this worker may have accepted or lost a
+    /// connection, and so may everybody else.
+    ///
+    /// The rule is on [`Split`]: be in the queue while holding no more than the
+    /// fewest anybody is holding. The one case that does not follow it is the
+    /// last worker in the queue, which stays whatever its count says, because
+    /// the alternative is a door nobody is listening at.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the kernel says about changing the poller. A door that will not
+    /// come out of a set is a worker that is about to take connections it should
+    /// not, and it is a thing that does not happen, so it stops the server
+    /// rather than being carried on from.
+    fn share_the_doors(&mut self) -> io::Result<()> {
+        let held = u32::try_from(self.reactor.engine().sink().held()).unwrap_or(u32::MAX);
+        if held != self.held {
+            self.held = held;
+            self.split.publish(self.me, held);
+        }
+        let turn = self.split.turn();
+        if turn == self.seen {
+            return Ok(());
+        }
+        let wanted = held <= self.split.fewest();
+        if wanted == self.watching {
+            self.seen = turn;
+            return Ok(());
+        }
+        if wanted {
+            for door in self.doors {
+                self.poller.add(door, door.token())?;
+            }
+            self.watching = true;
+            self.split.step_in();
+            self.seen = turn;
+        } else if self.split.step_out() {
+            for door in self.doors {
+                self.poller.unwatch(door, door.token())?;
+            }
+            self.watching = false;
+            self.seen = turn;
+        }
+        // Otherwise this is the only worker left in the queue and it stays in
+        // it. `seen` is deliberately not moved on, so the next turn asks again
+        // rather than waiting for somebody else to change something.
+        Ok(())
+    }
+
     /// Read everything waiting on one connection.
     fn read_conn(&mut self, conn: ConnId) {
         // A token for a connection that closed earlier in this same turn, which
@@ -863,6 +1068,31 @@ impl<'a> Worker<'a> {
                 }
             }
         }
+    }
+
+    /// One turn of the loop, for the tests that are about how connections are
+    /// shared out.
+    ///
+    /// The body of [`Worker::run`] without the stop check and without the wait,
+    /// which is asked for with no timeout here so that a turn with nothing on it
+    /// returns rather than sleeping. A test that starts a server cannot say
+    /// which thread woke first and so cannot assert anything about the split, so
+    /// the way to pin the split down is to drive the workers a turn at a time
+    /// and choose the order.
+    #[cfg(all(test, unix, not(miri)))]
+    fn turn_once(&mut self) -> io::Result<()> {
+        self.poller.wait(&mut self.ready, Duration::ZERO)?;
+        for at in 0..self.ready.len() {
+            match self.ready[at] {
+                LISTENER => self.accept_ready(LISTENER)?,
+                UNIX_LISTENER => self.accept_ready(UNIX_LISTENER)?,
+                token => self.read_conn(token as ConnId),
+            }
+        }
+        pump(&mut self.reactor, &mut self.batch);
+        self.bury_dead();
+        self.forget_closed();
+        self.share_the_doors()
     }
 
     /// Tell the engine about the sockets that failed under a write.
@@ -1628,15 +1858,7 @@ mod tests {
         fn a_burst_of_connections_is_shared_out_between_the_workers() {
             let path = socket_path("accept_share");
             let server = Server::open(None, Some(path.clone()), 4).expect("a fresh path");
-            let mut workers: Vec<Worker<'_>> = (0..4)
-                .map(|_| {
-                    Worker::new(
-                        &server.doors,
-                        Wire::over(Arc::clone(&server.shared), Net::default()),
-                    )
-                    .expect("a poller")
-                })
-                .collect();
+            let mut workers = crowd(&server, 4);
 
             // Held open for the length of the test, because a connection the
             // client dropped is one the worker would bury before it is counted.
@@ -1652,12 +1874,174 @@ mod tests {
                 }
             }
 
-            let held: Vec<usize> = workers
+            assert_eq!(spread(&workers), vec![4, 4, 4, 4]);
+        }
+
+        /// A worker that is ahead of the others is not asked again until they
+        /// have caught up, however many chances it gets.
+        ///
+        /// Taking one connection per ready event shares a burst out only if the
+        /// workers get their chances in turn, and in the real thing they do not.
+        /// A worker that just accepted is awake and running and comes back to
+        /// its poller first, while the ones that were waiting are still on their
+        /// way, so the same thread wins the door over and over. At sixteen
+        /// threads that put 215 of 771 connections on one thread and 22 on
+        /// another.
+        ///
+        /// So this driver is as unfair as a driver can be: worker 0 gets sixteen
+        /// turns in a row with four clients queued at the door, before worker 1
+        /// gets a single one. That is the worst case the race can produce, and
+        /// the answer is still one each, because a worker that has taken one
+        /// steps out of the queue for the door and its next fifteen turns find
+        /// nothing ready.
+        #[test]
+        fn a_worker_that_is_ahead_stops_being_offered_connections() {
+            let path = socket_path("accept_ahead");
+            let server = Server::open(None, Some(path.clone()), 4).expect("a fresh path");
+            let mut workers = crowd(&server, 4);
+            let _clients: Vec<UnixStream> = (0..4)
+                .map(|_| UnixStream::connect(&path).expect("the door is open"))
+                .collect();
+
+            for worker in &mut workers {
+                for _ in 0..16 {
+                    worker.turn_once().expect("the door is open");
+                }
+            }
+
+            assert_eq!(spread(&workers), vec![1, 1, 1, 1]);
+        }
+
+        /// The last worker in the queue for the doors stays in it however far
+        /// ahead it is.
+        ///
+        /// A worker steps out because somebody else will take the next
+        /// connection, and there is a window where that is not true: a worker
+        /// that has just dropped below the rest has published its count but has
+        /// not registered the doors again yet. If the one still at the door were
+        /// allowed to leave during it, nobody would be listening, and a level
+        /// triggered door does not wake anybody to say so. The client just
+        /// waits.
+        ///
+        /// The window is a race in the running server, so it is made by hand
+        /// here: worker 1 gets ahead and leaves, then worker 0 gets further
+        /// ahead than worker 1 and asks to leave too, and is refused.
+        #[test]
+        fn the_last_worker_in_the_queue_does_not_step_out() {
+            let path = socket_path("accept_last");
+            let server = Server::open(None, Some(path.clone()), 2).expect("a fresh path");
+            let mut workers = crowd(&server, 2);
+            let _clients: Vec<UnixStream> = (0..6)
+                .map(|_| UnixStream::connect(&path).expect("the door is open"))
+                .collect();
+
+            // Worker 1 takes two while worker 0 has none, so it is ahead and
+            // leaves the queue. Two workers, so worker 0 is now the only one in
+            // it.
+            for _ in 0..2 {
+                workers[1].accept_ready(UNIX_LISTENER).expect("the door");
+            }
+            workers[1]
+                .share_the_doors()
+                .expect("the poller lets it out");
+            assert!(!workers[1].watching, "it is ahead and has stepped out");
+
+            // Worker 0 takes three, which puts it ahead of worker 1. It asks to
+            // leave and does not, because there would be nobody left.
+            for _ in 0..3 {
+                workers[0].accept_ready(UNIX_LISTENER).expect("the door");
+            }
+            workers[0].share_the_doors().expect("nothing to change");
+            assert_eq!(spread(&workers), vec![3, 2]);
+            assert!(workers[0].watching, "somebody has to be at the door");
+
+            // And it is a real registration and not just a flag: the sixth
+            // client is still accepted.
+            workers[0].turn_once().expect("the door is open");
+            assert_eq!(spread(&workers), vec![4, 2]);
+        }
+
+        /// A worker whose clients went away comes back into the queue.
+        ///
+        /// What is published is a live count and not a record of whose turn it
+        /// was, so a thread that emptied out is the one with the fewest and
+        /// starts taking again while the ones that are still busy stay out. A
+        /// scheme that handed connections round in order has no way to see that,
+        /// and connections do not close at the same rate they arrive.
+        #[test]
+        fn a_worker_that_loses_its_clients_starts_taking_again() {
+            let path = socket_path("accept_back");
+            let server = Server::open(None, Some(path.clone()), 2).expect("a fresh path");
+            let mut workers = crowd(&server, 2);
+            let early: Vec<UnixStream> = (0..3)
+                .map(|_| UnixStream::connect(&path).expect("the door is open"))
+                .collect();
+            let _kept = UnixStream::connect(&path).expect("the door is open");
+
+            // Worker 0 is made to take the first three, which is not what the
+            // rule would have done and is the point: the test needs one worker
+            // holding more than the other. Worker 1 then takes the fourth.
+            for _ in 0..3 {
+                workers[0].accept_ready(UNIX_LISTENER).expect("the door");
+            }
+            workers[0]
+                .share_the_doors()
+                .expect("the poller lets it out");
+            workers[1].turn_once().expect("the door is open");
+            assert_eq!(spread(&workers), vec![3, 1]);
+            assert!(!workers[0].watching, "it is ahead");
+            assert!(workers[1].watching, "it has the fewest");
+
+            // Worker 0's three clients hang up. It reads the ends of them, the
+            // engine closes them, and it is the one with the fewest now.
+            drop(early);
+            for _ in 0..4 {
+                workers[0].turn_once().expect("the door is open");
+            }
+            assert_eq!(spread(&workers), vec![0, 1]);
+            assert!(workers[0].watching, "it has the fewest now");
+
+            // Worker 1 finds that out on its next turn and steps out, with
+            // nothing waiting at the door yet for either of them.
+            workers[1].turn_once().expect("the door is open");
+            assert!(!workers[1].watching, "it is the one ahead now");
+
+            // So the next connection goes to worker 0 even though worker 1 is
+            // the one that is asked first.
+            let _late = UnixStream::connect(&path).expect("the door is open");
+            workers[1].turn_once().expect("the door is open");
+            assert_eq!(spread(&workers), vec![0, 1], "worker 1 is out of the queue");
+            workers[0].turn_once().expect("the door is open");
+            assert_eq!(spread(&workers), vec![1, 1], "worker 0 took it");
+        }
+
+        /// The workers `run` would build, not started, so that a test can drive
+        /// them a turn at a time and choose the order.
+        ///
+        /// The server is the caller's because the workers borrow its doors, and
+        /// a function that returned both would be handing back a value that
+        /// borrows itself.
+        fn crowd(server: &Server, threads: usize) -> Vec<Worker<'_>> {
+            let split = Arc::new(Split::new(threads));
+            (0..threads)
+                .map(|me| {
+                    Worker::new(
+                        &server.doors,
+                        Wire::over(Arc::clone(&server.shared), Net::default()),
+                        Arc::clone(&split),
+                        me,
+                    )
+                    .expect("a poller")
+                })
+                .collect()
+        }
+
+        /// How many connections each worker ended up holding.
+        fn spread(workers: &[Worker<'_>]) -> Vec<usize> {
+            workers
                 .iter()
                 .map(|w| w.reactor.engine().sink().held())
-                .collect();
-            assert_eq!(held.iter().sum::<usize>(), 16, "{held:?}");
-            assert_eq!(held, vec![4, 4, 4, 4], "{held:?}");
+                .collect()
         }
     }
 }

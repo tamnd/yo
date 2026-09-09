@@ -105,14 +105,37 @@ impl Poller {
         self.inner.add(src, token)
     }
 
-    /// Stop reporting `token`.
+    /// Stop reporting `token`, whose socket is already closed.
     ///
-    /// Called after the socket behind it has already been closed, because
-    /// closing a descriptor takes it out of an `epoll` set and a `kqueue` on
-    /// its own. The backends that keep the registration list themselves, which
-    /// is Windows and the scan, are the ones with work to do here.
+    /// Closing a descriptor takes it out of an `epoll` set and a `kqueue` on
+    /// its own, so the backends with work to do here are the ones that keep the
+    /// registration list themselves, which is Windows and the scan.
+    ///
+    /// Use [`unwatch`](Self::unwatch) for a source that is still open.
     pub fn remove(&mut self, token: u64) {
         self.inner.remove(token);
+    }
+
+    /// Stop reporting a source that is still open.
+    ///
+    /// The other half of [`add`](Self::add), and not the same call as
+    /// [`remove`](Self::remove): that one tidies up after a descriptor the
+    /// kernel has already forgotten, and this one asks the kernel to forget a
+    /// descriptor that is still there. It takes the source and not just the
+    /// token because that is what `epoll` and `kqueue` are keyed on.
+    ///
+    /// A worker that shares a listening socket with its siblings uses this to
+    /// step out of the queue for it once it has taken a connection, so that the
+    /// wakeup goes to a thread that has not. Without it the only way to decline
+    /// a level triggered door is to wake on it and do nothing, which on an idle
+    /// server is a spin.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the kernel says, which for a source that was never added is
+    /// that there is nothing to remove.
+    pub fn unwatch(&mut self, src: &impl Source, token: u64) -> io::Result<()> {
+        self.inner.unwatch(src, token)
     }
 
     /// Fill `out` with the tokens that are ready, waiting up to `timeout`.
@@ -205,6 +228,26 @@ mod linux {
         }
 
         pub fn remove(&mut self, _token: u64) {}
+
+        pub fn unwatch(&mut self, src: &impl Source, _token: u64) -> io::Result<()> {
+            // The event argument was required before Linux 2.6.9 and is ignored
+            // now, but passing null to a kernel that still wants it is a
+            // segfault in kernel space, so a blank one goes along.
+            let mut ev = libc::epoll_event { events: 0, u64: 0 };
+            // SAFETY: both descriptors are open and the event outlives the call.
+            let rc = unsafe {
+                libc::epoll_ctl(
+                    self.epfd.as_raw_fd(),
+                    libc::EPOLL_CTL_DEL,
+                    src.as_raw_fd() as RawFd,
+                    &raw mut ev,
+                )
+            };
+            if rc < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(())
+        }
 
         pub fn wait(&mut self, out: &mut Vec<u64>, timeout: Duration) -> io::Result<()> {
             let ms = i32::try_from(timeout.as_millis()).unwrap_or(i32::MAX);
@@ -304,6 +347,29 @@ mod bsd {
 
         pub fn remove(&mut self, _token: u64) {}
 
+        pub fn unwatch(&mut self, src: &impl Source, _token: u64) -> io::Result<()> {
+            let mut change = blank();
+            change.ident = src.as_raw_fd() as usize;
+            change.filter = libc::EVFILT_READ;
+            change.flags = libc::EV_DELETE;
+            // SAFETY: one change, no event buffer, and a null timeout, which
+            // for a call with no events asked for means do not wait.
+            let rc = unsafe {
+                libc::kevent(
+                    self.kq.as_raw_fd(),
+                    &raw const change,
+                    1,
+                    ptr::null_mut(),
+                    0,
+                    ptr::null(),
+                )
+            };
+            if rc < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(())
+        }
+
         pub fn wait(&mut self, out: &mut Vec<u64>, timeout: Duration) -> io::Result<()> {
             let ts = libc::timespec {
                 tv_sec: libc::time_t::try_from(timeout.as_secs()).unwrap_or(libc::time_t::MAX),
@@ -397,6 +463,13 @@ mod win {
             }
         }
 
+        pub fn unwatch(&mut self, _src: &impl Source, token: u64) -> io::Result<()> {
+            // The array is ours either way, so an open socket and a closed one
+            // come out of it the same.
+            self.remove(token);
+            Ok(())
+        }
+
         pub fn wait(&mut self, out: &mut Vec<u64>, timeout: Duration) -> io::Result<()> {
             // `WSAPoll` refuses an empty array rather than treating it as a
             // sleep, so the sleep is here. This is the state the server is in
@@ -468,6 +541,11 @@ mod scan {
 
         pub fn remove(&mut self, token: u64) {
             self.tokens.retain(|t| *t != token);
+        }
+
+        pub fn unwatch(&mut self, _src: &impl Source, token: u64) -> io::Result<()> {
+            self.remove(token);
+            Ok(())
         }
 
         pub fn wait(&mut self, out: &mut Vec<u64>, timeout: Duration) -> io::Result<()> {
@@ -552,5 +630,71 @@ mod tests {
 
         poller.wait(&mut ready, Duration::ZERO).expect("wait");
         assert!(ready.is_empty(), "everything on it has been read");
+    }
+
+    /// A source that is still open and still has something on it stops being
+    /// reported once it is unwatched, and starts again when it is added back.
+    ///
+    /// This is what lets a worker step out of the queue for a shared listener
+    /// after it has taken a connection. The socket stays open the whole time,
+    /// which is the part `remove` was never asked to handle, and the second
+    /// half matters as much as the first: a door that cannot be picked back up
+    /// is a door that stops being answered.
+    #[test]
+    fn an_unwatched_source_is_not_reported_and_comes_back_when_added_again() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        listener.set_nonblocking(true).expect("nonblocking");
+        let addr = listener.local_addr().expect("addr");
+        let _client = TcpStream::connect(addr).expect("connect");
+
+        let mut poller = Poller::new().expect("poller");
+        poller.add(&listener, 3).expect("add");
+
+        let mut ready = Vec::new();
+        poller
+            .wait(&mut ready, Duration::from_secs(2))
+            .expect("wait");
+        assert_eq!(ready, vec![3], "somebody is waiting to be accepted");
+
+        poller.unwatch(&listener, 3).expect("unwatch");
+        poller.wait(&mut ready, Duration::ZERO).expect("wait");
+        assert!(
+            ready.is_empty(),
+            "still waiting to be accepted, but this poller has stepped out"
+        );
+
+        poller.add(&listener, 3).expect("add again");
+        poller
+            .wait(&mut ready, Duration::from_secs(2))
+            .expect("wait");
+        assert_eq!(ready, vec![3], "back in the queue for it");
+    }
+
+    /// Two pollers on one listener, which is the shape the server runs in: one
+    /// stepping out does not take the other with it.
+    ///
+    /// Registrations are per poller everywhere, and this is that written down,
+    /// because the accept split is only balanced if it is true.
+    #[test]
+    fn unwatching_in_one_poller_leaves_another_watching() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        listener.set_nonblocking(true).expect("nonblocking");
+        let addr = listener.local_addr().expect("addr");
+        let _client = TcpStream::connect(addr).expect("connect");
+
+        let mut mine = Poller::new().expect("poller");
+        let mut theirs = Poller::new().expect("poller");
+        mine.add(&listener, 5).expect("add");
+        theirs.add(&listener, 5).expect("add");
+
+        mine.unwatch(&listener, 5).expect("unwatch");
+
+        let mut ready = Vec::new();
+        mine.wait(&mut ready, Duration::ZERO).expect("wait");
+        assert!(ready.is_empty(), "this one stepped out");
+        theirs
+            .wait(&mut ready, Duration::from_secs(2))
+            .expect("wait");
+        assert_eq!(ready, vec![5], "this one did not");
     }
 }
