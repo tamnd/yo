@@ -409,18 +409,20 @@ doc = "12 section 7"
 
 [[group]]
 name = "connection"
-expected = 8
+expected = 11
 status = "shipped"
 doc = "12 section 9"
-# AUTH was the last one, and with it the eight are PING, ECHO, SELECT, RESET,
-# QUIT, HELLO, CLIENT and AUTH. Shipped here counts commands and not
-# subcommands, and CLIENT is short three of those: TRACKING, TRACKINGINFO and
-# CACHING, which are one feature and wait on the invalidation channel rather
-# than on anything in this group.
+# AUTH was the eighth, and with it they are PING, ECHO, SELECT, RESET, QUIT,
+# HELLO, CLIENT and AUTH. ASKING, READONLY and READWRITE came with cluster mode
+# and make eleven, and all three are refused outright on a server that is not a
+# cluster node, which is what a real server does with them too. Shipped here
+# counts commands and not subcommands, and CLIENT is short three of those:
+# TRACKING, TRACKINGINFO and CACHING, which are one feature and wait on the
+# invalidation channel rather than on anything in this group.
 
 [[group]]
 name = "server"
-expected = 32
+expected = 33
 status = "partial"
 doc = "12 section 9"
 
@@ -5302,6 +5304,50 @@ bounded = "inherent"
 status = "shipped"
 wire = "verified"
 notes = "Hand the master's job to one of its replicas without dropping a write, which is what an operator wants when the box the master is on has to go away at a time somebody chose rather than at a time it chose. Three steps and the order is the whole of it. Writes stop, using the same pause CLIENT PAUSE arms, so a write that arrives is held on its connection rather than refused and reads carry on. Then a replica is waited for until it has acknowledged every byte ever written, which is a wait that finishes because nothing is being written any more. Then this server becomes a replica of that one and tells it to become the master in the same breath, by putting a fourth word, FAILOVER, on the PSYNC it sends, and a server that gets a PSYNC like that promotes itself and answers it. The old master is caught up by construction, so what comes back is a CONTINUE and no snapshot, and the pause lifts. From a client the whole thing is one slow write. TO names which replica, and without it the first one to catch up gets picked, written down before the handover so that everything after that is about one server. TIMEOUT puts a limit on the wait, and running out of it puts everything back unless FORCE was asked for, which hands over anyway and loses whatever the replica had not got, which is why the reference refuses FORCE unless a timeout and a target are both named and why this does too. A target that refuses the PSYNC, because it is a master already or because it is following a different history, gives the job back and lifts the pause. A target that stops answering does not, on purpose: the server is then a replica of a server that is not there, which INFO shows as failover-in-progress and FAILOVER ABORT gets out of, and guessing on the operator's behalf would mean two servers deciding to be the master at once. ABORT is the only way out, which is why REPLICAOF is refused while one is going on and why CLIENT UNPAUSE does not lift this pause. The parsing is the reference's including its quirks, so each of the three words is taken at most once and a second one is a syntax error, TO needs both of its words present, ABORT is only ABORT when it is the whole command, and a timeout of nought or less is FAILOVER timeout must be greater than 0. The five refusals are the reference's sentences in the reference's order. INFO reports master_failover_state as no-failover, waiting-for-sync or failover-in-progress, and a PSYNC from anybody else while one is going on is NOMASTERLINK Can't SYNC while failing over. Admin, noscript and stale, which are the reference's flags."
+
+[[command]]
+name = "CLUSTER"
+group = "server"
+since = "3.0.0"
+arity = -2
+plan = "none"
+bounded = "inherent"
+status = "shipped"
+wire = "verified"
+notes = "The sixteen thousand slots, who owns each of them, and what a client is told when it asks the wrong node. A key belongs to CRC16 of its name modulo 16384, with the hash tag rule on top, so a key holding a brace with a closing brace after it and at least one byte between them hashes only what is between them, which is the only way a client has of making two keys land in one slot and so the only way a command that names two keys can run at all. The table is 16384 entries naming the node that owns each slot or nobody, with two more beside it for the slots that are moving, and it is written to the cluster config file in the reference's exact format after every change, so a real server can read this node's file and this node can read a real server's. The whole container is here: MYID, MYSHARDID, KEYSLOT, INFO, NODES, SLOTS, SHARDS, LINKS, REPLICAS, SLAVES, COUNT-FAILURE-REPORTS, COUNTKEYSINSLOT, GETKEYSINSLOT, SLOT-STATS, ADDSLOTS, DELSLOTS, ADDSLOTSRANGE, DELSLOTSRANGE, SETSLOT, FLUSHSLOTS, BUMPEPOCH, SET-CONFIG-EPOCH, RESET, SAVECONFIG, FORGET, REPLICATE, FAILOVER, MEET, MIGRATION, SYNCSLOTS and HELP, with the reference's arity per subcommand and the reference's error sentence for every way of getting one wrong. On a server that was not started with cluster-enabled yes every subcommand answers This instance has cluster support disabled, and the arity and the unknown subcommand complaints are still checked in front of it, which is what the reference does. The redirections are CROSSSLOT for keys in two slots, CLUSTERDOWN Hash slot not served for a slot nobody owns, CLUSTERDOWN The cluster is down when coverage is short and cluster-allow-reads-when-down is off, ASK for a key that has already left a slot being handed over, TRYAGAIN when a command names some keys that have gone and some that have not, and MOVED for a slot somebody else owns, and they are checked in getNodeByQuery's order, which puts the first key's owner in front of the cross slot check. What is not here is the cluster bus, so this node cannot learn about another one on its own and CLUSTER MEET says so, which is D-149, and CLUSTER MIGRATION IMPORT says the same after it has checked its arguments. COUNTKEYSINSLOT, GETKEYSINSLOT and SLOT-STATS walk the whole database rather than a per slot index, which is D-150."
+
+[[command]]
+name = "ASKING"
+group = "connection"
+since = "3.0.0"
+arity = 1
+plan = "none"
+bounded = "inherent"
+status = "shipped"
+wire = "verified"
+notes = "Let the command after this one into a slot this node is receiving and does not own yet, which is how a client follows an ASK it was told. It lasts exactly one command, which is what makes it safe: a client that has been told to ask over here says so again before every command it sends, and a client that has not cannot stumble into a half moved slot. Refused with This instance has cluster support disabled on a server that is not a cluster node. Fast, and it is one field write on the connection."
+
+[[command]]
+name = "READONLY"
+group = "connection"
+since = "3.0.0"
+arity = 1
+plan = "none"
+bounded = "inherent"
+status = "shipped"
+wire = "verified"
+notes = "Say that this connection will take reads from a replica rather than being redirected to the master. On a node that is nobody's replica, which is every node here until the cluster bus is in, it answers OK and does nothing else, which is what a real master answers too, so a client library that sends it on connect gets the same answer from both. Refused with This instance has cluster support disabled on a server that is not a cluster node. Loading, stale and fast, which are the reference's flags."
+
+[[command]]
+name = "READWRITE"
+group = "connection"
+since = "3.0.0"
+arity = 1
+plan = "none"
+bounded = "inherent"
+status = "shipped"
+wire = "verified"
+notes = "Undo READONLY and go back to being redirected to the master for every key. The same shape as READONLY and the same answer on a node that is nobody's replica, and refused with This instance has cluster support disabled on a server that is not a cluster node. Loading, stale and fast, which are the reference's flags."
 
 [[command]]
 name = "ROLE"

@@ -61,6 +61,7 @@ mod blocking;
 mod bloom;
 mod client;
 mod clients;
+mod cluster;
 mod cms;
 mod cpu;
 mod cuckoo;
@@ -941,6 +942,14 @@ pub struct Server {
     /// it starts on a master, waits on a replica, and ends with this server
     /// being one. See the `failover` module.
     failover: failover::Failover,
+    /// The sixteen thousand slots and who owns each of them, which is all of
+    /// cluster mode and is idle on a server that was not started as a node.
+    ///
+    /// Beside the replication fields because it is the other half of the same
+    /// subject: replication is how one server's keys reach a second, and this is
+    /// how a keyspace too big for one server is cut up in the first place. See
+    /// the `cluster` module.
+    cluster: cluster::Cluster,
     /// A handle on this server, for the one thing that outlives the command
     /// that started it.
     ///
@@ -1023,6 +1032,7 @@ impl Server {
             repl: repl::Replication::default(),
             follow: follow::Follower::default(),
             failover: failover::Failover::default(),
+            cluster: cluster::Cluster::default(),
             myself: Lock::new(Weak::new()),
             persist: persist::Persistence::default(),
             acl: acl::Users::default(),
@@ -1111,6 +1121,7 @@ impl Server {
             repl: repl::Replication::default(),
             follow: follow::Follower::default(),
             failover: failover::Failover::default(),
+            cluster: cluster::Cluster::default(),
             myself: Lock::new(Weak::new()),
             persist: persist::Persistence::default(),
             acl: acl::Users::default(),
@@ -2316,6 +2327,20 @@ pub struct Session {
     /// password, the access control list and the read only refusal, and from
     /// `CLIENT PAUSE`. See the `follow` module for why each of those.
     master: bool,
+    /// Whether the command running right now was preceded by `ASKING`.
+    ///
+    /// It is what lets a client reach a key in a slot this node is receiving and
+    /// does not own yet, and it lasts exactly one command, which is what makes
+    /// it safe: a client that has been told to ask over here says so again for
+    /// every command it sends, and a client that has not cannot stumble into a
+    /// half moved slot.
+    ///
+    /// Two fields for a one command life, the same pair `CLIENT REPLY SKIP`
+    /// uses, because the flag has to be set by a command that has not finished
+    /// and read by the next one. `ASKING` sets the second and the end of every
+    /// command moves the second into the first.
+    asking: bool,
+    asking_next: bool,
 }
 
 /// What a connection has asked to hear back, which is `CLIENT REPLY`.
@@ -2361,6 +2386,8 @@ impl Session {
             sock: Arc::new(Client::new(id)),
             authenticated: false,
             master: false,
+            asking: false,
+            asking_next: false,
             acl: Box::default(),
         }
     }
@@ -2394,6 +2421,12 @@ impl Session {
     #[must_use]
     pub(crate) fn serving_master(&self) -> bool {
         self.master
+    }
+
+    /// Let the command after this one into a slot this node is receiving, which
+    /// is what `ASKING` does and it lasts exactly that one command.
+    pub(crate) fn ask_next(&mut self) {
+        self.asking_next = true;
     }
 
     /// The row every other thread sees this connection through.
@@ -2502,6 +2535,10 @@ impl Session {
     /// every command that can move one of them, all six are written out here,
     /// which is six ordinary stores to a line this thread already owns.
     pub fn finished(&mut self) {
+        // One command's worth of `ASKING` steps forward here, which is where a
+        // real server clears its flag: in `resetClient`, after the body, and
+        // only for a command that was not `ASKING` itself.
+        self.asking = core::mem::take(&mut self.asking_next);
         let (sub, psub, ssub) = self.sub_counts();
         let (multi, multi_mem) = self.queued();
         let subscribed = self.subscribed();
@@ -2713,9 +2750,9 @@ pub fn execute(server: &Server, session: &mut Session, args: Args<'_>, out: &mut
 /// A hand written list because the table has one row per container and none per
 /// subcommand, so there is nothing to ask. It goes away with D-114, which gives
 /// every subcommand a row of its own and makes this a flag on the container.
-const CONTAINERS: [&str; 12] = [
-    "acl", "backup", "client", "command", "config", "function", "memory", "object", "pubsub",
-    "script", "xgroup", "xinfo",
+const CONTAINERS: [&str; 13] = [
+    "acl", "backup", "client", "cluster", "command", "config", "function", "memory", "object",
+    "pubsub", "script", "xgroup", "xinfo",
 ];
 
 /// The subcommand a container command was given, for the `cmd` field of
@@ -2868,6 +2905,32 @@ pub fn resolved(
         } else {
             session.dirty_multi();
             out.error(said.as_bytes());
+        }
+        return Flow::Continue;
+    }
+
+    // Where this command's keys say it should run, which is the whole of
+    // routing and is one field read on a server that is not a cluster node,
+    // which is nearly every server there is. Here, after the access control list
+    // and before the queue below, which is where a real server puts it: a user
+    // who may not touch a key is told that rather than told to go somewhere
+    // else, and a command queued inside a transaction is refused as it is queued
+    // so the whole transaction comes back as an `EXECABORT`.
+    //
+    // A command the master sent goes through untouched. A replica applies
+    // whatever its master wrote, including writes to slots the master owned and
+    // it does not, and a replica that redirected its own master would be a
+    // replica that stopped following.
+    if server.cluster_enabled()
+        && !session.serving_master()
+        && let Some(said) = cluster::gate(server, session.db, session.asking, spec, args)
+    {
+        server.mine().cmdstats.at(spec).rejected.bump();
+        if spec.name == "exec" {
+            multi::abort(server, session, said.message(), out);
+        } else {
+            session.dirty_multi();
+            out.error(said.message().as_bytes());
         }
         return Flow::Continue;
     }
@@ -32231,6 +32294,195 @@ mod tests {
                 vec!["SET".to_string(), "a".to_string(), "1".to_string()],
                 vec!["INCR".to_string(), "a".to_string()],
             ]
+        );
+    }
+
+    /// A cluster node owning every slot, with a second node in the table that
+    /// nobody has met, which is the only way a redirection can fire before the
+    /// bus is in.
+    ///
+    /// The slot `foo` lands in, read off a real server.
+    const FOO: u16 = 12182;
+
+    /// The slot `bar` lands in, which is a different one and is the whole point.
+    const BAR: u16 = 5061;
+
+    fn clustered() -> Fixture {
+        let mut server = Server::new();
+        server.enable_cluster("", 7000);
+        server.cluster_own_everything();
+        let other = server.cluster_pretend_node(
+            "5b1e2ce29b1e0c86bd53ee1e5b0dd7b66c0e6e0f",
+            "10.0.0.9",
+            7002,
+        );
+        assert_eq!(other, 1, "the made up node is the second one in the table");
+        Fixture::on(server)
+    }
+
+    /// A key in a slot somebody else owns is a redirection and not an answer.
+    #[test]
+    fn a_key_on_another_node_is_moved_there() {
+        let mut f = clustered();
+        f.server.cluster_hand_over(BAR, 1);
+        assert_eq!(
+            f.run(&[b"GET", b"bar"]),
+            format!("-MOVED {BAR} 10.0.0.9:7002\r\n")
+        );
+        // Every other slot is still this node's, so nothing about them moves.
+        assert_eq!(f.run(&[b"GET", b"foo"]), "$-1\r\n");
+    }
+
+    /// A command that names no key never redirects, whatever the table says,
+    /// which is what lets a client talk to any node at all.
+    #[test]
+    fn a_command_with_no_keys_never_redirects() {
+        let mut f = clustered();
+        for slot in 0..16384u16 {
+            f.server.cluster_hand_over(slot, 1);
+        }
+        assert_eq!(f.run(&[b"PING"]), "+PONG\r\n");
+        assert_eq!(f.run(&[b"ECHO", b"hi"]), "$2\r\nhi\r\n");
+    }
+
+    /// Two keys in two slots cannot be served by anybody, so the client is told
+    /// that rather than being sent somewhere that would only fail again.
+    #[test]
+    fn two_slots_in_one_command_is_a_cross_slot() {
+        let mut f = clustered();
+        assert_eq!(
+            f.run(&[b"MGET", b"foo", b"bar"]),
+            "-CROSSSLOT Keys in request don't hash to the same slot\r\n"
+        );
+        // The same two keys with a tag that puts them together are fine.
+        assert_eq!(
+            f.run(&[b"MGET", b"{t}foo", b"{t}bar"]),
+            "*2\r\n$-1\r\n$-1\r\n"
+        );
+    }
+
+    /// A hole in the table beats everything, including the two slots, because a
+    /// real server works out the first key's node before it looks at the rest.
+    #[test]
+    fn a_hole_is_reported_before_the_cross_slot() {
+        let mut server = Server::new();
+        server.enable_cluster("", 7000);
+        let mut f = Fixture::on(server);
+        assert_eq!(
+            f.run(&[b"MGET", b"foo", b"bar"]),
+            "-CLUSTERDOWN Hash slot not served\r\n"
+        );
+        // And with the slots back it is the two slots again.
+        f.server.cluster_own_everything();
+        assert_eq!(
+            f.run(&[b"MGET", b"foo", b"bar"]),
+            "-CROSSSLOT Keys in request don't hash to the same slot\r\n"
+        );
+    }
+
+    /// A slot on its way out sends a client on for the keys that have gone and
+    /// answers for the ones that are still here, which is what makes a slot move
+    /// without a window where a key is on neither node.
+    #[test]
+    fn a_migrating_slot_asks_for_the_keys_that_have_gone() {
+        let mut f = clustered();
+        f.run(&[b"SET", b"foo", b"1"]);
+        f.server.cluster_moving(FOO, Some(1), None);
+        // Still here, so this node answers.
+        assert_eq!(f.run(&[b"GET", b"foo"]), "$1\r\n1\r\n");
+        // Gone, so the client is sent on for this one command only.
+        assert_eq!(
+            f.run(&[b"GET", b"{foo}gone"]),
+            format!("-ASK {FOO} 10.0.0.9:7002\r\n")
+        );
+    }
+
+    /// Some here and some gone is nobody's command to run, and the client is
+    /// told to come back rather than being given half an answer.
+    #[test]
+    fn a_half_moved_slot_is_a_try_again() {
+        let mut f = clustered();
+        f.run(&[b"SET", b"{t}here", b"1"]);
+        let slot = cluster::key_slot(b"{t}here");
+        f.server.cluster_moving(slot, Some(1), None);
+        assert_eq!(
+            f.run(&[b"MGET", b"{t}here", b"{t}gone"]),
+            "-TRYAGAIN Multiple keys request during rehashing of slot\r\n"
+        );
+    }
+
+    /// A slot coming in is refused until the connection says `ASKING`, and the
+    /// permission lasts exactly one command.
+    #[test]
+    fn asking_lets_one_command_into_an_importing_slot() {
+        let mut f = clustered();
+        f.server.cluster_hand_over(FOO, 1);
+        f.server.cluster_moving(FOO, None, Some(1));
+        let moved = format!("-MOVED {FOO} 10.0.0.9:7002\r\n");
+        assert_eq!(f.run(&[b"GET", b"foo"]), moved);
+        assert_eq!(f.run(&[b"ASKING"]), "+OK\r\n");
+        assert_eq!(f.run(&[b"SET", b"foo", b"1"]), "+OK\r\n");
+        // And it is spent, so the next one is a redirection again.
+        assert_eq!(f.run(&[b"GET", b"foo"]), moved);
+    }
+
+    /// A transaction is refused at queue time rather than at `EXEC`, so a client
+    /// finds out about the redirection while it can still do something about it.
+    #[test]
+    fn a_transaction_is_refused_when_it_is_queued() {
+        let mut f = clustered();
+        f.server.cluster_hand_over(BAR, 1);
+        assert_eq!(f.run(&[b"MULTI"]), "+OK\r\n");
+        assert_eq!(
+            f.run(&[b"GET", b"bar"]),
+            format!("-MOVED {BAR} 10.0.0.9:7002\r\n")
+        );
+        assert_eq!(
+            f.run(&[b"EXEC"]),
+            "-EXECABORT Transaction discarded because of previous errors.\r\n"
+        );
+    }
+
+    /// The two commands a cluster refuses outright, because there is only one
+    /// database in a cluster and nothing to swap it with.
+    #[test]
+    fn select_and_swapdb_are_not_cluster_commands() {
+        let mut f = clustered();
+        assert_eq!(f.run(&[b"SELECT", b"0"]), "+OK\r\n");
+        assert_eq!(
+            f.run(&[b"SELECT", b"1"]),
+            "-ERR SELECT is not allowed in cluster mode\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"SWAPDB", b"0", b"1"]),
+            "-ERR SWAPDB is not allowed in cluster mode\r\n"
+        );
+    }
+
+    /// Everything in the container is refused on a server that was not started
+    /// as a cluster node, and so are the three connection commands.
+    #[test]
+    fn a_plain_server_has_no_cluster_in_it() {
+        let mut f = Fixture::new();
+        for argv in [
+            &[b"CLUSTER".as_slice(), b"INFO".as_slice()][..],
+            &[b"CLUSTER", b"MYID"],
+            &[b"CLUSTER", b"SLOTS"],
+            &[b"CLUSTER", b"HELP"],
+            &[b"ASKING"],
+            &[b"READONLY"],
+            &[b"READWRITE"],
+        ] {
+            assert_eq!(
+                f.run(argv),
+                "-ERR This instance has cluster support disabled\r\n",
+                "{argv:?}"
+            );
+        }
+        // The arity is still checked in front of the refusal.
+        assert_eq!(
+            f.run(&[b"CLUSTER", b"KEYSLOT"]),
+            "-ERR wrong number of arguments for 'cluster|keyslot' command\r\n"
         );
     }
 }

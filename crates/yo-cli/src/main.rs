@@ -34,6 +34,7 @@ usage:
   yodb serve [--bind ADDR] [--port PORT] [--unixsocket PATH] [--no-port]
              [--threads N] [--dir PATH] [--store PATH --maxmemory BYTES]
              [--requirepass PASSWORD] [--aclfile PATH] [--restore FILE]
+             [--cluster-enabled yes|no] [--cluster-config-file PATH]
              [--replicaof HOST PORT] [--masterauth PASSWORD]
              [--masteruser USER] [--replica-read-only yes|no]
 
@@ -63,6 +64,13 @@ usage:
                            with before it can send anything else. No
                            password by default, which is a server anybody
                            who can reach the port can read and write.
+             --cluster-enabled
+                           yes to hold the sixteen thousand slots and answer
+                           the CLUSTER commands, which is fixed once the
+                           server is up and is no by default
+             --cluster-config-file
+                           where a cluster node writes which slots it owns,
+                           under --dir, and nodes.conf by default
              --aclfile     a file to read the users out of at startup, and
                            the one ACL SAVE writes back to. Without one the
                            server starts with a single default user that can
@@ -351,6 +359,8 @@ fn serve_command(args: &[&str]) -> ExitCode {
     let mut masterauth: &str = "";
     let mut masteruser: &str = "";
     let mut replica_read_only = true;
+    let mut cluster = false;
+    let mut cluster_config_file = "nodes.conf";
 
     let mut at = 0;
     while at < args.len() {
@@ -389,6 +399,8 @@ fn serve_command(args: &[&str]) -> ExitCode {
             | "--restore"
             | "--masterauth"
             | "--masteruser"
+            | "--cluster-enabled"
+            | "--cluster-config-file"
             | "--replica-read-only" => {
                 let Some(value) = args.get(at) else {
                     eprintln!("yodb serve: {arg} needs a value");
@@ -411,6 +423,17 @@ fn serve_command(args: &[&str]) -> ExitCode {
                     masterauth = value;
                 } else if arg == "--masteruser" {
                     masteruser = value;
+                } else if arg == "--cluster-config-file" {
+                    cluster_config_file = value;
+                } else if arg == "--cluster-enabled" {
+                    match *value {
+                        "yes" => cluster = true,
+                        "no" => cluster = false,
+                        other => {
+                            eprintln!("yodb serve: --cluster-enabled is yes or no, not {other}");
+                            return ExitCode::from(2);
+                        }
+                    }
                 } else if arg == "--replica-read-only" {
                     match *value {
                         "yes" => replica_read_only = true,
@@ -561,8 +584,16 @@ fn serve_command(args: &[&str]) -> ExitCode {
     // server started on port zero would otherwise tell its master to dial back
     // on a port nobody is listening on. A server with no port at all announces
     // nothing, which is what a master shows for a replica that did not say.
-    if let Ok(bound) = server.local_addr() {
-        server.announce_port(bound.port());
+    let bound = server.local_addr().map(|a| a.port()).unwrap_or_default();
+    if bound != 0 {
+        server.announce_port(bound);
+    }
+    // After the port and after the directory, because a cluster node writes its
+    // table under one and names itself with the other, and before the image,
+    // because a node that read its keys back before it read its slots back would
+    // be a node answering CLUSTERDOWN for keys it is holding.
+    if cluster {
+        server.enable_cluster(cluster_config_file, bound);
     }
 
     // Last of the startup steps, because it is the only one that can take a while

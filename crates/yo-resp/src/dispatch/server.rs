@@ -247,6 +247,29 @@ const MASTERUSER: &str = "masteruser";
 /// The two words a yes or no setting is allowed to be.
 const BOOLS: [&str; 2] = ["yes", "no"];
 
+/// The two cluster settings that really move, both of them a yes or a no.
+///
+/// `cluster-require-full-coverage` decides whether a node with a hole somewhere
+/// in the cluster refuses everything or only the keys in the hole, and
+/// `cluster-allow-reads-when-down` decides whether a node that has decided the
+/// cluster is down still answers reads. Both take effect on the next command,
+/// which is what an operator digging a cluster out of a hole wants.
+const CLUSTER_COVERAGE: [&str; 2] = [
+    "cluster-require-full-coverage",
+    "cluster-allow-reads-when-down",
+];
+
+/// Whether this server is a cluster node, which is fixed for the life of the
+/// process and is Redis's rule.
+///
+/// A server that could be turned into a cluster node while it was holding keys
+/// would be a server whose keys were suddenly in slots it does not own, so
+/// `CONFIG SET` refuses it and the only way to set it is at startup.
+const CLUSTER_ENABLED: &str = "cluster-enabled";
+
+/// Where a cluster node writes its table, which it was given at startup.
+const CLUSTER_CONFIG_FILE: &str = "cluster-config-file";
+
 /// Which classes of keyspace change are published, and on which two channels.
 ///
 /// On its own for a fifth reason: it is the only setting whose value is neither
@@ -357,9 +380,44 @@ pub(super) fn execute(
         "psync" | "sync" => super::repl::psync(server, session, args, out)?,
         "replicaof" | "slaveof" => super::follow::replicaof(server, args, out)?,
         "failover" => super::failover::execute(server, args, out)?,
+        "cluster" => super::cluster::execute(server, session.db, args, out)?,
+        // The three connection commands cluster mode adds. `ASKING` is the one
+        // that does anything: it says the next command is allowed into a slot
+        // this node is receiving and does not own yet, which is how a client
+        // follows an `ASK` it was told.
+        //
+        // `READONLY` and `READWRITE` say whether this connection will take
+        // reads from a replica rather than being redirected to the master, and
+        // on a node that is nobody's replica, which is every node here until the
+        // bus is in, both of them are an `OK` and nothing else. That is what a
+        // real master answers too, so a client library that sends `READONLY` on
+        // connect gets the same answer from both.
+        "asking" => {
+            if !server.cluster_enabled() {
+                return Err(super::cluster::disabled());
+            }
+            session.ask_next();
+            out.ok();
+        }
+        "readonly" | "readwrite" => {
+            if !server.cluster_enabled() {
+                return Err(super::cluster::disabled());
+            }
+            out.ok();
+        }
         "hello" => hello(server, session, args, out)?,
         "select" => {
+            // A cluster has one database and the slots are how it is cut up, so
+            // moving to another one would be moving to a database no slot points
+            // at. Database nought is still allowed, because a client library
+            // that sends SELECT 0 on connect is asking for where it already is.
             let n = args.int(1)?;
+            if server.cluster_enabled() && n != 0 {
+                return Err(Error::new(
+                    Code::Invalid,
+                    "SELECT is not allowed in cluster mode",
+                ));
+            }
             let ok = usize::try_from(n).is_ok_and(|n| n < DATABASES);
             if !ok {
                 return Err(Error::new(Code::Invalid, "DB index is out of range"));
@@ -470,6 +528,12 @@ pub(super) fn execute(
         // and not the database, so it wakes up against the swapped in one, which
         // is Redis's behaviour and falls out of the index being what is stored.
         "swapdb" => {
+            if server.cluster_enabled() {
+                return Err(Error::new(
+                    Code::Invalid,
+                    "SWAPDB is not allowed in cluster mode",
+                ));
+            }
             let first = db_index(args.get(1), "invalid first DB index")?;
             let second = db_index(args.get(2), "invalid second DB index")?;
             server.striped(first).swap_with(server.striped(second));
@@ -1110,6 +1174,12 @@ fn config(server: &Server, args: Args<'_>, out: &mut Out) -> Result<()> {
         let readonly = REPLICA_READ_ONLY.map(wanted);
         let mauth = wanted(MASTERAUTH);
         let muser = wanted(MASTERUSER);
+        // The four cluster settings, which are there on every server and not
+        // only on a node, the same way a real server answers them: a tool asking
+        // `CONFIG GET cluster-enabled` wants a no rather than nothing back.
+        let coverage = CLUSTER_COVERAGE.map(wanted);
+        let clustered = wanted(CLUSTER_ENABLED);
+        let nodes_file = wanted(CLUSTER_CONFIG_FILE);
         out.map(
             fixed.clone().count()
                 + ladder.clone().count()
@@ -1127,7 +1197,11 @@ fn config(server: &Server, args: Args<'_>, out: &mut Out) -> Result<()> {
                 + usize::from(readonly[0])
                 + usize::from(readonly[1])
                 + usize::from(mauth)
-                + usize::from(muser),
+                + usize::from(muser)
+                + usize::from(coverage[0])
+                + usize::from(coverage[1])
+                + usize::from(clustered)
+                + usize::from(nodes_file),
         );
         for (k, v) in fixed {
             out.bulk(k.as_bytes());
@@ -1214,6 +1288,22 @@ fn config(server: &Server, args: Args<'_>, out: &mut Out) -> Result<()> {
                 out.bulk(BOOLS[usize::from(!server.replica_read_only_setting())].as_bytes());
             }
         }
+        if coverage[0] {
+            out.bulk(CLUSTER_COVERAGE[0].as_bytes());
+            out.bulk(BOOLS[usize::from(!server.cluster_full_coverage())].as_bytes());
+        }
+        if coverage[1] {
+            out.bulk(CLUSTER_COVERAGE[1].as_bytes());
+            out.bulk(BOOLS[usize::from(!server.cluster_reads_when_down())].as_bytes());
+        }
+        if clustered {
+            out.bulk(CLUSTER_ENABLED.as_bytes());
+            out.bulk(BOOLS[usize::from(!server.cluster_enabled())].as_bytes());
+        }
+        if nodes_file {
+            out.bulk(CLUSTER_CONFIG_FILE.as_bytes());
+            yo_alloc::allow(|| out.bulk(server.cluster_file().as_bytes()));
+        }
         if mauth || muser {
             server.with_master_auth(|user, pass| {
                 if mauth {
@@ -1253,6 +1343,7 @@ fn config(server: &Server, args: Args<'_>, out: &mut Out) -> Result<()> {
         let mut logged = None;
         let mut channels = None;
         let mut readonly = None;
+        let mut coverage: [Option<bool>; 2] = [None, None];
         let mut mauth = None;
         let mut muser = None;
         let mut i = 2;
@@ -1378,6 +1469,30 @@ fn config(server: &Server, args: Args<'_>, out: &mut Out) -> Result<()> {
                 readonly = Some(at == 0);
                 continue;
             }
+            if let Some(at) = CLUSTER_COVERAGE.iter().position(|k| is(name, k.as_bytes())) {
+                let Some(word) = BOOLS.iter().position(|w| is(value, w.as_bytes())) else {
+                    return Err(Error::fmt(
+                        Code::Invalid,
+                        format_args!(
+                            "CONFIG SET failed (possibly related to argument '{}') - argument must be 'yes' or 'no'",
+                            CLUSTER_COVERAGE[at]
+                        ),
+                    ));
+                };
+                coverage[at] = Some(word == 0);
+                continue;
+            }
+            if is(name, CLUSTER_ENABLED.as_bytes()) || is(name, CLUSTER_CONFIG_FILE.as_bytes()) {
+                return Err(yo_alloc::allow(|| {
+                    Error::fmt(
+                        Code::Unsupported,
+                        format_args!(
+                            "CONFIG SET failed (possibly related to argument '{}') - can't set immutable config",
+                            String::from_utf8_lossy(name).to_lowercase()
+                        ),
+                    )
+                }));
+            }
             if is(name, MASTERAUTH.as_bytes()) {
                 // Anything at all, including nothing, which is how the password
                 // is taken off again. It is read at the next dial rather than
@@ -1491,6 +1606,15 @@ fn config(server: &Server, args: Args<'_>, out: &mut Out) -> Result<()> {
         if let Some(yes) = readonly {
             server.set_replica_read_only(yes);
         }
+        // One write of the pair whichever of the two was named, for the same
+        // reason the master credentials are written together: they are read as a
+        // pair and a set of one has to leave the other where it was.
+        if coverage[0].is_some() || coverage[1].is_some() {
+            server.set_cluster_coverage(
+                coverage[0].unwrap_or_else(|| server.cluster_full_coverage()),
+                coverage[1].unwrap_or_else(|| server.cluster_reads_when_down()),
+            );
+        }
         // One write of the pair whichever of the two was named, because they
         // live together and a set of one has to leave the other where it was.
         if mauth.is_some() || muser.is_some() {
@@ -1573,11 +1697,20 @@ fn info(server: &Server, args: Args<'_>, out: &mut Out) {
             let _ = write!(
                 s,
                 "# Server\r\nredis_version:{REPORTED_VERSION}\r\nyo_version:{}\r\n\
-                 redis_mode:standalone\r\narch_bits:{}\r\nprocess_id:0\r\n\
-                 run_id:0000000000000000000000000000000000000000\r\ntcp_port:0\r\n\
+                 redis_mode:{}\r\narch_bits:{}\r\nprocess_id:0\r\n\
+                 run_id:0000000000000000000000000000000000000000\r\ntcp_port:{}\r\n\
                  uptime_in_seconds:{}\r\nio_threads_active:0\r\n\r\n",
                 env!("CARGO_PKG_VERSION"),
+                if server.cluster_enabled() {
+                    "cluster"
+                } else {
+                    "standalone"
+                },
                 usize::BITS,
+                // The port the socket was actually bound to, which whoever bound
+                // it told the server. Nought on an embedded caller that never
+                // opened one, which is honest: there is no port.
+                server.announced_port(),
                 server.uptime_secs(),
             );
         }
@@ -1707,6 +1840,15 @@ fn info(server: &Server, args: Args<'_>, out: &mut Out) {
         }
         if want("replication") {
             super::repl::info(server, &mut s);
+        }
+        if want("cluster") {
+            // One field, which is the one every client library reads on connect
+            // to decide whether it needs a slot map at all.
+            let _ = write!(
+                s,
+                "# Cluster\r\ncluster_enabled:{}\r\n\r\n",
+                u8::from(server.cluster_enabled()),
+            );
         }
         if extra("threads") {
             // An extra rather than a default section for the reason above: it
