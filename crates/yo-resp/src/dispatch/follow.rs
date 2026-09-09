@@ -322,6 +322,41 @@ impl Server {
         self.follow_now(Some(Upstream { host, port }));
     }
 
+    /// Whether the link to the master is up and applying, which is the question
+    /// a `PSYNC` from somebody else asks before it trusts what we would send.
+    #[must_use]
+    pub(crate) fn master_link_up(&self) -> bool {
+        State::from(self.follow.state.load(Relaxed)) == State::Up
+    }
+
+    /// Stop following anybody, which is `REPLICAOF NO ONE` and the two ways a
+    /// failover ends up back where it started.
+    ///
+    /// The promotion is the part that matters: the history that was being
+    /// followed is kept as the second id and a new one is taken, so a replica
+    /// that was following this server through the old master can be handed over
+    /// without a snapshot. See `repl::promote`.
+    pub(super) fn stop_following(self: &Arc<Server>) {
+        if self.following() {
+            self.promote();
+        }
+        self.follow_now(None);
+    }
+
+    /// Start following the server a failover picked.
+    ///
+    /// Two things make this different from `REPLICAOF host port`. There is no
+    /// promotion, because this server is handing its history over rather than
+    /// starting a new one, and the next `PSYNC` asks to carry on from where this
+    /// server has got to rather than starting again, because the target is
+    /// caught up to exactly there and a snapshot would be a copy of what it
+    /// already holds.
+    pub(super) fn follow_for_failover(self: &Arc<Server>, host: &str, port: u16) {
+        self.follow.resume.store(true, Relaxed);
+        let host = yo_alloc::allow(|| host.to_owned());
+        self.follow_now(Some(Upstream { host, port }));
+    }
+
     /// Start following, or stop.
     ///
     /// The intent is recorded and a thread is started, and the answer goes back
@@ -401,6 +436,15 @@ pub(super) fn replicaof(server: &Server, args: Args<'_>, out: &mut Out) -> Resul
     if args.len() != 3 {
         return Err(args::wrong_arity(name));
     }
+    // A failover is already deciding who the master is, and two commands that
+    // both decide that are two commands that can disagree. `FAILOVER ABORT` is
+    // the way out, which is why it is the only one.
+    if server.failing_over() {
+        return Err(Error::new(
+            Code::Invalid,
+            "REPLICAOF not allowed while failing over.",
+        ));
+    }
     let host = args.get(1);
     let port = args.get(2);
     // Both words are read before anything is looked up, so a caller who got the
@@ -428,14 +472,7 @@ pub(super) fn replicaof(server: &Server, args: Args<'_>, out: &mut Out) -> Resul
         ));
     };
     let Some(port) = told else {
-        // Promotion. The history this server was following is kept as the second
-        // id and a new one is taken, so a sub-replica that was following this
-        // server through the old master can be handed over without starting
-        // again. See `repl::promote`.
-        if server.following() {
-            server.promote();
-        }
-        shared.follow_now(None);
+        shared.stop_following();
         out.ok();
         return Ok(());
     };
@@ -579,6 +616,10 @@ fn once(server: &Arc<Server>, epoch: u64, to: &Upstream) -> std::io::Result<()> 
     // line the way every other answer in the handshake is: a full resync answers
     // with a line and then a snapshot, and reading the line here is the same read
     // either way.
+    // A fourth word on a server that is handing its job over, which is what
+    // tells the other end to stop being a replica and start being the master.
+    // See the `failover` module.
+    let handing_over = server.failover_stage() == super::failover::Stage::InProgress;
     if server.follow.resume.load(Relaxed) {
         // The server's own id and offset, which are the master's, because the
         // last thing applied moved them and nothing else writes them while a
@@ -587,7 +628,11 @@ fn once(server: &Arc<Server>, epoch: u64, to: &Upstream) -> std::io::Result<()> 
         // the step `repl::psync` takes coming the other way.
         let id = server.repl_id();
         let from = (server.repl_offset() + 1).to_string();
-        wire.write(&[b"PSYNC", &id, from.as_bytes()])?;
+        if handing_over {
+            wire.write(&[b"PSYNC", &id, from.as_bytes(), b"FAILOVER"])?;
+        } else {
+            wire.write(&[b"PSYNC", &id, from.as_bytes()])?;
+        }
     } else {
         wire.write(&[b"PSYNC", b"?", b"-1"])?;
     }
@@ -607,8 +652,17 @@ fn once(server: &Arc<Server>, epoch: u64, to: &Upstream) -> std::io::Result<()> 
         server.follow.state.store(State::Up as u8, Relaxed);
         server.follow.resume.store(true, Relaxed);
     } else {
+        // A target that would not take the handover, which is a failover that
+        // cannot happen. This server takes its job back and lets the writes it
+        // has been holding through, rather than sitting paused forever waiting
+        // for a server that has already said no.
+        if handing_over {
+            super::failover::abort(server);
+        }
         return Err(broken("the master would not resynchronise"));
     }
+    // Answered either way, so the handover is done and the pause lifts.
+    super::failover::landed(server);
     stream(server, epoch, &mut wire)
 }
 

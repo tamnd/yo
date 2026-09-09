@@ -6867,6 +6867,22 @@ pub static COMMANDS: &[Spec] = &[
         summary: "What REPLICAOF was called before it was called that.",
         group: "server",
     },
+    // Arity is a minimum of one, because every word is optional and the command
+    // with no words at all is a failover to whichever replica catches up first.
+    Spec {
+        name: "failover",
+        arity: -1,
+        flags: &["admin", "noscript", "stale"],
+        first_key: 0,
+        last_key: 0,
+        step: 0,
+        keys: &[],
+        acl: AC_ADMIN_SLOW,
+        since: "6.2.0",
+        complexity: "O(1)",
+        summary: "Hand the master's job to a replica, on purpose.",
+        group: "server",
+    },
     Spec {
         name: "role",
         arity: 1,

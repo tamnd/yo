@@ -291,6 +291,16 @@ impl Server {
     }
 }
 
+/// Whether a replica is the one at this host and port.
+///
+/// The host is compared as text and not as an address, which is Redis's own
+/// rule: what an operator types has to be what the server prints in `INFO`,
+/// because that is where they read it from.
+fn at(held: &Replica, host: &str, port: u16) -> bool {
+    let (theirs, their_port) = held.address();
+    theirs == host && their_port == u64::from(port)
+}
+
 /// Forty hex characters from the operating system's generator.
 ///
 /// From the system and not from the engine's own seeded one, because two servers
@@ -432,6 +442,52 @@ impl Server {
     #[must_use]
     pub(crate) fn repl_offset(&self) -> u64 {
         self.repl.offset.load(Acquire)
+    }
+
+    /// Whether a replica is attached at this address, and whether it is past its
+    /// snapshot, which are the two questions `FAILOVER TO` asks in that order.
+    ///
+    /// `None` is nobody there and is a different answer from `Some(false)`,
+    /// which is somebody there who is still loading. The address is matched the
+    /// way Redis matches it, against where the connection came from and against
+    /// the port the replica said it listens on rather than the port it dialled
+    /// out from, because the second one is not something an operator can type.
+    #[must_use]
+    pub(super) fn replica_online_at(&self, host: &str, port: u16) -> Option<bool> {
+        self.replica_rows()
+            .iter()
+            .find(|held| at(held, host, port))
+            .map(|held| held.online.load(Relaxed))
+    }
+
+    /// Whether the replica at this address has acknowledged every byte written.
+    ///
+    /// The wait a failover is, put as one question. A replica that has gone away
+    /// answers no rather than yes, which is what keeps a failover to a target
+    /// that died waiting rather than handing the job to nobody.
+    #[must_use]
+    pub(super) fn replica_caught_up(&self, host: &str, port: u16) -> bool {
+        let upto = self.repl_offset();
+        self.replica_rows()
+            .iter()
+            .any(|held| at(held, host, port) && held.ack.load(Relaxed) >= upto)
+    }
+
+    /// Where the first replica that has everything is, for a failover that was
+    /// not told which one to hand the job to.
+    ///
+    /// In the order they attached, which is the order `INFO` lists them in, so
+    /// two operators reading the same server pick the same one.
+    #[must_use]
+    pub(super) fn first_caught_up(&self) -> Option<(String, u16)> {
+        let upto = self.repl_offset();
+        yo_alloc::allow(|| {
+            self.replica_rows()
+                .iter()
+                .filter(|held| held.online.load(Relaxed) && held.ack.load(Relaxed) >= upto)
+                .map(|held| held.address())
+                .find_map(|(host, port)| u16::try_from(port).ok().map(|port| (host, port)))
+        })
     }
 
     /// A handle to every replica, copied out so the bytes can be posted with the
@@ -865,10 +921,21 @@ pub(super) fn psync(
         }
         None
     } else {
-        if args.len() != 3 {
+        // Four words when the fourth is `FAILOVER`, which is a master that has
+        // stopped writing telling us to take over from it. Three otherwise, and
+        // a fourth word that is not that one is not a spelling of anything.
+        let handover = args.len() == 4 && args.get(3).eq_ignore_ascii_case(b"failover");
+        if args.len() != 3 && !handover {
             return Err(args::wrong_arity("psync"));
         }
         let asked = args.get(1);
+        // Before anything else is read, because this is the one form of the
+        // command that changes what this server is rather than asking it for
+        // something, and a master that has already stopped writing is waiting on
+        // the answer.
+        if handover {
+            take_over(server, asked)?;
+        }
         let from = args.int(2)?;
         // The number a replica sends is the position of the first byte it
         // wants counted from one, so a replica that has everything asks for one
@@ -879,6 +946,20 @@ pub(super) fn psync(
         // first, so it starts again, which is what a real master does with it.
         (asked != b"?" && from >= 1).then(|| (asked.to_vec(), from as u64 - 1))
     };
+    // Nobody may attach to a server that is in the middle of handing its job
+    // over, because the offsets it is about to start reporting are somebody
+    // else's. The `FAILOVER` form above got past this, which is the point: that
+    // one is the handover and this is everybody else.
+    if server.failing_over() {
+        out.error(b"NOMASTERLINK Can't SYNC while failing over");
+        return Ok(());
+    }
+    // Nor to a replica whose own link is not up, because what it would be
+    // handing out is a history it has not finished reading.
+    if server.following() && !server.master_link_up() {
+        out.error(b"NOMASTERLINK Can't SYNC while not connected with my master");
+        return Ok(());
+    }
     if session.running() {
         return Err(Error::new(
             Code::Invalid,
@@ -901,6 +982,42 @@ pub(super) fn psync(
         }
     }
     full(server, session, out)
+}
+
+/// Take the master's job, because the master asked us to.
+///
+/// The fourth word of a `PSYNC` is how a `FAILOVER` finishes. Everything hard
+/// about it happened on the other side: the master stopped writing, waited until
+/// this server had acknowledged every byte, and only then sent this. So all that
+/// is left here is to check that it is talking to the right server and then stop
+/// being a replica, after which the `PSYNC` carries on as an ordinary one and is
+/// answered with a `+CONTINUE` that costs nothing, because the two sides are in
+/// step by construction.
+///
+/// The promotion is `REPLICAOF NO ONE`, so the history that was being followed
+/// is kept as the second id. That is what makes the old master's `PSYNC`, which
+/// names that very history, something this server can answer at all.
+fn take_over(server: &Server, asked: &[u8]) -> Result<()> {
+    if !server.following() {
+        return Err(Error::new(
+            Code::Invalid,
+            "PSYNC FAILOVER can't be sent to a master.",
+        ));
+    }
+    if asked != server.repl_id() {
+        return Err(Error::new(
+            Code::Invalid,
+            "PSYNC FAILOVER replid must match my replid.",
+        ));
+    }
+    let Some(shared) = server.myself() else {
+        return Err(Error::new(
+            Code::Invalid,
+            "PSYNC FAILOVER is not available on an embedded server",
+        ));
+    };
+    shared.stop_following();
+    Ok(())
 }
 
 /// The bytes a reconnecting replica missed, or `None` if it has to start again.
@@ -1047,9 +1164,10 @@ pub(super) fn info(server: &Server, s: &mut String) {
     }
     let _ = write!(
         s,
-        "master_failover_state:no-failover\r\n\
+        "master_failover_state:{}\r\n\
          master_replid:{}\r\nmaster_replid2:{}\r\n\
          master_repl_offset:{offset}\r\nsecond_repl_offset:{}\r\n",
+        server.failover_word(),
         String::from_utf8_lossy(&id),
         String::from_utf8_lossy(&id2),
         server.repl.second.load(Relaxed),

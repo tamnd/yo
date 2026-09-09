@@ -438,8 +438,20 @@ impl super::Server {
     }
 
     /// Let everybody go, which is `CLIENT UNPAUSE`.
+    ///
+    /// With one exception: a pause a failover armed is not an operator's to
+    /// lift. The whole safety of that command is that no write lands here
+    /// between the moment the target replica catches up and the moment it
+    /// becomes the master, and a `CLIENT UNPAUSE` that opened that window would
+    /// lose whatever went through it. `FAILOVER ABORT` is what lifts that one.
+    /// A client's own pause underneath it goes, which is what was asked for.
     pub fn unpause(&self) {
-        self.pause.store(0, Release);
+        let keep = if self.failing_over() {
+            (u64::MAX >> 1) << 1
+        } else {
+            0
+        };
+        self.pause.store(keep, Release);
     }
 
     /// Whether commands are being held right now, and whether that is all of

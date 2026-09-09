@@ -1047,3 +1047,11 @@ reason = "CONFIG SET repl-backlog-size on a real server really resizes the buffe
 status = "until"
 resolved_by = "M8"
 spec = "12 section 9"
+
+[[divergence]]
+id = "D-148"
+title = "REPLICAOF does not drop this server's own replicas"
+reason = "When a real server is pointed at a new master it calls disconnectSlaves, which drops every replica it was feeding and makes each of them come back and resynchronise. The reason is that the bytes it is about to start passing on are positions in a history its replicas have never seen, so anything it forwards after the switch is numbered against a stream they cannot line up with what they already have. Here the link is simply repointed and the replicas stay attached, which is right for the case that matters and wrong for the case that does not. The case that matters is FAILOVER, where the new master is the old master's own replica and the history carries over by construction, so dropping everybody would turn a handover that costs nothing into a round of full resynchronisations. The case that does not is an operator moving a middle server to an unrelated master by hand, where its sub-replicas will keep reading a stream whose offsets no longer mean anything until somebody restarts them. A REPLICAOF NO ONE followed by a REPLICAOF is the way to do that move safely today. Closing it properly needs the drop to be able to tell those two apart, which is a small change on top of the replica list and is why it is written down rather than done in the same breath as the failover."
+status = "until"
+resolved_by = "M8"
+spec = "12 section 9"
