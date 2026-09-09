@@ -415,8 +415,21 @@ mod tests {
         }
     }
 
+    /// `len` bytes that repeat every 251, which is prime so no chunk boundary
+    /// lines up with the cycle and a piece put back in the wrong place shows up.
+    ///
+    /// Built one cycle at a time rather than one byte at a time. The bytes are
+    /// the same either way and compiled it makes no odds, but a value of three
+    /// chunks is nearly two hundred thousand turns of a loop interpreted, and
+    /// this file hands Miri about eight hundred thousand of them.
     fn pattern(len: usize) -> Vec<u8> {
-        (0..len).map(|i| (i % 251) as u8).collect()
+        let cycle: [u8; 251] = std::array::from_fn(|i| i as u8);
+        let mut out = Vec::with_capacity(len);
+        while out.len() + cycle.len() <= len {
+            out.extend_from_slice(&cycle);
+        }
+        out.extend_from_slice(&cycle[..len - out.len()]);
+        out
     }
 
     fn whole<B: Blocks>(r: &Reader<'_, B>) -> Vec<u8> {

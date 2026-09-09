@@ -1145,6 +1145,20 @@ mod tests {
         assert_eq!(e.message(), "range exceeds maximum of 1000000 items");
         // One under the line is fine, and it is the positions that are counted
         // and not the elements, so this walks a million holes.
+        //
+        // A million holes is a million turns of a loop, and interpreted that is
+        // four and a half minutes on its own. The count cannot come down here,
+        // because the count is the claim: what is being asserted is that the
+        // line sits at a million and that a request one short of it is served
+        // rather than refused. A smaller number would be asserting that the
+        // line sits somewhere, which is not worth a test. So the half that
+        // costs the time is skipped under Miri and the refusal above, which is
+        // the half that touches the arithmetic, still runs.
+        if cfg!(miri) {
+            // Skipped under Miri: walking the million positions either side of
+            // GETRANGE_MAX is the claim, so it cannot be walked with fewer.
+            return;
+        }
         let mut n = 0u64;
         d.argetrange(b"a", 0, GETRANGE_MAX - 1, |_| n += 1)
             .expect("no key");

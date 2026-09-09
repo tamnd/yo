@@ -267,6 +267,24 @@ jobs:
       # and through all four shapes. After the pass those ten run in six to
       # twenty one seconds each.
       #
+      # A fourth pass took the four that were still over three minutes, and all
+      # four came out of the same rule applied a second time. Two of them are a
+      # ratio rather than a size, being a table churned at ninety nine removals
+      # per live member and an array walked against a map with the index space
+      # equal to the step count, and both had already come down tenfold with
+      # everything else. Ratios can come down again, so they came down another
+      # fourfold and tenfold with the ratio held, which is four hundred and
+      # twenty five seconds to sixteen and a hundred and eighty nine to ten. The
+      # third is the array range limit, where the count is the claim, being that
+      # the line sits at a million: that one walks the million only when it is
+      # not interpreted, and the refusal either side of it still runs. The
+      # fourth needed no cut at all. It was slow because the helper that builds
+      # its test bytes ran a modulo per byte, and this file hands Miri about
+      # eight hundred thousand bytes, so the helper now builds one cycle of two
+      # hundred and fifty one and repeats it. Same bytes, two hundred and four
+      # seconds to five. That last one is the case to look for first, because it
+      # costs no coverage at all.
+      #
       # Where the band is a constant rather than a knob there is a floor and the
       # count stops there. A run in an intset is capped at five hundred and
       # twelve by a `const`, so the smallest set of integers that splits at all

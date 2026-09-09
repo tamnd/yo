@@ -1958,8 +1958,18 @@ mod tests {
         // and the range width is a fortieth of the index space so that a range
         // delete takes a handful rather than everything or nothing. Shrinking
         // any one of them alone changes which paths this actually reaches.
-        let steps = many(20_000u64);
-        let width = many(500u64);
+        //
+        // Interpreted a step costs about ninety milliseconds, so two thousand
+        // of them is three minutes. What the three numbers are is a ratio and
+        // not a size, so under Miri they come down another fourfold together
+        // and the ratio is what survives: the index space is still the step
+        // count, so a write still lands on an occupied slot about as often as
+        // not, and the width is still a fortieth of it, so a range delete still
+        // takes a few per cent of what is live. Five hundred slots is well past
+        // the sparse ceiling of ten, so the promotion and the layouts either
+        // side of it are reached in the first dozen steps and stay reached.
+        let steps: u64 = if cfg!(miri) { 500 } else { 20_000 };
+        let width: u64 = steps / 40;
         for step in 0..steps {
             let idx = next() % steps;
             match step % 5 {
