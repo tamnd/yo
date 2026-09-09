@@ -2618,7 +2618,17 @@ mod tests {
     #[test]
     fn the_reason_a_file_would_not_open_reads_the_way_c_writes_it() {
         let missing = std::io::Error::from_raw_os_error(2);
-        assert_eq!(because(&missing), "No such file or directory");
+        // What is claimed here is that the number Rust puts on the end comes
+        // off, and that is true everywhere. The sentence in front of it is the
+        // system's own and is not: errno 2 is `No such file or directory` out
+        // of a C library and `The system cannot find the file specified.` out
+        // of Windows, and a server built on Windows should say what Windows
+        // says rather than repeat a sentence from another operating system.
+        let said = because(&missing);
+        assert!(!said.contains("(os error"), "{said}");
+        assert!(missing.to_string().starts_with(&said), "{said}");
+        #[cfg(unix)]
+        assert_eq!(said, "No such file or directory");
         // Anything with no errno behind it is left alone, since there is no
         // number on the end of it to take off.
         let made_up = std::io::Error::other("something else");
