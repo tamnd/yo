@@ -33,7 +33,7 @@ usage:
   yodb restore FILE [--quiet]
   yodb serve [--bind ADDR] [--port PORT] [--unixsocket PATH] [--no-port]
              [--threads N] [--dir PATH] [--store PATH --maxmemory BYTES]
-             [--requirepass PASSWORD] [--restore FILE]
+             [--requirepass PASSWORD] [--aclfile PATH] [--restore FILE]
 
   check    read a .yo file and report anything wrong with it. Never writes.
              --quick   skip the records and read only the headers
@@ -61,6 +61,12 @@ usage:
                            with before it can send anything else. No
                            password by default, which is a server anybody
                            who can reach the port can read and write.
+             --aclfile     a file to read the users out of at startup, and
+                           the one ACL SAVE writes back to. Without one the
+                           server starts with a single default user that can
+                           do anything, and ACL LOAD and ACL SAVE both say so.
+                           A file that will not parse stops the server from
+                           starting
              --dir         where the server writes, which is where BACKUP
                            puts its files and what CONFIG GET dir answers.
                            The directory the command was run from by default
@@ -316,6 +322,7 @@ fn serve_command(args: &[&str]) -> ExitCode {
     let mut dir: Option<std::path::PathBuf> = None;
     let mut threads = 1usize;
     let mut requirepass: Option<&str> = None;
+    let mut aclfile: Option<std::path::PathBuf> = None;
     let mut from_rdb: Option<std::path::PathBuf> = None;
 
     let mut at = 0;
@@ -329,7 +336,7 @@ fn serve_command(args: &[&str]) -> ExitCode {
             }
             "--no-port" => tcp = false,
             "--bind" | "--port" | "--unixsocket" | "--store" | "--maxmemory" | "--dir"
-            | "--threads" | "--requirepass" | "--restore" => {
+            | "--threads" | "--requirepass" | "--aclfile" | "--restore" => {
                 let Some(value) = args.get(at) else {
                     eprintln!("yodb serve: {arg} needs a value");
                     return ExitCode::from(2);
@@ -345,6 +352,8 @@ fn serve_command(args: &[&str]) -> ExitCode {
                     dir = Some(std::path::PathBuf::from(*value));
                 } else if arg == "--restore" {
                     from_rdb = Some(std::path::PathBuf::from(*value));
+                } else if arg == "--aclfile" {
+                    aclfile = Some(std::path::PathBuf::from(*value));
                 } else if arg == "--requirepass" {
                     // An empty one is no password, which is the same thing
                     // `CONFIG SET requirepass ""` means by it.
@@ -467,6 +476,15 @@ fn serve_command(args: &[&str]) -> ExitCode {
     }
     if let Some(dir) = dir {
         server.set_dir(dir);
+    }
+    // Before the store and before the image, because this is the only startup
+    // step that decides who is allowed to see what came out of either.
+    if let Some(path) = aclfile {
+        server.set_aclfile(path);
+        if let Err(errors) = server.load_acl() {
+            eprintln!("yodb serve: {errors}");
+            return ExitCode::from(2);
+        }
     }
     if let Some(opened) = opened {
         server.use_store(opened);

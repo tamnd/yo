@@ -512,6 +512,27 @@ impl Server {
         self.setup().set_maxmemory(bytes);
     }
 
+    /// Point the server at an ACL file, which is where its users come from.
+    ///
+    /// Taken here at startup and not readable afterwards, the same as on a real
+    /// server, where `aclfile` is an immutable config. Giving one does not read
+    /// it, [`Server::load_acl`] does, so the caller decides what a file that
+    /// will not parse means.
+    pub fn set_aclfile(&mut self, path: PathBuf) {
+        self.setup().set_aclfile(path);
+    }
+
+    /// Read the ACL file and make it the server's users.
+    ///
+    /// # Errors
+    ///
+    /// Everything the file got wrong, in one sentence, and the users are left
+    /// exactly as they were. Nothing on an ACL file that will not open, because
+    /// a server that was not given one has nothing to read.
+    pub fn load_acl(&self) -> Result<(), String> {
+        self.shared.load_acl()
+    }
+
     /// The password every connection has to send `AUTH` with.
     ///
     /// Taken here at startup so that the first connection after the port opens

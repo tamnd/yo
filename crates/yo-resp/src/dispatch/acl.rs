@@ -54,6 +54,8 @@
 //! decides whether it is out of memory, and a command with the wrong number of
 //! arguments is told that rather than told it is not allowed.
 
+use std::collections::VecDeque;
+use std::path::Path;
 use std::sync::Mutex;
 use std::sync::atomic::Ordering::{Acquire, Relaxed, Release};
 use std::sync::atomic::{AtomicBool, AtomicU64};
@@ -186,13 +188,19 @@ struct Selector {
 
 impl Selector {
     /// A selector that allows nothing, which is where every user starts.
-    fn new() -> Selector {
+    ///
+    /// Nothing except the channels, which start out either allowed or refused
+    /// depending on `open`, the server's `acl-pubsub-default`. That one setting
+    /// is the whole reason this takes an argument: it is read at the moment a
+    /// selector is made and never again, so a selector made before it changed
+    /// keeps what it was made with.
+    fn new(open: bool) -> Selector {
         Selector {
             allowed: [0; WORDS],
             all_commands: false,
             future: false,
             all_keys: false,
-            all_channels: false,
+            all_channels: open,
             rules: Vec::new(),
             firstargs: Vec::new(),
             deniedfirst: Vec::new(),
@@ -466,20 +474,24 @@ pub(crate) struct User {
 
 impl User {
     /// A new user, off, with no password and allowed nothing.
-    fn new(name: &[u8]) -> User {
+    ///
+    /// `open` is the server's `acl-pubsub-default` and goes to the root
+    /// selector, which is the only thing about a new user that a server setting
+    /// has any say in.
+    fn new(name: &[u8], open: bool) -> User {
         User {
             name: name.to_vec(),
             enabled: false,
             nopass: false,
             skip_sanitize: false,
             passwords: Vec::new(),
-            selectors: vec![Selector::new()],
+            selectors: vec![Selector::new(open)],
         }
     }
 
     /// The user a server with no `aclfile` starts with, which can do anything.
     fn default_user() -> User {
-        let mut user = User::new(DEFAULT);
+        let mut user = User::new(DEFAULT, false);
         user.enabled = true;
         user.nopass = true;
         let root = &mut user.selectors[0];
@@ -604,6 +616,13 @@ pub(crate) struct Users {
     /// true: the default user still has every permission, so no command can be
     /// refused once a connection is past the password.
     restricted: AtomicBool,
+    /// Whether a selector starts out allowed every channel.
+    ///
+    /// This is `acl-pubsub-default`, and it is here rather than with the other
+    /// settings because the only thing that reads it is the making of a
+    /// selector. It is false, meaning `resetchannels`, on a server nobody has
+    /// told otherwise, which has been the default since Redis 7.
+    open_channels: AtomicBool,
 }
 
 impl Default for Users {
@@ -613,6 +632,7 @@ impl Default for Users {
             generation: AtomicU64::new(1),
             guarded: AtomicBool::new(false),
             restricted: AtomicBool::new(false),
+            open_channels: AtomicBool::new(false),
         }
     }
 }
@@ -639,6 +659,16 @@ impl Users {
             self.generation.fetch_add(1, Release);
         }
         out
+    }
+
+    /// Whether a selector made from here on starts out allowed every channel.
+    pub(crate) fn open_channels(&self) -> bool {
+        self.open_channels.load(Relaxed)
+    }
+
+    /// Set `acl-pubsub-default`, which changes nothing that already exists.
+    pub(crate) fn set_open_channels(&self, open: bool) {
+        self.open_channels.store(open, Relaxed);
     }
 
     /// A copy of the user called `name`, if there is one.
@@ -747,7 +777,13 @@ impl Plain {
 ///
 /// Answers the same thing for a user that does not exist and a user whose
 /// password was wrong, on purpose: the difference between the two is a list of
-/// user names.
+/// user names. Both write the same line to the ACL log, naming the user that
+/// was asked for, which is where an operator goes to find out that somebody has
+/// been guessing.
+///
+/// `args` is the whole command, and the only thing read out of it is the name at
+/// the front, because that is what the log calls the object: a failed `AUTH` and
+/// a failed `HELLO ... AUTH` are otherwise the same row.
 ///
 /// The generation is read before the copy is taken rather than after. A write
 /// that lands in between then leaves the session stamped with a number that is
@@ -759,12 +795,16 @@ pub(super) fn authenticate(
     session: &mut Session,
     user: &[u8],
     password: &[u8],
+    args: Args<'_>,
+    out: &Out,
 ) -> bool {
     let stamp = server.acl.generation();
     let Some(found) = server.acl.get(user) else {
+        note_auth(server, session, out, args.get(0), user);
         return false;
     };
     if !found.admits(password) {
+        note_auth(server, session, out, args.get(0), user);
         return false;
     }
     session.become_user(stamp, found);
@@ -780,7 +820,7 @@ pub(super) fn authenticate(
 /// selector. That split is Redis's and it is why `ACL SETUSER u (on)` is a
 /// syntax error: `on` is a fact about the account and a selector is a set of
 /// permissions, so there is nowhere in a selector to put it.
-fn set_user(user: &mut User, rule: &[u8]) -> std::result::Result<(), Bad> {
+fn set_user(user: &mut User, rule: &[u8], open: bool) -> std::result::Result<(), Bad> {
     if rule.is_empty() {
         return Ok(());
     }
@@ -813,7 +853,7 @@ fn set_user(user: &mut User, rule: &[u8]) -> std::result::Result<(), Bad> {
             return Err(Bad::NoSuchPassword);
         }
     } else if rule[0] == b'(' && rule[rule.len() - 1] == b')' {
-        let mut selector = Selector::new();
+        let mut selector = Selector::new(open);
         for word in split(&rule[1..rule.len() - 1]) {
             set_selector(&mut selector, &word)?;
         }
@@ -824,7 +864,7 @@ fn set_user(user: &mut User, rule: &[u8]) -> std::result::Result<(), Bad> {
         user.selectors.truncate(1);
     } else if word(rule, b"reset") {
         let name = std::mem::take(&mut user.name);
-        *user = User::new(&name);
+        *user = User::new(&name, open);
     } else {
         return set_selector(&mut user.selectors[0], rule);
     }
@@ -1410,14 +1450,323 @@ pub(super) fn gate(
     session: &mut Session,
     spec: &'static Spec,
     args: Args<'_>,
+    out: &Out,
 ) -> Option<String> {
-    let user = current(server, session);
-    let why = permits(user, spec, args, 0).err()?;
-    // The code is in the line rather than in front of it, because the line goes
-    // two places: straight into the reply, and spliced into the `EXECABORT` an
-    // `EXEC` gets. The same reason `NOAUTH` is a whole line.
-    let said = refusal(why, &user.name, spec, args, 0, false);
-    Some(yo_alloc::allow(|| format!("NOPERM {said}")))
+    // The user is borrowed out of the session and the log wants the session
+    // back, so everything read off the user is copied out here and the borrow
+    // ends with the block. It costs one name and one sentence on a command that
+    // has just been refused, which is not a path anything is timed on.
+    let (why, said) = {
+        let user = current(server, session);
+        let why = permits(user, spec, args, 0).err()?;
+        // The code is in the line rather than in front of it, because the line
+        // goes two places: straight into the reply, and spliced into the
+        // `EXECABORT` an `EXEC` gets. The same reason `NOAUTH` is a whole line.
+        (why, refusal(why, &user.name, spec, args, 0, false))
+    };
+    yo_alloc::allow(|| {
+        let object = match why {
+            // The name a refusal spells, which is `acl|list` and not `acl`, and
+            // is the same string the sentence above names.
+            Denied::Command => container_name(spec, args, 0).into_bytes(),
+            Denied::Key(at) | Denied::Channel(at) => args.get(at).to_vec(),
+        };
+        let name = session.acl_name().to_vec();
+        server
+            .acl_log()
+            .note(server, session, out, why.reason(), object, name);
+        Some(format!("NOPERM {said}"))
+    })
+}
+
+// ----------------------------------------------------------------- the log
+
+/// How long two refusals can be apart and still be counted as the same one.
+///
+/// A minute, which is Redis's `ACL_LOG_GROUPING_MAX_TIME_DELTA`. The point of it
+/// is that a client stuck in a retry loop against a command it may not run fills
+/// the log with one entry and a count rather than with a hundred and twenty eight
+/// copies of itself, and the operator who comes to look still sees what else
+/// happened.
+const GROUPING_MS: u64 = 60_000;
+
+/// How far back a new refusal looks for one it matches.
+///
+/// Ten, which is Redis's `toscan`. It is a bound on the work rather than on the
+/// grouping: a refusal that would have matched the eleventh entry gets its own
+/// row instead, and the operator sees two rows where a longer scan would have
+/// shown one.
+const SCAN: usize = 10;
+
+/// Why something was refused, which is what `ACL LOG` reports as `reason`.
+///
+/// Redis has a fifth, `tls-cert`, for a client certificate that named a user the
+/// server has not got. There is no TLS here, so there is no way to reach it and
+/// no value for it, and the counter it feeds in `INFO stats` is reported as the
+/// nought it would always be.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Reason {
+    /// A command the user may not run.
+    Command,
+    /// A key the user may not reach.
+    Key,
+    /// A channel the user may not reach.
+    Channel,
+    /// A password that did not get in.
+    Auth,
+}
+
+impl Reason {
+    /// The word `ACL LOG` prints.
+    fn name(self) -> &'static str {
+        match self {
+            Reason::Command => "command",
+            Reason::Key => "key",
+            Reason::Channel => "channel",
+            Reason::Auth => "auth",
+        }
+    }
+}
+
+impl Denied {
+    /// The reason a refused command is logged under.
+    fn reason(self) -> Reason {
+        match self {
+            Denied::Command => Reason::Command,
+            Denied::Key(_) => Reason::Key,
+            Denied::Channel(_) => Reason::Channel,
+        }
+    }
+}
+
+/// Where the refused command came from, which is what `ACL LOG` reports as
+/// `context`.
+///
+/// Redis has a fourth, `module`, for a command a module ran on a user's behalf.
+/// Nothing here runs a command from a module, so there is no way to reach it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Context {
+    /// The client sent it.
+    Toplevel,
+    /// The client was queueing it into a transaction.
+    Multi,
+    /// A script called it.
+    Lua,
+}
+
+impl Context {
+    /// The word `ACL LOG` prints.
+    fn name(self) -> &'static str {
+        match self {
+            Context::Toplevel => "toplevel",
+            Context::Multi => "multi",
+            Context::Lua => "lua",
+        }
+    }
+
+    /// Where this connection's next refusal is coming from.
+    ///
+    /// A command being queued is `multi` and a command `EXEC` is replaying is
+    /// not, which is Redis's answer and falls out of where the gate sits: the
+    /// check happens as the command is queued, and the replay does not go
+    /// through it again.
+    fn of(session: &Session) -> Context {
+        if session.scripted {
+            Context::Lua
+        } else if session.in_multi() {
+            Context::Multi
+        } else {
+            Context::Toplevel
+        }
+    }
+}
+
+/// One refusal, which is one row of `ACL LOG`.
+#[derive(Debug)]
+struct Entry {
+    /// How many refusals have been folded into this row.
+    count: u64,
+    reason: Reason,
+    context: Context,
+    /// What was refused: the command's name, or the key or channel it named, or
+    /// the command the password was sent with.
+    object: Vec<u8>,
+    /// Who was refused, which for a failed `AUTH` is who they said they were.
+    username: Vec<u8>,
+    /// When the last refusal folded into this row happened.
+    ctime: u64,
+    /// The `CLIENT INFO` line of the connection that was refused.
+    cinfo: String,
+    /// Which refusal this was, counted over the life of the server.
+    entry_id: u64,
+    /// When the first refusal folded into this row happened.
+    created: u64,
+}
+
+/// The refusals, newest first, and the counters that go with them.
+///
+/// Its own lock rather than a corner of [`Users`], because the two are touched
+/// at opposite moments: the table is read on the command path and written by an
+/// operator, and this is written only when something has already gone wrong. A
+/// server whose users can do what they are asking for never takes this lock at
+/// all.
+#[derive(Debug)]
+pub(crate) struct Log {
+    /// Newest at the front, which is the order `ACL LOG` reports.
+    entries: Mutex<VecDeque<Entry>>,
+    /// How many rows have ever been opened, which is the next `entry-id`.
+    next_id: AtomicU64,
+    /// `acllog-max-len`, and nought means keep nothing.
+    max_len: AtomicU64,
+    /// The four counters `INFO stats` reports, in the order [`Reason`] declares
+    /// them.
+    denied: [AtomicU64; 4],
+}
+
+impl Default for Log {
+    fn default() -> Log {
+        Log {
+            entries: Mutex::new(VecDeque::new()),
+            next_id: AtomicU64::new(0),
+            // A hundred and twenty eight, which is the reference's default.
+            max_len: AtomicU64::new(128),
+            denied: Default::default(),
+        }
+    }
+}
+
+impl Log {
+    /// Write down a refusal.
+    ///
+    /// The counter moves whatever the length allows, which is Redis's order and
+    /// matters: an operator who turned the log off with `acllog-max-len 0` still
+    /// gets the numbers in `INFO stats` and only gives up the detail.
+    fn note(
+        &self,
+        server: &Server,
+        session: &Session,
+        out: &Out,
+        reason: Reason,
+        object: Vec<u8>,
+        username: Vec<u8>,
+    ) {
+        self.denied[reason as usize].fetch_add(1, Relaxed);
+        let max = self.max_len.load(Relaxed);
+        let mut held = self.entries.lock().unwrap_or_else(|e| e.into_inner());
+        if max == 0 {
+            held.clear();
+            return;
+        }
+        let context = Context::of(session);
+        let now = server.now_ms();
+        // The whole `CLIENT INFO` line of the connection, which is what makes
+        // the log worth reading: the row says a user was refused and this says
+        // which connection, from which address, running which library. Without
+        // the newline on the end, which `CLIENT INFO` puts there itself and this
+        // does not, so the two fields differ by that one byte on a real server
+        // too.
+        let mut cinfo = super::client::report(server, session, out.proto(), out.len());
+        if cinfo.ends_with('\n') {
+            cinfo.pop();
+        }
+        let matched = held.iter().take(SCAN).position(|e| {
+            e.reason == reason
+                && e.context == context
+                && e.object == object
+                && e.username == username
+                && now.abs_diff(e.ctime) <= GROUPING_MS
+        });
+        if let Some(at) = matched {
+            // Moved to the front as well as bumped, so the log is in order of
+            // when something last happened rather than of when it first did.
+            let mut entry = held.remove(at).expect("the position came from the deque");
+            entry.cinfo = cinfo;
+            entry.ctime = now;
+            entry.count += 1;
+            held.push_front(entry);
+            return;
+        }
+        held.push_front(Entry {
+            count: 1,
+            reason,
+            context,
+            object,
+            username,
+            ctime: now,
+            cinfo,
+            entry_id: self.next_id.fetch_add(1, Relaxed),
+            created: now,
+        });
+        while held.len() as u64 > max {
+            held.pop_back();
+        }
+    }
+
+    /// `ACL LOG RESET`.
+    ///
+    /// The ids do not go back to nought, which is Redis's behaviour and is the
+    /// useful one: a tool that remembers the last id it read must not be shown
+    /// that id again attached to a different refusal.
+    fn clear(&self) {
+        self.entries
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+    }
+
+    /// The five numbers `INFO stats` reports, in the order it reports them.
+    pub(crate) fn counters(&self) -> [u64; 5] {
+        [
+            self.denied[Reason::Auth as usize].load(Relaxed),
+            self.denied[Reason::Command as usize].load(Relaxed),
+            self.denied[Reason::Key as usize].load(Relaxed),
+            self.denied[Reason::Channel as usize].load(Relaxed),
+            // `acl_access_denied_tls_cert`, which cannot move without TLS.
+            0,
+        ]
+    }
+
+    /// `acllog-max-len`.
+    pub(crate) fn max_len(&self) -> u64 {
+        self.max_len.load(Relaxed)
+    }
+
+    /// `CONFIG SET acllog-max-len`.
+    ///
+    /// Nothing is trimmed here, which is the reference's behaviour: lowering the
+    /// number decides how long the log is allowed to be after the next refusal,
+    /// and until then `ACL LOG` still reports what is already in it.
+    pub(crate) fn set_max_len(&self, n: u64) {
+        self.max_len.store(n, Relaxed);
+    }
+}
+
+impl Server {
+    /// The refusals, for the gate and for `ACL LOG`.
+    pub(crate) fn acl_log(&self) -> &Log {
+        &self.acllog
+    }
+}
+
+/// Write down a password that did not get in.
+///
+/// Its own function rather than a branch in [`authenticate`], because the two
+/// things it needs that the rest of that path does not are the command the
+/// password arrived with and the buffer the reply is going into.
+fn note_auth(server: &Server, session: &Session, out: &Out, said: &[u8], user: &[u8]) {
+    yo_alloc::allow(|| {
+        server.acl_log().note(
+            server,
+            session,
+            out,
+            Reason::Auth,
+            // The command as the client spelled it, which is `AUTH` or `HELLO`
+            // in whatever case it was typed. That is what Redis logs, and it is
+            // the only way to tell the two apart in the log afterwards.
+            said.to_vec(),
+            user.to_vec(),
+        );
+    });
 }
 
 // ------------------------------------------------------------- the command
@@ -1430,11 +1779,7 @@ pub(super) fn gate(
 /// subcommand: the second one passes its own arity check and then falls off the
 /// end of the parse. There is no subcommand table here yet, so the arities live
 /// in this list and the same two sentences come out. It folds into D-114.
-///
-/// `LOAD`, `SAVE` and `LOG` are not here because they are not here at all yet,
-/// and a row for one of them would mean answering a precise arity error for a
-/// subcommand that is about to be called unknown.
-const ARITIES: [(&[u8], i32); 9] = [
+const ARITIES: [(&[u8], i32); 12] = [
     (b"cat", -2),
     (b"deluser", -3),
     (b"dryrun", -4),
@@ -1442,6 +1787,9 @@ const ARITIES: [(&[u8], i32); 9] = [
     (b"getuser", 3),
     (b"help", 2),
     (b"list", 2),
+    (b"load", 2),
+    (b"log", -2),
+    (b"save", 2),
     (b"setuser", -3),
     (b"users", 2),
     // `whoami` is not here because its arity is exactly two, which is the same
@@ -1475,6 +1823,20 @@ pub(super) fn execute(
             return Err(args::wrong_arity_sub("acl", "whoami"));
         }
         out.bulk(session.acl_name());
+    } else if (is(sub, b"load") || is(sub, b"save")) && server.aclfile().is_none() {
+        // In front of both bodies and in front of everything either of them
+        // would check, which is where the reference puts it: a server with no
+        // ACL file says so and says nothing about what was asked of it.
+        return Err(Error::new(
+            Code::Invalid,
+            "This Redis instance is not configured to use an ACL file. You may want to specify users via the ACL SETUSER command and then issue a CONFIG REWRITE (assuming you have a Redis configuration file set) in order to store users in the Redis configuration.",
+        ));
+    } else if is(sub, b"load") {
+        return yo_alloc::allow(|| load(server, out));
+    } else if is(sub, b"save") {
+        return yo_alloc::allow(|| save(server, out));
+    } else if is(sub, b"log") {
+        return yo_alloc::allow(|| log(server, args, out));
     } else if is(sub, b"cat") {
         cat(args, out)?;
     } else if is(sub, b"list") {
@@ -1620,14 +1982,15 @@ fn setuser(server: &Server, args: Args<'_>, out: &mut Out) -> Result<()> {
         ));
     }
     let rules = merge(args, 3)?;
+    let open = server.users().open_channels();
     let outcome = server.users().with(|table| {
         let at = table.binary_search_by(|u| u.name.as_slice().cmp(name));
         let mut staged = match at {
             Ok(at) => table[at].clone(),
-            Err(_) => User::new(name),
+            Err(_) => User::new(name, open),
         };
         for rule in &rules {
-            if let Err(why) = set_user(&mut staged, rule) {
+            if let Err(why) = set_user(&mut staged, rule, open) {
                 return (false, Err((rule.clone(), why)));
             }
         }
@@ -1662,10 +2025,28 @@ fn setuser(server: &Server, args: Args<'_>, out: &mut Out) -> Result<()> {
 /// error reported in its own sentence rather than as a modifier error, because
 /// there is no single modifier to blame.
 fn merge(args: Args<'_>, from: usize) -> Result<Vec<Vec<u8>>> {
-    let mut out: Vec<Vec<u8>> = Vec::with_capacity(args.len() - from);
+    let words = (from..args.len()).map(|i| args.get(i));
+    glue(words).map_err(|at| {
+        Error::fmt(
+            Code::Invalid,
+            format_args!(
+                "Unmatched parenthesis in acl selector starting at '{}'.",
+                String::from_utf8_lossy(args.get(from + at))
+            ),
+        )
+    })
+}
+
+/// The half of [`merge`] the ACL file wants too, which is everything but the
+/// sentence.
+///
+/// The error is which word opened the bracket that was never closed, because the
+/// two callers name it differently: the command quotes the word and the file
+/// gives the line it was on.
+fn glue<'a>(words: impl Iterator<Item = &'a [u8]>) -> std::result::Result<Vec<Vec<u8>>, usize> {
+    let mut out: Vec<Vec<u8>> = Vec::new();
     let mut open: Option<usize> = None;
-    for i in from..args.len() {
-        let word = args.get(i);
+    for (i, word) in words.enumerate() {
         if open.is_none() && word.first() == Some(&b'(') && word.last() != Some(&b')') {
             open = Some(i);
             out.push(word.to_vec());
@@ -1682,16 +2063,10 @@ fn merge(args: Args<'_>, from: usize) -> Result<Vec<Vec<u8>>> {
         }
         out.push(word.to_vec());
     }
-    if let Some(at) = open {
-        return Err(Error::fmt(
-            Code::Invalid,
-            format_args!(
-                "Unmatched parenthesis in acl selector starting at '{}'.",
-                String::from_utf8_lossy(args.get(at))
-            ),
-        ));
+    match open {
+        Some(at) => Err(at),
+        None => Ok(out),
     }
-    Ok(out)
 }
 
 /// `ACL DELUSER <username> [<username> ...]`.
@@ -1790,13 +2165,288 @@ fn dryrun(server: &Server, args: Args<'_>, out: &mut Out) -> Result<()> {
     Ok(())
 }
 
-/// What `ACL HELP` says.
+/// `ACL LOG [<count> | RESET]`.
+fn log(server: &Server, args: Args<'_>, out: &mut Out) -> Result<()> {
+    // Two arguments or three and nothing else, and a fourth is an unknown
+    // subcommand rather than a wrong count. That reads like a mistake and is
+    // not: a real server checks `acl|log`'s own arity first, which is a minimum
+    // of two and lets `ACL LOG 1 2` through, and then falls off the end of a
+    // parse that only knows two shapes.
+    if args.len() > 3 {
+        return Err(args::subcommand_syntax(args.get(1), "ACL"));
+    }
+    if args.len() == 3 && is(args.get(2), b"reset") {
+        server.acl_log().clear();
+        out.ok();
+        return Ok(());
+    }
+    // Ten by default, and a negative count is nought rather than an error, which
+    // is what makes `ACL LOG -1` an empty array.
+    let wanted = if args.len() == 3 {
+        args.int(2)?.max(0)
+    } else {
+        10
+    };
+    let now = server.now_ms();
+    let held = server
+        .acl_log()
+        .entries
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let count = (wanted as u64).min(held.len() as u64) as usize;
+    out.array(count);
+    for entry in held.iter().take(count) {
+        out.map(10);
+        out.bulk(b"count");
+        out.int(entry.count as i64);
+        out.bulk(b"reason");
+        out.bulk(entry.reason.name().as_bytes());
+        out.bulk(b"context");
+        out.bulk(entry.context.name().as_bytes());
+        out.bulk(b"object");
+        out.bulk(&entry.object);
+        out.bulk(b"username");
+        out.bulk(&entry.username);
+        out.bulk(b"age-seconds");
+        // Seconds with the milliseconds after the point, which is the one field
+        // here that is a double, and it is the age now rather than the age when
+        // the refusal happened.
+        out.double(now.saturating_sub(entry.ctime) as f64 / 1000.0);
+        out.bulk(b"client-info");
+        out.bulk(entry.cinfo.as_bytes());
+        out.bulk(b"entry-id");
+        out.int(entry.entry_id as i64);
+        out.bulk(b"timestamp-created");
+        out.int(entry.created as i64);
+        out.bulk(b"timestamp-last-updated");
+        out.int(entry.ctime as i64);
+    }
+    Ok(())
+}
+
+/// `ACL SAVE`, which writes the users out in the format the file is read in.
 ///
-/// The subcommands that are here, which is all of Redis's but `LOAD`, `SAVE` and
-/// `LOG`. Those three want an ACL file and a log of refusals, which is the next
-/// change rather than this one, and a client reading this to find out what it
-/// can send should not be told about them by a server that would answer them
-/// with an unknown subcommand.
+/// A temporary file beside the real one, then fsync, then rename, then fsync of
+/// the directory. That is Redis's sequence and it is the only sequence that
+/// leaves a reader with either the whole old file or the whole new one: a write
+/// straight over the real file would leave a half written ACL on a server that
+/// lost power, and a server that came back up refusing to let anybody in is a
+/// worse outcome than one that came back up with yesterday's users.
+fn save(server: &Server, out: &mut Out) -> Result<()> {
+    let Some(path) = server.aclfile() else {
+        return Ok(());
+    };
+    let mut text = Vec::with_capacity(256);
+    server.users().with(|table| {
+        for user in table.iter() {
+            text.extend_from_slice(b"user ");
+            text.extend_from_slice(&user.describe());
+            text.push(b'\n');
+        }
+        (false, ())
+    });
+    if write_file(path, &text).is_err() {
+        // The reason is in the server log on a real server and there is nowhere
+        // to put it here, so the client gets the sentence and nothing else,
+        // which is also what a real server gives it.
+        return Err(Error::new(
+            Code::Invalid,
+            "There was an error trying to save the ACLs. Please check the server logs for more information",
+        ));
+    }
+    out.ok();
+    Ok(())
+}
+
+/// The write, the rename and the two syncs.
+fn write_file(path: &Path, text: &[u8]) -> std::io::Result<()> {
+    use std::io::Write as _;
+
+    let temp = path.with_file_name(format!(
+        "{}.tmp-{}-{}",
+        path.file_name().unwrap_or_default().to_string_lossy(),
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_millis())
+    ));
+    let outcome = (|| {
+        let mut file = std::fs::File::create(&temp)?;
+        file.write_all(text)?;
+        file.sync_all()?;
+        drop(file);
+        std::fs::rename(&temp, path)
+    })();
+    if outcome.is_err() {
+        let _ = std::fs::remove_file(&temp);
+        return outcome;
+    }
+    // The directory, so that the rename itself is on disk and not only the
+    // bytes the rename pointed at. Best effort, because opening a directory as a
+    // file is a Unix thing and Windows answers an error rather than a handle,
+    // and a failure here means the file is written and the entry naming it may
+    // not have reached the platter yet.
+    if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty())
+        && let Ok(handle) = std::fs::File::open(dir)
+    {
+        let _ = handle.sync_all();
+    }
+    Ok(())
+}
+
+/// `ACL LOAD`, which replaces every user with what the file says.
+fn load(server: &Server, out: &mut Out) -> Result<()> {
+    let Some(path) = server.aclfile() else {
+        return Ok(());
+    };
+    match load_file(server, path) {
+        Ok(()) => {
+            out.ok();
+            Ok(())
+        }
+        Err(errors) => Err(Error::fmt(Code::Invalid, format_args!("{errors}"))),
+    }
+}
+
+/// Read `path` and, if every line of it is good, make it the server's users.
+///
+/// The whole file or none of it. The users are built in a table of their own and
+/// only swapped in once the last line has parsed, which is the reference's
+/// design and is the only sane one: a file with a typo halfway down would
+/// otherwise leave a server holding half of the new ACL and half of the old one,
+/// and nobody could say which half.
+///
+/// # Errors
+///
+/// Every complaint the file raised, joined into one sentence, which is what the
+/// client gets and what a server that cannot start prints.
+pub(crate) fn load_file(server: &Server, path: &Path) -> std::result::Result<(), String> {
+    let name = path.display().to_string();
+    let text = match std::fs::read(path) {
+        Ok(text) => text,
+        Err(e) => {
+            return Err(format!(
+                "Error loading ACLs, opening file '{name}': {}",
+                because(&e)
+            ));
+        }
+    };
+    let mut errors = String::new();
+    let mut staged: Vec<User> = Vec::new();
+    let open = server.users().open_channels();
+    for (at, raw) in text.split(|b| *b == b'\n').enumerate() {
+        let line = trim(raw);
+        // Blank lines and comments, which is what lets a file be commented.
+        if line.is_empty() || line[0] == b'#' {
+            continue;
+        }
+        let linenum = at + 1;
+        let words: Vec<&[u8]> = line.split(|b| *b == b' ').collect();
+        if words[0] != b"user" || words.len() < 2 {
+            errors.push_str(&format!(
+                "{name}:{linenum} should start with user keyword followed by the username. "
+            ));
+            continue;
+        }
+        // A username with a space in it could not be read back, since this is
+        // where the reading happens and it splits on spaces. A tab or a null is
+        // refused for the same reason a space is: the file is the only place a
+        // user is written down and a name that cannot be written down is a user
+        // that cannot be got at again.
+        let who = words[1];
+        if who.iter().any(|b| b.is_ascii_whitespace() || *b == 0) {
+            errors.push_str(&format!(
+                "'{name}:{linenum}: username '{}' contains invalid characters. ",
+                String::from_utf8_lossy(who)
+            ));
+            continue;
+        }
+        if staged.iter().any(|u| u.name == who) {
+            errors.push_str(&format!(
+                "WARNING: Duplicate user '{}' found on line {linenum}. ",
+                String::from_utf8_lossy(who)
+            ));
+            continue;
+        }
+        let Ok(rules) = glue(words[2..].iter().copied()) else {
+            errors.push_str(&format!(
+                "{name}:{linenum}: Unmatched parenthesis in selector definition."
+            ));
+            continue;
+        };
+        let mut user = User::new(who, open);
+        let mut said = false;
+        for rule in &rules {
+            let Err(why) = set_user(&mut user, trim(rule), open) else {
+                continue;
+            };
+            if why == Bad::Unknown {
+                // A name nobody has heard of is quoted back, because a command
+                // name is not a secret and an operator staring at a file wants
+                // to know which word was wrong. Every other complaint is about
+                // the shape of a rule that may hold a password hash.
+                errors.push_str(&format!(
+                    "{name}:{linenum}: Error in applying operation '{}': {}. ",
+                    String::from_utf8_lossy(rule),
+                    why.text()
+                ));
+            } else if !said {
+                // Only the first of the others, because a rule that failed may
+                // have been what the rules after it were written against, and
+                // eight complaints about one mistake is worse than one.
+                errors.push_str(&format!("{name}:{linenum}: {}. ", why.text()));
+                said = true;
+            }
+        }
+        staged.push(user);
+    }
+    if !errors.is_empty() {
+        errors.push_str(
+            "WARNING: ACL errors detected, no change to the previously active ACL rules was performed",
+        );
+        return Err(errors);
+    }
+    staged.sort_by(|a, b| a.name.cmp(&b.name));
+    server.users().with(|table| {
+        *table = staged;
+        // A file with no default user in it still leaves the server with one,
+        // because there has to be a user for a connection that has not
+        // authenticated to be. The reference gets there by a different route,
+        // making a fresh default and copying it over the old one, and lands on
+        // the same user.
+        if let Err(at) = table.binary_search_by(|u| u.name.as_slice().cmp(DEFAULT)) {
+            table.insert(at, User::default_user());
+        }
+        (true, ())
+    });
+    Ok(())
+}
+
+/// What went wrong with a file, in the words the C library would have used.
+///
+/// Rust writes `No such file or directory (os error 2)` where C's `strerror`
+/// writes `No such file or directory`, and the sentence this ends up in is one
+/// a client may be matching on, so the number Rust adds comes back off.
+fn because(e: &std::io::Error) -> String {
+    let said = e.to_string();
+    match said.find(" (os error ") {
+        Some(at) => said[..at].to_string(),
+        None => said,
+    }
+}
+
+/// A line with the blanks taken off both ends.
+///
+/// The same four characters the reference trims, which is why a file written on
+/// Windows loads: the carriage return at the end of every line is one of them.
+fn trim(line: &[u8]) -> &[u8] {
+    let blank = |b: &u8| matches!(b, b' ' | b'\t' | b'\r' | b'\n');
+    let from = line.iter().position(|b| !blank(b)).unwrap_or(line.len());
+    let to = line.iter().rposition(|b| !blank(b)).map_or(from, |i| i + 1);
+    &line[from..to]
+}
+
+/// What `ACL HELP` says.
 const HELP: &[&str] = &[
     "ACL <subcommand> [<arg> [value] [opt] ...]. Subcommands are:",
     "CAT [<category>]",
@@ -1813,6 +2463,12 @@ const HELP: &[&str] = &[
     "    be used to specify a different size.",
     "LIST",
     "    Show users details in config file format.",
+    "LOAD",
+    "    Reload users from the ACL file.",
+    "LOG [<count> | RESET]",
+    "    Show the ACL log entries.",
+    "SAVE",
+    "    Save the current config to the ACL file.",
     "SETUSER <username> <attribute> [<attribute> ...]",
     "    Create or modify a user with the specified attributes.",
     "USERS",
@@ -1831,9 +2487,9 @@ mod tests {
 
     /// A user built by applying rules in order, or the first rule that failed.
     fn built(rules: &[&str]) -> std::result::Result<User, Bad> {
-        let mut user = User::new(b"u");
+        let mut user = User::new(b"u", false);
         for rule in rules {
-            set_user(&mut user, rule.as_bytes())?;
+            set_user(&mut user, rule.as_bytes(), false)?;
         }
         Ok(user)
     }
@@ -1946,5 +2602,39 @@ mod tests {
         // not. A client that wants to know reads the keys field.
         let user = built(&["on", "~*", "&*", "+@all"]).expect("good rules");
         assert_eq!(user.flags(), ["on", "sanitize-payload"]);
+    }
+
+    #[test]
+    fn a_line_of_the_file_loses_the_blanks_on_both_ends() {
+        assert_eq!(trim(b"  user alice  "), b"user alice");
+        assert_eq!(trim(b"user alice\r"), b"user alice");
+        assert_eq!(trim(b"\t\r\n "), b"");
+        assert_eq!(trim(b""), b"");
+        // Only the ends, because a rule is separated from the next one by a
+        // single space and taking the inner ones out would join two rules.
+        assert_eq!(trim(b" a  b "), b"a  b");
+    }
+
+    #[test]
+    fn the_reason_a_file_would_not_open_reads_the_way_c_writes_it() {
+        let missing = std::io::Error::from_raw_os_error(2);
+        assert_eq!(because(&missing), "No such file or directory");
+        // Anything with no errno behind it is left alone, since there is no
+        // number on the end of it to take off.
+        let made_up = std::io::Error::other("something else");
+        assert_eq!(because(&made_up), "something else");
+    }
+
+    #[test]
+    fn a_new_selector_starts_where_acl_pubsub_default_says() {
+        let mut open = User::new(b"u", true);
+        set_user(&mut open, b"on", true).expect("a good rule");
+        assert!(String::from_utf8_lossy(&open.describe()).contains("&*"));
+        // And a reset goes back to the same place rather than to the built in
+        // one, which is what makes the setting worth having.
+        set_user(&mut open, b"reset", true).expect("a good rule");
+        assert!(String::from_utf8_lossy(&open.describe()).contains("&*"));
+        let shut = User::new(b"u", false);
+        assert!(String::from_utf8_lossy(&shut.describe()).contains("resetchannels"));
     }
 }

@@ -187,6 +187,33 @@ const REQUIREPASS: &str = "requirepass";
 /// is exactly the thing this is for and setting it afterwards has to work.
 const SEALED_TTL: &str = "backup-sealed-ttl";
 
+/// The file the users are read from and written back to, empty when there is
+/// none.
+///
+/// Immutable, which is Redis's rule for it and is the right one: an operator who
+/// could point a running server at a different ACL file would have a way of
+/// changing who may reach it that is invisible to everything watching the file
+/// it was started with.
+const ACLFILE: &str = "aclfile";
+
+/// How many refusals `ACL LOG` keeps, and nought keeps none.
+///
+/// Writable, because the reason to change it is that something is happening
+/// right now and the log is either too short to see it or long enough to be in
+/// the way.
+const ACLLOG_MAX_LEN: &str = "acllog-max-len";
+
+/// Whether a new selector starts out allowed every channel.
+///
+/// Writable, and writing it changes nothing that already exists: it is read at
+/// the moment a selector is made and never looked at again. Redis 6 behaved as
+/// `allchannels` and Redis 7 changed the default to `resetchannels`, which is
+/// what this setting is for, and yo starts where Redis 7 did.
+const ACL_PUBSUB_DEFAULT: &str = "acl-pubsub-default";
+
+/// The two words `acl-pubsub-default` is allowed to be, in Redis's order.
+const CHANNEL_DEFAULTS: [&str; 2] = ["allchannels", "resetchannels"];
+
 /// Which classes of keyspace change are published, and on which two channels.
 ///
 /// On its own for a fifth reason: it is the only setting whose value is neither
@@ -582,7 +609,8 @@ fn hello(server: &Server, session: &mut Session, args: Args<'_>, out: &mut Out) 
         while i < args.len() {
             let o = args.get(i);
             if is(o, b"AUTH") && i + 2 < args.len() {
-                if !acl::authenticate(server, session, args.get(i + 1), args.get(i + 2)) {
+                if !acl::authenticate(server, session, args.get(i + 1), args.get(i + 2), args, out)
+                {
                     out.error(b"WRONGPASS invalid username-password pair or user is disabled.");
                     return Ok(());
                 }
@@ -1035,6 +1063,9 @@ fn config(server: &Server, args: Args<'_>, out: &mut Out) -> Result<()> {
         let pass = wanted(REQUIREPASS);
         let ttl = wanted(SEALED_TTL);
         let events = wanted(NOTIFY);
+        let acls = wanted(ACLFILE);
+        let logged = wanted(ACLLOG_MAX_LEN);
+        let channels = wanted(ACL_PUBSUB_DEFAULT);
         out.map(
             fixed.clone().count()
                 + ladder.clone().count()
@@ -1045,7 +1076,10 @@ fn config(server: &Server, args: Args<'_>, out: &mut Out) -> Result<()> {
                 + usize::from(file)
                 + usize::from(pass)
                 + usize::from(ttl)
-                + usize::from(events),
+                + usize::from(events)
+                + usize::from(acls)
+                + usize::from(logged)
+                + usize::from(channels),
         );
         for (k, v) in fixed {
             out.bulk(k.as_bytes());
@@ -1103,6 +1137,29 @@ fn config(server: &Server, args: Args<'_>, out: &mut Out) -> Result<()> {
             let (buf, len) = notify::format(server.notify_flags());
             out.bulk(&buf[..len]);
         }
+        if acls {
+            // Exactly what the server was started with, which for nearly every
+            // server is nothing at all. Not resolved to an absolute path the way
+            // `dir` is, because a real server answers what it was given here.
+            out.bulk(ACLFILE.as_bytes());
+            yo_alloc::allow(|| {
+                out.bulk(
+                    server
+                        .aclfile()
+                        .map(|p| p.to_string_lossy())
+                        .unwrap_or_default()
+                        .as_bytes(),
+                );
+            });
+        }
+        if logged {
+            out.bulk(ACLLOG_MAX_LEN.as_bytes());
+            out.bulk_int(server.acl_log().max_len() as i64);
+        }
+        if channels {
+            out.bulk(ACL_PUBSUB_DEFAULT.as_bytes());
+            out.bulk(CHANNEL_DEFAULTS[usize::from(!server.users().open_channels())].as_bytes());
+        }
     } else if is(sub, b"SET") {
         // Too few is a wrong number of arguments and an odd number is a syntax
         // error, which is not the same sentence and is not the same rule. A
@@ -1127,6 +1184,8 @@ fn config(server: &Server, args: Args<'_>, out: &mut Out) -> Result<()> {
         let mut ttl = None;
         let mut events = None;
         let mut password = None;
+        let mut logged = None;
+        let mut channels = None;
         let mut i = 2;
         while i < args.len() {
             let (name, value) = (args.get(i), args.get(i + 1));
@@ -1165,8 +1224,9 @@ fn config(server: &Server, args: Args<'_>, out: &mut Out) -> Result<()> {
             }
             if is(name, MAXMEMORY_POLICY.as_bytes()) {
                 // Named twice in one command, the last one wins, which is the
-                // same rule the ladder settings follow and is what a real server
-                // does with any setting repeated in a single `CONFIG SET`.
+                // same rule the ladder settings follow here and is not what a
+                // real server does with a setting repeated in a single `CONFIG
+                // SET`. It refuses the command instead, which is D-138.
                 let Some(p) = Policy::parse(value) else {
                     return Err(Error::fmt(
                         Code::Invalid,
@@ -1193,6 +1253,42 @@ fn config(server: &Server, args: Args<'_>, out: &mut Out) -> Result<()> {
                         "CONFIG SET failed (possibly related to argument '{protected}') - can't set protected config"
                     ),
                 ));
+            }
+            // Refused whatever the value is, including the one it is already
+            // set to, which is how a real server answers every immutable
+            // config: the check is on the name and never reaches the value.
+            // The names in `SETTINGS` take the value that changes nothing,
+            // which is a difference and is registered as one.
+            if is(name, ACLFILE.as_bytes()) {
+                return Err(Error::fmt(
+                    Code::Unsupported,
+                    format_args!(
+                        "CONFIG SET failed (possibly related to argument '{ACLFILE}') - can't set immutable config"
+                    ),
+                ));
+            }
+            if is(name, ACLLOG_MAX_LEN.as_bytes()) {
+                let Some(n) = parse_i64(value).filter(|&n| n >= 0) else {
+                    return Err(bad_setting(ACLLOG_MAX_LEN, parse_i64(value).is_some()));
+                };
+                logged = Some(n as u64);
+                continue;
+            }
+            if is(name, ACL_PUBSUB_DEFAULT.as_bytes()) {
+                let Some(at) = CHANNEL_DEFAULTS
+                    .iter()
+                    .position(|w| is(value, w.as_bytes()))
+                else {
+                    return Err(Error::fmt(
+                        Code::Invalid,
+                        format_args!(
+                            "CONFIG SET failed (possibly related to argument '{ACL_PUBSUB_DEFAULT}') - argument(s) must be one of the following: {}, {}",
+                            CHANNEL_DEFAULTS[0], CHANNEL_DEFAULTS[1]
+                        ),
+                    ));
+                };
+                channels = Some(at == 0);
+                continue;
             }
             if is(name, REQUIREPASS.as_bytes()) {
                 // Anything at all is a password, including an empty one, which
@@ -1292,6 +1388,12 @@ fn config(server: &Server, args: Args<'_>, out: &mut Out) -> Result<()> {
         }
         if let Some(flags) = events {
             server.set_notify_flags(flags);
+        }
+        if let Some(n) = logged {
+            server.acl_log().set_max_len(n);
+        }
+        if let Some(open) = channels {
+            server.users().set_open_channels(open);
         }
         if let Some(value) = password {
             // The connections that are already open are left where they are,
@@ -1441,6 +1543,10 @@ fn info(server: &Server, args: Args<'_>, out: &mut Out) {
             let cold = server.cold_stats();
             let totals = server.totals();
             let subs = server.pubsub_counts();
+            // The five ACL counters last, which is where a real server puts them
+            // too: they are appended after the rest of the section rather than
+            // written with it.
+            let denied = server.acl_log().counters();
             let _ = write!(
                 s,
                 "# Stats\r\ntotal_connections_received:{}\r\n\
@@ -1450,7 +1556,10 @@ fn info(server: &Server, args: Args<'_>, out: &mut Out) {
                  yo_cold_demoted:{}\r\nyo_cold_promoted:{}\r\n\
                  yo_cold_faults:{}\r\nyo_cold_served:{}\r\nyo_cold_bytes_out:{}\r\n\
                  yo_cold_bytes_in:{}\r\npubsub_channels:{}\r\n\
-                 pubsub_patterns:{}\r\npubsubshard_channels:{}\r\n\r\n",
+                 pubsub_patterns:{}\r\npubsubshard_channels:{}\r\n\
+                 acl_access_denied_auth:{}\r\nacl_access_denied_cmd:{}\r\n\
+                 acl_access_denied_key:{}\r\nacl_access_denied_channel:{}\r\n\
+                 acl_access_denied_tls_cert:{}\r\n\r\n",
                 totals.connections,
                 totals.commands,
                 server.expired_fields(),
@@ -1468,6 +1577,11 @@ fn info(server: &Server, args: Args<'_>, out: &mut Out) {
                 subs.channels,
                 subs.patterns,
                 subs.shard,
+                denied[0],
+                denied[1],
+                denied[2],
+                denied[3],
+                denied[4],
             );
         }
         if want("cpu") {

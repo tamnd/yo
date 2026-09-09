@@ -601,7 +601,7 @@ fn line(row: &Client, now_ms: u64, obl: u64, resp: u32, into: &mut String) {
 }
 
 /// The whole report for one connection, as its own string.
-fn report(server: &Server, session: &Session, proto: Proto, mark: usize) -> String {
+pub(super) fn report(server: &Server, session: &Session, proto: Proto, mark: usize) -> String {
     yo_alloc::allow(|| {
         let mut s = String::with_capacity(512);
         line(
