@@ -77,6 +77,7 @@ pub mod keyspec;
 mod lists;
 mod load;
 mod lua;
+mod memory;
 mod migrate;
 mod misses;
 mod monitor;
@@ -644,6 +645,18 @@ pub struct Server {
     /// mid write gets one of the two readings and both of them were true a
     /// moment ago, which is all this number ever claims to be.
     used: AtomicUsize,
+    /// What the server was holding before a client had written anything.
+    ///
+    /// `MEMORY STATS` reports it as `startup.allocated` and subtracts it from
+    /// the total to work out what a key costs on average, which only means
+    /// something if the baseline is a real reading rather than a guess. So it is
+    /// taken once, at the end of building the server, and never again.
+    startup: AtomicUsize,
+    /// The largest total anything has ever seen here.
+    ///
+    /// See [`Server::peak_bytes`] for what "ever seen" means, which is not the
+    /// same as the largest total there ever was.
+    peak: AtomicUsize,
     /// Which database the next eviction draws from.
     ///
     /// Its own cursor and not [`Server::next_db`], because eviction and
@@ -893,7 +906,7 @@ impl Server {
     #[must_use]
     pub fn new() -> Server {
         let clock = Clock::system();
-        Server {
+        let server = Server {
             dbs: (0..DATABASES)
                 .map(|_| Db::with_clock(clock.clone(), 1))
                 .collect(),
@@ -906,6 +919,8 @@ impl Server {
             store: Lock::new(None),
             maxstore: AtomicU64::new(NO_MAXSTORE),
             used: AtomicUsize::new(0),
+            startup: AtomicUsize::new(0),
+            peak: AtomicUsize::new(0),
             evict_db: AtomicUsize::new(0),
             expire_db: AtomicUsize::new(0),
             expire_ms: AtomicU64::new(0),
@@ -939,7 +954,9 @@ impl Server {
             plain: acl::Plain::default(),
             debug: debug::Knobs::default(),
             mail: pubsub::boxes(1),
-        }
+        };
+        server.note_startup();
+        server
     }
 
     /// A server whose databases are cut into `width` stripes each.
@@ -963,13 +980,17 @@ impl Server {
             .map(|_| Db::with_clock(clock.clone(), width))
             .collect();
         server.width = server.dbs[0].width();
+        // Again, because the databases the first reading was taken of have just
+        // been thrown away and replaced with wider ones, and a wider database
+        // is a bigger baseline.
+        server.note_startup();
         server
     }
 
     /// A server on a clock the caller moves by hand, for tests.
     #[must_use]
     pub fn with_clock(clock: Clock) -> Server {
-        Server {
+        let server = Server {
             dbs: (0..DATABASES)
                 .map(|_| Db::with_clock(clock.clone(), 1))
                 .collect(),
@@ -982,6 +1003,8 @@ impl Server {
             store: Lock::new(None),
             maxstore: AtomicU64::new(NO_MAXSTORE),
             used: AtomicUsize::new(0),
+            startup: AtomicUsize::new(0),
+            peak: AtomicUsize::new(0),
             evict_db: AtomicUsize::new(0),
             expire_db: AtomicUsize::new(0),
             expire_ms: AtomicU64::new(0),
@@ -1015,7 +1038,9 @@ impl Server {
             plain: acl::Plain::default(),
             debug: debug::Knobs::default(),
             mail: pubsub::boxes(1),
-        }
+        };
+        server.note_startup();
+        server
     }
 
     /// One database, by index.
@@ -1225,6 +1250,36 @@ impl Server {
     #[must_use]
     pub fn memory_bytes(&self) -> usize {
         self.keyspaces().map(|db| db.memory_bytes()).sum::<usize>() + self.conn_bytes()
+    }
+
+    /// What the server was holding before any client had written to it.
+    ///
+    /// `MEMORY STATS` reports this as `startup.allocated`.
+    #[must_use]
+    pub fn startup_bytes(&self) -> usize {
+        self.startup.load(Relaxed)
+    }
+
+    /// The largest total anything here has ever seen, this reading included.
+    ///
+    /// Peak memory is a sampled number on a real server too: `serverCron` takes
+    /// a reading every hundred milliseconds and keeps the largest one. This is
+    /// sampled as well, at the points where the total is already being worked
+    /// out, which is once a batch on a server with a `maxmemory` and once a call
+    /// on one without. So on a server with no limit that nobody is watching, the
+    /// peak is the highest of the readings something asked for, which is the
+    /// most a server that never takes a reading can honestly claim.
+    #[must_use]
+    pub fn peak_bytes(&self) -> usize {
+        let now = self.memory_bytes();
+        self.peak.fetch_max(now, Relaxed).max(now)
+    }
+
+    /// Take the reading both of those start from.
+    fn note_startup(&self) {
+        let now = self.memory_bytes();
+        self.startup.store(now, Relaxed);
+        self.peak.store(now, Relaxed);
     }
 
     /// What the keyspace itself is holding, live records only.
@@ -1636,7 +1691,14 @@ impl Server {
     /// server that has not asked for one.
     pub fn refresh_memory(&self) {
         if self.maxmemory() != 0 {
-            self.used.store(self.settled_memory(), Relaxed);
+            let used = self.settled_memory();
+            self.used.store(used, Relaxed);
+            // The peak comes along for free here, because the walk that would
+            // otherwise cost something has already happened. It is the reason a
+            // server with a limit has a peak that means what it says and a
+            // server without one has a peak that is only as good as the last
+            // time somebody asked.
+            self.peak.fetch_max(used, Relaxed);
         }
     }
 
@@ -2461,9 +2523,9 @@ pub fn execute(server: &Server, session: &mut Session, args: Args<'_>, out: &mut
 /// A hand written list because the table has one row per container and none per
 /// subcommand, so there is nothing to ask. It goes away with D-114, which gives
 /// every subcommand a row of its own and makes this a flag on the container.
-const CONTAINERS: [&str; 11] = [
-    "acl", "backup", "client", "command", "config", "function", "object", "pubsub", "script",
-    "xgroup", "xinfo",
+const CONTAINERS: [&str; 12] = [
+    "acl", "backup", "client", "command", "config", "function", "memory", "object", "pubsub",
+    "script", "xgroup", "xinfo",
 ];
 
 /// The subcommand a container command was given, for the `cmd` field of
@@ -3048,6 +3110,17 @@ mod tests {
         session: Session,
         argv: Argv,
         out: Out,
+    }
+
+    /// The number out of an integer reply, for a test that compares two of them
+    /// rather than checking one against a constant.
+    fn int_of(reply: &str) -> i64 {
+        reply
+            .strip_prefix(':')
+            .and_then(|s| s.strip_suffix("\r\n"))
+            .unwrap_or_else(|| panic!("not an integer reply: {reply:?}"))
+            .parse()
+            .expect("an integer reply holds an integer")
     }
 
     impl Fixture {
@@ -7849,6 +7922,163 @@ mod tests {
         assert_eq!(
             f.run(&[b"OBJECT"]),
             "-ERR wrong number of arguments for 'object' command\r\n"
+        );
+    }
+
+    #[test]
+    fn memory_usage_counts_the_record_the_body_and_a_share_of_the_index() {
+        let mut f = Fixture::new();
+        assert_eq!(
+            f.run(&[b"MEMORY", b"USAGE", b"nokey"]),
+            "$-1\r\n",
+            "a null and not an error, the same as OBJECT"
+        );
+        f.run(&[b"SET", b"s", b"hello"]);
+        let small = int_of(&f.run(&[b"MEMORY", b"USAGE", b"s"]));
+        assert!(
+            small > 5,
+            "the value is in there and so are the name and the header"
+        );
+        // A longer value under the same name costs more, and by about what the
+        // extra bytes are, since a string lives in its own record.
+        f.run(&[b"SET", b"s", &[b'x'; 1000]]);
+        let big = int_of(&f.run(&[b"MEMORY", b"USAGE", b"s"]));
+        assert!(
+            big - small >= 995 && big - small <= 1005,
+            "{small} then {big}"
+        );
+        // A collection costs its body, so a set of a hundred members is worth
+        // far more than a set of one.
+        f.run(&[b"SADD", b"one", b"a"]);
+        f.run(&[b"SADD", b"many", b"a"]);
+        for i in 0..100u32 {
+            f.run(&[b"SADD", b"many", format!("member:{i}").as_bytes()]);
+        }
+        assert!(
+            int_of(&f.run(&[b"MEMORY", b"USAGE", b"many"]))
+                > int_of(&f.run(&[b"MEMORY", b"USAGE", b"one"]))
+        );
+        // Asking twice gives the same answer, which is the property a sampled
+        // estimate does not have.
+        assert_eq!(
+            f.run(&[b"MEMORY", b"USAGE", b"many"]),
+            f.run(&[b"MEMORY", b"USAGE", b"many"])
+        );
+    }
+
+    #[test]
+    fn memory_usage_reads_samples_and_does_not_use_it() {
+        let mut f = Fixture::new();
+        f.run(&[b"SET", b"s", b"v"]);
+        let plain = f.run(&[b"MEMORY", b"USAGE", b"s"]);
+        for count in [b"0".as_slice(), b"1", b"5", b"1000"] {
+            assert_eq!(
+                f.run(&[b"MEMORY", b"USAGE", b"s", b"SAMPLES", count]),
+                plain
+            );
+        }
+        // The last one wins, which is what the reference's loop does rather
+        // than something it decided to do.
+        assert_eq!(
+            f.run(&[
+                b"MEMORY", b"USAGE", b"s", b"SAMPLES", b"1", b"SAMPLES", b"2"
+            ]),
+            plain
+        );
+        assert_eq!(
+            f.run(&[b"MEMORY", b"USAGE", b"s", b"SAMPLES"]),
+            "-ERR syntax error\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"MEMORY", b"USAGE", b"s", b"SAMPLES", b"-1"]),
+            "-ERR syntax error\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"MEMORY", b"USAGE", b"s", b"SAMPLES", b"nine"]),
+            "-ERR value is not an integer or out of range\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"MEMORY", b"USAGE", b"s", b"BAD", b"1"]),
+            "-ERR syntax error\r\n"
+        );
+        assert_eq!(
+            f.run(&[b"MEMORY", b"USAGE"]),
+            "-ERR wrong number of arguments for 'memory|usage' command\r\n"
+        );
+    }
+
+    #[test]
+    fn memory_stats_grows_a_field_for_every_database_holding_a_key() {
+        let mut f = Fixture::new();
+        assert!(
+            f.run(&[b"MEMORY", b"STATS"]).starts_with("*72\r\n"),
+            "thirty six pairs on a server nobody has written to"
+        );
+        f.run(&[b"SET", b"a", b"1"]);
+        assert!(f.run(&[b"MEMORY", b"STATS"]).starts_with("*74\r\n"));
+        f.run(&[b"SELECT", b"7"]);
+        f.run(&[b"SET", b"b", b"2"]);
+        let reply = f.run(&[b"MEMORY", b"STATS"]);
+        assert!(reply.starts_with("*76\r\n"));
+        assert!(reply.contains("\r\n$4\r\ndb.0\r\n"));
+        assert!(reply.contains("\r\n$4\r\ndb.7\r\n"));
+        // And the row for a database is the pair a real server puts there.
+        assert!(reply.contains("overhead.hashtable.main"));
+        assert!(reply.contains("overhead.hashtable.expires"));
+        assert!(reply.contains("fragmentation.bytes"));
+    }
+
+    #[test]
+    fn memory_answers_the_four_that_only_look() {
+        let mut f = Fixture::new();
+        assert!(f.run(&[b"MEMORY", b"HELP"]).starts_with("*14\r\n+MEMORY "));
+        assert_eq!(f.run(&[b"MEMORY", b"PURGE"]), "+OK\r\n");
+        assert_eq!(
+            f.run(&[b"MEMORY", b"MALLOC-STATS"]),
+            "$45\r\nStats not supported for the current allocator\r\n"
+        );
+        // An empty server is one the doctor will not form an opinion about, and
+        // it says so in Sam's own words.
+        assert!(
+            f.run(&[b"MEMORY", b"DOCTOR"])
+                .contains("my issues detector can't be used in these conditions")
+        );
+        assert_eq!(
+            f.run(&[b"MEMORY", b"NOPE"]),
+            "-ERR unknown subcommand 'NOPE'. Try MEMORY HELP.\r\n"
+        );
+        for sub in [
+            b"STATS".as_slice(),
+            b"DOCTOR",
+            b"PURGE",
+            b"MALLOC-STATS",
+            b"HELP",
+        ] {
+            let name = String::from_utf8_lossy(sub).to_lowercase();
+            assert_eq!(
+                f.run(&[b"MEMORY", sub, b"extra"]),
+                format!("-ERR wrong number of arguments for 'memory|{name}' command\r\n"),
+                "the subcommand is named and not the container"
+            );
+        }
+        assert_eq!(
+            f.run(&[b"MEMORY"]),
+            "-ERR wrong number of arguments for 'memory' command\r\n"
+        );
+    }
+
+    #[test]
+    fn command_getkeys_finds_the_key_memory_usage_names() {
+        let mut f = Fixture::new();
+        assert_eq!(
+            f.run(&[b"COMMAND", b"GETKEYS", b"MEMORY", b"USAGE", b"k"]),
+            "*1\r\n$1\r\nk\r\n"
+        );
+        // And the subcommands that name none say so rather than answering an
+        // empty list.
+        assert!(
+            f.run(&[b"COMMAND", b"GETKEYS", b"MEMORY", b"DOCTOR"])
+                .starts_with("-ERR ")
         );
     }
 

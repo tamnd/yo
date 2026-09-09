@@ -157,6 +157,29 @@ impl Libraries {
         )
     }
 
+    /// What holding them costs, which `MEMORY STATS` reports as
+    /// `functions.caches`.
+    ///
+    /// The code, the names and the rows, which is all a library is here: the
+    /// compiled form belongs to whichever thread compiled it and is not this
+    /// server's to count.
+    pub(in crate::dispatch) fn memory_bytes(&self) -> usize {
+        self.held.capacity() * size_of::<Library>()
+            + self
+                .held
+                .iter()
+                .map(|l| {
+                    l.name.len()
+                        + l.code.len()
+                        + l.funcs.capacity() * size_of::<Func>()
+                        + l.funcs
+                            .iter()
+                            .map(|f| f.name.len() + f.desc.as_ref().map_or(0, |d| d.len()))
+                            .sum::<usize>()
+                })
+                .sum::<usize>()
+    }
+
     /// Every library, for `FUNCTION LIST` to walk.
     pub(in crate::dispatch) fn all(&self) -> &[Library] {
         &self.held

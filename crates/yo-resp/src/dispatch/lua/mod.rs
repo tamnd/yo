@@ -123,6 +123,24 @@ impl Scripts {
         self.held.contains_key(sha)
     }
 
+    /// How many bodies are held.
+    ///
+    /// `MEMORY DOCTOR` complains above a thousand of them, which is the one
+    /// place anything cares, and it is a count and not a walk.
+    pub(in crate::dispatch) fn count(&self) -> usize {
+        self.held.len()
+    }
+
+    /// What holding them costs, bodies and table together.
+    ///
+    /// `MEMORY STATS` reports this as `lua.caches`. The walk is over the number
+    /// of scripts a client loaded once at startup, and the command that asks is
+    /// a monitoring call, so the honest sum is affordable here.
+    pub(in crate::dispatch) fn memory_bytes(&self) -> usize {
+        let per = size_of::<[u8; 40]>() + size_of::<Box<[u8]>>();
+        self.held.capacity() * per + self.held.values().map(|b| b.len()).sum::<usize>()
+    }
+
     /// Forget every one of them, which is what `SCRIPT FLUSH` asks for.
     pub(in crate::dispatch) fn wipe(&mut self) {
         self.held.clear();
