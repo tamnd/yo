@@ -1608,6 +1608,32 @@ fn info(server: &Server, args: Args<'_>, out: &mut Out) {
         if want("replication") {
             super::repl::info(server, &mut s);
         }
+        if extra("threads") {
+            // An extra rather than a default section for the reason above: it
+            // grows with the thread count, and a tool polling `INFO` every
+            // second on a thirty two thread server does not want thirty two
+            // more lines every time.
+            //
+            // The three numbers are the three questions worth asking of a
+            // server where a connection belongs to the thread that accepted it.
+            // `clients` says whether the connections open right now are shared
+            // out. `connections` says whether they were shared out as they
+            // arrived, which is a different question, because a split that was
+            // fair at the start and is unfair now is clients hanging up rather
+            // than an accept race. `commands` says whether an even split of
+            // connections turned into an even split of work, which it does not
+            // when the clients are not all asking for the same thing.
+            let per = server.per_thread();
+            let _ = write!(s, "# Threads\r\nio_threads:{}\r\n", per.len());
+            for (at, thread) in per.iter().enumerate() {
+                let _ = write!(
+                    s,
+                    "thread_{at}:clients={},connections={},commands={}\r\n",
+                    thread.clients, thread.connections, thread.commands,
+                );
+            }
+            s.push_str("\r\n");
+        }
         if extra("commandstats") {
             s.push_str("# Commandstats\r\n");
             for (name, row) in server.command_stats() {
